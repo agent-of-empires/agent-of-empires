@@ -909,16 +909,6 @@ mod tests {
             })
             .unwrap();
 
-        let snapshot = temp.path().join("sessions-at-kill.json");
-        let ready = temp.path().join("trap-installed");
-        let script = format!(
-            "trap 'find {root} -name sessions.json -exec cat {{}} + > {out}.tmp; \
-             mv {out}.tmp {out}; exit 0' TERM HUP; \
-             touch {ready}; while :; do sleep 0.05; done",
-            root = temp.path().display(),
-            out = snapshot.display(),
-            ready = ready.display(),
-        );
         let name = crate::tmux::Session::generate_name(&inst.id, &inst.title);
         let _ = crate::tmux::tmux_command()
             .args(["kill-session", "-t", &name])
@@ -933,31 +923,54 @@ mod tests {
                 "80",
                 "-y",
                 "24",
-                "sh",
-                "-c",
+                "sleep 600",
             ])
-            .arg(&script)
             .output()
             .expect("tmux");
         assert!(created.status.success(), "the test needs a real pane");
         let _pane = crate::tmux::test_helpers::TmuxTestSession::from_name(name);
         crate::tmux::refresh_session_cache();
-        let wait_for = |path: &std::path::Path, what: &str| {
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-            while !path.exists() {
-                assert!(
-                    std::time::Instant::now() < deadline,
-                    "timed out waiting for {what}"
-                );
-                std::thread::sleep(std::time::Duration::from_millis(10));
+
+        // Read the stored rows synchronously as the first kill signal is about
+        // to be sent; a pane-side trap would race the SIGKILL escalation.
+        struct SnapshotAtFirstSignal {
+            sessions: std::path::PathBuf,
+            snapshot: std::sync::Arc<std::sync::Mutex<Option<String>>>,
+        }
+        impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for SnapshotAtFirstSignal {
+            fn on_event(
+                &self,
+                event: &tracing::Event<'_>,
+                _: tracing_subscriber::layer::Context<'_, S>,
+            ) {
+                if event.metadata().target() != "process.signal" {
+                    return;
+                }
+                let mut snapshot = self.snapshot.lock().unwrap();
+                if snapshot.is_none() {
+                    *snapshot = Some(std::fs::read_to_string(&self.sessions).unwrap());
+                }
             }
+        }
+        let snapshot = std::sync::Arc::default();
+        let layer = SnapshotAtFirstSignal {
+            sessions: storage.sessions_path().to_path_buf(),
+            snapshot: std::sync::Arc::clone(&snapshot),
         };
-        wait_for(&ready, "the pane to install its trap");
+        {
+            use tracing_subscriber::layer::SubscriberExt;
+            let _guard = tracing::subscriber::set_default(
+                tracing_subscriber::Registry::default().with(layer),
+            );
+            tracing::callsite::rebuild_interest_cache();
+            inst.stop().expect("stop");
+        }
 
-        inst.stop().expect("stop");
-
-        wait_for(&snapshot, "the pane to record its kill signal");
-        let at_kill = std::fs::read_to_string(&snapshot).unwrap();
+        let at_kill = snapshot
+            .lock()
+            .unwrap()
+            .take()
+            .expect("stop signals the pane's process tree");
         let rows: Vec<serde_json::Value> = serde_json::from_str(&at_kill).unwrap();
         let row = rows
             .iter()

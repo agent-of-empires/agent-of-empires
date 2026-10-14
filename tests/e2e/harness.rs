@@ -441,6 +441,9 @@ last_seen_version = "{}"
     /// Tear the TUI's own tmux session down so a test can `spawn_tui` again and assert on
     /// what a fresh start reads from disk.
     pub fn kill_tui(&mut self) {
+        // Killing the last session makes tmux exit asynchronously, and a
+        // `new-session` that connects to the exiting server fails.
+        self.tmux_ok(&["set-option", "-s", "exit-empty", "off"], "keep server");
         let name = self.session_name.clone();
         self.tmux_kill_session(&name);
         self.spawned = false;

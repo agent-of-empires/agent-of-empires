@@ -1518,31 +1518,40 @@ mod tests {
 
     #[test]
     #[cfg(any(target_os = "linux", target_os = "macos"))]
-    fn run_with_timeout_process_group_kills_descendants() {
-        let tmp = tempfile::tempdir().unwrap();
-        let pid_path = tmp.path().join("descendant.pid");
-        let term_path = tmp.path().join("terminated");
+    fn process_group_timeout_terminates_then_kills_descendants() {
+        use std::io::BufRead as _;
+
+        // The descendant ignores SIGTERM and prints its PID only once it does, so
+        // only the escalation can end it.
         let mut cmd = Command::new("sh");
         cmd.args([
             "-c",
-            "trap 'printf term > \"$2\"' TERM; sleep 10 & child=$!; printf %s \"$child\" > \"$1\"; wait",
-            "sh",
+            "sh -c 'trap \"\" TERM; echo $$; exec sleep 600' & wait",
         ])
-        .arg(&pid_path)
-        .arg(&term_path);
+        .stdout(Stdio::piped());
+        platform::configure_process_group(&mut cmd);
+        let mut child = cmd.spawn().unwrap();
+        let mut line = String::new();
+        std::io::BufReader::new(child.stdout.take().unwrap())
+            .read_line(&mut line)
+            .expect("descendant should publish its pid");
+        let pid: i32 = line.trim().parse().unwrap();
 
-        let result = run_with_timeout_process_group(&mut cmd, Duration::from_secs(2)).unwrap();
-        assert!(result.is_none(), "process group should time out");
-        assert_eq!(
-            std::fs::read_to_string(term_path).expect("SIGTERM trap should run"),
-            "term",
-            "the process-group leader must receive SIGTERM before escalation"
-        );
+        let status =
+            wait_with_timeout_inner(&mut child, Duration::from_millis(400), true, None).unwrap();
+        assert!(status.is_none(), "process group should time out");
+        // Linux fixes the exit signal when the first fatal signal is sent, so the
+        // later SIGKILL cannot mask a SIGTERM the leader already received.
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::unix::process::ExitStatusExt;
+            assert_eq!(
+                child.try_wait().unwrap().unwrap().signal(),
+                Some(libc::SIGTERM),
+                "the process-group leader must receive SIGTERM before escalation"
+            );
+        }
 
-        let pid: i32 = std::fs::read_to_string(pid_path)
-            .expect("shell should publish descendant pid")
-            .parse()
-            .unwrap();
         let process_is_running = |pid: i32| {
             let output = Command::new("ps")
                 .args(["-o", "stat=", "-p", &pid.to_string()])
@@ -1553,13 +1562,13 @@ mod tests {
                 && !state.trim().is_empty()
                 && !state.trim_start().starts_with('Z')
         };
-        let deadline = Instant::now() + Duration::from_secs(1);
+        let deadline = Instant::now() + Duration::from_secs(10);
         while process_is_running(pid) && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(10));
         }
         assert!(
             !process_is_running(pid),
-            "descendant must be exited or a terminated zombie after the timeout"
+            "descendant must be exited or a killed zombie after the timeout"
         );
     }
 
