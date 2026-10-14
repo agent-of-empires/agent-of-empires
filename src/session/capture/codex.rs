@@ -18,9 +18,17 @@ const CODEX_SCAN_MAX_CANDIDATES: usize = 4 * 1024;
 
 /// The cwd from a rollout's metadata line. Any declared `session_id` / `id`
 /// must equal the filename UUID, so a child rollout pointing at its parent is rejected.
+/// A non-null `parent_thread_id` also rejects: legacy subagent rollouts have
+/// self-consistent ids. This skips a root thread forked from a subagent.
 fn parse_codex_cwd_from_json(line: &str, filename_uuid: &str) -> Option<String> {
     let parsed: serde_json::Value = serde_json::from_str(line).ok()?;
     let payload = parsed.get("payload")?;
+    if payload
+        .get("parent_thread_id")
+        .is_some_and(|v| !v.is_null())
+    {
+        return None;
+    }
     let filename_id = Uuid::parse_str(filename_uuid).ok()?;
     for key in ["session_id", "id"] {
         if let Some(value) = payload.get(key) {
@@ -189,7 +197,7 @@ mod tests {
                 root,
                 cwd.clone(),
             ),
-            ("matching ids", meta(root, root), root, cwd),
+            ("matching ids", meta(root, root), root, cwd.clone()),
             (
                 "child session_id points at parent",
                 meta(child, root),
@@ -197,6 +205,20 @@ mod tests {
                 None,
             ),
             ("id differs from filename", meta(child, root), root, None),
+            (
+                "legacy subagent with self-consistent ids",
+                format!(
+                    r#"{{"payload":{{"id":"{child}","session_id":"{child}","parent_thread_id":"{root}","cwd":"/p"}}}}"#
+                ),
+                child,
+                None,
+            ),
+            (
+                "null parent_thread_id",
+                format!(r#"{{"payload":{{"id":"{root}","parent_thread_id":null,"cwd":"/p"}}}}"#),
+                root,
+                cwd,
+            ),
             ("malformed session_id", meta(root, "corrupt"), root, None),
             (
                 "missing cwd",
