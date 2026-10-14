@@ -8,11 +8,13 @@ Protected routes follow the configured authentication mode. Token authentication
 
 ## Runtime CLI reads
 
-The read-only CLI commands use `/api/runtime/ws` when `--daemon-url` or `AOE_DAEMON_URL` names an endpoint. The route uses the same credential policy as the daemon API, including bearer tokens, query tokens and login cookies; an unauthenticated daemon needs no credential. CLI clients use `AOE_DAEMON_TOKEN` or `AOE_DAEMON_PASSPHRASE`, with the existing device-bound session cache for passphrase login. See the [CLI transport options](cli/reference.md#aoe) for endpoint selection and fallback behavior.
+The read-only CLI commands use `/api/runtime/read/ws` when `--daemon-url` or `AOE_DAEMON_URL` names an endpoint. The reserved TUI stream path `/api/runtime/ws` does not serve this one-shot protocol. The read route uses the same credential policy as the daemon API, including bearer tokens, query tokens and login cookies; an unauthenticated daemon needs no credential. CLI clients use `AOE_DAEMON_TOKEN` or `AOE_DAEMON_PASSPHRASE`, with the existing device-bound session cache for passphrase login. See the [CLI transport options](cli/reference.md#aoe) for endpoint selection and fallback behavior.
 
 Environment URLs discard query parameters, matching TUI discovery; a query token is not a CLI credential. Explicit CLI endpoints require a base URL without a query. HTTP on a non-loopback host is accepted only without bearer or passphrase credentials; remote authentication requires HTTPS. Localhost login bypasses proxies and pins both IPv4 and IPv6 loopback addresses.
 
 When descriptor-based inspection finds no runtime publication, local reads remain available even if ownership or permissions prohibit a UDS connection. Valid inactive lock files left by shutdown do not constitute a publication: absence probes hold shared locks and recheck their identities. A live publisher, invalid lock or observed runtime artifact still refuses that fallback; this observation never authorizes a UDS connection.
+
+The non-Linux, absent-Linux-publication and absent-environment-peer disk-read paths are transitional until [CLI daemon auto-start](https://github.com/agent-of-empires/agent-of-empires/issues/4400). This exception is read-only CLI scope, not TUI or mutation fallback.
 
 Local publication waits for shared absence probes and readers retaining a prior namespace. An existing publisher's exclusive claim still refuses a second publisher.
 

@@ -155,7 +155,7 @@ async fn upgrade_against(response: Vec<u8>) -> Result<(), WsError> {
         stream.flush().await.ok();
         let _ = stream.read(&mut head).await;
     });
-    let request = format!("ws://{address}/api/runtime/ws")
+    let request = format!("ws://{address}/api/runtime/read/ws")
         .into_client_request()
         .expect("request builds");
     let outcome = tokio_tungstenite::connect_async(request).await;

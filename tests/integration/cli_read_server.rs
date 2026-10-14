@@ -158,7 +158,7 @@ async fn the_route_refuses_an_unauthenticated_upgrade_with_401() {
         .expect("connect");
     stream
         .write_all(
-            b"GET /api/runtime/ws HTTP/1.1\r\n\
+            b"GET /api/runtime/read/ws HTTP/1.1\r\n\
               Host: 127.0.0.1\r\n\
               Upgrade: websocket\r\n\
               Connection: Upgrade\r\n\
@@ -200,7 +200,7 @@ async fn the_route_shares_the_daemon_credential_gate() {
             configured_token.map(str::to_owned),
         );
         let address = serve(state).await;
-        let mut request = format!("ws://{address}/api/runtime/ws")
+        let mut request = format!("ws://{address}/api/runtime/read/ws")
             .into_client_request()
             .unwrap();
         if let Some(cookie) = cookie {
@@ -223,6 +223,10 @@ async fn the_route_shares_the_daemon_credential_gate() {
         assert_eq!(hello["data"]["owner"]["uid"], serde_json::Value::Null);
         socket.close(None).await.unwrap();
         if configured_token.is_none() {
+            assert!(matches!(
+                tokio_tungstenite::connect_async(format!("ws://{address}/api/runtime/ws")).await,
+                Err(tokio_tungstenite::tungstenite::Error::Http(_))
+            ));
             let outcome = execute(ScopedCommand::Profile, &read_source(address, None)).await;
             assert_eq!(outcome.exit, 0, "{:?}", outcome.stderr);
             assert_eq!(
@@ -360,7 +364,7 @@ async fn a_failed_host_hook_does_not_poison_runtime_reads() {
     use futures_util::StreamExt;
     use tokio_tungstenite::tungstenite::{client::IntoClientRequest, Message};
     let snapshot = tokio::time::timeout(Duration::from_secs(5), async {
-        let mut request = format!("ws://{address}/api/runtime/ws")
+        let mut request = format!("ws://{address}/api/runtime/read/ws")
             .into_client_request()
             .unwrap();
         request
@@ -554,7 +558,7 @@ async fn registered_project_text_and_native_paths_survive_runtime_reads() {
             .unwrap()
             .project_path = project.path.clone();
         let snapshot = tokio::time::timeout(Duration::from_secs(5), async {
-            let mut request = format!("ws://{address}/api/runtime/ws")
+            let mut request = format!("ws://{address}/api/runtime/read/ws")
                 .into_client_request()
                 .unwrap();
             request

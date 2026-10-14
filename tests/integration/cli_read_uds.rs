@@ -84,6 +84,56 @@ async fn a_live_daemon_socket_serves_the_read() {
     drop(server);
 }
 
+#[tokio::test]
+#[serial_test::serial]
+async fn one_shot_reads_only_upgrade_on_their_distinct_path() {
+    use futures_util::{SinkExt, StreamExt};
+    use tokio_tungstenite::tungstenite::{
+        protocol::{frame::coding::CloseCode, CloseFrame},
+        Error, Message,
+    };
+
+    let state = build_test_app_state_with_policy(Vec::new(), Vec::new(), Vec::new(), None);
+    let server = RuntimeUdsTestServer::start(state.clone()).unwrap();
+    let socket_path = server.app_dir().join("runtime.sock");
+    tokio::time::timeout(Duration::from_secs(5), async {
+        for path in ["/api/runtime/ws", "/unrelated"] {
+            let stream = tokio::net::UnixStream::connect(&socket_path).await.unwrap();
+            let outcome =
+                tokio_tungstenite::client_async(format!("ws://localhost{path}"), stream).await;
+            let Err(Error::Http(response)) = outcome else {
+                panic!("{path} must not upgrade to a one-shot runtime read");
+            };
+            assert_eq!(response.status(), 404);
+        }
+
+        let stream = tokio::net::UnixStream::connect(&socket_path).await.unwrap();
+        let (mut socket, _) =
+            tokio_tungstenite::client_async("ws://localhost/api/runtime/read/ws", stream)
+                .await
+                .unwrap();
+        for kind in ["hello", "snapshot"] {
+            let text = socket.next().await.unwrap().unwrap().into_text().unwrap();
+            let frame: serde_json::Value = serde_json::from_str(&text).unwrap();
+            assert_eq!(frame["kind"], kind);
+            if kind == "hello" {
+                assert_eq!(frame["data"]["protocol_version"], 4);
+            }
+        }
+        socket
+            .send(Message::Close(Some(CloseFrame {
+                code: CloseCode::Normal,
+                reason: "".into(),
+            })))
+            .await
+            .unwrap();
+    })
+    .await
+    .expect("route selection and the read finish within their budget");
+    state.shutdown.cancel();
+    let _fixture = server.join().await;
+}
+
 /// Every scoped command and alias completes over the real local socket.
 #[tokio::test]
 #[serial_test::serial]

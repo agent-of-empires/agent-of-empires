@@ -266,7 +266,7 @@ async fn execute_inner(
             #[cfg(target_os = "linux")]
             {
                 let connection = uds::connect(establishment_deadline).await?;
-                let request = "ws://localhost/api/runtime/ws"
+                let request = "ws://localhost/api/runtime/read/ws"
                     .into_client_request()
                     .map_err(|_| ReadFailure::post("unavailable"))?;
                 let exchange = connection.upgrade(request).await?;
@@ -355,7 +355,7 @@ async fn upgrade_http(
         let uri = request.uri();
         let path = uri
             .path()
-            .strip_suffix("/api/runtime/ws")
+            .strip_suffix("/api/runtime/read/ws")
             .ok_or_else(|| ReadFailure::pre("invalid_endpoint"))?;
         let base = if uri.scheme_str() == Some("wss") {
             format!(
@@ -704,14 +704,14 @@ mod tests {
             "this machine has a home to collapse to"
         );
         let cases: [(&str, bool); 8] = [
-            ("http://127.0.0.1:8080/api/runtime/ws", true),
-            ("http://[::1]:8080/api/runtime/ws", true),
-            ("https://[::1]/api/runtime/ws", true),
-            ("https://localhost:8080/api/runtime/ws", true),
-            ("https://example.test/api/runtime/ws", false),
-            ("wss://[fe80::1]/api/runtime/ws", false),
-            ("wss://[2001:db8::1]/api/runtime/ws", false),
-            ("http://192.168.1.10:8080/api/runtime/ws", false),
+            ("http://127.0.0.1:8080/api/runtime/read/ws", true),
+            ("http://[::1]:8080/api/runtime/read/ws", true),
+            ("https://[::1]/api/runtime/read/ws", true),
+            ("https://localhost:8080/api/runtime/read/ws", true),
+            ("https://example.test/api/runtime/read/ws", false),
+            ("wss://[fe80::1]/api/runtime/read/ws", false),
+            ("wss://[2001:db8::1]/api/runtime/read/ws", false),
+            ("http://192.168.1.10:8080/api/runtime/read/ws", false),
         ];
         for (url, expected) in cases {
             let request = tokio_tungstenite::tungstenite::http::Request::builder()
@@ -873,10 +873,18 @@ mod tests {
     #[test]
     fn a_bracketed_ipv6_endpoint_connects_to_an_address_literal() {
         for (url, host, port) in [
-            ("http://[::1]:8080/api/runtime/ws", "::1", 8080),
-            ("wss://[fe80::1]/api/runtime/ws", "fe80::1", 443),
-            ("http://127.0.0.1:8080/api/runtime/ws", "127.0.0.1", 8080),
-            ("wss://example.test/api/runtime/ws", "example.test", 443),
+            ("http://[::1]:8080/api/runtime/read/ws", "::1", 8080),
+            ("wss://[fe80::1]/api/runtime/read/ws", "fe80::1", 443),
+            (
+                "http://127.0.0.1:8080/api/runtime/read/ws",
+                "127.0.0.1",
+                8080,
+            ),
+            (
+                "wss://example.test/api/runtime/read/ws",
+                "example.test",
+                443,
+            ),
         ] {
             let request = url.into_client_request().expect("the URL parses");
             let (resolved, resolved_port) =
@@ -1030,7 +1038,8 @@ mod tests {
         test_support::accept_runtime_read_cache_for_test(&state).await;
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
-        let app = test_support::build_router_for_test(state.clone());
+        let app =
+            axum::Router::new().nest("/base", test_support::build_router_for_test(state.clone()));
         let shutdown = state.shutdown.clone();
         let server = tokio::spawn(async move {
             axum::serve(
@@ -1099,7 +1108,7 @@ mod tests {
         let cli = Cli::parse_from(["aoe", "session", "show", "passphrase-read", "--json"]);
         let source = ReadRequestSource {
             explicit_url: None,
-            env_url: Some(format!("http://localhost:{port}").into()),
+            env_url: Some(format!("http://localhost:{port}/base/").into()),
             token: None,
             explicit_profile: Some("main".into()),
             env_profile: None,

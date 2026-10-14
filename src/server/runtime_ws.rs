@@ -1,4 +1,4 @@
-//! Read-only runtime read endpoint: `GET /api/runtime/ws`.
+//! Read-only runtime read endpoint: `GET /api/runtime/read/ws`.
 //!
 //! One connection carries exactly two application frames, a Hello handshake
 //! and a Snapshot, and the server then sends a normal close. The handler only

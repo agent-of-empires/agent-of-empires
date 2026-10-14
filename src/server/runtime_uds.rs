@@ -411,7 +411,20 @@ async fn connection(state: Arc<AppState>, stream: UnixStream) {
         .max_frame_size(Some(FRAME_LIMIT));
     let upgraded = tokio::time::timeout_at(
         deadline,
-        tokio_tungstenite::accept_async_with_config(stream, Some(config)),
+        tokio_tungstenite::accept_hdr_async_with_config(
+            stream,
+            |request: &tokio_tungstenite::tungstenite::handshake::server::Request, response| {
+                if request.uri().path() == "/api/runtime/read/ws" {
+                    Ok(response)
+                } else {
+                    Err(tokio_tungstenite::tungstenite::http::Response::builder()
+                        .status(404)
+                        .body(None)
+                        .expect("static route refusal"))
+                }
+            },
+            Some(config),
+        ),
     )
     .await;
     let socket = match upgraded {

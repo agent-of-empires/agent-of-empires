@@ -1055,7 +1055,7 @@ mod tests {
         assert_eq!(observed, 1);
         let exchange = connection
             .upgrade(
-                "ws://localhost/api/runtime/ws"
+                "ws://localhost/api/runtime/read/ws"
                     .into_client_request()
                     .unwrap(),
             )
@@ -1568,7 +1568,7 @@ mod tests {
         let lock = dir.path().join(LOCK_FILE);
         std::fs::write(&lock, b"").expect("lock");
         let request = || {
-            "ws://localhost/api/runtime/ws"
+            "ws://localhost/api/runtime/read/ws"
                 .into_client_request()
                 .expect("the local request")
         };

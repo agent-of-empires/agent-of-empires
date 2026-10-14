@@ -194,7 +194,7 @@ fn parse_endpoint(raw: &str) -> Result<(String, bool), ReadFailure> {
     let ws_scheme = if secure { "wss" } else { "ws" };
     let explicit_port = port.map(|value| format!(":{value}")).unwrap_or_default();
     Ok((
-        format!("{ws_scheme}://{host}{explicit_port}{path}/api/runtime/ws"),
+        format!("{ws_scheme}://{host}{explicit_port}{path}/api/runtime/read/ws"),
         secure,
     ))
 }
@@ -319,7 +319,7 @@ mod tests {
                 None,
                 "",
                 false,
-                Some("ws://192.168.1.50:8080/api/runtime/ws"),
+                Some("ws://192.168.1.50:8080/api/runtime/read/ws"),
             ),
             ("http://192.168.1.50:8080", Some("secret"), "", false, None),
             ("http://192.168.1.50:8080", None, "phrase", false, None),
@@ -328,14 +328,14 @@ mod tests {
                 Some("env-secret"),
                 "",
                 false,
-                Some("wss://example.test/base/api/runtime/ws"),
+                Some("wss://example.test/base/api/runtime/read/ws"),
             ),
             (
                 "http://localhost:8080/?token=query-secret",
                 None,
                 "",
                 false,
-                Some("ws://localhost:8080/api/runtime/ws"),
+                Some("ws://localhost:8080/api/runtime/read/ws"),
             ),
             (
                 "http://localhost:8080/?token=query-secret",
@@ -419,11 +419,11 @@ mod tests {
     fn valid_raw_path_gets_one_endpoint_suffix() {
         assert_eq!(
             parse_endpoint("https://example.test/base/").unwrap().0,
-            "wss://example.test/base/api/runtime/ws"
+            "wss://example.test/base/api/runtime/read/ws"
         );
         assert_eq!(
             parse_endpoint("http://127.0.0.1:8080").unwrap().0,
-            "ws://127.0.0.1:8080/api/runtime/ws"
+            "ws://127.0.0.1:8080/api/runtime/read/ws"
         );
     }
 
