@@ -202,23 +202,23 @@ fn check_auth_gate(
 
 /// systemd `Type=notify` readiness. No-op unless `NOTIFY_SOCKET` is set.
 #[cfg(unix)]
-fn notify_ready(addr: &str) {
+async fn notify_ready(addr: &str) {
     let message = format!("READY=1\nSTATUS=listening on {addr}\n");
-    if let Err(e) = crate::process::systemd::notify::send(message.as_bytes()) {
+    if let Err(e) = crate::process::systemd::notify::send(message).await {
         tracing::warn!(target: "serve.lifecycle", "sd_notify READY failed: {e}");
     }
 }
 
 #[cfg(unix)]
-fn notify_stopping() {
-    let _ = crate::process::systemd::notify::send(b"STOPPING=1\n");
+async fn notify_stopping() {
+    let _ = crate::process::systemd::notify::send(b"STOPPING=1\n").await;
 }
 
 #[cfg(not(unix))]
-fn notify_ready(_status: &str) {}
+async fn notify_ready(_status: &str) {}
 
 #[cfg(not(unix))]
-fn notify_stopping() {}
+async fn notify_stopping() {}
 
 pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
     let ServerConfig {
@@ -958,7 +958,7 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
             let _ = tokio::signal::ctrl_c().await;
             tracing::info!(target: "serve.shutdown", "received ctrl-c, shutting down");
         }
-        notify_stopping();
+        notify_stopping().await;
         let plugin_host = shutdown_state.plugin_host.clone();
         run_shutdown_sequence(
             &shutdown_state.shutdown,
@@ -973,7 +973,7 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
         .await;
     };
 
-    notify_ready(&addr);
+    notify_ready(&addr).await;
     // Publish counts after readiness so its initial status cannot overwrite them.
     super::systemd_reconcile::push_status(&state).await;
 
@@ -1090,9 +1090,9 @@ mod tests {
     use super::*;
 
     #[cfg(unix)]
-    #[test]
+    #[tokio::test(flavor = "current_thread")]
     #[serial_test::parallel]
-    fn notifications_send_ready_status_and_stopping_to_notify_socket() {
+    async fn notifications_send_ready_status_and_stopping_to_notify_socket() {
         use std::os::unix::net::UnixDatagram;
         let _exclusion = crate::session::test_support::EnvGuard::read_lock();
         let dir = tempfile::tempdir().unwrap();
@@ -1121,11 +1121,11 @@ mod tests {
                 "NOTIFY_SOCKET",
                 destination.as_os_str(),
             )]);
-            notify_ready("127.0.0.1:1");
+            notify_ready("127.0.0.1:1").await;
             let mut buf = [0u8; 256];
             let n = socket.recv(&mut buf).unwrap();
             assert_eq!(&buf[..n], b"READY=1\nSTATUS=listening on 127.0.0.1:1\n");
-            notify_stopping();
+            notify_stopping().await;
             let n = socket.recv(&mut buf).unwrap();
             assert_eq!(&buf[..n], b"STOPPING=1\n");
         }

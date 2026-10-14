@@ -76,7 +76,7 @@ The upstream must set `X-Forwarded-For` (or `cf-connecting-ip`); aoe reads the l
 
 ### Running under systemd
 
-`aoe serve` supports `Type=notify` when `NOTIFY_SOCKET` is set, using pathname or Linux abstract (`@name`) sockets. It sends `READY=1` after binding the listener and starting workers/tasks, and `STOPPING=1` when shutdown starts. Each notification write has a one-second timeout; a receiver that remains full can still cause `READY=1` to be lost. Wrappers such as `cargo run` require `NotifyAccess=all`, since systemd otherwise accepts messages only from the main process.
+`aoe serve` supports `Type=notify` when `NOTIFY_SOCKET` is set, using pathname or Linux abstract (`@name`) sockets. It sends `READY=1` after binding the listener and starting workers/tasks, and `STOPPING=1` when shutdown starts. Writes run outside async workers and each has a one-second timeout; a receiver that remains full can still cause `READY=1` to be lost. Wrappers such as `cargo run` require `NotifyAccess=all`, since systemd otherwise accepts messages only from the main process.
 
 ## Security
 

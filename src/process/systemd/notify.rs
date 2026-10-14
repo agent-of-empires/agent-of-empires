@@ -1,17 +1,21 @@
-//! Daemon notifications over Unix datagram sockets.
+//! Bounded daemon notifications over Unix datagram sockets.
 
-pub(crate) fn send(message: &[u8]) -> std::io::Result<()> {
+pub(crate) async fn send(message: impl AsRef<[u8]> + Send + 'static) -> std::io::Result<()> {
     let Some(destination) = std::env::var_os("NOTIFY_SOCKET").filter(|path| !path.is_empty())
     else {
         return Ok(());
     };
-    let socket = std::os::unix::net::UnixDatagram::unbound()?;
-    #[cfg(target_os = "linux")]
-    crate::process::platform::connect_systemd_socket(&socket, &destination)?;
-    #[cfg(not(target_os = "linux"))]
-    socket.connect(&destination)?;
-    socket.set_write_timeout(Some(std::time::Duration::from_secs(1)))?;
-    socket.send(message).map(|_| ())
+    tokio::task::spawn_blocking(move || {
+        let socket = std::os::unix::net::UnixDatagram::unbound()?;
+        #[cfg(target_os = "linux")]
+        crate::process::platform::connect_systemd_socket(&socket, &destination)?;
+        #[cfg(not(target_os = "linux"))]
+        socket.connect(&destination)?;
+        socket.set_write_timeout(Some(std::time::Duration::from_secs(1)))?;
+        socket.send(message.as_ref()).map(|_| ())
+    })
+    .await
+    .map_err(std::io::Error::other)?
 }
 
 #[cfg(all(test, target_os = "linux"))]
@@ -49,9 +53,19 @@ mod tests {
             let (started, entered) = mpsc::sync_channel(0);
             let (sent, received) = mpsc::channel();
             let worker = std::thread::spawn(move || {
-                if started.send(()).is_ok() {
-                    sent.send(send(b"READY=1\n")).unwrap();
-                }
+                let result = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap()
+                    .block_on(async {
+                        let (result, ()) = tokio::join!(
+                            biased;
+                            send(b"READY=1\n"),
+                            async { let _ = started.send(()); }
+                        );
+                        result
+                    });
+                let _ = sent.send(result);
             });
             let entry = entered.recv_timeout(Duration::from_secs(5));
             drop(entered);
