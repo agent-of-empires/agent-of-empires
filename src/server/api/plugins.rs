@@ -137,8 +137,9 @@ pub async fn serve_plugin_icon(Path(id): Path<String>) -> Response {
 }
 
 /// Page policy from ADR 0005: only the bundle's own inline script and style run,
-/// and only the dashboard may frame it (with `sandbox="allow-scripts"`).
-const PLUGIN_PAGE_CSP: &str = "default-src 'none'; \
+/// and only the dashboard may frame it. `sandbox` gives the document an opaque
+/// origin even on a direct visit, not only inside the dashboard's iframe.
+const PLUGIN_PAGE_CSP: &str = "sandbox allow-scripts; default-src 'none'; \
     script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src data: blob:; \
     connect-src 'none'; form-action 'none'; base-uri 'none'; frame-ancestors 'self'";
 
@@ -163,8 +164,7 @@ pub async fn serve_plugin_page(
     uri: axum::http::Uri,
     headers: axum::http::HeaderMap,
 ) -> Response {
-    // Opened as a tab, the page would run on the dashboard origin and could
-    // read the token from localStorage; only the sandboxed frame is opaque.
+    // Second layer behind the CSP `sandbox`: never hand executable HTML to a tab.
     if headers.get("sec-fetch-dest").and_then(|v| v.to_str().ok()) != Some("iframe") {
         return api_error(
             StatusCode::FORBIDDEN,
@@ -1056,7 +1056,13 @@ mod tests {
                 crate::server::access::security_headers,
             ));
         let cases = [
-            ("/page", PLUGIN_PAGE_CSP, "SAMEORIGIN"),
+            (
+                "/page",
+                "sandbox allow-scripts; default-src 'none'; script-src 'unsafe-inline'; \
+                 style-src 'unsafe-inline'; img-src data: blob:; connect-src 'none'; \
+                 form-action 'none'; base-uri 'none'; frame-ancestors 'self'",
+                "SAMEORIGIN",
+            ),
             ("/other", crate::server::access::CSP, "DENY"),
         ];
         for (path, csp, frame_options) in cases {

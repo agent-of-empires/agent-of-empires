@@ -329,7 +329,7 @@ entry = "dist/board.html"
 
 A page `id` uses only letters, digits, `-` and `_`, and is unique among the plugin's pages. `entry` follows the [screenshot path rules](#screenshots) with an `.html` extension and must resolve inside the plugin directory. A plugin may declare several pages.
 
-The entry must be one self-contained file: inline every script and style, and embed images as `data:` or `blob:` URLs. The host serves only that file, at `GET /api/plugins/{id}/pages/{page_id}` for an active plugin, uncached. Its policy runs the inline script and style and `data:`/`blob:` images, and blocks every other resource load, connection and form submission. The URL serves only a frame load (`Sec-Fetch-Dest: iframe`) with no query string, and only the dashboard may frame it.
+The entry must be one self-contained file: inline every script and style, and embed images as `data:` or `blob:` URLs. The host serves only that file, at `GET /api/plugins/{id}/pages/{page_id}` for an active plugin, uncached. Its policy sandboxes the document (`sandbox allow-scripts`), so it gets an opaque origin even when the URL is opened directly, runs the inline script and style and `data:`/`blob:` images, and blocks every other resource load, connection and form submission. As a second layer, the URL serves only a frame load (`Sec-Fetch-Dest: iframe`) with no query string, and only the dashboard may frame it.
 
 ### Badge payload
 
