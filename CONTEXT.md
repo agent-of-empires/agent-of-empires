@@ -195,7 +195,7 @@ _Avoid_: monitor
 Entering a Session's tmux pane from the TUI. Unrelated to attaching a Worktree to an existing branch.
 
 **Live-send**:
-An attach mode that keeps the TUI on the home view and forwards keystrokes to the agent pane.
+An attach mode that keeps the TUI on the home view and forwards keystrokes to whichever pane is on screen: agent, Paired terminal or Tool session.
 
 **Surface**:
 Where the user meets AoE: TUI, web dashboard, or CLI.
