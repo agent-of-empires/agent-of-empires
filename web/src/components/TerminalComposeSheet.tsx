@@ -38,13 +38,13 @@ export function TerminalComposeSheet({ draftKey, bottomInset, onSubmit, onClose 
     ta.setSelectionRange(ta.value.length, ta.value.length);
   }, [grow]);
 
-  const deliver = (submit: boolean) => {
+  const deliver = (submit: boolean, keepTyping = !submit) => {
     const text = textRef.current?.value ?? "";
     if (!text.trim() || !onSubmit(text, submit)) return;
     drafts.delete(draftKey);
-    // Send ends the prompt, so the keyboard goes down; Insert keeps typing in the terminal.
-    if (submit) textRef.current?.blur();
-    onClose(!submit);
+    // A tapped Send drops the keyboard; Insert and the hardware chord keep typing in the terminal.
+    if (!keepTyping) textRef.current?.blur();
+    onClose(keepTyping);
   };
 
   const onKeyDown = (e: ReactKeyboardEvent<HTMLDivElement>) => {
@@ -63,7 +63,7 @@ export function TerminalComposeSheet({ draftKey, bottomInset, onSubmit, onClose 
       }
     } else if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) {
       e.preventDefault();
-      deliver(true);
+      deliver(true, true);
     }
   };
 
