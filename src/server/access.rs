@@ -283,6 +283,8 @@ pub(super) const CITYHALL_MUTATION_ALLOW: &[(&str, &str)] = &[
     ("PATCH", "/api/profiles/{name}/settings"),
     ("PATCH", "/api/theme"),
     ("POST", "/api/plugins/{id}/settings/options/resolve"),
+    // Lets a page frame load authenticate; grants nothing beyond rendering it.
+    ("POST", "/api/plugins/{id}/pages/{page_id}/ticket"),
     // Telemetry consent (its own surface, still prompted).
     ("POST", "/api/telemetry/consent"),
     ("POST", "/api/telemetry/seen"),

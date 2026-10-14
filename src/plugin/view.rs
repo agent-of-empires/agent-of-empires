@@ -46,7 +46,7 @@ pub struct PluginPageView {
     pub url: String,
 }
 
-fn page_url(plugin_id: &str, page_id: &str) -> String {
+pub fn page_url(plugin_id: &str, page_id: &str) -> String {
     format!("/api/plugins/{plugin_id}/pages/{page_id}")
 }
 
