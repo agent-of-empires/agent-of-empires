@@ -37,6 +37,10 @@ change rather than running several to be thorough. `--all-targets` links all
 twenty-odd test binaries separately; keep it for a pre-push check, not routine
 iteration.
 
+Run cargo in the foreground. Do not detach it with `&`, `nohup`, or
+`sh -c '...' &`: if that cargo is killed, its `rustc` children keep running
+under PID 1, each holding several GB of memory with no consumer.
+
 ## Code rules
 
 - Let `cargo fmt` and `cargo clippy` decide style; fix warnings.

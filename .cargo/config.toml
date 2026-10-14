@@ -1,5 +1,8 @@
 [build]
-jobs = 8
+# Several worktree sessions often build at once; each claiming 8 jobs
+# oversubscribes the host and pushes it into swap. Override with
+# CARGO_BUILD_JOBS for a solo build.
+jobs = 4
 
 [alias]
 xtask = "run -p xtask --"
