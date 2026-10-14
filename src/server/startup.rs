@@ -204,14 +204,14 @@ fn check_auth_gate(
 #[cfg(unix)]
 fn notify_ready(addr: &str) {
     let message = format!("READY=1\nSTATUS=listening on {addr}\n");
-    if let Err(e) = crate::process::notify_systemd(message.as_bytes()) {
+    if let Err(e) = crate::process::systemd::notify::send(message.as_bytes()) {
         tracing::warn!(target: "serve.lifecycle", "sd_notify READY failed: {e}");
     }
 }
 
 #[cfg(unix)]
 fn notify_stopping() {
-    let _ = crate::process::notify_systemd(b"STOPPING=1\n");
+    let _ = crate::process::systemd::notify::send(b"STOPPING=1\n");
 }
 
 #[cfg(not(unix))]

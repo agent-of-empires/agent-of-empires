@@ -25,7 +25,7 @@ pub(super) async fn push_status(state: &AppState) {
     let (r, w, i) = count_statuses(state.instances.read().await.iter().map(|inst| inst.status));
     let line = crate::process::systemd::status_line(r, w, i);
     #[cfg(unix)]
-    let _ = crate::process::notify_systemd(format!("STATUS={line}\n").as_bytes());
+    let _ = crate::process::systemd::notify::send(format!("STATUS={line}\n").as_bytes());
     #[cfg(not(unix))]
     let _ = line;
 }
