@@ -13,6 +13,7 @@ export function useSessions() {
   const [error, setError] = useState(false);
   const [loaded, setLoaded] = useState(false);
   const [appliedRead, setAppliedRead] = useState(0);
+  const lastReadRef = useRef(0);
   const intervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const lastLocalOrderingAtRef = useRef<number>(0);
 
@@ -30,6 +31,8 @@ export function useSessions() {
 
   const applyResult = useCallback((data: SessionsEnvelope | null, read: number) => {
     if (data !== null) {
+      if (read < lastReadRef.current) return;
+      lastReadRef.current = read;
       setSessions(data.sessions);
       setAppliedRead(read);
       // Ignore server ordering while a local drag's PUT may still be landing.
