@@ -461,19 +461,30 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path();
         let git = |args: &[&str]| {
-            std::process::Command::new("git")
+            let output = std::process::Command::new("git")
                 .args(args)
                 .current_dir(path)
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_SYSTEM", "/dev/null")
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .env_remove("GIT_CONFIG")
+                .env_remove("GIT_CONFIG_COUNT")
+                .env_remove("GIT_CONFIG_PARAMETERS")
+                .env("GIT_TEMPLATE_DIR", "")
                 .env("GIT_AUTHOR_NAME", "t")
                 .env("GIT_AUTHOR_EMAIL", "t@t")
                 .env("GIT_COMMITTER_NAME", "t")
                 .env("GIT_COMMITTER_EMAIL", "t@t")
                 .output()
-                .expect("run git")
+                .expect("run git");
+            assert!(
+                output.status.success(),
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            output
         };
-        if !git(&["init", "-q"]).status.success() {
-            return;
-        }
+        git(&["init", "-q"]);
         std::fs::write(path.join("f"), b"x").unwrap();
         git(&["add", "f"]);
         git(&["commit", "-qm", "c"]);
