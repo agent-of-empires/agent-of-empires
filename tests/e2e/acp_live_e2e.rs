@@ -713,8 +713,8 @@ fn wizard_created_structured_session_opens_structured_view() {
     h.type_text(project.to_str().unwrap());
     h.send_keys("Tab");
     h.type_text("wizstruct");
-    // The selector exists only when multiple tools are available.
-    if h.capture_screen().contains("Tool:") {
+    // The Tool row is focusable only when it shows a selector.
+    if h.capture_screen().contains("Tool: [") {
         h.send_keys("Tab");
     }
     h.send_keys("Tab");
