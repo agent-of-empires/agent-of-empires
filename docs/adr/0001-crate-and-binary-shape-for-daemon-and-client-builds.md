@@ -19,7 +19,7 @@ The Daemon and the Clients must build separately so a Client-only build, first t
 
 ## Considered options
 
-- **Cargo features on the single `aoe` crate.** Rejected: `src/lib.rs` declares 33 modules unconditionally and `session` is the densest edge (`session -> tmux` 314 use sites, `tmux -> session` 81 back), so a feature flag gates nothing the compiler can enforce. Each feature set also costs a full extra `target/` copy.
+- **Cargo features on the single `aoe` crate.** Rejected: `src/lib.rs` declares 29 modules unconditionally and `session` is the densest edge (`session -> tmux` 314 use sites, `tmux -> session` 81 back), so a feature flag gates nothing the compiler can enforce. Each feature set also costs a full extra `target/` copy.
 - **Git-style dispatch to external `aoe-<name>` executables.** Rejected: a large refactor for little UX gain. In-process modularity with Rust crates gives the same Client-only install without cross-executable duplication or a new process boundary.
 - **Separate bin names (`aoe`, `aoe-tui`, `aoed`).** Rejected: it breaks the single command name and the rule that `aoe` with no config on one machine keeps working. Auto-start also needs one binary: `aoe serve --daemon` re-execs the current executable.
 
