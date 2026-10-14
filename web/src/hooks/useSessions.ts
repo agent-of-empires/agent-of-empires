@@ -12,6 +12,7 @@ export function useSessions() {
   const [workspaceOrdering, setWorkspaceOrdering] = useState<string[]>([]);
   const [error, setError] = useState(false);
   const [loaded, setLoaded] = useState(false);
+  const [appliedRead, setAppliedRead] = useState(0);
   const intervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const lastLocalOrderingAtRef = useRef<number>(0);
 
@@ -29,8 +30,8 @@ export function useSessions() {
 
   const applyResult = useCallback((data: SessionsEnvelope | null, read: number) => {
     if (data !== null) {
-      markReadApplied(read);
       setSessions(data.sessions);
+      setAppliedRead(read);
       // Ignore server ordering while a local drag's PUT may still be landing.
       if (Date.now() - lastLocalOrderingAtRef.current > LOCAL_ORDERING_WINDOW_MS) {
         setWorkspaceOrdering(data.workspace_ordering);
@@ -43,6 +44,12 @@ export function useSessions() {
     }
     setLoaded(true);
   }, []);
+
+  // Published after the commit so no row sees the new ordinal beside the previous snapshot.
+  // eslint-disable-next-line react-you-might-not-need-an-effect/no-event-handler
+  useEffect(() => {
+    if (appliedRead) markReadApplied(appliedRead);
+  }, [appliedRead]);
 
   useEffect(() => {
     const poll = () => {
