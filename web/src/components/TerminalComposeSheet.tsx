@@ -19,6 +19,7 @@ interface Props {
  */
 export function TerminalComposeSheet({ draftKey, bottomInset, onSubmit, onClose }: Props) {
   const textRef = useRef<HTMLTextAreaElement>(null);
+  const dialogRef = useRef<HTMLDivElement>(null);
   const [empty, setEmpty] = useState(() => !drafts.get(draftKey)?.trim());
 
   const grow = useCallback(() => {
@@ -44,10 +45,20 @@ export function TerminalComposeSheet({ draftKey, bottomInset, onSubmit, onClose 
     onClose(true);
   };
 
-  const onKeyDown = (e: ReactKeyboardEvent<HTMLTextAreaElement>) => {
+  const onKeyDown = (e: ReactKeyboardEvent<HTMLDivElement>) => {
     if (e.key === "Escape") {
       e.preventDefault();
       onClose(false);
+    } else if (e.key === "Tab") {
+      // The terminal controls behind the sheet stay mounted, so wrap instead of leaving.
+      const items = dialogRef.current?.querySelectorAll<HTMLElement>("textarea, button:not([disabled])") ?? [];
+      const first = items[0];
+      const last = items[items.length - 1];
+      const wrapTo = e.shiftKey ? document.activeElement === first && last : document.activeElement === last && first;
+      if (wrapTo) {
+        e.preventDefault();
+        wrapTo.focus();
+      }
     } else if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) {
       e.preventDefault();
       deliver(true);
@@ -60,9 +71,11 @@ export function TerminalComposeSheet({ draftKey, bottomInset, onSubmit, onClose 
     <div className="absolute inset-x-0 top-0 z-30 flex flex-col justify-end" style={{ bottom: bottomInset }}>
       <div className="absolute inset-0 bg-black/40" onClick={() => onClose(false)} data-compose-backdrop />
       <div
+        ref={dialogRef}
         role="dialog"
         aria-modal="true"
         aria-label="Compose"
+        onKeyDown={onKeyDown}
         className="relative flex flex-col gap-2 p-2 bg-surface-900 border-t border-surface-700/40 rounded-t-lg"
       >
         <textarea
@@ -77,7 +90,6 @@ export function TerminalComposeSheet({ draftKey, bottomInset, onSubmit, onClose 
             setEmpty(!value.trim());
             grow();
           }}
-          onKeyDown={onKeyDown}
           // 16px stops iOS from zooming the page on focus.
           style={{ fontSize: "16px" }}
           className="w-full max-h-[40vh] resize-none overflow-y-auto bg-surface-950 border border-surface-700 rounded-md px-2 py-1.5 text-text-primary placeholder:text-text-dim focus:border-brand-600 focus:outline-none"

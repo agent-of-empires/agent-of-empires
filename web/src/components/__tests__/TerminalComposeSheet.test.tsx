@@ -69,4 +69,36 @@ describe("TerminalComposeSheet", () => {
     fireEvent.keyDown(sheet.text, { key: "Enter", metaKey: true });
     expect(sheet.onSubmit).toHaveBeenCalledWith("go", true);
   });
+
+  it.each([
+    ["empty", "", "Close"],
+    ["nonempty", "draft", "Send"],
+  ])("wraps Tab and Shift+Tab inside the sheet with a %s draft", (_name, draft, lastName) => {
+    const sheet = renderSheet(`wrap-${_name}`);
+    if (draft) sheet.type(draft);
+    const last = screen.getByRole("button", { name: lastName });
+
+    last.focus();
+    expect(fireEvent.keyDown(last, { key: "Tab" })).toBe(false);
+    expect(document.activeElement).toBe(sheet.text);
+
+    expect(fireEvent.keyDown(sheet.text, { key: "Tab", shiftKey: true })).toBe(false);
+    expect(document.activeElement).toBe(last);
+
+    // Mid-sheet Tab is left to the browser.
+    const close = screen.getByRole("button", { name: "Close" });
+    close.focus();
+    expect(fireEvent.keyDown(close, { key: "Tab", shiftKey: true })).toBe(true);
+  });
+
+  it("closes on Escape from every control and keeps the draft", () => {
+    const sheet = renderSheet("escape-all");
+    sheet.type("keep me");
+    for (const name of ["Close", "Insert", "Send"]) {
+      fireEvent.keyDown(screen.getByRole("button", { name }), { key: "Escape" });
+    }
+    expect(sheet.onClose.mock.calls).toEqual([[false], [false], [false]]);
+    sheet.unmount();
+    expect(renderSheet("escape-all").text.value).toBe("keep me");
+  });
 });
