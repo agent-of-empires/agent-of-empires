@@ -15,7 +15,7 @@ Today almost every mutating CLI command writes `sessions.json`, tmux, worktrees 
 - **Stays local, never auto-starts:**
   - Client assets: `theme export`, `sounds install`.
   - Files on the Daemon host: `init`, `hooks approve`. They only make sense when the Client runs on that host.
-  - Daemon and install management: `killall`, `update`, `uninstall`, `migrate`, `sandbox reclaim`, `serve`. `migrate` refuses while a Daemon runs.
+  - Daemon and install management: `killall`, `update`, `uninstall`, `migrate`, `sandbox reclaim`, `acp recover`, `serve`. `acp recover` is the operator escape hatch for when the Daemon cannot prove worker ownership, so it must not depend on that Daemon. `migrate` refuses while a Daemon runs.
   - `log-level` only changes a running Daemon, so it errors instead of starting one.
 - **Migration is per command, `add` first,** with no interim notify for commands not yet migrated. Until `add` is migrated, a request that resolves a just-added session can still 404 inside #4035's window; the Daemon's next reload restores the row but does not retry that request. The window closes once no Client writes out of band.
 - **The `aoe serve` flags stay the control surface** (`--daemon`, `--stop`, `--status`, `--restart`). `--stop` stops the Daemon only until the next Client call auto-starts it, unless `--no-autostart` is set; Workers and tmux sessions outlive it.
