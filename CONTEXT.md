@@ -1,6 +1,6 @@
 # Agent of Empires
 
-A session manager for AI coding agents. It runs many agents in parallel, each in its own persistent session, optionally on its own branch or inside a sandbox, and lets the user watch and steer them from the TUI, the web dashboard, or the CLI.
+A session manager for AI coding agents. It runs many agents in parallel, each in its own persistent Session, optionally on its own branch or inside a sandbox, and lets the user watch and steer them from the TUI, the web dashboard, or the CLI.
 
 ## Language
 
