@@ -41,7 +41,7 @@ A new Session seeded from a parent Session's Agent conversation.
 A Session with no Project. It runs in a temporary directory AoE owns.
 
 **Group**:
-A folder in the session sidebar, named by a slash-separated path. Can be collapsed or archived. Archived, Trash and Scratch are synthetic Groups.
+A named container in the session sidebar, addressed by a slash-separated path. Can be collapsed or archived. Archived, Trash and Scratch are synthetic Groups.
 _Avoid_: folder, section
 
 **Archive**:
@@ -284,7 +284,7 @@ _Avoid_: event (for this)
 ### Settings
 
 **Setting**:
-A user-facing option declared once on its config field. Every Surface derives its view of it from that declaration.
+A user-facing value declared once, in one place. Every Surface derives its view of it from that declaration.
 _Avoid_: config field, option
 
 **Repo config**:
