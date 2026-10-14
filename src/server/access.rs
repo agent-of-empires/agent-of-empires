@@ -424,7 +424,10 @@ pub(super) async fn security_headers(
     headers.insert("x-frame-options", "DENY".parse().unwrap());
     headers.insert("x-content-type-options", "nosniff".parse().unwrap());
     headers.insert("referrer-policy", "no-referrer".parse().unwrap());
-    headers.insert("content-security-policy", CSP.parse().unwrap());
+    // A handler may set a stricter policy, as the plugin page route does.
+    headers
+        .entry("content-security-policy")
+        .or_insert(CSP.parse().unwrap());
     response
 }
 

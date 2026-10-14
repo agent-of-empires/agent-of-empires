@@ -62,13 +62,16 @@ pub async fn list_plugins() -> Json<serde_json::Value> {
     }))
 }
 
-/// Resolve a plugin's declared `icon_asset` against its install directory,
-/// refusing anything outside it. Both `dir` and the joined path are
-/// canonicalized so a symlink or `..` segment cannot escape. Takes the
-/// already-loaded `dir`/`rel` rather than touching the registry, so it stays
-/// testable without a running plugin host.
-fn resolve_plugin_icon_path(dir: &std::path::Path, rel: &str) -> Option<PathBuf> {
-    if !aoe_plugin_api::screenshot_path_ok(rel) {
+/// Resolve a declared plugin file (`icon_asset`, page `entry`) against its
+/// install directory, refusing anything that fails `shape_ok` or lands outside
+/// it. Both `dir` and the joined path are canonicalized so a symlink or `..`
+/// segment cannot escape.
+fn resolve_plugin_file(
+    dir: &std::path::Path,
+    rel: &str,
+    shape_ok: fn(&str) -> bool,
+) -> Option<PathBuf> {
+    if !shape_ok(rel) {
         return None;
     }
     let root = dir.canonicalize().ok()?;
@@ -104,7 +107,10 @@ pub async fn serve_plugin_icon(Path(id): Path<String>) -> Response {
         return StatusCode::NOT_FOUND.into_response();
     };
 
-    let resolved = tokio::task::spawn_blocking(move || resolve_plugin_icon_path(&dir, &rel)).await;
+    let resolved = tokio::task::spawn_blocking(move || {
+        resolve_plugin_file(&dir, &rel, aoe_plugin_api::screenshot_path_ok)
+    })
+    .await;
     let path = match resolved {
         Ok(Some(p)) => p,
         _ => return StatusCode::NOT_FOUND.into_response(),
@@ -128,6 +134,50 @@ pub async fn serve_plugin_icon(Path(id): Path<String>) -> Response {
         bytes,
     )
         .into_response()
+}
+
+/// Plugin HTML is untrusted: opened directly it gets an opaque origin and no
+/// network, scripts or forms. The dashboard renders it in a sandboxed `srcdoc`.
+const PLUGIN_PAGE_CSP: &str = "sandbox; default-src 'none'; base-uri 'none'; \
+    form-action 'none'; frame-ancestors 'none'";
+
+fn plugin_page_response(bytes: Vec<u8>) -> Response {
+    (
+        StatusCode::OK,
+        [
+            (axum::http::header::CONTENT_TYPE, "text/html; charset=utf-8"),
+            (axum::http::header::CACHE_CONTROL, "private, no-store"),
+            (axum::http::header::CONTENT_SECURITY_POLICY, PLUGIN_PAGE_CSP),
+        ],
+        bytes,
+    )
+        .into_response()
+}
+
+/// `GET /api/plugins/{id}/pages/{page_id}`: the declared `entry` HTML of an
+/// active plugin's page. Anything undeclared, missing or escaping 404s.
+pub async fn serve_plugin_page(Path((id, page_id)): Path<(String, String)>) -> Response {
+    let registry = plugin::registry();
+    let Some(plugin) = registry.active().find(|p| p.id() == id) else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let (Some(dir), Some(rel)) = (
+        plugin.dir.clone(),
+        plugin.manifest.page_entry(&page_id).map(str::to_string),
+    ) else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let resolved = tokio::task::spawn_blocking(move || {
+        resolve_plugin_file(&dir, &rel, aoe_plugin_api::page_entry_path_ok)
+    })
+    .await;
+    let Ok(Some(path)) = resolved else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    match tokio::fs::read(&path).await {
+        Ok(bytes) => plugin_page_response(bytes),
+        Err(_) => StatusCode::NOT_FOUND.into_response(),
+    }
 }
 
 /// One active plugin command, normalized for the dashboard command palette and
@@ -176,20 +226,27 @@ pub async fn plugin_commands() -> Json<serde_json::Value> {
 }
 
 /// `GET /api/plugins/ui-state`: the plugin host's aggregated UI-state snapshot
-/// plus the notification ring. Empty when no host is running.
+/// plus the notification ring, and the pages active plugins declare. The
+/// snapshot is empty when no host is running.
 pub async fn plugin_ui_state(
     State(state): State<std::sync::Arc<AppState>>,
 ) -> Json<serde_json::Value> {
+    let pages: Vec<_> = plugin::registry()
+        .active()
+        .flat_map(|p| p.pages())
+        .collect();
     let empty = || json!({ "entries": [], "notifications": [] });
-    match state.plugin_host.as_ref().map(|h| h.ui_snapshot()) {
-        Some(snapshot) => Json(serde_json::to_value(snapshot).unwrap_or_else(|e| {
+    let mut body = match state.plugin_host.as_ref().map(|h| h.ui_snapshot()) {
+        Some(snapshot) => serde_json::to_value(snapshot).unwrap_or_else(|e| {
             // Serializing the snapshot should never fail; keep the response
             // shape stable rather than returning JSON null if it does.
             tracing::warn!(target: "serve.api", "failed to serialize plugin UI snapshot: {e}");
             empty()
-        })),
-        None => Json(empty()),
-    }
+        }),
+        None => empty(),
+    };
+    body["pages"] = json!(pages);
+    Json(body)
 }
 
 /// `GET /api/plugins/updates`: which installed external plugins have an update.
@@ -918,32 +975,70 @@ mod tests {
     }
 
     #[test]
-    fn resolve_plugin_icon_path_confines_to_the_install_dir() {
+    fn resolve_plugin_file_confines_to_the_install_dir() {
+        use aoe_plugin_api::{page_entry_path_ok, screenshot_path_ok};
         let root = tempfile::tempdir().unwrap();
         let dir = root.path().join("plugin");
-        std::fs::create_dir(&dir).unwrap();
-        for file in ["plugin/icon.png", "plugin/icon.svg", "secret.png"] {
+        std::fs::create_dir_all(dir.join("dist")).unwrap();
+        for file in [
+            "plugin/icon.png",
+            "plugin/icon.svg",
+            "plugin/dist/page.html",
+            "secret.png",
+            "secret.html",
+        ] {
             std::fs::write(root.path().join(file), b"x").unwrap();
         }
         std::os::unix::fs::symlink(root.path().join("secret.png"), dir.join("link.png")).unwrap();
+        std::os::unix::fs::symlink(root.path().join("secret.html"), dir.join("link.html")).unwrap();
+        let canon = dir.canonicalize().unwrap();
         assert_eq!(
-            resolve_plugin_icon_path(&dir, "icon.png"),
-            Some(dir.canonicalize().unwrap().join("icon.png"))
+            resolve_plugin_file(&dir, "icon.png", screenshot_path_ok),
+            Some(canon.join("icon.png"))
         );
-        // `icon.svg` exists inside but fails the shape check; `link.png` passes
-        // it and escapes through a symlink, so each guard is pinned alone.
-        for bad in [
-            "../secret.png",
-            "/etc/passwd.png",
-            "icon.svg",
-            "link.png",
-            "missing.png",
-        ] {
+        assert_eq!(
+            resolve_plugin_file(&dir, "dist/page.html", page_entry_path_ok),
+            Some(canon.join("dist/page.html"))
+        );
+        // Each bad path trips one guard alone: shape, symlink escape or absence.
+        let cases: [(&str, fn(&str) -> bool); 9] = [
+            ("../secret.png", screenshot_path_ok),
+            ("/etc/passwd.png", screenshot_path_ok),
+            ("icon.svg", screenshot_path_ok),
+            ("link.png", screenshot_path_ok),
+            ("missing.png", screenshot_path_ok),
+            ("../secret.html", page_entry_path_ok),
+            ("link.html", page_entry_path_ok),
+            ("icon.png", page_entry_path_ok),
+            ("missing.html", page_entry_path_ok),
+        ];
+        for (bad, shape_ok) in cases {
             assert!(
-                resolve_plugin_icon_path(&dir, bad).is_none(),
+                resolve_plugin_file(&dir, bad, shape_ok).is_none(),
                 "{bad:?} should not resolve"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn plugin_page_keeps_its_sandbox_csp_through_the_security_middleware() {
+        use tower::ServiceExt;
+        let app = axum::Router::new()
+            .route(
+                "/",
+                axum::routing::get(|| async { plugin_page_response(b"<p>hi</p>".to_vec()) }),
+            )
+            .layer(axum::middleware::from_fn(
+                crate::server::access::security_headers,
+            ));
+        let req = axum::http::Request::get("/")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        let header = |name| resp.headers().get(name).unwrap().to_str().unwrap();
+        assert_eq!(header("content-security-policy"), PLUGIN_PAGE_CSP);
+        assert_eq!(header("content-type"), "text/html; charset=utf-8");
+        assert_eq!(header("cache-control"), "private, no-store");
     }
 
     #[test]
