@@ -165,7 +165,12 @@ pub async fn serve_plugin_page(
     headers: axum::http::HeaderMap,
 ) -> Response {
     // Second layer behind the CSP `sandbox`: never hand executable HTML to a tab.
-    if headers.get("sec-fetch-dest").and_then(|v| v.to_str().ok()) != Some("iframe") {
+    // Browsers omit `Sec-Fetch-*` outside secure contexts (plain HTTP by LAN IP),
+    // so an absent header falls back to the sandbox alone.
+    if headers
+        .get("sec-fetch-dest")
+        .is_some_and(|v| v.as_bytes() != b"iframe")
+    {
         return api_error(
             StatusCode::FORBIDDEN,
             "frame_only",
@@ -1122,7 +1127,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn plugin_page_is_served_only_to_a_query_free_frame_load() {
+    async fn plugin_page_refuses_query_strings_and_non_frame_loads() {
         use tower::ServiceExt;
         let state = crate::server::test_support::build_test_app_state_with_policy(
             Vec::new(),
@@ -1144,7 +1149,8 @@ mod tests {
             ),
             ("", cookie, frame, StatusCode::NOT_FOUND),
             ("", cookie, Some("document"), StatusCode::FORBIDDEN),
-            ("", cookie, None, StatusCode::FORBIDDEN),
+            // Plain HTTP by LAN IP: no `Sec-Fetch-*` at all.
+            ("", cookie, None, StatusCode::NOT_FOUND),
             ("?token=wrong", None, frame, StatusCode::UNAUTHORIZED),
         ];
         for (query, cookie, dest, want) in cases {
