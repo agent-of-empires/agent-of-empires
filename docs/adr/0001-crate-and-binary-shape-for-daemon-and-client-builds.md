@@ -6,7 +6,7 @@ The Daemon and the Clients must build separately so a Client-only build, first t
 
 ## Decision
 
-- **One binary, in-process modules.** `aoe` stays a single executable. Namespaces (`serve`, the TUI, the CLI) are subcommands inside it, not external `aoe-<name>` executables found on `PATH`.
+- **One binary, in-process modules.** `aoe` stays a single executable. `serve`, the TUI (bare `aoe`) and the CLI (`aoe <options>`) are in-process modes of it, not external `aoe-<name>` executables found on `PATH`.
 - **Layout `daemon/client` and `daemon/backend`.** Following the thread on #4395, the crates are split by which side of the Daemon API they sit on:
   - `aoe-daemon-client`: the wire types and the HTTP client for the Daemon API. Every Client depends on it. It carries no `session`, `tmux`, `nix` or `axum` dependency and compiles on Windows.
   - `aoe-daemon-backend`: the Daemon itself (`aoe serve`, API, Supervisor, Workers, tmux ownership). Unix only.
