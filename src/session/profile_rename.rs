@@ -441,6 +441,15 @@ mod tests {
                 let _home = crate::session::test_support::isolate_app_dir_at(temp.path());
                 let storage = Storage::new_unwatched("before").unwrap();
                 let witness = Storage::new_unwatched("witness").unwrap();
+                let mut witness_row = Instance::new("move witness", temp.path().to_str().unwrap());
+                witness_row.id = "move-witness".into();
+                witness_row.source_profile = "witness".into();
+                witness
+                    .update(|rows, _| {
+                        rows.push(witness_row.clone());
+                        Ok(())
+                    })
+                    .unwrap();
                 let workspace = crate::session::scratch::provision_scratch_dir("renamed").unwrap();
                 std::fs::write(
                     workspace.join("retained"),
@@ -535,6 +544,55 @@ mod tests {
                         Ok(())
                     })
                     .is_err());
+                let pending_target = Storage::open_unwatched(original).unwrap();
+                let checkpoint_before = fs::read(checkpoint_path().unwrap()).unwrap();
+                let witness_before = fs::read(witness.sessions_path()).unwrap();
+                let target_before = if rowless {
+                    assert!(!pending_target.sessions_path().exists());
+                    None
+                } else {
+                    Some(fs::read(pending_target.sessions_path()).unwrap())
+                };
+                let targets = if moved {
+                    vec![&storage, &pending_target]
+                } else {
+                    vec![&storage]
+                };
+                let group_move = crate::session::GroupMovePlan::single(
+                    &witness_row.group_path,
+                    &witness_row.group_path,
+                );
+                for target in targets {
+                    assert!(witness
+                        .move_instances_to(
+                            target,
+                            &[(witness_row.clone(), witness_row.clone())],
+                            &group_move,
+                            |_, _| panic!("pending rename reached move validation"),
+                        )
+                        .is_err());
+                    assert!(witness
+                        .move_instance_to_with_effect(
+                            target,
+                            &witness_row,
+                            &witness_row,
+                            false,
+                            |_, _| panic!("pending rename reached move validation"),
+                            |_| panic!("pending rename reached external effect"),
+                        )
+                        .is_err());
+                }
+                assert_eq!(
+                    fs::read(checkpoint_path().unwrap()).unwrap(),
+                    checkpoint_before
+                );
+                assert_eq!(fs::read(witness.sessions_path()).unwrap(), witness_before);
+                match target_before {
+                    Some(bytes) => {
+                        assert_eq!(fs::read(pending_target.sessions_path()).unwrap(), bytes)
+                    }
+                    None => assert!(!pending_target.sessions_path().exists()),
+                }
                 assert_eq!(
                     crate::session::get_profile_dir_path("before")
                         .unwrap()
@@ -570,7 +628,38 @@ mod tests {
                     .unwrap();
                 assert_eq!(migrated.source_profile.as_deref(), Some(original));
                 assert_eq!(migrated.process_identity, record.process_identity);
+                assert_eq!(fs::read(witness.sessions_path()).unwrap(), witness_before);
+                let transferred = witness
+                    .move_instances_to(
+                        &target,
+                        &[(witness_row.clone(), witness_row.clone())],
+                        &group_move,
+                        |_, _| Ok(()),
+                    )
+                    .unwrap()
+                    .remove(0);
                 assert!(witness.load().unwrap().is_empty());
+                assert!(target
+                    .load()
+                    .unwrap()
+                    .iter()
+                    .any(|row| row.id == witness_row.id));
+                target
+                    .move_instance_to_with_effect(
+                        &witness,
+                        &transferred,
+                        &transferred,
+                        false,
+                        |_, _| Ok(()),
+                        |_| Ok(()),
+                    )
+                    .unwrap();
+                assert_eq!(fs::read(witness.sessions_path()).unwrap(), witness_before);
+                assert!(target
+                    .load()
+                    .unwrap()
+                    .iter()
+                    .all(|row| row.id != "move-witness"));
                 child.0.kill().unwrap();
                 child.0.wait().unwrap();
                 if !rowless {
