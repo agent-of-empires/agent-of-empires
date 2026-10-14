@@ -638,7 +638,11 @@
       "kind": "live-playwright",
       "risk": "medium",
       "specs": ["tests/live/settings-persistence.spec.ts"],
-      "components": ["web/src/components/SettingsView.tsx", "web/src/components/settings/SchemaSection.tsx"]
+      "components": [
+        "web/src/components/SettingsView.tsx",
+        "web/src/components/settings/SchemaSection.tsx",
+        "web/src/components/settings/customWidgets.tsx"
+      ]
     },
     {
       "id": "settings.tui-shortcut-bar",

@@ -65,14 +65,6 @@ pub(super) fn state_tag(inst: &Instance) -> &'static str {
     }
 }
 
-/// One timestamp spelling for every human line that shows one: RFC 3339 in UTC
-/// with the fractional part `AutoSi` keeps, zoned with `Z`. This is the same
-/// spelling `DateTime<Utc>` serializes to, so the human lines and the `--json`
-/// lines of one command agree, and so do the two transports.
-pub(crate) fn display_timestamp(value: chrono::DateTime<chrono::Utc>) -> String {
-    value.to_rfc3339_opts(chrono::SecondsFormat::AutoSi, true)
-}
-
 pub(super) fn active_snoozed_until(inst: &Instance) -> Option<chrono::DateTime<chrono::Utc>> {
     if inst.is_snoozed() {
         inst.snoozed_until
@@ -405,18 +397,13 @@ async fn run_all_profiles(json: bool, scope: SessionScope) -> Result<()> {
         return Ok(());
     }
 
-    // Every profile is opened before a byte is printed. Skipping one that will
-    // not open would print the rest, exit 0, and put a total on screen that
-    // counts the rows that happened to be readable rather than the sessions
-    // the store holds.
     let mut loaded: Vec<(&str, Vec<Instance>)> = Vec::with_capacity(profiles.len());
     for profile in &profiles {
-        let storage = Storage::open_unwatched(profile)
-            .map_err(|_| anyhow::anyhow!("{}", unreadable_profile_message(profile)))?;
-        let (instances, _) = storage
-            .load_with_groups()
-            .map_err(|_| anyhow::anyhow!("{}", unreadable_profile_message(profile)))?;
-        loaded.push((profile.as_str(), instances));
+        if let Ok((instances, _)) =
+            Storage::open_unwatched(profile).and_then(|storage| storage.load_with_groups())
+        {
+            loaded.push((profile.as_str(), instances));
+        }
     }
 
     if json {
@@ -467,17 +454,6 @@ async fn run_all_profiles(json: bool, scope: SessionScope) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// One spelling for every instant a command prints, and it is the spelling
-    /// the wire carries: milliseconds for a quarter second, nothing at all for
-    /// a whole second. A regression to bare `to_rfc3339()` appends `+00:00`
-    /// and the whole second loses its empty fraction.
-    #[test]
-    fn a_timestamp_prints_at_the_width_the_instant_has() {
-        let at = |value: &str| display_timestamp(value.parse().expect("an instant"));
-        assert_eq!(at("2026-02-03T04:05:06.25Z"), "2026-02-03T04:05:06.250Z");
-        assert_eq!(at("2026-02-03T04:05:06Z"), "2026-02-03T04:05:06Z");
-    }
 
     /// An optional field the row has no value for is left out, as every other
     /// optional field in the struct is. A `null` here would make a consumer

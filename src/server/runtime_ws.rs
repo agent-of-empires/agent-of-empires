@@ -1,9 +1,8 @@
 //! Read-only runtime read endpoint: `GET /api/runtime/read/ws`.
 //!
-//! One connection carries exactly two application frames, a Hello handshake
-//! and a Snapshot, and the server then sends a normal close. The handler only
-//! reads session, profile, group and project state; it never mutates it and
-//! never consults a client-local filesystem.
+//! One connection carries a Hello and a Snapshot. HTTP closes after sending;
+//! the local transport waits for the client's close handshake. Reads never
+//! mutate session, profile, group or project state.
 //!
 //! Authentication for the HTTP route is the router's existing credential gate, so
 //! a caller without a valid credential never reaches the upgrade. The same two
@@ -44,7 +43,7 @@ pub(crate) const NAMESPACE: &str = if cfg!(debug_assertions) {
     "release:agent-of-empires"
 };
 
-/// Bound admitted connections independently of the single-flight snapshot worker.
+/// Bound snapshot production and frame writes, not idle close handshakes.
 pub(crate) const RUNTIME_READ_CONCURRENCY: usize = 8;
 
 pub async fn runtime_ws(ws: WebSocketUpgrade, State(state): State<Arc<AppState>>) -> Response {
@@ -52,7 +51,7 @@ pub async fn runtime_ws(ws: WebSocketUpgrade, State(state): State<Arc<AppState>>
     if let Some(response) = super::api::cityhall_block(&state) {
         return response;
     }
-    // Bound the upgraded task, including a peer that stops reading.
+    // Bound the connection, including a peer that stops reading or closing.
     ws.max_message_size(MESSAGE_LIMIT)
         .max_frame_size(crate::cli::runtime_read::APPLICATION_LIMIT)
         .on_upgrade(move |socket| async move {
@@ -89,8 +88,7 @@ pub(crate) async fn serve_runtime_read_uds(
     run_read(ReadSocket::Unix(socket), state, Owner::local(uid), false).await;
 }
 
-/// One producer for both transports: same single-flight sampler, same two
-/// frames, same close. Only the socket and the declared owner differ.
+/// Both transports share snapshot production and the two application frames.
 enum ReadSocket {
     Web(WebSocket),
     #[cfg(any(target_os = "linux", test))]
@@ -186,7 +184,7 @@ async fn run_read(
     })
     .await;
 
-    let (snapshot, _admitted) = match sampled {
+    let (snapshot, admitted) = match sampled {
         Ok(sample) => sample,
         Err(error) => {
             tracing::error!(target: "runtime.ws", %error, "runtime sample task failed");
@@ -204,6 +202,7 @@ async fn run_read(
             data: &snapshot.data,
         }),
     ];
+    drop(snapshot);
     for frame in frames {
         match frame {
             Ok(encoded) => {
@@ -228,6 +227,7 @@ async fn run_read(
             }
         }
     }
+    drop(admitted);
     if close_after_frames {
         socket.close().await;
     } else {
@@ -381,7 +381,7 @@ fn publish_freshness(runtime: &RuntimeState, observed_at: DateTime<Utc>) -> (Sta
     (
         StatusFreshness::Observed {
             revision: next,
-            observed_at: crate::cli::list::display_timestamp(observed_at),
+            observed_at: wire_timestamp(observed_at),
         },
         cursor,
     )
@@ -1061,7 +1061,7 @@ impl SessionRead {
             profile: inst.source_profile.clone(),
             status: inst.status.into(),
             state: inst.effective_bucket().into(),
-            created_at: crate::cli::list::display_timestamp(inst.created_at),
+            created_at: wire_timestamp(inst.created_at),
             last_accessed_at: timestamp(inst.last_accessed_at),
             idle_entered_at: timestamp(inst.idle_entered_at),
             last_error: inst.last_error.clone(),
@@ -1092,8 +1092,12 @@ impl SessionRead {
     }
 }
 
+fn wire_timestamp(value: DateTime<Utc>) -> String {
+    value.to_rfc3339_opts(chrono::SecondsFormat::AutoSi, true)
+}
+
 fn timestamp(value: Option<DateTime<Utc>>) -> Option<String> {
-    value.map(crate::cli::list::display_timestamp)
+    value.map(wire_timestamp)
 }
 
 #[cfg(test)]
@@ -2349,30 +2353,52 @@ mod tests {
 
     #[tokio::test]
     #[serial_test::serial]
-    async fn admission_is_held_until_the_reading_peer_closes() {
+    async fn completed_responses_release_capacity_before_peer_close() {
+        async fn response(
+            peer: &mut tokio_tungstenite::WebSocketStream<UnixStream>,
+        ) -> serde_json::Value {
+            let mut snapshot = serde_json::Value::Null;
+            for expected in ["hello", "snapshot"] {
+                let frame = peer.next().await.unwrap().unwrap();
+                let value: serde_json::Value =
+                    serde_json::from_str(frame.to_text().unwrap()).unwrap();
+                assert_eq!(value["kind"], expected);
+                snapshot = value;
+            }
+            snapshot
+        }
+
         let _home = TempHome::new();
         let mut state = super::super::test_support::build_test_app_state(Vec::new());
         Arc::get_mut(&mut state).unwrap().runtime_read_semaphore =
             Arc::new(tokio::sync::Semaphore::new(1));
-        let semaphore = state.runtime_read_semaphore.clone();
-        let (socket, mut peer) = socket_pair().await;
-        let served = tokio::spawn(run_read(socket, state, Owner::remote(), false));
-        for expected in ["hello", "snapshot"] {
-            let frame = tokio::time::timeout(Duration::from_secs(5), peer.next())
-                .await
-                .unwrap()
-                .unwrap()
-                .unwrap();
-            let value: serde_json::Value = serde_json::from_str(frame.to_text().unwrap()).unwrap();
-            assert_eq!(value["kind"], expected);
-        }
-        assert_eq!(semaphore.available_permits(), 0);
-        peer.close(None).await.unwrap();
-        tokio::time::timeout(Duration::from_secs(5), served)
+        let (first_socket, mut first_peer) = socket_pair().await;
+        let first = tokio::spawn(run_read(
+            first_socket,
+            state.clone(),
+            Owner::remote(),
+            false,
+        ));
+        tokio::time::timeout(Duration::from_secs(5), response(&mut first_peer))
             .await
-            .unwrap()
             .unwrap();
-        assert_eq!(semaphore.available_permits(), 1);
+
+        let (second_socket, mut second_peer) = socket_pair().await;
+        let second = tokio::spawn(run_read(second_socket, state, Owner::remote(), false));
+        let second_response =
+            tokio::time::timeout(Duration::from_secs(5), response(&mut second_peer)).await;
+        drop(first_peer);
+        drop(second_peer);
+        tokio::time::timeout(Duration::from_secs(5), async {
+            first.await.unwrap();
+            second.await.unwrap();
+        })
+        .await
+        .unwrap();
+        assert!(
+            second_response.is_ok(),
+            "an idle close must not block the next read"
+        );
     }
 
     #[tokio::test]

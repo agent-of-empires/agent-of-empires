@@ -94,7 +94,18 @@ pub(crate) fn select_endpoint(source: &ReadRequestSource) -> Result<SelectedEndp
     let mut request = request_url
         .into_client_request()
         .map_err(|_| ReadFailure::pre("invalid_endpoint"))?;
-    let sends_credentials = source.token.is_some()
+    let token = source
+        .token
+        .as_deref()
+        .map(|value| {
+            value
+                .to_str()
+                .ok_or_else(|| ReadFailure::pre("invalid_token"))
+        })
+        .transpose()?
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let sends_credentials = token.is_some()
         || std::env::var("AOE_DAEMON_PASSPHRASE").is_ok_and(|secret| !secret.trim().is_empty());
     if !secure
         && !crate::daemon::is_loopback_host(request.uri().host().unwrap_or(""))
@@ -102,8 +113,9 @@ pub(crate) fn select_endpoint(source: &ReadRequestSource) -> Result<SelectedEndp
     {
         return Err(ReadFailure::pre("invalid_endpoint"));
     }
-    if let Some(token) = source.token.as_deref() {
-        let value = valid_token_bytes(token).ok_or_else(|| ReadFailure::pre("invalid_token"))?;
+    if let Some(token) = token {
+        let value = valid_token_bytes(OsStr::new(token))
+            .ok_or_else(|| ReadFailure::pre("invalid_token"))?;
         let value = std::str::from_utf8(value).expect("validated ASCII");
         request.headers_mut().insert(
             "Authorization",
@@ -250,7 +262,7 @@ fn valid_host(host: &str) -> bool {
             && !label.ends_with('-')
             && label
                 .bytes()
-                .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_'))
     })
 }
 
@@ -320,15 +332,31 @@ mod tests {
                 "",
                 false,
                 Some("ws://192.168.1.50:8080/api/runtime/read/ws"),
+                None,
             ),
-            ("http://192.168.1.50:8080", Some("secret"), "", false, None),
-            ("http://192.168.1.50:8080", None, "phrase", false, None),
+            (
+                "http://192.168.1.50:8080",
+                Some("secret"),
+                "",
+                false,
+                None,
+                None,
+            ),
+            (
+                "http://192.168.1.50:8080",
+                None,
+                "phrase",
+                false,
+                None,
+                None,
+            ),
             (
                 "https://example.test/base/?token=query-secret",
                 Some("env-secret"),
                 "",
                 false,
                 Some("wss://example.test/base/api/runtime/read/ws"),
+                Some("Bearer env-secret"),
             ),
             (
                 "http://localhost:8080/?token=query-secret",
@@ -336,6 +364,7 @@ mod tests {
                 "",
                 false,
                 Some("ws://localhost:8080/api/runtime/read/ws"),
+                None,
             ),
             (
                 "http://localhost:8080/?token=query-secret",
@@ -343,9 +372,42 @@ mod tests {
                 "",
                 true,
                 None,
+                None,
+            ),
+            (
+                "http://192.168.1.50:8080",
+                Some(" \t "),
+                "",
+                false,
+                Some("ws://192.168.1.50:8080/api/runtime/read/ws"),
+                None,
+            ),
+            (
+                "https://example.test",
+                Some(" \t secret \t "),
+                "",
+                false,
+                Some("wss://example.test/api/runtime/read/ws"),
+                Some("Bearer secret"),
+            ),
+            (
+                "http://api_service:8080",
+                None,
+                "",
+                false,
+                Some("ws://api_service:8080/api/runtime/read/ws"),
+                None,
+            ),
+            (
+                "https://example.test",
+                Some("bad token"),
+                "",
+                false,
+                None,
+                None,
             ),
         ];
-        for (url, token, phrase, explicit, expected) in cases {
+        for (url, token, phrase, explicit, expected, expected_header) in cases {
             let _env =
                 crate::session::test_support::EnvGuard::set(&[("AOE_DAEMON_PASSPHRASE", phrase)]);
             let source = ReadRequestSource {
@@ -366,7 +428,7 @@ mod tests {
                         .headers()
                         .get("Authorization")
                         .map(|value| value.to_str().unwrap()),
-                    token.map(|token| format!("Bearer {token}")).as_deref()
+                    expected_header
                 );
                 assert!(!request.uri().to_string().contains("query-secret"));
             } else {
@@ -428,10 +490,9 @@ mod tests {
     }
 
     #[test]
-    fn token_is_not_trimmed_and_enforces_ascii_delimiters() {
+    fn raw_token_bytes_reject_unsafe_delimiters_and_oversized_values() {
         assert!(valid_token_bytes(OsStr::new("abc")).is_some());
-        assert!(valid_token_bytes(OsStr::new(" abc")).is_none());
-        assert!(valid_token_bytes(OsStr::new("abc ")).is_none());
+        assert!(valid_token_bytes(OsStr::new("a b")).is_none());
         assert!(valid_token_bytes(OsStr::new("a\"b")).is_none());
         assert!(valid_token_bytes(OsStr::new("a\\b")).is_none());
         assert!(valid_token_bytes(OsStr::new("é")).is_none());

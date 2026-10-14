@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::fmt::Write as _;
 use std::path::Path;
 
 use serde::Serialize;
@@ -148,7 +149,9 @@ fn render_list(
 ) -> Result<Projection, ReadFailure> {
     let state = args.state;
     if args.all {
-        require_list_all_health(snapshot)?;
+        if !component_healthy(&snapshot.health.global_enumeration) {
+            return Err(unreadable("The profile registry"));
+        }
         // Local empty-inventory output precedes JSON formatting.
         if !snapshot.profiles.iter().any(|profile| profile.listed) {
             return Ok(Projection::text("No profiles found.\n".into()));
@@ -156,7 +159,11 @@ fn render_list(
         if args.json {
             let systemd_active = local_peer && list::systemd_scopes_active();
             let mut rows = Vec::new();
-            for profile in snapshot.profiles.iter().filter(|profile| profile.listed) {
+            for profile in snapshot
+                .profiles
+                .iter()
+                .filter(|profile| profile.listed && profile_sessions_healthy(profile))
+            {
                 for session in sessions_for_profile(snapshot, &profile.name)
                     .filter(|session| matches_state(session.state, state))
                 {
@@ -168,7 +175,11 @@ fn render_list(
         let show_state = state == StateFilter::All;
         let mut output = String::new();
         let mut total = 0usize;
-        for profile in snapshot.profiles.iter().filter(|profile| profile.listed) {
+        for profile in snapshot
+            .profiles
+            .iter()
+            .filter(|profile| profile.listed && profile_sessions_healthy(profile))
+        {
             let sessions: Vec<&SessionRead> = sessions_for_profile(snapshot, &profile.name)
                 .filter(|session| matches_state(session.state, state))
                 .collect();
@@ -467,22 +478,29 @@ fn render_show(
         session.command,
         session.status.as_str()
     );
-    match session.state {
-        WireState::Live => {}
-        WireState::Archived => output.push_str(&format!(
-            "  State:   archived ({})\n",
+    let timestamp = match session.state {
+        WireState::Live => None,
+        WireState::Archived => Some(
             session
                 .archived_at
                 .as_deref()
-                .expect("validated archived timestamp")
-        )),
-        WireState::Trashed => output.push_str(&format!(
-            "  State:   trashed ({})\n",
+                .expect("validated archived timestamp"),
+        ),
+        WireState::Trashed => Some(
             session
                 .trashed_at
                 .as_deref()
-                .expect("validated trashed timestamp")
-        )),
+                .expect("validated trashed timestamp"),
+        ),
+    };
+    if let Some(timestamp) = timestamp {
+        let timestamp = wire_instant_at(timestamp)?;
+        let _ = writeln!(
+            output,
+            "  State:   {} ({})",
+            session.state.as_str(),
+            timestamp.format("%+")
+        );
     }
     output.push_str(&format!("  Profile: {profile_name}\n"));
     if let Some(parent_id) = &session.parent_session_id {
@@ -607,15 +625,19 @@ fn render_trash(
     }
     let mut output = format!("Trashed sessions in profile '{profile_name}':\n");
     for session in sessions {
-        output.push_str(&format!(
-            "  {}  {}  (trashed {})\n",
-            session.id,
-            session.title,
+        let timestamp = wire_instant_at(
             session
                 .trashed_at
                 .as_deref()
-                .expect("validated trashed timestamp")
-        ));
+                .expect("validated trashed timestamp"),
+        )?;
+        let _ = writeln!(
+            output,
+            "  {}  {}  (trashed {})",
+            session.id,
+            session.title,
+            timestamp.format("%+")
+        );
     }
     Ok(output)
 }
@@ -856,21 +878,9 @@ fn unreadable(component: &str) -> ReadFailure {
     )
 }
 
-/// `aoe list --all` prints every session in every profile, so one profile that
-/// will not open makes the count a lie. The name that comes back is the first
-/// such profile, which is the one the operator has to look at.
-fn require_list_all_health(snapshot: &SnapshotData) -> Result<(), ReadFailure> {
-    if !component_healthy(&snapshot.health.global_enumeration) {
-        return Err(unreadable("The profile registry"));
-    }
-    for profile in snapshot.profiles.iter().filter(|profile| profile.listed) {
-        if !profile_component_healthy(&profile.health.profile_enumeration)
-            || !profile_component_healthy(&profile.health.profile_data)
-        {
-            return Err(profile_unreadable(&profile.name));
-        }
-    }
-    Ok(())
+fn profile_sessions_healthy(profile: &ProfileRead) -> bool {
+    profile_component_healthy(&profile.health.profile_enumeration)
+        && profile_component_healthy(&profile.health.profile_data)
 }
 
 /// Session projections require the profile inventory, groups and cached sessions.
@@ -882,9 +892,7 @@ fn require_selected_profile_health(
     if !component_healthy(&snapshot.health.global_enumeration) {
         return Err(unreadable("The profile registry"));
     }
-    if !profile_component_healthy(&profile.health.profile_enumeration)
-        || !profile_component_healthy(&profile.health.profile_data)
-    {
+    if !profile_sessions_healthy(profile) {
         return Err(profile_unreadable(display_name));
     }
     Ok(())
@@ -1082,19 +1090,33 @@ mod tests {
         }
     }
     #[test]
-    fn status_json_is_exact_compact_shape() {
+    fn status_flags_preserve_json_then_quiet_then_verbose_precedence() {
+        use clap::Parser;
         let value = snapshot(vec![
             session("a", WireStatus::Waiting),
             session("b", WireStatus::Creating),
         ]);
-        let args = crate::cli::status::StatusArgs::test_json();
-        let output = render_status(&args, &value, &source(), None)
-            .unwrap()
-            .stdout;
-        assert_eq!(
-            output,
-            "{\"waiting\":1,\"running\":0,\"idle\":0,\"stopped\":0,\"error\":0,\"total\":2}\n"
-        );
+        let cases: [(&[&str], bool); 3] = [
+            (&["aoe", "status", "--json", "-q", "-v"], true),
+            (&["aoe", "status", "-q", "-v"], false),
+            (&["aoe", "status", "--json", "-v"], true),
+        ];
+        let expected = serde_json::json!({
+            "waiting": 1, "running": 0, "idle": 0, "stopped": 0, "error": 0, "total": 2
+        });
+        for (argv, json) in cases {
+            let cli = crate::cli::Cli::try_parse_from(argv).unwrap();
+            let command = super::super::classify(cli.command.as_ref()).unwrap();
+            let output = evaluate(&command, &value, &source(), None).unwrap().stdout;
+            if json {
+                assert_eq!(
+                    serde_json::from_str::<serde_json::Value>(&output).unwrap(),
+                    expected
+                );
+            } else {
+                assert_eq!(output.trim().parse::<usize>().unwrap(), 1);
+            }
+        }
     }
     /// The human `Status:` line and the machine JSON disagree on purpose: one
     /// is read by a person, the other by a script that has always seen the
@@ -1801,10 +1823,11 @@ mod tests {
             };
             value.health.profiles = BTreeMap::from([(name.into(), value.profiles[0].health)]);
             super::super::dto::validate_snapshot(&value).unwrap();
-            let refusal = crate::cli::runtime_read::ReadOutcome::from(
-                render_list(&args, &value, &source(), false).unwrap_err(),
+            let listed = render_list(&args, &value, &source(), false).unwrap();
+            assert_eq!(
+                serde_json::from_str::<serde_json::Value>(&listed.stdout).unwrap(),
+                serde_json::json!([])
             );
-            assert!(refusal.stderr.unwrap().contains(name));
             assert!(render_profiles(&value).unwrap().contains(name));
             let mut selected = source();
             let expected = crate::session::validate_profile_name(name)

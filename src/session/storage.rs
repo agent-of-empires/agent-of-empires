@@ -322,8 +322,14 @@ where
 
 /// Missing or blank registries are empty; unreadable and nonregular paths are errors.
 fn read_nonempty(path: &Path) -> Result<Option<String>> {
-    use std::io::Read;
-    let mut file = match crate::process::open_read_nonblocking(path) {
+    open_regular_registry(path)?
+        .map(read_registry_file)
+        .transpose()
+        .map(Option::flatten)
+}
+
+fn open_regular_registry(path: &Path) -> Result<Option<fs::File>> {
+    let file = match crate::process::open_read_nonblocking(path) {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(error.into()),
         Ok(file) => file,
@@ -331,10 +337,11 @@ fn read_nonempty(path: &Path) -> Result<Option<String>> {
     if !file.metadata()?.is_file() {
         anyhow::bail!("{} is not a regular file", path.display());
     }
-    #[cfg(test)]
-    if let Some(replace) = tests::AFTER_REGISTRY_METADATA.with(|hook| hook.borrow_mut().take()) {
-        replace();
-    }
+    Ok(Some(file))
+}
+
+fn read_registry_file(mut file: fs::File) -> Result<Option<String>> {
+    use std::io::Read;
     let mut content = String::new();
     file.read_to_string(&mut content)?;
     if content.trim().is_empty() {
@@ -2684,27 +2691,18 @@ mod tests {
     use serial_test::serial;
     use tempfile::tempdir;
 
-    thread_local! {
-        pub(super) static AFTER_REGISTRY_METADATA: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
-            const { std::cell::RefCell::new(None) };
-    }
-
     #[test]
     fn registry_read_keeps_validated_file_after_path_replacement() {
         let root = tempdir().unwrap();
         for name in ["sessions.json", "groups.json"] {
             let path = root.path().join(name);
             fs::write(&path, "original registry").unwrap();
-            let replaced = path.clone();
-            AFTER_REGISTRY_METADATA.with(|hook| {
-                *hook.borrow_mut() = Some(Box::new(move || {
-                    let replacement = replaced.with_extension("replacement");
-                    fs::write(&replacement, "replacement registry").unwrap();
-                    fs::rename(replacement, replaced).unwrap();
-                }));
-            });
+            let file = open_regular_registry(&path).unwrap().unwrap();
+            let replacement = path.with_extension("replacement");
+            fs::write(&replacement, "replacement registry").unwrap();
+            fs::rename(replacement, &path).unwrap();
             assert_eq!(
-                read_nonempty(&path).unwrap().as_deref(),
+                read_registry_file(file).unwrap().as_deref(),
                 Some("original registry")
             );
             assert_eq!(fs::read_to_string(&path).unwrap(), "replacement registry");

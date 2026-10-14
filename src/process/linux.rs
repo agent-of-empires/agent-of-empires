@@ -468,7 +468,6 @@ pub(crate) mod runtime_io {
     use std::io::{self, Write};
     use std::mem::MaybeUninit;
     use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
-    use std::os::unix::ffi::OsStrExt;
     use std::path::{Path, PathBuf};
 
     pub(crate) const REGULAR: u32 = libc::S_IFREG;
@@ -521,25 +520,27 @@ pub(crate) mod runtime_io {
     fn name(value: &str) -> io::Result<CString> {
         CString::new(value).map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))
     }
-    pub(crate) fn open_directory(path: &Path) -> io::Result<OwnedFd> {
-        let path = CString::new(path.as_os_str().as_bytes())
-            .map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
-        owned(unsafe {
-            libc::open(
-                path.as_ptr(),
-                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-            )
-        })
+    #[derive(Clone, Copy)]
+    pub(crate) enum DirectoryAccess {
+        Search,
+        Read,
+    }
+
+    pub(crate) fn open_directory(path: &Path, access: DirectoryAccess) -> io::Result<OwnedFd> {
+        use nix::NixPath;
+        path.with_nix_path(|path| open_directory_at(libc::AT_FDCWD, path, access))?
     }
     pub(crate) fn open_directory_at(
         dir: RawFd,
         name: &CStr,
-        nofollow: bool,
+        access: DirectoryAccess,
     ) -> io::Result<OwnedFd> {
-        let flags = libc::O_RDONLY
-            | libc::O_DIRECTORY
+        let flags = libc::O_DIRECTORY
             | libc::O_CLOEXEC
-            | if nofollow { libc::O_NOFOLLOW } else { 0 };
+            | match access {
+                DirectoryAccess::Search => libc::O_PATH,
+                DirectoryAccess::Read => libc::O_RDONLY,
+            };
         owned(unsafe { libc::openat(dir, name.as_ptr(), flags) })
     }
     pub(crate) fn open_readonly_at(dir: RawFd, name: &CStr) -> io::Result<File> {
@@ -689,7 +690,7 @@ pub(crate) mod runtime_io {
         })
     }
     pub(crate) fn boot_id() -> Option<String> {
-        super::boot_id()
+        super::boot_id().filter(|value| valid_boot_id(value))
     }
     pub(crate) enum ProcessStart {
         Ticks(String),
@@ -733,6 +734,50 @@ pub(crate) mod runtime_io {
         Some(format!("linux:v1:{boot}:{ticks}"))
     }
 
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(crate) enum ProcessIdentityState {
+        Live,
+        Dead,
+        Unprovable,
+    }
+
+    fn valid_boot_id(value: &str) -> bool {
+        value.len() == 36
+            && value.bytes().enumerate().all(|(index, byte)| match index {
+                8 | 13 | 18 | 23 => byte == b'-',
+                _ => byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte),
+            })
+    }
+
+    fn parse_process_identity(value: &str) -> Option<(&str, &str)> {
+        let (boot, ticks) = value.strip_prefix("linux:v1:")?.split_once(':')?;
+        (valid_boot_id(boot)
+            && !ticks.is_empty()
+            && ticks.bytes().all(|byte| byte.is_ascii_digit()))
+        .then_some((boot, ticks))
+    }
+
+    pub(crate) fn valid_process_start_identity(value: &str) -> bool {
+        parse_process_identity(value).is_some()
+    }
+
+    pub(crate) fn process_identity_state(pid: u32, recorded: &str) -> ProcessIdentityState {
+        let Some((recorded_boot, recorded_ticks)) = parse_process_identity(recorded) else {
+            return ProcessIdentityState::Unprovable;
+        };
+        let Some(boot) = boot_id() else {
+            return ProcessIdentityState::Unprovable;
+        };
+        if boot != recorded_boot {
+            return ProcessIdentityState::Dead;
+        }
+        match process_start_ticks(pid) {
+            ProcessStart::Ticks(ticks) if ticks == recorded_ticks => ProcessIdentityState::Live,
+            ProcessStart::Ticks(_) | ProcessStart::Absent => ProcessIdentityState::Dead,
+            ProcessStart::Unprovable => ProcessIdentityState::Unprovable,
+        }
+    }
+
     #[derive(Debug, PartialEq, Eq)]
     pub(crate) enum AclError {
         NamedWrite,
@@ -748,9 +793,18 @@ pub(crate) mod runtime_io {
     pub(crate) const ACL_OTHER: u8 = 0x20;
     pub(crate) const ACL_WRITE: u8 = 0x02;
     pub(crate) const ACL_PERMISSION_MASK: u8 = 0x07;
-    pub(crate) fn validate_posix_acl(fd: RawFd) -> Result<(), AclError> {
+    pub(crate) fn validate_posix_acl(fd: RawFd, access: DirectoryAccess) -> Result<(), AclError> {
         let name = c"system.posix_acl_access";
-        let needed = unsafe { libc::fgetxattr(fd, name.as_ptr(), std::ptr::null_mut(), 0) };
+        // O_PATH needs a pathname operation, anchored to the retained descriptor.
+        let path =
+            matches!(access, DirectoryAccess::Search).then(|| format!("/proc/self/fd/{fd}\0"));
+        let read = |buffer: *mut libc::c_void, length: usize| unsafe {
+            match &path {
+                Some(path) => libc::getxattr(path.as_ptr().cast(), name.as_ptr(), buffer, length),
+                None => libc::fgetxattr(fd, name.as_ptr(), buffer, length),
+            }
+        };
+        let needed = read(std::ptr::null_mut(), 0);
         if needed < 0 {
             return match io::Error::last_os_error().raw_os_error() {
                 Some(libc::ENODATA | libc::ENOTSUP) => Ok(()),
@@ -758,8 +812,7 @@ pub(crate) mod runtime_io {
             };
         }
         let mut value = vec![0u8; needed as usize];
-        let actual =
-            unsafe { libc::fgetxattr(fd, name.as_ptr(), value.as_mut_ptr().cast(), value.len()) };
+        let actual = read(value.as_mut_ptr().cast(), value.len());
         if actual < 0 {
             return Err(AclError::Unverifiable);
         }
@@ -797,6 +850,8 @@ pub(crate) mod runtime_io {
 
     #[cfg(test)]
     pub(crate) fn set_acl(dir: &Path, value: &[u8]) {
+        use std::os::unix::ffi::OsStrExt;
+
         let path = CString::new(dir.as_os_str().as_bytes()).expect("path");
         let name = c"system.posix_acl_access";
         let result = unsafe {
@@ -864,5 +919,59 @@ pub(crate) mod runtime_io {
             unsafe { libc::umask(self.previous) };
             crate::test_env_lock::release_env_lock(self.env_lock.is_some());
         }
+    }
+}
+
+#[cfg(test)]
+mod runtime_identity_tests {
+    use super::runtime_io::*;
+
+    #[test]
+    #[serial_test::serial]
+    fn process_identities_distinguish_live_dead_and_unprovable() {
+        let pid = std::process::id();
+        let live = process_start_identity(pid).expect("current process identity");
+        assert!(valid_process_start_identity(&live));
+        assert_eq!(
+            process_identity_state(pid, &live),
+            ProcessIdentityState::Live
+        );
+
+        let (prefix, ticks) = live.rsplit_once(':').unwrap();
+        let other_ticks = if ticks == "0" { "1" } else { "0" };
+        assert_eq!(
+            process_identity_state(pid, &format!("{prefix}:{other_ticks}")),
+            ProcessIdentityState::Dead
+        );
+        let mut other_boot = boot_id().unwrap();
+        let first = if other_boot.starts_with('0') {
+            "1"
+        } else {
+            "0"
+        };
+        other_boot.replace_range(..1, first);
+        assert_eq!(
+            process_identity_state(pid, &format!("linux:v1:{other_boot}:1")),
+            ProcessIdentityState::Dead
+        );
+        for invalid in [
+            format!("darwin:v1:{other_boot}:1"),
+            format!("linux:v2:{other_boot}:1"),
+            format!("linux:v1:{other_boot}:123 "),
+            format!("linux:v1:{other_boot}:١"),
+            "linux:v1:AAAAAAAA-BBBB-CCCC-DDDD-EEEEEEEEEEEE:1".into(),
+            String::new(),
+        ] {
+            assert_eq!(
+                process_identity_state(pid, &invalid),
+                ProcessIdentityState::Unprovable,
+                "{invalid:?}"
+            );
+        }
+        fail_next_proc_read();
+        assert_eq!(
+            process_identity_state(pid, &live),
+            ProcessIdentityState::Unprovable
+        );
     }
 }

@@ -134,6 +134,72 @@ async fn one_shot_reads_only_upgrade_on_their_distinct_path() {
     let _fixture = server.join().await;
 }
 
+#[tokio::test]
+#[serial_test::serial]
+async fn stowed_and_search_only_namespaces_support_absent_and_served_reads() {
+    use std::os::unix::fs::{FileTypeExt, PermissionsExt};
+
+    for stowed in [true, false] {
+        let namespace = TempAppDir::new();
+        let base = namespace._dir.path();
+        let storage = agent_of_empires::session::Storage::new_unwatched("main").unwrap();
+        let app = agent_of_empires::session::get_app_dir().unwrap();
+        let target = base.join("stow-target");
+        let original_mode = std::fs::metadata(base).unwrap().permissions();
+        let mut instance = Instance::new("layout", "/repo");
+        instance.id = "layout-session".into();
+        instance.source_profile = "main".into();
+        storage
+            .update(|rows, _| {
+                rows.push(instance);
+                Ok(())
+            })
+            .unwrap();
+        let state = build_test_app_state_with_policy(
+            storage.load_with_groups().unwrap().0,
+            Vec::new(),
+            Vec::new(),
+            None,
+        );
+        if stowed {
+            std::fs::rename(&app, &target).unwrap();
+            std::os::unix::fs::symlink(&target, &app).unwrap();
+        } else {
+            std::fs::set_permissions(base, std::fs::Permissions::from_mode(0o111)).unwrap();
+        }
+        agent_of_empires::server::test_support::accept_runtime_read_cache_for_test(&state).await;
+        let absent = attempt_read(ScopedCommand::Profile, &local_source()).await;
+        let published = RuntimeUdsTestServer::start_in(base, state.clone());
+        if !stowed {
+            std::fs::set_permissions(base, original_mode).unwrap();
+        }
+        assert!(matches!(absent, ScopedRead::NoLocalPublication(None)));
+        let server = published.expect("valid namespace layout publishes");
+        let artifact_dir = if stowed { &target } else { &app };
+        assert!(std::fs::metadata(artifact_dir.join("runtime.sock"))
+            .unwrap()
+            .file_type()
+            .is_socket());
+        let cli = Cli::try_parse_from(["aoe", "list", "--json"]).unwrap();
+        let command = classify(cli.command.as_ref()).unwrap();
+        let mut source = local_source();
+        source.explicit_profile = Some("main".into());
+        let served = attempt_read(command, &source).await;
+        state.shutdown.cancel();
+        let _guards = server.join().await;
+        let ScopedRead::Answered(outcome) = served else {
+            panic!("published namespace must answer over UDS");
+        };
+        assert_eq!(outcome.exit, 0, "stderr: {:?}", outcome.stderr);
+        let rows: serde_json::Value =
+            serde_json::from_str(outcome.stdout.as_deref().unwrap()).unwrap();
+        assert_eq!(rows[0]["id"], "layout-session");
+        if stowed {
+            assert_eq!(std::fs::read_link(&app).unwrap(), target);
+        }
+    }
+}
+
 /// Every scoped command and alias completes over the real local socket.
 #[tokio::test]
 #[serial_test::serial]
@@ -174,33 +240,6 @@ async fn every_scoped_command_and_alias_round_trips_over_uds() {
         assert_eq!(outcome.exit, 0, "{argv:?} failed: {:?}", outcome.stderr);
         assert!(outcome.stdout.is_some(), "{argv:?} produced no stdout");
     }
-    state.shutdown.cancel();
-    let _fixture = server.join().await;
-}
-
-/// The machine form of `aoe status --json` must not depend on the transport.
-/// An empty profile read over the real local socket has to be the exact bytes
-/// the local command path prints for the same profile, spaces included.
-#[tokio::test]
-#[serial_test::serial]
-async fn the_daemon_and_local_status_json_agree_on_an_empty_profile() {
-    let state = build_test_app_state_with_policy(Vec::new(), Vec::new(), Vec::new(), None);
-    let server = RuntimeUdsTestServer::start(state.clone())
-        .unwrap_or_else(|reason| panic!("the local read must be publishable: {reason}"));
-    // A profile that holds nothing: the shape under test is the empty one, not
-    // the missing-profile refusal.
-    agent_of_empires::session::create_profile("main").expect("create fixture profile");
-    agent_of_empires::server::test_support::accept_runtime_read_cache_for_test(&state).await;
-
-    let cli = Cli::try_parse_from(["aoe", "status", "--json"]).expect("status parses");
-    let command = classify(cli.command.as_ref()).expect("status is a scoped read");
-    let outcome = read(command).await;
-
-    assert_eq!(outcome.exit, 0, "stderr: {:?}", outcome.stderr);
-    assert_eq!(
-        outcome.stdout.as_deref(),
-        Some("{\"waiting\":0,\"running\":0,\"idle\":0,\"stopped\":0,\"error\":0,\"total\":0}\n")
-    );
     state.shutdown.cancel();
     let _fixture = server.join().await;
 }

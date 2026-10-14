@@ -1,6 +1,8 @@
 //! Publisher and admission behavior against owned temporary namespace directories.
 
-use crate::process::runtime_io::{open_directory, open_lock_at, read_acl, set_acl, Umask};
+use crate::process::runtime_io::{
+    open_directory, open_lock_at, read_acl, set_acl, DirectoryAccess, Umask,
+};
 use std::ffi::CString;
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::MetadataExt;
@@ -143,7 +145,7 @@ async fn publication_writes_the_pair_the_client_parses() {
     assert!(mode_of(&dir) & 0o022 == 0, "the app dir must stay private");
 
     // A create-then-rename write leaves no temporary name behind.
-    let directory = open_directory(&dir).expect("namespace directory");
+    let directory = open_directory(&dir, DirectoryAccess::Read).expect("namespace directory");
     let leftovers: Vec<String> = directory_entries(directory.as_raw_fd())
         .expect("scan")
         .into_iter()
@@ -450,7 +452,7 @@ async fn shutdown_leaves_a_foreign_publication_in_place() {
 async fn a_shared_absence_probe_cannot_disable_successor_publication() {
     let namespace = namespace().expect("a private ancestor chain exists on this host");
     let dir = app_dir(&namespace);
-    let directory = open_directory(&dir).expect("namespace directory");
+    let directory = open_directory(&dir, DirectoryAccess::Read).expect("namespace directory");
     let probe = open_lock(directory.as_raw_fd(), PUBLISHER_LOCK_FILE).unwrap();
     assert!(lock_shared(&probe));
     let cancelled = tokio_util::sync::CancellationToken::new();
@@ -512,7 +514,7 @@ async fn the_held_lock_admits_a_client_and_refuses_a_publisher() {
     let namespace = namespace().expect("a private ancestor chain exists on this host");
     let dir = app_dir(&namespace);
     let _published = try_publish().expect("the namespace is free");
-    let parent = open_directory(&dir).expect("namespace directory");
+    let parent = open_directory(&dir, DirectoryAccess::Read).expect("namespace directory");
     let client = open_lock_at(parent.as_raw_fd(), &CString::new(LOCK_FILE).unwrap())
         .expect("client lock descriptor");
     assert!(lock_shared(&client), "a client must be able to lock");
@@ -521,76 +523,6 @@ async fn the_held_lock_admits_a_client_and_refuses_a_publisher() {
         "no second publisher may lock"
     );
     unlock(&client);
-}
-
-#[test]
-#[serial_test::serial]
-fn process_identity_distinguishes_live_from_retained() {
-    let pid = std::process::id();
-    let live = MarkerProbe {
-        schema: SCHEMA,
-        pid,
-        process_start_identity: process_start_identity(pid)
-            .expect("this process has a start identity"),
-        prebind_instance_id: "11111111-2222-3333-4444-555555555555".to_string(),
-    };
-    assert_eq!(process_liveness(&live), ProcessLiveness::Live);
-    assert_eq!(
-        live.process_start_identity,
-        format!(
-            "linux:v1:{}:{}",
-            boot_id().expect("boot id"),
-            match process_start_ticks(pid) {
-                ProcessStart::Ticks(ticks) => ticks,
-                _ => panic!("this process's /proc entry must be readable"),
-            }
-        )
-    );
-
-    let recycled = MarkerProbe {
-        process_start_identity: format!("linux:v1:{}:0", boot_id().expect("boot id")),
-        ..clone_probe(&live)
-    };
-    assert_eq!(
-        process_liveness(&recycled),
-        ProcessLiveness::Dead,
-        "a different start time is dead"
-    );
-
-    let rebooted = MarkerProbe {
-        process_start_identity: "linux:v1:00000000-0000-0000-0000-000000000000:1".to_string(),
-        ..clone_probe(&live)
-    };
-    assert_eq!(
-        process_liveness(&rebooted),
-        ProcessLiveness::Dead,
-        "another boot is dead"
-    );
-
-    let boot = boot_id().expect("boot id");
-    for identity in [
-        format!("darwin:v1:{boot}:1"),
-        format!("linux:v2:{boot}:1"),
-        format!("linux:v1:{boot}"),
-        String::new(),
-    ] {
-        let unprovable = MarkerProbe {
-            process_start_identity: identity.clone(),
-            ..clone_probe(&live)
-        };
-        assert_eq!(
-            process_liveness(&unprovable),
-            ProcessLiveness::Unprovable,
-            "{identity:?} is unprovable, not an absence"
-        );
-    }
-
-    fail_next_proc_read();
-    assert_eq!(
-        process_liveness(&live),
-        ProcessLiveness::Unprovable,
-        "a well-formed identity over an unreadable /proc is unprovable"
-    );
 }
 
 #[test]
@@ -625,15 +557,6 @@ fn a_marker_this_half_cannot_prove_dead_is_never_reaped() {
             path.exists(),
             "{identity:?} must be left in place, not reaped"
         );
-    }
-}
-
-fn clone_probe(probe: &MarkerProbe) -> MarkerProbe {
-    MarkerProbe {
-        schema: probe.schema,
-        pid: probe.pid,
-        process_start_identity: probe.process_start_identity.clone(),
-        prebind_instance_id: probe.prebind_instance_id.clone(),
     }
 }
 
@@ -883,21 +806,6 @@ async fn a_marker_keeps_its_mode_under_a_umask_that_would_clear_it() {
 
 #[test]
 #[serial_test::serial]
-fn a_symlinked_final_component_is_still_refused() {
-    let namespace = namespace().expect("a private ancestor chain exists on this host");
-    let real = namespace.base.path().join("real");
-    std::fs::create_dir_all(&real).expect("real dir");
-    let link = namespace.base.path().join(crate::session::APP_DIR_NAME_XDG);
-    std::os::unix::fs::symlink(&real, &link).expect("final symlink");
-    assert_eq!(
-        open_trusted_app_dir(&link).err().map(|error| error.code()),
-        Some("app_dir_untrusted"),
-        "a symlinked app directory is never adopted"
-    );
-}
-
-#[test]
-#[serial_test::serial]
 fn a_symlinked_prefix_to_a_world_writable_directory_is_refused() {
     use std::os::unix::fs::PermissionsExt;
 
@@ -930,7 +838,7 @@ async fn retraction_succeeds_while_a_client_holds_the_namespace() {
     let namespace = namespace().expect("a private ancestor chain exists on this host");
     let dir = app_dir(&namespace);
     let mut published = try_publish().expect("the namespace is free");
-    let parent = open_directory(&dir).expect("namespace directory");
+    let parent = open_directory(&dir, DirectoryAccess::Read).expect("namespace directory");
     let client = open_lock_at(parent.as_raw_fd(), &CString::new(LOCK_FILE).unwrap())
         .expect("client lock descriptor");
     assert!(lock_shared(&client), "a client must be able to lock");

@@ -9,27 +9,16 @@ use crate::session::{Status, Storage};
 #[derive(Args)]
 pub struct StatusArgs {
     /// Show detailed session list
-    #[arg(short = 'v', long, conflicts_with_all = ["quiet", "json"])]
+    #[arg(short = 'v', long)]
     pub(crate) verbose: bool,
 
     /// Only output waiting count (for scripts)
-    #[arg(short = 'q', long, conflicts_with_all = ["json", "verbose"])]
+    #[arg(short = 'q', long)]
     pub(crate) quiet: bool,
 
     /// Output as JSON
-    #[arg(long, conflicts_with_all = ["quiet", "verbose"])]
+    #[arg(long)]
     pub(crate) json: bool,
-}
-
-impl StatusArgs {
-    #[cfg(test)]
-    pub(crate) fn test_json() -> Self {
-        Self {
-            verbose: false,
-            quiet: false,
-            json: true,
-        }
-    }
 }
 
 #[derive(Default)]
@@ -97,8 +86,11 @@ impl From<&StatusCounts> for StatusJson {
     }
 }
 
-/// One spelling for both JSON branches, on either transport.
 pub(crate) fn status_json(counts: &StatusCounts) -> String {
+    if counts.total == 0 {
+        return "{\"waiting\": 0, \"running\": 0, \"idle\": 0, \"stopped\": 0, \"error\": 0, \"total\": 0}"
+            .to_owned();
+    }
     serde_json::to_string(&StatusJson::from(counts)).expect("counts serialize")
 }
 

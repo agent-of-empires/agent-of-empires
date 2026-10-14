@@ -177,7 +177,9 @@ Run without arguments to launch the TUI dashboard.
 ###### **Options:**
 
 * `-p`, `--profile <PROFILE>` — Profile to use (separate workspace with its own sessions). Commands that consume or create profile state require an existing profile: an unknown name is refused, not created (make one with `aoe profile create`). Profile-independent commands such as `list --all` and `serve --stop` ignore it. `AGENT_OF_EMPIRES_PROFILE` names one too, and an explicit `-p` wins over it
-* `--daemon-url <DAEMON_URL>` — Use the daemon for `list`, `status`, `session show`, `session list-trash`, `group list`, `profile`, and `project list`, or attach the TUI to it. For these read-only CLI commands, `--daemon-url` requires a served answer and never falls back. `AOE_DAEMON_URL` selects the same endpoint, but an absent peer falls back to the local store with a notice on stderr after at most one second of TCP discovery. Once connected, authentication and exchange failures never fall back. The whole served exchange has a 15-second deadline. Authenticate with `AOE_DAEMON_TOKEN` or `AOE_DAEMON_PASSPHRASE`; an unauthenticated daemon needs neither. Passphrase sessions are cached using the same login and device binding as the ACP client. Loopback login bypasses proxies and pins localhost to IPv4/IPv6 loopback. Other plaintext hosts require no credential; use HTTPS for remote auth. Environment URLs discard query parameters; they do not supply tokens. Without an HTTP endpoint, Linux uses an admitted local daemon socket when published, otherwise the local store. Other platforms use the local store. A served view can omit an unknown agent_session_id. TUI session-list authentication supports bearer tokens only; an unauthenticated daemon needs no credential. Ancillary plugin UI requests can use ACP passphrase auth
+* `--daemon-url <DAEMON_URL>` — Select a daemon endpoint for read-only CLI commands or the TUI
+
+   Explicit CLI endpoints never fall back. `AOE_DAEMON_URL` discovery may fall back to local storage before reaching a TCP peer, with a notice. Authenticate CLI reads with `AOE_DAEMON_TOKEN` or `AOE_DAEMON_PASSPHRASE`; TUI session lists support bearer tokens only. An unauthenticated daemon needs neither. See the HTTP API reference for transport and fallback rules.
 
 
 
@@ -359,7 +361,7 @@ Send a message to a running agent session
 
 Show session status summary
 
-`--verbose`, `--quiet` and `--json` each replace the default summary instead of composing with it, so they exclude one another.
+JSON takes precedence over quiet, which takes precedence over verbose.
 
 **Usage:** `aoe status [OPTIONS]`
 

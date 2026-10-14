@@ -21,11 +21,11 @@ use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 use super::runtime_ws;
 use super::runtime_ws::{CONNECTION_BUDGET, MESSAGE_LIMIT};
 use super::AppState;
-#[cfg(test)]
-use crate::process::runtime_io::fail_next_proc_read;
 use crate::process::runtime_io::{
-    self as os, boot_id, process_start_identity, process_start_ticks, ProcessStart,
+    self as os, process_identity_state, process_start_identity, ProcessIdentityState,
 };
+#[cfg(test)]
+use crate::process::runtime_io::{boot_id, fail_next_proc_read};
 
 pub(crate) const LOCK_FILE: &str = "lifetime.lock";
 pub(crate) const PUBLISHER_LOCK_FILE: &str = "publisher.lock";
@@ -33,13 +33,13 @@ pub(crate) const PREBIND_FILE: &str = "runtime.prebind.json";
 pub(crate) const POSTBIND_FILE: &str = "runtime.postbind.json";
 pub(crate) const SOCKET_FILE: &str = "runtime.sock";
 
-/// Marker schema version. The client refuses anything else, and imports this
-/// constant rather than spelling the number a second time.
+/// Marker schema shared with the client.
 pub(crate) const SCHEMA: u8 = 1;
 /// Temporary marker suffix, followed by the prebind instance id.
 pub(crate) const TEMPORARY_SEPARATOR: &str = ".tmp.";
-/// Backoff after an accept error, so a failing accept cannot spin the loop.
+pub(crate) const MARKER_LIMIT: u64 = 64 * 1024;
 const ACCEPT_BACKOFF: Duration = Duration::from_millis(50);
+const MAX_ACCEPT_BACKOFF: Duration = Duration::from_secs(1);
 const FRAME_LIMIT: usize = MESSAGE_LIMIT;
 
 /// Why a daemon could not publish. Each code is a distinct operator-visible
@@ -373,11 +373,13 @@ fn write_markers(
 
 /// Serve the local read until the daemon shuts down, then retract.
 pub(crate) async fn serve(state: Arc<AppState>, mut published: PublishedRuntime) {
+    let mut accept_backoff = ACCEPT_BACKOFF;
     loop {
         tokio::select! {
             _ = state.shutdown.cancelled() => break,
             accepted = published.listener.accept() => match accepted {
                 Ok((stream, _)) => {
+                    accept_backoff = ACCEPT_BACKOFF;
                     let state = state.clone();
                     crate::task_util::spawn_supervised(
                         "runtime.uds.connection",
@@ -387,7 +389,11 @@ pub(crate) async fn serve(state: Arc<AppState>, mut published: PublishedRuntime)
                 }
                 Err(error) => {
                     tracing::warn!(target: "runtime.uds", %error, "local runtime read accept failed");
-                    tokio::time::sleep(ACCEPT_BACKOFF).await;
+                    tokio::select! {
+                        _ = state.shutdown.cancelled() => break,
+                        _ = tokio::time::sleep(accept_backoff) => {}
+                    }
+                    accept_backoff = accept_backoff.saturating_mul(2).min(MAX_ACCEPT_BACKOFF);
                 }
             },
         }
@@ -475,7 +481,9 @@ fn reap_retained_state(dir: RawFd) -> Result<(), PublishError> {
         let Some(probe) = read_probe(dir, name)? else {
             continue;
         };
-        if process_liveness(&probe) != ProcessLiveness::Dead {
+        if process_identity_state(probe.pid, &probe.process_start_identity)
+            != ProcessIdentityState::Dead
+        {
             return Err(if probe.schema == SCHEMA {
                 PublishError::new(
                     "namespace_busy",
@@ -528,14 +536,21 @@ fn temporary_is_live(dir: RawFd, name: &str) -> Result<bool, PublishError> {
         }
     };
     let mut bytes = Vec::new();
-    if let Err(error) = file.read_to_end(&mut bytes) {
+    if let Err(error) = (&mut file).take(MARKER_LIMIT + 1).read_to_end(&mut bytes) {
         return Err(PublishError::new(
             "namespace_busy",
             format!("{name} could not be read: {error}"),
         ));
     }
-    Ok(serde_json::from_slice::<MarkerProbe>(&bytes)
-        .is_ok_and(|probe| !matches!(process_liveness(&probe), ProcessLiveness::Dead)))
+    if bytes.len() > MARKER_LIMIT as usize {
+        return Ok(false);
+    }
+    Ok(
+        serde_json::from_slice::<MarkerProbe>(&bytes).is_ok_and(|probe| {
+            process_identity_state(probe.pid, &probe.process_start_identity)
+                != ProcessIdentityState::Dead
+        }),
+    )
 }
 
 /// Every runtime artifact in the directory, temporary names included.
@@ -660,8 +675,16 @@ fn read_probe(dir: RawFd, name: &str) -> Result<Option<MarkerProbe>, PublishErro
     let mut file = os::open_readonly_at(dir, &entry)
         .map_err(|error| PublishError::new("marker_foreign", error.to_string()))?;
     let mut bytes = Vec::new();
-    file.read_to_end(&mut bytes)
+    (&mut file)
+        .take(MARKER_LIMIT + 1)
+        .read_to_end(&mut bytes)
         .map_err(|error| PublishError::new("marker_foreign", error.to_string()))?;
+    if bytes.len() > MARKER_LIMIT as usize {
+        return Err(PublishError::new(
+            "marker_foreign",
+            format!("{name} exceeds the marker limit"),
+        ));
+    }
     Ok(Some(serde_json::from_slice(&bytes).map_err(|error| {
         PublishError::new("marker_foreign", error.to_string())
     })?))
@@ -693,45 +716,6 @@ fn sync_dir(dir: RawFd) {
 fn anchored_child_path(dir: RawFd, child: &str) -> Result<PathBuf, PublishError> {
     os::anchored_path(dir, child)
         .map_err(|error| PublishError::new("anchored_alias_unavailable", error.to_string()))
-}
-
-/// Only a proven-dead writer permits reaping retained artifacts.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ProcessLiveness {
-    #[cfg(target_os = "linux")]
-    Live,
-    Dead,
-    Unprovable,
-}
-
-/// Whether the process that wrote a retained marker is still running. A marker
-/// from a boot that has ended, or a pid that has been recycled, is dead.
-#[cfg(target_os = "linux")]
-fn process_liveness(probe: &MarkerProbe) -> ProcessLiveness {
-    if !crate::cli::runtime_read::uds::valid_process_identity(&probe.process_start_identity) {
-        return ProcessLiveness::Unprovable;
-    }
-    let Some(rest) = probe.process_start_identity.strip_prefix("linux:v1:") else {
-        return ProcessLiveness::Unprovable;
-    };
-    let Some((recorded_boot, recorded_start)) = rest.split_once(':') else {
-        return ProcessLiveness::Unprovable;
-    };
-    let Some(boot) = boot_id() else {
-        // Without a boot id nothing can be proven dead, so fail closed.
-        return ProcessLiveness::Unprovable;
-    };
-    if boot != recorded_boot {
-        return ProcessLiveness::Dead;
-    }
-    match process_start_ticks(probe.pid) {
-        ProcessStart::Ticks(start) if start == recorded_start => ProcessLiveness::Live,
-        ProcessStart::Ticks(_) => ProcessLiveness::Dead,
-        // Only a proven-absent process is reaped.
-        ProcessStart::Absent => ProcessLiveness::Dead,
-        // Unreadable process state cannot authorize replacing a possibly-live publication.
-        ProcessStart::Unprovable => ProcessLiveness::Unprovable,
-    }
 }
 
 #[cfg(all(test, target_os = "linux"))]

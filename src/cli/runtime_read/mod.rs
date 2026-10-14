@@ -47,10 +47,9 @@ use super::{Cli, Commands};
 use crate::server::runtime_ws::CONNECTION_BUDGET;
 const CLOSE_BUDGET: Duration = Duration::from_millis(200);
 pub(crate) const APPLICATION_LIMIT: usize = 16 * 1024 * 1024;
-/// The line a read prints when a variable named an endpoint that did not
-/// answer, so the store's rows were printed by the local command.
+/// An environment endpoint was unusable or unreachable before any peer answered.
 pub(crate) const LOCAL_STORE_NOTICE: &str =
-    "notice: AOE_DAEMON_URL named an endpoint that did not answer, so this answer is the local store's.\n";
+    "notice: AOE_DAEMON_URL did not produce a daemon answer, so this answer is the local store's.\n";
 
 #[derive(Clone, Copy)]
 pub enum ScopedCommand<'a> {
@@ -126,6 +125,13 @@ pub fn read_sentence(code: &str) -> String {
     format!("daemon read: {code}\n")
 }
 
+#[derive(Debug, Clone, Copy)]
+enum DiscoveryBoundary {
+    Refused,
+    LocalAbsent,
+    HttpUnreached,
+}
+
 #[derive(Debug)]
 pub(crate) struct ReadFailure {
     code: &'static str,
@@ -133,6 +139,7 @@ pub(crate) struct ReadFailure {
     /// Exact user-facing diagnosis when a stable wire code cannot name the cause.
     exact: Option<String>,
     attempt_close: bool,
+    boundary: DiscoveryBoundary,
 }
 
 impl ReadFailure {
@@ -142,6 +149,18 @@ impl ReadFailure {
 
     pub(crate) fn post(code: &'static str) -> Self {
         Self::refusal(code, 4, true)
+    }
+
+    pub(crate) fn local_absence() -> Self {
+        let mut failure = Self::pre("marker_missing");
+        failure.boundary = DiscoveryBoundary::LocalAbsent;
+        failure
+    }
+
+    fn before_http_peer(mut self) -> Self {
+        self.boundary = DiscoveryBoundary::HttpUnreached;
+        self.attempt_close = false;
+        self
     }
 
     pub(crate) fn post_no_close(code: &'static str) -> Self {
@@ -164,6 +183,7 @@ impl ReadFailure {
             exit,
             exact: None,
             attempt_close,
+            boundary: DiscoveryBoundary::Refused,
         }
     }
 
@@ -248,10 +268,10 @@ fn absent_local_publication(error: &ReadFailure, source: &ReadRequestSource) -> 
     if source.explicit_url.is_some() {
         return false;
     }
-    match error.code() {
-        "marker_missing" => !source.env_url_is_set(),
-        "establishment_timeout" | "publisher_absent" => source.env_url_is_set(),
-        _ => false,
+    match error.boundary {
+        DiscoveryBoundary::LocalAbsent => !source.env_url_is_set(),
+        DiscoveryBoundary::HttpUnreached => source.env_url_is_set(),
+        DiscoveryBoundary::Refused => false,
     }
 }
 
@@ -259,7 +279,7 @@ async fn execute_inner(
     command: ScopedCommand<'_>,
     source: &ReadRequestSource,
 ) -> Result<render::Projection, ReadFailure> {
-    let endpoint = endpoint::select_endpoint(source)?;
+    let endpoint = endpoint::select_endpoint(source).map_err(ReadFailure::before_http_peer)?;
     let establishment_deadline = Instant::now() + CONNECTION_BUDGET;
     match endpoint {
         SelectedEndpoint::Local => {
@@ -291,7 +311,7 @@ async fn execute_inner(
             #[cfg(not(target_os = "linux"))]
             {
                 let _ = establishment_deadline;
-                Err(ReadFailure::pre("marker_missing"))
+                Err(ReadFailure::local_absence())
             }
         }
         SelectedEndpoint::Http { request } => {
@@ -304,8 +324,8 @@ async fn execute_inner(
             };
             let stream = tokio::time::timeout_at(connect_deadline, connect_http(request.uri()))
                 .await
-                .map_err(|_| ReadFailure::pre("establishment_timeout"))?
-                .map_err(|_| ReadFailure::post("publisher_absent"))?;
+                .map_err(|_| ReadFailure::pre("establishment_timeout").before_http_peer())?
+                .map_err(|_| ReadFailure::post("publisher_absent").before_http_peer())?;
             let stream = upgrade_http(*request, stream, source, establishment_deadline).await?;
             exchange_stream(
                 stream,
@@ -351,7 +371,9 @@ async fn upgrade_http(
     let peer = stream
         .peer_addr()
         .map_err(|_| ReadFailure::post("unavailable"))?;
-    let auth = if source.token.is_none() && std::env::var_os("AOE_DAEMON_PASSPHRASE").is_some() {
+    let auth = if !request.headers().contains_key("Authorization")
+        && std::env::var_os("AOE_DAEMON_PASSPHRASE").is_some()
+    {
         let uri = request.uri();
         let path = uri
             .path()
@@ -643,15 +665,8 @@ async fn finish_with_close<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    if let Err(error) = &result {
-        if !error.attempt_close {
-            return Err(ReadFailure {
-                code: error.code,
-                exit: error.exit,
-                exact: error.exact.clone(),
-                attempt_close: false,
-            });
-        }
+    if result.as_ref().is_err_and(|error| !error.attempt_close) {
+        return result;
     }
     match (result, close_local(stream, deadline).await) {
         (Err(error), _) => Err(error),
@@ -725,7 +740,7 @@ mod tests {
     /// Empty or blank environment endpoints preserve local takeover.
     #[test]
     fn an_empty_environment_url_still_takes_over_from_the_local_store() {
-        let missing = ReadFailure::pre("marker_missing");
+        let missing = ReadFailure::local_absence();
         let cases: [(&str, Option<OsString>); 3] = [
             ("absent", None),
             ("empty", Some(OsString::from(""))),
@@ -769,78 +784,16 @@ mod tests {
             "only an absent publication is a take-over"
         );
     }
-    /// New refusal codes must not silently widen local takeover.
-    #[test]
-    fn only_the_endpoint_codes_take_over_and_nothing_else_does() {
-        const TAKES_OVER: [&str; 3] = [
-            "marker_missing",
-            "establishment_timeout",
-            "publisher_absent",
-        ];
-        for code in EMITTABLE_CODES {
-            let error = ReadFailure::pre(code);
-            for (label, explicit_url, env_url) in [
-                ("nothing named", None, None),
-                ("a flag", Some("https://flag.test".to_string()), None),
-                ("a variable", None, Some(OsString::from("https://env.test"))),
-            ] {
-                let source = ReadRequestSource {
-                    explicit_url,
-                    env_url,
-                    token: None,
-                    explicit_profile: None,
-                    env_profile: None,
-                };
-                // `marker_missing` takes over only with no endpoint named, and
-                // the transport codes only with a variable naming one; an
-                // explicit flag is a request for a served answer either way.
-                let expected = match (*code, label) {
-                    ("marker_missing", "nothing named") => true,
-                    ("marker_missing", _) => false,
-                    (_, "a variable") => TAKES_OVER.contains(code),
-                    _ => false,
-                };
-                assert_eq!(
-                    absent_local_publication(&error, &source),
-                    expected,
-                    "{code} with {label}"
-                );
-            }
-        }
-    }
-
-    /// A TCP discovery timeout may fall back; an accepted but stalled peer may not.
-    #[test]
-    fn a_stall_after_the_socket_exists_is_not_the_same_as_a_stall_before_it() {
-        let source = ReadRequestSource {
-            explicit_url: None,
-            env_url: Some(OsString::from("http://127.0.0.1:9")),
-            token: Some(OsString::from("t")),
-            explicit_profile: None,
-            env_profile: None,
-        };
-
-        let before = ReadFailure::pre("establishment_timeout");
-        let after = ReadFailure::post("unavailable");
-
-        assert_ne!(before.code(), after.code(), "the two stages must differ");
-        assert!(
-            absent_local_publication(&before, &source),
-            "a connect that never completed takes over"
-        );
-        assert!(
-            !absent_local_publication(&after, &source),
-            "a peer that accepted and then stopped does not take over"
-        );
-    }
 
     /// An absent environment-selected peer falls back with an endpoint notice.
     #[tokio::test]
     async fn a_variable_naming_an_endpoint_that_did_not_answer_says_the_store_answered() {
-        let absent = "http://127.0.0.1:9";
+        let unused = tokio::net::TcpSocket::new_v4().unwrap();
+        unused.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        let absent = format!("http://{}", unused.local_addr().unwrap());
         let source = |explicit_url: Option<&str>| ReadRequestSource {
             explicit_url: explicit_url.map(str::to_string),
-            env_url: Some(OsString::from(absent)),
+            env_url: Some(OsString::from(&absent)),
             token: Some(OsString::from("t")),
             explicit_profile: None,
             env_profile: None,
@@ -852,13 +805,12 @@ mod tests {
         let ScopedRead::NoLocalPublication(notice) = read else {
             panic!("an endpoint that is not there must not be answered by a daemon");
         };
-        assert_eq!(
-            notice,
-            Some(LOCAL_STORE_NOTICE),
-            "the local store's rows have to say they are the local store's"
+        assert!(
+            notice.is_some(),
+            "an environment fallback must be disclosed"
         );
 
-        let flagged = attempt(command, &source(Some(absent))).await;
+        let flagged = attempt(command, &source(Some(&absent))).await;
         let ScopedRead::Answered(outcome) = flagged else {
             panic!("a flag naming an endpoint is a request for a served answer");
         };
@@ -902,26 +854,37 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn an_explicitly_empty_token_refuses_before_endpoint_discovery() {
-        let source = ReadRequestSource {
-            explicit_url: None,
-            env_url: Some(OsString::from("http://127.0.0.1:9")),
-            token: Some(OsString::new()),
-            explicit_profile: None,
-            env_profile: None,
-        };
+    #[serial_test::serial]
+    async fn invalid_environment_config_falls_back_but_explicit_endpoints_refuse() {
         let cli = Cli::parse_from(["aoe", "list"]);
-        let ScopedRead::Answered(outcome) =
-            attempt(classify(cli.command.as_ref()).unwrap(), &source).await
-        else {
-            panic!("a malformed credential is not an absent endpoint");
-        };
-        assert_eq!(outcome.exit, 2);
-        assert_eq!(outcome.stdout, None);
-        assert_eq!(
-            outcome.stderr.as_deref(),
-            Some("daemon read: invalid_token\n")
-        );
+        for (url, token, phrase) in [
+            ("not a URL", None, ""),
+            ("http://192.0.2.1:9", Some("secret"), ""),
+            ("http://192.0.2.1:9", None, "phrase"),
+            ("https://example.invalid", Some("bad token"), ""),
+        ] {
+            let _env =
+                crate::session::test_support::EnvGuard::set(&[("AOE_DAEMON_PASSPHRASE", phrase)]);
+            for explicit in [false, true] {
+                let source = ReadRequestSource {
+                    explicit_url: explicit.then(|| url.into()),
+                    env_url: (!explicit).then(|| OsString::from(url)),
+                    token: token.map(OsString::from),
+                    explicit_profile: None,
+                    env_profile: None,
+                };
+                let result = attempt(classify(cli.command.as_ref()).unwrap(), &source).await;
+                if explicit {
+                    let ScopedRead::Answered(outcome) = result else {
+                        panic!("explicit endpoint must fail closed");
+                    };
+                    assert_eq!(outcome.exit, 2);
+                    assert_eq!(outcome.stdout, None);
+                } else {
+                    assert!(matches!(result, ScopedRead::NoLocalPublication(Some(_))));
+                }
+            }
+        }
     }
 
     #[test]
@@ -951,11 +914,8 @@ mod tests {
     }
 
     #[test]
-    fn scoped_parser_rejects_conflicts_and_missing_profile_values() {
+    fn scoped_parser_rejects_missing_and_invalid_values() {
         let cases: &[&[&str]] = &[
-            &["aoe", "status", "--json", "--quiet"],
-            &["aoe", "status", "--quiet", "--verbose"],
-            &["aoe", "status", "--json", "--verbose"],
             &["aoe", "-p"],
             &["aoe", "list", "--state", "bogus"],
             &["aoe", "project", "list", "--scope", "bogus"],

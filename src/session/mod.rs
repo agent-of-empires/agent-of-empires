@@ -378,30 +378,6 @@ pub fn list_profiles() -> Result<Vec<String>> {
     list_profile_names_in(&profiles_dir)
 }
 
-/// [`list_profiles`] without the `get_app_dir` auto-create, for callers that must
-/// stay side-effect free. Enumeration failures surface as `Err` rather than an
-/// empty list, so the caller can degrade health instead of reporting "no profiles".
-pub fn list_profiles_readonly() -> Result<Vec<String>> {
-    let profiles_dir = get_app_dir_path()?.join("profiles");
-    // Absent is legitimately empty. Present but not a directory is a broken
-    // app dir, and reporting it as "no profiles" would give every read that
-    // depends on the inventory a clean answer about a state that is not
-    // clean, so it surfaces as an error and the caller degrades health.
-    match std::fs::metadata(&profiles_dir) {
-        Ok(metadata) if !metadata.is_dir() => {
-            anyhow::bail!(
-                "Profiles path is not a directory: {}",
-                profiles_dir.display()
-            );
-        }
-        Ok(_) => list_profile_names_in(&profiles_dir),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
-        Err(error) => {
-            Err(anyhow::Error::new(error).context(format!("read {}", profiles_dir.display())))
-        }
-    }
-}
-
 /// Picker order: alphabetical, with a profile named `default` last. One
 /// comparator for every surface a human chooses from, so the served renderer
 /// and the local command cannot drift apart on which row is listed where.
@@ -1429,30 +1405,6 @@ mod tests {
         assert!(
             !dir.join("profiles").join("deleted-profile").exists(),
             "stale default_profile must not be silently revived on disk",
-        );
-    }
-
-    /// Missing profile inventories are empty; non-directory inventories are errors.
-    #[test]
-    #[serial_test::serial]
-    fn readonly_enumeration_separates_a_missing_directory_from_a_broken_one() {
-        let temp = isolate_app_dir();
-        let dir = app_dir(&temp);
-        std::fs::remove_dir_all(dir.join("profiles")).ok();
-
-        assert_eq!(
-            list_profiles_readonly().unwrap(),
-            Vec::<String>::new(),
-            "an absent profiles directory is legitimately empty"
-        );
-        std::fs::create_dir_all(dir.join("profiles").join("alpha")).unwrap();
-        assert_eq!(list_profiles_readonly().unwrap(), vec!["alpha".to_string()]);
-        std::fs::remove_dir_all(dir.join("profiles")).unwrap();
-        std::fs::write(dir.join("profiles"), b"not a directory").unwrap();
-        let error = list_profiles_readonly().expect_err("a broken app dir is not healthy");
-        assert!(
-            error.to_string().contains("not a directory"),
-            "unexpected message: {error}"
         );
     }
 

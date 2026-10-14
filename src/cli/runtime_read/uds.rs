@@ -1,4 +1,4 @@
-use std::ffi::{CString, OsStr};
+use std::ffi::CString;
 use std::fs::File;
 use std::io::Read;
 use std::os::fd::{AsRawFd, OwnedFd, RawFd};
@@ -12,18 +12,19 @@ use tokio::time::Instant;
 
 use super::dto::{valid_namespace, valid_uuid};
 use super::ReadFailure;
-use crate::process::runtime_io::{self as os, validate_posix_acl, AclError};
+use crate::process::runtime_io::{
+    self as os, valid_process_start_identity, validate_posix_acl, AclError, ProcessIdentityState,
+};
 #[cfg(test)]
 use crate::process::runtime_io::{
     validate_acl_value, ACL_GROUP, ACL_GROUP_OBJ, ACL_MASK, ACL_OTHER, ACL_USER, ACL_USER_OBJ,
     ACL_VERSION,
 };
 use crate::server::runtime_uds::{
-    is_temporary_of, LOCK_FILE, POSTBIND_FILE, PREBIND_FILE, PUBLISHER_LOCK_FILE, SCHEMA,
-    SOCKET_FILE, TEMPORARY_SEPARATOR,
+    is_temporary_of, LOCK_FILE, MARKER_LIMIT, POSTBIND_FILE, PREBIND_FILE, PUBLISHER_LOCK_FILE,
+    SCHEMA, SOCKET_FILE, TEMPORARY_SEPARATOR,
 };
 
-const MARKER_LIMIT: u64 = 64 * 1024;
 /// Backoff avoids spinning within the bounded publication-establishment budget.
 const RETRY_INTERVAL: Duration = Duration::from_millis(50);
 
@@ -226,7 +227,7 @@ async fn wait_for_retry(establishment_deadline: Instant) -> Result<(), ()> {
 
 fn trusted_path_failure(error: TrustedPathError) -> ReadFailure {
     match error {
-        TrustedPathError::Missing => ReadFailure::pre("marker_missing"),
+        TrustedPathError::Missing => ReadFailure::local_absence(),
         TrustedPathError::Invalid => ReadFailure::pre("marker_invalid"),
         TrustedPathError::Refused(component) => {
             ReadFailure::pre_exact("marker_invalid", component.message())
@@ -337,32 +338,26 @@ fn walk_directory(path: &Path, euid: u32, admission: bool) -> Result<OwnedFd, Tr
     if admission {
         validate_directory_stat(&root, euid, false, true, Path::new("/"))?;
     }
-    let components: Vec<CString> = path
-        .components()
-        .skip(1)
-        .map(|component| {
-            let component = component.as_os_str();
-            CString::new(component.as_bytes()).map_err(|_| TrustedPathError::Invalid)
-        })
-        .collect::<Result<_, _>>()?;
-    if components.is_empty() {
+    let mut components = path.components().skip(1).peekable();
+    if components.peek().is_none() {
         return Err(TrustedPathError::Invalid);
     }
 
     let mut current = root;
-    let count = components.len();
     // Keep the encountered spelling for actionable refusals.
     let mut walked = PathBuf::from("/");
-    for (index, component) in components.into_iter().enumerate() {
-        let final_component = index + 1 == count;
-        walked.push(Path::new(OsStr::from_bytes(component.as_bytes())));
+    while let Some(component) = components.next() {
+        let final_component = components.peek().is_none();
+        walked.push(component.as_os_str());
+        let component = CString::new(component.as_os_str().as_bytes())
+            .map_err(|_| TrustedPathError::Invalid)?;
         // A missing ancestor is namespace absence; other open failures remain refusals.
         let next =
             open_dir_at(current.as_raw_fd(), &component, final_component).map_err(|error| {
                 if error.kind() == std::io::ErrorKind::NotFound {
                     TrustedPathError::Missing
                 } else {
-                    unopenable_component(&walked, &error)
+                    unopenable_component(&walked, &error, final_component)
                 }
             })?;
         // Connection trust is checked on opened objects, never on their pathnames.
@@ -374,20 +369,27 @@ fn walk_directory(path: &Path, euid: u32, admission: bool) -> Result<OwnedFd, Tr
     Ok(current)
 }
 
-/// Refuse an existing path component with an actionable repair.
-fn unopenable_component(path: &Path, error: &std::io::Error) -> TrustedPathError {
+fn unopenable_component(
+    path: &Path,
+    error: &std::io::Error,
+    final_component: bool,
+) -> TrustedPathError {
     let (cause, remedy) = match os::directory_open_failure(error) {
         os::DirectoryOpenFailure::Symlink => (
-            "a symlink, and the app directory may not be one",
-            "rm {path} && mkdir -p {path}",
+            "part of a symlink loop",
+            "Inspect the symlink chain at {path}; select a directory without a symlink loop.",
         ),
         os::DirectoryOpenFailure::NotDirectory => (
             "not a directory, where the walk needs one",
-            "rm {path} && mkdir -p {path}",
+            "Inspect the existing path at {path}; select a directory without removing configuration.",
         ),
         os::DirectoryOpenFailure::Permission => (
-            "not readable or searchable by this user",
-            "chmod u+rwx {path}",
+            if final_component {
+                "not readable or searchable by this user"
+            } else {
+                "not searchable by this user"
+            },
+            "Ask its owner to grant the required access, or select an accessible HOME/XDG_CONFIG_HOME.",
         ),
         os::DirectoryOpenFailure::Other => (
             "not a directory this user may open",
@@ -402,7 +404,7 @@ fn unopenable_component(path: &Path, error: &std::io::Error) -> TrustedPathError
 }
 
 fn open_dir(path: &Path) -> Result<OwnedFd, TrustedPathError> {
-    os::open_directory(path).map_err(|_| TrustedPathError::Invalid)
+    os::open_directory(path, os::DirectoryAccess::Search).map_err(|_| TrustedPathError::Invalid)
 }
 
 fn open_dir_at(
@@ -410,7 +412,12 @@ fn open_dir_at(
     component: &CString,
     final_component: bool,
 ) -> std::io::Result<OwnedFd> {
-    os::open_directory_at(parent, component, final_component)
+    let access = if final_component {
+        os::DirectoryAccess::Read
+    } else {
+        os::DirectoryAccess::Search
+    };
+    os::open_directory_at(parent, component, access)
 }
 
 fn validate_directory_owner(
@@ -467,7 +474,7 @@ fn validate_directory_stat(
             path,
             mode,
             "not a directory",
-            "rm {path} && mkdir -p {path}",
+            "Inspect the existing path at {path}; select a directory without removing configuration.",
         )));
     }
     if !group_other_writes_allowed(&stat, final_component) {
@@ -481,8 +488,12 @@ fn validate_directory_stat(
     if root_check {
         validate_directory_owner(&stat, euid, final_component, path)?;
     }
-    // Distinguish a named write from an ACL that cannot be verified.
-    validate_posix_acl(file.as_raw_fd()).map_err(|cause| {
+    let access = if final_component {
+        os::DirectoryAccess::Read
+    } else {
+        os::DirectoryAccess::Search
+    };
+    validate_posix_acl(file.as_raw_fd(), access).map_err(|cause| {
         let message = match cause {
             AclError::NamedWrite => {
                 "carrying a POSIX ACL that grants a named user or group write access"
@@ -557,7 +568,8 @@ async fn connect_admission(
     let Some(postbind) = postbind else {
         // A pending owner is not absence, including while it waits for old readers.
         if let Some(prebind) = &prebind {
-            if let ProcessState::Dead = process_state(prebind.pid, &prebind.process_start_identity)?
+            if os::process_identity_state(prebind.pid, &prebind.process_start_identity)
+                == ProcessIdentityState::Dead
             {
                 return Err(absent_publication(dir, euid));
             }
@@ -577,9 +589,10 @@ async fn connect_admission(
         }
     }
     // Dead markers are absence only when no successor owns publication.
-    match process_state(postbind.pid, &postbind.process_start_identity)? {
-        ProcessState::Live => {}
-        ProcessState::Dead => return Err(absent_publication(dir, euid)),
+    match os::process_identity_state(postbind.pid, &postbind.process_start_identity) {
+        ProcessIdentityState::Live => {}
+        ProcessIdentityState::Dead => return Err(absent_publication(dir, euid)),
+        ProcessIdentityState::Unprovable => return Err(ReadFailure::pre("marker_identity")),
     }
     validate_socket_entry(dir, &postbind, euid)?;
 
@@ -605,7 +618,7 @@ async fn connect_admission(
 }
 fn absent_publication(dir: RawFd, euid: u32) -> ReadFailure {
     match publisher_is_active(dir, euid) {
-        Ok(false) => ReadFailure::pre("marker_missing"),
+        Ok(false) => ReadFailure::local_absence(),
         Ok(true) => ReadFailure::pre("marker_identity"),
         Err(error) => error,
     }
@@ -640,12 +653,14 @@ fn runtime_entry_present(dir: RawFd) -> bool {
 /// Unsupported schemas are absent; invalid identities or namespaces remain refusals.
 fn validate_prebind(marker: &PrebindMarker, namespace: &str) -> Result<(), ReadFailure> {
     if marker.schema != SCHEMA {
-        return Err(ReadFailure::pre("marker_missing"));
+        return Err(ReadFailure::local_absence());
     }
     if !valid_uuid(&marker.prebind_instance_id) || !valid_namespace(&marker.namespace) {
         return Err(ReadFailure::pre("marker_invalid"));
     }
-    if marker.namespace != namespace || !valid_process_identity(&marker.process_start_identity) {
+    if marker.namespace != namespace
+        || !valid_process_start_identity(&marker.process_start_identity)
+    {
         return Err(ReadFailure::pre("marker_identity"));
     }
     Ok(())
@@ -653,7 +668,7 @@ fn validate_prebind(marker: &PrebindMarker, namespace: &str) -> Result<(), ReadF
 
 fn validate_postbind(marker: &PostbindMarker, namespace: &str) -> Result<(), ReadFailure> {
     if marker.schema != SCHEMA {
-        return Err(ReadFailure::pre("marker_missing"));
+        return Err(ReadFailure::local_absence());
     }
     if !valid_uuid(&marker.prebind_instance_id)
         || !valid_uuid(&marker.runtime_instance_id)
@@ -665,7 +680,7 @@ fn validate_postbind(marker: &PostbindMarker, namespace: &str) -> Result<(), Rea
     if marker.namespace != namespace
         || marker.socket_path != SOCKET_FILE
         || marker.owner_uid != crate::process::effective_uid()
-        || !valid_process_identity(&marker.process_start_identity)
+        || !valid_process_start_identity(&marker.process_start_identity)
     {
         return Err(ReadFailure::pre("marker_identity"));
     }
@@ -756,9 +771,7 @@ fn inspect_temporary_markers(dir: RawFd) -> Result<(), ReadFailure> {
             return Err(ReadFailure::pre("marker_invalid"));
         }
         // Unprovable liveness is not absence.
-        if !valid_process_identity(&process_identity)
-            || process_state(pid, &process_identity)? != ProcessState::Dead
-        {
+        if os::process_identity_state(pid, &process_identity) != ProcessIdentityState::Dead {
             return Err(ReadFailure::pre("marker_identity"));
         }
     }
@@ -945,61 +958,6 @@ fn socket_stat(stat: &os::Stat) -> bool {
 
 fn socket_mode_allowed(stat: &os::Stat, euid: u32) -> bool {
     stat.st_uid == euid && stat.st_mode & 0o777 == 0o600
-}
-
-/// Invalid process identities are unprovable, never proof of an absent publisher.
-pub(crate) fn valid_process_identity(value: &str) -> bool {
-    let Some((platform, version, boot, start)) = parse_process_identity(value) else {
-        return false;
-    };
-    platform == "linux"
-        && version == "v1"
-        && valid_uuid(boot)
-        && !start.is_empty()
-        && start.bytes().all(|byte| byte.is_ascii_digit())
-}
-
-fn parse_process_identity(value: &str) -> Option<(&str, &str, &str, &str)> {
-    let (platform, rest) = value.split_once(':')?;
-    let (version, rest) = rest.split_once(':')?;
-    let (boot, start) = rest.rsplit_once(':')?;
-    Some((platform, version, boot, start))
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ProcessState {
-    Live,
-    Dead,
-}
-
-fn process_state(pid: u32, recorded: &str) -> Result<ProcessState, ReadFailure> {
-    let Some((platform, _, boot, start)) = parse_process_identity(recorded) else {
-        return Err(ReadFailure::pre("marker_identity"));
-    };
-    if platform != "linux" {
-        return Err(ReadFailure::pre("marker_identity"));
-    }
-    let current_boot = current_boot_id().ok_or_else(|| ReadFailure::pre("marker_identity"))?;
-    if boot != current_boot {
-        return Ok(ProcessState::Dead);
-    }
-    match process_start(pid)? {
-        Some(current) if current == start => Ok(ProcessState::Live),
-        Some(_) => Ok(ProcessState::Dead),
-        None => Ok(ProcessState::Dead),
-    }
-}
-
-fn current_boot_id() -> Option<String> {
-    let value = os::boot_id()?;
-    valid_uuid(&value).then_some(value)
-}
-fn process_start(pid: u32) -> Result<Option<String>, ReadFailure> {
-    match os::process_start_ticks(pid) {
-        os::ProcessStart::Ticks(ticks) => Ok(Some(ticks)),
-        os::ProcessStart::Absent => Ok(None),
-        os::ProcessStart::Unprovable => Err(ReadFailure::pre("marker_identity")),
-    }
 }
 
 #[cfg(test)]
@@ -1220,14 +1178,6 @@ mod tests {
     }
 
     #[test]
-    fn process_identity_grammar_is_ascii_and_structured() {
-        let boot = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
-        assert!(valid_process_identity(&format!("linux:v1:{boot}:123")));
-        assert!(!valid_process_identity(&format!("linux:v1:{boot}:123 ")));
-        assert!(!valid_process_identity(&format!("linux:v2:{boot}:123")));
-    }
-
-    #[test]
     #[serial_test::parallel]
     fn an_absent_ancestor_is_an_absence_and_an_untrustworthy_one_is_not() {
         let _env = crate::session::test_support::EnvGuard::read_lock();
@@ -1326,12 +1276,11 @@ mod tests {
         ));
     }
 
-    /// Follow prefix symlinks without relaxing descriptor checks or final no-follow.
     #[test]
     #[serial_test::parallel]
-    fn a_symlinked_prefix_is_followed_but_every_check_still_applies() {
+    fn symlinked_directories_retain_verified_targets_and_permission_checks() {
         let _env = crate::session::test_support::EnvGuard::read_lock();
-        use std::os::unix::fs::PermissionsExt;
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
         let euid = crate::process::effective_uid();
         let base = tempfile::tempdir().expect("temp base");
@@ -1340,7 +1289,6 @@ mod tests {
         let link = base.path().join("link");
         std::os::unix::fs::symlink(&real, &link).expect("prefix symlink");
 
-        // The app directory reached through the symlink is admitted.
         let app = real.join("app-dir");
         std::fs::create_dir(&app).expect("app dir");
         assert!(
@@ -1348,7 +1296,6 @@ mod tests {
             "a symlinked prefix must not refuse the walk"
         );
 
-        // The checks are read off the resolved directory, not the link.
         let mut permissions = std::fs::metadata(&app).expect("stat").permissions();
         permissions.set_mode(0o777);
         std::fs::set_permissions(&app, permissions).expect("chmod");
@@ -1361,8 +1308,6 @@ mod tests {
         );
         std::fs::set_permissions(&app, std::fs::Permissions::from_mode(0o700)).expect("chmod");
 
-        // A prefix that is a symlink to a regular file is a non-directory
-        // component, not an absence.
         let file_link = base.path().join("file-link");
         let target = base.path().join("not-a-dir");
         std::fs::write(&target, b"x").expect("file");
@@ -1372,9 +1317,17 @@ mod tests {
             Err(TrustedPathError::Refused(_))
         ));
 
-        // And the final component is still pinned by O_NOFOLLOW.
         let app_link = base.path().join("app-link");
         std::os::unix::fs::symlink(&app, &app_link).expect("app symlink");
+        let expected = std::fs::metadata(&app).expect("verified target metadata");
+        let retained = open_trusted_directory(&app_link, euid).expect("admit final target");
+        std::fs::remove_file(&app_link).expect("retarget temporary symlink");
+        std::os::unix::fs::symlink(&target, &app_link).expect("retarget to regular file");
+        let observed = fstat(retained.as_raw_fd()).expect("retained target metadata");
+        assert_eq!(
+            (observed.st_dev, observed.st_ino),
+            (expected.dev(), expected.ino())
+        );
         assert!(matches!(
             open_trusted_directory(&app_link, euid),
             Err(TrustedPathError::Refused(_))

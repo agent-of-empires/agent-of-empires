@@ -596,75 +596,46 @@ async fn one_directory_under_two_spellings_is_one_project_on_both_transports() {
     .await;
 }
 
-/// An unreadable profile prevents a successful partial listing on either transport.
-/// The refusal identifies the unreadable profile.
 #[tokio::test]
 #[serial_test::serial]
-async fn a_profile_that_cannot_be_read_is_refused_by_both_transports() {
-    let fixture = Fixture::new();
-    fixture.write_broken_profile();
-    // Keep the successful picker before the refusal boundary.
-    let served = compare_transports(
-        &fixture,
-        &[
-            // Inventory does not open the broken store.
-            &["profile"],
-            &["list", "--all"],
-            &["list", "--json", "--all"],
-        ],
-        1,
-        // These answers do not depend on the session rows emptied by the probe.
-        &[
-            &["profile"],
-            &["list", "--all"],
-            &["list", "--json", "--all"],
-        ],
-    )
-    .await;
-
-    assert_eq!(
-        served[0].exit, 0,
-        "the picker reads no profile's data, so a broken one does not refuse it: {:?}",
-        served[0].stderr
-    );
-    for refusal in served.iter().skip(1) {
-        assert_eq!(
-            refusal.exit, 1,
-            "an unreadable profile is the operator's own state, so it leaves 1: {:?}",
-            refusal.stderr
-        );
-        assert!(
-            refusal.stderr.contains(BROKEN),
-            "the refusal names the profile it could not read: {:?}",
-            refusal.stderr
-        );
-        assert!(
-            refusal.stdout.is_empty(),
-            "a refusal prints no rows on either transport: {:?}",
-            refusal.stdout
-        );
-    }
-}
-
-#[tokio::test]
-#[serial_test::serial]
-async fn legacy_native_profile_names_keep_raw_picker_bytes_and_all_profile_refusals() {
-    for name in ["ALL", "legacy\\name"] {
+async fn unreadable_profiles_preserve_inventory_and_healthy_aggregate_rows() {
+    for name in [BROKEN, "ALL", "legacy\\name"] {
         let fixture = Fixture::new();
-        std::fs::create_dir_all(fixture.app_dir().join("profiles").join(name)).unwrap();
-        let commands: &[&[&str]] = &[
-            &["profile"],
-            &["list", "--all"],
-            &["list", "--all", "--json"],
-        ];
-        let served = compare_transports(&fixture, commands, 1, commands).await;
-        assert_eq!(served[0].exit, 0);
-        assert!(served[0].stdout.contains(name));
-        for result in served.iter().skip(1) {
-            assert_eq!(result.exit, 1);
-            assert!(result.stdout.is_empty());
-            assert!(result.stderr.contains(name));
+        if name == BROKEN {
+            fixture.write_broken_profile();
+        } else {
+            std::fs::create_dir_all(fixture.app_dir().join("profiles").join(name)).unwrap();
         }
+        let served = compare_transports(
+            &fixture,
+            &[
+                &["profile"],
+                &["list", "--all"],
+                &["list", "--json", "--all"],
+            ],
+            usize::MAX,
+            &[&["profile"]],
+        )
+        .await;
+        for answer in &served {
+            assert_eq!(answer.exit, 0, "{name}: {}", answer.stderr);
+        }
+        assert!(served[0].stdout.contains(name));
+        let rows: Vec<serde_json::Value> = serde_json::from_str(&served[2].stdout).unwrap();
+        let mut actual: Vec<_> = rows
+            .iter()
+            .map(|row| {
+                assert_eq!(row["profile"], PROFILE);
+                row["id"].as_str().unwrap().to_owned()
+            })
+            .collect();
+        let mut expected: Vec<_> = fixture_sessions(fixture.path())
+            .iter()
+            .map(|row| row["id"].as_str().unwrap().to_owned())
+            .collect();
+        actual.sort();
+        expected.sort();
+        assert_eq!(actual, expected, "healthy rows must survive {name}");
     }
 }
 
