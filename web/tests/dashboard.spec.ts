@@ -102,7 +102,7 @@ test.describe("Settings", () => {
     await page.goto("/");
     await page.locator("body").click();
     await page.keyboard.press("s");
-    await expect(page.getByRole("button", { name: /Back/i })).toBeVisible();
+    await expect(page.getByRole("button", { name: "← Back", exact: true })).toBeVisible();
   });
 });
 
