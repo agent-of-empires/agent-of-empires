@@ -1528,7 +1528,8 @@ mod tests {
             "-c",
             "sh -c 'trap \"\" TERM; echo $$; exec sleep 600' & wait",
         ])
-        .stdout(Stdio::piped());
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
         platform::configure_process_group(&mut cmd);
         let mut child = cmd.spawn().unwrap();
         let mut line = String::new();
