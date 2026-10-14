@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import type { SessionResponse } from "../lib/types";
 import { fetchSessions, type SessionsEnvelope } from "../lib/api";
 import { setServerDown } from "../lib/connectionState";
+import { beginRead, markReadApplied } from "../lib/sessionReads";
 
 const POLL_INTERVAL = 3000;
 const LOCAL_ORDERING_WINDOW_MS = 4000;
@@ -26,8 +27,9 @@ export function useSessions() {
     lastLocalOrderingAtRef.current = Date.now();
   }, []);
 
-  const applyResult = useCallback((data: SessionsEnvelope | null) => {
+  const applyResult = useCallback((data: SessionsEnvelope | null, read: number) => {
     if (data !== null) {
+      markReadApplied(read);
       setSessions(data.sessions);
       // Ignore server ordering while a local drag's PUT may still be landing.
       if (Date.now() - lastLocalOrderingAtRef.current > LOCAL_ORDERING_WINDOW_MS) {
@@ -43,8 +45,12 @@ export function useSessions() {
   }, []);
 
   useEffect(() => {
-    void fetchSessions().then(applyResult);
-    intervalRef.current = setInterval(() => void fetchSessions().then(applyResult), POLL_INTERVAL);
+    const poll = () => {
+      const read = beginRead();
+      void fetchSessions().then((data) => applyResult(data, read));
+    };
+    poll();
+    intervalRef.current = setInterval(poll, POLL_INTERVAL);
     return () => {
       if (intervalRef.current) clearInterval(intervalRef.current);
     };
