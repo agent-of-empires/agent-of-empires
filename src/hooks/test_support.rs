@@ -7,10 +7,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use tempfile::TempDir;
 
-/// Installs a hook-base override, cleared on drop. It also holds
-/// `test_env_lock`: a test that creates the base and then reads its mode is
-/// reading a mode, and `mkdirat` is masked by the process umask, so any test
-/// holding one for its own reasons has to exclude these.
+/// A thread-local hook base guarded against concurrent process-environment changes.
 pub(crate) struct BaseGuard(Option<std::sync::MutexGuard<'static, ()>>);
 
 impl BaseGuard {
@@ -24,8 +21,7 @@ impl BaseGuard {
     pub(crate) fn fresh() -> (Self, PathBuf, TempDir) {
         let tmp = TempDir::new().unwrap();
         let base = tmp.path().join("aoe-hooks");
-        super::dir_guard::override_base_for_test(base.clone());
-        super::dir_guard::reset_for_test();
+        Self::set_thread_base(base.clone());
         (Self(Self::lock()), base, tmp)
     }
 
@@ -38,9 +34,14 @@ impl BaseGuard {
 
     /// An explicit base; the caller creates any parents it needs.
     pub(crate) fn with_base(base: PathBuf) -> Self {
+        Self::set_thread_base(base);
+        Self(Self::lock())
+    }
+
+    /// The parent keeps the environment lock until its worker threads exit.
+    pub(crate) fn set_thread_base(base: PathBuf) {
         super::dir_guard::override_base_for_test(base);
         super::dir_guard::reset_for_test();
-        Self(Self::lock())
     }
 }
 

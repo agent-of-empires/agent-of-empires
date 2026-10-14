@@ -2396,6 +2396,7 @@ impl Instance {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ConversationState {
+    pub(crate) tool: String,
     pub(crate) session_id: Option<String>,
     pub(crate) binding: Option<ConversationBinding>,
     pub(crate) intent: ResumeIntent,
@@ -2406,7 +2407,8 @@ pub(crate) struct ConversationState {
 
 impl ConversationState {
     pub(crate) fn matches(&self, instance: &Instance) -> bool {
-        self.session_id == instance.agent_session_id
+        self.tool == instance.tool
+            && self.session_id == instance.agent_session_id
             && self.binding == instance.agent_session_binding
             && self.intent == instance.resume_intent
             && self.resume_binding == instance.resume_binding
@@ -2418,6 +2420,7 @@ impl ConversationState {
 impl Instance {
     pub(crate) fn conversation_state(&self) -> ConversationState {
         ConversationState {
+            tool: self.tool.clone(),
             session_id: self.agent_session_id.clone(),
             binding: self.agent_session_binding.clone(),
             intent: self.resume_intent.clone(),

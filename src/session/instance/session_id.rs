@@ -303,12 +303,15 @@ impl Instance {
         })
     }
 
-    fn self_heal_row_is_eligible(&self, contended: &HashSet<(String, String)>) -> bool {
+    fn needs_session_id_backfill(&self) -> bool {
         self.agent_session_id.is_none()
             && self.resume_intent.is_default()
             && !matches!(self.status, Status::Deleting | Status::Creating)
             && self.effective_bucket() == SessionBucket::Active
-            && !contended.contains(&self.contended_capture_key())
+    }
+
+    fn self_heal_row_is_eligible(&self, contended: &HashSet<(String, String)>) -> bool {
+        self.needs_session_id_backfill() && !contended.contains(&self.contended_capture_key())
     }
 
     /// Best-effort backfill under a Capture lifecycle reservation.
@@ -392,9 +395,8 @@ impl Instance {
         live: &crate::tmux::LiveSessionSnapshot,
         now: std::time::Instant,
     ) -> bool {
-        self.agent_session_id.is_none()
+        self.needs_session_id_backfill()
             && self.poller_repair.due(now)
-            && self.active_execution.is_some()
             && !self.has_live_agent_pane_in(live)
     }
 
@@ -1224,10 +1226,10 @@ work-opencode = "opencode"
         assert!(!base.self_heal_row_is_eligible(&contended));
     }
 
-    #[tokio::test(flavor = "current_thread")]
+    #[test]
     #[serial]
     #[serial(hook_base)]
-    async fn daemon_recovers_finished_execution_publications_without_writing_on_misses() {
+    fn daemon_backfills_legacy_capture_and_scoped_publications_without_writes_on_misses() {
         if crate::tmux::tmux_command().arg("-V").output().is_err() {
             eprintln!("tmux not available; skipping");
             return;
@@ -1236,93 +1238,115 @@ work-opencode = "opencode"
         const SID: &str = "11111111-2222-4333-8444-555555555555";
         let root = tempdir().unwrap();
         let _env = crate::server::test_support::RuntimeEnvGuard::set(root.path());
-        let (_hooks, _base, _hook_temp) = crate::hooks::test_support::BaseGuard::ready();
-        for (published, rejected) in [(false, false), (true, true), (true, false)] {
-            let mut inst = tool_instance("claude", root.path().to_str().unwrap());
-            inst.source_profile = PROFILE.into();
-            inst.status = Status::Stopped;
-            inst.resume_probe_failed_sid = rejected.then(|| SID.to_owned());
-            let directory = write_sidecar(&inst.id, SID);
-            let launch_id = uuid::Uuid::new_v4().to_string();
-            let leaf = crate::hooks::session_id_leaf(Some(&launch_id)).unwrap();
-            let sidecar = directory.join(leaf.as_ref());
-            if published {
-                std::fs::write(&sidecar, SID).unwrap();
-            }
-            inst.active_execution = Some(ActiveExecution {
-                launch_id,
-                binding: ExecutionBinding {
-                    agent: "claude".into(),
-                    stores: vec![root.path().join("claude")],
-                    configuration: Vec::new(),
-                    cwd: root.path().into(),
-                    cwd_filesystem: "host".into(),
-                    filesystem: "host".into(),
-                    exported_default_store: None,
-                },
-                capture: Some(CaptureContext::Hooks(sidecar)),
-                container: None,
-            });
-            let session = inst.tmux_session().unwrap();
-            let owned = crate::tmux::test_helpers::TmuxTestSession::from_name(session.name());
-            for args in [
-                vec!["new-session", "-d", "-s", owned.name(), "sleep 60"],
-                vec![
-                    "set-option",
-                    "-w",
-                    "-t",
-                    owned.name(),
-                    "remain-on-exit",
-                    "on",
-                ],
-                vec!["respawn-pane", "-k", "-t", owned.name(), "true"],
+        let (_hooks, hook_base, _hook_temp) = crate::hooks::test_support::BaseGuard::ready();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .on_thread_start(move || {
+                crate::hooks::test_support::BaseGuard::set_thread_base(hook_base.clone());
+            })
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            for (scoped, published, rejected) in [
+                (true, false, false),
+                (true, true, true),
+                (true, true, false),
+                (false, false, false),
+                (false, true, true),
+                (false, true, false),
             ] {
-                let result = crate::tmux::tmux_command().args(args).output().unwrap();
-                assert!(
-                    result.status.success(),
-                    "{}",
-                    String::from_utf8_lossy(&result.stderr)
+                let mut inst = tool_instance("claude", root.path().to_str().unwrap());
+                inst.source_profile = PROFILE.into();
+                inst.status = Status::Stopped;
+                inst.resume_probe_failed_sid = rejected.then(|| SID.to_owned());
+                let directory = write_sidecar(&inst.id, SID);
+                if scoped {
+                    let launch_id = uuid::Uuid::new_v4().to_string();
+                    let leaf = crate::hooks::session_id_leaf(Some(&launch_id)).unwrap();
+                    let sidecar = directory.join(leaf.as_ref());
+                    if published {
+                        std::fs::write(&sidecar, SID).unwrap();
+                    }
+                    inst.active_execution = Some(ActiveExecution {
+                        launch_id,
+                        binding: ExecutionBinding {
+                            agent: "claude".into(),
+                            stores: vec![root.path().join("claude")],
+                            configuration: Vec::new(),
+                            cwd: root.path().into(),
+                            cwd_filesystem: "host".into(),
+                            filesystem: "host".into(),
+                            exported_default_store: None,
+                        },
+                        capture: Some(CaptureContext::Hooks(sidecar)),
+                        container: None,
+                    });
+                } else if !published {
+                    std::fs::remove_file(directory.join("session_id")).unwrap();
+                }
+                let session = inst.tmux_session().unwrap();
+                let owned = crate::tmux::test_helpers::TmuxTestSession::from_name(session.name());
+                for args in [
+                    vec!["new-session", "-d", "-s", owned.name(), "sleep 60"],
+                    vec![
+                        "set-option",
+                        "-w",
+                        "-t",
+                        owned.name(),
+                        "remain-on-exit",
+                        "on",
+                    ],
+                    vec!["respawn-pane", "-k", "-t", owned.name(), "true"],
+                ] {
+                    let result = crate::tmux::tmux_command().args(args).output().unwrap();
+                    assert!(
+                        result.status.success(),
+                        "{}",
+                        String::from_utf8_lossy(&result.stderr)
+                    );
+                }
+                let pane = crate::tmux::test_helpers::only_pane_id(owned.name());
+                crate::tmux::test_helpers::wait_for_pane_dead(&pane);
+                crate::tmux::refresh_session_cache();
+                let live = crate::tmux::LiveSessionSnapshot::new();
+                assert!(!inst.has_live_agent_pane_in(&live));
+                assert!(inst.tmux_alive_cached());
+                assert_eq!(
+                    inst.try_retroactive_capture().map(|value| value.sid),
+                    published.then(|| SID.to_owned())
                 );
+                seed_disk_for_sidecar_test(PROFILE, &inst);
+                let storage = crate::session::Storage::open_unwatched(PROFILE).unwrap();
+                let registry = crate::session::get_app_dir()
+                    .unwrap()
+                    .join("profiles")
+                    .join(PROFILE)
+                    .join("sessions.json");
+                let before = std::fs::read(&registry).unwrap();
+                let state = crate::server::test_support::build_test_app_state(
+                    storage.load_with_groups().unwrap().0,
+                );
+                let repair_started = std::time::Instant::now();
+                crate::server::test_support::drain_session_id_updates_for_test(&state).await;
+                let rows = state.instances.read().await;
+                let persisted = storage.load_with_groups().unwrap().0;
+                assert_eq!(
+                    rows[0].agent_session_id.as_deref(),
+                    (published && !rejected).then_some(SID)
+                );
+                assert_eq!(
+                    persisted[0].agent_session_id.as_deref(),
+                    (published && !rejected).then_some(SID)
+                );
+                assert!(rows[0].session_id_poller.is_none());
+                assert!(persisted[0].lifecycle_reservation.is_none());
+                if !published || rejected {
+                    assert_eq!(std::fs::read(&registry).unwrap(), before);
+                    assert!(!rows[0].finished_execution_identity_is_due(&live, repair_started));
+                }
+                state.shutdown.cancel();
             }
-            let pane = crate::tmux::test_helpers::only_pane_id(owned.name());
-            crate::tmux::test_helpers::wait_for_pane_dead(&pane);
-            crate::tmux::refresh_session_cache();
-            let live = crate::tmux::LiveSessionSnapshot::new();
-            assert!(!inst.has_live_agent_pane_in(&live));
-            assert!(inst.tmux_alive_cached());
-            assert_eq!(
-                inst.try_retroactive_capture().map(|value| value.sid),
-                published.then(|| SID.to_owned())
-            );
-            seed_disk_for_sidecar_test(PROFILE, &inst);
-            let storage = crate::session::Storage::open_unwatched(PROFILE).unwrap();
-            let registry = crate::session::get_app_dir()
-                .unwrap()
-                .join("profiles")
-                .join(PROFILE)
-                .join("sessions.json");
-            let before = std::fs::read(&registry).unwrap();
-            let state = crate::server::test_support::build_test_app_state(
-                storage.load_with_groups().unwrap().0,
-            );
-            crate::server::test_support::drain_session_id_updates_for_test(&state).await;
-            let rows = state.instances.read().await;
-            let persisted = storage.load_with_groups().unwrap().0;
-            assert_eq!(
-                rows[0].agent_session_id.as_deref(),
-                (published && !rejected).then_some(SID)
-            );
-            assert_eq!(
-                persisted[0].agent_session_id.as_deref(),
-                (published && !rejected).then_some(SID)
-            );
-            assert!(rows[0].session_id_poller.is_none());
-            assert!(persisted[0].lifecycle_reservation.is_none());
-            if !published || rejected {
-                assert_eq!(std::fs::read(&registry).unwrap(), before);
-            }
-            state.shutdown.cancel();
-        }
+        });
     }
 
     #[test]

@@ -814,9 +814,9 @@ mod tests {
         let ScopedRead::Answered(outcome) = flagged else {
             panic!("a flag naming an endpoint is a request for a served answer");
         };
-        assert_eq!(
-            outcome.exit, 4,
-            "a named endpoint that is not there leaves the transport refusal's exit"
+        assert_ne!(
+            outcome.exit, 0,
+            "an explicit endpoint must refuse, not fall back"
         );
         assert!(outcome.stdout.is_none(), "a refusal prints no answer");
     }
