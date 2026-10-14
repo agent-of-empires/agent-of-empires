@@ -3589,34 +3589,6 @@ mod tests {
             .unwrap_or(0)
     }
 
-    fn start_ready_input_pane(name: &str) {
-        let mut args = [
-            "new-session", "-d", "-s", name, "-x", "80", "-y", "24",
-            r#"/bin/sh -c 'stty -echo; printf "INPUT-READY\n"; IFS= read -r line; printf "INPUT-ACK:%s\n" "$line"; exec sleep 30'"#,
-        ].map(str::to_owned).to_vec();
-        crate::tmux::utils::append_pane_base_index_args(&mut args, name);
-        let output = crate::tmux::tmux_command()
-            .args(args)
-            .output()
-            .expect("start input pane");
-        assert!(
-            output.status.success(),
-            "{}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        wait_until(
-            "input consumer ready",
-            std::time::Duration::from_secs(5),
-            || {
-                let output = crate::tmux::tmux_command()
-                    .args(["capture-pane", "-p", "-t", name])
-                    .output()
-                    .expect("capture consumer readiness");
-                output.status.success()
-                    && String::from_utf8_lossy(&output.stdout).contains("INPUT-READY")
-            },
-        );
-    }
     fn create_live_send_fixture(name: &str) -> crate::tmux::Session {
         let mut args: Vec<String> = [
             "new-session",
@@ -3627,7 +3599,7 @@ mod tests {
             "80",
             "-y",
             "24",
-            "sleep 30",
+            r#"/bin/sh -c 'stty -echo; printf "INPUT-READY\n"; IFS= read -r line; printf "INPUT-ACK:%s\n" "$line"; exec sleep 30'"#,
         ]
         .into_iter()
         .map(str::to_owned)
@@ -3642,6 +3614,19 @@ mod tests {
             "create live-send fixture: {}",
             String::from_utf8_lossy(&output.stderr)
         );
+        let target = format!("{name}:^.0");
+        wait_until(
+            "input consumer ready",
+            std::time::Duration::from_secs(5),
+            || {
+                let output = crate::tmux::tmux_command()
+                    .args(["capture-pane", "-p", "-t", &target])
+                    .output()
+                    .expect("capture consumer readiness");
+                output.status.success()
+                    && String::from_utf8_lossy(&output.stdout).contains("INPUT-READY")
+            },
+        );
         crate::tmux::refresh_session_cache();
         crate::tmux::Session::from_name(name)
     }
@@ -3655,9 +3640,7 @@ mod tests {
             return;
         }
         let guard = crate::tmux::test_helpers::TmuxTestSession::new("aoe_test_livelock_steal");
-        start_ready_input_pane(guard.name());
-        crate::tmux::refresh_session_cache();
-        let session = crate::tmux::Session::from_name(guard.name());
+        let session = create_live_send_fixture(guard.name());
 
         let worker = LiveSendWorker::spawn(guard.name().to_string(), None);
         wait_until(
@@ -3747,9 +3730,7 @@ mod tests {
             || worker.take_resize_failed(),
         );
 
-        start_ready_input_pane(guard.name());
-        crate::tmux::refresh_session_cache();
-        let session = crate::tmux::Session::from_name(guard.name());
+        let session = create_live_send_fixture(guard.name());
 
         // The new session has a live owner before the next resize.
         assert!(session.steal_size_owner("live-test-thief"));

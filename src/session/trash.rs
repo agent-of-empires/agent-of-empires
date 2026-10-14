@@ -1149,25 +1149,6 @@ mod tests {
         let main_repo = tmp.path().join("main");
         let worktree = tmp.path().join("wt");
         std::fs::create_dir_all(&main_repo).unwrap();
-        let git = |args: &[&str]| {
-            let output = std::process::Command::new("git")
-                .args(args)
-                .current_dir(&main_repo)
-                .env("GIT_CONFIG_GLOBAL", "/dev/null")
-                .env("GIT_CONFIG_SYSTEM", "/dev/null")
-                .env("GIT_CONFIG_NOSYSTEM", "1")
-                .env_remove("GIT_CONFIG")
-                .env_remove("GIT_CONFIG_COUNT")
-                .env_remove("GIT_CONFIG_PARAMETERS")
-                .env("GIT_TEMPLATE_DIR", "")
-                .output()
-                .expect("run fixture git");
-            assert!(
-                output.status.success(),
-                "git {args:?} failed: {}",
-                String::from_utf8_lossy(&output.stderr)
-            );
-        };
         for args in [
             vec!["init", "-q", "-b", "main", "."],
             vec![
@@ -1182,18 +1163,28 @@ mod tests {
                 "init",
             ],
         ] {
-            git(&args);
+            let out = std::process::Command::new("git")
+                .args(&args)
+                .current_dir(&main_repo)
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "git {args:?} failed");
         }
-        git(&[
-            "-c",
-            "worktree.useRelativePaths=true",
-            "worktree",
-            "add",
-            "-q",
-            "-b",
-            "feat",
-            worktree.to_str().unwrap(),
-        ]);
+        let out = std::process::Command::new("git")
+            .args([
+                "-c",
+                "worktree.useRelativePaths=true",
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "feat",
+                worktree.to_str().unwrap(),
+            ])
+            .current_dir(&main_repo)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "git worktree add failed");
 
         let link = std::fs::read_to_string(worktree.join(".git")).unwrap();
         let target = link.split_once("gitdir:").unwrap().1.trim().to_string();

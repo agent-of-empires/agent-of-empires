@@ -1548,7 +1548,7 @@ impl OpenCodeSessionSchema {
 }
 
 #[derive(Debug, thiserror::Error)]
-#[error("OpenCode native session schema cannot be attested; managed resume and fork are refused")]
+#[error("OpenCode native session schema cannot be attested; explicit managed resume and fork are refused")]
 pub(super) struct UnattestedOpenCodeSchema;
 
 fn opencode_session_row(

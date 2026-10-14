@@ -678,19 +678,35 @@ mod tests {
         crate::tmux::test_helpers::require_tmux!();
         use crate::session::instance::test_helpers::{seed_disk_for_sidecar_test, tool_instance};
         const SID: &str = "ses_saved000000000000000000000000";
-        for (legacy, yolo) in [(false, false), (false, true), (true, false), (true, true)] {
+        for (legacy, yolo, version) in [
+            (false, false, "2.0.24+31bdd8e"),
+            (false, true, "2.0.24+31bdd8e"),
+            (true, false, "2.0.24+31bdd8e"),
+            (true, true, "2.0.24+31bdd8e"),
+            (false, false, "2.0.27"),
+            (false, true, "2.0.27"),
+            (false, false, "distro-build"),
+            (false, true, "distro-build"),
+        ] {
             let directory = tempfile::tempdir().unwrap();
             let _home = crate::session::test_support::isolate_home(directory.path());
             let project = directory.path().join("project");
             std::fs::create_dir(&project).unwrap();
             let record = directory.path().join("launch.json");
+            let database = directory.path().join("opencode.db");
+            if version != "2.0.24+31bdd8e" {
+                rusqlite::Connection::open(&database)
+                    .unwrap()
+                    .execute_batch("CREATE TABLE unrelated (payload TEXT)")
+                    .unwrap();
+            }
             let native = format!(
                 r#"#!{}
 import json, os, sys
 if sys.argv[1:] == ['--help']: print({:?}); sys.exit(0)
-if sys.argv[1:] == ['--version']: print('2.0.24+31bdd8e'); sys.exit(0)
+if sys.argv[1:] == ['--version']: print({version:?}); sys.exit(0)
 with open(os.environ['FORK_RECORD'] + '.tmp', 'w') as log:
-    json.dump({{"argv": sys.argv[1:], "permission": os.environ.get('OPENCODE_PERMISSION')}}, log)
+    json.dump({{"argv": sys.argv[1:], "permission": os.environ.get('OPENCODE_PERMISSION'), "database": os.environ.get('OPENCODE_DB'), "cwd": os.getcwd()}}, log)
 os.replace(os.environ['FORK_RECORD'] + '.tmp', os.environ['FORK_RECORD'])
 sys.stdin.read()
 "#,
@@ -711,10 +727,7 @@ sys.stdin.read()
                 crate::session::config::profile_config::get_profile_config_path(profile).unwrap();
             std::fs::create_dir_all(config.parent().unwrap()).unwrap();
             let environment = vec![
-                format!(
-                    "OPENCODE_DB={}",
-                    directory.path().join("missing.db").display()
-                ),
+                format!("OPENCODE_DB={}", database.display()),
                 format!("FORK_RECORD={}", record.display()),
             ];
             std::fs::write(config, format!("environment={}\n[session]\nagent_status_hooks=false\nsmart_rename=false\nname_agent_session=false\nopencode_preassign_session_id=false\n", serde_json::to_string(&environment).unwrap())).unwrap();
@@ -746,6 +759,19 @@ sys.stdin.read()
                 std::thread::sleep(std::time::Duration::from_millis(10));
             };
             let argv = launched["argv"].as_array().unwrap();
+            assert_eq!(launched["database"], database.to_str().unwrap());
+            assert_eq!(launched["cwd"], project.to_str().unwrap());
+            assert_eq!(instance.agent_session_id.as_deref(), Some(SID));
+            assert!(instance.active_execution.is_none());
+            assert_eq!(
+                crate::session::storage::Storage::new_unwatched(profile)
+                    .unwrap()
+                    .load()
+                    .unwrap()[0]
+                    .agent_session_id
+                    .as_deref(),
+                Some(SID)
+            );
             assert!(argv
                 .windows(2)
                 .any(|pair| pair[0] == "--session" && pair[1] == SID));
