@@ -257,7 +257,7 @@ pub(crate) fn owner_excludes(
 }
 
 /// Runs `cmd` to completion with a deadline and a stdout byte cap, killing it on timeout.
-pub(super) fn run_with_timeout_limit(
+pub(crate) fn run_with_timeout_limit(
     mut cmd: std::process::Command,
     timeout: Duration,
     label: &str,

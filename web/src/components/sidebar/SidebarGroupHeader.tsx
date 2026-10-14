@@ -9,6 +9,7 @@ import {
   type RepoAppearanceUpdate,
 } from "../../lib/repoAppearance";
 import { STATUS_DOT_CLASS } from "../../lib/session";
+import { usePluginAttention } from "../../lib/pluginUiContext";
 import { workspaceAttentionCount, workspaceIsSunk } from "../../lib/sidebarSort";
 import { useSidebarCompact } from "../../lib/sidebarCompact";
 import { OFFLINE_TITLE } from "../../lib/connectionState";
@@ -54,6 +55,7 @@ function useDragClickSuppression(isDragging: boolean) {
 
 export const SidebarGroupHeader = memo(function SidebarGroupHeader(props: Props) {
   const { group, hasActiveChild, onClick, onNewSession, offline, dragHandle } = props;
+  const pluginAttention = usePluginAttention();
   // Appearance is repo-axis only; archive-all works on every axis.
   const canAppearance = group.capabilities.appearance;
   const archivableCount = props.onArchiveAll ? archivableWorkspaces(group).length : 0;
@@ -108,7 +110,10 @@ export const SidebarGroupHeader = memo(function SidebarGroupHeader(props: Props)
 
   // Sunk workspaces render in the footer, so they do not count toward the visible total.
   const sessionCount = group.workspaces.filter((v) => !workspaceIsSunk(v.workspace)).length;
-  const attentionCount = group.workspaces.reduce((n, v) => n + workspaceAttentionCount(v.workspace), 0);
+  const attentionCount = group.workspaces.reduce(
+    (n, v) => n + workspaceAttentionCount(v.workspace, pluginAttention),
+    0,
+  );
 
   return (
     <>

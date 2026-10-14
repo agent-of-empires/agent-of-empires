@@ -64,6 +64,51 @@ fn resolved_yolo(
     }
 }
 
+fn prime_runtime_for_capture(
+    capture: Option<&CaptureContext>,
+) -> Option<&crate::process::prime::PrimeRuntime> {
+    match capture? {
+        CaptureContext::Prime { runtime, .. } => runtime.as_ref(),
+        CaptureContext::PrimeStatus(runtime) => Some(runtime),
+        _ => None,
+    }
+}
+
+fn wrap_prime_launch(
+    command: &str,
+    execution: Option<&super::execution::NativeExecution>,
+    daemon_command: Option<&str>,
+    rewind_container_env: bool,
+) -> Result<String> {
+    let Some(runtime) =
+        execution.and_then(|execution| prime_runtime_for_capture(execution.capture.as_ref()))
+    else {
+        return Ok(command.to_owned());
+    };
+    let exe = std::env::current_exe()?;
+    let encoded = serde_json::to_string(runtime)?;
+    let daemon = daemon_command
+        .map(|command| {
+            format!(
+                " --daemon-command {}",
+                crate::session::environment::shell_escape_script_word(command)
+            )
+        })
+        .unwrap_or_default();
+    let rewind = if rewind_container_env {
+        " --rewind-container-env"
+    } else {
+        ""
+    };
+    Ok(format!(
+        "{} __prime-agent --runtime {}{}{rewind} -- sh -c {}",
+        shell_escape(&exe.to_string_lossy()),
+        shell_escape(&encoded),
+        daemon,
+        crate::session::environment::shell_escape_script_word(command)
+    ))
+}
+
 /// Append yolo-mode flags or environment variables to a launch command.
 fn apply_yolo_mode(cmd: &mut String, yolo: &crate::agents::YoloMode, is_sandboxed: bool) {
     match yolo {
@@ -754,6 +799,15 @@ impl Instance {
                     }
                     Some(execution)
                 }
+                Err(error)
+                    if self.default_selector_agent().is_some_and(|agent| {
+                        agent.name == "prime-agent"
+                            && self.launch_invokes_resolved_agent_directly(agent)
+                            && (managed || self.prime_agent_launch_options().is_some())
+                    }) =>
+                {
+                    return Err(error)
+                }
                 Err(error) if managed && !matches!(self.resume_intent, ResumeIntent::Default) => {
                     return Err(error);
                 }
@@ -870,10 +924,11 @@ impl Instance {
         })
     }
 
-    /// Refresh after pane teardown; Prime resident workers may still be running.
+    /// Carry the last authoritative root across native daemon shutdown.
     pub(super) fn refresh_prepared_prime_launch_after_pane_stop(
         &mut self,
         prepared: PreparedLaunch,
+        publication: Option<PrimeRootPublication>,
     ) -> Result<PreparedLaunch> {
         // Preserve the already adopted child across the second preparation.
         if !prepared.is_existing && self.stored_fork_child().is_none() {
@@ -883,7 +938,7 @@ impl Instance {
                 prepared.expected_conversation.pi_session_path.clone(),
             );
         }
-        self.absorb_published_prime_session();
+        self.absorb_published_prime_session(publication);
         let mut refreshed = self.prepare_launch_command(prepared.expected_conversation)?;
         refreshed.require_conversation_publication |= prepared.require_conversation_publication;
         refreshed.expected_prior_omp_generation = prepared.expected_prior_omp_generation;
@@ -1058,20 +1113,49 @@ impl Instance {
             apply_agent_launch_env(&mut tool_cmd, agent);
 
             let env_part = format!("{} ", env_info.docker_args);
-            let exec_command =
-                |cmd: &str| runtime.exec_shell_command(container, Some(&env_part), cmd);
-            let raw_command = exec_command(&wrap_native_container_command(
-                &tool_cmd,
+            let exec_command = |cmd: &str, interactive: bool| {
+                runtime.exec_shell_command(container, Some(&env_part), cmd, interactive)
+            };
+            let prime_runtime = execution
+                .and_then(|execution| prime_runtime_for_capture(execution.capture.as_ref()));
+            let tool_cmd = match prime_runtime {
+                Some(runtime) => format!(
+                    "env TMPDIR={} {}",
+                    shell_escape(&runtime.directory.to_string_lossy()),
+                    runtime.recorded_launch_command(&tool_cmd, false)
+                ),
+                None => tool_cmd,
+            };
+
+            let raw_command = exec_command(
+                &wrap_native_container_command(&tool_cmd, execution, container_cwd)?,
+                true,
+            );
+            let daemon_command = prime_runtime
+                .map(|runtime| {
+                    let daemon = format!(
+                        "env TMPDIR={} {} --mode daemon --daemon-socket {}",
+                        shell_escape(&runtime.directory.to_string_lossy()),
+                        shell_escape(&runtime.program.to_string_lossy()),
+                        shell_escape(&runtime.socket().to_string_lossy())
+                    );
+                    let daemon = runtime.recorded_launch_command(&daemon, true);
+                    wrap_native_container_command(&daemon, execution, container_cwd)
+                        .map(|command| exec_command(&command, false))
+                })
+                .transpose()?;
+            let raw_command = wrap_prime_launch(
+                &raw_command,
                 execution,
-                container_cwd,
-            )?);
+                daemon_command.as_deref(),
+                !env_info.env.is_empty(),
+            )?;
             let launch_command = if let Some(plan) = omp_capture_plan.as_ref() {
                 let marked_tool_cmd = wrap_omp_launch(&tool_cmd, plan);
-                let marked_command = exec_command(&wrap_native_container_command(
-                    &marked_tool_cmd,
-                    execution,
-                    container_cwd,
-                )?);
+                let marked_command = exec_command(
+                    &wrap_native_container_command(&marked_tool_cmd, execution, container_cwd)?,
+                    true,
+                );
                 gate_omp_launch(&raw_command, &marked_command, plan)
             } else {
                 raw_command
@@ -1180,7 +1264,6 @@ impl Instance {
         if let Some((_, ref env)) = identity_extension {
             env_prefix.push_str(env);
             self.pi_extension_launched = true;
-            env_prefix.push_str("AOE_SESSION_ROOT_ONLY=0 ");
         }
         let env_prefix = env_prefix;
 
@@ -1236,7 +1319,11 @@ impl Instance {
                     }
                     apply_first_launch_agent_name(&mut cmd, agent, self, execution, is_existing);
                     apply_agent_launch_env(&mut cmd, agent);
-                    let raw_command = format!("{}{}", env_prefix, cmd);
+                    let raw_command = format!(
+                        "{}{}",
+                        env_prefix,
+                        wrap_prime_launch(&cmd, execution, None, false)?
+                    );
                     let command = if let Some(plan) = omp_capture_plan.as_ref() {
                         let marked_command = wrap_omp_host_launch(&env_prefix, &cmd, plan);
                         gate_omp_launch(&raw_command, &marked_command, plan)
@@ -1325,7 +1412,11 @@ impl Instance {
             }
             apply_first_launch_agent_name(&mut cmd, agent, self, execution, is_existing);
             apply_agent_launch_env(&mut cmd, agent);
-            let raw_command = format!("{}{}", env_prefix, cmd);
+            let raw_command = format!(
+                "{}{}",
+                env_prefix,
+                wrap_prime_launch(&cmd, execution, None, false)?
+            );
             let command = if let Some(plan) = omp_capture_plan.as_ref() {
                 let marked_command = wrap_omp_host_launch(&env_prefix, &cmd, plan);
                 gate_omp_launch(&raw_command, &marked_command, plan)

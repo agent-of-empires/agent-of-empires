@@ -6,8 +6,15 @@ import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 
 import { SidebarGroupHeader } from "../sidebar/SidebarGroupHeader";
 import type { SidebarGroup } from "../../lib/sidebarGroups";
+import { PluginUiProvider } from "../../lib/pluginUiContext";
+import type { PluginUiEntry } from "../../lib/api";
 import type { SessionStatus, Workspace } from "../../lib/types";
 import { makeSession, makeWorkspace } from "./fixtures";
+
+const { entriesRef } = vi.hoisted(() => ({ entriesRef: { current: [] as PluginUiEntry[] } }));
+vi.mock("../../hooks/usePluginUiState", () => ({
+  usePluginUiState: () => ({ entries: entriesRef.current, revisions: {}, isRefreshing: false, poke: () => {} }),
+}));
 
 type Sunk = "archived" | "snoozed";
 const SUNK = { archived: { archived_at: "2025-01-02T00:00:00Z" }, snoozed: { snoozed_until: "2099-01-01T00:00:00Z" } };
@@ -93,6 +100,34 @@ describe("SidebarGroupHeader", () => {
   ])("attention badge for %s is %s", (_n, workspaces, badge) => {
     renderHeader({ group: group({ workspaces }) });
     expect(text("sidebar-group-attention-badge")).toBe(badge);
+  });
+
+  it.each([
+    ["danger", "1"],
+    ["warn", "1"],
+    ["info", undefined],
+    ["neutral", undefined],
+  ])("attention badge for a %s plugin row-column on an idle session is %s (#4446)", (tone, badge) => {
+    entriesRef.current = [
+      { plugin_id: "gh", slot: "row-column", id: "pr", session_id: "w1-s0", payload: { text: "PR", tone } },
+    ];
+    try {
+      render(
+        <PluginUiProvider>
+          <SidebarGroupHeader
+            group={group({ workspaces: views(workspace("w1", idle(2))) })}
+            hasActiveChild={false}
+            onClick={() => {}}
+            onNewSession={() => {}}
+            onUpdateAppearance={() => {}}
+            offline={false}
+          />
+        </PluginUiProvider>,
+      );
+      expect(text("sidebar-group-attention-badge")).toBe(badge);
+    } finally {
+      entriesRef.current = [];
+    }
   });
 
   it("renders the owner avatar when there is a remote owner, else the folder icon", () => {

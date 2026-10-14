@@ -63,13 +63,14 @@ describe("TerminalComposeSheet", () => {
     expect(renderSheet("undelivered").text.value).toBe("still here");
   });
 
-  it("sends on Ctrl or Cmd+Enter and leaves a plain Enter as a newline", () => {
+  it("sends on Ctrl or Cmd+Enter, keeping the terminal focused, and leaves a plain Enter as a newline", () => {
     const sheet = renderSheet("chord");
     sheet.type("go");
     expect(fireEvent.keyDown(sheet.text, { key: "Enter" })).toBe(true);
     expect(sheet.onSubmit).not.toHaveBeenCalled();
     fireEvent.keyDown(sheet.text, { key: "Enter", metaKey: true });
     expect(sheet.onSubmit).toHaveBeenCalledWith("go", true);
+    expect(sheet.onClose).toHaveBeenCalledWith(true);
   });
 
   it.each([

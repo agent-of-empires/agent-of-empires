@@ -2,6 +2,7 @@
 
 use std::collections::HashMap;
 use std::io::Read;
+use std::path::Path;
 use std::process::{Child, Command, ExitStatus, Output, Stdio};
 use std::time::{Duration, Instant};
 
@@ -236,6 +237,7 @@ pub mod worker;
 
 pub mod worker_registry;
 
+pub mod prime;
 pub mod runner;
 
 const WAIT_POLL_INTERVAL: Duration = Duration::from_millis(25);
@@ -518,6 +520,447 @@ pub fn processes_matching(
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct PrimeProcessIdentity {
+    pub pid: u32,
+    pub start_id: String,
+}
+
+pub(super) struct PrimeProcessSample {
+    pub identity: PrimeProcessIdentity,
+    pub parent: u32,
+    pub marked: bool,
+}
+
+fn prime_selection_mask(
+    samples: &[PrimeProcessSample],
+    known: &[PrimeProcessIdentity],
+) -> Vec<bool> {
+    use std::collections::HashMap;
+    let known: HashMap<_, _> = known
+        .iter()
+        .map(|identity| (identity.pid, &identity.start_id))
+        .collect();
+    let mut children: HashMap<u32, Vec<usize>> = HashMap::new();
+    let mut selected = vec![false; samples.len()];
+    let mut pending = Vec::new();
+    for (index, sample) in samples.iter().enumerate() {
+        children.entry(sample.parent).or_default().push(index);
+        if sample.marked
+            || known
+                .get(&sample.identity.pid)
+                .is_some_and(|start| **start == sample.identity.start_id)
+        {
+            selected[index] = true;
+            pending.push(index);
+        }
+    }
+    while let Some(index) = pending.pop() {
+        if let Some(descendants) = children.get(&samples[index].identity.pid) {
+            for &child in descendants {
+                if !selected[child] {
+                    selected[child] = true;
+                    pending.push(child);
+                }
+            }
+        }
+    }
+    selected
+}
+
+pub(crate) fn select_prime_processes(
+    samples: Vec<PrimeProcessSample>,
+    known: &[PrimeProcessIdentity],
+) -> Vec<PrimeProcessIdentity> {
+    let selected = prime_selection_mask(&samples, known);
+    samples
+        .into_iter()
+        .zip(selected)
+        .filter_map(|(sample, selected)| selected.then_some(sample.identity))
+        .collect()
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub(super) fn select_stable_prime_processes(
+    mut samples: Vec<PrimeProcessSample>,
+    known: &[PrimeProcessIdentity],
+) -> anyhow::Result<Vec<PrimeProcessIdentity>> {
+    let selected = prime_selection_mask(&samples, known);
+    let mut index = 0;
+    samples.retain(|_| {
+        let keep = selected[index];
+        index += 1;
+        keep
+    });
+    let handles = samples
+        .iter()
+        .map(|sample| platform::ProcessHandle::capture(&sample.identity))
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    let mut index = 0;
+    let mut failure = None;
+    samples.retain(|_| {
+        let live = match &handles[index] {
+            Some(handle) => match handle.exited() {
+                Ok(exited) => !exited,
+                Err(error) => {
+                    failure = Some(error);
+                    false
+                }
+            },
+            None => false,
+        };
+        index += 1;
+        live
+    });
+    if let Some(error) = failure {
+        return Err(error);
+    }
+    Ok(select_prime_processes(samples, known))
+}
+
+pub(crate) fn prime_processes(
+    marker: &str,
+    socket: &Path,
+    known: &[PrimeProcessIdentity],
+) -> anyhow::Result<Vec<PrimeProcessIdentity>> {
+    #[cfg(target_os = "linux")]
+    {
+        linux::prime_processes(marker, socket, known)
+    }
+    #[cfg(target_os = "macos")]
+    {
+        macos::prime_processes(marker, socket, known)
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        let _ = (marker, socket, known);
+        anyhow::bail!("Prime process proof unsupported on this platform")
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ProcessBirthIdentity {
+    pub boot_id: String,
+    pub start_id: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ProcessBirthFingerprint {
+    boot: [u8; 32],
+    process: [u8; 32],
+}
+
+impl ProcessBirthIdentity {
+    pub(crate) fn fingerprint(&self) -> ProcessBirthFingerprint {
+        use sha2::{Digest, Sha256};
+        ProcessBirthFingerprint {
+            boot: Sha256::digest(self.boot_id.as_bytes()).into(),
+            process: Sha256::digest(self.start_id.as_bytes()).into(),
+        }
+    }
+}
+
+pub(crate) struct RunnerProcessGuard {
+    pid: u32,
+    fingerprint: Option<ProcessBirthFingerprint>,
+    obsolete: bool,
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    members: parking_lot::Mutex<Vec<(PrimeProcessIdentity, platform::ProcessHandle)>>,
+    #[cfg(target_os = "linux")]
+    group_anchor: Option<platform::ProcessHandle>,
+}
+
+impl RunnerProcessGuard {
+    pub(crate) fn capture(
+        pid: u32,
+        fingerprint: Option<ProcessBirthFingerprint>,
+    ) -> anyhow::Result<Self> {
+        use sha2::{Digest, Sha256};
+        anyhow::ensure!(pid != 0, "invalid runner PID");
+        let obsolete_boot = if let Some(expected) = fingerprint {
+            let boot =
+                boot_id().ok_or_else(|| anyhow::anyhow!("current boot identity unavailable"))?;
+            expected.boot != <[u8; 32]>::from(Sha256::digest(boot.as_bytes()))
+        } else {
+            false
+        };
+        let before = if obsolete_boot {
+            None
+        } else {
+            runner_birth_identity(pid)?
+        };
+        let obsolete = obsolete_boot
+            || before.as_ref().is_some_and(|birth| {
+                Some(birth.fingerprint()) != fingerprint && fingerprint.is_some()
+            });
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        {
+            #[cfg(target_os = "linux")]
+            let group_anchor = if !obsolete {
+                if let Some(birth) = &before {
+                    anyhow::ensure!(fingerprint.is_some(), "runner birth identity is unattested; confirm external settlement before recovery");
+                    let identity = PrimeProcessIdentity {
+                        pid,
+                        start_id: birth.start_id.clone(),
+                    };
+                    match platform::ProcessHandle::capture_group(&identity)? {
+                        Some(handle) if handle.group_executing()?.is_some() => Some(handle),
+                        _ => None,
+                    }
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+            let guard = Self {
+                pid,
+                fingerprint,
+                obsolete,
+                members: parking_lot::Mutex::new(Vec::new()),
+                #[cfg(target_os = "linux")]
+                group_anchor,
+            };
+            if !obsolete {
+                #[cfg(target_os = "linux")]
+                if guard.group_anchor.is_some() {
+                    return Ok(guard);
+                }
+                let mut members = guard.members.lock();
+                guard.refresh(&mut members)?;
+            }
+            Ok(guard)
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        {
+            let _ = (before, obsolete);
+            anyhow::bail!("incarnation-bound runner control unsupported")
+        }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn refresh(
+        &self,
+        members: &mut Vec<(PrimeProcessIdentity, platform::ProcessHandle)>,
+    ) -> anyhow::Result<()> {
+        let before = runner_birth_identity(self.pid)?;
+        let root_attested = before
+            .as_ref()
+            .is_some_and(|birth| Some(birth.fingerprint()) == self.fingerprint);
+        anyhow::ensure!(
+            self.fingerprint.is_some() || before.is_none(),
+            "runner birth identity is unattested; confirm external settlement before recovery"
+        );
+        if before.is_none() {
+            members.retain(|(identity, _)| identity.pid != self.pid);
+        }
+        let anchor = if root_attested {
+            None
+        } else {
+            let mut anchor = None;
+            for (index, (identity, handle)) in members.iter().enumerate() {
+                if !handle.exited()? && platform::process_group_id(identity.pid)? == Some(self.pid)
+                {
+                    anchor = Some(index);
+                    break;
+                }
+            }
+            anchor
+        };
+        if !root_attested && anchor.is_none() {
+            anyhow::ensure!(
+                !runner_group_executing(self.pid)?,
+                "runner group ownership is unattested; retain evidence until external settlement"
+            );
+            return Ok(());
+        }
+        let mut identities = runner_group_identities(self.pid)?;
+        if let Some(birth) = before.as_ref().filter(|_| root_attested) {
+            identities.push(PrimeProcessIdentity {
+                pid: self.pid,
+                start_id: birth.start_id.clone(),
+            });
+        }
+        let mut added = Vec::new();
+        for identity in identities {
+            if !members.iter().any(|(known, _)| known == &identity) {
+                if let Some(handle) = platform::ProcessHandle::capture(&identity)? {
+                    added.push((identity, handle));
+                }
+            }
+        }
+        let stable = if root_attested {
+            let after = runner_birth_identity(self.pid)?;
+            anyhow::ensure!(
+                after.is_none() || after == before,
+                "runner incarnation changed during group capture"
+            );
+            after == before
+        } else if let Some(index) = anchor {
+            let (identity, handle) = &members[index];
+            !handle.exited()? && platform::process_group_id(identity.pid)? == Some(self.pid)
+        } else {
+            false
+        };
+        if !stable {
+            return Ok(());
+        }
+        members.extend(added);
+        Ok(())
+    }
+
+    pub(crate) fn executing(&self) -> anyhow::Result<bool> {
+        if self.obsolete {
+            return Ok(false);
+        }
+        #[cfg(target_os = "linux")]
+        if let Some(anchor) = &self.group_anchor {
+            let alive = anchor
+                .group_executing()?
+                .ok_or_else(|| anyhow::anyhow!("kernel lost bound group signalling support"))?;
+            if !alive {
+                return Ok(false);
+            }
+            let executing = runner_group_executing(self.pid)?;
+            return Ok(executing && anchor.group_executing()? == Some(true));
+        }
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        {
+            let mut members = self.members.lock();
+            self.refresh(&mut members)?;
+            for (_, handle) in members.iter() {
+                if !handle.exited()? {
+                    return Ok(true);
+                }
+            }
+        }
+        runner_group_executing(self.pid)
+    }
+
+    pub(crate) fn signal(&self, signal: i32) -> anyhow::Result<()> {
+        if self.obsolete {
+            return Ok(());
+        }
+        #[cfg(target_os = "linux")]
+        if let Some(anchor) = &self.group_anchor {
+            return anchor.signal_group(signal);
+        }
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        {
+            let mut members = self.members.lock();
+            self.refresh(&mut members)?;
+            for (_, handle) in members.iter() {
+                handle.signal(signal)?;
+            }
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        anyhow::bail!("incarnation-bound runner signalling unsupported: {signal}");
+        Ok(())
+    }
+
+    pub(crate) fn settle(&self, grace: Duration) -> anyhow::Result<()> {
+        self.signal(libc::SIGTERM)?;
+        let term_deadline = Instant::now() + grace;
+        let kill_deadline = term_deadline + Duration::from_secs(5);
+        let mut killed = false;
+        while self.executing()? {
+            let now = Instant::now();
+            if now >= term_deadline && !killed {
+                self.signal(libc::SIGKILL)?;
+                killed = true;
+            }
+            anyhow::ensure!(
+                now < kill_deadline,
+                "runner termination unproven; retained incarnation-bound ownership"
+            );
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        Ok(())
+    }
+}
+
+pub(crate) fn process_birth_identity(pid: u32) -> anyhow::Result<Option<ProcessBirthIdentity>> {
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    {
+        let Some(start_id) = platform::process_start_id(pid)? else {
+            return Ok(None);
+        };
+        let boot_id =
+            boot_id().ok_or_else(|| anyhow::anyhow!("process boot identity unavailable"))?;
+        Ok(Some(ProcessBirthIdentity { boot_id, start_id }))
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        let _ = pid;
+        anyhow::bail!("process birth identity unsupported on this platform")
+    }
+}
+
+pub(crate) fn runner_birth_identity(pid: u32) -> anyhow::Result<Option<ProcessBirthIdentity>> {
+    let birth = process_birth_identity(pid);
+    #[cfg(target_os = "macos")]
+    if birth.is_err() && platform::foreign_runner_group_absent(pid)? {
+        return Ok(None);
+    }
+    birth
+}
+
+pub(crate) fn fence_processes(
+    identities: &[PrimeProcessIdentity],
+    grace: Duration,
+) -> anyhow::Result<()> {
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    {
+        let mut handles = Vec::with_capacity(identities.len());
+        for identity in identities {
+            if let Some(handle) = platform::ProcessHandle::capture(identity)? {
+                handles.push(handle);
+            }
+        }
+        for handle in &handles {
+            handle.signal(libc::SIGTERM)?;
+        }
+        let term_deadline = Instant::now() + grace;
+        let kill_deadline = term_deadline + Duration::from_secs(5);
+        let mut killed = false;
+        loop {
+            let mut live = false;
+            for handle in &handles {
+                live |= !handle.exited()?;
+            }
+            if !live {
+                return Ok(());
+            }
+            let now = Instant::now();
+            if now >= term_deadline && !killed {
+                for handle in &handles {
+                    handle.signal(libc::SIGKILL)?;
+                }
+                killed = true;
+            }
+            anyhow::ensure!(now < kill_deadline, "owned process termination unproven");
+            std::thread::sleep(Duration::from_millis(25));
+        }
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        let _ = (identities, grace);
+        anyhow::bail!("incarnation-bound signalling unsupported on this platform")
+    }
+}
+
+pub(crate) fn runner_group_identities(group: u32) -> anyhow::Result<Vec<PrimeProcessIdentity>> {
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    {
+        platform::runner_group_identities(group)
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        let _ = group;
+        anyhow::bail!("runner group inspection unsupported on this platform")
+    }
+}
+
 pub fn boot_id() -> Option<String> {
     #[cfg(target_os = "linux")]
     {
@@ -540,6 +983,27 @@ pub fn boot_id() -> Option<String> {
 /// matches the host's, so the proof is skipped and declared mounts are trusted.
 pub fn host_shares_container_kernel() -> bool {
     cfg!(target_os = "linux")
+}
+
+pub(crate) struct ProcessArguments {
+    pub argv: Vec<String>,
+    pub stdin_is_tty: Option<bool>,
+}
+
+pub(crate) fn foreground_arguments(shell_pid: u32) -> Vec<ProcessArguments> {
+    #[cfg(target_os = "linux")]
+    {
+        linux::foreground_arguments(shell_pid)
+    }
+    #[cfg(target_os = "macos")]
+    {
+        macos::foreground_arguments(shell_pid)
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        let _ = shell_pid;
+        Vec::new()
+    }
 }
 
 pub fn parent_and_argv0(pid: u32) -> Option<(u32, String)> {
@@ -724,6 +1188,21 @@ fn kill_with_fallback(pids: &[u32]) {
     }
 }
 
+pub(crate) fn runner_group_executing(pid: u32) -> anyhow::Result<bool> {
+    #[cfg(target_os = "linux")]
+    {
+        linux::runner_group_executing(pid)
+    }
+    #[cfg(target_os = "macos")]
+    {
+        macos::runner_group_executing(pid)
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        anyhow::bail!("runner settlement unsupported for PID {pid}")
+    }
+}
+
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 fn process_exists(pid: u32) -> bool {
     match kill(Pid::from_raw(pid as i32), None) {
@@ -785,6 +1264,55 @@ fn signal_process_tree(pid: u32, signal: Signal) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn prime_process_selection_preserves_scope_across_pid_reuse() {
+        let sample = |pid, parent, start: &str, marked| PrimeProcessSample {
+            identity: PrimeProcessIdentity {
+                pid,
+                start_id: start.into(),
+            },
+            parent,
+            marked,
+        };
+        let known = PrimeProcessIdentity {
+            pid: 10,
+            start_id: "proc:100".into(),
+        };
+        for (start, expected) in [("proc:100", vec![10, 11, 12]), ("proc:200", vec![])] {
+            let selected = select_prime_processes(
+                vec![
+                    sample(10, 1, start, false),
+                    sample(11, 10, "proc:101", false),
+                    sample(12, 11, "proc:102", false),
+                    sample(20, 1, "proc:103", false),
+                ],
+                std::slice::from_ref(&known),
+            );
+            assert_eq!(
+                selected
+                    .into_iter()
+                    .map(|identity| identity.pid)
+                    .collect::<Vec<_>>(),
+                expected
+            );
+        }
+        let selected = select_prime_processes(
+            vec![
+                sample(10, 1, "proc:200", false),
+                sample(30, 1, "proc:300", true),
+                sample(31, 30, "proc:301", false),
+            ],
+            &[known],
+        );
+        assert_eq!(
+            selected
+                .into_iter()
+                .map(|identity| identity.pid)
+                .collect::<Vec<_>>(),
+            [30, 31]
+        );
+    }
 
     #[cfg(target_os = "macos")]
     #[test]

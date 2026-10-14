@@ -92,6 +92,9 @@ async fn async_main(helper: Option<String>, mut a: std::env::Args) -> Result<()>
             }
         }
     };
+    if let Some(Commands::PrimeRunner(args)) = cli.command {
+        return agent_of_empires::process::prime::run(args).await;
+    }
 
     if let Some(err) = serve_unavailable_error(&cli) {
         err.exit();
@@ -301,6 +304,7 @@ async fn run(
         Some(Commands::Uninstall(args)) => return cli::uninstall::run(args).await,
         Some(Commands::Update(args)) => return cli::update::run(args).await,
         Some(Commands::Migrate) => return cli::migrate::run(),
+
         Some(Commands::Stop { .. }) => return cli::killall::stop_trap(),
         _ => {}
     }

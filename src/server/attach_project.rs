@@ -298,7 +298,14 @@ async fn spawn_worker(state: &Arc<AppState>, id: &str) -> WorkerOutcome {
         }
     };
 
-    match state.acp_supervisor.spawn(request).await {
+    match state
+        .acp_supervisor
+        .spawn(
+            request,
+            crate::process::worker_registry::ResumeAuthority::Explicit,
+        )
+        .await
+    {
         Ok(()) => WorkerOutcome::Restarted,
         Err(e) => WorkerOutcome::RestartFailed(format!("worker respawn failed: {e}")),
     }

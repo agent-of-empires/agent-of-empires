@@ -239,6 +239,10 @@ pub enum Commands {
     #[command(name = "__acp-runner", hide = true)]
     AcpRunner(Box<crate::process::runner::AcpRunnerArgs>),
 
+    /// Internal: own the native Prime daemon and its frontend.
+    #[command(name = "__prime-agent", hide = true)]
+    PrimeRunner(crate::process::prime::PrimeRunnerArgs),
+
     /// Internal: extract Claude's `session_id` from a hook stdin payload
     /// and write it to the sidecar file. Spawned by the host-side
     /// `SessionStart`/`UserPromptSubmit` hook. Hidden from help.
@@ -336,7 +340,7 @@ pub fn command_name(command: &Commands) -> Option<&'static str> {
         Commands::Serve(_) => "serve",
         Commands::Url(_) => "url",
         Commands::Acp { .. } => "acp",
-        Commands::AcpRunner(_) => return None,
+        Commands::AcpRunner(_) | Commands::PrimeRunner(_) => return None,
         Commands::ExtractSessionId(_) => return None,
         Commands::Uninstall(_) => "uninstall",
         Commands::Update(_) => "update",

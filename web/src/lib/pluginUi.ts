@@ -111,6 +111,17 @@ export function toneTextClass(tone: PluginUiTone | undefined): string {
   );
 }
 
+/** Sessions with any plugin `row-column` entry toned `danger` or `warn`, for the sidebar attention sort and badges. */
+export function pluginAttentionSessionIds(entries: PluginUiEntry[]): Set<string> {
+  const ids = new Set<string>();
+  for (const e of entries) {
+    if (e.slot !== "row-column" || e.session_id == null) continue;
+    const tone = entryTone(e);
+    if (tone === "danger" || tone === "warn") ids.add(e.session_id);
+  }
+  return ids;
+}
+
 // `sort-key` and `filter-facet` are global entries referencing a per-session `row-column` by id; sorting and filtering run client-side.
 
 /** Matches the host's untagged `SortValue`. */

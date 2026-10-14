@@ -46,7 +46,7 @@ The sort picker offers three modes, and drag is available only in the first:
 
 - **Manual** (default).
 - **Recent activity**: by the most recent of `last_accessed_at`, `idle_entered_at`, and `created_at` across the workspace's sessions.
-- **Attention**: sessions needing a human first, mirroring the TUI. Ranks by status (Waiting, Error, Idle, Unknown, Running, Stopped, transient last), floats sessions the `attention-urgent` hook flagged above non-urgent rows in their tier, favorites first within a rank, then most recent activity.
+- **Attention**: sessions needing a human first, mirroring the TUI. Ranks by status (Waiting, Error, Idle, Unknown, Running, Stopped, transient last), floats sessions the `attention-urgent` hook flagged above non-urgent rows in their tier, favorites first within a rank, then most recent activity. A session with a plugin `row-column` entry toned `warn` or `danger` ranks at least as high as Error (Waiting stays ahead), and counts toward the attention badges and the jump-to-next shortcut like a Waiting or Error session. Archived, snoozed, and trashed sessions never count.
 
 A grouping toggle next to it cycles **By repo** (default), **By group** (the group set in the TUI rename dialog, with `aoe group move`, or from the row's **Edit group** menu; ungrouped sessions sit in a bucket at the bottom), and **By repo and group** (repo headers with groups nested inside). Group paths use `/` for hierarchy. Collapse state is tracked per axis, and the sort and grouping choices are per-browser. The Multi-repo and Scratch groups default to the bottom.
 

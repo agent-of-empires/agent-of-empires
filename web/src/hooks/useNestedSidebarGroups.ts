@@ -13,6 +13,7 @@ export function useNestedSidebarGroups(
   repoGroups: RepoGroup[],
   sortMode: SidebarSortMode,
   pluginSort?: PluginSortContext,
+  pluginAttention?: ReadonlySet<string>,
 ): {
   groups: NestedSidebarGroup[];
   toggleSubgroupCollapsed: (repoId: string, groupPath: string) => void;
@@ -26,9 +27,10 @@ export function useNestedSidebarGroups(
         idleDecayWindowMs,
         sortMode,
         pluginSort,
+        pluginAttention,
         isSubgroupCollapsed: (repoId, groupPath) => isCollapsed(subgroupKey(repoId, groupPath)),
       }),
-    [repoGroups, idleDecayWindowMs, sortMode, pluginSort, isCollapsed],
+    [repoGroups, idleDecayWindowMs, sortMode, pluginSort, pluginAttention, isCollapsed],
   );
 
   const toggleSubgroupCollapsed = useCallback(

@@ -486,30 +486,33 @@ pub(crate) async fn spawn_structured_session(
                     };
                     let source_profile_for_spawn = Some(source_profile.clone());
                     match supervisor
-                        .spawn(crate::acp::supervisor::SpawnRequest {
-                            session_id: id.clone(),
-                            agent: agent.clone(),
-                            tool,
-                            cwd,
-                            additional_dirs: vec![],
-                            provider_env: vec![],
-                            // A pick is made on a live session, never at create.
-                            provider: None,
-                            model,
-                            effort,
-                            effort_explicit,
-                            stored_acp_session_id,
-                            fork_from,
-                            sandbox_continuation:
-                                crate::acp::supervisor::SandboxContinuation::Persisted,
-                            sandbox_info,
-                            source_profile: source_profile_for_spawn,
-                            yolo_mode,
-                            acp_mode_id,
-                            agent_command_override: command_override,
-                            seed_history_replay,
-                            claude_store_pin: None,
-                        })
+                        .spawn(
+                            crate::acp::supervisor::SpawnRequest {
+                                session_id: id.clone(),
+                                agent: agent.clone(),
+                                tool,
+                                cwd,
+                                additional_dirs: vec![],
+                                provider_env: vec![],
+                                // A pick is made on a live session, never at create.
+                                provider: None,
+                                model,
+                                effort,
+                                effort_explicit,
+                                stored_acp_session_id,
+                                fork_from,
+                                sandbox_continuation:
+                                    crate::acp::supervisor::SandboxContinuation::Persisted,
+                                sandbox_info,
+                                source_profile: source_profile_for_spawn,
+                                yolo_mode,
+                                acp_mode_id,
+                                agent_command_override: command_override,
+                                seed_history_replay,
+                                claude_store_pin: None,
+                            },
+                            crate::process::worker_registry::ResumeAuthority::Explicit,
+                        )
                         .await
                     {
                         Ok(()) => {

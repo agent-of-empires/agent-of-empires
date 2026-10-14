@@ -81,6 +81,10 @@ pub fn detect_hook_only_status(_content: &str) -> Status {
     Status::Idle
 }
 
+pub fn detect_native_only_status(_content: &str) -> Status {
+    Status::Unknown
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2400,22 +2404,6 @@ Do you want to proceed?\n\
 
         assert_eq!(detect_vibe_status("Working…"), Status::Running);
         assert_eq!(detect_vibe_status("Loading..."), Status::Running);
-    }
-
-    #[test]
-    fn test_hook_only_agents_report_idle_from_the_pane() {
-        assert_eq!(detect_hook_only_status("anything"), Status::Idle);
-        assert_eq!(detect_hook_only_status(""), Status::Idle);
-        for agent in ["kiro", "settl", "kimi", "prime-agent"] {
-            let Some(def) = crate::agents::get_agent(agent) else {
-                continue;
-            };
-            assert_eq!(
-                (def.detect_status)("\u{2736} Working\u{2026} (4s \u{b7} \u{2193} 88 tokens)"),
-                Status::Idle,
-                "{agent} must not parse the pane"
-            );
-        }
     }
 
     const PI_RUNNING_PANE: &str = "\

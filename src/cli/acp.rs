@@ -48,10 +48,8 @@ pub enum AcpCommands {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
-    /// Gracefully stop an agent worker (SIGTERM the runner, agent
-    /// receives stdin EOF). Sessions can be reattached on the next
-    /// `aoe serve` only if they are still alive afterward; `stop`
-    /// destroys the worker.
+    /// Stop an agent worker and settle its owned native processes.
+    /// Unlike `aoe serve --stop`, this ends the worker rather than detaching.
     Stop {
         /// Session id to stop. Mutually exclusive with `--all`.
         session: Option<String>,
@@ -62,7 +60,27 @@ pub enum AcpCommands {
         #[arg(long, default_value = "5")]
         timeout_secs: u64,
     },
-    /// SIGKILL a worker immediately (use when `stop` doesn't take).
+    /// Retire unprovable worker ownership after external shutdown confirmation.
+    Recover {
+        /// Session whose ownership evidence to retire.
+        session: String,
+        /// Confirm native processes are stopped for an identifiable missing-route Prime record.
+        #[arg(
+            long,
+            required_unless_present = "confirm_worker_stopped",
+            conflicts_with = "confirm_worker_stopped"
+        )]
+        confirm_prime_stopped: bool,
+        /// Confirm the original runner and all host/container native processes are stopped.
+        /// Accepts malformed, unattested legacy, or externally settled orphan records.
+        #[arg(
+            long,
+            required_unless_present = "confirm_prime_stopped",
+            conflicts_with = "confirm_prime_stopped"
+        )]
+        confirm_worker_stopped: bool,
+    },
+    /// SIGKILL the runner, then settle its native workers.
     Kill {
         /// Session id to kill.
         session: String,
@@ -76,8 +94,7 @@ pub enum AcpCommands {
         #[arg(long)]
         follow: bool,
     },
-    /// Restart a wedged agent worker: stop the existing runner, then
-    /// let the daemon's reconciler spawn a fresh one on the next tick.
+    /// Restart a wedged worker after its runner and native workers have stopped.
     Restart {
         /// Session id whose worker to restart.
         session: String,
@@ -198,9 +215,14 @@ pub async fn run(command: AcpCommands) -> Result<()> {
             all,
             timeout_secs,
         } => stop(session, all, timeout_secs).await,
-        AcpCommands::Kill { session } => kill_now(&session),
+        AcpCommands::Recover {
+            session,
+            confirm_prime_stopped,
+            confirm_worker_stopped,
+        } => recover(&session, confirm_prime_stopped, confirm_worker_stopped),
+        AcpCommands::Kill { session } => kill_now(&session).await,
         AcpCommands::Logs { session, follow } => logs(session, follow),
-        AcpCommands::Restart { session } => restart(&session),
+        AcpCommands::Restart { session } => restart(&session).await,
         AcpCommands::History {
             session,
             since,
@@ -769,39 +791,75 @@ async fn stop(session: Option<String>, all: bool, timeout_secs: u64) -> Result<(
         println!("No matching agent workers.");
         return Ok(());
     }
-    stop_worker_records(&targets, timeout_secs).await;
+    stop_worker_records(&targets, timeout_secs).await?;
     Ok(())
 }
 
 pub(crate) async fn stop_all_workers(timeout_secs: u64) -> Result<usize> {
     use crate::process::worker_registry;
     let targets = worker_registry::list()?;
-    stop_worker_records(&targets, timeout_secs).await;
+    stop_worker_records(&targets, timeout_secs).await?;
     Ok(targets.len())
 }
 
 async fn stop_worker_records(
     targets: &[crate::process::worker_registry::WorkerRecord],
     timeout_secs: u64,
-) {
+) -> Result<()> {
     use crate::process::worker_registry;
+    let mut failures = Vec::new();
     for record in targets {
-        worker_registry::delete(&record.session_id).ok();
-        signal_and_wait(record, timeout_secs).await;
-        println!(
-            "Stopped agent worker for {} (PID {}).",
-            record.session_id, record.pid
-        );
+        let result = async {
+            worker_registry::request_stop(record)?;
+            signal_and_wait(record, timeout_secs).await?;
+            worker_registry::retire_selected(record)?;
+            Ok::<_, anyhow::Error>(())
+        }
+        .await;
+        match result {
+            Ok(()) => println!(
+                "Stopped agent worker for {} (PID {}).",
+                record.session_id, record.pid
+            ),
+            Err(error) => failures.push(format!("{}: {error:#}", record.session_id)),
+        }
     }
+    anyhow::ensure!(
+        failures.is_empty(),
+        "Worker shutdown failures:\n{}",
+        failures.join("\n")
+    );
+    Ok(())
 }
 
-fn kill_now(session: &str) -> Result<()> {
+fn recover(session: &str, confirm_prime_stopped: bool, confirm_worker_stopped: bool) -> Result<()> {
+    if confirm_worker_stopped {
+        crate::process::worker_registry::recover_worker(session)?;
+        println!("Retired unprovable worker ownership for {session} on external shutdown confirmation; AoE did not verify all detached processes.");
+        return Ok(());
+    }
+    anyhow::ensure!(
+        confirm_prime_stopped,
+        "external Prime shutdown must be confirmed"
+    );
+    let record = crate::process::worker_registry::load(session)?
+        .ok_or_else(|| anyhow::anyhow!("No agent worker registry entry for session {session}"))?;
+    crate::process::worker_registry::recover_untracked_prime(&record)?;
+    println!(
+        "Retired untracked Prime record for {} (PID {}, generation {}) on operator confirmation; AoE did not verify native shutdown.",
+        record.session_id, record.pid, record.generation
+    );
+    Ok(())
+}
+
+async fn kill_now(session: &str) -> Result<()> {
     use crate::process::worker_registry;
     let Some(record) = worker_registry::load(session)? else {
         anyhow::bail!("No agent worker registry entry for session {session}");
     };
-    worker_registry::delete(session).ok();
-    crate::process::worker::kill_process_group(record.pid);
+    worker_registry::request_stop(&record)?;
+    signal_and_wait(&record, 0).await?;
+    worker_registry::retire_selected(&record)?;
     println!("Killed agent worker for {} (PID {}).", session, record.pid);
     Ok(())
 }
@@ -809,17 +867,12 @@ fn kill_now(session: &str) -> Result<()> {
 async fn signal_and_wait(
     record: &crate::process::worker_registry::WorkerRecord,
     timeout_secs: u64,
-) {
+) -> Result<()> {
     use crate::process::worker_registry;
-    crate::process::worker::terminate_process_group(record.pid);
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
-    while std::time::Instant::now() < deadline {
-        if !worker_registry::is_pid_alive(record.pid) {
-            return;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-    }
-    crate::process::worker::kill_process_group(record.pid);
+    worker_registry::settle_runner(record, std::time::Duration::from_secs(timeout_secs)).await?;
+    let record = record.clone();
+    tokio::task::spawn_blocking(move || worker_registry::cleanup_runtime(&record)).await??;
+    Ok(())
 }
 
 fn logs(session: Option<String>, follow: bool) -> Result<()> {
@@ -874,17 +927,24 @@ fn logs(session: Option<String>, follow: bool) -> Result<()> {
     Ok(())
 }
 
-fn restart(session: &str) -> Result<()> {
+async fn restart(session: &str) -> Result<()> {
     use crate::process::worker_registry;
     let Some(record) = worker_registry::load(session)? else {
         anyhow::bail!("No agent worker registry entry for session {session}");
     };
+    let intent = worker_registry::request_stop(&record)?;
+    let pid = record.pid;
+    worker_registry::terminate_record_and_wait(record.clone(), ()).await?;
+    worker_registry::admit_resume(
+        session,
+        worker_registry::ResumeAuthority::Explicit,
+        &Some(intent),
+    )?;
     worker_registry::mark_restart_pending(session, record.generation);
-    worker_registry::delete(session).ok();
-    crate::process::worker::terminate_process_group(record.pid);
+
     println!(
         "Stopped runner for {} (PID {}). `aoe serve` will respawn on its next reconciler tick.",
-        session, record.pid
+        session, pid
     );
     Ok(())
 }
@@ -1146,6 +1206,45 @@ fn event_kind(event: &crate::acp::Event) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn bulk_stop_settles_later_workers_after_native_failure() {
+        use crate::process::worker_registry::{self, WorkerRecord};
+        let _app = crate::session::test_support::isolate_app_dir();
+        let make = |id: &str, key: &str| {
+            WorkerRecord::new(
+                id.into(),
+                i32::MAX as u32,
+                worker_registry::socket_path_for(id).unwrap(),
+                key.into(),
+                key.into(),
+                "/tmp".into(),
+                None,
+                vec![],
+                vec![],
+                None,
+                None,
+            )
+        };
+        let failed = make("untracked-prime", "prime-agent");
+        let healthy = make("healthy-worker", "aoe-agent");
+        for record in [&failed, &healthy] {
+            worker_registry::save(record).unwrap();
+        }
+        let error = stop_worker_records(&[failed.clone(), healthy], 0)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("untracked-prime"));
+        assert_eq!(
+            worker_registry::load(&failed.session_id)
+                .unwrap()
+                .unwrap()
+                .pid,
+            failed.pid
+        );
+        assert!(worker_registry::load("healthy-worker").unwrap().is_none());
+    }
 
     #[test]
     fn registry_lifecycle_mirrors_agents_registry() {

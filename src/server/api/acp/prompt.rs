@@ -239,6 +239,7 @@ pub async fn acp_prompt(
             &caller,
             &id,
             SendTurnRequest {
+                resume_authority: crate::process::worker_registry::ResumeAuthority::Explicit,
                 text: &req.text,
                 attachments: &attachments,
                 woke_idle_dormant,
@@ -348,8 +349,12 @@ pub async fn acp_prompt_diff_comments(
     let needs_resume = woke_idle_dormant || !state.acp_supervisor.is_running(&id).await;
     if needs_resume {
         use crate::server::acp_reconciler::ResumeTrigger;
-        match crate::server::acp_reconciler::trigger_resume_background(&state.session_service, &id)
-            .await
+        match crate::server::acp_reconciler::trigger_resume_background(
+            &state.session_service,
+            &id,
+            crate::process::worker_registry::ResumeAuthority::Explicit,
+        )
+        .await
         {
             Ok(ResumeTrigger::NotFound) => return session_not_found(),
             Ok(_) => {}

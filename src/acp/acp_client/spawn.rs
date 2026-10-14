@@ -71,6 +71,16 @@ pub struct SpawnConfig {
     pub provider_routing: Vec<(String, String)>,
 }
 
+impl SpawnConfig {
+    pub(crate) fn uses_native_prime(&self) -> bool {
+        self.wrapper_substitution
+            .as_ref()
+            .map(|(_, base)| base.as_str())
+            .unwrap_or(&self.agent_key)
+            == "prime-agent"
+    }
+}
+
 /// Request-sourced keys may not redirect infrastructure the operator env
 /// controls or hook the dynamic linker. Provider auth keys are allowed.
 pub(super) fn provider_env_denyreason(key: &str) -> Option<&'static str> {
@@ -340,12 +350,104 @@ pub(super) fn native_store_snapshot(
     })
 }
 
+pub(super) fn prime_runtime_for_spawn(
+    config: &SpawnConfig,
+    program: &str,
+    command: &std::process::Command,
+    overrides: &[(String, String)],
+    sandbox_argv: Option<&super::session_sandbox::SandboxArgv>,
+) -> Result<Option<crate::process::prime::PrimeRuntime>, AcpError> {
+    if !config.uses_native_prime() {
+        return Ok(None);
+    }
+    if let (Some(sandbox), Some(argv)) = (&config.sandbox_info, sandbox_argv) {
+        let id = sandbox.container_id.as_ref().ok_or_else(|| {
+            AcpError::Spawn("Prime requires a pinned sandbox container ID".into())
+        })?;
+        let script = format!(
+            r#"printf '%s\n' "${{PRIME_AGENT_CODING_AGENT_DIR:-$HOME/.prime/agent}}"; command -v {}"#,
+            crate::session::environment::shell_escape(&config.spec.command)
+        );
+        let transport = crate::containers::RuntimeExecutionSnapshot::capture(
+            &crate::containers::get_container_runtime(),
+        )
+        .map_err(|e| AcpError::Spawn(e.to_string()))?;
+        let mut probe = transport.command(&[]);
+        probe
+            .args(&argv.docker_args[..argv.exec_prefix_len])
+            .args(["sh", "-c", &script])
+            .envs(argv.inherit_env.iter().map(|(key, value)| (key, value)));
+        let bytes = crate::session::capture::run_with_timeout_limit(
+            probe,
+            std::time::Duration::from_secs(5),
+            "Prime sandbox route",
+            8192,
+        )
+        .map_err(|e| AcpError::Spawn(e.to_string()))?;
+        let output = String::from_utf8(bytes).map_err(|e| AcpError::Spawn(e.to_string()))?;
+        let mut lines = output.lines();
+        let root = lines
+            .next()
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| AcpError::Spawn("Prime sandbox agent-dir missing".into()))?;
+        let native_program = lines
+            .next()
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| AcpError::Spawn("Prime sandbox binary missing".into()))?;
+        let cwd = sandbox
+            .container_workdir
+            .clone()
+            .ok_or_else(|| AcpError::Spawn("Prime sandbox workdir is not pinned".into()))?;
+        return Ok(Some(
+            crate::process::prime::PrimeRuntime::new(
+                native_program.into(),
+                root.into(),
+                Some(crate::process::prime::PrimeContainer {
+                    transport,
+                    id: id.clone(),
+                    cwd: cwd.into(),
+                }),
+            )
+            .map_err(|error| AcpError::Spawn(error.to_string()))?,
+        ));
+    }
+    let env = |key: &str| {
+        overrides
+            .iter()
+            .rev()
+            .find(|(name, _)| name == key)
+            .map(|(_, value)| value.clone())
+            .or_else(|| effective_env_value(command, key))
+    };
+    let root = env("PRIME_AGENT_CODING_AGENT_DIR")
+        .filter(|s| !s.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| {
+            env("HOME")
+                .filter(|s| !s.is_empty())
+                .map(|home| PathBuf::from(home).join(".prime/agent"))
+        })
+        .ok_or_else(|| {
+            AcpError::Spawn("Prime agent-dir and HOME missing from launch environment".into())
+        })?;
+    let root = if root.is_absolute() {
+        root
+    } else {
+        config.cwd.join(root)
+    };
+    Ok(Some(
+        crate::process::prime::PrimeRuntime::new(program.into(), root, None)
+            .map_err(|error| AcpError::Spawn(error.to_string()))?,
+    ))
+}
+
 pub(super) fn spawn_subprocess(
     config: &SpawnConfig,
 ) -> Result<
     (
         tokio::process::Child,
         Option<crate::session::ExecutionBinding>,
+        Option<crate::process::prime::PrimeCleanupGuard>,
     ),
     AcpError,
 > {
@@ -385,6 +487,34 @@ pub(super) fn spawn_subprocess(
     );
 
     let native_store = native_store_snapshot(config, cmd.as_std(), &[]);
+    let prime_runtime = prime_runtime_for_spawn(config, &spawn_command, cmd.as_std(), &[], None)?;
+    if let Some(runtime) = &prime_runtime {
+        let environment: Vec<_> = cmd
+            .as_std()
+            .get_envs()
+            .filter_map(|(key, value)| value.map(|value| (key.to_owned(), value.to_owned())))
+            .collect();
+        let mut owned = tokio::process::Command::new(
+            std::env::current_exe().map_err(|e| AcpError::Spawn(e.to_string()))?,
+        );
+        owned
+            .arg("__prime-agent")
+            .arg("--runtime")
+            .arg(serde_json::to_string(runtime).map_err(|e| AcpError::Spawn(e.to_string()))?)
+            .arg("--")
+            .arg(&spawn_command)
+            .args(&config.spec.args)
+            .arg("--daemon-socket")
+            .arg(runtime.socket())
+            .current_dir(&config.cwd)
+            .env_clear()
+            .envs(environment)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true);
+        cmd = owned;
+    }
     let mut child = cmd.spawn().map_err(|e| {
         warn!(
             target: "acp.protocol.spawn",
@@ -417,7 +547,11 @@ pub(super) fn spawn_subprocess(
             "child has no stderr handle; agent crashes will be silent"
         ),
     }
-    Ok((child, native_store))
+    Ok((
+        child,
+        native_store,
+        prime_runtime.map(|runtime| crate::process::prime::PrimeCleanupGuard(Some(runtime), None)),
+    ))
 }
 
 /// An undrained stderr pipe fills and blocks the agent, which looks like a

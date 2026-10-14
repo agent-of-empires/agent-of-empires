@@ -95,9 +95,10 @@ fn publish_orphaned_turn_stop<S: BroadcastSink>(
     supervisor.synthesize_stopped_for_orphan(session_id, reason);
 }
 
-/// A `Monitor` watch lives inside the agent process, so a replacement process
-/// has lost it; the reminder gives the agent a turn to re-arm it.
-const MONITOR_RESTART_REMINDER: &str = "Note: this session's agent process restarted, so any background Monitor watch that was armed is no longer running. Re-arm it if it's still needed.";
+/// A `Monitor` watch or background command lives inside the agent process, so
+/// a replacement process has lost it; the reminder gives the agent a turn to
+/// re-arm it.
+const MONITOR_RESTART_REMINDER: &str = "Note: this session's agent process restarted, so any background Monitor watch or background command that was running is no longer running. Re-arm or re-run it if it's still needed.";
 
 /// Queues the re-arm reminder once a fresh process replaces the session's worker.
 pub(super) async fn requeue_interrupted_monitor(state: &AppState, session_id: &str) {
@@ -119,7 +120,15 @@ async fn admit(
     id: &str,
     kind: ResumeKind,
 ) -> Result<crate::acp::supervisor::ResumeReservation, ResumeOutcome> {
-    match state.acp_supervisor.begin_resume(id, kind).await {
+    match state
+        .acp_supervisor
+        .begin_resume(
+            id,
+            kind,
+            crate::process::worker_registry::ResumeAuthority::Automatic,
+        )
+        .await
+    {
         Ok(ResumeReservationOutcome::Reserved(r)) => Ok(r),
         Ok(ResumeReservationOutcome::AlreadyPresent) => Err(ResumeOutcome::SpawnFinished),
         Err(e @ SupervisorError::CapacityFull { .. }) => Err(ResumeOutcome::CapacityDeferred {
@@ -213,11 +222,21 @@ pub(super) async fn resume_one(state: Arc<AppState>, target: ResumeTarget) -> Re
                     }
                     Ok(Err(e)) => {
                         tracing::warn!(target: "acp.supervisor", session = %id, "attach failed; terminating the worker and falling back to fresh spawn: {e}");
-                        worker_registry::terminate_and_wait(&id).await;
+                        if worker_registry::terminate_record_and_wait(record, ())
+                            .await
+                            .is_err()
+                        {
+                            return ResumeOutcome::RetryAfterAttachTimeout;
+                        }
                     }
                     Err(_) => {
                         tracing::warn!(target: "acp.supervisor", session = %id, "attach timed out after 3s; terminating the worker and falling back to fresh spawn");
-                        worker_registry::terminate_and_wait(&id).await;
+                        if worker_registry::terminate_record_and_wait(record, ())
+                            .await
+                            .is_err()
+                        {
+                            return ResumeOutcome::RetryAfterAttachTimeout;
+                        }
                         return ResumeOutcome::RetryAfterAttachTimeout;
                     }
                 }
@@ -235,7 +254,12 @@ pub(super) async fn resume_one(state: Arc<AppState>, target: ResumeTarget) -> Re
                     new_runner_version = worker_registry::RUNNER_VERSION,
                     "replacing incompatible structured view runner"
                 );
-                worker_registry::terminate_and_wait(&id).await;
+                if worker_registry::terminate_record_and_wait(record, ())
+                    .await
+                    .is_err()
+                {
+                    return ResumeOutcome::RetryAfterAttachTimeout;
+                }
             }
             AdoptDecision::RespawnStaleIdle => {
                 tracing::info!(
@@ -245,10 +269,22 @@ pub(super) async fn resume_one(state: Arc<AppState>, target: ResumeTarget) -> Re
                     new_build = crate::build_info::BUILD_VERSION,
                     "respawning idle build-stale structured view worker on current binary"
                 );
-                worker_registry::terminate_and_wait(&id).await;
+                if worker_registry::terminate_record_and_wait(record, ())
+                    .await
+                    .is_err()
+                {
+                    return ResumeOutcome::RetryAfterAttachTimeout;
+                }
             }
             // A dead record can still hold a live pid whose socket vanished.
-            AdoptDecision::FreshSpawn => worker_registry::terminate_and_wait(&id).await,
+            AdoptDecision::FreshSpawn => {
+                if worker_registry::terminate_record_and_wait(record, ())
+                    .await
+                    .is_err()
+                {
+                    return ResumeOutcome::RetryAfterAttachTimeout;
+                }
+            }
         }
     }
 
@@ -430,11 +466,11 @@ pub(crate) enum ResumeTrigger {
 pub(crate) async fn trigger_resume_background(
     service: &Arc<SessionService>,
     id: &str,
+    authority: crate::process::worker_registry::ResumeAuthority,
 ) -> Result<ResumeTrigger, SupervisorError> {
-    service.acp_supervisor.forget_stale_cancel(id);
     let reservation = match service
         .acp_supervisor
-        .begin_resume(id, ResumeKind::Spawn)
+        .begin_resume(id, ResumeKind::Spawn, authority)
         .await?
     {
         ResumeReservationOutcome::Reserved(r) => r,
@@ -510,7 +546,10 @@ pub(super) async fn respawn_drained_stale_workers(state: &Arc<AppState>) {
         if let Some(generation) = generation {
             worker_registry::mark_restart_pending(&id, generation);
         }
-        worker_registry::terminate_and_wait(&id).await;
+        if let Err(error) = worker_registry::terminate_and_wait(&id).await {
+            tracing::warn!(target: "acp.supervisor", session = %id, %error, "runtime termination unproven; retaining restart marker");
+            continue;
+        }
         state.acp_supervisor.clear_respawn_pending(&id);
     }
 }
@@ -699,10 +738,7 @@ mod tests {
     #[serial_test::serial]
     async fn a_drained_stale_respawn_keeps_the_restart_marker_of_its_generation() {
         let (_home, state, _project) = test_state("s-drain");
-        let identity = crate::acp::runner_lifecycle::RunnerIdentity {
-            pid: 4242,
-            generation: 4,
-        };
+        let identity = crate::acp::runner_lifecycle::RunnerIdentity::unattested(4242, 4);
         state
             .acp_supervisor
             .test_install_attached("s-drain", identity)
@@ -735,9 +771,13 @@ mod tests {
         state.acp_event_store.record(id, 1, &prompt).unwrap();
         state.acp_supervisor.hydrate_seqs([(id.to_string(), 1)]);
 
-        let trigger = trigger_resume_background(&state.session_service, id)
-            .await
-            .expect("resume is admitted");
+        let trigger = trigger_resume_background(
+            &state.session_service,
+            id,
+            crate::process::worker_registry::ResumeAuthority::Explicit,
+        )
+        .await
+        .expect("resume is admitted");
         assert!(matches!(trigger, ResumeTrigger::Started));
 
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
@@ -774,13 +814,16 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn requeue_interrupted_monitor_queues_only_over_an_armed_monitor() {
-        for armed in [true, false] {
+        // (armed, description): `None` is how a background command arms.
+        for (armed, description) in [
+            (true, Some("watch for X".to_string())),
+            (true, None),
+            (false, None),
+        ] {
             let id = "sess-monitor";
             let (_home, state, _project) = test_state(id);
             if armed {
-                let event = crate::acp::state::Event::MonitorArmed {
-                    description: Some("watch for X".to_string()),
-                };
+                let event = crate::acp::state::Event::MonitorArmed { description };
                 state.acp_event_store.record(id, 1, &event).unwrap();
             }
 

@@ -5,6 +5,7 @@
 //! the public surface, and each concern lives in a submodule.
 
 mod between_prompt;
+mod close;
 mod commands;
 mod config_options;
 mod connection;
@@ -37,6 +38,7 @@ mod transcript_filter;
 mod update_events;
 mod watchdog;
 
+pub use close::CloseSessionOutcome;
 pub(crate) use connection::CANCEL_ESCALATION_GRACE;
 pub use delete::DeleteSessionOutcome;
 pub use errors::{AcpError, IncompatibleAgentError};
@@ -96,6 +98,7 @@ pub struct AcpClient {
     /// The detached runner this client launched, which its lease owns.
     runner_pid: Option<u32>,
     pub(crate) native_store: Option<crate::session::ExecutionBinding>,
+    _prime_runtime: Option<crate::process::prime::PrimeCleanupGuard>,
 }
 
 /// What the connection task needs to serve agent fs/* and terminal/* requests.
@@ -207,6 +210,7 @@ impl Launch {
             _child: child,
             runner_pid: None,
             native_store: None,
+            _prime_runtime: None,
         };
         (client, ready_rx)
     }
@@ -226,6 +230,7 @@ impl AcpClient {
             _child: None,
             runner_pid: None,
             native_store: None,
+            _prime_runtime: None,
         };
         (client, event_tx)
     }
@@ -335,6 +340,10 @@ impl AcpClient {
                     let _ = done.send(());
                     return;
                 }
+                ClientCmd::CloseSession(respond_to) => {
+                    let _ = respond_to.send(CloseSessionOutcome::Unsupported);
+                    "close_session"
+                }
                 ClientCmd::Shutdown => "shutdown",
             };
             record.lock().expect("cmd record mutex").push(name);
@@ -408,7 +417,9 @@ impl AcpClient {
         if let Some(socket_path) = config.socket_path.clone() {
             // A fresh spawn overwrites the registry entry, so reap any prior
             // runner's process group first or its children leak (#1689).
-            crate::process::worker_registry::terminate_and_wait(&session_id.0).await;
+            crate::process::worker_registry::terminate_and_wait(&session_id.0)
+                .await
+                .map_err(|e| AcpError::Spawn(format!("previous runtime cleanup: {e}")))?;
             let runner_sandbox = sandbox.as_ref().map(|(handle, _)| handle);
             let (runner_pid, native_store) =
                 spawn_runner_detached(&config, &socket_path, session_id.0.clone(), runner_sandbox)
@@ -419,7 +430,7 @@ impl AcpClient {
             return Ok(client);
         }
 
-        let (mut child, native_store) = spawn_subprocess(&config)?;
+        let (mut child, native_store, prime_runtime) = spawn_subprocess(&config)?;
         let stdin = child
             .stdin
             .take()
@@ -434,6 +445,10 @@ impl AcpClient {
         let transport = ByteStreams::new(stdin.compat_write(), stdout.compat());
         let events = mpsc::channel(64);
         let (mut client, ready_rx) = launch.start(events, transport, Some(child.clone()), None);
+        client._prime_runtime = prime_runtime.map(|mut guard| {
+            guard.1 = Some(child.clone());
+            guard
+        });
         wait_for_handshake(&label, ready_rx, Some(&child), &install_binary).await?;
         client.native_store = native_store;
         Ok(client)
@@ -754,9 +769,55 @@ impl AcpClient {
             }))
     }
 
+    pub async fn close_session(&self) -> CloseSessionOutcome {
+        let Some(commands) = &self.cmd_tx else {
+            return CloseSessionOutcome::Failed("client not running".into());
+        };
+        let (respond_to, response) = oneshot::channel();
+        let request = async {
+            if commands
+                .send(ClientCmd::CloseSession(respond_to))
+                .await
+                .is_err()
+            {
+                return CloseSessionOutcome::Failed("connect task gone".into());
+            }
+            response
+                .await
+                .unwrap_or_else(|_| CloseSessionOutcome::Failed("respond channel closed".into()))
+        };
+        tokio::time::timeout(
+            close::CLOSE_TIMEOUT + std::time::Duration::from_millis(500),
+            request,
+        )
+        .await
+        .unwrap_or(CloseSessionOutcome::TimedOut)
+    }
+
     pub async fn shutdown(&self) -> Result<(), AcpError> {
+        let native = self
+            ._prime_runtime
+            .as_ref()
+            .and_then(|guard| guard.0.as_ref());
+        if native.is_some() {
+            let _ = self.close_session().await;
+        }
         let cmd_tx = self.cmd_tx.as_ref().ok_or(AcpError::NotRunning)?;
         let _ = cmd_tx.send(ClientCmd::Shutdown).await;
+        if let Some(runtime) = native {
+            if let Some(child) = &self._child {
+                let mut child = child.lock().await;
+                if let Some(pid) = child.id() {
+                    crate::process::kill_process_tree(pid);
+                }
+                child.start_kill().ok();
+            }
+            let runtime = runtime.clone();
+            tokio::task::spawn_blocking(move || runtime.cleanup())
+                .await
+                .map_err(|error| AcpError::Transport(error.to_string()))?
+                .map_err(|error| AcpError::Transport(error.to_string()))?;
+        }
         Ok(())
     }
 

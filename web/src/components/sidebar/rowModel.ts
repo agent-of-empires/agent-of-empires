@@ -56,7 +56,13 @@ export function deriveRowModel(
     idleDecayWindowMs,
     isActive,
     unreadIndicatorEnabled,
-  }: { idleDecayWindowMs: number; isActive: boolean; unreadIndicatorEnabled: boolean },
+    pluginAttention,
+  }: {
+    idleDecayWindowMs: number;
+    isActive: boolean;
+    unreadIndicatorEnabled: boolean;
+    pluginAttention: ReadonlySet<string>;
+  },
 ) {
   const best = bestSession(workspace, idleDecayWindowMs);
   const { sessions } = workspace;
@@ -80,7 +86,7 @@ export function deriveRowModel(
   const isUnread =
     unreadIndicatorEnabled && effectiveUnread && !isActive && !effectiveArchived && effectiveSnoozedUntil == null;
   const status = best.status;
-  const needsAttention = workspaceAttentionCount(workspace) > 0;
+  const needsAttention = workspaceAttentionCount(workspace, pluginAttention) > 0;
   return {
     ...best,
     firstSession,
