@@ -84,6 +84,21 @@ pub(crate) fn rename_exclusive(
     }
 }
 
+#[cfg(unix)]
+pub(crate) fn notify_systemd(message: &[u8]) -> std::io::Result<()> {
+    let Some(destination) = std::env::var_os("NOTIFY_SOCKET").filter(|path| !path.is_empty())
+    else {
+        return Ok(());
+    };
+    let socket = std::os::unix::net::UnixDatagram::unbound()?;
+    socket.set_nonblocking(true)?;
+    #[cfg(target_os = "linux")]
+    platform::connect_systemd_socket(&socket, &destination)?;
+    #[cfg(not(target_os = "linux"))]
+    socket.connect(&destination)?;
+    socket.send(message).map(|_| ())
+}
+
 /// Only use this when output is not piped: a full pipe can wedge the child. Prefer
 /// [`run_with_timeout`].
 pub fn wait_with_timeout(
@@ -572,6 +587,50 @@ fn signal_process_tree(pid: u32, signal: Signal) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[serial_test::parallel]
+    fn notifications_do_not_wait_for_a_saturated_receiver() {
+        use std::os::unix::net::UnixDatagram;
+        use std::sync::mpsc;
+
+        let _exclusion = crate::session::test_support::EnvGuard::read_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("notify.sock");
+        let receiver = UnixDatagram::bind(&path).unwrap();
+        receiver
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            // A fresh sender cannot mistake its own full send buffer for a full receiver.
+            let sender = UnixDatagram::unbound().unwrap();
+            sender.set_nonblocking(true).unwrap();
+            sender.connect(&path).unwrap();
+            match sender.send(b"occupied") {
+                Ok(_) => assert!(Instant::now() < deadline, "receiver queue did not fill"),
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
+                Err(error) => panic!("fill receiver queue: {error}"),
+            }
+        }
+        let _env =
+            crate::session::test_support::EnvGuard::set(&[("NOTIFY_SOCKET", path.as_os_str())]);
+        let (sent, received) = mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            sent.send(notify_systemd(b"READY=1\n")).unwrap();
+        });
+        let result = received.recv_timeout(Duration::from_secs(5));
+        if result.is_err() {
+            // Release a blocking regression before failing the assertion.
+            receiver.recv(&mut [0u8; 32]).unwrap();
+        }
+        worker.join().unwrap();
+        assert!(
+            matches!(&result, Ok(Err(error)) if error.kind() == std::io::ErrorKind::WouldBlock),
+            "a full receiver must not hold up the notifier: {result:?}"
+        );
+    }
 
     #[cfg(target_os = "macos")]
     #[test]
