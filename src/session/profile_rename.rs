@@ -266,11 +266,11 @@ pub(crate) fn rename(old: &str, new: &str) -> Result<()> {
     }
     let old_dir = super::get_profile_dir_path(old)?;
     let new_dir = super::get_profile_dir_path(new)?;
-    anyhow::ensure!(!new_dir.try_exists()?, "Profile '{}' already exists", new);
-    let directory = DirectoryIdentity::read(&old_dir)?
-        .with_context(|| format!("Profile '{old}' does not exist"))?;
     let storage = Storage::open_unwatched(old)?;
     let result = storage.with_profile_rename_locked(|| {
+        anyhow::ensure!(!new_dir.try_exists()?, "Profile '{}' already exists", new);
+        let directory = DirectoryIdentity::read(&old_dir)?
+            .with_context(|| format!("Profile '{old}' does not exist"))?;
         let mut ids: Vec<String> = storage.load()?.into_iter().map(|row| row.id).collect();
         for (_, entry) in entries(&storage)? {
             anyhow::ensure!(
@@ -335,6 +335,88 @@ mod tests {
     use super::*;
     use crate::session::{Instance, LifecycleOperation, Status, View};
     use serial_test::serial;
+    #[test]
+    #[serial]
+    fn concurrent_destination_creation_refuses_rename_without_poisoning_recovery() {
+        let temp = tempfile::tempdir().unwrap();
+        let _home = crate::session::test_support::isolate_app_dir_at(temp.path());
+        let storage = Storage::new_unwatched("before").unwrap();
+        let workspace = crate::session::scratch::provision_scratch_dir("rename-race").unwrap();
+        fs::write(workspace.join("retained"), b"recoverable purge").unwrap();
+        let mut row = Instance::new("race", workspace.to_str().unwrap());
+        row.id = "rename-race".into();
+        row.source_profile = "before".into();
+        row.scratch = true;
+        let generation = row
+            .try_acquire_lifecycle_reservation(
+                LifecycleOperation::Purge,
+                Instance::LIFECYCLE_RESERVATION_TTL,
+                chrono::Utc::now() - chrono::Duration::days(1),
+            )
+            .unwrap();
+        row.status = Status::Deleting;
+        storage
+            .update(|rows, _| {
+                rows.push(row.clone());
+                Ok(())
+            })
+            .unwrap();
+        lifecycle_journal::record(
+            &LifecycleJournalEntry::deletion(
+                row,
+                Status::Idle,
+                storage.sessions_path().to_path_buf(),
+                lifecycle_journal::LifecycleDeletionOptions {
+                    generation,
+                    delete_worktree: false,
+                    delete_branch: false,
+                    delete_sandbox: false,
+                    force_delete: false,
+                    detach_hooks: true,
+                    keep_scratch: false,
+                    purge_acp_transcript: false,
+                },
+            )
+            .with_phase(lifecycle_journal::LifecyclePhase::TeardownStarted),
+        )
+        .unwrap();
+        let transition = super::super::storage::acquire_storage_shared_flock(
+            &super::super::get_app_dir().unwrap(),
+            crate::migrations::v027_isolate_sandbox_stores::LOCK,
+        )
+        .unwrap();
+        let (queued_tx, queued_rx) = std::sync::mpsc::channel();
+        let renamer = std::thread::spawn(move || {
+            let _observer = super::super::storage::observe_lock_contention_for_test(queued_tx);
+            super::super::rename_profile("before", "after")
+        });
+        queued_rx
+            .recv_timeout(std::time::Duration::from_secs(3))
+            .unwrap();
+        super::super::create_profile("after").unwrap();
+        let target = super::super::get_profile_dir_path("after").unwrap();
+        fs::write(
+            target.join("foreign-data"),
+            b"concurrent profile stays untouched",
+        )
+        .unwrap();
+        drop(transition);
+        assert!(renamer.join().unwrap().is_err());
+        super::super::deletion::recover_lifecycle_journals_once().unwrap();
+        assert!(
+            !workspace.exists(),
+            "failed rename poisoned unrelated purge recovery"
+        );
+        assert!(storage.load().unwrap().is_empty());
+        assert_eq!(
+            fs::read(target.join("foreign-data")).unwrap(),
+            b"concurrent profile stays untouched"
+        );
+        assert!(
+            !checkpoint_path().unwrap().exists(),
+            "ordinary conflict left a pending rename"
+        );
+    }
 
     struct OwnedChild(std::process::Child);
     impl Drop for OwnedChild {
