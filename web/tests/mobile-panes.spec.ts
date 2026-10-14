@@ -103,6 +103,29 @@ test.describe("Mobile right panel picker (#1452)", () => {
     await expect(page.locator('[data-tour="sidebar"]')).not.toHaveClass(/-translate-x-full/);
   });
 
+  for (const inset of [0, 40]) {
+    test(`drawer and backdrop start at the header bottom with a ${inset}px top safe-area inset`, async ({ page }) => {
+      await openLiveTerminal(page, { mobile: true, settings: null });
+      const cdp = await page.context().newCDPSession(page);
+      await cdp.send("Emulation.setSafeAreaInsetsOverride", { insets: { top: inset } });
+      await openPicker(page);
+
+      const headerBottom = await page
+        .locator("header")
+        .first()
+        .evaluate((el) => el.getBoundingClientRect().bottom);
+      expect(headerBottom).toBe(48 + inset);
+      await expect.poll(async () => (await picker(page).boundingBox())!.y).toBe(headerBottom);
+      const backdrop = page.getByTestId("mobile-right-panel-picker-backdrop");
+      expect((await backdrop.boundingBox())!.y).toBe(headerBottom);
+
+      // The toggle stays reachable: its click swaps drawers instead of hitting the backdrop.
+      await page.getByRole("button", { name: "Toggle sidebar" }).click();
+      await expect(picker(page)).toBeHidden();
+      await expect(page.locator('[data-tour="sidebar"]')).not.toHaveClass(/-translate-x-full/);
+    });
+  }
+
   test("picker promotes the paired terminal and it survives the keyboard", async ({ page }) => {
     await openLiveTerminal(page, { mobile: true, settings: { mobileFontSize: 10 } });
     await openPicker(page);

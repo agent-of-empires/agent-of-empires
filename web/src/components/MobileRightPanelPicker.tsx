@@ -91,14 +91,14 @@ export function MobileRightPanelPicker({
   return (
     <div className="md:hidden">
       <div
-        className={`fixed top-12 inset-x-0 bottom-0 z-40 bg-black/50 transition-[opacity,visibility] duration-300 motion-reduce:transition-none ${
+        className={`fixed top-[calc(3rem+env(safe-area-inset-top))] inset-x-0 bottom-0 z-40 bg-black/50 transition-[opacity,visibility] duration-300 motion-reduce:transition-none ${
           open ? "opacity-100" : "opacity-0 invisible"
         }`}
         onClick={onClose}
         data-testid="mobile-right-panel-picker-backdrop"
       />
       <div
-        className={`fixed top-12 right-0 bottom-0 z-50 w-[280px] max-w-[85vw] bg-surface-800 border-l border-surface-700/60 flex flex-col pr-[env(safe-area-inset-right)] pb-[env(safe-area-inset-bottom)] transition-[translate,visibility] duration-300 ease-in-out motion-reduce:transition-none ${
+        className={`fixed top-[calc(3rem+env(safe-area-inset-top))] right-0 bottom-0 z-50 w-[280px] max-w-[85vw] bg-surface-800 border-l border-surface-700/60 flex flex-col pr-[env(safe-area-inset-right)] pb-[env(safe-area-inset-bottom)] transition-[translate,visibility] duration-300 ease-in-out motion-reduce:transition-none ${
           open ? "translate-x-0" : "translate-x-full invisible"
         }`}
         role="dialog"
