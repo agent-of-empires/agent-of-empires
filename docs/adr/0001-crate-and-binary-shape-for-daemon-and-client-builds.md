@@ -26,7 +26,7 @@ The Daemon and the Clients must build separately so a Client-only build, first t
 ## Consequences
 
 - The existing `src/daemon/` module is the client side of the Daemon API, so the name `daemon` in code already means "Daemon client". Renaming it is a follow-up, as already scoped in #2734.
-- Where `session`, `tmux`, `hooks` and `migrations` sit relative to `aoe-daemon-client` is not decided here (see the Not yet specified section of #2734).
+- Where `session`, `tmux` and `hooks` sit relative to `aoe-daemon-client` is not decided here (see the Not yet specified section of #2734).
 - Explicit `aoe tui` and `aoe web` subcommands are a follow-up.
 - `main.rs` runs migrations for nearly every subcommand. A Client-only build has no local store to migrate, so it skips them and does not depend on `migrations`. Cutting that dependency is part of the CLI `session` edge work.
 - Windows ships the Client-only `aoe`. It needs a C toolchain for the `-sys` crates (`libgit2-sys`, `libsqlite3-sys`, `aws-lc-sys` and others) until those are made optional.
