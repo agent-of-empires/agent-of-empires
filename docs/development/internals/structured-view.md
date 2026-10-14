@@ -113,6 +113,8 @@ show_tool_durations = true
 wrap_tool_output = false          # initial line wrap of tool output blocks; each block can toggle
 compaction_reminder = false       # opt-in /compact nudge past the threshold
 compaction_reminder_percent = 75  # 1..99
+notice_display = "persistent"     # persistent | timeout | hidden; errors always persist
+notice_timeout_secs = 10          # auto-dismiss delay for notice_display = "timeout"
 silent_orphan_grace_secs = 120    # 0 disables
 auto_stop_idle_secs = 3600        # 0 disables; the next prompt respawns the worker
 rate_limit_auto_resume = false

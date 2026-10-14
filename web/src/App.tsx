@@ -2136,6 +2136,8 @@ function AppContent({
       replayEvents: serverAbout?.acp_replay_events ?? 0,
       compactionReminder: serverAbout?.acp_compaction_reminder ?? false,
       compactionReminderPercent: serverAbout?.acp_compaction_reminder_percent ?? 75,
+      noticeDisplay: serverAbout?.acp_notice_display ?? "persistent",
+      noticeTimeoutSecs: serverAbout?.acp_notice_timeout_secs ?? 10,
     }),
     [
       serverAbout?.acp_show_tool_durations,
@@ -2143,6 +2145,8 @@ function AppContent({
       serverAbout?.acp_replay_events,
       serverAbout?.acp_compaction_reminder,
       serverAbout?.acp_compaction_reminder_percent,
+      serverAbout?.acp_notice_display,
+      serverAbout?.acp_notice_timeout_secs,
     ],
   );
 

@@ -1566,6 +1566,10 @@ pub struct ServerAbout {
     /// Resolved `acp.compaction_reminder_percent`: the context-window
     /// percentage at which the reminder appears.
     pub acp_compaction_reminder_percent: u8,
+    /// Resolved `acp.notice_display`: how the structured view shows agent notices.
+    pub acp_notice_display: crate::session::config::NoticeDisplay,
+    /// Resolved `acp.notice_timeout_secs`, used when `acp_notice_display` is `timeout`.
+    pub acp_notice_timeout_secs: u32,
     /// `"debug"` when built with `debug_assertions`, else `"release"`. The web
     /// UI renders a DEV badge from it so concurrent debug (8081) and release
     /// (8080) instances are distinguishable, PWA installs included.
@@ -1593,6 +1597,8 @@ pub async fn get_about(State(state): State<Arc<AppState>>) -> Json<ServerAbout> 
     let acp_replay_events = acp_cfg.replay_events;
     let acp_compaction_reminder = acp_cfg.compaction_reminder;
     let acp_compaction_reminder_percent = acp_cfg.compaction_reminder_percent;
+    let acp_notice_display = acp_cfg.notice_display;
+    let acp_notice_timeout_secs = acp_cfg.notice_timeout_secs;
     let snapshot = state
         .sleep_inhibit_snapshot
         .load(std::sync::atomic::Ordering::Relaxed);
@@ -1615,6 +1621,8 @@ pub async fn get_about(State(state): State<Arc<AppState>>) -> Json<ServerAbout> 
         acp_replay_events,
         acp_compaction_reminder,
         acp_compaction_reminder_percent,
+        acp_notice_display,
+        acp_notice_timeout_secs,
         build_flavor: if cfg!(debug_assertions) {
             "debug"
         } else {
