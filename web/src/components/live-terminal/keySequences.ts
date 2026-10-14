@@ -21,9 +21,10 @@ export function altPrintableMetaKey(
   if (e.key === "Dead") return null;
   const code = e.key.length === 1 ? e.key.charCodeAt(0) : 0;
   if (code >= 0x20 && code <= 0x7e) {
-    // On macOS Option never yields a bare ASCII Meta key: ASCII here is the layout's Option layer
-    // (Czech Option+ů is ";"), which is text.
-    return isMac ? null : e.key;
+    // On macOS the Option layer yields ASCII text (Czech Option+ů is ";"). A key that is its own
+    // physical letter is a synthetic event (remote desktop, Playwright), so it stays Meta.
+    const ownLetter = /^Key[A-Z]$/.test(e.code) && e.key.toLowerCase() === e.code.slice(3).toLowerCase();
+    return isMac && !ownLetter ? null : e.key;
   }
   // macOS Option+letter composes a symbol (Option+V is "√"): recover the letter from the logical
   // layout map when available (AZERTY KeyQ is "a"), else from the physical key. Letters only.
