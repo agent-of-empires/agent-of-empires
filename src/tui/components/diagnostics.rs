@@ -114,7 +114,7 @@ pub(crate) fn format_bytes(bytes: u64) -> String {
     if bytes >= GIB {
         // Tenths of a GiB, rounded, so 32 GiB reads "32G" and 22.7 GiB "22.7G".
         let tenths = (bytes as u128 * 10 + GIB as u128 / 2) / GIB as u128;
-        if tenths % 10 == 0 {
+        if tenths.is_multiple_of(10) {
             format!("{}G", tenths / 10)
         } else {
             format!("{}.{}G", tenths / 10, tenths % 10)

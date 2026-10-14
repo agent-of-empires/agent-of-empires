@@ -54,7 +54,7 @@ A grouping toggle next to it cycles **By repo** (default), **By group** (the gro
 
 Right-click (long-press on touch) a session row:
 
-- **Pin** floats the workspace to the top in every sort mode. Pin is web-only and distinct from the favorite mark.
+- **Pin** floats the workspace to the top in every sort mode. Pin is web-only and distinct from the favorite mark. Favorites keep their `✦` marker in both normal and compact sidebars.
 - **Archive** tears down every tmux session the workspace owns (pass `kill_pane: false` in the API, or `--no-kill` on the CLI, to skip that) and shuts down the structured-view worker, then sinks the row into the collapsible "Snoozed & archived" footer. An archived session never starts or resumes, whether from a message, **Start**, attaching, or a daemon restart; unarchive it first.
 - **Snooze** sinks the row for a chosen duration (1h through 1w); it wakes when the timer expires, or early if you send a message.
 
@@ -74,7 +74,7 @@ Add one with the **+** on the section header (browse or type a path, optionally 
 
 ![The settings view with its section groups and the profile picker on the Session tab](../../assets/web/settings.png)
 
-Settings are grouped into **Dashboard** (Theme, Notifications for [web push](../../push-notifications.md), Terminal, Panels, Diff, Devices, Security), **Sessions** (Profiles, session defaults, Structured view, MCP servers, Skills), **Environment** (Sandbox, Worktree, Tmux, Sound), and **System** (Updates, Telemetry, Logging, Plugins). On a phone, Settings opens on this grouped list. The panel is generated from the same settings schema as the TUI, so a field declared once appears on both and they cannot drift; fields only the TUI reads sit under a **Terminal UI** fold. The host environment list is the one config knob the dashboard does not surface.
+Settings are grouped into **Dashboard** (Theme, Notifications for [web push](../../push-notifications.md), Terminal, Panels, Diff, Devices, Security), **Sessions** (Profiles, session defaults, Structured view, MCP servers, Skills), **Environment** (Sandbox, Worktree, Tmux, Systemd, Sound), and **System** (Updates, Telemetry, Logging, Plugins). On a phone, Settings opens on this grouped list. The panel is generated from the same settings schema as the TUI, so a field declared once appears on both and they cannot drift; fields only the TUI reads sit under a **Terminal UI** fold. The host environment list is the one config knob the dashboard does not surface.
 
 The profile picker, shown beside the title of tabs that hold profile-overridable fields, scopes which profile you are editing; global settings apply where a profile does not override a field. The **Profiles** tab (`/settings/profiles`) creates, renames, deletes, and sets the default profile, and its **Edit configuration** buttons deep-link into a tab scoped to that profile. Lifecycle hooks are shown read-only with their source, since hooks run arbitrary shell commands; the same applies to agent-command and environment fields. Creating, deleting, or renaming a profile, and saving global settings, are [step-up](../web-dashboard.md#security) actions.
 

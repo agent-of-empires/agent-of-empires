@@ -411,7 +411,8 @@ impl AcpClient {
             crate::process::worker_registry::terminate_and_wait(&session_id.0).await;
             let runner_sandbox = sandbox.as_ref().map(|(handle, _)| handle);
             let (runner_pid, native_store) =
-                spawn_runner_detached(&config, &socket_path, session_id.0.clone(), runner_sandbox)?;
+                spawn_runner_detached(&config, &socket_path, session_id.0.clone(), runner_sandbox)
+                    .await?;
             let mut client = Self::connect_via_socket(socket_path, launch(sandbox)).await?;
             client.runner_pid = Some(runner_pid);
             client.native_store = native_store;

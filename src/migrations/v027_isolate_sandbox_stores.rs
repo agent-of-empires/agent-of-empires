@@ -49,7 +49,7 @@ impl CopyState {
     fn copied_file(&mut self, bytes: u64) {
         self.files += 1;
         self.bytes += bytes;
-        if self.files % 100 == 0 {
+        if self.files.is_multiple_of(100) {
             progress::progress(format!(
                 "{} files, {}",
                 self.files,

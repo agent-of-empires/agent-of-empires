@@ -315,6 +315,7 @@ impl Instance {
             profile,
             &prepared.launch_env.pane,
             &prepared.launch_env.container,
+            Some(&self.id),
         )?;
         if let Some((_, transactions)) = prepared.sandbox_context_reset.as_ref() {
             crate::migrations::v033_isolate_sandbox_content::acknowledge_context_reset(
@@ -887,6 +888,17 @@ else:
                         std::thread::sleep(std::time::Duration::from_millis(10));
                     };
                     assert!(argv.windows(2).any(|pair| pair == ["--session", CHILD]));
+                    if fail_adoption {
+                        assert_eq!(instance.agent_session_id.as_deref(), Some(CHILD));
+                        assert!(matches!(instance.resume_intent, ResumeIntent::Fork { .. }));
+                        assert_eq!(
+                            instance
+                                .resume_binding
+                                .as_ref()
+                                .map(|binding| binding.session_id.as_str()),
+                            Some(PARENT)
+                        );
+                    }
                     observed.set(true);
                     if peer_pin {
                         crate::session::storage::Storage::new_unwatched(profile)
@@ -912,7 +924,11 @@ else:
                 fail_adoption,
                 fail_final,
             );
-            let result = instance.start_with_size_opts(None, false);
+            let result = if fail_adoption {
+                instance.restart_with_size_opts(None, false).map(|_| ())
+            } else {
+                instance.start_with_size_opts(None, false).map(|_| ())
+            };
             assert!(
                 reached.get(),
                 "case ({fail_adoption}, {fail_final}, {peer_pin}): {result:?}\n{}",

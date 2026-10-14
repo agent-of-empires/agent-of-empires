@@ -105,7 +105,7 @@ impl<S: BroadcastSink> Supervisor<S> {
     }
 
     pub async fn publish_user_prompt(&self, session_id: &str, text: String) -> PromptDisposition {
-        self.publish_user_prompt_with_attachments(session_id, text, &[], None, false)
+        self.publish_user_prompt_with_attachments(session_id, text, &[], None, false, None)
             .await
     }
 
@@ -120,6 +120,7 @@ impl<S: BroadcastSink> Supervisor<S> {
         attachments: &[AttachmentBlob],
         prompt_id: Option<String>,
         synthesized: bool,
+        origin_plugin: Option<String>,
     ) -> PromptDisposition {
         let agent_key = self.agent_key_for_session(session_id).await;
         let profile = crate::acp::agent_profiles::resolve(&agent_key);
@@ -149,6 +150,7 @@ impl<S: BroadcastSink> Supervisor<S> {
             attachments: refs,
             prompt_id,
             synthesized,
+            origin_plugin,
         };
         if !self.sink.publish_persisted(session_id, seq, &event) {
             // Roll back so refs never point at blobs that were not published.
@@ -580,6 +582,7 @@ mod tests {
             &[],
             None,
             true,
+            None,
         )
         .await;
 

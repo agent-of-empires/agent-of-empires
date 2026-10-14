@@ -57,6 +57,9 @@ pub struct QueuedPromptEntry {
     pub created_at: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub origin_device: Option<String>,
+    /// Plugin that queued this through `sessions.message.send`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin_plugin: Option<String>,
 }
 
 /// Ephemeral worker lifecycle; never persisted to the event log.

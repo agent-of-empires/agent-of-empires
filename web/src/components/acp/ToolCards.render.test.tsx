@@ -808,18 +808,18 @@ describe("HighlightedBlock stale-content transitions (#3974)", () => {
   });
 
   it("ignores a late resolution from a superseded request (pending A \u2192 committed B \u2192 late A)", async () => {
-    let resolveA!: (v: string | null) => void;
-    vi.mocked(highlightSnippet).mockReturnValueOnce(
-      new Promise<string | null>((res) => {
-        resolveA = res;
-      }),
-    );
+    const pending = Promise.withResolvers<string | null>();
+    const started = Promise.withResolvers<void>();
+    vi.mocked(highlightSnippet).mockImplementationOnce(() => {
+      started.resolve();
+      return pending.promise;
+    });
 
     const { html, text } = await renderWithLateResolution({
       a: readCard("/tmp/a.rs", "fn a() {}"),
       b: readCard("/tmp/README", "plain readme text"),
-      bText: "plain readme text",
-      resolveStale: () => resolveA('<pre class="shiki">OLD_A</pre>'),
+      requestStarted: started.promise,
+      resolveStale: () => pending.resolve('<pre class="shiki">OLD_A</pre>'),
       // Expand the card so the highlighted body renders.
       afterMount: (host) => host.querySelector("button")!.dispatchEvent(new MouseEvent("click", { bubbles: true })),
     });

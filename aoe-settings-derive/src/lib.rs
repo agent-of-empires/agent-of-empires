@@ -328,6 +328,7 @@ fn build_validation(
         "capability_list" => quote!(ValidationKind::CapabilityList),
         "security_opt_list" => quote!(ValidationKind::SecurityOptList),
         "network" => quote!(ValidationKind::Network),
+        "systemd_slice" => quote!(ValidationKind::SystemdSlice),
         range if range.starts_with("range:") => {
             let parts: Vec<&str> = range.trim_start_matches("range:").split(':').collect();
             if parts.is_empty() || parts.len() > 2 {

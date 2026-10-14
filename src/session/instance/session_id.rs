@@ -1498,10 +1498,7 @@ work-opencode = "opencode"
         assert!(!inst.opencode_launch_mirrorable_by_ambient_serve());
     }
 
-    /// A restart prepares the launch twice and resets the conversation to the
-    /// pre-fork seed on the way. The store must be asked once, and the adopted
-    /// child must survive that reset rather than the pane opening a seed id no
-    /// server ever created.
+    /// Reuse observed children only while the fork still targets their parent.
     #[test]
     fn a_store_fork_reuses_the_child_it_already_adopted() {
         let seed = "ses_child000000000000000000000000";

@@ -3,7 +3,8 @@
 use super::FieldDescriptor;
 use crate::session::config::{
     AcpConfig, AuthConfig, DiffConfig, LoggingConfig, SandboxConfig, SessionConfig, SkillsConfig,
-    TelemetryConfig, ThemeConfig, TmuxConfig, UpdatesConfig, WebConfig, WorktreeConfig,
+    SystemdSettings, TelemetryConfig, ThemeConfig, TmuxConfig, UpdatesConfig, WebConfig,
+    WorktreeConfig,
 };
 use crate::sound::SoundConfig;
 use crate::status_hooks::StatusHookConfig;
@@ -27,6 +28,7 @@ fn build_schema() -> Vec<FieldDescriptor> {
     out.extend(WorktreeConfig::settings_descriptors());
     out.extend(SandboxConfig::settings_descriptors());
     out.extend(TmuxConfig::settings_descriptors());
+    out.extend(SystemdSettings::settings_descriptors());
     out.extend(SessionConfig::settings_descriptors());
     out.extend(SoundConfig::settings_descriptors());
     out.extend(StatusHookConfig::settings_descriptors());
@@ -93,6 +95,63 @@ mod tests {
                 max: None
             }
         );
+    }
+
+    #[test]
+    fn systemd_section_is_a_global_only_schema_section() {
+        use super::super::ValidationKind;
+        // (field, widget, validation, advanced)
+        let cases = [
+            ("enabled", WidgetKind::Toggle, ValidationKind::None, false),
+            (
+                "slice",
+                WidgetKind::Text {
+                    multiline: false,
+                    mono: false,
+                },
+                ValidationKind::SystemdSlice,
+                false,
+            ),
+            (
+                "survive_daemon_restart",
+                WidgetKind::Toggle,
+                ValidationKind::None,
+                false,
+            ),
+            (
+                "memory_max",
+                WidgetKind::OptionalText { mono: false },
+                ValidationKind::MemoryLimit,
+                true,
+            ),
+            (
+                "tasks_max",
+                WidgetKind::Number {
+                    min: Some(0),
+                    max: Some(4194304),
+                },
+                ValidationKind::RangeU64 {
+                    min: 0,
+                    max: Some(4194304),
+                },
+                true,
+            ),
+        ];
+        let fields: Vec<&str> = schema_ref()
+            .iter()
+            .filter(|d| d.section == "systemd")
+            .map(|d| d.field.as_str())
+            .collect();
+        assert_eq!(fields, cases.iter().map(|c| c.0).collect::<Vec<_>>());
+        for (field, widget, validation, advanced) in cases {
+            let d = descriptor("systemd", field).unwrap();
+            assert_eq!(d.category, "Systemd", "{field}");
+            assert_eq!(d.widget, widget, "{field}");
+            assert_eq!(d.validation, validation, "{field}");
+            assert_eq!(d.advanced, advanced, "{field}");
+            assert!(!d.profile_overridable, "{field} is global-only");
+            assert!(matches!(d.web_write, WebWritePolicy::Allow), "{field}");
+        }
     }
 
     #[test]

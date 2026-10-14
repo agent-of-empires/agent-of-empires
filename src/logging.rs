@@ -134,6 +134,7 @@ pub const KNOWN_SUB_TARGETS: &[&str] = &[
     "process.tree",
     "process.reap",
     "process.ppid",
+    "process.systemd",
     "update.fetch",
     "update.cache",
     "update.parse",

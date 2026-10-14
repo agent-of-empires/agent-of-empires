@@ -12,6 +12,13 @@ use std::time::{Duration, Instant};
 use serde_json::Value;
 use tempfile::TempDir;
 
+/// The profile every harness session lives in.
+pub const PROFILE: &str = "default";
+
+/// Keeps tests off the developer's user manager; `systemd_scope.rs` opts back
+/// in with its own slice.
+pub const SYSTEMD_OFF: &str = "[systemd]\nenabled = false\n";
+
 pub fn app_dir_in(home: &Path) -> PathBuf {
     if cfg!(any(target_os = "linux", target_os = "macos")) {
         home.join(".config")
@@ -341,12 +348,14 @@ impl TuiTestHarness {
 
         // Skip the welcome, telemetry consent, and hooks dialogs plus update checks.
         let config_dir = app_dir_in(home_dir.path());
-        std::fs::create_dir_all(config_dir.join("profiles").join("default"))
+        std::fs::create_dir_all(config_dir.join("profiles").join(PROFILE))
             .expect("create default profile dir");
+        // Keep `[app_state]` last: tests append bare keys that belong to it.
         let config_content = format!(
             r#"[updates]
 update_check_mode = "off"
 
+{SYSTEMD_OFF}
 [app_state]
 has_seen_welcome = true
 has_responded_to_telemetry = true
@@ -643,7 +652,10 @@ last_seen_version = "{}"
     }
 
     pub fn sessions_path(&self) -> PathBuf {
-        app_dir_in(self.home_path()).join("profiles/default/sessions.json")
+        app_dir_in(self.home_path())
+            .join("profiles")
+            .join(PROFILE)
+            .join("sessions.json")
     }
 
     pub fn read_sessions(&self) -> Value {

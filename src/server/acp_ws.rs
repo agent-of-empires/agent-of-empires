@@ -842,6 +842,7 @@ mod tests {
                 attachments: Vec::new(),
                 prompt_id: None,
                 synthesized: false,
+                origin_plugin: None,
             },
         );
         let folded = state.session_service.fold_control_state("s-fold").await;

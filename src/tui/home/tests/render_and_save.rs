@@ -191,6 +191,55 @@ fn test_show_activity_age_toggles_age_column() {
     );
 }
 
+/// An active row has no age, so with a badge it must not reserve the age slot: the full
+/// title fits and the badge stays right-aligned at the row edge.
+#[test]
+#[serial]
+fn test_empty_age_slot_does_not_truncate_active_title() {
+    let (_temp, _guard) = test_home();
+    let title = "nineteen-char-title";
+    let mut inst = Instance::new(title, "/tmp/a");
+    inst.view = crate::session::View::Structured;
+    inst.status = Status::Running;
+    seed_profile("alpha", &[inst]);
+    let mut view = test_view(Some("alpha"));
+    view.group_by = crate::session::config::GroupByMode::Manual;
+    view.flat_items = view.build_flat_items();
+    let row = view
+        .flat_items
+        .iter()
+        .find(|item| matches!(item, Item::Session { .. }))
+        .cloned()
+        .expect("session row");
+    for show in [true, false] {
+        view.show_activity_age = show;
+        let text = view
+            .render_item_line(
+                &row,
+                false,
+                false,
+                &crate::tui::styles::Theme::default(),
+                35,
+                false,
+            )
+            .spans
+            .iter()
+            .map(|s| s.content.as_ref())
+            .collect::<String>();
+        assert!(text.contains(title), "{show}: {text:?}");
+        assert!(!text.contains('\u{2026}'), "{show}: {text:?}");
+        assert!(
+            text.trim_end().ends_with(" [structured]"),
+            "{show}: {text:?}"
+        );
+        assert_eq!(
+            crate::tui::components::rendered_width(&text),
+            35,
+            "{show}: {text:?}"
+        );
+    }
+}
+
 /// On a row too narrow for title and branch tag, the tag gives way and the title stays.
 #[test]
 #[serial]

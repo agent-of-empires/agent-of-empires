@@ -99,8 +99,7 @@ struct ManagedCaptureLease(std::fs::File);
 
 impl Drop for ManagedCaptureLease {
     fn drop(&mut self) {
-        // Spelled through the trait: `File`'s inherent `unlock` is newer than
-        // this crate's MSRV.
+        // Through the trait, so the release matches the `fs2` lock.
         let _ = fs2::FileExt::unlock(&self.0);
     }
 }

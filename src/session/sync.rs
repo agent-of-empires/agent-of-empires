@@ -530,7 +530,9 @@ const CLI_CAPTURE_POLL_INTERVAL: Duration = Duration::from_millis(200);
 /// resume/recovery silently broke. `finalize_launch` has already started the
 /// poller by the time this runs, so this simply drives the SAME
 /// [`drain_and_persist_session_ids`] path the TUI/daemon use, on a
-/// single-instance slice, until the id lands or `timeout` elapses.
+/// single-instance slice, until the id lands or `timeout` elapses. A
+/// preallocated Pi id counts as landed only once its transcript path is stored,
+/// since the extension publishes the id first.
 ///
 /// Instances with no poller (`ResumeStrategy::Unsupported`, a sandboxed agent
 /// whose container is not up, or a budget-exhausted poller) impose no wait.
@@ -565,6 +567,14 @@ fn capture_launched_session_id_with_wait(
     let start = Instant::now();
     let deadline = start + timeout;
     let mut notified = false;
+    // A preallocated Pi id (a fork child's) is known before Pi publishes its
+    // transcript path, which a restart needs for `--session`, so wait until
+    // that path is stored. A known id of any other agent gives nothing to wait for.
+    let path_pending = inst.pi_session_path.is_none()
+        && inst.agent_session_binding.as_ref().is_some_and(|binding| {
+            binding.provenance == crate::session::ConversationProvenance::Preallocated
+        })
+        && inst.uses_pi_session_sidecar();
     loop {
         // Reuse the fleet drain on a one-element slice. Each pass empties the
         // receiver and keeps its newest observation, so a correction queued
@@ -576,12 +586,19 @@ fn capture_launched_session_id_with_wait(
         while drain_and_persist_session_ids(std::slice::from_mut(inst), file_watch).touched()
             && Instant::now() < deadline
         {}
-        if inst.agent_session_id.is_some() || Instant::now() >= deadline {
+        if (inst.agent_session_id.is_some() && (!path_pending || inst.pi_session_path.is_some()))
+            || Instant::now() >= deadline
+        {
             break;
         }
         if notify && !notified && start.elapsed() >= Duration::from_secs(1) {
+            let awaited = if inst.agent_session_id.is_some() {
+                "transcript path"
+            } else {
+                "session id"
+            };
             eprintln!(
-                "{} is up; waiting for it to report its session id…",
+                "{} is up; waiting for it to report its {awaited}…",
                 inst.tool
             );
             notified = true;
@@ -2081,6 +2098,184 @@ mod tests {
                 .as_deref(),
             Some(fresh)
         );
+    }
+
+    /// A Pi fork child's id is reserved at launch and Pi publishes it before
+    /// its transcript path, so capture must wait for the stored path or the
+    /// next restart lacks `--session`.
+    #[test]
+    #[serial]
+    fn cli_capture_waits_for_the_transcript_path_of_a_preallocated_pi_id() {
+        use crate::session::instance::{ActiveExecution, CaptureContext, SessionSidecarSource};
+        use crate::session::{ConversationBinding, ConversationProvenance, ExecutionBinding};
+
+        let sid = "01a05234-8889-72e2-a7c9-7ebc27b25b79";
+        let launch = "22222222-3333-4333-8444-555555555555";
+        // Wait ticks after which Pi has published (its id, its transcript path).
+        for (id_tick, path_tick) in [(1, 2), (1, 1)] {
+            let (_hooks, _base, _hooks_tmp) = crate::hooks::test_support::BaseGuard::ready();
+            let temp = tempdir().unwrap();
+            let _guard = storage_home_guard(&temp);
+            let root = temp.path().join("pi-root");
+            std::fs::create_dir_all(root.join("store")).unwrap();
+            let root = root.canonicalize().unwrap();
+            let transcript = root
+                .join("store")
+                .join(format!("2026-01-01T00-00-00-000Z_{sid}.jsonl"));
+
+            let profile = format!("sync-cli-preallocated-{path_tick}");
+            let mut inst = Instance::new("cli-capture-preallocated-title", root.to_str().unwrap());
+            inst.source_profile = profile.clone();
+            inst.tool = "pi".to_string();
+            let source = SessionSidecarSource::host_hooks(&inst.id);
+            let binding = ExecutionBinding {
+                agent: "pi".into(),
+                stores: vec![root.join("store")],
+                configuration: Vec::new(),
+                exported_default_store: None,
+                cwd: root.clone(),
+                cwd_filesystem: "host".into(),
+                filesystem: "host".into(),
+            };
+            inst.active_execution = Some(ActiveExecution {
+                launch_id: launch.into(),
+                binding: binding.clone(),
+                capture: Some(CaptureContext::Pi {
+                    source: source.clone(),
+                    root: root.clone(),
+                }),
+                container: None,
+            });
+            // The binding `start.rs` reserves for a fork child.
+            inst.set_agent_conversation(
+                Some(sid.into()),
+                Some(ConversationBinding {
+                    session_id: sid.into(),
+                    execution: Some(binding),
+                    provenance: ConversationProvenance::Preallocated,
+                    transcript_path: None,
+                }),
+                None,
+            );
+            inst.mark_pi_extension_launched_for_test();
+            seed_instance_on_disk(&profile, &inst);
+
+            let poll = crate::session::capture::pi_sidecar_poll_fn(
+                inst.id.clone(),
+                source,
+                inst.active_execution.clone(),
+            );
+            let poller = Arc::new(Mutex::new(SessionPoller::new(
+                format!("test-tmux-{}", inst.id),
+                inst.tool.clone(),
+                inst.active_execution.clone(),
+            )));
+            inst.session_id_poller = Some(poller.clone());
+            let sidecar = crate::hooks::ensure_instance_dir_path(&inst.id).unwrap();
+
+            let inst_id = inst.id.clone();
+            let mut ticks = 0;
+            capture_launched_session_id_with_wait(
+                &mut inst,
+                &FileWatchService::noop(),
+                Duration::from_secs(5),
+                false,
+                |_| {
+                    ticks += 1;
+                    if ticks == id_tick {
+                        crate::hooks::write_session_id_via_guard(&inst_id, sid, Some(launch))
+                            .unwrap();
+                    }
+                    if ticks == path_tick {
+                        std::fs::write(
+                            &transcript,
+                            format!("{}\n", serde_json::json!({"type": "session", "id": sid})),
+                        )
+                        .unwrap();
+                        std::fs::write(
+                            sidecar.join(format!("session_path.{launch}")),
+                            transcript.to_str().unwrap(),
+                        )
+                        .unwrap();
+                    }
+                    if ticks <= path_tick {
+                        let observation = poll().expect("Pi has published its id");
+                        poller
+                            .lock()
+                            .unwrap()
+                            .inject_test_observation(&inst_id, observation);
+                    }
+                },
+            );
+
+            assert_eq!(
+                ticks, path_tick,
+                "capture must wait for the transcript path"
+            );
+            assert_eq!(inst.agent_session_id.as_deref(), Some(sid));
+            assert_eq!(inst.pi_session_path.as_deref(), transcript.to_str());
+            assert_eq!(
+                Storage::new_unwatched(&profile).unwrap().load().unwrap()[0]
+                    .pi_session_path
+                    .as_deref(),
+                transcript.to_str()
+            );
+        }
+    }
+
+    /// Only a Pi transcript path that can still arrive holds the capture: a
+    /// preallocated Claude fork id, or a Pi id whose path is already stored,
+    /// returns on the first pass.
+    #[test]
+    #[serial]
+    fn cli_capture_does_not_wait_for_a_known_id_without_a_pending_transcript() {
+        let (_hooks, _base, _hooks_tmp) = crate::hooks::test_support::BaseGuard::ready();
+        let temp = tempdir().unwrap();
+        let _guard = storage_home_guard(&temp);
+
+        let sid = "019342ab-1234-7def-8901-abcdef777777";
+        // (tool, stored transcript path)
+        let cases = [
+            ("claude", None),
+            (
+                "pi",
+                Some("/home/u/.pi/agent/sessions/--proj--/known.jsonl"),
+            ),
+        ];
+        for (tool, stored_path) in cases {
+            let profile = format!("sync-cli-known-{tool}");
+            let mut inst = Instance::new("cli-capture-known-title", "/tmp/known");
+            inst.source_profile = profile.clone();
+            inst.tool = tool.to_string();
+            inst.agent_session_id = Some(sid.to_string());
+            inst.agent_session_binding = Some(crate::session::ConversationBinding {
+                session_id: sid.to_string(),
+                execution: None,
+                provenance: crate::session::ConversationProvenance::Preallocated,
+                transcript_path: None,
+            });
+            inst.pi_session_path = stored_path.map(str::to_owned);
+            if tool == "pi" {
+                inst.mark_pi_extension_launched_for_test();
+            }
+            seed_instance_on_disk(&profile, &inst);
+            inst.session_id_poller = Some(Arc::new(Mutex::new(SessionPoller::new(
+                format!("test-tmux-{}", inst.id),
+                inst.tool.clone(),
+                inst.active_execution.clone(),
+            ))));
+
+            let mut ticks = 0;
+            capture_launched_session_id_with_wait(
+                &mut inst,
+                &FileWatchService::noop(),
+                Duration::from_secs(1),
+                false,
+                |_| ticks += 1,
+            );
+            assert_eq!(ticks, 0, "{tool} must not wait");
+            assert_eq!(inst.agent_session_id.as_deref(), Some(sid), "{tool}");
+        }
     }
 
     #[test]

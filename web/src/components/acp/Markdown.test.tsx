@@ -343,19 +343,19 @@ describe("ShikiSyntaxHighlighter stale-content transitions (#3974)", () => {
   });
 
   it("ignores a late resolution from a superseded request (pending A → committed B → late A)", async () => {
-    let resolveA!: (v: string | null) => void;
-    vi.mocked(highlightSnippet).mockReturnValueOnce(
-      new Promise<string | null>((res) => {
-        resolveA = res;
-      }),
-    );
+    const pending = Promise.withResolvers<string | null>();
+    const started = Promise.withResolvers<void>();
+    vi.mocked(highlightSnippet).mockImplementationOnce(() => {
+      started.resolve();
+      return pending.promise;
+    });
     const Comp = getSyntaxHighlighter();
 
     const { html, text } = await renderWithLateResolution({
       a: <Comp language="rust" code="fn a() {}" />,
       b: <Comp language={undefined} code="plain b text" />,
-      bText: "plain b text",
-      resolveStale: () => resolveA('<pre class="shiki">OLD_A</pre>'),
+      requestStarted: started.promise,
+      resolveStale: () => pending.resolve('<pre class="shiki">OLD_A</pre>'),
     });
 
     expect(text).toContain("plain b text");

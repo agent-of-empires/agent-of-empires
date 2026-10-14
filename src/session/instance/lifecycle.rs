@@ -104,6 +104,14 @@ impl Instance {
         )
     }
 
+    pub(crate) fn has_fresh_launch_reservation(&self, now: DateTime<Utc>) -> bool {
+        self.has_fresh_lifecycle_reservation(now)
+            && self
+                .lifecycle_reservation
+                .as_ref()
+                .is_some_and(|reservation| reservation.op == LifecycleOperation::Launch)
+    }
+
     pub fn release_lifecycle_reservation_if_owned(
         &mut self,
         operation: LifecycleOperation,
@@ -390,6 +398,9 @@ impl Instance {
         }
         if cleanup_pane {
             let _ = self.kill_clean_locked();
+            // Escapees of the discarded launch outlive its pane. The
+            // reservation still excludes a replacement the sweep would catch.
+            self.release_scope();
         }
         self.last_error = Some(format!("{error:#}"));
         let _ = self.commit_lifecycle_status(storage, LifecycleOperation::Launch, Status::Error);
@@ -640,6 +651,86 @@ mod tests {
             leftover.is_none(),
             "a failed launch must clear its reservation even after a same-generation status drift"
         );
+    }
+
+    /// A rolled-back launch sweeps the session's scope while its reservation
+    /// still excludes a replacement. A rollback that keeps the pane, one whose
+    /// reservation a peer took over, and a restart's pane teardown do not.
+    #[test]
+    #[serial_test::serial]
+    fn a_rolled_back_launch_releases_its_scope_under_the_reservation() {
+        use std::cell::RefCell;
+        use std::rc::Rc;
+
+        let temp = tempfile::tempdir().unwrap();
+        let _home = crate::session::test_support::isolate_app_dir_at(temp.path());
+        let profile = "lifecycle-rollback-scope";
+        let storage = crate::session::storage::Storage::new_unwatched(profile).unwrap();
+        let held_at_release = Rc::new(RefCell::new(Vec::new()));
+        let seen = Rc::clone(&held_at_release);
+        let _probe = crate::process::systemd::release_probe::install(move |id| {
+            let held = crate::session::storage::Storage::new_unwatched(profile)
+                .unwrap()
+                .load()
+                .unwrap()
+                .into_iter()
+                .find(|instance| instance.id == id)
+                .and_then(|instance| instance.lifecycle_reservation)
+                .map(|reservation| reservation.op);
+            seen.borrow_mut().push((id.to_string(), held));
+        });
+        let reserved = |id: &str| {
+            let mut inst = Instance::new(id, "/tmp/test");
+            inst.source_profile = profile.to_string();
+            storage
+                .update(|instances, _groups| {
+                    instances.push(inst.clone());
+                    Ok(())
+                })
+                .unwrap();
+            inst.acquire_lifecycle_reservation(
+                &storage,
+                LifecycleOperation::Launch,
+                Some(Status::Starting),
+            )
+            .unwrap();
+            inst
+        };
+        let error = anyhow::anyhow!("pinned launch exited");
+
+        let mut rolled_back = reserved("rolled-back");
+        rolled_back.fail_reserved_launch(&storage, &error, true);
+        assert_eq!(
+            *held_at_release.borrow(),
+            [(rolled_back.id.clone(), Some(LifecycleOperation::Launch))]
+        );
+        let disk = storage
+            .load()
+            .unwrap()
+            .into_iter()
+            .find(|instance| instance.id == rolled_back.id)
+            .unwrap();
+        assert_eq!(disk.status, Status::Error);
+        assert!(disk.lifecycle_reservation.is_none());
+        held_at_release.borrow_mut().clear();
+
+        let mut kept_pane = reserved("kept-pane");
+        kept_pane.fail_reserved_launch(&storage, &error, false);
+        let restarted = reserved("restarted");
+        restarted.kill_clean_locked().unwrap();
+        let mut superseded = reserved("superseded");
+        storage
+            .update(|instances, _groups| {
+                let stored = instances
+                    .iter_mut()
+                    .find(|instance| instance.id == superseded.id)
+                    .unwrap();
+                stored.lifecycle_generation += 1;
+                Ok(())
+            })
+            .unwrap();
+        superseded.fail_reserved_launch(&storage, &error, true);
+        assert!(held_at_release.borrow().is_empty());
     }
 
     /// The typed title names the agent on the first launch only: the commit clears it on disk,

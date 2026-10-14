@@ -401,8 +401,11 @@ impl Instance {
                 self.id,
             );
         }
-        self.kill_clean_locked()
-            .with_context(|| format!("kill_clean before resume fallback for {}", self.id))?;
+        let killed = self.kill_clean_locked();
+        // Only the sid is kept for the retry; the reservation still fences
+        // a replacement from the sweep.
+        self.release_scope();
+        killed.with_context(|| format!("kill_clean before resume fallback for {}", self.id))?;
         self.status = Status::Error;
         self.last_error = Some(format!(
             "resume failed for sid {}; preserved for explicit retry",
@@ -1114,10 +1117,29 @@ mod tests {
             .unwrap();
         let name = crate::tmux::Session::generate_name(&inst.id, &inst.title);
         let _pane = crate::tmux::test_helpers::TmuxTestSession::from_name(name);
+        // The pane the failed resume discards has its scope released while
+        // the launch reservation still fences a replacement.
+        let held_at_release = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let seen = std::rc::Rc::clone(&held_at_release);
+        let _probe = crate::process::systemd::release_probe::install(move |id| {
+            let held = crate::session::storage::Storage::new_unwatched(profile)
+                .unwrap()
+                .load()
+                .unwrap()
+                .into_iter()
+                .find(|row| row.id == id)
+                .and_then(|row| row.lifecycle_reservation)
+                .map(|reservation| reservation.op);
+            seen.borrow_mut().push((id.to_string(), held));
+        });
         let outcome = inst
             .start_with_resume_fallback(None, true, ResumeAttemptPolicy::Allow)
             .unwrap();
         assert_eq!(outcome, StartOutcome::ResumeFailed { sid: sid.into() });
+        assert_eq!(
+            *held_at_release.borrow(),
+            [(inst.id.clone(), Some(LifecycleOperation::Launch))]
+        );
         assert_eq!(inst.agent_session_binding, known);
         assert_eq!(inst.resume_probe_failed_sid.as_deref(), Some(sid));
         let saved = storage.load().unwrap();

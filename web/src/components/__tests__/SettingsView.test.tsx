@@ -26,6 +26,7 @@ describe("buildSidebar", () => {
       "sandbox",
       "worktree",
       "tmux",
+      "systemd",
       "sound",
       "-- System",
       "updates",

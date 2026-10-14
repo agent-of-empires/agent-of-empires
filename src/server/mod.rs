@@ -33,6 +33,7 @@ pub(crate) mod startup_recovery;
 pub(crate) mod state;
 pub(crate) mod status_poll;
 pub(crate) mod structured_repair;
+mod systemd_reconcile;
 #[cfg(test)]
 mod test_helpers;
 #[cfg(any(test, debug_assertions))]

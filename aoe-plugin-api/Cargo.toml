@@ -2,7 +2,7 @@
 name = "aoe-plugin-api"
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.85"
+rust-version = "1.89"
 publish = false
 description = "Plugin manifest and capability types for the Agent of Empires plugin system (#268)"
 license = "MIT"

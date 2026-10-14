@@ -92,6 +92,13 @@
       "components": ["web/src/components/MobileLiveTerminal.tsx", "web/src/components/LiveTerminalView.tsx"]
     },
     {
+      "id": "terminal.live-scroll-anchor",
+      "kind": "mocked-playwright",
+      "risk": "medium",
+      "specs": ["tests/live-terminal-scroll-anchor.spec.ts", "src/components/live-terminal/pacing.test.ts"],
+      "components": ["web/src/components/MobileLiveTerminal.tsx", "web/src/components/live-terminal/pacing.ts"]
+    },
+    {
       "id": "terminal.mobile-ime-syllable-rewrite",
       "kind": "mocked-playwright",
       "risk": "medium",
@@ -254,7 +261,6 @@
       "risk": "high",
       "specs": [
         "tests/live-terminal-compose.spec.ts",
-        "tests/live/acp-stories/mobile-toolbar-keys.spec.ts",
         "src/components/__tests__/TerminalComposeSheet.test.tsx",
         "src/components/__tests__/LiveTerminalView.compose.test.tsx",
         "src/components/__tests__/MobileTerminalToolbar.test.tsx",
@@ -272,6 +278,18 @@
         "web/src/lib/terminalToolbarKeys.ts",
         "web/src/lib/arrowJoystick.ts"
       ]
+    },
+    {
+      "id": "terminal.mobile-ctrl-consumption",
+      "kind": "live-playwright",
+      "risk": "high",
+      "specs": ["tests/live/acp-stories/mobile-toolbar-keys.spec.ts"],
+      "components": [
+        "web/src/components/MobileTerminalToolbar.tsx",
+        "web/src/components/LiveTerminalView.tsx",
+        "web/src/components/MobileLiveTerminal.tsx"
+      ],
+      "reason": "Checks received terminal bytes and real input focus after ordinary, interrupt, and held toolbar keys consume Ctrl."
     },
     {
       "id": "terminal.selection-hold",
@@ -637,6 +655,13 @@
       "components": []
     },
     {
+      "id": "settings.systemd-persistence",
+      "kind": "live-playwright",
+      "risk": "medium",
+      "specs": ["tests/live/settings-persistence.spec.ts"],
+      "components": ["web/src/components/SettingsView.tsx", "web/src/components/settings/SchemaSection.tsx"]
+    },
+    {
       "id": "settings.acp-persistence",
       "kind": "live-playwright",
       "risk": "high",
@@ -864,13 +889,16 @@
       "components": [
         "web/src/components/SettingsView.tsx",
         "web/src/components/settings/SchemaSection.tsx",
+        "web/src/components/settings/FormFields.tsx",
+        "web/src/lib/api.ts",
         "web/src/components/settings/PluginsSettings.tsx",
         "web/src/components/McpServers.tsx",
         "web/src/components/session-wizard/SessionWizard.tsx",
         "web/src/components/session-wizard/LaunchFooter.tsx",
         "web/src/components/WorkspaceSidebar.tsx",
         "web/src/components/Dashboard.tsx"
-      ]
+      ],
+      "reason": "Curates CityHall settings and wizard; writes 15-minute trash retention through the profile PATCH and retains it after a full reload and profile-qualified settings GET."
     },
     {
       "id": "tips.panel",
@@ -1299,7 +1327,8 @@
       "components": [
         "web/src/components/session-wizard/steps/ProjectStep.tsx",
         "web/src/components/session-wizard/steps/ImportSessionPicker.tsx"
-      ]
+      ],
+      "reason": "Covers partial-list disclosure for empty and nonempty results, with received counts independent of missing-directory and search filters."
     },
     {
       "id": "wizard.scratch-delete-cleans-tempdir",
@@ -1721,7 +1750,8 @@
       "kind": "vitest",
       "risk": "low",
       "specs": ["src/components/__tests__/SessionRowTriage.test.tsx"],
-      "components": ["web/src/components/WorkspaceSidebar.tsx"]
+      "components": ["web/src/components/WorkspaceSidebar.tsx", "web/src/components/sidebar/SessionRow.tsx"],
+      "reason": "Favorite markers remain distinct from pin in normal and compact rows, including favorite-to-nonfavorite updates."
     },
     {
       "id": "sidebar.unread-indicator",
@@ -2008,6 +2038,23 @@
       "notes": "The summary an agent retains on /compact renders as a collapsed card under the compaction divider; replacement and clearing are server-side row patches covered by Rust tests."
     },
     {
+      "id": "acp.plugin-message-origin",
+      "kind": "vitest",
+      "risk": "low",
+      "specs": [
+        "src/components/acp/ThreadMessages.test.tsx",
+        "src/lib/acpTypes.reducer.test.ts",
+        "src/hooks/useAcpSession.test.ts"
+      ],
+      "components": [
+        "web/src/components/acp/activityMessages.ts",
+        "web/src/components/acp/ThreadMessages.tsx",
+        "web/src/hooks/useAcpSession.ts",
+        "web/src/lib/acpTypes.ts"
+      ],
+      "notes": "A prompt a plugin sent through sessions.message.send carries a \"Sent by plugin\" label instead of passing for the user's own; the server stamps the sender on the row, and Send now on a queued row names it so the daemon keeps that sender."
+    },
+    {
       "id": "acp.tool-group-chunking",
       "kind": "vitest",
       "risk": "medium",
@@ -2060,7 +2107,8 @@
       "kind": "live-playwright",
       "risk": "medium",
       "specs": ["tests/live/right-panel.spec.ts"],
-      "components": ["web/src/components/diff/FileContextMenu.tsx", "web/src/lib/openInNewTab.ts"]
+      "components": ["web/src/components/diff/FileContextMenu.tsx", "web/src/lib/openInNewTab.ts"],
+      "reason": "Opens worktree text and a decodable PNG with positive intrinsic width; saves active HTML and refuses deleted files."
     },
     {
       "id": "right-panel.diff",
@@ -2111,7 +2159,8 @@
       "kind": "live-playwright",
       "risk": "medium",
       "specs": ["tests/live/right-panel.spec.ts"],
-      "components": ["web/src/components/FilesPane.tsx", "web/src/components/diff/FileContextMenu.tsx"]
+      "components": ["web/src/components/FilesPane.tsx", "web/src/components/diff/FileContextMenu.tsx"],
+      "reason": "Opens unchanged text and a decodable PNG with positive intrinsic width from the Files pane."
     },
     {
       "id": "right-panel.files-pane-live",
@@ -2161,6 +2210,14 @@
         "web/src/components/diff/DiffFileViewer.tsx",
         "web/src/components/diff/comments/SendCommentsDialog.tsx"
       ]
+    },
+    {
+      "id": "terminal.http-send-normalization",
+      "kind": "live-playwright",
+      "risk": "medium",
+      "specs": ["tests/live/live-terminal.spec.ts"],
+      "components": ["src/server/api/sessions/send.rs"],
+      "reason": "Captures real HTTP terminal input bytes after suffix normalization, including internal content and empty rejection."
     },
     {
       "id": "diff-comments.typed-event",

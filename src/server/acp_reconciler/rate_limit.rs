@@ -420,6 +420,7 @@ mod tests {
             attachments: Vec::new(),
             prompt_id: None,
             synthesized: false,
+            origin_plugin: None,
         };
         let stopped = || Event::Stopped {
             reason: "rate_limited".into(),
@@ -651,6 +652,7 @@ mod tests {
             attachments: Vec::new(),
             created_at: created_at.into(),
             origin_device: None,
+            origin_plugin: None,
         };
         let after = Utc.timestamp_opt(1_700_000_001, 0).unwrap().to_rfc3339();
         let before = Utc.timestamp_opt(1_699_999_999, 0).unwrap().to_rfc3339();
@@ -731,6 +733,7 @@ mod tests {
                     attachments: Vec::new(),
                     created_at: queued_at,
                     origin_device: None,
+                    origin_plugin: None,
                 },
             );
             assert!(

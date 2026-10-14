@@ -84,6 +84,36 @@ jobs:
             exit 1
           fi
 
+  msrv:
+    name: MSRV
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Read rust-version
+        id: msrv
+        run: |
+          python3 -c 'import tomllib; print("version=" + tomllib.load(open("Cargo.toml", "rb"))["package"]["rust-version"])' >> "$GITHUB_OUTPUT"
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with:
+          toolchain: ${{ steps.msrv.outputs.version }}
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          cache-bin: "false"
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      # Lib and bins only: dev-dependencies such as `serial_test` may need a
+      # newer compiler without affecting anyone building aoe.
+      - name: Check the locked graph on rust-version (core)
+        env:
+          MSRV: ${{ steps.msrv.outputs.version }}
+        run: cargo +"$MSRV" check --locked --workspace
+      - name: Check the locked graph on rust-version (web)
+        env:
+          MSRV: ${{ steps.msrv.outputs.version }}
+        run: |
+          mkdir -p target/ci-web-dist
+          printf '<!doctype html><title>aoe msrv placeholder</title>\n' > target/ci-web-dist/index.html
+          AOE_WEB_DIST="$PWD/target/ci-web-dist" cargo +"$MSRV" check --locked --workspace --features web
+
   web-fmt:
     name: Format (web)
     runs-on: ubuntu-latest

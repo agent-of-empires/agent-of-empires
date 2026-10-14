@@ -339,6 +339,46 @@ vt_live = true
 
 Per-option detection reads `~/.tmux.conf`, `$XDG_CONFIG_HOME/tmux/tmux.conf`, and `~/.config/tmux/tmux.conf` for a `set` / `setw` of the option. It is deliberately conservative: an option reached through `source-file`, `if-shell`, a false `%if`, or a key binding is not detected, so set the mode to `"disabled"` if you keep yours in one of those places. `/etc/tmux.conf` is not consulted.
 
+## systemd
+
+```toml
+[systemd]
+enabled = true
+slice = "background-aoe-{profile}.slice"
+survive_daemon_restart = true
+# memory_max = "4G"
+tasks_max = 0
+```
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `enabled` | `true` | Start every session through `systemd-run --user --scope`, so it runs in its own transient systemd scope. Sessions start unscoped when `systemd-run` is missing or the user manager is unreachable. `false` only prevents new scopes and skips the check below; stopping, deleting and trashing sessions still stop their existing scopes. Global only. |
+| `slice` | `"background-aoe-{profile}.slice"` | Template for the slice the session scopes live in; must end in `.slice`. `{profile}` expands to the session's profile name, escaped for systemd: every byte other than ASCII alphanumerics, `:` and `.` becomes `_<hex>` (so `-` and `_` are escaped too, as are spaces, `/` and non-ASCII characters). A value without `{profile}` is used as is. An invalid value falls back to the default with a warning. Global only. |
+| `survive_daemon_restart` | `true` | Keep sessions running when the aoe daemon service stops: agents live in their own scopes, outside the daemon's cgroup. `false` binds the scopes the daemon creates to its service with `PartOf=`, so stopping or restarting the daemon service stops them, and systemd does not start them again; this only takes effect when the daemon itself runs as a `.service`, otherwise it is ignored with a warning. Scopes created from the CLI or TUI are never bound. Global only. |
+| `memory_max` | unset | Memory cap for each session scope, a number followed by `b`, `k`, `m`, or `g` (e.g. `4G`, `512M`, `512b`). Unset or empty means unlimited; any other value is ignored with a warning. Global only. |
+| `tasks_max` | `0` | Task cap for each session scope (0 to 4194304). `0` means unlimited. Global only. |
+
+Each session start runs the agent as `systemd-run --user --scope`, in a fresh scope `aoe-session-<id>-<n>.scope`, where `<n>` is the start time in unix milliseconds. Only the session id reaches systemd: the scope description is `aoe session <first 8 chars of the id>`, and `aoe list` maps the id to the title. With the default `slice` template the scopes sit in `background.slice/background-aoe.slice/background-aoe-<profile>.slice`; a custom `slice` has its own hierarchy. Inspect them with:
+
+```sh
+systemctl --user status 'aoe-session-*'
+systemd-cgls --user
+```
+
+A session that changes profile keeps its old slice until its next start. To cap a whole profile or all of aoe, put limits on the slice itself with `systemctl --user set-property background-aoe-<profile>.slice MemoryMax=8G` or a drop-in. There `<profile>` is the escaped profile name, for example `my_2dprofile` for `my-profile`. The `memory_max` and `tasks_max` settings apply to each session scope on its own. Set `slice` to group sessions elsewhere, for example `aoe.slice`.
+
+aoe checks once per process that `systemd-run` works with the configured limits, with `--expand-environment=no` so `$` in session commands stays literal. The check is one attempt of at most 5 seconds. Sessions start unscoped, with one line in the log, when `systemd-run` or `env` is not on `PATH`, when `systemd-run` cannot reach the user manager or times out, when it rejects the configured `memory_max`/`tasks_max` (a warning naming them), or when `enabled` is `false` (`systemd.enabled=false`). If `systemd-run` fails after that check passed, the session start fails visibly: the tmux pane dies, and an ACP session reports an attach error after the dial deadline, with the `systemd-run` error in the runner log.
+
+Sessions that are already running are not moved into a scope. They stay unscoped until you restart or recreate them; restarting aoe or the daemon does not change that. Stopping, deleting or trashing a session releases its scopes with `systemctl --user stop --no-block`, also when `enabled` is `false`, so scopes started before you turned it off are still stopped. One known limitation: `aoe rm` from the CLI does not shut down the ACP runner of a structured session, so that runner and its scope keep running. Trashing or archiving a tmux session releases them when its pane is killed (the default). ACP sessions release whenever their worker is shut down, for example on archive, snooze, idle auto-stop, rename or a provider switch, and when their first launch fails after the runner registered itself (a runner that exits on its own before that leaves no record, so its scope is not swept). Restarting a tmux session does not release the old scope: it ends when its processes exit. A tmux start or restart whose launch fails once its pane may exist, and a resume whose pane dies right away, release all of the session's scopes, including the old one. aoe creates the scopes; systemd never starts sessions at boot or restarts them after a crash. The `[systemd]` settings are read once per aoe process, so changes take effect after aoe (including the daemon) restarts.
+
+For a sandboxed session only the container CLI or runner process is in the scope, so `memory_max` and `tasks_max` do not constrain the container itself; use the sandbox settings for that.
+
+The tmux server is not scoped. A tmux server started by the daemon lives in the daemon's cgroup, and restarting the daemon service can kill it and every pane with it, although the agent processes are still in their session scopes. Either set `KillMode=process` on the daemon unit (this leaves the daemon's other processes running after a stop), or select a dedicated tmux socket with `tmux.socket_name` whose server is started outside the daemon.
+
+The daemon reports `STATUS=<n> running, <n> waiting, <n> idle` to systemd, visible in `systemctl --user status <daemon unit>`.
+
+`aoe list --json` adds a `systemd_unit` field to live sessions that have a running process, when `enabled` is true and the user manager's socket exists (`$XDG_RUNTIME_DIR/systemd/private`, `$XDG_RUNTIME_DIR/bus` or the socket in `DBUS_SESSION_BUS_ADDRESS`). Its value is the unit glob `aoe-session-<id>-*.scope`. It is the expected pattern, not proof that a unit exists, since the check does not call systemd.
+
 ## Diff
 
 ```toml

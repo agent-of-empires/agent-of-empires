@@ -485,6 +485,7 @@ export type SettingsValidation =
   | { rule: "capability_list" }
   | { rule: "security_opt_list" }
   | { rule: "network" }
+  | { rule: "systemd_slice" }
   | { rule: "cron" }
   | {
       rule: "object_list";

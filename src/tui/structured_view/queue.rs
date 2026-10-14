@@ -74,6 +74,7 @@ impl QueueMirror {
             attachments: Vec::new(),
             created_at: String::new(),
             origin_device: None,
+            origin_plugin: None,
         });
     }
 }
@@ -120,6 +121,7 @@ mod tests {
             attachments: Vec::new(),
             created_at: String::new(),
             origin_device: None,
+            origin_plugin: None,
         };
         q.set_snapshot(vec![entry("b", 5, "second"), entry("a", 2, "first")]);
         assert_eq!(q.text_at(0), Some("first"));

@@ -5,7 +5,7 @@
 import { mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { test, expect } from "../helpers/liveTest";
-import { appDirFor, listSessions, resolveAoeBinary, waitForView } from "../helpers/aoeServe";
+import { SYSTEMD_OFF, appDirFor, listSessions, resolveAoeBinary, waitForView } from "../helpers/aoeServe";
 import {
   postAcp,
   replayJson,
@@ -158,7 +158,7 @@ test("custom agent with agent_acp_cmd runs in structured view", async ({ spawnSe
       mkdirSync(appDir, { recursive: true });
       writeFileSync(
         join(appDir, "config.toml"),
-        `[session.custom_agents]\n"oc-acp" = "true"\n"oc-terminal" = "true"\n\n[session.agent_acp_cmd]\n"oc-acp" = "true acp"\n`,
+        `[session.custom_agents]\n"oc-acp" = "true"\n"oc-terminal" = "true"\n\n[session.agent_acp_cmd]\n"oc-acp" = "true acp"\n\n${SYSTEMD_OFF}`,
       );
     },
   });

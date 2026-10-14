@@ -96,6 +96,7 @@ fn write_config(xdg: &Path, toml: &str) {
     });
     std::fs::create_dir_all(&app).expect("create app dir");
     std::fs::write(app.join("config.toml"), toml).expect("write config.toml");
+    crate::common::disable_systemd_scopes(&app);
 }
 
 /// The disclosure has to be derived from the effective config, not from
@@ -266,6 +267,7 @@ fn hooks_approve_clears_the_launch_gate_for_every_path() {
 
     let socket = tmp.path().join("tmux.sock");
     let _cleanup = TmuxCleanup(socket.clone());
+    write_config(&xdg, "");
 
     // 1. The issue's command: refused, and the refusal says how to clear it.
     let add = run_aoe(

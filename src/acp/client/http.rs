@@ -315,6 +315,7 @@ impl HttpClient {
             attachments: Vec::new(),
             prompt_id: None,
             no_revive,
+            queued_prompt_id: None,
         };
         let path = format!("/api/sessions/{session_id}/acp/prompt");
         let res = self

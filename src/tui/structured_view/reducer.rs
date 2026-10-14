@@ -530,6 +530,7 @@ mod tests {
                 text: "go".into(),
                 attachments: vec![],
                 synthesized: false,
+                origin_plugin: None,
             },
             Event::PromptCapabilities {
                 steering: true,
@@ -773,6 +774,7 @@ mod tests {
             text: "go".into(),
             attachments: vec![],
             synthesized: false,
+            origin_plugin: None,
         };
         let reset = || Event::SessionContextReset {
             reason: "worker restarted".into(),
@@ -883,6 +885,7 @@ mod tests {
                 text: "hi".into(),
                 attachments: Vec::new(),
                 synthesized: false,
+                origin_plugin: None,
             },
             Event::AgentMessageChunk { text: "one".into() },
         ]);

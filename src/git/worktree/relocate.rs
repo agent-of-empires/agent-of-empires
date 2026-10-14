@@ -738,7 +738,8 @@ mod tests {
         let control = named(b"probe-utf8");
         std::fs::create_dir(&control).expect("probe dir must be writable");
         let created = named(b"probe-\xff");
-        if refused(std::fs::create_dir(&created)) || refused(std::fs::rename(&control, created)) {
+        let renamed = named(b"probe-renamed-\xff");
+        if refused(std::fs::create_dir(&created)) || refused(std::fs::rename(&control, renamed)) {
             eprintln!(
                 "skipping move_worktree_relocates_non_utf8_submodule_paths: {} refuses non-UTF-8 names",
                 probe.path().display()

@@ -304,6 +304,7 @@ mod tests {
                 text: text.to_string(),
                 attachments: Vec::new(),
                 synthesized: false,
+                origin_plugin: None,
             }
         }
         let finished_turn = |extra: Vec<Event>, tail: Vec<Event>| {

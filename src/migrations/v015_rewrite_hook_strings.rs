@@ -18,8 +18,9 @@ use std::path::Path;
 use tracing::{debug, info, warn};
 
 use crate::hooks::{
-    has_aoe_marker, install_codex_hooks_with_preserved_state, install_hooks, iter_hook_targets_in,
-    snapshot_codex_hooks_state, HookInstallTarget, HookTarget, HookTargetKind,
+    has_aoe_marker, install_codex_hooks_with_preserved_state, install_codex_json_hooks,
+    install_hooks, iter_hook_targets_in, snapshot_codex_hooks_state, HookInstallTarget, HookTarget,
+    HookTargetKind,
 };
 
 pub fn run() -> Result<()> {
@@ -79,8 +80,12 @@ pub(crate) fn run_in(home: &Path, app_dir: &Path) -> Result<()> {
 /// from "AoE never installed event X."
 fn rewrite_one(target: &HookTarget) -> Result<()> {
     match target.kind {
-        HookTargetKind::JsonSettings | HookTargetKind::CodexJson => {
+        HookTargetKind::JsonSettings => {
             install_hooks(&target.path, &target.events, HookInstallTarget::Host)
+        }
+        HookTargetKind::CodexJson => {
+            install_codex_json_hooks(&target.path, &target.events, HookInstallTarget::Host)
+                .map(drop)
         }
         // Defensive: `iter_hook_targets_in` does not emit `CodexToml` for
         // any registered agent (codex declares `CodexJson`). The arm stays
@@ -449,11 +454,12 @@ mod tests {
         assert!(allow.exists(), "allowlist must be created alongside config");
         let parsed: Value = serde_json::from_str(&fs::read_to_string(&allow).unwrap()).unwrap();
         let approvals = parsed["approvals"].as_array().unwrap();
+        // `pre_llm_call` also approves the foreground identity publisher.
         for approval in approvals {
             let cmd = approval["command"].as_str().unwrap();
             assert!(
-                cmd.contains("case \"$AOE_INSTANCE_ID\""),
-                "allowlist must key on the new hardened command"
+                cmd.contains("case \"$AOE_INSTANCE_ID\"") || cmd.contains("__extract-session-id"),
+                "allowlist must key on the new hardened command; got: {cmd}"
             );
         }
     }
@@ -697,5 +703,33 @@ mod tests {
                 "{default} must not be magicked into existence"
             );
         }
+    }
+
+    /// `[features].hooks = false` means the migration strips AoE entries
+    /// instead of rewriting them, and keeps the user's own hooks.
+    #[test]
+    #[serial_test::serial(shell_env)]
+    fn codex_opt_out_strips_aoe_entries() {
+        let _g = unset_agent_home_env();
+        let (_tmp, home, app_dir) = setup_dirs();
+        let codex = home.join(".codex");
+        fs::create_dir_all(&codex).unwrap();
+        fs::write(codex.join("config.toml"), "[features]\nhooks = false\n").unwrap();
+        write_json(
+            &codex.join("hooks.json"),
+            &serde_json::json!({"hooks": {"SessionStart": [
+                {"hooks": [{"type": "command", "command": LEGACY_STATUS_CMD}]},
+                {"hooks": [{"type": "command", "command": "echo user-only"}]},
+            ]}}),
+        );
+
+        run_in(&home, &app_dir).unwrap();
+
+        let text = fs::read_to_string(codex.join("hooks.json")).unwrap();
+        assert!(
+            !text.contains("aoe-hooks"),
+            "AoE entries left behind: {text}"
+        );
+        assert!(text.contains("echo user-only"), "user hook lost: {text}");
     }
 }

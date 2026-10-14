@@ -112,11 +112,15 @@ pub fn extract_transcript_delta(events: &[(u64, Event)], since_seq: u64) -> (Str
             Event::UserPromptSent {
                 text,
                 synthesized: false,
+                origin_plugin,
                 ..
             } => {
                 agent_open = false;
                 new_turns += 1;
-                out.push_str("\n[User]\n");
+                match origin_plugin {
+                    Some(plugin) => out.push_str(&format!("\n[Plugin {plugin}]\n")),
+                    None => out.push_str("\n[User]\n"),
+                }
                 out.push_str(text.trim());
                 out.push('\n');
             }
@@ -379,6 +383,7 @@ mod tests {
             text: text.into(),
             attachments: vec![],
             synthesized: false,
+            origin_plugin: None,
         }
     }
     fn synthesized_user(text: &str) -> Event {
@@ -387,6 +392,7 @@ mod tests {
             text: text.into(),
             attachments: vec![],
             synthesized: true,
+            origin_plugin: None,
         }
     }
     fn agent(text: &str) -> Event {
@@ -424,6 +430,22 @@ mod tests {
         let (text, snap, turns) = extract_transcript_delta(&events, 3);
         assert!(!text.contains("login") && text.contains("second"));
         assert_eq!((snap, turns), (4, 1));
+    }
+
+    #[test]
+    fn extract_labels_a_plugin_message_with_its_sender_not_as_the_user() {
+        let plugin = Event::UserPromptSent {
+            prompt_id: None,
+            text: "PR #7 was merged".into(),
+            attachments: vec![],
+            synthesized: false,
+            origin_plugin: Some("cron".into()),
+        };
+        let events = vec![(1, user("typed")), (2, plugin)];
+        let (text, _, turns) = extract_transcript_delta(&events, 0);
+        assert!(text.contains("[Plugin cron]\nPR #7 was merged"), "{text}");
+        assert_eq!(text.matches("[User]").count(), 1);
+        assert_eq!(turns, 2);
     }
 
     #[test]

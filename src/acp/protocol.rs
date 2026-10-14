@@ -99,6 +99,11 @@ pub struct PromptRequest {
     /// callers never set it and keep the default revive-as-needed behavior.
     #[serde(default)]
     pub no_revive: bool,
+    /// The queue row this prompt delivers ("Send now"). The daemon consumes the
+    /// row and keeps the sender it stored, so a plugin message is not
+    /// re-attributed to the user.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub queued_prompt_id: Option<String>,
 }
 
 /// `POST /api/sessions/{id}/acp/prompt/diff-comments` body.

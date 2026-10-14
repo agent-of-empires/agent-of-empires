@@ -14,11 +14,14 @@ Runtime conversation changes such as `/clear`, `/new`, fork, continue, or a fres
 | Pi | Yes | Yes | Pane-scoped AoE extension |
 | OMP | Yes | Yes | Pane-scoped routed terminal store |
 | OpenCode | Opt-in | No | AoE-preassigned native id |
-| Gemini CLI, Hermes, Kimi CLI | No | Yes | Isolated managed store |
+| Hermes | Yes | Yes | `pre_llm_call` hook of the CLI or TUI foreground agent (host; subagents and background tasks are never adopted), isolated managed store (sandbox) |
+| Gemini CLI, Kimi CLI | No | Yes | Isolated managed store |
 | Prime Agent | No | Yes | Root-only publication and isolated managed store |
 | Vibe, Droid, Copilot CLI, Settl, Qwen Code, Kiro CLI, Antigravity | No | No | None verified |
 
 `No` means automatic discovery is unsupported there, not that resume is: a user-provided exact id stays authoritative for any agent with a verified resume contract, and agents with no such contract reject automatic resume entirely. OpenCode host capture also needs `session.opencode_preassign_session_id = true`. AoE never scans a shared store or infers an identity from recency. [Importing](#importing-an-existing-conversation) is different: you pick the conversation, and its recency only drives a warning.
+
+Hermes host identity hooks validate the complete JSON payload while retaining only the foreground identity, not the conversation history. Payloads up to 64 MiB are accepted. Larger or malformed payloads do not update the stored identity; the previous identity remains unchanged. This transport limit bounds input processing and temporary token storage, not exact process memory usage.
 
 Sandbox config and conversation stores are staged per AoE instance, including custom `agent_config_dir` roots, and a cross-process lease guards each managed store, so two sessions in the same directory cannot claim each other's conversation.
 
@@ -153,11 +156,11 @@ Upgrading the agent binary from inside a session does not replace the process in
 
 ## Importing an existing conversation
 
-Conversations started outside AoE can be pulled into a structured-view session from the web wizard's **Import session** tab. The tab appears when at least one built-in agent has both its CLI and its ACP adapter installed, since the import resumes through that adapter. Pick the agent, then a conversation: AoE lists it newest first, with its title, working directory, and last activity. It preselects Claude when available and remembers your last pick.
+Conversations started outside AoE can be pulled into a structured-view session from the web wizard's **Import session** tab. The tab appears when at least one built-in agent has both its CLI and its ACP adapter installed, since the import resumes through that adapter. Pick the agent, then a conversation: AoE sorts the returned conversations by activity, showing their title, working directory, and last activity. It preselects Claude when available and remembers your last pick.
 
 Picking one creates a structured-view session in that conversation's recorded working directory and loads it with ACP `session/load`, so the prior transcript is there and you can keep going. It always uses the recorded directory and never creates a worktree or a sandbox, because the conversation only resolves on the host where it started. The original is read in place, not copied.
 
-The list hides conversations not worth importing: ones AoE already owns, scratch sessions, and anything inside an AoE worktree directory. It shows at most the newest 200 and says when it cut the rest. Sessions whose directory no longer exists are hidden until you tick "show missing directories", and then shown disabled. A conversation active in the last 10 minutes, or with no recorded activity, asks for confirmation first: if it is still open in another terminal, two processes would append to the same transcript.
+The list hides conversations not worth importing: ones AoE already owns, scratch sessions, and anything inside an AoE worktree directory. It returns at most 200 conversations. Resource limits can make the returned list partial even below 200; unread pages may contain newer conversations. An empty partial result does not establish that no importable conversations exist. Sessions whose directory no longer exists are hidden until you tick "show missing directories", and then shown disabled. A conversation active in the last 10 minutes, or with no recorded activity, asks for confirmation first: if it is still open in another terminal, two processes would append to the same transcript.
 
 ### Claude
 

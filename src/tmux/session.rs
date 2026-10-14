@@ -286,10 +286,11 @@ impl Session {
         profile: &str,
         extra_env: &[PaneEnvMutation],
     ) -> Result<()> {
-        self.create_with_size_env_inner(working_dir, command, size, profile, extra_env, &[])
+        self.create_with_size_env_inner(working_dir, command, size, profile, extra_env, &[], None)
     }
 
     /// Container target env values are read from an inherited env-file descriptor.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn create_with_size_env_and_container_env(
         &self,
         working_dir: &str,
@@ -298,6 +299,7 @@ impl Session {
         profile: &str,
         extra_env: &[PaneEnvMutation],
         container_env: &[(String, String)],
+        scope_session_id: Option<&str>,
     ) -> Result<()> {
         self.create_with_size_env_inner(
             working_dir,
@@ -306,9 +308,12 @@ impl Session {
             profile,
             extra_env,
             container_env,
+            scope_session_id,
         )
     }
 
+    /// `scope_session_id` runs the pane command in that session's systemd scope.
+    #[allow(clippy::too_many_arguments)]
     fn create_with_size_env_inner(
         &self,
         working_dir: &str,
@@ -317,6 +322,7 @@ impl Session {
         profile: &str,
         extra_env: &[PaneEnvMutation],
         container_env: &[(String, String)],
+        scope_session_id: Option<&str>,
     ) -> Result<()> {
         if self.exists() {
             return Ok(());
@@ -368,8 +374,12 @@ impl Session {
             }
         }
 
+        // Blocking: the first call per process runs the systemd capability probe.
+        let scope =
+            scope_session_id.and_then(|id| crate::process::systemd::scope_prefix_for(id, profile));
+
         let mut env_file = EphemeralEnvFile::create(&protected_env, container_env)?;
-        let wrapped_command = env_file.wrap_command(command)?;
+        let wrapped_command = env_file.wrap_command(command, scope.as_ref())?;
         let mut args = build_create_args(
             &self.name,
             working_dir,
@@ -1831,6 +1841,13 @@ fn raw_byte_batches(bytes: &[u8]) -> Vec<Vec<String>> {
         .collect()
 }
 
+/// Carries a scoped launch into its shell; distinct from the launch's own
+/// heredoc on fd 3 and the container env fd.
+const SCOPED_LAUNCH_FD: u8 = 4;
+const _: () = assert!(
+    SCOPED_LAUNCH_FD != 3 && SCOPED_LAUNCH_FD != crate::session::environment::CONTAINER_EXEC_ENV_FD
+);
+
 /// A one-shot, mode-0600 environment script for a pane command. The guard
 /// owns cleanup until the pane unlinks the file.
 struct EphemeralEnvFile {
@@ -1882,7 +1899,15 @@ impl EphemeralEnvFile {
         Ok(channel)
     }
 
-    fn wrap_command(&self, command: Option<&str>) -> Result<String> {
+    /// `scope` runs the launch as `<prefix> env ... <shell> /dev/fd/4` with the
+    /// launch in a heredoc on fd 4, still a child of the pane shell, so it
+    /// stays out of every argv. `env` restores the pane's `INVOCATION_ID`,
+    /// which `systemd-run` overwrites.
+    fn wrap_command(
+        &self,
+        command: Option<&str>,
+        scope: Option<&crate::process::systemd::ScopePrefix>,
+    ) -> Result<String> {
         let path = self
             .path
             .as_deref()
@@ -1912,10 +1937,33 @@ impl EphemeralEnvFile {
             "rm -f -- {}",
             shell_escape_script_word(&path.to_string_lossy())
         )?;
-        writeln!(file, "{launch}")?;
+        match scope {
+            Some(scope) => {
+                // The inner shell closes fd 4 first, so the agent does not inherit it.
+                let body = format!("exec {SCOPED_LAUNCH_FD}<&-\n{launch}");
+                let mut delimiter = "AOE_SCOPED_LAUNCH".to_string();
+                while body.lines().any(|line| line == delimiter) {
+                    delimiter.push('_');
+                }
+                let words: Vec<String> = scope
+                    .with_env_restore()
+                    .iter()
+                    .map(|word| shell_escape_script_word(word))
+                    .chain([
+                        // Expanded by the pane shell, so it carries the pane's value.
+                        r#"${INVOCATION_ID+"INVOCATION_ID=$INVOCATION_ID"}"#.to_string(),
+                        shell_escape_script_word(&shell),
+                        format!("/dev/fd/{SCOPED_LAUNCH_FD} {SCOPED_LAUNCH_FD}<<'{delimiter}'"),
+                    ])
+                    .collect();
+                writeln!(file, "{}\n{body}\n{delimiter}", words.join(" "))?;
+            }
+            None => writeln!(file, "{launch}")?,
+        }
         file.flush()?;
 
-        // One short script invocation; exports and the command body stay in the file.
+        // The pane command is one short script invocation: exports and the launch
+        // stay in the file.
         Ok(format!(
             "exec {} {}",
             crate::session::environment::shell_escape(&shell),
@@ -4057,7 +4105,7 @@ mod tests {
         )
         .unwrap();
         let path = file.path.as_ref().unwrap().clone();
-        let wrapper = file.wrap_command(Some("omp --help")).unwrap();
+        let wrapper = file.wrap_command(Some("omp --help"), None).unwrap();
         let args = build_create_args("s", "/tmp/work", &[], Some(&wrapper), None);
         assert!(wrapper.starts_with(&format!(
             "exec {} ",
@@ -4115,7 +4163,7 @@ mod tests {
             shell_escape_script_word(&output.to_string_lossy()),
             shell_escape_script_word(&stale_output.to_string_lossy())
         );
-        let wrapper = file.wrap_command(Some(&command)).unwrap();
+        let wrapper = file.wrap_command(Some(&command), None).unwrap();
         let status = std::process::Command::new("sh")
             .args(["-c", &wrapper])
             .env("AOE_TEST_STALE", "inherited")
@@ -4152,7 +4200,7 @@ mod tests {
             crate::session::environment::CONTAINER_EXEC_ENV_PATH,
             shell_escape_script_word(&payload_output.to_string_lossy()),
         );
-        let wrapper = file.wrap_command(Some(&command)).unwrap();
+        let wrapper = file.wrap_command(Some(&command), None).unwrap();
         let script = std::fs::read_to_string(&script_path).unwrap();
 
         assert!(!script.contains("/repo-controlled/bin"));
@@ -4206,6 +4254,304 @@ mod tests {
             &[("MULTILINE".to_string(), "line one\nline two".to_string())],
         )
         .is_err());
+    }
+
+    #[test]
+    fn wrap_command_script_shape() {
+        let f = EphemeralEnvFile::create(&[], &[]).unwrap();
+        f.wrap_command(Some("echo hi"), None).unwrap();
+        let path = f.path.clone().unwrap();
+        let script = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(
+            script,
+            format!(
+                "rm -f -- {}\necho hi\n",
+                shell_escape_script_word(&path.to_string_lossy())
+            )
+        );
+
+        let prefix = crate::process::systemd::ScopePrefix {
+            argv: [
+                "/usr/bin/systemd-run",
+                "--user",
+                "--scope",
+                "--unit=u.scope",
+                "--",
+            ]
+            .map(String::from)
+            .to_vec(),
+            env_bin: "/usr/bin/env".to_string(),
+        };
+        let shell = crate::session::environment::user_posix_shell();
+        let scoped_line = format!(
+            "'/usr/bin/systemd-run' '--user' '--scope' '--unit=u.scope' '--' '/usr/bin/env' \
+             '-u' 'INVOCATION_ID' ${{INVOCATION_ID+\"INVOCATION_ID=$INVOCATION_ID\"}} {} /dev/fd/4 4<<",
+            shell_escape_script_word(&shell),
+        );
+        // (launch, expected heredoc delimiter)
+        let cases = [
+            ("echo hi", "AOE_SCOPED_LAUNCH"),
+            ("cat <<'X'\nAOE_SCOPED_LAUNCH\nX", "AOE_SCOPED_LAUNCH_"),
+        ];
+        for (launch, delimiter) in cases {
+            let f = EphemeralEnvFile::create(&[], &[]).unwrap();
+            let wrapper = f.wrap_command(Some(launch), Some(&prefix)).unwrap();
+            let path = f.path.clone().unwrap();
+            let script = std::fs::read_to_string(&path).unwrap();
+            assert_eq!(
+                script,
+                format!(
+                    "rm -f -- {}\n{scoped_line}'{delimiter}'\nexec 4<&-\n{launch}\n{delimiter}\n",
+                    shell_escape_script_word(&path.to_string_lossy()),
+                ),
+                "scoped launch must follow the rm line and must not be exec'd"
+            );
+            assert!(!wrapper.contains(launch), "{wrapper}");
+        }
+    }
+
+    /// A fake `systemd-run` that drops its flags through `--` and execs the
+    /// rest, so no scope is ever created.
+    #[cfg(target_os = "linux")]
+    fn fake_systemd_run(dir: &std::path::Path, body: &str) -> crate::process::systemd::ScopePrefix {
+        use std::os::unix::fs::PermissionsExt;
+        let shim = dir.join("systemd-run");
+        std::fs::write(&shim, body).unwrap();
+        std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let cfg = crate::process::systemd::ScopeConfig {
+            slice_template: crate::process::systemd::DEFAULT_SLICE_TEMPLATE.to_string(),
+            limits: crate::process::systemd::Limits {
+                memory_max: Some(1 << 30),
+                tasks_max: Some(64),
+            },
+            part_of: None,
+        };
+        let mut argv = vec![shim.to_string_lossy().into_owned()];
+        argv.extend(crate::process::systemd::scope_args(
+            &cfg,
+            "aoe-session-example-1.scope",
+            "aoe session example",
+            "example",
+        ));
+        let env_bin = which::which("env").unwrap().to_string_lossy().into_owned();
+        crate::process::systemd::ScopePrefix { argv, env_bin }
+    }
+
+    #[cfg(target_os = "linux")]
+    const EXEC_AFTER_DASHES: &str = "#!/bin/sh\n\
+        # fake systemd-run: drop everything up to and including \"--\", exec the rest\n\
+        while [ \"$#\" -gt 0 ]; do\n\
+        \x20 if [ \"$1\" = \"--\" ]; then shift; break; fi\n\
+        \x20 shift\n\
+        done\n\
+        exec \"$@\"\n";
+
+    #[test]
+    #[serial_test::serial]
+    #[cfg(target_os = "linux")]
+    fn scoped_launch_behaves_like_unwrapped_launch() {
+        let temp = tempfile::tempdir().unwrap();
+        let prefix = fake_systemd_run(temp.path(), EXEC_AFTER_DASHES);
+        let path = format!(
+            "{}:{}",
+            temp.path().display(),
+            std::env::var("PATH").unwrap_or_default()
+        );
+        let _env = crate::session::test_support::EnvGuard::set(&[
+            ("PATH", path.as_str()),
+            ("HOME", "/home/example"),
+        ]);
+        let launch = "printf '[%s]\\n' \"double \\\"q\\\"\" 'single'\\''q' \"$HOME\" \"`echo back`\" '$HOME'\n\
+                      cd / && echo \"second line $((1 + 2)) $(pwd)\"\n\
+                      EXAMPLE_VAR=assigned sh -c 'echo \"$EXAMPLE_VAR\"'\n\
+                      cat <<'AOE_SCOPED_LAUNCH'\nAOE_SCOPED_LAUNCH-like\nAOE_SCOPED_LAUNCH\n\
+                      sh /dev/fd/3 3<<'AOE_LAUNCH_BODY'\necho nested\nAOE_LAUNCH_BODY\n\
+                      if { true >&4; } 2>/dev/null; then echo fd4-open; else echo fd4-closed; fi";
+        let run = |prefix: Option<&crate::process::systemd::ScopePrefix>| {
+            let f = EphemeralEnvFile::create(&[], &[]).unwrap();
+            let wrapper = f.wrap_command(Some(launch), prefix).unwrap();
+            let out = std::process::Command::new("sh")
+                .args(["-c", &wrapper])
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "{out:?}");
+            String::from_utf8(out.stdout).unwrap()
+        };
+        let unwrapped = run(None);
+        assert_eq!(
+            unwrapped,
+            "[double \"q\"]\n[single'q]\n[/home/example]\n[back]\n[$HOME]\nsecond line 3 /\nassigned\n\
+             AOE_SCOPED_LAUNCH-like\nnested\nfd4-closed\n"
+        );
+        assert_eq!(run(Some(&prefix)), unwrapped);
+    }
+
+    /// The launch stays out of argv, so the per-argument exec limit (128 KiB on
+    /// Linux) does not apply to it.
+    #[test]
+    #[serial_test::serial]
+    #[cfg(target_os = "linux")]
+    fn scoped_launch_larger_than_the_argument_limit_runs() {
+        let _env = crate::session::test_support::EnvGuard::read_lock();
+        let temp = tempfile::tempdir().unwrap();
+        let prefix = fake_systemd_run(temp.path(), EXEC_AFTER_DASHES);
+        let launch = format!(": '{}'\necho big-ok", "x".repeat(300 * 1024));
+        for scope in [None, Some(&prefix)] {
+            let f = EphemeralEnvFile::create(&[], &[]).unwrap();
+            let wrapper = f.wrap_command(Some(&launch), scope).unwrap();
+            let out = std::process::Command::new("sh")
+                .args(["-c", &wrapper])
+                .output()
+                .unwrap();
+            assert_eq!(
+                String::from_utf8_lossy(&out.stdout),
+                "big-ok\n",
+                "scoped={} {out:?}",
+                scope.is_some()
+            );
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    #[cfg(target_os = "linux")]
+    fn scoped_launch_keeps_the_pane_invocation_id() {
+        let _env = crate::session::test_support::EnvGuard::read_lock();
+        let temp = tempfile::tempdir().unwrap();
+        let injecting = format!("#!/bin/sh\nexport INVOCATION_ID=injected\n{EXEC_AFTER_DASHES}");
+        let prefix = fake_systemd_run(temp.path(), &injecting);
+        for pane_value in [None, Some(""), Some("example")] {
+            let f = EphemeralEnvFile::create(&[], &[]).unwrap();
+            let wrapper = f
+                .wrap_command(
+                    Some("printf '[%s]' \"${INVOCATION_ID-unset}\""),
+                    Some(&prefix),
+                )
+                .unwrap();
+            let mut cmd = std::process::Command::new("sh");
+            cmd.args(["-c", &wrapper]);
+            match pane_value {
+                Some(v) => cmd.env("INVOCATION_ID", v),
+                None => cmd.env_remove("INVOCATION_ID"),
+            };
+            let out = cmd.output().unwrap();
+            assert!(out.status.success(), "{out:?}");
+            assert_eq!(
+                String::from_utf8_lossy(&out.stdout),
+                format!("[{}]", pane_value.unwrap_or("unset")),
+                "pane INVOCATION_ID {pane_value:?}"
+            );
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    #[cfg(target_os = "linux")]
+    fn scoped_launch_keeps_container_env_fd() {
+        let _env = crate::session::test_support::EnvGuard::read_lock();
+        let temp = tempfile::tempdir().unwrap();
+        let prefix = fake_systemd_run(temp.path(), EXEC_AFTER_DASHES);
+        let f =
+            EphemeralEnvFile::create(&[], &[("TOKEN".to_string(), "example".to_string())]).unwrap();
+        let launch = format!(
+            "cat <&{}",
+            crate::session::environment::CONTAINER_EXEC_ENV_FD
+        );
+        let wrapper = f.wrap_command(Some(&launch), Some(&prefix)).unwrap();
+        let out = std::process::Command::new("sh")
+            .args(["-c", &wrapper])
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{out:?}");
+        assert_eq!(String::from_utf8_lossy(&out.stdout), "TOKEN=example\n");
+    }
+
+    #[test]
+    #[serial_test::serial]
+    #[cfg(target_os = "linux")]
+    fn scoped_pane_runs_target_and_dies_when_systemd_run_fails() {
+        require_tmux!();
+        let _env = crate::session::test_support::EnvGuard::read_lock();
+        let temp = tempfile::tempdir().unwrap();
+
+        let ok_dir = temp.path().join("ok");
+        std::fs::create_dir(&ok_dir).unwrap();
+        let prefix = fake_systemd_run(&ok_dir, EXEC_AFTER_DASHES);
+        let f = EphemeralEnvFile::create(&[], &[]).unwrap();
+        let marker = "aoe-launch-marker";
+        let launch = format!("# {marker}\nsleep 30");
+        let wrapper = f.wrap_command(Some(&launch), Some(&prefix)).unwrap();
+        let guard = TmuxTestSession::new("aoe_test_scoped_ok");
+        let output = start_test_session(guard.name(), ("80", "24"), &[&wrapper], &[]);
+        assert!(output.status.success(), "{output:?}");
+        // The pane shell stays in the foreground, so watch its descendants
+        // instead of `pane_current_command`.
+        let pane_pid = pane_field(&only_pane_id(guard.name()), "#{pane_pid}");
+        let descendants = || {
+            let mut found = Vec::new();
+            let mut queue = vec![pane_pid.clone()];
+            while let Some(pid) = queue.pop() {
+                let children = std::fs::read_to_string(format!("/proc/{pid}/task/{pid}/children"))
+                    .unwrap_or_default();
+                queue.extend(children.split_whitespace().map(str::to_string));
+                found.push(pid);
+            }
+            found
+        };
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let tree = loop {
+            let tree = descendants();
+            let sleeping = tree.iter().any(|pid| {
+                std::fs::read_to_string(format!("/proc/{pid}/comm"))
+                    .is_ok_and(|comm| comm.trim() == "sleep")
+            });
+            if sleeping {
+                break tree;
+            }
+            assert!(Instant::now() < deadline, "pane never ran the target");
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        for pid in tree {
+            let cmdline = std::fs::read(format!("/proc/{pid}/cmdline")).unwrap_or_default();
+            assert!(
+                !String::from_utf8_lossy(&cmdline).contains(marker),
+                "launch text in the argv of {pid}: {cmdline:?}"
+            );
+        }
+
+        let fail_dir = temp.path().join("fail");
+        std::fs::create_dir(&fail_dir).unwrap();
+        let prefix = fake_systemd_run(&fail_dir, "#!/bin/sh\nexit 1\n");
+        let f = EphemeralEnvFile::create(&[], &[]).unwrap();
+        let started = temp.path().join("started");
+        let launch = format!(
+            "touch {}\nsleep 30",
+            shell_escape_script_word(&started.to_string_lossy())
+        );
+        let wrapper = f.wrap_command(Some(&launch), Some(&prefix)).unwrap();
+        let failing = TmuxTestSession::new("aoe_test_scoped_fail");
+        let name = failing.name().to_string();
+        let output = start_test_session(
+            &name,
+            ("80", "24"),
+            &[&wrapper],
+            &[";", "set-option", "-p", "-t", &name, "remain-on-exit", "on"],
+        );
+        assert!(output.status.success(), "{output:?}");
+        let pane = only_pane_id(&name);
+        // tmux can report the pane dead before it reaps the exit status, so
+        // the marker, not `pane_dead_status`, proves the target never ran.
+        wait_for_pane_dead(&pane);
+        assert!(!started.exists(), "the launch must not run unscoped");
+        drop(failing);
+        let exists = crate::tmux::tmux_command()
+            .args(["has-session", "-t", &format!("={name}")])
+            .output()
+            .unwrap();
+        assert!(
+            !exists.status.success(),
+            "failed pane session must be cleaned up"
+        );
     }
 
     #[test]

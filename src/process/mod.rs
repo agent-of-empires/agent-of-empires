@@ -230,6 +230,8 @@ pub(crate) const HAS_CODEX_MANAGED_PREFERENCES: bool = true;
 
 pub(crate) mod metrics;
 
+pub mod systemd;
+
 pub mod worker;
 
 pub mod worker_registry;
