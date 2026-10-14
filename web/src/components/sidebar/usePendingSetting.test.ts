@@ -107,4 +107,17 @@ describe("usePendingSetting", () => {
     expect(h.value()).toBe("b");
     expect(h.onError).not.toHaveBeenCalled();
   });
+
+  it("does not flicker when a stale read echoes the last settled pick", async () => {
+    const h = setup();
+    h.pick("a");
+    await h.settle(0, true);
+    h.pick("b");
+    h.poll("a");
+    expect(h.value()).toBe("b");
+    await h.settle(1, true);
+    h.pick("x");
+    h.poll("b");
+    expect(h.value()).toBe("x");
+  });
 });

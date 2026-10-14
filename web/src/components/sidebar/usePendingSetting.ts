@@ -5,7 +5,7 @@ interface Pending<T> {
   value: T;
   /** The server value when the first pick was made. */
   from: T;
-  /** Picks whose saves are still in flight. */
+  /** Picks whose saves are in flight, plus the last settled one, which a read in flight may still echo. */
   sent: T[];
   /** Read ordinal at the moment every save had settled; null while any is in flight. */
   settledAt: number | null;
@@ -40,7 +40,7 @@ export function usePendingSetting<T>(server: T, save: (next: T) => Promise<boole
         setPending(null);
         onError();
       } else if (inflight.current === 0) {
-        setPending((p) => (p ? { ...p, sent: [], settledAt: startedReads() } : p));
+        setPending((p) => (p ? { ...p, sent: [p.value], settledAt: startedReads() } : p));
       }
     });
   };
