@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { fetchPluginUiState, type PluginUiEntry, type PluginUiNotification } from "../lib/api";
+import { fetchPluginUiState, type PluginPage, type PluginUiEntry, type PluginUiNotification } from "../lib/api";
 import { reportError, reportInfo, reportOpenLink } from "../lib/toastBus";
 
 const POLL_INTERVAL = 3000;
@@ -22,6 +22,8 @@ const REFRESH_INDICATOR_DELAY = 250;
 export function usePluginUiState() {
   const [entries, setEntries] = useState<PluginUiEntry[]>([]);
   const [revisions, setRevisions] = useState<Record<string, Record<string, number>>>({});
+  // `null` until the first snapshot, so a deep link waits instead of reporting an unknown page.
+  const [pages, setPages] = useState<PluginPage[] | null>(null);
   const [isRefreshing, setIsRefreshing] = useState(false);
   const lastNotifySeqRef = useRef<number | null>(null);
   const pokeRef = useRef<() => void>(() => {});
@@ -65,6 +67,9 @@ export function usePluginUiState() {
         if (cancelled || state === null) return;
         setEntries(state.entries);
         setRevisions(state.revisions ?? {});
+        // Pages rarely change, so keep the identity and spare the TopBar and palette a re-render.
+        const nextPages = state.pages ?? [];
+        setPages((prev) => (JSON.stringify(prev) === JSON.stringify(nextPages) ? prev : nextPages));
         apply(state.notifications);
       } finally {
         if (slowTimer) clearTimeout(slowTimer);
@@ -94,5 +99,5 @@ export function usePluginUiState() {
 
   const poke = useCallback(() => pokeRef.current(), []);
 
-  return { entries, revisions, isRefreshing, poke };
+  return { entries, revisions, pages, isRefreshing, poke };
 }
