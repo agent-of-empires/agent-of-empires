@@ -74,7 +74,7 @@ A Session with output the user has not looked at since it last changed.
 ### Where sessions run
 
 **Project**:
-A registered repository directory in the project registry, with its own defaults such as base branch and Smart rename. Scoped Global or to one Profile.
+A registered directory in the project registry, usually a Repository, with its own defaults such as base branch and Smart rename. Scoped Global or to one Profile.
 _Avoid_: saved project, repo (for the registry entry), folder
 
 **Working directory**:
