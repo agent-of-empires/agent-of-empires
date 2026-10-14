@@ -240,6 +240,10 @@ A remote path to the Web dashboard through Cloudflare or Tailscale.
 A signed-in browser login to the Web dashboard, listed in Connected Devices and revocable there.
 _Avoid_: login session, subscription
 
+**Principal**:
+Who a request to the Daemon acts as: the local owner over the Unix socket, a Device, or a Proxy such as CityHall's. A Daemon serves exactly one human; users and accounts belong to CityHall (#4394).
+_Avoid_: user, owner, account
+
 **Push subscription**:
 A browser's Web Push registration, bound to the current access token and dropped when it rotates.
 _Avoid_: device
