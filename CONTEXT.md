@@ -251,8 +251,11 @@ A named permission a Plugin requests in its Manifest and is granted at install.
 _Avoid_: agent capability (different concept), permission
 
 **Trust level**:
-How much AoE trusts a Plugin: builtin, featured, community or local.
-_Avoid_: validation state
+How a Plugin was admitted: builtin or community.
+
+**Validation**:
+Where a Plugin came from: builtin, featured, community or local. Labelled "validation" in the CLI, TUI and web.
+_Avoid_: trust level (different concept)
 
 **Plugin worker**:
 A Plugin's child process, supervised by the Daemon. Always qualified, to separate it from Worker.
