@@ -7,11 +7,17 @@ import {
   type ExternalStoreAdapter,
   type ThreadMessageLike,
 } from "@assistant-ui/react";
-import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode, type SetStateAction } from "react";
 
 import { useAcpSession } from "../../hooks/useAcpSession";
 import { useHistoryWindow } from "../../hooks/useHistoryWindow";
-import { clearDraft, getDraftAttachments, setDraftAttachments } from "../../lib/acpDrafts";
+import {
+  clearDraft,
+  getDraftAttachments,
+  notifyAttachmentRestoreFailure,
+  setDraftAttachments,
+} from "../../lib/acpDrafts";
+import { MAX_ATTACHMENTS } from "./composerInput";
 import { isVisiblyBusy } from "../../lib/acpTypes";
 import type { AcpState, ApprovalDecision, ElicitationResolution, PromptAttachmentInput } from "../../lib/acpTypes";
 import { useAgentProfile } from "../../lib/agentProfileContext";
@@ -80,25 +86,52 @@ function RuntimeHost({ adapter, children }: { adapter: ExternalStoreAdapter<Thre
   return <AssistantRuntimeProvider runtime={runtime}>{children}</AssistantRuntimeProvider>;
 }
 
-/** Staged attachments persisted per session, with a ref mirror for `onNew`. */
+/** Staged attachments persisted per session. The ref is the source of truth for `onNew`
+ *  and for functional updates, so persistence happens in the setter instead of an effect. */
 function usePendingAttachments(sessionId: string) {
-  // The view remounts per session, so the initializer seeds the right draft once.
-  const [pendingAttachments, setPendingAttachments] = useState<PromptAttachmentInput[]>(() =>
-    getDraftAttachments(sessionId),
-  );
+  const [pendingAttachments, setState] = useState<PromptAttachmentInput[]>([]);
   const pendingAttachmentsRef = useRef<PromptAttachmentInput[]>(pendingAttachments);
-  useEffect(() => {
-    pendingAttachmentsRef.current = pendingAttachments;
-  }, [pendingAttachments]);
-  // Skip the first run: re-serializing the just-loaded base64 would be wasted work.
+  // The view remounts per session. Writes wait for the async restore so the empty initial
+  // state cannot delete the stored draft.
   const hydratedRef = useRef(false);
+  const setPendingAttachments = useCallback(
+    (action: SetStateAction<PromptAttachmentInput[]>) => {
+      const next = typeof action === "function" ? action(pendingAttachmentsRef.current) : action;
+      pendingAttachmentsRef.current = next;
+      setState(next);
+      if (hydratedRef.current) void setDraftAttachments(sessionId, next);
+    },
+    [sessionId],
+  );
   useEffect(() => {
-    if (!hydratedRef.current) {
+    let cancelled = false;
+    void getDraftAttachments(sessionId).then((stored) => {
+      // A failed read leaves the runtime unhydrated, so a staged attachment cannot overwrite
+      // the draft that may still be intact in storage.
+      if (stored === null) {
+        if (!cancelled) notifyAttachmentRestoreFailure(sessionId);
+        return;
+      }
+      // Anything staged while the read was in flight goes after the restored set, and near the
+      // cap the older stored files yield.
+      const staged = pendingAttachmentsRef.current;
+      const merged =
+        staged.length === 0 ? stored : stored.slice(0, Math.max(0, MAX_ATTACHMENTS - staged.length)).concat(staged);
+      if (cancelled) {
+        // Navigated away mid-read: still persist what was staged, but leave the shared state alone.
+        if (staged.length > 0) void setDraftAttachments(sessionId, merged);
+        return;
+      }
       hydratedRef.current = true;
-      return;
-    }
-    setDraftAttachments(sessionId, pendingAttachments);
-  }, [sessionId, pendingAttachments]);
+      pendingAttachmentsRef.current = merged;
+      setState(merged);
+      // Without staged files the merge is exactly what storage already holds.
+      if (staged.length > 0) void setDraftAttachments(sessionId, merged);
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [sessionId]);
   return { pendingAttachments, setPendingAttachments, pendingAttachmentsRef };
 }
 
@@ -179,8 +212,6 @@ export function AcpRuntime({
       if (!text && attachments.length === 0) return;
       // Clear drafts before awaiting: an unmount mid-send must not rehydrate what was sent.
       clearDraft(sessionId);
-      pendingAttachmentsRef.current = [];
-      setDraftAttachments(sessionId, []);
       setPendingAttachments([]);
       await acp.sendPrompt(text, attachments);
     },
