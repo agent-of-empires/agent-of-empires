@@ -131,8 +131,8 @@ async fn main() -> Result<()> {
     }
 
     if let Some(err) = serve_unavailable_error(&cli) {
-    err.exit();
-}
+        err.exit();
+    }
 
     if let Some(url) = &cli.daemon_url {
         // SAFETY: single-threaded at this point — we haven't entered
