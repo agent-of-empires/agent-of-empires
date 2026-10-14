@@ -84,6 +84,12 @@ impl RuntimeExecutionSnapshot {
         command
     }
 
+    pub(crate) fn container_exists(&self, id: &str) -> anyhow::Result<bool> {
+        Ok(self
+            .runtime()
+            .does_container_exist_with_command(id, &mut self.command(&[]))?)
+    }
+
     fn probe(&self, args: &[&str]) -> anyhow::Result<Vec<u8>> {
         let args = args.iter().map(|arg| (*arg).to_owned()).collect::<Vec<_>>();
         let output = self.runtime().base.probe_output(&mut self.command(&args))?;

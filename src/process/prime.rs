@@ -899,6 +899,16 @@ done"#;
         }
         let _lock = self.lock_proof()?;
         let mut proof = self.read_proof()?;
+        if let Some(container) = &self.container {
+            if !container.transport.container_exists(&container.id)? {
+                proof.processes.clear();
+                proof.settled = true;
+                self.write_proof(&proof)?;
+                state.observation = None;
+                state.cleaned = true;
+                return Ok(());
+            }
+        }
         let exists = self.directory_exists(proof.settled)?;
         let epoch = self.process_epoch()?;
         if proof
@@ -1237,6 +1247,99 @@ pub async fn run(args: PrimeRunnerArgs) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[serial_test::serial]
+    fn removed_container_settles_only_after_a_definitive_frozen_transport_probe() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let root = tempfile::tempdir().unwrap();
+        let _home = crate::session::test_support::isolate_app_dir_at(root.path());
+        let executable = root.path().join("runtime");
+        std::fs::write(&executable, r#"#!/bin/sh
+case "$1" in
+  container|logs)
+    case "$CASE" in
+      missing) echo 'Error: container not found: pinned; No such container: pinned' >&2; exit 1 ;;
+      daemon) echo 'Cannot connect to the Docker daemon; unable to connect to Podman socket; failed to connect to container daemon; container not found; No such container: pinned' >&2; exit 1 ;;
+      permission) echo 'permission denied while trying to connect to the docker daemon socket; permission denied accessing container socket; container not found; No such container: pinned' >&2; exit 1 ;;
+      ambiguous) echo 'container with ID pinned failed to execute' >&2; exit 1 ;;
+      present) exit 0 ;;
+    esac ;;
+esac
+echo 'guest execution refused' >&2
+exit 42
+"#).unwrap();
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+        for kind in [
+            crate::session::ContainerRuntimeName::Docker,
+            crate::session::ContainerRuntimeName::Podman,
+            crate::session::ContainerRuntimeName::AppleContainer,
+        ] {
+            for case in [
+                "missing",
+                "daemon",
+                "permission",
+                "ambiguous",
+                "present",
+                "not-installed",
+            ] {
+                let runtime = PrimeRuntime::new(
+                    "/bin/false".into(),
+                    root.path().join("agent"),
+                    Some(PrimeContainer {
+                        transport: crate::containers::RuntimeExecutionSnapshot {
+                            kind,
+                            program: if case == "not-installed" {
+                                root.path().join("absent-binary")
+                            } else {
+                                executable.clone()
+                            },
+                            cwd: root.path().into(),
+                            endpoint: "frozen".into(),
+                            local_mounts: false,
+                            routing: vec![("CASE".into(), Some(case.into()))],
+                            global_arguments: Vec::new(),
+                        },
+                        id: "pinned".into(),
+                        cwd: root.path().into(),
+                    }),
+                )
+                .unwrap();
+                runtime
+                    .write_proof(&PrimeCleanupProof {
+                        route: runtime.proof_route().unwrap(),
+                        processes: vec![crate::process::PrimeProcessIdentity {
+                            pid: std::process::id(),
+                            start_id: "guest:obsolete".into(),
+                        }],
+                        settled: false,
+                        epoch: Some("original-guest".into()),
+                        launch_epoch: Some("original-guest".into()),
+                    })
+                    .unwrap();
+                let original = std::fs::read(runtime.control_path().unwrap()).unwrap();
+                let restored: PrimeRuntime =
+                    serde_json::from_slice(&serde_json::to_vec(&runtime).unwrap()).unwrap();
+                let result = restored.cleanup();
+                if case == "missing" {
+                    result.unwrap();
+                    let proof = restored.read_proof().unwrap();
+                    assert!(proof.settled);
+                    assert!(proof.processes.is_empty());
+                    assert_eq!(proof.epoch.as_deref(), Some("original-guest"));
+                    let fresh: PrimeRuntime =
+                        serde_json::from_slice(&serde_json::to_vec(&restored).unwrap()).unwrap();
+                    fresh.cleanup().unwrap();
+                } else {
+                    assert!(result.is_err(), "{kind:?}/{case}");
+                    assert_eq!(
+                        std::fs::read(restored.control_path().unwrap()).unwrap(),
+                        original
+                    );
+                }
+            }
+        }
+    }
 
     #[cfg(target_os = "linux")]
     struct CleanupProbe(std::process::Child);

@@ -367,6 +367,29 @@ fn process_membership(pid: u32) -> anyhow::Result<Option<libc::proc_bsdinfo>> {
     anyhow::ensure!(info.pbi_pid == pid, "unexpected process membership PID");
     Ok(Some(info))
 }
+
+pub(super) fn foreign_runner_group_absent(pid: u32) -> anyhow::Result<bool> {
+    let mut info = std::mem::MaybeUninit::<libc::proc_bsdshortinfo>::uninit();
+    let size = std::mem::size_of::<libc::proc_bsdshortinfo>() as i32;
+    let read = unsafe {
+        libc::proc_pidinfo(
+            i32::try_from(pid)?,
+            libc::PROC_PIDT_SHORTBSDINFO,
+            0,
+            info.as_mut_ptr().cast(),
+            size,
+        )
+    };
+    if read != size {
+        return Err(std::io::Error::last_os_error())
+            .context("runner short process metadata unavailable");
+    }
+    let info = unsafe { info.assume_init() };
+    anyhow::ensure!(info.pbsi_pid == pid, "unexpected runner metadata PID");
+    let uid = unsafe { libc::geteuid() };
+    let ruid = unsafe { libc::getuid() };
+    Ok((info.pbsi_uid != uid || info.pbsi_ruid != ruid) && !runner_group_executing(pid)?)
+}
 pub(super) fn prime_processes(
     marker: &str,
     socket: &std::path::Path,
@@ -986,6 +1009,107 @@ impl super::SleepInhibit for CaffeinateInhibitor {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn foreign_runner_probe_requires_an_empty_original_group_and_keeps_native_tokens_strict() {
+        use std::io::BufRead as _;
+        use std::os::unix::process::CommandExt as _;
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+        let available = Command::new("sudo")
+            .args(["-n", "-u", "nobody", "true"])
+            .status();
+        if !available.is_ok_and(|status| status.success()) {
+            eprintln!("skipping foreign-runner probe: passwordless sudo unavailable");
+            return;
+        }
+        struct Foreign(std::process::Child);
+        impl Drop for Foreign {
+            fn drop(&mut self) {
+                self.0.stdin.take();
+                let _ = self.0.wait();
+            }
+        }
+        for own_group in [false, true] {
+            let script = format!(
+                "import os,sys\npid=os.fork()\nif pid == 0:\n    {}\n    print(os.getpid(),flush=True)\n    sys.stdin.read()\n    os._exit(0)\nelse:\n    _,status=os.waitpid(pid,0)\n    sys.exit(os.waitstatus_to_exitcode(status))",
+                if own_group { "os.setsid()" } else { "pass" }
+            );
+            let mut child = Foreign(
+                Command::new("sudo")
+                    .args(["-n", "-u", "nobody", "python3", "-c", &script])
+                    .current_dir("/tmp")
+                    .process_group(0)
+                    .stdin(std::process::Stdio::piped())
+                    .stdout(std::process::Stdio::piped())
+                    .spawn()
+                    .unwrap(),
+            );
+            let mut line = String::new();
+            std::io::BufReader::new(child.0.stdout.take().unwrap())
+                .read_line(&mut line)
+                .unwrap();
+            let pid = line.trim().parse::<u32>().unwrap();
+            assert!(
+                process_start_id(pid).is_err(),
+                "generic native ownership must remain unproven"
+            );
+            assert_eq!(foreign_runner_group_absent(pid).unwrap(), !own_group);
+            if own_group {
+                assert!(super::super::runner_birth_identity(pid).is_err());
+            } else {
+                assert!(super::super::runner_birth_identity(pid).unwrap().is_none());
+                let guard = super::super::RunnerProcessGuard::capture(pid, None).unwrap();
+                let mut words = [0; 8];
+                words[5] = pid;
+                guard.members.lock().push((
+                    super::super::PrimeProcessIdentity {
+                        pid,
+                        start_id: audit_start_id(&AuditToken { values: words }),
+                    },
+                    ProcessHandle(AuditToken { values: words }),
+                ));
+                let auxiliary = Command::new("cat")
+                    .process_group(0)
+                    .stdin(std::process::Stdio::piped())
+                    .spawn()
+                    .unwrap();
+                struct Auxiliary(std::process::Child);
+                impl Drop for Auxiliary {
+                    fn drop(&mut self) {
+                        let _ = self.0.kill();
+                        let _ = self.0.wait();
+                    }
+                }
+                let auxiliary_identity = super::super::PrimeProcessIdentity {
+                    pid: auxiliary.id(),
+                    start_id: process_start_id(auxiliary.id()).unwrap().unwrap(),
+                };
+                let auxiliary_handle = ProcessHandle::capture(&auxiliary_identity)
+                    .unwrap()
+                    .unwrap();
+                let mut auxiliary = Auxiliary(auxiliary);
+                guard
+                    .members
+                    .lock()
+                    .push((auxiliary_identity, auxiliary_handle));
+                assert!(
+                    guard.executing().unwrap(),
+                    "a known detached member must remain owned"
+                );
+                guard.signal(libc::SIGTERM).unwrap();
+                assert!(!auxiliary.0.wait().unwrap().success());
+                assert!(!guard.executing().unwrap());
+            }
+            assert!(
+                child.0.try_wait().unwrap().is_none(),
+                "the foreign execution was signalled"
+            );
+            drop(child.0.stdin.take());
+            assert!(child.0.wait().unwrap().success());
+        }
+    }
 
     #[test]
     fn prime_quiescence_accepts_observed_owned_zombies() {

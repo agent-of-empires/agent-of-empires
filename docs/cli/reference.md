@@ -1734,7 +1734,7 @@ Retire unprovable worker ownership after external shutdown confirmation
 ###### **Options:**
 
 * `--confirm-prime-stopped` — Confirm native processes are stopped for an identifiable missing-route Prime record
-* `--confirm-worker-stopped` — Confirm the original runner and all host/container native processes are stopped. Only malformed or unattested legacy runner records are eligible
+* `--confirm-worker-stopped` — Confirm the original runner and all host/container native processes are stopped. Accepts malformed, unattested legacy, or externally settled orphan records
 
 
 

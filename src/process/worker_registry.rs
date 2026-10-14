@@ -228,17 +228,30 @@ pub(crate) fn register_runner(record: &WorkerRecord) -> Result<tokio::net::UnixL
     })
 }
 
-pub(crate) fn recover_unreadable_worker(session_id: &str) -> Result<()> {
+pub(crate) fn recover_worker(session_id: &str) -> Result<()> {
     let path = record_path(session_id)?;
     let selected = std::fs::read(&path)?;
-    let legacy: Option<WorkerRecord> = serde_json::from_slice(&selected).ok();
-    anyhow::ensure!(
-        legacy.as_ref().is_none_or(
-            |record| record.runner_identity.is_none() && record.runner_version < RUNNER_VERSION
-        ),
-        "recovery requires malformed or unattested legacy runner ownership"
-    );
-    if let Some(record) = &legacy {
+    let record: Option<WorkerRecord> = serde_json::from_slice(&selected).ok();
+    if let Some(record) = &record {
+        if let Some(expected) = &record.runner_identity {
+            let runner = crate::process::RunnerProcessGuard::capture(
+                record.pid,
+                Some(expected.fingerprint()),
+            )?;
+            anyhow::ensure!(
+                !runner.executing()?,
+                "original runner or its group is still executing; recovery refused"
+            );
+        } else {
+            anyhow::ensure!(
+                record.runner_version < RUNNER_VERSION || !is_pid_alive(record.pid),
+                "original runner is still alive or unattested; recovery refused"
+            );
+            anyhow::ensure!(
+                !crate::process::runner_group_executing(record.pid)?,
+                "runner group still has executing processes; stop the original execution externally before recovery"
+            );
+        }
         if record
             .prime_runtime
             .as_ref()
@@ -667,18 +680,20 @@ fn settle_runner_sync(record: &WorkerRecord, grace: std::time::Duration) -> Resu
         }
         Some(expected.fingerprint())
     } else {
-        let before = crate::process::process_birth_identity(record.pid)?;
+        let before = crate::process::runner_birth_identity(record.pid)?;
         if before.is_some() {
             anyhow::ensure!(crate::process::worker::peer_pid_from_socket(&expected_socket(record)) == Some(record.pid),
                 "Legacy runner identity is unattested; use aoe acp recover {} --confirm-worker-stopped after external settlement", record.session_id);
             anyhow::ensure!(
-                crate::process::process_birth_identity(record.pid)? == before,
+                crate::process::runner_birth_identity(record.pid)? == before,
                 "runner incarnation changed while attesting its control socket"
             );
         }
         before.map(|identity| identity.fingerprint())
     };
-    crate::process::RunnerProcessGuard::capture(record.pid, fingerprint)?.settle(grace)
+    crate::process::RunnerProcessGuard::capture(record.pid, fingerprint)
+        .and_then(|runner| runner.settle(grace))
+        .with_context(|| format!("runner termination unproven; stop the original execution externally, then run aoe acp recover {} --confirm-worker-stopped", record.session_id))
 }
 
 pub(crate) async fn settle_runner(record: &WorkerRecord, grace: std::time::Duration) -> Result<()> {
@@ -751,7 +766,7 @@ pub(crate) fn recover_untracked_prime(selected: &WorkerRecord) -> Result<()> {
         anyhow::ensure!(
             current.runner_identity.as_ref().map_or_else(
                 || Ok(!is_pid_alive(current.pid)),
-                |expected| crate::process::process_birth_identity(current.pid)
+                |expected| crate::process::runner_birth_identity(current.pid)
                     .map(|actual| actual.as_ref() != Some(expected))
             )?,
             "runner is still alive; recovery refused"
@@ -785,6 +800,68 @@ mod tests {
     use super::*;
     use serial_test::serial;
     use tempfile::TempDir;
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    #[serial]
+    fn cold_orphan_recovery_requires_external_group_settlement_and_preserves_live_owners() {
+        use std::io::BufRead as _;
+        use std::os::unix::process::CommandExt as _;
+        let root = TempDir::new().unwrap();
+        let _home = crate::session::test_support::isolate_app_dir_at(root.path());
+        let mut leader = KillOnDrop(
+            std::process::Command::new("bash")
+                .args(["-c", "sleep 600 & printf '%s\\n' \"$!\"; read -r ignored"])
+                .process_group(0)
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .spawn()
+                .unwrap(),
+        );
+        let mut line = String::new();
+        std::io::BufReader::new(leader.0.stdout.take().unwrap())
+            .read_line(&mut line)
+            .unwrap();
+        let member_pid = line.trim().parse::<u32>().unwrap();
+        let member = crate::process::PrimeProcessIdentity {
+            pid: member_pid,
+            start_id: crate::process::process_birth_identity(member_pid)
+                .unwrap()
+                .unwrap()
+                .start_id,
+        };
+        struct Member(crate::process::PrimeProcessIdentity);
+        impl Drop for Member {
+            fn drop(&mut self) {
+                let _ = crate::process::fence_processes(
+                    std::slice::from_ref(&self.0),
+                    std::time::Duration::ZERO,
+                );
+            }
+        }
+        let member = Member(member);
+        let record = new_record(
+            "cold-orphan",
+            leader.0.id(),
+            socket_path_for("cold-orphan").unwrap(),
+        );
+        save(&record).unwrap();
+        let path = record_path(&record.session_id).unwrap();
+        let original = std::fs::read(&path).unwrap();
+        assert!(recover_worker(&record.session_id).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), original);
+        drop(leader.0.stdin.take());
+        leader.0.wait().unwrap();
+        assert!(crate::process::runner_group_executing(record.pid).unwrap());
+        assert!(terminate(&record.session_id).is_err());
+        assert!(recover_worker(&record.session_id).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), original);
+        crate::process::fence_processes(std::slice::from_ref(&member.0), std::time::Duration::ZERO)
+            .unwrap();
+        assert!(!crate::process::runner_group_executing(record.pid).unwrap());
+        recover_worker(&record.session_id).unwrap();
+        assert!(load(&record.session_id).unwrap().is_none());
+    }
 
     #[tokio::test]
     #[serial]
@@ -884,7 +961,7 @@ mod tests {
             assert!(load(id).is_err());
             assert!(save(&replacement).is_err());
             assert!(delete(id).is_err());
-            assert!(recover_unreadable_worker(id).is_err());
+            assert!(recover_worker(id).is_err());
             assert_eq!(std::fs::read(&path).unwrap(), bytes);
             assert_eq!(
                 crate::process::worker::peer_pid_from_socket(&control),
@@ -893,7 +970,7 @@ mod tests {
             let proof = workers_dir().unwrap().join(".unreadable.prime-proof");
             std::fs::write(&proof, b"unidentified native ownership").unwrap();
             drop(listener);
-            recover_unreadable_worker(id).unwrap();
+            recover_worker(id).unwrap();
             assert!(!path.exists());
             assert!(!control.exists());
             assert_eq!(
@@ -948,7 +1025,7 @@ mod tests {
                     if prime {
                         recover_untracked_prime(&record)
                     } else {
-                        recover_unreadable_worker(id)
+                        recover_worker(id)
                     }
                 };
                 assert!(recover().is_err());

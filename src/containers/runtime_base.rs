@@ -78,8 +78,7 @@ impl RuntimeBase {
         supports_labels: true,
         supported_run_flags: &[RunFlag::CapAdd, RunFlag::CapDrop],
         // Avoid bare "not found": daemon errors like "socket not found" would read as absent.
-        not_found_markers: &["container with id", "container not found"],
-        // Placeholder: wording not yet captured from a real Apple daemon-down.
+        not_found_markers: &["notfound: \"container with id", "container not found"],
         daemon_down_markers: &["connect to container daemon"],
         permission_denied_markers: &["permission denied"],
     };
@@ -122,15 +121,15 @@ impl RuntimeBase {
     /// Splits a failed state probe into definitive absence (`Ok(false)`) or a runtime failure
     /// that must surface, so fail-closed gates do not swallow a daemon-down signal.
     pub fn classify_probe_failure(&self, stderr: &str) -> Result<bool> {
-        if self.is_not_found(stderr) {
-            return Ok(false);
-        }
         // Permission-denied first: Podman's socket-permission stderr also matches its daemon-down marker.
         if self.is_permission_denied(stderr) {
             return Err(DockerError::PermissionDenied);
         }
         if self.is_daemon_down(stderr) {
             return Err(DockerError::DaemonNotRunning);
+        }
+        if self.is_not_found(stderr) {
+            return Ok(false);
         }
         Err(DockerError::InspectFailed(sanitize_stderr(stderr)))
     }

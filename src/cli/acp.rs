@@ -72,7 +72,7 @@ pub enum AcpCommands {
         )]
         confirm_prime_stopped: bool,
         /// Confirm the original runner and all host/container native processes are stopped.
-        /// Only malformed or unattested legacy runner records are eligible.
+        /// Accepts malformed, unattested legacy, or externally settled orphan records.
         #[arg(
             long,
             required_unless_present = "confirm_prime_stopped",
@@ -834,7 +834,7 @@ async fn stop_worker_records(
 
 fn recover(session: &str, confirm_prime_stopped: bool, confirm_worker_stopped: bool) -> Result<()> {
     if confirm_worker_stopped {
-        crate::process::worker_registry::recover_unreadable_worker(session)?;
+        crate::process::worker_registry::recover_worker(session)?;
         println!("Retired unprovable worker ownership for {session} on external shutdown confirmation; AoE did not verify all detached processes.");
         return Ok(());
     }

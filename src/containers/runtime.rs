@@ -115,30 +115,30 @@ impl ContainerRuntime {
     }
 
     pub fn does_container_exist(&self, name: &str) -> Result<bool> {
+        self.does_container_exist_with_command(name, &mut self.base.command())
+    }
+
+    pub(crate) fn does_container_exist_with_command(
+        &self,
+        name: &str,
+        command: &mut std::process::Command,
+    ) -> Result<bool> {
         match self.kind {
             RuntimeKind::Docker | RuntimeKind::Podman => {
-                // `container inspect` stderr is what the `DOCKER_MISSING` fixture pins; changing argv needs new fixtures.
-                let mut cmd = self.base.command();
-                cmd.args(["container", "inspect", name]);
-                let output = self.base.probe_output(&mut cmd)?;
-                if !output.status.success() {
-                    let stderr = String::from_utf8_lossy(&output.stderr);
-                    return self.base.classify_probe_failure(&stderr);
-                }
-                Ok(true)
+                command.args(["container", "inspect", name]);
             }
             RuntimeKind::AppleContainer => {
-                // Apple's `inspect` succeeds for missing containers; `logs` fails for them.
-                let mut cmd = self.base.command();
-                cmd.args(["logs", name]);
-                let output = self.base.probe_output(&mut cmd)?;
-                if !output.status.success() {
-                    let stderr = String::from_utf8_lossy(&output.stderr);
-                    return self.base.classify_probe_failure(&stderr);
-                }
-                Ok(true)
+                // Apple's inspect can succeed for missing containers; logs cannot.
+                command.args(["logs", name]);
             }
         }
+        let output = self.base.probe_output(command)?;
+        if !output.status.success() {
+            return self
+                .base
+                .classify_probe_failure(&String::from_utf8_lossy(&output.stderr));
+        }
+        Ok(true)
     }
 
     pub fn is_container_running(&self, name: &str) -> Result<bool> {

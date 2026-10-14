@@ -452,7 +452,7 @@ pub(crate) struct RunnerProcessGuard {
     fingerprint: Option<ProcessBirthFingerprint>,
     obsolete: bool,
     #[cfg(any(target_os = "linux", target_os = "macos"))]
-    members: std::sync::Mutex<Vec<(PrimeProcessIdentity, platform::ProcessHandle)>>,
+    members: parking_lot::Mutex<Vec<(PrimeProcessIdentity, platform::ProcessHandle)>>,
     #[cfg(target_os = "linux")]
     group_anchor: Option<platform::ProcessHandle>,
 }
@@ -474,7 +474,7 @@ impl RunnerProcessGuard {
         let before = if obsolete_boot {
             None
         } else {
-            process_birth_identity(pid)?
+            runner_birth_identity(pid)?
         };
         let obsolete = obsolete_boot
             || before.as_ref().is_some_and(|birth| {
@@ -504,7 +504,7 @@ impl RunnerProcessGuard {
                 pid,
                 fingerprint,
                 obsolete,
-                members: std::sync::Mutex::new(Vec::new()),
+                members: parking_lot::Mutex::new(Vec::new()),
                 #[cfg(target_os = "linux")]
                 group_anchor,
             };
@@ -513,10 +513,7 @@ impl RunnerProcessGuard {
                 if guard.group_anchor.is_some() {
                     return Ok(guard);
                 }
-                let mut members = guard
-                    .members
-                    .lock()
-                    .map_err(|_| anyhow::anyhow!("runner member lock poisoned"))?;
+                let mut members = guard.members.lock();
                 guard.refresh(&mut members)?;
             }
             Ok(guard)
@@ -533,7 +530,7 @@ impl RunnerProcessGuard {
         &self,
         members: &mut Vec<(PrimeProcessIdentity, platform::ProcessHandle)>,
     ) -> anyhow::Result<()> {
-        let before = process_birth_identity(self.pid)?;
+        let before = runner_birth_identity(self.pid)?;
         let root_attested = before
             .as_ref()
             .is_some_and(|birth| Some(birth.fingerprint()) == self.fingerprint);
@@ -541,6 +538,9 @@ impl RunnerProcessGuard {
             self.fingerprint.is_some() || before.is_none(),
             "runner birth identity is unattested; confirm external settlement before recovery"
         );
+        if before.is_none() {
+            members.retain(|(identity, _)| identity.pid != self.pid);
+        }
         let anchor = if root_attested {
             None
         } else {
@@ -577,7 +577,7 @@ impl RunnerProcessGuard {
             }
         }
         let stable = if root_attested {
-            let after = process_birth_identity(self.pid)?;
+            let after = runner_birth_identity(self.pid)?;
             anyhow::ensure!(
                 after.is_none() || after == before,
                 "runner incarnation changed during group capture"
@@ -613,10 +613,7 @@ impl RunnerProcessGuard {
         }
         #[cfg(any(target_os = "linux", target_os = "macos"))]
         {
-            let mut members = self
-                .members
-                .lock()
-                .map_err(|_| anyhow::anyhow!("runner member lock poisoned"))?;
+            let mut members = self.members.lock();
             self.refresh(&mut members)?;
             for (_, handle) in members.iter() {
                 if !handle.exited()? {
@@ -637,10 +634,7 @@ impl RunnerProcessGuard {
         }
         #[cfg(any(target_os = "linux", target_os = "macos"))]
         {
-            let mut members = self
-                .members
-                .lock()
-                .map_err(|_| anyhow::anyhow!("runner member lock poisoned"))?;
+            let mut members = self.members.lock();
             self.refresh(&mut members)?;
             for (_, handle) in members.iter() {
                 handle.signal(signal)?;
@@ -687,6 +681,15 @@ pub(crate) fn process_birth_identity(pid: u32) -> anyhow::Result<Option<ProcessB
         let _ = pid;
         anyhow::bail!("process birth identity unsupported on this platform")
     }
+}
+
+pub(crate) fn runner_birth_identity(pid: u32) -> anyhow::Result<Option<ProcessBirthIdentity>> {
+    let birth = process_birth_identity(pid);
+    #[cfg(target_os = "macos")]
+    if birth.is_err() && platform::foreign_runner_group_absent(pid)? {
+        return Ok(None);
+    }
+    birth
 }
 
 pub(crate) fn fence_processes(
