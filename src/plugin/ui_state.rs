@@ -690,6 +690,7 @@ fn validate_payload(slot: UiSlot, raw: &Value) -> Result<Value, String> {
             serde_json::to_value(parsed).map_err(|e| e.to_string())
         }
         UiSlot::Notification => Err("notification is pushed via ui.notify".into()),
+        UiSlot::Page => Err("page renders its declared entry and takes no state".into()),
     }
 }
 
@@ -1085,6 +1086,13 @@ mod tests {
                 UiSlot::RowBadge,
                 Some("s1"),
                 json!({"text": "x".repeat(9 * 1024)}),
+                false,
+            ),
+            (
+                "page takes no pushed state",
+                UiSlot::Page,
+                None,
+                json!({"text": "x"}),
                 false,
             ),
         ];
