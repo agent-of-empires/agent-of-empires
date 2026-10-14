@@ -111,6 +111,7 @@ _Avoid_: workspace, separate workspace
 
 **Substrate**:
 The kind of place a Session runs: local, worktree, workspace, sandbox or scratch.
+_Avoid_: substrate for tmux vs acp (that axis is Terminal view vs Structured view)
 
 ### Agents
 
