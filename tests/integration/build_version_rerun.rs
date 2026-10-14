@@ -126,6 +126,92 @@ fn watch_paths_resolve_in_a_git_worktree() {
 
 #[test]
 #[serial_test::parallel]
+fn watch_paths_ignore_inherited_repository_context() {
+    const CHILD_DIR: &str = "AOE_BUILD_WATCH_CHILD_DIR";
+    const CHILD_RECORD: &str = "AOE_BUILD_WATCH_CHILD_RECORD";
+    if let (Some(directory), Some(record)) =
+        (std::env::var_os(CHILD_DIR), std::env::var_os(CHILD_RECORD))
+    {
+        let paths = build_git_watch::git_watch_paths(Path::new(&directory));
+        std::fs::write(record, serde_json::to_vec(&paths).unwrap()).unwrap();
+        return;
+    }
+    if !git_available() {
+        eprintln!("skipping: git not available");
+        return;
+    }
+
+    let temporary = tempfile::tempdir().unwrap();
+    let target = temporary.path().join("target");
+    let foreign = temporary.path().join("foreign");
+    for repository in [&target, &foreign] {
+        std::fs::create_dir(repository).unwrap();
+        git(repository, &["init", "-q"]);
+        git(repository, &["config", "user.email", "test@example.com"]);
+        git(repository, &["config", "user.name", "Test"]);
+        git(repository, &["commit", "--allow-empty", "-qm", "init"]);
+    }
+    let foreign_git = foreign.join(".git");
+    let record = temporary.path().join("observed.json");
+    let configuration = temporary.path().join("git-config");
+    std::fs::write(&configuration, "").unwrap();
+    let output = Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "build_version_rerun::watch_paths_ignore_inherited_repository_context",
+            "--nocapture",
+        ])
+        .env(CHILD_DIR, &target)
+        .env(CHILD_RECORD, &record)
+        .env("GIT_DIR", &foreign_git)
+        .env("GIT_WORK_TREE", &foreign)
+        .env("GIT_COMMON_DIR", &foreign_git)
+        .env("GIT_INDEX_FILE", foreign_git.join("index"))
+        .env("GIT_OBJECT_DIRECTORY", foreign_git.join("objects"))
+        .env(
+            "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+            foreign_git.join("objects"),
+        )
+        .env("GIT_NAMESPACE", "foreign")
+        .env("GIT_CONFIG_GLOBAL", &configuration)
+        .env("GIT_CONFIG_SYSTEM", &configuration)
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env_remove("GIT_CONFIG")
+        .env_remove("GIT_CONFIG_COUNT")
+        .env_remove("GIT_CONFIG_PARAMETERS")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let paths: Vec<String> = serde_json::from_slice(&std::fs::read(record).unwrap()).unwrap();
+    let mut observed: Vec<_> = paths
+        .iter()
+        .map(|path| {
+            let path = Path::new(path);
+            if path.is_absolute() {
+                path.to_path_buf()
+            } else {
+                target.join(path)
+            }
+            .canonicalize()
+            .unwrap()
+        })
+        .collect();
+    let mut expected: Vec<_> = ["HEAD", "logs/HEAD"]
+        .iter()
+        .map(|path| target.join(".git").join(path).canonicalize().unwrap())
+        .collect();
+    observed.sort();
+    expected.sort();
+    assert_eq!(observed, expected);
+}
+
+#[test]
+#[serial_test::parallel]
 fn git_watch_paths_empty_when_git_cannot_resolve() {
     if !git_available() {
         eprintln!("skipping: git not available");

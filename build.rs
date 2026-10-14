@@ -24,9 +24,9 @@ fn warn_on_deprecated_serve_feature() {
 /// wins: env override, `GITHUB_SHA`, local git sha plus a coarse dirty flag, then
 /// `CARGO_PKG_VERSION`.
 fn emit_build_version() {
-    use std::process::Command;
+    let repo_dir = std::path::Path::new(".");
 
-    for path in git_watch_paths(std::path::Path::new(".")) {
+    for path in git_watch_paths(repo_dir) {
         println!("cargo:rerun-if-changed={path}");
     }
     println!("cargo:rerun-if-env-changed=AOE_BUILD_VERSION");
@@ -39,8 +39,8 @@ fn emit_build_version() {
     } else if let Ok(sha) = std::env::var("GITHUB_SHA") {
         let short: String = sha.chars().take(12).collect();
         format!("{pkg_version}+g{short}")
-    } else if let Some(short) = git_short_sha(&mut Command::new("git")) {
-        let dirty = git_is_dirty(&mut Command::new("git"));
+    } else if let Some(short) = git_short_sha(&mut build_git_command(repo_dir)) {
+        let dirty = git_is_dirty(&mut build_git_command(repo_dir));
         format!(
             "{pkg_version}+g{short}{}",
             if dirty { "-dirty" } else { "" }

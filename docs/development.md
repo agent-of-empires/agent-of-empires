@@ -16,6 +16,8 @@ The binary is `target/{profile}/aoe`. Web commands and test selection live in `w
 
 Debug builds carry line tables only, and dependencies carry no debug info, to keep `target/` small across worktrees. Panics still name the file and line in this crate, but a debugger has no local values; rebuild with `RUSTFLAGS="-Cdebuginfo=2"` for a full debugging session.
 
+Git-derived build metadata belongs to the source checkout: watched HEAD/reflog paths, fallback SHA and dirty state share one repository boundary. Inherited Git-hook repository selectors do not redirect it; protected Git configuration remains effective.
+
 ## Test isolation
 
 Git fixture children must clear inherited repository-location and state selectors, ignore global/system configuration and config injection, and assert every setup command's exit status. Do not change the developer's Git configuration to make a fixture pass.
