@@ -16,7 +16,7 @@ export function usePendingSetting<T>(server: T, save: (next: T) => Promise<boole
   const [pending, setPending] = useState<Pending<T> | null>(null);
   const latest = useRef(0);
   const inflight = useRef(0);
-  const appliedRead = useAppliedRead();
+  const appliedRead = useAppliedRead(pending?.settledAt != null);
   if (pending) {
     const done =
       pending.settledAt !== null

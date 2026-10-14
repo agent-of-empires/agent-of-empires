@@ -13,13 +13,14 @@ export function markReadApplied(n: number) {
   listeners.forEach((l) => l());
 }
 
-/** Ordinal of the session read currently on screen. */
-export function useAppliedRead() {
+/** Ordinal of the session read currently on screen; 0 and no subscription while inactive. */
+export function useAppliedRead(active: boolean) {
   return useSyncExternalStore(
     (l) => {
+      if (!active) return () => {};
       listeners.add(l);
       return () => void listeners.delete(l);
     },
-    () => applied,
+    () => (active ? applied : 0),
   );
 }
