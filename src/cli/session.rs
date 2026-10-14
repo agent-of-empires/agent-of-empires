@@ -504,6 +504,13 @@ async fn archive_session(profile: &str, args: ArchiveArgs) -> Result<()> {
     })?;
     if landed {
         println!("Archived: {}", title);
+        if inst.is_structured() {
+            super::acp::stop_runner(&id).await.map_err(|error| {
+                anyhow::anyhow!(
+                    "{title} is archived, but its agent runner could not be stopped: {error:#}"
+                )
+            })?;
+        }
         Ok(())
     } else {
         bail!(
@@ -675,6 +682,16 @@ async fn empty_trash(profile: &str) -> Result<()> {
                 continue;
             }
         };
+        if inst.is_structured() {
+            if let Err(error) = super::acp::stop_runner(&inst.id).await {
+                eprintln!(
+                    "Warning ({}): could not stop the agent runner, keeping session in trash: {error:#}",
+                    inst.title
+                );
+                kept_for_retry += 1;
+                continue;
+            }
+        }
         let result = transaction.run_hooks()?.complete_with(|instance| {
             super::purge_acp_transcript(instance).map_err(|error| {
                 format!("transcript not purged, keeping session in trash: {error}")
