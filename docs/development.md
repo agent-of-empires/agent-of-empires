@@ -18,7 +18,7 @@ Debug builds carry line tables only, and dependencies carry no debug info, to ke
 
 ## Test isolation
 
-Git fixtures must ignore inherited global/system configuration and config-injection environment variables in their child processes, and assert every setup command's exit status. Do not change the developer's Git configuration to make a fixture pass.
+Git fixture children must clear inherited repository-location and state selectors, ignore global/system configuration and config injection, and assert every setup command's exit status. Do not change the developer's Git configuration to make a fixture pass.
 
 ## Running and logs
 
