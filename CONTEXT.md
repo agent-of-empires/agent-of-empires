@@ -229,8 +229,12 @@ _Avoid_: PWA, web UI, structured view (that is a view, not a surface)
 A remote path to the Web dashboard through Cloudflare or Tailscale.
 
 **Device**:
-A browser push subscription bound to the current access token.
-_Avoid_: subscription
+A signed-in browser login to the Web dashboard, listed in Connected Devices and revocable there.
+_Avoid_: login session, subscription
+
+**Push subscription**:
+A browser's Web Push registration, bound to the current access token and dropped when it rotates.
+_Avoid_: device
 
 ### Plugins and events
 
