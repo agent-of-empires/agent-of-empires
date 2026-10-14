@@ -1102,6 +1102,268 @@ pub async fn stop_session(
     (StatusCode::OK, Json(serde_json::json!(response))).into_response()
 }
 
+#[derive(Deserialize)]
+pub struct SwitchTerminalAgentBody {
+    /// Installed built-in agent or configured custom terminal tool name.
+    pub target: String,
+}
+
+/// `POST /api/sessions/{id}/switch-agent` switches a terminal/tmux session to
+/// another tool without changing its AoE identity or worktree.
+///
+/// The outgoing tool's native session ids are parked by `Instance::swap_tool`,
+/// so the incoming CLI never receives a foreign resume id. What it gets instead
+/// is a bounded, sanitized tail of the outgoing pane, typed in once the
+/// relaunched CLI is past its boot shell by the shared restart
+/// (`session::restart`), which reports whether that handoff landed.
+///
+/// A failed resume is reported as `409 resume_failed` with the parked id
+/// preserved, exactly like [`start_session`]: the pane is dead, so a `200` here
+/// would claim a running session whose context was never handed over.
+pub async fn switch_terminal_agent(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    body: Result<Json<SwitchTerminalAgentBody>, axum::extract::rejection::JsonRejection>,
+) -> impl IntoResponse {
+    if let Some(resp) = cityhall_block_non_structured(&state, &id).await {
+        return resp;
+    }
+    if state.read_only {
+        return crate::server::api::read_only_response();
+    }
+    let Json(body) = match body {
+        Ok(body) => body,
+        Err(rejection) => return rejection.into_response(),
+    };
+    let target = body.target.trim().to_string();
+    if target.is_empty() {
+        return api_error(
+            StatusCode::BAD_REQUEST,
+            "validation_failed",
+            "target is required",
+        );
+    }
+
+    let lock = state.instance_lock(&id).await;
+    let _guard = lock.lock().await;
+
+    let (profile, working, from_tool) = {
+        let instances = state.instances.read().await;
+        let Some(instance) = instances.iter().find(|i| i.id == id) else {
+            return session_not_found();
+        };
+        if instance.is_structured() {
+            return api_error(
+                StatusCode::CONFLICT,
+                "structured_session",
+                "use the ACP switch-agent endpoint for structured sessions",
+            );
+        }
+        if let Err(blocked) = instance.ensure_startable() {
+            return crate::server::api::start_blocked_response(blocked);
+        }
+        // A launch reservation, a delete, or a peer's swap owns the row; land the
+        // swap on top of one and whichever finishes last persists the stale tool.
+        if matches!(
+            instance.status,
+            Status::Creating | Status::Deleting | Status::Starting
+        ) {
+            return api_error(
+                StatusCode::CONFLICT,
+                "session_busy",
+                "session is already changing state",
+            );
+        }
+        if instance.tool == target {
+            return api_error(
+                StatusCode::BAD_REQUEST,
+                "same_tool",
+                format!("session is already using {target}"),
+            );
+        }
+        (
+            instance.source_profile.clone(),
+            instance.clone(),
+            instance.tool.clone(),
+        )
+    };
+
+    // The same identity check `create_session` applies, so a switch cannot name a
+    // tool a new session could not be created with.
+    let project_path = std::path::Path::new(&working.project_path);
+    if !validate_session_tool_identity(&target, &profile, project_path) {
+        return api_error(
+            StatusCode::BAD_REQUEST,
+            "unknown_tool",
+            format!("agent tool is not installed or configured: {target}"),
+        );
+    }
+
+    // The incoming tool's own command and args, the way the restart dialog
+    // re-resolves them: a command override left over from the outgoing tool
+    // would launch it again under the incoming tool's name.
+    let (target_command, target_extra_args) = {
+        let config = crate::session::config::profile_config::resolve_config_or_warn(&profile);
+        (
+            config.session.resolve_tool_command(&target),
+            config
+                .session
+                .agent_extra_args
+                .get(&target)
+                .cloned()
+                .unwrap_or_default(),
+        )
+    };
+
+    // Persist before memory, on the store the server watches, so the watcher
+    // reload cannot resurrect the outgoing tool mid-restart.
+    let persist_id = id.clone();
+    let persist_profile = profile.clone();
+    let persist_tool = target.clone();
+    let persist_command = target_command.clone();
+    let persist_extra_args = target_extra_args.clone();
+    let stored = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let stored_on_disk = Arc::clone(&stored);
+    if persist_session_update(
+        profile,
+        "switch terminal agent",
+        state.file_watch.clone(),
+        move |instances| {
+            let found = instances.iter_mut().find(|i| i.id == persist_id);
+            stored_on_disk.store(found.is_some(), std::sync::atomic::Ordering::Relaxed);
+            if let Some(instance) = found {
+                instance.source_profile = persist_profile;
+                instance.swap_tool(&persist_tool);
+                instance.command = persist_command;
+                instance.extra_args = persist_extra_args;
+            }
+        },
+    )
+    .await
+    .is_err()
+    {
+        return persist_failed_response();
+    }
+    if !stored.load(std::sync::atomic::Ordering::Relaxed) {
+        return session_not_found();
+    }
+
+    let mut working = working;
+    working.swap_tool(&target);
+    working.command = target_command;
+    working.extra_args = target_extra_args;
+    // Mirror `start_session`: show the relaunch as in flight rather than leaving the
+    // outgoing pane's last polled status on a row that is already mid-cascade. Peers
+    // also read this as the `session_busy` conflict instead of racing the swap.
+    working.status = Status::Starting;
+    {
+        let mut instances = state.instances.write().await;
+        if let Some(instance) = instances.iter_mut().find(|i| i.id == id) {
+            let previous = instance.status;
+            instance.swap_tool(&target);
+            instance.command = working.command.clone();
+            instance.extra_args = working.extra_args.clone();
+            instance.status = Status::Starting;
+            instance.last_error = None;
+            publish_status_change(&state.status_tx, instance, previous);
+        }
+    }
+
+    // The relaunch takes its own Launch reservation, which bumps the lifecycle
+    // generation the 2s status poll stamps its patches with, so a poll decided
+    // against the outgoing pane cannot land on top of the cascade; `sync_base` is
+    // the pre-cascade snapshot that post-cascade merge compares against.
+    let sync_base = working.clone();
+    let restart_result = tokio::task::spawn_blocking(move || {
+        crate::session::restart::perform_restart(crate::session::restart::RestartRequest {
+            session_id: working.id.clone(),
+            instance: working,
+            size: None,
+            wake_message: String::new(),
+            skip_on_launch: false,
+            bound_hooks: true,
+            // The incoming tool runs in its own config store, so the container
+            // built for the outgoing one must not be reused.
+            discard_sandbox_container: true,
+            conversation_carry: None,
+            handoff_from_tool: Some(from_tool),
+        })
+    })
+    .await;
+
+    let result = match restart_result {
+        Ok(result) => result,
+        Err(e) => {
+            tracing::error!(
+                target: "http.api.sessions",
+                "switch_terminal_agent panicked for {id}: {e}"
+            );
+            return api_error(StatusCode::INTERNAL_SERVER_ERROR, "internal", "internal");
+        }
+    };
+    let crate::session::restart::RestartResult {
+        instance: started,
+        outcome,
+        handoff,
+        ..
+    } = result;
+
+    let resume_failed_sid = match &outcome {
+        Ok(crate::session::StartOutcome::ResumeFailed { sid }) => Some(sid.clone()),
+        _ => None,
+    };
+    let failure = match &outcome {
+        Ok(_) => None,
+        Err(message) => Some(message.clone()),
+    };
+
+    let mut instances = state.instances.write().await;
+    let Some(instance) = instances.iter_mut().find(|i| i.id == id) else {
+        return crate::server::api::session_gone_after_persist();
+    };
+    let synced = sync_live_after_restart(&state.status_tx, instance, &sync_base, &started);
+    if let Some(message) = failure {
+        if synced {
+            let synced_status = instance.status;
+            instance.status = Status::Error;
+            instance.last_error = Some(message.clone());
+            publish_status_change(&state.status_tx, instance, synced_status);
+        }
+        tracing::warn!(
+            target: "http.api.sessions",
+            "switch_terminal_agent restart failed for {id}: {message}"
+        );
+        return api_error(StatusCode::INTERNAL_SERVER_ERROR, "restart_failed", message);
+    }
+    let context_handoff = handoff.as_str();
+    if let Some(sid) = resume_failed_sid {
+        return (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "error": "resume_failed",
+                "message": format!("Resume failed for sid {sid}; preserved for explicit retry"),
+                "resume_session_id": sid,
+                "context_handoff": context_handoff,
+            })),
+        )
+            .into_response();
+    }
+    // Built only on the success path: the wire body reports the instance the
+    // restart left behind, which the 409 above never claims.
+    let response =
+        SessionResponse::from_instance(instance, crate::claude_settings::read_tui_fullscreen());
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "session_id": id,
+            "tool": response.tool,
+            "status": response.status,
+            "context_handoff": context_handoff,
+        })),
+    )
+        .into_response()
+}
+
 /// Start (resume) a stopped session, the inverse of [`stop_session`]. Plain
 /// sessions restart exactly like `ensure_session`; structured sessions are
 /// un-parked by clearing the idle-dormant mark so the acp reconciler respawns

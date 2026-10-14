@@ -843,6 +843,7 @@ pub fn resume_after_conversion(
                     bound_hooks: true,
                     discard_sandbox_container: false,
                     conversation_carry: None,
+                    handoff_from_tool: None,
                 });
                 match result.outcome {
                     Ok(_) => {

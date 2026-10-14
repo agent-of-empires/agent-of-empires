@@ -36,6 +36,7 @@ const session = { id: "s1" };
 const plugins = { plugins: [], load_errors: [] };
 const hit = { session_id: "s1", seq: 3, kind: "agent", snippet: "hit", match_count: 2 };
 const switched = { session_id: "s-1", agent: "codex", before_seq: 41, switch_seq: 42, status: "ok" };
+const terminalSwitch = { session_id: "s-1", tool: "codex", status: "running", context_handoff: "sent" };
 const skill = {
   directory: "review",
   name: "review",
@@ -188,6 +189,16 @@ const requestCases: RequestCase[] = [
     "POST /api/sessions/s-1/acp/switch-agent",
     () => api.switchAcpAgent("s-1", "claude", null, "manual"),
     { body: { target: "claude", reason: "manual" } },
+  ],
+  [
+    "POST /api/sessions/s-1/switch-agent",
+    () => api.switchTerminalAgent("s-1", "codex"),
+    { body: { target: "codex" }, respond: json(terminalSwitch), result: { ok: true, result: terminalSwitch } },
+  ],
+  [
+    "POST /api/sessions/weird%2Fid/switch-agent",
+    () => api.switchTerminalAgent("weird/id", "codex"),
+    { body: { target: "codex" } },
   ],
   [
     "POST /api/sessions/s-1/acp/enable",
@@ -595,6 +606,7 @@ const failureCases: [string, () => Promise<unknown>, unknown][] = [
   ["fetchThemes", () => api.fetchThemes(), []],
   ["fetchAcpAgents", () => api.fetchAcpAgents(), []],
   ["fetchAcpOptionCatalog", () => api.fetchAcpOptionCatalog(), { version: 1, agents: {} }],
+  ["switchTerminalAgent", () => api.switchTerminalAgent("s1", "codex"), { ok: false, committed: false }],
   ["fetchIsGitRepo", () => api.fetchIsGitRepo("/r"), null],
   ["getHomePath", () => api.getHomePath(), null],
   ["browseFilesystem", () => api.browseFilesystem("/r"), { entries: [], has_more: false, ok: false }],
@@ -716,6 +728,29 @@ describe("acpDisable", () => {
     expect(await api.acpDisable("s-1")).toEqual({ ok: false });
     offline();
     expect(await api.acpDisable("s-1")).toEqual({ ok: false });
+  });
+});
+
+describe("switchTerminalAgent", () => {
+  it.each([
+    [
+      "resume failure after the swap reached disk",
+      json({ error: "resume_failed", message: "Resume failed for sid s-9; preserved for explicit retry" }, 409),
+      { ok: false, committed: true, message: "Resume failed for sid s-9; preserved for explicit retry" },
+    ],
+    [
+      "relaunch failure after the swap reached disk",
+      json({ error: "restart_failed", message: "boom" }, 500),
+      { ok: false, committed: true, message: "boom" },
+    ],
+    [
+      "refusal that left the row untouched",
+      json({ error: "same_tool", message: "session is already using codex" }, 400),
+      { ok: false, committed: false, message: "session is already using codex" },
+    ],
+  ])("%s", async (_name, response, expected) => {
+    fetchSpy.mockResolvedValueOnce(response);
+    expect(await api.switchTerminalAgent("s1", "codex")).toEqual(expected);
   });
 });
 

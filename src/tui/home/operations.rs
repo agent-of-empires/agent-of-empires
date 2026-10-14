@@ -434,6 +434,10 @@ impl HomeView {
             conversation_carry::ToolSwap::Park => (false, None),
             conversation_carry::ToolSwap::KeepConversation(carry) => (true, carry),
         };
+        // A parked cross-CLI swap is what needs a handoff: the incoming CLI has no native
+        // session for this conversation. An account swap carries the transcript itself, so
+        // its CLI resumes natively and the pane still gets the ordinary wake message.
+        let mut handoff_from_tool: Option<String> = None;
 
         // A cross-profile restart stages on a detached candidate: do not persist a tool
         // swap into the source row before the target transaction accepts it.
@@ -455,6 +459,7 @@ impl HomeView {
                         requested.swap_account(target_tool);
                     } else {
                         requested.swap_tool(target_tool);
+                        handoff_from_tool = Some(restart_edit_authoritative.tool.clone());
                     }
                 }
             }
@@ -497,6 +502,7 @@ impl HomeView {
                         self.mutate_instance(&id, |inst| inst.swap_account(target_tool));
                     } else {
                         self.mutate_instance(&id, |inst| inst.swap_tool(target_tool));
+                        handoff_from_tool = Some(current_tool);
                     }
                     let disk_ids = self.persist_tool_swap(&id, target_tool, account_swap);
                     if let Some(carry) = carry_plan.as_mut() {
@@ -560,6 +566,7 @@ impl HomeView {
             bound_hooks: true,
             discard_sandbox_container: tool_swapped,
             conversation_carry: carry_plan,
+            handoff_from_tool,
         });
         Ok(())
     }

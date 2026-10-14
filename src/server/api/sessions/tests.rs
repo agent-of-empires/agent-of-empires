@@ -3641,6 +3641,258 @@ async fn start_rechecks_the_stored_row() {
     }
 }
 
+/// #4042 review P2: switching a terminal session back to a tool whose parked
+/// native id can no longer be resumed must report that failure. The probe kills
+/// the pane, so a `200` here would claim a running session on the new tool whose
+/// context was never handed over; the parked id must also stay for the explicit
+/// retry the message names.
+#[tokio::test]
+#[serial_test::serial]
+async fn switch_terminal_agent_reports_a_failed_resume_and_keeps_the_parked_sid() {
+    if crate::tmux::tmux_command().arg("-V").output().is_err() {
+        eprintln!("tmux not available; skipping");
+        return;
+    }
+    use crate::server::test_support as support;
+    use axum::body::to_bytes;
+
+    const SID: &str = "11111111-2222-4333-8444-555555555555";
+    const PROFILE: &str = "default";
+
+    let temp = tempfile::tempdir().unwrap();
+    let _home = crate::session::test_support::isolate_app_dir_at(temp.path());
+    // Launching claude installs its host status hooks, which the cascade refuses
+    // without the acknowledgement the `aoe hooks approve` prompt writes.
+    crate::session::config::update_app_state(|state| state.has_acknowledged_agent_hooks = true)
+        .unwrap();
+    let _claude_dir = crate::session::test_support::EnvGuard::set(&[(
+        "CLAUDE_CONFIG_DIR",
+        temp.path().join(".claude"),
+    )]);
+    // Keep the review's failure mode alone: a dying CLI, not a hook-approval refusal.
+    // Dies on every launch, `--resume` included, which is what the probe sees.
+    let _claude = crate::session::test_support::install_login_shell_path_command(
+        temp.path(),
+        "claude",
+        "#!/bin/sh\nexit 1\n",
+    );
+    let project = temp.path().join("project");
+    std::fs::create_dir_all(&project).unwrap();
+    let project = std::fs::canonicalize(&project).unwrap();
+
+    // The row runs the outgoing tool; switching back restores the claude id parked
+    // by an earlier swap away from it, and the transcript on disk is what makes the
+    // relaunch resume that id rather than pin a fresh one. Built through `swap_tool`
+    // rather than a hand-written parked entry: that is the review's repro path
+    // (swap away parks claude's id, swap back restores it), so the test cannot
+    // drift from what the endpoint sees.
+    let mut inst = Instance::new("switch-resume", project.to_str().unwrap());
+    inst.source_profile = PROFILE.to_string();
+    inst.tool = "claude".to_string();
+    inst.command = "claude".to_string();
+    inst.agent_session_id = Some(SID.to_string());
+    inst.status = Status::Idle;
+    inst.swap_tool("codex");
+    let transcript_dir = temp.path().join(".claude/projects").join(
+        crate::session::capture::encode_claude_project_path(&project.to_string_lossy()),
+    );
+    std::fs::create_dir_all(&transcript_dir).unwrap();
+    std::fs::write(transcript_dir.join(format!("{SID}.jsonl")), "seed\n").unwrap();
+    let id = inst.id.clone();
+    let pane = crate::tmux::Session::generate_name(&id, &inst.title);
+
+    support::seed_instances_on_disk_for_test(PROFILE, vec![inst.clone()]);
+    let state = support::build_test_app_state(vec![inst]);
+
+    let response = switch_terminal_agent(
+        State(state.clone()),
+        Path(id.clone()),
+        Ok(Json(SwitchTerminalAgentBody {
+            target: "claude".to_string(),
+        })),
+    )
+    .await
+    .into_response();
+    let _ = crate::tmux::tmux_command()
+        .args(["kill-session", "-t", &pane])
+        .output();
+
+    let status = response.status();
+    let body: serde_json::Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["error"], "resume_failed", "{body}");
+    assert_eq!(
+        body["resume_session_id"], SID,
+        "the retry needs the id that failed: {body}"
+    );
+    assert_eq!(
+        body["context_handoff"], "unavailable",
+        "a dead pane hands nothing over: {body}"
+    );
+    assert_eq!(
+        state.instances.read().await[0].status,
+        Status::Error,
+        "the live row must not read as the switch having landed"
+    );
+
+    let row = support::load_instances_from_disk_for_test(PROFILE)
+        .into_iter()
+        .find(|row| row.id == id)
+        .expect("the switched row stays on disk");
+    assert_eq!(row.tool, "claude", "the swap itself is committed");
+    assert_eq!(
+        row.agent_session_id.as_deref(),
+        Some(SID),
+        "the parked id survives the failed resume"
+    );
+    assert_eq!(
+        row.resume_probe_failed_sid.as_deref(),
+        Some(SID),
+        "the failure is recorded so the retry does not loop on it"
+    );
+}
+
+/// The success half of the same contract: a terminal session whose outgoing pane
+/// still holds output switches to another installed tool, reports the handoff as
+/// `sent`, and the incoming CLI really receives the fenced take-over prompt built
+/// from that output. The `409` test above proves a dead pane is reported as a
+/// failure; without this one, a `200` would only prove the swap committed.
+#[tokio::test]
+#[serial_test::serial]
+async fn switch_terminal_agent_hands_the_outgoing_pane_to_the_incoming_cli() {
+    if crate::tmux::tmux_command().arg("-V").output().is_err() {
+        eprintln!("tmux not available; skipping");
+        return;
+    }
+    use crate::server::test_support as support;
+    use axum::body::to_bytes;
+
+    const PROFILE: &str = "default";
+    const MARKER: &str = "outgoing-pane-context-marker";
+
+    let temp = tempfile::tempdir().unwrap();
+    let _home = crate::session::test_support::isolate_app_dir_at(temp.path());
+    crate::session::config::update_app_state(|state| state.has_acknowledged_agent_hooks = true)
+        .unwrap();
+
+    // The incoming tool has no native session of ours to resume, so it only has to come
+    // up and hold the pane's foreground (what the readiness probe waits for) while
+    // recording whatever the handoff types in. `cat` on the pane's tty is the crudest
+    // stand-in for a CLI's input box, and it never exits, so the pane stays live.
+    let received = temp.path().join("codex-received.txt");
+    let _codex = crate::session::test_support::install_login_shell_path_command(
+        temp.path(),
+        "codex",
+        &format!("#!/bin/sh\nexec cat > '{}'\n", received.display()),
+    );
+
+    let project = temp.path().join("project");
+    std::fs::create_dir_all(&project).unwrap();
+    let project = std::fs::canonicalize(&project).unwrap();
+
+    let mut inst = Instance::new("switch-handoff", project.to_str().unwrap());
+    inst.source_profile = PROFILE.to_string();
+    inst.tool = "claude".to_string();
+    inst.command = "claude".to_string();
+    inst.status = Status::Idle;
+    let id = inst.id.clone();
+    let pane = crate::tmux::Session::generate_name(&id, &inst.title);
+
+    // The outgoing pane is what the handoff is captured from, so it has to hold real
+    // output: the failure case above switches away from whatever the launch left.
+    let created = crate::tmux::tmux_command()
+        .args([
+            "new-session",
+            "-d",
+            "-s",
+            &pane,
+            "sh",
+            "-c",
+            &format!("printf '{MARKER}\\n'; sleep 600"),
+        ])
+        .status();
+    if !created.map(|status| status.success()).unwrap_or(false) {
+        eprintln!("tmux new-session failed; skipping");
+        return;
+    }
+    crate::tmux::refresh_session_cache();
+    let capture = || {
+        crate::tmux::tmux_command()
+            .args(["capture-pane", "-p", "-t", &pane])
+            .output()
+            .map(|out| String::from_utf8_lossy(&out.stdout).into_owned())
+            .unwrap_or_default()
+    };
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+    while !capture().contains(MARKER) {
+        if std::time::Instant::now() >= deadline {
+            eprintln!("the outgoing pane never showed its marker; skipping");
+            let _ = crate::tmux::tmux_command()
+                .args(["kill-session", "-t", &pane])
+                .output();
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
+
+    support::seed_instances_on_disk_for_test(PROFILE, vec![inst.clone()]);
+    let state = support::build_test_app_state(vec![inst]);
+
+    let response = switch_terminal_agent(
+        State(state.clone()),
+        Path(id.clone()),
+        Ok(Json(SwitchTerminalAgentBody {
+            target: "codex".to_string(),
+        })),
+    )
+    .await
+    .into_response();
+
+    let status = response.status();
+    let body: serde_json::Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
+    // The handoff is typed inline before the response is built, but the pane's tty
+    // line discipline only hands the text to the reader on the trailing Enter.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+    let handed = loop {
+        let text = std::fs::read_to_string(&received).unwrap_or_default();
+        if text.contains(MARKER) || std::time::Instant::now() >= deadline {
+            break text;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    };
+    let pane_after = capture();
+    let _ = crate::tmux::tmux_command()
+        .args(["kill-session", "-t", &pane])
+        .output();
+
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["tool"], "codex", "{body}");
+    assert_eq!(
+        body["context_handoff"], "sent",
+        "the outgoing pane held output to hand over: {body}"
+    );
+    assert!(
+        handed.contains(MARKER),
+        "the incoming CLI received the captured tail: {handed:?} pane={pane_after:?}"
+    );
+    assert!(
+        handed.contains("previous terminal context"),
+        "and it arrives fenced as untrusted context: {handed:?}"
+    );
+    assert_eq!(
+        state.instances.read().await[0].tool,
+        "codex",
+        "the live row runs the incoming tool"
+    );
+    let row = support::load_instances_from_disk_for_test(PROFILE)
+        .into_iter()
+        .find(|row| row.id == id)
+        .expect("the switched row stays on disk");
+    assert_eq!(row.tool, "codex", "the swap is committed");
+}
+
 /// The HTTP send boundary strips terminal control bytes from captured snippets before tmux input.
 #[tokio::test]
 #[serial_test::serial]

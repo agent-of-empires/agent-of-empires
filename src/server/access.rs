@@ -317,6 +317,9 @@ pub(super) const CITYHALL_MUTATION_DENY: &[(&str, &str)] = &[
     ("POST", "/api/sessions/{id}/terminal"),
     ("DELETE", "/api/sessions/{id}/terminal"),
     ("POST", "/api/sessions/{id}/container-terminal"),
+    // Terminal-only: CityHall owns structured sessions, so the handler refuses every
+    // target in this mode (non-structured -> 403, structured -> `409 structured_session`).
+    ("POST", "/api/sessions/{id}/switch-agent"),
     // Git / project / profile management.
     ("POST", "/api/git/clone"),
     ("POST", "/api/projects"),

@@ -4781,6 +4781,19 @@ impl HomeView {
                     super::Item::Session { id, .. } => self.session_switch_view_target(id),
                     super::Item::Group { .. } => None,
                 };
+                // Swapping the terminal agent runs through the restart
+                // picker, so it is offered only for a live terminal row: a
+                // structured row already has its ACP switch, and a row
+                // mid-creation or mid-deletion has no pane to relaunch.
+                let can_switch_terminal_agent = match &self.flat_items[idx] {
+                    super::Item::Session { id, .. } => self.get_instance(id).is_some_and(|inst| {
+                        !inst.is_structured()
+                            && !inst.is_archived()
+                            && !inst.is_trashed()
+                            && !matches!(inst.status, Status::Creating | Status::Deleting)
+                    }),
+                    super::Item::Group { .. } => false,
+                };
                 ContextMenuDialog::for_session(
                     anchor,
                     is_archived,
@@ -4788,6 +4801,7 @@ impl HomeView {
                     unread,
                     can_fork,
                     switch_view,
+                    can_switch_terminal_agent,
                 )
             });
             return true;
@@ -4876,6 +4890,7 @@ impl HomeView {
             // group row borrows a member's, as `'N'` does.
             ContextMenuAction::NewFromSelection => self.open_new_from_selection(),
             ContextMenuAction::Fork => self.open_fork_from_selection(),
+            ContextMenuAction::SwitchTerminalAgent => self.open_terminal_switch_dialog(),
             ContextMenuAction::SwitchView => self.prompt_switch_view_for_selected(),
             ContextMenuAction::OpenSortPicker => self.show_sort_picker(),
             ContextMenuAction::AddProject => self.open_add_project_for_selected(),
@@ -5949,8 +5964,20 @@ impl HomeView {
     /// AI engine; submit restarts it, optionally migrating profile and/or swapping the
     /// engine. No-op with no selection or a mid-transition session.
     fn open_restart_dialog(&mut self) {
-        // Match the new-session paths: bail with the no-agents modal when no tool is
-        // installed, rather than opening a picker with an empty tool list.
+        self.open_restart_dialog_focused(false);
+    }
+
+    /// [`open_restart_dialog`](Self::open_restart_dialog) with the tool selector
+    /// focused, which is what the "Switch terminal agent" entry point means: the
+    /// user has already decided to swap the CLI and only needs to pick the
+    /// target.
+    fn open_terminal_switch_dialog(&mut self) {
+        self.open_restart_dialog_focused(true);
+    }
+
+    /// Match the new-session paths: bail with the no-agents modal when no tool is
+    /// installed, rather than opening a picker with an empty tool list.
+    fn open_restart_dialog_focused(&mut self, focus_tool: bool) {
         if !self.available_tools.any_available() {
             self.show_no_agents();
             return;
@@ -5978,7 +6005,7 @@ impl HomeView {
         let profiles =
             list_profiles_for_display().unwrap_or_else(|_| vec![current_profile.clone()]);
         let tools: Vec<String> = self.available_tools.available_list().to_vec();
-        self.restart_dialog = Some(RestartDialog::new(
+        let mut dialog = RestartDialog::new(
             &current_title,
             &current_profile,
             &current_tool,
@@ -5986,7 +6013,11 @@ impl HomeView {
             &current_extra_args,
             profiles,
             tools,
-        ));
+        );
+        if focus_tool {
+            dialog.focus_tool_selector();
+        }
+        self.restart_dialog = Some(dialog);
     }
 
     /// Try to enter live-send against the selected session. Unlike `resolve_send_target`

@@ -1,5 +1,6 @@
 //! Shared session restart logic.
 
+use crate::session::terminal_handoff::{capture_tail, deliver, prompt, Outcome, READY_TIMEOUT};
 use crate::session::{Instance, StartOutcome};
 
 pub struct RestartRequest {
@@ -22,6 +23,12 @@ pub struct RestartRequest {
     /// pre-swap row and run inside the cascade, once the outgoing agent is dead
     /// and before the incoming one starts.
     pub conversation_carry: Option<crate::session::conversation_carry::ConversationCarry>,
+    /// The tool the session is switching away from, on a cross-agent tool swap.
+    /// `perform_restart` then captures the outgoing pane's tail before the cascade
+    /// kills it and hands it to the incoming CLI as a take-over prompt; see
+    /// [`crate::session::terminal_handoff`]. `None` on every account-only or
+    /// same-tool restart, which carry `wake_message` alone.
+    pub handoff_from_tool: Option<String>,
 }
 
 pub struct RestartResult {
@@ -32,8 +39,11 @@ pub struct RestartResult {
     /// Post-cascade instance snapshot.
     pub instance: Box<Instance>,
     pub outcome: Result<StartOutcome, String>,
+    /// What became of the cross-agent handoff this restart was asked to make.
+    pub handoff: Outcome,
 }
 
+/// Run one restart to completion on the calling thread, including the inline handoff.
 pub fn perform_restart(request: RestartRequest) -> RestartResult {
     let RestartRequest {
         session_id,
@@ -44,11 +54,20 @@ pub fn perform_restart(request: RestartRequest) -> RestartResult {
         bound_hooks,
         discard_sandbox_container,
         conversation_carry,
+        handoff_from_tool,
     } = request;
 
     let title = instance.title.clone();
     let tool = instance.tool.clone();
     let before = instance.clone();
+
+    // A cross-CLI swap captures the outgoing pane now: the cascade below kills it, and the
+    // incoming CLI has no native session of ours to resume, so this tail is the only carrier
+    // between the two. A capture that yields nothing reports the handoff unavailable; the
+    // configured wake keys still fire below.
+    let handoff_message = handoff_from_tool
+        .as_deref()
+        .and_then(|from_tool| capture_tail(&instance).map(|tail| prompt(from_tool, &tool, &tail)));
 
     // With `bound_hooks`, honor the on_launch / before_start hook timeout the startup-recovery
     // worker installs (`run_recovery_for_instance`), so a hanging hook (e.g. a `mint` script
@@ -69,11 +88,27 @@ pub fn perform_restart(request: RestartRequest) -> RestartResult {
             .map_err(|e| e.to_string())
     };
 
-    // On a successful restart, send the wake-up keys on a detached thread so the result (and the
-    // row's status update) propagate back immediately rather than waiting out the up-to-3s
-    // pane-readiness probe.
-    let should_wake = launched_agent(&outcome);
-    if should_wake && !wake_message.is_empty() {
+    // A requested handoff is delivered inline because its result is part of this restart's
+    // report: a caller that asked for a handoff must learn whether it landed. Ordinary wake-up
+    // keys stay on a detached thread, so their pane-readiness probe never delays the result.
+    let handoff = match handoff_message {
+        Some(message) if launched_agent(&outcome) => {
+            if deliver(&session_id, &title, &tool, &message, READY_TIMEOUT) {
+                Outcome::Sent
+            } else {
+                Outcome::Unavailable
+            }
+        }
+        Some(_) => Outcome::Unavailable,
+        None if handoff_from_tool.is_some() => Outcome::Unavailable,
+        None => Outcome::NotRequested,
+    };
+
+    // The handoff is the pane's carrier when it lands. When it does not -- not asked
+    // for, nothing captureable, or a paste that never took -- the configured wake keys
+    // are what a restart of this session sends anyway, so a tool swap keeps the same
+    // nudge a same-tool restart would.
+    if handoff != Outcome::Sent && launched_agent(&outcome) && !wake_message.is_empty() {
         spawn_wake_worker(session_id.clone(), title, tool, wake_message);
     }
 
@@ -82,6 +117,7 @@ pub fn perform_restart(request: RestartRequest) -> RestartResult {
         before: Box::new(before),
         instance: Box::new(instance),
         outcome,
+        handoff,
     }
 }
 
@@ -96,37 +132,18 @@ pub(crate) fn launched_agent(outcome: &Result<StartOutcome, String>) -> bool {
 }
 
 /// Wait for the restarted pane to become live and past its boot shell, then send the wake-up
-/// message.
+/// message. Detached from the restart result, which must not wait out the readiness probe.
 fn spawn_wake_worker(session_id: String, title: String, tool: String, wake_message: String) {
     let spawn_result = std::thread::Builder::new()
         .name(format!("aoe-restart-wake/{}", session_id))
         .stack_size(128 * 1024)
         .spawn(move || {
-            let Ok(tmux_session) = crate::tmux::Session::new(&session_id, &title) else {
-                return;
-            };
-            let deadline = std::time::Instant::now() + std::time::Duration::from_millis(3000);
-            loop {
-                if !tmux_session.exists() {
-                    return;
-                }
-                let pane_alive = !tmux_session.is_pane_dead();
-                let hook_active = crate::hooks::read_hook_status(&session_id).is_some();
-                if pane_alive && (hook_active || !tmux_session.is_pane_running_shell()) {
-                    break;
-                }
-                if std::time::Instant::now() >= deadline {
-                    break;
-                }
-                std::thread::sleep(std::time::Duration::from_millis(50));
-            }
-
-            if !tmux_session.exists() {
-                return;
-            }
-            let delay = crate::agents::send_keys_enter_delay(&tool);
-            if let Err(e) = tmux_session.send_keys_with_delay(&wake_message, delay) {
-                tracing::warn!(target: "session.restart", "failed to send wake-up message after restart: {}", e);
+            if !deliver(&session_id, &title, &tool, &wake_message, READY_TIMEOUT) {
+                tracing::warn!(
+                    target: "session.restart",
+                    session_id,
+                    "restart wake-up message was not delivered"
+                );
             }
         });
     if let Err(err) = spawn_result {
@@ -212,12 +229,14 @@ mod tests {
                 bound_hooks: true,
                 discard_sandbox_container: true,
                 conversation_carry: None,
+                handoff_from_tool: None,
             });
 
             let error = result
                 .outcome
                 .expect_err("the fake runtime fails every launch");
             assert_eq!(error.contains("busy"), peer_reserved, "{error}");
+
             let removals = std::fs::read_to_string(&calls)
                 .unwrap_or_default()
                 .lines()
@@ -235,7 +254,6 @@ mod tests {
         let outcome = Ok(StartOutcome::ResumeFailed {
             sid: "11111111-2222-3333-4444-555555555555".to_string(),
         });
-
         assert!(!launched_agent(&outcome));
     }
 }

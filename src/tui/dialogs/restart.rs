@@ -107,6 +107,13 @@ impl RestartDialog {
         }
     }
 
+    /// Focus the AI-engine selector rather than the profile one, so a caller
+    /// whose decision is already the engine (the "Switch terminal agent" entry
+    /// point) lands the user on the field they came to change.
+    pub fn focus_tool_selector(&mut self) {
+        self.focused_field = 1;
+    }
+
     pub fn handle_click(&mut self, col: u16, row: u16) -> Option<DialogResult<RestartData>> {
         let pos = ratatui::layout::Position::from((col, row));
         // While the tool-config overlay is up, a click on a field focuses it;

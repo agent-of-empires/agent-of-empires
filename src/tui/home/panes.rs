@@ -132,6 +132,7 @@ impl HomeView {
                 bound_hooks: false,
                 discard_sandbox_container: false,
                 conversation_carry: None,
+                handoff_from_tool: None,
             });
     }
 

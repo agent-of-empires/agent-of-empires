@@ -88,6 +88,7 @@ export interface SingleRowActions {
   editGroup: () => void;
   switchView: () => void;
   switchAgent: () => void;
+  switchTerminalAgent: () => void;
   fork: () => void;
   autoName: () => void;
   summarize: () => void;
@@ -155,12 +156,13 @@ export function SingleRowMenuItems({
 }) {
   const [moreOpen, setMoreOpen] = useState(false);
   const moreId = useId();
-  const { firstSession: first, acpSession: acp } = model;
+  const { firstSession: first, acpSession: acp, terminalSession: terminal } = model;
   const write = !readOnly;
   const canSwitchView = write && !!first && (first.view === "structured" || first.acp_capable);
   const canFork = write && !!acp?.acp_session_id && acp.acp_can_fork;
   const more = write && {
     switchAgent: !!acp,
+    switchTerminalAgent: !!terminal,
     autoName: !!acp,
     summarize: !!acp,
     editWorkdir: model.canEditWorkdir,
@@ -219,6 +221,16 @@ export function SingleRowMenuItems({
                 indent
               >
                 Switch agent
+              </MenuItem>
+            )}
+            {more.switchTerminalAgent && (
+              <MenuItem
+                onClick={a.switchTerminalAgent}
+                testId="sidebar-context-menu-switch-terminal-agent"
+                icon={icon(ArrowLeftRight)}
+                indent
+              >
+                Switch terminal agent
               </MenuItem>
             )}
             {more.autoName && (

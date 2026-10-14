@@ -20,6 +20,7 @@ This document contains the help content for the `aoe` command-line program.
 * [`aoe session start`↴](#aoe-session-start)
 * [`aoe session stop`↴](#aoe-session-stop)
 * [`aoe session restart`↴](#aoe-session-restart)
+* [`aoe session switch-agent`↴](#aoe-session-switch-agent)
 * [`aoe session attach`↴](#aoe-session-attach)
 * [`aoe session show`↴](#aoe-session-show)
 * [`aoe session rename`↴](#aoe-session-rename)
@@ -395,6 +396,7 @@ Manage session lifecycle (start, stop, attach, etc.)
 * `start` — Start a session's tmux process
 * `stop` — Stop session process
 * `restart` — Restart session (or all sessions with `--all`)
+* `switch-agent` — Switch a terminal/tmux session to another installed agent CLI while preserving its AoE session and worktree identity. The outgoing tool's parked native session id is kept for a later switch back; the incoming CLI receives a bounded tail of the outgoing pane as a hand-off prompt. Structured sessions use `aoe acp switch-agent`
 * `attach` — Attach to session interactively
 * `show` — Show session details
 * `rename` — Rename a session
@@ -458,6 +460,19 @@ Restart session (or all sessions with `--all`)
 * `--parallel <PARALLEL>` — Concurrency cap for `--all`. Restarting many sandboxed sessions in parallel pressures dockerd, so the default is intentionally modest. Ignored when `--all` is not set
 
   Default value: `3`
+
+
+
+## `aoe session switch-agent`
+
+Switch a terminal/tmux session to another installed agent CLI while preserving its AoE session and worktree identity. The outgoing tool's parked native session id is kept for a later switch back; the incoming CLI receives a bounded tail of the outgoing pane as a hand-off prompt. Structured sessions use `aoe acp switch-agent`
+
+**Usage:** `aoe session switch-agent <IDENTIFIER> <TARGET>`
+
+###### **Arguments:**
+
+* `<IDENTIFIER>` — Session ID or title
+* `<TARGET>` — Installed agent CLI to switch to (for example `claude`, `codex`, `gemini`)
 
 
 

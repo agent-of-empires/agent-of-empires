@@ -11,6 +11,7 @@ import {
 import type { PluginUiEntry } from "../../lib/api";
 import type { PromptAttachmentInput, QueuedPrompt } from "../../lib/acpTypes";
 import { buildSkillIndex, type SkillIndex } from "../../lib/skillProvenance";
+import { clearPendingSwitchAgent, OPEN_SWITCH_AGENT_EVENT } from "../../lib/switchAgentTrigger";
 import { Composer } from "./Composer";
 
 const { skillIndexRef, entriesRef } = vi.hoisted(() => ({
@@ -280,6 +281,37 @@ describe("slash command popover", () => {
     await waitFor(() => expect(option(/\/aoe-review/)).toHaveLength(1));
     expect(option(/\/aoe-review/)[0]!.textContent).toContain("Claude");
     expect(option(/\/help/)[0]!.textContent).not.toContain("Claude");
+  });
+
+  it("offers the local switch-agent command even when the adapter omits it", async () => {
+    const { textarea } = mount();
+    await typeAt(textarea(), "/switch", 7);
+    expect(option(/\/switch-agent/)).toHaveLength(1);
+  });
+
+  it("executes the local switch-agent command instead of inserting it", async () => {
+    // The command opens the picker, which loads the ACP registry on open.
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (url: string) => ({
+        ok: true,
+        json: async () => (String(url).includes("/api/acp/agents") ? [] : { files: [] }),
+      })),
+    );
+    const opened: string[] = [];
+    const record = (e: Event) => opened.push((e as CustomEvent<{ sessionId: string }>).detail.sessionId);
+    window.addEventListener(OPEN_SWITCH_AGENT_EVENT, record);
+    try {
+      const { textarea } = mount();
+      await typeAt(textarea(), "/switch", 7);
+      await pick(/\/switch-agent/);
+
+      expect(opened).toEqual(["sess"]);
+      expect(textarea().value).not.toContain("/switch-agent ");
+    } finally {
+      window.removeEventListener(OPEN_SWITCH_AGENT_EVENT, record);
+      clearPendingSwitchAgent();
+    }
   });
 });
 

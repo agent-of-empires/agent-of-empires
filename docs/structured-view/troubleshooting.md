@@ -91,8 +91,9 @@ Each resume re-sends the interrupted prompt, so it gives up after five re-sends 
 
 The same hand-off is available any time, which is how you return to the original agent after a rate-limit switch.
 
-- **Web**: right-click the session and pick "Switch agent". The picker lists built-in agents only.
+- **Web**: right-click the session and pick "Switch agent", or type `/switch-agent` in the structured composer. The picker lists built-in agents only.
 - **CLI**: `aoe acp switch-agent <session> <target>` (`aoe acp agents` lists the target keys; `--model <name>` overrides the model it starts with). A custom agent with an `agent_acp_cmd` is a valid target even though neither surface lists it.
+- **Terminal/tmux sessions**: right-click a terminal session and pick "Switch terminal agent", or run `aoe session switch-agent <session> <target>`. The project, worktree and AoE session stay the same. The new CLI starts a fresh native session and receives a bounded handoff prompt from the outgoing terminal capture when available; it never receives the old tool's resume id.
 
 The transcript divider reads `Switched structured view agent from <from> to <to> (manual)`, distinct from the `(rate_limited)` one the recovery flow emits.
 

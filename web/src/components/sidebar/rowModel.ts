@@ -87,6 +87,7 @@ export function deriveRowModel(
     runningSession,
     navigationSession: runningSession ?? firstSession,
     acpSession: sessions.find((s) => s.view === "structured"),
+    terminalSession: sessions.find((s) => s.view === "terminal"),
     sessionId: firstSession?.id,
     sessionTitle,
     branchLabel,

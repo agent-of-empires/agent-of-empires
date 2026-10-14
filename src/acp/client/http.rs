@@ -14,6 +14,7 @@ use crate::acp::elicitations::ElicitationResolution;
 use crate::acp::protocol::{
     ApprovalDecisionWire, FilesResponse, PromptRequest, ReplayResponse, ResolveApprovalRequest,
     SwitchAgentRequest, SwitchAgentResponse, SwitchProviderRequest, SwitchProviderResponse,
+    SwitchTerminalAgentRequest, SwitchTerminalAgentResponse,
 };
 use crate::acp::transcript::TranscriptRow;
 use crate::plugin::ui_state::UiSnapshot;
@@ -463,6 +464,28 @@ impl HttpClient {
             reason: reason.map(str::to_string),
         };
         let path = format!("/api/sessions/{session_id}/acp/switch-agent");
+        let res = self
+            .send(
+                || self.request(Method::POST, &path).json(&body),
+                Scope::Session(session_id),
+            )
+            .await?;
+        Ok(res.json().await?)
+    }
+
+    /// Hand a terminal session to another installed CLI. The AoE session,
+    /// worktree and per-tool parked native session ids all stay put; the
+    /// incoming CLI gets a bounded tail of the outgoing pane as a hand-off
+    /// prompt instead of a foreign resume id and reports whether it landed.
+    pub async fn switch_terminal_agent(
+        &self,
+        session_id: &str,
+        target: &str,
+    ) -> Result<SwitchTerminalAgentResponse, HttpError> {
+        let body = SwitchTerminalAgentRequest {
+            target: target.to_string(),
+        };
+        let path = format!("/api/sessions/{session_id}/switch-agent");
         let res = self
             .send(
                 || self.request(Method::POST, &path).json(&body),

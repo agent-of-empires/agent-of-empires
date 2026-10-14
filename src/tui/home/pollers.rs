@@ -421,6 +421,7 @@ impl HomeView {
                         before,
                         mut instance,
                         outcome,
+                        handoff,
                     } = result;
 
                     self.restart_in_flight.remove(&session_id);
@@ -461,7 +462,25 @@ impl HomeView {
                                 ),
                             ));
                         }
-                        Ok(_) => {}
+                        Ok(_) => {
+                            if handoff == crate::session::terminal_handoff::Outcome::Unavailable {
+                                tracing::warn!(
+                                    target: "session.restart",
+                                    id = %session_id,
+                                    tool = %instance.tool,
+                                    "cross-agent handoff could not be delivered",
+                                );
+                                self.info_dialog = Some(InfoDialog::new(
+                                    "Restarted",
+                                    &format!(
+                                        "Switched to {}; the previous agent's terminal context \
+                                         could not be handed over. The new session starts with \
+                                         the agent's own history only.",
+                                        instance.tool
+                                    ),
+                                ));
+                            }
+                        }
                         Err(e) => {
                             tracing::warn!(
                                 target: "session.restart",

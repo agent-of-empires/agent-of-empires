@@ -21,6 +21,13 @@ pub enum SessionCommands {
     /// Restart session (or all sessions with `--all`)
     Restart(RestartArgs),
 
+    /// Switch a terminal/tmux session to another installed agent CLI while
+    /// preserving its AoE session and worktree identity. The outgoing tool's
+    /// parked native session id is kept for a later switch back; the incoming
+    /// CLI receives a bounded tail of the outgoing pane as a hand-off prompt.
+    /// Structured sessions use `aoe acp switch-agent`.
+    SwitchAgent(SwitchAgentArgs),
+
     /// Attach to session interactively
     Attach(SessionIdArgs),
 
@@ -190,6 +197,15 @@ pub struct RestartArgs {
     /// intentionally modest. Ignored when `--all` is not set.
     #[arg(long, default_value_t = 3)]
     pub parallel: usize,
+}
+
+#[derive(Args)]
+pub struct SwitchAgentArgs {
+    /// Session ID or title
+    pub identifier: String,
+
+    /// Installed agent CLI to switch to (for example `claude`, `codex`, `gemini`)
+    pub target: String,
 }
 
 #[derive(Args)]
@@ -389,6 +405,7 @@ pub async fn run(profile: &str, command: SessionCommands) -> Result<()> {
         SessionCommands::Start(args) => start_session(profile, args).await,
         SessionCommands::Stop(args) => stop_session(profile, args).await,
         SessionCommands::Restart(args) => restart_session_dispatch(profile, args).await,
+        SessionCommands::SwitchAgent(args) => switch_agent(profile, args).await,
         SessionCommands::Attach(args) => attach_session(profile, args).await,
         SessionCommands::Show(args) => show_session(profile, args).await,
         SessionCommands::Capture(args) => capture_session(profile, args).await,
@@ -1096,6 +1113,79 @@ async fn stop_session(profile: &str, args: SessionIdArgs) -> Result<()> {
     }
 
     Ok(())
+}
+
+/// `aoe session switch-agent <session> <target>`.
+///
+/// Terminal/tmux sessions only: the swap stops the current CLI, relaunches the
+/// target in the same pane, and hands over a bounded tail of the outgoing
+/// terminal. Structured sessions keep their own `aoe acp switch-agent`.
+///
+/// The swap itself runs on the daemon, which owns the instance lock and the
+/// status stream; going through it is what keeps the CLI's validation and
+/// failure reporting identical to the web and TUI surfaces.
+async fn switch_agent(profile: &str, args: SwitchAgentArgs) -> Result<()> {
+    let storage = Storage::open_unwatched(profile)?;
+    let (instances, _groups) = storage.load_with_groups()?;
+    // Resolve here so a title or an id prefix works, and so the daemon receives
+    // the canonical id rather than whatever the user typed.
+    let inst = super::resolve_session(&args.identifier, &instances)?;
+    if inst.is_structured() {
+        bail!(
+            "session {} is a structured-view session; use `aoe acp switch-agent {} <target>`",
+            inst.title,
+            inst.id
+        );
+    }
+    let session_id = inst.id.clone();
+    let target = args.target.trim();
+    if target.is_empty() {
+        bail!("target agent tool cannot be empty");
+    }
+
+    let endpoint = crate::acp::client::require_daemon().await?;
+    let client = crate::acp::client::HttpClient::new(endpoint)?;
+    let resp = client
+        .switch_terminal_agent(&session_id, target)
+        .await
+        .map_err(|e| match e {
+            crate::acp::client::HttpError::Server { status, body } => {
+                anyhow::anyhow!(
+                    "switch failed (HTTP {status}): {}",
+                    server_error_message(&body)
+                )
+            }
+            other => anyhow::Error::new(other),
+        })?;
+
+    println!("✓ Switched session {} to {}", inst.title, resp.tool);
+    if resp.context_handoff == "sent" {
+        println!(
+            "  Handed the previous terminal output to {} as a take-over prompt.",
+            resp.tool
+        );
+    } else {
+        println!(
+            "  No previous terminal context was handed over; {} starts from its own history.",
+            resp.tool
+        );
+    }
+    Ok(())
+}
+
+/// The API's own `message` out of an error body, so a `409 resume_failed` reaches
+/// the user as the reason and the preserved session id rather than as one line of
+/// JSON. Falls back to the raw body when it carries no `message`.
+fn server_error_message(body: &str) -> String {
+    serde_json::from_str::<serde_json::Value>(body)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("message")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string)
+        })
+        .unwrap_or_else(|| body.to_string())
 }
 
 async fn restart_session_dispatch(profile: &str, args: RestartArgs) -> Result<()> {
@@ -3130,6 +3220,25 @@ mod target_filter_tests {
         assert_eq!(
             pick_targets_for_restart_all(&instances, Some(&ordinary_context)),
             [caller.id, other.id]
+        );
+    }
+}
+
+#[cfg(test)]
+mod server_error_message_tests {
+    use super::server_error_message;
+
+    #[test]
+    fn an_api_error_body_renders_as_its_message_and_nothing_else() {
+        let body = r#"{"error":"resume_failed","message":"Resume failed for sid abc; preserved for explicit retry","context_handoff":"unavailable"}"#;
+        assert_eq!(
+            server_error_message(body),
+            "Resume failed for sid abc; preserved for explicit retry"
+        );
+        assert_eq!(server_error_message("gateway down"), "gateway down");
+        assert_eq!(
+            server_error_message(r#"{"error":"internal"}"#),
+            r#"{"error":"internal"}"#
         );
     }
 }
