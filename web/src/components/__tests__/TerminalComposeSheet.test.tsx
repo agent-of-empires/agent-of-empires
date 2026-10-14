@@ -21,7 +21,7 @@ describe("TerminalComposeSheet", () => {
   it.each([
     ["Send", true],
     ["Insert", false],
-  ])("%s pastes the draft with submit=%s, then clears it and refocuses the terminal", (action, submit) => {
+  ])("%s pastes the draft with submit=%s, then clears it", (action, submit) => {
     const key = `deliver-${action}`;
     const first = renderSheet(key);
     expect(document.activeElement).toBe(first.text);
@@ -30,7 +30,9 @@ describe("TerminalComposeSheet", () => {
     first.type("fix the\nbug");
     fireEvent.click(screen.getByRole("button", { name: action }));
     expect(first.onSubmit.mock.calls).toEqual([["fix the\nbug", submit]]);
-    expect(first.onClose).toHaveBeenCalledWith(true);
+    // Only Insert keeps the keyboard up for the terminal.
+    expect(first.onClose).toHaveBeenCalledWith(!submit);
+    expect(document.activeElement === first.text).toBe(!submit);
     first.unmount();
 
     expect(renderSheet(key).text.value).toBe("");

@@ -6,7 +6,7 @@ const drafts = new Map<string, string>();
 
 interface Props {
   draftKey: string;
-  /** Height the soft keyboard covers, so the sheet sits above it. */
+  /** Soft keyboard height above the home-indicator inset, which the sheet adds since its parent drops it. */
   bottomInset: number;
   /** Whether the pane will receive the text. */
   onSubmit: (text: string, submit: boolean) => boolean;
@@ -41,7 +41,9 @@ export function TerminalComposeSheet({ draftKey, bottomInset, onSubmit, onClose 
     const text = textRef.current?.value ?? "";
     if (!text.trim() || !onSubmit(text, submit)) return;
     drafts.delete(draftKey);
-    onClose(true);
+    // Send ends the prompt, so the keyboard goes down; Insert keeps typing in the terminal.
+    if (submit) textRef.current?.blur();
+    onClose(!submit);
   };
 
   const onKeyDown = (e: ReactKeyboardEvent<HTMLTextAreaElement>) => {
@@ -57,7 +59,10 @@ export function TerminalComposeSheet({ draftKey, bottomInset, onSubmit, onClose 
   const action = "h-10 px-3 rounded-md text-sm transition-colors disabled:opacity-40";
 
   return (
-    <div className="absolute inset-x-0 top-0 z-30 flex flex-col justify-end" style={{ bottom: bottomInset }}>
+    <div
+      className="absolute inset-x-0 top-0 z-30 flex flex-col justify-end"
+      style={{ bottom: `calc(${bottomInset}px + env(safe-area-inset-bottom))` }}
+    >
       <div className="absolute inset-0 bg-black/40" onClick={() => onClose(false)} data-compose-backdrop />
       <div
         role="dialog"
