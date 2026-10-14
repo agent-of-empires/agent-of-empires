@@ -161,7 +161,17 @@ fn plugin_page_response(bytes: Vec<u8>) -> Response {
 pub async fn serve_plugin_page(
     Path((id, page_id)): Path<(String, String)>,
     uri: axum::http::Uri,
+    headers: axum::http::HeaderMap,
 ) -> Response {
+    // Opened as a tab, the page would run on the dashboard origin and could
+    // read the token from localStorage; only the sandboxed frame is opaque.
+    if headers.get("sec-fetch-dest").and_then(|v| v.to_str().ok()) != Some("iframe") {
+        return api_error(
+            StatusCode::FORBIDDEN,
+            "frame_only",
+            "Plugin pages load only inside the dashboard frame",
+        );
+    }
     // Page script can read its own URL, so a `?token=` must never reach it.
     if uri.query().is_some() {
         return api_error(
@@ -1068,7 +1078,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn plugin_page_refuses_a_query_so_no_token_reaches_page_script() {
+    async fn plugin_page_is_served_only_to_a_query_free_frame_load() {
         use tower::ServiceExt;
         let state = crate::server::test_support::build_test_app_state_with_policy(
             Vec::new(),
@@ -1078,18 +1088,30 @@ mod tests {
         );
         let app = crate::server::test_support::build_router_for_test(state);
         let cookie = Some("aoe_token=secret-token");
+        let frame = Some("iframe");
+        // NOT_FOUND means every guard passed and only the plugin is unknown.
         let cases = [
-            ("?token=secret-token", None, StatusCode::BAD_REQUEST),
-            ("?token=secret-token", cookie, StatusCode::BAD_REQUEST),
-            ("", cookie, StatusCode::NOT_FOUND),
-            ("?token=wrong", None, StatusCode::UNAUTHORIZED),
+            ("?token=secret-token", None, frame, StatusCode::BAD_REQUEST),
+            (
+                "?token=secret-token",
+                cookie,
+                frame,
+                StatusCode::BAD_REQUEST,
+            ),
+            ("", cookie, frame, StatusCode::NOT_FOUND),
+            ("", cookie, Some("document"), StatusCode::FORBIDDEN),
+            ("", cookie, None, StatusCode::FORBIDDEN),
+            ("?token=wrong", None, frame, StatusCode::UNAUTHORIZED),
         ];
-        for (query, cookie, want) in cases {
+        for (query, cookie, dest, want) in cases {
             let mut req =
                 axum::http::Request::get(format!("/api/plugins/acme.absent/pages/board{query}"))
                     .header("host", "127.0.0.1");
             if let Some(c) = cookie {
                 req = req.header("cookie", c);
+            }
+            if let Some(d) = dest {
+                req = req.header("sec-fetch-dest", d);
             }
             let mut req = req.body(axum::body::Body::empty()).unwrap();
             req.extensions_mut()
@@ -1098,7 +1120,11 @@ mod tests {
                     5555,
                 ))));
             let resp = app.clone().oneshot(req).await.unwrap();
-            assert_eq!(resp.status(), want, "{query} cookie={cookie:?}");
+            assert_eq!(
+                resp.status(),
+                want,
+                "{query} cookie={cookie:?} dest={dest:?}"
+            );
         }
     }
 
