@@ -45,7 +45,8 @@ retries. Saved identity tracks unfinished groups; each TERM or KILL also require
 matching live socket peer and its recorded kernel boot/start identity. Legacy identities
 remain unknown instead of being minted from a potentially reused PID. Resource cleanup
 requires complete proof that no group member can write. Zombies alone do not block it;
-live descendants and unreadable process membership do.
+a zombie leader with remaining threads is still potentially writing. Live descendants
+and unreadable process membership retain resources.
 
 The orphan reaper records `.orphan-stop` evidence before signaling. Runner self-cleanup
 cannot erase that retry path. The marker neither authorizes signals nor prevents a new
@@ -58,11 +59,14 @@ invocation-local socket identity again before unlinking sockets and then the rec
 Unknown or replaced artifacts retain resources. Recovery repeats the runner gate after
 destroy hooks; a completed hook checkpoint does not make the pre-hook check current.
 
-Profile rename records directory identity before retargeting deletion snapshots and ACP
-profile references. Recovery rolls back before the directory commit or completes after
+Profile rename validates source and destination under the exclusive transition, then
+records directory identity before retargeting deletion snapshots and ACP profile references.
+Recovery rolls back before the directory commit or completes after
 it, preserving resource paths and conditionally updating the still-current default.
 Pending names refuse ordinary mutations and runner publication; publication retains its
 transition guard through agent spawn. The session-move journal format and path are unchanged.
+Path and effective-config reads select default names without creating profile directories,
+including empty selections. The explicit default-profile bootstrap boundary is unchanged.
 
 `Kept` checkpoints record intentionally retained resources. Recovery removes one only
 after every recognized scratch/workspace path is proven absent and no sibling intent
