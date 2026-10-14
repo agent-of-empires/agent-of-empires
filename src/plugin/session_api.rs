@@ -651,14 +651,12 @@ async fn sessions_turn_send(
             .send_turn(
                 &caller,
                 &req.session_id,
-                SendTurnRequest {
-                    text: &req.text,
-                    attachments: &[],
-                    woke_idle_dormant,
-                    prompt_id: None,
-                    synthesized: false,
-                    no_revive: false,
-                },
+                SendTurnRequest { resume_authority: crate::process::worker_registry::ResumeAuthority::Explicit, text: &req.text,
+                attachments: &[],
+                woke_idle_dormant,
+                prompt_id: None,
+                synthesized: false,
+                no_revive: false, },
             )
             .await;
         if sent.is_err() && marked_pending {
@@ -855,6 +853,7 @@ async fn deliver_structured(
             &caller,
             id,
             SendTurnRequest {
+                resume_authority: crate::process::worker_registry::ResumeAuthority::Explicit,
                 text: &req.message,
                 attachments: &[],
                 woke_idle_dormant,

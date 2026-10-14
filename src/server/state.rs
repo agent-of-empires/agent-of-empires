@@ -162,6 +162,8 @@ pub struct AppState {
     /// Live control-state projection per session, folded at the publish choke point and
     /// shared with `ChannelSink`.
     pub acp_control_cache: Arc<crate::acp::control_cache::ControlStateCache>,
+    /// One orphan teardown per exact runner identity until its cleanup completes.
+    pub(crate) acp_orphan_cleanups: std::sync::Mutex<std::collections::HashSet<(String, u32, u64)>>,
     /// Owns the per-session ACP agent subprocesses.
     pub acp_supervisor:
         Arc<crate::acp::supervisor::Supervisor<crate::acp::supervisor::ChannelSink>>,

@@ -21,6 +21,20 @@ function layout(rowsPerLine: number[], keys: readonly string[] = LINES.slice(0, 
 
 const ones = (n: number) => Array.from({ length: n }, () => 1);
 
+/** The pane rows of logical `lines` wrapped at `width`, as tmux lays them out after a resize. */
+function wrapAt(lines: readonly string[], width: number) {
+  return lines.flatMap((line) => line.match(new RegExp(`.{1,${width}}`, "g")) ?? [""]);
+}
+
+/** A single-row-per-line layout of `lines` wrapped at `width`. */
+const rewrapped = (lines: readonly string[], width: number) => {
+  const keys = wrapAt(lines, width);
+  return layout(ones(keys.length), keys);
+};
+
+// Long lines change row count when re-wrapped; the short ones do not.
+const PROSE = ["aa", "bbbbbbbbbb", "cc", "dddddddddd", "ee", "ffffffffff", "gg", "hh"];
+
 describe("scroll anchor across a relayout", () => {
   it.each([
     {
@@ -126,6 +140,67 @@ describe("scroll anchor across a relayout", () => {
       before: { top: 37, spacer: 2, layout: layout([1, 2, 1]) },
       after: { spacer: 2, layout: layout([1, 2, 1]) },
       expected: 37,
+    },
+  ])("$name", ({ before, after, expected }) => {
+    const anchor = scrollAnchor(before.top, VIEW_H, before.spacer, before.layout, LINE_H);
+    expect(anchor).not.toBeNull();
+    expect(anchoredScrollTop(anchor!, after.spacer, after.layout, LINE_H)).toBeCloseTo(expected);
+  });
+
+  // A width change re-wraps tmux's rows, so the anchor's rows no longer match one for one.
+  it.each([
+    {
+      name: "a line keeps its place when the pane is re-wrapped wider",
+      before: { top: 45, spacer: 0, layout: rewrapped(PROSE, 4) },
+      after: { spacer: 0, layout: rewrapped(PROSE, 5) },
+      expected: 3.5 * LINE_H,
+    },
+    {
+      name: "a line keeps its place when the pane is re-wrapped narrower",
+      before: { top: 35, spacer: 0, layout: rewrapped(PROSE, 5) },
+      after: { spacer: 0, layout: rewrapped(PROSE, 4) },
+      expected: 4.5 * LINE_H,
+    },
+    {
+      name: "a continuation row lands on the row now holding its first character",
+      before: { top: 60, spacer: 0, layout: rewrapped(PROSE, 4) },
+      after: { spacer: 0, layout: rewrapped(PROSE, 5) },
+      expected: 4 * LINE_H,
+    },
+    {
+      name: "a line keeps its place across a re-wrap and a switch from the VT grid to tmux",
+      before: { top: 85, spacer: 4, layout: rewrapped(PROSE, 4) },
+      after: { spacer: 0, layout: rewrapped(["p0", "p1", "p2", "p3", "p4", "p5", ...PROSE], 5) },
+      expected: 9.5 * LINE_H,
+    },
+    {
+      name: "a re-wrap of repeated text picks the copy nearest the reader",
+      before: {
+        top: 180,
+        spacer: 0,
+        layout: rewrapped([...PROSE.slice(0, 6), "mid1", "mid2", ...PROSE.slice(0, 6)], 4),
+      },
+      after: { spacer: 0, layout: rewrapped([...PROSE.slice(0, 6), "mid1", "mid2", ...PROSE.slice(0, 6)], 5) },
+      expected: 14 * LINE_H,
+    },
+    {
+      name: "a blank line at the top keeps its place when the pane is re-wrapped",
+      before: {
+        top: 15,
+        spacer: 0,
+        layout: rewrapped(["aa", "", "bbbbbbbbbb", "cc", "dddddddddd", "ee", "ffffffffff", "gg"], 4),
+      },
+      after: {
+        spacer: 0,
+        layout: rewrapped(["aa", "", "bbbbbbbbbb", "cc", "dddddddddd", "ee", "ffffffffff", "gg"], 5),
+      },
+      expected: 1.5 * LINE_H,
+    },
+    {
+      name: "too little text to identify a re-wrapped line keeps the line number",
+      before: { top: 10, spacer: 0, layout: layout(ones(3), ["ab", "cd", "ef"]) },
+      after: { spacer: 0, layout: layout(ones(2), ["abc", "def"]) },
+      expected: 10,
     },
   ])("$name", ({ before, after, expected }) => {
     const anchor = scrollAnchor(before.top, VIEW_H, before.spacer, before.layout, LINE_H);

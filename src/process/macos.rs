@@ -1,6 +1,7 @@
 //! macOS-specific process utilities.
 
 pub(crate) const HAS_CODEX_MANAGED_PREFERENCES: bool = true;
+use anyhow::Context as _;
 use std::collections::HashMap;
 use std::process::Command;
 
@@ -153,6 +154,455 @@ pub(super) fn processes_matching(
         }
     }
     found
+}
+
+pub(super) fn runner_group_executing(group: u32) -> anyhow::Result<bool> {
+    let mut command = Command::new("ps");
+    command
+        .args(["-A", "-o", "pid=,pgid=,stat="])
+        .env("LC_ALL", "C");
+    let output = crate::session::capture::run_with_timeout_limit(
+        command,
+        std::time::Duration::from_secs(2),
+        "runner group census",
+        1024 * 1024,
+    )?;
+    for line in std::str::from_utf8(&output)?.lines() {
+        let mut fields = line.split_ascii_whitespace();
+        fields
+            .next()
+            .context("missing process PID")?
+            .parse::<u32>()?;
+        let process_group = fields
+            .next()
+            .context("missing process group")?
+            .parse::<u32>()?;
+        let state = fields.next().context("missing process state")?;
+        if process_group == group && !state.starts_with('Z') {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct AuditToken {
+    values: [u32; 8],
+}
+
+unsafe extern "C" {
+    static mach_task_self_: libc::mach_port_t;
+    fn task_name_for_pid(
+        task: libc::mach_port_t,
+        pid: libc::pid_t,
+        name: *mut libc::mach_port_t,
+    ) -> libc::kern_return_t;
+    fn mach_port_deallocate(
+        task: libc::mach_port_t,
+        name: libc::mach_port_t,
+    ) -> libc::kern_return_t;
+}
+
+fn audit_token(pid: u32) -> anyhow::Result<Option<AuditToken>> {
+    let raw_pid = i32::try_from(pid)?;
+    anyhow::ensure!(raw_pid > 0, "invalid owned process PID");
+    let mut port = 0;
+    let task = unsafe { mach_task_self_ };
+    let result = unsafe { task_name_for_pid(task, raw_pid, &mut port) };
+    if result != 0 {
+        if !super::worker::is_pid_alive(pid) {
+            return Ok(None);
+        }
+        if process_membership(pid)?.is_none_or(|info| info.pbi_status == libc::SZOMB) {
+            return Ok(None);
+        }
+        anyhow::bail!("process audit token unavailable: Mach error {result}");
+    }
+    struct Port(libc::mach_port_t, libc::mach_port_t);
+    impl Drop for Port {
+        fn drop(&mut self) {
+            unsafe {
+                mach_port_deallocate(self.0, self.1);
+            }
+        }
+    }
+    let _port = Port(task, port);
+    let mut token = AuditToken { values: [0; 8] };
+    let mut count = 8;
+    let result = unsafe { libc::task_info(port, 15, token.values.as_mut_ptr().cast(), &mut count) };
+    if result != 0 || count != 8 || token.values[5] != pid {
+        if !super::worker::is_pid_alive(pid)
+            || process_membership(pid)?.is_none_or(|info| info.pbi_status == libc::SZOMB)
+        {
+            return Ok(None);
+        }
+        anyhow::bail!(
+            "invalid process audit token: Mach error {result}, count {count}, PID {}",
+            token.values[5]
+        );
+    }
+    Ok(Some(token))
+}
+
+fn audit_start_id(token: &AuditToken) -> String {
+    use std::fmt::Write as _;
+    let mut value = String::with_capacity(70);
+    value.push_str("audit:");
+    for word in token.values {
+        write!(value, "{word:08x}").unwrap();
+    }
+    value
+}
+
+pub(super) fn process_start_id(pid: u32) -> anyhow::Result<Option<String>> {
+    Ok(audit_token(pid)?.as_ref().map(audit_start_id))
+}
+
+pub(super) struct ProcessHandle(AuditToken);
+
+impl ProcessHandle {
+    pub(super) fn capture(identity: &super::PrimeProcessIdentity) -> anyhow::Result<Option<Self>> {
+        anyhow::ensure!(
+            identity.start_id.starts_with("audit:"),
+            "process lacks incarnation-bound signal authority"
+        );
+        let Some(token) = audit_token(identity.pid)? else {
+            return Ok(None);
+        };
+        if audit_start_id(&token) != identity.start_id {
+            return Ok(None);
+        }
+        Ok(Some(Self(token)))
+    }
+
+    pub(super) fn exited(&self) -> anyhow::Result<bool> {
+        Ok(audit_token(self.0.values[5])?
+            .is_none_or(|current| current.values[7] != self.0.values[7]))
+    }
+
+    pub(super) fn signal(&self, signal: i32) -> anyhow::Result<()> {
+        type Signal = unsafe extern "C" fn(*mut AuditToken, i32) -> i32;
+        static FUNCTION: std::sync::OnceLock<Option<Signal>> = std::sync::OnceLock::new();
+        let function = FUNCTION
+            .get_or_init(|| unsafe {
+                let library = libc::dlopen(
+                    c"/usr/lib/libproc.dylib".as_ptr(),
+                    libc::RTLD_LAZY | libc::RTLD_LOCAL,
+                );
+                if library.is_null() {
+                    return None;
+                }
+                let function = libc::dlsym(library, c"proc_signal_with_audittoken".as_ptr());
+                if function.is_null() {
+                    libc::dlclose(library);
+                    return None;
+                }
+                // The cached function keeps its library loaded for the process lifetime.
+                Some(std::mem::transmute::<*mut libc::c_void, Signal>(function))
+            })
+            .context("incarnation-bound signalling unavailable on this macOS version")?;
+        let mut token = self.0;
+        let result = unsafe { function(&mut token, signal) };
+        if result != 0 && result != libc::ESRCH {
+            return Err(std::io::Error::from_raw_os_error(result))
+                .context("signalling owned audit token");
+        }
+        Ok(())
+    }
+}
+
+pub(super) fn runner_group_identities(
+    group: u32,
+) -> anyhow::Result<Vec<super::PrimeProcessIdentity>> {
+    let mut command = Command::new("ps");
+    command.args(["-A", "-o", "pid=,pgid=,stat="]);
+    let output = crate::session::capture::run_with_timeout_limit(
+        command,
+        std::time::Duration::from_secs(2),
+        "runner group identities",
+        1024 * 1024,
+    )?;
+    let mut identities = Vec::new();
+    for line in std::str::from_utf8(&output)?.lines() {
+        let mut fields = line.split_whitespace();
+        let pid = fields.next().context("missing process PID")?.parse()?;
+        let pgrp = fields
+            .next()
+            .context("missing process group")?
+            .parse::<u32>()?;
+        let zombie = fields
+            .next()
+            .context("missing process state")?
+            .starts_with('Z');
+        if pgrp == group && !zombie {
+            if let Some(start_id) = process_start_id(pid)? {
+                if process_group_id(pid)? == Some(group)
+                    && process_start_id(pid)?.as_ref() == Some(&start_id)
+                {
+                    identities.push(super::PrimeProcessIdentity { pid, start_id });
+                }
+            }
+        }
+    }
+    Ok(identities)
+}
+pub(super) fn process_group_id(pid: u32) -> anyhow::Result<Option<u32>> {
+    let group = unsafe { libc::getpgid(i32::try_from(pid)?) };
+    if group >= 0 {
+        return Ok(Some(group as u32));
+    }
+    let error = std::io::Error::last_os_error();
+    if error.raw_os_error() == Some(libc::ESRCH) {
+        Ok(None)
+    } else {
+        Err(error.into())
+    }
+}
+
+fn process_membership(pid: u32) -> anyhow::Result<Option<libc::proc_bsdinfo>> {
+    let mut info = std::mem::MaybeUninit::<libc::proc_bsdinfo>::uninit();
+    let size = std::mem::size_of::<libc::proc_bsdinfo>() as i32;
+    let read = unsafe {
+        libc::proc_pidinfo(
+            i32::try_from(pid)?,
+            libc::PROC_PIDTBSDINFO,
+            0,
+            info.as_mut_ptr().cast(),
+            size,
+        )
+    };
+    if read != size {
+        let error = std::io::Error::last_os_error();
+        if error.raw_os_error() == Some(libc::ESRCH) {
+            return Ok(None);
+        }
+        anyhow::bail!("process membership unavailable: {error}");
+    }
+    let info = unsafe { info.assume_init() };
+    anyhow::ensure!(info.pbi_pid == pid, "unexpected process membership PID");
+    Ok(Some(info))
+}
+
+pub(super) fn foreign_runner_group_absent(pid: u32) -> anyhow::Result<bool> {
+    let mut info = std::mem::MaybeUninit::<libc::proc_bsdshortinfo>::uninit();
+    let size = std::mem::size_of::<libc::proc_bsdshortinfo>() as i32;
+    let read = unsafe {
+        libc::proc_pidinfo(
+            i32::try_from(pid)?,
+            libc::PROC_PIDT_SHORTBSDINFO,
+            0,
+            info.as_mut_ptr().cast(),
+            size,
+        )
+    };
+    if read != size {
+        return Err(std::io::Error::last_os_error())
+            .context("runner short process metadata unavailable");
+    }
+    let info = unsafe { info.assume_init() };
+    anyhow::ensure!(info.pbsi_pid == pid, "unexpected runner metadata PID");
+    let uid = unsafe { libc::geteuid() };
+    let ruid = unsafe { libc::getuid() };
+    Ok((info.pbsi_uid != uid || info.pbsi_ruid != ruid) && !runner_group_executing(pid)?)
+}
+pub(super) fn prime_processes(
+    marker: &str,
+    socket: &std::path::Path,
+    known: &[super::PrimeProcessIdentity],
+) -> anyhow::Result<Vec<super::PrimeProcessIdentity>> {
+    let mut command = Command::new("ps");
+    command
+        .args(["-A", "-o", "pid=,ppid=,stat=,lstart="])
+        .env("LC_ALL", "C")
+        .env("LC_TIME", "C")
+        .env("LANG", "C")
+        .env("TZ", "UTC");
+    let output = crate::session::capture::run_with_timeout_limit(
+        command,
+        std::time::Duration::from_secs(2),
+        "Prime process census",
+        1024 * 1024,
+    )?;
+    let mut samples = Vec::new();
+    let mut bytes = Vec::new();
+    let mut legacy_observed = Vec::new();
+    let mut known_zombies = Vec::new();
+    for line in std::str::from_utf8(&output)?.lines() {
+        let mut rest = line;
+        let mut take = || -> anyhow::Result<&str> {
+            let (value, tail) = rest
+                .trim_start()
+                .split_once(char::is_whitespace)
+                .context("incomplete process census row")?;
+            rest = tail;
+            Ok(value)
+        };
+        let pid = take()?.parse::<u32>()?;
+        let parent = take()?.parse::<u32>()?;
+        let zombie = take()?.starts_with('Z');
+        if zombie && known.iter().any(|identity| identity.pid == pid) {
+            known_zombies.push(pid);
+        }
+        if zombie || pid == std::process::id() {
+            continue;
+        }
+        let start = rest.trim();
+        anyhow::ensure!(!start.is_empty(), "missing process start identity");
+        let marked = match prime_launch_marker(pid, marker, socket, &mut bytes) {
+            Ok(marked) => marked,
+            Err(error) if known.iter().any(|identity| identity.pid == pid) => return Err(error),
+            Err(_) => false,
+        };
+        samples.push(super::PrimeProcessSample {
+            identity: super::PrimeProcessIdentity {
+                pid,
+                start_id: format!("ps:{start}"),
+            },
+            parent,
+            marked,
+        });
+    }
+    let candidate_known: Vec<_> = samples
+        .iter()
+        .filter(|sample| {
+            known
+                .iter()
+                .any(|identity| identity.pid == sample.identity.pid)
+        })
+        .map(|sample| sample.identity.clone())
+        .collect();
+    let candidates = super::prime_selection_mask(&samples, &candidate_known);
+    let mut attested = Vec::new();
+    for (mut sample, candidate) in samples.into_iter().zip(candidates) {
+        if !candidate {
+            continue;
+        }
+        let pid = sample.identity.pid;
+        let Some(token) = audit_token(pid)? else {
+            continue;
+        };
+        let Some(membership) = process_membership(pid)? else {
+            continue;
+        };
+        let Some(after) = audit_token(pid)? else {
+            continue;
+        };
+        anyhow::ensure!(
+            after == token,
+            "owned process incarnation changed during census"
+        );
+        if !sample.marked && known.iter().any(|known| known == &sample.identity) {
+            legacy_observed.push(super::PrimeProcessIdentity {
+                pid,
+                start_id: audit_start_id(&token),
+            });
+        }
+        sample.identity.start_id = audit_start_id(&token);
+        sample.parent = membership.pbi_ppid;
+        attested.push(sample);
+    }
+    let samples = attested;
+    for identity in known {
+        if !samples
+            .iter()
+            .any(|sample| sample.identity.pid == identity.pid)
+        {
+            anyhow::ensure!(
+                known_zombies.contains(&identity.pid) || !super::worker::is_pid_alive(identity.pid),
+                "owned Prime process {} omitted from census",
+                identity.pid
+            );
+        }
+    }
+    let owned = super::select_stable_prime_processes(samples, known)?;
+    for identity in legacy_observed {
+        anyhow::ensure!(
+            owned.contains(&identity)
+                || process_start_id(identity.pid)?.as_deref() != Some(&identity.start_id),
+            "legacy worker birth is unproven; retain ownership until external settlement"
+        );
+    }
+    Ok(owned)
+}
+
+fn prime_launch_marker(
+    pid: u32,
+    marker: &str,
+    socket: &std::path::Path,
+    bytes: &mut Vec<u8>,
+) -> anyhow::Result<bool> {
+    let pid = i32::try_from(pid)?;
+    let mut mib = [libc::CTL_KERN, libc::KERN_PROCARGS2, pid];
+    let mut length = 0usize;
+    let queried = unsafe {
+        libc::sysctl(
+            mib.as_mut_ptr(),
+            3,
+            std::ptr::null_mut(),
+            &mut length,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if queried != 0 {
+        return Err(std::io::Error::last_os_error()).context("reading process argument size");
+    }
+    anyhow::ensure!(
+        (4..=256 * 1024).contains(&length),
+        "invalid process argument size"
+    );
+    bytes.clear();
+    bytes.reserve(length);
+    let capacity = bytes.capacity();
+    let read = unsafe {
+        libc::sysctl(
+            mib.as_mut_ptr(),
+            3,
+            bytes.as_mut_ptr().cast(),
+            &mut length,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if read != 0 {
+        return Err(std::io::Error::last_os_error()).context("reading process arguments");
+    }
+    anyhow::ensure!(
+        (4..=capacity).contains(&length),
+        "invalid process argument result"
+    );
+    // sysctl initialized exactly length bytes on success.
+    unsafe {
+        bytes.set_len(length);
+    }
+    let count = i32::from_ne_bytes(bytes[..4].try_into()?);
+    anyhow::ensure!(
+        (0..=4096).contains(&count),
+        "invalid process argument count"
+    );
+    let mut tail = &bytes[4..];
+    let executable_end = tail
+        .iter()
+        .position(|byte| *byte == 0)
+        .context("unterminated process executable")?;
+    tail = &tail[executable_end + 1..];
+    while tail.first() == Some(&0) {
+        tail = &tail[1..];
+    }
+    let mut routed = false;
+    for _ in 0..count {
+        let end = tail
+            .iter()
+            .position(|byte| *byte == 0)
+            .context("unterminated process argument")?;
+        routed |= &tail[..end] == socket.as_os_str().as_encoded_bytes();
+        tail = &tail[end + 1..];
+    }
+    Ok(routed
+        || tail
+            .split(|byte| *byte == 0)
+            .any(|entry| entry == marker.as_bytes()))
 }
 
 pub(super) fn sample_memory() -> super::metrics::MemorySample {
@@ -392,6 +842,75 @@ pub(super) fn boot_id() -> Option<String> {
     }
 }
 
+pub(super) fn foreground_arguments(shell_pid: u32) -> Vec<super::ProcessArguments> {
+    let Some(foreground) = get_foreground_pid(shell_pid) else {
+        return Vec::new();
+    };
+    let group = unsafe { libc::getpgid(foreground as i32) };
+    if group < 0 {
+        return Vec::new();
+    }
+    collect_pid_tree(foreground)
+        .into_iter()
+        .filter_map(|pid| {
+            if unsafe { libc::getpgid(pid as i32) } != group {
+                return None;
+            }
+            let mut mib = [libc::CTL_KERN, libc::KERN_PROCARGS2, pid as i32];
+            let mut length = 0usize;
+            if unsafe {
+                libc::sysctl(
+                    mib.as_mut_ptr(),
+                    3,
+                    std::ptr::null_mut(),
+                    &mut length,
+                    std::ptr::null_mut(),
+                    0,
+                )
+            } != 0
+                || length > 256 * 1024
+            {
+                return None;
+            }
+            let mut bytes = vec![0u8; length];
+            if unsafe {
+                libc::sysctl(
+                    mib.as_mut_ptr(),
+                    3,
+                    bytes.as_mut_ptr().cast(),
+                    &mut length,
+                    std::ptr::null_mut(),
+                    0,
+                )
+            } != 0
+            {
+                return None;
+            }
+            bytes.truncate(length);
+            let count = i32::from_ne_bytes(bytes.get(..4)?.try_into().ok()?);
+            if !(1..=4096).contains(&count) {
+                return None;
+            }
+            let tail = bytes.get(4..)?;
+            let executable_end = tail.iter().position(|byte| *byte == 0)?;
+            let padding = tail.get(executable_end + 1..)?;
+            let start = padding.iter().position(|byte| *byte != 0)?;
+            let mut arguments = padding[start..].split(|byte| *byte == 0);
+            let argv: Vec<String> = arguments
+                .by_ref()
+                .take(count as usize)
+                .map(|word| std::str::from_utf8(word).map(str::to_owned))
+                .collect::<Result<_, _>>()
+                .ok()?;
+
+            Some(super::ProcessArguments {
+                argv,
+                stdin_is_tty: None,
+            })
+        })
+        .collect()
+}
+
 pub(super) fn parent_and_argv0(pid: u32) -> Option<(u32, String)> {
     let output = Command::new("ps")
         .args(["-o", "ppid=,args=", "-p", &pid.to_string()])
@@ -500,5 +1019,169 @@ impl super::SleepInhibit for CaffeinateInhibitor {
             &mut self.child,
             "caffeinate exited unexpectedly; OS sleep will not be inhibited on this host",
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn foreign_runner_probe_requires_an_empty_original_group_and_keeps_native_tokens_strict() {
+        use std::io::BufRead as _;
+        use std::os::unix::process::CommandExt as _;
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+        let available = Command::new("sudo")
+            .args(["-n", "-u", "nobody", "true"])
+            .status();
+        if !available.is_ok_and(|status| status.success()) {
+            eprintln!("skipping foreign-runner probe: passwordless sudo unavailable");
+            return;
+        }
+        struct Foreign(std::process::Child);
+        impl Drop for Foreign {
+            fn drop(&mut self) {
+                self.0.stdin.take();
+                let _ = self.0.wait();
+            }
+        }
+        for own_group in [false, true] {
+            let script = format!(
+                "import os,sys\npid=os.fork()\nif pid == 0:\n    {}\n    print(os.getpid(),flush=True)\n    sys.stdin.read()\n    os._exit(0)\nelse:\n    _,status=os.waitpid(pid,0)\n    sys.exit(os.waitstatus_to_exitcode(status))",
+                if own_group { "os.setsid()" } else { "pass" }
+            );
+            let mut child = Foreign(
+                Command::new("sudo")
+                    .args(["-n", "-u", "nobody", "python3", "-c", &script])
+                    .current_dir("/tmp")
+                    .process_group(0)
+                    .stdin(std::process::Stdio::piped())
+                    .stdout(std::process::Stdio::piped())
+                    .spawn()
+                    .unwrap(),
+            );
+            let mut line = String::new();
+            std::io::BufReader::new(child.0.stdout.take().unwrap())
+                .read_line(&mut line)
+                .unwrap();
+            let pid = line.trim().parse::<u32>().unwrap();
+            assert!(
+                process_start_id(pid).is_err(),
+                "generic native ownership must remain unproven"
+            );
+            assert_eq!(foreign_runner_group_absent(pid).unwrap(), !own_group);
+            if own_group {
+                assert!(super::super::runner_birth_identity(pid).is_err());
+            } else {
+                assert!(super::super::runner_birth_identity(pid).unwrap().is_none());
+                let guard = super::super::RunnerProcessGuard::capture(pid, None).unwrap();
+                let mut words = [0; 8];
+                words[5] = pid;
+                guard.members.lock().push((
+                    super::super::PrimeProcessIdentity {
+                        pid,
+                        start_id: audit_start_id(&AuditToken { values: words }),
+                    },
+                    ProcessHandle(AuditToken { values: words }),
+                ));
+                let auxiliary = Command::new("cat")
+                    .process_group(0)
+                    .stdin(std::process::Stdio::piped())
+                    .spawn()
+                    .unwrap();
+                struct Auxiliary(std::process::Child);
+                impl Drop for Auxiliary {
+                    fn drop(&mut self) {
+                        let _ = self.0.kill();
+                        let _ = self.0.wait();
+                    }
+                }
+                let auxiliary_identity = super::super::PrimeProcessIdentity {
+                    pid: auxiliary.id(),
+                    start_id: process_start_id(auxiliary.id()).unwrap().unwrap(),
+                };
+                let auxiliary_handle = ProcessHandle::capture(&auxiliary_identity)
+                    .unwrap()
+                    .unwrap();
+                let mut auxiliary = Auxiliary(auxiliary);
+                guard
+                    .members
+                    .lock()
+                    .push((auxiliary_identity, auxiliary_handle));
+                assert!(
+                    guard.executing().unwrap(),
+                    "a known detached member must remain owned"
+                );
+                guard.signal(libc::SIGTERM).unwrap();
+                assert!(!auxiliary.0.wait().unwrap().success());
+                assert!(!guard.executing().unwrap());
+            }
+            assert!(
+                child.0.try_wait().unwrap().is_none(),
+                "the foreign execution was signalled"
+            );
+            drop(child.0.stdin.take());
+            assert!(child.0.wait().unwrap().success());
+        }
+    }
+
+    #[test]
+    fn prime_quiescence_accepts_observed_owned_zombies() {
+        use std::io::{BufRead as _, Write as _};
+        struct OwnedChild(std::process::Child);
+        impl Drop for OwnedChild {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        let root = tempfile::tempdir().unwrap();
+        let marker = format!("TMPDIR={}", root.path().display());
+        let socket = root.path().join("daemon.sock");
+        let mut child = OwnedChild(
+            Command::new("sh")
+                .args(["-c", "printf 'ready\n'; IFS= read -r line"])
+                .env("TMPDIR", root.path())
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .spawn()
+                .unwrap(),
+        );
+        let mut ready = String::new();
+        std::io::BufReader::new(child.0.stdout.take().unwrap())
+            .read_line(&mut ready)
+            .unwrap();
+        assert_eq!(ready, "ready\n");
+        let owned = prime_processes(&marker, &socket, &[])
+            .unwrap()
+            .into_iter()
+            .find(|identity| identity.pid == child.0.id())
+            .unwrap();
+        child.0.stdin.as_mut().unwrap().write_all(b"\n").unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        loop {
+            let mut probe = Command::new("ps");
+            probe.args(["-p", &child.0.id().to_string(), "-o", "stat="]);
+            let state = crate::session::capture::run_with_timeout_limit(
+                probe,
+                std::time::Duration::from_secs(1),
+                "owned zombie observation",
+                1024,
+            )
+            .unwrap();
+            if std::str::from_utf8(&state).unwrap().trim().starts_with('Z') {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "owned child did not become a zombie"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let remaining = prime_processes(&marker, &socket, std::slice::from_ref(&owned)).unwrap();
+        assert!(!remaining.contains(&owned));
+        assert!(child.0.wait().unwrap().success());
     }
 }

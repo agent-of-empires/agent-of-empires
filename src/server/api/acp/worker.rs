@@ -156,7 +156,7 @@ pub async fn spawn_acp(
 
     // An explicit resume overrides a stop kept from a resume that failed
     // before it installed; only the reconciler's fallback must honor it.
-    state.acp_supervisor.forget_stale_cancel(&id);
+
     let request = SpawnRequest {
         additional_dirs: req.additional_dirs,
         provider_env: req
@@ -170,7 +170,14 @@ pub async fn spawn_acp(
     if let Some(resp) = refuse_if_stored_row_shelved(&state, &instance).await {
         return resp;
     }
-    match state.acp_supervisor.spawn(request).await {
+    match state
+        .acp_supervisor
+        .spawn(
+            request,
+            crate::process::worker_registry::ResumeAuthority::Explicit,
+        )
+        .await
+    {
         Ok(()) => {}
         Err(SupervisorError::AlreadyRunning(_)) if rate_limit_resume_resets_at.is_some() => {}
         Err(e) => return supervisor_error_response("spawn failed", &e),
@@ -425,7 +432,7 @@ pub async fn switch_acp_agent(
     };
 
     let model = req.model.clone();
-    state.acp_supervisor.forget_stale_cancel(&id);
+
     // A new backend starts a fresh session. Effort vocabularies are
     // adapter-specific, so the old pick is dropped too.
     let request = SpawnRequest {
@@ -442,7 +449,14 @@ pub async fn switch_acp_agent(
     if let Some(resp) = refuse_if_stored_row_shelved(&state, &instance).await {
         return resp;
     }
-    if let Err(e) = state.acp_supervisor.spawn(request).await {
+    if let Err(e) = state
+        .acp_supervisor
+        .spawn(
+            request,
+            crate::process::worker_registry::ResumeAuthority::Explicit,
+        )
+        .await
+    {
         return supervisor_error_response("spawn failed", &e);
     }
     state
@@ -660,7 +674,6 @@ pub async fn switch_acp_provider(
         }
     };
 
-    state.acp_supervisor.forget_stale_cancel(&id);
     // Everything that names the conversation survives: the provider changes
     // where the tokens are served from, not which transcript is resumed.
     let Some(instance) = find_instance(&state, &id).await else {
@@ -670,7 +683,14 @@ pub async fn switch_acp_provider(
     if let Some(resp) = refuse_if_stored_row_shelved(&state, &instance).await {
         return resp;
     }
-    if let Err(e) = state.acp_supervisor.spawn(request).await {
+    if let Err(e) = state
+        .acp_supervisor
+        .spawn(
+            request,
+            crate::process::worker_registry::ResumeAuthority::Explicit,
+        )
+        .await
+    {
         return supervisor_error_response("spawn failed after provider switch", &e);
     }
 

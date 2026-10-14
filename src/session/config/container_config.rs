@@ -1658,10 +1658,6 @@ pub(crate) fn install_pi_sandbox_extension_at(root: &Path) -> Result<()> {
     install_session_extension_at(root, &rel)
 }
 
-/// Stage the root-only identity extension inside Prime's private sandbox store.
-pub(crate) fn install_prime_sandbox_extension_at(root: &Path) -> Result<()> {
-    install_session_extension_at(root, Path::new("extensions/aoe-session-id.js"))
-}
 /// Which branch [`compute_volume_paths_with_resolve`] resolved the mounts through.
 ///
 /// Reported rather than re-derived, so a caller acting on the difference between the

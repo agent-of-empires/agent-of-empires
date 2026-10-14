@@ -101,6 +101,7 @@ impl SessionSandbox {
 pub(super) struct SandboxArgv {
     pub(super) docker_binary: String,
     pub(super) docker_args: Vec<String>,
+    pub(super) exec_prefix_len: usize,
     pub(super) inherit_env: Vec<(String, String)>,
 }
 
@@ -176,7 +177,14 @@ pub(super) fn build_sandbox_docker_argv(
         }
     }
 
-    docker_args.push(sandbox.container_name.clone());
+    docker_args.push(
+        sandbox
+            .container_id
+            .as_ref()
+            .unwrap_or(&sandbox.container_name)
+            .clone(),
+    );
+    let exec_prefix_len = docker_args.len();
     docker_args.push(config.spec.command.clone());
     for a in &config.spec.args {
         docker_args.push(a.clone());
@@ -185,6 +193,7 @@ pub(super) fn build_sandbox_docker_argv(
     Ok(SandboxArgv {
         docker_binary,
         docker_args,
+        exec_prefix_len,
         inherit_env,
     })
 }

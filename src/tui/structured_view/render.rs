@@ -1973,6 +1973,43 @@ mod tests {
         assert!(state.dismissed_notices.is_empty());
     }
 
+    #[test]
+    fn notice_policy_hides_advisories_but_never_errors() {
+        use crate::session::config::{NoticeDisplay, NoticePolicy};
+
+        let notice = |id: &str, severity: &str| SessionNotice {
+            id: id.into(),
+            severity: severity.into(),
+            title: id.into(),
+            description: None,
+        };
+        let mut state = test_state();
+        state.transcript.session_notices = vec![
+            notice("info", "info"),
+            notice("warning", "warning"),
+            notice("error", "error"),
+        ];
+        let visible = |state: &StructuredViewState| -> Vec<String> {
+            state.visible_notices().map(|n| n.id.clone()).collect()
+        };
+
+        assert_eq!(visible(&state), ["info", "warning", "error"]);
+
+        for display in [NoticeDisplay::Hidden, NoticeDisplay::Timeout] {
+            state.notice_policy = NoticePolicy {
+                display,
+                timeout_secs: 0,
+            };
+            assert_eq!(visible(&state), ["error"], "{display:?}");
+        }
+
+        state.notice_policy = NoticePolicy {
+            display: NoticeDisplay::Timeout,
+            timeout_secs: 3600,
+        };
+        assert_eq!(visible(&state), ["info", "warning", "error"]);
+    }
+
     fn line_text(line: &Line) -> String {
         line.spans.iter().map(|s| s.content.as_ref()).collect()
     }

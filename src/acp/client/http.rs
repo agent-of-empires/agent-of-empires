@@ -578,6 +578,23 @@ impl HttpClient {
             .filter(|pct| (1..=99).contains(pct)))
     }
 
+    /// The daemon's notice display policy, for the same reason as
+    /// [`Self::compaction_reminder`].
+    pub async fn notice_policy(&self) -> Result<crate::session::config::NoticePolicy, HttpError> {
+        #[derive(serde::Deserialize)]
+        struct NoticeAbout {
+            acp_notice_display: crate::session::config::NoticeDisplay,
+            acp_notice_timeout_secs: u32,
+        }
+        let about: NoticeAbout = self
+            .get_json("/api/about", Scope::Session("<about>"))
+            .await?;
+        Ok(crate::session::config::NoticePolicy {
+            display: about.acp_notice_display,
+            timeout_secs: about.acp_notice_timeout_secs,
+        })
+    }
+
     /// Cheapest authenticated probe: separates a down host (transport error)
     /// from misconfigured auth (401).
     pub async fn health_check(&self) -> Result<(), HttpError> {

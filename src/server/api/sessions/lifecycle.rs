@@ -1208,6 +1208,7 @@ pub async fn start_session(
                 publish_status_change(&state.status_tx, inst, old_status);
             }
         }
+        state.acp_supervisor.request_respawn(&id);
         let instances = state.instances.read().await;
         let response = match instances.iter().find(|i| i.id == id) {
             Some(inst) => {

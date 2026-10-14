@@ -112,6 +112,7 @@ This document contains the help content for the `aoe` command-line program.
 * [`aoe acp doctor`↴](#aoe-acp-doctor)
 * [`aoe acp agents`↴](#aoe-acp-agents)
 * [`aoe acp stop`↴](#aoe-acp-stop)
+* [`aoe acp recover`↴](#aoe-acp-recover)
 * [`aoe acp kill`↴](#aoe-acp-kill)
 * [`aoe acp logs`↴](#aoe-acp-logs)
 * [`aoe acp restart`↴](#aoe-acp-restart)
@@ -205,6 +206,7 @@ Add a new session
 * `-l`, `--launch` — Launch the session immediately after creating
 * `-w`, `--worktree <WORKTREE_BRANCH>` — Create session in a git worktree for the specified branch
 * `-b`, `--new-branch` — Create a new branch (use with --worktree)
+* `--generated-name` — Use a generated civilization name as the session title and as the `{branch}` value of the worktree path template, instead of the branch name (use with --worktree). The git branch stays as given. Attaching to an existing worktree keeps its directory and only generates the title. Cannot be combined with --title, --repo or --project
 * `--base-branch <BASE_BRANCH>` — Branch to base the new worktree branch on (use with --new-branch). Defaults to the repository's default branch. Useful for stacking work on top of an in-flight PR branch, hot-fixing a release branch, or branching off a teammate's branch
 * `--repo-base <REPO_BASES>` — Base branch for one repo of a multi-repo workspace, as `<repo>=<branch>` (repeatable). `<repo>` is the repo's directory name or the path you passed to `--repo`. Outranks `--base-branch`, which stays the base for every repo this does not name. Example: `--base-branch develop --repo-base api=epic/checkout`
 * `-r`, `--repo <EXTRA_REPOS>` — Additional repositories for multi-repo workspace (use with --worktree)
@@ -1662,10 +1664,11 @@ Manage the ACP structured-view workers (doctor, ps, logs, prompt, approve, ...)
 
 * `doctor` — Verify the structured view can start: Node runtime, configured agents, provider auth (claude login)
 * `agents` — List configured agents (claude-code, aoe-agent, etc.)
-* `stop` — Gracefully stop an agent worker (SIGTERM the runner, agent receives stdin EOF). Sessions can be reattached on the next `aoe serve` only if they are still alive afterward; `stop` destroys the worker
-* `kill` — SIGKILL a worker immediately (use when `stop` doesn't take)
+* `stop` — Stop an agent worker and settle its owned native processes. Unlike `aoe serve --stop`, this ends the worker rather than detaching
+* `recover` — Retire unprovable worker ownership after external shutdown confirmation
+* `kill` — SIGKILL the runner, then settle its native workers
 * `logs` — Tail the runner's log file for an agent session
-* `restart` — Restart a wedged agent worker: stop the existing runner, then let the daemon's reconciler spawn a fresh one on the next tick
+* `restart` — Restart a wedged worker after its runner and native workers have stopped
 * `history` — Print the persisted transcript for an agent session
 * `status` — Print live status for an agent session: highest/lowest seq, and whether the on-disk retention window has truncated history
 * `prompt` — Send a prompt to an agent session's agent
@@ -1706,7 +1709,7 @@ List configured agents (claude-code, aoe-agent, etc.)
 
 ## `aoe acp stop`
 
-Gracefully stop an agent worker (SIGTERM the runner, agent receives stdin EOF). Sessions can be reattached on the next `aoe serve` only if they are still alive afterward; `stop` destroys the worker
+Stop an agent worker and settle its owned native processes. Unlike `aoe serve --stop`, this ends the worker rather than detaching
 
 **Usage:** `aoe acp stop [OPTIONS] [SESSION]`
 
@@ -1723,9 +1726,26 @@ Gracefully stop an agent worker (SIGTERM the runner, agent receives stdin EOF). 
 
 
 
+## `aoe acp recover`
+
+Retire unprovable worker ownership after external shutdown confirmation
+
+**Usage:** `aoe acp recover [OPTIONS] <SESSION>`
+
+###### **Arguments:**
+
+* `<SESSION>` — Session whose ownership evidence to retire
+
+###### **Options:**
+
+* `--confirm-prime-stopped` — Confirm native processes are stopped for an identifiable missing-route Prime record
+* `--confirm-worker-stopped` — Confirm the original runner and all host/container native processes are stopped. Accepts malformed, unattested legacy, or externally settled orphan records
+
+
+
 ## `aoe acp kill`
 
-SIGKILL a worker immediately (use when `stop` doesn't take)
+SIGKILL the runner, then settle its native workers
 
 **Usage:** `aoe acp kill <SESSION>`
 
@@ -1750,7 +1770,7 @@ Tail the runner's log file for an agent session
 
 ## `aoe acp restart`
 
-Restart a wedged agent worker: stop the existing runner, then let the daemon's reconciler spawn a fresh one on the next tick
+Restart a wedged worker after its runner and native workers have stopped
 
 **Usage:** `aoe acp restart <SESSION>`
 

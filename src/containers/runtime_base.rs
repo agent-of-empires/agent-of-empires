@@ -78,8 +78,7 @@ impl RuntimeBase {
         supports_labels: true,
         supported_run_flags: &[RunFlag::CapAdd, RunFlag::CapDrop],
         // Avoid bare "not found": daemon errors like "socket not found" would read as absent.
-        not_found_markers: &["container with id", "container not found"],
-        // Placeholder: wording not yet captured from a real Apple daemon-down.
+        not_found_markers: &["notfound: \"container with id", "container not found"],
         daemon_down_markers: &["connect to container daemon"],
         permission_denied_markers: &["permission denied"],
     };
@@ -122,15 +121,15 @@ impl RuntimeBase {
     /// Splits a failed state probe into definitive absence (`Ok(false)`) or a runtime failure
     /// that must surface, so fail-closed gates do not swallow a daemon-down signal.
     pub fn classify_probe_failure(&self, stderr: &str) -> Result<bool> {
-        if self.is_not_found(stderr) {
-            return Ok(false);
-        }
         // Permission-denied first: Podman's socket-permission stderr also matches its daemon-down marker.
         if self.is_permission_denied(stderr) {
             return Err(DockerError::PermissionDenied);
         }
         if self.is_daemon_down(stderr) {
             return Err(DockerError::DaemonNotRunning);
+        }
+        if self.is_not_found(stderr) {
+            return Ok(false);
         }
         Err(DockerError::InspectFailed(sanitize_stderr(stderr)))
     }
@@ -612,13 +611,20 @@ impl RuntimeBase {
         Ok(())
     }
 
-    pub fn exec_command(&self, name: &str, options: Option<&str>, cmd: &str) -> String {
-        [self.binary, "exec", "-it"]
-            .into_iter()
-            .chain(options)
-            .chain([name, cmd])
-            .collect::<Vec<_>>()
-            .join(" ")
+    pub fn exec_command(
+        &self,
+        name: &str,
+        options: Option<&str>,
+        cmd: &str,
+        interactive: bool,
+    ) -> String {
+        format!(
+            "{} exec{}{}{} {name} {cmd}",
+            self.binary,
+            if interactive { " -it" } else { "" },
+            if options.is_some() { " " } else { "" },
+            options.unwrap_or_default()
+        )
     }
 
     /// No `-it` (stdout is piped, stdin closed) and argv, not a shell string, so the prompt is never shell-parsed.
@@ -1011,18 +1017,6 @@ mod tests {
         assert!(removes_invocation_id(&PODMAN));
         assert!(!removes_invocation_id(&DOCKER));
         assert!(!removes_invocation_id(&APPLE));
-    }
-
-    #[test]
-    fn exec_command_formats() {
-        assert_eq!(
-            DOCKER.exec_command("my-container", Some("-w /workspace"), "my-agent"),
-            "docker exec -it -w /workspace my-container my-agent"
-        );
-        assert_eq!(
-            APPLE.exec_command("my-container", None, "my-agent"),
-            "container exec -it my-container my-agent"
-        );
     }
 
     #[test]

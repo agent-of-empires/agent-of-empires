@@ -632,9 +632,9 @@ impl Instance {
                 let Some(plan) = prime_plan else {
                     return PollerStart::NotApplicable;
                 };
-                let preferred_sidecar = self.prime_root_sidecar_poll_fn(plan.clone());
+                let root_publication = self.prime_root_poll_fn(plan.clone());
                 Box::new(prime_agent_poll_fn_sandboxed(
-                    preferred_sidecar,
+                    root_publication,
                     plan,
                     self.id.clone(),
                     capture_floor_ms,
@@ -877,11 +877,11 @@ impl Instance {
     }
 
     pub(super) fn stop_and_flush_poller_lifecycle_locked(&mut self) {
-        // A Pi pane's last word is in its sidecar, which no poller may have read: a CLI-only pane
-        // has none, and a restart tears the pane down before the next one starts.
-        self.flush_published_if_present();
-        // stop_poller() signals the thread but leaves the handle in place, so this is_some() means
-        // "a poller existed and may have queued a final observation".
+        let native_prime = self.prime_runtime().is_some();
+        if !native_prime {
+            self.flush_published_if_present();
+        }
+        // Stop and discard queued observations before the final native root read.
         self.stop_poller();
         if self.session_id_poller.is_some() {
             let file_watch = self.resolve_file_watch();
@@ -906,6 +906,9 @@ impl Instance {
             }
         }
         self.session_id_poller = None;
+        if native_prime {
+            self.flush_published_if_present();
+        }
     }
 }
 

@@ -88,6 +88,9 @@ async fn main() -> Result<()> {
         }
     };
 
+    if let Some(Commands::PrimeRunner(args)) = cli.command {
+        return agent_of_empires::process::prime::run(args).await;
+    }
     let read_source = cli::runtime_read::read_request_source(&cli);
     // Linux defaults to local UDS discovery; other platforms default to the store.
     // An explicitly selected endpoint replaces either default.
@@ -128,8 +131,8 @@ async fn main() -> Result<()> {
     }
 
     if let Some(err) = serve_unavailable_error(&cli) {
-        err.exit();
-    }
+    err.exit();
+}
 
     if let Some(url) = &cli.daemon_url {
         // SAFETY: single-threaded at this point — we haven't entered
@@ -375,6 +378,7 @@ async fn run(
         Some(Commands::Uninstall(args)) => return exit_zero(cli::uninstall::run(args).await),
         Some(Commands::Update(args)) => return exit_zero(cli::update::run(args).await),
         Some(Commands::Migrate) => return exit_zero(cli::migrate::run()),
+
         Some(Commands::Stop { .. }) => return exit_zero(cli::killall::stop_trap()),
         _ => {}
     }

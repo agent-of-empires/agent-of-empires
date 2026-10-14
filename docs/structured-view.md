@@ -25,8 +25,9 @@ aoe ships an ACP registry entry for each tool whose ACP server we have verified.
 | `pi` | `pi-acp` | `npm install -g pi-acp` (plus `@earendil-works/pi-coding-agent`) | `pi-acp --terminal-login`, or provider env |
 | `omp` | `omp acp` (native) | `curl -fsSL https://omp.sh/install \| sh` | OMP login or provider env |
 | `kimi` | `kimi acp` (native) | `curl -fsSL https://code.kimi.com/kimi-code/install.sh \| bash` | `kimi login`, or provider env |
-| `prime-agent` | `prime-agent --mode acp` (native) | `curl -fsSL https://app.primeintellect.ai/prime-agent/install.sh \| sh` | `/login` once, or provider env |
+| `prime-agent` | `prime-agent --mode acp` (native 0.10.x) | `curl -fsSL https://app.primeintellect.ai/prime-agent/install.sh \| sh` | `/login` once, or provider env |
 | `aoe-agent` | bundled (Vercel AI SDK 7) | `aoe acp doctor --fix --adapter aoe-agent` | provider env vars |
+
 
 Gemini CLI is deprecated upstream for individual accounts; enterprise and API-key auth remain valid, and Antigravity CLI is the consumer replacement.
 
@@ -48,6 +49,28 @@ Each built-in adapter receives only the provider variables it is known to read, 
 | `prime-agent` | `PRIME_API_KEY`, `PRIME_TEAM_ID`, every provider key its model registry reads, and the Vertex, Bedrock, and AWS credential-chain variables (see `src/acp/agent_registry.rs`) |
 
 `vibe`, `pi`, `omp`, `kimi`, and custom adapters have no ambient allowlist yet: give them auth through the session's `extra_env`, the `environment` list, or `session.inherit_host_environment` for host sessions. In a sandboxed session the per-adapter keys above still cross the container boundary, but `inherit_host_environment` does not, so use `sandbox.environment` there. Allowlist entries naming a file or directory (`CLAUDE_CONFIG_DIR`, `CODEX_HOME`, `GOOGLE_APPLICATION_CREDENTIALS`, the AWS file variables) are host-only and never cross, since each agent's config dir is already bind-mounted at its canonical container location; each drop is logged under the `acp` target with the key and the reason.
+
+### Prime runtime ownership
+
+Native Prime Agent 0.10.x uses a daemon owned by each structured execution. Ownership follows the resolved ACP backend, including inherited custom agents, rather than the session tool label. The daemon and frontend receive the same effective environment and use the original agent directory for credentials, settings, skills, and history. Sandboxed preparation resolves Prime with the frontend’s executable, environment, working directory, and pinned container ID. AoE does not reuse a daemon launched with another session’s credentials.
+
+Stopping or restarting a session requires process settlement before replacement. Runner retirement is bound to its registry generation, kernel birth identity, and boot. Linux uses pidfds; macOS uses audit-token PID versions. Linux 6.9 and newer can signal the original process group through a retained pidfd after the leader exits. A cold collector without an attested group anchor retains ownership. Foreign-user permission errors do not establish ownership; an uninspectable owned incarnation blocks retirement. Positively scoped native auxiliaries are fenced even if they detached with setsid. Detached runner expiry removes its record and sockets only after cleanup succeeds.
+
+Successful cleanup removes the private runtime directory and retains a compact termination receipt in the AoE worker directory. The receipt binds launch evidence to its original host boot or guest PID namespace. A changed epoch invalidates old descriptors and launch PID files across retries. A missing runtime directory can settle only after the current census proves no owned processes remain. Definitive absence of the pinned container on its recorded runtime endpoint settles that guest's obligations without signalling host PIDs; stopped, paused, and unreachable containers are not treated as absent. The receipt’s absolute host path is pinned before applying the agent environment, and preparation commits it before launching native processes. Failure rolls back only the directory created by that attempt.
+
+Container images must provide Bash and GNU grep for scoped process inspection, plus Python 3.9 or newer with `os.pidfd_open` and `signal.pidfd_send_signal` on the guest kernel. AoE probes pidfd signalling during preparation and binds guest signals to the recorded incarnation, without a numeric PID fallback. Missing capabilities refuse launch. Stopping `aoe serve` only detaches; an admitted turn continues and the next daemon reattaches to the same worker.
+
+On Apple Container, worker descriptor snapshots are streamed as a tar archive by the guest Python helper. Symlinks and non-regular descriptors are refused; no host copy destination is used.
+
+CLI stop and kill persist a stop intent before signalling. Reattachment, automatic respawn, queued turns, and runner publication respect that fence. Only an explicit resume after settled retirement can clear the stop intent it observed; a newer stop remains authoritative. For a tracked runtime that cannot prove settlement, externally stop only that execution on its original host or pinned container and retry `aoe acp stop <id>`.
+
+A legacy Prime record without an attested native cleanup route cannot be retired automatically. Upgrades pin an existing control receipt only when it matches the recorded execution route; otherwise the route and ownership record remain intact with an unknown control path. First identify its original host or container and externally stop every native worker and service belonging to that execution. If that scope cannot be identified or its shutdown cannot be confirmed, retain the record. Do not use a global Prime shutdown that would affect unrelated executions.
+
+After confirming native shutdown and verifying the original runner has exited, run `aoe acp recover <id> --confirm-prime-stopped` on the original worker host. The flag is an operator attestation, not proof obtained by AoE. Recovery refuses live original runners, attested native routes, non-Prime records, and changed execution identities. It retires only the selected record and runner sockets, not conversation history.
+
+Malformed registry bytes remain an admission fence. After externally stopping the original runner and all its host or container native processes, use `aoe acp recover <id> --confirm-worker-stopped`. This covers unattested legacy runners and orphaned runner groups after external settlement. Recovery observes rather than signals: a known runner or group still executing, a live control-socket peer, changed evidence, or failed cleanup of an attested native route prevents retirement. Unidentified native receipts remain intact. If the original scope cannot be identified and stopped, retain the record rather than discarding it.
+
+Prime 0.10.0 does not advertise ACP `session/load`: reattachment preserves a live session, but a cold ACP start creates a new native context and reports a context reset.
 
 ### Switching provider
 
@@ -138,7 +161,7 @@ AOE_DAEMON_URL=https://aoe.example.com AOE_DAEMON_TOKEN=… aoe   # remote sessi
 aoe acp attach <session_id> --daemon-url https://aoe.example.com
 ```
 
-With `AOE_DAEMON_URL` set, the TUI opens a remote session picker, and `aoe serve --status`, `aoe acp *`, and the read-only CLI commands select that daemon. Local-only operations such as tmux attach, `aoe stop`, and file editing still require the local machine or SSH. Runtime reads permit unauthenticated HTTP to non-loopback hosts, but remote authentication requires HTTPS. The read client pins `localhost` to loopback without DNS. See [runtime CLI reads](api.md#runtime-cli-reads) for endpoint selection and fallback rules.
+With `AOE_DAEMON_URL` set, the TUI opens a remote session picker; `aoe serve --status`, daemon-backed `aoe acp` verbs and the read-only CLI commands select that daemon. Local operations such as tmux attach, `aoe stop`, file editing and worker recovery still require the local machine or SSH. The TUI picker sends bearer tokens only over HTTPS or loopback. Runtime CLI reads permit non-loopback HTTP without credentials; remote authentication requires HTTPS, and `localhost` is pinned to loopback without DNS. See [runtime CLI reads](api.md#runtime-cli-reads) for endpoint selection and fallback rules.
 
 For runtime reads and ACP requests to a daemon running `--auth=passphrase`, use `AOE_DAEMON_PASSPHRASE` instead of a bearer token. These clients share the `/api/login` handshake, device binding, and persisted session cache. Login secrets never follow redirects; loopback login bypasses environment proxies. ACP local discovery can also read the saved `serve.passphrase` file. A revoked cached session triggers a fresh login; a failed authentication never substitutes local rows. TUI session-list authentication supports bearer tokens only; an unauthenticated daemon needs no credential. Ancillary plugin UI requests can use passphrase authentication through the ACP client.
 
@@ -156,6 +179,8 @@ Every structured-view operation has a matching verb against the same daemon:
 | `aoe acp tail <id>` | Stream broadcast frames as JSON lines |
 | `aoe acp attach <id>` | Open the TUI structured view |
 | `aoe acp stop` / `kill` / `restart` / `logs` / `switch-agent` | Worker management |
+| `aoe acp recover <id> --confirm-prime-stopped` | Retire an identifiable missing-route Prime record after operator-confirmed native shutdown |
+| `aoe acp recover <id> --confirm-worker-stopped` | Retire malformed or unattested legacy ownership after external shutdown confirmation |
 | `aoe ps --acp` | List workers with their ACP columns; `--dead` includes dead and orphaned ones |
 
-Every verb needs a running `aoe serve` and exits with a hint if none is found. The CLI never spawns a daemon on your behalf, so the localhost-versus-tunnel choice stays explicit.
+Daemon-backed verbs need a running `aoe serve` and exit with a hint if none is found. The CLI never spawns a daemon on your behalf. Recovery operates on the local worker registry, so run it on the original worker host, using SSH for a remote host.

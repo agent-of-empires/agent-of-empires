@@ -1,5 +1,6 @@
 // Structured view transcript and composer against a real server: attachments, file links, cards, turn control.
 
+import type { Page } from "@playwright/test";
 import { spawnSync } from "node:child_process";
 import { join } from "node:path";
 import { test, expect } from "../helpers/liveTest";
@@ -121,9 +122,68 @@ test("staged composer image survives session switch and reload", async ({ page, 
   await expect(chip).toHaveCount(0);
   await switchTo("draft-source", source);
   await expect(chip).toBeVisible({ timeout: 10_000 });
+  await waitForCommittedDraft(page);
   await page.reload();
   await waitForStructuredView(page);
   await expect(chip).toBeVisible({ timeout: 10_000 });
+});
+
+// Reload only after the draft is committed to IndexedDB, not merely shown as a chip.
+async function waitForCommittedDraft(page: Page): Promise<void> {
+  await expect
+    .poll(() =>
+      page.evaluate(
+        () =>
+          new Promise<number>((resolve, reject) => {
+            const open = indexedDB.open("aoe-composer-attachments");
+            open.onerror = () => reject(open.error);
+            open.onsuccess = () => {
+              const db = open.result;
+              if (!db.objectStoreNames.contains("drafts")) {
+                db.close();
+                resolve(0);
+                return;
+              }
+              const count = db.transaction("drafts").objectStore("drafts").count();
+              count.onsuccess = () => {
+                db.close();
+                resolve(count.result);
+              };
+            };
+          }),
+      ),
+    )
+    .toBeGreaterThan(0);
+}
+
+test("staged photo past the localStorage quota survives reload without a storage-full toast", async ({
+  page,
+  spawnServe,
+}) => {
+  const serve = await spawnServe({
+    acp: true,
+    fakeAcpScript: IMAGE_CAPABLE,
+    seedFn: ({ home, env }) => {
+      aoeAdd(env, initWorkingRepo(join(home, "project-a"), env).path, "photo-draft");
+    },
+  });
+  const id = await sessionIdByTitle(serve.baseUrl, "photo-draft");
+  await enableStructuredViewAndWait(serve.baseUrl, id, 30_000, serve.home);
+
+  await openStructuredView(page, serve, id);
+  await expect(page.getByRole("button", { name: /Attach files/ })).toBeEnabled({ timeout: 30_000 });
+  // 8 MiB of base64 payload is far over the ~5 MiB localStorage quota.
+  const photo = Buffer.concat([Buffer.from(PNG_1X1_B64, "base64"), Buffer.alloc(8 * 1024 * 1024)]);
+  await page.locator('input[type="file"]').setInputFiles({ name: "photo.png", mimeType: "image/png", buffer: photo });
+  const chip = page.getByRole("img", { name: "photo.png" });
+  await expect(chip).toBeVisible({ timeout: 10_000 });
+  await expect(page.getByText(/storage full/i)).toHaveCount(0);
+  await waitForCommittedDraft(page);
+
+  await page.reload();
+  await waitForStructuredView(page);
+  await expect(chip).toBeVisible({ timeout: 10_000 });
+  await expect(page.getByText(/storage full/i)).toHaveCount(0);
 });
 
 test("structured view transcript file links open in-app, scroll to cited line, and render out-of-repo paths as inert text", async ({

@@ -213,6 +213,7 @@ fn build_test_app_state_impl(
         telemetry_session_creates,
         telemetry_structured: StructuredTelemetryCounters::default(),
         telemetry_last_reported: std::sync::Mutex::new(None),
+        acp_orphan_cleanups: std::sync::Mutex::new(std::collections::HashSet::new()),
         shutdown: CancellationToken::new(),
         file_watch,
         disk_changed: Arc::new(tokio::sync::Notify::new()),

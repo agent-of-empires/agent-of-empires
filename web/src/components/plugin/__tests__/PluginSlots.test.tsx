@@ -456,6 +456,19 @@ describe("pane blocks", () => {
     expect(screen.queryByTestId("plugin-pane-refreshing")).toBeNull();
   });
 
+  it("overlays the refresh indicator outside the scroll flow so content does not shift", () => {
+    refreshingRef.current = true;
+    renderBlocks({ kind: "heading", text: "GitHub" });
+    const indicator = screen.getByTestId("plugin-pane-refreshing");
+    expect(screen.getByRole("status", { name: "Refreshing" })).toBe(indicator);
+    expect(indicator.textContent).toBe("");
+    const scroller = screen.getByText("GitHub").closest(".overflow-auto");
+    expect(scroller).toBeTruthy();
+    expect(scroller?.contains(indicator)).toBe(false);
+    expect(indicator.parentElement?.className).toContain("relative");
+    expect(indicator.parentElement?.contains(scroller)).toBe(true);
+  });
+
   it("renders heading, linked row, note, divider and skips unknown kinds", () => {
     const { container } = renderBlocks(
       { kind: "heading", text: "GitHub" },

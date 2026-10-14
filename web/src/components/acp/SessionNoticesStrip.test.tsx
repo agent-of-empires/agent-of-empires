@@ -1,8 +1,9 @@
 // @vitest-environment jsdom
-import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import type { SessionNotice } from "../../lib/acpTypes";
+import { AcpPrefsProvider, type AcpPrefs } from "../../lib/acpPrefs";
 import { SessionNoticesStrip } from "./PromptStrips";
 
 afterEach(() => {
@@ -44,5 +45,58 @@ describe("SessionNoticesStrip", () => {
   it("renders an unrecognized severity rather than dropping it", () => {
     render(<SessionNoticesStrip notices={[mk("notice-1", "critical", "Quota exhausted")]} onDismiss={() => {}} />);
     expect(screen.getByText("Quota exhausted")).toBeTruthy();
+  });
+});
+
+describe("SessionNoticesStrip notice display pref", () => {
+  const prefs = (noticeDisplay: AcpPrefs["noticeDisplay"]): AcpPrefs => ({
+    showToolDurations: true,
+    wrapToolOutput: false,
+    replayEvents: 0,
+    compactionReminder: false,
+    compactionReminderPercent: 75,
+    noticeDisplay,
+    noticeTimeoutSecs: 10,
+  });
+  const notices = [mk("n-info", "info", "Fast mode off"), mk("n-error", "error", "Compaction failed")];
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it("hides advisories but keeps errors when hidden", () => {
+    render(
+      <AcpPrefsProvider value={prefs("hidden")}>
+        <SessionNoticesStrip notices={notices} onDismiss={() => {}} />
+      </AcpPrefsProvider>,
+    );
+    expect(screen.queryByText("Fast mode off")).toBeNull();
+    expect(screen.getByText("Compaction failed")).toBeTruthy();
+  });
+
+  it("auto-dismisses advisories after the timeout but never errors", () => {
+    vi.useFakeTimers();
+    const onDismiss = vi.fn();
+    render(
+      <AcpPrefsProvider value={prefs("timeout")}>
+        <SessionNoticesStrip notices={notices} onDismiss={onDismiss} />
+      </AcpPrefsProvider>,
+    );
+
+    act(() => vi.advanceTimersByTime(9_999));
+    expect(onDismiss).not.toHaveBeenCalled();
+    act(() => vi.advanceTimersByTime(1));
+    expect(onDismiss).toHaveBeenCalledTimes(1);
+    expect(onDismiss).toHaveBeenCalledWith("n-info");
+    act(() => vi.advanceTimersByTime(60_000));
+    expect(onDismiss).toHaveBeenCalledTimes(1);
+  });
+
+  it("keeps notices until dismissed by default", () => {
+    vi.useFakeTimers();
+    const onDismiss = vi.fn();
+    render(<SessionNoticesStrip notices={notices} onDismiss={onDismiss} />);
+    act(() => vi.advanceTimersByTime(60_000));
+    expect(onDismiss).not.toHaveBeenCalled();
   });
 });

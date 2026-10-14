@@ -240,8 +240,10 @@ pub(super) fn detect_off_protocol_work_completed(
 /// Wake signal from a non-failed `ScheduleWakeup` tool update. The initial
 /// `ToolCall` is excluded because the tool may still fail; `InProgress` is
 /// accepted because the adapter strips `raw_input` from `Completed`.
+/// `restored_title` names an update that arrived without a title.
 pub(super) fn wakeup_lifecycle_signal_from_update(
     update: &SessionUpdate,
+    restored_title: Option<&str>,
     profile: &agent_profiles::AgentProfile,
 ) -> Option<LifecycleSignal> {
     if !profile.supports_wakeup_tools {
@@ -251,7 +253,7 @@ pub(super) fn wakeup_lifecycle_signal_from_update(
         return None;
     };
     if matches!(u.fields.status, Some(ToolCallStatus::Failed))
-        || u.fields.title.as_deref() != Some("ScheduleWakeup")
+        || u.fields.title.as_deref().or(restored_title) != Some("ScheduleWakeup")
     {
         return None;
     }
@@ -447,8 +449,11 @@ mod tests {
                 (ToolCallStatus::InProgress, true),
                 (ToolCallStatus::Failed, false),
             ] {
-                let sig =
-                    wakeup_lifecycle_signal_from_update(&wake(status), &agent_profiles::CLAUDE);
+                let sig = wakeup_lifecycle_signal_from_update(
+                    &wake(status),
+                    None,
+                    &agent_profiles::CLAUDE,
+                );
                 assert_eq!(
                     matches!(sig, Some(LifecycleSignal::WakeupPending { .. })),
                     expected,
@@ -459,9 +464,28 @@ mod tests {
             tc.raw_input = Some(serde_json::json!({ "delaySeconds": 60 }));
             assert!(wakeup_lifecycle_signal_from_update(
                 &SessionUpdate::ToolCall(tc),
+                None,
                 &agent_profiles::CLAUDE
             )
             .is_none());
+            let untitled = SessionUpdate::ToolCallUpdate(ToolCallUpdate::new(
+                "tc-wake-3",
+                ToolCallUpdateFields::new()
+                    .status(ToolCallStatus::InProgress)
+                    .raw_input(serde_json::json!({ "delaySeconds": 60 })),
+            ));
+            for (restored, expected) in [(Some("ScheduleWakeup"), true), (None, false)] {
+                let sig = wakeup_lifecycle_signal_from_update(
+                    &untitled,
+                    restored,
+                    &agent_profiles::CLAUDE,
+                );
+                assert_eq!(
+                    matches!(sig, Some(LifecycleSignal::WakeupPending { .. })),
+                    expected,
+                    "{restored:?}"
+                );
+            }
         }
     }
 

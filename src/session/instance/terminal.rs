@@ -245,6 +245,7 @@ impl Instance {
                 &env_part,
             )),
             &resolver_command,
+            true,
         );
 
         // Values ride the protected env-file, never the host shell or runtime
@@ -523,7 +524,8 @@ exec /usr/bin/env -i PATH="$TARGET_PATH" SHELL="$FALLBACK_SHELL" "$@"
             ),
         ] {
             let args_file = temp.path().join(format!("args-{binary}"));
-            let command = runtime.exec_command("test-container", Some(&options), &resolver_command);
+            let command =
+                runtime.exec_command("test-container", Some(&options), &resolver_command, true);
             let output = Command::new("/bin/sh")
                 .args(["-c", &command])
                 .env_clear()
