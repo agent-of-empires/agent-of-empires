@@ -9,6 +9,7 @@ export function useSessionGroups(
   workspaces: Workspace[],
   sortMode: SidebarSortMode,
   pluginSort?: PluginSortContext,
+  pluginAttention?: ReadonlySet<string>,
 ): {
   groups: SidebarGroup[];
   toggleGroupCollapsed: (groupId: string) => void;
@@ -17,8 +18,8 @@ export function useSessionGroups(
   const { isCollapsed, toggle } = useCollapsedKeys("aoe-group-collapsed-");
 
   const groups = useMemo(
-    () => buildSessionGroups(workspaces, { idleDecayWindowMs, sortMode, pluginSort, isCollapsed }),
-    [workspaces, idleDecayWindowMs, sortMode, pluginSort, isCollapsed],
+    () => buildSessionGroups(workspaces, { idleDecayWindowMs, sortMode, pluginSort, pluginAttention, isCollapsed }),
+    [workspaces, idleDecayWindowMs, sortMode, pluginSort, pluginAttention, isCollapsed],
   );
 
   return { groups, toggleGroupCollapsed: toggle };

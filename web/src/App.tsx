@@ -25,12 +25,13 @@ import { useWorkspaces } from "./hooks/useWorkspaces";
 import { useLastSessionRestore } from "./hooks/useLastSessionRestore";
 import { SCRATCH_GROUP_ID, useRepoGroups } from "./hooks/useRepoGroups";
 import { useSessionGroups } from "./hooks/useSessionGroups";
+import { useAttentionJump } from "./hooks/useAttentionJump";
 import { useNestedSidebarGroups } from "./hooks/useNestedSidebarGroups";
 import { useOrgGroups } from "./hooks/useOrgGroups";
-import { PluginUiProvider, usePluginUiEntries } from "./lib/pluginUiContext";
+import { PluginUiProvider, usePluginAttention, usePluginUiEntries } from "./lib/pluginUiContext";
 import { buildSortValueMap, pluginSortSpecs } from "./lib/pluginUi";
 import type { PluginSortContext, SidebarSortMode } from "./lib/sidebarSort";
-import { nextAttentionSessionId, sessionNeedsAttention, workspaceIsTrashed } from "./lib/sidebarSort";
+import { nextAttentionSessionId, workspaceIsTrashed } from "./lib/sidebarSort";
 import { useSidebarAxis, useSidebarSortMode } from "./hooks/useSidebarPrefs";
 import { repoGroupToSidebarGroup, type SidebarGroup } from "./lib/sidebarGroups";
 import { useProjects } from "./hooks/useProjects";
@@ -436,6 +437,7 @@ function AppContent({
   // built-in sort; if the entry reappears on a later poll the selection
   // resumes. Selecting a built-in mode clears it via `selectSidebarSortMode`.
   const pluginUiEntries = usePluginUiEntries();
+  const pluginAttention = usePluginAttention();
   const [pluginSortRef, setPluginSortRef] = useState<{ pluginId: string; entryId: string } | null>(null);
   const activePluginSort = useMemo(() => {
     if (!pluginSortRef) return null;
@@ -470,8 +472,13 @@ function AppContent({
     toggleRepoCollapsed,
     updateRepoAppearance,
     reorderRepoGroups,
-  } = useRepoGroups(workspaces, workspaceOrdering, sidebarSortMode, projects, pluginSort);
-  const { groups: sessionGroups, toggleGroupCollapsed } = useSessionGroups(workspaces, sidebarSortMode, pluginSort);
+  } = useRepoGroups(workspaces, workspaceOrdering, sidebarSortMode, projects, pluginSort, pluginAttention);
+  const { groups: sessionGroups, toggleGroupCollapsed } = useSessionGroups(
+    workspaces,
+    sidebarSortMode,
+    pluginSort,
+    pluginAttention,
+  );
   // The nested `repo+group` axis reuses the already-built repo groups for
   // its top level (so repo collapse, appearance, and ordering are shared
   // with the repo axis) and splits each repo by `group_path` underneath.
@@ -480,6 +487,7 @@ function AppContent({
     repoGroups,
     sidebarSortMode,
     pluginSort,
+    pluginAttention,
   );
   // The org axis (#3283) partitions the same repo groups by remote owner;
   // it needs no sort/plugin-sort input of its own since it reuses each
@@ -1684,19 +1692,7 @@ function AppContent({
   // Flattened, display-ordered session ids plus the subset needing attention,
   // sourced from the same sidebar model the user sees so jump-to-next follows
   // the visible order under any sort or axis.
-  const attentionJump = useMemo(() => {
-    const orderedIds: string[] = [];
-    const attention = new Set<string>();
-    for (const g of sidebarGroups) {
-      for (const v of g.workspaces) {
-        for (const s of v.workspace.sessions) {
-          orderedIds.push(s.id);
-          if (sessionNeedsAttention(s)) attention.add(s.id);
-        }
-      }
-    }
-    return { orderedIds, attention };
-  }, [sidebarGroups]);
+  const attentionJump = useAttentionJump(sidebarGroups);
 
   const handleJumpToAttention = useCallback(() => {
     const next = nextAttentionSessionId(attentionJump.orderedIds, attentionJump.attention, activeSessionId);
