@@ -261,6 +261,31 @@ fn hooks_cli_discloses_omp_profile_and_relative_agent_dir() {
         assert!(result.stdout.contains("resolved against the launch cwd"));
         assert!(!result.stdout.contains(&default.display().to_string()));
     }
+    for (omp_profile, pi_profile, expected) in [
+        ("work", "legacy", profile.to_string_lossy().into_owned()),
+        (
+            "",
+            "work",
+            "<launch cwd>/relative-agent/hooks/pre/aoe-status.ts".to_string(),
+        ),
+    ] {
+        write_config(
+            &xdg,
+            &format!(
+                "environment = [\"HOME={}\", \"OMP_PROFILE={omp_profile}\", \"PI_PROFILE={pi_profile}\", \"PI_CODING_AGENT_DIR=relative-agent\"]\n",
+                home.display()
+            ),
+        );
+        for args in [&["hooks", "status"][..], &["hooks", "approve"][..]] {
+            let result = run_aoe(&home, &xdg, &stub, &socket, args);
+            assert_eq!(result.code, Some(0), "{}", result.all());
+            assert!(
+                result.stdout.contains(&format!("  omp: {expected}")),
+                "{}",
+                result.stdout
+            );
+        }
+    }
 }
 
 /// #4159: the approval is install-wide while this command has no project

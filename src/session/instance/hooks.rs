@@ -153,11 +153,10 @@ pub(crate) fn host_hook_disclosure_for_profile(
         root.clone()
     } else {
         let environment = crate::session::capture::host_launcher_environment(host_env);
-        let has_profile = options.profile.is_some()
-            || environment
-                .get("PI_PROFILE")
-                .is_some_and(|profile| !profile.is_empty());
-        let relative = (!has_profile)
+        let effective_profile =
+            crate::session::capture::resolve_omp_profile(options.profile.as_deref(), &environment)?;
+        let relative = effective_profile
+            .is_none()
             .then(|| environment.get("PI_CODING_AGENT_DIR"))
             .flatten()
             .filter(|dir| !dir.is_empty() && !Path::new(dir).is_absolute());

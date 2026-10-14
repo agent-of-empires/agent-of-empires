@@ -159,7 +159,7 @@ pub(super) fn resolve_layout(
     ))
 }
 
-pub(super) fn resolve_profile(
+pub(crate) fn resolve_profile(
     cli_profile: Option<&str>,
     env: &HashMap<String, String>,
 ) -> Result<Option<String>> {
