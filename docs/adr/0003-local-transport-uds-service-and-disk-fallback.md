@@ -2,17 +2,17 @@
 
 Status: proposed. Decides #4399 (part of #2734). Terms follow `CONTEXT.md`: **Daemon** is the `aoe serve` process, a **Client** is the TUI, CLI or Web dashboard that pilots it, a **Principal** is who a request to the Daemon acts as.
 
-Issue #3839 settled the same REST+WS routes over a local Unix socket and remote TCP, with kernel peer credentials and no bearer on the Unix socket. #3838 settled a hard fail with reconnect guidance when no Daemon is reachable, with no on-disk cache. #4136 serves CLI reads over a Unix socket on Linux only and falls back to on-disk storage elsewhere. This ADR accepts #4136 as a bounded wave 1, fixes the transport per platform, and says what removes the fallback.
+Issue #3839 settled the same REST+WS routes over a local Unix socket and remote TCP, with kernel peer credentials and no bearer on the Unix socket. #3838 settled a hard fail with reconnect guidance when no Daemon is reachable, with no on-disk cache. #4136 serves CLI reads over a Unix socket on Linux only and falls back to on-disk storage in other cases. This ADR accepts #4136 as a bounded wave 1, fixes the transport per platform, and says what removes the fallback.
 
 ## Decision
 
-- **A Unix socket is the local channel.** #4136 ships as a bounded wave 1: its distinct Hello+Snapshot contract at `/api/runtime/ws` is an accepted exception to "same REST+WS routes over the local Unix socket and remote TCP" (#3839). Converging onto the shared router and a typed `LocalPeer` Principal is an explicit obligation of #3897.
-- **macOS uses the same Unix socket with `LOCAL_PEERCRED`**, implemented in `src/process/macos.rs` and mirroring Linux `SO_PEERCRED`.
+- **A Unix socket is the local channel.** #4136 ships as a bounded wave 1: its distinct Hello+Snapshot contract is an accepted exception to "same REST+WS routes over the local Unix socket and remote TCP" (#3839). Converging onto the shared router and a typed `LocalPeer` Principal is an explicit obligation of #3897. The one-shot read moves to a path distinct from `/api/runtime/ws`, which #4009's TUI stream uses at protocol v2; #4136 sets the path.
+- **macOS uses the same Unix socket with `LOCAL_PEERCRED`**, implemented in `src/process/macos.rs` and mirroring Linux `SO_PEERCRED` (#4431).
 - **The Windows CLI has no local transport.** There is no Windows Daemon for now, so the Windows CLI is always a remote Client: no named pipe, no loopback TCP to a local Daemon. Revisit only if a Windows Daemon is planned.
-- **The non-Linux disk fallback in #4136 is a transitional exception to #3838.** It is direct read access to authoritative storage, not a Client-side cache, and exists for read-only CLI commands only. It is removed in the same change that ships the macOS UDS listener; afterwards a CLI that cannot reach the Daemon hard fails with reconnect guidance, as #3838 requires. There is no fallback for mutations (#4400), the TUI or Windows. No calendar deadline is asserted.
+- **#4136's disk reads are a transitional exception to #3838, for read-only CLI commands only.** They are direct reads of authoritative storage, not a Client-side cache. Three paths read disk: non-Linux platforms, Linux when no Daemon has published, and `AOE_DAEMON_URL` getting no answer in time. The macOS UDS listener removes none of the last two, and removing them before the CLI can start a Daemon would make `aoe list` hard fail whenever none runs. All three are therefore removed together when CLI auto-start from #4400 lands; afterwards a CLI that cannot reach the Daemon hard fails with reconnect guidance, as #3838 requires. There is no fallback for mutations (#4400), the TUI or Windows. No calendar deadline is asserted.
 - **The socket path derives from the app directory (`HOME`-based), not `XDG_RUNTIME_DIR`.** The path selects the Daemon; peer credentials only prove the caller has the same UID. CityHall's process backend runs several per-user Daemons under one OS user with distinct `HOME`s, and they must not collide (constraint from #4394, ADR 0002). Peer credentials cannot tell such Daemons apart; that is accepted, because the same OS user is one trust boundary.
 - **#4136 retained scope.**
-  - Accepted: the SessionRead projection, with a ticketed obligation to converge on one projection later; the ACP selector fences; the strict noncreating Storage reads.
+  - Accepted: the SessionRead projection, with an obligation to converge on one projection later (#4432); the ACP selector fences; the generation, status and Idle pairing in `src/server/reload.rs`; the strict noncreating Storage reads.
   - Split into its own PR: the notification helper replacement, which is independent lifecycle hardening and not a prerequisite for CLI reads.
 
 ## Considered options
@@ -24,6 +24,6 @@ Issue #3839 settled the same REST+WS routes over a local Unix socket and remote 
 
 ## Consequences
 
-- Until the macOS UDS listener lands, macOS read-only CLI commands may read storage directly. The TUI and mutations never do. Landing the listener deletes that path.
-- Router and `LocalPeer` convergence is tracked by #3897. The macOS listener with the fallback removal, and the projection convergence, stay in the Not yet specified section of #2734 until their shape is fixed.
+- Until #4400's CLI auto-start lands, read-only CLI commands may read storage directly on the three paths above. The TUI and mutations never do.
+- Tracking: router and `LocalPeer` convergence is #3897, the macOS UDS listener is #4431, projection convergence is #4432.
 - Nothing here precludes a later multi-user layer (ADR 0002).
