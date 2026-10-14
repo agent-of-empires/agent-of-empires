@@ -200,6 +200,8 @@ function rewrappedRow(context: readonly string[], keys: readonly string[], predi
   const strip = (key: string) => key.replace(/\s+/g, "");
   const needle = context.map(strip).join("");
   if (needle.length < MIN_REWRAP_CHARS) return null;
+  // Leading blank lines strip to nothing, so the needle starts that many rows below the context's first line.
+  const blankLead = context.findIndex((key) => strip(key) !== "");
   const starts: number[] = [];
   let text = "";
   for (const key of keys) {
@@ -220,7 +222,7 @@ function rewrappedRow(context: readonly string[], keys: readonly string[], predi
   let best: number | null = null;
   let bestDistance = Number.POSITIVE_INFINITY;
   for (let at = text.indexOf(needle); at >= 0; at = text.indexOf(needle, at + 1)) {
-    const row = rowAt(at);
+    const row = rowAt(at) - blankLead;
     const distance = Math.min(...predictions.map((p) => Math.abs(p - row)));
     if (distance < bestDistance) {
       best = row;

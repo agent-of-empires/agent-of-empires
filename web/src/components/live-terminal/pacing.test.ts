@@ -184,6 +184,19 @@ describe("scroll anchor across a relayout", () => {
       expected: 14 * LINE_H,
     },
     {
+      name: "a blank line at the top keeps its place when the pane is re-wrapped",
+      before: {
+        top: 15,
+        spacer: 0,
+        layout: rewrapped(["aa", "", "bbbbbbbbbb", "cc", "dddddddddd", "ee", "ffffffffff", "gg"], 4),
+      },
+      after: {
+        spacer: 0,
+        layout: rewrapped(["aa", "", "bbbbbbbbbb", "cc", "dddddddddd", "ee", "ffffffffff", "gg"], 5),
+      },
+      expected: 1.5 * LINE_H,
+    },
+    {
       name: "too little text to identify a re-wrapped line keeps the line number",
       before: { top: 10, spacer: 0, layout: layout(ones(3), ["ab", "cd", "ef"]) },
       after: { spacer: 0, layout: layout(ones(2), ["abc", "def"]) },
