@@ -18,7 +18,7 @@ Today almost every mutating CLI command writes `sessions.json`, tmux, worktrees 
   - Daemon and install management: `killall`, `update`, `uninstall`, `migrate`, `sandbox reclaim`, `serve`. `migrate` refuses while a Daemon runs.
   - `log-level` only changes a running Daemon, so it errors instead of starting one.
 - **Migration is per command, `add` first,** with no interim notify for commands not yet migrated. Until `add` is migrated, a request that resolves a just-added session can still 404 inside #4035's window; the Daemon's next reload restores the row but does not retry that request. The window closes once no Client writes out of band.
-- **The `aoe serve` flags stay the control surface** (`--daemon`, `--stop`, `--status`, `--restart`). Stopping the Daemon stops AoE.
+- **The `aoe serve` flags stay the control surface** (`--daemon`, `--stop`, `--status`, `--restart`). `--stop` stops the Daemon only until the next Client call auto-starts it, unless `--no-autostart` is set; Workers and tmux sessions outlive it.
 - **Web serving and Tunnel are Daemon settings,** so an auto-started Daemon honors their persisted values. They are written through the Daemon like other config it reads, and changing one makes the Daemon perform the coordinated restart from #3838. `aoe serve` exposure flags (`--remote`, `--host`, `--port`, `--auth`) against a running Daemon update these settings instead of bailing.
 
 ## Considered options
