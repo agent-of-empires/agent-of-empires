@@ -94,7 +94,7 @@ A multi-repo Session's directory, holding one Worktree per Repository on a share
 _Avoid_: profile, multi-repo session, `/workspace` (the Sandbox mount)
 
 **Base branch**:
-The ref a Session's diff is compared against. Per-session override, then creation base, then Profile default, then the Repository's default branch.
+The ref a Session's diff is compared against. Per-session override, then creation base, then Profile default, then the Repository's default branch. The Project default applies only when the Worktree branch is created and is then recorded as the creation base.
 _Avoid_: PR target, diff base
 
 **Sandbox**:
