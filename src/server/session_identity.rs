@@ -111,16 +111,32 @@ pub(super) async fn drain_session_id_updates_in_state(state: &Arc<AppState>) {
             .collect();
         let mut snapshot = snapshot;
         // Preserve a final queued observation before replacing a stopped worker.
-        let outcome =
+        let mut outcome =
             crate::session::sync::drain_and_persist_session_ids(&mut snapshot, &file_watch);
         // One observation for the whole repair walk, as on the TUI side.
         let live = crate::tmux::LiveSessionSnapshot::new();
         let backoff_before = repair_backoffs(&snapshot);
+        let repair_now = std::time::Instant::now();
+        let contended = if snapshot
+            .iter()
+            .any(|inst| inst.finished_execution_identity_is_due(&live, repair_now))
+        {
+            Instance::contended_capture_cwds(&snapshot)
+        } else {
+            std::collections::HashSet::new()
+        };
         let runtime_changed: std::collections::HashSet<String> = snapshot
             .iter_mut()
             .filter_map(|inst| {
                 let retry_before = inst.session_id_poller_retry_after;
                 let started = inst.repair_session_id_poller_if_needed(&live);
+                let generation_before = inst.lifecycle_generation;
+                if inst.repair_finished_execution_identity(&live, &contended, repair_now) {
+                    outcome.applied.push(inst.id.clone());
+                }
+                if inst.lifecycle_generation != generation_before {
+                    outcome.lifecycle_advanced.push(inst.id.clone());
+                }
                 (started || inst.session_id_poller_retry_after != retry_before)
                     .then(|| inst.id.clone())
             })

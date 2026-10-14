@@ -22,6 +22,7 @@ An explicitly selected unreadable profile fails rather than returning an empty s
 
 Wire members declared nullable must still be present. CLI JSON is a separate contract; for example, `session show --json` omits an unknown `agent_session_id`. A `systemd_unit` glob in local list JSON describes an expected scope name, not proof that the unit exists; remote snapshots omit it.
 
+Background daemon maintenance can recover missing native session IDs from launch-attested publications after the agent pane exits. Read requests do not perform these writes.
 
 ## GET /api/sessions
 

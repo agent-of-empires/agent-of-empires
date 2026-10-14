@@ -284,7 +284,7 @@ mod tests {
         .await;
         crate::server::reload::reload_state_instances_from_disk(
             &state,
-            vec![old],
+            vec![old].into(),
             Vec::new(),
             crate::server::state::StatusSource::DiskOnly,
             stale_epoch,

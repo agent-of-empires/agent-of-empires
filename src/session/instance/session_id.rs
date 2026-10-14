@@ -311,8 +311,7 @@ impl Instance {
             && !contended.contains(&self.contended_capture_key())
     }
 
-    /// Best-effort backfill of a missing `agent_session_id` from a read-only CLI
-    /// command, under a capture lifecycle reservation. Any miss is a silent no-op.
+    /// Best-effort backfill under a Capture lifecycle reservation.
     pub(crate) fn self_heal_session_id(
         &mut self,
         profile: &str,
@@ -383,9 +382,49 @@ impl Instance {
                 target: "session.store",
                 instance = %self.id,
                 tool = %self.tool,
-                "backfilled agent_session_id from a read-only CLI command; \
-                 resume is now available without a TUI or daemon",
+                "backfilled agent_session_id from a native publication",
             );
+        }
+    }
+
+    pub(crate) fn finished_execution_identity_is_due(
+        &self,
+        live: &crate::tmux::LiveSessionSnapshot,
+        now: std::time::Instant,
+    ) -> bool {
+        self.agent_session_id.is_none()
+            && self.poller_repair.due(now)
+            && self.active_execution.is_some()
+            && !self.has_live_agent_pane_in(live)
+    }
+
+    pub(crate) fn repair_finished_execution_identity(
+        &mut self,
+        live: &crate::tmux::LiveSessionSnapshot,
+        contended: &HashSet<(String, String)>,
+        now: std::time::Instant,
+    ) -> bool {
+        if !self.finished_execution_identity_is_due(live, now)
+            || !self.self_heal_row_is_eligible(contended)
+            || !self.tmux_alive_cached()
+        {
+            return false;
+        }
+        // A missing publication must not acquire and persist a Capture reservation.
+        if self.try_retroactive_capture().is_some_and(|observation| {
+            observation.execution.as_ref() == self.active_execution.as_ref()
+                && self.resume_probe_failed_sid.as_deref() != Some(observation.sid.as_str())
+        }) {
+            let profile = self.effective_profile();
+            self.self_heal_session_id(&profile, contended);
+        }
+        // Only a released, applied CAS fills the previously missing id.
+        if self.agent_session_id.is_some() {
+            self.poller_repair.reset();
+            true
+        } else {
+            self.poller_repair.reprobe(std::time::Instant::now());
+            false
         }
     }
 
@@ -1183,6 +1222,107 @@ work-opencode = "opencode"
 
         let contended = HashSet::from([base.contended_capture_key()]);
         assert!(!base.self_heal_row_is_eligible(&contended));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    #[serial]
+    #[serial(hook_base)]
+    async fn daemon_recovers_finished_execution_publications_without_writing_on_misses() {
+        if crate::tmux::tmux_command().arg("-V").output().is_err() {
+            eprintln!("tmux not available; skipping");
+            return;
+        }
+        const PROFILE: &str = "daemon-finished-capture";
+        const SID: &str = "11111111-2222-4333-8444-555555555555";
+        let root = tempdir().unwrap();
+        let _env = crate::server::test_support::RuntimeEnvGuard::set(root.path());
+        let (_hooks, _base, _hook_temp) = crate::hooks::test_support::BaseGuard::ready();
+        for (published, rejected) in [(false, false), (true, true), (true, false)] {
+            let mut inst = tool_instance("claude", root.path().to_str().unwrap());
+            inst.source_profile = PROFILE.into();
+            inst.status = Status::Stopped;
+            inst.resume_probe_failed_sid = rejected.then(|| SID.to_owned());
+            let directory = write_sidecar(&inst.id, SID);
+            let launch_id = uuid::Uuid::new_v4().to_string();
+            let leaf = crate::hooks::session_id_leaf(Some(&launch_id)).unwrap();
+            let sidecar = directory.join(leaf.as_ref());
+            if published {
+                std::fs::write(&sidecar, SID).unwrap();
+            }
+            inst.active_execution = Some(ActiveExecution {
+                launch_id,
+                binding: ExecutionBinding {
+                    agent: "claude".into(),
+                    stores: vec![root.path().join("claude")],
+                    configuration: Vec::new(),
+                    cwd: root.path().into(),
+                    cwd_filesystem: "host".into(),
+                    filesystem: "host".into(),
+                    exported_default_store: None,
+                },
+                capture: Some(CaptureContext::Hooks(sidecar)),
+                container: None,
+            });
+            let session = inst.tmux_session().unwrap();
+            let owned = crate::tmux::test_helpers::TmuxTestSession::from_name(session.name());
+            for args in [
+                vec!["new-session", "-d", "-s", owned.name(), "sleep 60"],
+                vec![
+                    "set-option",
+                    "-w",
+                    "-t",
+                    owned.name(),
+                    "remain-on-exit",
+                    "on",
+                ],
+                vec!["respawn-pane", "-k", "-t", owned.name(), "true"],
+            ] {
+                let result = crate::tmux::tmux_command().args(args).output().unwrap();
+                assert!(
+                    result.status.success(),
+                    "{}",
+                    String::from_utf8_lossy(&result.stderr)
+                );
+            }
+            let pane = crate::tmux::test_helpers::only_pane_id(owned.name());
+            crate::tmux::test_helpers::wait_for_pane_dead(&pane);
+            crate::tmux::refresh_session_cache();
+            let live = crate::tmux::LiveSessionSnapshot::new();
+            assert!(!inst.has_live_agent_pane_in(&live));
+            assert!(inst.tmux_alive_cached());
+            assert_eq!(
+                inst.try_retroactive_capture().map(|value| value.sid),
+                published.then(|| SID.to_owned())
+            );
+            seed_disk_for_sidecar_test(PROFILE, &inst);
+            let storage = crate::session::Storage::open_unwatched(PROFILE).unwrap();
+            let registry = crate::session::get_app_dir()
+                .unwrap()
+                .join("profiles")
+                .join(PROFILE)
+                .join("sessions.json");
+            let before = std::fs::read(&registry).unwrap();
+            let state = crate::server::test_support::build_test_app_state(
+                storage.load_with_groups().unwrap().0,
+            );
+            crate::server::test_support::drain_session_id_updates_for_test(&state).await;
+            let rows = state.instances.read().await;
+            let persisted = storage.load_with_groups().unwrap().0;
+            assert_eq!(
+                rows[0].agent_session_id.as_deref(),
+                (published && !rejected).then_some(SID)
+            );
+            assert_eq!(
+                persisted[0].agent_session_id.as_deref(),
+                (published && !rejected).then_some(SID)
+            );
+            assert!(rows[0].session_id_poller.is_none());
+            assert!(persisted[0].lifecycle_reservation.is_none());
+            if !published || rejected {
+                assert_eq!(std::fs::read(&registry).unwrap(), before);
+            }
+            state.shutdown.cancel();
+        }
     }
 
     #[test]
