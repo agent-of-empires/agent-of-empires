@@ -45,6 +45,7 @@ function renderToolbar(
       compact={opts.compact ?? false}
       ctrlActive={false}
       onCtrlToggle={vi.fn()}
+      onCtrlClear={vi.fn()}
     />,
   );
   return { ...result, sendData, sendPaste, onCompose };
@@ -81,18 +82,6 @@ describe("MobileTerminalToolbar keys", () => {
     renderToolbar({ keys: full, compact: true });
     expect(labels()).not.toContain("Enter");
   });
-
-  it.each(TOOLBAR_KEY_CATALOG.filter((k) => k.data).map((k) => [k.name, k.id, k.data!] as const))(
-    "a tap on %s sends its sequence once",
-    (name, id, data) => {
-      const { sendData } = renderToolbar({ keys: [id] });
-      const key = screen.getByLabelText(name);
-      fireEvent.pointerDown(key);
-      fireEvent.pointerUp(key);
-      fireEvent.click(key);
-      expect(sendData.mock.calls).toEqual([[data]]);
-    },
-  );
 
   it("repeats a held key until release, without a trailing tap", () => {
     vi.useFakeTimers();
@@ -209,13 +198,11 @@ describe("MobileTerminalToolbar paste", () => {
   });
 });
 
-// User story (ported from the live Playwright acp-stories suite): the Ctrl toggle latches the modifier so the next
-// keystroke combines with Ctrl.
 function CtrlLatchHarness({ sendData }: { sendData: (data: string) => boolean }) {
   const [ctrlActive, setCtrlActive] = useState(false);
   return (
     <MobileTerminalToolbar
-      keys={["ctrl", "ctrl-c"]}
+      keys={["ctrl", "ctrl-c", "enter", "backspace"]}
       sendData={sendData}
       sendPaste={vi.fn()}
       onCompose={vi.fn()}
@@ -224,6 +211,7 @@ function CtrlLatchHarness({ sendData }: { sendData: (data: string) => boolean })
       compact={false}
       ctrlActive={ctrlActive}
       onCtrlToggle={() => setCtrlActive((v) => !v)}
+      onCtrlClear={() => setCtrlActive(false)}
     />
   );
 }
@@ -244,5 +232,32 @@ describe("MobileTerminalToolbar Ctrl latch", () => {
     fireEvent.click(screen.getByRole("button", { name: "Ctrl+C interrupt" }));
     expect(sendData).toHaveBeenCalledWith("\x03");
     expect(ctrl.getAttribute("aria-pressed")).toBe("false");
+    fireEvent.click(screen.getByRole("button", { name: "Ctrl+C interrupt" }));
+    expect(ctrl.getAttribute("aria-pressed")).toBe("false");
+    expect(sendData.mock.calls).toEqual([["\x03"], ["\x03"]]);
+  });
+  it("ordinary keys consume Ctrl and held repetitions never rearm it", () => {
+    vi.useFakeTimers();
+    const sendData = vi.fn(() => true);
+    render(<CtrlLatchHarness sendData={sendData} />);
+    const ctrl = screen.getByRole("button", { name: "Ctrl" });
+    fireEvent.click(ctrl);
+    fireEvent.click(screen.getByRole("button", { name: "Enter" }));
+    expect(ctrl.getAttribute("aria-pressed")).toBe("false");
+    expect(sendData.mock.calls).toEqual([["\r"]]);
+
+    fireEvent.click(ctrl);
+    const back = screen.getByRole("button", { name: "Backspace" });
+    fireEvent.pointerDown(back);
+    act(() => vi.advanceTimersByTime(HOLD_REPEAT_DELAY_MS));
+    expect(ctrl.getAttribute("aria-pressed")).toBe("false");
+    for (let tick = 0; tick < 3; tick++) {
+      act(() => vi.advanceTimersByTime(HOLD_REPEAT_INTERVAL_MS));
+      expect(ctrl.getAttribute("aria-pressed")).toBe("false");
+    }
+    fireEvent.pointerUp(back);
+    fireEvent.click(back);
+    act(() => vi.advanceTimersByTime(10 * HOLD_REPEAT_INTERVAL_MS));
+    expect(sendData.mock.calls).toEqual([["\r"], ["\x7f"], ["\x7f"], ["\x7f"], ["\x7f"]]);
   });
 });

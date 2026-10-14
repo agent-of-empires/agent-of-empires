@@ -9,6 +9,11 @@ import { listSessions, seedSessionViaAoeAdd } from "../helpers/aoeServe";
 import { commitAll, generateLargeFileContent, pngStubBytes, writeBinaryFile } from "../helpers/gitFixture";
 import { enableStructuredViewAndWait } from "../helpers/acp";
 
+const decodablePng = Buffer.from(
+  "iVBORw0KGgoAAAANSUhEUgAAAAIAAAACCAYAAABytg0kAAAAEklEQVR4AWLSSN30H4SZGKAAAAAA//977exuAAAABklEQVQDADoABIHXJwUZAAAAAElFTkSuQmCC",
+  "base64",
+);
+
 async function openSession(page: Page, serve: ServeHandle, title: string) {
   await page.goto(`${serve.baseUrl}/`);
   const row = page.getByRole("link").filter({ hasText: title }).first();
@@ -106,7 +111,7 @@ test("right panel diff list: Open file shows the worktree copy, saves HTML, and 
       committed: { "notes.txt": "committed copy\n", "gone.txt": "bye\n" },
       files: { "notes.txt": "worktree copy\n", "page.html": "<script>document.title = 'ran';</script>\n" },
       prepare: (dir) => {
-        writeBinaryFile(dir, "image.png", pngStubBytes());
+        writeBinaryFile(dir, "image.png", decodablePng);
         rmSync(join(dir, "gone.txt"));
       },
     }),
@@ -124,7 +129,11 @@ test("right panel diff list: Open file shows the worktree copy, saves HTML, and 
   await textTab.close();
 
   const [imageTab] = await Promise.all([page.waitForEvent("popup"), (await openFileFor(/image\.png/)).click()]);
-  await expect(imageTab.locator("img")).toHaveCount(1, { timeout: 10_000 });
+  const image = imageTab.locator("img");
+  await expect(image).toHaveCount(1, { timeout: 10_000 });
+  await expect
+    .poll(() => image.evaluate((node) => (node as HTMLImageElement).naturalWidth), { timeout: 10_000 })
+    .toBeGreaterThan(0);
   await imageTab.close();
 
   // Active content is saved under its own name rather than rendered in the dashboard's origin.
@@ -140,7 +149,7 @@ test("files pane: Open file shows an unchanged file in a new tab", async ({ page
       title: "rp-files-open",
       committed: { "docs/guide.md": "unchanged guide\n" },
       prepare: (dir, env) => {
-        writeBinaryFile(dir, "logo.png", pngStubBytes());
+        writeBinaryFile(dir, "logo.png", decodablePng);
         commitAll(dir, "logo", env);
       },
     }),
@@ -158,7 +167,12 @@ test("files pane: Open file shows an unchanged file in a new tab", async ({ page
   await textTab.close();
 
   const [imageTab] = await Promise.all([page.waitForEvent("popup"), (await openFileFor("logo.png")).click()]);
-  await expect(imageTab.locator("img")).toHaveCount(1, { timeout: 10_000 });
+  const image = imageTab.locator("img");
+  await expect(image).toHaveCount(1, { timeout: 10_000 });
+  await expect
+    .poll(() => image.evaluate((node) => (node as HTMLImageElement).naturalWidth), { timeout: 10_000 })
+    .toBeGreaterThan(0);
+  await imageTab.close();
 });
 
 test("right panel notifications: structured view comments banner appears on stage, clears on discard", async ({

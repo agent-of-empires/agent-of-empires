@@ -109,3 +109,97 @@ export function mountedBlocks(
   const bottomPadLines = blocks.length === 0 ? spacerLines + visibleRowCount : visibleRowCount - nextStart;
   return { blocks, bottomPadLines };
 }
+
+/** Rendered rows: each loaded line's plain text, each visual row's source line and wrap offset, each line's
+ *  first row, and the index of the first line on the live screen. */
+export interface RowLayout {
+  keys: readonly string[];
+  lineStartRow: number[];
+  source: Array<{ line: number; wrap: number }>;
+  screenStart: number;
+}
+
+/** History lines compared to find the anchor again once its line number has changed. */
+const ANCHOR_CONTEXT_LINES = 8;
+
+/** A scroll position as a pane line, its wrap row, and the fraction of a row above the scroller top. Pane lines
+ *  count from the top of the scrollback and the spacer holds one row per line; `fromEnd` counts back from the
+ *  end instead, which a trim or a switch between the VT grid and tmux capture leaves unchanged. `context` is the
+ *  plain text of history lines starting `probe` lines below the anchor's: its own when it is a loaded history
+ *  line, the first loaded ones for a spacer line, or those just above the live screen for a screen line, which
+ *  is repainted in place. The oldest boundary, or a view of nothing but spacer, has no context and keeps its
+ *  scrollbar position: one asks for the oldest line, and in the other nothing was read. */
+export interface ScrollAnchor {
+  line: number;
+  fromEnd: number;
+  wrap: number;
+  fraction: number;
+  probe: number;
+  context: readonly string[];
+}
+
+export function scrollAnchor(
+  top: number,
+  viewHeight: number,
+  spacerLines: number,
+  layout: RowLayout,
+  lineH: number,
+): ScrollAnchor | null {
+  const abs = Math.floor(top / lineH);
+  const fraction = top / lineH - abs;
+  const row = abs - spacerLines;
+  const src = row < 0 ? { line: row, wrap: 0 } : layout.source[row];
+  if (!src) return null;
+  const line = spacerLines + src.line;
+  const first =
+    src.line < layout.screenStart ? Math.max(0, src.line) : Math.max(0, layout.screenStart - ANCHOR_CONTEXT_LINES);
+  const keepPosition = top <= 0 || spacerLines * lineH >= top + viewHeight;
+  const context = keepPosition
+    ? []
+    : layout.keys.slice(first, Math.min(first + ANCHOR_CONTEXT_LINES, layout.screenStart));
+  return {
+    line,
+    fromEnd: spacerLines + layout.keys.length - line,
+    wrap: src.wrap,
+    fraction,
+    probe: first - src.line,
+    context,
+  };
+}
+
+/** Local index of the anchor's line: where its context is found, searching outward from predictions counted from
+ *  either end, else its line number, which holds while output only appends. */
+function anchorLine(anchor: ScrollAnchor, spacerLines: number, keys: readonly string[]): number {
+  const fromStart = anchor.line - spacerLines;
+  const { context, probe } = anchor;
+  if (context.length === 0) return fromStart;
+  // A context cut off by the end only counts once no full match exists, so a repeat near the end loses.
+  const matches = (at: number, cutOff: boolean) =>
+    at >= 0 && at < keys.length && context.every((key, k) => (at + k < keys.length ? keys[at + k] === key : cutOff));
+  const predictions = [fromStart + probe, keys.length - anchor.fromEnd + probe];
+  const reach = Math.max(...predictions.map((p) => Math.max(p, keys.length - 1 - p)));
+  for (const cutOff of [false, true]) {
+    for (let d = 0; d <= reach; d++) {
+      for (const p of predictions) {
+        if (matches(p - d, cutOff)) return p - d - probe;
+        if (d > 0 && matches(p + d, cutOff)) return p + d - probe;
+      }
+    }
+  }
+  return fromStart;
+}
+
+/** The scrollTop that puts `anchor` back where it was, or null when its line is not in this layout. */
+export function anchoredScrollTop(
+  anchor: ScrollAnchor,
+  spacerLines: number,
+  layout: RowLayout,
+  lineH: number,
+): number | null {
+  const local = anchorLine(anchor, spacerLines, layout.keys);
+  if (local < 0) return Math.max(0, spacerLines + local + anchor.fraction) * lineH;
+  const first = layout.lineStartRow[local];
+  if (first == null) return null;
+  const rows = (layout.lineStartRow[local + 1] ?? layout.source.length) - first;
+  return (spacerLines + first + Math.min(anchor.wrap, rows - 1) + anchor.fraction) * lineH;
+}

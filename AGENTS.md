@@ -67,6 +67,9 @@ Tests must be deterministic, isolated from user state, and clean up resources.
 CI runs the non-e2e suites with `cargo nextest run`, one process per test, so
 every test must pass when run alone. nextest skips doctests; write examples
 that need checking as unit tests.
+Tmux sockets isolate servers, not user configuration. Fixtures targeting `^.0`
+must use managed session creation or reuse `append_pane_base_index_args` from
+`src/tmux/utils.rs`.
 Use table cases inside one test when setup is shared. Do not test constants,
 derived implementations, trivial getters, or rendering without an asserted
 behavior.

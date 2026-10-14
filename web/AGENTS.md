@@ -31,6 +31,8 @@ and `npx playwright test --config=playwright.live.config.ts` for live tests.
 Live tests use `tests/helpers/aoeServe.ts`, which gives each test an isolated
 home, tmux socket, and port. Use its existing fixtures instead of launching a
 shared server.
+Async React race tests must await request start and the relevant commits.
+Timer counts do not prove completion; `act` may close the race being exercised.
 
 Any user-facing change to auth, session creation, settings, profiles, sessions,
 sidebar, diff, notifications, directory browsing, devices, git clone,

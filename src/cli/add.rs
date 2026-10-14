@@ -51,10 +51,9 @@ pub struct AddArgs {
     #[arg(long = "tool", conflicts_with = "command")]
     tool: Option<String>,
 
-    /// Parent session (creates sub-session, inherits group). The sub-session
-    /// does not inherit the parent's worktree or path: without `--worktree`
-    /// it opens at `<path>` (default: the current directory) on whatever
-    /// branch is checked out there.
+    /// Parent session (creates sub-session, inherits group, not worktree or path).
+    /// Without `--worktree` or `--scratch`, opens at `<path>` (default: current
+    /// directory) on its checked-out branch. `--scratch` uses a fresh directory.
     #[arg(short = 'P', long)]
     parent: Option<String>,
 
