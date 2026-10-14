@@ -241,7 +241,7 @@ A signed-in browser login to the Web dashboard, listed in Connected Devices and 
 _Avoid_: login session, subscription
 
 **Principal**:
-Who a request to the Daemon acts as: the local owner over the Unix socket, a Device, or a Proxy such as CityHall's. A Daemon serves exactly one human; users and accounts belong to CityHall (#4394).
+Target (#4394): who a request to the Daemon acts as: the local owner over the Unix socket, a Device, or a Proxy such as CityHall's. A Daemon serves exactly one human; users and accounts belong to CityHall. Today requests authenticate with a bearer token or passphrase login, and `read_only` is checked per request.
 _Avoid_: user, owner, account
 
 **Push subscription**:
