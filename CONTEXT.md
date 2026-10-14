@@ -65,7 +65,7 @@ A Session that is trashed, snoozed or archived. The "do not bother me" states as
 Forcing a Session to the top of the dashboard. Pinning cancels Archive and Snooze.
 
 **Favorite**:
-A user mark on a Session. It biases ordering within the Session's attention tier and has its own sidebar filter, but does not cancel Dismissed states.
+A user mark on a Session. Favoriting cancels Archive and Snooze, like Pin. With favorites-first on, the default, favorites sort to the top of their scope in every order; with it off they only break ties within their attention tier.
 _Avoid_: star, pin (different concept)
 
 **Unread**:
