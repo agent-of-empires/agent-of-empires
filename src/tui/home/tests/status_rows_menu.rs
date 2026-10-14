@@ -1361,10 +1361,6 @@ fn trash_header_d_and_palette_open_empty_trash_confirm() {
     }
 }
 
-/// A trashed row whose repo is gone fails every delete, so Empty Trash escalates it one
-/// opt-in step per attempt: plain delete, forced delete, then removal from aoe. A peer
-/// restore between the last confirm and its submit keeps the row, and a peer holding the
-/// lifecycle lock delays the removal without blocking input.
 #[test]
 #[serial]
 fn empty_trash_escalates_a_row_that_keeps_failing() {

@@ -199,7 +199,7 @@ pub(crate) fn filename_key(path: &Path) -> Result<JournalKey> {
         "noncanonical journal generation"
     );
     anyhow::ensure!(
-        !encoded.is_empty() && encoded.len() <= 128 && encoded.len() % 2 == 0,
+        !encoded.is_empty() && encoded.len() <= 128 && encoded.len().is_multiple_of(2),
         "invalid encoded journal session"
     );
     let mut key = JournalKey {
@@ -212,7 +212,7 @@ pub(crate) fn filename_key(path: &Path) -> Result<JournalKey> {
         b'a'..=b'f' => Ok(byte - b'a' + 10),
         _ => anyhow::bail!("noncanonical journal session encoding"),
     };
-    for (slot, bytes) in key.id.iter_mut().zip(encoded.as_bytes().chunks_exact(2)) {
+    for (slot, bytes) in key.id.iter_mut().zip(encoded.as_bytes().as_chunks::<2>().0) {
         *slot = (nibble(bytes[0])? << 4) | nibble(bytes[1])?;
     }
     super::validate_instance_id(std::str::from_utf8(&key.id[..key.len])?)?;

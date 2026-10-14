@@ -2452,12 +2452,12 @@ mod tests {
 
         crate::process::worker::kill_process_group(pid);
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
-        while crate::process::worker::is_process_group_alive(pid)
+        while runner_group_alive(pid, fence.runner_process_identity)
             && std::time::Instant::now() < deadline
         {
             std::thread::sleep(std::time::Duration::from_millis(20));
         }
-        assert!(!crate::process::worker::is_process_group_alive(pid));
+        assert!(!runner_group_alive(pid, fence.runner_process_identity));
         terminate_and_confirm_stopped(session_id, "profile", retry_generation).unwrap();
         assert!(!record_path(session_id).unwrap().exists());
         assert!(!socket_exists(&socket_path_for(session_id).unwrap()));
@@ -3141,7 +3141,7 @@ mod tests {
             }
             crate::process::worker::kill_process_group(pid);
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
-            while crate::process::worker::is_process_group_alive(pid) {
+            while runner_group_alive(pid, initial.runner_process_identity) {
                 assert!(std::time::Instant::now() < deadline);
                 std::thread::sleep(std::time::Duration::from_millis(20));
             }
@@ -3531,7 +3531,7 @@ mod tests {
     #[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
     #[test]
     #[serial]
-    fn new_review_zombie_only_runner_group_does_not_block_purge() {
+    fn zombie_only_runner_group_does_not_block_purge() {
         use std::os::unix::process::CommandExt as _;
         let temp = TempDir::with_prefix_in("aoe-", "/tmp").unwrap();
         let _home = crate::session::test_support::isolate_app_dir_at(temp.path());

@@ -692,8 +692,7 @@ impl HomeView {
     /// Commit one profile's group deletion before any purge is queued, so a watcher
     /// reload or a restart cannot rebuild the group from an unchanged `groups.json`.
     /// Blockers are re-checked against durable rows because a Creating member may exist
-    /// only on disk. `Status::Deleting` stays an in-memory overlay owned by
-    /// `PurgeTransaction`.
+    /// only on disk.
     fn persist_group_delete_with_sessions(
         &mut self,
         profile: &str,

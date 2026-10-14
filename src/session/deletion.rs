@@ -3133,7 +3133,6 @@ mod tests {
     fn spawn_live_acp_writer(
         socket_path: &Path,
         output_path: &Path,
-        reaped: std::sync::Arc<std::sync::atomic::AtomicBool>,
     ) -> (u32, std::thread::JoinHandle<std::process::ExitStatus>) {
         use std::os::unix::process::CommandExt as _;
 
@@ -3156,7 +3155,6 @@ mod tests {
             loop {
                 match child.try_wait() {
                     Ok(Some(status)) => {
-                        reaped.store(true, std::sync::atomic::Ordering::Release);
                         return status;
                     }
                     Ok(None) => {}
@@ -3171,7 +3169,6 @@ mod tests {
                     crate::process::worker::kill_process_group(pid);
                     let _ = child.kill();
                     let status = child.wait().expect("reap timed-out ACP writer");
-                    reaped.store(true, std::sync::atomic::Ordering::Release);
                     return status;
                 }
                 std::thread::sleep(Duration::from_millis(10));
@@ -4867,9 +4864,6 @@ mod tests {
     #[serial]
     #[cfg(unix)]
     fn recovery_stops_a_live_acp_writer_before_removing_its_workspace_and_transcript() {
-        use std::sync::atomic::{AtomicBool, Ordering};
-        use std::sync::Arc;
-
         let temp = tempfile::TempDir::with_prefix_in("aoe-purge-", "/tmp").unwrap();
         let _guard = isolate_app_dir_at(temp.path());
         let profile = "purge-live-acp-recovery";
@@ -4880,10 +4874,8 @@ mod tests {
         instance.view = View::Structured;
 
         let writer_path = worktree_path.join("live-writer-output");
-        let reaped = Arc::new(AtomicBool::new(false));
         let socket_path = crate::process::worker_registry::socket_path_for(&instance.id).unwrap();
-        let (writer_pid, waiter) =
-            spawn_live_acp_writer(&socket_path, &writer_path, Arc::clone(&reaped));
+        let (writer_pid, waiter) = spawn_live_acp_writer(&socket_path, &writer_path);
         let writer_deadline = std::time::Instant::now() + Duration::from_secs(3);
         while !writer_path.exists() {
             assert!(
@@ -4946,12 +4938,13 @@ mod tests {
         .unwrap();
         drop(conn);
 
-        let exited_before_worktree_cleanup = Arc::clone(&reaped);
+        let writer_identity = record.process_identity;
         AFTER_PATHS_IN_USE_SCAN.with(|hook| {
             *hook.borrow_mut() = Some(Box::new(move || {
                 assert!(
-                    exited_before_worktree_cleanup.load(Ordering::Acquire),
-                    "ACP writer must be reaped before managed worktree cleanup starts"
+                    !crate::process::process_group_has_writers(writer_pid, writer_identity)
+                        .expect("writer membership must be observable before cleanup"),
+                    "ACP writers must stop before managed worktree cleanup starts"
                 );
             }));
         });
