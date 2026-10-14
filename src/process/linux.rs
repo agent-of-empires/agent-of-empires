@@ -29,14 +29,20 @@ pub(super) fn kernel_process_state(pid: u32) -> anyhow::Result<Option<super::Ker
         .nth(1)
         .context("kernel process group absent")?
         .parse()?;
+    let threads = fields
+        .nth(14)
+        .context("kernel process thread count absent")?
+        .parse::<u32>()?;
+    anyhow::ensure!(threads > 0, "invalid kernel process thread count");
     let start_id = fields
-        .nth(16)
+        .nth(1)
         .context("kernel process birth absent")?
         .parse()?;
     Ok(Some(super::KernelProcessState {
         start_id,
         group,
-        writing: state[0] != b'Z',
+        // A zombie leader can still have live threads sharing its resources.
+        writing: state[0] != b'Z' || threads > 1,
     }))
 }
 
@@ -477,6 +483,127 @@ impl super::SleepInhibit for SystemdInhibitor {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[serial_test::serial]
+    fn fenced_purge_retains_a_live_thread_after_leader_exit() {
+        use std::io::Write as _;
+        use std::os::unix::process::CommandExt as _;
+        use std::time::{Duration, Instant};
+
+        struct ChildGuard(Child);
+        impl Drop for ChildGuard {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        let temp = tempfile::TempDir::with_prefix_in("aoe-thread-", "/tmp").unwrap();
+        let _home = crate::session::test_support::isolate_app_dir_at(temp.path());
+        let source = temp.path().join("writer.c");
+        let executable = temp.path().join("writer");
+        let marker = temp.path().join("writing");
+        fs::write(
+            &source,
+            r#"#include <pthread.h>
+#include <stdio.h>
+#include <stdlib.h>
+static void *writer(void *path) {
+    char command[32];
+    while (fgets(command, sizeof(command), stdin)) {
+        FILE *file = fopen(path, "w");
+        if (!file) abort();
+        fputs(command, file);
+        fclose(file);
+    }
+    return NULL;
+}
+int main(int argc, char **argv) {
+    if (argc != 2) return 2;
+    pthread_t thread;
+    if (pthread_create(&thread, NULL, writer, argv[1])) return 3;
+    pthread_exit(NULL);
+}
+"#,
+        )
+        .unwrap();
+        let compiled = Command::new("cc")
+            .arg("-pthread")
+            .arg(&source)
+            .arg("-o")
+            .arg(&executable)
+            .output()
+            .unwrap();
+        assert!(
+            compiled.status.success(),
+            "{}",
+            String::from_utf8_lossy(&compiled.stderr)
+        );
+        let mut child = ChildGuard(
+            Command::new(&executable)
+                .arg(&marker)
+                .process_group(0)
+                .stdin(Stdio::piped())
+                .spawn()
+                .unwrap(),
+        );
+        let pid = child.0.id();
+        let request_write = |child: &mut ChildGuard, sequence: &str| {
+            write!(child.0.stdin.as_mut().unwrap(), "{sequence}").unwrap();
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while fs::read_to_string(&marker).ok().as_deref() != Some(sequence) {
+                assert!(
+                    Instant::now() < deadline,
+                    "live thread did not acknowledge write"
+                );
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        };
+        request_write(&mut child, "before\n");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !fs::read_to_string(format!("/proc/{pid}/stat"))
+            .unwrap()
+            .rsplit_once(')')
+            .unwrap()
+            .1
+            .trim_start()
+            .starts_with("Z ")
+        {
+            assert!(Instant::now() < deadline, "leader did not exit");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let identity = crate::process::kernel_process_identity(pid).unwrap();
+        use crate::process::worker_registry as registry;
+        let session_id = "zombie-thread";
+        let record = registry::WorkerRecord::new(
+            session_id.into(),
+            pid,
+            registry::socket_path_for(session_id).unwrap(),
+            "fixture".into(),
+            "fixture".into(),
+            temp.path().to_path_buf(),
+            None,
+            vec![],
+            vec![],
+            None,
+            Some("profile".into()),
+        );
+        registry::save(&record).unwrap();
+        registry::fence_for_purge(session_id, "profile", 1).unwrap();
+        let stopped = registry::terminate_and_confirm_stopped(session_id, "profile", 1);
+        request_write(&mut child, "after\n");
+        assert!(
+            stopped.is_err(),
+            "purge confirmed stop while a thread could still write"
+        );
+        assert!(registry::load(session_id).unwrap().is_some());
+        assert!(crate::process::process_group_has_writers(pid, identity).unwrap());
+        child.0.kill().unwrap();
+        child.0.wait().unwrap();
+        assert!(!crate::process::process_group_has_writers(pid, identity).unwrap());
+        registry::terminate_and_confirm_stopped(session_id, "profile", 1).unwrap();
+        assert!(registry::load(session_id).unwrap().is_none());
+    }
 
     #[test]
     fn test_parse_stat_field() {
