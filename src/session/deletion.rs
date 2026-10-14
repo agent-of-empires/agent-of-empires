@@ -4375,13 +4375,36 @@ mod tests {
 
     #[test]
     #[serial]
-    fn unreadable_or_future_journal_does_not_block_another_session() {
-        for future in [false, true] {
+    fn journal_errors_preserve_resources_and_scope_recovery() {
+        #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+        enum Case {
+            Malformed,
+            Future,
+            HigherMalformed,
+            Unidentified,
+            #[cfg(unix)]
+            PermissionDenied,
+        }
+        for case in [
+            Case::Malformed,
+            Case::Future,
+            Case::HigherMalformed,
+            Case::Unidentified,
+            #[cfg(unix)]
+            Case::PermissionDenied,
+        ] {
+            #[cfg(unix)]
+            if case == Case::PermissionDenied && unsafe { libc::geteuid() } == 0 {
+                eprintln!("PermissionDenied observation unavailable with root DAC override");
+                continue;
+            }
+
             let _home = isolate_app_dir();
             let storage = Storage::new_unwatched("isolated-errors").unwrap();
             let bad_workspace = crate::session::scratch::provision_scratch_dir("bad").unwrap();
             let good_workspace = crate::session::scratch::provision_scratch_dir("good").unwrap();
             std::fs::write(bad_workspace.join("retained"), b"unknown intent retained").unwrap();
+            std::fs::write(good_workspace.join("retained"), b"healthy intent").unwrap();
             let mut bad = Instance::new("bad", bad_workspace.to_str().unwrap());
             bad.id = "bad".into();
             bad.source_profile = "isolated-errors".into();
@@ -4392,25 +4415,99 @@ mod tests {
             good.source_profile = "isolated-errors".into();
             good.scratch = true;
             seed_expired_purge(&storage, good, LifecyclePhase::HooksComplete);
-            if future {
-                let mut entry = crate::session::lifecycle_journal::read_deletion(&bad_path)
-                    .unwrap()
+            let mut error_path = bad_path.clone();
+            match case {
+                Case::Malformed => std::fs::write(&error_path, b"malformed").unwrap(),
+                Case::Future => {
+                    let mut entry = crate::session::lifecycle_journal::read_deletion(&bad_path)
+                        .unwrap()
+                        .unwrap();
+                    entry.version += 1;
+                    crate::session::lifecycle_journal::update(&error_path, &entry).unwrap();
+                }
+                Case::HigherMalformed => {
+                    let entry = crate::session::lifecycle_journal::read_deletion(&bad_path)
+                        .unwrap()
+                        .unwrap();
+                    error_path = crate::session::lifecycle_journal::record(
+                        &entry.with_generation(entry.generation + 1),
+                    )
                     .unwrap();
-                entry.version += 1;
-                crate::session::lifecycle_journal::update(&bad_path, &entry).unwrap();
-            } else {
-                std::fs::write(&bad_path, b"malformed").unwrap();
+                    std::fs::write(&error_path, b"malformed higher same SID").unwrap();
+                }
+                Case::Unidentified => {
+                    error_path = bad_path.parent().unwrap().join("unidentifiable.json");
+                    std::fs::write(&error_path, b"unattributable journal bytes").unwrap();
+                }
+                #[cfg(unix)]
+                Case::PermissionDenied => {
+                    use std::os::unix::fs::PermissionsExt as _;
+                    std::fs::set_permissions(&error_path, std::fs::Permissions::from_mode(0o000))
+                        .unwrap();
+                    assert_eq!(
+                        std::fs::read(&error_path).unwrap_err().kind(),
+                        std::io::ErrorKind::PermissionDenied
+                    );
+                    let error = crate::session::lifecycle_journal::deletion_exists(
+                        storage.sessions_path(),
+                        "bad",
+                        1,
+                    )
+                    .unwrap_err();
+                    assert_eq!(
+                        error.downcast_ref::<std::io::Error>().unwrap().kind(),
+                        std::io::ErrorKind::PermissionDenied
+                    );
+                }
             }
+
             recover_lifecycle_journals_once().unwrap();
-            assert!(bad_workspace.join("retained").exists());
-            assert!(bad_path.exists());
-            assert!(
-                !good_workspace.exists(),
-                "unrelated malformed/future journal blocked healthy recovery"
+            #[cfg(unix)]
+            if case == Case::PermissionDenied {
+                use std::os::unix::fs::PermissionsExt as _;
+                std::fs::set_permissions(&error_path, std::fs::Permissions::from_mode(0o600))
+                    .unwrap();
+            }
+            assert_eq!(
+                std::fs::read(bad_workspace.join("retained")).unwrap(),
+                b"unknown intent retained",
+                "{case:?}"
             );
+            assert!(bad_path.exists(), "{case:?}");
+            assert!(error_path.exists(), "{case:?}");
+            let profile_blocked = case == Case::Unidentified;
             let rows = storage.load().unwrap();
-            assert!(rows.iter().any(|row| row.id == "bad"));
-            assert!(!rows.iter().any(|row| row.id == "good"));
+            assert!(
+                rows.iter()
+                    .any(|row| row.id == "bad" && row.status == Status::Deleting),
+                "{case:?}"
+            );
+            assert_eq!(
+                rows.iter().any(|row| row.id == "good"),
+                profile_blocked,
+                "{case:?}"
+            );
+            assert_eq!(good_workspace.exists(), profile_blocked, "{case:?}");
+            if profile_blocked {
+                assert_eq!(
+                    std::fs::read(&error_path).unwrap(),
+                    b"unattributable journal bytes"
+                );
+                assert_eq!(
+                    std::fs::read(good_workspace.join("retained")).unwrap(),
+                    b"healthy intent"
+                );
+            }
+            #[cfg(unix)]
+            if case == Case::PermissionDenied {
+                crate::session::lifecycle_journal::consume(&bad_path).unwrap();
+                assert!(!crate::session::lifecycle_journal::deletion_exists(
+                    storage.sessions_path(),
+                    "bad",
+                    1
+                )
+                .unwrap());
+            }
         }
     }
 
