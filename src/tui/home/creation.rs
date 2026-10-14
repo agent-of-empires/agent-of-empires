@@ -36,6 +36,43 @@ pub(in crate::tui) struct SessionMutationGuards {
     pub(super) _lifecycle: crate::session::StorageFlock,
 }
 
+pub(super) fn resolve_creation_title<'a>(
+    data: &mut NewSessionData,
+    instances: impl Iterator<Item = &'a Instance>,
+) -> anyhow::Result<()> {
+    if !data.title.is_empty() {
+        return Ok(());
+    }
+
+    let profile_instances: Vec<&Instance> = instances
+        .filter(|instance| instance.source_profile == data.profile)
+        .collect();
+    let existing_titles: Vec<&str> = profile_instances
+        .iter()
+        .map(|instance| instance.title.as_str())
+        .collect();
+    let existing_branches: Vec<&str> = profile_instances
+        .iter()
+        .filter_map(|instance| instance.worktree_info.as_ref().map(|w| w.branch.as_str()))
+        .collect();
+    let taken_branches = crate::session::builder::collect_taken_branches_for_derived_dedupe(
+        &existing_branches,
+        &data.path,
+        &data.extra_repo_paths,
+        data.worktree_enabled,
+        data.create_new_branch,
+        data.scratch,
+    );
+    data.title = crate::session::builder::resolve_title(
+        &data.title,
+        data.worktree_branch.as_deref(),
+        data.worktree_enabled,
+        &existing_titles,
+        &taken_branches,
+    )?;
+    Ok(())
+}
+
 impl HomeView {
     /// Request background session creation, used for sandbox sessions so the UI does not
     /// block. A `Status::Creating` stub appears in the list, so progress shows in the
@@ -48,35 +85,8 @@ impl HomeView {
         // Pre-resolve the title with the logic the builder will run, so the stub, the
         // background creation and the final instance agree; otherwise an empty title shows
         // as the path basename in the stub and a civilization name in the instance.
-        if data.title.is_empty() {
-            let existing_titles: Vec<&str> = self
-                .instances()
-                .filter(|i| i.source_profile == data.profile)
-                .map(|i| i.title.as_str())
-                .collect();
-            let existing_branches: Vec<&str> = self
-                .instances()
-                .filter(|i| i.source_profile == data.profile)
-                .filter_map(|i| i.worktree_info.as_ref().map(|w| w.branch.as_str()))
-                .collect();
-            let taken_branches = crate::session::builder::collect_taken_branches_for_derived_dedupe(
-                &existing_branches,
-                &data.path,
-                &data.extra_repo_paths,
-                data.worktree_enabled,
-                data.create_new_branch,
-                data.scratch,
-            );
-            if let Ok(title) = crate::session::builder::resolve_title(
-                &data.title,
-                data.worktree_branch.as_deref(),
-                data.worktree_enabled,
-                &existing_titles,
-                &taken_branches,
-            ) {
-                data.title = title;
-            }
-        }
+        let _ = resolve_creation_title(&mut data, self.instances());
+
         let stub_title = data.title.clone();
         let mut stub = Instance::new(&stub_title, &data.path);
         stub.tool = if data.tool.is_empty() {

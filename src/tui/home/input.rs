@@ -37,6 +37,28 @@ const EMPTY_TRASH_DROP_FAILED: &str = "drop_failed";
 /// 400ms matches most desktop environments.
 const DOUBLE_CLICK_THRESHOLD: std::time::Duration = std::time::Duration::from_millis(400);
 
+fn resolve_hook_approval_launch_cwd(
+    data: &mut NewSessionData,
+    existing_instances: &[crate::session::Instance],
+    config: &crate::session::config::Config,
+) -> anyhow::Result<std::path::PathBuf> {
+    if !data.worktree_enabled {
+        return Ok(std::path::PathBuf::from(&data.path));
+    }
+
+    super::creation::resolve_creation_title(data, existing_instances.iter())?;
+    let existing_branches: Vec<&str> = existing_instances
+        .iter()
+        .filter_map(|instance| instance.worktree_info.as_ref().map(|w| w.branch.as_str()))
+        .collect();
+    let params = crate::session::builder::InstanceParams::from(data.clone());
+    let planned = crate::session::builder::plan_worktree(&params, &existing_branches, config)?
+        .ok_or_else(|| anyhow::anyhow!("worktree mode did not produce a launch path"))?;
+    let launch_cwd = planned.path.clone();
+    data.planned_worktree = Some(planned);
+    Ok(launch_cwd)
+}
+
 /// The two synthetic bottom-of-sidebar sections. Their headers look like groups in
 /// `flat_items` but carry sentinel paths, so the section-scoped context-menu actions
 /// resolve which one the cursor is on here instead of repeating the path checks.
@@ -1685,7 +1707,7 @@ impl HomeView {
                 }
                 None
             }
-            DialogResult::Submit(data) => {
+            DialogResult::Submit(mut data) => {
                 // Check if the tool uses hooks and user hasn't acknowledged yet
                 let tool_name = if data.tool.is_empty() {
                     "claude".to_string()
@@ -1722,11 +1744,27 @@ impl HomeView {
                         && crate::agents::hook_install_required(hook_agent, hooks_enabled)
                         && !acknowledged
                     {
+                        let existing_instances: Vec<_> = self.instances().cloned().collect();
+                        let launch_cwd = match resolve_hook_approval_launch_cwd(
+                            &mut data,
+                            &existing_instances,
+                            &resolved_config,
+                        ) {
+                            Ok(path) => path,
+                            Err(error) => {
+                                if let Some(new_dialog) = &mut self.new_dialog {
+                                    new_dialog.set_error(format!(
+                                        "Cannot resolve agent hook path: {error}"
+                                    ));
+                                }
+                                return None;
+                            }
+                        };
                         let dialog = match HooksInstallDialog::new_for_launch(
                             &tool_name,
                             hook_agent,
                             &resolved_config,
-                            std::path::Path::new(&data.path),
+                            &launch_cwd,
                             &command,
                             &data.extra_args,
                         ) {
@@ -7275,6 +7313,7 @@ mod tests {
             tool: "claude".to_string(),
             worktree_enabled: false,
             worktree_branch: None,
+            planned_worktree: None,
             create_new_branch: false,
             base_branch: None,
             extra_repo_paths: Vec::new(),
@@ -7326,5 +7365,87 @@ mod tests {
             HomeView::volume_ignores_glob_confirm_message(&glob_session_data(path)).is_none(),
             "literal-only ignores must not trigger the gate"
         );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn hook_approval_discloses_relative_omp_dir_from_planned_worktree_cwd() {
+        let temp_home = tempfile::TempDir::new().unwrap();
+        let _home = crate::session::test_support::isolate_home(temp_home.path());
+        let repo_parent = tempfile::TempDir::new().unwrap();
+        let project = repo_parent.path().join("source");
+        std::fs::create_dir_all(&project).unwrap();
+        let repo = git2::Repository::init(&project).unwrap();
+        let signature = git2::Signature::now("Test", "test@example.com").unwrap();
+        std::fs::write(project.join("README.md"), "source\\n").unwrap();
+        let tree_id = {
+            let mut index = repo.index().unwrap();
+            index.add_path(std::path::Path::new("README.md")).unwrap();
+            index.write_tree().unwrap()
+        };
+        let tree = repo.find_tree(tree_id).unwrap();
+        repo.commit(Some("HEAD"), &signature, &signature, "init", &tree, &[])
+            .unwrap();
+
+        let mut data = glob_session_data(project.to_str().unwrap());
+        data.profile = "default".to_string();
+        data.title = "Hook cwd".to_string();
+        data.tool = "omp".to_string();
+        data.worktree_enabled = true;
+        data.worktree_branch = Some("hook-cwd".to_string());
+        data.create_new_branch = true;
+        data.sandbox = false;
+
+        let profile_dir = crate::session::get_profile_dir("default").unwrap();
+        std::fs::create_dir_all(&profile_dir).unwrap();
+        std::fs::write(
+            profile_dir.join("config.toml"),
+            format!(
+                "environment = [\"HOME={}\", \"PI_CODING_AGENT_DIR=relative-agent\"]\n",
+                temp_home.path().display()
+            ),
+        )
+        .unwrap();
+        let config = crate::session::config::profile_config::resolve_config_or_warn("default");
+        let launch_cwd = resolve_hook_approval_launch_cwd(&mut data, &[], &config).unwrap();
+        assert_ne!(launch_cwd, project);
+
+        let agent = crate::agents::get_agent("omp").expect("OMP agent");
+        let disclosure = crate::session::host_hook_disclosure_for_launch(
+            "omp",
+            agent,
+            &config,
+            &launch_cwd,
+            "omp",
+            "",
+        )
+        .unwrap();
+        assert_eq!(
+            disclosure.settings_paths,
+            vec![launch_cwd
+                .join("relative-agent/hooks/pre/aoe-status.ts")
+                .to_string_lossy()
+                .into_owned()]
+        );
+
+        let build = crate::session::builder::build_instance(
+            crate::session::builder::InstanceParams::from(data),
+            &[],
+            &[],
+            "default",
+        )
+        .unwrap();
+        let final_cwd = std::path::PathBuf::from(&build.instance.project_path);
+        let installed_target = crate::session::host_hook_disclosure_for_launch(
+            "omp",
+            agent,
+            &config,
+            &final_cwd,
+            &build.instance.command,
+            &build.instance.extra_args,
+        )
+        .unwrap();
+        assert_eq!(disclosure.settings_paths, installed_target.settings_paths);
+        assert!(final_cwd.is_dir());
     }
 }

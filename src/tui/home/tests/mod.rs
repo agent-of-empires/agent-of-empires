@@ -418,6 +418,7 @@ fn creation_data(project_dir: &std::path::Path, title: &str, group: &str) -> New
         tool: "claude".to_string(),
         worktree_enabled: false,
         worktree_branch: None,
+        planned_worktree: None,
         create_new_branch: false,
         base_branch: None,
         extra_repo_paths: Vec::new(),

@@ -5,7 +5,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use anyhow::{bail, Result};
+use anyhow::{bail, Context, Result};
 use chrono::Utc;
 
 use crate::containers;
@@ -63,6 +63,8 @@ pub struct InstanceParams {
     pub create_new_branch: bool,
     /// Branch to base a freshly-created worktree branch on.
     pub base_branch: Option<String>,
+    /// Worktree branch and final cwd disclosed by the TUI before hook consent.
+    pub(crate) planned_worktree: Option<PlannedWorktree>,
     pub sandbox: bool,
     /// The sandbox image to use. Required when sandbox is true.
     pub sandbox_image: String,
@@ -85,6 +87,14 @@ pub struct InstanceParams {
     /// One-shot fork seed. When `Some`, the freshly-built instance is set up
     /// to fork its parent on first launch instead of starting fresh.
     pub fork_seed: Option<crate::session::ForkSeed>,
+}
+
+/// A worktree location fixed before the approval dialog so creation cannot
+/// disclose one hook target and later launch in another directory.
+#[derive(Debug, Clone)]
+pub(crate) struct PlannedWorktree {
+    pub(crate) branch: String,
+    pub(crate) path: PathBuf,
 }
 
 /// Result of building an instance, tracking what was created for cleanup purposes.
@@ -238,14 +248,38 @@ pub fn create_workspace(
     workspace_template: &str,
     init_submodules: bool,
 ) -> Result<WorkspaceResult> {
+    create_workspace_with_path(
+        primary,
+        extra_repos,
+        branch,
+        create_new_branch,
+        workspace_template,
+        init_submodules,
+        None,
+    )
+}
+
+fn create_workspace_with_path(
+    primary: &WorkspaceRepoSpec,
+    extra_repos: &[WorkspaceRepoSpec],
+    branch: &str,
+    create_new_branch: bool,
+    workspace_template: &str,
+    init_submodules: bool,
+    workspace_path_override: Option<&Path>,
+) -> Result<WorkspaceResult> {
     let primary_main_repo = GitWorktree::find_main_repo(&primary.path)?;
     let primary_git_wt = GitWorktree::new(primary_main_repo)?;
 
-    let session_id = uuid::Uuid::new_v4().to_string();
-    let session_id_short = &session_id[..8];
-
-    let workspace_path =
-        primary_git_wt.compute_path(branch, workspace_template, session_id_short)?;
+    let workspace_path = if let Some(path) = workspace_path_override {
+        if path.exists() {
+            bail!("Workspace path already exists: {}", path.display());
+        }
+        path.to_path_buf()
+    } else {
+        let session_id = uuid::Uuid::new_v4().to_string();
+        primary_git_wt.compute_path(branch, workspace_template, &session_id[..8])?
+    };
     let workspace_dir = workspace_path.to_string_lossy().to_string();
     std::fs::create_dir_all(&workspace_path)?;
 
@@ -523,22 +557,15 @@ pub fn build_instance(
         existing_titles,
         &taken_branches,
     )?;
-    let branch_source = resolve_worktree_branch(
-        params.worktree_enabled,
-        params.worktree_branch.as_deref(),
-        &final_title,
-    );
-
-    let effective_worktree_branch: Option<String> = match branch_source {
-        None => None,
-        Some(BranchSource::Explicit(name)) => Some(name),
-        Some(BranchSource::Derived(name)) => {
-            if params.create_new_branch {
-                Some(dedupe_branch_name(&name, &taken_branches))
-            } else {
-                Some(name)
-            }
+    let resolved_worktree_branch =
+        effective_worktree_branch(&params, &final_title, &taken_branches);
+    let effective_worktree_branch = if let Some(planned) = &params.planned_worktree {
+        if resolved_worktree_branch.as_deref() != Some(planned.branch.as_str()) {
+            bail!("The planned worktree branch changed before session creation");
         }
+        Some(planned.branch.clone())
+    } else {
+        resolved_worktree_branch
     };
 
     if let Some(branch) = &effective_worktree_branch {
@@ -580,13 +607,17 @@ pub fn build_instance(
                 })
                 .collect();
 
-            let ws_result = create_workspace(
+            let ws_result = create_workspace_with_path(
                 &primary,
                 &extra_repos,
                 branch,
                 params.create_new_branch,
                 &config.worktree.workspace_path_template,
                 config.worktree.init_submodules,
+                params
+                    .planned_worktree
+                    .as_ref()
+                    .map(|planned| planned.path.as_path()),
             )?;
 
             final_path = ws_result.workspace_path.to_string_lossy().to_string();
@@ -621,12 +652,19 @@ pub fn build_instance(
                 &config.worktree.path_template
             };
 
+            let planned_path = params
+                .planned_worktree
+                .as_ref()
+                .map(|planned| planned.path.as_path());
             if !params.create_new_branch {
                 let existing_worktrees = git_wt.list_worktrees()?;
                 if let Some(existing) = existing_worktrees
                     .iter()
                     .find(|wt| wt.branch.as_deref() == Some(branch))
                 {
+                    if planned_path.is_some_and(|path| existing.path.as_path() != path) {
+                        bail!("The selected worktree path changed before session creation");
+                    }
                     final_path = existing.path.to_string_lossy().to_string();
                     worktree_info = Some(WorktreeInfo {
                         branch: branch.clone(),
@@ -636,8 +674,12 @@ pub fn build_instance(
                         base_branch: None,
                     });
                 } else {
-                    let session_id = uuid::Uuid::new_v4().to_string();
-                    let worktree_path = git_wt.compute_path(branch, template, &session_id[..8])?;
+                    let worktree_path = if let Some(path) = planned_path {
+                        path.to_path_buf()
+                    } else {
+                        let session_id = uuid::Uuid::new_v4().to_string();
+                        git_wt.compute_path(branch, template, &session_id[..8])?
+                    };
 
                     let w = git_wt.create_worktree(branch, &worktree_path, false, None)?;
                     warnings.extend(w);
@@ -657,8 +699,12 @@ pub fn build_instance(
                     });
                 }
             } else {
-                let session_id = uuid::Uuid::new_v4().to_string();
-                let worktree_path = git_wt.compute_path(branch, template, &session_id[..8])?;
+                let worktree_path = if let Some(path) = planned_path {
+                    path.to_path_buf()
+                } else {
+                    let session_id = uuid::Uuid::new_v4().to_string();
+                    git_wt.compute_path(branch, template, &session_id[..8])?
+                };
 
                 if worktree_path.exists() {
                     return Err(GitError::WorktreeAlreadyExists(worktree_path.clone()).into());
@@ -1161,6 +1207,107 @@ fn resolve_worktree_branch(
             None => BranchSource::Derived(branch_name_from_title(final_title)),
         },
     )
+}
+
+fn effective_worktree_branch(
+    params: &InstanceParams,
+    final_title: &str,
+    taken_branches: &HashSet<String>,
+) -> Option<String> {
+    match resolve_worktree_branch(
+        params.worktree_enabled,
+        params.worktree_branch.as_deref(),
+        final_title,
+    )? {
+        BranchSource::Explicit(name) => Some(name),
+        BranchSource::Derived(name) => Some(if params.create_new_branch {
+            dedupe_branch_name(&name, taken_branches)
+        } else {
+            name
+        }),
+    }
+}
+
+pub(crate) fn plan_worktree(
+    params: &InstanceParams,
+    existing_branches: &[&str],
+    config: &Config,
+) -> Result<Option<PlannedWorktree>> {
+    if !params.worktree_enabled {
+        return Ok(None);
+    }
+    if params.title.is_empty() {
+        bail!("Cannot plan a worktree before resolving the session title");
+    }
+
+    let taken_branches = collect_taken_branches_for_derived_dedupe(
+        existing_branches,
+        &params.path,
+        &params.extra_repo_paths,
+        params.worktree_enabled,
+        params.create_new_branch,
+        params.scratch,
+    );
+    let branch = effective_worktree_branch(params, &params.title, &taken_branches)
+        .context("worktree mode did not resolve a branch")?;
+
+    let path = if !params.extra_repo_paths.is_empty() {
+        let primary_path = PathBuf::from(&params.path)
+            .canonicalize()
+            .unwrap_or_else(|_| PathBuf::from(&params.path));
+        let primary_main_repo = GitWorktree::find_main_repo(&primary_path)?;
+        let primary_git_wt = GitWorktree::new(primary_main_repo)?;
+        let session_id = uuid::Uuid::new_v4().to_string();
+        primary_git_wt.compute_path(
+            &branch,
+            &config.worktree.workspace_path_template,
+            &session_id[..8],
+        )?
+    } else {
+        let path = PathBuf::from(&params.path);
+        if !GitWorktree::is_git_repo(&path) {
+            return Err(anyhow::Error::new(GitError::NotAGitRepo).context(format!(
+                "Worktree mode requires a git repository, but this path is not one: {}\n\
+                 Tip: start an in-place session (no worktree) here, or point at a git repository.",
+                path.display()
+            )));
+        }
+        let main_repo_path_raw = GitWorktree::find_main_repo(&path)?;
+        let main_repo_path = main_repo_path_raw
+            .canonicalize()
+            .unwrap_or(main_repo_path_raw);
+        let git_wt = GitWorktree::new(main_repo_path.clone())?;
+
+        if !params.create_new_branch {
+            if let Some(existing) = git_wt
+                .list_worktrees()?
+                .iter()
+                .find(|worktree| worktree.branch.as_deref() == Some(branch.as_str()))
+            {
+                existing.path.clone()
+            } else {
+                let session_id = uuid::Uuid::new_v4().to_string();
+                let is_bare = GitWorktree::is_bare_repo(&main_repo_path);
+                let template = if is_bare {
+                    &config.worktree.bare_repo_path_template
+                } else {
+                    &config.worktree.path_template
+                };
+                git_wt.compute_path(&branch, template, &session_id[..8])?
+            }
+        } else {
+            let session_id = uuid::Uuid::new_v4().to_string();
+            let is_bare = GitWorktree::is_bare_repo(&main_repo_path);
+            let template = if is_bare {
+                &config.worktree.bare_repo_path_template
+            } else {
+                &config.worktree.path_template
+            };
+            git_wt.compute_path(&branch, template, &session_id[..8])?
+        }
+    };
+
+    Ok(Some(PlannedWorktree { branch, path }))
 }
 
 /// Replace characters that git ref names cannot contain (per `git-check-ref-format(1)`) with '-'.
@@ -1908,6 +2055,7 @@ mod tests {
             worktree_enabled: false,
             worktree_branch: None,
             create_new_branch: false,
+            planned_worktree: None,
             base_branch: None,
             sandbox: false,
             sandbox_image: "ubuntu:latest".to_string(),
@@ -2118,6 +2266,7 @@ mod tests {
             worktree_branch: None,
             create_new_branch: false,
             base_branch: None,
+            planned_worktree: None,
             sandbox: false,
             sandbox_image: String::new(),
             yolo_mode: false,
@@ -2174,6 +2323,7 @@ mod tests {
             worktree_branch: None,
             create_new_branch: false,
             base_branch: None,
+            planned_worktree: None,
             sandbox: false,
             sandbox_image: String::new(),
             yolo_mode: false,

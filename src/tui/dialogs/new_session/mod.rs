@@ -104,6 +104,7 @@ pub struct NewSessionData {
     pub tool: String,
     pub worktree_enabled: bool,
     pub worktree_branch: Option<String>,
+    pub(crate) planned_worktree: Option<crate::session::builder::PlannedWorktree>,
     pub create_new_branch: bool,
     /// Base for the new worktree branch, only read when `create_new_branch`.
     /// `None` falls back to the repository's default branch.
@@ -142,6 +143,7 @@ impl From<NewSessionData> for crate::session::builder::InstanceParams {
             tool: data.tool,
             worktree_enabled: data.worktree_enabled,
             worktree_branch: data.worktree_branch,
+            planned_worktree: data.planned_worktree,
             create_new_branch: data.create_new_branch,
             base_branch: data.base_branch,
             sandbox: data.sandbox,
@@ -2205,6 +2207,7 @@ impl NewSessionDialog {
             tool: self.available_tools[self.tool_index].clone(),
             worktree_enabled: !self.scratch && self.worktree_enabled,
             worktree_branch,
+            planned_worktree: None,
             create_new_branch: self.create_new_branch,
             base_branch,
             extra_repo_paths: if !self.scratch && self.worktree_enabled {
