@@ -1528,8 +1528,7 @@ mod tests {
         let mut inst = tool_instance("pi", project.to_str().unwrap());
         let mut sandbox = test_sandbox("aoe-pi-argv", Some("/workspace"));
         sandbox.extra_env = Some(vec![
-            "AOE_SESSION_ROOT_ONLY=1".to_string(),
-            "PI_CODING_AGENT_SESSION_DIR=/root/.pi/agent/sessions".to_string(),
+            "PI_CODING_AGENT_SESSION_DIR=/root/.pi/agent/sessions".to_string()
         ]);
         inst.sandbox_info = Some(sandbox);
         admit_sandbox_fixture(&inst);
@@ -1547,7 +1546,6 @@ mod tests {
             inst.id
         );
 
-        // Native container launches carry the publisher through the exec environment file.
         let execution = inst.resolve_native_execution(None).unwrap();
         let docker_env = execution.inputs.docker_env.as_ref().unwrap();
         let value = |key| {
@@ -1562,7 +1560,6 @@ mod tests {
             value("AOE_SESSION_ID_FILE"),
             Some(sidecar.split_once('=').unwrap().1)
         );
-        assert_eq!(value("AOE_SESSION_ROOT_ONLY"), Some("0"));
 
         let parts = inst
             .build_launch_command(Some(&execution), &mut inst.conversation_state())
@@ -1598,7 +1595,6 @@ mod tests {
         let command = parts.command.unwrap();
         assert!(command.contains(" -e "), "{command}");
         assert!(command.contains("AOE_SESSION_ID_FILE="));
-        assert!(command.contains("AOE_SESSION_ROOT_ONLY=0"));
         assert!(alias.pi_extension_launched);
 
         let mut wrapper = Instance::new("pi alias wrapper", "/tmp/pi-alias-wrapper");

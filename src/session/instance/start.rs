@@ -694,6 +694,7 @@ mod tests {
             let _home = crate::session::test_support::isolate_home(directory.path());
             let project = directory.path().join("project");
             std::fs::create_dir(&project).unwrap();
+            let project = std::fs::canonicalize(project).unwrap();
             let record = directory.path().join("launch.json");
             let database = directory.path().join("opencode.db");
             if version != "2.0.24+31bdd8e" {
