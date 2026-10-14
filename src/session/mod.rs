@@ -321,7 +321,6 @@ pub fn format_debug_namespace_warning(release: &Path, dev: &Path) -> String {
 }
 
 pub fn get_profile_dir(profile: &str) -> Result<PathBuf> {
-    let base = get_app_dir()?;
     let resolved;
     let profile_name = if profile.is_empty() {
         resolved = config::resolve_default_profile();
@@ -329,6 +328,8 @@ pub fn get_profile_dir(profile: &str) -> Result<PathBuf> {
     } else {
         profile
     };
+    validate_profile_name(profile_name)?;
+    let base = get_app_dir()?;
     let _transition = storage::acquire_storage_shared_flock(
         &base,
         crate::migrations::v027_isolate_sandbox_stores::LOCK,
@@ -346,7 +347,6 @@ pub fn get_profile_dir(profile: &str) -> Result<PathBuf> {
 
 /// Resolve the on-disk profile directory path WITHOUT creating it.
 pub fn get_profile_dir_path(profile: &str) -> Result<PathBuf> {
-    let base = get_app_dir()?;
     let resolved;
     let profile_name = if profile.is_empty() {
         resolved = config::default_profile_name();
@@ -354,6 +354,8 @@ pub fn get_profile_dir_path(profile: &str) -> Result<PathBuf> {
     } else {
         profile
     };
+    validate_profile_name(profile_name)?;
+    let base = get_app_dir()?;
     Ok(base.join("profiles").join(profile_name))
 }
 
@@ -1151,7 +1153,15 @@ mod tests {
 
     #[test]
     fn validate_profile_name_accepts_existing_dirs_and_rejects_traversal() {
-        for name in ["work", "personal", "client-a", ".hidden", "1", "main"] {
+        for name in [
+            "work",
+            "personal",
+            "client-a",
+            "stray with spaces",
+            ".hidden",
+            "1",
+            "main",
+        ] {
             validate_profile_name(name)
                 .unwrap_or_else(|e| panic!("expected {name:?} to validate: {e}"));
         }
@@ -1159,6 +1169,17 @@ mod tests {
             validate_profile_name(bad)
                 .err()
                 .unwrap_or_else(|| panic!("expected {bad:?} to be rejected"));
+        }
+    }
+
+    #[test]
+    fn profile_dir_path_rejects_traversal_before_resolving_app_dir() {
+        for bad in ["../outside", r"..\outside", "/outside", "a/b"] {
+            for result in [get_profile_dir_path(bad), get_profile_dir(bad)] {
+                result
+                    .err()
+                    .unwrap_or_else(|| panic!("expected profile path {bad:?} to be rejected"));
+            }
         }
     }
 
