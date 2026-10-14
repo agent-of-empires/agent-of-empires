@@ -16,10 +16,15 @@ interface TerminalKeyLike {
 export function altPrintableMetaKey(
   e: { key: string; code: string; shiftKey: boolean },
   layoutMap: KeyboardLayoutReader | null,
+  isMac: boolean,
 ): string | null {
   if (e.key === "Dead") return null;
   const code = e.key.length === 1 ? e.key.charCodeAt(0) : 0;
-  if (code >= 0x20 && code <= 0x7e) return e.key;
+  if (code >= 0x20 && code <= 0x7e) {
+    // On macOS Option never yields a bare ASCII Meta key: ASCII here is the layout's Option layer
+    // (Czech Option+ů is ";"), which is text.
+    return isMac ? null : e.key;
+  }
   // macOS Option+letter composes a symbol (Option+V is "√"): recover the letter from the logical
   // layout map when available (AZERTY KeyQ is "a"), else from the physical key. Letters only.
   if (!/^Key[A-Z]$/.test(e.code)) return null;
