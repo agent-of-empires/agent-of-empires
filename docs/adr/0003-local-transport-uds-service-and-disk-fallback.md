@@ -2,7 +2,7 @@
 
 Status: proposed. Decides #4399 (part of #2734). Terms follow `CONTEXT.md`: **Daemon** is the `aoe serve` process, a **Client** is the TUI, CLI or Web dashboard that pilots it, a **Principal** is who a request to the Daemon acts as.
 
-#3839 settled the same REST+WS routes over a local Unix socket and remote TCP, with kernel peer credentials and no bearer on the Unix socket. #3838 settled a hard fail with reconnect guidance when no Daemon is reachable, with no on-disk cache. #4136 serves CLI reads over a Unix socket on Linux only and falls back to on-disk storage elsewhere. This ADR accepts #4136 as a bounded wave 1, fixes the transport per platform, and says what removes the fallback.
+Issue #3839 settled the same REST+WS routes over a local Unix socket and remote TCP, with kernel peer credentials and no bearer on the Unix socket. #3838 settled a hard fail with reconnect guidance when no Daemon is reachable, with no on-disk cache. #4136 serves CLI reads over a Unix socket on Linux only and falls back to on-disk storage elsewhere. This ADR accepts #4136 as a bounded wave 1, fixes the transport per platform, and says what removes the fallback.
 
 ## Decision
 
