@@ -56,6 +56,8 @@ mod profile_picker;
 mod project_registry;
 mod purge_restore_race;
 mod remote_home_e2e;
+#[cfg(target_os = "linux")]
+mod remove_structured_runner;
 mod resume_fallback;
 mod sandbox;
 mod send_structured_e2e;
