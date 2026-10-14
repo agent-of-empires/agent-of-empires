@@ -221,9 +221,8 @@ describe("ListField with a controlled parent", () => {
     await waitFor(() => expect(rows()).toEqual(["c"]));
     const input = screen.getByDisplayValue("x");
     fireEvent.keyDown(input, { key: "Enter" });
-    await waitFor(() => expect(screen.queryByRole("textbox")).toBeNull());
-    expect(screen.getByText("x")).toBeTruthy();
-    expect(screen.getByText("c")).toBeTruthy();
+    await waitFor(() => expect(rows()).toEqual(["x", "c"]));
+    expect(screen.queryByRole("textbox")).toBeNull();
   });
 
   it("keeps editing the last entry after an earlier one is removed", async () => {

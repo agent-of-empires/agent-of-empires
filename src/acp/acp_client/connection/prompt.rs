@@ -408,6 +408,14 @@ impl Session {
             Some(ClientCmd::FlushForTest(done)) => {
                 let _ = done.send(());
             }
+            Some(ClientCmd::CloseSession(respond_to)) => {
+                crate::acp::acp_client::close::dispatch_close(
+                    &self.connection,
+                    self.acp_session_id.clone(),
+                    self.close_capable,
+                    respond_to,
+                );
+            }
             Some(ClientCmd::Shutdown) | None => {
                 info!(
                     target: "acp.protocol",

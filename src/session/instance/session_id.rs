@@ -165,7 +165,7 @@ impl Instance {
             ResumeIntent::Default => {}
         }
 
-        match self.prime_root_publication() {
+        match self.prime_root_publication(false) {
             Some(PrimeRootPublication::Ready(id))
                 if !self.is_capture_excluded(
                     &id,

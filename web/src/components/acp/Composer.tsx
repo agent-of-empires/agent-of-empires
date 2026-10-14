@@ -9,7 +9,7 @@ import { AtSign, Paperclip, Pencil, Slash } from "lucide-react";
 import { useFocusTerminalTarget } from "../../hooks/useFocusTerminalTarget";
 import { useMobileKeyboard } from "../../hooks/useMobileKeyboard";
 import { useSkillIndex } from "../../hooks/useSkillIndex";
-import { clearDraft, clearDraftAttachments } from "../../lib/acpDrafts";
+import { clearDraft } from "../../lib/acpDrafts";
 import type { AcpState, PromptAttachmentInput, PromptCapabilities, QueuedPrompt } from "../../lib/acpTypes";
 import { isIOS, isStandalone } from "../../lib/platform";
 import { sessionEntries } from "../../lib/pluginUi";
@@ -491,7 +491,6 @@ function sendFromTextarea(
   void enqueuePrompt(text, attachments.length > 0 ? attachments : undefined);
   client.setText("");
   clearDraft(sessionId);
-  clearDraftAttachments(sessionId);
   clearAttachments();
   if (taRef.current) taRef.current.style.height = "auto";
 }

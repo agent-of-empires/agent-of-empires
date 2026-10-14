@@ -445,6 +445,21 @@ async fn readopt_orphan_runners(state: &Arc<AppState>, attempted: &mut HashSet<S
     }
 }
 
+struct OrphanCleanupClaim {
+    state: Arc<AppState>,
+    identity: (String, u32, u64),
+}
+
+impl Drop for OrphanCleanupClaim {
+    fn drop(&mut self) {
+        self.state
+            .acp_orphan_cleanups
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .remove(&self.identity);
+    }
+}
+
 /// Reaps registry entries whose session no longer exists.
 async fn sweep_orphan_workers(state: &Arc<AppState>, live: &HashSet<&String>) {
     let Ok(records) = crate::process::worker_registry::list() else {
@@ -456,19 +471,30 @@ async fn sweep_orphan_workers(state: &Arc<AppState>, live: &HashSet<&String>) {
         {
             continue;
         }
-        tracing::info!(
-            target: "acp.supervisor",
-            session = %record.session_id,
-            pid = record.pid,
-            "sweeping orphan worker (no matching session on disk)"
-        );
-        // Group kill with escalation, detached so one stubborn orphan cannot stall the sweep (#1921).
-        #[cfg(unix)]
-        tokio::spawn(crate::process::worker::reap_group_escalating(
-            record.pid,
-            Duration::from_secs(2),
-        ));
-        crate::process::worker_registry::delete(&record.session_id).ok();
+        let identity = (record.session_id.clone(), record.pid, record.generation);
+        if !state
+            .acp_orphan_cleanups
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .insert(identity.clone())
+        {
+            continue;
+        }
+        let claim = Arc::new(OrphanCleanupClaim {
+            state: Arc::clone(state),
+            identity,
+        });
+        tracing::info!(target: "acp.supervisor", session = %record.session_id, pid = record.pid,
+            "orphan acp worker; settling owned native runtime");
+        tokio::spawn(async move {
+            let session_id = record.session_id.clone();
+            if let Err(error) =
+                crate::process::worker_registry::terminate_record_and_wait(record, claim).await
+            {
+                tracing::warn!(target: "acp.supervisor", session = %session_id, %error,
+                    "orphan native cleanup unproven; retaining registry route");
+            }
+        });
     }
 }
 
@@ -476,6 +502,126 @@ async fn sweep_orphan_workers(state: &Arc<AppState>, live: &HashSet<&String>) {
 mod tests {
     use super::test_fixtures::{capacity_startup_errors, test_state, Tick};
     use super::*;
+
+    #[test]
+    #[serial_test::serial]
+    fn orphan_claim_survives_cancellation_until_blocking_cleanup_finishes() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .max_blocking_threads(1)
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let (_app, state, project) = test_state("live-session");
+            let log = project.path().join("cleanup-calls");
+            let program = project.path().join("unavailable-prime");
+            std::fs::write(
+                &program,
+                format!(
+                    "#!/bin/sh\nprintf 'entered\n' >> {}\nexit 1\n",
+                    crate::session::environment::shell_escape(&log.to_string_lossy())
+                ),
+            )
+            .unwrap();
+            std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700)).unwrap();
+            let native =
+                crate::process::prime::PrimeRuntime::new(program, project.path().into(), None)
+                    .unwrap();
+            native.prepare().unwrap();
+            struct RuntimeDirectory(std::path::PathBuf);
+            impl Drop for RuntimeDirectory {
+                fn drop(&mut self) {
+                    let _ = std::fs::remove_dir_all(&self.0);
+                }
+            }
+            let _directory = RuntimeDirectory(native.directory.clone());
+            let mut record = crate::process::worker_registry::WorkerRecord::new(
+                "orphan-prime".into(),
+                i32::MAX as u32,
+                crate::process::worker_registry::socket_path_for("orphan-prime").unwrap(),
+                "prime-agent".into(),
+                "prime-agent".into(),
+                project.path().into(),
+                None,
+                vec![],
+                vec![],
+                None,
+                None,
+            );
+            record.prime_runtime = Some(native);
+            crate::process::worker_registry::save(&record).unwrap();
+            let identity = (record.session_id.clone(), record.pid, record.generation);
+            state
+                .acp_orphan_cleanups
+                .lock()
+                .unwrap()
+                .insert(identity.clone());
+            let claim = Arc::new(OrphanCleanupClaim {
+                state: state.clone(),
+                identity: identity.clone(),
+            });
+            let weak = Arc::downgrade(&claim);
+            let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+            let (release_tx, release_rx) = std::sync::mpsc::channel();
+            let blocker = tokio::task::spawn_blocking(move || {
+                ready_tx.send(()).unwrap();
+                release_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            });
+            ready_rx.recv().unwrap();
+            let task = tokio::spawn(crate::process::worker_registry::terminate_record_and_wait(
+                record.clone(),
+                claim,
+            ));
+            tokio::time::timeout(Duration::from_secs(2), async {
+                while weak.strong_count() != 2 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            task.abort();
+            assert!(task.await.unwrap_err().is_cancelled());
+            assert!(state
+                .acp_orphan_cleanups
+                .lock()
+                .unwrap()
+                .contains(&identity));
+            for _ in 0..2 {
+                sweep_orphan_workers(&state, &HashSet::new()).await;
+            }
+            release_tx.send(()).unwrap();
+            blocker.await.unwrap();
+            tokio::time::timeout(Duration::from_secs(2), async {
+                while weak.strong_count() != 0 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            assert!(crate::process::worker_registry::load(&record.session_id)
+                .unwrap()
+                .is_some());
+            let duplicate = tokio::time::timeout(Duration::from_millis(100), async {
+                loop {
+                    if std::fs::read_to_string(&log).unwrap().lines().count() > 1 {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await;
+            assert!(
+                duplicate.is_err(),
+                "another tick ran native cleanup concurrently"
+            );
+            assert!(!state
+                .acp_orphan_cleanups
+                .lock()
+                .unwrap()
+                .contains(&identity));
+        });
+    }
 
     #[test]
     fn park_message_classifies_missing_project_path() {

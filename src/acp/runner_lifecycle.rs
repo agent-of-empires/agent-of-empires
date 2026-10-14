@@ -3,16 +3,56 @@
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
-/// Exact identity of a runner process: its pid plus the generation stamped
-/// into its registry record at spawn. Generation 0 (older records) matches on pid alone.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Registry generation and kernel birth identity of one runner.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct RunnerIdentity {
     pub pid: u32,
     pub generation: u64,
+    pub birth_fingerprint: Option<crate::process::ProcessBirthFingerprint>,
 }
 
 impl RunnerIdentity {
-    /// Whether a registry record still describes this runner.
+    pub fn unattested(pid: u32, generation: u64) -> Self {
+        Self {
+            pid,
+            generation,
+            birth_fingerprint: None,
+        }
+    }
+
+    pub fn from_record(record: &crate::process::worker_registry::WorkerRecord) -> Self {
+        Self {
+            pid: record.pid,
+            generation: record.generation,
+            birth_fingerprint: record
+                .runner_identity
+                .as_ref()
+                .map(|identity| identity.fingerprint()),
+        }
+    }
+
+    pub fn owns_record(&self, record: &crate::process::worker_registry::WorkerRecord) -> bool {
+        self.matches_record(record.pid, record.generation)
+            && self.birth_fingerprint
+                == record
+                    .runner_identity
+                    .as_ref()
+                    .map(|identity| identity.fingerprint())
+    }
+    pub fn disowns_record(&self, record: &crate::process::worker_registry::WorkerRecord) -> bool {
+        !self.matches_record(record.pid, record.generation)
+            || self
+                .birth_fingerprint
+                .zip(
+                    record
+                        .runner_identity
+                        .as_ref()
+                        .map(|identity| identity.fingerprint()),
+                )
+                .is_some_and(|(expected, current)| expected != current)
+    }
+
+    /// Whether the PID and registry generation match, including legacy generations.
     pub fn matches_record(&self, pid: u32, generation: u64) -> bool {
         self.pid == pid
             && (self.generation == 0 || generation == 0 || self.generation == generation)
@@ -123,31 +163,64 @@ pub enum StopDecision {
 /// Process signalling and liveness, so teardown can be driven against a
 /// fake in tests without spawning anything.
 pub trait ProcessControl: Send + Sync + 'static {
-    fn is_alive(&self, pid: u32) -> bool;
-    fn terminate_group(&self, pid: u32);
-    fn kill_group(&self, pid: u32);
+    fn is_alive(&self, identity: RunnerIdentity) -> bool;
+    fn terminate_group(&self, identity: RunnerIdentity);
+    fn kill_group(&self, identity: RunnerIdentity);
+    fn forget(&self, identity: RunnerIdentity);
     /// Stops every systemd scope of the session, sweeping processes that
     /// escaped the runner's group. Blocking and bounded.
     fn release_scope(&self, session_id: &str);
 }
 
-pub struct SystemProcessControl;
+#[derive(Default)]
+pub struct SystemProcessControl {
+    guards: std::sync::Mutex<HashMap<RunnerIdentity, crate::process::RunnerProcessGuard>>,
+}
+
+impl SystemProcessControl {
+    fn with_guard<T>(
+        &self,
+        identity: RunnerIdentity,
+        action: impl FnOnce(&crate::process::RunnerProcessGuard) -> anyhow::Result<T>,
+    ) -> anyhow::Result<T> {
+        let mut guards = self
+            .guards
+            .lock()
+            .map_err(|_| anyhow::anyhow!("runner guard lock poisoned"))?;
+        if let std::collections::hash_map::Entry::Vacant(entry) = guards.entry(identity) {
+            entry.insert(crate::process::RunnerProcessGuard::capture(
+                identity.pid,
+                identity.birth_fingerprint,
+            )?);
+        }
+        action(&guards[&identity])
+    }
+}
 
 impl ProcessControl for SystemProcessControl {
-    /// pid 0 addresses the caller's own group and is never a runner.
-    fn is_alive(&self, pid: u32) -> bool {
-        pid != 0 && crate::process::worker::is_pid_alive_and_ours(pid)
+    fn is_alive(&self, identity: RunnerIdentity) -> bool {
+        if identity.pid == 0 {
+            return false;
+        }
+        self.with_guard(identity, |guard| guard.executing())
+            .unwrap_or(true)
     }
 
-    fn terminate_group(&self, pid: u32) {
-        if pid != 0 {
-            crate::process::worker::terminate_process_group(pid);
+    fn terminate_group(&self, identity: RunnerIdentity) {
+        if let Err(error) = self.with_guard(identity, |guard| guard.signal(libc::SIGTERM)) {
+            tracing::warn!(pid = identity.pid, %error, "runner termination unproven");
         }
     }
 
-    fn kill_group(&self, pid: u32) {
-        if pid != 0 {
-            crate::process::worker::kill_process_group(pid);
+    fn kill_group(&self, identity: RunnerIdentity) {
+        if let Err(error) = self.with_guard(identity, |guard| guard.signal(libc::SIGKILL)) {
+            tracing::warn!(pid = identity.pid, %error, "runner termination unproven");
+        }
+    }
+
+    fn forget(&self, identity: RunnerIdentity) {
+        if let Ok(mut guards) = self.guards.lock() {
+            guards.remove(&identity);
         }
     }
 
@@ -608,7 +681,7 @@ impl LifecycleTable {
 /// Scripted process control for lifecycle tests.
 #[cfg(test)]
 pub(crate) mod test_support {
-    use super::{ProcessControl, WorkerPhase};
+    use super::{ProcessControl, RunnerIdentity, WorkerPhase};
     use std::collections::HashSet;
     use std::sync::Mutex;
 
@@ -666,11 +739,12 @@ pub(crate) mod test_support {
     }
 
     impl ProcessControl for FakeProcessControl {
-        fn is_alive(&self, pid: u32) -> bool {
-            self.alive.lock().unwrap().contains(&pid)
+        fn is_alive(&self, identity: RunnerIdentity) -> bool {
+            self.alive.lock().unwrap().contains(&identity.pid)
         }
 
-        fn terminate_group(&self, pid: u32) {
+        fn terminate_group(&self, identity: RunnerIdentity) {
+            let pid = identity.pid;
             self.signals.lock().unwrap().push((pid, "TERM"));
             if !self.immortal.lock().unwrap().contains(&pid) {
                 self.alive.lock().unwrap().remove(&pid);
@@ -678,12 +752,15 @@ pub(crate) mod test_support {
             self.terminated.notify_one();
         }
 
-        fn kill_group(&self, pid: u32) {
+        fn kill_group(&self, identity: RunnerIdentity) {
+            let pid = identity.pid;
             self.signals.lock().unwrap().push((pid, "KILL"));
             if !self.immortal.lock().unwrap().contains(&pid) {
                 self.alive.lock().unwrap().remove(&pid);
             }
         }
+
+        fn forget(&self, _identity: RunnerIdentity) {}
 
         fn release_scope(&self, session_id: &str) {
             let phase = self
@@ -707,7 +784,7 @@ mod tests {
     const ID: &str = "s-1";
 
     fn identity(pid: u32, generation: u64) -> RunnerIdentity {
-        RunnerIdentity { pid, generation }
+        RunnerIdentity::unattested(pid, generation)
     }
 
     #[test]

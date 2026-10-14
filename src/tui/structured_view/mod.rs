@@ -226,6 +226,7 @@ struct ViewSetup {
 pub(crate) struct ViewSideInfo {
     session: Result<crate::acp::session_paths::SessionViewInfo, String>,
     compaction_reminder: Option<u8>,
+    notice_policy: crate::session::config::NoticePolicy,
     /// Initial daemon-owned prompt-queue snapshot, so the queue strip and
     /// ArrowUp recall reflect prompts queued elsewhere. Empty on a fetch error.
     queued: Vec<QueuedPromptEntry>,
@@ -266,6 +267,13 @@ async fn setup_view(endpoint: DaemonEndpoint, session_id: &str) -> Result<ViewSe
                     None
                 }
             };
+            let notice_policy = match http.notice_policy().await {
+                Ok(policy) => policy,
+                Err(e) => {
+                    tracing::warn!(target: "acp.tui", "notice policy fetch failed; notices stay until dismissed: {e}");
+                    Default::default()
+                }
+            };
             let queued = match http.queue_list(&session_id).await {
                 Ok(entries) => entries,
                 Err(e) => {
@@ -277,6 +285,7 @@ async fn setup_view(endpoint: DaemonEndpoint, session_id: &str) -> Result<ViewSe
                 .send(ViewSideInfo {
                     session,
                     compaction_reminder,
+                    notice_policy,
                     queued,
                 })
                 .await;
@@ -480,6 +489,7 @@ fn apply_session_info(
 /// full-screen loop and the embedded preview.
 pub(crate) fn apply_side_info(state: &mut StructuredViewState, side: ViewSideInfo) {
     state.compaction_reminder_percent = side.compaction_reminder;
+    state.notice_policy = side.notice_policy;
     state.set_queue_snapshot(side.queued);
     match side.session {
         Ok(info) => apply_session_info(state, info),

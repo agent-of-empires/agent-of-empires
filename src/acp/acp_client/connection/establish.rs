@@ -182,6 +182,7 @@ pub(super) async fn establish(
         session_from_storage: matches!(ctx.mode, ConnectMode::Resume { .. }),
         channels: SessionChannels::default(),
         steering_capable,
+        close_capable: init.agent_capabilities.session_capabilities.close.is_some(),
         source_profile: ctx.source_profile,
         default_effort: ctx.default_effort,
         default_mode: ctx.default_mode,

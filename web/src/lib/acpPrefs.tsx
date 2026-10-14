@@ -11,6 +11,9 @@ export interface AcpPrefs {
   replayEvents: number;
   compactionReminder: boolean;
   compactionReminderPercent: number;
+  /** How agent notices show: until dismissed, auto-dismissed, or never. Errors always persist. */
+  noticeDisplay: "persistent" | "timeout" | "hidden";
+  noticeTimeoutSecs: number;
 }
 
 const DEFAULT_PREFS: AcpPrefs = {
@@ -19,6 +22,8 @@ const DEFAULT_PREFS: AcpPrefs = {
   replayEvents: 0,
   compactionReminder: false,
   compactionReminderPercent: 75,
+  noticeDisplay: "persistent",
+  noticeTimeoutSecs: 10,
 };
 
 const AcpPrefsContext = createContext<AcpPrefs>(DEFAULT_PREFS);

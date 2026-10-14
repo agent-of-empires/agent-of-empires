@@ -78,6 +78,18 @@ pub(super) fn monitor_event_from_raw(raw_input: &serde_json::Value) -> Option<Ev
     Some(Event::MonitorArmed { description })
 }
 
+/// A `Bash` launched with `run_in_background`: the adapter's metadata-only
+/// update carries `toolResponse.backgroundTaskId`. Shown with the Monitor
+/// badge since both are off-turn work that reports back later.
+pub(super) fn background_command_launched_from_value(v: &serde_json::Value) -> Option<Event> {
+    let cc = v.get("_meta")?.get("claudeCode")?;
+    if cc.get("toolName").and_then(|t| t.as_str()) != Some("Bash") {
+        return None;
+    }
+    cc.get("toolResponse")?.get("backgroundTaskId")?.as_str()?;
+    Some(Event::MonitorArmed { description: None })
+}
+
 /// A Claude async sub-agent launch, arriving as `_meta.claudeCode` with
 /// `toolName: "Agent"` and a `toolResponse` whose `status` is
 /// `"async_launched"`. `agentId` is the only required field; anything else
@@ -116,6 +128,22 @@ pub(super) fn background_agent_launched_from_value(v: &serde_json::Value) -> Opt
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn background_command_launch_arms_badge() {
+        let launched = |tool: &str, response: serde_json::Value| serde_json::json!({"_meta": {"claudeCode": {"toolName": tool, "toolResponse": response}}});
+        let bg = serde_json::json!({"stdout": "", "backgroundTaskId": "byiee4aex"});
+        assert!(matches!(
+            background_command_launched_from_value(&launched("Bash", bg.clone())),
+            Some(Event::MonitorArmed { description: None })
+        ));
+        assert!(background_command_launched_from_value(&launched("Read", bg)).is_none());
+        assert!(background_command_launched_from_value(&launched(
+            "Bash",
+            serde_json::json!({"stdout": "ok"})
+        ))
+        .is_none());
+    }
 
     #[test]
     fn raw_input_parsers() {

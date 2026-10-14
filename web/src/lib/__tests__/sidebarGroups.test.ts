@@ -109,6 +109,19 @@ describe("buildSessionGroups", () => {
     expect(wsIds(groups[0]!)).toEqual(["w-waiting", "w-idle", "w-running"]);
   });
 
+  it("ranks a plugin danger/warn session with Error under attention sort (#4446)", () => {
+    const workspaces = [
+      ws("w-running", "feature", { status: "Running" }),
+      ws("w-toned", "feature", { status: "Idle" }),
+      ws("w-waiting", "feature", { status: "Waiting" }),
+    ];
+    const opts = { idleDecayWindowMs: IDLE_DECAY_WINDOW_MS, sortMode: "attention" as const, isCollapsed: () => false };
+    const order = (pluginAttention?: ReadonlySet<string>) =>
+      wsIds(buildSessionGroups(workspaces, { ...opts, pluginAttention })[0]!);
+    expect(order()).toEqual(["w-waiting", "w-toned", "w-running"]);
+    expect(order(new Set(["w-running-s"]))).toEqual(["w-waiting", "w-running", "w-toned"]);
+  });
+
   it("buckets by group_path alphabetically with Ungrouped last", () => {
     const groups = build([ws("w1", "refactor"), ws("w0", ""), ws("w2", "feature"), ws("w3", "   ")]);
     expect(groups.map((g) => g.id)).toEqual(["feature", "refactor", UNGROUPED_GROUP_ID]);

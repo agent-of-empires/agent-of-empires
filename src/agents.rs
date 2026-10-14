@@ -68,14 +68,13 @@ pub enum SessionCaptureBackend {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SessionIdentityPublisher {
-    Extension { root_only: bool },
+    Extension,
 }
 
 impl SessionCaptureBackend {
     pub(crate) const fn identity_publisher(self) -> Option<SessionIdentityPublisher> {
         match self {
-            Self::Pi => Some(SessionIdentityPublisher::Extension { root_only: false }),
-            Self::PrimeAgent => Some(SessionIdentityPublisher::Extension { root_only: true }),
+            Self::Pi => Some(SessionIdentityPublisher::Extension),
             _ => None,
         }
     }
@@ -871,6 +870,7 @@ pub const AGENTS: &[AgentDef] = &[
     },
     AgentDef {
         oneshot_flag: Some("-p"),
+        detect_status: status_detection::detect_native_only_status,
         yolo: Some(YoloMode::AlwaysYolo),
         instruction_flag: Some("--append-system-prompt {}"),
         container_env: &[(
