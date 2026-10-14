@@ -200,11 +200,11 @@ An attach mode that keeps the TUI on the home view and forwards keystrokes to wh
 ### Processes
 
 **Daemon**:
-The always-on `aoe serve` process that owns all Session runtime state and is required to use AoE. Hosts the API, Web serving, the Supervisor, the Reconciler, Plugin workers and push notifications.
+The `aoe serve` process. Hosts the API, the Web dashboard, the Supervisor, the Reconciler, Plugin workers and push notifications. Target (#2734): always-on, required, owns all Session runtime state. Today the local TUI and CLI also act on the Session store and tmux directly.
 _Avoid_: server, agent daemon
 
 **Client**:
-A program that drives a Daemon through its API: the TUI, the CLI or the Web dashboard. Holds no Session runtime state of its own.
+A program that pilots a Daemon: the TUI, the CLI or the Web dashboard. Target (#2734): reaches the Daemon only through its API, holding no Session runtime state. Today only the Web dashboard and the TUI under `AOE_DAEMON_URL` do.
 _Avoid_: surface, frontend
 
 **Remote Daemon**:
@@ -212,7 +212,7 @@ A Daemon on another machine that a Client reaches over the network. Plain Daemon
 _Avoid_: remote server, host
 
 **Web serving**:
-The Daemon's toggle for hosting the Web dashboard. Not a separate process.
+Target (#2734): a Daemon toggle for hosting the Web dashboard, not a separate process. Today `aoe serve` always hosts it and no Setting controls it.
 _Avoid_: web server
 
 **Supervisor**:
@@ -230,7 +230,7 @@ Stopping a Terminal view Session that has sat Idle past a threshold. Distinct fr
 _Avoid_: dormant
 
 **Web dashboard**:
-The browser Client the Daemon serves through Web serving, protected by a rotating access token and an optional passphrase.
+The browser Client the Daemon serves, protected by a rotating access token and an optional passphrase.
 _Avoid_: PWA, web UI, structured view (that is a view, not a Client)
 
 **Tunnel**:
