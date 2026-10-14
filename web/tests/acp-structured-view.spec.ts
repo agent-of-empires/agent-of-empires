@@ -244,6 +244,34 @@ test("mobile composer shows a compact usage hint inside the viewport", async ({ 
   const box = (await usage.boundingBox())!;
   expect(box.x).toBeGreaterThanOrEqual(0);
   expect(box.x + box.width).toBeLessThanOrEqual(page.viewportSize()!.width);
+
+  // WCAG AA body text. Folds ancestor opacity into the foreground, which a
+  // bare computed `color` read would miss.
+  for (const id of ["composer-usage-pct", "composer-usage-cost"]) {
+    const ratio = await page.getByTestId(id).evaluate((el) => {
+      const rgb = (c: string) => c.match(/[\d.]+/g)!.map(Number);
+      const lum = ([r, g, b]: number[]) => {
+        const [R, G, B] = [r, g, b].map((v) => {
+          const c = v! / 255;
+          return c <= 0.03928 ? c / 12.92 : ((c + 0.055) / 1.055) ** 2.4;
+        });
+        return 0.2126 * R! + 0.7152 * G! + 0.0722 * B!;
+      };
+      let opacity = 1;
+      let bg: number[] | null = null;
+      for (let n: Element | null = el; n; n = n.parentElement) {
+        const cs = getComputedStyle(n);
+        opacity *= Number(cs.opacity);
+        const c = rgb(cs.backgroundColor);
+        if (!bg && (c[3] ?? 1) === 1) bg = c;
+      }
+      const fg = rgb(getComputedStyle(el).color);
+      const mixed = fg.slice(0, 3).map((v, i) => v! * opacity + bg![i]! * (1 - opacity));
+      const [hi, lo] = [lum(mixed), lum(bg!)].sort((a, b) => b - a);
+      return (hi! + 0.05) / (lo! + 0.05);
+    });
+    expect(ratio, id).toBeGreaterThanOrEqual(4.5);
+  }
 });
 
 // ────────────────────────── memory recall ─────────────────────────

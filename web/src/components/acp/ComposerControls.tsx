@@ -320,7 +320,7 @@ export function AuthStatusHint({ authStatus }: { authStatus: AcpState["authStatu
 export function UsageHint({ usage }: { usage: AcpState["sessionUsage"] }) {
   if (!usage || usage.size <= 0) return null;
   const pct = Math.min(100, Math.round((usage.used / usage.size) * 100));
-  const tone = pct >= 90 ? "text-rose-400" : pct >= 75 ? "text-amber-400" : "text-text-dim";
+  const tone = pct >= 90 ? "text-rose-400" : pct >= 75 ? "text-amber-400" : "text-text-subtle";
   const cost = usage.cost ? formatCost(usage.cost.amount, usage.cost.currency) : null;
   const explanation =
     `Context window: ${usage.used.toLocaleString()} of ${usage.size.toLocaleString()} tokens used (${pct}%). ` +
@@ -339,11 +339,11 @@ export function UsageHint({ usage }: { usage: AcpState["sessionUsage"] }) {
           <span className="hidden sm:inline">
             {formatTokens(usage.used)}/{formatTokens(usage.size)}
           </span>
-          <span className="opacity-70">
+          <span data-testid="composer-usage-pct">
             <span className="hidden sm:inline">(</span>
             {pct}%<span className="hidden sm:inline">)</span>
           </span>
-          {cost ? <span className="opacity-70">· {cost}</span> : null}
+          {cost ? <span data-testid="composer-usage-cost">· {cost}</span> : null}
         </span>
       </Tooltip>
     </span>
