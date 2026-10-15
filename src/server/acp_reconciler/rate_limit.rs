@@ -73,6 +73,9 @@ fn queue_supersedes(minted_at_ms: &[i64], limit_at_ms: Option<i64>) -> bool {
         .any(|queued_at| *queued_at > limit_at_ms)
 }
 
+/// Sent when a limit ended an agent-initiated turn, which has no prompt to redeliver.
+const AGENT_TURN_CONTINUATION: &str = "continue";
+
 /// What the continuation producer decided for one session (#4092).
 #[must_use]
 pub(crate) enum ContinuationOutcome {
@@ -103,7 +106,7 @@ pub(crate) async fn install_rate_limit_continuation(
     id: &str,
     _submission: tokio::sync::OwnedMutexGuard<()>,
 ) -> ContinuationOutcome {
-    let Some(Some((text, attachments))) = query_store(
+    let Some(interrupted) = query_store(
         &state.acp_event_store,
         id,
         "rate-limit continuation",
@@ -112,6 +115,24 @@ pub(crate) async fn install_rate_limit_continuation(
     .await
     else {
         return ContinuationOutcome::Stands;
+    };
+    let (text, attachments) = match interrupted {
+        Some(prompt) => prompt,
+        // Nothing to redeliver: an agent-initiated turn is continued the way
+        // a user would, with a bare prompt (#4373).
+        None => {
+            let agent_turn = query_store(
+                &state.acp_event_store,
+                id,
+                "rate-limit agent-turn continuation",
+                |s, id| s.rate_limit_interrupted_agent_turn(id),
+            )
+            .await;
+            if agent_turn != Some(true) {
+                return ContinuationOutcome::Stands;
+            }
+            (AGENT_TURN_CONTINUATION.to_string(), Vec::new())
+        }
     };
     #[cfg(test)]
     state.session_service.await_install_barrier(id).await;
@@ -627,6 +648,53 @@ mod tests {
             );
             assert_eq!(pending_turn(&state, id).await, kept, "{case}");
         }
+    }
+
+    /// A limit that ended an agent-initiated turn has no prompt to redeliver, so
+    /// the park resumes with a bare `continue` (#4373).
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn agent_initiated_park_installs_a_continue_prompt() {
+        let id = "sess-4373-continue";
+        let (_home, state, _project) = test_state(id);
+        enable_auto_resume(true);
+        let long_ago = Utc::now() - chrono::Duration::hours(1);
+        let events = [
+            Event::AgentMessageChunk { text: "x".into() },
+            Event::RateLimit {
+                info: crate::acp::state::RateLimitInfo {
+                    status: "limited".into(),
+                    resets_at: Some(long_ago),
+                    kind: "usage".into(),
+                },
+            },
+            Event::Stopped {
+                reason: "rate_limited".into(),
+            },
+        ];
+        for (seq, event) in events.iter().enumerate() {
+            state
+                .acp_event_store
+                .record_at(id, seq as u64 + 1, event, long_ago.timestamp_millis())
+                .unwrap();
+        }
+        state
+            .acp_supervisor
+            .hydrate_seqs([(id.to_string(), state.acp_event_store.highest_seq(id))]);
+
+        let outcome = install_rate_limit_continuation(
+            &state,
+            id,
+            state.session_service.prompt_submission(id).await,
+        )
+        .await;
+
+        assert!(matches!(outcome, ContinuationOutcome::Stands));
+        let queued = state.instances.read().await[0]
+            .pending_initial_turn
+            .as_ref()
+            .map(|t| (t.text.clone(), t.synthesized));
+        assert_eq!(queued, Some((AGENT_TURN_CONTINUATION.to_string(), true)));
     }
 
     fn auto_resumed_breadcrumbs(state: &AppState, id: &str) -> usize {
