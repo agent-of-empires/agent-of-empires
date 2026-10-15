@@ -17,6 +17,7 @@ use crate::plugin::launch::{resolve_launch, OsLaunchResolver};
 use crate::plugin::protocol::{self, codes, RpcResponse};
 use crate::plugin::registry::PluginRegistry;
 use crate::plugin::sandbox::{NoSandbox, SandboxBackend};
+use crate::plugin::worker_logs;
 use crate::process::worker;
 use crate::server::push::StatusChange;
 
@@ -98,6 +99,7 @@ impl PluginHost {
         let workers_dir = app_dir.join("plugin-workers");
         worker::ensure_dir(&workers_dir)
             .with_context(|| format!("prepare {}", workers_dir.display()))?;
+        worker_logs::prune_legacy(&workers_dir);
         let api = HostApiState::open(
             &app_dir.join("plugin_events.db"),
             profile,
@@ -488,7 +490,7 @@ impl PluginHost {
         let prepared = self.sandbox.prepare(&launch)?;
 
         let worker_id = uuid::Uuid::new_v4().to_string();
-        let log_path = worker::log_path(&self.workers_dir, &worker_id)?;
+        let log_path = worker_logs::log_path(&self.workers_dir, plugin_id, &worker_id)?;
         let log = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
@@ -514,9 +516,20 @@ impl PluginHost {
             });
         }
 
-        let mut child = cmd
-            .spawn()
-            .with_context(|| format!("spawn worker for {plugin_id}"))?;
+        let mut child = match cmd.spawn() {
+            Ok(child) => child,
+            Err(e) => {
+                // Keep the previous log as the newest one rather than an empty file.
+                let _ = std::fs::remove_file(&log_path);
+                return Err(e).with_context(|| format!("spawn worker for {plugin_id}"));
+            }
+        };
+        worker_logs::prune_plugin(
+            &self.workers_dir,
+            plugin_id,
+            &log_path,
+            worker_logs::KEEP_PER_PLUGIN,
+        );
         let pid = child.id().unwrap_or(0);
 
         let stdin = child.stdin.take().context("worker stdin missing")?;

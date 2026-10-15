@@ -599,3 +599,7 @@ bin = "my-plugin-worker"
 |---|---|---|---|
 | `asset` | string | yes | Asset-name template; `${os}`, `${arch}`, `${target}` are substituted before matching the release. |
 | `bin` | string | no | Executable path inside the extracted archive. Omit to run the downloaded asset directly (a raw, non-archive binary). |
+
+### Worker logs
+
+The worker's stdout carries JSON-RPC only; write diagnostics to stderr. The host captures stderr in `<app_dir>/plugin-workers/<plugin-id>_<worker-uuid>.log`, one file per start, and `aoe plugin logs <id>` prints the newest path. Only the five newest logs per plugin are kept. See [Worker logs](plugins.md#worker-logs).

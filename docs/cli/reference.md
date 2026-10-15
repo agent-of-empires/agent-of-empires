@@ -48,6 +48,7 @@ This document contains the help content for the `aoe` command-line program.
 * [`aoe plugin`↴](#aoe-plugin)
 * [`aoe plugin list`↴](#aoe-plugin-list)
 * [`aoe plugin info`↴](#aoe-plugin-info)
+* [`aoe plugin logs`↴](#aoe-plugin-logs)
 * [`aoe plugin enable`↴](#aoe-plugin-enable)
 * [`aoe plugin disable`↴](#aoe-plugin-disable)
 * [`aoe plugin install`↴](#aoe-plugin-install)
@@ -836,6 +837,7 @@ Manage plugins (list, info, enable, disable, install, update, uninstall)
 
 * `list` — List every known plugin with version, validation, and state
 * `info` — Show one plugin's manifest details
+* `logs` — Print the path of a plugin worker's most recent log
 * `enable` — Enable a plugin's contributions
 * `disable` — Disable a plugin; its settings stay on disk for re-enabling
 * `install` — Install an external plugin from a `gh:owner/repo[@ref]` slug or a local directory. With no `@ref`, installs the repo's latest release; an explicit `@ref` installs unverified, un-audited code. Community plugins run at your own risk
@@ -864,6 +866,18 @@ Show one plugin's manifest details
 ###### **Arguments:**
 
 * `<ID>` — Plugin id, e.g. `aoe.web`
+
+
+
+## `aoe plugin logs`
+
+Print the path of a plugin worker's most recent log
+
+**Usage:** `aoe plugin logs <ID>`
+
+###### **Arguments:**
+
+* `<ID>` — Plugin id
 
 
 
