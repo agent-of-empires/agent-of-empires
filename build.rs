@@ -1,4 +1,4 @@
-// Shared with `tests/build_version_rerun.rs`.
+// Shared with `tests/integration/build_version_rerun.rs`.
 include!("build_git_watch.rs");
 
 fn main() {
