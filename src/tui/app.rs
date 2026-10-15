@@ -1248,6 +1248,16 @@ impl App {
             full |= self.home.tick_settings_status();
             full |= self.home.tick_opener();
 
+            // The link policy is not input policy, so it reloads even during live-send.
+            if self
+                .home
+                .config_watch
+                .link_policy_dirty
+                .swap(false, std::sync::atomic::Ordering::Acquire)
+            {
+                full |= self.home.refresh_link_policy();
+            }
+
             // Full/config reloads stay deferred during live-send to preserve input
             // policy and mouse-capture state.
             let live_idle = self.home.live_send.is_none();

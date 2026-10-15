@@ -42,11 +42,15 @@ pub(crate) fn is_uri_scheme(s: &str) -> bool {
         && chars.all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'))
 }
 
-/// `scheme://` and at least one authority character, so an entry cannot open
-/// every handler under a scheme.
+/// `scheme://authority/`: an entry names one complete authority, so it opens
+/// neither every handler under a scheme nor `vscode://file-other/` for
+/// `vscode://file`.
 fn names_an_authority(prefix: &str) -> bool {
     prefix.split_once("://").is_some_and(|(scheme, rest)| {
-        is_uri_scheme(scheme) && !rest.is_empty() && !rest.starts_with('/')
+        is_uri_scheme(scheme)
+            && rest
+                .split_once('/')
+                .is_some_and(|(authority, _)| !authority.is_empty())
     })
 }
 
@@ -178,6 +182,7 @@ mod tests {
         }
         for url in [
             "vscode://vscode.git/clone?url=x",
+            "vscode://file-other/path",
             "vscode-insiders://file/Users/u/a.md",
             "file:///Users/u/a.md",
             "javascript:alert(1)",
@@ -185,11 +190,20 @@ mod tests {
             assert!(!is_openable_link(url, &allowed), "{url}");
         }
 
-        // Entries without an authority, and never-opened schemes, are ignored.
-        let ignored =
-            ["vscode:", "vscode://", "file://", "javascript:", "1x://y"].map(String::from);
+        // Entries without a complete authority, and never-opened schemes, are ignored.
+        let ignored = [
+            "vscode:",
+            "vscode://",
+            "vscode://file",
+            "file://",
+            "javascript:",
+            "1x://y/",
+        ]
+        .map(String::from);
         for url in [
             "vscode://vscode.git/clone?url=x",
+            "vscode://file/Users/u/a.md",
+            "vscode://file-other/path",
             "file:///Users/u/a.command",
             "javascript:alert(1)",
             "1x://y/z",

@@ -422,8 +422,8 @@ pub struct HomeView {
     pub(super) trashed_section_collapsed: bool,
 
     recovery_rx: Option<std::sync::mpsc::Receiver<RecoveryUpdate>>,
-    /// The last non-web link handed to the system opener, until its exit status arrives.
-    pub(super) opener_exit: Option<(String, std::sync::mpsc::Receiver<std::process::ExitStatus>)>,
+    /// Non-web links handed to the system opener, until each exit status arrives.
+    pub(super) opener_exits: Vec<(String, std::sync::mpsc::Receiver<std::process::ExitStatus>)>,
     /// Held while recovery workers run so a later daemon cannot duplicate cascades.
     recovery_lock: Option<crate::session::recovery::RecoveryLock>,
 

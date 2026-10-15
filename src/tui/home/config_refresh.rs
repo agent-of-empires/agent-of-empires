@@ -40,6 +40,22 @@ impl HomeView {
         Ok(())
     }
 
+    /// Re-read only `session.preview_link_prefixes`; true when it changed. A read
+    /// failure is left to the full reload, which reports it.
+    pub(in crate::tui) fn refresh_link_policy(&mut self) -> bool {
+        let Ok(config) = crate::session::resolve_config(&self.config_profile()) else {
+            return false;
+        };
+        let changed = self.preview_link_prefixes != config.session.preview_link_prefixes;
+        self.set_link_prefixes(&config.session.preview_link_prefixes);
+        changed
+    }
+
+    fn set_link_prefixes(&mut self, prefixes: &[String]) {
+        crate::session::set_preview_link_prefixes(prefixes);
+        self.preview_link_prefixes = prefixes.to_vec();
+    }
+
     /// Apply a snapshot, reporting interactive warnings without interrupting watcher reloads.
     fn apply_config_to_state(
         &mut self,
@@ -61,7 +77,7 @@ impl HomeView {
         self.set_sidebar_position(config.session.sidebar_position);
         self.show_diagnostics = config.session.show_diagnostics_pane;
         self.show_shortcut_bar = config.session.show_shortcut_bar;
-        self.preview_link_prefixes = config.session.preview_link_prefixes.clone();
+        self.set_link_prefixes(&config.session.preview_link_prefixes);
         self.daemon_sidebar = config.session.daemon_sidebar;
         if !self.daemon_sidebar {
             self.set_sidebar_source(
@@ -83,7 +99,6 @@ impl HomeView {
             crate::tui::styles::idle_decay_window(config.theme.idle_decay_minutes);
         crate::session::set_unread_enabled(config.session.unread_indicator);
         crate::session::set_favorites_first(config.session.favorites_first);
-        crate::session::set_preview_link_prefixes(&config.session.preview_link_prefixes);
         self.tips_unseen = tips_unseen_count(&config);
         self.queue_shortcut_bar_tip(&config);
         self.tool_configs = config.tools;

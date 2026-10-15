@@ -132,7 +132,9 @@ impl HomeView {
             crate::tui::open_url::open_url(url)
         } else if crate::util::is_openable_link(url, &self.preview_link_prefixes) {
             crate::tui::open_url::open_with_system(url).map(|exit| {
-                self.opener_exit = exit.map(|rx| (url.to_string(), rx));
+                if let Some(rx) = exit {
+                    self.opener_exits.push((url.to_string(), rx));
+                }
             })
         } else {
             Err(std::io::Error::new(
@@ -153,22 +155,20 @@ impl HomeView {
     /// Report a system opener that exited unsuccessfully, which is how a scheme
     /// with no registered app fails; true when the flash changed.
     pub fn tick_opener(&mut self) -> bool {
-        let Some((url, rx)) = self.opener_exit.as_ref() else {
-            return false;
-        };
-        let status = match rx.try_recv() {
-            Ok(status) => status,
-            Err(std::sync::mpsc::TryRecvError::Empty) => return false,
-            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                self.opener_exit = None;
-                return false;
+        let mut failed = None;
+        self.opener_exits.retain(|(url, rx)| match rx.try_recv() {
+            Ok(status) => {
+                if !status.success() {
+                    failed = Some((url.clone(), status));
+                }
+                false
             }
-        };
-        let url = url.clone();
-        self.opener_exit = None;
-        if status.success() {
+            Err(std::sync::mpsc::TryRecvError::Empty) => true,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => false,
+        });
+        let Some((url, status)) = failed else {
             return false;
-        }
+        };
         crate::tui::clipboard::copy_to_clipboard(&url);
         self.flash_status(format!("nothing opened it ({status}); copied {url}"));
         true

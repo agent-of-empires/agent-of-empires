@@ -1706,8 +1706,8 @@ pub struct SessionConfig {
 
     /// Link targets beyond http and https that a click in the preview may open,
     /// as `scheme://authority/` prefixes: `vscode://file/` lets an agent print a
-    /// short relative path that opens the file in VS Code. An entry without an
-    /// authority is ignored, and `file:`, `javascript:`, `data:` and `vbscript:`
+    /// short relative path that opens the file in VS Code. An entry not in that
+    /// form is ignored, and `file:`, `javascript:`, `data:` and `vbscript:`
     /// never open. Applies to links printed after the change. Empty by default:
     /// only web links open, and other targets are not passed to the terminal.
     #[serde(default)]

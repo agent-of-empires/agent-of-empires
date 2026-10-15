@@ -199,6 +199,7 @@ impl HomeView {
 
         let config_watch = ConfigWatchState {
             dirty: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            link_policy_dirty: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             handles: HashMap::new(),
         };
 
@@ -464,7 +465,7 @@ impl HomeView {
             hide_stopped_in_groups: false,
             group_totals: HashMap::new(),
             recovery_rx: None,
-            opener_exit: None,
+            opener_exits: Vec::new(),
             recovery_lock: None,
             recovery_in_flight: std::collections::HashSet::new(),
             restart_cooldown_at: std::collections::HashMap::new(),

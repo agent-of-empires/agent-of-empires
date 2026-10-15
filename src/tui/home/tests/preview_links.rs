@@ -420,14 +420,45 @@ fn a_non_web_target_stays_inert_until_a_prefix_allows_it() {
 
 #[cfg(unix)]
 #[test]
-fn a_successful_opener_exit_leaves_the_opened_flash() {
+fn each_pending_opener_is_kept_until_its_own_exit_arrives() {
     use std::os::unix::process::ExitStatusExt;
     let mut env = create_test_env_empty();
-    let (tx, rx) = std::sync::mpsc::channel();
-    env.view.opener_exit = Some(("vscode://file/x".to_string(), rx));
+    let (first_tx, first_rx) = std::sync::mpsc::channel();
+    let (second_tx, second_rx) = std::sync::mpsc::channel();
+    env.view
+        .opener_exits
+        .push(("vscode://file/a".to_string(), first_rx));
+    env.view
+        .opener_exits
+        .push(("vscode://file/b".to_string(), second_rx));
     assert!(!env.view.tick_opener(), "nothing yet");
-    assert!(env.view.opener_exit.is_some());
-    tx.send(std::process::ExitStatus::from_raw(0)).unwrap();
+    assert_eq!(env.view.opener_exits.len(), 2);
+    second_tx
+        .send(std::process::ExitStatus::from_raw(0))
+        .unwrap();
+    assert!(!env.view.tick_opener(), "a success leaves the opened flash");
+    assert_eq!(env.view.opener_exits.len(), 1);
+    assert_eq!(env.view.opener_exits[0].0, "vscode://file/a");
+    drop(first_tx);
     assert!(!env.view.tick_opener());
-    assert!(env.view.opener_exit.is_none());
+    assert!(env.view.opener_exits.is_empty());
+}
+
+#[test]
+#[serial]
+fn the_link_policy_reloads_on_its_own() {
+    // `refresh_link_policy` is what the main loop runs during live-send, when the
+    // full config reload waits.
+    use crate::session::config::update_config;
+    let mut env = create_test_env_empty();
+    update_config(|c| c.session.preview_link_prefixes = vec!["vscode://file/".to_string()])
+        .unwrap();
+    assert!(env.view.refresh_link_policy());
+    assert_eq!(env.view.preview_link_prefixes, ["vscode://file/"]);
+    assert!(crate::session::preview_link_openable("vscode://file/x"));
+    assert!(!env.view.refresh_link_policy(), "unchanged");
+    update_config(|c| c.session.preview_link_prefixes = Vec::new()).unwrap();
+    assert!(env.view.refresh_link_policy());
+    assert!(env.view.preview_link_prefixes.is_empty());
+    assert!(!crate::session::preview_link_openable("vscode://file/x"));
 }
