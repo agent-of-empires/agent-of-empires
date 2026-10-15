@@ -22,6 +22,7 @@ import {
   setPendingTerminalFocus,
   type FocusTerminalDetail,
 } from "../lib/terminalFocus";
+import { isSessionActive } from "../lib/session";
 import { StrokeIcon } from "./icons";
 
 interface Props {
@@ -235,6 +236,17 @@ export function LiveTerminalView({ session, active = true, surface = "agent", te
     });
   }, [session.id, surface, terminalIndex]);
 
+  // Stop then Start leaves a dead pane's closed socket behind; re-ensure on the Start edge only, so a
+  // crash-looping agent cannot retrigger it.
+  const wasActiveRef = useRef({ id: session.id, active: isSessionActive(session.status) });
+  const sessionActive = isSessionActive(session.status);
+  const { paneDead } = live.state;
+  useEffect(() => {
+    const prev = wasActiveRef.current;
+    wasActiveRef.current = { id: session.id, active: sessionActive };
+    if (surface === "agent" && paneDead && prev.id === session.id && !prev.active && sessionActive) retryEnsure();
+  }, [session.id, sessionActive, paneDead, surface, retryEnsure]);
+
   // Focus/blur MUST be first in the handler so iOS keeps the user-gesture
   // chain and actually shows the keyboard.
   const toggleKeyboard = useCallback(() => {
@@ -297,6 +309,8 @@ export function LiveTerminalView({ session, active = true, surface = "agent", te
         retryCountdown={live.state.retryCountdown}
         maxRetries={live.maxRetries}
         onRetry={live.manualReconnect}
+        paneDead={live.state.paneDead}
+        onRestart={retryEnsure}
       />
 
       {ensureWarning && (

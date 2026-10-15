@@ -149,7 +149,8 @@
         "tests/mobile-panes.spec.ts",
         "tests/keyboard-auto-resize.spec.ts",
         "tests/mobile-keyboard.spec.ts",
-        "src/hooks/useMobileViewportLock.test.ts"
+        "src/hooks/useMobileViewportLock.test.ts",
+        "src/components/__tests__/LiveTerminalView.recover.test.tsx"
       ],
       "components": [
         "web/src/App.tsx",
