@@ -3,14 +3,14 @@
 use anyhow::{bail, Context, Result};
 use nix::dir::Dir;
 use nix::errno::Errno;
-use nix::fcntl::{open, openat, AtFlags, OFlag};
+use nix::fcntl::{open, openat, renameat, AtFlags, OFlag};
 use nix::sys::stat::{fstat, fstatat, mkdirat, FileStat, Mode};
 use nix::unistd::{linkat, unlinkat, UnlinkatFlags};
-use std::ffi::{CString, OsStr, OsString};
+use std::ffi::OsString;
 use std::fs::File;
 use std::io::Read;
-use std::os::fd::{AsRawFd, OwnedFd};
-use std::os::unix::ffi::{OsStrExt, OsStringExt};
+use std::os::fd::OwnedFd;
+use std::os::unix::ffi::OsStringExt;
 use std::path::{Component, Path, PathBuf};
 
 pub(crate) struct AnchoredDir {
@@ -25,6 +25,8 @@ pub(crate) struct FilePublication<'a> {
 
 #[cfg(test)]
 thread_local! {
+    /// Runs between the replace and its post-check in `publish_staged`.
+    static AFTER_REPLACE: std::cell::RefCell<Option<Box<dyn Fn()>>> = const { std::cell::RefCell::new(None) };
     pub(crate) static FAIL_SYNC_ONCE: std::cell::RefCell<Option<PathBuf>> = const { std::cell::RefCell::new(None) };
 }
 
@@ -262,7 +264,7 @@ impl AnchoredDir {
     }
 
     /// Publish the staging file `from` at `to` and drop the staging name.
-    /// `false` means `to` was left untouched: something was already there
+    /// `false` means `to` kept its live copy: something was already there
     /// (no `replace`), or it changed after `replace` was observed.
     ///
     /// Makes a file visible only once it is complete, so a process killed
@@ -273,9 +275,13 @@ impl AnchoredDir {
     /// `renameat2(RENAME_NOREPLACE)` would also answer, but it is Linux-only
     /// and this has to hold on macOS.
     ///
-    /// `replace` is the modification time the caller saw on `to`. The two names
-    /// are exchanged and the displaced file is checked against it; if a writer
-    /// got in first it is swapped back, so no copy is ever unlinked unseen.
+    /// `replace` is the modification time the caller saw on `to`. The old file
+    /// is hard-linked to `.aoe-prev` before the rename and unlinked only if it
+    /// is still unchanged after it. A change means a writer got in: the carry
+    /// is kept at `.aoe-conflict` and the old file is put back, so no version
+    /// is unlinked unseen. A leftover `.aoe-prev` is a crashed replace and
+    /// fails the next one rather than being overwritten. A writer that holds
+    /// the old file open past the post-check is not covered.
     pub(crate) fn publish_staged(
         &self,
         from: &Path,
@@ -285,22 +291,60 @@ impl AnchoredDir {
         let (from_parent, from_leaf) = self.open_parent(from)?;
         let (to_parent, to_leaf) = self.open_parent(to)?;
         if let Some(observed) = replace {
-            match exchange(&from_parent, &from_leaf, &to_parent, &to_leaf) {
-                Ok(()) => {
-                    let validation = self.regular_modified(from);
-                    let unchanged = matches!(validation, Ok(Some(seen)) if seen == observed);
-                    if !unchanged {
-                        exchange(&from_parent, &from_leaf, &to_parent, &to_leaf)
-                            .context("restoring anchored file")?;
-                    }
-                    validation?;
-                    self.remove_file(from)?;
-                    return Ok(unchanged);
-                }
+            let prev = with_suffix(to, ".aoe-prev");
+            let (prev_parent, prev_leaf) = self.open_parent(&prev)?;
+            match linkat(
+                &to_parent,
+                to_leaf.as_os_str(),
+                &prev_parent,
+                prev_leaf.as_os_str(),
+                AtFlags::empty(),
+            ) {
+                Ok(()) => {}
                 // `to` vanished after it was observed: publish as a first copy.
-                Err(Errno::ENOENT) => {}
-                Err(error) => return Err(error).context("replacing anchored file"),
+                Err(Errno::ENOENT) => return self.publish_staged(from, to, None),
+                Err(Errno::EEXIST) => bail!(
+                    "an interrupted carry left a displaced transcript at {}; recover it first",
+                    prev.display()
+                ),
+                Err(error) => return Err(error).context("preserving anchored file"),
             }
+            if self.regular_modified(&prev)? != Some(observed) {
+                self.remove_file(&prev)?;
+                self.remove_file(from)?;
+                return Ok(false);
+            }
+            renameat(
+                &from_parent,
+                from_leaf.as_os_str(),
+                &to_parent,
+                to_leaf.as_os_str(),
+            )
+            .context("replacing anchored file")?;
+            #[cfg(test)]
+            AFTER_REPLACE.with(|hook| hook.borrow().as_ref().map(|hook| hook()));
+            if self.regular_modified(&prev)? == Some(observed) {
+                self.remove_file(&prev)?;
+                return Ok(true);
+            }
+            let conflict = with_suffix(to, ".aoe-conflict");
+            let (conflict_parent, conflict_leaf) = self.open_parent(&conflict)?;
+            linkat(
+                &to_parent,
+                to_leaf.as_os_str(),
+                &conflict_parent,
+                conflict_leaf.as_os_str(),
+                AtFlags::empty(),
+            )
+            .context("preserving the carried file")?;
+            renameat(
+                &prev_parent,
+                prev_leaf.as_os_str(),
+                &to_parent,
+                to_leaf.as_os_str(),
+            )
+            .context("restoring anchored file")?;
+            return Ok(false);
         }
         let published = match linkat(
             &from_parent,
@@ -556,41 +600,10 @@ fn normal_components(path: &Path) -> Result<Vec<std::ffi::OsString>> {
     Ok(result)
 }
 
-/// Atomically swap two directory entries.
-fn exchange(
-    from_parent: &OwnedFd,
-    from_leaf: &OsStr,
-    to_parent: &OwnedFd,
-    to_leaf: &OsStr,
-) -> nix::Result<()> {
-    let from = CString::new(from_leaf.as_bytes()).map_err(|_| Errno::EINVAL)?;
-    let to = CString::new(to_leaf.as_bytes()).map_err(|_| Errno::EINVAL)?;
-    let (from_fd, to_fd) = (from_parent.as_raw_fd(), to_parent.as_raw_fd());
-    // SAFETY: both descriptors are open and both names are NUL-terminated
-    // strings that outlive the call.
-    #[cfg(target_os = "linux")]
-    let rc = unsafe {
-        libc::syscall(
-            libc::SYS_renameat2,
-            from_fd,
-            from.as_ptr(),
-            to_fd,
-            to.as_ptr(),
-            libc::RENAME_EXCHANGE,
-        )
-    };
-    // SAFETY: as above.
-    #[cfg(target_os = "macos")]
-    let rc = unsafe {
-        libc::renameatx_np(
-            from_fd,
-            from.as_ptr(),
-            to_fd,
-            to.as_ptr(),
-            libc::RENAME_SWAP,
-        )
-    };
-    Errno::result(rc).map(drop)
+fn with_suffix(path: &Path, suffix: &str) -> PathBuf {
+    let mut name = path.as_os_str().to_os_string();
+    name.push(suffix);
+    PathBuf::from(name)
 }
 
 #[cfg(test)]
@@ -629,14 +642,22 @@ mod tests {
         );
     }
 
-    /// A writer that updates the target after the caller read its mtime must
-    /// keep its copy; an untouched stale target is still replaced.
+    /// The old file is replaced only while untouched; a writer on either
+    /// inode, or an interrupted earlier replace, never costs a version.
     #[cfg(unix)]
     #[test]
-    fn replace_publish_preserves_a_concurrently_written_target() {
+    fn replace_publish_never_unlinks_an_unseen_version() {
         use std::fs::FileTimes;
+        use std::io::Write;
         use std::time::{Duration, SystemTime};
 
+        struct Reset;
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                AFTER_REPLACE.set(None);
+            }
+        }
+        let _reset = Reset;
         let now = SystemTime::now();
         let stale = now - Duration::from_secs(3600);
         let set_mtime = |path: &Path, at: SystemTime| {
@@ -647,53 +668,86 @@ mod tests {
                 .set_times(FileTimes::new().set_modified(at))
                 .unwrap();
         };
-        for (concurrent_write, published, expected) in [
-            (false, true, &b"carry\n"[..]),
-            (true, false, &b"live\n"[..]),
-        ] {
+        let read = |root: &Path, name: &str| std::fs::read(root.join(name)).ok();
+        let (target, staging) = (Path::new("conv.jsonl"), Path::new("conv.jsonl.aoe-carry"));
+
+        // (case, published, target, conflict, prev)
+        let cases: [(&str, bool, &[u8], Option<&[u8]>, Option<&[u8]>); 5] = [
+            ("untouched", true, b"carry\n", None, None),
+            ("changed before", false, b"live\n", None, None),
+            (
+                "writers during the replace",
+                false,
+                b"old\nfd\n",
+                Some(b"carry\npath\n"),
+                None,
+            ),
+            (
+                "interrupted earlier",
+                false,
+                b"old\n",
+                None,
+                Some(b"displaced\n"),
+            ),
+            ("deleted", true, b"carry\n", None, None),
+        ];
+        for (case, published, expected, conflict, prev) in cases {
             let temp = tempfile::tempdir().unwrap();
-            let anchored = AnchoredDir::open(temp.path()).unwrap();
-            let (target, staging) = (Path::new("conv.jsonl"), Path::new("conv.jsonl.aoe-carry"));
-            std::fs::write(temp.path().join(target), b"old\n").unwrap();
-            set_mtime(&temp.path().join(target), stale);
+            let root = temp.path();
+            let anchored = AnchoredDir::open(root).unwrap();
+            std::fs::write(root.join(target), b"old\n").unwrap();
+            set_mtime(&root.join(target), stale);
             let observed = anchored.regular_modified(target).unwrap().unwrap();
-            std::fs::write(temp.path().join(staging), b"carry\n").unwrap();
-            if concurrent_write {
-                std::fs::write(temp.path().join(target), b"live\n").unwrap();
-                set_mtime(&temp.path().join(target), now);
+            std::fs::write(root.join(staging), b"carry\n").unwrap();
+            match case {
+                "changed before" => {
+                    std::fs::write(root.join(target), b"live\n").unwrap();
+                    set_mtime(&root.join(target), now);
+                }
+                "writers during the replace" => {
+                    let held = std::fs::OpenOptions::new()
+                        .append(true)
+                        .open(root.join(target))
+                        .unwrap();
+                    let path = root.join(target);
+                    AFTER_REPLACE.set(Some(Box::new(move || {
+                        (&held).write_all(b"fd\n").unwrap();
+                        let mut through_path = std::fs::OpenOptions::new()
+                            .append(true)
+                            .open(&path)
+                            .unwrap();
+                        through_path.write_all(b"path\n").unwrap();
+                    })));
+                }
+                "interrupted earlier" => {
+                    std::fs::write(root.join("conv.jsonl.aoe-prev"), b"displaced\n").unwrap();
+                }
+                "deleted" => std::fs::remove_file(root.join(target)).unwrap(),
+                _ => {}
             }
 
-            let result = anchored
-                .publish_staged(staging, target, Some(observed))
-                .unwrap();
+            let result = anchored.publish_staged(staging, target, Some(observed));
+            AFTER_REPLACE.set(None);
 
-            assert_eq!(result, published, "concurrent_write={concurrent_write}");
+            assert_eq!(result.is_err(), case == "interrupted earlier", "{case}");
+            if let Ok(result) = result {
+                assert_eq!(result, published, "{case}");
+            }
             assert_eq!(
-                std::fs::read(temp.path().join(target)).unwrap(),
-                expected,
-                "concurrent_write={concurrent_write}"
+                read(root, "conv.jsonl").as_deref(),
+                Some(expected),
+                "{case}"
             );
-            assert!(!temp.path().join(staging).exists());
+            assert_eq!(
+                read(root, "conv.jsonl.aoe-conflict").as_deref(),
+                conflict,
+                "{case}"
+            );
+            assert_eq!(read(root, "conv.jsonl.aoe-prev").as_deref(), prev, "{case}");
+            if case != "interrupted earlier" {
+                assert!(read(root, "conv.jsonl.aoe-carry").is_none(), "{case}");
+            }
         }
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn replace_publish_of_a_deleted_target_publishes_the_copy() {
-        let temp = tempfile::tempdir().unwrap();
-        let anchored = AnchoredDir::open(temp.path()).unwrap();
-        let (target, staging) = (Path::new("conv.jsonl"), Path::new("conv.jsonl.aoe-carry"));
-        std::fs::write(temp.path().join(target), b"old\n").unwrap();
-        let observed = anchored.regular_modified(target).unwrap().unwrap();
-        std::fs::remove_file(temp.path().join(target)).unwrap();
-        std::fs::write(temp.path().join(staging), b"carry\n").unwrap();
-
-        assert!(anchored
-            .publish_staged(staging, target, Some(observed))
-            .unwrap());
-
-        assert_eq!(std::fs::read(temp.path().join(target)).unwrap(), b"carry\n");
-        assert!(!temp.path().join(staging).exists());
     }
 
     #[cfg(unix)]
