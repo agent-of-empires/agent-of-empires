@@ -868,6 +868,13 @@
       ]
     },
     {
+      "id": "app-shell.topbar-header-start",
+      "kind": "vitest",
+      "risk": "low",
+      "specs": ["src/components/__tests__/TopBar.test.tsx", "src/components/plugin/__tests__/PluginSlots.test.tsx"],
+      "components": ["web/src/components/TopBar.tsx", "web/src/components/plugin/PluginSlots.tsx"]
+    },
+    {
       "id": "app-shell.activity-bar",
       "kind": "vitest",
       "risk": "low",

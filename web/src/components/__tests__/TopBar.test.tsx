@@ -74,6 +74,22 @@ describe("TopBar", () => {
     expect(getByText("offline")).toBeTruthy();
   });
 
+  it("bounds the header-start group: hidden below md, capped above, and hidden on the compact rail", () => {
+    const group = (container: HTMLElement) => container.querySelector('[data-testid="topbar-header-start"]');
+    const roomy = renderTopBar();
+    expect(group(roomy.container)?.className).toMatch(/\bhidden\b.*\bmd:flex\b.*\bmax-w-48\b.*\boverflow-hidden\b/);
+    expect(group(roomy.container)?.className).not.toContain("md:hidden");
+    roomy.unmount();
+
+    localStorage.setItem("aoe-web-settings", JSON.stringify({ sidebarCompact: true }));
+    try {
+      const compact = render(<TopBar {...topBarProps()} sidebarColumnVisible />);
+      expect(group(compact.container)?.className).toContain("md:hidden");
+    } finally {
+      localStorage.removeItem("aoe-web-settings");
+    }
+  });
+
   it("does not render the workspace/repo breadcrumb even with an active workspace and session", () => {
     const workspace = {
       id: "ws-1",

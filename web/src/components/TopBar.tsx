@@ -171,8 +171,13 @@ export function TopBar({
              toggle and the logo: it would sit flush against the divider and read as clipped. */}
           <span className={`font-mono text-xs leading-none truncate ${hideWordmark ? "md:hidden" : ""}`}>aoe</span>
         </button>
-        {/* Hidden with the wordmark: the compact rail leaves no room beside the logo. */}
-        <div className={`flex items-center gap-1.5 min-w-0 ${hideWordmark ? "md:hidden" : ""}`}>
+        {/* The left zone is content-sized unless the sidebar column is showing, so the chips are capped and hidden
+           below md instead of pushing the core controls off-screen. Also hidden with the wordmark: the compact rail
+           leaves no room beside the logo. */}
+        <div
+          data-testid="topbar-header-start"
+          className={`hidden md:flex items-center gap-1.5 min-w-0 max-w-48 overflow-hidden ${hideWordmark ? "md:hidden" : ""}`}
+        >
           <PluginHeaderStartSegments />
         </div>
       </div>
