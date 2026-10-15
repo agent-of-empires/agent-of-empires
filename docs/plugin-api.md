@@ -304,6 +304,7 @@ id = "my_pane"
 | Slot | Scope | Renders |
 |---|---|---|
 | `status-bar` | global | A segment in the dashboard status bar. |
+| `header-start` | global | A chip beside the logo in the dashboard top bar, hidden with the wordmark on the compact sidebar rail (requires `api_version >= 17`). |
 | `card` | global | A card on the dashboard overview. |
 | `sort-key` | global | A named sort option over a `row-column` value. |
 | `filter-facet` | global | A named filter over a `row-column` value. |
@@ -337,7 +338,9 @@ A worker may push state for a page with `ui.state.set` (`slot = "page"`, `id` = 
 
 ### Badge payload
 
-`status-bar`, `row-badge` and `detail-badge` take either one badge, `{ text?, icon?, tone?, href?, tooltip? }` (`status-bar` and `detail-badge` require `text` or `items`), or an `items` list of such badges that replaces the top-level fields. `items: []` clears the badge.
+`status-bar`, `header-start`, `row-badge` and `detail-badge` take either one badge, `{ text?, icon?, tone?, href?, tooltip? }` (`status-bar`, `header-start` and `detail-badge` require `text` or `items`), or an `items` list of such badges that replaces the top-level fields. `items: []` clears the badge.
+
+Global chips (`status-bar`, `header-start`) also take an integer `order`, default 0, lowest first; ties keep plugin id then entry id order. In the terminal UI they render as text and tone in the status line, `header-start` first; icons, tooltips and links are web only.
 
 Give items a shared `group` to collapse them into one chip that shows one item at a time. Clicking or tapping it advances to the next item and wraps around, for example a usage badge cycling `5h`, `7d` and `opus` values:
 
