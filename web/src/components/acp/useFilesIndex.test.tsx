@@ -15,47 +15,28 @@ interface Item {
 }
 
 describe("fuzzyFilter", () => {
-  it("returns the first cap items unfiltered for an empty query", () => {
-    const items: Item[] = [{ label: "a" }, { label: "b" }, { label: "c" }, { label: "d" }];
-    expect(fuzzyFilter(items, "", 2)).toEqual([{ label: "a" }, { label: "b" }]);
-  });
-
-  it("ranks prefix match above substring match", () => {
-    const items: Item[] = [{ label: "zfoo" }, { label: "foobar" }];
-    const out = fuzzyFilter(items, "foo");
-    expect(out.map((i) => i.label)).toEqual(["foobar", "zfoo"]);
-  });
-
-  it("label substring beats description substring", () => {
-    const items: Item[] = [
-      { label: "other", description: "contains foo in description" },
-      { label: "has-foo-in-label" },
-    ];
-    const out = fuzzyFilter(items, "foo");
-    expect(out.map((i) => i.label)).toEqual(["has-foo-in-label", "other"]);
-  });
-
-  it("breaks score ties by shorter label", () => {
-    const items: Item[] = [{ label: "foobarbaz" }, { label: "foobar" }, { label: "foo" }];
-    const out = fuzzyFilter(items, "foo");
-    expect(out.map((i) => i.label)).toEqual(["foo", "foobar", "foobarbaz"]);
-  });
-
-  it("caps results at the cap limit", () => {
-    const items: Item[] = Array.from({ length: 50 }, (_, i) => ({
-      label: `foo${i}`,
-    }));
-    expect(fuzzyFilter(items, "foo", 5)).toHaveLength(5);
-  });
-
-  it("drops items that don't match label or description", () => {
-    const items: Item[] = [{ label: "alpha" }, { label: "beta", description: "the quick" }, { label: "gamma" }];
-    expect(fuzzyFilter(items, "xyz")).toEqual([]);
-  });
-
-  it("is case-insensitive", () => {
-    const items: Item[] = [{ label: "README.md" }];
-    expect(fuzzyFilter(items, "readme")).toEqual([{ label: "README.md" }]);
+  it("ranks prefix, label, and shorter matches first, case-insensitively, within the cap", () => {
+    const labels = (items: Item[], query: string, cap?: number) => fuzzyFilter(items, query, cap).map((i) => i.label);
+    // Empty query returns the first `cap` items unfiltered.
+    expect(labels([{ label: "a" }, { label: "b" }, { label: "c" }], "", 2)).toEqual(["a", "b"]);
+    expect(labels([{ label: "zfoo" }, { label: "foobar" }], "foo")).toEqual(["foobar", "zfoo"]);
+    expect(
+      labels([{ label: "other", description: "contains foo in description" }, { label: "has-foo-in-label" }], "foo"),
+    ).toEqual(["has-foo-in-label", "other"]);
+    expect(labels([{ label: "foobarbaz" }, { label: "foobar" }, { label: "foo" }], "foo")).toEqual([
+      "foo",
+      "foobar",
+      "foobarbaz",
+    ]);
+    expect(
+      labels(
+        Array.from({ length: 50 }, (_, i) => ({ label: `foo${i}` })),
+        "foo",
+        5,
+      ),
+    ).toHaveLength(5);
+    expect(labels([{ label: "alpha" }, { label: "beta", description: "the quick" }], "xyz")).toEqual([]);
+    expect(labels([{ label: "README.md" }], "readme")).toEqual(["README.md"]);
   });
 });
 
@@ -72,38 +53,20 @@ describe("useFilesIndex hook", () => {
     vi.unstubAllGlobals();
   });
 
-  it("returns loading=true on first render and resolves with files", async () => {
-    fetchSpy.mockResolvedValueOnce({
-      ok: true,
-      json: async () => ({ files: ["a.txt", "b.rs"] }),
-    });
-    const { result } = renderHook(() => useFilesIndex("s-1"));
+  it("starts loading, then resolves with files from the URL-encoded session path", async () => {
+    fetchSpy.mockResolvedValueOnce({ ok: true, json: async () => ({ files: ["a.txt", "b.rs"] }) });
+    const { result } = renderHook(() => useFilesIndex("session/with/slash"));
     expect(result.current.loading).toBe(true);
     expect(result.current.files).toEqual([]);
     await waitFor(() => expect(result.current.loading).toBe(false));
     expect(result.current.files).toEqual(["a.txt", "b.rs"]);
-    expect(fetchSpy).toHaveBeenCalledWith("/api/sessions/s-1/acp/files");
-  });
-
-  it("URL-encodes the session id", async () => {
-    fetchSpy.mockResolvedValueOnce({
-      ok: true,
-      json: async () => ({ files: [] }),
-    });
-    renderHook(() => useFilesIndex("session/with/slash"));
-    await waitFor(() => expect(fetchSpy).toHaveBeenCalledWith("/api/sessions/session%2Fwith%2Fslash/acp/files"));
+    expect(fetchSpy).toHaveBeenCalledWith("/api/sessions/session%2Fwith%2Fslash/acp/files");
   });
 
   it("re-fetches when sessionId changes", async () => {
     fetchSpy
-      .mockResolvedValueOnce({
-        ok: true,
-        json: async () => ({ files: ["one"] }),
-      })
-      .mockResolvedValueOnce({
-        ok: true,
-        json: async () => ({ files: ["two"] }),
-      });
+      .mockResolvedValueOnce({ ok: true, json: async () => ({ files: ["one"] }) })
+      .mockResolvedValueOnce({ ok: true, json: async () => ({ files: ["two"] }) });
     const { result, rerender } = renderHook(({ id }: { id: string }) => useFilesIndex(id), {
       initialProps: { id: "s-1" },
     });
@@ -113,44 +76,76 @@ describe("useFilesIndex hook", () => {
     expect(fetchSpy).toHaveBeenCalledTimes(2);
   });
 
-  it("returns empty list when fetch rejects", async () => {
-    fetchSpy.mockRejectedValueOnce(new Error("network down"));
+  it.each([
+    ["a rejected fetch", () => fetchSpy.mockRejectedValueOnce(new Error("network down"))],
+    [
+      "a non-ok response",
+      () => fetchSpy.mockResolvedValueOnce({ ok: false, json: async () => ({ files: ["should-not-appear"] }) }),
+    ],
+    ["a response without files", () => fetchSpy.mockResolvedValueOnce({ ok: true, json: async () => ({}) })],
+  ])("yields an empty list for %s", async (_label, arrange) => {
+    arrange();
     const { result } = renderHook(() => useFilesIndex("s-1"));
     await waitFor(() => expect(result.current.loading).toBe(false));
     expect(result.current.files).toEqual([]);
   });
 
-  it("treats non-ok responses as an empty file list", async () => {
-    fetchSpy.mockResolvedValueOnce({
-      ok: false,
-      json: async () => ({ files: ["should-not-appear"] }),
+  it.each(["success", "failure"] as const)("ignores a superseded session's late %s", async (outcome) => {
+    let resolveFetch!: (value: Response) => void;
+    let rejectFetch!: (reason: Error) => void;
+    const pending = new Promise<Response>((resolve, reject) => {
+      resolveFetch = resolve;
+      rejectFetch = reject;
     });
-    const { result } = renderHook(() => useFilesIndex("s-1"));
-    await waitFor(() => expect(result.current.loading).toBe(false));
-    expect(result.current.files).toEqual([]);
-  });
-
-  it("tolerates a response without a files field", async () => {
-    fetchSpy.mockResolvedValueOnce({
+    fetchSpy.mockReturnValueOnce(pending).mockResolvedValueOnce({
       ok: true,
-      json: async () => ({}),
+      json: async () => ({ files: ["current.txt"] }),
     });
-    const { result } = renderHook(() => useFilesIndex("s-1"));
-    await waitFor(() => expect(result.current.loading).toBe(false));
-    expect(result.current.files).toEqual([]);
+    const { result, rerender } = renderHook(({ id }) => useFilesIndex(id), {
+      initialProps: { id: "old-session" },
+    });
+    rerender({ id: "current-session" });
+    await waitFor(() => expect(result.current.files).toEqual(["current.txt"]));
+
+    await act(async () => {
+      if (outcome === "success") {
+        resolveFetch(new Response(JSON.stringify({ files: ["stale.txt"] })));
+      } else {
+        rejectFetch(new Error("old session unavailable"));
+      }
+    });
+    expect(result.current.files).toEqual(["current.txt"]);
+    expect(result.current.error).toBe(false);
+    expect(result.current.loading).toBe(false);
   });
 
-  it("does not update state after unmount", async () => {
-    let resolveFetch: (v: unknown) => void = () => {};
-    const pending = new Promise<unknown>((res) => {
-      resolveFetch = res;
+  it("keeps the current session loading when a superseded request completes", async () => {
+    let resolveOld!: (value: Response) => void;
+    let resolveCurrent!: (value: Response) => void;
+    fetchSpy
+      .mockReturnValueOnce(
+        new Promise<Response>((resolve) => {
+          resolveOld = resolve;
+        }),
+      )
+      .mockReturnValueOnce(
+        new Promise<Response>((resolve) => {
+          resolveCurrent = resolve;
+        }),
+      );
+    const { result, rerender } = renderHook(({ id }) => useFilesIndex(id), {
+      initialProps: { id: "old-session" },
     });
-    fetchSpy.mockReturnValueOnce(pending);
-    const { result, unmount } = renderHook(() => useFilesIndex("s-1"));
-    unmount();
+    rerender({ id: "current-session" });
     await act(async () => {
-      resolveFetch({ ok: true, json: async () => ({ files: ["x"] }) });
+      resolveOld(new Response(JSON.stringify({ files: ["stale.txt"] })));
     });
+    expect(result.current.loading).toBe(true);
     expect(result.current.files).toEqual([]);
+    await act(async () => {
+      resolveCurrent(new Response(JSON.stringify({ files: ["current.txt"] })));
+    });
+    expect(result.current.loading).toBe(false);
+    expect(result.current.files).toEqual(["current.txt"]);
   });
 });

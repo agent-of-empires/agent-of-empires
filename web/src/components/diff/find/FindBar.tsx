@@ -2,19 +2,13 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { findMatches, type FindMatch, type SearchableLine } from "./findMatches";
 
 interface Props {
-  /** Lines that find may match against: the diff's changed lines. */
   lines: SearchableLine[];
-  /** Called with the active match (or null when none) so the host can
-   *  scroll/select it in the virtualized renderer. */
+  /** Receives the active match, or null, so the host can scroll to it. */
   onJump: (match: FindMatch | null) => void;
   onClose: () => void;
 }
 
-/**
- * In-diff find bar. Searches the diff *model* via {@link findMatches} (not the
- * DOM), so it reaches lines the virtualized renderer hasn't mounted. Enter /
- * Shift+Enter step through matches; Esc closes.
- */
+/** Find over the diff model; Enter and Shift+Enter step, Esc closes. */
 export function FindBar({ lines, onJump, onClose }: Props) {
   const [query, setQuery] = useState("");
   const [caseSensitive, setCaseSensitive] = useState(false);
@@ -45,11 +39,8 @@ export function FindBar({ lines, onJump, onClose }: Props) {
     [safeFind, query, caseSensitive, regex],
   );
 
-  // Displayed index is derived at render; jumps fire from the event handlers
-  // below (not an effect), per the no-set-state-in-effect lint posture.
   const activeIdx = matches.length === 0 ? 0 : Math.min(active, matches.length - 1);
 
-  /** Re-run the search with new inputs and jump to its first match. */
   const retarget = (q: string, cs: boolean, rx: boolean) => {
     setActive(0);
     onJump(safeFind(q, cs, rx).matches[0] ?? null);

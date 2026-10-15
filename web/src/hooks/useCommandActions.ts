@@ -5,18 +5,8 @@ import type { SessionResponse } from "../lib/types";
 import type { ConversationSearchHit } from "../lib/api";
 import type { CommandAction } from "../components/command-palette/types";
 
-// A conversation-search palette row minus its `perform` handler. The caller
-// attaches `perform` in a closure (so the select callback is never passed
-// into this render-time builder, which the react-hooks lint reads as a
-// possible ref access during render).
 export type ConversationActionData = Omit<CommandAction, "perform"> & { sessionId: string };
 
-// Map conversation-content search hits (#2515) to palette row data. The hit
-// carries only the session id; title and state come from the client's
-// session list. Skips the active session (already in view) and any hit whose
-// session is no longer in the list. A sunk-state label and a match-count
-// suffix annotate the row so an archived/trashed hit is not mistaken for a
-// live one.
 export function buildConversationActions(
   hits: ConversationSearchHit[],
   sessions: SessionResponse[],
@@ -48,10 +38,6 @@ export function buildConversationActions(
   });
 }
 
-// State toggles the palette offers for the active session. Each is shown only
-// in the matching direction: e.g. "unarchive" on an archived session, "archive"
-// otherwise. "snooze" needs a duration, so the host opens the snooze modal; the
-// rest are argless server toggles.
 export type SessionStateAction =
   | "pin"
   | "unpin"
@@ -108,11 +94,6 @@ export function useCommandActions({
   return useMemo(() => {
     const actions: CommandAction[] = [];
 
-    // Creation commands are mutation UI. In read-only mode the sidebar and
-    // dashboard already hide their "new session" buttons, so the palette must
-    // omit these too rather than offer a command that opens a wizard the
-    // server 403s on submit. The keyboard-shortcut path stays a guarded no-op
-    // (a key can't be hidden); these visible entries are dropped instead.
     if (!readOnly) {
       actions.push({
         id: "action:new-session",
@@ -141,8 +122,6 @@ export function useCommandActions({
       perform: onGoDashboard,
     });
 
-    // Only offered when something actually needs attention, so the command
-    // never dead-ends. Shares the jump handler with the `a` shortcut.
     if (hasAttentionSession) {
       actions.push({
         id: "action:jump-attention",
@@ -165,9 +144,6 @@ export function useCommandActions({
       });
     }
 
-    // Triage toggles for the active session, each shown only in the applicable
-    // direction (unarchive on an archived session, archive otherwise, etc.).
-    // These mutate the server, so they are dropped in read-only mode.
     if (!readOnly && activeSession) {
       const a = activeSession;
       const label = a.title || a.branch || "session";

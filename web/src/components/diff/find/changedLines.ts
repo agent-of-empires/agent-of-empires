@@ -1,15 +1,7 @@
 import type { FileDiffMetadata } from "@pierre/diffs";
 import type { SearchableLine } from "./findMatches";
 
-/**
- * The changed (added/deleted) lines of an already-parsed diff, in rendered
- * (top-to-bottom, deletions-before-additions per change block) order.
- *
- * This is the searchable set for in-diff find: for the MVP we match only lines
- * that are actually part of the change, not unchanged context or the rest of
- * the file. Expanded-context lines (which the user can reveal) are out of
- * scope for now.
- */
+/** Added and deleted lines in render order: the searchable set for in-diff find. */
 export function changedLines(meta: FileDiffMetadata): SearchableLine[] {
   const out: SearchableLine[] = [];
   for (const hunk of meta.hunks) {
@@ -36,8 +28,7 @@ export function changedLines(meta: FileDiffMetadata): SearchableLine[] {
   return out;
 }
 
-// Pierre keeps the trailing newline on each stored line; strip it so find
-// matches and column offsets are line-text accurate.
+// Stored lines keep their trailing newline.
 function stripNewline(s: string): string {
   return s.replace(/\r?\n$/, "");
 }

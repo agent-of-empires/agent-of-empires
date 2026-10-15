@@ -1,30 +1,4 @@
 //! Web Push payload encryption and delivery.
-//!
-//! Implements RFC 8291 (Web Push payload encryption) over RFC 8188
-//! (aes128gcm Content-Encoding) plus VAPID (RFC 8292) for the
-//! Authorization header. The scheme:
-//!
-//! 1. Server generates an ephemeral P-256 keypair per push.
-//! 2. ECDH(server_ephemeral_priv, subscription_p256dh) yields a shared
-//!    secret; HKDF mixes in the subscription's `auth` secret and a
-//!    `WebPush: info\0 || ua_pub || as_pub` info string to produce IKM.
-//! 3. A random 16-byte salt plus the IKM are fed through HKDF again
-//!    with distinct info strings to derive the content encryption key
-//!    (CEK, 16 bytes) and nonce (12 bytes).
-//! 4. Plaintext is padded with a trailing 0x02 record-terminator byte
-//!    and encrypted with AES-128-GCM.
-//! 5. The body is: salt(16) || record_size(4, BE) || idlen(1) ||
-//!    as_pub(65) || ciphertext.
-//!
-//! The VAPID JWT is signed with ES256 using the server's long-lived
-//! VAPID private key and carries `aud` (origin of the push endpoint),
-//! `exp` (12-hour horizon), and `sub` (contact URL).
-//!
-//! Everything here is hand-rolled rather than pulled from the
-//! `web-push` crate because we already have the p256/hkdf/aes-gcm
-//! primitives for other features, and the crate's transitive feature
-//! flags drag in openssl on some configurations which we specifically
-//! avoid elsewhere.
 
 use anyhow::{anyhow, Context, Result};
 use base64::Engine;
@@ -34,13 +8,10 @@ use std::time::Duration;
 
 use super::push::{base64_url_decode, PushState, Subscription};
 
-/// Per-send HTTPS timeout. A dead Apple/Google endpoint must not tie up
-/// the worker forever, since a stuck send blocks the Semaphore permit.
+/// Per-send HTTPS timeout.
 pub const SEND_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// TTL for the push notification, in seconds. If the browser is offline
-/// for longer than this, the push is discarded by the relay rather than
-/// queued indefinitely.
+/// TTL for the push notification, in seconds.
 pub const PUSH_TTL_SECS: u32 = 60 * 60 * 24; // 24h
 
 /// VAPID JWT lifetime. Spec allows up to 24h but 12h is common.
@@ -51,11 +22,49 @@ pub const VAPID_EXP_SECS: u64 = 60 * 60 * 12;
 pub enum SendOutcome {
     /// 2xx from the push endpoint.
     Delivered,
-    /// 410 Gone or 404 Not Found: subscription is permanently invalid,
-    /// caller should GC (gated on generation counter).
+    /// 404 or 410: the subscription no longer exists.
     Gone,
-    /// Any other failure: timeout, connection error, 5xx, 429, etc.
+    /// The subscription is bound to a different VAPID key, so no send with ours can succeed.
+    KeyMismatch,
+    /// Any other 4xx except 429: the push service refused this request.
+    Rejected,
+    /// Timeout, connection error, 429 or 5xx; may succeed later.
     Failed,
+}
+
+impl SendOutcome {
+    /// Whether the subscription can never be delivered again and should be dropped.
+    pub fn is_dead(self) -> bool {
+        matches!(self, Self::Gone | Self::KeyMismatch)
+    }
+
+    /// Stable name reported to the client by `/api/push/status`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Delivered => "delivered",
+            Self::Gone => "gone",
+            Self::KeyMismatch => "key-mismatch",
+            Self::Rejected => "rejected",
+            Self::Failed => "failed",
+        }
+    }
+}
+
+/// Classify a push service response. Apple reports the failure `reason` in a JSON body
+/// (VapidPkHashMismatch is a 403); FCM reports a key mismatch as a 403 with prose.
+pub fn classify_response(status: u16, body: &str) -> SendOutcome {
+    match status {
+        200..=299 => SendOutcome::Delivered,
+        404 | 410 => SendOutcome::Gone,
+        403 if body.contains("VapidPkHashMismatch")
+            || body.contains("does not correspond to the sender") =>
+        {
+            SendOutcome::KeyMismatch
+        }
+        429 => SendOutcome::Failed,
+        400..=499 => SendOutcome::Rejected,
+        _ => SendOutcome::Failed,
+    }
 }
 
 #[derive(Serialize)]
@@ -65,7 +74,7 @@ struct VapidClaims {
     sub: String,
 }
 
-/// The body shape the service worker expects from `event.data.json()`.
+/// Payload for status-driven pushes; the service worker reads it via `event.data.json()`.
 #[derive(Serialize)]
 pub struct PushPayload {
     pub title: String,
@@ -75,11 +84,7 @@ pub struct PushPayload {
     pub session_id: String,
 }
 
-/// Build a pre-configured reqwest client for push delivery:
-/// - no_proxy: corporate MITM proxies would otherwise see endpoint URLs
-///   and encrypted payloads
-/// - SEND_TIMEOUT per request, caps worst-case blocking
-/// - rustls only, no openssl surface
+/// Build a pre-configured reqwest client for push delivery.
 pub fn build_client() -> Result<reqwest::Client> {
     reqwest::Client::builder()
         .no_proxy()
@@ -88,8 +93,7 @@ pub fn build_client() -> Result<reqwest::Client> {
         .context("build reqwest client for push")
 }
 
-/// Construct the VAPID `Authorization: vapid t=<jwt>, k=<pub_b64url>`
-/// header value for a given endpoint's origin (aud).
+/// Construct the VAPID `Authorization: vapid t=<jwt>, k=<pub_b64url>` header for an endpoint.
 pub fn vapid_auth_header(state: &PushState, endpoint: &str) -> Result<String> {
     use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
 
@@ -119,9 +123,8 @@ fn endpoint_origin(endpoint: &str) -> Result<String> {
     })
 }
 
-/// Encrypt `plaintext` into an aes128gcm-encoded body per RFC 8188/8291
-/// targeting the given subscription. Returns the binary body (salt +
-/// header + keyid + ciphertext) ready to POST as request body.
+/// Encrypt `plaintext` into an aes128gcm-encoded body per RFC 8188/8291 targeting the given
+/// subscription.
 pub fn encrypt_aes128gcm(subscription: &Subscription, plaintext: &[u8]) -> Result<Vec<u8>> {
     use aes_gcm::aead::Aead;
     use aes_gcm::{Aes128Gcm, KeyInit};
@@ -161,8 +164,7 @@ pub fn encrypt_aes128gcm(subscription: &Subscription, plaintext: &[u8]) -> Resul
     let shared = diffie_hellman(d_as.to_nonzero_scalar(), p_ua.as_affine());
     let shared_bytes = shared.raw_secret_bytes();
 
-    // First HKDF: derive IKM from (auth_secret, shared, WebPush info).
-    //   info = "WebPush: info\0" || ua_pub || as_pub
+    // First HKDF.
     let mut info1 = Vec::with_capacity(14 + 65 + 65);
     info1.extend_from_slice(b"WebPush: info\0");
     info1.extend_from_slice(&p_ua_bytes);
@@ -186,8 +188,7 @@ pub fn encrypt_aes128gcm(subscription: &Subscription, plaintext: &[u8]) -> Resul
     hk2.expand(b"Content-Encoding: nonce\0", &mut nonce)
         .map_err(|e| anyhow!("HKDF expand for nonce: {}", e))?;
 
-    // AES-128-GCM encryption. Pad with record-terminator 0x02; single
-    // record so no further padding is required.
+    // AES-128-GCM encryption.
     let cipher = Aes128Gcm::new((&cek).into());
     let mut plaintext_padded = plaintext.to_vec();
     plaintext_padded.push(0x02);
@@ -195,8 +196,7 @@ pub fn encrypt_aes128gcm(subscription: &Subscription, plaintext: &[u8]) -> Resul
         .encrypt((&nonce).into(), plaintext_padded.as_ref())
         .map_err(|e| anyhow!("AES-GCM encrypt: {}", e))?;
 
-    // aes128gcm body layout:
-    //   salt(16) || record_size u32 BE (4) || idlen u8 (1) || keyid(idlen) || ciphertext
+    // aes128gcm body layout.
     let record_size: u32 = (ciphertext.len() + 17)
         .max(18)
         .try_into()
@@ -210,21 +210,15 @@ pub fn encrypt_aes128gcm(subscription: &Subscription, plaintext: &[u8]) -> Resul
     Ok(body)
 }
 
-/// Send a single push notification. Encrypts the payload, signs VAPID,
-/// POSTs to the push endpoint under a 10s timeout, and returns whether
-/// the browser accepted the push, marked the subscription gone, or
-/// failed for another reason.
-///
-/// `observed_generation` is the subscription's generation counter at
-/// snapshot time; on 410/404 the caller uses it to gate GC so we don't
-/// wipe an entry that was re-subscribed during the in-flight send.
-pub async fn send_one(
+/// Send a single push notification.
+pub async fn send_one<T: Serialize>(
     client: &reqwest::Client,
     state: &PushState,
     subscription: &Subscription,
-    payload: &PushPayload,
+    payload: &T,
+    ttl_secs: u32,
 ) -> SendOutcome {
-    match send_one_inner(client, state, subscription, payload).await {
+    match send_one_inner(client, state, subscription, payload, ttl_secs).await {
         Ok(outcome) => outcome,
         Err(e) => {
             tracing::warn!(target: "http.middleware",
@@ -237,11 +231,12 @@ pub async fn send_one(
     }
 }
 
-async fn send_one_inner(
+async fn send_one_inner<T: Serialize>(
     client: &reqwest::Client,
     state: &PushState,
     subscription: &Subscription,
-    payload: &PushPayload,
+    payload: &T,
+    ttl_secs: u32,
 ) -> Result<SendOutcome> {
     let plaintext = serde_json::to_vec(payload).context("serialize push payload")?;
     let encrypted = encrypt_aes128gcm(subscription, &plaintext)?;
@@ -252,7 +247,7 @@ async fn send_one_inner(
         .header("Authorization", authorization)
         .header("Content-Type", "application/octet-stream")
         .header("Content-Encoding", "aes128gcm")
-        .header("TTL", PUSH_TTL_SECS.to_string())
+        .header("TTL", ttl_secs.to_string())
         .body(encrypted)
         .send()
         .await
@@ -260,27 +255,24 @@ async fn send_one_inner(
 
     let status = resp.status();
     if status.is_success() {
-        Ok(SendOutcome::Delivered)
-    } else if status == reqwest::StatusCode::GONE || status == reqwest::StatusCode::NOT_FOUND {
-        Ok(SendOutcome::Gone)
-    } else {
-        let text = resp
-            .text()
-            .await
-            .unwrap_or_else(|_| String::from("(body unreadable)"));
-        tracing::warn!(target: "http.middleware",
-            endpoint = %subscription.endpoint,
-            status = %status,
-            body = %text,
-            "push: non-success response"
-        );
-        Ok(SendOutcome::Failed)
+        return Ok(SendOutcome::Delivered);
     }
+    let text = resp
+        .text()
+        .await
+        .unwrap_or_else(|_| String::from("(body unreadable)"));
+    let outcome = classify_response(status.as_u16(), &text);
+    tracing::warn!(target: "http.middleware",
+        endpoint = %subscription.endpoint,
+        status = %status,
+        body = %text,
+        outcome = outcome.as_str(),
+        "push: non-success response"
+    );
+    Ok(outcome)
 }
 
-/// URL-safe base64 without padding, for things that aren't subscription
-/// keys. Exposed as an alias for callers so they don't have to import
-/// `base64` directly.
+/// URL-safe base64 without padding, for things that aren't subscription keys.
 pub fn b64url(bytes: &[u8]) -> String {
     use base64::engine::general_purpose::URL_SAFE_NO_PAD;
     URL_SAFE_NO_PAD.encode(bytes)
@@ -291,7 +283,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn endpoint_origin_strips_path_and_query() {
+    fn endpoint_origin_strips_path_and_query_and_rejects_garbage() {
         assert_eq!(
             endpoint_origin("https://fcm.googleapis.com/fcm/send/abc?x=1").unwrap(),
             "https://fcm.googleapis.com"
@@ -304,19 +296,40 @@ mod tests {
             endpoint_origin("http://localhost:8080/push/x").unwrap(),
             "http://localhost:8080"
         );
-    }
-
-    #[test]
-    fn endpoint_origin_rejects_garbage() {
         assert!(endpoint_origin("not-a-url").is_err());
         assert!(endpoint_origin("data:text/plain,hi").is_err());
     }
 
     #[test]
+    fn classify_response_separates_dead_rejected_and_transient() {
+        use SendOutcome::*;
+        let cases: &[(u16, &str, SendOutcome)] = &[
+            (201, "", Delivered),
+            (410, r#"{"reason":"Unregistered"}"#, Gone),
+            (404, "", Gone),
+            (403, r#"{"reason":"VapidPkHashMismatch"}"#, KeyMismatch),
+            (
+                403,
+                "the key in the authorization header does not correspond to the sender ID used to subscribe this user",
+                KeyMismatch,
+            ),
+            (403, r#"{"reason":"BadJwtToken"}"#, Rejected),
+            (400, r#"{"reason":"BadWebPushRequest"}"#, Rejected),
+            (413, r#"{"reason":"PayloadTooLarge"}"#, Rejected),
+            (429, r#"{"reason":"TooManyRequests"}"#, Failed),
+            (500, "", Failed),
+            (503, r#"{"reason":"ServiceUnavailable"}"#, Failed),
+        ];
+        for (status, body, want) in cases {
+            assert_eq!(classify_response(*status, body), *want, "{status} {body}");
+        }
+        assert!(Gone.is_dead() && KeyMismatch.is_dead());
+        assert!(!Rejected.is_dead() && !Failed.is_dead() && !Delivered.is_dead());
+    }
+
+    #[test]
     fn encrypt_aes128gcm_shape_and_header() {
-        // Subscription key material from a real browser push subscription
-        // is base64url. We'll fabricate reasonable byte shapes (65 bytes
-        // for p256dh, 16 for auth) and verify the body layout.
+        // Subscription key material from a real browser push subscription is base64url.
         let p_ua_bytes = {
             // Generate a valid P-256 public key.
             let seed = [7u8; 32];

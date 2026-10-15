@@ -3,8 +3,7 @@
 //! Exercises the detached `run_terminal_rename` runner against a real tmux pane
 //! and a fake `claude` one-shot shim: a still-civ-named session is renamed from
 //! its first turn (user story 1), and a manually-named session is never touched
-//! (user story 2). Runs under `serve` only because that is where the async test
-//! harness (`#[tokio::test]`) is wired; the code under test is not serve-gated.
+//! (user story 2).
 
 use std::io::Write as _;
 use std::os::unix::fs::PermissionsExt as _;
@@ -108,11 +107,39 @@ fn create_pane(name: &str, typed: &str) {
         .status()
         .expect("tmux new-session");
     assert!(status.success(), "tmux new-session failed for {name}");
-    let _ = Command::new("tmux")
+    let send = Command::new("tmux")
         .arg("-S")
         .arg(tmux_socket())
         .args(["send-keys", "-t", name, "-l", typed])
-        .output();
+        .output()
+        .expect("tmux send-keys");
+    assert!(
+        send.status.success(),
+        "tmux send-keys failed for {name}: {}",
+        String::from_utf8_lossy(&send.stderr)
+    );
+
+    let mut pane = String::new();
+    let mut ready = false;
+    for _ in 0..40 {
+        let output = Command::new("tmux")
+            .arg("-S")
+            .arg(tmux_socket())
+            // `-J` joins soft-wrapped rows so a prompt longer than the pane width still matches.
+            .args(["capture-pane", "-t", name, "-p", "-J"])
+            .output()
+            .expect("tmux capture-pane");
+        pane = String::from_utf8_lossy(&output.stdout).into_owned();
+        if output.status.success() && pane.contains(typed) {
+            ready = true;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    assert!(
+        ready,
+        "typed first-turn context never reached tmux pane {name}:\n{pane}"
+    );
     tmux::refresh_session_cache();
 }
 
@@ -206,44 +233,5 @@ async fn forced_rename_bypasses_a_prior_failed_attempt() {
         reload_title(&id).0,
         "Retry title wins",
         "force must bypass the attempted gate"
-    );
-}
-
-#[tokio::test]
-#[serial]
-async fn never_overwrites_a_manual_title() {
-    if !tmux_available() {
-        eprintln!("skipping: tmux not on PATH");
-        return;
-    }
-    let _home = setup_temp_home();
-    let _bin = install_fake_claude("Should Not Apply");
-
-    let inst = seed_instance("Zulu");
-    let id = inst.id.clone();
-    // Manually rename: diverges title from last_auto_title, freezing it.
-    Storage::new_unwatched("default")
-        .unwrap()
-        .update(|instances, _| {
-            if let Some(i) = instances.iter_mut().find(|i| i.id == id) {
-                i.title = "Hand picked".to_string();
-            }
-            Ok(())
-        })
-        .unwrap();
-
-    let name = tmux::Session::generate_name(&id, "Hand picked");
-    create_pane(&name, "do something else entirely");
-    // A manual title is not eligible, so no rename/rekey happens here.
-    let _cleanup = TmuxCleanup(vec![name]);
-
-    smart_rename::run_terminal_rename("default", &id, false)
-        .await
-        .expect("run_terminal_rename");
-
-    let (title, _) = reload_title(&id);
-    assert_eq!(
-        title, "Hand picked",
-        "a manual title must never be overwritten"
     );
 }

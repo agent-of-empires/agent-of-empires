@@ -5,9 +5,7 @@ import { reportError, reportInfo } from "../lib/toastBus";
 
 interface Props {
   onClose: () => void;
-  /** Id of the currently-open session, or null on the dashboard / no session.
-   *  When set, the modal shows a "Copy session id" row; the id is otherwise
-   *  unreachable in a PWA install where the URL bar is hidden. */
+  /** Id of the currently-open session, or null on the dashboard / no session. */
   sessionId: string | null;
 }
 

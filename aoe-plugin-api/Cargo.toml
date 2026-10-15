@@ -2,7 +2,7 @@
 name = "aoe-plugin-api"
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.85"
+rust-version = "1.89"
 publish = false
 description = "Plugin manifest and capability types for the Agent of Empires plugin system (#268)"
 license = "MIT"
@@ -18,6 +18,5 @@ toml = "1.1"
 thiserror = "2.0"
 sha2 = "0.11"
 # Parses and matches the manifest's `aoe_version` host-compatibility range.
-# Direct dep here (not via the host) because plugin install/load runs in
-# TUI-only builds, where the main crate's `serve`-gated semver is absent.
+# Direct dep here (not via the host) so this crate stays standalone.
 semver = "1"

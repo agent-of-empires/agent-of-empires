@@ -56,12 +56,14 @@ fn wait_for_config(h: &TuiTestHarness, needles: &[&str]) -> String {
     }
 }
 
+/// The first run walks every page in order; picking Tmux attach and the
+/// `empire` theme persists both choices.
 #[test]
 #[parallel]
-fn intro_walkthrough_appears_on_first_run() {
+fn intro_walkthrough_persists_attach_and_theme_choices() {
     require_tmux!();
 
-    let mut h = TuiTestHarness::new("intro_first_run");
+    let mut h = TuiTestHarness::new("intro_walkthrough");
     force_first_run(&h);
     h.spawn_tui();
 
@@ -70,18 +72,6 @@ fn intro_walkthrough_appears_on_first_run() {
     h.assert_screen_contains("(1/6)");
     h.assert_screen_contains("[Skip]");
     h.assert_screen_contains("[Next");
-}
-
-#[test]
-#[parallel]
-fn intro_advances_through_pages_with_enter() {
-    require_tmux!();
-
-    let mut h = TuiTestHarness::new("intro_pages");
-    force_first_run(&h);
-    h.spawn_tui();
-
-    h.wait_for("(1/6)");
     h.send_keys("Enter");
     h.wait_for("(2/6)");
     h.assert_screen_contains("Help improve aoe with anonymous usage telemetry?");
@@ -91,17 +81,24 @@ fn intro_advances_through_pages_with_enter() {
     h.send_keys("Enter");
     h.wait_for("(4/6)");
     h.assert_screen_contains("How do you want to drive your sessions?");
+    // LiveSend is pre-selected; flip to Tmux and wait for the `▶` marker so a
+    // dropped keystroke cannot advance with the old selection.
+    h.send_keys("Down");
+    h.wait_for("▶ Tmux mode");
     h.send_keys("Enter");
     h.wait_for("(5/6)");
     h.assert_screen_contains("Pick a theme");
+    // BUILTIN_THEMES is ordered `default, empire, ...`.
+    h.send_keys("Down");
+    h.wait_for("▶ empire");
     h.send_keys("Enter");
     h.wait_for("(6/6)");
     h.assert_screen_contains("You're all set");
     h.send_keys("Enter");
-    // Intro dismissed: list view marker should appear and the dialog title
-    // should be gone.
+
     h.wait_for("No sessions yet");
     h.wait_for_absent("(6/6)", Duration::from_secs(3));
+    wait_for_config(&h, &["name = \"empire\"", "default_attach_mode = \"tmux\""]);
 }
 
 #[test]
@@ -134,77 +131,4 @@ fn intro_esc_skips_without_changing_theme() {
         !cfg.contains("default_attach_mode = \"live_send\""),
         "skip should not write an attach mode; got:\n{cfg}"
     );
-}
-
-#[test]
-#[parallel]
-fn intro_theme_pick_persists_to_config() {
-    require_tmux!();
-
-    let mut h = TuiTestHarness::new("intro_theme_save");
-    force_first_run(&h);
-    h.spawn_tui();
-
-    h.wait_for("(1/6)");
-    h.send_keys("Enter"); // -> page 2 (telemetry)
-    h.wait_for("(2/6)");
-    h.send_keys("Enter"); // -> page 3 (first session)
-    h.wait_for("(3/6)");
-    h.send_keys("Enter"); // -> page 4 (attach mode, pre-selects LiveSend)
-    h.wait_for("(4/6)");
-    h.send_keys("Enter"); // -> page 5 (theme picker)
-    h.wait_for("(5/6)");
-    // BUILTIN_THEMES (src/tui/styles/mod.rs) is ordered `default, empire, ...`
-    // so a single Down from the default-seeded cursor lands on `empire`.
-    h.send_keys("Down");
-    // Wait for the selection marker to land on `empire` before advancing, so a
-    // dropped/late Down keystroke can't leave the cursor on the default theme
-    // (render_theme_picker marks the selected row with a leading `▶`).
-    h.wait_for("▶ empire");
-    h.send_keys("Enter"); // -> page 6 (done)
-    h.wait_for("(6/6)");
-    h.send_keys("Enter"); // submit
-
-    h.wait_for("No sessions yet");
-    h.wait_for_absent("(6/6)", Duration::from_secs(3));
-
-    // Walking through AttachMode without toggling persists the wizard's
-    // pre-selected LiveSend on the attach-mode field alongside the theme.
-    wait_for_config(
-        &h,
-        &["name = \"empire\"", "default_attach_mode = \"live_send\""],
-    );
-}
-
-#[test]
-#[parallel]
-fn intro_lets_user_choose_tmux_attach() {
-    require_tmux!();
-
-    let mut h = TuiTestHarness::new("intro_attach_tmux");
-    force_first_run(&h);
-    h.spawn_tui();
-
-    h.wait_for("(1/6)");
-    h.send_keys("Enter"); // -> telemetry
-    h.wait_for("(2/6)");
-    h.send_keys("Enter"); // -> first session
-    h.wait_for("(3/6)");
-    h.send_keys("Enter"); // -> attach mode
-    h.wait_for("(4/6)");
-    // Pre-selected LiveSend; flip to Tmux.
-    h.send_keys("Down");
-    // Confirm the marker moved to Tmux before advancing, so a dropped Down
-    // can't leave LiveSend selected (render_attach_mode marks the row `▶`).
-    h.wait_for("▶ Tmux mode");
-    h.send_keys("Enter"); // -> theme
-    h.wait_for("(5/6)");
-    h.send_keys("Enter"); // -> done
-    h.wait_for("(6/6)");
-    h.send_keys("Enter"); // submit
-
-    h.wait_for("No sessions yet");
-    h.wait_for_absent("(6/6)", Duration::from_secs(3));
-
-    wait_for_config(&h, &["default_attach_mode = \"tmux\""]);
 }

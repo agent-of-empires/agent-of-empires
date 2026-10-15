@@ -8,7 +8,10 @@ use ratatui::widgets::*;
 use tui_input::backend::crossterm::EventHandler;
 use tui_input::Input;
 
+use super::hint_buttons::{Hint, HintButtons};
+use super::scroll::calculate_scroll;
 use super::text_input::set_prefixed_input_cursor_position;
+use crate::tui::dialogs::{contains, hover_select, row_index};
 use crate::tui::styles::Theme;
 
 pub enum DirPickerResult {
@@ -17,16 +20,34 @@ pub enum DirPickerResult {
     Selected(String),
 }
 
+const HINTS: [Hint; 4] = [
+    ("Enter", "open/select", KeyCode::Null),
+    ("\u{2190}", "back", KeyCode::Left),
+    ("?", "help", KeyCode::Char('?')),
+    ("Esc", "cancel", KeyCode::Esc),
+];
+
 pub struct DirPicker {
     active: bool,
     filter: Input,
     selected: usize,
+    /// The row the list scrolls to keep visible. Follows `selected` except
+    /// on hover, so the rows never shift under a still pointer.
+    scroll_cursor: usize,
     cwd: PathBuf,
     dirs: Vec<String>,
     /// True when read_dir failed (e.g. permission denied)
     read_error: bool,
     show_hidden: bool,
     show_help: bool,
+    /// Hit areas from the last render; the list rows cover only the rendered
+    /// items, starting at `scroll_offset`.
+    dialog_area: Rect,
+    rows_area: Rect,
+    scroll_offset: usize,
+    more_above_area: Rect,
+    more_below_area: Rect,
+    footer: HintButtons,
 }
 
 impl Default for DirPicker {
@@ -41,11 +62,18 @@ impl DirPicker {
             active: false,
             filter: Input::default(),
             selected: 0,
+            scroll_cursor: 0,
             cwd: PathBuf::new(),
             dirs: Vec::new(),
             read_error: false,
             show_hidden: false,
             show_help: false,
+            dialog_area: Rect::default(),
+            rows_area: Rect::default(),
+            scroll_offset: 0,
+            more_above_area: Rect::default(),
+            more_below_area: Rect::default(),
+            footer: HintButtons::default(),
         }
     }
 
@@ -69,6 +97,7 @@ impl DirPicker {
         self.cwd = path;
         self.filter = Input::default();
         self.selected = 0;
+        self.scroll_cursor = 0;
         self.show_help = false;
         self.refresh_dirs();
         self.active = true;
@@ -122,7 +151,6 @@ impl DirPicker {
         result
     }
 
-    /// Resolve a filtered list entry name to an absolute path.
     fn resolve_path(&self, name: &str) -> PathBuf {
         if name == "./" {
             self.cwd.clone()
@@ -144,7 +172,85 @@ impl DirPicker {
         self.refresh_dirs();
     }
 
+    /// Act on the highlighted row: `./` selects the current directory and
+    /// closes, any other row navigates into it.
+    fn open_selected(&mut self) -> DirPickerResult {
+        let filtered = self.filtered_dirs();
+        if filtered.is_empty() {
+            return DirPickerResult::Continue;
+        }
+        let name = &filtered[self.selected.min(filtered.len() - 1)];
+        if name == "./" {
+            self.active = false;
+            DirPickerResult::Selected(self.cwd.to_string_lossy().to_string())
+        } else {
+            let path = self.resolve_path(name);
+            self.navigate_to(path);
+            DirPickerResult::Continue
+        }
+    }
+
+    fn go_up(&mut self) {
+        if let Some(parent) = self.cwd.parent() {
+            self.navigate_to(parent.to_path_buf());
+        }
+    }
+
+    /// Filtered-list index of the rendered row under `(col, row)`.
+    fn row_at(&self, col: u16, row: u16) -> Option<usize> {
+        let visible = self.rows_area.height as usize;
+        row_index(self.rows_area, col, row, visible).map(|i| self.scroll_offset + i)
+    }
+
+    /// A row acts like Enter on it and an overflow marker steps toward the
+    /// hidden rows; a click outside cancels.
+    pub fn handle_click(&mut self, col: u16, row: u16) -> DirPickerResult {
+        let result = self.click(col, row);
+        self.scroll_cursor = self.selected;
+        result
+    }
+
+    fn click(&mut self, col: u16, row: u16) -> DirPickerResult {
+        if self.show_help {
+            self.show_help = false;
+            return DirPickerResult::Continue;
+        }
+        if !contains(self.dialog_area, col, row) {
+            self.active = false;
+            return DirPickerResult::Cancelled;
+        }
+        if let Some(idx) = self.row_at(col, row) {
+            self.selected = idx;
+            return self.open_selected();
+        }
+        if contains(self.more_above_area, col, row) {
+            self.selected = self.scroll_offset.saturating_sub(1);
+        } else if contains(self.more_below_area, col, row) {
+            self.selected = self.scroll_offset + self.rows_area.height as usize;
+        } else if let Some(key) = self.footer.key_at(col, row) {
+            return self.apply_key(key);
+        }
+        DirPickerResult::Continue
+    }
+
+    /// Move the row highlight under the pointer and track the hovered hint.
+    /// Leaves the scroll alone. Returns whether anything changed.
+    pub fn handle_hover(&mut self, col: u16, row: u16) -> bool {
+        if self.show_help {
+            return false;
+        }
+        let hint_changed = self.footer.handle_hover(col, row);
+        let hovered = self.row_at(col, row);
+        hover_select(&mut self.selected, hovered) | hint_changed
+    }
+
     pub fn handle_key(&mut self, key: KeyEvent) -> DirPickerResult {
+        let result = self.apply_key(key);
+        self.scroll_cursor = self.selected;
+        result
+    }
+
+    fn apply_key(&mut self, key: KeyEvent) -> DirPickerResult {
         if self.show_help {
             if matches!(key.code, KeyCode::Esc | KeyCode::Char('?')) {
                 self.show_help = false;
@@ -159,35 +265,16 @@ impl DirPicker {
             return DirPickerResult::Continue;
         }
 
-        let filtered = self.filtered_dirs();
-        let filtered_len = filtered.len();
+        let filtered_len = self.filtered_dirs().len();
 
         match key.code {
             KeyCode::Esc => {
                 self.active = false;
                 DirPickerResult::Cancelled
             }
-            KeyCode::Enter | KeyCode::Right => {
-                if filtered_len == 0 {
-                    return DirPickerResult::Continue;
-                }
-                let idx = self.selected.min(filtered_len - 1);
-                let name = &filtered[idx];
-                if name == "./" {
-                    // Select current directory and close picker
-                    self.active = false;
-                    DirPickerResult::Selected(self.cwd.to_string_lossy().to_string())
-                } else {
-                    // Navigate into directory (including ../)
-                    let path = self.resolve_path(name);
-                    self.navigate_to(path);
-                    DirPickerResult::Continue
-                }
-            }
+            KeyCode::Enter | KeyCode::Right => self.open_selected(),
             KeyCode::Left => {
-                if let Some(parent) = self.cwd.parent() {
-                    self.navigate_to(parent.to_path_buf());
-                }
+                self.go_up();
                 DirPickerResult::Continue
             }
             KeyCode::Up => {
@@ -204,9 +291,7 @@ impl DirPicker {
             }
             KeyCode::Backspace => {
                 if self.filter.value().is_empty() {
-                    if let Some(parent) = self.cwd.parent() {
-                        self.navigate_to(parent.to_path_buf());
-                    }
+                    self.go_up();
                 } else {
                     self.filter.handle_event(&crossterm::event::Event::Key(key));
                     self.selected = 0;
@@ -245,7 +330,7 @@ impl DirPicker {
         format!("{}{}", ellipsis, tail)
     }
 
-    pub fn render(&self, frame: &mut Frame, area: Rect, theme: &Theme) {
+    pub fn render(&mut self, frame: &mut Frame, area: Rect, theme: &Theme) {
         let filtered = self.filtered_dirs();
         let max_visible: usize = 10;
         let list_height = filtered.len().min(max_visible) as u16;
@@ -254,6 +339,7 @@ impl DirPicker {
         let dialog_width: u16 = 60.min(area.width.saturating_sub(4));
 
         let dialog_area = crate::tui::dialogs::centered_rect(area, dialog_width, dialog_height);
+        self.dialog_area = dialog_area;
         frame.render_widget(Clear, dialog_area);
 
         // " Browse: <path> " with border chars leaves dialog_width - 2 for content,
@@ -293,7 +379,36 @@ impl DirPicker {
         set_prefixed_input_cursor_position(frame, chunks[0], "Filter: ", &self.filter);
 
         let visible_height = chunks[2].height as usize;
-        let scroll = super::scroll::calculate_scroll(filtered.len(), self.selected, visible_height);
+        let scroll = calculate_scroll(filtered.len(), self.scroll_cursor, visible_height);
+        let list = chunks[2];
+        let line_at = |offset: u16, height: u16| {
+            let y = list.y + offset;
+            Rect::new(
+                list.x,
+                y,
+                list.width,
+                height.min(list.bottom().saturating_sub(y)),
+            )
+        };
+        let above = u16::from(scroll.has_more_above);
+        let has_rows = !self.read_error && !filtered.is_empty();
+        let visible = if has_rows {
+            scroll.list_visible as u16
+        } else {
+            0
+        };
+        self.scroll_offset = scroll.scroll_offset;
+        self.rows_area = line_at(above, visible);
+        self.more_above_area = if has_rows && scroll.has_more_above {
+            line_at(0, 1)
+        } else {
+            Rect::default()
+        };
+        self.more_below_area = if has_rows && scroll.has_more_below {
+            line_at(above + visible, 1)
+        } else {
+            Rect::default()
+        };
 
         let mut lines: Vec<Line> = Vec::new();
         if self.read_error {
@@ -349,18 +464,8 @@ impl DirPicker {
         }
         frame.render_widget(Paragraph::new(lines), chunks[2]);
 
-        // Hint line
-        let hint_line = Line::from(vec![
-            Span::styled("Enter", Style::default().fg(theme.hint)),
-            Span::raw(" open/select  "),
-            Span::styled("\u{2190}", Style::default().fg(theme.hint)),
-            Span::raw(" back  "),
-            Span::styled("?", Style::default().fg(theme.hint)),
-            Span::raw(" help  "),
-            Span::styled("Esc", Style::default().fg(theme.hint)),
-            Span::raw(" cancel"),
-        ]);
-        frame.render_widget(Paragraph::new(hint_line), chunks[3]);
+        self.footer
+            .render(frame, chunks[3], theme, &HINTS, Alignment::Left);
 
         if self.show_help {
             self.render_help_overlay(frame, area, theme);
@@ -428,489 +533,373 @@ impl DirPicker {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crossterm::event::{KeyEvent, KeyModifiers};
+    use crate::tui::dialogs::test_render::find;
 
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)
     }
 
-    /// Create a temp directory with known subdirectories for deterministic tests.
-    fn setup_tempdir() -> (tempfile::TempDir, PathBuf) {
-        let tmp = tempfile::tempdir().expect("failed to create tempdir");
+    /// A picker opened on a temp dir holding `dirs` plus one regular file, which
+    /// must never be listed.
+    fn picker_over(dirs: &[&str]) -> (tempfile::TempDir, PathBuf, DirPicker) {
+        let tmp = tempfile::tempdir().expect("tempdir");
         let base = tmp.path().to_path_buf();
-        std::fs::create_dir(base.join("alpha")).unwrap();
-        std::fs::create_dir(base.join("beta")).unwrap();
-        std::fs::create_dir(base.join("gamma")).unwrap();
-        // Create a regular file to verify it's excluded
+        for dir in dirs {
+            std::fs::create_dir(base.join(dir)).unwrap();
+        }
         std::fs::write(base.join("file.txt"), "hello").unwrap();
-        (tmp, base)
-    }
-
-    #[test]
-    fn test_new_is_inactive() {
-        let picker = DirPicker::new();
-        assert!(!picker.is_active());
-    }
-
-    #[test]
-    fn test_activate_sets_cwd_and_lists_dirs() {
-        let (_tmp, base) = setup_tempdir();
         let mut picker = DirPicker::new();
         picker.activate(&base.to_string_lossy());
+        (tmp, base, picker)
+    }
+
+    /// The standard fixture, listing `./`, `../`, alpha, beta, gamma.
+    fn fixture() -> (tempfile::TempDir, PathBuf, DirPicker) {
+        picker_over(&["alpha", "beta", "gamma"])
+    }
+
+    fn press(picker: &mut DirPicker, codes: &[KeyCode]) -> DirPickerResult {
+        let mut result = DirPickerResult::Continue;
+        for code in codes {
+            result = picker.handle_key(key(*code));
+        }
+        result
+    }
+
+    fn typed(picker: &mut DirPicker, text: &str) {
+        for ch in text.chars() {
+            picker.handle_key(key(KeyCode::Char(ch)));
+        }
+    }
+
+    fn selected_path(result: DirPickerResult, what: &str) -> String {
+        match result {
+            DirPickerResult::Selected(path) => path,
+            _ => panic!("expected Selected from {what}"),
+        }
+    }
+
+    #[test]
+    fn activate_lists_directories_only_and_starts_on_the_dot_entry() {
+        assert!(!DirPicker::new().is_active());
+        let (_tmp, base, picker) = fixture();
         assert!(picker.is_active());
         assert_eq!(picker.cwd, base);
         assert_eq!(picker.filter.value(), "");
         assert_eq!(picker.selected, 0);
-        // Should list 3 dirs, not the file
-        assert_eq!(picker.dirs.len(), 3);
-        assert!(picker.dirs.contains(&"alpha".to_string()));
-        assert!(!picker.dirs.contains(&"file.txt".to_string()));
-    }
+        assert_eq!(picker.dirs, vec!["alpha", "beta", "gamma"]);
+        assert_eq!(picker.filtered_dirs()[..2], ["./", "../"]);
 
-    #[test]
-    fn test_activate_with_empty_path() {
+        // An empty path still lands on a real directory.
         let mut picker = DirPicker::new();
         picker.activate("");
         assert!(picker.is_active());
         assert!(picker.cwd.is_dir());
     }
 
+    /// Case-insensitive order, symlinked directories included, and hidden
+    /// directories only after an explicit Ctrl+H, which toggles both ways.
     #[test]
-    fn test_dirs_sorted_case_insensitive() {
-        let tmp = tempfile::tempdir().unwrap();
-        let base = tmp.path().to_path_buf();
-        std::fs::create_dir(base.join("Zebra")).unwrap();
-        std::fs::create_dir(base.join("apple")).unwrap();
-        std::fs::create_dir(base.join("Banana")).unwrap();
-
-        let mut picker = DirPicker::new();
-        picker.activate(&base.to_string_lossy());
+    fn listing_sorts_follows_symlinks_and_toggles_hidden() {
+        let (_tmp, _base, picker) = picker_over(&["Zebra", "apple", "Banana"]);
         assert_eq!(picker.dirs, vec!["apple", "Banana", "Zebra"]);
-    }
-
-    #[test]
-    fn test_esc_cancels() {
-        let (_tmp, base) = setup_tempdir();
-        let mut picker = DirPicker::new();
-        picker.activate(&base.to_string_lossy());
-
-        let result = picker.handle_key(key(KeyCode::Esc));
-        assert!(matches!(result, DirPickerResult::Cancelled));
-        assert!(!picker.is_active());
-    }
-
-    #[test]
-    fn test_enter_on_dot_selects_cwd() {
-        let (_tmp, base) = setup_tempdir();
-        let mut picker = DirPicker::new();
-        picker.activate(&base.to_string_lossy());
-
-        // selected=0 is "./" -- Enter on it selects the current directory
-        let result = picker.handle_key(key(KeyCode::Enter));
-        match result {
-            DirPickerResult::Selected(path) => {
-                assert_eq!(path, base.to_string_lossy());
-            }
-            _ => panic!("Expected Selected"),
-        }
-        assert!(!picker.is_active());
-    }
-
-    #[test]
-    fn test_enter_on_parent_navigates_up() {
-        let (_tmp, base) = setup_tempdir();
-        let mut picker = DirPicker::new();
-        picker.activate(&base.to_string_lossy());
-
-        // Navigate to "../" (index 1: ./, ../, alpha, beta, gamma)
-        picker.handle_key(key(KeyCode::Down));
-        assert_eq!(picker.selected, 1);
-
-        let result = picker.handle_key(key(KeyCode::Enter));
-        assert!(matches!(result, DirPickerResult::Continue));
-        assert!(picker.is_active());
-        assert_eq!(picker.cwd, base.parent().unwrap().to_path_buf());
-    }
-
-    #[test]
-    fn test_enter_on_subdir_navigates_into() {
-        let (_tmp, base) = setup_tempdir();
-        let mut picker = DirPicker::new();
-        picker.activate(&base.to_string_lossy());
-
-        // Navigate to "alpha" (index 2: ./, ../, alpha, beta, gamma)
-        picker.handle_key(key(KeyCode::Down));
-        picker.handle_key(key(KeyCode::Down));
-        let result = picker.handle_key(key(KeyCode::Enter));
-        assert!(matches!(result, DirPickerResult::Continue));
-        assert!(picker.is_active());
-        assert_eq!(picker.cwd, base.join("alpha"));
-        assert_eq!(picker.filter.value(), "");
-        assert_eq!(picker.selected, 0);
-    }
-
-    #[test]
-    fn test_right_arrow_navigates_into_directory() {
-        let (_tmp, base) = setup_tempdir();
-        let mut picker = DirPicker::new();
-        picker.activate(&base.to_string_lossy());
-
-        // Navigate to "alpha" (index 2)
-        picker.handle_key(key(KeyCode::Down));
-        picker.handle_key(key(KeyCode::Down));
-        let result = picker.handle_key(key(KeyCode::Right));
-        assert!(matches!(result, DirPickerResult::Continue));
-        assert_eq!(picker.cwd, base.join("alpha"));
-    }
-
-    #[test]
-    fn test_right_arrow_on_dot_selects_cwd() {
-        let (_tmp, base) = setup_tempdir();
-        let mut picker = DirPicker::new();
-        picker.activate(&base.to_string_lossy());
-
-        // selected=0 is "./" -- Right on it selects (same as Enter on ./)
-        let result = picker.handle_key(key(KeyCode::Right));
-        match result {
-            DirPickerResult::Selected(path) => {
-                assert_eq!(path, base.to_string_lossy());
-            }
-            _ => panic!("Expected Selected"),
-        }
-        assert!(!picker.is_active());
-    }
-
-    #[test]
-    fn test_left_arrow_navigates_to_parent() {
-        let (_tmp, base) = setup_tempdir();
-        let child = base.join("alpha");
-        let mut picker = DirPicker::new();
-        picker.activate(&child.to_string_lossy());
-
-        let result = picker.handle_key(key(KeyCode::Left));
-        assert!(matches!(result, DirPickerResult::Continue));
-        assert_eq!(picker.cwd, base);
-    }
-
-    #[test]
-    fn test_backspace_empty_filter_goes_to_parent() {
-        let (_tmp, base) = setup_tempdir();
-        let child = base.join("alpha");
-        let mut picker = DirPicker::new();
-        picker.activate(&child.to_string_lossy());
-
-        picker.handle_key(key(KeyCode::Backspace));
-        assert_eq!(picker.cwd, base);
-    }
-
-    #[test]
-    fn test_backspace_with_filter_removes_char() {
-        let (_tmp, base) = setup_tempdir();
-        let mut picker = DirPicker::new();
-        picker.activate(&base.to_string_lossy());
-
-        picker.handle_key(key(KeyCode::Char('a')));
-        assert_eq!(picker.filter.value(), "a");
-        picker.handle_key(key(KeyCode::Backspace));
-        assert_eq!(picker.filter.value(), "");
-    }
-
-    #[test]
-    fn test_enter_navigates_then_dot_selects() {
-        let (_tmp, base) = setup_tempdir();
-        let mut picker = DirPicker::new();
-        picker.activate(&base.to_string_lossy());
-
-        // Navigate to "alpha" (index 2) and enter it
-        picker.handle_key(key(KeyCode::Down));
-        picker.handle_key(key(KeyCode::Down));
-        picker.handle_key(key(KeyCode::Enter));
-        assert_eq!(picker.cwd, base.join("alpha"));
-
-        // After entering, selected resets to 0 which is "./"
-        // Enter on "./" selects the current directory
-        let result = picker.handle_key(key(KeyCode::Enter));
-        match result {
-            DirPickerResult::Selected(path) => {
-                assert_eq!(path, base.join("alpha").to_string_lossy().to_string());
-            }
-            _ => panic!("Expected Selected"),
-        }
-        assert!(!picker.is_active());
-    }
-
-    #[test]
-    fn test_navigation_up_down() {
-        let (_tmp, base) = setup_tempdir();
-        let mut picker = DirPicker::new();
-        picker.activate(&base.to_string_lossy());
-
-        // Can't go above 0
-        picker.handle_key(key(KeyCode::Up));
-        assert_eq!(picker.selected, 0);
-
-        picker.handle_key(key(KeyCode::Down));
-        assert_eq!(picker.selected, 1);
-        picker.handle_key(key(KeyCode::Down));
-        assert_eq!(picker.selected, 2);
-        picker.handle_key(key(KeyCode::Up));
-        assert_eq!(picker.selected, 1);
-    }
-
-    #[test]
-    fn test_navigation_clamps_at_end() {
-        let (_tmp, base) = setup_tempdir();
-        let mut picker = DirPicker::new();
-        picker.activate(&base.to_string_lossy());
-
-        // 5 items: "./", "../", "alpha", "beta", "gamma"
-        for _ in 0..10 {
-            picker.handle_key(key(KeyCode::Down));
-        }
-        assert_eq!(picker.selected, 4);
-    }
-
-    #[test]
-    fn test_filtered_dirs_includes_dot_entry() {
-        let (_tmp, base) = setup_tempdir();
-        let mut picker = DirPicker::new();
-        picker.activate(&base.to_string_lossy());
-
-        let filtered = picker.filtered_dirs();
-        assert_eq!(filtered[0], "./");
-        assert_eq!(filtered[1], "../");
-    }
-
-    #[test]
-    fn test_filter_narrows_results() {
-        let (_tmp, base) = setup_tempdir();
-        let mut picker = DirPicker::new();
-        picker.activate(&base.to_string_lossy());
-
-        // "a" matches "alpha", "beta", "gamma" (all contain 'a'), but not "./" or "../"
-        picker.handle_key(key(KeyCode::Char('a')));
-        let filtered = picker.filtered_dirs();
-        assert!(filtered.contains(&"alpha".to_string()));
-        assert!(filtered.contains(&"beta".to_string()));
-        assert!(filtered.contains(&"gamma".to_string()));
-        assert!(!filtered.contains(&"./".to_string()));
-        assert!(!filtered.contains(&"../".to_string()));
-
-        // "al" matches only "alpha"
-        picker.handle_key(key(KeyCode::Char('l')));
-        let filtered = picker.filtered_dirs();
-        assert_eq!(filtered, vec!["alpha"]);
-    }
-
-    #[test]
-    fn test_filter_resets_selection() {
-        let (_tmp, base) = setup_tempdir();
-        let mut picker = DirPicker::new();
-        picker.activate(&base.to_string_lossy());
-
-        picker.handle_key(key(KeyCode::Down));
-        picker.handle_key(key(KeyCode::Down));
-        assert_eq!(picker.selected, 2);
-
-        picker.handle_key(key(KeyCode::Char('a')));
-        assert_eq!(picker.selected, 0);
-    }
-
-    #[test]
-    fn test_jk_are_filter_chars_not_navigation() {
-        let (_tmp, base) = setup_tempdir();
-        let mut picker = DirPicker::new();
-        picker.activate(&base.to_string_lossy());
-
-        picker.handle_key(key(KeyCode::Char('j')));
-        assert_eq!(picker.filter.value(), "j");
-        assert_eq!(picker.selected, 0);
-
-        picker.handle_key(key(KeyCode::Char('k')));
-        assert_eq!(picker.filter.value(), "jk");
-    }
-
-    #[test]
-    fn test_symlinked_dirs_are_listed() {
-        let tmp = tempfile::tempdir().unwrap();
-        let base = tmp.path().to_path_buf();
-        let real_dir = base.join("real");
-        std::fs::create_dir(&real_dir).unwrap();
 
         #[cfg(unix)]
         {
-            std::os::unix::fs::symlink(&real_dir, base.join("link")).unwrap();
-            let mut picker = DirPicker::new();
-            picker.activate(&base.to_string_lossy());
-            assert!(picker.dirs.contains(&"real".to_string()));
+            let (_tmp, base, mut picker) = picker_over(&["real"]);
+            std::os::unix::fs::symlink(base.join("real"), base.join("link")).unwrap();
+            picker.refresh_dirs();
             assert!(picker.dirs.contains(&"link".to_string()));
+        }
+
+        let (_tmp, _base, mut picker) = picker_over(&[".hidden", "visible"]);
+        assert_eq!(picker.dirs, vec!["visible"]);
+        let ctrl_h = KeyEvent::new(KeyCode::Char('h'), KeyModifiers::CONTROL);
+        picker.handle_key(ctrl_h);
+        assert!(picker.show_hidden);
+        assert_eq!(picker.dirs, vec![".hidden", "visible"]);
+        picker.handle_key(ctrl_h);
+        assert!(!picker.show_hidden);
+        assert_eq!(picker.dirs, vec!["visible"]);
+    }
+
+    /// `Enter` and `Right` both act on the highlighted row: `./` selects the
+    /// current directory and closes, a subdirectory navigates into it and resets
+    /// the filter and selection, after which `./` selects the new directory.
+    /// `Esc` cancels.
+    #[test]
+    fn accept_keys_select_the_dot_row_or_navigate_into_a_subdir() {
+        let (_tmp, _base, mut picker) = fixture();
+        assert!(matches!(
+            press(&mut picker, &[KeyCode::Esc]),
+            DirPickerResult::Cancelled
+        ));
+        assert!(!picker.is_active());
+
+        for accept in [KeyCode::Enter, KeyCode::Right] {
+            let (_tmp, base, mut picker) = fixture();
+            let path = selected_path(press(&mut picker, &[accept]), "./");
+            assert_eq!(path, base.to_string_lossy());
+            assert!(!picker.is_active());
+
+            // Rows are ./, ../, alpha, beta, gamma, so two Downs reach alpha.
+            let (_tmp, base, mut picker) = fixture();
+            let result = press(&mut picker, &[KeyCode::Down, KeyCode::Down, accept]);
+            assert!(matches!(result, DirPickerResult::Continue));
+            assert!(picker.is_active());
+            assert_eq!(picker.cwd, base.join("alpha"));
+            assert_eq!(picker.filter.value(), "");
+            assert_eq!(picker.selected, 0);
+            let path = selected_path(press(&mut picker, &[accept]), "./ in alpha");
+            assert_eq!(path, base.join("alpha").to_string_lossy());
         }
     }
 
+    /// Every way up: `Enter` on `../`, `Left`, and `Backspace` on an empty
+    /// filter.
     #[test]
-    fn test_files_excluded_from_listing() {
-        let (_tmp, base) = setup_tempdir();
-        let mut picker = DirPicker::new();
-        picker.activate(&base.to_string_lossy());
-        assert!(!picker.dirs.contains(&"file.txt".to_string()));
+    fn parent_navigation_keys_all_reach_the_parent() {
+        let (_tmp, base, mut picker) = fixture();
+        let result = press(&mut picker, &[KeyCode::Down, KeyCode::Enter]);
+        assert!(matches!(result, DirPickerResult::Continue));
+        assert!(picker.is_active());
+        assert_eq!(picker.cwd, base.parent().unwrap());
+
+        for code in [KeyCode::Left, KeyCode::Backspace] {
+            let (_tmp, base, _) = fixture();
+            let mut picker = DirPicker::new();
+            picker.activate(&base.join("alpha").to_string_lossy());
+            press(&mut picker, &[code]);
+            assert_eq!(picker.cwd, base, "{code:?}");
+        }
+    }
+
+    /// Up and Down clamp; keys with nothing to act on (Enter on an empty
+    /// match list, Tab) leave the picker as it was.
+    #[test]
+    fn selection_clamps_and_idle_keys_are_no_ops() {
+        let (_tmp, _base, mut picker) = fixture();
+        press(&mut picker, &[KeyCode::Up]);
+        assert_eq!(picker.selected, 0);
+        press(&mut picker, &[KeyCode::Down, KeyCode::Down, KeyCode::Up]);
+        assert_eq!(picker.selected, 1);
+        // Five rows: ./, ../, alpha, beta, gamma.
+        press(&mut picker, &[KeyCode::Down; 10]);
+        assert_eq!(picker.selected, 4);
+
+        let (_tmp, _base, mut picker) = fixture();
+        typed(&mut picker, "zzz");
+        assert!(picker.filtered_dirs().is_empty());
+        assert!(matches!(
+            press(&mut picker, &[KeyCode::Enter]),
+            DirPickerResult::Continue
+        ));
+        assert!(picker.is_active());
+
+        let (_tmp, base, mut picker) = fixture();
+        assert!(matches!(
+            press(&mut picker, &[KeyCode::Tab]),
+            DirPickerResult::Continue
+        ));
+        assert_eq!(picker.cwd, base);
+        assert_eq!(picker.selected, 0);
+    }
+
+    /// Filtering owns every printable key (`j`/`k` type rather than move),
+    /// matches directory names, and resets the highlight; Enter on a single
+    /// match navigates into it.
+    #[test]
+    fn filter_narrows_the_list_and_resets_the_selection() {
+        let (_tmp, base, mut picker) = fixture();
+        press(&mut picker, &[KeyCode::Down, KeyCode::Down]);
+        assert_eq!(picker.selected, 2);
+
+        typed(&mut picker, "a");
+        assert_eq!(picker.selected, 0);
+        assert_eq!(picker.filtered_dirs(), vec!["alpha", "beta", "gamma"]);
+
+        typed(&mut picker, "l");
+        assert_eq!(picker.filtered_dirs(), vec!["alpha"]);
+
+        // Backspace with a filter edits it rather than navigating up.
+        press(&mut picker, &[KeyCode::Backspace]);
+        assert_eq!(picker.filter.value(), "a");
+
+        typed(&mut picker, "l");
+        press(&mut picker, &[KeyCode::Enter]);
+        assert_eq!(picker.cwd, base.join("alpha"));
+        assert_eq!(picker.filter.value(), "");
+        assert_eq!(picker.selected, 0);
+        assert!(picker.is_active());
+
+        let (_tmp, _base, mut picker) = fixture();
+        typed(&mut picker, "jk");
+        assert_eq!(picker.filter.value(), "jk");
+        assert_eq!(picker.selected, 0);
+    }
+
+    /// The `./` and `../` rows survive a filter only while it looks like them.
+    #[test]
+    fn dot_filter_keeps_the_navigation_rows_only_while_it_matches_them() {
+        let (_tmp, _base, mut picker) = fixture();
+        typed(&mut picker, ".");
+        let filtered = picker.filtered_dirs();
+        assert!(filtered.contains(&"./".to_string()));
+        assert!(filtered.contains(&"../".to_string()));
+
+        typed(&mut picker, "/");
+        let filtered = picker.filtered_dirs();
+        assert!(!filtered.contains(&"./".to_string()));
+        assert!(!filtered.contains(&"../".to_string()));
     }
 
     #[test]
-    fn test_parent_entry_not_shown_at_root() {
+    fn root_has_no_parent_row_but_keeps_the_dot_row() {
         let mut picker = DirPicker::new();
         picker.activate("/");
         let filtered = picker.filtered_dirs();
         assert!(!filtered.contains(&"../".to_string()));
-        // "./" should still be present at root
         assert!(filtered.contains(&"./".to_string()));
     }
 
     #[test]
-    fn test_dotfiles_hidden_by_default() {
-        let tmp = tempfile::tempdir().unwrap();
-        let base = tmp.path().to_path_buf();
-        std::fs::create_dir(base.join(".hidden")).unwrap();
-        std::fs::create_dir(base.join("visible")).unwrap();
-
+    fn an_unreadable_directory_lists_nothing_and_flags_the_error() {
         let mut picker = DirPicker::new();
-        picker.activate(&base.to_string_lossy());
-        assert!(picker.dirs.contains(&"visible".to_string()));
-        assert!(!picker.dirs.contains(&".hidden".to_string()));
-    }
-
-    #[test]
-    fn test_ctrl_h_toggles_hidden() {
-        let tmp = tempfile::tempdir().unwrap();
-        let base = tmp.path().to_path_buf();
-        std::fs::create_dir(base.join(".hidden")).unwrap();
-        std::fs::create_dir(base.join("visible")).unwrap();
-
-        let mut picker = DirPicker::new();
-        picker.activate(&base.to_string_lossy());
-        assert!(!picker.dirs.contains(&".hidden".to_string()));
-
-        let ctrl_h = KeyEvent::new(KeyCode::Char('h'), KeyModifiers::CONTROL);
-        picker.handle_key(ctrl_h);
-        assert!(picker.show_hidden);
-        assert!(picker.dirs.contains(&".hidden".to_string()));
-        assert!(picker.dirs.contains(&"visible".to_string()));
-
-        picker.handle_key(ctrl_h);
-        assert!(!picker.show_hidden);
-        assert!(!picker.dirs.contains(&".hidden".to_string()));
-    }
-
-    #[test]
-    fn test_enter_on_empty_filtered_list_is_noop() {
-        let (_tmp, base) = setup_tempdir();
-        let mut picker = DirPicker::new();
-        picker.activate(&base.to_string_lossy());
-
-        // Type a filter that matches nothing
-        picker.handle_key(key(KeyCode::Char('z')));
-        picker.handle_key(key(KeyCode::Char('z')));
-        picker.handle_key(key(KeyCode::Char('z')));
-        let filtered = picker.filtered_dirs();
-        assert!(filtered.is_empty());
-
-        let result = picker.handle_key(key(KeyCode::Enter));
-        assert!(matches!(result, DirPickerResult::Continue));
-        assert!(picker.is_active());
-    }
-
-    #[test]
-    fn test_unreadable_dir_shows_error() {
-        let mut picker = DirPicker::new();
-        // Activate on a path that doesn't exist to trigger read_dir failure
         picker.cwd = PathBuf::from("/nonexistent_path_that_should_not_exist");
         picker.refresh_dirs();
         assert!(picker.read_error);
         assert!(picker.dirs.is_empty());
     }
 
-    #[test]
-    fn test_dot_filter_matches_navigation_entries() {
-        let (_tmp, base) = setup_tempdir();
-        let mut picker = DirPicker::new();
-        picker.activate(&base.to_string_lossy());
-
-        // Typing "." should show both "./" and "../"
-        picker.handle_key(key(KeyCode::Char('.')));
-        let filtered = picker.filtered_dirs();
-        assert!(filtered.contains(&"./".to_string()));
-        assert!(filtered.contains(&"../".to_string()));
-
-        // Typing "/" after "." (filter is "./") should NOT show either
-        picker.handle_key(key(KeyCode::Char('/')));
-        let filtered = picker.filtered_dirs();
-        assert!(!filtered.contains(&"./".to_string()));
-        assert!(!filtered.contains(&"../".to_string()));
+    fn draw(picker: &mut DirPicker) -> ratatui::buffer::Buffer {
+        crate::tui::dialogs::test_render::draw(80, 30, |f, theme| picker.render(f, f.area(), theme))
     }
 
+    /// A click on a row does what Enter on it would, each hint segment does
+    /// what its key would, and a click outside the dialog cancels.
     #[test]
-    fn test_enter_single_filtered_match_navigates() {
-        let (_tmp, base) = setup_tempdir();
-        let mut picker = DirPicker::new();
-        picker.activate(&base.to_string_lossy());
+    fn clicks_mirror_the_keys_for_rows_and_hints() {
+        enum Want {
+            Selected,
+            Cwd(&'static str),
+            Cancelled,
+            Help,
+        }
+        let cases = [
+            // Prefixed so a `...`-truncated path in the title cannot match.
+            ("> ./", Want::Selected),
+            ("  ../", Want::Cwd("..")),
+            ("alpha/", Want::Cwd("alpha")),
+            // Inert: hover moves the selection, so a row click picks instead.
+            ("open/select", Want::Cwd("")),
+            ("back", Want::Cwd("..")),
+            ("help", Want::Help),
+            ("cancel", Want::Cancelled),
+            ("Filter:", Want::Cwd("")),
+        ];
+        for (target, want) in cases {
+            let (_tmp, base, mut picker) = fixture();
+            let (col, row) = find(&draw(&mut picker), target);
+            let result = picker.handle_click(col, row);
+            match want {
+                Want::Selected => {
+                    assert_eq!(selected_path(result, target), base.to_string_lossy());
+                    assert!(!picker.is_active(), "{target}");
+                }
+                Want::Cwd(rel) => {
+                    assert!(matches!(result, DirPickerResult::Continue), "{target}");
+                    let expected = match rel {
+                        ".." => base.parent().unwrap().to_path_buf(),
+                        _ => base.join(rel),
+                    };
+                    assert_eq!(picker.cwd, expected, "{target}");
+                }
+                Want::Cancelled => {
+                    assert!(matches!(result, DirPickerResult::Cancelled), "{target}");
+                    assert!(!picker.is_active(), "{target}");
+                }
+                Want::Help => {
+                    assert!(picker.show_help, "{target}");
+                    // Any click closes the overlay and nothing else.
+                    assert!(matches!(
+                        picker.handle_click(0, 0),
+                        DirPickerResult::Continue
+                    ));
+                    assert!(!picker.show_help && picker.is_active());
+                }
+            }
+        }
 
-        // Type "al" to filter down to just "alpha"
-        picker.handle_key(key(KeyCode::Char('a')));
-        picker.handle_key(key(KeyCode::Char('l')));
-        let filtered = picker.filtered_dirs();
-        assert_eq!(filtered, vec!["alpha"]);
-
-        // Enter should navigate into "alpha"
-        picker.handle_key(key(KeyCode::Enter));
-        assert_eq!(picker.cwd, base.join("alpha"));
-        assert_eq!(picker.filter.value(), "");
-        assert_eq!(picker.selected, 0);
-        assert!(picker.is_active());
+        let (_tmp, _base, mut picker) = fixture();
+        draw(&mut picker);
+        assert!(matches!(
+            picker.handle_click(0, 0),
+            DirPickerResult::Cancelled
+        ));
+        assert!(!picker.is_active());
     }
 
+    /// Hover moves the row highlight without scrolling and tints hints
+    /// without acting; each reports a change only when its target changes.
     #[test]
-    fn test_tab_does_nothing_in_dir_picker() {
-        let (_tmp, base) = setup_tempdir();
-        let mut picker = DirPicker::new();
-        picker.activate(&base.to_string_lossy());
-        let original_cwd = picker.cwd.clone();
+    fn hover_tracks_rows_without_scrolling() {
+        let (_tmp, _base, mut picker) = fixture();
+        let buffer = draw(&mut picker);
+        let (col, row) = find(&buffer, "beta/");
+        assert!(picker.handle_hover(col, row));
+        assert_eq!(picker.selected, 3);
+        assert!(!picker.handle_hover(col + 1, row));
 
-        let result = picker.handle_key(key(KeyCode::Tab));
-        assert!(matches!(result, DirPickerResult::Continue));
-        assert_eq!(picker.cwd, original_cwd);
-        assert_eq!(picker.selected, 0);
+        // Scrolled past the top: hovering a row near the top highlights it
+        // but keeps the rows where they are.
+        let names: Vec<String> = (0..20).map(|i| format!("d{i:02}")).collect();
+        let (_tmp, _base, mut picker) =
+            picker_over(&names.iter().map(String::as_str).collect::<Vec<_>>());
+        press(&mut picker, &[KeyCode::Down; 15]);
+        let buffer = draw(&mut picker);
+        let offset = picker.scroll_offset;
+        assert!(offset > 0);
+        let first = &picker.filtered_dirs()[offset];
+        let (col, row) = find(&buffer, &format!("{first}/"));
+        assert!(picker.handle_hover(col, row));
+        assert_eq!(picker.selected, offset);
+        draw(&mut picker);
+        assert_eq!(picker.scroll_offset, offset);
+
+        // The overflow markers step onto the hidden rows, scrolling to them.
+        let (col, row) = find(&buffer, "more below]");
+        picker.handle_click(col, row);
+        let below = picker.selected;
+        draw(&mut picker);
+        assert!(picker.scroll_offset + (picker.rows_area.height as usize) > below);
+        let (col, row) = find(&draw(&mut picker), "more above]");
+        picker.handle_click(col, row);
+        assert_eq!(picker.selected, picker.scroll_offset - 1);
     }
 
+    /// Long paths are cut from the left, keeping the tail, and never split a
+    /// multi-byte character.
     #[test]
-    fn test_truncate_path_short() {
+    fn truncate_path_keeps_the_tail_within_the_budget() {
         assert_eq!(DirPicker::truncate_path("/short", 20), "/short");
-    }
+        assert_eq!(DirPicker::truncate_path("/exact", 6), "/exact");
 
-    #[test]
-    fn test_truncate_path_long() {
         let long = "/home/user/very/deeply/nested/directory/structure";
-        let truncated = DirPicker::truncate_path(long, 30);
-        assert!(truncated.starts_with("..."));
-        assert!(truncated.chars().count() <= 30);
-        assert!(truncated.ends_with("directory/structure"));
-    }
+        let cut = DirPicker::truncate_path(long, 30);
+        assert!(cut.starts_with("..."));
+        assert!(cut.chars().count() <= 30);
+        assert!(cut.ends_with("directory/structure"));
 
-    #[test]
-    fn test_truncate_path_exact() {
-        let path = "/exact";
-        assert_eq!(DirPicker::truncate_path(path, 6), "/exact");
-    }
-
-    #[test]
-    fn test_truncate_path_multibyte_utf8() {
-        let path = "/home/user/projetcs/donnees/repertoire";
-        let truncated = DirPicker::truncate_path(path, 20);
-        assert!(truncated.starts_with("..."));
-        assert!(truncated.chars().count() <= 20);
-
-        // Ensure it doesn't panic on actual multi-byte chars
-        let unicode_path = "/home/\u{00e9}\u{00e8}\u{00ea}/\u{00fc}\u{00f6}\u{00e4}/dir";
-        let truncated = DirPicker::truncate_path(unicode_path, 10);
-        assert!(truncated.starts_with("..."));
-        assert!(truncated.chars().count() <= 10);
+        for (path, budget) in [
+            ("/home/user/projetcs/donnees/repertoire", 20),
+            (
+                "/home/\u{00e9}\u{00e8}\u{00ea}/\u{00fc}\u{00f6}\u{00e4}/dir",
+                10,
+            ),
+        ] {
+            let cut = DirPicker::truncate_path(path, budget);
+            assert!(cut.starts_with("..."), "{path}");
+            assert!(cut.chars().count() <= budget, "{path}");
+        }
     }
 }

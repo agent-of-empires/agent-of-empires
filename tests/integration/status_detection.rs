@@ -99,23 +99,14 @@ mod opencode {
     }
 
     #[test]
-    fn test_running_state() {
-        test_all_fixtures_in_dir("opencode", "running", Status::Running, identity, detect);
-    }
-
-    #[test]
-    fn test_waiting_permission_state() {
-        test_all_fixtures_in_dir(
-            "opencode",
-            "waiting_permission",
-            Status::Waiting,
-            identity,
-            detect,
-        );
-    }
-
-    #[test]
-    fn test_idle_state() {
-        test_all_fixtures_in_dir("opencode", "idle", Status::Idle, identity, detect);
+    #[serial_test::parallel]
+    fn fixtures_detect_their_state() {
+        for (state, expected) in [
+            ("running", Status::Running),
+            ("waiting_permission", Status::Waiting),
+            ("idle", Status::Idle),
+        ] {
+            test_all_fixtures_in_dir("opencode", state, expected, identity, detect);
+        }
     }
 }

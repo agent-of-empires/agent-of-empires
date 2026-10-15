@@ -1,6 +1,4 @@
-/// Map a file path's extension to a code-fence language tag. Returns
-/// the empty string when no good guess is available so the fence falls
-/// back to plain text without leaking a meaningless `unknown` tag.
+/// Code-fence language for a path, or "" when unknown.
 
 const MAP: Record<string, string> = {
   rs: "rust",

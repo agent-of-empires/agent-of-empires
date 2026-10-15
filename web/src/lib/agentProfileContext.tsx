@@ -1,13 +1,5 @@
 /* eslint-disable react-refresh/only-export-components */
-// React context exposing the active session's AgentProfile to the
-// structured view's deeply-nested renderers. The wizard's `tool` field flows
-// into `SessionResponse.tool`, which the structured view reads at view-mount
-// time and feeds to the provider; classifiers in ToolCards consume it
-// via `useAgentProfile()`.
-//
-// Default value is `DEFAULT_AGENT_PROFILE` so a stray render outside
-// the provider keeps the generic-tool dispatch working rather than
-// throwing.
+// The active session's AgentProfile for deep structured view renderers, plus the server-owned clear aliases in a sibling context. Outside a provider it defaults to the generic profile.
 
 import { createContext, useContext, type ReactNode } from "react";
 
@@ -15,17 +7,32 @@ import { DEFAULT_AGENT_PROFILE, resolveAgentProfile, type AgentProfile } from ".
 
 const AgentProfileContext = createContext<AgentProfile>(DEFAULT_AGENT_PROFILE);
 
+// Stable empty default so consumers never see a fresh array.
+const NO_CLEAR_ALIASES: readonly string[] = [];
+const ClearAliasesContext = createContext<readonly string[]>(NO_CLEAR_ALIASES);
+
 export function AgentProfileProvider({
   toolKey,
+  clearAliases,
   children,
 }: {
   toolKey: string | null | undefined;
+  clearAliases?: readonly string[];
   children: ReactNode;
 }) {
   const profile = resolveAgentProfile(toolKey);
-  return <AgentProfileContext.Provider value={profile}>{children}</AgentProfileContext.Provider>;
+  return (
+    <AgentProfileContext.Provider value={profile}>
+      <ClearAliasesContext.Provider value={clearAliases ?? NO_CLEAR_ALIASES}>{children}</ClearAliasesContext.Provider>
+    </AgentProfileContext.Provider>
+  );
 }
 
 export function useAgentProfile(): AgentProfile {
   return useContext(AgentProfileContext);
+}
+
+/** Empty without a clear alias or outside a provider. */
+export function useClearAliases(): readonly string[] {
+  return useContext(ClearAliasesContext);
 }

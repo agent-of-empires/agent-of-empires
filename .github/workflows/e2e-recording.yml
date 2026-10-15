@@ -18,10 +18,10 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+      - uses: ./.github/actions/rust-toolchain
 
-      # Default features include `serve`, so building the e2e crate runs
-      # the web frontend build in build.rs.
+      # The e2e suite drives Node helpers (the fake ACP agent), so Node is
+      # needed at run time even though the default build invokes no npm.
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: '22'

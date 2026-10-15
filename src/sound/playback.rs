@@ -3,7 +3,6 @@
 use super::config::is_default_volume;
 use super::discovery::find_sound_file;
 
-/// Get the platform-specific audio command for playing a sound file
 fn get_audio_command(path: &str, volume: f64) -> Result<(String, Vec<String>), std::io::Error> {
     if cfg!(target_os = "macos") {
         Ok((
@@ -11,7 +10,6 @@ fn get_audio_command(path: &str, volume: f64) -> Result<(String, Vec<String>), s
             vec!["-v".to_string(), format!("{:.4}", volume), path.to_string()],
         ))
     } else {
-        // Linux
         let ext = std::path::Path::new(path)
             .extension()
             .and_then(|e| e.to_str())
@@ -19,7 +17,6 @@ fn get_audio_command(path: &str, volume: f64) -> Result<(String, Vec<String>), s
         let pa_volume = ((volume * 65536.0).round() as u32).to_string();
 
         if ext.eq_ignore_ascii_case("ogg") {
-            // Check if paplay is available
             if which::which("paplay").is_ok() {
                 Ok((
                     "paplay".to_string(),
@@ -36,7 +33,6 @@ fn get_audio_command(path: &str, volume: f64) -> Result<(String, Vec<String>), s
                 ))
             }
         } else {
-            // WAV files
             if which::which("aplay").is_ok() {
                 warn_aplay_volume_once(volume);
                 Ok(("aplay".to_string(), vec![path.to_string()]))
@@ -55,9 +51,7 @@ fn get_audio_command(path: &str, volume: f64) -> Result<(String, Vec<String>), s
     }
 }
 
-/// aplay has no volume flag, so the configured volume is ignored when it's
-/// the backend. Warn the user once per process so the "slider does nothing"
-/// case isn't silent.
+/// aplay has no volume flag; warn once so the ignored setting is not silent.
 fn warn_aplay_volume_once(volume: f64) {
     use std::sync::atomic::{AtomicBool, Ordering};
     static WARNED: AtomicBool = AtomicBool::new(false);
@@ -69,7 +63,6 @@ fn warn_aplay_volume_once(volume: f64) {
     }
 }
 
-/// Play a sound file by name (blocking version for testing)
 pub fn play_sound_blocking(name: &str, volume: f64) -> Result<(), std::io::Error> {
     let Some(path) = find_sound_file(name) else {
         return Err(std::io::Error::new(
@@ -97,7 +90,6 @@ pub fn play_sound_blocking(name: &str, volume: f64) -> Result<(), std::io::Error
     }
 }
 
-/// Play a sound file by name (fire-and-forget, non-blocking)
 pub fn play_sound(name: &str, volume: f64) {
     let Some(path) = find_sound_file(name) else {
         tracing::debug!(target: "sound.playback", "Sound file not found: {}", name);

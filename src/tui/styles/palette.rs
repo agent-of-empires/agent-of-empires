@@ -75,7 +75,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn palette_exact_cube_vertices_hit() {
+    fn palette_downsampling() {
         // Pure primaries land exactly on the 6x6x6 cube extreme indexes.
         assert_eq!(rgb_to_palette_index(255, 0, 0), 196);
         assert_eq!(rgb_to_palette_index(0, 255, 0), 46);
@@ -85,10 +85,7 @@ mod tests {
         assert_eq!(rgb_to_palette_index(255, 0, 255), 201);
         assert_eq!(rgb_to_palette_index(255, 255, 255), 231);
         assert_eq!(rgb_to_palette_index(0, 0, 0), 16);
-    }
 
-    #[test]
-    fn palette_pure_grey_hits_grey_ramp() {
         // Grey values around the middle of the ramp should pick a 232-255 index,
         // not a cube vertex — grey ramp is denser near #808080 than the cube.
         let mid_grey = rgb_to_palette_index(128, 128, 128);
@@ -97,10 +94,6 @@ mod tests {
             "expected grey-ramp index for #808080, got {}",
             mid_grey
         );
-    }
-
-    #[test]
-    fn color_to_palette_preserves_non_rgb() {
         assert_eq!(color_to_palette(Color::Reset), Color::Reset);
         assert_eq!(color_to_palette(Color::Indexed(42)), Color::Indexed(42));
         assert_eq!(color_to_palette(Color::Red), Color::Red);

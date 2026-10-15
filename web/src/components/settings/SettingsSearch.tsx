@@ -9,11 +9,7 @@ interface Props {
   onJump: (hit: SettingsSearchHit) => void;
 }
 
-// Full-text settings search. Sits in the settings header and filters the
-// schema-backed settings as you type, mirroring the TUI `/` overlay: selecting
-// a hit jumps to that field's tab (SettingsView scrolls it into view). cmdk
-// provides the fuzzy filtering and arrow/Enter keyboard navigation; the index
-// is built once from the cached schema.
+// Fuzzy settings search; selecting a hit jumps to the field.
 export function SettingsSearch({ schema, loading, onJump }: Props) {
   const [query, setQuery] = useState("");
   const index = useMemo(() => buildSettingsSearchIndex(schema), [schema]);

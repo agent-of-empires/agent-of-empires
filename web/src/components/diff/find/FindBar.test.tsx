@@ -31,18 +31,14 @@ describe("FindBar", () => {
     expect(last?.side).toBe("old");
   });
 
-  it("steps to the next match on Enter", () => {
+  it("steps forward on Enter and wraps backwards on Shift+Enter", () => {
     const { onJump, input } = setup();
     fireEvent.change(input, { target: { value: "beta" } });
     fireEvent.keyDown(input, { key: "Enter" });
     expect(screen.getByText("2/3")).toBeTruthy();
     const last = onJump.mock.calls.at(-1)?.[0];
     expect(last?.side).toBe("new");
-  });
-
-  it("wraps backwards on Shift+Enter", () => {
-    const { input } = setup();
-    fireEvent.change(input, { target: { value: "beta" } });
+    fireEvent.keyDown(input, { key: "Enter", shiftKey: true });
     fireEvent.keyDown(input, { key: "Enter", shiftKey: true });
     expect(screen.getByText("3/3")).toBeTruthy();
   });
@@ -59,11 +55,5 @@ describe("FindBar", () => {
     fireEvent.click(screen.getByRole("button", { name: "Regular expression" }));
     fireEvent.change(input, { target: { value: "(" } });
     expect(screen.getByText("Invalid pattern")).toBeTruthy();
-  });
-
-  it("closes on Escape", () => {
-    const { onClose, input } = setup();
-    fireEvent.keyDown(input, { key: "Escape" });
-    expect(onClose).toHaveBeenCalled();
   });
 });

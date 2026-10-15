@@ -1,16 +1,7 @@
-//! Migration v002: Seed shared sandbox directories from existing named Docker volumes.
-//!
-//! Previously, agent auth was stored in named Docker volumes (e.g. `aoe-claude-auth`).
-//! Now sandbox dirs are the only mechanism. This migration copies data from any
-//! existing named volumes into the corresponding sandbox directories so users don't
-//! lose their auth state.
-//!
-//! Uses a merge strategy: files from the volume are only copied if they don't already
-//! exist in the sandbox dir. This means the migration is safe to run even if
-//! sync_agent_config has already populated the sandbox dir with non-credential files.
-//!
-//! Old volumes are intentionally preserved after migration. Users can remove them
-//! manually with `docker volume rm aoe-claude-auth aoe-opencode-auth ...`.
+//! Migration v002: seed the shared sandbox directories from the legacy named
+//! Docker volumes that used to hold agent auth. Files already present in a
+//! sandbox dir win, so a dir `sync_agent_config` has populated is safe. The
+//! volumes are left in place for the user to remove.
 
 use anyhow::Result;
 use std::path::Path;

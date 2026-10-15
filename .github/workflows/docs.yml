@@ -30,7 +30,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Setup Rust
-        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        uses: ./.github/actions/rust-toolchain
 
       - name: Setup Node.js
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
@@ -38,10 +38,7 @@ jobs:
           node-version: '22'
 
       - name: Generate CLI documentation
-        run: |
-          mkdir -p target/ci-web-dist
-          printf '<!doctype html><title>aoe docs placeholder</title>\n' > target/ci-web-dist/index.html
-          AOE_WEB_DIST="$PWD/target/ci-web-dist" cargo xtask gen-docs
+        run: cargo xtask gen-docs
 
       - name: Build site
         run: ./scripts/build-site.sh
@@ -60,4 +57,4 @@ jobs:
     steps:
       - name: Deploy to GitHub Pages
         id: deployment
-        uses: actions/deploy-pages@cd2ce8fcbc39b97be8ca5fce6e763baed58fa128 # v5.0.0
+        uses: actions/deploy-pages@368f82528645a54fb793d4d04e342629a3f51346 # v5.0.1

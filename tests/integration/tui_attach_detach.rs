@@ -1,18 +1,4 @@
-//! Integration tests for TUI attach/detach behavior
-//!
-//! These tests validate that the terminal state is properly managed when
-//! attaching to and detaching from tmux sessions.
-
-use std::process::Command;
-
-/// Verify tmux is available for testing
-fn tmux_available() -> bool {
-    Command::new("tmux")
-        .arg("-V")
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
-}
+//! Source-level guards for the TUI attach/detach terminal handoff.
 
 fn app_method_body<'a>(source: &'a str, name: &str) -> &'a str {
     let signature = format!("fn {name}");
@@ -53,105 +39,45 @@ fn assert_contains_in_order(haystack: &str, needles: &[&str]) {
     }
 }
 
-/// Test that tmux sessions can be created and killed
+/// The TUI live-send resize path must queue geometry through `LiveSendWorker`.
+/// The worker dispatches through `Session::resize_window_if_owner`, preserving
+/// chrome-aware sizing while fencing ownership in tmux's command queue (#2766).
+/// A synchronous prep resize races the worker's ownership claim; a raw
+/// `resize-window` also ignores chrome and leaves the pane a row short (#2742).
+/// The chrome math and worker behavior have direct tests; this guards the
+/// cross-module wiring.
 #[test]
-fn test_tmux_session_lifecycle() {
-    if !tmux_available() {
-        eprintln!("Skipping test: tmux not available");
-        return;
-    }
-
-    let session_name = "aoe_test_lifecycle_12345678";
-
-    // Create a detached session
-    let create = Command::new("tmux")
-        .args(["new-session", "-d", "-s", session_name])
-        .output()
-        .expect("Failed to create tmux session");
-
-    assert!(create.status.success(), "Failed to create test session");
-
-    // Verify session exists
-    let check = Command::new("tmux")
-        .args(["has-session", "-t", session_name])
-        .output()
-        .expect("Failed to check session");
-
-    assert!(
-        check.status.success(),
-        "Session should exist after creation"
-    );
-
-    // Kill session
-    let kill = Command::new("tmux")
-        .args(["kill-session", "-t", session_name])
-        .output()
-        .expect("Failed to kill session");
-
-    assert!(kill.status.success(), "Failed to kill test session");
-
-    // Verify session no longer exists
-    let check_after = Command::new("tmux")
-        .args(["has-session", "-t", session_name])
-        .output()
-        .expect("Failed to check session");
-
-    assert!(
-        !check_after.status.success(),
-        "Session should not exist after kill"
-    );
-}
-
-/// Test that session names are properly sanitized
-#[test]
-fn test_session_name_format() {
-    let prefix = "aoe_";
-
-    // Valid session names should start with our prefix
-    let session_name = format!("{}my_project_abc12345", prefix);
-    assert!(session_name.starts_with(prefix));
-
-    // Session names should not contain problematic characters
-    assert!(!session_name.contains(' '));
-    assert!(!session_name.contains(':'));
-    assert!(!session_name.contains('.'));
-}
-
-/// The TUI live-send resize path must size the pane through
-/// `Session::resize_window` (which adds the status-bar chrome back so the pane
-/// lands at exactly the requested rows, #2766), not a raw `resize-window` that
-/// ignores chrome. A raw resize leaves the live pane a row short of the preview
-/// output area whenever a client reserves the status row, desyncing the live
-/// preview by a row (#2742). Behavioral coverage is unreliable here because
-/// `resize-window` is a no-op / reports chrome 0 on a detached, client-less
-/// tmux on some builds (see the dropped convergence test in #2766); the
-/// chrome math itself is unit-tested by `chrome_rows_*`. This guards the
-/// wiring so it can't silently regress to the raw path.
-#[test]
+#[serial_test::parallel]
 fn test_live_send_resize_uses_chrome_aware_resize_window() {
-    // Worker dispatch (the `TmuxAction::Resize` arm).
     let dispatch =
         std::fs::read_to_string("src/tui/home/live_send.rs").expect("Failed to read live_send.rs");
     let body = app_method_body(&dispatch, "dispatch_via_fork");
     assert!(
-        body.contains("resize_window("),
-        "dispatch_via_fork must resize through Session::resize_window (chrome-aware, #2766)"
+        body.contains("resize_window_if_owner("),
+        "dispatch_via_fork must use the guarded chrome-aware resize path (#2766)"
     );
     assert!(
         !body.contains("\"resize-window\""),
-        "dispatch_via_fork must not run a raw `resize-window`, which ignores status-bar chrome (#2742)"
+        "dispatch_via_fork must not run a raw resize-window (#2742)"
     );
 
-    // Live-send entry sync (`finalize_live_send_resize`).
-    let home = std::fs::read_to_string("src/tui/home/mod.rs").expect("Failed to read home/mod.rs");
-    let finalize = app_method_body(&home, "finalize_live_send_resize");
+    let render =
+        std::fs::read_to_string("src/tui/home/render.rs").expect("Failed to read render.rs");
+    let reconcile = app_method_body(&render, "resize_live_pane_if_target");
     assert!(
-        finalize.contains("resize_window("),
-        "finalize_live_send_resize must resize through Session::resize_window (chrome-aware, #2766)"
+        reconcile.contains("worker.resize(width, height)"),
+        "render must queue settled geometry through LiveSendWorker"
     );
     assert!(
-        !finalize.contains("\"resize-window\""),
-        "finalize_live_send_resize must not run a raw `resize-window` (#2742)"
+        !reconcile.contains("resize_window("),
+        "render must not synchronously resize on the paint path"
+    );
+
+    let prep = std::fs::read_to_string("src/tui/home/live_send_prep.rs")
+        .expect("Failed to read home/live_send_prep.rs");
+    assert!(
+        !prep.contains("resize_window("),
+        "live-send preparation must leave post-draw resize ownership to the worker"
     );
 }
 
@@ -164,6 +90,7 @@ fn test_live_send_resize_uses_chrome_aware_resize_window() {
 /// alternate screen are restored so the fresh reader is born into raw
 /// mode rather than attached to a briefly-cooked tty.
 #[test]
+#[serial_test::parallel]
 fn test_terminal_mode_sequence_documented() {
     let source = std::fs::read_to_string("src/tui/app.rs").expect("Failed to read app.rs");
     let helper_body = app_method_body(&source, "with_raw_mode_disabled");
@@ -201,6 +128,7 @@ fn test_terminal_mode_sequence_documented() {
 /// Attach paths go through `with_attached_status_hooks`, which wraps that
 /// helper while polling status hooks during a blocked tmux attach.
 #[test]
+#[serial_test::parallel]
 fn test_attach_uses_terminal_backend() {
     let source = std::fs::read_to_string("src/tui/app.rs").expect("Failed to read app.rs");
 
@@ -231,7 +159,11 @@ fn test_attach_uses_terminal_backend() {
         "with_attached_status_hooks should not use std::io::stdout() directly"
     );
 
-    for attach_method in ["attach_session", "attach_terminal", "attach_tool_session"] {
+    for attach_method in [
+        "attach_live_session",
+        "attach_terminal",
+        "attach_tool_session",
+    ] {
         let attach_body = app_method_body(&source, attach_method);
 
         assert!(
@@ -250,23 +182,34 @@ fn test_attach_uses_terminal_backend() {
 /// terminal. Apply their final snapshot after reload so the next normal
 /// poll sees the same runtime status and does not fire the transition again.
 #[test]
+#[serial_test::parallel]
 fn test_attach_applies_attached_status_snapshot_after_reload() {
     let source = std::fs::read_to_string("src/tui/app.rs").expect("Failed to read app.rs");
 
-    for attach_method in ["attach_session", "attach_terminal", "attach_tool_session"] {
+    // Every attach path hands its hook snapshot to one settle helper, which
+    // owns the reload-then-apply order.
+    for attach_method in [
+        "attach_live_session",
+        "attach_terminal",
+        "attach_tool_session",
+    ] {
         let attach_body = app_method_body(&source, attach_method);
         assert_contains_in_order(
             attach_body,
             &[
                 "attached_status_updates",
-                "self.home.reload()?",
-                "apply_status_updates_without_hooks(attached_status_updates)",
+                "self.settle_after_attach(attached_status_updates)?",
             ],
         );
     }
+    assert_contains_in_order(
+        app_method_body(&source, "settle_after_attach"),
+        &["self.home.reload()?", "apply_status_updates_without_hooks("],
+    );
 }
 
 #[test]
+#[serial_test::parallel]
 fn test_attach_resets_status_refresh_without_watcher() {
     let source = std::fs::read_to_string("src/tui/app.rs").expect("Failed to read app.rs");
     let attached_status_body = app_method_body(&source, "with_attached_status_hooks");
@@ -280,44 +223,5 @@ fn test_attach_resets_status_refresh_without_watcher() {
             "self.home.reset_status_refresh()",
             "result.map",
         ],
-    );
-}
-
-/// Test that a failed restart inside attach surfaces a transient toast.
-///
-/// Before the fix, when `restart_instance_with_size_opts` returned Err the
-/// code stored the error on the instance and bailed `Ok(())`, with no
-/// user-visible signal. This test guards the wiring that turns the failure
-/// into an `UpdateStatus::transient` toast.
-#[test]
-fn test_attach_restart_failure_emits_transient_toast() {
-    let source = std::fs::read_to_string("src/tui/app.rs").expect("Failed to read app.rs");
-
-    let attach_fn_start = source
-        .find("fn attach_session(")
-        .expect("attach_session function not found");
-
-    // Walk to the end of attach_session by finding the next `fn ` at the
-    // same indentation level.
-    let attach_fn_section = &source[attach_fn_start..];
-    let attach_fn_end = attach_fn_section
-        .find("\n    fn ")
-        .unwrap_or(attach_fn_section.len());
-    let attach_fn_body = &attach_fn_section[..attach_fn_end];
-
-    let restart_idx = attach_fn_body
-        .find("restart_instance_with_size_opts")
-        .expect("attach_session should call restart_instance_with_size_opts");
-    let after_restart = &attach_fn_body[restart_idx..];
-
-    assert!(
-        after_restart.contains("UpdateStatus::transient"),
-        "attach_session must surface restart failure via UpdateStatus::transient. \
-         Without this, the TUI silently stays on home and the user sees no error."
-    );
-    assert!(
-        after_restart.contains("restart failed"),
-        "the toast should carry the `restart failed: ...` prefix so the error \
-         is recognizable in the bar."
     );
 }

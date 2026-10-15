@@ -31,7 +31,7 @@ const PAGES = [
     dest: "guides/diff-view.md",
     title: "Diff View",
     description:
-      "Review git changes and edit files directly from the Agent of Empires TUI.",
+      "Review a session's changes in the TUI and the web dashboard: split view, inline comments, and the per-repo base override.",
   },
   {
     source: "docs/guides/repo-config.md",
@@ -50,9 +50,16 @@ const PAGES = [
   {
     source: "docs/guides/sandbox.md",
     dest: "guides/sandbox.md",
-    title: "Docker Sandbox: Quick Reference",
+    title: "Container Sandbox",
     description:
-      "Run AI coding agents in isolated Docker containers with Agent of Empires.",
+      "Run AI coding agents in isolated containers with Agent of Empires: Docker, Podman, or Apple Container.",
+  },
+  {
+    source: "docs/guides/otari-telemetry.md",
+    dest: "guides/otari-telemetry.md",
+    title: "Claude Code Telemetry to Otari",
+    description:
+      "Export Claude Code usage from host and AoE sandbox sessions to a self-hosted Otari gateway.",
   },
   {
     source: "docs/guides/tmux-status-bar.md",
@@ -64,30 +71,16 @@ const PAGES = [
   {
     source: "docs/guides/web-dashboard.md",
     dest: "guides/web-dashboard.md",
-    title: "Web Dashboard (Experimental)",
+    title: "Web Dashboard",
     description:
       "Remote access to AI coding agent sessions from any browser with Agent of Empires.",
-  },
-  {
-    source: "docs/guides/remote-phone-access.md",
-    dest: "guides/remote-phone-access.md",
-    title: "Remote Access from Your Phone",
-    description:
-      "Access your Agent of Empires sessions from your phone via Tailscale Funnel or Cloudflare Tunnel with QR pairing.",
-  },
-  {
-    source: "docs/guides/tailscale.md",
-    dest: "guides/tailscale.md",
-    title: "Tailscale Setup",
-    description:
-      "Set up Tailscale from scratch to reach your AOE TUI and web dashboard from any device on your tailnet.",
   },
   {
     source: "docs/guides/web/dashboard.md",
     dest: "guides/web/dashboard.md",
     title: "Dashboard & Workspaces",
     description:
-      "The web dashboard layout: workspace sidebar, status glyphs, the session-creation wizard, command palette, sidebar sort, and triage.",
+      "The web dashboard layout: workspace sidebar, session wizard, command palette, sort and grouping, triage, settings, and profiles.",
   },
   {
     source: "docs/guides/web/terminal.md",
@@ -97,20 +90,6 @@ const PAGES = [
       "The browser agent and paired terminals: PTY relay, scrollback, reconnect behavior, WebSocket close codes, and read-only mode.",
   },
   {
-    source: "docs/guides/web/diff.md",
-    dest: "guides/web/diff.md",
-    title: "Web Diff View",
-    description:
-      "Review a session's changes from the browser: the flat / tree changed-files list, per-session base override, and inline review comments.",
-  },
-  {
-    source: "docs/guides/web/settings.md",
-    dest: "guides/web/settings.md",
-    title: "Settings & Profiles",
-    description:
-      "The web settings tabs, the profile picker, connected-device tracking, and the step-up elevation gate for persisted config edits.",
-  },
-  {
     source: "docs/guides/worktrees.md",
     dest: "guides/worktrees.md",
     title: "Worktrees Reference",
@@ -118,25 +97,11 @@ const PAGES = [
       "Git worktree commands and configuration reference for Agent of Empires.",
   },
   {
-    source: "docs/guides/agent-override.md",
-    dest: "guides/agent-override.md",
-    title: "Agent Command Overrides",
-    description:
-      "Override agent commands with custom scripts or sandboxed wrappers in Agent of Empires.",
-  },
-  {
     source: "docs/guides/session-resume.md",
     dest: "guides/session-resume.md",
-    title: "Session Resume (Claude)",
+    title: "Session Resume & Forking",
     description:
-      "Persist and resume Claude Code conversations across reboots, upgrades, and runtime rotations.",
-  },
-  {
-    source: "docs/guides/session-fork.md",
-    dest: "guides/session-fork.md",
-    title: "Forking Sessions",
-    description:
-      "Fork a session to start a second agent from its context, then diverge onto a different task, leaving the original untouched.",
+      "Persist, resume, fork, and import agent conversations across reboots, upgrades, and runtime rotations.",
   },
   {
     source: "docs/guides/multi-repo-workspaces.md",
@@ -210,32 +175,11 @@ const PAGES = [
       "How to add a configuration setting with the single-source schema that drives the TUI, web dashboard, and server.",
   },
   {
-    source: "docs/development/logging.md",
-    dest: "docs/development/logging.md",
-    title: "Logging",
-    description:
-      "Logging targets, env-var matrix, runtime control endpoint, and browser-side error relay for Agent of Empires.",
-  },
-  {
-    source: "docs/development/playwright.md",
-    dest: "docs/development/playwright.md",
-    title: "Playwright + Vitest testing",
-    description:
-      "Long-form reference for the web dashboard test pipeline: mocked vs live Playwright, Vitest contract tests, fake ACP agent, coverage matrix, coverage reports.",
-  },
-  {
     source: "docs/development/releases.md",
     dest: "docs/development/releases.md",
     title: "Releases",
     description:
       "Weekly release cadence, automated staging PR, post-merge tagger, and emergency-release path for Agent of Empires maintainers.",
-  },
-  {
-    source: "docs/development/web-dashboard.md",
-    dest: "docs/development/web-dashboard.md",
-    title: "Web Dashboard Development",
-    description:
-      "Build the web dashboard from source, run the frontend dev workflow (cargo xtask dev and manual Vite + VITE_PROXY), and the server architecture.",
   },
   {
     source: "docs/development/internals/structured-view.md",
@@ -245,18 +189,11 @@ const PAGES = [
       "Contributor reference for the ACP subsystem: worker lifecycle and persistence, stuck-turn watchdogs, rate-limit handling, agent profiles, and the security model.",
   },
   {
-    source: "docs/development/internals/sandbox.md",
-    dest: "docs/development/internals/sandbox.md",
-    title: "Sandbox Internals",
-    description:
-      "Contributor reference for Docker sandbox internals: shared agent credential sync, the container lifecycle, Vertex AI wiring, and GH_TOKEN forwarding.",
-  },
-  {
     source: "docs/development/internals/plugin-system.md",
     dest: "docs/development/internals/plugin-system.md",
     title: "Plugin System Internals",
     description:
-      "Code-level design for the plugin system: subprocess JSON-RPC runtime, core event bus, contribution registries, capability model, and the phased rollout.",
+      "Code-level design for the plugin system: subprocess JSON-RPC runtime, event bus, contribution registries, and capability model.",
   },
   {
     source: "docs/development/writing-plugins.md",
@@ -264,13 +201,6 @@ const PAGES = [
     title: "Writing Plugins",
     description:
       "Build an Agent of Empires plugin end to end: scaffold from the template, declare the manifest, write the JSON-RPC worker, install locally, and publish.",
-  },
-  {
-    source: "docs/development/internals/sessions.md",
-    dest: "docs/development/internals/sessions.md",
-    title: "Session & Worktree Internals",
-    description:
-      "Contributor reference for the session layer: Claude conversation resume, worktree creation, scratch-session cleanup, and MCP server forwarding.",
   },
   {
     source: "docs/sounds.md",
@@ -285,34 +215,6 @@ const PAGES = [
     title: "Push Notifications",
     description:
       "Browser and PWA push notifications for Agent of Empires session status changes and structured view approvals.",
-  },
-  {
-    source: "docs/features.md",
-    dest: "docs/features.md",
-    title: "Features",
-    description:
-      "Canonical inventory of every Agent of Empires feature, grouped by surface and capability, with links to each guide.",
-  },
-  {
-    source: "docs/github-integration.md",
-    dest: "docs/github-integration.md",
-    title: "GitHub Integration",
-    description:
-      "How Agent of Empires resolves a GitHub token, the per-failure hints it shows, and what is deferred to follow-ups.",
-  },
-  {
-    source: "docs/guides/podman.md",
-    dest: "guides/podman.md",
-    title: "Podman",
-    description:
-      "Run Agent of Empires sandboxes on Podman, a daemonless and rootless Docker alternative.",
-  },
-  {
-    source: "docs/guides/apple-containers.md",
-    dest: "guides/apple-containers.md",
-    title: "Apple Containers",
-    description:
-      "Run Agent of Empires sandboxes on Apple's native macOS container runtime on Apple silicon.",
   },
   {
     source: "docs/guides/configuration.md",
@@ -354,7 +256,7 @@ const PAGES = [
     dest: "docs/structured-view/troubleshooting.md",
     title: "Structured View Troubleshooting",
     description:
-      "The structured view security model plus a field guide to every failure mode: doctor errors, spawn failures, rate limits, stuck turns, and the watchdog.",
+      "A field guide to every structured view failure mode: doctor errors, spawn failures, rate limits, stuck turns, and the watchdog.",
   },
   {
     source: "docs/guides/tool-sessions.md",
@@ -386,63 +288,12 @@ const PAGES = [
   },
 ];
 
-// Every known docs path → website URL, used for link rewriting.
-const URL_MAP = {
-  // Docs pages
-  "docs/plugins.md": "/docs/plugins/",
-  "docs/index.md": "/docs/",
-  "docs/installation.md": "/docs/installation/",
-  "docs/quick-start.md": "/docs/quick-start/",
-  "docs/sounds.md": "/docs/sounds/",
-  "docs/push-notifications.md": "/docs/push-notifications/",
-  "docs/features.md": "/docs/features/",
-  "docs/github-integration.md": "/docs/github-integration/",
-  "docs/development.md": "/docs/development/",
-  "docs/development/adding-agents.md": "/docs/development/adding-agents/",
-  "docs/development/adding-settings.md": "/docs/development/adding-settings/",
-  "docs/development/logging.md": "/docs/development/logging/",
-  "docs/development/playwright.md": "/docs/development/playwright/",
-  "docs/development/releases.md": "/docs/development/releases/",
-  "docs/development/web-dashboard.md": "/docs/development/web-dashboard/",
-  "docs/development/internals/structured-view.md": "/docs/development/internals/structured-view/",
-  "docs/development/internals/sandbox.md": "/docs/development/internals/sandbox/",
-  "docs/development/internals/plugin-system.md": "/docs/development/internals/plugin-system/",
-  "docs/development/writing-plugins.md": "/docs/development/writing-plugins/",
-  "docs/development/internals/sessions.md": "/docs/development/internals/sessions/",
-  "docs/guides/configuration.md": "/docs/guides/configuration/",
-  "docs/cli/reference.md": "/docs/cli/reference/",
-  "docs/structured-view.md": "/docs/structured-view/",
-  "docs/structured-view/interface.md": "/docs/structured-view/interface/",
-  "docs/structured-view/controls.md": "/docs/structured-view/controls/",
-  "docs/structured-view/troubleshooting.md": "/docs/structured-view/troubleshooting/",
-  "docs/api.md": "/docs/api/",
-  "docs/plugin-api.md": "/docs/plugin-api/",
-  "docs/telemetry.md": "/docs/telemetry/",
-  // Guides
-  "docs/guides/shell-completions.md": "/guides/shell-completions/",
-  "docs/guides/diff-view.md": "/guides/diff-view/",
-  "docs/guides/repo-config.md": "/guides/repo-config/",
-  "docs/guides/mcp-servers.md": "/guides/mcp-servers/",
-  "docs/guides/sandbox.md": "/guides/sandbox/",
-  "docs/guides/tmux-status-bar.md": "/guides/tmux-status-bar/",
-  "docs/guides/web-dashboard.md": "/guides/web-dashboard/",
-  "docs/guides/web/dashboard.md": "/guides/web/dashboard/",
-  "docs/guides/web/terminal.md": "/guides/web/terminal/",
-  "docs/guides/web/diff.md": "/guides/web/diff/",
-  "docs/guides/web/settings.md": "/guides/web/settings/",
-  "docs/guides/remote-phone-access.md": "/guides/remote-phone-access/",
-  "docs/guides/tailscale.md": "/guides/tailscale/",
-  "docs/guides/worktrees.md": "/guides/worktrees/",
-  "docs/guides/agent-override.md": "/guides/agent-override/",
-  "docs/guides/session-resume.md": "/guides/session-resume/",
-  "docs/guides/session-fork.md": "/guides/session-fork/",
-  "docs/guides/multi-repo-workspaces.md": "/guides/multi-repo-workspaces/",
-  "docs/guides/scratch-sessions.md": "/guides/scratch-sessions/",
-  "docs/guides/live-mode.md": "/guides/live-mode/",
-  "docs/guides/tool-sessions.md": "/guides/tool-sessions/",
-  "docs/guides/podman.md": "/guides/podman/",
-  "docs/guides/apple-containers.md": "/guides/apple-containers/",
-};
+function pageUrl(dest) {
+  return "/" + dest.replace(/\.md$/, "/").replace(/\/index\/$/, "/");
+}
+
+// Every synced docs path → website URL, used for link rewriting.
+const URL_MAP = Object.fromEntries(PAGES.map((p) => [p.source, pageUrl(p.dest)]));
 
 const GITHUB_BASE =
   "https://github.com/agent-of-empires/agent-of-empires/blob/main/";
@@ -559,7 +410,7 @@ const navSource = readFileSync(navPath, "utf8");
 const navHrefs = new Set([...navSource.matchAll(/href:\s*"([^"]+)"/g)].map((m) => m[1]));
 let missing = 0;
 for (const page of PAGES) {
-  const url = "/" + page.dest.replace(/\.md$/, "/").replace(/\/index\/$/, "/");
+  const url = pageUrl(page.dest);
   if (!navHrefs.has(url)) {
     console.error(`  WARNING: ${url} (from ${page.source}) is not in docsNav.ts`);
     missing++;

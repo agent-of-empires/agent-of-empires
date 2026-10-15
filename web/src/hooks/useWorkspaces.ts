@@ -3,27 +3,17 @@ import type { SessionResponse, Workspace } from "../lib/types";
 import { isSessionActive } from "../lib/session";
 import { useIdleDecayWindowMs } from "../lib/idleDecay";
 
-/** Strip trailing slashes for consistent grouping */
 function normalizePath(p: string): string {
   return p.replace(/\/+$/, "");
 }
 
-// Sort order is intentionally not applied here: every consumer either
-// looks up workspaces by id (App.tsx uses `.find`) or hands the list to
-// `useRepoGroups`, which sorts via the shared comparator in
-// `lib/workspaceSort.ts`. Keeping a second sort site is what produced the
-// reshuffle bug in #1169.
 export function useWorkspaces(sessions: SessionResponse[]): Workspace[] {
   const idleDecayWindowMs = useIdleDecayWindowMs();
 
   return useMemo(() => {
     const groups = new Map<string, SessionResponse[]>();
 
-    // Sessions with a non-null `branch` represent a worktree and collapse
-    // into a single workspace row (one row per worktree). Sessions with a
-    // null `branch` (no `--worktree`) each get their own workspace; without
-    // this split, multiple `aoe add <same-path>` sessions vanished behind
-    // `workspace.sessions[0]`. See #956.
+    // Worktree sessions (non-null branch) share a row; plain sessions each get their own (#956).
     for (const session of sessions) {
       const repoPath = normalizePath(session.main_repo_path ?? session.project_path);
       const key = session.branch ? `${repoPath}::${session.branch}` : `${repoPath}::__session__::${session.id}`;

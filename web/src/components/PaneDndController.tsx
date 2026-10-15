@@ -31,12 +31,8 @@ import {
   type RenderGroup,
 } from "./paneDnd";
 
-// Prefer the droppable the pointer is actually inside, and only among pane
-// droppables, so a drag in the right column never magnetically snaps to a
-// distant bottom target the way a global closestCenter would. A tab hit wins
-// over everything (reorder), then a split-half hit (split into a new group),
-// then group/empty-dock bodies. Mirrors the filtered-collision approach in
-// WorkspaceSidebar (#1644).
+// Prefer the droppable the pointer is actually inside, and only among pane droppables, so a drag in the right
+// column never magnetically snaps to a distant bottom target the way a global closestCenter would.
 const panesCollision: CollisionDetection = (args) => {
   const paneContainers = args.droppableContainers.filter((c) => {
     const t = c.data.current?.type;
@@ -60,10 +56,8 @@ interface Props {
   children: ReactNode;
 }
 
-/** Owns the single DndContext spanning both docks: sensors, the pane-aware
- *  collision policy, the live drop target, a DragOverlay replica that follows
- *  the cursor across the distant docks, and the empty-dock landing zones. Docks
- *  stay presentational and read the drop state through usePaneDnd. */
+/** Owns the single DndContext spanning both docks: sensors, the pane-aware collision policy, the live drop target,
+ *  a DragOverlay replica that follows the cursor across the distant docks, and the empty-dock landing zones. */
 export function PaneDndController({ groupsByDock, descriptorFor, onPlaceTab, children }: Props) {
   const [activeTab, setActiveTab] = useState<string | null>(null);
   const [source, setSource] = useState<DragSource | null>(null);
@@ -160,10 +154,7 @@ export function PaneDndController({ groupsByDock, descriptorFor, onPlaceTab, chi
   );
 }
 
-/** A landing zone for a dock that currently has no groups (so no Dock is in the
- *  DOM to drop onto). Pinned to the dock's screen edge, shown only while a pane
- *  tab is dragged. MeasuringStrategy.Always on the context measures it even
- *  though it mounts on drag start. */
+/** A landing zone for a dock that currently has no groups (so no Dock is in the DOM to drop onto). */
 function EmptyDockDropZone({ location }: { location: DockLocation }) {
   const { setNodeRef, isOver } = useDroppable({
     id: `empty-dock:${location}`,

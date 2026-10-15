@@ -1,14 +1,8 @@
-// Pure selection model for the sidebar's multi-select (Shift+click range,
-// Cmd/Ctrl+click additive toggle). Kept free of React so the gesture
-// semantics are unit-testable, mirroring how sidebarSort.ts holds the pure
-// sort/triage helpers. Selection is keyed by workspace id (rows are workspace
-// rows); resolution to a session id happens at action time. See #1724.
+// Pure multi-select model for the sidebar (Shift range, Cmd/Ctrl toggle), keyed by workspace id.
 
 export interface SidebarSelectionState {
-  /** Currently selected workspace ids. */
   selectedIds: ReadonlySet<string>;
-  /** Pivot for Shift+click range selection: the last row the user toggled or
-   *  the start of the most recent range. `null` when there is no selection. */
+  /** Pivot for Shift+click ranges; `null` without a selection. */
   anchorId: string | null;
 }
 
@@ -17,10 +11,7 @@ export const EMPTY_SELECTION: SidebarSelectionState = {
   anchorId: null,
 };
 
-/** What a row click means, derived purely from its modifier keys. The parent
- *  classifies the event and dispatches the matching reducer action (and, for
- *  `navigate`, also performs route navigation). Mac uses Cmd, Windows/Linux
- *  use Ctrl; both map to the additive toggle. */
+/** Mac Cmd and Windows/Linux Ctrl both map to the additive toggle. */
 export type ClickIntent = "navigate" | "toggle" | "range" | "additive-range";
 
 export function classifyClick(modifiers: { metaKey: boolean; ctrlKey: boolean; shiftKey: boolean }): ClickIntent {
@@ -30,11 +21,7 @@ export function classifyClick(modifiers: { metaKey: boolean; ctrlKey: boolean; s
   return "navigate";
 }
 
-/** Inclusive id range between `anchorId` and `targetId` within the rendered
- *  order. Direction-agnostic (anchor may be above or below the target). If
- *  either endpoint is missing from `orderedIds` (e.g. it scrolled into a
- *  collapsed group since the anchor was set) the range collapses to just the
- *  target, which is the least surprising fallback. */
+/** Inclusive and direction-agnostic; collapses to the target when either end is not rendered. */
 export function rangeBetween(orderedIds: readonly string[], anchorId: string, targetId: string): string[] {
   const a = orderedIds.indexOf(anchorId);
   const b = orderedIds.indexOf(targetId);
@@ -51,8 +38,7 @@ export type SidebarSelectionAction =
       type: "range";
       targetId: string;
       orderedIds: readonly string[];
-      /** Add the range to the existing selection instead of replacing it
-       *  (Shift+Cmd/Ctrl). */
+      /** Shift+Cmd/Ctrl adds the range to the selection. */
       additive: boolean;
     }
   | { type: "clear" }
@@ -64,32 +50,23 @@ export function selectionReducer(state: SidebarSelectionState, action: SidebarSe
       const next = new Set(state.selectedIds);
       if (next.has(action.id)) next.delete(action.id);
       else next.add(action.id);
-      // Anchor follows the toggled row so a subsequent Shift+click ranges
-      // from here.
+      // The anchor follows the toggled row.
       return { selectedIds: next, anchorId: action.id };
     }
     case "range": {
-      // Pivot from the existing anchor; if there is none, or it scrolled out
-      // of the rendered order (collapsed group, filter), re-anchor on the
-      // clicked row so the next Shift+click forms a range from here instead
-      // of repeatedly collapsing to a single row.
+      // Re-anchor on the clicked row when the anchor is missing or no longer rendered.
       const anchor =
         state.anchorId != null && action.orderedIds.includes(state.anchorId) ? state.anchorId : action.targetId;
       const range = rangeBetween(action.orderedIds, anchor, action.targetId);
       const next = action.additive ? new Set([...state.selectedIds, ...range]) : new Set(range);
-      // Anchor stays put so repeated Shift+clicks re-pivot from the same
-      // origin, matching Finder / file-manager behavior.
+      // The anchor stays put so repeated Shift+clicks pivot from the same origin.
       return { selectedIds: next, anchorId: anchor };
     }
     case "select-only":
-      // Right-clicking a row outside the current selection makes it the sole
-      // selection and the anchor, without navigating (the context menu acts on
-      // the selection, not the route). Mirrors file-manager right-click.
+      // Right-clicking outside the selection selects just that row, without navigating.
       return { selectedIds: new Set([action.id]), anchorId: action.id };
     case "navigate":
-      // A plain click clears any multi-selection but keeps the navigated row
-      // as the anchor, so the next Shift+click ranges from here instead of
-      // collapsing to the single clicked row (Finder / file-manager behavior).
+      // A plain click clears the selection but anchors on the clicked row.
       return { selectedIds: new Set<string>(), anchorId: action.id };
     case "clear":
       return EMPTY_SELECTION;

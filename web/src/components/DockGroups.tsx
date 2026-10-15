@@ -3,9 +3,7 @@ import { Fragment, type ReactNode } from "react";
 import type { DockLocation } from "../lib/panes";
 import { Dock, type PaneDisplay } from "./Dock";
 
-/** One rendered group: its persisted index, its visible tabs, and the active
- *  one. The parent filters out groups with no visible tab but keeps each
- *  surviving group's persisted index, so drops address the right group. */
+/** One rendered group: its persisted index, its visible tabs, and the active one. */
 export interface DockGroupView {
   group: number;
   tabs: string[];
@@ -23,11 +21,8 @@ interface Props {
   onNewTerminal?: () => void;
 }
 
-/** Lays a dock's groups out along its split axis: the tall right column stacks
- *  groups top to bottom (flex column), the wide bottom strip places groups
- *  side by side (flex row). Groups share space equally; a thin divider
- *  separates them. Equal flex sizing is intentional until per-group resize
- *  handles are added (`#2486` follow-up). */
+/** Lays a dock's groups out along its split axis: the tall right column stacks groups top to bottom (flex column),
+ *  the wide bottom strip places groups side by side (flex row). */
 export function DockGroups({
   location,
   groups,

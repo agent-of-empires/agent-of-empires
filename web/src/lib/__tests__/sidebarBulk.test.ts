@@ -29,8 +29,6 @@ describe("bucketSelectionForBulk", () => {
     ];
     const b = bucketSelectionForBulk(workspaces, noOverride);
     expect(b.pinnable.map((w) => w.id)).toEqual(["live"]);
-    // Pinned rows are archivable/snoozable too: the backend clears the
-    // pin on either transition, so bulk Archive/Snooze includes them.
     expect(b.archivable.map((w) => w.id)).toEqual(["live", "pinned"]);
     expect(b.snoozable.map((w) => w.id)).toEqual(["live", "pinned"]);
     expect(b.unpinnable.map((w) => w.id)).toEqual(["pinned"]);
@@ -39,8 +37,6 @@ describe("bucketSelectionForBulk", () => {
   });
 
   it("respects an optimistic override over the server value", () => {
-    // Server says live, but a pending optimistic pin makes it eligible only
-    // for Unpin, not Pin.
     const workspaces = [ws("w", {})];
     const overlay = new Map([["w", withOverride(EMPTY_OPTIMISTIC, { pinned: true })]]);
     const b = bucketSelectionForBulk(workspaces, (id) => overlay.get(id) ?? EMPTY_OPTIMISTIC);

@@ -10,8 +10,8 @@ use std::sync::Arc;
 
 use crate::file_watch::FileWatchService;
 use crate::git::diff::{
-    check_merge_base_status, compute_changed_files, compute_file_diff, get_default_base_ref,
-    list_branches, DiffFile, FileDiff,
+    check_merge_base_status, compute_changed_files, compute_file_contents, compute_file_diff,
+    get_default_base_ref, list_branches, DiffFile, FileContents, FileDiff, FileStatus,
 };
 use crate::session::config::{update_app_state, update_config};
 use crate::session::{load_profile_config, resolve_config_or_warn, save_profile_config, Config};
@@ -26,9 +26,29 @@ pub struct BranchSelectState {
     pub selected: usize,
 }
 
-/// The diff view state
+/// The branch picker's click targets from the last frame.
+#[derive(Default)]
+pub(crate) struct BranchPickerMouse {
+    pub(crate) dialog: ratatui::layout::Rect,
+    /// `(branch index, rect)` per drawn branch row.
+    pub(crate) rows: Vec<(usize, ratatui::layout::Rect)>,
+    /// The `[N more above]` / `[N more below]` rows, zero-sized when absent.
+    pub(crate) more_above: ratatui::layout::Rect,
+    pub(crate) more_below: ratatui::layout::Rect,
+    /// Visual only: the list's scroll follows the selection, so moving it
+    /// on hover would slide rows out from under the pointer.
+    pub(crate) hover: crate::tui::components::hover::HoverState,
+}
+
+impl BranchPickerMouse {
+    pub(crate) fn rects(&self) -> Vec<ratatui::layout::Rect> {
+        let mut rects = crate::tui::dialogs::target_rects(&self.rows);
+        rects.extend([self.more_above, self.more_below]);
+        rects
+    }
+}
+
 pub struct DiffView {
-    /// Path to the repository root
     pub(crate) repo_path: PathBuf,
 
     /// Session id this diff view belongs to. None when opened in a
@@ -40,43 +60,40 @@ pub struct DiffView {
     /// persisting the base-branch override.
     pub(crate) profile: String,
 
-    /// Base branch to compare against
     pub(crate) base_branch: String,
 
-    /// List of changed files
     pub(crate) files: Vec<DiffFile>,
 
-    /// Currently selected file index
     pub(crate) selected_file: usize,
 
-    /// Cached file diffs
     pub(crate) diff_cache: HashMap<PathBuf, FileDiff>,
 
-    /// Scroll offset for the diff content
+    /// Cached old/new file bodies used by rendered Markdown mode.
+    pub(crate) file_contents_cache: HashMap<PathBuf, FileContents>,
+
+    /// Show Markdown files as rendered prose instead of their raw diff.
+    pub(crate) markdown_rendered: bool,
+
     pub(crate) scroll_offset: u16,
 
     /// Number of visible lines (set during render)
     pub(crate) visible_lines: u16,
 
-    /// Total lines in current diff
     pub(crate) total_lines: u16,
 
-    /// Branch selection dialog state
     pub(crate) branch_select: Option<BranchSelectState>,
 
-    /// Error message to display
+    pub(crate) branch_mouse: BranchPickerMouse,
+
     pub(crate) error_message: Option<String>,
 
-    /// Success message to display
     pub(crate) success_message: Option<String>,
 
-    /// Context lines for diff
     pub(crate) context_lines: usize,
 
     /// Render the selected file's diff side-by-side instead of unified.
     pub(crate) split_view: bool,
 
-    /// Show help overlay
     pub(crate) show_help: bool,
 
     /// Width of the file list panel (resizable with h/l)
@@ -171,10 +188,13 @@ impl DiffView {
             files: Vec::new(),
             selected_file: 0,
             diff_cache: HashMap::new(),
+            file_contents_cache: HashMap::new(),
+            markdown_rendered: true,
             scroll_offset: 0,
             visible_lines: 20,
             total_lines: 0,
             branch_select: None,
+            branch_mouse: BranchPickerMouse::default(),
             error_message: None,
             success_message: None,
             context_lines,
@@ -192,10 +212,10 @@ impl DiffView {
         Ok(view)
     }
 
-    /// Refresh the list of changed files
     pub fn refresh_files(&mut self) -> anyhow::Result<()> {
         self.files = compute_changed_files(&self.repo_path, &self.base_branch)?;
         self.diff_cache.clear();
+        self.file_contents_cache.clear();
         if self.selected_file >= self.files.len() {
             self.selected_file = self.files.len().saturating_sub(1);
         }
@@ -210,7 +230,6 @@ impl DiffView {
         Ok(())
     }
 
-    /// Get the currently selected file
     pub fn selected_file(&self) -> Option<&DiffFile> {
         self.files.get(self.selected_file)
     }
@@ -230,7 +249,6 @@ impl DiffView {
         }
     }
 
-    /// Get or compute the diff for the selected file
     pub fn get_current_diff(&mut self) -> Option<&FileDiff> {
         let file = self.files.get(self.selected_file)?;
         let path = file.path.clone();
@@ -255,7 +273,73 @@ impl DiffView {
         self.diff_cache.get(&path)
     }
 
-    /// Open the branch selection dialog
+    /// Get or compute the old/new bodies for the selected Markdown file.
+    pub fn get_current_file_contents(&mut self) -> Option<&FileContents> {
+        let file = self.files.get(self.selected_file)?;
+        if !Self::is_markdown_path(&file.path) {
+            return None;
+        }
+        let path = file.path.clone();
+
+        if !self.file_contents_cache.contains_key(&path) {
+            match compute_file_contents(&self.repo_path, &path, &self.base_branch) {
+                Ok(contents) => {
+                    self.file_contents_cache.insert(path.clone(), contents);
+                }
+                Err(e) => {
+                    self.error_message = Some(format!("Failed to read file contents: {e}"));
+                    return None;
+                }
+            }
+        }
+
+        self.file_contents_cache.get(&path)
+    }
+
+    pub(crate) fn selected_file_is_markdown(&self) -> bool {
+        self.selected_file()
+            .is_some_and(|file| Self::is_markdown_path(&file.path))
+    }
+
+    pub(crate) fn markdown_available(&self) -> bool {
+        let Some(file) = self.selected_file() else {
+            return false;
+        };
+        Self::is_markdown_path(&file.path)
+            && self
+                .file_contents_cache
+                .get(&file.path)
+                .is_some_and(|contents| !contents.is_binary)
+    }
+
+    pub(crate) fn current_markdown_source(&self) -> Option<&str> {
+        if !self.markdown_rendered || !self.markdown_available() {
+            return None;
+        }
+        let file = self.selected_file()?;
+        let contents = self.file_contents_cache.get(&file.path)?;
+        Some(if contents.status == FileStatus::Deleted {
+            contents.old_content.as_str()
+        } else {
+            contents.new_content.as_str()
+        })
+    }
+
+    pub(crate) fn toggle_markdown_rendering(&mut self) {
+        if self.markdown_available() {
+            self.markdown_rendered = !self.markdown_rendered;
+            self.scroll_offset = 0;
+        }
+    }
+
+    fn is_markdown_path(path: &std::path::Path) -> bool {
+        path.extension()
+            .and_then(|extension| extension.to_str())
+            .is_some_and(|extension| {
+                extension.eq_ignore_ascii_case("md") || extension.eq_ignore_ascii_case("markdown")
+            })
+    }
+
     pub fn open_branch_select(&mut self) {
         match list_branches(&self.repo_path) {
             Ok(branches) => {
@@ -315,7 +399,6 @@ impl DiffView {
         self.pending_override.take()
     }
 
-    /// Navigate to next file
     pub fn next_file(&mut self) {
         if self.selected_file < self.files.len().saturating_sub(1) {
             self.selected_file += 1;
@@ -323,7 +406,6 @@ impl DiffView {
         }
     }
 
-    /// Navigate to previous file
     pub fn prev_file(&mut self) {
         if self.selected_file > 0 {
             self.selected_file -= 1;
@@ -351,44 +433,36 @@ impl DiffView {
         self.file_list_scroll_offset = self.file_list_scroll_offset.min(max_offset);
     }
 
-    /// Scroll diff content down
     pub fn scroll_down(&mut self, amount: u16) {
         let max_scroll = self.total_lines.saturating_sub(self.visible_lines);
         self.scroll_offset = (self.scroll_offset + amount).min(max_scroll);
     }
 
-    /// Scroll diff content up
     pub fn scroll_up(&mut self, amount: u16) {
         self.scroll_offset = self.scroll_offset.saturating_sub(amount);
     }
 
-    /// Page down in diff content
     pub fn page_down(&mut self) {
         self.scroll_down(self.visible_lines.saturating_sub(2));
     }
 
-    /// Page up in diff content
     pub fn page_up(&mut self) {
         self.scroll_up(self.visible_lines.saturating_sub(2));
     }
 
-    /// Half-page down in diff content
     pub fn half_page_down(&mut self) {
         self.scroll_down(self.visible_lines / 2);
     }
 
-    /// Half-page up in diff content
     pub fn half_page_up(&mut self) {
         self.scroll_up(self.visible_lines / 2);
     }
 
-    /// Shrink the file list panel
     pub fn shrink_file_list(&mut self) {
         self.file_list_width = self.file_list_width.saturating_sub(5).max(5);
         self.save_file_list_width();
     }
 
-    /// Grow the file list panel
     pub fn grow_file_list(&mut self) {
         self.file_list_width = (self.file_list_width + 5).min(80);
         self.save_file_list_width();
@@ -450,10 +524,13 @@ impl DiffView {
             files: Vec::new(),
             selected_file: 0,
             diff_cache: HashMap::new(),
+            file_contents_cache: HashMap::new(),
+            markdown_rendered: true,
             scroll_offset: 0,
             visible_lines: 20,
             total_lines: 0,
             branch_select: None,
+            branch_mouse: BranchPickerMouse::default(),
             error_message: None,
             success_message: None,
             context_lines: 3,

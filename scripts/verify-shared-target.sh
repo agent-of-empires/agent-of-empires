@@ -27,10 +27,8 @@ set -euo pipefail
 #                 store, then reads kache's restore counters and asserts the
 #                 second (warm) build restored its dependency artifacts as
 #                 reflinks/hardlinks (shared blocks) rather than copies. Also
-#                 builds --no-default-features into a third dir to prove serve and
-#                 non-serve builds coexist against one store. Needs kache
-#                 installed and a single filesystem under $TMPDIR; skips cleanly
-#                 otherwise.
+#                 builds with the default-plugins flag off in a third dir, keeping
+#                 OpenSSL/SQLite vendoring. Needs kache and one filesystem under $TMPDIR; skips otherwise.
 #
 # Usage:
 #   scripts/verify-shared-target.sh --self-test
@@ -168,10 +166,10 @@ full_run() {
     fail "kache copied dependency artifacts instead of sharing them; no disk dedup across worktrees"
   fi
 
-  info "building --no-default-features into a third dir (serve + non-serve coexist)..."
-  cargo build --manifest-path "$ROOT_DIR/Cargo.toml" --no-default-features --target-dir "$target_serve" >/dev/null ||
-    fail "--no-default-features build failed against the shared store"
-  ok "--no-default-features builds against the same store as the default (serve) builds"
+  info "building with default-plugins flag off and vendored OpenSSL/SQLite in a third dir..."
+  cargo build --manifest-path "$ROOT_DIR/Cargo.toml" --no-default-features --features vendored --target-dir "$target_serve" >/dev/null ||
+    fail "vendored build with default-plugins flag off failed against the shared store"
+  ok "default-plugins flag off builds against the same store as the default builds"
 
   trap - EXIT
   rm -rf "$base"

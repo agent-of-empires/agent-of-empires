@@ -1,5 +1,4 @@
 //! `aoe plugin`: plugin management (list, info, enable, disable, install,
-//! update, uninstall).
 
 use anyhow::Result;
 use clap::Subcommand;
@@ -35,11 +34,15 @@ pub enum PluginCommands {
         #[arg(long)]
         yes: bool,
     },
-    /// Update an installed external plugin from its recorded source. Prompts to
-    /// re-approve capabilities if the update changes the capability set.
+    /// Update an installed external plugin from its recorded source and restart
+    /// its worker in a running daemon. Prompts to re-approve capabilities if the
+    /// update changes the capability set.
     Update {
         /// Plugin id
         id: String,
+        /// Re-approve a changed capability set without prompting
+        #[arg(long)]
+        yes: bool,
     },
     /// Uninstall an external plugin, removing its files and capability grant
     Uninstall {
@@ -68,7 +71,7 @@ pub async fn run(command: PluginCommands) -> Result<()> {
         PluginCommands::Enable { id } => run_set_enabled(&id, true).await,
         PluginCommands::Disable { id } => run_set_enabled(&id, false).await,
         PluginCommands::Install { source, yes } => run_install(&source, yes).await,
-        PluginCommands::Update { id } => run_update(&id).await,
+        PluginCommands::Update { id, yes } => run_update(&id, yes).await,
         PluginCommands::Uninstall { id } => run_uninstall(&id),
         PluginCommands::Hash { path } => run_hash(&path),
         PluginCommands::Discover { query } => run_discover(query.as_deref()).await,
@@ -153,10 +156,6 @@ fn run_info(id: &str) -> Result<()> {
     if !m.keybinds.is_empty() {
         println!("  keybinds:");
         for kb in &m.keybinds {
-            // A core binding on the same chord always wins; flag the conflict so
-            // the author knows the plugin keybind will never fire (#2094).
-            // An unparseable key is skipped by the TUI resolver, so flag it
-            // here rather than print it as if it were usable.
             let note = match crate::tui::home::bindings::parse_chord(&kb.key) {
                 Some(c) if crate::tui::home::bindings::core_shadows(&c) => "  (shadowed by core)",
                 Some(_) => "",
@@ -191,9 +190,6 @@ fn format_report(report: &crate::plugin::install::InstallReport, verb: &str) -> 
     } else {
         out.push_str(&report.capabilities.join(", "));
     }
-    // Surface inactivity whenever the grant did not cover the install, including
-    // the empty-capabilities case (declining a UI-only manifest change leaves a
-    // plugin ungranted with no capabilities to list).
     if !report.granted {
         out.push_str(" (not granted, plugin inactive)");
     } else if !report.capabilities.is_empty() {
@@ -212,9 +208,17 @@ async fn run_install(source: &str, yes: bool) -> Result<()> {
     Ok(())
 }
 
-async fn run_update(id: &str) -> Result<()> {
-    let report = crate::plugin::install::update(id).await?;
+async fn run_update(id: &str, yes: bool) -> Result<()> {
+    use crate::plugin::install::LiveRestart;
+    let report = crate::plugin::install::update(id, yes).await?;
     print_report(&report, "Updated");
+    match crate::plugin::install::restart_worker_live(id).await {
+        LiveRestart::Daemon => println!("  the running daemon reloaded the plugin."),
+        LiveRestart::NoDaemon => {}
+        LiveRestart::DaemonStale { reason } => println!(
+            "  warning: a daemon is running but did not reload the plugin ({reason}); its worker keeps the previous build until the daemon restarts."
+        ),
+    }
     Ok(())
 }
 
@@ -276,49 +280,36 @@ mod tests {
     use crate::plugin::registry::ValidationState;
 
     #[test]
-    fn report_shows_validation_line() {
-        let report = InstallReport {
-            id: "acme.foo".into(),
-            version: "1.2.3".into(),
-            capabilities: vec!["session.read".into(), "filesystem.read".into()],
-            granted: true,
-            validation: ValidationState::Community,
-        };
-        let out = format_report(&report, "Installed");
+    fn format_report_surfaces_validation_and_grant_state() {
+        let report =
+            |version: &str, capabilities: Vec<String>, granted, validation| InstallReport {
+                id: "acme.foo".into(),
+                version: version.into(),
+                capabilities,
+                granted,
+                validation,
+            };
+
+        let granted = report(
+            "1.2.3",
+            vec!["session.read".into(), "filesystem.read".into()],
+            true,
+            ValidationState::Community,
+        );
         assert_eq!(
-            out,
+            format_report(&granted, "Installed"),
             "Installed acme.foo 1.2.3.\n  validation: community\n  capabilities: session.read, filesystem.read (granted)"
         );
-    }
 
-    #[test]
-    fn local_install_validation_labelled_local() {
-        let report = InstallReport {
-            id: "acme.foo".into(),
-            version: "0.1.0".into(),
-            capabilities: vec![],
-            granted: true,
-            validation: ValidationState::Local,
-        };
-        let out = format_report(&report, "Installed");
+        let local = report("0.1.0", vec![], true, ValidationState::Local);
+        let out = format_report(&local, "Installed");
         assert!(
             out.contains("\n  validation: local\n"),
-            "local install surfaces its validation: {out:?}"
+            "a local install surfaces its validation: {out:?}"
         );
-    }
 
-    #[test]
-    fn inactive_with_no_capabilities_still_warns() {
-        // An ungranted update with no capabilities (e.g. a declined UI-only
-        // manifest change) must still flag that the plugin is inactive.
-        let report = InstallReport {
-            id: "acme.foo".into(),
-            version: "0.1.0".into(),
-            capabilities: vec![],
-            granted: false,
-            validation: ValidationState::Community,
-        };
-        let out = format_report(&report, "Updated");
+        let inactive = report("0.1.0", vec![], false, ValidationState::Community);
+        let out = format_report(&inactive, "Updated");
         assert!(
             out.ends_with("  capabilities: none (not granted, plugin inactive)"),
             "inactivity is surfaced with no capabilities: {out:?}"

@@ -11,24 +11,25 @@ import {
   subscribeAcpState,
 } from "./acpStateStorage";
 
-function entryKey(id: string): string {
-  return `${STORAGE_KEY_PREFIX}${id}`;
-}
+const entryKey = (id: string) => `${STORAGE_KEY_PREFIX}${id}`;
+const entry = (queued: number, savedAt = Date.now()) =>
+  JSON.stringify({
+    savedAt,
+    state: {
+      lastSeq: 0,
+      activity: [],
+      queuedPrompts: Array.from({ length: queued }, (_, i) => ({ id: `q${i}`, text: `q${i}`, queuedAt: "t" })),
+    },
+  });
 
-function writeEntry(id: string, queued: number, savedAt = Date.now()): void {
-  const queuedPrompts = Array.from({ length: queued }, (_, i) => ({
-    id: `${id}-${i}`,
-    text: `q${i}`,
-    queuedAt: "t",
-  }));
-  localStorage.setItem(
-    entryKey(id),
-    JSON.stringify({
-      savedAt,
-      state: { lastSeq: 0, activity: [], queuedPrompts },
-    }),
-  );
+const unsubs: (() => void)[] = [];
+function listen(filter: string[] | null) {
+  const cb = vi.fn();
+  unsubs.push(subscribeAcpState(cb, filter && new Set(filter)));
+  return cb;
 }
+const storageEvent = (key: string | null, newValue: string | null = null) =>
+  window.dispatchEvent(new StorageEvent("storage", { key, newValue, storageArea: localStorage }));
 
 beforeEach(() => {
   localStorage.clear();
@@ -36,181 +37,78 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+  for (const unsub of unsubs.splice(0)) unsub();
   localStorage.clear();
   clearQueueCount();
   vi.restoreAllMocks();
 });
 
 describe("getQueuedCount", () => {
-  it("returns 0 for a missing entry", () => {
-    expect(getQueuedCount("nope")).toBe(0);
+  it.each<[string, string | null, number]>([
+    ["a missing entry", null, 0],
+    ["a stored entry", entry(4), 4],
+    ["a TTL-expired entry", entry(5, Date.now() - STATE_TTL_MS - 1), 0],
+    ["a corrupt entry", "{not json", 0],
+    ["an entry without queuedPrompts", JSON.stringify({ savedAt: Date.now(), state: { lastSeq: 0 } }), 0],
+  ])("reads %s", (_name, raw, expected) => {
+    if (raw !== null) localStorage.setItem(entryKey("a"), raw);
+    expect(getQueuedCount("a")).toBe(expected);
   });
 
-  it("parses the count from localStorage on a cache miss", () => {
-    writeEntry("a", 4);
-    expect(getQueuedCount("a")).toBe(4);
-  });
-
-  it("memoises the count so a later localStorage edit is not re-read", () => {
-    writeEntry("a", 2);
+  it("memoises the parsed count", () => {
+    localStorage.setItem(entryKey("a"), entry(2));
     expect(getQueuedCount("a")).toBe(2);
-    // Direct localStorage mutation does not invalidate the in-memory
-    // cache; only setQueueCount / a storage event / clear do.
-    writeEntry("a", 9);
+    localStorage.setItem(entryKey("a"), entry(9));
     expect(getQueuedCount("a")).toBe(2);
-  });
-
-  it("treats a TTL-expired entry as 0", () => {
-    writeEntry("a", 5, Date.now() - STATE_TTL_MS - 1);
-    expect(getQueuedCount("a")).toBe(0);
-  });
-
-  it("treats a corrupt entry as 0", () => {
-    localStorage.setItem(entryKey("a"), "{not json");
-    expect(getQueuedCount("a")).toBe(0);
-  });
-
-  it("treats an entry without a queuedPrompts array as 0", () => {
-    localStorage.setItem(entryKey("a"), JSON.stringify({ savedAt: Date.now(), state: { lastSeq: 0 } }));
-    expect(getQueuedCount("a")).toBe(0);
   });
 
   it("returns 0 when localStorage access throws", () => {
-    const spy = vi.spyOn(Storage.prototype, "getItem").mockImplementation(() => {
+    vi.spyOn(Storage.prototype, "getItem").mockImplementation(() => {
       throw new Error("blocked");
     });
     expect(getQueuedCount("a")).toBe(0);
-    spy.mockRestore();
   });
 });
 
-describe("setQueueCount", () => {
-  it("publishes the count and notifies subscribers", () => {
-    const cb = vi.fn();
-    const unsub = subscribeAcpState(cb, new Set(["a"]));
+describe("publishing and subscriptions", () => {
+  it("setQueueCount publishes and notifies only matching subscribers", () => {
+    const a = listen(["a"]);
+    const b = listen(["b"]);
+    const all = listen(null);
     setQueueCount("a", 3);
-    expect(cb).toHaveBeenCalledTimes(1);
     expect(getQueuedCount("a")).toBe(3);
-    unsub();
+    expect([a, b, all].map((cb) => cb.mock.calls.length)).toEqual([1, 0, 1]);
   });
 
-  it("does not notify a subscriber filtered to other sessions", () => {
-    const cb = vi.fn();
-    const unsub = subscribeAcpState(cb, new Set(["b"]));
-    setQueueCount("a", 1);
-    expect(cb).not.toHaveBeenCalled();
-    unsub();
-  });
-});
-
-describe("clearQueueCount", () => {
-  it("clears one session and notifies that session's subscribers", () => {
+  it("clearQueueCount clears one session or all of them", () => {
     setQueueCount("a", 2);
-    const cb = vi.fn();
-    const unsub = subscribeAcpState(cb, new Set(["a"]));
+    const a = listen(["a"]);
+    const b = listen(["b"]);
     clearQueueCount("a");
-    expect(cb).toHaveBeenCalledTimes(1);
-    // Cache dropped; with no localStorage entry the count reads 0.
     expect(getQueuedCount("a")).toBe(0);
-    unsub();
-  });
-
-  it("clears all sessions and notifies every subscriber", () => {
-    const cbA = vi.fn();
-    const cbB = vi.fn();
-    const unsubA = subscribeAcpState(cbA, new Set(["a"]));
-    const unsubB = subscribeAcpState(cbB, new Set(["b"]));
+    expect([a, b].map((cb) => cb.mock.calls.length)).toEqual([1, 0]);
     clearQueueCount();
-    expect(cbA).toHaveBeenCalledTimes(1);
-    expect(cbB).toHaveBeenCalledTimes(1);
-    unsubA();
-    unsubB();
-  });
-});
-
-describe("subscribeAcpState storage events", () => {
-  it("refreshes the cache and notifies on a matching cross-tab write", () => {
-    const cb = vi.fn();
-    const unsub = subscribeAcpState(cb, new Set(["a"]));
-    window.dispatchEvent(
-      new StorageEvent("storage", {
-        key: entryKey("a"),
-        newValue: JSON.stringify({
-          savedAt: Date.now(),
-          state: {
-            lastSeq: 0,
-            activity: [],
-            queuedPrompts: [{ id: "a-0", text: "x", queuedAt: "t" }],
-          },
-        }),
-        storageArea: localStorage,
-      }),
-    );
-    expect(cb).toHaveBeenCalledTimes(1);
-    expect(getQueuedCount("a")).toBe(1);
-    unsub();
+    expect([a, b].map((cb) => cb.mock.calls.length)).toEqual([2, 1]);
   });
 
-  it("ignores keys outside the acp-state prefix", () => {
-    const cb = vi.fn();
-    const unsub = subscribeAcpState(cb, new Set(["a"]));
-    window.dispatchEvent(
-      new StorageEvent("storage", {
-        key: "some:other:key",
-        newValue: "x",
-        storageArea: localStorage,
-      }),
-    );
-    expect(cb).not.toHaveBeenCalled();
-    unsub();
-  });
-
-  it("treats a removed entry (null newValue) as 0", () => {
+  it.each<[string, string | null, string | null, number, number]>([
+    ["a matching cross-tab write", entryKey("a"), entry(1), 1, 1],
+    ["a removed entry", entryKey("a"), null, 1, 0],
+    ["an unrelated key", "some:other:key", "x", 0, 3],
+    ["a cross-tab clear", null, null, 1, 0],
+  ])("storage event for %s", (_name, key, value, calls, count) => {
     setQueueCount("a", 3);
-    const cb = vi.fn();
-    const unsub = subscribeAcpState(cb, new Set(["a"]));
-    window.dispatchEvent(
-      new StorageEvent("storage", {
-        key: entryKey("a"),
-        newValue: null,
-        storageArea: localStorage,
-      }),
-    );
-    expect(cb).toHaveBeenCalledTimes(1);
-    expect(getQueuedCount("a")).toBe(0);
-    unsub();
-  });
-
-  it("fires unconditionally and drops the cache on a cross-tab clear (null key)", () => {
-    setQueueCount("a", 2);
-    const cb = vi.fn();
-    const unsub = subscribeAcpState(cb, new Set(["a"]));
-    window.dispatchEvent(new StorageEvent("storage", { key: null, storageArea: localStorage }));
-    expect(cb).toHaveBeenCalledTimes(1);
-    expect(getQueuedCount("a")).toBe(0);
-    unsub();
-  });
-
-  it("a null-filter listener fires for any session change", () => {
-    const cb = vi.fn();
-    const unsub = subscribeAcpState(cb, null);
-    setQueueCount("whatever", 1);
-    expect(cb).toHaveBeenCalledTimes(1);
-    unsub();
+    const cb = listen(["a"]);
+    storageEvent(key, value);
+    expect(cb).toHaveBeenCalledTimes(calls);
+    expect(getQueuedCount("a")).toBe(count);
   });
 
   it("stops firing after unsubscribe", () => {
-    const cb = vi.fn();
-    const unsub = subscribeAcpState(cb, new Set(["a"]));
-    unsub();
+    const cb = listen(["a"]);
+    for (const unsub of unsubs.splice(0)) unsub();
     setQueueCount("a", 1);
-    window.dispatchEvent(
-      new StorageEvent("storage", {
-        key: entryKey("a"),
-        newValue: null,
-        storageArea: localStorage,
-      }),
-    );
+    storageEvent(entryKey("a"));
     expect(cb).not.toHaveBeenCalled();
   });
 });

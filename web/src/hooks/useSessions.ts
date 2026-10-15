@@ -2,29 +2,23 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import type { SessionResponse } from "../lib/types";
 import { fetchSessions, type SessionsEnvelope } from "../lib/api";
 import { setServerDown } from "../lib/connectionState";
+import { beginRead, markReadApplied } from "../lib/sessionReads";
 
 const POLL_INTERVAL = 3000;
-// How long after a local drag we treat the client's ordering as
-// authoritative. The PUT typically lands in <1s and the poll runs
-// every 3s, so 4s is comfortably above both. Past this window the
-// server's value wins again, which is how a remote drag on another
-// device propagates back to us.
 const LOCAL_ORDERING_WINDOW_MS = 4000;
 
 export function useSessions() {
   const [sessions, setSessions] = useState<SessionResponse[]>([]);
   const [workspaceOrdering, setWorkspaceOrdering] = useState<string[]>([]);
   const [error, setError] = useState(false);
-  // True once the first fetch attempt resolves (success or failure). Lets
-  // callers distinguish "still loading" from "list confirmed empty / no
-  // such session," which matters for refresh on `/session/<id>` where an
-  // empty `sessions` array during initial paint otherwise indistinguishably
-  // collapses to the dashboard fallback. See #1351.
   const [loaded, setLoaded] = useState(false);
+  const [appliedRead, setAppliedRead] = useState(0);
+  const lastReadRef = useRef(0);
   const intervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const lastLocalOrderingAtRef = useRef<number>(0);
 
   const injectSession = useCallback((session: SessionResponse) => {
+    // Single-session responses omit rate-limit fields; keep the last known values (#3514).
     setSessions((prev) => {
       if (prev.some((s) => s.id === session.id)) return prev;
       return [session, ...prev];
@@ -35,13 +29,13 @@ export function useSessions() {
     lastLocalOrderingAtRef.current = Date.now();
   }, []);
 
-  const applyResult = useCallback((data: SessionsEnvelope | null) => {
+  const applyResult = useCallback((data: SessionsEnvelope | null, read: number) => {
     if (data !== null) {
+      if (read < lastReadRef.current) return;
+      lastReadRef.current = read;
       setSessions(data.sessions);
-      // Drop the server's ordering while a recent local drag is still
-      // settling. Without this guard, a poll that fires between our
-      // optimistic setState and the PUT landing can read the file in
-      // its pre-drag state and revert the row to its old slot.
+      setAppliedRead(read);
+      // Ignore server ordering while a local drag's PUT may still be landing.
       if (Date.now() - lastLocalOrderingAtRef.current > LOCAL_ORDERING_WINDOW_MS) {
         setWorkspaceOrdering(data.workspace_ordering);
       }
@@ -54,13 +48,19 @@ export function useSessions() {
     setLoaded(true);
   }, []);
 
-  const refresh = useCallback(async () => {
-    applyResult(await fetchSessions());
-  }, [applyResult]);
+  // Published after the commit so no row sees the new ordinal beside the previous snapshot.
+  useEffect(() => {
+    // eslint-disable-next-line react-you-might-not-need-an-effect/no-event-handler
+    if (appliedRead) markReadApplied(appliedRead);
+  }, [appliedRead]);
 
   useEffect(() => {
-    void fetchSessions().then(applyResult);
-    intervalRef.current = setInterval(() => void fetchSessions().then(applyResult), POLL_INTERVAL);
+    const poll = () => {
+      const read = beginRead();
+      void fetchSessions().then((data) => applyResult(data, read));
+    };
+    poll();
+    intervalRef.current = setInterval(poll, POLL_INTERVAL);
     return () => {
       if (intervalRef.current) clearInterval(intervalRef.current);
     };
@@ -70,12 +70,18 @@ export function useSessions() {
     setSessions((prev) => prev.map((s) => (s.id === id ? { ...s, status } : s)));
   }, []);
 
-  // Replace a single session with a fresh server snapshot (e.g. the response
-  // from a trash/restore/archive PATCH) so the UI re-buckets immediately
-  // instead of waiting for the next poll. No-op if the id isn't present.
-  // See #2489.
   const applySession = useCallback((session: SessionResponse) => {
-    setSessions((prev) => prev.map((s) => (s.id === session.id ? session : s)));
+    setSessions((prev) =>
+      prev.map((s) =>
+        s.id === session.id
+          ? {
+              ...session,
+              rate_limit: session.rate_limit === undefined ? s.rate_limit : session.rate_limit,
+              rate_limit_auto_resume: session.rate_limit_auto_resume ?? s.rate_limit_auto_resume,
+            }
+          : s,
+      ),
+    );
   }, []);
 
   return {
@@ -85,7 +91,6 @@ export function useSessions() {
     markLocalOrderingUpdate,
     error,
     loaded,
-    refresh,
     injectSession,
     setSessionStatus,
     applySession,

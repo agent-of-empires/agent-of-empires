@@ -1,47 +1,27 @@
 // @vitest-environment jsdom
-//
-// The hooks panel is a security boundary surface: it must render lifecycle
-// hooks read-only (no inputs/controls) and explain why they cannot be
-// edited from the dashboard. These tests pin the three-state rendering and
-// the read-only invariant.
 
 import { describe, expect, it } from "vitest";
 import { render } from "@testing-library/react";
 import { HooksReadOnlyPanel } from "../HooksReadOnlyPanel";
 import { buildEffectiveHooks } from "../../../lib/profileHooks";
 
-function mount(profile: Parameters<typeof buildEffectiveHooks>[0], global: Parameters<typeof buildEffectiveHooks>[1]) {
-  return render(<HooksReadOnlyPanel groups={buildEffectiveHooks(profile, global)} />);
-}
+type Hooks = Parameters<typeof buildEffectiveHooks>[0];
 
 describe("HooksReadOnlyPanel", () => {
-  it("renders the explain-why note about remote code execution", () => {
-    const { getByText } = mount({}, {});
+  it("explains why hooks are read-only and exposes no controls", () => {
+    const { container, getByText } = render(
+      <HooksReadOnlyPanel groups={buildEffectiveHooks({ on_create: ["echo hi"] }, { on_launch: ["echo global"] })} />,
+    );
     expect(getByText(/remote code execution/i)).toBeTruthy();
+    expect(container.querySelectorAll("input, textarea, button, select")).toHaveLength(0);
   });
 
-  it("exposes no editable controls (read-only invariant)", () => {
-    const { container } = mount({ on_create: ["echo hi"] }, { on_launch: ["echo global"] });
-    expect(container.querySelectorAll("input").length).toBe(0);
-    expect(container.querySelectorAll("textarea").length).toBe(0);
-    expect(container.querySelectorAll("button").length).toBe(0);
-    expect(container.querySelectorAll("select").length).toBe(0);
-  });
-
-  it("shows a profile override command with the override badge", () => {
-    const { getByText } = mount({ on_create: ["echo hi"] }, {});
-    expect(getByText("echo hi")).toBeTruthy();
-    expect(getByText("Profile override")).toBeTruthy();
-  });
-
-  it("labels an inherited global command", () => {
-    const { getByText } = mount({}, { on_launch: ["echo global"] });
-    expect(getByText("echo global")).toBeTruthy();
-    expect(getByText("Inherited from global")).toBeTruthy();
-  });
-
-  it("labels an explicit empty override as overridden-to-none", () => {
-    const { getByText } = mount({ on_destroy: [] }, { on_destroy: ["docker compose down"] });
-    expect(getByText("Overridden: none")).toBeTruthy();
+  it.each<[string, Hooks, Hooks, string[]]>([
+    ["a profile override", { on_create: ["echo hi"] }, {}, ["echo hi", "Profile override"]],
+    ["an inherited global command", {}, { on_launch: ["echo global"] }, ["echo global", "Inherited from global"]],
+    ["an explicit empty override", { on_destroy: [] }, { on_destroy: ["docker compose down"] }, ["Overridden: none"]],
+  ])("labels %s", (_, profile, global, texts) => {
+    const { getByText } = render(<HooksReadOnlyPanel groups={buildEffectiveHooks(profile, global)} />);
+    for (const text of texts) expect(getByText(text)).toBeTruthy();
   });
 });

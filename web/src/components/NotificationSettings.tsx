@@ -1,12 +1,10 @@
 import { usePushSubscription } from "../hooks/usePushSubscription";
+import { deniedGuidance, type PushHealth } from "../lib/pushHealth";
 
-// Push-notifications settings section. Rendered inside SettingsView.
-// State machine lives in usePushSubscription; this component is a view
-// on top of it with a single Enable/Disable primary action and a
-// secondary test-send button when enabled.
+// Push-notifications settings section.
 
 export function NotificationSettings() {
-  const { state, enable, disable, sendTest, resubscribe } = usePushSubscription();
+  const { state, health, enable, disable, sendTest } = usePushSubscription();
 
   const isBusy =
     state.kind === "asking" ||
@@ -20,6 +18,7 @@ export function NotificationSettings() {
       <h3 className="font-mono text-sm uppercase tracking-widest text-text-muted mb-3">Notifications</h3>
 
       <StatusRow state={state} />
+      <HealthRow health={health} />
 
       <div className="mt-4 flex flex-wrap gap-2">
         {(state.kind === "off" || state.kind === "denied" || state.kind === "error") && (
@@ -40,7 +39,7 @@ export function NotificationSettings() {
               Send test notification
             </button>
             <button
-              onClick={resubscribe}
+              onClick={enable}
               title="Re-register this device. Use after changing the server port or hostname so notifications open the right URL."
               className="px-3 py-2 rounded-md border border-surface-700 hover:bg-surface-700/40 text-sm font-medium text-text-secondary transition-colors"
             >
@@ -124,6 +123,19 @@ function StatusRow({ state }: { state: ReturnType<typeof usePushSubscription>["s
     case "error":
       return <p className="text-sm text-status-error">Error: {state.message}</p>;
   }
+}
+
+/** Why a device that asked for notifications is not getting them. */
+function HealthRow({ health }: { health: PushHealth }) {
+  const message = {
+    revoked: "Notifications stopped: this device dropped its subscription. Enable notifications again.",
+    "key-mismatch":
+      "Notifications stopped: this device is registered with an old server key. Enable notifications again.",
+    "delivery-failed": "The push service refused the last notification for this device. Enable notifications again.",
+    "permission-denied": deniedGuidance(),
+  }[health as string];
+  if (!message) return null;
+  return <p className="mt-2 text-sm text-status-waiting">{message}</p>;
 }
 
 function IOSInstallHelp() {

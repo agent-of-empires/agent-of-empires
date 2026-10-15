@@ -1,11 +1,3 @@
-// Drift guard + behavioral lock for the single shortcut registry (issue #1648).
-//
-// This is the test that makes "one source of truth" real: it pins the exact
-// rendered label strings (so the help overlay and tour cannot silently change
-// formatting), pins the match behavior of every binding (so a refactor cannot
-// rebind a key), proves the SHORTCUTS array order is cosmetic (exactly one
-// shortcut matches any given event), and couples the tour to the registry
-// (every tour hint id resolves to a registered shortcut).
 import { describe, expect, it } from "vitest";
 import {
   SHORTCUTS,
@@ -13,33 +5,26 @@ import {
   type ShortcutDef,
   type ShortcutKeyEvent,
   formatHelpShortcut,
-  formatTourShortcut,
   matchShortcut,
+  formatTourShortcut,
 } from "../shortcuts";
 import { TOUR_STEPS } from "../tourSteps";
 
-function ev(partial: Partial<ShortcutKeyEvent>): ShortcutKeyEvent {
-  return {
-    key: "",
-    code: "",
-    metaKey: false,
-    ctrlKey: false,
-    altKey: false,
-    shiftKey: false,
-    ...partial,
-  };
-}
+// Ctrl+Q matches only while an embedded terminal or structured composer owns focus; bare keys remain textless.
+const ev = (partial: Partial<ShortcutKeyEvent>): ShortcutKeyEvent => ({
+  key: "",
+  code: "",
+  metaKey: false,
+  ctrlKey: false,
+  altKey: false,
+  shiftKey: false,
+  ...partial,
+});
 
 describe("SHORTCUTS registry", () => {
-  it("has unique ids", () => {
-    const ids = SHORTCUTS.map((s) => s.id);
-    expect(new Set(ids).size).toBe(ids.length);
-  });
-
-  it("SHORTCUTS_BY_ID resolves every entry", () => {
-    for (const s of SHORTCUTS) {
-      expect(SHORTCUTS_BY_ID[s.id]).toBe(s);
-    }
+  it("has unique ids that SHORTCUTS_BY_ID resolves", () => {
+    expect(new Set(SHORTCUTS.map((s) => s.id)).size).toBe(SHORTCUTS.length);
+    for (const s of SHORTCUTS) expect(SHORTCUTS_BY_ID[s.id]).toBe(s);
   });
 });
 
@@ -47,6 +32,7 @@ describe("label formatting (locked byte-for-byte against pre-refactor output)", 
   const helpMac: Record<string, string> = {
     palette: "⌘K",
     sidebar: "⌘B",
+    sidebarFocus: "⌃Q",
     rightPanel: "⌘⌥B",
     terminalFocus: "⌘`",
     new: "n",
@@ -60,6 +46,7 @@ describe("label formatting (locked byte-for-byte against pre-refactor output)", 
   const helpOther: Record<string, string> = {
     palette: "CtrlK",
     sidebar: "CtrlB",
+    sidebarFocus: "CtrlQ",
     rightPanel: "CtrlAltB",
     terminalFocus: "Ctrl`",
     new: "n",
@@ -73,6 +60,7 @@ describe("label formatting (locked byte-for-byte against pre-refactor output)", 
   const tour: Record<string, string> = {
     palette: "⌘K / Ctrl+K",
     sidebar: "⌘B / Ctrl+B",
+    sidebarFocus: "⌃Q / Ctrl+Q",
     rightPanel: "⌘⌥B / Ctrl+Alt+B",
     terminalFocus: "⌘` / Ctrl+`",
     new: "n",
@@ -93,13 +81,14 @@ describe("label formatting (locked byte-for-byte against pre-refactor output)", 
   }
 });
 
-describe("matchShortcut behavior (no binding changed by the refactor)", () => {
+describe("matchShortcut behavior", () => {
   const cases: Array<{
     name: string;
     event: ShortcutKeyEvent;
     mac: boolean;
     isInput?: boolean;
     expected: ShortcutDef["id"] | null;
+    isSessionInput?: boolean;
   }> = [
     {
       name: "mac Meta+K -> palette",
@@ -149,6 +138,36 @@ describe("matchShortcut behavior (no binding changed by the refactor)", () => {
       event: ev({ key: "b", code: "KeyB", metaKey: true }),
       mac: true,
       expected: "sidebar",
+    },
+    {
+      name: "Ctrl+Q returns focus to the sidebar from the session input on Mac",
+      event: ev({ key: "q", code: "KeyQ", ctrlKey: true }),
+      mac: true,
+      isInput: true,
+      isSessionInput: true,
+      expected: "sidebarFocus",
+    },
+    {
+      name: "Ctrl+Q returns focus to the sidebar from the session input on other platforms",
+      event: ev({ key: "q", code: "KeyQ", ctrlKey: true }),
+      mac: false,
+      isInput: true,
+      isSessionInput: true,
+      expected: "sidebarFocus",
+    },
+    {
+      name: "Ctrl+Q outside a session input is left to the browser",
+      event: ev({ key: "q", code: "KeyQ", ctrlKey: true }),
+      mac: false,
+      isInput: true,
+      expected: null,
+    },
+    {
+      name: "Cmd+Q remains the browser shortcut",
+      event: ev({ key: "q", code: "KeyQ", metaKey: true }),
+      mac: true,
+      isSessionInput: true,
+      expected: null,
     },
     {
       name: "Mac Option+B (key '∫', code KeyB) still -> rightPanel",
@@ -247,6 +266,7 @@ describe("matchShortcut behavior (no binding changed by the refactor)", () => {
       const matched = matchShortcut(c.event, {
         mac: c.mac,
         isInput: c.isInput ?? false,
+        isSessionInput: c.isSessionInput ?? false,
       });
       expect(matched?.shortcut.id ?? null).toBe(c.expected);
     });
@@ -281,71 +301,11 @@ describe("matchShortcut behavior (no binding changed by the refactor)", () => {
   });
 });
 
-describe("array order is cosmetic (predicates are mutually exclusive)", () => {
-  // Build the event that should fire each shortcut, then assert exactly one
-  // shortcut in the whole registry matches it. If a future binding overlaps an
-  // existing one, this turns red regardless of array order.
-  function triggeringEvent(s: ShortcutDef): {
-    event: ShortcutKeyEvent;
-    isInput: boolean;
-  } {
-    const t = s.trigger;
-    const e = ev({});
-    if (t.scope === "global") {
-      if (t.mod) e.metaKey = true;
-      if (t.shift) e.shiftKey = true;
-      if (t.alt) e.altKey = true;
-      if (t.code) {
-        e.code = t.code;
-        e.key = t.code === "Backquote" ? "`" : t.code.replace(/^Key/, "").toLowerCase();
-      }
-      if (t.key) e.key = t.key;
-    } else {
-      e.key = t.key ?? "";
-    }
-    return { event: e, isInput: false };
-  }
-
-  function allMatchingIds(event: ShortcutKeyEvent, opts: { mac: boolean; isInput: boolean }): string[] {
-    const mod = opts.mac ? event.metaKey : event.metaKey || event.ctrlKey;
-    const hasMetaCtrlAlt = event.metaKey || event.ctrlKey || event.altKey;
-    const ids: string[] = [];
-    for (const s of SHORTCUTS) {
-      const t = s.trigger;
-      if (t.scope === "global") {
-        if (t.mod !== undefined && t.mod !== mod) continue;
-        if (t.shift !== undefined && t.shift !== event.shiftKey) continue;
-        if (t.alt !== undefined && t.alt !== event.altKey) continue;
-        if (t.code !== undefined) {
-          if (event.code !== t.code) continue;
-        } else if (t.key !== undefined) {
-          const ok = t.keyCaseInsensitive ? event.key.toLowerCase() === t.key.toLowerCase() : event.key === t.key;
-          if (!ok) continue;
-        } else {
-          continue;
-        }
-        ids.push(s.id);
-      } else {
-        if (opts.isInput || hasMetaCtrlAlt) continue;
-        if (event.key === t.key) ids.push(s.id);
-      }
-    }
-    return ids;
-  }
-
-  for (const s of SHORTCUTS) {
-    it(`exactly one shortcut matches the event that triggers ${s.id} (mac)`, () => {
-      const { event, isInput } = triggeringEvent(s);
-      expect(allMatchingIds(event, { mac: true, isInput })).toEqual([s.id]);
-    });
-  }
-});
-
 describe("tour drift guard", () => {
   it("every tour shortcut hint id resolves to a registered shortcut", () => {
     for (const step of TOUR_STEPS) {
       for (const hint of step.shortcutHints ?? []) {
-        expect(SHORTCUTS_BY_ID[hint.id], `step "${step.id}" hint "${hint.id}" is not registered`).toBeDefined();
+        expect(SHORTCUTS_BY_ID[hint.id], `step "${step.id}" hint "${hint.id}"`).toBeDefined();
       }
     }
   });

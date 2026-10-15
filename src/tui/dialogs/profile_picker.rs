@@ -7,27 +7,24 @@ use tui_input::backend::crossterm::EventHandler;
 use tui_input::Input;
 
 use super::DialogResult;
+use crate::tui::components::buttons::render_yes_no;
+use crate::tui::components::hint_buttons::HintButtons;
+use crate::tui::components::hover::{paint_hover_bg, HoverState};
 use crate::tui::components::set_prefixed_input_cursor_position;
 use crate::tui::styles::Theme;
 
-/// Result when profile picker submits
 pub enum ProfilePickerAction {
     Switch(String),
     Created(String),
     Deleted(String),
 }
 
-/// Sub-mode of the profile picker
 enum Mode {
-    /// Browsing the profile list
     List,
-    /// Entering a name for a new profile
     CreateInput,
-    /// Confirming deletion of the selected profile
     ConfirmDelete,
 }
 
-/// Info about a single profile entry
 pub struct ProfileEntry {
     pub name: String,
     pub session_count: usize,
@@ -38,12 +35,17 @@ pub struct ProfilePickerDialog {
     mode: Mode,
     profiles: Vec<ProfileEntry>,
     selected: usize,
-    /// Input for new profile name
     name_input: Input,
-    /// Error/validation message
     error: Option<String>,
-    /// Confirmation selection: true = Yes, false = No
     confirm_selected: bool,
+    /// `(profile index, rect)` for each drawn list row.
+    row_rects: Vec<(usize, Rect)>,
+    /// `[Yes]` / `[No]` in the delete confirm.
+    confirm_rects: (Rect, Rect),
+    /// The hovered row or confirm button. Visual only: a footer action acts
+    /// on `selected`, so the pointer crossing rows must not retarget it.
+    hover: HoverState,
+    footer: HintButtons,
 }
 
 impl ProfilePickerDialog {
@@ -59,6 +61,44 @@ impl ProfilePickerDialog {
             name_input: Input::default(),
             error: None,
             confirm_selected: false,
+            row_rects: Vec::new(),
+            confirm_rects: (Rect::default(), Rect::default()),
+            hover: HoverState::default(),
+            footer: HintButtons::default(),
+        }
+    }
+
+    /// A row click switches to that profile.
+    pub fn handle_click(&mut self, col: u16, row: u16) -> Option<KeyEvent> {
+        match self.mode {
+            Mode::List => {
+                if let Some(idx) = super::hit(&self.row_rects, col, row) {
+                    self.selected = idx;
+                    return Some(KeyEvent::from(KeyCode::Enter));
+                }
+            }
+            Mode::ConfirmDelete => {
+                let (yes, no) = self.confirm_rects;
+                if let Some(key) = super::hit(&[('y', yes), ('n', no)], col, row) {
+                    return Some(KeyEvent::from(KeyCode::Char(key)));
+                }
+            }
+            Mode::CreateInput => {}
+        }
+        self.footer.key_at(col, row)
+    }
+
+    pub fn handle_hover(&mut self, col: u16, row: u16) -> bool {
+        let rects = self.hover_rects();
+        let target = self.hover.update(col, row, &rects);
+        self.footer.handle_hover(col, row) | target
+    }
+
+    fn hover_rects(&self) -> Vec<Rect> {
+        match self.mode {
+            Mode::List => super::target_rects(&self.row_rects),
+            Mode::ConfirmDelete => vec![self.confirm_rects.0, self.confirm_rects.1],
+            Mode::CreateInput => Vec::new(),
         }
     }
 
@@ -67,9 +107,8 @@ impl ProfilePickerDialog {
     }
 
     fn can_delete_selected(&self) -> bool {
-        // The invariant is "at least one profile must exist", a count, not a
-        // name. Any non-active profile is deletable as long as it is not the
-        // last one. The backend `delete_profile` enforces the same rule.
+        // The invariant is a count, not a name: any non-active profile is
+        // deletable while it is not the last. `delete_profile` agrees.
         self.selected_profile()
             .is_some_and(|p| !p.is_active && self.profiles.len() > 1)
     }
@@ -203,7 +242,9 @@ impl ProfilePickerDialog {
         None
     }
 
-    pub fn render(&self, frame: &mut Frame, area: Rect, theme: &Theme) {
+    pub fn render(&mut self, frame: &mut Frame, area: Rect, theme: &Theme) {
+        self.row_rects.clear();
+        self.confirm_rects = (Rect::default(), Rect::default());
         match self.mode {
             Mode::List => self.render_list(frame, area, theme),
             Mode::CreateInput => self.render_create(frame, area, theme),
@@ -211,25 +252,16 @@ impl ProfilePickerDialog {
         }
     }
 
-    fn render_list(&self, frame: &mut Frame, area: Rect, theme: &Theme) {
+    fn render_list(&mut self, frame: &mut Frame, area: Rect, theme: &Theme) {
         let max_visible: usize = 8;
         let list_height = self.profiles.len().min(max_visible) as u16;
         // list + hint (1) + borders (2) + margin (2)
         let dialog_height = (list_height + 5).min(area.height);
         let dialog_width: u16 = 40;
 
-        let dialog_area = super::centered_rect(area, dialog_width, dialog_height);
-        frame.render_widget(Clear, dialog_area);
-
-        let block = Block::default()
-            .borders(Borders::ALL)
-            .border_type(BorderType::Rounded)
-            .border_style(Style::default().fg(theme.accent))
-            .title(" Profiles ")
-            .title_style(Style::default().fg(theme.title).bold());
-
-        let inner = block.inner(dialog_area);
-        frame.render_widget(block, dialog_area);
+        let block = super::dialog_block(" Profiles ", theme);
+        let (_, inner) =
+            super::render_dialog_frame(frame, area, dialog_width, dialog_height, block);
 
         let chunks = Layout::default()
             .direction(Direction::Vertical)
@@ -284,31 +316,30 @@ impl ProfilePickerDialog {
             }
 
             lines.push(Line::from(spans));
+            self.row_rects.push((
+                abs_idx,
+                Rect::new(chunks[0].x, chunks[0].y + i as u16, chunks[0].width, 1),
+            ));
         }
 
         frame.render_widget(Paragraph::new(lines), chunks[0]);
-
-        // Hint line
-        let mut hint_spans = vec![
-            Span::styled("n", Style::default().fg(theme.hint)),
-            Span::raw(" new  "),
-        ];
-        if self.can_delete_selected() {
-            hint_spans.extend([
-                Span::styled("d", Style::default().fg(theme.hint)),
-                Span::raw(" delete  "),
-            ]);
+        if let Some(rect) = self.hover.current_in(&self.hover_rects()) {
+            paint_hover_bg(frame, rect, theme.selection);
         }
-        hint_spans.extend([
-            Span::styled("Enter", Style::default().fg(theme.hint)),
-            Span::raw(" switch  "),
-            Span::styled("Esc", Style::default().fg(theme.hint)),
-            Span::raw(" close"),
+
+        let mut hints = vec![("n", "new", KeyCode::Char('n'))];
+        if self.can_delete_selected() {
+            hints.push(("d", "delete", KeyCode::Char('d')));
+        }
+        hints.extend([
+            ("Enter", "switch", KeyCode::Enter),
+            ("Esc", "close", KeyCode::Esc),
         ]);
-        frame.render_widget(Paragraph::new(Line::from(hint_spans)), chunks[1]);
+        self.footer
+            .render(frame, chunks[1], theme, &hints, Alignment::Left);
     }
 
-    fn render_create(&self, frame: &mut Frame, area: Rect, theme: &Theme) {
+    fn render_create(&mut self, frame: &mut Frame, area: Rect, theme: &Theme) {
         let has_error = self.error.is_some();
         let dialog_width: u16 = 40;
         // inner width = dialog_width - borders(2) - margin(2) = 36
@@ -325,18 +356,9 @@ impl ProfilePickerDialog {
         // name(1) + spacer(1) + error_lines + hint(1) + borders(2) + margin(2)
         let dialog_height: u16 = if has_error { 7 + error_lines } else { 7 };
 
-        let dialog_area = super::centered_rect(area, dialog_width, dialog_height);
-        frame.render_widget(Clear, dialog_area);
-
-        let block = Block::default()
-            .borders(Borders::ALL)
-            .border_type(BorderType::Rounded)
-            .border_style(Style::default().fg(theme.accent))
-            .title(" New Profile ")
-            .title_style(Style::default().fg(theme.title).bold());
-
-        let inner = block.inner(dialog_area);
-        frame.render_widget(block, dialog_area);
+        let block = super::dialog_block(" New Profile ", theme);
+        let (_, inner) =
+            super::render_dialog_frame(frame, area, dialog_width, dialog_height, block);
 
         let mut constraints = vec![
             Constraint::Length(1), // "Name:" label + input
@@ -353,7 +375,6 @@ impl ProfilePickerDialog {
             .constraints(constraints)
             .split(inner);
 
-        // Name input
         let value = self.name_input.value();
         let input_line = Line::from(vec![
             Span::styled("Name: ", Style::default().fg(theme.text)),
@@ -365,7 +386,6 @@ impl ProfilePickerDialog {
 
         let mut chunk_idx = 2;
 
-        // Error message
         if let Some(err) = &self.error {
             frame.render_widget(
                 Paragraph::new(err.as_str())
@@ -376,32 +396,25 @@ impl ProfilePickerDialog {
             chunk_idx += 1;
         }
 
-        // Hint
-        let hint_line = Line::from(vec![
-            Span::styled("Enter", Style::default().fg(theme.hint)),
-            Span::raw(" confirm  "),
-            Span::styled("Esc", Style::default().fg(theme.hint)),
-            Span::raw(" cancel"),
-        ]);
-        frame.render_widget(Paragraph::new(hint_line), chunks[chunk_idx]);
+        self.footer.render(
+            frame,
+            chunks[chunk_idx],
+            theme,
+            &[
+                ("Enter", "confirm", KeyCode::Enter),
+                ("Esc", "cancel", KeyCode::Esc),
+            ],
+            Alignment::Left,
+        );
     }
 
-    fn render_confirm_delete(&self, frame: &mut Frame, area: Rect, theme: &Theme) {
+    fn render_confirm_delete(&mut self, frame: &mut Frame, area: Rect, theme: &Theme) {
         let dialog_height: u16 = 8;
         let dialog_width: u16 = 40;
 
-        let dialog_area = super::centered_rect(area, dialog_width, dialog_height);
-        frame.render_widget(Clear, dialog_area);
-
-        let block = Block::default()
-            .borders(Borders::ALL)
-            .border_type(BorderType::Rounded)
-            .border_style(Style::default().fg(theme.error))
-            .title(" Delete Profile ")
-            .title_style(Style::default().fg(theme.error).bold());
-
-        let inner = block.inner(dialog_area);
-        frame.render_widget(block, dialog_area);
+        let block = super::toned_dialog_block(" Delete Profile ", theme.error, theme.error);
+        let (_, inner) =
+            super::render_dialog_frame(frame, area, dialog_width, dialog_height, block);
 
         let chunks = Layout::default()
             .direction(Direction::Vertical)
@@ -409,7 +422,6 @@ impl ProfilePickerDialog {
             .constraints([Constraint::Min(1), Constraint::Length(1)])
             .split(inner);
 
-        // Message
         if let Some(profile) = self.selected_profile() {
             let msg = format!(
                 "Delete '{}' ({} session{})?",
@@ -425,27 +437,14 @@ impl ProfilePickerDialog {
             );
         }
 
-        // Buttons
-        let yes_style = if self.confirm_selected {
-            Style::default().fg(theme.error).bold()
-        } else {
-            Style::default().fg(theme.dimmed)
-        };
-        let no_style = if !self.confirm_selected {
-            Style::default().fg(theme.running).bold()
-        } else {
-            Style::default().fg(theme.dimmed)
-        };
-
-        let buttons = Line::from(vec![
-            Span::raw("  "),
-            Span::styled("[Yes]", yes_style),
-            Span::raw("    "),
-            Span::styled("[No]", no_style),
-        ]);
-        frame.render_widget(
-            Paragraph::new(buttons).alignment(Alignment::Center),
+        // No footer here; drop the list's hint rects so they can't be clicked.
+        self.footer.clear();
+        self.confirm_rects = render_yes_no(
+            frame,
             chunks[1],
+            theme,
+            self.confirm_selected,
+            self.hover.current(),
         );
     }
 }
@@ -453,245 +452,182 @@ impl ProfilePickerDialog {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crossterm::event::KeyModifiers;
+    use crate::tui::dialogs::test_keys::key;
 
-    fn key(code: KeyCode) -> KeyEvent {
-        KeyEvent::new(code, KeyModifiers::NONE)
+    fn entry(name: &str, session_count: usize, is_active: bool) -> ProfileEntry {
+        ProfileEntry {
+            name: name.to_string(),
+            session_count,
+            is_active,
+        }
     }
 
-    fn sample_profiles() -> Vec<ProfileEntry> {
-        vec![
-            ProfileEntry {
-                name: "default".to_string(),
-                session_count: 2,
-                is_active: true,
-            },
-            ProfileEntry {
-                name: "work".to_string(),
-                session_count: 3,
-                is_active: false,
-            },
-            ProfileEntry {
-                name: "personal".to_string(),
-                session_count: 0,
-                is_active: false,
-            },
-        ]
+    /// default (active), work, personal.
+    fn dialog() -> ProfilePickerDialog {
+        ProfilePickerDialog::new(
+            vec![
+                entry("default", 2, true),
+                entry("work", 3, false),
+                entry("personal", 0, false),
+            ],
+            "default",
+        )
     }
 
-    #[test]
-    fn test_new_selects_active_profile() {
-        let dialog = ProfilePickerDialog::new(sample_profiles(), "default");
-        assert_eq!(dialog.selected, 0);
-
-        let dialog = ProfilePickerDialog::new(sample_profiles(), "work");
-        assert_eq!(dialog.selected, 1);
-    }
-
-    #[test]
-    fn test_esc_cancels() {
-        let mut dialog = ProfilePickerDialog::new(sample_profiles(), "default");
-        let result = dialog.handle_key(key(KeyCode::Esc));
-        assert!(matches!(result, DialogResult::Cancel));
+    /// The dialog in create mode with `name` typed into it.
+    fn naming(name: &str) -> ProfilePickerDialog {
+        let mut d = dialog();
+        d.handle_key(key(KeyCode::Char('n')));
+        assert!(matches!(d.mode, Mode::CreateInput));
+        for c in name.chars() {
+            d.handle_key(key(KeyCode::Char(c)));
+        }
+        d
     }
 
     #[test]
-    fn test_navigate_and_select() {
-        let mut dialog = ProfilePickerDialog::new(sample_profiles(), "default");
+    fn the_list_opens_on_the_active_profile_and_navigation_clamps() {
+        assert_eq!(dialog().selected, 0);
+        assert_eq!(
+            ProfilePickerDialog::new(
+                vec![entry("default", 2, true), entry("work", 3, false)],
+                "work"
+            )
+            .selected,
+            1
+        );
 
-        // Move down to "work"
-        dialog.handle_key(key(KeyCode::Down));
-        assert_eq!(dialog.selected, 1);
+        let mut d = dialog();
+        d.handle_key(key(KeyCode::Up));
+        assert_eq!(d.selected, 0, "cannot go above the first row");
+        for _ in 0..4 {
+            d.handle_key(key(KeyCode::Down));
+        }
+        assert_eq!(d.selected, 2, "cannot go past the last row");
+        d.handle_key(key(KeyCode::Char('k')));
+        assert_eq!(d.selected, 1);
+        d.handle_key(key(KeyCode::Char('j')));
+        assert_eq!(d.selected, 2);
 
-        // Select it
-        let result = dialog.handle_key(key(KeyCode::Enter));
         assert!(matches!(
-            result,
+            dialog().handle_key(key(KeyCode::Esc)),
+            DialogResult::Cancel
+        ));
+    }
+
+    #[test]
+    fn enter_switches_to_another_profile_and_cancels_on_the_active_one() {
+        let mut d = dialog();
+        assert!(matches!(
+            d.handle_key(key(KeyCode::Enter)),
+            DialogResult::Cancel
+        ));
+
+        d.handle_key(key(KeyCode::Down));
+        assert!(matches!(
+            d.handle_key(key(KeyCode::Enter)),
             DialogResult::Submit(ProfilePickerAction::Switch(name)) if name == "work"
         ));
     }
 
     #[test]
-    fn test_enter_on_active_cancels() {
-        let mut dialog = ProfilePickerDialog::new(sample_profiles(), "default");
-        // "default" is active, Enter should cancel
-        let result = dialog.handle_key(key(KeyCode::Enter));
-        assert!(matches!(result, DialogResult::Cancel));
-    }
-
-    #[test]
-    fn test_create_flow() {
-        let mut dialog = ProfilePickerDialog::new(sample_profiles(), "default");
-
-        // Press 'n' to enter create mode
-        dialog.handle_key(key(KeyCode::Char('n')));
-        assert!(matches!(dialog.mode, Mode::CreateInput));
-
-        // Type a name
-        dialog.handle_key(key(KeyCode::Char('t')));
-        dialog.handle_key(key(KeyCode::Char('e')));
-        dialog.handle_key(key(KeyCode::Char('s')));
-        dialog.handle_key(key(KeyCode::Char('t')));
-
-        let result = dialog.handle_key(key(KeyCode::Enter));
+    fn creating_a_profile_validates_the_typed_name() {
         assert!(matches!(
-            result,
+            naming("test").handle_key(key(KeyCode::Enter)),
             DialogResult::Submit(ProfilePickerAction::Created(name)) if name == "test"
         ));
-    }
 
-    #[test]
-    fn test_create_empty_name_error() {
-        let mut dialog = ProfilePickerDialog::new(sample_profiles(), "default");
-        dialog.handle_key(key(KeyCode::Char('n')));
-
-        let result = dialog.handle_key(key(KeyCode::Enter));
-        assert!(matches!(result, DialogResult::Continue));
-        assert!(dialog.error.is_some());
-        assert!(dialog.error.as_ref().unwrap().contains("empty"));
-    }
-
-    #[test]
-    fn test_create_duplicate_name_error() {
-        let mut dialog = ProfilePickerDialog::new(sample_profiles(), "default");
-        dialog.handle_key(key(KeyCode::Char('n')));
-
-        // Type "work" which already exists
-        for c in "work".chars() {
-            dialog.handle_key(key(KeyCode::Char(c)));
+        // (typed name, the phrase the inline error must carry)
+        for (name, expected) in [
+            ("", "empty"),
+            ("work", "already exists"),
+            ("a/b", "path separators"),
+        ] {
+            let mut d = naming(name);
+            assert!(matches!(
+                d.handle_key(key(KeyCode::Enter)),
+                DialogResult::Continue
+            ));
+            let error = d.error.as_ref().expect("an inline error");
+            assert!(error.contains(expected), "{name:?} -> {error:?}");
         }
 
-        let result = dialog.handle_key(key(KeyCode::Enter));
-        assert!(matches!(result, DialogResult::Continue));
-        assert!(dialog.error.as_ref().unwrap().contains("already exists"));
+        let mut d = naming("test");
+        d.handle_key(key(KeyCode::Esc));
+        assert!(matches!(d.mode, Mode::List));
     }
 
     #[test]
-    fn test_create_path_separator_error() {
-        let mut dialog = ProfilePickerDialog::new(sample_profiles(), "default");
-        dialog.handle_key(key(KeyCode::Char('n')));
+    fn deleting_asks_first_and_is_refused_for_the_active_or_last_profile() {
+        let mut d = dialog();
+        d.handle_key(key(KeyCode::Char('d')));
+        assert!(matches!(d.mode, Mode::List), "the active profile stays");
 
-        for c in "a/b".chars() {
-            dialog.handle_key(key(KeyCode::Char(c)));
-        }
+        // The invariant is a count, not a name: a profile named "default" is
+        // deletable, and the last one is not, whatever it is called.
+        let mut d = ProfilePickerDialog::new(
+            vec![entry("default", 0, false), entry("work", 0, true)],
+            "work",
+        );
+        d.handle_key(key(KeyCode::Up));
+        assert_eq!(d.selected, 0);
+        d.handle_key(key(KeyCode::Char('d')));
+        assert!(matches!(d.mode, Mode::ConfirmDelete));
 
-        let result = dialog.handle_key(key(KeyCode::Enter));
-        assert!(matches!(result, DialogResult::Continue));
-        assert!(dialog.error.as_ref().unwrap().contains("path separators"));
-    }
+        let mut d = ProfilePickerDialog::new(vec![entry("only", 0, false)], "work");
+        d.handle_key(key(KeyCode::Char('d')));
+        assert!(matches!(d.mode, Mode::List));
 
-    #[test]
-    fn test_create_esc_returns_to_list() {
-        let mut dialog = ProfilePickerDialog::new(sample_profiles(), "default");
-        dialog.handle_key(key(KeyCode::Char('n')));
-        assert!(matches!(dialog.mode, Mode::CreateInput));
+        // Confirming deletes; Esc backs out to the list.
+        let mut d = dialog();
+        d.handle_key(key(KeyCode::Down));
+        d.handle_key(key(KeyCode::Char('d')));
+        assert!(matches!(d.mode, Mode::ConfirmDelete));
+        d.handle_key(key(KeyCode::Esc));
+        assert!(matches!(d.mode, Mode::List));
 
-        dialog.handle_key(key(KeyCode::Esc));
-        assert!(matches!(dialog.mode, Mode::List));
-    }
-
-    #[test]
-    fn test_delete_not_allowed_on_active() {
-        let mut dialog = ProfilePickerDialog::new(sample_profiles(), "default");
-        // "default" is active, 'd' should not enter confirm mode
-        dialog.handle_key(key(KeyCode::Char('d')));
-        assert!(matches!(dialog.mode, Mode::List));
-    }
-
-    #[test]
-    fn test_delete_allowed_on_profile_named_default() {
-        // A profile literally named "default" is ordinary: deletable when it
-        // is not active and is not the only profile left.
-        let profiles = vec![
-            ProfileEntry {
-                name: "default".to_string(),
-                session_count: 0,
-                is_active: false,
-            },
-            ProfileEntry {
-                name: "work".to_string(),
-                session_count: 0,
-                is_active: true,
-            },
-        ];
-        let mut dialog = ProfilePickerDialog::new(profiles, "work");
-        // Select "default" (index 0)
-        dialog.handle_key(key(KeyCode::Up));
-        assert_eq!(dialog.selected, 0);
-
-        dialog.handle_key(key(KeyCode::Char('d')));
-        assert!(matches!(dialog.mode, Mode::ConfirmDelete));
-    }
-
-    #[test]
-    fn test_delete_not_allowed_on_last_profile() {
-        // The count invariant: the only remaining profile cannot be deleted.
-        let profiles = vec![ProfileEntry {
-            name: "only".to_string(),
-            session_count: 0,
-            is_active: false,
-        }];
-        let mut dialog = ProfilePickerDialog::new(profiles, "work");
-        dialog.handle_key(key(KeyCode::Char('d')));
-        assert!(matches!(dialog.mode, Mode::List));
-    }
-
-    #[test]
-    fn test_delete_confirm_flow() {
-        let mut dialog = ProfilePickerDialog::new(sample_profiles(), "default");
-        // Select "work"
-        dialog.handle_key(key(KeyCode::Down));
-        assert_eq!(dialog.selected, 1);
-
-        // Press 'd' to enter confirm
-        dialog.handle_key(key(KeyCode::Char('d')));
-        assert!(matches!(dialog.mode, Mode::ConfirmDelete));
-
-        // Press 'y' to confirm
-        let result = dialog.handle_key(key(KeyCode::Char('y')));
+        d.handle_key(key(KeyCode::Char('d')));
         assert!(matches!(
-            result,
+            d.handle_key(key(KeyCode::Char('y'))),
             DialogResult::Submit(ProfilePickerAction::Deleted(name)) if name == "work"
         ));
     }
 
     #[test]
-    fn test_delete_cancel_returns_to_list() {
-        let mut dialog = ProfilePickerDialog::new(sample_profiles(), "default");
-        dialog.handle_key(key(KeyCode::Down));
-        dialog.handle_key(key(KeyCode::Char('d')));
-        assert!(matches!(dialog.mode, Mode::ConfirmDelete));
+    fn clicks_and_hover_drive_every_mode() {
+        use crate::tui::dialogs::test_render::{draw, find};
+        let press = |d: &mut ProfilePickerDialog, label: &str| {
+            let buf = draw(80, 24, |f, theme| d.render(f, f.area(), theme));
+            let (x, y) = find(&buf, label);
+            d.handle_click(x, y).map(|k| k.code)
+        };
 
-        dialog.handle_key(key(KeyCode::Esc));
-        assert!(matches!(dialog.mode, Mode::List));
-    }
+        let mut d = dialog();
+        let buf = draw(80, 24, |f, theme| d.render(f, f.area(), theme));
+        let (x, y) = find(&buf, "personal");
+        assert!(d.handle_hover(x, y));
+        assert_eq!(d.selected, 0, "hover tints but never retargets `d`");
+        let (x, y) = find(&buf, "work");
+        assert_eq!(d.handle_click(x, y).map(|k| k.code), Some(KeyCode::Enter));
+        assert_eq!(d.selected, 1, "the clicked row is what Enter switches to");
 
-    #[test]
-    fn test_navigation_clamps() {
-        let mut dialog = ProfilePickerDialog::new(sample_profiles(), "default");
-
-        // Can't go above 0
-        dialog.handle_key(key(KeyCode::Up));
-        assert_eq!(dialog.selected, 0);
-
-        // Go to last
-        dialog.handle_key(key(KeyCode::Down));
-        dialog.handle_key(key(KeyCode::Down));
-        assert_eq!(dialog.selected, 2);
-
-        // Can't go past last
-        dialog.handle_key(key(KeyCode::Down));
-        assert_eq!(dialog.selected, 2);
-    }
-
-    #[test]
-    fn test_k_j_navigation() {
-        let mut dialog = ProfilePickerDialog::new(sample_profiles(), "default");
-
-        dialog.handle_key(key(KeyCode::Char('j')));
-        assert_eq!(dialog.selected, 1);
-
-        dialog.handle_key(key(KeyCode::Char('k')));
-        assert_eq!(dialog.selected, 0);
+        // The table: (label clicked, key pressed), each followed by that key.
+        for (label, want) in [
+            ("d delete", KeyCode::Char('d')),
+            ("[No]", KeyCode::Char('n')),
+            ("n new", KeyCode::Char('n')),
+            ("Esc cancel", KeyCode::Esc),
+            ("d delete", KeyCode::Char('d')),
+            ("[Yes]", KeyCode::Char('y')),
+        ] {
+            assert_eq!(press(&mut d, label), Some(want), "{label}");
+            let result = d.handle_key(KeyEvent::from(want));
+            if label == "[Yes]" {
+                assert!(matches!(
+                    result,
+                    DialogResult::Submit(ProfilePickerAction::Deleted(name)) if name == "work"
+                ));
+            }
+        }
     }
 }

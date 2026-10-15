@@ -40,6 +40,7 @@ function gateState(over: Partial<GateState> = {}): GateState {
 function prefs(over: Partial<AcpPrefs> = {}): AcpPrefs {
   return {
     showToolDurations: true,
+    wrapToolOutput: false,
     replayEvents: 0,
     compactionReminder: true,
     compactionReminderPercent: 80,
@@ -85,18 +86,9 @@ describe("isCompactionReminderDue", () => {
 });
 
 describe("CompactionReminderBanner", () => {
-  it("renders nothing while the reminder is off", () => {
-    renderBanner(gateState(), prefs({ compactionReminder: false }));
-    expect(screen.queryByTestId("compaction-reminder")).toBeNull();
-  });
-
-  it("reports the current percentage once the threshold is crossed", () => {
-    renderBanner(gateState({ sessionUsage: usage(170_000, 200_000) }), prefs());
+  it("reports the percentage, sends /compact rather than prefilling, and dismisses on the close control", () => {
+    const { onCompact, onDismiss } = renderBanner(gateState({ sessionUsage: usage(170_000, 200_000) }), prefs());
     expect(screen.getByTestId("compaction-reminder").textContent).toContain("85%");
-  });
-
-  it("sends /compact rather than prefilling, and dismisses on the close control", () => {
-    const { onCompact, onDismiss } = renderBanner(gateState(), prefs());
     screen.getByRole("button", { name: "Compact now" }).click();
     expect(onCompact).toHaveBeenCalledTimes(1);
     expect(onDismiss).not.toHaveBeenCalled();

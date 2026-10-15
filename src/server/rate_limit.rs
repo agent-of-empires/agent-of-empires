@@ -1,8 +1,4 @@
 //! IP-based auth failure rate limiting.
-//!
-//! After 5 failed authentication attempts from an IP within 15 minutes,
-//! subsequent requests from that IP are locked out for 15 minutes.
-//! State is in-memory only; restarting the server clears all lockouts.
 
 use std::collections::HashMap;
 use std::net::IpAddr;
@@ -18,16 +14,6 @@ const WINDOW_DURATION: std::time::Duration = std::time::Duration::from_secs(15 *
 const CLEANUP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
 const MAX_TRACKED_IPS: usize = 10_000;
 // Failures within this window of the last recorded failure collapse into one.
-// Prevents a single page load's parallel API calls from burning the whole budget
-// while still blocking serial brute-force attempts.
-//
-// Chosen for 500ms because:
-// - A browser's parallel fetches on mount land within ~10-50ms, so 500ms is
-//   well above the burst window.
-// - A scripted serial attacker still hits lockout in 5 * 500ms = 2.5s, which
-//   is fast enough that brute-force remains impractical.
-// - A human mistyping a passphrase in the login flow waits >500ms between
-//   attempts, so each of their failures counts.
 const COALESCE_WINDOW: std::time::Duration = std::time::Duration::from_millis(500);
 
 struct FailureRecord {
@@ -72,8 +58,14 @@ impl RateLimiter {
     /// Record a failed auth attempt. Returns true if this failure triggered a lockout.
     pub async fn record_failure(&self, ip: IpAddr) -> bool {
         let mut failures = self.failures.write().await;
-        let now = Instant::now();
+        Self::record_failure_at(&mut failures, ip, Instant::now())
+    }
 
+    fn record_failure_at(
+        failures: &mut HashMap<IpAddr, FailureRecord>,
+        ip: IpAddr,
+        now: Instant,
+    ) -> bool {
         if failures.len() >= MAX_TRACKED_IPS && !failures.contains_key(&ip) {
             return false;
         }
@@ -103,11 +95,7 @@ impl RateLimiter {
             record.first_failure = now;
         }
 
-        // Coalesce bursts: failures landing within COALESCE_WINDOW of the last
-        // recorded failure count as the same attempt. A single page load fires
-        // many parallel API calls; without this, one user burns all 5 slots
-        // instantly. Serial brute-force is unaffected (attackers pace slower
-        // than 500ms/attempt would be pointless).
+        // Coalesce bursts.
         if record.count > 0 && now.duration_since(record.last_failure) < COALESCE_WINDOW {
             record.last_failure = now;
             return false;
@@ -183,98 +171,68 @@ impl RateLimiter {
 mod tests {
     use super::*;
 
-    // Record failures with spacing > COALESCE_WINDOW so each counts separately.
-    async fn record_spaced(limiter: &RateLimiter, ip: IpAddr) -> bool {
-        let result = limiter.record_failure(ip).await;
-        tokio::time::sleep(COALESCE_WINDOW + std::time::Duration::from_millis(50)).await;
-        result
+    /// Record the `n`th failure `n` coalesce windows after `base`, so each counts
+    /// separately.
+    async fn record_spaced(limiter: &RateLimiter, ip: IpAddr, base: Instant, n: u32) -> bool {
+        let mut failures = limiter.failures.write().await;
+        RateLimiter::record_failure_at(&mut failures, ip, base + COALESCE_WINDOW * 2 * n)
     }
 
+    /// The lockout arms on the `MAX_FAILURES`'th spaced failure and not before; further
+    /// failures while locked arm nothing new, and another peer is untouched.
     #[tokio::test]
-    async fn allows_under_limit() {
+    async fn lockout_arms_at_the_threshold_and_stays_per_ip() {
         let limiter = RateLimiter::new();
         let ip: IpAddr = "1.2.3.4".parse().unwrap();
+        let other: IpAddr = "5.6.7.8".parse().unwrap();
+        let base = Instant::now();
+        assert!(limiter.check_locked(ip).await.is_none());
 
-        for _ in 0..4 {
-            assert!(!record_spaced(&limiter, ip).await);
+        for n in 0..MAX_FAILURES - 1 {
+            assert!(!record_spaced(&limiter, ip, base, n).await);
         }
         assert!(limiter.check_locked(ip).await.is_none());
-    }
-
-    #[tokio::test]
-    async fn locks_at_threshold() {
-        let limiter = RateLimiter::new();
-        let ip: IpAddr = "1.2.3.4".parse().unwrap();
-
-        for _ in 0..4 {
-            record_spaced(&limiter, ip).await;
-        }
-        // 5th spaced failure triggers lockout
-        assert!(record_spaced(&limiter, ip).await);
+        assert!(
+            record_spaced(&limiter, ip, base, MAX_FAILURES).await,
+            "the threshold arms it"
+        );
         assert!(limiter.check_locked(ip).await.is_some());
+        assert!(!limiter.record_failure(ip).await, "already locked");
+        assert!(limiter.check_locked(other).await.is_none());
     }
 
     #[tokio::test]
     async fn success_clears_failures() {
         let limiter = RateLimiter::new();
         let ip: IpAddr = "1.2.3.4".parse().unwrap();
+        let base = Instant::now();
 
-        for _ in 0..3 {
-            record_spaced(&limiter, ip).await;
+        for n in 0..3 {
+            record_spaced(&limiter, ip, base, n).await;
         }
         limiter.record_success(ip).await;
 
         // After success, should be able to fail again without lockout
-        for _ in 0..4 {
-            assert!(!record_spaced(&limiter, ip).await);
+        for n in 3..7 {
+            assert!(!record_spaced(&limiter, ip, base, n).await);
         }
-    }
-
-    #[tokio::test]
-    async fn independent_ips() {
-        let limiter = RateLimiter::new();
-        let ip_a: IpAddr = "1.2.3.4".parse().unwrap();
-        let ip_b: IpAddr = "5.6.7.8".parse().unwrap();
-
-        // Lock out IP A
-        for _ in 0..5 {
-            record_spaced(&limiter, ip_a).await;
-        }
-        assert!(limiter.check_locked(ip_a).await.is_some());
-        // IP B is unaffected
-        assert!(limiter.check_locked(ip_b).await.is_none());
     }
 
     #[tokio::test]
     async fn burst_failures_coalesce() {
-        // A single page load's parallel API calls (all firing within ~milliseconds)
-        // must not exhaust the failure budget.
         let limiter = RateLimiter::new();
         let ip: IpAddr = "1.2.3.4".parse().unwrap();
-
-        // 20 failures in a tight loop should count as 1
+        let now = Instant::now();
+        let mut failures = limiter.failures.write().await;
         for _ in 0..20 {
-            assert!(!limiter.record_failure(ip).await);
+            assert!(!RateLimiter::record_failure_at(&mut failures, ip, now));
         }
-        assert!(limiter.check_locked(ip).await.is_none());
-    }
-
-    #[tokio::test]
-    async fn unlocked_ip_returns_none() {
-        let limiter = RateLimiter::new();
-        let ip: IpAddr = "10.0.0.1".parse().unwrap();
-        assert!(limiter.check_locked(ip).await.is_none());
-    }
-
-    #[tokio::test]
-    async fn already_locked_failure_is_noop() {
-        let limiter = RateLimiter::new();
-        let ip: IpAddr = "1.2.3.4".parse().unwrap();
-
-        for _ in 0..5 {
-            record_spaced(&limiter, ip).await;
+        for attempt in 1..MAX_FAILURES {
+            assert_eq!(
+                RateLimiter::record_failure_at(&mut failures, ip, now + COALESCE_WINDOW * attempt,),
+                attempt == MAX_FAILURES - 1,
+                "the burst consumes exactly one attempt, not zero or twenty",
+            );
         }
-        // Additional failures while locked return false (no new lockout triggered)
-        assert!(!limiter.record_failure(ip).await);
     }
 }

@@ -1,46 +1,13 @@
-// Per-browser device-binding secret used as the second factor on top of
-// the passphrase login cookie. Generated once on first load via
-// `crypto.getRandomValues`, persisted in localStorage, and presented on
-// every authenticated REST request (via `X-Aoe-Device-Binding`) and
-// every WebSocket upgrade (via the `aoe-device.<secret>` subprotocol).
-//
-// A stolen `aoe_session` cookie alone is therefore not enough to
-// authenticate as the user: the attacker also needs the binding
-// secret. Mobile IP rotation no longer logs the user out because IP
-// is no longer part of the session identity on the server side. See
-// #1131.
-//
-// Generation timing: the secret is created on the FIRST authenticated
-// fetch, not at login. `fetchInterceptor.attachAuthHeader` calls
-// `getOrCreateDeviceBindingSecret()` for every same-origin request,
-// and `loginStatus()` runs before the login page renders. So by the
-// time the user submits the passphrase, the secret already exists in
-// localStorage and the `device_binding_secret` field on the POST body
-// is just re-reading it. Intentional: the binding is per-browser, not
-// per-session, and rotating it with each login would force every PWA
-// tab open on this browser to re-authenticate at the same moment.
-//
-// This module deliberately stays small so that a future hardening
-// pass (WebCrypto non-extractable keys + per-request signatures) can
-// replace the storage and accessor without touching the call sites.
+// Per-browser device-binding secret, the second factor beside the login cookie (`X-Aoe-Device-Binding` header, `aoe-device.<secret>` WS subprotocol). Created on the first authenticated fetch and shared by all tabs.
 
 const STORAGE_KEY = "aoe_device_binding_secret_v1";
 
-/** Bytes of entropy in the secret. Matches the server-side constant in
- *  `src/server/login.rs::BINDING_SECRET_BYTES`. */
+/** Matches `BINDING_SECRET_BYTES` in src/server/login.rs. */
 const BINDING_SECRET_BYTES = 32;
 
 let cached: string | null = null;
 
-/**
- * Return the persisted device-binding secret, generating and storing
- * one on first call. The returned value is the base64url-encoded
- * 32-byte secret ready to ship over the wire.
- *
- * Throws if `crypto.getRandomValues` or `localStorage` is unavailable;
- * the login page surfaces a typed error in that case rather than
- * silently falling back to a guessable identifier.
- */
+/** Throws when crypto or localStorage is unavailable rather than falling back to a guessable id. */
 export function getOrCreateDeviceBindingSecret(): string {
   if (cached !== null) return cached;
   try {
@@ -50,9 +17,7 @@ export function getOrCreateDeviceBindingSecret(): string {
       return existing;
     }
   } catch {
-    // localStorage threw (Safari private mode, sandboxed iframe).
-    // Fall through to generation; the write below will throw again
-    // and the caller will surface the failure to the user.
+    // localStorage threw; the write below will throw too and surface it.
   }
   const bytes = new Uint8Array(BINDING_SECRET_BYTES);
   if (typeof crypto === "undefined" || !crypto.getRandomValues) {
@@ -72,9 +37,7 @@ export function getOrCreateDeviceBindingSecret(): string {
   return secret;
 }
 
-/** Drop the cached secret. Called by the logout flow so a future
- *  login creates a fresh binding (the cookie is invalidated server
- *  side; the secret should rotate with it). */
+/** Called on logout so the next login gets a fresh binding. */
 export function clearDeviceBindingSecret(): void {
   cached = null;
   try {
@@ -84,15 +47,10 @@ export function clearDeviceBindingSecret(): void {
   }
 }
 
-/** Test seam: returns the in-memory cached secret without going
- *  through localStorage. Used by unit tests to assert that the
- *  module memoises after the first call. */
 export function __getCachedDeviceBindingSecretForTests(): string | null {
   return cached;
 }
 
-/** Test seam: reset the memoised secret so each test case starts from
- *  a clean slate. */
 export function __resetDeviceBindingForTests(): void {
   cached = null;
 }
@@ -104,9 +62,7 @@ function base64UrlEncode(bytes: Uint8Array): string {
 }
 
 function isValidEncoded(value: string): boolean {
-  // base64url of 32 bytes (no padding) is 43 chars; padded variants
-  // can be 44 with one `=`. Accept either but reject obvious garbage
-  // before sending it to the server.
+  // base64url of 32 bytes is 43 chars, or 44 padded.
   if (value.length < 43 || value.length > 44) return false;
   return /^[A-Za-z0-9_-]+=?$/.test(value);
 }

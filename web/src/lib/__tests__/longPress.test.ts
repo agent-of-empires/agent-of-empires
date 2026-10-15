@@ -9,7 +9,6 @@ describe("exceedsTouchSlop (#2232)", () => {
   });
 
   it("tolerates normal finger jitter under the slop so the long-press survives", () => {
-    // A real hold wobbles a few px; the old cancel-on-any-move killed the menu.
     expect(exceedsTouchSlop(start, { x: 103, y: 98 })).toBe(false);
     expect(exceedsTouchSlop(start, { x: 95, y: 104 })).toBe(false);
   });

@@ -1,37 +1,75 @@
-/** Write `text` to the clipboard, returning whether it succeeded.
- *
- *  Prefers the async Clipboard API, but that is only defined in secure
- *  contexts (HTTPS or `localhost`). `aoe serve` is frequently reached
- *  over plain HTTP on a LAN or Tailscale IP, where `navigator.clipboard`
- *  is `undefined`, so fall back to a hidden-textarea `execCommand("copy")`
- *  (same approach the mobile terminal toolbar uses for its paste path). */
+const CLIPBOARD_TEXT_TYPES = ["text/plain", "text/uri-list", "text/html"] as const;
+
+// Copy-link UIs often write only text/uri-list.
+function normalizeClipboardData(type: string, raw: string): string {
+  if (type === "text/uri-list") {
+    // CRLF-separated URLs with `#` comment lines.
+    return raw
+      .split(/\r?\n/)
+      .filter((l) => l && !l.startsWith("#"))
+      .join("\n");
+  }
+  if (type === "text/html") return htmlClipboardText(raw);
+  return raw;
+}
+
+const HTML_BLOCKS = "p,div,li,tr,pre,blockquote,h1,h2,h3,h4,h5,h6";
+
+/** The document's text, or the href when the html is a single copied link. */
+function htmlClipboardText(raw: string): string {
+  const body = new DOMParser().parseFromString(raw, "text/html").body;
+  if (!body) return "";
+  const links = body.querySelectorAll("a[href]");
+  const only = links.length === 1 ? links[0]! : null;
+  const href = only?.getAttribute("href");
+  if (only && href && body.textContent?.trim() === only.textContent?.trim()) return href;
+  for (const br of body.querySelectorAll("br")) br.replaceWith("\n");
+  for (const block of body.querySelectorAll(HTML_BLOCKS)) block.append("\n");
+  return (body.textContent ?? "")
+    .replace(/[ \t]+\n/g, "\n")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+}
+
+/** "" when refused or empty; the async Clipboard API needs a secure context. */
+export async function readClipboardText(): Promise<string> {
+  if (!window.isSecureContext) return "";
+  try {
+    if (navigator.clipboard?.read) {
+      for (const item of await navigator.clipboard.read()) {
+        for (const type of CLIPBOARD_TEXT_TYPES) {
+          if (!item.types.includes(type)) continue;
+          const text = normalizeClipboardData(type, await (await item.getType(type)).text());
+          if (text) return text;
+        }
+      }
+      return "";
+    }
+    return (await navigator.clipboard?.readText?.()) ?? "";
+  } catch {
+    return "";
+  }
+}
+
+/** Falls back to `execCommand("copy")` over plain HTTP, where `navigator.clipboard` is undefined. */
 export async function writeClipboard(text: string): Promise<boolean> {
   if (window.isSecureContext && navigator.clipboard?.writeText) {
     try {
       await navigator.clipboard.writeText(text);
       return true;
     } catch {
-      // Permission denied, no document focus, etc. Fall through to the
-      // execCommand path rather than failing outright.
+      // Permission denied or no focus: try execCommand.
     }
   }
   return legacyCopy(text);
 }
 
 export interface ArmedClipboardWrite {
-  /** Resolve the gesture-bound write. Returns false after cancellation or timeout. */
   resolve: (text: string) => boolean;
   cancel: () => void;
 }
 
-/** Arm a clipboard write during a browser user gesture and resolve it later.
- *
- *  OSC 52 reaches the dashboard asynchronously after a mouse release has
- *  crossed the WebSocket and pane. Chromium and Safari preserve the release's
- *  clipboard authorization when `clipboard.write()` receives a
- *  promise-valued ClipboardItem synchronously; the promise is resolved when
- *  the OSC 52 payload arrives. Engines without that path fall back to the
- *  best-effort writer above. */
+/** Arm a write during a user gesture and resolve it when OSC 52 arrives; a promise-valued ClipboardItem keeps the gesture's authorization. */
 export function armClipboardWrite(timeoutMs = 1000): ArmedClipboardWrite {
   let settled = false;
   let timer: ReturnType<typeof setTimeout> | null = null;
@@ -53,8 +91,7 @@ export function armClipboardWrite(timeoutMs = 1000): ArmedClipboardWrite {
         resolveBlob = resolve;
         rejectBlob = reject;
       });
-      // A timed-out selection must not become an unhandled rejection if an
-      // engine drops the ClipboardItem's promise without consuming it.
+      // An unconsumed timed-out promise must not become an unhandled rejection.
       pending.catch(() => {});
       resolveText = (text) => resolveBlob?.(new Blob([text], { type: "text/plain" }));
       timer = setTimeout(() => {
@@ -66,7 +103,7 @@ export function armClipboardWrite(timeoutMs = 1000): ArmedClipboardWrite {
       void navigator.clipboard.write([new ClipboardItem({ "text/plain": pending })]).catch(() => {});
     }
   } catch {
-    // Promise-valued ClipboardItem is not supported. Use the fallback below.
+    // Promise-valued ClipboardItem unsupported.
     if (timer) clearTimeout(timer);
     timer = null;
     resolveText = null;
@@ -99,8 +136,7 @@ export function armClipboardWrite(timeoutMs = 1000): ArmedClipboardWrite {
 function legacyCopy(text: string): boolean {
   const ta = document.createElement("textarea");
   ta.value = text;
-  // Keep it off-screen and non-interactive so selecting it neither scrolls
-  // the page nor steals focus visibly.
+  // Off-screen and read-only so selecting it neither scrolls nor visibly steals focus.
   ta.setAttribute("readonly", "");
   ta.style.position = "fixed";
   ta.style.top = "-9999px";

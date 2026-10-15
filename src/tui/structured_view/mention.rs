@@ -145,145 +145,102 @@ mod tests {
     }
 
     #[test]
-    fn active_mention_basic_token() {
-        // "see @src" with cursor at end (col 8).
-        let l = lines(&["see @src"]);
-        let m = active_mention(&l, (0, 8)).expect("mention");
-        assert_eq!(m.start_col, 4);
-        assert_eq!(m.end_col, 8);
-        assert_eq!(m.query, "src");
+    fn active_mention_cases() {
+        // (lines, cursor, Some((row, start_col, end_col, query)))
+        type Case<'a> = (
+            &'a [&'a str],
+            (usize, usize),
+            Option<(usize, usize, usize, &'a str)>,
+        );
+        let cases: &[Case] = &[
+            (&["see @src"], (0, 8), Some((0, 4, 8, "src"))),
+            (&["@foo"], (0, 4), Some((0, 0, 4, "foo"))),
+            // Cursor mid-token: the range still covers the whole run so the
+            // entire token gets replaced.
+            (&["@foobar"], (0, 4), Some((0, 0, 7, "foobar"))),
+            // Whitespace between `@` and the cursor: no contiguous token.
+            (&["@foo bar"], (0, 8), None),
+            // `user@host` must not trigger: the `@` follows a non-space.
+            (&["user@host"], (0, 9), None),
+            (&["plain text"], (0, 5), None),
+            (&["first", "go @lib/x"], (1, 9), Some((1, 3, 9, "lib/x"))),
+            // CJK chars before the token must not throw off char indexing.
+            (
+                &["日本 @src/main.rs"],
+                (0, 15),
+                Some((0, 3, 15, "src/main.rs")),
+            ),
+        ];
+        for (text, cursor, want) in cases {
+            let got = active_mention(&lines(text), *cursor)
+                .map(|m| (m.row, m.start_col, m.end_col, m.query));
+            let want = want.map(|(r, s, e, q)| (r, s, e, q.to_string()));
+            assert_eq!(got, want, "{text:?} at {cursor:?}");
+        }
     }
 
     #[test]
-    fn active_mention_at_line_start() {
-        let l = lines(&["@foo"]);
-        let m = active_mention(&l, (0, 4)).expect("mention");
-        assert_eq!(m.start_col, 0);
-        assert_eq!(m.query, "foo");
+    fn fuzzy_filter_cases() {
+        let cases: &[(&[&str], &str, usize, &[&str])] = &[
+            // Prefix beats substring.
+            (
+                &["zsrc/lib.rs", "src/main.rs"],
+                "src",
+                30,
+                &["src/main.rs", "zsrc/lib.rs"],
+            ),
+            (
+                &["src/main.rs", "src/lib.rs", "docs/readme.md"],
+                "src/l",
+                30,
+                &["src/lib.rs"],
+            ),
+            // Ties break on the shorter path.
+            (
+                &["aa/longer.rs", "aa.rs"],
+                "aa",
+                30,
+                &["aa.rs", "aa/longer.rs"],
+            ),
+            (&["a", "b", "c"], "", 2, &["a", "b"]),
+            (&["README.md"], "readme", 30, &["README.md"]),
+        ];
+        for (files, query, limit, want) in cases {
+            assert_eq!(
+                fuzzy_filter(&lines(files), query, *limit),
+                *want,
+                "{query:?}"
+            );
+        }
     }
 
     #[test]
-    fn active_mention_cursor_mid_token_covers_full_range() {
-        // "@foobar" with cursor after "foo" (col 4). The token end must
-        // still extend to the end of the run so the whole token gets
-        // replaced, not just the prefix before the cursor.
-        let l = lines(&["@foobar"]);
-        let m = active_mention(&l, (0, 4)).expect("mention");
-        assert_eq!(m.start_col, 0);
-        assert_eq!(m.end_col, 7);
-        assert_eq!(m.query, "foobar");
-    }
-
-    #[test]
-    fn active_mention_aborts_on_whitespace_between_at_and_cursor() {
-        // Cursor after the space: "@foo |" -> no contiguous token.
-        let l = lines(&["@foo bar"]);
-        assert_eq!(active_mention(&l, (0, 8)), None);
-    }
-
-    #[test]
-    fn active_mention_requires_leading_boundary() {
-        // `user@host` must not trigger: the `@` follows a non-space.
-        let l = lines(&["user@host"]);
-        assert_eq!(active_mention(&l, (0, 9)), None);
-    }
-
-    #[test]
-    fn active_mention_none_without_at() {
-        let l = lines(&["plain text"]);
-        assert_eq!(active_mention(&l, (0, 5)), None);
-    }
-
-    #[test]
-    fn active_mention_second_line() {
-        let l = lines(&["first", "go @lib/x"]);
-        let m = active_mention(&l, (1, 9)).expect("mention");
-        assert_eq!(m.row, 1);
-        assert_eq!(m.start_col, 3);
-        assert_eq!(m.query, "lib/x");
-    }
-
-    #[test]
-    fn active_mention_handles_multibyte_prefix() {
-        // CJK chars before the token must not throw off char indexing.
-        let l = lines(&["日本 @src/main.rs"]);
-        let m = active_mention(&l, (0, 15)).expect("mention");
-        assert_eq!(m.start_col, 3);
-        assert_eq!(m.query, "src/main.rs");
-    }
-
-    #[test]
-    fn fuzzy_filter_prefix_beats_substring() {
-        let files = lines(&["zsrc/lib.rs", "src/main.rs"]);
-        let out = fuzzy_filter(&files, "src", 30);
-        assert_eq!(out, vec!["src/main.rs", "zsrc/lib.rs"]);
-    }
-
-    #[test]
-    fn fuzzy_filter_narrows_on_longer_query() {
-        let files = lines(&["src/main.rs", "src/lib.rs", "docs/readme.md"]);
-        let out = fuzzy_filter(&files, "src/l", 30);
-        assert_eq!(out, vec!["src/lib.rs"]);
-    }
-
-    #[test]
-    fn fuzzy_filter_ties_break_on_shorter_path() {
-        let files = lines(&["aa/longer.rs", "aa.rs"]);
-        let out = fuzzy_filter(&files, "aa", 30);
-        assert_eq!(out, vec!["aa.rs", "aa/longer.rs"]);
-    }
-
-    #[test]
-    fn fuzzy_filter_empty_query_returns_head() {
-        let files = lines(&["a", "b", "c"]);
-        let out = fuzzy_filter(&files, "", 2);
-        assert_eq!(out, vec!["a", "b"]);
-    }
-
-    #[test]
-    fn fuzzy_filter_is_case_insensitive() {
-        let files = lines(&["README.md"]);
-        assert_eq!(fuzzy_filter(&files, "readme", 30), vec!["README.md"]);
-    }
-
-    #[test]
-    fn mention_replacement_adds_trailing_space() {
+    fn apply_selection_replaces_the_token_and_spaces_only_at_line_end() {
         assert_eq!(mention_replacement("src/x.rs", None), ":file[src/x.rs] ");
-    }
-
-    #[test]
-    fn mention_replacement_skips_space_before_whitespace() {
         assert_eq!(
             mention_replacement("src/x.rs", Some(' ')),
             ":file[src/x.rs]"
         );
-    }
-
-    #[test]
-    fn apply_selection_replaces_full_token() {
-        let mut ta = TextArea::from(["see @src here"]);
-        // Cursor anywhere; we drive replacement off the Mention range.
-        let m = active_mention(ta.lines(), (0, 8)).expect("mention");
-        apply_selection(&mut ta, &m, "src/main.rs");
-        // The "see " prefix and " here" suffix are untouched; only the
-        // `@src` token becomes the directive. No trailing space is added
-        // because the next char is already whitespace.
-        assert_eq!(ta.lines(), ["see :file[src/main.rs] here"]);
-    }
-
-    #[test]
-    fn apply_selection_at_end_of_line_appends_space() {
-        let mut ta = TextArea::from(["open @ma"]);
-        let m = active_mention(ta.lines(), (0, 8)).expect("mention");
-        apply_selection(&mut ta, &m, "Makefile");
-        assert_eq!(ta.lines(), ["open :file[Makefile] "]);
-    }
-
-    #[test]
-    fn apply_selection_handles_multibyte_path() {
-        let mut ta = TextArea::from(["ref @x"]);
-        let m = active_mention(ta.lines(), (0, 6)).expect("mention");
-        apply_selection(&mut ta, &m, "ドキュメント/a.md");
-        assert_eq!(ta.lines(), ["ref :file[ドキュメント/a.md] "]);
+        for (line, col, pick, want) in [
+            // Prefix and suffix untouched; no extra space before whitespace.
+            (
+                "see @src here",
+                8,
+                "src/main.rs",
+                "see :file[src/main.rs] here",
+            ),
+            ("open @ma", 8, "Makefile", "open :file[Makefile] "),
+            (
+                "ref @x",
+                6,
+                "ドキュメント/a.md",
+                "ref :file[ドキュメント/a.md] ",
+            ),
+        ] {
+            let mut ta = TextArea::from([line]);
+            let m = active_mention(ta.lines(), (0, col)).expect("mention");
+            apply_selection(&mut ta, &m, pick);
+            assert_eq!(ta.lines(), [want]);
+        }
     }
 }

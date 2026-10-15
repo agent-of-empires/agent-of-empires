@@ -26,7 +26,6 @@ function captureDispatch(): () => FocusTerminalDetail[] {
 }
 
 afterEach(() => {
-  // Drain any latch left over so tests stay independent.
   consumePendingTerminalFocus("agent");
   consumePendingTerminalFocus("composer");
   consumePendingTerminalFocus("paired");
@@ -56,7 +55,6 @@ describe("requestSessionInputFocus", () => {
     requestSessionInputFocus({ view: "structured" }, false);
     const events = done();
     expect(events).toEqual([{ target: "composer" }]);
-    // Latch was set for the not-yet-mounted case.
     expect(consumePendingTerminalFocus("composer")).toBe(true);
     expect(consumePendingTerminalFocus("composer")).toBe(false);
   });

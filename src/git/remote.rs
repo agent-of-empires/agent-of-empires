@@ -5,9 +5,8 @@ use std::path::Path;
 use super::error::{GitError, Result};
 use super::open_repo_at;
 
-/// Clone a git repository as a bare repo with worktree setup, following the
-/// workflow-guide structure. Returns the path to the created worktree
-/// (`<destination>/main`). Cleans up `<destination>` on failure.
+/// Clone as a bare repo with the workflow-guide worktree layout, returning
+/// `<destination>/main`. Removes `<destination>` on failure.
 #[tracing::instrument(target = "git.fetch", skip_all, fields(url = %redact_url(url)))]
 pub fn clone_bare_repo(url: &str, destination: &Path) -> Result<String> {
     if destination.exists() {
@@ -29,10 +28,9 @@ pub fn clone_bare_repo(url: &str, destination: &Path) -> Result<String> {
         args = ?["clone", "--bare", &redacted_url, bare_str],
         "spawning git clone --bare"
     );
-    // Stdin is piped to null so SSH passphrase prompts fail immediately;
-    // stdout/stderr draining and the kill-on-deadline are handled by
-    // run_with_timeout, so a grandchild holding the pipe (credential
-    // helper, pager) cannot block past the timeout.
+    // Stdin is null so an SSH passphrase prompt fails instead of hanging.
+    // `run_with_timeout` captures output in regular files, so a grandchild
+    // inheriting the handles cannot block past the deadline.
     let mut cmd = std::process::Command::new("git");
     cmd.args(["clone", "--bare", url, bare_str])
         .stdin(std::process::Stdio::null());
@@ -92,13 +90,10 @@ pub fn clone_bare_repo(url: &str, destination: &Path) -> Result<String> {
 
     run_in_bare(&["fetch", "origin"])?;
 
-    // Detect the default branch. `git clone --bare` points the bare repo's
-    // own HEAD at the remote's default branch, which works on every git
-    // version. `refs/remotes/origin/HEAD` is only populated by `git fetch`
-    // on git >= 2.45 (followRemoteHEAD), so it can't be relied on; try it
-    // and then main/master as fallbacks. These probes must tolerate a
-    // non-zero exit (the ref simply not existing), so they don't go through
-    // `run_in_bare`, which treats failure as fatal and wipes the clone.
+    // The bare repo's own HEAD points at the remote default on every git
+    // version; `refs/remotes/origin/HEAD` only exists from git 2.45, so it and
+    // main/master are fallbacks. These probes tolerate a missing ref, so they
+    // bypass `run_in_bare`, which treats failure as fatal and wipes the clone.
     let probe = |args: &[&str]| -> Option<String> {
         let output = std::process::Command::new("git")
             .args(args)
@@ -162,12 +157,9 @@ pub fn clone_bare_repo(url: &str, destination: &Path) -> Result<String> {
         )));
     }
 
-    // Lock the `main` worktree for the same cross-boundary prune protection
-    // `GitWorktree::create_worktree` applies to every session worktree (#2414):
-    // this is the one aoe-created worktree that does not go through
-    // `create_worktree`, so without this a prune from a context that cannot see
-    // `<destination>/main` would reap its admin entry. Best-effort: a lock
-    // failure only forfeits that protection, so warn and keep the clone.
+    // `main` is the one aoe-created worktree that does not go through
+    // `create_worktree`, so lock it here for the same cross-boundary prune
+    // protection (#2414). Best-effort: a failure only forfeits that.
     match super::GitWorktree::new(destination.to_path_buf()) {
         Ok(git_wt) => {
             if let Err(e) = git_wt.lock_worktree(&worktree_path) {
@@ -199,11 +191,9 @@ pub fn clone_bare_repo(url: &str, destination: &Path) -> Result<String> {
     Ok(worktree_path.display().to_string())
 }
 
-/// Clone a git repository from a URL into the given destination directory.
-///
-/// The destination must not already exist. If `shallow` is true, only the
-/// latest commit is fetched (`--depth 1`). The clone is killed after 5
-/// minutes to prevent indefinite hangs (unresponsive remotes, SSH prompts).
+/// Clone into `destination`, which must not exist. `shallow` fetches only the
+/// latest commit. Killed after 5 minutes, so an unresponsive remote or an SSH
+/// prompt cannot hang forever.
 #[tracing::instrument(target = "git.fetch", skip_all, fields(url = %redact_url(url), shallow))]
 pub fn clone_repo(url: &str, destination: &Path, shallow: bool) -> Result<()> {
     if destination.exists() {
@@ -223,8 +213,7 @@ pub fn clone_repo(url: &str, destination: &Path, shallow: bool) -> Result<()> {
     }
     args.extend([url, dest_str]);
 
-    // Pipe stdin to /dev/null so SSH passphrase prompts fail immediately
-    // instead of hanging the blocking thread.
+    // Null stdin so an SSH passphrase prompt fails instead of hanging.
     let redacted_url = redact_url(url);
     let redacted_args: Vec<&str> = args
         .iter()
@@ -238,9 +227,8 @@ pub fn clone_repo(url: &str, destination: &Path, shallow: bool) -> Result<()> {
     let mut cmd = std::process::Command::new("git");
     cmd.args(&args).stdin(std::process::Stdio::null());
 
-    // 5-minute timeout to avoid blocking the thread pool forever; output
-    // draining is deadline-bounded too, so a grandchild holding the pipe
-    // cannot hang the wait.
+    // Output goes to regular files, so a grandchild inheriting the handles
+    // cannot hang the wait past the timeout.
     let timeout = std::time::Duration::from_secs(300);
 
     match crate::process::run_with_timeout(&mut cmd, timeout) {
@@ -276,35 +264,55 @@ fn redact_url(url: &str) -> String {
     url.to_string()
 }
 
-/// Extract the owner (first path segment) from a git remote URL.
-///
-/// Handles common formats:
-/// - SSH shorthand: `git@github.com:owner/repo.git`
-/// - HTTPS: `https://github.com/owner/repo.git`
-/// - SSH URL: `ssh://git@github.com/owner/repo.git`
-pub(crate) fn parse_owner_from_remote_url(url: &str) -> Option<String> {
-    // SSH shorthand: git@host:owner/repo.git
-    // Detect by presence of '@' before ':' and no "://" scheme prefix.
+/// Split a git remote URL into its host and the path segment after it,
+/// rejecting any URL that is not a canonical hosted remote: a known scheme
+/// (`http`/`https`/`ssh`) or SSH shorthand (`user@host:path`). Local schemes
+/// (`file://`), bare/absolute filesystem paths, and relative paths all
+/// return `None` so they can never be mistaken for a hosted `owner/repo`.
+fn split_host_and_path(url: &str) -> Option<(&str, &str)> {
     if !url.contains("://") {
-        if let Some(colon_pos) = url.find(':') {
-            if url[..colon_pos].contains('@') {
-                let after = &url[colon_pos + 1..];
-                let owner = after.split('/').next()?;
-                return (!owner.is_empty()).then(|| owner.to_string());
-            }
+        // SSH shorthand: git@host:owner/repo.git
+        let colon_pos = url.find(':')?;
+        let userinfo = &url[..colon_pos];
+        if !userinfo.contains('@') {
+            return None;
         }
+        let path = &url[colon_pos + 1..];
+        // An absolute path (`git@host:/foo/bar.git`) is a filesystem path,
+        // not a hosted owner/repo slug; reject it.
+        if path.starts_with('/') {
+            return None;
+        }
+        let host = userinfo.rsplit_once('@').map_or(userinfo, |(_, h)| h);
+        if host.is_empty() {
+            return None;
+        }
+        return Some((host, path));
     }
 
-    // URL format: scheme://[user@]host/owner/repo.git
-    let without_scheme = url.split("://").nth(1).unwrap_or(url);
-    let after_host = &without_scheme[without_scheme.find('/')? + 1..];
-    let owner = after_host.split('/').next()?;
-    (!owner.is_empty()).then(|| owner.to_string())
+    let (scheme, without_scheme) = url.split_once("://")?;
+    if !matches!(scheme, "http" | "https" | "ssh") {
+        return None;
+    }
+    let slash_pos = without_scheme.find('/')?;
+    let host_part = &without_scheme[..slash_pos];
+    let host = host_part.rsplit_once('@').map_or(host_part, |(_, h)| h);
+    if host.is_empty() {
+        return None;
+    }
+    Some((host, &without_scheme[slash_pos + 1..]))
 }
 
-/// Look up the owner of a git repository by reading the `origin` remote URL.
-/// Returns `None` if the path is not a git repo, has no origin remote, or the
-/// URL cannot be parsed.
+/// The owner segment of a hosted remote URL, via
+/// [`parse_slug_from_remote_url`] so a local path's first component can never
+/// pass as one.
+pub(crate) fn parse_owner_from_remote_url(url: &str) -> Option<String> {
+    parse_slug_from_remote_url(url)
+        .and_then(|s| s.split_once('/').map(|(owner, _)| owner.to_string()))
+}
+
+/// The owner from a repo's `origin` remote, or `None` when there is no repo,
+/// no origin, or no parse.
 pub fn get_remote_owner(path: &Path) -> Option<String> {
     let repo = open_repo_at(path).ok()?;
     let remote = repo.find_remote("origin").ok()?;
@@ -312,61 +320,54 @@ pub fn get_remote_owner(path: &Path) -> Option<String> {
     parse_owner_from_remote_url(url)
 }
 
-/// Extract the `owner/repo` slug from a git remote URL, stripping any `.git`
-/// suffix and trailing slash. Handles the same formats as
-/// [`parse_owner_from_remote_url`]. Returns `None` unless the URL is a canonical
-/// hosted repo: a known remote scheme (`http`/`https`/`ssh`) or SSH shorthand,
-/// with exactly an `owner/repo` path. Local schemes like `file://` are rejected
-/// so they never produce a bogus slug.
+/// The bare owner for display plus an `owner@host` key for grouping, from one
+/// parse, so two same-named owners on different hosts never share a bucket.
+/// `None` under the same conditions as [`parse_owner_from_remote_url`].
+pub(crate) fn parse_owner_with_key_from_remote_url(url: &str) -> Option<(String, String)> {
+    let owner = parse_owner_from_remote_url(url)?;
+    let (host, _) = split_host_and_path(url)?;
+    // Hostnames are case-insensitive, so two spellings of one host must not
+    // produce two buckets.
+    let key = format!("{owner}@{}", host.to_ascii_lowercase());
+    Some((owner, key))
+}
+
+/// `parse_owner_with_key_from_remote_url` against a repo's `origin`, in one
+/// lookup. `None` under the same conditions as [`get_remote_owner`].
+pub fn get_remote_owner_with_key(path: &Path) -> Option<(String, String)> {
+    let repo = open_repo_at(path).ok()?;
+    let remote = repo.find_remote("origin").ok()?;
+    let url = remote.url().ok()?;
+    parse_owner_with_key_from_remote_url(url)
+}
+
+/// The `owner/repo` slug of a remote URL, without any `.git` suffix or
+/// trailing slash. `None` unless the URL is a canonical hosted repo: an
+/// `http`, `https` or `ssh` scheme, or SSH shorthand, with exactly an
+/// `owner/repo` path.
 pub(crate) fn parse_slug_from_remote_url(url: &str) -> Option<String> {
-    // Reduce to the path after the host: `owner/repo(.git)`.
-    let path = if !url.contains("://") {
-        // SSH shorthand: git@host:owner/repo.git
-        let colon_pos = url.find(':')?;
-        if !url[..colon_pos].contains('@') {
-            return None;
-        }
-        let scp_path = &url[colon_pos + 1..];
-        // An absolute path (`git@host:/foo/bar.git`) is a filesystem path, not a
-        // hosted owner/repo slug; reject it.
-        if scp_path.starts_with('/') {
-            return None;
-        }
-        scp_path
-    } else {
-        let (scheme, without_scheme) = url.split_once("://")?;
-        if !matches!(scheme, "http" | "https" | "ssh") {
-            return None;
-        }
-        &without_scheme[without_scheme.find('/')? + 1..]
-    };
+    let (_, path) = split_host_and_path(url)?;
     let path = path.trim_end_matches('/');
     let path = path.strip_suffix(".git").unwrap_or(path);
     let mut segments = path.split('/').filter(|s| !s.is_empty());
     let owner = segments.next()?;
     let repo = segments.next()?;
-    // Reject deeper paths (e.g. `file://`-style or nested paths): a hosted repo
-    // is exactly `owner/repo`.
+    // A hosted repo is exactly `owner/repo`; anything deeper is not one.
     if segments.next().is_some() {
         return None;
     }
     Some(format!("{}/{}", owner, repo))
 }
 
-/// Read a git repository's `origin` remote URL verbatim. Returns `None` if the
-/// path is not a git repo or has no origin remote.
-///
-/// Unlike [`get_remote_owner`] / [`get_remote_slug`] this does no parsing: the
-/// CityHall bundle needs the URL itself, so a workspace can clone it.
+/// A repo's `origin` URL verbatim, unparsed, for the CityHall bundle.
 pub fn get_remote_url(path: &Path) -> Option<String> {
     let repo = open_repo_at(path).ok()?;
     let remote = repo.find_remote("origin").ok()?;
     remote.url().ok().map(str::to_string)
 }
 
-/// Look up the `owner/repo` slug of a git repository by reading the `origin`
-/// remote URL. Returns `None` if the path is not a git repo, has no origin
-/// remote, or the URL cannot be parsed into an owner/repo pair.
+/// The slug from a repo's `origin` remote, or `None` when there is no repo,
+/// no origin, or no parse.
 pub fn get_remote_slug(path: &Path) -> Option<String> {
     let repo = open_repo_at(path).ok()?;
     let remote = repo.find_remote("origin").ok()?;
@@ -379,92 +380,93 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_parse_owner_ssh_shorthand() {
-        assert_eq!(
-            parse_owner_from_remote_url("git@github.com:agent-of-empires/agent-of-empires.git"),
-            Some("agent-of-empires".to_string()),
-        );
-    }
-
-    #[test]
-    fn test_parse_slug_formats() {
-        for url in [
-            "git@github.com:mozilla-ai/any-llm.git",
-            "https://github.com/mozilla-ai/any-llm.git",
-            "ssh://git@github.com/mozilla-ai/any-llm.git",
-            "https://github.com/mozilla-ai/any-llm", // no .git suffix
-            "git@github.com:mozilla-ai/any-llm",
+    fn parse_slug_reads_only_owner_repo_remotes() {
+        let slug = Some("mozilla-ai/any-llm");
+        for (url, expected) in [
+            ("git@github.com:mozilla-ai/any-llm.git", slug),
+            ("https://github.com/mozilla-ai/any-llm.git", slug),
+            ("ssh://git@github.com/mozilla-ai/any-llm.git", slug),
+            ("https://github.com/mozilla-ai/any-llm", slug),
+            ("git@github.com:mozilla-ai/any-llm", slug),
+            ("", None),
+            ("git@github.com:owner", None),
+            ("https://github.com/owner", None),
+            ("file:///tmp/repo.git", None),
+            ("file://host/owner/repo.git", None),
+            ("https://example.com/group/sub/repo.git", None),
+            ("git@host:/foo/bar.git", None),
         ] {
             assert_eq!(
-                parse_slug_from_remote_url(url),
-                Some("mozilla-ai/any-llm".to_string()),
-                "failed for {url}"
+                parse_slug_from_remote_url(url).as_deref(),
+                expected,
+                "{url}"
             );
         }
     }
 
+    /// The owner is the first path segment of a canonical hosted remote, in
+    /// every spelling git accepts. A local scheme, an absolute SSH path, or a
+    /// URL with no real host has no owner at all: taking the first segment
+    /// unconditionally gave those a bogus org header.
     #[test]
-    fn test_parse_slug_rejects_incomplete() {
-        assert_eq!(parse_slug_from_remote_url(""), None);
-        // Owner but no repo segment.
-        assert_eq!(parse_slug_from_remote_url("git@github.com:owner"), None);
-        assert_eq!(parse_slug_from_remote_url("https://github.com/owner"), None);
-    }
-
-    #[test]
-    fn test_parse_slug_rejects_non_remote_schemes_and_deep_paths() {
-        // file:// and other local schemes must not yield a slug.
-        assert_eq!(parse_slug_from_remote_url("file:///tmp/repo.git"), None);
-        assert_eq!(
-            parse_slug_from_remote_url("file://host/owner/repo.git"),
-            None
-        );
-        // Deeper paths are not a canonical hosted owner/repo.
-        assert_eq!(
-            parse_slug_from_remote_url("https://example.com/group/sub/repo.git"),
-            None
-        );
-        // Absolute-path SSH shorthand is a filesystem path, not owner/repo.
-        assert_eq!(parse_slug_from_remote_url("git@host:/foo/bar.git"), None);
-    }
-
-    #[test]
-    fn test_parse_owner_https() {
-        assert_eq!(
-            parse_owner_from_remote_url("https://github.com/agent-of-empires/agent-of-empires.git"),
-            Some("agent-of-empires".to_string()),
-        );
-    }
-
-    #[test]
-    fn test_parse_owner_ssh_url() {
-        assert_eq!(
-            parse_owner_from_remote_url(
-                "ssh://git@github.com/agent-of-empires/agent-of-empires.git"
+    fn parse_owner_accepts_only_hosted_remotes() {
+        let cases = [
+            (
+                "git@github.com:agent-of-empires/agent-of-empires.git",
+                Some("agent-of-empires"),
             ),
-            Some("agent-of-empires".to_string()),
-        );
+            (
+                "https://github.com/agent-of-empires/agent-of-empires.git",
+                Some("agent-of-empires"),
+            ),
+            (
+                "ssh://git@github.com/agent-of-empires/agent-of-empires.git",
+                Some("agent-of-empires"),
+            ),
+            (
+                "http://github.com/mozilla-ai/lumigator.git",
+                Some("mozilla-ai"),
+            ),
+            (
+                "https://github.com/agent-of-empires/agent-of-empires",
+                Some("agent-of-empires"),
+            ),
+            ("", None),
+            ("file:///srv/git/foo.git", None),
+            ("file://host/myorg/repo.git", None),
+            ("git@host:/foo/bar.git", None),
+            ("user@:owner/repo.git", None),
+            ("https:///owner/repo.git", None),
+            ("ssh://@/owner/repo.git", None),
+        ];
+        for (url, expected) in cases {
+            assert_eq!(
+                parse_owner_from_remote_url(url),
+                expected.map(str::to_string),
+                "{url}"
+            );
+        }
     }
 
+    /// The key scopes the owner by host, lowercased, so one login on two
+    /// hosts never shares a bucket and two spellings of one host always do.
+    /// A non-hosted remote resolves to no identity at all.
     #[test]
-    fn test_parse_owner_http() {
-        assert_eq!(
-            parse_owner_from_remote_url("http://github.com/mozilla-ai/lumigator.git"),
-            Some("mozilla-ai".to_string()),
-        );
-    }
-
-    #[test]
-    fn test_parse_owner_no_dotgit_suffix() {
-        assert_eq!(
-            parse_owner_from_remote_url("https://github.com/agent-of-empires/agent-of-empires"),
-            Some("agent-of-empires".to_string()),
-        );
-    }
-
-    #[test]
-    fn test_parse_owner_empty_url() {
-        assert_eq!(parse_owner_from_remote_url(""), None);
+    fn parse_owner_with_key_scopes_identity_by_lowercased_host() {
+        let cases = [
+            ("git@github.com:acme/x.git", Some("acme@github.com")),
+            ("https://gitlab.com/acme/y.git", Some("acme@gitlab.com")),
+            ("git@GitHub.COM:acme/x.git", Some("acme@github.com")),
+            ("https://GitHub.com/acme/x.git", Some("acme@github.com")),
+            ("file:///srv/git/foo.git", None),
+        ];
+        for (url, key) in cases {
+            assert_eq!(
+                parse_owner_with_key_from_remote_url(url),
+                key.map(|key| ("acme".to_string(), key.to_string())),
+                "{url}"
+            );
+        }
     }
 
     #[test]

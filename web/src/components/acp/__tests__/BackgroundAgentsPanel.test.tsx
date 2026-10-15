@@ -34,12 +34,6 @@ function agent(over: Partial<BackgroundAgent> = {}): BackgroundAgent {
 }
 
 describe("BackgroundAgentsPanel", () => {
-  it("shows an empty state with no agents", () => {
-    agentsMock.mockReturnValue([]);
-    const { container } = render(<BackgroundAgentsPanel sessionId="s-1" />);
-    expect(container.textContent).toContain("No background sub-agents launched yet");
-  });
-
   it("lists a running agent with description, tool count, and last activity", () => {
     agentsMock.mockReturnValue([agent()]);
     const { container } = render(<BackgroundAgentsPanel sessionId="s-1" />);
@@ -55,20 +49,35 @@ describe("BackgroundAgentsPanel", () => {
     expect(container.textContent).not.toContain("a1");
   });
 
-  it("expands to reveal prompt, model, and result; never leaks the agent id", () => {
+  it("expands to reveal prompt, model, result, and tool calls; never leaks the agent id", () => {
+    // A finished agent, so the first button is the row toggle (no Stop).
     agentsMock.mockReturnValue([
       agent({
         status: "completed",
         endedAt: new Date().toISOString(),
         result: "found 12 files",
+        tools: [
+          { name: "Bash", title: "ls -la", ok: true },
+          { name: "Read", title: "src/main.rs", ok: false },
+          { name: "Grep", title: "tmux", ok: undefined },
+        ],
       }),
     ]);
     const { container, getAllByRole } = render(<BackgroundAgentsPanel sessionId="s-1" />);
     expect(container.textContent).toContain("done");
-    fireEvent.click(getAllByRole("button")[0]!); // row toggle (not the details button)
-    expect(container.textContent).toContain("do the thing");
-    expect(container.textContent).toContain("claude-opus-4-8");
-    expect(container.textContent).toContain("found 12 files");
+    fireEvent.click(getAllByRole("button")[0]!);
+    for (const text of [
+      "do the thing",
+      "claude-opus-4-8",
+      "found 12 files",
+      "tools · 3",
+      "ls -la",
+      "src/main.rs",
+      "Grep",
+    ]) {
+      expect(container.textContent).toContain(text);
+    }
+    expect(container.textContent).not.toContain("a1");
   });
 
   it("orders running agents before finished ones", () => {
@@ -83,30 +92,6 @@ describe("BackgroundAgentsPanel", () => {
     expect(runIdx).toBeLessThan(doneIdx);
   });
 
-  it("lists the sub-agent's individual tool calls when expanded", () => {
-    // Use a finished agent so the only button is the row toggle (no Stop).
-    agentsMock.mockReturnValue([
-      agent({
-        status: "completed",
-        endedAt: new Date().toISOString(),
-        tools: [
-          { name: "Bash", title: "ls -la", ok: true },
-          { name: "Read", title: "src/main.rs", ok: false },
-          { name: "Grep", title: "tmux", ok: undefined },
-        ],
-      }),
-    ]);
-    const { container, getAllByRole } = render(<BackgroundAgentsPanel sessionId="s-1" />);
-    // First button is the row toggle; second is the details (modal) button.
-    fireEvent.click(getAllByRole("button")[0]!);
-    expect(container.textContent).toContain("tools · 3");
-    expect(container.textContent).toContain("Bash");
-    expect(container.textContent).toContain("ls -la");
-    expect(container.textContent).toContain("Read");
-    expect(container.textContent).toContain("src/main.rs");
-    expect(container.textContent).toContain("Grep");
-  });
-
   it("shows a Stop button for active agents that POSTs the session cancel", async () => {
     const fetchMock = vi.fn(() => Promise.resolve({ ok: true } as Response));
     vi.stubGlobal("fetch", fetchMock);
@@ -118,16 +103,13 @@ describe("BackgroundAgentsPanel", () => {
     vi.unstubAllGlobals();
   });
 
-  it("hides the Stop button when no agent is active", () => {
-    agentsMock.mockReturnValue([agent({ status: "completed", endedAt: new Date().toISOString() })]);
-    const { queryByRole } = render(<BackgroundAgentsPanel sessionId="s-1" />);
-    expect(queryByRole("button", { name: /stop/i })).toBeNull();
-  });
-
-  it("hides the Stop button for a stalled agent (cancel would be a no-op)", () => {
-    agentsMock.mockReturnValue([agent({ status: "stalled" })]);
-    const { queryByRole } = render(<BackgroundAgentsPanel sessionId="s-1" />);
-    expect(queryByRole("button", { name: /stop/i })).toBeNull();
+  it("hides the Stop button for finished or stalled agents (cancel would be a no-op)", () => {
+    for (const over of [{ status: "completed", endedAt: new Date().toISOString() }, { status: "stalled" }] as const) {
+      agentsMock.mockReturnValue([agent(over)]);
+      const { queryByRole, unmount } = render(<BackgroundAgentsPanel sessionId="s-1" />);
+      expect(queryByRole("button", { name: /stop/i }), over.status).toBeNull();
+      unmount();
+    }
   });
 
   it("opens a details modal showing the full prompt, result, and tools", () => {

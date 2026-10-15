@@ -1,0 +1,597 @@
+//! Spawning the detached runner process and waiting for its control socket.
+
+use tracing::{info, warn};
+
+use super::errors::AcpError;
+use super::resolve_command::resolve_agent_command;
+use super::session_sandbox::{build_sandbox_docker_argv, SessionSandbox};
+use super::spawn::{
+    apply_claude_store_route, apply_env_filter, host_environment_denyreason, prepend_path_dirs,
+    SpawnConfig,
+};
+
+/// Deadline for the runner socket to appear. 10s suffices in production, but
+/// a debug-build cold start under CI load blows past it deterministically, so
+/// debug builds honor `AOE_ACP_RUNNER_SOCKET_TIMEOUT_MS`.
+pub(super) fn runner_socket_deadline() -> std::time::Duration {
+    #[cfg(debug_assertions)]
+    if let Ok(raw) = std::env::var("AOE_ACP_RUNNER_SOCKET_TIMEOUT_MS") {
+        if let Ok(ms) = raw.parse::<u64>() {
+            // Floor so a `...=0` typo cannot fail the dial before its first
+            // retry, which surfaces as "does not speak control protocol".
+            return std::time::Duration::from_millis(ms.max(100));
+        }
+    }
+    std::time::Duration::from_secs(10)
+}
+
+/// Fault injection for the #1890 e2e: the first N fresh-spawn handshakes fail
+/// after the runner is up but before the daemon records a worker, leaving a
+/// live registered runner the daemon never adopted. Each call consumes one
+/// budgeted failure; debug builds only.
+#[cfg(debug_assertions)]
+pub(super) fn take_injected_fresh_handshake_failure() -> bool {
+    use std::sync::atomic::{AtomicI64, Ordering};
+    use std::sync::OnceLock;
+    static REMAINING: OnceLock<AtomicI64> = OnceLock::new();
+    let remaining = REMAINING.get_or_init(|| {
+        let n = std::env::var("AOE_ACP_TEST_FAIL_FIRST_HANDSHAKES")
+            .ok()
+            .and_then(|v| v.trim().parse::<i64>().ok())
+            .unwrap_or(0);
+        AtomicI64::new(n)
+    });
+    // `try_update` needs Rust 1.99, newer than the MSRV and the Nix toolchain.
+    #[allow(deprecated)]
+    let claimed = remaining.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
+        (n > 0).then_some(n - 1)
+    });
+    claimed.is_ok()
+}
+
+/// Prepends the scope `prefix` to `cmd`. The runner env is cleared, so the
+/// user-manager variables `systemd-run` needs are added for it and unset again
+/// with `env -u` in front of the runner, next to the restore of the variable
+/// `systemd-run` injects. Stdio and `pre_exec` are not carried over: set them
+/// on the result. A program containing `=` stays unscoped, since `env` would
+/// read it as an assignment.
+pub(super) fn wrap_in_scope(
+    cmd: tokio::process::Command,
+    prefix: &crate::process::systemd::ScopePrefix,
+) -> tokio::process::Command {
+    const BUS_VARS: [&str; 2] = ["XDG_RUNTIME_DIR", "DBUS_SESSION_BUS_ADDRESS"];
+    let original = cmd.as_std();
+    if original.get_program().to_string_lossy().contains('=') {
+        tracing::debug!(target: "process.systemd", "runner path contains '='; starts unscoped");
+        return cmd;
+    }
+    let restore = prefix.with_env_restore();
+    let Some((program, prefix_args)) = restore.split_first() else {
+        return cmd;
+    };
+    let added: Vec<(&str, std::ffi::OsString)> = BUS_VARS
+        .iter()
+        .filter(|var| !original.get_envs().any(|(k, _)| k == **var))
+        .filter_map(|var| std::env::var_os(var).map(|v| (*var, v)))
+        .collect();
+    let injected = crate::process::systemd::INJECTED_VAR;
+    let own_injected = original
+        .get_envs()
+        .find_map(|(k, v)| (k == injected).then_some(v).flatten());
+
+    let mut wrapped = tokio::process::Command::new(program);
+    wrapped.args(prefix_args);
+    for (var, _) in &added {
+        wrapped.arg("-u").arg(var);
+    }
+    if let Some(value) = own_injected {
+        let mut assignment = std::ffi::OsString::from(format!("{injected}="));
+        assignment.push(value);
+        wrapped.arg(assignment);
+    }
+    wrapped
+        .arg(original.get_program())
+        .args(original.get_args());
+    wrapped.env_clear();
+    for (key, value) in original.get_envs() {
+        if let Some(value) = value {
+            wrapped.env(key, value);
+        }
+    }
+    wrapped.envs(added);
+    if let Some(dir) = original.get_current_dir() {
+        wrapped.current_dir(dir);
+    }
+    wrapped
+}
+
+/// The runner log opened for appending, with the runner's own 0600 mode, or
+/// null when it cannot be opened.
+fn append_to_log(path: &std::path::Path) -> std::process::Stdio {
+    let mut options = std::fs::OpenOptions::new();
+    options.create(true).append(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+    match options.open(path) {
+        Ok(file) => file.into(),
+        Err(e) => {
+            tracing::debug!(target: "process.systemd", "runner log {}: {e}", path.display());
+            std::process::Stdio::null()
+        }
+    }
+}
+
+/// The runner owns the agent subprocess and outlives the daemon, so no `Child`
+/// handle is kept: the daemon reaches it over the unix socket, and the OS keeps
+/// it alive across `aoe serve` restarts.
+pub(super) async fn spawn_runner_detached(
+    config: &SpawnConfig,
+    socket_path: &std::path::Path,
+    session_id: String,
+    session_sandbox: Option<&SessionSandbox>,
+) -> Result<(u32, Option<crate::session::ExecutionBinding>), AcpError> {
+    let current_exe =
+        std::env::current_exe().map_err(|e| AcpError::Spawn(format!("current_exe: {e}")))?;
+    let log_path = crate::process::worker_registry::log_path_for(&session_id)
+        .map_err(|e| AcpError::Spawn(format!("log path: {e}")))?;
+    if let Some(parent) = log_path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+
+    // A sandboxed session wraps the agent in `docker exec`, so host PATH
+    // resolution is skipped: the container's own PATH resolves the binary.
+    let sandbox_argv = match (&config.sandbox_info, session_sandbox) {
+        (Some(sandbox), Some(handle)) => {
+            let argv = build_sandbox_docker_argv(
+                config,
+                sandbox,
+                handle.container_workdir.to_string_lossy().as_ref(),
+            )?;
+            info!(
+                target: "acp.protocol.spawn",
+                session = %session_id,
+                container = %sandbox.container_name,
+                container_id = sandbox.container_id.as_deref().unwrap_or("?"),
+                image = %sandbox.image,
+                workdir = %handle.container_workdir.display(),
+                docker = %argv.docker_binary,
+                "docker wrap applied"
+            );
+            Some(argv)
+        }
+        (Some(_), None) => {
+            return Err(AcpError::Spawn(
+                "sandbox_info set but SessionSandbox handle missing; \
+                 SessionSandbox::from_info must run before spawn_runner_detached"
+                    .into(),
+            ));
+        }
+        (None, _) => {
+            info!(
+                target: "acp.protocol.spawn",
+                session = %session_id,
+                "docker wrap skipped (no sandbox_info)"
+            );
+            None
+        }
+    };
+
+    // Resolve against PATH plus the node-manager dirs so the runner finds the
+    // binary even when the daemon's frozen PATH does not carry it (#1048).
+    let resolved = if sandbox_argv.is_some() {
+        None
+    } else {
+        // A get_app_dir failure only costs the bundled-adapter lookup; PATH
+        // and the node-manager scan still run.
+        let app_dir = crate::session::get_app_dir().ok();
+        resolve_agent_command(&config.spec.command, app_dir.as_deref())
+    };
+    let (spawn_command, extra_path_dirs): (String, Vec<std::path::PathBuf>) =
+        match (&sandbox_argv, &resolved) {
+            (Some(s), _) => (s.docker_binary.clone(), Vec::new()),
+            (None, Some(r)) => (
+                r.path.to_string_lossy().into_owned(),
+                r.prepend_paths.clone(),
+            ),
+            (None, None) => (config.spec.command.clone(), Vec::new()),
+        };
+
+    let mut cmd = tokio::process::Command::new(&current_exe);
+    cmd.arg("__acp-runner")
+        .arg("--socket")
+        .arg(socket_path)
+        .arg("--session-id")
+        .arg(&session_id)
+        .arg("--agent-name")
+        .arg(&config.spec.command)
+        .arg("--agent-key")
+        .arg(&config.agent_key)
+        .arg("--cwd")
+        .arg(&config.cwd);
+    if !config.additional_dirs.is_empty() {
+        cmd.arg("--additional-dirs").arg(
+            config
+                .additional_dirs
+                .iter()
+                .map(|p| p.to_string_lossy().into_owned())
+                .collect::<Vec<_>>()
+                .join(","),
+        );
+    }
+    let provider_keys: Vec<&str> = config
+        .provider_env
+        .iter()
+        .map(|(k, _)| k.as_str())
+        .collect();
+    if !provider_keys.is_empty() {
+        cmd.arg("--provider-env-keys").arg(provider_keys.join(","));
+    }
+    if let Some(profile) = config.source_profile.as_deref().filter(|s| !s.is_empty()) {
+        cmd.arg("--source-profile").arg(profile);
+    }
+    if let Some(stored) = &config.stored_acp_session_id {
+        cmd.arg("--stored-acp-session-id").arg(stored);
+    }
+    cmd.arg("--generation").arg(config.generation.to_string());
+    cmd.arg("--");
+    if let Some(s) = &sandbox_argv {
+        cmd.arg(&s.docker_binary);
+        for a in &s.docker_args {
+            cmd.arg(a);
+        }
+    } else {
+        // Pass the resolved absolute path (or fall back to the bare command).
+        // The runner spawns whatever it receives, so an absolute path bypasses
+        // any PATH lookup inside the runner.
+        cmd.arg(&spawn_command);
+        for a in &config.spec.args {
+            cmd.arg(a);
+        }
+    }
+
+    // The runner inherits this env when it spawns the agent, so one filter
+    // pass covers both. AOE_TOKEN is stripped here and reaches neither.
+    cmd.env_clear();
+    apply_env_filter(cmd.as_std_mut(), config, &[]);
+    apply_claude_store_route(cmd.as_std_mut(), config);
+    #[cfg(debug_assertions)]
+    if let Ok(interval) = std::env::var("AOE_ACP_WATCHDOG_POLL_MS") {
+        cmd.env("AOE_ACP_WATCHDOG_POLL_MS", interval);
+    }
+    // Trusted `Config.environment`, then the provider pick that outranks it,
+    // for the adapter only, riding one reserved
+    // carrier key (JSON `[[key, value], ...]`) that the runner strips and
+    // applies to its child. HOME / PATH / XDG_CONFIG_HOME are legal entries
+    // here, and setting those on the runner itself would move the
+    // worker-registry path it writes (#1383) or change which binary it loads.
+    let host_environment: Vec<(String, String)> = config
+        .host_environment
+        .iter()
+        .chain(&config.provider_routing)
+        .filter(|(key, _)| match host_environment_denyreason(key) {
+            Some(reason) => {
+                warn!(
+                    target: "acp",
+                    key = %key,
+                    reason,
+                    "rejecting configured host environment key",
+                );
+                false
+            }
+            None => true,
+        })
+        .cloned()
+        .collect();
+    if !host_environment.is_empty() {
+        let encoded = serde_json::to_string(&host_environment)
+            .map_err(|e| AcpError::Spawn(format!("encode host environment: {e}")))?;
+        cmd.env(crate::process::runner::ACP_AGENT_ENV, encoded);
+    }
+    if let Some(s) = &sandbox_argv {
+        // docker reads each `-e KEY` value from its own process env, so set
+        // them on the runner, which is docker's parent.
+        for (key, value) in &s.inherit_env {
+            cmd.env(key, value);
+        }
+    } else if let Some(dir) = &config.artifact_dir {
+        // On the host, so point at the host dir; the sandbox path exports the
+        // fixed container mount in build_sandbox_docker_argv (#2587).
+        cmd.env(crate::session::artifacts::ARTIFACT_DIR_ENV, dir);
+    }
+    if config.uses_native_prime() {
+        let mut snapshot = std::process::Command::new(&spawn_command);
+        snapshot.envs(
+            cmd.as_std()
+                .get_envs()
+                .filter_map(|(key, value)| value.map(|value| (key, value))),
+        );
+        let runtime = super::spawn::prime_runtime_for_spawn(
+            config,
+            &spawn_command,
+            &snapshot,
+            &host_environment,
+            sandbox_argv.as_ref(),
+        )?
+        .ok_or_else(|| AcpError::Spawn("Prime runtime missing".into()))?;
+        let encoded =
+            serde_json::to_string(&runtime).map_err(|e| AcpError::Spawn(e.to_string()))?;
+        let original: Vec<_> = cmd
+            .as_std()
+            .get_args()
+            .map(std::ffi::OsStr::to_owned)
+            .collect();
+        let separator = original
+            .iter()
+            .position(|arg| arg == "--")
+            .ok_or_else(|| AcpError::Spawn("runner argument separator missing".into()))?;
+
+        let mut owned = tokio::process::Command::new(&current_exe);
+        owned
+            .args(&original[..separator])
+            .arg("--prime-runtime")
+            .arg(&encoded)
+            .arg("--")
+            .arg(&current_exe)
+            .arg("__prime-agent")
+            .arg("--runtime")
+            .arg(&encoded)
+            .arg("--")
+            .args(&original[separator + 1..])
+            .arg("--daemon-socket")
+            .arg(runtime.socket());
+        owned.env_clear().envs(
+            cmd.as_std()
+                .get_envs()
+                .filter_map(|(key, value)| value.map(|value| (key, value))),
+        );
+        cmd = owned;
+    }
+    if !extra_path_dirs.is_empty() {
+        // Prepend the resolved bin dirs so the adapter and its
+        // `#!/usr/bin/env node` shim resolve against the same install.
+        let current = std::env::var_os("PATH").unwrap_or_default();
+        cmd.env("PATH", prepend_path_dirs(&current, &extra_path_dirs));
+    }
+
+    // Reads the runner env, so it runs before the scope wrapper adds its own.
+    let native_store = super::spawn::native_store_snapshot(config, cmd.as_std(), &host_environment);
+    let prefix = {
+        let id = session_id.clone();
+        let profile = config.source_profile.clone().unwrap_or_default();
+        tokio::task::spawn_blocking(move || {
+            crate::process::systemd::scope_prefix_for(&id, &profile)
+        })
+        .await
+        .ok()
+        .flatten()
+    };
+    let mut cmd = match &prefix {
+        Some(prefix) => wrap_in_scope(cmd, prefix),
+        None => cmd,
+    };
+
+    // Its own session leader, so a SIGTERM to the daemon's group does not
+    // cascade; the runner installs its own handlers.
+    #[cfg(unix)]
+    {
+        unsafe {
+            cmd.pre_exec(|| {
+                nix::unistd::setsid().map_err(std::io::Error::other)?;
+                Ok(())
+            });
+        }
+    }
+
+    // The runner writes its own log file. Inheriting our stdio would put
+    // per-session noise in debug.log and leave the runner reading EOF on its
+    // own stdin once the daemon dies. A scoped start sends stderr to that log
+    // so a failing `systemd-run` leaves its reason there.
+    let stderr = match &prefix {
+        Some(_) => append_to_log(&log_path),
+        None => std::process::Stdio::null(),
+    };
+    cmd.stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(stderr);
+
+    info!(
+        target: "acp.protocol.spawn",
+        session = %session_id,
+        socket = %socket_path.display(),
+        runner = %current_exe.display(),
+        agent = %config.spec.command,
+        resolved = %spawn_command,
+        "spawning detached structured view runner"
+    );
+
+    let mut child = cmd.spawn().map_err(|e| {
+        warn!(
+            target: "acp.protocol.spawn",
+            session = %session_id,
+            "runner spawn failed: {e}"
+        );
+        AcpError::Spawn(format!("spawn runner: {e}"))
+    })?;
+    let pid = child
+        .id()
+        .ok_or_else(|| AcpError::Spawn("runner exited before it could be identified".into()))?;
+    // Reap it, so a finished runner does not linger as a zombie that still
+    // answers `kill(pid, 0)` and keeps a teardown from proving it gone.
+    tokio::spawn(async move {
+        let _ = child.wait().await;
+    });
+    Ok((pid, native_store))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::process::systemd::ScopePrefix;
+    use crate::session::test_support::EnvGuard;
+    use std::ffi::{OsStr, OsString};
+
+    const XDG: &str = "XDG_RUNTIME_DIR";
+    const BUS: &str = "DBUS_SESSION_BUS_ADDRESS";
+    const ENV: &str = "/usr/bin/env";
+
+    fn prefix() -> ScopePrefix {
+        ScopePrefix {
+            argv: ["/usr/bin/systemd-run", "--user", "--scope", "--"]
+                .map(String::from)
+                .to_vec(),
+            env_bin: ENV.to_string(),
+        }
+    }
+
+    fn agent() -> tokio::process::Command {
+        let mut cmd = tokio::process::Command::new("agent");
+        cmd.arg("--flag")
+            .arg("value")
+            .env_clear()
+            .env("A", "1")
+            .env_remove("B")
+            .current_dir("/example/cwd");
+        cmd
+    }
+
+    fn argv(cmd: &tokio::process::Command) -> Vec<OsString> {
+        let std = cmd.as_std();
+        std::iter::once(std.get_program())
+            .chain(std.get_args())
+            .map(OsStr::to_os_string)
+            .collect()
+    }
+
+    fn envs(cmd: &tokio::process::Command) -> Vec<(OsString, Option<OsString>)> {
+        let mut v: Vec<_> = cmd
+            .as_std()
+            .get_envs()
+            .map(|(k, v)| (k.to_os_string(), v.map(OsStr::to_os_string)))
+            .collect();
+        v.sort();
+        v
+    }
+
+    fn env_bin() -> String {
+        which::which("env")
+            .expect("env on PATH")
+            .to_string_lossy()
+            .into_owned()
+    }
+
+    fn os(v: &[&str]) -> Vec<OsString> {
+        v.iter().map(OsString::from).collect()
+    }
+
+    fn pair(k: &str, v: &str) -> (OsString, Option<OsString>) {
+        (k.into(), Some(v.into()))
+    }
+
+    #[test]
+    fn wrap_in_scope_prepends_prefix_and_restores_the_agent_env() {
+        // (aoe XDG, aoe BUS, original carries XDG, expected unset vars)
+        let cases: [(Option<&str>, Option<&str>, bool, &[&str]); 4] = [
+            (
+                Some("/run/user/example"),
+                Some("unix:path=/x"),
+                false,
+                &[XDG, BUS],
+            ),
+            (
+                Some("/run/user/example"),
+                Some("unix:path=/x"),
+                true,
+                &[BUS],
+            ),
+            (Some("/run/user/example"), None, false, &[XDG]),
+            (None, None, false, &[]),
+        ];
+        for (xdg, bus, carries_xdg, unset) in cases {
+            let _guard = match (xdg, bus) {
+                (Some(x), Some(b)) => EnvGuard::set(&[(XDG, x), (BUS, b)]),
+                (Some(x), None) => EnvGuard::unset(&[BUS]).and_set(XDG, x),
+                _ => EnvGuard::unset(&[XDG, BUS]),
+            };
+            let mut original = agent();
+            if carries_xdg {
+                original.env(XDG, "/run/user/own");
+            }
+            let wrapped = wrap_in_scope(original, &prefix());
+            let label = format!("{xdg:?} {bus:?} carries_xdg={carries_xdg}");
+
+            let mut want = prefix().argv;
+            want.push(ENV.to_string());
+            for var in ["INVOCATION_ID"].iter().chain(unset) {
+                want.extend(["-u".to_string(), var.to_string()]);
+            }
+            want.extend(["agent", "--flag", "value"].map(String::from));
+            assert_eq!(
+                argv(&wrapped),
+                os(&want.iter().map(String::as_str).collect::<Vec<_>>()),
+                "{label}"
+            );
+
+            let mut want_env = vec![pair("A", "1")];
+            if carries_xdg {
+                want_env.push(pair(XDG, "/run/user/own"));
+            }
+            for var in unset {
+                let value = if *var == XDG { xdg } else { bus };
+                want_env.push(pair(var, value.unwrap()));
+            }
+            want_env.sort();
+            assert_eq!(envs(&wrapped), want_env, "{label}: B stays removed");
+            assert_eq!(
+                wrapped.as_std().get_current_dir(),
+                Some(std::path::Path::new("/example/cwd")),
+                "{label}"
+            );
+        }
+    }
+
+    /// `env` would take a program path containing `=` for an assignment.
+    #[test]
+    fn wrap_in_scope_skips_a_program_with_an_equals_sign() {
+        let original = || {
+            let mut cmd = tokio::process::Command::new("/opt/a=b/aoe");
+            cmd.arg("__acp-runner").env_clear().env("A", "1");
+            cmd
+        };
+        let wrapped = wrap_in_scope(original(), &prefix());
+        assert_eq!(argv(&wrapped), argv(&original()));
+        assert_eq!(envs(&wrapped), envs(&original()));
+    }
+
+    /// Runs the wrapped command with `env` standing in for `systemd-run` and
+    /// injecting `INVOCATION_ID` like it: the innermost `env` must see exactly
+    /// the original, cleared environment.
+    #[tokio::test]
+    async fn wrapped_agent_sees_exactly_its_original_env() {
+        let env = env_bin();
+        let fake_systemd_run = ScopePrefix {
+            argv: vec![env.clone(), "INVOCATION_ID=injected".to_string()],
+            env_bin: env.clone(),
+        };
+        for own in [None, Some("own")] {
+            let mut original = tokio::process::Command::new(&env);
+            original.env_clear().env("A", "1");
+            if let Some(own) = own {
+                original.env("INVOCATION_ID", own);
+            }
+            let mut wrapped = {
+                let _guard = EnvGuard::set(&[(XDG, "/run/user/example"), (BUS, "unix:path=/x")]);
+                wrap_in_scope(original, &fake_systemd_run)
+            };
+            let out = wrapped.output().await.expect("run wrapped env");
+            assert!(out.status.success(), "{out:?}");
+            let mut seen: Vec<String> = String::from_utf8_lossy(&out.stdout)
+                .lines()
+                .map(String::from)
+                .collect();
+            seen.sort();
+            let mut want = vec!["A=1".to_string()];
+            want.extend(own.map(|v| format!("INVOCATION_ID={v}")));
+            assert_eq!(seen, want, "own INVOCATION_ID {own:?}");
+        }
+    }
+}

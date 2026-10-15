@@ -1,42 +1,19 @@
-//! Migration v017: rewrite previously-installed AoE hook shell strings to the
-//! per-user-base shape (issue #1844). This is the second hook-string rewrite
-//! in the AoE history; v015 hardened the in-shell guards and v017 changes the
-//! base path baked into them from `/tmp/aoe-hooks` (world-known, multi-tenant
-//! exposed) to `/tmp/aoe-hooks-<euid>` host-side, plus a SELinux/ACL/xattr-
-//! tolerant mode pattern (`d*------|d*------.|d*------+|d*------@`) and an
-//! environment-pinning preamble (`unset IFS; umask 077; LC_ALL=C ls -ldn`).
+//! Migration v017: rewrite installed AoE hook shell strings to the per-user
+//! base shape (#1844): `/tmp/aoe-hooks-<euid>` instead of the world-known
+//! `/tmp/aoe-hooks`, a SELinux/ACL/xattr-tolerant mode pattern, and an
+//! environment-pinning preamble.
 //!
-//! ## Strategy: rewrite first, sweep last
+//! Rewrite first, sweep last. Every reachable host target is rewritten through
+//! the live `install_*` functions, and only if all of them succeeded is the
+//! legacy `/tmp/aoe-hooks` directory swept, via an `O_NOFOLLOW` open and a
+//! per-entry uid check that never recurses blindly and never touches another
+//! user's entries. Sweeping first would leave a rewrite-failed target
+//! recreating the legacy directory on every fire; this way a partial failure
+//! stays discoverable for manual cleanup.
 //!
-//! 1. **Rewrite** every reachable host hook target's bytes via the live
-//!    `install_*` functions. Per-target rewrite failures `tracing::warn!`
-//!    and continue.
-//! 2. **Sweep** the legacy `/tmp/aoe-hooks` directory ONLY if every
-//!    rewrite succeeded AND it exists owned by us. `O_NOFOLLOW` open +
-//!    per-entry `fstatat` uid check; we never `remove_dir_all` and never
-//!    touch entries owned by another user (multi-tenant safe).
-//!
-//! Reverse order (sweep first, rewrite last) was rejected: a rewrite
-//! failure between sweep and the schema bump would leave the agent
-//! recreating `/tmp/aoe-hooks` on every fire, undoing the hardening for
-//! any rewrite-failed target until the user manually runs
-//! `aoe uninstall && aoe add`. With rewrite-first, a partial-failure
-//! state keeps legacy entries discoverable for manual cleanup.
-//!
-//! ## Failure policy
-//!
-//! Per `AGENTS.md > Data Migrations`, a returned `Err` aborts boot. v017
-//! never bubbles per-target failures (matches v015): every per-target
-//! issue surfaces as `tracing::warn!`, the schema-version still bumps so
-//! the migration runs at most once, and recovery is `aoe uninstall && aoe
-//! add` exactly as documented for v015.
-//!
-//! ## Sandbox image hooks
-//!
-//! Hooks baked into a Docker / Podman / Apple-Containers sandbox image are
-//! NOT rewritten by v017 (inherits the v015 limitation). Next image rebuild
-//! picks up the current canonical bytes. Defense-in-depth bound: container
-//! isolation already gates the multi-tenant threat we are addressing.
+//! Per-target failures warn and are skipped; only a missing home directory
+//! aborts boot. Host paths only, so hooks baked into a sandbox image keep the
+//! legacy bytes until the image is rebuilt.
 
 use anyhow::Result;
 use std::fs;
@@ -44,8 +21,9 @@ use std::path::{Path, PathBuf};
 use tracing::{debug, info, warn};
 
 use crate::hooks::{
-    has_aoe_marker, install_codex_hooks_with_preserved_state, install_hooks, iter_hook_targets_in,
-    snapshot_codex_hooks_state, HookInstallTarget, HookTarget, HookTargetKind,
+    has_aoe_marker, install_codex_hooks_with_preserved_state, install_codex_json_hooks,
+    install_hooks, iter_hook_targets_in, snapshot_codex_hooks_state, HookInstallTarget, HookTarget,
+    HookTargetKind,
 };
 
 /// Path of the legacy world-known hook directory swept by this migration.
@@ -160,8 +138,12 @@ fn rewrite_one(target: &HookTarget) -> Result<()> {
         anyhow::bail!("test-injected rewrite failure for {}", target.agent_name);
     }
     match target.kind {
-        HookTargetKind::JsonSettings | HookTargetKind::CodexJson => {
+        HookTargetKind::JsonSettings => {
             install_hooks(&target.path, &target.events, HookInstallTarget::Host)
+        }
+        HookTargetKind::CodexJson => {
+            install_codex_json_hooks(&target.path, &target.events, HookInstallTarget::Host)
+                .map(drop)
         }
         HookTargetKind::CodexToml => {
             let preserved = snapshot_codex_hooks_state(&target.path)?;
@@ -475,9 +457,10 @@ fn read_environment_from_toml(path: &Path) -> Option<Vec<String>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::session::test_support::EnvGuard;
+    use crate::migrations::hook_fixtures::{setup_dirs, unset_agent_home_env, write_json};
     use serde_json::Value;
     use std::fs;
+    #[cfg(target_os = "linux")]
     use tempfile::TempDir;
 
     /// Pre-#1844 hardened bytes (post-v015): the form we are migrating
@@ -488,35 +471,6 @@ mod tests {
         mkdir -p \"/tmp/aoe-hooks/$AOE_INSTANCE_ID\" 2>/dev/null; \
         printf running > \"/tmp/aoe-hooks/$AOE_INSTANCE_ID/status\" 2>/dev/null; \
         exit 0'";
-
-    /// Clears CODEX_HOME, CLAUDE_CONFIG_DIR, etc. for the test duration so
-    /// the migration's path resolution sees only the explicit fixtures in
-    /// `home` / `app_dir`.
-    fn unset_agent_home_env() -> EnvGuard {
-        EnvGuard::unset(&[
-            "CODEX_HOME",
-            "CLAUDE_CONFIG_DIR",
-            "CURSOR_CONFIG_DIR",
-            "GEMINI_CONFIG_DIR",
-            "QWEN_CONFIG_DIR",
-        ])
-    }
-
-    fn setup_dirs() -> (TempDir, std::path::PathBuf, std::path::PathBuf) {
-        let tmp = TempDir::new().unwrap();
-        let home = tmp.path().join("home");
-        let app_dir = tmp.path().join("app");
-        fs::create_dir_all(&home).unwrap();
-        fs::create_dir_all(&app_dir).unwrap();
-        (tmp, home, app_dir)
-    }
-
-    fn write_json(path: &Path, value: &Value) {
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent).unwrap();
-        }
-        fs::write(path, serde_json::to_string_pretty(value).unwrap()).unwrap();
-    }
 
     fn pre_v017_claude_settings() -> Value {
         serde_json::json!({
@@ -548,7 +502,7 @@ mod tests {
                     if !cmd.contains("aoe-hooks") {
                         continue;
                     }
-                    if cmd.contains("aoe __extract-session-id") {
+                    if cmd.contains("__extract-session-id") {
                         continue;
                     }
                     status_writers += 1;
@@ -587,8 +541,14 @@ mod tests {
         write_json(&claude, &pre_v017_claude_settings());
 
         run_in(&home, &app_dir).unwrap();
-
         assert_post_v017_canonical(&claude);
+        let after_first = fs::read_to_string(&claude).unwrap();
+        run_in(&home, &app_dir).unwrap();
+        assert_eq!(
+            fs::read_to_string(&claude).unwrap(),
+            after_first,
+            "v017 must be byte-idempotent"
+        );
     }
 
     #[test]
@@ -616,22 +576,6 @@ mod tests {
             "echo user-only",
             "non-AoE file must be byte-untouched"
         );
-    }
-
-    #[test]
-    #[serial_test::serial(shell_env)]
-    fn idempotent_byte_identical_on_second_run() {
-        let _env = unset_agent_home_env();
-        let (_tmp, home, app_dir) = setup_dirs();
-        let claude = home.join(".claude").join("settings.json");
-        write_json(&claude, &pre_v017_claude_settings());
-
-        run_in(&home, &app_dir).unwrap();
-        let after_first = fs::read_to_string(&claude).unwrap();
-        run_in(&home, &app_dir).unwrap();
-        let after_second = fs::read_to_string(&claude).unwrap();
-
-        assert_eq!(after_first, after_second, "v017 must be byte-idempotent");
     }
 
     #[test]
@@ -792,5 +736,33 @@ mod tests {
             sandbox_before, sandbox_after,
             "v017 must not touch settings under .claude/sandbox/ (baked into image)"
         );
+    }
+
+    /// `[features].hooks = false` means the migration strips AoE entries
+    /// instead of rewriting them, and keeps the user's own hooks.
+    #[test]
+    #[serial_test::serial(shell_env)]
+    fn codex_opt_out_strips_aoe_entries() {
+        let _g = unset_agent_home_env();
+        let (_tmp, home, app_dir) = setup_dirs();
+        let codex = home.join(".codex");
+        fs::create_dir_all(&codex).unwrap();
+        fs::write(codex.join("config.toml"), "[features]\nhooks = false\n").unwrap();
+        write_json(
+            &codex.join("hooks.json"),
+            &serde_json::json!({"hooks": {"SessionStart": [
+                {"hooks": [{"type": "command", "command": PRE_V017_STATUS_CMD}]},
+                {"hooks": [{"type": "command", "command": "echo user-only"}]},
+            ]}}),
+        );
+
+        run_in(&home, &app_dir).unwrap();
+
+        let text = fs::read_to_string(codex.join("hooks.json")).unwrap();
+        assert!(
+            !text.contains("aoe-hooks"),
+            "AoE entries left behind: {text}"
+        );
+        assert!(text.contains("echo user-only"), "user hook lost: {text}");
     }
 }

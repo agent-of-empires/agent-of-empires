@@ -1,9 +1,4 @@
 // @vitest-environment jsdom
-//
-// Coverage for LoginPage: passphrase submit -> login(), success calls
-// onSuccess, failure surfaces the error and re-enables the form, the
-// show/hide passphrase toggle flips the input type, and the submit button is
-// gated on a non-empty passphrase.
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";

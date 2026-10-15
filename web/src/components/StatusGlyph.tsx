@@ -37,29 +37,13 @@ const STATIC_GLYPH: Record<SessionStatus, string> = {
   Creating: "⠀",
 };
 
-/** Glyph for a dormant (idle-reaped, resumable) structured worker. A distinct
- *  double-bar braille dot, matching the TUI's ICON_DORMANT, so dormancy reads
- *  by shape as well as by its dim-amber color. See #2250. */
+/** Glyph for a dormant (idle-reaped, resumable) structured worker. */
 const DORMANT_GLYPH = "⠶";
 
-/** Slowed-down `breathe` rattle for a freshly-stopped Idle session.
- *  Reuses the same animation as Starting on purpose; differentiation is
- *  by color (Starting uses `--color-text-muted`, fresh-idle uses
- *  `--color-status-fresh-idle`). The longer interval (vs Starting) reads
- *  as "gentle reminder" rather than "actively transitioning". */
+/** Slowed-down `breathe` rattle for a freshly-stopped Idle session. */
 const FRESH_IDLE_RATTLE = { frames: RATTLES.breathe!.frames, interval: 280 };
 
-/** Animated status glyph that cycles through rattles frames.
- *  Each instance offsets by `createdAt` so spinners look unique.
- *
- *  When `idleEnteredAt` is within the decay window, an Idle session
- *  renders an animated `breathe` rattle styled with
- *  `--color-status-fresh-idle`. The motion matches the visual language of
- *  the other attention-worthy states (Running, Waiting, Starting all
- *  animate); without it the row would be the only static-glyph state in
- *  the "needs attention" bucket, which reads inconsistent. The shape
- *  variation also serves as a redundant cue alongside color for
- *  colorblind users and monochrome terminals. */
+/** Animated status glyph that cycles through rattles frames. */
 export function StatusGlyph({
   status,
   createdAt,

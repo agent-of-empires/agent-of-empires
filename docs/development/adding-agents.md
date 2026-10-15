@@ -4,17 +4,17 @@
 
 | File | Purpose |
 |------|---------|
-| `src/agents.rs` | Agent registry entry (name, binary, detection, flags) |
-| `src/tmux/status_detection.rs` | Status detection function (pane parsing or stub) |
-| `src/hooks/mod.rs` | Hook installer (if the agent supports hooks) |
-| `src/session/instance.rs` | Wire hook installation + `AOE_INSTANCE_ID` env prefix |
-| `src/session/container_config.rs` | Config mount for Docker sandbox |
-| `src/acp/agent_registry.rs` | Structured view ACP adapter entry (only if the agent ships an ACP server) |
-| `src/acp/agent_profiles.rs` + `web/src/lib/agentProfiles.ts` | Structured view profile (clear aliases, meta namespace, capability gates, tool aliases) |
-| `src/acp/install_hints.rs` | Install hint surfaced by `aoe acp doctor` and handshake failures |
-| `docker/Dockerfile` | Install agent in sandbox image |
-| `docs/structured-view.md` | Per-agent structured view feature matrix |
-| `README.md`, `docs/` | Documentation updates |
+| `src/agents.rs` | Registry entry (name, binary, detection, flags) |
+| `src/tmux/detect/manifests/<agent>.toml` | Detection rules, for a pane-parsed agent |
+| `src/tmux/status_detection.rs` | Detection entry point (manifest call or stub) |
+| `src/hooks/mod.rs` | Hook installer, if the agent supports hooks |
+| `src/session/instance/hooks.rs` | Hook wiring plus the `AOE_INSTANCE_ID` env prefix |
+| `src/session/config/container_config.rs` | Config mount for the sandbox |
+| `src/acp/agent_registry.rs` | ACP adapter entry, if the agent ships an ACP server |
+| `src/acp/agent_profiles.rs`, `web/src/lib/agentProfiles.ts` | Structured view profile |
+| `src/acp/install_hints.rs` | Install hint for `aoe acp doctor` and handshake failures |
+| `docker/Dockerfile` | Install the agent in the sandbox image |
+| `docs/structured-view.md`, `docs/index.md`, `README.md` | Supported-agent lists |
 
 ## Levels of support
 
@@ -22,47 +22,49 @@ Each level is additive; do only what the agent supports.
 
 | Level | What it gives | Requires |
 |-------|---------------|----------|
-| 1. Basic | Appears in `aoe agents`, sessions launch, status always "Idle" | `AgentDef` + stub `detect_status` |
-| 2. Pane-parse status | Status inferred from terminal output; no agent config, brittle to UI changes | `detect_<agent>_status(&str) -> Status` (OpenCode, Vibe, Copilot, Pi, Droid) |
-| 3. Hook status | Agent writes status to a file via hooks; reliable, survives UI changes | `hook_config` + generic `install_hooks()` or a custom `install_<agent>_hooks()` (Claude, Cursor, Gemini generic; Codex TOML, Hermes YAML, Kiro JSON) |
-| 4. Session resume | Restart resumes the prior conversation | `resume_strategy` in `AgentDef` |
-| 5. Docker sandbox | Runs isolated; host config synced in | `AgentConfigMount` + Dockerfile install |
+| 1. Basic | Appears in `aoe agents`, sessions launch, status always Idle | `AgentDef` plus a stub `detect_status` |
+| 2. Pane-parse status | Status inferred from terminal output | A manifest plus `detect_<agent>_status` calling into it |
+| 3. Hook status | The agent writes status the instant it changes | `hook_config` with the generic `install_hooks()`, or `sidecar_hooks` with a custom installer |
+| 4. Session resume | A restart resumes the same native conversation | A `session_support` contract with verified resume argv |
+| 5. Sandbox | Runs isolated with host config synced in | `AgentConfigMount` plus a Dockerfile install |
+
+Levels 3 and 4 are independent. `session_support` declares verified native resume argv; its optional capture spec is the only backend allowed to supply an id, with each environment explicitly `PaneScoped`, `Preassigned`, `ManagedExclusiveStore`, or `Unsupported`. Use `capture: None` for argv-only support, and omit `session_support` entirely when the resume argv itself is unverified. Managed-store capture additionally requires a physically per-instance store, a cwd match, a launch-time floor, and a cross-process ownership lease.
 
 ## Steps
 
-**1. Research:** binary name, detection (`which`), YOLO/auto-approve flag, resume flag, hook support + format (JSON/YAML/TOML), config dir, install command.
+**1. Research** the binary name, detection, YOLO flag, exact resume and fork argv, authoritative session-id source, host and sandbox storage paths, hook identity field, config dir, and install command. Treat an unverified environment as unsupported.
 
-**2. `AgentDef` (`src/agents.rs`):** add to the `AGENTS` array. Key fields: `detection: DetectionMethod::Which(...)`, `yolo: Some(YoloMode::CliFlag(...))`, either `hook_config` (with `format: HookFormat::JsonSettings` or `HookFormat::CodexJson`) or `sidecar_hooks` (with `format: SidecarFormat::SettlToml`, `HermesYaml`, or `KiroJson`, plus `events: ..._SIDECAR_EVENTS`), `resume_strategy`, `host_only`, `install_hint`. The format enums drive installer and marker-walker dispatch; adding a hook-based agent without picking a variant is a compile error. `set_default_command: true` only when the binary name alone isn't enough to relaunch (e.g. opencode).
+**2. `AgentDef`** in `src/agents.rs`: add to `AGENTS`, declaring detection, YOLO mode, hooks, lifecycle, and `SessionSupport` where resume argv is verified. Add a capture spec only for an authoritative source, naming one backend plus separate host and sandbox contexts. Hook-based capture must declare `HookIdentityField::SessionId` or `ConversationIdOrSessionId` from the upstream payload contract.
 
-**3. Status detection (`src/tmux/status_detection.rs`):** hook-based agents get a stub returning `Status::Idle`. Pane-parse agents get a function matching on lowercased pane content. Prefer `--format json` over substring matching when the CLI offers it; human-readable output changes between versions.
+Add a `session_name_flag` arm only from documented argv: it names the agent's own session at launch (`claude --name <title>`) when `session.name_agent_session` is on.
 
-**4. Hooks (if applicable):** for non-Claude formats add a custom installer in `src/hooks/mod.rs` (see `install_hermes_hooks_with_events`, `install_kiro_hooks_with_events`). Wire it into `SidecarHooks::install`, and make sure `status_hook_env_prefix()` includes the agent so `AOE_INSTANCE_ID` and `AOE_PROFILE` reach the hook (without the instance id hooks write nothing). Hook statuses use `HookStatus` (`Running`, `Waiting`, `Idle`, `Error`), not raw strings, and sidecar event defaults live on the agent so profile `agents.<name>.status_map` entries feed host and sandbox installs through the same resolver. Keep installers as pure file IO; any subprocess work (e.g. setting a default agent) goes in a separate function so `cargo test` doesn't mutate the dev's real environment.
+**3. Status detection**: an agent whose pane carries state gets a manifest in `src/tmux/detect/manifests/<agent>.toml` and a `detect_<agent>_status` calling into it (see `detect_claude`). Rules are `{id, state, priority, region, matcher}` and the highest-priority match wins, so a new case is a row rather than another branch. The hook file is a rule too (`region = "hook"`), which is what lets a blocking prompt on screen outrank a `running` write. Mark a rule `visible = true` only when it reads state off the agent's own live chrome, which is what lets the poller publish it without a confirming capture. Agents with no pane signal keep a stub returning `Status::Idle`.
 
-**5. Container mount (`src/session/container_config.rs`):** add an `AgentConfigMount` (`tool_name`, `host_rel`, `container_suffix`, `skip_entries`). Host hook installation does not cover sandbox sessions; if the agent uses hooks, wire them into `build_container_config` so the sidecar volume mounts and config materializes in the container.
+**4. Hooks**: for non-Claude formats add an installer in `src/hooks/mod.rs` (see `install_hermes_hooks_with_events`), wire it into `SidecarHooks::install`, and add the agent to `status_hook_env_prefix()` so `AOE_INSTANCE_ID` and `AOE_PROFILE` reach the hook. Without the instance id, hooks write nothing. Use `HookStatus` rather than raw strings, and keep installers pure file IO: any subprocess work belongs in a separate function so `cargo test` cannot mutate a developer's real environment.
 
-**6. Dockerfile (`docker/Dockerfile`):** install the agent and add its config dir to the `mkdir -p` block.
+**5. Container mount**: add an `AgentConfigMount` (`tool_name`, `host_rel`, `container_suffix`, `skip_entries`) so the resolved config store is mounted where the containerized binary reads it, and install hooks and session-id sidecars into that mounted store. Declare a sandbox capture context only after this path is proven.
 
-**7. Tests:** update the `src/agents.rs` tests (`test_get_agent_known`, `test_agent_names`, `test_resolve_tool_name`, `test_settings_index_roundtrip`, `test_send_keys_enter_delay`, `test_install_hint_lookup`); add a detection test in `status_detection.rs`; for hook-based agents add to `test_status_hook_env_prefix_includes_hermes`.
+**6. Dockerfile**: install the agent and add its config dir to the `mkdir -p` block.
 
-**8. Structured view profile (if the agent ships an ACP server):** its CLI accepts `acp`/`--acp` or ships a `*-acp` adapter. Add the binary to `src/acp/agent_registry.rs::with_defaults()` (keyed on the `src/agents.rs` name), an install hint to `src/acp/install_hints.rs`, a server profile to `src/acp/agent_profiles.rs` (registered in `resolve()`), and a mirrored profile in `web/src/lib/agentProfiles.ts` (registered in `PROFILES`). Keep profiles conservative: until you've observed the adapter's `_meta` convention for child tool-call linkage, leave `parent_meta_namespaces` and the alias map empty. Missing indentation is safer than fake parent links; an empty alias map renders the generic tool card, which is the correct fallback. Add the agent to the feature matrix in `docs/structured-view.md`; profile mechanics are documented in `docs/development/internals/structured-view.md`.
+**7. Structured view profile**, if the agent ships an ACP server (its CLI accepts `acp` / `--acp`, or it ships a `*-acp` adapter): add the binary to `agent_registry.rs::with_defaults()` keyed on the `src/agents.rs` name, an install hint, a server profile registered in `resolve()`, and a mirrored frontend profile in `PROFILES`. Keep profiles conservative: until you have observed the adapter's `_meta` convention for child tool calls, leave `parent_meta_namespaces` and the alias map empty, since missing indentation is safer than fake parent links and an empty alias map renders the correct generic card.
 
-**9. Docs:** `README.md` (features + FAQ), `docs/index.md` (supported agents), `docs/guides/sandbox.md` (image table), `docker/Dockerfile.dev` (inherited-agents comment).
+**8. Tests**: update the registry matrix and settings round-trip tests, then cover resume argv, the capture backend, host and sandbox contexts, missing-id fail-closed behavior, `/clear` rotation where supported, restart persistence, and two concurrent sessions in the same cwd. Managed-store tests must prove the launch floor and ownership lease reject stale or peer-owned ids, and hook agents that the declared identity field reaches the pane-scoped sidecar.
 
-**10. Verify:**
+**9. Verify**:
 
 ```bash
 cargo fmt && cargo clippy -- -D warnings
 cargo test --lib agents
 cargo test --lib <youragent>
 cargo test --lib container_config
-cargo build && ./target/debug/aoe agents   # verify detection
+cargo build && ./target/debug/aoe agents
 ```
 
 ## Hook format reference
 
-### Claude/Cursor/Gemini (generic `hook_config`)
+### Claude and Gemini (generic `hook_config`)
 
-Set `hook_config: Some(AgentHookConfig { ... })`; the generic `install_hooks()` handles it.
+Set `hook_config: Some(AgentHookConfig { ... })` and the generic `install_hooks()` handles their nested settings schema:
 
 ```json
 {
@@ -73,54 +75,27 @@ Set `hook_config: Some(AgentHookConfig { ... })`; the generic `install_hooks()` 
 }
 ```
 
-Each entry in `events: &[HookEvent]` carries:
+Each `HookEvent` carries:
 
 | Field | Meaning |
 |-------|---------|
-| `name` | Agent's event name (e.g. `"PreToolUse"`). |
-| `matcher` | Optional pattern for events that need it (e.g. Claude's `Notification` matcher). |
-| `status` | `Some(HookStatus::Running\|Waiting\|Idle\|Error)` to install a status-writer on this event, or `None` for a purely lifecycle event. |
-| `session_id_capture` | `true` installs a command that extracts `session_id` from the agent's stdin JSON and writes it to `/tmp/aoe-hooks-<euid>/<AOE_INSTANCE_ID>/session_id` (host) or `/tmp/aoe-hooks/<AOE_INSTANCE_ID>/session_id` (sandbox; see issue #1844 for the host/container path split), read by [session-resume](../guides/session-resume.md). Currently only Claude (`SessionStart`, `UserPromptSubmit`). With `status` also set, both commands share the matcher block and the session-id command runs first so it consumes stdin before the status writer. |
-| `waiting_tools` | Tool names whose invocation blocks on the user for the tool's entire execution (Claude's `AskUserQuestion`). When non-empty on a status event, the status writer inspects the payload's `tool_name` on stdin and writes `waiting` for these tools instead of the event's status. Pair it with a tool-scoped event that restores the normal status once the tool completes (Claude adds `PostToolUse` with matcher `AskUserQuestion`), or the status sticks on `waiting` through the rest of the turn. |
+| `name` | The agent's event name, e.g. `"PreToolUse"`. |
+| `matcher` | Optional pattern, for events that need one. |
+| `status` | `Some(HookStatus::…)` installs a status writer on this event; `None` is a purely lifecycle event. |
+| `identity_field` | Installs a command that extracts the declared top-level native identity from stdin into the pane-scoped `session_id` sidecar. Use only a field documented upstream. With `status` also set, the identity command runs first, and it stays installed when `agent_status_hooks = false`. |
+| `waiting_tools` | Tool names whose invocation blocks on the user for the tool's whole execution (Claude's `AskUserQuestion`). The status writer then inspects the payload's `tool_name` and writes `waiting` instead of the event's status. Pair it with a tool-scoped event that restores the normal status, or the status sticks on `waiting`. |
 
-### Codex (custom TOML)
+### Other formats
 
-`[hooks]` table in `.codex/config.toml`:
-
-```toml
-[[hooks.PreToolUse]]
-[[hooks.PreToolUse.hooks]]
-type = "command"
-command = "sh -c '...'"
-```
-
-Set `hook_config: Some(AgentHookConfig { settings_rel_path: ".codex/config.toml", ... })`. Host installs must go through `install_codex_hooks()` / `uninstall_codex_hooks()` so `CODEX_HOME`, existing `[hooks.state]` trust data, `[features].hooks = false`, the `config.toml.lock`, and atomic replacement are respected. Codex status is hook-first with targeted pane reconciliation for known hook gaps.
-
-### Hermes (custom YAML)
-
-```yaml
-hooks:
-  pre_tool_call:
-    - command: "sh -c '...'"
-```
-
-### Kiro CLI (custom JSON agent config)
-
-```json
-{
-  "name": "aoe-hooks",
-  "tools": ["*"],
-  "hooks": {
-    "preToolUse": [{"command": "sh -c '...'"}],
-    "stop": [{"command": "sh -c '...'"}]
-  }
-}
-```
+- **Cursor Agent**: version 1 `.cursor/hooks.json`, with direct command entries under `hooks.beforeSubmitPrompt`. Its stable identity is `conversation_id`; `generation_id` is turn-scoped and must not be captured. Use `SidecarHooks` with `install_cursor_hooks_with_events`.
+- **Codex**: the same generic JSON payload, written to `hooks.json` in Codex's config dir (`settings_rel_path: ".codex/hooks.json"`, `format: HookFormat::CodexJson`). `install_codex_json_hooks()` checks the adjacent `config.toml` feature opt-out first, and empty-event cleanup removes AoE's entries while preserving user hooks. Sandbox installation refuses linked or unreadable config files rather than following them. Codex's `config.toml` holds `[hooks.state]` trust data and `[features].hooks`; do not point `settings_rel_path` at it.
+- **Hermes**: custom YAML, `hooks.pre_tool_call[].command`.
+- **Kiro CLI**: a custom JSON agent config with `hooks.preToolUse[].command`.
+- **Kimi Code**: a flat `[[hooks]]` array in `.kimi-code/config.toml`, which also holds provider and oauth settings, so the installer rewrites only its own entries.
 
 ## Common pitfalls
 
-- **Missing `status_hook_env_prefix`:** without `AOE_INSTANCE_ID`, hooks write nothing.
-- **Wrong hook format:** test that hooks fire by sending a message and checking `/tmp/aoe-hooks-$(id -u)/*/status` (host) or `/tmp/aoe-hooks/*/status` (inside the sandbox).
-- **Sandbox hooks are separate:** host installation skips containers; wire into `build_container_config` too.
-- **Waiting status needs a dedicated event:** not all agents expose an approval/permission event. If none exists, document it as a limitation and consider filing upstream.
-- **Sidebar quick permission response:** the TUI's `a`/`A` sidebar action (respond to a pending permission prompt without attaching) needs each agent's exact keystroke sequence, not detection. Set `AgentDef.permission_response` to a `PermissionResponse { allow, allow_always, deny }` of `KeyToken`s (see `claude`/`opencode` in `src/agents.rs`) once you've confirmed, by hand, how the agent's own CLI prompt is answered (bare digit, arrow+Enter, etc., with no assumed trailing Enter). `allow_always` is an `Option`: set it to `None` when the agent's prompt offers no "don't ask again" choice (see `omp`), and the dialog drops the "Allow Always" button plus its `Shift+A` shortcut rather than offering one that would silently do nothing. Leave the whole `permission_response` field `None` if you haven't verified the sequences; the action then tells the user the agent isn't supported yet.
+- **Missing `status_hook_env_prefix`**: without `AOE_INSTANCE_ID` hooks write nothing. Test by sending a message and checking `/tmp/aoe-hooks-$(id -u)/*/status` on the host, or `/tmp/aoe-hooks/*/status` inside the sandbox.
+- **Sandbox hooks are separate**: host installation skips containers, so wire into `build_container_config` too.
+- **Waiting status needs its own event**: not every agent exposes an approval event. Document the gap and consider filing upstream.
+- **Sidebar quick permission response**: the TUI's `a` / `A` action needs each agent's exact keystroke sequence, not detection. Set `AgentDef.permission_response` only once you have confirmed by hand how the agent's prompt is answered (bare digit, arrow plus Enter, no assumed trailing Enter). Set `allow_always: None` when the prompt offers no "don't ask again" choice, and leave the whole field `None` until verified: the action then tells the user the agent is not supported yet.

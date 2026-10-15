@@ -27,26 +27,27 @@ export const REPO_COLOR_OPTIONS: Array<{
   { id: "slate", label: "Slate" },
 ];
 
-const REPO_COLOR_TOKENS: Record<RepoColor, string> = {
-  amber: "--color-status-waiting",
-  teal: "--color-terminal-active",
-  sky: "--color-sandbox",
-  violet: "--color-diff-header",
-  rose: "--color-status-error",
-  slate: "--color-surface-700",
+// Fixed hues: these are user labels, and theme tokens can share one value.
+const REPO_COLOR_HEX: Record<RepoColor, string> = {
+  amber: "#f59e0b",
+  teal: "#14b8a6",
+  sky: "#0ea5e9",
+  violet: "#8b5cf6",
+  rose: "#f43f5e",
+  slate: "#64748b",
 };
 
 // Faint tinted background for a repo header / project row carrying a color.
 export function repoColorStyle(color: RepoColor | null): CSSProperties | undefined {
   if (!color) return undefined;
   return {
-    backgroundColor: `color-mix(in srgb, var(${REPO_COLOR_TOKENS[color]}) 14%, transparent)`,
+    backgroundColor: `color-mix(in srgb, ${REPO_COLOR_HEX[color]} 14%, transparent)`,
   };
 }
 
 // Solid swatch for the color picker.
 export function repoSwatchStyle(color: RepoColor): CSSProperties {
-  return { backgroundColor: `var(${REPO_COLOR_TOKENS[color]})` };
+  return { backgroundColor: REPO_COLOR_HEX[color] };
 }
 
 const validColors = new Set(REPO_COLOR_OPTIONS.map((option) => option.id));

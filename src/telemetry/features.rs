@@ -1,29 +1,11 @@
-//! Registry of opt-in features whose adoption telemetry reports.
-//!
-//! This is the single, auditable place that decides which feature flags are
-//! tracked. The result is a map keyed by a **fixed set of short feature
-//! names** (the allowlist), so it can never carry a path, name, or other
-//! free-form value, and the gateway forwards it as allowlisted short-id ->
-//! bool while dropping anything else.
-//!
-//! Tracking a newly gated feature is one entry here: add its name and how to
-//! detect it from [`Config`]. For example, an `openshell` feature behind a
-//! config flag would be `m.insert("openshell".into(), config.openshell.enabled)`.
+//! Allowlisted registry of opt-in features whose adoption telemetry reports.
 
 use std::collections::BTreeMap;
 
 use crate::session::config::UpdateCheckMode;
 use crate::session::Config;
 
-/// Install-level feature adoption: allowlisted feature name -> whether it is
-/// turned on in the **global** config for this install.
-///
-/// This is deliberately the global, pre-profile-merge config, not a profile's
-/// effective config: it answers "what does this install default to", which is a
-/// stable install-level adoption signal. Because sessions can run under arbitrary
-/// profiles whose overrides are not reflected here, this is not per-session usage;
-/// per-session adoption is reported separately by the snapshot's session counts
-/// (`session_sandboxed`, `session_yolo`, ...). Documented in `docs/telemetry.md`.
+/// Reads the global, pre-profile-merge config: an install-level signal, not per-session usage.
 pub fn active_features(config: &Config) -> BTreeMap<String, bool> {
     let mut features = BTreeMap::new();
     features.insert("worktree".to_string(), config.worktree.enabled);
@@ -48,8 +30,6 @@ mod tests {
         let features = active_features(&config);
         assert_eq!(features.get("worktree"), Some(&true));
         assert_eq!(features.get("auto_update"), Some(&true));
-        // Defaults stay false, but the keys are always present so the gateway
-        // sees a stable, fixed key set.
         assert_eq!(features.get("sandbox"), Some(&false));
     }
 }

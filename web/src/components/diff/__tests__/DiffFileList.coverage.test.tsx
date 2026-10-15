@@ -387,7 +387,7 @@ describe("DiffFileList BasePicker", () => {
     const option = await screen.findByText("develop");
     fireEvent.mouseDown(option);
 
-    await vi.waitFor(() => expect(mock.setSessionDiffBase).toHaveBeenCalledWith("s1", "develop"));
+    await vi.waitFor(() => expect(mock.setSessionDiffBase).toHaveBeenCalledWith("s1", "develop", undefined));
     await vi.waitFor(() => expect(onBaseBranchChanged).toHaveBeenCalled());
   });
 
@@ -401,7 +401,7 @@ describe("DiffFileList BasePicker", () => {
     fireEvent.click(screen.getByRole("button", { name: /Change diff base/ }));
     const reset = await screen.findByText(/Reset to auto-detected/);
     fireEvent.click(reset);
-    await vi.waitFor(() => expect(mock.setSessionDiffBase).toHaveBeenCalledWith("s1", null));
+    await vi.waitFor(() => expect(mock.setSessionDiffBase).toHaveBeenCalledWith("s1", null, undefined));
   });
 
   it("picks the highlighted branch via keyboard Enter and navigates with arrows", async () => {
@@ -416,7 +416,7 @@ describe("DiffFileList BasePicker", () => {
     const input = await screen.findByPlaceholderText("Search branches...");
     fireEvent.keyDown(input, { key: "ArrowDown" }); // highlight index 1 ("two")
     fireEvent.keyDown(input, { key: "Enter" });
-    await vi.waitFor(() => expect(mock.setSessionDiffBase).toHaveBeenCalledWith("s1", "two"));
+    await vi.waitFor(() => expect(mock.setSessionDiffBase).toHaveBeenCalledWith("s1", "two", undefined));
   });
 
   it("falls back to the typed query when Enter is pressed with no suggestion", async () => {
@@ -428,7 +428,7 @@ describe("DiffFileList BasePicker", () => {
     const input = await screen.findByPlaceholderText("Search branches...");
     fireEvent.change(input, { target: { value: "typed-branch" } });
     fireEvent.keyDown(input, { key: "Enter" });
-    await vi.waitFor(() => expect(mock.setSessionDiffBase).toHaveBeenCalledWith("s1", "typed-branch"));
+    await vi.waitFor(() => expect(mock.setSessionDiffBase).toHaveBeenCalledWith("s1", "typed-branch", undefined));
   });
 
   it("closes the popover on Escape", async () => {

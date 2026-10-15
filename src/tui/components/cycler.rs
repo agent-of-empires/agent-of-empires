@@ -1,9 +1,7 @@
 //! Shared left/right cycler fields for the New and Restart session dialogs.
 //!
-//! Both modals let the user cycle a profile and an AI tool before launch.
-//! Centralizing the span construction keeps the two dialogs visually
-//! identical; previously the restart dialog carried its own divergent
-//! `AI:` label and `< value >` tool styling.
+//! Both modals let the user cycle a profile and an AI tool before launch and
+//! share these span builders so the rows stay consistent.
 
 use ratatui::prelude::*;
 
@@ -42,6 +40,7 @@ pub fn profile_cycler_spans(
 }
 
 /// Spans for a `Label: ← ● value  [n/m] →` cycler, the AI-tool picker style.
+/// With `numbered`, a tool with a digit hotkey reads `← [n] value →` instead.
 ///
 /// `index` is 0-based. When `total` is 1 or 0 the bullet, count badge, and
 /// arrow affordances are dropped and only the value is shown, matching the
@@ -51,6 +50,7 @@ pub fn tool_cycler_spans(
     value: &str,
     index: usize,
     total: usize,
+    numbered: bool,
     focused: bool,
     theme: &Theme,
 ) -> Vec<Span<'static>> {
@@ -78,13 +78,36 @@ pub fn tool_cycler_spans(
     if focused {
         spans.push(Span::styled("← ", dimmed));
     }
-    spans.push(Span::styled("● ", accent));
-    spans.push(Span::styled(value.to_string(), accent));
-    spans.push(Span::styled(format!("  [{}/{}]", index + 1, total), dimmed));
+    if numbered && index < 9 {
+        spans.push(Span::styled(
+            format!("[{}] ", index + 1),
+            Style::default().fg(theme.hint).bold(),
+        ));
+        spans.push(Span::styled(value.to_string(), accent));
+    } else {
+        spans.push(Span::styled("● ", accent));
+        spans.push(Span::styled(value.to_string(), accent));
+        spans.push(Span::styled(format!("  [{}/{}]", index + 1, total), dimmed));
+    }
     if focused {
         spans.push(Span::styled("  →", dimmed));
     }
     spans
+}
+
+/// Discreet lifecycle suffix for the Tool cycler: an amber ` ⚠ deprecated`
+/// span when the selected tool's registry entry is deprecated, empty for
+/// Active (and unknown) tools so the common row is unchanged.
+pub fn tool_lifecycle_spans(tool: &str, theme: &Theme) -> Vec<Span<'static>> {
+    let Some(label) =
+        crate::agents::get_agent(tool).and_then(crate::agents::AgentDef::lifecycle_label)
+    else {
+        return Vec::new();
+    };
+    vec![Span::styled(
+        format!(" ⚠ {label}"),
+        Style::default().fg(theme.waiting),
+    )]
 }
 
 #[cfg(test)]
@@ -96,56 +119,88 @@ mod tests {
     }
 
     #[test]
-    fn profile_cycler_shows_brackets_when_multiple() {
+    fn cycler_spans_cases() {
         let theme = Theme::default();
-        let spans = profile_cycler_spans("Profile:", "work", 3, false, &theme);
-        assert_eq!(contents(&spans), ["Profile:", " ", "< ", "work", " >"]);
+        let profile =
+            |value, count, focused| profile_cycler_spans("Profile:", value, count, focused, &theme);
+        let tool = |value, index, count, focused| {
+            tool_cycler_spans("Tool:", value, index, count, false, focused, &theme)
+        };
+        let numbered = |value, index, count| {
+            tool_cycler_spans("Tool:", value, index, count, true, true, &theme)
+        };
+        let cases: Vec<(Vec<Span<'static>>, &[&str], bool)> = vec![
+            (
+                profile("work", 3, false),
+                &["Profile:", " ", "< ", "work", " >"],
+                false,
+            ),
+            (
+                profile("default", 1, false),
+                &["Profile:", " ", "default"],
+                false,
+            ),
+            (
+                profile("work", 3, true),
+                &["Profile:", " ", "< ", "work", " >"],
+                true,
+            ),
+            (
+                tool("claude", 0, 3, true),
+                &["Tool:", " ", "← ", "● ", "claude", "  [1/3]", "  →"],
+                true,
+            ),
+            (
+                tool("codex", 1, 3, false),
+                &["Tool:", " ", "● ", "codex", "  [2/3]"],
+                false,
+            ),
+            (
+                numbered("codex", 1, 3),
+                &["Tool:", " ", "← ", "[2] ", "codex", "  →"],
+                true,
+            ),
+            // Only 1-9 are hotkeys, so the tenth tool keeps the plain badge.
+            (
+                numbered("droid", 9, 10),
+                &["Tool:", " ", "← ", "● ", "droid", "  [10/10]", "  →"],
+                true,
+            ),
+            (
+                tool("claude", 0, 1, false),
+                &["Tool:", " ", "claude"],
+                false,
+            ),
+            // The single-tool early return must still show focus so users can
+            // see which row Tab landed on.
+            (tool("claude", 0, 1, true), &["Tool:", " ", "claude"], true),
+        ];
+        for (spans, want, underlined) in cases {
+            assert_eq!(contents(&spans), want);
+            assert_eq!(
+                spans[0].style.add_modifier.contains(Modifier::UNDERLINED),
+                underlined,
+                "{want:?}"
+            );
+        }
     }
 
     #[test]
-    fn profile_cycler_drops_brackets_when_single() {
+    fn tool_lifecycle_spans_mark_only_deprecated_tools() {
+        // (tool, expected suffix). Unknown tools behave like Active: no
+        // suffix, so custom-agent rows stay unchanged.
         let theme = Theme::default();
-        let spans = profile_cycler_spans("Profile:", "default", 1, false, &theme);
-        assert_eq!(contents(&spans), ["Profile:", " ", "default"]);
-    }
-
-    #[test]
-    fn profile_cycler_underlines_label_when_focused() {
-        let theme = Theme::default();
-        let spans = profile_cycler_spans("Profile:", "work", 3, true, &theme);
-        assert!(spans[0].style.add_modifier.contains(Modifier::UNDERLINED));
-    }
-
-    #[test]
-    fn tool_cycler_focused_shows_arrows_and_badge() {
-        let theme = Theme::default();
-        let spans = tool_cycler_spans("Tool:", "claude", 0, 3, true, &theme);
-        assert_eq!(
-            contents(&spans),
-            ["Tool:", " ", "← ", "● ", "claude", "  [1/3]", "  →"]
-        );
-    }
-
-    #[test]
-    fn tool_cycler_unfocused_drops_arrows_keeps_badge() {
-        let theme = Theme::default();
-        let spans = tool_cycler_spans("Tool:", "codex", 1, 3, false, &theme);
-        assert_eq!(contents(&spans), ["Tool:", " ", "● ", "codex", "  [2/3]"]);
-    }
-
-    #[test]
-    fn tool_cycler_single_tool_is_plain() {
-        let theme = Theme::default();
-        let spans = tool_cycler_spans("Tool:", "claude", 0, 1, false, &theme);
-        assert_eq!(contents(&spans), ["Tool:", " ", "claude"]);
-    }
-
-    #[test]
-    fn tool_cycler_single_tool_underlines_label_when_focused() {
-        // Single-tool early return must still respect focus so users
-        // can see which row Tab landed on.
-        let theme = Theme::default();
-        let spans = tool_cycler_spans("Tool:", "claude", 0, 1, true, &theme);
-        assert!(spans[0].style.add_modifier.contains(Modifier::UNDERLINED));
+        let cases = [
+            ("gemini", vec![" ⚠ deprecated"]),
+            ("claude", vec![]),
+            ("not-an-agent", vec![]),
+        ];
+        for (tool, expected) in cases {
+            let spans = tool_lifecycle_spans(tool, &theme);
+            assert_eq!(contents(&spans), expected, "{tool}");
+            if !spans.is_empty() {
+                assert_eq!(spans[0].style.fg, Some(theme.waiting), "{tool}");
+            }
+        }
     }
 }

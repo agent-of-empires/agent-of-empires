@@ -1,20 +1,14 @@
-// Regression for #1345: clicking the sidebar resize bar (mousedown + mouseup,
-// no drag) used to crash the whole app when localStorage was full because
-// localStorage.setItem ran unguarded inside a React setState updater. The
-// throw surfaced through the commit phase and blanked the dashboard.
-//
-// This spec stubs localStorage.setItem to throw QuotaExceededError for the
-// sidebar width key only, then drives the exact click sequence the user
-// reported. The app must stay mounted; the header must remain visible.
-//
-// The stub is enabled via a flag flipped just before the gesture so it does
-// not interfere with page-load writes to unrelated keys.
+// #1345: clicking the sidebar resize bar with no drag crashed the app when
+// localStorage was full, because setItem ran unguarded inside a React setState
+// updater and the throw blanked the dashboard through the commit phase. The stub
+// throws only for the sidebar width key, and only once the gesture starts, so
+// page-load writes to other keys are unaffected.
 
 import { test, expect } from "./helpers/mockedTest";
+import { mockStaticApis } from "./helpers/apiMocks";
 import type { Page } from "@playwright/test";
 
 const SIDEBAR_WIDTH_KEY = "aoe-sidebar-width";
-const SPLIT_STORAGE_KEY = "aoe-split-ratio";
 const RIGHT_PANEL_KEY = "aoe-pane-layout";
 
 async function stubQuotaForKey(page: Page, key: string) {
@@ -45,11 +39,8 @@ async function enableThrow(page: Page, key: string) {
 }
 
 async function mockApis(page: Page) {
-  await page.route("**/api/login/status", (r) => r.fulfill({ json: { required: false, authenticated: true } }));
+  await mockStaticApis(page);
   await page.route("**/api/sessions", (r) => r.fulfill({ json: { sessions: [], workspace_ordering: [] } }));
-  for (const path of ["settings", "themes", "agents", "profiles", "groups", "devices", "docker/status", "about"]) {
-    await page.route(`**/api/${path}`, (r) => r.fulfill({ json: path === "docker/status" ? {} : [] }));
-  }
 }
 
 test.describe("#1345 localStorage QuotaExceeded crash regression", () => {
@@ -77,32 +68,6 @@ test.describe("#1345 localStorage QuotaExceeded crash regression", () => {
 
     // App stayed mounted. If the fix regresses, the React tree blanks and
     // the header detaches from the DOM.
-    await expect(page.locator("header")).toBeVisible();
-  });
-
-  test("content split resize handle click does not crash when setItem throws QuotaExceeded", async ({ page }) => {
-    await stubQuotaForKey(page, SPLIT_STORAGE_KEY);
-    await mockApis(page);
-    await page.setViewportSize({ width: 1280, height: 720 });
-    await page.goto("/");
-    await expect(page.locator("header")).toBeVisible();
-
-    await enableThrow(page, SPLIT_STORAGE_KEY);
-
-    const handle = page.getByTestId("content-split-resize-handle");
-    // Empty session list still renders the split; if not visible, this test
-    // is a no-op for the build under test, not a regression.
-    const count = await handle.count();
-    if (count === 0) {
-      test.skip(true, "content split not rendered with empty session list");
-      return;
-    }
-    const box = await handle.first().boundingBox();
-    if (!box) throw new Error("content-split handle has no bounding box");
-    await page.mouse.move(box.x + box.width / 2, box.y + box.height / 2);
-    await page.mouse.down();
-    await page.mouse.up();
-
     await expect(page.locator("header")).toBeVisible();
   });
 

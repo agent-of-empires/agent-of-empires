@@ -1,15 +1,10 @@
 // @vitest-environment jsdom
-//
-// Covers the mobile single-pane container (#1452): the back header, the
-// agent / paired / diff layers with their inert + visibility toggling, the
-// structured view vs terminal agent branch, the diff list vs viewer branch, and the
-// send-comments dialog. Heavy children are stubbed; this asserts the
-// container's own branching, which the Playwright suite then exercises live.
 
 import { describe, expect, it, vi } from "vitest";
-import { fireEvent, render, screen } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 
-import type { SessionResponse } from "../../lib/types";
+import type { DiffComparison, SessionResponse } from "../../lib/types";
+import { makeSession as baseSession } from "./fixtures";
 import type { useDiffComments } from "../../hooks/useDiffComments";
 
 vi.mock("../TerminalSessionStack", () => ({
@@ -19,7 +14,26 @@ vi.mock("../PairedTerminal", () => ({
   PairedShellPane: () => <div data-testid="paired-shell" />,
 }));
 vi.mock("../diff/DiffFileList", () => ({
-  DiffFileList: () => <div data-testid="diff-list" />,
+  DiffFileList: ({
+    comparison,
+    onComparisonChange,
+  }: {
+    comparison: DiffComparison;
+    onComparisonChange: (comparison: DiffComparison) => void;
+  }) => (
+    <div data-testid="diff-list">
+      <select
+        aria-label="Diff comparison"
+        value={comparison}
+        onChange={(event) => onComparisonChange(event.target.value as DiffComparison)}
+      >
+        <option value="base">Base</option>
+        <option value="origin_main">origin/main</option>
+        <option value="uncommitted">Uncommitted</option>
+        <option value="upstream">Tracking branch</option>
+      </select>
+    </div>
+  ),
 }));
 vi.mock("../diff/DiffFileViewer", () => ({
   DiffFileViewer: () => <div data-testid="diff-viewer" />,
@@ -37,30 +51,19 @@ vi.mock("../diff/comments/SendCommentsDialog", () => ({
 vi.mock("../acp/StructuredView", () => ({
   StructuredView: () => <div data-testid="acp-view" />,
 }));
+vi.mock("../acp/BackgroundAgentsPanel", () => ({
+  BackgroundAgentsPanel: ({ sessionId }: { sessionId: string | null }) => (
+    <div data-testid="background-agents-panel">{sessionId}</div>
+  ),
+}));
+vi.mock("../FilesPane", () => ({
+  FilesPane: ({ sessionId }: { sessionId: string | null }) => <div data-testid="files-pane">{sessionId}</div>,
+}));
 
 import { MobileMainPane } from "../MobileMainPane";
 
-function session(overrides: Partial<SessionResponse> = {}): SessionResponse {
-  return {
-    id: "s1",
-    title: "t",
-    project_path: "/tmp/t",
-    group_path: "/tmp",
-    tool: "claude",
-    status: "Running",
-    yolo_mode: false,
-    created_at: new Date().toISOString(),
-    last_accessed_at: null,
-    last_error: null,
-    branch: null,
-    main_repo_path: null,
-    is_sandboxed: false,
-    has_terminal: true,
-    profile: "default",
-    workspace_repos: [],
-    ...overrides,
-  } as SessionResponse;
-}
+const session = (overrides: Partial<SessionResponse> = {}) =>
+  baseSession({ id: "s1", title: "t", project_path: "/tmp/t", status: "Running", ...overrides });
 
 function makeStore(overrides: Partial<ReturnType<typeof useDiffComments>> = {}): ReturnType<typeof useDiffComments> {
   return {
@@ -85,6 +88,7 @@ function setup(overrides: Partial<Parameters<typeof MobileMainPane>[0]> = {}) {
     view: "agent",
     pluginPanes: [],
     onBackToAgent,
+    onOpenAgentsPane: vi.fn(),
     pairedMounted: false,
     activeSession: session(),
     activeSessionId: "s1",
@@ -119,12 +123,6 @@ function setup(overrides: Partial<Parameters<typeof MobileMainPane>[0]> = {}) {
 }
 
 describe("MobileMainPane", () => {
-  it("shows the agent terminal and no back header in structured view", () => {
-    setup({ view: "agent" });
-    expect(screen.getByTestId("agent-terminal")).toBeDefined();
-    expect(screen.queryByTestId("mobile-back-to-agent")).toBeNull();
-  });
-
   it("renders the structured view for structured view sessions", async () => {
     setup({ view: "agent", activeSession: session({ view: "structured" }) });
     // StructuredView is lazy-loaded behind Suspense, so await its resolution.
@@ -139,18 +137,48 @@ describe("MobileMainPane", () => {
 
   it("mounts the paired shell only once activated", () => {
     setup({ view: "agent", pairedMounted: false });
+    expect(screen.getByTestId("agent-terminal")).toBeDefined();
+    expect(screen.queryByTestId("mobile-back-to-agent")).toBeNull();
     expect(screen.queryByTestId("paired-shell")).toBeNull();
-  });
-
-  it("keeps the paired shell mounted after first activation", () => {
+    cleanup();
     setup({ view: "agent", pairedMounted: true });
     expect(screen.getByTestId("paired-shell")).toBeDefined();
   });
 
-  it("shows the diff file list in diff view", () => {
+  it("passes the active session to the agents and files panes", () => {
+    for (const [view, testId] of [
+      ["agents", "background-agents-panel"],
+      ["files", "files-pane"],
+    ] as const) {
+      setup({ view, activeSessionId: "s1" });
+      expect(screen.getByTestId(testId).textContent).toBe("s1");
+      expect(screen.getByTestId("mobile-back-to-agent")).toBeDefined();
+      cleanup();
+    }
+  });
+
+  it("shows the diff list, or the viewer when a file is selected", () => {
     setup({ view: "diff" });
     expect(screen.getByTestId("diff-list")).toBeDefined();
-    expect(screen.getByText("Diff")).toBeDefined();
+    cleanup();
+    setup({ view: "diff", selectedFilePath: "src/foo.ts" });
+    expect(screen.getByTestId("diff-viewer")).toBeDefined();
+    expect(screen.queryByTestId("diff-list")).toBeNull();
+  });
+  it("shows comparison choices on the mobile diff list and file viewer", () => {
+    const onComparisonChange = vi.fn();
+    setup({ view: "diff", onComparisonChange });
+    const listComparison = screen.getByRole("combobox", { name: "Diff comparison" });
+    expect(listComparison).toBeDefined();
+    fireEvent.change(listComparison, { target: { value: "upstream" } });
+    expect(onComparisonChange).toHaveBeenCalledWith("upstream");
+    cleanup();
+
+    setup({ view: "diff", selectedFilePath: "src/foo.ts", comparison: "uncommitted", onComparisonChange });
+    const viewerComparison = screen.getByRole("combobox", { name: "Diff comparison" });
+    expect((viewerComparison as HTMLSelectElement).value).toBe("uncommitted");
+    fireEvent.change(viewerComparison, { target: { value: "origin_main" } });
+    expect(onComparisonChange).toHaveBeenCalledWith("origin_main");
   });
 
   it("renders the plugin pane body and its title for a plugin view", () => {
@@ -173,12 +201,6 @@ describe("MobileMainPane", () => {
     expect(screen.getByTestId("mobile-back-to-agent")).toBeDefined();
   });
 
-  it("shows the diff viewer when a file is selected", () => {
-    setup({ view: "diff", selectedFilePath: "src/foo.ts" });
-    expect(screen.getByTestId("diff-viewer")).toBeDefined();
-    expect(screen.queryByTestId("diff-list")).toBeNull();
-  });
-
   it("shows the comments banner when there are comments", () => {
     setup({
       view: "diff",
@@ -197,26 +219,34 @@ describe("MobileMainPane", () => {
     expect(screen.getByTestId("send-dialog")).toBeDefined();
   });
 
-  it("on send: clears comments + drafts, closes the dialog and the open file", () => {
-    const onCloseSendDialog = vi.fn();
-    const onClearSelectedFile = vi.fn();
-    const store = makeStore({ clearAfterSend: true });
-    setup({
-      view: "diff",
-      commentsEnabled: true,
-      sendDialogOpen: true,
-      diffComments: store,
-      onCloseSendDialog,
-      onClearSelectedFile,
-    });
-    fireEvent.click(screen.getByTestId("send-dialog"));
-    expect(store.clearComments).toHaveBeenCalled();
-    expect(store.setIntroDraft).toHaveBeenCalledWith("");
-    expect(onCloseSendDialog).toHaveBeenCalled();
-    expect(onClearSelectedFile).toHaveBeenCalled();
+  it("on send clears comments + drafts, closes dialog and file, and returns only terminal sessions to agent", () => {
+    for (const [view, returnsToAgent] of [
+      ["structured", false],
+      ["terminal", true],
+    ] as const) {
+      const onCloseSendDialog = vi.fn();
+      const onClearSelectedFile = vi.fn();
+      const store = makeStore({ clearAfterSend: true });
+      const { onBackToAgent } = setup({
+        activeSession: session({ view }),
+        view: "diff",
+        commentsEnabled: true,
+        sendDialogOpen: true,
+        diffComments: store,
+        onCloseSendDialog,
+        onClearSelectedFile,
+      });
+      fireEvent.click(screen.getByTestId("send-dialog"));
+      expect(store.clearComments).toHaveBeenCalled();
+      expect(store.setIntroDraft).toHaveBeenCalledWith("");
+      expect(onCloseSendDialog).toHaveBeenCalled();
+      expect(onClearSelectedFile).toHaveBeenCalled();
+      expect(onBackToAgent).toHaveBeenCalledTimes(returnsToAgent ? 1 : 0);
+      cleanup();
+    }
   });
 
-  it("on send with clearAfterSend off: keeps comments but still closes", () => {
+  it("keeps comments when clearAfterSend is off while closing the dialog", () => {
     const onCloseSendDialog = vi.fn();
     const store = makeStore({ clearAfterSend: false });
     setup({

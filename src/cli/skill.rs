@@ -162,10 +162,6 @@ fn add(args: SkillAddArgs) -> Result<()> {
 
 fn edit(args: SkillEditArgs) -> Result<()> {
     let (home, app_dir) = skills_dirs()?;
-    // Every input path is bounded before it becomes a String. edit_skill
-    // enforces the same limit, but only after the whole input is already in
-    // memory, so an oversized file or an endless stdin stream would be read in
-    // full just to be rejected.
     let content = match args.file {
         Some(path) if path.as_os_str() == "-" => read_stdin_capped()?,
         Some(path) => skills_model::read_file_capped(&path, skills_model::MAX_SKILL_MD_BYTES)
@@ -207,9 +203,6 @@ fn edit_with_editor(
         .context("failed to read edited SKILL.md")
 }
 
-/// Read stdin, refusing more than the `SKILL.md` limit. Reads through one
-/// handle and rejects an overflow byte, so a stream that never ends cannot
-/// exhaust memory before validation runs.
 fn read_stdin_capped() -> Result<String> {
     let mut buf = Vec::new();
     std::io::stdin()
@@ -284,8 +277,6 @@ fn sync(args: SkillSyncArgs) -> Result<()> {
         }
     }
 
-    // A conflict is a normal, reportable result: the user's own file is intact.
-    // Only a genuine failure to write is worth a non-zero exit.
     let failed = outcomes
         .iter()
         .filter(|o| o.status == skills_model::SyncStatus::Error)

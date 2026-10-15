@@ -1,14 +1,5 @@
-// Shared body wrapper for tool-call cards. When the tool failed
-// (`status === "err"`), render the adapter's failure reason in a
-// dedicated error block and tuck the per-kind card's normal body
-// (e.g. the attempted Edit diff, parsed search match list, MCP input
-// payload) below it inside a collapsed `<details>`. When the tool
-// succeeded or is still running, render the per-kind body verbatim.
-//
-// Without this wrapper, cards with rich custom bodies (EditToolCard
-// most notably) drop the error text on the floor; the only signal
-// that anything went wrong is a tiny red status dot in the header.
-// See issue #1090.
+// On failure, shows the error and tucks the card's normal body into a collapsed
+// "attempted action"; otherwise renders the body as-is.
 
 import type { ReactNode } from "react";
 
@@ -16,14 +7,8 @@ import { describeToolErrorTag, parseToolError } from "../../lib/toolErrorParse";
 
 interface Props {
   status: "running" | "ok" | "err" | "stopped";
-  /** Raw `result.text` from the completion row. claude-agent-acp wraps
-   *  Claude's tool errors in `<tool_use_error>...</tool_use_error>`;
-   *  the parser peels the wrapper and surfaces it as a label outside
-   *  the error body so the source is clear. */
+  /** Raw result text; a `<tag>...</tag>` wrapper becomes a label chip. */
   errorText?: string;
-  /** The per-kind card's normal body. Rendered as-is on success;
-   *  shown below the error block in a collapsed `<details>` on error
-   *  (so power users can still inspect what was attempted). */
   children: ReactNode;
 }
 

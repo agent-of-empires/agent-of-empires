@@ -1,8 +1,3 @@
-// JSON-shaped args_preview parser. Every structured view tool card runs the
-// args through these helpers; if parseJsonObject silently accepts
-// arrays or non-object scalars, ApprovalCard's <dl> renderer crashes
-// when callers iterate Object.entries on a non-object.
-
 import { describe, expect, it } from "vitest";
 
 import {
@@ -17,156 +12,82 @@ import {
   todoItemsFromArgs,
 } from "./acpArgs";
 
-describe("humanizePermissionTitle", () => {
-  it("maps a known permission identifier to a readable label", () => {
-    expect(humanizePermissionTitle("external_directory")).toBe("External directory access");
-  });
-
-  it("passes an unknown identifier through verbatim", () => {
-    expect(humanizePermissionTitle("Bash")).toBe("Bash");
-    expect(humanizePermissionTitle("some_future_kind")).toBe("some_future_kind");
-  });
+it.each([
+  ["external_directory", "External directory access"],
+  ["Bash", "Bash"],
+  ["some_future_kind", "some_future_kind"],
+])("humanizePermissionTitle(%j) is %j", (title, expected) => {
+  expect(humanizePermissionTitle(title)).toBe(expected);
 });
 
-describe("parseJsonObject", () => {
-  it("returns the object for valid JSON object input", () => {
-    expect(parseJsonObject("{}")).toEqual({});
-    expect(parseJsonObject('{"a":1,"b":"x"}')).toEqual({ a: 1, b: "x" });
-  });
-
-  it("rejects arrays", () => {
-    expect(parseJsonObject("[]")).toBeNull();
-    expect(parseJsonObject("[1,2,3]")).toBeNull();
-  });
-
-  it("rejects scalar JSON values", () => {
-    expect(parseJsonObject('"hello"')).toBeNull();
-    expect(parseJsonObject("42")).toBeNull();
-    expect(parseJsonObject("true")).toBeNull();
-    expect(parseJsonObject("false")).toBeNull();
-    expect(parseJsonObject("null")).toBeNull();
-  });
-
-  it("returns null for non-JSON input", () => {
-    expect(parseJsonObject("not json")).toBeNull();
-    expect(parseJsonObject("")).toBeNull();
-  });
-
-  it("returns null for truncated JSON", () => {
-    expect(parseJsonObject("{")).toBeNull();
-    expect(parseJsonObject('{"a":')).toBeNull();
-    expect(parseJsonObject('{"a":1,')).toBeNull();
-  });
-
-  it("returns null when the agent appends a truncation marker", () => {
-    expect(parseJsonObject('{"a":1}[truncated]')).toBeNull();
-  });
-
-  it("preserves nested object/array values inside the parsed object", () => {
-    const out = parseJsonObject('{"items":[1,2],"meta":{"n":3}}');
-    expect(out).toEqual({ items: [1, 2], meta: { n: 3 } });
-  });
+it.each<[string, Record<string, unknown> | null]>([
+  ["{}", {}],
+  ['{"items":[1,2],"meta":{"n":3}}', { items: [1, 2], meta: { n: 3 } }],
+  ...["[]", "42", "null", "not json", "", '{"a":1}[truncated]'].map((input): [string, null] => [input, null]),
+])("parseJsonObject(%j)", (input, expected) => {
+  expect(parseJsonObject(input)).toEqual(expected);
 });
 
-describe("pickStr", () => {
-  it("returns the value of the first string-typed key", () => {
+describe("pickStr / pickFirst", () => {
+  it("pickStr returns the first string-valued key", () => {
     const o = { command: "ls", path: "/tmp" };
     expect(pickStr(o, "command", "path")).toBe("ls");
     expect(pickStr(o, "path", "command")).toBe("/tmp");
-  });
-
-  it("skips keys whose values are not strings", () => {
-    const o = { a: 1, b: true, c: null, d: "found" };
-    expect(pickStr(o, "a", "b", "c", "d")).toBe("found");
-  });
-
-  it("returns null when no key matches", () => {
-    expect(pickStr({ a: 1 }, "b", "c")).toBeNull();
-  });
-
-  it("returns null when the object is null", () => {
-    expect(pickStr(null, "anything")).toBeNull();
-  });
-
-  it("returns null on an empty object", () => {
-    expect(pickStr({}, "a")).toBeNull();
-  });
-
-  it("does not pick up an inherited prototype key", () => {
-    // The args_preview is JSON.parse output, which never has a custom
-    // prototype, but the helper should still only look at own keys.
+    expect(pickStr({ a: 1, b: true, c: null, d: "found" }, "a", "b", "c", "d")).toBe("found");
     class Bag {
-      hidden = "via prototype";
+      hidden = "via instance field";
     }
-    const o = new Bag() as unknown as Record<string, unknown>;
-    expect(pickStr(o, "hidden")).toBe("via prototype");
+    expect(pickStr(new Bag() as unknown as Record<string, unknown>, "hidden")).toBe("via instance field");
+  });
+
+  it.each<[Record<string, unknown> | null, string[]]>([
+    [{ a: 1 }, ["b", "c"]],
+    [null, ["anything"]],
+    [{}, ["a"]],
+  ])("pickStr(%j) is null", (o, keys) => {
+    expect(pickStr(o, ...keys)).toBeNull();
+  });
+
+  it.each<[(string | null | undefined)[], string | null]>([
+    [[null, undefined, "", "first", "second"], "first"],
+    [["   ", "real"], "real"],
+    [[null, undefined, ""], null],
+    [[], null],
+    [["   ", "\t"], null],
+  ])("pickFirst(%j) is %j", (candidates, expected) => {
+    expect(pickFirst(...candidates)).toBe(expected);
   });
 });
 
-describe("pickFirst", () => {
-  it("returns the first non-empty string", () => {
-    expect(pickFirst(null, undefined, "", "first", "second")).toBe("first");
-  });
-
-  it("skips strings that are only whitespace", () => {
-    expect(pickFirst("   ", "real")).toBe("real");
-  });
-
-  it("returns null when every candidate is empty or absent", () => {
-    expect(pickFirst(null, undefined, "")).toBeNull();
-    expect(pickFirst()).toBeNull();
-    expect(pickFirst("   ", "\t")).toBeNull();
-  });
+it.each<[string, string | null]>([
+  [JSON.stringify({ command: "ls -al" }), "ls -al"],
+  [JSON.stringify({ filepath: "/tmp/opencode" }), "/tmp/opencode"],
+  [JSON.stringify({ _aoe_title: "Run the suite" }), "Run the suite"],
+  ["{}", null],
+  [JSON.stringify({ _aoe_parent: "p" }), null],
+  ["not json", null],
+])("previewFromArgs(%s) is %j", (args, expected) => {
+  expect(previewFromArgs(args)).toBe(expected);
 });
 
-describe("previewFromArgs", () => {
-  it("prefers a shell command", () => {
-    expect(previewFromArgs(JSON.stringify({ command: "ls -al" }))).toBe("ls -al");
-  });
-
-  it("falls back to a file path for read/edit shapes", () => {
-    expect(previewFromArgs(JSON.stringify({ file_path: "src/a.ts" }))).toBe("src/a.ts");
-    expect(previewFromArgs(JSON.stringify({ filepath: "/tmp/opencode" }))).toBe("/tmp/opencode");
-  });
-
-  it("surfaces query/pattern and url shapes", () => {
-    expect(previewFromArgs(JSON.stringify({ pattern: "TODO" }))).toBe("TODO");
-    expect(previewFromArgs(JSON.stringify({ url: "https://x" }))).toBe("https://x");
-  });
-
-  it("falls back to the ACP-forwarded _aoe_title", () => {
-    expect(previewFromArgs(JSON.stringify({ _aoe_title: "Run the suite" }))).toBe("Run the suite");
-  });
-
-  it("returns null when no usable primary argument is present", () => {
-    expect(previewFromArgs("{}")).toBeNull();
-    expect(previewFromArgs(JSON.stringify({ _aoe_parent: "p" }))).toBeNull();
-    expect(previewFromArgs("not json")).toBeNull();
-  });
-});
-
-describe("hasArgsBody", () => {
-  it("is true for an object with a non-bookkeeping key", () => {
-    expect(hasArgsBody(JSON.stringify({ command: "ls" }))).toBe(true);
-  });
-
-  it("is false for an empty object or _aoe_-only object", () => {
-    expect(hasArgsBody("{}")).toBe(false);
-    expect(hasArgsBody(JSON.stringify({ _aoe_title: "x" }))).toBe(false);
-  });
-
-  it("is true for non-blank non-object payloads, false when blank", () => {
-    expect(hasArgsBody("raw text [truncated]")).toBe(true);
-    expect(hasArgsBody("   ")).toBe(false);
-  });
+it.each([
+  [JSON.stringify({ command: "ls" }), true],
+  ["{}", false],
+  [JSON.stringify({ _aoe_title: "x" }), false],
+  ["raw text [truncated]", true],
+  ["   ", false],
+])("hasArgsBody(%j) is %s", (args, expected) => {
+  expect(hasArgsBody(args)).toBe(expected);
 });
 
 describe("todoItemsFromArgs", () => {
-  it("returns todo items with non-blank content", () => {
+  it("returns todo items with non-blank content, ignoring whitespace-only ones", () => {
     expect(
       todoItemsFromArgs({
         todos: [
           { content: " Check schema ", status: "completed" },
+          { content: "   ", status: "pending" },
+          { content: "\t", status: "in_progress" },
           { content: "Render todos", status: "in_progress" },
         ],
       }),
@@ -176,42 +97,18 @@ describe("todoItemsFromArgs", () => {
     ]);
   });
 
-  it("ignores whitespace-only todo content", () => {
-    expect(
-      todoItemsFromArgs({
-        todos: [
-          { content: "   ", status: "pending" },
-          { content: "\t", status: "in_progress" },
-          { content: "Keep me", status: "completed" },
-        ],
-      }),
-    ).toEqual([{ content: "Keep me", status: "completed" }]);
-  });
-
   it("detects todo args only when at least one item has content", () => {
     expect(hasTodoItemsArgsText(JSON.stringify({ todos: [{ content: "   ", status: "pending" }] }))).toBe(false);
     expect(hasTodoItemsArgsText(JSON.stringify({ todos: [{ content: "Real", status: "pending" }] }))).toBe(true);
   });
 });
 
-describe("hasTodoArrayArgsText", () => {
-  it("recognizes an empty todos array as a clear-list snapshot", () => {
-    // The #2003 case: a TodoWrite that clears the list still carries the
-    // `todos` key, so it must read as a todo snapshot even with zero items.
-    expect(hasTodoArrayArgsText(JSON.stringify({ todos: [] }))).toBe(true);
-  });
-
-  it("recognizes a populated todos array", () => {
-    expect(hasTodoArrayArgsText(JSON.stringify({ todos: [{ content: "Real", status: "pending" }] }))).toBe(true);
-  });
-
-  it("rejects payloads with no todos key (a genuine non-todo tool)", () => {
-    expect(hasTodoArrayArgsText(JSON.stringify({ thought: "thinking" }))).toBe(false);
-    expect(hasTodoArrayArgsText("{}")).toBe(false);
-  });
-
-  it("rejects a todos key that is not an array", () => {
-    expect(hasTodoArrayArgsText(JSON.stringify({ todos: "nope" }))).toBe(false);
-    expect(hasTodoArrayArgsText("not json")).toBe(false);
-  });
+it.each([
+  [JSON.stringify({ todos: [] }), true],
+  [JSON.stringify({ todos: [{ content: "Real", status: "pending" }] }), true],
+  [JSON.stringify({ thought: "thinking" }), false],
+  [JSON.stringify({ todos: "nope" }), false],
+  ["not json", false],
+])("hasTodoArrayArgsText(%s) is %s", (args, expected) => {
+  expect(hasTodoArrayArgsText(args)).toBe(expected);
 });

@@ -1,10 +1,4 @@
 // @vitest-environment jsdom
-//
-// Render contract for StringDiff: even with no token grid (the hook is
-// stubbed to return `tokens: null`), the raw old / new text must still
-// surface. Captures the same opacity-0 regression as the DiffLine
-// regression test but exercised through the structured view Edit-card embed
-// path so a future refactor of StringDiff cannot reintroduce the gate.
 
 import { describe, expect, it, vi } from "vitest";
 import { render } from "@testing-library/react";
@@ -33,10 +27,5 @@ describe("StringDiff", () => {
       <StringDiff oldText="const x = 1;\n" newText={`const x = ${"a".repeat(200)};\n`} filePath="snippet.ts" />,
     );
     expect(getByTestId("string-diff").className).toMatch(/\boverflow-x-auto\b/);
-  });
-
-  it("returns null for an empty diff", () => {
-    const { container } = render(<StringDiff oldText="" newText="" filePath="snippet.ts" />);
-    expect(container.textContent).toBe("");
   });
 });

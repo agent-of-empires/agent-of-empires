@@ -1,5 +1,6 @@
 import { test, expect, type Page } from "./helpers/mockedTest";
-import { clickSidebarSession, openMobileSidebar } from "./helpers/sidebar";
+import { mockStructuredSessionApis, openStructuredViewFor } from "./helpers/structuredSessionMocks";
+import { sessionResponse } from "./helpers/sessions";
 
 // Queue-recall behavior for the structured-view composer (#2147), driven
 // through the real component in mocked mode so the ArrowUp/ArrowDown
@@ -13,75 +14,53 @@ import { clickSidebarSession, openMobileSidebar } from "./helpers/sidebar";
 const SESSION_ID = "sess-acp-recall";
 const TITLE = "acp-recall";
 
-async function setup(page: Page) {
-  await page.route("**/api/login/status", (r) => r.fulfill({ json: { required: false, authenticated: true } }));
-  for (const path of [
-    "settings",
-    "themes",
-    "agents",
-    "profiles",
-    "groups",
-    "devices",
-    "docker/status",
-    "about",
-    "system/update-status",
-  ]) {
-    await page.route(`**/api/${path}`, (r) =>
-      r.fulfill({
-        json:
-          path === "docker/status" || path === "about" || path === "settings" || path === "system/update-status"
-            ? {}
-            : [],
-      }),
-    );
-  }
-  await page.route("**/api/sessions", (r) => {
-    if (r.request().method() === "POST") return r.fulfill({ status: 400 });
-    return r.fulfill({
-      json: {
-        sessions: [
-          {
-            id: SESSION_ID,
-            title: TITLE,
-            project_path: "/tmp/acp-recall",
-            group_path: "/tmp",
-            tool: "claude",
-            status: "Running",
-            yolo_mode: false,
-            created_at: new Date().toISOString(),
-            last_accessed_at: null,
-            last_error: null,
-            branch: null,
-            main_repo_path: null,
-            is_sandboxed: false,
-            has_terminal: true,
-            profile: "default",
-            workspace_repos: [],
-            view: "structured",
-            acp_worker_state: "running",
-            claude_fullscreen: false,
-          },
-        ],
-        workspace_ordering: [],
-      },
+async function setup(page: Page, includeSibling = false) {
+  await mockStructuredSessionApis(page, { id: SESSION_ID, title: TITLE, projectPath: "/tmp/acp-recall" });
+  if (includeSibling) {
+    await page.route("**/api/sessions", (r) => {
+      if (r.request().method() === "POST") return r.fulfill({ status: 400 });
+      return r.fulfill({
+        json: {
+          sessions: [
+            sessionResponse({
+              id: SESSION_ID,
+              title: TITLE,
+              project_path: "/tmp/acp-recall",
+              branch: "focus-branch",
+              status: "Running",
+              view: "structured",
+              acp_worker_state: "running",
+              claude_fullscreen: false,
+            }),
+            sessionResponse({
+              id: "sess-acp-sibling",
+              title: `${TITLE} sibling`,
+              project_path: "/tmp/acp-recall",
+              branch: "focus-branch",
+              status: "Stopped",
+              view: "structured",
+              acp_worker_state: "stopped",
+              claude_fullscreen: false,
+            }),
+          ],
+          workspace_ordering: [],
+        },
+      });
     });
+  }
+  // The daemon owns the send / queue decision (Tier 3): the first prompt opens
+  // the turn and every follow-up parks behind it. Registered after the shared
+  // acp/** route so it wins Playwright's reverse-registration-order matching.
+  let promptPosts = 0;
+  await page.route(/\/acp\/prompt(\?|$)/, (r) => {
+    promptPosts += 1;
+    if (promptPosts === 1) return r.fulfill({ json: { disposition: "sent" } });
+    const id = `srv-q${promptPosts}`;
+    return r.fulfill({ json: { disposition: "queued", reason: "turn_active", queued_id: id } });
   });
-  await page.route("**/api/sessions/*/ensure", (r) => r.fulfill({ json: { ok: true } }));
-  // Prompt POSTs + replay succeed (empty), so the optimistic send sticks.
-  await page.route("**/api/sessions/*/acp/**", (r) => r.fulfill({ json: {} }));
-  // Accept both sockets as open-but-silent: the session reads as connected
-  // so the first Enter sends (turn active) and the rest queue.
-  await page.routeWebSocket(/\/sessions\/[^/]+\/ws(\?|$)/, () => {});
-  await page.routeWebSocket(/\/sessions\/[^/]+\/acp\/ws/, () => {});
 }
 
-async function openStructuredSession(page: Page) {
-  await page.goto("/");
-  await expect(page.locator("header")).toBeVisible();
-  await openMobileSidebar(page);
-  await clickSidebarSession(page, TITLE);
-  await expect(page.getByTestId("structured-view-root")).toBeVisible({ timeout: 10000 });
-}
+const openStructuredSession = (page: Page) => openStructuredViewFor(page, TITLE);
 
 test.describe("Structured-view composer queue recall (#2147)", () => {
   test("ArrowUp recalls queued prompts, banner + Esc + edit-in-place", async ({ page }) => {
@@ -144,5 +123,20 @@ test.describe("Structured-view composer queue recall (#2147)", () => {
     await expect(page.getByRole("button", { name: /^second queued$/ })).toHaveCount(0);
     await expect(page.getByRole("button", { name: /^first queued$/ })).toBeVisible();
     await expect(page.getByText(/Editing queued message/)).toHaveCount(0);
+  });
+
+  test("Ctrl+Q focuses the active workspace row even when its link targets another session", async ({ page }) => {
+    await setup(page, true);
+    await page.goto("/session/sess-acp-sibling");
+    await expect(page.getByTestId("structured-view-root")).toBeVisible({ timeout: 10000 });
+
+    const activeRow = page.getByRole("navigation", { name: "Sessions sidebar" }).locator("[data-active-session-row]");
+    await expect(activeRow).toHaveAttribute("href", "/session/sess-acp-recall");
+    await expect(activeRow).not.toHaveAttribute("aria-current");
+
+    const composer = page.locator("[data-session-composer] textarea");
+    await composer.focus();
+    await page.keyboard.press("Control+q");
+    await expect(activeRow).toBeFocused();
   });
 });

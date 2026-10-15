@@ -4,40 +4,35 @@ import { dispatchThemePickerChanged } from "../../hooks/useResolvedTheme";
 import type { AgentInfo, SettingsFieldDescriptor } from "../../lib/types";
 import { SelectField, SliderField, TextField } from "./FormFields";
 
-/** Props every custom settings widget receives. A custom widget renders one
- *  schema field whose `widget.kind === "custom"`; it owns any bespoke encoding
- *  and any widget-specific post-save side-effect (e.g. repainting the
- *  dashboard after a theme change). Section-level effects (the acp
- *  serverAbout refresh) live in SchemaSection's `onAfterSave`, not here. */
 export interface CustomWidgetProps {
   descriptor: SettingsFieldDescriptor;
   value: unknown;
-  /** Persist this field. Mirrors `onSaveField` bound to (section, field).
-   *  Returns the save result (a Promise<boolean> in practice) so a widget can
-   *  gate a side-effect on success. */
+  /** Returns the save result so a widget can gate side effects on success. */
   save: (value: unknown) => Promise<boolean> | unknown;
 }
 
 export type CustomSettingsWidget = (props: CustomWidgetProps) => React.ReactElement;
 
-/** Resolve a save result (Promise<boolean> | unknown) to a success boolean.
- *  A non-Promise return is treated as success unless it is literally `false`,
- *  so widgets stay correct whether `onSaveField` is async or sync. */
 async function didSave(result: Promise<boolean> | unknown): Promise<boolean> {
   if (result instanceof Promise) return await result;
   return result !== false;
 }
 
-/** Theme picker. Options come from the live theme list (builtins plus custom
- *  `~/.agent-of-empires/themes/*.toml`); a successful save repaints the
- *  dashboard chrome. The repaint only fires after the PATCH lands so a failed
- *  save (elevation missing, read-only, network) does not paint a theme that
- *  is not on disk (#1510). */
+/** Installed agents that support one-shot calls; empty if the fetch fails. */
+function useOneshotAgents(): AgentInfo[] {
+  const [agents, setAgents] = useState<AgentInfo[]>([]);
+  useEffect(() => {
+    fetchAgents()
+      .then(setAgents)
+      .catch(() => setAgents([]));
+  }, []);
+  return agents.filter((a) => a.installed && a.oneshot_capable);
+}
+
+/** Theme picker; repaints only after the save succeeds. */
 export function ThemeNameWidget({ descriptor, value, save }: CustomWidgetProps) {
   const [themes, setThemes] = useState<string[]>([]);
   useEffect(() => {
-    // Degrade to an empty list if the theme fetch fails; never leave an
-    // unhandled rejection.
     fetchThemes()
       .then(setThemes)
       .catch(() => setThemes([]));
@@ -57,15 +52,13 @@ export function ThemeNameWidget({ descriptor, value, save }: CustomWidgetProps) 
   );
 }
 
-/** Default agent picker. The web keeps a free-text field (empty = auto-detect)
- *  rather than the TUI's agent-name select, matching prior behavior. */
+/** Free-text default agent; empty means auto-detect. */
 export function DefaultToolWidget({ descriptor, value, save }: CustomWidgetProps) {
   return (
     <TextField
       label={descriptor.label}
       description={descriptor.description}
       value={typeof value === "string" ? value : ""}
-      // Empty clears the override (and falls back to auto-detect).
       onChange={(v) => save(v || null)}
       placeholder="Auto-detect"
       mono
@@ -73,22 +66,11 @@ export function DefaultToolWidget({ descriptor, value, save }: CustomWidgetProps
   );
 }
 
-/** Utility agent picker (smart rename + conversation summary). Lists
- *  installed one-shot-capable agents plus a "Same as session" default (empty
- *  string), so one-shot utility calls can be pointed at a cheaper or more
- *  obedient model than the session's own agent. Mirrors the TUI
- *  `smart-rename-agent` widget; the install + one-shot filter keeps the
- *  dropdown to agents the one-shot would actually work on. */
+/** Agent for one-shot utility calls; empty means the session's agent. */
 export function SmartRenameAgentWidget({ descriptor, value, save }: CustomWidgetProps) {
-  const [agents, setAgents] = useState<AgentInfo[]>([]);
-  useEffect(() => {
-    fetchAgents()
-      .then(setAgents)
-      .catch(() => setAgents([]));
-  }, []);
   const options = [
     { value: "", label: "Same as session" },
-    ...agents.filter((a) => a.installed && a.oneshot_capable).map((a) => ({ value: a.name, label: a.name })),
+    ...useOneshotAgents().map((a) => ({ value: a.name, label: a.name })),
   ];
   return (
     <SelectField
@@ -101,8 +83,7 @@ export function SmartRenameAgentWidget({ descriptor, value, save }: CustomWidget
   );
 }
 
-/** Playback volume. A float slider (0.1 to 1.5); the generic `slider` widget
- *  is integer-only, so this stays a custom control. */
+/** Float volume slider; the generic slider is integer-only. */
 export function SoundVolumeWidget({ descriptor, value, save }: CustomWidgetProps) {
   return (
     <SliderField
@@ -118,10 +99,7 @@ export function SoundVolumeWidget({ descriptor, value, save }: CustomWidgetProps
   );
 }
 
-// Mirrors `KNOWN_SUB_TARGETS` in src/logging.rs. Keeping this list hardcoded
-// (rather than fetched) is intentional: it is the curated dropdown surface;
-// advanced users can still edit `config.toml` directly or hit
-// `PATCH /api/log-level` for arbitrary EnvFilter directives.
+// Mirrors `KNOWN_SUB_TARGETS` in src/logging.rs.
 const KNOWN_TARGETS: { value: string; group: string }[] = [
   { value: "acp.protocol", group: "Structured view" },
   { value: "acp.protocol.stderr", group: "Structured view" },
@@ -164,9 +142,7 @@ const LEVELS = [
   { value: "error", label: "error" },
 ];
 
-/** Per-target log-level matrix. The `targets` field is a `{ target: level }`
- *  map; setting a row to "(default)" removes its override and inherits the
- *  baseline level. */
+/** `{ target: level }` map; "(default)" removes the override. */
 export function LoggingTargetsWidget({ descriptor, value, save }: CustomWidgetProps) {
   const targets = (value ?? {}) as Record<string, string>;
   const saveTarget = (target: string, level: string) => {
@@ -206,21 +182,9 @@ export function LoggingTargetsWidget({ descriptor, value, save }: CustomWidgetPr
   );
 }
 
-/** Per-agent model for the smart-rename title one-shot. The `smart_rename_model`
- *  field is an `{ agent: model }` map; one free-text row per installed
- *  one-shot-capable agent. Clearing a row removes the key, so the agent falls
- *  back to its built-in default (claude pins `haiku`, others the CLI default).
- *  The third "force CLI default" state (an explicit empty-string value, opting
- *  out of the built-in pin) is only meaningful for claude and is settable via
- *  the TUI or config.toml, not this widget. Ids are free-form because AoE pins
- *  no CLI version. */
+/** `{ agent: model }` map for one-shot calls; clearing a row restores the built-in default. */
 export function SmartRenameModelWidget({ descriptor, value, save }: CustomWidgetProps) {
-  const [agents, setAgents] = useState<AgentInfo[]>([]);
-  useEffect(() => {
-    fetchAgents()
-      .then(setAgents)
-      .catch(() => setAgents([]));
-  }, []);
+  const tunable = useOneshotAgents();
   const models = (value ?? {}) as Record<string, string>;
   const saveModel = (agent: string, model: string) => {
     const next = { ...models };
@@ -232,7 +196,6 @@ export function SmartRenameModelWidget({ descriptor, value, save }: CustomWidget
     }
     save(next);
   };
-  const tunable = agents.filter((a) => a.installed && a.oneshot_capable);
   return (
     <div className="space-y-4">
       <h4 className="text-sm font-semibold text-text-primary">{descriptor.label}</h4>

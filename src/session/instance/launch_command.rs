@@ -1,0 +1,3187 @@
+//! Building the shell command a session launches with.
+
+use super::*;
+
+pub(super) struct LaunchCommandParts {
+    command: Option<String>,
+    is_existing: bool,
+    omp_capture_plan: Option<OmpCapturePlan>,
+    launch_env: LaunchEnvironment,
+    fork_mints_child: bool,
+}
+
+#[derive(Default)]
+pub(super) struct LaunchEnvironment {
+    pub(super) pane: Vec<tmux::PaneEnvMutation>,
+    pub(super) container: Vec<(String, String)>,
+}
+
+pub(super) struct PreparedLaunch {
+    pub(super) command: Option<String>,
+    pub(super) is_existing: bool,
+    pub(super) omp_capture_plan: Option<OmpCapturePlan>,
+    pub(super) fork_mints_child: bool,
+    pub(super) launch_env: LaunchEnvironment,
+    pub(super) expected_conversation: ConversationState,
+    pub(super) sandbox_context_reset: Option<(String, Vec<String>)>,
+    pub(super) canonical_conversation: Option<ConversationState>,
+    pub(super) expected_prior_omp_generation: Option<String>,
+    pub(super) execution: Option<super::execution::NativeExecution>,
+    /// Relocated and store-adopted conversations require durable confirmation.
+    pub(super) require_conversation_publication: bool,
+}
+
+fn prepared_fork_mints_child(
+    agent: Option<&'static crate::agents::AgentDef>,
+    intent: &ResumeIntent,
+    context: &super::execution::AgentLaunchContext<'_>,
+) -> bool {
+    matches!(intent, ResumeIntent::Fork { .. })
+        && agent.is_some_and(|agent| {
+            agent
+                .fork_strategy
+                .resolve(context.generation())
+                .is_some_and(|strategy| strategy.mints_child())
+        })
+}
+
+fn resolved_yolo(
+    agent: &'static crate::agents::AgentDef,
+    launch_context: &super::execution::AgentLaunchContext<'_>,
+) -> Option<&'static crate::agents::YoloMode> {
+    let yolo = agent.yolo.as_ref()?;
+    let generation = launch_context.generation();
+    match yolo.resolve(generation) {
+        Some(resolved) => Some(resolved),
+        None => {
+            // Neither spelling can be claimed for a build whose help never
+            // answered, and sending the wrong one is silently inert.
+            tracing::warn!(target: "session.store", tool = agent.name,
+                "agent --help did not answer, so its approval mechanism cannot be established; \
+                 the launch runs without it");
+            None
+        }
+    }
+}
+
+fn prime_runtime_for_capture(
+    capture: Option<&CaptureContext>,
+) -> Option<&crate::process::prime::PrimeRuntime> {
+    match capture? {
+        CaptureContext::Prime { runtime, .. } => runtime.as_ref(),
+        CaptureContext::PrimeStatus(runtime) => Some(runtime),
+        _ => None,
+    }
+}
+
+fn wrap_prime_launch(
+    command: &str,
+    execution: Option<&super::execution::NativeExecution>,
+    daemon_command: Option<&str>,
+    rewind_container_env: bool,
+) -> Result<String> {
+    let Some(runtime) =
+        execution.and_then(|execution| prime_runtime_for_capture(execution.capture.as_ref()))
+    else {
+        return Ok(command.to_owned());
+    };
+    let exe = std::env::current_exe()?;
+    let encoded = serde_json::to_string(runtime)?;
+    let daemon = daemon_command
+        .map(|command| {
+            format!(
+                " --daemon-command {}",
+                crate::session::environment::shell_escape_script_word(command)
+            )
+        })
+        .unwrap_or_default();
+    let rewind = if rewind_container_env {
+        " --rewind-container-env"
+    } else {
+        ""
+    };
+    Ok(format!(
+        "{} __prime-agent --runtime {}{}{rewind} -- sh -c {}",
+        shell_escape(&exe.to_string_lossy()),
+        shell_escape(&encoded),
+        daemon,
+        crate::session::environment::shell_escape_script_word(command)
+    ))
+}
+
+/// Append yolo-mode flags or environment variables to a launch command.
+fn apply_yolo_mode(cmd: &mut String, yolo: &crate::agents::YoloMode, is_sandboxed: bool) {
+    match yolo {
+        crate::agents::YoloMode::CliFlag(flag) => {
+            *cmd = format!("{} {}", cmd, flag);
+        }
+        crate::agents::YoloMode::EnvVar(key, value) if !is_sandboxed => {
+            *cmd = format_env_var_prefix(key, value, cmd);
+        }
+        crate::agents::YoloMode::EnvVar(..)
+        | crate::agents::YoloMode::AlwaysYolo
+        | crate::agents::YoloMode::EitherGeneration { .. } => {}
+    }
+}
+
+/// Format an environment variable assignment as a shell-safe command prefix.
+fn format_env_var_prefix(key: &str, value: &str, cmd: &str) -> String {
+    let escaped = shell_escape(value);
+    format!("{}={} {}", key, escaped, cmd)
+}
+
+/// Append the agent's session-name flag with the title typed in the New Session dialog, on the
+/// first launch only and when `session.name_agent_session` is on.
+fn apply_first_launch_agent_name(
+    cmd: &mut String,
+    agent: Option<&crate::agents::AgentDef>,
+    inst: &Instance,
+    execution: Option<&super::execution::NativeExecution>,
+    resumes: bool,
+) {
+    // A resumed conversation may carry a name the user gave it inside the agent.
+    let Some(agent) = agent.filter(|_| inst.first_launch_names_agent && !resumes) else {
+        return;
+    };
+    let title = inst.title.trim();
+    // A leading hyphen reads as another flag to the agent's parser, which rejects the launch.
+    if title.is_empty() || title.starts_with('-') {
+        return;
+    }
+    if !crate::session::config::profile_config::resolve_config_or_warn(&inst.effective_profile())
+        .session
+        .name_agent_session
+    {
+        return;
+    }
+    // Only an attested direct host executable admits name injection.
+    let Some(execution) = execution.filter(|execution| {
+        execution
+            .inputs
+            .runs_host_path_binary(agent.binary, &execution.program)
+    }) else {
+        return;
+    };
+    if let Some(flag) = agent.supported_session_name_flag(&execution.host_command()) {
+        cmd.push_str(&format!(" {} {}", flag, shell_escape(title)));
+    }
+}
+
+/// Write the Pi session-id extension into the app dir and return its path.
+pub(super) fn session_identity_extension_path() -> Result<PathBuf> {
+    const SOURCE: &str = crate::session::instance::SESSION_IDENTITY_EXTENSION;
+    let root = crate::session::get_app_dir()?;
+    let rel = Path::new("agent-extensions").join("pi-aoe-session-id.js");
+    let path = root.join(&rel);
+    if std::fs::read_to_string(&path).ok().as_deref() != Some(SOURCE) {
+        crate::session::replace_file_no_follow(&root, &rel, SOURCE.as_bytes())?;
+    }
+    Ok(path)
+}
+
+/// Whether a host `environment` list assigns `PATH`.
+pub(super) fn environment_defines_path(environment: &[String]) -> bool {
+    environment.iter().any(|entry| {
+        entry
+            .split_once('=')
+            .is_some_and(|(key, _)| key.trim() == "PATH")
+    })
+}
+
+pub(super) fn build_resume_flags(
+    tool: &str,
+    session_id: &str,
+    is_existing_session: bool,
+) -> String {
+    use crate::agents::{get_agent, ResumeStrategy};
+
+    if !is_valid_session_id(session_id) {
+        tracing::warn!(target: "session.store",
+            "Refusing to build resume flags: invalid session ID {:?}",
+            session_id
+        );
+        return String::new();
+    }
+    let Some(agent) = get_agent(tool) else {
+        return String::new();
+    };
+    let Some(support) = agent.session_support.as_ref() else {
+        tracing::info!(target: "session.store",
+            tool = %tool,
+            sid = %session_id,
+            "session resume is disabled for this agent; stored ID left unused"
+        );
+        return String::new();
+    };
+    match &support.resume {
+        ResumeStrategy::Flag(flag) => format!("{} {}", flag, session_id),
+        ResumeStrategy::FlagPair {
+            existing,
+            new_session,
+        } => {
+            let flag = if is_existing_session {
+                existing
+            } else {
+                new_session
+            };
+            format!("{} {}", flag, session_id)
+        }
+        ResumeStrategy::Subcommand(sub) => format!("{} {}", sub, session_id),
+    }
+}
+
+/// Build the launch flags for a one-shot terminal fork. Returns the empty string for an unforkable
+/// agent, an invalid id, or an agent whose store mints the child over its own API (mirroring
+/// `build_resume_flags`'s fail-closed contract).
+pub(super) fn build_fork_flags(
+    tool: &str,
+    parent_id: &str,
+    child_id: &str,
+    generation: crate::agents::AgentGeneration,
+) -> String {
+    use crate::agents::{get_agent, ForkStrategy};
+
+    if !is_valid_session_id(parent_id) || !is_valid_session_id(child_id) {
+        tracing::warn!(target: "session.store",
+            "Refusing to build fork flags: invalid id (parent={parent_id:?} child={child_id:?})");
+        return String::new();
+    }
+    let Some(agent) = get_agent(tool) else {
+        return String::new();
+    };
+    let Some(strategy) = agent.fork_strategy.resolve(generation) else {
+        return String::new();
+    };
+    match strategy {
+        ForkStrategy::ClaudeFork => {
+            format!("--resume {parent_id} --fork-session --session-id {child_id}")
+        }
+        ForkStrategy::PiFork => format!("--fork {parent_id} --session-id {child_id}"),
+        ForkStrategy::CodexFork => {
+            // Codex mints its own forked id; child_id is unused. The subcommand
+            // is inserted after the binary by apply_session_flags.
+            format!("fork {parent_id}")
+        }
+        // The child already exists in the store before this launch, so the
+        // command opens it instead of asking the agent to fork.
+        ForkStrategy::Flag(fork_flag) => {
+            // Resume the parent session (using the agent's own resume flag),
+            // then add the fork flag; the agent mints the new id.
+            match agent.session_support.as_ref().map(|support| support.resume) {
+                Some(crate::agents::ResumeStrategy::Flag(resume_flag)) => {
+                    format!("{resume_flag} {parent_id} {fork_flag}")
+                }
+                _ => String::new(),
+            }
+        }
+        ForkStrategy::ServeFork
+        | ForkStrategy::EitherGeneration { .. }
+        | ForkStrategy::Unsupported => String::new(),
+    }
+}
+
+pub(super) struct ParsedLaunchCommand {
+    pub(super) words: Vec<String>,
+    pub(super) executable_end: usize,
+}
+
+pub(super) fn parse_launch_command(command: &str) -> Option<ParsedLaunchCommand> {
+    let words = shell_words::split(command).ok()?;
+    words.first()?;
+
+    let mut started = false;
+    let mut quote = None;
+    let mut escaped = false;
+    for (offset, ch) in command.char_indices() {
+        let separator = matches!(ch, ' ' | '\t' | '\n' | '\r');
+        if !started {
+            if separator {
+                continue;
+            }
+            started = true;
+        }
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        match quote {
+            Some('\'') => {
+                if ch == '\'' {
+                    quote = None;
+                }
+            }
+            Some('"') => match ch {
+                '"' => quote = None,
+                '\\' => escaped = true,
+                _ => {}
+            },
+            _ => match ch {
+                '\'' | '"' => quote = Some(ch),
+                '\\' => escaped = true,
+                _ if separator => {
+                    return Some(ParsedLaunchCommand {
+                        words,
+                        executable_end: offset,
+                    });
+                }
+                _ => {}
+            },
+        }
+    }
+    Some(ParsedLaunchCommand {
+        words,
+        executable_end: command.len(),
+    })
+}
+
+/// Insert a subcommand at the parsed executable boundary, or append flags.
+pub(super) fn splice_subcommand_or_append(
+    cmd: &mut String,
+    part: &str,
+    subcommand_at: Option<usize>,
+) {
+    cmd.reserve(part.len() + 1);
+    if let Some(offset) = subcommand_at {
+        cmd.insert_str(offset, part);
+        cmd.insert(offset, ' ');
+    } else {
+        cmd.push(' ');
+        cmd.push_str(part);
+    }
+}
+
+pub(super) fn append_resume_flags(
+    tool: &str,
+    session_id: Option<&str>,
+    is_existing_session: bool,
+    cmd: &mut String,
+    executable_end: usize,
+    context: &str,
+) -> bool {
+    use crate::agents::{get_agent, ResumeStrategy};
+
+    if let Some(session_id) = session_id {
+        let resume_part = build_resume_flags(tool, session_id, is_existing_session);
+        if resume_part.is_empty() {
+            return false;
+        }
+        let subcommand_at = matches!(
+            get_agent(tool).and_then(|agent| agent.session_support.as_ref()),
+            Some(crate::agents::SessionSupport {
+                resume: ResumeStrategy::Subcommand(_),
+                ..
+            })
+        )
+        .then_some(executable_end);
+        splice_subcommand_or_append(cmd, &resume_part, subcommand_at);
+        tracing::debug!(target: "session.store", "Added resume flags to {} command: {}", context, resume_part);
+        return true;
+    }
+    false
+}
+
+/// Prepend agent-specific environment overrides to a launch command.
+fn apply_agent_launch_env(cmd: &mut String, agent: Option<&'static crate::agents::AgentDef>) {
+    if !matches!(agent.map(|a| a.name), Some("antigravity" | "codex")) {
+        return;
+    }
+
+    *cmd = format!(
+        "env -u NO_COLOR TERM=xterm-256color COLORTERM=truecolor {}",
+        cmd
+    );
+}
+
+/// Run a script through a dedicated descriptor so its size is not constrained by the per-argument
+/// exec limit and the launched agent retains the pane TTY on standard input.
+pub(super) fn shell_stdin_command(shell: &str, login: bool, script: &str, stem: &str) -> String {
+    let delimiter = heredoc_delimiter(script, stem);
+    let flag = if login { "-l " } else { "" };
+    format!(
+        "{} {flag}/dev/fd/3 3<<'{delimiter}'\n{script}\n{delimiter}",
+        shell_escape(shell)
+    )
+}
+
+fn heredoc_delimiter(body: &str, stem: &str) -> String {
+    let mut delimiter = stem.to_owned();
+    while body.lines().any(|line| line == delimiter) {
+        delimiter.push('_');
+    }
+    delimiter
+}
+
+/// Disable terminal suspension before replacing the pane process with the requested command.
+/// Restore cwd and native routing after the login shell's startup files.
+pub(super) fn wrap_command_ignore_suspend(
+    cmd: &str,
+    working_dir: &str,
+    routing: &[(String, Option<String>)],
+    case_insensitive_routing: &[&str],
+) -> String {
+    let user = crate::session::environment::user_shell();
+    let posix = crate::session::environment::user_posix_shell();
+    let mut script = execution_context(working_dir, routing, case_insensitive_routing);
+    script.push_str(&format!("stty susp undef\nexec env {cmd}"));
+    shell_stdin_command(&posix, user == posix, &script, "AOE_LAUNCH_BODY")
+}
+
+fn pin_host_program(cmd: &mut String, snapshot: &std::process::Command) -> Result<()> {
+    let mut words = shell_words::split(cmd)?;
+    *words.first_mut().context("host program is missing")? = snapshot
+        .get_program()
+        .to_str()
+        .context("host executable path is not UTF-8")?
+        .to_owned();
+    *cmd = shell_words::join(words);
+    Ok(())
+}
+
+fn wrap_bound_opencode_command(
+    cmd: &str,
+    working_dir: &str,
+    snapshot: &std::process::Command,
+) -> Result<String> {
+    let mut environment = Vec::with_capacity(snapshot.get_envs().size_hint().0);
+    for (key, value) in snapshot.get_envs() {
+        if crate::process::LIVE_PANE_ENV_KEYS
+            .iter()
+            .any(|live| key == std::ffi::OsStr::new(live))
+        {
+            continue;
+        }
+        if let Some(value) = value {
+            environment.push((
+                crate::process::frozen_environment_value(key),
+                crate::process::frozen_environment_value(value),
+            ));
+        }
+    }
+    let cwd = snapshot
+        .get_current_dir()
+        .and_then(std::path::Path::to_str)
+        .context("OpenCode launch cwd is not UTF-8")?;
+    let argv = shell_words::split(cmd).context("parsing OpenCode launch argv")?;
+    let payload = serde_json::to_string(&crate::process::NativeLaunchPayload {
+        argv,
+        cwd,
+        environment,
+    })?;
+    wrap_opencode_payload(&payload, working_dir, true)
+}
+
+fn wrap_unbound_opencode_yolo_command(
+    cmd: &str,
+    working_dir: &str,
+    overrides: &[(String, String)],
+) -> Result<String> {
+    let payload = serde_json::to_string(&crate::process::NativeLaunchPayload {
+        argv: shell_words::split(cmd)?,
+        cwd: working_dir,
+        environment: overrides
+            .iter()
+            .map(|(key, value)| (key.as_str(), value.as_str()))
+            .collect(),
+    })?;
+    wrap_opencode_payload(&payload, working_dir, false)
+}
+
+fn wrap_opencode_payload(payload: &str, working_dir: &str, frozen: bool) -> Result<String> {
+    let user = crate::session::environment::user_shell();
+    let posix = crate::session::environment::user_posix_shell();
+    let mut script = execution_context(working_dir, &[], &[]);
+    script.push_str("stty susp undef\n");
+    if frozen {
+        script.push_str("set --");
+        for key in crate::process::LIVE_PANE_ENV_KEYS {
+            script.push_str(&format!(
+                "\nif [ \"${{{key}+x}}\" = x ]; then set -- \"$@\" \"{key}=${key}\"; fi"
+            ));
+        }
+        script.push_str("\nexec /usr/bin/env -i -- \"$@\" ");
+    } else {
+        script.push_str("exec ");
+    }
+    let delimiter = heredoc_delimiter(payload, "AOE_NATIVE_LAUNCH");
+    let executable = crate::process::executable_for_native_launch()
+        .context("resolving AoE executable for native launch")?;
+    let executable = executable
+        .to_str()
+        .context("AoE executable path is not UTF-8")?;
+    let helper = if frozen {
+        "__frozen-env"
+    } else {
+        "__opencode-yolo"
+    };
+    script.push_str(&format!(
+        "{} {helper} 3<&- 4<<'{delimiter}'\n{payload}\n{delimiter}",
+        crate::session::environment::shell_escape_script_word(executable)
+    ));
+    Ok(shell_stdin_command(
+        &posix,
+        user == posix,
+        &script,
+        "AOE_LAUNCH_BODY",
+    ))
+}
+
+fn execution_context(
+    working_dir: &str,
+    routing: &[(String, Option<String>)],
+    case_insensitive_routing: &[&str],
+) -> String {
+    let mut script = format!(
+        "cd {} || exit 1\n",
+        crate::session::environment::shell_escape_script_word(working_dir)
+    );
+    if !case_insensitive_routing.is_empty() {
+        script.push_str(
+            "eval \"$(unset aoe_key aoe_value || { printf 'exit 1\\n'; exit 1; }\nset | while IFS='=' read -r aoe_key aoe_value; do\ncase \"$aoe_key\" in\n",
+        );
+        let mut retained = routing
+            .iter()
+            .filter(|(key, value)| {
+                value.is_some()
+                    && case_insensitive_routing
+                        .iter()
+                        .any(|name| key.eq_ignore_ascii_case(name))
+            })
+            .peekable();
+        if retained.peek().is_some() {
+            for (index, (key, _)) in retained.enumerate() {
+                if index != 0 {
+                    script.push('|');
+                }
+                script.push_str(key);
+            }
+            script.push_str(") ;;\n");
+        }
+        for (index, key) in case_insensitive_routing.iter().enumerate() {
+            if index != 0 {
+                script.push('|');
+            }
+            for byte in key.bytes() {
+                if byte.is_ascii_alphabetic() {
+                    script.push('[');
+                    script.push(byte.to_ascii_lowercase() as char);
+                    script.push(byte.to_ascii_uppercase() as char);
+                    script.push(']');
+                } else {
+                    script.push(byte as char);
+                }
+            }
+        }
+        script
+            .push_str(") printf 'unset %s || exit 1\\n' \"$aoe_key\";;\nesac\ndone)\" || exit 1\n");
+    }
+    for (key, value) in routing {
+        match value {
+            Some(value) => {
+                let value = crate::session::environment::shell_escape_script_word(value);
+                script.push_str(&format!(
+                    "if [ \"${{{key}+x}}\" = x ] && [ \"${key}\" = {value} ]; then\nexport {key} || exit 1\nelse\nexport {key}={value} || exit 1\nfi\n"
+                ));
+            }
+            None => script.push_str(&format!("unset {key} || exit 1\n")),
+        }
+    }
+    script
+}
+
+fn wrap_native_container_command(
+    cmd: &str,
+    execution: Option<&super::execution::NativeExecution>,
+    cwd: &str,
+) -> Result<String> {
+    let mut script = execution_context(
+        cwd,
+        execution.map_or(&[][..], |execution| execution.routing.as_slice()),
+        execution.map_or(&[][..], |execution| execution.case_insensitive_routing),
+    );
+    script.push_str(&format!("exec env {cmd}"));
+    Ok(format!(
+        "/bin/sh -c {}",
+        crate::session::environment::shell_escape_script_word(&script)
+    ))
+}
+
+impl Instance {
+    fn sandbox_launch_context(
+        &self,
+        agent: Option<&crate::agents::AgentDef>,
+        execution: Option<&super::execution::NativeExecution>,
+        runtime: &crate::containers::RuntimeExecutionSnapshot,
+        container: &str,
+        environment: &crate::session::environment::DockerExecEnv,
+        cwd: &str,
+    ) -> super::execution::AgentLaunchContext<'static> {
+        use crate::agents::AgentGeneration;
+        let generation = if agent.is_none_or(|agent| !agent.spans_agent_generations) {
+            AgentGeneration::Current
+        } else {
+            let probe = || -> Result<AgentGeneration> {
+                let agent = agent.context("sandbox agent is unavailable")?;
+                anyhow::ensure!(
+                    execution.is_some()
+                        || self.launch_invokes_resolved_agent_directly(agent)
+                        || self
+                            .execution_agent()
+                            .is_ok_and(|actual| actual.name == agent.name),
+                    "sandbox executable identity is unprovable"
+                );
+                anyhow::ensure!(
+                    !Self::contains_active_shell_syntax(self.get_tool_command())
+                        && !Self::contains_active_shell_syntax(&self.extra_args),
+                    "sandbox command contains active shell syntax"
+                );
+                let parsed = parse_launch_command(self.get_tool_command())
+                    .context("sandbox command is unparseable")?;
+                let program = execution
+                    .map(|execution| execution.program.as_os_str())
+                    .or_else(|| parsed.words.first().map(std::ffi::OsStr::new))
+                    .context("sandbox executable is missing")?
+                    .to_str()
+                    .context("sandbox executable is not UTF-8")?;
+                let routing = execution.map_or(&[][..], |execution| execution.routing.as_slice());
+                let env_file = crate::session::environment::container_env_file(
+                    environment
+                        .env
+                        .iter()
+                        .map(|(key, value)| (key.as_str(), value.as_str()))
+                        .chain(routing.iter().filter_map(|(key, value)| {
+                            value.as_deref().map(|value| (key.as_str(), value))
+                        })),
+                )?;
+                let mut script = String::new();
+                for (key, value) in routing {
+                    if value.is_none() {
+                        script.push_str(&format!(
+                            "unset {}; ",
+                            crate::session::environment::shell_escape_script_word(key)
+                        ));
+                    }
+                }
+                script.push_str(&format!(
+                    "exec {} --help",
+                    crate::session::environment::shell_escape_script_word(program)
+                ));
+                let args = ["/bin/sh".to_owned(), "-c".to_owned(), script];
+                let mut command =
+                    runtime.exec_with_env_file(container, cwd, &args, env_file.path());
+                command.stdin(std::process::Stdio::null());
+                let output = crate::process::run_with_timeout(
+                    &mut command,
+                    std::time::Duration::from_secs(5),
+                )?
+                .context("sandbox help timed out")?;
+                anyhow::ensure!(
+                    output.status.success(),
+                    "sandbox help exited unsuccessfully"
+                );
+                let mut bytes = output.stdout;
+                if !output.stderr.is_empty() {
+                    if !bytes.is_empty() {
+                        bytes.push(b'\n');
+                    }
+                    bytes.extend(output.stderr);
+                }
+                let help = String::from_utf8(bytes).context("sandbox help is not UTF-8")?;
+                Ok(crate::agents::agent_generation_from_help(&help))
+            };
+            match probe() {
+                Ok(generation) => generation,
+                Err(error) => {
+                    tracing::warn!(target: "session.store", %error, "sandbox generation could not be established");
+                    AgentGeneration::Unknown
+                }
+            }
+        };
+        super::execution::AgentLaunchContext::resolved(generation)
+    }
+
+    pub fn has_custom_command(&self) -> bool {
+        if !self.extra_args.is_empty() {
+            return true;
+        }
+        self.has_command_override()
+    }
+
+    /// True only when the launch command differs from the agent's default binary (ignores
+    /// extra_args).
+    pub fn has_command_override(&self) -> bool {
+        if self.command.is_empty() {
+            return false;
+        }
+        crate::agents::get_agent(&self.tool)
+            .map(|a| self.command != a.binary)
+            .unwrap_or(true)
+    }
+
+    pub fn expects_shell(&self) -> bool {
+        crate::tmux::utils::is_shell_command(self.get_tool_command())
+    }
+
+    pub fn get_tool_command(&self) -> &str {
+        if self.command.is_empty() {
+            crate::agents::get_agent(&self.tool)
+                .map(|a| a.binary)
+                .unwrap_or("bash")
+        } else {
+            &self.command
+        }
+    }
+
+    /// The text searched for a user-selected `--agent NAME` flag.
+    pub(super) fn selected_agent_args(&self) -> String {
+        if self.command.is_empty() {
+            self.extra_args.clone()
+        } else if self.extra_args.is_empty() {
+            self.command.clone()
+        } else {
+            format!("{} {}", self.command, self.extra_args)
+        }
+    }
+
+    /// Launch command including any agent `launch_subcommand` (e.g. `kiro-cli chat`).
+    fn get_launch_command(&self) -> String {
+        if self.command.is_empty() {
+            crate::agents::get_agent(&self.tool)
+                .map(|a| a.launch_base_command())
+                .unwrap_or_else(|| "bash".to_string())
+        } else {
+            self.command.clone()
+        }
+    }
+
+    pub(super) fn prepare_launch_command(
+        &mut self,
+        expected_conversation: ConversationState,
+    ) -> Result<PreparedLaunch> {
+        let sandbox_context_reset = match self.resolved_agent() {
+            Some(agent) => {
+                crate::migrations::v033_isolate_sandbox_content::prepare_terminal_launch_context(
+                    self, agent.name,
+                )?
+            }
+            None => None,
+        };
+        let mut expected_conversation = if sandbox_context_reset.is_some() {
+            self.conversation_state()
+        } else {
+            expected_conversation
+        };
+        let expected_prior_omp_generation = self.omp_capture_generation.clone();
+        let prior_probe_failed_sid = self.resume_probe_failed_sid.clone();
+        let preparation = (|| -> Result<_> {
+            if matches!(self.resume_intent, ResumeIntent::Default) {
+                if let Some(observation) = self.capture_freshest_conversation() {
+                    self.apply_conversation_observation(&observation);
+                }
+            }
+            let validate_target = !matches!(self.resume_intent, ResumeIntent::Default)
+                || self
+                    .conversation_target()
+                    .and_then(|(_, binding, _)| binding)
+                    .is_some_and(ConversationBinding::is_known);
+            let managed = !matches!(self.resume_intent, ResumeIntent::Cleared)
+                && (self.agent_session_id.is_some()
+                    || matches!(
+                        self.resume_intent,
+                        ResumeIntent::Use(_) | ResumeIntent::Fork { .. }
+                    ));
+            let execution = match self.resolve_native_execution(self.conversation_target()) {
+                Ok(execution) => {
+                    if validate_target {
+                        self.validate_conversation_target(
+                            &execution.binding,
+                            execution.target_session_id.as_deref(),
+                        )?;
+                    }
+                    Some(execution)
+                }
+                Err(error)
+                    if self.default_selector_agent().is_some_and(|agent| {
+                        agent.name == "prime-agent"
+                            && self.launch_invokes_resolved_agent_directly(agent)
+                            && (managed || self.prime_agent_launch_options().is_some())
+                    }) =>
+                {
+                    return Err(error)
+                }
+                Err(error) if managed && !matches!(self.resume_intent, ResumeIntent::Default) => {
+                    return Err(error);
+                }
+                // A stored id no context can attest is a deviation, not routine: warn.
+                Err(error) if managed => {
+                    // The `managed` arm above leaves only a Default launch, which
+                    // records an id by definition.
+                    let recorded = self
+                        .agent_session_id
+                        .as_deref()
+                        .expect("a managed default launch records a conversation id");
+                    tracing::warn!(target: "session.store", error = %error, recorded, "no attestable execution context for a recorded conversation; launching with the agent's own resume flags");
+                    None
+                }
+                Err(error) => {
+                    tracing::debug!(target: "session.store", error = %error, "native execution unavailable; using native launch flags");
+                    None
+                }
+            };
+            let prior_canonical = if let Some(target) = execution
+                .as_ref()
+                .and_then(|execution| execution.resolved_target_session_id.as_ref())
+            {
+                let prior = self.conversation_state();
+                let mut binding = self
+                    .conversation_target()
+                    .and_then(|(_, binding, _)| binding)
+                    .context("resolved Hermes target has no validated binding")?
+                    .clone();
+                binding.session_id.clone_from(target);
+                if matches!(self.resume_intent, ResumeIntent::Use(_)) {
+                    self.resume_intent = ResumeIntent::Use(target.clone());
+                    self.resume_binding = Some(binding.clone());
+                }
+                self.set_agent_conversation(
+                    Some(target.clone()),
+                    Some(binding),
+                    self.pi_session_path.clone(),
+                );
+                Some(prior)
+            } else {
+                None
+            };
+            let parts =
+                self.build_launch_command(execution.as_ref(), &mut expected_conversation)?;
+            if (managed || parts.is_existing) && validate_target {
+                if let Some(execution) = execution.as_ref() {
+                    self.validate_conversation_target(
+                        &execution.binding,
+                        execution
+                            .resolved_target_session_id
+                            .as_deref()
+                            .or(execution.target_session_id.as_deref()),
+                    )?;
+                }
+            }
+            let canonical_conversation = prior_canonical.map(|prior| {
+                let canonical = self.conversation_state();
+                self.adopt_conversation_state(prior);
+                canonical
+            });
+            Ok((parts, execution, canonical_conversation))
+        })();
+        let (
+            LaunchCommandParts {
+                command,
+                is_existing,
+                omp_capture_plan,
+                mut launch_env,
+                fork_mints_child,
+            },
+            mut execution,
+            canonical_conversation,
+        ) = match preparation {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                self.adopt_conversation_state(expected_conversation);
+                self.resume_probe_failed_sid = prior_probe_failed_sid;
+                self.omp_capture_generation = expected_prior_omp_generation;
+                return Err(error);
+            }
+        };
+        if let Some(execution) = execution.as_mut() {
+            launch_env.pane = std::mem::take(&mut execution.inputs.pane_env);
+            launch_env.container = execution
+                .inputs
+                .docker_env
+                .take()
+                .map(|environment| environment.env)
+                .unwrap_or_default();
+        }
+        if omp_capture_plan.is_some() && !self.is_sandboxed() {
+            launch_env.pane.extend(omp_host_routing_environment(
+                &self.resolved_host_environment(),
+            ));
+        }
+        let require_conversation_publication = execution
+            .as_ref()
+            .is_some_and(|execution| execution.agent.name == "opencode")
+            && !fork_mints_child
+            && self.stored_fork_child().is_some();
+        Ok(PreparedLaunch {
+            command,
+            is_existing,
+            omp_capture_plan,
+            launch_env,
+            fork_mints_child,
+            expected_conversation,
+            canonical_conversation,
+            expected_prior_omp_generation,
+            sandbox_context_reset,
+            execution,
+            require_conversation_publication,
+        })
+    }
+
+    /// Carry the last authoritative root across native daemon shutdown.
+    pub(super) fn refresh_prepared_prime_launch_after_pane_stop(
+        &mut self,
+        prepared: PreparedLaunch,
+        publication: Option<PrimeRootPublication>,
+    ) -> Result<PreparedLaunch> {
+        // Preserve the already adopted child across the second preparation.
+        if !prepared.is_existing && self.stored_fork_child().is_none() {
+            self.set_agent_conversation(
+                prepared.expected_conversation.session_id.clone(),
+                prepared.expected_conversation.binding.clone(),
+                prepared.expected_conversation.pi_session_path.clone(),
+            );
+        }
+        self.absorb_published_prime_session(publication);
+        let mut refreshed = self.prepare_launch_command(prepared.expected_conversation)?;
+        refreshed.require_conversation_publication |= prepared.require_conversation_publication;
+        refreshed.expected_prior_omp_generation = prepared.expected_prior_omp_generation;
+        Ok(refreshed)
+    }
+
+    /// Construct the command only after hook execution has completed. Keeping this phase hook-free
+    /// prevents a revalidation retry from replaying user code while the lifecycle lock is held.
+    pub(super) fn build_launch_command(
+        &mut self,
+        execution: Option<&super::execution::NativeExecution>,
+        expected: &mut ConversationState,
+    ) -> Result<LaunchCommandParts> {
+        if self.tool == "omp" && !self.has_command_override() {
+            reject_omp_secret_args(&crate::session::config::quote_model_value_in_args(
+                &self.extra_args,
+            ))?;
+        }
+        let agent = execution
+            .map(|execution| execution.agent)
+            .or_else(|| self.default_selector_agent());
+
+        let parts = if self.is_sandboxed() {
+            let fallback_container_name = execution
+                .is_none()
+                .then(|| {
+                    self.sandbox_info
+                        .as_ref()
+                        .map(|sandbox| sandbox.container_name.clone())
+                        .context("sandbox_info missing for sandboxed instance")
+                })
+                .transpose()?;
+            let snapshot = execution.and_then(|execution| execution.inputs.container.as_ref());
+            let fallback_runtime = execution
+                .is_none()
+                .then(|| {
+                    crate::containers::RuntimeExecutionSnapshot::capture(
+                        &crate::containers::get_container_runtime(),
+                    )
+                })
+                .transpose()?;
+            let runtime = snapshot
+                .map(|snapshot| &snapshot.runtime)
+                .or(fallback_runtime.as_ref())
+                .context("prepared sandbox transport is missing")?;
+            let container = snapshot
+                .map(|snapshot| snapshot.id.as_str())
+                .or(fallback_container_name.as_deref())
+                .context("sandbox identity is missing")?;
+            let fallback_identity = execution
+                .is_none()
+                .then(|| self.identity_extension_launch())
+                .flatten();
+            let identity_extension = execution
+                .and_then(|execution| execution.inputs.identity_extension.as_ref())
+                .or(fallback_identity.as_ref());
+            let fallback_environment = if execution.is_none() {
+                Some(self.sandbox_launch_environment(
+                    agent,
+                    identity_extension,
+                    &self.effective_profile(),
+                    None,
+                    &crate::session::config::repo_config::resolve_config_with_repo(
+                        &self.effective_profile(),
+                        std::path::Path::new(&self.project_path),
+                    )?,
+                )?)
+            } else {
+                None
+            };
+            let env_info = execution
+                .and_then(|execution| execution.inputs.docker_env.as_ref())
+                .or(fallback_environment.as_ref())
+                .context("prepared sandbox environment is missing")?;
+            let fallback_cwd = execution.is_none().then(|| self.container_workdir());
+            let container_cwd = execution
+                .and_then(|execution| execution.inputs.cwd.to_str())
+                .or(fallback_cwd.as_deref())
+                .context("sandbox cwd is not UTF-8")?;
+            let launch_context = &self.sandbox_launch_context(
+                agent,
+                execution,
+                runtime,
+                container,
+                env_info,
+                container_cwd,
+            );
+            let fork_mints_child =
+                prepared_fork_mints_child(agent, &self.resume_intent, launch_context);
+            let yolo = self
+                .is_yolo_mode()
+                .then(|| agent.and_then(|agent| resolved_yolo(agent, launch_context)))
+                .flatten();
+
+            let omp_capture_plan = execution
+                .and_then(|execution| execution.omp.as_ref())
+                .and_then(|context| {
+                    self.resolve_omp_capture_plan(
+                        context,
+                        snapshot.map(|snapshot| snapshot.runtime.kind),
+                    )
+                });
+
+            let launch_cmd = self.freeze_native_invocation(
+                self.get_launch_command(),
+                execution,
+                launch_context,
+            )?;
+            let base_cmd = if self.extra_args.is_empty() {
+                launch_cmd
+            } else if self.command.is_empty() {
+                // Default agent binary: quote a shell-active --model/-m value
+                // the same way the host launch path does (build_host_command).
+                // A custom command override is the user's own argv, so it is
+                // left untouched, matching that path's scoping.
+                format!(
+                    "{} {}",
+                    launch_cmd,
+                    crate::session::config::quote_model_value_in_args(&self.extra_args)
+                )
+            } else {
+                format!("{} {}", launch_cmd, self.extra_args)
+            };
+            let mut tool_cmd = if self.is_yolo_mode() {
+                match yolo {
+                    Some(crate::agents::YoloMode::CliFlag(flag)) => {
+                        format!("{} {}", base_cmd, flag)
+                    }
+                    Some(crate::agents::YoloMode::EnvVar(..))
+                    | Some(crate::agents::YoloMode::AlwaysYolo)
+                    | Some(crate::agents::YoloMode::EitherGeneration { .. })
+                    | None => base_cmd,
+                }
+            } else {
+                base_cmd
+            };
+            if let Some(instruction) = self
+                .sandbox_info
+                .as_ref()
+                .and_then(|s| s.custom_instruction.as_ref())
+                .filter(|s| !s.is_empty())
+            {
+                if let Some(flag_template) = agent.and_then(|a| a.instruction_flag) {
+                    let escaped = shell_escape(instruction);
+                    let flag = flag_template.replace("{}", &escaped);
+                    tool_cmd = format!("{} {}", tool_cmd, flag);
+                }
+            }
+
+            let extension_backend = agent
+                .and_then(|agent| agent.session_support.as_ref())
+                .and_then(|support| support.capture.as_ref())
+                .map(|capture| capture.backend);
+
+            let extension_configured = identity_extension.is_some();
+            self.pi_extension_launched = extension_configured
+                && extension_backend == Some(crate::agents::SessionCaptureBackend::Pi);
+            if let Some((ref flag, _)) = identity_extension {
+                tool_cmd.push_str(flag);
+            }
+            let is_existing = self.apply_session_flags(
+                &mut tool_cmd,
+                "sandboxed",
+                agent,
+                execution,
+                launch_context,
+                expected,
+            )?;
+            if let Some(crate::agents::YoloMode::EnvVar(key, value)) = yolo {
+                tool_cmd = format_env_var_prefix(key, value, &tool_cmd);
+            }
+            apply_agent_launch_env(&mut tool_cmd, agent);
+
+            let env_part = format!("{} ", env_info.docker_args);
+            let exec_command = |cmd: &str, interactive: bool| {
+                runtime.exec_shell_command(container, Some(&env_part), cmd, interactive)
+            };
+            let prime_runtime = execution
+                .and_then(|execution| prime_runtime_for_capture(execution.capture.as_ref()));
+            let tool_cmd = match prime_runtime {
+                Some(runtime) => format!(
+                    "env TMPDIR={} {}",
+                    shell_escape(&runtime.directory.to_string_lossy()),
+                    runtime.recorded_launch_command(&tool_cmd, false)
+                ),
+                None => tool_cmd,
+            };
+
+            let raw_command = exec_command(
+                &wrap_native_container_command(&tool_cmd, execution, container_cwd)?,
+                true,
+            );
+            let daemon_command = prime_runtime
+                .map(|runtime| {
+                    let daemon = format!(
+                        "env TMPDIR={} {} --mode daemon --daemon-socket {}",
+                        shell_escape(&runtime.directory.to_string_lossy()),
+                        shell_escape(&runtime.program.to_string_lossy()),
+                        shell_escape(&runtime.socket().to_string_lossy())
+                    );
+                    let daemon = runtime.recorded_launch_command(&daemon, true);
+                    wrap_native_container_command(&daemon, execution, container_cwd)
+                        .map(|command| exec_command(&command, false))
+                })
+                .transpose()?;
+            let raw_command = wrap_prime_launch(
+                &raw_command,
+                execution,
+                daemon_command.as_deref(),
+                !env_info.env.is_empty(),
+            )?;
+            let launch_command = if let Some(plan) = omp_capture_plan.as_ref() {
+                let marked_tool_cmd = wrap_omp_launch(&tool_cmd, plan);
+                let marked_command = exec_command(
+                    &wrap_native_container_command(&marked_tool_cmd, execution, container_cwd)?,
+                    true,
+                );
+                gate_omp_launch(&raw_command, &marked_command, plan)
+            } else {
+                raw_command
+            };
+            let runtime_cwd = runtime.cwd.to_str().context("runtime cwd is not UTF-8")?;
+            let runtime_routing = runtime.routing.as_slice();
+            let wrapped =
+                wrap_command_ignore_suspend(&launch_command, runtime_cwd, runtime_routing, &[]);
+            LaunchCommandParts {
+                command: Some(wrapped),
+                is_existing,
+                omp_capture_plan,
+                fork_mints_child,
+                launch_env: LaunchEnvironment {
+                    pane: Vec::new(),
+                    container: fallback_environment
+                        .map(|environment| environment.env)
+                        .unwrap_or_default(),
+                },
+            }
+        } else {
+            let mut result = self.build_host_command(agent, execution, expected)?;
+            result.launch_env.pane = if execution.is_none() {
+                crate::session::environment::resolve_host_environment_pairs(
+                    &self.resolved_host_environment(),
+                )
+                .into_iter()
+                .map(|(key, value)| tmux::PaneEnvMutation::set(key, value))
+                .collect()
+            } else {
+                Vec::new()
+            };
+            result
+        };
+        Ok(parts)
+    }
+
+    /// Build the tmux command for a host session after all launch hooks have
+    /// completed.
+    fn build_host_command(
+        &mut self,
+        agent: Option<&'static crate::agents::AgentDef>,
+        execution: Option<&super::execution::NativeExecution>,
+        expected: &mut ConversationState,
+    ) -> Result<LaunchCommandParts> {
+        let fallback_identity = execution
+            .is_none()
+            .then(|| self.identity_extension_launch())
+            .flatten();
+        let identity_extension = execution
+            .and_then(|execution| execution.inputs.identity_extension.as_ref())
+            .or(fallback_identity.as_ref());
+        self.build_host_command_with_identity_extension(
+            agent,
+            identity_extension,
+            execution,
+            expected,
+        )
+    }
+
+    fn build_host_command_with_identity_extension(
+        &mut self,
+        agent: Option<&'static crate::agents::AgentDef>,
+        identity_extension: Option<&(String, String)>,
+        execution: Option<&super::execution::NativeExecution>,
+        expected: &mut ConversationState,
+    ) -> Result<LaunchCommandParts> {
+        let host_command = agent
+            .filter(|agent| agent.spans_agent_generations)
+            .and_then(|agent| self.host_agent_command(agent, execution));
+        let launch_context =
+            &super::execution::AgentLaunchContext::host(agent, host_command.as_ref());
+        let fork_mints_child =
+            prepared_fork_mints_child(agent, &self.resume_intent, launch_context);
+        let yolo = self
+            .is_yolo_mode()
+            .then(|| {
+                agent
+                    .filter(|_| host_command.is_none())
+                    .and_then(|agent| resolved_yolo(agent, launch_context))
+            })
+            .flatten();
+        let omp_capture_plan = execution
+            .and_then(|execution| execution.omp.as_ref())
+            .and_then(|context| self.resolve_omp_capture_plan(context, None));
+
+        let fallback_profile;
+        let profile = if let Some(execution) = execution {
+            execution.inputs.profile.as_str()
+        } else {
+            fallback_profile = self.effective_profile();
+            &fallback_profile
+        };
+        let program = parse_launch_command(self.get_tool_command()).and_then(|parsed| {
+            parsed.words.first().and_then(|word| {
+                Path::new(word)
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .map(str::to_owned)
+            })
+        });
+        let mut env_prefix =
+            status_hook_env_prefix(profile, &self.id, self.status_agent(), program.as_deref());
+        // The publisher is pane-scoped, including for safe Default wrappers.
+        self.pi_extension_launched = false;
+        if let Some((_, ref env)) = identity_extension {
+            env_prefix.push_str(env);
+            self.pi_extension_launched = true;
+        }
+        let env_prefix = env_prefix;
+
+        if self.command.is_empty() {
+            match agent {
+                Some(a) => {
+                    let mut cmd = self.freeze_native_invocation(
+                        a.launch_base_command(),
+                        execution,
+                        launch_context,
+                    )?;
+                    if let Some((ref flag, _)) = identity_extension {
+                        cmd.push_str(flag);
+                    }
+                    if !self.extra_args.is_empty() {
+                        // A model id carrying shell metacharacters (a
+                        // context-window suffix such as `[1m]`) would abort the
+                        // launch line before the agent starts.
+                        cmd = format!(
+                            "{} {}",
+                            cmd,
+                            crate::session::config::quote_model_value_in_args(&self.extra_args)
+                        );
+                    }
+                    if host_command.is_none() {
+                        if let Some(yolo) = yolo {
+                            apply_yolo_mode(&mut cmd, yolo, false);
+                        }
+                    }
+                    let is_existing = self.apply_session_flags(
+                        &mut cmd,
+                        "host agent",
+                        agent,
+                        execution,
+                        launch_context,
+                        expected,
+                    )?;
+                    let defer_yolo = self.is_yolo_mode()
+                        && host_command.is_some()
+                        && execution.is_none()
+                        && self.agent_session_id.is_none();
+                    if let Some(snapshot) = host_command.as_ref() {
+                        if execution.is_none() {
+                            pin_host_program(&mut cmd, snapshot)?;
+                        }
+                        if !defer_yolo && self.is_yolo_mode() {
+                            if let Some(yolo) =
+                                agent.and_then(|agent| resolved_yolo(agent, launch_context))
+                            {
+                                apply_yolo_mode(&mut cmd, yolo, false);
+                            }
+                        }
+                    }
+                    apply_first_launch_agent_name(&mut cmd, agent, self, execution, is_existing);
+                    apply_agent_launch_env(&mut cmd, agent);
+                    let raw_command = format!(
+                        "{}{}",
+                        env_prefix,
+                        wrap_prime_launch(&cmd, execution, None, false)?
+                    );
+                    let command = if let Some(plan) = omp_capture_plan.as_ref() {
+                        let marked_command = wrap_omp_host_launch(&env_prefix, &cmd, plan);
+                        gate_omp_launch(&raw_command, &marked_command, plan)
+                    } else {
+                        raw_command
+                    };
+                    Ok(LaunchCommandParts {
+                        command: if let Some(snapshot) = host_command
+                            .as_ref()
+                            .filter(|_| execution.is_some() || self.agent_session_id.is_some())
+                        {
+                            Some(wrap_bound_opencode_command(
+                                &command,
+                                &self.project_path,
+                                snapshot,
+                            )?)
+                        } else if defer_yolo {
+                            let overrides =
+                                crate::session::environment::resolve_host_environment_pairs(
+                                    &self.resolved_host_environment(),
+                                );
+                            Some(wrap_unbound_opencode_yolo_command(
+                                &command,
+                                &self.project_path,
+                                &overrides,
+                            )?)
+                        } else {
+                            Some(wrap_command_ignore_suspend(
+                                &command,
+                                &self.project_path,
+                                execution.map_or(&[], |execution| execution.routing.as_slice()),
+                                execution
+                                    .map_or(&[], |execution| execution.case_insensitive_routing),
+                            ))
+                        },
+                        is_existing,
+                        omp_capture_plan,
+                        fork_mints_child,
+                        launch_env: LaunchEnvironment::default(),
+                    })
+                }
+                None => Ok(LaunchCommandParts {
+                    command: None,
+                    is_existing: false,
+                    omp_capture_plan,
+                    fork_mints_child,
+                    launch_env: LaunchEnvironment::default(),
+                }),
+            }
+        } else {
+            let mut cmd =
+                self.freeze_native_invocation(self.command.clone(), execution, launch_context)?;
+            if let Some((ref flag, _)) = identity_extension {
+                cmd.push_str(flag);
+            }
+            if !self.extra_args.is_empty() {
+                cmd = format!("{} {}", cmd, self.extra_args);
+            }
+            if host_command.is_none() {
+                if let Some(yolo) = yolo {
+                    apply_yolo_mode(&mut cmd, yolo, false);
+                }
+            }
+            let is_existing = self.apply_session_flags(
+                &mut cmd,
+                "host custom",
+                agent,
+                execution,
+                launch_context,
+                expected,
+            )?;
+            let defer_yolo = self.is_yolo_mode()
+                && host_command.is_some()
+                && execution.is_none()
+                && self.agent_session_id.is_none();
+            if let Some(snapshot) = host_command.as_ref() {
+                if execution.is_none() {
+                    pin_host_program(&mut cmd, snapshot)?;
+                }
+                if !defer_yolo && self.is_yolo_mode() {
+                    if let Some(yolo) = agent.and_then(|agent| resolved_yolo(agent, launch_context))
+                    {
+                        apply_yolo_mode(&mut cmd, yolo, false);
+                    }
+                }
+            }
+            apply_first_launch_agent_name(&mut cmd, agent, self, execution, is_existing);
+            apply_agent_launch_env(&mut cmd, agent);
+            let raw_command = format!(
+                "{}{}",
+                env_prefix,
+                wrap_prime_launch(&cmd, execution, None, false)?
+            );
+            let command = if let Some(plan) = omp_capture_plan.as_ref() {
+                let marked_command = wrap_omp_host_launch(&env_prefix, &cmd, plan);
+                gate_omp_launch(&raw_command, &marked_command, plan)
+            } else {
+                raw_command
+            };
+            Ok(LaunchCommandParts {
+                command: if let Some(snapshot) = host_command
+                    .as_ref()
+                    .filter(|_| execution.is_some() || self.agent_session_id.is_some())
+                {
+                    Some(wrap_bound_opencode_command(
+                        &command,
+                        &self.project_path,
+                        snapshot,
+                    )?)
+                } else if defer_yolo {
+                    let overrides = crate::session::environment::resolve_host_environment_pairs(
+                        &self.resolved_host_environment(),
+                    );
+                    Some(wrap_unbound_opencode_yolo_command(
+                        &command,
+                        &self.project_path,
+                        &overrides,
+                    )?)
+                } else {
+                    Some(wrap_command_ignore_suspend(
+                        &command,
+                        &self.project_path,
+                        execution.map_or(&[], |execution| execution.routing.as_slice()),
+                        execution.map_or(&[], |execution| execution.case_insensitive_routing),
+                    ))
+                },
+                is_existing,
+                omp_capture_plan,
+                fork_mints_child,
+                launch_env: LaunchEnvironment::default(),
+            })
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::agents::AgentGeneration;
+    use crate::session::instance::test_helpers::*;
+    use crate::session::test_support::EnvGuard;
+
+    fn host_command(inst: &mut Instance) -> String {
+        let agent = crate::agents::get_agent(&inst.tool);
+        inst.build_host_command(agent, None, &mut inst.conversation_state())
+            .unwrap()
+            .command
+            .unwrap()
+    }
+
+    fn attested_host_command(inst: &mut Instance) -> String {
+        let agent = crate::agents::get_agent(&inst.tool);
+        let execution = inst.resolve_native_execution(None).ok();
+        inst.build_host_command(agent, execution.as_ref(), &mut inst.conversation_state())
+            .unwrap()
+            .command
+            .unwrap()
+    }
+
+    const CLAUDE_HELP_WITH_NAME: &str = "  -n, --name <name>  Set a display name";
+
+    /// A `claude` on PATH whose `--help` prints `help` and leaves a mark in `probed`.
+    fn install_claude_help_stub(
+        root: &std::path::Path,
+        help: &str,
+        probed: &std::path::Path,
+    ) -> crate::session::test_support::EnvGuard {
+        crate::agents::forget_agent_help_for_test();
+        crate::session::test_support::install_login_shell_path_command(
+            root,
+            "claude",
+            &format!(
+                "#!/bin/sh\ncase \"$1\" in --help) : > {}; printf '%s\\n' {};; esac\nexit 0\n",
+                shell_escape(probed.to_str().unwrap()),
+                shell_escape(help),
+            ),
+        )
+    }
+
+    fn set_name_agent_session(inst: &Instance, on: bool) {
+        let mut config = crate::session::config::profile_config::ProfileConfig::default();
+        config.overrides.insert(
+            "session".to_string(),
+            serde_json::json!({ "name_agent_session": on }),
+        );
+        crate::session::config::profile_config::save_profile_config(
+            &inst.effective_profile(),
+            &config,
+        )
+        .unwrap();
+    }
+
+    // The sidecar env var has to survive into the docker argv; no CI container would catch it.
+    #[test]
+    #[serial_test::serial]
+    fn sandboxed_pi_publishes_through_env_without_a_command_line_extension() {
+        let (_guard, _base, _tmp) = crate::hooks::test_support::BaseGuard::ready();
+        let temp_home = tempfile::tempdir().unwrap();
+        let _home = crate::session::test_support::isolate_home(temp_home.path());
+        let project = temp_home.path().join("proj");
+        std::fs::create_dir_all(&project).unwrap();
+        let mut inst = tool_instance("pi", project.to_str().unwrap());
+        let mut sandbox = test_sandbox("aoe-pi-argv", Some("/workspace"));
+        sandbox.extra_env = Some(vec![
+            "PI_CODING_AGENT_SESSION_DIR=/root/.pi/agent/sessions".to_string()
+        ]);
+        inst.sandbox_info = Some(sandbox);
+        admit_sandbox_fixture(&inst);
+        let config = inst.build_container_config().unwrap();
+        let _transport =
+            install_container_transport(temp_home.path(), "aoe-pi-argv", &config.volumes);
+        std::fs::copy(
+            temp_home.path().join("native-bin/prime-agent"),
+            temp_home.path().join("native-bin/pi"),
+        )
+        .unwrap();
+        let sidecar = format!(
+            "AOE_SESSION_ID_FILE={}/{}/session_id",
+            crate::session::config::container_config::PI_SIDECAR_DIR_IN_CONTAINER,
+            inst.id
+        );
+
+        let execution = inst.resolve_native_execution(None).unwrap();
+        let docker_env = execution.inputs.docker_env.as_ref().unwrap();
+        let value = |key| {
+            docker_env
+                .env
+                .iter()
+                .rev()
+                .find(|(name, _)| name == key)
+                .map(|(_, value)| value.as_str())
+        };
+        assert_eq!(
+            value("AOE_SESSION_ID_FILE"),
+            Some(sidecar.split_once('=').unwrap().1)
+        );
+
+        let parts = inst
+            .build_launch_command(Some(&execution), &mut inst.conversation_state())
+            .expect("a sandboxed launch line");
+        let cmd = parts.command.expect("a command");
+        assert!(cmd.contains("--env-file"), "{cmd}");
+        assert!(!cmd.contains("aoe-session-id.js"), "{cmd}");
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn pi_extension_is_injected_only_into_a_direct_pi_launch() {
+        let home = tempfile::tempdir().unwrap();
+        let _app = crate::session::test_support::isolate_app_dir_at(home.path());
+
+        let mut alias = Instance::new("pi alias", "/tmp/pi-alias-launch");
+        alias.tool = "company-pi".to_string();
+        alias.detect_as = "pi".to_string();
+        alias.command = "pi".to_string();
+        let agent = alias.resolved_agent();
+        let identity_extension = (
+            " -e '/tmp/pi-aoe-session-id.js'".to_string(),
+            "AOE_SESSION_ID_FILE='/tmp/pi-session-id' ".to_string(),
+        );
+        let parts = alias
+            .build_host_command_with_identity_extension(
+                agent,
+                Some(&identity_extension),
+                None,
+                &mut alias.conversation_state(),
+            )
+            .unwrap();
+        let command = parts.command.unwrap();
+        assert!(command.contains(" -e "), "{command}");
+        assert!(command.contains("AOE_SESSION_ID_FILE="));
+        assert!(alias.pi_extension_launched);
+
+        let mut wrapper = Instance::new("pi alias wrapper", "/tmp/pi-alias-wrapper");
+        wrapper.tool = "company-pi".to_string();
+        wrapper.detect_as = "pi".to_string();
+        wrapper.command = "echo not-pi".to_string();
+        assert!(wrapper.identity_extension_launch().is_none());
+        let agent = wrapper.resolved_agent();
+        let command = wrapper
+            .build_host_command(agent, None, &mut wrapper.conversation_state())
+            .unwrap()
+            .command
+            .unwrap();
+        assert!(!command.contains("pi-aoe-session-id.js"));
+        assert!(!command.contains("AOE_SESSION_ID_FILE="));
+        assert!(!wrapper.pi_extension_launched);
+
+        let mut terminated = tool_instance("pi", "/tmp/pi-terminator");
+        terminated.extra_args = "--".to_string();
+        let command = host_command(&mut terminated);
+        assert!(!command.contains(" -e "), "extension follows --: {command}");
+        assert!(!terminated.pi_extension_launched);
+    }
+
+    #[test]
+    #[serial_test::serial(shell_env)]
+    fn wrap_command_runs_a_descriptor_script_login_only_for_posix_shells() {
+        for (shell, prefix) in [
+            ("/bin/bash", ""),
+            ("/bin/zsh", "'/bin/zsh' -l /dev/fd/3 "),
+            // fish and nu PATH setup is not in bash login files.
+            ("/usr/bin/fish", "'bash' /dev/fd/3 "),
+            ("/usr/bin/nu", "'bash' /dev/fd/3 "),
+        ] {
+            let _shell = EnvGuard::set(&[("SHELL", shell)]);
+            let wrapped = wrap_command_ignore_suspend("claude", "/tmp/proj", &[], &[]);
+            assert!(wrapped.starts_with(prefix), "{shell}: {wrapped}");
+            assert!(wrapped.contains("/dev/fd/3 3<<'AOE_LAUNCH_BODY'"));
+            assert!(wrapped.contains("\nstty susp undef\nexec env claude\n"));
+            assert!(!wrapped.contains(" -c "));
+        }
+    }
+
+    /// Login shell rc files can `cd` after tmux set the pane cwd, so the script re-enters it.
+    #[test]
+    fn wrap_command_reasserts_working_dir_after_login_shell() {
+        let _lock = EnvGuard::read_lock();
+        let Ok(bash) = which::which("bash") else {
+            eprintln!("skipping: bash not found on PATH");
+            return;
+        };
+        let _shell = EnvGuard::set(&[("SHELL", &bash)]);
+        let temp = tempfile::tempdir().unwrap();
+        let working_dir = temp.path().join("some project's dir");
+        std::fs::create_dir(&working_dir).unwrap();
+        let wrapped = wrap_command_ignore_suspend("pwd", working_dir.to_str().unwrap(), &[], &[]);
+        assert!(wrapped.contains("3<<'AOE_LAUNCH_BODY'\ncd "), "{wrapped}");
+        assert!(wrapped.contains("|| exit 1\nstty susp undef"), "{wrapped}");
+        let output = std::process::Command::new(&bash)
+            .args(["-c", &wrapped])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let printed = String::from_utf8_lossy(&output.stdout);
+        assert_eq!(
+            std::path::Path::new(printed.trim()).canonicalize().unwrap(),
+            working_dir.canonicalize().unwrap(),
+        );
+    }
+
+    #[test]
+    fn tool_command_and_custom_command_detection() {
+        // (tool, command, extra_args, tool command, has_custom_command, has_command_override,
+        //  expects_shell)
+        for (tool, command, extra, want_cmd, custom, overridden, shell) in [
+            ("claude", "", "", "claude", false, false, false),
+            ("opencode", "", "", "opencode", false, false, false),
+            ("codex", "", "", "codex", false, false, false),
+            ("gemini", "", "", "gemini", false, false, false),
+            ("unknown", "", "", "bash", false, false, true),
+            (
+                "claude",
+                "claude --resume abc123",
+                "",
+                "claude --resume abc123",
+                true,
+                true,
+                false,
+            ),
+            ("claude", "claude", "", "claude", false, false, false),
+            ("claude", "my-wrapper", "", "my-wrapper", true, true, false),
+            ("claude", "bash", "", "bash", true, true, true),
+            (
+                "unknown_agent",
+                "unknown_agent",
+                "",
+                "unknown_agent",
+                true,
+                true,
+                false,
+            ),
+            ("claude", "", "--model opus", "claude", true, false, false),
+        ] {
+            let mut inst = tool_instance(tool, "/tmp/test");
+            inst.command = command.to_string();
+            inst.extra_args = extra.to_string();
+            let label = format!("{tool}/{command}/{extra}");
+            assert_eq!(inst.get_tool_command(), want_cmd, "{label}");
+            assert_eq!(inst.has_custom_command(), custom, "{label}");
+            assert_eq!(inst.has_command_override(), overridden, "{label}");
+            assert_eq!(inst.expects_shell(), shell, "{label}");
+        }
+    }
+
+    #[test]
+    fn resume_and_fork_flags_per_agent() {
+        let sid = "019342ab-1234-7def-8901-abcdef012345";
+        for (tool, existing, expected) in [
+            ("claude", true, format!("--resume {sid}")),
+            ("claude", false, format!("--session-id {sid}")),
+            ("opencode", true, format!("--session {sid}")),
+            ("opencode", false, format!("--session {sid}")),
+            ("vibe", true, format!("--resume {sid}")),
+            ("copilot", true, format!("--session-id {sid}")),
+            ("pi", true, format!("--session {sid}")),
+            ("pi", false, format!("--session-id {sid}")),
+            ("mistral", false, String::new()),
+        ] {
+            assert_eq!(
+                build_resume_flags(tool, sid, existing),
+                expected,
+                "{tool}/{existing}"
+            );
+        }
+        assert_eq!(build_resume_flags("claude", "$(rm -rf /)", true), "");
+        assert_eq!(build_resume_flags("opencode", "id; echo pwned", false), "");
+
+        for (tool, parent, child, generation, expected) in [
+            (
+                "codex",
+                "parent-id",
+                "ignored-child",
+                AgentGeneration::Current,
+                "fork parent-id",
+            ),
+            // OpenCode 2.x mints the child in its store before the launch, so no
+            // fork flag reaches the command line.
+            (
+                "opencode",
+                "parent-id",
+                "ignored-child",
+                AgentGeneration::Current,
+                "",
+            ),
+            // 1.x has no fork endpoint under /api, so it keeps the root flag.
+            (
+                "opencode",
+                "parent-id",
+                "ignored-child",
+                AgentGeneration::Legacy,
+                "--session parent-id --fork",
+            ),
+            ("cursor", "parent", "child", AgentGeneration::Current, ""),
+            (
+                "claude",
+                "$(rm -rf /)",
+                "child",
+                AgentGeneration::Current,
+                "",
+            ),
+            (
+                "claude",
+                "parent",
+                "; echo pwned",
+                AgentGeneration::Current,
+                "",
+            ),
+            (
+                "pi",
+                "parent-id",
+                "child-id",
+                AgentGeneration::Current,
+                "--fork parent-id --session-id child-id",
+            ),
+            ("pi", "$(rm -rf /)", "child", AgentGeneration::Current, ""),
+            ("pi", "parent", "; echo pwned", AgentGeneration::Current, ""),
+        ] {
+            assert_eq!(
+                build_fork_flags(tool, parent, child, generation),
+                expected,
+                "{tool}/{generation:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn fork_command_places_codex_subcommand_after_binary_and_appends_flags() {
+        let mut inst = tool_instance("codex", "/tmp/x");
+        inst.agent_session_id = Some("child-ignored".to_string());
+        inst.resume_intent = ResumeIntent::Fork {
+            from: "parent-1234".to_string(),
+        };
+        let mut cmd = "codex --some-flag".to_string();
+        inst.apply_session_flags(
+            &mut cmd,
+            "test",
+            crate::agents::get_agent("codex"),
+            None,
+            &super::execution::AgentLaunchContext::host(
+                crate::agents::get_agent("codex"),
+                inst.default_selector_agent()
+                    .and_then(|agent| inst.host_agent_command(agent, None))
+                    .as_ref(),
+            ),
+            &mut inst.conversation_state(),
+        )
+        .unwrap();
+        assert_eq!(cmd, "codex fork parent-1234 --some-flag");
+    }
+
+    /// A store fork adopts a child mid-preparation, and the launch then
+    /// revalidates the conversation against the target the execution captured
+    /// before the command was built. The adopted child must not read as a target
+    /// that changed under the launch, which is what a promoted intent would do.
+    #[test]
+    fn a_store_fork_keeps_the_parent_as_its_revalidation_target() {
+        let home = tempfile::tempdir().unwrap();
+        let _app = crate::session::test_support::isolate_app_dir_at(home.path());
+        let parent = "ses_parent00000000000000000000000";
+        let child = "ses_ef71c5686ffedIqGGjtFGLwW1r";
+
+        let mut inst = tool_instance("opencode", "/tmp/test");
+        inst.resume_intent = ResumeIntent::Fork {
+            from: parent.to_string(),
+        };
+        inst.resume_binding = Some(crate::session::ConversationBinding {
+            session_id: parent.to_string(),
+            execution: None,
+            provenance: crate::session::ConversationProvenance::Observed,
+            transcript_path: None,
+        });
+        inst.agent_session_id = Some(child.to_string());
+        inst.agent_session_binding = Some(crate::session::ConversationBinding {
+            session_id: child.to_string(),
+            execution: None,
+            provenance: crate::session::ConversationProvenance::Observed,
+            transcript_path: None,
+        });
+
+        assert_eq!(
+            inst.stored_fork_child(),
+            Some(child),
+            "a second pass opens the adopted child"
+        );
+        assert_eq!(
+            inst.conversation_target().map(|(sid, _, _)| sid),
+            Some(parent),
+            "the fork target stays the parent, so the post-build revalidation matches"
+        );
+    }
+
+    #[test]
+    fn pi_fork_refuses_an_unpinnable_launch() {
+        let mut inst = tool_instance("pi", "/tmp/x");
+        inst.agent_session_id = Some("child-5678".to_string());
+        inst.resume_intent = ResumeIntent::Fork {
+            from: "parent-1234".to_string(),
+        };
+        let mut cmd = "pi".to_string();
+        let error = inst
+            .apply_session_flags(
+                &mut cmd,
+                "test",
+                crate::agents::get_agent("pi"),
+                None,
+                &super::execution::AgentLaunchContext::host(
+                    crate::agents::get_agent("pi"),
+                    inst.default_selector_agent()
+                        .and_then(|agent| inst.host_agent_command(agent, None))
+                        .as_ref(),
+                ),
+                &mut inst.conversation_state(),
+            )
+            .expect_err("an unpinnable Pi fork must be refused");
+        assert!(error.to_string().contains("Pi fork needs"), "{error}");
+        assert_eq!(cmd, "pi", "nothing may be appended to a refused launch");
+    }
+
+    #[test]
+    fn resume_command_uses_validated_executable_anchor() {
+        let home = tempfile::tempdir().unwrap();
+        let _isolation = crate::session::test_support::isolate_app_dir_at(home.path());
+        let profile = "validated-wrapper-anchor";
+        crate::session::instance::test_helpers::declare_execution_aliases(
+            profile,
+            &[("codex-personal", "codex")],
+            home.path(),
+        );
+        let cases = [
+            (
+                "tab separator",
+                "codex",
+                "",
+                "codex\t--model o3",
+                "codex resume SID\t--model o3",
+            ),
+            (
+                "leading whitespace",
+                "codex",
+                "",
+                " \tcodex\t--model o3",
+                " \tcodex resume SID\t--model o3",
+            ),
+            (
+                "multiple spaces",
+                "codex",
+                "",
+                "codex   --model o3",
+                "codex resume SID   --model o3",
+            ),
+            (
+                "direct alias",
+                "codex-personal",
+                "codex",
+                " \tcodex\t--model o3",
+                " \tcodex resume SID\t--model o3",
+            ),
+        ];
+        for (name, tool, detect_as, command, expected) in cases {
+            let mut inst = Instance::new(name, "/tmp/x");
+            inst.tool = tool.to_string();
+            inst.detect_as = detect_as.to_string();
+            inst.command = command.to_string();
+            inst.agent_session_id = Some("SID".to_string());
+            inst.resume_intent = ResumeIntent::Use("SID".to_string());
+            let mut cmd = command.to_string();
+
+            assert!(
+                inst.apply_session_flags(
+                    &mut cmd,
+                    "test",
+                    inst.resolved_agent(),
+                    None,
+                    &super::execution::AgentLaunchContext::host(
+                        inst.default_selector_agent(),
+                        inst.default_selector_agent()
+                            .and_then(|agent| inst.host_agent_command(agent, None))
+                            .as_ref()
+                    ),
+                    &mut inst.conversation_state()
+                )
+                .unwrap(),
+                "{name}"
+            );
+            assert_eq!(cmd, expected, "{name}");
+            assert_eq!(
+                shell_words::split(&cmd).unwrap(),
+                ["codex", "resume", "SID", "--model", "o3"],
+                "{name}"
+            );
+        }
+
+        let mut wrapper = Instance::new("wrapper", "/tmp/x");
+        wrapper.source_profile = profile.into();
+        wrapper.tool = "codex-personal".to_string();
+        wrapper.detect_as = "codex".to_string();
+        wrapper.command = "codex-personal".to_string();
+        wrapper.agent_session_id = Some("SID".to_string());
+        wrapper.resume_intent = ResumeIntent::Use("SID".to_string());
+        let mut cmd = wrapper.command.clone();
+
+        assert!(wrapper
+            .apply_session_flags(
+                &mut cmd,
+                "test",
+                wrapper.resolved_agent(),
+                None,
+                &super::execution::AgentLaunchContext::host(
+                    wrapper.default_selector_agent(),
+                    wrapper
+                        .default_selector_agent()
+                        .and_then(|agent| wrapper.host_agent_command(agent, None))
+                        .as_ref()
+                ),
+                &mut wrapper.conversation_state()
+            )
+            .unwrap());
+        assert_eq!(cmd, "codex-personal resume SID");
+
+        // A launcher still hides the binary, so the token would reach `ssh`.
+        let mut launcher = Instance::new("launcher", "/tmp/x");
+        launcher.source_profile = profile.into();
+        launcher.tool = "codex-personal".to_string();
+        launcher.detect_as = "codex".to_string();
+        launcher.command = "ssh -t host codex".to_string();
+        launcher.agent_session_id = Some("SID".to_string());
+        launcher.resume_intent = ResumeIntent::Use("SID".to_string());
+        let mut launcher_cmd = launcher.command.clone();
+
+        assert!(launcher
+            .apply_session_flags(
+                &mut launcher_cmd,
+                "test",
+                launcher.resolved_agent(),
+                None,
+                &super::execution::AgentLaunchContext::host(
+                    launcher.default_selector_agent(),
+                    launcher
+                        .default_selector_agent()
+                        .and_then(|agent| launcher.host_agent_command(agent, None))
+                        .as_ref()
+                ),
+                &mut launcher.conversation_state()
+            )
+            .is_err());
+        assert_eq!(launcher_cmd, "ssh -t host codex");
+    }
+
+    #[test]
+    fn environment_defines_path_only_for_the_assigning_form() {
+        // A pass-through entry keeps AoE's own PATH; an assignment can front a different pi.
+        assert!(environment_defines_path(&["PATH=/opt/bin".to_string()]));
+        assert!(environment_defines_path(&[
+            "API_KEY=x".to_string(),
+            " PATH =/opt/bin".to_string()
+        ]));
+        assert!(!environment_defines_path(&["PATH".to_string()]));
+        assert!(!environment_defines_path(&["PATHOLOGICAL=1".to_string()]));
+        assert!(!environment_defines_path(&[]));
+    }
+
+    #[test]
+    fn host_command_applies_yolo_resume_and_launch_subcommand() {
+        let mut codex = tool_instance("codex", "/tmp/test");
+        codex.yolo_mode = true;
+        let cmd = host_command(&mut codex);
+        match crate::agents::get_agent("codex")
+            .unwrap()
+            .yolo
+            .as_ref()
+            .unwrap()
+        {
+            crate::agents::YoloMode::CliFlag(flag) => assert!(cmd.contains(flag)),
+            crate::agents::YoloMode::EnvVar(key, _) => assert!(cmd.contains(key)),
+            crate::agents::YoloMode::AlwaysYolo
+            | crate::agents::YoloMode::EitherGeneration { .. } => {}
+        }
+
+        let mut claude = tool_instance("claude", "/tmp/test");
+        claude.agent_session_id = Some("ses_abc123def456".to_string());
+        let cmd = host_command(&mut claude);
+        assert!(cmd.contains("ses_abc123def456"));
+        assert!(cmd.contains("--session-id") || cmd.contains("--resume"));
+
+        // Kiro must launch via `kiro-cli chat`, with yolo flags after the subcommand.
+        let mut kiro = tool_instance("kiro", "/tmp/test");
+        kiro.yolo_mode = true;
+        let cmd = host_command(&mut kiro);
+        let chat = cmd.find("kiro-cli chat").expect("chat subcommand present");
+        assert!(cmd.find("--trust-all-tools").expect("yolo flag present") > chat);
+
+        // A command override is verbatim: no injected subcommand.
+        let mut custom = tool_instance("kiro", "/tmp/test");
+        custom.command = "kiro-cli chat --trust-all-tools".to_string();
+        assert_eq!(host_command(&mut custom).matches("chat").count(), 1);
+    }
+
+    /// The inlined permission object still reaches 1.x builds, where a bare
+    /// double quote would end the shell assignment and let the object be
+    /// word-split into the command.
+    #[test]
+    fn the_inlined_permission_object_is_quoted_for_the_legacy_generation() {
+        let cmd = format_env_var_prefix("OPENCODE_PERMISSION", r#"{"*":"allow"}"#, "opencode");
+        assert_eq!(cmd, r#"OPENCODE_PERMISSION='{"*":"allow"}' opencode"#);
+        let wrapped = wrap_command_ignore_suspend(&cmd, "/tmp/proj", &[], &[]);
+        assert!(wrapped.contains(r#"OPENCODE_PERMISSION='{"*":"allow"}' opencode"#));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn unknown_opencode_routes_refuse_preparation_and_preserve_the_conversation() {
+        let home = tempfile::tempdir().unwrap();
+        let _app = crate::session::test_support::isolate_app_dir_at(home.path());
+        let version_file = home.path().join("native-version");
+        let help_file = home.path().join("native-help");
+        let script = format!(
+            "#!/bin/sh\ncase \"$1\" in --version) /bin/cat '{}';; --help) /bin/cat '{}';; esac\n",
+            version_file.display(),
+            help_file.display()
+        );
+        let _opencode = crate::session::test_support::install_login_shell_path_command(
+            home.path(),
+            "opencode",
+            &script,
+        );
+        let project = home.path().join("project");
+        std::fs::create_dir(&project).unwrap();
+        let project = project.canonicalize().unwrap();
+        let database = home.path().join("opencode.db");
+        let db = rusqlite::Connection::open(&database).unwrap();
+        db.execute_batch("CREATE TABLE session_v2 (id TEXT PRIMARY KEY, workspace_id TEXT, directory TEXT NOT NULL)").unwrap();
+        let sid = "ses_0000000000000000000000000000abcd";
+        db.execute(
+            "INSERT INTO session_v2 VALUES (?1, NULL, ?2)",
+            rusqlite::params![sid, project.to_str().unwrap()],
+        )
+        .unwrap();
+        let profile = "unknown-opencode-route";
+        write_profile_environment(profile, &format!("OPENCODE_DB={}", database.display()));
+        for (version, schema_unattested, modes) in [
+            (
+                "2.0.24",
+                false,
+                &["fresh", "use", "fork", "default", "fallback"][..],
+            ),
+            ("2.0.27", true, &["use", "fork"][..]),
+            ("distro-build", true, &["use", "fork"][..]),
+        ] {
+            std::fs::write(
+                &help_file,
+                if schema_unattested {
+                    "--auto approvals"
+                } else {
+                    ""
+                },
+            )
+            .unwrap();
+            for mode in modes {
+                std::fs::write(&version_file, "2.0.24").unwrap();
+                let mut inst = tool_instance("opencode", project.to_str().unwrap());
+                inst.source_profile = profile.into();
+                let binding = inst.asserted_resume_binding(sid, None).unwrap();
+                if *mode == "use" {
+                    inst.resume_intent = ResumeIntent::Use(sid.into());
+                    inst.resume_binding = Some(binding);
+                } else if *mode == "fork" {
+                    inst.resume_intent = ResumeIntent::Fork { from: sid.into() };
+                    inst.resume_binding = Some(binding);
+                } else if *mode != "fresh" {
+                    inst.set_agent_conversation(Some(sid.into()), Some(binding), None);
+                }
+                std::fs::write(&version_file, version).unwrap();
+                let expected = inst.conversation_state();
+                if *mode == "fallback" {
+                    super::super::execution::FAIL_NEXT_NATIVE_RESOLUTION
+                        .with(|fail| fail.set(true));
+                }
+                let error = inst
+                    .prepare_launch_command(expected.clone())
+                    .err()
+                    .expect("unknown routing must refuse");
+                assert_eq!(
+                    error.is::<super::super::execution::UnattestedOpenCodeSchema>(),
+                    schema_unattested,
+                    "{version}:{mode}: {error:#}"
+                );
+                assert_eq!(
+                    inst.conversation_state(),
+                    expected,
+                    "{version}:{mode}: refused launch changed its target"
+                );
+            }
+        }
+    }
+
+    /// Records `entry` as the profile's environment, the way the documented
+    /// `environment = [...]` grammar does.
+    fn write_profile_environment(profile: &str, entry: &str) {
+        let mut config = crate::session::config::profile_config::ProfileConfig::default();
+        config
+            .overrides
+            .insert("environment".to_string(), serde_json::json!([entry]));
+        crate::session::config::profile_config::save_profile_config(profile, &config).unwrap();
+    }
+
+    #[test]
+    fn host_command_forces_color_only_for_color_sensitive_agents() {
+        for (tool, command, needle, forced) in [
+            ("antigravity", "", "agy", true),
+            ("antigravity", "agy --some-flag", "agy --some-flag", true),
+            ("codex", "", "codex", true),
+            ("cursor", "", "", false),
+        ] {
+            let mut inst = tool_instance(tool, "/tmp/test");
+            inst.command = command.to_string();
+            let cmd = host_command(&mut inst);
+            assert!(cmd.contains(needle), "{cmd}");
+            for env in [
+                "env -u NO_COLOR",
+                "TERM=xterm-256color",
+                "COLORTERM=truecolor",
+            ] {
+                assert_eq!(cmd.contains(env), forced, "{tool}: {env}");
+            }
+        }
+    }
+
+    #[test]
+    fn selected_agent_args_combines_command_and_extra_last_wins() {
+        for (command, extra, expected) in [
+            ("", "--agent custom-agent", "custom-agent"),
+            ("kiro-cli chat --agent custom-agent", "", "custom-agent"),
+            (
+                "kiro-cli chat --agent from-command",
+                "--agent from-extra",
+                "from-extra",
+            ),
+        ] {
+            let mut inst = tool_instance("kiro", "/tmp/test");
+            inst.command = command.to_string();
+            inst.extra_args = extra.to_string();
+            assert_eq!(
+                crate::agents::parse_selected_agent(&inst.selected_agent_args(), "--agent")
+                    .as_deref(),
+                Some(expected)
+            );
+        }
+    }
+    #[test]
+    #[serial_test::serial]
+    fn default_known_target_attempts_moved_context_without_rebinding() {
+        let root = tempfile::tempdir().unwrap();
+        let _app = crate::session::test_support::isolate_app_dir_at(root.path());
+        let _env = crate::session::test_support::EnvGuard::set(&[
+            ("HOME", root.path().to_str().unwrap()),
+            ("CODEX_HOME", root.path().join("codex-a").to_str().unwrap()),
+        ]);
+        let _claude = crate::session::test_support::install_login_shell_path_command(
+            root.path(),
+            "claude",
+            "#!/bin/sh\nexit 1\n",
+        );
+        let _codex = crate::session::test_support::install_login_shell_path_command(
+            root.path(),
+            "codex",
+            "#!/bin/sh\nexit 1\n",
+        );
+        for name in ["codex-a", "codex-b"] {
+            let home = root.path().join(name);
+            std::fs::create_dir_all(&home).unwrap();
+            std::fs::write(home.join("auth.json"), r#"{"OPENAI_API_KEY":"test"}"#).unwrap();
+        }
+        let sid = "11111111-2222-4333-8444-555555555555";
+        for agent in ["claude", "codex"] {
+            let before = root.path().join(format!("{agent}-before"));
+            let after = root.path().join(format!("{agent}-after"));
+            std::fs::create_dir_all(&before).unwrap();
+            std::fs::create_dir_all(&after).unwrap();
+            let mut inst = tool_instance(agent, before.to_str().unwrap());
+            inst.command = agent.into();
+            let asserted = inst.asserted_resume_binding(sid, None);
+            if agent == "codex" && crate::process::HAS_CODEX_MANAGED_PREFERENCES {
+                assert_eq!(
+                    format!("{:#}", asserted.unwrap_err()),
+                    "aoe session set-session-id cannot resolve the native execution identity for this context: Codex managed preferences cannot be attested by the local file contract"
+                );
+                continue;
+            }
+            let known = asserted.unwrap();
+            inst.set_agent_conversation(Some(sid.into()), Some(known.clone()), None);
+            if agent == "claude" {
+                inst.project_path = after.to_str().unwrap().into();
+            }
+            let _changed = (agent == "codex").then(|| {
+                crate::session::test_support::EnvGuard::set(&[(
+                    "CODEX_HOME",
+                    root.path().join("codex-b").to_str().unwrap(),
+                )])
+            });
+            let prepared = inst
+                .prepare_launch_command(inst.conversation_state())
+                .unwrap();
+            let flag = if agent == "codex" {
+                "resume "
+            } else {
+                "--resume "
+            };
+            assert!(prepared.command.unwrap().contains(&format!("{flag}{sid}")));
+            assert_eq!(inst.agent_session_binding.as_ref(), Some(&known));
+            for intent in [
+                ResumeIntent::Use(sid.into()),
+                ResumeIntent::Fork { from: sid.into() },
+            ] {
+                inst.resume_intent = intent;
+                inst.resume_binding = Some(known.clone());
+                assert!(inst
+                    .prepare_launch_command(inst.conversation_state())
+                    .is_err());
+            }
+        }
+    }
+
+    /// Claude reads `$CLAUDE_CONFIG_DIR/.claude.json` whenever the variable is
+    /// set, so a host launch into the default store must leave it unset (#4119).
+    #[test]
+    #[serial_test::serial]
+    fn host_claude_exports_its_store_only_when_it_is_not_the_default() {
+        let temp = tempfile::tempdir().unwrap();
+        let _app = crate::session::test_support::isolate_app_dir_at(temp.path());
+        let _claude = crate::session::test_support::install_login_shell_path_command(
+            temp.path(),
+            "claude",
+            "#!/bin/sh\nexit 0\n",
+        );
+        let default = temp.path().join(".claude");
+        let custom = temp.path().join("custom-claude");
+        let sid = "11111111-1111-4111-8111-111111111111";
+        let canonical = |path: &std::path::Path| {
+            crate::session::capture::canonicalize_allowing_missing_leaf(path).unwrap()
+        };
+        for (exported, expected) in [
+            (None, None),
+            (Some(&default), Some(&default)),
+            (Some(&custom), Some(&custom)),
+        ] {
+            let _env = match exported {
+                Some(dir) => EnvGuard::set(&[("CLAUDE_CONFIG_DIR", dir)]),
+                None => EnvGuard::unset(&["CLAUDE_CONFIG_DIR"]),
+            };
+            let expected = expected.map(|path| canonical(path));
+            let mut inst = Instance::new("claude-host-store", "/tmp");
+            let routed = |inst: &Instance| {
+                let execution = inst
+                    .resolve_native_execution(inst.conversation_target())
+                    .unwrap();
+                let routed = execution
+                    .routing
+                    .iter()
+                    .find(|(key, _)| key == "CLAUDE_CONFIG_DIR")
+                    .map(|(_, value)| value.as_deref().map(|value| canonical(value.as_ref())))
+                    .expect("Claude store is always routed");
+                (routed, execution)
+            };
+            let (fresh, execution) = routed(&inst);
+            assert_eq!(fresh, expected, "exported={exported:?}");
+            let parts = inst
+                .build_launch_command(Some(&execution), &mut inst.conversation_state())
+                .unwrap();
+            let command = parts.command.unwrap();
+            assert_eq!(
+                command.contains("unset CLAUDE_CONFIG_DIR"),
+                expected.is_none(),
+                "{command}"
+            );
+
+            // Resuming a conversation recorded in the default store keeps it unset, also from
+            // a binding recorded before the export was, and that binding still validates.
+            let mut asserted = inst.asserted_resume_binding(sid, None).unwrap();
+            inst.resume_binding = Some(asserted.clone());
+            inst.resume_intent = ResumeIntent::Use(sid.into());
+            assert_eq!(routed(&inst).0, expected, "exported={exported:?}");
+            asserted.execution.as_mut().unwrap().exported_default_store = None;
+            inst.resume_binding = Some(asserted);
+            let (legacy, execution) = routed(&inst);
+            assert_eq!(legacy, expected, "legacy exported={exported:?}");
+            inst.validate_conversation_target(&execution.binding, Some(sid))
+                .unwrap();
+        }
+    }
+
+    /// A store explicitly selected through a symlinked `~/.claude` is still exported, and the
+    /// selection survives capture; only the implicit default stays unset.
+    #[test]
+    #[serial_test::serial]
+    fn explicit_alias_of_the_default_claude_store_stays_exported() {
+        let temp = tempfile::tempdir().unwrap();
+        let _app = crate::session::test_support::isolate_app_dir_at(temp.path());
+        let _env = EnvGuard::unset(&["CLAUDE_CONFIG_DIR"]);
+        let _claude = crate::session::test_support::install_login_shell_path_command(
+            temp.path(),
+            "claude",
+            "#!/bin/sh\nexit 0\n",
+        );
+        let work = temp.path().join("profiles/work");
+        std::fs::create_dir_all(&work).unwrap();
+        std::os::unix::fs::symlink(&work, temp.path().join(".claude")).unwrap();
+        let work = work.canonicalize().unwrap();
+        let declare = |profile: &str, dir: &str| {
+            let path =
+                crate::session::config::profile_config::get_profile_config_path(profile).unwrap();
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(
+                &path,
+                format!("[session.agent_config_dir]\nclaude = {dir:?}\n"),
+            )
+            .unwrap();
+        };
+        declare("alias", work.to_str().unwrap());
+        declare("literal", "~/.claude");
+        let sid = "11111111-1111-4111-8111-111111111111";
+        let routed = |inst: &Instance| {
+            let execution = inst
+                .resolve_native_execution(inst.conversation_target())
+                .unwrap();
+            let routed = execution
+                .routing
+                .iter()
+                .find(|(key, _)| key == "CLAUDE_CONFIG_DIR")
+                .and_then(|(_, value)| value.clone())
+                .map(std::path::PathBuf::from);
+            (routed, execution.binding)
+        };
+        let capture = |inst: &mut Instance, binding| {
+            inst.resume_binding = None;
+            inst.resume_intent = ResumeIntent::Default;
+            inst.set_agent_conversation(
+                Some(sid.into()),
+                Some(crate::session::ConversationBinding {
+                    session_id: sid.into(),
+                    execution: Some(binding),
+                    provenance: crate::session::ConversationProvenance::Observed,
+                    transcript_path: None,
+                }),
+                None,
+            );
+        };
+
+        let literal = temp.path().join(".claude");
+        for (profile, store, expected) in [
+            ("undeclared", None, None),
+            ("literal", None, None),
+            ("alias", None, Some(&work)),
+            ("undeclared", Some(&work), Some(&work)),
+            ("undeclared", Some(&literal), None),
+        ] {
+            let mut inst = Instance::new("claude-alias-store", "/tmp");
+            inst.source_profile = profile.into();
+            if let Some(store) = store {
+                inst.resume_binding = Some(inst.asserted_resume_binding(sid, Some(store)).unwrap());
+                inst.resume_intent = ResumeIntent::Use(sid.into());
+            }
+            let (launched, binding) = routed(&inst);
+            assert_eq!(
+                launched.as_ref(),
+                expected,
+                "profile={profile} store={store:?}"
+            );
+            // The next launch resumes from the binding this launch's capture records.
+            capture(&mut inst, binding.clone());
+            inst.source_profile = "undeclared".into();
+            assert_eq!(
+                routed(&inst).0.as_ref(),
+                expected,
+                "profile={profile} store={store:?}"
+            );
+            // A binding recorded before the export was kept it only while a selector names it.
+            capture(
+                &mut inst,
+                crate::session::ExecutionBinding {
+                    exported_default_store: None,
+                    ..binding
+                },
+            );
+            inst.source_profile = profile.into();
+            let legacy = if store.is_some() { None } else { expected };
+            assert_eq!(
+                routed(&inst).0.as_ref(),
+                legacy,
+                "legacy profile={profile} store={store:?}"
+            );
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn sandboxed_assertion_keeps_the_native_container_store() {
+        let temp = tempfile::tempdir().unwrap();
+        let _app = crate::session::test_support::isolate_app_dir_at(&temp.path().join("app"));
+        let project = temp.path().join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        let profile = "sandbox-asserted-store";
+        super::super::test_helpers::declare_execution_aliases(
+            profile,
+            &[("claude", "claude")],
+            temp.path(),
+        );
+        let mut inst = Instance::new("claude-sandbox", project.to_str().unwrap());
+        inst.tool = "claude".into();
+        inst.command = "claude".into();
+        inst.source_profile = profile.into();
+        inst.sandbox_info = Some(crate::session::SandboxInfo {
+            provider: None,
+            enabled: true,
+            container_id: None,
+            image: "fixture".into(),
+            container_name: "claude-sandbox".into(),
+            extra_env: None,
+            custom_instruction: None,
+            container_workdir: Some("/workspace/project".into()),
+            before_start_env: Vec::new(),
+        });
+        let config = inst.build_container_config().unwrap();
+        let _transport = super::super::test_helpers::install_container_transport(
+            temp.path(),
+            "claude-sandbox",
+            &config.volumes,
+        );
+        std::fs::copy(
+            temp.path().join("native-bin/prime-agent"),
+            temp.path().join("native-bin/claude"),
+        )
+        .unwrap();
+        let sid = "11111111-1111-4111-8111-111111111111";
+        let execution = inst.resolve_native_execution(None).unwrap();
+        let asserted = inst.asserted_resume_binding(sid, None).unwrap();
+        inst.resume_intent = ResumeIntent::Use(sid.into());
+        inst.resume_binding = Some(asserted);
+        inst.prepare_launch_command(inst.conversation_state())
+            .unwrap();
+        let resumed = inst
+            .resolve_native_execution(inst.conversation_target())
+            .unwrap();
+        inst.validate_conversation_target(&resumed.binding, Some(sid))
+            .unwrap();
+        assert_eq!(resumed.binding, execution.binding);
+        assert_ne!(
+            resumed.binding.stores[0],
+            std::path::Path::new("/root/.claude")
+        );
+        assert_eq!(
+            resumed
+                .routing
+                .iter()
+                .find(|(key, _)| key == "CLAUDE_CONFIG_DIR")
+                .unwrap()
+                .1
+                .as_deref(),
+            Some("/root/.claude")
+        );
+        inst.resume_intent = ResumeIntent::Default;
+        inst.resume_binding = None;
+        inst.set_agent_conversation(
+            Some(sid.into()),
+            Some(crate::session::ConversationBinding::unknown(sid)),
+            None,
+        );
+        let carried = inst
+            .prepare_launch_command(inst.conversation_state())
+            .unwrap();
+        assert!(carried
+            .command
+            .unwrap()
+            .contains(&format!("--resume {sid}")));
+        assert_eq!(
+            inst.agent_session_binding,
+            Some(crate::session::ConversationBinding::unknown(sid))
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn an_unattestable_recorded_conversation_warns_at_launch() {
+        let root = tempfile::tempdir().unwrap();
+        let _app = crate::session::test_support::isolate_app_dir_at(root.path());
+        let codex_home = root.path().join("codex");
+        std::fs::create_dir_all(&codex_home).unwrap();
+        let _env = crate::session::test_support::EnvGuard::set(&[
+            ("HOME", root.path().to_str().unwrap()),
+            ("CODEX_HOME", codex_home.to_str().unwrap()),
+        ]);
+        // Nothing here can attest a Codex execution identity.
+        let _codex = crate::session::test_support::install_login_shell_path_command(
+            root.path(),
+            "codex",
+            "#!/bin/sh\nexit 1\n",
+        );
+        let project = root.path().join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        let sid = "11111111-2222-4333-8444-555555555555";
+        let launch = |session_id: Option<&str>, intent: ResumeIntent| {
+            let mut inst = tool_instance("codex", project.to_str().unwrap());
+            inst.agent_session_id = session_id.map(str::to_owned);
+            inst.resume_intent = intent;
+            let capture = crate::session::test_support::LogCapture::start();
+            let _ = inst.prepare_launch_command(inst.conversation_state());
+            capture.contents()
+        };
+
+        let carried = launch(Some(sid), ResumeIntent::Default);
+        let warned = carried
+            .lines()
+            .find(|line| line.contains("WARN") && line.contains("no attestable execution context"))
+            .unwrap_or_else(|| panic!("no warning for the carried conversation:\n{carried}"));
+        assert!(warned.contains(sid), "the warning names the conversation");
+        assert!(!carried.contains("native execution unavailable"));
+
+        // A cleared launch still holds its stored id this early, so it must not warn.
+        for (session_id, label) in [(Some(sid), "cleared with a stored id"), (None, "fresh")] {
+            let quiet = launch(session_id, ResumeIntent::Cleared);
+            assert!(
+                !quiet.contains("no attestable execution context"),
+                "a {label} launch must stay quiet:\n{quiet}"
+            );
+            assert!(
+                quiet.lines().any(|line| line.contains("DEBUG")
+                    && line.contains("native execution unavailable; using native launch flags")),
+                "expected the debug line for a {label} launch:\n{quiet}"
+            );
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn migration_unattributed_pins_resume_against_configured_store() {
+        let root = tempfile::tempdir().unwrap();
+        let _app = crate::session::test_support::isolate_app_dir_at(&root.path().join("app"));
+        // $HOME is the last store fallback, so pin it to the fixture root.
+        let _env = EnvGuard::set(&[("HOME", root.path().to_str().unwrap())]);
+        let _unset = EnvGuard::unset(&["CLAUDE_CONFIG_DIR"]);
+        let _claude = crate::session::test_support::install_login_shell_path_command(
+            root.path(),
+            "claude",
+            "#!/bin/sh\nexit 1\n",
+        );
+        let project = root.path().join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        let store = root.path().join("account");
+        std::fs::create_dir_all(&store).unwrap();
+        let profile = "unattributed-store";
+        let parent = "11111111-2222-4333-8444-555555555555";
+        let child = "22222222-3333-4444-8555-666666666666";
+        let config =
+            crate::session::config::profile_config::get_profile_config_path(profile).unwrap();
+        std::fs::create_dir_all(config.parent().unwrap()).unwrap();
+        std::fs::write(
+            config,
+            format!(
+                "[session.agent_config_dir]\nclaude = {:?}\n",
+                store.to_str().unwrap()
+            ),
+        )
+        .unwrap();
+
+        // Pre-upgrade rows: a pinned conversation and a forked child, neither
+        // of which recorded a binding.
+        let mut pinned = tool_instance("claude", project.to_str().unwrap());
+        pinned.agent_session_id = Some(parent.into());
+        pinned.resume_intent = ResumeIntent::Use(parent.into());
+        let mut forked = tool_instance("claude", project.to_str().unwrap());
+        forked.agent_session_id = Some(child.into());
+        forked.resume_intent = ResumeIntent::Fork {
+            from: parent.into(),
+        };
+        crate::session::storage::Storage::new_unwatched(profile)
+            .unwrap()
+            .update(|rows, _| {
+                *rows = vec![pinned, forked];
+                Ok(())
+            })
+            .unwrap();
+
+        // Pin below v031 so only the provenance migration and its successors touch this fixture.
+        std::fs::write(
+            crate::session::get_app_dir()
+                .unwrap()
+                .join(".schema_version"),
+            "30",
+        )
+        .unwrap();
+        crate::migrations::run_migrations().unwrap();
+
+        let rows = crate::session::storage::Storage::new_unwatched(profile)
+            .unwrap()
+            .load()
+            .unwrap();
+        let pin = bound_row(&rows, profile, parent);
+        let fork = bound_row(&rows, profile, child);
+        assert_eq!(
+            pin.resume_binding,
+            Some(ConversationBinding::unknown(parent))
+        );
+        assert_eq!(
+            pin.agent_session_binding,
+            Some(ConversationBinding::unknown(parent))
+        );
+        assert_eq!(
+            fork.resume_binding,
+            Some(ConversationBinding::unknown(parent))
+        );
+        assert_eq!(
+            fork.agent_session_binding,
+            Some(ConversationBinding::unknown(child))
+        );
+
+        for (row, forks) in [(&pin, false), (&fork, true)] {
+            let prepared = prepared_launch(row);
+            let command = prepared.command.clone().unwrap();
+            assert!(command.contains(&format!("--resume {parent}")), "{command}");
+            // Nothing recorded a store, so the launch has to take the store
+            // that current configuration names, resolved to its real path.
+            assert_eq!(
+                prepared.execution.unwrap().binding.stores[0],
+                path_identity(&store),
+                "{command}"
+            );
+            // A pin resumes its own conversation; a fork writes a new one.
+            assert_eq!(command.contains("--fork-session"), forks, "{command}");
+            assert_eq!(command.contains("--session-id"), forks, "{command}");
+        }
+
+        // An explicit pin still needs a binding that names its own
+        // conversation, whatever its provenance.
+        let mut foreign = pin.clone();
+        foreign.resume_binding = Some(ConversationBinding::unknown(child));
+        let error = foreign
+            .prepare_launch_command(foreign.conversation_state())
+            .err()
+            .expect("a pin naming another conversation stays refused")
+            .to_string();
+        assert!(
+            error.contains("conversation provenance is unknown"),
+            "{error}"
+        );
+
+        // Provenance that contradicts an attached execution identity is not
+        // the migration's shape, so it buys nothing.
+        let mut contradictory = pin.clone();
+        let mut asserted = contradictory.asserted_resume_binding(parent, None).unwrap();
+        asserted.provenance = crate::session::ConversationProvenance::Unknown;
+        contradictory.resume_binding = Some(asserted);
+        let error = contradictory
+            .prepare_launch_command(contradictory.conversation_state())
+            .err()
+            .expect("a contradictory provenance stays refused")
+            .to_string();
+        assert!(
+            error.contains("has not been observed or explicitly asserted"),
+            "{error}"
+        );
+    }
+
+    /// The migrated row that names `sid`; load does not stamp the launch's config profile.
+    fn bound_row(rows: &[Instance], profile: &str, sid: &str) -> Instance {
+        let mut row = rows
+            .iter()
+            .find(|row| row.agent_session_id.as_deref() == Some(sid))
+            .unwrap_or_else(|| panic!("migration left no row bound to {sid}"))
+            .clone();
+        row.source_profile = profile.into();
+        row
+    }
+
+    fn prepared_launch(row: &Instance) -> PreparedLaunch {
+        let mut row = row.clone();
+        row.prepare_launch_command(row.conversation_state())
+            .expect("a conversation migration left unattributed must resume")
+    }
+
+    /// A recorded store outranks `session.agent_config_dir`, so repointing the
+    /// entry switches the account for new sessions only. The launch has to say
+    /// so, or the edit is indistinguishable from doing nothing.
+    #[test]
+    #[serial_test::serial]
+    fn a_recorded_claude_store_overrides_a_repointed_agent_config_dir() {
+        let _app = crate::session::test_support::isolate_app_dir();
+        let stub = tempfile::tempdir().unwrap();
+        let _claude = crate::session::test_support::install_login_shell_path_command(
+            stub.path(),
+            "claude",
+            "#!/bin/sh\nexit 1\n",
+        );
+        let home = dirs::home_dir().unwrap();
+        let app = crate::session::get_app_dir().unwrap();
+        std::fs::create_dir_all(&app).unwrap();
+        let project = home.join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        let profile = crate::session::config::effective_profile("");
+        let _registry = crate::tmux::status_rules::ProfileRegistryGuard::take(&profile);
+        let sid = "11111111-2222-3333-4444-555555555555";
+        let declare = |store: &str| {
+            for root in [store, "source", "destination"] {
+                std::fs::create_dir_all(home.join(root)).unwrap();
+            }
+            std::fs::write(
+                app.join("config.toml"),
+                format!("[session.agent_config_dir]\nclaude = \"~/{store}\"\n"),
+            )
+            .unwrap();
+        };
+        let instance = || {
+            let mut inst = Instance::new("claude-store", project.to_str().unwrap());
+            inst.tool = "claude".into();
+            inst.command = "claude".into();
+            inst.source_profile = profile.clone();
+            inst
+        };
+        let resumed = |inst: &mut Instance, execution: crate::session::ExecutionBinding| {
+            let binding = crate::session::ConversationBinding {
+                session_id: sid.into(),
+                provenance: crate::session::ConversationProvenance::Asserted,
+                transcript_path: None,
+                execution: Some(execution),
+            };
+            inst.agent_session_id = Some(sid.into());
+            inst.agent_session_binding = Some(binding.clone());
+            inst.resume_intent = crate::session::ResumeIntent::Default;
+            let capture = crate::session::test_support::LogCapture::start();
+            let prepared = inst
+                .prepare_launch_command(inst.conversation_state())
+                .unwrap();
+            (prepared, capture.contents())
+        };
+
+        // The first launch attests the store the entry names.
+        declare("source");
+        let attested = instance().resolve_native_execution(None).unwrap();
+        assert_eq!(
+            attested.binding.stores[0],
+            home.join("source").canonicalize().unwrap()
+        );
+
+        // A real transcript in the recorded store, so the launch takes the
+        // resume path rather than starting a fresh conversation. Claude looks
+        // it up under the canonical working directory, not the stored one.
+        let transcript = home
+            .join("source/projects")
+            .join(crate::session::capture::encode_claude_project_path(
+                &crate::session::capture::canonicalize_or_raw(project.to_str().unwrap())
+                    .to_string_lossy(),
+            ))
+            .join(format!("{sid}.jsonl"));
+        std::fs::create_dir_all(transcript.parent().unwrap()).unwrap();
+        std::fs::write(&transcript, "conversation\n").unwrap();
+
+        // Repointing the entry moves a targetless launch, so the divergence
+        // below is the recorded binding holding the store, not a stale config.
+        declare("destination");
+        let configured = home.join("destination").canonicalize().unwrap();
+        assert_eq!(
+            instance()
+                .resolve_native_execution(None)
+                .unwrap()
+                .binding
+                .stores[0],
+            configured
+        );
+
+        let (prepared, log) = resumed(&mut instance(), attested.binding.clone());
+        assert!(
+            prepared
+                .command
+                .as_deref()
+                .is_some_and(|command| command.contains(&format!("--resume {sid}"))),
+            "the conversation must still resume, in its recorded store"
+        );
+        let source = crate::session::instance::test_helpers::path_identity(&home.join("source"));
+        assert_eq!(
+            prepared.execution.as_ref().unwrap().binding.stores.first(),
+            Some(&source),
+            "the recorded store outranks the repointed entry"
+        );
+        // The resolver reports nothing itself: a restart resolves twice, so
+        // the launch is the only place that may emit.
+        assert_eq!(
+            prepared.execution.as_ref().unwrap().store_override.as_ref(),
+            Some(&(
+                source.clone(),
+                crate::session::instance::test_helpers::path_identity(&home.join("destination")),
+                "agent_config_dir"
+            )),
+            "the launch must name the store a new session would use and where it came from"
+        );
+        assert!(
+            !log.contains("launch_store="),
+            "resolution must stay silent so a restart cannot warn twice: {log}"
+        );
+
+        // Keyed on level, target and structured fields, not prose, so a
+        // reword cannot disarm them and a downgrade cannot hide the line.
+        let capture = crate::session::test_support::LogCapture::start();
+        let reporter = instance();
+        let reporting_id = reporter.id.clone();
+        reporter.report_store_override(prepared.execution.as_ref());
+        let line = capture.contents();
+        for expected in [
+            "WARN session.store:".to_string(),
+            // The line names the session that is reporting, so assert it on
+            // the instance that reports rather than on the one resolved.
+            format!("session={reporting_id}"),
+            format!("launch_store={}", source.display()),
+            format!(
+                "new_session_store={}",
+                crate::session::instance::test_helpers::path_identity(&home.join("destination"))
+                    .display()
+            ),
+            "new_session_store_source=agent_config_dir".to_string(),
+        ] {
+            assert!(line.contains(&expected), "{expected} missing from: {line}");
+        }
+
+        // A selector that cannot be resolved must not fail a launch the
+        // recorded store already decides, so the resume still goes through
+        // and nothing is reported.
+        let broken = home.join("broken");
+        std::os::unix::fs::symlink(home.join("absent"), &broken).unwrap();
+        std::fs::write(
+            app.join("config.toml"),
+            "[session.agent_config_dir]\nclaude = \"~/broken\"\n",
+        )
+        .unwrap();
+        let (unresolved, _) = resumed(&mut instance(), attested.binding.clone());
+        assert!(
+            unresolved
+                .command
+                .as_deref()
+                .is_some_and(|command| command.contains(&format!("--resume {sid}"))),
+            "a dangling selector must not block a recorded-store resume"
+        );
+        // It is still a divergence, and the one a user can act on: the
+        // launch is not on the store they wrote, so report that spelling.
+        let reported = unresolved
+            .execution
+            .as_ref()
+            .and_then(|execution| execution.store_override.as_ref())
+            .expect("an unresolvable selector is still a divergence")
+            .clone();
+        assert_eq!(reported.2, "agent_config_dir");
+        assert!(
+            reported.1.to_string_lossy().ends_with("broken"),
+            "the report must name the spelling the user wrote: {reported:?}"
+        );
+
+        // The other side of that bargain: with nothing recorded the selector
+        // does choose the root, so an unresolvable one must still refuse.
+        let bare = instance();
+        let refusal = match bare.resolve_native_execution(None) {
+            Err(refusal) => refusal,
+            Ok(_) => panic!("an unresolvable selector must refuse a launch it decides"),
+        };
+        let refusal = format!("{refusal:#}");
+        // The path, not the wording: it is this test's own input, and it is
+        // what a discarded error chain would take with it. Asserting the
+        // refusal's phrasing would couple this to a message in execution.rs
+        // that #4154 deliberately stopped freezing.
+        assert!(
+            refusal.contains(&*broken.to_string_lossy()),
+            "the refusal must keep the cause, which names the path: {refusal}"
+        );
+
+        // Same declaration as the recorded store: the common launch stays quiet.
+        declare("source");
+        let (uncontested, _) = resumed(&mut instance(), attested.binding.clone());
+        assert!(
+            uncontested
+                .execution
+                .as_ref()
+                .and_then(|execution| execution.store_override.as_ref())
+                .is_none(),
+            "an uncontested store must not be reported"
+        );
+
+        // A second spelling of the same directory is not a divergence: the
+        // entry is a symlink onto the store the conversation already uses.
+        let aliased = home.join("link");
+        std::os::unix::fs::symlink(&source, &aliased).unwrap();
+        declare("link");
+        let (spelled, _) = resumed(&mut instance(), attested.binding.clone());
+        assert!(
+            spelled
+                .execution
+                .as_ref()
+                .and_then(|execution| execution.store_override.as_ref())
+                .is_none(),
+            "a symlinked spelling of the recorded store must not be reported"
+        );
+
+        // The other two sources, which the guide tells a reader to key on:
+        // the session environment, then the default with nothing declared.
+        std::fs::write(app.join("config.toml"), "[session]\n").unwrap();
+        let env = EnvGuard::set(&[("CLAUDE_CONFIG_DIR", home.join("source"))]);
+        let (unreported, _) = resumed(&mut instance(), attested.binding.clone());
+        assert!(
+            unreported
+                .execution
+                .as_ref()
+                .and_then(|execution| execution.store_override.as_ref())
+                .is_none(),
+            "the environment naming the recorded store is not a divergence"
+        );
+        drop(env);
+        let other = home.join("elsewhere");
+        std::fs::create_dir_all(&other).unwrap();
+        let env = EnvGuard::set(&[("CLAUDE_CONFIG_DIR", &other)]);
+        let (from_env, _) = resumed(&mut instance(), attested.binding.clone());
+        assert_eq!(
+            from_env
+                .execution
+                .as_ref()
+                .and_then(|execution| execution.store_override.as_ref()),
+            Some(&(
+                crate::session::instance::test_helpers::path_identity(&source),
+                crate::session::instance::test_helpers::path_identity(&other),
+                "environment"
+            )),
+            "a session environment store must be named as the source"
+        );
+        drop(env);
+        // The session environment baselines on the process environment, so the
+        // default tier needs the variable removed, not merely undeclared.
+        let _env = EnvGuard::unset(&["CLAUDE_CONFIG_DIR"]);
+        let (from_default, _) = resumed(&mut instance(), attested.binding.clone());
+        assert_eq!(
+            from_default
+                .execution
+                .as_ref()
+                .and_then(|execution| execution.store_override.as_ref()),
+            Some(&(
+                crate::session::instance::test_helpers::path_identity(&source),
+                crate::session::instance::test_helpers::path_identity(&home.join(".claude")),
+                "default"
+            )),
+            "with no declaration and no environment the default store is the source"
+        );
+    }
+
+    /// A typed title rides the first launch as the agent's own session name, quoted, and only
+    /// once the setting is on: with it off the agent is not even probed for the flag.
+    #[test]
+    #[serial_test::serial]
+    fn a_typed_title_names_the_agent_only_when_the_setting_is_on() {
+        let temp_home = tempfile::tempdir().unwrap();
+        let _home = crate::session::test_support::isolate_home(temp_home.path());
+        let project = temp_home.path().join("proj");
+        std::fs::create_dir_all(&project).unwrap();
+        let probed = temp_home.path().join("probed");
+        let _claude = install_claude_help_stub(temp_home.path(), CLAUDE_HELP_WITH_NAME, &probed);
+
+        let mut claude = tool_instance("claude", project.to_str().unwrap());
+        claude.title = "O'Brien's plan".to_string();
+        claude.first_launch_names_agent = true;
+        let command = attested_host_command(&mut claude);
+        assert!(!command.contains("--name"), "off by default: {command}");
+        assert!(
+            !probed.exists(),
+            "the agent was probed with the setting off"
+        );
+
+        set_name_agent_session(&claude, true);
+        let command = attested_host_command(&mut claude);
+        let expected = format!("--name {}", shell_escape("O'Brien's plan"));
+        assert!(
+            command.contains(&expected),
+            "want: {expected}\ngot:  {command}"
+        );
+        assert!(probed.exists(), "the setting on probes the agent");
+    }
+
+    /// Each case starts from a launch that is named, then changes one thing that must keep the
+    /// title off the launch line.
+    #[test]
+    #[serial_test::serial]
+    fn the_agent_name_is_withheld_where_it_would_not_land_as_a_name() {
+        let temp_home = tempfile::tempdir().unwrap();
+        let _home = crate::session::test_support::isolate_home(temp_home.path());
+        let _env = EnvGuard::unset(&["CLAUDE_CONFIG_DIR"]);
+        let project = temp_home.path().join("proj");
+        std::fs::create_dir_all(&project).unwrap();
+        let probed = temp_home.path().join("probed");
+        let _claude = install_claude_help_stub(temp_home.path(), CLAUDE_HELP_WITH_NAME, &probed);
+
+        type Case = (&'static str, fn(&mut Instance));
+        let cases: &[Case] = &[
+            ("a generated title", |inst| {
+                inst.first_launch_names_agent = false
+            }),
+            ("a resumed conversation", |inst| {
+                let sid = inst
+                    .agent_session_id
+                    .clone()
+                    .expect("the baseline pinned an id");
+                seed_claude_transcript(inst, &sid)
+            }),
+            ("a command override", |inst| {
+                inst.command = "ssh -t host claude".into()
+            }),
+            ("an argument terminator", |inst| {
+                inst.extra_args = "--".into()
+            }),
+            ("-n in the arguments", |inst| {
+                inst.extra_args = "-n mine".into()
+            }),
+            ("--name in the arguments", |inst| {
+                inst.extra_args = "--name mine".into()
+            }),
+            ("--name= in the arguments", |inst| {
+                inst.extra_args = "--name=mine".into()
+            }),
+            ("a flag-shaped title", |inst| {
+                inst.title = "--dry-run notes".into()
+            }),
+        ];
+        for (case, change) in cases {
+            let mut claude = tool_instance("claude", project.to_str().unwrap());
+            claude.title = "night shift".to_string();
+            claude.first_launch_names_agent = true;
+            set_name_agent_session(&claude, true);
+            assert!(
+                attested_host_command(&mut claude).contains("--name"),
+                "{case}: the baseline is named"
+            );
+            change(&mut claude);
+            let command = attested_host_command(&mut claude);
+            if *case == "a resumed conversation" {
+                assert!(command.contains("--resume"), "{case}: {command}");
+            }
+            assert_eq!(
+                command.matches("--name").count(),
+                claude.extra_args.matches("--name").count(),
+                "{case}: only the user's own --name may remain: {command}"
+            );
+        }
+
+        let mut claude = tool_instance("claude", project.to_str().unwrap());
+        claude.title = "night shift".to_string();
+        claude.first_launch_names_agent = true;
+        let command = host_command(&mut claude);
+        assert!(
+            !command.contains("--name"),
+            "without an attested execution the pane may run another install: {command}"
+        );
+
+        let _older =
+            install_claude_help_stub(temp_home.path(), "  -r, --resume [value]  Resume", &probed);
+        let command = attested_host_command(&mut claude);
+        assert!(
+            !command.contains("--name"),
+            "an install whose --help lacks the flag would reject it: {command}"
+        );
+    }
+
+    /// A sandboxed launch execs the container's agent, which the host probe does not speak for.
+    #[test]
+    #[serial_test::serial]
+    fn a_sandboxed_launch_carries_no_agent_name() {
+        let temp = tempfile::tempdir().unwrap();
+        let _app = crate::session::test_support::isolate_app_dir_at(&temp.path().join("app"));
+        let project = temp.path().join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        let profile = "sandbox-agent-name";
+        super::super::test_helpers::declare_execution_aliases(
+            profile,
+            &[("claude", "claude")],
+            temp.path(),
+        );
+        let mut inst = Instance::new("claude-sandbox", project.to_str().unwrap());
+        inst.tool = "claude".into();
+        inst.command = "claude".into();
+        inst.source_profile = profile.into();
+        inst.title = "night shift".into();
+        inst.first_launch_names_agent = true;
+        set_name_agent_session(&inst, true);
+        inst.sandbox_info = Some(crate::session::SandboxInfo {
+            provider: None,
+            enabled: true,
+            container_id: None,
+            image: "fixture".into(),
+            container_name: "claude-sandbox".into(),
+            extra_env: None,
+            custom_instruction: None,
+            container_workdir: Some("/workspace/project".into()),
+            before_start_env: Vec::new(),
+        });
+        let config = inst.build_container_config().unwrap();
+        let _transport = super::super::test_helpers::install_container_transport(
+            temp.path(),
+            "claude-sandbox",
+            &config.volumes,
+        );
+        std::fs::copy(
+            temp.path().join("native-bin/prime-agent"),
+            temp.path().join("native-bin/claude"),
+        )
+        .unwrap();
+
+        let command = inst
+            .prepare_launch_command(inst.conversation_state())
+            .unwrap()
+            .command
+            .expect("a sandboxed launch command");
+        assert!(
+            command.contains("--session-id"),
+            "the session flags were applied, so the launch line was really built: {command}"
+        );
+        assert!(!command.contains("--name"), "{command}");
+    }
+}

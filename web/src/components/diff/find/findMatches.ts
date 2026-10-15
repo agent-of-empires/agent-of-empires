@@ -1,20 +1,7 @@
-/**
- * In-diff find that searches a supplied set of lines (the diff *model*), not
- * the rendered DOM.
- *
- * The diff is rendered with a virtualized renderer (`@pierre/diffs`), so
- * off-screen lines are not in the DOM and the browser's native Cmd+F can't
- * reach them. Searching the model lets find/next/prev jump to a match anywhere
- * in the diff; the caller then scrolls the renderer to it.
- *
- * Callers pass exactly the lines that should be searchable; for the MVP, the
- * changed (added/deleted) lines of the diff (see `changedLines`), so find only
- * matches content that's actually part of the change, not the whole file.
- */
+// Find over the diff model: virtualized rows are not in the DOM, so native find cannot reach them.
 
 export type FindSide = "old" | "new";
 
-/** A line that find is allowed to match against. */
 export interface SearchableLine {
   side: FindSide;
   /** 1-based line number within that side. */
@@ -30,7 +17,6 @@ export interface FindMatch {
   startCol: number;
   /** Exclusive end char offset within the line. */
   endCol: number;
-  /** Global ordering index across all returned matches. */
   index: number;
 }
 
@@ -39,15 +25,7 @@ export interface FindOptions {
   regex?: boolean;
 }
 
-/**
- * Find every non-overlapping occurrence of `query` across `lines`, preserving
- * the order of `lines` (callers pass them in rendered/diff order so next/prev
- * steps top-to-bottom).
- *
- * Returns an empty array for an empty query. Throws `SyntaxError` when `regex`
- * is set and `query` is not a valid regular expression, so the caller can
- * surface an "invalid pattern" state.
- */
+/** Non-overlapping matches in line order; throws `SyntaxError` for an invalid regex. */
 export function findMatches(lines: SearchableLine[], query: string, opts: FindOptions = {}): FindMatch[] {
   if (query.length === 0) return [];
 

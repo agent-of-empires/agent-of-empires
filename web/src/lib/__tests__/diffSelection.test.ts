@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { expect, it } from "vitest";
 import { diffSelectionStale } from "../diffSelection";
 import type { RichDiffFile } from "../types";
 
@@ -11,28 +11,14 @@ const file = (path: string, repo_name?: string): RichDiffFile => ({
   repo_name,
 });
 
-describe("diffSelectionStale", () => {
-  it("is false when there is no selection", () => {
-    expect(diffSelectionStale(null, false, [file("a.ts")])).toBe(false);
-  });
-
-  it("is false for a cited selection even when absent from the diff", () => {
-    expect(diffSelectionStale({ path: "b.ts", cited: true }, false, [file("a.ts")])).toBe(false);
-  });
-
-  it("is false while the diff list is still loading", () => {
-    expect(diffSelectionStale({ path: "b.ts" }, true, [])).toBe(false);
-  });
-
-  it("is true when a plain selection is absent from the diff list", () => {
-    expect(diffSelectionStale({ path: "b.ts" }, false, [file("a.ts")])).toBe(true);
-  });
-
-  it("is false when the selection is present (path and repo match)", () => {
-    expect(diffSelectionStale({ path: "a.ts", repoName: "api" }, false, [file("a.ts", "api")])).toBe(false);
-  });
-
-  it("is true when the path matches but the repo differs", () => {
-    expect(diffSelectionStale({ path: "a.ts", repoName: "web" }, false, [file("a.ts", "api")])).toBe(true);
-  });
+it("diffSelectionStale only for a loaded, uncited selection missing from the diff", () => {
+  const cases: [string, Parameters<typeof diffSelectionStale>, boolean][] = [
+    ["no selection", [null, false, [file("a.ts")]], false],
+    ["cited", [{ path: "b.ts", cited: true }, false, [file("a.ts")]], false],
+    ["loading", [{ path: "b.ts" }, true, []], false],
+    ["absent", [{ path: "b.ts" }, false, [file("a.ts")]], true],
+    ["present", [{ path: "a.ts", repoName: "api" }, false, [file("a.ts", "api")]], false],
+    ["other repo", [{ path: "a.ts", repoName: "web" }, false, [file("a.ts", "api")]], true],
+  ];
+  for (const [name, args, expected] of cases) expect(diffSelectionStale(...args), name).toBe(expected);
 });

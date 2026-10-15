@@ -1,4 +1,4 @@
-import { useMemo } from "react";
+import { useMemo, useRef, useState } from "react";
 import { updateSettings } from "../../lib/api";
 import type { SettingsFieldDescriptor } from "../../lib/types";
 import { SchemaSection } from "./SchemaSection";
@@ -6,29 +6,36 @@ import { SchemaSection } from "./SchemaSection";
 const PLUGIN_PREFIX = "plugin:";
 
 interface Props {
-  /** Full schema descriptor list (`GET /api/settings/schema`), including the
-   *  virtual `plugin:<id>` sections of active plugins. */
+  /** Includes the virtual `plugin:<id>` sections. */
   schema: SettingsFieldDescriptor[];
-  /** The loaded global settings object (`GET /api/settings`). */
   settings: Record<string, unknown> | null;
-  /** Re-fetch settings after a successful save, so the new value round-trips. */
   onSaved: () => void;
 }
 
-/** Stored value table for a plugin's settings: `plugins.<id>.settings`. */
 function storedSettings(settings: Record<string, unknown> | null, id: string): Record<string, unknown> {
   const plugins = (settings?.plugins ?? {}) as Record<string, { settings?: Record<string, unknown> }>;
   return plugins[id]?.settings ?? {};
 }
 
 /**
- * Settings for active plugins, rendered through the same generic SchemaSection
- * as core settings, one block per `plugin:<id>` section. Plugin settings are
- * global-only at Tier 0, so saves go through the global `PATCH /api/settings`
- * (the server folds `plugin:<id>` into `plugins.<id>.settings`); the manifest's
- * declared default is shown until a value is stored.
+ * A saved value shown until the refetch it triggers lands. `inflight` counts unfinished PATCHes;
+ * `acked` is the last value the server accepted, which a later failed save falls back to.
  */
+type Pending = Record<
+  string,
+  { section: string; field: string; value: unknown; inflight: number; acked?: { value: unknown } }
+>;
+
+/** One SchemaSection per active plugin; plugin settings are global, saved via `PATCH /api/settings`. */
 export function PluginSettingsSections({ schema, settings, onSaved }: Props) {
+  const [pending, setPending] = useState<Pending>({});
+  const queue = useRef<Record<string, Promise<void>>>({});
+  const [seenSettings, setSeenSettings] = useState(settings);
+  if (settings !== seenSettings) {
+    setSeenSettings(settings);
+    setPending((p) => Object.fromEntries(Object.entries(p).filter(([, e]) => e.inflight > 0)));
+  }
+
   const sections = useMemo(() => {
     const seen = new Set<string>();
     const ordered: string[] = [];
@@ -43,8 +50,32 @@ export function PluginSettingsSections({ schema, settings, onSaved }: Props) {
 
   if (sections.length === 0) return null;
 
+  // Apply the value at once, like the core settings tabs, so an editor that acts on
+  // `values` again before the PATCH and refetch finish builds on this save, not the old value.
   const save = async (section: string, field: string, value: unknown): Promise<boolean> => {
-    const ok = await updateSettings({ [section]: { [field]: value } });
+    const key = `${section}\0${field}`;
+    setPending((p) => ({ ...p, [key]: { ...p[key], section, field, value, inflight: (p[key]?.inflight ?? 0) + 1 } }));
+    // The server applies each PATCH atomically but not in arrival order, so send a field's saves one at a time.
+    const request = (queue.current[key] ?? Promise.resolve()).then(() =>
+      updateSettings({ [section]: { [field]: value } }),
+    );
+    queue.current[key] = request.then(
+      () => undefined,
+      () => undefined,
+    );
+    const ok = await request;
+    setPending((p) => {
+      const entry = p[key];
+      if (!entry) return p;
+      const inflight = entry.inflight - 1;
+      const acked = ok ? { value } : entry.acked;
+      if (!ok && inflight === 0) {
+        // Fall back to what the server last accepted: the settings prop may not have refetched it yet.
+        if (!acked) return Object.fromEntries(Object.entries(p).filter(([k]) => k !== key));
+        return { ...p, [key]: { ...entry, value: acked.value, inflight, acked } };
+      }
+      return { ...p, [key]: { ...entry, inflight, acked } };
+    });
     if (ok) onSaved();
     return ok;
   };
@@ -60,6 +91,9 @@ export function PluginSettingsSections({ schema, settings, onSaved }: Props) {
           if (d.section === section && d.default !== undefined) values[d.field] = d.default;
         }
         Object.assign(values, storedSettings(settings, id));
+        for (const e of Object.values(pending)) {
+          if (e.section === section) values[e.field] = e.value;
+        }
         return (
           <div key={section} className="space-y-3">
             <h5 className="text-xs font-mono text-text-secondary">{id}</h5>

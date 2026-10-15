@@ -15,13 +15,8 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { act, cleanup, fireEvent, render, renderHook, screen } from "@testing-library/react";
 import type { ReactNode } from "react";
 
-vi.mock("../../lib/highlighter", () => ({
-  ensureThemeLoaded: vi.fn().mockResolvedValue("dark-plus"),
-  getHighlighter: vi.fn().mockResolvedValue({
-    codeToHtml: (code: string) => `<pre>${code}</pre>`,
-  }),
-  langKeyForExt: (s: string) => s,
-  loadLanguage: vi.fn().mockResolvedValue(undefined),
+vi.mock("../../lib/snippetHighlighter", () => ({
+  highlightSnippet: vi.fn().mockResolvedValue(null),
 }));
 
 vi.mock("../../hooks/useShikiTheme", () => ({
@@ -58,12 +53,8 @@ afterEach(() => {
 });
 
 describe("useToolDisplayMode", () => {
-  it("defaults to detailed outside a provider", () => {
-    const { result } = renderHook(() => useToolDisplayMode());
-    expect(result.current).toBe("detailed");
-  });
-
-  it("reads the provided density inside a provider", () => {
+  it("defaults to detailed outside a provider and reads the provided density inside one", () => {
+    expect(renderHook(() => useToolDisplayMode()).result.current).toBe("detailed");
     const { result } = renderHook(() => useToolDisplayMode(), {
       wrapper: ({ children }) => <ToolDisplayModeProvider density="compact">{children}</ToolDisplayModeProvider>,
     });
@@ -72,21 +63,18 @@ describe("useToolDisplayMode", () => {
 });
 
 describe("useToolDensityPref", () => {
-  it("defaults detailed and toggles to compact, persisting to storage", () => {
-    const { result } = renderHook(() => useToolDensityPref());
+  it("defaults detailed, toggles with persistence, and initialises from storage", () => {
+    const { result, unmount } = renderHook(() => useToolDensityPref());
     expect(result.current[0]).toBe("detailed");
     act(() => result.current[1]());
     expect(result.current[0]).toBe("compact");
     expect(window.localStorage.getItem(STORAGE_KEY)).toBe("compact");
-    act(() => result.current[1]());
-    expect(result.current[0]).toBe("detailed");
+    unmount();
+    const reloaded = renderHook(() => useToolDensityPref());
+    expect(reloaded.result.current[0]).toBe("compact");
+    act(() => reloaded.result.current[1]());
+    expect(reloaded.result.current[0]).toBe("detailed");
     expect(window.localStorage.getItem(STORAGE_KEY)).toBe("detailed");
-  });
-
-  it("initialises from a previously stored compact preference", () => {
-    window.localStorage.setItem(STORAGE_KEY, "compact");
-    const { result } = renderHook(() => useToolDensityPref());
-    expect(result.current[0]).toBe("compact");
   });
 });
 

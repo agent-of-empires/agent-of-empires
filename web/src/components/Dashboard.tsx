@@ -1,10 +1,13 @@
 import { useMemo } from "react";
 import type { SessionResponse } from "../lib/types";
-import { isSessionActive } from "../lib/session";
+import { getStatusTextClass, isSessionActive } from "../lib/session";
 import { useIdleDecayWindowMs } from "../lib/idleDecay";
+import { useIsWideViewport } from "../hooks/useIsWideViewport";
 import { AOE_BRAND_MARK_COLORS, AOE_BRAND_MARK_TEXT_SHADOW } from "../lib/brandMark";
 import { TOUR_ANCHORS, type TourAnchorId } from "../lib/tourSteps";
-import { PluginCards } from "./plugin/PluginSlots";
+import { PluginCards, PluginHomePanes } from "./plugin/PluginSlots";
+import { StatusGlyph } from "./StatusGlyph";
+import { StrokeIcon } from "./icons";
 
 interface Props {
   sessions: SessionResponse[];
@@ -20,6 +23,7 @@ interface Props {
 
 export function Dashboard({
   sessions,
+  onSelectSession,
   onNewSession,
   onCloneFromUrl,
   onToggleSidebar,
@@ -27,6 +31,7 @@ export function Dashboard({
   canManageProjects = true,
 }: Props) {
   const idleDecayWindowMs = useIdleDecayWindowMs();
+  const isWideViewport = useIsWideViewport();
   const stats = useMemo(() => {
     const projects = new Set<string>();
     let total = 0;
@@ -34,10 +39,9 @@ export function Dashboard({
     let waiting = 0;
     let errors = 0;
     for (const s of sessions) {
-      // Trashed sessions are conceptually deleted (the sidebar buckets them
-      // into a dedicated Trash section, out of the active/archived buckets), so
-      // they must not skew this summary: a session left in an Error state does
-      // not matter once it is in the trash. See #2489.
+      // Trashed sessions are conceptually deleted (the sidebar buckets them into a dedicated Trash section, out of
+      // the active/archived buckets), so they must not skew this summary: a session left in an Error state does
+      // not matter once it is in the trash.
       if (s.trashed_at) continue;
       total++;
       projects.add(s.main_repo_path || s.project_path);
@@ -47,9 +51,22 @@ export function Dashboard({
     }
     return { total, active, waiting, errors, projects: projects.size };
   }, [idleDecayWindowMs, sessions]);
+  const recentSessions = useMemo(
+    () =>
+      sessions
+        .filter((session) => !session.trashed_at)
+        .sort((a, b) => recentSessionTimestamp(b) - recentSessionTimestamp(a) || b.id.localeCompare(a.id))
+        .slice(0, 5),
+    [sessions],
+  );
 
   return (
-    <div className="flex-1 flex flex-col items-center justify-center bg-surface-950 px-4">
+    <div
+      className="flex-1 flex flex-col items-center justify-start overflow-y-auto bg-surface-950 px-4 py-6 md:justify-center md:py-0"
+      // Bottom home-indicator clearance: the App root no longer reserves it
+      // (see index.css .safe-area-inset). Collapses to the base gap off-device.
+      style={{ paddingBottom: "max(1.5rem, env(safe-area-inset-bottom))" }}
+    >
       {/* Logo + Title */}
       <svg viewBox="0 0 128 128" className="w-12 h-12 md:w-16 md:h-16 mb-3" aria-hidden="true">
         <defs>
@@ -123,25 +140,60 @@ export function Dashboard({
         </div>
       )}
 
+      {/* The desktop sidebar is always available, but mobile starts at this dashboard. */}
+      {!isWideViewport && recentSessions.length > 0 && (
+        <section className="md:hidden mb-4 w-full max-w-md" aria-labelledby="recent-sessions-heading">
+          <h2
+            id="recent-sessions-heading"
+            className="mb-2 px-1 text-[11px] font-mono uppercase tracking-[0.16em] text-text-muted"
+          >
+            Recent sessions
+          </h2>
+          <div className="overflow-hidden rounded-lg border border-surface-700/40 bg-surface-900">
+            {recentSessions.map((session) => (
+              <button
+                key={session.id}
+                type="button"
+                onClick={() => onSelectSession(session.id)}
+                className="flex w-full cursor-pointer items-center gap-3 border-b border-surface-700/40 px-3 py-2.5 text-left last:border-b-0 hover:bg-surface-850 active:bg-surface-800 focus-visible:outline-2 focus-visible:outline-offset-[-2px] focus-visible:outline-brand-600"
+              >
+                <span
+                  aria-hidden="true"
+                  className={`shrink-0 font-mono text-sm leading-none ${getStatusTextClass(session, idleDecayWindowMs)}`}
+                >
+                  <StatusGlyph
+                    status={session.status}
+                    createdAt={session.created_at ?? null}
+                    idleEnteredAt={session.idle_entered_at}
+                    dormant={session.dormant}
+                  />
+                </span>
+                <span className="min-w-0 flex-1">
+                  <span className="block truncate font-mono text-sm font-medium text-text-primary">
+                    {session.title}
+                  </span>
+                  <span className="block truncate text-xs text-text-muted">
+                    {session.main_repo_path || session.project_path}
+                  </span>
+                </span>
+                <span aria-hidden="true" className="text-text-dim">
+                  ›
+                </span>
+              </button>
+            ))}
+          </div>
+        </section>
+      )}
+
       {/* Mobile sidebar toggle */}
       <button
         onClick={onToggleSidebar}
         className="md:hidden mb-4 w-full max-w-md px-4 py-2.5 rounded-lg bg-surface-900 border border-surface-700/40 text-text-secondary text-sm flex items-center justify-center gap-2 cursor-pointer hover:bg-surface-850 active:bg-surface-800 transition-colors"
       >
-        <svg
-          width="16"
-          height="16"
-          viewBox="0 0 24 24"
-          fill="none"
-          stroke="currentColor"
-          strokeWidth="2"
-          strokeLinecap="round"
-          strokeLinejoin="round"
-          aria-hidden="true"
-        >
+        <StrokeIcon size={16} strokeWidth="2" hidden>
           <rect x="3" y="3" width="18" height="18" rx="2" />
           <line x1="9" y1="3" x2="9" y2="21" />
-        </svg>
+        </StrokeIcon>
         Show sessions
       </button>
 
@@ -182,6 +234,10 @@ export function Dashboard({
           no spacing) until a plugin pushes a card. */}
       <PluginCards />
 
+      {/* Host-wide plugin panes (the home-pane slot). Renders nothing until a
+          plugin pushes one. */}
+      <PluginHomePanes />
+
       {/* Keyboard hint (desktop only) */}
       {!readOnly && (
         <p className="mt-4 text-[11px] font-mono text-text-dim hidden md:block">
@@ -191,6 +247,11 @@ export function Dashboard({
       )}
     </div>
   );
+}
+
+function recentSessionTimestamp(session: SessionResponse): number {
+  const timestamp = Date.parse(session.last_accessed_at ?? session.created_at);
+  return Number.isNaN(timestamp) ? 0 : timestamp;
 }
 
 function ActionPane({
@@ -212,57 +273,24 @@ function ActionPane({
 }) {
   const iconSvg = {
     folder: (
-      <svg
-        width="24"
-        height="24"
-        viewBox="0 0 24 24"
-        fill="none"
-        stroke="currentColor"
-        strokeWidth="1.5"
-        strokeLinecap="round"
-        strokeLinejoin="round"
-        className="text-brand-500"
-        aria-hidden="true"
-      >
+      <StrokeIcon size={24} strokeWidth="1.5" className="text-brand-500" hidden>
         <path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z" />
-      </svg>
+      </StrokeIcon>
     ),
     git: (
-      <svg
-        width="24"
-        height="24"
-        viewBox="0 0 24 24"
-        fill="none"
-        stroke="currentColor"
-        strokeWidth="1.5"
-        strokeLinecap="round"
-        strokeLinejoin="round"
-        className="text-brand-500"
-        aria-hidden="true"
-      >
+      <StrokeIcon size={24} strokeWidth="1.5" className="text-brand-500" hidden>
         <circle cx="12" cy="18" r="3" />
         <circle cx="6" cy="6" r="3" />
         <circle cx="18" cy="6" r="3" />
         <path d="M18 9v2c0 .6-.4 1-1 1H7c-.6 0-1-.4-1-1V9" />
         <line x1="12" y1="12" x2="12" y2="15" />
-      </svg>
+      </StrokeIcon>
     ),
     book: (
-      <svg
-        width="24"
-        height="24"
-        viewBox="0 0 24 24"
-        fill="none"
-        stroke="currentColor"
-        strokeWidth="1.5"
-        strokeLinecap="round"
-        strokeLinejoin="round"
-        className="text-brand-500"
-        aria-hidden="true"
-      >
+      <StrokeIcon size={24} strokeWidth="1.5" className="text-brand-500" hidden>
         <path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20" />
         <path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z" />
-      </svg>
+      </StrokeIcon>
     ),
   };
 

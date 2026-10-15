@@ -1,20 +1,9 @@
-import { useEffect, useRef, useState } from "react";
+import { useRef, useState } from "react";
 import { Check, Clock, ListOrdered, SlidersHorizontal, Siren } from "lucide-react";
 import type { SidebarSortMode } from "../lib/sidebarSort";
 import type { PluginSortSpec } from "../lib/pluginUi";
 import { Tooltip } from "./Tooltip";
-
-// Sidebar sort picker (#1640). Replaces the former two-state Clock /
-// ListOrdered toggle now that there are three modes; a cycle button gets
-// opaque past two states, so this is an explicit labeled dropdown. The
-// trigger shows the active mode's icon and tints brand when any non-manual
-// (computed) mode is active, matching the axis toggle's affordance. Outside
-// click and Escape close it, mirroring OverflowMenu.
-//
-// Plugin `sort-key` entries (#2401) appear as extra options below the
-// built-ins; selecting one activates an ephemeral plugin sort (a computed
-// mode, so drag is disabled while it is active). Selecting a built-in clears
-// it via `onSortModeChange`.
+import { useOutsideDismiss } from "./useOutsideDismiss";
 
 interface ModeSpec {
   mode: SidebarSortMode;
@@ -47,6 +36,7 @@ interface Props {
   onPluginSortChange?: (ref: PluginSortRef) => void;
 }
 
+/** Sort mode dropdown; plugin `sort-key` entries follow the built-ins as computed modes. */
 export function SidebarSortPicker({
   sortMode,
   onSortModeChange,
@@ -57,29 +47,13 @@ export function SidebarSortPicker({
   const [open, setOpen] = useState(false);
   const ref = useRef<HTMLDivElement>(null);
 
-  useEffect(() => {
-    if (!open) return;
-    const onDocClick = (e: MouseEvent) => {
-      if (ref.current && !ref.current.contains(e.target as Node)) setOpen(false);
-    };
-    const onKeydown = (e: KeyboardEvent) => {
-      if (e.key === "Escape") setOpen(false);
-    };
-    document.addEventListener("mousedown", onDocClick);
-    document.addEventListener("keydown", onKeydown);
-    return () => {
-      document.removeEventListener("mousedown", onDocClick);
-      document.removeEventListener("keydown", onKeydown);
-    };
-  }, [open]);
+  useOutsideDismiss(open, [ref], () => setOpen(false));
 
-  // A plugin sort is active only when the ref resolves to a live `sort-key`
-  // entry; a stale ref (daemon restart) falls back to the built-in trigger.
+  // A stale ref (for example after a daemon restart) falls back to the built-in trigger.
   const activePlugin = pluginSortRef
     ? pluginSorts.find((s) => s.pluginId === pluginSortRef.pluginId && s.entryId === pluginSortRef.entryId)
     : undefined;
 
-  // MODES is non-empty by construction, so the fallback is always defined.
   const activeBuiltin = MODES.find((m) => m.mode === sortMode) ?? MODES[0]!;
   const ActiveIcon = activePlugin ? SlidersHorizontal : activeBuiltin.Icon;
   const activeLabel = activePlugin ? activePlugin.label : activeBuiltin.label;
@@ -110,60 +84,68 @@ export function SidebarSortPicker({
           data-testid="sidebar-sort-menu"
           className="absolute right-0 top-full mt-1 min-w-[160px] bg-surface-800 border border-surface-700/50 rounded-md shadow-xl py-1 z-50 animate-fade-in"
         >
-          {MODES.map(({ mode, label, Icon }) => {
-            const selected = !activePlugin && mode === sortMode;
-            return (
-              <button
-                key={mode}
-                role="menuitemradio"
-                aria-checked={selected}
-                data-testid={`sidebar-sort-option-${mode}`}
-                onClick={() => {
-                  setOpen(false);
-                  if (activePlugin || mode !== sortMode) onSortModeChange(mode);
-                }}
-                className={`w-full flex items-center gap-2 px-3 py-1.5 text-sm cursor-pointer hover:bg-surface-700/60 ${
-                  selected ? "text-brand-500" : "text-text-secondary hover:text-text-primary"
-                }`}
-              >
-                <Icon className="h-3.5 w-3.5 shrink-0" />
-                <span className="flex-1 text-left">{label}</span>
-                {selected && <Check className="h-3.5 w-3.5 shrink-0" />}
-              </button>
-            );
-          })}
-          {pluginSorts.length > 0 && (
-            <>
-              <div className="my-1 border-t border-surface-700/50" role="separator" />
-              {pluginSorts.map((spec) => {
-                const selected =
-                  activePlugin != null &&
-                  activePlugin.pluginId === spec.pluginId &&
-                  activePlugin.entryId === spec.entryId;
-                return (
-                  <button
-                    key={`${spec.pluginId}:${spec.entryId}`}
-                    role="menuitemradio"
-                    aria-checked={selected}
-                    data-testid={`sidebar-sort-option-plugin-${spec.entryId}`}
-                    onClick={() => {
-                      setOpen(false);
-                      if (!selected) onPluginSortChange?.({ pluginId: spec.pluginId, entryId: spec.entryId });
-                    }}
-                    className={`w-full flex items-center gap-2 px-3 py-1.5 text-sm cursor-pointer hover:bg-surface-700/60 ${
-                      selected ? "text-brand-500" : "text-text-secondary hover:text-text-primary"
-                    }`}
-                  >
-                    <SlidersHorizontal className="h-3.5 w-3.5 shrink-0" />
-                    <span className="flex-1 text-left truncate">{spec.label}</span>
-                    {selected && <Check className="h-3.5 w-3.5 shrink-0" />}
-                  </button>
-                );
-              })}
-            </>
-          )}
+          {MODES.map(({ mode, label, Icon }) => (
+            <SortOption
+              key={mode}
+              testId={`sidebar-sort-option-${mode}`}
+              Icon={Icon}
+              label={label}
+              selected={!activePlugin && mode === sortMode}
+              onSelect={(selected) => {
+                setOpen(false);
+                if (!selected) onSortModeChange(mode);
+              }}
+            />
+          ))}
+          {pluginSorts.length > 0 && <div className="my-1 border-t border-surface-700/50" role="separator" />}
+          {pluginSorts.map((spec) => (
+            <SortOption
+              key={`${spec.pluginId}:${spec.entryId}`}
+              testId={`sidebar-sort-option-plugin-${spec.entryId}`}
+              Icon={SlidersHorizontal}
+              label={spec.label}
+              truncate
+              selected={activePlugin?.pluginId === spec.pluginId && activePlugin.entryId === spec.entryId}
+              onSelect={(selected) => {
+                setOpen(false);
+                if (!selected) onPluginSortChange?.({ pluginId: spec.pluginId, entryId: spec.entryId });
+              }}
+            />
+          ))}
         </div>
       )}
     </div>
+  );
+}
+
+function SortOption({
+  testId,
+  Icon,
+  label,
+  truncate = false,
+  selected,
+  onSelect,
+}: {
+  testId: string;
+  Icon: typeof Clock;
+  label: string;
+  truncate?: boolean;
+  selected: boolean;
+  onSelect: (selected: boolean) => void;
+}) {
+  return (
+    <button
+      role="menuitemradio"
+      aria-checked={selected}
+      data-testid={testId}
+      onClick={() => onSelect(selected)}
+      className={`w-full flex items-center gap-2 px-3 py-1.5 text-sm cursor-pointer hover:bg-surface-700/60 ${
+        selected ? "text-brand-500" : "text-text-secondary hover:text-text-primary"
+      }`}
+    >
+      <Icon className="h-3.5 w-3.5 shrink-0" />
+      <span className={`flex-1 text-left${truncate ? " truncate" : ""}`}>{label}</span>
+      {selected && <Check className="h-3.5 w-3.5 shrink-0" />}
+    </button>
   );
 }

@@ -1,15 +1,11 @@
-//! Skills manager: list every discovered skill (the AoE-managed store plus
-//! every host-discovered agent skills directory), view a skill's `SKILL.md`,
-//! and run the managed-skill lifecycle in-TUI: create, edit, delete, adopt a
-//! host skill into the managed store, and share every managed skill out to
-//! every agent's skills directory. The TUI twin of `aoe skill` and the
-//! backend model in `crate::session::skills_model`.
+//! Skills manager: list every discovered skill, view a `SKILL.md`, and run the
+//! managed-skill lifecycle (create, edit, delete, adopt a host skill, share to
+//! every agent). The TUI twin of `aoe skill` over `crate::session::skills_model`.
 //!
-//! `home`/`app_dir` are resolved once at construction and reused for every
-//! action rather than re-resolved per keypress, so the mutating helpers below
-//! take no I/O-resolution path of their own (and so a test can hand them a
-//! tempdir directly).
+//! `home`/`app_dir` resolve once at construction, so the mutating helpers take
+//! no resolution path of their own and a test can hand them a tempdir.
 
+use std::cell::RefCell;
 use std::path::PathBuf;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -19,6 +15,7 @@ use ratatui_textarea::TextArea;
 
 use super::{centered_rect, DialogResult};
 use crate::session::skills_model::{self, DiscoveredSkill, SkillError, SyncOutcome, SyncStatus};
+use crate::tui::components::hint_buttons::ListMouse;
 use crate::tui::styles::Theme;
 use crate::tui::worker::Worker;
 
@@ -30,17 +27,23 @@ struct SyncRequest {
 
 /// The floating popup owning the keyboard; at most one at a time.
 enum Popup {
-    /// Read-only view of a skill's `SKILL.md` (Enter on a row).
-    View { content: String, scroll: u16 },
+    View {
+        content: String,
+        scroll: u16,
+    },
     /// Editing a managed skill's `SKILL.md`.
     Edit {
         directory: String,
         text_area: Box<TextArea<'static>>,
     },
     /// Creating a new managed skill: the directory name being typed.
-    Create { name: String },
+    Create {
+        name: String,
+    },
     /// Confirming deletion of a managed skill.
-    ConfirmDelete { directory: String },
+    ConfirmDelete {
+        directory: String,
+    },
 }
 
 pub struct SkillsManagerDialog {
@@ -50,12 +53,11 @@ pub struct SkillsManagerDialog {
     popup: Option<Popup>,
     home: PathBuf,
     app_dir: PathBuf,
-    /// Spawned on the first share, so a panel that is only browsed never
-    /// starts a thread. Reconciling every skill against every root walks and
-    /// digests whole packages, so it cannot run on the thread that draws
-    /// frames and reads keys without freezing both.
+    /// Spawned on the first share, so browsing starts no thread. Reconciling
+    /// walks and digests whole packages, which would freeze the draw loop.
     sync_worker: Option<Worker<SyncRequest, Vec<SyncOutcome>>>,
     syncing: bool,
+    mouse: RefCell<ListMouse>,
 }
 
 impl Default for SkillsManagerDialog {
@@ -64,8 +66,7 @@ impl Default for SkillsManagerDialog {
     }
 }
 
-/// Map a [`SkillError`] to the message shown in `info`, the same wording the
-/// CLI and the web API surface for the same failures.
+/// The `info` message for a [`SkillError`], worded as the CLI and web do.
 fn describe_skill_error(error: SkillError) -> String {
     match error {
         SkillError::InvalidInput(m)
@@ -124,13 +125,13 @@ impl SkillsManagerDialog {
             app_dir,
             sync_worker: None,
             syncing: false,
+            mouse: RefCell::default(),
         };
         dialog.reload();
         dialog
     }
 
-    /// Drain a finished share. Returns whether anything changed, so the caller
-    /// only redraws when it must, matching the other pollers.
+    /// Drain a finished share; true when the caller must redraw.
     pub fn tick(&mut self) -> bool {
         let Some(worker) = &self.sync_worker else {
             return false;
@@ -153,6 +154,22 @@ impl SkillsManagerDialog {
     fn reload_after(&mut self, message: String) {
         self.reload();
         self.info = Some(message);
+    }
+
+    pub fn handle_click(&mut self, col: u16, row: u16) -> Option<KeyEvent> {
+        let mouse = self.mouse.get_mut();
+        if let Some(key) = mouse.hint_at(col, row) {
+            return Some(key);
+        }
+        if self.popup.is_some() {
+            return None;
+        }
+        mouse.click_row(col, row, self.rows.len(), &mut self.selected)
+    }
+
+    pub fn handle_hover(&mut self, col: u16, row: u16) -> bool {
+        let (len, rows_live) = (self.rows.len(), self.popup.is_none());
+        self.mouse.get_mut().handle_hover(col, row, len, rows_live)
     }
 
     pub fn handle_key(&mut self, key: KeyEvent) -> DialogResult<()> {
@@ -207,18 +224,15 @@ impl SkillsManagerDialog {
         }
     }
 
-    /// Take a bracketed paste. Only the editor and the create prompt accept
-    /// text; anywhere else in the panel a paste is a no-op, which still has to
-    /// be swallowed here rather than falling through to the home view's other
-    /// dialogs while this one is open.
+    /// Take a bracketed paste. Only the editor and create prompt accept text;
+    /// elsewhere it is swallowed rather than falling through to the home view.
     pub fn handle_paste(&mut self, text: &str) {
         match &mut self.popup {
             Some(Popup::Edit { text_area, .. }) => {
                 text_area.insert_str(text);
             }
             Some(Popup::Create { name }) => {
-                // A directory name is one line, so a multi-line paste takes its
-                // first line rather than smuggling newlines into a path.
+                // A directory name is one line; take the first.
                 name.push_str(text.lines().next().unwrap_or_default());
             }
             _ => {}
@@ -317,8 +331,7 @@ impl SkillsManagerDialog {
                 name.pop();
                 self.popup = Some(Popup::Create { name });
             }
-            // Only a plain keypress is text. Without this, a chord like Ctrl+U
-            // types its letter into the name instead of being ignored.
+            // Only a plain keypress is text, or Ctrl+U types its letter.
             KeyCode::Char(c)
                 if !key
                     .modifiers
@@ -350,7 +363,7 @@ impl SkillsManagerDialog {
         DialogResult::Continue
     }
 
-    /// Open the read-only view popup for the selected row (any provenance).
+    /// Open the read-only view popup for the selected row.
     fn open_view(&mut self) {
         let Some(row) = self.rows.get(self.selected) else {
             return;
@@ -438,8 +451,7 @@ impl SkillsManagerDialog {
         self.popup = Some(Popup::ConfirmDelete { directory });
     }
 
-    /// Reconcile every managed skill into every agent's skills directory and
-    /// summarize the outcome counts.
+    /// Reconcile every managed skill into every agent's skills directory.
     fn share_all(&mut self) {
         if self.syncing {
             self.info = Some("Already sharing.".to_string());
@@ -475,6 +487,7 @@ impl SkillsManagerDialog {
             .padding(Padding::horizontal(1));
         let inner = block.inner(rect);
         f.render_widget(block, rect);
+        self.mouse.borrow_mut().reset();
         self.render_list(f, inner, theme);
         match &self.popup {
             Some(Popup::View { content, scroll }) => {
@@ -490,6 +503,9 @@ impl SkillsManagerDialog {
             }
             None => {}
         }
+        self.mouse
+            .borrow()
+            .paint_hover(f, theme, self.rows.len(), self.popup.is_none());
     }
 
     fn render_list(&self, f: &mut Frame, area: Rect, theme: &Theme) {
@@ -541,6 +557,9 @@ impl SkillsManagerDialog {
             let mut state = ListState::default();
             state.select(Some(self.selected));
             f.render_stateful_widget(list, chunks[0], &mut state);
+            self.mouse
+                .borrow_mut()
+                .record_list(chunks[0], state.offset());
         }
 
         self.render_footer(f, chunks[1], theme);
@@ -566,6 +585,9 @@ impl SkillsManagerDialog {
             .style(Style::default().fg(color))
             .wrap(Wrap { trim: true });
         f.render_widget(footer, area);
+        if self.info.is_none() {
+            self.mouse.borrow_mut().record_hints(f.buffer_mut(), area);
+        }
     }
 
     fn render_view(&self, f: &mut Frame, area: Rect, theme: &Theme, content: &str, scroll: u16) {
@@ -590,6 +612,9 @@ impl SkillsManagerDialog {
             Paragraph::new("j/k scroll · esc close").style(Style::default().fg(theme.dimmed)),
             chunks[1],
         );
+        self.mouse
+            .borrow_mut()
+            .record_hints(f.buffer_mut(), chunks[1]);
     }
 
     fn render_edit(
@@ -633,6 +658,9 @@ impl SkillsManagerDialog {
             Paragraph::new("ctrl+s save · esc cancel").style(Style::default().fg(theme.dimmed)),
             chunks[1],
         );
+        self.mouse
+            .borrow_mut()
+            .record_hints(f.buffer_mut(), chunks[1]);
     }
 
     fn render_create(&self, f: &mut Frame, area: Rect, theme: &Theme, name: &str) {
@@ -710,6 +738,15 @@ impl SkillsManagerDialog {
         let inner = block.inner(rect);
         f.render_widget(block, rect);
         f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: true }), inner);
+        // The footer is the notice's last line.
+        let footer_row = Rect {
+            y: inner.bottom().saturating_sub(1),
+            height: 1,
+            ..inner
+        };
+        self.mouse
+            .borrow_mut()
+            .record_hints(f.buffer_mut(), footer_row);
     }
 }
 
@@ -752,6 +789,7 @@ mod tests {
             app_dir,
             sync_worker: None,
             syncing: false,
+            mouse: RefCell::default(),
         };
         dialog.reload();
         dialog.selected = dialog
@@ -764,12 +802,6 @@ mod tests {
         (dialog.info, dialog.popup.is_some())
     }
 
-    /// `e`/`x` are writable-only (AoE-managed rows open a popup; host rows are
-    /// refused with an explanation), `a` is the mirror image (host rows adopt
-    /// straight through; a managed row is refused as already-managed).
-    /// A paste belongs to whatever the panel currently has open, and nowhere
-    /// else: with no popup it must be swallowed rather than leaking to the
-    /// home view's other dialogs.
     #[test]
     fn paste_lands_in_the_open_popup_only() {
         let tmp = tempfile::tempdir().unwrap();
@@ -785,6 +817,7 @@ mod tests {
             app_dir,
             sync_worker: None,
             syncing: false,
+            mouse: RefCell::default(),
         };
         dialog.reload();
 

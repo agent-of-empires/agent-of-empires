@@ -45,6 +45,9 @@ struct StatusJson {
 pub async fn run(profile: &str, args: StatusArgs) -> Result<()> {
     let storage = Storage::open_unwatched(profile)?;
     let (mut instances, _) = storage.load_with_groups()?;
+    for inst in &mut instances {
+        inst.source_profile = storage.profile().to_string();
+    }
 
     if instances.is_empty() {
         if args.json {
@@ -59,12 +62,13 @@ pub async fn run(profile: &str, args: StatusArgs) -> Result<()> {
         return Ok(());
     }
 
-    // Refresh tmux session cache
+    crate::session::config::profile_config::resolve_config_or_warn(profile);
+
     crate::tmux::refresh_session_cache();
 
     let contended = crate::session::Instance::contended_capture_cwds(&instances);
     for inst in &mut instances {
-        inst.update_status();
+        inst.update_status_once(None, None);
         inst.self_heal_session_id(profile, &contended);
     }
 
@@ -105,7 +109,6 @@ pub async fn run(profile: &str, args: StatusArgs) -> Result<()> {
         );
     }
 
-    // Show update notice if available (skip for JSON/quiet output)
     if !args.json && !args.quiet {
         crate::update::print_update_notice().await;
     }
@@ -145,19 +148,8 @@ fn print_status_group(
 
     println!("{} ({}):", label, matching.len());
     for inst in matching {
-        let path = shorten_path(&inst.project_path);
+        let path = crate::util::collapse_tilde(&inst.project_path);
         println!("  {} {:<16} {:<10} {}", symbol, inst.title, inst.tool, path);
     }
     println!();
-}
-
-fn shorten_path(path: &str) -> String {
-    if let Some(home) = dirs::home_dir() {
-        if let Some(home_str) = home.to_str() {
-            if let Some(stripped) = path.strip_prefix(home_str) {
-                return format!("~{}", stripped);
-            }
-        }
-    }
-    path.to_string()
 }

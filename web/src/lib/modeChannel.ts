@@ -1,31 +1,8 @@
-// Mode-picker channel resolution (#1764).
-//
-// The structured view composer's mode picker can be driven by three different
-// sources depending on what the active agent advertises over ACP. This
-// module owns the precedence and the read/write pairing so the picker
-// never reads one channel while writing another (the bug that trapped
-// OpenCode users: OpenCode advertises modes via the config-option
-// channel and rejects session/set_mode, so reading config + writing
-// set_mode left them with a phantom "default" mode they could not
-// leave).
-//
-// Precedence, most authoritative first:
-//   1. config: an ACP config option of category "mode" (OpenCode, and
-//      claude-agent-acp v0.37.0+). Active value is `current_value`;
-//      switches go through session/set_config_option.
-//   2. legacy: ACP SessionModeState (`availableModes` / `currentModeId`,
-//      older claude). Switches go through session/set_mode.
-//   3. fallback: claude's hardcoded Default/Plan/AcceptEdits/Yolo
-//      taxonomy, only when the agent's profile opts in
-//      (`capabilities.legacyModeFallback`). Switches go through
-//      session/set_mode.
-// When none apply (a non-claude agent that advertised nothing), the
-// picker renders nothing rather than a vocabulary the agent rejects.
+// Mode-picker channel resolution: read and write through the same channel, in precedence order: a "mode" config option (set_config_option), then ACP SessionModeState (set_mode), then Claude's legacy taxonomy when the profile opts in. Otherwise no picker.
 
 import type { AcpState, ConfigOptionDescriptor, SessionMode } from "./acpTypes";
 
-/** Claude's historical four-mode taxonomy. Used only as the
- *  `capabilities.legacyModeFallback` fallback; not an ACP default. */
+/** Only used when the profile sets `capabilities.legacyModeFallback`. */
 export const LEGACY_MODES: ReadonlyArray<{
   id: string;
   legacyId: SessionMode;
@@ -64,12 +41,7 @@ export interface ModeOption {
   description: string;
 }
 
-/** The resolved channel the picker should read and write. `kind`
- *  selects the write path: "config" -> session/set_config_option on
- *  `configId`; "legacy" -> session/set_mode. `pendingId` is the value
- *  currently in flight (config channel only; pessimistic UI). A
- *  discriminated union so the "config" variant guarantees a non-null
- *  `configId`. */
+/** `kind` selects the write path; `pendingId` is the in-flight value on the config channel. */
 export type ModeChannel =
   | {
       kind: "config";
@@ -77,7 +49,6 @@ export type ModeChannel =
       modes: ModeOption[];
       activeId: string;
       pendingId: string | null;
-      /** Menu header label. */
       label: string;
     }
   | {
@@ -86,7 +57,6 @@ export type ModeChannel =
       modes: ModeOption[];
       activeId: string;
       pendingId: null;
-      /** Menu header label. */
       label: string;
     };
 
@@ -96,7 +66,6 @@ export interface ResolveModeChannelArgs {
   currentModeId: string | null;
   legacyMode: SessionMode;
   pendingConfigOption: AcpState["pendingConfigOption"];
-  /** From the active agent's profile (`capabilities.legacyModeFallback`). */
   allowLegacyFallback: boolean;
 }
 
@@ -104,8 +73,7 @@ function findModeConfig(options: ConfigOptionDescriptor[]): ConfigOptionDescript
   return options.find((o) => o.category === "mode" && o.options.length > 0);
 }
 
-/** Resolve the mode-picker channel, or null when the picker should not
- *  render. Pure; unit-tested in `modeChannel.test.ts`. */
+/** Null when the picker should not render. */
 export function resolveModeChannel(args: ResolveModeChannelArgs): ModeChannel | null {
   const { configOptions, availableModes, currentModeId, legacyMode, pendingConfigOption, allowLegacyFallback } = args;
 

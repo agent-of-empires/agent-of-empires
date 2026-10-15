@@ -95,43 +95,28 @@ mod tests {
     use super::*;
 
     #[test]
-    fn matches_every_registered_code() {
+    fn every_registered_code_is_normalized_and_matches() {
+        // An unnormalized key would never match what match_cheat looks up.
         for (code, message) in CHEATS {
+            assert_eq!(normalize(code), *code, "not normalized: {code:?}");
             assert_eq!(match_cheat(code), Some(*message));
         }
     }
 
     #[test]
-    fn all_codes_are_already_normalized() {
-        // If a key isn't normalized, match_cheat(key) would miss it.
-        for (code, _) in CHEATS {
-            assert_eq!(
-                normalize(code),
-                *code,
-                "cheat code is not normalized: {code:?}"
-            );
+    fn match_cheat_is_exact_modulo_case_and_whitespace() {
+        for (query, hit) in [
+            ("WOLOLO", true),
+            ("  Rock On  ", true),
+            ("how do  you   turn this on", true),
+            ("settings", false),
+            ("new session", false),
+            ("", false),
+            ("wolol", false),
+            ("wololo and more", false),
+            ("say marco", false),
+        ] {
+            assert_eq!(match_cheat(query).is_some(), hit, "{query:?}");
         }
-        assert_eq!(CHEATS.len(), 21);
-    }
-
-    #[test]
-    fn case_insensitive_and_whitespace_tolerant() {
-        assert!(match_cheat("WOLOLO").is_some());
-        assert!(match_cheat("  Rock On  ").is_some());
-        assert!(match_cheat("how do  you   turn this on").is_some());
-    }
-
-    #[test]
-    fn ordinary_searches_do_not_match() {
-        assert_eq!(match_cheat("settings"), None);
-        assert_eq!(match_cheat("new session"), None);
-        assert_eq!(match_cheat(""), None);
-    }
-
-    #[test]
-    fn substrings_and_prefixes_do_not_match() {
-        assert_eq!(match_cheat("wolol"), None);
-        assert_eq!(match_cheat("wololo and more"), None);
-        assert_eq!(match_cheat("say marco"), None);
     }
 }

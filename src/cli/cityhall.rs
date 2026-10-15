@@ -1,8 +1,4 @@
 //! `aoe cityhall` subcommands: produce and consume the CityHall config bundle.
-//!
-//! `export` runs on an admin's own machine; `apply` runs inside a CityHall
-//! workspace (normally driven automatically at `aoe serve` boot, see
-//! `crate::cli::serve`). See `crate::session::cityhall_bundle`.
 
 use anyhow::{bail, Context, Result};
 use clap::{Args, Subcommand, ValueHint};
@@ -72,8 +68,6 @@ fn run_apply(args: ApplyArgs) -> Result<()> {
     if !report.preserved.is_empty() {
         println!("Already in place: {}", report.preserved.join(", "));
     }
-    // Project failures are collected rather than fatal, so surface them here
-    // instead of letting a partial apply look like a clean one.
     for failure in &report.failures {
         eprintln!("Warning: {failure}");
     }
@@ -83,14 +77,6 @@ fn run_apply(args: ApplyArgs) -> Result<()> {
     Ok(())
 }
 
-/// Whether an apply that reported failures managed to land nothing at all.
-///
-/// A partial apply stays a success: the other projects are in place, and the
-/// boot path depends on that. Only a run where every project failed is worth a
-/// non-zero exit, because a script cannot otherwise tell it from a clean one. A
-/// project that was already cloned and already registered counts as landed;
-/// without that, re-applying an unchanged bundle alongside one bad remote would
-/// look like a total failure.
 fn nothing_applied(report: &cityhall_bundle::ApplyReport) -> bool {
     !report.failures.is_empty()
         && report.cloned.is_empty()
@@ -123,12 +109,9 @@ mod tests {
     fn only_a_totally_failed_apply_is_an_error() {
         let cases = [
             (report(&[], &[], &[], &["a: clone failed"]), true),
-            // The regression this guards: one repo already in place next to one
-            // bad remote is a partial apply, not a total failure.
             (report(&[], &[], &["kept"], &["a: clone failed"]), false),
             (report(&["new"], &[], &[], &["a: clone failed"]), false),
             (report(&[], &["reg"], &[], &["a: clone failed"]), false),
-            // No failures at all is never an error, including a pure no-op.
             (report(&[], &[], &[], &[]), false),
             (report(&[], &[], &["kept"], &[]), false),
         ];

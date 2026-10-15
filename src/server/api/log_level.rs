@@ -1,13 +1,8 @@
-//! REST handlers for runtime log-level control.
-//!
-//! Two endpoints under `/api/log-level`:
-//!   - GET → current filter directive, reload availability
-//!   - PATCH → swap filter via `{level}` (expanded to known roots) or
-//!     `{filter}` (raw EnvFilter syntax with regex disabled)
-//!
-//! Backed by the process-global `FilterController` in `crate::logging`,
-//! not `AppState`. Same module is reused by the runner subprocess so
-//! a future runner-side IPC can swap filters with identical semantics.
+//! REST handlers for runtime log-level control, backed by the process-global
+//! `FilterController` in `crate::logging` rather than `AppState`. `PATCH` swaps
+//! the filter via `{level}` (expanded to known roots) or `{filter}` (raw
+//! EnvFilter syntax with regex disabled). The runner subprocess reuses this
+//! module so a future runner-side IPC gets identical semantics.
 
 use std::sync::Arc;
 
@@ -91,7 +86,7 @@ pub async fn patch_log_level(
 
     match result {
         Ok(swap) => {
-            // Skip the log and persist on a no-op swap so an unchanged
+            // Skip the log and persist on a no-op swap, so an unchanged
             // directive cannot feed the file-watch loop (#1894).
             if swap.changed {
                 tracing::info!(

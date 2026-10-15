@@ -26,13 +26,10 @@ const ONE_WEEK: u32 = 7 * 24 * 60;
 
 pub struct SnoozeDurationDialog {
     title: String,
-    /// Hit rect per preset row, paired with the minutes it submits.
-    /// Captured during `render` so a click on a row produces the same
-    /// Submit as the matching digit key.
+    /// Hit rect per preset row with the minutes it submits, so a click
+    /// matches its digit key.
     row_rects: Vec<(u32, Rect)>,
-    /// Hover-tracked row index. Drives the row highlight without
-    /// changing semantics: a row hover doesn't itself submit, only a
-    /// click on the row does.
+    /// Hovered row. Drives the highlight only; a click submits.
     hovered_row: Option<usize>,
 }
 
@@ -46,11 +43,7 @@ impl SnoozeDurationDialog {
     }
 
     pub fn handle_click(&self, col: u16, row: u16) -> Option<DialogResult<u32>> {
-        let pos = ratatui::layout::Position::from((col, row));
-        self.row_rects
-            .iter()
-            .find(|(_, rect)| rect.contains(pos))
-            .map(|(minutes, _)| DialogResult::Submit(*minutes))
+        super::hit(&self.row_rects, col, row).map(DialogResult::Submit)
     }
 
     pub fn handle_hover(&mut self, col: u16, row: u16) -> bool {
@@ -83,18 +76,8 @@ impl SnoozeDurationDialog {
 
     pub fn render(&mut self, frame: &mut Frame, area: Rect, theme: &Theme) {
         self.row_rects.clear();
-        let dialog_area = super::centered_rect(area, 52, 14);
-        frame.render_widget(Clear, dialog_area);
-
-        let block = Block::default()
-            .borders(Borders::ALL)
-            .border_type(BorderType::Rounded)
-            .border_style(Style::default().fg(theme.waiting))
-            .title(" Snooze ")
-            .title_style(Style::default().fg(theme.waiting).bold());
-
-        let inner = block.inner(dialog_area);
-        frame.render_widget(block, dialog_area);
+        let block = super::toned_dialog_block(" Snooze ", theme.waiting, theme.waiting);
+        let (_, inner) = super::render_dialog_frame(frame, area, 52, 14, block);
 
         let chunks = Layout::default()
             .direction(Direction::Vertical)
@@ -165,63 +148,26 @@ mod tests {
     }
 
     #[test]
-    fn digit_presets() {
-        let cases: &[(char, u32)] = &[
-            ('1', 60),
-            ('2', 120),
-            ('3', 180),
-            ('4', 240),
-            ('5', 300),
-            ('6', 360),
-            ('8', 1440),
-            ('0', 10080),
+    fn keys_pick_a_preset_or_cancel() {
+        let cases = [
+            ('1', DialogResult::Submit(60)),
+            ('2', DialogResult::Submit(120)),
+            ('3', DialogResult::Submit(180)),
+            ('4', DialogResult::Submit(240)),
+            ('5', DialogResult::Submit(300)),
+            ('6', DialogResult::Submit(360)),
+            ('8', DialogResult::Submit(1440)),
+            ('0', DialogResult::Submit(10080)),
+            ('7', DialogResult::Continue),
+            ('9', DialogResult::Continue),
+            ('x', DialogResult::Continue),
+            ('q', DialogResult::Cancel),
         ];
-        for (digit, minutes) in cases {
+        for (ch, want) in cases {
             let mut d = SnoozeDurationDialog::new("sess");
-            match d.handle_key(k(KeyCode::Char(*digit))) {
-                DialogResult::Submit(m) => assert_eq!(m, *minutes, "digit {digit}"),
-                _ => panic!("expected Submit({minutes}) for digit {digit}"),
-            }
+            assert_eq!(d.handle_key(k(KeyCode::Char(ch))), want, "{ch}");
         }
-    }
-
-    #[test]
-    fn esc_cancels() {
         let mut d = SnoozeDurationDialog::new("sess");
-        assert!(matches!(
-            d.handle_key(k(KeyCode::Esc)),
-            DialogResult::Cancel
-        ));
-    }
-
-    #[test]
-    fn q_cancels() {
-        let mut d = SnoozeDurationDialog::new("sess");
-        assert!(matches!(
-            d.handle_key(k(KeyCode::Char('q'))),
-            DialogResult::Cancel
-        ));
-    }
-
-    #[test]
-    fn unknown_continues() {
-        let mut d = SnoozeDurationDialog::new("sess");
-        assert!(matches!(
-            d.handle_key(k(KeyCode::Char('x'))),
-            DialogResult::Continue
-        ));
-    }
-
-    #[test]
-    fn seven_and_nine_unbound() {
-        let mut d = SnoozeDurationDialog::new("sess");
-        assert!(matches!(
-            d.handle_key(k(KeyCode::Char('7'))),
-            DialogResult::Continue
-        ));
-        assert!(matches!(
-            d.handle_key(k(KeyCode::Char('9'))),
-            DialogResult::Continue
-        ));
+        assert_eq!(d.handle_key(k(KeyCode::Esc)), DialogResult::Cancel);
     }
 }

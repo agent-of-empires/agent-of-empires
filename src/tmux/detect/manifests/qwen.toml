@@ -1,0 +1,35 @@
+id = "qwen"
+
+[[rules]]
+extends = "interrupt_hint"
+id = "interrupt_hint"
+priority = 970
+
+[[rules]]
+extends = "spinner"
+id = "spinner"
+priority = 960
+
+[[rules]]
+extends = "approval_prompt"
+id = "approval_prompt"
+priority = 950
+contains_any = ["execute?", "run command?", "enter to select", "esc to cancel"]
+
+# Qwen renders its menu cursor as `›` by default and `❯` in some themes.
+[[rules]]
+id = "numbered_choice"
+state = "waiting"
+priority = 940
+region = "whole_recent"
+visible = true
+line_regex = ['(?i)^\s*[\x{203A}\x{276F}]\s*[123]\.']
+
+[[rules]]
+extends = "input_prompt"
+id = "input_prompt"
+priority = 930
+any = [
+  { line_regex = ['(?i)^\s*qwen>\s*$'] },
+  { line = { regex = ['(?i)^\s*>\s\S.{0,96}$'], not_regex = ['(?i)esc'] } },
+]

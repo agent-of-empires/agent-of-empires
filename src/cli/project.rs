@@ -1,5 +1,4 @@
 //! `aoe project` subcommands: manage the project registry used by the
-//! multi-repo workspace pickers.
 
 use anyhow::{bail, Result};
 use clap::{Args, Subcommand, ValueEnum, ValueHint};
@@ -120,8 +119,6 @@ fn resolve_default_scope(profile_explicit: bool) -> ProjectScope {
 }
 
 async fn list(profile: &str, args: ProjectListArgs) -> Result<()> {
-    // Global-only listing never touches profile-scoped storage, so it must
-    // not require a profile to exist (or resolve/bootstrap a default one).
     let resolved_profile = match args.scope {
         ScopeFilter::Global => None,
         ScopeFilter::All | ScopeFilter::Profile => Some(resolve_existing_profile(profile)?),
@@ -175,8 +172,6 @@ async fn add(profile: &str, profile_explicit: bool, args: ProjectAddArgs) -> Res
         Some(ScopeArg::Profile) => ProjectScope::Profile,
         None => resolve_default_scope(profile_explicit),
     };
-    // Global-scope adds never touch profile-scoped storage, so they must
-    // not require a profile to exist.
     let resolved_profile = match scope {
         ProjectScope::Global => None,
         ProjectScope::Profile => Some(resolve_existing_profile(profile)?),
@@ -188,9 +183,6 @@ async fn add(profile: &str, profile_explicit: bool, args: ProjectAddArgs) -> Res
         .canonicalize()
         .unwrap_or_else(|_| args.path.clone());
 
-    // Non-git directories are allowed: their sessions run in place, with no
-    // worktrees or branches. We still reject paths that don't resolve to a
-    // directory, which the previous git-repo gate rejected implicitly.
     if !canonical.is_dir() {
         bail!(
             "Path does not exist or is not a directory: {}",
@@ -198,12 +190,16 @@ async fn add(profile: &str, profile_explicit: bool, args: ProjectAddArgs) -> Res
         );
     }
 
-    let name = args.name.unwrap_or_else(|| {
-        canonical
-            .file_name()
-            .map(|n| n.to_string_lossy().to_string())
-            .unwrap_or_else(|| "project".to_string())
-    });
+    let name = match args.name {
+        Some(n) => n,
+        None => {
+            let base = canonical
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_else(|| "project".to_string());
+            projects::unique_name(profile, scope, &base)
+        }
+    };
 
     let project = Project::new(name.clone(), canonical.to_string_lossy(), scope)
         .with_base_branch(args.base_branch);
@@ -233,8 +229,6 @@ async fn remove(profile: &str, profile_explicit: bool, args: ProjectRemoveArgs) 
         Some(ScopeArg::Profile) => ProjectScope::Profile,
         None => resolve_default_scope(profile_explicit),
     };
-    // Global-scope removes never touch profile-scoped storage, so they must
-    // not require a profile to exist.
     let resolved_profile = match scope {
         ProjectScope::Global => None,
         ProjectScope::Profile => Some(resolve_existing_profile(profile)?),

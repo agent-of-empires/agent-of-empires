@@ -1,33 +1,20 @@
 // @vitest-environment jsdom
-//
-// Contract test for useKeyboardShortcuts. We care most about a single
-// regression risk introduced when wterm was swapped for xterm.js:
-// xterm's helper textarea calls stopPropagation on a handful of
-// modifier-key combos, so the hook must attach the document listener
-// in capture phase to observe the keydown before xterm.js swallows it.
-//
-// Live Playwright tests in terminal-focus-shortcut.spec.ts cover the
-// full flow against a mounted terminal; this is the cheap unit-level
-// guard that catches "someone moved this back to bubble phase" before
-// the e2e suite ever runs.
 
 import { describe, expect, it, vi } from "vitest";
 import { renderHook } from "@testing-library/react";
-import { useKeyboardShortcuts } from "./useKeyboardShortcuts";
+import { useKeyboardShortcuts, type ShortcutActions } from "./useKeyboardShortcuts";
 
 function dispatch(target: EventTarget, init: KeyboardEventInit) {
-  const event = new KeyboardEvent("keydown", {
-    bubbles: true,
-    cancelable: true,
-    ...init,
-  });
+  const event = new KeyboardEvent("keydown", { bubbles: true, cancelable: true, ...init });
   target.dispatchEvent(event);
   return event;
 }
 
-function makeActions() {
-  return {
+function mount() {
+  const actions = {
     onNew: vi.fn(),
+    onFocusSidebar: vi.fn(),
+    onJumpToAttention: vi.fn(),
     onNewScratch: vi.fn(),
     onDiff: vi.fn(),
     onEscape: vi.fn(),
@@ -37,97 +24,129 @@ function makeActions() {
     onToggleSidebar: vi.fn(),
     onToggleRightPanel: vi.fn(),
     onToggleTerminalFocus: vi.fn(),
-  };
+  } satisfies ShortcutActions;
+  return { actions, ...renderHook(() => useKeyboardShortcuts(() => actions)) };
 }
 
+type ActionName = keyof ShortcutActions;
+
 describe("useKeyboardShortcuts", () => {
-  it("fires onPalette for Ctrl+K dispatched on a nested target", () => {
-    const actions = makeActions();
-    renderHook(() => useKeyboardShortcuts(() => actions));
-
-    dispatch(document.body, { key: "k", ctrlKey: true });
-
-    expect(actions.onPalette).toHaveBeenCalledTimes(1);
+  it.each<[string, KeyboardEventInit, ActionName | null, ActionName | null]>([
+    [
+      "Ctrl+Alt+B toggles the right panel, not the sidebar",
+      { key: "b", code: "KeyB", ctrlKey: true, altKey: true },
+      "onToggleRightPanel",
+      "onToggleSidebar",
+    ],
+    [
+      "Cmd/Ctrl+Shift+N creates a scratch session",
+      { key: "N", code: "KeyN", ctrlKey: true, shiftKey: true },
+      "onNewScratch",
+      "onNew",
+    ],
+  ])("%s", (_label, init, fired, notFired) => {
+    const { actions } = mount();
+    dispatch(document.body, init);
+    if (fired) expect(actions[fired]).toHaveBeenCalledTimes(1);
+    if (notFired) expect(actions[notFired]).not.toHaveBeenCalled();
   });
 
-  it("still fires when a child element calls stopPropagation in bubble phase", () => {
-    // Mirror what xterm.js's helper textarea does to Cmd/Ctrl + letter
-    // combos: handle them on its own element and stopPropagation so the
-    // event would normally never reach document. The capture-phase
-    // attachment installed by the hook means we see the keydown before
-    // the child's bubble-phase listener runs.
-    const actions = makeActions();
-    renderHook(() => useKeyboardShortcuts(() => actions));
-
+  it("still fires under a child that stops propagation, and detaches on unmount", () => {
+    const { actions, unmount } = mount();
     const child = document.createElement("textarea");
     document.body.appendChild(child);
     child.addEventListener("keydown", (e) => e.stopPropagation());
 
     dispatch(child, { key: "k", ctrlKey: true });
+    expect(actions.onPalette).toHaveBeenCalledTimes(1);
 
+    unmount();
+    dispatch(child, { key: "k", ctrlKey: true });
     expect(actions.onPalette).toHaveBeenCalledTimes(1);
     child.remove();
   });
 
-  it("routes Ctrl+Alt+B (KeyB) to onToggleRightPanel", () => {
-    const actions = makeActions();
-    renderHook(() => useKeyboardShortcuts(() => actions));
+  it.each([
+    { selector: '[data-term="agent"]', label: "agent terminal" },
+    { selector: '[data-term="paired"]', label: "paired terminal" },
+    { selector: "[data-session-composer]", label: "structured composer" },
+  ])("returns focus to the sidebar from the $label", ({ selector }) => {
+    const { actions, unmount } = mount();
+    const container = document.createElement("div");
+    if (selector === '[data-term="agent"]') container.dataset.term = "agent";
+    else if (selector === '[data-term="paired"]') container.dataset.term = "paired";
+    else container.dataset.sessionComposer = "";
+    const input = document.createElement("textarea");
+    container.appendChild(input);
+    document.body.appendChild(container);
 
-    dispatch(document.body, {
-      key: "b",
-      code: "KeyB",
-      ctrlKey: true,
-      altKey: true,
-    });
+    const event = dispatch(input, { key: "q", code: "KeyQ", ctrlKey: true });
 
-    expect(actions.onToggleRightPanel).toHaveBeenCalledTimes(1);
-    expect(actions.onToggleSidebar).not.toHaveBeenCalled();
-  });
-
-  it("routes Cmd/Ctrl+Shift+N to onNewScratch (fast-create shortcut)", () => {
-    // Cmd+Shift+N (Mac) / Ctrl+Shift+N (other) is the
-    // wizard-pre-configured-for-scratch + skip-to-Review shortcut.
-    // Uses `e.code === "KeyN"` so Shift+layout-specific punctuation
-    // does not break the match.
-    const actions = makeActions();
-    renderHook(() => useKeyboardShortcuts(() => actions));
-
-    dispatch(document.body, {
-      key: "N",
-      code: "KeyN",
-      ctrlKey: true,
-      shiftKey: true,
-    });
-
-    expect(actions.onNewScratch).toHaveBeenCalledTimes(1);
-    expect(actions.onNew).not.toHaveBeenCalled();
-  });
-
-  it("does NOT fire onNewScratch for plain Shift+N (no modifier)", () => {
-    // Single-key shortcuts only fire when no input/textarea is
-    // focused AND no modifier is held; "n" with no modifier maps to
-    // `onNew`, but the Shift+N path needs both the meta/ctrl
-    // modifier AND Shift. Guard against a regression that drops the
-    // modifier check.
-    const actions = makeActions();
-    renderHook(() => useKeyboardShortcuts(() => actions));
-
-    dispatch(document.body, {
-      key: "N",
-      code: "KeyN",
-      shiftKey: true,
-    });
-
-    expect(actions.onNewScratch).not.toHaveBeenCalled();
-  });
-
-  it("detaches the listener on unmount", () => {
-    const actions = makeActions();
-    const { unmount } = renderHook(() => useKeyboardShortcuts(() => actions));
-
+    expect(event.defaultPrevented).toBe(true);
+    expect(actions.onFocusSidebar).toHaveBeenCalledOnce();
+    expect(actions.onJumpToAttention).not.toHaveBeenCalled();
     unmount();
-    dispatch(document.body, { key: "k", ctrlKey: true });
+    container.remove();
+  });
 
-    expect(actions.onPalette).not.toHaveBeenCalled();
+  it("handles document-dispatched global shortcuts", () => {
+    const { actions, unmount } = mount();
+    dispatch(document, { key: "?", code: "Slash", shiftKey: true });
+    expect(actions.onHelp).toHaveBeenCalledOnce();
+    unmount();
+  });
+
+  it("treats the mobile proxy as a session input only while session-owned", () => {
+    const { actions, unmount } = mount();
+    const proxy = document.createElement("textarea");
+    proxy.dataset.keyboardProxy = "";
+    document.body.appendChild(proxy);
+
+    const unowned = dispatch(proxy, { key: "q", code: "KeyQ", ctrlKey: true });
+    proxy.dataset.sessionInput = "";
+    const owned = dispatch(proxy, { key: "q", code: "KeyQ", ctrlKey: true });
+    delete proxy.dataset.sessionInput;
+    const leftSession = dispatch(proxy, { key: "q", code: "KeyQ", ctrlKey: true });
+
+    expect(unowned.defaultPrevented).toBe(false);
+    expect(owned.defaultPrevented).toBe(true);
+    expect(leftSession.defaultPrevented).toBe(false);
+    expect(actions.onFocusSidebar).toHaveBeenCalledOnce();
+    unmount();
+    proxy.remove();
+  });
+
+  it("leaves Ctrl+Q in a regular input and Cmd+Q in a session input to the browser", () => {
+    const { actions, unmount } = mount();
+    const regularInput = document.createElement("input");
+    document.body.appendChild(regularInput);
+    const regularEvent = dispatch(regularInput, { key: "q", code: "KeyQ", ctrlKey: true });
+
+    const terminal = document.createElement("div");
+    terminal.dataset.term = "agent";
+    const terminalInput = document.createElement("textarea");
+    terminal.appendChild(terminalInput);
+    document.body.appendChild(terminal);
+    const commandEvent = dispatch(terminalInput, { key: "q", code: "KeyQ", metaKey: true });
+
+    expect(regularEvent.defaultPrevented).toBe(false);
+    expect(commandEvent.defaultPrevented).toBe(false);
+    expect(actions.onFocusSidebar).not.toHaveBeenCalled();
+    unmount();
+    regularInput.remove();
+    terminal.remove();
+  });
+
+  it("keeps bare shortcuts textless", () => {
+    const { actions, unmount } = mount();
+    dispatch(document.body, { key: "n" });
+    expect(actions.onNew).toHaveBeenCalledOnce();
+
+    const input = document.createElement("input");
+    document.body.appendChild(input);
+    dispatch(input, { key: "n" });
+    expect(actions.onNew).toHaveBeenCalledOnce();
+    unmount();
+    input.remove();
   });
 });

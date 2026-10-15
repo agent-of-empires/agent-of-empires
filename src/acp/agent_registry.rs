@@ -1,30 +1,21 @@
-//! Named agent registry: maps an agent name (e.g. `claude-code`,
-//! `aoe-agent`, `gemini`) to a spawn command + args. Users add agents via
-//! the settings TUI; this module is the in-memory model.
+//! Named agent registry: maps an agent name (e.g. `claude`, `aoe-agent`) to a spawn command.
 
-use super::install_hints::install_hint_for;
+use super::install_hints::{env_allowlist_for, install_hint_for, AOE_AGENT_BINARY};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentSpec {
-    /// Executable to run, e.g. `npx` or `/usr/local/bin/aoe-agent`.
     pub command: String,
     pub args: Vec<String>,
-    /// Human-readable description shown in the settings TUI and
-    /// `aoe acp agents`.
+    /// Shown in the settings TUI and `aoe acp agents`.
     pub description: String,
-    /// Optional: which env vars from aoe to forward to this agent. If
-    /// `None`, only `PATH`, `HOME`, `LANG`, `TERM`, and provider auth env
-    /// (e.g. `ANTHROPIC_API_KEY`) are forwarded.
+    /// Provider env vars forwarded on top of `ALWAYS_FORWARD_ENV` in `acp_client/spawn.rs`.
     pub env_allowlist: Option<Vec<String>>,
 }
 
 impl AgentSpec {
-    /// Build an ACP `AgentSpec` from a custom agent's `agent_acp_cmd`
-    /// string. The string is split with shell-word rules into argv and run
-    /// directly (no shell). Returns a user-facing error message when the
-    /// command is empty or has malformed quoting.
+    /// Build a spec from a custom agent's `agent_acp_cmd` string.
     pub fn from_acp_cmd(name: &str, cmd: &str) -> Result<AgentSpec, String> {
         let argv = shell_words::split(cmd).map_err(|e| {
             format!("custom agent `{name}` has a malformed structured view command ({e})")
@@ -49,150 +40,99 @@ pub struct AgentRegistry {
 }
 
 impl AgentRegistry {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// Returns a registry seeded with one entry per aoe tool that has
-    /// a published ACP server, plus our own `aoe-agent` as a generic
-    /// multi-provider fallback. Each entry is keyed on the same name
-    /// the tmux view uses (claude / opencode / gemini / codex /
-    /// vibe / pi / omp) so the spawn path can map `instance.tool`
-    /// directly to a registry key.
-    ///
-    /// Sources verified against
-    /// <https://agentclientprotocol.com/get-started/agents.md>
-    /// (Jan 2026):
-    ///
-    ///   claude   → claude-agent-acp     (Zed adapter for Claude SDK)
-    ///   opencode → `opencode acp`       (native, SST)
-    ///   gemini   → `gemini --acp`       (native, Google)
-    ///   codex    → codex-acp            (ACP adapter, OpenAI Codex CLI)
-    ///   vibe     → vibe-acp             (native, Mistral)
-    ///   pi       → pi-acp               (adapter, Pi coding agent)
-    ///   omp      → `omp acp`            (native, Oh My Pi)
-    ///
-    /// We deliberately don't use `npx -y` for these. First-run
-    /// downloads can hang for tens of seconds with no output, which
-    /// used to leave the structured view worker silently wedged before the
-    /// handshake. `aoe acp doctor --fix` can install missing
-    /// binaries on demand.
+    /// One entry per tool with a published ACP server, plus aoe's own `aoe-agent`.
     pub fn with_defaults() -> Self {
-        let mut reg = Self::new();
-
         let claude_install = install_hint_for("claude-agent-acp").unwrap_or("(see project docs)");
-        reg.agents.insert(
-            "claude".into(),
-            AgentSpec {
-                command: "claude-agent-acp".into(),
-                args: vec![],
-                description: format!(
-                    "Anthropic Claude via the official ACP adapter ({claude_install})"
-                ),
-                env_allowlist: None,
-            },
-        );
-        // Legacy alias used by older session records before the
-        // tool-keyed naming. Kept so persisted sessions with
-        // agent_name="claude-code" still resolve.
-        reg.agents.insert(
-            "claude-code".into(),
-            AgentSpec {
-                command: "claude-agent-acp".into(),
-                args: vec![],
-                description: "Alias for `claude` (legacy name)".into(),
-                env_allowlist: None,
-            },
-        );
-        reg.agents.insert(
-            "opencode".into(),
-            AgentSpec {
-                command: "opencode".into(),
-                args: vec!["acp".into()],
-                description: "OpenCode (SST) — native ACP via `opencode acp`".into(),
-                env_allowlist: None,
-            },
-        );
-        reg.agents.insert(
-            "gemini".into(),
-            AgentSpec {
-                command: "gemini".into(),
-                args: vec!["--acp".into()],
-                description: "Google Gemini CLI — native ACP via `gemini --acp`".into(),
-                env_allowlist: None,
-            },
-        );
-        reg.agents.insert(
-            "codex".into(),
-            AgentSpec {
-                command: "codex-acp".into(),
-                args: vec![],
-                description:
-                    "OpenAI Codex CLI via ACP adapter (npm i -g @agentclientprotocol/codex-acp@latest)".into(),
-                env_allowlist: None,
-            },
-        );
-        reg.agents.insert(
-            "vibe".into(),
-            AgentSpec {
-                command: "vibe-acp".into(),
-                args: vec![],
-                description: "Mistral Vibe — native ACP via the bundled `vibe-acp` binary".into(),
-                env_allowlist: None,
-            },
-        );
-        reg.agents.insert(
-            "pi".into(),
-            AgentSpec {
-                command: "pi-acp".into(),
-                args: vec![],
-                description: "Pi coding agent (`pi`) via the pi-acp adapter (npm i -g pi-acp)"
-                    .into(),
-                env_allowlist: None,
-            },
-        );
-        reg.agents.insert(
-            "omp".into(),
-            AgentSpec {
-                command: "omp".into(),
-                args: vec!["acp".into()],
-                description: "Oh My Pi coding agent, native ACP via `omp acp`".into(),
-                env_allowlist: None,
-            },
-        );
-        reg.agents.insert(
-            "kimi".into(),
-            AgentSpec {
-                command: "kimi".into(),
-                args: vec!["acp".into()],
-                description: "Kimi Code (Moonshot AI) — native ACP via `kimi acp`".into(),
-                env_allowlist: None,
-            },
-        );
-        reg.agents.insert(
-            "aoe-agent".into(),
-            AgentSpec {
-                command: "${aoe_data_dir}/acp-worker/dist/aoe-agent".into(),
-                args: vec![],
-                description: "aoe's bundled multi-provider agent (Vercel AI SDK 6)".into(),
-                env_allowlist: None,
-            },
-        );
-        reg
+        let claude_description =
+            format!("Anthropic Claude via the official ACP adapter ({claude_install})");
+        // (name, command, args, description)
+        let defaults: [(&str, &str, &[&str], &str); 11] = [
+            ("claude", "claude-agent-acp", &[], &claude_description),
+            // Legacy alias from older session records.
+            (
+                "claude-code",
+                "claude-agent-acp",
+                &[],
+                "Alias for `claude` (legacy name)",
+            ),
+            (
+                "opencode",
+                "opencode",
+                &["acp"],
+                "OpenCode (SST), native ACP via `opencode acp`",
+            ),
+            (
+                "gemini",
+                "gemini",
+                &["--acp"],
+                "Google Gemini CLI, native ACP via `gemini --acp`",
+            ),
+            (
+                "codex",
+                "codex-acp",
+                &[],
+                "OpenAI Codex CLI via ACP adapter (npm i -g @agentclientprotocol/codex-acp@latest)",
+            ),
+            (
+                "vibe",
+                "vibe-acp",
+                &[],
+                "Mistral Vibe, native ACP via the bundled `vibe-acp` binary",
+            ),
+            (
+                "pi",
+                "pi-acp",
+                &[],
+                "Pi coding agent (`pi`) via the pi-acp adapter (npm i -g pi-acp)",
+            ),
+            (
+                "omp",
+                "omp",
+                &["acp"],
+                "Oh My Pi coding agent, native ACP via `omp acp`",
+            ),
+            (
+                "kimi",
+                "kimi",
+                &["acp"],
+                "Kimi Code (Moonshot AI), native ACP via `kimi acp`",
+            ),
+            (
+                "prime-agent",
+                "prime-agent",
+                &["--mode", "acp"],
+                "PrimeIntellect Prime Agent, native ACP via `prime-agent --mode acp`",
+            ),
+            // Installed into the app dir like the npm adapters.
+            (
+                "aoe-agent",
+                AOE_AGENT_BINARY,
+                &[],
+                "aoe's bundled multi-provider agent (Vercel AI SDK)",
+            ),
+        ];
+        let agents = defaults
+            .into_iter()
+            .map(|(name, command, args, description)| {
+                let keys = env_allowlist_for(command);
+                let spec = AgentSpec {
+                    command: command.into(),
+                    args: args.iter().map(|a| a.to_string()).collect(),
+                    description: description.into(),
+                    env_allowlist: (!keys.is_empty())
+                        .then(|| keys.iter().map(|s| s.to_string()).collect()),
+                };
+                (name.to_string(), spec)
+            })
+            .collect();
+        Self { agents }
     }
 
     pub fn get(&self, name: &str) -> Option<&AgentSpec> {
         self.agents.get(name)
     }
 
-    pub fn upsert(&mut self, name: String, spec: AgentSpec) {
-        self.agents.insert(name, spec);
-    }
-
-    pub fn remove(&mut self, name: &str) -> Option<AgentSpec> {
-        self.agents.remove(name)
-    }
-
+    /// Entries sorted by name.
     pub fn list(&self) -> Vec<(&String, &AgentSpec)> {
         let mut entries: Vec<_> = self.agents.iter().collect();
         entries.sort_by_key(|(n, _)| n.as_str());
@@ -200,67 +140,219 @@ impl AgentRegistry {
     }
 }
 
+/// The built-in base `tool` inherits via `agent_detect_as`, when that base has an ACP adapter.
+pub fn inherited_acp_base(tool: &str, agent_detect_as: &HashMap<String, String>) -> Option<String> {
+    let base = agent_detect_as.get(tool)?;
+    AgentRegistry::with_defaults()
+        .get(base)
+        .map(|_| base.clone())
+}
+
+/// The agent a structured-view session of `tool` spawns as: an explicit
+/// override, the tool's own registry entry or custom command, an inherited
+/// base, then (except for `claude`) the configured default agent.
+pub fn pick_acp_agent_name(
+    registry: &AgentRegistry,
+    session: &crate::session::config::SessionConfig,
+    acp: &crate::session::config::AcpConfig,
+    tool: &str,
+    explicit_override: Option<&str>,
+) -> String {
+    if let Some(name) = explicit_override.filter(|name| !name.is_empty()) {
+        return name.to_string();
+    }
+    let custom_cmd = session
+        .agent_acp_cmd
+        .get(tool)
+        .is_some_and(|cmd| AgentSpec::from_acp_cmd(tool, cmd).is_ok());
+    if registry.get(tool).is_some() || custom_cmd {
+        return tool.to_string();
+    }
+    if let Some(base) = inherited_acp_base(tool, &session.agent_detect_as) {
+        return base;
+    }
+    if tool == "claude" {
+        "claude".into()
+    } else {
+        acp.resolved_default_agent().to_string()
+    }
+}
+
+/// The model pinned for the agent `tool` spawns as, if any.
+pub fn pinned_model_for_tool(
+    config: &crate::session::config::Config,
+    tool: &str,
+    explicit_override: Option<&str>,
+) -> Option<String> {
+    let agent = pick_acp_agent_name(
+        &AgentRegistry::with_defaults(),
+        &config.session,
+        &config.acp,
+        tool,
+        explicit_override,
+    );
+    config.acp.pinned_model_for(&agent)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[test]
-    fn defaults_include_claude_code_and_aoe_agent() {
-        let reg = AgentRegistry::with_defaults();
-        assert!(reg.get("claude-code").is_some());
-        assert!(reg.get("aoe-agent").is_some());
-        assert!(reg.get("omp").is_some());
+    fn strings(keys: &[&str]) -> Vec<String> {
+        keys.iter().map(|s| s.to_string()).collect()
     }
 
     #[test]
-    fn from_acp_cmd_splits_argv() {
+    fn pick_acp_agent_name_resolves_the_agent_a_spawn_runs() {
+        let registry = AgentRegistry::with_defaults();
+        let session = crate::session::config::SessionConfig {
+            agent_detect_as: [
+                ("my-claude".to_string(), "claude".to_string()),
+                ("my-cursor".to_string(), "cursor".to_string()),
+                ("bad-sp".to_string(), "claude".to_string()),
+            ]
+            .into(),
+            agent_acp_cmd: [
+                ("oc-sp".to_string(), "ocp run sp acp".to_string()),
+                ("bad-sp".to_string(), String::new()),
+            ]
+            .into(),
+            ..Default::default()
+        };
+        let acp = crate::session::config::AcpConfig {
+            default_agent: "opencode".into(),
+            ..Default::default()
+        };
+
+        for (tool, explicit, want) in [
+            ("claude", Some("gemini"), "gemini"),
+            ("claude", Some(""), "claude"),
+            ("opencode", None, "opencode"),
+            ("oc-sp", None, "oc-sp"),
+            ("my-claude", None, "claude"),
+            ("my-cursor", None, "opencode"),
+            ("claude", None, "claude"),
+            ("unknown", None, "opencode"),
+            ("bad-sp", None, "claude"),
+        ] {
+            assert_eq!(
+                pick_acp_agent_name(&registry, &session, &acp, tool, explicit),
+                want,
+                "{tool} / {explicit:?}"
+            );
+        }
+
+        let detect_as: HashMap<String, String> = [
+            ("lenovo-claude", "claude"),
+            ("work-codex", "codex"),
+            // A terminal-only base has no adapter.
+            ("my-cursor", "cursor"),
+            // A base that is itself a custom name is not followed.
+            ("chain", "lenovo-claude"),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+        for (tool, expected) in [
+            ("lenovo-claude", Some("claude")),
+            ("work-codex", Some("codex")),
+            ("my-cursor", None),
+            ("chain", None),
+            ("unmapped", None),
+        ] {
+            assert_eq!(
+                inherited_acp_base(tool, &detect_as).as_deref(),
+                expected,
+                "{tool}"
+            );
+        }
+    }
+
+    #[test]
+    fn pinned_model_for_tool_reads_the_resolved_agents_pin() {
+        let mut config = crate::session::config::Config::default();
+        config
+            .session
+            .agent_detect_as
+            .insert("my-claude".into(), "claude".into());
+        config.acp.acp_defaults.insert(
+            "claude".into(),
+            crate::session::config::AcpAgentDefaults {
+                model: Some("claude-pinned".into()),
+                pin_model: true,
+                ..Default::default()
+            },
+        );
+        for (tool, explicit, want) in [
+            ("my-claude", None, Some("claude-pinned")),
+            ("claude", None, Some("claude-pinned")),
+            ("claude", Some("gemini"), None),
+            ("opencode", None, None),
+        ] {
+            assert_eq!(
+                pinned_model_for_tool(&config, tool, explicit).as_deref(),
+                want,
+                "{tool}"
+            );
+        }
+    }
+
+    #[test]
+    fn from_acp_cmd_splits_argv_and_rejects_bad_commands() {
         let spec = AgentSpec::from_acp_cmd("oc-sp", "ocp run sp acp").unwrap();
-        assert_eq!(spec.command, "ocp");
-        assert_eq!(spec.args, vec!["run", "sp", "acp"]);
+        assert_eq!(
+            (spec.command.as_str(), spec.args.clone()),
+            ("ocp", strings(&["run", "sp", "acp"]))
+        );
         assert_eq!(spec.description, "Custom ACP agent `oc-sp`");
         assert!(spec.env_allowlist.is_none());
-    }
 
-    #[test]
-    fn from_acp_cmd_honors_quoting() {
-        let spec = AgentSpec::from_acp_cmd("wrap", "sh -lc 'ocp run sp acp'").unwrap();
-        assert_eq!(spec.command, "sh");
-        assert_eq!(spec.args, vec!["-lc", "ocp run sp acp"]);
-    }
-
-    #[test]
-    fn from_acp_cmd_rejects_empty() {
-        assert!(AgentSpec::from_acp_cmd("x", "").is_err());
-        assert!(AgentSpec::from_acp_cmd("x", "   ").is_err());
-    }
-
-    #[test]
-    fn from_acp_cmd_rejects_unbalanced_quotes() {
-        assert!(AgentSpec::from_acp_cmd("x", "ocp run \"unterminated").is_err());
-    }
-
-    #[test]
-    fn list_is_sorted() {
-        let mut reg = AgentRegistry::new();
-        reg.upsert(
-            "zeta".into(),
-            AgentSpec {
-                command: "z".into(),
-                args: vec![],
-                description: "z".into(),
-                env_allowlist: None,
-            },
+        let quoted = AgentSpec::from_acp_cmd("wrap", "sh -lc 'ocp run sp acp'").unwrap();
+        assert_eq!(
+            (quoted.command.as_str(), quoted.args),
+            ("sh", strings(&["-lc", "ocp run sp acp"]))
         );
-        reg.upsert(
-            "alpha".into(),
-            AgentSpec {
-                command: "a".into(),
-                args: vec![],
-                description: "a".into(),
-                env_allowlist: None,
-            },
+        for bad in ["", "   ", "ocp run \"unterminated"] {
+            assert!(AgentSpec::from_acp_cmd("x", bad).is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn default_env_allowlists_come_from_the_binarys_catalog_entry() {
+        let reg = AgentRegistry::with_defaults();
+        for (name, spec) in reg.list() {
+            let catalog = env_allowlist_for(&spec.command);
+            let want = (!catalog.is_empty()).then(|| strings(catalog));
+            assert_eq!(spec.env_allowlist, want, "{name}");
+        }
+        // The two Claude names share one binary, so they share one allowlist.
+        assert_eq!(
+            reg.get("claude").unwrap().env_allowlist,
+            reg.get("claude-code").unwrap().env_allowlist
         );
-        let names: Vec<&str> = reg.list().iter().map(|(n, _)| n.as_str()).collect();
-        assert_eq!(names, vec!["alpha", "zeta"]);
+        // gemini reads GEMINI_API_KEY, never the AI-Studio-only name.
+        let gemini = reg.get("gemini").unwrap().env_allowlist.clone().unwrap();
+        assert!(gemini.iter().any(|k| k == "GEMINI_API_KEY"));
+        assert!(!gemini.iter().any(|k| k == "GOOGLE_GENERATIVE_AI_API_KEY"));
+
+        let with_allowlist: Vec<&str> = reg
+            .list()
+            .into_iter()
+            .filter(|(_, spec)| spec.env_allowlist.is_some())
+            .map(|(name, _)| name.as_str())
+            .collect();
+        assert_eq!(
+            with_allowlist,
+            [
+                "aoe-agent",
+                "claude",
+                "claude-code",
+                "codex",
+                "gemini",
+                "opencode",
+                "prime-agent"
+            ],
+            "unverified adapters (pi, omp, kimi, vibe) must stay without an env_allowlist"
+        );
     }
 }

@@ -28,32 +28,26 @@ function skillKey(skill: SkillSummary): string {
   return `${sourceId(skill)}:${skill.directory}`;
 }
 
-/** Compact counts line for a sync run, e.g. "3 shared, 1 unchanged, 1 conflict".
- *  "shared" folds together "created" and "updated" since both put a skill into
- *  an agent's directory; "unchanged" is omitted from the detail list below but
- *  still counted here so the user sees the full picture. */
+const SYNC_COUNTS: [label: string, statuses: string[], plural: boolean][] = [
+  ["shared", ["created", "updated"], false],
+  ["removed", ["removed"], false],
+  ["unchanged", ["unchanged"], false],
+  ["conflict", ["conflict"], true],
+  ["error", ["error"], true],
+];
+
+/** Compact counts line for a sync run, e.g. "3 shared, 1 unchanged, 1 conflict". */
 function summarizeSyncOutcomes(outcomes: SkillSyncOutcome[]): string {
-  const counts = { shared: 0, removed: 0, unchanged: 0, conflict: 0, error: 0 };
-  for (const outcome of outcomes) {
-    if (outcome.status === "created" || outcome.status === "updated") counts.shared += 1;
-    else if (outcome.status === "removed") counts.removed += 1;
-    else if (outcome.status === "unchanged") counts.unchanged += 1;
-    else if (outcome.status === "conflict") counts.conflict += 1;
-    else if (outcome.status === "error") counts.error += 1;
-  }
-  const parts: string[] = [];
-  if (counts.shared) parts.push(`${counts.shared} shared`);
-  if (counts.removed) parts.push(`${counts.removed} removed`);
-  if (counts.unchanged) parts.push(`${counts.unchanged} unchanged`);
-  if (counts.conflict) parts.push(`${counts.conflict} conflict${counts.conflict === 1 ? "" : "s"}`);
-  if (counts.error) parts.push(`${counts.error} error${counts.error === 1 ? "" : "s"}`);
+  const parts = SYNC_COUNTS.flatMap(([label, statuses, plural]) => {
+    const n = outcomes.filter((o) => statuses.includes(o.status)).length;
+    return n ? [`${n} ${label}${plural && n !== 1 ? "s" : ""}`] : [];
+  });
   return parts.length ? parts.join(", ") : "Nothing to sync.";
 }
 
-/** Fold a follow-up sync's outcomes into the displayed list: rows sharing a
- *  (root, directory) key are replaced in place so the rest of the panel
- *  (other roots, other skills) does not disappear, and any outcome the
- *  follow-up introduces that was not already shown is appended. */
+/** Fold a follow-up sync's outcomes into the displayed list: rows sharing a (root, directory) key are replaced in
+ *  place so the rest of the panel (other roots, other skills) does not disappear, and any outcome the follow-up
+ *  introduces that was not already shown is appended. */
 function mergeSyncOutcomes(current: SkillSyncOutcome[] | null, updates: SkillSyncOutcome[]): SkillSyncOutcome[] {
   const key = (outcome: SkillSyncOutcome) => `${outcome.root}:${outcome.directory}`;
   const updateMap = new Map(updates.map((outcome) => [key(outcome), outcome]));
@@ -64,9 +58,7 @@ function mergeSyncOutcomes(current: SkillSyncOutcome[] | null, updates: SkillSyn
   return merged;
 }
 
-/** One collapsible section of the sidebar list ("Managed" or "Available to
- *  adopt"). Both groups render the same row shape; only the membership and
- *  the section label differ, so the row markup lives here once. */
+/** One collapsible section of the sidebar list ("Managed" or "Available to adopt"). */
 function SkillGroup({
   title,
   skills,
@@ -121,11 +113,6 @@ function SkillGroup({
   );
 }
 
-/** The right pane's tab row. A single tab today (the raw/preview toggle lives
- *  separately, since it applies within this tab); kept as a list so adding a
- *  second tab (e.g. usage statistics) is a one-entry change. */
-const DETAIL_TABS = [{ id: "content", label: "SKILL.md" }] as const;
-
 export function SkillsManager({ readOnly = false }: { readOnly?: boolean } = {}) {
   const [data, setData] = useState<SkillsResponse | null>(null);
   const [selectedKey, setSelectedKey] = useState<string | null>(null);
@@ -173,11 +160,9 @@ export function SkillsManager({ readOnly = false }: { readOnly?: boolean } = {})
   const selected = data?.skills.find((skill) => skillKey(skill) === selectedKey) ?? null;
   const dirty = detail !== null && draft !== detail.content;
 
-  // Keyed on the selection's primitives, NOT the `selected` object: that object
-  // is a fresh `.find()` result on every render, so depending on it re-ran this
-  // effect after any `load()` and reset the draft out from under an unsaved
-  // edit. Sharing, replacing a conflict, and saving all keep the same skill
-  // selected, so with primitive deps they no longer touch the editor at all.
+  // Keyed on the selection's primitives, NOT the `selected` object: that object is a fresh `.find()` result on
+  // every render, so depending on it re-ran this effect after any `load()` and reset the draft out from under an
+  // unsaved edit.
   const selectedSource = selected ? sourceId(selected) : null;
   const selectedDirectory = selected?.directory ?? null;
 
@@ -217,102 +202,102 @@ export function SkillsManager({ readOnly = false }: { readOnly?: boolean } = {})
     setSelectedKey(skillKey(skill));
   };
 
-  const create = async () => {
-    // Creating jumps the selection to the new skill, so it discards a draft the
-    // same way clicking another row does.
-    if (!confirmDiscard()) return;
+  /** Runs a mutation with the busy flag; a failure shows its error (or `fallback`), success runs `onOk`. */
+  const run = async <T extends { ok: boolean; error?: string }>(
+    call: () => Promise<T>,
+    fallback: string,
+    onOk: (result: T) => Promise<void> | void,
+    onError?: () => void,
+  ) => {
     setBusy(true);
-    const result = await createSkill(newDirectory, newDescription || undefined);
+    const result = await call();
     setBusy(false);
     if (!result.ok) {
-      setNotice(result.error ?? "Could not create skill.");
+      onError?.();
+      setNotice(result.error ?? fallback);
       return;
     }
-    const key = `aoe-managed:${newDirectory}`;
-    setNewDirectory("");
-    setNewDescription("");
-    setShowCreateForm(false);
-    setNotice("Managed skill created.");
-    await load(key);
+    await onOk(result);
   };
-
-  const sync = async () => {
-    setBusy(true);
-    const result = await syncSkills();
-    setBusy(false);
-    if (!result.ok) {
-      setSyncOutcomes(null);
-      setNotice(result.error ?? "Could not sync skills.");
-      return;
-    }
+  const reload = () => load(selectedKey ?? undefined);
+  const showOutcomes = async (result: { outcomes: SkillSyncOutcome[] }) => {
     setNotice(null);
     setSyncOutcomes(result.outcomes);
-    await load(selectedKey ?? undefined);
+    await reload();
   };
 
-  /** Re-run sync for a single conflict, naming it in `replace` so the backend
-   *  overwrites it instead of leaving it alone. Merges the follow-up's
-   *  outcomes into the panel instead of replacing it wholesale, so the other
-   *  rows already shown do not vanish. */
-  const replaceConflict = async (outcome: SkillSyncOutcome) => {
-    setBusy(true);
-    const result = await syncSkills({ roots: [outcome.root], replace: [outcome.directory] });
-    setBusy(false);
-    if (!result.ok) {
-      setNotice(result.error ?? "Could not replace skill.");
-      return;
-    }
-    setNotice(null);
-    setSyncOutcomes((current) => mergeSyncOutcomes(current, result.outcomes));
-    await load(selectedKey ?? undefined);
+  const create = async () => {
+    // Creating selects the new skill, which discards a draft like clicking another row.
+    if (!confirmDiscard()) return;
+    await run(
+      () => createSkill(newDirectory, newDescription || undefined),
+      "Could not create skill.",
+      async () => {
+        const key = `aoe-managed:${newDirectory}`;
+        setNewDirectory("");
+        setNewDescription("");
+        setShowCreateForm(false);
+        setNotice("Managed skill created.");
+        await load(key);
+      },
+    );
   };
 
-  /** Share only the selected skill: the server reconciles just that
-   *  directory and skips orphan removal for the rest of the library, so the
-   *  outcome panel reports exactly what happened to the one the user is
-   *  looking at. */
+  const sync = () =>
+    run(
+      () => syncSkills(),
+      "Could not sync skills.",
+      showOutcomes,
+      () => setSyncOutcomes(null),
+    );
+
+  /** Re-syncs one conflict, naming it in `replace` so the backend overwrites it. */
+  const replaceConflict = (outcome: SkillSyncOutcome) =>
+    run(
+      () => syncSkills({ roots: [outcome.root], replace: [outcome.directory] }),
+      "Could not replace skill.",
+      async (result) => {
+        setNotice(null);
+        setSyncOutcomes((current) => mergeSyncOutcomes(current, result.outcomes));
+        await reload();
+      },
+    );
+
+  /** Shares only the selected skill; the server skips orphan removal for the rest of the library. */
   const shareSkill = async () => {
     if (!selected) return;
-    setBusy(true);
-    const result = await syncSkills({ directories: [selected.directory] });
-    setBusy(false);
-    if (!result.ok) {
-      setSyncOutcomes(null);
-      setNotice(result.error ?? "Could not share skill.");
-      return;
-    }
-    setNotice(null);
-    setSyncOutcomes(result.outcomes);
-    await load(selectedKey ?? undefined);
+    await run(
+      () => syncSkills({ directories: [selected.directory] }),
+      "Could not share skill.",
+      showOutcomes,
+      () => setSyncOutcomes(null),
+    );
   };
 
   const adopt = async () => {
-    if (!selected || selected.provenance.kind !== "external") return;
-    // Adopting selects the new managed copy, moving off whatever is being edited.
-    if (!confirmDiscard()) return;
-    setBusy(true);
-    const result = await adoptSkill(selected.provenance.root, selected.directory);
-    setBusy(false);
-    if (!result.ok) {
-      setNotice(result.error ?? "Could not adopt skill.");
-      return;
-    }
-    setNotice("Skill adopted into AoE's managed store.");
-    await load(`aoe-managed:${result.directory ?? selected.directory}`);
+    if (!selected || selected.provenance.kind !== "external" || !confirmDiscard()) return;
+    const { root } = selected.provenance;
+    await run(
+      () => adoptSkill(root, selected.directory),
+      "Could not adopt skill.",
+      async (result) => {
+        setNotice("Skill adopted into AoE's managed store.");
+        await load(`aoe-managed:${result.directory ?? selected.directory}`);
+      },
+    );
   };
 
   const save = async () => {
     if (!selected?.writable) return;
-    setBusy(true);
-    const result = await updateSkill(selected.directory, draft);
-    setBusy(false);
-    if (!result.ok) {
-      setNotice(result.error ?? "Could not save skill.");
-      return;
-    }
-    setDetail((current) => (current ? { ...current, content: draft } : current));
-    setNotice("Skill saved.");
-    await load(selectedKey ?? undefined);
+    await run(
+      () => updateSkill(selected.directory, draft),
+      "Could not save skill.",
+      async () => {
+        setDetail((current) => (current ? { ...current, content: draft } : current));
+        setNotice("Skill saved.");
+        await reload();
+      },
+    );
   };
 
   const discard = () => {
@@ -321,16 +306,15 @@ export function SkillsManager({ readOnly = false }: { readOnly?: boolean } = {})
 
   const remove = async () => {
     if (!selected?.writable || !window.confirm(`Delete managed skill "${selected.directory}"?`)) return;
-    setBusy(true);
-    const result = await deleteSkill(selected.directory);
-    setBusy(false);
-    if (!result.ok) {
-      setNotice(result.error ?? "Could not delete skill.");
-      return;
-    }
-    setDetail(null);
-    setNotice("Managed skill deleted.");
-    await load();
+    await run(
+      () => deleteSkill(selected.directory),
+      "Could not delete skill.",
+      async () => {
+        setDetail(null);
+        setNotice("Managed skill deleted.");
+        await load();
+      },
+    );
   };
 
   const normalized = search.trim().toLowerCase();
@@ -468,11 +452,9 @@ export function SkillsManager({ readOnly = false }: { readOnly?: boolean } = {})
         </div>
       )}
 
-      {/* Explicit height: the settings content area (SettingsView) is itself
-          a scroll container with no fixed height, so a plain h-full/flex-1
-          pane here has nothing to measure against and collapses to its
-          content height instead of scrolling internally. Pinning a height
-          on the grid lets each pane scroll independently within it. */}
+      {/* Explicit height: the settings content area (SettingsView) is itself a scroll container with no fixed
+         height, so a plain h-full/flex-1 pane here has nothing to measure against and collapses to its content
+         height instead of scrolling internally. */}
       <div className="grid h-[calc(100vh-16rem)] min-h-[26rem] gap-4 lg:grid-cols-[320px_minmax(0,1fr)]">
         <aside className="flex min-h-0 flex-col overflow-y-auto rounded-lg border border-surface-700/60 bg-surface-850/70">
           <div className="sticky top-0 z-10 space-y-2 border-b border-surface-700/60 bg-surface-850/95 p-3">
@@ -539,19 +521,13 @@ export function SkillsManager({ readOnly = false }: { readOnly?: boolean } = {})
                 </p>
                 <div className="flex items-center justify-between gap-3">
                   <div className="flex gap-4">
-                    {DETAIL_TABS.map((tab) => (
-                      <span
-                        key={tab.id}
-                        className="border-b-2 border-brand-500 pb-1 font-mono text-[11px] uppercase tracking-wider text-brand-500"
-                      >
-                        {tab.label}
-                      </span>
-                    ))}
+                    <span className="border-b-2 border-brand-500 pb-1 font-mono text-[11px] uppercase tracking-wider text-brand-500">
+                      SKILL.md
+                    </span>
                   </div>
-                  {/* Segmented toggle chips, not standalone action buttons: kept
-                      below the 32px button height so the pair reads as one
-                      compact control sitting at the tab-label baseline rather
-                      than a second row of full-size buttons. */}
+                  {/* Segmented toggle chips, not standalone action buttons: kept below the 32px button height so
+                     the pair reads as one compact control sitting at the tab-label baseline rather than a second
+                     row of full-size buttons. */}
                   <div className="flex items-center gap-1 rounded-md bg-surface-900 p-0.5">
                     <button
                       type="button"
@@ -579,9 +555,8 @@ export function SkillsManager({ readOnly = false }: { readOnly?: boolean } = {})
                 </div>
               </div>
 
-              {/* min-h-0 lets the editor shrink inside the flex column so it
-                  grows to the bottom of the pane instead of sitting at a fixed
-                  height with dead space above the footer. */}
+              {/* min-h-0 lets the editor shrink inside the flex column so it grows to the bottom of the pane
+                 instead of sitting at a fixed height with dead space above the footer. */}
               <div className="flex min-h-0 flex-1 flex-col p-4">
                 {detail ? (
                   viewMode === "raw" ? (

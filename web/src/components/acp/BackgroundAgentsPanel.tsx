@@ -1,12 +1,5 @@
-// Background agents panel.
-//
-// Lists the async sub-agents (Claude `Task` with isAsync) launched in the
-// active structured-view session, with live status, elapsed time, current
-// activity, and (on completion) the result. Data comes from the
-// `useBackgroundAgents` store, which reuses the single ACP WebSocket
-// subscription <StructuredView> already holds, so this sibling pane does
-// not open a second connection. See src/acp/background_agent.rs for the
-// backend tailer that produces the events.
+// Async sub-agents of the active session, from the store fed by StructuredView's
+// existing WebSocket, so this pane opens no connection of its own.
 
 import { useEffect, useState } from "react";
 import { Bot, ChevronDown, Maximize2, Square, X } from "lucide-react";
@@ -33,8 +26,7 @@ export function BackgroundAgentsPanel({ sessionId }: { sessionId: string | null 
     if (ra !== rb) return ra - rb;
     return b.startedAt.localeCompare(a.startedAt);
   });
-  // Stop only when something is genuinely running; a stalled agent has
-  // stopped writing, so /acp/cancel would be a confusing no-op.
+  // A stalled agent is no longer writing, so cancel would be a no-op.
   const anyRunning = agents.some((a) => a.status === "running");
 
   return (
@@ -62,10 +54,7 @@ function isActive(status: BackgroundAgentStatus): boolean {
   return status === "running" || status === "stalled";
 }
 
-/** Interrupt the session, which stops the SDK's in-flight async sub-agents.
- *  ACP has no per-agent cancel, so this is the same `/acp/cancel` the
- *  composer Stop uses, reachable here because the panel sits in a sibling
- *  dock with no composer turn of its own. */
+/** ACP has no per-agent cancel; cancelling the session stops its async sub-agents. */
 function StopButton({ sessionId }: { sessionId: string }) {
   const [busy, setBusy] = useState(false);
   return (
@@ -193,8 +182,6 @@ function AgentDetailModal({ agent, onClose }: { agent: BackgroundAgent; onClose:
   );
 }
 
-/** The sub-agent's individual tool calls, like the main output: one row
- *  per read / bash / grep with its target and outcome. */
 function ToolList({ tools }: { tools: BackgroundAgentTool[] }) {
   return (
     <div className="flex flex-col gap-0.5">
@@ -231,8 +218,7 @@ function Field({
   value: string;
   mono?: boolean;
   tone?: "warn";
-  /** In the narrow inline row, cap long text to a few lines; the details
-   *  modal renders without this so prompt/result show in full. */
+  /** Clamp long text in the narrow panel; the details modal shows it in full. */
   clamp?: boolean;
 }) {
   return (

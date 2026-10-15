@@ -4,59 +4,34 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use tui_input::backend::crossterm::EventHandler;
 use tui_input::Input;
 
-use crate::tui::dialogs::{CustomInstructionDialog, DialogResult};
+use crate::tui::dialogs::{hit, CustomInstructionDialog, DialogResult};
 
 use super::fields::ListItemValidation;
 use super::{
     FieldValue, ListEditState, SettingsCategory, SettingsFocus, SettingsScope, SettingsView,
 };
 
-/// Result of handling a key event in the settings view
 pub enum SettingsAction {
-    /// Continue showing the settings view
     Continue,
-    /// Close the settings view (with optional unsaved changes warning)
     Close,
-    /// Close was cancelled due to unsaved changes
     UnsavedChangesWarning,
-    /// Live-preview a theme change (theme name)
     PreviewTheme(String),
 }
 
 impl SettingsView {
     pub fn handle_key(&mut self, key: KeyEvent) -> SettingsAction {
-        // Clear transient messages on any key
         self.success_message = None;
         self.success_message_expires_at = None;
-        // Any keypress invalidates the mouse hover highlight; otherwise
-        // a stationary cursor keeps highlighting an unrelated row while
-        // the keyboard cursor moves elsewhere. Mirrors the sidebar's
-        // move_cursor_clears_hover pattern.
+        // A stationary cursor must not keep highlighting a row the keyboard
+        // has moved off.
         self.mouse_pos = None;
 
-        // Handle custom instruction dialog
         if let Some(ref mut dialog) = self.custom_instruction_dialog {
-            match dialog.handle_key(key) {
-                DialogResult::Submit(value) => {
-                    let field = &mut self.fields[self.selected_field];
-                    if let FieldValue::OptionalText(ref mut v) = field.value {
-                        *v = value;
-                    }
-                    self.apply_field_to_config(self.selected_field);
-                    self.custom_instruction_dialog = None;
-                    return SettingsAction::Continue;
-                }
-                DialogResult::Cancel => {
-                    self.custom_instruction_dialog = None;
-                    return SettingsAction::Continue;
-                }
-                DialogResult::Continue => {
-                    return SettingsAction::Continue;
-                }
-            }
+            let result = dialog.handle_key(key);
+            self.finish_custom_instruction(result);
+            return SettingsAction::Continue;
         }
 
-        // Handle help overlay
         if self.show_help {
             if matches!(
                 key.code,
@@ -67,25 +42,19 @@ impl SettingsView {
             return SettingsAction::Continue;
         }
 
-        // Handle text editing mode
         if self.editing_input.is_some() {
             return self.handle_text_edit_key(key);
         }
 
-        // Handle list editing mode
         if self.list_edit_state.is_some() {
             return self.handle_list_edit_key(key);
         }
 
-        // Handle the settings-search popup. While it is open every
-        // other dispatch (scope cycle, navigation in the main panels)
-        // is suppressed: the user is typing into the bar and picking a
-        // hit, not driving the underlying settings view.
+        // The search popup suppresses every other dispatch while open.
         if self.search_input.is_some() {
             return self.handle_search_key(key);
         }
 
-        // Save is always reachable
         if key.code == KeyCode::Char('s') && key.modifiers == KeyModifiers::CONTROL {
             if let Err(e) = self.save() {
                 self.error_message = Some(format!("Failed to save: {}", e));
@@ -93,21 +62,14 @@ impl SettingsView {
             return SettingsAction::Continue;
         }
 
-        // The Plugins category hosts the plugin manager inline, with the
-        // active plugins' editable settings fields beneath it. Tab toggles
-        // the sub-focus between the two panes; the manager owns every key
-        // while it has the sub-focus (Space stages an enable/disable, Esc
-        // steps back to the category panel). With the fields sub-focused,
-        // keys fall through to the normal field handling below, so plugin
-        // settings edit and save exactly like core settings.
+        // The Plugins category hosts the plugin manager above the active
+        // plugins' fields. Tab toggles sub-focus; the manager owns every key
+        // while it holds it, otherwise keys fall through to field handling.
         if self.current_category() == SettingsCategory::Plugins
             && self.focus == SettingsFocus::Fields
         {
-            // Scope keys behave like on every other tab rather than being
-            // swallowed by the manager: the Plugins tab is Global-only (like
-            // Telemetry), so a scope switch falls back to the new scope's
-            // first tab. Not while the manager captures input, where `[`/`{`
-            // are literal text for the discovery search query.
+            // Scope keys still switch scope here, except while the manager
+            // captures input, where `[`/`{` are literal search text.
             let scope_key = matches!(key.code, KeyCode::Char('[' | ']' | '{' | '}'))
                 && !self.plugin_manager.captures_input();
             if !scope_key {
@@ -124,9 +86,7 @@ impl SettingsView {
             }
         }
 
-        // Normal mode
         match (key.code, key.modifiers) {
-            // Close from anywhere
             (KeyCode::Char('q'), _) => {
                 if self.has_changes {
                     SettingsAction::UnsavedChangesWarning
@@ -135,7 +95,6 @@ impl SettingsView {
                 }
             }
 
-            // Escape goes up one level
             (KeyCode::Esc, _) => match self.focus {
                 SettingsFocus::Fields => {
                     self.focus = SettingsFocus::Categories;
@@ -150,7 +109,6 @@ impl SettingsView {
                 }
             },
 
-            // Switch scope: [ and ] cycle between Global / Profile / Repo
             (KeyCode::Char(']'), _) => {
                 if self.has_changes {
                     return SettingsAction::UnsavedChangesWarning;
@@ -190,7 +148,6 @@ impl SettingsView {
                 SettingsAction::Continue
             }
 
-            // Cycle through profiles when in Profile scope: { and }
             (KeyCode::Char('}'), _) | (KeyCode::Char('{'), _) => {
                 if self.scope == SettingsScope::Profile && !self.available_profiles.is_empty() {
                     if self.has_changes {
@@ -216,7 +173,6 @@ impl SettingsView {
                 SettingsAction::Continue
             }
 
-            // Switch focus between categories and fields
             (KeyCode::Tab, _) | (KeyCode::Right, _) | (KeyCode::Char('l'), _) => {
                 self.focus = SettingsFocus::Fields;
                 SettingsAction::Continue
@@ -226,15 +182,10 @@ impl SettingsView {
                 SettingsAction::Continue
             }
 
-            // Navigate up/down. Inside the field list, navigation skips
-            // past non-interactive section dividers
-            // (`FieldValue::SectionHeader`) so the cursor never lands on
-            // a row the user can't edit.
+            // Navigation skips `FieldValue::SectionHeader` dividers.
             (KeyCode::Up, _) | (KeyCode::Char('k'), _) => {
                 match self.focus {
                     SettingsFocus::Categories => {
-                        // Skip non-selectable section dividers so the
-                        // cursor jumps category-to-category.
                         let mut idx = self.selected_category;
                         while idx > 0 {
                             idx -= 1;
@@ -289,7 +240,6 @@ impl SettingsView {
                 SettingsAction::Continue
             }
 
-            // Toggle boolean / edit field
             (KeyCode::Char(' '), _) => {
                 if self.focus == SettingsFocus::Fields && !self.fields.is_empty() {
                     let field = &mut self.fields[self.selected_field];
@@ -301,7 +251,6 @@ impl SettingsView {
                 SettingsAction::Continue
             }
 
-            // Enter - edit field or expand list
             (KeyCode::Enter, _) => {
                 if self.focus == SettingsFocus::Fields && !self.fields.is_empty() {
                     let field = &self.fields[self.selected_field];
@@ -346,48 +295,36 @@ impl SettingsView {
                             }
                         }
                         FieldValue::List(_) => {
-                            // Expand list for editing
                             self.list_edit_state = Some(ListEditState::default());
                         }
                         FieldValue::SectionHeader => {
-                            // Non-interactive divider. Navigation should
-                            // never land the cursor here in the first
-                            // place; this arm just makes the match
-                            // exhaustive.
+                            // Navigation never lands here; arm is for exhaustiveness.
                         }
                     }
                 } else if self.focus == SettingsFocus::Categories {
-                    // Move to fields when pressing Enter on a category
                     self.focus = SettingsFocus::Fields;
                 }
                 SettingsAction::Continue
             }
 
-            // Toggle help overlay
             (KeyCode::Char('?'), _) => {
                 self.show_help = true;
                 SettingsAction::Continue
             }
 
-            // Open the settings-wide search overlay. Any field with a
-            // matching label or description (across every category) is
-            // a hit; Enter jumps to that field.
             (KeyCode::Char('/'), _) => {
                 self.open_search();
                 SettingsAction::Continue
             }
 
-            // Reset field to default (clear profile/repo override)
             (KeyCode::Char('r'), _) => {
                 if (self.scope == SettingsScope::Profile || self.scope == SettingsScope::Repo)
                     && self.focus == SettingsFocus::Fields
                     && !self.fields.is_empty()
                 {
                     let was_theme = self.fields[self.selected_field].is_theme_name();
-                    // Clearing an override doesn't change which fields exist, only
-                    // their inherited values. rebuild_fields() resets scroll to 0,
-                    // which would yank the user away from the field they just reset.
-                    // Preserve the cursor and scroll position.
+                    // Clearing an override only changes inherited values, so
+                    // restore the cursor that rebuild_fields() reset.
                     let saved_selected = self.selected_field;
                     let saved_scroll = self.fields_scroll_offset;
                     self.clear_profile_override(self.selected_field);
@@ -414,17 +351,27 @@ impl SettingsView {
         }
     }
 
-    /// Route a key to the embedded plugin manager (Plugins category). Space
-    /// stages an enable/disable into this view's config; Esc/`q`
-    /// (manager Cancel) returns to the category panel.
+    /// Apply the instruction editor's outcome, from a key or a click.
+    fn finish_custom_instruction(&mut self, result: DialogResult<Option<String>>) {
+        match result {
+            DialogResult::Submit(value) => {
+                let field = &mut self.fields[self.selected_field];
+                if let FieldValue::OptionalText(ref mut v) = field.value {
+                    *v = value;
+                }
+                self.apply_field_to_config(self.selected_field);
+                self.custom_instruction_dialog = None;
+            }
+            DialogResult::Cancel => self.custom_instruction_dialog = None,
+            DialogResult::Continue => {}
+        }
+    }
+
+    /// Route a key to the embedded plugin manager. Esc returns to categories.
     fn handle_plugins_manager_key(&mut self, key: KeyEvent) -> SettingsAction {
-        // Space STAGES enable/disable in this view's config, like every
-        // other settings row, instead of writing to disk immediately. That
-        // keeps it in the Ctrl-s save flow (no surprise immediate write, no
-        // file-watch flash); the row shows the pending state at once. Only
-        // when the manager is not capturing input itself (a consent popup,
-        // the discovery search): those own every key, Space included. Enter
-        // falls through to the manager (details popup).
+        // Space stages enable/disable into this view's config so it saves
+        // through Ctrl-s like any other row, unless the manager is itself
+        // capturing input (consent popup, discovery search).
         if key.code == KeyCode::Char(' ') && !self.plugin_manager.captures_input() {
             if let Some(p) = self.plugin_manager.selected() {
                 let id = p.id.clone();
@@ -452,20 +399,15 @@ impl SettingsView {
                 SettingsAction::Continue
             }
         };
-        // Master-detail: moving the manager selection swaps which plugin's
-        // settings the fields pane shows, so a selection change rebuilds the
-        // (filtered) field list.
+        // Master-detail: a selection change rebuilds the filtered field list.
         if self.plugin_manager.selected().map(|p| p.id.clone()) != selected_before {
             self.rebuild_fields();
         }
         result
     }
 
-    /// Drive the settings-search popup. Esc closes without changing
-    /// selection; Enter jumps to the highlighted hit; up/down navigate
-    /// the hit list; Ctrl+s stays reachable for saving staged edits;
-    /// every other key feeds the query in the bar and re-runs the
-    /// filter so the popup narrows as the user types.
+    /// Drive the settings-search popup: Enter jumps to the highlighted hit,
+    /// Ctrl+s still saves, and every other key feeds the query.
     fn handle_search_key(&mut self, key: KeyEvent) -> SettingsAction {
         if key.code == KeyCode::Char('s') && key.modifiers == KeyModifiers::CONTROL {
             if let Err(e) = self.save() {
@@ -512,7 +454,6 @@ impl SettingsView {
                     let text = input.value().to_string();
                     let field = &mut self.fields[self.selected_field];
 
-                    // Apply the new value
                     match &mut field.value {
                         FieldValue::Text(ref mut v) => {
                             *v = text;
@@ -532,10 +473,8 @@ impl SettingsView {
                         _ => {}
                     }
 
-                    // Validate
                     if let Err(e) = field.validate() {
                         self.error_message = Some(e);
-                        // Revert to editing
                         self.editing_input = match &field.value {
                             FieldValue::Text(v) => Some(Input::new(v.clone())),
                             FieldValue::OptionalText(v) => {
@@ -552,7 +491,6 @@ impl SettingsView {
                 }
             }
             _ => {
-                // Delegate all other key events to tui_input
                 if let Some(ref mut input) = self.editing_input {
                     input.handle_event(&crossterm::event::Event::Key(key));
                 }
@@ -567,7 +505,6 @@ impl SettingsView {
             None => return SettingsAction::Continue,
         };
 
-        // If we're editing an item or adding new
         if state.editing_item.is_some() {
             return self.handle_list_item_edit_key(key);
         }
@@ -587,12 +524,11 @@ impl SettingsView {
                 }
             }
             KeyCode::Char('a') => {
-                // Add new item
                 state.adding_new = true;
                 state.editing_item = Some(Input::default());
             }
             KeyCode::Char('d') => {
-                // Delete selected item - capture index before borrowing fields
+                // Capture the index before borrowing fields.
                 let selected_idx = state.selected_index;
                 let mut new_selected_idx = selected_idx;
 
@@ -611,7 +547,6 @@ impl SettingsView {
                 self.apply_field_to_config(self.selected_field);
             }
             KeyCode::Enter => {
-                // Edit selected item
                 if let FieldValue::List(items) = &self.fields[self.selected_field].value {
                     if !items.is_empty() && state.selected_index < items.len() {
                         state.editing_item = Some(Input::new(items[state.selected_index].clone()));
@@ -636,7 +571,6 @@ impl SettingsView {
                 self.error_message = None;
             }
             KeyCode::Enter => {
-                // Take the input and flags out to avoid borrow conflict
                 let input = state.editing_item.take();
                 let adding_new = state.adding_new;
                 let selected_idx = state.selected_index;
@@ -648,7 +582,6 @@ impl SettingsView {
                         let item_validation =
                             self.fields[self.selected_field].list_item_validation();
 
-                        // Validate key=value format for agent override fields
                         let validation_result = match item_validation {
                             ListItemValidation::AgentKeyValue => {
                                 Some(validate_agent_key_value(&text))
@@ -658,11 +591,13 @@ impl SettingsView {
                             }
                             ListItemValidation::DetectAs => Some(validate_detect_as_entry(&text)),
                             ListItemValidation::AcpCmd => Some(validate_acp_cmd_entry(&text)),
+                            ListItemValidation::AgentConfigDir => {
+                                Some(validate_agent_config_dir_entry(&text))
+                            }
                             ListItemValidation::None | ListItemValidation::EnvEntry => None,
                         };
                         if let Some(Err(msg)) = validation_result {
                             self.error_message = Some(msg);
-                            // Re-open the editor so the user can fix the entry
                             if let Some(ref mut s) = self.list_edit_state {
                                 s.editing_item = Some(tui_input::Input::new(text));
                                 s.adding_new = adding_new;
@@ -670,7 +605,6 @@ impl SettingsView {
                             return SettingsAction::Continue;
                         }
 
-                        // Validate env var references before accepting
                         if item_validation == ListItemValidation::EnvEntry {
                             self.error_message = crate::session::validate_env_entry(&text);
                         }
@@ -688,7 +622,7 @@ impl SettingsView {
                             }
                         }
                         self.apply_field_to_config(self.selected_field);
-                        // Clear stale errors, but preserve env validation warnings set above
+                        // Preserve the env validation warning set above.
                         if item_validation != ListItemValidation::EnvEntry {
                             self.error_message = None;
                         }
@@ -696,7 +630,6 @@ impl SettingsView {
                 }
             }
             _ => {
-                // Delegate all other key events to tui_input
                 if let Some(ref mut input) = state.editing_item {
                     input.handle_event(&crossterm::event::Event::Key(key));
                 }
@@ -705,9 +638,7 @@ impl SettingsView {
         SettingsAction::Continue
     }
 
-    /// The `search_hits` index of the popup row at screen row `row`,
-    /// if any. Backed by the rects the popup render captured; shared
-    /// by click and hover routing.
+    /// The `search_hits` index of the popup row at screen row `row`.
     fn search_hit_at_row(&self, row: u16) -> Option<usize> {
         self.search_hit_rows
             .iter()
@@ -720,8 +651,7 @@ impl SettingsView {
             return;
         }
 
-        // Pick the right override store based on scope, then clear the field's
-        // path generically (global-only fields and section markers no-op).
+        // Global-only fields and section markers no-op.
         let field = self.fields[field_index].clone();
         let config = if self.scope == SettingsScope::Repo {
             &mut self.repo_as_profile
@@ -730,7 +660,6 @@ impl SettingsView {
         };
         super::fields::clear_override(&field, config);
 
-        // Sync repo_config when in Repo scope
         if self.scope == SettingsScope::Repo {
             self.repo_config = Some(crate::session::profile_to_repo_config(
                 &self.repo_as_profile,
@@ -740,7 +669,6 @@ impl SettingsView {
         self.recompute_dirty();
     }
 
-    /// Force close without saving
     pub fn force_close(&mut self) {
         self.has_changes = false;
     }
@@ -750,21 +678,16 @@ impl SettingsView {
             dialog.handle_paste(text);
             return;
         }
-        // The search popup is a full editing mode (gated on
-        // `search_input.is_some()` in `handle_key`), so bracketed
-        // pastes need a path into the query. Without this, terminals
-        // that emit `Paste` events for clipboard input would silently
-        // drop pasted search queries.
+        // The search popup is a full editing mode, so a bracketed paste needs
+        // its own path into the query.
         if let Some(ref mut input) = self.search_input {
             crate::tui::dialogs::paste_into_input(input, text);
             self.search_selected = 0;
             self.recompute_search_hits();
             return;
         }
-        // A list item being typed (add or edit) is an input too. Without
-        // this arm a pasted env var vanished silently; terminals that
-        // batch rapid keystrokes into a paste (tmux's assume-paste-time)
-        // made even typed-looking input disappear (issue #2932).
+        // A list item being typed is an input too: terminals batch rapid
+        // keystrokes into a paste, so even typed-looking input arrives here.
         if let Some(state) = self.list_edit_state.as_mut() {
             if let Some(ref mut input) = state.editing_item {
                 crate::tui::dialogs::paste_into_input(input, text);
@@ -776,34 +699,29 @@ impl SettingsView {
         }
     }
 
-    /// Route a left-click into the settings view. Returns
-    /// `Some(SettingsAction)` when the click was consumed (the
-    /// settings view stays open, only the focus/scope/selection
-    /// changes; the caller still needs to redraw). Returns `None`
-    /// when nothing hit and the click should be treated as a swallow
-    /// (since settings is a full-screen takeover, clicks anywhere
-    /// inside it are absorbed by the modal regardless).
-    ///
-    /// Editing modes (`editing_input`, `list_edit_state`, custom
-    /// instruction dialog, help overlay) intentionally skip click
-    /// routing so a stray click during composition doesn't reset focus
-    /// or drop a half-typed value. The keyboard's Esc / Enter handlers
-    /// remain the way out of those modes. The search popup routes
-    /// clicks like the command palette: a hit row jumps, inside-miss
-    /// is a no-op, outside dismisses.
+    /// Route a left-click into the settings view. `Some` when the click
+    /// acted, `None` when it hit nothing (the full-screen modal swallows it
+    /// either way). Overlays own the click; inline text editing ignores it so
+    /// a stray click cannot drop a half-typed value.
     pub fn handle_click(&mut self, col: u16, row: u16) -> Option<SettingsAction> {
-        if self.editing_input.is_some()
-            || self.list_edit_state.is_some()
-            || self.custom_instruction_dialog.is_some()
-            || self.show_help
-        {
+        if let Some(dialog) = self.custom_instruction_dialog.as_mut() {
+            let result = dialog.handle_click(col, row)?;
+            self.finish_custom_instruction(result);
+            return Some(SettingsAction::Continue);
+        }
+        if self.show_help {
+            self.show_help = false;
+            return Some(SettingsAction::Continue);
+        }
+        if self.list_edit_state.is_some() {
+            return self.handle_list_edit_click(col, row);
+        }
+        if self.editing_input.is_some() {
             return None;
         }
         let pos = ratatui::layout::Position::from((col, row));
 
         if self.search_input.is_some() {
-            // The bar is the query input; clicking the thing being
-            // typed into must not dismiss it.
             if self.search_bar_rect.contains(pos) {
                 return Some(SettingsAction::Continue);
             }
@@ -818,18 +736,12 @@ impl SettingsView {
             return Some(SettingsAction::Continue);
         }
 
-        // A click on the idle search bar opens the search, same as `/`.
         if self.search_bar_rect.contains(pos) {
             self.open_search();
             return Some(SettingsAction::Continue);
         }
 
-        if let Some((scope, _)) = self
-            .scope_tab_rects
-            .iter()
-            .find(|(_, rect)| rect.contains(pos))
-            .copied()
-        {
+        if let Some(scope) = hit(&self.scope_tab_rects, col, row) {
             if scope != self.scope {
                 if self.has_changes {
                     return Some(SettingsAction::UnsavedChangesWarning);
@@ -841,12 +753,7 @@ impl SettingsView {
             return Some(SettingsAction::Continue);
         }
 
-        if let Some((idx, _)) = self
-            .category_rects
-            .iter()
-            .find(|(_, rect)| rect.contains(pos))
-            .copied()
-        {
+        if let Some(idx) = hit(&self.category_rects, col, row) {
             self.focus = SettingsFocus::Categories;
             if self.selected_category != idx {
                 self.selected_category = idx;
@@ -857,26 +764,16 @@ impl SettingsView {
             return Some(SettingsAction::Continue);
         }
 
-        if let Some((idx, _)) = self
-            .field_rects
-            .iter()
-            .find(|(_, rect)| rect.contains(pos))
-            .copied()
-        {
+        if let Some(idx) = hit(&self.field_rects, col, row) {
             self.focus = SettingsFocus::Fields;
             self.selected_field = idx;
-            // On the Plugins tab the field list shares the right pane with
-            // the plugin manager; a click on a field row must also move the
-            // sub-focus there, or the keyboard would keep driving the manager
-            // while the clicked field renders selected.
+            // On the Plugins tab the click must also move sub-focus, or the
+            // keyboard would keep driving the manager above.
             if self.current_category() == SettingsCategory::Plugins {
                 self.plugins_fields_focus = true;
             }
-            // A click on a checkbox row toggles it in one action, like a
-            // real checkbox, instead of only selecting it and waiting for
-            // Space. Other field types keep select-only: their editors /
-            // cyclers open on Enter, so a stray click shouldn't mutate
-            // them.
+            // A checkbox row toggles on click; other types stay select-only,
+            // since their editors open on Enter.
             if let FieldValue::Bool(ref mut value) = self.fields[idx].value {
                 *value = !*value;
                 self.apply_field_to_config(idx);
@@ -887,14 +784,41 @@ impl SettingsView {
         None
     }
 
-    /// Track the mouse position so the renderer can paint a hover
-    /// highlight on whichever scope chip / category row / field row
-    /// the cursor is over. Hover never moves the keyboard cursor;
-    /// see `ConfirmDialog::handle_hover` for why. Editing / help
-    /// modes clear the hover so the highlight doesn't bleed behind
-    /// the overlay. The search popup instead moves its hit selection
-    /// under the cursor, mirroring the command palette.
+    /// Ignored while an item is being typed, so a click cannot drop the text.
+    fn handle_list_edit_click(&mut self, col: u16, row: u16) -> Option<SettingsAction> {
+        let state = self.list_edit_state.as_mut()?;
+        if state.editing_item.is_some() {
+            return None;
+        }
+        let hits = &self.list_edit_hits;
+        if let Some(code) = hit(&hits.actions, col, row) {
+            return Some(self.handle_list_edit_key(KeyEvent::from(code)));
+        }
+        state.selected_index = hit(&hits.rows, col, row)?;
+        Some(SettingsAction::Continue)
+    }
+
+    /// Hover on an expanded list tints the row or header action under the
+    /// pointer without moving the row cursor. True when the tint moved.
+    fn handle_list_edit_hover(&mut self, col: u16, row: u16) -> bool {
+        let editing = self
+            .list_edit_state
+            .as_ref()
+            .is_none_or(|state| state.editing_item.is_some());
+        if editing {
+            return false;
+        }
+        self.list_hover
+            .update(col, row, &self.list_edit_hits.rects())
+    }
+
+    /// Track the mouse so the renderer can paint a hover highlight. Field
+    /// hover never moves the keyboard cursor; editing and help modes clear it
+    /// so it cannot bleed behind the overlay.
     pub fn handle_hover(&mut self, col: u16, row: u16) -> bool {
+        if let Some(dialog) = self.custom_instruction_dialog.as_mut() {
+            return dialog.handle_hover(col, row);
+        }
         if self.search_input.is_some() {
             let pos = ratatui::layout::Position::from((col, row));
             if !self.search_popup_area.contains(pos) {
@@ -913,21 +837,42 @@ impl SettingsView {
             || self.list_edit_state.is_some()
             || self.custom_instruction_dialog.is_some()
             || self.show_help;
+        let list_changed = self.handle_list_edit_hover(col, row);
         let new_pos = if suppress { None } else { Some((col, row)) };
         if self.mouse_pos == new_pos {
-            return false;
+            return list_changed;
         }
-        // Only request a redraw when the resolved hover target
-        // actually changes; a mouse drift inside the same field or
-        // entirely off the rects shouldn't repaint every pixel.
+        // Redraw only when the resolved hover target changes.
         let prev_scope = self.hovered_scope();
         let prev_cat = self.hovered_category();
         let prev_field = self.hovered_field();
         self.mouse_pos = new_pos;
-        prev_scope != self.hovered_scope()
+        list_changed
+            || prev_scope != self.hovered_scope()
             || prev_cat != self.hovered_category()
             || prev_field != self.hovered_field()
     }
+}
+
+/// `name=dir`: any agent name (custom ones are the point of the setting), and
+/// a directory AoE can resolve without a working directory to guess from.
+fn validate_agent_config_dir_entry(text: &str) -> Result<(), String> {
+    let Some((name, dir)) = text.split_once('=') else {
+        return Err(
+            "Must be in agent_name=dir format (e.g. claude-personal=~/.claude-personal)"
+                .to_string(),
+        );
+    };
+    if name.is_empty() {
+        return Err("Agent name cannot be empty".to_string());
+    }
+    if dir.is_empty() {
+        return Err("Config directory cannot be empty".to_string());
+    }
+    if !crate::session::config::is_resolvable_agent_config_dir(dir) {
+        return Err(format!("'{}' must be an absolute path, ~ or ~/...", dir));
+    }
+    Ok(())
 }
 
 /// Validate that an entry for AgentExtraArgs or AgentCommandOverride is in `agent_name=value` format.
@@ -1032,53 +977,64 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_validate_agent_key_value() {
-        assert!(validate_agent_key_value("claude=my-wrapper").is_ok());
-        assert!(validate_agent_key_value("opencode=--port 8080").is_ok());
-        for (entry, expected) in [
-            ("just-a-command", "agent_name=value"),
-            ("=some-value", "cannot be empty"),
-            ("claude=", "cannot be empty"),
-            ("nonexistent=cmd", "not a known agent"),
-        ] {
-            let err = validate_agent_key_value(entry).unwrap_err();
-            assert!(err.contains(expected), "{entry:?} -> {err:?}");
+    fn list_entry_validators() {
+        type Validator = fn(&str) -> Result<(), String>;
+        let key_value: Validator = validate_agent_key_value;
+        let config_dir: Validator = validate_agent_config_dir_entry;
+        let custom: Validator = validate_custom_agent_entry;
+        let detect_as: Validator = validate_detect_as_entry;
+        // (validator, entry, error substrings; empty means Ok)
+        let cases: &[(Validator, &str, &[&str])] = &[
+            (key_value, "claude=my-wrapper", &[]),
+            (key_value, "opencode=--port 8080", &[]),
+            (key_value, "just-a-command", &["agent_name=value"]),
+            (key_value, "=some-value", &["cannot be empty"]),
+            (key_value, "claude=", &["cannot be empty"]),
+            (key_value, "nonexistent=cmd", &["not a known agent"]),
+            // A custom agent name is the point of the config-dir setting, so
+            // it is not checked against the registry.
+            (config_dir, "claude-personal=~/.claude-personal", &[]),
+            (config_dir, "claude=/opt/claude", &[]),
+            (config_dir, "claude=~", &[]),
+            (config_dir, "just-a-name", &["agent_name=dir"]),
+            (config_dir, "=~/.claude-personal", &["name cannot be empty"]),
+            (config_dir, "my-agent=", &["directory cannot be empty"]),
+            (config_dir, "my-agent=.claude-personal", &["absolute path"]),
+            // Another user's home: resolution would drop it without a word.
+            (config_dir, "my-agent=~bob/.claude", &["absolute path"]),
+            (custom, "lenovo-claude=ssh -t lenovo claude", &[]),
+            (custom, "my-wrapper=./run.sh", &[]),
+            (custom, "just-a-name", &["name=command"]),
+            (custom, "=ssh -t host claude", &["name cannot be empty"]),
+            (custom, "my-agent=", &["Command cannot be empty"]),
+            // Shadowing a builtin is redirected to the dedicated override.
+            (
+                custom,
+                "claude=my-wrapper",
+                &["built-in agent", "Agent Command Override"],
+            ),
+            (detect_as, "lenovo-claude=claude", &[]),
+            (detect_as, "just-a-name", &["name=builtin"]),
+            (detect_as, "=claude", &["name cannot be empty"]),
+            (detect_as, "my-agent=", &["cannot be empty"]),
+            // The error lists the valid builtins so the user can self-correct.
+            (
+                detect_as,
+                "my-agent=nonexistent",
+                &["not a known built-in agent", "Known agents:"],
+            ),
+        ];
+        for (validate, entry, errors) in cases {
+            match validate(entry) {
+                Ok(()) => assert!(errors.is_empty(), "{entry:?} unexpectedly ok"),
+                Err(err) => {
+                    assert!(!errors.is_empty(), "{entry:?} -> {err:?}");
+                    for want in *errors {
+                        assert!(err.contains(want), "{entry:?} -> {err:?}");
+                    }
+                }
+            }
         }
-    }
-
-    #[test]
-    fn test_validate_custom_agent_entry() {
-        assert!(validate_custom_agent_entry("lenovo-claude=ssh -t lenovo claude").is_ok());
-        assert!(validate_custom_agent_entry("my-wrapper=./run.sh").is_ok());
-        for (entry, expected) in [
-            ("just-a-name", "name=command"),
-            ("=ssh -t host claude", "name cannot be empty"),
-            ("my-agent=", "Command cannot be empty"),
-        ] {
-            let err = validate_custom_agent_entry(entry).unwrap_err();
-            assert!(err.contains(expected), "{entry:?} -> {err:?}");
-        }
-        // Shadowing a builtin is redirected to the dedicated override setting.
-        let err = validate_custom_agent_entry("claude=my-wrapper").unwrap_err();
-        assert!(err.contains("built-in agent"));
-        assert!(err.contains("Agent Command Override"));
-    }
-
-    #[test]
-    fn test_validate_detect_as_entry() {
-        assert!(validate_detect_as_entry("lenovo-claude=claude").is_ok());
-        for (entry, expected) in [
-            ("just-a-name", "name=builtin"),
-            ("=claude", "name cannot be empty"),
-            ("my-agent=", "cannot be empty"),
-        ] {
-            let err = validate_detect_as_entry(entry).unwrap_err();
-            assert!(err.contains(expected), "{entry:?} -> {err:?}");
-        }
-        // The error lists the valid builtins so the user can self-correct.
-        let err = validate_detect_as_entry("my-agent=nonexistent").unwrap_err();
-        assert!(err.contains("not a known built-in agent"));
-        assert!(err.contains("Known agents:"));
     }
 
     mod search_popup {
@@ -1097,63 +1053,54 @@ mod tests {
             }
         }
 
-        /// `/` opens the search popup; the popup is then routed to
-        /// for every subsequent key (gated by `search_input.is_some()`).
         #[test]
         #[serial]
-        fn slash_opens_search_popup() {
+        fn search_opens_filters_and_esc_restores_selection() {
             let (_t, _guard, mut view) = fresh_view();
+            let cat_before = view.selected_category;
+            let field_before = view.selected_field;
             assert!(view.search_input.is_none());
             press(&mut view, KeyCode::Char('/'));
             assert!(view.search_input.is_some(), "/ must enter search mode");
-            // Empty query lists every interactive field across all
-            // visible categories, so the hit list is nonzero and
-            // Enter has a target.
-            assert!(
-                !view.search_hits.is_empty(),
-                "empty-query search should list every interactive field"
-            );
-        }
-
-        /// Typing a query narrows the hit list to matching fields.
-        /// "live" should match the Live-Send Exit Chord row, which
-        /// lives under the Interaction tab.
-        #[test]
-        #[serial]
-        fn typing_filters_hits() {
-            let (_t, _guard, mut view) = fresh_view();
-            press(&mut view, KeyCode::Char('/'));
+            // An empty query lists every interactive field, each with the
+            // value the popup renders, so Enter has a target straight away.
             let unfiltered = view.search_hits.len();
+            assert!(unfiltered > 0);
+            for hit in &view.search_hits {
+                assert!(!hit.value_display.is_empty(), "{:?}", hit.field_label);
+            }
             type_text(&mut view, "live");
-            assert!(
-                view.search_hits.len() < unfiltered,
-                "a query should narrow the hit list"
-            );
-            let labels: Vec<String> = view
-                .search_hits
-                .iter()
-                .map(|h| h.field_label.clone())
-                .collect();
-            assert!(
-                labels
-                    .iter()
-                    .any(|l| l.to_lowercase().contains("live-send exit chord")),
-                "search 'live' should surface the Live-Send Exit Chord field; got {:?}",
-                labels
-            );
+            assert!(view.search_hits.len() < unfiltered, "a query narrows hits");
+            assert!(view.search_hits.iter().any(|h| h
+                .field_label
+                .to_lowercase()
+                .contains("live-send exit chord")));
+            press(&mut view, KeyCode::Esc);
+            assert!(view.search_input.is_none());
+            assert_eq!(view.selected_category, cat_before);
+            assert_eq!(view.selected_field, field_before);
         }
 
-        /// Enter on a hit jumps to that hit's category + field and
-        /// closes the popup. We pick "default tool" (on the Agents
-        /// tab) to also verify the jump crosses categories cleanly.
+        /// Default Tool lives on the Agents tab, so the jump also has to
+        /// cross categories cleanly.
         #[test]
         #[serial]
         fn enter_jumps_to_hit_category_and_field() {
             let (_t, _guard, mut view) = fresh_view();
             press(&mut view, KeyCode::Char('/'));
+            // A category name ranks that tab's fields first.
+            type_text(&mut view, "sandbox");
+            let first = view.search_hits.first().expect("hits for 'sandbox'");
+            assert_eq!(
+                first.category,
+                crate::tui::settings::SettingsCategory::Sandbox,
+                "{:?}",
+                first.field_label
+            );
+            press(&mut view, KeyCode::Esc);
+            press(&mut view, KeyCode::Char('/'));
             type_text(&mut view, "default tool");
             assert!(!view.search_hits.is_empty(), "no hits for 'default tool'");
-            // Position cursor on a hit whose label exactly matches.
             let target_idx = view
                 .search_hits
                 .iter()
@@ -1178,45 +1125,6 @@ mod tests {
             );
         }
 
-        /// A query naming a category ranks that tab's own settings
-        /// above fields that merely mention the term in prose, so
-        /// "sandbox" leads with the Sandbox tab.
-        #[test]
-        #[serial]
-        fn category_query_ranks_that_tab_first() {
-            let (_t, _guard, mut view) = fresh_view();
-            press(&mut view, KeyCode::Char('/'));
-            type_text(&mut view, "sandbox");
-            let first = view.search_hits.first().expect("hits for 'sandbox'");
-            assert_eq!(
-                first.category,
-                crate::tui::settings::SettingsCategory::Sandbox,
-                "the top hit for 'sandbox' should come from the Sandbox tab, got {:?}",
-                first.field_label
-            );
-        }
-
-        /// Every hit carries the field's current value so the popup can
-        /// render it after the label (issue #2932). Section headers are the
-        /// only rows with an empty display value, and they never become hits.
-        #[test]
-        #[serial]
-        fn hits_carry_current_field_values() {
-            let (_t, _guard, mut view) = fresh_view();
-            press(&mut view, KeyCode::Char('/'));
-            assert!(!view.search_hits.is_empty());
-            for hit in &view.search_hits {
-                assert!(
-                    !hit.value_display.is_empty(),
-                    "hit {:?} should carry a non-empty value display",
-                    hit.field_label
-                );
-            }
-        }
-
-        /// `j`/`k` (and Down/Up) in the categories panel must skip
-        /// non-selectable section dividers so the cursor jumps
-        /// category-to-category.
         #[test]
         #[serial]
         fn category_nav_skips_section_dividers() {
@@ -1245,92 +1153,42 @@ mod tests {
             );
         }
 
-        /// The search-jump-edit flow end to end: search for the sandbox
-        /// env list, jump to it, expand it, add an item, and type. The
-        /// typed characters must land in the add prompt's input.
+        /// The search-jump-edit flow end to end, down to the characters
+        /// landing in the add prompt. A paste must land there too rather than
+        /// falling through: terminals batch rapid keystrokes into pastes.
         #[test]
         #[serial]
-        fn jump_then_list_add_typing_lands_in_the_prompt() {
-            let (_t, _guard, mut view) = fresh_view();
-            press(&mut view, KeyCode::Char('/'));
-            type_text(&mut view, "sandbox environment");
-            let target_idx = view
-                .search_hits
-                .iter()
-                .position(|h| h.field_ident == "sandbox.environment")
-                .expect("sandbox.environment should appear in hits");
-            view.search_selected = target_idx;
-            press(&mut view, KeyCode::Enter);
-            assert!(
-                matches!(
+        fn jump_then_list_add_typing_or_paste_lands_in_the_prompt() {
+            for paste in [false, true] {
+                let (_t, _guard, mut view) = fresh_view();
+                press(&mut view, KeyCode::Char('/'));
+                type_text(&mut view, "sandbox environment");
+                let target_idx = view
+                    .search_hits
+                    .iter()
+                    .position(|h| h.field_ident == "sandbox.environment")
+                    .expect("sandbox.environment should appear in hits");
+                view.search_selected = target_idx;
+                press(&mut view, KeyCode::Enter);
+                assert!(matches!(
                     view.fields[view.selected_field].value,
                     crate::tui::settings::FieldValue::List(_)
-                ),
-                "the jump should land on the Sandbox Environment list, got {:?}",
-                view.fields[view.selected_field].label
-            );
-            press(&mut view, KeyCode::Enter);
-            assert!(view.list_edit_state.is_some(), "Enter expands the list");
-            press(&mut view, KeyCode::Char('a'));
-            type_text(&mut view, "FOO=bar");
-            let value = view
-                .list_edit_state
-                .as_ref()
-                .and_then(|s| s.editing_item.as_ref())
-                .map(|i| i.value().to_string());
-            assert_eq!(
-                value.as_deref(),
-                Some("FOO=bar"),
-                "typed characters must land in the add prompt"
-            );
-        }
-
-        /// Pasting into a list item's add/edit prompt must land in that
-        /// prompt. It used to fall through `handle_paste` and vanish,
-        /// which also ate "typed" input under terminals that batch
-        /// rapid keystrokes into a paste (tmux's assume-paste-time).
-        #[test]
-        #[serial]
-        fn paste_lands_in_the_list_item_prompt() {
-            let (_t, _guard, mut view) = fresh_view();
-            press(&mut view, KeyCode::Char('/'));
-            type_text(&mut view, "sandbox environment");
-            let target_idx = view
-                .search_hits
-                .iter()
-                .position(|h| h.field_ident == "sandbox.environment")
-                .expect("sandbox.environment should appear in hits");
-            view.search_selected = target_idx;
-            press(&mut view, KeyCode::Enter);
-            press(&mut view, KeyCode::Enter);
-            press(&mut view, KeyCode::Char('a'));
-            view.handle_paste("FOO=bar");
-            let value = view
-                .list_edit_state
-                .as_ref()
-                .and_then(|s| s.editing_item.as_ref())
-                .map(|i| i.value().to_string());
-            assert_eq!(
-                value.as_deref(),
-                Some("FOO=bar"),
-                "a paste must land in the add prompt"
-            );
-        }
-
-        /// Esc closes the popup without changing the selected
-        /// category/field; the caller's edit context is preserved.
-        #[test]
-        #[serial]
-        fn esc_closes_search_without_changing_selection() {
-            let (_t, _guard, mut view) = fresh_view();
-            let cat_before = view.selected_category;
-            let field_before = view.selected_field;
-            press(&mut view, KeyCode::Char('/'));
-            type_text(&mut view, "tmux");
-            press(&mut view, KeyCode::Esc);
-            assert!(view.search_input.is_none());
-            assert_eq!(view.selected_category, cat_before);
-            assert_eq!(view.selected_field, field_before);
+                ));
+                press(&mut view, KeyCode::Enter);
+                assert!(view.list_edit_state.is_some(), "Enter expands the list");
+                press(&mut view, KeyCode::Char('a'));
+                if paste {
+                    view.handle_paste("FOO=bar");
+                } else {
+                    type_text(&mut view, "FOO=bar");
+                }
+                let value = view
+                    .list_edit_state
+                    .as_ref()
+                    .and_then(|s| s.editing_item.as_ref())
+                    .map(|i| i.value().to_string());
+                assert_eq!(value.as_deref(), Some("FOO=bar"), "paste={paste}");
+            }
         }
     }
 
@@ -1343,42 +1201,37 @@ mod tests {
 
         #[test]
         #[serial]
-        fn click_on_scope_tab_switches_scope() {
+        fn scope_tab_click_switches_unless_unsaved_or_editing() {
+            let tab = (SettingsScope::Profile, Rect::new(40, 0, 18, 1));
             let (_t, _guard, mut view) = fresh_view();
-            // Stage a Profile scope rect at known coords.
-            view.scope_tab_rects
-                .push((SettingsScope::Profile, Rect::new(40, 0, 18, 1)));
+            view.scope_tab_rects.push(tab);
             assert_eq!(view.scope, SettingsScope::Global);
             view.handle_click(45, 0);
             assert_eq!(view.scope, SettingsScope::Profile);
-        }
 
-        #[test]
-        #[serial]
-        fn click_on_scope_tab_with_unsaved_changes_warns() {
             let (_t, _guard, mut view) = fresh_view();
             view.has_changes = true;
-            view.scope_tab_rects
-                .push((SettingsScope::Profile, Rect::new(40, 0, 18, 1)));
-            let result = view.handle_click(45, 0);
+            view.scope_tab_rects.push(tab);
             assert!(matches!(
-                result,
+                view.handle_click(45, 0),
                 Some(SettingsAction::UnsavedChangesWarning)
             ));
-            assert_eq!(
-                view.scope,
-                SettingsScope::Global,
-                "scope must not change while there are unsaved changes"
-            );
+            assert_eq!(view.scope, SettingsScope::Global);
+
+            // Esc and Enter own the exit from an edit.
+            let (_t, _guard, mut view) = fresh_view();
+            view.editing_input = Some(tui_input::Input::new("typing".to_string()));
+            view.scope_tab_rects.push(tab);
+            assert!(view.handle_click(45, 0).is_none());
+            assert_eq!(view.scope, SettingsScope::Global);
         }
 
         #[test]
         #[serial]
-        fn click_on_category_row_focuses_and_selects() {
+        fn click_on_category_or_field_focuses_and_selects() {
             let (_t, _guard, mut view) = fresh_view();
             view.focus = crate::tui::settings::SettingsFocus::Fields;
             let original = view.selected_category;
-            // Pick a different Tab row to stage a click against.
             let other_tab = (0..view.categories.len())
                 .find(|&i| {
                     i != original
@@ -1393,11 +1246,7 @@ mod tests {
             view.handle_click(5, 10);
             assert_eq!(view.focus, crate::tui::settings::SettingsFocus::Categories);
             assert_eq!(view.selected_category, other_tab);
-        }
 
-        #[test]
-        #[serial]
-        fn click_on_field_focuses_and_selects() {
             let (_t, _guard, mut view) = fresh_view();
             view.field_rects.push((0, Rect::new(20, 5, 50, 2)));
             view.field_rects.push((1, Rect::new(20, 8, 50, 2)));
@@ -1407,8 +1256,6 @@ mod tests {
             assert_eq!(view.selected_field, 1);
         }
 
-        /// A click on a checkbox row toggles it in one action, like a
-        /// real checkbox, not just selecting it.
         #[test]
         #[serial]
         fn click_on_bool_field_toggles_it() {
@@ -1426,10 +1273,9 @@ mod tests {
             }
         }
 
-        /// Select the first category (by tab order) that has a toggle
-        /// field and return its `(field index, current value)`, so mouse
-        /// tests don't depend on which fields the default tab happens to
-        /// carry. Leaves `view` parked on that category.
+        /// The first toggle field in tab order as `(index, value)`, leaving
+        /// `view` parked on its category, so the mouse tests do not depend on
+        /// what the default tab carries.
         fn first_bool_field(
             view: &mut crate::tui::settings::SettingsView,
         ) -> Option<(usize, bool)> {
@@ -1457,9 +1303,8 @@ mod tests {
             None
         }
 
-        /// A click on a non-boolean field selects it but must NOT mutate
-        /// it: its editor/cycler opens on Enter, so a stray click can't
-        /// change the value out from under the user.
+        /// A non-boolean field's editor opens on Enter, so a plain click on
+        /// it must select without mutating.
         #[test]
         #[serial]
         fn click_on_non_bool_field_only_selects() {
@@ -1469,7 +1314,6 @@ mod tests {
                 .iter()
                 .position(|f| !matches!(f.value, FieldValue::Bool(_) | FieldValue::SectionHeader))
                 .expect("the default category should have a non-toggle field");
-            // FieldValue is Debug but not PartialEq; compare its rendering.
             let before = format!("{:?}", view.fields[idx].value);
             view.field_rects.push((idx, Rect::new(20, 5, 50, 2)));
             view.handle_click(25, 6);
@@ -1481,16 +1325,12 @@ mod tests {
             );
         }
 
-        /// Clicking a hit row in the search popup jumps to that hit,
-        /// same as highlighting it and pressing Enter (the command
-        /// palette's click behavior).
         #[test]
         #[serial]
-        fn click_on_popup_hit_jumps_to_it() {
+        fn popup_click_jumps_on_a_hit_keeps_open_inside_and_dismisses_outside() {
             let (_t, _guard, mut view) = fresh_view();
             view.open_search();
-            // Stage the rects render would have captured: popup at
-            // (2, 6), first two hits on rows 7 and 8.
+            // Staged as render would capture them: two hits on rows 7 and 8.
             view.search_popup_area = Rect::new(2, 6, 100, 20);
             view.search_hit_rows = vec![(7, 0), (8, 1)];
             let target = view.search_hits[1].field_ident.clone();
@@ -1505,14 +1345,7 @@ mod tests {
                 target,
                 "a hit click must jump to that hit's field"
             );
-        }
 
-        /// A click inside the popup that misses every hit row is a
-        /// no-op; a click outside the popup dismisses it without
-        /// changing the selection, like Esc.
-        #[test]
-        #[serial]
-        fn popup_click_miss_keeps_open_and_outside_dismisses() {
             let (_t, _guard, mut view) = fresh_view();
             let cat_before = view.selected_category;
             let field_before = view.selected_field;
@@ -1539,11 +1372,18 @@ mod tests {
                 view.selected_field, field_before,
                 "dismissing by click must not select the field underneath"
             );
+
+            // A click on the idle search bar opens it, and a second click on
+            // the bar while the popup is open must not close it.
+            let (_t, _guard, mut view) = fresh_view();
+            view.search_bar_rect = Rect::new(0, 3, 170, 3);
+            view.handle_click(10, 4);
+            assert!(view.search_input.is_some());
+            view.search_popup_area = Rect::new(2, 6, 100, 20);
+            view.handle_click(10, 4);
+            assert!(view.search_input.is_some());
         }
 
-        /// Hovering a hit row moves the popup selection under the
-        /// cursor, mirroring the command palette; hovering the same
-        /// row again reports no change.
         #[test]
         #[serial]
         fn popup_hover_moves_hit_selection() {
@@ -1566,106 +1406,146 @@ mod tests {
             assert_eq!(view.search_selected, 1);
         }
 
-        /// Clicking the idle search bar opens the search, same as `/`;
-        /// clicking it again while the popup is open must NOT dismiss
-        /// the search the user is typing into.
+        /// Hover paints a highlight and nothing else: it must never shift
+        /// the keyboard cursor, or a mouse drifting across the panel would
+        /// silently change what the next Enter or Space targets.
         #[test]
         #[serial]
-        fn click_on_bar_opens_search_and_does_not_dismiss_it() {
-            let (_t, _guard, mut view) = fresh_view();
-            view.search_bar_rect = Rect::new(0, 3, 170, 3);
-            assert!(view.search_input.is_none());
-            view.handle_click(10, 4);
-            assert!(
-                view.search_input.is_some(),
-                "a click on the idle bar must open the search"
-            );
-
-            view.search_popup_area = Rect::new(2, 6, 100, 20);
-            view.handle_click(10, 4);
-            assert!(
-                view.search_input.is_some(),
-                "a click on the bar while the popup is open must not close it"
-            );
-        }
-
-        #[test]
-        #[serial]
-        fn handle_click_returns_none_when_editing() {
-            let (_t, _guard, mut view) = fresh_view();
-            view.editing_input = Some(tui_input::Input::new("typing".to_string()));
-            view.scope_tab_rects
-                .push((SettingsScope::Profile, Rect::new(40, 0, 18, 1)));
-            // A click during edit should NOT switch scope or even
-            // resolve a hit; the keyboard's Esc / Enter own the exit.
-            assert!(view.handle_click(45, 0).is_none());
-            assert_eq!(view.scope, SettingsScope::Global);
-        }
-
-        #[test]
-        #[serial]
-        fn hover_never_moves_focus() {
-            // Hover must not shift the keyboard cursor in settings;
-            // otherwise the mouse drifting across the fields panel
-            // silently changes which field a subsequent Enter / Space
-            // targets. Click still navigates.
+        fn hover_highlights_without_touching_the_keyboard_cursor() {
             let (_t, _guard, mut view) = fresh_view();
             view.field_rects.push((0, Rect::new(20, 5, 50, 2)));
             view.field_rects.push((1, Rect::new(20, 8, 50, 2)));
             view.focus = crate::tui::settings::SettingsFocus::Categories;
             view.selected_field = 0;
-            view.handle_hover(25, 9);
-            assert_eq!(view.focus, crate::tui::settings::SettingsFocus::Categories);
-            assert_eq!(view.selected_field, 0);
-        }
 
-        #[test]
-        #[serial]
-        fn hover_records_mouse_pos_and_resolves_to_field() {
-            // Hover only paints a visual highlight (drawn by the
-            // renderer from `hovered_field()` against `field_rects`);
-            // it must not touch keyboard selection state. Verify both:
-            // mouse_pos is set and resolves to the right field, but
-            // selected_field stays put.
-            let (_t, _guard, mut view) = fresh_view();
-            view.field_rects.push((0, Rect::new(20, 5, 50, 2)));
-            view.field_rects.push((1, Rect::new(20, 8, 50, 2)));
-            view.selected_field = 0;
-            let changed = view.handle_hover(25, 9);
-            assert!(changed, "hover entering a new field should redraw");
+            assert!(view.handle_hover(25, 9), "entering a new field redraws");
             assert_eq!(view.hovered_field(), Some(1));
+            assert_eq!(view.focus, crate::tui::settings::SettingsFocus::Categories);
             assert_eq!(view.selected_field, 0, "selection must not move");
-        }
 
-        #[test]
-        #[serial]
-        fn keypress_clears_hover() {
-            // A stationary hover left over from before the user
-            // switched to keyboard would otherwise stay lit on a row
-            // the user is no longer interacting with. Any keystroke
-            // invalidates it.
-            let (_t, _guard, mut view) = fresh_view();
-            view.field_rects.push((0, Rect::new(20, 5, 50, 2)));
-            view.handle_hover(25, 5);
-            assert_eq!(view.hovered_field(), Some(0));
+            // A keystroke invalidates the highlight, so a stale hover cannot
+            // stay lit on a row the user has moved off.
             view.handle_key(crossterm::event::KeyEvent::new(
                 crossterm::event::KeyCode::Down,
                 crossterm::event::KeyModifiers::NONE,
             ));
             assert_eq!(view.hovered_field(), None);
+
+            // While a field is being edited the surface is keyboard-only, so
+            // a highlight there would mislead about what a click does.
+            view.editing_input = Some(tui_input::Input::new(String::new()));
+            view.handle_hover(25, 5);
+            assert_eq!(view.hovered_field(), None);
+        }
+
+        /// Park the cursor on the field `ident` through the search jump.
+        fn jump_to(view: &mut SettingsView, ident: &str) {
+            view.open_search();
+            view.search_selected = view
+                .search_hits
+                .iter()
+                .position(|h| h.field_ident == ident)
+                .unwrap_or_else(|| panic!("{ident} should be searchable"));
+            view.jump_to_selected_search_hit();
+            assert_eq!(view.fields[view.selected_field].ident(), ident);
+        }
+
+        /// Screen position of the first cell of `text` in the rendered view.
+        fn render_and_find(view: &mut SettingsView, text: &str) -> (u16, u16) {
+            use crate::tui::dialogs::test_render::{draw, find};
+            find(
+                &draw(120, 40, |f, theme| view.render(f, f.area(), theme)),
+                text,
+            )
         }
 
         #[test]
         #[serial]
-        fn hover_suppressed_while_editing() {
-            // While a text field is being edited the rest of the
-            // surface is keyboard-only; a lingering hover highlight
-            // there would mislead the user about what a click does
-            // (in fact, click is also gated during edit).
+        fn a_custom_instruction_save_click_applies_the_text() {
             let (_t, _guard, mut view) = fresh_view();
-            view.field_rects.push((0, Rect::new(20, 5, 50, 2)));
-            view.editing_input = Some(tui_input::Input::new(String::new()));
-            view.handle_hover(25, 5);
+            jump_to(&mut view, "sandbox.custom_instruction");
+            view.custom_instruction_dialog = Some(CustomInstructionDialog::new(None));
+            view.handle_key(KeyEvent::new(KeyCode::Char('h'), KeyModifiers::NONE));
+            let (col, row) = render_and_find(&mut view, "Save");
+            view.handle_click(col, row);
+            assert!(view.custom_instruction_dialog.is_none());
+            let value = &view.fields[view.selected_field].value;
+            assert!(matches!(value, FieldValue::OptionalText(Some(v)) if v == "h"));
+        }
+
+        #[test]
+        #[serial]
+        fn help_overlay_is_dismissed_by_click_and_blocks_the_wheel() {
+            let (_t, _guard, mut view) = fresh_view();
+            view.fields_viewport_height = 1;
+            view.scrollbar_area = Rect::new(100, 5, 1, 20);
+            view.show_help = true;
+            assert!(!view.handle_wheel_scroll(false));
+            assert_eq!(view.fields_scroll_offset, 0);
+            assert!(!view.hit_scrollbar(100, 10));
+
+            view.field_rects.push((1, Rect::new(20, 5, 50, 2)));
+            let before = view.selected_field;
+            assert!(view.handle_click(25, 6).is_some());
+            assert!(!view.show_help, "a click closes help");
+            assert_eq!(view.selected_field, before, "without reaching the field");
+            assert!(view.hit_scrollbar(100, 10));
+        }
+
+        #[test]
+        #[serial]
+        fn expanded_list_rows_and_actions_take_the_mouse() {
+            let staged = || {
+                let (t, guard, mut view) = fresh_view();
+                jump_to(&mut view, "sandbox.environment");
+                let items = ["A=1", "B=2", "C=3"].map(str::to_string).to_vec();
+                view.fields[view.selected_field].value = FieldValue::List(items);
+                view.list_edit_state = Some(ListEditState::default());
+                view.list_edit_hits.actions = vec![
+                    (KeyCode::Char('a'), Rect::new(27, 4, 5, 1)),
+                    (KeyCode::Char('d'), Rect::new(33, 4, 8, 1)),
+                    (KeyCode::Esc, Rect::new(54, 4, 10, 1)),
+                ];
+                view.list_edit_hits.rows = (0..3)
+                    .map(|i| (i, Rect::new(22, 5 + i as u16, 60, 1)))
+                    .collect();
+                (t, guard, view)
+            };
+            let items = |view: &SettingsView| match &view.fields[view.selected_field].value {
+                FieldValue::List(items) => items.clone(),
+                other => panic!("{other:?}"),
+            };
+
+            // A row click selects; the delete action then removes that row.
+            let (_t, _guard, mut view) = staged();
+            view.handle_click(30, 6);
+            assert_eq!(view.list_edit_state.as_ref().unwrap().selected_index, 1);
+            view.handle_click(35, 4);
+            assert_eq!(items(&view), ["A=1", "C=3"]);
+
+            // The add action opens the prompt, which then swallows clicks.
+            let (_t, _guard, mut view) = staged();
+            view.handle_click(28, 4);
+            let state = view.list_edit_state.as_ref().unwrap();
+            assert!(state.adding_new && state.editing_item.is_some());
+            assert!(view.handle_click(30, 5).is_none());
+            assert!(!view.handle_hover(30, 7));
+            let state = view.list_edit_state.as_ref().unwrap();
+            assert!(state.editing_item.is_some() && state.selected_index == 0);
+
+            // The close action closes the list.
+            let (_t, _guard, mut view) = staged();
+            view.handle_click(55, 4);
+            assert!(view.list_edit_state.is_none());
+
+            // Hover tints without moving the row cursor `(d)elete` acts on.
+            let (_t, _guard, mut view) = staged();
+            assert!(view.handle_hover(30, 7));
+            assert_eq!(view.list_hover.current(), Some(Rect::new(22, 7, 60, 1)));
+            assert!(!view.handle_hover(40, 7), "same row, no redraw");
+            assert!(view.handle_hover(35, 4));
+            assert_eq!(view.list_hover.current(), Some(Rect::new(33, 4, 8, 1)));
+            assert_eq!(view.list_edit_state.as_ref().unwrap().selected_index, 0);
             assert_eq!(view.hovered_field(), None);
         }
     }

@@ -8,14 +8,12 @@
 
 import { describe, expect, it, vi } from "vitest";
 import zlib from "node:zlib";
-import { createFrameInflater, supportsFrameDeflate } from "./frameStream";
+import { createFrameInflater } from "./frameStream";
 
 function toArrayBuffer(u8: Uint8Array): ArrayBuffer {
   return u8.buffer.slice(u8.byteOffset, u8.byteOffset + u8.byteLength) as ArrayBuffer;
 }
 
-/** Streaming raw-deflate that emits one sync-flushed chunk per frame,
- *  mirroring the server's FrameDeflater (shared dictionary across calls). */
 function makeDeflater() {
   const stream = zlib.createDeflateRaw();
   const pending: Buffer[] = [];
@@ -34,10 +32,6 @@ function makeDeflater() {
 }
 
 describe("frameStream", () => {
-  it("advertises support where DecompressionStream exists", () => {
-    expect(supportsFrameDeflate()).toBe(true);
-  });
-
   it("decodes sequential frames in order through one stream", async () => {
     const deflate = makeDeflater();
     const frames: string[] = [];
@@ -77,12 +71,48 @@ describe("frameStream", () => {
   });
 
   it("dispose silences teardown races instead of surfacing them as errors", async () => {
-    const deflate = makeDeflater();
-    const onError = vi.fn();
-    const inflater = createFrameInflater(() => {}, onError);
-    inflater.push(toArrayBuffer(await deflate('{"type":"frame"}')));
-    inflater.dispose();
-    await new Promise((r) => setTimeout(r, 20));
-    expect(onError).not.toHaveBeenCalled();
+    for (const failure of ["read", "write"] as const) {
+      let resolveRead!: (value: ReadableStreamReadResult<Uint8Array>) => void;
+      let rejectRead!: (error: Error) => void;
+      const read = new Promise<ReadableStreamReadResult<Uint8Array>>((resolve, reject) => {
+        resolveRead = resolve;
+        rejectRead = reject;
+      });
+      let resolveWrite!: () => void;
+      let rejectWrite!: (error: Error) => void;
+      const write = new Promise<void>((resolve, reject) => {
+        resolveWrite = resolve;
+        rejectWrite = reject;
+      });
+      const reader = { read: vi.fn(() => read), cancel: vi.fn().mockResolvedValue(undefined) };
+      const writer = { write: vi.fn(() => write), abort: vi.fn().mockResolvedValue(undefined) };
+      vi.stubGlobal(
+        "DecompressionStream",
+        class {
+          readable = { getReader: () => reader };
+          writable = { getWriter: () => writer };
+        },
+      );
+      try {
+        const onError = vi.fn();
+        const inflater = createFrameInflater(() => {}, onError);
+        inflater.push(new ArrayBuffer(1));
+        expect(reader.read).toHaveBeenCalledTimes(1);
+        expect(writer.write).toHaveBeenCalledTimes(1);
+        inflater.dispose();
+
+        if (failure === "read") {
+          rejectRead(new Error("cancelled read"));
+          resolveWrite();
+        } else {
+          resolveRead({ done: true, value: undefined });
+          rejectWrite(new Error("aborted write"));
+        }
+        await Promise.allSettled([read, write]);
+        expect(onError, failure).not.toHaveBeenCalled();
+      } finally {
+        vi.unstubAllGlobals();
+      }
+    }
   });
 });

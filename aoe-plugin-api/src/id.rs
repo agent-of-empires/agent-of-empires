@@ -3,12 +3,6 @@ use std::fmt;
 use serde::{Deserialize, Serialize};
 
 /// Identifier of a plugin, e.g. `aoe.status` or `someuser.review-helper`.
-///
-/// Lowercase ASCII segments separated by dots; segments may contain digits and
-/// hyphens but must start with a letter. The id namespaces everything the
-/// plugin touches: its config table (`[plugins."<id>"]`), its `plugin_meta`
-/// slot on sessions, its event topics (`plugin.<id>.*`), and its canonical
-/// action names (`plugin.<id>.<action>`).
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(try_from = "String", into = "String")]
 pub struct PluginId(String);
@@ -56,14 +50,6 @@ impl PluginId {
         &self.0
     }
 
-    /// Whether this id sits in a namespace reserved for first-party plugins:
-    /// `aoe.*` (bundled builtins) and `agent-of-empires.*` (official plugins
-    /// shipped through the featured index). The host lets a community install
-    /// use a reserved namespace only when the source is featured-verified, so
-    /// a third party cannot publish as `aoe.web` or `agent-of-empires.github`
-    /// and usurp the builtin/official id, the telemetry allowlist, or the
-    /// `plugin_meta` namespace. Builtin manifests are loaded from inside the
-    /// binary and never pass through that install gate.
     pub fn is_reserved_namespace(&self) -> bool {
         matches!(
             self.0.split('.').next(),

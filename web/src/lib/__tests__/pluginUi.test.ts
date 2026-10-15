@@ -47,7 +47,6 @@ describe("pluginUi selectors", () => {
     ];
     expect(sessionEntries(entries, "row-badge", "s1").map((e) => e.id)).toEqual(["a"]);
     expect(sessionEntries(entries, "row-badge", undefined)).toEqual([]);
-    // Tearing guard: an id for a session that no longer exists matches nothing.
     expect(sessionEntries(entries, "row-badge", "gone")).toEqual([]);
   });
 
@@ -122,7 +121,6 @@ describe("pluginUi sort-key / filter-facet (#2401)", () => {
     expect(compareSortValues(1, 2, "desc")).toBeGreaterThan(0);
     expect(compareSortValues("a", "b", "asc")).toBeLessThan(0);
     expect(compareSortValues("a", "b", "desc")).toBeGreaterThan(0);
-    // Mixed types are deterministic: a number sorts before a string (asc).
     expect(compareSortValues(1, "a", "asc")).toBeLessThan(0);
   });
 
@@ -167,9 +165,7 @@ describe("pluginUi sort-key / filter-facet (#2401)", () => {
     const entries = [
       entry("row-column", { id: "col", session_id: "s1", payload: { sort_value: 1 } }),
       entry("row-column", { id: "col", session_id: "s2", payload: { sort_value: 2 } }),
-      // Same column id but a different plugin must not bleed in.
       entry("row-column", { id: "col", session_id: "s3", plugin_id: "other.kit", payload: { sort_value: 9 } }),
-      // Different column id, ignored.
       entry("row-column", { id: "elsewhere", session_id: "s4", payload: { sort_value: 5 } }),
     ];
     const map = buildSortValueMap(entries, "acme.kit", "col");
@@ -187,13 +183,9 @@ describe("pluginUi sort-key / filter-facet (#2401)", () => {
     ];
     const facetStatus = { pluginId: "acme.kit", column: "st", values: new Set(["run", "idle"]) };
     const facetLang = { pluginId: "acme.kit", column: "lang", values: new Set(["rust"]) };
-    // s1 matches both facets.
     expect(sessionMatchesFacets(entries, "s1", [facetStatus, facetLang])).toBe(true);
-    // s2 matches status (idle) but has no lang row-column => fails the AND.
     expect(sessionMatchesFacets(entries, "s2", [facetStatus, facetLang])).toBe(false);
-    // s2 matches status alone.
     expect(sessionMatchesFacets(entries, "s2", [facetStatus])).toBe(true);
-    // No active facets => trivially true.
     expect(sessionMatchesFacets(entries, "s2", [])).toBe(true);
   });
 });

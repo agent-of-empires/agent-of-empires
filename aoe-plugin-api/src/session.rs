@@ -1,42 +1,16 @@
-//! Session create / turn-delivery DTOs for the `sessions.create` and
-//! `sessions.turn.send` worker RPCs (API v9, #2897).
-//!
-//! The host validates every field against its own catalogs and policy; a
-//! plugin cannot pick a view other than structured, pre-approve repository
-//! trust, or pass agent launch flags. The caller's plugin identity comes
-//! from the RPC connection, never from these payloads.
+//! DTOs for the `sessions.create`, `sessions.turn.send` and `sessions.message.send` RPCs.
 
 use serde::{Deserialize, Serialize};
 
-/// Parameters of `sessions.create`. Requires the `session.create` grant;
-/// additionally `session.prompt` when `initial_turn` is present and
-/// `session.unattended` when the host classifies `mode_id` as unattended.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SessionsCreateRequest {
     /// Agent to run, an id from `acp.capabilities.get`.
     pub agent_id: String,
-    /// Project directory the session runs in. Canonicalized and checked
-    /// against repository trust by the host, fail-closed. Absent or empty
-    /// means *no project*: the host provisions a throwaway scratch session
-    /// (no repo, so no trust anchor). Optional since API v11; a present value
-    /// keeps the v9/v10 behavior.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub project_path: Option<String>,
-    /// Additional repository paths for a multi-repo session, each canonicalized
-    /// and existence-checked by the host. Only valid alongside a
-    /// `project_path` (the first repo is the trust anchor); combining extras
-    /// with a scratch session is refused. API v11.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub extra_project_paths: Vec<String>,
-    /// Run the session inside the host's sandbox (a container). The host uses
-    /// its configured sandbox image; a plugin cannot pick an image. Sandboxing
-    /// only narrows what the agent can reach, so it needs no extra grant beyond
-    /// `session.create`. The create fails synchronously when no container
-    /// runtime is installed or running; when a runtime is present the container
-    /// is started asynchronously after the create returns, so image-pull or
-    /// startup failures surface on the session later, not as a create error.
-    /// API v11.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub sandbox: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -48,14 +22,8 @@ pub struct SessionsCreateRequest {
     pub title: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub group: Option<String>,
-    /// First prompt, accepted atomically with the create and delivered once
-    /// the worker is live (at-least-once).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub initial_turn: Option<InitialTurn>,
-    /// Create-deduplication key, scoped to the calling plugin. Retrying with
-    /// the same key and payload returns the existing session
-    /// (`created: false`); a different payload under the same key is a
-    /// conflict. Retained while the session record exists.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub idempotency_key: Option<String>,
 }
@@ -75,13 +43,39 @@ pub struct SessionsCreateResponse {
     pub created: bool,
 }
 
-/// Parameters of `sessions.turn.send`. Requires the `session.prompt` grant;
-/// the target must have been created by the calling plugin.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TurnSendRequest {
     pub session_id: String,
     pub text: String,
+}
+
+/// Request of `sessions.message.send`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MessageSendRequest {
+    pub session_id: String,
+    pub message: String,
+}
+
+/// How the host handled a message.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MessageDisposition {
+    /// Typed into a terminal pane, or started as a new agent turn.
+    Sent,
+    /// Folded into the agent's running turn.
+    Steered,
+    /// Parked on the session's queue behind a running turn.
+    Queued,
+}
+
+/// Response of `sessions.message.send`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MessageSendResponse {
+    pub disposition: MessageDisposition,
+    /// A stopped or dormant session was woken to take the message.
+    pub revived: bool,
 }
 
 #[cfg(test)]
@@ -123,8 +117,6 @@ mod tests {
 
     #[test]
     fn create_request_rejects_bypass_flags() {
-        // No unknown field can smuggle a host-side knob (allow_untrusted,
-        // extra args, env) through the create payload.
         let err = serde_json::from_value::<SessionsCreateRequest>(serde_json::json!({
             "agent_id": "claude",
             "project_path": "/p",
@@ -135,9 +127,26 @@ mod tests {
     }
 
     #[test]
+    fn message_send_wire_shapes_are_stable() {
+        let response = MessageSendResponse {
+            disposition: MessageDisposition::Steered,
+            revived: true,
+        };
+        assert_eq!(
+            serde_json::to_value(&response).expect("serialize"),
+            serde_json::json!({"disposition": "steered", "revived": true})
+        );
+        let err = serde_json::from_value::<MessageSendRequest>(serde_json::json!({
+            "session_id": "s",
+            "message": "hi",
+            "text": "x"
+        }))
+        .expect_err("unknown fields must be rejected");
+        assert!(err.to_string().contains("text"));
+    }
+
+    #[test]
     fn scratch_request_omits_project_path() {
-        // No project selected: project_path is absent on the wire (scratch),
-        // and an omitted project_path round-trips to None.
         let request = SessionsCreateRequest {
             agent_id: "claude".into(),
             project_path: None,
@@ -171,7 +180,6 @@ mod tests {
             initial_turn: None,
             idempotency_key: None,
         };
-        // Default (false) is omitted so it never bloats a fixture.
         assert!(serde_json::to_value(&request)
             .expect("serialize")
             .get("sandbox")

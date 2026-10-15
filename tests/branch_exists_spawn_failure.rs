@@ -46,7 +46,6 @@ fn setup_test_repo() -> (TempDir, git2::Repository) {
 /// The `Ok(true)` and `Ok(false)` branches are locked by the
 /// integration tests in `tests/integration/worktree_integration.rs`
 /// (`edit_workdir_moves_dir_and_optionally_renames_branch`,
-/// `tied_rename_moves_dir_to_title_leaf_without_touching_branch`,
 /// `edit_workdir_rejects_invalid_cases_without_partial_changes`).
 ///
 /// Any future test in this file that mutates `PATH` MUST use this

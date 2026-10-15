@@ -1,14 +1,8 @@
-// Keyboard-shortcut stories ported from the live suite (#1419 era
-// acp-stories): Cmd/Ctrl+B toggles the workspace sidebar, Shift+D
-// toggles the diff pane specifically, and Cmd/Ctrl+Alt+B collapses or
-// restores the whole right dock via the chord binding. All flip App.tsx
-// state through useKeyboardShortcuts; the chords bind on e.code === "KeyB"
-// so Mac layouts where Option+B emits "∫" still match.
-//
-// These need a mounted session view. The whole-dock toggle is observed via
-// ContentSplit's drag handle (data-testid="content-split-resize-handle",
-// present only when a session is open and the right dock has panes); the
-// per-pane diff toggle is observed via its activity-bar button's aria-pressed.
+// Keyboard shortcuts through useKeyboardShortcuts: Cmd/Ctrl+B toggles the
+// sidebar, Shift+D the diff pane, Cmd/Ctrl+Alt+B the whole right dock. The
+// chords bind on `e.code === "KeyB"` so Mac layouts emitting "∫" still match.
+// The dock toggle is observed via ContentSplit's drag handle, which exists only
+// with a session open and panes docked.
 
 import { test, expect } from "./helpers/mockedTest";
 import type { Page } from "@playwright/test";
@@ -84,10 +78,22 @@ test("Cmd/Ctrl+B toggles the workspace sidebar", async ({ page }) => {
   await expect(sessionRow).toBeVisible();
 });
 
-test("Shift+D toggles the diff pane on a session view", async ({ page }) => {
+test("Cmd/Ctrl+Alt+B toggles the right panel and Shift+D the diff pane on a session view", async ({ page }) => {
   await mockTerminalApis(page);
   await page.setViewportSize({ width: 1280, height: 720 });
   await page.goto(`/session/${SESSION}`);
+
+  const handle = page.locator('[data-testid="content-split-resize-handle"]');
+  await expect(handle).toBeVisible();
+  await expect.poll(() => rightDockState(page)).toEqual({ tabs: ["diff", "terminal:0"], collapsed: false });
+
+  await page.keyboard.press("ControlOrMeta+Alt+b");
+  await expect(handle).toBeHidden();
+  await expect.poll(() => rightDockState(page)).toEqual({ tabs: ["diff", "terminal:0"], collapsed: true });
+
+  await page.keyboard.press("ControlOrMeta+Alt+b");
+  await expect(handle).toBeVisible();
+  await expect.poll(() => rightDockState(page)).toEqual({ tabs: ["diff", "terminal:0"], collapsed: false });
 
   // Shift+D toggles the diff pane specifically (not the whole dock); the
   // activity-bar toggle's pressed state reflects whether diff is open.
@@ -103,22 +109,4 @@ test("Shift+D toggles the diff pane on a session view", async ({ page }) => {
   await blurToBody(page);
   await page.keyboard.press("Shift+D");
   await expect(diffToggle).toHaveAttribute("aria-pressed", "true");
-});
-
-test("Cmd/Ctrl+Alt+B toggles the right panel on a session view", async ({ page }) => {
-  await mockTerminalApis(page);
-  await page.setViewportSize({ width: 1280, height: 720 });
-  await page.goto("/session/pinch-test");
-
-  const handle = page.locator('[data-testid="content-split-resize-handle"]');
-  await expect(handle).toBeVisible();
-  await expect.poll(() => rightDockState(page)).toEqual({ tabs: ["diff", "terminal:0"], collapsed: false });
-
-  await page.keyboard.press("ControlOrMeta+Alt+b");
-  await expect(handle).toBeHidden();
-  await expect.poll(() => rightDockState(page)).toEqual({ tabs: ["diff", "terminal:0"], collapsed: true });
-
-  await page.keyboard.press("ControlOrMeta+Alt+b");
-  await expect(handle).toBeVisible();
-  await expect.poll(() => rightDockState(page)).toEqual({ tabs: ["diff", "terminal:0"], collapsed: false });
 });

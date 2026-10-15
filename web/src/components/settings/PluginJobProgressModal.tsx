@@ -3,25 +3,17 @@ import { useEffect, useRef, useState } from "react";
 import { fetchPluginJob, type PluginJob } from "../../lib/api";
 
 interface PluginJobProgressModalProps {
-  /** The lifecycle job to follow. */
   jobId: string;
-  /** Header line, e.g. "Installing acme.widget". */
   title: string;
-  /** Close the modal. The caller refreshes the plugin list. Closing mid-run
-   *  only stops polling; the host-side job keeps running. */
+  /** Closing mid-run only stops polling; the job keeps running. */
   onClose: () => void;
 }
 
-/// Live progress for a host-side plugin lifecycle job (install / update /
-/// uninstall). Polls the job status + log tail once a second until the job
-/// reaches a terminal state, rendering the verbatim host output so a
-/// dashboard-only user can watch fetch / build / remove work and see the final
-/// success or failure without a terminal.
+/// Polls a plugin lifecycle job and its log tail until it finishes.
 export function PluginJobProgressModal({ jobId, title, onClose }: PluginJobProgressModalProps) {
   const [job, setJob] = useState<PluginJob | null>(null);
   const [error, setError] = useState<string | null>(null);
-  // The job is gone (404), e.g. the daemon restarted mid-run. Terminal: stop
-  // polling and let the user close, rather than spinning forever.
+  // A 404 (e.g. daemon restart) is terminal, so Close is not stuck disabled.
   const [gone, setGone] = useState(false);
   const logRef = useRef<HTMLPreElement>(null);
 
@@ -38,11 +30,9 @@ export function PluginJobProgressModal({ jobId, title, onClose }: PluginJobProgr
           timer = setTimeout(() => void poll(), 1000);
         }
       } else if (res.status === 404) {
-        // The job no longer exists; treat it as terminal instead of retrying.
         setGone(true);
         setError(res.message);
       } else {
-        // A transient read failure should not kill the follow; retry slower.
         setError(res.message);
         timer = setTimeout(() => void poll(), 2000);
       }
@@ -54,7 +44,6 @@ export function PluginJobProgressModal({ jobId, title, onClose }: PluginJobProgr
     };
   }, [jobId]);
 
-  // Keep the newest output in view as the tail grows.
   useEffect(() => {
     const el = logRef.current;
     if (el) el.scrollTop = el.scrollHeight;

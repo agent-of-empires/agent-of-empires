@@ -1,17 +1,8 @@
 import { useEffect, useRef, useState } from "react";
 import { fetchContextPrimer } from "../../lib/api";
 
-/**
- * Banner shown above the structured view composer when `session/load` failed
- * and a prior user prompt exists. Clicking "Resume with prior context"
- * fetches a markdown primer (last N turns from the SQLite event log)
- * and pre-fills the composer with it so the user can review/edit
- * before sending. See #1004.
- *
- * Dismiss state lives on the cached reducer state (`onDismiss` clears
- * `contextPrimerAvailable` in the hook) rather than component-local
- * `useState`, so dismissing once survives session switches. See #1110.
- */
+/** After a failed `session/load`, offers to prefill a recap of recent turns.
+ *  Dismissal lives in the reducer so it survives session switches. */
 interface Props {
   sessionId: string;
   available: { resetSeq: number; reason: string } | null;

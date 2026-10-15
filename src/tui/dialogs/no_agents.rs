@@ -11,11 +11,8 @@ use super::DialogResult;
 use crate::tui::components::hover::{paint_hover_bg, HoverState};
 use crate::tui::styles::Theme;
 
-/// Result of the no-agents dialog interaction.
 pub enum NoAgentsAction {
-    /// User chose to re-check for installed agents.
     Recheck,
-    /// User chose to quit AoE.
     Quit,
 }
 
@@ -24,8 +21,7 @@ pub struct NoAgentsDialog {
     recheck_focused: bool,
     recheck_button_area: Rect,
     quit_button_area: Rect,
-    /// Which button the mouse is over, for the hover highlight. Visual
-    /// only; never changes `recheck_focused`.
+    /// The hovered button. Visual only; never changes `recheck_focused`.
     hover: HoverState,
 }
 
@@ -50,9 +46,7 @@ impl NoAgentsDialog {
         None
     }
 
-    /// Highlight the button under the cursor without changing the
-    /// Re-check / Quit focus. See `ConfirmDialog::handle_hover` for the
-    /// rationale. Returns `true` when the highlighted button changed.
+    /// Highlight the button under the cursor without changing focus.
     pub fn handle_hover(&mut self, col: u16, row: u16) -> bool {
         self.hover
             .update(col, row, &[self.recheck_button_area, self.quit_button_area])
@@ -82,19 +76,9 @@ impl NoAgentsDialog {
     }
 
     pub fn render(&mut self, frame: &mut Frame, area: Rect, theme: &Theme) {
-        let dialog_area = super::centered_rect(area, 70, 20);
-
-        frame.render_widget(Clear, dialog_area);
-
-        let block = Block::default()
-            .borders(Borders::ALL)
-            .border_type(BorderType::Rounded)
-            .border_style(Style::default().fg(theme.accent))
-            .title(" Welcome to Agent of Empires ")
-            .title_style(Style::default().fg(theme.accent).bold());
-
-        let inner = block.inner(dialog_area);
-        frame.render_widget(block, dialog_area);
+        let block =
+            super::toned_dialog_block(" Welcome to Agent of Empires ", theme.accent, theme.accent);
+        let (_, inner) = super::render_dialog_frame(frame, area, 70, 20, block);
 
         let chunks = Layout::default()
             .direction(Direction::Vertical)
@@ -171,8 +155,7 @@ impl NoAgentsDialog {
         ]);
 
         let button_area = chunks[1];
-        // Compute centered button positions deterministically so the
-        // hit rects line up with the rendered glyphs.
+        // Centered deterministically, so the hit rects line up with the glyphs.
         let recheck_label = "[Re-check]";
         let quit_label = "[Quit]";
         let gap: u16 = 4;
@@ -228,49 +211,34 @@ mod tests {
     }
 
     #[test]
-    fn test_recheck_on_enter() {
-        let mut dialog = NoAgentsDialog::new();
-        // Default focus is on Re-check
-        let result = dialog.handle_key(key(KeyCode::Enter));
-        assert!(matches!(
-            result,
-            DialogResult::Submit(NoAgentsAction::Recheck)
-        ));
-    }
-
-    #[test]
-    fn test_quit_on_esc() {
-        let mut dialog = NoAgentsDialog::new();
-        let result = dialog.handle_key(key(KeyCode::Esc));
-        assert!(matches!(result, DialogResult::Submit(NoAgentsAction::Quit)));
-    }
-
-    #[test]
-    fn test_quit_on_q() {
-        let mut dialog = NoAgentsDialog::new();
-        let result = dialog.handle_key(key(KeyCode::Char('q')));
-        assert!(matches!(result, DialogResult::Submit(NoAgentsAction::Quit)));
-    }
-
-    #[test]
-    fn test_recheck_on_r() {
-        let mut dialog = NoAgentsDialog::new();
-        let result = dialog.handle_key(key(KeyCode::Char('r')));
-        assert!(matches!(
-            result,
-            DialogResult::Submit(NoAgentsAction::Recheck)
-        ));
-    }
-
-    #[test]
-    fn test_tab_toggles_focus() {
-        let mut dialog = NoAgentsDialog::new();
-        assert!(dialog.recheck_focused);
-        dialog.handle_key(key(KeyCode::Tab));
-        assert!(!dialog.recheck_focused);
-        // Enter now submits Quit
-        let result = dialog.handle_key(key(KeyCode::Enter));
-        assert!(matches!(result, DialogResult::Submit(NoAgentsAction::Quit)));
+    fn keys_decide_the_action() {
+        use NoAgentsAction::{Quit, Recheck};
+        // Default focus is Re-check; Tab moves it to Quit.
+        let cases = [
+            (&[KeyCode::Enter][..], Some(Recheck)),
+            (&[KeyCode::Esc], Some(Quit)),
+            (&[KeyCode::Char('q')], Some(Quit)),
+            (&[KeyCode::Char('r')], Some(Recheck)),
+            (&[KeyCode::Tab, KeyCode::Enter], Some(Quit)),
+            (&[KeyCode::Char('x')], None),
+        ];
+        for (keys, want) in cases {
+            let mut dialog = NoAgentsDialog::new();
+            let mut last = DialogResult::Continue;
+            for code in keys {
+                last = dialog.handle_key(key(*code));
+            }
+            let got = match last {
+                DialogResult::Submit(action) => Some(action),
+                DialogResult::Continue => None,
+                DialogResult::Cancel => panic!("{keys:?} cancelled"),
+            };
+            assert_eq!(
+                got.map(|a| matches!(a, Recheck)),
+                want.map(|a| matches!(a, Recheck)),
+                "{keys:?}"
+            );
+        }
     }
 
     #[test]
@@ -288,12 +256,5 @@ mod tests {
         // Off the buttons clears.
         assert!(dialog.handle_hover(99, 99));
         assert_eq!(dialog.hover.current(), None);
-    }
-
-    #[test]
-    fn test_other_keys_continue() {
-        let mut dialog = NoAgentsDialog::new();
-        let result = dialog.handle_key(key(KeyCode::Char('x')));
-        assert!(matches!(result, DialogResult::Continue));
     }
 }

@@ -104,16 +104,14 @@ mod tests {
     }
 
     #[test]
-    fn test_sanitize_branch_name_replaces_slashes() {
-        let sanitized = sanitize_branch_name("feat/my-feature");
-        assert_eq!(sanitized, "feat-my-feature");
-    }
-
-    #[test]
-    fn test_sanitize_branch_name_handles_special_chars() {
-        let sanitized = sanitize_branch_name("feat@bug#123");
-        assert!(!sanitized.contains("@"));
-        assert!(!sanitized.contains("#"));
+    fn test_sanitize_branch_name_replaces_path_and_shell_characters() {
+        for (branch, expected) in [
+            ("feat/my-feature", "feat-my-feature"),
+            ("feat@bug#123", "feat-bug-123"),
+            ("a\\b:c*d?e\"f<g>h|i", "a-b-c-d-e-f-g-h-i"),
+        ] {
+            assert_eq!(sanitize_branch_name(branch), expected);
+        }
     }
 
     #[test]

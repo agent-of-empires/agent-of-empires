@@ -2,10 +2,6 @@ import { describe, expect, it } from "vitest";
 
 import { parseSessionColorsEnabled } from "../sessionColors";
 
-// The parser encodes a compatibility contract: only a literal `false` turns
-// session colors off, so a daemon predating `session.show_session_colors`
-// keeps rendering them. A careless rewrite into a truthiness check would
-// silently disable colors for every older server, hence the explicit cases.
 describe("parseSessionColorsEnabled", () => {
   it("defaults to enabled when there are no settings at all", () => {
     expect(parseSessionColorsEnabled(undefined)).toBe(true);

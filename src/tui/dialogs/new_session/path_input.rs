@@ -20,22 +20,6 @@ fn char_to_byte_idx(value: &str, char_idx: usize) -> usize {
         .unwrap_or(value.len())
 }
 
-/// Replace the home directory prefix with `~` for display.
-pub(super) fn collapse_tilde(path: &str) -> String {
-    if let Some(home) = dirs::home_dir() {
-        let home_str = home.to_string_lossy();
-        if let Some(rest) = path.strip_prefix(home_str.as_ref()) {
-            if rest.is_empty() {
-                return "~".to_string();
-            }
-            if rest.starts_with('/') {
-                return format!("~{}", rest);
-            }
-        }
-    }
-    path.to_string()
-}
-
 /// Expand a leading `~` or `~/...` to the user's home directory.
 /// Cross-platform via `dirs::home_dir()` (handles `USERPROFILE` on Windows).
 ///

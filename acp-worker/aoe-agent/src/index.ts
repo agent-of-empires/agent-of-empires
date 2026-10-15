@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * aoe-agent: ACP server wrapping Vercel AI SDK 6.
+ * aoe-agent: ACP server wrapping Vercel AI SDK 7.
  *
  * One Node process per structured-view session. Accepts ACP requests from aoe
  * (the Rust ACP client) on stdin/stdout, drives a Vercel AI SDK loop
@@ -21,7 +21,8 @@ import { anthropic } from "@ai-sdk/anthropic";
 import { openai } from "@ai-sdk/openai";
 import { google } from "@ai-sdk/google";
 import { z } from "zod";
-import { appendTurn, loadTranscript } from "./transcript.ts";
+import { appendTurn, createTranscript, loadTranscript } from "./transcript.ts";
+import { classifyKind } from "./toolKind.ts";
 
 const DEFAULT_MODEL = "claude-opus-4-7";
 
@@ -72,8 +73,10 @@ async function handlePrompt(
       abortSignal,
     });
 
+    const update = (update: Record<string, unknown>) =>
+      client.notify("session/update", { sessionId: params.sessionId, update });
+
     let assistantBuffer = "";
-    const toolCallTitles = new Map<string, string>();
     for await (const part of result.fullStream) {
       if (abortSignal.aborted) break;
       switch (part.type) {
@@ -84,55 +87,34 @@ async function handlePrompt(
             "";
           if (!delta) break;
           assistantBuffer += delta;
-          await client.notify("session/update", {
-            sessionId: params.sessionId,
-            update: {
-              sessionUpdate: "agent_message_chunk",
-              content: { type: "text", text: delta },
-            },
+          await update({
+            sessionUpdate: "agent_message_chunk",
+            content: { type: "text", text: delta },
           });
           break;
         }
         case "tool-call": {
-          const id = part.toolCallId;
           const name = part.toolName;
-          toolCallTitles.set(id, name);
-          await client.notify("session/update", {
-            sessionId: params.sessionId,
-            update: {
-              sessionUpdate: "tool_call",
-              toolCallId: id,
-              title: name,
-              kind: classifyKind(name),
-              status: "pending",
-              rawInput: part.input as Record<string, unknown>,
-            },
+          await update({
+            sessionUpdate: "tool_call",
+            toolCallId: part.toolCallId,
+            title: name,
+            kind: classifyKind(name),
+            status: "pending",
+            rawInput: part.input as Record<string, unknown>,
           });
           break;
         }
-        case "tool-result": {
-          const id = part.toolCallId;
-          await client.notify("session/update", {
-            sessionId: params.sessionId,
-            update: {
-              sessionUpdate: "tool_call_update",
-              toolCallId: id,
-              status: "completed",
-              rawOutput: serialiseToolOutput(part.output),
-            },
-          });
-          break;
-        }
+        case "tool-result":
         case "tool-error": {
-          const id = part.toolCallId;
-          await client.notify("session/update", {
-            sessionId: params.sessionId,
-            update: {
-              sessionUpdate: "tool_call_update",
-              toolCallId: id,
-              status: "failed",
-              rawOutput: { error: String(part.error) },
-            },
+          const failed = part.type === "tool-error";
+          await update({
+            sessionUpdate: "tool_call_update",
+            toolCallId: part.toolCallId,
+            status: failed ? "failed" : "completed",
+            rawOutput: failed
+              ? { error: String(part.error) }
+              : serialiseToolOutput(part.output),
           });
           break;
         }
@@ -163,7 +145,12 @@ async function handlePrompt(
     const artifactDir = process.env.AOE_ARTIFACT_DIR;
     if (artifactDir && assistantBuffer) {
       try {
-        await appendTurn(artifactDir, userText, assistantBuffer);
+        await appendTurn(
+          artifactDir,
+          params.sessionId,
+          userText,
+          assistantBuffer,
+        );
       } catch (err) {
         process.stderr.write(`[aoe-agent] transcript persist failed: ${err}\n`);
       }
@@ -182,10 +169,7 @@ async function handlePrompt(
         sessionId: params.sessionId,
         update: {
           sessionUpdate: "agent_message_chunk",
-          content: {
-            type: "text",
-            text: `\n[aoe-agent error] ${message}\n`,
-          },
+          content: { type: "text", text: `\n[aoe-agent error] ${message}\n` },
         },
       })
       .catch(() => undefined);
@@ -268,19 +252,6 @@ function buildTools(sessionId: string, client: acp.AgentContext) {
   };
 }
 
-function classifyKind(toolName: string): acp.ToolKind {
-  switch (toolName) {
-    case "Read":
-      return "read";
-    case "Write":
-      return "edit";
-    case "Bash":
-      return "execute";
-    default:
-      return "other";
-  }
-}
-
 function serialiseToolOutput(output: unknown): Record<string, unknown> {
   if (output && typeof output === "object" && !Array.isArray(output)) {
     return output as Record<string, unknown>;
@@ -288,17 +259,31 @@ function serialiseToolOutput(output: unknown): Record<string, unknown> {
   return { value: output };
 }
 
+/**
+ * Map an `AOE_AGENT_MODEL` id onto a provider by bare prefix or an explicit
+ * `provider:` prefix. Anything else hits the Anthropic fallback, so
+ * local-model ids are not a valid configuration until an openai-compatible
+ * branch exists.
+ */
 function pickModel(modelId: string) {
-  if (modelId.startsWith("claude-") || modelId.startsWith("anthropic:")) {
-    return anthropic(modelId.replace(/^anthropic:/, ""));
-  }
-  if (modelId.startsWith("gpt-") || modelId.startsWith("openai:")) {
-    return openai(modelId.replace(/^openai:/, ""));
-  }
-  if (modelId.startsWith("gemini-") || modelId.startsWith("google:")) {
-    return google(modelId.replace(/^google:/, ""));
+  const providers = [
+    { bare: "claude-", tag: "anthropic:", make: anthropic },
+    { bare: "gpt-", tag: "openai:", make: openai },
+    { bare: "gemini-", tag: "google:", make: google },
+  ];
+  for (const { bare, tag, make } of providers) {
+    if (modelId.startsWith(tag)) return make(modelId.slice(tag.length));
+    if (modelId.startsWith(bare)) return make(modelId);
   }
   return anthropic(modelId);
+}
+
+function startSession(sessionId: string, messages: ModelMessage[]): void {
+  sessions.set(sessionId, {
+    pendingPrompt: null,
+    modelId: process.env.AOE_AGENT_MODEL ?? DEFAULT_MODEL,
+    messages,
+  });
 }
 
 function randomHexId(): string {
@@ -317,7 +302,7 @@ function main() {
     .onRequest("initialize", ({ params }) => ({
       protocolVersion: params.protocolVersion ?? acp.PROTOCOL_VERSION,
       agentCapabilities: {
-        loadSession: true,
+        loadSession: Boolean(process.env.AOE_ARTIFACT_DIR),
         promptCapabilities: {
           image: false,
           audio: false,
@@ -325,39 +310,30 @@ function main() {
       },
     }))
     .onRequest("authenticate", () => ({}))
-    .onRequest("session/new", () => {
+    .onRequest("session/new", async () => {
       const sessionId = randomHexId();
-      const modelId = process.env.AOE_AGENT_MODEL ?? DEFAULT_MODEL;
-      sessions.set(sessionId, {
-        pendingPrompt: null,
-        modelId,
-        messages: [],
-      });
-      return { sessionId };
-    })
-    .onRequest("session/load", async ({ params }) => {
-      // Reattach across an `aoe serve` restart: seed the model's context from
-      // the persisted transcript. aoe rebuilds the UI from its own event
-      // store and drops any transcript we might replay, so no session/update
-      // replay is needed here, only restoring in-memory history. Registering
-      // the session in the map is required, else the next session/prompt fails
-      // with "Session not found".
       const artifactDir = process.env.AOE_ARTIFACT_DIR;
-      let messages: ModelMessage[] = [];
+      // Best-effort: a non-writable artifact dir must not block the clear.
+      // The session runs ephemerally; a later load of a missing transcript
+      // resets context rather than replaying another session's history.
       if (artifactDir) {
         try {
-          messages = await loadTranscript(artifactDir);
+          await createTranscript(artifactDir, sessionId);
         } catch (err) {
           process.stderr.write(
-            `[aoe-agent] transcript load failed: ${err}\n`,
+            `[aoe-agent] transcript create failed: ${err}\n`,
           );
         }
       }
-      sessions.set(params.sessionId, {
-        pendingPrompt: null,
-        modelId: process.env.AOE_AGENT_MODEL ?? DEFAULT_MODEL,
-        messages,
-      });
+      startSession(sessionId, []);
+      return { sessionId };
+    })
+    .onRequest("session/load", async ({ params }) => {
+      // AoE replays UI events itself; restore only this native model context.
+      const artifactDir = process.env.AOE_ARTIFACT_DIR;
+      if (!artifactDir) throw new Error("Session persistence is unavailable");
+      const messages = await loadTranscript(artifactDir, params.sessionId);
+      startSession(params.sessionId, messages);
       return {};
     })
     .onRequest("session/set_mode", () => ({}))

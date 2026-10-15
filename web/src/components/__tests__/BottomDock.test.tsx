@@ -1,8 +1,4 @@
 // @vitest-environment jsdom
-//
-// BottomDock wraps Dock in a height-resizable strip. Verify it mounts the
-// active tab and exposes the height-resize handle (the bit Dock.test does not
-// cover).
 
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { cleanup, fireEvent, render } from "@testing-library/react";

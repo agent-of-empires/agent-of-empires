@@ -1,7 +1,8 @@
 import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { toastBus, type ToastApi, type ToastKind } from "../lib/toastBus";
 import { requestOpenSession } from "../lib/sessionRoute";
-import { isExternalHttpUrl, openExternal } from "../lib/pluginCommands";
+import { openPluginLink } from "../lib/pluginCommands";
+import { isAllowedHref } from "../lib/pluginHref";
 
 interface Toast {
   id: number;
@@ -32,9 +33,7 @@ export function ToastProvider({ children }: { children: ReactNode }) {
     [dismiss],
   );
 
-  // Pushes a toast with an associated session so tapping it jumps to
-  // that session. Kept internal to this module since only the SW push
-  // handler uses it.
+  // Pushes a toast with an associated session so tapping it jumps to that session.
   const pushWithSession = useCallback(
     (message: string, sessionId: string) => {
       const id = nextId.current++;
@@ -65,10 +64,8 @@ export function ToastProvider({ children }: { children: ReactNode }) {
     [push, pushWithHref],
   );
 
-  // Service worker forwards incoming push payloads here when the PWA
-  // is already visible and focused, so we show the notification as an
-  // in-app toast instead of an OS lock-screen buzz. Matches the
-  // "don't bug me if I'm already looking at the app" requirement.
+  // Service worker forwards incoming push payloads here when the PWA is already visible and focused, so we show
+  // the notification as an in-app toast instead of an OS lock-screen buzz.
   useEffect(() => {
     if (typeof navigator === "undefined" || !navigator.serviceWorker) return;
     const handler = (event: MessageEvent) => {
@@ -105,10 +102,9 @@ export function ToastProvider({ children }: { children: ReactNode }) {
           const clickable = !!t.sessionId || !!t.href;
           const onToastClick = () => {
             if (t.href) {
-              // Defensive re-check: the server already rejects non-http(s)
-              // notification hrefs, but never hand an unvalidated scheme to
-              // window.open in case a future push path skips that gate.
-              if (isExternalHttpUrl(t.href)) openExternal(t.href);
+              // Defensive re-check: the server already rejects disallowed notification hrefs, but never hand an
+              // unvalidated scheme to window.open in case a future push path skips that gate.
+              if (isAllowedHref(t.href)) openPluginLink(t.href);
             } else if (t.sessionId) {
               requestOpenSession(t.sessionId);
             } else {
@@ -146,11 +142,8 @@ export function ToastProvider({ children }: { children: ReactNode }) {
   );
 }
 
-/**
- * Hook that wires the React ToastProvider into the module-level toastBus so
- * non-React callers (like the fetch interceptor) can surface errors as toasts.
- * Keep this component-local: it is only safe to call inside ToastProvider.
- */
+/** Hook that wires the React ToastProvider into the module-level toastBus so non-React callers (like the fetch
+ *  interceptor) can surface errors as toasts. */
 export function ToastBusBridge() {
   const ctx = useContext(ToastContext);
   useEffect(() => {

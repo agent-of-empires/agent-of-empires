@@ -1,7 +1,7 @@
 ---
 name: aoe
 description: Use when launching, monitoring, or controlling AI coding agents (Claude Code, Codex, OpenCode, etc.) in tmux via Agent of Empires (aoe). Covers creating sessions, capturing agent output, running parallel worktree agents, and organizing work into groups and profiles. Prefer aoe over raw tmux for agent management.
-version: 1.0.0
+version: 1.1.0
 author: njbrake (Agent of Empires)
 license: MIT
 metadata:
@@ -49,8 +49,11 @@ aoe add /path/to/repo -t "API work" -g backend -l
 # Add with specific tool
 aoe add . -t "codex session" -c codex
 
-# Add in a git worktree (parallel branch)
-aoe add . -t "fix-123" -w fix/issue-123 -l
+# Add in a git worktree on a new branch, YOLO mode (omit -b to check out an existing branch)
+aoe add . -t "fix-123" -w fix/issue-123 -b -y -l
+
+# Base the new branch on another branch instead of the default
+aoe add . -t "fix-124" -w fix/issue-124 -b --base-branch fix/issue-123 -l
 
 # Add in Docker sandbox
 aoe add . -t "sandboxed" -s -l
@@ -62,12 +65,17 @@ aoe add . -t "sub task" -P <parent-id>
 aoe add . -t "yolo" -y -l
 ```
 
+Without `--base-branch`, `-w <branch> -b` starts the branch from `worktree.default_base_branch` if set, otherwise from the repo's detected default branch (chosen among each remote's `HEAD` target and `main`/`master`), fetched first. It is not the branch checked out where you run `aoe add`, so pass `--base-branch` to build on a feature branch.
+
+A sandboxed session (`-s`) sees only its mounts: the project, its agent store and credentials, `~/.gitconfig`, and configured `extra_volumes`. Work that needs host-only resources (macOS Keychain, launchd, the aoe app directory, other paths outside the project) must run without `-s`. See the [sandbox guide](https://github.com/agent-of-empires/agent-of-empires/blob/main/docs/guides/sandbox.md).
+
 ## Listing Sessions
 
 ```bash
 aoe list              # human-readable
 aoe list --json       # JSON for parsing
 aoe list --all        # across all profiles
+aoe list --json --state=live   # skip trashed and archived rows
 ```
 
 **JSON shape** (`aoe list --json`):
@@ -81,13 +89,16 @@ aoe list --all        # across all profiles
     "tool": "claude",
     "command": "claude",
     "profile": "default",
+    "state": "live",
     "created_at": "2025-01-01T00:00:00Z",
     "workspace_repos": []
   }
 ]
 ```
 
-`command` is omitted when empty; `worktree` appears only for worktree-backed sessions. `list --json` does not include live status: use `aoe status --json` or `aoe session capture --json` for that.
+`command` is omitted when empty; `worktree` appears only for worktree-backed sessions. `state` is `live`, `archived`, or `trashed`; `trashed_at` and `archived_at` are set independently, and trashing leaves `archived_at` alone, so a session archived and then trashed carries both keys and reports `trashed`. Neither timestamp is durable, but they do not clear alike: `archived_at` is cleared by `aoe session unarchive`, by `aoe session favorite`, and by anything that wakes the session (`aoe send`, and `aoe session restart` when it sends its wake message), while `trashed_at` is cleared only by `aoe session restore`. Key off `state` rather than caching a timestamp. A trashed session stays in the listing and keeps its title, so check `state` before treating a row as a live session. `list --json` does not include live status: use `aoe status --json` or `aoe session capture --json` for that.
+
+`snoozed_until` and `pinned_at` round out the four state timestamps the REST API exposes: `pinned_at` appears whenever the session is pinned for the web sidebar, while `snoozed_until` appears only while the snooze is still active (the API's own gate), so an expired deadline omits the key instead of advertising a snooze that already ended. Both are independent of `state`, and neither key appears on a row carrying neither marker. `snoozed_until` also clears readily, more often than its siblings: waking the session (`aoe send`), archiving, favoriting, unsnoozing, or pinning all remove it on the next read, so treat a missing key as no active snooze rather than a listing gap.
 
 ## Session Lifecycle
 
@@ -114,6 +125,8 @@ aoe status --json
 aoe status -q   # just the waiting count (for scripting)
 ```
 
+`-n` has no cap, but capture only reaches back as far as tmux scrollback (`history-limit`, 2000 lines by default), and agent TUIs that redraw the screen leave little of a long turn in it. For a long report, ask the agent to write it to a file in its worktree and read that file from the host (`path` in `aoe session show --json`).
+
 **JSON shape** (`aoe session capture --json`):
 ```json
 {
@@ -136,11 +149,14 @@ aoe status -q   # just the waiting count (for scripting)
   "tool": "claude",
   "command": "claude",
   "status": "running",
+  "state": "live",
   "profile": "default"
 }
 ```
 
-`parent_session_id` is included only for sub-sessions.
+`parent_session_id` is included only for sub-sessions. `state` is `live`, `archived`, or `trashed`, the same vocabulary `aoe list --json` uses; `trashed_at` and `archived_at` are set independently, and trashing deliberately leaves `archived_at` alone, so a session archived and then trashed carries both keys and reports `trashed`. Neither timestamp is durable, and they do not clear alike: `archived_at` is cleared by `aoe session unarchive`, by `aoe session favorite`, and by anything that wakes the session, which means `aoe send` and `aoe session restart` when it sends its wake message (with `session.restart_wake_message` set to the empty string it does not send one, and the archive survives the restart). `trashed_at` is cleared only by `aoe session restore`. Read the current `state` rather than caching a timestamp; `status` is the pane's live status and does not carry it, since an archived session can still be running.
+
+The same two keys apply here as in `aoe list --json`: `pinned_at` whenever the session is pinned for the web sidebar, `snoozed_until` only while the snooze is still active.
 
 **JSON shape** (`aoe status --json`):
 ```json
@@ -163,6 +179,31 @@ aoe session show          # auto-detects current session
 aoe session capture       # auto-detects current session
 aoe session current --json
 ```
+
+## Sending messages
+
+```bash
+aoe send <id-or-title> "message"
+aoe send <id-or-title> "message" --no-revive   # fail instead of starting a stopped session
+```
+
+`aoe send` starts a stopped session unless `--no-revive` is given, waits at most 5 seconds for the agent to look ready, then sends anyway. A message that arrives before the agent's prompt is up is lost or left unsubmitted, so after launching, poll capture until the agent is ready instead of sleeping a fixed time. `status` also reads `idle` for a blank or unrecognized screen, such as the pane before Claude Code draws, so for Claude Code in any permission mode also require its `❯` input line. Send only after both were observed; on a capture error or deadline, stop without sending:
+
+```bash
+ready=
+for _ in $(seq 60); do
+  out=$(aoe session capture "fix-123" --json --strip-ansi) || { echo "capture failed" >&2; exit 1; }
+  st=$(printf '%s\n' "$out" | jq -er .status) || { echo "unreadable capture" >&2; exit 1; }
+  if [ "$st" = idle ] && printf '%s\n' "$out" | jq -r .content | grep -q '^[[:space:]]*❯'; then
+    ready=1; break
+  fi
+  sleep 2
+done
+[ -n "$ready" ] || { echo "fix-123 not ready after 120s" >&2; exit 1; }
+aoe send "fix-123" "Fix issue #123 and open a PR"
+```
+
+After sending, confirm the agent picked it up (status `running`, or the message in the transcript) before assuming delivery. Messages of 16 bytes or more, or with a newline, are pasted (bracketed when the agent enables it) and followed by Enter, and an agent may show them collapsed (Claude Code renders `[Pasted text #1 ...]`). Claude Code's input box can also show a dimmed suggested next prompt that looks like typed text; it was not submitted. Only text in the transcript above the input box has been sent.
 
 ## Renaming and Organizing
 
@@ -197,9 +238,12 @@ aoe worktree cleanup -f
 ## Removing Sessions
 
 ```bash
-aoe remove <id-or-title>
-aoe remove <id-or-title> --delete-worktree --force
+aoe remove <id-or-title>                    # move to trash (alias: rm)
+aoe session restore <id-or-title>           # bring it back
+aoe remove <id-or-title> --purge --delete-worktree --force   # delete permanently
 ```
+
+With `session.delete_to_trash` on (the default), `aoe remove` stops the agent, keeps the record with `state` `trashed`, and moves an aoe-managed worktree into a `.aoe-trash/<id>` directory beside it. `--delete-worktree`, `--delete-branch`, and `--keep-container` only apply with `--purge`. For sandboxed sessions the move can fail (for example with `Permission denied`); aoe then prints `left worktree in place` and still trashes the session.
 
 ## Workflow Patterns
 
@@ -214,9 +258,9 @@ aoe session capture "feature X" --json
 ### Parallel worktree agents
 
 ```bash
-aoe add . -t "issue-100" -w fix/issue-100 -l
-aoe add . -t "issue-101" -w fix/issue-101 -l
-aoe add . -t "issue-102" -w fix/issue-102 -l
+aoe add . -t "issue-100" -w fix/issue-100 -b -l
+aoe add . -t "issue-101" -w fix/issue-101 -b -l
+aoe add . -t "issue-102" -w fix/issue-102 -b -l
 aoe status --json   # check all at once
 ```
 
@@ -254,6 +298,7 @@ done
 2. **Using raw `tmux` to start or stop agents.** That bypasses aoe's tracking; the session's status and metadata go stale. Always use `aoe session start/stop/restart`.
 3. **Forgetting `-l`/`--launch`.** `aoe add` creates a session but does not start it unless you pass `-l`.
 4. **Running across the wrong profile.** Sessions are profile-scoped; use `-p <name>` or set `AGENT_OF_EMPIRES_PROFILE` when scripting, and `aoe list --all` to see everything.
+5. **Sending before the agent is ready.** Poll capture until `status` is `idle` with the input line on screen, abort on timeout, and confirm the agent started working afterwards. See [Sending messages](#sending-messages).
 
 ## Verification Checklist
 

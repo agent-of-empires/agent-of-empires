@@ -1,14 +1,3 @@
-// Playwright config for documentation screenshot capture.
-//
-// Runs tests/capture/screenshots.spec.ts, which spawns a seeded
-// `aoe serve` (via tests/helpers/aoeServe.ts) and writes hero PNGs into
-// docs/assets/. Single worker for determinism; longer timeout because
-// structured view specs drive a scripted ACP turn end to end.
-//
-// Use scripts/dev/capture-web-screenshots.sh, or:
-//   AOE_E2E_BINARY=../target/release/aoe \
-//     npx playwright test --config=playwright.capture.config.ts
-
 import { defineConfig } from "@playwright/test";
 
 export default defineConfig({

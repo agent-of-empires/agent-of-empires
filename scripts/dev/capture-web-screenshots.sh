@@ -10,13 +10,14 @@
 #   scripts/dev/capture-web-screenshots.sh
 #
 # Honors AOE_E2E_BINARY if set; otherwise prefers an existing
-# target/release/aoe, then builds one with default features (includes serve).
+# target/release/aoe, then builds one with `--features web`. A default build
+# ships the daemon but no dashboard bundle, so every page would capture as a 404.
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$REPO_ROOT"
 
-# Resolve a serve-enabled binary.
+# Resolve a binary with the dashboard bundle embedded.
 if [[ -n "${AOE_E2E_BINARY:-}" && -x "${AOE_E2E_BINARY}" ]]; then
   BIN="${AOE_E2E_BINARY}"
 elif [[ -x "target/release/aoe" ]]; then
@@ -24,8 +25,8 @@ elif [[ -x "target/release/aoe" ]]; then
 elif [[ -x "target/debug/aoe" ]]; then
   BIN="target/debug/aoe"
 else
-  echo "No aoe binary found; building release with default features (this is slow on a cold cache)."
-  cargo build --release
+  echo "No aoe binary found; building release with --features web (this is slow on a cold cache)."
+  cargo build --release --features web
   BIN="target/release/aoe"
 fi
 export AOE_E2E_BINARY="$(cd "$(dirname "$BIN")" && pwd)/$(basename "$BIN")"

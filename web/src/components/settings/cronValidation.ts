@@ -1,10 +1,4 @@
-// Small client-side 5-field cron validator for the scheduled-jobs widget
-// (#2897). The API v9 settings validator is authoritative for cron; this only
-// mirrors that rule to give early feedback (wrong field count, out-of-range
-// values) before save. It is intentionally minimal: numeric fields with `*`,
-// `,`, `-`, `/`, matching the ranges croner enforces server-side and covering
-// everything the picker generates. Named tokens (JAN/MON) are not accepted
-// here; advanced users wanting those edit via the TUI or config.toml.
+// Minimal 5-field cron check for early feedback; the server validator is authoritative.
 
 const FIELD_RANGES: [number, number][] = [
   [0, 59], // minute
@@ -36,8 +30,6 @@ function validItem(item: string, min: number, max: number): boolean {
   return false;
 }
 
-/** Return an error string for an invalid 5-field cron, or null when it is
- *  acceptable. Purely a UX gate; the picker only ever produces valid output. */
 export function validateCron(expr: string): string | null {
   const parts = expr.trim().split(/\s+/).filter(Boolean);
   if (parts.length !== 5) {

@@ -1,144 +1,37 @@
 //! Mid-turn `aoe serve` reattach: integration coverage for the daemon
-//! side of the fix. Stands up a UNIX socket fronted by a byte-proxy to a
-//! Node ACP shim (so we exercise the real `AcpClient::attach` →
-//! `connect_via_socket` → ACP `initialize` path) and asserts:
+//! side of the fix. Stands up the production runner around a Node ACP shim
+//! so the real `AcpClient::attach`, control connection, and ACP
+//! `initialize` path are exercised. It asserts:
 //!
 //! 1. `attach` with `in_flight_turn = true` synthesizes
 //!    `Event::Stopped { reason: "reattach_idle" }` after the configured
-//!    grace, since the orphaned upstream `session/prompt` response has
-//!    no daemon-side request id to land against.
+//!    grace when the runner has no activity or completion to replay.
 //!
-//! 2. `attach` with `in_flight_turn = false` does NOT synthesize one —
-//!    the watchdog must stay disarmed when the session was idle.
+//! 2. `attach` with `in_flight_turn = false` does not synthesize one.
+//!
+//! 3. A completion cached while detached preserves its native reason only
+//!    when durable state still marks the turn in flight. A clean client
+//!    shutdown also releases the runner for the next attachment.
 //!
 //! Skipped automatically if `node` is not on PATH.
 //!
 //! Note: the parent `main.rs` only compiles this module under
-//! `cfg(all(feature = "serve", debug_assertions))`. Debug-only because
-//! the watchdog grace is tunable via `AOE_RESUME_IDLE_GRACE_MS` only
-//! under `cfg(debug_assertions)` (see `resume_idle_grace()` in
-//! `src/structured view/acp_client.rs`); release builds would wait the full
-//! 10s production default and fail the 3s assertion below.
+//! `cfg(debug_assertions)`, the only builds where `AOE_RESUME_IDLE_GRACE_MS`
+//! and `AOE_RESUME_IDLE_CHECK_INTERVAL_MS` tune the watchdog.
 
-use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use agent_of_empires::acp::acp_client::AcpClient;
 use agent_of_empires::acp::state::{AcpSessionId, Event};
-use tokio::net::UnixListener;
-use tokio::process::Command;
 
-use crate::common::{shim_path, shim_ready};
-
-/// Spawn the shim and bridge its stdio to a UNIX listener. Mimics what
-/// `aoe __acp-runner` does in production: byte-proxy, no protocol
-/// awareness. Accepts exactly one connection per call so we don't have
-/// to coordinate listener lifetime with the test's drain logic.
-///
-/// If `preseed_session_id` is `Some`, the shim pre-creates that session
-/// id so `AcpClient::attach` (Resume mode) can immediately send prompts
-/// without going through `session/new`.
-///
-/// Returns the listener path; the bridge task is detached.
-async fn spawn_shim_socket_bridge_with_preseed(
-    preseed_session_id: Option<&str>,
-) -> (PathBuf, tempfile::TempDir) {
-    let shim = shim_path();
-    let temp = tempfile::tempdir().unwrap();
-    let socket_path = temp.path().join("runner.sock");
-
-    let mut cmd = Command::new("node");
-    cmd.arg(&shim);
-    if let Some(id) = preseed_session_id {
-        cmd.env("SHIM_PRESEED_SESSION_ID", id);
-    }
-    let mut shim_proc = cmd
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .kill_on_drop(true)
-        .spawn()
-        .expect("spawn shim");
-    let shim_stdin = shim_proc.stdin.take().expect("shim stdin");
-    let shim_stdout = shim_proc.stdout.take().expect("shim stdout");
-
-    let listener = UnixListener::bind(&socket_path).expect("bind listener");
-
-    tokio::spawn(async move {
-        // Single accept — the test only attaches once. After the first
-        // connection closes we stop accepting; the shim process is then
-        // dropped via kill_on_drop when this task ends.
-        let _shim_proc = shim_proc;
-        let (stream, _) = match listener.accept().await {
-            Ok(pair) => pair,
-            Err(_) => return,
-        };
-        let (mut sock_read, mut sock_write) = stream.into_split();
-        let mut shim_in = shim_stdin;
-        let mut shim_out = shim_stdout;
-        let to_shim = async move { tokio::io::copy(&mut sock_read, &mut shim_in).await.ok() };
-        let from_shim = async move { tokio::io::copy(&mut shim_out, &mut sock_write).await.ok() };
-        let _ = tokio::join!(to_shim, from_shim);
-    });
-
-    (socket_path, temp)
-}
-
-async fn spawn_shim_socket_bridge() -> (PathBuf, tempfile::TempDir) {
-    spawn_shim_socket_bridge_with_preseed(None).await
-}
-
-/// Variant for the watchdog-disarm test: preseeds `session_id` AND tells
-/// the shim to emit one unsolicited `agent_message_chunk` after
-/// `emit_delay_ms`, then stay silent. Mimics a still-alive runner
-/// forwarding a single mid-turn notification right after reattach.
-async fn spawn_shim_socket_bridge_emitting_unsolicited(
-    session_id: &str,
-    emit_delay_ms: u64,
-) -> (PathBuf, tempfile::TempDir) {
-    let shim = shim_path();
-    let temp = tempfile::tempdir().unwrap();
-    let socket_path = temp.path().join("runner.sock");
-
-    let mut cmd = Command::new("node");
-    cmd.arg(&shim);
-    cmd.env("SHIM_PRESEED_SESSION_ID", session_id);
-    cmd.env("SHIM_EMIT_UNSOLICITED_NOTIF", emit_delay_ms.to_string());
-    let mut shim_proc = cmd
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .kill_on_drop(true)
-        .spawn()
-        .expect("spawn shim");
-    let shim_stdin = shim_proc.stdin.take().expect("shim stdin");
-    let shim_stdout = shim_proc.stdout.take().expect("shim stdout");
-
-    let listener = UnixListener::bind(&socket_path).expect("bind listener");
-
-    tokio::spawn(async move {
-        let _shim_proc = shim_proc;
-        let (stream, _) = match listener.accept().await {
-            Ok(pair) => pair,
-            Err(_) => return,
-        };
-        let (mut sock_read, mut sock_write) = stream.into_split();
-        let mut shim_in = shim_stdin;
-        let mut shim_out = shim_stdout;
-        let to_shim = async move { tokio::io::copy(&mut sock_read, &mut shim_in).await.ok() };
-        let from_shim = async move { tokio::io::copy(&mut shim_out, &mut sock_write).await.ok() };
-        let _ = tokio::join!(to_shim, from_shim);
-    });
-
-    (socket_path, temp)
-}
+use crate::common::{shim_ready, spawn_runner_with_shim};
 
 async fn drain_for_stopped_reason(client: &mut AcpClient, deadline: Instant) -> Option<String> {
     while Instant::now() < deadline {
         match tokio::time::timeout(Duration::from_millis(200), client.next_event()).await {
             Ok(Some(Event::Stopped { reason })) => return Some(reason),
             Ok(Some(_)) => continue,
-            Ok(None) => return None,
+            Ok(None) => panic!("ACP stream closed during reattach observation"),
             Err(_) => continue,
         }
     }
@@ -153,11 +46,16 @@ async fn attach_in_flight_synthesizes_reattach_idle_stopped() {
         return;
     }
 
-    // Shorten the watchdog grace so the test completes inside ~3s
-    // instead of the 10s production default.
-    std::env::set_var("AOE_RESUME_IDLE_GRACE_MS", "500");
+    // Shorten the watchdog grace and tick from the production defaults.
+    let _env = crate::common::EnvGuard::from_pairs(&[
+        ("AOE_RESUME_IDLE_GRACE_MS", "200"),
+        ("AOE_RESUME_IDLE_CHECK_INTERVAL_MS", "50"),
+    ]);
 
-    let (socket_path, _tmp) = spawn_shim_socket_bridge().await;
+    // The runner must announce the same session id the daemon attaches
+    // with; the control handshake verifies it.
+    const SESSION: &str = "midturn-true";
+    let (socket_path, _runner) = spawn_runner_with_shim(SESSION, &[]).await;
 
     let mut client = AcpClient::attach(
         socket_path,
@@ -192,9 +90,15 @@ async fn attach_idle_session_does_not_synthesize_stopped() {
         return;
     }
 
-    std::env::set_var("AOE_RESUME_IDLE_GRACE_MS", "500");
+    let _env = crate::common::EnvGuard::from_pairs(&[
+        ("AOE_RESUME_IDLE_GRACE_MS", "200"),
+        ("AOE_RESUME_IDLE_CHECK_INTERVAL_MS", "50"),
+    ]);
 
-    let (socket_path, _tmp) = spawn_shim_socket_bridge().await;
+    // The runner must announce the same session id the daemon attaches
+    // with; the control handshake verifies it.
+    const SESSION: &str = "midturn-false";
+    let (socket_path, _runner) = spawn_runner_with_shim(SESSION, &[]).await;
 
     let mut client = AcpClient::attach(
         socket_path,
@@ -211,7 +115,7 @@ async fn attach_idle_session_does_not_synthesize_stopped() {
     .expect("attach in_flight=false");
 
     let stopped =
-        drain_for_stopped_reason(&mut client, Instant::now() + Duration::from_secs(2)).await;
+        drain_for_stopped_reason(&mut client, Instant::now() + Duration::from_secs(1)).await;
     let _ = client.shutdown().await;
 
     assert!(
@@ -234,14 +138,30 @@ async fn attach_in_flight_disarms_after_first_inbound_notification() {
         return;
     }
 
-    // Grace 800ms; the shim emits its single chunk at 200ms. Without the
-    // disarm-on-first-event fix the watchdog would fire ~800ms after that
-    // chunk (around t=1s); we drain for 2.5s to catch it. With the fix it
-    // disarms on the chunk and never fires.
-    std::env::set_var("AOE_RESUME_IDLE_GRACE_MS", "800");
+    // Release the notification only after the intended client attaches.
+    let _env = crate::common::EnvGuard::from_pairs(&[
+        ("AOE_RESUME_IDLE_GRACE_MS", "800"),
+        ("AOE_RESUME_IDLE_CHECK_INTERVAL_MS", "50"),
+    ]);
 
+    let release_dir = tempfile::tempdir().expect("notification release directory");
+    let release = release_dir.path().join("release");
     let session_id = "test-acp-session-id";
-    let (socket_path, _tmp) = spawn_shim_socket_bridge_emitting_unsolicited(session_id, 200).await;
+    // The runner must announce the same session id the daemon attaches
+    // with; the control handshake verifies it.
+    const SESSION: &str = "midturn-disarm";
+    let (socket_path, _runner) = spawn_runner_with_shim(
+        SESSION,
+        &[
+            ("SHIM_PRESEED_SESSION_ID", session_id.to_string()),
+            ("SHIM_EMIT_UNSOLICITED_NOTIF", "0".to_string()),
+            (
+                "SHIM_UNSOLICITED_RELEASE_FILE",
+                release.display().to_string(),
+            ),
+        ],
+    )
+    .await;
 
     let mut client = AcpClient::attach(
         socket_path,
@@ -257,8 +177,22 @@ async fn attach_in_flight_disarms_after_first_inbound_notification() {
     .await
     .expect("attach in_flight=true");
 
+    std::fs::write(&release, b"release").expect("release notification after attachment");
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            match client.next_event().await.expect("reattached stream open") {
+                Event::AgentMessageChunk { text } if text == "mid-turn chunk after reattach" => {
+                    break
+                }
+                Event::Stopped { reason } => panic!("stopped before notification: {reason}"),
+                _ => {}
+            }
+        }
+    })
+    .await
+    .expect("final attachment received the intended notification");
     let stopped =
-        drain_for_stopped_reason(&mut client, Instant::now() + Duration::from_millis(2500)).await;
+        drain_for_stopped_reason(&mut client, Instant::now() + Duration::from_millis(1600)).await;
     let _ = client.shutdown().await;
 
     assert!(
@@ -267,68 +201,176 @@ async fn attach_in_flight_disarms_after_first_inbound_notification() {
     );
 }
 
-/// End-to-end socket transport: attach to the runner-style bridge,
-/// send a prompt, and confirm the shim's response round-trips back as
-/// `AgentMessageChunk` + `Stopped` events. This replaces the
-/// `shim_agent_round_trips_via_unix_socket` test deleted in the
-/// worker-persistence redesign. It does NOT exercise the production
-/// `spawn_runner_detached` path (which requires a built `aoe` binary
-/// with the `__acp-runner` subcommand registered, and so belongs
-/// in `tests/e2e/`); it does exercise everything downstream:
-/// `AcpClient` socket connection, ACP `initialize` handshake,
-/// `session/prompt` round-trip, and event mapping.
-#[tokio::test]
-async fn socket_transport_round_trips_prompt_via_attach() {
-    if let Err(reason) = shim_ready() {
-        eprintln!("skipping: {reason}");
-        return;
+async fn read_typed_control(
+    stream: &mut tokio::net::UnixStream,
+) -> agent_of_empires::acp::control_protocol::ControlBody {
+    use agent_of_empires::acp::control_protocol::{self, ControlBody};
+
+    loop {
+        let frame = control_protocol::read_frame(stream)
+            .await
+            .expect("read control frame")
+            .expect("runner kept control socket open");
+        if !matches!(frame, ControlBody::Notify { .. }) {
+            return frame;
+        }
     }
+}
 
-    let preseed = "preseed-roundtrip-session";
-    let (socket_path, _tmp) = spawn_shim_socket_bridge_with_preseed(Some(preseed)).await;
+async fn replay_completion_after_disconnect(session: &str, in_flight_turn: bool) -> Option<String> {
+    use agent_of_empires::acp::control_protocol::{self, ControlBody};
 
-    let mut client = AcpClient::attach(
-        socket_path,
+    let completion_dir = tempfile::tempdir().expect("completion observation directory");
+    let completed = completion_dir.path().join("completed");
+    let completion_release = completion_dir.path().join("release-completion");
+    let (socket_path, _runner) = spawn_runner_with_shim(
+        session,
+        &[
+            (
+                "AOE_E2E_PROMPT_COMPLETED_FILE",
+                completed.display().to_string(),
+            ),
+            (
+                "SHIM_PROMPT_COMPLETION_RELEASE_FILE",
+                completion_release.display().to_string(),
+            ),
+        ],
+    )
+    .await;
+    let control_path = agent_of_empires::process::worker::control_socket_sibling(&socket_path);
+    let mut first = tokio::net::UnixStream::connect(&control_path)
+        .await
+        .expect("connect first daemon");
+    assert!(matches!(
+        control_protocol::read_frame(&mut first).await.unwrap(),
+        Some(ControlBody::Hello { .. })
+    ));
+    control_protocol::write_frame(
+        &mut first,
+        &ControlBody::Attach {
+            control_protocol_version: control_protocol::CONTROL_PROTOCOL_VERSION,
+        },
+    )
+    .await
+    .unwrap();
+    control_protocol::write_frame(
+        &mut first,
+        &ControlBody::Initialize {
+            request: serde_json::json!({"protocolVersion": 1}),
+        },
+    )
+    .await
+    .unwrap();
+    assert!(matches!(
+        read_typed_control(&mut first).await,
+        ControlBody::Initialized { .. }
+    ));
+    control_protocol::write_frame(
+        &mut first,
+        &ControlBody::EstablishSession {
+            method: "session/new".into(),
+            request: serde_json::json!({
+                "cwd": std::env::temp_dir(),
+                "mcpServers": [],
+            }),
+        },
+    )
+    .await
+    .unwrap();
+    let acp_session_id = match read_typed_control(&mut first).await {
+        ControlBody::SessionReady { acp_session_id, .. } => acp_session_id,
+        frame => panic!("expected SessionReady, got {frame:?}"),
+    };
+    assert!(matches!(
+        control_protocol::read_frame(&mut first).await.unwrap(),
+        Some(ControlBody::Notify { method, .. }) if method == "_aoe/session_replayed"
+    ));
+    control_protocol::write_frame(
+        &mut first,
+        &ControlBody::Prompt {
+            request: serde_json::json!({
+                "sessionId": acp_session_id,
+                "prompt": [{"type": "text", "text": "MAX_TOKENS detached completion"}],
+            }),
+        },
+    )
+    .await
+    .unwrap();
+    assert!(matches!(
+        control_protocol::read_frame(&mut first).await.unwrap(),
+        Some(ControlBody::PromptStarted { .. })
+    ));
+    assert!(matches!(
+        control_protocol::read_frame(&mut first).await.unwrap(),
+        Some(ControlBody::Notify { .. })
+    ));
+    drop(first);
+    std::fs::write(&completion_release, b"release").expect("release completion after detach");
+
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while std::fs::read(&completed).ok().as_deref() != Some(b"queued") {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("runner queued detached completion before reattachment");
+    let mut resumed = AcpClient::attach(
+        socket_path.clone(),
         std::env::temp_dir(),
         vec![],
-        preseed.into(),
-        false, // not in flight; this is a fresh round-trip
-        AcpSessionId("roundtrip".into()),
+        acp_session_id.clone(),
+        in_flight_turn,
+        AcpSessionId(session.into()),
         None,
         "claude".into(),
         None,
     )
     .await
-    .expect("attach to bridge");
+    .expect("resume after detached completion");
+    let reason =
+        drain_for_stopped_reason(&mut resumed, Instant::now() + Duration::from_millis(1200)).await;
+    resumed.shutdown().await.expect("shutdown resumed client");
+    let closed = tokio::time::timeout(Duration::from_secs(3), async {
+        while resumed.next_event().await.is_some() {}
+    })
+    .await;
+    assert!(closed.is_ok(), "resumed client detached cleanly");
 
-    client
-        .send_prompt("hello over socket", &[])
-        .await
-        .expect("send_prompt");
+    let reopened = AcpClient::attach(
+        socket_path,
+        std::env::temp_dir(),
+        vec![],
+        acp_session_id,
+        false,
+        AcpSessionId(session.into()),
+        None,
+        "claude".into(),
+        None,
+    )
+    .await
+    .expect("runner accepts a new daemon after clean shutdown");
+    reopened.shutdown().await.expect("shutdown reopened client");
+    reason
+}
 
-    let deadline = Instant::now() + Duration::from_secs(10);
-    let mut saw_received = false;
-    let mut saw_stopped = false;
-    while Instant::now() < deadline && !(saw_received && saw_stopped) {
-        match tokio::time::timeout(Duration::from_millis(200), client.next_event()).await {
-            Ok(Some(Event::AgentMessageChunk { text })) => {
-                if text.contains("received: hello over socket") {
-                    saw_received = true;
-                }
-            }
-            Ok(Some(Event::Stopped { .. })) => {
-                saw_stopped = true;
-            }
-            Ok(Some(_)) => continue,
-            Ok(None) => break,
-            Err(_) => continue,
-        }
+#[tokio::test]
+#[serial_test::parallel]
+async fn cached_completion_obeys_durable_in_flight_state_on_attach() {
+    if let Err(reason) = shim_ready() {
+        eprintln!("skipping: {reason}");
+        return;
     }
-    let _ = client.shutdown().await;
 
-    assert!(
-        saw_received,
-        "shim should echo received: hello over socket via the socket transport"
+    let adopted = replay_completion_after_disconnect("cached-completion-live", true).await;
+    assert_eq!(
+        adopted.as_deref(),
+        Some("max_tokens"),
+        "an adopted turn must surface the runner's cached native completion"
     );
-    assert!(saw_stopped, "shim should emit Stopped at end of turn");
+
+    let durable = replay_completion_after_disconnect("cached-completion-durable", false).await;
+    assert!(
+        durable.is_none(),
+        "an already-durable terminal must suppress the stale cached completion, got {durable:?}"
+    );
 }

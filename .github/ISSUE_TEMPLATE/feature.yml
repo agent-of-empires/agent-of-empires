@@ -1,0 +1,15 @@
+name: Feature
+description: Suggest an improvement
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: What problem does this solve?
+    validations:
+      required: true
+  - type: input
+    id: ai
+    attributes:
+      label: AI usage
+      placeholder: "None, or which parts are AI-written"

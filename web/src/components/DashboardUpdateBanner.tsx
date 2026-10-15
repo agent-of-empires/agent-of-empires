@@ -6,16 +6,7 @@ import { currentWebBuildId, isWebUpdateAvailable } from "../lib/webBuildId";
 // fires several when a PWA resumes); one /api/about per window is plenty.
 const CHECK_THROTTLE_MS = 30_000;
 
-/**
- * "Dashboard updated, reload" banner. The aoe binary embeds the web
- * bundle, so updating the binary swaps the assets under every connected
- * client; a long-lived page (especially an installed PWA, which has no
- * refresh affordance on iOS) keeps running the old code until reloaded.
- * Compares this page's own entry-bundle hash against the server's
- * `web_build_id` on mount, whenever the tab becomes visible or comes
- * back online, and immediately when a lazy chunk fails to load
- * (`vite:preloadError`, the classic stale-deploy signature).
- */
+/** "Dashboard updated, reload" banner. */
 export function DashboardUpdateBanner() {
   const [updateAvailable, setUpdateAvailable] = useState(false);
   const lastCheckRef = useRef(0);
@@ -41,9 +32,8 @@ export function DashboardUpdateBanner() {
       if (document.visibilityState === "visible") void check(false);
     };
     const onOnline = () => void check(false);
-    // A failed dynamic import means the chunk this page wants no longer
-    // exists on the server: the bundle changed underneath us. Surface
-    // the banner without waiting for the next visibility flip.
+    // A failed dynamic import means the chunk this page wants no longer exists on the server: the bundle changed
+    // underneath us.
     const onPreloadError = () => void check(true);
 
     void check(true);

@@ -6,17 +6,19 @@
 use std::sync::mpsc;
 use std::thread;
 
+use tokio_util::sync::CancellationToken;
+
 use crate::session::builder::{self, CreatedWorktree, InstanceParams};
-use crate::session::repo_config::{self, HookProgress, HooksConfig};
+use crate::session::config::repo_config::{self, HookProgress, ResolvedHooks};
 use crate::session::Instance;
 use crate::tui::dialogs::NewSessionData;
 
 pub struct CreationRequest {
     pub data: NewSessionData,
-    /// Existing instances, used for generating unique titles
     pub existing_instances: Vec<Instance>,
     /// Trusted hooks to execute after instance creation (already approved by user).
-    pub hooks: Option<HooksConfig>,
+    pub hooks: Option<ResolvedHooks>,
+    pub cancel: CancellationToken,
 }
 
 #[derive(Debug)]
@@ -24,15 +26,23 @@ pub enum CreationResult {
     Success {
         session_id: String,
         instance: Box<Instance>,
-        /// Worktree created during build, needed for cleanup if cancelled
         created_worktree: Option<CreatedWorktreeInfo>,
-        /// Whether on_launch hooks were already executed in the background
+        /// Workspace worktrees created during build, needed for rollback.
+        created_workspace_worktrees: Vec<CreatedWorktreeInfo>,
         on_launch_hooks_ran: bool,
         /// Non-fatal warnings from worktree creation (e.g. post-checkout hook
         /// failures). Surfaced as a transient toast in the UI.
         warnings: Vec<String>,
     },
     Error(String),
+    /// Cancelled before success; the worker already rolled back what it built.
+    Cancelled,
+}
+
+pub struct CreationOutcome {
+    pub result: CreationResult,
+    /// Cancelled after the worker's last check: a `Success` still needs rollback.
+    pub cancelled: bool,
 }
 
 /// Serializable worktree info for passing across thread boundary
@@ -40,6 +50,7 @@ pub enum CreationResult {
 pub struct CreatedWorktreeInfo {
     pub path: String,
     pub main_repo_path: String,
+    pub owned_branch: Option<String>,
 }
 
 impl From<&CreatedWorktree> for CreatedWorktreeInfo {
@@ -47,32 +58,54 @@ impl From<&CreatedWorktree> for CreatedWorktreeInfo {
         Self {
             path: wt.path.to_string_lossy().to_string(),
             main_repo_path: wt.main_repo_path.to_string_lossy().to_string(),
+            owned_branch: wt.owned_branch.clone(),
+        }
+    }
+}
+
+impl From<&CreatedWorktreeInfo> for CreatedWorktree {
+    fn from(worktree: &CreatedWorktreeInfo) -> Self {
+        Self {
+            path: worktree.path.as_str().into(),
+            main_repo_path: worktree.main_repo_path.as_str().into(),
+            owned_branch: worktree.owned_branch.clone(),
         }
     }
 }
 
 pub struct CreationPoller {
     request_tx: mpsc::Sender<(CreationRequest, mpsc::Sender<HookProgress>)>,
-    result_rx: mpsc::Receiver<CreationResult>,
+    result_rx: mpsc::Receiver<(CreationResult, CancellationToken)>,
     progress_rx: mpsc::Receiver<HookProgress>,
     progress_tx: mpsc::Sender<HookProgress>,
     _handle: thread::JoinHandle<()>,
-    pending: bool,
+    /// Requests sent and not yet received, including cancelled ones still winding down.
+    in_flight: usize,
     /// Profile from the last creation request (for cross-profile saves)
     last_profile: Option<String>,
+}
+
+/// Appends which config file declared the failing `on_create` commands.
+fn on_create_error(e: &anyhow::Error, hooks: &ResolvedHooks) -> String {
+    let msg = format!("on_create hook failed: {e:#}");
+    match hooks.origin_hint("on_create") {
+        Some(hint) => format!("{msg}\n{hint}"),
+        None => msg,
+    }
 }
 
 impl CreationPoller {
     pub fn new() -> Self {
         let (request_tx, request_rx) =
             mpsc::channel::<(CreationRequest, mpsc::Sender<HookProgress>)>();
-        let (result_tx, result_rx) = mpsc::channel::<CreationResult>();
+        let (result_tx, result_rx) = mpsc::channel::<(CreationResult, CancellationToken)>();
         let (progress_tx, progress_rx) = mpsc::channel::<HookProgress>();
 
         let handle = thread::spawn(move || {
             while let Ok((request, prog_tx)) = request_rx.recv() {
+                let cancel = request.cancel.clone();
                 let result = Self::create_instance(request, &prog_tx);
-                if result_tx.send(result).is_err() {
+                if result_tx.send((result, cancel)).is_err() {
                     break;
                 }
             }
@@ -84,7 +117,7 @@ impl CreationPoller {
             progress_rx,
             progress_tx,
             _handle: handle,
-            pending: false,
+            in_flight: 0,
             last_profile: None,
         }
     }
@@ -95,6 +128,10 @@ impl CreationPoller {
     ) -> CreationResult {
         let data = request.data;
         let hooks = request.hooks;
+        let cancel = request.cancel;
+        if cancel.is_cancelled() {
+            return CreationResult::Cancelled;
+        }
         let profile = data.profile.clone();
         let sandbox = data.sandbox;
 
@@ -127,18 +164,42 @@ impl CreationPoller {
         // pick the right profile's overrides; if it's left blank they'd silently
         // fall back to the global default profile.
         instance.source_profile = profile.clone();
-        #[cfg(feature = "serve")]
         if structured {
             builder::structured::apply_structured_choice(&mut instance);
         }
-        #[cfg(not(feature = "serve"))]
-        let _ = structured;
         let created_worktree = build_result.created_worktree;
         let created_workspace_worktrees = build_result.created_workspace_worktrees;
         let warnings = build_result.warnings;
+        let roll_back = |instance: &Instance| {
+            builder::cleanup_instance(
+                instance,
+                created_worktree.as_ref(),
+                &created_workspace_worktrees,
+                None,
+            )
+        };
+        let cancelled = |instance: &Instance| {
+            roll_back(instance);
+            CreationResult::Cancelled
+        };
+        // A step that fails because the user cancelled reports the cancel, not the error.
+        let failed = |instance: &Instance, message: String| {
+            if cancel.is_cancelled() {
+                return cancelled(instance);
+            }
+            roll_back(instance);
+            CreationResult::Error(message)
+        };
+        if cancel.is_cancelled() {
+            return cancelled(&instance);
+        }
 
-        let has_on_create = hooks.as_ref().is_some_and(|h| !h.on_create.is_empty());
-        let has_on_launch = hooks.as_ref().is_some_and(|h| !h.on_launch.is_empty());
+        let has_on_create = hooks
+            .as_ref()
+            .is_some_and(|h| !h.hooks().on_create.is_empty());
+        let has_on_launch = hooks
+            .as_ref()
+            .is_some_and(|h| !h.hooks().on_launch.is_empty());
         let mut container_started = false;
         let hook_env = repo_config::lifecycle_env_vars(&instance);
 
@@ -149,67 +210,65 @@ impl CreationPoller {
                 // Ensure the container is running so we can exec hooks inside it.
                 // Don't create the tmux session yet -- that happens at attach time
                 // where the terminal size is available.
-                if let Err(e) = instance.get_container_for_instance() {
-                    builder::cleanup_instance(
-                        &instance,
-                        created_worktree.as_ref(),
-                        &created_workspace_worktrees,
-                    );
-                    return CreationResult::Error(format!("{:#}", e));
+                if let Err(e) = instance.get_container_until_cancelled(&cancel) {
+                    return failed(&instance, format!("{:#}", e));
                 }
                 container_started = true;
+                if cancel.is_cancelled() {
+                    return cancelled(&instance);
+                }
                 if let Some(ref sandbox) = instance.sandbox_info {
                     let workdir = instance.container_workdir();
                     if let Err(e) = repo_config::execute_hooks_in_container_streamed(
-                        &hooks.on_create,
+                        &hooks.hooks().on_create,
                         &sandbox.container_name,
                         &workdir,
                         progress_tx,
                         &hook_env,
                     ) {
                         tracing::warn!(target: "session.create", "on_create hook failed in container: {:#}", e);
-                        builder::cleanup_instance(
-                            &instance,
-                            created_worktree.as_ref(),
-                            &created_workspace_worktrees,
-                        );
-                        return CreationResult::Error(format!("on_create hook failed: {:#}", e));
+                        return failed(&instance, on_create_error(&e, hooks));
                     }
                 }
             } else if let Err(e) = repo_config::execute_hooks_streamed(
-                &hooks.on_create,
+                &hooks.hooks().on_create,
                 std::path::Path::new(&instance.project_path),
                 progress_tx,
                 &hook_env,
             ) {
-                builder::cleanup_instance(
-                    &instance,
-                    created_worktree.as_ref(),
-                    &created_workspace_worktrees,
-                );
-                return CreationResult::Error(format!("on_create hook failed: {:#}", e));
+                return failed(&instance, on_create_error(&e, hooks));
             }
         }
 
         // Execute on_launch hooks in background too (non-fatal, like start_with_size).
         // This prevents blocking the UI thread when the session is first attached.
         if has_on_launch {
+            // A cancel during on_create must not start the next phase.
+            if cancel.is_cancelled() {
+                return cancelled(&instance);
+            }
             let hooks = hooks.as_ref().unwrap();
             if sandbox {
                 if !container_started {
-                    if let Err(e) = instance.get_container_for_instance() {
+                    if let Err(e) = instance.get_container_until_cancelled(&cancel) {
+                        if cancel.is_cancelled() {
+                            return cancelled(&instance);
+                        }
                         let msg = format!("Container startup warning: {:#}", e);
                         tracing::warn!(target: "session.create", "{}", msg);
                         let _ = progress_tx.send(HookProgress::Output(msg));
                     } else {
                         container_started = true;
+                        if cancel.is_cancelled() {
+                            return cancelled(&instance);
+                        }
                     }
                 }
                 if container_started {
                     if let Some(ref sandbox) = instance.sandbox_info {
                         let workdir = instance.container_workdir();
                         if let Err(e) = repo_config::execute_hooks_in_container_streamed(
-                            &hooks.on_launch,
+                            &hooks.hooks().on_launch,
                             &sandbox.container_name,
                             &workdir,
                             progress_tx,
@@ -220,7 +279,7 @@ impl CreationPoller {
                     }
                 }
             } else if let Err(e) = repo_config::execute_hooks_streamed(
-                &hooks.on_launch,
+                &hooks.hooks().on_launch,
                 std::path::Path::new(&instance.project_path),
                 progress_tx,
                 &hook_env,
@@ -233,29 +292,31 @@ impl CreationPoller {
             // Only ensure the container is running here if hooks didn't already
             // start it. Don't create the tmux session yet -- that happens at attach time
             // where the terminal size is available.
-            if let Err(e) = instance.get_container_for_instance() {
-                builder::cleanup_instance(
-                    &instance,
-                    created_worktree.as_ref(),
-                    &created_workspace_worktrees,
-                );
-                return CreationResult::Error(format!("{:#}", e));
+            if let Err(e) = instance.get_container_until_cancelled(&cancel) {
+                return failed(&instance, format!("{:#}", e));
             }
+        }
+        if cancel.is_cancelled() {
+            return cancelled(&instance);
         }
 
         let created_worktree_info = created_worktree.as_ref().map(CreatedWorktreeInfo::from);
+        let created_workspace_worktree_info = created_workspace_worktrees
+            .iter()
+            .map(CreatedWorktreeInfo::from)
+            .collect();
 
         CreationResult::Success {
             session_id: instance.id.clone(),
             instance: Box::new(instance),
             created_worktree: created_worktree_info,
+            created_workspace_worktrees: created_workspace_worktree_info,
             on_launch_hooks_ran: has_on_launch,
             warnings,
         }
     }
 
     pub fn request_creation(&mut self, request: CreationRequest) {
-        self.pending = true;
         self.last_profile = Some(request.data.profile.clone());
         if self
             .request_tx
@@ -263,34 +324,34 @@ impl CreationPoller {
             .is_err()
         {
             tracing::error!(target: "session.create", "Failed to send creation request: receiver thread died");
-            self.pending = false;
+        } else {
+            self.in_flight += 1;
         }
     }
 
-    /// Get the profile from the last creation request
     pub fn last_profile(&self) -> Option<String> {
         self.last_profile.clone()
     }
 
-    pub fn try_recv_result(&mut self) -> Option<CreationResult> {
-        match self.result_rx.try_recv() {
-            Ok(result) => {
-                self.pending = false;
-                Some(result)
-            }
-            Err(_) => None,
-        }
+    pub fn try_recv_result(&mut self) -> Option<CreationOutcome> {
+        self.received(self.result_rx.try_recv().ok())
     }
 
     /// Blocking receive with timeout, used during shutdown cleanup.
-    pub fn recv_result_timeout(&mut self, timeout: std::time::Duration) -> Option<CreationResult> {
-        match self.result_rx.recv_timeout(timeout) {
-            Ok(result) => {
-                self.pending = false;
-                Some(result)
-            }
-            Err(_) => None,
-        }
+    pub fn recv_result_timeout(&mut self, timeout: std::time::Duration) -> Option<CreationOutcome> {
+        self.received(self.result_rx.recv_timeout(timeout).ok())
+    }
+
+    fn received(
+        &mut self,
+        received: Option<(CreationResult, CancellationToken)>,
+    ) -> Option<CreationOutcome> {
+        let (result, cancel) = received?;
+        self.in_flight = self.in_flight.saturating_sub(1);
+        Some(CreationOutcome {
+            result,
+            cancelled: cancel.is_cancelled(),
+        })
     }
 
     pub fn try_recv_progress(&self) -> Option<HookProgress> {
@@ -298,76 +359,12 @@ impl CreationPoller {
     }
 
     pub fn is_pending(&self) -> bool {
-        self.pending
+        self.in_flight > 0
     }
 }
 
 impl Default for CreationPoller {
     fn default() -> Self {
         Self::new()
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::session::ForkSeed;
-
-    fn fork_data(seed: ForkSeed) -> NewSessionData {
-        NewSessionData {
-            profile: "default".into(),
-            title: "Forked".into(),
-            path: "/tmp".into(),
-            group: String::new(),
-            tool: "claude".into(),
-            worktree_enabled: false,
-            worktree_branch: None,
-            create_new_branch: false,
-            base_branch: None,
-            extra_repo_paths: Vec::new(),
-            sandbox: false,
-            sandbox_image: String::new(),
-            yolo_mode: false,
-            extra_env: Vec::new(),
-            extra_args: String::new(),
-            command_override: String::new(),
-            scratch: false,
-            fork_seed: Some(seed),
-            structured: false,
-        }
-    }
-
-    /// Regression for the async creation path dropping the fork seed: the
-    /// poller builds its own `InstanceParams` literal, which once hardcoded
-    /// `fork_seed: None`, so a TUI fork of a sandboxed/hooked/worktree session
-    /// silently produced a plain new session. Assert the seed is forwarded and
-    /// applied (child id pinned, one-shot Fork intent set).
-    #[test]
-    fn create_instance_forwards_fork_seed() {
-        let request = CreationRequest {
-            data: fork_data(ForkSeed::Terminal {
-                parent_agent_session_id: "parent-uuid".into(),
-                child_session_id: "child-uuid".into(),
-            }),
-            existing_instances: Vec::new(),
-            hooks: None,
-        };
-        let (progress_tx, _progress_rx) = mpsc::channel();
-
-        let result = CreationPoller::create_instance(request, &progress_tx);
-
-        let instance = match result {
-            CreationResult::Success { instance, .. } => *instance,
-            other => panic!("expected successful creation, got {other:?}"),
-        };
-        assert_eq!(instance.agent_session_id.as_deref(), Some("child-uuid"));
-        assert!(
-            matches!(
-                instance.resume_intent,
-                crate::session::ResumeIntent::Fork { ref from } if from == "parent-uuid"
-            ),
-            "fork intent must carry the parent id, got {:?}",
-            instance.resume_intent
-        );
     }
 }

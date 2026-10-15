@@ -1,104 +1,30 @@
 # Sound Effects
 
-Agent of Empires plays sound effects when agent sessions change state (start, running, waiting, idle, error). The structured view also plays a browser-side chime when a pending approval lands.
-
-## Quick Start
-
-1. Install sounds:
-   ```bash
-   aoe sounds install
-   ```
-   This downloads CC0 (public domain) fantasy/RPG sounds to your config directory. Requires internet for the initial download.
-2. Enable sounds: launch `aoe`, press `s` for Settings, select the Sound category, enable sounds.
-3. Start an agent session and listen for the transition sounds.
-
-## Available Sounds
-
-`aoe sounds install` ships ~10 CC0 RPG sound effects (from the [80 CC0 RPG SFX](https://opengameart.org/content/80-cc0-rpg-sfx) pack by SubspaceAudio) into:
-
-- Linux: `~/.config/agent-of-empires/sounds/`
-- macOS: `~/.agent-of-empires/sounds/`
-
-Defaults cover `start`, `running`, `waiting`, `idle`, and `error`, plus extra variety sounds. Add your own `.wav`/`.ogg` files to the same directory.
-
-### Useful Commands
+AoE can play a sound when a session changes state (start, running, waiting, idle, error). The structured view also plays a browser-side chime when a pending approval or question lands.
 
 ```bash
-aoe sounds list          # check installed sounds
-aoe sounds test start    # test a sound
+aoe sounds install       # download the CC0 pack into your config dir
+aoe sounds list
+aoe sounds test start
 ```
 
-## Sound Selection
-
-Each transition plays its configured per-transition override when one is set; transitions without an override pick a random sound from your sounds directory. To hear one signature sound everywhere, set the same file on every per-transition override.
-
-## Configuration
-
-Configure via the TUI (press `s`, select Sound), or edit TOML directly. Toggle the scope to "Profile" (top-right in Settings) to override per profile.
-
-- Enabled: turn sounds on/off
-- Per-transition overrides: set a specific sound for each state; states without an override play a random sound from the available files
-
-**Global**: `~/.config/agent-of-empires/config.toml` (Linux) or `~/.agent-of-empires/config.toml` (macOS)
+The install downloads about ten CC0 RPG effects from the [80 CC0 RPG SFX](https://opengameart.org/content/80-cc0-rpg-sfx) pack by SubspaceAudio into `~/.config/agent-of-empires/sounds/` (Linux) or `~/.agent-of-empires/sounds/` (macOS). Then enable sounds in the TUI settings (`s`, Sound category) or in `config.toml`:
 
 ```toml
 [sound]
 enabled = true
-on_error = "error"          # specific sound for errors; unset states play a random sound
-on_approval = "approval"    # structured view only; browser-side chime for approvals and questions
+on_error = "error"        # unset transitions play a random sound
+on_approval = "approval"  # structured view only; plays in the browser
 ```
 
-**Profile**: `~/.config/agent-of-empires/profiles/<profile>/config.toml`
+Each transition plays its per-transition override when one is set, and a random sound from your sounds directory otherwise, so setting the same file on every transition gives you one signature sound. Add your own `.wav` or `.ogg` files to the sounds directory and reference them by filename without the extension. A profile's `[sound]` section overrides the global one.
 
-```toml
-[sound]
-enabled = true
-on_start = "spell"
-on_running = "metal"
-on_error = "error"
-```
+## Playback
 
-## Custom Sounds
+Status sounds play on the **host** running the session, through `afplay` on macOS and `aplay` or `paplay` on Linux (`apt install alsa-utils pulseaudio-utils`). Audio does not work over SSH.
 
-Add `.wav` or `.ogg` files to `~/.config/agent-of-empires/sounds/`, then reference them by filename without extension:
+`on_approval` is the exception: it plays in the **browser** where the dashboard is open, since `aoe serve` often runs on a remote box. Browsers enforce an autoplay policy, so the first one after a page load may stay silent until you interact with the tab; the push notification still fires.
 
-```bash
-cp ~/Downloads/wololo.wav ~/.config/agent-of-empires/sounds/
-# Then in settings, set "On Start" to "wololo"
-```
+If nothing plays, check that the files exist and are readable with a `.wav` or `.ogg` extension, that sounds are enabled in Settings, and that the player works directly (`aplay ~/.config/agent-of-empires/sounds/start.wav`). Restart the TUI to refresh the sound list, and check `aoe logs` with `AGENT_OF_EMPIRES_DEBUG=1`.
 
-## Audio Playback
-
-Status transition sounds play on the **server host** using platform-native players:
-
-- **macOS**: `afplay`
-- **Linux**: `aplay` (ALSA) or `paplay` (PulseAudio)
-
-The `on_approval` sound is the exception: it plays in the **browser** where the dashboard is open, not on the host, and covers both tool approvals and `AskUserQuestion` questions. Browsers enforce an autoplay policy, so the first one after a fresh page load may stay silent until you interact with the structured view tab; the OS push notification still surfaces it.
-
-If sounds don't play, ensure audio tools are installed:
-
-```bash
-# Debian/Ubuntu
-sudo apt install alsa-utils pulseaudio-utils
-
-# Arch Linux
-sudo pacman -S alsa-utils pulseaudio
-```
-
-## Troubleshooting
-
-**Sounds not playing?**
-- **SSH session**: audio doesn't work over SSH; you need a local terminal with speakers/headphones.
-- Check that sound files exist in `~/.config/agent-of-empires/sounds/`.
-- Verify sounds are enabled in Settings.
-- Test audio directly: `aplay ~/.config/agent-of-empires/sounds/start.wav` (Linux).
-- Check logs: `AGENT_OF_EMPIRES_DEBUG=1 aoe`, then `aoe logs`.
-
-**Custom sounds aren't listed?**
-- Ensure files have a `.wav` or `.ogg` extension and are readable.
-- Restart the TUI to refresh the sound list.
-
-## License
-
-Bundled sounds are CC0 1.0 Universal (Public Domain); no attribution required. Source: [OpenGameArt.org - 80 CC0 RPG SFX](https://opengameart.org/content/80-cc0-rpg-sfx) by SubspaceAudio.
+The bundled sounds are CC0 1.0 Universal (public domain); no attribution required.

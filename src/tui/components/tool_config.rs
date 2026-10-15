@@ -12,7 +12,7 @@ use ratatui::widgets::*;
 use tui_input::backend::crossterm::EventHandler;
 use tui_input::Input;
 
-use super::render_text_field;
+use super::{cycler::tool_lifecycle_spans, render_text_field};
 use crate::tui::styles::Theme;
 
 /// Tool-config overlay fields: command override, then extra args.
@@ -20,13 +20,31 @@ pub const TOOL_CONFIG_CMD: usize = 0;
 pub const TOOL_CONFIG_ARGS: usize = 1;
 const TOOL_CONFIG_FIELD_COUNT: usize = 2;
 
-/// Trailing spans appended to the Tool row: a dimmed `(configured)` marker
-/// when an override is set, plus the `Ctrl+P` hint while the row is focused.
-/// `has_config` is true when either the command override or extra args is
-/// non-empty.
-pub fn tool_config_suffix_spans(
+/// Trailing lifecycle and configuration spans appended to the Tool row.
+/// Lifecycle status comes first so lower-priority configuration metadata cannot
+/// clip it. The focused configuration hint is compact when a status is present.
+pub fn tool_row_suffix_spans(
+    tool: &str,
     has_config: bool,
     focused: bool,
+    theme: &Theme,
+) -> Vec<Span<'static>> {
+    let mut spans = tool_lifecycle_spans(tool, theme);
+    let compact_config = !spans.is_empty();
+    spans.extend(tool_config_suffix_spans(
+        has_config,
+        focused,
+        compact_config,
+        theme,
+    ));
+    spans
+}
+
+/// Configuration spans appended after higher-priority Tool row status.
+fn tool_config_suffix_spans(
+    has_config: bool,
+    focused: bool,
+    compact: bool,
     theme: &Theme,
 ) -> Vec<Span<'static>> {
     let mut spans = Vec::new();
@@ -38,10 +56,10 @@ pub fn tool_config_suffix_spans(
     }
     if focused {
         spans.push(Span::styled(
-            if has_config {
-                "  Ctrl+P: edit"
-            } else {
-                "  (Ctrl+P to configure)"
+            match (has_config, compact) {
+                (true, true) => " Ctrl+P",
+                (true, false) => "  Ctrl+P: edit",
+                (false, _) => "  (Ctrl+P to configure)",
             },
             Style::default().fg(theme.dimmed),
         ));
@@ -49,11 +67,8 @@ pub fn tool_config_suffix_spans(
     spans
 }
 
-/// Outcome of feeding a key to the tool-config overlay.
 pub enum ToolConfigOutcome {
-    /// The overlay stays open.
     Continue,
-    /// The overlay should close (Enter/Esc).
     Close,
 }
 
@@ -194,99 +209,43 @@ mod tests {
     }
 
     #[test]
-    fn suffix_empty_when_unconfigured_and_unfocused() {
+    fn suffix_spans_cases() {
         let theme = Theme::default();
-        assert!(tool_config_suffix_spans(false, false, &theme).is_empty());
+        // (configured, focused, compact) -> spans
+        let cases: [((bool, bool, bool), &[&str]); 5] = [
+            ((false, false, false), &[]),
+            ((false, true, false), &["  (Ctrl+P to configure)"]),
+            ((true, true, false), &["  (configured)", "  Ctrl+P: edit"]),
+            ((true, true, true), &["  (configured)", " Ctrl+P"]),
+            ((true, false, false), &["  (configured)"]),
+        ];
+        for ((configured, focused, compact), want) in cases {
+            let spans = tool_config_suffix_spans(configured, focused, compact, &theme);
+            assert_eq!(contents(&spans), want, "{configured} {focused} {compact}");
+        }
     }
 
     #[test]
-    fn suffix_shows_configure_hint_when_focused_unconfigured() {
-        let theme = Theme::default();
-        let spans = tool_config_suffix_spans(false, true, &theme);
-        assert_eq!(contents(&spans), ["  (Ctrl+P to configure)"]);
-    }
-
-    #[test]
-    fn suffix_shows_configured_and_edit_when_focused_configured() {
-        let theme = Theme::default();
-        let spans = tool_config_suffix_spans(true, true, &theme);
-        assert_eq!(contents(&spans), ["  (configured)", "  Ctrl+P: edit"]);
-    }
-
-    #[test]
-    fn suffix_shows_configured_only_when_unfocused_configured() {
-        let theme = Theme::default();
-        let spans = tool_config_suffix_spans(true, false, &theme);
-        assert_eq!(contents(&spans), ["  (configured)"]);
-    }
-
-    #[test]
-    fn key_enter_and_esc_request_close() {
-        let mut cmd = Input::default();
-        let mut args = Input::default();
-        let mut field = 0;
-        assert!(matches!(
-            handle_tool_config_key(
-                KeyEvent::from(KeyCode::Enter),
-                &mut cmd,
-                &mut args,
-                &mut field
-            ),
-            ToolConfigOutcome::Close
-        ));
-        assert!(matches!(
-            handle_tool_config_key(
-                KeyEvent::from(KeyCode::Esc),
-                &mut cmd,
-                &mut args,
-                &mut field
-            ),
-            ToolConfigOutcome::Close
-        ));
-    }
-
-    #[test]
-    fn key_tab_wraps_fields() {
-        let mut cmd = Input::default();
-        let mut args = Input::default();
-        let mut field = 0;
-        handle_tool_config_key(
-            KeyEvent::from(KeyCode::Tab),
-            &mut cmd,
-            &mut args,
-            &mut field,
-        );
-        assert_eq!(field, 1);
-        handle_tool_config_key(
-            KeyEvent::from(KeyCode::Tab),
-            &mut cmd,
-            &mut args,
-            &mut field,
-        );
-        assert_eq!(field, 0);
-    }
-
-    #[test]
-    fn key_typing_routes_to_focused_field() {
+    fn keys_close_wrap_and_route_typing() {
         let mut cmd = Input::default();
         let mut args = Input::default();
         let mut field = TOOL_CONFIG_CMD;
-        handle_tool_config_key(
-            KeyEvent::from(KeyCode::Char('z')),
-            &mut cmd,
-            &mut args,
-            &mut field,
-        );
-        assert_eq!(cmd.value(), "z");
-        assert_eq!(args.value(), "");
-
-        field = TOOL_CONFIG_ARGS;
-        handle_tool_config_key(
-            KeyEvent::from(KeyCode::Char('q')),
-            &mut cmd,
-            &mut args,
-            &mut field,
-        );
-        assert_eq!(args.value(), "q");
+        let press = |code, field: &mut usize, cmd: &mut Input, args: &mut Input| {
+            handle_tool_config_key(KeyEvent::from(code), cmd, args, field)
+        };
+        for code in [KeyCode::Enter, KeyCode::Esc] {
+            assert!(matches!(
+                press(code, &mut field, &mut cmd, &mut args),
+                ToolConfigOutcome::Close
+            ));
+        }
+        press(KeyCode::Char('z'), &mut field, &mut cmd, &mut args);
+        assert_eq!((cmd.value(), args.value()), ("z", ""));
+        press(KeyCode::Tab, &mut field, &mut cmd, &mut args);
+        assert_eq!(field, TOOL_CONFIG_ARGS);
+        press(KeyCode::Char('q'), &mut field, &mut cmd, &mut args);
+        assert_eq!((cmd.value(), args.value()), ("z", "q"));
+        press(KeyCode::Tab, &mut field, &mut cmd, &mut args);
+        assert_eq!(field, TOOL_CONFIG_CMD, "Tab wraps");
     }
 }

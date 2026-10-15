@@ -6,59 +6,65 @@ use agent_of_empires::session::{execute_hooks, HookTimeout, HookTimeoutScope};
 use serial_test::serial;
 use tempfile::TempDir;
 
+/// A hung hook under a recovery scope is killed at the deadline and reported
+/// as a typed `HookTimeout` carrying the command and deadline.
 #[test]
 #[serial]
-fn hung_on_launch_hook_times_out_and_releases_lock_within_grace() {
-    let timeout = Duration::from_millis(300);
-    let _scope = HookTimeoutScope::new(timeout);
+fn hung_on_launch_hook_times_out_with_typed_error() {
+    let _scope = HookTimeoutScope::new(Duration::from_secs(1));
 
     let project = TempDir::new().expect("tempdir");
     let started = Instant::now();
     let result = execute_hooks(&["sleep 60".to_string()], project.path(), &[]);
     let elapsed = started.elapsed();
 
-    assert!(result.is_err(), "expected timeout Err, got {:?}", result);
-    let err_msg = format!("{:#}", result.unwrap_err());
+    let err = result.expect_err("sleep 60 must time out under a 1s scope");
+    assert!(format!("{err:#}").contains("timed out"), "got: {err:#}");
+    let typed = err
+        .chain()
+        .find_map(|c| c.downcast_ref::<HookTimeout>())
+        .unwrap_or_else(|| panic!("expected HookTimeout in chain, got: {err:#}"));
+    assert_eq!(typed.cmd, "sleep 60");
+    assert_eq!(typed.timeout_secs, 1);
     assert!(
-        err_msg.contains("timed out"),
-        "expected timeout-shaped error, got: {}",
-        err_msg
-    );
-    assert!(
-        elapsed < Duration::from_secs(3),
-        "expected timeout to fire within 3s (300ms deadline + kill grace + slow CI cushion), took {:?}",
-        elapsed
-    );
-}
-
-#[test]
-#[serial]
-fn fast_on_launch_hook_succeeds_inside_timeout_scope() {
-    let _scope = HookTimeoutScope::new(Duration::from_secs(5));
-
-    let project = TempDir::new().expect("tempdir");
-    let started = Instant::now();
-    let result = execute_hooks(&["true".to_string()], project.path(), &[]);
-    let elapsed = started.elapsed();
-
-    assert!(result.is_ok(), "fast hook should succeed, got {:?}", result);
-    assert!(
-        elapsed < Duration::from_secs(1),
-        "fast hook should complete promptly, took {:?}",
-        elapsed
+        elapsed < Duration::from_secs(4),
+        "timeout must fire near the 1s deadline (plus kill grace and CI cushion), took {elapsed:?}"
     );
 }
 
+/// Hooks that finish on their own behave the same with or without a scope:
+/// success stays success, stdin is closed so `cat` cannot block, and a
+/// non-zero exit is an ordinary failure rather than a `HookTimeout`.
 #[test]
 #[serial]
-fn no_scope_means_no_timeout_for_non_recovery_callers() {
-    let project = TempDir::new().expect("tempdir");
-    let result = execute_hooks(&["true".to_string()], project.path(), &[]);
-    assert!(
-        result.is_ok(),
-        "no-scope path must remain unchanged, got {:?}",
-        result
-    );
+fn completing_hooks_are_unaffected_by_the_timeout_scope() {
+    // (scope, command, succeeds, bound on elapsed)
+    let cases = [
+        (None, "true", true, Duration::from_secs(1)),
+        (Some(5), "true", true, Duration::from_secs(1)),
+        (Some(2), "cat", true, Duration::from_millis(500)),
+        (Some(5), "false", false, Duration::from_secs(1)),
+    ];
+    for (scope, cmd, succeeds, bound) in cases {
+        let _scope = scope.map(|secs| HookTimeoutScope::new(Duration::from_secs(secs)));
+        let project = TempDir::new().expect("tempdir");
+        let started = Instant::now();
+        let result = execute_hooks(&[cmd.to_string()], project.path(), &[]);
+        let elapsed = started.elapsed();
+
+        assert!(elapsed < bound, "{cmd} under {scope:?} took {elapsed:?}");
+        match result {
+            Ok(()) => assert!(succeeds, "{cmd} under {scope:?} must fail"),
+            Err(err) => {
+                assert!(!succeeds, "{cmd} under {scope:?}: {err:#}");
+                assert!(
+                    err.chain()
+                        .all(|c| c.downcast_ref::<HookTimeout>().is_none()),
+                    "a non-zero exit must not surface as HookTimeout: {err:#}"
+                );
+            }
+        }
+    }
 }
 
 #[test]
@@ -102,65 +108,4 @@ fn nested_scopes_restore_outer_timeout_on_drop() {
         elapsed
     );
     drop(outer_scope);
-}
-
-#[test]
-#[serial]
-fn hook_reading_stdin_does_not_block_under_timeout_scope() {
-    let _scope = HookTimeoutScope::new(Duration::from_secs(2));
-
-    let project = TempDir::new().expect("tempdir");
-    let started = Instant::now();
-    let result = execute_hooks(&["cat".to_string()], project.path(), &[]);
-    let elapsed = started.elapsed();
-    assert!(
-        result.is_ok(),
-        "cat must EOF on null stdin and succeed, got {:?}",
-        result
-    );
-    assert!(
-        elapsed < Duration::from_millis(500),
-        "cat must not block on stdin, took {:?}",
-        elapsed
-    );
-}
-
-#[test]
-#[serial]
-fn hung_on_launch_hook_emits_typed_hook_timeout_in_error_chain() {
-    let timeout = Duration::from_secs(1);
-    let _scope = HookTimeoutScope::new(timeout);
-
-    let project = TempDir::new().expect("tempdir");
-    let result = execute_hooks(&["sleep 60".to_string()], project.path(), &[]);
-
-    let err = result.expect_err("sleep 60 must time out under a 1s scope");
-    let typed = err
-        .chain()
-        .find_map(|c| c.downcast_ref::<HookTimeout>())
-        .unwrap_or_else(|| panic!("expected HookTimeout in chain, got: {err:#}"));
-    assert_eq!(
-        typed.cmd, "sleep 60",
-        "typed error must carry the offending command verbatim",
-    );
-    assert_eq!(
-        typed.timeout_secs, 1,
-        "typed error must carry the deadline in seconds",
-    );
-}
-
-#[test]
-#[serial]
-fn nonzero_exit_under_scope_is_not_classified_as_hook_timeout() {
-    let _scope = HookTimeoutScope::new(Duration::from_secs(5));
-
-    let project = TempDir::new().expect("tempdir");
-    let result = execute_hooks(&["false".to_string()], project.path(), &[]);
-
-    let err = result.expect_err("`false` exits non-zero, run_hooks_captured must Err");
-    assert!(
-        err.chain()
-            .all(|c| c.downcast_ref::<HookTimeout>().is_none()),
-        "exit-non-zero under a recovery scope must NOT surface as HookTimeout; got: {err:#}",
-    );
 }

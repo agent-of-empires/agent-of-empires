@@ -1,13 +1,4 @@
-// Long-press gesture tolerance for sidebar session rows.
-//
-// A finger never holds perfectly still during a long-press. Cancelling the
-// pending long-press on any movement (the old behavior) meant the rename/delete
-// menu only opened when you pressed unnaturally precisely; otherwise Android's
-// slop-tolerant native link menu won the gesture instead (#2232). We only treat
-// the press as cancelled once movement exceeds this slop, the same 8px the
-// dnd-kit TouchSensor uses for its reorder activation tolerance, so a normal
-// jittery hold still arms the menu while a deliberate drag (scroll/reorder)
-// still cancels it.
+// Movement allowed before a long-press cancels, matching dnd-kit's TouchSensor, so a jittery hold still opens the menu.
 export const LONG_PRESS_SLOP_PX = 8;
 
 export function exceedsTouchSlop(

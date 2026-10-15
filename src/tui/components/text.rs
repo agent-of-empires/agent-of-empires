@@ -1,48 +1,295 @@
 //! Small shared text helpers for TUI rendering.
 
-/// Truncate `text` to `max_width` display cells, appending `…` if
-/// anything was dropped. Width-aware (wide glyphs count their real cell
-/// width), so a truncated string never paints past its budget. Returns
-/// "" when `max_width` is 0 (the text gets sacrificed entirely so
-/// whatever fixed content it competes with wins).
-pub fn truncate_to_width(text: &str, max_width: usize) -> String {
+/// One rendered row resolved into display columns, measured from the line's own
+/// graphemes. Reading a scratch buffer back is wrong: `Buffer::set_line` resets
+/// the continuation cell of a wide grapheme and `Cell::symbol()` answers `" "`
+/// for it, so every wide grapheme would gain a phantom space.
+pub(crate) struct LineColumns {
+    /// The row's visible text, concatenated left to right.
+    pub(crate) text: String,
+    /// Column each byte of `text` belongs to, plus a trailing entry for the
+    /// end of the row. A continuation cell contributes no byte, which is what
+    /// makes an exclusive end offset resolve past both halves of a wide
+    /// grapheme.
+    column_of: Vec<u16>,
+    /// Whether source text was dropped because it did not fit `width`. A run
+    /// ending at the retained boundary may be a prefix of something longer, so
+    /// anything inferred from the text alone has to refuse it.
+    clipped: bool,
+}
+
+impl LineColumns {
+    /// Column holding the grapheme that starts at `byte`. `byte` must be a
+    /// char boundary of `text` or its length.
+    pub(crate) fn column_at(&self, byte: usize) -> u16 {
+        self.column_of
+            .get(byte)
+            .copied()
+            .unwrap_or_else(|| self.column_of.last().copied().unwrap_or(0))
+    }
+
+    /// Whether the row was cut short of `width`, so its last run may be a
+    /// prefix rather than the whole of what the pane holds.
+    pub(crate) fn is_clipped(&self) -> bool {
+        self.clipped
+    }
+
+    /// The text painted between `from` and `to_excl` display columns.
+    pub(crate) fn slice(&self, from: u16, to_excl: u16) -> String {
+        let mut out = String::new();
+        for (offset, ch) in self.text.char_indices() {
+            let col = self.column_at(offset);
+            if col >= from && col < to_excl {
+                out.push(ch);
+            }
+        }
+        out
+    }
+}
+
+/// Resolve `line` into display columns at `width`.
+pub(crate) fn line_columns(line: &ratatui::text::Line, width: u16) -> LineColumns {
+    use ratatui::buffer::CellWidth;
     use unicode_segmentation::UnicodeSegmentation;
-    use unicode_width::UnicodeWidthStr;
-    if max_width == 0 {
-        return String::new();
-    }
-    if UnicodeWidthStr::width(text) <= max_width {
-        return text.to_string();
-    }
-    // Reserve one cell for the ellipsis.
-    let budget = max_width.saturating_sub(1);
-    let mut out = String::new();
-    // Step by grapheme cluster, and measure the accumulated prefix rather than
-    // summing per-piece widths. Both matter, for different reasons.
-    //
-    // Clusters, because a `char` is not a display unit: cutting mid-cluster
-    // leaves a dangling combining mark ("क्" out of "क्ष") or strips a VS16 so
-    // the base glyph flips from emoji to text presentation.
-    //
-    // Accumulated measurement, because `UnicodeWidthStr::width` resolves those
-    // clusters, so "\u{26a0}\u{fe0f}" is 2 cells while its chars sum to 1.
-    // Summing over-admits and returns a string wider than the budget, breaking
-    // the promise above (and underflowing any caller that subtracts the result
-    // from a remaining budget).
-    for g in text.graphemes(true) {
-        out.push_str(g);
-        if UnicodeWidthStr::width(out.as_str()) > budget {
-            out.truncate(out.len() - g.len());
+
+    let mut text = String::with_capacity(width as usize);
+    let mut column_of = Vec::with_capacity(width as usize);
+    let mut col = 0u16;
+    let mut clipped = false;
+    for span in &line.spans {
+        for grapheme in span.content.graphemes(true) {
+            // Same filtering and width rule as `Buffer::set_stringn`. `CellWidth`
+            // is not `UnicodeWidthStr`: it adds a cell for halfwidth katakana
+            // dakuten, and a disagreeing mapper would shift every underline,
+            // OSC 8 span and selection on the row.
+            if grapheme.contains(char::is_control) {
+                continue;
+            }
+            let cells = grapheme.cell_width();
+            if cells == 0 {
+                continue;
+            }
+            // A grapheme the renderer cannot fit is not painted, so it must not
+            // be matchable either.
+            if col + cells > width {
+                clipped = true;
+                break;
+            }
+            column_of.resize(column_of.len() + grapheme.len(), col);
+            text.push_str(grapheme);
+            col += cells;
+        }
+        if clipped {
             break;
         }
     }
+    column_of.push(col);
+    LineColumns {
+        text,
+        column_of,
+        clipped,
+    }
+}
+
+/// Truncate `text` to `max_width` display cells, appending `…` if anything was
+/// dropped. Width-aware, so a truncated string never paints past its budget.
+/// Returns "" when `max_width` is 0.
+pub fn truncate_to_width(text: &str, max_width: usize) -> String {
+    if max_width == 0 {
+        return String::new();
+    }
+    if rendered_width(text) <= max_width {
+        return text.to_string();
+    }
+    // Reserve one cell for the ellipsis.
+    let mut out = prefix_within_width(text, max_width.saturating_sub(1)).to_string();
     out.push('\u{2026}');
     out
 }
 
+/// Cells `text` occupies when painted: the per-grapheme `CellWidth` metric that
+/// `Span::styled_graphemes` and `Buffer::set_stringn` apply.
+///
+/// Not `UnicodeWidthStr::width`, which scores halfwidth katakana dakuten
+/// (U+FF9E, U+FF9F) at zero cells where the renderer spends one, so a
+/// string-width budget admits twice the text that fits for that script.
+/// Clusters holding a control character are dropped first, as both renderer
+/// paths do: they paint nothing, and `CellWidth` debug-asserts on a lone one.
+pub fn rendered_width(text: &str) -> usize {
+    use ratatui::buffer::CellWidth;
+    use unicode_segmentation::UnicodeSegmentation;
+    text.graphemes(true)
+        .filter(|g| !g.contains(char::is_control))
+        .map(|g| g.cell_width() as usize)
+        .sum()
+}
+
+/// The longest prefix of `text` that fits in `max_width` display cells, with no
+/// ellipsis.
+///
+/// Steps by grapheme cluster, because a `char` is not a display unit: cutting
+/// mid-cluster leaves a dangling combining mark or strips a VS16 so the glyph
+/// flips from emoji to text presentation. Cells come from [`rendered_width`], so
+/// a cluster whose scalars do not sum to what it paints neither over- nor
+/// under-fills the budget. A control-carrying cluster costs nothing yet stays in
+/// the slice, so the result is still a borrowed prefix.
+pub fn prefix_within_width(text: &str, max_width: usize) -> &str {
+    use ratatui::buffer::CellWidth;
+    use unicode_segmentation::UnicodeSegmentation;
+    let mut cells = 0usize;
+    let mut end = 0;
+    for (start, g) in text.grapheme_indices(true) {
+        if !g.contains(char::is_control) {
+            cells += g.cell_width() as usize;
+            if cells > max_width {
+                break;
+            }
+        }
+        end = start + g.len();
+    }
+    &text[..end]
+}
+
+/// `text` fitted to a `max_width` column of a multi-span
+/// [`ratatui::text::Line`].
+///
+/// Cut and padded by different metrics, because ratatui lays a `Line` out with
+/// two that disagree: `Span::render` advances per `CellWidth`, while
+/// `render_spans` starts the next span at `Span::width` (`UnicodeWidthStr`).
+/// They part on halfwidth katakana dakuten (U+FF9E, U+FF9F). So the cut uses
+/// [`truncate_to_width`], keeping painted glyphs inside the column, and the pad
+/// uses `UnicodeWidthStr`, landing the next span on the column boundary.
+pub fn fixed_width(text: &str, max_width: usize) -> String {
+    use unicode_width::UnicodeWidthStr;
+    let text = truncate_to_width(text, max_width);
+    let pad = max_width.saturating_sub(UnicodeWidthStr::width(text.as_str()));
+    format!("{text}{}", " ".repeat(pad))
+}
+
 #[cfg(test)]
 mod tests {
-    use super::truncate_to_width;
+    use super::{
+        fixed_width, line_columns, prefix_within_width, rendered_width, truncate_to_width,
+    };
+
+    /// A wide grapheme occupies two columns and its continuation cell is reset
+    /// by the renderer. Reading that back out of a buffer yields a phantom
+    /// space, which is what used to stop a CJK label from ever matching.
+    #[test]
+    fn wide_graphemes_span_two_columns_without_a_phantom_space() {
+        use ratatui::text::Line;
+        let columns = line_columns(&Line::from("日本語 x"), 40);
+        assert_eq!(columns.text, "日本語 x", "no space injected between cells");
+        assert_eq!(columns.column_at(0), 0);
+        assert_eq!(columns.column_at("日".len()), 2);
+        assert_eq!(columns.column_at("日本".len()), 4);
+        assert_eq!(columns.column_at("日本語 ".len()), 7);
+        assert_eq!(columns.slice(0, 6), "日本語");
+    }
+
+    /// A grapheme that does not fit the pane is not painted, so it must not be
+    /// matchable either.
+    #[test]
+    fn a_grapheme_past_the_pane_edge_is_not_included() {
+        use ratatui::text::Line;
+        assert_eq!(line_columns(&Line::from("ab日"), 3).text, "ab");
+        assert_eq!(line_columns(&Line::from("ab日"), 4).text, "ab日");
+    }
+
+    #[test]
+    fn slice_returns_the_columns_asked_for() {
+        use ratatui::text::Line;
+        let columns = line_columns(&Line::from("hello world"), 40);
+        assert_eq!(columns.slice(6, 11), "world");
+        assert_eq!(columns.slice(0, 5), "hello");
+    }
+
+    #[test]
+    fn prefix_within_width_measures_clusters_as_a_string() {
+        // No ellipsis, and a prefix that fits comes back whole.
+        assert_eq!(prefix_within_width("abc", 4), "abc");
+        assert_eq!(prefix_within_width("abcdef", 4), "abcd");
+        assert_eq!(prefix_within_width("abc", 0), "");
+        // Per-scalar widths sum to 4 but the string is 5 cells: drop `a`.
+        assert_eq!(
+            prefix_within_width("\u{2665}\u{fe0f}界a", 4),
+            "\u{2665}\u{fe0f}界"
+        );
+        // Per-scalar widths sum to 5 but the skin-tone cluster is 2 cells:
+        // keep `m`.
+        assert_eq!(
+            prefix_within_width("\u{1f91d}\u{1f3fd}m", 4),
+            "\u{1f91d}\u{1f3fd}m"
+        );
+    }
+
+    /// The passthrough guard has to use the renderer's metric too: halfwidth
+    /// katakana dakuten scores zero in `UnicodeWidthStr`, so a string-width
+    /// guard hands back twice the budget untouched.
+    #[test]
+    fn truncate_to_width_guard_uses_the_rendered_metric() {
+        let halfwidth = "\u{ff8a}\u{ff9f}".repeat(20);
+        assert_eq!(rendered_width(&halfwidth), 40);
+        let out = truncate_to_width(&halfwidth, 24);
+        assert!(rendered_width(&out) <= 24, "{out:?}");
+        assert!(out.ends_with('\u{2026}'));
+    }
+
+    /// Control characters paint nothing, so charging cells for them ellipsizes
+    /// text that fits, and `CellWidth` debug-asserts when a lone ASCII control
+    /// reaches it. Plugin row-column text can carry internal tabs.
+    #[test]
+    fn control_characters_cost_no_cells() {
+        use ratatui::buffer::Buffer;
+        use ratatui::layout::Rect;
+        use ratatui::text::Line;
+
+        assert_eq!(rendered_width("a\tb"), 2);
+        assert_eq!(rendered_width("a\r\nb"), 2);
+        assert_eq!(prefix_within_width("a\tb", 2), "a\tb");
+        assert_eq!(truncate_to_width("a\tb", 2), "a\tb");
+        // Still budgeted correctly once the visible text does overflow.
+        assert_eq!(truncate_to_width("a\tbcdef", 3), "a\tb\u{2026}");
+
+        // The two cells ratatui actually paints for the passthrough case.
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 4, 1));
+        let (x, _) = buffer.set_line(0, 0, &Line::raw(truncate_to_width("a\tb", 2)), 4);
+        assert_eq!(x, 2, "{buffer:?}");
+        assert_eq!(buffer[(0, 0)].symbol(), "a");
+        assert_eq!(buffer[(1, 0)].symbol(), "b");
+    }
+
+    /// Both halves of the column contract: the next span starts exactly
+    /// `max_width` on, and the painted glyphs stay inside that. A `{:<width$}`
+    /// pad breaks the first for wide glyphs; a `CellWidth` pad breaks it for
+    /// halfwidth katakana.
+    #[test]
+    fn fixed_width_fits_a_line_column() {
+        use unicode_width::UnicodeWidthStr;
+        let wide = "\u{754c}".repeat(40);
+        for (text, width) in [
+            ("agent", 8),
+            ("\u{65e5}\u{672c}\u{8a9e}", 8),
+            ("\u{ff8a}\u{ff9e}\u{ff8a}\u{ff9e}\u{ff8a}\u{ff9e}", 8),
+            ("a much longer title than fits", 8),
+            (wide.as_str(), 24),
+            ("a\tb", 4),
+            ("", 3),
+        ] {
+            let out = fixed_width(text, width);
+            assert_eq!(
+                UnicodeWidthStr::width(out.as_str()),
+                width,
+                "{text:?} at {width}: next span must start on the boundary"
+            );
+            assert!(
+                rendered_width(out.trim_end()) <= width,
+                "{text:?} at {width}: painted glyphs must stay inside the column"
+            );
+        }
+        assert_eq!(fixed_width("ab", 5), "ab   ");
+        assert_eq!(fixed_width("abcdef", 0), "");
+    }
 
     #[test]
     fn truncate_to_width_passthrough_when_fits() {

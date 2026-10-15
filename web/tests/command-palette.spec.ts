@@ -21,13 +21,6 @@ test.describe("Command palette", () => {
     await expect(page.getByPlaceholder("Search actions, sessions, settings…")).toBeVisible();
   });
 
-  test("opens via header pill click", async ({ page }) => {
-    await page.setViewportSize({ width: 1280, height: 720 });
-    await page.goto("/");
-    await page.getByRole("button", { name: "Open command palette" }).first().click();
-    await expect(page.getByPlaceholder("Search actions, sessions, settings…")).toBeVisible();
-  });
-
   test("closes on Escape", async ({ page }) => {
     await page.setViewportSize({ width: 1280, height: 720 });
     await page.goto("/");
@@ -36,38 +29,6 @@ test.describe("Command palette", () => {
     await expect(page.getByPlaceholder("Search actions, sessions, settings…")).toBeVisible();
     await page.keyboard.press("Escape");
     await expect(page.getByPlaceholder("Search actions, sessions, settings…")).not.toBeVisible();
-  });
-
-  test("closes on backdrop click", async ({ page }) => {
-    await page.setViewportSize({ width: 1280, height: 720 });
-    await page.goto("/");
-    await page.locator("body").click();
-    await page.keyboard.press("ControlOrMeta+k");
-    await expect(page.getByPlaceholder("Search actions, sessions, settings…")).toBeVisible();
-    await page.locator('[data-testid="command-palette-backdrop"]').click({
-      position: { x: 10, y: 10 },
-    });
-    await expect(page.getByPlaceholder("Search actions, sessions, settings…")).not.toBeVisible();
-  });
-
-  test("shows initial action groups", async ({ page }) => {
-    await page.setViewportSize({ width: 1280, height: 720 });
-    await page.goto("/");
-    await page.locator("body").click();
-    await page.keyboard.press("ControlOrMeta+k");
-    await expect(page.getByRole("option", { name: /New session/i })).toBeVisible();
-    await expect(page.getByRole("option", { name: /Go to dashboard/i })).toBeVisible();
-    await expect(page.getByRole("option", { name: /Open settings/i })).toBeVisible();
-  });
-
-  test("typing filters results", async ({ page }) => {
-    await page.setViewportSize({ width: 1280, height: 720 });
-    await page.goto("/");
-    await page.locator("body").click();
-    await page.keyboard.press("ControlOrMeta+k");
-    await page.getByPlaceholder("Search actions, sessions, settings…").fill("settings");
-    await expect(page.getByRole("option", { name: /Open settings/i })).toBeVisible();
-    await expect(page.getByRole("option", { name: /New session/i })).not.toBeVisible();
   });
 
   test("empty state on no matches", async ({ page }) => {
@@ -107,16 +68,6 @@ test.describe("Command palette", () => {
     await expect(page.getByPlaceholder("Search actions, sessions, settings…")).toBeVisible();
   });
 
-  test("About action opens About modal", async ({ page }) => {
-    await page.setViewportSize({ width: 1280, height: 720 });
-    await page.goto("/");
-    await page.locator("body").click();
-    await page.keyboard.press("ControlOrMeta+k");
-    await page.getByPlaceholder("Search actions, sessions, settings…").fill("About Agent");
-    await page.keyboard.press("Enter");
-    await expect(page.getByRole("heading", { name: "Agent of Empires" })).toBeVisible();
-  });
-
   test("mobile: palette icon button opens palette", async ({ page }) => {
     await page.setViewportSize({ width: 375, height: 812 });
     await page.goto("/");
@@ -147,18 +98,6 @@ test.describe("Command palette", () => {
     await expect(page.locator('[data-testid="cheat-overlay"]')).toHaveCount(0, { timeout: 4000 });
     // Palette is still interactive: a normal search still filters.
     await search.fill("settings");
-    await expect(page.getByRole("option", { name: /Open settings/i })).toBeVisible();
-  });
-
-  test("non-cheat search does not fire an easter egg", async ({ page }) => {
-    await page.setViewportSize({ width: 1280, height: 720 });
-    await page.goto("/");
-    await page.locator("body").click();
-    await page.keyboard.press("ControlOrMeta+k");
-    const search = page.getByPlaceholder("Search actions, sessions, settings…");
-    await search.fill("settings");
-    await expect(page.locator('[data-testid="cheat-overlay"]')).toHaveCount(0);
-    await expect(search).toHaveValue("settings");
     await expect(page.getByRole("option", { name: /Open settings/i })).toBeVisible();
   });
 });

@@ -1,4 +1,52 @@
-import { useState } from "react";
+import { useId, useState, type ReactNode } from "react";
+
+const CONTROL = "w-full bg-surface-900 border border-surface-700 rounded-md px-3 py-2 text-sm text-text-primary";
+const FOCUS = "focus:border-brand-600 focus:outline-none";
+
+/** Label above an optional description above the control. A `label` of `undefined` drops the element. */
+function FieldShell({
+  label,
+  description,
+  labelClassName,
+  children,
+}: {
+  label?: string;
+  description?: string;
+  labelClassName?: string;
+  children: ReactNode;
+}) {
+  return (
+    <div>
+      {label !== undefined && (
+        <label className={labelClassName ?? "block text-sm text-text-bright mb-1"}>{label}</label>
+      )}
+      {description && <div className="text-xs text-text-dim mb-1">{description}</div>}
+      {children}
+    </div>
+  );
+}
+
+/** Edits a local draft while focused and commits on blur, so typing never fights the saved value. */
+function useDraft(value: string, onCommit: (draft: string) => void) {
+  const [local, setLocal] = useState(value);
+  const [focused, setFocused] = useState(false);
+
+  if (!focused && local !== value) setLocal(value);
+
+  const commit = () => {
+    onCommit(local);
+    setFocused(false);
+  };
+  return {
+    commit,
+    props: {
+      value: local,
+      onChange: (e: { target: { value: string } }) => setLocal(e.target.value),
+      onFocus: () => setFocused(true),
+      onBlur: commit,
+    },
+  };
+}
 
 export function CollapsibleSection({
   title,
@@ -44,6 +92,36 @@ export function CollapsibleSection({
         </div>
       </button>
       {open && <div className="px-4 py-4 space-y-4 border-t border-surface-700/20">{children}</div>}
+    </div>
+  );
+}
+
+/** Checkbox row used by the per-browser preference panels. */
+export function CheckboxRow({
+  title,
+  description,
+  checked,
+  onChange,
+}: {
+  title: string;
+  description: string;
+  checked: boolean;
+  onChange: (v: boolean) => void;
+}) {
+  return (
+    <div>
+      <label className="flex items-center justify-between gap-3 cursor-pointer">
+        <div>
+          <div className="text-[13px] text-text-secondary">{title}</div>
+          <p className="text-[11px] text-text-muted mt-1">{description}</p>
+        </div>
+        <input
+          type="checkbox"
+          checked={checked}
+          onChange={(e) => onChange(e.target.checked)}
+          className="accent-brand-600 w-4 h-4 shrink-0"
+        />
+      </label>
     </div>
   );
 }
@@ -97,32 +175,20 @@ export function TextField({
   mono?: boolean;
   multiline?: boolean;
 }) {
-  const [local, setLocal] = useState(value);
-  const [focused, setFocused] = useState(false);
+  const draft = useDraft(value, (next) => {
+    if (next !== value) onChange(next);
+  });
 
-  // Sync from parent when not focused (external updates)
-  if (!focused && local !== value) setLocal(value);
-
-  const commit = () => {
-    if (local !== value) onChange(local);
-    setFocused(false);
-  };
-
-  const cls = `w-full bg-surface-900 border border-surface-700 rounded-md px-3 py-2 text-sm text-text-primary placeholder:text-text-dim focus:border-brand-600 focus:outline-none ${mono ? "font-mono" : ""}`;
+  const cls = `${CONTROL} placeholder:text-text-dim ${FOCUS} ${mono ? "font-mono" : ""}`;
   return (
-    <div>
-      <label className="block text-sm text-text-bright mb-1">{label}</label>
-      {description && <div className="text-xs text-text-dim mb-1">{description}</div>}
+    <FieldShell label={label} description={description}>
       {multiline ? (
         <textarea
-          value={local}
-          onChange={(e) => setLocal(e.target.value)}
-          onFocus={() => setFocused(true)}
-          onBlur={commit}
+          {...draft.props}
           onKeyDown={(e) => {
             if (e.key === "Enter" && !e.shiftKey) {
               e.preventDefault();
-              commit();
+              draft.commit();
             }
           }}
           placeholder={placeholder}
@@ -132,18 +198,15 @@ export function TextField({
       ) : (
         <input
           type="text"
-          value={local}
-          onChange={(e) => setLocal(e.target.value)}
-          onFocus={() => setFocused(true)}
-          onBlur={commit}
+          {...draft.props}
           onKeyDown={(e) => {
-            if (e.key === "Enter") commit();
+            if (e.key === "Enter") draft.commit();
           }}
           placeholder={placeholder}
           className={cls}
         />
       )}
-    </div>
+    </FieldShell>
   );
 }
 
@@ -160,27 +223,19 @@ export function SelectField({
   value: string;
   onChange: (v: string) => void;
   options: { value: string; label: string }[];
-  /** Override the default `text-sm text-text-bright mb-1` label classes
-   *  (used by the Logging panel to render heavier section labels).
-   *  Pass `""` to suppress the label element entirely. */
+  /** Overrides the label classes; `""` hides the label. */
   labelClassName?: string;
 }) {
   return (
-    <div>
-      {label && <label className={labelClassName ?? "block text-sm text-text-bright mb-1"}>{label}</label>}
-      {description && <div className="text-xs text-text-dim mb-1">{description}</div>}
-      <select
-        value={value}
-        onChange={(e) => onChange(e.target.value)}
-        className="w-full bg-surface-900 border border-surface-700 rounded-md px-3 py-2 text-sm text-text-primary focus:border-brand-600 focus:outline-none"
-      >
+    <FieldShell label={label || undefined} description={description} labelClassName={labelClassName}>
+      <select value={value} onChange={(e) => onChange(e.target.value)} className={`${CONTROL} ${FOCUS}`}>
         {options.map((opt) => (
           <option key={opt.value} value={opt.value}>
             {opt.label}
           </option>
         ))}
       </select>
-    </div>
+    </FieldShell>
   );
 }
 
@@ -199,35 +254,24 @@ export function NumberField({
   min?: number;
   max?: number;
 }) {
-  const [local, setLocal] = useState(String(value));
-  const [focused, setFocused] = useState(false);
-
-  if (!focused && local !== String(value)) setLocal(String(value));
-
-  const commit = () => {
-    const n = Number(local);
+  const draft = useDraft(String(value), (next) => {
+    const n = Number(next);
     if (!isNaN(n) && n !== value) onChange(n);
-    setFocused(false);
-  };
+  });
 
   return (
-    <div>
-      <label className="block text-sm text-text-bright mb-1">{label}</label>
-      {description && <div className="text-xs text-text-dim mb-1">{description}</div>}
+    <FieldShell label={label} description={description}>
       <input
         type="number"
-        value={local}
-        onChange={(e) => setLocal(e.target.value)}
-        onFocus={() => setFocused(true)}
-        onBlur={commit}
+        {...draft.props}
         onKeyDown={(e) => {
-          if (e.key === "Enter") commit();
+          if (e.key === "Enter") draft.commit();
         }}
         min={min}
         max={max}
-        className="w-full bg-surface-900 border border-surface-700 rounded-md px-3 py-2 text-sm text-text-primary focus:border-brand-600 focus:outline-none"
+        className={`${CONTROL} ${FOCUS}`}
       />
-    </div>
+    </FieldShell>
   );
 }
 
@@ -270,6 +314,23 @@ export function SliderField({
   );
 }
 
+/** Where the entry at `index` of `prev` sits in `next`, or null once it can't be identified. */
+function followEdit(prev: string[], next: string[], index: number): number | null {
+  let at = index;
+  if (next.length === prev.length - 1) {
+    // One entry was removed. Equal neighbours make its exact position ambiguous,
+    // so work out the range of positions that fit and bail out if it can reach the edited row.
+    let last = 0;
+    while (last < next.length && prev[last] === next[last]) last++;
+    let tail = 0;
+    while (tail < next.length && prev[prev.length - 1 - tail] === next[next.length - 1 - tail]) tail++;
+    const first = next.length - tail;
+    if (first > last || (first <= index && index <= last)) return null;
+    if (last < index) at = index - 1;
+  }
+  return next[at] === prev[index] ? at : null;
+}
+
 export function ListField({
   label,
   description,
@@ -285,35 +346,90 @@ export function ListField({
   placeholder?: string;
   validate?: (value: string) => string | null;
 }) {
+  const inputId = useId();
   const [adding, setAdding] = useState(false);
   const [draft, setDraft] = useState("");
   const [error, setError] = useState<string | null>(null);
+  const [editing, setEditing] = useState<number | null>(null);
+  const [seen, setSeen] = useState(items);
+
+  const cancel = () => {
+    setAdding(false);
+    setEditing(null);
+    setDraft("");
+    setError(null);
+  };
+
+  // Keep the edit pointed at the same entry when the parent changes the list.
+  if (seen.length !== items.length || seen.some((v, i) => v !== items[i])) {
+    setSeen(items);
+    if (editing !== null) {
+      const at = followEdit(seen, items, editing);
+      if (at === null) cancel();
+      else setEditing(at);
+    }
+  }
+
+  const startEdit = (i: number) => {
+    setAdding(false);
+    setEditing(i);
+    setDraft(items[i]!);
+    setError(null);
+  };
 
   const submit = () => {
     const trimmed = draft.trim();
     if (!trimmed) return;
-    if (validate) {
-      const err = validate(trimmed);
-      if (err) {
-        setError(err);
-        return;
-      }
+    const err = validate?.(trimmed);
+    if (err) {
+      setError(err);
+      return;
     }
-    onChange([...items, trimmed]);
-    setDraft("");
-    setError(null);
-    setAdding(false);
+    onChange(editing === null ? [...items, trimmed] : items.map((item, i) => (i === editing ? trimmed : item)));
+    cancel();
   };
 
-  const remove = (index: number) => {
-    onChange(items.filter((_, i) => i !== index));
-  };
+  const draftInput = (
+    <div className="mt-2">
+      <div className="flex gap-2">
+        <input
+          id={inputId}
+          type="text"
+          value={draft}
+          onChange={(e) => {
+            setDraft(e.target.value);
+            setError(null);
+          }}
+          onKeyDown={(e) => {
+            // Safari ends a composition with isComposing already false and keyCode 229.
+            if (e.key === "Enter" && !e.nativeEvent.isComposing && e.keyCode !== 229) submit();
+            if (e.key === "Escape") cancel();
+          }}
+          placeholder={placeholder}
+          autoFocus
+          className={`flex-1 bg-surface-900 border rounded-md px-3 py-1.5 text-sm font-mono text-text-primary placeholder:text-text-dim focus:outline-none ${error ? "border-red-500" : "border-surface-700 focus:border-brand-600"}`}
+        />
+        <button
+          onClick={submit}
+          className="px-3 py-1.5 rounded-md bg-brand-600 hover:bg-brand-500 text-sm font-medium text-surface-950 cursor-pointer"
+        >
+          {editing === null ? "Add" : "Save"}
+        </button>
+        <button onClick={cancel} className="px-2 py-1.5 text-sm text-text-dim hover:text-text-primary cursor-pointer">
+          Cancel
+        </button>
+      </div>
+      {error && <div className="text-xs text-red-400 mt-1">{error}</div>}
+    </div>
+  );
 
   return (
     <div>
       <div className="flex items-center justify-between mb-1">
-        <label className="text-sm text-text-bright">{label}</label>
-        {!adding && (
+        <label htmlFor={inputId} className="text-sm text-text-bright">
+          {label}
+        </label>
+        {!adding && editing === null && (
           <button
             onClick={() => setAdding(true)}
             className="text-xs text-brand-500 hover:text-brand-400 cursor-pointer"
@@ -325,64 +441,38 @@ export function ListField({
       {description && <div className="text-xs text-text-dim mb-2">{description}</div>}
       {items.length === 0 && !adding && <div className="text-xs text-text-dim italic py-2">No items configured</div>}
       <div className="space-y-1 max-h-[320px] overflow-y-auto">
-        {items.map((item, i) => (
-          <div key={i} className="flex items-center justify-between gap-2 px-2 py-1.5 bg-surface-900 rounded group">
-            <span className="text-sm font-mono text-text-primary truncate">{item}</span>
-            <button
-              onClick={() => remove(i)}
-              className="text-text-dim hover:text-red-400 opacity-0 group-hover:opacity-100 transition-opacity cursor-pointer shrink-0"
-              title="Remove"
-            >
-              <svg className="w-3.5 h-3.5" viewBox="0 0 16 16" fill="currentColor">
-                <path d="M5.5 5.5A.5.5 0 0 1 6 6v6a.5.5 0 0 1-1 0V6a.5.5 0 0 1 .5-.5m2.5 0a.5.5 0 0 1 .5.5v6a.5.5 0 0 1-1 0V6a.5.5 0 0 1 .5-.5m3 .5a.5.5 0 0 0-1 0v6a.5.5 0 0 0 1 0z" />
-                <path d="M14.5 3a1 1 0 0 1-1 1H13v9a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V4h-.5a1 1 0 0 1 0-2H6a1 1 0 0 1 1-1h2a1 1 0 0 1 1 1h3.5a1 1 0 0 1 1 1M4.118 4 4 4.059V13a1 1 0 0 0 1 1h6a1 1 0 0 0 1-1V4.059L11.882 4z" />
-              </svg>
-            </button>
-          </div>
-        ))}
+        {items.map((item, i) =>
+          editing === i ? (
+            <div key={i}>{draftInput}</div>
+          ) : (
+            <div key={i} className="flex items-center justify-between gap-2 pl-2 pr-1 py-0.5 bg-surface-900 rounded">
+              <span className="text-sm font-mono text-text-primary truncate">{item}</span>
+              <div className="flex items-center gap-2 shrink-0">
+                <button
+                  onClick={() => startEdit(i)}
+                  className="p-2 text-text-dim hover:text-text-primary cursor-pointer"
+                  title={`Edit ${item}`}
+                >
+                  <svg className="w-3.5 h-3.5" viewBox="0 0 16 16" fill="currentColor">
+                    <path d="M12.146.146a.5.5 0 0 1 .708 0l3 3a.5.5 0 0 1 0 .708l-10 10a.5.5 0 0 1-.168.11l-5 2a.5.5 0 0 1-.65-.65l2-5a.5.5 0 0 1 .11-.168zM11.207 2.5 13.5 4.793 14.793 3.5 12.5 1.207zm1.586 3L10.5 3.207 4 9.707V10h.5a.5.5 0 0 1 .5.5v.5h.5a.5.5 0 0 1 .5.5v.5h.293zm-9.761 5.175-.106.106-1.528 3.821 3.821-1.528.106-.106A.5.5 0 0 1 5 12.5V12h-.5a.5.5 0 0 1-.5-.5V11h-.5a.5.5 0 0 1-.468-.325" />
+                  </svg>
+                </button>
+                <button
+                  onClick={() => onChange(items.filter((_, j) => j !== i))}
+                  className="p-2 text-text-dim hover:text-red-400 cursor-pointer"
+                  title={`Remove ${item}`}
+                >
+                  <svg className="w-3.5 h-3.5" viewBox="0 0 16 16" fill="currentColor">
+                    <path d="M5.5 5.5A.5.5 0 0 1 6 6v6a.5.5 0 0 1-1 0V6a.5.5 0 0 1 .5-.5m2.5 0a.5.5 0 0 1 .5.5v6a.5.5 0 0 1-1 0V6a.5.5 0 0 1 .5-.5m3 .5a.5.5 0 0 0-1 0v6a.5.5 0 0 0 1 0z" />
+                    <path d="M14.5 3a1 1 0 0 1-1 1H13v9a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V4h-.5a1 1 0 0 1 0-2H6a1 1 0 0 1 1-1h2a1 1 0 0 1 1 1h3.5a1 1 0 0 1 1 1M4.118 4 4 4.059V13a1 1 0 0 0 1 1h6a1 1 0 0 0 1-1V4.059L11.882 4z" />
+                  </svg>
+                </button>
+              </div>
+            </div>
+          ),
+        )}
       </div>
-      {adding && (
-        <div className="mt-2">
-          <div className="flex gap-2">
-            <input
-              type="text"
-              value={draft}
-              onChange={(e) => {
-                setDraft(e.target.value);
-                setError(null);
-              }}
-              onKeyDown={(e) => {
-                if (e.key === "Enter") submit();
-                if (e.key === "Escape") {
-                  setAdding(false);
-                  setDraft("");
-                  setError(null);
-                }
-              }}
-              placeholder={placeholder}
-              autoFocus
-              className={`flex-1 bg-surface-900 border rounded-md px-3 py-1.5 text-sm font-mono text-text-primary placeholder:text-text-dim focus:outline-none ${error ? "border-red-500" : "border-surface-700 focus:border-brand-600"}`}
-            />
-            <button
-              onClick={submit}
-              className="px-3 py-1.5 rounded-md bg-brand-600 hover:bg-brand-500 text-sm font-medium text-surface-950 cursor-pointer"
-            >
-              Add
-            </button>
-            <button
-              onClick={() => {
-                setAdding(false);
-                setDraft("");
-                setError(null);
-              }}
-              className="px-2 py-1.5 text-sm text-text-dim hover:text-text-primary cursor-pointer"
-            >
-              Cancel
-            </button>
-          </div>
-          {error && <div className="text-xs text-red-400 mt-1">{error}</div>}
-        </div>
-      )}
+      {adding && draftInput}
     </div>
   );
 }

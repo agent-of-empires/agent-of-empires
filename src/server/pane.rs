@@ -1,8 +1,4 @@
-//! Shared tmux-pane helpers for the live (capture-streaming) WebSocket
-//! handlers: dead-pane rescue for the paired host/container shells, the
-//! readiness probe used before a session is rendered, and the close codes /
-//! early-close helper. The old PTY-relay renderer that lived here was removed
-//! when the web dashboard unified on the capture-snapshot live view.
+//! Shared tmux-pane helpers for the live (capture-streaming) WebSocket handlers.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -11,46 +7,27 @@ use axum::extract::ws::{CloseFrame, Message, WebSocket};
 
 use super::AppState;
 
-/// Upper bound on the paired-terminal index a client may request. The web
-/// dashboard owns the live set of terminal tabs, so a stray or hostile request
-/// could otherwise spawn unbounded tmux sessions; this caps the blast radius.
-/// 31 is far above any plausible tab count. See #2437.
+/// Upper bound on the paired-terminal index a client may request.
 pub(crate) const MAX_TERMINAL_INDEX: u32 = 31;
 
-/// Close code we send when the live capture loop found the underlying pane
-/// gone. The web live hook treats this as "stop retrying immediately, surface
-/// the manual reconnect banner" rather than burning the retry budget against a
-/// permanently broken pane. Picked from the application-reserved 4000-4999
-/// range; not used elsewhere. See #1107.
+/// Close code we send when the live capture loop found the underlying pane gone.
 pub(crate) const CLOSE_CODE_PTY_DEAD: u16 = 4001;
 
-/// WebSocket close code 1001 ("going away"). Sent when the daemon is
-/// shutting down so the client can distinguish a server-side exit from
-/// a transient transport error and skip its reconnect backoff for one
-/// cycle. See #1198.
+/// WebSocket close code 1001 ("going away").
 pub(crate) const CLOSE_CODE_GOING_AWAY: u16 = 1001;
 
-/// WebSocket close code 1013 ("try again later"). Sent when the tmux
-/// pane is not ready within the bounded readiness window. Browser
-/// retries on the fast-start ladder. Distinct from 4001 (permanently dead
-/// pane) so logs separate transient warm-up from genuine failure. See #1455.
+/// WebSocket close code 1013 ("try again later").
 pub(crate) const CLOSE_CODE_TRY_AGAIN_LATER: u16 = 1013;
 
-/// Total time we'll spend waiting for the tmux session + pane to be
-/// attachable before giving up and closing 1013. 2s covers tmux warm-up
-/// across the slow machines we've seen reports from while staying short
-/// enough that a truly dead pane doesn't hold the upgrade open for the
-/// user. See #1455.
+/// Total time we'll spend waiting for the tmux session + pane to be attachable before
+/// giving up and closing 1013.
 const TMUX_READY_TIMEOUT: Duration = Duration::from_millis(2000);
 
-/// Poll interval for the readiness wait. 50ms gives ~40 probes inside
-/// the 2s window; each probe shells out to `tmux has-session` and (if
-/// that passes) `tmux list-panes`, which is cheap.
+/// Poll interval for the readiness wait.
 const TMUX_READY_POLL: Duration = Duration::from_millis(50);
 
-/// Revive a dead paired host-shell pane (or recreate a missing session) so a
-/// live-view reconnect recovers instead of hot-looping. Returns the tmux
-/// session name to capture.
+/// Revive a dead paired host-shell pane (or recreate a missing session) so a live-view
+/// reconnect recovers instead of hot-looping.
 pub(crate) async fn respawn_paired_if_dead(
     state: &Arc<AppState>,
     id: &str,
@@ -67,16 +44,7 @@ pub(crate) async fn respawn_paired_if_dead(
 
     let mut inst_for_blocking = inst.clone();
     let tmux_name_clone = tmux_name.clone();
-    // Two failure modes the user can land in:
-    //   1. Pane is dead but the tmux session still exists (shell exit
-    //      under `remain-on-exit on`). `kill_terminal_if_dead` clears
-    //      the tombstone, then we respawn.
-    //   2. The whole tmux session is gone (`tmux kill-session`, daemon
-    //      reaped on aoe restart, etc). `kill_terminal_if_dead`
-    //      returns false here because there's nothing to kill, but the
-    //      next capture finds no session and the WS closes 4001. Recreate
-    //      the session in that case too so the retry click recovers
-    //      instead of hot-looping. See #1107 follow-up.
+    // Two failure modes the user can land in.
     let respawned = tokio::task::spawn_blocking(move || -> anyhow::Result<bool> {
         let killed_dead = inst_for_blocking.kill_terminal_if_dead_indexed(index)?;
         let session_missing = !inst_for_blocking
@@ -131,13 +99,7 @@ pub(crate) async fn respawn_container_if_dead(
 
     let mut inst_for_blocking = inst.clone();
     let tmux_name_clone = tmux_name.clone();
-    // No in-memory cache to update for container terminal: `has_container_terminal()`
-    // queries tmux directly, so unlike the paired variant we don't need to write
-    // back a `terminal_info` flag after a successful respawn.
-    //
-    // See `respawn_paired_if_dead` for the missing-session branch: a
-    // `tmux kill-session` on a paired container terminal also has to
-    // recreate from scratch, not just kill-then-respawn the pane.
+    // No in-memory cache to update for container terminal.
     let _respawned = tokio::task::spawn_blocking(move || -> anyhow::Result<bool> {
         let killed_dead = inst_for_blocking.kill_container_terminal_if_dead_indexed(index)?;
         let session_missing = !inst_for_blocking
@@ -178,10 +140,7 @@ pub(crate) async fn close_early(socket: &mut WebSocket, code: u16, reason: &'sta
         .await;
 }
 
-/// Outcome of one tmux-readiness probe. `Ready` lets the caller proceed
-/// to capture the pane; `NotReady` means try again after the poll
-/// interval; `Dead` short-circuits the wait when every pane is reported
-/// dead (no point in polling further).
+/// Outcome of one tmux-readiness probe.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum PaneReadiness {
     Ready,
@@ -189,10 +148,7 @@ pub(crate) enum PaneReadiness {
     Dead,
 }
 
-/// Parse `tmux list-panes -F "#{pane_dead}"` output: one line per pane,
-/// each line `0` (alive) or `1` (dead). Empty output means the session
-/// exists but has no panes yet (not ready). All-dead means the pane has
-/// permanently exited.
+/// Parse `tmux list-panes -F "#{pane_dead}"` output.
 fn parse_pane_dead_output(output: &str) -> PaneReadiness {
     let lines: Vec<&str> = output
         .lines()
@@ -209,13 +165,8 @@ fn parse_pane_dead_output(output: &str) -> PaneReadiness {
     }
 }
 
-/// Poll `tmux has-session` + `tmux list-panes` at TMUX_READY_POLL until
-/// the session has at least one alive pane, or until TMUX_READY_TIMEOUT
-/// expires. Returns the final outcome so the caller can distinguish a
-/// transient warm-up (`NotReady` -> retryable 1013) from a permanently
-/// dead pane (`Dead` -> 4001 short-circuit). Bails out early on `Dead`
-/// rather than polling further because no amount of waiting will make
-/// an exited pane reattachable.
+/// Poll `tmux has-session` + `tmux list-panes` at TMUX_READY_POLL until the session has at
+/// least one alive pane, or until TMUX_READY_TIMEOUT expires.
 pub(crate) async fn wait_for_tmux_ready(tmux_name: &str) -> PaneReadiness {
     let deadline = Instant::now() + TMUX_READY_TIMEOUT;
     loop {
@@ -232,10 +183,7 @@ pub(crate) async fn wait_for_tmux_ready(tmux_name: &str) -> PaneReadiness {
     }
 }
 
-/// One probe iteration: `tmux has-session` then (on success) `tmux
-/// list-panes -F "#{pane_dead}"`. Both shell out to the tmux binary;
-/// they're cheap (microseconds in the happy path) so the 50ms poll
-/// floor dominates wall time, not subprocess overhead.
+/// One probe iteration.
 async fn probe_tmux_readiness(tmux_name: &str) -> PaneReadiness {
     let name = tmux_name.to_string();
     tokio::task::spawn_blocking(move || {
@@ -267,29 +215,19 @@ async fn probe_tmux_readiness(tmux_name: &str) -> PaneReadiness {
 mod tests {
     use super::*;
 
+    /// A window is ready while any pane is alive; an empty answer means tmux has not
+    /// created the panes yet, which is not the same as a dead window.
     #[test]
-    fn parse_pane_dead_empty_is_not_ready() {
-        assert_eq!(parse_pane_dead_output(""), PaneReadiness::NotReady);
-        assert_eq!(parse_pane_dead_output("   \n  \n"), PaneReadiness::NotReady);
-    }
-
-    #[test]
-    fn parse_pane_dead_single_alive_is_ready() {
-        assert_eq!(parse_pane_dead_output("0\n"), PaneReadiness::Ready);
-    }
-
-    #[test]
-    fn parse_pane_dead_single_dead_is_dead() {
-        assert_eq!(parse_pane_dead_output("1\n"), PaneReadiness::Dead);
-    }
-
-    #[test]
-    fn parse_pane_dead_mixed_is_ready() {
-        assert_eq!(parse_pane_dead_output("1\n0\n1\n"), PaneReadiness::Ready);
-    }
-
-    #[test]
-    fn parse_pane_dead_all_dead_is_dead() {
-        assert_eq!(parse_pane_dead_output("1\n1\n"), PaneReadiness::Dead);
+    fn parse_pane_dead_output_reads_the_whole_window() {
+        for (out, want) in [
+            ("", PaneReadiness::NotReady),
+            ("   \n  \n", PaneReadiness::NotReady),
+            ("0\n", PaneReadiness::Ready),
+            ("1\n", PaneReadiness::Dead),
+            ("1\n0\n1\n", PaneReadiness::Ready),
+            ("1\n1\n", PaneReadiness::Dead),
+        ] {
+            assert_eq!(parse_pane_dead_output(out), want, "{out:?}");
+        }
     }
 }

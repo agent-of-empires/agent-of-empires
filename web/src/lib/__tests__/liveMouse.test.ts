@@ -1,5 +1,12 @@
 import { describe, expect, it } from "vitest";
-import { buttonMouseBytes, wheelMouseBytes, wheelNotches } from "../liveMouse";
+import {
+  cursorLineIndex,
+  pointerPaneCell,
+  buttonMouseBytes,
+  unwrapPointer,
+  wheelMouseBytes,
+  wheelNotches,
+} from "../liveMouse";
 
 const bytes = (...n: number[]) => new Uint8Array(n);
 const ascii = (s: string) => new Uint8Array([...s].map((c) => c.charCodeAt(0)));
@@ -11,7 +18,6 @@ describe("wheelMouseBytes", () => {
   });
 
   it("encodes legacy X10 wheel up/down (value + 32, ESC [ M prefix)", () => {
-    // wheel up = button 64 -> 0x60; col/row 3 -> 0x23.
     expect(wheelMouseBytes(true, false, 3, 3)).toEqual(bytes(0x1b, 0x5b, 0x4d, 64 + 32, 3 + 32, 3 + 32));
     expect(wheelMouseBytes(false, false, 3, 3)).toEqual(bytes(0x1b, 0x5b, 0x4d, 65 + 32, 3 + 32, 3 + 32));
   });
@@ -30,7 +36,6 @@ describe("buttonMouseBytes", () => {
     expect(buttonMouseBytes(0, false, false, true, 5, 7)).toEqual(ascii("\x1b[<0;5;7M"));
     expect(buttonMouseBytes(1, false, false, true, 5, 7)).toEqual(ascii("\x1b[<1;5;7M"));
     expect(buttonMouseBytes(2, false, false, true, 5, 7)).toEqual(ascii("\x1b[<2;5;7M"));
-    // Release keeps button identity but ends with lowercase m.
     expect(buttonMouseBytes(0, true, false, true, 5, 7)).toEqual(ascii("\x1b[<0;5;7m"));
   });
 
@@ -72,5 +77,90 @@ describe("wheelNotches", () => {
 
   it("is a no-op for a zero threshold", () => {
     expect(wheelNotches(99, 0, 8)).toEqual({ notches: 0, remainder: 99 });
+  });
+});
+
+describe("cursorLineIndex", () => {
+  it("indexes the live edge when every line fits on screen", () => {
+    expect(cursorLineIndex(72, 72, 63)).toBe(63);
+  });
+
+  it("keeps the mapping when scrolled back (screenRows < lines.length)", () => {
+    expect(cursorLineIndex(120, 72, 0)).toBe(48);
+    expect(cursorLineIndex(120, 72, 63)).toBe(111);
+  });
+
+  it("clamps the live edge at zero when the viewport is taller than the capture", () => {
+    expect(cursorLineIndex(5, 72, 3)).toBe(3);
+  });
+});
+
+describe("pointerPaneCell", () => {
+  it("is the identity when pane 0 sits at the window origin", () => {
+    expect(pointerPaneCell(10, 5, { cols: 80, rows: 24 })).toEqual({ col: 10, row: 6 });
+    expect(pointerPaneCell(10, 5, { cols: 80, rows: 24, left: 0, top: 0 })).toEqual({
+      col: 10,
+      row: 6,
+    });
+  });
+
+  it("subtracts a non-zero pane origin", () => {
+    expect(pointerPaneCell(10, 5, { cols: 164, rows: 71, left: 0, top: 1 })).toEqual({
+      col: 10,
+      row: 5,
+    });
+    expect(pointerPaneCell(340, 5, { cols: 164, rows: 71, left: 165, top: 1 })).toEqual({
+      col: 164,
+      row: 5,
+    });
+    expect(pointerPaneCell(170, 5, { cols: 164, rows: 71, left: 165, top: 1 })).toEqual({
+      col: 5,
+      row: 5,
+    });
+  });
+
+  it("clamps to pane 0's rectangle", () => {
+    expect(pointerPaneCell(500, 100, { cols: 164, rows: 71, left: 0, top: 1 })).toEqual({
+      col: 164,
+      row: 71,
+    });
+    expect(pointerPaneCell(0, 0, { cols: 164, rows: 71, left: 0, top: 1 })).toEqual({
+      col: 1,
+      row: 1,
+    });
+  });
+
+  it("treats a missing rectangle as a 1x1 pane", () => {
+    expect(pointerPaneCell(7, 9, null)).toEqual({ col: 1, row: 1 });
+  });
+});
+
+describe("unwrapPointer", () => {
+  // Line 0 is one row, line 1 wraps into three (the middle row one cell short for a deferred wide glyph), line 2 is one row.
+  const source = [
+    { line: 0, wrap: 0 },
+    { line: 1, wrap: 0 },
+    { line: 1, wrap: 1 },
+    { line: 1, wrap: 2 },
+    { line: 2, wrap: 0 },
+  ];
+  const widths = [5, 40, 39, 10, 3];
+  const rowWidth = (i: number) => widths[i]!;
+
+  it.each([
+    ["an unwrapped row", 0, 7, 0, { compositeRow: 0, compositeCol: 7 }],
+    ["a wrapped line's first row", 1, 7, 0, { compositeRow: 1, compositeCol: 7 }],
+    ["a continuation row", 2, 7, 0, { compositeRow: 1, compositeCol: 47 }],
+    ["a later continuation after a short row", 3, 7, 0, { compositeRow: 1, compositeCol: 86 }],
+    ["the line after a wrap", 4, 2, 0, { compositeRow: 2, compositeCol: 2 }],
+    ["a screen starting below history", 4, 2, 1, { compositeRow: 1, compositeCol: 2 }],
+    ["a row above the content", -2, 3, 0, { compositeRow: -2, compositeCol: 3 }],
+    ["a row below the content", 6, 3, 0, { compositeRow: 4, compositeCol: 3 }],
+  ])("maps %s", (_n, row, col, screenTop, want) => {
+    expect(unwrapPointer(row, col, source, rowWidth, screenTop)).toEqual(want);
+  });
+
+  it("passes coordinates through with no rendered rows", () => {
+    expect(unwrapPointer(3, 4, [], rowWidth, 0)).toEqual({ compositeRow: 3, compositeCol: 4 });
   });
 });

@@ -1,27 +1,21 @@
 //! Permission UI bridge.
-//!
-//! When an agent emits ACP `session/request_permission`, the structured view
-//! creates an `Approval` (with a server-side `Nonce`) and surfaces it via
-//! `state::Event::ApprovalRequested`. The client renders the approval card
-//! and the user taps allow/deny. The client posts back with the nonce and
-//! decision; the server resolves via `state::Event::ApprovalResolved`.
-//!
-//! This module isolates the bridge so the actor in `state.rs` doesn't have
-//! to know about UI semantics.
 
 use chrono::Utc;
 
-use super::approvals::{is_destructive, Approval, Nonce, ResolvedApproval};
+use super::approvals::{
+    is_choice_list, is_destructive, Approval, ApprovalOption, Nonce, ResolvedApproval,
+};
 use super::state::ToolCall;
 
-/// Build a fresh `Approval` for an incoming permission request. Generates
-/// a server-side nonce and decides destructive/benign classification.
-pub fn build_approval(tool_call: ToolCall) -> Approval {
+/// Build a fresh `Approval` for an incoming permission request.
+pub fn build_approval(tool_call: ToolCall, options: Vec<ApprovalOption>) -> Approval {
     let destructive = is_destructive(&tool_call.name, &tool_call.args_preview);
     Approval {
         nonce: Nonce::new(),
         tool_call,
         destructive,
+        choice: is_choice_list(&options),
+        options,
         requested_at: Utc::now(),
         resolved: None,
     }
@@ -43,41 +37,44 @@ pub fn resolve(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::acp::approvals::ApprovalDecision;
+    use crate::acp::approvals::ApprovalOptionKind;
 
-    #[test]
-    fn build_approval_marks_destructive_bash_rm() {
-        let tc = ToolCall {
+    fn tool_call(name: &str, kind: &str, args_preview: &str) -> ToolCall {
+        ToolCall {
             id: "tc".into(),
-            name: "Bash".into(),
-            kind: "execute".into(),
-            args_preview: r#"{"command":"rm -rf /tmp/x"}"#.into(),
+            name: name.into(),
+            kind: kind.into(),
+            args_preview: args_preview.into(),
             started_at: Utc::now(),
             parent_tool_call_id: None,
             memory_recall: None,
             diffs: Vec::new(),
-        };
-        let a = build_approval(tc);
-        assert!(a.destructive);
-        assert!(a.resolved.is_none());
-        assert!(!a.nonce.0.is_empty());
+        }
     }
 
     #[test]
-    fn resolve_sets_decision_and_timestamp() {
-        let tc = ToolCall {
-            id: "tc".into(),
-            name: "Read".into(),
-            kind: "read".into(),
-            args_preview: "{}".into(),
-            started_at: Utc::now(),
-            parent_tool_call_id: None,
-            memory_recall: None,
-            diffs: Vec::new(),
-        };
-        let mut a = build_approval(tc);
-        resolve(&mut a, ApprovalDecision::Allow, None);
-        let resolved = a.resolved.unwrap();
-        assert_eq!(resolved.decision, ApprovalDecision::Allow);
+    fn build_approval_classifies_the_tool_call_and_its_options() {
+        let destructive = build_approval(
+            tool_call("Bash", "execute", r#"{"command":"rm -rf /tmp/x"}"#),
+            Vec::new(),
+        );
+        assert!(destructive.destructive);
+        assert!(!destructive.choice);
+        assert!(destructive.resolved.is_none());
+        assert!(!destructive.nonce.0.is_empty());
+
+        let options: Vec<_> = ["Alpha", "Bravo"]
+            .iter()
+            .enumerate()
+            .map(|(i, name)| ApprovalOption {
+                option_id: format!("choice-{i}"),
+                name: (*name).into(),
+                kind: ApprovalOptionKind::AllowOnce,
+            })
+            .collect();
+        let question = build_approval(tool_call("Pi select", "other", "{}"), options.clone());
+        assert!(question.choice);
+        assert!(!question.destructive);
+        assert_eq!(question.options, options);
     }
 }

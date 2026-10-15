@@ -1,8 +1,4 @@
 // @vitest-environment jsdom
-//
-// Coverage for TokenEntryPage: extractToken handles both a raw token and a
-// full dashboard URL; a verified token saves and calls onSuccess; a rejected
-// token shows the error and re-enables the form.
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";

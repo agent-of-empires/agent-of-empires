@@ -1,8 +1,5 @@
-//! Edit-worktree-workdir-name dialog.
-//!
-//! A focused dialog (separate from the title/group rename flow) for changing
-//! a managed worktree session's directory name, with an opt-in to also rename
-//! the git branch. See #1723.
+//! Change a managed worktree session's directory name, with an opt-in to
+//! rename the git branch too. Separate from the title/group rename flow.
 
 use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::prelude::*;
@@ -11,15 +8,14 @@ use tui_input::backend::crossterm::EventHandler;
 use tui_input::Input;
 
 use super::DialogResult;
+use crate::tui::components::hint_buttons::HintButtons;
+use crate::tui::components::hover::{paint_hover_bg, HoverState};
 use crate::tui::components::render_text_field;
 use crate::tui::styles::Theme;
 
-/// Data returned when the dialog is submitted.
 #[derive(Debug, Clone)]
 pub struct WorktreeNameData {
-    /// New workdir name (raw; sanitized downstream).
     pub name: String,
-    /// Whether to also rename the underlying git branch.
     pub rename_branch: bool,
 }
 
@@ -30,6 +26,10 @@ pub struct WorktreeNameDialog {
     rename_branch: bool,
     /// 0 = name input, 1 = "rename branch" toggle.
     focused_field: usize,
+    field_rects: [Rect; 2],
+    /// The hovered toggle row. Visual only; never moves focus.
+    hover: HoverState,
+    footer: HintButtons,
 }
 
 impl WorktreeNameDialog {
@@ -40,6 +40,9 @@ impl WorktreeNameDialog {
             new_name: Input::default(),
             rename_branch: false,
             focused_field: 0,
+            field_rects: [Rect::default(); 2],
+            hover: HoverState::default(),
+            footer: HintButtons::default(),
         }
     }
 
@@ -82,6 +85,25 @@ impl WorktreeNameDialog {
         }
     }
 
+    /// A click on a field focuses it (and flips the toggle); a click on a
+    /// footer hint returns the key it stands for, for the caller to press.
+    pub fn handle_click(&mut self, col: u16, row: u16) -> Option<KeyEvent> {
+        let pos = ratatui::layout::Position::from((col, row));
+        if let Some(field) = self.field_rects.iter().position(|r| r.contains(pos)) {
+            self.focused_field = field;
+            if field == 1 {
+                self.rename_branch = !self.rename_branch;
+            }
+            return None;
+        }
+        self.footer.key_at(col, row)
+    }
+
+    pub fn handle_hover(&mut self, col: u16, row: u16) -> bool {
+        let toggle = self.hover.update(col, row, &self.field_rects[1..]);
+        self.footer.handle_hover(col, row) | toggle
+    }
+
     pub fn handle_paste(&mut self, text: &str) {
         if self.toggle_focused() {
             return;
@@ -90,9 +112,6 @@ impl WorktreeNameDialog {
     }
 
     pub fn render(&mut self, frame: &mut Frame, area: Rect, theme: &Theme) {
-        let dialog_area = super::centered_rect(area, 54, 13);
-        frame.render_widget(Clear, dialog_area);
-
         let block = Block::default()
             .borders(Borders::ALL)
             .border_type(BorderType::Rounded)
@@ -100,8 +119,7 @@ impl WorktreeNameDialog {
             .border_style(Style::default().fg(theme.accent))
             .title(" Edit Workdir Name ")
             .title_style(Style::default().fg(theme.title).bold());
-        let inner = block.inner(dialog_area);
-        frame.render_widget(block, dialog_area);
+        let (_, inner) = super::render_dialog_frame(frame, area, 54, 13, block);
 
         let chunks = Layout::default()
             .direction(Direction::Vertical)
@@ -132,6 +150,7 @@ impl WorktreeNameDialog {
             chunks[1],
         );
 
+        self.field_rects = [chunks[3], chunks[4]];
         render_text_field(
             frame,
             chunks[3],
@@ -156,17 +175,22 @@ impl WorktreeNameDialog {
             chunks[4],
         );
 
-        let hint = Line::from(vec![
-            Span::styled("Tab", Style::default().fg(theme.hint)),
-            Span::raw(" switch  "),
-            Span::styled("Space", Style::default().fg(theme.hint)),
-            Span::raw(" toggle  "),
-            Span::styled("Enter", Style::default().fg(theme.hint)),
-            Span::raw(" save  "),
-            Span::styled("Esc", Style::default().fg(theme.hint)),
-            Span::raw(" cancel"),
-        ]);
-        frame.render_widget(Paragraph::new(hint), chunks[6]);
+        if let Some(rect) = self.hover.current_in(&self.field_rects[1..]) {
+            paint_hover_bg(frame, rect, theme.selection);
+        }
+
+        self.footer.render(
+            frame,
+            chunks[6],
+            theme,
+            &[
+                ("Tab", "switch", KeyCode::Tab),
+                ("Space", "toggle", KeyCode::Null),
+                ("Enter", "save", KeyCode::Enter),
+                ("Esc", "cancel", KeyCode::Esc),
+            ],
+            Alignment::Left,
+        );
     }
 }
 
@@ -180,50 +204,40 @@ mod tests {
     }
 
     #[test]
-    fn empty_name_cancels() {
-        let mut d = WorktreeNameDialog::new("old", "old");
-        assert!(matches!(
-            d.handle_key(key(KeyCode::Enter)),
-            DialogResult::Cancel
-        ));
-    }
-
-    #[test]
-    fn types_name_and_submits() {
-        let mut d = WorktreeNameDialog::new("old", "old");
-        for c in "new-name".chars() {
-            d.handle_key(key(KeyCode::Char(c)));
-        }
-        match d.handle_key(key(KeyCode::Enter)) {
-            DialogResult::Submit(data) => {
-                assert_eq!(data.name, "new-name");
-                assert!(!data.rename_branch);
+    fn typed_name_and_toggle_decide_the_submit() {
+        use KeyCode::{Char, Enter, Tab};
+        // (keys before Enter, Some((name, rename_branch)) or None for cancel).
+        // Space types into the name field; it toggles only once focused.
+        let cases: [(&[KeyCode], Option<(&str, bool)>); 4] = [
+            (&[], None),
+            (&[Char('n'), Char('e'), Char('w')], Some(("new", false))),
+            (&[Char('a'), Char(' '), Char('b')], Some(("a b", false))),
+            (&[Char('x'), Tab, Char(' ')], Some(("x", true))),
+        ];
+        for (keys, want) in cases {
+            let mut d = WorktreeNameDialog::new("old", "old");
+            for code in keys {
+                d.handle_key(key(*code));
             }
-            _ => panic!("expected submit"),
+            let got = match d.handle_key(key(Enter)) {
+                DialogResult::Submit(data) => Some((data.name, data.rename_branch)),
+                DialogResult::Cancel => None,
+                DialogResult::Continue => panic!("{keys:?} did not decide"),
+            };
+            assert_eq!(got, want.map(|(n, r)| (n.to_string(), r)), "{keys:?}");
         }
     }
 
     #[test]
-    fn toggle_enables_branch_rename() {
+    fn a_click_focuses_a_field_and_flips_the_toggle_while_hover_only_tints() {
         let mut d = WorktreeNameDialog::new("old", "old");
-        for c in "x".chars() {
-            d.handle_key(key(KeyCode::Char(c)));
-        }
-        d.handle_key(key(KeyCode::Tab)); // focus toggle
-        d.handle_key(key(KeyCode::Char(' '))); // toggle on
-        match d.handle_key(key(KeyCode::Enter)) {
-            DialogResult::Submit(data) => assert!(data.rename_branch),
-            _ => panic!("expected submit"),
-        }
-    }
-
-    #[test]
-    fn space_on_name_field_types_space_not_toggle() {
-        let mut d = WorktreeNameDialog::new("old", "old");
-        d.handle_key(key(KeyCode::Char('a')));
-        d.handle_key(key(KeyCode::Char(' ')));
-        d.handle_key(key(KeyCode::Char('b')));
-        assert_eq!(d.new_name.value(), "a b");
-        assert!(!d.rename_branch);
+        crate::tui::dialogs::test_render::draw(80, 20, |f, theme| d.render(f, f.area(), theme));
+        let [name, toggle] = d.field_rects;
+        assert!(d.handle_hover(toggle.x, toggle.y));
+        assert_eq!(d.focused_field, 0);
+        assert_eq!(d.handle_click(toggle.x, toggle.y), None);
+        assert!(d.rename_branch && d.focused_field == 1);
+        d.handle_click(name.x, name.y);
+        assert_eq!(d.focused_field, 0);
     }
 }

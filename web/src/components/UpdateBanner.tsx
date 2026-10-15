@@ -2,23 +2,10 @@ import { useEffect, useState } from "react";
 import { dismissUpdate, fetchUpdateStatus } from "../lib/api";
 import type { UpdateStatus } from "../lib/api";
 
-// Re-poll cadence for `/api/system/update-status`. The server caches the
-// GitHub check for a day, so hourly polls are cheap cache hits that still
-// pick up a new release (or a dismissal from another device) promptly.
+// Re-poll cadence for `/api/system/update-status`.
 const POLL_MINUTES = 60;
 
-/**
- * Top-of-app banner shown when `update_available` is true. Dismiss
- * persists by latest_version in server-side app_state (not per-browser
- * localStorage), so acknowledging a release once hides it on every device
- * and matches the TUI's snooze; a newer release re-surfaces it.
- * Polls on mount + at a fixed hourly cadence + on tab
- * visibilitychange. Honors `update_check_mode`: server returns
- * `update_available: false` when mode = off, so nothing renders.
- * Mode = auto also suppresses the banner (the runtime installs
- * silently and the user picks the new binary up next launch).
- * See #984 and #1140.
- */
+/** Top-of-app banner shown when `update_available` is true. */
 export function UpdateBanner() {
   const [status, setStatus] = useState<UpdateStatus | null>(null);
   // Optimistic local dismissal so the banner hides immediately on click,

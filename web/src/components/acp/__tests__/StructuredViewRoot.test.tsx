@@ -1,12 +1,4 @@
 // @vitest-environment jsdom
-//
-// Wiring test for the structured-view root keyboard reservation (#2011).
-// StructuredViewRoot is the tiny exported shell that calls useMobileKeyboard
-// and applies structuredViewRootStyle, extracted so this hook-to-style path is
-// covered without mounting the assistant-ui runtime (the #1282 pattern). The
-// pure helper is unit-tested separately in StructuredView.layout.test.ts; this
-// asserts the hook value actually reaches the rendered root's inline style.
-
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { cleanup, render, screen } from "@testing-library/react";
 
@@ -21,26 +13,45 @@ import { StructuredViewRoot } from "../StructuredView";
 
 afterEach(() => {
   cleanup();
+  window.localStorage.clear();
   mockKeyboard.current = { isMobile: false, keyboardOpen: false, keyboardHeight: 0 };
 });
 
-describe("StructuredViewRoot (#2011)", () => {
-  it("reserves the measured keyboard height as bottom padding (iOS regular Safari)", () => {
-    mockKeyboard.current = { isMobile: true, keyboardOpen: true, keyboardHeight: 280 };
-    render(
-      <StructuredViewRoot>
-        <div>child</div>
-      </StructuredViewRoot>,
-    );
-    expect(screen.getByTestId("structured-view-root").style.paddingBottom).toBe("280px");
+function renderRoot(keyboardHeight: number) {
+  mockKeyboard.current = { isMobile: true, keyboardOpen: keyboardHeight > 0, keyboardHeight };
+  render(
+    <StructuredViewRoot>
+      <div>child</div>
+    </StructuredViewRoot>,
+  );
+  return screen.getByTestId("structured-view-root");
+}
+
+describe("StructuredViewRoot", () => {
+  it.each([
+    [280, "280px"],
+    [0, ""],
+    [-12, ""],
+  ])("reserves keyboard height %s as bottom padding", (height, padding) => {
+    expect(renderRoot(height).style.paddingBottom).toBe(padding);
   });
 
-  it("reserves nothing when the layout viewport already shrinks (keyboardHeight 0)", () => {
-    render(
-      <StructuredViewRoot>
-        <div>child</div>
-      </StructuredViewRoot>,
+  // rem, not px, so the transcript still follows the browser's root font size.
+  it("publishes both conversation font sizes as rem, defaulting to 14px, without dropping the keyboard reservation", () => {
+    const fontSizes = (root: HTMLElement) => [
+      root.style.getPropertyValue("--acp-conversation-font-size-mobile"),
+      root.style.getPropertyValue("--acp-conversation-font-size-desktop"),
+    ];
+    expect(fontSizes(renderRoot(0))).toEqual(["0.875rem", "0.875rem"]);
+    cleanup();
+    window.localStorage.setItem(
+      "aoe-web-settings",
+      JSON.stringify({ structuredMobileFontSize: 11, structuredDesktopFontSize: 18 }),
     );
-    expect(screen.getByTestId("structured-view-root").style.paddingBottom).toBe("");
+    const root = renderRoot(300);
+    expect(fontSizes(root)).toEqual(["0.6875rem", "1.125rem"]);
+    // The CSS rule choosing between them keys off this class.
+    expect(root.classList.contains("acp-conversation-scope")).toBe(true);
+    expect(root.style.paddingBottom).toBe("300px");
   });
 });

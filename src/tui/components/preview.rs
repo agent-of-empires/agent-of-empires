@@ -9,41 +9,32 @@ use ratatui::widgets::*;
 use crate::session::Instance;
 use crate::tui::styles::Theme;
 
-/// Light value type the renderers consume in place of a raw `&str`.
-/// The caller is expected to hand over the cached parse from
-/// `PreviewCache::ensure_parsed`; we then read it directly for the
-/// actual render.
-///
-/// Passing a pre-parsed `Text` is the whole point of the
-/// optimisation: it lets the cache update once per content change
-/// rather than re-running the full `ansi-to-tui` pipeline on every
-/// frame. See `PreviewCache::ensure_parsed` for the parse-and-cache
-/// contract.
+/// Light value type the renderers consume in place of a raw `&str`: the cached
+/// parse from `PreviewCache::ensure_parsed`, so the cache updates once per
+/// content change rather than re-running `ansi-to-tui` on every frame.
 pub struct CachedPreview<'a> {
-    /// `None` means the source `content` was empty (no pane bytes
-    /// yet, or just cleared); callers render their own placeholder.
+    /// `None` means the source `content` was empty.
     pub text: Option<&'a Text<'static>>,
+    /// No frame has landed for the displayed session yet, so an empty `text`
+    /// says nothing about its pane: paint nothing rather than the "No output
+    /// available" hint, which would blink while a just-selected session fills.
+    pub pending: bool,
 }
 
 impl<'a> CachedPreview<'a> {
-    pub fn from_text(text: Option<&'a Text<'static>>) -> Self {
-        Self { text }
+    pub fn new(text: Option<&'a Text<'static>>, pending: bool) -> Self {
+        Self { text, pending }
     }
 }
 
-/// Row count of the Agent-view info header (profile/tool, path, status,
-/// optional sandbox line, optional worktree block) for `instance`.
+/// Row count of the Agent-view info header (profile/tool, path, status, optional
+/// sandbox line, optional worktree block) for `instance`.
 ///
-/// Exposed at the module level so callers outside `Preview::render_with_cache`
-/// can compute the same split. In particular, the live-send sync resize
-/// in `HomeView::finalize_live_send_resize` needs to size the tmux pane
-/// to the OUTPUT portion, not the full inner. The output portion is
-/// `inner.height - agent_info_height(inst) - 1`: subtract the info
-/// header, then subtract one more row for the inner ` Output ` banner
-/// that `render_output_cached` draws on top of the output sub-rect (a
-/// `Borders::TOP` block consumes one row). If the agent renders into a
-/// taller pane than the visible output area, the top of its output gets
-/// clipped on every frame and the user sees content shifted up.
+/// Module-level so callers outside `Preview::render_with_cache` compute the same
+/// split: render sizes the live-send tmux pane to the OUTPUT portion,
+/// `inner.height - agent_info_height(inst) - 1`, subtracting the header and the
+/// one row the inner ` Output ` banner block consumes. A taller pane clips the
+/// top of the agent's output on every frame.
 pub fn agent_info_height(instance: &Instance) -> u16 {
     let base: u16 = 3; // profile+tool / path / status
     let sandbox_lines: u16 = if instance.is_sandboxed() { 1 } else { 0 };
@@ -56,14 +47,11 @@ pub fn agent_info_height(instance: &Instance) -> u16 {
     }
 }
 
-/// Row count of the Terminal-view (and Tool-view) info header
-/// (title / path / status, plus one optional sandbox row) for
-/// `instance`.
+/// Row count of the Terminal-view (and Tool-view) info header (title / path /
+/// status, plus one optional sandbox row) for `instance`.
 ///
-/// Symmetric with [`agent_info_height`]: the live-send sync resize
-/// against a terminal target needs the OUTPUT portion of the preview
-/// pane, which is `inner.height - terminal_info_height(inst) - 1`
-/// (info header + one row for the inner ` Terminal Output ` banner).
+/// Symmetric with [`agent_info_height`]: the live-send resize against a terminal
+/// target uses `inner.height - terminal_info_height(inst) - 1`.
 pub fn terminal_info_height(instance: &Instance) -> u16 {
     let base: u16 = 3; // title / path / status
     let sandbox_lines: u16 = if instance.sandbox_info.as_ref().is_some_and(|s| s.enabled) {
@@ -77,13 +65,10 @@ pub fn terminal_info_height(instance: &Instance) -> u16 {
 /// The geometry of the preview body, computed once so every consumer agrees on
 /// where the output goes and how many rows it spans.
 ///
-/// Historically the info-header / banner / output split was re-derived
-/// independently in the renderers (`Layout` + `Borders`), in `render_preview`
-/// (for the tmux pane size and the scroll clamp), and in the live `[offset/max]`
-/// footer. Each derivation drifted by a row at some point, which is the bug
-/// #1521, #1570, and #1604 each chased in turn. `PreviewLayout::compute` is the
-/// single definition; `output.height` is THE visible-row count. Anyone needing
-/// preview geometry calls this rather than re-counting rows.
+/// The info-header / banner / output split was once re-derived independently in
+/// the renderers, in `render_preview` and in the live `[offset/max]` footer, and
+/// each derivation drifted by a row (#1521, #1570, #1604). This is the single
+/// definition; `output.height` is THE visible-row count.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct PreviewLayout {
     /// The info-header rect, present iff the header is shown (header toggle on
@@ -99,11 +84,10 @@ pub(crate) struct PreviewLayout {
 
 impl PreviewLayout {
     /// Split `area` (the preview block's inner rect) into header / banner /
-    /// output. With the header hidden (toggle off) or the viewport compact, the
-    /// output claims the whole `area` and there is no banner. Otherwise the
-    /// header takes the top `info_height` rows, a one-row banner follows, and
-    /// the output gets the rest, clamped so a pane shorter than that chrome
-    /// yields a zero-height output instead of underflowing.
+    /// output. With the header hidden or the viewport compact, the output claims
+    /// the whole `area` and there is no banner. Otherwise the header takes the
+    /// top `info_height` rows, a one-row banner follows, and the output gets the
+    /// rest, clamped so a pane shorter than that chrome yields zero height.
     pub(crate) fn compute(area: Rect, compact: bool, show_info: bool, info_height: u16) -> Self {
         if compact || !show_info {
             return Self {
@@ -161,10 +145,9 @@ impl Preview {
         compact: bool,
         show_info: bool,
     ) {
-        // One source of truth for the header / banner / output split. Compact
+        // One source of truth for the header / banner / output split; compact
         // viewports and the hidden-header toggle both collapse to "output owns
-        // the whole area" inside `PreviewLayout::compute`, symmetric with the
-        // Structured view's `render_with_cache`.
+        // the whole area" inside `PreviewLayout::compute`.
         let layout =
             PreviewLayout::compute(area, compact, show_info, terminal_info_height(instance));
 
@@ -223,9 +206,8 @@ impl Preview {
         let line_count = parsed_output.map_or(0, |t| t.lines.len());
 
         // The inner ` Terminal Output ` banner is present exactly when the info
-        // section is (see `PreviewLayout`): with it hidden the outer block title
-        // already names the view and the scroll indicator is hoisted there by
-        // the caller, so the body claims the freed row.
+        // section is: with it hidden the outer block title already names the
+        // view, so the body claims the freed row.
         if let Some(banner) = layout.banner {
             let mut block = Block::default()
                 .borders(Borders::TOP)
@@ -260,7 +242,7 @@ impl Preview {
                 scroll_offset,
                 Style::default().fg(theme.text),
             );
-        } else {
+        } else if !cached_output.pending {
             let hint = Paragraph::new("No output available")
                 .style(Style::default().fg(theme.dimmed))
                 .alignment(Alignment::Center);
@@ -281,9 +263,8 @@ impl Preview {
         show_info: bool,
     ) {
         // One source of truth for the split. With the header hidden or the
-        // viewport compact, `PreviewLayout::compute` returns `info: None` /
-        // `banner: None` and the output claims the whole pane (the outer block
-        // already says "Preview", so an inner banner would be redundant chrome).
+        // viewport compact the output claims the whole pane, and the outer block
+        // already says "Preview".
         let layout = PreviewLayout::compute(area, compact, show_info, agent_info_height(instance));
         if let Some(info_area) = layout.info {
             Self::render_info(frame, info_area, instance, theme, idle_decay_window);
@@ -414,20 +395,15 @@ impl Preview {
         scroll_offset: u16,
         theme: &Theme,
     ) {
-        // `output.height` is the visible-row count straight from `PreviewLayout`;
-        // there is no banner subtraction here (the banner, when present, sits in
-        // its own row above `output`).
+        // `output.height` is the visible-row count straight from
+        // `PreviewLayout`. The error path below returns early, so `parsed_output`
+        // is the caller's cached parse by the time the Paragraph uses it.
         let visible_height = output.height as usize;
-        // The error path below returns early, so by the time we use
-        // `parsed_output` for the output Paragraph the error case has
-        // been handled. Until then `parsed_output` is just the cached
-        // parse passed in by the caller (renamed for readability).
         let parsed_output = cached_output.text;
         let line_count = parsed_output.map_or(0, |t| t.lines.len());
 
-        // The inner ` Output ` banner is drawn only when `PreviewLayout` gave us
-        // a banner row (info header shown, non-compact). The outer block already
-        // names the session when it's hidden, so the body claims the freed row.
+        // The inner ` Output ` banner is drawn only when `PreviewLayout` gave a
+        // banner row; otherwise the body claims the freed row.
         if let Some(banner) = banner {
             let mut block = Block::default()
                 .borders(Borders::TOP)
@@ -476,7 +452,7 @@ impl Preview {
                 scroll_offset,
                 Style::default().fg(theme.text),
             );
-        } else {
+        } else if !cached_output.pending {
             let hint = Paragraph::new("No output available")
                 .style(Style::default().fg(theme.dimmed))
                 .alignment(Alignment::Center);
@@ -485,11 +461,10 @@ impl Preview {
     }
 }
 
-/// The `Borders::TOP` block that draws the ` Output ` / ` Terminal Output `
-/// banner. It spans the banner row plus the whole output body so its single top
-/// border lands on the banner row and `block.inner()` coincides exactly with
-/// `output`. Built from `PreviewLayout`'s `output` + `banner` rects so the
-/// banner can never be sized independently of the body it caps.
+/// The `Borders::TOP` block drawing the ` Output ` / ` Terminal Output ` banner.
+/// It spans the banner row plus the output body so its top border lands on the
+/// banner row and `block.inner()` coincides with `output`, which is why it is
+/// built from `PreviewLayout`'s rects rather than sized independently.
 fn banner_block_area(output: Rect, banner: Rect) -> Rect {
     Rect {
         x: output.x,
@@ -499,14 +474,10 @@ fn banner_block_area(output: Rect, banner: Rect) -> Rect {
     }
 }
 
-/// Pick the row offset passed to `Paragraph::scroll`. Zero user offset shows
-/// the bottom of the cached pane (live-follow). A positive offset scrolls the
-/// same number of lines back, saturating at the top of the capture.
-///
-/// Exposed at crate visibility so the preview drag-select code can map a
-/// screen row to the absolute content line under it: the value returned here
-/// is the index of the parsed-text line painted on the output pane's top row,
-/// so `first_line + (screen_row - pane.y)` is the line beneath any cell.
+/// Pick the row offset passed to `Paragraph::scroll`. Zero shows the bottom of
+/// the cached pane (live-follow); a positive offset scrolls back, saturating at
+/// the top. Crate-visible so preview drag-select can map a screen row to an
+/// absolute content line: `first_line + (screen_row - pane.y)`.
 pub(crate) fn compute_scroll(line_count: usize, visible_height: usize, user_offset: u16) -> u16 {
     if line_count <= visible_height {
         return 0;
@@ -531,13 +502,9 @@ pub(crate) fn visible_line_range(
 /// Render only the visible window of `text` into `area`.
 ///
 /// `Paragraph::new(text).scroll((n, 0))` clones and lays out the WHOLE parsed
-/// `Text` every frame, so a deep frozen snapshot (the reading capture can run to
-/// thousands of lines) made a fast wheel flick stutter: each frame paid an
-/// O(total-lines) clone plus layout, and at a high event rate the renders
-/// couldn't keep up. Slicing to just the `visible_height` rows at the current
-/// offset first keeps every frame O(visible), so scroll cost is flat no matter
-/// how much scrollback is held. Rendered at scroll 0 because the slice already
-/// starts at the top visible row.
+/// `Text` every frame, so a deep snapshot made a fast wheel flick stutter.
+/// Slicing to the `visible_height` rows at the current offset keeps every frame
+/// O(visible). Rendered at scroll 0 because the slice starts at the top row.
 fn render_scrolled_output(
     frame: &mut Frame,
     area: Rect,
@@ -567,10 +534,12 @@ pub fn format_scroll_indicator(
     Some(format!(" [{}/{}] ", clamped, max_offset))
 }
 
-/// Parse a captured ANSI string into a ratatui `Text`.
+/// Parse a captured ANSI string into a ratatui `Text`. Module-level so
+/// `PreviewCache::ensure_parsed` can drive the cache from `home/preview.rs`.
 ///
-/// Visible at the module level so `PreviewCache::ensure_parsed` can
-/// call it from `src/tui/home/mod.rs` to drive the cache.
+/// OSC 8 is stripped rather than carried: `ansi-to-tui` drops the visible text
+/// around an ST-terminated OSC (#1181), and a ratatui cell cannot hold a
+/// hyperlink target. The targets live in `PreviewCache::links` instead.
 pub fn parse_output_text(content: &str) -> Text<'static> {
     let cleaned = crate::tmux::utils::strip_osc_st(content);
     cleaned.into_text().unwrap_or_else(|_| Text::from(cleaned))
@@ -583,20 +552,12 @@ fn shorten_path(path: &str) -> String {
         if let (Ok(canonical_path), Ok(canonical_home)) =
             (path_buf.canonicalize(), home.canonicalize())
         {
-            let path_str = canonical_path.to_string_lossy();
-            if let Some(home_str) = canonical_home.to_str() {
-                if let Some(stripped) = path_str.strip_prefix(home_str) {
-                    return format!("~{}", stripped);
-                }
-            }
-            return path_str.into_owned();
+            return crate::util::collapse_home(
+                &canonical_path.to_string_lossy(),
+                &canonical_home.to_string_lossy(),
+            );
         }
-
-        if let Some(home_str) = home.to_str() {
-            if let Some(stripped) = path.strip_prefix(home_str) {
-                return format!("~{}", stripped);
-            }
-        }
+        return crate::util::collapse_home(path, &home.to_string_lossy());
     }
     path.to_string()
 }
@@ -605,39 +566,37 @@ fn shorten_path(path: &str) -> String {
 mod tests {
     use super::*;
 
+    /// Pins `$HOME` so the read inside `shorten_path` cannot see a value another
+    /// test set. `isolate_home` holds the process-global env lock for the guard's
+    /// lifetime and restores `$HOME` on Drop, before the tempdir is deleted.
     #[test]
-    fn test_shorten_path_with_home() {
-        if let Some(home) = dirs::home_dir() {
-            if let Some(home_str) = home.to_str() {
-                let path = format!("{}/projects/myapp", home_str);
-                let shortened = shorten_path(&path);
-                assert_eq!(shortened, "~/projects/myapp");
-            }
+    #[serial_test::serial]
+    fn shorten_path_abbreviates_home() {
+        let home = tempfile::TempDir::new().expect("temp home");
+        let _home = crate::session::test_support::isolate_home(home.path());
+        let home_str = home.path().to_str().expect("utf-8 temp home");
+
+        for (case, path, expect) in [
+            (
+                "a path under home",
+                format!("{home_str}/projects/myapp"),
+                "~/projects/myapp",
+            ),
+            ("home itself", home_str.to_string(), "~"),
+            // A sibling whose name merely starts with the home path.
+            (
+                "a similar prefix",
+                format!("{home_str}extra/not/home"),
+                &*format!("{home_str}extra/not/home"),
+            ),
+            (
+                "a trailing slash",
+                format!("{home_str}/projects/"),
+                "~/projects/",
+            ),
+        ] {
+            assert_eq!(shorten_path(&path), expect, "{case}");
         }
-    }
-
-    #[test]
-    fn test_shorten_path_without_home_prefix() {
-        let path = "/tmp/some/path";
-        let shortened = shorten_path(path);
-        assert_eq!(shortened, "/tmp/some/path");
-    }
-
-    #[test]
-    fn test_shorten_path_exact_home() {
-        if let Some(home) = dirs::home_dir() {
-            if let Some(home_str) = home.to_str() {
-                let shortened = shorten_path(home_str);
-                assert_eq!(shortened, "~");
-            }
-        }
-    }
-
-    #[test]
-    fn test_shorten_path_relative() {
-        let path = "relative/path";
-        let shortened = shorten_path(path);
-        assert_eq!(shortened, "relative/path");
     }
 
     #[test]
@@ -647,31 +606,8 @@ mod tests {
         assert_eq!(shortened, "");
     }
 
-    #[test]
-    fn test_shorten_path_similar_prefix_not_home() {
-        if let Some(home) = dirs::home_dir() {
-            if let Some(home_str) = home.to_str() {
-                let path = format!("{}extra/not/home", home_str);
-                let shortened = shorten_path(&path);
-                assert_eq!(shortened, format!("~extra/not/home"));
-            }
-        }
-    }
-
-    #[test]
-    fn test_shorten_path_preserves_trailing_slash() {
-        if let Some(home) = dirs::home_dir() {
-            if let Some(home_str) = home.to_str() {
-                let path = format!("{}/projects/", home_str);
-                let shortened = shorten_path(&path);
-                assert_eq!(shortened, "~/projects/");
-            }
-        }
-    }
-
-    // Single source of truth for the preview split. These pin down the row
-    // arithmetic that #1521 / #1570 / #1604 each got wrong in a different
-    // derivation; now there is only one.
+    // Single source of truth for the preview split, pinning the row arithmetic
+    // that #1521 / #1570 / #1604 each got wrong in a different derivation.
     fn rect(x: u16, y: u16, w: u16, h: u16) -> Rect {
         Rect {
             x,
@@ -719,9 +655,7 @@ mod tests {
     }
 
     // End to end: a captured screen exactly as tall as the banner-less output,
-    // live-following (offset 0). The scroll must be 0 so the top row (a fresh
-    // shell's cursor) stays on screen. This is the #1604 "first row hidden"
-    // regression, now expressed against the single layout source.
+    // live-following. Scroll must be 0 so the top row stays on screen (#1604).
     #[test]
     fn full_height_capture_does_not_scroll_when_banner_hidden() {
         let area = rect(0, 0, 80, 40);
@@ -790,11 +724,9 @@ mod tests {
         );
     }
 
-    // `agent_info_height` drives both the preview layout split in
-    // `render_with_cache` and the live-send sync resize in
-    // `HomeView::finalize_live_send_resize`. A one-row drift here brings
-    // the shifted-preview bug right back, so each branch of the formula
-    // gets a dedicated case.
+    // `agent_info_height` drives both the preview layout split and the live-send
+    // worker geometry, so each branch of the formula gets a case: a one-row drift
+    // brings the shifted-preview bug back.
     mod agent_info_height {
         use super::super::agent_info_height;
         use crate::session::{Instance, SandboxInfo, WorktreeInfo};
@@ -812,6 +744,7 @@ mod tests {
 
         fn enabled_sandbox() -> SandboxInfo {
             SandboxInfo {
+                provider: None,
                 enabled: true,
                 container_id: None,
                 image: "img".into(),
@@ -868,10 +801,8 @@ mod tests {
         }
     }
 
-    // Terminal-view counterpart of `agent_info_height`. Same drift-guard
-    // motivation: the live-send sync resize against a terminal target
-    // sizes the tmux pane to `inner - terminal_info_height - 1`. A wrong
-    // formula here brings the shifted-preview bug back in Terminal view.
+    // Terminal-view counterpart of `agent_info_height`, guarding the same drift:
+    // the live-send resize sizes the pane to `inner - terminal_info_height - 1`.
     mod terminal_info_height {
         use super::super::terminal_info_height;
         use crate::session::{Instance, SandboxInfo, WorktreeInfo};
@@ -879,6 +810,7 @@ mod tests {
 
         fn enabled_sandbox() -> SandboxInfo {
             SandboxInfo {
+                provider: None,
                 enabled: true,
                 container_id: None,
                 image: "img".into(),
@@ -926,5 +858,54 @@ mod tests {
             });
             assert_eq!(terminal_info_height(&inst), 3);
         }
+    }
+
+    /// Rows of a rendered terminal preview, for the hint assertions below.
+    fn terminal_preview_rows(pending: bool) -> Vec<String> {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+        let theme = crate::tui::styles::load_theme("empire");
+        let instance = Instance::new("pane", "/tmp/pane");
+        let mut terminal = Terminal::new(TestBackend::new(60, 12)).unwrap();
+        terminal
+            .draw(|frame| {
+                Preview::render_terminal_preview(
+                    frame,
+                    frame.area(),
+                    &instance,
+                    true,
+                    CachedPreview::new(None, pending),
+                    0,
+                    &theme,
+                    false,
+                    false,
+                );
+            })
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol().to_string())
+                    .collect()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn empty_preview_hint_waits_for_the_first_frame() {
+        let hint = |pending| {
+            terminal_preview_rows(pending)
+                .iter()
+                .any(|row| row.contains("No output available"))
+        };
+        assert!(
+            hint(false),
+            "an empty frame for the displayed session paints the hint"
+        );
+        assert!(
+            !hint(true),
+            "no frame yet for the displayed session paints nothing"
+        );
     }
 }

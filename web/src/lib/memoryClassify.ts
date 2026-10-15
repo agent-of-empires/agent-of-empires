@@ -1,9 +1,4 @@
-// Recognise Claude memory-system file ops so the structured view can render them
-// as a dedicated MemoryCard rather than a generic Read/Edit/Write card.
-//
-// Memory lives under `~/.claude/projects/<slug>/memory/*.md` and is
-// touched via the standard Read/Edit/Write tools, so the file path is
-// the only reliable signal. See issue #1071.
+// Recognise Claude memory file ops (`~/.claude/projects/<slug>/memory/*.md`) by path, for the MemoryCard.
 
 import { parseJsonObject, pickFirst, pickStr } from "./acpArgs";
 import type { ToolCall } from "./acpTypes";
@@ -12,13 +7,10 @@ export type MemoryVerb = "recalled" | "saved" | "updated";
 
 export interface MemoryHit {
   isMemory: true;
-  /** Full absolute path captured from the tool args. */
   path: string;
-  /** Filename including extension, e.g. `feedback_testing.md`. */
   basename: string;
-  /** Verb keyed off the underlying tool: Read/Edit/Write. */
   verb: MemoryVerb;
-  /** True when the path's basename is `MEMORY.md`, the user-facing index. */
+  /** The `MEMORY.md` index. */
   isIndex: boolean;
 }
 
@@ -26,9 +18,7 @@ export interface NotMemory {
   isMemory: false;
 }
 
-/** A path is a memory file when it sits inside Claude's per-project
- *  memory directory and ends with `.md`. The full segment match keeps
- *  unrelated paths that merely contain `memory` from triggering. */
+/** Requires the full memory directory segment and a `.md` extension. */
 export function isMemoryPath(path: string): boolean {
   if (!path.endsWith(".md")) return false;
   return /\/\.claude\/projects\/[^/]+\/memory\//.test(path);
@@ -73,12 +63,7 @@ export interface ParsedMemory {
   body: string;
 }
 
-/** Lightweight frontmatter parser for memory files. Handles the
- *  `---`-delimited YAML-ish header documented in the memory-system
- *  prompt (`name`, `description`, `type`); any other fields are
- *  ignored. Fails soft: a file with no frontmatter (or malformed
- *  frontmatter) parses to a null header and the full text as body, so
- *  the card still renders something useful. */
+/** `name`/`description`/`type` frontmatter; without a valid header the whole text is the body. */
 export function parseMemoryFrontmatter(content: string): ParsedMemory {
   const empty: ParsedMemory = {
     name: null,
@@ -122,16 +107,7 @@ export function parseMemoryFrontmatter(content: string): ParsedMemory {
   };
 }
 
-/** Strip the transport noise the SDK wraps around synthesize-mode
- *  recall text before it reaches the card. The recalled file content
- *  arrives inside a `<system-reminder>` envelope and carries `cat -n`
- *  style line-number prefixes (the Read tool's `<spaces>N<tab>` form),
- *  both of which leak into the UI when rendered verbatim. We drop the
- *  envelope tags and the per-line number prefixes, leaving the markdown
- *  body intact for rendering. See #2142.
- *
- *  ponytail: only the tab-separated `cat -n` prefix is stripped; if the
- *  SDK ever switches to an arrow (`N→`) separator, extend the line regex. */
+/** Strip the `<system-reminder>` envelope and tab-separated `cat -n` prefixes from recalled memory. */
 export function cleanRecalledMemory(text: string): string {
   return text
     .replace(/<\/?system-reminder>/g, "")

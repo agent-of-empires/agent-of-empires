@@ -8,10 +8,8 @@ interface Props {
   onToggle: (id: string) => void;
 }
 
-/** Desktop icon strip (JetBrains-style tool-window bar): one icon per dockable
- *  pane (built-in or plugin-contributed), clicking toggles that pane open or
- *  closed. Replaces the single "toggle diff panel" button, which mislabeled a
- *  column that now holds diff, terminal, and plugin panes. */
+/** Desktop icon strip (JetBrains-style tool-window bar): one icon per dockable pane (built-in or plugin-
+ *  contributed), clicking toggles that pane open or closed. */
 export function ActivityBar({ paneIds, descriptorFor, isOpen, onToggle }: Props) {
   if (paneIds.length === 0) return null;
   return (
