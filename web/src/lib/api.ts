@@ -923,6 +923,8 @@ export interface ServerAbout {
   acp_replay_events: number;
   acp_compaction_reminder: boolean;
   acp_compaction_reminder_percent: number;
+  acp_notice_display: "persistent" | "timeout" | "hidden";
+  acp_notice_timeout_secs: number;
   build_flavor: "debug" | "release";
   /** Entry bundle name, compared against this page's own to detect a stale client. */
   web_build_id?: string | null;

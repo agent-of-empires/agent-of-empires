@@ -265,7 +265,7 @@ impl<S: BroadcastSink> Supervisor<S> {
             lifecycle: Arc::new(std::sync::Mutex::new(LifecycleTable::new(
                 chrono::Utc::now().timestamp_millis().max(1) as u64,
             ))),
-            process_control: Arc::new(SystemProcessControl),
+            process_control: Arc::new(SystemProcessControl::default()),
             launcher: Arc::new(|config, session_id| Box::pin(AcpClient::spawn(config, session_id))),
             warmed_up_agents: Arc::default(),
             agent_warmup_locks: Arc::default(),
@@ -307,11 +307,6 @@ impl<S: BroadcastSink> Supervisor<S> {
     fn mark_incompatible_binary(&self, session_id: &str, binary: &str) {
         lock_recover(&self.incompatible_binaries)
             .insert(session_id.to_string(), binary.to_string());
-    }
-
-    /// A user-initiated resume overrides a stop kept from a resume that failed before install.
-    pub fn forget_stale_cancel(&self, session_id: &str) {
-        lock_recover(&self.lifecycle).forget_stale_cancel(session_id);
     }
 
     pub fn request_respawn(&self, session_id: &str) {

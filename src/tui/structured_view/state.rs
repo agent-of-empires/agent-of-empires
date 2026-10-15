@@ -2,7 +2,9 @@
 //! and the websocket handle. Side effects run in the async loop in [`super`],
 //! so this state stays freely borrowable by the render layer.
 
-use std::collections::{HashSet, VecDeque};
+use std::cell::RefCell;
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::time::Instant;
 
 use ratatui::layout::Rect;
 use ratatui_textarea::TextArea;
@@ -16,6 +18,7 @@ use crate::acp::session_paths::SessionPathRoots;
 use crate::acp::state::{AvailableCommand, SessionNotice};
 use crate::daemon::QueuedPromptEntry;
 use crate::plugin::ui_state::{Notification, UiSnapshot};
+use crate::session::config::NoticePolicy;
 use crate::tui::components::hover::HoverState;
 use crate::tui::plugin_ui;
 
@@ -44,6 +47,12 @@ pub struct StructuredViewState {
     /// list is shared, and dismissing in this view must not clear the web's
     /// banner. Pruned by [`Self::prune_dismissed_notices`].
     pub dismissed_notices: HashSet<String>,
+    /// The daemon's notice display policy. Read from `/api/about`, so a
+    /// remote-attached view honours that daemon's config.
+    pub notice_policy: NoticePolicy,
+    /// When each notice was first rendered here, which the auto-dismiss timeout
+    /// counts from. Interior-mutable: the render borrows the state immutably.
+    notice_first_seen: RefCell<HashMap<String, Instant>>,
     /// Mirror of the daemon-owned prompt queue (drained server-side at the turn
     /// edge). Refreshed from `/queue` on connect and at each turn edge, with
     /// optimistic edits in between.
@@ -263,20 +272,33 @@ pub enum ToastKind {
 }
 
 impl StructuredViewState {
-    /// Notices the daemon still reports and the user has not dismissed here.
+    /// Notices the daemon still reports that the user has not dismissed here
+    /// and the notice policy has not hidden.
     pub fn visible_notices(&self) -> impl Iterator<Item = &SessionNotice> {
-        self.transcript
-            .session_notices
-            .iter()
-            .filter(|n| !self.dismissed_notices.contains(&n.id))
+        let now = Instant::now();
+        self.transcript.session_notices.iter().filter(move |n| {
+            if self.dismissed_notices.contains(&n.id) {
+                return false;
+            }
+            let first_seen = *self
+                .notice_first_seen
+                .borrow_mut()
+                .entry(n.id.clone())
+                .or_insert(now);
+            !self
+                .notice_policy
+                .hides(&n.severity, now.saturating_duration_since(first_seen))
+        })
     }
 
-    /// Drops dismissal ids the daemon no longer reports, so the set cannot grow
-    /// across a long session. Call after adopting a `reduced_state` frame.
+    /// Drops dismissal and first-seen ids the daemon no longer reports, so the
+    /// sets cannot grow across a long session. Call after adopting a
+    /// `reduced_state` frame.
     pub fn prune_dismissed_notices(&mut self) {
         let live = &self.transcript.session_notices;
-        self.dismissed_notices
-            .retain(|id| live.iter().any(|n| &n.id == id));
+        let is_live = |id: &String| live.iter().any(|n| &n.id == id);
+        self.dismissed_notices.retain(is_live);
+        self.notice_first_seen.get_mut().retain(|id, _| is_live(id));
     }
 
     pub fn new(
@@ -297,6 +319,8 @@ impl StructuredViewState {
             ws,
             toast: None,
             dismissed_notices: HashSet::new(),
+            notice_policy: NoticePolicy::default(),
+            notice_first_seen: RefCell::new(HashMap::new()),
             queue: QueueMirror::default(),
             in_flight: false,
             slash_selected: 0,

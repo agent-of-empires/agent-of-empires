@@ -43,6 +43,8 @@ export const HOST_STATE_VARS = new Set([
   "AOE_E2E_PARTIAL_FRAME_FILE",
   "AOE_E2E_PROMPT_COMPLETED_FILE",
   "AOE_E2E_STORAGE_LOCK_CONTENDED",
+  "AOE_PRIME_CENSUS_CHILD",
+  "AOE_RUNNER_EXPIRY_CHILD",
   "AOE_TUI_TEST_CHILD",
   "AOE_TUI_TEST_ENTERED",
   // Test-only subprocess controls must never leak from the host shell.

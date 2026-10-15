@@ -5,18 +5,36 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   __resetDraftPersistFailureNotifications,
   clearDraft,
-  clearDraftAttachments,
   getDraft,
   getDraftAttachments,
   hasDraft,
   hasDraftAttachments,
+  notifyAttachmentRestoreFailure,
   setDraft,
   setDraftAttachments,
   subscribeDrafts,
   sweepOrphanDrafts,
 } from "./acpDrafts";
 import type { PromptAttachmentInput } from "./acpTypes";
+import { deleteAttachments, listAttachmentSessionIds, saveAttachments } from "./attachmentStore";
 import { toastBus } from "./toastBus";
+
+// Lets a test hold a save in flight so queued-write ordering is exercised without sleeps.
+const saveGate = vi.hoisted(() => ({ hold: null as Promise<void> | null, deleteHold: null as Promise<void> | null }));
+vi.mock("./attachmentStore", async (importOriginal) => {
+  const real = await importOriginal<typeof import("./attachmentStore")>();
+  return {
+    ...real,
+    saveAttachments: async (...args: Parameters<typeof real.saveAttachments>) => {
+      await saveGate.hold;
+      return real.saveAttachments(...args);
+    },
+    deleteAttachments: async (...args: Parameters<typeof real.deleteAttachments>) => {
+      await saveGate.deleteHold;
+      return real.deleteAttachments(...args);
+    },
+  };
+});
 
 const img = (dataB64 = "AAAA", name?: string): PromptAttachmentInput => ({
   kind: "image",
@@ -54,10 +72,14 @@ function listen(filter: string[] | null) {
 }
 const storageEvent = (key: string | null) => window.dispatchEvent(new StorageEvent("storage", { key, newValue: "x" }));
 
-beforeEach(() => {
+beforeEach(async () => {
   window.localStorage.clear();
   __resetDraftPersistFailureNotifications();
+  await Promise.all((await listAttachmentSessionIds()).map((id) => deleteAttachments(id)));
 });
+
+// Sorted ids currently held in IndexedDB.
+const storedIds = () => listAttachmentSessionIds().then((ids) => ids.sort());
 
 afterEach(() => {
   for (const unsub of unsubs.splice(0)) unsub();
@@ -120,26 +142,33 @@ describe("subscribeDrafts", () => {
     expect(cb).toHaveBeenCalledTimes(calls);
   });
 
-  it("notifies filtered subscribers on attachment writes", () => {
+  it("notifies filtered subscribers on attachment writes", async () => {
     const cb = listen(["s-1"]);
-    setDraftAttachments("s-1", [img()]);
+    await setDraftAttachments("s-1", [img()]);
     expect(cb).toHaveBeenCalledTimes(1);
   });
 });
 
 describe("sweepOrphanDrafts", () => {
-  it("removes text and attachment drafts for inactive sessions only", () => {
+  it("removes text and attachment drafts for inactive sessions only", async () => {
     setDraft("s-keep", "alive");
-    setDraftAttachments("s-keep", [img("keep")]);
+    await setDraftAttachments("s-keep", [img("keep")]);
     setDraft("s-orphan", "gone");
-    setDraftAttachments("s-orphan", [img("gone")]);
+    await setDraftAttachments("s-orphan", [img("gone")]);
     localStorage.setItem("aoe:other", "untouched");
     sweepOrphanDrafts(new Set(["s-keep"]));
     expect(getDraft("s-keep")).toBe("alive");
-    expect(getDraftAttachments("s-keep")).toEqual([img("keep")]);
+    expect(await getDraftAttachments("s-keep")).toEqual([img("keep")]);
     expect(localStorage.getItem("acp:draft:s-orphan")).toBeNull();
     expect(localStorage.getItem("acp:draft-attachments:s-orphan")).toBeNull();
     expect(localStorage.getItem("aoe:other")).toBe("untouched");
+    await vi.waitFor(async () => expect(await storedIds()).toEqual(["s-keep"]));
+  });
+
+  it("removes an IndexedDB record that has no marker", async () => {
+    await saveAttachments("s-stray", [img("stray")]);
+    sweepOrphanDrafts(new Set());
+    await vi.waitFor(async () => expect(await storedIds()).toEqual([]));
   });
 
   it("notifies once only when something was removed", () => {
@@ -162,40 +191,169 @@ describe("sweepOrphanDrafts", () => {
 });
 
 describe("attachment drafts (#2493)", () => {
-  it("round-trip per session and light hasDraft without text", () => {
-    expect([getDraftAttachments("s-1"), hasDraftAttachments("s-1"), hasDraft("s-1")]).toEqual([[], false, false]);
-    setDraftAttachments("s-1", [img("ONE", "shot.png")]);
-    setDraftAttachments("s-2", [img("TWO")]);
-    expect(getDraftAttachments("s-1")).toEqual([img("ONE", "shot.png")]);
-    expect(getDraftAttachments("s-2")).toEqual([img("TWO")]);
+  it("round-trip per session and light hasDraft without text", async () => {
+    expect([await getDraftAttachments("s-1"), hasDraftAttachments("s-1"), hasDraft("s-1")]).toEqual([[], false, false]);
+    await setDraftAttachments("s-1", [img("ONE", "shot.png")]);
+    await setDraftAttachments("s-2", [img("TWO")]);
+    expect(await getDraftAttachments("s-1")).toEqual([img("ONE", "shot.png")]);
+    expect(await getDraftAttachments("s-2")).toEqual([img("TWO")]);
     expect([hasDraftAttachments("s-1"), hasDraft("s-1")]).toEqual([true, true]);
   });
 
-  it.each([
-    ["an empty array", () => setDraftAttachments("s-1", [])],
-    ["clearDraftAttachments", () => clearDraftAttachments("s-1")],
-  ])("%s removes the key", (_name, clear) => {
-    setDraftAttachments("s-1", [img()]);
-    clear();
+  it("stores a photo far past the localStorage quota", async () => {
+    const photo = img("A".repeat(8 * 1024 * 1024), "photo.jpg");
+    const errors = toastErrors();
+    await setDraftAttachments("s-1", [photo]);
+    expect(errors).toEqual([]);
+    expect(localStorage.getItem("acp:draft-attachments:s-1")).toBe("1");
+    expect(await getDraftAttachments("s-1")).toEqual([photo]);
+  });
+
+  it("an empty array removes the marker and the stored record", async () => {
+    await setDraftAttachments("s-1", [img()]);
+    await setDraftAttachments("s-1", []);
     expect(localStorage.getItem("acp:draft-attachments:s-1")).toBeNull();
     expect(hasDraftAttachments("s-1")).toBe(false);
+    expect(await storedIds()).toEqual([]);
   });
 
-  it("drops malformed entries and treats corrupt JSON as no draft", () => {
-    localStorage.setItem("acp:draft-attachments:s-1", JSON.stringify([img("OK"), { kind: "image" }, "garbage", null]));
-    expect(getDraftAttachments("s-1")).toEqual([img("OK")]);
-    localStorage.setItem("acp:draft-attachments:s-1", "{not json");
-    expect([getDraftAttachments("s-1"), hasDraftAttachments("s-1"), hasDraft("s-1")]).toEqual([[], false, false]);
+  it("drops malformed entries and treats a missing record as no draft", async () => {
+    await saveAttachments("s-1", [img("OK"), { kind: "image" }, "garbage", null] as unknown as PromptAttachmentInput[]);
+    localStorage.setItem("acp:draft-attachments:s-1", "1");
+    expect(await getDraftAttachments("s-1")).toEqual([img("OK")]);
+    localStorage.setItem("acp:draft-attachments:s-2", "1");
+    expect(await getDraftAttachments("s-2")).toEqual([]);
   });
 
-  it("removes the key on a failed write so a stale draft is never restored, toasting once", () => {
+  it("reports a failed read as null, not as an empty draft", async () => {
+    await setDraftAttachments("s-1", [img("KEEP")]);
+    const get = vi.spyOn(IDBObjectStore.prototype, "get").mockImplementationOnce(() => {
+      throw new DOMException("read failed", "UnknownError");
+    });
+    expect(await getDraftAttachments("s-1")).toBeNull();
+    get.mockRestore();
+    expect(await getDraftAttachments("s-1")).toEqual([img("KEEP")]);
+  });
+
+  it("drops a pre-IndexedDB JSON payload from the marker key on read", async () => {
+    localStorage.setItem("acp:draft-attachments:s-1", JSON.stringify([img("OLD")]));
+    expect(hasDraftAttachments("s-1")).toBe(false);
+    expect(await getDraftAttachments("s-1")).toEqual([]);
+    expect(localStorage.getItem("acp:draft-attachments:s-1")).toBeNull();
+  });
+
+  it("treats a marker that cannot be written as a failed save, leaving no orphan record", async () => {
     const errors = toastErrors();
-    setDraftAttachments("s-1", [img("OLD")]);
     quotaFull();
-    setDraftAttachments("s-1", [img("NEW-TOO-BIG")]);
-    setDraftAttachments("s-1", [img("BIGGER")]);
+    await setDraftAttachments("s-1", [img("SAVED")]);
+    vi.restoreAllMocks();
+    expect(await getDraftAttachments("s-1")).toEqual([]);
+    expect(await storedIds()).toEqual([]);
+    expect(errors).toEqual([expect.stringMatching(/storage full/i)]);
+  });
+
+  it("does not restore a record whose marker was removed, as when a delete aborts on unload", async () => {
+    await setDraftAttachments("s-1", [img("SENT")]);
+    localStorage.removeItem("acp:draft-attachments:s-1");
+    expect(await storedIds()).toEqual(["s-1"]);
+    expect(await getDraftAttachments("s-1")).toEqual([]);
+  });
+
+  it("does not warn about a failed older save after the draft was cleared", async () => {
+    const errors = toastErrors();
+    vi.spyOn(IDBObjectStore.prototype, "put").mockImplementationOnce(() => {
+      throw new DOMException("The quota has been exceeded.", "QuotaExceededError");
+    });
+    const older = setDraftAttachments("s-1", [img("OLDER")]);
+    const cleared = setDraftAttachments("s-1", []);
+    await Promise.all([older, cleared]);
+    expect(errors).toEqual([]);
+    expect(await storedIds()).toEqual([]);
+  });
+
+  it("a delayed clear leaves a newer draft that another context saved meanwhile", async () => {
+    const real = await vi.importActual<typeof import("./attachmentStore")>("./attachmentStore");
+    await setDraftAttachments("s-1", [img("A")]);
+    let release: () => void = () => {};
+    saveGate.deleteHold = new Promise<void>((resolve) => (release = resolve));
+    try {
+      // The clear removes the marker now, but its delete transaction is delayed.
+      const clearing = setDraftAttachments("s-1", []);
+      // Another tab stages a newer draft before that delete runs: marker and record both land.
+      localStorage.setItem("acp:draft-attachments:s-1", "1");
+      await real.saveAttachments("s-1", [img("OTHER-TAB")], Date.now() + 10_000);
+      release();
+      await clearing;
+      expect(await getDraftAttachments("s-1")).toEqual([img("OTHER-TAB")]);
+    } finally {
+      saveGate.deleteHold = null;
+    }
+  });
+
+  it("re-arms the restore-failure toast after a successful restore", async () => {
+    const errors = toastErrors();
+    notifyAttachmentRestoreFailure("s-1");
+    notifyAttachmentRestoreFailure("s-1");
+    expect(errors).toHaveLength(1);
+    await getDraftAttachments("s-1");
+    expect(errors).toHaveLength(1);
+    await setDraftAttachments("s-1", [img("X")]);
+    await getDraftAttachments("s-1");
+    notifyAttachmentRestoreFailure("s-1");
+    expect(errors).toHaveLength(2);
+  });
+
+  it("restores only after writes already queued for the session have landed", async () => {
+    let release: () => void = () => {};
+    saveGate.hold = new Promise<void>((resolve) => (release = resolve));
+    try {
+      const first = setDraftAttachments("s-1", [img("A")]);
+      const second = setDraftAttachments("s-1", [img("B")]);
+      // Both saves wait on the gate, so this read is issued while A is in flight and B is queued.
+      const restored = getDraftAttachments("s-1");
+      release();
+      await Promise.all([first, second]);
+      expect(await restored).toEqual([img("B")]);
+    } finally {
+      saveGate.hold = null;
+    }
+  });
+
+  it("applies overlapping writes in call order", async () => {
+    const first = setDraftAttachments("s-1", [img("FIRST")]);
+    const second = setDraftAttachments("s-1", [img("SECOND")]);
+    await Promise.all([first, second]);
+    expect(await getDraftAttachments("s-1")).toEqual([img("SECOND")]);
+    const stage = setDraftAttachments("s-1", [img("THIRD")]);
+    const clear = setDraftAttachments("s-1", []);
+    await Promise.all([stage, clear]);
+    expect([hasDraftAttachments("s-1"), await storedIds()]).toEqual([false, []]);
+  });
+
+  it("keeps a newer queued write when an older one fails", async () => {
+    const errors = toastErrors();
+    vi.spyOn(IDBObjectStore.prototype, "put").mockImplementationOnce(() => {
+      throw new DOMException("The quota has been exceeded.", "QuotaExceededError");
+    });
+    const older = setDraftAttachments("s-1", [img("OLDER")]);
+    const newer = setDraftAttachments("s-1", [img("NEWER")]);
+    await Promise.all([older, newer]);
+    expect(hasDraftAttachments("s-1")).toBe(true);
+    expect(await getDraftAttachments("s-1")).toEqual([img("NEWER")]);
+    expect(errors).toEqual([]);
+  });
+
+  it("removes the marker and record on a failed write and toasts once", async () => {
+    const errors = toastErrors();
+    await setDraftAttachments("s-1", [img("OLD")]);
+    vi.spyOn(IDBObjectStore.prototype, "put").mockImplementation(() => {
+      throw new DOMException("The quota has been exceeded.", "QuotaExceededError");
+    });
+    await setDraftAttachments("s-1", [img("NEW-TOO-BIG")]);
+    await setDraftAttachments("s-1", [img("BIGGER")]);
     vi.restoreAllMocks();
     expect(localStorage.getItem("acp:draft-attachments:s-1")).toBeNull();
+    expect(await storedIds()).toEqual([]);
     expect(errors).toEqual([expect.stringMatching(/storage full/i)]);
   });
 });

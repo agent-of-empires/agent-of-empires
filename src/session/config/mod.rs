@@ -538,6 +538,27 @@ pub struct AcpConfig {
         validate = "range:1:99"
     )]
     pub compaction_reminder_percent: u8,
+    /// How the structured view shows agent notices (rate-limit warnings, model
+    /// fallbacks). Persistent keeps each until dismissed, timeout dismisses
+    /// info and warning notices after the timeout below, hidden never shows
+    /// them. Error notices always stay until dismissed.
+    #[serde(default)]
+    #[setting(
+        label = "Agent notices",
+        widget = "select",
+        options = "persistent:Until dismissed,timeout:Auto-dismiss,hidden:Hidden"
+    )]
+    pub notice_display: NoticeDisplay,
+    /// Seconds before an info or warning notice auto-dismisses when agent
+    /// notices are set to auto-dismiss.
+    #[serde(default = "default_notice_timeout_secs")]
+    #[setting(
+        label = "Notice auto-dismiss (s)",
+        widget = "number",
+        min = 1,
+        validate = "range:1"
+    )]
+    pub notice_timeout_secs: u32,
     /// Silent-orphan watchdog: vendor-agnostic correctness grace. When
     /// a prompt is in flight, `tool_calls_in_flight` is empty, at least
     /// one progress notification has arrived, and no further progress
@@ -647,6 +668,10 @@ fn default_compaction_reminder_percent() -> u8 {
     75
 }
 
+fn default_notice_timeout_secs() -> u32 {
+    10
+}
+
 fn default_silent_orphan_grace_secs() -> u32 {
     120
 }
@@ -666,6 +691,8 @@ impl Default for AcpConfig {
             wrap_tool_output: false,
             compaction_reminder: false,
             compaction_reminder_percent: default_compaction_reminder_percent(),
+            notice_display: NoticeDisplay::default(),
+            notice_timeout_secs: default_notice_timeout_secs(),
             silent_orphan_grace_secs: default_silent_orphan_grace_secs(),
             auto_stop_idle_secs: default_acp_auto_stop_idle_secs(),
             rate_limit_auto_resume: false,
@@ -1864,6 +1891,38 @@ pub enum NewSessionView {
     Auto,
     Structured,
     Terminal,
+}
+
+/// See `AcpConfig::notice_display`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NoticeDisplay {
+    #[default]
+    Persistent,
+    Timeout,
+    Hidden,
+}
+
+/// Resolved notice display policy, shared by every structured view surface.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct NoticePolicy {
+    pub display: NoticeDisplay,
+    pub timeout_secs: u32,
+}
+
+impl NoticePolicy {
+    /// Whether a notice of `severity` that has been visible for `age` is
+    /// hidden. Errors are never hidden: they are failures, not advisories.
+    pub fn hides(&self, severity: &str, age: std::time::Duration) -> bool {
+        if severity == "error" {
+            return false;
+        }
+        match self.display {
+            NoticeDisplay::Persistent => false,
+            NoticeDisplay::Hidden => true,
+            NoticeDisplay::Timeout => age.as_secs() >= u64::from(self.timeout_secs),
+        }
+    }
 }
 
 /// How the TUI activates an existing terminal-mode session. See
@@ -3855,6 +3914,33 @@ mod model_value_quoting_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn notice_policy_hides_by_display_severity_and_age() {
+        use std::time::Duration;
+
+        let policy = |display| NoticePolicy {
+            display,
+            timeout_secs: 10,
+        };
+        let secs = Duration::from_secs;
+        // (display, severity, age secs, hidden)
+        let cases = [
+            (NoticeDisplay::Persistent, "warning", 999, false),
+            (NoticeDisplay::Hidden, "info", 0, true),
+            (NoticeDisplay::Hidden, "error", 0, false),
+            (NoticeDisplay::Timeout, "warning", 9, false),
+            (NoticeDisplay::Timeout, "warning", 10, true),
+            (NoticeDisplay::Timeout, "error", 999, false),
+        ];
+        for (display, severity, age, hidden) in cases {
+            assert_eq!(
+                policy(display).hides(severity, secs(age)),
+                hidden,
+                "{display:?} {severity} {age}s"
+            );
+        }
+    }
 
     /// Drives the `auto` branch of [`resolve_tmux_setting`]: a config that does
     /// not set the option must read as "silent" so aoe still applies its own

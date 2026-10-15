@@ -107,13 +107,14 @@ export function buildSessionGroups(
     // `manual` falls back to last activity on this axis.
     sortMode: SidebarSortMode;
     pluginSort?: PluginSortContext;
+    pluginAttention?: ReadonlySet<string>;
     // `groupPath` is "" for Ungrouped, letting nested callers avoid the sentinel id.
     isCollapsed: (groupId: string, groupPath: string) => boolean;
   },
 ): SidebarGroup[] {
   const compareWorkspace = opts.pluginSort
     ? compareWorkspacesByPluginSort(opts.pluginSort)
-    : compareWorkspacesForComputedSortMode(opts.sortMode);
+    : compareWorkspacesForComputedSortMode(opts.sortMode, opts.pluginAttention);
   const byGroup = new Map<string, SidebarWorkspaceView[]>();
   const order: string[] = [];
 
@@ -212,6 +213,7 @@ export function buildNestedSidebarGroups(
     idleDecayWindowMs: number;
     sortMode: SidebarSortMode;
     pluginSort?: PluginSortContext;
+    pluginAttention?: ReadonlySet<string>;
     isSubgroupCollapsed: (repoId: string, groupPath: string) => boolean;
   },
 ): NestedSidebarGroup[] {
@@ -221,6 +223,7 @@ export function buildNestedSidebarGroups(
       idleDecayWindowMs: opts.idleDecayWindowMs,
       sortMode: opts.sortMode,
       pluginSort: opts.pluginSort,
+      pluginAttention: opts.pluginAttention,
       isCollapsed: (_groupId, groupPath) => opts.isSubgroupCollapsed(repo.id, groupPath),
     });
     return {

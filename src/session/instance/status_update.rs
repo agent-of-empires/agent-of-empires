@@ -324,8 +324,32 @@ impl Instance {
         }
 
         let pane_content = session.capture_pane(50).unwrap_or_default();
-        let detected =
-            tmux::detect_status_from_content_in(&self.source_profile, &pane_content, &pane_tool);
+        let detected = if pane_tool == "prime-agent" {
+            if is_dead {
+                Status::Error
+            } else {
+                tmux::status_rules::detect(
+                    &self.source_profile,
+                    &pane_tool,
+                    &crate::tmux::utils::strip_ansi(&pane_content),
+                )
+                .or_else(|| {
+                    metadata
+                        .and_then(|metadata| metadata.pane_pid)
+                        .or_else(|| session.get_pane_pid())
+                        .and_then(|pid| self.prime_live_status(pid))
+                })
+                .unwrap_or_else(|| {
+                    if self.pane_is_stale_shell(metadata, &session) {
+                        Status::Idle
+                    } else {
+                        Status::Unknown
+                    }
+                })
+            }
+        } else {
+            tmux::detect_status_from_content_in(&self.source_profile, &pane_content, &pane_tool)
+        };
         tracing::trace!(target: "session.store",
             "status '{}': detected={:?}, cmd_override={}, custom_cmd={}",
             self.title,

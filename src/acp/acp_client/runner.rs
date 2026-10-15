@@ -298,6 +298,54 @@ pub(super) async fn spawn_runner_detached(
         // fixed container mount in build_sandbox_docker_argv (#2587).
         cmd.env(crate::session::artifacts::ARTIFACT_DIR_ENV, dir);
     }
+    if config.uses_native_prime() {
+        let mut snapshot = std::process::Command::new(&spawn_command);
+        snapshot.envs(
+            cmd.as_std()
+                .get_envs()
+                .filter_map(|(key, value)| value.map(|value| (key, value))),
+        );
+        let runtime = super::spawn::prime_runtime_for_spawn(
+            config,
+            &spawn_command,
+            &snapshot,
+            &host_environment,
+            sandbox_argv.as_ref(),
+        )?
+        .ok_or_else(|| AcpError::Spawn("Prime runtime missing".into()))?;
+        let encoded =
+            serde_json::to_string(&runtime).map_err(|e| AcpError::Spawn(e.to_string()))?;
+        let original: Vec<_> = cmd
+            .as_std()
+            .get_args()
+            .map(std::ffi::OsStr::to_owned)
+            .collect();
+        let separator = original
+            .iter()
+            .position(|arg| arg == "--")
+            .ok_or_else(|| AcpError::Spawn("runner argument separator missing".into()))?;
+
+        let mut owned = tokio::process::Command::new(&current_exe);
+        owned
+            .args(&original[..separator])
+            .arg("--prime-runtime")
+            .arg(&encoded)
+            .arg("--")
+            .arg(&current_exe)
+            .arg("__prime-agent")
+            .arg("--runtime")
+            .arg(&encoded)
+            .arg("--")
+            .args(&original[separator + 1..])
+            .arg("--daemon-socket")
+            .arg(runtime.socket());
+        owned.env_clear().envs(
+            cmd.as_std()
+                .get_envs()
+                .filter_map(|(key, value)| value.map(|value| (key, value))),
+        );
+        cmd = owned;
+    }
     if !extra_path_dirs.is_empty() {
         // Prepend the resolved bin dirs so the adapter and its
         // `#!/usr/bin/env node` shim resolve against the same install.

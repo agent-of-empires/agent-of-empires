@@ -102,6 +102,8 @@ pub struct AcpRunnerArgs {
     /// the registry record and compared against the restart marker.
     #[arg(long, default_value_t = 0)]
     pub generation: u64,
+    #[arg(long)]
+    pub prime_runtime: Option<String>,
     /// Agent program + args after `--`.
     #[arg(last = true, required = true)]
     pub agent_argv: Vec<String>,
@@ -135,9 +137,15 @@ pub async fn run(args: AcpRunnerArgs) -> Result<()> {
         "structured view runner starting"
     );
 
+    // Registry admission fences stop requests before binding or publishing.
+    if let Some(parent) = args.socket.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating socket dir {}", parent.display()))?;
+    }
+
     // Publish before spawning so a failed publication cannot leak an agent tree.
     let our_pid = std::process::id();
-    let record = WorkerRecord::new(
+    let mut record = WorkerRecord::new(
         args.session_id.clone(),
         our_pid,
         args.socket.clone(),
@@ -155,6 +163,12 @@ pub async fn run(args: AcpRunnerArgs) -> Result<()> {
         },
     )
     .with_generation(args.generation);
+    record.prime_runtime = args
+        .prime_runtime
+        .as_deref()
+        .map(serde_json::from_str)
+        .transpose()
+        .context("parsing Prime runtime")?;
     let (control_listener, profile_guard) = worker_registry::publish_runner(&record)
         .context("publishing runner listener and record")?;
 
@@ -250,8 +264,6 @@ pub async fn run(args: AcpRunnerArgs) -> Result<()> {
         }
     };
 
-    let mut preserve_registry = false;
-
     tokio::select! {
         status = agent_child.wait() => {
             let elapsed = agent_started_at.elapsed();
@@ -297,17 +309,11 @@ pub async fn run(args: AcpRunnerArgs) -> Result<()> {
         }
         reason = &mut watchdog_rx => {
             if let Ok(reason) = reason {
-                // The replacement runner owns the registry and socket now.
-                if matches!(reason, WatchdogShutdown::Superseded) {
-                    preserve_registry = true;
-                }
-                self_terminate_agent_tree(reason, &session_id, our_pid, &mut agent_child).await;
+                self_terminate_agent_tree(reason, &record, &mut agent_child).await;
             }
         }
         terminate_runner = accept_loop => {
             debug_assert!(terminate_runner);
-            // The daemon may already have spawned a replacement; never unlink it.
-            preserve_registry = true;
             let _ = agent_child.start_kill();
             let _ = agent_child.wait().await;
         }
@@ -315,8 +321,14 @@ pub async fn run(args: AcpRunnerArgs) -> Result<()> {
 
     watchdog_handle.abort();
     agent_stdout_task.abort();
-    if !preserve_registry {
-        worker_registry::delete_if_owned(&session_id, our_pid).ok();
+    let cleanup_record = record.clone();
+    tokio::task::spawn_blocking(move || worker_registry::cleanup_runtime(&cleanup_record))
+        .await??;
+    // The daemon retires the route after it proves the whole runner group exited.
+    // Removing it here would lose ownership evidence for descendants of the agent.
+    if !crate::process::worker::kill_own_process_group_if_leader(our_pid) {
+        let _ = agent_child.start_kill();
+        let _ = tokio::time::timeout(Duration::from_secs(2), agent_child.wait()).await;
     }
     Ok(())
 }
@@ -387,10 +399,11 @@ async fn run_watchdog(
 
 async fn self_terminate_agent_tree(
     reason: WatchdogShutdown,
-    session_id: &str,
-    own_pid: u32,
+    record: &WorkerRecord,
     agent_child: &mut Child,
 ) {
+    let session_id = &record.session_id;
+    let own_pid = record.pid;
     info!(
         target: "acp.runner",
         session = %session_id,
@@ -398,8 +411,11 @@ async fn self_terminate_agent_tree(
         "runner abandoned; terminating agent tree"
     );
 
-    worker_registry::delete_if_owned(session_id, own_pid).ok();
-
+    if record.prime_runtime.is_some() {
+        if let Some(pid) = agent_child.id() {
+            crate::process::kill_process_tree(pid);
+        }
+    }
     #[cfg(unix)]
     if let Some(agent_pid) = agent_child.id() {
         use nix::sys::signal::{kill, Signal};
@@ -408,10 +424,30 @@ async fn self_terminate_agent_tree(
     }
     let _ = tokio::time::timeout(Duration::from_secs(2), agent_child.wait()).await;
 
-    // As group leader this SIGKILLs the whole agent tree and the runner itself.
+    let cleanup_record = record.clone();
+    loop {
+        let route = cleanup_record.clone();
+        match tokio::task::spawn_blocking(move || worker_registry::cleanup_runtime(&route)).await {
+            Ok(Ok(())) => break,
+            result => {
+                warn!(target: "acp.runner", ?result, "native cleanup unproven; retaining ownership evidence");
+                if (cleanup_record.agent_key == "prime-agent"
+                    || cleanup_record.prime_runtime.is_some())
+                    && cleanup_record
+                        .prime_runtime
+                        .as_ref()
+                        .is_none_or(|runtime| runtime.proof_path.is_none())
+                {
+                    break;
+                }
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    // The daemon owns registry retirement after the entire process group is gone.
     if !crate::process::worker::kill_own_process_group_if_leader(own_pid) {
         let _ = agent_child.start_kill();
-        let _ = agent_child.wait().await;
+        let _ = tokio::time::timeout(Duration::from_secs(2), agent_child.wait()).await;
     }
 }
 
@@ -582,6 +618,123 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     #[serial_test::serial]
+    async fn detached_expiry_retires_only_settled_records_and_sockets_before_self_exit() {
+        use std::io::Read as _;
+        use std::os::unix::process::ExitStatusExt as _;
+        use tokio::io::AsyncWriteExt as _;
+        if let Ok(case) = std::env::var("AOE_RUNNER_EXPIRY_CHILD") {
+            assert!(unsafe { libc::setsid() } >= 0);
+            let id = "expired";
+            let socket = worker_registry::socket_path_for(id).unwrap();
+            let mut record = WorkerRecord::new(
+                id.into(),
+                std::process::id(),
+                socket,
+                "agent".into(),
+                "agent".into(),
+                std::env::temp_dir(),
+                None,
+                vec![],
+                vec![],
+                None,
+                None,
+            )
+            .with_generation(1);
+            if case == "untracked-prime" {
+                record.agent_key = "prime-agent".into();
+            }
+            let _listener = worker_registry::register_runner(&record).unwrap();
+            let mut agent = Command::new("cat")
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .spawn()
+                .unwrap();
+            agent
+                .stdin
+                .as_mut()
+                .unwrap()
+                .write_all(b"agent-ready\n")
+                .await
+                .unwrap();
+            let mut ready = String::new();
+            BufReader::new(agent.stdout.take().unwrap())
+                .read_line(&mut ready)
+                .await
+                .unwrap();
+            assert_eq!(ready, "agent-ready\n");
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            let task = tokio::spawn(run_watchdog(
+                worker_registry::record_path(id).unwrap(),
+                worker_registry::restart_marker_path(id).unwrap(),
+                record.pid,
+                record.generation,
+                Arc::new(AtomicU64::new(
+                    now_secs() - DETACHED_RETENTION.as_secs() - 1,
+                )),
+                id.into(),
+                tx,
+            ));
+            let reason = tokio::time::timeout(Duration::from_secs(5), rx)
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(matches!(reason, WatchdogShutdown::DetachedRetentionExpired));
+            task.await.unwrap();
+            self_terminate_agent_tree(reason, &record, &mut agent).await;
+            panic!("the expired runner must exit its own process group");
+        }
+        for case in ["settled", "untracked-prime"] {
+            let root = tempfile::TempDir::with_prefix_in("aoe-expiry-", "/tmp").unwrap();
+            let _home = crate::session::test_support::isolate_app_dir_at(root.path());
+            let name = format!(
+                "{}::detached_expiry_retires_only_settled_records_and_sockets_before_self_exit",
+                module_path!().split_once("::").unwrap().1
+            );
+            let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", &name, "--nocapture"])
+                .env("AOE_RUNNER_EXPIRY_CHILD", case)
+                .env("AOE_ACP_WATCHDOG_POLL_MS", "1")
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap();
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            let status = loop {
+                if let Some(status) = child.try_wait().unwrap() {
+                    break status;
+                }
+                if std::time::Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    panic!("expired runner did not exit");
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            };
+            let mut stderr = String::new();
+            child
+                .stderr
+                .take()
+                .unwrap()
+                .read_to_string(&mut stderr)
+                .unwrap();
+            assert_eq!(status.signal(), Some(libc::SIGKILL), "{stderr}");
+            let record = worker_registry::load("expired").unwrap();
+            let control = crate::process::worker::control_socket_sibling(
+                &worker_registry::socket_path_for("expired").unwrap(),
+            );
+            if case == "settled" {
+                assert!(record.is_none());
+                assert!(!control.exists());
+            } else {
+                assert_eq!(record.unwrap().agent_key, "prime-agent");
+                assert!(control.exists());
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial_test::serial]
     async fn watchdog_teardown_preserves_replacement_registry_owner() {
         // Under /tmp, not $TMPDIR: macOS paths exceed the 104-byte sun_path limit.
         let app_root = tempfile::TempDir::with_prefix_in("aoe-wd-", "/tmp").unwrap();
@@ -606,8 +759,9 @@ mod tests {
         .unwrap();
         let mut child = Command::new("sleep").arg("60").spawn().unwrap();
 
-        self_terminate_agent_tree(WatchdogShutdown::RecordMissing, session_id, 111, &mut child)
-            .await;
+        let mut original = worker_registry::load(session_id).unwrap().unwrap();
+        original.pid = 111;
+        self_terminate_agent_tree(WatchdogShutdown::RecordMissing, &original, &mut child).await;
 
         assert_eq!(worker_registry::load(session_id).unwrap().unwrap().pid, 222);
         assert!(control_socket.exists());

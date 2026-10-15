@@ -82,7 +82,11 @@ impl<S: BroadcastSink> Supervisor<S> {
             )
             .into());
         }
-        self.client_for_session(session_id).await
+        let client = self.client_for_session(session_id).await?;
+        if crate::process::worker_registry::stop_requested(session_id) {
+            return Err(SupervisorError::SpawnCancelled(session_id.into()));
+        }
+        Ok(client)
     }
 
     /// Await worker readiness so a caller can gate a durable side effect on it.
@@ -251,14 +255,27 @@ mod tests {
             "with no reservation, wait_for_worker fails fast"
         );
 
-        let reservation = reserve(sup.begin_resume("s-1748", ResumeKind::Spawn).await);
+        let reservation = reserve(
+            sup.begin_resume(
+                "s-1748",
+                ResumeKind::Spawn,
+                crate::process::worker_registry::ResumeAuthority::Automatic,
+            )
+            .await,
+        );
         assert!(
             sup.is_running("s-1748").await,
             "a reservation counts as running so the reconciler skips it"
         );
         assert_eq!(sup.worker_state("s-1748").await, AcpWorkerState::Resuming);
         assert!(matches!(
-            sup.begin_resume("s-1748", ResumeKind::Spawn).await.unwrap(),
+            sup.begin_resume(
+                "s-1748",
+                ResumeKind::Spawn,
+                crate::process::worker_registry::ResumeAuthority::Automatic
+            )
+            .await
+            .unwrap(),
             ResumeReservationOutcome::AlreadyPresent
         ));
 

@@ -250,6 +250,7 @@ pub(super) fn silent_orphan_check_interval() -> Duration {
 /// history replay so stale frames cannot affect a new prompt.
 pub(super) fn classify_watchdog_notification_signals(
     update: &SessionUpdate,
+    restored_title: Option<&str>,
     profile: &agent_profiles::AgentProfile,
     suppressing_history_replay: bool,
 ) -> (Option<LifecycleSignal>, Option<LifecycleSignal>) {
@@ -258,7 +259,7 @@ pub(super) fn classify_watchdog_notification_signals(
     }
     (
         classify_lifecycle_signal(update),
-        wakeup_lifecycle_signal_from_update(update, profile),
+        wakeup_lifecycle_signal_from_update(update, restored_title, profile),
     )
 }
 
@@ -647,6 +648,7 @@ mod tests {
         ] {
             let (lifecycle, wakeup) = classify_watchdog_notification_signals(
                 update,
+                None,
                 &agent_profiles::CLAUDE,
                 suppressing,
             );

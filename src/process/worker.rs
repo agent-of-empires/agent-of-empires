@@ -78,7 +78,7 @@ pub fn peer_pid_from_socket(_path: &Path) -> Option<u32> {
 }
 
 #[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
-fn connect_with_timeout(path: &Path) -> Option<std::os::unix::net::UnixStream> {
+pub(crate) fn connect_with_timeout(path: &Path) -> Option<std::os::unix::net::UnixStream> {
     use std::os::fd::{AsFd, AsRawFd};
     use std::os::unix::net::UnixStream;
 

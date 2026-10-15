@@ -21,17 +21,23 @@ export function PluginPaneBody({
   const footer = isObject(entry.payload.footer) ? entry.payload.footer : undefined;
   const refreshing = usePluginUiRefreshing();
   return (
-    <div className="flex flex-1 min-h-0 flex-col" data-testid="plugin-pane-body" data-plugin-id={entry.plugin_id}>
+    <div
+      className="relative flex flex-1 min-h-0 flex-col"
+      data-testid="plugin-pane-body"
+      data-plugin-id={entry.plugin_id}
+    >
+      {/* Outside the scroller, inside its p-3 top gutter: no layout shift, never covers content at scroll-top. */}
+      {refreshing && (
+        <div
+          role="status"
+          aria-label="Refreshing"
+          className="pointer-events-none absolute right-3 top-0 z-10 text-text-dim"
+          data-testid="plugin-pane-refreshing"
+        >
+          <Spinner className="size-3" />
+        </div>
+      )}
       <div className="min-h-0 flex-1 overflow-auto p-3">
-        {refreshing && (
-          <div
-            className="sticky top-0 z-10 mb-1.5 flex items-center justify-end gap-1 text-[10px] text-text-dim"
-            data-testid="plugin-pane-refreshing"
-          >
-            <Spinner className="size-3" />
-            Refreshing…
-          </div>
-        )}
         {blocks ? (
           <div className="flex flex-col gap-1.5">
             {blocks.map((b, i) => (

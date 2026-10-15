@@ -7,6 +7,7 @@ import {
   type MobileKeyboardProxyInput,
 } from "../../lib/mobileKeyboardProxy";
 import { writeClipboard } from "../../lib/clipboard";
+import { IS_MAC } from "../../lib/shortcuts";
 import {
   altPrintableMetaKey,
   controlCode,
@@ -131,7 +132,7 @@ export function useTerminalInput({
   const onKeyDownCapture = useCallback(
     (e: KeyboardEvent) => {
       if (composingRef.current || e.isComposing || !e.altKey || e.ctrlKey || e.metaKey) return;
-      const metaKey = altPrintableMetaKey(e, keyboardLayoutRef.current);
+      const metaKey = altPrintableMetaKey(e, keyboardLayoutRef.current, IS_MAC);
       if (!metaKey) return;
       e.preventDefault();
       e.stopPropagation();
