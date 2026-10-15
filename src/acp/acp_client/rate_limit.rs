@@ -115,6 +115,14 @@ pub(super) fn rate_limit_from_captured_rejection(
     })
 }
 
+/// Captures belong to the turn that observed them, so each turn boundary drops them.
+pub(super) fn clear_captured_rejections(captures: &std::sync::Mutex<HashMap<String, i64>>) {
+    captures
+        .lock()
+        .expect("rate-limit capture mutex poisoned")
+        .clear();
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -235,6 +243,8 @@ mod tests {
                 let info = rate_limit_from_captured_rejection(&captures, now);
                 assert_eq!(info.as_ref().and_then(|i| i.resets_at), want);
                 assert!(info.is_none_or(|i| i.kind == "rate_limit"));
+                clear_captured_rejections(&captures);
+                assert!(rate_limit_from_captured_rejection(&captures, now).is_none());
             }
         }
     }
