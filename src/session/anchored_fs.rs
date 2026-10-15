@@ -265,6 +265,20 @@ impl AnchoredDir {
         matches!(self.regular_lookup(relative), Ok(Some(true)))
     }
 
+    /// Whether two entries are the same file, without following links.
+    fn same_file(&self, a: &Path, b: &Path) -> Result<bool> {
+        let mut ids = [None, None];
+        for (id, path) in ids.iter_mut().zip([a, b]) {
+            let (parent, leaf) = self.open_parent(path)?;
+            *id = match fstatat(&parent, leaf.as_os_str(), AtFlags::AT_SYMLINK_NOFOLLOW) {
+                Ok(stat) => Some((stat.st_dev, stat.st_ino)),
+                Err(Errno::ENOENT) => None,
+                Err(error) => return Err(error).context("inspecting anchored file"),
+            };
+        }
+        Ok(ids[0].is_some() && ids[0] == ids[1])
+    }
+
     /// Publish the staging file `from` at `to` and drop the staging name.
     /// `false` means `to` kept its live copy: something was already there
     /// (no `replace`), or it changed after `replace` was observed.
@@ -281,8 +295,9 @@ impl AnchoredDir {
     /// is hard-linked to `.aoe-prev` before the rename and unlinked only if it
     /// is still unchanged after it. A change means a writer got in: the carry
     /// is kept at the first free `.aoe-conflict[.N]` and the old file is put back, so no version
-    /// is unlinked unseen. A leftover `.aoe-prev` is a crashed replace and
-    /// fails the next one rather than being overwritten. A writer that holds
+    /// is unlinked unseen. A leftover `.aoe-prev` that is
+    /// a link to the live file is dropped; any other fails the next replace
+    /// rather than being overwritten. A writer that holds
     /// the old file open past the post-check is not covered.
     pub(crate) fn publish_staged(
         &self,
@@ -295,21 +310,33 @@ impl AnchoredDir {
         if let Some(observed) = replace {
             let prev = with_suffix(to, ".aoe-prev");
             let (prev_parent, prev_leaf) = self.open_parent(&prev)?;
-            match linkat(
-                &to_parent,
-                to_leaf.as_os_str(),
-                &prev_parent,
-                prev_leaf.as_os_str(),
-                AtFlags::empty(),
-            ) {
-                Ok(()) => {}
-                // `to` vanished after it was observed: publish as a first copy.
-                Err(Errno::ENOENT) => return self.publish_staged(from, to, None),
-                Err(Errno::EEXIST) => bail!(
-                    "an interrupted carry left a displaced transcript at {}; recover it first",
-                    prev.display()
-                ),
-                Err(error) => return Err(error).context("preserving anchored file"),
+            let mut recovered = false;
+            loop {
+                match linkat(
+                    &to_parent,
+                    to_leaf.as_os_str(),
+                    &prev_parent,
+                    prev_leaf.as_os_str(),
+                    AtFlags::empty(),
+                ) {
+                    Ok(()) => break,
+                    // `to` vanished after it was observed: publish as a first copy.
+                    Err(Errno::ENOENT) => return self.publish_staged(from, to, None),
+                    // A link to the live file is a replace that died before its
+                    // rename: nothing was displaced.
+                    Err(Errno::EEXIST) if !recovered && self.same_file(to, &prev)? => {
+                        self.remove_file(&prev)?;
+                        recovered = true;
+                    }
+                    Err(Errno::EEXIST) => bail!(
+                        "an interrupted carry left {} (the live copy it replaced) next to {} \
+                         (the carried copy); keep the one you want and delete {}",
+                        prev.display(),
+                        to.display(),
+                        prev.display()
+                    ),
+                    Err(error) => return Err(error).context("preserving anchored file"),
+                }
             }
             if self.regular_modified(&prev)? != Some(observed) {
                 self.remove_file(&prev)?;
@@ -688,7 +715,7 @@ mod tests {
 
         // (case, published, target, conflict, prev)
         type Case<'a> = (&'a str, bool, &'a [u8], Option<&'a [u8]>, Option<&'a [u8]>);
-        let cases: [Case; 6] = [
+        let cases: [Case; 7] = [
             ("untouched", true, b"carry\n", None, None),
             ("changed before", false, b"live\n", None, None),
             (
@@ -713,6 +740,7 @@ mod tests {
                 Some(b"displaced\n"),
             ),
             ("deleted", true, b"carry\n", None, None),
+            ("leftover link", true, b"carry\n", None, None),
         ];
         for (case, published, expected, conflict, prev) in cases {
             let temp = tempfile::tempdir().unwrap();
@@ -749,6 +777,10 @@ mod tests {
                     std::fs::write(root.join("conv.jsonl.aoe-prev"), b"displaced\n").unwrap();
                 }
                 "deleted" => std::fs::remove_file(root.join(target)).unwrap(),
+                "leftover link" => {
+                    std::fs::hard_link(root.join(target), root.join("conv.jsonl.aoe-prev"))
+                        .unwrap();
+                }
                 _ => {}
             }
 
