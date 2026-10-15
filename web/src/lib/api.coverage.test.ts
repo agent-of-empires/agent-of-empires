@@ -232,6 +232,11 @@ describe("getSessionDiffFiles", () => {
     expect(lastCall()[0]).toBe("/api/sessions/s1/diff/files");
   });
 
+  it("adds the requested comparison mode", async () => {
+    fetchSpy.mockResolvedValueOnce(jsonResponse({ files: [] }));
+    await getSessionDiffFiles("s1", "origin_main");
+    expect(lastCall()[0]).toBe("/api/sessions/s1/diff/files?comparison=origin_main");
+  });
   it("returns null on non-2xx", async () => {
     fetchSpy.mockResolvedValueOnce(new Response("", { status: 404 }));
     expect(await getSessionDiffFiles("s1")).toBeNull();
@@ -252,6 +257,22 @@ describe("getSessionFileContents", () => {
     fetchSpy.mockResolvedValueOnce(jsonResponse({ patch: "" }));
     await getSessionFileContents("s1", "a.ts", "myrepo");
     expect(String(lastCall()[0])).toContain("repo=myrepo");
+  });
+
+  it("adds the requested comparison alongside the repo", async () => {
+    fetchSpy.mockResolvedValueOnce(jsonResponse({ patch: "" }));
+    await getSessionFileContents("s1", "a.ts", "myrepo", "uncommitted");
+    const params = new URL(String(lastCall()[0]), "http://localhost").searchParams;
+    expect(params.get("repo")).toBe("myrepo");
+    expect(params.get("comparison")).toBe("uncommitted");
+  });
+
+  it("preserves explicit comparison errors from the server", async () => {
+    fetchSpy.mockResolvedValueOnce(jsonResponse({ error: "bad_request", message: "Comparison ref is missing." }, 400));
+    expect(await getSessionFileContents("s1", "a.ts", undefined, "origin_main")).toEqual({
+      error: "bad_request",
+      message: "Comparison ref is missing.",
+    });
   });
 
   it("returns null on non-2xx", async () => {

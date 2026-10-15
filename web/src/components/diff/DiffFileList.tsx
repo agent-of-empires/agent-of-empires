@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import type { RepoBase, RichDiffFile } from "../../lib/types";
+import type { DiffComparison, RepoBase, RichDiffFile } from "../../lib/types";
 import type { BranchInfo } from "../../lib/api";
 import { buildDiffTree, type DiffTreeNode } from "../../lib/diffTree";
 import { useWebSettings } from "../../hooks/useWebSettings";
@@ -7,6 +7,8 @@ import { fetchBranches, setSessionDiffBase } from "../../lib/api";
 import { CopyPathContextMenu, type PathMenuState } from "./CopyPathContextMenu";
 
 interface Props {
+  comparison?: DiffComparison;
+  onComparisonChange?: (comparison: DiffComparison) => void;
   files: RichDiffFile[];
   /** One entry per repo whose diff was computed. Single-repo sessions
    *  get a one-element array; workspace sessions get one per member.
@@ -231,6 +233,8 @@ export function DiffFileList({
   repoPath,
   baseBranchOverride,
   onBaseBranchChanged,
+  comparison = "base",
+  onComparisonChange,
 }: Props) {
   const isMultiRepo = perRepoBases.length > 1;
   // Multi-repo workspaces compose multiple `(name, base_branch)` pairs;
@@ -371,15 +375,27 @@ export function DiffFileList({
   return (
     <div className="flex flex-col h-full bg-surface-900 overflow-hidden" onContextMenu={handleContextMenu}>
       <CopyPathContextMenu menu={pathMenu} onClose={closePathMenu} />
-      {/* Header */}
       <div className="px-3 py-2 border-b border-surface-700/20 shrink-0">
         <div className="flex items-center gap-2 flex-wrap">
           <span className="font-mono text-[11px] uppercase tracking-wider text-text-dim">Changes</span>
-          {isMultiRepo ? (
+          {onComparisonChange && (
+            <select
+              aria-label="Diff comparison"
+              value={comparison}
+              onChange={(event) => onComparisonChange(event.target.value as DiffComparison)}
+              className="rounded border border-surface-700 bg-surface-800 px-1.5 py-1 font-mono text-[10px] text-text-primary focus:border-brand-500 focus:outline-none"
+            >
+              <option value="base">Base</option>
+              <option value="origin_main">origin/main</option>
+              <option value="uncommitted">Uncommitted</option>
+              <option value="upstream">Tracking branch</option>
+            </select>
+          )}
+          {comparison === "base" && isMultiRepo ? (
             <span className="font-mono text-[10px] px-1.5 py-px rounded bg-surface-800 text-text-muted">
               {perRepoBases.length} repos
             </span>
-          ) : sessionId && repoPath ? (
+          ) : comparison === "base" && sessionId && repoPath ? (
             <BasePicker
               sessionId={sessionId}
               repoPath={repoPath}
@@ -387,11 +403,11 @@ export function DiffFileList({
               hasOverride={Boolean(baseBranchOverride)}
               onChanged={onBaseBranchChanged}
             />
-          ) : (
+          ) : comparison === "base" ? (
             <span className="font-mono text-[10px] px-1.5 py-px rounded bg-surface-800 text-text-muted">
               vs {singleBaseBranch}
             </span>
-          )}
+          ) : null}
           {files.length > 0 && (
             <>
               <span className="font-mono text-[11px] text-text-muted">
@@ -436,12 +452,15 @@ export function DiffFileList({
             <span className="text-xs">Loading files...</span>
           </div>
         ) : files.length === 0 && !isMultiRepo ? (
-          // Single-repo empty: name the base so a clean tree reads as
-          // "checked, nothing to show" rather than a broken diff (#2152).
-          // Multi-repo empty falls through to MultiRepoGroups below, which
-          // already lists every member with its base and a per-repo note.
+          // Keep an unavailable comparison distinct from a clean tree.
           <div className="flex items-center justify-center h-full text-text-dim text-xs">
-            No changes vs <span className="font-mono ml-1">{singleBaseBranch}</span>
+            {warning ? (
+              "Comparison unavailable"
+            ) : (
+              <>
+                No changes vs <span className="font-mono ml-1">{singleBaseBranch}</span>
+              </>
+            )}
           </div>
         ) : isMultiRepo ? (
           <MultiRepoGroups
@@ -543,7 +562,9 @@ function MultiRepoGroups({
               </span>
             </button>
             {!collapsed && repoFiles.length === 0 && (
-              <div className="px-3 py-2 text-[11px] text-text-dim italic">No changes in this repo.</div>
+              <div className="px-3 py-2 text-[11px] text-text-dim italic">
+                {repo.warning ? "Comparison unavailable" : "No changes in this repo."}
+              </div>
             )}
             {!collapsed && repoFiles.length > 0 && (
               <RepoBody

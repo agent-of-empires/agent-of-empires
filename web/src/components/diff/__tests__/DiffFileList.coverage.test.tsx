@@ -101,6 +101,18 @@ describe("DiffFileList state branches", () => {
     expect(screen.getAllByText("No changes in this repo.")).toHaveLength(3);
   });
 
+  it("shows comparison unavailable only for the repo with a warning", () => {
+    renderList({
+      perRepoBases: [
+        { repo_name: "clean", base_branch: "main" },
+        { repo_name: "missing-upstream", base_branch: "upstream", warning: "No upstream configured." },
+      ],
+      warning: "missing-upstream: No upstream configured.",
+    });
+    expect(screen.getByText("No changes in this repo.")).toBeTruthy();
+    expect(screen.getByText("Comparison unavailable")).toBeTruthy();
+  });
+
   it("renders the warning banner when provided", () => {
     renderList({ files: [file({ path: "a.ts" })], warning: "diff truncated" });
     expect(screen.getByText("diff truncated")).toBeTruthy();
@@ -297,6 +309,48 @@ describe("DiffFileList multi-repo grouping", () => {
     const { onSelectFile } = renderList({ files, perRepoBases });
     fireEvent.click(screen.getByText("handler.rs").closest("button")!);
     expect(onSelectFile).toHaveBeenCalledWith("src/handler.rs", "api");
+  });
+});
+
+describe("DiffFileList comparison selector", () => {
+  it("selects a comparison and only shows BasePicker in base mode", () => {
+    const onComparisonChange = vi.fn();
+    const props = {
+      files: [file({ path: "a.ts" })],
+      sessionId: "s1",
+      repoPath: "/repo",
+      comparison: "base" as const,
+      onComparisonChange,
+    };
+    const { rerender } = render(
+      <DiffFileList
+        {...props}
+        perRepoBases={singleBase}
+        warning={null}
+        selectedPath={null}
+        selectedRepoName={undefined}
+        loading={false}
+        onSelectFile={vi.fn()}
+      />,
+    );
+    const select = screen.getByRole("combobox", { name: "Diff comparison" });
+    fireEvent.change(select, { target: { value: "origin_main" } });
+    expect(onComparisonChange).toHaveBeenCalledWith("origin_main");
+    expect(screen.getByRole("button", { name: /Change diff base/ })).toBeTruthy();
+
+    rerender(
+      <DiffFileList
+        {...props}
+        comparison="origin_main"
+        perRepoBases={singleBase}
+        warning={null}
+        selectedPath={null}
+        selectedRepoName={undefined}
+        loading={false}
+        onSelectFile={vi.fn()}
+      />,
+    );
+    expect(screen.queryByRole("button", { name: /Change diff base/ })).toBeNull();
   });
 });
 

@@ -9,7 +9,7 @@ import { SendCommentsDialog } from "./diff/comments/SendCommentsDialog";
 import { PluginPaneBody } from "./plugin/PluginSlots";
 import type { RightPanelView } from "../lib/rightPanelView";
 import { isPluginPaneId, type PluginPane } from "../lib/pluginPanes";
-import type { RepoBase, RichDiffFile, SessionResponse } from "../lib/types";
+import type { DiffComparison, RepoBase, RichDiffFile, SessionResponse } from "../lib/types";
 import type { useDiffComments } from "../hooks/useDiffComments";
 import type { FileRef } from "../lib/fileRef";
 
@@ -28,6 +28,8 @@ interface Props {
   selectedRepoName: string | undefined;
   selectedFileLine: number | undefined;
   revision: number;
+  comparison: DiffComparison;
+  onComparisonChange: (comparison: DiffComparison) => void;
   diffFiles: RichDiffFile[];
   perRepoBases: RepoBase[];
   warning: string | null;
@@ -72,6 +74,8 @@ export function MobileMainPane({
   revision,
   diffFiles,
   perRepoBases,
+  comparison,
+  onComparisonChange,
   warning,
   diffFilesLoading,
   onSelectFile,
@@ -104,6 +108,19 @@ export function MobileMainPane({
             <span aria-hidden>&larr;</span> Agent
           </button>
           <span className="text-xs text-text-dim">{viewLabel}</span>
+          {view === "diff" && selectedFilePath && (
+            <select
+              aria-label="Diff comparison"
+              value={comparison}
+              onChange={(event) => onComparisonChange(event.target.value as DiffComparison)}
+              className="ml-auto max-w-36 rounded border border-surface-700 bg-surface-800 px-1.5 py-1 font-mono text-[10px] text-text-primary focus:border-brand-500 focus:outline-none"
+            >
+              <option value="base">Base</option>
+              <option value="origin_main">origin/main</option>
+              <option value="uncommitted">Uncommitted</option>
+              <option value="upstream">Tracking branch</option>
+            </select>
+          )}
         </div>
       )}
       <div className="relative flex-1 flex flex-col min-h-0 overflow-hidden">
@@ -148,6 +165,7 @@ export function MobileMainPane({
                 filePath={selectedFilePath}
                 repoName={selectedRepoName}
                 targetLine={selectedFileLine}
+                comparison={comparison}
                 revision={revision}
                 onClose={onCloseFile}
                 commentsEnabled={commentsEnabled}
@@ -176,6 +194,8 @@ export function MobileMainPane({
                   repoPath={activeSession?.main_repo_path ?? activeSession?.project_path ?? null}
                   baseBranchOverride={activeSession?.base_branch_override ?? null}
                   onBaseBranchChanged={onDiffRefresh}
+                  comparison={comparison}
+                  onComparisonChange={onComparisonChange}
                 />
               </div>
             )}

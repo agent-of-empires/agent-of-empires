@@ -6456,6 +6456,8 @@ pub struct RepoBase {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub repo_name: Option<String>,
     pub base_branch: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub warning: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -6649,9 +6651,110 @@ fn resolve_diff_base(
     crate::git::diff::get_default_base_ref(repo_path).unwrap_or_else(|_| "main".to_string())
 }
 
+/// Comparison against the persisted/default base or a well-defined Git ref.
+#[derive(Clone, Copy, Debug, Default, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum DiffComparison {
+    #[default]
+    Base,
+    OriginMain,
+    Uncommitted,
+    Upstream,
+}
+
+/// Resolve comparison modes to names accepted by the existing merge-base diff
+/// pipeline. Explicit refs are resolved exactly so a missing comparison never
+/// quietly turns into a different branch.
+fn resolve_diff_comparison(
+    comparison: DiffComparison,
+    base_branch: String,
+    repo_path: &std::path::Path,
+) -> Result<String, String> {
+    match comparison {
+        DiffComparison::Base => Ok(base_branch),
+        DiffComparison::Uncommitted => {
+            let repo = git2::Repository::open(repo_path)
+                .map_err(|e| format!("Could not open repository: {e}"))?;
+            repo.head()
+                .and_then(|head| head.peel_to_commit())
+                .map_err(|_| {
+                    "Cannot compare uncommitted changes: HEAD does not resolve to a commit."
+                        .to_string()
+                })?;
+            Ok("HEAD".to_string())
+        }
+        DiffComparison::OriginMain => {
+            let repo = git2::Repository::open(repo_path)
+                .map_err(|e| format!("Could not open repository: {e}"))?;
+            let reference = "refs/remotes/origin/main";
+            repo.find_reference(reference)
+                .and_then(|reference| reference.peel_to_commit())
+                .map_err(|_| {
+                    format!(
+                        "Comparison ref '{reference}' is missing or does not point to a commit."
+                    )
+                })?;
+            Ok(reference.to_string())
+        }
+        DiffComparison::Upstream => {
+            let repo = git2::Repository::open(repo_path)
+                .map_err(|e| format!("Could not open repository: {e}"))?;
+            let head = repo.head().map_err(|_| {
+                "Cannot compare upstream: HEAD is detached or unresolved.".to_string()
+            })?;
+            if !head.is_branch() {
+                return Err("Cannot compare upstream: HEAD is detached.".to_string());
+            }
+            let branch_name = head.shorthand().map_err(|_| {
+                "Cannot compare upstream: current branch name is unavailable.".to_string()
+            })?;
+            let branch = repo
+                .find_branch(branch_name, git2::BranchType::Local)
+                .map_err(|_| {
+                    "Cannot compare upstream: current local branch is unavailable.".to_string()
+                })?;
+            let upstream = match branch.upstream() {
+                Ok(upstream) => upstream,
+                Err(_) => {
+                    let config = repo.config().ok();
+                    let configured = config.as_ref().is_some_and(|config| {
+                        config
+                            .get_string(&format!("branch.{branch_name}.remote"))
+                            .is_ok()
+                            && config
+                                .get_string(&format!("branch.{branch_name}.merge"))
+                                .is_ok()
+                    });
+                    return Err(if configured {
+                        format!(
+                            "Cannot compare upstream: configured upstream for branch '{branch_name}' is missing."
+                        )
+                    } else {
+                        format!("Cannot compare upstream: branch '{branch_name}' has no configured upstream.")
+                    });
+                }
+            };
+            let reference = upstream.get().name().map_err(|_| {
+                "Cannot compare upstream: configured upstream ref name is unavailable.".to_string()
+            })?;
+            if !reference.starts_with("refs/remotes/") {
+                return Err(format!(
+                    "Cannot compare upstream: configured upstream '{reference}' is not a remote-tracking branch."
+                ));
+            }
+            upstream
+                .get()
+                .peel_to_commit()
+                .map_err(|_| format!("Cannot compare upstream: configured upstream '{reference}' is missing or does not point to a commit."))?;
+            Ok(reference.to_string())
+        }
+    }
+}
+
 pub async fn session_diff_files(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
+    axum::extract::Query(query): axum::extract::Query<DiffComparisonQuery>,
 ) -> impl IntoResponse {
     if let Some(resp) = super::cityhall_block(&state) {
         return resp;
@@ -6669,6 +6772,7 @@ pub async fn session_diff_files(
             .diff
             .default_branch
             .clone();
+        let comparison = query.comparison;
         let mut all_files: Vec<RichDiffFileInfo> = Vec::new();
         let mut per_repo_bases: Vec<RepoBase> = Vec::new();
         let mut warnings: Vec<String> = Vec::new();
@@ -6681,31 +6785,73 @@ pub async fn session_diff_files(
                 config_default.as_deref(),
                 path,
             );
-            let warning = diff::check_merge_base_status(path, &base_branch);
-            let changed = scan_state
-                .changed_files_cached(path, &base_branch)
-                .unwrap_or_default();
+            let resolved = resolve_diff_comparison(comparison, base_branch, path);
+            let (base_branch, display_base) = match resolved {
+                Ok(base_branch) => {
+                    let display_base = match comparison {
+                        DiffComparison::OriginMain => "origin/main".to_string(),
+                        DiffComparison::Uncommitted => "HEAD".to_string(),
+                        DiffComparison::Upstream => base_branch
+                            .strip_prefix("refs/remotes/")
+                            .unwrap_or(&base_branch)
+                            .to_string(),
+                        DiffComparison::Base => base_branch.clone(),
+                    };
+                    (base_branch, display_base)
+                }
+                Err(error) => {
+                    per_repo_bases.push(RepoBase {
+                        repo_name: repo.name.clone(),
+                        base_branch: comparison.label().to_string(),
+                        warning: Some(error.clone()),
+                    });
+                    match repo.name.as_deref() {
+                        Some(name) => warnings.push(format!("{name}: {error}")),
+                        None => warnings.push(error),
+                    }
+                    continue;
+                }
+            };
+            let mut repo_warning = diff::check_merge_base_status(path, &base_branch);
+            let changed = scan_state.changed_files_cached(path, &base_branch);
 
-            for f in changed {
-                all_files.push(RichDiffFileInfo {
-                    path: f.path.to_string_lossy().to_string(),
-                    old_path: f.old_path.map(|p| p.to_string_lossy().to_string()),
-                    status: f.status.label().to_string(),
-                    additions: f.additions,
-                    deletions: f.deletions,
-                    repo_name: repo.name.clone(),
-                });
+            match changed {
+                Ok(changed) => {
+                    for f in changed {
+                        all_files.push(RichDiffFileInfo {
+                            path: f.path.to_string_lossy().to_string(),
+                            old_path: f.old_path.map(|p| p.to_string_lossy().to_string()),
+                            status: f.status.label().to_string(),
+                            additions: f.additions,
+                            deletions: f.deletions,
+                            repo_name: repo.name.clone(),
+                        });
+                    }
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        repo_path = %path.display(),
+                        repo_name = ?repo.name,
+                        error = %error,
+                        "Failed to compute diff file list"
+                    );
+                    if repo_warning.is_none() {
+                        repo_warning =
+                            Some("Unable to compute diff for this repository.".to_string());
+                    }
+                }
+            }
+            if let Some(warning) = &repo_warning {
+                match repo.name.as_deref() {
+                    Some(name) => warnings.push(format!("{name}: {warning}")),
+                    None => warnings.push(warning.clone()),
+                }
             }
             per_repo_bases.push(RepoBase {
                 repo_name: repo.name.clone(),
-                base_branch: base_branch.clone(),
+                base_branch: display_base,
+                warning: repo_warning,
             });
-            if let Some(w) = warning {
-                match repo.name.as_deref() {
-                    Some(n) => warnings.push(format!("{n}: {w}")),
-                    None => warnings.push(w),
-                }
-            }
         }
 
         RichDiffFilesResponse {
@@ -6738,6 +6884,23 @@ pub async fn session_diff_files(
 }
 
 #[derive(Deserialize)]
+pub struct DiffComparisonQuery {
+    #[serde(default)]
+    comparison: DiffComparison,
+}
+
+impl DiffComparison {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Base => "base",
+            Self::OriginMain => "origin/main",
+            Self::Uncommitted => "HEAD",
+            Self::Upstream => "upstream",
+        }
+    }
+}
+
+#[derive(Deserialize)]
 pub struct FileDiffQuery {
     pub path: String,
     /// Workspace repo name when the session is a multi-repo workspace.
@@ -6746,11 +6909,14 @@ pub struct FileDiffQuery {
     /// single-repo URL keeps working for the primary repo. See #1047.
     #[serde(default)]
     pub repo: Option<String>,
+    #[serde(default)]
+    comparison: DiffComparison,
 }
 
 /// Response for a rejected diff request (bad path, file not changed, etc.).
 enum DiffFileError {
     BadRequest(&'static str),
+    BadComparison(String),
     NotFound(&'static str),
     Internal(anyhow::Error),
 }
@@ -6816,6 +6982,8 @@ pub async fn session_diff_file(
                 config_default.as_deref(),
                 repo_path,
             );
+            let base_branch = resolve_diff_comparison(query.comparison, base_branch, repo_path)
+                .map_err(DiffFileError::BadComparison)?;
 
             // Validate the requested path. Files in the changed set are diffed;
             // an in-repo file with no diff against the base is served through
@@ -6931,6 +7099,11 @@ pub async fn session_diff_file(
     match result {
         Ok(Ok(value)) => (StatusCode::OK, Json(value)).into_response(),
         Ok(Err(DiffFileError::BadRequest(msg))) => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "bad_request", "message": msg})),
+        )
+            .into_response(),
+        Ok(Err(DiffFileError::BadComparison(msg))) => (
             StatusCode::BAD_REQUEST,
             Json(serde_json::json!({"error": "bad_request", "message": msg})),
         )
@@ -8348,6 +8521,45 @@ mod tests {
         // Auto-detect when nothing is set. The tmp dir is not a repo so
         // `get_default_base_ref` returns Err -> "main" fallback.
         assert_eq!(resolve_diff_base(None, None, None, tmp.path()), "main");
+    }
+
+    #[test]
+    fn explicit_diff_comparisons_report_missing_refs_and_detached_upstream() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = git2::Repository::init(tmp.path()).unwrap();
+        let tree_id = repo.treebuilder(None).unwrap().write().unwrap();
+        let tree = repo.find_tree(tree_id).unwrap();
+        let signature = git2::Signature::now("Test", "test@example.com").unwrap();
+        let commit_id = repo
+            .commit(
+                Some("refs/heads/main"),
+                &signature,
+                &signature,
+                "initial",
+                &tree,
+                &[],
+            )
+            .unwrap();
+        repo.set_head("refs/heads/main").unwrap();
+
+        let missing_origin = resolve_diff_comparison(
+            DiffComparison::OriginMain,
+            "ignored".to_string(),
+            tmp.path(),
+        )
+        .unwrap_err();
+        assert!(missing_origin.contains("refs/remotes/origin/main"));
+
+        let missing_upstream =
+            resolve_diff_comparison(DiffComparison::Upstream, "ignored".to_string(), tmp.path())
+                .unwrap_err();
+        assert!(missing_upstream.contains("no configured upstream"));
+
+        repo.set_head_detached(commit_id).unwrap();
+        let detached_upstream =
+            resolve_diff_comparison(DiffComparison::Upstream, "ignored".to_string(), tmp.path())
+                .unwrap_err();
+        assert!(detached_upstream.contains("detached"));
     }
 
     #[test]

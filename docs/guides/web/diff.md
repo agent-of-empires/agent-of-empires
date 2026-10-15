@@ -26,6 +26,12 @@ Keyboard navigation: arrow up / down moves the selection, arrow
 left / right expands or collapses a directory in tree view, and
 Enter / Space opens a file or toggles a directory.
 
+## Comparison
+
+The comparison selector offers **Base branch**, **origin/main**, **Uncommitted**, and **Tracking branch**. Base branch keeps the worktree, session override, profile, and auto-detected base behavior described below. **Uncommitted** compares `HEAD` with the index and working tree, including untracked files, so committed branch changes are omitted. **origin/main** and **Tracking branch** show changes since the merge base with the selected remote branch, including uncommitted work. Tracking branch uses this checkout's configured upstream. Neither mode fetches; unavailable references are reported instead of silently choosing another base.
+
+The selection applies to both the changed-file list and the selected file's contents.
+
 ## Base override
 
 By default the diff is computed against the branch the worktree was forked from (its recorded base branch), falling back to the configured `diff.default_branch` and then auto-detection. The **base picker** chip overrides it per session: type to filter branches, pick one, and the diff recomputes. A reset affordance appears while an override is active. The override is sent to the server (`PATCH /api/sessions/{id}/diff-base`) so it persists for the session, not just the browser.

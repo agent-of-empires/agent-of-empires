@@ -2,6 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { FileDiff, Virtualizer } from "@pierre/diffs/react";
 import { processFile } from "@pierre/diffs";
 import type { DiffLineAnnotation, FileContents, FileDiffOptions, SelectedLineRange } from "@pierre/diffs";
+import type { DiffComparison } from "../../lib/types";
 import { useFileContents } from "../../hooks/useFileContents";
 import { useWebSettings } from "../../hooks/useWebSettings";
 import { useShikiTheme } from "../../hooks/useShikiTheme";
@@ -31,6 +32,7 @@ interface Props {
   targetLine?: number;
   /** Triggers a re-fetch when the file list changes. */
   revision?: number;
+  comparison?: DiffComparison;
   /** Called when the user wants to return to the terminal view. */
   onClose?: () => void;
   /** When true, the in-diff comment UI (line selection, inline cards/forms,
@@ -83,11 +85,12 @@ export function DiffFileViewer({
   repoName,
   targetLine,
   revision,
+  comparison = "base",
   onClose,
   commentsEnabled = false,
   commentsStore,
 }: Props) {
-  const { contents, loading, error } = useFileContents(sessionId, filePath, repoName, revision);
+  const { contents, loading, error } = useFileContents(sessionId, filePath, repoName, revision, comparison);
   const { theme } = useShikiTheme();
   const { settings, update } = useWebSettings();
 

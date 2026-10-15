@@ -1,6 +1,6 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
 import { getSessionFileContents } from "../lib/api";
-import type { RichFileContentsResponse } from "../lib/types";
+import type { DiffComparison, RichFileContentsResponse } from "../lib/types";
 
 interface UseFileContentsResult {
   contents: RichFileContentsResponse | null;
@@ -42,8 +42,9 @@ function cacheKeyFor(
   filePath: string,
   repoName: string | undefined,
   revision: number | undefined,
+  comparison: DiffComparison,
 ): string {
-  return JSON.stringify([sessionId, filePath, repoName ?? null, revision ?? 0]);
+  return JSON.stringify([sessionId, filePath, repoName ?? null, revision ?? 0, comparison]);
 }
 
 function cachePut(key: string, value: RichFileContentsResponse) {
@@ -95,13 +96,15 @@ export function useFileContents(
   repoName: string | undefined,
   /** Triggers a re-fetch when bumped (e.g. from useDiffFiles.revision). */
   externalRevision?: number,
+  comparison: DiffComparison = "base",
 ): UseFileContentsResult {
-  const key = sessionId && filePath ? cacheKeyFor(sessionId, filePath, repoName, externalRevision) : null;
+  const key = sessionId && filePath ? cacheKeyFor(sessionId, filePath, repoName, externalRevision, comparison) : null;
 
   const [contents, setContents] = useState<RichFileContentsResponse | null>(() => (key ? cacheGet(key) : null));
   const [loading, setLoading] = useState(key != null && cacheGet(key) == null);
   const [error, setError] = useState<string | null>(null);
   const [handledKey, setHandledKey] = useState(key);
+  const [handledComparison, setHandledComparison] = useState(comparison);
   const requestIdRef = useRef(0);
 
   // Sync transient state to the active file at render time (not in an effect).
@@ -113,6 +116,8 @@ export function useFileContents(
   // same-tick switch).
   if (key !== handledKey) {
     setHandledKey(key);
+    const comparisonChanged = comparison !== handledComparison;
+    setHandledComparison(comparison);
     setError(null);
     if (!key) {
       setContents(null);
@@ -123,11 +128,16 @@ export function useFileContents(
         setContents(hit);
         setLoading(false);
       } else {
-        // Keep stale contents under a loading scrim; don't blank the viewer.
+        if (comparisonChanged) setContents(null);
         setLoading(true);
       }
     }
   }
+
+  // Invalidate an old content request before the browser paints the new key.
+  useLayoutEffect(() => {
+    requestIdRef.current += 1;
+  }, [key]);
 
   const fetchContents = useCallback(
     async (force = false) => {
@@ -136,7 +146,7 @@ export function useFileContents(
         setLoading(false);
         return;
       }
-      const k = cacheKeyFor(sessionId, filePath, repoName, externalRevision);
+      const k = cacheKeyFor(sessionId, filePath, repoName, externalRevision, comparison);
       if (!force) {
         const hit = cacheGet(k);
         if (hit) {
@@ -149,10 +159,12 @@ export function useFileContents(
       const reqId = ++requestIdRef.current;
       setLoading(true);
       setError(null);
-      const resp = await getSessionFileContents(sessionId, filePath, repoName);
-      // Drop stale responses from rapid file/session switches.
+      const resp = await getSessionFileContents(sessionId, filePath, repoName, comparison);
+      // Drop stale responses from rapid file/session/comparison switches.
       if (reqId !== requestIdRef.current) return;
-      if (resp) {
+      if (resp && "error" in resp) {
+        setError(resp.message);
+      } else if (resp) {
         cachePut(k, resp);
         setContents(resp);
       } else {
@@ -160,7 +172,7 @@ export function useFileContents(
       }
       setLoading(false);
     },
-    [sessionId, filePath, repoName, externalRevision],
+    [sessionId, filePath, repoName, externalRevision, comparison],
   );
 
   // Defer the fetch a tick so a same-tick switch (A -> B -> C) cancels the

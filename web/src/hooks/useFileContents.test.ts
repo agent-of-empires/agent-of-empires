@@ -197,4 +197,43 @@ describe("useFileContents", () => {
     });
     expect(result.current.contents?.new_content).toBe("beta");
   });
+
+  it("separates baselines in cache and drops an in-flight result after switching", async () => {
+    const { promise: staleResponse, resolve: resolveStale } = Promise.withResolvers<RichFileContentsResponse | null>();
+    const spy = vi.spyOn(api, "getSessionFileContents");
+    spy.mockResolvedValueOnce(makeContents("a.ts", "base"));
+    const { result, rerender } = renderHook(
+      ({ comparison }) => useFileContents("s1", "a.ts", undefined, undefined, comparison),
+      { initialProps: { comparison: "base" as const } },
+    );
+    await waitFor(() => expect(result.current.contents?.new_content).toBe("base"));
+
+    spy.mockReturnValueOnce(staleResponse).mockResolvedValueOnce(makeContents("a.ts", "upstream"));
+    rerender({ comparison: "uncommitted" });
+    await waitFor(() => expect(spy).toHaveBeenCalledTimes(2));
+    rerender({ comparison: "upstream" });
+    await waitFor(() => expect(result.current.contents?.new_content).toBe("upstream"));
+
+    await act(async () => {
+      resolveStale(makeContents("a.ts", "late-uncommitted"));
+    });
+    expect(result.current.contents?.new_content).toBe("upstream");
+
+    // Returning to base hits its own cache entry, not the upstream contents.
+    rerender({ comparison: "base" });
+    expect(result.current.contents?.new_content).toBe("base");
+    expect(spy).toHaveBeenCalledWith("s1", "a.ts", undefined, "base");
+    expect(spy).toHaveBeenCalledWith("s1", "a.ts", undefined, "uncommitted");
+    expect(spy).toHaveBeenCalledWith("s1", "a.ts", undefined, "upstream");
+  });
+
+  it("shows the server's useful comparison error", async () => {
+    vi.spyOn(api, "getSessionFileContents").mockResolvedValue({
+      error: "bad_request",
+      message: "Comparison ref is missing.",
+    });
+    const { result } = renderHook(() => useFileContents("s1", "a.ts", undefined, undefined, "origin_main"));
+    await waitFor(() => expect(result.current.error).toBe("Comparison ref is missing."));
+    expect(result.current.contents).toBeNull();
+  });
 });

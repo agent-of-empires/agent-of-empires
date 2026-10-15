@@ -129,7 +129,7 @@ import { ThemeIntro } from "./components/onboarding/ThemeIntro";
 import type { TourScope } from "./lib/tourSteps";
 import { SessionWizard } from "./components/session-wizard/SessionWizard";
 import type { WizardPrefill } from "./components/session-wizard/SessionWizard";
-import type { ProjectInfo, RepoGroup, SessionResponse } from "./lib/types";
+import type { DiffComparison, ProjectInfo, RepoGroup, SessionResponse } from "./lib/types";
 import { Dashboard } from "./components/Dashboard";
 import { LoginPage } from "./components/LoginPage";
 import { TokenEntryPage } from "./components/TokenEntryPage";
@@ -466,6 +466,7 @@ function AppContent({
      *  FileContentViewer instead of the git-diff viewer. See #3088. */
     external?: boolean;
   } | null>(null);
+  const [diffComparison, setDiffComparison] = useState<DiffComparison>("base");
   const selectedFilePath = selectedFile?.path ?? null;
   const selectedFileExternal = selectedFile?.external ?? false;
   const selectedRepoName = selectedFile?.repoName;
@@ -729,7 +730,7 @@ function AppContent({
     loading: diffFilesLoading,
     revision,
     refresh: refreshDiffFiles,
-  } = useDiffFiles(activeSessionId, diffPanelActive);
+  } = useDiffFiles(activeSessionId, diffPanelActive, diffComparison);
 
   // Diff-viewer comments (#928). Acp-only and session-scoped. The
   // banner lives in the diff pane while the inline UI lives inside
@@ -1697,6 +1698,8 @@ function AppContent({
           selectedRepoName={selectedRepoName}
           selectedFileLine={selectedFileLine}
           revision={revision}
+          comparison={diffComparison}
+          onComparisonChange={setDiffComparison}
           diffFiles={diffFiles}
           perRepoBases={perRepoBases}
           warning={warning}
@@ -1739,6 +1742,8 @@ function AppContent({
             session={activeSession ?? null}
             sessionId={activeSessionId}
             files={diffFiles}
+            comparison={diffComparison}
+            onComparisonChange={setDiffComparison}
             perRepoBases={perRepoBases}
             warning={warning}
             filesLoading={diffFilesLoading}
@@ -1817,6 +1822,7 @@ function AppContent({
                       sessionId={activeSessionId}
                       filePath={selectedFilePath}
                       repoName={selectedRepoName}
+                      comparison={diffComparison}
                       targetLine={selectedFileLine}
                       revision={revision}
                       onClose={handleCloseFile}

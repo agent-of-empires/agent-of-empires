@@ -1,13 +1,15 @@
 import { DiffFileList } from "./diff/DiffFileList";
 import { CommentsBanner } from "./diff/comments/CommentsBanner";
 import { PluginDetailBadges } from "./plugin/PluginSlots";
-import type { RepoBase, RichDiffFile, SessionResponse } from "../lib/types";
+import type { DiffComparison, RepoBase, RichDiffFile, SessionResponse } from "../lib/types";
 
 interface Props {
   session: SessionResponse | null;
   sessionId: string | null;
   files: RichDiffFile[];
   perRepoBases: RepoBase[];
+  comparison: DiffComparison;
+  onComparisonChange: (comparison: DiffComparison) => void;
   warning: string | null;
   filesLoading: boolean;
   selectedFilePath: string | null;
@@ -34,6 +36,8 @@ export function DiffPane({
   filesLoading,
   selectedFilePath,
   selectedRepoName,
+  comparison,
+  onComparisonChange,
   onSelectFile,
   onDiffRefresh,
   commentsEnabled,
@@ -70,6 +74,8 @@ export function DiffPane({
         sessionId={sessionId}
         repoPath={session?.main_repo_path ?? session?.project_path ?? null}
         baseBranchOverride={session?.base_branch_override ?? null}
+        comparison={comparison}
+        onComparisonChange={onComparisonChange}
         onBaseBranchChanged={onDiffRefresh}
       />
     </div>

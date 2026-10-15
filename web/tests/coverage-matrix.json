@@ -1503,7 +1503,8 @@
       "specs": [
         "tests/live/right-panel-diff-files.spec.ts",
         "tests/live/right-panel-large-diff.spec.ts",
-        "tests/live/right-panel-notifications.spec.ts"
+        "tests/live/right-panel-notifications.spec.ts",
+        "tests/live/diff-comparison.spec.ts"
       ],
       "components": [
         "web/src/components/DiffPane.tsx",
