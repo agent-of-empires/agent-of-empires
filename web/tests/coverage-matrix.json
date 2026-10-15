@@ -1000,7 +1000,11 @@
       "id": "wizard",
       "kind": "mocked-playwright",
       "risk": "high",
-      "specs": ["tests/wizard.spec.ts", "tests/wizard-project.spec.ts"],
+      "specs": [
+        "tests/wizard.spec.ts",
+        "tests/wizard-project.spec.ts",
+        "src/components/session-wizard/__tests__/SessionWizard.test.tsx"
+      ],
       "components": [
         "web/src/components/DirectoryBrowser.tsx",
         "web/src/components/session-wizard/SessionWizard.tsx",
