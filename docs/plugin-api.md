@@ -349,10 +349,10 @@ A request is `{ "aoeBridge": 1, "id", "method", "params"? }`, where `id` is a nu
 | `plugins.uiState` | none | `session.read` | The `GET /api/plugins/ui-state` body, including other plugins' entries |
 | `action` | `{ "method", "params"?, "sessionId"? }` | not read-only or CityHall | `{ "baselineRevision" }`; the call goes to this plugin's own worker, as a [pane action](#pane-actions) does |
 | `openSession` | `{ "id" }` | none | `null`; the dashboard navigates to the session |
-| `session.archive` | `{ "id" }` | `session.write`, not read-only or CityHall | `null`; archives the session and stops its pane |
-| `session.trash` | `{ "id" }` | `session.write`, not read-only or CityHall | `null`; moves the session to the trash and stops its pane |
+| `session.archive` | `{ "id" }` | `session.read` and `session.write`, not read-only or CityHall | `null`; archives the session and stops its pane |
+| `session.trash` | `{ "id" }` | `session.read` and `session.write`, not read-only or CityHall | `null`; moves the session to the trash and stops its pane |
 
-Error codes: `unknown_method`, `invalid_params`, `capability_denied` (the plugin does not declare the required capability), `read_only`, `cityhall_mode`, and `failed` (the dashboard's request failed). An `action` result only acknowledges delivery; its effect arrives in `plugins.uiState` once the worker updates its state.
+Error codes: `unknown_method`, `invalid_params` (also an `id` that `sessions.list` does not return), `capability_denied` (the plugin does not declare the required capability), `read_only`, `cityhall_mode`, and `failed` (the dashboard's request failed). An `action` result only acknowledges delivery; its effect arrives in `plugins.uiState` once the worker updates its state.
 
 The dashboard pushes `{ "aoeBridge": 1, "event", "data" }` messages, with no `id`:
 
