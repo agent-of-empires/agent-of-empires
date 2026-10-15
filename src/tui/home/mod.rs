@@ -410,6 +410,13 @@ pub struct HomeView {
 
     pub(super) show_preview_info: bool,
 
+    /// Preview the agent above its paired terminal; `view_mode` picks the focused half.
+    pub(super) split_terminal: bool,
+    /// Captures whichever split half is not focused; the focused half uses
+    /// `preview_capture_worker` like a single preview.
+    pub(super) split_capture_worker: Option<live_send::LiveCaptureWorker>,
+    pub(super) split_capture_target: Option<String>,
+
     pub(super) archived_section_collapsed: bool,
 
     /// Stopped sessions inside groups are left out of the sidebar, for this run only.

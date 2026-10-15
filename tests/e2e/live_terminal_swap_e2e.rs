@@ -43,8 +43,24 @@ fn wait_for_pane_text(socket: &std::path::Path, prefix: &str, text: &str) -> Str
 #[parallel]
 fn test_leader_t_moves_live_keys_between_agent_and_terminal() {
     require_tmux!();
+    swap_round_trip(false);
+}
 
-    let mut h = TuiTestHarness::new("live_terminal_swap");
+/// Same round trip with the split preview on, where both panes stay on screen and only
+/// the focused half receives keys.
+#[test]
+#[parallel]
+fn test_split_preview_shows_both_panes_and_relays_to_focused_half() {
+    require_tmux!();
+    swap_round_trip(true);
+}
+
+fn swap_round_trip(split: bool) {
+    let mut h = TuiTestHarness::new(if split {
+        "live_terminal_swap_split"
+    } else {
+        "live_terminal_swap"
+    });
     write_live_send_config(&h);
     let bin = h.install_path_command("claude");
     std::fs::write(
@@ -63,6 +79,9 @@ fn test_leader_t_moves_live_keys_between_agent_and_terminal() {
 
     h.spawn_tui();
     h.wait_for("Swappy");
+    if split {
+        h.send_keys("|");
+    }
     h.send_keys("Enter");
     h.wait_for_timeout("LIVE", Duration::from_secs(10));
     let socket = h.home_path().join("tmux.sock");
@@ -82,8 +101,19 @@ fn test_leader_t_moves_live_keys_between_agent_and_terminal() {
         !agent.contains("SHELL_SIDE"),
         "shell keystrokes must not reach the agent pane:\n{agent}"
     );
-    assert!(
-        h.capture_screen().contains("LIVE"),
-        "swapping must not leave live mode"
-    );
+    let screen = h.capture_screen();
+    assert!(screen.contains("LIVE"), "swapping must not leave live mode");
+    if split {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !(h.capture_screen().contains("SHELL_SIDE")
+            && h.capture_screen().contains("AGENT_SIDE"))
+        {
+            assert!(
+                Instant::now() < deadline,
+                "split must show both panes:\n{}",
+                h.capture_screen()
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
 }

@@ -25,6 +25,7 @@ Almost every key goes to the agent, so AoE reserves one **leader** chord, tmux-s
 | `Ctrl+B` then `k` | Open the command palette |
 | `Ctrl+B` then `b` | Hide or show the sidebar, giving the preview full width |
 | `Ctrl+B` then `t` | Switch between the agent and its paired terminal, starting the terminal if needed |
+| `Ctrl+B` then `\|` | Split the preview: agent above its paired terminal |
 | `Ctrl+B` then `q` | Exit live mode |
 | `Ctrl+B` then `Ctrl+B` | Send a literal `Ctrl+B` to the agent |
 | `Esc` or any other key | Cancel the menu, send nothing |

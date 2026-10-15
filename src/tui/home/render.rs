@@ -176,6 +176,42 @@ pub(super) fn map_live_preview_cursor(
 
 /// Pane lines to capture for the preview, accounting for the scrollback offset plus a
 /// buffer so moderate scrolls don't force a fresh capture on every wheel tick.
+/// Rows each split half needs; a shorter preview stays single.
+const SPLIT_MIN_HALF_ROWS: u16 = 6;
+
+/// The split preview's rects: agent on top, a one-row divider, terminal below.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct SplitRects {
+    pub(super) agent: Rect,
+    pub(super) divider: Rect,
+    pub(super) terminal: Rect,
+}
+
+/// Equal halves, so a pane sized for either half fits the other and focus swaps never
+/// resize the fleet. An odd leftover row stays blank at the bottom.
+pub(super) fn split_preview_rects(inner: Rect) -> Option<SplitRects> {
+    let half = inner.height.saturating_sub(1) / 2;
+    if half < SPLIT_MIN_HALF_ROWS {
+        return None;
+    }
+    Some(SplitRects {
+        agent: Rect {
+            height: half,
+            ..inner
+        },
+        divider: Rect {
+            y: inner.y + half,
+            height: 1,
+            ..inner
+        },
+        terminal: Rect {
+            y: inner.y + half + 1,
+            height: half,
+            ..inner
+        },
+    })
+}
+
 fn capture_lines_for(height: u16, scroll_offset: u16) -> usize {
     // Off the live edge: capture the whole scrollback once so the snapshot stays put. A
     // window that grew per notch was re-anchored to the advancing live edge on every
@@ -2085,6 +2121,214 @@ impl HomeView {
         Some(name)
     }
 
+    /// Whether the preview splits into agent and paired terminal: only for a tmux-backed
+    /// agent in Agent or Terminal view, where `view_mode` names the focused half.
+    pub(super) fn split_terminal_applies(&self) -> bool {
+        if !self.split_terminal || matches!(self.view_mode, ViewMode::Tool(_)) {
+            return false;
+        }
+        self.selected_session
+            .as_ref()
+            .and_then(|id| self.get_instance(id))
+            .is_some_and(|inst| {
+                !inst.is_structured()
+                    && !inst.is_archived()
+                    && !inst.is_trashed()
+                    && !matches!(inst.status, Status::Creating | Status::Deleting)
+            })
+    }
+
+    /// The pane behind the split half that is not focused. `None` for a terminal that is
+    /// not running, so no worker polls a missing session.
+    fn split_passive_tmux_name(&self) -> Option<String> {
+        let id = self.selected_session.as_ref()?;
+        let inst = self.get_instance(id)?;
+        if matches!(self.view_mode, ViewMode::Terminal) {
+            return Some(crate::tmux::Session::resolve_name_for_display(
+                &inst.id,
+                &inst.title,
+            ));
+        }
+        if !self.paired_terminal_running_for_display(inst) {
+            return None;
+        }
+        Some(match self.effective_terminal_mode(id) {
+            TerminalMode::Host => {
+                crate::tmux::TerminalSession::resolve_name_for_display(&inst.id, &inst.title)
+            }
+            TerminalMode::Container => {
+                crate::tmux::ContainerTerminalSession::resolve_name_for_display(
+                    &inst.id,
+                    &inst.title,
+                )
+            }
+        })
+    }
+
+    /// Point the split worker at the passive half's pane, or drop it when there is none.
+    /// Passive capture is observer-only: idle cadence, plain `capture-pane`, never a
+    /// resize, since the terminal is shared with the web dashboard.
+    fn sync_split_capture_worker(&mut self, desired: Option<String>) {
+        let Some(target) = desired else {
+            self.split_capture_worker = None;
+            self.split_capture_target = None;
+            return;
+        };
+        let forward_empty = !matches!(self.view_mode, ViewMode::Terminal);
+        let worker = self.split_capture_worker.get_or_insert_with(|| {
+            let worker = live_send::LiveCaptureWorker::spawn(self.preview_wake.clone());
+            worker.set_vt_enabled(false);
+            worker
+        });
+        if self.split_capture_target.as_deref() != Some(target.as_str()) {
+            worker.set_target(target.clone());
+            self.split_capture_target = Some(target);
+        }
+        worker.set_forward_empty(forward_empty);
+    }
+
+    /// Paint the unfocused split half and its divider. Touches no preview geometry, so
+    /// mouse, scroll and selection keep describing the focused half.
+    fn render_split_passive_half(
+        &mut self,
+        frame: &mut Frame,
+        split: &SplitRects,
+        compact: bool,
+        theme: &Theme,
+    ) {
+        let Some(id) = self.selected_session.clone() else {
+            return;
+        };
+        frame.render_widget(
+            Block::default()
+                .borders(Borders::TOP)
+                .border_style(Style::default().fg(theme.terminal_border))
+                .title(" Terminal ")
+                .title_style(Style::default().fg(theme.terminal_border)),
+            split.divider,
+        );
+        let terminal_focused = matches!(self.view_mode, ViewMode::Terminal);
+        let rect = if terminal_focused {
+            split.agent
+        } else {
+            split.terminal
+        };
+        if !terminal_focused
+            && !self
+                .get_instance(&id)
+                .is_some_and(|inst| self.paired_terminal_running_for_display(inst))
+        {
+            let key = if self.strict_hotkeys { "Ctrl+T" } else { "T" };
+            frame.render_widget(
+                Paragraph::new(format!("No terminal running. Press {key} to start one."))
+                    .style(Style::default().fg(theme.dimmed))
+                    .alignment(Alignment::Center),
+                rect,
+            );
+            return;
+        }
+        let container = self.effective_terminal_mode(&id) == TerminalMode::Container;
+        let select: fn(&mut Self) -> &mut super::PreviewCache = match (terminal_focused, container)
+        {
+            (true, _) => |s| &mut s.preview_cache,
+            (false, true) => |s| &mut s.container_terminal_preview_cache,
+            (false, false) => |s| &mut s.terminal_preview_cache,
+        };
+        let Some(info_height) = self.get_instance(&id).map(|inst| {
+            if terminal_focused {
+                preview::agent_info_height(inst)
+            } else {
+                preview::terminal_info_height(inst)
+            }
+        }) else {
+            return;
+        };
+        let output =
+            preview::PreviewLayout::compute(rect, compact, self.show_preview_info, info_height)
+                .output;
+        self.apply_split_capture(output.width, output.height, select);
+        select(self).ensure_parsed();
+        let cache = match (terminal_focused, container) {
+            (true, _) => &self.preview_cache,
+            (false, true) => &self.container_terminal_preview_cache,
+            (false, false) => &self.terminal_preview_cache,
+        };
+        let Some(inst) = self.get_instance(&id) else {
+            return;
+        };
+        let cached = CachedPreview::new(cache.parsed_text.as_ref(), cache.is_pending_for(&id));
+        if terminal_focused {
+            Preview::render_with_cache(
+                frame,
+                rect,
+                inst,
+                cached,
+                0,
+                theme,
+                self.idle_decay_window,
+                compact,
+                self.show_preview_info,
+            );
+        } else {
+            Preview::render_terminal_preview(
+                frame,
+                rect,
+                inst,
+                true,
+                cached,
+                0,
+                theme,
+                compact,
+                self.show_preview_info,
+            );
+        }
+        frame.buffer_mut().set_style(
+            rect,
+            Style::default().add_modifier(ratatui::style::Modifier::DIM),
+        );
+    }
+
+    /// Apply the split worker's newest frame to the passive half's cache. No scroll or
+    /// freeze handling: the passive half always shows the live edge.
+    fn apply_split_capture(
+        &mut self,
+        width: u16,
+        height: u16,
+        select: fn(&mut Self) -> &mut super::PreviewCache,
+    ) {
+        let Some(id) = self.selected_session.clone() else {
+            return;
+        };
+        {
+            let cache = select(self);
+            if cache.session_id.as_deref() != Some(id.as_str()) && !cache.content.is_empty() {
+                *cache = super::PreviewCache::default();
+            }
+        }
+        let Some(worker) = self.split_capture_worker.as_ref() else {
+            return;
+        };
+        worker.set_capture_lines(capture_lines_for(height, 0));
+        let Some(frame) = worker.take_latest() else {
+            return;
+        };
+        if !worker.frame_is_current(&frame) {
+            return;
+        }
+        if frame.content.is_empty() && !worker.should_forward_empty() {
+            worker.restore_latest(frame);
+            return;
+        }
+        select(self).store_capture(
+            frame.content,
+            id,
+            frame.target,
+            frame.generation,
+            (width, height),
+            frame.cursor,
+        );
+    }
+
     /// Observe worker progress without relying on changed-frame publication. A stalled
     /// worker is replaced only after its tmux operation deadline and grace, so a slow but
     /// legitimate sample is never overlapped.
@@ -2801,7 +3045,17 @@ impl HomeView {
             block = block.title_top(Line::from(hint_spans).right_aligned());
         }
 
-        let inner = block.inner(area);
+        let split = self
+            .split_terminal_applies()
+            .then(|| split_preview_rects(block.inner(area)))
+            .flatten();
+        // Split mode hands the whole single-preview path the focused half, so geometry,
+        // scroll, selection and mouse hits all describe it; the other half is paint-only.
+        let inner = match (&split, &self.view_mode) {
+            (Some(s), ViewMode::Terminal) => s.terminal,
+            (Some(s), _) => s.agent,
+            (None, _) => block.inner(area),
+        };
         self.preview_area = inner;
         self.preview_outer_area = area;
         self.diff_area = Rect::default();
@@ -2880,6 +3134,12 @@ impl HomeView {
                 self.displayed_pane_tmux_name()
             };
         self.sync_preview_capture_worker(desired);
+        let passive = if selected_archived || selected_trashed || selected_stopped {
+            None
+        } else {
+            split.as_ref().and_then(|_| self.split_passive_tmux_name())
+        };
+        self.sync_split_capture_worker(passive);
 
         // Pre-size every other open session's detached pane to the rect it would be shown
         // at (and adopt worker completions), in every view mode. The selected session is
@@ -2977,6 +3237,10 @@ impl HomeView {
             self.render_structured_preview(frame, inner, theme);
             self.paint_preview_selection(frame, theme);
             return;
+        }
+
+        if let Some(split) = &split {
+            self.render_split_passive_half(frame, split, compact, theme);
         }
 
         match self.view_mode {
@@ -3754,7 +4018,7 @@ impl HomeView {
                         _ => "t terminal",
                     };
                     let menu = format!(
-                        "  {lead}:  k palette \u{00b7} {sidebar_cmd} \u{00b7} {swap_cmd} \u{00b7} q exit "
+                        "  {lead}:  k palette \u{00b7} {sidebar_cmd} \u{00b7} {swap_cmd} \u{00b7} | split \u{00b7} q exit "
                     );
                     let menu_budget = (area.width as usize)
                         .saturating_sub(unicode_width::UnicodeWidthStr::width(chip));
@@ -4769,6 +5033,23 @@ mod tests {
     // The column lives at `list_width - badge_width - SLOT - MARGIN`; `pad_len` goes
     // between the row prefix and the column, and None hides the column so the title is
     // not clipped.
+
+    #[test]
+    fn split_preview_rects_cases() {
+        let at = |height| Rect::new(0, 3, 50, height);
+        assert_eq!(split_preview_rects(at(12)), None, "two halves need 13 rows");
+        let split = split_preview_rects(at(13)).expect("13 rows split");
+        assert_eq!(
+            (split.agent, split.divider, split.terminal),
+            (
+                Rect::new(0, 3, 50, 6),
+                Rect::new(0, 9, 50, 1),
+                Rect::new(0, 10, 50, 6)
+            )
+        );
+        let even = split_preview_rects(at(14)).expect("14 rows split");
+        assert_eq!(even.agent.height, even.terminal.height, "halves stay equal");
+    }
 
     #[test]
     fn activity_column_padding_cases() {

@@ -454,6 +454,12 @@ impl HomeView {
                 .as_ref()
                 .and_then(|c| c.app_state.show_preview_info)
                 .unwrap_or(true),
+            split_terminal: user_config
+                .as_ref()
+                .and_then(|c| c.app_state.home_split_terminal)
+                .unwrap_or(false),
+            split_capture_worker: None,
+            split_capture_target: None,
             archived_section_collapsed: user_config
                 .as_ref()
                 .and_then(|c| c.app_state.archived_section_collapsed)

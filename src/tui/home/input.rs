@@ -2889,6 +2889,7 @@ impl HomeView {
             }
             ActionId::ToggleContainer => self.toggle_container_for_selected(),
             ActionId::TogglePreviewInfo => self.toggle_preview_info(),
+            ActionId::ToggleSplitTerminal => self.toggle_split_terminal(),
             ActionId::ToggleHideStopped => self.toggle_hide_stopped_in_groups(),
             ActionId::ToggleDiagnostics => self.toggle_diagnostics(),
             ActionId::OpenSystemHealth => self.open_system_health(),
@@ -6115,6 +6116,7 @@ impl HomeView {
                 KeyCode::Char('t') | KeyCode::Char('T') if plain => {
                     return self.swap_live_send_target(&state)
                 }
+                KeyCode::Char('|') if plain => self.toggle_split_terminal(),
                 // Esc, or any unbound or modified key, cancels the menu without
                 // forwarding: the leader already swallowed the keystroke, as tmux's
                 // prefix does for unknown keys.

@@ -877,6 +877,11 @@ pub struct AppStateConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub show_preview_info: Option<bool>,
 
+    /// Split the home preview into the agent above its paired terminal. `None`/absent
+    /// means a single preview.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub home_split_terminal: Option<bool>,
+
     /// True once the user has answered the telemetry opt-in prompt (in any
     /// surface, either by enabling or declining). Gates the one-time
     /// standalone consent popup shown to users who completed the walkthrough
