@@ -35,6 +35,11 @@ function closePort(port: { current: MessagePort | null }) {
   port.current = null;
 }
 
+function newNonce(): string {
+  // getRandomValues, unlike randomUUID, also works on a plain-HTTP dashboard.
+  return Array.from(crypto.getRandomValues(new Uint8Array(16)), (b) => b.toString(16).padStart(2, "0")).join("");
+}
+
 async function runCall(call: BridgeCall, pluginId: string): Promise<unknown> {
   switch (call.method) {
     case "ready":
@@ -66,13 +71,15 @@ export function PluginPageView({ pluginId, pageId, onBack, readOnly, cityhall, t
   const pages = usePluginPages();
   const page = pages?.find((p) => p.plugin_id === pluginId && p.id === pageId);
   const [attempt, setAttempt] = useState(0);
-  const [minted, setMinted] = useState<{ page: PluginPage; attempt: number; ok: boolean } | null>(null);
+  const [minted, setMinted] = useState<{ page: PluginPage; attempt: number; ok: boolean; nonce: string } | null>(null);
   const [lost, setLost] = useState(false);
   const frameRef = useRef<HTMLIFrameElement | null>(null);
   // A frame's second load is a new document behind the same window, so it no longer holds the handshake.
   const loads = useRef(0);
   // Transferred by the page with `ready`; a later document can never reach it, so nothing crosses a navigation.
   const port = useRef<MessagePort | null>(null);
+  // Rides the frame URL's fragment, which never reaches the server; `ready` must echo it, so a document the page navigates to cannot take its identity.
+  const nonce = useRef<string | null>(null);
 
   const attachFrame = useCallback((frame: HTMLIFrameElement | null) => {
     frameRef.current = frame;
@@ -85,7 +92,9 @@ export function PluginPageView({ pluginId, pageId, onBack, readOnly, cityhall, t
     if (!page) return;
     let cancelled = false;
     void mintPluginPageTicket(page).then((ok) => {
-      if (!cancelled) setMinted({ page, attempt, ok });
+      if (cancelled) return;
+      nonce.current = newNonce();
+      setMinted({ page, attempt, ok, nonce: nonce.current });
     });
     return () => {
       cancelled = true;
@@ -117,7 +126,7 @@ export function PluginPageView({ pluginId, pageId, onBack, readOnly, cityhall, t
       if (!frame || event.source !== frame || loads.current > 1 || port.current) return;
       const req = parseRequest(event.data);
       const channel = event.ports[0];
-      if (req?.method !== "ready" || !channel) return;
+      if (req?.method !== "ready" || !channel || !nonce.current || req.params.nonce !== nonce.current) return;
       port.current = channel;
       channel.onmessage = serve(channel);
       channel.postMessage(bridgeReply(req.id, null));
@@ -173,7 +182,7 @@ export function PluginPageView({ pluginId, pageId, onBack, readOnly, cityhall, t
         key={attempt}
         ref={attachFrame}
         title={page.title}
-        src={page.url}
+        src={`${page.url}#${ticket.nonce}`}
         sandbox="allow-scripts"
         onLoad={onFrameLoad}
         className="flex-1 w-full border-0 bg-surface-900"

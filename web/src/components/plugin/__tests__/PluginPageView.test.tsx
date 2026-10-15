@@ -69,7 +69,8 @@ async function openFrame() {
       Object.defineProperty(event, "ports", { value: ports });
       window.dispatchEvent(event);
     });
-  return { ...utils, frame, send };
+  const nonce = new URL(frame.src).hash.slice(1);
+  return { ...utils, frame, send, nonce };
 }
 
 beforeEach(() => {
@@ -89,7 +90,7 @@ describe("PluginPageView", () => {
     resolve(true);
     const frame = await screen.findByTestId("plugin-page-frame");
     expect(frame.getAttribute("sandbox")).toBe("allow-scripts");
-    expect(frame.getAttribute("src")).toBe(board.url);
+    expect(frame.getAttribute("src")).toMatch(new RegExp(`^${board.url}#[0-9a-f]{32}$`));
   });
 
   it.each([
@@ -112,17 +113,17 @@ describe("PluginPageView", () => {
 
   it("hands the channel only to its own frame's ready, then serves requests over it", async () => {
     h.sessions.mockResolvedValue({ sessions: [{ id: "s" }], workspace_ordering: [] });
-    const { send } = await openFrame();
+    const { send, nonce } = await openFrame();
     const foreign = fakePort();
-    await send({ aoeBridge: 1, id: 1, method: "ready" }, [foreign.port], window);
+    await send({ aoeBridge: 1, id: 1, method: "ready", params: { nonce } }, [foreign.port], window);
     await send({ aoeBridge: 1, id: 2, method: "sessions.list" }, [foreign.port]);
     expect(foreign.port.onmessage).toBeNull();
 
     const { port, request } = fakePort();
-    await send({ aoeBridge: 1, id: "r", method: "ready" }, [port]);
+    await send({ aoeBridge: 1, id: "r", method: "ready", params: { nonce } }, [port]);
     expect(port.postMessage).toHaveBeenCalledWith({ aoeBridge: 1, id: "r", result: null });
     const late = fakePort();
-    await send({ aoeBridge: 1, id: "r2", method: "ready" }, [late.port]);
+    await send({ aoeBridge: 1, id: "r2", method: "ready", params: { nonce } }, [late.port]);
     expect(late.port.onmessage).toBeNull();
 
     await request({ aoeBridge: 1, id: 3, method: "sessions.list" });
@@ -130,10 +131,22 @@ describe("PluginPageView", () => {
     expect(h.sessions).toHaveBeenCalledTimes(1);
   });
 
-  it("pushes context and theme after ready, and every later theme change", async () => {
-    const { send } = await openFrame();
+  it("hands the channel only to a ready that echoes this opening's nonce", async () => {
+    const { send, nonce } = await openFrame();
+    for (const params of [undefined, { nonce: "" }, { nonce: "0".repeat(32) }]) {
+      const guess = fakePort();
+      await send({ aoeBridge: 1, id: "g", method: "ready", params }, [guess.port]);
+      expect(guess.port.onmessage).toBeNull();
+    }
     const { port } = fakePort();
-    await send({ aoeBridge: 1, id: "r", method: "ready" }, [port]);
+    await send({ aoeBridge: 1, id: "r", method: "ready", params: { nonce } }, [port]);
+    expect(port.onmessage).not.toBeNull();
+  });
+
+  it("pushes context and theme after ready, and every later theme change", async () => {
+    const { send, nonce } = await openFrame();
+    const { port } = fakePort();
+    await send({ aoeBridge: 1, id: "r", method: "ready", params: { nonce } }, [port]);
     expect(port.postMessage).toHaveBeenCalledWith({
       aoeBridge: 1,
       event: "context",
@@ -148,10 +161,10 @@ describe("PluginPageView", () => {
   });
 
   it("tears the frame down and closes the channel when it loads a second document, then reopens fresh", async () => {
-    const { frame, send } = await openFrame();
+    const { frame, send, nonce } = await openFrame();
     const { port } = fakePort();
     fireEvent.load(frame);
-    await send({ aoeBridge: 1, id: "r", method: "ready" }, [port]);
+    await send({ aoeBridge: 1, id: "r", method: "ready", params: { nonce } }, [port]);
     expect(screen.getByTestId("plugin-page-frame")).toBe(frame);
     fireEvent.load(frame);
     expect(port.close).toHaveBeenCalled();
@@ -185,9 +198,9 @@ describe("PluginPageView", () => {
   });
 
   it("gates an open channel's requests on the current mode", async () => {
-    const { send, rerender } = await openFrame();
+    const { send, rerender, nonce } = await openFrame();
     const { port, request } = fakePort();
-    await send({ aoeBridge: 1, id: "r", method: "ready" }, [port]);
+    await send({ aoeBridge: 1, id: "r", method: "ready", params: { nonce } }, [port]);
     rerender(
       <PluginPageView
         pluginId="acme.kit"

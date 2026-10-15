@@ -338,13 +338,13 @@ A worker may push state for a page with `ui.state.set` (`slot = "page"`, `id` = 
 
 #### Page bridge
 
-The page opens the bridge by posting `ready` to `parent` with target origin `"*"`, since its origin is opaque, and transferring one end of a `MessageChannel`. Every later request, reply and push travels over that channel, so nothing reaches a document that replaces the page. The dashboard accepts one `ready` per frame and ignores any other message on the window. Every message carries `aoeBridge: 1`, the bridge version.
+The page opens the bridge by posting `ready` to `parent` with target origin `"*"`, since its origin is opaque, transferring one end of a `MessageChannel` and passing `params: { "nonce" }` set to its URL fragment without the `#`. The dashboard frames each opening with a fresh nonce there, so a document the page navigates to cannot open the bridge in its place. Every later request, reply and push travels over that channel, so nothing reaches a document that replaces the page. The dashboard accepts one `ready` per frame and ignores any other message on the window. Every message carries `aoeBridge: 1`, the bridge version.
 
 A request is `{ "aoeBridge": 1, "id", "method", "params"? }`, where `id` is a number or a string of at most 128 characters and `params` an object. The reply echoes the `id` with either `result` or `error: { "code", "message" }`. The dashboard drops, without replying, any message that is not an object, has another version, or has a malformed `id`, `method` or `params`.
 
 | Method | Params | Requires | Result |
 |---|---|---|---|
-| `ready` | none | none | `null`, then the `context` and `theme` pushes |
+| `ready` | `{ "nonce" }` | none | `null`, then the `context` and `theme` pushes |
 | `sessions.list` | none | `session.read` | The `sessions` array of `GET /api/sessions` |
 | `plugins.uiState` | none | `session.read` | The `GET /api/plugins/ui-state` body, including other plugins' entries |
 | `action` | `{ "method", "params"?, "sessionId"? }` | not read-only or CityHall | `{ "baselineRevision" }`; the call goes to this plugin's own worker, as a [pane action](#pane-actions) does |
@@ -386,7 +386,7 @@ handlers.theme = ({ cssVars }) => {
   for (const [k, v] of Object.entries(cssVars)) document.documentElement.style.setProperty(k, String(v));
 };
 handlers.context = (ctx) => console.log("bridge context", ctx);
-request({ method: "ready" }, (m) => parent.postMessage(m, "*", [port2]))
+request({ method: "ready", params: { nonce: location.hash.slice(1) } }, (m) => parent.postMessage(m, "*", [port2]))
   .then(() => call<{ id: string }[]>("sessions.list"))
   .then((sessions) => console.log(sessions));
 ```

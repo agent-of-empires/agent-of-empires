@@ -49,13 +49,24 @@ const send = (msg, transfer) => new Promise((resolve) => {
 });
 window.call = (method, params) => send({ aoeBridge: 1, id: ++next, method, params });
 (async () => {
-  const ready = await send({ aoeBridge: 1, id: ++next, method: "ready" }, [port2]);
+  const ready = await send({ aoeBridge: 1, id: ++next, method: "ready", params: { nonce: location.hash.slice(1) } }, [port2]);
   const sessions = await call("sessions.list");
   const uiState = await call("plugins.uiState");
   const action = await call("action", { method: "move", params: { to: "done" }, sessionId: "sess-a" });
   const unknown = await call("sessions.archive");
   parent.postMessage({ kind: "results", ready, sessions, uiState, action, unknown, pushes: pushes.slice(0, 2) }, "*");
 })();
+</script>`;
+
+// Navigates away before its own load, so the next document's load reads as the frame's first.
+const REDIRECT_FIXTURE = `<!doctype html><script>location.replace("/api/plugins/acme.other/pages/board");</script>`;
+
+// Another plugin's page trying to take the redirecting page's bridge without its nonce.
+const OTHER_FIXTURE = `<!doctype html><p>other fixture</p><script>
+const { port1, port2 } = new MessageChannel();
+port1.onmessage = (e) => parent.postMessage({ kind: "other-reply", data: e.data }, "*");
+parent.postMessage({ aoeBridge: 1, id: 1, method: "ready", params: { nonce: location.hash.slice(1) } }, "*", [port2]);
+parent.postMessage({ kind: "other-sent" }, "*");
 </script>`;
 
 const theme = (name: string, appearance: "dark" | "light", bg: string) => ({
@@ -137,7 +148,7 @@ test.describe("Plugin pages (#4460)", () => {
     await expect(page.getByRole("navigation", { name: "Sessions sidebar" })).toHaveCount(0);
     const frame = page.getByTestId("plugin-page-frame");
     await expect(frame).toHaveAttribute("sandbox", "allow-scripts");
-    await expect(frame).toHaveAttribute("src", PAGE.url);
+    await expect(frame).toHaveAttribute("src", new RegExp(`^${PAGE.url}#[0-9a-f]{32}$`));
     await expect(page.frameLocator("[data-testid=plugin-page-frame]").getByText("board fixture")).toBeVisible();
     expect(order.slice(0, 2)).toEqual([`POST ${PAGE.url}/ticket`, `GET ${PAGE.url}`]);
 
@@ -225,10 +236,46 @@ test.describe("Plugin pages (#4460)", () => {
       .toEqual({ kind: "theme", data: { appearance: "dark", cssVars: { "--color-surface-900": "#000000" } } });
     expect(frameLoads).toHaveLength(1);
 
-    const frame = page.frames().find((f) => f.url().endsWith(PAGE.url));
+    const frame = page.frames().find((f) => new URL(f.url()).pathname === PAGE.url);
     await frame!.evaluate(() =>
       (window as typeof window & { call: (m: string, p: unknown) => unknown }).call("openSession", { id: "sess-a" }),
     );
     await expect(page).toHaveURL("/session/sess-a");
+  });
+
+  test("a page another document replaces before ready never hands it the bridge", async ({ page }) => {
+    await mockApis(page, [PAGE]);
+    await page.route(`**${PAGE.url}`, (r) =>
+      r.fulfill({ contentType: "text/html", headers: { "content-security-policy": PAGE_CSP }, body: REDIRECT_FIXTURE }),
+    );
+    await page.route("**/api/plugins/acme.other/pages/board", (r) =>
+      r.fulfill({ contentType: "text/html", headers: { "content-security-policy": PAGE_CSP }, body: OTHER_FIXTURE }),
+    );
+    const actions: string[] = [];
+    await page.route("**/api/plugins/*/action", (r) => {
+      actions.push(r.request().url());
+      return r.fulfill({ status: 202, json: { ok: true } });
+    });
+    // The host answers an accepted ready synchronously while dispatching it, before the page's next message.
+    await page.addInitScript(() => {
+      const w = window as typeof window & { __bridgePosts: unknown[] };
+      w.__bridgePosts = [];
+      const post = MessagePort.prototype.postMessage;
+      MessagePort.prototype.postMessage = function (this: MessagePort, msg: unknown, ...rest: never[]) {
+        if ((msg as { aoeBridge?: number } | null)?.aoeBridge) w.__bridgePosts.push(msg);
+        return post.call(this, msg, ...rest);
+      };
+    });
+
+    await page.goto("/plugins/acme.kit/board");
+    await page.waitForFunction(() =>
+      (window as typeof window & { __frameReports: { kind?: string }[] }).__frameReports.some(
+        (m) => m?.kind === "other-sent",
+      ),
+    );
+    expect(await page.evaluate(() => (window as typeof window & { __bridgePosts: unknown[] }).__bridgePosts)).toEqual(
+      [],
+    );
+    expect(actions).toEqual([]);
   });
 });
