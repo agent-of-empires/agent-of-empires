@@ -238,9 +238,11 @@ export function LiveTerminalView({ session, active = true, surface = "agent", te
 
   // Stop then Start leaves a dead pane's closed socket behind. Latch the Start edge until the 4001 close
   // arrives (either order), consume it once so a crash-looping agent cannot retrigger it, and drop it
-  // once a socket is healthy so a later exit is not auto-restarted.
+  // a healthy replacement socket connects, so a later exit is not auto-restarted. The old socket may still be
+  // open when Start lands, so only a false to true edge clears it.
   const prevStatusRef = useRef({ id: session.id, active: isSessionActive(session.status) });
   const startedRef = useRef(false);
+  const wasConnectedRef = useRef(false);
   const sessionActive = isSessionActive(session.status);
   const { paneDead, connected } = live.state;
   useEffect(() => {
@@ -248,7 +250,8 @@ export function LiveTerminalView({ session, active = true, surface = "agent", te
     prevStatusRef.current = { id: session.id, active: sessionActive };
     if (prev.id !== session.id) startedRef.current = false;
     else if (!prev.active && sessionActive) startedRef.current = true;
-    if (connected) startedRef.current = false;
+    if (connected && !wasConnectedRef.current) startedRef.current = false;
+    wasConnectedRef.current = connected;
     // eslint-disable-next-line react-you-might-not-need-an-effect/no-event-handler
     if (surface === "agent" && paneDead && startedRef.current) {
       startedRef.current = false;

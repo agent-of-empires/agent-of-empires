@@ -51,6 +51,7 @@ vi.mock("../MobileLiveTerminal", () => ({
 
 beforeEach(() => {
   live.state.paneDead = true;
+  live.state.connected = false;
   live.ensureSession.mockClear();
 });
 afterEach(cleanup);
@@ -80,10 +81,12 @@ describe("LiveTerminalView after the agent exits", () => {
 
   it("keeps the Start edge until the dead-pane close arrives", async () => {
     live.state.paneDead = false;
+    live.state.connected = true;
     const { rerender } = render(<LiveTerminalView session={makeSession({ id: "dead", status: "Stopped" })} />);
     await waitFor(() => expect(live.ensureSession).toHaveBeenCalledTimes(1));
     rerender(<LiveTerminalView session={makeSession({ id: "dead", status: "Running" })} />);
     expect(live.ensureSession).toHaveBeenCalledTimes(1);
+    live.state.connected = false;
     live.state.paneDead = true;
     rerender(<LiveTerminalView session={makeSession({ id: "dead", status: "Running" })} />);
     await waitFor(() => expect(live.ensureSession).toHaveBeenCalledTimes(2));
