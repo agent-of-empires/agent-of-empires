@@ -12,6 +12,7 @@ const PAGE = {
   title: "Board",
   icon: "kanban",
   url: "/api/plugins/acme.kit/pages/board",
+  capabilities: ["session.read"],
 };
 
 // The daemon's page policy (src/server/api/plugins.rs `PLUGIN_PAGE_CSP`).
@@ -25,6 +26,45 @@ const probe = (f) => { try { return String(f()); } catch (e) { return "blocked:"
 const report = { storage: probe(() => localStorage.getItem("aoe_auth_token")), cookie: probe(() => document.cookie), href: location.href };
 fetch("/api/sessions").then(() => "reached", (e) => "blocked:" + e.name).then((api) => parent.postMessage({ ...report, api }, "*"));
 </script>`;
+
+// A page driving the bridge the way the docs/plugin-api.md client snippet does.
+const BRIDGE_FIXTURE = `<!doctype html><p>bridge fixture</p><script>
+let next = 0;
+const pending = new Map();
+const pushes = [];
+addEventListener("message", (e) => {
+  const m = e.data;
+  if (!m || m.aoeBridge !== 1) return;
+  if (m.event) {
+    pushes.push(m);
+    if (m.event === "theme") parent.postMessage({ kind: "theme", data: m.data }, "*");
+    return;
+  }
+  pending.get(m.id)?.(m);
+});
+window.call = (method, params) => new Promise((resolve) => {
+  const id = ++next;
+  pending.set(id, resolve);
+  parent.postMessage({ aoeBridge: 1, id, method, params }, "*");
+});
+(async () => {
+  const ready = await call("ready");
+  const sessions = await call("sessions.list");
+  const uiState = await call("plugins.uiState");
+  const action = await call("action", { method: "move", params: { to: "done" }, sessionId: "sess-a" });
+  const unknown = await call("sessions.archive");
+  parent.postMessage({ kind: "results", ready, sessions, uiState, action, unknown, pushes: pushes.slice(0, 2) }, "*");
+})();
+</script>`;
+
+const theme = (name: string, appearance: "dark" | "light", bg: string) => ({
+  name,
+  source: "builtin",
+  appearance,
+  web: { cssVars: { "--color-surface-900": bg } },
+  terminal: { cssVars: {} },
+  syntax: { shikiTheme: "github-dark" },
+});
 
 async function mockApis(page: Page, pages: unknown[]) {
   await mockStaticApis(page);
@@ -126,5 +166,68 @@ test.describe("Plugin pages (#4460)", () => {
     // A deep link has no in-app history, so Back lands on the dashboard.
     await page.getByRole("button", { name: "← Back" }).click();
     await expect(page).toHaveURL("/");
+  });
+
+  test("the page round-trips every bridge method and follows theme changes without reloading", async ({ page }) => {
+    await mockApis(page, [PAGE]);
+    await page.route(`**${PAGE.url}`, (r) =>
+      r.fulfill({ contentType: "text/html", headers: { "content-security-policy": PAGE_CSP }, body: BRIDGE_FIXTURE }),
+    );
+    await page.route("**/api/theme/current", (r) => r.fulfill({ json: theme("day", "light", "#ffffff") }));
+    await page.route("**/api/themes/night", (r) => r.fulfill({ json: theme("night", "dark", "#000000") }));
+    const actionBodies: unknown[] = [];
+    await page.route("**/api/plugins/*/action", (r) => {
+      actionBodies.push({ url: new URL(r.request().url()).pathname, body: r.request().postDataJSON() });
+      return r.fulfill({ status: 202, json: { ok: true, baseline_revision: 3 } });
+    });
+    const frameLoads: string[] = [];
+    page.on("request", (req) => {
+      if (new URL(req.url()).pathname === PAGE.url && req.method() === "GET") frameLoads.push(req.url());
+    });
+
+    await page.goto("/plugins/acme.kit/board");
+    const latest = (kind: string) =>
+      page.evaluate(
+        (k) =>
+          (window as typeof window & { __frameReports: { kind?: string }[] }).__frameReports
+            .filter((m) => m?.kind === k)
+            .at(-1),
+        kind,
+      );
+    await expect.poll(() => latest("results")).toBeTruthy();
+    const results = (await latest("results")) as unknown as Record<string, Record<string, unknown>>;
+    expect(results.ready).toEqual({ aoeBridge: 1, id: 1, result: null });
+    expect(results.pushes).toEqual([
+      {
+        aoeBridge: 1,
+        event: "context",
+        data: { readOnly: false, cityhall: false, pluginId: "acme.kit", pageId: "board", bridgeVersion: 1 },
+      },
+      { aoeBridge: 1, event: "theme", data: { appearance: "light", cssVars: { "--color-surface-900": "#ffffff" } } },
+    ]);
+    expect((results.sessions.result as { id: string }[]).map((s) => s.id)).toEqual(["sess-a"]);
+    expect(results.uiState.result).toEqual({ entries: [], notifications: [], pages: [PAGE] });
+    expect(results.action).toEqual({ aoeBridge: 1, id: 4, result: { baselineRevision: 3 } });
+    expect(actionBodies).toEqual([
+      {
+        url: "/api/plugins/acme.kit/action",
+        body: { method: "move", params: { to: "done" }, session_id: "sess-a" },
+      },
+    ]);
+    expect(results.unknown).toMatchObject({ id: 5, error: { code: "unknown_method" } });
+
+    await page.evaluate(() =>
+      window.dispatchEvent(new CustomEvent("aoe:theme-picker-changed", { detail: { name: "night" } })),
+    );
+    await expect
+      .poll(() => latest("theme"))
+      .toEqual({ kind: "theme", data: { appearance: "dark", cssVars: { "--color-surface-900": "#000000" } } });
+    expect(frameLoads).toHaveLength(1);
+
+    const frame = page.frames().find((f) => f.url().endsWith(PAGE.url));
+    await frame!.evaluate(() =>
+      (window as typeof window & { call: (m: string, p: unknown) => unknown }).call("openSession", { id: "sess-a" }),
+    );
+    await expect(page).toHaveURL("/session/sess-a");
   });
 });

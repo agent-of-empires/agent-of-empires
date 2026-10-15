@@ -1857,10 +1857,11 @@
       "components": [
         "web/src/components/plugin/PluginPagesMenu.tsx",
         "web/src/components/plugin/PluginPageView.tsx",
+        "web/src/lib/pluginBridge.ts",
         "web/src/components/TopBar.tsx",
         "web/src/App.tsx"
       ],
-      "notes": "Pages menu and palette entries appear only with a declared page; the route hides the sidebar, mints a page ticket before framing, and Back pops history. A fixture page served under the daemon's page CSP proves the sandboxed frame cannot read storage, cookies or call the API. Mint ordering and empty states are also unit-tested in PluginPageView.test.tsx; the ticket's server side in src/server/api/plugins.rs."
+      "notes": "Pages menu and palette entries appear only with a declared page; the route hides the sidebar, mints a page ticket before framing, and Back pops history. A fixture page served under the daemon's page CSP proves the sandboxed frame cannot read storage, cookies or call the API. A bridge fixture page round-trips ready, sessions.list, plugins.uiState, its own action and openSession, and receives a theme change without reloading. Mint ordering, empty states, frame-only replies, theme pushes and teardown on a second load are unit-tested in PluginPageView.test.tsx; envelope validation and gating in pluginBridge.test.ts; the ticket's server side in src/server/api/plugins.rs."
     },
     {
       "id": "sidebar.plugin-row-slots",
