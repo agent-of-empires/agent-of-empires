@@ -85,6 +85,7 @@ describe("TopBar", () => {
     try {
       const compact = render(<TopBar {...topBarProps()} sidebarColumnVisible />);
       expect(group(compact.container)?.className).toContain("md:hidden");
+      expect(group(compact.container)?.className).not.toContain("md:flex");
     } finally {
       localStorage.removeItem("aoe-web-settings");
     }

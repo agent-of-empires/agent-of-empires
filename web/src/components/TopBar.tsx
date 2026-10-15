@@ -176,7 +176,7 @@ export function TopBar({
            leaves no room beside the logo. */}
         <div
           data-testid="topbar-header-start"
-          className={`hidden md:flex items-center gap-1.5 min-w-0 max-w-48 overflow-hidden ${hideWordmark ? "md:hidden" : ""}`}
+          className={`hidden ${hideWordmark ? "md:hidden" : "md:flex"} items-center gap-1.5 min-w-0 max-w-48 overflow-hidden`}
         >
           <PluginHeaderStartSegments />
         </div>
