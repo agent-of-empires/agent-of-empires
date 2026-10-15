@@ -272,10 +272,18 @@ describe("plugin slots", () => {
       chip("header-start", "b", -1),
       chip("header-start", "c", 5),
       chip("status-bar", "d", -9),
+      chip("status-bar", "e", 5),
+      chip("status-bar", "f"),
     ];
     const { container } = render(<PluginHeaderStartSegments />);
     const texts = [...container.querySelectorAll("[data-plugin-slot]")].map((n) => n.textContent);
     expect(texts).toEqual(["b", "a", "c"]);
+    const statusBar = render(<PluginStatusBarSegments />);
+    expect([...statusBar.container.querySelectorAll("[data-plugin-slot]")].map((n) => n.textContent)).toEqual([
+      "d",
+      "f",
+      "e",
+    ]);
   });
 
   it("home-pane renders blocks, and the simple form's title only once", () => {
