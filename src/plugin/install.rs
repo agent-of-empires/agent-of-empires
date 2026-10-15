@@ -1359,6 +1359,9 @@ mod tests {
         UiContribution {
             slot,
             id: id.to_string(),
+            title: None,
+            icon: None,
+            entry: None,
         }
     }
 

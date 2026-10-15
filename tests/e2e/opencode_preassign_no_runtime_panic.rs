@@ -27,15 +27,27 @@ use crate::harness::{require_tmux, TuiTestHarness};
 const TITLE: &str = "OpencodePreassignE2E";
 const RUNTIME_PANIC: &str = "Cannot start a runtime from within a runtime";
 
-/// Install a fake OpenCode on PATH that records its argv and then idles.
-/// The fake server never binds its port, so opt-in preassignment times out and
-/// the launch proceeds without a guessed id.
+/// Install a fake OpenCode on PATH that records its argv, answers `--help` like
+/// a 2.x build, and idles otherwise.
+///
+/// The generation probe reads `--help` before anything else: a fake that never
+/// answers leaves the generation unknown and the preassign is refused before
+/// `serve` is ever spawned. The help therefore omits the 1.x root `--fork` and
+/// exits successfully, which is what makes this launch a 2.x one. The fake
+/// server never binds its port, so opt-in preassignment still times out and the
+/// launch proceeds without a guessed id.
 fn install_fake_opencode(h: &mut TuiTestHarness) -> PathBuf {
     let bin = h.install_path_command("opencode");
     let log = h.home_path().join("fake-opencode.log");
     let script = format!(
-        "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\nexec sleep 30\n",
-        log.display()
+        "#!/bin/sh\n\
+         printf '%s\\n' \"$*\" >> '{log}'\n\
+         if [ \"$1\" = \"--help\" ]; then\n\
+         \tprintf '%s\\n' 'Usage: opencode [command] [flags]' 'Commands:' '  serve   Start the API and web server'\n\
+         \texit 0\n\
+         fi\n\
+         exec sleep 30\n",
+        log = log.display()
     );
     let script_path = bin.join("opencode");
     fs::write(&script_path, script).expect("write fake opencode");

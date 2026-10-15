@@ -6,7 +6,8 @@ use std::collections::HashMap;
 use std::process::Command;
 
 pub(super) use super::unix::{
-    configure_process_group, kill_process_group, terminate_process_group,
+    close_frozen_payload, configure_process_group, exec_command, kill_process_group,
+    restore_environment_value, terminate_process_group,
 };
 pub(super) fn open_read_nonblocking(path: &std::path::Path) -> std::io::Result<std::fs::File> {
     use std::os::unix::fs::OpenOptionsExt;

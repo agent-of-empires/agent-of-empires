@@ -3599,7 +3599,7 @@ mod tests {
             "80",
             "-y",
             "24",
-            "sleep 30",
+            r#"/bin/sh -c 'stty -echo; printf "INPUT-READY\n"; IFS= read -r line; printf "INPUT-ACK:%s\n" "$line"; exec sleep 30'"#,
         ]
         .into_iter()
         .map(str::to_owned)
@@ -3613,6 +3613,19 @@ mod tests {
             output.status.success(),
             "create live-send fixture: {}",
             String::from_utf8_lossy(&output.stderr)
+        );
+        let target = format!("{name}:^.0");
+        wait_until(
+            "input consumer ready",
+            std::time::Duration::from_secs(5),
+            || {
+                let output = crate::tmux::tmux_command()
+                    .args(["capture-pane", "-p", "-t", &target])
+                    .output()
+                    .expect("capture consumer readiness");
+                output.status.success()
+                    && String::from_utf8_lossy(&output.stdout).contains("INPUT-READY")
+            },
         );
         crate::tmux::refresh_session_cache();
         crate::tmux::Session::from_name(name)
@@ -3651,10 +3664,9 @@ mod tests {
             Some("live-test-thief".to_string()),
             "worker must not steal the lock back"
         );
-        // Keys queued after the resize are dispatched after its batch, even
-        // when ownership filtering removes the resize itself.
         let target = format!("{}:^.0", guard.name());
         worker.send(TmuxKey::Literal("RESIZE-BATCH-COMPLETE".into()));
+        worker.send(TmuxKey::Named("Enter".into()));
         wait_until(
             "post-resize input reached the pane",
             std::time::Duration::from_secs(5),
@@ -3664,7 +3676,8 @@ mod tests {
                     .output()
                     .expect("capture ordered input");
                 output.status.success()
-                    && String::from_utf8_lossy(&output.stdout).contains("RESIZE-BATCH-COMPLETE")
+                    && String::from_utf8_lossy(&output.stdout)
+                        .contains("INPUT-ACK:RESIZE-BATCH-COMPLETE")
             },
         );
         assert_eq!(
@@ -3734,10 +3747,9 @@ mod tests {
             Some("live-test-thief".to_string()),
             "unowned retry must not steal from a live owner"
         );
-        // Keys queued after the resize are dispatched after its batch, even
-        // when ownership filtering removes the resize itself.
         let target = format!("{}:^.0", guard.name());
         worker.send(TmuxKey::Literal("RESIZE-BATCH-COMPLETE".into()));
+        worker.send(TmuxKey::Named("Enter".into()));
         wait_until(
             "post-resize input reached the pane",
             std::time::Duration::from_secs(5),
@@ -3747,7 +3759,8 @@ mod tests {
                     .output()
                     .expect("capture ordered input");
                 output.status.success()
-                    && String::from_utf8_lossy(&output.stdout).contains("RESIZE-BATCH-COMPLETE")
+                    && String::from_utf8_lossy(&output.stdout)
+                        .contains("INPUT-ACK:RESIZE-BATCH-COMPLETE")
             },
         );
         assert_eq!(

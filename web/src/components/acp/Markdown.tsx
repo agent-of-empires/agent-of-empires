@@ -222,7 +222,7 @@ function ShikiSyntaxHighlighter({ language, code }: SyntaxHighlighterProps) {
 
   // The em-based size carries no line-height, so set it or code inherits the looser body leading.
   return (
-    <>
+    <div className="acp-code-block">
       <CodeHeader language={language} code={code} wrapped={wrapped} onToggleWrap={toggleWrap} />
       {html ? (
         <div
@@ -236,7 +236,7 @@ function ShikiSyntaxHighlighter({ language, code }: SyntaxHighlighterProps) {
           {wrapped ? <WrapLines text={code} /> : code}
         </pre>
       )}
-    </>
+    </div>
   );
 }
 

@@ -571,7 +571,7 @@ impl UiStore {
 
 fn max_payload_bytes(slot: UiSlot) -> usize {
     match slot {
-        UiSlot::Pane | UiSlot::HomePane => MAX_PANE_PAYLOAD_BYTES,
+        UiSlot::Pane | UiSlot::HomePane | UiSlot::Page => MAX_PANE_PAYLOAD_BYTES,
         UiSlot::ComposerAction => MAX_COMPOSER_ACTION_PAYLOAD_BYTES,
         _ => MAX_PAYLOAD_BYTES,
     }
@@ -690,6 +690,9 @@ fn validate_payload(slot: UiSlot, raw: &Value) -> Result<Value, String> {
             serde_json::to_value(parsed).map_err(|e| e.to_string())
         }
         UiSlot::Notification => Err("notification is pushed via ui.notify".into()),
+        // Opaque to the host; only the page's own script reads it.
+        UiSlot::Page if raw.is_object() => Ok(raw.clone()),
+        UiSlot::Page => Err("page state must be a JSON object".into()),
     }
 }
 
@@ -1085,6 +1088,34 @@ mod tests {
                 UiSlot::RowBadge,
                 Some("s1"),
                 json!({"text": "x".repeat(9 * 1024)}),
+                false,
+            ),
+            (
+                "page takes an opaque global object",
+                UiSlot::Page,
+                None,
+                json!({"stages": {"s1": "todo"}, "config": {"any": [1, 2]}}),
+                true,
+            ),
+            (
+                "page state must be an object",
+                UiSlot::Page,
+                None,
+                json!([1, 2]),
+                false,
+            ),
+            (
+                "page state is global only",
+                UiSlot::Page,
+                Some("s1"),
+                json!({}),
+                false,
+            ),
+            (
+                "page state past the 64 KiB cap rejected",
+                UiSlot::Page,
+                None,
+                json!({"blob": "x".repeat(64 * 1024)}),
                 false,
             ),
         ];

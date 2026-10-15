@@ -3885,11 +3885,8 @@ impl HomeView {
         // status indicators, which render but aren't clickable.
         let mut groups: Vec<(u8, Option<KeyEvent>, Vec<Span<'static>>)> = Vec::new();
 
-        // Serve indicator, shown only while the `aoe serve` daemon is live. The TUI does
-        // not own the daemon, so the PID file is probed each render; mode comes from a
-        // PID-keyed cache rather than a per-frame file read.
-        let mode_label = crate::cli::serve::cached_serve_mode_label();
-        if crate::cli::serve::daemon_pid().is_some() {
+        // Serve indicator, shown only while the `aoe serve` daemon is live.
+        if let Some(mode_label) = self.serve_badge {
             // A build without the dashboard bundle answers the API only, so
             // the badge must not read as "the dashboard is up".
             let what = if cfg!(feature = "web") {

@@ -663,6 +663,7 @@ export type PluginUiSlot =
   | "composer-action"
   | "detail-badge"
   | "home-pane"
+  | "page"
   | "notification";
 
 /** `payload` shape is determined by `slot`. */
@@ -686,15 +687,32 @@ export interface PluginUiNotification {
   href?: string;
 }
 
+/** A page an active plugin declares; `url` serves its HTML to a sandboxed frame. */
+export interface PluginPage {
+  plugin_id: string;
+  id: string;
+  title: string;
+  icon: string | null;
+  url: string;
+}
+
 export interface PluginUiState {
   entries: PluginUiEntry[];
   notifications: PluginUiNotification[];
+  /** Absent on older daemons. */
+  pages?: PluginPage[];
   /** Mutation counter per plugin, then per scope (session id, or `""` for global). Absent on older daemons. */
   revisions?: Record<string, Record<string, number>>;
 }
 
 export function fetchPluginUiState(): Promise<PluginUiState | null> {
   return fetchJson<PluginUiState>("/api/plugins/ui-state");
+}
+
+/** Lets the next frame load of `page.url` authenticate when device binding is on; the ticket rides an HttpOnly cookie. */
+export async function mintPluginPageTicket(page: PluginPage): Promise<boolean> {
+  const reply = await send(`${page.url}/ticket`, { method: "POST" }).catch(() => null);
+  return reply?.ok ?? false;
 }
 
 export function setPluginEnabled(id: string, enabled: boolean): Promise<PluginToggleResult> {

@@ -241,7 +241,7 @@ A signed-in browser login to the Web dashboard, listed in Connected Devices and 
 _Avoid_: login session, subscription
 
 **Principal**:
-Target (#4394): who a request to the Daemon acts as: the local owner over the Unix socket, a Device, or a Proxy such as CityHall's. A Daemon serves exactly one human; users and accounts belong to CityHall. Today requests authenticate with a bearer token or passphrase login, and `read_only` is checked per request.
+Target (#4394): who a request to the Daemon acts as: the local owner over the Unix socket, a Device, a Token holder presenting the access token, or a Proxy such as CityHall's. A Daemon serves exactly one human; users and accounts belong to CityHall. Today requests authenticate with a bearer token or passphrase login, and `read_only` is checked per request.
 _Avoid_: user, owner, account
 
 **Push subscription**:
@@ -310,3 +310,29 @@ _Avoid_: config field, option
 **Repo config**:
 Settings and Repo hooks a Repository carries in its own `.agent-of-empires` directory, layered over Profile and global Settings.
 _Avoid_: repo override, project config
+
+### Board
+
+**Board**:
+The Web dashboard view that lays Sessions out in Columns. One Board spans every Project; Dismissed Sessions are not on it.
+_Avoid_: kanban, lanes view
+
+**Column**:
+A lane on the Board, either a Stage column or a Signal column, never both. Order on the Board is left to right and doubles as Signal priority.
+_Avoid_: lane, bucket
+
+**Card**:
+A Session as shown on the Board. Sits in exactly one Column.
+_Avoid_: approval card (different concept)
+
+**Stage**:
+The Column a user placed a Session in by hand. Sticky: it holds until the user moves the Card again.
+_Avoid_: status, state, phase
+
+**Signal**:
+A transient condition on a Session raised by a Rule, such as a pending Approval or a PR with changes requested. While any Signal is active it decides the Card's Column; when it clears the Card returns to its Stage.
+_Avoid_: alert, flag, automated status
+
+**Rule**:
+A predicate over a Session that, when true, raises a Signal for one Signal column. Rules only read; they never change a Stage.
+_Avoid_: automation, trigger, filter

@@ -23,6 +23,8 @@ mod cli_read_server;
 #[cfg(all(target_os = "linux", debug_assertions))]
 mod cli_read_uds;
 mod common;
+#[cfg(unix)]
+mod frozen_environment;
 mod home_isolation;
 
 mod daemon_client;

@@ -4,7 +4,10 @@
 
 import type { PromptAttachmentInput } from "./acpTypes";
 
-const DB_NAME = "aoe-composer-attachments";
+// A new name isolates this protocol (tuple revisions, `S:/C:` markers) from older tabs that still
+// run the first IndexedDB version, so neither side can read or rewrite the other's data.
+const DB_NAME = "aoe-composer-attachments-v2";
+const LEGACY_DB_NAME = "aoe-composer-attachments";
 const STORE = "drafts";
 
 let dbPromise: Promise<IDBDatabase> | null = null;
@@ -52,10 +55,30 @@ async function run<T>(mode: IDBTransactionMode, fn: (store: IDBObjectStore) => I
   });
 }
 
-// A record carries the revision (call-time clock) of the write that produced it, so a delayed
-// delete from another tab can tell it is looking at a newer draft than the one it was clearing.
+// Every record carries the revision of the write that produced it. Revisions are totally ordered
+// across tabs (clock first, tab id as tiebreak), and each mutation is one transaction that checks
+// the stored revision, so a stale save, a delayed delete or a failed-save cleanup from any tab
+// can never replace or remove a newer draft.
+export type Revision = readonly [clock: number, tabId: string];
+
+const TAB_ID = Math.random().toString(36).slice(2);
+let lastClock = 0;
+
+/** A revision strictly newer than any this tab issued before. The clock has sub-millisecond
+ *  resolution so that revisions from different tabs practically never tie. */
+export function nextRevision(): Revision {
+  const now = typeof performance === "undefined" ? Date.now() : performance.timeOrigin + performance.now();
+  lastClock = Math.max(now, lastClock + 0.001);
+  return [lastClock, TAB_ID];
+}
+
+export function compareRevisions(a: Revision, b: Revision): number {
+  if (a[0] !== b[0]) return a[0] - b[0];
+  return a[1] < b[1] ? -1 : a[1] > b[1] ? 1 : 0;
+}
+
 interface StoredDraft {
-  rev: number;
+  rev: Revision;
   attachments: readonly PromptAttachmentInput[];
 }
 
@@ -64,31 +87,73 @@ export async function loadAttachments(sessionId: string): Promise<unknown> {
   return record?.attachments;
 }
 
-export async function saveAttachments(
-  sessionId: string,
-  attachments: readonly PromptAttachmentInput[],
-  rev = Date.now(),
-): Promise<void> {
-  const record: StoredDraft = { rev, attachments };
-  await run("readwrite", (s) => s.put(record, sessionId));
+/** The newest state in the store: its revision, and whether it is a draft or a clear (tombstone). */
+export async function loadState(sessionId: string): Promise<{ rev: Revision; saved: boolean } | undefined> {
+  const record = await run<StoredDraft | undefined>("readonly", (s) => s.get(sessionId));
+  return record && { rev: record.rev, saved: record.attachments.length > 0 };
 }
 
-/** Deletes the record unless a write newer than `clearedAt` already replaced it. The check and the
- *  delete share one transaction, so a save from another tab cannot slip in between. */
-export async function deleteAttachments(sessionId: string, clearedAt = Infinity): Promise<void> {
+/** Drops the database of the first IndexedDB version, which nothing reads any more. */
+export async function deleteLegacyDatabase(): Promise<void> {
+  if (typeof indexedDB === "undefined") return;
+  await new Promise<void>((resolve, reject) => {
+    const req = indexedDB.deleteDatabase(LEGACY_DB_NAME);
+    req.onsuccess = () => resolve();
+    req.onerror = () => reject(req.error);
+    req.onblocked = () => resolve();
+  });
+}
+
+/** Reads the current record inside one readwrite transaction and lets `apply` mutate or skip. */
+async function mutate(sessionId: string, apply: (store: IDBObjectStore, current: StoredDraft | undefined) => void) {
   const db = await openDb();
   await new Promise<void>((resolve, reject) => {
     const tx = db.transaction(STORE, "readwrite");
     const store = tx.objectStore(STORE);
     const read = store.get(sessionId) as IDBRequest<StoredDraft | undefined>;
+    let failure: unknown;
     read.onsuccess = () => {
-      if (read.result && read.result.rev > clearedAt) return;
-      store.delete(sessionId);
+      try {
+        apply(store, read.result);
+      } catch (err) {
+        failure = err;
+        tx.abort();
+      }
     };
+    // Resolve on commit, so a quota abort still rejects.
     tx.oncomplete = () => resolve();
     tx.onerror = () => reject(tx.error ?? read.error);
-    tx.onabort = () => reject(tx.error ?? new Error("indexedDB transaction aborted"));
+    tx.onabort = () => reject(failure ?? tx.error ?? new Error("indexedDB transaction aborted"));
   });
+}
+
+/** Stores the draft unless a newer revision is already there. */
+export async function saveAttachments(
+  sessionId: string,
+  attachments: readonly PromptAttachmentInput[],
+  rev: Revision = nextRevision(),
+): Promise<void> {
+  const record: StoredDraft = { rev, attachments };
+  await mutate(sessionId, (store, current) => {
+    if (current && compareRevisions(current.rev, rev) > 0) return;
+    store.put(record, sessionId);
+  });
+}
+
+/** Records a clear as a tombstone with its revision, unless a newer revision is already there. The
+ *  revision is what lets a late older save from any tab see, inside its own transaction, that the
+ *  draft was cleared after it was issued. */
+export async function clearAttachments(sessionId: string, rev: Revision): Promise<void> {
+  const tombstone: StoredDraft = { rev, attachments: [] };
+  await mutate(sessionId, (store, current) => {
+    if (current && compareRevisions(current.rev, rev) > 0) return;
+    store.put(tombstone, sessionId);
+  });
+}
+
+/** Removes the record outright, tombstone included. Only for sessions that no longer exist. */
+export async function deleteAttachments(sessionId: string): Promise<void> {
+  await run("readwrite", (s) => s.delete(sessionId));
 }
 
 export async function listAttachmentSessionIds(): Promise<string[]> {
