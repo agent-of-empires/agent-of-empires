@@ -333,7 +333,7 @@ The entry must be one self-contained file: inline every script and style, and em
 
 The dashboard opens a page at `/plugins/{id}/{page_id}` in an iframe with `sandbox="allow-scripts"` and nothing else. The page cannot read dashboard storage or cookies, call the API, submit forms, open windows or navigate the dashboard; its only data path is the bridge. A page that reloads itself more than 60 seconds after opening loses its authentication when device binding is on; reopen it from the dashboard instead.
 
-A worker may push state for a page with `ui.state.set` (`slot = "page"`, `id` = the page id, no `session_id`). The payload is any JSON object up to 64 KiB, stored unvalidated; `ui.state.remove` clears it. It appears in `GET /api/plugins/ui-state` as a global entry, `{ "plugin_id", "slot": "page", "id", "payload" }`, which the page reads through the bridge.
+A worker may push state for a page with `ui.state.set` (`slot = "page"`, `id` = the page id, no `session_id`). The payload is any JSON object up to 64 KiB, stored unvalidated; `ui.state.remove` clears it. It appears in `GET /api/plugins/ui-state` as a global entry, `{ "plugin_id", "slot": "page", "id", "payload" }`. The page itself cannot read it yet; frame access arrives with the bridge (#4461).
 
 ### Badge payload
 
