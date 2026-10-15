@@ -1,90 +1,90 @@
 # Code owners for agent-of-empires/agent-of-empires. Last match wins.
-# Each line lists the area owner, then the other reviewers; any one approval
-# satisfies code owner review. Unlisted paths follow the merge rule in
+# Each area is owned by a team that auto-assigns one reviewer; any team
+# member's approval satisfies code owner review. Members are listed in
 # MAINTAINERS.md. Docs: https://docs.github.com/en/repositories/managing-your-repositorys-settings-and-features/customizing-your-repository/about-code-owners
 
 # Web dashboard, plugin pages and the plugin API
-/web/                                   @Seluj78 @cwrau
-/aoe-plugin-api/                        @Seluj78 @cwrau
-/plugins/                               @Seluj78 @cwrau
-/src/plugin/                            @Seluj78 @cwrau
-/src/cli/plugin.rs                      @Seluj78 @cwrau
-/src/server/api/plugins.rs              @Seluj78 @cwrau
-/src/server/api/plugin_settings.rs      @Seluj78 @cwrau
-/src/server/plugin_status.rs            @Seluj78 @cwrau
-/src/tui/plugin_ui.rs                   @Seluj78 @cwrau
-/docs/plugin-api.md                     @Seluj78 @cwrau
-/docs/plugins.md                        @Seluj78 @cwrau
-/docs/development/writing-plugins.md    @Seluj78 @cwrau
+/web/                                   @agent-of-empires/web
+/aoe-plugin-api/                        @agent-of-empires/web
+/plugins/                               @agent-of-empires/web
+/src/plugin/                            @agent-of-empires/web
+/src/cli/plugin.rs                      @agent-of-empires/web
+/src/server/api/plugins.rs              @agent-of-empires/web
+/src/server/api/plugin_settings.rs      @agent-of-empires/web
+/src/server/plugin_status.rs            @agent-of-empires/web
+/src/tui/plugin_ui.rs                   @agent-of-empires/web
+/docs/plugin-api.md                     @agent-of-empires/web
+/docs/plugins.md                        @agent-of-empires/web
+/docs/development/writing-plugins.md    @agent-of-empires/web
 
 # ACP, structured view, composer and attachments
-/src/acp/                               @cwrau @Seluj78
-/acp-worker/                            @cwrau @Seluj78
-/src/cli/acp.rs                         @cwrau @Seluj78
-/src/server/acp_*                       @cwrau @Seluj78
-/src/server/acp_reconciler/             @cwrau @Seluj78
-/src/server/api/acp/                    @cwrau @Seluj78
-/src/server/structured_repair.rs        @cwrau @Seluj78
-/src/tui/structured_view/               @cwrau @Seluj78
-/web/src/components/acp/                @cwrau @Seluj78
-/web/src/lib/acp*                       @cwrau @Seluj78
-/web/src/lib/attachmentStore*           @cwrau @Seluj78
-/docs/structured-view.md                @cwrau @Seluj78
-/docs/structured-view/                  @cwrau @Seluj78
-/docs/development/internals/structured-view.md  @cwrau @Seluj78
+/src/acp/                               @agent-of-empires/acp
+/acp-worker/                            @agent-of-empires/acp
+/src/cli/acp.rs                         @agent-of-empires/acp
+/src/server/acp_*                       @agent-of-empires/acp
+/src/server/acp_reconciler/             @agent-of-empires/acp
+/src/server/api/acp/                    @agent-of-empires/acp
+/src/server/structured_repair.rs        @agent-of-empires/acp
+/src/tui/structured_view/               @agent-of-empires/acp
+/web/src/components/acp/                @agent-of-empires/acp
+/web/src/lib/acp*                       @agent-of-empires/acp
+/web/src/lib/attachmentStore*           @agent-of-empires/acp
+/docs/structured-view.md                @agent-of-empires/acp
+/docs/structured-view/                  @agent-of-empires/acp
+/docs/development/internals/structured-view.md  @agent-of-empires/acp
 
 # Daemon, session lifecycle, worktrees, process, containers and build
-/src/daemon/                            @jerome-benoit @njbrake
-/src/session/                           @jerome-benoit @njbrake
-/src/server/session_*                   @jerome-benoit @njbrake
-/src/server/api/sessions/               @jerome-benoit @njbrake
-/src/git/                               @jerome-benoit @njbrake
-/src/cli/worktree.rs                    @jerome-benoit @njbrake
-/src/process/                           @jerome-benoit @njbrake
-/src/containers/                        @jerome-benoit @njbrake
-/src/cli/sandbox.rs                     @jerome-benoit @njbrake
-/docker/                                @jerome-benoit @njbrake
-/build.rs                               @jerome-benoit @njbrake
-/build_git_watch.rs                     @jerome-benoit @njbrake
-/xtask/                                 @jerome-benoit @njbrake
+/src/daemon/                            @agent-of-empires/runtime
+/src/session/                           @agent-of-empires/runtime
+/src/server/session_*                   @agent-of-empires/runtime
+/src/server/api/sessions/               @agent-of-empires/runtime
+/src/git/                               @agent-of-empires/runtime
+/src/cli/worktree.rs                    @agent-of-empires/runtime
+/src/process/                           @agent-of-empires/runtime
+/src/containers/                        @agent-of-empires/runtime
+/src/cli/sandbox.rs                     @agent-of-empires/runtime
+/docker/                                @agent-of-empires/runtime
+/build.rs                               @agent-of-empires/runtime
+/build_git_watch.rs                     @agent-of-empires/runtime
+/xtask/                                 @agent-of-empires/runtime
 
 # Hooks, agent integrations, OMP and tmux
-/src/hooks/                             @athal7 @jerome-benoit
-/src/cli/hooks.rs                       @athal7 @jerome-benoit
-/src/status_hooks.rs                    @athal7 @jerome-benoit
-/src/agents.rs                          @athal7 @jerome-benoit
-/src/cli/agents.rs                      @athal7 @jerome-benoit
-/src/session/instance/omp.rs            @athal7 @jerome-benoit
-/src/session/capture/                   @athal7 @jerome-benoit
-/src/tmux/                              @athal7 @jerome-benoit
-/src/cli/tmux.rs                        @athal7 @jerome-benoit
-/contrib/                               @athal7 @jerome-benoit
-/docs/development/adding-agents.md      @athal7 @jerome-benoit
+/src/hooks/                             @agent-of-empires/integrations
+/src/cli/hooks.rs                       @agent-of-empires/integrations
+/src/status_hooks.rs                    @agent-of-empires/integrations
+/src/agents.rs                          @agent-of-empires/integrations
+/src/cli/agents.rs                      @agent-of-empires/integrations
+/src/session/instance/omp.rs            @agent-of-empires/integrations
+/src/session/capture/                   @agent-of-empires/integrations
+/src/tmux/                              @agent-of-empires/integrations
+/src/cli/tmux.rs                        @agent-of-empires/integrations
+/contrib/                               @agent-of-empires/integrations
+/docs/development/adding-agents.md      @agent-of-empires/integrations
 
 # Protected: security, stored data, supply chain, release and governance
-/src/server/auth.rs                     @njbrake @Seluj78 @jerome-benoit
-/src/server/login.rs                    @njbrake @Seluj78 @jerome-benoit
-/src/server/rate_limit.rs               @njbrake @Seluj78 @jerome-benoit
-/src/server/tunnel.rs                   @njbrake @Seluj78 @jerome-benoit
-/src/server/push.rs                     @njbrake @Seluj78 @jerome-benoit
-/src/server/push_send.rs                @njbrake @Seluj78 @jerome-benoit
-/src/migrations/                        @njbrake @Seluj78 @jerome-benoit
-/src/session/storage.rs                 @njbrake @Seluj78 @jerome-benoit
-Cargo.toml                              @njbrake @Seluj78 @jerome-benoit
-Cargo.lock                              @njbrake @Seluj78 @jerome-benoit
-/flake.nix                              @njbrake @Seluj78 @jerome-benoit
-/flake.lock                             @njbrake @Seluj78 @jerome-benoit
-/.github/                               @njbrake @Seluj78 @jerome-benoit
-/scripts/                               @njbrake @Seluj78 @jerome-benoit
-/AGENTS.md                              @njbrake @Seluj78 @jerome-benoit
-/CLAUDE.md                              @njbrake @Seluj78 @jerome-benoit
-/DESIGN.md                              @njbrake @Seluj78 @jerome-benoit
-/MAINTAINERS.md                         @njbrake @Seluj78 @jerome-benoit
+/src/server/auth.rs                     @agent-of-empires/protected
+/src/server/login.rs                    @agent-of-empires/protected
+/src/server/rate_limit.rs               @agent-of-empires/protected
+/src/server/tunnel.rs                   @agent-of-empires/protected
+/src/server/push.rs                     @agent-of-empires/protected
+/src/server/push_send.rs                @agent-of-empires/protected
+/src/migrations/                        @agent-of-empires/protected
+/src/session/storage.rs                 @agent-of-empires/protected
+Cargo.toml                              @agent-of-empires/protected
+Cargo.lock                              @agent-of-empires/protected
+/flake.nix                              @agent-of-empires/protected
+/flake.lock                             @agent-of-empires/protected
+/.github/                               @agent-of-empires/protected
+/scripts/                               @agent-of-empires/protected
+/AGENTS.md                              @agent-of-empires/protected
+/CLAUDE.md                              @agent-of-empires/protected
+/DESIGN.md                              @agent-of-empires/protected
+/MAINTAINERS.md                         @agent-of-empires/protected
 
-# Releases: only these two maintainers cut releases
-/.github/workflows/release.yml          @njbrake @Seluj78
-/.github/workflows/prepare-release.yml  @njbrake @Seluj78
-/.github/workflows/open-release-pr.yml  @njbrake @Seluj78
-/.github/workflows/tag-release-pr.yml   @njbrake @Seluj78
-/cliff.toml                             @njbrake @Seluj78
-/docs/development/releases.md           @njbrake @Seluj78
+# Releases
+/.github/workflows/release.yml          @agent-of-empires/release
+/.github/workflows/prepare-release.yml  @agent-of-empires/release
+/.github/workflows/open-release-pr.yml  @agent-of-empires/release
+/.github/workflows/tag-release-pr.yml   @agent-of-empires/release
+/cliff.toml                             @agent-of-empires/release
+/docs/development/releases.md           @agent-of-empires/release
