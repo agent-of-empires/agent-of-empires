@@ -64,6 +64,8 @@ export interface WizardState {
   groups: GroupInfo[];
   profiles: ProfileInfo[];
   dockerAvailable: boolean;
+  /** The Docker probe has answered, even if the answer was a failure. */
+  dockerChecked: boolean;
 }
 
 export type Action =
@@ -223,7 +225,7 @@ export function reducer(state: WizardState, action: Action): WizardState {
     case "SET_PROFILES":
       return { ...state, profiles: action.profiles };
     case "SET_DOCKER":
-      return { ...state, dockerAvailable: action.available };
+      return { ...state, dockerAvailable: action.available, dockerChecked: true };
     case "APPLY_PROFILE_DEFAULTS": {
       // A remembered or prefilled path can resolve its repo probe before this arrives, so the
       // seeded default must not flip a worktree back on for a scratch session or a non-repo path.

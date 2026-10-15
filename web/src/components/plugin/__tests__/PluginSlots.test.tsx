@@ -7,6 +7,7 @@ import { PluginPaneBody } from "../PluginPane";
 import {
   PluginComposerActions,
   PluginDetailBadges,
+  PluginHeaderStartSegments,
   PluginHomePanes,
   PluginRowBadges,
   PluginStatusBarSegments,
@@ -243,6 +244,19 @@ describe("plugin slots", () => {
       expect(container.querySelector("button, span")).toBeNull();
     });
 
+    it("detail-badge orders by payload order, then snapshot order", () => {
+      const badge = (id: string, order?: number): PluginUiEntry => ({
+        plugin_id: "acme.kit",
+        slot: "detail-badge",
+        id,
+        session_id: "s1",
+        payload: { text: id, ...(order === undefined ? {} : { order }) },
+      });
+      entriesRef.current = [badge("a"), badge("b", -1), badge("c", 5)];
+      const { container } = render(<PluginDetailBadges sessionId="s1" />);
+      expect([...container.querySelectorAll("[data-plugin-slot]")].map((n) => n.textContent)).toEqual(["b", "a", "c"]);
+    });
+
     it("detail-badge accepts grouped items too", () => {
       entriesRef.current = [
         {
@@ -257,6 +271,32 @@ describe("plugin slots", () => {
       fireEvent.click(screen.getByRole("button"));
       expect(screen.getByRole("button").textContent).toContain("y");
     });
+  });
+
+  it("header-start and status-bar chips order by payload order, then snapshot order", () => {
+    const chip = (slot: "header-start" | "status-bar", id: string, order?: number): PluginUiEntry => ({
+      plugin_id: "acme.kit",
+      slot,
+      id,
+      payload: { text: id, ...(order === undefined ? {} : { order }) },
+    });
+    entriesRef.current = [
+      chip("header-start", "a"),
+      chip("header-start", "b", -1),
+      chip("header-start", "c", 5),
+      chip("status-bar", "d", -9),
+      chip("status-bar", "e", 5),
+      chip("status-bar", "f"),
+    ];
+    const { container } = render(<PluginHeaderStartSegments />);
+    const texts = [...container.querySelectorAll("[data-plugin-slot]")].map((n) => n.textContent);
+    expect(texts).toEqual(["b", "a", "c"]);
+    const statusBar = render(<PluginStatusBarSegments />);
+    expect([...statusBar.container.querySelectorAll("[data-plugin-slot]")].map((n) => n.textContent)).toEqual([
+      "d",
+      "f",
+      "e",
+    ]);
   });
 
   it("home-pane renders blocks, and the simple form's title only once", () => {

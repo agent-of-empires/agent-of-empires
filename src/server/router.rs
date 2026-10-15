@@ -202,6 +202,7 @@ pub(super) fn build_router(state: Arc<AppState>) -> Router {
             post(api::restart_plugin_worker),
         )
         .route("/api/plugins/{id}/action", post(api::invoke_plugin_action))
+        .route("/api/plugins/{id}/sessions", get(api::plugin_sessions))
         .route(
             "/api/plugins/{id}/settings/options/resolve",
             post(api::resolve_options),

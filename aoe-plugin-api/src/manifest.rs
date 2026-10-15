@@ -553,6 +553,8 @@ pub fn lucide_icon_name_ok(name: &str) -> bool {
 pub enum UiSlot {
     /// A segment in the dashboard status/top bar (global).
     StatusBar,
+    /// A chip beside the logo in the dashboard top bar (global, API v17).
+    HeaderStart,
     /// A badge on a session row (per session).
     RowBadge,
     RowColumn,
@@ -588,6 +590,7 @@ impl UiSlot {
     pub fn as_str(self) -> &'static str {
         match self {
             UiSlot::StatusBar => "status-bar",
+            UiSlot::HeaderStart => "header-start",
             UiSlot::RowBadge => "row-badge",
             UiSlot::RowColumn => "row-column",
             UiSlot::SortKey => "sort-key",
@@ -1072,6 +1075,12 @@ impl PluginManifest {
                 "page UI slots require api_version >= 16".into(),
             );
         }
+        if self.api_version < 17 {
+            check(
+                self.ui.iter().all(|u| u.slot != UiSlot::HeaderStart),
+                "header-start UI slots require api_version >= 17".into(),
+            );
+        }
         for key in self.setting_defaults.keys() {
             check(
                 key.contains('.') && !key.starts_with('.') && !key.ends_with('.'),
@@ -1274,6 +1283,17 @@ mod tests {
         };
         rejects(&[("session.message below v15", toml(14), "api_version >= 15")]);
         PluginManifest::from_toml_str(&toml(15)).expect("v15 parses");
+    }
+
+    #[test]
+    fn header_start_slot_requires_api_version_17() {
+        let toml = |v: u32| format!("{HEAD}{v}\n\n[[ui]]\nslot = \"header-start\"\nid = \"h\"\n");
+        rejects(&[(
+            "header-start below v17",
+            toml(16),
+            "header-start UI slots require api_version >= 17",
+        )]);
+        PluginManifest::from_toml_str(&toml(17)).expect("header-start parses from v17");
     }
 
     #[test]

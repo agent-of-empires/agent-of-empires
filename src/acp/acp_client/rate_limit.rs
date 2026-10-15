@@ -102,6 +102,34 @@ pub(super) fn captured_rate_limit_resets_at(
         .max()
 }
 
+/// A turn nobody prompted ends without an error, so a still-future rejected
+/// window is the only evidence it ended on the limit. Drains the captures under
+/// one lock so a window recorded meanwhile is never cleared unobserved.
+pub(super) fn take_rate_limit_from_captured_rejection(
+    captures: &std::sync::Mutex<HashMap<String, i64>>,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Option<RateLimitInfo> {
+    let drained = std::mem::take(&mut *captures.lock().expect("rate-limit capture mutex poisoned"));
+    drained
+        .values()
+        .filter_map(|secs| chrono::DateTime::from_timestamp(*secs, 0))
+        .filter(|dt| *dt > now)
+        .max()
+        .map(|resets_at| RateLimitInfo {
+            status: "usage limit reached".to_string(),
+            resets_at: Some(resets_at),
+            kind: "rate_limit".to_string(),
+        })
+}
+
+/// Captures belong to the turn that observed them, so each turn boundary drops them.
+pub(super) fn clear_captured_rejections(captures: &std::sync::Mutex<HashMap<String, i64>>) {
+    captures
+        .lock()
+        .expect("rate-limit capture mutex poisoned")
+        .clear();
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -219,6 +247,10 @@ mod tests {
                         .collect(),
                 );
                 assert_eq!(captured_rate_limit_resets_at(&captures, now), want);
+                let info = take_rate_limit_from_captured_rejection(&captures, now);
+                assert_eq!(info.as_ref().and_then(|i| i.resets_at), want);
+                assert!(info.is_none_or(|i| i.kind == "rate_limit"));
+                assert!(take_rate_limit_from_captured_rejection(&captures, now).is_none());
             }
         }
     }

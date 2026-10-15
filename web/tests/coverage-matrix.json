@@ -872,6 +872,13 @@
       ]
     },
     {
+      "id": "app-shell.topbar-header-start",
+      "kind": "vitest",
+      "risk": "low",
+      "specs": ["src/components/__tests__/TopBar.test.tsx", "src/components/plugin/__tests__/PluginSlots.test.tsx"],
+      "components": ["web/src/components/TopBar.tsx", "web/src/components/plugin/PluginSlots.tsx"]
+    },
+    {
       "id": "app-shell.activity-bar",
       "kind": "vitest",
       "risk": "low",
@@ -1004,7 +1011,11 @@
       "id": "wizard",
       "kind": "mocked-playwright",
       "risk": "high",
-      "specs": ["tests/wizard.spec.ts", "tests/wizard-project.spec.ts"],
+      "specs": [
+        "tests/wizard.spec.ts",
+        "tests/wizard-project.spec.ts",
+        "src/components/session-wizard/__tests__/SessionWizard.test.tsx"
+      ],
       "components": [
         "web/src/components/DirectoryBrowser.tsx",
         "web/src/components/session-wizard/SessionWizard.tsx",
@@ -1857,10 +1868,11 @@
       "components": [
         "web/src/components/plugin/PluginPagesMenu.tsx",
         "web/src/components/plugin/PluginPageView.tsx",
+        "web/src/lib/pluginBridge.ts",
         "web/src/components/TopBar.tsx",
         "web/src/App.tsx"
       ],
-      "notes": "Pages menu and palette entries appear only with a declared page; the route hides the sidebar, mints a page ticket before framing, and Back pops history. A fixture page served under the daemon's page CSP proves the sandboxed frame cannot read storage, cookies or call the API. Mint ordering and empty states are also unit-tested in PluginPageView.test.tsx; the ticket's server side in src/server/api/plugins.rs."
+      "notes": "Pages menu and palette entries appear only with a declared page; the route hides the sidebar, mints a page ticket before framing, and Back pops history. A fixture page served under the daemon's page CSP proves the sandboxed frame cannot read storage, cookies or call the API. A bridge fixture page round-trips ready, sessions.list, plugins.uiState, its own action and openSession, and receives a theme change without reloading; a page that navigates to another plugin's page before ready never hands that page the bridge. Mint ordering, empty states, the nonce-checked ready-only channel handoff, theme pushes, teardown on a second load and remount resets are unit-tested in PluginPageView.test.tsx; envelope validation and gating in pluginBridge.test.ts; the ticket's server side in src/server/api/plugins.rs."
     },
     {
       "id": "sidebar.plugin-row-slots",
@@ -2269,10 +2281,12 @@
         "src/lib/acpHistoryWindow.test.ts",
         "src/hooks/__tests__/useHistoryWindow.test.tsx",
         "src/lib/historyScroll.test.ts",
-        "src/hooks/useAcpSession.test.ts"
+        "src/hooks/useAcpSession.test.ts",
+        "src/hooks/acpSession/replay.test.ts"
       ],
       "components": [
         "web/src/lib/acpHistoryWindow.ts",
+        "web/src/hooks/acpSession/replay.ts",
         "web/src/lib/historyScroll.ts",
         "web/src/hooks/useHistoryWindow.ts",
         "web/src/hooks/useAcpSession.ts",

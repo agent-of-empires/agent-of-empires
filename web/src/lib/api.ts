@@ -654,6 +654,7 @@ export type PluginUiTone = "neutral" | "info" | "success" | "warn" | "danger";
 
 export type PluginUiSlot =
   | "status-bar"
+  | "header-start"
   | "row-badge"
   | "row-column"
   | "sort-key"
@@ -694,6 +695,8 @@ export interface PluginPage {
   title: string;
   icon: string | null;
   url: string;
+  /** The plugin's granted capabilities; the page bridge gates on them. */
+  capabilities: string[];
 }
 
 export interface PluginUiState {
@@ -705,13 +708,18 @@ export interface PluginUiState {
   revisions?: Record<string, Record<string, number>>;
 }
 
+/** A plugin's sessions in its worker's `sessions.list` row shape; null unless it declares `session.read`. */
+export function fetchPluginSessions(pluginId: string): Promise<{ sessions: Record<string, unknown>[] } | null> {
+  return fetchJson(`/api/plugins/${encodeURIComponent(pluginId)}/sessions`);
+}
+
 export function fetchPluginUiState(): Promise<PluginUiState | null> {
   return fetchJson<PluginUiState>("/api/plugins/ui-state");
 }
 
-/** Lets the next frame load of `page.url` authenticate when device binding is on; the ticket rides an HttpOnly cookie. */
-export async function mintPluginPageTicket(page: PluginPage): Promise<boolean> {
-  const reply = await send(`${page.url}/ticket`, { method: "POST" }).catch(() => null);
+/** Lets the next frame load of a page's `url` authenticate when device binding is on; the ticket rides an HttpOnly cookie. */
+export async function mintPluginPageTicket(url: string): Promise<boolean> {
+  const reply = await send(`${url}/ticket`, { method: "POST" }).catch(() => null);
   return reply?.ok ?? false;
 }
 

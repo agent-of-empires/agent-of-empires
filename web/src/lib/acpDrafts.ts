@@ -6,6 +6,7 @@ import type { PromptAttachmentInput } from "./acpTypes";
 import {
   clearAttachments,
   deleteAttachments,
+  deleteAttachmentsUpTo,
   listAttachmentSessionIds,
   loadAttachments,
   nextRevision,
@@ -148,6 +149,16 @@ function isPromptAttachmentInput(v: unknown): v is PromptAttachmentInput {
   );
 }
 
+/** Records a clear as a tombstone; when even that does not fit the quota, frees the stale bytes
+ *  instead, so a draft that was cleared or failed to save cannot linger until its session goes. */
+async function recordClear(sessionId: string, rev: Revision): Promise<void> {
+  try {
+    await clearAttachments(sessionId, rev);
+  } catch {
+    await deleteAttachmentsUpTo(sessionId, rev);
+  }
+}
+
 /** Runs under a cross-tab lock where the browser has one, and plainly otherwise. */
 async function withSessionLock(sessionId: string, fn: () => Promise<void>): Promise<void> {
   const locks = typeof navigator === "undefined" ? undefined : navigator.locks;
@@ -197,7 +208,10 @@ export async function getDraftAttachments(sessionId: string): Promise<PromptAtta
     if (!hasDraftAttachments(sessionId)) return [];
     const stored = await loadAttachments(sessionId);
     toastedRestoreSessions.delete(sessionId);
-    return Array.isArray(stored) ? stored.filter(isPromptAttachmentInput) : [];
+    const restored = Array.isArray(stored) ? stored.filter(isPromptAttachmentInput) : [];
+    // A saved marker over a tombstone (an interrupted tab never repaired it) would keep the draft dot up.
+    if (restored.length === 0) void reconcileMarker(sessionId);
+    return restored;
   } catch {
     return null;
   }
@@ -217,7 +231,7 @@ export function setDraftAttachments(sessionId: string, attachments: readonly Pro
     clearDraftPersistFailure(sessionId);
     // The delete may queue behind a save, so it only removes what existed when the clear happened.
     return chainAttachmentWrite(sessionId, async () => {
-      await clearAttachments(sessionId, rev);
+      await recordClear(sessionId, rev);
       await reconcileMarker(sessionId);
     }).catch(() => {});
   }
@@ -234,7 +248,7 @@ export function setDraftAttachments(sessionId: string, attachments: readonly Pro
       if (attachmentGenerations.get(sessionId) !== generation) return;
       // Exact-or-none: replace this write's record with a clear at its revision, which leaves any
       // newer state (another tab's draft) alone.
-      await clearAttachments(sessionId, rev).catch(() => {});
+      await recordClear(sessionId, rev).catch(() => {});
       writeMarker(sessionId, false, rev);
       notifyDraftPersistFailure(sessionId);
       notify(sessionId);

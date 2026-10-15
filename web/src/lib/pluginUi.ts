@@ -56,6 +56,16 @@ export function globalEntries(entries: PluginUiEntry[], slot: PluginUiSlot): Plu
   return entries.filter((e) => e.slot === slot && e.session_id == null);
 }
 
+/** By payload `order` (default 0, lowest first); the sort is stable, so ties keep snapshot order. Sorts in place. */
+export function byOrder(entries: PluginUiEntry[]): PluginUiEntry[] {
+  const order = (e: PluginUiEntry) => (typeof e.payload.order === "number" ? e.payload.order : 0);
+  return entries.sort((a, b) => order(a) - order(b));
+}
+
+export function chipEntries(entries: PluginUiEntry[], slot: PluginUiSlot): PluginUiEntry[] {
+  return byOrder(globalEntries(entries, slot));
+}
+
 /** Also the tearing guard: entries for vanished sessions never match. */
 export function sessionEntries(
   entries: PluginUiEntry[],
