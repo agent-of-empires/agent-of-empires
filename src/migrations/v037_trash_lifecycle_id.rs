@@ -20,9 +20,7 @@ fn run_in(app_dir: &Path) -> Result<()> {
         )?;
         let changed = sessions_file::heal_rows(&path, &fs::read_to_string(&path)?, |row| {
             if row.get("trashed_at").is_some_and(|at| !at.is_null())
-                && !row
-                    .get("trash_lifecycle_id")
-                    .is_some_and(|id| !id.is_null())
+                && row.get("trash_lifecycle_id").is_none_or(|id| id.is_null())
             {
                 row.insert(
                     "trash_lifecycle_id".into(),

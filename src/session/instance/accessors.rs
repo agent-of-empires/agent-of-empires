@@ -292,9 +292,9 @@ impl Instance {
 
     /// Whether this launch shape leaves Claude user hooks enabled.
     pub(crate) fn hook_session_publisher_allowed_by_argv(&self) -> bool {
-        if !self
+        if self
             .default_selector_agent()
-            .is_some_and(|agent| agent.name == "claude")
+            .is_none_or(|agent| agent.name != "claude")
         {
             return true;
         }

@@ -5060,9 +5060,9 @@ impl HomeView {
 
     /// Present without consuming a key or interrupting agent input or another action.
     pub(in crate::tui) fn try_present_shortcut_bar_tip(&mut self) -> bool {
-        if !self
+        if self
             .pending_tip_pop
-            .is_some_and(|tip| tip.id == crate::tips::SHORTCUT_BAR_TIP_ID)
+            .is_none_or(|tip| tip.id != crate::tips::SHORTCUT_BAR_TIP_ID)
             || self.has_dialog()
             || self.is_creation_pending()
             || self.structured_preview_pending

@@ -2068,7 +2068,7 @@ impl Instance {
                 for key in ["HERMES_MANAGED_DIR", "TERMINAL_ENV", "TERMINAL_CWD"] {
                     routing.push((key.into(), value(key)));
                 }
-                if !root.parent().and_then(std::path::Path::file_name).is_some_and(|name| name == "profiles") {
+                if root.parent().and_then(std::path::Path::file_name).is_none_or(|name| name != "profiles") {
                     namespace_arguments.extend(["--profile".into(), "default".into()]);
                 }
                 configuration.push(root.clone());
