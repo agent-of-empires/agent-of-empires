@@ -75,8 +75,9 @@ export function ScratchOverridesModal({ profile, onClose }: Props) {
     setSubmitting(true);
     setError(null);
     const patch = { session: { scratch_smart_rename: choice === "default" ? null : choice } };
-    const ok = scope === "global" ? await updateMachineSettings(patch) : await updateProfileSettings(profile, patch);
-    if (!ok) {
+    const outcome =
+      scope === "global" ? await updateMachineSettings(patch) : await updateProfileSettings(profile, patch);
+    if (outcome !== "committed") {
       setSubmitting(false);
       setError("Update failed");
       return;

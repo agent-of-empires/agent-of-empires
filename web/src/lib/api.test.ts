@@ -76,9 +76,17 @@ const requestCases: RequestCase[] = [
   ["GET /api/settings", () => api.fetchSettings()],
   ["GET /api/settings?profile=my%20profile", () => api.fetchSettings("my profile")],
   ["GET /api/settings?layer=machine", () => api.fetchMachineSettings()],
-  ["PATCH /api/settings", () => api.updateSettings({ a: 1 }), { body: { a: 1 }, result: true }],
-  ["PATCH /api/settings?profile=my%20p", () => api.updateSettings({ a: 1 }, "my p"), { body: { a: 1 }, result: true }],
-  ["PATCH /api/settings?layer=machine", () => api.updateMachineSettings({ a: 1 }), { body: { a: 1 }, result: true }],
+  ["PATCH /api/settings", () => api.updateSettings({ a: 1 }), { body: { a: 1 }, result: "committed" }],
+  [
+    "PATCH /api/settings?profile=my%20p",
+    () => api.updateSettings({ a: 1 }, "my p"),
+    { body: { a: 1 }, result: "committed" },
+  ],
+  [
+    "PATCH /api/settings?layer=machine",
+    () => api.updateMachineSettings({ a: 1 }),
+    { body: { a: 1 }, result: "committed" },
+  ],
   ["PATCH /api/theme", () => api.updateTheme({ name: "dracula" }), { body: { name: "dracula" }, result: true }],
   ["GET /api/app-state/web-ui-state", () => api.getWebUiState(), { respond: json({ k: "v" }), result: { k: "v" } }],
   [
@@ -563,21 +571,50 @@ describe("request shapes", () => {
 });
 
 describe("settings saves", () => {
-  it.each([
+  const typed = [
     ["updateSettings", () => api.updateSettings({ a: 1 }, "p")],
     ["updateMachineSettings", () => api.updateMachineSettings({ a: 1 })],
     ["updateProfileSettings", () => api.updateProfileSettings("p", { a: 1 })],
-    ["setDefaultProfile", () => api.setDefaultProfile("p")],
-  ])("%s announces a landed save and stays quiet on a rejected one", async (_name, save) => {
+  ] as const;
+
+  it.each(typed)("%s tells a rejected, an uncertain and a committed save apart", async (_name, save) => {
+    const listener = vi.fn();
+    const off = onSettingsChanged(listener);
+    const errorBody = (status: number, error: string) =>
+      ({ ok: false, status, json: async () => ({ error, message: "" }) }) as unknown as Response;
+    try {
+      fetchSpy.mockImplementation(async () => errorBody(400, "update_failed"));
+      expect(await save()).toBe("rejected");
+      expect(listener).not.toHaveBeenCalled();
+
+      for (const failure of [errorBody(500, "load_failed"), errorBody(500, "partially_saved"), empty(502)]) {
+        fetchSpy.mockImplementation(async () => failure);
+        expect(await save()).toBe("uncertain");
+      }
+      fetchSpy.mockImplementation(async () => {
+        throw new Error("offline");
+      });
+      expect(await save()).toBe("uncertain");
+      expect(listener).toHaveBeenCalledTimes(4);
+
+      fetchSpy.mockImplementation(async () => empty());
+      expect(await save()).toBe("committed");
+      expect(listener).toHaveBeenCalledTimes(5);
+    } finally {
+      off();
+    }
+  });
+
+  it("setDefaultProfile announces a landed save and stays quiet on a rejected one", async () => {
     const listener = vi.fn();
     const off = onSettingsChanged(listener);
     try {
       fetchSpy.mockImplementation(async () => empty(500));
-      expect(await save()).toBe(false);
+      expect(await api.setDefaultProfile("p")).toBe(false);
       expect(listener).not.toHaveBeenCalled();
 
       fetchSpy.mockImplementation(async () => empty());
-      expect(await save()).toBe(true);
+      expect(await api.setDefaultProfile("p")).toBe(true);
       expect(listener).toHaveBeenCalledTimes(1);
     } finally {
       off();
@@ -1108,7 +1145,7 @@ describe("profile settings write guard", () => {
   ])("refuses %s without sending", async (_name, updates) => {
     fetchSpy.mockResolvedValueOnce(json(schema));
     const errSpy = vi.spyOn(console, "error").mockImplementation(() => {});
-    expect(await api.updateProfileSettings("work", updates)).toBe(false);
+    expect(await api.updateProfileSettings("work", updates)).toBe("rejected");
     expect(fetchSpy).toHaveBeenCalledTimes(1);
     expect(errSpy).toHaveBeenCalled();
     errSpy.mockRestore();
@@ -1116,14 +1153,14 @@ describe("profile settings write guard", () => {
 
   it("PATCHes an allowed section", async () => {
     fetchSpy.mockResolvedValueOnce(json(schema)).mockResolvedValueOnce(empty());
-    expect(await api.updateProfileSettings("work", { description: "mine" })).toBe(true);
+    expect(await api.updateProfileSettings("work", { description: "mine" })).toBe("committed");
     expect(lastCall()).toMatchObject({ url: "/api/profiles/work/settings", init: { method: "PATCH" } });
     expect(bodyOf(lastCall().init)).toEqual({ description: "mine" });
   });
 
   it("defers to the server when the schema is unavailable", async () => {
     fetchSpy.mockResolvedValueOnce(empty(503)).mockResolvedValueOnce(empty());
-    expect(await api.updateProfileSettings("work", { hooks: {} })).toBe(true);
+    expect(await api.updateProfileSettings("work", { hooks: {} })).toBe("committed");
     expect(fetchSpy).toHaveBeenCalledTimes(2);
     expect(lastCall().url).toBe("/api/profiles/work/settings");
   });

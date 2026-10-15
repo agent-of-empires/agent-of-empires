@@ -77,8 +77,7 @@ export function useSettingsCommands({ open, readOnly, onOpenSettingsTab }: Args)
             const next = !isOn;
             void (async () => {
               const patch = { [f.section]: { [f.field]: next } };
-              const ok = await updateSettings(patch);
-              if (!ok) {
+              if ((await updateSettings(patch)) !== "committed") {
                 reportError(`Failed to update ${f.label}`);
                 return;
               }

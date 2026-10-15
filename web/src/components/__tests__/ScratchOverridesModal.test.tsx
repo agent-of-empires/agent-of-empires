@@ -62,7 +62,7 @@ describe("ScratchOverridesModal", () => {
 
   it("saves the selected scope and value via the machine-wide settings API, then closes", async () => {
     mockFetchGlobal.mockResolvedValue({ session: {} });
-    mockUpdateGlobal.mockResolvedValue(true);
+    mockUpdateGlobal.mockResolvedValue("committed");
     const onClose = vi.fn();
     renderModal(onClose);
     await waitFor(() => expect(smartRenameSelect().value).toBe("inherit"));
@@ -78,7 +78,7 @@ describe("ScratchOverridesModal", () => {
   it("saves through the profile settings API when profile scope is selected", async () => {
     mockFetchGlobal.mockResolvedValue({ session: {} });
     mockFetchProfile.mockResolvedValue({ session: {} });
-    mockUpdateProfile.mockResolvedValue(true);
+    mockUpdateProfile.mockResolvedValue("committed");
     const onClose = vi.fn();
     renderModal(onClose);
     await waitFor(() => expect(smartRenameSelect().value).toBe("inherit"));
@@ -97,7 +97,7 @@ describe("ScratchOverridesModal", () => {
 
   it("shows the error and stays open when saving fails", async () => {
     mockFetchGlobal.mockResolvedValue({ session: {} });
-    mockUpdateGlobal.mockResolvedValue(false);
+    mockUpdateGlobal.mockResolvedValue("rejected");
     const onClose = vi.fn();
     renderModal(onClose);
     await waitFor(() => expect(smartRenameSelect().value).toBe("inherit"));
@@ -207,7 +207,7 @@ describe("ScratchOverridesModal", () => {
     async () => {
       mockFetchGlobal.mockResolvedValue({ session: {} });
       mockFetchProfile.mockResolvedValue({ session: {} });
-      mockUpdateProfile.mockResolvedValue(true);
+      mockUpdateProfile.mockResolvedValue("committed");
       renderModal();
       fireEvent.click(screen.getByRole("button", { name: "Profile-only" }));
       await waitFor(() => expect(smartRenameSelect().value).toBe("default"));
@@ -223,7 +223,7 @@ describe("ScratchOverridesModal", () => {
   it("preserves an explicit profile-level 'inherit' override as-is, distinct from clearing it", async () => {
     mockFetchGlobal.mockResolvedValue({ session: {} });
     mockFetchProfile.mockResolvedValue({ session: { scratch_smart_rename: "inherit" } });
-    mockUpdateProfile.mockResolvedValue(true);
+    mockUpdateProfile.mockResolvedValue("committed");
     renderModal();
     fireEvent.click(screen.getByRole("button", { name: "Profile-only" }));
     await waitFor(() => expect(smartRenameSelect().value).toBe("inherit"));

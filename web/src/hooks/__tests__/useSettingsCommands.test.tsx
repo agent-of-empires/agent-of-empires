@@ -56,7 +56,7 @@ beforeEach(() => {
     session: { live_send: false },
     worktree: { auto_cleanup: true },
   } as never);
-  vi.mocked(updateSettings).mockResolvedValue(true);
+  vi.mocked(updateSettings).mockResolvedValue("committed");
 });
 
 async function render(overrides: Partial<Parameters<typeof useSettingsCommands>[0]> = {}) {

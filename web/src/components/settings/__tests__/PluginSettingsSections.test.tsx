@@ -1,15 +1,19 @@
 // @vitest-environment jsdom
 
-import { describe, expect, it, vi } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 
 vi.mock("../../../lib/api", () => ({
-  updateSettings: vi.fn().mockResolvedValue(true),
+  updateSettings: vi.fn().mockResolvedValue("committed"),
 }));
 
 import { updateSettings } from "../../../lib/api";
+import type { SaveOutcome } from "../../../lib/api";
 import { PluginSettingsSections } from "../PluginSettingsSections";
+import { resetPluginSaves } from "../pluginSaves";
 import type { SettingsFieldDescriptor } from "../../../lib/types";
+
+beforeEach(resetPluginSaves);
 
 const ALLOW = { policy: "allow" } as const;
 const NONE = { rule: "none" } as const;
@@ -102,8 +106,8 @@ describe("PluginSettingsSections list editing while a save is in flight", () => 
   ];
   const stored = (tags: string[]) => ({ plugins: { "acme.kit": { settings: { tags } } } });
   const held = () => {
-    let release: (ok: boolean) => void = () => {};
-    const promise = new Promise<boolean>((resolve) => (release = resolve));
+    let release: (outcome: SaveOutcome) => void = () => {};
+    const promise = new Promise<SaveOutcome>((resolve) => (release = resolve));
     return { promise, release };
   };
   const lastPatch = () => vi.mocked(updateSettings).mock.calls.at(-1)![0];
@@ -124,7 +128,7 @@ describe("PluginSettingsSections list editing while a save is in flight", () => 
 
     // Saves of one field go out in order: the edit waits for the removal's PATCH.
     expect(updateSettings).toHaveBeenCalledTimes(1);
-    pendingPatch.release(true);
+    pendingPatch.release("committed");
     await waitFor(() => expect(updateSettings).toHaveBeenCalledTimes(2));
     expect(lastPatch()).toEqual({ "plugin:acme.kit": { tags: ["x", "c"] } });
   });
@@ -135,7 +139,7 @@ describe("PluginSettingsSections list editing while a save is in flight", () => 
     render(<PluginSettingsSections schema={LIST_SCHEMA} settings={stored(["a", "b"])} onSaved={() => {}} />);
     fireEvent.click(screen.getAllByTitle(/^Remove /)[0]!);
     await waitFor(() => expect(screen.queryByText("a")).toBeNull());
-    failing.release(false);
+    failing.release("rejected");
     await waitFor(() => expect(screen.getByText("a")).toBeTruthy());
   });
 
@@ -152,9 +156,9 @@ describe("PluginSettingsSections list editing while a save is in flight", () => 
     fireEvent.change(await screen.findByDisplayValue("b"), { target: { value: "x" } });
     fireEvent.click(screen.getByText("Save"));
 
-    removal.release(true);
+    removal.release("committed");
     await waitFor(() => expect(updateSettings).toHaveBeenCalledTimes(2));
-    edit.release(false);
+    edit.release("rejected");
 
     // The removal was saved, so `a` must not reappear.
     await waitFor(() => expect(screen.getByText("b")).toBeTruthy());
@@ -175,7 +179,7 @@ describe("PluginSettingsSections list editing while a save is in flight", () => 
     render(<PluginSettingsSections schema={LIST_SCHEMA} settings={stored(["a", "b", "c"])} onSaved={() => {}} />);
 
     fireEvent.click(screen.getAllByTitle(/^Remove /)[0]!);
-    removal.release(true);
+    removal.release("committed");
     await waitFor(() => expect(screen.queryByText("a")).toBeNull());
 
     // Only now is the edit submitted, with the removal already acknowledged and nothing in flight.
@@ -183,7 +187,7 @@ describe("PluginSettingsSections list editing while a save is in flight", () => 
     fireEvent.change(screen.getByDisplayValue("b"), { target: { value: "x" } });
     fireEvent.click(screen.getByText("Save"));
     await waitFor(() => expect(updateSettings).toHaveBeenCalledTimes(2));
-    edit.release(false);
+    edit.release("rejected");
 
     await waitFor(() => expect(screen.getByText("b")).toBeTruthy());
     expect(screen.queryByText("a")).toBeNull();
@@ -194,6 +198,44 @@ describe("PluginSettingsSections list editing while a save is in flight", () => 
     expect(lastPatch()).toEqual({ "plugin:acme.kit": { tags: ["b", "y"] } });
   });
 
+  it("builds the next edit on a removal still in flight after the list remounts", async () => {
+    vi.mocked(updateSettings).mockClear();
+    const removal = held();
+    vi.mocked(updateSettings).mockReturnValueOnce(removal.promise);
+    const props = { schema: LIST_SCHEMA, settings: stored(["a", "b", "c"]), onSaved: () => {} };
+    const first = render(<PluginSettingsSections {...props} />);
+    fireEvent.click(screen.getAllByTitle(/^Remove /)[0]!);
+    await waitFor(() => expect(lastPatch()).toEqual({ "plugin:acme.kit": { tags: ["b", "c"] } }));
+
+    first.unmount();
+    render(<PluginSettingsSections {...props} />);
+    await waitFor(() => expect(screen.queryByText("a")).toBeNull());
+    fireEvent.click(screen.getAllByTitle(/^Remove /)[0]!);
+
+    // The second removal waits for the first PATCH and removes `b` from `[b, c]`, not from `[a, b, c]`.
+    expect(updateSettings).toHaveBeenCalledTimes(1);
+    removal.release("committed");
+    await waitFor(() => expect(updateSettings).toHaveBeenCalledTimes(2));
+    expect(lastPatch()).toEqual({ "plugin:acme.kit": { tags: ["c"] } });
+  });
+
+  it("keeps the edit when the server persisted it but the outcome is uncertain, then refetches", async () => {
+    vi.mocked(updateSettings).mockClear();
+    const outcome = held();
+    vi.mocked(updateSettings).mockReturnValueOnce(outcome.promise);
+    const onSaved = vi.fn();
+    render(<PluginSettingsSections schema={LIST_SCHEMA} settings={stored(["a", "b", "c"])} onSaved={onSaved} />);
+    fireEvent.click(screen.getAllByTitle(/^Remove /)[0]!);
+    await waitFor(() => expect(screen.queryByText("a")).toBeNull());
+
+    outcome.release("uncertain");
+    await waitFor(() => expect(onSaved).toHaveBeenCalledTimes(1));
+    expect(screen.queryByText("a")).toBeNull();
+    fireEvent.click(screen.getAllByTitle(/^Remove /)[0]!);
+    await waitFor(() => expect(updateSettings).toHaveBeenCalledTimes(2));
+    expect(lastPatch()).toEqual({ "plugin:acme.kit": { tags: ["c"] } });
+  });
+
   it("shows the refetched settings once they arrive", async () => {
     const done = held();
     vi.mocked(updateSettings).mockReturnValueOnce(done.promise);
@@ -201,7 +243,7 @@ describe("PluginSettingsSections list editing while a save is in flight", () => 
       <PluginSettingsSections schema={LIST_SCHEMA} settings={stored(["a", "b"])} onSaved={() => {}} />,
     );
     fireEvent.click(screen.getAllByTitle(/^Remove /)[0]!);
-    done.release(true);
+    done.release("committed");
     await waitFor(() => expect(screen.queryByText("a")).toBeNull());
     rerender(<PluginSettingsSections schema={LIST_SCHEMA} settings={stored(["z"])} onSaved={() => {}} />);
     expect(screen.getByText("z")).toBeTruthy();

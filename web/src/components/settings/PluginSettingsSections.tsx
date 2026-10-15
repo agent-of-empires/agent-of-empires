@@ -1,4 +1,5 @@
-import { useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useSyncExternalStore } from "react";
+import { getPendingSaves, queueSave, setPending, subscribePendingSaves } from "./pluginSaves";
 import { updateSettings } from "../../lib/api";
 import type { SettingsFieldDescriptor } from "../../lib/types";
 import { SchemaSection } from "./SchemaSection";
@@ -17,24 +18,12 @@ function storedSettings(settings: Record<string, unknown> | null, id: string): R
   return plugins[id]?.settings ?? {};
 }
 
-/**
- * A saved value shown until the refetch it triggers lands. `inflight` counts unfinished PATCHes;
- * `acked` is the last value the server accepted, which a later failed save falls back to.
- */
-type Pending = Record<
-  string,
-  { section: string; field: string; value: unknown; inflight: number; acked?: { value: unknown } }
->;
-
 /** One SchemaSection per active plugin; plugin settings are global, saved via `PATCH /api/settings`. */
 export function PluginSettingsSections({ schema, settings, onSaved }: Props) {
-  const [pending, setPending] = useState<Pending>({});
-  const queue = useRef<Record<string, Promise<void>>>({});
-  const [seenSettings, setSeenSettings] = useState(settings);
-  if (settings !== seenSettings) {
-    setSeenSettings(settings);
+  const pending = useSyncExternalStore(subscribePendingSaves, getPendingSaves);
+  useEffect(() => {
     setPending((p) => Object.fromEntries(Object.entries(p).filter(([, e]) => e.inflight > 0)));
-  }
+  }, [settings]);
 
   const sections = useMemo(() => {
     const seen = new Set<string>();
@@ -56,28 +45,23 @@ export function PluginSettingsSections({ schema, settings, onSaved }: Props) {
     const key = `${section}\0${field}`;
     setPending((p) => ({ ...p, [key]: { ...p[key], section, field, value, inflight: (p[key]?.inflight ?? 0) + 1 } }));
     // The server applies each PATCH atomically but not in arrival order, so send a field's saves one at a time.
-    const request = (queue.current[key] ?? Promise.resolve()).then(() =>
-      updateSettings({ [section]: { [field]: value } }),
-    );
-    queue.current[key] = request.then(
-      () => undefined,
-      () => undefined,
-    );
-    const ok = await request;
+    const request = queueSave(key, () => updateSettings({ [section]: { [field]: value } }));
+    const outcome = await request;
     setPending((p) => {
       const entry = p[key];
       if (!entry) return p;
       const inflight = entry.inflight - 1;
-      const acked = ok ? { value } : entry.acked;
-      if (!ok && inflight === 0) {
+      const acked = outcome === "committed" ? { value } : entry.acked;
+      if (outcome === "rejected" && inflight === 0) {
         // Fall back to what the server last accepted: the settings prop may not have refetched it yet.
         if (!acked) return Object.fromEntries(Object.entries(p).filter(([k]) => k !== key));
         return { ...p, [key]: { ...entry, value: acked.value, inflight, acked } };
       }
       return { ...p, [key]: { ...entry, inflight, acked } };
     });
-    if (ok) onSaved();
-    return ok;
+    // An uncertain save keeps its value on screen; the refetch settles what the server holds.
+    if (outcome !== "rejected") onSaved();
+    return outcome !== "rejected";
   };
 
   return (

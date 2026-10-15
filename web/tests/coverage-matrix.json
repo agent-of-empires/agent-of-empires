@@ -465,6 +465,23 @@
       "components": ["web/src/lib/api.ts", "web/src/lib/settingsEvents.ts", "web/src/hooks/useApprovalSound.ts"]
     },
     {
+      "id": "settings.save-coordination",
+      "kind": "vitest",
+      "risk": "high",
+      "specs": [
+        "src/lib/settingsStore.test.ts",
+        "src/lib/api.test.ts",
+        "src/components/settings/__tests__/PluginSettingsSections.test.tsx"
+      ],
+      "components": [
+        "web/src/lib/settingsStore.ts",
+        "web/src/lib/api.ts",
+        "web/src/components/SettingsView.tsx",
+        "web/src/components/settings/PluginSettingsSections.tsx",
+        "web/src/components/settings/pluginSaves.ts"
+      ]
+    },
+    {
       "id": "settings.theme-persistence",
       "kind": "live-playwright",
       "risk": "high",

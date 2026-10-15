@@ -125,7 +125,7 @@ export function ProfilesSection({ readOnly }: Props) {
   const handleSaveDescription = async () => {
     setError(null);
     const trimmed = description.trim();
-    if (!(await updateProfileSettings(selected, { description: trimmed ? trimmed : null }))) {
+    if ((await updateProfileSettings(selected, { description: trimmed ? trimmed : null })) !== "committed") {
       return setError("Failed to save description");
     }
     descriptionDirty.current = false;
