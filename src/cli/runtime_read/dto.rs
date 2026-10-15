@@ -597,19 +597,14 @@ pub(crate) fn validate_snapshot(snapshot: &SnapshotData) -> Result<(), &'static 
         .iter()
         .map(|project| project.path.as_str())
         .collect();
-    let listed_profiles: HashSet<&str> = snapshot
-        .profiles
-        .iter()
-        .filter(|profile| profile.listed)
-        .map(|profile| profile.name.as_str())
-        .collect();
-    let mut listed_ids = HashSet::new();
-    let mut session_ids = HashSet::new();
     let mut parents: HashMap<(&str, &str), Option<&str>> = HashMap::new();
     for session in &snapshot.sessions {
-        if !session_ids.insert((session.profile.as_str(), session.id.as_str()))
-            || (listed_profiles.contains(session.profile.as_str())
-                && !listed_ids.insert(session.id.as_str()))
+        if parents
+            .insert(
+                (session.profile.as_str(), session.id.as_str()),
+                session.parent_session_id.as_deref(),
+            )
+            .is_some()
             || !profile_names.contains(session.profile.as_str())
         {
             return Err("schema_invalid");
@@ -627,20 +622,9 @@ pub(crate) fn validate_snapshot(snapshot: &SnapshotData) -> Result<(), &'static 
         {
             return Err("schema_invalid");
         }
-        parents.insert(
-            (session.profile.as_str(), session.id.as_str()),
-            session.parent_session_id.as_deref(),
-        );
     }
     for ((profile, id), parent) in &parents {
-        if let Some(parent) = parent {
-            // Hidden copies cannot create an edge in the canonical graph.
-            if listed_profiles.contains(profile)
-                && !parents.contains_key(&(*profile, *parent))
-                && listed_ids.contains(parent)
-            {
-                return Err("schema_invalid");
-            }
+        if parent.is_some() {
             let mut seen = HashSet::new();
             let mut cursor = Some(*id);
             let mut depth = 0usize;
@@ -1043,10 +1027,9 @@ pub(crate) fn valid_absolute_path(value: &str) -> bool {
             }))
 }
 
-/// Registry spellings also permit trailing separators without rewriting the stored value.
+/// Stored absolute spellings are opaque and need not be lexically normalized.
 pub(crate) fn valid_stored_project_path(value: &str) -> bool {
-    let trimmed = value.trim_end_matches('/');
-    (trimmed.is_empty() && value.starts_with('/')) || valid_absolute_path(trimmed)
+    value.starts_with('/') && !value.contains('\0')
 }
 
 /// The existing session writer uses an empty string for a non-UTF-8 native path.
@@ -1266,8 +1249,8 @@ mod tests {
         value.sessions[0].parent_session_id = Some("b".into());
         assert_eq!(
             validate_snapshot(&value),
-            Err("schema_invalid"),
-            "a parent in another profile is still refused"
+            Ok(()),
+            "an ID in another profile does not resolve a local orphan"
         );
     }
 
@@ -1321,7 +1304,7 @@ mod tests {
     }
 
     #[test]
-    fn hidden_copies_scope_parent_graphs_without_relaxing_listed_uuid_uniqueness() {
+    fn profile_scoped_ids_preserve_independent_parent_graphs() {
         let mut value = parent_chain_snapshot(2);
         let mut hidden = value.profiles[0].clone();
         hidden.name = "outside".into();
@@ -1347,7 +1330,7 @@ mod tests {
         assert_eq!(validate_snapshot(&cycle), Err("schema_invalid"));
         let mut listed_copy = value.clone();
         listed_copy.profiles[1].listed = true;
-        assert_eq!(validate_snapshot(&listed_copy), Err("schema_invalid"));
+        assert_eq!(validate_snapshot(&listed_copy), Ok(()));
         value.sessions[0].parent_session_id = Some("hidden-only".into());
         let mut hidden_only = value.sessions[2].clone();
         hidden_only.id = "hidden-only".into();
@@ -1476,6 +1459,11 @@ mod tests {
             "/repo/",
             "/repo///",
             "/",
+            "//",
+            "/..",
+            "/repo/./one",
+            "/repo/../etc",
+            "/repo//one",
             "/team\twork/",
             "/name\nline",
             "/repo/\u{202e}",
@@ -1485,7 +1473,7 @@ mod tests {
                 "{admitted} is a directory the store can hold"
             );
         }
-        for refused in ["repo", "", "/repo/../etc", "/repo//one", "/repo/\0"] {
+        for refused in ["repo", "", ".", "..", "repo/../other", "~/repo", "/repo/\0"] {
             assert!(
                 !valid_stored_project_path(refused),
                 "{refused:?} is not an admitted absolute spelling"

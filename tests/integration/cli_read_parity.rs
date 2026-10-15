@@ -484,12 +484,18 @@ fn row(
 
 /// Probe cached fixture rows as the daemon status watcher does.
 fn daemon_instances() -> Vec<Instance> {
-    let storage =
-        agent_of_empires::session::Storage::open_unwatched(PROFILE).expect("profile storage");
-    let (mut instances, _) = storage.load_with_groups().expect("load");
-    for instance in &mut instances {
-        instance.source_profile = PROFILE.to_string();
-        instance.update_status_once(None, None);
+    let mut instances = Vec::new();
+    for profile in agent_of_empires::session::list_profiles().expect("profiles") {
+        let Ok((mut rows, _)) = agent_of_empires::session::Storage::open_unwatched(&profile)
+            .and_then(|storage| storage.load_with_groups())
+        else {
+            continue;
+        };
+        for instance in &mut rows {
+            instance.source_profile = profile.clone();
+            instance.update_status_once(None, None);
+        }
+        instances.extend(rows);
     }
     instances
 }
@@ -557,7 +563,88 @@ fn assert_same(args: &[String], served: &Run, local: &Run) {
 #[serial_test::serial]
 async fn the_served_bytes_are_the_bytes_the_local_command_prints() {
     let fixture = Fixture::new();
+    let mut rows = fixture_sessions(fixture.path());
+    rows.push(row(
+        "n-legacy-worktree",
+        Status::Stopped,
+        "/srv/repo/../repo-worktrees/feat",
+        "",
+        "Legacy worktree",
+        false,
+        false,
+    ));
+    std::fs::write(
+        fixture.sessions_path(),
+        serde_json::to_vec_pretty(&rows).unwrap(),
+    )
+    .unwrap();
     compare_both_transports(&fixture).await;
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn profile_scoped_ids_preserve_each_store_on_both_transports() {
+    let fixture = Fixture::new();
+    let mut child = row(
+        "i-child",
+        Status::Idle,
+        "/srv/registered",
+        "",
+        "Other child",
+        false,
+        false,
+    );
+    child["parent_session_id"] = serde_json::json!("h-parent");
+    let copied = vec![
+        row(
+            "h-parent",
+            Status::Idle,
+            "/srv/registered",
+            "",
+            "Other parent",
+            false,
+            false,
+        ),
+        child,
+    ];
+    std::fs::write(
+        fixture.app_dir().join("profiles/zeta/sessions.json"),
+        serde_json::to_vec_pretty(&copied).unwrap(),
+    )
+    .unwrap();
+    let answers = compare_transports(
+        &fixture,
+        &[
+            &["list", "--json", "-p", "main"],
+            &["list", "--json", "-p", "zeta"],
+            &["list", "--json", "--all"],
+            &["list", "--all"],
+            &["session", "show", "i-child", "-p", "main"],
+            &["session", "show", "i-child", "-p", "zeta"],
+        ],
+        usize::MAX,
+        &[
+            &["list", "--json", "-p", "zeta"],
+            &["session", "show", "i-child", "-p", "zeta"],
+        ],
+    )
+    .await;
+    let all: Vec<serde_json::Value> = serde_json::from_str(&answers[2].stdout).unwrap();
+    let mut parents: Vec<_> = all
+        .iter()
+        .filter(|row| row["id"] == "h-parent")
+        .map(|row| {
+            (
+                row["profile"].as_str().unwrap(),
+                row["title"].as_str().unwrap(),
+            )
+        })
+        .collect();
+    parents.sort_unstable();
+    assert_eq!(parents, [("main", "Parent"), ("zeta", "Other parent")]);
+    assert!(answers[4].stdout.contains("Parent"));
+    assert!(!answers[4].stdout.contains("Other parent"));
+    assert!(answers[5].stdout.contains("Other parent"));
 }
 
 /// Canonical equality merges symlink spellings and applies profile shadowing.

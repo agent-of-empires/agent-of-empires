@@ -12,6 +12,8 @@ Read-only CLI commands use `/api/runtime/read/ws` when `--daemon-url` or `AOE_DA
 
 An explicit endpoint requires a served answer and never falls back. Environment discovery falls back to local storage, with a notice on stderr, if its configuration is unusable or no TCP peer is reached within one second. Authentication, upgrade and protocol failures after reaching a peer never fall back. Each served exchange has a 15-second deadline.
 
+After upgrading the CLI, a `protocol_mismatch` means the target daemon uses a different protocol version. On that daemon's host, run `aoe serve --restart` for a detached daemon; otherwise restart the foreground daemon or its service through the service manager. Update that host's installation if needed. A missing runtime-read route can also indicate an older daemon, but first check the selected URL and proxy routing.
+
 Without an HTTP endpoint, Linux reads use a verified, same-user local daemon socket when published; otherwise they use local storage. Invalid or unverifiable publication artifacts refuse fallback. Other platforms use local storage.
 
 The route follows the daemon's authentication mode. CLI clients use `AOE_DAEMON_TOKEN` or `AOE_DAEMON_PASSPHRASE`; passphrase login shares the ACP client's device-bound session cache. Environment URLs discard query parameters, including query tokens. Explicit endpoints reject queries. HTTP on a non-loopback host is accepted only without credentials; remote authentication requires HTTPS. Localhost connections bypass proxies and pin both loopback address families.
@@ -21,6 +23,10 @@ Loopback HTTP does not verify the listener's OS user. If another local user bind
 Runtime snapshots include stored launch commands on both transports to preserve CLI output. Commands may contain inline secrets; treat clients allowed to read snapshots as trusted, and do not expose `--auth none` to untrusted peers. Human output from served reads strips C0/C1 control characters from daemon-provided fields; JSON retains the original values.
 
 Wire protocol **version 4** sends a `Hello` followed by a `Snapshot`. Profiles carry `name`, `listed` and `aliases`; aliases select the same physical store while preserving the requested spelling. Alias-only external stores are available through scoped reads but excluded from ordinary profile inventories and all-profile lists.
+
+Runtime-read session identity and parent relationships are scoped to a profile. The same session ID may appear in different profiles without invalidating the snapshot. Stored absolute project paths retain their spelling, including legacy `.` / `..` components and repeated separators; reads do not normalize them or resolve them on the client.
+
+Profile stores and alias targets must remain responsive. Filesystem operations on a stalled mount can delay daemon status refresh and snapshot sampling. The exchange deadline does not cancel those filesystem operations.
 
 An explicitly selected unreadable profile fails rather than returning an empty successful result. All-profile listing skips unreadable profiles, matching local listing behavior. Group and project registries have independent health, so an unrelated failure does not prevent a healthy read.
 

@@ -595,7 +595,7 @@ fn build_snapshot(
         })
         .map(|(name, _)| name.as_str())
         .collect();
-    reconcile_legacy_rows(&mut sessions, &listed_names);
+    reconcile_legacy_rows(&mut sessions);
 
     let mut profile_reads = Vec::with_capacity(inventory.len());
     let mut profile_health = BTreeMap::new();
@@ -720,16 +720,11 @@ fn drop_unusable_projects(projects: &mut Vec<ProjectRead>) {
 }
 
 /// Preserve scoped orphans and sever cycles.
-fn reconcile_legacy_rows(sessions: &mut [SessionRead], listed: &HashSet<&str>) {
+fn reconcile_legacy_rows(sessions: &mut [SessionRead]) {
     let index: HashMap<(&str, &str), usize> = sessions
         .iter()
         .enumerate()
         .map(|(position, row)| ((row.profile.as_str(), row.id.as_str()), position))
-        .collect();
-    let listed_ids: HashSet<&str> = sessions
-        .iter()
-        .filter(|row| listed.contains(row.profile.as_str()))
-        .map(|row| row.id.as_str())
         .collect();
     let mut parents: HashMap<usize, usize> = sessions
         .iter()
@@ -741,16 +736,7 @@ fn reconcile_legacy_rows(sessions: &mut [SessionRead], listed: &HashSet<&str>) {
                 .map(|parent| (position, parent))
         })
         .collect();
-    let mut severed = cycle_entries(&mut parents);
-    for (position, row) in sessions.iter().enumerate() {
-        if listed.contains(row.profile.as_str())
-            && row.parent_session_id.as_deref().is_some_and(|parent| {
-                !index.contains_key(&(row.profile.as_str(), parent)) && listed_ids.contains(parent)
-            })
-        {
-            severed.insert(position);
-        }
-    }
+    let severed = cycle_entries(&mut parents);
     for (position, row) in sessions.iter_mut().enumerate() {
         if severed.contains(&position) {
             row.parent_session_id = None;
@@ -1886,7 +1872,7 @@ mod tests {
     }
 
     #[test]
-    fn cross_profile_parents_and_cycles_are_severed_at_the_closing_row() {
+    fn profile_local_orphans_survive_while_cycles_are_severed() {
         let mut cross = row("a", Some("b"), "/repo");
         cross.profile = "other".into();
         let b = row("b", None, "/repo");
@@ -1896,7 +1882,7 @@ mod tests {
         let mut rows = vec![cross, b, orphan];
         rows.append(&mut cycle);
 
-        reconcile_legacy_rows(&mut rows, &HashSet::from(["main", "other"]));
+        reconcile_legacy_rows(&mut rows);
 
         let parents: Vec<(&str, Option<&str>)> = rows
             .iter()
@@ -1905,7 +1891,7 @@ mod tests {
         assert_eq!(
             parents,
             vec![
-                ("a", None),
+                ("a", Some("b")),
                 ("b", None),
                 ("c", Some("nowhere")),
                 ("x", None),

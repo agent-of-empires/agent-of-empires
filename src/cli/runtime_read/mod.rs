@@ -122,6 +122,9 @@ pub const RENDERER_INTERNAL: &str = "renderer_internal";
 
 /// Format a runtime refusal code for CLI stderr.
 pub fn read_sentence(code: &str) -> String {
+    if code == "protocol_mismatch" {
+        return "daemon read: protocol_mismatch\nClient and daemon protocol versions differ. Restart the target daemon on its host with `aoe serve --restart` (or its service manager); update that host's aoe installation if needed.\n".into();
+    }
     format!("daemon read: {code}\n")
 }
 
@@ -700,6 +703,13 @@ where
 
 fn map_upgrade_error(error: WsError) -> ReadFailure {
     match error {
+        WsError::Http(response) if response.status().as_u16() == 404 => {
+            let mut failure = ReadFailure::post("server_error");
+            failure.exact = Some(
+                "daemon read: server_error\nThe runtime-read route was not found. Check the selected URL and proxy routing. If the daemon predates this CLI, update it and restart it on its host with `aoe serve --restart` (or its service manager).\n".into(),
+            );
+            failure
+        }
         WsError::Http(response) => map_http_status(response.status().as_u16()),
         _ => ReadFailure::post("unavailable"),
     }

@@ -60,10 +60,9 @@
       "not": { "pattern": "(^|/)\\.{1,2}(/|$)" }
     },
     "stored_project_path": {
-      "description": "Native absolute spelling, preserved verbatim; trailing separators also preserve legacy registry identity.",
+      "description": "Stored absolute spelling, preserved verbatim, including legacy dot components and repeated separators.",
       "type": "string",
-      "pattern": "^/([^/\\u0000]+(/[^/\\u0000]+)*)?/*$",
-      "not": { "pattern": "(^|/)\\.{1,2}(/|$)" }
+      "pattern": "^/[^\\u0000]*$"
     },
     "session_project_path": {
       "oneOf": [{ "$ref": "#/$defs/stored_project_path" }, { "const": "" }]
