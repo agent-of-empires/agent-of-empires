@@ -4,28 +4,43 @@ use agent_client_protocol::schema::v1::{
     EnvVariable, HttpHeader, McpCapabilities, McpServer, McpServerHttp, McpServerSse,
     McpServerStdio,
 };
+use std::borrow::Cow;
 use std::collections::BTreeMap;
 use tracing::warn;
 
-use crate::session::mcp::project_mcp::{ProjectMcpServer, ProjectMcpTransport};
+use crate::session::mcp::mcp_model::{McpProvenance, ResolvedMcpServer};
+use crate::session::mcp::project_mcp::ProjectMcpTransport;
 
 /// Convert resolved, transport-typed servers (parsed and merged by
 /// `session::mcp::mcp_model`) into ACP `McpServer` values for forwarding through
 /// `session/new` and `session/load`.
-pub fn project_servers_to_acp(servers: Vec<ProjectMcpServer>) -> Vec<McpServer> {
+pub fn project_servers_to_acp(
+    servers: Vec<ResolvedMcpServer>,
+    session_env: &[(String, String)],
+) -> Vec<McpServer> {
     servers
         .into_iter()
-        .map(|server| match server.transport {
-            ProjectMcpTransport::Stdio { command, args, env } => McpServer::Stdio(
-                McpServerStdio::new(server.name, command)
-                    .args(args)
-                    .env(to_env(env)),
-            ),
-            ProjectMcpTransport::Http { url, headers } => {
-                McpServer::Http(McpServerHttp::new(server.name, url).headers(to_headers(headers)))
-            }
-            ProjectMcpTransport::Sse { url, headers } => {
-                McpServer::Sse(McpServerSse::new(server.name, url).headers(to_headers(headers)))
+        .map(|resolved| {
+            let session_env = if matches!(&resolved.provenance, McpProvenance::ProjectLocal) {
+                &[]
+            } else {
+                session_env
+            };
+            let server = resolved.def;
+            match server.transport {
+                ProjectMcpTransport::Stdio { command, args, env } => McpServer::Stdio(
+                    McpServerStdio::new(server.name, command)
+                        .args(args)
+                        .env(to_env(env)),
+                ),
+                ProjectMcpTransport::Http { url, headers } => {
+                    let headers = to_headers(&server.name, headers, session_env);
+                    McpServer::Http(McpServerHttp::new(server.name, url).headers(headers))
+                }
+                ProjectMcpTransport::Sse { url, headers } => {
+                    let headers = to_headers(&server.name, headers, session_env);
+                    McpServer::Sse(McpServerSse::new(server.name, url).headers(headers))
+                }
             }
         })
         .collect()
@@ -37,11 +52,85 @@ fn to_env(env: BTreeMap<String, String>) -> Vec<EnvVariable> {
         .collect()
 }
 
-fn to_headers(headers: BTreeMap<String, String>) -> Vec<HttpHeader> {
+fn to_headers(
+    server: &str,
+    headers: BTreeMap<String, String>,
+    session_env: &[(String, String)],
+) -> Vec<HttpHeader> {
     headers
         .into_iter()
-        .map(|(name, value)| HttpHeader::new(name, value))
+        .filter_map(|(header_name, value)| {
+            let (expanded, has_unresolved_reference) =
+                expand_env_references(server, &header_name, &value, session_env);
+            if has_unresolved_reference && header_name.eq_ignore_ascii_case("authorization") {
+                return None;
+            }
+            let value = match expanded {
+                Cow::Borrowed(_) => value,
+                Cow::Owned(value) => value,
+            };
+            Some(HttpHeader::new(header_name, value))
+        })
         .collect()
+}
+
+fn expand_env_references<'a>(
+    server: &str,
+    header: &str,
+    value: &'a str,
+    session_env: &[(String, String)],
+) -> (Cow<'a, str>, bool) {
+    let mut cursor = 0;
+    let mut copied_until = 0;
+    let mut expanded = None;
+    let mut has_unresolved_reference = false;
+    while let Some(relative_start) = value[cursor..].find("${") {
+        let start = cursor + relative_start;
+        if start > 0 && value.as_bytes()[start - 1] == b'$' {
+            cursor = start + 2;
+            continue;
+        }
+        let name_start = start + 2;
+        let Some(relative_end) = value[name_start..].find('}') else {
+            break;
+        };
+        let end = name_start + relative_end;
+        let name = &value[name_start..end];
+        cursor = end + 1;
+        if !crate::session::environment::is_valid_env_key(name) {
+            continue;
+        }
+        let replacement = session_env
+            .iter()
+            .rev()
+            .find(|(key, _)| key == name)
+            .map(|(_, value)| value)
+            .filter(|value| !value.is_empty());
+        let Some(replacement) = replacement else {
+            warn!(
+                target: "acp.mcp",
+                server,
+                header,
+                env_var = name,
+                "MCP header environment reference could not be resolved or is not allowed for this config source"
+            );
+            has_unresolved_reference = true;
+            continue;
+        };
+        let output = expanded.get_or_insert_with(String::new);
+        output.push_str(&value[copied_until..start]);
+        output.push_str(replacement);
+        copied_until = end + 1;
+    }
+
+    let expanded = match expanded {
+        Some(mut output) => {
+            output.push_str(&value[copied_until..]);
+            Cow::Owned(output)
+        }
+        None => Cow::Borrowed(value),
+    };
+    (expanded, has_unresolved_reference)
 }
 
 /// Drop servers the agent cannot accept: `stdio` is always supported, but
@@ -96,14 +185,40 @@ fn server_kind(server: &McpServer) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use crate::session::mcp::mcp_model::{McpProvenance, ResolvedMcpServer};
     use crate::session::mcp::project_mcp::parse_standard_mcp_servers;
 
     fn names(servers: &[McpServer]) -> Vec<&str> {
         servers.iter().map(server_name).collect()
     }
 
+    fn resolved(json: &str, provenance: McpProvenance) -> Vec<ResolvedMcpServer> {
+        parse_standard_mcp_servers(json)
+            .unwrap()
+            .into_iter()
+            .map(|def| ResolvedMcpServer {
+                def,
+                provenance: provenance.clone(),
+                shadowed: Vec::new(),
+            })
+            .collect()
+    }
+
     fn to_acp(json: &str) -> Vec<McpServer> {
-        project_servers_to_acp(parse_standard_mcp_servers(json).unwrap())
+        project_servers_to_acp(resolved(json, McpProvenance::Global), &[])
+    }
+
+    fn new_session_request(
+        json: &str,
+        provenance: McpProvenance,
+        session_env: &[(String, String)],
+    ) -> serde_json::Value {
+        let servers = project_servers_to_acp(resolved(json, provenance), session_env);
+        serde_json::to_value(
+            agent_client_protocol::schema::v1::NewSessionRequest::new("/work").mcp_servers(servers),
+        )
+        .unwrap()
     }
 
     #[test]
@@ -161,5 +276,77 @@ mod tests {
             names(&filter_for_capabilities(servers, &both, "t")),
             vec!["http", "sse", "stdio"]
         );
+    }
+
+    #[test]
+    fn serializes_resolved_auth_header_in_session_new_request() {
+        let session_env = vec![
+            ("GITHUB_TOKEN".to_string(), "older-token".to_string()),
+            ("GITHUB_TOKEN".to_string(), "synthetic-token".to_string()),
+        ];
+        let request = new_session_request(
+            r#"{"mcpServers":{"remote":{"type":"http","url":"https://mcp.invalid","headers":{"Authorization":"Bearer ${GITHUB_TOKEN}"}}}}"#,
+            McpProvenance::Profile {
+                name: "work".into(),
+            },
+            &session_env,
+        );
+
+        assert_eq!(
+            request["mcpServers"][0]["headers"][0],
+            serde_json::json!({
+                "name": "Authorization",
+                "value": "Bearer synthetic-token"
+            })
+        );
+    }
+
+    #[test]
+    fn unresolved_authorization_is_omitted_but_server_and_other_placeholders_remain() {
+        let request = new_session_request(
+            r#"{"mcpServers":{"remote":{"type":"http","url":"https://mcp.invalid","headers":{"Authorization":"Bearer ${GITHUB_TOKEN}","X-Reference":"${MISSING}"}}}}"#,
+            McpProvenance::Global,
+            &[],
+        );
+
+        assert_eq!(request["mcpServers"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            request["mcpServers"][0]["headers"],
+            serde_json::json!([{
+                "name": "X-Reference",
+                "value": "${MISSING}"
+            }])
+        );
+    }
+
+    #[test]
+    fn empty_authorization_reference_is_omitted_instead_of_sending_bearer_space() {
+        let request = new_session_request(
+            r#"{"mcpServers":{"remote":{"type":"http","url":"https://mcp.invalid","headers":{"Authorization":"Bearer ${GITHUB_TOKEN}"}}}}"#,
+            McpProvenance::Profile {
+                name: "work".into(),
+            },
+            &[
+                ("GITHUB_TOKEN".into(), "older-token".into()),
+                ("GITHUB_TOKEN".into(), String::new()),
+            ],
+        );
+
+        assert_eq!(request["mcpServers"].as_array().unwrap().len(), 1);
+        assert_eq!(request["mcpServers"][0]["headers"], serde_json::json!([]));
+        assert!(!request.to_string().contains("older-token"));
+    }
+
+    #[test]
+    fn project_local_authorization_does_not_expand_from_session_environment() {
+        let request = new_session_request(
+            r#"{"mcpServers":{"remote":{"type":"http","url":"https://mcp.invalid","headers":{"Authorization":"Bearer ${GITHUB_TOKEN}"}}}}"#,
+            McpProvenance::ProjectLocal,
+            &[("GITHUB_TOKEN".into(), "synthetic-token".into())],
+        );
+
+        assert_eq!(request["mcpServers"].as_array().unwrap().len(), 1);
+        assert_eq!(request["mcpServers"][0]["headers"], serde_json::json!([]));
+        assert!(!request.to_string().contains("synthetic-token"));
     }
 }
