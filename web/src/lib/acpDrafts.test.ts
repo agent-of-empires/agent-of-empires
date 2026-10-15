@@ -390,6 +390,31 @@ describe("attachment drafts (#2493)", () => {
     expect(await getDraftAttachments("s-1")).toEqual([]);
   });
 
+  it("repairs a saved marker left over a tombstone when restore reads it", async () => {
+    const real = await vi.importActual<typeof import("./attachmentStore")>("./attachmentStore");
+    await real.saveAttachments("s-1", [img("OLD")], [100, "a"]);
+    await real.clearAttachments("s-1", [200, "b"]);
+    // A stale write left the saved marker, and the tab was interrupted before repairing it.
+    localStorage.setItem("acp:draft-attachments-v2:s-1", "S:100:a");
+    expect(await getDraftAttachments("s-1")).toEqual([]);
+    await vi.waitFor(() => expect(hasDraftAttachments("s-1")).toBe(false));
+    expect(localStorage.getItem("acp:draft-attachments-v2:s-1")).toBe("C:200:b");
+  });
+
+  it("frees the stale bytes when even the tombstone does not fit the quota", async () => {
+    toastErrors();
+    await setDraftAttachments("s-1", [img("STALE")]);
+    expect(await storedIds()).toEqual(["s-1"]);
+    // Every write overflows, tombstones included; only deletes still work.
+    vi.spyOn(IDBObjectStore.prototype, "put").mockImplementation(() => {
+      throw new DOMException("The quota has been exceeded.", "QuotaExceededError");
+    });
+    await setDraftAttachments("s-1", []);
+    vi.restoreAllMocks();
+    expect(await storedIds()).toEqual([]);
+    expect(await listAttachmentSessionIds()).toEqual([]);
+  });
+
   it("reconciles the marker under a per-session cross-tab lock when the browser has one", async () => {
     const names: string[] = [];
     Object.defineProperty(navigator, "locks", {

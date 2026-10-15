@@ -64,11 +64,10 @@ export type Revision = readonly [clock: number, tabId: string];
 const TAB_ID = Math.random().toString(36).slice(2);
 let lastClock = 0;
 
-/** A revision strictly newer than any this tab issued before. The clock has sub-millisecond
- *  resolution so that revisions from different tabs practically never tie. */
+/** A revision strictly newer than any this tab issued before. The wall clock is what tabs share:
+ *  `performance.now()` stops during OS sleep, so a tab opened before a sleep would lag behind. */
 export function nextRevision(): Revision {
-  const now = typeof performance === "undefined" ? Date.now() : performance.timeOrigin + performance.now();
-  lastClock = Math.max(now, lastClock + 0.001);
+  lastClock = Math.max(Date.now(), lastClock + 0.001);
   return [lastClock, TAB_ID];
 }
 
@@ -148,6 +147,15 @@ export async function clearAttachments(sessionId: string, rev: Revision): Promis
   await mutate(sessionId, (store, current) => {
     if (current && compareRevisions(current.rev, rev) > 0) return;
     store.put(tombstone, sessionId);
+  });
+}
+
+/** Removes the record unless a revision newer than `upTo` is there: the fallback that still frees
+ *  the bytes when a tombstone does not fit. */
+export async function deleteAttachmentsUpTo(sessionId: string, upTo: Revision): Promise<void> {
+  await mutate(sessionId, (store, current) => {
+    if (current && compareRevisions(current.rev, upTo) > 0) return;
+    store.delete(sessionId);
   });
 }
 
