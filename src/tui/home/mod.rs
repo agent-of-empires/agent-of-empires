@@ -192,6 +192,7 @@ pub struct HomeView {
     pub(super) pending_repo_trust_data: Option<NewSessionData>,
     pub(super) hooks_install_dialog: Option<HooksInstallDialog>,
     pub(super) pending_hooks_install_data: Option<NewSessionData>,
+    pub(super) pending_hook_approval_creation: Option<crate::tui::creation_poller::CreationResult>,
     pub(super) volume_ignores_glob_dialog: Option<ConfirmDialog>,
     pub(super) pending_volume_ignores_glob_data: Option<NewSessionData>,
     pub(super) intro_dialog: Option<IntroDialog>,

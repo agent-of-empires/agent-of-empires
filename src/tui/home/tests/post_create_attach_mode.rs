@@ -81,7 +81,6 @@ fn sync_path_session_data(project: &str) -> crate::tui::dialogs::NewSessionData 
         worktree_enabled: false,
         worktree_branch: None,
         create_new_branch: false,
-        planned_worktree: None,
         base_branch: None,
         extra_repo_paths: Vec::new(),
         sandbox: false,

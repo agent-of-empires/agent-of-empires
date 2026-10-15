@@ -321,7 +321,6 @@ fn test_create_session_in_all_mode_is_findable() {
         tool: "claude".to_string(),
         worktree_enabled: false,
         worktree_branch: None,
-        planned_worktree: None,
         create_new_branch: false,
         base_branch: None,
         extra_repo_paths: Vec::new(),

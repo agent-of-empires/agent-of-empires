@@ -181,7 +181,6 @@ pub(crate) async fn spawn_structured_session(
             } else {
                 None
             },
-            planned_worktree: None,
             sandbox,
             sandbox_image,
             yolo_mode,

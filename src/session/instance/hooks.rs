@@ -1525,6 +1525,46 @@ mod tests {
             ]
         );
     }
+    #[test]
+    #[serial_test::serial]
+    fn omp_installer_uses_created_worktree_for_relative_agent_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _app = crate::session::test_support::isolate_app_dir_at(&tmp.path().join("app"));
+        let _home_guard = crate::session::test_support::isolate_home(tmp.path());
+        let _env = EnvGuard::unset(&crate::session::capture::OMP_STORE_ENV_KEYS[1..]);
+        let home = tmp.path().join("home");
+        let source = tmp.path().join("source");
+        let worktree = tmp.path().join("worktree");
+        for path in [&home, &source, &worktree] {
+            std::fs::create_dir_all(path).unwrap();
+        }
+        std::fs::write(source.join(".env"), "PI_CODING_AGENT_DIR=relative-agent\n").unwrap();
+        std::fs::write(
+            worktree.join(".env"),
+            "PI_CODING_AGENT_DIR=relative-agent\n",
+        )
+        .unwrap();
+        let profile = "omp-worktree-relative-dir";
+        write_profile(
+            profile,
+            &format!("environment = [\"HOME={}\"]\n", home.display()),
+        );
+        acknowledge_hooks();
+
+        let mut inst = hook_inst("omp");
+        inst.source_profile = profile.into();
+        inst.project_path = worktree.to_string_lossy().into_owned();
+        let agent = crate::agents::get_agent("omp");
+        assert!(inst.ensure_disclosed_host_hook_path(agent).is_ok());
+        inst.install_agent_status_hooks(agent, None);
+
+        assert!(worktree
+            .join("relative-agent/hooks/pre/aoe-status.ts")
+            .is_file());
+        assert!(!source
+            .join("relative-agent/hooks/pre/aoe-status.ts")
+            .exists());
+    }
 
     #[test]
     fn omp_profile_cli_disclosure_matches_launch_resolution() {

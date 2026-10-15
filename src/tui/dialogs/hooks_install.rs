@@ -56,7 +56,7 @@ impl HooksInstallDialog {
         ))
     }
 
-    fn from_disclosure(disclosure: crate::session::HostHookDisclosure) -> Self {
+    pub(crate) fn from_disclosure(disclosure: crate::session::HostHookDisclosure) -> Self {
         Self {
             settings_paths: disclosure.settings_paths,
             hook_commands: disclosure.hook_commands,
