@@ -1,11 +1,5 @@
 import { useCallback, useEffect, useRef, useState, type ReactNode } from "react";
-import {
-  fetchPluginUiState,
-  fetchPluginSessions,
-  invokePluginAction,
-  mintPluginPageTicket,
-  type PluginPage,
-} from "../../lib/api";
+import { fetchPluginUiState, fetchPluginSessions, invokePluginAction, mintPluginPageTicket } from "../../lib/api";
 import {
   BRIDGE_VERSION,
   bridgeError,
@@ -71,7 +65,9 @@ export function PluginPageView({ pluginId, pageId, onBack, readOnly, cityhall, t
   const pages = usePluginPages();
   const page = pages?.find((p) => p.plugin_id === pluginId && p.id === pageId);
   const [attempt, setAttempt] = useState(0);
-  const [minted, setMinted] = useState<{ page: PluginPage; attempt: number; ok: boolean; nonce: string } | null>(null);
+  // Keyed by URL, not the page object, which a poll replaces whenever any plugin's pages change.
+  const pageUrl = page?.url;
+  const [minted, setMinted] = useState<{ url: string; attempt: number; ok: boolean; nonce: string } | null>(null);
   const [lost, setLost] = useState(false);
   const frameRef = useRef<HTMLIFrameElement | null>(null);
   // A frame's second load is a new document behind the same window, so it no longer holds the handshake.
@@ -89,17 +85,17 @@ export function PluginPageView({ pluginId, pageId, onBack, readOnly, cityhall, t
 
   // The frame load authenticates with the ticket this sets, so mint before rendering it.
   useEffect(() => {
-    if (!page) return;
+    if (!pageUrl) return;
     let cancelled = false;
-    void mintPluginPageTicket(page).then((ok) => {
+    void mintPluginPageTicket(pageUrl).then((ok) => {
       if (cancelled) return;
       nonce.current = newNonce();
-      setMinted({ page, attempt, ok, nonce: nonce.current });
+      setMinted({ url: pageUrl, attempt, ok, nonce: nonce.current });
     });
     return () => {
       cancelled = true;
     };
-  }, [page, attempt]);
+  }, [pageUrl, attempt]);
 
   // Installed before the frame exists, so a page's handshake cannot beat it.
   useEffect(() => {
@@ -162,7 +158,7 @@ export function PluginPageView({ pluginId, pageId, onBack, readOnly, cityhall, t
     setAttempt((a) => a + 1);
   };
 
-  const ticket = page && minted?.page === page && minted.attempt === attempt ? minted : null;
+  const ticket = page && minted?.url === page.url && minted.attempt === attempt ? minted : null;
   let body = null;
   if (pages !== null && !page) {
     body = <Empty title="Page not found" detail={`No active plugin ${pluginId} declares a page ${pageId}.`} />;

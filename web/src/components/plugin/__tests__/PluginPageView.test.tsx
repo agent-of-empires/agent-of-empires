@@ -9,13 +9,13 @@ import { PluginPageView } from "../PluginPageView";
 
 const h = vi.hoisted(() => ({
   pages: null as PluginPage[] | null,
-  mint: vi.fn<(page: PluginPage) => Promise<boolean>>(),
+  mint: vi.fn<(url: string) => Promise<boolean>>(),
   sessions: vi.fn(),
   action: vi.fn(),
 }));
 vi.mock("../../../lib/pluginUiContext", () => ({ usePluginPages: () => h.pages }));
 vi.mock("../../../lib/api", () => ({
-  mintPluginPageTicket: (page: PluginPage) => h.mint(page),
+  mintPluginPageTicket: (url: string) => h.mint(url),
   fetchPluginSessions: (pluginId: string) => h.sessions(pluginId),
   fetchPluginUiState: vi.fn(),
   invokePluginAction: (...args: unknown[]) => h.action(...args),
@@ -85,7 +85,7 @@ describe("PluginPageView", () => {
     let resolve!: (ok: boolean) => void;
     h.mint.mockReturnValue(new Promise((r) => (resolve = r)));
     view();
-    expect(h.mint).toHaveBeenCalledWith(board);
+    expect(h.mint).toHaveBeenCalledWith(board.url);
     expect(screen.queryByTestId("plugin-page-frame")).toBeNull();
     resolve(true);
     const frame = await screen.findByTestId("plugin-page-frame");
@@ -171,13 +171,17 @@ describe("PluginPageView", () => {
     expect(screen.queryByTestId("plugin-page-frame")).toBeNull();
     fireEvent.click(screen.getByText("Reopen"));
     expect(h.mint).toHaveBeenCalledTimes(2);
-    expect(await screen.findByTestId("plugin-page-frame")).not.toBe(frame);
+    const reopened = await screen.findByTestId("plugin-page-frame");
+    expect(reopened).not.toBe(frame);
+    // A fresh frame's first load is not a reload.
+    fireEvent.load(reopened);
+    expect(screen.getByTestId("plugin-page-frame")).toBe(reopened);
   });
 
-  it("starts a remounted frame's load count afresh", async () => {
+  it("keeps the frame and its ticket when a poll replaces the page object", async () => {
     const { frame, rerender } = await openFrame();
     fireEvent.load(frame);
-    h.pages = [{ ...board }];
+    h.pages = [{ ...board, title: "Renamed" }];
     rerender(
       <PluginPageView
         pluginId="acme.kit"
@@ -188,13 +192,8 @@ describe("PluginPageView", () => {
         theme={null}
       />,
     );
-    const next = await waitFor(() => {
-      const f = screen.getByTestId("plugin-page-frame");
-      expect(f).not.toBe(frame);
-      return f;
-    });
-    fireEvent.load(next);
-    expect(screen.getByTestId("plugin-page-frame")).toBe(next);
+    expect(screen.getByTestId("plugin-page-frame")).toBe(frame);
+    expect(h.mint).toHaveBeenCalledTimes(1);
   });
 
   it("gates an open channel's requests on the current mode", async () => {

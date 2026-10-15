@@ -717,9 +717,9 @@ export function fetchPluginUiState(): Promise<PluginUiState | null> {
   return fetchJson<PluginUiState>("/api/plugins/ui-state");
 }
 
-/** Lets the next frame load of `page.url` authenticate when device binding is on; the ticket rides an HttpOnly cookie. */
-export async function mintPluginPageTicket(page: PluginPage): Promise<boolean> {
-  const reply = await send(`${page.url}/ticket`, { method: "POST" }).catch(() => null);
+/** Lets the next frame load of a page's `url` authenticate when device binding is on; the ticket rides an HttpOnly cookie. */
+export async function mintPluginPageTicket(url: string): Promise<boolean> {
+  const reply = await send(`${url}/ticket`, { method: "POST" }).catch(() => null);
   return reply?.ok ?? false;
 }
 
