@@ -426,7 +426,15 @@ mod tests {
         // Format: (desc substring, non-strict key, strict key).
         let cases = [
             ("Diff view", "D", "Ctrl+D"),
-            ("Web dashboard", "R", "Ctrl+R"),
+            (
+                if cfg!(feature = "web") {
+                    "Web dashboard"
+                } else {
+                    "Remote API access"
+                },
+                "R",
+                "Ctrl+R",
+            ),
             ("Attach to terminal", "T", "Ctrl+T"),
             ("New from selection", "N", "Ctrl+N"),
             ("Projects", "p", "P"),

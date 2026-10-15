@@ -797,10 +797,18 @@ pub static BINDINGS: &[Binding] = &[
         context: Context::Always,
         help: Some(HelpMeta {
             section: HelpSection::Other,
-            desc: "Web dashboard (browser / phone)",
+            desc: if cfg!(feature = "web") {
+                "Web dashboard (browser / phone)"
+            } else {
+                "Remote API access (LAN / Tunnel)"
+            },
         }),
         palette: Some(PaletteMeta {
-            title: "Open web dashboard (browser / phone)",
+            title: if cfg!(feature = "web") {
+                "Open web dashboard (browser / phone)"
+            } else {
+                "Open remote API access (LAN / Tunnel)"
+            },
             keywords: &[
                 "serve",
                 "web",

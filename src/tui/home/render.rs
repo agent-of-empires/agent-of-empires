@@ -4055,8 +4055,10 @@ impl HomeView {
             if strict { kctrl('d') } else { kc('D') },
             mk(if strict { "^D" } else { "D" }, "Diff"),
         ));
+        let mut serving_status = None;
         if !super::input::web_plugin_disabled() {
             let (priority, spans) = web_footer_entry(self.serve_running, strict, theme);
+            serving_status = self.serve_running.then_some(groups.len());
             groups.push((priority, if strict { kctrl('r') } else { kc('R') }, spans));
         }
         groups.push((1, kctrl('k'), mk("^K", "Cmds")));
@@ -4094,7 +4096,8 @@ impl HomeView {
             .saturating_sub(badge_reserve);
 
         let mut order: Vec<usize> = (0..groups.len()).collect();
-        order.sort_by_key(|&i| groups[i].0);
+        // The running server status packs before other priority-0 groups, so it is the last to drop.
+        order.sort_by_key(|&i| (groups[i].0, Some(i) != serving_status));
 
         let mut keep = vec![false; groups.len()];
         let mut used = 0usize;

@@ -162,6 +162,27 @@ fn live_send_banner_names_space_chords_and_hides_buttons() {
     assert!(screen.contains("Ctrl+Space:"), "{screen}");
 }
 
+/// The running server status outlasts the other priority-0 hints: at 48 columns with tips
+/// and a committed search, the search cue fills the space `?` would need, not the status.
+#[test]
+#[serial]
+fn running_web_status_survives_a_committed_search_on_a_narrow_footer() {
+    let mut env = create_test_env_with_sessions(3);
+    env.view.tips_unseen = 3;
+    for c in ['/', 's', 'e', 's', 's'] {
+        env.view.handle_key(key(KeyCode::Char(c)), None);
+    }
+    env.view.handle_key(key(KeyCode::Enter), None);
+    let shown = |env: &TestEnv, code| env.view.footer_buttons.iter().any(|(k, _)| k.code == code);
+    render_at(&mut env, 48, 12);
+    assert!(shown(&env, KeyCode::Char('n')), "search cue kept");
+    assert!(!shown(&env, KeyCode::Char('R')), "idle hint drops first");
+    env.view.serve_running = true;
+    render_at(&mut env, 48, 12);
+    assert!(shown(&env, KeyCode::Char('R')), "running status kept");
+    assert!(shown(&env, KeyCode::Enter), "Enter kept");
+}
+
 /// The web dashboard entry and New survive the narrow footers the bar is tuned for: with a
 /// tips badge showing, `R` (strict: Ctrl+R), New and Msg stay at 80 and 60 columns, and
 /// Fav, now below them, is the one that drops.
