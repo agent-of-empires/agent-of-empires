@@ -72,7 +72,7 @@ export function loadSettings(profile: string): void {
       publish(e, { settings: s });
     })
     .catch(() => {
-      if (current()) publish(e, { settings: null });
+      if (current()) publish(e, { error: "Could not refresh settings, please reload" });
     });
 }
 

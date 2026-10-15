@@ -81,6 +81,16 @@ describe("settings store", () => {
     await waitFor(() => expect(listOf(hook)).toEqual(["a", "b"]));
   });
 
+  it("keeps the loaded settings when a reconcile GET rejects", async () => {
+    const hook = await seed("main", ["a", "b"]);
+    vi.mocked(fetchSettings).mockRejectedValueOnce(new Error("offline"));
+    await act(async () => {
+      await saveField("main", "web", "list", ["b"], async () => "uncertain");
+    });
+    await waitFor(() => expect(hook.result.current.error).toBe("Could not refresh settings, please reload"));
+    expect(listOf(hook)).toEqual(["b"]);
+  });
+
   it("does not refetch after a committed save", async () => {
     await seed("main", ["a", "b"]);
     await act(async () => {
