@@ -356,7 +356,7 @@ impl AnchoredDir {
                 self.remove_file(&prev)?;
                 return Ok(true);
             }
-            let mut preserved = false;
+            let mut preserved = None;
             for attempt in 0..CONFLICT_NAME_ATTEMPTS {
                 let mut conflict = to_leaf.clone();
                 conflict.push(match attempt {
@@ -371,14 +371,16 @@ impl AnchoredDir {
                     AtFlags::empty(),
                 ) {
                     Ok(()) => {
-                        preserved = true;
+                        preserved = Some(conflict);
                         break;
                     }
                     Err(Errno::EEXIST) => {}
                     Err(error) => return Err(error).context("preserving the carried file"),
                 }
             }
-            anyhow::ensure!(preserved, "no free name to preserve the carried file under");
+            let Some(conflict) = preserved else {
+                bail!("no free name to preserve the carried file under");
+            };
             renameat(
                 &prev_parent,
                 prev_leaf.as_os_str(),
@@ -386,6 +388,13 @@ impl AnchoredDir {
                 to_leaf.as_os_str(),
             )
             .context("restoring anchored file")?;
+            tracing::warn!(
+                target: "session.store",
+                destination = %to.display(),
+                conflict = %conflict.to_string_lossy(),
+                "a writer changed the destination transcript during the carry; kept it \
+                 and saved the carried copy beside it"
+            );
             return Ok(false);
         }
         let published = match linkat(
