@@ -517,6 +517,28 @@ impl HomeView {
         touched
     }
 
+    pub fn request_serve_probe(&mut self) {
+        if !self.serve_probe_in_flight {
+            self.serve_probe_in_flight = true;
+            self.serve_probe.request(());
+        }
+    }
+
+    /// True when the badge changed.
+    pub fn apply_serve_probe(&mut self) -> bool {
+        match self.serve_probe.try_recv() {
+            Ok(badge) => {
+                self.serve_probe_in_flight = false;
+                std::mem::replace(&mut self.serve_badge, badge) != badge
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => false,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                self.serve_probe_in_flight = false;
+                false
+            }
+        }
+    }
+
     pub fn take_restarted_attaches(&mut self) -> Vec<String> {
         std::mem::take(&mut self.restarted_attaches)
     }

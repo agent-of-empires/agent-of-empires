@@ -3,7 +3,7 @@
 
 import { createContext, useContext, useMemo, useState, type ReactNode } from "react";
 import { usePluginUiState } from "../hooks/usePluginUiState";
-import type { PluginUiEntry } from "./api";
+import type { PluginPage, PluginUiEntry } from "./api";
 import { pluginAttentionSessionIds } from "./pluginUi";
 
 // Separate contexts so poll-driven flag and revision changes don't re-render every entry consumer.
@@ -12,6 +12,7 @@ const PluginUiAttentionContext = createContext<ReadonlySet<string>>(new Set());
 const PluginUiRefreshingContext = createContext(false);
 const PluginUiRevisionsContext = createContext<Record<string, Record<string, number>>>({});
 const PluginUiPokeContext = createContext<() => void>(() => {});
+const PluginUiPagesContext = createContext<PluginPage[] | null>(null);
 
 /** Every poll delivers fresh entries, so keep the previous set while its members are unchanged to spare dependents the recompute. */
 function useStableAttention(entries: PluginUiEntry[]): ReadonlySet<string> {
@@ -23,14 +24,16 @@ function useStableAttention(entries: PluginUiEntry[]): ReadonlySet<string> {
 }
 
 export function PluginUiProvider({ children }: { children: ReactNode }) {
-  const { entries, revisions, isRefreshing, poke } = usePluginUiState();
+  const { entries, revisions, pages, isRefreshing, poke } = usePluginUiState();
   const attention = useStableAttention(entries);
   return (
     <PluginUiEntriesContext.Provider value={entries}>
       <PluginUiAttentionContext.Provider value={attention}>
         <PluginUiRevisionsContext.Provider value={revisions}>
           <PluginUiPokeContext.Provider value={poke}>
-            <PluginUiRefreshingContext.Provider value={isRefreshing}>{children}</PluginUiRefreshingContext.Provider>
+            <PluginUiRefreshingContext.Provider value={isRefreshing}>
+              <PluginUiPagesContext.Provider value={pages}>{children}</PluginUiPagesContext.Provider>
+            </PluginUiRefreshingContext.Provider>
           </PluginUiPokeContext.Provider>
         </PluginUiRevisionsContext.Provider>
       </PluginUiAttentionContext.Provider>
@@ -61,4 +64,9 @@ export function usePluginUiRevision(pluginId: string, sessionId?: string): numbe
 /** Poll now and briefly boost the cadence so an action's result shows promptly. */
 export function usePluginUiPoke(): () => void {
   return useContext(PluginUiPokeContext);
+}
+
+/** Pages active plugins declare, `null` before the first poll; keeps its identity across polls while unchanged. */
+export function usePluginPages(): PluginPage[] | null {
+  return useContext(PluginUiPagesContext);
 }

@@ -491,6 +491,7 @@ impl Instance {
         } else {
             None
         };
+
         container_config::build_container_config(
             &self.project_path,
             sandbox,
@@ -500,7 +501,9 @@ impl Instance {
             )
             .with_selected_agent(selected_agent.as_deref())
             .with_credential_fold(fold),
-            self.is_yolo_mode(),
+            container_config::SandboxYolo {
+                enabled: self.is_yolo_mode(),
+            },
             &self.id,
             self.workspace_info.as_ref(),
             &self.source_profile,

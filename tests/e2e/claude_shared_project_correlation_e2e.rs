@@ -265,7 +265,7 @@ fn run_shared_project_correlation(test_name: &str, spec_a: SessionSpec, spec_b: 
 
     let mut h = TuiTestHarness::new_in_tmp(test_name);
     let claude_home = h.home_path().join(".claude");
-    h.set_env("CLAUDE_CONFIG_DIR", &claude_home.display().to_string());
+    h.set_env("CLAUDE_CONFIG_DIR", claude_home.as_os_str());
     install_claude_shim(&mut h);
 
     // Per-spec mtime reference files (only for specs that pin a jsonl mtime).

@@ -1839,6 +1839,19 @@
       "notes": "A plugin-supplied UI link's internal/external classification and path resolution (src/lib/pluginHref.ts) is unit-tested in src/lib/__tests__/pluginHref.test.ts; this covers the browser-level click behavior: an internal relative href navigates via the router (no full page load), a session-shaped href goes through the same session-selection flow a sidebar click uses, an external href opens a new tab, and a modified click is not intercepted."
     },
     {
+      "id": "plugins.pages",
+      "kind": "mocked-playwright",
+      "risk": "high",
+      "specs": ["tests/plugin-pages.spec.ts"],
+      "components": [
+        "web/src/components/plugin/PluginPagesMenu.tsx",
+        "web/src/components/plugin/PluginPageView.tsx",
+        "web/src/components/TopBar.tsx",
+        "web/src/App.tsx"
+      ],
+      "notes": "Pages menu and palette entries appear only with a declared page; the route hides the sidebar, mints a page ticket before framing, and Back pops history. A fixture page served under the daemon's page CSP proves the sandboxed frame cannot read storage, cookies or call the API. Mint ordering and empty states are also unit-tested in PluginPageView.test.tsx; the ticket's server side in src/server/api/plugins.rs."
+    },
+    {
       "id": "sidebar.plugin-row-slots",
       "kind": "mocked-playwright",
       "risk": "medium",
@@ -3055,7 +3068,8 @@
         "web/src/hooks/useAcpSession.ts",
         "web/src/hooks/acpSession/reducer.ts",
         "web/src/lib/acpTypes.ts"
-      ]
+      ],
+      "notes": "#4475: notice_timeout_secs is capped at 2147483 so its millisecond delay fits a browser setTimeout, and PromptStrips clamps the delay for older configs above the cap. SessionNoticesStrip.test.tsx covers the boundary: a timeout past the timer limit does not dismiss at once and fires only after the clamped delay."
     },
     {
       "id": "acp.queue-send-now",

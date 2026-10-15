@@ -62,13 +62,16 @@ pub async fn list_plugins() -> Json<serde_json::Value> {
     }))
 }
 
-/// Resolve a plugin's declared `icon_asset` against its install directory,
-/// refusing anything outside it. Both `dir` and the joined path are
-/// canonicalized so a symlink or `..` segment cannot escape. Takes the
-/// already-loaded `dir`/`rel` rather than touching the registry, so it stays
-/// testable without a running plugin host.
-fn resolve_plugin_icon_path(dir: &std::path::Path, rel: &str) -> Option<PathBuf> {
-    if !aoe_plugin_api::screenshot_path_ok(rel) {
+/// Resolve a declared plugin file (`icon_asset`, page `entry`) against its
+/// install directory, refusing anything that fails `shape_ok` or lands outside
+/// it. Both `dir` and the joined path are canonicalized so a symlink or `..`
+/// segment cannot escape.
+fn resolve_plugin_file(
+    dir: &std::path::Path,
+    rel: &str,
+    shape_ok: fn(&str) -> bool,
+) -> Option<PathBuf> {
+    if !shape_ok(rel) {
         return None;
     }
     let root = dir.canonicalize().ok()?;
@@ -104,7 +107,10 @@ pub async fn serve_plugin_icon(Path(id): Path<String>) -> Response {
         return StatusCode::NOT_FOUND.into_response();
     };
 
-    let resolved = tokio::task::spawn_blocking(move || resolve_plugin_icon_path(&dir, &rel)).await;
+    let resolved = tokio::task::spawn_blocking(move || {
+        resolve_plugin_file(&dir, &rel, aoe_plugin_api::screenshot_path_ok)
+    })
+    .await;
     let path = match resolved {
         Ok(Some(p)) => p,
         _ => return StatusCode::NOT_FOUND.into_response(),
@@ -128,6 +134,111 @@ pub async fn serve_plugin_icon(Path(id): Path<String>) -> Response {
         bytes,
     )
         .into_response()
+}
+
+/// Page policy from ADR 0005: only the bundle's own inline script and style run,
+/// and only the dashboard may frame it. `sandbox` gives the document an opaque
+/// origin even on a direct visit, not only inside the dashboard's iframe.
+const PLUGIN_PAGE_CSP: &str = "sandbox allow-scripts; default-src 'none'; \
+    script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src data: blob:; \
+    connect-src 'none'; form-action 'none'; base-uri 'none'; frame-ancestors 'self'";
+
+fn plugin_page_response(bytes: Vec<u8>) -> Response {
+    (
+        StatusCode::OK,
+        [
+            (axum::http::header::CONTENT_TYPE, "text/html; charset=utf-8"),
+            (axum::http::header::CACHE_CONTROL, "private, no-store"),
+            (axum::http::header::CONTENT_SECURITY_POLICY, PLUGIN_PAGE_CSP),
+            (axum::http::header::X_FRAME_OPTIONS, "SAMEORIGIN"),
+        ],
+        bytes,
+    )
+        .into_response()
+}
+
+/// `GET /api/plugins/{id}/pages/{page_id}`: the declared `entry` HTML of an
+/// active plugin's page. Anything undeclared, missing or escaping 404s.
+pub async fn serve_plugin_page(
+    Path((id, page_id)): Path<(String, String)>,
+    uri: axum::http::Uri,
+    headers: axum::http::HeaderMap,
+) -> Response {
+    // Second layer behind the CSP `sandbox`: never hand executable HTML to a tab.
+    if headers.get("sec-fetch-dest").and_then(|v| v.to_str().ok()) != Some("iframe") {
+        return api_error(
+            StatusCode::FORBIDDEN,
+            "frame_only",
+            "Plugin pages load only inside the dashboard frame",
+        );
+    }
+    // Page script can read its own URL, so a `?token=` must never reach it.
+    if uri.query().is_some() {
+        return api_error(
+            StatusCode::BAD_REQUEST,
+            "query_not_allowed",
+            "Plugin page URLs take no query string",
+        );
+    }
+    let registry = plugin::registry();
+    let Some(plugin) = registry.active().find(|p| p.id() == id) else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let (Some(dir), Some(rel)) = (
+        plugin.dir.clone(),
+        plugin.manifest.page_entry(&page_id).map(str::to_string),
+    ) else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let resolved = tokio::task::spawn_blocking(move || {
+        resolve_plugin_file(&dir, &rel, aoe_plugin_api::page_entry_path_ok)
+    })
+    .await;
+    let Ok(Some(path)) = resolved else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    match tokio::fs::read(&path).await {
+        Ok(bytes) => plugin_page_response(bytes),
+        Err(_) => StatusCode::NOT_FOUND.into_response(),
+    }
+}
+
+/// `POST /api/plugins/{id}/pages/{page_id}/ticket`: before framing a page, the dashboard
+/// lets a device-bound session hand that frame load a short-lived, page-scoped cookie, since
+/// a frame navigation cannot carry the binding header. Without a login session the frame
+/// authenticates as any other request and no cookie is set.
+pub async fn mint_plugin_page_ticket(
+    State(state): State<std::sync::Arc<AppState>>,
+    Path((id, page_id)): Path<(String, String)>,
+    session: Option<axum::Extension<AuthenticatedSession>>,
+) -> Response {
+    let declared = plugin::registry()
+        .active()
+        .any(|p| p.id() == id && p.manifest.page_entry(&page_id).is_some());
+    if !declared {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    let mut response = (
+        StatusCode::NO_CONTENT,
+        [(axum::http::header::CACHE_CONTROL, "no-store")],
+    )
+        .into_response();
+    if let Some(axum::Extension(AuthenticatedSession(session_id))) = session {
+        let ticket = state
+            .login_manager
+            .mint_page_ticket(&session_id, &id, &page_id)
+            .await;
+        let cookie = crate::server::login::build_page_ticket_cookie(
+            &ticket,
+            &plugin::view::page_url(&id, &page_id),
+            state.behind_tunnel,
+        );
+        response.headers_mut().append(
+            axum::http::header::SET_COOKIE,
+            cookie.parse().expect("manifest ids are header-safe"),
+        );
+    }
+    response
 }
 
 /// One active plugin command, normalized for the dashboard command palette and
@@ -176,20 +287,27 @@ pub async fn plugin_commands() -> Json<serde_json::Value> {
 }
 
 /// `GET /api/plugins/ui-state`: the plugin host's aggregated UI-state snapshot
-/// plus the notification ring. Empty when no host is running.
+/// plus the notification ring, and the pages active plugins declare. The
+/// snapshot is empty when no host is running.
 pub async fn plugin_ui_state(
     State(state): State<std::sync::Arc<AppState>>,
 ) -> Json<serde_json::Value> {
+    let pages: Vec<_> = plugin::registry()
+        .active()
+        .flat_map(|p| p.pages())
+        .collect();
     let empty = || json!({ "entries": [], "notifications": [] });
-    match state.plugin_host.as_ref().map(|h| h.ui_snapshot()) {
-        Some(snapshot) => Json(serde_json::to_value(snapshot).unwrap_or_else(|e| {
+    let mut body = match state.plugin_host.as_ref().map(|h| h.ui_snapshot()) {
+        Some(snapshot) => serde_json::to_value(snapshot).unwrap_or_else(|e| {
             // Serializing the snapshot should never fail; keep the response
             // shape stable rather than returning JSON null if it does.
             tracing::warn!(target: "serve.api", "failed to serialize plugin UI snapshot: {e}");
             empty()
-        })),
-        None => Json(empty()),
-    }
+        }),
+        None => empty(),
+    };
+    body["pages"] = json!(pages);
+    Json(body)
 }
 
 /// `GET /api/plugins/updates`: which installed external plugins have an update.
@@ -918,30 +1036,138 @@ mod tests {
     }
 
     #[test]
-    fn resolve_plugin_icon_path_confines_to_the_install_dir() {
+    fn resolve_plugin_file_confines_to_the_install_dir() {
+        use aoe_plugin_api::{page_entry_path_ok, screenshot_path_ok};
         let root = tempfile::tempdir().unwrap();
         let dir = root.path().join("plugin");
-        std::fs::create_dir(&dir).unwrap();
-        for file in ["plugin/icon.png", "plugin/icon.svg", "secret.png"] {
+        std::fs::create_dir_all(dir.join("dist")).unwrap();
+        for file in [
+            "plugin/icon.png",
+            "plugin/icon.svg",
+            "plugin/dist/page.html",
+            "secret.png",
+            "secret.html",
+        ] {
             std::fs::write(root.path().join(file), b"x").unwrap();
         }
         std::os::unix::fs::symlink(root.path().join("secret.png"), dir.join("link.png")).unwrap();
+        std::os::unix::fs::symlink(root.path().join("secret.html"), dir.join("link.html")).unwrap();
+        let canon = dir.canonicalize().unwrap();
         assert_eq!(
-            resolve_plugin_icon_path(&dir, "icon.png"),
-            Some(dir.canonicalize().unwrap().join("icon.png"))
+            resolve_plugin_file(&dir, "icon.png", screenshot_path_ok),
+            Some(canon.join("icon.png"))
         );
-        // `icon.svg` exists inside but fails the shape check; `link.png` passes
-        // it and escapes through a symlink, so each guard is pinned alone.
-        for bad in [
-            "../secret.png",
-            "/etc/passwd.png",
-            "icon.svg",
-            "link.png",
-            "missing.png",
-        ] {
+        assert_eq!(
+            resolve_plugin_file(&dir, "dist/page.html", page_entry_path_ok),
+            Some(canon.join("dist/page.html"))
+        );
+        // Each bad path trips one guard alone: shape, symlink escape or absence.
+        let cases: [(&str, fn(&str) -> bool); 9] = [
+            ("../secret.png", screenshot_path_ok),
+            ("/etc/passwd.png", screenshot_path_ok),
+            ("icon.svg", screenshot_path_ok),
+            ("link.png", screenshot_path_ok),
+            ("missing.png", screenshot_path_ok),
+            ("../secret.html", page_entry_path_ok),
+            ("link.html", page_entry_path_ok),
+            ("icon.png", page_entry_path_ok),
+            ("missing.html", page_entry_path_ok),
+        ];
+        for (bad, shape_ok) in cases {
             assert!(
-                resolve_plugin_icon_path(&dir, bad).is_none(),
+                resolve_plugin_file(&dir, bad, shape_ok).is_none(),
                 "{bad:?} should not resolve"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn only_the_plugin_page_relaxes_the_global_frame_policy() {
+        use tower::ServiceExt;
+        let app = axum::Router::new()
+            .route(
+                "/page",
+                axum::routing::get(|| async { plugin_page_response(b"<p>hi</p>".to_vec()) }),
+            )
+            .route("/other", axum::routing::get(|| async { "ok" }))
+            .layer(axum::middleware::from_fn(
+                crate::server::access::security_headers,
+            ));
+        let cases = [
+            (
+                "/page",
+                "sandbox allow-scripts; default-src 'none'; script-src 'unsafe-inline'; \
+                 style-src 'unsafe-inline'; img-src data: blob:; connect-src 'none'; \
+                 form-action 'none'; base-uri 'none'; frame-ancestors 'self'",
+                "SAMEORIGIN",
+            ),
+            ("/other", crate::server::access::CSP, "DENY"),
+        ];
+        for (path, csp, frame_options) in cases {
+            let req = axum::http::Request::get(path)
+                .body(axum::body::Body::empty())
+                .unwrap();
+            let resp = app.clone().oneshot(req).await.unwrap();
+            let header = |name| resp.headers().get(name).unwrap().to_str().unwrap();
+            assert_eq!(header("content-security-policy"), csp, "{path}");
+            assert_eq!(header("x-frame-options"), frame_options, "{path}");
+        }
+        let req = axum::http::Request::get("/page")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        let header = |name| resp.headers().get(name).unwrap().to_str().unwrap();
+        assert_eq!(header("content-type"), "text/html; charset=utf-8");
+        assert_eq!(header("cache-control"), "private, no-store");
+    }
+
+    #[tokio::test]
+    async fn plugin_page_is_served_only_to_a_query_free_frame_load() {
+        use tower::ServiceExt;
+        let state = crate::server::test_support::build_test_app_state_with_policy(
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Some("secret-token".to_string()),
+        );
+        let app = crate::server::test_support::build_router_for_test(state);
+        let cookie = Some("aoe_token=secret-token");
+        let frame = Some("iframe");
+        // NOT_FOUND means every guard passed and only the plugin is unknown.
+        let cases = [
+            ("?token=secret-token", None, frame, StatusCode::BAD_REQUEST),
+            (
+                "?token=secret-token",
+                cookie,
+                frame,
+                StatusCode::BAD_REQUEST,
+            ),
+            ("", cookie, frame, StatusCode::NOT_FOUND),
+            ("", cookie, Some("document"), StatusCode::FORBIDDEN),
+            ("", cookie, None, StatusCode::FORBIDDEN),
+            ("?token=wrong", None, frame, StatusCode::UNAUTHORIZED),
+        ];
+        for (query, cookie, dest, want) in cases {
+            let mut req =
+                axum::http::Request::get(format!("/api/plugins/acme.absent/pages/board{query}"))
+                    .header("host", "127.0.0.1");
+            if let Some(c) = cookie {
+                req = req.header("cookie", c);
+            }
+            if let Some(d) = dest {
+                req = req.header("sec-fetch-dest", d);
+            }
+            let mut req = req.body(axum::body::Body::empty()).unwrap();
+            req.extensions_mut()
+                .insert(axum::extract::ConnectInfo(std::net::SocketAddr::from((
+                    [203, 0, 113, 7],
+                    5555,
+                ))));
+            let resp = app.clone().oneshot(req).await.unwrap();
+            assert_eq!(
+                resp.status(),
+                want,
+                "{query} cookie={cookie:?} dest={dest:?}"
             );
         }
     }
@@ -1024,6 +1250,206 @@ id = "voice"
         std::fs::create_dir_all(&dir).expect("create plugin dir");
         std::fs::write(dir.join("aoe-plugin.toml"), &manifest).expect("write manifest");
         PluginManifest::hash_bytes(manifest.as_bytes())
+    }
+
+    /// Install each `(id, granted)` plugin declaring `pages`, each served as `<p>{id}</p>`.
+    fn install_page_plugins(plugins: &[(&str, bool)], pages: &[&str]) {
+        let mut config = Config::default();
+        for &(id, granted) in plugins {
+            let mut manifest =
+                format!("id = \"{id}\"\nname = \"Board\"\nversion = \"1.0.0\"\napi_version = 16\n");
+            let dir = crate::plugin::plugins_dir().unwrap().join(id);
+            std::fs::create_dir_all(dir.join("dist")).unwrap();
+            for page in pages {
+                manifest.push_str(&format!(
+                    "\n[[ui]]\nslot = \"page\"\nid = \"{page}\"\ntitle = \"Board\"\nentry = \"dist/{page}.html\"\n"
+                ));
+                std::fs::write(
+                    dir.join(format!("dist/{page}.html")),
+                    format!("<p>{id}</p>"),
+                )
+                .unwrap();
+            }
+            std::fs::write(dir.join("aoe-plugin.toml"), &manifest).unwrap();
+            if granted {
+                config.plugins.insert(
+                    id.to_string(),
+                    PluginConfig {
+                        grant: Some(CapabilityGrant {
+                            manifest_hash: PluginManifest::hash_bytes(manifest.as_bytes()),
+                            capabilities: Vec::new(),
+                            granted_at: chrono::Utc::now(),
+                        }),
+                        ..PluginConfig::default()
+                    },
+                );
+            }
+        }
+        update_config(|c| *c = config).expect("save config");
+        crate::plugin::reload_registry();
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_device_bound_frame_loads_its_page_only_through_a_page_ticket() {
+        use base64::Engine;
+        use tower::ServiceExt;
+        let _app_dir = AppDirEnvGuard::new();
+        install_page_plugins(&[("acme.board", true)], &["board", "notes"]);
+
+        let mut state = crate::server::test_support::build_test_app_state_with_policy(
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Some("secret-token".to_string()),
+        );
+        std::sync::Arc::get_mut(&mut state)
+            .expect("fresh state")
+            .login_manager =
+            std::sync::Arc::new(crate::server::login::LoginManager::new(Some("pw")));
+        let login = std::sync::Arc::clone(&state.login_manager);
+        let binding = [7u8; 32];
+        let session = login.create_session(&binding, "203.0.113.7", "t").await;
+        let binding = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(binding);
+        let app = crate::server::test_support::build_router_for_test(state);
+        let send =
+            |method: &str, path: &str, cookie: String, bound: bool| {
+                let mut req = axum::http::Request::builder()
+                    .method(method)
+                    .uri(path)
+                    .header("host", "127.0.0.1")
+                    .header("cookie", cookie)
+                    .header("sec-fetch-dest", "iframe");
+                if bound {
+                    req = req.header("x-aoe-device-binding", &binding);
+                }
+                let mut req = req.body(axum::body::Body::empty()).unwrap();
+                req.extensions_mut().insert(axum::extract::ConnectInfo(
+                    std::net::SocketAddr::from(([203, 0, 113, 7], 5555)),
+                ));
+                app.clone().oneshot(req)
+            };
+        let board = "/api/plugins/acme.board/pages/board";
+        let base = format!("aoe_token=secret-token; aoe_session={session}");
+
+        let resp = send("GET", board, base.clone(), false).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED, "no ticket");
+        let resp = send("POST", &format!("{board}/ticket"), base.clone(), false)
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED, "unbound mint");
+        let resp = send(
+            "POST",
+            "/api/plugins/acme.board/pages/absent/ticket",
+            base.clone(),
+            true,
+        )
+        .await
+        .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND, "undeclared page");
+
+        let resp = send("POST", &format!("{board}/ticket"), base.clone(), true)
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+        let set_cookie = resp
+            .headers()
+            .get_all("set-cookie")
+            .iter()
+            .map(|v| v.to_str().unwrap().to_string())
+            .find(|c| c.starts_with("aoe_page_ticket="))
+            .expect("ticket cookie");
+        for attr in [
+            "HttpOnly",
+            "SameSite=Strict",
+            &format!("Path={board};"),
+            "Max-Age=60",
+        ] {
+            assert!(set_cookie.contains(attr), "{set_cookie} lacks {attr}");
+        }
+        let ticket = set_cookie.split(';').next().unwrap().to_string();
+        let with_ticket = format!("{base}; {ticket}");
+
+        let resp = send("GET", board, with_ticket.clone(), false)
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "ticketed frame load");
+        for path in [
+            "/api/plugins/acme.board/pages/notes",
+            "/api/plugins/ui-state",
+        ] {
+            let resp = send("GET", path, with_ticket.clone(), false).await.unwrap();
+            assert_eq!(resp.status(), StatusCode::UNAUTHORIZED, "{path}");
+        }
+
+        login.invalidate_session(&session).await;
+        let resp = send("GET", board, with_ticket, false).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED, "after logout");
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn an_active_plugins_page_is_delivered_through_the_real_route() {
+        use tower::ServiceExt;
+        let _app_dir = AppDirEnvGuard::new();
+        // `acme.idle` is installed but never granted, so it is inactive.
+        install_page_plugins(&[("acme.board", true), ("acme.idle", false)], &["board"]);
+
+        let state = crate::server::test_support::build_test_app_state_with_policy(
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Some("secret-token".to_string()),
+        );
+        let app = crate::server::test_support::build_router_for_test(state);
+        let get =
+            |path: &str| {
+                let mut req = axum::http::Request::get(path)
+                    .header("host", "127.0.0.1")
+                    .header("cookie", "aoe_token=secret-token")
+                    .header("sec-fetch-dest", "iframe")
+                    .body(axum::body::Body::empty())
+                    .unwrap();
+                req.extensions_mut().insert(axum::extract::ConnectInfo(
+                    std::net::SocketAddr::from(([203, 0, 113, 7], 5555)),
+                ));
+                app.clone().oneshot(req)
+            };
+
+        let resp = get("/api/plugins/acme.board/pages/board").await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let header = |name| {
+            resp.headers()
+                .get(name)
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .to_string()
+        };
+        assert_eq!(header("content-security-policy"), PLUGIN_PAGE_CSP);
+        assert_eq!(header("x-frame-options"), "SAMEORIGIN");
+        assert_eq!(header("content-type"), "text/html; charset=utf-8");
+        let body = axum::body::to_bytes(resp.into_body(), 1024).await.unwrap();
+        assert_eq!(&body[..], b"<p>acme.board</p>");
+
+        let resp = get("/api/plugins/acme.idle/pages/board").await.unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+
+        let resp = get("/api/plugins/ui-state").await.unwrap();
+        let body = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let state: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            state["pages"],
+            json!([{
+                "plugin_id": "acme.board",
+                "id": "board",
+                "title": "Board",
+                "icon": null,
+                "url": "/api/plugins/acme.board/pages/board",
+            }])
+        );
     }
 
     #[test]

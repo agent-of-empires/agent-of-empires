@@ -427,6 +427,11 @@ impl HomeView {
             confirm_before_quit,
             host_tab_title,
             active_tui_count: 1,
+            serve_badge: None,
+            serve_probe: crate::tui::worker::Worker::spawn("aoe-serve-probe", |()| {
+                crate::cli::serve::serve_badge()
+            }),
+            serve_probe_in_flight: false,
             idle_decay_window,
             settings_view: None,
             settings_close_confirm: false,

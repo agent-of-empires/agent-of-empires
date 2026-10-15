@@ -1,6 +1,6 @@
 import type { CommandActionGroup } from "./types";
 
-export const GROUP_ORDER: CommandActionGroup[] = ["Actions", "Sessions", "Conversations", "Settings"];
+export const GROUP_ORDER: CommandActionGroup[] = ["Actions", "Sessions", "Conversations", "Pages", "Settings"];
 
 export type PaletteTab = "All" | CommandActionGroup;
 

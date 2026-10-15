@@ -548,22 +548,22 @@ pub fn read_serve_urls() -> Vec<ServeUrl> {
     out
 }
 
-pub fn cached_serve_mode_label() -> Option<&'static str> {
+/// Spawns `ps` to verify the daemon, so keep it off the render path.
+pub fn serve_badge() -> Option<Option<&'static str>> {
     static CACHE: Mutex<Option<(u32, Option<&'static str>)>> = Mutex::new(None);
 
     let pid = daemon_pid()?;
-    if let Ok(mut guard) = CACHE.lock() {
-        if let Some((cached_pid, cached_label)) = *guard {
-            if cached_pid == pid {
-                return cached_label;
-            }
+    let Ok(mut guard) = CACHE.lock() else {
+        return Some(read_serve_mode_label());
+    };
+    if let Some((cached_pid, cached_label)) = *guard {
+        if cached_pid == pid {
+            return Some(cached_label);
         }
-        let label = read_serve_mode_label();
-        *guard = Some((pid, label));
-        label
-    } else {
-        read_serve_mode_label()
     }
+    let label = read_serve_mode_label();
+    *guard = Some((pid, label));
+    Some(label)
 }
 
 fn read_serve_mode_label() -> Option<&'static str> {

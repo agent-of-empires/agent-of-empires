@@ -33,8 +33,8 @@ use layout::*;
 
 pub(crate) use container::{omp_poll_fn_sandboxed, try_capture_omp_session_id_in_container};
 pub(crate) use layout::{
-    host_launcher_environment, omp_host_routing_environment, read_container_environment,
-    resolve_omp_store_layout, resolve_omp_store_layout_in_container_with_environment,
+    omp_host_routing_environment, read_container_environment, resolve_omp_store_layout,
+    resolve_omp_store_layout_in_container_with_environment,
     resolve_omp_store_layout_with_environment,
 };
 pub(crate) use options::{reject_omp_secret_args, OmpCliCaptureOptions};

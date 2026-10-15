@@ -283,6 +283,8 @@ pub(super) const CITYHALL_MUTATION_ALLOW: &[(&str, &str)] = &[
     ("PATCH", "/api/profiles/{name}/settings"),
     ("PATCH", "/api/theme"),
     ("POST", "/api/plugins/{id}/settings/options/resolve"),
+    // Lets a page frame load authenticate; grants nothing beyond rendering it.
+    ("POST", "/api/plugins/{id}/pages/{page_id}/ticket"),
     // Telemetry consent (its own surface, still prompted).
     ("POST", "/api/telemetry/consent"),
     ("POST", "/api/telemetry/seen"),
@@ -421,10 +423,15 @@ pub(super) async fn security_headers(
 ) -> axum::response::Response {
     let mut response = next.run(request).await;
     let headers = response.headers_mut();
-    headers.insert("x-frame-options", "DENY".parse().unwrap());
+    // The plugin page route sets its own frame and content policy.
+    headers
+        .entry("x-frame-options")
+        .or_insert("DENY".parse().unwrap());
     headers.insert("x-content-type-options", "nosniff".parse().unwrap());
     headers.insert("referrer-policy", "no-referrer".parse().unwrap());
-    headers.insert("content-security-policy", CSP.parse().unwrap());
+    headers
+        .entry("content-security-policy")
+        .or_insert(CSP.parse().unwrap());
     response
 }
 

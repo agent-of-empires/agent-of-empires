@@ -8,7 +8,7 @@ A manifest carries two independent version axes.
 
 | Key | Meaning |
 |---|---|
-| `api_version` | The manifest *schema* version. The current schema is `15`. The host rejects a manifest whose `api_version` is newer than it supports. |
+| `api_version` | The manifest *schema* version. The current schema is `16`. The host rejects a manifest whose `api_version` is newer than it supports. |
 | `aoe_version` | A semver requirement on the *host app* version, e.g. `">=1.11.0, <2.0.0"`. The host refuses to install, and skips loading, a plugin whose requirement excludes the running version. Optional; requires `api_version >= 4`. |
 
 Each key below notes the `api_version` it needs. Target the newest schema your plugin uses, and set `aoe_version` to the host range you have tested.
@@ -30,7 +30,7 @@ capabilities = ["runtime.worker"]
 | `id` | string | yes | Plugin id (see [Plugin id](#plugin-id)). Namespaces config, events, and action names. |
 | `name` | string | yes | Human-readable display name. |
 | `version` | string | yes | Semantic version of the plugin. |
-| `api_version` | integer | yes | Manifest schema version, `1` to `15`. |
+| `api_version` | integer | yes | Manifest schema version, `1` to `16`. |
 | `description` | string | no | Shown in plugin listings. Defaults to empty. |
 | `aoe_version` | string | no | Host-app semver requirement. Requires `api_version >= 4`. |
 | `capabilities` | array of string | no | Runtime grants the worker needs (see [Capabilities](#capabilities)). Static contributions need none. |
@@ -285,7 +285,7 @@ Quotas per plugin: 64 keys, 256-byte keys, 64 KiB values. `cas` (compare-and-swa
 
 ## UI slots
 
-Declares the host-rendered slots the worker pushes state into via the `ui.state.set` host RPC.
+Declares the host-rendered slots the worker pushes state into via the `ui.state.set` host RPC, and the plugin's pages.
 
 ```toml
 [[ui]]
@@ -297,6 +297,9 @@ id = "my_pane"
 |---|---|---|---|
 | `slot` | string | yes | One of the slot names below. Unknown slots are rejected. |
 | `id` | string | no | Addressing id for `(slot, id)` state pushes. Required to be non-empty when a command `action` targets it. |
+| `title` | string | page only | Page name shown in the dashboard. Required on a `page`. |
+| `icon` | string | no | Page only. A [lucide](https://lucide.dev/icons/) kebab-case icon name. |
+| `entry` | string | page only | Plugin-relative path to the page's `.html` file. Required on a `page`. See [Pages](#pages). |
 
 | Slot | Scope | Renders |
 |---|---|---|
@@ -310,7 +313,27 @@ id = "my_pane"
 | `pane` | per-session | A dockable tool-window pane (requires `api_version >= 3`). See [Pane payload](#pane-payload). |
 | `home-pane` | global | A host-wide docked pane on the dashboard overview and the structured-view pane overlay, carrying the same block vocabulary as `pane` but session-less (requires `api_version >= 13`). Several plugins' home panes stack in snapshot order. |
 | `composer-action` | per-session | A button beside the ACP composer controls (requires `api_version >= 8`). |
+| `page` | global | A full dashboard view rendered from a plugin HTML file (requires `api_version >= 16`). Optional pushed state is opaque to the host. See [Pages](#pages). |
 | `notification` | n/a | A transient notification pushed via `ui.notify`; gated by the `notifications` capability, not a slot declaration. |
+
+### Pages
+
+```toml
+[[ui]]
+slot = "page"
+id = "board"
+title = "Board"
+icon = "kanban"
+entry = "dist/board.html"
+```
+
+A page `id` uses only letters, digits, `-` and `_`, and is unique among the plugin's pages. `entry` follows the [screenshot path rules](#screenshots) with an `.html` extension and must resolve inside the plugin directory. A plugin may declare several pages.
+
+The entry must be one self-contained file: inline every script and style, and embed images as `data:` or `blob:` URLs. The host serves only that file, at `GET /api/plugins/{id}/pages/{page_id}` for an active plugin, uncached. Its policy sandboxes the document (`sandbox allow-scripts`), so it gets an opaque origin even when the URL is opened directly, runs the inline script and style and `data:`/`blob:` images, and blocks every other resource load, connection and form submission. As a second layer, the URL serves only a frame load (`Sec-Fetch-Dest: iframe`) with no query string, and only the dashboard may frame it.
+
+The dashboard opens a page at `/plugins/{id}/{page_id}` in an iframe with `sandbox="allow-scripts"` and nothing else. The page cannot read dashboard storage or cookies, call the API, submit forms, open windows or navigate the dashboard; its only data path is the bridge. A page that reloads itself more than 60 seconds after opening loses its authentication when device binding is on; reopen it from the dashboard instead.
+
+A worker may push state for a page with `ui.state.set` (`slot = "page"`, `id` = the page id, no `session_id`). The payload is any JSON object up to 64 KiB, stored unvalidated; `ui.state.remove` clears it. It appears in `GET /api/plugins/ui-state` as a global entry, `{ "plugin_id", "slot": "page", "id", "payload" }`. The page itself cannot read it yet; frame access arrives with the bridge (#4461).
 
 ### Badge payload
 

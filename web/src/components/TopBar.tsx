@@ -4,6 +4,7 @@ import { PaletteTriggerPill } from "./PaletteTriggerPill";
 import { OverflowMenu, type OverflowItem } from "./OverflowMenu";
 import { TOUR_ANCHORS, tourAnchor } from "../lib/tourSteps";
 import { PluginStatusBarSegments } from "./plugin/PluginSlots";
+import { PluginPagesMenu } from "./plugin/PluginPagesMenu";
 import { ActivityBar } from "./ActivityBar";
 import type { PaneDisplay } from "./Dock";
 import { useWebSettings } from "../hooks/useWebSettings";
@@ -225,6 +226,7 @@ export function TopBar({
           </>
         )}
 
+        <PluginPagesMenu />
         <OverflowMenu items={overflowItems} triggerDataTour={TOUR_ANCHORS.topbarMore} />
       </div>
     </header>

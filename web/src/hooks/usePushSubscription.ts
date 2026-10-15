@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useEffect, useSyncExternalStore } from "react";
 import { isIOS, isStandalone } from "../lib/platform";
 import {
   classifyPushHealth,
@@ -111,169 +111,211 @@ function base64UrlToUint8Array(b64: string): Uint8Array<ArrayBuffer> {
   return out;
 }
 
-export function usePushSubscription() {
-  const [state, setState] = useState<PushState>({ kind: "loading" });
-  const [health, setHealth] = useState<PushHealth>("unknown");
-  // A visibility refresh must not overwrite the state of an action in flight.
-  const busy = useRef(false);
+interface Snapshot {
+  state: PushState;
+  health: PushHealth;
+}
 
-  const refresh = useCallback(async () => {
-    const unsupported = unsupportedState();
-    if (unsupported) {
-      setHealth("unknown");
-      return setState(unsupported);
+const INITIAL: Snapshot = { state: { kind: "loading" }, health: "unknown" };
+
+// One store shared by every mounted consumer, so the banner and the settings
+// panel converge without a remount. It resets when the last consumer unmounts.
+let snapshot = INITIAL;
+const listeners = new Set<() => void>();
+// A refresh must not run over an action in flight, and actions do not overlap.
+let busy = false;
+// Bumped by every refresh and action; writes from an older generation are dropped.
+let generation = 0;
+
+function subscribe(listener: () => void) {
+  listeners.add(listener);
+  return () => {
+    listeners.delete(listener);
+    if (listeners.size === 0) {
+      generation++;
+      busy = false;
+      snapshot = INITIAL;
     }
+  };
+}
+
+function publish(gen: number, next: Partial<Snapshot>) {
+  if (gen !== generation) return;
+  snapshot = { ...snapshot, ...next };
+  listeners.forEach((l) => l());
+}
+
+async function refresh() {
+  if (busy) return;
+  const gen = ++generation;
+  const live = () => gen === generation;
+  const unsupported = unsupportedState();
+  if (unsupported) return publish(gen, { state: unsupported, health: "unknown" });
+  try {
+    const perm = Notification.permission;
+    const sub = await currentSubscription();
+    if (!live()) return;
+    let status: PushStatus;
     try {
-      const perm = Notification.permission;
-      const sub = await currentSubscription();
-      let status: PushStatus;
-      try {
-        status = await fetchStatus(sub?.endpoint);
-      } catch {
-        if (busy.current) return;
-        if (perm === "granted" && sub) writePushWanted(true);
-        if (perm === "denied") setState({ kind: "denied" });
-        else setState(perm === "granted" && sub ? { kind: "enabled" } : { kind: "off" });
-        return;
-      }
-      if (!status.enabled) {
-        setHealth("unknown");
-        return setState({ kind: "disabled-by-server" });
-      }
-      // Subscriptions made before intent was recorded count as wanted.
-      const wanted = readPushWanted() || (perm === "granted" && !!sub);
-      if (wanted) writePushWanted(true);
-      let next = classifyPushHealth({
-        wanted,
-        permission: perm,
-        subscribed: !!sub,
-        keyMatches: sub && status.public_key ? keyMatches(sub, status.public_key) : null,
-        server: status.subscription ?? null,
-      });
-      // Re-binds the sub to the current token (#3386) or restores one the server dropped.
-      if (sub && perm === "granted" && (next === "server-forgot" || (next === "healthy" && !status.subscription))) {
-        const resp = await postPush("subscribe", subscribeBody(sub)).catch(() => null);
-        if (resp?.ok) next = "healthy";
-      }
-      if (busy.current) return;
-      setHealth(next);
-      if (perm === "denied") setState({ kind: "denied" });
-      else setState(perm === "granted" && sub ? { kind: "enabled" } : { kind: "off" });
-    } catch (e) {
-      if (!busy.current) setState(errorState(e));
+      status = await fetchStatus(sub?.endpoint);
+    } catch {
+      if (!live()) return;
+      if (perm === "granted" && sub) writePushWanted(true);
+      if (perm === "denied") publish(gen, { state: { kind: "denied" } });
+      else publish(gen, { state: perm === "granted" && sub ? { kind: "enabled" } : { kind: "off" } });
+      return;
     }
-  }, []);
+    if (!live()) return;
+    if (!status.enabled) return publish(gen, { state: { kind: "disabled-by-server" }, health: "unknown" });
+    // Subscriptions made before intent was recorded count as wanted.
+    const wanted = readPushWanted() || (perm === "granted" && !!sub);
+    if (wanted) writePushWanted(true);
+    let next = classifyPushHealth({
+      wanted,
+      permission: perm,
+      subscribed: !!sub,
+      keyMatches: sub && status.public_key ? keyMatches(sub, status.public_key) : null,
+      server: status.subscription ?? null,
+    });
+    // Re-binds the sub to the current token (#3386) or restores one the server dropped.
+    if (sub && perm === "granted" && (next === "server-forgot" || (next === "healthy" && !status.subscription))) {
+      const resp = await postPush("subscribe", subscribeBody(sub)).catch(() => null);
+      if (resp?.ok) next = "healthy";
+    }
+    if (perm === "denied") publish(gen, { health: next, state: { kind: "denied" } });
+    else publish(gen, { health: next, state: perm === "granted" && sub ? { kind: "enabled" } : { kind: "off" } });
+  } catch (e) {
+    publish(gen, { state: errorState(e) });
+  }
+}
+
+/** Starts an exclusive action; null when another one is already running. */
+function beginAction(): number | null {
+  if (busy) return null;
+  busy = true;
+  return ++generation;
+}
+
+function endAction(gen: number) {
+  if (gen === generation) busy = false;
+}
+
+// Also the repair path: iOS only allows requestPermission and a first subscribe inside a
+// user gesture, so the permission request stays the first await of a click handler.
+async function enable() {
+  const unsupported = unsupportedState();
+  if (unsupported) return publish(generation, { state: unsupported });
+  const gen = beginAction();
+  if (gen === null) return;
+  publish(gen, { state: { kind: "asking" } });
+  try {
+    // WebKit resolves "denied" for a gestureless request even when already granted.
+    if (Notification.permission !== "granted" && (await Notification.requestPermission()) !== "granted") {
+      return publish(gen, {
+        state: iosTab() ? { kind: "unsupported", reason: "ios-not-standalone" } : { kind: "denied" },
+      });
+    }
+    publish(gen, { state: { kind: "subscribing" } });
+    const vapidResp = await fetch("/api/push/vapid-public-key");
+    if (!vapidResp.ok) {
+      return publish(gen, { state: { kind: "error", message: `Server returned ${vapidResp.status} for VAPID key` } });
+    }
+    const { public_key } = (await vapidResp.json()) as { public_key: string };
+    const reg = await navigator.serviceWorker.ready;
+    let sub = await reg.pushManager.getSubscription();
+    // A 404/410 permanently retires a browser endpoint. Re-subscribing the same
+    // endpoint only stores a dead subscription again, so renew it before posting.
+    const status = sub ? await fetchStatus(sub.endpoint) : null;
+    const keyMismatch = sub && keyMatches(sub, public_key) !== true;
+    const gone = hasFreshGoneFailure(status?.subscription ?? null);
+    if (sub && (keyMismatch || gone)) {
+      const stale = sub.endpoint;
+      const unsubscribed = await sub.unsubscribe().catch(() => false);
+      if (!unsubscribed && (await reg.pushManager.getSubscription())?.endpoint === stale) {
+        throw new Error("Could not unsubscribe the expired notification subscription");
+      }
+      // Browser ownership is already retired; a failed server cleanup must
+      // not block registering the replacement endpoint.
+      await postPush("unsubscribe", { endpoint: stale }).catch(() => {});
+      sub = null;
+    }
+    sub ??= await reg.pushManager.subscribe({
+      userVisibleOnly: true,
+      applicationServerKey: base64UrlToUint8Array(public_key),
+    });
+    // Also refreshes the server-side origin after the dashboard moved (#1188).
+    const subscribeResp = await postPush("subscribe", subscribeBody(sub));
+    if (!subscribeResp.ok) {
+      // Don't keep a browser subscription the server has no record of.
+      await sub.unsubscribe().catch(() => {});
+      return publish(gen, {
+        state: { kind: "error", message: `Server returned ${subscribeResp.status} on subscribe` },
+      });
+    }
+    writePushWanted(true);
+    publish(gen, { health: "healthy", state: { kind: "enabled" } });
+  } catch (e) {
+    publish(gen, { state: errorState(e) });
+  } finally {
+    endAction(gen);
+  }
+}
+
+async function disable() {
+  const gen = beginAction();
+  if (gen === null) return;
+  writePushWanted(false);
+  publish(gen, { health: "not-wanted", state: { kind: "disabling" } });
+  try {
+    const sub = await currentSubscription();
+    if (sub) {
+      const endpoint = sub.endpoint;
+      await sub.unsubscribe().catch(() => {});
+      await postPush("unsubscribe", { endpoint }).catch(() => {});
+    }
+    publish(gen, { state: { kind: "off" } });
+  } catch (e) {
+    publish(gen, { state: errorState(e) });
+  } finally {
+    endAction(gen);
+  }
+}
+
+async function sendTest() {
+  const gen = beginAction();
+  if (gen === null) return;
+  publish(gen, { state: { kind: "sending-test" } });
+  try {
+    const sub = await currentSubscription();
+    if (!sub) return publish(gen, { state: { kind: "error", message: "No active subscription" } });
+    const resp = await postPush("test", { endpoint: sub.endpoint });
+    if (!resp.ok)
+      return publish(gen, { state: { kind: "error", message: `Test failed: server returned ${resp.status}` } });
+    const failure = await testFailureMessage(resp);
+    if (failure) return publish(gen, { health: "delivery-failed", state: { kind: "error", message: failure } });
+    publish(gen, { state: { kind: "enabled" } });
+  } catch (e) {
+    publish(gen, { state: errorState(e) });
+  } finally {
+    endAction(gen);
+  }
+}
+
+export function usePushSubscription() {
+  const { state, health } = useSyncExternalStore(subscribe, () => snapshot);
 
   useEffect(() => {
     const timer = setTimeout(() => {
       void refresh();
     }, 0);
     const onVisibility = () => {
-      if (document.visibilityState === "visible" && !busy.current) void refresh();
+      if (document.visibilityState === "visible") void refresh();
     };
     document.addEventListener("visibilitychange", onVisibility);
     return () => {
       clearTimeout(timer);
       document.removeEventListener("visibilitychange", onVisibility);
     };
-  }, [refresh]);
-
-  // Also the repair path: iOS only allows requestPermission and a first subscribe inside a
-  // user gesture, so the permission request stays the first await of a click handler.
-  const enable = useCallback(async () => {
-    const unsupported = unsupportedState();
-    if (unsupported) return setState(unsupported);
-    busy.current = true;
-    setState({ kind: "asking" });
-    try {
-      // WebKit resolves "denied" for a gestureless request even when already granted.
-      if (Notification.permission !== "granted" && (await Notification.requestPermission()) !== "granted") {
-        return setState(iosTab() ? { kind: "unsupported", reason: "ios-not-standalone" } : { kind: "denied" });
-      }
-      setState({ kind: "subscribing" });
-      const vapidResp = await fetch("/api/push/vapid-public-key");
-      if (!vapidResp.ok) {
-        return setState({ kind: "error", message: `Server returned ${vapidResp.status} for VAPID key` });
-      }
-      const { public_key } = (await vapidResp.json()) as { public_key: string };
-      const reg = await navigator.serviceWorker.ready;
-      let sub = await reg.pushManager.getSubscription();
-      // A 404/410 permanently retires a browser endpoint. Re-subscribing the same
-      // endpoint only stores a dead subscription again, so renew it before posting.
-      const status = sub ? await fetchStatus(sub.endpoint) : null;
-      const keyMismatch = sub && keyMatches(sub, public_key) !== true;
-      const gone = hasFreshGoneFailure(status?.subscription ?? null);
-      if (sub && (keyMismatch || gone)) {
-        const stale = sub.endpoint;
-        const unsubscribed = await sub.unsubscribe().catch(() => false);
-        if (!unsubscribed && (await reg.pushManager.getSubscription())?.endpoint === stale) {
-          throw new Error("Could not unsubscribe the expired notification subscription");
-        }
-        // Browser ownership is already retired; a failed server cleanup must
-        // not block registering the replacement endpoint.
-        await postPush("unsubscribe", { endpoint: stale }).catch(() => {});
-        sub = null;
-      }
-      sub ??= await reg.pushManager.subscribe({
-        userVisibleOnly: true,
-        applicationServerKey: base64UrlToUint8Array(public_key),
-      });
-      // Also refreshes the server-side origin after the dashboard moved (#1188).
-      const subscribeResp = await postPush("subscribe", subscribeBody(sub));
-      if (!subscribeResp.ok) {
-        // Don't keep a browser subscription the server has no record of.
-        await sub.unsubscribe().catch(() => {});
-        return setState({ kind: "error", message: `Server returned ${subscribeResp.status} on subscribe` });
-      }
-      writePushWanted(true);
-      setHealth("healthy");
-      setState({ kind: "enabled" });
-    } catch (e) {
-      setState(errorState(e));
-    } finally {
-      busy.current = false;
-    }
-  }, []);
-
-  const disable = useCallback(async () => {
-    busy.current = true;
-    writePushWanted(false);
-    setHealth("not-wanted");
-    setState({ kind: "disabling" });
-    try {
-      const sub = await currentSubscription();
-      if (sub) {
-        const endpoint = sub.endpoint;
-        await sub.unsubscribe().catch(() => {});
-        await postPush("unsubscribe", { endpoint }).catch(() => {});
-      }
-      setState({ kind: "off" });
-    } catch (e) {
-      setState(errorState(e));
-    } finally {
-      busy.current = false;
-    }
-  }, []);
-
-  const sendTest = useCallback(async () => {
-    busy.current = true;
-    setState({ kind: "sending-test" });
-    try {
-      const sub = await currentSubscription();
-      if (!sub) return setState({ kind: "error", message: "No active subscription" });
-      const resp = await postPush("test", { endpoint: sub.endpoint });
-      if (!resp.ok) return setState({ kind: "error", message: `Test failed: server returned ${resp.status}` });
-      const failure = await testFailureMessage(resp);
-      if (failure) {
-        setHealth("delivery-failed");
-        return setState({ kind: "error", message: failure });
-      }
-      setState({ kind: "enabled" });
-    } catch (e) {
-      setState(errorState(e));
-    } finally {
-      busy.current = false;
-    }
   }, []);
 
   return { state, health, enable, disable, sendTest, refresh };

@@ -9,10 +9,10 @@ pub mod session;
 pub use capability::{CapabilityId, TrustLevel, KNOWN_CAPABILITIES};
 pub use id::{InvalidPluginId, PluginId};
 pub use manifest::{
-    lucide_icon_name_ok, screenshot_path_ok, BuildStep, ClientAction, CommandContribution,
-    KeybindContribution, ManifestError, ObjectFieldContribution, ObjectFieldType, OptionSource,
-    PluginManifest, RuntimeSpec, Screenshot, SettingContribution, SettingType, StatusContribution,
-    ThemeContribution, UiContribution, UiSlot, MAX_SCREENSHOTS,
+    lucide_icon_name_ok, page_entry_path_ok, screenshot_path_ok, BuildStep, ClientAction,
+    CommandContribution, KeybindContribution, ManifestError, ObjectFieldContribution,
+    ObjectFieldType, OptionSource, PluginManifest, RuntimeSpec, Screenshot, SettingContribution,
+    SettingType, StatusContribution, ThemeContribution, UiContribution, UiSlot, MAX_SCREENSHOTS,
 };
 
-pub const API_VERSION: u32 = 15;
+pub const API_VERSION: u32 = 16;

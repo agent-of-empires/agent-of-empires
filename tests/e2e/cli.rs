@@ -469,7 +469,7 @@ fn cli_restart_all_refuses_to_run_when_tmux_server_context_does_not_match() {
     let caller_name = set_cli_tmux_context(&mut h, &caller_id, "Caller");
     let restartable_pid = tmux_pane_pid(&h, &restartable_name);
     let (socket, server_pid) = tmux_server_identity(&h, &caller_name);
-    h.set_env("TMUX", &format!("{socket},{},0", server_pid + 1));
+    h.set_env("TMUX", format!("{socket},{},0", server_pid + 1));
 
     let output = h.run_cli(&["session", "restart", "--all"]);
 
