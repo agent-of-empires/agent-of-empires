@@ -33,9 +33,10 @@ function mockReplay(pages: Record<string, Page>) {
 
 async function coldOpen(signal = new AbortController().signal) {
   const actions: { kind: string; rows?: ActivityRow[]; oldestSeq?: number }[] = [];
+  const handshakes = () => actions.filter((a) => a.kind === "handshake");
   const setHasMore = vi.fn();
   await fetchReplay("sid", { current: 0 }, (a) => actions.push(a as (typeof actions)[number]), setHasMore, signal);
-  return { frames: actions.filter((a) => a.kind === "frames"), setHasMore };
+  return { frames: actions.filter((a) => a.kind === "frames"), setHasMore, handshakes };
 }
 
 const TAIL = String(Number.MAX_SAFE_INTEGER);
@@ -74,6 +75,23 @@ describe("fetchTail", () => {
     const { frames, setHasMore } = await coldOpen();
     expect(frames[0]!.rows!.map((r) => r.id)).toEqual(["t0", "t1"]);
     expect(setHasMore).toHaveBeenCalledWith(false);
+  });
+
+  it("still fetches the handshake when paging reaches the start of history", async () => {
+    const requests = mockReplay({
+      [TAIL]: { rows: [row("t1", "tool_start")], next_cursor: 80, has_more: true },
+      "80": { rows: [row("u", "user_prompt")], next_cursor: 1, has_more: false },
+    });
+    const fetchMock = globalThis.fetch as unknown as ReturnType<typeof vi.fn>;
+    const impl = fetchMock.getMockImplementation()!;
+    fetchMock.mockImplementation(async (url: string) => {
+      if (!url.includes("since=0")) return impl(url);
+      requests.push(url);
+      return new Response(JSON.stringify({ frames: [{ seq: 1 }], lost: false, highest_seq: 100 }));
+    });
+    const { handshakes } = await coldOpen();
+    expect(requests.some((u) => u.includes("since=0"))).toBe(true);
+    expect(handshakes()).toHaveLength(1);
   });
 
   it("dispatches nothing when aborted mid-paging", async () => {

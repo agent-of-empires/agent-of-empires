@@ -73,6 +73,8 @@ async function fetchTail(
   let rows = toActivityRows(await readRows(tailRowsRes), sid);
   let cursor = tail.next_cursor ?? 0;
   let hasMore = tail.has_more ?? false;
+  // The handshake lives at the start of the log, which row pages do not carry.
+  const needsHandshake = hasMore && cursor > 1;
   // Page back until the last user prompt is loaded, so the first window can open on the whole last turn.
   while (hasMore && cursor > 1 && lastUserBoundaryIndex(rows) < 0) {
     const res = await getReplay(sid, `before=${cursor}&limit=${REPLAY_PAGE_SIZE}&view=rows`, signal);
@@ -88,7 +90,7 @@ async function fetchTail(
   dispatch({ kind: "frames", frames: tail.frames ?? [], rows, oldestSeq: cursor });
   setHasMoreOlder(hasMore);
   if (tail.highest_seq > lastSeq.current) lastSeq.current = tail.highest_seq;
-  if (hasMore && cursor > 1) {
+  if (needsHandshake) {
     const hsRes = await getReplay(sid, `since=0&limit=${HANDSHAKE_PREFIX_SIZE}`, signal);
     if (hsRes.ok) {
       const hs = (await hsRes.json()) as ReplayPageResponse;
