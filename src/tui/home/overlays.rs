@@ -131,7 +131,9 @@ impl HomeView {
         let opened = if crate::util::is_http_url(url) {
             crate::tui::open_url::open_url(url)
         } else if crate::util::is_openable_link(url, &self.preview_link_prefixes) {
-            crate::tui::open_url::open_with_system(url)
+            crate::tui::open_url::open_with_system(url).map(|exit| {
+                self.opener_exit = exit.map(|rx| (url.to_string(), rx));
+            })
         } else {
             Err(std::io::Error::new(
                 std::io::ErrorKind::PermissionDenied,
@@ -146,6 +148,30 @@ impl HomeView {
             }
         };
         self.flash_status(status);
+    }
+
+    /// Report a system opener that exited unsuccessfully, which is how a scheme
+    /// with no registered app fails; true when the flash changed.
+    pub fn tick_opener(&mut self) -> bool {
+        let Some((url, rx)) = self.opener_exit.as_ref() else {
+            return false;
+        };
+        let status = match rx.try_recv() {
+            Ok(status) => status,
+            Err(std::sync::mpsc::TryRecvError::Empty) => return false,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                self.opener_exit = None;
+                return false;
+            }
+        };
+        let url = url.clone();
+        self.opener_exit = None;
+        if status.success() {
+            return false;
+        }
+        crate::tui::clipboard::copy_to_clipboard(&url);
+        self.flash_status(format!("nothing opened it ({status}); copied {url}"));
+        true
     }
 
     pub(in crate::tui) fn status_flash_text(&self) -> Option<&str> {

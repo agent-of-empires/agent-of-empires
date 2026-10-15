@@ -277,7 +277,6 @@ pub struct HomeView {
 
     pub(super) show_diagnostics: bool,
     pub(super) show_shortcut_bar: bool,
-    /// `session.preview_link_prefixes`: non-web link targets the preview may open.
     pub(super) preview_link_prefixes: Vec<String>,
     pub(super) metrics_poller: super::metrics_poller::MetricsPoller,
     pub(super) pending_metrics_refresh: bool,
@@ -423,6 +422,8 @@ pub struct HomeView {
     pub(super) trashed_section_collapsed: bool,
 
     recovery_rx: Option<std::sync::mpsc::Receiver<RecoveryUpdate>>,
+    /// The last non-web link handed to the system opener, until its exit status arrives.
+    pub(super) opener_exit: Option<(String, std::sync::mpsc::Receiver<std::process::ExitStatus>)>,
     /// Held while recovery workers run so a later daemon cannot duplicate cascades.
     recovery_lock: Option<crate::session::recovery::RecoveryLock>,
 

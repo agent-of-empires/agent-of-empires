@@ -1246,6 +1246,7 @@ impl App {
 
             full |= self.home.tick_dialog();
             full |= self.home.tick_settings_status();
+            full |= self.home.tick_opener();
 
             // Full/config reloads stay deferred during live-send to preserve input
             // policy and mouse-capture state.

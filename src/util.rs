@@ -13,21 +13,46 @@ pub(crate) fn is_http_url(url: &str) -> bool {
     lower.starts_with("http://") || lower.starts_with("https://")
 }
 
+/// Schemes no `session.preview_link_prefixes` entry opens: their handlers run
+/// code or read local data.
+const NEVER_OPENED: &[&str] = &["file:", "javascript:", "data:", "vbscript:"];
+
 /// Whether a preview link to `url` may open: an [`is_http_url`] address, or one
-/// starting with a prefix from `session.preview_link_prefixes`.
-///
-/// Prefixes compare case-insensitively and an empty one matches nothing, so the
-/// default empty list keeps every non-web scheme closed. A prefix should name the
-/// authority as well as the scheme (`vscode://file/`, not `vscode:`): most
-/// custom schemes route the rest of the URL to a handler.
+/// starting with a `session.preview_link_prefixes` entry, compared
+/// case-insensitively. An entry counts only in `scheme://authority` form, and
+/// [`NEVER_OPENED`] schemes stay closed whatever is listed.
 pub(crate) fn is_openable_link(url: &str, extra_prefixes: &[String]) -> bool {
     if is_http_url(url) {
         return true;
     }
-    let lower = url.to_ascii_lowercase();
+    if NEVER_OPENED.iter().any(|s| starts_with_ignore_case(url, s)) {
+        return false;
+    }
     extra_prefixes
         .iter()
-        .any(|p| !p.is_empty() && lower.starts_with(&p.to_ascii_lowercase()))
+        .map(|p| p.trim())
+        .any(|p| names_an_authority(p) && starts_with_ignore_case(url, p))
+}
+
+/// Whether `s` is an RFC 3986 scheme: a letter, then letters, digits, `+`,
+/// `-` or `.`.
+pub(crate) fn is_uri_scheme(s: &str) -> bool {
+    let mut chars = s.chars();
+    chars.next().is_some_and(|c| c.is_ascii_alphabetic())
+        && chars.all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'))
+}
+
+/// `scheme://` and at least one authority character, so an entry cannot open
+/// every handler under a scheme.
+fn names_an_authority(prefix: &str) -> bool {
+    prefix.split_once("://").is_some_and(|(scheme, rest)| {
+        is_uri_scheme(scheme) && !rest.is_empty() && !rest.starts_with('/')
+    })
+}
+
+fn starts_with_ignore_case(s: &str, prefix: &str) -> bool {
+    s.get(..prefix.len())
+        .is_some_and(|head| head.eq_ignore_ascii_case(prefix))
 }
 
 /// Whether `url` is safe for a plugin-supplied UI link: an [`is_http_url`]
@@ -142,7 +167,7 @@ mod tests {
             assert!(!is_openable_link(url, &none), "{url} with no prefixes");
         }
 
-        let allowed = ["vscode://file/".to_string(), String::new()];
+        let allowed = [" vscode://file/ ".to_string(), String::new()];
         for url in [
             "vscode://file/Users/u/notes/a.md",
             "vscode://file/Users/u/src/main.rs:12:4",
@@ -158,6 +183,18 @@ mod tests {
             "javascript:alert(1)",
         ] {
             assert!(!is_openable_link(url, &allowed), "{url}");
+        }
+
+        // Entries without an authority, and never-opened schemes, are ignored.
+        let ignored =
+            ["vscode:", "vscode://", "file://", "javascript:", "1x://y"].map(String::from);
+        for url in [
+            "vscode://vscode.git/clone?url=x",
+            "file:///Users/u/a.command",
+            "javascript:alert(1)",
+            "1x://y/z",
+        ] {
+            assert!(!is_openable_link(url, &ignored), "{url}");
         }
     }
 

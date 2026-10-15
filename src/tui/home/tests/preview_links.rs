@@ -348,3 +348,86 @@ fn capture_frames_carry_their_own_targets_through_the_parse() {
         Some("https://example.com/aoe".to_string())
     );
 }
+
+#[test]
+#[serial]
+fn a_non_web_target_stays_inert_until_a_prefix_allows_it() {
+    // Extraction, the config reload, painting, the click hit-test and the hand-off
+    // to the host terminal all follow `session.preview_link_prefixes`.
+    use crate::session::config::update_config;
+    use ratatui::style::Modifier;
+    const VSCODE: &str = "vscode://file/Users/u/notes/a.md:12";
+    let mut env = create_test_env_empty();
+    let frame = format!(
+        "see \x1b]8;;{VSCODE}\x1b\\notes/a.md\x1b]8;;\x1b\\ now\n\
+         and \x1b]8;;javascript:alert(1)\x1b\\click me\x1b]8;;\x1b\\ too\n"
+    );
+    for (prefixes, live) in [
+        (vec![], false),
+        (vec!["vscode://file/".to_string()], true),
+        (vec![], false),
+    ] {
+        update_config(|c| c.session.preview_link_prefixes = prefixes.clone()).unwrap();
+        env.view.try_refresh_from_config_watcher().unwrap();
+        env.view.preview_cache = crate::tui::home::PreviewCache::default();
+        env.view.preview_cache.store_capture(
+            frame.clone(),
+            "s1".to_string(),
+            "aoe_s1".to_string(),
+            1,
+            (40, 4),
+            None,
+        );
+        env.view.preview_cache.ensure_parsed();
+        let total_lines = env
+            .view
+            .preview_cache
+            .parsed_text
+            .as_ref()
+            .unwrap()
+            .lines
+            .len();
+        env.view.preview_area = PANE;
+        env.view.preview_text_view = PreviewTextView {
+            pane: PANE,
+            first_line: 0,
+            total_lines,
+        };
+        env.view.hyperlink_cells.lock().unwrap().clear();
+        let mut buf = ratatui::buffer::Buffer::empty(Rect::new(0, 0, 60, 10));
+        env.view.paint_preview_links(&mut buf);
+        let underlined =
+            |row: u16| (0..60).any(|col| buf[(col, row)].modifier.contains(Modifier::UNDERLINED));
+
+        assert_eq!(underlined(PANE.y), live, "{prefixes:?}: underline");
+        assert_eq!(
+            env.view.preview_link_at(PANE.x + 4, PANE.y).as_deref(),
+            live.then_some(VSCODE),
+            "{prefixes:?}: click target"
+        );
+        assert_eq!(
+            !env.view.hyperlink_cells.lock().unwrap().is_empty(),
+            live,
+            "{prefixes:?}: passed to the host terminal"
+        );
+        assert!(
+            !underlined(PANE.y + 1),
+            "{prefixes:?}: javascript underline"
+        );
+        assert_eq!(env.view.preview_link_at(PANE.x + 4, PANE.y + 1), None);
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn a_successful_opener_exit_leaves_the_opened_flash() {
+    use std::os::unix::process::ExitStatusExt;
+    let mut env = create_test_env_empty();
+    let (tx, rx) = std::sync::mpsc::channel();
+    env.view.opener_exit = Some(("vscode://file/x".to_string(), rx));
+    assert!(!env.view.tick_opener(), "nothing yet");
+    assert!(env.view.opener_exit.is_some());
+    tx.send(std::process::ExitStatus::from_raw(0)).unwrap();
+    assert!(!env.view.tick_opener());
+    assert!(env.view.opener_exit.is_none());
+}

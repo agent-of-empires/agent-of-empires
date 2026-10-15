@@ -17,22 +17,10 @@ const MAX_PENDING: usize = 8192;
 
 const MAX_URI: usize = 2048;
 
-/// A target with a URI scheme and no control byte, which could inject escapes.
-/// Which schemes may open is decided where the preview anchors links
-/// (`util::is_openable_link`), so the rest never reach the host terminal.
+/// A target the preview could open (`session::preview_link_openable`), so an
+/// unopenable one never takes a table slot; a control byte could inject escapes.
 fn usable_uri(uri: &str) -> bool {
-    has_scheme(uri) && !uri.chars().any(char::is_control)
-}
-
-/// `scheme ":"` with an RFC 3986 scheme: a letter, then letters, digits, `+`,
-/// `-` or `.`.
-fn has_scheme(uri: &str) -> bool {
-    let Some((scheme, _)) = uri.split_once(':') else {
-        return false;
-    };
-    let mut chars = scheme.chars();
-    chars.next().is_some_and(|c| c.is_ascii_alphabetic())
-        && chars.all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'))
+    crate::session::preview_link_openable(uri) && !uri.chars().any(char::is_control)
 }
 
 pub(crate) struct Osc8Scanner {
@@ -200,6 +188,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn extracts_across_forms_and_neighbours() {
         let cases: Vec<(&str, Vec<PaneLink>)> = vec![
             (
@@ -236,17 +225,16 @@ mod tests {
                 "\x1b]8;;https://a.com\x1b\\A\x1b]8;;https://b.com\x1b\\B\x1b]8;;\x1b\\",
                 vec![link("A", "https://a.com"), link("B", "https://b.com")],
             ),
-            // Any scheme is extracted; which may open is `util::is_openable_link`'s call.
+            // With no `session.preview_link_prefixes`, only web targets are kept.
+            ("\x1b]8;;file:///etc/passwd\x1b\\pw\x1b]8;;\x1b\\", vec![]),
             (
                 "\x1b]8;;vscode://file/Users/x/notes/a.md:12\x1b\\notes/a.md\x1b]8;;\x1b\\",
-                vec![link("notes/a.md", "vscode://file/Users/x/notes/a.md:12")],
+                vec![],
             ),
             (
                 "\x1b]8;;javascript:alert(1)\x1b\\click\x1b]8;;\x1b\\",
-                vec![link("click", "javascript:alert(1)")],
+                vec![],
             ),
-            ("\x1b]8;;no-scheme-here\x1b\\pw\x1b]8;;\x1b\\", vec![]),
-            ("\x1b]8;;1x:y\x1b\\pw\x1b]8;;\x1b\\", vec![]),
             ("\x1b]8;;https://a.com\x1b\\\x1b]8;;\x1b\\", vec![]),
             ("\x1b]8;;\x1b\\plain", vec![]),
             ("no links here", vec![]),

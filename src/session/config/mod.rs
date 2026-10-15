@@ -1705,16 +1705,17 @@ pub struct SessionConfig {
     pub show_shortcut_bar: bool,
 
     /// Link targets beyond http and https that a click in the preview may open,
-    /// as URL prefixes: `vscode://file/` lets an agent print a short relative
-    /// path that opens the file in VS Code. Matching is a case-insensitive
-    /// prefix, so name the authority as well as the scheme; most custom schemes
-    /// hand the rest of the URL to a handler. Empty by default: only web links
-    /// open, and other targets are not passed to the terminal either.
+    /// as `scheme://authority/` prefixes: `vscode://file/` lets an agent print a
+    /// short relative path that opens the file in VS Code. An entry without an
+    /// authority is ignored, and `file:`, `javascript:`, `data:` and `vbscript:`
+    /// never open. Applies to links printed after the change. Empty by default:
+    /// only web links open, and other targets are not passed to the terminal.
     #[serde(default)]
     #[setting(
-        label = "Extra link prefixes",
+        label = "Preview link prefixes",
         widget = "list",
         category = "Interaction",
+        web = "local_only:hands pane-supplied links to the host's URL handlers",
         global_only,
         tui_only,
         advanced

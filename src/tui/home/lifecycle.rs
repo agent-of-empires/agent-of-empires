@@ -165,6 +165,7 @@ impl HomeView {
             crate::tui::styles::idle_decay_window(resolved.theme.idle_decay_minutes);
         crate::session::set_unread_enabled(resolved.session.unread_indicator);
         crate::session::set_favorites_first(resolved.session.favorites_first);
+        crate::session::set_preview_link_prefixes(&resolved.session.preview_link_prefixes);
         let user_config = load_config().ok().flatten();
         let sort_order = user_config
             .as_ref()
@@ -463,6 +464,7 @@ impl HomeView {
             hide_stopped_in_groups: false,
             group_totals: HashMap::new(),
             recovery_rx: None,
+            opener_exit: None,
             recovery_lock: None,
             recovery_in_flight: std::collections::HashSet::new(),
             restart_cooldown_at: std::collections::HashMap::new(),

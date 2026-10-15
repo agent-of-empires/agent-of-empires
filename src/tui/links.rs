@@ -10,10 +10,9 @@
 //! filled it, so a link once printed as `[docs](x)` makes every later standalone
 //! `docs` on screen resolve to `x`. `MIN_LINK_TEXT` and word alignment rule out
 //! the worst of it, but not a common word. Hovering shows the target first and
-//! only http/https, or a prefix the user allowed in
-//! `session.preview_link_prefixes`, ever opens, which keeps this misleading
-//! rather than dangerous; removing it needs per-cell positions `vt100` does not
-//! keep.
+//! only a [`crate::util::is_openable_link`] target ever opens, which keeps this
+//! misleading rather than dangerous; removing it needs per-cell positions
+//! `vt100` does not keep.
 //!
 //! The result never overlaps itself: the painter and the click hit-test must
 //! agree about which candidate owns a cell, or the terminal advertises one
@@ -282,7 +281,6 @@ mod tests {
         let found = link_spans_for_line(&line, 40, &links, &["vscode://file/".to_string()]);
         assert_eq!(found.len(), 1);
         assert_eq!(found[0].uri, "vscode://file/Users/u/notes/a.md");
-        assert!(link_spans_for_line(&line, 40, &links, &["vscode://ext/".to_string()]).is_empty());
     }
 
     #[test]

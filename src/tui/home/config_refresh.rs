@@ -83,6 +83,7 @@ impl HomeView {
             crate::tui::styles::idle_decay_window(config.theme.idle_decay_minutes);
         crate::session::set_unread_enabled(config.session.unread_indicator);
         crate::session::set_favorites_first(config.session.favorites_first);
+        crate::session::set_preview_link_prefixes(&config.session.preview_link_prefixes);
         self.tips_unseen = tips_unseen_count(&config);
         self.queue_shortcut_bar_tip(&config);
         self.tool_configs = config.tools;
