@@ -1,5 +1,12 @@
 import { useCallback, useEffect, useRef, useState, type ReactNode } from "react";
-import { fetchPluginUiState, fetchPluginSessions, invokePluginAction, mintPluginPageTicket } from "../../lib/api";
+import {
+  fetchPluginUiState,
+  fetchPluginSessions,
+  invokePluginAction,
+  mintPluginPageTicket,
+  setSessionArchive,
+  trashSession,
+} from "../../lib/api";
 import {
   BRIDGE_VERSION,
   bridgeError,
@@ -56,6 +63,13 @@ async function runCall(call: BridgeCall, pluginId: string): Promise<unknown> {
     }
     case "openSession":
       requestOpenSession(call.sessionId);
+      return null;
+    // Null, not the session row, which is wider than the summary sessions.list hands a page.
+    case "session.archive":
+      if (!(await setSessionArchive(call.sessionId, true))) throw new Error("archive failed");
+      return null;
+    case "session.trash":
+      if (!(await trashSession(call.sessionId))) throw new Error("trash failed");
       return null;
   }
 }

@@ -25,7 +25,8 @@ export type BridgeCall =
   | { method: "sessions.list" }
   | { method: "plugins.uiState" }
   | { method: "action"; action: string; params: Record<string, unknown>; sessionId?: string }
-  | { method: "openSession"; sessionId: string };
+  | { method: "openSession"; sessionId: string }
+  | { method: "session.archive" | "session.trash"; sessionId: string };
 
 export interface BridgeGrants {
   capabilities: readonly string[];
@@ -51,6 +52,11 @@ export function parseRequest(data: unknown): BridgeRequest | null {
 
 type Parse = (params: Record<string, unknown>) => BridgeCall | null;
 
+const sessionTarget =
+  (method: "session.archive" | "session.trash"): Parse =>
+  ({ id }) =>
+    isText(id) ? { method, sessionId: id } : null;
+
 const METHODS = new Map<string, { capability?: string; mutates?: boolean; parse: Parse }>([
   ["ready", { parse: () => ({ method: "ready" }) }],
   ["sessions.list", { capability: "session.read", parse: () => ({ method: "sessions.list" }) }],
@@ -67,6 +73,8 @@ const METHODS = new Map<string, { capability?: string; mutates?: boolean; parse:
     },
   ],
   ["openSession", { parse: ({ id }) => (isText(id) ? { method: "openSession", sessionId: id } : null) }],
+  ["session.archive", { capability: "session.write", mutates: true, parse: sessionTarget("session.archive") }],
+  ["session.trash", { capability: "session.write", mutates: true, parse: sessionTarget("session.trash") }],
 ]);
 
 /** Validates params, then gates on the plugin's capabilities and the dashboard mode. */
