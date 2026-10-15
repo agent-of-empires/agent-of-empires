@@ -65,8 +65,6 @@ Releases are staged weekly. Maintainer instructions live in
 
 Merge rules and area owners are in [MAINTAINERS.md](MAINTAINERS.md).
 
-For help, open a [GitHub Discussion](../../discussions) or an issue.
-
 ## Review rubric
 
 Reviewers tag each requested change with a priority:
