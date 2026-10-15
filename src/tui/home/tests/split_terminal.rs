@@ -129,3 +129,34 @@ fn split_focus_swap_keeps_the_other_half_cached() {
         Some(term.as_str())
     );
 }
+
+/// A worktree agent's tall info header must not eat the split half: headers are off while
+/// split, so the focused output (and the fleet size derived from it) is the whole half.
+#[test]
+#[serial]
+fn split_hides_info_headers_so_output_owns_each_half() {
+    let cache = crate::tmux::SessionCacheGuard::capture();
+    let mut inst = Instance::new("treeish", "/tmp/tree");
+    inst.worktree_info = Some(crate::session::WorktreeInfo {
+        branch: "feature/foo".to_string(),
+        main_repo_path: "/tmp/tree-main".to_string(),
+        managed_by_aoe: true,
+        created_at: chrono::Utc::now(),
+        base_branch: None,
+    });
+    let term = crate::tmux::TerminalSession::generate_name(&inst.id, &inst.title);
+    let mut env = seeded_env(test_home(), &[inst.clone()], true);
+    env.view.select_session_by_id(&inst.id);
+    env.view.split_terminal = true;
+    env.view.show_preview_info = true;
+    cache.force_present(&[term.as_str()]);
+
+    let screen = render_home_to_string(&mut env.view, 120, 24);
+
+    assert!(screen.contains(" Terminal "), "{screen}");
+    assert_eq!(
+        env.view.preview_pane_area, env.view.preview_area,
+        "{screen}"
+    );
+    assert!(!screen.contains("hide info with"), "{screen}");
+}

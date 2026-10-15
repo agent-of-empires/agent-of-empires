@@ -2243,9 +2243,7 @@ impl HomeView {
         }) else {
             return;
         };
-        let output =
-            preview::PreviewLayout::compute(rect, compact, self.show_preview_info, info_height)
-                .output;
+        let output = preview::PreviewLayout::compute(rect, compact, false, info_height).output;
         self.apply_split_capture(output.width, output.height, select);
         select(self).ensure_parsed();
         let cache = match (terminal_focused, container) {
@@ -2267,19 +2265,11 @@ impl HomeView {
                 theme,
                 self.idle_decay_window,
                 compact,
-                self.show_preview_info,
+                false,
             );
         } else {
             Preview::render_terminal_preview(
-                frame,
-                rect,
-                inst,
-                true,
-                cached,
-                0,
-                theme,
-                compact,
-                self.show_preview_info,
+                frame, rect, inst, true, cached, 0, theme, compact, false,
             );
         }
         frame.buffer_mut().set_style(
@@ -2617,6 +2607,7 @@ impl HomeView {
         &mut self,
         inner: Rect,
         compact: bool,
+        show_info: bool,
         exclude: Option<&str>,
     ) {
         self.adopt_passive_resize_completions();
@@ -2644,7 +2635,7 @@ impl HomeView {
             let output = preview::PreviewLayout::compute(
                 inner,
                 compact,
-                self.show_preview_info,
+                show_info,
                 preview::agent_info_height(inst),
             )
             .output;
@@ -2945,6 +2936,21 @@ impl HomeView {
             .border_style(Style::default().fg(border_color))
             .padding(Padding::horizontal(1));
 
+        let split = self
+            .split_terminal_applies()
+            .then(|| split_preview_rects(block.inner(area)))
+            .flatten();
+        // Split mode hands the whole single-preview path the focused half, so geometry,
+        // scroll, selection and mouse hits all describe it; the other half is paint-only.
+        let inner = match (&split, &self.view_mode) {
+            (Some(s), ViewMode::Terminal) => s.terminal,
+            (Some(s), _) => s.agent,
+            (None, _) => block.inner(area),
+        };
+        // Info headers are off while split: two headers would leave a worktree agent a
+        // couple of output rows, and the passive fleet would size every pane to match.
+        let show_info = self.show_preview_info && split.is_none();
+
         // In compact mode, hoist session name + status icon into the
         // outer title so the (now omitted) info header isn't missed.
         let compact_title: Option<Line> = if compact {
@@ -3015,7 +3021,9 @@ impl HomeView {
             // (Agent's worktree-flavored one, Terminal/Tool's minimal one), so the hint
             // applies everywhere except the compact branch, whose title is taken.
             let key = if self.strict_hotkeys { "I" } else { "i" };
-            let hint_text = if self.show_preview_info {
+            let hint_text = if split.is_some() {
+                String::new()
+            } else if show_info {
                 format!(" hide info with {key} ")
             } else {
                 format!(" show info with {key} ")
@@ -3029,9 +3037,8 @@ impl HomeView {
             // mounted structured preview owns its own scroll state, and the generic
             // indicator reads the tmux cache, which is stale or empty for it.
             let structured_mounted = self.structured_preview.is_some();
-            let scroll_indicator = if !self.show_preview_info && !structured_mounted {
-                let inner_height = area.height.saturating_sub(2);
-                let visible_height = inner_height as usize;
+            let scroll_indicator = if !show_info && !structured_mounted {
+                let visible_height = inner.height as usize;
                 let captured_lines = self.active_captured_lines();
                 format_scroll_indicator(captured_lines, visible_height, self.preview_scroll_offset)
             } else {
@@ -3045,17 +3052,6 @@ impl HomeView {
             block = block.title_top(Line::from(hint_spans).right_aligned());
         }
 
-        let split = self
-            .split_terminal_applies()
-            .then(|| split_preview_rects(block.inner(area)))
-            .flatten();
-        // Split mode hands the whole single-preview path the focused half, so geometry,
-        // scroll, selection and mouse hits all describe it; the other half is paint-only.
-        let inner = match (&split, &self.view_mode) {
-            (Some(s), ViewMode::Terminal) => s.terminal,
-            (Some(s), _) => s.agent,
-            (None, _) => block.inner(area),
-        };
         self.preview_area = inner;
         self.preview_outer_area = area;
         self.diff_area = Rect::default();
@@ -3154,7 +3150,7 @@ impl HomeView {
         } else {
             None
         };
-        self.reconcile_passive_fleet(inner, compact, fleet_exclude.as_deref());
+        self.reconcile_passive_fleet(inner, compact, show_info, fleet_exclude.as_deref());
 
         if selected_archived {
             self.render_archived_preview(frame, inner, theme);
@@ -3192,7 +3188,7 @@ impl HomeView {
                 let layout = preview::PreviewLayout::compute(
                     inner,
                     compact,
-                    self.show_preview_info,
+                    show_info,
                     inst.map(preview::agent_info_height).unwrap_or(0),
                 );
                 if let (Some(info_area), Some(inst)) = (layout.info, inst) {
@@ -3269,7 +3265,7 @@ impl HomeView {
                             preview::PreviewLayout::compute(
                                 inner,
                                 compact,
-                                self.show_preview_info,
+                                show_info,
                                 preview::agent_info_height(inst),
                             )
                             .output
@@ -3307,7 +3303,7 @@ impl HomeView {
                                 theme,
                                 self.idle_decay_window,
                                 compact,
-                                self.show_preview_info,
+                                show_info,
                             );
                         }
                     } else {
@@ -3336,7 +3332,7 @@ impl HomeView {
                             preview::PreviewLayout::compute(
                                 inner,
                                 compact,
-                                self.show_preview_info,
+                                show_info,
                                 preview::terminal_info_height(inst),
                             )
                             .output
@@ -3411,7 +3407,7 @@ impl HomeView {
                             self.preview_scroll_offset,
                             theme,
                             compact,
-                            self.show_preview_info,
+                            show_info,
                         );
                     }
                 } else {
@@ -3434,7 +3430,7 @@ impl HomeView {
                             preview::PreviewLayout::compute(
                                 inner,
                                 compact,
-                                self.show_preview_info,
+                                show_info,
                                 preview::terminal_info_height(inst),
                             )
                             .output
@@ -3480,7 +3476,7 @@ impl HomeView {
                             self.preview_scroll_offset,
                             theme,
                             compact,
-                            self.show_preview_info,
+                            show_info,
                         );
                     }
                 } else {
