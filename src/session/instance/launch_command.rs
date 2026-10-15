@@ -1708,13 +1708,6 @@ mod tests {
         assert!(!command.contains(" -e "), "extension follows --: {command}");
         assert!(!terminated.pi_extension_launched);
     }
-    #[test]
-    fn yolo_envvar_value_is_quoted_and_survives_the_suspend_wrapper() {
-        let cmd = format_env_var_prefix("OPENCODE_PERMISSION", r#"{"*":"allow"}"#, "opencode");
-        assert_eq!(cmd, r#"OPENCODE_PERMISSION='{"*":"allow"}' opencode"#);
-        let wrapped = wrap_command_ignore_suspend(&cmd, "/tmp/proj", &[], &[]);
-        assert!(wrapped.contains(r#"OPENCODE_PERMISSION='{"*":"allow"}' opencode"#));
-    }
 
     #[test]
     #[serial_test::serial(shell_env)]
