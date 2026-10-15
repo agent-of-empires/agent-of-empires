@@ -61,7 +61,7 @@ export function ProfilesSection({ readOnly }: Props) {
       .then(([profile, global]) => {
         if (seq !== loadSeq.current) return;
         setProfileSettings(profile);
-        setGlobalHooks(global?.hooks as HooksOverride | undefined);
+        setGlobalHooks(global?.hooks);
         setError(null);
         if (!descriptionDirty.current) {
           setDescription(typeof profile?.description === "string" ? profile.description : "");
