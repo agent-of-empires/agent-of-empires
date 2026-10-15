@@ -62,8 +62,6 @@ function loadLastUsedTool(): string {
   return stored && ACP_CAPABLE_TOOLS.has(stored) ? stored : "claude";
 }
 
-type Obj = Record<string, unknown> | undefined;
-
 export interface WizardPrefill {
   path?: string;
   tool?: string;
@@ -279,7 +277,7 @@ export function SessionWizard({ onClose, onCreated, onCreatedInBackground, prefi
         // A committed switch owns the settings now; applying these late would overwrite its defaults.
         if (!s || committedProfileRef.current !== initialProfile) return;
         setCommandMaps(commandMapsFromSettings(s));
-        const img = ((s.sandbox as Obj)?.default_image as string) || "";
+        const img = typeof s.sandbox?.default_image === "string" ? s.sandbox.default_image : "";
         if (img) dispatch({ type: "SET_FIELD", field: "sandboxImage", value: img });
         const defaults = profileDefaults(s, prefill?.tool ?? "", state.data.tool);
         dispatch({
