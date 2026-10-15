@@ -616,9 +616,7 @@ export function SettingsView({
           <div className="space-y-6" {...tourAnchor(TOUR_ANCHORS.settingsPlugins)}>
             <PluginsSettings readOnly={cityhall} />
             {!cityhall &&
-              (schemaGuard() ?? (
-                <PluginSettingsSections schema={schema} settings={settings} onSaved={reloadSettings} />
-              ))}
+              (schemaGuard() ?? <PluginSettingsSections schema={schema} settings={settings} onSaveField={sendSave} />)}
           </div>
         );
 

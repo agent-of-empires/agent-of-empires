@@ -21,9 +21,31 @@ interface Unconfirmed {
   attempts: number;
 }
 
-/** Resends of an unconfirmed edit before the saved value is shown instead. */
+/** Resends of an unconfirmed edit before it is left unresolved, still on screen, for the user to settle. */
 const MAX_ATTEMPTS = 3;
-const UNCERTAIN_ERROR = "Could not confirm the save, please check the value";
+const CONFIRM_ERROR = "Could not confirm";
+const UNCERTAIN_ERROR = `${CONFIRM_ERROR} the save, please check the value`;
+const PLUGIN_PREFIX = "plugin:";
+
+/** Plugin settings live under `plugins.<id>.settings` rather than a section of their own. */
+function readField(settings: Settings, section: string, field: string): unknown {
+  if (!section.startsWith(PLUGIN_PREFIX)) return (settings[section] as Settings | undefined)?.[field];
+  const plugins = settings.plugins as Record<string, { settings?: Settings }> | undefined;
+  return plugins?.[section.slice(PLUGIN_PREFIX.length)]?.settings?.[field];
+}
+
+function writeField(settings: Settings, section: string, field: string, value: unknown): Settings {
+  if (!section.startsWith(PLUGIN_PREFIX)) {
+    return { ...settings, [section]: { ...(settings[section] as Settings | undefined), [field]: value } };
+  }
+  const id = section.slice(PLUGIN_PREFIX.length);
+  const plugins = (settings.plugins ?? {}) as Record<string, { settings?: Settings }>;
+  const plugin = plugins[id] ?? {};
+  return {
+    ...settings,
+    plugins: { ...plugins, [id]: { ...plugin, settings: { ...plugin.settings, [field]: value } } },
+  };
+}
 
 interface Entry {
   view: SettingsView;
@@ -88,25 +110,24 @@ const same = (a: unknown, b: unknown) => JSON.stringify(a) === JSON.stringify(b)
 
 /**
  * Settle unconfirmed edits against a fetch: the ones it shows are done, the rest stay on screen
- * and are resent, and one that kept failing gives way to the fetched value.
+ * and are resent. One that kept failing stays on screen too, unresolved: no fetch proves a late
+ * commit is not still coming, so the saved value never replaces it behind the user's back.
  */
-function settle(e: Entry, fetched: Settings): { settings: Settings; resend: Unconfirmed[]; gaveUp: string[] } {
+function settle(e: Entry, fetched: Settings): { settings: Settings; resend: Unconfirmed[]; unresolved: string[] } {
   let settings = fetched;
   const resend: Unconfirmed[] = [];
-  const gaveUp: string[] = [];
+  const unresolved: string[] = [];
   for (const [key, u] of e.unconfirmed) {
-    if (same((fetched[u.section] as Settings | undefined)?.[u.field], u.value)) {
+    if (same(readField(fetched, u.section, u.field), u.value)) {
       e.unconfirmed.delete(key);
-    } else if (u.attempts >= MAX_ATTEMPTS) {
-      e.unconfirmed.delete(key);
-      gaveUp.push(`${u.section}.${u.field}`);
-    } else {
-      settings = { ...settings, [u.section]: { ...(settings[u.section] as Settings | undefined), [u.field]: u.value } };
-      resend.push(u);
+      continue;
     }
+    settings = writeField(settings, u.section, u.field, u.value);
+    if (u.attempts >= MAX_ATTEMPTS) unresolved.push(`${u.section}.${u.field}`);
+    else resend.push(u);
   }
   e.needsReconcile = e.unconfirmed.size > 0;
-  return { settings, resend, gaveUp };
+  return { settings, resend, unresolved };
 }
 
 /**
@@ -132,11 +153,11 @@ export function loadSettings(profile: string): Promise<boolean> {
         publish(e, { error: REFRESH_ERROR });
         return false;
       }
-      const { settings, resend, gaveUp } = settle(e, s);
+      const { settings, resend, unresolved } = settle(e, s);
       const error =
-        gaveUp.length > 0
-          ? `Could not save ${gaveUp.join(", ")}; showing the saved value`
-          : e.unconfirmed.size === 0 && e.view.error === UNCERTAIN_ERROR
+        unresolved.length > 0
+          ? `${CONFIRM_ERROR} ${unresolved.join(", ")}; showing your value. Reload to discard it`
+          : e.unconfirmed.size === 0 && e.view.error?.startsWith(CONFIRM_ERROR)
             ? null
             : e.view.error;
       publish(e, { settings, error });
@@ -175,7 +196,7 @@ export async function saveField(
   publish(e, {
     // Another edit does not answer a "could not confirm" still waiting on the server.
     error: e.unconfirmed.size > 0 ? e.view.error : null,
-    settings: base && { ...base, [section]: { ...(base[section] as Settings | undefined), [field]: value } },
+    settings: base && writeField(base, section, field, value),
   });
   const request = e.tail.then(send);
   e.tail = request.catch(() => undefined);

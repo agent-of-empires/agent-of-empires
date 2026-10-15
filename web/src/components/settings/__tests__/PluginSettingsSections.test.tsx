@@ -1,22 +1,26 @@
 // @vitest-environment jsdom
 
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 
 vi.mock("../../../lib/api", () => ({
-  updateSettings: vi.fn().mockResolvedValue("committed"),
+  updateSettings: vi.fn(),
+  fetchSettings: vi.fn(),
 }));
 
-import { updateSettings } from "../../../lib/api";
+import { fetchSettings, updateSettings } from "../../../lib/api";
 import type { SaveOutcome } from "../../../lib/api";
+import { loadSettings, resetSettingsStore, saveField, useProfileSettings } from "../../../lib/settingsStore";
 import { PluginSettingsSections } from "../PluginSettingsSections";
-import { resetPluginSaves } from "../pluginSaves";
 import type { SettingsFieldDescriptor } from "../../../lib/types";
 
-beforeEach(resetPluginSaves);
-
-// A refetch that has not landed yet: the settings prop keeps showing the old list.
-const refetchPending = () => new Promise<void>(() => {});
+beforeEach(() => {
+  resetSettingsStore();
+  vi.mocked(updateSettings).mockReset().mockResolvedValue("committed");
+  vi.mocked(fetchSettings)
+    .mockReset()
+    .mockReturnValue(new Promise(() => {}));
+});
 
 const ALLOW = { policy: "allow" } as const;
 const NONE = { rule: "none" } as const;
@@ -63,10 +67,25 @@ const SCHEMA: SettingsFieldDescriptor[] = [
   },
 ];
 
+const LIST_SCHEMA: SettingsFieldDescriptor[] = [
+  {
+    section: "plugin:acme.kit",
+    field: "tags",
+    category: "Plugins",
+    label: "Tags",
+    description: "",
+    widget: { kind: "list" },
+    web_write: ALLOW,
+    profile_overridable: false,
+    validation: NONE,
+    advanced: false,
+  },
+];
+
 describe("PluginSettingsSections", () => {
   it("renders only plugin sections, seeding the manifest default until a value is stored", () => {
     const { rerender } = render(
-      <PluginSettingsSections schema={SCHEMA} settings={{ plugins: {} }} onSaved={() => {}} />,
+      <PluginSettingsSections schema={SCHEMA} settings={{ plugins: {} }} onSaveField={async () => true} />,
     );
     expect(screen.getByText("acme.kit")).toBeTruthy();
     expect(screen.queryByText("Idle Decay")).toBeNull();
@@ -75,38 +94,21 @@ describe("PluginSettingsSections", () => {
       <PluginSettingsSections
         schema={SCHEMA}
         settings={{ plugins: { "acme.kit": { settings: { retries: 4 } } } }}
-        onSaved={() => {}}
+        onSaveField={async () => true}
       />,
     );
     expect(screen.getByDisplayValue("4")).toBeTruthy();
   });
 
-  it("saves through the global PATCH with the plugin:<id> section", async () => {
-    const onSaved = vi.fn();
-    render(<PluginSettingsSections schema={SCHEMA} settings={{ plugins: {} }} onSaved={onSaved} />);
+  it("saves a field under its plugin:<id> section", async () => {
+    const onSaveField = vi.fn(async () => true);
+    render(<PluginSettingsSections schema={SCHEMA} settings={{ plugins: {} }} onSaveField={onSaveField} />);
     fireEvent.click(screen.getByRole("switch"));
-    await waitFor(() => {
-      expect(updateSettings).toHaveBeenCalledWith({ "plugin:acme.kit": { enabled: false } });
-    });
-    expect(onSaved).toHaveBeenCalled();
+    await waitFor(() => expect(onSaveField).toHaveBeenCalledWith("plugin:acme.kit", "enabled", false));
   });
 });
 
-describe("PluginSettingsSections list editing while a save is in flight", () => {
-  const LIST_SCHEMA: SettingsFieldDescriptor[] = [
-    {
-      section: "plugin:acme.kit",
-      field: "tags",
-      category: "Plugins",
-      label: "Tags",
-      description: "",
-      widget: { kind: "list" },
-      web_write: ALLOW,
-      profile_overridable: false,
-      validation: NONE,
-      advanced: false,
-    },
-  ];
+describe("plugin list editing through the settings store", () => {
   const stored = (tags: string[]) => ({ plugins: { "acme.kit": { settings: { tags } } } });
   const held = () => {
     let release: (outcome: SaveOutcome) => void = () => {};
@@ -115,80 +117,76 @@ describe("PluginSettingsSections list editing while a save is in flight", () => 
   };
   const lastPatch = () => vi.mocked(updateSettings).mock.calls.at(-1)![0];
 
-  it("builds a Save on the removal still waiting for its PATCH and refetch", async () => {
-    vi.mocked(updateSettings).mockClear();
-    const pendingPatch = held();
-    vi.mocked(updateSettings).mockReturnValueOnce(pendingPatch.promise);
-    render(<PluginSettingsSections schema={LIST_SCHEMA} settings={stored(["a", "b", "c"])} onSaved={refetchPending} />);
+  function Harness() {
+    const { settings, error } = useProfileSettings("main");
+    return (
+      <>
+        <PluginSettingsSections
+          schema={LIST_SCHEMA}
+          settings={settings}
+          onSaveField={(section, field, value) =>
+            saveField("main", section, field, value, () => updateSettings({ [section]: { [field]: value } }, "main"))
+          }
+        />
+        {error && <p role="alert">{error}</p>}
+      </>
+    );
+  }
+
+  async function mount(tags: string[]) {
+    vi.mocked(fetchSettings).mockResolvedValueOnce(stored(tags));
+    await act(async () => {
+      await loadSettings("main");
+    });
+    const view = render(<Harness />);
+    await waitFor(() => expect(screen.getByText(tags[0]!)).toBeTruthy());
+    return view;
+  }
+
+  const removeFirst = () => fireEvent.click(screen.getAllByTitle(/^Remove /)[0]!);
+
+  it("sends a second edit after the first PATCH, built on the first", async () => {
+    const first = held();
+    vi.mocked(updateSettings).mockReturnValueOnce(first.promise);
+    await mount(["a", "b", "c"]);
 
     fireEvent.click(screen.getByTitle("Edit b"));
-    fireEvent.click(screen.getAllByTitle(/^Remove /)[0]!);
+    removeFirst();
     await waitFor(() => expect(lastPatch()).toEqual({ "plugin:acme.kit": { tags: ["b", "c"] } }));
-
-    // The settings prop is still the old list: neither the PATCH nor the refetch has finished.
     fireEvent.change(await screen.findByDisplayValue("b"), { target: { value: "x" } });
     fireEvent.click(screen.getByText("Save"));
 
-    // Saves of one field go out in order: the edit waits for the removal's PATCH.
     expect(updateSettings).toHaveBeenCalledTimes(1);
-    pendingPatch.release("committed");
+    first.release("committed");
     await waitFor(() => expect(updateSettings).toHaveBeenCalledTimes(2));
     expect(lastPatch()).toEqual({ "plugin:acme.kit": { tags: ["x", "c"] } });
   });
 
-  it("reverts the shown list when the save fails", async () => {
+  it("shows the saved list again when the server rejects the save", async () => {
     const failing = held();
     vi.mocked(updateSettings).mockReturnValueOnce(failing.promise);
-    render(<PluginSettingsSections schema={LIST_SCHEMA} settings={stored(["a", "b"])} onSaved={() => {}} />);
-    fireEvent.click(screen.getAllByTitle(/^Remove /)[0]!);
+    await mount(["a", "b"]);
+    vi.mocked(fetchSettings).mockResolvedValueOnce(stored(["a", "b"]));
+    removeFirst();
     await waitFor(() => expect(screen.queryByText("a")).toBeNull());
+
     failing.release("rejected");
     await waitFor(() => expect(screen.getByText("a")).toBeTruthy());
+    expect(screen.getByRole("alert").textContent).toMatch(/Failed to save/);
   });
 
-  it("keeps an acknowledged save when a later queued save fails before the refetch lands", async () => {
-    vi.mocked(updateSettings).mockClear();
+  it("keeps an acknowledged removal when a later queued save is rejected", async () => {
     const removal = held();
     const edit = held();
     vi.mocked(updateSettings).mockReturnValueOnce(removal.promise).mockReturnValueOnce(edit.promise);
-    // The settings prop never changes: the refetch for the acknowledged removal is still pending.
-    render(<PluginSettingsSections schema={LIST_SCHEMA} settings={stored(["a", "b", "c"])} onSaved={refetchPending} />);
+    await mount(["a", "b", "c"]);
+    vi.mocked(fetchSettings).mockResolvedValueOnce(stored(["b", "c"]));
 
     fireEvent.click(screen.getByTitle("Edit b"));
-    fireEvent.click(screen.getAllByTitle(/^Remove /)[0]!);
+    removeFirst();
     fireEvent.change(await screen.findByDisplayValue("b"), { target: { value: "x" } });
     fireEvent.click(screen.getByText("Save"));
-
     removal.release("committed");
-    await waitFor(() => expect(updateSettings).toHaveBeenCalledTimes(2));
-    edit.release("rejected");
-
-    // The removal was saved, so `a` must not reappear.
-    await waitFor(() => expect(screen.getByText("b")).toBeTruthy());
-    expect(screen.queryByText("a")).toBeNull();
-    fireEvent.click(screen.getByTitle("Edit c"));
-    fireEvent.change(screen.getByDisplayValue("c"), { target: { value: "y" } });
-    fireEvent.click(screen.getByText("Save"));
-    await waitFor(() => expect(updateSettings).toHaveBeenCalledTimes(3));
-    expect(lastPatch()).toEqual({ "plugin:acme.kit": { tags: ["b", "y"] } });
-  });
-
-  it("keeps an acknowledged save when a save submitted after it fails before the refetch lands", async () => {
-    vi.mocked(updateSettings).mockClear();
-    const removal = held();
-    const edit = held();
-    vi.mocked(updateSettings).mockReturnValueOnce(removal.promise).mockReturnValueOnce(edit.promise);
-    // The settings prop never changes: the refetch for the acknowledged removal is still pending.
-    render(<PluginSettingsSections schema={LIST_SCHEMA} settings={stored(["a", "b", "c"])} onSaved={refetchPending} />);
-
-    fireEvent.click(screen.getAllByTitle(/^Remove /)[0]!);
-    removal.release("committed");
-    await waitFor(() => expect(screen.queryByText("a")).toBeNull());
-
-    // Only now is the edit submitted, with the removal already acknowledged and nothing in flight.
-    fireEvent.click(screen.getByTitle("Edit b"));
-    fireEvent.change(screen.getByDisplayValue("b"), { target: { value: "x" } });
-    fireEvent.click(screen.getByText("Save"));
     await waitFor(() => expect(updateSettings).toHaveBeenCalledTimes(2));
     edit.release("rejected");
 
@@ -202,85 +200,53 @@ describe("PluginSettingsSections list editing while a save is in flight", () => 
   });
 
   it("builds the next edit on a removal still in flight after the list remounts", async () => {
-    vi.mocked(updateSettings).mockClear();
     const removal = held();
     vi.mocked(updateSettings).mockReturnValueOnce(removal.promise);
-    const props = { schema: LIST_SCHEMA, settings: stored(["a", "b", "c"]), onSaved: () => {} };
-    const first = render(<PluginSettingsSections {...props} />);
-    fireEvent.click(screen.getAllByTitle(/^Remove /)[0]!);
+    const first = await mount(["a", "b", "c"]);
+    removeFirst();
     await waitFor(() => expect(lastPatch()).toEqual({ "plugin:acme.kit": { tags: ["b", "c"] } }));
 
     first.unmount();
-    render(<PluginSettingsSections {...props} />);
+    render(<Harness />);
     await waitFor(() => expect(screen.queryByText("a")).toBeNull());
-    fireEvent.click(screen.getAllByTitle(/^Remove /)[0]!);
+    removeFirst();
 
-    // The second removal waits for the first PATCH and removes `b` from `[b, c]`, not from `[a, b, c]`.
     expect(updateSettings).toHaveBeenCalledTimes(1);
     removal.release("committed");
     await waitFor(() => expect(updateSettings).toHaveBeenCalledTimes(2));
     expect(lastPatch()).toEqual({ "plugin:acme.kit": { tags: ["c"] } });
   });
 
-  it("keeps a committed removal across a remount while its refetch is still pending", async () => {
-    vi.mocked(updateSettings).mockClear();
-    const onSaved = vi.fn(refetchPending);
-    const props = { schema: LIST_SCHEMA, settings: stored(["a", "b", "c"]), onSaved };
-    const first = render(<PluginSettingsSections {...props} />);
-    fireEvent.click(screen.getAllByTitle(/^Remove /)[0]!);
-    await waitFor(() => expect(onSaved).toHaveBeenCalledTimes(1));
+  it("keeps a committed removal across a remount while a refetch has not landed", async () => {
+    const first = await mount(["a", "b", "c"]);
+    removeFirst();
+    await waitFor(() => expect(updateSettings).toHaveBeenCalledTimes(1));
 
-    // The refetch has not landed: the prop still shows the old list.
+    // Nothing refetched: the cache still shows the optimistic list when the tab reopens.
     first.unmount();
-    render(<PluginSettingsSections {...props} />);
+    render(<Harness />);
     expect(screen.queryByText("a")).toBeNull();
-    fireEvent.click(screen.getAllByTitle(/^Remove /)[0]!);
+    removeFirst();
     await waitFor(() => expect(updateSettings).toHaveBeenCalledTimes(2));
     expect(lastPatch()).toEqual({ "plugin:acme.kit": { tags: ["c"] } });
   });
 
-  it("keeps a committed removal when its refetch fails", async () => {
-    vi.mocked(updateSettings).mockClear();
-    const onSaved = vi.fn(() => Promise.resolve(false));
-    render(<PluginSettingsSections schema={LIST_SCHEMA} settings={stored(["a", "b", "c"])} onSaved={onSaved} />);
-    fireEvent.click(screen.getAllByTitle(/^Remove /)[0]!);
-    await waitFor(() => expect(onSaved).toHaveBeenCalledTimes(1));
-    await Promise.resolve();
+  it("warns and keeps the edit when a write never landed and every fetch shows the old list", async () => {
+    vi.mocked(updateSettings).mockResolvedValue("uncertain");
+    await mount(["a", "b", "c"]);
+    vi.mocked(fetchSettings).mockResolvedValue(stored(["a", "b", "c"]));
 
-    expect(screen.queryByText("a")).toBeNull();
-    fireEvent.click(screen.getAllByTitle(/^Remove /)[0]!);
-    await waitFor(() => expect(updateSettings).toHaveBeenCalledTimes(2));
-    expect(lastPatch()).toEqual({ "plugin:acme.kit": { tags: ["c"] } });
-  });
+    removeFirst();
 
-  it("keeps the edit when the server persisted it but the outcome is uncertain, then refetches", async () => {
-    vi.mocked(updateSettings).mockClear();
-    const outcome = held();
-    vi.mocked(updateSettings).mockReturnValueOnce(outcome.promise);
-    const onSaved = vi.fn();
-    render(<PluginSettingsSections schema={LIST_SCHEMA} settings={stored(["a", "b", "c"])} onSaved={onSaved} />);
-    fireEvent.click(screen.getAllByTitle(/^Remove /)[0]!);
-    await waitFor(() => expect(screen.queryByText("a")).toBeNull());
-
-    outcome.release("uncertain");
-    await waitFor(() => expect(onSaved).toHaveBeenCalledTimes(1));
-    expect(screen.queryByText("a")).toBeNull();
-    fireEvent.click(screen.getAllByTitle(/^Remove /)[0]!);
-    await waitFor(() => expect(updateSettings).toHaveBeenCalledTimes(2));
-    expect(lastPatch()).toEqual({ "plugin:acme.kit": { tags: ["c"] } });
-  });
-
-  it("shows the refetched settings once they arrive", async () => {
-    const done = held();
-    vi.mocked(updateSettings).mockReturnValueOnce(done.promise);
-    const { rerender } = render(
-      <PluginSettingsSections schema={LIST_SCHEMA} settings={stored(["a", "b"])} onSaved={() => {}} />,
+    await waitFor(() => expect(updateSettings).toHaveBeenCalledTimes(3));
+    await waitFor(() =>
+      expect(screen.getByRole("alert").textContent).toMatch(/Could not confirm plugin:acme\.kit\.tags/),
     );
-    fireEvent.click(screen.getAllByTitle(/^Remove /)[0]!);
-    done.release("committed");
-    await waitFor(() => expect(screen.queryByText("a")).toBeNull());
-    rerender(<PluginSettingsSections schema={LIST_SCHEMA} settings={stored(["z"])} onSaved={() => {}} />);
-    expect(screen.getByText("z")).toBeTruthy();
-    expect(screen.queryByText("b")).toBeNull();
+    expect(screen.queryByText("a")).toBeNull();
+
+    // A late commit and a later edit cannot restore `a`: the edit builds on the kept list.
+    removeFirst();
+    await waitFor(() => expect(updateSettings).toHaveBeenCalledTimes(4));
+    expect(lastPatch()).toEqual({ "plugin:acme.kit": { tags: ["c"] } });
   });
 });

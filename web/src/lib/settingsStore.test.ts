@@ -138,7 +138,7 @@ describe("settings store", () => {
     await waitFor(() => expect(listOf(hook)).toEqual(["x", "b"]));
   });
 
-  it("resends an edit that never landed, then shows the saved value with a persistent error", async () => {
+  it("resends an edit that never landed, then leaves it unresolved on screen with a persistent error", async () => {
     const hook = await seed("main", ["a", "b"]);
     vi.mocked(fetchSettings).mockResolvedValue(plugins(["a", "b"]));
     const send = vi.fn(async (): Promise<SaveOutcome> => "uncertain");
@@ -147,15 +147,34 @@ describe("settings store", () => {
       await saveField("main", "web", "list", ["b"], send);
     });
 
-    await waitFor(() => expect(hook.result.current.error).toMatch(/Could not save web\.list/));
+    await waitFor(() => expect(hook.result.current.error).toMatch(/Could not confirm web\.list/));
     expect(send).toHaveBeenCalledTimes(3);
-    expect(listOf(hook)).toEqual(["a", "b"]);
-    // Nothing is left to reconcile: a further save does not fetch again.
-    const calls = vi.mocked(fetchSettings).mock.calls.length;
+    // No fetch can prove a late commit is not coming, so the saved value does not replace the edit.
+    expect(listOf(hook)).toEqual(["b"]);
+  });
+
+  it("builds the next edit on an unresolved one, so a late commit cannot restore a removal", async () => {
+    const hook = await seed("main", ["a", "b", "c"]);
+    // Every send reports an unknown outcome and every fetch still shows the old list.
+    vi.mocked(fetchSettings).mockResolvedValue(plugins(["a", "b", "c"]));
     await act(async () => {
-      await saveField("main", "web", "flag", true, async () => "committed");
+      await saveField("main", "web", "list", ["b", "c"], async () => "uncertain");
     });
-    expect(fetchSettings).toHaveBeenCalledTimes(calls);
+    await waitFor(() => expect(hook.result.current.error).toMatch(/showing your value/));
+    expect(listOf(hook)).toEqual(["b", "c"]);
+
+    // The delayed commit lands, then the user removes `b`: the payload keeps `a` removed.
+    const sent: unknown[] = [];
+    const next = (listOf(hook) ?? []).filter((x) => x !== "b");
+    await act(async () => {
+      await saveField("main", "web", "list", next, async () => {
+        vi.mocked(fetchSettings).mockResolvedValue(plugins(next as string[]));
+        sent.push(next);
+        return "committed";
+      });
+    });
+    expect(sent).toEqual([["c"]]);
+    expect(listOf(hook)).toEqual(["c"]);
   });
 
   it("keeps the could-not-confirm message when another field is edited meanwhile", async () => {
