@@ -67,30 +67,22 @@ fn watch_paths_resolve_in_a_git_worktree() {
     let main_repo = tmp.path().join("main");
     std::fs::create_dir(&main_repo).expect("create main repo dir");
 
-    assert!(git(&main_repo, &["init", "-q"]).status.success());
-    // Identity + a commit so HEAD points at something and a worktree can branch.
+    git(&main_repo, &["init", "-q"]);
     git(&main_repo, &["config", "user.email", "test@example.com"]);
     git(&main_repo, &["config", "user.name", "Test"]);
-    assert!(git(&main_repo, &["commit", "--allow-empty", "-qm", "init"])
-        .status
-        .success());
+    git(&main_repo, &["commit", "--allow-empty", "-qm", "init"]);
 
     let worktree = tmp.path().join("wt");
-    assert!(
-        git(
-            &main_repo,
-            &[
-                "worktree",
-                "add",
-                "-q",
-                worktree.to_str().unwrap(),
-                "-b",
-                "wt-branch",
-            ],
-        )
-        .status
-        .success(),
-        "failed to create worktree"
+    git(
+        &main_repo,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            worktree.to_str().unwrap(),
+            "-b",
+            "wt-branch",
+        ],
     );
 
     // Sanity: in a worktree `.git` is a file, so the naive hardcoded path the
@@ -243,12 +235,12 @@ fn watched_paths_move_on_a_commit_but_not_on_a_plain_status() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let repo = tmp.path().join("repo");
     std::fs::create_dir(&repo).expect("create repo dir");
-    assert!(git(&repo, &["init", "-q"]).status.success());
+    git(&repo, &["init", "-q"]);
     git(&repo, &["config", "user.email", "test@example.com"]);
     git(&repo, &["config", "user.name", "Test"]);
     std::fs::write(repo.join("tracked.txt"), "one\n").expect("write tracked file");
-    assert!(git(&repo, &["add", "tracked.txt"]).status.success());
-    assert!(git(&repo, &["commit", "-qm", "init"]).status.success());
+    git(&repo, &["add", "tracked.txt"]);
+    git(&repo, &["commit", "-qm", "init"]);
 
     let snapshot = |repo: &Path| -> Vec<(String, Vec<u8>)> {
         build_git_watch::git_watch_paths(repo)
@@ -280,7 +272,7 @@ fn watched_paths_move_on_a_commit_but_not_on_a_plain_status() {
                 .set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(1)),
         )
         .expect("backdate tracked file");
-    assert!(git(&repo, &["status", "--porcelain"]).status.success());
+    git(&repo, &["status", "--porcelain"]);
     assert_ne!(
         index_before,
         std::fs::read(&index).expect("read index"),
@@ -294,9 +286,7 @@ fn watched_paths_move_on_a_commit_but_not_on_a_plain_status() {
 
     // A commit advances the branch ref; `HEAD` itself never changes, so the
     // reflog is what keeps the embedded version from going stale.
-    assert!(git(&repo, &["commit", "-qm", "second", "--allow-empty"])
-        .status
-        .success());
+    git(&repo, &["commit", "-qm", "second", "--allow-empty"]);
     assert_ne!(
         before,
         snapshot(&repo),

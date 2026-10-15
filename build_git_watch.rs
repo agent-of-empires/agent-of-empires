@@ -1,6 +1,6 @@
 // Shared by build.rs and tests/integration/build_version_rerun.rs; dependency-free.
 
-/// Watch existing HEAD and reflog paths, never the index or missing inputs.
+/// Skip index churn from `git status` and missing inputs that keep Cargo stale.
 pub fn git_watch_paths(dir: &std::path::Path) -> Vec<String> {
     ["HEAD", "logs/HEAD"]
         .iter()
@@ -25,6 +25,8 @@ fn git_path(dir: &std::path::Path, file: &str) -> Option<String> {
     }
 }
 
+// Ignore repository selectors exported by Git hooks so metadata describes `dir`.
+// Keep protected configuration such as `safe.directory`.
 fn build_git_command(dir: &std::path::Path) -> std::process::Command {
     let mut command = std::process::Command::new("git");
     command

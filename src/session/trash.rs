@@ -1145,62 +1145,27 @@ mod tests {
         if !git_available() {
             return;
         }
+        use crate::git::test_support::run_git;
+
         let tmp = tempfile::TempDir::new().unwrap();
         let main_repo = tmp.path().join("main");
         let worktree = tmp.path().join("wt");
         std::fs::create_dir_all(&main_repo).unwrap();
-        let git = |args: &[&str]| {
-            let output = std::process::Command::new("git")
-                .args(args)
-                .current_dir(&main_repo)
-                .env("GIT_CONFIG_GLOBAL", "/dev/null")
-                .env("GIT_CONFIG_SYSTEM", "/dev/null")
-                .env("GIT_CONFIG_NOSYSTEM", "1")
-                .env_remove("GIT_CONFIG")
-                .env_remove("GIT_CONFIG_COUNT")
-                .env_remove("GIT_CONFIG_PARAMETERS")
-                .env_remove("GIT_DIR")
-                .env_remove("GIT_WORK_TREE")
-                .env_remove("GIT_COMMON_DIR")
-                .env_remove("GIT_INDEX_FILE")
-                .env_remove("GIT_OBJECT_DIRECTORY")
-                .env_remove("GIT_ALTERNATE_OBJECT_DIRECTORIES")
-                .env_remove("GIT_PREFIX")
-                .env("GIT_TEMPLATE_DIR", "")
-                .output()
-                .expect("run git fixture command");
-            assert!(
-                output.status.success(),
-                "git {args:?} failed: {}",
-                String::from_utf8_lossy(&output.stderr)
-            );
-        };
-        for args in [
-            vec!["init", "-q", "-b", "main", "."],
-            vec![
+        run_git(&main_repo, &["init", "-q", "-b", "main", "."]);
+        run_git(&main_repo, &["commit", "-q", "--allow-empty", "-m", "init"]);
+        run_git(
+            &main_repo,
+            &[
                 "-c",
-                "user.email=t@t",
-                "-c",
-                "user.name=t",
-                "commit",
+                "worktree.useRelativePaths=true",
+                "worktree",
+                "add",
                 "-q",
-                "--allow-empty",
-                "-m",
-                "init",
+                "-b",
+                "feat",
+                worktree.to_str().unwrap(),
             ],
-        ] {
-            git(&args);
-        }
-        git(&[
-            "-c",
-            "worktree.useRelativePaths=true",
-            "worktree",
-            "add",
-            "-q",
-            "-b",
-            "feat",
-            worktree.to_str().unwrap(),
-        ]);
+        );
 
         let link = std::fs::read_to_string(worktree.join(".git")).unwrap();
         let target = link.split_once("gitdir:").unwrap().1.trim().to_string();
