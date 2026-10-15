@@ -184,3 +184,45 @@ fn split_hides_info_headers_so_output_owns_each_half() {
     );
     assert!(!screen.contains("hide info with"), "{screen}");
 }
+
+/// The empty-terminal hint names the key that actually starts it: in live mode `T` goes
+/// to the agent, so the hint points at the leader chord instead.
+#[test]
+#[serial]
+fn split_empty_terminal_hint_follows_live_mode() {
+    use crate::tui::home::live_send::{parse_chord, LiveSendState, LiveSendTarget};
+
+    let cache = crate::tmux::SessionCacheGuard::capture();
+    let cases = [
+        ("not live", None, "Press T to start one"),
+        (
+            "live with leader",
+            parse_chord("C-b"),
+            "Press Ctrl+B then t to start one",
+        ),
+        (
+            "live, leader disabled",
+            None,
+            "Exit live mode, then press T to start one",
+        ),
+    ];
+    for (i, (name, leader, expected)) in cases.into_iter().enumerate() {
+        let (mut env, agent, _term) = split_env(false);
+        cache.force_present(&[agent.as_str()]);
+        if i > 0 {
+            let inst = env.view.instance_at(0).clone();
+            env.view.live_send = Some(LiveSendState {
+                session_id: inst.id.clone(),
+                title: inst.title.clone(),
+                tmux_name: agent.clone(),
+                target: LiveSendTarget::Agent,
+                exit_chords: Vec::new(),
+                leader,
+            });
+        }
+
+        let screen = render_home_to_string(&mut env.view, 120, 40);
+
+        assert!(screen.contains(expected), "{name}:\n{screen}");
+    }
+}

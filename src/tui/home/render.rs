@@ -2223,8 +2223,16 @@ impl HomeView {
                 .is_some_and(|inst| self.paired_terminal_running_for_display(inst))
         {
             let key = if self.strict_hotkeys { "Ctrl+T" } else { "T" };
+            // Live mode forwards `T` to the agent; only the leader reaches the swap.
+            let how = match self.live_send.as_ref().map(|state| state.leader) {
+                Some(Some(leader)) => {
+                    format!("Press {} then t", live_send::display_chord(leader))
+                }
+                Some(None) => format!("Exit live mode, then press {key}"),
+                None => format!("Press {key}"),
+            };
             frame.render_widget(
-                Paragraph::new(format!("No terminal running. Press {key} to start one."))
+                Paragraph::new(format!("No terminal running. {how} to start one."))
                     .style(Style::default().fg(theme.dimmed))
                     .alignment(Alignment::Center),
                 rect,
