@@ -1,7 +1,7 @@
 // REST replay of ACP history: recent-first cold open, forward top-up, and older pages.
 
 import { lastUserBoundaryIndex } from "../../lib/acpHistoryWindow";
-import type { AcpFrame, TranscriptRow } from "../../lib/acpTypes";
+import { mergePrependedActivity, type AcpFrame, type TranscriptRow } from "../../lib/acpTypes";
 import { toActivityRows, type Action } from "./reducer";
 
 // Re-request this many seqs behind lastSeq; the reducer's seq dedupe makes the overlap idempotent.
@@ -81,7 +81,7 @@ async function fetchTail(
     if (!res.ok) break;
     const page = (await res.json()) as ReplayPageResponse;
     signal.throwIfAborted();
-    rows = toActivityRows(page.rows ?? [], sid).concat(rows);
+    rows = mergePrependedActivity(toActivityRows(page.rows ?? [], sid), rows);
     const next = page.next_cursor ?? cursor;
     hasMore = (page.has_more ?? false) && next < cursor;
     cursor = next;

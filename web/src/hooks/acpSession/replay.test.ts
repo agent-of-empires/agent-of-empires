@@ -77,6 +77,30 @@ describe("fetchTail", () => {
     expect(setHasMore).toHaveBeenCalledWith(false);
   });
 
+  it("merges a tool start split across the page seam into the tail placeholder", async () => {
+    const toolStart = (id: string, name: string, startedAt: string): TranscriptRow => ({
+      ...row(id, "tool_start"),
+      tool_call_id: "c1",
+      tool: { id: "c1", name, kind: "read", args_preview: "", started_at: startedAt },
+    });
+    mockReplay({
+      [TAIL]: {
+        rows: [toolStart("start-c1", "tool call", "2026-01-01T00:05:00Z")],
+        next_cursor: 80,
+        has_more: true,
+      },
+      "80": {
+        rows: [row("u", "user_prompt"), toolStart("tool-c1", "Read", "2026-01-01T00:00:00Z")],
+        next_cursor: 40,
+        has_more: true,
+      },
+    });
+    const { frames } = await coldOpen();
+    const starts = frames[0]!.rows!.filter((r) => r.kind === "tool_start");
+    expect(starts).toHaveLength(1);
+    expect(starts[0]!.tool).toMatchObject({ name: "Read", started_at: "2026-01-01T00:00:00Z" });
+  });
+
   it("still fetches the handshake when paging reaches the start of history", async () => {
     const requests = mockReplay({
       [TAIL]: { rows: [row("t1", "tool_start")], next_cursor: 80, has_more: true },
