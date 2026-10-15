@@ -126,6 +126,24 @@ impl Instance {
         &mut self,
         cancel: &tokio_util::sync::CancellationToken,
     ) -> Result<containers::DockerContainer> {
+        self.ensure_container(cancel, false)
+    }
+
+    /// [`Self::get_container_for_instance`] for a persisted session: the stored row is reread
+    /// under the lifecycle flock, held through the runtime start or create, so a completed archive
+    /// or trash cannot be followed by a container come-up. Hooks run before the flock is taken.
+    pub(super) fn get_container_admitted(&mut self) -> Result<containers::DockerContainer> {
+        self.ensure_container(&tokio_util::sync::CancellationToken::new(), true)
+    }
+
+    fn ensure_container(
+        &mut self,
+        cancel: &tokio_util::sync::CancellationToken,
+        admit: bool,
+    ) -> Result<containers::DockerContainer> {
+        // Taken inside the shared transition flock below; no holder of the lifecycle flock waits
+        // for that flock exclusively, so the order cannot cycle.
+        let admission = |instance: &Self| admit.then(|| instance.lock_for_input()).transpose();
         let checkpoint = || {
             if cancel.is_cancelled() {
                 anyhow::bail!("sandbox start cancelled");
@@ -259,6 +277,7 @@ impl Instance {
                 if recreate {
                     container.remove(false)?;
                 } else {
+                    let _admission = admission(self)?;
                     container_config::place_shadowed_credential_mountpoints(&config);
                     container.start()?;
                     self.finish_container_reuse(&container, &config, &command)?;
@@ -279,6 +298,7 @@ impl Instance {
         if !recreate {
             self.ensure_before_start_env(true)?;
         }
+        let _admission = admission(self)?;
         let config = self.build_container_config()?;
         // Still the workdir the *previous* container was created with; the pin below
         // is what moves it forward.
@@ -1018,6 +1038,157 @@ claude-personal = "~/.claude-global"
                 instance.container_agent_identity().unwrap(),
                 "{tool}/{detect_as}"
             );
+        }
+    }
+
+    /// #4205: an archive or trash that completes while the `before_start` hook runs stops the
+    /// container come-up, for both the restart and the create branch.
+    #[cfg(unix)]
+    #[test]
+    #[serial_test::serial]
+    fn admitted_container_start_refuses_a_row_dismissed_during_the_hook() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let _home = crate::session::test_support::isolate_app_dir_at(temp.path());
+        let project = temp.path().join("project");
+        std::fs::create_dir(&project).unwrap();
+        let bin = temp.path().join("bin");
+        std::fs::create_dir(&bin).unwrap();
+        let calls_path = temp.path().join("runtime-calls");
+        let absent_path = temp.path().join("container-absent");
+        // A stopped `opencode` container (no shared credential mounts to match) unless
+        // `absent_path` exists. Bring-up calls are logged and fail, so the launch stops before tmux.
+        let script = format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{calls}'\n\
+             case \"$1\" in start|run|create) echo 'permission denied' >&2; exit 1;; image) exit 0;; esac\n\
+             if [ \"$1\" = container ] && [ \"$2\" = inspect ]; then\n\
+             if [ -e '{absent}' ]; then echo 'Error: No such container: c' >&2; exit 1; fi\n\
+             if [ \"$#\" -eq 3 ]; then echo '[{{\"Id\":\"fake\",\"State\":{{\"Running\":false}},\"Mounts\":[]}}]'; exit 0; fi\n\
+             case \"$*\" in\n\
+             *agent-tool*) ;;\n\
+             *sandbox-store-generation*) echo 2 ;;\n\
+             *State.Running*) echo false ;;\n\
+             esac\n\
+             exit 0\n\
+             fi\n\
+             exit 1\n",
+            calls = calls_path.display(),
+            absent = absent_path.display(),
+        );
+        for binary in ["docker", "podman", "container"] {
+            let path = bin.join(binary);
+            std::fs::write(&path, &script).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let _path = crate::session::test_support::path_prepended(&bin);
+
+        type Dismiss = (&'static str, fn(&mut Instance), StartBlocked);
+        let dismissals: [Dismiss; 2] = [
+            ("archive", Instance::archive, StartBlocked::Archived),
+            ("trash", Instance::trash, StartBlocked::Trashed),
+        ];
+        // (label, container present, dismissal; `None` is the control)
+        let mut cases = Vec::new();
+        for present in [true, false] {
+            cases.push((present, None));
+            cases.extend(dismissals.iter().map(|d| (present, Some(d))));
+        }
+        for (present, dismissal) in cases {
+            let label = format!(
+                "{}-{}",
+                if present { "stopped" } else { "create" },
+                dismissal.map_or("control", |(name, ..)| name)
+            );
+            let _ = std::fs::remove_file(&calls_path);
+            if present {
+                let _ = std::fs::remove_file(&absent_path);
+            } else {
+                std::fs::write(&absent_path, "").unwrap();
+            }
+            let ready = temp.path().join(format!("{label}-ready"));
+            let release = temp.path().join(format!("{label}-release"));
+            let hook = format!(
+                ": > {}; while [ ! -e {} ]; do sleep 0.01; done",
+                crate::session::environment::shell_escape(&ready.to_string_lossy()),
+                crate::session::environment::shell_escape(&release.to_string_lossy()),
+            );
+            crate::session::config::update_config(|global| {
+                global.host_hooks.before_start = vec![hook];
+            })
+            .unwrap();
+
+            let profile = format!("admit-{label}");
+            let _registry = crate::tmux::status_rules::ProfileRegistryGuard::take(&profile);
+            let storage = crate::session::storage::Storage::new_unwatched(&profile).unwrap();
+            let mut instance = Instance::new(&label, project.to_str().unwrap());
+            instance.tool = "opencode".to_string();
+            instance.source_profile = profile.clone();
+            instance.sandbox_info = Some(SandboxInfo {
+                provider: None,
+                enabled: true,
+                container_id: None,
+                image: "test:latest".to_string(),
+                container_name: "admit".to_string(),
+                extra_env: None,
+                custom_instruction: None,
+                before_start_env: Vec::new(),
+                container_workdir: None,
+            });
+            let id = instance.id.clone();
+            storage
+                .update(|instances, _groups| {
+                    instances.push(instance.clone());
+                    Ok(())
+                })
+                .unwrap();
+
+            let launch = std::thread::spawn(move || instance.get_container_admitted().map(|_| ()));
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            while !ready.exists() && std::time::Instant::now() < deadline {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            assert!(ready.exists(), "{label}: the hook never ran");
+            if let Some((_, dismiss, _)) = dismissal {
+                let _lock = storage.acquire_instance_lifecycle_lock(&id).unwrap();
+                storage
+                    .update(|instances, _groups| {
+                        dismiss(instances.iter_mut().find(|row| row.id == id).unwrap());
+                        Ok(())
+                    })
+                    .unwrap();
+            }
+            std::fs::write(&release, "").unwrap();
+            let error = launch
+                .join()
+                .unwrap()
+                .expect_err("the fake runtime fails every bring-up");
+
+            let calls = std::fs::read_to_string(&calls_path).unwrap_or_default();
+            let brought_up = calls.lines().any(|line| {
+                ["start ", "run ", "create "]
+                    .iter()
+                    .any(|v| line.starts_with(v))
+            });
+            let case = format!("{label}: {error:#}\n{calls}");
+            match dismissal {
+                Some((_, _, blocked)) => {
+                    assert!(!brought_up, "{case}");
+                    assert_eq!(
+                        error.downcast_ref::<StartBlocked>(),
+                        Some(blocked),
+                        "{case}"
+                    );
+                    let row = storage
+                        .load()
+                        .unwrap()
+                        .into_iter()
+                        .find(|row| row.id == id)
+                        .unwrap();
+                    assert_eq!(row.ensure_startable().unwrap_err(), *blocked, "{case}");
+                }
+                None => assert!(brought_up, "{case}"),
+            }
         }
     }
 }
