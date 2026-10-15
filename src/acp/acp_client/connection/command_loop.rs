@@ -29,9 +29,7 @@ use crate::acp::acp_client::control::DaemonControlClient;
 use crate::acp::acp_client::delete::handle_delete_session_cmd;
 use crate::acp::acp_client::errors::acp_internal_error;
 use crate::acp::acp_client::lifecycle::LifecycleEnvelope;
-use crate::acp::acp_client::rate_limit::{
-    clear_captured_rejections, rate_limit_from_captured_rejection,
-};
+use crate::acp::acp_client::rate_limit::take_rate_limit_from_captured_rejection;
 use crate::acp::acp_client::reset::{
     await_reset_request, ResetRequestError, ResetSessionOutcome, SESSION_RESET_IN_TASK_TIMEOUT,
 };
@@ -222,9 +220,10 @@ impl Session {
         }
         // The limit arrives as agent text with no prompt error; park like the
         // prompt path so the reaper can resume after the reset (#4373).
-        let captured =
-            rate_limit_from_captured_rejection(&shared.rate_limit_rejections, chrono::Utc::now());
-        clear_captured_rejections(&shared.rate_limit_rejections);
+        let captured = take_rate_limit_from_captured_rejection(
+            &shared.rate_limit_rejections,
+            chrono::Utc::now(),
+        );
         if let Some(info) = captured {
             info!(
                 target: "acp.protocol",
