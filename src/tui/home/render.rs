@@ -174,8 +174,6 @@ pub(super) fn map_live_preview_cursor(
     Some(Position::new(col as u16, row as u16))
 }
 
-/// Pane lines to capture for the preview, accounting for the scrollback offset plus a
-/// buffer so moderate scrolls don't force a fresh capture on every wheel tick.
 /// Rows each split half needs; a shorter preview stays single.
 const SPLIT_MIN_HALF_ROWS: u16 = 6;
 
@@ -212,6 +210,8 @@ pub(super) fn split_preview_rects(inner: Rect) -> Option<SplitRects> {
     })
 }
 
+/// Pane lines to capture for the preview, accounting for the scrollback offset plus a
+/// buffer so moderate scrolls don't force a fresh capture on every wheel tick.
 fn capture_lines_for(height: u16, scroll_offset: u16) -> usize {
     // Off the live edge: capture the whole scrollback once so the snapshot stays put. A
     // window that grew per notch was re-anchored to the advancing live edge on every
