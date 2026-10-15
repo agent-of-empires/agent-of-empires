@@ -5,7 +5,14 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 
 import { SessionWizard, type WizardPrefill } from "../SessionWizard";
-import { fetchAgents, fetchCreateProgress, fetchIsGitRepo, fetchProfiles, fetchSettings } from "../../../lib/api";
+import {
+  fetchAgents,
+  fetchCreateProgress,
+  fetchDockerStatus,
+  fetchIsGitRepo,
+  fetchProfiles,
+  fetchSettings,
+} from "../../../lib/api";
 import { agent } from "./fixtures";
 import { toastBus } from "../../../lib/toastBus";
 import { startPendingCreates } from "../../../lib/pendingCreates";
@@ -551,5 +558,33 @@ describe("SessionWizard unknown create outcome", () => {
     // Resolved, so a later wizard starts a fresh request.
     renderWizard();
     expect(screen.queryByText(/may still be created/)).toBeNull();
+  });
+});
+
+// #4517: only a sandboxed launch has to wait on the Docker probe.
+describe("SessionWizard Docker readiness", () => {
+  const launchButton = () => screen.getByText(/Launch session/).closest("button") as HTMLButtonElement;
+  const pendingProbe = () => {
+    let answer!: (v: { available: boolean; runtime: string | null }) => void;
+    vi.mocked(fetchDockerStatus).mockReturnValueOnce(new Promise((r) => (answer = r)));
+    return (available: boolean) => answer({ available, runtime: null });
+  };
+
+  it("enables Launch without waiting for Docker when the sandbox is off", async () => {
+    pendingProbe();
+    renderWizard();
+    await waitFor(() => expect(launchButton().disabled).toBe(false));
+  });
+
+  it("holds a sandboxed Launch for the probe, then reports an unavailable runtime", async () => {
+    const answer = pendingProbe();
+    renderWizard({ path: "/tmp/proj", tool: "claude", sandboxEnabled: true });
+    await waitFor(() => expect(fetchSettings).toHaveBeenCalled());
+    expect(launchButton().disabled).toBe(true);
+    answer(false);
+    await waitFor(() => expect(launchButton().disabled).toBe(false));
+    fireEvent.click(launchButton());
+    expect(await screen.findByText(/Sandbox unavailable: Docker is not running/)).toBeTruthy();
+    expect(createSession).not.toHaveBeenCalled();
   });
 });

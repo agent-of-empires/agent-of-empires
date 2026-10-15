@@ -176,6 +176,7 @@ export function SessionWizard({ onClose, onCreated, onCreatedInBackground, prefi
     groups: [],
     profiles: [],
     dockerAvailable: false,
+    dockerChecked: false,
   });
 
   // No project yet is the TUI's focused Path field: open straight on the picker.
@@ -234,10 +235,10 @@ export function SessionWizard({ onClose, onCreated, onCreatedInBackground, prefi
   useEffect(() => {
     fetchAgents().then((a) => dispatch({ type: "SET_AGENTS", agents: a }));
     fetchGroups().then((g) => dispatch({ type: "SET_GROUPS", groups: g }));
-    // Part of the readiness barrier: a seeded sandbox is only submittable once Docker has answered.
-    const dockerSeed = fetchDockerStatus()
+    // A sandboxed launch waits on this; see the defaultsReady prop on LaunchFooter.
+    fetchDockerStatus()
       .then((d) => dispatch({ type: "SET_DOCKER", available: d.available }))
-      .catch(() => {});
+      .catch(() => dispatch({ type: "SET_DOCKER", available: false }));
     // A remembered or prefilled path is never selected in ProjectStep, so seed its override here.
     const initialPath = state.data.path;
     const initialProfile = state.data.profile;
@@ -291,7 +292,7 @@ export function SessionWizard({ onClose, onCreated, onCreatedInBackground, prefi
         });
       })
       .catch(() => {});
-    void Promise.all([settingsSeed, projectSeed, dockerSeed]).then(() => setDefaultsReady(true));
+    void Promise.all([settingsSeed, projectSeed]).then(() => setDefaultsReady(true));
     // Seed once; a re-render with a new prefill object must not stomp user edits.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
@@ -807,7 +808,9 @@ export function SessionWizard({ onClose, onCreated, onCreatedInBackground, prefi
               }
               onSubmit={handleSubmit}
               nameOnly={nameOnly}
-              defaultsReady={defaultsReady && !profileSwitching && !projectUnresolved}
+              defaultsReady={
+                defaultsReady && !profileSwitching && !projectUnresolved && !(d.sandboxEnabled && !state.dockerChecked)
+              }
               onBackground={creating && onCreatedInBackground ? handleBackground : undefined}
             />
           </div>
