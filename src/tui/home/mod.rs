@@ -378,8 +378,8 @@ pub struct HomeView {
     pub(super) host_tab_title: bool,
 
     pub(super) active_tui_count: usize,
-    pub(super) serve_badge: Option<Option<&'static str>>,
-    pub(super) serve_probe: crate::tui::worker::Worker<(), Option<Option<&'static str>>>,
+    pub(super) serve_running: bool,
+    pub(super) serve_probe: crate::tui::worker::Worker<(), bool>,
     pub(super) serve_probe_in_flight: bool,
 
     pub(super) settings_view: Option<SettingsView>,

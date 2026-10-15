@@ -23,6 +23,8 @@ aoe serve --open                # Open the URL in a browser when ready
 aoe serve --remote --read-only  # Monitor without sending keystrokes
 ```
 
+From the TUI, press `R` (`Ctrl+R` with strict hotkeys), shown as `R Web` in the shortcut bar, to start a background server on your network or over a tunnel. While it runs, the entry reads `R ● Web` in green.
+
 The server prints a URL carrying an auth token; the token becomes a cookie on first visit. `--open` is suppressed with `--daemon`, `--remote`, and whenever no browser you could see is reachable (SSH without `DISPLAY`, a Linux host with no display server); setting `BROWSER` overrides that check except on macOS.
 
 In `--remote` mode the token rotates every 4 hours, so a URL captured at startup eventually stops working. `aoe url` prints the live one against a running daemon (`--all` for every labeled URL, `--token-only` for scripted login), and `--remote` prints a QR code for phone pairing.

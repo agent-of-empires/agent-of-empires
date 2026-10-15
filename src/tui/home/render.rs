@@ -3859,8 +3859,8 @@ impl HomeView {
         let committed_search = !self.search_active && !self.search_matches.is_empty();
 
         // Priority-tagged shortcut groups: lower priority survives longer when the footer
-        // can't fit everything (iPhone Mosh landscape is ~80 cols). Essentials (Nav /
-        // Enter / Help / Quit / Serve) survive first; Diff / Search / Mode / Group drop
+        // can't fit everything (iPhone Mosh landscape is ~80 cols). Essentials (Enter / Help
+        // / the running web dashboard) survive first; Diff / Search / Mode / Group drop
         // first. Groups render in declaration order, joined with · at render time.
         let mk = |key: &str, desc: &str| -> Vec<Span<'static>> {
             vec![
@@ -3884,29 +3884,6 @@ impl HomeView {
         // (priority, click-key, spans); `click-key` is `None` for the non-actionable
         // status indicators, which render but aren't clickable.
         let mut groups: Vec<(u8, Option<KeyEvent>, Vec<Span<'static>>)> = Vec::new();
-
-        // Serve indicator, shown only while the `aoe serve` daemon is live.
-        if let Some(mode_label) = self.serve_badge {
-            // A build without the dashboard bundle answers the API only, so
-            // the badge must not read as "the dashboard is up".
-            let what = if cfg!(feature = "web") {
-                "Serving"
-            } else {
-                "Serving API"
-            };
-            let label = match mode_label {
-                Some(m) => format!(" \u{25CF} {} ({}) ", what, m),
-                None => format!(" \u{25CF} {} ", what),
-            };
-            groups.push((
-                0,
-                None,
-                vec![Span::styled(
-                    label,
-                    Style::default().fg(theme.running).bold(),
-                )],
-            ));
-        }
 
         // Other-TUI indicator, shown when more than one `aoe` TUI is alive: two TUIs
         // watching the same sessions clash over pane sizes (tmux reflows to the smallest
@@ -4009,13 +3986,13 @@ impl HomeView {
         // already uses `N`.
         let new_uses_shift = committed_search && !strict;
         groups.push((
-            2,
+            1,
             kc(if strict || new_uses_shift { 'N' } else { 'n' }),
             mk(if strict || new_uses_shift { "N" } else { "n" }, "New"),
         ));
 
-        // Priority 1 is the core daily workflow (message), which survives the greedy pack
-        // at ~80 cols; del stays at p3 and can drop first.
+        // Priority 1 is the core daily workflow (new, message, the web dashboard), which
+        // survives the greedy pack at ~80 cols; del stays at p3 and can drop first.
         if self.selected_session.is_some() {
             groups.push((
                 1,
@@ -4053,7 +4030,7 @@ impl HomeView {
         // advertises it wherever `f` actually does something.
         if self.selected_session.is_some() && (in_attention || crate::session::favorites_first()) {
             groups.push((
-                1,
+                2,
                 kc(if strict { 'F' } else { 'f' }),
                 mk(if strict { "F" } else { "f" }, "Fav"),
             ));
@@ -4078,6 +4055,10 @@ impl HomeView {
             if strict { kctrl('d') } else { kc('D') },
             mk(if strict { "^D" } else { "D" }, "Diff"),
         ));
+        if !super::input::web_plugin_disabled() {
+            let (priority, spans) = web_footer_entry(self.serve_running, strict, theme);
+            groups.push((priority, if strict { kctrl('r') } else { kc('R') }, spans));
+        }
         groups.push((1, kctrl('k'), mk("^K", "Cmds")));
         groups.push((0, kc('?'), mk_key("?")));
 
@@ -4233,9 +4214,51 @@ impl HomeView {
     }
 }
 
+/// The footer's web dashboard entry and its priority: a hint while no `aoe serve` daemon
+/// runs, then a green status that survives every width, as the old Serving badge did.
+/// A build without the dashboard bundle serves the API only, so it never says "Web".
+fn web_footer_entry(running: bool, strict: bool, theme: &Theme) -> (u8, Vec<Span<'static>>) {
+    let what = if cfg!(feature = "web") { "Web" } else { "API" };
+    let key = Span::styled(
+        if strict { "^R " } else { "R " },
+        Style::default().fg(theme.accent).bold(),
+    );
+    if running {
+        let status = Span::styled(
+            format!("\u{25CF} {what}"),
+            Style::default().fg(theme.running).bold(),
+        );
+        (0, vec![key, status])
+    } else {
+        (
+            1,
+            vec![key, Span::styled(what, Style::default().fg(theme.dimmed))],
+        )
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn web_footer_entry_hints_until_served_then_shows_a_status_that_outranks_hints() {
+        let theme = crate::tui::styles::load_theme("empire");
+        let what = if cfg!(feature = "web") { "Web" } else { "API" };
+        for (running, strict, priority, text) in [
+            (false, false, 1, format!("R {what}")),
+            (false, true, 1, format!("^R {what}")),
+            (true, false, 0, format!("R \u{25CF} {what}")),
+            (true, true, 0, format!("^R \u{25CF} {what}")),
+        ] {
+            let (p, spans) = web_footer_entry(running, strict, &theme);
+            let rendered: String = spans.iter().map(|s| s.content.as_ref()).collect();
+            assert_eq!((p, rendered.as_str()), (priority, text.as_str()));
+            let label_fg = spans.last().and_then(|s| s.style.fg);
+            let expected = if running { theme.running } else { theme.dimmed };
+            assert_eq!(label_fg, Some(expected), "running={running}");
+        }
+    }
 
     #[test]
     fn live_resize_failure_retries_only_after_backoff() {

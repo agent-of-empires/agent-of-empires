@@ -90,6 +90,16 @@ fn flash_text(flash: &Flash) -> &str {
     flash.as_ref().map_or("", |(m, _)| m.as_str())
 }
 
+/// The view's name, matching the footer's web entry. A build without the dashboard bundle
+/// serves the API only.
+fn view_title() -> &'static str {
+    if cfg!(feature = "web") {
+        "Web Dashboard"
+    } else {
+        "Remote API Access"
+    }
+}
+
 /// Clear `area`, draw a titled rounded border, and return the inner area.
 fn render_page(
     frame: &mut Frame,
@@ -177,7 +187,8 @@ fn render_mode_picker(
     (local_available, tunnel_available): (bool, bool),
     flash: &str,
 ) {
-    let inner = render_page(frame, area, " Remote Access ", theme.accent, theme.accent);
+    let title = format!(" {} ", view_title());
+    let inner = render_page(frame, area, &title, theme.accent, theme.accent);
     // The head is the question plus a spacer row.
     let (question, [local, tunnel], flash_area, keys) = card_page(inner, (72, 13), 2, 7);
     centered_line(
@@ -514,11 +525,7 @@ fn render_active(
         theme.title
     };
     let mode_label = if is_tunnel { "tunnel" } else { "local" };
-    let title = if cfg!(feature = "web") {
-        format!(" Remote Access ({mode_label})")
-    } else {
-        format!(" Remote API Access ({mode_label})")
-    };
+    let title = format!(" {} ({mode_label})", view_title());
     let mut header_spans = vec![
         Span::styled(title, Style::default().fg(title_color).bold()),
         Span::styled(format!("  open {}", format_elapsed(elapsed)), dimmed),
@@ -687,7 +694,7 @@ fn render_help_overlay(frame: &mut Frame, area: Rect, theme: &Theme, mode: Serve
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(theme.border))
-        .title(" Remote Access Help ")
+        .title(format!(" {} Help ", view_title()))
         .title_style(heading);
     let inner = block.inner(dialog_area);
     frame.render_widget(block, dialog_area);
@@ -868,6 +875,11 @@ mod tests {
                 "{needle:?}\n{screen}"
             );
         }
+        assert_eq!(
+            screen.contains("Web Dashboard (local)"),
+            cfg!(feature = "web"),
+            "{screen}"
+        );
     }
 
     fn view(state: ServeViewState) -> ServeView {

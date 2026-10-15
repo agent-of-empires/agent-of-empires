@@ -49,6 +49,13 @@ pub(super) enum SidebarSection {
 /// Persist the first-run intro picks: theme name to `config.theme.name`, attach mode to
 /// `default_attach_mode`. Failures are logged and swallowed so a config write hiccup
 /// cannot block startup.
+/// The `aoe.web` plugin serves the dashboard; with it disabled, `R` explains why instead.
+pub(super) fn web_plugin_disabled() -> bool {
+    crate::plugin::registry()
+        .get("aoe.web")
+        .is_some_and(|p| !p.enabled)
+}
+
 fn apply_intro_outcome(outcome: &IntroOutcome) {
     if outcome.final_theme.is_none()
         && outcome.final_attach_mode.is_none()
@@ -3646,10 +3653,7 @@ impl HomeView {
     }
 
     fn open_serve(&mut self) {
-        let web_disabled = crate::plugin::registry()
-            .get("aoe.web")
-            .is_some_and(|p| !p.enabled);
-        if web_disabled {
+        if web_plugin_disabled() {
             self.info_dialog = Some(InfoDialog::new(
                 "Web dashboard disabled",
                 "The aoe.web plugin is disabled, so the web dashboard cannot \

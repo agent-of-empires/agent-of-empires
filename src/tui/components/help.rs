@@ -426,7 +426,7 @@ mod tests {
         // Format: (desc substring, non-strict key, strict key).
         let cases = [
             ("Diff view", "D", "Ctrl+D"),
-            ("Serve", "R", "Ctrl+R"),
+            ("Web dashboard", "R", "Ctrl+R"),
             ("Attach to terminal", "T", "Ctrl+T"),
             ("New from selection", "N", "Ctrl+N"),
             ("Projects", "p", "P"),
