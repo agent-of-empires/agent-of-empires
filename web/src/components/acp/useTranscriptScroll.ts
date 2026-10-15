@@ -42,6 +42,12 @@ export function useTranscriptScroll({
   // keyboard resize that clears `wasAtBottomRef` but cannot clear this.
   const lastAtBottomAtRef = useRef(0);
   const toolAnchorsRef = useRef<readonly ToolAnchor[]>([]);
+  // Keep an unclamped fold correction until later content provides its scroll range.
+  const pendingToolAnchorDeltaRef = useRef<number | null>(null);
+  // A fold can remove a card before React remounts its replacement.
+  const pendingFoldAnchorMissRef = useRef(false);
+  // Keep stale anchors through another layout pass; a later fold commit can clamp a correction.
+  const pendingFoldCorrectionStableRef = useRef(false);
   // The pin intent when the anchors were last fresh. A fold shrinks the layout under the
   // reader and the browser clamps the scroll, which would otherwise read as a re-pin.
   const anchorIntentRef = useRef(true);
@@ -138,8 +144,8 @@ export function useTranscriptScroll({
       gestureActive = true;
       scheduleGestureClear();
     };
-    const sample = (force = false) => {
-      if (force || !isCoarse || gestureActive) {
+    const sample = (force = false, preservePinIntent = false) => {
+      if (!preservePinIntent && (force || !isCoarse || gestureActive)) {
         const pinned = isPinnedToBottom(vp.scrollTop, vp.clientHeight, vp.scrollHeight);
         const prevStuck = wasAtBottomRef.current;
         wasAtBottomRef.current = pinned;
@@ -166,8 +172,18 @@ export function useTranscriptScroll({
       if (decision.fire) requestEarlierHistory();
     };
     const onScroll = () => {
-      sample();
       const previous = toolAnchorsRef.current;
+      const folded = previous.some(({ el }) => !el.isConnected);
+      if (folded && gestureActive) {
+        pendingToolAnchorDeltaRef.current = null;
+        pendingFoldAnchorMissRef.current = false;
+        pendingFoldCorrectionStableRef.current = false;
+        sample();
+        toolAnchorsRef.current = sampleToolAnchors(vp);
+        anchorIntentRef.current = wasAtBottomRef.current;
+        return;
+      }
+      sample(false, folded || pendingToolAnchorDeltaRef.current !== null);
       toolAnchorsRef.current = resampleToolAnchors(vp, previous);
       if (toolAnchorsRef.current !== previous) anchorIntentRef.current = wasAtBottomRef.current;
     };
@@ -220,11 +236,13 @@ export function useTranscriptScroll({
     // Growth with a pending anchor came from older rows at the top: keep the
     // read position. Otherwise it grew at the bottom: follow if pinned.
     const contentRo = new ResizeObserver(() => {
-      // Every exit resamples: anchors left holding folded-away cards would
-      // otherwise outlive the fold and misplace a later correction.
+      // Keep pre-fold anchors across a clamp; streamed content may provide the missing scroll range later.
       const resample = () => {
         toolAnchorsRef.current = sampleToolAnchors(vp);
         anchorIntentRef.current = wasAtBottomRef.current;
+        pendingToolAnchorDeltaRef.current = null;
+        pendingFoldAnchorMissRef.current = false;
+        pendingFoldCorrectionStableRef.current = false;
       };
       const anchor = pendingScrollAnchorRef.current;
       if (anchor != null) {
@@ -236,14 +254,60 @@ export function useTranscriptScroll({
       }
       // Mid-fold the pin flag may come from the clamp, so go by the intent from before it.
       const folding = toolAnchorsRef.current.some(({ el }) => !el.isConnected);
+      let remountedElement: Element | null = null;
+      let remountedOffset: number | null = null;
+      let survivingAnchor = false;
+      if (folding) {
+        for (const anchor of toolAnchorsRef.current) {
+          if (anchor.el.isConnected) {
+            survivingAnchor = true;
+            break;
+          }
+          const next = vp.querySelector(`[data-tool-id="${CSS.escape(anchor.id)}"]`);
+          if (next) {
+            remountedElement = next;
+            remountedOffset = anchor.offset;
+            break;
+          }
+        }
+        if (remountedElement === null) {
+          pendingFoldCorrectionStableRef.current = false;
+          if (survivingAnchor || pendingFoldAnchorMissRef.current) resample();
+          else pendingFoldAnchorMissRef.current = true;
+          return;
+        }
+        // Browser scroll changes during folding are layout shifts, not reader movement.
+        for (const anchor of toolAnchorsRef.current) {
+          anchor.scrollTop = vp.scrollTop;
+        }
+      }
+      pendingFoldAnchorMissRef.current = false;
       if (folding ? anchorIntentRef.current : wasAtBottomRef.current) {
         vp.scrollTop = vp.scrollHeight;
         resample();
         return;
       }
-      // A card remounted elsewhere in the tree (a run folding into a group)
-      // loses the browser's own anchoring; hold the reader's place by id.
-      vp.scrollTop += toolAnchorDelta(vp, toolAnchorsRef.current);
+      const delta = folding
+        ? toolAnchorDelta(vp, toolAnchorsRef.current)
+        : (pendingToolAnchorDeltaRef.current ?? toolAnchorDelta(vp, toolAnchorsRef.current));
+      const beforeCorrection = vp.scrollTop;
+      vp.scrollTop = beforeCorrection + delta;
+      const remaining = delta - (vp.scrollTop - beforeCorrection);
+      if (folding) {
+        pendingToolAnchorDeltaRef.current = null;
+        const currentOffset = remountedElement!.getBoundingClientRect().top - vp.getBoundingClientRect().top;
+        if (Math.abs(currentOffset - remountedOffset!) > 1) {
+          pendingFoldCorrectionStableRef.current = false;
+          return;
+        }
+        if (Math.abs(delta) >= 1 || !pendingFoldCorrectionStableRef.current) {
+          pendingFoldCorrectionStableRef.current = true;
+          return;
+        }
+      } else {
+        pendingToolAnchorDeltaRef.current = Math.abs(remaining) >= 1 ? remaining : null;
+        if (pendingToolAnchorDeltaRef.current !== null) return;
+      }
       sample();
       resample();
     });
