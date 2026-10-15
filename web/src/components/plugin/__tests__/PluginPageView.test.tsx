@@ -18,6 +18,7 @@ const board: PluginPage = {
   title: "Board",
   icon: null,
   url: "/api/plugins/acme.kit/pages/board",
+  capabilities: ["session.read"],
 };
 
 const view = () => render(<PluginPageView pluginId="acme.kit" pageId="board" onBack={() => {}} />);

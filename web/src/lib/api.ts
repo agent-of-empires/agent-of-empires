@@ -695,6 +695,8 @@ export interface PluginPage {
   title: string;
   icon: string | null;
   url: string;
+  /** The plugin's granted capabilities; the page bridge gates on them. */
+  capabilities: string[];
 }
 
 export interface PluginUiState {
