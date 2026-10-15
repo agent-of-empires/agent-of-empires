@@ -42,8 +42,6 @@ export function useTranscriptScroll({
   // keyboard resize that clears `wasAtBottomRef` but cannot clear this.
   const lastAtBottomAtRef = useRef(0);
   const toolAnchorsRef = useRef<readonly ToolAnchor[]>([]);
-  // Keep an unclamped fold correction until later content provides its scroll range.
-  const pendingToolAnchorDeltaRef = useRef<number | null>(null);
   // A fold can remove a card before React remounts its replacement.
   const pendingFoldAnchorMissRef = useRef(false);
   // Keep stale anchors through another layout pass; a later fold commit can clamp a correction.
@@ -62,6 +60,7 @@ export function useTranscriptScroll({
     const vp = viewportRef.current;
     if (!vp) return;
     wasAtBottomRef.current = true;
+    anchorIntentRef.current = true;
     lastAtBottomAtRef.current = performance.now();
     setAtBottom(true);
     vp.scrollTo({ top: vp.scrollHeight, behavior });
@@ -144,8 +143,8 @@ export function useTranscriptScroll({
       gestureActive = true;
       scheduleGestureClear();
     };
-    const sample = (force = false, preservePinIntent = false) => {
-      if (!preservePinIntent && (force || !isCoarse || gestureActive)) {
+    const sample = (force = false) => {
+      if (force || !isCoarse || gestureActive) {
         const pinned = isPinnedToBottom(vp.scrollTop, vp.clientHeight, vp.scrollHeight);
         const prevStuck = wasAtBottomRef.current;
         wasAtBottomRef.current = pinned;
@@ -175,7 +174,6 @@ export function useTranscriptScroll({
       const previous = toolAnchorsRef.current;
       const folded = previous.some(({ el }) => !el.isConnected);
       if (folded && gestureActive) {
-        pendingToolAnchorDeltaRef.current = null;
         pendingFoldAnchorMissRef.current = false;
         pendingFoldCorrectionStableRef.current = false;
         sample();
@@ -183,7 +181,7 @@ export function useTranscriptScroll({
         anchorIntentRef.current = wasAtBottomRef.current;
         return;
       }
-      sample(false, folded || pendingToolAnchorDeltaRef.current !== null);
+      sample();
       toolAnchorsRef.current = resampleToolAnchors(vp, previous);
       if (toolAnchorsRef.current !== previous) anchorIntentRef.current = wasAtBottomRef.current;
     };
@@ -240,7 +238,6 @@ export function useTranscriptScroll({
       const resample = () => {
         toolAnchorsRef.current = sampleToolAnchors(vp);
         anchorIntentRef.current = wasAtBottomRef.current;
-        pendingToolAnchorDeltaRef.current = null;
         pendingFoldAnchorMissRef.current = false;
         pendingFoldCorrectionStableRef.current = false;
       };
@@ -287,14 +284,10 @@ export function useTranscriptScroll({
         resample();
         return;
       }
-      const delta = folding
-        ? toolAnchorDelta(vp, toolAnchorsRef.current)
-        : (pendingToolAnchorDeltaRef.current ?? toolAnchorDelta(vp, toolAnchorsRef.current));
+      const delta = toolAnchorDelta(vp, toolAnchorsRef.current);
       const beforeCorrection = vp.scrollTop;
       vp.scrollTop = beforeCorrection + delta;
-      const remaining = delta - (vp.scrollTop - beforeCorrection);
       if (folding) {
-        pendingToolAnchorDeltaRef.current = null;
         const currentOffset = remountedElement!.getBoundingClientRect().top - vp.getBoundingClientRect().top;
         if (Math.abs(currentOffset - remountedOffset!) > 1) {
           pendingFoldCorrectionStableRef.current = false;
@@ -304,9 +297,6 @@ export function useTranscriptScroll({
           pendingFoldCorrectionStableRef.current = true;
           return;
         }
-      } else {
-        pendingToolAnchorDeltaRef.current = Math.abs(remaining) >= 1 ? remaining : null;
-        if (pendingToolAnchorDeltaRef.current !== null) return;
       }
       sample();
       resample();

@@ -3066,6 +3066,7 @@
       "components": [
         "web/src/components/acp/ToolExpansion.tsx",
         "web/src/components/acp/GroupToolCards.tsx",
+        "web/src/components/acp/useTranscriptScroll.ts",
         "web/src/lib/toolAnchor.ts"
       ]
     },

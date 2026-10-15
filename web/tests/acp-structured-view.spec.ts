@@ -651,6 +651,40 @@ test.describe("tool run folding", () => {
     await expect(page.getByText("After 30.")).toBeAttached();
     expect(Math.abs((await header.boundingBox())!.y - before)).toBeLessThanOrEqual(1);
   });
+  test.describe("explicit pin during a fold", () => {
+    test.use({ viewport: { width: 390, height: 844 }, hasTouch: true, isMobile: true });
+
+    test("Jump to latest keeps following after a tool run folds", async ({ page }) => {
+      const filler = Array.from({ length: 40 }, (_, i) => `Filler paragraph ${i + 1}.`).join("\n\n");
+      const mock = await mockAcpSession(page, {
+        title: "story-fold-explicit-pin",
+        initialEvents: [
+          liveTurn,
+          agentMessageChunk(filler),
+          ...[1, 2, 3, 4].flatMap((n) => [toolCallStarted(readTool(n)), completed(n)]),
+        ],
+      });
+      await openStructuredSession(page, mock);
+
+      const distanceToBottom = () =>
+        acpViewport(page).evaluate((el) => el.scrollHeight - el.clientHeight - el.scrollTop);
+      await acpViewport(page).hover();
+      await page.mouse.wheel(0, -250);
+      await expect.poll(distanceToBottom).toBeGreaterThan(200);
+
+      const jumpToLatest = page.getByTestId("acp-jump-to-bottom");
+      await expect(jumpToLatest).toBeVisible();
+      await jumpToLatest.click();
+      await expect.poll(distanceToBottom).toBeLessThanOrEqual(1);
+
+      mock.pushEvents([agentMessageChunk("Moving on.")]);
+      await expect(page.getByText("4 actions")).toBeVisible();
+      await expect.poll(distanceToBottom).toBeLessThanOrEqual(1);
+      mock.pushEvents([agentMessageChunk("Follow-up streamed after the fold.")]);
+      await expect(page.getByText("Follow-up streamed after the fold.")).toBeVisible();
+      await expect.poll(distanceToBottom).toBeLessThanOrEqual(1);
+    });
+  });
 
   // A turn ending on tool calls has no closing text, so the end of the turn folds the run.
   test("a run folds when the turn ends, keeping an opened card in place", async ({ page }) => {
