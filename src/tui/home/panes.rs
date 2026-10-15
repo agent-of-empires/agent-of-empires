@@ -151,6 +151,22 @@ impl HomeView {
         }
     }
 
+    /// Render-path check for the paired terminal in the session's effective mode.
+    pub(super) fn paired_terminal_running_for_display(&self, inst: &Instance) -> bool {
+        let name = match self.effective_terminal_mode(&inst.id) {
+            TerminalMode::Container => {
+                crate::tmux::ContainerTerminalSession::resolve_name_for_display(
+                    &inst.id,
+                    &inst.title,
+                )
+            }
+            TerminalMode::Host => {
+                crate::tmux::TerminalSession::resolve_name_for_display(&inst.id, &inst.title)
+            }
+        };
+        crate::tmux::session_exists_for_display(&name)
+    }
+
     pub fn toggle_terminal_mode(&mut self, session_id: &str) {
         let new_mode = match self.get_terminal_mode(session_id) {
             TerminalMode::Container => TerminalMode::Host,

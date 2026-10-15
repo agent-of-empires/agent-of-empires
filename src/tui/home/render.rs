@@ -11,7 +11,7 @@ use rattles::presets::prelude as spinners;
 use super::{
     live_send, HomeView, TerminalMode, ViewMode, ICON_ARCHIVED_SECTION, ICON_COLLAPSED,
     ICON_DELETING, ICON_DORMANT, ICON_ERROR, ICON_EXPANDED, ICON_FAVORITE, ICON_IDLE, ICON_PINNED,
-    ICON_STOPPED, ICON_TRASH_SECTION, ICON_UNKNOWN, ICON_UNREAD,
+    ICON_STOPPED, ICON_TERMINAL, ICON_TRASH_SECTION, ICON_UNKNOWN, ICON_UNREAD,
 };
 use crate::containers::image_update::ImageUpdate;
 use crate::session::config::{GroupByMode, RowTagMode, SidebarPosition, SortOrder};
@@ -1700,145 +1700,131 @@ impl HomeView {
                 if let Some(inst) = self.get_instance(id) {
                     // Each view mode contributes only the live-state glyph and color for
                     // its own pane; the overlays on top belong to `decorate_row`.
-                    let (seed, sunk) =
-                        match self.view_mode {
-                            ViewMode::Structured => {
-                                // Idle sessions decay from `fresh_idle` toward `idle`
-                                // over `idle_decay_window`, with a slow `breathe` rattle
-                                // inside the window to match the other attention-worthy
-                                // states and cue colorblind or monochrome terminals.
-                                let idle_age = inst.idle_age();
-                                let is_fresh_idle =
-                                    matches!(idle_age, Some(age) if age < self.idle_decay_window);
-                                // Dormant (idle-reaped, resumable) structured workers get
-                                // their own glyph and dim amber, ahead of the raw status.
-                                // Unread still wins below: an unseen finished turn is the
-                                // more actionable signal, as in the web sidebar. See #2250.
-                                let is_shown_dormant = inst.is_shown_dormant();
-                                let mut icon = if is_shown_dormant {
-                                    ICON_DORMANT
-                                } else {
-                                    match inst.status {
-                                        Status::Running => spinner_running(&inst.created_at),
-                                        Status::Waiting => spinner_waiting(&inst.created_at),
-                                        Status::Idle if is_fresh_idle => spinner_idle_fresh(
-                                            &inst.created_at,
-                                            inst.idle_entered_at,
-                                        ),
-                                        Status::Idle => ICON_IDLE,
-                                        Status::Unknown => ICON_UNKNOWN,
-                                        Status::Stopped => ICON_STOPPED,
-                                        Status::Error => ICON_ERROR,
-                                        Status::Starting => spinner_starting(&inst.created_at),
-                                        Status::Deleting => ICON_DELETING,
-                                        Status::Creating => spinner_starting(&inst.created_at),
+                    let (seed, sunk) = match self.view_mode {
+                        ViewMode::Structured => {
+                            // Idle sessions decay from `fresh_idle` toward `idle`
+                            // over `idle_decay_window`, with a slow `breathe` rattle
+                            // inside the window to match the other attention-worthy
+                            // states and cue colorblind or monochrome terminals.
+                            let idle_age = inst.idle_age();
+                            let is_fresh_idle =
+                                matches!(idle_age, Some(age) if age < self.idle_decay_window);
+                            // Dormant (idle-reaped, resumable) structured workers get
+                            // their own glyph and dim amber, ahead of the raw status.
+                            // Unread still wins below: an unseen finished turn is the
+                            // more actionable signal, as in the web sidebar. See #2250.
+                            let is_shown_dormant = inst.is_shown_dormant();
+                            let mut icon = if is_shown_dormant {
+                                ICON_DORMANT
+                            } else {
+                                match inst.status {
+                                    Status::Running => spinner_running(&inst.created_at),
+                                    Status::Waiting => spinner_waiting(&inst.created_at),
+                                    Status::Idle if is_fresh_idle => {
+                                        spinner_idle_fresh(&inst.created_at, inst.idle_entered_at)
                                     }
-                                };
-                                // Unread paints only on resting rows (Idle/Unknown); a
-                                // live status keeps its own color and spinner. Sunk rows
-                                // (archived/snoozed) never paint it, since the user
-                                // dismissed them; the flag stays on disk and comes back on
-                                // restore. Snooze is checked in every sort mode here, not
-                                // just Attention, so a snoozed unread row still drops the
-                                // dot (#2571).
-                                let unread_resting = crate::session::unread_enabled()
-                                    && inst.is_unread()
-                                    && !inst.is_archived()
-                                    && !inst.is_snoozed()
-                                    && matches!(inst.status, Status::Idle | Status::Unknown);
-                                let color = if is_shown_dormant && !unread_resting {
-                                    theme.dormant()
-                                } else {
-                                    match inst.status {
-                                        Status::Running => theme.running,
-                                        Status::Waiting => theme.waiting,
-                                        Status::Idle if unread_resting => theme.unread,
-                                        Status::Idle => theme
-                                            .idle_color_at_age(idle_age, self.idle_decay_window),
-                                        Status::Unknown if unread_resting => theme.unread,
-                                        Status::Unknown => theme.waiting,
-                                        Status::Stopped => theme.dimmed,
-                                        Status::Error => theme.error,
-                                        Status::Starting => theme.dimmed,
-                                        Status::Deleting => theme.waiting,
-                                        Status::Creating => theme.accent,
-                                    }
-                                };
-                                let mut modifier = ratatui::style::Modifier::empty();
-                                if unread_resting {
-                                    // Make unread unmistakable: solid dot plus bold on
-                                    // top of `theme.unread`; a color swap alone read as
-                                    // too subtle (#2088 review).
-                                    icon = ICON_UNREAD;
-                                    modifier = ratatui::style::Modifier::BOLD;
+                                    Status::Idle => ICON_IDLE,
+                                    Status::Unknown => ICON_UNKNOWN,
+                                    Status::Stopped => ICON_STOPPED,
+                                    Status::Error => ICON_ERROR,
+                                    Status::Starting => spinner_starting(&inst.created_at),
+                                    Status::Deleting => ICON_DELETING,
+                                    Status::Creating => spinner_starting(&inst.created_at),
                                 }
-                                (
-                                    RowSeed {
-                                        icon,
-                                        color,
-                                        modifier,
-                                    },
-                                    SunkRow::AgentStatus(agent_row_icon(inst)),
-                                )
+                            };
+                            // Unread paints only on resting rows (Idle/Unknown); a
+                            // live status keeps its own color and spinner. Sunk rows
+                            // (archived/snoozed) never paint it, since the user
+                            // dismissed them; the flag stays on disk and comes back on
+                            // restore. Snooze is checked in every sort mode here, not
+                            // just Attention, so a snoozed unread row still drops the
+                            // dot (#2571).
+                            let unread_resting = crate::session::unread_enabled()
+                                && inst.is_unread()
+                                && !inst.is_archived()
+                                && !inst.is_snoozed()
+                                && matches!(inst.status, Status::Idle | Status::Unknown);
+                            let color = if is_shown_dormant && !unread_resting {
+                                theme.dormant()
+                            } else {
+                                match inst.status {
+                                    Status::Running => theme.running,
+                                    Status::Waiting => theme.waiting,
+                                    Status::Idle if unread_resting => theme.unread,
+                                    Status::Idle => {
+                                        theme.idle_color_at_age(idle_age, self.idle_decay_window)
+                                    }
+                                    Status::Unknown if unread_resting => theme.unread,
+                                    Status::Unknown => theme.waiting,
+                                    Status::Stopped => theme.dimmed,
+                                    Status::Error => theme.error,
+                                    Status::Starting => theme.dimmed,
+                                    Status::Deleting => theme.waiting,
+                                    Status::Creating => theme.accent,
+                                }
+                            };
+                            let mut modifier = ratatui::style::Modifier::empty();
+                            if unread_resting {
+                                // Make unread unmistakable: solid dot plus bold on
+                                // top of `theme.unread`; a color swap alone read as
+                                // too subtle (#2088 review).
+                                icon = ICON_UNREAD;
+                                modifier = ratatui::style::Modifier::BOLD;
                             }
-                            ViewMode::Terminal => {
-                                let terminal_mode = self.effective_terminal_mode(id);
-                                let terminal_running =
-                                    match terminal_mode {
-                                        TerminalMode::Container => {
-                                            let name = crate::tmux::ContainerTerminalSession::
-                                        resolve_name_for_display(&inst.id, &inst.title);
-                                            crate::tmux::session_exists_for_display(&name)
-                                        }
-                                        TerminalMode::Host => {
-                                            let name = crate::tmux::TerminalSession::
-                                        resolve_name_for_display(&inst.id, &inst.title);
-                                            crate::tmux::session_exists_for_display(&name)
-                                        }
-                                    };
-                                // Unread means the agent produced output nobody looked
-                                // at, which the paired terminal has no notion of, so
-                                // Terminal view never paints the dot.
-                                let (icon, color) = if terminal_running {
-                                    (spinner_running(&inst.created_at), theme.terminal_active)
-                                } else {
-                                    (ICON_IDLE, theme.dimmed)
-                                };
-                                (
-                                    RowSeed {
-                                        icon,
-                                        color,
-                                        modifier: ratatui::style::Modifier::empty(),
-                                    },
-                                    SunkRow::Pane,
-                                )
-                            }
-                            ViewMode::Tool(ref tool_name) => {
-                                let tool_session = crate::tmux::ToolSession::for_display(
-                                    &inst.id,
-                                    &inst.title,
-                                    tool_name,
-                                );
-                                let tool_running = crate::tmux::session_exists_for_display(
-                                    tool_session.session_name(),
-                                ) && !crate::tmux::pane_dead_for_display(
-                                    tool_session.session_name(),
-                                );
-                                let (icon, color) = if tool_running {
-                                    (spinner_running(&inst.created_at), theme.terminal_active)
-                                } else {
-                                    (ICON_IDLE, theme.dimmed)
-                                };
-                                (
-                                    RowSeed {
-                                        icon,
-                                        color,
-                                        modifier: ratatui::style::Modifier::empty(),
-                                    },
-                                    SunkRow::Pane,
-                                )
-                            }
-                        };
+                            (
+                                RowSeed {
+                                    icon,
+                                    color,
+                                    modifier,
+                                },
+                                SunkRow::AgentStatus(agent_row_icon(inst)),
+                            )
+                        }
+                        ViewMode::Terminal => {
+                            let terminal_running = self.paired_terminal_running_for_display(inst);
+                            // Unread means the agent produced output nobody looked
+                            // at, which the paired terminal has no notion of, so
+                            // Terminal view never paints the dot.
+                            let (icon, color) = if terminal_running {
+                                (spinner_running(&inst.created_at), theme.terminal_active)
+                            } else {
+                                (ICON_IDLE, theme.dimmed)
+                            };
+                            (
+                                RowSeed {
+                                    icon,
+                                    color,
+                                    modifier: ratatui::style::Modifier::empty(),
+                                },
+                                SunkRow::Pane,
+                            )
+                        }
+                        ViewMode::Tool(ref tool_name) => {
+                            let tool_session = crate::tmux::ToolSession::for_display(
+                                &inst.id,
+                                &inst.title,
+                                tool_name,
+                            );
+                            let tool_running = crate::tmux::session_exists_for_display(
+                                tool_session.session_name(),
+                            ) && !crate::tmux::pane_dead_for_display(
+                                tool_session.session_name(),
+                            );
+                            let (icon, color) = if tool_running {
+                                (spinner_running(&inst.created_at), theme.terminal_active)
+                            } else {
+                                (ICON_IDLE, theme.dimmed)
+                            };
+                            (
+                                RowSeed {
+                                    icon,
+                                    color,
+                                    modifier: ratatui::style::Modifier::empty(),
+                                },
+                                SunkRow::Pane,
+                            )
+                        }
+                    };
                     decorate_row(inst, in_attention, seed, sunk, theme)
                 } else {
                     (
@@ -1939,7 +1925,12 @@ impl HomeView {
             } else {
                 None
             };
-        let badge_width = badge_text.map_or(0, |s| s.len());
+        // Agent view only: Terminal view already shows the terminal's state in the icon.
+        let terminal_badge = (self.view_mode == ViewMode::Structured
+            && self.paired_terminal_running_for_display(inst))
+        .then(|| format!(" {ICON_TERMINAL}"));
+        let badge_width =
+            badge_text.map_or(0, |s| s.len()) + terminal_badge.as_ref().map_or(0, |s| s.len());
         let age = if self.show_activity_age {
             row_age(inst, in_attention)
         } else {
@@ -1982,6 +1973,17 @@ impl HomeView {
             ));
         }
 
+        if let Some(badge) = terminal_badge {
+            let badge_style = Style::default().fg(theme.terminal_active);
+            line_spans.push(Span::styled(
+                badge,
+                if is_selected {
+                    selected_row_style(badge_style, theme)
+                } else {
+                    badge_style
+                },
+            ));
+        }
         if let Some(badge) = badge_text {
             let badge_style = Style::default().fg(theme.sandbox);
             line_spans.push(Span::styled(
