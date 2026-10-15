@@ -7,6 +7,7 @@ import { useRef, useState } from "react";
 import { invokePluginAction, type PluginUiEntry } from "../../lib/api";
 import { usePluginUiEntries, usePluginUiPoke } from "../../lib/pluginUiContext";
 import {
+  byOrder,
   chipEntries,
   entryText,
   entryTone,
@@ -142,7 +143,7 @@ export function PluginHomePanes() {
 }
 
 export function PluginDetailBadges({ sessionId }: { sessionId: string }) {
-  const entries = sessionEntries(usePluginUiEntries(), "detail-badge", sessionId);
+  const entries = byOrder(sessionEntries(usePluginUiEntries(), "detail-badge", sessionId));
   if (entries.length === 0) return null;
   return (
     <div className="flex flex-wrap items-center gap-1.5" data-testid="plugin-detail-badges">

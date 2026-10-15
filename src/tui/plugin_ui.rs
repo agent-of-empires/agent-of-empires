@@ -24,10 +24,10 @@ pub fn global_entries(snapshot: &UiSnapshot, slot: UiSlot) -> impl Iterator<Item
         .filter(move |e| e.slot == slot && e.session_id.is_none())
 }
 
-/// Global chip entries for `slot` by payload `order` (default 0, lowest first),
-/// keeping snapshot order among ties.
-pub fn chip_entries(snapshot: &UiSnapshot, slot: UiSlot) -> Vec<&UiEntry> {
-    let mut entries: Vec<&UiEntry> = global_entries(snapshot, slot).collect();
+/// Entries by payload `order` (default 0, lowest first), keeping input order
+/// among ties.
+pub fn by_order<'a>(entries: impl Iterator<Item = &'a UiEntry>) -> Vec<&'a UiEntry> {
+    let mut entries: Vec<&UiEntry> = entries.collect();
     entries.sort_by_key(|e| e.payload.get("order").and_then(Value::as_i64).unwrap_or(0));
     entries
 }
@@ -809,11 +809,24 @@ mod tests {
             ]),
             json!([]),
         );
-        let texts: Vec<&str> = chip_entries(&snap, UiSlot::HeaderStart)
+        let texts: Vec<&str> = by_order(global_entries(&snap, UiSlot::HeaderStart))
             .into_iter()
             .filter_map(entry_text)
             .collect();
         assert_eq!(texts, vec!["b", "a", "d", "c"]);
+
+        let snap = snapshot(
+            json!([
+                {"plugin_id": "p", "slot": "detail-badge", "id": "a", "session_id": "s", "payload": {"text": "a", "order": 2}},
+                {"plugin_id": "p", "slot": "detail-badge", "id": "b", "session_id": "s", "payload": {"text": "b"}}
+            ]),
+            json!([]),
+        );
+        let detail: Vec<&str> = by_order(session_entries(&snap, UiSlot::DetailBadge, "s"))
+            .into_iter()
+            .filter_map(entry_text)
+            .collect();
+        assert_eq!(detail, vec!["b", "a"]);
     }
 
     #[test]

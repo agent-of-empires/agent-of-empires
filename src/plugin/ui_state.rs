@@ -67,7 +67,7 @@ struct TextPayload {
     /// `Some([])` is an explicit clear and stays distinct from an absent list.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     items: Option<Vec<BadgeItem>>,
-    /// Position among a global chip slot's entries, lowest first; default 0.
+    /// Position among a chip slot's entries (`status-bar`, `header-start`, `detail-badge`), lowest first; default 0.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     order: Option<i32>,
 }

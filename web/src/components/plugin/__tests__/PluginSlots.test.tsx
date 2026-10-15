@@ -244,6 +244,19 @@ describe("plugin slots", () => {
       expect(container.querySelector("button, span")).toBeNull();
     });
 
+    it("detail-badge orders by payload order, then snapshot order", () => {
+      const badge = (id: string, order?: number): PluginUiEntry => ({
+        plugin_id: "acme.kit",
+        slot: "detail-badge",
+        id,
+        session_id: "s1",
+        payload: { text: id, ...(order === undefined ? {} : { order }) },
+      });
+      entriesRef.current = [badge("a"), badge("b", -1), badge("c", 5)];
+      const { container } = render(<PluginDetailBadges sessionId="s1" />);
+      expect([...container.querySelectorAll("[data-plugin-slot]")].map((n) => n.textContent)).toEqual(["b", "a", "c"]);
+    });
+
     it("detail-badge accepts grouped items too", () => {
       entriesRef.current = [
         {
