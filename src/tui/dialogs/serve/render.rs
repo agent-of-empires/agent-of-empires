@@ -94,9 +94,9 @@ fn flash_text(flash: &Flash) -> &str {
 /// serves the API only.
 fn view_title() -> &'static str {
     if cfg!(feature = "web") {
-        "Web Dashboard"
+        "Web dashboard"
     } else {
-        "Remote API Access"
+        "Remote API access"
     }
 }
 
@@ -694,7 +694,7 @@ fn render_help_overlay(frame: &mut Frame, area: Rect, theme: &Theme, mode: Serve
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(theme.border))
-        .title(format!(" {} Help ", view_title()))
+        .title(format!(" {} help ", view_title()))
         .title_style(heading);
     let inner = block.inner(dialog_area);
     frame.render_widget(block, dialog_area);
@@ -868,7 +868,7 @@ mod tests {
             .chars()
             .any(|c| ['\u{2588}', '\u{2580}', '\u{2584}'].contains(&c));
         assert_eq!(qr_drawn, cfg!(feature = "web"), "{screen}");
-        for needle in ["Remote API Access", "No dashboard bundle in this build:"] {
+        for needle in ["Remote API access", "No dashboard bundle in this build:"] {
             assert_eq!(
                 screen.contains(needle),
                 !cfg!(feature = "web"),
@@ -876,7 +876,7 @@ mod tests {
             );
         }
         assert_eq!(
-            screen.contains("Web Dashboard (local)"),
+            screen.contains("Web dashboard (local)"),
             cfg!(feature = "web"),
             "{screen}"
         );
