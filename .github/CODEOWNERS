@@ -1,5 +1,5 @@
 # Code owners for agent-of-empires/agent-of-empires. Last match wins.
-# Each line lists the area owner, then the second reviewer; either approval
+# Each line lists the area owner, then the other reviewers; any one approval
 # satisfies code owner review. Unlisted paths follow the merge rule in
 # MAINTAINERS.md. Docs: https://docs.github.com/en/repositories/managing-your-repositorys-settings-and-features/customizing-your-repository/about-code-owners
 
@@ -62,23 +62,29 @@
 /docs/development/adding-agents.md      @athal7 @jerome-benoit
 
 # Protected: security, stored data, supply chain, release and governance
-/src/server/auth.rs                     @njbrake @jerome-benoit
-/src/server/login.rs                    @njbrake @jerome-benoit
-/src/server/rate_limit.rs               @njbrake @jerome-benoit
-/src/server/tunnel.rs                   @njbrake @jerome-benoit
-/src/server/push.rs                     @njbrake @jerome-benoit
-/src/server/push_send.rs                @njbrake @jerome-benoit
-/src/migrations/                        @njbrake @jerome-benoit
-/src/session/storage.rs                 @njbrake @jerome-benoit
-Cargo.toml                              @njbrake @jerome-benoit
-Cargo.lock                              @njbrake @jerome-benoit
-/flake.nix                              @njbrake @jerome-benoit
-/flake.lock                             @njbrake @jerome-benoit
-/.github/                               @njbrake @jerome-benoit
-/scripts/                               @njbrake @jerome-benoit
-/cliff.toml                             @njbrake @jerome-benoit
-/docs/development/releases.md           @njbrake @jerome-benoit
-/AGENTS.md                              @njbrake @jerome-benoit
-/CLAUDE.md                              @njbrake @jerome-benoit
-/DESIGN.md                              @njbrake @jerome-benoit
-/MAINTAINERS.md                         @njbrake @jerome-benoit
+/src/server/auth.rs                     @njbrake @Seluj78 @jerome-benoit
+/src/server/login.rs                    @njbrake @Seluj78 @jerome-benoit
+/src/server/rate_limit.rs               @njbrake @Seluj78 @jerome-benoit
+/src/server/tunnel.rs                   @njbrake @Seluj78 @jerome-benoit
+/src/server/push.rs                     @njbrake @Seluj78 @jerome-benoit
+/src/server/push_send.rs                @njbrake @Seluj78 @jerome-benoit
+/src/migrations/                        @njbrake @Seluj78 @jerome-benoit
+/src/session/storage.rs                 @njbrake @Seluj78 @jerome-benoit
+Cargo.toml                              @njbrake @Seluj78 @jerome-benoit
+Cargo.lock                              @njbrake @Seluj78 @jerome-benoit
+/flake.nix                              @njbrake @Seluj78 @jerome-benoit
+/flake.lock                             @njbrake @Seluj78 @jerome-benoit
+/.github/                               @njbrake @Seluj78 @jerome-benoit
+/scripts/                               @njbrake @Seluj78 @jerome-benoit
+/AGENTS.md                              @njbrake @Seluj78 @jerome-benoit
+/CLAUDE.md                              @njbrake @Seluj78 @jerome-benoit
+/DESIGN.md                              @njbrake @Seluj78 @jerome-benoit
+/MAINTAINERS.md                         @njbrake @Seluj78 @jerome-benoit
+
+# Releases: only these two maintainers cut releases
+/.github/workflows/release.yml          @njbrake @Seluj78
+/.github/workflows/prepare-release.yml  @njbrake @Seluj78
+/.github/workflows/open-release-pr.yml  @njbrake @Seluj78
+/.github/workflows/tag-release-pr.yml   @njbrake @Seluj78
+/cliff.toml                             @njbrake @Seluj78
+/docs/development/releases.md           @njbrake @Seluj78

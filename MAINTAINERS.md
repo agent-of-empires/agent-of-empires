@@ -2,13 +2,14 @@
 
 | Maintainer | Areas |
 | --- | --- |
-| [@njbrake](https://github.com/njbrake) | Project direction; protected paths |
-| [@Seluj78](https://github.com/Seluj78) | Web dashboard, plugin pages, plugin API |
+| [@njbrake](https://github.com/njbrake) | Project direction; security, releases, governance |
+| [@Seluj78](https://github.com/Seluj78) | Web dashboard, plugin pages, plugin API; security, releases, governance |
 | [@cwrau](https://github.com/cwrau) | ACP, structured view, composer, attachments |
 | [@jerome-benoit](https://github.com/jerome-benoit) | Daemon, session lifecycle, worktrees, process, containers, build |
 | [@athal7](https://github.com/athal7) | Hooks, agent integrations, OMP, tmux |
 
-[CODEOWNERS](.github/CODEOWNERS) maps paths to an owner and a second reviewer.
+[CODEOWNERS](.github/CODEOWNERS) maps paths to their owners. Only @njbrake and
+@Seluj78 cut [releases](docs/development/releases.md).
 
 ## Merging
 
