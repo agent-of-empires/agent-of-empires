@@ -287,6 +287,14 @@ describe("code block header", () => {
     expect(writeText).toHaveBeenCalledWith("alert('hi')");
   });
 
+  it("keeps the header and the code in one bordered box", () => {
+    const Highlighter = override<{ language?: string; code: string }>("SyntaxHighlighter");
+    const { container, getByText } = render(<Highlighter code="one" />);
+    const box = container.querySelector(".acp-code-block");
+    expect(box?.contains(getByText("copy"))).toBe(true);
+    expect(box?.querySelector("pre")?.textContent).toBe("one");
+  });
+
   it("wraps the code per line when the header toggle is pressed", () => {
     const Highlighter = override<{ language?: string; code: string }>("SyntaxHighlighter");
     const { container, getByRole } = render(<Highlighter code={"one\ntwo"} />);
