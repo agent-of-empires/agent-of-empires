@@ -67,6 +67,9 @@ struct TextPayload {
     /// `Some([])` is an explicit clear and stays distinct from an absent list.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     items: Option<Vec<BadgeItem>>,
+    /// Position among a global chip slot's entries, lowest first; default 0.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    order: Option<i32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -645,7 +648,7 @@ fn validate_payload(slot: UiSlot, raw: &Value) -> Result<Value, String> {
         serde_json::to_value(parsed).map_err(|e| e.to_string())
     }
     match slot {
-        UiSlot::StatusBar | UiSlot::DetailBadge => {
+        UiSlot::StatusBar | UiSlot::HeaderStart | UiSlot::DetailBadge => {
             let parsed: TextPayload =
                 serde_json::from_value(raw.clone()).map_err(|e| e.to_string())?;
             if parsed.text.is_none() && parsed.items.is_none() {
@@ -952,6 +955,27 @@ mod tests {
                 Some("s1"),
                 json!({"items": [{"text": "a"}]}),
                 true,
+            ),
+            (
+                "header start accepts text with an order",
+                UiSlot::HeaderStart,
+                None,
+                json!({"text": "Codex 49%", "order": -2}),
+                true,
+            ),
+            (
+                "header start with neither text nor items rejected",
+                UiSlot::HeaderStart,
+                None,
+                json!({"order": 1}),
+                false,
+            ),
+            (
+                "header start is not per-session",
+                UiSlot::HeaderStart,
+                Some("s1"),
+                json!({"text": "x"}),
+                false,
             ),
             (
                 "status bar accepts an explicitly empty items list",
