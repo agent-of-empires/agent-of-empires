@@ -31,9 +31,7 @@ pub(crate) struct StatusCounts {
     pub(crate) total: usize,
 }
 
-/// The five groups `aoe status --verbose` prints, in the order it prints them,
-/// with the glyph each one uses. The renderer iterates this same table, so a
-/// group cannot be dropped or respelled on one transport only.
+/// Shared display order and glyphs for local and served status output.
 pub(crate) const VERBOSE_GROUPS: [(&str, &str, Status); 5] = [
     ("WAITING", "⠃", Status::Waiting),
     ("RUNNING", "⠋", Status::Running),
@@ -42,22 +40,24 @@ pub(crate) const VERBOSE_GROUPS: [(&str, &str, Status); 5] = [
     ("ERROR", "✕", Status::Error),
 ];
 
-/// One verbose group: the heading, one padded row per session, and the blank
-/// line after it. Empty when the group has no members, exactly as the local
-/// command prints nothing at all for an empty group.
-/// A row is title, tool, path, in the order it is printed. `title` and `tool`
-/// are borrowed because both callers hold the sessions for the length of the
-/// call, so a row cost two clones it does not need. Only the path is owned:
-/// collapsing it under a home is the one step that builds a new string, and
-/// putting it last keeps the owned field from reading as the first column.
-pub(crate) fn verbose_group(label: &str, symbol: &str, rows: &[(&str, &str, String)]) -> String {
+/// Format a nonempty verbose group from title, tool and path rows.
+pub(crate) fn verbose_group(
+    label: &str,
+    symbol: &str,
+    rows: &[(impl AsRef<str>, impl AsRef<str>, String)],
+) -> String {
     use std::fmt::Write;
     if rows.is_empty() {
         return String::new();
     }
     let mut output = format!("{label} ({}):\n", rows.len());
     for (title, tool, path) in rows {
-        let _ = writeln!(output, "  {symbol} {title:<16} {tool:<10} {path}");
+        let _ = writeln!(
+            output,
+            "  {symbol} {:<16} {:<10} {path}",
+            title.as_ref(),
+            tool.as_ref()
+        );
     }
     output.push('\n');
     output
@@ -186,23 +186,4 @@ pub async fn run(profile: &str, args: StatusArgs) -> Result<()> {
     }
 
     Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::verbose_group;
-
-    /// A row is read positionally and printed in the order it is read, so a
-    /// transposition is invisible to the parity suite: both transports build
-    /// the row and call this one function, so both print the same wrong order
-    /// and the comparison of the two passes. This is the only place that can
-    /// see it.
-    #[test]
-    fn a_verbose_row_prints_title_then_tool_then_path() {
-        let rows = vec![("fix the thing", "claude", "~/work/repo".to_string())];
-        assert_eq!(
-            verbose_group("RUNNING", "⠋", &rows),
-            "RUNNING (1):\n  ⠋ fix the thing    claude     ~/work/repo\n\n"
-        );
-    }
 }

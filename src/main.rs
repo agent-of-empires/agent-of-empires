@@ -13,12 +13,11 @@ fn is_serve_command(cli: &Cli) -> bool {
     matches!(cli.command, Some(Commands::Serve(_)))
 }
 
-/// Runs before the tokio worker pool exists, so `set_var` is sound.
+/// Seed CityHall before constructing the runtime.
 fn seed_cityhall_env(cli: &Cli) {
     if let Some(Commands::Serve(args)) = &cli.command {
         if args.cityhall {
-            // SAFETY: single-threaded here, same invariant as the
-            // AOE_DAEMON_URL seed above (no worker threads spawned yet).
+            // SAFETY: main calls this before any runtime or background work starts.
             unsafe {
                 std::env::set_var("AOE_CITYHALL_MODE", "1");
             }
@@ -42,8 +41,7 @@ fn serve_unavailable_error(cli: &Cli) -> Option<clap::Error> {
     })
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
     // Hidden helper for the VT live preview, handled before clap so it stays off the CLI surface.
     {
         let mut a = std::env::args();
@@ -66,18 +64,19 @@ async fn main() -> Result<()> {
             }
             let profile = next.unwrap_or_default();
             let session_id = a.next().unwrap_or_default();
-            let _ = agent_of_empires::session::smart_rename::run_smart_rename_now(
-                &profile,
-                &session_id,
-                force,
-            )
-            .await;
+            let _ = tokio::runtime::Runtime::new()?.block_on(
+                agent_of_empires::session::smart_rename::run_smart_rename_now(
+                    &profile,
+                    &session_id,
+                    force,
+                ),
+            );
             return Ok(());
         }
     }
 
     // Only a parse failure loads the plugin registry to graft plugin commands.
-    let mut cli = match Cli::try_parse() {
+    let cli = match Cli::try_parse() {
         Ok(cli) => cli,
         Err(_) => {
             let matches = cli::graft::augmented_command().get_matches();
@@ -89,24 +88,30 @@ async fn main() -> Result<()> {
     };
 
     if let Some(Commands::PrimeRunner(args)) = cli.command {
-        return agent_of_empires::process::prime::run(args).await;
+        return tokio::runtime::Runtime::new()?
+            .block_on(agent_of_empires::process::prime::run(args));
     }
     let read_source = cli::runtime_read::read_request_source(&cli);
-    // Linux defaults to local UDS discovery; other platforms default to the store.
-    // An explicitly selected endpoint replaces either default.
-    //
-    // A served read is still a CLI invocation, so its answer is carried into
-    // `run` rather than printed here. The preflight below, the namespace
-    // warning, telemetry, migrations and the unknown-config warnings, is what
-    // every other command gets, and skipping it would make a daemon-served
-    // `aoe list` the only command in the tool that reports neither.
+    if let Some(err) = serve_unavailable_error(&cli) {
+        err.exit();
+    }
+    if let Some(url) = &cli.daemon_url {
+        // SAFETY: no runtime or background work has started.
+        unsafe {
+            std::env::set_var("AOE_DAEMON_URL", url);
+        }
+    }
+    seed_cityhall_env(&cli);
+    tokio::runtime::Runtime::new()?.block_on(run_cli(cli, read_source))
+}
+
+async fn run_cli(mut cli: Cli, read_source: cli::runtime_read::ReadRequestSource) -> Result<()> {
+    // Keep daemon-served reads on the normal CLI preflight path.
     let answered = match cli::runtime_read::classify(cli.command.as_ref()) {
         Some(command) => match cli::runtime_read::attempt(command, &read_source).await {
             cli::runtime_read::ScopedRead::Answered(outcome) => Some(outcome),
             cli::runtime_read::ScopedRead::NoLocalPublication(notice) => {
-                // Ahead of the local command's own output, and on stderr, so
-                // the store's rows read as the local command's rows. Dropped
-                // with no endpoint named, which is the ordinary local read.
+                // A fallback notice precedes the local answer on stderr.
                 if let Some(notice) = notice {
                     let _ = std::io::stderr().lock().write_all(notice.as_bytes());
                 }
@@ -129,22 +134,6 @@ async fn main() -> Result<()> {
             }
         }
     }
-
-    if let Some(err) = serve_unavailable_error(&cli) {
-        err.exit();
-    }
-
-    if let Some(url) = &cli.daemon_url {
-        // SAFETY: single-threaded at this point — we haven't entered
-        // the tokio runtime's worker pool yet (the runtime is owned by
-        // the `#[tokio::main]` wrapper that called us, and clap's
-        // parsing was synchronous).
-        unsafe {
-            std::env::set_var("AOE_DAEMON_URL", url);
-        }
-    }
-
-    seed_cityhall_env(&cli);
 
     // Before anything calls `get_app_dir()`, which would create the dev dir.
     let debug_namespace_drift = agent_of_empires::session::debug_namespace_drift();

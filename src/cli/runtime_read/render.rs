@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::path::Path;
@@ -54,6 +55,16 @@ pub(crate) fn evaluate(
     }
 }
 
+fn terminal_text(value: &str) -> Cow<'_, str> {
+    let Some((start, _)) = value.char_indices().find(|(_, ch)| ch.is_control()) else {
+        return Cow::Borrowed(value);
+    };
+    let mut clean = String::with_capacity(value.len());
+    clean.push_str(&value[..start]);
+    clean.extend(value[start..].chars().filter(|ch| !ch.is_control()));
+    Cow::Owned(clean)
+}
+
 fn selected_profile<'a>(
     snapshot: &'a SnapshotData,
     source: &'a super::endpoint::ReadRequestSource,
@@ -61,23 +72,20 @@ fn selected_profile<'a>(
     let selected = match selected_profile_source(source) {
         ProfileSource::Explicit(value) => value,
         ProfileSource::Environment(value) => value.to_str().ok_or_else(|| {
-            // The local path reaches clap for this one (`main.rs` refuses an
-            // `AGENT_OF_EMPIRES_PROFILE` that is not UTF-8), and clap's exit
-            // is 2, so the served refusal leaves 2 as well rather than
-            // reporting a wire failure for the operator's own variable.
+            // Match clap's invalid-environment-profile exit status.
             ReadFailure::exit(2, "error: AGENT_OF_EMPIRES_PROFILE must be valid UTF-8\n")
         })?,
         ProfileSource::Default => match snapshot.default_profile.as_deref() {
             Some(value) => value,
-            // The daemon resolved a name, published it, and this snapshot
-            // carries no such profile. The local path resolves the same name
-            // and refuses with this sentence, so both transports answer it the
-            // same way instead of one naming nothing and the other naming a
-            // profile.
+            // A resolved but absent default is a user-state refusal.
             None => match &snapshot.resolved_default_profile {
                 Some(name) => {
-                    crate::session::validate_profile_name(name)
-                        .map_err(|error| ReadFailure::exit(1, format!("Error: {error}\n")))?;
+                    crate::session::validate_profile_name(name).map_err(|error| {
+                        ReadFailure::exit(
+                            1,
+                            format!("Error: {}\n", terminal_text(&error.to_string())),
+                        )
+                    })?;
                     return Err(profile_absent("default_missing", name));
                 }
                 // Nothing was resolved, because resolving would have created
@@ -86,8 +94,9 @@ fn selected_profile<'a>(
             },
         },
     };
-    crate::session::validate_profile_name(selected)
-        .map_err(|error| ReadFailure::exit(1, format!("Error: {error}\n")))?;
+    crate::session::validate_profile_name(selected).map_err(|error| {
+        ReadFailure::exit(1, format!("Error: {}\n", terminal_text(&error.to_string())))
+    })?;
     snapshot
         .profiles
         .iter()
@@ -98,17 +107,9 @@ fn selected_profile<'a>(
         .ok_or_else(|| profile_absent("profile_missing", selected))
 }
 
-/// A profile name the store does not have, refused the way the local command
-/// refuses it (`session::resolve_existing_profile`): exit 1, and the
-/// operator's own sentence including the half that tells them what to do
-/// next. This is the user's own state rather than a wire failure, so it is
-/// not a `daemon read: <code>`. It uses the same mechanism the tmux refusals
-/// in this file use, and leaves the same exit the local path leaves.
-///
-/// `code` says which of the two ways the client arrived here it did: a profile
-/// the caller named by hand, or the daemon's own resolved default naming one
-/// the store does not have. The sentence and the exit are the same either way.
+/// Preserve the local CLI's profile-creation guidance and exit status.
 fn profile_absent(code: &'static str, name: &str) -> ReadFailure {
+    let name = terminal_text(name);
     ReadFailure::refuse(
         code,
         1,
@@ -118,15 +119,11 @@ fn profile_absent(code: &'static str, name: &str) -> ReadFailure {
     )
 }
 
-/// An id prefix that names more than one session, refused with the local
-/// resolver's own sentence (`cli::resolve_session`): the candidate list is
-/// the only thing the operator can act on, and the order and the spelling are
-/// the local path's, sorted the way it sorts them, so the two transports say
-/// the same words about the same ambiguity.
+/// Preserve the local resolver's sorted ambiguity candidates.
 fn ambiguous_prefix(identifier: &str, candidates: &[&SessionRead]) -> ReadFailure {
     let mut lines: Vec<String> = candidates
         .iter()
-        .map(|session| format!("  {} ({})", session.id, session.title))
+        .map(|session| format!("  {} ({})", session.id, terminal_text(&session.title)))
         .collect();
     lines.sort();
     ReadFailure::refuse(
@@ -183,18 +180,20 @@ fn render_list(
             let sessions: Vec<&SessionRead> = sessions_for_profile(snapshot, &profile.name)
                 .filter(|session| matches_state(session.state, state))
                 .collect();
-            // A profile with nothing in this scope prints no banner, exactly as
-            // the local all-profiles listing skips it.
+            // Empty profiles have no banner.
             if sessions.is_empty() {
                 continue;
             }
-            output.push_str(&format!("\n═══ Profile: {} ═══\n\n", profile.name));
+            output.push_str(&format!(
+                "\n═══ Profile: {} ═══\n\n",
+                terminal_text(&profile.name)
+            ));
             output.push_str(&list::table_header(show_state));
             for (session, depth) in tree_order(&sessions) {
                 output.push_str(&list::table_row(
-                    &list::table_title(&session.title, depth),
-                    &session.group_path,
-                    &session.project_path,
+                    &list::table_title(&terminal_text(&session.title), depth),
+                    &terminal_text(&session.group_path),
+                    &terminal_text(&session.project_path),
                     show_state.then(|| session.state.as_str()),
                     &session.id,
                 ));
@@ -224,24 +223,23 @@ fn render_list(
         return json_lines(&rows).map(Projection::text);
     }
     if sessions.is_empty() {
+        let profile_name = terminal_text(profile_name);
         return Ok(Projection::text(format!(
             "No sessions found in profile '{profile_name}'.\n"
         )));
     }
     let show_state = state == StateFilter::All;
-    let mut output = format!("Profile: {profile_name}\n\n");
+    let mut output = format!("Profile: {}\n\n", terminal_text(profile_name));
     output.push_str(&list::table_header(show_state));
     for (session, depth) in tree_order(&sessions) {
         output.push_str(&list::table_row(
-            &list::table_title(&session.title, depth),
-            &session.group_path,
-            &session.project_path,
+            &list::table_title(&terminal_text(&session.title), depth),
+            &terminal_text(&session.group_path),
+            &terminal_text(&session.project_path),
             show_state.then(|| session.state.as_str()),
             &session.id,
         ));
     }
-    // The per-profile listing has always closed on its own count, the way the
-    // all-profiles listing closes on its own.
     output.push_str(&format!("\nTotal: {} sessions\n", sessions.len()));
     Ok(Projection {
         stdout: output,
@@ -309,10 +307,7 @@ fn session_json(
         parent_session_id: session.parent_session_id.clone(),
         systemd_unit: (systemd_active
             && session.state.as_str() == "live"
-            && !matches!(
-                session.status.as_str(),
-                "Stopped" | "Deleting" | "Creating" | "Error"
-            ))
+            && crate::process::systemd::has_process(session.status.session_status()))
         .then(|| crate::process::systemd::unit_glob(&session.id)),
     })
 }
@@ -357,6 +352,7 @@ fn render_status(
         return Ok(Projection::text(format!("{}\n", counts.waiting)));
     }
     if sessions.is_empty() {
+        let profile_name = terminal_text(profile_name);
         return Ok(Projection::text(format!(
             "No sessions in profile '{profile_name}'.\n"
         )));
@@ -364,17 +360,14 @@ fn render_status(
     if args.verbose {
         let mut output = String::new();
         for (label, symbol, status) in VERBOSE_GROUPS {
-            // Borrowed rather than cloned: `sessions` are rows of the snapshot,
-            // which outlives this projection, and the local path it replaced
-            // borrowed the same way.
-            let rows: Vec<(&str, &str, String)> = sessions
+            let rows: Vec<(Cow<'_, str>, Cow<'_, str>, String)> = sessions
                 .iter()
                 .filter(|session| session.status.session_status() == status)
                 .map(|session| {
                     (
-                        session.title.as_str(),
-                        session.tool.as_str(),
-                        collapse_home(&session.project_path, local_home),
+                        terminal_text(&session.title),
+                        terminal_text(&session.tool),
+                        collapse_home(&terminal_text(&session.project_path), local_home),
                     )
                 })
                 .collect();
@@ -382,7 +375,8 @@ fn render_status(
         }
         output.push_str(&format!(
             "Total: {} sessions in profile '{profile_name}'\n",
-            counts.total
+            counts.total,
+            profile_name = terminal_text(profile_name),
         ));
         return Ok(Projection {
             stdout: output,
@@ -470,12 +464,12 @@ fn render_show(
 
     let mut output = format!(
         "Session: {}\n  ID:      {}\n  Path:    {}\n  Group:   {}\n  Tool:    {}\n  Command: {}\n  Status:  {}\n",
-        session.title,
+        terminal_text(&session.title),
         session.id,
-        session.project_path,
-        session.group_path,
-        session.tool,
-        session.command,
+        terminal_text(&session.project_path),
+        terminal_text(&session.group_path),
+        terminal_text(&session.tool),
+        terminal_text(&session.command),
         session.status.as_str()
     );
     let timestamp = match session.state {
@@ -502,13 +496,11 @@ fn render_show(
             timestamp.format("%+")
         );
     }
-    output.push_str(&format!("  Profile: {profile_name}\n"));
+    output.push_str(&format!("  Profile: {}\n", terminal_text(profile_name)));
     if let Some(parent_id) = &session.parent_session_id {
-        // A parent that names no row is what a purged parent leaves behind, and
-        // the local path prints the bare id rather than refusing. The two JSON
-        // paths and this one have to agree, so the id is printed either way.
+        // A purged parent can leave a dangling id.
         let line = match sessions.iter().find(|candidate| &candidate.id == parent_id) {
-            Some(parent) => format!("  Parent:  {} ({parent_id})", parent.title),
+            Some(parent) => format!("  Parent:  {} ({parent_id})", terminal_text(&parent.title)),
             None => format!("  Parent:  {parent_id}"),
         };
         output.push_str(&format!("{line}\n"));
@@ -520,7 +512,11 @@ fn render_show(
     if !children.is_empty() {
         output.push_str("  Children:\n");
         for child in children {
-            output.push_str(&format!("    {} ({})\n", child.title, child.id));
+            output.push_str(&format!(
+                "    {} ({})\n",
+                terminal_text(&child.title),
+                child.id
+            ));
         }
     }
     Ok(Projection::text(output))
@@ -602,12 +598,11 @@ fn find_session<'a>(
     {
         return Ok(session);
     }
-    // `cli::resolve_session`'s own sentence, and the local path's exit: this is
-    // the user's own state, not a wire failure.
+    // Preserve the local CLI's user-state refusal.
     Err(ReadFailure::refuse(
         "session_missing",
         1,
-        format!("Error: Session not found: {identifier}\n"),
+        format!("Error: Session not found: {}\n", terminal_text(identifier)),
     ))
 }
 
@@ -623,7 +618,10 @@ fn render_trash(
     if sessions.is_empty() {
         return Ok("Trash is empty.\n".into());
     }
-    let mut output = format!("Trashed sessions in profile '{profile_name}':\n");
+    let mut output = format!(
+        "Trashed sessions in profile '{}':\n",
+        terminal_text(profile_name)
+    );
     for session in sessions {
         let timestamp = wire_instant_at(
             session
@@ -635,7 +633,7 @@ fn render_trash(
             output,
             "  {}  {}  (trashed {})",
             session.id,
-            session.title,
+            terminal_text(&session.title),
             timestamp.format("%+")
         );
     }
@@ -686,7 +684,7 @@ fn render_groups(
         output.push_str(&format!(
             "{}• {} ({} sessions)\n",
             "  ".repeat(depth),
-            group.name,
+            terminal_text(&group.name),
             count
         ));
     }
@@ -717,10 +715,11 @@ fn render_profiles(snapshot: &SnapshotData) -> Result<String, ReadFailure> {
     names.sort_by(|a, b| crate::session::profile_display_order(a, b));
     let mut output = String::from("Profiles:\n");
     for name in names {
+        let display_name = terminal_text(name);
         if snapshot.default_profile.as_deref() == Some(name) {
-            output.push_str(&format!("  * {name} (default)\n"));
+            output.push_str(&format!("  * {display_name} (default)\n"));
         } else {
-            output.push_str(&format!("    {name}\n"));
+            output.push_str(&format!("    {display_name}\n"));
         }
     }
     output.push_str(&format!(
@@ -821,12 +820,12 @@ fn render_projects(
     for project in &projects {
         output.push_str(&format!(
             "  • {} [{}]  {}\n",
-            project.name,
+            terminal_text(&project.name),
             project.scope.as_str(),
-            project.path
+            terminal_text(&project.path)
         ));
         if let Some(branch) = &project.default_base_branch {
-            output.push_str(&format!("      base branch: {branch}\n"));
+            output.push_str(&format!("      base branch: {}\n", terminal_text(branch)));
         }
     }
     let count = projects.len();
@@ -860,7 +859,7 @@ fn profile_unreadable(name: &str) -> ReadFailure {
         1,
         format!(
             "Error: {}\n",
-            crate::cli::list::unreadable_profile_message(name)
+            crate::cli::list::unreadable_profile_message(&terminal_text(name))
         ),
     )
 }
@@ -868,6 +867,7 @@ fn profile_unreadable(name: &str) -> ReadFailure {
 /// The same refusal for a global component the read rests on, named as the
 /// thing it is rather than dressed up as a profile.
 fn unreadable(component: &str) -> ReadFailure {
+    let component = terminal_text(component);
     ReadFailure::refuse(
         "health_degraded",
         1,
@@ -1012,6 +1012,101 @@ mod tests {
             token: None,
             explicit_profile: Some("main".into()),
             env_profile: Some(OsString::from("ignored")),
+        }
+    }
+
+    #[test]
+    fn human_projections_strip_controls_without_changing_json_values() {
+        use clap::Parser;
+
+        let text = "café\x1b]52;c;c2VjcmV0\x07\r\nforged\t\u{7f}\u{85}\u{9b}";
+        let mut parent = session("parent", WireStatus::Running);
+        parent.title = text.into();
+        parent.tool = text.into();
+        parent.command = text.into();
+        parent.group_path = text.into();
+        parent.project_path = format!("/{text}");
+        let mut child = session("parent-child", WireStatus::Running);
+        child.title = text.into();
+        child.parent_session_id = Some(parent.id.clone());
+        let mut trashed = session("trashed", WireStatus::Stopped);
+        trashed.title = text.into();
+        trashed.state = WireState::Trashed;
+        trashed.trashed_at = Some("2026-01-01T00:00:00Z".into());
+        let mut foreign = session("foreign", WireStatus::Idle);
+        foreign.profile = text.into();
+        let mut value = snapshot(vec![parent, child, trashed, foreign]);
+        value.profiles.push(ProfileRead {
+            name: text.into(),
+            listed: true,
+            aliases: vec![],
+            groups: vec![],
+            projects: vec![],
+            health: health(),
+        });
+        value.profiles[0].groups.push(super::super::dto::GroupRead {
+            name: text.into(),
+            path: text.into(),
+            children: vec![],
+        });
+        value.global_projects.push(ProjectRead {
+            name: text.into(),
+            path: format!("/{text}"),
+            merge_key: "owned-project".into(),
+            scope: ProjectScope::Global,
+            default_base_branch: Some(text.into()),
+            registered: true,
+        });
+        let cases: &[&[&str]] = &[
+            &["aoe", "list"],
+            &["aoe", "list", "--all"],
+            &["aoe", "status", "--verbose"],
+            &["aoe", "session", "show", "parent"],
+            &["aoe", "session", "show", "parent-child"],
+            &["aoe", "session", "list-trash"],
+            &["aoe", "profile", "list"],
+            &["aoe", "group", "list"],
+            &["aoe", "project", "list", "--scope", "global"],
+        ];
+        for argv in cases {
+            let cli = crate::cli::Cli::try_parse_from(*argv).unwrap();
+            let command = super::super::classify(cli.command.as_ref()).unwrap();
+            let output = evaluate(&command, &value, &source(), None).unwrap().stdout;
+            assert!(
+                output.chars().all(|ch| !ch.is_control() || ch == '\n'),
+                "{argv:?}: {output:?}"
+            );
+            assert!(!output.contains("\nforged"), "{argv:?}: {output:?}");
+            assert!(output.contains("café"), "{argv:?}: {output:?}");
+        }
+        for argv in [
+            &["aoe", "session", "show", "parent", "--json"][..],
+            &["aoe", "list", "--json"][..],
+        ] {
+            let cli = crate::cli::Cli::try_parse_from(argv).unwrap();
+            let command = super::super::classify(cli.command.as_ref()).unwrap();
+            let output = evaluate(&command, &value, &source(), None).unwrap().stdout;
+            let json: serde_json::Value = serde_json::from_str(&output).unwrap();
+            let row = if json.is_array() { &json[0] } else { &json };
+            assert_eq!(row["title"], text);
+            assert_eq!(row["command"], text);
+            assert_eq!(row["path"], format!("/{text}"));
+        }
+        let missing = format!("missing-{text}");
+        for identifier in ["par", missing.as_str()] {
+            let args = ShowArgs {
+                identifier: Some(identifier.into()),
+                json: false,
+            };
+            let error = evaluate(&ScopedCommand::Show(&args), &value, &source(), None)
+                .expect_err("ambiguous or absent identifiers must refuse");
+            let outcome = super::super::ReadOutcome::from(error);
+            let message = outcome.stderr.unwrap();
+            assert!(
+                message.chars().all(|ch| !ch.is_control() || ch == '\n'),
+                "{message:?}"
+            );
+            assert!(!message.contains("\nforged"), "{message:?}");
         }
     }
 
@@ -1625,48 +1720,6 @@ mod tests {
         super::super::dto::validate_snapshot(&snapshot).unwrap();
         super::super::dto::validate_cross_message(&hello, &snapshot, None).unwrap();
         snapshot
-    }
-
-    #[test]
-    #[serial_test::serial]
-    fn a_persisted_multiline_command_round_trips_to_human_and_json_show() {
-        let _home = crate::session::test_support::isolate_app_dir();
-        let storage = crate::session::Storage::new_unwatched("main").unwrap();
-        let command = "printf 'first\tpart'\nprintf 'second\nline'";
-        storage
-            .update(|rows, _| {
-                let mut row = crate::session::Instance::new("multiline", "/repo");
-                row.id = "command".into();
-                row.tool = "shell".into();
-                row.command = command.into();
-                rows.push(row);
-                Ok(())
-            })
-            .unwrap();
-        let value = recorded_store("main");
-        let rendered = render_show(
-            &ShowArgs {
-                identifier: Some("command".into()),
-                json: true,
-            },
-            &value,
-            &source(),
-        )
-        .unwrap()
-        .stdout;
-        let json: serde_json::Value = serde_json::from_str(&rendered).unwrap();
-        assert_eq!(json["command"], command);
-        let human = render_show(
-            &ShowArgs {
-                identifier: Some("command".into()),
-                json: false,
-            },
-            &value,
-            &source(),
-        )
-        .unwrap()
-        .stdout;
-        assert!(human.contains(command), "{human}");
     }
 
     #[test]

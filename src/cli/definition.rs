@@ -54,11 +54,7 @@ pub struct Cli {
     /// Profile-independent commands such as `list --all` and `serve --stop`
     /// ignore it. `AGENT_OF_EMPIRES_PROFILE` names one too, and an explicit
     /// `-p` wins over it.
-    // No `env` attribute here on purpose. clap would fold the variable into
-    // `cli.profile` itself, and the two are not the same field: `explicit_profile`
-    // and `env_profile` are read separately, and which of them wins is the
-    // documented precedence. An `env` attribute would erase that distinction
-    // behind what looks like a help-text fix.
+    // No env attribute: explicit and environment profiles are tracked separately.
     #[arg(short = 'p', long, global = true)]
     pub profile: Option<String>,
 

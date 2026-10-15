@@ -240,10 +240,7 @@ fn app_path_and_home() -> Result<(PathBuf, PathBuf), TrustedPathError> {
     if !home.is_absolute() {
         return Err(TrustedPathError::Invalid);
     }
-    let base = std::env::var_os("XDG_CONFIG_HOME")
-        .map(PathBuf::from)
-        .filter(|path| path.is_absolute())
-        .unwrap_or_else(|| home.join(".config"));
+    let base = crate::session::xdg_config_base().map_err(|_| TrustedPathError::Invalid)?;
     Ok((base.join(crate::session::APP_DIR_NAME_XDG), home))
 }
 

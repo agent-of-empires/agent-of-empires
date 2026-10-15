@@ -248,35 +248,14 @@ impl From<crate::session::Status> for WireStatus {
 
 impl WireStatus {
     pub(crate) fn as_str(self) -> &'static str {
-        match self {
-            Self::Running => "Running",
-            Self::Waiting => "Waiting",
-            Self::Idle => "Idle",
-            Self::Unknown => "Unknown",
-            Self::Stopped => "Stopped",
-            Self::Error => "Error",
-            Self::Starting => "Starting",
-            Self::Deleting => "Deleting",
-            Self::Creating => "Creating",
-        }
+        self.session_status().wire_str()
     }
     /// CLI JSON status values are lowercase; human status and wire values are PascalCase.
     pub(crate) fn json_str(self) -> &'static str {
-        match self {
-            Self::Running => "running",
-            Self::Waiting => "waiting",
-            Self::Idle => "idle",
-            Self::Unknown => "unknown",
-            Self::Stopped => "stopped",
-            Self::Error => "error",
-            Self::Starting => "starting",
-            Self::Deleting => "deleting",
-            Self::Creating => "creating",
-        }
+        self.session_status().as_str()
     }
 
-    /// The local status this wire value names, so the renderer's tallies are
-    /// the local command's own rather than a second set of rules.
+    /// Domain status used by the shared CLI predicates and tallies.
     pub(crate) fn session_status(self) -> crate::session::Status {
         use crate::session::Status;
         match self {
