@@ -77,9 +77,14 @@ async function fetchTail(
   const needsHandshake = hasMore && cursor > 1;
   // Page back until the last user prompt is loaded, so the first window can open on the whole last turn.
   while (hasMore && cursor > 1 && lastUserBoundaryIndex(rows) < 0) {
-    const res = await getReplay(sid, `before=${cursor}&limit=${REPLAY_PAGE_SIZE}&view=rows`, signal);
-    if (!res.ok) break;
-    const page = (await res.json()) as ReplayPageResponse;
+    let page: ReplayPageResponse;
+    try {
+      const res = await getReplay(sid, `before=${cursor}&limit=${REPLAY_PAGE_SIZE}&view=rows`, signal);
+      if (!res.ok) break;
+      page = (await res.json()) as ReplayPageResponse;
+    } catch {
+      break; // An abort is rethrown below; any other failure keeps what is loaded.
+    }
     signal.throwIfAborted();
     rows = mergePrependedActivity(toActivityRows(page.rows ?? [], sid), rows);
     const next = page.next_cursor ?? cursor;

@@ -101,6 +101,21 @@ describe("fetchTail", () => {
     expect(starts[0]!.tool).toMatchObject({ name: "Read", started_at: "2026-01-01T00:00:00Z" });
   });
 
+  it("keeps the tail when an older page fetch throws", async () => {
+    mockReplay({ [TAIL]: { rows: [row("t1", "tool_start")], next_cursor: 80, has_more: true } });
+    const fetchMock = globalThis.fetch as unknown as ReturnType<typeof vi.fn>;
+    const impl = fetchMock.getMockImplementation()!;
+    fetchMock.mockImplementation(async (url: string) => {
+      if (url.includes("before=80")) throw new TypeError("network down");
+      return impl(url);
+    });
+    const { frames, setHasMore } = await coldOpen();
+    expect(frames).toHaveLength(1);
+    expect(frames[0]!.rows!.map((r) => r.id)).toEqual(["t1"]);
+    expect(frames[0]!.oldestSeq).toBe(80);
+    expect(setHasMore).toHaveBeenCalledWith(true);
+  });
+
   it("still fetches the handshake when paging reaches the start of history", async () => {
     const requests = mockReplay({
       [TAIL]: { rows: [row("t1", "tool_start")], next_cursor: 80, has_more: true },
