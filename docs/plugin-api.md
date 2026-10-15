@@ -304,7 +304,7 @@ id = "my_pane"
 | Slot | Scope | Renders |
 |---|---|---|
 | `status-bar` | global | A segment in the dashboard status bar. |
-| `header-start` | global | A chip beside the logo in the dashboard top bar, hidden with the wordmark on the compact sidebar rail (requires `api_version >= 17`). |
+| `header-start` | global | A chip beside the logo in the dashboard top bar, hidden below the `md` breakpoint and with the wordmark on the compact sidebar rail (requires `api_version >= 17`). |
 | `card` | global | A card on the dashboard overview. |
 | `sort-key` | global | A named sort option over a `row-column` value. |
 | `filter-facet` | global | A named filter over a `row-column` value. |
