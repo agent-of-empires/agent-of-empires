@@ -3,69 +3,92 @@
 
 use super::*;
 
-/// One tmux-backed session, selected, with the split on and the session cache pinned to
-/// `running_terminal`.
-fn split_env(structured: bool) -> (TestEnv, String) {
+/// One tmux-backed session, selected, with the split on. Returns the agent and paired
+/// terminal tmux names for the caller to pin in the session cache.
+fn split_env(structured: bool) -> (TestEnv, String, String) {
     let mut inst = Instance::new("splitter", "/tmp/split");
     if structured {
         inst.view = crate::session::View::Structured;
     }
+    let agent = crate::tmux::Session::generate_name(&inst.id, &inst.title);
     let term = crate::tmux::TerminalSession::generate_name(&inst.id, &inst.title);
     let mut env = seeded_env(test_home(), &[inst.clone()], true);
     env.view.select_session_by_id(&inst.id);
     env.view.split_terminal = true;
-    (env, term)
+    (env, agent, term)
 }
 
 #[test]
 #[serial]
 fn split_preview_layout_and_focus() {
     let cache = crate::tmux::SessionCacheGuard::capture();
+    struct Case {
+        name: &'static str,
+        structured: bool,
+        mode: ViewMode,
+        agent_alive: bool,
+        running: bool,
+        height: u16,
+        expect_split: bool,
+    }
+    let base = |name| Case {
+        name,
+        structured: false,
+        mode: ViewMode::Structured,
+        agent_alive: true,
+        running: true,
+        height: 40,
+        expect_split: true,
+    };
     let cases = [
-        ("agent focused", false, ViewMode::Structured, true, 40, true),
-        (
-            "terminal focused",
-            false,
-            ViewMode::Terminal,
-            true,
-            40,
-            true,
-        ),
-        (
-            "no terminal yet",
-            false,
-            ViewMode::Structured,
-            false,
-            40,
-            true,
-        ),
-        (
-            "structured session stays single",
-            true,
-            ViewMode::Structured,
-            true,
-            40,
-            false,
-        ),
-        (
-            "short preview stays single",
-            false,
-            ViewMode::Structured,
-            true,
-            14,
-            false,
-        ),
+        base("agent focused"),
+        Case {
+            mode: ViewMode::Terminal,
+            ..base("terminal focused")
+        },
+        Case {
+            running: false,
+            ..base("no terminal yet")
+        },
+        Case {
+            structured: true,
+            expect_split: false,
+            ..base("structured session stays single")
+        },
+        Case {
+            height: 14,
+            expect_split: false,
+            ..base("short preview stays single")
+        },
+        Case {
+            mode: ViewMode::Terminal,
+            agent_alive: false,
+            expect_split: false,
+            ..base("gone agent stays single")
+        },
     ];
-    for (name, structured, mode, running, height, expect_split) in cases {
-        let (mut env, term) = split_env(structured);
-        let present: &[&str] = if running { &[term.as_str()] } else { &[] };
-        cache.force_present(present);
+    for case in cases {
+        let Case {
+            name,
+            structured,
+            mode,
+            agent_alive,
+            running,
+            height,
+            expect_split,
+        } = case;
+        let (mut env, agent, term) = split_env(structured);
+        let present: Vec<&str> = [(agent_alive, agent.as_str()), (running, term.as_str())]
+            .into_iter()
+            .filter_map(|(on, name)| on.then_some(name))
+            .collect();
+        cache.force_present(&present);
         env.view.view_mode = mode.clone();
 
         let screen = render_home_to_string(&mut env.view, 120, height);
 
         assert_eq!(
-            screen.contains(" Terminal "),
+            screen.contains(" Terminal ─"),
             expect_split,
             "{name}:\n{screen}"
         );
@@ -99,8 +122,8 @@ fn split_preview_layout_and_focus() {
 #[serial]
 fn split_focus_swap_keeps_the_other_half_cached() {
     let cache = crate::tmux::SessionCacheGuard::capture();
-    let (mut env, term) = split_env(false);
-    cache.force_present(&[term.as_str()]);
+    let (mut env, agent, term) = split_env(false);
+    cache.force_present(&[agent.as_str(), term.as_str()]);
     let id = env.view.selected_session.clone().unwrap();
     render_home_to_string(&mut env.view, 120, 40);
     assert_eq!(
@@ -144,16 +167,17 @@ fn split_hides_info_headers_so_output_owns_each_half() {
         created_at: chrono::Utc::now(),
         base_branch: None,
     });
+    let agent = crate::tmux::Session::generate_name(&inst.id, &inst.title);
     let term = crate::tmux::TerminalSession::generate_name(&inst.id, &inst.title);
     let mut env = seeded_env(test_home(), &[inst.clone()], true);
     env.view.select_session_by_id(&inst.id);
     env.view.split_terminal = true;
     env.view.show_preview_info = true;
-    cache.force_present(&[term.as_str()]);
+    cache.force_present(&[agent.as_str(), term.as_str()]);
 
     let screen = render_home_to_string(&mut env.view, 120, 24);
 
-    assert!(screen.contains(" Terminal "), "{screen}");
+    assert!(screen.contains(" Terminal ─"), "{screen}");
     assert_eq!(
         env.view.preview_pane_area, env.view.preview_area,
         "{screen}"

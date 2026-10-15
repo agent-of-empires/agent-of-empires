@@ -2121,8 +2121,9 @@ impl HomeView {
         Some(name)
     }
 
-    /// Whether the preview splits into agent and paired terminal: only for a tmux-backed
-    /// agent in Agent or Terminal view, where `view_mode` names the focused half.
+    /// Whether the preview splits into agent and paired terminal: only for a live
+    /// tmux-backed agent in Agent or Terminal view, where `view_mode` names the focused
+    /// half. A gone agent pane falls back to the single preview and its placeholder.
     pub(super) fn split_terminal_applies(&self) -> bool {
         if !self.split_terminal || matches!(self.view_mode, ViewMode::Tool(_)) {
             return false;
@@ -2135,6 +2136,9 @@ impl HomeView {
                     && !inst.is_archived()
                     && !inst.is_trashed()
                     && !matches!(inst.status, Status::Creating | Status::Deleting)
+                    && crate::tmux::session_exists_for_display(
+                        &crate::tmux::Session::resolve_name_for_display(&inst.id, &inst.title),
+                    )
             })
     }
 
