@@ -97,6 +97,7 @@ describe("usePluginUiState pages", () => {
       title: "Board",
       icon: null,
       url: "/api/plugins/acme.kit/pages/board",
+      capabilities: [],
     };
     const withPages = (): PluginUiState => ({ ...snapshot(), pages: [{ ...page }] });
     const { result } = mountPolling(withPages(), withPages(), { ...snapshot(), pages: [] });

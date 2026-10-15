@@ -877,6 +877,11 @@ pub struct AppStateConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub show_preview_info: Option<bool>,
 
+    /// Split the home preview into the agent above its paired terminal. `None`/absent
+    /// means a single preview.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub home_split_terminal: Option<bool>,
+
     /// True once the user has answered the telemetry opt-in prompt (in any
     /// surface, either by enabling or declining). Gates the one-time
     /// standalone consent popup shown to users who completed the walkthrough
@@ -1704,6 +1709,24 @@ pub struct SessionConfig {
     )]
     pub show_shortcut_bar: bool,
 
+    /// Link targets beyond http and https that a click in the preview may open,
+    /// as `scheme://authority/` prefixes: `vscode://file/` lets an agent print a
+    /// short relative path that opens the file in VS Code. An entry not in that
+    /// form is ignored, and `file:`, `javascript:`, `data:` and `vbscript:`
+    /// never open. Applies to links printed after the change. Empty by default:
+    /// only web links open, and other targets are not passed to the terminal.
+    #[serde(default)]
+    #[setting(
+        label = "Preview link prefixes",
+        widget = "list",
+        category = "Interaction",
+        web = "local_only:hands pane-supplied links to the host's URL handlers",
+        global_only,
+        tui_only,
+        advanced
+    )]
+    pub preview_link_prefixes: Vec<String>,
+
     /// Keep an aoe-managed worktree session's directory leaf in sync with its
     /// title. When enabled (default), renaming the session also moves its
     /// worktree directory, and new sessions derive the directory leaf from the
@@ -2028,6 +2051,7 @@ impl Default for SessionConfig {
             favorites_first: true,
             show_tips: true,
             show_shortcut_bar: true,
+            preview_link_prefixes: Vec::new(),
             tie_workdir_to_name: true,
         }
     }

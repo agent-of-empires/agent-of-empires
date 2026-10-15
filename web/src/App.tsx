@@ -1860,9 +1860,13 @@ function AppContent({
     if (pluginPageMatch) {
       return (
         <PluginPageView
+          key={pluginPageMatch.pathname}
           pluginId={pluginPageMatch.params.pluginId ?? ""}
           pageId={pluginPageMatch.params.pageId ?? ""}
           onBack={handleClosePluginPage}
+          readOnly={serverAbout?.read_only ?? false}
+          cityhall={caps.cityhall}
+          theme={resolvedTheme}
         />
       );
     }

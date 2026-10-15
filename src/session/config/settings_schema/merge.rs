@@ -55,6 +55,23 @@ pub fn apply_changed_leaves(target: &mut Value, baseline: &Value, current: &Valu
                     }
                 }
             }
+            // A section added or cleared since the baseline: touch only its own leaves,
+            // so siblings a concurrent writer put there survive.
+            (None, Some(cur_val))
+                if cur_val.is_object() && target_map.get(key).is_some_and(Value::is_object) =>
+            {
+                let target_val = target_map.get_mut(key).expect("checked above");
+                apply_changed_leaves(target_val, &Value::Object(Default::default()), cur_val);
+            }
+            (Some(base_val), None)
+                if base_val.is_object() && target_map.get(key).is_some_and(Value::is_object) =>
+            {
+                let target_val = target_map.get_mut(key).expect("checked above");
+                apply_changed_leaves(target_val, base_val, &Value::Object(Default::default()));
+                if target_val.as_object().is_some_and(|m| m.is_empty()) {
+                    target_map.remove(key);
+                }
+            }
             (_, Some(cur_val)) => {
                 target_map.insert(key.clone(), cur_val.clone());
             }
@@ -159,5 +176,22 @@ mod tests {
             apply_changed_leaves(&mut target, &baseline, &current);
             assert_eq!(target, expected, "{label}");
         }
+    }
+    #[test]
+    fn apply_changed_leaves_keeps_siblings_when_a_section_appears_or_clears() {
+        // First override: the editor adds `sound.enabled`, a peer already wrote `sound.volume`.
+        let mut fresh = json!({"sound": {"volume": 0.5}});
+        apply_changed_leaves(&mut fresh, &json!({}), &json!({"sound": {"enabled": true}}));
+        assert_eq!(fresh, json!({"sound": {"volume": 0.5, "enabled": true}}));
+
+        // Last override: the editor clears `sound.enabled`, a peer added `sound.volume`.
+        let mut fresh = json!({"sound": {"enabled": true, "volume": 0.5}});
+        apply_changed_leaves(&mut fresh, &json!({"sound": {"enabled": true}}), &json!({}));
+        assert_eq!(fresh, json!({"sound": {"volume": 0.5}}));
+
+        // Nothing else left in the section: it goes away rather than lingering empty.
+        let mut fresh = json!({"sound": {"enabled": true}});
+        apply_changed_leaves(&mut fresh, &json!({"sound": {"enabled": true}}), &json!({}));
+        assert_eq!(fresh, json!({}));
     }
 }

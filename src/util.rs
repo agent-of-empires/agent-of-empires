@@ -2,8 +2,7 @@
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
-/// Whether `url` is a plain web URL, the only kind aoe hands to a browser
-/// opener or renders as a clickable link.
+/// Whether `url` is a plain web URL, the only kind aoe hands to a browser.
 ///
 /// Deliberately narrow: agent output, plugin UI state and pane text are all
 /// untrusted, and `javascript:`, `file:` and `data:` must never reach an
@@ -12,6 +11,52 @@ use std::time::{SystemTime, UNIX_EPOCH};
 pub(crate) fn is_http_url(url: &str) -> bool {
     let lower = url.to_ascii_lowercase();
     lower.starts_with("http://") || lower.starts_with("https://")
+}
+
+/// Schemes no `session.preview_link_prefixes` entry opens: their handlers run
+/// code or read local data.
+const NEVER_OPENED: &[&str] = &["file:", "javascript:", "data:", "vbscript:"];
+
+/// Whether a preview link to `url` may open: an [`is_http_url`] address, or one
+/// starting with a `session.preview_link_prefixes` entry, compared
+/// case-insensitively. An entry counts only in `scheme://authority` form, and
+/// [`NEVER_OPENED`] schemes stay closed whatever is listed.
+pub(crate) fn is_openable_link(url: &str, extra_prefixes: &[String]) -> bool {
+    if is_http_url(url) {
+        return true;
+    }
+    if NEVER_OPENED.iter().any(|s| starts_with_ignore_case(url, s)) {
+        return false;
+    }
+    extra_prefixes
+        .iter()
+        .map(|p| p.trim())
+        .any(|p| names_an_authority(p) && starts_with_ignore_case(url, p))
+}
+
+/// Whether `s` is an RFC 3986 scheme: a letter, then letters, digits, `+`,
+/// `-` or `.`.
+pub(crate) fn is_uri_scheme(s: &str) -> bool {
+    let mut chars = s.chars();
+    chars.next().is_some_and(|c| c.is_ascii_alphabetic())
+        && chars.all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'))
+}
+
+/// `scheme://authority/`: an entry names one complete authority, so it opens
+/// neither every handler under a scheme nor `vscode://file-other/` for
+/// `vscode://file`.
+fn names_an_authority(prefix: &str) -> bool {
+    prefix.split_once("://").is_some_and(|(scheme, rest)| {
+        is_uri_scheme(scheme)
+            && rest
+                .split_once('/')
+                .is_some_and(|(authority, _)| !authority.is_empty())
+    })
+}
+
+fn starts_with_ignore_case(s: &str, prefix: &str) -> bool {
+    s.get(..prefix.len())
+        .is_some_and(|head| head.eq_ignore_ascii_case(prefix))
 }
 
 /// Whether `url` is safe for a plugin-supplied UI link: an [`is_http_url`]
@@ -112,6 +157,59 @@ mod tests {
         let t = SystemTime::now();
         let secs = t.duration_since(UNIX_EPOCH).unwrap().as_secs();
         assert_eq!(system_time_to_ms(t) / 1_000, secs);
+    }
+
+    #[test]
+    fn is_openable_link_opens_only_web_urls_unless_a_prefix_allows_more() {
+        let none: [String; 0] = [];
+        assert!(is_openable_link("https://example.com", &none));
+        for url in [
+            "vscode://file/Users/u/a.md",
+            "file:///etc/passwd",
+            "javascript:alert(1)",
+        ] {
+            assert!(!is_openable_link(url, &none), "{url} with no prefixes");
+        }
+
+        let allowed = [" vscode://file/ ".to_string(), String::new()];
+        for url in [
+            "vscode://file/Users/u/notes/a.md",
+            "vscode://file/Users/u/src/main.rs:12:4",
+            "VSCode://File/Users/u/a.md",
+            "https://example.com",
+        ] {
+            assert!(is_openable_link(url, &allowed), "{url}");
+        }
+        for url in [
+            "vscode://vscode.git/clone?url=x",
+            "vscode://file-other/path",
+            "vscode-insiders://file/Users/u/a.md",
+            "file:///Users/u/a.md",
+            "javascript:alert(1)",
+        ] {
+            assert!(!is_openable_link(url, &allowed), "{url}");
+        }
+
+        // Entries without a complete authority, and never-opened schemes, are ignored.
+        let ignored = [
+            "vscode:",
+            "vscode://",
+            "vscode://file",
+            "file://",
+            "javascript:",
+            "1x://y/",
+        ]
+        .map(String::from);
+        for url in [
+            "vscode://vscode.git/clone?url=x",
+            "vscode://file/Users/u/a.md",
+            "vscode://file-other/path",
+            "file:///Users/u/a.command",
+            "javascript:alert(1)",
+            "1x://y/z",
+        ] {
+            assert!(!is_openable_link(url, &ignored), "{url}");
+        }
     }
 
     #[test]

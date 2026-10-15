@@ -49,6 +49,13 @@ pub(super) enum SidebarSection {
 /// Persist the first-run intro picks: theme name to `config.theme.name`, attach mode to
 /// `default_attach_mode`. Failures are logged and swallowed so a config write hiccup
 /// cannot block startup.
+/// The `aoe.web` plugin serves the dashboard; with it disabled, `R` explains why instead.
+pub(super) fn web_plugin_disabled() -> bool {
+    crate::plugin::registry()
+        .get("aoe.web")
+        .is_some_and(|p| !p.enabled)
+}
+
 fn apply_intro_outcome(outcome: &IntroOutcome) {
     if outcome.final_theme.is_none()
         && outcome.final_attach_mode.is_none()
@@ -1769,8 +1776,7 @@ impl HomeView {
                 self.jump_to_adjacent_finished(delta);
                 return None;
             }
-            self.handle_live_send_key(key);
-            return None;
+            return self.handle_live_send_key(key);
         }
 
         // Handle unsaved changes confirmation for settings (shown over settings view)
@@ -2890,6 +2896,7 @@ impl HomeView {
             }
             ActionId::ToggleContainer => self.toggle_container_for_selected(),
             ActionId::TogglePreviewInfo => self.toggle_preview_info(),
+            ActionId::ToggleSplitTerminal => self.toggle_split_terminal(),
             ActionId::ToggleHideStopped => self.toggle_hide_stopped_in_groups(),
             ActionId::ToggleDiagnostics => self.toggle_diagnostics(),
             ActionId::OpenSystemHealth => self.open_system_health(),
@@ -3646,10 +3653,7 @@ impl HomeView {
     }
 
     fn open_serve(&mut self) {
-        let web_disabled = crate::plugin::registry()
-            .get("aoe.web")
-            .is_some_and(|p| !p.enabled);
-        if web_disabled {
+        if web_plugin_disabled() {
             self.info_dialog = Some(InfoDialog::new(
                 "Web dashboard disabled",
                 "The aoe.web plugin is disabled, so the web dashboard cannot \
@@ -5617,10 +5621,15 @@ impl HomeView {
             .lines
             .get(view.abs_line_at_row(row))?;
         let offset = col - view.pane.x;
-        crate::tui::links::link_spans_for_line(line, view.pane.width, &cache.links)
-            .into_iter()
-            .find(|span| (span.start..span.end).contains(&offset))
-            .map(|span| span.uri)
+        crate::tui::links::link_spans_for_line(
+            line,
+            view.pane.width,
+            &cache.links,
+            &self.preview_link_prefixes,
+        )
+        .into_iter()
+        .find(|span| (span.start..span.end).contains(&offset))
+        .map(|span| span.uri)
     }
 
     /// Same as `preview_double_click_action`, but the caller supplies `now` so
@@ -6016,16 +6025,37 @@ impl HomeView {
         // against the shell on screen, Tool view to the named tool's pane.
         self.pending_live_send_target = match &self.view_mode {
             ViewMode::Structured => live_send::LiveSendTarget::Agent,
-            ViewMode::Terminal => {
-                if inst.is_sandboxed() && self.get_terminal_mode(&id) == TerminalMode::Container {
-                    live_send::LiveSendTarget::ContainerTerminal
-                } else {
-                    live_send::LiveSendTarget::Terminal
-                }
-            }
+            ViewMode::Terminal => self.paired_terminal_target(inst),
             ViewMode::Tool(name) => live_send::LiveSendTarget::Tool(name.clone()),
         };
         Some(Action::EnterLiveSend(id))
+    }
+
+    /// The paired terminal live send reaches for `inst`: the container shell when a
+    /// sandboxed session is in container mode, else the host shell.
+    fn paired_terminal_target(&self, inst: &crate::session::Instance) -> live_send::LiveSendTarget {
+        if inst.is_sandboxed() && self.get_terminal_mode(&inst.id) == TerminalMode::Container {
+            live_send::LiveSendTarget::ContainerTerminal
+        } else {
+            live_send::LiveSendTarget::Terminal
+        }
+    }
+
+    /// Leader `t`: move live send between the agent and its paired terminal without
+    /// leaving live mode. Re-enters through `EnterLiveSend` so a cold terminal gets the
+    /// same revive path as a fresh entry; the view follows only once that succeeds.
+    fn swap_live_send_target(&mut self, state: &live_send::LiveSendState) -> Option<Action> {
+        let inst = self.get_instance(&state.session_id)?;
+        let target = match state.target {
+            live_send::LiveSendTarget::Terminal | live_send::LiveSendTarget::ContainerTerminal => {
+                live_send::LiveSendTarget::Agent
+            }
+            live_send::LiveSendTarget::Agent | live_send::LiveSendTarget::Tool(_) => {
+                self.paired_terminal_target(inst)
+            }
+        };
+        self.pending_live_send_target = target;
+        Some(Action::EnterLiveSend(state.session_id.clone()))
     }
 
     /// Auto-start live-send after an explicit view switch (`ToggleView`,
@@ -6057,10 +6087,8 @@ impl HomeView {
     /// what the worker is targeting, the user would otherwise type
     /// into the void with only a `tracing::warn!` for company. Auto-
     /// exit + info dialog instead.
-    fn handle_live_send_key(&mut self, key: KeyEvent) {
-        let Some(state) = self.live_send.clone() else {
-            return;
-        };
+    fn handle_live_send_key(&mut self, key: KeyEvent) -> Option<Action> {
+        let state = self.live_send.clone()?;
         let use_omp_approval_chord = matches!(&state.target, live_send::LiveSendTarget::Agent)
             && self
                 .get_instance(&state.session_id)
@@ -6087,7 +6115,7 @@ impl HomeView {
                             worker.send(tmux_key);
                         }
                     }
-                    return;
+                    return None;
                 }
             }
             // Command letters match only when unmodified: the leader-again passthrough
@@ -6103,12 +6131,16 @@ impl HomeView {
                 KeyCode::Char('q') | KeyCode::Char('Q') if plain => {
                     self.exit_live_send_and_restore_sizing(&state)
                 }
+                KeyCode::Char('t') | KeyCode::Char('T') if plain => {
+                    return self.swap_live_send_target(&state)
+                }
+                KeyCode::Char('|') if plain => self.toggle_split_terminal(),
                 // Esc, or any unbound or modified key, cancels the menu without
                 // forwarding: the leader already swallowed the keystroke, as tmux's
                 // prefix does for unknown keys.
                 _ => {}
             }
-            return;
+            return None;
         }
 
         // `handle_key` already cleared any finalized preview selection at the top, which
@@ -6127,12 +6159,12 @@ impl HomeView {
                 KeyCode::PageUp => {
                     self.preview_scroll_offset =
                         self.preview_scroll_offset.saturating_add(PAGE_STEP);
-                    return;
+                    return None;
                 }
                 KeyCode::PageDown => {
                     self.preview_scroll_offset =
                         self.preview_scroll_offset.saturating_sub(PAGE_STEP);
-                    return;
+                    return None;
                 }
                 _ => {}
             }
@@ -6142,7 +6174,7 @@ impl HomeView {
         // escaping a stuck live mode shouldn't hit a "session ended" dialog on the way.
         if live_send::chord_list_matches(&state.exit_chords, key) {
             self.exit_live_send_and_restore_sizing(&state);
-            return;
+            return None;
         }
         // Leader press: arm the live-send command menu and swallow the keystroke; the
         // next key goes to the pending-leader branch at the top. Checked after the exit
@@ -6150,11 +6182,11 @@ impl HomeView {
         if let Some(leader) = state.leader {
             if live_send::chord_matches(leader, key) {
                 self.live_send_pending_leader = true;
-                return;
+                return None;
             }
         }
         if self.end_live_send_on_drift(&state) {
-            return;
+            return None;
         }
         // Ctrl+C here is forwarded to the agent rather than quitting aoe (the app-level
         // handler defers to live-send via `is_live_send_capturing`). Flash the footer so
@@ -6178,6 +6210,7 @@ impl HomeView {
                 self.stamp_last_accessed(&state.session_id);
             }
         }
+        None
     }
 
     /// Exit live-send before an activation hands the terminal to a tmux attach. With

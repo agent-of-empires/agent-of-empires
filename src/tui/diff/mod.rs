@@ -14,7 +14,7 @@ use crate::git::diff::{
     get_default_base_ref, list_branches, DiffFile, FileContents, FileDiff, FileStatus,
 };
 use crate::session::config::{update_app_state, update_config};
-use crate::session::{load_profile_config, resolve_config_or_warn, save_profile_config, Config};
+use crate::session::{resolve_config_or_warn, update_profile_config, Config};
 use crate::tui::dialogs::InfoDialog;
 
 pub use input::DiffAction;
@@ -488,27 +488,24 @@ impl DiffView {
             }
             return;
         }
-        match load_profile_config(&self.profile) {
-            Ok(mut profile_config) => {
-                // Overrides are sparse JSON (#1692): set diff.split_view in the
-                // generic override map rather than a typed DiffConfigOverride.
-                let diff = profile_config
-                    .overrides
-                    .entry("diff".to_string())
-                    .or_insert_with(|| serde_json::json!({}));
-                if let Some(obj) = diff.as_object_mut() {
-                    obj.insert("split_view".to_string(), serde_json::json!(self.split_view));
-                }
-                if let Err(e) = save_profile_config(&self.profile, &profile_config) {
-                    tracing::warn!(
-                        "failed to persist diff split_view for profile {}: {e}",
-                        self.profile
-                    );
-                }
+        let split_view = self.split_view;
+        let saved = update_profile_config(&self.profile, |profile_config| {
+            // Overrides are sparse JSON (#1692): set diff.split_view in the
+            // generic override map rather than a typed DiffConfigOverride.
+            let diff = profile_config
+                .overrides
+                .entry("diff".to_string())
+                .or_insert_with(|| serde_json::json!({}));
+            if let Some(obj) = diff.as_object_mut() {
+                obj.insert("split_view".to_string(), serde_json::json!(split_view));
             }
-            Err(e) => {
-                tracing::warn!("failed to load profile config {}: {e}", self.profile);
-            }
+            Ok(())
+        });
+        if let Err(e) = saved {
+            tracing::warn!(
+                "failed to persist diff split_view for profile {}: {e}",
+                self.profile
+            );
         }
     }
 

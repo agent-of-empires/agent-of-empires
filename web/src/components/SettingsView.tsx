@@ -1,5 +1,5 @@
 /* eslint-disable react-refresh/only-export-components */
-import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import { useCallback, useEffect, useMemo, useState, type ReactNode } from "react";
 import { useServerDown, OFFLINE_TITLE } from "../lib/connectionState";
 import { ConnectedDevices } from "./ConnectedDevices";
 import { McpServers } from "./McpServers";
@@ -9,13 +9,13 @@ import { SecuritySettings } from "./SecuritySettings";
 import { TerminalSettings } from "./TerminalSettings";
 import {
   fetchProfiles,
-  fetchSettings,
   getSettingsSchema,
   setDefaultProfile,
   updateProfileSettings,
   updateSettings,
   updateTheme,
 } from "../lib/api";
+import { loadSettings, saveField, useProfileSettings } from "../lib/settingsStore";
 import type { ProfileInfo, SettingsFieldDescriptor } from "../lib/types";
 import { SchemaSection } from "./settings/SchemaSection";
 import { SelectField } from "./settings/FormFields";
@@ -246,9 +246,6 @@ export function SettingsView({
   cityhall = false,
 }: Props) {
   const offline = useServerDown();
-  const [settings, setSettings] = useState<Record<string, unknown> | null>(null);
-  const [saving, setSaving] = useState(false);
-  const [saveError, setSaveError] = useState<string | null>(null);
   // Seed empty rather than "default" so the initial
   // useEffect-gated loadSettings doesn't fire a wasted
   // fetchSettings("default") against a profile that may not exist.
@@ -262,6 +259,7 @@ export function SettingsView({
   // Seed from the `?profile=` query (deep-link from the Profiles page) when
   // present, else empty (see the note above on why not "default").
   const [selectedProfile, setSelectedProfile] = useState(profile ?? "");
+  const { settings, saving, error: saveError } = useProfileSettings(selectedProfile);
   // Bumped only on a user-initiated profile switch (the header picker), never
   // on the mount-time fetchProfiles resolution that flips selectedProfile from
   // its "" seed to the default. The content fieldset keys its remount on this
@@ -372,76 +370,29 @@ export function SettingsView({
     if (ok) fetchProfiles().then(setProfiles);
   };
 
-  // Guard against a slow fetch for a previously-selected profile landing
-  // after a fast switch and clobbering the current profile's settings. The
-  // Profiles page deep-links raise the odds of rapid profile changes.
-  const loadSeq = useRef(0);
-  const loadSettings = useCallback(() => {
-    if (!selectedProfile) return;
-    const seq = ++loadSeq.current;
-    fetchSettings(selectedProfile)
-      .then((s) => {
-        if (seq !== loadSeq.current) return;
-        if (s) setSettings(s);
-      })
-      .catch(() => {
-        if (seq !== loadSeq.current) return;
-        setSettings(null);
-      });
-  }, [selectedProfile]);
+  const reloadSettings = useCallback(() => loadSettings(selectedProfile), [selectedProfile]);
 
   useEffect(() => {
-    loadSettings();
-  }, [loadSettings]);
+    reloadSettings();
+  }, [reloadSettings]);
 
   const sendSave = useCallback(
-    async (section: string, field: string, value: unknown): Promise<boolean> => {
-      if (!selectedProfile) return false;
-      setSaving(true);
-      setSaveError(null);
+    (section: string, field: string, value: unknown): Promise<boolean> => {
+      if (!selectedProfile) return Promise.resolve(false);
       const patch = { [section]: { [field]: value } };
       // CityHall denies the general save at its boundary; its curated trash
       // toggles are profile overrides with their own narrow endpoint.
-      const ok = cityhall
-        ? await updateProfileSettings(selectedProfile, patch)
-        : await updateSettings(patch, selectedProfile);
-      setSaving(false);
-      if (!ok) {
-        setSaveError("Failed to save, please try again");
-        loadSettings();
-      }
-      return ok;
+      const send = () =>
+        cityhall ? updateProfileSettings(selectedProfile, patch) : updateSettings(patch, selectedProfile);
+      return saveField(selectedProfile, section, field, value, send);
     },
-    [selectedProfile, loadSettings, cityhall],
-  );
-
-  const updateLocal = useCallback(
-    (patch: Record<string, unknown>) => {
-      if (settings) setSettings({ ...settings, ...patch });
-    },
-    [settings],
+    [selectedProfile, cityhall],
   );
 
   const session = (settings?.session ?? {}) as Record<string, unknown>;
   const sandbox = (settings?.sandbox ?? {}) as Record<string, unknown>;
   const worktree = (settings?.worktree ?? {}) as Record<string, unknown>;
   const web = (settings?.web ?? {}) as Record<string, unknown>;
-
-  const saveField = useCallback(
-    (section: string, sectionData: Record<string, unknown>, field: string, value: unknown): Promise<boolean> => {
-      updateLocal({ [section]: { ...sectionData, [field]: value } });
-      return sendSave(section, field, value);
-    },
-    [updateLocal, sendSave],
-  );
-
-  const saveSubField = useCallback(
-    (section: string, field: string, value: unknown): Promise<boolean> => {
-      const sectionData = (settings?.[section] ?? {}) as Record<string, unknown>;
-      return saveField(section, sectionData, field, value);
-    },
-    [settings, saveField],
-  );
 
   // The theme name and color mode are global preferences, not
   // profile-overridable: write them through the dedicated non-elevated
@@ -450,22 +401,14 @@ export function SettingsView({
   // Settings open/close (the empire->rose-pine flip). Profile-overridable rows
   // in the same tab (e.g. idle decay) still write to the selected profile.
   const saveThemeField = useCallback(
-    async (section: string, field: string, value: unknown): Promise<boolean> => {
+    (section: string, field: string, value: unknown): Promise<boolean> => {
       const overridable = schema.some((d) => d.section === section && d.field === field && d.profile_overridable);
-      if (overridable) return saveSubField(section, field, value);
-      const sectionData = (settings?.theme ?? {}) as Record<string, unknown>;
-      updateLocal({ theme: { ...sectionData, [field]: value } });
-      setSaving(true);
-      setSaveError(null);
-      const ok = await updateTheme({ [field]: value });
-      setSaving(false);
-      if (!ok) {
-        setSaveError("Failed to save, please try again");
-        loadSettings();
-      }
-      return ok;
+      if (overridable) return sendSave(section, field, value);
+      return saveField(selectedProfile, section, field, value, async () =>
+        (await updateTheme({ [field]: value })) ? "committed" : "rejected",
+      );
     },
-    [schema, settings, updateLocal, loadSettings, saveSubField],
+    [schema, selectedProfile, sendSave],
   );
 
   const renderTabContent = () => {
@@ -535,7 +478,7 @@ export function SettingsView({
                   schema={schema}
                   focusRequest={focusRequest}
                   values={session}
-                  onSaveField={saveSubField}
+                  onSaveField={sendSave}
                   onlyFields={CITYHALL_SESSION_FIELDS}
                 />
               )}
@@ -564,7 +507,7 @@ export function SettingsView({
                 schema={schema}
                 focusRequest={focusRequest}
                 values={session}
-                onSaveField={saveSubField}
+                onSaveField={sendSave}
                 advancedSubtitle="Idle auto-stop, sleep inhibit, session-id polling, and other session tuning."
               />
             )}
@@ -578,7 +521,7 @@ export function SettingsView({
             schema={schema}
             focusRequest={focusRequest}
             values={sandbox}
-            onSaveField={saveSubField}
+            onSaveField={sendSave}
             advancedSubtitle="Resource limits, custom instructions, environment, volumes, and ports."
           />
         );
@@ -590,7 +533,7 @@ export function SettingsView({
             schema={schema}
             focusRequest={focusRequest}
             values={worktree}
-            onSaveField={saveSubField}
+            onSaveField={sendSave}
             advancedSubtitle="Bare-repo and workspace path templates, branch cleanup, and submodules."
             fieldAnchor={{ field: "path_template", anchor: TOUR_ANCHORS.settingsWorktree }}
           />
@@ -618,7 +561,7 @@ export function SettingsView({
             schema={schema}
             focusRequest={focusRequest}
             values={(settings?.sound ?? {}) as Record<string, unknown>}
-            onSaveField={saveSubField}
+            onSaveField={sendSave}
           />
         );
       case "tmux":
@@ -628,7 +571,7 @@ export function SettingsView({
             schema={schema}
             focusRequest={focusRequest}
             values={(settings?.tmux ?? {}) as Record<string, unknown>}
-            onSaveField={saveSubField}
+            onSaveField={sendSave}
           />
         );
       case "systemd":
@@ -638,7 +581,7 @@ export function SettingsView({
             schema={schema}
             focusRequest={focusRequest}
             values={(settings?.systemd ?? {}) as Record<string, unknown>}
-            onSaveField={saveSubField}
+            onSaveField={sendSave}
             advancedSubtitle="Per-session memory and task limits."
           />
         );
@@ -649,7 +592,7 @@ export function SettingsView({
             schema={schema}
             focusRequest={focusRequest}
             values={(settings?.updates ?? {}) as Record<string, unknown>}
-            onSaveField={saveSubField}
+            onSaveField={sendSave}
           />
         );
       case "telemetry":
@@ -663,7 +606,7 @@ export function SettingsView({
             schema={schema}
             focusRequest={focusRequest}
             values={(settings?.logging ?? {}) as Record<string, unknown>}
-            onSaveField={saveSubField}
+            onSaveField={sendSave}
             advancedSubtitle="Sink and rotation; some fields require restarting aoe to take effect."
           />
         );
@@ -673,7 +616,7 @@ export function SettingsView({
           <div className="space-y-6" {...tourAnchor(TOUR_ANCHORS.settingsPlugins)}>
             <PluginsSettings readOnly={cityhall} />
             {!cityhall &&
-              (schemaGuard() ?? <PluginSettingsSections schema={schema} settings={settings} onSaved={loadSettings} />)}
+              (schemaGuard() ?? <PluginSettingsSections schema={schema} settings={settings} onSaveField={sendSave} />)}
           </div>
         );
 
@@ -694,7 +637,7 @@ export function SettingsView({
                     schema={schema}
                     focusRequest={focusRequest}
                     values={web}
-                    onSaveField={saveSubField}
+                    onSaveField={sendSave}
                   />
                 ))}
             </div>
@@ -734,7 +677,7 @@ export function SettingsView({
               schema={schema}
               focusRequest={focusRequest}
               values={acp}
-              onSaveField={saveSubField}
+              onSaveField={sendSave}
               // The acp section mirrors three fields into serverAbout, which
               // ToolCards and the composer read live; refresh it after any acp
               // save so those surfaces pick up the change without a reload.

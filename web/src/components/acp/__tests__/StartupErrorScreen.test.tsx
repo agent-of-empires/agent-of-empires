@@ -196,6 +196,75 @@ describe("StartupErrorScreen", () => {
       expect(note).not.toContain("docker pull");
     });
 
+    it("names only the recovery actions that render (#4578)", async () => {
+      const opencode = "curl -fsSL https://opencode.ai/install | bash";
+      const manual: React.ComponentProps<typeof StartupErrorScreen>["detail"][] = [
+        { ...incompatible(false), package_name: "OpenCode", install_command: opencode },
+        { kind: "missing_agent_info", expected_package: "OpenCode", install_command: opencode, auto_install: false },
+        {
+          kind: "mismatched_agent_name",
+          expected: "OpenCode",
+          received: "wrapper",
+          install_command: opencode,
+          auto_install: false,
+        },
+        {
+          kind: "unparseable_agent_version",
+          package_name: "OpenCode",
+          raw_version: "x",
+          required: "1.0.0",
+          install_command: opencode,
+          auto_install: false,
+        },
+      ];
+      const cases: [
+        string,
+        React.ComponentProps<typeof StartupErrorScreen>["detail"],
+        boolean,
+        boolean,
+        "enabled" | "disabled" | "none",
+      ][] = [
+        // [label, detail, isSandboxed, allow_agent_install, update button]
+        ["host, npm adapter", incompatible(true), false, true, "enabled"],
+        ["host, manual adapter", incompatible(false), false, true, "none"],
+        ["sandbox, npm adapter", incompatible(true), true, true, "enabled"],
+        ["sandbox, npm adapter, install off", incompatible(true), true, false, "disabled"],
+        ...manual.map((d) => [`sandbox, manual ${d.kind}`, d, true, true, "none"] as (typeof cases)[number]),
+      ];
+      for (const [label, detail, isSandboxed, allow, button] of cases) {
+        fetchSettings.mockResolvedValue({ acp: { allow_agent_install: allow } });
+        const { queryByTestId, findByTestId } = render(
+          <StartupErrorScreen detail={detail} sessionId="s1" isSandboxed={isSandboxed} />,
+        );
+        const command = "install_command" in detail ? detail.install_command : "";
+        if (button === "none") {
+          await waitFor(() => expect(fetchSettings).toHaveBeenCalled());
+        } else {
+          await findByTestId(`startup-error-update-restart${button === "disabled" ? "-disabled" : ""}`);
+        }
+        expect(queryByTestId("startup-error-update-restart") !== null, label).toBe(button === "enabled");
+        expect(queryByTestId("startup-error-update-restart-disabled") !== null, label).toBe(button === "disabled");
+
+        const note = queryByTestId("startup-error-sandbox-note")?.textContent ?? null;
+        const manualStep = queryByTestId("startup-error-sandbox-install-command");
+        if (!isSandboxed) {
+          expect(note, label).toBeNull();
+          expect(queryByTestId("startup-error-install-command")?.textContent, label).toBe(command);
+        } else {
+          expect(queryByTestId("startup-error-install-command"), label).toBeNull();
+          expect(note?.includes("Update & restart"), label).toBe(button !== "none");
+          if (button === "none") {
+            expect(note, label).toContain("then press Restart agent");
+            expect(manualStep?.textContent, label).toBe(command);
+          } else {
+            expect(manualStep, label).toBeNull();
+          }
+        }
+        cleanup();
+        fetchSettings.mockClear();
+      }
+    });
+
     it("relabels the recovery button, then installs through the same endpoint and respawns", async () => {
       fetchSettings.mockResolvedValue({ acp: { allow_agent_install: true } });
       installAcpAgent.mockResolvedValue(installOk());

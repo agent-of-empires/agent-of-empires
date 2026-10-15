@@ -96,6 +96,12 @@ impl HomeView {
         Self::persist_app_state("preview info", |s| s.show_preview_info = Some(show));
     }
 
+    pub fn toggle_split_terminal(&mut self) {
+        self.split_terminal = !self.split_terminal;
+        let split = self.split_terminal;
+        Self::persist_app_state("split terminal", |s| s.home_split_terminal = Some(split));
+    }
+
     /// Forget one session's passive-resize bookkeeping so the next render
     /// re-asserts its preview geometry. Call whenever the agent window's real
     /// size changes out from under the preview (attach, live mode enter/exit).

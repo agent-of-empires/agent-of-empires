@@ -21,7 +21,7 @@ use std::time::Duration;
 use crate::harness::{app_dir_in, require_tmux, TuiTestHarness};
 
 /// Route activation straight into live-send, mirroring `live_takeover`.
-fn write_live_send_config(h: &TuiTestHarness) {
+pub(crate) fn write_live_send_config(h: &TuiTestHarness) {
     let config_dir = app_dir_in(h.home_path());
     let config_content = format!(
         r#"[updates]
@@ -57,7 +57,7 @@ fn agent_session_on(socket: &std::path::Path) -> String {
         .expect("agent tmux session exists")
 }
 
-fn capture(socket: &std::path::Path, session: &str) -> String {
+pub(crate) fn capture(socket: &std::path::Path, session: &str) -> String {
     let output = Command::new("tmux")
         .arg("-S")
         .arg(socket)

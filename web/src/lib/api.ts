@@ -322,6 +322,33 @@ async function announceSave(save: Promise<boolean>): Promise<boolean> {
   return ok;
 }
 
+/** `uncertain`: the write may have landed (network error, 5xx, or a failure after the server persisted). */
+export type SaveOutcome = "committed" | "rejected" | "uncertain";
+
+const POST_PERSIST_ERRORS = new Set(["partially_saved", "load_failed"]);
+
+// Stamps each settings PATCH so the server can drop one that commits after a newer edit of the same field.
+const writeTab = globalThis.crypto?.randomUUID?.() ?? Math.random().toString(36).slice(2);
+let writeSeq = 0;
+
+async function sendSave(url: string, init: RequestInit): Promise<SaveOutcome> {
+  const headers = { ...(init.headers as Record<string, string>), "X-Aoe-Write-Stamp": `${writeTab}.${++writeSeq}` };
+  try {
+    const { ok, status, payload } = await send(url, { ...init, headers });
+    if (ok) return "committed";
+    if (status >= 500 || POST_PERSIST_ERRORS.has(stringField(payload, "error") ?? "")) return "uncertain";
+    return "rejected";
+  } catch {
+    return "uncertain";
+  }
+}
+
+async function announceOutcome(save: Promise<SaveOutcome>): Promise<SaveOutcome> {
+  const outcome = await save;
+  if (outcome !== "rejected") notifySettingsChanged();
+  return outcome;
+}
+
 /** This install's CityHall config bundle as TOML; throws with the server's message. */
 export async function fetchCityHallBundle(): Promise<string> {
   const res = await fetch("/api/cityhall/bundle");
@@ -695,6 +722,8 @@ export interface PluginPage {
   title: string;
   icon: string | null;
   url: string;
+  /** The plugin's granted capabilities; the page bridge gates on them. */
+  capabilities: string[];
 }
 
 export interface PluginUiState {
@@ -706,13 +735,18 @@ export interface PluginUiState {
   revisions?: Record<string, Record<string, number>>;
 }
 
+/** A plugin's sessions in its worker's `sessions.list` row shape; null unless it declares `session.read`. */
+export function fetchPluginSessions(pluginId: string): Promise<{ sessions: Record<string, unknown>[] } | null> {
+  return fetchJson(`/api/plugins/${encodeURIComponent(pluginId)}/sessions`);
+}
+
 export function fetchPluginUiState(): Promise<PluginUiState | null> {
   return fetchJson<PluginUiState>("/api/plugins/ui-state");
 }
 
-/** Lets the next frame load of `page.url` authenticate when device binding is on; the ticket rides an HttpOnly cookie. */
-export async function mintPluginPageTicket(page: PluginPage): Promise<boolean> {
-  const reply = await send(`${page.url}/ticket`, { method: "POST" }).catch(() => null);
+/** Lets the next frame load of a page's `url` authenticate when device binding is on; the ticket rides an HttpOnly cookie. */
+export async function mintPluginPageTicket(url: string): Promise<boolean> {
+  const reply = await send(`${url}/ticket`, { method: "POST" }).catch(() => null);
   return reply?.ok ?? false;
 }
 
@@ -761,15 +795,15 @@ export function invokePluginCommand(fqid: string, sessionId: string): Promise<bo
 /** Save settings; the server puts each field in the layer `fetchSettings`
  *  reads it from: `profile` (default: the served one) where it may override,
  *  machine-wide otherwise. */
-export function updateSettings(updates: Record<string, unknown>, profile?: string): Promise<boolean> {
+export function updateSettings(updates: Record<string, unknown>, profile?: string): Promise<SaveOutcome> {
   const params = profile ? `?profile=${encodeURIComponent(profile)}` : "";
-  return announceSave(fetchOk(`/api/settings${params}`, jsonInit("PATCH", updates)));
+  return announceOutcome(sendSave(`/api/settings${params}`, jsonInit("PATCH", updates)));
 }
 
 /** Set the machine-wide value of every field in `updates`, for editors that
  *  set the value a profile inherits. */
-export function updateMachineSettings(updates: Record<string, unknown>): Promise<boolean> {
-  return announceSave(fetchOk("/api/settings?layer=machine", jsonInit("PATCH", updates)));
+export function updateMachineSettings(updates: Record<string, unknown>): Promise<SaveOutcome> {
+  return announceOutcome(sendSave("/api/settings?layer=machine", jsonInit("PATCH", updates)));
 }
 
 // Theme, tour, tips and acknowledgement flags use dedicated endpoints so these
@@ -881,17 +915,17 @@ export function profileWritableSections(schema: SettingsFieldDescriptor[]): Set<
 }
 
 /** PATCH profile settings, refusing blocked sections. Without a schema, defers to the server's guard. */
-export async function updateProfileSettings(name: string, updates: Record<string, unknown>): Promise<boolean> {
+export async function updateProfileSettings(name: string, updates: Record<string, unknown>): Promise<SaveOutcome> {
   const schema = await getSettingsSchema();
   if (schema) {
     const writable = profileWritableSections(schema);
     const blocked = Object.keys(updates).find((key) => !writable.has(key));
     if (blocked !== undefined) {
       console.error(`updateProfileSettings: refusing to send blocked profile section "${blocked}"`);
-      return false;
+      return "rejected";
     }
   }
-  return announceSave(fetchOk(`/api/profiles/${encodeURIComponent(name)}/settings`, jsonInit("PATCH", updates)));
+  return announceOutcome(sendSave(`/api/profiles/${encodeURIComponent(name)}/settings`, jsonInit("PATCH", updates)));
 }
 
 // --- Themes & Sounds ---
@@ -1716,7 +1750,7 @@ export function setSessionNotifications(id: string, preset: "off" | "default" | 
 }
 
 const sessionUpdate = (id: string, action: string, init: RequestInit) =>
-  fetchJson<SessionResponse>(`/api/sessions/${id}/${action}`, init);
+  fetchJson<SessionResponse>(`/api/sessions/${encodeURIComponent(id)}/${action}`, init);
 
 /** Set or clear (`null`) one repo's diff base; omit `repo` for a single-repo session. */
 export function setSessionDiffBase(

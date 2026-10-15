@@ -12,7 +12,10 @@ const PAGE = {
   title: "Board",
   icon: "kanban",
   url: "/api/plugins/acme.kit/pages/board",
+  capabilities: ["session.read"],
 };
+
+const WRITE_PAGE = { ...PAGE, capabilities: ["session.read", "session.write"] };
 
 // The daemon's page policy (src/server/api/plugins.rs `PLUGIN_PAGE_CSP`).
 const PAGE_CSP =
@@ -25,6 +28,59 @@ const probe = (f) => { try { return String(f()); } catch (e) { return "blocked:"
 const report = { storage: probe(() => localStorage.getItem("aoe_auth_token")), cookie: probe(() => document.cookie), href: location.href };
 fetch("/api/sessions").then(() => "reached", (e) => "blocked:" + e.name).then((api) => parent.postMessage({ ...report, api }, "*"));
 </script>`;
+
+// A page driving the bridge the way the docs/plugin-api.md client snippet does.
+const BRIDGE_FIXTURE = `<!doctype html><p>bridge fixture</p><script>
+let next = 0;
+const pending = new Map();
+const pushes = [];
+const { port1, port2 } = new MessageChannel();
+port1.onmessage = (e) => {
+  const m = e.data;
+  if (m.event) {
+    pushes.push(m);
+    if (m.event === "theme") parent.postMessage({ kind: "theme", data: m.data }, "*");
+    return;
+  }
+  pending.get(m.id)?.(m);
+};
+const send = (msg, transfer) => new Promise((resolve) => {
+  pending.set(msg.id, resolve);
+  if (transfer) parent.postMessage(msg, "*", transfer);
+  else port1.postMessage(msg);
+});
+window.call = (method, params) => send({ aoeBridge: 1, id: ++next, method, params });
+(async () => {
+  const ready = await send({ aoeBridge: 1, id: ++next, method: "ready", params: { nonce: location.hash.slice(1) } }, [port2]);
+  const sessions = await call("sessions.list");
+  const uiState = await call("plugins.uiState");
+  const action = await call("action", { method: "move", params: { to: "done" }, sessionId: "sess-a" });
+  const unknown = await call("sessions.archive");
+  const archive = await call("session.archive", { id: "sess-a" });
+  const trash = await call("session.trash", { id: "sess-a" });
+  parent.postMessage({ kind: "results", ready, sessions, uiState, action, unknown, archive, trash, pushes: pushes.slice(0, 2) }, "*");
+})();
+</script>`;
+
+// Navigates away before its own load, so the next document's load reads as the frame's first.
+const REDIRECT_FIXTURE = `<!doctype html><script>location.replace("/api/plugins/acme.other/pages/board");</script>`;
+
+// Another plugin's page trying to take the redirecting page's bridge without its nonce.
+const OTHER_FIXTURE = `<!doctype html><p>other fixture</p><script>
+const { port1, port2 } = new MessageChannel();
+port1.onmessage = (e) => parent.postMessage({ kind: "other-reply", data: e.data }, "*");
+parent.postMessage({ aoeBridge: 1, id: 1, method: "ready", params: { nonce: location.hash.slice(1) } }, "*", [port2]);
+parent.postMessage({ kind: "other-sent" }, "*");
+</script>`;
+
+const theme = (name: string, appearance: "dark" | "light", bg: string) => ({
+  name,
+  source: "builtin",
+  appearance,
+  web: { cssVars: { "--color-surface-900": bg } },
+  terminal: { cssVars: {} },
+  syntax: { shikiTheme: "github-dark" },
+});
 
 async function mockApis(page: Page, pages: unknown[]) {
   await mockStaticApis(page);
@@ -46,6 +102,26 @@ async function mockApis(page: Page, pages: unknown[]) {
 
 /** Opens the palette once the first ui-state poll has landed, so a missing entry is not just an early read.
  *  Starts on a session, where no first-run overlay covers the palette. */
+/** Records archive and trash requests, each answered with the session row. */
+async function mockLifecycle(page: Page): Promise<string[]> {
+  const calls: string[] = [];
+  await page.route(/\/api\/sessions\/sess-a\/(archive|trash)$/, (r) => {
+    const req = r.request();
+    calls.push(`${req.method()} ${new URL(req.url()).pathname} ${req.postData()}`);
+    return r.fulfill({ json: sessionResponse({ id: "sess-a", title: "Ethiopians" }) });
+  });
+  return calls;
+}
+
+const latestReport = (page: Page, kind: string) =>
+  page.evaluate(
+    (k) =>
+      (window as typeof window & { __frameReports: { kind?: string }[] }).__frameReports
+        .filter((m) => m?.kind === k)
+        .at(-1),
+    kind,
+  );
+
 async function searchPalette(page: Page, query: string) {
   const polled = page.waitForResponse("**/api/plugins/ui-state");
   await page.goto("/session/sess-a");
@@ -96,7 +172,7 @@ test.describe("Plugin pages (#4460)", () => {
     await expect(page.getByRole("navigation", { name: "Sessions sidebar" })).toHaveCount(0);
     const frame = page.getByTestId("plugin-page-frame");
     await expect(frame).toHaveAttribute("sandbox", "allow-scripts");
-    await expect(frame).toHaveAttribute("src", PAGE.url);
+    await expect(frame).toHaveAttribute("src", new RegExp(`^${PAGE.url}#[0-9a-f]{32}$`));
     await expect(page.frameLocator("[data-testid=plugin-page-frame]").getByText("board fixture")).toBeVisible();
     expect(order.slice(0, 2)).toEqual([`POST ${PAGE.url}/ticket`, `GET ${PAGE.url}`]);
 
@@ -126,5 +202,123 @@ test.describe("Plugin pages (#4460)", () => {
     // A deep link has no in-app history, so Back lands on the dashboard.
     await page.getByRole("button", { name: "← Back" }).click();
     await expect(page).toHaveURL("/");
+  });
+
+  test("the page round-trips every bridge method and follows theme changes without reloading", async ({ page }) => {
+    await mockApis(page, [WRITE_PAGE]);
+    await page.route(`**${PAGE.url}`, (r) =>
+      r.fulfill({ contentType: "text/html", headers: { "content-security-policy": PAGE_CSP }, body: BRIDGE_FIXTURE }),
+    );
+    const lifecycle = await mockLifecycle(page);
+    await page.route("**/api/theme/current", (r) => r.fulfill({ json: theme("day", "light", "#ffffff") }));
+    await page.route("**/api/themes/night", (r) => r.fulfill({ json: theme("night", "dark", "#000000") }));
+    // The worker-shaped rows, not the wider /api/sessions ones.
+    const summary = { id: "sess-a", title: "Ethiopians", project_path: "/tmp/agent-of-empires", status: "Idle" };
+    await page.route("**/api/plugins/acme.kit/sessions", (r) => r.fulfill({ json: { sessions: [summary] } }));
+    const actionBodies: unknown[] = [];
+    await page.route("**/api/plugins/*/action", (r) => {
+      actionBodies.push({ url: new URL(r.request().url()).pathname, body: r.request().postDataJSON() });
+      return r.fulfill({ status: 202, json: { ok: true, baseline_revision: 3 } });
+    });
+    const frameLoads: string[] = [];
+    page.on("request", (req) => {
+      if (new URL(req.url()).pathname === PAGE.url && req.method() === "GET") frameLoads.push(req.url());
+    });
+
+    await page.goto("/plugins/acme.kit/board");
+    const latest = (kind: string) => latestReport(page, kind);
+    await expect.poll(() => latest("results")).toBeTruthy();
+    const results = (await latest("results")) as unknown as Record<string, Record<string, unknown>>;
+    expect(results.ready).toEqual({ aoeBridge: 1, id: 1, result: null });
+    expect(results.pushes).toEqual([
+      {
+        aoeBridge: 1,
+        event: "context",
+        data: { readOnly: false, cityhall: false, pluginId: "acme.kit", pageId: "board", bridgeVersion: 1 },
+      },
+      { aoeBridge: 1, event: "theme", data: { appearance: "light", cssVars: { "--color-surface-900": "#ffffff" } } },
+    ]);
+    expect(results.sessions.result).toEqual([summary]);
+    expect(results.uiState.result).toEqual({ entries: [], notifications: [], pages: [WRITE_PAGE] });
+    expect(results.action).toEqual({ aoeBridge: 1, id: 4, result: { baselineRevision: 3 } });
+    expect(actionBodies).toEqual([
+      {
+        url: "/api/plugins/acme.kit/action",
+        body: { method: "move", params: { to: "done" }, session_id: "sess-a" },
+      },
+    ]);
+    expect(results.unknown).toMatchObject({ id: 5, error: { code: "unknown_method" } });
+    expect(results.archive).toEqual({ aoeBridge: 1, id: 6, result: null });
+    expect(results.trash).toEqual({ aoeBridge: 1, id: 7, result: null });
+    expect(lifecycle).toEqual([
+      'PATCH /api/sessions/sess-a/archive {"archived":true,"kill_pane":true}',
+      'POST /api/sessions/sess-a/trash {"kill_pane":true}',
+    ]);
+
+    await page.evaluate(() =>
+      window.dispatchEvent(new CustomEvent("aoe:theme-picker-changed", { detail: { name: "night" } })),
+    );
+    await expect
+      .poll(() => latest("theme"))
+      .toEqual({ kind: "theme", data: { appearance: "dark", cssVars: { "--color-surface-900": "#000000" } } });
+    expect(frameLoads).toHaveLength(1);
+
+    const frame = page.frames().find((f) => new URL(f.url()).pathname === PAGE.url);
+    await frame!.evaluate(() =>
+      (window as typeof window & { call: (m: string, p: unknown) => unknown }).call("openSession", { id: "sess-a" }),
+    );
+    await expect(page).toHaveURL("/session/sess-a");
+  });
+
+  test("a page without session.write cannot archive or trash", async ({ page }) => {
+    await mockApis(page, [PAGE]);
+    await page.route(`**${PAGE.url}`, (r) =>
+      r.fulfill({ contentType: "text/html", headers: { "content-security-policy": PAGE_CSP }, body: BRIDGE_FIXTURE }),
+    );
+    await page.route("**/api/plugins/*/action", (r) => r.fulfill({ status: 202, json: { ok: true } }));
+    const lifecycle = await mockLifecycle(page);
+
+    await page.goto("/plugins/acme.kit/board");
+    await expect.poll(() => latestReport(page, "results")).toBeTruthy();
+    const results = (await latestReport(page, "results")) as unknown as Record<string, unknown>;
+    expect(results.archive).toMatchObject({ id: 6, error: { code: "capability_denied" } });
+    expect(results.trash).toMatchObject({ id: 7, error: { code: "capability_denied" } });
+    expect(lifecycle).toEqual([]);
+  });
+
+  test("a page another document replaces before ready never hands it the bridge", async ({ page }) => {
+    await mockApis(page, [PAGE]);
+    await page.route(`**${PAGE.url}`, (r) =>
+      r.fulfill({ contentType: "text/html", headers: { "content-security-policy": PAGE_CSP }, body: REDIRECT_FIXTURE }),
+    );
+    await page.route("**/api/plugins/acme.other/pages/board", (r) =>
+      r.fulfill({ contentType: "text/html", headers: { "content-security-policy": PAGE_CSP }, body: OTHER_FIXTURE }),
+    );
+    const actions: string[] = [];
+    await page.route("**/api/plugins/*/action", (r) => {
+      actions.push(r.request().url());
+      return r.fulfill({ status: 202, json: { ok: true } });
+    });
+    // The host answers an accepted ready synchronously while dispatching it, before the page's next message.
+    await page.addInitScript(() => {
+      const w = window as typeof window & { __bridgePosts: unknown[] };
+      w.__bridgePosts = [];
+      const post = MessagePort.prototype.postMessage;
+      MessagePort.prototype.postMessage = function (this: MessagePort, msg: unknown, ...rest: never[]) {
+        if ((msg as { aoeBridge?: number } | null)?.aoeBridge) w.__bridgePosts.push(msg);
+        return post.call(this, msg, ...rest);
+      };
+    });
+
+    await page.goto("/plugins/acme.kit/board");
+    await page.waitForFunction(() =>
+      (window as typeof window & { __frameReports: { kind?: string }[] }).__frameReports.some(
+        (m) => m?.kind === "other-sent",
+      ),
+    );
+    expect(await page.evaluate(() => (window as typeof window & { __bridgePosts: unknown[] }).__bridgePosts)).toEqual(
+      [],
+    );
+    expect(actions).toEqual([]);
   });
 });

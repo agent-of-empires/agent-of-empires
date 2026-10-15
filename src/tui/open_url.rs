@@ -1,7 +1,7 @@
-//! The single seam for opening a URL in the user's browser.
+//! The single seam for opening a link: [`open_url`] for web URLs and
+//! [`open_with_system`] for allowed non-web ones.
 //!
-//! Every open goes through [`open_url`] so there is one place to intercept and
-//! one set of reachability rules. `aoe serve --open` routes through it too, so
+//! Both go through one place to intercept and one set of reachability rules. `aoe serve --open` routes through it too, so
 //! the server and the TUI cannot disagree about whether a browser is reachable
 //! on the same host.
 //! When `AOE_OPEN_URL_TO` names a file, the URL is appended to it (one per
@@ -40,21 +40,70 @@ pub fn resolve_href(base_url: &str, href: &str) -> String {
 /// spawned `xdg-open` fails out of band, and over SSH a browser that does start
 /// opens on a screen the user is not sitting at.
 pub fn open_url(url: &str) -> std::io::Result<()> {
-    if let Ok(path) = std::env::var(OPEN_URL_TO_ENV) {
-        let mut f = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(path)?;
-        writeln!(f, "{url}")?;
-        return Ok(());
-    }
-    if !browser_reachable() {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::Unsupported,
-            "no browser you could see from here",
-        ));
+    if let Some(done) = intercept_or_refuse(url) {
+        return done;
     }
     webbrowser::open(url)
+}
+
+/// Open a non-web `url` with the app registered for its scheme, under the same
+/// test hook and reachability rule as [`open_url`]. The caller decides which
+/// schemes are allowed; `webbrowser` only launches browsers.
+///
+/// The opener is reaped off the calling thread, and its exit status arrives on
+/// the returned receiver: a scheme with no registered app shows up only there.
+/// `None` when the test hook recorded the URL instead.
+pub fn open_with_system(
+    url: &str,
+) -> std::io::Result<Option<std::sync::mpsc::Receiver<std::process::ExitStatus>>> {
+    // A leading `-` would reach the opener as an option.
+    if !url.starts_with(|c: char| c.is_ascii_alphabetic()) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "not a URL",
+        ));
+    }
+    if let Some(done) = intercept_or_refuse(url) {
+        return done.map(|()| None);
+    }
+    let opener = if cfg!(target_os = "macos") {
+        "open"
+    } else {
+        "xdg-open"
+    };
+    let mut child = std::process::Command::new(opener)
+        .arg(url)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()?;
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        if let Ok(status) = child.wait() {
+            let _ = tx.send(status);
+        }
+    });
+    Ok(Some(rx))
+}
+
+/// The `AOE_OPEN_URL_TO` record, or the refusal when nothing the user could see
+/// would open; `None` when the caller should go ahead and launch.
+fn intercept_or_refuse(url: &str) -> Option<std::io::Result<()>> {
+    if let Ok(path) = std::env::var(OPEN_URL_TO_ENV) {
+        let written = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .and_then(|mut f| writeln!(f, "{url}"));
+        return Some(written);
+    }
+    if !browser_reachable() {
+        return Some(Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "no browser you could see from here",
+        )));
+    }
+    None
 }
 
 /// Whether launching a browser here would put it in front of the user.
@@ -171,6 +220,8 @@ mod tests {
         // before reaching `webbrowser`, which would spawn something.
         let err = open_url("https://example.com").expect_err("must not report success");
         assert_eq!(err.kind(), std::io::ErrorKind::Unsupported);
+        let err = open_with_system("vscode://file/x").expect_err("must not report success");
+        assert_eq!(err.kind(), std::io::ErrorKind::Unsupported);
     }
 
     #[test]
@@ -194,9 +245,11 @@ mod tests {
         let _env = crate::session::test_support::EnvGuard::set(&[(OPEN_URL_TO_ENV, &path)]);
         open_url("https://example.com/pr/1").unwrap();
         open_url("https://example.com/pr/2").unwrap();
+        assert!(open_with_system("vscode://file/x").unwrap().is_none());
+        assert!(open_with_system("-a Calculator").is_err());
         assert_eq!(
             std::fs::read_to_string(&path).unwrap(),
-            "https://example.com/pr/1\nhttps://example.com/pr/2\n"
+            "https://example.com/pr/1\nhttps://example.com/pr/2\nvscode://file/x\n"
         );
     }
 }

@@ -149,7 +149,9 @@
         "tests/mobile-panes.spec.ts",
         "tests/keyboard-auto-resize.spec.ts",
         "tests/mobile-keyboard.spec.ts",
-        "src/hooks/useMobileViewportLock.test.ts"
+        "src/hooks/useMobileViewportLock.test.ts",
+        "src/components/__tests__/LiveTerminalView.recover.test.tsx",
+        "src/components/__tests__/LiveTerminalView.restart.test.tsx"
       ],
       "components": [
         "web/src/App.tsx",
@@ -463,6 +465,22 @@
       "risk": "medium",
       "specs": ["src/lib/api.test.ts", "src/hooks/useApprovalSound.test.ts"],
       "components": ["web/src/lib/api.ts", "web/src/lib/settingsEvents.ts", "web/src/hooks/useApprovalSound.ts"]
+    },
+    {
+      "id": "settings.save-coordination",
+      "kind": "vitest",
+      "risk": "high",
+      "specs": [
+        "src/lib/settingsStore.test.ts",
+        "src/lib/api.test.ts",
+        "src/components/settings/__tests__/PluginSettingsSections.test.tsx"
+      ],
+      "components": [
+        "web/src/lib/settingsStore.ts",
+        "web/src/lib/api.ts",
+        "web/src/components/SettingsView.tsx",
+        "web/src/components/settings/PluginSettingsSections.tsx"
+      ]
     },
     {
       "id": "settings.theme-persistence",
@@ -1857,10 +1875,11 @@
       "components": [
         "web/src/components/plugin/PluginPagesMenu.tsx",
         "web/src/components/plugin/PluginPageView.tsx",
+        "web/src/lib/pluginBridge.ts",
         "web/src/components/TopBar.tsx",
         "web/src/App.tsx"
       ],
-      "notes": "Pages menu and palette entries appear only with a declared page; the route hides the sidebar, mints a page ticket before framing, and Back pops history. A fixture page served under the daemon's page CSP proves the sandboxed frame cannot read storage, cookies or call the API. Mint ordering and empty states are also unit-tested in PluginPageView.test.tsx; the ticket's server side in src/server/api/plugins.rs."
+      "notes": "Pages menu and palette entries appear only with a declared page; the route hides the sidebar, mints a page ticket before framing, and Back pops history. A fixture page served under the daemon's page CSP proves the sandboxed frame cannot read storage, cookies or call the API. A bridge fixture page round-trips ready, sessions.list, plugins.uiState, its own action, session.archive, session.trash and openSession, a page without session.write is refused both lifecycle calls, and it receives a theme change without reloading; a page that navigates to another plugin's page before ready never hands that page the bridge. Mint ordering, empty states, the nonce-checked ready-only channel handoff, theme pushes, teardown on a second load and remount resets are unit-tested in PluginPageView.test.tsx; envelope validation and gating in pluginBridge.test.ts; the ticket's server side in src/server/api/plugins.rs."
     },
     {
       "id": "sidebar.plugin-row-slots",

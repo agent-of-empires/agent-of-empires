@@ -91,6 +91,23 @@ fn tui_serve_dialog_mode_picker_opens_and_escapes() {
     h.wait_for("No sessions yet");
 }
 
+/// The shortcut bar advertises `R` while nothing is served, then turns the same entry into
+/// a running status once a daemon starts, without restarting the TUI.
+#[test]
+#[parallel]
+fn tui_footer_web_entry_tracks_the_daemon() {
+    require_tmux!();
+    let what = if cfg!(feature = "web") { "Web" } else { "API" };
+    let mut h = TuiTestHarness::new("serve_footer_entry");
+    h.stop_daemon_on_drop();
+    h.spawn_tui();
+    h.wait_for(" aoe ");
+    h.wait_for(&format!("R {what}"));
+
+    h.start_daemon();
+    h.wait_for(&format!("R \u{25CF} {what}"));
+}
+
 /// The daemon child binds the port and survives (it must not self-detect its
 /// own pre-written PID), logs through the tracing sink rather than a revived
 /// `serve.log` (#1124), replays its launch state on `--restart` (#1794), and

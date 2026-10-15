@@ -71,7 +71,7 @@ vi.mock("../../lib/api", () => ({
   fetchPlugins: vi.fn(() => Promise.resolve(null)),
   fetchSettings: vi.fn(() => Promise.resolve({ acp: {}, sandbox: {}, worktree: {} })),
   getSettingsSchema: vi.fn(() => Promise.resolve(MOCK_SCHEMA)),
-  updateSettings: vi.fn(() => Promise.resolve(true)),
+  updateSettings: vi.fn(() => Promise.resolve("committed" as const)),
   setDefaultProfile: vi.fn(() => Promise.resolve(true)),
   createProfile: vi.fn(() => Promise.resolve(true)),
   renameProfile: vi.fn(() => Promise.resolve(true)),
@@ -143,6 +143,10 @@ function selectProfile(container: HTMLElement, name: string) {
   expect(select).toBeTruthy();
   fireEvent.change(select, { target: { value: name } });
 }
+
+import { resetSettingsStore } from "../../lib/settingsStore";
+
+beforeEach(resetSettingsStore);
 
 describe("Settings Advanced fold", () => {
   beforeEach(() => {
