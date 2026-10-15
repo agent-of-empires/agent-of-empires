@@ -62,16 +62,12 @@ one in a persistent session with optional worktree and container isolation.
 
 ## How It Works
 
-Each agent runs in its own [tmux](https://github.com/tmux/tmux/wiki) session,
-so it keeps running when you close the TUI, disconnect SSH, or lose your
-terminal. AoE adds status detection, worktrees, sandboxing, the web dashboard
-and diff review around those sessions; `tmux attach` still works. Press
-**`Ctrl+b d`** to detach from a session and return to the TUI.
+Each agent runs in its own [tmux](https://github.com/tmux/tmux/wiki) session, so your agents keep running when you close the TUI, disconnect SSH, or your terminal crashes. Reopen `aoe` and everything is where you left it. The key shortcut to know: **`Ctrl+b d`** detaches from a session and returns to the TUI.
 
 ## Install
 
-Requires [tmux](https://github.com/tmux/tmux/wiki) on Linux or macOS (Windows
-through WSL2). [Docker](https://www.docker.com/) is optional, for sandboxing.
+Requires [tmux](https://github.com/tmux/tmux/wiki) on Linux or macOS.
+[Docker](https://www.docker.com/) is optional, for sandboxing.
 
 ```bash
 brew install aoe
@@ -95,6 +91,18 @@ aoe serve                    # Start the web dashboard
 - [CLI](https://www.agent-of-empires.com/docs/cli/reference/) and
   [HTTP API](https://www.agent-of-empires.com/docs/api/) references
 - [Roadmap](https://github.com/orgs/agent-of-empires/projects/1)
+
+## FAQ
+
+**What happens when I close aoe?** Nothing. Sessions are tmux sessions running in the background; they are removed only when you delete them.
+
+**Which AI tools are supported?** Run `aoe agents` for the current list and availability on your machine.
+
+**Can I use AoE over SSH?** Yes. Sessions persist across disconnects; reconnect and run `aoe` again.
+
+**Does it work on Windows?** Only through WSL2. AoE depends on tmux and POSIX process handling.
+
+**How is this different from plain tmux?** tmux gives you persistent sessions. AoE adds agent-aware status detection, git worktree management, container sandboxing, a web dashboard with phone access, and a diff viewer around them. You can still `tmux attach` to any AoE session directly.
 
 ## Contributing
 
