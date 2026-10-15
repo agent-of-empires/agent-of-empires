@@ -96,6 +96,21 @@ export function PluginPageView({ pluginId, pageId, onBack, readOnly, cityhall, t
   useEffect(() => {
     if (!page) return;
     const grants = { capabilities: page.capabilities, readOnly, cityhall };
+    const serve = (channel: MessagePort) => (e: MessageEvent) => {
+      const call = parseRequest(e.data);
+      if (!call) return;
+      const resolved = resolveRequest(call, grants);
+      if ("error" in resolved) {
+        channel.postMessage(bridgeError(call.id, resolved.error, resolved.message));
+        return;
+      }
+      runCall(resolved.call, page.plugin_id).then(
+        (result) => channel.postMessage(bridgeReply(call.id, result)),
+        () => channel.postMessage(bridgeError(call.id, "failed", `${call.method} failed.`)),
+      );
+    };
+    // An open channel resolves against the current modes, not those at its handshake.
+    if (port.current) port.current.onmessage = serve(port.current);
     const onMessage = (event: MessageEvent) => {
       // `event.origin` is "null" for the sandboxed frame; only the window identifies it.
       const frame = frameRef.current?.contentWindow;
@@ -104,19 +119,7 @@ export function PluginPageView({ pluginId, pageId, onBack, readOnly, cityhall, t
       const channel = event.ports[0];
       if (req?.method !== "ready" || !channel) return;
       port.current = channel;
-      channel.onmessage = (e: MessageEvent) => {
-        const call = parseRequest(e.data);
-        if (!call) return;
-        const resolved = resolveRequest(call, grants);
-        if ("error" in resolved) {
-          channel.postMessage(bridgeError(call.id, resolved.error, resolved.message));
-          return;
-        }
-        runCall(resolved.call, page.plugin_id).then(
-          (result) => channel.postMessage(bridgeReply(call.id, result)),
-          () => channel.postMessage(bridgeError(call.id, "failed", `${call.method} failed.`)),
-        );
-      };
+      channel.onmessage = serve(channel);
       channel.postMessage(bridgeReply(req.id, null));
       channel.postMessage(
         bridgePush("context", { readOnly, cityhall, pluginId, pageId, bridgeVersion: BRIDGE_VERSION }),

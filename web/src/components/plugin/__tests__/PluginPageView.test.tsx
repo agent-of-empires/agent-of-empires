@@ -11,13 +11,14 @@ const h = vi.hoisted(() => ({
   pages: null as PluginPage[] | null,
   mint: vi.fn<(page: PluginPage) => Promise<boolean>>(),
   sessions: vi.fn(),
+  action: vi.fn(),
 }));
 vi.mock("../../../lib/pluginUiContext", () => ({ usePluginPages: () => h.pages }));
 vi.mock("../../../lib/api", () => ({
   mintPluginPageTicket: (page: PluginPage) => h.mint(page),
   fetchSessions: () => h.sessions(),
   fetchPluginUiState: vi.fn(),
-  invokePluginAction: vi.fn(),
+  invokePluginAction: (...args: unknown[]) => h.action(...args),
 }));
 
 const board: PluginPage = {
@@ -75,6 +76,7 @@ beforeEach(() => {
   h.pages = [board];
   h.mint.mockReset();
   h.sessions.mockReset();
+  h.action.mockReset();
 });
 
 describe("PluginPageView", () => {
@@ -180,5 +182,26 @@ describe("PluginPageView", () => {
     });
     fireEvent.load(next);
     expect(screen.getByTestId("plugin-page-frame")).toBe(next);
+  });
+
+  it("gates an open channel's requests on the current mode", async () => {
+    const { send, rerender } = await openFrame();
+    const { port, request } = fakePort();
+    await send({ aoeBridge: 1, id: "r", method: "ready" }, [port]);
+    rerender(
+      <PluginPageView
+        pluginId="acme.kit"
+        pageId="board"
+        onBack={() => {}}
+        readOnly={true}
+        cityhall={false}
+        theme={null}
+      />,
+    );
+    await request({ aoeBridge: 1, id: 2, method: "action", params: { method: "move" } });
+    expect(port.postMessage).toHaveBeenLastCalledWith(
+      expect.objectContaining({ id: 2, error: expect.objectContaining({ code: "read_only" }) }),
+    );
+    expect(h.action).not.toHaveBeenCalled();
   });
 });
