@@ -21,6 +21,13 @@ export function setPending(update: (p: Pending) => Pending) {
   for (const l of listeners) l();
 }
 
+/** Drop a field's overlay unless a newer save of it is still in flight. */
+export function dropOverlay(key: string) {
+  setPending((p) =>
+    p[key] && p[key].inflight === 0 ? Object.fromEntries(Object.entries(p).filter(([k]) => k !== key)) : p,
+  );
+}
+
 export function subscribePendingSaves(cb: () => void) {
   listeners.add(cb);
   return () => listeners.delete(cb);

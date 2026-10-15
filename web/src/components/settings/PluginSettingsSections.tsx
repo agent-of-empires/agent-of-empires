@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useSyncExternalStore } from "react";
-import { getPendingSaves, queueSave, setPending, subscribePendingSaves } from "./pluginSaves";
+import { dropOverlay, getPendingSaves, queueSave, setPending, subscribePendingSaves } from "./pluginSaves";
 import { updateSettings } from "../../lib/api";
 import type { SettingsFieldDescriptor } from "../../lib/types";
 import { SchemaSection } from "./SchemaSection";
@@ -10,7 +10,8 @@ interface Props {
   /** Includes the virtual `plugin:<id>` sections. */
   schema: SettingsFieldDescriptor[];
   settings: Record<string, unknown> | null;
-  onSaved: () => void;
+  /** Refetches the settings; resolves once a fetch started after the save has landed. */
+  onSaved: () => Promise<void> | void;
 }
 
 function storedSettings(settings: Record<string, unknown> | null, id: string): Record<string, unknown> {
@@ -21,9 +22,17 @@ function storedSettings(settings: Record<string, unknown> | null, id: string): R
 /** One SchemaSection per active plugin; plugin settings are global, saved via `PATCH /api/settings`. */
 export function PluginSettingsSections({ schema, settings, onSaved }: Props) {
   const pending = useSyncExternalStore(subscribePendingSaves, getPendingSaves);
+  // An overlay outlives remounts and is dropped only once the settings show its value; a fetch that
+  // still shows the old value predates the commit (or the write is still on its way).
   useEffect(() => {
-    setPending((p) => Object.fromEntries(Object.entries(p).filter(([, e]) => e.inflight > 0)));
-  }, [settings]);
+    const keep = Object.entries(pending).filter(
+      ([, e]) =>
+        e.inflight > 0 ||
+        JSON.stringify(storedSettings(settings, e.section.slice(PLUGIN_PREFIX.length))[e.field]) !==
+          JSON.stringify(e.value),
+    );
+    if (keep.length !== Object.keys(pending).length) setPending(() => Object.fromEntries(keep));
+  }, [settings, pending]);
 
   const sections = useMemo(() => {
     const seen = new Set<string>();
@@ -60,7 +69,12 @@ export function PluginSettingsSections({ schema, settings, onSaved }: Props) {
       return { ...p, [key]: { ...entry, inflight, acked } };
     });
     // An uncertain save keeps its value on screen; the refetch settles what the server holds.
-    if (outcome !== "rejected") onSaved();
+    if (outcome !== "rejected") {
+      void Promise.resolve(onSaved()).then(() => {
+        // The overlay only bridges until a fetch that started after the commit lands.
+        if (outcome === "committed") dropOverlay(key);
+      });
+    }
     return outcome !== "rejected";
   };
 

@@ -15,6 +15,9 @@ import type { SettingsFieldDescriptor } from "../../../lib/types";
 
 beforeEach(resetPluginSaves);
 
+// A refetch that has not landed yet: the settings prop keeps showing the old list.
+const refetchPending = () => new Promise<void>(() => {});
+
 const ALLOW = { policy: "allow" } as const;
 const NONE = { rule: "none" } as const;
 
@@ -116,7 +119,7 @@ describe("PluginSettingsSections list editing while a save is in flight", () => 
     vi.mocked(updateSettings).mockClear();
     const pendingPatch = held();
     vi.mocked(updateSettings).mockReturnValueOnce(pendingPatch.promise);
-    render(<PluginSettingsSections schema={LIST_SCHEMA} settings={stored(["a", "b", "c"])} onSaved={() => {}} />);
+    render(<PluginSettingsSections schema={LIST_SCHEMA} settings={stored(["a", "b", "c"])} onSaved={refetchPending} />);
 
     fireEvent.click(screen.getByTitle("Edit b"));
     fireEvent.click(screen.getAllByTitle(/^Remove /)[0]!);
@@ -149,7 +152,7 @@ describe("PluginSettingsSections list editing while a save is in flight", () => 
     const edit = held();
     vi.mocked(updateSettings).mockReturnValueOnce(removal.promise).mockReturnValueOnce(edit.promise);
     // The settings prop never changes: the refetch for the acknowledged removal is still pending.
-    render(<PluginSettingsSections schema={LIST_SCHEMA} settings={stored(["a", "b", "c"])} onSaved={() => {}} />);
+    render(<PluginSettingsSections schema={LIST_SCHEMA} settings={stored(["a", "b", "c"])} onSaved={refetchPending} />);
 
     fireEvent.click(screen.getByTitle("Edit b"));
     fireEvent.click(screen.getAllByTitle(/^Remove /)[0]!);
@@ -176,7 +179,7 @@ describe("PluginSettingsSections list editing while a save is in flight", () => 
     const edit = held();
     vi.mocked(updateSettings).mockReturnValueOnce(removal.promise).mockReturnValueOnce(edit.promise);
     // The settings prop never changes: the refetch for the acknowledged removal is still pending.
-    render(<PluginSettingsSections schema={LIST_SCHEMA} settings={stored(["a", "b", "c"])} onSaved={() => {}} />);
+    render(<PluginSettingsSections schema={LIST_SCHEMA} settings={stored(["a", "b", "c"])} onSaved={refetchPending} />);
 
     fireEvent.click(screen.getAllByTitle(/^Remove /)[0]!);
     removal.release("committed");
@@ -215,6 +218,23 @@ describe("PluginSettingsSections list editing while a save is in flight", () => 
     // The second removal waits for the first PATCH and removes `b` from `[b, c]`, not from `[a, b, c]`.
     expect(updateSettings).toHaveBeenCalledTimes(1);
     removal.release("committed");
+    await waitFor(() => expect(updateSettings).toHaveBeenCalledTimes(2));
+    expect(lastPatch()).toEqual({ "plugin:acme.kit": { tags: ["c"] } });
+  });
+
+  it("keeps a committed removal across a remount while its refetch is still pending", async () => {
+    vi.mocked(updateSettings).mockClear();
+    const onSaved = vi.fn(refetchPending);
+    const props = { schema: LIST_SCHEMA, settings: stored(["a", "b", "c"]), onSaved };
+    const first = render(<PluginSettingsSections {...props} />);
+    fireEvent.click(screen.getAllByTitle(/^Remove /)[0]!);
+    await waitFor(() => expect(onSaved).toHaveBeenCalledTimes(1));
+
+    // The refetch has not landed: the prop still shows the old list.
+    first.unmount();
+    render(<PluginSettingsSections {...props} />);
+    expect(screen.queryByText("a")).toBeNull();
+    fireEvent.click(screen.getAllByTitle(/^Remove /)[0]!);
     await waitFor(() => expect(updateSettings).toHaveBeenCalledTimes(2));
     expect(lastPatch()).toEqual({ "plugin:acme.kit": { tags: ["c"] } });
   });

@@ -605,6 +605,20 @@ describe("settings saves", () => {
     }
   });
 
+  it("stamps each settings PATCH with an increasing per-tab sequence and treats a stale write as rejected", async () => {
+    const stamp = () => (lastCall().init?.headers as Record<string, string>)["X-Aoe-Write-Stamp"]!;
+    fetchSpy.mockImplementation(async () => empty());
+    await api.updateSettings({ a: 1 });
+    const [tab, first] = stamp().split(/\.(?=\d+$)/);
+    await api.updateProfileSettings("p", { a: 1 });
+    expect(stamp()).toBe(`${tab}.${Number(first) + 1}`);
+
+    fetchSpy.mockImplementation(
+      async () => ({ ok: false, status: 409, json: async () => ({ error: "stale_write" }) }) as unknown as Response,
+    );
+    expect(await api.updateSettings({ a: 1 })).toBe("rejected");
+  });
+
   it("setDefaultProfile announces a landed save and stays quiet on a rejected one", async () => {
     const listener = vi.fn();
     const off = onSettingsChanged(listener);

@@ -327,9 +327,14 @@ export type SaveOutcome = "committed" | "rejected" | "uncertain";
 
 const POST_PERSIST_ERRORS = new Set(["partially_saved", "load_failed"]);
 
+// Stamps each settings PATCH so the server can drop one that commits after a newer edit of the same field.
+const writeTab = globalThis.crypto?.randomUUID?.() ?? Math.random().toString(36).slice(2);
+let writeSeq = 0;
+
 async function sendSave(url: string, init: RequestInit): Promise<SaveOutcome> {
+  const headers = { ...(init.headers as Record<string, string>), "X-Aoe-Write-Stamp": `${writeTab}.${++writeSeq}` };
   try {
-    const { ok, status, payload } = await send(url, init);
+    const { ok, status, payload } = await send(url, { ...init, headers });
     if (ok) return "committed";
     if (status >= 500 || POST_PERSIST_ERRORS.has(stringField(payload, "error") ?? "")) return "uncertain";
     return "rejected";

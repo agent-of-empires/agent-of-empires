@@ -20,7 +20,10 @@ const listOf = (hook: { result: { current: SettingsView } }) =>
 
 beforeEach(() => {
   resetSettingsStore();
-  vi.mocked(fetchSettings).mockReset();
+  // Unscripted fetches (a retry after the test is over) hang instead of resolving to undefined.
+  vi.mocked(fetchSettings)
+    .mockReset()
+    .mockReturnValue(new Promise(() => {}));
 });
 
 async function seed(profile: string, list: string[]) {
@@ -89,6 +92,50 @@ describe("settings store", () => {
     });
     await waitFor(() => expect(hook.result.current.error).toBe("Could not refresh settings, please reload"));
     expect(listOf(hook)).toEqual(["b"]);
+  });
+
+  it("keeps an unconfirmed edit over a fetch that predates its late commit", async () => {
+    const hook = await seed("main", ["a", "b", "c"]);
+    // The first fetch reads the old list: the write that dropped its connection has not committed yet.
+    vi.mocked(fetchSettings).mockResolvedValueOnce(plugins(["a", "b", "c"]));
+    await act(async () => {
+      await saveField("main", "web", "list", ["b", "c"], async () => "uncertain");
+    });
+    await waitFor(() => expect(fetchSettings).toHaveBeenCalledTimes(2));
+    expect(listOf(hook)).toEqual(["b", "c"]);
+
+    // The next edit builds on the kept intent, not on the old list, so `a` stays removed.
+    const next = (listOf(hook) ?? []).filter((x) => x !== "b");
+    vi.mocked(fetchSettings).mockResolvedValue(plugins(["c"]));
+    await act(async () => {
+      await saveField("main", "web", "list", next, async () => "committed");
+    });
+    expect(listOf(hook)).toEqual(["c"]);
+
+    // A later fetch showing the committed value settles the intent: no more reconciling.
+    const calls = vi.mocked(fetchSettings).mock.calls.length;
+    loadSettings("main");
+    await waitFor(() => expect(fetchSettings).toHaveBeenCalledTimes(calls + 1));
+    await act(async () => {
+      await saveField("main", "web", "list", ["c"], async () => "committed");
+    });
+    expect(fetchSettings).toHaveBeenCalledTimes(calls + 1);
+  });
+
+  it("refetches when a GET was overtaken by a save that has since committed", async () => {
+    const hook = await seed("main", ["a", "b", "c"]);
+    // A mount-time GET still in flight when the user edits; the TUI changed the list meanwhile.
+    const stale = deferred<Record<string, unknown>>();
+    vi.mocked(fetchSettings)
+      .mockReturnValueOnce(stale.promise)
+      .mockResolvedValueOnce(plugins(["x", "b"]));
+    loadSettings("main");
+    await act(async () => {
+      await saveField("main", "web", "flag", true, async () => "committed");
+    });
+    await act(async () => stale.resolve(plugins(["a", "b", "c"])));
+
+    await waitFor(() => expect(listOf(hook)).toEqual(["x", "b"]));
   });
 
   it("does not refetch after a committed save", async () => {
