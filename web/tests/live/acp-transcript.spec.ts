@@ -3,6 +3,7 @@
 import type { Page } from "@playwright/test";
 import { spawnSync } from "node:child_process";
 import { join } from "node:path";
+import { crc32, deflateSync } from "node:zlib";
 import { test, expect } from "../helpers/liveTest";
 import { writeFileSync } from "node:fs";
 import { fakeAcpScriptPath, resolveAoeBinary } from "../helpers/aoeServe";
@@ -81,6 +82,58 @@ test("structured view prompt carries an image attachment end to end", async ({ s
   expect((await prompt("sneaky", { kind: "image", mime_type: "image/png", data: spoof, name: "x.png" })).status).toBe(
     400,
   );
+});
+
+// A valid grayscale PNG with a real decodable size, so the browser computes a natural height.
+function solidPng(width: number, height: number): Buffer {
+  const chunk = (type: string, data: Buffer) => {
+    const body = Buffer.concat([Buffer.from(type, "ascii"), data]);
+    const out = Buffer.alloc(body.length + 8);
+    out.writeUInt32BE(data.length, 0);
+    body.copy(out, 4);
+    out.writeUInt32BE(crc32(body), body.length + 4);
+    return out;
+  };
+  const ihdr = Buffer.alloc(13);
+  ihdr.writeUInt32BE(width, 0);
+  ihdr.writeUInt32BE(height, 4);
+  ihdr.writeUInt8(8, 8); // bit depth; colour type 0 (grayscale) stays zero
+  const raw = Buffer.alloc((width + 1) * height, 0x80);
+  for (let row = 0; row < height; row++) raw[row * (width + 1)] = 0; // filter: none
+  return Buffer.concat([
+    Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
+    chunk("IHDR", ihdr),
+    chunk("IDAT", deflateSync(raw)),
+    chunk("IEND", Buffer.alloc(0)),
+  ]);
+}
+
+test("uploaded image in a user message is capped in height and never overflows", async ({ page, spawnServe }) => {
+  const { serve, sessionId } = await startAcpSession(spawnServe, {
+    title: "acp-image-size",
+    fakeAcpScript: IMAGE_CAPABLE,
+  });
+  expect2xx(
+    await postAcp(serve.baseUrl, sessionId, "/prompt", {
+      text: "tall picture",
+      attachments: [
+        { kind: "image", mime_type: "image/png", data: solidPng(100, 1200).toString("base64"), name: "tall.png" },
+      ],
+    }),
+  );
+
+  await openStructuredView(page, serve, sessionId);
+  const image = page.locator("img.acp-artifact-image");
+  await expect(image).toBeVisible({ timeout: 15_000 });
+  await expect.poll(() => image.evaluate((el: HTMLImageElement) => el.naturalHeight)).toBe(1200);
+
+  const box = (await image.boundingBox())!;
+  expect(box.height).toBeLessThanOrEqual(320);
+  // Aspect ratio survives the cap.
+  const contentRatio = await image.evaluate((el: HTMLImageElement) => el.clientWidth / el.clientHeight);
+  expect(contentRatio).toBeCloseTo(100 / 1200, 2);
+  const viewport = page.viewportSize()!;
+  expect(box.x + box.width).toBeLessThanOrEqual(viewport.width);
 });
 
 test("staged composer image survives session switch and reload", async ({ page, spawnServe }) => {

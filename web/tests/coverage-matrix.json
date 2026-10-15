@@ -3062,7 +3062,8 @@
         "web/src/hooks/useAcpSession.ts",
         "web/src/hooks/acpSession/reducer.ts",
         "web/src/lib/acpTypes.ts"
-      ]
+      ],
+      "notes": "#4475: notice_timeout_secs is capped at 2147483 so its millisecond delay fits a browser setTimeout, and PromptStrips clamps the delay for older configs above the cap. SessionNoticesStrip.test.tsx covers the boundary: a timeout past the timer limit does not dismiss at once and fires only after the clamped delay."
     },
     {
       "id": "acp.queue-send-now",

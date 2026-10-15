@@ -260,7 +260,7 @@ impl Instance {
             if let Some(binding) = excluded {
                 self.retroactive_capture_excludes.remove(&binding);
             }
-            prepared.carry_relocated = relocated;
+            prepared.require_conversation_publication |= relocated;
             return Ok(prepared);
         }
         let prepared = self.prepare_launch_command(expected)?;
@@ -806,8 +806,19 @@ mod tests {
                 .unwrap()
                 .launch_base_command();
             let base_command = command.clone();
-            let resumed =
-                inst.apply_session_flags(&mut command, "test", inst.resolved_agent(), None);
+            let resumed = inst.apply_session_flags(
+                &mut command,
+                "test",
+                inst.resolved_agent(),
+                None,
+                &super::execution::AgentLaunchContext::host(
+                    inst.resolved_agent(),
+                    inst.default_selector_agent()
+                        .and_then(|agent| inst.host_agent_command(agent, None))
+                        .as_ref(),
+                ),
+                &mut inst.conversation_state(),
+            );
             if resume_supported {
                 assert!(resumed.unwrap(), "{tool}: launch resume decision");
                 assert_ne!(command, base_command, "{tool}: resume selector missing");

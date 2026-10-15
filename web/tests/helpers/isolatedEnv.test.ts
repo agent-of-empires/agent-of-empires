@@ -111,8 +111,10 @@ const INHERITED_BY_CONTRACT = new Set([
   "AOE_TERMINAL_TRACE",
   "AOE_TEST_TOKEN_GRACE_SECS",
   "AOE_TEST_TOKEN_LIFETIME_SECS",
-  // Rust test-binary re-entry marker, compiled out of aoe serve.
+  // Rust test-binary re-entry markers, compiled out of aoe serve.
   "AOE_AGENT_PROBE_TEST_CHILD",
+  "AOE_FROZEN_NATIVE_TEST_CHILD",
+  "AOE_LOOPBACK_PROXY_TEST_CHILD",
   // A marker `aoe` echoes into a pane to probe a login shell, not a variable
   // the daemon resolves anything from.
   "AOE_AGENT_OK",

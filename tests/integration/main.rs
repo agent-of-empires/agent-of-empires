@@ -15,6 +15,8 @@
 //! only debug builds compile, so release test builds (the Nix checks) skip them.
 
 mod common;
+#[cfg(unix)]
+mod frozen_environment;
 mod home_isolation;
 
 mod daemon_client;

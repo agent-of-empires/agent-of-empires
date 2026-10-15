@@ -34,7 +34,7 @@ pub(crate) use gemini::{
 pub(crate) use hermes::hermes_poll_fn_sandboxed_store;
 pub(crate) use kimi::{kimi_poll_fn_sandboxed_store, selected_index_record, KIMI_INDEX_MAX_BYTES};
 pub(crate) use omp::*;
-pub(crate) use opencode::preassign_opencode_session_id;
+pub(crate) use opencode::{fork_opencode_session_id, preassign_opencode_session_id};
 pub(crate) use pi::{extract_pi_header_fields, pi_sidecar_poll_fn, read_pi_session_observation};
 pub(crate) use prime::{
     prime_agent_poll_fn_sandboxed, root_session_header, PrimeRootPublication,

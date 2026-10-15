@@ -550,13 +550,16 @@ pub struct AcpConfig {
     )]
     pub notice_display: NoticeDisplay,
     /// Seconds before an info or warning notice auto-dismisses when agent
-    /// notices are set to auto-dismiss.
+    /// notices are set to auto-dismiss. Capped at 2147483 so the web
+    /// dashboard's `setTimeout` delay (a signed 32-bit millisecond count)
+    /// cannot overflow and fire immediately.
     #[serde(default = "default_notice_timeout_secs")]
     #[setting(
         label = "Notice auto-dismiss (s)",
         widget = "number",
         min = 1,
-        validate = "range:1"
+        max = 2147483,
+        validate = "range:1:2147483"
     )]
     pub notice_timeout_secs: u32,
     /// Silent-orphan watchdog: vendor-agnostic correctness grace. When

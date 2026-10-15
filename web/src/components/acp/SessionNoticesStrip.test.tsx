@@ -92,6 +92,22 @@ describe("SessionNoticesStrip notice display pref", () => {
     expect(onDismiss).toHaveBeenCalledTimes(1);
   });
 
+  it("keeps a notice whose timeout is past the browser timer limit (#4475)", () => {
+    vi.useFakeTimers();
+    const onDismiss = vi.fn();
+    render(
+      <AcpPrefsProvider value={{ ...prefs("timeout"), noticeTimeoutSecs: 2_147_484 }}>
+        <SessionNoticesStrip notices={notices} onDismiss={onDismiss} />
+      </AcpPrefsProvider>,
+    );
+
+    act(() => vi.advanceTimersByTime(2_147_483_646));
+    expect(onDismiss).not.toHaveBeenCalled();
+    act(() => vi.advanceTimersByTime(1));
+    expect(onDismiss).toHaveBeenCalledTimes(1);
+    expect(onDismiss).toHaveBeenCalledWith("n-info");
+  });
+
   it("keeps notices until dismissed by default", () => {
     vi.useFakeTimers();
     const onDismiss = vi.fn();
