@@ -334,7 +334,58 @@ The entry must be one self-contained file: inline every script and style, and em
 
 The dashboard opens a page at `/plugins/{id}/{page_id}` in an iframe with `sandbox="allow-scripts"` and nothing else. The page cannot read dashboard storage or cookies, call the API, submit forms, open windows or navigate the dashboard; its only data path is the bridge. A page that reloads itself more than 60 seconds after opening loses its authentication when device binding is on; reopen it from the dashboard instead.
 
-A worker may push state for a page with `ui.state.set` (`slot = "page"`, `id` = the page id, no `session_id`). The payload is any JSON object up to 64 KiB, stored unvalidated; `ui.state.remove` clears it. It appears in `GET /api/plugins/ui-state` as a global entry, `{ "plugin_id", "slot": "page", "id", "payload" }`. The page itself cannot read it yet; frame access arrives with the bridge (#4461).
+A worker may push state for a page with `ui.state.set` (`slot = "page"`, `id` = the page id, no `session_id`). The payload is any JSON object up to 64 KiB, stored unvalidated; `ui.state.remove` clears it. It appears in `GET /api/plugins/ui-state` as a global entry, `{ "plugin_id", "slot": "page", "id", "payload" }`, which the page reads through `plugins.uiState`.
+
+#### Page bridge
+
+The page talks to the dashboard with `postMessage` to `parent`; the dashboard replies to the page's window with target origin `"*"`, since the page's origin is opaque. Every message carries `aoeBridge: 1`, the bridge version.
+
+A request is `{ "aoeBridge": 1, "id", "method", "params"? }`, where `id` is a number or a string of at most 128 characters and `params` an object. The reply echoes the `id` with either `result` or `error: { "code", "message" }`. The dashboard drops, without replying, any message that comes from another window, is not an object, has another version, or has a malformed `id`, `method` or `params`.
+
+| Method | Params | Requires | Result |
+|---|---|---|---|
+| `ready` | none | none | `null`, then the `context` and `theme` pushes |
+| `sessions.list` | none | `session.read` | The `sessions` array of `GET /api/sessions` |
+| `plugins.uiState` | none | `session.read` | The `GET /api/plugins/ui-state` body, including other plugins' entries |
+| `action` | `{ "method", "params"?, "sessionId"? }` | not read-only or CityHall | `{ "baselineRevision" }`; the call goes to this plugin's own worker, as a [pane action](#pane-actions) does |
+| `openSession` | `{ "id" }` | none | `null`; the dashboard navigates to the session |
+
+Error codes: `unknown_method`, `invalid_params`, `capability_denied` (the plugin does not declare the required capability), `read_only`, `cityhall_mode`, and `failed` (the dashboard's request failed). An `action` result only acknowledges delivery; its effect arrives in `plugins.uiState` once the worker updates its state.
+
+The dashboard pushes `{ "aoeBridge": 1, "event", "data" }` messages, with no `id`:
+
+- `context`, once after `ready`: `{ "readOnly", "cityhall", "pluginId", "pageId", "bridgeVersion" }`.
+- `theme`, after `ready` and on every theme change: `{ "appearance": "dark" | "light", "cssVars": { "--name": "value" } }`, the dashboard's resolved CSS variables.
+
+When the frame loads a second document, because the page reloaded or navigated itself, the dashboard removes the frame and offers to reopen it. A minimal client:
+
+```ts
+let next = 0;
+const pending = new Map<number, (reply: { result?: unknown; error?: { code: string; message: string } }) => void>();
+const handlers: Record<string, (data: any) => void> = {};
+
+addEventListener("message", (e) => {
+  const m = e.data;
+  if (e.source !== parent || m?.aoeBridge !== 1) return;
+  if (m.event) return handlers[m.event]?.(m.data);
+  pending.get(m.id)?.(m);
+  pending.delete(m.id);
+});
+
+function call<T>(method: string, params?: object): Promise<T> {
+  const id = ++next;
+  parent.postMessage({ aoeBridge: 1, id, method, params }, "*");
+  return new Promise((resolve, reject) =>
+    pending.set(id, (m) => (m.error ? reject(m.error) : resolve(m.result as T))),
+  );
+}
+
+handlers.theme = ({ cssVars }) => {
+  for (const [k, v] of Object.entries(cssVars)) document.documentElement.style.setProperty(k, String(v));
+};
+handlers.context = (ctx) => console.log("bridge context", ctx);
+call("ready").then(() => call<{ id: string }[]>("sessions.list")).then((sessions) => console.log(sessions));
+```
 
 ### Badge payload
 
