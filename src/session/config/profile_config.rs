@@ -115,12 +115,35 @@ pub(crate) fn overrides_ignored_keys(overrides: &serde_json::Value) -> Vec<Strin
     ignored
 }
 
-/// Save profile-specific config
+/// Save profile-specific config, replacing the whole file. Callers holding a
+/// possibly stale copy must go through [`update_profile_config`] instead.
 pub fn save_profile_config(profile: &str, config: &ProfileConfig) -> Result<()> {
     let path = get_profile_config_path(profile)?;
     let content = toml::to_string_pretty(config)?;
     crate::session::atomic_write(&path, content.as_bytes())?;
     Ok(())
+}
+
+/// Sidecar lock in the profile directory serialising [`update_profile_config`].
+const PROFILE_CONFIG_LOCK_FILENAME: &str = ".config.toml.lock";
+
+/// Read-modify-write a profile's overrides under a cross-process `flock`.
+///
+/// `f` sees a fresh load taken after the lock is held, so edits it does not
+/// touch keep whatever another writer committed. Nothing is written when `f`
+/// or the type check of its result fails. Not reentrant: do not call it from
+/// inside `f`.
+pub fn update_profile_config<R>(
+    profile: &str,
+    f: impl FnOnce(&mut ProfileConfig) -> Result<R>,
+) -> Result<R> {
+    let dir = get_profile_dir(profile)?;
+    let _flock = crate::session::acquire_storage_flock(&dir, PROFILE_CONFIG_LOCK_FILENAME)?;
+    let mut config = load_profile_config(profile)?;
+    let result = f(&mut config)?;
+    validate_overrides_typecheck(&config.overrides_value())?;
+    save_profile_config(profile, &config)?;
+    Ok(result)
 }
 
 /// Get the path to a profile's config file. This goes through the
@@ -718,5 +741,86 @@ mod tests {
         let config = resolve_config_or_warn("broken");
         assert!(!config.session.confirm_before_quit);
         assert_eq!(config.theme.name, "rose-pine");
+    }
+    fn set_leaf(profile: &mut ProfileConfig, section: &str, field: &str, value: serde_json::Value) {
+        profile
+            .overrides
+            .entry(section.to_string())
+            .or_insert_with(|| json!({}))
+            .as_object_mut()
+            .unwrap()
+            .insert(field.to_string(), value);
+    }
+
+    /// A writer that read the profile before another committed must still see that commit:
+    /// the read happens under the lock, so disjoint leaves from two writers both survive.
+    #[test]
+    #[serial_test::serial]
+    fn update_profile_config_keeps_disjoint_writers_edits() {
+        let _guard = crate::session::test_support::isolate_app_dir();
+        let (inside_tx, inside_rx) = std::sync::mpsc::channel();
+        let (go_tx, go_rx) = std::sync::mpsc::channel::<()>();
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+
+        let first = std::thread::spawn(move || {
+            update_profile_config("work", |p| {
+                inside_tx.send(()).unwrap();
+                go_rx.recv().unwrap();
+                set_leaf(p, "sound", "enabled", json!(true));
+                Ok(())
+            })
+            .unwrap();
+        });
+        inside_rx.recv().unwrap();
+
+        // Writes the way the TUI does: only the leaves changed since it opened.
+        let second = std::thread::spawn(move || {
+            let baseline = json!({});
+            let edited = json!({"diff": {"split_view": false}});
+            started_tx.send(()).unwrap();
+            update_profile_config("work", |p| {
+                let mut fresh = serde_json::to_value(&*p)?;
+                crate::session::config::settings_schema::apply_changed_leaves(
+                    &mut fresh, &baseline, &edited,
+                );
+                *p = serde_json::from_value(fresh)?;
+                Ok(())
+            })
+            .unwrap();
+        });
+        started_rx.recv().unwrap();
+        go_tx.send(()).unwrap();
+        first.join().unwrap();
+        second.join().unwrap();
+
+        let saved = load_profile_config("work").unwrap();
+        assert_eq!(saved.overrides["sound"]["enabled"], json!(true));
+        assert_eq!(saved.overrides["diff"]["split_view"], json!(false));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn update_profile_config_writes_nothing_when_the_update_fails() {
+        let _guard = crate::session::test_support::isolate_app_dir();
+        update_profile_config("work", |p| {
+            set_leaf(p, "sound", "enabled", json!(true));
+            Ok(())
+        })
+        .unwrap();
+
+        let failed = update_profile_config::<()>("work", |p| {
+            set_leaf(p, "diff", "split_view", json!(false));
+            anyhow::bail!("boom")
+        });
+        assert!(failed.is_err());
+        let mistyped = update_profile_config("work", |p| {
+            set_leaf(p, "sound", "enabled", json!("yes"));
+            Ok(())
+        });
+        assert!(mistyped.is_err());
+
+        let saved = load_profile_config("work").unwrap();
+        assert_eq!(saved.overrides["sound"]["enabled"], json!(true));
+        assert!(saved.overrides.get("diff").is_none());
     }
 }
