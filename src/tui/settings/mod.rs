@@ -865,14 +865,18 @@ impl SettingsView {
                 // save would revert edits another writer made while this pane was open.
                 let edited = config_to_json(&self.profile_config);
                 let baseline = self.baseline_profile.clone();
-                update_profile_config(&self.profile, |p| {
+                self.profile_config = update_profile_config(&self.profile, |p| {
                     let mut fresh = serde_json::to_value(&*p)?;
                     crate::session::config::settings_schema::apply_changed_leaves(
                         &mut fresh, &baseline, &edited,
                     );
                     *p = serde_json::from_value(fresh)?;
-                    Ok(())
+                    Ok(p.clone())
                 })?;
+                // Show what is on disk, including other writers' edits merged in.
+                self.resolved_base =
+                    merge_configs(self.global_config.clone(), &self.profile_config);
+                self.rebuild_fields();
             }
             SettingsScope::Repo => {
                 if let (Some(ref project_path), Some(ref repo_config)) =
