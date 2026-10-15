@@ -102,6 +102,19 @@ pub(super) fn captured_rate_limit_resets_at(
         .max()
 }
 
+/// A turn nobody prompted ends without an error, so a still-future rejected
+/// window is the only evidence it ended on the limit.
+pub(super) fn rate_limit_from_captured_rejection(
+    captures: &std::sync::Mutex<HashMap<String, i64>>,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Option<RateLimitInfo> {
+    captured_rate_limit_resets_at(captures, now).map(|resets_at| RateLimitInfo {
+        status: "usage limit reached".to_string(),
+        resets_at: Some(resets_at),
+        kind: "rate_limit".to_string(),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -219,6 +232,9 @@ mod tests {
                         .collect(),
                 );
                 assert_eq!(captured_rate_limit_resets_at(&captures, now), want);
+                let info = rate_limit_from_captured_rejection(&captures, now);
+                assert_eq!(info.as_ref().and_then(|i| i.resets_at), want);
+                assert!(info.is_none_or(|i| i.kind == "rate_limit"));
             }
         }
     }

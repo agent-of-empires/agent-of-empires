@@ -29,6 +29,7 @@ use crate::acp::acp_client::control::DaemonControlClient;
 use crate::acp::acp_client::delete::handle_delete_session_cmd;
 use crate::acp::acp_client::errors::acp_internal_error;
 use crate::acp::acp_client::lifecycle::LifecycleEnvelope;
+use crate::acp::acp_client::rate_limit::rate_limit_from_captured_rejection;
 use crate::acp::acp_client::reset::{
     await_reset_request, ResetRequestError, ResetSessionOutcome, SESSION_RESET_IN_TASK_TIMEOUT,
 };
@@ -215,6 +216,25 @@ impl Session {
         // terminal; state is reset either way.
         let adopted = shared.adopted_turn_active.swap(false, Ordering::Relaxed);
         if adopted && !shared.terminal_claim.claim() {
+            return;
+        }
+        // The limit arrives as agent text with no prompt error; park like the
+        // prompt path so the reaper can resume after the reset (#4373).
+        if let Some(info) =
+            rate_limit_from_captured_rejection(&shared.rate_limit_rejections, chrono::Utc::now())
+        {
+            info!(
+                target: "acp.protocol",
+                session = %shared.session_label,
+                resets_at = ?info.resets_at,
+                "agent-initiated turn ended on a rejected rate-limit window; emitting RateLimit + Stopped"
+            );
+            shared.emit(Event::RateLimit { info }).await;
+            shared
+                .emit(Event::Stopped {
+                    reason: "rate_limited".into(),
+                })
+                .await;
             return;
         }
         let reason = between_prompt_stop_reason(adopted, cost_seen);
