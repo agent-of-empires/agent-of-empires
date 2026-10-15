@@ -81,8 +81,8 @@ pub(crate) fn init_repo() -> (TempDir, Repository) {
 
 #[test]
 fn run_git_ignores_inherited_repository_context() {
-    const REPOSITORY: &str = "AOE_GIT_FIXTURE_REPOSITORY";
-    const RECORD: &str = "AOE_GIT_FIXTURE_RECORD";
+    const REPOSITORY: &str = "AOE_GIT_FIXTURE_REPO_DIR";
+    const RECORD: &str = "AOE_GIT_FIXTURE_RECORD_PATH";
     if let (Some(repository), Some(record)) =
         (std::env::var_os(REPOSITORY), std::env::var_os(RECORD))
     {
