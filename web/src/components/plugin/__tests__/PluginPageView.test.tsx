@@ -1,16 +1,24 @@
 // @vitest-environment jsdom
 
-import { render, screen } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { PluginPage } from "../../../lib/api";
+import type { ResolvedTheme } from "../../../lib/theme";
+import { THEME_CHANGED_EVENT } from "../../../lib/theme";
 import { PluginPageView } from "../PluginPageView";
 
 const h = vi.hoisted(() => ({
   pages: null as PluginPage[] | null,
   mint: vi.fn<(page: PluginPage) => Promise<boolean>>(),
+  sessions: vi.fn(),
 }));
 vi.mock("../../../lib/pluginUiContext", () => ({ usePluginPages: () => h.pages }));
-vi.mock("../../../lib/api", () => ({ mintPluginPageTicket: (page: PluginPage) => h.mint(page) }));
+vi.mock("../../../lib/api", () => ({
+  mintPluginPageTicket: (page: PluginPage) => h.mint(page),
+  fetchSessions: () => h.sessions(),
+  fetchPluginUiState: vi.fn(),
+  invokePluginAction: vi.fn(),
+}));
 
 const board: PluginPage = {
   plugin_id: "acme.kit",
@@ -21,11 +29,42 @@ const board: PluginPage = {
   capabilities: ["session.read"],
 };
 
-const view = () => render(<PluginPageView pluginId="acme.kit" pageId="board" onBack={() => {}} />);
+const view = () =>
+  render(
+    <PluginPageView
+      pluginId="acme.kit"
+      pageId="board"
+      onBack={() => {}}
+      readOnly={false}
+      cityhall={false}
+      theme={null}
+    />,
+  );
+
+const darkTheme = {
+  name: "night",
+  source: "builtin",
+  appearance: "dark",
+  web: { cssVars: { "--color-surface-900": "#000" } },
+  terminal: { cssVars: { "--term-bg": "#111" } },
+  syntax: { shikiTheme: "x" },
+} as const satisfies ResolvedTheme;
+
+async function openFrame() {
+  h.mint.mockResolvedValue(true);
+  view();
+  const frame = (await screen.findByTestId("plugin-page-frame")) as HTMLIFrameElement;
+  const win = frame.contentWindow!;
+  const posted = vi.spyOn(win, "postMessage").mockImplementation(() => {});
+  const send = (data: unknown, source: Window | null = win) =>
+    act(() => window.dispatchEvent(new MessageEvent("message", { data, source, origin: "null" })));
+  return { frame, posted, send };
+}
 
 beforeEach(() => {
   h.pages = [board];
   h.mint.mockReset();
+  h.sessions.mockReset();
 });
 
 describe("PluginPageView", () => {
@@ -57,5 +96,49 @@ describe("PluginPageView", () => {
     view();
     expect(screen.queryByTestId("plugin-page-empty")).toBeNull();
     expect(h.mint).not.toHaveBeenCalled();
+  });
+
+  it("answers only its own frame, by window rather than origin", async () => {
+    h.sessions.mockResolvedValue({ sessions: [{ id: "s" }], workspace_ordering: [] });
+    const { posted, send } = await openFrame();
+    await send({ aoeBridge: 1, id: 1, method: "sessions.list" }, window);
+    await send({ aoeBridge: 1, id: 2, method: "sessions.list" });
+    await waitFor(() => expect(posted).toHaveBeenCalledWith({ aoeBridge: 1, id: 2, result: [{ id: "s" }] }, "*"));
+    expect(h.sessions).toHaveBeenCalledTimes(1);
+  });
+
+  it("pushes context and theme after ready, and every later theme change", async () => {
+    const { posted, send } = await openFrame();
+    await send({ aoeBridge: 1, id: "r", method: "ready" });
+    await waitFor(() =>
+      expect(posted).toHaveBeenCalledWith(
+        {
+          aoeBridge: 1,
+          event: "context",
+          data: { readOnly: false, cityhall: false, pluginId: "acme.kit", pageId: "board", bridgeVersion: 1 },
+        },
+        "*",
+      ),
+    );
+    act(() => window.dispatchEvent(new CustomEvent(THEME_CHANGED_EVENT, { detail: darkTheme })));
+    expect(posted).toHaveBeenLastCalledWith(
+      {
+        aoeBridge: 1,
+        event: "theme",
+        data: { appearance: "dark", cssVars: { "--color-surface-900": "#000", "--term-bg": "#111" } },
+      },
+      "*",
+    );
+  });
+
+  it("tears the frame down when it loads a second document, and reopens with a fresh ticket", async () => {
+    const { frame } = await openFrame();
+    fireEvent.load(frame);
+    expect(screen.getByTestId("plugin-page-frame")).toBe(frame);
+    fireEvent.load(frame);
+    expect(screen.queryByTestId("plugin-page-frame")).toBeNull();
+    fireEvent.click(screen.getByText("Reopen"));
+    expect(h.mint).toHaveBeenCalledTimes(2);
+    expect(await screen.findByTestId("plugin-page-frame")).not.toBe(frame);
   });
 });
