@@ -108,6 +108,20 @@ describe("ScratchOverridesModal", () => {
     expect(onClose).not.toHaveBeenCalled();
   });
 
+  it("says the outcome is unconfirmed, not failed, when the server may have saved", async () => {
+    mockFetchGlobal.mockResolvedValue({ session: {} });
+    mockUpdateGlobal.mockResolvedValue("uncertain");
+    const onClose = vi.fn();
+    renderModal(onClose);
+    await waitFor(() => expect(smartRenameSelect().value).toBe("inherit"));
+
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+
+    await waitFor(() => expect(screen.getByText(/Could not confirm the update/)).toBeTruthy());
+    expect(screen.queryByText("Update failed")).toBeNull();
+    expect(onClose).not.toHaveBeenCalled();
+  });
+
   it("blocks Save and shows an error when the initial load fails, instead of silently defaulting to 'inherit'", async () => {
     mockFetchGlobal.mockResolvedValue(null);
     renderModal();

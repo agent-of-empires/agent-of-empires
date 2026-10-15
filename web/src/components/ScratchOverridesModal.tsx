@@ -79,7 +79,7 @@ export function ScratchOverridesModal({ profile, onClose }: Props) {
       scope === "global" ? await updateMachineSettings(patch) : await updateProfileSettings(profile, patch);
     if (outcome !== "committed") {
       setSubmitting(false);
-      setError("Update failed");
+      setError(outcome === "uncertain" ? "Could not confirm the update, please check the value" : "Update failed");
       return;
     }
     onClose();
