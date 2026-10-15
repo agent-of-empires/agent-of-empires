@@ -2258,10 +2258,12 @@
         "src/lib/acpHistoryWindow.test.ts",
         "src/hooks/__tests__/useHistoryWindow.test.tsx",
         "src/lib/historyScroll.test.ts",
-        "src/hooks/useAcpSession.test.ts"
+        "src/hooks/useAcpSession.test.ts",
+        "src/hooks/acpSession/replay.test.ts"
       ],
       "components": [
         "web/src/lib/acpHistoryWindow.ts",
+        "web/src/hooks/acpSession/replay.ts",
         "web/src/lib/historyScroll.ts",
         "web/src/hooks/useHistoryWindow.ts",
         "web/src/hooks/useAcpSession.ts",

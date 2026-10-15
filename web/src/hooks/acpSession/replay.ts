@@ -1,5 +1,6 @@
 // REST replay of ACP history: recent-first cold open, forward top-up, and older pages.
 
+import { lastUserBoundaryIndex } from "../../lib/acpHistoryWindow";
 import type { AcpFrame, TranscriptRow } from "../../lib/acpTypes";
 import { toActivityRows, type Action } from "./reducer";
 
@@ -69,12 +70,25 @@ async function fetchTail(
     return;
   }
   if (!tailRowsRes.ok) return;
-  const rows = toActivityRows(await readRows(tailRowsRes), sid);
+  let rows = toActivityRows(await readRows(tailRowsRes), sid);
+  let cursor = tail.next_cursor ?? 0;
+  let hasMore = tail.has_more ?? false;
+  // Page back until the last user prompt is loaded, so the first window can open on the whole last turn.
+  while (hasMore && cursor > 1 && lastUserBoundaryIndex(rows) < 0) {
+    const res = await getReplay(sid, `before=${cursor}&limit=${REPLAY_PAGE_SIZE}&view=rows`, signal);
+    if (!res.ok) break;
+    const page = (await res.json()) as ReplayPageResponse;
+    signal.throwIfAborted();
+    rows = toActivityRows(page.rows ?? [], sid).concat(rows);
+    const next = page.next_cursor ?? cursor;
+    hasMore = (page.has_more ?? false) && next < cursor;
+    cursor = next;
+  }
   signal.throwIfAborted();
-  dispatch({ kind: "frames", frames: tail.frames ?? [], rows, oldestSeq: tail.next_cursor ?? 0 });
-  setHasMoreOlder(tail.has_more ?? false);
+  dispatch({ kind: "frames", frames: tail.frames ?? [], rows, oldestSeq: cursor });
+  setHasMoreOlder(hasMore);
   if (tail.highest_seq > lastSeq.current) lastSeq.current = tail.highest_seq;
-  if ((tail.has_more ?? false) && (tail.next_cursor ?? 0) > 1) {
+  if (hasMore && cursor > 1) {
     const hsRes = await getReplay(sid, `since=0&limit=${HANDSHAKE_PREFIX_SIZE}`, signal);
     if (hsRes.ok) {
       const hs = (await hsRes.json()) as ReplayPageResponse;
