@@ -15,6 +15,8 @@ const PAGE = {
   capabilities: ["session.read"],
 };
 
+const WRITE_PAGE = { ...PAGE, capabilities: ["session.read", "session.write"] };
+
 // The daemon's page policy (src/server/api/plugins.rs `PLUGIN_PAGE_CSP`).
 const PAGE_CSP =
   "sandbox allow-scripts; default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; " +
@@ -54,7 +56,9 @@ window.call = (method, params) => send({ aoeBridge: 1, id: ++next, method, param
   const uiState = await call("plugins.uiState");
   const action = await call("action", { method: "move", params: { to: "done" }, sessionId: "sess-a" });
   const unknown = await call("sessions.archive");
-  parent.postMessage({ kind: "results", ready, sessions, uiState, action, unknown, pushes: pushes.slice(0, 2) }, "*");
+  const archive = await call("session.archive", { id: "sess-a" });
+  const trash = await call("session.trash", { id: "sess-a" });
+  parent.postMessage({ kind: "results", ready, sessions, uiState, action, unknown, archive, trash, pushes: pushes.slice(0, 2) }, "*");
 })();
 </script>`;
 
@@ -98,6 +102,26 @@ async function mockApis(page: Page, pages: unknown[]) {
 
 /** Opens the palette once the first ui-state poll has landed, so a missing entry is not just an early read.
  *  Starts on a session, where no first-run overlay covers the palette. */
+/** Records archive and trash requests, each answered with the session row. */
+async function mockLifecycle(page: Page): Promise<string[]> {
+  const calls: string[] = [];
+  await page.route(/\/api\/sessions\/sess-a\/(archive|trash)$/, (r) => {
+    const req = r.request();
+    calls.push(`${req.method()} ${new URL(req.url()).pathname} ${req.postData()}`);
+    return r.fulfill({ json: sessionResponse({ id: "sess-a", title: "Ethiopians" }) });
+  });
+  return calls;
+}
+
+const latestReport = (page: Page, kind: string) =>
+  page.evaluate(
+    (k) =>
+      (window as typeof window & { __frameReports: { kind?: string }[] }).__frameReports
+        .filter((m) => m?.kind === k)
+        .at(-1),
+    kind,
+  );
+
 async function searchPalette(page: Page, query: string) {
   const polled = page.waitForResponse("**/api/plugins/ui-state");
   await page.goto("/session/sess-a");
@@ -181,10 +205,11 @@ test.describe("Plugin pages (#4460)", () => {
   });
 
   test("the page round-trips every bridge method and follows theme changes without reloading", async ({ page }) => {
-    await mockApis(page, [PAGE]);
+    await mockApis(page, [WRITE_PAGE]);
     await page.route(`**${PAGE.url}`, (r) =>
       r.fulfill({ contentType: "text/html", headers: { "content-security-policy": PAGE_CSP }, body: BRIDGE_FIXTURE }),
     );
+    const lifecycle = await mockLifecycle(page);
     await page.route("**/api/theme/current", (r) => r.fulfill({ json: theme("day", "light", "#ffffff") }));
     await page.route("**/api/themes/night", (r) => r.fulfill({ json: theme("night", "dark", "#000000") }));
     // The worker-shaped rows, not the wider /api/sessions ones.
@@ -201,14 +226,7 @@ test.describe("Plugin pages (#4460)", () => {
     });
 
     await page.goto("/plugins/acme.kit/board");
-    const latest = (kind: string) =>
-      page.evaluate(
-        (k) =>
-          (window as typeof window & { __frameReports: { kind?: string }[] }).__frameReports
-            .filter((m) => m?.kind === k)
-            .at(-1),
-        kind,
-      );
+    const latest = (kind: string) => latestReport(page, kind);
     await expect.poll(() => latest("results")).toBeTruthy();
     const results = (await latest("results")) as unknown as Record<string, Record<string, unknown>>;
     expect(results.ready).toEqual({ aoeBridge: 1, id: 1, result: null });
@@ -221,7 +239,7 @@ test.describe("Plugin pages (#4460)", () => {
       { aoeBridge: 1, event: "theme", data: { appearance: "light", cssVars: { "--color-surface-900": "#ffffff" } } },
     ]);
     expect(results.sessions.result).toEqual([summary]);
-    expect(results.uiState.result).toEqual({ entries: [], notifications: [], pages: [PAGE] });
+    expect(results.uiState.result).toEqual({ entries: [], notifications: [], pages: [WRITE_PAGE] });
     expect(results.action).toEqual({ aoeBridge: 1, id: 4, result: { baselineRevision: 3 } });
     expect(actionBodies).toEqual([
       {
@@ -230,6 +248,12 @@ test.describe("Plugin pages (#4460)", () => {
       },
     ]);
     expect(results.unknown).toMatchObject({ id: 5, error: { code: "unknown_method" } });
+    expect(results.archive).toEqual({ aoeBridge: 1, id: 6, result: null });
+    expect(results.trash).toEqual({ aoeBridge: 1, id: 7, result: null });
+    expect(lifecycle).toEqual([
+      'PATCH /api/sessions/sess-a/archive {"archived":true,"kill_pane":true}',
+      'POST /api/sessions/sess-a/trash {"kill_pane":true}',
+    ]);
 
     await page.evaluate(() =>
       window.dispatchEvent(new CustomEvent("aoe:theme-picker-changed", { detail: { name: "night" } })),
@@ -244,6 +268,22 @@ test.describe("Plugin pages (#4460)", () => {
       (window as typeof window & { call: (m: string, p: unknown) => unknown }).call("openSession", { id: "sess-a" }),
     );
     await expect(page).toHaveURL("/session/sess-a");
+  });
+
+  test("a page without session.write cannot archive or trash", async ({ page }) => {
+    await mockApis(page, [PAGE]);
+    await page.route(`**${PAGE.url}`, (r) =>
+      r.fulfill({ contentType: "text/html", headers: { "content-security-policy": PAGE_CSP }, body: BRIDGE_FIXTURE }),
+    );
+    await page.route("**/api/plugins/*/action", (r) => r.fulfill({ status: 202, json: { ok: true } }));
+    const lifecycle = await mockLifecycle(page);
+
+    await page.goto("/plugins/acme.kit/board");
+    await expect.poll(() => latestReport(page, "results")).toBeTruthy();
+    const results = (await latestReport(page, "results")) as unknown as Record<string, unknown>;
+    expect(results.archive).toMatchObject({ id: 6, error: { code: "capability_denied" } });
+    expect(results.trash).toMatchObject({ id: 7, error: { code: "capability_denied" } });
+    expect(lifecycle).toEqual([]);
   });
 
   test("a page another document replaces before ready never hands it the bridge", async ({ page }) => {
