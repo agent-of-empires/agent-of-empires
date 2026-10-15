@@ -598,3 +598,92 @@ describe("usePushSubscription health", () => {
     expect(result.current.health).toBe("delivery-failed");
   });
 });
+
+// Holds the first status request until released, to order a refresh against actions.
+function deferFirstStatus() {
+  const real = fetch;
+  let held = false;
+  let release!: () => void;
+  let started!: () => void;
+  const released = new Promise<void>((r) => (release = r));
+  const request = new Promise<void>((r) => (started = r));
+  vi.stubGlobal(
+    "fetch",
+    vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      if (String(input).includes("/status") && !held) {
+        held = true;
+        started();
+        await released;
+      }
+      return real(input, init);
+    }),
+  );
+  return { request, release };
+}
+
+const flush = () =>
+  act(async () => {
+    for (let i = 0; i < 10; i++) await Promise.resolve();
+  });
+
+describe("usePushSubscription shared state and stale writes", () => {
+  it("drops a refresh that started before enable completed", async () => {
+    noSubscription();
+    const status = deferFirstStatus();
+    const { result } = renderHook(() => usePushSubscription());
+    await act(async () => {
+      await new Promise((r) => setTimeout(r, 0));
+      await status.request;
+    });
+    await act_(result, "enable");
+    status.release();
+    await flush();
+    expect(result.current.state).toEqual({ kind: "enabled" });
+    expect(result.current.health).toBe("healthy");
+  });
+
+  it("does not re-register a subscription that disable removed during a refresh", async () => {
+    installFetch(statusWith(serverSub({ registered: false })));
+    const status = deferFirstStatus();
+    const { result } = renderHook(() => usePushSubscription());
+    await act(async () => {
+      await new Promise((r) => setTimeout(r, 0));
+      await status.request;
+    });
+    await act_(result, "disable");
+    status.release();
+    await flush();
+    expect(called("/api/push/subscribe")).toBe(false);
+    expect(result.current.health).toBe("not-wanted");
+    expect(result.current.state).toEqual({ kind: "off" });
+  });
+
+  it("converges two mounted consumers and ignores a conflicting action in flight", async () => {
+    noSubscription();
+    const first = await mountAndSettle();
+    const second = await mountAndSettle();
+    let finishSubscribe!: () => void;
+    const subscribeStarted = new Promise<void>((started) => {
+      subscribeImpl = () =>
+        new Promise((resolve) => {
+          started();
+          finishSubscribe = () => resolve((currentSub = makeSubscription()));
+        });
+    });
+    let enabling!: Promise<void>;
+    await act(async () => {
+      enabling = first.result.current.enable();
+      await subscribeStarted;
+    });
+    expect(second.result.current.state).toEqual({ kind: "subscribing" });
+    await act_(second.result, "disable");
+    expect(called("/api/push/unsubscribe")).toBe(false);
+    await act(async () => {
+      finishSubscribe();
+      await enabling;
+    });
+    expect(first.result.current.state).toEqual({ kind: "enabled" });
+    expect(second.result.current.state).toEqual({ kind: "enabled" });
+    expect(second.result.current.health).toBe("healthy");
+  });
+});
