@@ -285,17 +285,22 @@ impl AnchoredDir {
         let (from_parent, from_leaf) = self.open_parent(from)?;
         let (to_parent, to_leaf) = self.open_parent(to)?;
         if let Some(observed) = replace {
-            exchange(&from_parent, &from_leaf, &to_parent, &to_leaf)
-                .context("replacing anchored file")?;
-            let validation = self.regular_modified(from);
-            let unchanged = matches!(validation, Ok(Some(seen)) if seen == observed);
-            if !unchanged {
-                exchange(&from_parent, &from_leaf, &to_parent, &to_leaf)
-                    .context("restoring anchored file")?;
+            match exchange(&from_parent, &from_leaf, &to_parent, &to_leaf) {
+                Ok(()) => {
+                    let validation = self.regular_modified(from);
+                    let unchanged = matches!(validation, Ok(Some(seen)) if seen == observed);
+                    if !unchanged {
+                        exchange(&from_parent, &from_leaf, &to_parent, &to_leaf)
+                            .context("restoring anchored file")?;
+                    }
+                    validation?;
+                    self.remove_file(from)?;
+                    return Ok(unchanged);
+                }
+                // `to` vanished after it was observed: publish as a first copy.
+                Err(Errno::ENOENT) => {}
+                Err(error) => return Err(error).context("replacing anchored file"),
             }
-            validation?;
-            self.remove_file(from)?;
-            return Ok(unchanged);
         }
         let published = match linkat(
             &from_parent,
@@ -557,9 +562,9 @@ fn exchange(
     from_leaf: &OsStr,
     to_parent: &OwnedFd,
     to_leaf: &OsStr,
-) -> Result<()> {
-    let from = CString::new(from_leaf.as_bytes())?;
-    let to = CString::new(to_leaf.as_bytes())?;
+) -> nix::Result<()> {
+    let from = CString::new(from_leaf.as_bytes()).map_err(|_| Errno::EINVAL)?;
+    let to = CString::new(to_leaf.as_bytes()).map_err(|_| Errno::EINVAL)?;
     let (from_fd, to_fd) = (from_parent.as_raw_fd(), to_parent.as_raw_fd());
     // SAFETY: both descriptors are open and both names are NUL-terminated
     // strings that outlive the call.
@@ -585,7 +590,7 @@ fn exchange(
             libc::RENAME_SWAP,
         )
     };
-    Errno::result(rc).map(drop).map_err(Into::into)
+    Errno::result(rc).map(drop)
 }
 
 #[cfg(test)]
@@ -670,6 +675,25 @@ mod tests {
             );
             assert!(!temp.path().join(staging).exists());
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn replace_publish_of_a_deleted_target_publishes_the_copy() {
+        let temp = tempfile::tempdir().unwrap();
+        let anchored = AnchoredDir::open(temp.path()).unwrap();
+        let (target, staging) = (Path::new("conv.jsonl"), Path::new("conv.jsonl.aoe-carry"));
+        std::fs::write(temp.path().join(target), b"old\n").unwrap();
+        let observed = anchored.regular_modified(target).unwrap().unwrap();
+        std::fs::remove_file(temp.path().join(target)).unwrap();
+        std::fs::write(temp.path().join(staging), b"carry\n").unwrap();
+
+        assert!(anchored
+            .publish_staged(staging, target, Some(observed))
+            .unwrap());
+
+        assert_eq!(std::fs::read(temp.path().join(target)).unwrap(), b"carry\n");
+        assert!(!temp.path().join(staging).exists());
     }
 
     #[cfg(unix)]
