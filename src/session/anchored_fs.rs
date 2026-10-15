@@ -13,6 +13,8 @@ use std::os::fd::OwnedFd;
 use std::os::unix::ffi::OsStringExt;
 use std::path::{Component, Path, PathBuf};
 
+const CONFLICT_NAME_ATTEMPTS: u32 = 100;
+
 pub(crate) struct AnchoredDir {
     root: PathBuf,
     fd: OwnedFd,
@@ -278,7 +280,7 @@ impl AnchoredDir {
     /// `replace` is the modification time the caller saw on `to`. The old file
     /// is hard-linked to `.aoe-prev` before the rename and unlinked only if it
     /// is still unchanged after it. A change means a writer got in: the carry
-    /// is kept at `.aoe-conflict` and the old file is put back, so no version
+    /// is kept at the first free `.aoe-conflict[.N]` and the old file is put back, so no version
     /// is unlinked unseen. A leftover `.aoe-prev` is a crashed replace and
     /// fails the next one rather than being overwritten. A writer that holds
     /// the old file open past the post-check is not covered.
@@ -327,16 +329,29 @@ impl AnchoredDir {
                 self.remove_file(&prev)?;
                 return Ok(true);
             }
-            let conflict = with_suffix(to, ".aoe-conflict");
-            let (conflict_parent, conflict_leaf) = self.open_parent(&conflict)?;
-            linkat(
-                &to_parent,
-                to_leaf.as_os_str(),
-                &conflict_parent,
-                conflict_leaf.as_os_str(),
-                AtFlags::empty(),
-            )
-            .context("preserving the carried file")?;
+            let mut preserved = false;
+            for attempt in 0..CONFLICT_NAME_ATTEMPTS {
+                let mut conflict = to_leaf.clone();
+                conflict.push(match attempt {
+                    0 => ".aoe-conflict".to_string(),
+                    n => format!(".aoe-conflict.{n}"),
+                });
+                match linkat(
+                    &to_parent,
+                    to_leaf.as_os_str(),
+                    &to_parent,
+                    conflict.as_os_str(),
+                    AtFlags::empty(),
+                ) {
+                    Ok(()) => {
+                        preserved = true;
+                        break;
+                    }
+                    Err(Errno::EEXIST) => {}
+                    Err(error) => return Err(error).context("preserving the carried file"),
+                }
+            }
+            anyhow::ensure!(preserved, "no free name to preserve the carried file under");
             renameat(
                 &prev_parent,
                 prev_leaf.as_os_str(),
@@ -672,7 +687,7 @@ mod tests {
         let (target, staging) = (Path::new("conv.jsonl"), Path::new("conv.jsonl.aoe-carry"));
 
         // (case, published, target, conflict, prev)
-        let cases: [(&str, bool, &[u8], Option<&[u8]>, Option<&[u8]>); 5] = [
+        let cases: [(&str, bool, &[u8], Option<&[u8]>, Option<&[u8]>); 6] = [
             ("untouched", true, b"carry\n", None, None),
             ("changed before", false, b"live\n", None, None),
             (
@@ -680,6 +695,13 @@ mod tests {
                 false,
                 b"old\nfd\n",
                 Some(b"carry\npath\n"),
+                None,
+            ),
+            (
+                "earlier conflict",
+                false,
+                b"old\nfd\n",
+                Some(b"earlier\n"),
                 None,
             ),
             (
@@ -704,7 +726,10 @@ mod tests {
                     std::fs::write(root.join(target), b"live\n").unwrap();
                     set_mtime(&root.join(target), now);
                 }
-                "writers during the replace" => {
+                "writers during the replace" | "earlier conflict" => {
+                    if case == "earlier conflict" {
+                        std::fs::write(root.join("conv.jsonl.aoe-conflict"), b"earlier\n").unwrap();
+                    }
                     let held = std::fs::OpenOptions::new()
                         .append(true)
                         .open(root.join(target))
@@ -744,6 +769,12 @@ mod tests {
                 "{case}"
             );
             assert_eq!(read(root, "conv.jsonl.aoe-prev").as_deref(), prev, "{case}");
+            if case == "earlier conflict" {
+                assert_eq!(
+                    read(root, "conv.jsonl.aoe-conflict.1").as_deref(),
+                    Some(&b"carry\npath\n"[..])
+                );
+            }
             if case != "interrupted earlier" {
                 assert!(read(root, "conv.jsonl.aoe-carry").is_none(), "{case}");
             }
