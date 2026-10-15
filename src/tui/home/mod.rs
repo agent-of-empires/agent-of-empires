@@ -277,6 +277,8 @@ pub struct HomeView {
 
     pub(super) show_diagnostics: bool,
     pub(super) show_shortcut_bar: bool,
+    /// `session.preview_link_prefixes`: non-web link targets the preview may open.
+    pub(super) preview_link_prefixes: Vec<String>,
     pub(super) metrics_poller: super::metrics_poller::MetricsPoller,
     pub(super) pending_metrics_refresh: bool,
     pub(super) metrics: crate::process::metrics::MetricsSnapshot,

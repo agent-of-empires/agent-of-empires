@@ -349,6 +349,7 @@ impl HomeView {
             pending_status_refresh: false,
             show_diagnostics: resolved.session.show_diagnostics_pane,
             show_shortcut_bar: resolved.session.show_shortcut_bar,
+            preview_link_prefixes: resolved.session.preview_link_prefixes.clone(),
             metrics_poller: crate::tui::metrics_poller::MetricsPoller::new(),
             pending_metrics_refresh: false,
             metrics: crate::process::metrics::MetricsSnapshot::default(),

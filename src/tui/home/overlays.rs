@@ -123,10 +123,22 @@ impl HomeView {
         self.status_flash = Some((text.into(), Instant::now() + FLASH_WINDOW));
     }
 
-    /// Open `url` in the browser. aoe captures the mouse, so the host terminal
-    /// can't; over SSH no browser opens, so the URL is copied via OSC 52 instead.
+    /// Open `url` in the browser, or with its scheme's app when
+    /// `session.preview_link_prefixes` allows it. aoe captures the mouse, so the
+    /// host terminal can't; over SSH nothing opens, so the URL is copied via
+    /// OSC 52 instead.
     pub(in crate::tui) fn open_link(&mut self, url: &str) {
-        let status = match crate::tui::open_url::open_url(url) {
+        let opened = if crate::util::is_http_url(url) {
+            crate::tui::open_url::open_url(url)
+        } else if crate::util::is_openable_link(url, &self.preview_link_prefixes) {
+            crate::tui::open_url::open_with_system(url)
+        } else {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "not an allowed link prefix",
+            ))
+        };
+        let status = match opened {
             Ok(()) => format!("opened {url}"),
             Err(e) => {
                 crate::tui::clipboard::copy_to_clipboard(url);

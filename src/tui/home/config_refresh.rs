@@ -61,6 +61,7 @@ impl HomeView {
         self.set_sidebar_position(config.session.sidebar_position);
         self.show_diagnostics = config.session.show_diagnostics_pane;
         self.show_shortcut_bar = config.session.show_shortcut_bar;
+        self.preview_link_prefixes = config.session.preview_link_prefixes.clone();
         self.daemon_sidebar = config.session.daemon_sidebar;
         if !self.daemon_sidebar {
             self.set_sidebar_source(

@@ -3276,7 +3276,12 @@ impl HomeView {
             let Some(line) = text.lines.get(view.first_line + row_offset as usize) else {
                 break;
             };
-            for span in crate::tui::links::link_spans_for_line(line, pane.width, &cache.links) {
+            for span in crate::tui::links::link_spans_for_line(
+                line,
+                pane.width,
+                &cache.links,
+                &self.preview_link_prefixes,
+            ) {
                 for col in span.start..span.end {
                     let pos = (pane.x + col, pane.y + row_offset);
                     if !buf_area.contains(Position::from(pos)) {

@@ -2,8 +2,7 @@
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
-/// Whether `url` is a plain web URL, the only kind aoe hands to a browser
-/// opener or renders as a clickable link.
+/// Whether `url` is a plain web URL, the only kind aoe hands to a browser.
 ///
 /// Deliberately narrow: agent output, plugin UI state and pane text are all
 /// untrusted, and `javascript:`, `file:` and `data:` must never reach an
@@ -12,6 +11,23 @@ use std::time::{SystemTime, UNIX_EPOCH};
 pub(crate) fn is_http_url(url: &str) -> bool {
     let lower = url.to_ascii_lowercase();
     lower.starts_with("http://") || lower.starts_with("https://")
+}
+
+/// Whether a preview link to `url` may open: an [`is_http_url`] address, or one
+/// starting with a prefix from `session.preview_link_prefixes`.
+///
+/// Prefixes compare case-insensitively and an empty one matches nothing, so the
+/// default empty list keeps every non-web scheme closed. A prefix should name the
+/// authority as well as the scheme (`vscode://file/`, not `vscode:`): most
+/// custom schemes route the rest of the URL to a handler.
+pub(crate) fn is_openable_link(url: &str, extra_prefixes: &[String]) -> bool {
+    if is_http_url(url) {
+        return true;
+    }
+    let lower = url.to_ascii_lowercase();
+    extra_prefixes
+        .iter()
+        .any(|p| !p.is_empty() && lower.starts_with(&p.to_ascii_lowercase()))
 }
 
 /// Whether `url` is safe for a plugin-supplied UI link: an [`is_http_url`]
@@ -112,6 +128,37 @@ mod tests {
         let t = SystemTime::now();
         let secs = t.duration_since(UNIX_EPOCH).unwrap().as_secs();
         assert_eq!(system_time_to_ms(t) / 1_000, secs);
+    }
+
+    #[test]
+    fn is_openable_link_opens_only_web_urls_unless_a_prefix_allows_more() {
+        let none: [String; 0] = [];
+        assert!(is_openable_link("https://example.com", &none));
+        for url in [
+            "vscode://file/Users/u/a.md",
+            "file:///etc/passwd",
+            "javascript:alert(1)",
+        ] {
+            assert!(!is_openable_link(url, &none), "{url} with no prefixes");
+        }
+
+        let allowed = ["vscode://file/".to_string(), String::new()];
+        for url in [
+            "vscode://file/Users/u/notes/a.md",
+            "vscode://file/Users/u/src/main.rs:12:4",
+            "VSCode://File/Users/u/a.md",
+            "https://example.com",
+        ] {
+            assert!(is_openable_link(url, &allowed), "{url}");
+        }
+        for url in [
+            "vscode://vscode.git/clone?url=x",
+            "vscode-insiders://file/Users/u/a.md",
+            "file:///Users/u/a.md",
+            "javascript:alert(1)",
+        ] {
+            assert!(!is_openable_link(url, &allowed), "{url}");
+        }
     }
 
     #[test]

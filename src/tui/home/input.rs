@@ -5617,10 +5617,15 @@ impl HomeView {
             .lines
             .get(view.abs_line_at_row(row))?;
         let offset = col - view.pane.x;
-        crate::tui::links::link_spans_for_line(line, view.pane.width, &cache.links)
-            .into_iter()
-            .find(|span| (span.start..span.end).contains(&offset))
-            .map(|span| span.uri)
+        crate::tui::links::link_spans_for_line(
+            line,
+            view.pane.width,
+            &cache.links,
+            &self.preview_link_prefixes,
+        )
+        .into_iter()
+        .find(|span| (span.start..span.end).contains(&offset))
+        .map(|span| span.uri)
     }
 
     /// Same as `preview_double_click_action`, but the caller supplies `now` so

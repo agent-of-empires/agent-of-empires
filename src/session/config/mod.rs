@@ -1704,6 +1704,23 @@ pub struct SessionConfig {
     )]
     pub show_shortcut_bar: bool,
 
+    /// Link targets beyond http and https that a click in the preview may open,
+    /// as URL prefixes: `vscode://file/` lets an agent print a short relative
+    /// path that opens the file in VS Code. Matching is a case-insensitive
+    /// prefix, so name the authority as well as the scheme; most custom schemes
+    /// hand the rest of the URL to a handler. Empty by default: only web links
+    /// open, and other targets are not passed to the terminal either.
+    #[serde(default)]
+    #[setting(
+        label = "Extra link prefixes",
+        widget = "list",
+        category = "Interaction",
+        global_only,
+        tui_only,
+        advanced
+    )]
+    pub preview_link_prefixes: Vec<String>,
+
     /// Keep an aoe-managed worktree session's directory leaf in sync with its
     /// title. When enabled (default), renaming the session also moves its
     /// worktree directory, and new sessions derive the directory leaf from the
@@ -2028,6 +2045,7 @@ impl Default for SessionConfig {
             favorites_first: true,
             show_tips: true,
             show_shortcut_bar: true,
+            preview_link_prefixes: Vec::new(),
             tie_workdir_to_name: true,
         }
     }

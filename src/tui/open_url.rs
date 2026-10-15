@@ -40,21 +40,52 @@ pub fn resolve_href(base_url: &str, href: &str) -> String {
 /// spawned `xdg-open` fails out of band, and over SSH a browser that does start
 /// opens on a screen the user is not sitting at.
 pub fn open_url(url: &str) -> std::io::Result<()> {
-    if let Ok(path) = std::env::var(OPEN_URL_TO_ENV) {
-        let mut f = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(path)?;
-        writeln!(f, "{url}")?;
-        return Ok(());
-    }
-    if !browser_reachable() {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::Unsupported,
-            "no browser you could see from here",
-        ));
+    if let Some(done) = intercept_or_refuse(url) {
+        return done;
     }
     webbrowser::open(url)
+}
+
+/// Open a non-web `url` with the app registered for its scheme, under the same
+/// test hook and reachability rule as [`open_url`]. The caller decides which
+/// schemes are allowed; `webbrowser` only launches browsers.
+pub fn open_with_system(url: &str) -> std::io::Result<()> {
+    if let Some(done) = intercept_or_refuse(url) {
+        return done;
+    }
+    let opener = if cfg!(target_os = "macos") {
+        "open"
+    } else {
+        "xdg-open"
+    };
+    let mut child = std::process::Command::new(opener)
+        .arg(url)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()?;
+    std::thread::spawn(move || child.wait());
+    Ok(())
+}
+
+/// The `AOE_OPEN_URL_TO` record, or the refusal when nothing the user could see
+/// would open; `None` when the caller should go ahead and launch.
+fn intercept_or_refuse(url: &str) -> Option<std::io::Result<()>> {
+    if let Ok(path) = std::env::var(OPEN_URL_TO_ENV) {
+        let written = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .and_then(|mut f| writeln!(f, "{url}"));
+        return Some(written);
+    }
+    if !browser_reachable() {
+        return Some(Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "no browser you could see from here",
+        )));
+    }
+    None
 }
 
 /// Whether launching a browser here would put it in front of the user.
