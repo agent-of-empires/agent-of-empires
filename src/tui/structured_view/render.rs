@@ -1077,9 +1077,15 @@ fn render_status(
     }
     // Plugin status-bar segments and this session's badges; icons, tooltips,
     // and links have no terminal surface.
-    for entry in plugin_ui::global_entries(&state.plugin_ui, UiSlot::StatusBar).chain(
-        plugin_ui::session_entries(&state.plugin_ui, UiSlot::DetailBadge, &state.session_id),
-    ) {
+    for entry in plugin_ui::chip_entries(&state.plugin_ui, UiSlot::HeaderStart)
+        .into_iter()
+        .chain(plugin_ui::chip_entries(&state.plugin_ui, UiSlot::StatusBar))
+        .chain(plugin_ui::session_entries(
+            &state.plugin_ui,
+            UiSlot::DetailBadge,
+            &state.session_id,
+        ))
+    {
         if let Some(text) = plugin_ui::entry_text(entry) {
             spans.push(Span::styled(
                 format!(" {text} "),

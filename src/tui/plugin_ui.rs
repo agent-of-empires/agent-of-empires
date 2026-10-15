@@ -24,6 +24,14 @@ pub fn global_entries(snapshot: &UiSnapshot, slot: UiSlot) -> impl Iterator<Item
         .filter(move |e| e.slot == slot && e.session_id.is_none())
 }
 
+/// Global chip entries for `slot` by payload `order` (default 0, lowest first),
+/// keeping snapshot order among ties.
+pub fn chip_entries(snapshot: &UiSnapshot, slot: UiSlot) -> Vec<&UiEntry> {
+    let mut entries: Vec<&UiEntry> = global_entries(snapshot, slot).collect();
+    entries.sort_by_key(|e| e.payload.get("order").and_then(Value::as_i64).unwrap_or(0));
+    entries
+}
+
 /// Per-session entries for `slot` whose `session_id` matches exactly. Exact, as
 /// a tearing guard: a snapshot can momentarily carry another session's entries,
 /// and showing those would mislabel its state as this one's.
@@ -787,6 +795,25 @@ mod tests {
         assert_eq!(mine, vec!["mine"]);
         let tones: Vec<Option<Tone>> = snap.entries[..3].iter().map(entry_tone).collect();
         assert_eq!(tones, vec![Some(Tone::Danger), None, None]);
+    }
+
+    #[test]
+    fn chip_entries_sort_by_order_then_snapshot_order() {
+        let snap = snapshot(
+            json!([
+                {"plugin_id": "p", "slot": "header-start", "id": "a", "payload": {"text": "a"}},
+                {"plugin_id": "p", "slot": "header-start", "id": "b", "payload": {"text": "b", "order": -1}},
+                {"plugin_id": "p", "slot": "header-start", "id": "c", "payload": {"text": "c", "order": 5}},
+                {"plugin_id": "p", "slot": "header-start", "id": "d", "payload": {"text": "d"}},
+                {"plugin_id": "p", "slot": "status-bar", "id": "e", "payload": {"text": "e", "order": -9}}
+            ]),
+            json!([]),
+        );
+        let texts: Vec<&str> = chip_entries(&snap, UiSlot::HeaderStart)
+            .into_iter()
+            .filter_map(entry_text)
+            .collect();
+        assert_eq!(texts, vec!["b", "a", "d", "c"]);
     }
 
     #[test]
