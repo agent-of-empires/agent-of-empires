@@ -774,7 +774,8 @@ last_seen_version = "{}"
         self.synchronize_input();
     }
 
-    fn send_hex_keys<S: AsRef<str>>(&self, bytes: &[S]) {
+    /// Send raw terminal input bytes as hex, bypassing tmux key-name encoding.
+    pub fn send_hex_keys<S: AsRef<str>>(&self, bytes: &[S]) {
         assert!(self.spawned, "must call spawn_tui() or spawn() first");
         let mut args = vec!["send-keys", "-t", &self.session_name, "-H"];
         args.extend(bytes.iter().map(AsRef::as_ref));

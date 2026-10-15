@@ -34,6 +34,8 @@ While the leader is armed the status bar becomes a which-key menu. Only the lead
 
 `Shift+Enter` inserts a newline into the agent's input box on kitty-protocol-capable terminals (Ghostty, Kitty, WezTerm, foot, Konsole 24+, Alacritty 0.13+, recent xterm). Elsewhere it submits like bare `Enter`, so use `Alt+Enter` (`Option+Enter` on macOS), which sends `ESC+CR` natively on many terminals, or configure your terminal to send `ESC+CR` for `Shift+Enter`.
 
+When your terminal reports `Ctrl+Enter` distinctly, AoE forwards it as `CSI-u` so OMP's docked approval dialog can receive its approve chord in live mode. OMP's `Ctrl+Q` fallback collides with AoE's default live-mode exit; rebind `live_send_exit_chord` to use that chord. `Esc` denies the OMP prompt.
+
 ## Split windows
 
 If the session's tmux window is split, by hand or by an agent that spawns a pane per teammate, the preview composites every pane onto the window grid with borders in the gaps, so nothing is hidden. Two things change while it is split: scrolling history is unavailable, because panes keep independent scrollbacks with no coherent way to stack them, and input still goes to the first pane, so a click or wheel aimed at a neighbouring pane does nothing. Attach to the session to interact with the other panes.

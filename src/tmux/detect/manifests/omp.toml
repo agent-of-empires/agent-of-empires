@@ -236,6 +236,18 @@ not = [
   ] },
 ]
 
+# Current OMP tool approvals use a docked action prompt, not a selector list.
+[[rules]]
+id = "tool_approval"
+state = "waiting"
+priority = 970
+positional = true
+region = "bottom_non_empty_lines(8)"
+wrap = 8
+visible = true
+contains = ["Allow tool:", "approve", "deny"]
+
+
 # Generic OMP selectors use a selected row, multiple options, and a keyboard footer.
 [[rules]]
 id = "selector_panel"

@@ -4,7 +4,7 @@
 
 use serial_test::parallel;
 
-use crate::harness::{require_tmux, TuiTestHarness};
+use crate::harness::{require_tmux, wait_until, TuiTestHarness};
 
 /// Write a fake agent script that prints a static permission-prompt block,
 /// then blocks reading exactly one byte from stdin via `dd` (not `read -r`,
@@ -100,4 +100,84 @@ fn test_respond_to_permission_allow_sends_bare_digit() {
     // PermissionResponse.allow), with nothing else injected before or
     // after it.
     h.wait_for("GOT:[1]");
+}
+
+/// OMP's approval chord is distinct from the arrows and Enter used by question selectors.
+#[test]
+#[parallel]
+fn test_respond_to_omp_approval_uses_approval_shortcuts() {
+    require_tmux!();
+
+    let mut h = TuiTestHarness::new("omp_perm_resp");
+    let fake_omp = h.home_path().join("fake-omp");
+    let script = "#!/bin/sh\n\
+for request in 1 2; do\n\
+  printf 'Allow tool: bash\\n'\n\
+  printf 'Command: printf approval-%s\\n' \"$request\"\n\
+  printf 'Ctrl+Enter / Ctrl+Q approve · Esc deny\\n'\n\
+  stty -icanon -echo -ixon min 1 time 0 2>/dev/null\n\
+  first=$(dd bs=1 count=1 2>/dev/null | od -An -tx1 | tr -d '[:space:]')\n\
+  stty min 0 time 5 2>/dev/null\n\
+  rest=$(dd bs=1 count=15 2>/dev/null | od -An -tx1 | tr -d '[:space:]')\n\
+  bytes=\"${first}${rest}\"\n\
+  stty icanon echo ixon 2>/dev/null\n\
+  printf 'GOT[%s]:[%s]\\n' \"$request\" \"$bytes\"\n\
+done\n\
+sleep 60\n";
+    std::fs::write(&fake_omp, script).expect("write fake OMP prompt");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&fake_omp, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod fake OMP prompt");
+    }
+
+    let project = h.project_path();
+    let session_id = h.add_session(&[
+        project.to_str().unwrap(),
+        "-t",
+        "OmpPermRespTest",
+        "--tool",
+        "omp",
+        "--cmd-override",
+        fake_omp.to_str().unwrap(),
+        "--launch",
+    ]);
+
+    h.spawn_tui();
+    h.wait_for(" aoe ");
+    h.wait_for("OmpPermRespTest");
+    h.wait_for("Allow tool: bash");
+
+    let capture = wait_until(
+        std::time::Duration::from_secs(10),
+        std::time::Duration::from_millis(200),
+        || {
+            let out = h.run_cli(&["session", "capture", &session_id, "--json"]);
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            let parsed: serde_json::Value =
+                serde_json::from_str(&stdout).unwrap_or(serde_json::Value::Null);
+            if parsed["content"]
+                .as_str()
+                .is_some_and(|content| content.contains("Allow tool: bash"))
+                && parsed["status"] == "waiting"
+            {
+                Ok(parsed)
+            } else {
+                Err(format!("OMP approval not Waiting: {stdout}"))
+            }
+        },
+    );
+    assert_eq!(capture["status"], "waiting");
+
+    h.send_keys("a");
+    h.wait_for("Respond to Permission Prompt");
+    h.send_keys("a");
+    h.wait_for("GOT[1]:[11]");
+
+    h.wait_for("approval-2");
+    h.send_keys("a");
+    h.wait_for("Respond to Permission Prompt");
+    h.send_keys("d");
+    h.wait_for("GOT[2]:[1b]");
 }

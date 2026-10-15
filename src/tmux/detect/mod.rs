@@ -130,4 +130,14 @@ mod tests {
         }
         assert_eq!(manifests().len(), MANIFEST_SOURCES.len());
     }
+
+    #[test]
+    fn omp_docked_tool_approval_is_waiting() {
+        let screen =
+            "Allow tool: bash\nCommand: printf approval-1\nCtrl+Enter / Ctrl+Q approve · Esc deny";
+        let detection = detect("omp", screen, "", None).expect("OMP manifest");
+
+        assert_eq!(detection.status, Some(Status::Waiting));
+        assert_eq!(detection.rule, "tool_approval");
+    }
 }
