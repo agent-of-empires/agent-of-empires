@@ -101,7 +101,7 @@ describe("settings store", () => {
     await act(async () => {
       await saveField("main", "web", "list", ["b", "c"], async () => "uncertain");
     });
-    await waitFor(() => expect(fetchSettings).toHaveBeenCalledTimes(2));
+    await waitFor(() => expect(vi.mocked(fetchSettings).mock.calls.length).toBeGreaterThanOrEqual(2));
     expect(listOf(hook)).toEqual(["b", "c"]);
 
     // The next edit builds on the kept intent, not on the old list, so `a` stays removed.
@@ -136,6 +136,61 @@ describe("settings store", () => {
     await act(async () => stale.resolve(plugins(["a", "b", "c"])));
 
     await waitFor(() => expect(listOf(hook)).toEqual(["x", "b"]));
+  });
+
+  it("resends an edit that never landed, then shows the saved value with a persistent error", async () => {
+    const hook = await seed("main", ["a", "b"]);
+    vi.mocked(fetchSettings).mockResolvedValue(plugins(["a", "b"]));
+    const send = vi.fn(async (): Promise<SaveOutcome> => "uncertain");
+
+    await act(async () => {
+      await saveField("main", "web", "list", ["b"], send);
+    });
+
+    await waitFor(() => expect(hook.result.current.error).toMatch(/Could not save web\.list/));
+    expect(send).toHaveBeenCalledTimes(3);
+    expect(listOf(hook)).toEqual(["a", "b"]);
+    // Nothing is left to reconcile: a further save does not fetch again.
+    const calls = vi.mocked(fetchSettings).mock.calls.length;
+    await act(async () => {
+      await saveField("main", "web", "flag", true, async () => "committed");
+    });
+    expect(fetchSettings).toHaveBeenCalledTimes(calls);
+  });
+
+  it("keeps the could-not-confirm message when another field is edited meanwhile", async () => {
+    const hook = await seed("main", ["a", "b"]);
+    await act(async () => {
+      await saveField("main", "web", "list", ["b"], async () => "uncertain");
+    });
+    const message = hook.result.current.error;
+    expect(message).toMatch(/Could not confirm/);
+
+    await act(async () => {
+      await saveField("main", "web", "flag", true, async () => "committed");
+    });
+    expect(hook.result.current.error).toBe(message);
+  });
+
+  it("clears the could-not-confirm message once a fetch shows the edit", async () => {
+    const hook = await seed("main", ["a", "b"]);
+    vi.mocked(fetchSettings).mockResolvedValueOnce(plugins(["b"]));
+    await act(async () => {
+      await saveField("main", "web", "list", ["b"], async () => "uncertain");
+    });
+    await waitFor(() => expect(hook.result.current.error).toBeNull());
+  });
+
+  it("reports a failed refetch and resolves to false", async () => {
+    const hook = await seed("main", ["a"]);
+    vi.mocked(fetchSettings).mockResolvedValueOnce(null as never);
+    let applied = true;
+    await act(async () => {
+      applied = await loadSettings("main");
+    });
+    expect(applied).toBe(false);
+    expect(hook.result.current.error).toBe("Could not refresh settings, please reload");
+    expect(listOf(hook)).toEqual(["a"]);
   });
 
   it("does not refetch after a committed save", async () => {

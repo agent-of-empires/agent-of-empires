@@ -10,8 +10,8 @@ interface Props {
   /** Includes the virtual `plugin:<id>` sections. */
   schema: SettingsFieldDescriptor[];
   settings: Record<string, unknown> | null;
-  /** Refetches the settings; resolves once a fetch started after the save has landed. */
-  onSaved: () => Promise<void> | void;
+  /** Refetches the settings; resolves once a fetch started after the save has landed, to whether it applied. */
+  onSaved: () => Promise<boolean | void> | void;
 }
 
 function storedSettings(settings: Record<string, unknown> | null, id: string): Record<string, unknown> {
@@ -70,9 +70,9 @@ export function PluginSettingsSections({ schema, settings, onSaved }: Props) {
     });
     // An uncertain save keeps its value on screen; the refetch settles what the server holds.
     if (outcome !== "rejected") {
-      void Promise.resolve(onSaved()).then(() => {
-        // The overlay only bridges until a fetch that started after the commit lands.
-        if (outcome === "committed") dropOverlay(key);
+      void Promise.resolve(onSaved()).then((applied) => {
+        // The overlay only bridges until a fetch that started after the commit lands; a failed one keeps it.
+        if (outcome === "committed" && applied !== false) dropOverlay(key);
       });
     }
     return outcome !== "rejected";

@@ -13,6 +13,18 @@ export interface SettingsView {
  * Per-profile settings kept outside any component, so an edit built after a remount sees the
  * edits still waiting on their PATCH, and saves of one profile reach the server in edit order.
  */
+interface Unconfirmed {
+  section: string;
+  field: string;
+  value: unknown;
+  send: () => Promise<SaveOutcome>;
+  attempts: number;
+}
+
+/** Resends of an unconfirmed edit before the saved value is shown instead. */
+const MAX_ATTEMPTS = 3;
+const UNCERTAIN_ERROR = "Could not confirm the save, please check the value";
+
 interface Entry {
   view: SettingsView;
   /** Bumped by every edit and every settled save; a GET started before a bump is stale. */
@@ -25,9 +37,9 @@ interface Entry {
    * Edits whose outcome is unknown. A late commit can still follow any fetch, so a fetched
    * value that differs from the intent never replaces it; only a matching one settles it.
    */
-  unconfirmed: Map<string, { section: string; field: string; value: unknown }>;
+  unconfirmed: Map<string, Unconfirmed>;
   fieldGen: Map<string, number>;
-  loading: Promise<void>;
+  loading: Promise<boolean>;
   afterDrain: (() => void)[];
   loadSeq: number;
 }
@@ -46,7 +58,7 @@ function entry(profile: string): Entry {
       needsReconcile: false,
       unconfirmed: new Map(),
       fieldGen: new Map(),
-      loading: Promise.resolve(),
+      loading: Promise.resolve(false),
       afterDrain: [],
       loadSeq: 0,
     };
@@ -70,46 +82,70 @@ export function useProfileSettings(profile: string): SettingsView {
   );
 }
 
+const REFRESH_ERROR = "Could not refresh settings, please reload";
+
 const same = (a: unknown, b: unknown) => JSON.stringify(a) === JSON.stringify(b);
 
-/** Drop unconfirmed edits the server now shows; keep the rest on screen over the fetched value. */
-function settle(e: Entry, fetched: Settings): Settings {
-  let out = fetched;
-  for (const [key, { section, field, value }] of e.unconfirmed) {
-    if (same((fetched[section] as Settings | undefined)?.[field], value)) {
+/**
+ * Settle unconfirmed edits against a fetch: the ones it shows are done, the rest stay on screen
+ * and are resent, and one that kept failing gives way to the fetched value.
+ */
+function settle(e: Entry, fetched: Settings): { settings: Settings; resend: Unconfirmed[]; gaveUp: string[] } {
+  let settings = fetched;
+  const resend: Unconfirmed[] = [];
+  const gaveUp: string[] = [];
+  for (const [key, u] of e.unconfirmed) {
+    if (same((fetched[u.section] as Settings | undefined)?.[u.field], u.value)) {
       e.unconfirmed.delete(key);
+    } else if (u.attempts >= MAX_ATTEMPTS) {
+      e.unconfirmed.delete(key);
+      gaveUp.push(`${u.section}.${u.field}`);
     } else {
-      out = { ...out, [section]: { ...(out[section] as Settings | undefined), [field]: value } };
+      settings = { ...settings, [u.section]: { ...(settings[u.section] as Settings | undefined), [u.field]: u.value } };
+      resend.push(u);
     }
   }
   e.needsReconcile = e.unconfirmed.size > 0;
-  return out;
+  return { settings, resend, gaveUp };
 }
 
 /**
  * Fetch the profile's settings. A response is dropped if a newer fetch started, and one that an
  * edit or settled save overtook is retried once the queue is idle, so the cache never stays on a
- * snapshot older than what it shows. Resolves once a fetch started after the call has landed.
+ * snapshot older than what it shows. Resolves once a fetch started after the call has landed, to
+ * whether a response was applied.
  */
-export function loadSettings(profile: string): Promise<void> {
-  if (!profile) return Promise.resolve();
+export function loadSettings(profile: string): Promise<boolean> {
+  if (!profile) return Promise.resolve(false);
   const e = entry(profile);
   const { gen } = e;
   const seq = ++e.loadSeq;
   const request = fetchSettings(profile)
-    .then((s): void | Promise<void> => {
+    .then((s): boolean | Promise<boolean> => {
       if (seq !== e.loadSeq) return e.loading;
       if (gen !== e.gen || e.pending > 0) {
         e.needsReconcile = true;
         if (e.pending === 0) return loadSettings(profile);
         return new Promise<void>((resolve) => e.afterDrain.push(resolve)).then(() => e.loading);
       }
-      if (s) publish(e, { settings: settle(e, s) });
+      if (!s) {
+        publish(e, { error: REFRESH_ERROR });
+        return false;
+      }
+      const { settings, resend, gaveUp } = settle(e, s);
+      const error =
+        gaveUp.length > 0
+          ? `Could not save ${gaveUp.join(", ")}; showing the saved value`
+          : e.unconfirmed.size === 0 && e.view.error === UNCERTAIN_ERROR
+            ? null
+            : e.view.error;
+      publish(e, { settings, error });
+      for (const u of resend) void saveField(profile, u.section, u.field, u.value, u.send, u.attempts);
+      return true;
     })
     .catch(() => {
-      if (seq === e.loadSeq && gen === e.gen && e.pending === 0) {
-        publish(e, { error: "Could not refresh settings, please reload" });
-      }
+      if (seq === e.loadSeq && gen === e.gen && e.pending === 0) publish(e, { error: REFRESH_ERROR });
+      return false;
     });
   e.loading = request;
   return request;
@@ -126,6 +162,7 @@ export async function saveField(
   field: string,
   value: unknown,
   send: () => Promise<SaveOutcome>,
+  attempts = 0,
 ): Promise<boolean> {
   const e = entry(profile);
   const base = e.view.settings;
@@ -136,7 +173,8 @@ export async function saveField(
   e.gen++;
   e.pending++;
   publish(e, {
-    error: null,
+    // Another edit does not answer a "could not confirm" still waiting on the server.
+    error: e.unconfirmed.size > 0 ? e.view.error : null,
     settings: base && { ...base, [section]: { ...(base[section] as Settings | undefined), [field]: value } },
   });
   const request = e.tail.then(send);
@@ -147,13 +185,13 @@ export async function saveField(
   if (outcome !== "committed") e.needsReconcile = true;
   // A newer edit of the same field supersedes this one, so only the latest keeps its intent.
   if (outcome === "uncertain" && e.fieldGen.get(key) === fieldGen) {
-    e.unconfirmed.set(key, { section, field, value });
+    e.unconfirmed.set(key, { section, field, value, send, attempts: attempts + 1 });
   }
   const error =
     outcome === "rejected"
       ? "Failed to save, please try again"
       : outcome === "uncertain"
-        ? "Could not confirm the save, please check the value"
+        ? UNCERTAIN_ERROR
         : e.view.error;
   publish(e, { error });
   if (e.pending === 0) {

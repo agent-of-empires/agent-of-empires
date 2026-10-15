@@ -239,6 +239,20 @@ describe("PluginSettingsSections list editing while a save is in flight", () => 
     expect(lastPatch()).toEqual({ "plugin:acme.kit": { tags: ["c"] } });
   });
 
+  it("keeps a committed removal when its refetch fails", async () => {
+    vi.mocked(updateSettings).mockClear();
+    const onSaved = vi.fn(() => Promise.resolve(false));
+    render(<PluginSettingsSections schema={LIST_SCHEMA} settings={stored(["a", "b", "c"])} onSaved={onSaved} />);
+    fireEvent.click(screen.getAllByTitle(/^Remove /)[0]!);
+    await waitFor(() => expect(onSaved).toHaveBeenCalledTimes(1));
+    await Promise.resolve();
+
+    expect(screen.queryByText("a")).toBeNull();
+    fireEvent.click(screen.getAllByTitle(/^Remove /)[0]!);
+    await waitFor(() => expect(updateSettings).toHaveBeenCalledTimes(2));
+    expect(lastPatch()).toEqual({ "plugin:acme.kit": { tags: ["c"] } });
+  });
+
   it("keeps the edit when the server persisted it but the outcome is uncertain, then refetches", async () => {
     vi.mocked(updateSettings).mockClear();
     const outcome = held();
