@@ -394,6 +394,12 @@ fn setup_creation_test_env() -> CreationTestEnv {
             .unwrap();
     }
 
+    // These tests exercise creation finalization after hook consent was granted.
+    crate::session::config::update_app_state(|state| {
+        state.has_acknowledged_agent_hooks = true;
+    })
+    .unwrap();
+
     let mut view = test_view(Some("default"));
     view.group_by = crate::session::config::GroupByMode::Manual;
     view.flat_items = view.build_flat_items();
