@@ -3748,8 +3748,14 @@ impl HomeView {
                     } else {
                         "b hide sidebar"
                     };
-                    let menu =
-                        format!("  {lead}:  k palette \u{00b7} {sidebar_cmd} \u{00b7} q exit ");
+                    let swap_cmd = match state.target {
+                        live_send::LiveSendTarget::Terminal
+                        | live_send::LiveSendTarget::ContainerTerminal => "t agent",
+                        _ => "t terminal",
+                    };
+                    let menu = format!(
+                        "  {lead}:  k palette \u{00b7} {sidebar_cmd} \u{00b7} {swap_cmd} \u{00b7} q exit "
+                    );
                     let menu_budget = (area.width as usize)
                         .saturating_sub(unicode_width::UnicodeWidthStr::width(chip));
                     let menu = truncate_to_width(&menu, menu_budget);

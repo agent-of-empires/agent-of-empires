@@ -248,6 +248,13 @@ impl HomeView {
                 live_send::parse_chord(live_send::DEFAULT_LEADER)
             })
         };
+        // Show the pane the keys now reach. A no-op on entry, where the target was picked
+        // from the view; it flips the view on a leader `t` swap.
+        let view_mode = target.view_mode();
+        if self.view_mode != view_mode {
+            self.view_mode = view_mode;
+            self.preview_scroll_offset = 0;
+        }
         self.live_send = Some(live_send::LiveSendState {
             session_id: inst.id.clone(),
             title: inst.title.clone(),

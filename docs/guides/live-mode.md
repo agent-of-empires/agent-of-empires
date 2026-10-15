@@ -24,11 +24,12 @@ Almost every key goes to the agent, so AoE reserves one **leader** chord, tmux-s
 | --- | --- |
 | `Ctrl+B` then `k` | Open the command palette |
 | `Ctrl+B` then `b` | Hide or show the sidebar, giving the preview full width |
+| `Ctrl+B` then `t` | Switch between the agent and its paired terminal, starting the terminal if needed |
 | `Ctrl+B` then `q` | Exit live mode |
 | `Ctrl+B` then `Ctrl+B` | Send a literal `Ctrl+B` to the agent |
 | `Esc` or any other key | Cancel the menu, send nothing |
 
-While the leader is armed the status bar becomes a which-key menu. Only the leader itself is taken from the agent, and pressing it twice still delivers it downstream, so every other chord, `Ctrl+K` included, passes through untouched. The command palette layers over live mode: `Esc` drops back into the relay, while choosing a command leaves live mode first, so the preview never shows one session while your keystrokes go to another. The sidebar always reappears when you exit live mode, so hiding it cannot strand you.
+While the leader is armed the status bar becomes a which-key menu. Only the leader itself is taken from the agent, and pressing it twice still delivers it downstream, so every other chord, `Ctrl+K` included, passes through untouched. The command palette layers over live mode: `Esc` drops back into the relay, while choosing a command leaves live mode first, so the preview never shows one session while your keystrokes go to another. The sidebar stays as you left it when you exit live mode; click the collapsed strip to bring it back.
 
 `Shift+PageUp` and `Shift+PageDown` scroll the preview through the agent's history without leaving live mode; bare `PageUp` and `PageDown` still pass through for agents that page their own UI.
 

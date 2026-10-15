@@ -1013,3 +1013,80 @@ mod paste_splitting {
         assert!(split_paste_for_live_send("").is_empty());
     }
 }
+
+/// Leader `t` re-enters live send on the other half of the agent/terminal pair, through
+/// the same `EnterLiveSend` action as a fresh entry, and only a plain `t` counts.
+#[test]
+#[serial]
+fn leader_t_swaps_live_target_between_agent_and_terminal() {
+    use crate::tui::home::live_send::{parse_chord, LiveSendTarget};
+
+    let mut env = create_test_env_with_sessions(1);
+    let id = install_live_for_first_session(&mut env);
+    let cases = [
+        (
+            "agent to terminal",
+            LiveSendTarget::Agent,
+            KeyModifiers::NONE,
+            Some(LiveSendTarget::Terminal),
+        ),
+        (
+            "terminal to agent",
+            LiveSendTarget::Terminal,
+            KeyModifiers::NONE,
+            Some(LiveSendTarget::Agent),
+        ),
+        (
+            "container to agent",
+            LiveSendTarget::ContainerTerminal,
+            KeyModifiers::NONE,
+            Some(LiveSendTarget::Agent),
+        ),
+        (
+            "tool to terminal",
+            LiveSendTarget::Tool("lazygit".into()),
+            KeyModifiers::NONE,
+            Some(LiveSendTarget::Terminal),
+        ),
+        (
+            "modified t is not the swap",
+            LiveSendTarget::Agent,
+            KeyModifiers::CONTROL,
+            None,
+        ),
+    ];
+    for (name, from, modifiers, expected) in cases {
+        let state = env.view.live_send.as_mut().expect("live");
+        state.target = from;
+        state.leader = parse_chord("C-b");
+        env.view.pending_live_send_target = LiveSendTarget::Agent;
+        let view_before = env.view.view_mode.clone();
+
+        env.view.handle_key(
+            KeyEvent::new(KeyCode::Char('b'), KeyModifiers::CONTROL),
+            None,
+        );
+        let action = env
+            .view
+            .handle_key(KeyEvent::new(KeyCode::Char('t'), modifiers), None);
+
+        match expected {
+            Some(target) => {
+                assert!(
+                    matches!(&action, Some(Action::EnterLiveSend(sid)) if *sid == id),
+                    "{name}: {action:?}"
+                );
+                assert_eq!(env.view.pending_live_send_target, target, "{name}");
+            }
+            None => assert!(action.is_none(), "{name}: {action:?}"),
+        }
+        assert!(
+            env.view.live_send.is_some(),
+            "{name}: live mode must survive"
+        );
+        assert_eq!(
+            env.view.view_mode, view_before,
+            "{name}: the view follows only once prepare_live_send succeeds"
+        );
+    }
+}
