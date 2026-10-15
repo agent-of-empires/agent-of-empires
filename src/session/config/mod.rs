@@ -3765,39 +3765,33 @@ pub fn resolve_theme_palette_mode() -> bool {
 /// deterministic). On a genuine first run, when no profile directory exists
 /// yet, one is bootstrapped (see `ensure_bootstrap_profile`).
 pub fn resolve_default_profile() -> String {
+    default_profile_candidate().unwrap_or_else(ensure_bootstrap_profile)
+}
+
+pub(crate) fn default_profile_name() -> String {
+    default_profile_candidate().unwrap_or_else(|| BOOTSTRAP_PROFILE.to_owned())
+}
+
+fn default_profile_candidate() -> Option<String> {
     let config = Config::load_or_warn();
     if !config.default_profile.is_empty() {
-        return config.default_profile;
+        return Some(config.default_profile);
     }
-    match super::list_profiles() {
-        Ok(profiles) => match profiles.into_iter().next() {
-            Some(first) => first,
-            None => ensure_bootstrap_profile(),
-        },
-        Err(_) => ensure_bootstrap_profile(),
-    }
+    super::list_profiles().ok()?.into_iter().next()
 }
 
 /// Name of the profile created on a genuine first run.
 const BOOTSTRAP_PROFILE: &str = "main";
 
-/// Create the first profile on a genuine first run and return its name.
-///
-/// AoE always needs at least one profile (somewhere to file sessions). When
-/// `profiles/` has no entries, this creates `main`. It is idempotent: calling
-/// it when `main` already exists just returns the name.
 fn ensure_bootstrap_profile() -> String {
     let _ = super::get_profile_dir(BOOTSTRAP_PROFILE);
     BOOTSTRAP_PROFILE.to_string()
 }
 
-/// Return `profile` if non-empty, otherwise the user's globally configured
-/// default profile. Used at start-time config-resolution sites that prefer
-/// an instance's `source_profile` but tolerate it being unset (e.g. tests
-/// or pre-`source_profile`-wiring callers).
+/// Resolve a profile name without creating its directory.
 pub fn effective_profile(profile: &str) -> String {
     if profile.is_empty() {
-        resolve_default_profile()
+        default_profile_name()
     } else {
         profile.to_string()
     }

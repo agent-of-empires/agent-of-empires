@@ -143,9 +143,9 @@ pub async fn run(args: AcpRunnerArgs) -> Result<()> {
             .with_context(|| format!("creating socket dir {}", parent.display()))?;
     }
 
-    // Save the record before spawning so a save failure has no agent tree to leak.
+    // Publish before spawning so a failed publication cannot leak an agent tree.
     let our_pid = std::process::id();
-    let record = WorkerRecord::new(
+    let mut record = WorkerRecord::new(
         args.session_id.clone(),
         our_pid,
         args.socket.clone(),
@@ -163,15 +163,14 @@ pub async fn run(args: AcpRunnerArgs) -> Result<()> {
         },
     )
     .with_generation(args.generation);
-    let mut record = record;
     record.prime_runtime = args
         .prime_runtime
         .as_deref()
         .map(serde_json::from_str)
         .transpose()
         .context("parsing Prime runtime")?;
-    let control_listener =
-        worker_registry::register_runner(&record).context("registering runner ownership")?;
+    let (control_listener, profile_guard) = worker_registry::publish_runner(&record)
+        .context("publishing runner listener and record")?;
 
     let (mut agent_child, agent_stdin, agent_stdout, agent_stderr) = match spawn_agent(&args) {
         Ok(handles) => handles,
@@ -180,6 +179,7 @@ pub async fn run(args: AcpRunnerArgs) -> Result<()> {
             return Err(e).with_context(|| format!("spawning agent {:?}", args.agent_argv));
         }
     };
+    drop(profile_guard);
     let agent_started_at = std::time::Instant::now();
 
     // Drain stderr so the child cannot block on a full pipe.
@@ -264,8 +264,6 @@ pub async fn run(args: AcpRunnerArgs) -> Result<()> {
         }
     };
 
-    let mut preserve_registry = false;
-
     tokio::select! {
         status = agent_child.wait() => {
             let elapsed = agent_started_at.elapsed();
@@ -311,17 +309,11 @@ pub async fn run(args: AcpRunnerArgs) -> Result<()> {
         }
         reason = &mut watchdog_rx => {
             if let Ok(reason) = reason {
-                // The replacement runner owns the registry and socket now.
-                if matches!(reason, WatchdogShutdown::Superseded) {
-                    preserve_registry = true;
-                }
                 self_terminate_agent_tree(reason, &record, &mut agent_child).await;
             }
         }
         terminate_runner = accept_loop => {
             debug_assert!(terminate_runner);
-            // The daemon may already have spawned a replacement; never unlink it.
-            preserve_registry = true;
             let _ = agent_child.start_kill();
             let _ = agent_child.wait().await;
         }
@@ -332,8 +324,11 @@ pub async fn run(args: AcpRunnerArgs) -> Result<()> {
     let cleanup_record = record.clone();
     tokio::task::spawn_blocking(move || worker_registry::cleanup_runtime(&cleanup_record))
         .await??;
-    if !preserve_registry {
-        worker_registry::delete_if_owned(&session_id, our_pid).ok();
+    // The daemon retires the route after it proves the whole runner group exited.
+    // Removing it here would lose ownership evidence for descendants of the agent.
+    if !crate::process::worker::kill_own_process_group_if_leader(our_pid) {
+        let _ = agent_child.start_kill();
+        let _ = tokio::time::timeout(Duration::from_secs(2), agent_child.wait()).await;
     }
     Ok(())
 }
@@ -430,10 +425,10 @@ async fn self_terminate_agent_tree(
     let _ = tokio::time::timeout(Duration::from_secs(2), agent_child.wait()).await;
 
     let cleanup_record = record.clone();
-    let cleanup_proven = loop {
+    loop {
         let route = cleanup_record.clone();
         match tokio::task::spawn_blocking(move || worker_registry::cleanup_runtime(&route)).await {
-            Ok(Ok(())) => break true,
+            Ok(Ok(())) => break,
             result => {
                 warn!(target: "acp.runner", ?result, "native cleanup unproven; retaining ownership evidence");
                 if (cleanup_record.agent_key == "prime-agent"
@@ -443,21 +438,13 @@ async fn self_terminate_agent_tree(
                         .as_ref()
                         .is_none_or(|runtime| runtime.proof_path.is_none())
                 {
-                    break false;
+                    break;
                 }
             }
         }
         tokio::time::sleep(Duration::from_millis(500)).await;
-    };
-    if cleanup_proven
-        && !worker_registry::delete_if_owned_by(
-            session_id,
-            crate::acp::runner_lifecycle::RunnerIdentity::from_record(record),
-        )
-    {
-        warn!(target: "acp.runner", session = %session_id, "settled runner record could not be retired");
     }
-    // Kill only the runner's own group after retaining or retiring its evidence.
+    // The daemon owns registry retirement after the entire process group is gone.
     if !crate::process::worker::kill_own_process_group_if_leader(own_pid) {
         let _ = agent_child.start_kill();
         let _ = tokio::time::timeout(Duration::from_secs(2), agent_child.wait()).await;

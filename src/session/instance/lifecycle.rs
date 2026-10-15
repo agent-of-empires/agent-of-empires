@@ -104,6 +104,37 @@ impl Instance {
         )
     }
 
+    /// Refresh an owned reservation while a bounded or user-defined hook runs. The generation
+    /// remains the identity of the operation; only its liveness timestamp moves forward.
+    pub(crate) fn renew_lifecycle_reservation_if_owned(
+        &mut self,
+        operation: LifecycleOperation,
+        generation: u64,
+        now: DateTime<Utc>,
+    ) -> bool {
+        if self.lifecycle_reservation_is_owned(operation, generation) {
+            if let Some(reservation) = self.lifecycle_reservation.as_mut() {
+                reservation.at = now;
+                return true;
+            }
+        }
+        false
+    }
+
+    pub(crate) fn start_reservation_heartbeat(
+        &self,
+        storage: &crate::session::storage::Storage,
+        operation: LifecycleOperation,
+    ) -> Result<crate::session::ReservationHeartbeat> {
+        crate::session::ReservationHeartbeat::start(
+            storage,
+            &self.id,
+            operation,
+            self.lifecycle_generation,
+            std::time::Duration::from_secs(60),
+        )
+    }
+
     pub(crate) fn has_fresh_launch_reservation(&self, now: DateTime<Utc>) -> bool {
         self.has_fresh_lifecycle_reservation(now)
             && self
@@ -123,6 +154,26 @@ impl Instance {
         } else {
             false
         }
+    }
+
+    /// Publish a retained purge result beyond peers' Deleting observation.
+    pub(crate) fn finish_owned_purge(
+        &mut self,
+        generation: u64,
+        status_before: Status,
+    ) -> Result<bool, LifecycleReservationError> {
+        if !self.lifecycle_reservation_is_owned(LifecycleOperation::Purge, generation) {
+            return Ok(false);
+        }
+        let completed = generation
+            .checked_add(1)
+            .ok_or(LifecycleReservationError::GenerationOverflow)?;
+        if self.status == Status::Deleting {
+            self.status = status_before;
+        }
+        self.lifecycle_reservation = None;
+        self.lifecycle_generation = completed;
+        Ok(true)
     }
 
     /// Clear a crashed owner's expired reservation. The generation is

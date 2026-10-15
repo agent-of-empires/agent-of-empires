@@ -163,6 +163,14 @@ impl Instance {
             LifecycleOperation::Launch,
             Some(Status::Starting),
         )?;
+        let heartbeat = match self.start_reservation_heartbeat(&storage, LifecycleOperation::Launch)
+        {
+            Ok(heartbeat) => heartbeat,
+            Err(error) => {
+                self.fail_reserved_launch(&storage, &error, false);
+                return Err(error);
+            }
+        };
         if restart {
             self.stop_and_flush_poller_lifecycle_locked();
             self.capture_omp_before_restart(&profile);
@@ -179,6 +187,7 @@ impl Instance {
         drop(lifecycle_lock);
         drop(title_lock);
         let hook_result = self.run_pre_launch_hooks(skip_on_launch, &profile);
+        heartbeat.stop();
         let (_title_lock, _lifecycle_lock) =
             self.reacquire_launch_locks_after_hooks(&storage, hook_result)?;
         self.reconcile_sidecar_into_disk();

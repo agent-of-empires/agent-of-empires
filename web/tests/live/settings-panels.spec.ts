@@ -1,9 +1,11 @@
-// Settings panels backed by the real server: MCP servers, skills, plugins, and profile overrides.
+// Settings panels against the real server, including profile overrides and kept-resource recovery.
 
-import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { spawnSync } from "node:child_process";
+import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import type { Page } from "@playwright/test";
 import { test, expect, authHeaders, bootDashboard, type ServeHandle } from "../helpers/liveTest";
+import { appDirFor, resolveAoeBinary } from "../helpers/aoeServe";
 
 test.describe("MCP servers", () => {
   test("MCP panel shows native servers with provenance and redacts secrets", async ({ page, spawnServe }) => {
@@ -193,4 +195,50 @@ test("per-profile setting override leaves global state untouched", async ({ serv
   // One save naming the profile; the server routes the field to it.
   expect(patches.some((url) => url.endsWith("/api/settings?profile=work"))).toBe(true);
   expect(patches.some((url) => url.endsWith("/api/settings") || url.includes("layer=machine"))).toBe(false);
+});
+
+test("renaming a profile preserves rowless kept resources across daemon restart", async ({ page, spawnServe }) => {
+  let appDir = "";
+  let scratch = "";
+  const serve = await spawnServe({
+    seedFn: ({ home, xdg, env }) => {
+      const binary = resolveAoeBinary();
+      appDir = appDirFor(home, xdg, binary);
+      const cli = (...args: string[]) => {
+        const result = spawnSync(binary, args, { env, encoding: "utf8" });
+        if (result.status !== 0) throw new Error("aoe " + args.join(" ") + ": " + result.stderr);
+        return result.stdout;
+      };
+      cli("profile", "create", "kept-before");
+      cli("-p", "kept-before", "add", "--scratch", "--title", "kept-data");
+      const [row] = JSON.parse(cli("-p", "kept-before", "list", "--json")) as Array<{ id: string; path: string }>;
+      if (!row) throw new Error("scratch row was not created");
+      scratch = row.path;
+      writeFileSync(join(scratch, "retained"), "kept across rename");
+      cli("-p", "kept-before", "remove", row.id, "--purge", "--keep-scratch");
+      writeFileSync(join(appDir, "state.toml"), "has_responded_to_telemetry = true\nhas_seen_web_tour = true\n");
+    },
+  });
+  await page.goto(serve.baseUrl + "/settings/profiles");
+  await page.getByRole("button", { name: /^kept-before(?: default)?$/ }).click();
+  await page.getByRole("button", { name: "Rename", exact: true }).click();
+  await page.getByPlaceholder("New name").fill("kept-after");
+  await page.getByPlaceholder("New name").press("Enter");
+  await expect(page.getByRole("button", { name: /^kept-after(?: default)?$/ })).toBeVisible();
+  await expect(page.getByRole("button", { name: /^kept-before(?: default)?$/ })).toBeHidden();
+  const journalDir = join(appDir, "profiles", "kept-after", ".lifecycle-journal");
+  const name = readdirSync(journalDir).find((name) => name.startsWith("delete-"));
+  if (!name) throw new Error("kept tombstone disappeared while its scratch directory exists");
+  const journal = join(journalDir, name);
+  const retained = () => {
+    expect(readFileSync(join(scratch, "retained"), "utf8")).toBe("kept across rename");
+    expect(existsSync(journal)).toBe(true);
+    expect(existsSync(join(appDir, "profiles", "kept-before"))).toBe(false);
+  };
+  retained();
+  await serve.restart();
+  retained();
+  rmSync(scratch, { recursive: true });
+  await serve.restart();
+  await expect.poll(() => existsSync(journal)).toBe(false);
 });

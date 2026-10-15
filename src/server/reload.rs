@@ -31,11 +31,8 @@ pub(super) fn load_all_instances(
     };
     let mut all = Vec::new();
     for profile in &profiles {
-        match Storage::new(profile, file_watch.clone()).and_then(|s| s.load()) {
-            Ok(mut instances) => {
-                for inst in &mut instances {
-                    inst.source_profile = profile.clone();
-                }
+        match load_profile_instances(profile, file_watch) {
+            Ok(instances) => {
                 all.extend(instances);
             }
             Err(e) => {
@@ -50,6 +47,17 @@ pub(super) fn load_all_instances(
         }
     }
     Ok(all)
+}
+
+fn load_profile_instances(
+    profile: &str,
+    file_watch: &Arc<FileWatchService>,
+) -> anyhow::Result<Vec<Instance>> {
+    let mut instances = Storage::open(profile, Arc::clone(file_watch))?.load()?;
+    for instance in &mut instances {
+        instance.source_profile = profile.to_string();
+    }
+    Ok(instances)
 }
 
 /// Carry over the in-memory-only fields from the prior `state.instances` entry into the
@@ -342,6 +350,23 @@ pub(super) fn apply_acp_overlay_inplace(prior_by_id: &PriorById, merged: &mut [I
 mod tests {
     use super::*;
     use chrono::Utc;
+
+    #[test]
+    #[serial_test::serial]
+    fn reload_of_a_renamed_profile_does_not_recreate_its_old_directory() {
+        let _home = crate::session::test_support::isolate_app_dir();
+        let file_watch = FileWatchService::new().unwrap();
+        Storage::new_unwatched("reload-before").unwrap();
+        let old_path = crate::session::get_profile_dir_path("reload-before").unwrap();
+
+        crate::session::rename_profile("reload-before", "reload-after").unwrap();
+
+        assert!(load_profile_instances("reload-before", &file_watch).is_err());
+        assert!(!old_path.exists());
+        assert!(crate::session::get_profile_dir_path("reload-after")
+            .unwrap()
+            .is_dir());
+    }
 
     fn terminal_row(status: Status) -> Instance {
         let mut row = Instance::new("reload-publish", "/tmp/aoe-reload-publish");

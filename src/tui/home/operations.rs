@@ -692,8 +692,7 @@ impl HomeView {
     /// Commit one profile's group deletion before any purge is queued, so a watcher
     /// reload or a restart cannot rebuild the group from an unchanged `groups.json`.
     /// Blockers are re-checked against durable rows because a Creating member may exist
-    /// only on disk. `Status::Deleting` stays an in-memory overlay owned by
-    /// `PurgeTransaction`.
+    /// only on disk.
     fn persist_group_delete_with_sessions(
         &mut self,
         profile: &str,
@@ -883,20 +882,26 @@ impl HomeView {
             .map(|attempt| attempt.forced)
     }
 
-    /// Force-remove a session from storage, for rows stuck in Deleting. Worktree and
-    /// branch cleanup are skipped because the original deletion already attempted them;
-    /// tmux and sandbox teardown run off-thread so a hung call cannot block input.
+    /// Queue a guarded row removal without worktree, branch or scratch cleanup.
     pub(super) fn force_remove_session(&mut self, session_id: &str) -> anyhow::Result<()> {
-        let instance = self.instances.get(session_id).cloned();
-        self.failed_deletes.remove(session_id);
-        self.remove_instance(session_id);
-        self.rebuild_group_trees();
-        self.save()?;
-        self.reload()?;
-
-        if let Some(inst) = instance {
-            spawn_force_teardown(inst);
-        }
+        let Some(instance) = self.instances.get(session_id).cloned() else {
+            return Ok(());
+        };
+        self.deletes_in_flight.insert(
+            instance.id.clone(),
+            super::DeleteAttempt {
+                forced: true,
+                trashed_at: instance.trashed_at,
+                trash_lifecycle_id: instance.trash_lifecycle_id.clone(),
+            },
+        );
+        self.drop_poller.request(
+            instance.id.clone(),
+            DropRequest {
+                instance,
+                force_remove: true,
+            },
+        );
         Ok(())
     }
 
@@ -917,6 +922,7 @@ impl HomeView {
             inst.id.clone(),
             DropRequest {
                 instance: inst.clone(),
+                force_remove: false,
             },
         );
     }
@@ -927,6 +933,13 @@ impl HomeView {
         };
         let inst = result.instance;
         self.deletes_in_flight.remove(&inst.id);
+        if self.instances.get(&inst.id).is_some_and(|current| {
+            current.source_profile != inst.source_profile
+                || current.lifecycle_generation != inst.lifecycle_generation
+                || (inst.is_trashed() && !current.same_trash_lifecycle(&inst))
+        }) {
+            return true;
+        }
         if should_clear_drop_retry_state(&result.dropped, &inst, self.instances.get(&inst.id)) {
             self.failed_deletes.remove(&inst.id);
         }
@@ -948,6 +961,7 @@ impl HomeView {
             }
             Err(e) => {
                 self.set_instance_status(&inst.id, inst.status);
+                self.info_dialog = Some(InfoDialog::new("Session not removed", &e.to_string()));
                 tracing::error!(target: "tui.home", session = %inst.id, "empty trash drop failed: {e}");
             }
         }
@@ -2430,6 +2444,7 @@ fn restore_from_trash_with_storage(
 
 pub(in crate::tui) struct DropRequest {
     instance: Instance,
+    force_remove: bool,
 }
 
 pub(in crate::tui) struct DropResult {
@@ -2443,37 +2458,46 @@ impl crate::tui::worker::SessionScoped for DropResult {
     }
 }
 
-/// Remove the durable row under its lifecycle lock and purge claim, and only while it is
-/// still in the trash lifecycle the failure was recorded in, so a peer restore between
-/// confirm and submit keeps the row and its processes.
+/// Drop only the requested durable lifecycle, after abandoning destructive intents.
 pub(super) fn perform_drop(request: DropRequest) -> DropResult {
     let inst = request.instance;
     let id = inst.id.as_str();
     let dropped = (|| -> anyhow::Result<bool> {
         let storage = Storage::open_unwatched(&inst.source_profile)?;
-        let _lifecycle_lock = storage.acquire_instance_lifecycle_lock(id)?;
-        let mut dropped = false;
+        crate::session::profile_rename::ensure_profile_available(storage.profile())?;
+        let Some(_owner) = storage.try_acquire_purge_owner_lock(id)? else {
+            return Ok(false);
+        };
+        crate::session::profile_rename::ensure_profile_available(storage.profile())?;
+        let Some(_lifecycle_lock) = storage.try_acquire_instance_lifecycle_lock(id)? else {
+            return Ok(false);
+        };
         storage.update(|instances, _groups| {
-            let same_lifecycle = instances
-                .iter()
-                .any(|stored| stored.id == id && stored.same_trash_lifecycle(&inst));
-            if same_lifecycle
-                && matches!(
-                    crate::session::claim::decide_purge_claim(
-                        instances,
-                        id,
-                        true,
-                        chrono::Utc::now()
-                    )?,
-                    crate::session::claim::PurgeClaimDecision::Claimed(_)
-                )
-            {
-                instances.retain(|stored| stored.id != id);
-                dropped = true;
+            let Some(stored) = instances.iter().find(|stored| stored.id == id) else {
+                return Ok(false);
+            };
+            let eligible = if request.force_remove {
+                stored.status == Status::Deleting
+                    && stored.lifecycle_generation == inst.lifecycle_generation
+            } else {
+                stored.same_trash_lifecycle(&inst)
+                    && matches!(
+                        crate::session::claim::decide_purge_claim(
+                            instances,
+                            id,
+                            true,
+                            chrono::Utc::now()
+                        )?,
+                        crate::session::claim::PurgeClaimDecision::Claimed(_)
+                    )
+            };
+            if !eligible {
+                return Ok(false);
             }
-            Ok(())
-        })?;
-        Ok(dropped)
+            crate::session::deletion::abandon_purge_intents_lifecycle_locked(&storage, id)?;
+            instances.retain(|stored| stored.id != id);
+            Ok(true)
+        })
     })();
     DropResult {
         instance: inst,

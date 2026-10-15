@@ -5,6 +5,69 @@ use anyhow::Context as _;
 use std::collections::HashMap;
 use std::process::Command;
 
+pub(super) fn kernel_process_state(pid: u32) -> anyhow::Result<Option<super::KernelProcessState>> {
+    let mut info = std::mem::MaybeUninit::<libc::proc_bsdinfo>::uninit();
+    let size = std::mem::size_of::<libc::proc_bsdinfo>() as i32;
+    // The kernel initializes the complete BSD record; partial results are never read.
+    let bytes = unsafe {
+        libc::proc_pidinfo(
+            pid as i32,
+            libc::PROC_PIDTBSDINFO,
+            0,
+            info.as_mut_ptr().cast(),
+            size,
+        )
+    };
+    if bytes != size {
+        let error = std::io::Error::last_os_error();
+        if bytes == 0 && error.raw_os_error() == Some(libc::ESRCH) {
+            return Ok(None);
+        }
+        return Err(anyhow::anyhow!(
+            "kernel process information incomplete: {error}"
+        ));
+    }
+    let info = unsafe { info.assume_init() };
+    anyhow::ensure!(info.pbi_pid == pid, "kernel process identity changed");
+    let start_id = info
+        .pbi_start_tvsec
+        .checked_mul(1_000_000)
+        .and_then(|seconds| seconds.checked_add(info.pbi_start_tvusec))
+        .ok_or_else(|| anyhow::anyhow!("kernel process birth overflow"))?;
+    // Darwin p_stat ABI: SZOMB is 5; sleeping and stopped processes remain writers.
+    Ok(Some(super::KernelProcessState {
+        start_id,
+        group: info.pbi_pgid,
+        writing: info.pbi_status != 5,
+    }))
+}
+
+pub(super) fn group_has_writers(group: u32) -> anyhow::Result<bool> {
+    use anyhow::Context as _;
+    let output = Command::new("ps")
+        .args(["-axo", "pid=,pgid=,state="])
+        .output()?;
+    anyhow::ensure!(output.status.success(), "process group enumeration failed");
+    let text = std::str::from_utf8(&output.stdout)?;
+    let mut observed = false;
+    for line in text.lines().filter(|line| !line.trim().is_empty()) {
+        let mut fields = line.split_whitespace();
+        let _: u32 = fields.next().context("process PID absent")?.parse()?;
+        let pgid: u32 = fields.next().context("process group absent")?.parse()?;
+        let state = fields.next().context("process state absent")?.as_bytes();
+        anyhow::ensure!(
+            !state.is_empty() && state[0].is_ascii_alphabetic() && fields.next().is_none(),
+            "invalid process group observation"
+        );
+        observed = true;
+        if pgid == group && state[0] != b'Z' {
+            return Ok(true);
+        }
+    }
+    anyhow::ensure!(observed, "empty process namespace observation");
+    Ok(false)
+}
+
 pub(super) use super::unix::{
     close_frozen_payload, configure_process_group, exec_command, kill_process_group,
     restore_environment_value, terminate_process_group,

@@ -1215,6 +1215,7 @@ mod tests {
                 .join(profile)
                 .join("sessions.json"),
         );
+        std::fs::create_dir_all(storage.sessions_path().parent().unwrap()).unwrap();
         let mut inst = make_inst(profile, "title");
         let on_disk = inst.clone();
         storage

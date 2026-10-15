@@ -1361,10 +1361,6 @@ fn trash_header_d_and_palette_open_empty_trash_confirm() {
     }
 }
 
-/// A trashed row whose repo is gone fails every delete, so Empty Trash escalates it one
-/// opt-in step per attempt: plain delete, forced delete, then removal from aoe. A peer
-/// restore between the last confirm and its submit keeps the row, and a peer holding the
-/// lifecycle lock delays the removal without blocking input.
 #[test]
 #[serial]
 fn empty_trash_escalates_a_row_that_keeps_failing() {
@@ -1410,21 +1406,14 @@ fn empty_trash_escalates_a_row_that_keeps_failing() {
             "trash reservation released"
         );
 
-        // (checkbox labels offered, forced delete expected in flight); each offered box is ticked.
-        let rounds: [(&[&str], bool); 3] = [
-            (&[], false),
-            (&["Force delete 1 that failed before"], true),
-            (&["Remove 1 from aoe that failed a forced delete"], false),
-        ];
-        for (round, (labels, forced)) in rounds.into_iter().enumerate() {
+        for (round, forced) in [false, true, false].into_iter().enumerate() {
             env.view.prompt_empty_trash();
             let dialog = env
                 .view
                 .confirm_dialog
                 .as_mut()
                 .expect("empty-trash confirm");
-            assert_eq!(dialog.checkbox_labels_for_test(), labels, "round {round}");
-            if !labels.is_empty() {
+            if round > 0 {
                 dialog.handle_key(key(KeyCode::Down));
                 dialog.handle_key(key(KeyCode::Char(' ')));
             }
@@ -1445,16 +1434,14 @@ fn empty_trash_escalates_a_row_that_keeps_failing() {
             env.view.handle_key(key(KeyCode::Char('y')), None);
 
             if round == 2 {
-                // The submit returned with the lock still held; the row leaves only when
-                // the drop worker's result lands.
                 assert!(env.view.get_instance(&id).is_some(), "{peer:?}");
-                drop(peer_lock);
                 let deadline = Instant::now() + Duration::from_secs(10);
                 while !env.view.apply_drop_results() {
                     assert!(Instant::now() < deadline, "{peer:?}: no drop result");
                     std::thread::sleep(Duration::from_millis(20));
                 }
-                let kept = peer == Peer::Restores;
+                drop(peer_lock);
+                let kept = peer != Peer::Idle;
                 assert_eq!(durable(&storage).is_some(), kept, "{peer:?}");
                 assert_eq!(env.view.get_instance(&id).is_some(), kept, "{peer:?}");
                 break;

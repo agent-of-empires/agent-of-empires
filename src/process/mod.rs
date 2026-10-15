@@ -216,6 +216,94 @@ pub fn exec_post_login_opencode_yolo() -> anyhow::Result<()> {
     Err(platform::exec_command(&mut command).into())
 }
 
+#[derive(
+    Debug, Clone, Copy, serde::Serialize, serde::Deserialize, PartialEq, Eq, PartialOrd, Ord,
+)]
+pub struct KernelProcessIdentity {
+    boot_id: uuid::Uuid,
+    start_id: u64,
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+struct KernelProcessState {
+    start_id: u64,
+    group: u32,
+    writing: bool,
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn kernel_boot_id() -> anyhow::Result<uuid::Uuid> {
+    static BOOT: std::sync::OnceLock<uuid::Uuid> = std::sync::OnceLock::new();
+    if let Some(boot) = BOOT.get() {
+        return Ok(*boot);
+    }
+    let text =
+        platform::boot_id().ok_or_else(|| anyhow::anyhow!("kernel boot identity unavailable"))?;
+    let boot = uuid::Uuid::parse_str(&text)?;
+    let _ = BOOT.set(boot);
+    Ok(boot)
+}
+
+pub(crate) fn kernel_process_identity(pid: u32) -> anyhow::Result<Option<KernelProcessIdentity>> {
+    anyhow::ensure!(
+        pid > 0 && pid <= i32::MAX as u32,
+        "invalid process identity PID"
+    );
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    {
+        let Some(state) = platform::kernel_process_state(pid)? else {
+            return Ok(None);
+        };
+        Ok(Some(KernelProcessIdentity {
+            boot_id: kernel_boot_id()?,
+            start_id: state.start_id,
+        }))
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    anyhow::bail!("kernel process identity unavailable on this platform")
+}
+
+pub(crate) fn process_group_has_writers(
+    pid: u32,
+    identity: Option<KernelProcessIdentity>,
+) -> anyhow::Result<bool> {
+    anyhow::ensure!(
+        pid > 0 && pid <= i32::MAX as u32,
+        "invalid process group PID"
+    );
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    {
+        if let Some(identity) = identity {
+            if identity.boot_id != kernel_boot_id()? {
+                return Ok(false);
+            }
+        }
+        if let Some(state) = platform::kernel_process_state(pid)? {
+            if state.writing {
+                let identity = identity.ok_or_else(|| {
+                    anyhow::anyhow!("live process group leader identity is unknown")
+                })?;
+                anyhow::ensure!(
+                    identity.start_id == state.start_id,
+                    "live process group leader identity changed"
+                );
+                if state.group == pid {
+                    return Ok(true);
+                }
+            }
+        }
+        if !worker::is_process_group_alive(pid) {
+            return Ok(false);
+        }
+        platform::group_has_writers(pid)
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        let _ = identity;
+        anyhow::bail!("process group writer proof unavailable on this platform")
+    }
+}
+
 /// Lower the child's scheduling and I/O priority where the OS supports it.
 pub(crate) fn throttle_child(cmd: &mut std::process::Command) {
     #[cfg(target_os = "macos")]
@@ -1312,6 +1400,30 @@ mod tests {
                 .collect::<Vec<_>>(),
             [30, 31]
         );
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn live_process_group_leader_requires_its_recorded_birth_identity() {
+        use std::os::unix::process::CommandExt as _;
+
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        let identity = kernel_process_identity(pid).unwrap().unwrap();
+        assert!(process_group_has_writers(pid, Some(identity)).unwrap());
+
+        let mut reused = identity;
+        reused.start_id += 1;
+        assert!(process_group_has_writers(pid, Some(reused)).is_err());
+        assert!(process_group_has_writers(pid, None).is_err());
+
+        child.kill().unwrap();
+        child.wait().unwrap();
+        assert!(!process_group_has_writers(pid, Some(identity)).unwrap());
     }
 
     #[cfg(target_os = "macos")]

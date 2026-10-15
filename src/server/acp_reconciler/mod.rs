@@ -115,7 +115,11 @@ fn due(last: &mut Option<Instant>, interval: Duration) -> bool {
 
 /// Structured and not archived, snoozed or trashed.
 fn is_untriaged_structured(i: &Instance) -> bool {
-    i.is_structured() && !i.is_archived() && !i.is_snoozed() && !i.is_trashed()
+    i.is_structured()
+        && i.status != crate::session::Status::Deleting
+        && !i.is_archived()
+        && !i.is_snoozed()
+        && !i.is_trashed()
 }
 
 /// Eligible for a reconciler-driven worker.
@@ -433,6 +437,9 @@ async fn readopt_orphan_runners(state: &Arc<AppState>, attempted: &mut HashSet<S
         if state.acp_supervisor.is_owned(id).await {
             continue;
         }
+        if crate::process::worker_registry::is_purge_fenced(id).unwrap_or(true) {
+            continue;
+        }
         if matches!(
             crate::process::worker_registry::load(id),
             Ok(Some(record)) if crate::process::worker_registry::is_record_live(&record)
@@ -462,10 +469,41 @@ impl Drop for OrphanCleanupClaim {
 
 /// Reaps registry entries whose session no longer exists.
 async fn sweep_orphan_workers(state: &Arc<AppState>, live: &HashSet<&String>) {
-    let Ok(records) = crate::process::worker_registry::list() else {
-        return;
+    use crate::process::worker_registry;
+    #[cfg(unix)]
+    let records = worker_registry::list_for_reaping();
+    #[cfg(not(unix))]
+    let records = worker_registry::list();
+    let records = match records {
+        Ok(records) => records,
+        Err(error) => {
+            tracing::warn!(target: "acp.supervisor", error = %error, "cannot enumerate orphan workers");
+            return;
+        }
     };
     for record in records {
+        #[cfg(unix)]
+        {
+            let tracked = match worker_registry::cleanup_dead_orphan_tracking(&record) {
+                Ok(worker_registry::OrphanTracking::Reclaimed) => continue,
+                Ok(worker_registry::OrphanTracking::Untracked) => false,
+                Ok(worker_registry::OrphanTracking::Pending) => true,
+                Err(error) => {
+                    tracing::warn!(target: "acp.supervisor", session = %record.session_id, error = %error, "cannot reclaim orphan tracking");
+                    continue;
+                }
+            };
+            if tracked
+                && state
+                    .instances
+                    .read()
+                    .await
+                    .iter()
+                    .any(|row| row.id == record.session_id)
+            {
+                continue;
+            }
+        }
         if live.contains(&record.session_id)
             || state.acp_supervisor.is_owned(&record.session_id).await
         {

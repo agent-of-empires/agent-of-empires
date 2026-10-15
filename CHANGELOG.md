@@ -4,6 +4,14 @@ All notable changes to Agent of Empires will be documented in this file.
 
 The format follows [Conventional Commits](https://www.conventionalcommits.org/).
 
+## Unreleased
+
+### Bug Fixes
+
+- **session:** Keep purge ownership across long hooks and suspend, make retained rollbacks visible to cached views, and preserve deletion recovery across profile renames and Force Remove. Kept checkpoints remain until every retained resource is proven reclaimed.
+- **session:** Keep noncreating profile and effective-config reads side-effect-free under transition locks while preserving genuine first-run bootstrap.
+- **process:** Track self-cleaned runner groups durably, verify kernel birth before purge signals, and distinguish zombies from live descendants and surviving threads without deleting unknown or successor artifacts.
+
 ## [1.19.0](https://github.com/agent-of-empires/agent-of-empires/releases/tag/v1.19.0) - 2026-10-08
 
 

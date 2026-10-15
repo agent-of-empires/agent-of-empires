@@ -250,7 +250,7 @@ impl<S: BroadcastSink> Supervisor<S> {
                 && claim.attempts > TEARDOWN_RETRY_CAP
                 && claim
                     .identity
-                    .is_none_or(|identity| !self.process_control.is_alive(identity))
+                    .is_some_and(|identity| !self.process_control.is_alive(identity))
             {
                 warn!(
                     target: "acp.supervisor",
@@ -1596,5 +1596,36 @@ mod tests {
             AcpWorkerState::Stopping,
             "unreadable ownership evidence cannot prove native settlement"
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    #[serial_test::serial]
+    async fn a_lost_teardown_driver_requires_the_registry_runner_to_be_dead_past_the_retry_cap() {
+        let _home = isolate_home();
+        let control = Arc::new(FakeProcessControl::default());
+        control.immortal(5758);
+        let sup = Supervisor::new(VecSink::new()).with_process_control(control.clone());
+        save_record("s-no-identity", 5758, 5);
+        lock_recover(&sup.lifecycle).adopt_for_stop("s-no-identity");
+
+        for _ in 0..=TEARDOWN_RETRY_CAP {
+            lock_recover(&sup.lifecycle).age_stopping("s-no-identity", TEARDOWN_ORPHAN_GRACE);
+            sup.retry_pending_teardowns().await;
+            assert_eq!(
+                sup.worker_state("s-no-identity").await,
+                AcpWorkerState::Stopping,
+                "missing cached identity cannot prove the registry runner stopped"
+            );
+        }
+        assert!(worker_registry::load("s-no-identity").unwrap().is_some());
+
+        control.exit(5758);
+        lock_recover(&sup.lifecycle).age_stopping("s-no-identity", TEARDOWN_ORPHAN_GRACE);
+        sup.retry_pending_teardowns().await;
+        assert_eq!(
+            sup.worker_state("s-no-identity").await,
+            AcpWorkerState::Absent
+        );
+        assert!(worker_registry::load("s-no-identity").unwrap().is_none());
     }
 }
