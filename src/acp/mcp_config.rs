@@ -86,10 +86,6 @@ fn expand_env_references<'a>(
     let mut has_unresolved_reference = false;
     while let Some(relative_start) = value[cursor..].find("${") {
         let start = cursor + relative_start;
-        if start > 0 && value.as_bytes()[start - 1] == b'$' {
-            cursor = start + 2;
-            continue;
-        }
         let name_start = start + 2;
         let Some(relative_end) = value[name_start..].find('}') else {
             break;
@@ -302,6 +298,22 @@ mod tests {
     }
 
     #[test]
+    fn expands_reference_after_a_literal_dollar() {
+        let request = new_session_request(
+            r#"{"mcpServers":{"remote":{"type":"http","url":"https://mcp.invalid","headers":{"Authorization":"Bearer $${GITHUB_TOKEN}"}}}}"#,
+            McpProvenance::Profile {
+                name: "work".into(),
+            },
+            &[("GITHUB_TOKEN".into(), "synthetic-token".into())],
+        );
+
+        assert_eq!(
+            request["mcpServers"][0]["headers"][0]["value"],
+            "Bearer $synthetic-token"
+        );
+    }
+
+    #[test]
     fn unresolved_authorization_is_omitted_but_server_and_other_placeholders_remain() {
         let request = new_session_request(
             r#"{"mcpServers":{"remote":{"type":"http","url":"https://mcp.invalid","headers":{"Authorization":"Bearer ${GITHUB_TOKEN}","X-Reference":"${MISSING}"}}}}"#,
@@ -315,6 +327,24 @@ mod tests {
             serde_json::json!([{
                 "name": "X-Reference",
                 "value": "${MISSING}"
+            }])
+        );
+    }
+
+    #[test]
+    fn unresolved_authorization_after_a_literal_dollar_is_omitted() {
+        let request = new_session_request(
+            r#"{"mcpServers":{"remote":{"type":"http","url":"https://mcp.invalid","headers":{"Authorization":"Bearer $${GITHUB_TOKEN}","X-Reference":"$${MISSING}"}}}}"#,
+            McpProvenance::Global,
+            &[],
+        );
+
+        assert_eq!(request["mcpServers"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            request["mcpServers"][0]["headers"],
+            serde_json::json!([{
+                "name": "X-Reference",
+                "value": "$${MISSING}"
             }])
         );
     }
