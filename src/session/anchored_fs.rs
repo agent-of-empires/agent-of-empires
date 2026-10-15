@@ -687,7 +687,8 @@ mod tests {
         let (target, staging) = (Path::new("conv.jsonl"), Path::new("conv.jsonl.aoe-carry"));
 
         // (case, published, target, conflict, prev)
-        let cases: [(&str, bool, &[u8], Option<&[u8]>, Option<&[u8]>); 6] = [
+        type Case<'a> = (&'a str, bool, &'a [u8], Option<&'a [u8]>, Option<&'a [u8]>);
+        let cases: [Case; 6] = [
             ("untouched", true, b"carry\n", None, None),
             ("changed before", false, b"live\n", None, None),
             (
