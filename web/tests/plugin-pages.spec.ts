@@ -187,6 +187,9 @@ test.describe("Plugin pages (#4460)", () => {
     );
     await page.route("**/api/theme/current", (r) => r.fulfill({ json: theme("day", "light", "#ffffff") }));
     await page.route("**/api/themes/night", (r) => r.fulfill({ json: theme("night", "dark", "#000000") }));
+    // The worker-shaped rows, not the wider /api/sessions ones.
+    const summary = { id: "sess-a", title: "Ethiopians", project_path: "/tmp/agent-of-empires", status: "Idle" };
+    await page.route("**/api/plugins/acme.kit/sessions", (r) => r.fulfill({ json: { sessions: [summary] } }));
     const actionBodies: unknown[] = [];
     await page.route("**/api/plugins/*/action", (r) => {
       actionBodies.push({ url: new URL(r.request().url()).pathname, body: r.request().postDataJSON() });
@@ -217,7 +220,7 @@ test.describe("Plugin pages (#4460)", () => {
       },
       { aoeBridge: 1, event: "theme", data: { appearance: "light", cssVars: { "--color-surface-900": "#ffffff" } } },
     ]);
-    expect((results.sessions.result as { id: string }[]).map((s) => s.id)).toEqual(["sess-a"]);
+    expect(results.sessions.result).toEqual([summary]);
     expect(results.uiState.result).toEqual({ entries: [], notifications: [], pages: [PAGE] });
     expect(results.action).toEqual({ aoeBridge: 1, id: 4, result: { baselineRevision: 3 } });
     expect(actionBodies).toEqual([

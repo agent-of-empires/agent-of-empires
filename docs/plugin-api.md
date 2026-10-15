@@ -345,7 +345,7 @@ A request is `{ "aoeBridge": 1, "id", "method", "params"? }`, where `id` is a nu
 | Method | Params | Requires | Result |
 |---|---|---|---|
 | `ready` | `{ "nonce" }` | none | `null`, then the `context` and `theme` pushes |
-| `sessions.list` | none | `session.read` | The `sessions` array of `GET /api/sessions` |
+| `sessions.list` | none | `session.read` | The sessions, in the rows a worker's [`sessions.list`](#session-listing) returns |
 | `plugins.uiState` | none | `session.read` | The `GET /api/plugins/ui-state` body, including other plugins' entries |
 | `action` | `{ "method", "params"?, "sessionId"? }` | not read-only or CityHall | `{ "baselineRevision" }`; the call goes to this plugin's own worker, as a [pane action](#pane-actions) does |
 | `openSession` | `{ "id" }` | none | `null`; the dashboard navigates to the session |

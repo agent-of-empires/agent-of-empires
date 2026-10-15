@@ -19,6 +19,7 @@ use crate::plugin::install::OperationLog;
 use crate::server::auth::{handler_elevated, AuthenticatedSession, LoopbackTrusted};
 
 const CAP_COMPOSER_READ: &str = "composer.read";
+const CAP_SESSION_READ: &str = "session.read";
 
 /// Resolve the read-only and elevation gates shared by every mutation.
 /// Elevation goes through `handler_elevated`, so a loopback-trusted caller
@@ -356,6 +357,30 @@ pub async fn plugin_details(Query(query): Query<DetailsQuery>) -> Response {
     }
 }
 
+/// `GET /api/plugins/{id}/sessions`: the sessions a page bridge serves an
+/// active plugin declaring `session.read`, in the rows its worker's
+/// `sessions.list` returns rather than the wider `GET /api/sessions` rows.
+pub async fn plugin_sessions(
+    State(state): State<std::sync::Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Response {
+    if !active_plugin_declares(&id, CAP_SESSION_READ) {
+        return api_error(
+            StatusCode::FORBIDDEN,
+            "capability_denied",
+            format!("Plugin {id} does not declare {CAP_SESSION_READ}"),
+        );
+    }
+    let instances = state.instances.read().await;
+    // Same scope as `GET /api/sessions`: CityHall sees only structured sessions.
+    let sessions: Vec<_> = instances
+        .iter()
+        .filter(|inst| !state.cityhall_mode || inst.is_structured())
+        .map(plugin::host_api::session_summary)
+        .collect();
+    Json(json!({ "sessions": sessions })).into_response()
+}
+
 #[derive(Deserialize)]
 pub struct PluginActionBody {
     /// The worker method to invoke (the plugin names it in its UI action
@@ -534,17 +559,20 @@ pub async fn invoke_plugin_command(
     }
 }
 
-fn strip_composer_snapshot_without_capability(plugin_id: &str, params: &mut serde_json::Value) {
-    let can_read = plugin::registry()
+fn active_plugin_declares(plugin_id: &str, capability: &str) -> bool {
+    plugin::registry()
         .get(plugin_id)
         .filter(|p| p.active())
         .is_some_and(|p| {
             p.manifest
                 .capabilities
                 .iter()
-                .any(|cap| cap.as_str() == CAP_COMPOSER_READ)
-        });
-    if can_read {
+                .any(|cap| cap.as_str() == capability)
+        })
+}
+
+fn strip_composer_snapshot_without_capability(plugin_id: &str, params: &mut serde_json::Value) {
+    if active_plugin_declares(plugin_id, CAP_COMPOSER_READ) {
         return;
     }
     if let serde_json::Value::Object(map) = params {
@@ -1511,5 +1539,65 @@ id = "voice"
         strip_composer_snapshot_without_capability(plain_id, &mut plain_params);
         assert!(plain_params.get("composer").is_none());
         assert_eq!(plain_params.get("other"), Some(&json!(true)));
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn plugin_sessions_serve_worker_rows_only_with_session_read() {
+        use tower::ServiceExt;
+        let _app_dir = AppDirEnvGuard::new();
+        let reader_caps = ["runtime.worker", CAP_SESSION_READ];
+        let plain_caps = ["runtime.worker"];
+        let mut config = Config::default();
+        for (dir, id, caps) in [
+            ("reader", "dev.example.reader", &reader_caps[..]),
+            ("plain", "dev.example.plain", &plain_caps[..]),
+        ] {
+            let hash = write_plugin_manifest(dir, id, caps);
+            config.plugins.insert(
+                id.to_string(),
+                PluginConfig {
+                    grant: Some(CapabilityGrant {
+                        manifest_hash: hash,
+                        capabilities: caps.iter().map(|cap| cap.to_string()).collect(),
+                        granted_at: chrono::Utc::now(),
+                    }),
+                    ..PluginConfig::default()
+                },
+            );
+        }
+        update_config(|c| *c = config).expect("save config");
+        crate::plugin::reload_registry();
+
+        let inst = crate::session::Instance::new("alpha", "/tmp/alpha");
+        let expected = json!([crate::plugin::host_api::session_summary(&inst)]);
+        let state = crate::server::test_support::build_test_app_state(vec![inst]);
+        let app = crate::server::test_support::build_router_for_test(state);
+        let get =
+            |path: &str| {
+                let mut req = axum::http::Request::get(path)
+                    .header("host", "127.0.0.1")
+                    .body(axum::body::Body::empty())
+                    .unwrap();
+                req.extensions_mut().insert(axum::extract::ConnectInfo(
+                    std::net::SocketAddr::from(([127, 0, 0, 1], 5555)),
+                ));
+                app.clone().oneshot(req)
+            };
+
+        let resp = get("/api/plugins/dev.example.reader/sessions")
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["sessions"], expected);
+
+        for id in ["dev.example.plain", "dev.example.absent"] {
+            let resp = get(&format!("/api/plugins/{id}/sessions")).await.unwrap();
+            assert_eq!(resp.status(), StatusCode::FORBIDDEN, "{id}");
+        }
     }
 }

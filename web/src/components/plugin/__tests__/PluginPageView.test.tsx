@@ -16,7 +16,7 @@ const h = vi.hoisted(() => ({
 vi.mock("../../../lib/pluginUiContext", () => ({ usePluginPages: () => h.pages }));
 vi.mock("../../../lib/api", () => ({
   mintPluginPageTicket: (page: PluginPage) => h.mint(page),
-  fetchSessions: () => h.sessions(),
+  fetchPluginSessions: (pluginId: string) => h.sessions(pluginId),
   fetchPluginUiState: vi.fn(),
   invokePluginAction: (...args: unknown[]) => h.action(...args),
 }));
@@ -112,7 +112,7 @@ describe("PluginPageView", () => {
   });
 
   it("hands the channel only to its own frame's ready, then serves requests over it", async () => {
-    h.sessions.mockResolvedValue({ sessions: [{ id: "s" }], workspace_ordering: [] });
+    h.sessions.mockResolvedValue({ sessions: [{ id: "s" }] });
     const { send, nonce } = await openFrame();
     const foreign = fakePort();
     await send({ aoeBridge: 1, id: 1, method: "ready", params: { nonce } }, [foreign.port], window);
@@ -128,7 +128,7 @@ describe("PluginPageView", () => {
 
     await request({ aoeBridge: 1, id: 3, method: "sessions.list" });
     await waitFor(() => expect(port.postMessage).toHaveBeenCalledWith({ aoeBridge: 1, id: 3, result: [{ id: "s" }] }));
-    expect(h.sessions).toHaveBeenCalledTimes(1);
+    expect(h.sessions.mock.calls).toEqual([["acme.kit"]]);
   });
 
   it("hands the channel only to a ready that echoes this opening's nonce", async () => {

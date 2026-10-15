@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useRef, useState, type ReactNode } from "react";
 import {
   fetchPluginUiState,
-  fetchSessions,
+  fetchPluginSessions,
   invokePluginAction,
   mintPluginPageTicket,
   type PluginPage,
@@ -45,7 +45,7 @@ async function runCall(call: BridgeCall, pluginId: string): Promise<unknown> {
     case "ready":
       return null;
     case "sessions.list": {
-      const reply = await fetchSessions();
+      const reply = await fetchPluginSessions(pluginId);
       if (!reply) throw new Error("sessions unavailable");
       return reply.sessions;
     }

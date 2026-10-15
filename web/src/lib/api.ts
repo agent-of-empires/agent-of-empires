@@ -708,6 +708,11 @@ export interface PluginUiState {
   revisions?: Record<string, Record<string, number>>;
 }
 
+/** A plugin's sessions in its worker's `sessions.list` row shape; null unless it declares `session.read`. */
+export function fetchPluginSessions(pluginId: string): Promise<{ sessions: Record<string, unknown>[] } | null> {
+  return fetchJson(`/api/plugins/${encodeURIComponent(pluginId)}/sessions`);
+}
+
 export function fetchPluginUiState(): Promise<PluginUiState | null> {
   return fetchJson<PluginUiState>("/api/plugins/ui-state");
 }
