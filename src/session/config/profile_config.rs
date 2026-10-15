@@ -776,7 +776,7 @@ mod tests {
         // Writes the way the TUI does: only the leaves changed since it opened.
         let second = std::thread::spawn(move || {
             let baseline = json!({});
-            let edited = json!({"diff": {"split_view": false}});
+            let edited = json!({"sound": {"on_error": "alert"}});
             started_tx.send(()).unwrap();
             update_profile_config("work", |p| {
                 let mut fresh = serde_json::to_value(&*p)?;
@@ -795,7 +795,7 @@ mod tests {
 
         let saved = load_profile_config("work").unwrap();
         assert_eq!(saved.overrides["sound"]["enabled"], json!(true));
-        assert_eq!(saved.overrides["diff"]["split_view"], json!(false));
+        assert_eq!(saved.overrides["sound"]["on_error"], json!("alert"));
     }
 
     #[test]
