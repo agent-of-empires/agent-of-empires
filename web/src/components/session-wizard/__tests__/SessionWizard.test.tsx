@@ -590,4 +590,25 @@ describe("SessionWizard Docker readiness", () => {
     expect(await screen.findByText(/Sandbox unavailable: Docker is not running/)).toBeTruthy();
     expect(createSession).not.toHaveBeenCalled();
   });
+
+  it("re-holds Launch when a profile switch turns the sandbox on while the probe is pending", async () => {
+    const answer = pendingProbe();
+    vi.mocked(fetchProfiles).mockResolvedValue([
+      { name: "default", is_default: true },
+      { name: "work", is_default: false },
+    ]);
+    vi.mocked(fetchSettings).mockImplementation((async (profile?: string) =>
+      profile === "work" ? { sandbox: { enabled_by_default: true } } : {}) as never);
+    renderWizard();
+    await waitFor(() => expect(launchButton().disabled).toBe(false));
+
+    fireEvent.click(await screen.findByText("Profile"));
+    fireEvent.click(screen.getByRole("radio", { name: /work/ }));
+    const sandbox = () => screen.getByRole("switch", { name: "Run in a safe container" });
+    await waitFor(() => expect(sandbox().getAttribute("aria-checked")).toBe("true"));
+    expect(launchButton().disabled).toBe(true);
+
+    answer(true);
+    await waitFor(() => expect(launchButton().disabled).toBe(false));
+  });
 });
