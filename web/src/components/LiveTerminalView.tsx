@@ -236,16 +236,25 @@ export function LiveTerminalView({ session, active = true, surface = "agent", te
     });
   }, [session.id, surface, terminalIndex]);
 
-  // Stop then Start leaves a dead pane's closed socket behind; re-ensure on the Start edge only, so a
-  // crash-looping agent cannot retrigger it.
-  const wasActiveRef = useRef({ id: session.id, active: isSessionActive(session.status) });
+  // Stop then Start leaves a dead pane's closed socket behind. Latch the Start edge until the 4001 close
+  // arrives (either order), consume it once so a crash-looping agent cannot retrigger it, and drop it
+  // once a socket is healthy so a later exit is not auto-restarted.
+  const prevStatusRef = useRef({ id: session.id, active: isSessionActive(session.status) });
+  const startedRef = useRef(false);
   const sessionActive = isSessionActive(session.status);
-  const { paneDead } = live.state;
+  const { paneDead, connected } = live.state;
   useEffect(() => {
-    const prev = wasActiveRef.current;
-    wasActiveRef.current = { id: session.id, active: sessionActive };
-    if (surface === "agent" && paneDead && prev.id === session.id && !prev.active && sessionActive) retryEnsure();
-  }, [session.id, sessionActive, paneDead, surface, retryEnsure]);
+    const prev = prevStatusRef.current;
+    prevStatusRef.current = { id: session.id, active: sessionActive };
+    if (prev.id !== session.id) startedRef.current = false;
+    else if (!prev.active && sessionActive) startedRef.current = true;
+    if (connected) startedRef.current = false;
+    // eslint-disable-next-line react-you-might-not-need-an-effect/no-event-handler
+    if (surface === "agent" && paneDead && startedRef.current) {
+      startedRef.current = false;
+      retryEnsure();
+    }
+  }, [session.id, sessionActive, paneDead, connected, surface, retryEnsure]);
 
   // Focus/blur MUST be first in the handler so iOS keeps the user-gesture
   // chain and actually shows the keyboard.
