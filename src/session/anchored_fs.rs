@@ -3,14 +3,14 @@
 use anyhow::{bail, Context, Result};
 use nix::dir::Dir;
 use nix::errno::Errno;
-use nix::fcntl::{open, openat, renameat, AtFlags, OFlag};
+use nix::fcntl::{open, openat, AtFlags, OFlag};
 use nix::sys::stat::{fstat, fstatat, mkdirat, FileStat, Mode};
 use nix::unistd::{linkat, unlinkat, UnlinkatFlags};
-use std::ffi::OsString;
+use std::ffi::{CString, OsStr, OsString};
 use std::fs::File;
 use std::io::Read;
-use std::os::fd::OwnedFd;
-use std::os::unix::ffi::OsStringExt;
+use std::os::fd::{AsRawFd, OwnedFd};
+use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::{Component, Path, PathBuf};
 
 pub(crate) struct AnchoredDir {
@@ -262,8 +262,8 @@ impl AnchoredDir {
     }
 
     /// Publish the staging file `from` at `to` and drop the staging name.
-    /// `false` means something was already at `to` and was left untouched,
-    /// which only happens when `replace` is unset.
+    /// `false` means `to` was left untouched: something was already there
+    /// (no `replace`), or it changed after `replace` was observed.
     ///
     /// Makes a file visible only once it is complete, so a process killed
     /// mid-write leaves a staging name rather than a half file under the real
@@ -272,18 +272,28 @@ impl AnchoredDir {
     /// existence check and this call would lose its file.
     /// `renameat2(RENAME_NOREPLACE)` would also answer, but it is Linux-only
     /// and this has to hold on macOS.
-    pub(crate) fn publish_staged(&self, from: &Path, to: &Path, replace: bool) -> Result<bool> {
+    ///
+    /// `replace` is the modification time the caller saw on `to`. The two names
+    /// are exchanged and the displaced file is checked against it; if a writer
+    /// got in first it is swapped back, so no copy is ever unlinked unseen.
+    pub(crate) fn publish_staged(
+        &self,
+        from: &Path,
+        to: &Path,
+        replace: Option<std::time::SystemTime>,
+    ) -> Result<bool> {
         let (from_parent, from_leaf) = self.open_parent(from)?;
         let (to_parent, to_leaf) = self.open_parent(to)?;
-        if replace {
-            renameat(
-                &from_parent,
-                from_leaf.as_os_str(),
-                &to_parent,
-                to_leaf.as_os_str(),
-            )
-            .context("replacing anchored file")?;
-            return Ok(true);
+        if let Some(observed) = replace {
+            exchange(&from_parent, &from_leaf, &to_parent, &to_leaf)
+                .context("replacing anchored file")?;
+            let unchanged = self.regular_modified(from)? == Some(observed);
+            if !unchanged {
+                exchange(&from_parent, &from_leaf, &to_parent, &to_leaf)
+                    .context("restoring anchored file")?;
+            }
+            self.remove_file(from)?;
+            return Ok(unchanged);
         }
         let published = match linkat(
             &from_parent,
@@ -539,6 +549,43 @@ fn normal_components(path: &Path) -> Result<Vec<std::ffi::OsString>> {
     Ok(result)
 }
 
+/// Atomically swap two directory entries.
+fn exchange(
+    from_parent: &OwnedFd,
+    from_leaf: &OsStr,
+    to_parent: &OwnedFd,
+    to_leaf: &OsStr,
+) -> Result<()> {
+    let from = CString::new(from_leaf.as_bytes())?;
+    let to = CString::new(to_leaf.as_bytes())?;
+    let (from_fd, to_fd) = (from_parent.as_raw_fd(), to_parent.as_raw_fd());
+    // SAFETY: both descriptors are open and both names are NUL-terminated
+    // strings that outlive the call.
+    #[cfg(target_os = "linux")]
+    let rc = unsafe {
+        libc::syscall(
+            libc::SYS_renameat2,
+            from_fd,
+            from.as_ptr(),
+            to_fd,
+            to.as_ptr(),
+            libc::RENAME_EXCHANGE,
+        )
+    };
+    // SAFETY: as above.
+    #[cfg(target_os = "macos")]
+    let rc = unsafe {
+        libc::renameatx_np(
+            from_fd,
+            from.as_ptr(),
+            to_fd,
+            to.as_ptr(),
+            libc::RENAME_SWAP,
+        )
+    };
+    Errno::result(rc).map(drop).map_err(Into::into)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -573,6 +620,54 @@ mod tests {
                 .identity()
                 .unwrap()
         );
+    }
+
+    /// A writer that updates the target after the caller read its mtime must
+    /// keep its copy; an untouched stale target is still replaced.
+    #[cfg(unix)]
+    #[test]
+    fn replace_publish_preserves_a_concurrently_written_target() {
+        use std::fs::FileTimes;
+        use std::time::{Duration, SystemTime};
+
+        let now = SystemTime::now();
+        let stale = now - Duration::from_secs(3600);
+        let set_mtime = |path: &Path, at: SystemTime| {
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(path)
+                .unwrap()
+                .set_times(FileTimes::new().set_modified(at))
+                .unwrap();
+        };
+        for (concurrent_write, published, expected) in [
+            (false, true, &b"carry\n"[..]),
+            (true, false, &b"live\n"[..]),
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let anchored = AnchoredDir::open(temp.path()).unwrap();
+            let (target, staging) = (Path::new("conv.jsonl"), Path::new("conv.jsonl.aoe-carry"));
+            std::fs::write(temp.path().join(target), b"old\n").unwrap();
+            set_mtime(&temp.path().join(target), stale);
+            let observed = anchored.regular_modified(target).unwrap().unwrap();
+            std::fs::write(temp.path().join(staging), b"carry\n").unwrap();
+            if concurrent_write {
+                std::fs::write(temp.path().join(target), b"live\n").unwrap();
+                set_mtime(&temp.path().join(target), now);
+            }
+
+            let result = anchored
+                .publish_staged(staging, target, Some(observed))
+                .unwrap();
+
+            assert_eq!(result, published, "concurrent_write={concurrent_write}");
+            assert_eq!(
+                std::fs::read(temp.path().join(target)).unwrap(),
+                expected,
+                "concurrent_write={concurrent_write}"
+            );
+            assert!(!temp.path().join(staging).exists());
+        }
     }
 
     #[cfg(unix)]
