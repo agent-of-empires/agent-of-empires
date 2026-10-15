@@ -67,7 +67,31 @@ pub fn section_in_schema(section: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::session::config::settings_schema::{WebWritePolicy, WidgetKind};
+    use crate::session::config::settings_schema::{ValidationKind, WebWritePolicy, WidgetKind};
+
+    #[test]
+    fn notice_timeout_is_capped_below_the_browser_timer_limit() {
+        // The web dashboard passes this value to setTimeout in milliseconds,
+        // which overflows above 2^31 - 1 ms (#4475).
+        let d = descriptor("acp", "notice_timeout_secs").unwrap();
+        assert_eq!(
+            d.validation,
+            ValidationKind::RangeU64 {
+                min: 1,
+                max: Some(2_147_483),
+            }
+        );
+        assert!(crate::session::config::settings_schema::validate_value(
+            &d.validation,
+            &serde_json::json!(2_147_483)
+        )
+        .is_ok());
+        assert!(crate::session::config::settings_schema::validate_value(
+            &d.validation,
+            &serde_json::json!(2_147_484)
+        )
+        .is_err());
+    }
 
     #[test]
     fn schema_has_no_duplicate_paths() {

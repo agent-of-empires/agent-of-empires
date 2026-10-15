@@ -421,10 +421,15 @@ pub(super) async fn security_headers(
 ) -> axum::response::Response {
     let mut response = next.run(request).await;
     let headers = response.headers_mut();
-    headers.insert("x-frame-options", "DENY".parse().unwrap());
+    // The plugin page route sets its own frame and content policy.
+    headers
+        .entry("x-frame-options")
+        .or_insert("DENY".parse().unwrap());
     headers.insert("x-content-type-options", "nosniff".parse().unwrap());
     headers.insert("referrer-policy", "no-referrer".parse().unwrap());
-    headers.insert("content-security-policy", CSP.parse().unwrap());
+    headers
+        .entry("content-security-policy")
+        .or_insert(CSP.parse().unwrap());
     response
 }
 

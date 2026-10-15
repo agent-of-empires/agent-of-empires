@@ -34,6 +34,186 @@ mod platform {
     pub(super) fn kill_process_group(_: &std::process::Child) {}
 
     pub(super) fn terminate_process_group(_: &std::process::Child) {}
+    pub(super) fn restore_environment_value(
+        _: super::FrozenEnvironmentValue<String, Vec<u8>>,
+    ) -> std::io::Result<std::ffi::OsString> {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "frozen environments require Linux or macOS",
+        ))
+    }
+    pub(super) fn close_frozen_payload() -> std::io::Result<()> {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "frozen environments require Linux or macOS",
+        ))
+    }
+    pub(super) fn exec_command(_: &mut std::process::Command) -> std::io::Error {
+        std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "process replacement requires Linux or macOS",
+        )
+    }
+}
+
+pub(crate) const LIVE_PANE_ENV_KEYS: [&str; 3] = ["TERM", "TMUX", "TMUX_PANE"];
+
+#[derive(serde::Serialize, serde::Deserialize)]
+pub(crate) struct NativeLaunchPayload<T, E> {
+    pub(crate) argv: Vec<String>,
+    pub(crate) cwd: T,
+    pub(crate) environment: Vec<(E, E)>,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(untagged)]
+pub(crate) enum FrozenEnvironmentValue<T, B> {
+    Text(T),
+    Bytes(B),
+}
+
+pub(crate) fn frozen_environment_value(
+    value: &std::ffi::OsStr,
+) -> FrozenEnvironmentValue<&str, &[u8]> {
+    match value.to_str() {
+        Some(value) => FrozenEnvironmentValue::Text(value),
+        None => FrozenEnvironmentValue::Bytes(value.as_encoded_bytes()),
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod test_support {
+    thread_local! { static EXECUTABLE: std::cell::RefCell<Option<std::path::PathBuf>> = const { std::cell::RefCell::new(None) }; }
+    pub(crate) struct NativeLaunchExecutable;
+    impl NativeLaunchExecutable {
+        pub(crate) fn install(path: std::path::PathBuf) -> Self {
+            EXECUTABLE.with(|slot| {
+                assert!(slot.borrow().is_none());
+                *slot.borrow_mut() = Some(path);
+            });
+            Self
+        }
+    }
+    impl Drop for NativeLaunchExecutable {
+        fn drop(&mut self) {
+            EXECUTABLE.with(|slot| {
+                slot.borrow_mut().take();
+            });
+        }
+    }
+    pub(super) fn executable() -> Option<std::path::PathBuf> {
+        EXECUTABLE.with(|slot| slot.borrow().clone())
+    }
+}
+
+pub(crate) fn executable_for_native_launch() -> std::io::Result<std::path::PathBuf> {
+    #[cfg(test)]
+    if let Some(executable) = test_support::executable() {
+        return Ok(executable);
+    }
+    let executable = std::env::current_exe()?;
+    #[cfg(target_os = "linux")]
+    return linux::launch_executable(executable);
+    #[cfg(not(target_os = "linux"))]
+    Ok(executable)
+}
+
+fn read_native_launch_payload() -> anyhow::Result<(
+    NativeLaunchPayload<String, FrozenEnvironmentValue<String, Vec<u8>>>,
+    usize,
+)> {
+    use anyhow::Context;
+    let file = std::fs::File::open("/dev/fd/4").context("opening native launch descriptor")?;
+    let payload = serde_json::from_reader::<
+        _,
+        NativeLaunchPayload<String, FrozenEnvironmentValue<String, Vec<u8>>>,
+    >(file);
+    platform::close_frozen_payload().context("closing native launch descriptor")?;
+    let payload = payload.context("reading native launch descriptor")?;
+    let program_at = payload
+        .argv
+        .iter()
+        .position(|word| {
+            !word
+                .split_once('=')
+                .is_some_and(|(key, _)| crate::session::environment::is_valid_env_key(key))
+        })
+        .context("native launch program is missing")?;
+    anyhow::ensure!(
+        !payload.argv[program_at].is_empty(),
+        "native launch program is empty"
+    );
+    Ok((payload, program_at))
+}
+
+#[doc(hidden)]
+pub fn exec_frozen_environment() -> anyhow::Result<()> {
+    let (payload, program_at) = read_native_launch_payload()?;
+    let mut command = Command::new(&payload.argv[program_at]);
+    command
+        .args(&payload.argv[program_at + 1..])
+        .current_dir(payload.cwd)
+        .env_clear();
+    for (key, value) in payload.environment {
+        command.env(
+            platform::restore_environment_value(key)?,
+            platform::restore_environment_value(value)?,
+        );
+    }
+    for key in LIVE_PANE_ENV_KEYS {
+        command.env_remove(key);
+        if let Some(value) = std::env::var_os(key) {
+            command.env(key, value);
+        }
+    }
+    for assignment in &payload.argv[..program_at] {
+        let (key, value) = assignment.split_once('=').unwrap();
+        command.env(key, value);
+    }
+    Err(platform::exec_command(&mut command).into())
+}
+
+#[doc(hidden)]
+pub fn exec_post_login_opencode_yolo() -> anyhow::Result<()> {
+    use anyhow::Context;
+    let (payload, program_at) = read_native_launch_payload()?;
+    let mut command = Command::new(&payload.argv[program_at]);
+    command
+        .current_dir(payload.cwd)
+        .env_clear()
+        .envs(std::env::vars_os());
+    for (key, value) in payload.environment {
+        command.env(
+            platform::restore_environment_value(key)?,
+            platform::restore_environment_value(value)?,
+        );
+    }
+    for assignment in &payload.argv[..program_at] {
+        let (key, value) = assignment.split_once('=').unwrap();
+        command.env(key, value);
+    }
+    let agent =
+        crate::agents::get_agent("opencode").context("OpenCode agent definition is missing")?;
+    let generation = crate::agents::agent_generation_for(agent, &command);
+    command.args(&payload.argv[program_at + 1..]);
+    match agent
+        .yolo
+        .as_ref()
+        .and_then(|mode| mode.resolve(generation))
+    {
+        Some(crate::agents::YoloMode::CliFlag(flag)) => {
+            command.arg(flag);
+        }
+        Some(crate::agents::YoloMode::EnvVar(key, value)) => {
+            command.env(key, value);
+        }
+        Some(crate::agents::YoloMode::AlwaysYolo) => {}
+        Some(crate::agents::YoloMode::EitherGeneration { .. }) => {
+            anyhow::bail!("unresolved OpenCode approval mechanism")
+        }
+        None => eprintln!("OpenCode --help did not establish a generation; YOLO was not applied"),
+    }
+    Err(platform::exec_command(&mut command).into())
 }
 
 /// Lower the child's scheduling and I/O priority where the OS supports it.
@@ -62,6 +242,39 @@ pub mod runner;
 
 const WAIT_POLL_INTERVAL: Duration = Duration::from_millis(25);
 const PROCESS_GROUP_TERMINATION_GRACE: Duration = Duration::from_millis(250);
+
+pub(crate) fn spawn_process_group(command: &mut Command) -> std::io::Result<Child> {
+    platform::configure_process_group(command);
+    command.spawn()
+}
+
+/// Keep the owned leader unreaped until the last group signal, reserving its PID.
+pub(crate) fn terminate_and_reap_process_group(
+    child: &mut Child,
+    grace: Duration,
+) -> std::io::Result<()> {
+    platform::terminate_process_group(child);
+    std::thread::sleep(grace);
+    platform::kill_process_group(child);
+    let _ = child.kill();
+    let deadline = Instant::now() + Duration::from_secs(1);
+    let mut poll = Duration::from_millis(1);
+    loop {
+        if child.try_wait()?.is_some() {
+            return Ok(());
+        }
+        let now = Instant::now();
+        if now >= deadline {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "terminated process group leader could not be reaped",
+            ));
+        }
+        std::thread::sleep(poll.min(deadline.saturating_duration_since(now)));
+        poll = (poll * 2).min(WAIT_POLL_INTERVAL);
+    }
+}
+
 /// Atomically publish a directory entry without replacing an existing entry.
 /// Both names are relative to retained directory descriptors; there is no
 /// check-then-rename fallback on platforms without an exclusive rename syscall.
@@ -1518,31 +1731,41 @@ mod tests {
 
     #[test]
     #[cfg(any(target_os = "linux", target_os = "macos"))]
-    fn run_with_timeout_process_group_kills_descendants() {
-        let tmp = tempfile::tempdir().unwrap();
-        let pid_path = tmp.path().join("descendant.pid");
-        let term_path = tmp.path().join("terminated");
+    fn process_group_timeout_terminates_then_kills_descendants() {
+        use std::io::BufRead as _;
+
+        // The descendant ignores SIGTERM and prints its PID only once it does, so
+        // only the escalation can end it.
         let mut cmd = Command::new("sh");
         cmd.args([
             "-c",
-            "trap 'printf term > \"$2\"' TERM; sleep 10 & child=$!; printf %s \"$child\" > \"$1\"; wait",
-            "sh",
+            "sh -c 'trap \"\" TERM; echo $$; exec sleep 600' & wait",
         ])
-        .arg(&pid_path)
-        .arg(&term_path);
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+        platform::configure_process_group(&mut cmd);
+        let mut child = cmd.spawn().unwrap();
+        let mut line = String::new();
+        std::io::BufReader::new(child.stdout.take().unwrap())
+            .read_line(&mut line)
+            .expect("descendant should publish its pid");
+        let pid: i32 = line.trim().parse().unwrap();
 
-        let result = run_with_timeout_process_group(&mut cmd, Duration::from_secs(2)).unwrap();
-        assert!(result.is_none(), "process group should time out");
-        assert_eq!(
-            std::fs::read_to_string(term_path).expect("SIGTERM trap should run"),
-            "term",
-            "the process-group leader must receive SIGTERM before escalation"
-        );
+        let status =
+            wait_with_timeout_inner(&mut child, Duration::from_millis(400), true, None).unwrap();
+        assert!(status.is_none(), "process group should time out");
+        // Linux fixes the exit signal when the first fatal signal is sent, so the
+        // later SIGKILL cannot mask a SIGTERM the leader already received.
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::unix::process::ExitStatusExt;
+            assert_eq!(
+                child.try_wait().unwrap().unwrap().signal(),
+                Some(libc::SIGTERM),
+                "the process-group leader must receive SIGTERM before escalation"
+            );
+        }
 
-        let pid: i32 = std::fs::read_to_string(pid_path)
-            .expect("shell should publish descendant pid")
-            .parse()
-            .unwrap();
         let process_is_running = |pid: i32| {
             let output = Command::new("ps")
                 .args(["-o", "stat=", "-p", &pid.to_string()])
@@ -1553,13 +1776,13 @@ mod tests {
                 && !state.trim().is_empty()
                 && !state.trim_start().starts_with('Z')
         };
-        let deadline = Instant::now() + Duration::from_secs(1);
+        let deadline = Instant::now() + Duration::from_secs(10);
         while process_is_running(pid) && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(10));
         }
         assert!(
             !process_is_running(pid),
-            "descendant must be exited or a terminated zombie after the timeout"
+            "descendant must be exited or a killed zombie after the timeout"
         );
     }
 

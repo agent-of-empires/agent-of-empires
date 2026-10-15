@@ -76,6 +76,18 @@ pub struct AddArgs {
     #[arg(short = 'b', long = "new-branch")]
     create_branch: bool,
 
+    /// Use a generated civilization name as the session title and as the
+    /// `{branch}` value of the worktree path template, instead of the branch
+    /// name (use with --worktree). The git branch stays as given. Attaching
+    /// to an existing worktree keeps its directory and only generates the
+    /// title. Cannot be combined with --title, --repo or --project.
+    #[arg(
+        long = "generated-name",
+        requires = "worktree_branch",
+        conflicts_with = "title"
+    )]
+    generated_name: bool,
+
     /// Branch to base the new worktree branch on (use with --new-branch).
     /// Defaults to the repository's default branch. Useful for stacking
     /// work on top of an in-flight PR branch, hot-fixing a release
@@ -212,6 +224,14 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
         bail!("--repo-base requires --worktree to specify a branch\nTip: aoe add /path --project repoB -w branch-name --repo-base repoB=develop");
     }
 
+    if args.generated_name && explicit_worktree_branch(&args).is_none() {
+        bail!("--generated-name requires --worktree with a non-empty branch name");
+    }
+
+    if args.generated_name && (!args.extra_repos.is_empty() || !args.projects.is_empty()) {
+        bail!("--generated-name does not apply to multi-repo workspaces: their directory comes from workspace_path_template, not the title");
+    }
+
     let resolved_project_paths: Vec<PathBuf> = if args.projects.is_empty() {
         Vec::new()
     } else {
@@ -237,7 +257,9 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
 
     let storage = Storage::new_unwatched(profile)?;
     let (instances, _groups) = storage.load_with_groups()?;
-    let final_title = resolve_session_title(&args, &instances)?;
+    let worktree_session_id = uuid::Uuid::new_v4().to_string()[..8].to_string();
+    let final_title =
+        resolve_session_title(&args, &instances, &path, &config, &worktree_session_id)?;
 
     let mut resolved_tool = resolve_tool_for_add(&args, &config)?;
 
@@ -378,17 +400,7 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
             let git_wt =
                 GitWorktree::new(main_repo_path.clone())?.with_init_submodules(init_submodules);
 
-            let attach_existing = !args.create_branch;
-            let existing_match = if attach_existing {
-                git_wt.list_worktrees().ok().and_then(|wts| {
-                    wts.into_iter()
-                        .find(|wt| wt.branch.as_deref() == Some(branch))
-                })
-            } else {
-                None
-            };
-
-            if let Some(existing) = existing_match {
+            if let Some(existing) = existing_worktree_for_branch(&git_wt, &args, branch) {
                 println!(
                     "Attaching to existing worktree: {}",
                     existing.path.display()
@@ -402,23 +414,17 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
                     base_branch: None,
                 });
             } else {
-                let session_id = uuid::Uuid::new_v4().to_string();
-                let session_id_short = &session_id[..8];
-
-                let template = if GitWorktree::is_bare_repo(&main_repo_path) {
-                    &config.worktree.bare_repo_path_template
-                } else {
-                    &config.worktree.path_template
-                };
+                let template = worktree_path_template(&config, &main_repo_path);
                 let leaf_seed_owned;
-                let leaf_seed = if config.session.tie_workdir_to_name {
+                let leaf_seed = if config.session.tie_workdir_to_name || args.generated_name {
                     leaf_seed_owned =
                         crate::session::worktree_edit::worktree_leaf_from_title(&final_title);
                     leaf_seed_owned.as_str()
                 } else {
                     branch
                 };
-                let worktree_path = git_wt.compute_path(leaf_seed, template, session_id_short)?;
+                let worktree_path =
+                    git_wt.compute_path(leaf_seed, template, &worktree_session_id)?;
 
                 if worktree_path.exists() {
                     bail!(
@@ -1073,20 +1079,92 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
     Ok(())
 }
 
-fn resolve_session_title(args: &AddArgs, instances: &[Instance]) -> Result<String> {
+fn resolve_session_title(
+    args: &AddArgs,
+    instances: &[Instance],
+    path: &std::path::Path,
+    config: &crate::session::Config,
+    worktree_session_id: &str,
+) -> Result<String> {
     if let Some(title) = &args.title {
         return Ok(title.trim().to_string());
     }
-    let default_title = if let Some(branch) = explicit_worktree_branch(args) {
+    let existing_titles: Vec<&str> = instances.iter().map(|i| i.title.as_str()).collect();
+    let default_title = if args.generated_name {
+        generated_worktree_title(args, path, config, &existing_titles, worktree_session_id)?
+    } else if let Some(branch) = explicit_worktree_branch(args) {
         branch.to_string()
     } else {
-        let existing_titles: Vec<&str> = instances.iter().map(|i| i.title.as_str()).collect();
         civilizations::generate_random_title(&existing_titles)
     };
     if args.interactive {
         prompt_session_title(&default_title)
     } else {
         Ok(default_title)
+    }
+}
+
+/// The worktree `--worktree` attaches to instead of creating one (`-b` always creates).
+fn existing_worktree_for_branch(
+    git_wt: &crate::git::GitWorktree,
+    args: &AddArgs,
+    branch: &str,
+) -> Option<crate::git::WorktreeEntry> {
+    if args.create_branch {
+        return None;
+    }
+    git_wt
+        .list_worktrees()
+        .ok()?
+        .into_iter()
+        .find(|wt| wt.branch.as_deref() == Some(branch))
+}
+
+/// A civilization title unused by any session. When a new worktree will be created, its
+/// directory (computed with the session id creation will use) must also be free; attaching,
+/// or a path that is not a git repo, skips that check (creation reports the latter).
+fn generated_worktree_title(
+    args: &AddArgs,
+    path: &std::path::Path,
+    config: &crate::session::Config,
+    existing_titles: &[&str],
+    worktree_session_id: &str,
+) -> Result<String> {
+    use crate::git::GitWorktree;
+
+    let git_wt = GitWorktree::find_main_repo(path)
+        .and_then(GitWorktree::new)
+        .ok();
+    let branch = explicit_worktree_branch(args).map(builder::git_sanitize_branch_name);
+    let attaching = match (&git_wt, &branch) {
+        (Some(git_wt), Some(branch)) => {
+            existing_worktree_for_branch(git_wt, args, branch).is_some()
+        }
+        _ => false,
+    };
+    let dir_taken = |candidate: &str| {
+        let Some(git_wt) = git_wt.as_ref().filter(|_| !attaching) else {
+            return false;
+        };
+        let template = worktree_path_template(config, &git_wt.repo_path);
+        let leaf = crate::session::worktree_edit::worktree_leaf_from_title(candidate);
+        git_wt
+            .compute_path(&leaf, template, worktree_session_id)
+            .is_ok_and(|p| p.exists())
+    };
+    civilizations::generate_random_title_filtered(existing_titles, dir_taken).context(
+        "Could not generate a unique worktree name; drop --generated-name and pass --title",
+    )
+}
+
+fn worktree_path_template<'a>(
+    config: &'a crate::session::Config,
+    main_repo_path: &std::path::Path,
+) -> &'a str {
+    if crate::git::GitWorktree::is_bare_repo(main_repo_path) {
+        &config.worktree.bare_repo_path_template
+    } else {
+        &config.worktree.path_template
     }
 }
 
@@ -1479,12 +1557,262 @@ mod tests {
         }
     }
 
+    mod generated_name {
+        use super::profile_guard::dispatch_argv;
+        use crate::git::test_support::{commit, run_git};
+        use crate::session::{civilizations, Storage};
+        use clap::Parser;
+        use serial_test::serial;
+        use std::path::{Path, PathBuf};
+
+        fn init_repo_under(root: &Path) -> PathBuf {
+            let profiles = crate::session::get_app_dir().unwrap().join("profiles");
+            std::fs::create_dir_all(profiles.join("real")).unwrap();
+            let repo_path = root.join("repo");
+            std::fs::create_dir(&repo_path).unwrap();
+            let repo = git2::Repository::init(&repo_path).unwrap();
+            commit(&repo, Some("HEAD"), &[], &[], None);
+            repo_path
+        }
+
+        fn only_session() -> crate::session::Instance {
+            let (rows, _) = Storage::new_unwatched("real")
+                .unwrap()
+                .load_with_groups()
+                .unwrap();
+            assert_eq!(rows.len(), 1);
+            rows.into_iter().next().unwrap()
+        }
+
+        #[test]
+        fn flag_needs_a_worktree_and_excludes_an_explicit_title() {
+            use crate::cli::Cli;
+            for argv in [
+                &["aoe", "add", ".", "--generated-name"][..],
+                &["aoe", "add", ".", "-w", "b", "--generated-name", "-t", "x"][..],
+            ] {
+                assert!(Cli::try_parse_from(argv).is_err(), "{argv:?}");
+            }
+        }
+
+        #[tokio::test]
+        #[serial]
+        async fn new_worktree_gets_a_generated_dir_and_title_but_keeps_the_branch() {
+            let _guard = crate::session::test_support::isolate_app_dir();
+            let _tie = crate::session::test_support::TieWorkdirToNameGuard::set(false);
+            let root = tempfile::tempdir().unwrap();
+            let repo = init_repo_under(root.path());
+
+            let (profile, args) = dispatch_argv(&[
+                "aoe",
+                "add",
+                repo.to_str().unwrap(),
+                "-w",
+                "feat/my-feature",
+                "-b",
+                "--generated-name",
+                "-p",
+                "real",
+            ]);
+            super::super::run(&profile, args).await.unwrap();
+
+            let session = only_session();
+            assert!(civilizations::is_default_civ_name(&session.title));
+            let info = session.worktree_info.expect("worktree session");
+            assert_eq!(info.branch, "feat/my-feature");
+            let leaf = crate::session::worktree_edit::worktree_leaf_from_title(&session.title);
+            assert_eq!(
+                Path::new(&session.project_path).canonicalize().unwrap(),
+                root.path()
+                    .join("repo-worktrees")
+                    .join(leaf)
+                    .canonicalize()
+                    .unwrap()
+            );
+            assert_eq!(
+                run_git(
+                    Path::new(&session.project_path),
+                    &["branch", "--show-current"]
+                )
+                .trim(),
+                "feat/my-feature"
+            );
+        }
+
+        fn title_for(
+            repo: &Path,
+            flags: &[&str],
+            config: &crate::session::Config,
+        ) -> anyhow::Result<String> {
+            let mut argv = vec!["aoe", "add", repo.to_str().unwrap(), "--generated-name"];
+            argv.extend_from_slice(flags);
+            let (_, args) = dispatch_argv(&argv);
+            super::super::generated_worktree_title(&args, repo, config, &[], "abcd1234")
+        }
+
+        #[test]
+        #[serial]
+        fn title_skips_names_whose_worktree_dir_exists() {
+            let _guard = crate::session::test_support::isolate_app_dir();
+            let root = tempfile::tempdir().unwrap();
+            let repo = init_repo_under(root.path());
+            let free = civilizations::CIVILIZATIONS[0];
+            let worktrees = root.path().join("repo-worktrees");
+            for civ in &civilizations::CIVILIZATIONS[1..] {
+                let leaf = crate::session::worktree_edit::worktree_leaf_from_title(civ);
+                std::fs::create_dir_all(worktrees.join(leaf)).unwrap();
+            }
+
+            let title = title_for(
+                &repo,
+                &["-w", "feat/x", "-b"],
+                &crate::session::Config::default(),
+            )
+            .unwrap();
+            assert_eq!(title, free);
+        }
+
+        #[test]
+        #[serial]
+        fn session_id_template_with_an_existing_parent_still_generates_a_title() {
+            let _guard = crate::session::test_support::isolate_app_dir();
+            let root = tempfile::tempdir().unwrap();
+            let repo = init_repo_under(root.path());
+            std::fs::create_dir(root.path().join("wt")).unwrap();
+            let mut config = crate::session::Config::default();
+            config.worktree.path_template = "../wt/{session-id}".to_string();
+
+            title_for(&repo, &["-w", "feat/x", "-b"], &config)
+                .expect("the occupied parent must not block a title");
+        }
+
+        #[test]
+        #[serial]
+        fn attaching_skips_the_directory_check() {
+            let _guard = crate::session::test_support::isolate_app_dir();
+            let root = tempfile::tempdir().unwrap();
+            let repo = init_repo_under(root.path());
+            run_git(
+                &repo,
+                &[
+                    "worktree",
+                    "add",
+                    "-b",
+                    "feat/x",
+                    root.path().join("hand-made").to_str().unwrap(),
+                ],
+            );
+            let worktrees = root.path().join("repo-worktrees");
+            for civ in civilizations::CIVILIZATIONS {
+                let leaf = crate::session::worktree_edit::worktree_leaf_from_title(civ);
+                std::fs::create_dir_all(worktrees.join(leaf)).unwrap();
+            }
+
+            let title = title_for(&repo, &["-w", "feat/x"], &crate::session::Config::default())
+                .expect("attaching creates no directory, so none can collide");
+            assert!(civilizations::is_default_civ_name(&title));
+        }
+
+        #[tokio::test]
+        #[serial]
+        async fn attaching_keeps_the_existing_dir_and_generates_only_the_title() {
+            let _guard = crate::session::test_support::isolate_app_dir();
+            let root = tempfile::tempdir().unwrap();
+            let repo = init_repo_under(root.path());
+            let existing = root.path().join("hand-made");
+            run_git(
+                &repo,
+                &[
+                    "worktree",
+                    "add",
+                    "-b",
+                    "feat/x",
+                    existing.to_str().unwrap(),
+                ],
+            );
+
+            let (profile, args) = dispatch_argv(&[
+                "aoe",
+                "add",
+                repo.to_str().unwrap(),
+                "-w",
+                "feat/x",
+                "--generated-name",
+                "-p",
+                "real",
+            ]);
+            super::super::run(&profile, args).await.unwrap();
+
+            let session = only_session();
+            assert!(civilizations::is_default_civ_name(&session.title));
+            assert_eq!(
+                Path::new(&session.project_path).canonicalize().unwrap(),
+                existing.canonicalize().unwrap()
+            );
+            assert!(!root.path().join("repo-worktrees").exists());
+        }
+
+        #[tokio::test]
+        #[serial]
+        async fn blank_branch_is_refused_instead_of_adding_an_in_place_session() {
+            let _guard = crate::session::test_support::isolate_app_dir();
+            let root = tempfile::tempdir().unwrap();
+            let repo = init_repo_under(root.path());
+            let (profile, args) = dispatch_argv(&[
+                "aoe",
+                "add",
+                repo.to_str().unwrap(),
+                "-w",
+                " ",
+                "--generated-name",
+                "-p",
+                "real",
+            ]);
+            let msg = super::super::run(&profile, args)
+                .await
+                .unwrap_err()
+                .to_string();
+            assert!(msg.contains("non-empty branch"), "{msg}");
+            let (rows, _) = Storage::new_unwatched("real")
+                .unwrap()
+                .load_with_groups()
+                .unwrap();
+            assert!(rows.is_empty());
+        }
+
+        #[tokio::test]
+        #[serial]
+        async fn multi_repo_workspace_is_refused() {
+            let _guard = crate::session::test_support::isolate_app_dir();
+            let root = tempfile::tempdir().unwrap();
+            let repo = init_repo_under(root.path());
+            let (profile, args) = dispatch_argv(&[
+                "aoe",
+                "add",
+                repo.to_str().unwrap(),
+                "-w",
+                "feat/x",
+                "-b",
+                "--repo",
+                root.path().join("other").to_str().unwrap(),
+                "--generated-name",
+                "-p",
+                "real",
+            ]);
+            let msg = super::super::run(&profile, args)
+                .await
+                .unwrap_err()
+                .to_string();
+            assert!(msg.contains("--generated-name"), "{msg}");
+        }
+    }
+
     mod profile_guard {
         use crate::cli::{Cli, Commands};
         use clap::Parser;
         use serial_test::serial;
 
-        fn dispatch_argv(argv: &[&str]) -> (String, super::super::AddArgs) {
+        pub(super) fn dispatch_argv(argv: &[&str]) -> (String, super::super::AddArgs) {
             let cli = Cli::try_parse_from(argv).expect("argv parses");
             let profile = cli.profile.unwrap_or_default();
             match cli.command {

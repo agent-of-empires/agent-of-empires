@@ -829,6 +829,93 @@ mod tests {
         });
         assert!(inst.prime_agent_capture_plan_with(&config, store).is_none());
     }
+
+    #[test]
+    #[serial_test::serial]
+    fn prepared_prime_launch_refreshes_resident_root_without_overwriting_peer() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _app = crate::session::test_support::isolate_app_dir_at(&tmp.path().join("app"));
+        let project = tmp.path().join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        let mut inst = tool_instance("prime-agent", project.to_str().unwrap());
+        inst.source_profile = "prime-resident-root-refresh".into();
+        inst.extra_args = "--session-dir /root/.prime/agent/sessions".into();
+        inst.sandbox_info = Some(test_sandbox("prime-resident", Some("/workspace/project")));
+        admit_sandbox_fixture(&inst);
+        let config = inst.build_container_config().unwrap();
+        let _transport = install_container_transport(tmp.path(), "prime-resident", &config.volumes);
+        let parent = "018f47a6-7b80-7cc3-98a2-37b5f486b2a1";
+        let newer = "018f47a6-7b80-7cc3-98a2-37b5f486b2a3";
+        inst.set_agent_conversation(Some(parent.into()), None, None);
+        let storage =
+            crate::session::storage::Storage::new_unwatched(&inst.source_profile).unwrap();
+        storage
+            .update(|rows, _| {
+                rows.push(inst.clone());
+                Ok(())
+            })
+            .unwrap();
+        let prepared = inst
+            .prepare_launch_command(inst.conversation_state())
+            .unwrap();
+        assert!(prepared.command.as_deref().unwrap().contains(parent));
+
+        let publication = PrimeRootPublication::Ready(newer.into());
+        let mut excluded = inst.clone();
+        excluded
+            .retroactive_capture_excludes
+            .insert(ConversationBinding::unknown(newer));
+        let prior = excluded.conversation_state();
+        let prepared_excluded = excluded.prepare_launch_command(prior).unwrap();
+        let excluded_prepared = excluded
+            .refresh_prepared_prime_launch_after_pane_stop(
+                prepared_excluded,
+                Some(publication.clone()),
+            )
+            .unwrap();
+        assert!(!excluded_prepared
+            .command
+            .as_deref()
+            .unwrap()
+            .contains(newer));
+
+        let refreshed = inst
+            .refresh_prepared_prime_launch_after_pane_stop(prepared, Some(publication))
+            .unwrap();
+        assert!(refreshed.command.as_deref().unwrap().contains(newer));
+        assert_eq!(
+            inst.persist_session_id(
+                &inst.source_profile.clone(),
+                &refreshed.expected_conversation
+            ),
+            SidPersistOutcome::Published
+        );
+        assert_eq!(
+            storage.load().unwrap()[0].agent_session_id.as_deref(),
+            Some(newer)
+        );
+
+        let peer = "018f47a6-7b80-7cc3-98a2-37b5f486b2a2";
+        storage
+            .update(|rows, _| {
+                rows[0].agent_session_id = Some(peer.into());
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(
+            inst.persist_session_id(
+                &inst.source_profile.clone(),
+                &refreshed.expected_conversation,
+            ),
+            SidPersistOutcome::Published
+        );
+        assert_eq!(
+            storage.load().unwrap()[0].agent_session_id.as_deref(),
+            Some(peer)
+        );
+        assert_eq!(inst.agent_session_id.as_deref(), Some(peer));
+    }
+
     #[test]
     fn native_root_publication_requires_header_corroboration_and_preserves_empty_boundary() {
         let temp = tempfile::tempdir().unwrap();

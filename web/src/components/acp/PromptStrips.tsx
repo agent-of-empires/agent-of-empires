@@ -92,6 +92,10 @@ interface NoticeTone {
 
 // Solid theme surfaces: a translucent severity wash darkens a light theme's
 // surface below AA for the text on it, so severity rides on border and icon.
+// Browsers treat a setTimeout delay above 2^31 - 1 ms as 0, so a config
+// written before the server-side cap could otherwise dismiss notices at once.
+const MAX_TIMER_DELAY_MS = 2_147_483_647;
+
 const NOTICE_ROW = "flex items-start gap-2 rounded-lg border bg-surface-850 px-2.5 py-1.5";
 const NOTICE_DISMISS =
   "inline-flex shrink-0 items-center justify-center rounded-md border border-surface-700 p-1 text-text-primary hover:bg-surface-800";
@@ -157,7 +161,7 @@ export function SessionNoticesStrip({
       if (!timers.current.has(id)) {
         timers.current.set(
           id,
-          setTimeout(() => onDismissRef.current(id), noticeTimeoutSecs * 1000),
+          setTimeout(() => onDismissRef.current(id), Math.min(noticeTimeoutSecs * 1000, MAX_TIMER_DELAY_MS)),
         );
       }
     }

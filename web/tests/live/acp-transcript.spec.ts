@@ -1,7 +1,9 @@
 // Structured view transcript and composer against a real server: attachments, file links, cards, turn control.
 
+import type { Page } from "@playwright/test";
 import { spawnSync } from "node:child_process";
 import { join } from "node:path";
+import { crc32, deflateSync } from "node:zlib";
 import { test, expect } from "../helpers/liveTest";
 import { writeFileSync } from "node:fs";
 import { fakeAcpScriptPath, resolveAoeBinary } from "../helpers/aoeServe";
@@ -82,6 +84,58 @@ test("structured view prompt carries an image attachment end to end", async ({ s
   );
 });
 
+// A valid grayscale PNG with a real decodable size, so the browser computes a natural height.
+function solidPng(width: number, height: number): Buffer {
+  const chunk = (type: string, data: Buffer) => {
+    const body = Buffer.concat([Buffer.from(type, "ascii"), data]);
+    const out = Buffer.alloc(body.length + 8);
+    out.writeUInt32BE(data.length, 0);
+    body.copy(out, 4);
+    out.writeUInt32BE(crc32(body), body.length + 4);
+    return out;
+  };
+  const ihdr = Buffer.alloc(13);
+  ihdr.writeUInt32BE(width, 0);
+  ihdr.writeUInt32BE(height, 4);
+  ihdr.writeUInt8(8, 8); // bit depth; colour type 0 (grayscale) stays zero
+  const raw = Buffer.alloc((width + 1) * height, 0x80);
+  for (let row = 0; row < height; row++) raw[row * (width + 1)] = 0; // filter: none
+  return Buffer.concat([
+    Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
+    chunk("IHDR", ihdr),
+    chunk("IDAT", deflateSync(raw)),
+    chunk("IEND", Buffer.alloc(0)),
+  ]);
+}
+
+test("uploaded image in a user message is capped in height and never overflows", async ({ page, spawnServe }) => {
+  const { serve, sessionId } = await startAcpSession(spawnServe, {
+    title: "acp-image-size",
+    fakeAcpScript: IMAGE_CAPABLE,
+  });
+  expect2xx(
+    await postAcp(serve.baseUrl, sessionId, "/prompt", {
+      text: "tall picture",
+      attachments: [
+        { kind: "image", mime_type: "image/png", data: solidPng(100, 1200).toString("base64"), name: "tall.png" },
+      ],
+    }),
+  );
+
+  await openStructuredView(page, serve, sessionId);
+  const image = page.locator("img.acp-artifact-image");
+  await expect(image).toBeVisible({ timeout: 15_000 });
+  await expect.poll(() => image.evaluate((el: HTMLImageElement) => el.naturalHeight)).toBe(1200);
+
+  const box = (await image.boundingBox())!;
+  expect(box.height).toBeLessThanOrEqual(320);
+  // Aspect ratio survives the cap.
+  const contentRatio = await image.evaluate((el: HTMLImageElement) => el.clientWidth / el.clientHeight);
+  expect(contentRatio).toBeCloseTo(100 / 1200, 2);
+  const viewport = page.viewportSize()!;
+  expect(box.x + box.width).toBeLessThanOrEqual(viewport.width);
+});
+
 test("staged composer image survives session switch and reload", async ({ page, spawnServe }) => {
   // #2493: staged attachments persist like text drafts across the per-session remount.
   const serve = await spawnServe({
@@ -121,9 +175,68 @@ test("staged composer image survives session switch and reload", async ({ page, 
   await expect(chip).toHaveCount(0);
   await switchTo("draft-source", source);
   await expect(chip).toBeVisible({ timeout: 10_000 });
+  await waitForCommittedDraft(page);
   await page.reload();
   await waitForStructuredView(page);
   await expect(chip).toBeVisible({ timeout: 10_000 });
+});
+
+// Reload only after the draft is committed to IndexedDB, not merely shown as a chip.
+async function waitForCommittedDraft(page: Page): Promise<void> {
+  await expect
+    .poll(() =>
+      page.evaluate(
+        () =>
+          new Promise<number>((resolve, reject) => {
+            const open = indexedDB.open("aoe-composer-attachments");
+            open.onerror = () => reject(open.error);
+            open.onsuccess = () => {
+              const db = open.result;
+              if (!db.objectStoreNames.contains("drafts")) {
+                db.close();
+                resolve(0);
+                return;
+              }
+              const count = db.transaction("drafts").objectStore("drafts").count();
+              count.onsuccess = () => {
+                db.close();
+                resolve(count.result);
+              };
+            };
+          }),
+      ),
+    )
+    .toBeGreaterThan(0);
+}
+
+test("staged photo past the localStorage quota survives reload without a storage-full toast", async ({
+  page,
+  spawnServe,
+}) => {
+  const serve = await spawnServe({
+    acp: true,
+    fakeAcpScript: IMAGE_CAPABLE,
+    seedFn: ({ home, env }) => {
+      aoeAdd(env, initWorkingRepo(join(home, "project-a"), env).path, "photo-draft");
+    },
+  });
+  const id = await sessionIdByTitle(serve.baseUrl, "photo-draft");
+  await enableStructuredViewAndWait(serve.baseUrl, id, 30_000, serve.home);
+
+  await openStructuredView(page, serve, id);
+  await expect(page.getByRole("button", { name: /Attach files/ })).toBeEnabled({ timeout: 30_000 });
+  // 8 MiB of base64 payload is far over the ~5 MiB localStorage quota.
+  const photo = Buffer.concat([Buffer.from(PNG_1X1_B64, "base64"), Buffer.alloc(8 * 1024 * 1024)]);
+  await page.locator('input[type="file"]').setInputFiles({ name: "photo.png", mimeType: "image/png", buffer: photo });
+  const chip = page.getByRole("img", { name: "photo.png" });
+  await expect(chip).toBeVisible({ timeout: 10_000 });
+  await expect(page.getByText(/storage full/i)).toHaveCount(0);
+  await waitForCommittedDraft(page);
+
+  await page.reload();
+  await waitForStructuredView(page);
+  await expect(chip).toBeVisible({ timeout: 10_000 });
+  await expect(page.getByText(/storage full/i)).toHaveCount(0);
 });
 
 test("structured view transcript file links open in-app, scroll to cited line, and render out-of-repo paths as inert text", async ({

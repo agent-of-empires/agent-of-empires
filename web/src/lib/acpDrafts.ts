@@ -3,12 +3,16 @@
 import { useMemo, useSyncExternalStore } from "react";
 
 import type { PromptAttachmentInput } from "./acpTypes";
+import { deleteAttachments, listAttachmentSessionIds, loadAttachments, saveAttachments } from "./attachmentStore";
 import { safeGetItem, safeRemoveItem, safeSetItem } from "./safeStorage";
 import { toastBus } from "./toastBus";
 
 const DRAFT_KEY_PREFIX = "acp:draft:";
 // Attachments use their own key: text writes are debounced per keystroke while attachments write on stage/remove.
+// The value is only a marker that IndexedDB holds the bytes. It decides whether a draft exists; the
+// record is cleanup-only without it, so an aborted delete cannot bring a sent draft back.
 const ATTACHMENT_KEY_PREFIX = "acp:draft-attachments:";
+const ATTACHMENT_MARKER = "1";
 
 // Sessions that already toasted "storage full"; a successful write re-arms the toast.
 const toastedSessions = new Set<string>();
@@ -17,6 +21,15 @@ function notifyDraftPersistFailure(sessionId: string): void {
   if (toastedSessions.has(sessionId)) return;
   toastedSessions.add(sessionId);
   toastBus.handler?.error("Storage full: unsent draft not saved. Free space or copy your draft elsewhere.");
+}
+
+const toastedRestoreSessions = new Set<string>();
+
+/** A failed read is not "no draft", so say so: nothing staged now will be saved either. */
+export function notifyAttachmentRestoreFailure(sessionId: string): void {
+  if (toastedRestoreSessions.has(sessionId)) return;
+  toastedRestoreSessions.add(sessionId);
+  toastBus.handler?.error("Could not load saved attachments. Files you attach now will not survive a reload.");
 }
 
 function clearDraftPersistFailure(sessionId: string): void {
@@ -51,6 +64,7 @@ function notify(sessionId: string | null) {
 
 export function __resetDraftPersistFailureNotifications(): void {
   toastedSessions.clear();
+  toastedRestoreSessions.clear();
 }
 
 export function getDraft(sessionId: string): string {
@@ -92,50 +106,79 @@ function isPromptAttachmentInput(v: unknown): v is PromptAttachmentInput {
   );
 }
 
-export function getDraftAttachments(sessionId: string): PromptAttachmentInput[] {
+// Per-session write chain so an older write can never land after a newer one.
+const attachmentWrites = new Map<string, Promise<void>>();
+// Latest write per session, so a failed older write can tell it was superseded.
+const attachmentGenerations = new Map<string, number>();
+
+function chainAttachmentWrite(sessionId: string, write: () => Promise<void>): Promise<void> {
+  const next = (attachmentWrites.get(sessionId) ?? Promise.resolve()).then(write);
+  const tail = next.catch(() => {});
+  attachmentWrites.set(sessionId, tail);
+  void tail.then(() => {
+    if (attachmentWrites.get(sessionId) === tail) attachmentWrites.delete(sessionId);
+  });
+  return next;
+}
+
+/** Null when the read failed, which is not the same as no draft: callers must not overwrite it. */
+export async function getDraftAttachments(sessionId: string): Promise<PromptAttachmentInput[] | null> {
   const raw = safeGetItem(attachmentKey(sessionId));
-  if (!raw) return [];
-  try {
-    const parsed: unknown = JSON.parse(raw);
-    if (!Array.isArray(parsed)) return [];
-    return parsed.filter(isPromptAttachmentInput);
-  } catch {
+  if (raw !== ATTACHMENT_MARKER) {
+    // An older JSON payload in the marker key is dead weight now; drop it.
+    if (raw !== null) safeRemoveItem(attachmentKey(sessionId));
     return [];
   }
+  try {
+    // Queued writes land first, and a clear among them leaves nothing to restore.
+    await attachmentWrites.get(sessionId);
+    if (!hasDraftAttachments(sessionId)) return [];
+    const stored = await loadAttachments(sessionId);
+    toastedRestoreSessions.delete(sessionId);
+    return Array.isArray(stored) ? stored.filter(isPromptAttachmentInput) : [];
+  } catch {
+    return null;
+  }
 }
 
-export function setDraftAttachments(sessionId: string, attachments: readonly PromptAttachmentInput[]): void {
+// The bytes live in IndexedDB; localStorage keeps only a marker, so `hasDraft` stays synchronous
+// and a write in another tab still fires a `storage` event. A marker that cannot be written
+// makes the record undiscoverable, so it counts as a failed save.
+export function setDraftAttachments(sessionId: string, attachments: readonly PromptAttachmentInput[]): Promise<void> {
   const key = attachmentKey(sessionId);
-  let ok = true;
+  const generation = (attachmentGenerations.get(sessionId) ?? 0) + 1;
+  attachmentGenerations.set(sessionId, generation);
   if (attachments.length === 0) {
     safeRemoveItem(key);
-  } else {
-    let json = "";
-    try {
-      json = JSON.stringify(attachments);
-    } catch {
-      ok = false;
-    }
-    if (ok) ok = safeSetItem(key, json);
-    // Exact-or-none: never leave a stale older attachment set to be restored and re-sent.
-    if (!ok) safeRemoveItem(key);
-  }
-  if (!ok) {
-    notifyDraftPersistFailure(sessionId);
-  } else {
+    notify(sessionId);
     clearDraftPersistFailure(sessionId);
+    // The delete may queue behind a save, so it only removes what was there when the clear happened.
+    const clearedAt = Date.now();
+    return chainAttachmentWrite(sessionId, () => deleteAttachments(sessionId, clearedAt)).catch(() => {});
   }
+  const marked = safeSetItem(key, ATTACHMENT_MARKER);
   notify(sessionId);
+  const rev = Date.now();
+  return chainAttachmentWrite(sessionId, async () => {
+    try {
+      if (!marked) throw new Error("draft marker not written");
+      await saveAttachments(sessionId, attachments, rev);
+      clearDraftPersistFailure(sessionId);
+    } catch {
+      // An older failing write must not take the marker of a newer write or a clear behind it,
+      // nor warn about a draft that no longer exists.
+      if (attachmentGenerations.get(sessionId) !== generation) return;
+      // Exact-or-none: never leave a stale older attachment set to be restored and re-sent.
+      safeRemoveItem(key);
+      await deleteAttachments(sessionId).catch(() => {});
+      notifyDraftPersistFailure(sessionId);
+      notify(sessionId);
+    }
+  });
 }
 
-export function clearDraftAttachments(sessionId: string): void {
-  setDraftAttachments(sessionId, []);
-}
-
-// Avoids parsing base64 on the sidebar hot path; a non-empty array is longer than "[]".
 export function hasDraftAttachments(sessionId: string): boolean {
-  const v = safeGetItem(attachmentKey(sessionId));
-  return v !== null && v.length > 2 && v.startsWith("[");
+  return safeGetItem(attachmentKey(sessionId)) === ATTACHMENT_MARKER;
 }
 
 // Remove drafts for sessions not in the active set (deleted in another tab or device).
@@ -155,6 +198,17 @@ export function sweepOrphanDrafts(activeSessionIds: ReadonlySet<string>): void {
     // localStorage blocked; the sweep is best-effort.
   }
   if (toRemove.length > 0) notify(null);
+  void sweepOrphanAttachmentRecords(activeSessionIds);
+}
+
+async function sweepOrphanAttachmentRecords(activeSessionIds: ReadonlySet<string>): Promise<void> {
+  try {
+    for (const sid of await listAttachmentSessionIds()) {
+      if (!activeSessionIds.has(sid)) await chainAttachmentWrite(sid, () => deleteAttachments(sid));
+    }
+  } catch {
+    // IndexedDB unavailable; the sweep is best-effort.
+  }
 }
 
 export function hasDraft(sessionId: string): boolean {

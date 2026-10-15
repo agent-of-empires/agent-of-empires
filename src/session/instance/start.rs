@@ -352,11 +352,8 @@ impl Instance {
                     .or_else(|| omp_capture_metadata.clone().map(CaptureContext::Omp)),
                 container: execution.inputs.container,
             });
-            let native_mints_child = matches!(
-                prepared.expected_conversation.intent,
-                ResumeIntent::Fork { .. }
-            ) && !execution.agent.fork_strategy.preassigns_child_id();
-            if native_mints_child {
+
+            if prepared.fork_mints_child {
                 self.set_agent_conversation(None, None, None);
             } else if let Some(sid) = self.agent_session_id.clone() {
                 let existing = self.agent_session_binding.as_ref().filter(|binding| {
@@ -429,7 +426,7 @@ impl Instance {
             profile,
             &prepared.expected_conversation,
             omp_capture_metadata,
-            canonicalized || prepared.carry_relocated,
+            canonicalized || prepared.require_conversation_publication,
         )?;
 
         #[cfg(test)]
@@ -656,6 +653,354 @@ fn attested_default_store(
 mod tests {
     use super::*;
 
+    #[cfg(unix)]
+    fn frozen_test_helper(
+        root: &std::path::Path,
+        entry: &str,
+    ) -> crate::process::test_support::NativeLaunchExecutable {
+        use std::os::unix::fs::PermissionsExt;
+        let helper = root.join("native-helper");
+        let module = module_path!().split_once("::").unwrap().1;
+        std::fs::write(&helper, format!("#!/bin/sh\nAOE_FROZEN_NATIVE_TEST_CHILD=1 exec {} --exact {} --nocapture --test-threads=1\n", crate::session::environment::shell_escape(std::env::current_exe().unwrap().to_str().unwrap()), crate::session::environment::shell_escape(&format!("{module}::{entry}")))).unwrap();
+        std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o700)).unwrap();
+        crate::process::test_support::NativeLaunchExecutable::install(helper)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[serial_test::serial]
+    fn default_opencode_restart_preserves_native_resume_without_an_attested_store() {
+        if std::env::var_os("AOE_FROZEN_NATIVE_TEST_CHILD").is_some() {
+            crate::process::exec_frozen_environment().unwrap();
+            return;
+        }
+        let Ok(python) = which::which("python3") else {
+            return;
+        };
+        crate::tmux::test_helpers::require_tmux!();
+        use crate::session::instance::test_helpers::{seed_disk_for_sidecar_test, tool_instance};
+        const SID: &str = "ses_saved000000000000000000000000";
+        for (legacy, yolo, version) in [
+            (false, false, "2.0.24+31bdd8e"),
+            (false, true, "2.0.24+31bdd8e"),
+            (true, false, "2.0.24+31bdd8e"),
+            (true, true, "2.0.24+31bdd8e"),
+            (false, false, "2.0.27"),
+            (false, true, "2.0.27"),
+            (false, false, "distro-build"),
+            (false, true, "distro-build"),
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let _home = crate::session::test_support::isolate_home(directory.path());
+            let project = directory.path().join("project");
+            std::fs::create_dir(&project).unwrap();
+            let project = std::fs::canonicalize(project).unwrap();
+            let record = directory.path().join("launch.json");
+            let database = directory.path().join("opencode.db");
+            if version != "2.0.24+31bdd8e" {
+                rusqlite::Connection::open(&database)
+                    .unwrap()
+                    .execute_batch("CREATE TABLE unrelated (payload TEXT)")
+                    .unwrap();
+            }
+            let native = format!(
+                r#"#!{}
+import json, os, sys
+if sys.argv[1:] == ['--help']: print({:?}); sys.exit(0)
+if sys.argv[1:] == ['--version']: print({version:?}); sys.exit(0)
+with open(os.environ['FORK_RECORD'] + '.tmp', 'w') as log:
+    json.dump({{"argv": sys.argv[1:], "permission": os.environ.get('OPENCODE_PERMISSION'), "database": os.environ.get('OPENCODE_DB'), "cwd": os.getcwd()}}, log)
+os.replace(os.environ['FORK_RECORD'] + '.tmp', os.environ['FORK_RECORD'])
+sys.stdin.read()
+"#,
+                python.display(),
+                if legacy {
+                    "--fork --session"
+                } else {
+                    "--auto --session"
+                }
+            );
+            let _path = crate::session::test_support::install_login_shell_path_command(
+                directory.path(),
+                "opencode",
+                &native,
+            );
+            let profile = "default-unattested";
+            let config =
+                crate::session::config::profile_config::get_profile_config_path(profile).unwrap();
+            std::fs::create_dir_all(config.parent().unwrap()).unwrap();
+            let environment = vec![
+                format!("OPENCODE_DB={}", database.display()),
+                format!("FORK_RECORD={}", record.display()),
+            ];
+            std::fs::write(config, format!("environment={}\n[session]\nagent_status_hooks=false\nsmart_rename=false\nname_agent_session=false\nopencode_preassign_session_id=false\n", serde_json::to_string(&environment).unwrap())).unwrap();
+            let mut instance = tool_instance("opencode", project.to_str().unwrap());
+            instance.source_profile = profile.into();
+            instance.yolo_mode = yolo;
+            instance.set_agent_conversation(Some(SID.into()), None, None);
+            seed_disk_for_sidecar_test(profile, &instance);
+            let _pane = crate::tmux::test_helpers::TmuxTestSession::from_name(
+                instance.tmux_session().unwrap().name(),
+            );
+            let _helper = frozen_test_helper(
+                directory.path(),
+                "default_opencode_restart_preserves_native_resume_without_an_attested_store",
+            );
+            let result = instance.start_with_size_opts(None, false).unwrap();
+            assert!(matches!(result, LaunchSidOutcome::Existing { sid } if sid == SID));
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(8);
+            let launched: serde_json::Value = loop {
+                if let Ok(bytes) = std::fs::read(&record) {
+                    if let Ok(value) = serde_json::from_slice(&bytes) {
+                        break value;
+                    }
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "native restart did not launch"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            };
+            let argv = launched["argv"].as_array().unwrap();
+            assert_eq!(launched["database"], database.to_str().unwrap());
+            assert_eq!(launched["cwd"], project.to_str().unwrap());
+            assert_eq!(instance.agent_session_id.as_deref(), Some(SID));
+            assert!(instance.active_execution.is_none());
+            assert_eq!(
+                crate::session::storage::Storage::new_unwatched(profile)
+                    .unwrap()
+                    .load()
+                    .unwrap()[0]
+                    .agent_session_id
+                    .as_deref(),
+                Some(SID)
+            );
+            assert!(argv
+                .windows(2)
+                .any(|pair| pair[0] == "--session" && pair[1] == SID));
+            assert_eq!(argv.iter().any(|word| word == "--standalone"), !legacy);
+            assert_eq!(argv.iter().any(|word| word == "--auto"), yolo && !legacy);
+            if legacy && yolo {
+                let policy: serde_json::Value =
+                    serde_json::from_str(launched["permission"].as_str().unwrap()).unwrap();
+                assert_eq!(policy["*"], "allow");
+            } else {
+                assert!(launched["permission"].is_null());
+            }
+        }
+    }
+    #[cfg(unix)]
+    #[test]
+    #[serial_test::serial]
+    fn store_fork_requires_durable_publication_and_preserves_recovery_and_peer_pins() {
+        if std::env::var_os("AOE_FROZEN_NATIVE_TEST_CHILD").is_some() {
+            crate::process::exec_frozen_environment().unwrap();
+            return;
+        }
+        let Ok(python) = which::which("python3") else {
+            return;
+        };
+        if which::which("tmux").is_err() {
+            return;
+        }
+        use crate::session::instance::test_helpers::{seed_disk_for_sidecar_test, tool_instance};
+        const PARENT: &str = "ses_parent00000000000000000000000";
+        const CHILD: &str = "ses_child000000000000000000000000";
+        const SEED: &str = "ses_seed0000000000000000000000000";
+        for (fail_adoption, fail_final, peer_pin) in [
+            (true, false, false),
+            (false, true, false),
+            (true, true, false),
+            (false, false, true),
+        ] {
+            let logs = crate::session::test_support::LogCapture::start();
+            let directory = tempfile::tempdir().unwrap();
+            let _home = crate::session::test_support::isolate_home(directory.path());
+            let project = directory.path().join("project");
+            std::fs::create_dir(&project).unwrap();
+            let project = project.canonicalize().unwrap();
+            let database = directory.path().join("opencode.db");
+            let connection = rusqlite::Connection::open(&database).unwrap();
+            connection.execute_batch("CREATE TABLE session_v2(id TEXT PRIMARY KEY, project_id TEXT NOT NULL, workspace_id TEXT, parent_id TEXT, fork_session_id TEXT, fork_boundary TEXT, slug TEXT NOT NULL, directory TEXT NOT NULL, path TEXT, title TEXT, version TEXT NOT NULL, share_url TEXT, metadata TEXT, cost REAL, agent TEXT, model TEXT, time_created INTEGER, time_updated INTEGER)").unwrap();
+            connection.execute("INSERT INTO session_v2(id,project_id,directory,slug,version,time_created,time_updated) VALUES (?1,'project',?2,'parent','2.0.24',0,0)", rusqlite::params![PARENT, project.to_str().unwrap()]).unwrap();
+            let record = directory.path().join("launch.json");
+            let forks = directory.path().join("forks");
+            let native = format!(
+                r#"#!{}
+import json, os, socket, sqlite3, sys
+if sys.argv[1:] == ['--help']: print('--auto --session'); sys.exit(0)
+if sys.argv[1:] == ['--version']: print('2.0.24+31bdd8e'); sys.exit(0)
+if sys.argv[1] == 'serve':
+    server = socket.socket()
+    server.bind(('127.0.0.1', int(sys.argv[sys.argv.index('--port') + 1])))
+    server.listen()
+    server.settimeout(15)
+    while True:
+        stream, _ = server.accept()
+        with stream:
+            stream.settimeout(2)
+            request = b''
+            while b'\r\n\r\n' not in request:
+                part = stream.recv(8192)
+                if not part: raise RuntimeError("incomplete request headers")
+                request += part
+            headers, payload = request.split(b'\r\n\r\n', 1)
+            length = next((int(line.split(b':', 1)[1]) for line in headers.split(b'\r\n') if line.lower().startswith(b'content-length:')), 0)
+            while len(payload) < length:
+                part = stream.recv(length - len(payload))
+                if not part: raise RuntimeError("incomplete request body")
+                payload += part
+            if request.startswith(b'POST '):
+                with sqlite3.connect(os.environ['OPENCODE_DB']) as db:
+                    db.execute("INSERT INTO session_v2(id,project_id,directory,slug,version,time_created,time_updated) SELECT 'ses_child000000000000000000000000',project_id,directory,'child',version,0,0 FROM session_v2 WHERE id='ses_parent00000000000000000000000'")
+                with open(os.environ['FORK_COUNT'], 'a') as log: log.write('fork\n')
+            body = b'{{"data":{{"id":"ses_child000000000000000000000000"}}}}'
+            stream.sendall(b'HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Type: application/json\r\nContent-Length: ' + str(len(body)).encode() + b'\r\n\r\n' + body)
+else:
+    with open(os.environ['FORK_RECORD'] + '.tmp', 'w') as log: json.dump(sys.argv[1:], log)
+    os.replace(os.environ['FORK_RECORD'] + '.tmp', os.environ['FORK_RECORD'])
+    sys.stdin.read()
+"#,
+                python.display()
+            );
+            let _path = crate::session::test_support::install_login_shell_path_command(
+                directory.path(),
+                "opencode",
+                &native,
+            );
+            let profile = "fork-publication";
+            let config =
+                crate::session::config::profile_config::get_profile_config_path(profile).unwrap();
+            std::fs::create_dir_all(config.parent().unwrap()).unwrap();
+            let environment = vec![
+                format!("OPENCODE_DB={}", database.display()),
+                format!("FORK_RECORD={}", record.display()),
+                format!("FORK_COUNT={}", forks.display()),
+            ];
+            std::fs::write(config, format!("environment={}\n[session]\nagent_status_hooks=false\nsmart_rename=false\nname_agent_session=false\nopencode_preassign_session_id=false\n", serde_json::to_string(&environment).unwrap())).unwrap();
+            let mut instance = tool_instance("opencode", project.to_str().unwrap());
+            instance.source_profile = profile.into();
+            let parent = instance.asserted_resume_binding(PARENT, None).unwrap();
+            instance.set_agent_conversation(Some(SEED.into()), None, None);
+            instance.resume_intent = ResumeIntent::Fork {
+                from: PARENT.into(),
+            };
+            instance.resume_binding = Some(parent.clone());
+            let _pane = crate::tmux::test_helpers::TmuxTestSession::from_name(
+                instance.tmux_session().unwrap().name(),
+            );
+            seed_disk_for_sidecar_test(profile, &instance);
+            let _helper = frozen_test_helper(
+                directory.path(),
+                "store_fork_requires_durable_publication_and_preserves_recovery_and_peer_pins",
+            );
+            let reached = std::rc::Rc::new(std::cell::Cell::new(false));
+            let observed = reached.clone();
+            let launch_record = record.clone();
+            let observer = test_support::FinalizeObserver::install(
+                instance.id.clone(),
+                move |instance, phase| {
+                    if !matches!(phase, test_support::FinalizePhase::Before) {
+                        return;
+                    }
+                    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(8);
+                    let argv: Vec<String> = loop {
+                        if let Ok(bytes) = std::fs::read(&launch_record) {
+                            if let Ok(argv) = serde_json::from_slice(&bytes) {
+                                break argv;
+                            }
+                        }
+                        assert!(
+                            std::time::Instant::now() < deadline,
+                            "native child did not launch"
+                        );
+                        std::thread::sleep(std::time::Duration::from_millis(10));
+                    };
+                    assert!(argv.windows(2).any(|pair| pair == ["--session", CHILD]));
+                    if fail_adoption {
+                        assert_eq!(instance.agent_session_id.as_deref(), Some(CHILD));
+                        assert!(matches!(instance.resume_intent, ResumeIntent::Fork { .. }));
+                        assert_eq!(
+                            instance
+                                .resume_binding
+                                .as_ref()
+                                .map(|binding| binding.session_id.as_str()),
+                            Some(PARENT)
+                        );
+                    }
+                    observed.set(true);
+                    if peer_pin {
+                        crate::session::storage::Storage::new_unwatched(profile)
+                            .unwrap()
+                            .update(|rows, _| {
+                                let row =
+                                    rows.iter_mut().find(|row| row.id == instance.id).unwrap();
+                                row.set_agent_conversation(
+                                    Some(PARENT.into()),
+                                    Some(parent.clone()),
+                                    None,
+                                );
+                                row.resume_intent = ResumeIntent::Use(PARENT.into());
+                                row.resume_binding = Some(parent.clone());
+                                Ok(())
+                            })
+                            .unwrap();
+                    }
+                },
+            );
+            let faults = super::super::sid_persist::test_support::WriteFailures::install(
+                instance.id.clone(),
+                fail_adoption,
+                fail_final,
+            );
+            let result = if fail_adoption {
+                instance.restart_with_size_opts(None, false).map(|_| ())
+            } else {
+                instance.start_with_size_opts(None, false).map(|_| ())
+            };
+            assert!(
+                reached.get(),
+                "case ({fail_adoption}, {fail_final}, {peer_pin}): {result:?}\n{}",
+                logs.contents()
+            );
+            assert_eq!(result.is_ok(), !fail_final && !peer_pin, "{result:?}");
+            let storage = crate::session::storage::Storage::new_unwatched(profile).unwrap();
+            let disk = storage.load().unwrap().remove(0);
+            if fail_final || peer_pin {
+                assert!(!instance.tmux_session().unwrap().exists());
+                assert_eq!(disk.status, Status::Error);
+                if peer_pin {
+                    assert_eq!(disk.agent_session_id.as_deref(), Some(PARENT));
+                    assert_eq!(disk.resume_intent, ResumeIntent::Use(PARENT.into()));
+                } else if fail_adoption {
+                    assert_eq!(disk.agent_session_id.as_deref(), Some(SEED));
+                    assert_eq!(
+                        disk.resume_intent,
+                        ResumeIntent::Fork {
+                            from: PARENT.into()
+                        }
+                    );
+                } else {
+                    assert_eq!(disk.agent_session_id.as_deref(), Some(CHILD));
+                    assert_eq!(disk.resume_intent, ResumeIntent::Default);
+                    drop(faults);
+                    drop(observer);
+                    std::fs::remove_file(&record).unwrap();
+                    let resumed = instance.start_with_size_opts(None, false).unwrap();
+                    assert!(matches!(resumed, LaunchSidOutcome::Existing { sid } if sid == CHILD));
+                    assert_eq!(
+                        storage.load().unwrap()[0].agent_session_id.as_deref(),
+                        Some(CHILD)
+                    );
+                }
+            } else {
+                assert_eq!(disk.agent_session_id.as_deref(), Some(CHILD));
+                assert_eq!(disk.resume_intent, ResumeIntent::Default);
+                assert_eq!(disk.active_execution, instance.active_execution);
+            }
+            assert_eq!(std::fs::read_to_string(forks).unwrap(), "fork\n");
+        }
+    }
     #[test]
     fn start_with_size_opts_returns_skipped_for_structured() {
         let mut inst = Instance::new("Test", "/tmp/test");
@@ -879,6 +1224,7 @@ mod tests {
             case_insensitive_routing: &[],
             omp: None,
             inputs: NativeLaunchInputs {
+                raw_environment: Vec::new(),
                 launch_id: "launch-attested-route".into(),
                 environment: Default::default(),
                 cwd: temp.path().to_path_buf(),
@@ -896,6 +1242,7 @@ mod tests {
             resolved_target_session_id: None,
             pi_pinnable: false,
             opencode_preassign: false,
+            opencode_schema: None,
             store_override: None,
         };
 
