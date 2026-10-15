@@ -3,7 +3,7 @@ import type { SessionResponse, Workspace } from "../lib/types";
 import { PaletteTriggerPill } from "./PaletteTriggerPill";
 import { OverflowMenu, type OverflowItem } from "./OverflowMenu";
 import { TOUR_ANCHORS, tourAnchor } from "../lib/tourSteps";
-import { PluginStatusBarSegments } from "./plugin/PluginSlots";
+import { PluginHeaderStartSegments, PluginStatusBarSegments } from "./plugin/PluginSlots";
 import { PluginPagesMenu } from "./plugin/PluginPagesMenu";
 import { ActivityBar } from "./ActivityBar";
 import type { PaneDisplay } from "./Dock";
@@ -171,6 +171,10 @@ export function TopBar({
              toggle and the logo: it would sit flush against the divider and read as clipped. */}
           <span className={`font-mono text-xs leading-none truncate ${hideWordmark ? "md:hidden" : ""}`}>aoe</span>
         </button>
+        {/* Hidden with the wordmark: the compact rail leaves no room beside the logo. */}
+        <div className={`flex items-center gap-1.5 min-w-0 ${hideWordmark ? "md:hidden" : ""}`}>
+          <PluginHeaderStartSegments />
+        </div>
       </div>
 
       {/* Center zone: palette trigger; carries the bottom border across the

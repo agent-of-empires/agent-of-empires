@@ -7,6 +7,7 @@ import { useRef, useState } from "react";
 import { invokePluginAction, type PluginUiEntry } from "../../lib/api";
 import { usePluginUiEntries, usePluginUiPoke } from "../../lib/pluginUiContext";
 import {
+  chipEntries,
   entryText,
   entryTone,
   globalEntries,
@@ -39,7 +40,11 @@ function EntryBadge({ entry }: { entry: PluginUiEntry }) {
 }
 
 export function PluginStatusBarSegments() {
-  return globalEntries(usePluginUiEntries(), "status-bar").map((e) => <EntryBadge key={entryKey(e)} entry={e} />);
+  return chipEntries(usePluginUiEntries(), "status-bar").map((e) => <EntryBadge key={entryKey(e)} entry={e} />);
+}
+
+export function PluginHeaderStartSegments() {
+  return chipEntries(usePluginUiEntries(), "header-start").map((e) => <EntryBadge key={entryKey(e)} entry={e} />);
 }
 
 export function PluginRowBadges({ sessionId }: { sessionId: string }) {

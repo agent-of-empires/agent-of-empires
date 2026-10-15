@@ -7,6 +7,7 @@ import { PluginPaneBody } from "../PluginPane";
 import {
   PluginComposerActions,
   PluginDetailBadges,
+  PluginHeaderStartSegments,
   PluginHomePanes,
   PluginRowBadges,
   PluginStatusBarSegments,
@@ -257,6 +258,24 @@ describe("plugin slots", () => {
       fireEvent.click(screen.getByRole("button"));
       expect(screen.getByRole("button").textContent).toContain("y");
     });
+  });
+
+  it("header-start and status-bar chips order by payload order, then snapshot order", () => {
+    const chip = (slot: "header-start" | "status-bar", id: string, order?: number): PluginUiEntry => ({
+      plugin_id: "acme.kit",
+      slot,
+      id,
+      payload: { text: id, ...(order === undefined ? {} : { order }) },
+    });
+    entriesRef.current = [
+      chip("header-start", "a"),
+      chip("header-start", "b", -1),
+      chip("header-start", "c", 5),
+      chip("status-bar", "d", -9),
+    ];
+    const { container } = render(<PluginHeaderStartSegments />);
+    const texts = [...container.querySelectorAll("[data-plugin-slot]")].map((n) => n.textContent);
+    expect(texts).toEqual(["b", "a", "c"]);
   });
 
   it("home-pane renders blocks, and the simple form's title only once", () => {

@@ -654,6 +654,7 @@ export type PluginUiTone = "neutral" | "info" | "success" | "warn" | "danger";
 
 export type PluginUiSlot =
   | "status-bar"
+  | "header-start"
   | "row-badge"
   | "row-column"
   | "sort-key"
