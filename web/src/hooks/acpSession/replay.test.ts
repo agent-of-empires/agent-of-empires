@@ -116,6 +116,21 @@ describe("fetchTail", () => {
     expect(setHasMore).toHaveBeenCalledWith(true);
   });
 
+  it("stops after the page cap and leaves older history for loadOlder", async () => {
+    const pages: Record<string, Page> = {
+      [TAIL]: { rows: [row("t-tail", "tool_start")], next_cursor: 700, has_more: true },
+    };
+    for (let c = 700; c > 100; c -= 100) {
+      pages[String(c)] = { rows: [row(`t${c}`, "tool_start")], next_cursor: c - 100, has_more: true };
+    }
+    const requests = mockReplay(pages);
+    const { frames, setHasMore } = await coldOpen();
+    expect(requests.filter((u) => /before=\d+&limit=\d+&view=rows/.test(u) && !u.includes(TAIL))).toHaveLength(5);
+    expect(frames).toHaveLength(1);
+    expect(frames[0]!.oldestSeq).toBe(200);
+    expect(setHasMore).toHaveBeenCalledWith(true);
+  });
+
   it("still fetches the handshake when paging reaches the start of history", async () => {
     const requests = mockReplay({
       [TAIL]: { rows: [row("t1", "tool_start")], next_cursor: 80, has_more: true },

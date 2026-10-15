@@ -7,6 +7,8 @@ import { toActivityRows, type Action } from "./reducer";
 // Re-request this many seqs behind lastSeq; the reducer's seq dedupe makes the overlap idempotent.
 const REPLAY_OVERLAP = 50;
 const REPLAY_PAGE_SIZE = 1000;
+// Bounds the cold-open fetch to fit the dial timeout; past it the window opens at its default size.
+const MAX_COLD_OPEN_PAGES = 5;
 // Above every real seq, so `before=` returns the newest page.
 const TAIL_BEFORE = Number.MAX_SAFE_INTEGER;
 // The handshake lands in the first few events of a session.
@@ -76,7 +78,11 @@ async function fetchTail(
   // The handshake lives at the start of the log, which row pages do not carry.
   const needsHandshake = hasMore && cursor > 1;
   // Page back until the last user prompt is loaded, so the first window can open on the whole last turn.
-  while (hasMore && cursor > 1 && lastUserBoundaryIndex(rows) < 0) {
+  for (
+    let pages = 0;
+    pages < MAX_COLD_OPEN_PAGES && hasMore && cursor > 1 && lastUserBoundaryIndex(rows) < 0;
+    pages += 1
+  ) {
     let page: ReplayPageResponse;
     try {
       const res = await getReplay(sid, `before=${cursor}&limit=${REPLAY_PAGE_SIZE}&view=rows`, signal);
