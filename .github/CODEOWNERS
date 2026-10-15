@@ -1,45 +1,90 @@
-# CODEOWNERS - merge gating for agent-of-empires/agent-of-empires
-#
-# Last-match-wins semantics. Pair with branch protection / ruleset on `main`:
-#   - Require PR before merging
-#   - Require status checks (CI) to pass
-#   - Require signed commits
-#   - Require review from Code Owners
-#
-# Docs: https://docs.github.com/en/repositories/managing-your-repositorys-settings-and-features/customizing-your-repository/about-code-owners
+# Code owners for agent-of-empires/agent-of-empires. Last match wins.
+# Each area is owned by a team that auto-assigns one reviewer; any team
+# member's approval satisfies code owner review. Members are listed in
+# MAINTAINERS.md. Docs: https://docs.github.com/en/repositories/managing-your-repositorys-settings-and-features/customizing-your-repository/about-code-owners
 
-# Default: njbrake reviews everything not otherwise scoped
-*                                       @njbrake
+# Web dashboard, plugin pages and the plugin API
+/web/                                   @agent-of-empires/web
+/aoe-plugin-api/                        @agent-of-empires/web
+/plugins/                               @agent-of-empires/web
+/src/plugin/                            @agent-of-empires/web
+/src/cli/plugin.rs                      @agent-of-empires/web
+/src/server/api/plugins.rs              @agent-of-empires/web
+/src/server/api/plugin_settings.rs      @agent-of-empires/web
+/src/server/plugin_status.rs            @agent-of-empires/web
+/src/tui/plugin_ui.rs                   @agent-of-empires/web
+/docs/plugin-api.md                     @agent-of-empires/web
+/docs/plugins.md                        @agent-of-empires/web
+/docs/development/writing-plugins.md    @agent-of-empires/web
 
-# Structured view and web dashboard - acp team can self-route, njbrake co-owns
-/web/                                   @agent-of-empires/acp @njbrake
-/src/server/acp_reconciler.rs       @agent-of-empires/acp @njbrake
-/src/server/acp_ws.rs               @agent-of-empires/acp @njbrake
-/src/server/api/acp.rs              @agent-of-empires/acp @njbrake
-/src/tui/structured_view/                  @agent-of-empires/acp @njbrake
+# ACP, structured view, composer and attachments
+/src/acp/                               @agent-of-empires/acp
+/acp-worker/                            @agent-of-empires/acp
+/src/cli/acp.rs                         @agent-of-empires/acp
+/src/server/acp_*                       @agent-of-empires/acp
+/src/server/acp_reconciler/             @agent-of-empires/acp
+/src/server/api/acp/                    @agent-of-empires/acp
+/src/server/structured_repair.rs        @agent-of-empires/acp
+/src/tui/structured_view/               @agent-of-empires/acp
+/web/src/components/acp/                @agent-of-empires/acp
+/web/src/lib/acp*                       @agent-of-empires/acp
+/web/src/lib/attachmentStore*           @agent-of-empires/acp
+/docs/structured-view.md                @agent-of-empires/acp
+/docs/structured-view/                  @agent-of-empires/acp
+/docs/development/internals/structured-view.md  @agent-of-empires/acp
 
-# Security-sensitive surface area - njbrake only
-/src/server/auth.rs                     @njbrake
-/src/server/login.rs                    @njbrake
-/src/server/rate_limit.rs               @njbrake
-/src/server/tunnel.rs                   @njbrake
-/src/server/push.rs                     @njbrake
-/src/server/push_send.rs                @njbrake
+# Daemon, session lifecycle, worktrees, process, containers and build
+/src/daemon/                            @agent-of-empires/runtime
+/src/session/                           @agent-of-empires/runtime
+/src/server/session_*                   @agent-of-empires/runtime
+/src/server/api/sessions/               @agent-of-empires/runtime
+/src/git/                               @agent-of-empires/runtime
+/src/cli/worktree.rs                    @agent-of-empires/runtime
+/src/process/                           @agent-of-empires/runtime
+/src/containers/                        @agent-of-empires/runtime
+/src/cli/sandbox.rs                     @agent-of-empires/runtime
+/docker/                                @agent-of-empires/runtime
+/build.rs                               @agent-of-empires/runtime
+/build_git_watch.rs                     @agent-of-empires/runtime
+/xtask/                                 @agent-of-empires/runtime
 
-# Architecture and data-safety critical - njbrake only
-/src/migrations/                        @njbrake
-/src/session/storage.rs                 @njbrake
-/src/tmux/                              @njbrake
+# Hooks, agent integrations, OMP and tmux
+/src/hooks/                             @agent-of-empires/integrations
+/src/cli/hooks.rs                       @agent-of-empires/integrations
+/src/status_hooks.rs                    @agent-of-empires/integrations
+/src/agents.rs                          @agent-of-empires/integrations
+/src/cli/agents.rs                      @agent-of-empires/integrations
+/src/session/instance/omp.rs            @agent-of-empires/integrations
+/src/session/capture/                   @agent-of-empires/integrations
+/src/tmux/                              @agent-of-empires/integrations
+/src/cli/tmux.rs                        @agent-of-empires/integrations
+/contrib/                               @agent-of-empires/integrations
+/docs/development/adding-agents.md      @agent-of-empires/integrations
 
-# Supply chain, build, release - njbrake only
-/Cargo.toml                             @njbrake
-/Cargo.lock                             @njbrake
-/scripts/                               @njbrake
-/.github/                               @njbrake
-/flake.nix                              @njbrake
-/flake.lock                             @njbrake
+# Protected: security, stored data, supply chain, release and governance
+/src/server/auth.rs                     @agent-of-empires/protected
+/src/server/login.rs                    @agent-of-empires/protected
+/src/server/rate_limit.rs               @agent-of-empires/protected
+/src/server/tunnel.rs                   @agent-of-empires/protected
+/src/server/push.rs                     @agent-of-empires/protected
+/src/server/push_send.rs                @agent-of-empires/protected
+/src/migrations/                        @agent-of-empires/protected
+/src/session/storage.rs                 @agent-of-empires/protected
+Cargo.toml                              @agent-of-empires/protected
+Cargo.lock                              @agent-of-empires/protected
+/flake.nix                              @agent-of-empires/protected
+/flake.lock                             @agent-of-empires/protected
+/.github/                               @agent-of-empires/protected
+/scripts/                               @agent-of-empires/protected
+/AGENTS.md                              @agent-of-empires/protected
+/CLAUDE.md                              @agent-of-empires/protected
+/DESIGN.md                              @agent-of-empires/protected
+/MAINTAINERS.md                         @agent-of-empires/protected
 
-# Repo governance - njbrake only
-/AGENTS.md                              @njbrake
-/CLAUDE.md                              @njbrake
-/DESIGN.md                              @njbrake
+# Releases
+/.github/workflows/release.yml          @agent-of-empires/release
+/.github/workflows/prepare-release.yml  @agent-of-empires/release
+/.github/workflows/open-release-pr.yml  @agent-of-empires/release
+/.github/workflows/tag-release-pr.yml   @agent-of-empires/release
+/cliff.toml                             @agent-of-empires/release
+/docs/development/releases.md           @agent-of-empires/release

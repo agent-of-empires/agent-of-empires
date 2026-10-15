@@ -64,50 +64,33 @@ one in a persistent session with optional worktree and container isolation.
 
 Each agent runs in its own [tmux](https://github.com/tmux/tmux/wiki) session, so your agents keep running when you close the TUI, disconnect SSH, or your terminal crashes. Reopen `aoe` and everything is where you left it. The key shortcut to know: **`Ctrl+b d`** detaches from a session and returns to the TUI.
 
-## Installation
+## Install
 
-**Prerequisites:** [tmux](https://github.com/tmux/tmux/wiki) (required), [Docker](https://www.docker.com/) (optional, for sandboxing)
+Requires [tmux](https://github.com/tmux/tmux/wiki) on Linux or macOS.
+[Docker](https://www.docker.com/) is optional, for sandboxing.
 
 ```bash
-# Quick install (Linux & macOS)
-curl -fsSL \
-  https://raw.githubusercontent.com/agent-of-empires/agent-of-empires/main/scripts/install.sh \
-  | bash
-
-# Homebrew
 brew install aoe
-
-# Nix
-nix run github:agent-of-empires/agent-of-empires
-
-# Build from source
-git clone https://github.com/agent-of-empires/agent-of-empires
-cd agent-of-empires && cargo build --release
+# or
+curl -fsSL https://raw.githubusercontent.com/agent-of-empires/agent-of-empires/main/scripts/install.sh | bash
 ```
 
-## Quick Start
+Nix and source builds are covered in
+[Installation](https://www.agent-of-empires.com/docs/installation/).
 
 ```bash
-aoe                          # Launch the TUI
+aoe                          # Launch the TUI (press ? for help)
 aoe add --cmd claude         # Create a session running Claude Code
 aoe serve                    # Start the web dashboard
 ```
 
-In the TUI, press `?` for help. The bottom information bar shows the keybindings available in context.
-
 ## Documentation
 
-- [Installation](https://www.agent-of-empires.com/docs/installation/) and
-  [quick start](https://www.agent-of-empires.com/docs/quick-start/)
-- [Guides](https://www.agent-of-empires.com/guides/)
+- [Quick start](https://www.agent-of-empires.com/docs/quick-start/) and
+  [guides](https://www.agent-of-empires.com/guides/)
 - [CLI](https://www.agent-of-empires.com/docs/cli/reference/) and
   [HTTP API](https://www.agent-of-empires.com/docs/api/) references
-- [Development](https://www.agent-of-empires.com/docs/development/) and
-  [CONTRIBUTING.md](CONTRIBUTING.md)
-
-## Roadmap
-
-The AoE roadmap is public: see the [project board](https://github.com/orgs/agent-of-empires/projects/1) for what's planned, in progress, and recently shipped. Issues and PRs welcome.
+- [Roadmap](https://github.com/orgs/agent-of-empires/projects/1)
 
 ## FAQ
 
@@ -121,13 +104,13 @@ The AoE roadmap is public: see the [project board](https://github.com/orgs/agent
 
 **How is this different from plain tmux?** tmux gives you persistent sessions. AoE adds agent-aware status detection, git worktree management, container sandboxing, a web dashboard with phone access, and a diff viewer around them. You can still `tmux attach` to any AoE session directly.
 
-## Acknowledgments
+## Contributing
 
-Inspired by [agent-deck](https://github.com/asheshgoplani/agent-deck) (Go + Bubble Tea).
-
-## Maintainers
-
-Maintained by the Agent of Empires community, with support from [Mozilla.ai](https://www.mozilla.ai/). See [CONTRIBUTORS](https://github.com/agent-of-empires/agent-of-empires/graphs/contributors) for the full list of contributors.
+Start with [CONTRIBUTING.md](CONTRIBUTING.md). Area owners and merge rules are
+in [MAINTAINERS.md](MAINTAINERS.md); local builds are in
+[docs/development.md](docs/development.md). AoE is supported by
+[Mozilla.ai](https://www.mozilla.ai/) and inspired by
+[agent-deck](https://github.com/asheshgoplani/agent-deck).
 
 ## License
 

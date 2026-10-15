@@ -23,7 +23,8 @@ use crate::acp::acp_client::errors::acp_internal_error;
 use crate::acp::acp_client::lifecycle::{LifecycleSignal, OffProtocolWorkKind};
 use crate::acp::acp_client::opencode::recover_opencode_prompt_error;
 use crate::acp::acp_client::rate_limit::{
-    captured_rate_limit_resets_at, classify_rate_limit_error, is_unsupported_session_error,
+    captured_rate_limit_resets_at, classify_rate_limit_error, clear_captured_rejections,
+    is_unsupported_session_error,
 };
 use crate::acp::acp_client::reset::ResetSessionOutcome;
 use crate::acp::acp_client::steer::{first_text_block, SteerOutcome, SteerRequest};
@@ -162,6 +163,7 @@ impl Session {
         shared.prompt_in_flight.store(true, Ordering::Relaxed);
         shared.terminal_claim.begin_turn();
         shared.between_prompt.reset_for_prompt();
+        clear_captured_rejections(&shared.rate_limit_rejections);
         info!(target: "acp.protocol", "sending prompt ({} content blocks)", blocks.len());
         // Bump the epoch before sending so envelopes from a handler parked on
         // the previous prompt are discarded.

@@ -37,7 +37,7 @@ pub use plugin_settings::resolve_options;
 pub use plugins::{
     apply_plugin_update, dismiss_plugin_update, invoke_plugin_action, invoke_plugin_command,
     list_plugins, mint_plugin_page_ticket, plugin_commands, plugin_details, plugin_discover,
-    plugin_job_status, plugin_ui_state, plugin_update_preview, plugin_updates,
+    plugin_job_status, plugin_sessions, plugin_ui_state, plugin_update_preview, plugin_updates,
     preview_plugin_install, restart_plugin_worker, serve_plugin_icon, serve_plugin_page,
     set_plugin_enabled, start_plugin_install, start_plugin_uninstall,
 };

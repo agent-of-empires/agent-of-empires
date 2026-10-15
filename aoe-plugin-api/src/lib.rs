@@ -15,4 +15,4 @@ pub use manifest::{
     SettingType, StatusContribution, ThemeContribution, UiContribution, UiSlot, MAX_SCREENSHOTS,
 };
 
-pub const API_VERSION: u32 = 16;
+pub const API_VERSION: u32 = 17;

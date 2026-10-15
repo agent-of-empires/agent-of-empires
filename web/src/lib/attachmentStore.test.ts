@@ -1,11 +1,12 @@
 // @vitest-environment jsdom
 
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 
 import {
   clearAttachments,
   compareRevisions,
   deleteAttachments,
+  deleteAttachmentsUpTo,
   loadAttachments,
   loadState,
   nextRevision,
@@ -31,6 +32,26 @@ describe("attachmentStore", () => {
     expect(await loadState("s-rev")).toEqual({ rev: [300, "a"], saved: true });
     await deleteAttachments("s-rev");
     expect(await loadAttachments("s-rev")).toBeUndefined();
+  });
+
+  it("issues revisions from the shared wall clock, not a clock that stops during sleep", () => {
+    const hourAhead = Date.now() + 3_600_000;
+    const now = vi.spyOn(Date, "now").mockReturnValue(hourAhead);
+    // performance.now() would put this tab an hour behind; it must follow Date.now().
+    const first = nextRevision();
+    const second = nextRevision();
+    now.mockRestore();
+    expect(first[0]).toBeGreaterThanOrEqual(hourAhead);
+    expect(compareRevisions(first, second)).toBeLessThan(0);
+  });
+
+  it("a bounded delete frees a record unless a newer revision replaced it", async () => {
+    await saveAttachments("s-up", att("OLD"), [100, "a"]);
+    await deleteAttachmentsUpTo("s-up", [150, "a"]);
+    expect(await loadAttachments("s-up")).toBeUndefined();
+    await saveAttachments("s-up", att("NEWER"), [300, "b"]);
+    await deleteAttachmentsUpTo("s-up", [150, "a"]);
+    expect(await loadAttachments("s-up")).toEqual(att("NEWER"));
   });
 
   it("orders revisions antisymmetrically, including equal clocks", () => {

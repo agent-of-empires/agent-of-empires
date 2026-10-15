@@ -1145,33 +1145,17 @@ mod tests {
         if !git_available() {
             return;
         }
+        use crate::git::test_support::run_git;
+
         let tmp = tempfile::TempDir::new().unwrap();
         let main_repo = tmp.path().join("main");
         let worktree = tmp.path().join("wt");
         std::fs::create_dir_all(&main_repo).unwrap();
-        for args in [
-            vec!["init", "-q", "-b", "main", "."],
-            vec![
-                "-c",
-                "user.email=t@t",
-                "-c",
-                "user.name=t",
-                "commit",
-                "-q",
-                "--allow-empty",
-                "-m",
-                "init",
-            ],
-        ] {
-            let out = std::process::Command::new("git")
-                .args(&args)
-                .current_dir(&main_repo)
-                .output()
-                .unwrap();
-            assert!(out.status.success(), "git {args:?} failed");
-        }
-        let out = std::process::Command::new("git")
-            .args([
+        run_git(&main_repo, &["init", "-q", "-b", "main", "."]);
+        run_git(&main_repo, &["commit", "-q", "--allow-empty", "-m", "init"]);
+        run_git(
+            &main_repo,
+            &[
                 "-c",
                 "worktree.useRelativePaths=true",
                 "worktree",
@@ -1180,11 +1164,8 @@ mod tests {
                 "-b",
                 "feat",
                 worktree.to_str().unwrap(),
-            ])
-            .current_dir(&main_repo)
-            .output()
-            .unwrap();
-        assert!(out.status.success(), "git worktree add failed");
+            ],
+        );
 
         let link = std::fs::read_to_string(worktree.join(".git")).unwrap();
         let target = link.split_once("gitdir:").unwrap().1.trim().to_string();

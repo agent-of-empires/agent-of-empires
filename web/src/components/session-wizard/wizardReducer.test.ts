@@ -11,6 +11,7 @@ function makeState(data: Partial<WizardData> = {}): WizardState {
     groups: [],
     profiles: [],
     dockerAvailable: false,
+    dockerChecked: false,
   };
 }
 
