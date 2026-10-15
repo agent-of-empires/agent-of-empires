@@ -287,11 +287,13 @@ impl AnchoredDir {
         if let Some(observed) = replace {
             exchange(&from_parent, &from_leaf, &to_parent, &to_leaf)
                 .context("replacing anchored file")?;
-            let unchanged = self.regular_modified(from)? == Some(observed);
+            let validation = self.regular_modified(from);
+            let unchanged = matches!(validation, Ok(Some(seen)) if seen == observed);
             if !unchanged {
                 exchange(&from_parent, &from_leaf, &to_parent, &to_leaf)
                     .context("restoring anchored file")?;
             }
+            validation?;
             self.remove_file(from)?;
             return Ok(unchanged);
         }
