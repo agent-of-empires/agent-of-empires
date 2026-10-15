@@ -163,7 +163,7 @@ export function TopBar({
 
         <button
           onClick={onGoDashboard}
-          className="flex items-center gap-1.5 min-w-0 text-text-muted hover:text-text-secondary transition-colors cursor-pointer"
+          className="flex items-center gap-1.5 shrink-0 text-text-muted hover:text-text-secondary transition-colors cursor-pointer"
           aria-label="Go to dashboard"
         >
           <img src="/icon-192.png" alt="" width="18" height="18" className="rounded-sm shrink-0" />
