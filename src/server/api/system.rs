@@ -375,6 +375,7 @@ fn machine_elevation_gate(
 pub async fn update_settings(
     State(state): State<Arc<AppState>>,
     axum::extract::Query(query): axum::extract::Query<SettingsQuery>,
+    headers: HeaderMap,
     session: Option<axum::Extension<AuthenticatedSession>>,
     loopback: Option<axum::Extension<LoopbackTrusted>>,
     body: Result<Json<serde_json::Value>, axum::extract::rejection::JsonRejection>,
@@ -443,14 +444,24 @@ pub async fn update_settings(
         strip_local_only(&mut overrides);
     }
 
+    let stamp = WriteStamp::from_headers(&headers);
+    let mut applied = write_gate().await;
+    let machine_scope = "";
+    let stale = drop_stale_leaves(&applied, stamp.as_ref(), machine_scope, &mut machine)
+        | drop_stale_leaves(&applied, stamp.as_ref(), &profile, &mut overrides);
+    if stale && is_empty_patch(&machine) && is_empty_patch(&overrides) {
+        return stale_write_response();
+    }
+
     let profile_saved = !is_empty_patch(&overrides);
     if profile_saved {
-        if let Err(resp) = write_profile_patch(profile.clone(), overrides).await {
+        if let Err(resp) = write_profile_patch(profile.clone(), overrides.clone()).await {
             return resp;
         }
+        record_applied(&mut applied, stamp.as_ref(), &profile, &overrides);
     }
     if !is_empty_patch(&machine) {
-        if let Err(resp) = write_machine_patch(&state, machine).await {
+        if let Err(resp) = write_machine_patch(&state, machine.clone()).await {
             if !profile_saved {
                 return resp;
             }
@@ -461,7 +472,9 @@ pub async fn update_settings(
                 "Profile changes were saved, but machine-wide changes failed; retry to finish",
             );
         }
+        record_applied(&mut applied, stamp.as_ref(), machine_scope, &machine);
     }
+    drop(applied);
 
     let effective = tokio::task::spawn_blocking(move || crate::session::resolve_config(&profile))
         .await
@@ -478,6 +491,118 @@ pub async fn update_settings(
             )
         }
     }
+}
+
+/// Header a client stamps on each settings PATCH: `<tab id>.<sequence>`, increasing per tab.
+const WRITE_STAMP_HEADER: &str = "x-aoe-write-stamp";
+
+/// Past this many tracked leaves the table is reset rather than grown without bound.
+const MAX_TRACKED_WRITES: usize = 4096;
+
+struct WriteStamp {
+    tab: String,
+    seq: u64,
+}
+
+impl WriteStamp {
+    fn from_headers(headers: &HeaderMap) -> Option<Self> {
+        let (tab, seq) = headers
+            .get(WRITE_STAMP_HEADER)?
+            .to_str()
+            .ok()?
+            .rsplit_once('.')?;
+        Some(Self {
+            tab: tab.to_string(),
+            seq: seq.parse().ok()?,
+        })
+    }
+
+    fn key(&self, scope: &str, section: &str, field: &str) -> String {
+        format!("{}|{scope}|{section}.{field}", self.tab)
+    }
+}
+
+/// Latest stamped write applied per tab and leaf, behind the lock that also serialises the
+/// writes themselves. A PATCH whose connection dropped can still commit late; dropping it
+/// when a newer write of the same leaf already landed keeps the client's latest edit.
+async fn write_gate() -> tokio::sync::MutexGuard<'static, HashMap<String, u64>> {
+    static GATE: tokio::sync::OnceCell<tokio::sync::Mutex<HashMap<String, u64>>> =
+        tokio::sync::OnceCell::const_new();
+    GATE.get_or_init(|| async { tokio::sync::Mutex::new(HashMap::new()) })
+        .await
+        .lock()
+        .await
+}
+
+fn patch_leaves(patch: &serde_json::Value) -> Vec<(String, String)> {
+    let Some(sections) = patch.as_object() else {
+        return Vec::new();
+    };
+    sections
+        .iter()
+        .flat_map(|(section, value)| match value.as_object() {
+            Some(fields) => fields
+                .keys()
+                .map(|field| (section.clone(), field.clone()))
+                .collect(),
+            None => vec![(section.clone(), String::new())],
+        })
+        .collect()
+}
+
+/// Remove leaves an equal or newer stamped write already applied; true if any were removed.
+fn drop_stale_leaves(
+    applied: &HashMap<String, u64>,
+    stamp: Option<&WriteStamp>,
+    scope: &str,
+    patch: &mut serde_json::Value,
+) -> bool {
+    let Some(stamp) = stamp else {
+        return false;
+    };
+    let mut dropped = false;
+    for (section, field) in patch_leaves(patch) {
+        if applied
+            .get(&stamp.key(scope, &section, &field))
+            .is_some_and(|&seen| seen >= stamp.seq)
+        {
+            dropped = true;
+            if field.is_empty() {
+                patch.as_object_mut().map(|m| m.remove(&section));
+            } else if let Some(fields) = patch.get_mut(&section).and_then(|v| v.as_object_mut()) {
+                fields.remove(&field);
+                if fields.is_empty() {
+                    patch.as_object_mut().map(|m| m.remove(&section));
+                }
+            }
+        }
+    }
+    dropped
+}
+
+fn record_applied(
+    applied: &mut HashMap<String, u64>,
+    stamp: Option<&WriteStamp>,
+    scope: &str,
+    patch: &serde_json::Value,
+) {
+    let Some(stamp) = stamp else {
+        return;
+    };
+    if applied.len() > MAX_TRACKED_WRITES {
+        applied.clear();
+    }
+    for (section, field) in patch_leaves(patch) {
+        applied.insert(stamp.key(scope, &section, &field), stamp.seq);
+    }
+}
+
+fn stale_write_response() -> axum::response::Response {
+    api_error(
+        StatusCode::CONFLICT,
+        "stale_write",
+        "A newer save of these settings was already applied",
+    )
 }
 
 /// Persist a validated machine-wide patch and apply the side effects of the
@@ -1930,6 +2055,7 @@ fn first_non_cityhall_profile_leaf(patch: &serde_json::Value) -> Option<String> 
 pub async fn update_profile_settings(
     State(state): State<Arc<AppState>>,
     axum::extract::Path(name): axum::extract::Path<String>,
+    headers: HeaderMap,
     session: Option<axum::Extension<AuthenticatedSession>>,
     loopback: Option<axum::Extension<LoopbackTrusted>>,
     body: Result<Json<serde_json::Value>, axum::extract::rejection::JsonRejection>,
@@ -1970,7 +2096,17 @@ pub async fn update_profile_settings(
     // Validate scope before stripping, including global-only local fields.
     strip_local_only(&mut body);
 
-    match write_profile_patch(name, body).await {
+    let stamp = WriteStamp::from_headers(&headers);
+    let mut applied = write_gate().await;
+    if drop_stale_leaves(&applied, stamp.as_ref(), &name, &mut body) && is_empty_patch(&body) {
+        return stale_write_response();
+    }
+    let written = write_profile_patch(name.clone(), body.clone()).await;
+    if written.is_ok() {
+        record_applied(&mut applied, stamp.as_ref(), &name, &body);
+    }
+    drop(applied);
+    match written {
         Ok(config) => match serde_json::to_value(&config) {
             Ok(val) => (StatusCode::OK, Json(val)).into_response(),
             Err(e) => api_error(
@@ -2158,6 +2294,7 @@ mod tests {
                         profile: None,
                         layer: None,
                     }),
+                    HeaderMap::new(),
                     Some(axum::Extension(AuthenticatedSession(session))),
                     None,
                     Ok(Json(body)),
@@ -2208,6 +2345,7 @@ mod tests {
                         profile: None,
                         layer: None,
                     }),
+                    HeaderMap::new(),
                     None,
                     Some(axum::Extension(LoopbackTrusted)),
                     Ok(Json(body)),
@@ -2545,5 +2683,62 @@ mod tests {
             let body = to_bytes(resp.into_body(), 1024).await.unwrap();
             assert!(body.is_empty(), "{name}: unexpected body bytes: {body:?}");
         }
+    }
+    /// A PATCH whose connection dropped can commit after the client's newer edit of the
+    /// same leaf; the stamp makes the server drop it instead of restoring the old value.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn settings_save_drops_a_late_older_write_of_the_same_leaf() {
+        use serde_json::json;
+        let home = tempfile::TempDir::new().unwrap();
+        let _home = crate::session::test_support::isolate_home(home.path());
+        let state = crate::server::test_support::build_test_app_state(Vec::new());
+        let save = |tab_seq: &'static str, slice: &'static str| {
+            let state = state.clone();
+            async move {
+                let mut headers = HeaderMap::new();
+                headers.insert(WRITE_STAMP_HEADER, tab_seq.parse().unwrap());
+                update_settings(
+                    State(state),
+                    axum::extract::Query(SettingsQuery {
+                        profile: None,
+                        layer: Some("machine".into()),
+                    }),
+                    headers,
+                    None,
+                    Some(axum::Extension(LoopbackTrusted)),
+                    Ok(Json(json!({"systemd": {"slice": slice}}))),
+                )
+                .await
+                .into_response()
+                .status()
+            }
+        };
+
+        assert_eq!(save("tab1.2", "newer.slice").await, StatusCode::OK);
+        assert_eq!(save("tab1.1", "older.slice").await, StatusCode::CONFLICT);
+        assert_eq!(
+            crate::session::Config::load().unwrap().systemd.slice,
+            "newer.slice"
+        );
+        // Another tab has its own sequence, and an unstamped write is never dropped.
+        assert_eq!(save("tab2.1", "other-tab.slice").await, StatusCode::OK);
+        assert_eq!(
+            update_settings(
+                State(state.clone()),
+                axum::extract::Query(SettingsQuery {
+                    profile: None,
+                    layer: Some("machine".into()),
+                }),
+                HeaderMap::new(),
+                None,
+                Some(axum::Extension(LoopbackTrusted)),
+                Ok(Json(json!({"systemd": {"slice": "unstamped.slice"}}))),
+            )
+            .await
+            .into_response()
+            .status(),
+            StatusCode::OK
+        );
     }
 }
