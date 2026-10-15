@@ -2,7 +2,7 @@
 
 import { StrictMode } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 
 import { SessionWizard, type WizardPrefill } from "../SessionWizard";
 import {
@@ -578,8 +578,11 @@ describe("SessionWizard Docker readiness", () => {
 
   it("holds a sandboxed Launch for the probe, then reports an unavailable runtime", async () => {
     const answer = pendingProbe();
-    renderWizard({ path: "/tmp/proj", tool: "claude", sandboxEnabled: true });
-    await waitFor(() => expect(fetchSettings).toHaveBeenCalled());
+    vi.mocked(fetchSettings).mockResolvedValueOnce({ session: { default_tool: "opencode" }, sandbox: {} } as never);
+    renderWizard({ path: "/tmp/proj", sandboxEnabled: true });
+    // The seeded defaults are applied, so only the Docker probe can still hold Launch.
+    await waitFor(() => expect(screen.getByTestId("wizard-agent-row").textContent).toContain("opencode"));
+    await act(async () => {});
     expect(launchButton().disabled).toBe(true);
     answer(false);
     await waitFor(() => expect(launchButton().disabled).toBe(false));
