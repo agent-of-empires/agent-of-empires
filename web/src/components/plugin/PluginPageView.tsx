@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState, type ReactNode } from "react";
+import { useCallback, useEffect, useRef, useState, type ReactNode } from "react";
 import {
   fetchPluginUiState,
   fetchSessions,
@@ -28,6 +28,11 @@ interface Props {
   readOnly: boolean;
   cityhall: boolean;
   theme: ResolvedTheme | null;
+}
+
+function closePort(port: { current: MessagePort | null }) {
+  port.current?.close();
+  port.current = null;
 }
 
 async function runCall(call: BridgeCall, pluginId: string): Promise<unknown> {
@@ -63,10 +68,17 @@ export function PluginPageView({ pluginId, pageId, onBack, readOnly, cityhall, t
   const [attempt, setAttempt] = useState(0);
   const [minted, setMinted] = useState<{ page: PluginPage; attempt: number; ok: boolean } | null>(null);
   const [lost, setLost] = useState(false);
-  const frameRef = useRef<HTMLIFrameElement>(null);
+  const frameRef = useRef<HTMLIFrameElement | null>(null);
   // A frame's second load is a new document behind the same window, so it no longer holds the handshake.
   const loads = useRef(0);
-  const ready = useRef(false);
+  // Transferred by the page with `ready`; a later document can never reach it, so nothing crosses a navigation.
+  const port = useRef<MessagePort | null>(null);
+
+  const attachFrame = useCallback((frame: HTMLIFrameElement | null) => {
+    frameRef.current = frame;
+    loads.current = 0;
+    closePort(port);
+  }, []);
 
   // The frame load authenticates with the ticket this sets, so mint before rendering it.
   useEffect(() => {
@@ -80,33 +92,36 @@ export function PluginPageView({ pluginId, pageId, onBack, readOnly, cityhall, t
     };
   }, [page, attempt]);
 
-  // Installed before the frame exists, so a page's first message cannot beat it.
+  // Installed before the frame exists, so a page's handshake cannot beat it.
   useEffect(() => {
     if (!page) return;
+    const grants = { capabilities: page.capabilities, readOnly, cityhall };
     const onMessage = (event: MessageEvent) => {
       // `event.origin` is "null" for the sandboxed frame; only the window identifies it.
       const frame = frameRef.current?.contentWindow;
-      if (!frame || event.source !== frame || loads.current > 1) return;
+      if (!frame || event.source !== frame || loads.current > 1 || port.current) return;
       const req = parseRequest(event.data);
-      if (!req) return;
-      const post = (msg: unknown) => {
-        if (frameRef.current?.contentWindow === frame && loads.current <= 1) frame.postMessage(msg, "*");
+      const channel = event.ports[0];
+      if (req?.method !== "ready" || !channel) return;
+      port.current = channel;
+      channel.onmessage = (e: MessageEvent) => {
+        const call = parseRequest(e.data);
+        if (!call) return;
+        const resolved = resolveRequest(call, grants);
+        if ("error" in resolved) {
+          channel.postMessage(bridgeError(call.id, resolved.error, resolved.message));
+          return;
+        }
+        runCall(resolved.call, page.plugin_id).then(
+          (result) => channel.postMessage(bridgeReply(call.id, result)),
+          () => channel.postMessage(bridgeError(call.id, "failed", `${call.method} failed.`)),
+        );
       };
-      const resolved = resolveRequest(req, { capabilities: page.capabilities, readOnly, cityhall });
-      if ("error" in resolved) {
-        post(bridgeError(req.id, resolved.error, resolved.message));
-        return;
-      }
-      runCall(resolved.call, page.plugin_id).then(
-        (result) => {
-          post(bridgeReply(req.id, result));
-          if (resolved.call.method !== "ready") return;
-          ready.current = true;
-          post(bridgePush("context", { readOnly, cityhall, pluginId, pageId, bridgeVersion: BRIDGE_VERSION }));
-          if (theme) post(bridgePush("theme", themePayload(theme)));
-        },
-        () => post(bridgeError(req.id, "failed", `${req.method} failed.`)),
+      channel.postMessage(bridgeReply(req.id, null));
+      channel.postMessage(
+        bridgePush("context", { readOnly, cityhall, pluginId, pageId, bridgeVersion: BRIDGE_VERSION }),
       );
+      if (theme) channel.postMessage(bridgePush("theme", themePayload(theme)));
     };
     window.addEventListener("message", onMessage);
     return () => window.removeEventListener("message", onMessage);
@@ -115,11 +130,8 @@ export function PluginPageView({ pluginId, pageId, onBack, readOnly, cityhall, t
   useEffect(
     () =>
       listen(
-        (event) => {
-          if (!ready.current || loads.current > 1) return;
-          const next = (event as CustomEvent<ResolvedTheme>).detail;
-          frameRef.current?.contentWindow?.postMessage(bridgePush("theme", themePayload(next)), "*");
-        },
+        (event) =>
+          port.current?.postMessage(bridgePush("theme", themePayload((event as CustomEvent<ResolvedTheme>).detail))),
         [window, THEME_CHANGED_EVENT],
       ),
     [],
@@ -127,12 +139,13 @@ export function PluginPageView({ pluginId, pageId, onBack, readOnly, cityhall, t
 
   const onFrameLoad = () => {
     loads.current += 1;
-    if (loads.current > 1) setLost(true);
+    if (loads.current > 1) {
+      closePort(port);
+      setLost(true);
+    }
   };
 
   const reopen = () => {
-    loads.current = 0;
-    ready.current = false;
     setLost(false);
     setAttempt((a) => a + 1);
   };
@@ -155,7 +168,7 @@ export function PluginPageView({ pluginId, pageId, onBack, readOnly, cityhall, t
     body = (
       <iframe
         key={attempt}
-        ref={frameRef}
+        ref={attachFrame}
         title={page.title}
         src={page.url}
         sandbox="allow-scripts"

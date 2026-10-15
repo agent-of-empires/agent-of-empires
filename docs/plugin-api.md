@@ -338,9 +338,9 @@ A worker may push state for a page with `ui.state.set` (`slot = "page"`, `id` = 
 
 #### Page bridge
 
-The page talks to the dashboard with `postMessage` to `parent`; the dashboard replies to the page's window with target origin `"*"`, since the page's origin is opaque. Every message carries `aoeBridge: 1`, the bridge version.
+The page opens the bridge by posting `ready` to `parent` with target origin `"*"`, since its origin is opaque, and transferring one end of a `MessageChannel`. Every later request, reply and push travels over that channel, so nothing reaches a document that replaces the page. The dashboard accepts one `ready` per frame and ignores any other message on the window. Every message carries `aoeBridge: 1`, the bridge version.
 
-A request is `{ "aoeBridge": 1, "id", "method", "params"? }`, where `id` is a number or a string of at most 128 characters and `params` an object. The reply echoes the `id` with either `result` or `error: { "code", "message" }`. The dashboard drops, without replying, any message that comes from another window, is not an object, has another version, or has a malformed `id`, `method` or `params`.
+A request is `{ "aoeBridge": 1, "id", "method", "params"? }`, where `id` is a number or a string of at most 128 characters and `params` an object. The reply echoes the `id` with either `result` or `error: { "code", "message" }`. The dashboard drops, without replying, any message that is not an object, has another version, or has a malformed `id`, `method` or `params`.
 
 | Method | Params | Requires | Result |
 |---|---|---|---|
@@ -363,28 +363,32 @@ When the frame loads a second document, because the page reloaded or navigated i
 let next = 0;
 const pending = new Map<number, (reply: { result?: unknown; error?: { code: string; message: string } }) => void>();
 const handlers: Record<string, (data: any) => void> = {};
+const { port1, port2 } = new MessageChannel();
 
-addEventListener("message", (e) => {
-  const m = e.data;
-  if (e.source !== parent || m?.aoeBridge !== 1) return;
+port1.onmessage = ({ data: m }) => {
   if (m.event) return handlers[m.event]?.(m.data);
   pending.get(m.id)?.(m);
   pending.delete(m.id);
-});
+};
 
-function call<T>(method: string, params?: object): Promise<T> {
+function request<T>(msg: object, send: (msg: object) => void): Promise<T> {
   const id = ++next;
-  parent.postMessage({ aoeBridge: 1, id, method, params }, "*");
-  return new Promise((resolve, reject) =>
+  const reply = new Promise<T>((resolve, reject) =>
     pending.set(id, (m) => (m.error ? reject(m.error) : resolve(m.result as T))),
   );
+  send({ aoeBridge: 1, id, ...msg });
+  return reply;
 }
+
+const call = <T>(method: string, params?: object) => request<T>({ method, params }, (m) => port1.postMessage(m));
 
 handlers.theme = ({ cssVars }) => {
   for (const [k, v] of Object.entries(cssVars)) document.documentElement.style.setProperty(k, String(v));
 };
 handlers.context = (ctx) => console.log("bridge context", ctx);
-call("ready").then(() => call<{ id: string }[]>("sessions.list")).then((sessions) => console.log(sessions));
+request({ method: "ready" }, (m) => parent.postMessage(m, "*", [port2]))
+  .then(() => call<{ id: string }[]>("sessions.list"))
+  .then((sessions) => console.log(sessions));
 ```
 
 ### Badge payload

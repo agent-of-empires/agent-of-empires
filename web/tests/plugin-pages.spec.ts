@@ -32,23 +32,24 @@ const BRIDGE_FIXTURE = `<!doctype html><p>bridge fixture</p><script>
 let next = 0;
 const pending = new Map();
 const pushes = [];
-addEventListener("message", (e) => {
+const { port1, port2 } = new MessageChannel();
+port1.onmessage = (e) => {
   const m = e.data;
-  if (!m || m.aoeBridge !== 1) return;
   if (m.event) {
     pushes.push(m);
     if (m.event === "theme") parent.postMessage({ kind: "theme", data: m.data }, "*");
     return;
   }
   pending.get(m.id)?.(m);
+};
+const send = (msg, transfer) => new Promise((resolve) => {
+  pending.set(msg.id, resolve);
+  if (transfer) parent.postMessage(msg, "*", transfer);
+  else port1.postMessage(msg);
 });
-window.call = (method, params) => new Promise((resolve) => {
-  const id = ++next;
-  pending.set(id, resolve);
-  parent.postMessage({ aoeBridge: 1, id, method, params }, "*");
-});
+window.call = (method, params) => send({ aoeBridge: 1, id: ++next, method, params });
 (async () => {
-  const ready = await call("ready");
+  const ready = await send({ aoeBridge: 1, id: ++next, method: "ready" }, [port2]);
   const sessions = await call("sessions.list");
   const uiState = await call("plugins.uiState");
   const action = await call("action", { method: "move", params: { to: "done" }, sessionId: "sess-a" });

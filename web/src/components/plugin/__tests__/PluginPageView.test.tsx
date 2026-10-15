@@ -50,15 +50,25 @@ const darkTheme = {
   syntax: { shikiTheme: "x" },
 } as const satisfies ResolvedTheme;
 
+function fakePort() {
+  const port = { postMessage: vi.fn(), close: vi.fn(), onmessage: null as ((e: { data: unknown }) => void) | null };
+  const request = (data: unknown) => act(() => port.onmessage?.({ data }));
+  return { port, request };
+}
+
 async function openFrame() {
   h.mint.mockResolvedValue(true);
-  view();
+  const utils = view();
   const frame = (await screen.findByTestId("plugin-page-frame")) as HTMLIFrameElement;
   const win = frame.contentWindow!;
-  const posted = vi.spyOn(win, "postMessage").mockImplementation(() => {});
-  const send = (data: unknown, source: Window | null = win) =>
-    act(() => window.dispatchEvent(new MessageEvent("message", { data, source, origin: "null" })));
-  return { frame, posted, send };
+  // jsdom's MessageEvent rejects foreign ports, so attach the transferred port after construction.
+  const send = (data: unknown, ports: unknown[] = [], source: Window | null = win) =>
+    act(() => {
+      const event = new MessageEvent("message", { data, source, origin: "null" });
+      Object.defineProperty(event, "ports", { value: ports });
+      window.dispatchEvent(event);
+    });
+  return { ...utils, frame, send };
 }
 
 beforeEach(() => {
@@ -98,47 +108,77 @@ describe("PluginPageView", () => {
     expect(h.mint).not.toHaveBeenCalled();
   });
 
-  it("answers only its own frame, by window rather than origin", async () => {
+  it("hands the channel only to its own frame's ready, then serves requests over it", async () => {
     h.sessions.mockResolvedValue({ sessions: [{ id: "s" }], workspace_ordering: [] });
-    const { posted, send } = await openFrame();
-    await send({ aoeBridge: 1, id: 1, method: "sessions.list" }, window);
-    await send({ aoeBridge: 1, id: 2, method: "sessions.list" });
-    await waitFor(() => expect(posted).toHaveBeenCalledWith({ aoeBridge: 1, id: 2, result: [{ id: "s" }] }, "*"));
+    const { send } = await openFrame();
+    const foreign = fakePort();
+    await send({ aoeBridge: 1, id: 1, method: "ready" }, [foreign.port], window);
+    await send({ aoeBridge: 1, id: 2, method: "sessions.list" }, [foreign.port]);
+    expect(foreign.port.onmessage).toBeNull();
+
+    const { port, request } = fakePort();
+    await send({ aoeBridge: 1, id: "r", method: "ready" }, [port]);
+    expect(port.postMessage).toHaveBeenCalledWith({ aoeBridge: 1, id: "r", result: null });
+    const late = fakePort();
+    await send({ aoeBridge: 1, id: "r2", method: "ready" }, [late.port]);
+    expect(late.port.onmessage).toBeNull();
+
+    await request({ aoeBridge: 1, id: 3, method: "sessions.list" });
+    await waitFor(() => expect(port.postMessage).toHaveBeenCalledWith({ aoeBridge: 1, id: 3, result: [{ id: "s" }] }));
     expect(h.sessions).toHaveBeenCalledTimes(1);
   });
 
   it("pushes context and theme after ready, and every later theme change", async () => {
-    const { posted, send } = await openFrame();
-    await send({ aoeBridge: 1, id: "r", method: "ready" });
-    await waitFor(() =>
-      expect(posted).toHaveBeenCalledWith(
-        {
-          aoeBridge: 1,
-          event: "context",
-          data: { readOnly: false, cityhall: false, pluginId: "acme.kit", pageId: "board", bridgeVersion: 1 },
-        },
-        "*",
-      ),
-    );
+    const { send } = await openFrame();
+    const { port } = fakePort();
+    await send({ aoeBridge: 1, id: "r", method: "ready" }, [port]);
+    expect(port.postMessage).toHaveBeenCalledWith({
+      aoeBridge: 1,
+      event: "context",
+      data: { readOnly: false, cityhall: false, pluginId: "acme.kit", pageId: "board", bridgeVersion: 1 },
+    });
     act(() => window.dispatchEvent(new CustomEvent(THEME_CHANGED_EVENT, { detail: darkTheme })));
-    expect(posted).toHaveBeenLastCalledWith(
-      {
-        aoeBridge: 1,
-        event: "theme",
-        data: { appearance: "dark", cssVars: { "--color-surface-900": "#000", "--term-bg": "#111" } },
-      },
-      "*",
-    );
+    expect(port.postMessage).toHaveBeenLastCalledWith({
+      aoeBridge: 1,
+      event: "theme",
+      data: { appearance: "dark", cssVars: { "--color-surface-900": "#000", "--term-bg": "#111" } },
+    });
   });
 
-  it("tears the frame down when it loads a second document, and reopens with a fresh ticket", async () => {
-    const { frame } = await openFrame();
+  it("tears the frame down and closes the channel when it loads a second document, then reopens fresh", async () => {
+    const { frame, send } = await openFrame();
+    const { port } = fakePort();
     fireEvent.load(frame);
+    await send({ aoeBridge: 1, id: "r", method: "ready" }, [port]);
     expect(screen.getByTestId("plugin-page-frame")).toBe(frame);
     fireEvent.load(frame);
+    expect(port.close).toHaveBeenCalled();
     expect(screen.queryByTestId("plugin-page-frame")).toBeNull();
     fireEvent.click(screen.getByText("Reopen"));
     expect(h.mint).toHaveBeenCalledTimes(2);
     expect(await screen.findByTestId("plugin-page-frame")).not.toBe(frame);
+  });
+
+  it("starts a remounted frame's load count afresh", async () => {
+    const { frame, rerender } = await openFrame();
+    fireEvent.load(frame);
+    h.pages = [{ ...board }];
+    rerender(
+      <PluginPageView
+        pluginId="acme.kit"
+        pageId="board"
+        onBack={() => {}}
+        readOnly={false}
+        cityhall={false}
+        theme={null}
+      />,
+    );
+    const next = await waitFor(() => {
+      const f = screen.getByTestId("plugin-page-frame");
+      expect(f).not.toBe(frame);
+      return f;
+    });
+    fireEvent.load(next);
+    expect(screen.getByTestId("plugin-page-frame")).toBe(next);
   });
 });
