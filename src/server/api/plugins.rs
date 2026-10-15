@@ -164,9 +164,8 @@ pub async fn serve_plugin_page(
     uri: axum::http::Uri,
     headers: axum::http::HeaderMap,
 ) -> Response {
-    // Second layer behind the CSP `sandbox`: never hand executable HTML to a tab.
-    // Browsers omit `Sec-Fetch-*` outside secure contexts (plain HTTP by LAN IP),
-    // so an absent header falls back to the sandbox alone.
+    // Second layer behind the CSP `sandbox`. Browsers omit `Sec-Fetch-*` outside
+    // secure contexts (plain HTTP by LAN IP), so only a non-frame value is refused.
     if headers
         .get("sec-fetch-dest")
         .is_some_and(|v| v.as_bytes() != b"iframe")
@@ -1151,6 +1150,7 @@ mod tests {
             ("", cookie, Some("document"), StatusCode::FORBIDDEN),
             // Plain HTTP by LAN IP: no `Sec-Fetch-*` at all.
             ("", cookie, None, StatusCode::NOT_FOUND),
+            ("?token=secret-token", cookie, None, StatusCode::BAD_REQUEST),
             ("?token=wrong", None, frame, StatusCode::UNAUTHORIZED),
         ];
         for (query, cookie, dest, want) in cases {
