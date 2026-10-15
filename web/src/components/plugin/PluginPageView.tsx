@@ -9,6 +9,7 @@ import {
 } from "../../lib/api";
 import {
   BRIDGE_VERSION,
+  BridgeRefusal,
   bridgeError,
   bridgePush,
   bridgeReply,
@@ -66,11 +67,22 @@ async function runCall(call: BridgeCall, pluginId: string): Promise<unknown> {
       return null;
     // Null, not the session row, which is wider than the summary sessions.list hands a page.
     case "session.archive":
+      await requireListed(pluginId, call.sessionId);
       if (!(await setSessionArchive(call.sessionId, true))) throw new Error("archive failed");
       return null;
     case "session.trash":
+      await requireListed(pluginId, call.sessionId);
       if (!(await trashSession(call.sessionId))) throw new Error("trash failed");
       return null;
+  }
+}
+
+/** Only an exact id from sessions.list, which is scoped to the plugin host's profile, reaches the lifecycle API. */
+async function requireListed(pluginId: string, sessionId: string) {
+  const reply = await fetchPluginSessions(pluginId);
+  if (!reply) throw new Error("sessions unavailable");
+  if (!reply.sessions.some((s) => s.id === sessionId)) {
+    throw new BridgeRefusal("invalid_params", `No session ${sessionId} in this profile.`);
   }
 }
 
@@ -125,7 +137,12 @@ export function PluginPageView({ pluginId, pageId, onBack, readOnly, cityhall, t
       }
       runCall(resolved.call, page.plugin_id).then(
         (result) => channel.postMessage(bridgeReply(call.id, result)),
-        () => channel.postMessage(bridgeError(call.id, "failed", `${call.method} failed.`)),
+        (e: unknown) =>
+          channel.postMessage(
+            e instanceof BridgeRefusal
+              ? bridgeError(call.id, e.code, e.message)
+              : bridgeError(call.id, "failed", `${call.method} failed.`),
+          ),
       );
     };
     // An open channel resolves against the current modes, not those at its handshake.

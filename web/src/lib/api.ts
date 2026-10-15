@@ -1723,7 +1723,7 @@ export function setSessionNotifications(id: string, preset: "off" | "default" | 
 }
 
 const sessionUpdate = (id: string, action: string, init: RequestInit) =>
-  fetchJson<SessionResponse>(`/api/sessions/${id}/${action}`, init);
+  fetchJson<SessionResponse>(`/api/sessions/${encodeURIComponent(id)}/${action}`, init);
 
 /** Set or clear (`null`) one repo's diff base; omit `repo` for a single-repo session. */
 export function setSessionDiffBase(

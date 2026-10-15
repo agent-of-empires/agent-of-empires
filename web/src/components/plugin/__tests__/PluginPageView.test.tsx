@@ -203,7 +203,8 @@ describe("PluginPageView", () => {
   });
 
   it("archives and trashes the target session, replying null or failed", async () => {
-    h.pages = [{ ...board, capabilities: ["session.write"] }];
+    h.pages = [{ ...board, capabilities: ["session.read", "session.write"] }];
+    h.sessions.mockResolvedValue({ sessions: [{ id: "s" }] });
     h.archive.mockResolvedValue({ id: "s" });
     h.trash.mockResolvedValueOnce({ id: "s" }).mockResolvedValueOnce(null);
     const { send, nonce } = await openFrame();
@@ -222,6 +223,28 @@ describe("PluginPageView", () => {
     expect(h.archive.mock.calls).toEqual([["s", true]]);
     expect(h.trash.mock.calls).toEqual([["s"], ["s"]]);
   });
+
+  it.each(["other", "../plugins/victim/uninstall#", "..", "%2e%2e", "s/../x"])(
+    "refuses to archive or trash %s, which sessions.list does not return",
+    async (id) => {
+      h.pages = [{ ...board, capabilities: ["session.read", "session.write"] }];
+      h.sessions.mockResolvedValue({ sessions: [{ id: "s" }] });
+      const { send, nonce } = await openFrame();
+      const { port, request } = fakePort();
+      await send({ aoeBridge: 1, id: "r", method: "ready", params: { nonce } }, [port]);
+      await request({ aoeBridge: 1, id: 2, method: "session.archive", params: { id } });
+      await request({ aoeBridge: 1, id: 3, method: "session.trash", params: { id } });
+      await waitFor(() => {
+        for (const reqId of [2, 3]) {
+          expect(port.postMessage).toHaveBeenCalledWith(
+            expect.objectContaining({ id: reqId, error: expect.objectContaining({ code: "invalid_params" }) }),
+          );
+        }
+      });
+      expect(h.archive).not.toHaveBeenCalled();
+      expect(h.trash).not.toHaveBeenCalled();
+    },
+  );
 
   it("gates an open channel's requests on the current mode", async () => {
     const { send, rerender, nonce } = await openFrame();

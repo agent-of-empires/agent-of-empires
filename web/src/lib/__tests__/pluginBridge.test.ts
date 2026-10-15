@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { parseRequest, resolveRequest, type BridgeGrants } from "../pluginBridge";
 
+const RW = ["session.read", "session.write"];
 const open: BridgeGrants = { capabilities: ["session.read"], readOnly: false, cityhall: false };
 
 describe("parseRequest", () => {
@@ -48,21 +49,27 @@ describe("resolveRequest", () => {
     { method: "action", params: { method: "move", sessionId: 3 }, grants: {}, error: "invalid_params" },
     { method: "openSession", params: { id: "s" }, grants: { readOnly: true, cityhall: true }, error: null },
     { method: "openSession", params: {}, grants: {}, error: "invalid_params" },
-    { method: "session.archive", params: { id: "s" }, grants: { capabilities: ["session.write"] }, error: null },
-    { method: "session.trash", params: { id: "s" }, grants: { capabilities: ["session.write"] }, error: null },
+    { method: "session.archive", params: { id: "s" }, grants: { capabilities: RW }, error: null },
+    { method: "session.trash", params: { id: "s" }, grants: { capabilities: RW }, error: null },
     { method: "session.archive", params: { id: "s" }, grants: {}, error: "capability_denied" },
     { method: "session.trash", params: { id: "s" }, grants: {}, error: "capability_denied" },
-    { method: "session.trash", params: {}, grants: { capabilities: ["session.write"] }, error: "invalid_params" },
+    { method: "session.trash", params: {}, grants: { capabilities: RW }, error: "invalid_params" },
+    {
+      method: "session.trash",
+      params: { id: "s" },
+      grants: { capabilities: ["session.write"] },
+      error: "capability_denied",
+    },
     {
       method: "session.archive",
       params: { id: "s" },
-      grants: { capabilities: ["session.write"], readOnly: true },
+      grants: { capabilities: RW, readOnly: true },
       error: "read_only",
     },
     {
       method: "session.trash",
       params: { id: "s" },
-      grants: { capabilities: ["session.write"], cityhall: true },
+      grants: { capabilities: RW, cityhall: true },
       error: "cityhall_mode",
     },
     { method: "sessions.archive", params: {}, grants: {}, error: "unknown_method" },
@@ -72,7 +79,7 @@ describe("resolveRequest", () => {
   });
 
   it("maps a session target to the call", () => {
-    expect(resolve("session.trash", { id: "s" }, { capabilities: ["session.write"] })).toEqual({
+    expect(resolve("session.trash", { id: "s" }, { capabilities: RW })).toEqual({
       call: { method: "session.trash", sessionId: "s" },
     });
   });

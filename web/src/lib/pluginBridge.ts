@@ -52,15 +52,18 @@ export function parseRequest(data: unknown): BridgeRequest | null {
 
 type Parse = (params: Record<string, unknown>) => BridgeCall | null;
 
+// The target must be a session sessions.list returns, so the page needs to read it too.
+const TARGET_CAPS = ["session.read", "session.write"];
+
 const sessionTarget =
   (method: "session.archive" | "session.trash"): Parse =>
   ({ id }) =>
     isText(id) ? { method, sessionId: id } : null;
 
-const METHODS = new Map<string, { capability?: string; mutates?: boolean; parse: Parse }>([
+const METHODS = new Map<string, { capabilities?: string[]; mutates?: boolean; parse: Parse }>([
   ["ready", { parse: () => ({ method: "ready" }) }],
-  ["sessions.list", { capability: "session.read", parse: () => ({ method: "sessions.list" }) }],
-  ["plugins.uiState", { capability: "session.read", parse: () => ({ method: "plugins.uiState" }) }],
+  ["sessions.list", { capabilities: ["session.read"], parse: () => ({ method: "sessions.list" }) }],
+  ["plugins.uiState", { capabilities: ["session.read"], parse: () => ({ method: "plugins.uiState" }) }],
   [
     "action",
     {
@@ -73,8 +76,8 @@ const METHODS = new Map<string, { capability?: string; mutates?: boolean; parse:
     },
   ],
   ["openSession", { parse: ({ id }) => (isText(id) ? { method: "openSession", sessionId: id } : null) }],
-  ["session.archive", { capability: "session.write", mutates: true, parse: sessionTarget("session.archive") }],
-  ["session.trash", { capability: "session.write", mutates: true, parse: sessionTarget("session.trash") }],
+  ["session.archive", { capabilities: TARGET_CAPS, mutates: true, parse: sessionTarget("session.archive") }],
+  ["session.trash", { capabilities: TARGET_CAPS, mutates: true, parse: sessionTarget("session.trash") }],
 ]);
 
 /** Validates params, then gates on the plugin's capabilities and the dashboard mode. */
@@ -83,12 +86,20 @@ export function resolveRequest(req: BridgeRequest, grants: BridgeGrants): Bridge
   if (!spec) return { error: "unknown_method", message: `Unknown method ${req.method}.` };
   const call = spec.parse(req.params);
   if (!call) return { error: "invalid_params", message: `Invalid params for ${req.method}.` };
-  if (spec.capability && !grants.capabilities.includes(spec.capability)) {
-    return { error: "capability_denied", message: `${req.method} requires the ${spec.capability} capability.` };
-  }
+  const missing = spec.capabilities?.find((cap) => !grants.capabilities.includes(cap));
+  if (missing) return { error: "capability_denied", message: `${req.method} requires the ${missing} capability.` };
   if (spec.mutates && grants.readOnly) return { error: "read_only", message: "The dashboard is read-only." };
   if (spec.mutates && grants.cityhall) return { error: "cityhall_mode", message: "Not available in CityHall mode." };
   return { call };
+}
+
+/** Thrown by a call to reply with `code` rather than `failed`. */
+export class BridgeRefusal extends Error {
+  readonly code: BridgeErrorCode;
+  constructor(code: BridgeErrorCode, message: string) {
+    super(message);
+    this.code = code;
+  }
 }
 
 export const bridgeReply = (id: BridgeId, result: unknown) => ({ aoeBridge: BRIDGE_VERSION, id, result });

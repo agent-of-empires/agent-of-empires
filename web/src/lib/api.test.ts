@@ -355,6 +355,12 @@ const requestCases: RequestCase[] = [
     () => api.trashSession("s1"),
     { body: { kill_pane: true }, respond: json(session), result: session },
   ],
+  // A hostile id stays inside its path segment.
+  [
+    "POST /api/sessions/..%2Fplugins%2Fx%2Funinstall%23/trash",
+    () => api.trashSession("../plugins/x/uninstall#"),
+    { body: { kill_pane: true } },
+  ],
   ["POST /api/sessions/s1/restore", () => api.restoreSession("s1"), { respond: json(session), result: session }],
   ["POST /api/sessions/s1/stop", () => api.stopSession("s1"), { respond: json(session), result: session }],
   [
