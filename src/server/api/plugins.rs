@@ -1454,6 +1454,7 @@ id = "voice"
                 "title": "Board",
                 "icon": null,
                 "url": "/api/plugins/acme.board/pages/board",
+                "capabilities": [],
             }])
         );
     }
