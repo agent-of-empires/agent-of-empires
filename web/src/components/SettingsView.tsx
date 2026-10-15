@@ -14,6 +14,7 @@ import {
   updateProfileSettings,
   updateSettings,
   updateTheme,
+  type SettingsResponse,
 } from "../lib/api";
 import { loadSettings, saveField, useProfileSettings } from "../lib/settingsStore";
 import type { ProfileInfo, SettingsFieldDescriptor } from "../lib/types";
@@ -259,7 +260,8 @@ export function SettingsView({
   // Seed from the `?profile=` query (deep-link from the Profiles page) when
   // present, else empty (see the note above on why not "default").
   const [selectedProfile, setSelectedProfile] = useState(profile ?? "");
-  const { settings, saving, error: saveError } = useProfileSettings(selectedProfile);
+  const { settings: storedSettings, saving, error: saveError } = useProfileSettings(selectedProfile);
+  const settings = storedSettings as SettingsResponse | null;
   // Bumped only on a user-initiated profile switch (the header picker), never
   // on the mount-time fetchProfiles resolution that flips selectedProfile from
   // its "" seed to the default. The content fieldset keys its remount on this
@@ -389,10 +391,10 @@ export function SettingsView({
     [selectedProfile, cityhall],
   );
 
-  const session = (settings?.session ?? {}) as Record<string, unknown>;
-  const sandbox = (settings?.sandbox ?? {}) as Record<string, unknown>;
-  const worktree = (settings?.worktree ?? {}) as Record<string, unknown>;
-  const web = (settings?.web ?? {}) as Record<string, unknown>;
+  const session = settings?.session ?? {};
+  const sandbox = settings?.sandbox ?? {};
+  const worktree = settings?.worktree ?? {};
+  const web = settings?.web ?? {};
 
   // The theme name and color mode are global preferences, not
   // profile-overridable: write them through the dedicated non-elevated
@@ -545,7 +547,7 @@ export function SettingsView({
             section="theme"
             schema={schema}
             focusRequest={focusRequest}
-            values={(settings?.theme ?? {}) as Record<string, unknown>}
+            values={settings?.theme ?? {}}
             onSaveField={saveThemeField}
             hideFields={cityhall ? CITYHALL_THEME_HIDDEN : undefined}
           />
@@ -560,7 +562,7 @@ export function SettingsView({
             section="sound"
             schema={schema}
             focusRequest={focusRequest}
-            values={(settings?.sound ?? {}) as Record<string, unknown>}
+            values={settings?.sound ?? {}}
             onSaveField={sendSave}
           />
         );
@@ -570,7 +572,7 @@ export function SettingsView({
             section="tmux"
             schema={schema}
             focusRequest={focusRequest}
-            values={(settings?.tmux ?? {}) as Record<string, unknown>}
+            values={settings?.tmux ?? {}}
             onSaveField={sendSave}
           />
         );
@@ -580,7 +582,7 @@ export function SettingsView({
             section="systemd"
             schema={schema}
             focusRequest={focusRequest}
-            values={(settings?.systemd ?? {}) as Record<string, unknown>}
+            values={settings?.systemd ?? {}}
             onSaveField={sendSave}
             advancedSubtitle="Per-session memory and task limits."
           />
@@ -591,7 +593,7 @@ export function SettingsView({
             section="updates"
             schema={schema}
             focusRequest={focusRequest}
-            values={(settings?.updates ?? {}) as Record<string, unknown>}
+            values={settings?.updates ?? {}}
             onSaveField={sendSave}
           />
         );
@@ -605,7 +607,7 @@ export function SettingsView({
             section="logging"
             schema={schema}
             focusRequest={focusRequest}
-            values={(settings?.logging ?? {}) as Record<string, unknown>}
+            values={settings?.logging ?? {}}
             onSaveField={sendSave}
             advancedSubtitle="Sink and rotation; some fields require restarting aoe to take effect."
           />
@@ -658,7 +660,7 @@ export function SettingsView({
         if (!settings) {
           return <div className="text-sm text-text-dim">Loading settings...</div>;
         }
-        const acp = (settings.acp ?? {}) as Record<string, unknown>;
+        const acp = settings.acp ?? {};
         return (
           <div className="space-y-4">
             {/* Tour anchor for the per-agent defaults step (#2631). Anchored on
