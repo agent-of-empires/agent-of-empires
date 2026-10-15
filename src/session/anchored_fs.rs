@@ -298,7 +298,9 @@ impl AnchoredDir {
     /// is unlinked unseen. A leftover `.aoe-prev` that is
     /// a link to the live file is dropped; any other fails the next replace
     /// rather than being overwritten. A writer that holds
-    /// the old file open past the post-check is not covered.
+    /// the old file open past the post-check is not covered, nor is one
+    /// that replaces `to` by path (rename over it, or unlink and recreate)
+    /// between the backup link and the rename.
     pub(crate) fn publish_staged(
         &self,
         from: &Path,
