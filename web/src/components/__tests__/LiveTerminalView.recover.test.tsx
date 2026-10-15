@@ -92,6 +92,19 @@ describe("LiveTerminalView after the agent exits", () => {
     await waitFor(() => expect(live.ensureSession).toHaveBeenCalledTimes(2));
   });
 
+  it("does not treat Idle to Running as a Start, so a later exit is not auto-restarted", async () => {
+    live.state.paneDead = false;
+    live.state.connected = true;
+    const { rerender } = render(<LiveTerminalView session={makeSession({ id: "dead", status: "Idle" })} />);
+    await waitFor(() => expect(live.ensureSession).toHaveBeenCalledTimes(1));
+    rerender(<LiveTerminalView session={makeSession({ id: "dead", status: "Running" })} />);
+    live.state.connected = false;
+    live.state.paneDead = true;
+    rerender(<LiveTerminalView session={makeSession({ id: "dead", status: "Running" })} />);
+    await screen.findByRole("button", { name: "Restart" });
+    expect(live.ensureSession).toHaveBeenCalledTimes(1);
+  });
+
   it("does not re-ensure on a status change while the pane is alive", async () => {
     live.state.paneDead = false;
     const { rerender } = render(<LiveTerminalView session={makeSession({ id: "dead", status: "Stopped" })} />);
