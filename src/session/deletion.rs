@@ -1472,6 +1472,15 @@ mod tests {
     fn init_repo(path: &Path) {
         std::fs::create_dir_all(path).unwrap();
         let repo = git2::Repository::init(path).unwrap();
+        // Prevent global/user excludes from hiding dirty-worktree test fixtures.
+        let excludes = repo.path().join("test-excludes");
+        std::fs::write(&excludes, "").unwrap();
+        repo.config()
+            .unwrap()
+            .open_level(git2::ConfigLevel::Local)
+            .unwrap()
+            .set_str("core.excludesFile", excludes.to_str().unwrap())
+            .unwrap();
         let sig = git2::Signature::now("Test", "test@example.com").unwrap();
         let tree_id = repo.index().unwrap().write_tree().unwrap();
         let tree = repo.find_tree(tree_id).unwrap();
@@ -1878,7 +1887,8 @@ mod tests {
 
     mod ordering {
         use super::*;
-        use std::sync::{Arc, Mutex};
+        use parking_lot::Mutex;
+        use std::sync::Arc;
         use tracing::field::{Field, Visit};
         use tracing::subscriber::with_default;
         use tracing::Subscriber;
@@ -1928,21 +1938,30 @@ mod tests {
                 let mut v = V::default();
                 event.record(&mut v);
                 if v.msg.as_deref() == Some("perform_deletion: stage") {
-                    self.stages.lock().unwrap().extend(v.stage);
+                    self.stages.lock().extend(v.stage);
                 }
             }
         }
 
         fn stages_of(request: &DeletionRequest) -> (Vec<String>, DeletionResult) {
+            stages_of_with(request, |session_id| {
+                DockerContainer::from_session_id(session_id).teardown(session_id)
+            })
+        }
+
+        fn stages_of_with(
+            request: &DeletionRequest,
+            teardown: impl FnOnce(&str) -> Teardown,
+        ) -> (Vec<String>, DeletionResult) {
             let stages = Arc::new(Mutex::new(Vec::new()));
             let subscriber = tracing_subscriber::registry().with(StageRecorder {
                 stages: Arc::clone(&stages),
             });
             let result = with_default(subscriber, || {
                 tracing::callsite::rebuild_interest_cache();
-                perform_deletion(request)
+                perform_deletion_with(request, teardown)
             });
-            let stages = stages.lock().unwrap().clone();
+            let stages = stages.lock().clone();
             (stages, result)
         }
 
@@ -2206,14 +2225,19 @@ mod tests {
                     instance.sandbox_info = Some(sandbox_info("aoe-dirty-test-doesnotexist"));
                 }
                 std::fs::write(worktree_path.join("uncommitted.log"), "important").unwrap();
-                let request = DeletionRequest {
+                let mut request = DeletionRequest {
                     delete_worktree: true,
                     delete_branch: true,
                     delete_sandbox: sandboxed,
                     ..request(instance)
                 };
 
-                let (stages, result) = stages_of(&request);
+                let teardown_called = std::cell::Cell::new(false);
+                let (stages, result) = stages_of_with(&request, |_session_id| {
+                    teardown_called.set(true);
+                    Teardown::Removed
+                });
+                assert_eq!(teardown_called.get(), sandboxed);
                 assert!(!result.success, "dirty worktree deleted without --force");
                 if sandboxed {
                     let err = result.errors.join("; ");
@@ -2224,20 +2248,18 @@ mod tests {
                 assert!(main_repo.join(".git/worktrees/worktree").exists());
                 assert!(!stages.iter().any(|s| s == "sandbox_worktree_preclean"));
 
-                let (stages, result) = stages_of(&DeletionRequest {
-                    force_delete: true,
-                    delete_sandbox: false,
-                    ..request
-                });
+                // The forced-removal assertion is about the host Git behavior, not Docker's
+                // best-effort in-container preclean; keep this path daemon-independent.
+                request.force_delete = true;
+                request.delete_sandbox = false;
+                request.instance.sandbox_info = None;
+                let (stages, result) = stages_of_with(&request, |_| Teardown::Removed);
                 assert!(
                     result.success,
                     "force delete should succeed: {:?}",
                     result.errors
                 );
-                assert_eq!(
-                    stages.iter().any(|s| s == "sandbox_worktree_preclean"),
-                    sandboxed
-                );
+                assert!(!stages.iter().any(|s| s == "sandbox_worktree_preclean"));
                 assert!(!worktree_path.exists());
                 assert!(!main_repo.join(".git/worktrees/worktree").exists());
             }

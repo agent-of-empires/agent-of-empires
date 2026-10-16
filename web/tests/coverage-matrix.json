@@ -2157,7 +2157,7 @@
       "id": "right-panel.diff",
       "kind": "live-playwright",
       "risk": "medium",
-      "specs": ["tests/live/right-panel.spec.ts"],
+      "specs": ["tests/live/right-panel.spec.ts", "tests/live/diff-comparison.spec.ts"],
       "components": [
         "web/src/components/DiffPane.tsx",
         "web/src/components/diff/DiffFileList.tsx",

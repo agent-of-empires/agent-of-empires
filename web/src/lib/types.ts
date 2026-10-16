@@ -192,6 +192,10 @@ export interface TimingPongMessage {
   server_busy_us: number;
 }
 
+/** Baseline used by both diff listing and file-content requests. */
+export type DiffComparison = "base" | "origin_main" | "uncommitted" | "upstream";
+
+/** Rich diff file info with addition/deletion stats */
 export interface RichDiffFile {
   path: string;
   old_path: string | null;
@@ -202,10 +206,12 @@ export interface RichDiffFile {
   repo_name?: string;
 }
 
+/** One repo's base branch and comparison status in a workspace session. */
 export interface RepoBase {
   /** Omitted for single-repo sessions. */
   repo_name?: string;
   base_branch: string;
+  warning?: string;
   /** Worktree path this repo's diff was computed in. */
   repo_path: string;
   base_override?: string;
@@ -213,7 +219,7 @@ export interface RepoBase {
 
 export interface RichDiffFilesResponse {
   files: RichDiffFile[];
-  /** One entry per repo; workspace members can have different defaults. */
+  /** One entry per repo in the session, including each repo's comparison warning if unavailable. */
   per_repo_bases: RepoBase[];
   warning: string | null;
 }

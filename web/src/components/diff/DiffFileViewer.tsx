@@ -2,6 +2,7 @@ import { useCallback, useMemo, useRef, useState, type ReactNode } from "react";
 import { FileDiff, Virtualizer } from "@pierre/diffs/react";
 import { processFile } from "@pierre/diffs";
 import type { DiffLineAnnotation, FileContents, FileDiffOptions, SelectedLineRange } from "@pierre/diffs";
+import type { DiffComparison } from "../../lib/types";
 import { useFileContents } from "../../hooks/useFileContents";
 import { useWebSettings } from "../../hooks/useWebSettings";
 import { useShikiTheme } from "../../hooks/useShikiTheme";
@@ -32,6 +33,7 @@ interface Props {
   targetLine?: number;
   /** Triggers a re-fetch when the file list changes. */
   revision?: number;
+  comparison?: DiffComparison;
   onClose?: () => void;
   /** Enables line selection comments; requires `commentsStore`. */
   commentsEnabled?: boolean;
@@ -61,11 +63,12 @@ export function DiffFileViewer({
   repoName,
   targetLine,
   revision,
+  comparison = "base",
   onClose,
   commentsEnabled = false,
   commentsStore,
 }: Props) {
-  const { contents, loading, error } = useFileContents(sessionId, filePath, repoName, revision);
+  const { contents, loading, error } = useFileContents(sessionId, filePath, repoName, revision, comparison);
   const { theme } = useShikiTheme();
   const { settings } = useWebSettings();
 
@@ -85,8 +88,8 @@ export function DiffFileViewer({
   const [selected, setSelected] = useState<SelectedLineRange | null>(null);
   const [findOpen, setFindOpen] = useState(false);
 
-  // Reset transient state on a file or target change, during render; a cited line starts selected.
-  const syncKey = JSON.stringify([sessionId, repoName ?? null, filePath, revision, targetLine ?? null]);
+  // Reset transient state on a file, comparison, or target change; a cited line starts selected.
+  const syncKey = JSON.stringify([sessionId, repoName ?? null, filePath, comparison, revision, targetLine ?? null]);
   const [handledSyncKey, setHandledSyncKey] = useState(syncKey);
   if (syncKey !== handledSyncKey) {
     setHandledSyncKey(syncKey);

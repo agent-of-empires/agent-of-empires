@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import type { RepoBase, RichDiffFile } from "../../lib/types";
+import type { DiffComparison, RepoBase, RichDiffFile } from "../../lib/types";
 import { sessionDiffRawFileUrl } from "../../lib/api";
 import { buildDiffTree } from "../../lib/diffTree";
 import { useWebSettings } from "../../hooks/useWebSettings";
@@ -8,6 +8,8 @@ import { FileContextMenu, type PathMenuState } from "./FileContextMenu";
 import { Chevron, FlatList, LineCounts, TreeView } from "./DiffFileRows";
 
 interface Props {
+  comparison?: DiffComparison;
+  onComparisonChange?: (comparison: DiffComparison) => void;
   files: RichDiffFile[];
   /** One entry per repo whose diff was computed. */
   perRepoBases: RepoBase[];
@@ -49,6 +51,8 @@ export function DiffFileList({
   repoPath,
   baseBranchOverride,
   onBaseBranchChanged,
+  comparison = "base",
+  onComparisonChange,
 }: Props) {
   const isMultiRepo = perRepoBases.length > 1;
   const singleBaseBranch = perRepoBases[0]?.base_branch ?? "main";
@@ -148,15 +152,22 @@ export function DiffFileList({
         collapsedDirs={collapsedDirs}
         onToggleDir={toggleDir}
         sessionId={sessionId}
+        comparison={comparison}
         onBaseBranchChanged={onBaseBranchChanged}
         {...listProps}
       />
     ));
   } else if (files.length === 0) {
-    // Naming the base makes a clean tree read as checked, not broken.
+    // Keep an unavailable comparison distinct from a clean tree.
     body = (
       <div className="flex items-center justify-center h-full text-text-dim text-xs">
-        No changes vs <span className="font-mono ml-1">{singleBaseBranch}</span>
+        {warning || perRepoBases[0]?.warning ? (
+          "Comparison unavailable"
+        ) : (
+          <>
+            No changes vs <span className="font-mono ml-1">{singleBaseBranch}</span>
+          </>
+        )}
       </div>
     );
   } else if (viewMode === "tree") {
@@ -179,9 +190,22 @@ export function DiffFileList({
       <div className="px-3 py-2 border-b border-surface-700/20 shrink-0">
         <div className="flex items-center gap-2 flex-wrap">
           <span className="font-mono text-[11px] uppercase tracking-wider text-text-dim">Changes</span>
+          {onComparisonChange && (
+            <select
+              aria-label="Diff comparison"
+              value={comparison}
+              onChange={(event) => onComparisonChange(event.target.value as DiffComparison)}
+              className="rounded border border-surface-700 bg-surface-800 px-1.5 py-1 font-mono text-[10px] text-text-primary focus:border-brand-500 focus:outline-none"
+            >
+              <option value="base">Base</option>
+              <option value="origin_main">origin/main</option>
+              <option value="uncommitted">Uncommitted</option>
+              <option value="upstream">Tracking branch</option>
+            </select>
+          )}
           {isMultiRepo ? (
             <span className={CHIP}>{perRepoBases.length} repos</span>
-          ) : sessionId && repoPath ? (
+          ) : comparison === "base" && sessionId && repoPath ? (
             <BasePicker
               sessionId={sessionId}
               repoPath={repoPath}
@@ -189,9 +213,9 @@ export function DiffFileList({
               hasOverride={Boolean(baseBranchOverride)}
               onChanged={onBaseBranchChanged}
             />
-          ) : (
+          ) : comparison === "base" ? (
             <span className={CHIP}>vs {singleBaseBranch}</span>
-          )}
+          ) : null}
           {files.length > 0 && (
             <>
               <span className="font-mono text-[11px] text-text-muted">
@@ -244,6 +268,7 @@ function RepoGroup({
   collapsedDirs,
   onToggleDir,
   sessionId,
+  comparison,
   onBaseBranchChanged,
   ...listProps
 }: {
@@ -255,6 +280,7 @@ function RepoGroup({
   collapsedDirs: Set<string>;
   onToggleDir: (dirPath: string) => void;
   sessionId?: string | null;
+  comparison: DiffComparison;
   onBaseBranchChanged?: () => void;
   selectedPath: string | null;
   selectedRepoName: string | undefined;
@@ -284,7 +310,7 @@ function RepoGroup({
           <Chevron collapsed={collapsed} />
           <span className="font-mono text-[12px] truncate">{repo.repo_name ?? "(default)"}</span>
         </button>
-        {sessionId ? (
+        {comparison === "base" && sessionId ? (
           <BasePicker
             sessionId={sessionId}
             repoPath={repo.repo_path}
@@ -293,14 +319,17 @@ function RepoGroup({
             hasOverride={Boolean(repo.base_override)}
             onChanged={onBaseBranchChanged}
           />
-        ) : (
+        ) : comparison === "base" ? (
           <span className="font-mono text-[10px] text-text-dim">vs {repo.base_branch}</span>
-        )}
+        ) : null}
         <span className="font-mono text-[11px] text-text-muted">{files.length}</span>
         <LineCounts additions={sum(files, "additions")} deletions={sum(files, "deletions")} />
       </div>
+      {!collapsed && repo.warning && <p className="px-3 pt-2 text-[11px] text-status-waiting">{repo.warning}</p>}
       {!collapsed && files.length === 0 && (
-        <div className="px-3 py-2 text-[11px] text-text-dim italic">No changes in this repo.</div>
+        <div className="px-3 py-2 text-[11px] text-text-dim italic">
+          {repo.warning ? "Comparison unavailable" : "No changes in this repo."}
+        </div>
       )}
       {!collapsed &&
         files.length > 0 &&

@@ -335,13 +335,14 @@ mod tests {
         let _app_dir = crate::session::test_support::isolate_app_dir();
         let barrier = tempfile::tempdir().unwrap();
         let hook = support::install_blocking_before_session_hook(barrier.path(), "attach");
+        let profile = "attach-project-test";
         let mut inst =
             crate::session::Instance::new("attach-4116", barrier.path().to_str().unwrap());
+        inst.source_profile = profile.to_string();
         inst.view = crate::session::View::Structured;
         inst.status = crate::session::Status::Idle;
         let id = inst.id.clone();
-        let profile = inst.source_profile.clone();
-        support::seed_instances_on_disk_for_test(&profile, vec![inst.clone()]);
+        support::seed_instances_on_disk_for_test(profile, vec![inst.clone()]);
         let (launcher, launches) = support::counting_failing_launcher();
         let state = support::build_test_app_state_with_launcher(vec![inst], launcher);
 
@@ -350,7 +351,7 @@ mod tests {
             let id = id.clone();
             async move { spawn_worker(&state, &id).await }
         });
-        let archived = support::archive_while_hook_waits(&hook, &profile, |row| row.id == id).await;
+        let archived = support::archive_while_hook_waits(&hook, profile, |row| row.id == id).await;
         let outcome = restart.await.unwrap();
 
         assert!(archived, "before_session hook did not run");

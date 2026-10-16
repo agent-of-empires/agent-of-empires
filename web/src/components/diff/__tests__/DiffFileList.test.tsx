@@ -92,8 +92,35 @@ describe("header and empty states", () => {
       expect(screen.getAllByText(t).length).toBeGreaterThan(0);
     }
   });
-});
+  it("shows unavailable comparison per repo without hiding clean repos", () => {
+    renderList({
+      perRepoBases: [
+        { repo_name: "clean", base_branch: "main" },
+        { repo_name: "missing-upstream", base_branch: "upstream", warning: "No upstream configured." },
+      ],
+      warning: "missing-upstream: No upstream configured.",
+      comparison: "upstream",
+      onComparisonChange: vi.fn(),
+    });
+    expect(screen.getByText("No changes in this repo.")).toBeTruthy();
+    expect(screen.getByText("Comparison unavailable")).toBeTruthy();
+    expect(screen.getByText("No upstream configured.")).toBeTruthy();
+  });
 
+  it("shows the comparison selector and hides the base picker outside base mode", () => {
+    const onComparisonChange = vi.fn();
+    renderList({
+      files: [file({ path: "a.ts" })],
+      sessionId: "s1",
+      repoPath: "/repo",
+      comparison: "origin_main",
+      onComparisonChange,
+    });
+    fireEvent.change(screen.getByRole("combobox", { name: "Diff comparison" }), { target: { value: "uncommitted" } });
+    expect(onComparisonChange).toHaveBeenCalledWith("uncommitted");
+    expect(screen.queryByRole("button", { name: /Change diff base/ })).toBeNull();
+  });
+});
 describe("tree view", () => {
   const files = [file({ path: "src/app/foo.rs" }), file({ path: "src/app/bar.rs" }), file({ path: "top.rs" })];
 

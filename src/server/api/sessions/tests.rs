@@ -1414,6 +1414,62 @@ fn resolve_diff_base_prefers_override_then_worktree_then_config_then_auto() {
     assert_eq!(resolve_diff_base(None, None, None, tmp.path()), "main");
 }
 
+#[test]
+fn diff_comparisons_require_explicit_refs() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = git2::Repository::init(tmp.path()).unwrap();
+    let tree_id = repo.treebuilder(None).unwrap().write().unwrap();
+    let tree = repo.find_tree(tree_id).unwrap();
+    let signature = git2::Signature::now("Test", "test@example.com").unwrap();
+    let commit_id = repo
+        .commit(
+            Some("refs/heads/main"),
+            &signature,
+            &signature,
+            "initial",
+            &tree,
+            &[],
+        )
+        .unwrap();
+    repo.set_head("refs/heads/main").unwrap();
+
+    let missing_origin = resolve_diff_comparison(
+        DiffComparison::OriginMain,
+        "ignored".to_string(),
+        tmp.path(),
+    )
+    .unwrap_err();
+    assert!(missing_origin.contains("refs/remotes/origin/main"));
+
+    let missing_upstream =
+        resolve_diff_comparison(DiffComparison::Upstream, "ignored".to_string(), tmp.path())
+            .unwrap_err();
+    assert!(missing_upstream.contains("no configured upstream"));
+
+    repo.reference(
+        "refs/remotes/origin/main",
+        commit_id,
+        true,
+        "test origin main",
+    )
+    .unwrap();
+    assert_eq!(
+        resolve_diff_comparison(
+            DiffComparison::OriginMain,
+            "ignored".to_string(),
+            tmp.path()
+        )
+        .unwrap(),
+        "refs/remotes/origin/main"
+    );
+
+    repo.set_head_detached(commit_id).unwrap();
+    let detached_upstream =
+        resolve_diff_comparison(DiffComparison::Upstream, "ignored".to_string(), tmp.path())
+            .unwrap_err();
+    assert!(detached_upstream.contains("detached"));
+}
+
 /// Each workspace member carries its own override and recorded base, and the
 /// session-level `base_branch_override` does not leak into any of them. That
 /// leak made a multi-repo diff compare every repo against one ref (#3329).
@@ -3034,6 +3090,7 @@ async fn diff_file_rejects_workspace_with_no_repos() {
         Query(FileDiffQuery {
             path: "Cargo.toml".to_string(),
             repo: None,
+            comparison: DiffComparison::Base,
         }),
     )
     .await
@@ -3110,6 +3167,7 @@ mod open_file {
             Query(FileDiffQuery {
                 path: path.to_string(),
                 repo: repo.map(str::to_string),
+                comparison: DiffComparison::Base,
             }),
         )
         .await

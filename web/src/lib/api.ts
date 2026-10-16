@@ -3,6 +3,7 @@ import { notifySettingsChanged } from "./settingsEvents";
 import { clientFormFactor } from "./formFactor";
 import type {
   SessionResponse,
+  DiffComparison,
   RichDiffFilesResponse,
   RichFileContentsResponse,
   AgentInfo,
@@ -226,18 +227,52 @@ export function killTerminal(id: string, index: number): Promise<boolean> {
   return fetchOk(`/api/sessions/${id}/terminal?index=${index}`, { method: "DELETE" });
 }
 
-export function getSessionDiffFiles(id: string): Promise<RichDiffFilesResponse | null> {
-  return fetchJson<RichDiffFilesResponse>(`/api/sessions/${id}/diff/files`);
+export function getSessionDiffFiles(
+  id: string,
+  comparison: DiffComparison = "base",
+): Promise<RichDiffFilesResponse | null> {
+  const query = comparison === "base" ? "" : `?comparison=${comparison}`;
+  return fetchJson<RichDiffFilesResponse>(`/api/sessions/${id}/diff/files${query}`);
 }
 
-export function getSessionFileContents(
+/**
+ * Fetch raw old/new contents plus a server-computed unified patch for a
+ * file; the client renders the patch via `@pierre/diffs` without re-diffing.
+ * See {@link RichFileContentsResponse}.
+ */
+export async function getSessionFileContents(
   id: string,
   filePath: string,
   repoName?: string,
-): Promise<RichFileContentsResponse | null> {
+  comparison: DiffComparison = "base",
+): Promise<RichFileContentsResponse | DiffRequestError | null> {
   const params = new URLSearchParams({ path: filePath });
   if (repoName) params.set("repo", repoName);
-  return fetchJson<RichFileContentsResponse>(`/api/sessions/${id}/diff/file?${params.toString()}`);
+  if (comparison !== "base") params.set("comparison", comparison);
+  try {
+    const response = await fetch(`/api/sessions/${id}/diff/file?${params.toString()}`);
+    if (!response.ok) {
+      const body: unknown = await response.json().catch(() => null);
+      if (
+        body &&
+        typeof body === "object" &&
+        "error" in body &&
+        typeof body.error === "string" &&
+        "message" in body &&
+        typeof body.message === "string"
+      ) {
+        return { error: body.error, message: body.message };
+      }
+      return null;
+    }
+    return (await response.json()) as RichFileContentsResponse;
+  } catch {
+    return null;
+  }
+}
+export interface DiffRequestError {
+  error: string;
+  message: string;
 }
 
 /** URL of a diffed file's current worktree bytes, for opening in a new tab. */

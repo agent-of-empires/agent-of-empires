@@ -67,6 +67,28 @@ fn wait_for(path: &Path, what: &str) {
         std::thread::sleep(Duration::from_millis(50));
     }
 }
+fn connect_when_ready(path: &Path, what: &str) -> UnixStream {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        match UnixStream::connect(path) {
+            Ok(stream) => return stream,
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
+                ) =>
+            {
+                assert!(
+                    Instant::now() < deadline,
+                    "{what} did not accept connections at {}: {error}",
+                    path.display()
+                );
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Err(error) => panic!("could not connect to {what} at {}: {error}", path.display()),
+        }
+    }
+}
 
 fn wait_for_u32(path: &Path, what: &str) -> u32 {
     let deadline = Instant::now() + Duration::from_secs(10);
@@ -1828,9 +1850,8 @@ for line in sys.stdin:
             .spawn()
             .expect("spawn native-identity runner"),
     );
-    wait_for(&control, "native-identity control socket");
     let attach = || {
-        let mut stream = UnixStream::connect(&control).unwrap();
+        let mut stream = connect_when_ready(&control, "native-identity control socket");
         stream
             .set_read_timeout(Some(Duration::from_secs(10)))
             .unwrap();

@@ -106,6 +106,78 @@ describe("useDiffFiles", () => {
     expect(result.current.files[0]!.path).toBe("two.ts");
   });
 
+  it("bumps revision again when the file list changes between fetches", async () => {
+    mockGetFiles.mockResolvedValueOnce(resp({ files: [file("one.ts")] }));
+    const { result } = renderHook(() => useDiffFiles("s1", true));
+    await waitFor(() => expect(result.current.revision).toBe(1));
+
+    mockGetFiles.mockResolvedValueOnce(resp({ files: [file("two.ts")] }));
+    await act(async () => {
+      await result.current.refresh();
+    });
+    expect(result.current.revision).toBe(2);
+    expect(result.current.files[0]!.path).toBe("two.ts");
+  });
+});
+
+describe("useDiffFiles comparison modes", () => {
+  it("refreshes warning and per-repo bases when file statistics are unchanged", async () => {
+    mockGetFiles
+      .mockResolvedValueOnce(
+        resp({
+          files: [file("same.ts")],
+          per_repo_bases: [{ base_branch: "custom", repo_path: "" }],
+          warning: "base warning",
+        }),
+      )
+      .mockResolvedValueOnce(
+        resp({
+          files: [file("same.ts")],
+          per_repo_bases: [{ base_branch: "main", repo_path: "" }],
+          warning: null,
+        }),
+      );
+    const { result } = renderHook(() => useDiffFiles("s1", true));
+    await waitFor(() => expect(result.current.warning).toBe("base warning"));
+    await act(async () => {
+      await result.current.refresh();
+    });
+    expect(result.current.perRepoBases).toEqual([{ base_branch: "main", repo_path: "" }]);
+    expect(result.current.warning).toBeNull();
+    expect(result.current.files).toEqual([file("same.ts")]);
+    expect(result.current.revision).toBe(2);
+  });
+
+  it("drops an earlier baseline response after comparison changes", async () => {
+    const { promise: baseResponse, resolve: resolveBase } = Promise.withResolvers<RichDiffFilesResponse | null>();
+    mockGetFiles.mockReturnValueOnce(baseResponse).mockResolvedValueOnce(resp({ files: [file("upstream.ts")] }));
+    const { result, rerender } = renderHook(({ comparison }) => useDiffFiles("s1", true, comparison), {
+      initialProps: { comparison: "base" as const },
+    });
+    await waitFor(() => expect(mockGetFiles).toHaveBeenCalledTimes(1));
+    rerender({ comparison: "upstream" });
+    await waitFor(() => expect(result.current.files[0]?.path).toBe("upstream.ts"));
+    await act(async () => {
+      resolveBase(resp({ files: [file("stale-base.ts")] }));
+    });
+    expect(result.current.files.map((entry) => entry.path)).toEqual(["upstream.ts"]);
+  });
+
+  it("keeps revisions monotonic when revisiting a comparison", async () => {
+    mockGetFiles.mockResolvedValue(resp({ files: [file("same.ts")] }));
+    const { result, rerender } = renderHook(({ comparison }) => useDiffFiles("s1", true, comparison), {
+      initialProps: { comparison: "base" as const },
+    });
+    await waitFor(() => expect(result.current.revision).toBe(1));
+
+    rerender({ comparison: "upstream" });
+    await waitFor(() => expect(result.current.revision).toBe(2));
+    rerender({ comparison: "base" });
+    await waitFor(() => expect(result.current.revision).toBe(3));
+  });
+});
+
+describe("useDiffFiles polling", () => {
   it("polls every 10s while enabled and stops once disabled", async () => {
     vi.useFakeTimers();
     mockGetFiles.mockResolvedValue(resp());

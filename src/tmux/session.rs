@@ -4222,6 +4222,10 @@ mod tests {
         let host_path = std::env::var_os("PATH").unwrap_or_default();
         let status = std::process::Command::new("/bin/sh")
             .args(["-c", &wrapper])
+            // The wrapper embeds the user's shell; isolate its startup files
+            // without mutating the environment of concurrent tests.
+            .env("HOME", temp.path())
+            .env("ZDOTDIR", temp.path())
             .env("PATH", &host_path)
             .env_remove("DOCKER_HOST")
             .env_remove("BASH_ENV")

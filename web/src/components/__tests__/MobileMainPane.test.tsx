@@ -3,7 +3,7 @@
 import { describe, expect, it, vi } from "vitest";
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 
-import type { SessionResponse } from "../../lib/types";
+import type { DiffComparison, SessionResponse } from "../../lib/types";
 import { makeSession as baseSession } from "./fixtures";
 import type { useDiffComments } from "../../hooks/useDiffComments";
 
@@ -14,7 +14,26 @@ vi.mock("../PairedTerminal", () => ({
   PairedShellPane: () => <div data-testid="paired-shell" />,
 }));
 vi.mock("../diff/DiffFileList", () => ({
-  DiffFileList: () => <div data-testid="diff-list" />,
+  DiffFileList: ({
+    comparison,
+    onComparisonChange,
+  }: {
+    comparison: DiffComparison;
+    onComparisonChange: (comparison: DiffComparison) => void;
+  }) => (
+    <div data-testid="diff-list">
+      <select
+        aria-label="Diff comparison"
+        value={comparison}
+        onChange={(event) => onComparisonChange(event.target.value as DiffComparison)}
+      >
+        <option value="base">Base</option>
+        <option value="origin_main">origin/main</option>
+        <option value="uncommitted">Uncommitted</option>
+        <option value="upstream">Tracking branch</option>
+      </select>
+    </div>
+  ),
 }));
 vi.mock("../diff/DiffFileViewer", () => ({
   DiffFileViewer: () => <div data-testid="diff-viewer" />,
@@ -78,6 +97,8 @@ function setup(overrides: Partial<Parameters<typeof MobileMainPane>[0]> = {}) {
     webSettings: { persistentTerminals: false, maxPersistentTerminals: 3 },
     selectedFilePath: null,
     selectedRepoName: undefined,
+    comparison: "base",
+    onComparisonChange: vi.fn(),
     revision: 0,
     diffFiles: [],
     perRepoBases: [],
@@ -143,6 +164,21 @@ describe("MobileMainPane", () => {
     setup({ view: "diff", selectedFilePath: "src/foo.ts" });
     expect(screen.getByTestId("diff-viewer")).toBeDefined();
     expect(screen.queryByTestId("diff-list")).toBeNull();
+  });
+  it("shows comparison choices on the mobile diff list and file viewer", () => {
+    const onComparisonChange = vi.fn();
+    setup({ view: "diff", onComparisonChange });
+    const listComparison = screen.getByRole("combobox", { name: "Diff comparison" });
+    expect(listComparison).toBeDefined();
+    fireEvent.change(listComparison, { target: { value: "upstream" } });
+    expect(onComparisonChange).toHaveBeenCalledWith("upstream");
+    cleanup();
+
+    setup({ view: "diff", selectedFilePath: "src/foo.ts", comparison: "uncommitted", onComparisonChange });
+    const viewerComparison = screen.getByRole("combobox", { name: "Diff comparison" });
+    expect((viewerComparison as HTMLSelectElement).value).toBe("uncommitted");
+    fireEvent.change(viewerComparison, { target: { value: "origin_main" } });
+    expect(onComparisonChange).toHaveBeenCalledWith("origin_main");
   });
 
   it("renders the plugin pane body and its title for a plugin view", () => {

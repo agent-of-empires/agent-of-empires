@@ -32,6 +32,12 @@ The changed-files list has two layouts, toggled in its header: **flat** lists ev
 
 The **Files** pane (folder icon in the activity bar) browses the session's whole working directory, not just its git changes, so it lists files even in a non-git scratch session. Right-click a file there for the same **Open file** and **Copy relative path** actions. Markdown renders as HTML with a **Rendered** / **Raw** toggle, in this pane and from the diff list. Files an agent cites that live outside the session's repo open only when that agent actually read or wrote them during this session: the dashboard cannot open an arbitrary host path.
 
+### Comparison modes (web)
+
+The browser diff selector offers **Base**, **origin/main**, **Uncommitted**, and **Tracking branch**. Base uses the repo's configured and auto-detected base behavior described above, including session overrides. **Uncommitted** compares `HEAD` with the index and working tree, including untracked files, so committed branch changes are omitted. **origin/main** and **Tracking branch** compare from the merge base with the selected remote branch, including uncommitted work. Tracking branch uses this checkout's configured upstream. These modes do not fetch; an unavailable reference is reported instead of silently choosing another base.
+
+The selection applies to both the changed-file list and the selected file's contents. In multi-repo workspaces, availability warnings are shown on the affected repository without hiding other repositories' results. The base picker is available only in Base mode.
+
 ### Split view
 
 Split layout shows old on the left and new on the right, with an aligned placeholder opposite a pure addition or deletion. The TUI stores the choice in `[diff].split_view`; the web dashboard stores it per browser (**Settings > Diff**). Both fall back to unified on a narrow pane.

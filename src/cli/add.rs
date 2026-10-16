@@ -1877,8 +1877,10 @@ mod tests {
         async fn add_refuses_a_fork_child_under_another_agent() {
             let root = tempfile::tempdir().unwrap();
             let _guard = crate::session::test_support::isolate_app_dir_at(root.path());
-            // The CLI resolves the requested tool's binary before the fork parent
-            // check, so both agents need a command on the path.
+            let availability = crate::tmux::AgentAvailabilityGuard::capture();
+            availability.clear();
+            // Agent availability searches the process PATH, so the fake
+            // commands installed below take precedence over global installs.
             let _claude = crate::session::test_support::install_login_shell_path_command(
                 root.path(),
                 "claude",

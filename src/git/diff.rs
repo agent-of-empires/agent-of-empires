@@ -193,6 +193,15 @@ fn get_commit_from_ref<'a>(
     repo: &'a git2::Repository,
     reference: &str,
 ) -> Result<git2::Commit<'a>> {
+    // Fully qualified refs and HEAD are explicit identities; resolve them
+    // before the legacy short-name lookup can redirect them to origin.
+    if reference == "HEAD" || reference.starts_with("refs/") {
+        return repo
+            .revparse_single(reference)?
+            .peel_to_commit()
+            .map_err(|_| GitError::BranchNotFound(reference.to_string()));
+    }
+
     let remote_ref = format!("origin/{}", reference);
 
     // Try as a local branch
@@ -798,8 +807,28 @@ mod tests {
             .unwrap();
     }
 
-    /// Only tracked blobs are served: an untracked secret (#1810) and `.git`
-    /// internals both exist on disk but must 404.
+    #[test]
+    fn explicit_head_does_not_resolve_to_origin_head() {
+        let (_dir, repo) = setup_test_repo();
+        let initial = repo.head().unwrap().target().unwrap();
+        commit_file(&repo, "feature.txt", "feature change\n", "feature commit");
+        let feature_tip = repo.head().unwrap().target().unwrap();
+        repo.reference(
+            "refs/remotes/origin/HEAD",
+            initial,
+            true,
+            "test remote HEAD",
+        )
+        .unwrap();
+
+        assert_eq!(
+            get_commit_from_ref(&repo, "HEAD").unwrap().id(),
+            feature_tip,
+            "explicit HEAD must refer to the current checkout, not origin/HEAD"
+        );
+    }
+
+    /// Only tracked blobs are served: untracked secrets and `.git` internals 404.
     #[test]
     fn unchanged_file_contents_serves_only_tracked_blobs() {
         let (dir, _repo) = setup_test_repo();

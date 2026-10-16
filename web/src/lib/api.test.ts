@@ -576,6 +576,30 @@ describe("request shapes", () => {
   });
 });
 
+describe("diff comparison requests", () => {
+  it("uses the requested comparison for diff file lists", async () => {
+    fetchSpy.mockResolvedValueOnce(json({ files: [] }));
+    await api.getSessionDiffFiles("s1", "origin_main");
+    expect(lastCall().url).toBe("/api/sessions/s1/diff/files?comparison=origin_main");
+  });
+
+  it("uses the requested comparison and repo for file contents", async () => {
+    fetchSpy.mockResolvedValueOnce(json({ patch: "" }));
+    await api.getSessionFileContents("s1", "src/a b.ts", "myrepo", "uncommitted");
+    const url = new URL(lastCall().url, "http://localhost");
+    expect(url.pathname).toBe("/api/sessions/s1/diff/file");
+    expect(url.searchParams.get("path")).toBe("src/a b.ts");
+    expect(url.searchParams.get("repo")).toBe("myrepo");
+    expect(url.searchParams.get("comparison")).toBe("uncommitted");
+  });
+
+  it("omits the default comparison parameter", async () => {
+    fetchSpy.mockResolvedValueOnce(json({ patch: "" }));
+    await api.getSessionFileContents("s1", "a.ts", undefined, "base");
+    expect(lastCall().url).toBe("/api/sessions/s1/diff/file?path=a.ts");
+  });
+});
+
 describe("settings saves", () => {
   const typed = [
     ["updateSettings", () => api.updateSettings({ a: 1 }, "p")],

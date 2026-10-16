@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { getSessionDiffFiles, reportTelemetrySeen } from "../lib/api";
-import type { RepoBase, RichDiffFile } from "../lib/types";
+import type { DiffComparison, RepoBase, RichDiffFile } from "../lib/types";
 import { useLatestRef } from "./useLatestRef";
 
 const POLL_INTERVAL = 10_000;
@@ -14,7 +14,11 @@ interface UseDiffFilesResult {
   refresh: () => void;
 }
 
-export function useDiffFiles(sessionId: string | null, enabled: boolean): UseDiffFilesResult {
+export function useDiffFiles(
+  sessionId: string | null,
+  enabled: boolean,
+  comparison: DiffComparison = "base",
+): UseDiffFilesResult {
   const [files, setFiles] = useState<RichDiffFile[]>([]);
   const [perRepoBases, setPerRepoBases] = useState<RepoBase[]>([{ base_branch: "main", repo_path: "" }]);
   const [warning, setWarning] = useState<string | null>(null);
@@ -29,10 +33,12 @@ export function useDiffFiles(sessionId: string | null, enabled: boolean): UseDif
     if (!sessionId) return;
     const reqId = ++requestIdRef.current;
     const capturedSessionId = sessionId;
-    const resp = await getSessionDiffFiles(capturedSessionId);
-    if (reqId !== requestIdRef.current || capturedSessionId !== sessionId) return;
+    const capturedComparison = comparison;
+    const resp = await getSessionDiffFiles(capturedSessionId, capturedComparison);
+    // Include bases and warning: a base change can leave the file list identical (#3329).
+    // Drop stale responses: another fetch started, or session/comparison changed mid-flight.
+    if (reqId !== requestIdRef.current || capturedSessionId !== sessionId || capturedComparison !== comparison) return;
     if (resp) {
-      // Include bases and warning: a base change can leave the file list identical (#3329).
       const fingerprint = JSON.stringify({
         files: resp.files,
         per_repo_bases: resp.per_repo_bases,
@@ -51,20 +57,28 @@ export function useDiffFiles(sessionId: string | null, enabled: boolean): UseDif
       }
     }
     setLoading(false);
-  }, [sessionId, enabledRef]);
+  }, [sessionId, comparison, enabledRef]);
 
   const [trackedSessionId, setTrackedSessionId] = useState(sessionId);
-  if (sessionId !== trackedSessionId) {
+  const [trackedComparison, setTrackedComparison] = useState(comparison);
+  if (sessionId !== trackedSessionId || comparison !== trackedComparison) {
     setTrackedSessionId(sessionId);
-    if (sessionId === null) {
+    setTrackedComparison(comparison);
+    if (sessionId === null || sessionId !== trackedSessionId) {
       setFiles([]);
-      setLoading(false);
+      setPerRepoBases([{ base_branch: "main", repo_path: "" }]);
+      setWarning(null);
       setRevision(0);
+      setLoading(sessionId !== null);
     } else {
+      setFiles([]);
+      setPerRepoBases([{ base_branch: "main", repo_path: "" }]);
+      setWarning(null);
       setLoading(true);
     }
   }
 
+  // Fetch on session/comparison change; invalidate any in-flight requests.
   useEffect(() => {
     requestIdRef.current += 1;
     lastFingerprintRef.current = "";
@@ -73,7 +87,7 @@ export function useDiffFiles(sessionId: string | null, enabled: boolean): UseDif
       void fetchFiles();
     }, 0);
     return () => clearTimeout(timer);
-  }, [sessionId, fetchFiles]);
+  }, [sessionId, comparison, fetchFiles]);
 
   useEffect(() => {
     if (!enabled || !sessionId) return;
