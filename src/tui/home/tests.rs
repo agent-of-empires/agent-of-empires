@@ -18271,14 +18271,60 @@ mod permission_response_dialog {
 
     #[test]
     #[serial]
-    fn agent_without_allow_always_still_opens_dialog() {
+    fn omp_without_live_provider_prompt_does_not_open_a_static_response() {
         let mut env = create_test_env_empty();
         let id = add_session_with_tool(&mut env.view, "session-one", "omp");
         env.view.selected_session = Some(id);
         let _ = env.view.handle_key(key(KeyCode::Char('a')), None);
-        assert!(
-            env.view.permission_response_dialog.is_some(),
-            "an agent with allow_always: None must still support allow/deny"
+        assert!(env.view.permission_response_dialog.is_none());
+        assert!(env.view.info_dialog.is_some());
+    }
+
+    #[test]
+    #[serial]
+    fn live_provider_question_takes_precedence_over_builtin_permission_mapping() {
+        use aoe_plugin_api::agent_integration::{
+            AgentIntegrationPrompt, AgentIntegrationQuestion, AgentIntegrationSnapshot,
+            AgentIntegrationStatus,
+        };
+        use std::sync::Arc;
+
+        let mut env = create_test_env_empty();
+        let id = add_session_with_tool(&mut env.view, "session-one", "claude");
+        let instance = env.view.get_instance(&id).unwrap().clone();
+        let snapshot = Arc::new(AgentIntegrationSnapshot {
+            schema_version: 1,
+            instance_id: id.clone(),
+            provider_session_id: "provider-session".into(),
+            writer_pid: 123,
+            revision: 7,
+            status: AgentIntegrationStatus::Waiting,
+            reply_keys: Vec::new(),
+            prompt: Some(AgentIntegrationPrompt::Question {
+                id: "prompt-1".into(),
+                title: "Choose".into(),
+                questions: vec![AgentIntegrationQuestion {
+                    id: "q1".into(),
+                    question: "Which?".into(),
+                    options: vec![],
+                    multi: false,
+                    recommended: None,
+                }],
+            }),
+        });
+
+        env.view
+            .open_permission_response_for_instance(&id, &instance, Some(snapshot));
+
+        assert!(env.view.agent_question_dialog.is_some());
+        assert!(env.view.permission_response_dialog.is_none());
+        assert_eq!(
+            env.view
+                .pending_integration_snapshot
+                .as_ref()
+                .unwrap()
+                .provider_session_id,
+            "provider-session"
         );
     }
 
@@ -18835,4 +18881,40 @@ mod daemon_status_apply_tests {
             );
         }
     }
+}
+#[test]
+fn permission_response_tokens_map_each_choice_to_its_own_field() {
+    use crate::agents::{KeyToken, PermissionResponse};
+    use crate::tui::dialogs::PermissionResponseChoice;
+
+    let response = PermissionResponse {
+        allow: &[KeyToken::Literal("1")],
+        allow_always: Some(&[KeyToken::Literal("2")]),
+        deny: &[KeyToken::Literal("3")],
+    };
+    assert_eq!(
+        super::permission_response_tokens(&response, PermissionResponseChoice::Allow),
+        Some(response.allow)
+    );
+    assert_eq!(
+        super::permission_response_tokens(&response, PermissionResponseChoice::AllowAlways),
+        response.allow_always
+    );
+    assert_eq!(
+        super::permission_response_tokens(&response, PermissionResponseChoice::Deny),
+        Some(response.deny)
+    );
+
+    let without_allow_always = PermissionResponse {
+        allow: &[KeyToken::Named("Enter")],
+        allow_always: None,
+        deny: &[KeyToken::Named("Down"), KeyToken::Named("Enter")],
+    };
+    assert_eq!(
+        super::permission_response_tokens(
+            &without_allow_always,
+            PermissionResponseChoice::AllowAlways
+        ),
+        None
+    );
 }

@@ -246,7 +246,6 @@ serve = [
     "cap-std",
 ]
 cap-std = ["dep:cap-std"]
-
 [dev-dependencies]
 serial_test = "3.4"
 # Test-only tracing capture (#2756, I4): asserts the equal-timestamp guard's

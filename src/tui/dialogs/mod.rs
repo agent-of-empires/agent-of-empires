@@ -1,5 +1,6 @@
 //! TUI dialog components
 
+mod agent_question;
 pub mod attach_project;
 mod changelog;
 mod cheats;
@@ -35,6 +36,7 @@ mod tool_picker;
 mod update_confirm;
 mod worktree_name;
 
+pub use agent_question::AgentQuestionDialog;
 pub use attach_project::AttachProjectDialog;
 pub use changelog::ChangelogDialog;
 pub use command_palette::{

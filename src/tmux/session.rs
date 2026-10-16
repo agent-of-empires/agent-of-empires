@@ -1100,7 +1100,7 @@ impl Session {
     /// exactly as many as its shape requires. Used to answer an agent CLI's
     /// own interactive permission prompt; see
     /// [`crate::agents::PermissionResponse`].
-    pub fn send_key_tokens(&self, tokens: &[crate::agents::KeyToken]) -> Result<()> {
+    pub fn send_key_tokens(&self, tokens: &[crate::agents::KeyToken<'_>]) -> Result<()> {
         if !self.exists() {
             bail!("Session does not exist: {}", self.name);
         }

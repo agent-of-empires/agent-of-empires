@@ -133,6 +133,7 @@ pub fn read_hook_urgent(instance_id: &str) -> bool {
 /// Remove the hook status directory for a given instance (cleanup on stop/delete).
 /// Symlink-safe via `dir_guard::remove_instance_dir` (`unlinkat` walk).
 pub fn cleanup_hook_status_dir(instance_id: &str) {
+    crate::plugin::agent_integration::forget(instance_id);
     if let Err(e) = dir_guard::remove_instance_dir(instance_id) {
         tracing::warn!(target: "hooks.status",
             "Failed to cleanup hook status dir for {}: {}", instance_id, e);

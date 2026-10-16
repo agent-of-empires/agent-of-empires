@@ -1,11 +1,9 @@
-//! Dialog for answering a session's own interactive permission prompt (the
-//! CLI's "Do you want to proceed?" style prompt) by sending the exact
-//! keystrokes a human would type, without attaching to the session.
-//!
-//! AoE never parses pane content to detect or validate a pending prompt
-//! (see `AgentDef.permission_response`); the user has already seen the
-//! prompt before pressing the shortcut that opens this dialog. The Allow
-//! Always choice is offered only when the agent's mapping has one.
+//! Dialog for choosing a response to an interactive permission prompt.
+//! The selected choice is sent through the active provider integration when
+//! available, otherwise it uses the existing agent-specific key mapping.
+//! AoE never parses pane content to detect or validate a pending prompt; the
+//! user opens this dialog after seeing the prompt. Allow Always is offered
+//! only when supported by the captured prompt or legacy mapping.
 
 use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::prelude::*;
@@ -56,9 +54,12 @@ const ALL_CHOICES: [(&str, PermissionResponseChoice); 3] = [
 impl PermissionResponseDialog {
     pub fn new(
         session_title: &str,
-        allow_always: Option<&'static [crate::agents::KeyToken]>,
+        allow_always: Option<&'static [crate::agents::KeyToken<'static>]>,
     ) -> Self {
-        let supports_allow_always = allow_always.is_some();
+        Self::new_with_allow_always(session_title, allow_always.is_some())
+    }
+
+    pub fn new_with_allow_always(session_title: &str, supports_allow_always: bool) -> Self {
         let choices = ALL_CHOICES
             .into_iter()
             .filter(|(_, choice)| {
@@ -128,7 +129,7 @@ impl PermissionResponseDialog {
                 Style::default().fg(theme.title).bold(),
             )),
             Line::from(Span::styled(
-                "AoE sends these as raw keystrokes; make sure the prompt is on screen.",
+                "Choose the response for the prompt visible in your session.",
                 Style::default().fg(theme.dimmed),
             )),
         ])
@@ -176,7 +177,7 @@ mod tests {
     /// Non-empty stand-in for a real agent's `allow_always` mapping. `Some(&[])`
     /// would also satisfy `.is_some()` but reads as "supported with zero
     /// keystrokes", a footgun if copy-pasted into a real `AgentDef`.
-    const ALLOW_ALWAYS: Option<&[crate::agents::KeyToken]> =
+    const ALLOW_ALWAYS: Option<&[crate::agents::KeyToken<'static>]> =
         Some(&[crate::agents::KeyToken::Literal("2")]);
 
     fn key(code: KeyCode) -> KeyEvent {

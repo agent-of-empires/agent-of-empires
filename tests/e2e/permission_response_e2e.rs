@@ -131,3 +131,276 @@ fn test_respond_to_permission_deny_sends_bare_digit() {
 
     h.wait_for("GOT:[3]");
 }
+
+fn install_fake_integration_plugin(h: &TuiTestHarness) {
+    let plugin = h.home_path().join("fake-integration");
+    std::fs::create_dir_all(&plugin).unwrap();
+    std::fs::write(
+        plugin.join("aoe-plugin.toml"),
+        r#"
+id = "acme.fake-integration"
+name = "Fake provider integration"
+version = "0.1.0"
+api_version = 13
+capabilities = ["session.integration"]
+
+[[agent_integrations]]
+tool = "claude"
+"#,
+    )
+    .unwrap();
+    let output = h.run_cli(&["plugin", "install", plugin.to_str().unwrap(), "--yes"]);
+    assert!(
+        output.status.success(),
+        "install fake integration failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+fn install_fake_integration_agent(h: &TuiTestHarness) -> std::path::PathBuf {
+    let bin = h.home_path().join("fake-bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let agent = bin.join("fake-claude-integration");
+    let script = r#"#!/bin/sh
+set -eu
+umask 077
+dir="/tmp/aoe-hooks-$(id -u)/$AOE_INSTANCE_ID"
+mkdir -p "$dir"
+printf '%s\n' "$AOE_INSTANCE_ID" > "$HOME/instance-id"
+write_report() {
+  tmp="$dir/.integration.$$.tmp"
+  cat > "$tmp"
+  mv "$tmp" "$dir/integration-acme.fake-integration.json"
+}
+refresh_report() {
+  while :; do
+    sleep 1
+    touch "$dir/integration-acme.fake-integration.json" 2>/dev/null || :
+  done
+}
+publish_approval() {
+  write_report <<EOF
+{"schema_version":1,"instance_id":"$AOE_INSTANCE_ID","provider_session_id":"fake-provider-session","writer_pid":$$,"revision":1,"status":"waiting","reply_keys":[{"kind":"named","value":"F12"}],"prompt":{"kind":"approval","id":"approval-one","title":"Fake approval","allow_always":false}}
+EOF
+}
+read_reply() {
+  marker="$1"
+  key=$(dd bs=5 count=1 2>/dev/null | od -An -tx1 | tr -d ' \n')
+  printf 'GOT:%s:F12:%s\n' "$marker" "$key"
+  reply=$(cat "$dir/integration-acme.fake-integration.reply.json")
+}
+announce_reply() {
+  case "$reply" in
+    *'"choice":"allow"'*) printf 'PROVIDER_APPROVED\n' ;;
+    *'"selected_options":["SQLite"]'*) printf 'PROVIDER_ANSWER_SQLITE\n' ;;
+    *) printf 'INVALID_PROVIDER_REPLY\n' ;;
+  esac
+}
+stty -icanon -echo 2>/dev/null
+publish_approval
+refresh_report &
+refresh_pid=$!
+trap 'kill "$refresh_pid" 2>/dev/null || true' EXIT
+printf 'Fake approval\n'
+read_reply approval
+write_report <<EOF
+{"schema_version":1,"instance_id":"$AOE_INSTANCE_ID","provider_session_id":"fake-provider-session","writer_pid":$$,"revision":2,"status":"waiting","reply_keys":[{"kind":"named","value":"F12"}],"prompt":{"kind":"question","id":"question-one","title":"Choose database","questions":[{"id":"database","question":"Database?","options":[{"label":"SQLite"},{"label":"Postgres"}],"multi":false,"recommended":0}]}}
+EOF
+announce_reply
+printf 'Provider question ready\n'
+read_reply question
+announce_reply
+sleep 60
+"#;
+    std::fs::write(&agent, script).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&agent, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    agent
+}
+
+#[test]
+#[parallel]
+fn provider_report_drives_approval_and_question_replies_over_tmux() {
+    require_tmux!();
+
+    let mut h = TuiTestHarness::new("provider_reply");
+    install_fake_integration_plugin(&h);
+    let fake_agent = install_fake_integration_agent(&h);
+
+    let project = h.project_path();
+    h.run_cli(&[
+        "add",
+        project.to_str().unwrap(),
+        "-t",
+        "ProviderReply",
+        "--tool",
+        "claude",
+        "--cmd-override",
+        fake_agent.to_str().unwrap(),
+        "--launch",
+    ]);
+
+    h.spawn_tui();
+    h.wait_for_ready();
+    h.wait_for("ProviderReply");
+    h.wait_for("Fake approval");
+    let reply_path = fake_provider_reply_path(&h);
+    let sidecar_cleanup = FakeProviderSidecarCleanup(reply_path.parent().unwrap().to_path_buf());
+    h.send_keys("a");
+    h.wait_for("Respond to Permission Prompt");
+    h.send_keys("a");
+    h.wait_for("GOT:approval:F12:1b5b32347e");
+    h.wait_for("PROVIDER_APPROVED");
+    h.wait_for("Provider question ready");
+
+    h.send_keys("a");
+    h.wait_for("Database?");
+    h.wait_for("Choose database");
+    h.send_keys("Enter");
+    h.send_keys("C-s");
+    h.wait_for("GOT:question:F12:1b5b32347e");
+    h.wait_for("PROVIDER_ANSWER_SQLITE");
+    drop(h);
+    drop(sidecar_cleanup);
+}
+
+fn install_fake_stale_prompt_agent(h: &TuiTestHarness) -> std::path::PathBuf {
+    let bin = h.home_path().join("fake-bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let agent = bin.join("fake-stale-claude");
+    let script = r#"#!/bin/sh
+set -eu
+umask 077
+dir="/tmp/aoe-hooks-$(id -u)/$AOE_INSTANCE_ID"
+mkdir -p "$dir"
+printf '%s\n' "$AOE_INSTANCE_ID" > "$HOME/instance-id"
+tmp="$dir/.integration.$$.tmp"
+cat > "$tmp" <<EOF
+{"schema_version":1,"instance_id":"$AOE_INSTANCE_ID","provider_session_id":"fake-provider-session","writer_pid":$$,"revision":1,"status":"waiting","reply_keys":[{"kind":"named","value":"F12"}],"prompt":{"kind":"approval","id":"approval-one","title":"Fake approval","allow_always":false}}
+EOF
+mv "$tmp" "$dir/integration-acme.fake-integration.json"
+printf 'Fake approval\n'
+refresh_report() {
+  while :; do
+    sleep 1
+    touch "$dir/integration-acme.fake-integration.json" 2>/dev/null || :
+  done
+}
+refresh_report &
+refresh_pid=$!
+trap 'kill "$refresh_pid" 2>/dev/null || true' EXIT
+stty -icanon -echo 2>/dev/null
+key=$(dd bs=5 count=1 2>/dev/null | od -An -tx1 | tr -d ' \n')
+printf 'GOT:F12:%s\n' "$key"
+sleep 60
+"#;
+    std::fs::write(&agent, script).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&agent, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    agent
+}
+
+fn fake_provider_reply_path(h: &TuiTestHarness) -> std::path::PathBuf {
+    let instance_id = std::fs::read_to_string(h.home_path().join("instance-id"))
+        .unwrap()
+        .trim()
+        .to_owned();
+    std::path::PathBuf::from(format!(
+        "/tmp/aoe-hooks-{}/{}/integration-acme.fake-integration.reply.json",
+        nix::unistd::geteuid().as_raw(),
+        instance_id
+    ))
+}
+
+struct FakeProviderSidecarCleanup(std::path::PathBuf);
+
+impl Drop for FakeProviderSidecarCleanup {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+fn replace_fake_provider_prompt(h: &TuiTestHarness) {
+    use std::os::unix::fs::OpenOptionsExt;
+    let reply_path = fake_provider_reply_path(h);
+    let dir = reply_path.parent().unwrap();
+    let report_path = dir.join("integration-acme.fake-integration.json");
+    let mut report: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&report_path).unwrap()).unwrap();
+    report["revision"] = serde_json::json!(2);
+    report["prompt"]["id"] = serde_json::json!("approval-two");
+    report["prompt"]["title"] = serde_json::json!("Changed approval");
+    let temporary = dir.join(".integration-test.tmp");
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&temporary)
+        .unwrap();
+    use std::io::Write;
+    file.write_all(&serde_json::to_vec(&report).unwrap())
+        .unwrap();
+    file.sync_all().unwrap();
+    std::fs::rename(temporary, &report_path).unwrap();
+}
+
+#[test]
+#[parallel]
+fn provider_reply_cancel_and_stale_prompt_never_send_tmux_keys() {
+    require_tmux!();
+
+    let mut h = TuiTestHarness::new("provider_stale_reply");
+    install_fake_integration_plugin(&h);
+    let fake_agent = install_fake_stale_prompt_agent(&h);
+    let project = h.project_path();
+    h.run_cli(&[
+        "add",
+        project.to_str().unwrap(),
+        "-t",
+        "ProviderStaleReply",
+        "--tool",
+        "claude",
+        "--cmd-override",
+        fake_agent.to_str().unwrap(),
+        "--launch",
+    ]);
+
+    h.spawn_tui();
+    h.wait_for_ready();
+    h.wait_for("ProviderStaleReply");
+    h.wait_for("Fake approval");
+
+    let reply_path = fake_provider_reply_path(&h);
+    let sidecar_cleanup = FakeProviderSidecarCleanup(reply_path.parent().unwrap().to_path_buf());
+    h.send_keys("a");
+    h.wait_for("Respond to Permission Prompt");
+    h.send_keys("Escape");
+    h.wait_for_absent(
+        "Respond to Permission Prompt",
+        std::time::Duration::from_secs(3),
+    );
+    assert!(
+        !reply_path.exists(),
+        "cancel must not write a provider reply"
+    );
+
+    h.send_keys("a");
+    h.wait_for("Respond to Permission Prompt");
+    replace_fake_provider_prompt(&h);
+    h.send_keys("a");
+    h.wait_for("Respond Failed");
+    h.wait_for("prompt changed");
+    assert!(
+        !reply_path.exists(),
+        "stale prompt must be rejected before writing a reply"
+    );
+    h.assert_screen_not_contains("GOT:F12");
+    drop(h);
+    drop(sidecar_cleanup);
+}

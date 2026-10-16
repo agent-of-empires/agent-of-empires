@@ -333,28 +333,28 @@ pub struct AgentDef {
 /// A tmux keystroke: either literal text sent verbatim (e.g. a menu digit) or
 /// a named tmux key (e.g. `"Enter"`, `"Right"`). See `TmuxSession::send_key_tokens`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum KeyToken {
+pub enum KeyToken<'a> {
     /// Sent as `tmux send-keys -l -- <text>` (literal, no key-name interpretation).
-    Literal(&'static str),
+    Literal(&'a str),
     /// Sent as `tmux send-keys <name>`, e.g. `"Enter"`, `"Right"`.
-    Named(&'static str),
+    Named(&'a str),
 }
 
-/// The keystroke sequences that answer an agent's own interactive
-/// permission prompt, mapped once by hand per agent and never derived from
-/// pane content. The user visually confirms a prompt is actually showing
-/// before invoking the respond-to-prompt action; the software does not detect
-/// or verify it.
+/// The keystroke sequences that answer an agent's own interactive permission
+/// prompt when no provider integration reports it. These are mapped by hand
+/// per agent and never inferred from pane content. The user visually confirms
+/// a prompt is showing before invoking this fallback; the software does not
+/// detect or verify it.
 #[derive(Clone, Copy, Debug)]
 pub struct PermissionResponse {
     /// Keystrokes that select "allow once" / "yes" for this single request.
-    pub allow: &'static [KeyToken],
+    pub allow: &'static [KeyToken<'static>],
     /// Keystrokes that select "allow always" / "don't ask again" for the
     /// remainder of the session. `None` when the agent's prompt has no such
     /// choice.
-    pub allow_always: Option<&'static [KeyToken]>,
+    pub allow_always: Option<&'static [KeyToken<'static>]>,
     /// Keystrokes that select "deny" / "no".
-    pub deny: &'static [KeyToken],
+    pub deny: &'static [KeyToken<'static>],
 }
 
 /// Claude Code hook events. `SessionStart` and `UserPromptSubmit` carry
@@ -1186,11 +1186,7 @@ pub const AGENTS: &[AgentDef] = &[
         host_only: false,
         send_keys_enter_delay_ms: 0,
         install_hint: "curl -fsSL https://omp.sh/install | sh",
-        permission_response: Some(PermissionResponse {
-            allow: &[KeyToken::Named("Enter")],
-            allow_always: None,
-            deny: &[KeyToken::Named("Down"), KeyToken::Named("Enter")],
-        }),
+        permission_response: None,
     },
 ];
 

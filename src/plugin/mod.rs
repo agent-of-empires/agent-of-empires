@@ -6,6 +6,7 @@
 //! installs, capability grants, and the Tier 0 / Tier 1 contribution surface
 //! return in follow-up PRs.
 
+pub mod agent_integration;
 pub mod auto_update;
 pub mod changelog;
 pub mod contributions;

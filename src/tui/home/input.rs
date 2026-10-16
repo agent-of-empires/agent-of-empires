@@ -15,12 +15,12 @@ use crate::tui::app::Action;
 #[cfg(feature = "serve")]
 use crate::tui::dialogs::ServeAction;
 use crate::tui::dialogs::{
-    builtin_commands, CommandPaletteDialog, ConfirmDialog, ContextMenuAction, ContextMenuDialog,
-    DeleteDialogConfig, DialogResult, GroupDeleteOptionsDialog, HooksInstallDialog, InfoDialog,
-    IntroOutcome, NewSessionData, NewSessionDialog, NoAgentsAction, PaletteAction, PaletteCommand,
-    PaletteGroup, ProfilePickerAction, ProjectsDialog, RenameDialog, RenameMode, RepoTrustAction,
-    RestartDialog, SendMessageDialog, TipsDialog, TipsOutcome, UnifiedDeleteDialog,
-    WorktreeNameDialog,
+    builtin_commands, AgentQuestionDialog, CommandPaletteDialog, ConfirmDialog, ContextMenuAction,
+    ContextMenuDialog, DeleteDialogConfig, DialogResult, GroupDeleteOptionsDialog,
+    HooksInstallDialog, InfoDialog, IntroOutcome, NewSessionData, NewSessionDialog, NoAgentsAction,
+    PaletteAction, PaletteCommand, PaletteGroup, ProfilePickerAction, ProjectsDialog, RenameDialog,
+    RenameMode, RepoTrustAction, RestartDialog, SendMessageDialog, TipsDialog, TipsOutcome,
+    UnifiedDeleteDialog, WorktreeNameDialog,
 };
 use crate::tui::diff::{DiffAction, DiffView};
 use crate::tui::responsive;
@@ -2542,6 +2542,26 @@ impl HomeView {
             return None;
         }
 
+        // Provider-native prompts take precedence over built-in permission mappings.
+        if let Some(dialog) = &mut self.agent_question_dialog {
+            match dialog.handle_key(key) {
+                DialogResult::Continue => {}
+                DialogResult::Cancel => {
+                    self.agent_question_dialog = None;
+                    self.pending_permission_response_session = None;
+                    self.pending_integration_snapshot = None;
+                }
+                DialogResult::Submit(answers) => {
+                    self.agent_question_dialog = None;
+                    if let Some(session_id) = self.pending_permission_response_session.take() {
+                        self.execute_agent_question_response(&session_id, answers);
+                    }
+                    self.pending_integration_snapshot = None;
+                }
+            }
+            return None;
+        }
+
         // Permission response dialog
         if let Some(dialog) = &mut self.permission_response_dialog {
             match dialog.handle_key(key) {
@@ -2549,6 +2569,7 @@ impl HomeView {
                 DialogResult::Cancel => {
                     self.permission_response_dialog = None;
                     self.pending_permission_response_session = None;
+                    self.pending_integration_snapshot = None;
                 }
                 DialogResult::Submit(choice) => {
                     self.permission_response_dialog = None;
@@ -5937,6 +5958,10 @@ impl HomeView {
         // its editor focused, a paste that fell through to that branch would
         // open a message dialog aimed at whatever session was selected before
         // the panel opened, and render both overlays at once.
+        if let Some(dialog) = &mut self.agent_question_dialog {
+            dialog.handle_paste(text);
+            return;
+        }
         if let Some(ref mut dialog) = self.skills_manager_dialog {
             dialog.handle_paste(text);
             return;
@@ -6393,40 +6418,96 @@ impl HomeView {
         true
     }
 
-    /// Open the permission-response dialog for the currently-selected
-    /// session, letting the user answer a permission prompt they can see
-    /// in the pane without attaching. Unlike `open_send_message_dialog`,
-    /// this has no `Status::Waiting` gate: the user has already visually
-    /// confirmed the prompt is showing, and AoE never parses pane content
-    /// to verify it. Silently no-ops when there's no valid session
-    /// selected or it's mid create/delete; shows an info dialog when the
-    /// selected session's agent has no mapped keystroke sequences yet.
+    /// Open a response UI for the selected session. A fresh provider prompt is
+    /// captured before considering any agent's legacy response mapping.
     fn open_permission_response_dialog(&mut self) {
         let Some(id) = self.selected_session.clone() else {
             return;
         };
-        let Some(inst) = self.get_instance(&id) else {
+        let Some(instance) = self.get_instance(&id).cloned() else {
             return;
         };
-        if matches!(inst.status, Status::Creating | Status::Deleting) {
+        if matches!(instance.status, Status::Creating | Status::Deleting)
+            || instance.is_structured()
+        {
             return;
         }
-        if inst.is_structured() {
+        let integration_configured = crate::plugin::agent_integration::configured(&instance);
+        let snapshot = crate::plugin::agent_integration::snapshot(&instance);
+        if integration_configured && snapshot.is_none() {
+            self.info_dialog = Some(InfoDialog::new(
+                "Provider Integration Unavailable",
+                "The approved provider integration has no fresh status report. Retry after it reconnects; no legacy response keys were sent.",
+            ));
             return;
         }
-        let title = inst.title.clone();
-        let tool = inst.tool.clone();
-        let Some(response) = crate::agents::get_agent(&tool).and_then(|a| a.permission_response)
+        self.open_permission_response_for_instance(&id, &instance, snapshot);
+    }
+    pub(super) fn open_permission_response_for_instance(
+        &mut self,
+        id: &str,
+        instance: &crate::session::Instance,
+        snapshot: Option<
+            std::sync::Arc<aoe_plugin_api::agent_integration::AgentIntegrationSnapshot>,
+        >,
+    ) {
+        use aoe_plugin_api::agent_integration::AgentIntegrationPrompt;
+
+        if let Some(snapshot) = snapshot {
+            match snapshot.prompt.as_ref() {
+                Some(AgentIntegrationPrompt::Approval {
+                    title,
+                    allow_always,
+                    ..
+                }) => {
+                    self.pending_permission_response_session = Some(id.to_string());
+                    self.pending_integration_snapshot = Some(snapshot.clone());
+                    self.permission_response_dialog = Some(
+                        crate::tui::dialogs::PermissionResponseDialog::new_with_allow_always(
+                            title,
+                            *allow_always,
+                        ),
+                    );
+                }
+                Some(AgentIntegrationPrompt::Question {
+                    title, questions, ..
+                }) => {
+                    if questions.is_empty() {
+                        self.info_dialog = Some(InfoDialog::new(
+                            "Invalid Provider Prompt",
+                            "The provider reported a question prompt with no questions.",
+                        ));
+                        return;
+                    }
+                    self.pending_permission_response_session = Some(id.to_string());
+                    self.pending_integration_snapshot = Some(snapshot.clone());
+                    self.agent_question_dialog =
+                        Some(AgentQuestionDialog::new(title, questions.clone()));
+                }
+                None => {
+                    self.info_dialog = Some(InfoDialog::new(
+                        "No Active Prompt",
+                        "This session has no active provider prompt to answer.",
+                    ));
+                }
+            }
+            return;
+        }
+
+        let tool = &instance.tool;
+        let Some(response) =
+            crate::agents::get_agent(tool).and_then(|agent| agent.permission_response)
         else {
             self.info_dialog = Some(InfoDialog::new(
                 "Not Supported",
-                &format!("{} doesn't support quick permission responses yet.", tool),
+                &format!("{tool} doesn't support quick permission responses yet."),
             ));
             return;
         };
-        self.pending_permission_response_session = Some(id);
+        self.pending_permission_response_session = Some(id.to_string());
+        self.pending_integration_snapshot = None;
         self.permission_response_dialog = Some(crate::tui::dialogs::PermissionResponseDialog::new(
-            &title,
+            &instance.title,
             response.allow_always,
         ));
     }

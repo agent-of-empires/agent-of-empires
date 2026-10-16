@@ -87,6 +87,11 @@ pub struct PluginManifest {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub status: Vec<StatusContribution>,
 
+    /// Provider-native status and terminal prompt replies. Requires API v13
+    /// and the `session.integration` capability.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub agent_integrations: Vec<crate::agent_integration::AgentIntegrationContribution>,
+
     /// UI slots the plugin renders into. Consumed by #2366.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub ui: Vec<UiContribution>,
@@ -1187,6 +1192,32 @@ impl PluginManifest {
             check(
                 !s.id.is_empty(),
                 format!("status[{i}].id must not be empty"),
+            );
+        }
+        let mut integration_tools = std::collections::HashSet::new();
+        for integration in &self.agent_integrations {
+            check(
+                !integration.tool.is_empty()
+                    && integration.tool.bytes().all(|c| {
+                        c.is_ascii_lowercase() || c.is_ascii_digit() || c == b'-' || c == b'_'
+                    }),
+                "agent_integrations.tool must be a nonempty lowercase agent id".into(),
+            );
+            check(
+                integration_tools.insert(integration.tool.as_str()),
+                "agent_integrations must not repeat a tool".into(),
+            );
+        }
+        if !self.agent_integrations.is_empty() {
+            check(
+                self.api_version >= 13,
+                "agent_integrations require api_version >= 13".into(),
+            );
+            check(
+                self.capabilities
+                    .iter()
+                    .any(|c| c.as_str() == "session.integration"),
+                "agent_integrations require the session.integration capability".into(),
             );
         }
         check(

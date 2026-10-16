@@ -7,7 +7,7 @@
 //!
 //! Hook events are agent-specific and defined in `AgentHookConfig::events`.
 
-mod dir_guard;
+pub(crate) mod dir_guard;
 mod status_file;
 mod targets;
 

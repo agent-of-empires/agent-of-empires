@@ -377,6 +377,14 @@ pub(crate) fn read_file_at(
     name: &str,
     max_bytes: usize,
 ) -> Result<Option<Vec<u8>>> {
+    Ok(read_file_with_metadata_at(dir, name, max_bytes)?.map(|(_, bytes)| bytes))
+}
+
+pub(crate) fn read_file_with_metadata_at(
+    dir: BorrowedFd<'_>,
+    name: &str,
+    max_bytes: usize,
+) -> Result<Option<(Metadata, Vec<u8>)>> {
     use std::io::Read;
     validate_hook_leaf(name)?;
     let fd = match openat(
@@ -390,13 +398,14 @@ pub(crate) fn read_file_at(
         Err(e) => return Err(e).with_context(|| format!("openat read {name}")),
     };
     let mut file = std::fs::File::from(fd);
-    if !file.metadata()?.is_file() {
+    let metadata = file.metadata()?;
+    if !metadata.is_file() {
         return Ok(None);
     }
     let mut buf = Vec::with_capacity(max_bytes.min(4096));
     let limit = u64::try_from(max_bytes).unwrap_or(u64::MAX);
     file.by_ref().take(limit).read_to_end(&mut buf)?;
-    Ok(Some(buf))
+    Ok(Some((metadata, buf)))
 }
 
 /// `fstatat(AT_SYMLINK_NOFOLLOW)` view for mtime gating. Returns `Ok(None)` on

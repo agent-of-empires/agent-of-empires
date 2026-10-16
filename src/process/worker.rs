@@ -13,25 +13,9 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 
-/// Probe whether `pid` is still alive. On Unix: `kill(pid, 0)` returns
-/// `Ok(())` for live and `Err(ESRCH)` for dead. Other errors (EPERM,
-/// etc.) mean the process exists but we lack permission to signal it,
-/// still alive.
-#[cfg(unix)]
+/// Re-export the process-level liveness probe for worker callers.
 pub fn is_pid_alive(pid: u32) -> bool {
-    use nix::errno::Errno;
-    use nix::sys::signal::kill;
-    use nix::unistd::Pid;
-    match kill(Pid::from_raw(pid as i32), None) {
-        Ok(()) => true,
-        Err(Errno::ESRCH) => false,
-        Err(_) => true,
-    }
-}
-
-#[cfg(not(unix))]
-pub fn is_pid_alive(_pid: u32) -> bool {
-    false
+    crate::process::is_pid_alive(pid)
 }
 
 /// Ask the kernel which process is listening on this Unix domain socket

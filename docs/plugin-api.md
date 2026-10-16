@@ -19,10 +19,10 @@ A manifest carries two independent version axes.
 
 | Key | Meaning |
 |---|---|
-| `api_version` | The manifest *schema* version. The current schema is `12`. The host rejects a manifest whose `api_version` is newer than it supports. Bump it as you adopt newer sections (see below). |
+| `api_version` | The manifest *schema* version. The current schema is `13`. The host rejects a manifest whose `api_version` is newer than it supports. Bump it as you adopt newer sections (see below). |
 | `aoe_version` | A semver requirement on the *host app* version, e.g. `">=1.11.0, <2.0.0"`. The host refuses to install, and skips loading, a plugin whose requirement excludes the running version. Optional; requires `api_version >= 4`. |
 
-Schema additions by `api_version`: `2` added contributions (commands, keybinds, settings, ui), `3` added the `pane` UI slot, `4` added `status` and `aoe_version`, `5` added `screenshots`, `6` added a command `action`, `7` added identity icons, `8` added the `composer-action` UI slot, `9` added session-driving worker RPCs (see [Session-driving RPCs](#session-driving-rpcs)), plugin-private storage, and the `dynamic_select` / `object_list` / `cron` settings widgets, `10` added the `tool-card-badge` UI slot, `11` added the `acp.capabilities.probe` RPC + capability, a `thinking` (thought-level) list on the capability response, the `dynamic_multi_select` object-list field widget, and an optional `project_path` (empty = scratch session), `extra_project_paths`, and a `sandbox` flag on `sessions.create`, plus a `multiline` attribute for `string` settings fields, `12` grew the pane block vocabulary (see [Pane payload](#pane-payload)): the `callout`, `bar` and `columns` kinds, clickable `row`s carrying `params`, header summaries and scrollable bodies on `section`, `disabled` / `variant` / `href` on `action`, and a pane-level `footer`.
+Schema additions by `api_version`: `2` added contributions (commands, keybinds, settings, ui), `3` added the `pane` UI slot, `4` added `status` and `aoe_version`, `5` added `screenshots`, `6` added a command `action`, `7` added identity icons, `8` added the `composer-action` UI slot, `9` added session-driving worker RPCs (see [Session-driving RPCs](#session-driving-rpcs)), plugin-private storage, and the `dynamic_select` / `object_list` / `cron` settings widgets, `10` added the `tool-card-badge` UI slot, `11` added the `acp.capabilities.probe` RPC + capability, a `thinking` (thought-level) list on the capability response, the `dynamic_multi_select` object-list field widget, and an optional `project_path` (empty = scratch session), `extra_project_paths`, and a `sandbox` flag on `sessions.create`, plus a `multiline` attribute for `string` settings fields, `12` grew the pane block vocabulary (see [Pane payload](#pane-payload)): the `callout`, `bar` and `columns` kinds, clickable `row`s carrying `params`, header summaries and scrollable bodies on `section`, `disabled` / `variant` / `href` on `action`, and a pane-level `footer`, `13` added `agent_integrations` for provider-native session status and user-requested terminal prompt replies.
 
 ## Top-level fields
 
@@ -41,12 +41,13 @@ capabilities = ["runtime.worker"]
 | `id` | string | yes | Plugin id (see [Plugin id](#plugin-id)). Namespaces config, events, and action names. |
 | `name` | string | yes | Human-readable display name. |
 | `version` | string | yes | Semantic version of the plugin. |
-| `api_version` | integer | yes | Manifest schema version, `1` to `12`. |
+| `api_version` | integer | yes | Manifest schema version, `1` to `13`. |
 | `description` | string | no | Shown in plugin listings. Defaults to empty. |
 | `aoe_version` | string | no | Host-app semver requirement. Requires `api_version >= 4`. |
 | `capabilities` | array of string | no | Runtime grants the worker needs (see [Capabilities](#capabilities)). Static contributions need none. |
 | `screenshots` | array | no | Up to 8. Requires `api_version >= 5`. See [Screenshots](#screenshots). |
 | `setting_defaults` | table | no | Overrides for core host settings, keyed by canonical path (e.g. `"theme.idle_decay_minutes"`). Resolution is user value, then plugin override, then core default. |
+| `agent_integrations` | array of tables | no | Provider-native status and explicit prompt replies for a supported agent. Requires `api_version >= 13` and the `session.integration` capability. Each `[[agent_integrations]]` table has one `tool` agent id; a manifest must not repeat a tool. |
 
 ## Plugin id
 
@@ -80,6 +81,7 @@ themes, ui, status) need no capability.
 | `browser_open` | Opening a URL in the user's browser from a command `action`. |
 | `composer.read` | Reading a click-scoped snapshot of the active ACP composer draft from a `composer-action`. |
 | `composer.write` | Publishing a host-validated draft edit from a `composer-action` UI-state payload. |
+| `session.integration` | Reading a provider-native session report and sending explicit approval/question replies through the registered session's tmux pane (`api_version >= 13`). It does not grant approval authority or OMP extension execution. |
 | `acp.capabilities.read` | Discovering available agents and their advertised models/modes via `acp.capabilities.get` (`api_version >= 9`). |
 | `acp.capabilities.probe` | Triggering a handshake-only catalog probe via `acp.capabilities.probe`: the host spawns the agent adapter, runs initialize + `session/new` (no prompt turn, so no tokens), records the advertised models/modes/thought-levels, and tears it down. Distinct from `acp.capabilities.read` because it spawns a real process (`api_version >= 11`). |
 | `session.create` | Creating a host-owned structured session via `sessions.create` (`api_version >= 9`). |

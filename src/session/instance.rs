@@ -5455,6 +5455,31 @@ impl Instance {
             self.has_command_override()
         );
 
+        if crate::plugin::agent_integration::configured(self) {
+            if is_dead {
+                self.status = Status::Error;
+                if self.last_error.is_none() {
+                    let pane_content = session.capture_pane(20).unwrap_or_default();
+                    self.last_error = Some(summarize_error_from_pane(&pane_content));
+                }
+            } else if let Some(report) = crate::plugin::agent_integration::snapshot(self) {
+                use aoe_plugin_api::agent_integration::AgentIntegrationStatus;
+                self.status = match report.status {
+                    AgentIntegrationStatus::Running => Status::Running,
+                    AgentIntegrationStatus::Waiting => Status::Waiting,
+                    AgentIntegrationStatus::Idle => Status::Idle,
+                    AgentIntegrationStatus::Error => Status::Error,
+                };
+                self.last_error = (self.status == Status::Error)
+                    .then(|| "Provider integration reported an error".to_owned());
+            } else {
+                self.status = Status::Error;
+                self.last_error =
+                    Some("Provider integration report unavailable or expired".to_owned());
+            }
+            return;
+        }
+
         let detection_tool = if self.detect_as.is_empty() {
             &self.tool
         } else {

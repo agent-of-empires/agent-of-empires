@@ -35,9 +35,9 @@ use super::deletion_poller::DeletionPoller;
 #[cfg(feature = "serve")]
 use super::dialogs::ServeView;
 use super::dialogs::{
-    AttachProjectDialog, ChangelogDialog, CommandPaletteDialog, ConfirmDialog, ContextMenuDialog,
-    GroupDeleteOptionsDialog, GroupPickerDialog, HooksInstallDialog, InfoDialog, IntroDialog,
-    NewSessionData, NewSessionDialog, NoAgentsDialog, ProfilePickerDialog,
+    AgentQuestionDialog, AttachProjectDialog, ChangelogDialog, CommandPaletteDialog, ConfirmDialog,
+    ContextMenuDialog, GroupDeleteOptionsDialog, GroupPickerDialog, HooksInstallDialog, InfoDialog,
+    IntroDialog, NewSessionData, NewSessionDialog, NoAgentsDialog, ProfilePickerDialog,
     ProjectSessionPickerDialog, ProjectsDialog, RenameDialog, RepoTrustDialog, RestartDialog,
     SnoozeDurationDialog, SortPickerDialog, UnifiedDeleteDialog, UpdateConfirmDialog,
     WorktreeNameDialog,
@@ -567,10 +567,13 @@ pub struct HomeView {
     pub(super) tips_badge_hovered: bool,
     pub(super) send_message_dialog: Option<super::dialogs::SendMessageDialog>,
     pub(super) permission_response_dialog: Option<super::dialogs::PermissionResponseDialog>,
-    /// Session to receive the permission-response keystrokes once the
-    /// dialog resolves.
+    /// Session to receive the response when the approval dialog resolves.
     pub(super) pending_permission_response_session: Option<String>,
-    /// Session to receive the message from the send dialog
+    /// Live provider prompt captured when its response UI was opened.
+    pub(super) pending_integration_snapshot:
+        Option<std::sync::Arc<aoe_plugin_api::agent_integration::AgentIntegrationSnapshot>>,
+    pub(super) agent_question_dialog: Option<AgentQuestionDialog>,
+    /// Session to receive the message from the send dialog.
     pub(super) pending_send_session: Option<String>,
     /// Which pane the pending send-message dialog will target. Set
     /// alongside `pending_send_session` and read when the dialog
@@ -2195,6 +2198,8 @@ impl HomeView {
             send_message_dialog: None,
             permission_response_dialog: None,
             pending_permission_response_session: None,
+            pending_integration_snapshot: None,
+            agent_question_dialog: None,
             pending_send_session: None,
             pending_send_target: live_send::LiveSendTarget::Agent,
             pending_live_send_target: live_send::LiveSendTarget::Agent,
@@ -4554,6 +4559,7 @@ impl HomeView {
             || self.tool_picker_dialog.is_some()
             || self.send_message_dialog.is_some()
             || self.permission_response_dialog.is_some()
+            || self.agent_question_dialog.is_some()
             || self.update_confirm_dialog.is_some()
             || self.telemetry_consent_dialog.is_some()
             || self.tips_dialog.is_some()
@@ -4621,6 +4627,7 @@ impl HomeView {
             || self.tool_picker_dialog.is_some()
             || self.send_message_dialog.is_some()
             || self.permission_response_dialog.is_some()
+            || self.agent_question_dialog.is_some()
             || self.update_confirm_dialog.is_some()
             || self.telemetry_consent_dialog.is_some()
             || self.tips_dialog.is_some()
@@ -5555,16 +5562,40 @@ impl HomeView {
         }
     }
 
-    /// Send the tmux keystrokes for a permission-prompt decision straight
-    /// to the selected session's agent pane. No pane-readiness wait like
-    /// `execute_send_message` performs: this action only makes sense
-    /// against an already-live pane showing a prompt, so there is nothing
-    /// to revive.
+    /// Submit a permission response immediately without waiting for pane readiness.
     pub fn execute_permission_response(
         &mut self,
         session_id: &str,
         choice: crate::tui::dialogs::PermissionResponseChoice,
     ) {
+        if let Some(expected) = self.pending_integration_snapshot.take() {
+            let Some(instance) = self.get_instance(session_id).cloned() else {
+                return;
+            };
+            let choice = match choice {
+                crate::tui::dialogs::PermissionResponseChoice::Allow => {
+                    aoe_plugin_api::agent_integration::IntegrationApprovalChoice::Allow
+                }
+                crate::tui::dialogs::PermissionResponseChoice::AllowAlways => {
+                    aoe_plugin_api::agent_integration::IntegrationApprovalChoice::AllowAlways
+                }
+                crate::tui::dialogs::PermissionResponseChoice::Deny => {
+                    aoe_plugin_api::agent_integration::IntegrationApprovalChoice::Deny
+                }
+            };
+            let response =
+                aoe_plugin_api::agent_integration::AgentIntegrationResponse::Approval { choice };
+            if let Err(error) =
+                crate::plugin::agent_integration::respond(&instance, &expected, response)
+            {
+                self.info_dialog = Some(InfoDialog::new(
+                    "Respond Failed",
+                    &format!("Provider prompt changed or response failed: {error}"),
+                ));
+            }
+            return;
+        }
+
         let Some(inst) = self.get_instance(session_id) else {
             return;
         };
@@ -5572,7 +5603,7 @@ impl HomeView {
             return;
         }
         let Some(response) =
-            crate::agents::get_agent(&inst.tool).and_then(|a| a.permission_response)
+            crate::agents::get_agent(&inst.tool).and_then(|agent| agent.permission_response)
         else {
             return;
         };
@@ -5580,19 +5611,42 @@ impl HomeView {
             return;
         };
         let tmux_session = match crate::tmux::Session::new(&inst.id, &inst.title) {
-            Ok(s) => s,
-            Err(e) => {
+            Ok(session) => session,
+            Err(error) => {
                 self.info_dialog = Some(InfoDialog::new(
                     "Respond Failed",
-                    &format!("Failed to resolve session: {}", e),
+                    &format!("Failed to resolve session: {error}"),
                 ));
                 return;
             }
         };
-        if let Err(e) = tmux_session.send_key_tokens(tokens) {
+        if let Err(error) = tmux_session.send_key_tokens(tokens) {
             self.info_dialog = Some(InfoDialog::new(
                 "Respond Failed",
-                &format!("Failed to send response: {}", e),
+                &format!("Failed to send response: {error}"),
+            ));
+        }
+    }
+
+    pub fn execute_agent_question_response(
+        &mut self,
+        session_id: &str,
+        answers: Vec<aoe_plugin_api::agent_integration::AgentIntegrationAnswer>,
+    ) {
+        let Some(expected) = self.pending_integration_snapshot.take() else {
+            return;
+        };
+        let Some(instance) = self.get_instance(session_id).cloned() else {
+            return;
+        };
+        let response =
+            aoe_plugin_api::agent_integration::AgentIntegrationResponse::Question { answers };
+        if let Err(error) =
+            crate::plugin::agent_integration::respond(&instance, &expected, response)
+        {
+            self.info_dialog = Some(InfoDialog::new(
+                "Respond Failed",
+                &format!("Provider prompt changed or response failed: {error}"),
             ));
         }
     }
@@ -5604,53 +5658,12 @@ impl HomeView {
 fn permission_response_tokens(
     response: &crate::agents::PermissionResponse,
     choice: crate::tui::dialogs::PermissionResponseChoice,
-) -> Option<&'static [crate::agents::KeyToken]> {
+) -> Option<&'static [crate::agents::KeyToken<'static>]> {
     use crate::tui::dialogs::PermissionResponseChoice::*;
     match choice {
         Allow => Some(response.allow),
         AllowAlways => response.allow_always,
         Deny => Some(response.deny),
-    }
-}
-
-#[cfg(test)]
-mod permission_response_tokens_tests {
-    use super::*;
-    use crate::agents::{KeyToken, PermissionResponse};
-    use crate::tui::dialogs::PermissionResponseChoice;
-
-    #[test]
-    fn maps_each_choice_to_its_own_field() {
-        let response = PermissionResponse {
-            allow: &[KeyToken::Literal("1")],
-            allow_always: Some(&[KeyToken::Literal("2")]),
-            deny: &[KeyToken::Literal("3")],
-        };
-        assert_eq!(
-            permission_response_tokens(&response, PermissionResponseChoice::Allow),
-            Some(response.allow)
-        );
-        assert_eq!(
-            permission_response_tokens(&response, PermissionResponseChoice::AllowAlways),
-            response.allow_always
-        );
-        assert_eq!(
-            permission_response_tokens(&response, PermissionResponseChoice::Deny),
-            Some(response.deny)
-        );
-    }
-
-    #[test]
-    fn allow_always_none_maps_to_none() {
-        let response = PermissionResponse {
-            allow: &[KeyToken::Named("Enter")],
-            allow_always: None,
-            deny: &[KeyToken::Named("Down"), KeyToken::Named("Enter")],
-        };
-        assert_eq!(
-            permission_response_tokens(&response, PermissionResponseChoice::AllowAlways),
-            None
-        );
     }
 }
 

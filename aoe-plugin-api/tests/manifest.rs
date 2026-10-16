@@ -21,6 +21,63 @@ description = "The aoe serve web dashboard."
 }
 
 #[test]
+fn omp_aoe_package_manifest_parses() {
+    let manifest =
+        PluginManifest::from_toml_str(include_str!("../../plugins/agent-omp/aoe-plugin.toml"))
+            .expect("AoE-facing OMP package manifest is valid");
+    assert_eq!(manifest.id.as_str(), "omp.agent-of-empires");
+    assert_eq!(manifest.name, "Oh My Pi Integration");
+}
+
+#[test]
+fn agent_integration_requires_api_capability_and_unique_valid_tools() {
+    let base = r#"
+id = "acme.omp"
+name = "OMP"
+version = "0.1.0"
+api_version = {api_version}
+capabilities = {capabilities}
+[[agent_integrations]]
+tool = "omp"
+"#;
+    let valid = base
+        .replace("{api_version}", "13")
+        .replace("{capabilities}", r#"["session.integration"]"#);
+    let manifest = PluginManifest::from_toml_str(&valid).expect("valid integration parses");
+    assert_eq!(manifest.agent_integrations[0].tool, "omp");
+
+    let cases = [
+        (
+            base.replace("{api_version}", "12")
+                .replace("{capabilities}", r#"["session.integration"]"#),
+            "require api_version >= 13",
+        ),
+        (
+            base.replace("{api_version}", "13")
+                .replace("{capabilities}", "[]"),
+            "require the session.integration capability",
+        ),
+        (
+            base.replace("{api_version}", "13")
+                .replace("{capabilities}", r#"["session.integration"]"#)
+                .replace("tool = \"omp\"", "tool = \"OMP\""),
+            "lowercase agent id",
+        ),
+        (
+            format!("{valid}\n[[agent_integrations]]\ntool = \"omp\"\n"),
+            "must not repeat a tool",
+        ),
+    ];
+    for (toml, expected_error) in cases {
+        let error = PluginManifest::from_toml_str(&toml).unwrap_err();
+        assert!(
+            matches!(&error, ManifestError::Invalid(errors) if errors.iter().any(|item| item.contains(expected_error))),
+            "expected {expected_error:?}, got {error:?}"
+        );
+    }
+}
+
+#[test]
 fn api_version_1_still_parses() {
     // The bundled aoe.web manifest still targets api_version 1; an older
     // manifest must keep loading on a newer host.

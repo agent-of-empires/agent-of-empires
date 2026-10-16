@@ -41,6 +41,27 @@ pub mod worker_registry;
 #[cfg(feature = "serve")]
 pub mod runner;
 
+/// Probe whether a process exists without sending it a signal.
+#[cfg(unix)]
+pub fn is_pid_alive(pid: u32) -> bool {
+    let Ok(pid) = i32::try_from(pid) else {
+        return false;
+    };
+    if pid <= 0 {
+        return false;
+    }
+    match nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None) {
+        Ok(()) => true,
+        Err(nix::errno::Errno::ESRCH) => false,
+        Err(_) => true,
+    }
+}
+
+#[cfg(not(unix))]
+pub fn is_pid_alive(_pid: u32) -> bool {
+    false
+}
+
 const WAIT_POLL_INTERVAL: Duration = Duration::from_millis(25);
 
 /// Wait for `child` to exit, killing and reaping it if it outlives `timeout`.
@@ -566,6 +587,14 @@ fn signal_process_tree(pid: u32, signal: Signal) {
 mod tests {
     use super::*;
 
+    #[cfg(unix)]
+    #[test]
+    fn is_pid_alive_rejects_invalid_pid_values() {
+        assert!(is_pid_alive(std::process::id()));
+        for pid in [0, i32::MAX as u32 + 1, u32::MAX] {
+            assert!(!is_pid_alive(pid), "{pid} is not a valid process id");
+        }
+    }
     #[test]
     fn processes_matching_empty_input_is_empty() {
         assert!(processes_matching(&[], &[]).is_empty());

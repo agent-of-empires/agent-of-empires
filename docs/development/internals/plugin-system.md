@@ -185,19 +185,18 @@ dependency arrow runs consumer -> substrate):
 ## Contribution schema (#2093)
 
 `PluginManifest` extends past identity to the contribution sections a plugin
-declares: `capabilities`, `commands`, `keybinds`, `settings`, `ui`, and a
-`runtime` worker entrypoint. These are the sections the first external plugin
-declares; they are defined in `aoe-plugin-api` and parsed/validated by the
-host, but consumed by later issues (the settings registry in #2094, the runtime
-host in #2095, the command/keybind/UI surfaces in #2366). `api_version` is now
-10 (bumped to 2 for the contribution sections, 3 when the `detail-panel` slot
-became the dockable `pane` slot, 4 for the `status` section and the
-`aoe_version` field, 5 for screenshots, 6 for command actions, 7 for identity
-icons, 8 for the `composer-action` slot, 9 for ACP-capability discovery,
-host-owned sessions, plugin-private storage, and structured settings widgets,
-and 10 for the `settings-page` and `tool-card-badge` slots); an
-older `api_version` manifest still loads as long as it targets no newer field. Unknown top-level keys remain
-a hard parse error
+declares: `capabilities`, `commands`, `keybinds`, `settings`, `ui`,
+`agent_integrations`, and a `runtime` worker entrypoint. They are defined in
+`aoe-plugin-api` and parsed and validated by the host. `api_version` is now 13
+(bumped to 2 for the contribution sections, 3 when the `detail-panel` slot
+became the dockable `pane` slot, 4 for `status` and `aoe_version`, 5 for
+screenshots, 6 for command actions, 7 for identity icons, 8 for the
+`composer-action` slot, 9 for ACP-capability discovery, host-owned sessions,
+plugin-private storage, and structured settings widgets, 10 for the
+`settings-page` and `tool-card-badge` slots, 11 for ACP capability probes and
+related session and setting fields, 12 for richer pane blocks, and 13 for
+provider-native session integrations). Older manifests still load as long as
+they target no newer field. Unknown top-level keys remain a hard parse error
 (`deny_unknown_fields`).
 
 The `themes` section ships and is consumed by the theme registry (#2094); the
@@ -331,8 +330,11 @@ data, host state, the OS, or the network. The v1 set
 (`aoe_plugin_api::KNOWN_CAPABILITIES`): `runtime.worker`, `session.read`,
 `session.write`, `config.read`, `config.write`, `process.spawn`, `net`,
 `fs.read`, `fs.write`, `clipboard.read`, `clipboard.write`, `notifications`,
-`browser_open`, `composer.read`, and `composer.write`. A plugin's own declared
-settings need no `config.*`; that gates host/global or other-plugin config.
+`browser_open`, `composer.read`, `composer.write`, `session.integration`, and
+ACP capabilities. A plugin's own declared settings need no `config.*`; that
+gates host/global or other-plugin config. `session.integration` grants
+provider status observation and user-requested terminal replies for a declared
+agent; it does not grant OMP plugin code or bypass native approval.
 
 Capabilities are open strings (`CapabilityId`), so a follow-up can add one
 without an `api_version` bump. An unknown capability still parses (forward

@@ -12,6 +12,7 @@
 //! kind (#2432). See `docs/development/internals/plugin-system.md`.
 
 pub mod acp;
+pub mod agent_integration;
 mod capability;
 mod id;
 mod manifest;
@@ -46,5 +47,6 @@ pub use manifest::{
 /// grew a `thinking` (thought-level) list; 12 when the pane block vocabulary
 /// gained the `callout`, `bar`, and `columns` kinds, clickable/badged `row`s,
 /// header-summary and scrollable `section`s, `disabled`/`variant` actions, and
-/// the pane-level `footer`.
-pub const API_VERSION: u32 = 12;
+/// the pane-level `footer`; 13 when provider-native session status and
+/// user-requested terminal replies gained `agent_integrations`.
+pub const API_VERSION: u32 = 13;
