@@ -102,14 +102,19 @@ for the harness API.
 
 ## Pull requests
 
-- Branch prefixes: `feature/`, `fix/`, `docs/`, `refactor/`.
-- Use conventional commit and PR titles.
-- Follow `.github/pull_request_template.md`; include what changed, why, tests,
-  and screenshots or recordings for UI changes.
+Follow [CONTRIBUTING.md](CONTRIBUTING.md) for branches, titles and the PR
+template, and [MAINTAINERS.md](MAINTAINERS.md) for review and merge rules.
+
 - Before review, run `cargo fmt`, `cargo clippy`, and `cargo test`, adding
   `--features web` when relevant.
 - For `web/` changes also run its format, lint, type, and applicable test checks
   from `web/AGENTS.md`, including the coverage matrix requirement.
+- Do not request reviewers; CODEOWNERS routes each PR.
+- Keep a PR within one owner area where possible; split changes that cross
+  areas.
+- When reviewing, tag each requested change P1, P2 or P3 per the
+  [rubric](CONTRIBUTING.md#review-rubric), say what would satisfy it, and file
+  P3s as issues.
 
 Codecov gates web changes at 75% patch coverage and prevents a project drop
 beyond its threshold. Do not add tautological tests merely to move coverage.
@@ -125,8 +130,8 @@ Persisted schema or path changes require a migration in `src/migrations/`; see
 
 `docs/cli/reference.md` is generated from clap help via `cargo xtask gen-docs`.
 Edit the CLI source and regenerate it. Documentation content lives in `docs/`;
-the website consumes it. Follow `docs/development/adding-a-website-page.md` for
-new pages.
+the website publishes only the pages listed in `website/scripts/sync-docs.mjs`.
+Follow `docs/development/adding-a-website-page.md` for new pages.
 
 Every non-Rust, non-TOML asset embedded with `include_*` must be added to
 `commonArgs.src` in `flake.nix`; CI checks this with
@@ -137,10 +142,6 @@ ignored paths for experiments.
 
 Read `DESIGN.md` before visual changes.
 
-## Skills
-
-When an available skill matches the request, invoke it before doing the work.
-
 ## Agent skills
 
 ### Issue tracker
@@ -149,7 +150,7 @@ Issues live in GitHub Issues for `agent-of-empires/agent-of-empires`, via `gh`. 
 
 ### Triage labels
 
-Default five-role vocabulary (`needs-triage`, `needs-info`, `ready-for-agent`, `ready-for-human`, `wontfix`). See `docs/agents/triage-labels.md`.
+Only `needs-triage` and `ready-for-agent` exist. See `docs/agents/triage-labels.md`.
 
 ### Domain docs
 

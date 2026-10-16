@@ -62,7 +62,7 @@ vi.mock("../../../lib/api", () => ({
   fetchPlugins: vi.fn(() => Promise.resolve(null)),
   fetchSettings: vi.fn(() => Promise.resolve({ tmux: {}, logging: {}, session: {}, sound: {} })),
   getSettingsSchema: vi.fn(() => Promise.resolve(SCHEMA)),
-  updateSettings: vi.fn(() => Promise.resolve(true)),
+  updateSettings: vi.fn(() => Promise.resolve("committed" as const)),
   updateTheme: vi.fn(() => Promise.resolve(true)),
   fetchThemes: vi.fn(() => Promise.resolve([])),
   setDefaultProfile: vi.fn(() => Promise.resolve(true)),
@@ -107,6 +107,10 @@ function clickToggle(container: HTMLElement, label: string) {
   fireEvent.click(sw);
 }
 
+import { resetSettingsStore } from "../../../lib/settingsStore";
+
+beforeEach(resetSettingsStore);
+
 describe("schema-driven settings field PATCH payloads", () => {
   beforeEach(() => {
     vi.clearAllMocks();
@@ -132,7 +136,7 @@ describe("schema-driven settings field PATCH payloads", () => {
       expect(select.value).toBe(value);
     }
 
-    vi.mocked(api.updateSettings).mockResolvedValueOnce(false);
+    vi.mocked(api.updateSettings).mockResolvedValueOnce("rejected");
     fireEvent.change(select, { target: { value: "right" } });
     await screen.findByText("Failed to save, please try again");
     await waitFor(() => expect(select.value).toBe("left"));

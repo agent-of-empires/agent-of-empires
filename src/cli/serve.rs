@@ -3,7 +3,6 @@
 use anyhow::{bail, Context, Result};
 use clap::{Args, ValueEnum};
 use std::path::PathBuf;
-use std::sync::Mutex;
 
 /// How the dashboard authenticates HTTP/WS requests.
 ///
@@ -548,24 +547,6 @@ pub fn read_serve_urls() -> Vec<ServeUrl> {
     out
 }
 
-pub fn cached_serve_mode_label() -> Option<&'static str> {
-    static CACHE: Mutex<Option<(u32, Option<&'static str>)>> = Mutex::new(None);
-
-    let pid = daemon_pid()?;
-    if let Ok(mut guard) = CACHE.lock() {
-        if let Some((cached_pid, cached_label)) = *guard {
-            if cached_pid == pid {
-                return cached_label;
-            }
-        }
-        let label = read_serve_mode_label();
-        *guard = Some((pid, label));
-        label
-    } else {
-        read_serve_mode_label()
-    }
-}
-
 fn read_serve_mode_label() -> Option<&'static str> {
     let dir = crate::session::get_app_dir().ok()?;
     let raw = std::fs::read_to_string(dir.join("serve.mode")).ok()?;
@@ -744,6 +725,7 @@ pub(crate) fn daemon_status() -> DaemonStatus {
     }
 }
 
+/// Verifying the daemon's identity spawns `ps`, so keep calls off the render path.
 pub fn daemon_pid() -> Option<u32> {
     match daemon_status() {
         DaemonStatus::Verified(pid) => Some(pid),

@@ -20,6 +20,7 @@ export function PushHealthBanner() {
   useEffect(() => {
     if (health === "healthy") writeDismissed(null);
   }, [health]);
+  if (health === "healthy" && dismissed !== null) setDismissed(null);
 
   if (!needsAttention(health) || dismissed === health) return null;
   const busy = state.kind === "asking" || state.kind === "subscribing";

@@ -181,6 +181,10 @@ pub(super) fn build_router(state: Arc<AppState>) -> Router {
             "/api/plugins/{id}/pages/{page_id}",
             get(api::serve_plugin_page),
         )
+        .route(
+            "/api/plugins/{id}/pages/{page_id}/ticket",
+            post(api::mint_plugin_page_ticket),
+        )
         .route("/api/plugins/commands", get(api::plugin_commands))
         .route(
             "/api/plugins/commands/{fqid}/invoke",
@@ -196,6 +200,7 @@ pub(super) fn build_router(state: Arc<AppState>) -> Router {
             post(api::restart_plugin_worker),
         )
         .route("/api/plugins/{id}/action", post(api::invoke_plugin_action))
+        .route("/api/plugins/{id}/sessions", get(api::plugin_sessions))
         .route(
             "/api/plugins/{id}/settings/options/resolve",
             post(api::resolve_options),

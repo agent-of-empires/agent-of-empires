@@ -628,14 +628,14 @@ fn fleet_reconcile_presizes_open_sessions_once_per_epoch() {
     // First sighting of a fleet geometry arms only; nothing reaches the
     // worker until the same geometry holds for a second refresh.
     env.view
-        .reconcile_passive_fleet(inner, false, Some(&selected));
+        .reconcile_passive_fleet(inner, false, true, Some(&selected));
     assert!(env.view.passive_fleet_armed.is_some());
     assert!(env.view.passive_pane_queued.is_empty());
 
     // Second sighting queues every open session except the excluded
     // (selected) one.
     env.view
-        .reconcile_passive_fleet(inner, false, Some(&selected));
+        .reconcile_passive_fleet(inner, false, true, Some(&selected));
     assert!(!env.view.passive_pane_queued.contains_key(&selected));
     for id in &ids[1..] {
         assert!(
@@ -649,7 +649,7 @@ fn fleet_reconcile_presizes_open_sessions_once_per_epoch() {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
     loop {
         env.view
-            .reconcile_passive_fleet(inner, false, Some(&selected));
+            .reconcile_passive_fleet(inner, false, true, Some(&selected));
         if ids[1..]
             .iter()
             .all(|id| env.view.passive_pane_declined.contains_key(id))
@@ -663,7 +663,7 @@ fn fleet_reconcile_presizes_open_sessions_once_per_epoch() {
         std::thread::sleep(std::time::Duration::from_millis(20));
     }
     env.view
-        .reconcile_passive_fleet(inner, false, Some(&selected));
+        .reconcile_passive_fleet(inner, false, true, Some(&selected));
     assert!(
         ids[1..]
             .iter()
@@ -675,10 +675,10 @@ fn fleet_reconcile_presizes_open_sessions_once_per_epoch() {
     // declines and the follow-up refresh retries each session once.
     let inner2 = ratatui::layout::Rect::new(0, 0, 120, 38);
     env.view
-        .reconcile_passive_fleet(inner2, false, Some(&selected));
+        .reconcile_passive_fleet(inner2, false, true, Some(&selected));
     assert!(env.view.passive_pane_declined.is_empty());
     env.view
-        .reconcile_passive_fleet(inner2, false, Some(&selected));
+        .reconcile_passive_fleet(inner2, false, true, Some(&selected));
     for id in &ids[1..] {
         assert!(
             env.view.passive_pane_queued.contains_key(id),
@@ -692,7 +692,7 @@ fn fleet_reconcile_presizes_open_sessions_once_per_epoch() {
     let armed_before = env.view.passive_fleet_armed.clone();
     env.view.selected_session = Some(ids[1].clone());
     env.view
-        .reconcile_passive_fleet(inner2, false, Some(&ids[1]));
+        .reconcile_passive_fleet(inner2, false, true, Some(&ids[1]));
     assert_eq!(env.view.passive_fleet_armed, armed_before);
     assert!(
         env.view.passive_pane_queued.contains_key(&ids[0]),
@@ -718,7 +718,7 @@ fn fleet_reconcile_reasserts_after_external_resize() {
     env.view.selected_session = Some(selected.clone());
     let inner = ratatui::layout::Rect::new(0, 0, 141, 45);
     env.view
-        .reconcile_passive_fleet(inner, false, Some(&selected));
+        .reconcile_passive_fleet(inner, false, true, Some(&selected));
 
     // Pretend ids[1]'s resize was applied at its wanted geometry, read back from the armed
     // epoch so the fixture can't drift from the real layout math.
@@ -745,7 +745,7 @@ fn fleet_reconcile_reasserts_after_external_resize() {
     // contradiction: the session stays in sync, nothing queued.
     crate::tmux::test_inject_pane_window_size(&name, (cols, rows));
     env.view
-        .reconcile_passive_fleet(inner, false, Some(&selected));
+        .reconcile_passive_fleet(inner, false, true, Some(&selected));
     assert!(env.view.passive_pane_synced.contains_key(&ids[1]));
     assert!(!env.view.passive_pane_queued.contains_key(&ids[1]));
 
@@ -753,7 +753,7 @@ fn fleet_reconcile_reasserts_after_external_resize() {
     // view): the contradicted entry is dropped and the pane re-asserted.
     crate::tmux::test_inject_pane_window_size(&name, (cols + 10, rows));
     env.view
-        .reconcile_passive_fleet(inner, false, Some(&selected));
+        .reconcile_passive_fleet(inner, false, true, Some(&selected));
     assert!(!env.view.passive_pane_synced.contains_key(&ids[1]));
     assert!(env.view.passive_pane_queued.contains_key(&ids[1]));
 }
@@ -781,7 +781,7 @@ fn stale_observation_published_after_adoption_does_not_invalidate() {
     env.view.selected_session = Some(selected.clone());
     let inner = ratatui::layout::Rect::new(0, 0, 141, 45);
     env.view
-        .reconcile_passive_fleet(inner, false, Some(&selected));
+        .reconcile_passive_fleet(inner, false, true, Some(&selected));
     let (cols, rows) = env
         .view
         .passive_fleet_armed
@@ -808,7 +808,7 @@ fn stale_observation_published_after_adoption_does_not_invalidate() {
     crate::tmux::test_inject_pane_window_size_at(&name, (cols + 10, rows), listed_at);
 
     env.view
-        .reconcile_passive_fleet(inner, false, Some(&selected));
+        .reconcile_passive_fleet(inner, false, true, Some(&selected));
     assert!(
         env.view.passive_pane_synced.contains_key(&ids[1]),
         "a pre-resize observation must not invalidate the adopted size"
@@ -833,7 +833,7 @@ fn fleet_reconcile_retries_expired_declines() {
     env.view.selected_session = Some(selected.clone());
     let inner = ratatui::layout::Rect::new(0, 0, 141, 45);
     env.view
-        .reconcile_passive_fleet(inner, false, Some(&selected));
+        .reconcile_passive_fleet(inner, false, true, Some(&selected));
     let want = env
         .view
         .passive_fleet_armed
@@ -854,7 +854,7 @@ fn fleet_reconcile_retries_expired_declines() {
         .passive_pane_declined
         .insert(ids[1].clone(), (want, expired));
     env.view
-        .reconcile_passive_fleet(inner, false, Some(&selected));
+        .reconcile_passive_fleet(inner, false, true, Some(&selected));
     assert!(env.view.passive_pane_queued.contains_key(&ids[1]));
 
     // A fresh decline parks it again.
@@ -863,7 +863,7 @@ fn fleet_reconcile_retries_expired_declines() {
         .passive_pane_declined
         .insert(ids[1].clone(), (want, std::time::Instant::now()));
     env.view
-        .reconcile_passive_fleet(inner, false, Some(&selected));
+        .reconcile_passive_fleet(inner, false, true, Some(&selected));
     assert!(!env.view.passive_pane_queued.contains_key(&ids[1]));
 }
 
@@ -889,9 +889,9 @@ fn fleet_reconcile_is_single_tui_only() {
 
     env.view.active_tui_count = 2;
     env.view
-        .reconcile_passive_fleet(inner, false, Some(&selected));
+        .reconcile_passive_fleet(inner, false, true, Some(&selected));
     env.view
-        .reconcile_passive_fleet(inner, false, Some(&selected));
+        .reconcile_passive_fleet(inner, false, true, Some(&selected));
     assert!(env.view.passive_fleet_armed.is_none());
     assert!(env.view.passive_pane_queued.is_empty());
 
@@ -899,10 +899,10 @@ fn fleet_reconcile_is_single_tui_only() {
     // debounce.
     env.view.active_tui_count = 1;
     env.view
-        .reconcile_passive_fleet(inner, false, Some(&selected));
+        .reconcile_passive_fleet(inner, false, true, Some(&selected));
     assert!(env.view.passive_fleet_armed.is_some());
     env.view
-        .reconcile_passive_fleet(inner, false, Some(&selected));
+        .reconcile_passive_fleet(inner, false, true, Some(&selected));
     assert!(env.view.passive_pane_queued.contains_key(&ids[1]));
 }
 
@@ -1011,5 +1011,82 @@ mod paste_splitting {
         // An empty paste emits nothing at all: an empty tmux paste
         // would still flash through some agents' paste handlers.
         assert!(split_paste_for_live_send("").is_empty());
+    }
+}
+
+/// Leader `t` re-enters live send on the other half of the agent/terminal pair, through
+/// the same `EnterLiveSend` action as a fresh entry, and only a plain `t` counts.
+#[test]
+#[serial]
+fn leader_t_swaps_live_target_between_agent_and_terminal() {
+    use crate::tui::home::live_send::{parse_chord, LiveSendTarget};
+
+    let mut env = create_test_env_with_sessions(1);
+    let id = install_live_for_first_session(&mut env);
+    let cases = [
+        (
+            "agent to terminal",
+            LiveSendTarget::Agent,
+            KeyModifiers::NONE,
+            Some(LiveSendTarget::Terminal),
+        ),
+        (
+            "terminal to agent",
+            LiveSendTarget::Terminal,
+            KeyModifiers::NONE,
+            Some(LiveSendTarget::Agent),
+        ),
+        (
+            "container to agent",
+            LiveSendTarget::ContainerTerminal,
+            KeyModifiers::NONE,
+            Some(LiveSendTarget::Agent),
+        ),
+        (
+            "tool to terminal",
+            LiveSendTarget::Tool("lazygit".into()),
+            KeyModifiers::NONE,
+            Some(LiveSendTarget::Terminal),
+        ),
+        (
+            "modified t is not the swap",
+            LiveSendTarget::Agent,
+            KeyModifiers::CONTROL,
+            None,
+        ),
+    ];
+    for (name, from, modifiers, expected) in cases {
+        let state = env.view.live_send.as_mut().expect("live");
+        state.target = from;
+        state.leader = parse_chord("C-b");
+        env.view.pending_live_send_target = LiveSendTarget::Agent;
+        let view_before = env.view.view_mode.clone();
+
+        env.view.handle_key(
+            KeyEvent::new(KeyCode::Char('b'), KeyModifiers::CONTROL),
+            None,
+        );
+        let action = env
+            .view
+            .handle_key(KeyEvent::new(KeyCode::Char('t'), modifiers), None);
+
+        match expected {
+            Some(target) => {
+                assert!(
+                    matches!(&action, Some(Action::EnterLiveSend(sid)) if *sid == id),
+                    "{name}: {action:?}"
+                );
+                assert_eq!(env.view.pending_live_send_target, target, "{name}");
+            }
+            None => assert!(action.is_none(), "{name}: {action:?}"),
+        }
+        assert!(
+            env.view.live_send.is_some(),
+            "{name}: live mode must survive"
+        );
+        assert_eq!(
+            env.view.view_mode, view_before,
+            "{name}: the view follows only once prepare_live_send succeeds"
+        );
     }
 }

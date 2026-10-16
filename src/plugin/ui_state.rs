@@ -67,6 +67,9 @@ struct TextPayload {
     /// `Some([])` is an explicit clear and stays distinct from an absent list.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     items: Option<Vec<BadgeItem>>,
+    /// Position among a chip slot's entries (`status-bar`, `header-start`, `detail-badge`), lowest first; default 0.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    order: Option<i32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -571,7 +574,7 @@ impl UiStore {
 
 fn max_payload_bytes(slot: UiSlot) -> usize {
     match slot {
-        UiSlot::Pane | UiSlot::HomePane => MAX_PANE_PAYLOAD_BYTES,
+        UiSlot::Pane | UiSlot::HomePane | UiSlot::Page => MAX_PANE_PAYLOAD_BYTES,
         UiSlot::ComposerAction => MAX_COMPOSER_ACTION_PAYLOAD_BYTES,
         _ => MAX_PAYLOAD_BYTES,
     }
@@ -645,7 +648,7 @@ fn validate_payload(slot: UiSlot, raw: &Value) -> Result<Value, String> {
         serde_json::to_value(parsed).map_err(|e| e.to_string())
     }
     match slot {
-        UiSlot::StatusBar | UiSlot::DetailBadge => {
+        UiSlot::StatusBar | UiSlot::HeaderStart | UiSlot::DetailBadge => {
             let parsed: TextPayload =
                 serde_json::from_value(raw.clone()).map_err(|e| e.to_string())?;
             if parsed.text.is_none() && parsed.items.is_none() {
@@ -690,7 +693,9 @@ fn validate_payload(slot: UiSlot, raw: &Value) -> Result<Value, String> {
             serde_json::to_value(parsed).map_err(|e| e.to_string())
         }
         UiSlot::Notification => Err("notification is pushed via ui.notify".into()),
-        UiSlot::Page => Err("page renders its declared entry and takes no state".into()),
+        // Opaque to the host; only the page's own script reads it.
+        UiSlot::Page if raw.is_object() => Ok(raw.clone()),
+        UiSlot::Page => Err("page state must be a JSON object".into()),
     }
 }
 
@@ -952,6 +957,27 @@ mod tests {
                 true,
             ),
             (
+                "header start accepts text with an order",
+                UiSlot::HeaderStart,
+                None,
+                json!({"text": "Codex 49%", "order": -2}),
+                true,
+            ),
+            (
+                "header start with neither text nor items rejected",
+                UiSlot::HeaderStart,
+                None,
+                json!({"order": 1}),
+                false,
+            ),
+            (
+                "header start is not per-session",
+                UiSlot::HeaderStart,
+                Some("s1"),
+                json!({"text": "x"}),
+                false,
+            ),
+            (
                 "status bar accepts an explicitly empty items list",
                 UiSlot::StatusBar,
                 None,
@@ -1089,10 +1115,31 @@ mod tests {
                 false,
             ),
             (
-                "page takes no pushed state",
+                "page takes an opaque global object",
                 UiSlot::Page,
                 None,
-                json!({"text": "x"}),
+                json!({"stages": {"s1": "todo"}, "config": {"any": [1, 2]}}),
+                true,
+            ),
+            (
+                "page state must be an object",
+                UiSlot::Page,
+                None,
+                json!([1, 2]),
+                false,
+            ),
+            (
+                "page state is global only",
+                UiSlot::Page,
+                Some("s1"),
+                json!({}),
+                false,
+            ),
+            (
+                "page state past the 64 KiB cap rejected",
+                UiSlot::Page,
+                None,
+                json!({"blob": "x".repeat(64 * 1024)}),
                 false,
             ),
         ];

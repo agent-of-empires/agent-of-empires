@@ -246,6 +246,51 @@ describe("subagents", () => {
     expect(names(toolParts([child("ch-1", "elsewhere")]))).toEqual(["read"]);
   });
 
+  describe("children after a mid-turn split", () => {
+    const answered = row("e1", "elicitation_answered", "yes");
+    const done = (id: string, extra: Partial<ActivityRow> = {}) =>
+      row(`done-${id}`, "tool_complete", `out-${id}`, { toolCallId: id, ...extra });
+    const assistants = (rows: ActivityRow[]) =>
+      activityToThreadMessages([user(), ...rows], true).filter((m) => m.role === "assistant");
+
+    it("keeps async children out of every later message", () => {
+      const msgs = assistants([
+        task(),
+        done("task-1", { asyncSubagent: true }),
+        answered,
+        message("Next.", "m2"),
+        child("a", "task-1"),
+        done("a"),
+        child("b", "task-1"),
+      ]);
+      expect(msgs).toHaveLength(2);
+      const parts = msgs[0]!.content as Part[];
+      expect(names(parts)).toEqual([SUBAGENT_TASK_NAME]);
+      expect(payload(parts[0]!)).toMatchObject({ async: true, children: [], parent: { toolCallId: "task-1" } });
+      expect(msgs[1]!.content).toEqual([{ type: "text", text: "Next." }]);
+    });
+
+    it("folds sync children into the parent card in the earlier message", () => {
+      const msgs = assistants([task(), answered, child("a", "task-1"), done("a"), done("task-1")]);
+      expect(msgs).toHaveLength(1);
+      const p = payload((msgs[0]!.content as Part[])[0]!);
+      expect(p.parent).toMatchObject({ toolCallId: "task-1", result: { content: "out-task-1" } });
+      expect(p.children).toMatchObject([{ toolCallId: "a", result: { content: "out-a" } }]);
+    });
+
+    it("does not split streamed text around a child call", () => {
+      const msgs = assistants([
+        task(),
+        message("🐤 plugin-", "m2"),
+        child("a", "task-1"),
+        message("linear#4 reviewed", "m3"),
+      ]);
+      expect((msgs[0]!.content as Part[]).filter((p) => p.type === "text")).toEqual([
+        { type: "text", text: "🐤 plugin-linear#4 reviewed" },
+      ]);
+    });
+  });
+
   it("collapses a childless async launch with async set", () => {
     const done = row("done-task-1", "tool_complete", "Async agent launched\nagentId: secret", {
       toolCallId: "task-1",

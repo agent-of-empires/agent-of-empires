@@ -17,9 +17,10 @@ const MAX_PENDING: usize = 8192;
 
 const MAX_URI: usize = 2048;
 
-/// Only http(s) reaches a browser; a control byte could inject escapes.
+/// A target the preview could open (`session::preview_link_openable`), so an
+/// unopenable one never takes a table slot; a control byte could inject escapes.
 fn usable_uri(uri: &str) -> bool {
-    crate::util::is_http_url(uri) && !uri.chars().any(char::is_control)
+    crate::session::preview_link_openable(uri) && !uri.chars().any(char::is_control)
 }
 
 pub(crate) struct Osc8Scanner {
@@ -187,6 +188,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn extracts_across_forms_and_neighbours() {
         let cases: Vec<(&str, Vec<PaneLink>)> = vec![
             (
@@ -223,7 +225,12 @@ mod tests {
                 "\x1b]8;;https://a.com\x1b\\A\x1b]8;;https://b.com\x1b\\B\x1b]8;;\x1b\\",
                 vec![link("A", "https://a.com"), link("B", "https://b.com")],
             ),
+            // With no `session.preview_link_prefixes`, only web targets are kept.
             ("\x1b]8;;file:///etc/passwd\x1b\\pw\x1b]8;;\x1b\\", vec![]),
+            (
+                "\x1b]8;;vscode://file/Users/x/notes/a.md:12\x1b\\notes/a.md\x1b]8;;\x1b\\",
+                vec![],
+            ),
             (
                 "\x1b]8;;javascript:alert(1)\x1b\\click\x1b]8;;\x1b\\",
                 vec![],

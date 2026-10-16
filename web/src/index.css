@@ -383,6 +383,19 @@ html[data-ios-standalone]:not([data-editing]) {
   border: 1px solid var(--color-surface-700);
   background: var(--color-surface-950);
 }
+/* The header row and the code share one box; the code scrolls on its own. */
+.acp-markdown .acp-code-block {
+  margin: 0.5rem 0;
+  border: 1px solid var(--color-surface-700);
+  border-radius: 0.375rem;
+  background: var(--color-surface-950);
+  overflow: hidden;
+}
+.acp-markdown .acp-code-block pre {
+  margin: 0;
+  border: 0;
+  border-radius: 0;
+}
 .acp-markdown hr {
   border: none;
   border-top: 1px solid var(--color-surface-800);

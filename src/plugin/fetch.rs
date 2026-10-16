@@ -458,33 +458,17 @@ mod tests {
 
     #[test]
     fn ls_remote_peels_annotated_tag_to_commit() {
+        use crate::git::test_support::run_git;
+
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path();
-        let git = |args: &[&str]| {
-            std::process::Command::new("git")
-                .args(args)
-                .current_dir(path)
-                .env("GIT_AUTHOR_NAME", "t")
-                .env("GIT_AUTHOR_EMAIL", "t@t")
-                .env("GIT_COMMITTER_NAME", "t")
-                .env("GIT_COMMITTER_EMAIL", "t@t")
-                .output()
-                .expect("run git")
-        };
-        if !git(&["init", "-q"]).status.success() {
-            return;
-        }
+        run_git(path, &["init", "-q"]);
         std::fs::write(path.join("f"), b"x").unwrap();
-        git(&["add", "f"]);
-        git(&["commit", "-qm", "c"]);
-        git(&["tag", "-a", "v1", "-m", "release"]);
+        run_git(path, &["add", "f"]);
+        run_git(path, &["commit", "-qm", "c"]);
+        run_git(path, &["tag", "-a", "v1", "-m", "release"]);
 
-        let sha_of = |rev: &str| {
-            String::from_utf8(git(&["rev-parse", rev]).stdout)
-                .unwrap()
-                .trim()
-                .to_string()
-        };
+        let sha_of = |rev: &str| run_git(path, &["rev-parse", rev]).trim().to_string();
         let commit = sha_of("HEAD");
         let tag_object = sha_of("v1");
         assert_ne!(

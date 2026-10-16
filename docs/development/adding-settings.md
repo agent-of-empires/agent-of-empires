@@ -13,7 +13,7 @@ Add the field to the relevant `#[derive(SettingsSection)]` struct (in `src/sessi
 pub my_setting: bool,
 ```
 
-The `SettingsSection` derive turns it into a `FieldDescriptor` in `settings_schema::schema()`, and from there the TUI builds its row (`src/tui/settings/fields.rs`), the web renders the matching control from `GET /api/settings/schema`, the server validates PATCH leaves against the field's `web_write` policy and `validation` rule, profile and repo overrides merge generically, and `config.toml` round-trips through serde. Run `cargo test` and `cargo build --features web`; the field is live everywhere.
+The `SettingsSection` derive turns it into a `FieldDescriptor` in `settings_schema::schema()`, and from there the TUI builds its row (`src/tui/settings/fields.rs`), the web renders the matching control from `GET /api/settings/schema`, the server validates PATCH leaves against the field's `web_write` policy and `validation` rule, profile and repo overrides merge generically, and `config.toml` round-trips through serde. Run `cargo xtask gen-settings-keys` to refresh `web/src/lib/generated/settingsKeys.ts` (CI fails if it is stale; a renamed field then fails `tsc` wherever the dashboard still reads the old name), then `cargo test` and `cargo build --features web`; the field is live everywhere.
 
 ## Section and widget
 

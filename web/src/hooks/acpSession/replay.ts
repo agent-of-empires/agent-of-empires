@@ -1,11 +1,14 @@
 // REST replay of ACP history: recent-first cold open, forward top-up, and older pages.
 
-import type { AcpFrame, TranscriptRow } from "../../lib/acpTypes";
+import { lastUserBoundaryIndex } from "../../lib/acpHistoryWindow";
+import { mergePrependedActivity, type AcpFrame, type TranscriptRow } from "../../lib/acpTypes";
 import { toActivityRows, type Action } from "./reducer";
 
 // Re-request this many seqs behind lastSeq; the reducer's seq dedupe makes the overlap idempotent.
 const REPLAY_OVERLAP = 50;
 const REPLAY_PAGE_SIZE = 1000;
+// Bounds the cold-open fetch to fit the dial timeout; past it the window opens at its default size.
+const MAX_COLD_OPEN_PAGES = 5;
 // Above every real seq, so `before=` returns the newest page.
 const TAIL_BEFORE = Number.MAX_SAFE_INTEGER;
 // The handshake lands in the first few events of a session.
@@ -69,12 +72,36 @@ async function fetchTail(
     return;
   }
   if (!tailRowsRes.ok) return;
-  const rows = toActivityRows(await readRows(tailRowsRes), sid);
+  let rows = toActivityRows(await readRows(tailRowsRes), sid);
+  let cursor = tail.next_cursor ?? 0;
+  let hasMore = tail.has_more ?? false;
+  // The handshake lives at the start of the log, which row pages do not carry.
+  const needsHandshake = hasMore && cursor > 1;
+  // Page back until the last user prompt is loaded, so the first window can open on the whole last turn.
+  for (
+    let pages = 0;
+    pages < MAX_COLD_OPEN_PAGES && hasMore && cursor > 1 && lastUserBoundaryIndex(rows) < 0;
+    pages += 1
+  ) {
+    let page: ReplayPageResponse;
+    try {
+      const res = await getReplay(sid, `before=${cursor}&limit=${REPLAY_PAGE_SIZE}&view=rows`, signal);
+      if (!res.ok) break;
+      page = (await res.json()) as ReplayPageResponse;
+    } catch {
+      break; // An abort is rethrown below; any other failure keeps what is loaded.
+    }
+    signal.throwIfAborted();
+    rows = mergePrependedActivity(toActivityRows(page.rows ?? [], sid), rows);
+    const next = page.next_cursor ?? cursor;
+    hasMore = (page.has_more ?? false) && next < cursor;
+    cursor = next;
+  }
   signal.throwIfAborted();
-  dispatch({ kind: "frames", frames: tail.frames ?? [], rows, oldestSeq: tail.next_cursor ?? 0 });
-  setHasMoreOlder(tail.has_more ?? false);
+  dispatch({ kind: "frames", frames: tail.frames ?? [], rows, oldestSeq: cursor });
+  setHasMoreOlder(hasMore);
   if (tail.highest_seq > lastSeq.current) lastSeq.current = tail.highest_seq;
-  if ((tail.has_more ?? false) && (tail.next_cursor ?? 0) > 1) {
+  if (needsHandshake) {
     const hsRes = await getReplay(sid, `since=0&limit=${HANDSHAKE_PREFIX_SIZE}`, signal);
     if (hsRes.ok) {
       const hs = (await hsRes.json()) as ReplayPageResponse;

@@ -13,6 +13,7 @@ import { useAcpSession } from "../../hooks/useAcpSession";
 import { useHistoryWindow } from "../../hooks/useHistoryWindow";
 import {
   clearDraft,
+  exclusiveRestore,
   getDraftAttachments,
   notifyAttachmentRestoreFailure,
   setDraftAttachments,
@@ -105,7 +106,8 @@ function usePendingAttachments(sessionId: string) {
   );
   useEffect(() => {
     let cancelled = false;
-    void getDraftAttachments(sessionId).then((stored) => {
+    void exclusiveRestore(sessionId, async () => {
+      const stored = await getDraftAttachments(sessionId);
       // A failed read leaves the runtime unhydrated, so a staged attachment cannot overwrite
       // the draft that may still be intact in storage.
       if (stored === null) {

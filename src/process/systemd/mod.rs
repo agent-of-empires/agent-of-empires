@@ -1,6 +1,4 @@
-//! Per-session transient systemd scopes via `systemd-run --user --scope`. Best
-//! effort: every failure is logged and ignored so a session never depends on
-//! systemd. Compiled on every OS; outside Linux the entry points are inert.
+//! Unix daemon notifications and best-effort Linux transient session scopes.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -9,6 +7,9 @@ use std::sync::OnceLock;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::session::config::SystemdSettings;
+
+#[cfg(unix)]
+pub(crate) mod notify;
 
 pub(crate) const DEFAULT_SLICE_TEMPLATE: &str = "background-aoe-{profile}.slice";
 const UNIT_PREFIX: &str = "aoe-session-";

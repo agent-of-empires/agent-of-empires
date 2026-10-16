@@ -63,4 +63,16 @@ from the base branch, so new or changed detection rules may need a manual label.
 Releases are staged weekly. Maintainer instructions live in
 [docs/development/releases.md](docs/development/releases.md).
 
-For help, open a [GitHub Discussion](../../discussions) or an issue.
+Merge rules and area owners are in [MAINTAINERS.md](MAINTAINERS.md).
+
+## Review rubric
+
+Reviewers tag each requested change with a priority:
+
+- **P1**: breaks behavior, security, or stored data. Blocks merge.
+- **P2**: a correctness, test, or maintainability gap this PR should close.
+  Blocks merge.
+- **P3**: a worthwhile improvement outside this PR. Becomes a follow-up issue,
+  not a blocker.
+
+Every requested change states what would satisfy it.

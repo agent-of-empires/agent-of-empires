@@ -40,6 +40,22 @@ impl HomeView {
         Ok(())
     }
 
+    /// Re-read only `session.preview_link_prefixes`; true when it changed. A read
+    /// failure is left to the full reload, which reports it.
+    pub(in crate::tui) fn refresh_link_policy(&mut self) -> bool {
+        let Ok(config) = crate::session::resolve_config(&self.config_profile()) else {
+            return false;
+        };
+        let changed = self.preview_link_prefixes != config.session.preview_link_prefixes;
+        self.set_link_prefixes(&config.session.preview_link_prefixes);
+        changed
+    }
+
+    fn set_link_prefixes(&mut self, prefixes: &[String]) {
+        crate::session::set_preview_link_prefixes(prefixes);
+        self.preview_link_prefixes = prefixes.to_vec();
+    }
+
     /// Apply a snapshot, reporting interactive warnings without interrupting watcher reloads.
     fn apply_config_to_state(
         &mut self,
@@ -61,6 +77,7 @@ impl HomeView {
         self.set_sidebar_position(config.session.sidebar_position);
         self.show_diagnostics = config.session.show_diagnostics_pane;
         self.show_shortcut_bar = config.session.show_shortcut_bar;
+        self.set_link_prefixes(&config.session.preview_link_prefixes);
         self.daemon_sidebar = config.session.daemon_sidebar;
         if !self.daemon_sidebar {
             self.set_sidebar_source(

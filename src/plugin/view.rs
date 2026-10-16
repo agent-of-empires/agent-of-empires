@@ -44,9 +44,11 @@ pub struct PluginPageView {
     pub title: String,
     pub icon: Option<String>,
     pub url: String,
+    /// The page's bridge gates on these; the grant covers all of them for an active plugin.
+    pub capabilities: Vec<String>,
 }
 
-fn page_url(plugin_id: &str, page_id: &str) -> String {
+pub fn page_url(plugin_id: &str, page_id: &str) -> String {
     format!("/api/plugins/{plugin_id}/pages/{page_id}")
 }
 
@@ -64,12 +66,7 @@ impl LoadedPlugin {
             builtin: self.builtin(),
             validation: self.validation.as_str().to_string(),
             source: self.source.clone(),
-            capabilities: self
-                .manifest
-                .capabilities
-                .iter()
-                .map(|c| c.as_str().to_string())
-                .collect(),
+            capabilities: self.capability_ids(),
             ui_contributions: self
                 .manifest
                 .ui
@@ -87,6 +84,14 @@ impl LoadedPlugin {
         }
     }
 
+    fn capability_ids(&self) -> Vec<String> {
+        self.manifest
+            .capabilities
+            .iter()
+            .map(|c| c.as_str().to_string())
+            .collect()
+    }
+
     pub fn pages(&self) -> impl Iterator<Item = PluginPageView> + '_ {
         self.manifest
             .ui
@@ -98,6 +103,7 @@ impl LoadedPlugin {
                 title: u.title.clone().unwrap_or_default(),
                 icon: u.icon.clone(),
                 url: page_url(self.id(), &u.id),
+                capabilities: self.capability_ids(),
             })
     }
 }

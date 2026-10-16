@@ -188,7 +188,7 @@ async function waitForCommittedDraft(page: Page): Promise<void> {
       page.evaluate(
         () =>
           new Promise<number>((resolve, reject) => {
-            const open = indexedDB.open("aoe-composer-attachments");
+            const open = indexedDB.open("aoe-composer-attachments-v2");
             open.onerror = () => reject(open.error);
             open.onsuccess = () => {
               const db = open.result;

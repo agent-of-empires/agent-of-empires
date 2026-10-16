@@ -28,7 +28,8 @@ import { useSessionGroups } from "./hooks/useSessionGroups";
 import { useAttentionJump } from "./hooks/useAttentionJump";
 import { useNestedSidebarGroups } from "./hooks/useNestedSidebarGroups";
 import { useOrgGroups } from "./hooks/useOrgGroups";
-import { PluginUiProvider, usePluginAttention, usePluginUiEntries } from "./lib/pluginUiContext";
+import { PluginUiProvider, usePluginAttention, usePluginPages, usePluginUiEntries } from "./lib/pluginUiContext";
+import { buildPluginPageActions } from "./lib/pluginPages";
 import { buildSortValueMap, pluginSortSpecs } from "./lib/pluginUi";
 import type { PluginSortContext, SidebarSortMode } from "./lib/sidebarSort";
 import { nextAttentionSessionId, workspaceIsTrashed } from "./lib/sidebarSort";
@@ -55,6 +56,7 @@ import type { RightPanelView } from "./lib/rightPanelView";
 import { usePaneLayout, dockTabs, dockGroups, dockOf, isActiveTab, isDockCollapsed } from "./lib/paneLayout";
 import { isPluginPaneId, resolvePaneIcon, usePluginPanes, type PluginPane } from "./lib/pluginPanes";
 import { PluginPaneBody } from "./components/plugin/PluginPane";
+import { PluginPageView } from "./components/plugin/PluginPageView";
 import { TOUR_ANCHORS, tourAnchor } from "./lib/tourSteps";
 import {
   deleteWorkspaceSessions,
@@ -92,7 +94,7 @@ import {
   restoreSession,
   fetchPlugins,
 } from "./lib/api";
-import type { DeleteSessionOptions, ServerAbout } from "./lib/api";
+import type { DeleteSessionOptions, ServerAbout, SettingsResponse } from "./lib/api";
 import { getClientCapabilities } from "./lib/clientCapabilities";
 import { normalizeProjectPathKey } from "./lib/registeredProjects";
 import { IdleDecayWindowContext, parseIdleDecayWindowMs } from "./lib/idleDecay";
@@ -194,7 +196,7 @@ export default function App() {
   const [sessionColorsEnabled, setSessionColorsEnabled] = useState(true);
   const [systemHealthEnabled, setSystemHealthEnabled] = useState(false);
 
-  const applyAppSettings = useCallback((settings: Record<string, unknown> | null | undefined) => {
+  const applyAppSettings = useCallback((settings: SettingsResponse | null | undefined) => {
     setIdleDecayWindowMs(parseIdleDecayWindowMs(settings));
     setUnreadIndicatorEnabled(parseUnreadIndicatorEnabled(settings));
     setSessionRowTagMode(parseSessionRowTagMode(settings));
@@ -356,6 +358,9 @@ function AppContent({
   const profilesMatch = useMatch("/profiles");
   const activeSessionId = sessionMatch?.params.sessionId ?? null;
   const showSettings = settingsRootMatch !== null || settingsTabMatch !== null;
+  const pluginPageMatch = useMatch("/plugins/:pluginId/:pageId");
+  // Settings and plugin pages take the full width, sidebar and session panels hidden.
+  const fullPageView = showSettings || pluginPageMatch !== null;
   const settingsTab = settingsTabMatch?.params.tab ?? null;
 
   const {
@@ -437,6 +442,8 @@ function AppContent({
   // built-in sort; if the entry reappears on a later poll the selection
   // resumes. Selecting a built-in mode clears it via `selectSidebarSortMode`.
   const pluginUiEntries = usePluginUiEntries();
+  const pluginPages = usePluginPages();
+  const pluginPageActions = useMemo(() => buildPluginPageActions(pluginPages ?? []), [pluginPages]);
   const pluginAttention = usePluginAttention();
   const [pluginSortRef, setPluginSortRef] = useState<{ pluginId: string; entryId: string } | null>(null);
   const activePluginSort = useMemo(() => {
@@ -1573,6 +1580,12 @@ function AppContent({
     }
   }, [navigate, activeSessionId]);
 
+  const handleClosePluginPage = useCallback(() => {
+    // A deep link has no in-app history to pop.
+    if (location.key !== "default") navigate(-1);
+    else navigate("/");
+  }, [navigate, location.key]);
+
   const handleOpenHelp = useCallback(() => {
     setShowHelp(true);
   }, []);
@@ -1845,6 +1858,19 @@ function AppContent({
   );
 
   const renderContent = () => {
+    if (pluginPageMatch) {
+      return (
+        <PluginPageView
+          key={pluginPageMatch.pathname}
+          pluginId={pluginPageMatch.params.pluginId ?? ""}
+          pageId={pluginPageMatch.params.pageId ?? ""}
+          onBack={handleClosePluginPage}
+          readOnly={serverAbout?.read_only ?? false}
+          cityhall={caps.cityhall}
+          theme={resolvedTheme}
+        />
+      );
+    }
     if (showSettings) {
       return (
         <SettingsView
@@ -2205,7 +2231,7 @@ function AppContent({
     serverAboutLoaded &&
     sessionsLoaded &&
     !activeSessionId &&
-    !showSettings &&
+    !fullPageView &&
     !showSessionWizard &&
     !showHelp &&
     !showAbout &&
@@ -2300,7 +2326,7 @@ function AppContent({
   // dashboard / settings / diff panes the bar is the only navigation there is.
   const headerCollapsible =
     singlePane &&
-    !showSettings &&
+    !fullPageView &&
     !!activeWorkspace &&
     activeSession?.view === "structured" &&
     rightPanelView === "agent";
@@ -2337,8 +2363,8 @@ function AppContent({
             isDevBuild={isDebugBuild(serverAbout)}
             onOpenTips={tips.open}
             onGoDashboard={handleGoDashboard}
-            sidebarColumnVisible={!showSettings && sidebarOpen}
-            rightColumnVisible={isMdUp && !showSettings && !!activeWorkspace && !!activeSession && !rightDockCollapsed}
+            sidebarColumnVisible={!fullPageView && sidebarOpen}
+            rightColumnVisible={isMdUp && !fullPageView && !!activeWorkspace && !!activeSession && !rightDockCollapsed}
           />
         </CollapsibleRegion>
 
@@ -2364,7 +2390,7 @@ function AppContent({
         )}
 
         <div className="flex flex-1 min-h-0">
-          {!showSettings && (
+          {!fullPageView && (
             <WorkspaceSidebar
               groups={sidebarGroups}
               nestedGroups={nestedGroups}
@@ -2516,7 +2542,13 @@ function AppContent({
             setShowPalette(false);
             setPaletteQuery("");
           }}
-          actions={[...commandActions, ...conversationActions, ...settingsCommands, ...pluginCommandActions]}
+          actions={[
+            ...commandActions,
+            ...conversationActions,
+            ...pluginPageActions,
+            ...settingsCommands,
+            ...pluginCommandActions,
+          ]}
           onSearchChange={setPaletteQuery}
           searching={conversationSearching}
         />
@@ -2554,7 +2586,7 @@ function AppContent({
           ref={setKeyboardProxyRef}
           data-keyboard-proxy
           data-session-input={
-            activeSession && !showSettings && (!singlePane || rightPanelView === "agent" || rightPanelView === "paired")
+            activeSession && !fullPageView && (!singlePane || rightPanelView === "agent" || rightPanelView === "paired")
               ? ""
               : undefined
           }

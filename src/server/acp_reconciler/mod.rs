@@ -604,7 +604,12 @@ mod tests {
                 .is_some());
             let duplicate = tokio::time::timeout(Duration::from_millis(100), async {
                 loop {
-                    if std::fs::read_to_string(&log).unwrap().lines().count() > 1 {
+                    if std::fs::read_to_string(&log)
+                        .unwrap_or_default()
+                        .lines()
+                        .count()
+                        > 1
+                    {
                         break;
                     }
                     tokio::time::sleep(Duration::from_millis(5)).await;

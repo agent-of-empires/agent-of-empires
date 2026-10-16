@@ -590,6 +590,7 @@ impl App {
         let mut last_spinner_redraw = std::time::Instant::now();
         let mut last_heartbeat = std::time::Instant::now();
         let mut last_presence_refresh = std::time::Instant::now();
+        let mut last_serve_probe = std::time::Instant::now();
         let mut last_session_idle_reap = std::time::Instant::now();
         let mut last_update_eval = std::time::Instant::now();
         const STATUS_REFRESH_INTERVAL: Duration = Duration::from_millis(500);
@@ -601,6 +602,7 @@ impl App {
         const SPINNER_REDRAW_INTERVAL: Duration = Duration::from_millis(120);
         const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
         const PRESENCE_REFRESH_INTERVAL: Duration = Duration::from_secs(3);
+        const SERVE_PROBE_INTERVAL: Duration = Duration::from_secs(2);
         // Auto-stop for idle plain tmux sessions; the storage lock prevents
         // double stops when serve runs its own reaper.
         const SESSION_IDLE_REAP_INTERVAL: Duration = Duration::from_secs(60);
@@ -610,6 +612,7 @@ impl App {
         crate::session::write_tui_heartbeat();
         crate::session::write_tui_activity();
         self.home.active_tui_count = crate::session::count_active_tuis(PRESENCE_FRESH_WINDOW);
+        self.home.request_serve_probe();
 
         // Telemetry is opt-in; sends are detached and swallow errors.
         let telemetry_snapshot_interval = crate::telemetry::snapshot_interval();
@@ -1243,6 +1246,17 @@ impl App {
 
             full |= self.home.tick_dialog();
             full |= self.home.tick_settings_status();
+            full |= self.home.tick_opener();
+
+            // The link policy is not input policy, so it reloads even during live-send.
+            if self
+                .home
+                .config_watch
+                .link_policy_dirty
+                .swap(false, std::sync::atomic::Ordering::Acquire)
+            {
+                full |= self.home.refresh_link_policy();
+            }
 
             // Full/config reloads stay deferred during live-send to preserve input
             // policy and mouse-capture state.
@@ -1310,6 +1324,12 @@ impl App {
                 last_telemetry_snapshot = std::time::Instant::now();
                 self.emit_telemetry_snapshot();
             }
+
+            if last_serve_probe.elapsed() >= SERVE_PROBE_INTERVAL {
+                last_serve_probe = std::time::Instant::now();
+                self.home.request_serve_probe();
+            }
+            refresh_needed |= self.home.apply_serve_probe();
 
             if last_presence_refresh.elapsed() >= PRESENCE_REFRESH_INTERVAL {
                 last_presence_refresh = std::time::Instant::now();

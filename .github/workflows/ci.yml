@@ -175,6 +175,11 @@ jobs:
           cargo xtask gen-docs
           git diff --exit-code docs/cli/reference.md \
             || (echo "::error::CLI docs are out of date. Run 'cargo xtask gen-docs' and commit." && exit 1)
+      - name: Check web setting names are up-to-date
+        run: |
+          cargo xtask gen-settings-keys
+          git diff --exit-code web/src/lib/generated/settingsKeys.ts \
+            || (echo "::error::Web setting names are out of date. Run 'cargo xtask gen-settings-keys' and commit." && exit 1)
       - name: Check rustdoc is warning-clean
         env:
           RUSTDOCFLAGS: "-D warnings"

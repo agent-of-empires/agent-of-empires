@@ -88,3 +88,26 @@ describe("usePluginUiState refresh indicator", () => {
     expect(result.current.isRefreshing).toBe(false);
   });
 });
+
+describe("usePluginUiState pages", () => {
+  it("is null before the first snapshot, then keeps one identity while pages are unchanged", async () => {
+    const page = {
+      plugin_id: "acme.kit",
+      id: "board",
+      title: "Board",
+      icon: null,
+      url: "/api/plugins/acme.kit/pages/board",
+      capabilities: [],
+    };
+    const withPages = (): PluginUiState => ({ ...snapshot(), pages: [{ ...page }] });
+    const { result } = mountPolling(withPages(), withPages(), { ...snapshot(), pages: [] });
+    expect(result.current.pages).toBeNull();
+    await tick(0);
+    const first = result.current.pages;
+    expect(first).toEqual([page]);
+    await tick(3000);
+    expect(result.current.pages).toBe(first);
+    await tick(3000);
+    expect(result.current.pages).toEqual([]);
+  });
+});

@@ -777,8 +777,8 @@ fn copy_file_confirmed(
     let replace = match (target.regular_modified(relative)?, incoming) {
         // Nothing there, or nothing readable there: publish without replacing,
         // so a writer that lands one first keeps it.
-        (None, _) => false,
-        (Some(existing), Some(incoming)) if incoming > existing => true,
+        (None, _) => None,
+        (Some(existing), Some(incoming)) if incoming > existing => Some(existing),
         // Current, or two timestamps that cannot be ordered. Either way the
         // destination is not provably stale, so leave it.
         (Some(_), _) => return Ok(target.regular_exists(relative)),
@@ -795,7 +795,10 @@ fn copy_file_confirmed(
         .map_err(anyhow::Error::from)
         .and_then(|()| target.publish_staged(&staging, relative, replace));
     match copied {
-        Ok(published) => Ok(published),
+        Ok(true) => Ok(true),
+        // A replace that lost to a concurrent writer left a newer live copy.
+        Ok(false) if replace.is_some() => Ok(target.regular_exists(relative)),
+        Ok(false) => Ok(false),
         Err(error) => {
             let _ = target.remove_file(&staging);
             Err(error)

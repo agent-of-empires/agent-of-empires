@@ -51,10 +51,9 @@ export function ScratchOverridesModal({ profile, onClose }: Props) {
         setLoadedScope(scope);
         return;
       }
-      const session = settings.session as { scratch_smart_rename?: unknown } | undefined;
       setLoadError(false);
       setError(null);
-      const raw = session?.scratch_smart_rename;
+      const raw = settings.session?.scratch_smart_rename;
       setChoice(isStoredChoice(raw) ? raw : scope === "profile" ? "default" : "inherit");
       setLoadedScope(scope);
     });
@@ -75,10 +74,11 @@ export function ScratchOverridesModal({ profile, onClose }: Props) {
     setSubmitting(true);
     setError(null);
     const patch = { session: { scratch_smart_rename: choice === "default" ? null : choice } };
-    const ok = scope === "global" ? await updateMachineSettings(patch) : await updateProfileSettings(profile, patch);
-    if (!ok) {
+    const outcome =
+      scope === "global" ? await updateMachineSettings(patch) : await updateProfileSettings(profile, patch);
+    if (outcome !== "committed") {
       setSubmitting(false);
-      setError("Update failed");
+      setError(outcome === "uncertain" ? "Could not confirm the update, please check the value" : "Update failed");
       return;
     }
     onClose();

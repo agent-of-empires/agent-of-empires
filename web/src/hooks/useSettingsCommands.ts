@@ -77,9 +77,11 @@ export function useSettingsCommands({ open, readOnly, onOpenSettingsTab }: Args)
             const next = !isOn;
             void (async () => {
               const patch = { [f.section]: { [f.field]: next } };
-              const ok = await updateSettings(patch);
-              if (!ok) {
-                reportError(`Failed to update ${f.label}`);
+              const outcome = await updateSettings(patch);
+              if (outcome !== "committed") {
+                reportError(
+                  outcome === "uncertain" ? `Could not confirm ${f.label} was updated` : `Failed to update ${f.label}`,
+                );
                 return;
               }
               const where = f.profile_overridable ? ` (profile ${defaultProfile})` : "";
