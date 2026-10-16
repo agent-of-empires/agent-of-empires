@@ -27,6 +27,7 @@ import { reportError, reportInfo } from "../../lib/toastBus";
 import { ContextMenu } from "../ContextMenu";
 import { SessionGroupModal } from "../SessionGroupModal";
 import { StatusGlyph } from "../StatusGlyph";
+import { SwitchTerminalAgentModal } from "../SwitchTerminalAgentModal";
 import { useContextMenu } from "../useContextMenu";
 import { AddProjectModal } from "./AddProjectModal";
 import { RowSubRows, RowTrailingBadges } from "./RowBadges";
@@ -38,7 +39,7 @@ import { useLongPress } from "./useLongPress";
 import { usePendingSetting } from "./usePendingSetting";
 import { WorkdirNameModal } from "./WorkdirNameModal";
 
-type Modal = "snooze" | "workdir" | "addProject" | "group" | null;
+type Modal = "snooze" | "workdir" | "addProject" | "group" | "switchTerminalAgent" | null;
 
 export interface SessionRowProps {
   workspace: Workspace;
@@ -341,6 +342,7 @@ function buildRowActions(
       requestOpenSession(acp.id);
       requestSwitchAgent(acp.id);
     }),
+    switchTerminalAgent: after(() => setModal("switchTerminalAgent")),
     fork: after(async () => {
       if (!acp?.acp_session_id || !acp.acp_can_fork) return;
       const result = await createSession({
@@ -400,6 +402,17 @@ function RowModals({
         sessionTitle={model.sessionTitle || label}
         currentGroup={model.firstSession?.group_path ?? ""}
         onSave={async (group) => (sessionId ? updateSessionGroup(sessionId, group) : false)}
+        onClose={close}
+      />,
+      document.body,
+    );
+  }
+  if (modal === "switchTerminalAgent") {
+    return createPortal(
+      <SwitchTerminalAgentModal
+        open
+        sessionId={model.terminalSession?.id ?? null}
+        currentTool={model.terminalSession?.tool ?? null}
         onClose={close}
       />,
       document.body,

@@ -4498,6 +4498,25 @@
         "web/src/components/acp/Composer.tsx",
         "web/src/components/acp/ComposerControls.tsx"
       ]
+    },
+    {
+      "id": "session.terminal-agent-switch",
+      "kind": "vitest",
+      "risk": "high",
+      "specs": [
+        "src/components/__tests__/SwitchTerminalAgentModal.test.tsx",
+        "src/components/acp/Composer.test.tsx",
+        "src/lib/api.test.ts"
+      ],
+      "components": [
+        "web/src/components/SwitchTerminalAgentModal.tsx",
+        "web/src/components/sidebar/SessionRow.tsx",
+        "web/src/components/sidebar/SessionRowMenu.tsx",
+        "web/src/components/sidebar/rowModel.ts",
+        "web/src/components/acp/Composer.tsx",
+        "web/src/components/acp/useComposerHooks.ts",
+        "web/src/lib/api.ts"
+      ]
     }
   ]
 }

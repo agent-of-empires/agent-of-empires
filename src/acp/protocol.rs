@@ -270,6 +270,25 @@ pub struct SwitchAgentResponse {
     pub status: String,
 }
 
+/// `POST /api/sessions/{id}/switch-agent` body for terminal/tmux sessions.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct SwitchTerminalAgentRequest {
+    /// Installed built-in agent or configured custom terminal tool name.
+    pub target: String,
+}
+
+/// `POST /api/sessions/{id}/switch-agent` response. `context_handoff` is `sent`
+/// when the outgoing pane's tail reached the incoming CLI and `unavailable`
+/// when it was empty, unreadable, or never delivered.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct SwitchTerminalAgentResponse {
+    pub session_id: String,
+    pub tool: String,
+    pub status: String,
+    #[serde(default)]
+    pub context_handoff: String,
+}
+
 /// `POST /api/sessions/{id}/acp/switch-provider` body.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct SwitchProviderRequest {

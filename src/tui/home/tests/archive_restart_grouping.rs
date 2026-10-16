@@ -763,6 +763,7 @@ fn apply_restart_results_preserves_peer_sid_and_marker() {
             outcome: Ok(StartOutcome::ResumeFailed {
                 sid: "phase1-stale-sid".to_string(),
             }),
+            handoff: crate::session::terminal_handoff::Outcome::NotRequested,
         },
     );
 
@@ -808,6 +809,7 @@ fn apply_restart_results_propagates_worker_sid_without_peer_write() {
             before: Box::new(before),
             instance: Box::new(worker),
             outcome: Ok(StartOutcome::Resumed),
+            handoff: crate::session::terminal_handoff::Outcome::NotRequested,
         },
     );
 
@@ -873,6 +875,7 @@ fn restart_then_attach_queues_the_cascade_and_attaches_after_launch() {
                 before: Box::new(before.clone()),
                 instance: Box::new(before.clone()),
                 outcome,
+                handoff: crate::session::terminal_handoff::Outcome::NotRequested,
             },
         );
 

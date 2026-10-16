@@ -36,6 +36,7 @@ pub mod smart_rename;
 pub mod stop;
 mod storage;
 pub(crate) mod sync;
+pub mod terminal_handoff;
 #[cfg(test)]
 pub(crate) mod test_support;
 pub mod trash;

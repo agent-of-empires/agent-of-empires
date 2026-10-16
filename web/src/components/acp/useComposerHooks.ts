@@ -134,8 +134,13 @@ const flatAdapter = (search: Unstable_TriggerAdapter["search"]): Unstable_Trigge
   search,
 });
 
+/** Id of the composer's own `/switch-agent` entry: the `/` popover executes it by
+ *  opening the structured-view picker instead of inserting text. */
+export const SWITCH_AGENT_COMMAND_ID = "aoe-switch-agent";
+
 /** `@` files and `/` commands, both as flat search lists. Server clear aliases the
- *  agent does not advertise itself (codex/opencode `/new`) are appended. */
+ *  agent does not advertise itself (codex/opencode `/new`), plus the composer's own
+ *  `/switch-agent`, are appended. */
 export function useTriggerAdapters(sessionId: string, availableCommands: AcpState["availableCommands"]) {
   const { files } = useFilesIndex(sessionId);
   const fileAdapter = useMemo(
@@ -175,6 +180,16 @@ export function useTriggerAdapters(sessionId: string, availableCommands: AcpStat
         acceptsInput: false,
       } as Unstable_TriggerItem);
       advertised.add(name);
+    }
+    // AoE's own picker, which no adapter advertises.
+    if (!advertised.has("switch-agent")) {
+      items.push({
+        id: SWITCH_AGENT_COMMAND_ID,
+        type: "command",
+        label: "/switch-agent",
+        description: "switch the session to another agent CLI",
+        acceptsInput: false,
+      } as Unstable_TriggerItem);
     }
     return flatAdapter((query) => fuzzyFilter(items, query, 30));
   }, [availableCommands, clearAliases]);

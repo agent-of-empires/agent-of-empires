@@ -27,6 +27,8 @@ pub enum ContextMenuAction {
     NewFromSelection,
     /// Fork the session into an independent one resuming its conversation.
     Fork,
+    /// Open the restart picker with the terminal agent field focused.
+    SwitchTerminalAgent,
     /// Flip the persisted view between structured (ACP) and tmux terminal.
     /// Confirmed first, since the swap destroys in-flight history.
     SwitchView,
@@ -86,8 +88,10 @@ impl ContextMenuDialog {
     /// `None` and carries the current state when `Some`, which flips the label:
     /// `snooze` (hidden outside Attention sort, matching the `'h'` keybinding),
     /// `unread` (hidden when the feature is off), `can_fork` (only for an agent
-    /// that can actually fork), and `switch_view` (only for a row that can
-    /// change views, labelled with the view it lands on).
+    /// that can actually fork), `switch_view` (only for a row that can change
+    /// views, labelled with the view it lands on), and
+    /// `can_switch_terminal_agent` (only for a terminal row that is not
+    /// mid-transition).
     pub fn for_session(
         anchor: (u16, u16),
         is_archived: bool,
@@ -95,6 +99,7 @@ impl ContextMenuDialog {
         unread: Option<bool>,
         can_fork: bool,
         switch_view: Option<bool>,
+        can_switch_terminal_agent: bool,
     ) -> Self {
         let archive_label = if is_archived { "Unarchive" } else { "Archive" };
         let mut items = vec![
@@ -118,6 +123,12 @@ impl ContextMenuDialog {
         items.push((ContextMenuAction::Delete, "Delete"));
         if can_fork {
             items.push((ContextMenuAction::Fork, "Fork session"));
+        }
+        if can_switch_terminal_agent {
+            items.push((
+                ContextMenuAction::SwitchTerminalAgent,
+                "Switch terminal agent",
+            ));
         }
         if let Some(is_structured) = switch_view {
             let label = if is_structured {
@@ -432,14 +443,14 @@ mod tests {
 
     /// A session menu at `(0, 0)` with snooze shown, unread hidden, fork on.
     fn session() -> ContextMenuDialog {
-        ContextMenuDialog::for_session((0, 0), false, Some(false), None, true, None)
+        ContextMenuDialog::for_session((0, 0), false, Some(false), None, true, None, false)
     }
 
     /// A session menu whose `last_area` is stubbed as if render had run, so
     /// click and hover routing can be exercised without a `Frame`.
     fn rendered_session(height: u16) -> ContextMenuDialog {
         let mut menu =
-            ContextMenuDialog::for_session((10, 10), false, Some(false), None, true, None);
+            ContextMenuDialog::for_session((10, 10), false, Some(false), None, true, None, false);
         menu.last_area = Rect::new(10, 10, 14, height);
         menu
     }
@@ -458,6 +469,7 @@ mod tests {
                 unread,
                 true,
                 None,
+                false,
             ))
         };
         let cases: &[(&str, Vec<&str>, Vec<&str>)] = &[
@@ -591,11 +603,29 @@ mod tests {
                 None,
                 false,
                 switch_view,
+                false,
             ))
         };
         assert!(!rows(None).iter().any(|l| l.starts_with("Switch to")));
         assert!(rows(Some(false)).contains(&"Switch to structured"));
         assert!(rows(Some(true)).contains(&"Switch to terminal"));
+    }
+
+    #[test]
+    fn switch_terminal_agent_row_appears_only_when_enabled() {
+        let rows = |can_switch_terminal_agent| {
+            labels(&ContextMenuDialog::for_session(
+                (0, 0),
+                false,
+                Some(false),
+                None,
+                true,
+                None,
+                can_switch_terminal_agent,
+            ))
+        };
+        assert!(!rows(false).contains(&"Switch terminal agent"));
+        assert!(rows(true).contains(&"Switch terminal agent"));
     }
 
     #[test]
@@ -669,13 +699,14 @@ mod tests {
         // unbound key. `u` needs the unread row, `h` the snooze row, and the
         // session menu has no pin row at all.
         let mut unread_on =
-            ContextMenuDialog::for_session((0, 0), false, None, Some(false), true, None);
+            ContextMenuDialog::for_session((0, 0), false, None, Some(false), true, None, false);
         assert!(matches!(
             unread_on.handle_key(key(KeyCode::Char('u'))),
             DialogResult::Submit(A::ToggleUnread)
         ));
         for ch in ['u', 'h'] {
-            let mut bare = ContextMenuDialog::for_session((0, 0), false, None, None, true, None);
+            let mut bare =
+                ContextMenuDialog::for_session((0, 0), false, None, None, true, None, false);
             assert!(matches!(
                 bare.handle_key(key(KeyCode::Char(ch))),
                 DialogResult::Continue
@@ -717,10 +748,16 @@ mod tests {
 
         // Before a render captures `last_area`, every point is outside, so a
         // stray click cannot be mistaken for one inside the menu.
-        assert!(
-            ContextMenuDialog::for_session((10, 10), false, Some(false), None, true, None)
-                .click_is_outside(10, 10)
-        );
+        assert!(ContextMenuDialog::for_session(
+            (10, 10),
+            false,
+            Some(false),
+            None,
+            true,
+            None,
+            false
+        )
+        .click_is_outside(10, 10));
     }
 
     #[test]

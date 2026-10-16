@@ -17,6 +17,7 @@ import { usePluginUiEntries } from "../../lib/pluginUiContext";
 import {
   clearPendingSwitchAgent,
   getPendingSwitchAgent,
+  requestSwitchAgent,
   subscribePendingSwitchAgent,
 } from "../../lib/switchAgentTrigger";
 import { TOUR_ANCHORS, tourAnchor } from "../../lib/tourSteps";
@@ -49,6 +50,7 @@ import {
 import { SessionConfigControls } from "./SessionConfigControls";
 import { SwitchAgentModal } from "./SwitchAgentModal";
 import {
+  SWITCH_AGENT_COMMAND_ID,
   useAttachments,
   useComposerClient,
   useDraftPersistence,
@@ -223,7 +225,13 @@ export function Composer(props: Props) {
 
             <ComposerPrimitive.Unstable_TriggerPopover char="/" adapter={slashAdapter} className={POPOVER_CLASS}>
               <ComposerPrimitive.Unstable_TriggerPopover.Action
-                onExecute={(item) => insertSlashCommand(taRef, item)}
+                onExecute={(item) => {
+                  if (item.id === SWITCH_AGENT_COMMAND_ID) {
+                    requestSwitchAgent(sessionId);
+                    return;
+                  }
+                  insertSlashCommand(taRef, item);
+                }}
                 removeOnExecute
               />
               <PopoverItems trigger="/" skillIndex={skillIndex} />

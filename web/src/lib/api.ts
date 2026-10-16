@@ -1811,6 +1811,37 @@ export async function startSession(id: string): Promise<StartSessionResult> {
   };
 }
 
+export interface SwitchTerminalAgentResponse {
+  session_id: string;
+  tool: string;
+  status: string;
+  /** `sent` when the outgoing terminal capture reached the new CLI; `unavailable` otherwise. */
+  context_handoff: "sent" | "unavailable" | string;
+}
+
+export type SwitchTerminalAgentResult =
+  | { ok: true; result: SwitchTerminalAgentResponse }
+  /** `committed` marks a refusal that came after the swap reached disk: the row now runs
+   *  `target` with the relaunch failed, so the caller reports it instead of retrying. */
+  | { ok: false; committed: boolean; message?: string };
+
+/** Relaunch a terminal session's pane on another agent CLI, keeping the AoE
+ *  session, project path, and worktree. */
+export async function switchTerminalAgent(id: string, target: string): Promise<SwitchTerminalAgentResult> {
+  const reply = await send(`/api/sessions/${encodeURIComponent(id)}/switch-agent`, jsonInit("POST", { target })).catch(
+    () => null,
+  );
+  if (reply?.ok && reply.payload) {
+    return { ok: true, result: reply.payload as unknown as SwitchTerminalAgentResponse };
+  }
+  const code = stringField(reply?.payload, "error");
+  return {
+    ok: false,
+    committed: code === "resume_failed" || code === "restart_failed",
+    message: stringField(reply?.payload, "message"),
+  };
+}
+
 /** `null` unsnoozes; otherwise 1..=43200 minutes, validated server-side. */
 export function setSessionSnooze(id: string, minutes: number | null): Promise<SessionResponse | null> {
   return sessionUpdate(id, "snooze", jsonInit("PATCH", { minutes }));
