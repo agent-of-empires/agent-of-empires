@@ -428,11 +428,21 @@ impl<S: BroadcastSink> Supervisor<S> {
         // Only the queries and their publishes belong before the drain; the
         // resume send is a real await, so it runs after `workers` is dropped.
         self.cancel_orphaned_requests(session_id);
-        let resumable = if matches!(kind, WorkerKind::Attached) {
-            collect_resumable_background_agent_launches(&*self.sink, &self.next_seqs, session_id)
+        // Tasks follow the same split: an attached worker's tasks may still be
+        // running, so their tailers resume; a replaced worker's are finished
+        // by the detach.
+        let (resumable, open_tasks) = if matches!(kind, WorkerKind::Attached) {
+            (
+                collect_resumable_background_agent_launches(
+                    &*self.sink,
+                    &self.next_seqs,
+                    session_id,
+                ),
+                self.sink.unresolved_background_task_ids(session_id),
+            )
         } else {
             self.detach_orphaned_background_agents(session_id);
-            Vec::new()
+            (Vec::new(), Vec::new())
         };
         if context_reset.is_some() {
             lock_recover(&self.pending_context_resets).insert(session_id.to_string());
@@ -443,7 +453,8 @@ impl<S: BroadcastSink> Supervisor<S> {
             inbound,
             context_reset,
         );
-        let client_for_resume = (!resumable.is_empty()).then(|| Arc::clone(&client));
+        let client_for_resume =
+            (!resumable.is_empty() || !open_tasks.is_empty()).then(|| Arc::clone(&client));
         workers.insert(
             session_id.to_string(),
             WorkerHandle {
@@ -469,7 +480,12 @@ impl<S: BroadcastSink> Supervisor<S> {
             // a runner that may still be serving. The drain task shares this
             // channel, so it runs its own closed-inbound handling and
             // `readopt_orphan_runners` reattaches on the next tick.
-            let _ = resuming.resume_background_tailing(resumable).await;
+            if !resumable.is_empty() {
+                let _ = resuming.resume_background_tailing(resumable).await;
+            }
+            if !open_tasks.is_empty() {
+                let _ = resuming.resume_task_tailing(open_tasks).await;
+            }
         }
         drop(reservation);
         self.worker_notify.notify_waiters();
@@ -1755,10 +1771,12 @@ mod tests {
     /// fake runner behind a control socket, an unresolved
     /// `BackgroundAgentLaunched` (+`Progress`) already on disk, and the
     /// connection left by a successful `attach`. `output_file` is the launch
-    /// payload's transcript path, empty for the untrackable case.
+    /// payload's transcript path, empty for the untrackable case. `open_task`
+    /// also leaves a `BackgroundTaskStarted` of that id on disk.
     async fn attach_with_orphaned_background_agent(
         session_id: &str,
         output_file: &str,
+        open_task: Option<&str>,
     ) -> AttachBackgroundAgentFixture {
         use crate::acp::control_protocol::{self, ControlBody};
         use crate::acp::state::BackgroundAgentStatus;
@@ -1792,6 +1810,17 @@ mod tests {
                 at: chrono::Utc::now(),
             },
         );
+        if let Some(task_id) = open_task {
+            sink.publish(
+                session_id,
+                3,
+                &Event::BackgroundTaskStarted {
+                    task_id: task_id.into(),
+                    tool_call_id: None,
+                    description: "sleep".into(),
+                },
+            );
+        }
 
         // `is_record_live` requires a live pid; `sleep 60` as its own process
         // group leader keeps the cleanup kill off the test process.
@@ -1939,6 +1968,7 @@ mod tests {
         let mut fixture = attach_with_orphaned_background_agent(
             "s-attach-survivor",
             &transcript.path().to_string_lossy(),
+            None,
         )
         .await;
         let state = await_background_agent_resolved(
@@ -1968,7 +1998,8 @@ mod tests {
     async fn attach_still_detaches_a_background_agent_with_no_transcript_path() {
         use crate::acp::state::BackgroundAgentStatus;
 
-        let mut fixture = attach_with_orphaned_background_agent("s-attach-untrackable", "").await;
+        let mut fixture =
+            attach_with_orphaned_background_agent("s-attach-untrackable", "", None).await;
         let state = await_background_agent_resolved(
             &mut fixture,
             "s-attach-untrackable",
@@ -1981,6 +2012,54 @@ mod tests {
             state.background_agents[0].status,
             BackgroundAgentStatus::Detached
         );
+    }
+
+    /// A task left open when the daemon restarted may have ended meanwhile:
+    /// `attach` resumes its transcript tailer, which reads the end already on
+    /// disk instead of leaving the session busy for good.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn attach_resumes_tailing_a_background_task_that_ended_during_the_restart() {
+        let session_id = "s-attach-task";
+        let mut fixture =
+            attach_with_orphaned_background_agent(session_id, "", Some("task-1")).await;
+        assert_eq!(
+            fixture.store.unresolved_background_task_ids(session_id),
+            ["task-1".to_string()],
+            "precondition: the task is open before the tailer runs"
+        );
+        // The fake runner's native session is `acp-sid`; its transcript holds
+        // the end of the task.
+        let home = crate::session::capture::claude_home_for_host_environment(None, &[]).unwrap();
+        assert!(
+            home.starts_with(std::env::var("HOME").unwrap()),
+            "the test must write under the isolated home, not {home:?}"
+        );
+        let dir = home.join("projects/-enc");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("acp-sid.jsonl"),
+            r#"{"type":"queue-operation","operation":"enqueue","content":"<task-notification>\n<task-id>task-1</task-id>\n<status>completed</status>\n</task-notification>"}"#
+                .to_string()
+                + "\n",
+        )
+        .unwrap();
+
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            while !fixture
+                .store
+                .unresolved_background_task_ids(session_id)
+                .is_empty()
+            {
+                match fixture.rx.recv().await {
+                    Ok(_) => {}
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(e) => panic!("broadcast channel closed: {e}"),
+                }
+            }
+        })
+        .await
+        .expect("the resumed tailer must finish the task");
     }
 
     #[tokio::test]

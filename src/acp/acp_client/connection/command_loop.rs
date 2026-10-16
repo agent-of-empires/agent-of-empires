@@ -173,6 +173,9 @@ impl Session {
                 Some(ClientCmd::ResumeBackgroundTailing(launches)) => {
                     self.shared.resume_background_tailing(launches)
                 }
+                Some(ClientCmd::ResumeTaskTailing(task_ids)) => self
+                    .shared
+                    .resume_task_tailing(&self.acp_session_id.0, task_ids),
                 Some(ClientCmd::ResetSession {
                     text,
                     deadline,

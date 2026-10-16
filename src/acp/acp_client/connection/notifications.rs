@@ -4,8 +4,9 @@
 use crate::acp::agent_profiles::AgentProfile;
 use crate::acp::background_agent::{spawn_tailer, TailerStart, TranscriptSource};
 use crate::acp::state::Event;
+use crate::acp::task_transcript::spawn_task_tailer;
 use agent_client_protocol::schema::v1::{SessionId, SessionNotification, SessionUpdate};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::sync::mpsc;
@@ -71,6 +72,9 @@ pub(super) struct Shared {
     compaction: std::sync::Mutex<CompactionTracker>,
     pub(super) tool_context_cache: ToolContextCache,
     bg_transcript_source: TranscriptSource,
+    /// Background tasks with a live transcript tailer, which removes its id
+    /// when the task ends.
+    pub(super) bg_tasks: Arc<std::sync::Mutex<HashSet<String>>>,
 }
 
 impl Shared {
@@ -114,6 +118,7 @@ impl Shared {
             compaction: Default::default(),
             tool_context_cache: Arc::new(std::sync::Mutex::new(ToolCallContextCache::default())),
             bg_transcript_source,
+            bg_tasks: Arc::default(),
         }
     }
 
@@ -241,6 +246,7 @@ impl Shared {
             );
         }
         self.capture_rate_limit(&notification.update);
+        let session_id = notification.session_id.0.to_string();
         let update_for_tool_context = notification.update.clone();
         let mut events = map_update_to_events(notification.update, self.profile);
         events.extend(restored_wake_event);
@@ -284,10 +290,49 @@ impl Shared {
                 );
                 continue;
             }
+            let started_task = match &event {
+                Event::BackgroundTaskStarted { task_id, .. } => {
+                    // A sandboxed session's transcript lives in the container,
+                    // which is not read, so its tasks are not tracked.
+                    if !matches!(self.bg_transcript_source, TranscriptSource::Host) {
+                        continue;
+                    }
+                    Some(task_id.clone())
+                }
+                _ => None,
+            };
             update_tool_context_cache(&self.tool_context_cache, &event, &update_for_tool_context);
             if self.event_tx.send(event).await.is_err() {
                 break;
             }
+            // After the start is queued, so a task that already ended cannot
+            // have its finish overtake it.
+            if let Some(task_id) = started_task {
+                spawn_task_tailer(
+                    task_id,
+                    session_id.clone(),
+                    self.bg_tasks.clone(),
+                    self.event_tx.downgrade(),
+                    TailerStart::Live,
+                );
+            }
+        }
+    }
+
+    /// Re-tail tasks a previous daemon left open: their end may already be in
+    /// the transcript, so each tailer reads it from the start.
+    pub(super) fn resume_task_tailing(&self, session_id: &str, task_ids: Vec<String>) {
+        if !matches!(self.bg_transcript_source, TranscriptSource::Host) {
+            return;
+        }
+        for task_id in task_ids {
+            spawn_task_tailer(
+                task_id,
+                session_id.to_string(),
+                self.bg_tasks.clone(),
+                self.event_tx.downgrade(),
+                TailerStart::Resumed,
+            );
         }
     }
 
