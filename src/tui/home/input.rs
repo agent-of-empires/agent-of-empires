@@ -3015,18 +3015,19 @@ impl HomeView {
             crate::session::fork::structured_fork_capable(&inst.tool, inst.agent_name.as_deref())
         } else {
             inst.fork_parent_ref().ok().flatten().is_some_and(|parent| {
-                let agent = match parent {
-                    crate::session::fork::ForkParentRef::Unattributed { agent, .. } => agent,
-                    _ => {
-                        return parent
-                            .binding()
-                            .and_then(|binding| binding.execution.as_ref())
-                            .is_some_and(|execution| {
-                                crate::session::fork::terminal_agent_can_fork(&execution.agent)
-                            })
+                use crate::session::fork::{fork_capturable, terminal_agent_can_fork};
+                match parent {
+                    crate::session::fork::ForkParentRef::Unattributed { agent, .. } => {
+                        terminal_agent_can_fork(agent) && fork_capturable(agent, None)
                     }
-                };
-                crate::session::fork::terminal_agent_can_fork(agent)
+                    _ => parent
+                        .binding()
+                        .and_then(|binding| binding.execution.as_ref())
+                        .is_some_and(|execution| {
+                            terminal_agent_can_fork(&execution.agent)
+                                && fork_capturable(&execution.agent, Some(execution))
+                        }),
+                }
             })
         }
     }

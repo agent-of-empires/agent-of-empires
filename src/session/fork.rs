@@ -206,6 +206,16 @@ pub fn terminal_agent_can_fork(agent: &str) -> bool {
     })
 }
 
+/// Whether a fork of `agent` can run where the parent's `execution` recorded it.
+/// An unattributed parent records no execution, so the fork has to work in both
+/// contexts.
+pub fn fork_capturable(agent: &str, execution: Option<&crate::session::ExecutionBinding>) -> bool {
+    get_agent(agent).is_some_and(|def| match execution {
+        Some(execution) => def.can_fork_in(execution.filesystem != "host"),
+        None => def.can_fork_in(true) && def.can_fork_in(false),
+    })
+}
+
 /// Hold a fork child to the parent's identity when the parent is an
 /// unattributed id, which the launch cannot identity-check. `launched` is the
 /// agent the child's own command and profile actually resolve to, not the
@@ -276,13 +286,7 @@ pub fn terminal_fork_seed(
             agent: agent.to_owned(),
         });
     }
-    // An unattributed parent records no execution, so the fork has to be
-    // capturable in both contexts.
-    let capturable = get_agent(agent).is_some_and(|def| match &parent.execution {
-        Some(execution) => def.can_fork_in(execution.filesystem != "host"),
-        None => def.can_fork_in(true) && def.can_fork_in(false),
-    });
-    if !capturable {
+    if !fork_capturable(agent, parent.execution.as_ref()) {
         return Err(ForkDenied::ChildNotCapturable {
             agent: agent.to_owned(),
         });
@@ -438,6 +442,8 @@ mod tests {
             "sandbox"
         );
 
+        assert!(!fork_capturable("prime-agent", None), "unknown context");
+        assert!(fork_capturable("claude", None), "unaffected agent");
         let unknown = ConversationBinding::unknown("parent-uuid");
         let unattributed = terminal_fork_seed(
             Some(ForkParentRef::Unattributed {
