@@ -2550,6 +2550,7 @@
       "risk": "high",
       "specs": [
         "tests/live/acp-transcript.spec.ts",
+        "tests/acp-user-attachments.spec.ts",
         "src/components/acp/Composer.test.tsx",
         "src/components/acp/ThreadMessages.test.tsx"
       ],

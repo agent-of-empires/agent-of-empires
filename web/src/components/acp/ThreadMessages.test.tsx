@@ -5,7 +5,7 @@
 // resolves through ArtifactImage's authenticated fetch instead (see artifactMedia.tsx).
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { cleanup, fireEvent, render, waitFor } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import {
   AssistantRuntimeProvider,
   ThreadPrimitive,
@@ -15,6 +15,7 @@ import {
 
 import { parseJsonObject } from "../../lib/acpArgs";
 import { writeClipboard } from "../../lib/clipboard";
+import * as openInNewTabModule from "../../lib/openInNewTab";
 import type { ActivityRow, ToolCall } from "../../lib/acpTypes";
 import { activityToThreadMessages, SUBAGENT_TASK_NAME, TODO_GROUP_NAME, TOOL_GROUP_NAME } from "./activityMessages";
 import { AssistantMessage, UserMessage } from "./ThreadMessages";
@@ -68,6 +69,92 @@ describe("UserMessage image part", () => {
     });
     expect(fetch).toHaveBeenCalledWith(ATTACHMENT_URL);
     expect(container.querySelector(`img[src="${ATTACHMENT_URL}"]`)).toBeNull();
+  });
+});
+
+describe("UserMessage attachment bubble", () => {
+  it("renders the image and the text in one bubble, image first", async () => {
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue({ ok: true, blob: async () => new Blob(["x"]) }));
+    const rows: ActivityRow[] = [
+      {
+        id: "p1",
+        kind: "user_prompt",
+        text: "look at this",
+        at: "2026-10-06T00:00:00Z",
+        attachments: [{ id: "att1", kind: "image", mimeType: "image/png", url: ATTACHMENT_URL }],
+      },
+    ];
+    const { container } = render(<Harness messages={activityToThreadMessages(rows, false)} />);
+
+    const bubbles = container.querySelectorAll('[data-testid="user-message-bubble"]');
+    expect(bubbles).toHaveLength(1);
+    await waitFor(() => expect(bubbles[0]!.querySelector("img.acp-artifact-image")).not.toBeNull());
+    const img = bubbles[0]!.querySelector("img.acp-artifact-image")!;
+    const text = Array.from(bubbles[0]!.querySelectorAll("p")).find((p) => p.textContent === "look at this")!;
+    expect(img.compareDocumentPosition(text) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+  });
+});
+
+describe("UserMessage image click", () => {
+  it("expands the attachment in an overlay and closes on Escape or backdrop click", async () => {
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue({ ok: true, blob: async () => new Blob(["x"]) }));
+    const { container } = render(
+      <Harness messages={[{ role: "user", content: [{ type: "image", image: ATTACHMENT_URL }] }]} />,
+    );
+    await waitFor(() => expect(container.querySelector("img.acp-artifact-image")).not.toBeNull());
+    expect(screen.queryByTestId("image-lightbox")).toBeNull();
+
+    const thumb = container.querySelector("img.acp-artifact-image")!.closest("button")!;
+    fireEvent.click(thumb);
+    expect(screen.getByTestId("image-lightbox").querySelector("img")?.getAttribute("src")).toBe("blob:mock-url");
+    // Focus moves to the close button and Tab cannot reach the thread behind it.
+    const close = screen.getByRole("button", { name: "Close image" });
+    expect(document.activeElement).toBe(close);
+    expect(fireEvent.keyDown(document, { key: "Tab" })).toBe(false);
+
+    // The app dispatches global shortcuts from a document capture listener; it must not see keys while the modal is open.
+    const globalShortcut = vi.fn();
+    document.addEventListener("keydown", globalShortcut, true);
+    fireEvent.keyDown(document, { key: "`", code: "Backquote", ctrlKey: true });
+    expect(globalShortcut).not.toHaveBeenCalled();
+
+    fireEvent.keyDown(document, { key: "Escape" });
+    document.removeEventListener("keydown", globalShortcut, true);
+    expect(screen.queryByTestId("image-lightbox")).toBeNull();
+    expect(document.activeElement).toBe(thumb);
+
+    fireEvent.click(thumb);
+    fireEvent.click(screen.getByRole("button", { name: "Close image" }));
+    expect(screen.queryByTestId("image-lightbox")).toBeNull();
+    expect(document.activeElement).toBe(thumb);
+
+    fireEvent.click(container.querySelector("img.acp-artifact-image")!);
+    fireEvent.click(screen.getByTestId("image-lightbox"));
+    expect(screen.queryByTestId("image-lightbox")).toBeNull();
+  });
+});
+
+describe("UserMessage file attachment", () => {
+  it("shares the bubble with the text and opens through the authenticated opener", () => {
+    const open = vi.spyOn(openInNewTabModule, "openInNewTab").mockResolvedValue({ ok: true });
+    const rows: ActivityRow[] = [
+      {
+        id: "p2",
+        kind: "user_prompt",
+        text: "see doc",
+        at: "2026-10-06T00:00:00Z",
+        attachments: [
+          { id: "att2", kind: "resource", mimeType: "application/pdf", name: "spec.pdf", size: 1, url: "/api/f/att2" },
+        ],
+      },
+    ];
+    const { container } = render(<Harness messages={activityToThreadMessages(rows, false)} />);
+    const bubble = container.querySelector('[data-testid="user-message-bubble"]')!;
+    expect(bubble.textContent).toContain("spec.pdf");
+    expect(bubble.textContent).toContain("see doc");
+
+    fireEvent.click(screen.getByText("spec.pdf"));
+    expect(open).toHaveBeenCalledWith("/api/f/att2", "spec.pdf");
   });
 });
 
@@ -263,5 +350,17 @@ describe("AssistantMessage tool output media", () => {
       />,
     );
     expect(getByAltText("tool output image (image/png)").getAttribute("src")).toBe("data:image/png;base64,AAAA");
+  });
+
+  it("expands an inline image result in the lightbox", () => {
+    const { getByAltText } = render(
+      <Harness
+        messages={activityToThreadMessages(rows([{ kind: "image", mime_type: "image/png", data: "AAAA" }]), false)}
+      />,
+    );
+    fireEvent.click(getByAltText("tool output image (image/png)"));
+    expect(screen.getByTestId("image-lightbox").querySelector("img")?.getAttribute("src")).toBe(
+      "data:image/png;base64,AAAA",
+    );
   });
 });

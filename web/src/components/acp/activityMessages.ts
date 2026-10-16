@@ -105,14 +105,21 @@ export function activityToThreadMessages(
       continue;
     }
     if (row.kind === "user_prompt") {
-      // Images become image parts; other attachments show as a labelled line.
+      // Images become image parts; other attachments become file parts.
+      // Attachments lead so the user bubble shows them above the message text.
       const parts = [
-        ...(row.text ? [{ type: "text" as const, text: row.text }] : []),
         ...(row.attachments ?? []).map((att) =>
           att.kind === "image"
             ? { type: "image" as const, image: att.url }
-            : { type: "text" as const, text: `📎 ${att.name ?? att.kind} (${att.mimeType})` },
+            : {
+                type: "file" as const,
+                data: att.url,
+                mimeType: att.mimeType,
+                filename: att.name ?? att.kind,
+                sourceType: "url" as const,
+              },
         ),
+        ...(row.text ? [{ type: "text" as const, text: row.text }] : []),
       ];
       pushUser(
         row,

@@ -1,10 +1,11 @@
-import { useMemo } from "react";
+import { createContext, useContext, useMemo } from "react";
 
 import { MessagePrimitive, useAuiState } from "@assistant-ui/react";
 
 import { isElicitationAnswersPayload, type ActivityRow, type ToolCall, type ToolOutputBlock } from "../../lib/acpTypes";
 import { parseJsonObject } from "../../lib/acpArgs";
 import { pickMemoryRecall } from "../../lib/memoryRecall";
+import { openInNewTab } from "../../lib/openInNewTab";
 import { ArtifactImage } from "./artifactMedia";
 import { DiffCommentsUserCard } from "../diff/comments/DiffCommentsUserCard";
 import { isDiffCommentsCardPayload, parseDiffCommentsSentinel } from "../diff/comments/buildPrompt";
@@ -15,10 +16,23 @@ import { AsyncSubagentCard, SubagentCard, ToolGroupCard } from "./GroupToolCards
 import { TodoGroupCard } from "./TodoCards";
 import { ToolCard } from "./ToolCards";
 
+// True while the parts render inside one shared bubble, so text drops its own.
+const SharedBubbleContext = createContext(false);
+
 export function UserMessage() {
   const originPlugin = useAuiState(
     (s) => (s.message.metadata?.custom as { originPlugin?: unknown } | undefined)?.originPlugin,
   );
+  // Cards (diff comments, elicitation answers) bring their own chrome.
+  const shareBubble = useAuiState((s) => {
+    const custom = s.message.metadata?.custom as { diffComments?: unknown; elicitationAnswers?: unknown } | undefined;
+    return (
+      !custom?.diffComments &&
+      !custom?.elicitationAnswers &&
+      s.message.content.some((part) => part.type === "image" || part.type === "file")
+    );
+  });
+  const parts = <MessagePrimitive.Parts components={{ Text: UserText, Image: UserImage, File: UserFile }} />;
   return (
     <MessagePrimitive.Root className="group mt-4 flex flex-col items-end gap-1">
       {typeof originPlugin === "string" && (
@@ -26,7 +40,16 @@ export function UserMessage() {
           Sent by plugin {originPlugin}
         </div>
       )}
-      <MessagePrimitive.Parts components={{ Text: UserText, Image: UserImage }} />
+      {shareBubble ? (
+        <div
+          data-testid="user-message-bubble"
+          className="flex max-w-[80%] min-w-0 flex-col gap-1.5 rounded-2xl rounded-br-sm border border-surface-700 bg-surface-800/70 p-1.5 text-sm"
+        >
+          <SharedBubbleContext.Provider value>{parts}</SharedBubbleContext.Provider>
+        </div>
+      ) : (
+        parts
+      )}
     </MessagePrimitive.Root>
   );
 }
@@ -35,10 +58,26 @@ export function UserMessage() {
 // (e.g. the passphrase device-binding header), so route it through the same
 // authenticated-fetch-to-blob-URL path artifacts already use.
 function UserImage({ image }: { image: string }) {
-  return <ArtifactImage url={image} alt="attachment" />;
+  return <ArtifactImage url={image} alt="attachment" expandable />;
+}
+
+// Documents are not rendered; they open in a new tab through the authenticated fetch.
+function UserFile({ data, filename, mimeType }: { data: string; filename?: string; mimeType: string }) {
+  return (
+    <button
+      type="button"
+      title={`Open ${mimeType}`}
+      className="flex max-w-full cursor-pointer items-center gap-1.5 self-end rounded-md border border-surface-700 bg-surface-900/60 px-2 py-1 text-left text-xs text-text-secondary hover:text-text-primary"
+      onClick={() => void openInNewTab(data, filename)}
+    >
+      <span aria-hidden>📎</span>
+      <span className="min-w-0 truncate">{filename ?? "attachment"}</span>
+    </button>
+  );
 }
 
 function UserText({ text }: { text: string }) {
+  const inSharedBubble = useContext(SharedBubbleContext);
   const typedPayload = useAuiState(
     (s) => (s.message.metadata?.custom as { diffComments?: unknown } | undefined)?.diffComments,
   );
@@ -57,6 +96,13 @@ function UserText({ text }: { text: string }) {
     return <DiffCommentsUserCard payload={payload} />;
   }
   // `breaks`: the composer is a plain textarea, so a single newline must stay visible.
+  if (inSharedBubble) {
+    return (
+      <div className="min-w-0 px-1.5 py-0.5">
+        <Markdown text={text} smooth={false} breaks />
+      </div>
+    );
+  }
   return (
     <div className="max-w-[80%] min-w-0 rounded-2xl rounded-br-sm border border-surface-700 bg-surface-800/70 px-3 py-1.5 text-sm">
       <Markdown text={text} smooth={false} breaks />
