@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useRef, useState, type ReactNode } from "react";
+import { Maximize2, PanelBottom, X } from "lucide-react";
 import {
   fetchPluginUiState,
   fetchPluginSessions,
@@ -19,9 +20,13 @@ import {
   type BridgeCall,
 } from "../../lib/pluginBridge";
 import { usePluginPages } from "../../lib/pluginUiContext";
+import type { SessionMenuRequest } from "./PluginSessionMenu";
 import { requestOpenSession } from "../../lib/sessionRoute";
+import { safeGetItem, safeSetItem } from "../../lib/safeStorage";
 import { THEME_CHANGED_EVENT, type ResolvedTheme } from "../../lib/theme";
 import { listen } from "../../hooks/domEvents";
+import { useIsWideViewport } from "../../hooks/useIsWideViewport";
+import { usePersistedFlag } from "../usePersistedFlag";
 
 interface Props {
   pluginId: string;
@@ -30,7 +35,21 @@ interface Props {
   readOnly: boolean;
   cityhall: boolean;
   theme: ResolvedTheme | null;
+  /** The session's main view for the split pane, or null when the dashboard does not know it. */
+  renderSession: (sessionId: string) => ReactNode;
+  /** The host session menu for `session.contextMenu`. */
+  renderSessionMenu: (request: SessionMenuRequest) => ReactNode;
 }
+
+interface PageHost {
+  openSession: (id: string) => void;
+  /** Resolves with the picked page item's id, or null. */
+  openMenu: (request: Omit<SessionMenuRequest, "key" | "onClose">) => Promise<string | null>;
+}
+
+const SPLIT_HEIGHT_KEY = "aoe-plugin-page-split-height";
+const DEFAULT_SPLIT = 0.5;
+const clampSplit = (f: number) => Math.min(0.8, Math.max(0.2, f));
 
 function closePort(port: { current: MessagePort | null }) {
   port.current?.close();
@@ -42,7 +61,7 @@ function newNonce(): string {
   return Array.from(crypto.getRandomValues(new Uint8Array(16)), (b) => b.toString(16).padStart(2, "0")).join("");
 }
 
-async function runCall(call: BridgeCall, pluginId: string): Promise<unknown> {
+async function runCall(call: BridgeCall, pluginId: string, host: PageHost): Promise<unknown> {
   switch (call.method) {
     case "ready":
       return null;
@@ -63,7 +82,7 @@ async function runCall(call: BridgeCall, pluginId: string): Promise<unknown> {
       return reply;
     }
     case "openSession":
-      requestOpenSession(call.sessionId);
+      host.openSession(call.sessionId);
       return null;
     // Null, not the session row, which is wider than the summary sessions.list hands a page.
     case "session.archive":
@@ -74,6 +93,11 @@ async function runCall(call: BridgeCall, pluginId: string): Promise<unknown> {
       await requireListed(pluginId, call.sessionId);
       if (!(await trashSession(call.sessionId))) throw new Error("trash failed");
       return null;
+    case "session.contextMenu": {
+      await requireListed(pluginId, call.sessionId);
+      const { sessionId, x, y, items } = call;
+      return host.openMenu({ sessionId, x, y, items });
+    }
   }
 }
 
@@ -87,7 +111,16 @@ async function requireListed(pluginId: string, sessionId: string) {
 }
 
 /** A plugin page, full width. The frame gets an opaque origin: no dashboard storage, cookies, token or API; the bridge is its only data path. */
-export function PluginPageView({ pluginId, pageId, onBack, readOnly, cityhall, theme }: Props) {
+export function PluginPageView({
+  pluginId,
+  pageId,
+  onBack,
+  readOnly,
+  cityhall,
+  theme,
+  renderSession,
+  renderSessionMenu,
+}: Props) {
   const pages = usePluginPages();
   const page = pages?.find((p) => p.plugin_id === pluginId && p.id === pageId);
   const [attempt, setAttempt] = useState(0);
@@ -102,6 +135,46 @@ export function PluginPageView({ pluginId, pageId, onBack, readOnly, cityhall, t
   const port = useRef<MessagePort | null>(null);
   // Rides the frame URL's fragment, which never reaches the server; `ready` must echo it, so a document the page navigates to cannot take its identity.
   const nonce = useRef<string | null>(null);
+
+  // Split view: the page's openSession fills a bottom pane instead of leaving the page.
+  const wide = useIsWideViewport();
+  const [splitPref, toggleSplit] = usePersistedFlag(`aoe-plugin-page-split:${pluginId}/${pageId}`, false);
+  const split = wide && splitPref;
+  const [selected, setSelected] = useState<string | null>(null);
+  const shown = split ? selected : null;
+  const shownRef = useRef(shown);
+  const openSessionRef = useRef<(id: string) => void>(requestOpenSession);
+  useEffect(() => {
+    openSessionRef.current = split ? setSelected : requestOpenSession;
+  }, [split]);
+  useEffect(() => {
+    shownRef.current = shown;
+    port.current?.postMessage(bridgePush("selection", { sessionId: shown }));
+  }, [shown]);
+
+  // The last request stays mounted after its menu closes, so a picker it opened can finish.
+  const [menuRequest, setMenuRequest] = useState<SessionMenuRequest | null>(null);
+  const menuResolve = useRef<((picked: string | null) => void) | null>(null);
+  const menuKey = useRef(0);
+  const [host] = useState<PageHost>(() => ({
+    openSession: (id) => openSessionRef.current(id),
+    openMenu: ({ x, y, ...rest }) => {
+      // The page sends frame coordinates; the menu floats in the dashboard viewport.
+      const rect = frameRef.current?.getBoundingClientRect();
+      menuResolve.current?.(null);
+      return new Promise((resolve) => {
+        menuResolve.current = resolve;
+        menuKey.current += 1;
+        setMenuRequest({
+          key: menuKey.current,
+          x: x + (rect?.left ?? 0),
+          y: y + (rect?.top ?? 0),
+          ...rest,
+          onClose: resolve,
+        });
+      });
+    },
+  }));
 
   const attachFrame = useCallback((frame: HTMLIFrameElement | null) => {
     frameRef.current = frame;
@@ -135,7 +208,7 @@ export function PluginPageView({ pluginId, pageId, onBack, readOnly, cityhall, t
         channel.postMessage(bridgeError(call.id, resolved.error, resolved.message));
         return;
       }
-      runCall(resolved.call, page.plugin_id).then(
+      runCall(resolved.call, page.plugin_id, host).then(
         (result) => channel.postMessage(bridgeReply(call.id, result)),
         (e: unknown) =>
           channel.postMessage(
@@ -161,10 +234,11 @@ export function PluginPageView({ pluginId, pageId, onBack, readOnly, cityhall, t
         bridgePush("context", { readOnly, cityhall, pluginId, pageId, bridgeVersion: BRIDGE_VERSION }),
       );
       if (theme) channel.postMessage(bridgePush("theme", themePayload(theme)));
+      channel.postMessage(bridgePush("selection", { sessionId: shownRef.current }));
     };
     window.addEventListener("message", onMessage);
     return () => window.removeEventListener("message", onMessage);
-  }, [page, pluginId, pageId, readOnly, cityhall, theme]);
+  }, [page, pluginId, pageId, readOnly, cityhall, theme, host]);
 
   useEffect(
     () =>
@@ -205,15 +279,48 @@ export function PluginPageView({ pluginId, pageId, onBack, readOnly, cityhall, t
     );
   } else if (page && ticket?.ok) {
     body = (
-      <iframe
-        key={attempt}
-        ref={attachFrame}
-        title={page.title}
-        src={`${page.url}#${ticket.nonce}`}
-        sandbox="allow-scripts"
-        onLoad={onFrameLoad}
-        className="flex-1 w-full border-0 bg-surface-900"
-        data-testid="plugin-page-frame"
+      <SplitLayout
+        split={split}
+        top={(dragging) => (
+          <iframe
+            key={attempt}
+            ref={attachFrame}
+            title={page.title}
+            src={`${page.url}#${ticket.nonce}`}
+            sandbox="allow-scripts"
+            onLoad={onFrameLoad}
+            // The frame would swallow the divider's mousemove events mid-drag.
+            className={`flex-1 min-h-0 w-full border-0 bg-surface-900 ${dragging ? "pointer-events-none" : ""}`}
+            data-testid="plugin-page-frame"
+          />
+        )}
+        bottom={
+          shown ? (
+            <>
+              <div className="shrink-0 flex items-center justify-end gap-1 px-2 h-8 border-b border-surface-700/60 bg-surface-850">
+                <button
+                  onClick={() => requestOpenSession(shown)}
+                  className="w-6 h-6 flex items-center justify-center rounded cursor-pointer text-text-muted hover:text-text-primary hover:bg-surface-700/50"
+                  aria-label="Open full"
+                  title="Open full"
+                >
+                  <Maximize2 size={14} aria-hidden="true" />
+                </button>
+                <button
+                  onClick={() => setSelected(null)}
+                  className="w-6 h-6 flex items-center justify-center rounded cursor-pointer text-text-muted hover:text-text-primary hover:bg-surface-700/50"
+                  aria-label="Close session"
+                  title="Close session"
+                >
+                  <X size={14} aria-hidden="true" />
+                </button>
+              </div>
+              {renderSession(shown) ?? <Empty title="Session not found" detail="It may have been deleted." />}
+            </>
+          ) : (
+            <Empty title="No session selected" detail="Open a session from the page to show it here." />
+          )
+        }
       />
     );
   }
@@ -224,9 +331,98 @@ export function PluginPageView({ pluginId, pageId, onBack, readOnly, cityhall, t
         <button onClick={onBack} className="text-brand-500 cursor-pointer text-sm shrink-0">
           &larr; Back
         </button>
-        <span className="text-xs font-mono text-text-bright truncate">{page?.title ?? pageId}</span>
+        <span className="flex-1 text-xs font-mono text-text-bright truncate">{page?.title ?? pageId}</span>
+        {wide && (
+          <button
+            onClick={toggleSplit}
+            className={`w-8 h-8 shrink-0 flex items-center justify-center rounded-md cursor-pointer transition-colors ${
+              split
+                ? "text-text-primary bg-surface-700/60"
+                : "text-text-muted hover:text-text-secondary hover:bg-surface-700/50"
+            }`}
+            aria-label="Split view"
+            aria-pressed={split}
+            title="Split view"
+          >
+            <PanelBottom size={16} strokeWidth={1.5} aria-hidden="true" />
+          </button>
+        )}
       </div>
       {body}
+      {menuRequest && renderSessionMenu(menuRequest)}
+    </div>
+  );
+}
+
+/** The top pane stays at one tree position, so toggling the split never reloads the page frame. */
+function SplitLayout({
+  split,
+  top,
+  bottom,
+}: {
+  split: boolean;
+  top: (dragging: boolean) => ReactNode;
+  bottom: ReactNode;
+}) {
+  const [fraction, setFraction] = useState(() => {
+    const saved = parseFloat(safeGetItem(SPLIT_HEIGHT_KEY) ?? "");
+    return Number.isFinite(saved) ? clampSplit(saved) : DEFAULT_SPLIT;
+  });
+  const [dragging, setDragging] = useState(false);
+  const ref = useRef<HTMLDivElement>(null);
+  const latest = useRef(fraction);
+
+  useEffect(() => {
+    if (!dragging) return;
+    const onMove = (e: MouseEvent) => {
+      const rect = ref.current?.getBoundingClientRect();
+      if (!rect?.height) return;
+      latest.current = clampSplit((rect.bottom - e.clientY) / rect.height);
+      setFraction(latest.current);
+    };
+    const onUp = () => {
+      setDragging(false);
+      safeSetItem(SPLIT_HEIGHT_KEY, String(latest.current));
+      // Terminals re-fit on resize.
+      window.dispatchEvent(new Event("resize"));
+    };
+    document.addEventListener("mousemove", onMove);
+    document.addEventListener("mouseup", onUp);
+    document.body.style.cursor = "row-resize";
+    document.body.style.userSelect = "none";
+    return () => {
+      document.removeEventListener("mousemove", onMove);
+      document.removeEventListener("mouseup", onUp);
+      document.body.style.cursor = "";
+      document.body.style.userSelect = "";
+    };
+  }, [dragging]);
+
+  return (
+    <div ref={ref} className="flex-1 min-h-0 flex flex-col">
+      {top(dragging)}
+      {split && (
+        <>
+          <div
+            role="separator"
+            aria-orientation="horizontal"
+            aria-label="Resize split"
+            data-testid="plugin-page-split-resize"
+            onMouseDown={(e) => {
+              e.preventDefault();
+              setDragging(true);
+            }}
+            className="h-1 shrink-0 cursor-row-resize bg-surface-700/60 hover:bg-brand-600/50 transition-colors duration-75"
+          />
+          <div
+            className="shrink-0 min-h-0 flex flex-col overflow-hidden"
+            style={{ height: `${fraction * 100}%` }}
+            data-testid="plugin-page-split-session"
+          >
+            {bottom}
+          </div>
+        </>
+      )}
     </div>
   );
 }

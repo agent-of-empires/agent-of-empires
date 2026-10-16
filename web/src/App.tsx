@@ -57,6 +57,7 @@ import { usePaneLayout, dockTabs, dockGroups, dockOf, isActiveTab, isDockCollaps
 import { isPluginPaneId, resolvePaneIcon, usePluginPanes, type PluginPane } from "./lib/pluginPanes";
 import { PluginPaneBody } from "./components/plugin/PluginPane";
 import { PluginPageView } from "./components/plugin/PluginPageView";
+import { PluginSessionMenu } from "./components/plugin/PluginSessionMenu";
 import { TOUR_ANCHORS, tourAnchor } from "./lib/tourSteps";
 import {
   deleteWorkspaceSessions,
@@ -1856,6 +1857,42 @@ function AppContent({
     [conversationHits, sessions, activeSessionId, handleSelectSession],
   );
 
+  /** A session's chat or terminal. Only the routed session (`primary`) owns the file viewer, agents pane and persistent terminals. */
+  const renderSessionView = (session: SessionResponse | undefined, sessionId: string, primary: boolean) =>
+    session?.view === "structured" ? (
+      <Suspense fallback={<AcpLoadingFallback />}>
+        <StructuredView
+          key={sessionId}
+          sessionId={sessionId}
+          acpWorkerState={session.acp_worker_state ?? "absent"}
+          rateLimitAutoResume={session.rate_limit_auto_resume}
+          tool={session.tool}
+          acpAgent={session.acp_agent ?? null}
+          acpProvider={session.acp_provider ?? null}
+          clearAliases={session.clear_aliases}
+          archivedAt={session.archived_at ?? null}
+          snoozedUntil={session.snoozed_until ?? null}
+          trashedAt={session.trashed_at ?? null}
+          onRestore={
+            session.trashed_at
+              ? () => handleRestoreSession(trashedWorkspaceRestoreIds(workspaces, sessionId))
+              : undefined
+          }
+          onOpenFileRef={primary ? handleOpenFileRef : undefined}
+          fileRefSession={primary ? session : undefined}
+          onOpenAgentsPane={primary ? openAgentsPane : undefined}
+          isSandboxed={session.is_sandboxed}
+        />
+      </Suspense>
+    ) : (
+      <TerminalSessionStack
+        activeSessionId={sessionId}
+        sessions={primary ? sessions.filter((s) => s.view !== "structured") : session ? [session] : []}
+        persistent={primary && webSettings.persistentTerminals}
+        maxPersistentTerminals={webSettings.maxPersistentTerminals}
+      />
+    );
+
   const renderContent = () => {
     if (pluginPageMatch) {
       return (
@@ -1867,6 +1904,24 @@ function AppContent({
           readOnly={serverAbout?.read_only ?? false}
           cityhall={caps.cityhall}
           theme={resolvedTheme}
+          renderSession={(id) => {
+            const session = sessions.find((s) => s.id === id);
+            return session ? renderSessionView(session, id, false) : null;
+          }}
+          renderSessionMenu={(request) => (
+            <PluginSessionMenu
+              request={request}
+              workspaces={workspaces}
+              readOnly={serverAbout?.read_only ?? false}
+              handlers={{
+                onDelete: handleDeleteSession,
+                onStop: handleStopSession,
+                onStart: handleStartSession,
+                onSwitchView: handleSwitchView,
+                onCreateSession: handleCreateSession,
+              }}
+            />
+          )}
         />
       );
     }
@@ -2028,39 +2083,7 @@ function AppContent({
             left={
               <div className="flex-1 flex flex-col min-h-0 overflow-hidden relative">
                 <div className={selectedFilePath ? "hidden" : "flex-1 flex flex-col min-h-0 overflow-hidden"}>
-                  {activeSession?.view === "structured" ? (
-                    <Suspense fallback={<AcpLoadingFallback />}>
-                      <StructuredView
-                        key={activeSessionId}
-                        sessionId={activeSessionId!}
-                        acpWorkerState={activeSession.acp_worker_state ?? "absent"}
-                        rateLimitAutoResume={activeSession.rate_limit_auto_resume}
-                        tool={activeSession.tool}
-                        acpAgent={activeSession.acp_agent ?? null}
-                        acpProvider={activeSession.acp_provider ?? null}
-                        clearAliases={activeSession.clear_aliases}
-                        archivedAt={activeSession.archived_at ?? null}
-                        snoozedUntil={activeSession.snoozed_until ?? null}
-                        trashedAt={activeSession.trashed_at ?? null}
-                        onRestore={
-                          activeSession.trashed_at
-                            ? () => handleRestoreSession(trashedWorkspaceRestoreIds(workspaces, activeSessionId!))
-                            : undefined
-                        }
-                        onOpenFileRef={handleOpenFileRef}
-                        fileRefSession={activeSession}
-                        onOpenAgentsPane={openAgentsPane}
-                        isSandboxed={activeSession.is_sandboxed}
-                      />
-                    </Suspense>
-                  ) : (
-                    <TerminalSessionStack
-                      activeSessionId={activeSessionId!}
-                      sessions={sessions.filter((session) => session.view !== "structured")}
-                      persistent={webSettings.persistentTerminals}
-                      maxPersistentTerminals={webSettings.maxPersistentTerminals}
-                    />
-                  )}
+                  {renderSessionView(activeSession, activeSessionId!, true)}
                 </div>
 
                 {selectedFilePath &&
