@@ -611,6 +611,7 @@ fn collect_acp_states() -> Vec<AcpState> {
         .collect()
 }
 
+/// Collects tmux and ACP runtime state for `instances` and merges it into rows.
 fn collect_rows(
     instances: &mut [Instance],
     filter: SubstrateFilter,
@@ -647,6 +648,7 @@ fn collect_rows(
     )
 }
 
+/// Renders the list view as a table, or as JSON when `json` is set.
 fn render_rows(rows: &[Row], acp: bool, json: bool, compact: bool) -> Result<String> {
     if json {
         let mut out = if acp {
@@ -666,6 +668,7 @@ fn render_rows(rows: &[Row], acp: bool, json: bool, compact: bool) -> Result<Str
     })
 }
 
+/// Serializes `value` as compact or pretty JSON.
 fn to_json<T: Serialize>(value: &T, compact: bool) -> Result<String> {
     Ok(if compact {
         serde_json::to_string(value)?
@@ -674,6 +677,7 @@ fn to_json<T: Serialize>(value: &T, compact: bool) -> Result<String> {
     })
 }
 
+/// Prefixes a clear-screen sequence to table frames on a TTY.
 fn watch_frame(body: String, json: bool, tty: bool) -> String {
     if tty && !json {
         format!("\x1b[2J\x1b[H{body}")
@@ -708,6 +712,7 @@ struct DetailJson {
     acp: Option<AcpDetailJson>,
 }
 
+/// Projects a row into the single-session JSON shape.
 fn detail_json(row: &Row) -> DetailJson {
     DetailJson {
         session: row.id.clone(),
@@ -731,6 +736,7 @@ fn detail_json(row: &Row) -> DetailJson {
     }
 }
 
+/// Renders a row as a key/value block.
 fn render_detail(row: &Row) -> String {
     use std::fmt::Write;
     let dash = |v: Option<String>| v.unwrap_or_else(|| "-".to_string());
@@ -763,28 +769,31 @@ fn render_detail(row: &Row) -> String {
     out
 }
 
+/// A leftover tmux session can share a structured session's id, so match the
+/// instance's own substrate.
+fn pick_row(rows: Vec<Row>, id: &str, substrate: Substrate) -> Option<Row> {
+    rows.into_iter()
+        .find(|r| r.id == id && r.substrate == substrate)
+}
+
 /// The row for `identifier`, or a dead placeholder when the instance resolves
 /// but no live runtime does.
 fn detail_row(profile: &str, profile_explicit: bool, identifier: &str) -> Result<Row> {
     let mut instances = load_instances(profile, profile_explicit);
     let inst = super::resolve_session(identifier, &instances)?;
-    let (id, title, structured, tool) = (
-        inst.id.clone(),
-        inst.title.clone(),
-        inst.is_structured(),
-        inst.tool.clone(),
-    );
+    let substrate = if inst.is_structured() {
+        Substrate::Acp
+    } else {
+        Substrate::Tmux
+    };
+    let (id, title, tool) = (inst.id.clone(), inst.title.clone(), inst.tool.clone());
     let created = inst.created_at.timestamp().max(0) as u64;
 
     let rows = collect_rows(&mut instances, SubstrateFilter::All, true);
-    Ok(rows.into_iter().find(|r| r.id == id).unwrap_or(Row {
+    Ok(pick_row(rows, &id, substrate).unwrap_or(Row {
         id,
         title,
-        substrate: if structured {
-            Substrate::Acp
-        } else {
-            Substrate::Tmux
-        },
+        substrate,
         state: "dead",
         pid: None,
         age_secs: Some(now_secs().saturating_sub(created)),
@@ -1264,6 +1273,18 @@ mod tests {
         let v = serde_json::to_value(detail_json(&rows[1])).unwrap();
         assert_eq!(v["socket"], "/tmp/w.sock");
         assert_eq!(v["substrate"], "acp");
+    }
+
+    #[test]
+    fn pick_row_matches_the_instance_substrate_when_ids_collide() {
+        let mut tmux = row("acp-id-1", "A", false);
+        tmux.pid = Some(1);
+        let mut acp = row("acp-id-1", "A", false);
+        acp.substrate = Substrate::Acp;
+        acp.pid = Some(2);
+        let picked = pick_row(vec![tmux, acp], "acp-id-1", Substrate::Acp).unwrap();
+        assert_eq!(picked.pid, Some(2));
+        assert!(pick_row(vec![row("other", "", false)], "acp-id-1", Substrate::Acp).is_none());
     }
 
     #[test]
