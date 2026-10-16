@@ -3076,8 +3076,8 @@ fn same_named_groups_across_profiles_are_tagged_and_listed_once() {
         })
         .collect();
     let tagged = |tag: &str| labels.iter().filter(|l| l.contains(tag)).count();
-    assert_eq!(tagged("work (1) [alpha]"), 1, "{labels:?}");
-    assert_eq!(tagged("work (1) [beta]"), 1, "{labels:?}");
+    assert_eq!(tagged("[alpha] work (1)"), 1, "{labels:?}");
+    assert_eq!(tagged("[beta] work (1)"), 1, "{labels:?}");
     assert!(
         labels
             .iter()
