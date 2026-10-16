@@ -352,6 +352,8 @@ test.describe("Plugin pages (#4460)", () => {
     // A click back on the page dismisses the menu.
     await open();
     await expect(menu).toBeVisible();
+    // A raw click does not retry, so wait out the shield that swallows clicks just after opening.
+    await expect(page.getByTestId("plugin-session-menu-backdrop")).toHaveAttribute("data-armed", "true");
     await page.mouse.click(frameBox.x + frameBox.width - 20, frameBox.y + frameBox.height - 20);
     await expect(menu).toHaveCount(0);
   });

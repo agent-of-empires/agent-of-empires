@@ -37,12 +37,14 @@ describe("PluginSessionMenu", () => {
     const onClose = open({ items: [{ id: "move:done", label: "Move to Done" }] });
     expect(screen.getByTestId("sidebar-context-menu")).toBeTruthy();
     expect(backdrop().className).toContain("z-[60]");
+    expect(backdrop().dataset.armed).toBeUndefined();
     fireEvent.mouseDown(backdrop());
     fireEvent.contextMenu(backdrop());
     expect(screen.getByTestId("sidebar-context-menu")).toBeTruthy();
 
     arm();
     expect(backdrop().className).toContain("z-40");
+    expect(backdrop().dataset.armed).toBe("true");
     fireEvent.click(screen.getByRole("button", { name: "Move to Done" }));
     expect(screen.queryByTestId("sidebar-context-menu")).toBeNull();
     expect(onClose).toHaveBeenCalledExactlyOnceWith("move:done");

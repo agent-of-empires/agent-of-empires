@@ -110,6 +110,7 @@ function HostMenu({
             className={`fixed inset-0 ${armed ? "z-40" : "z-[60]"}`}
             aria-hidden="true"
             data-testid="plugin-session-menu-backdrop"
+            data-armed={armed || undefined}
             onMouseDown={() => armed && closeMenu()}
             onContextMenu={(e) => {
               e.preventDefault();
