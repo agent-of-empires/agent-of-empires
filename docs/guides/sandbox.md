@@ -60,6 +60,7 @@ environment = ["ANTHROPIC_API_KEY"]
 | `cap_add` / `cap_drop` | `[]` | Capabilities added or dropped |
 | `security_opt` | `[]` | Security options, e.g. `seccomp=unconfined` |
 | `extra_run_args` | `[]` | Extra arguments passed to container run, before the image |
+| `shared_credential` | `"host_seed"` | `"host_seed"` or `"separate_login"`: where the credential an agent shares across its sandboxes comes from (see [Shared credentials](#shared-credentials)); applies to every agent with a sandbox login, today Claude. `"separate_login"` is not supported with Apple Container. Global only |
 
 Docker and Podman honor every run-policy option. Apple Container honors `cap_add` / `cap_drop` and ignores `privileged` and `security_opt` with a warning; `extra_run_args` is passed through everywhere.
 
@@ -217,11 +218,15 @@ moved, so drop the variable or run `aoe migrate` before launching it.
 
 Claude Code rotates refresh tokens and invalidates the old token, so per-session credential copies would log each other out. All Claude sandboxes mount `sandbox-v2/.credentials.json`; login or refresh in one reaches all. Conversation stores remain private.
 
-When the shared file holds no credential, the next start or refresh seeds it from the freshest macOS Keychain entry, host `.credentials.json`, or earlier session-store copy. Once populated, the host never replaces it automatically; the sandboxes have their own refresh chain. Fresher sandbox credentials from an earlier layout are folded in at that session's next start.
+When the shared file holds no credential, the next start or refresh seeds it from the freshest macOS Keychain entry, host `.credentials.json`, or earlier session-store copy (in `host_seed` mode). Once populated, the host never replaces it automatically; the sandboxes have their own refresh chain. Fresher sandbox credentials from an earlier layout are folded in at that session's next start.
 
-Claude Code empties both tokens after failed authentication, making the shared file eligible for seeding again. Simultaneous refreshes can still conflict: the losing container may empty the shared file and lose the winner's new token.
+Claude Code empties both tokens after failed authentication, making the shared file eligible for seeding again (in `host_seed` mode). Simultaneous refreshes can still conflict: the losing container may empty the shared file and lose the winner's new token.
 
 To seed from a new host login, stop every Claude sandbox, delete only `sandbox-v2/.credentials.json`, and start one. Older containers are recreated when stopped; a running one must be stopped before relaunch. `/logout` in any sandbox revokes all sandboxes' tokens but cannot remove the mounted file; log in again to replace the revoked credential.
+
+The setting applies to every agent that declares a sandbox login; today that is Claude. A seeded file starts from the host's own token, so the first side to refresh logs the other out once. To keep the host login and the sandboxes fully apart, set `shared_credential = "separate_login"` under `[sandbox]`. The sandboxes then hold a different login than the host, so a host refresh can never invalidate the sandboxes and a sandbox refresh or logout can never invalidate the host. AoE never reads the host file or the Keychain, never copies a store copy into the shared file and never writes a credential into it; it only creates the file empty when it is absent. Log in once inside any Claude sandbox: the login lands in the shared file and every Claude sandbox uses it through the mount. A credential that fails to authenticate is still emptied for all sandboxes, and in this mode the file is not seeded again: log in again in a sandbox. `/logout` in a sandbox ends the sandbox login for all of them and never touches the host login.
+
+AoE leaves an existing file as it is, so an install that was seeded from the host keeps the host's token after the switch. To switch, stop the sandboxes, delete `sandbox-v2/.credentials.json`, set the option, start one sandbox and log in. The option is global only: a profile cannot override it, because every profile that uses the same Claude config directory shares the one file. Profiles with their own Claude directory via `session.agent_config_dir` have separate shared files, but still follow the one global value.
 
 ### Reclaiming stores
 

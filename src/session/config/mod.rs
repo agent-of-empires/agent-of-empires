@@ -2954,6 +2954,30 @@ pub struct SandboxConfig {
     )]
     pub custom_instruction: Option<String>,
 
+    /// Where the credential an agent's sandboxes share comes from. It applies
+    /// to every agent that declares a sandbox login (today Claude). Seed from
+    /// host login fills an empty shared file from the host's own login. That
+    /// copies the host's own token, so the first side to refresh logs the
+    /// other out once. Separate sandbox login never reads the host login and
+    /// leaves the file empty until you log in for the sandboxes. That is a
+    /// different login than the host's, so a host refresh can never
+    /// invalidate the sandboxes and a sandbox refresh or logout can never
+    /// invalidate the host. Separate sandbox login is not supported with
+    /// Apple Container, which cannot run the login helper: a launch that
+    /// needs the login fails there instead of waiting for it.
+    // Global-only: profiles sharing an agent config dir share one credential
+    // file, so one profile's value cannot be honored apart from another's.
+    #[serde(default)]
+    #[setting(
+        label = "Shared agent credential",
+        widget = "select",
+        options = "host_seed:Seed from host login,separate_login:Separate sandbox login",
+        web = "elevation:sandbox credential handling affects host login isolation",
+        repo = "deny",
+        global_only
+    )]
+    pub shared_credential: SharedCredentialMode,
+
     /// Container runtime for sandboxing.
     #[serde(default)]
     #[setting(
@@ -2974,6 +2998,15 @@ pub enum ContainerRuntimeName {
     #[default]
     Docker,
     Podman,
+}
+
+/// Where the credential an agent's sandboxes share comes from.
+#[derive(Serialize, Deserialize, Debug, Default, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SharedCredentialMode {
+    #[default]
+    HostSeed,
+    SeparateLogin,
 }
 
 /// Volume mounting strategy for volume_ignores paths.
@@ -3015,6 +3048,7 @@ impl Default for SandboxConfig {
             security_opt: Vec::new(),
             extra_run_args: Vec::new(),
             custom_instruction: None,
+            shared_credential: SharedCredentialMode::default(),
             container_runtime: ContainerRuntimeName::default(),
         }
     }
@@ -4445,6 +4479,61 @@ mod tests {
                 serde_json::to_string(&parsed).unwrap(),
                 format!("\"{value}\""),
                 "select option {value:?} must round-trip"
+            );
+        }
+    }
+
+    #[test]
+    fn shared_credential_is_an_elevated_repo_denied_select() {
+        let field = settings_schema::descriptor("sandbox", "shared_credential")
+            .expect("sandbox.shared_credential descriptor");
+        assert_eq!(field.label, "Shared agent credential");
+        assert!(!field.profile_overridable);
+        assert_eq!(
+            field.web_write,
+            settings_schema::WebWritePolicy::RequiresElevation {
+                reason: "sandbox credential handling affects host login isolation".to_string()
+            }
+        );
+        let settings_schema::WidgetKind::Select { options } = &field.widget else {
+            panic!("shared_credential must render as a select");
+        };
+        let options: Vec<(&str, &str)> = options
+            .iter()
+            .map(|o| (o.value.as_str(), o.label.as_str()))
+            .collect();
+        assert_eq!(
+            options,
+            [
+                ("host_seed", "Seed from host login"),
+                ("separate_login", "Separate sandbox login")
+            ]
+        );
+
+        // (config.toml, parsed)
+        for (toml_src, expected) in [
+            ("", Some(SharedCredentialMode::HostSeed)),
+            (
+                "shared_credential = \"host_seed\"",
+                Some(SharedCredentialMode::HostSeed),
+            ),
+            (
+                "shared_credential = \"separate_login\"",
+                Some(SharedCredentialMode::SeparateLogin),
+            ),
+            ("shared_credential = \"keychain\"", None),
+        ] {
+            let parsed = toml::from_str::<Config>(&format!("[sandbox]\n{toml_src}"))
+                .ok()
+                .map(|config| config.sandbox.shared_credential);
+            assert_eq!(parsed, expected, "{toml_src:?}");
+            let Some(mode) = parsed else { continue };
+            let mut config = Config::default();
+            config.sandbox.shared_credential = mode;
+            let round_tripped: Config = toml::from_str(&toml::to_string(&config).unwrap()).unwrap();
+            assert_eq!(
+                round_tripped.sandbox.shared_credential, mode,
+                "{toml_src:?}"
             );
         }
     }
