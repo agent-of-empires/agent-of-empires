@@ -30,7 +30,14 @@ pub(crate) fn open_repo_at(path: &Path) -> std::result::Result<git2::Repository,
 }
 
 /// An existing directory that is not itself a Repository. Like `open_repo_at`
-/// this never searches parents, so a subdirectory of a Repository counts.
+/// this never searches parents, so a subdirectory of a Repository counts. Git
+/// metadata that exists but cannot be read or opened is not evidence of absence.
 pub(crate) fn is_outside_repository(path: &Path) -> bool {
-    path.is_dir() && !GitWorktree::is_git_repo(path)
+    let no_git_entry = matches!(
+        std::fs::symlink_metadata(path.join(".git")),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound
+    );
+    path.is_dir()
+        && no_git_entry
+        && matches!(open_repo_at(path), Err(e) if e.code() == git2::ErrorCode::NotFound)
 }

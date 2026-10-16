@@ -1498,6 +1498,20 @@ async fn session_diff_files_flags_a_working_directory_outside_any_repository() {
     let (repo, _repo) = crate::git::test_support::init_repo();
     let subdir = repo.path().join("pkg");
     std::fs::create_dir(&subdir).unwrap();
+    let broken_worktree = plain.path().join("broken-worktree");
+    std::fs::create_dir(&broken_worktree).unwrap();
+    std::fs::write(
+        broken_worktree.join(".git"),
+        "gitdir: /nonexistent/repo/.git/worktrees/w\n",
+    )
+    .unwrap();
+    let (unreadable, _unreadable_repo) = crate::git::test_support::init_repo();
+    let unreadable_git = unreadable.path().join(".git");
+    let set_mode = |mode| {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&unreadable_git, std::fs::Permissions::from_mode(mode)).unwrap();
+    };
+    set_mode(0o000);
     let cases = [
         // (label, Working directory, outside a Repository)
         ("plain dir", plain.path().to_path_buf(), true),
@@ -1505,6 +1519,13 @@ async fn session_diff_files_flags_a_working_directory_outside_any_repository() {
         ("subdir of a repository", subdir, true),
         ("repository root", repo.path().to_path_buf(), false),
         ("missing dir", plain.path().join("gone"), false),
+        // Git metadata that exists but cannot be opened is not evidence of no Repository.
+        (
+            "linked worktree with a missing gitdir",
+            broken_worktree,
+            false,
+        ),
+        ("unreadable .git", unreadable.path().to_path_buf(), false),
     ];
     let instances: Vec<Instance> = cases
         .iter()
@@ -1533,6 +1554,7 @@ async fn session_diff_files_flags_a_working_directory_outside_any_repository() {
             );
         }
     }
+    set_mode(0o755);
 }
 
 /// #4574: the Web dashboard skips Diff auto-open for a Session outside any
