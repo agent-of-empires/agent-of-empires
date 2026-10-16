@@ -4,6 +4,7 @@ prompt_marker = ['^\s*╭[─-]*\s+\S']
 [markers.composer_top]
 line_regex = ['^\s*╭[─-]*\s+\S']
 
+
 [markers.selector_footer]
 line_regex = ['(?i)^\s*[│|].*(?:navigate|scroll|select|confirm|open).*(?:esc|⎋|cancel).*[│|]\s*$']
 max_depth = 12
@@ -242,7 +243,8 @@ id = "tool_approval"
 state = "waiting"
 priority = 970
 positional = true
-region = "bottom_non_empty_lines(16)"
+region = "bottom_non_empty_lines(40)"
+max_position = 24
 wrap = 12
 visible = true
 contains = ["Allow tool:", "approve", "deny"]

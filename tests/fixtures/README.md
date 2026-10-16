@@ -52,6 +52,9 @@ capture while the approval prompt is visible. To capture expanded details,
 ask OMP for a harmless command with a long argument, press `Ctrl+O` in the
 pane, then capture the expanded approval:
 
+To test a wrapped composer, type an unsent steering draft while the approval is
+pending and capture before submitting or approving it.
+
 ```sh
 ./scripts/capture-fixtures.sh omp waiting_permission <custom-tmux-session> tool_approval_custom
 ./scripts/capture-fixtures.sh omp waiting_permission <compact-tmux-session> tool_approval_compact

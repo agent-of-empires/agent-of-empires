@@ -132,12 +132,60 @@ mod tests {
     }
 
     #[test]
-    fn omp_docked_tool_approval_is_waiting() {
-        let screen =
-            "Allow tool: bash\nCommand: printf approval-1\nCtrl+Enter / Ctrl+Q approve · Esc deny";
-        let detection = detect("omp", screen, "", None).expect("OMP manifest");
+    fn omp_docked_tool_approval_is_waiting_with_wrapped_composer() {
+        let screen = [
+            "Earlier command was denied; it will not be retried.",
+            "Plan:",
+            "1. Verify the command.",
+            "╭─── ☑ Todo 5 tasks ─────────────────────────────────────╮",
+            "│ ├─ ☑ Verify the command.                               │",
+            "╰────────────────────────────────────────────────────────╯",
+            "* Run printf with a long fixed argument.",
+            "⎋ Running requested printf command",
+            "╭─ Allow tool: bash ──────────────────────────────────────╮",
+            "│ Command: printf approval-1                              │",
+            "├─────────────────────────────────────────────────────────┤",
+            "│ ⌃⏎/⌃Q approve · ⎋ deny · ⌃O less                       │",
+            "╰─────────────────────────────────────────────────────────╯",
+            "draft line one",
+            "draft line two",
+            "draft line three",
+            "draft line four",
+            "draft line five",
+            "draft line six",
+            "draft line seven",
+            "draft line eight",
+            "draft line nine",
+            "draft line ten",
+            "draft line eleven",
+            "draft line twelve",
+            "draft line thirteen",
+            "draft line fourteen",
+            "draft line fifteen",
+            "draft line sixteen",
+            "draft line seventeen",
+            "draft line eighteen",
+            "╭── GPT-6.1-Sol > Prewalk ────────────────────────────────╮",
+            "╰─────────────────────────────────────────────────────────╯",
+        ]
+        .join("\n");
+        let detection = detect("omp", &screen, "", None).expect("OMP manifest");
 
         assert_eq!(detection.status, Some(Status::Waiting));
         assert_eq!(detection.rule, "tool_approval");
+    }
+
+    #[test]
+    fn omp_stale_approval_outside_bounded_live_area_is_not_waiting() {
+        let mut lines = vec![
+            "╭─ Allow tool: bash ──────────────────────────────────────╮".to_string(),
+            "│ Command: printf approval-1                              │".to_string(),
+            "│ ⌃⏎/⌃Q approve · ⎋ deny                                 │".to_string(),
+        ];
+        lines.extend((0..37).map(|line| format!("new prompt content {line}")));
+        let screen = lines.join("\n");
+        let detection = detect("omp", &screen, "", None).expect("OMP manifest");
+
+        assert_ne!(detection.status, Some(Status::Waiting));
     }
 }
