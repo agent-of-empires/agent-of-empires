@@ -264,7 +264,9 @@ describe("subagents", () => {
         child("b", "task-1"),
       ]);
       expect(msgs).toHaveLength(2);
-      expect(names(msgs[0]!.content as Part[])).toEqual([SUBAGENT_TASK_NAME]);
+      const parts = msgs[0]!.content as Part[];
+      expect(names(parts)).toEqual([SUBAGENT_TASK_NAME]);
+      expect(payload(parts[0]!)).toMatchObject({ async: true, children: [], parent: { toolCallId: "task-1" } });
       expect(msgs[1]!.content).toEqual([{ type: "text", text: "Next." }]);
     });
 
