@@ -12,6 +12,8 @@ test("arrow keys move focus through the session list and Enter opens the focused
   const rows = page.getByTestId("sidebar-session-row");
   await expect(rows).toHaveCount(3);
   await rows.nth(0).focus();
+  await page.keyboard.press("ArrowUp");
+  await expect(rows.nth(0)).toBeFocused();
 
   await page.keyboard.press("ArrowDown");
   await expect(rows.nth(1)).toBeFocused();
