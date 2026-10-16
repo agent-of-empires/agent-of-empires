@@ -269,9 +269,10 @@ describe("subagents", () => {
     });
 
     it("folds sync children into the parent card in the earlier message", () => {
-      const msgs = assistants([task(), answered, child("a", "task-1"), done("a")]);
+      const msgs = assistants([task(), answered, child("a", "task-1"), done("a"), done("task-1")]);
       expect(msgs).toHaveLength(1);
       const p = payload((msgs[0]!.content as Part[])[0]!);
+      expect(p.parent).toMatchObject({ toolCallId: "task-1", result: { content: "out-task-1" } });
       expect(p.children).toMatchObject([{ toolCallId: "a", result: { content: "out-a" } }]);
     });
 

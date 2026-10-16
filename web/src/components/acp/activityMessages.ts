@@ -63,7 +63,6 @@ export function activityToThreadMessages(
   const messages: (ThreadMessageLike | AssistantBuilder)[] = [];
   let currentAssistant: AssistantBuilder | null = null;
   const builderByToolId = new Map<string, AssistantBuilder>();
-  const childBuilder = new Map<string, AssistantBuilder>();
   const flushAssistant = () => {
     if (!currentAssistant) return;
     messages.push(currentAssistant);
@@ -134,13 +133,12 @@ export function activityToThreadMessages(
 
     if (row.kind === "tool_start" && row.tool) {
       const parentBuilder = builderByToolId.get(row.tool.parent_tool_call_id ?? "");
-      if (parentBuilder) childBuilder.set(row.tool.id, parentBuilder);
       const builder = parentBuilder ?? (currentAssistant ??= new AssistantBuilder(row.id, row.at));
       builder.appendToolCall(row.tool, !!parentBuilder);
       builderByToolId.set(row.tool.id, builder);
     } else if (row.kind === "tool_complete" || row.kind === "tool_error" || row.kind === "tool_stopped") {
       const toolCallId = row.toolCallId ?? row.id.replace(/^(done|stopped)-/, "");
-      const builder = childBuilder.get(toolCallId) ?? (currentAssistant ??= new AssistantBuilder(row.id, row.at));
+      const builder = builderByToolId.get(toolCallId) ?? (currentAssistant ??= new AssistantBuilder(row.id, row.at));
       builder.completeToolCall(
         toolCallId,
         row.kind === "tool_error",
