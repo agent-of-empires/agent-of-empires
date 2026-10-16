@@ -1,4 +1,4 @@
-import { test, expect } from "./helpers/mockedTest";
+import { test, expect, observeFor } from "./helpers/mockedTest";
 import { mockTerminalApis } from "./helpers/terminal-mocks";
 import { clickSidebarSession } from "./helpers/sidebar";
 import {
@@ -98,11 +98,14 @@ test.describe("Desktop live terminal input", () => {
     const beforeGutter = handle.liveMessages.length;
     await page.mouse.click(frame.x + g.frameWidth + 1, first.y + first.height / 2);
     await expect(pane).toHaveAttribute("data-pane-focused", "true");
-    expect(
-      liveTexts(handle)
-        .slice(beforeGutter)
-        .some((s) => /\x1b(\[<|\[M)/.test(s)),
-    ).toBe(false);
+    // Socket messages land asynchronously, so hold the window open before ruling out a forwarded click.
+    await observeFor(page, 300, async () => {
+      expect(
+        liveTexts(handle)
+          .slice(beforeGutter)
+          .some((s) => /\x1b(\[<|\[M)/.test(s)),
+      ).toBe(false);
+    });
     // Late in cell 0, where a pane-relative origin would already read column 2.
     await page.mouse.click(box.x + g.cell * 0.9, first.y + first.height / 2);
     await expect.poll(() => liveMatches(handle, /\x1b\[<0;1;1M/)).toBe(true);
