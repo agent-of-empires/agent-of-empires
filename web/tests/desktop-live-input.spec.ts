@@ -1,6 +1,14 @@
 import { test, expect } from "./helpers/mockedTest";
 import { mockTerminalApis } from "./helpers/terminal-mocks";
 import { clickSidebarSession } from "./helpers/sidebar";
+import {
+  expectScrollMode,
+  gridGeometry,
+  lastResizeCols,
+  liveMatches,
+  openLiveTerminal,
+  scroller as liveScroller,
+} from "./helpers/liveTerminal";
 
 // #2115: clicking the non-focusable rendered pane must refocus the hidden input so typing reaches the pane.
 test.describe("Desktop live terminal input", () => {
@@ -44,6 +52,46 @@ test.describe("Desktop live terminal input", () => {
 
     await input.blur();
     await expect(pane).not.toHaveAttribute("data-pane-focused", "true");
+  });
+
+  // #4575: the pane frame is drawn over the pane's edge, so the grid sits inside a gutter rather than under it.
+  test("the grid clears the 1px pane frame and column 0 still selects and forwards", async ({ page }) => {
+    const handle = await openLiveTerminal(page);
+    await page.locator("[data-live-terminal]").first().click();
+    await expect(page.locator('[data-term="agent"]').first()).toHaveAttribute("data-pane-focused", "true");
+    const g = await gridGeometry(page);
+    expect(g.frameWidth).toBe(1);
+    for (const inset of [g.left, g.right]) {
+      expect(inset).toBeGreaterThanOrEqual(4);
+      expect(inset).toBeLessThanOrEqual(6);
+    }
+    await expect.poll(() => lastResizeCols(handle)).toBe(Math.floor(g.gridWidth / g.cell));
+    const box = (await liveScroller(page).boundingBox())!;
+
+    await handle.pushLiveFrame({ content: "alpha beta\n", rows: 24, history: 0, cursor: null });
+    const alpha = (await page.getByText("alpha beta", { exact: true }).boundingBox())!;
+    const y = alpha.y + alpha.height / 2;
+    await page.mouse.move(box.x + g.cell * 0.2, y);
+    await page.mouse.down();
+    await page.mouse.move(box.x + g.cell * 5.2, y, { steps: 4 });
+    await page.mouse.up();
+    expect(await page.evaluate(() => window.getSelection()?.toString())).toBe("alpha");
+    await page.evaluate(() => window.getSelection()?.removeAllRanges());
+
+    await handle.pushLiveFrame({
+      content: ["first", ...Array<string>(23).fill("")].join("\n") + "\n",
+      rows: 24,
+      history: 0,
+      cursor: null,
+      altScreen: true,
+      mouse: true,
+      mouseSgr: true,
+    });
+    await expectScrollMode(page, "forward");
+    const first = (await page.getByText("first", { exact: true }).boundingBox())!;
+    // Late in cell 0, where a pane-relative origin would already read column 2.
+    await page.mouse.click(box.x + g.cell * 0.9, first.y + first.height / 2);
+    await expect.poll(() => liveMatches(handle, /\x1b\[<0;1;1M/)).toBe(true);
   });
 
   test("Ctrl+Shift+C copies the selection without ^C, and Ctrl+V pastes through tmux without ^V", async ({ page }) => {
