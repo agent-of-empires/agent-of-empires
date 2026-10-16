@@ -312,6 +312,11 @@ async fn run(
     let profile_explicit = cli.profile.is_some();
     let profile = cli.profile.unwrap_or_default();
 
+    let serve_lock = match &cli.command {
+        Some(Commands::Serve(args)) => cli::serve::lock_for_startup(args)?,
+        _ => None,
+    };
+
     if cli.command.is_some() {
         let reporter = cli
             .command
@@ -359,7 +364,7 @@ async fn run(
         // After migrations: enable/disable rewrite config.toml through the
         // current schema, which drops any key a pending migration would carry.
         Some(Commands::Telemetry { command }) => cli::telemetry::run(command),
-        Some(Commands::Serve(args)) => cli::serve::run(&profile, args).await,
+        Some(Commands::Serve(args)) => cli::serve::run(&profile, args, serve_lock).await,
         Some(Commands::Url(args)) => cli::url::run(args),
         Some(Commands::Sandbox { command }) => cli::sandbox::run(command),
         // Runs after migrations, which run for every command: `approve` writes
