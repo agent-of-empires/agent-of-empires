@@ -119,23 +119,28 @@ interface Snapshot {
 const INITIAL: Snapshot = { state: { kind: "loading" }, health: "unknown" };
 
 // One store shared by every mounted consumer, so the banner and the settings
-// panel converge without a remount. It resets when the last consumer unmounts.
+// panel converge without a remount. It resets when the last consumer unmounts,
+// or when the action running at that moment settles.
 let snapshot = INITIAL;
 const listeners = new Set<() => void>();
 // A refresh must not run over an action in flight, and actions do not overlap.
 let busy = false;
 // Bumped by every refresh and action; writes from an older generation are dropped.
 let generation = 0;
+// A refresh's re-registration POST; actions wait for it so it cannot land after them.
+let registration: Promise<unknown> = Promise.resolve();
+
+function reset() {
+  generation++;
+  busy = false;
+  snapshot = INITIAL;
+}
 
 function subscribe(listener: () => void) {
   listeners.add(listener);
   return () => {
     listeners.delete(listener);
-    if (listeners.size === 0) {
-      generation++;
-      busy = false;
-      snapshot = INITIAL;
-    }
+    if (listeners.size === 0 && !busy) reset();
   };
 }
 
@@ -179,8 +184,9 @@ async function refresh() {
     });
     // Re-binds the sub to the current token (#3386) or restores one the server dropped.
     if (sub && perm === "granted" && (next === "server-forgot" || (next === "healthy" && !status.subscription))) {
-      const resp = await postPush("subscribe", subscribeBody(sub)).catch(() => null);
-      if (resp?.ok) next = "healthy";
+      const post = postPush("subscribe", subscribeBody(sub)).catch(() => null);
+      registration = post;
+      if ((await post)?.ok) next = "healthy";
     }
     if (perm === "denied") publish(gen, { health: next, state: { kind: "denied" } });
     else publish(gen, { health: next, state: perm === "granted" && sub ? { kind: "enabled" } : { kind: "off" } });
@@ -197,7 +203,9 @@ function beginAction(): number | null {
 }
 
 function endAction(gen: number) {
-  if (gen === generation) busy = false;
+  if (gen !== generation) return;
+  busy = false;
+  if (listeners.size === 0) reset();
 }
 
 // Also the repair path: iOS only allows requestPermission and a first subscribe inside a
@@ -215,6 +223,7 @@ async function enable() {
         state: iosTab() ? { kind: "unsupported", reason: "ios-not-standalone" } : { kind: "denied" },
       });
     }
+    await registration;
     publish(gen, { state: { kind: "subscribing" } });
     const vapidResp = await fetch("/api/push/vapid-public-key");
     if (!vapidResp.ok) {
@@ -267,6 +276,7 @@ async function disable() {
   writePushWanted(false);
   publish(gen, { health: "not-wanted", state: { kind: "disabling" } });
   try {
+    await registration;
     const sub = await currentSubscription();
     if (sub) {
       const endpoint = sub.endpoint;
@@ -286,6 +296,7 @@ async function sendTest() {
   if (gen === null) return;
   publish(gen, { state: { kind: "sending-test" } });
   try {
+    await registration;
     const sub = await currentSubscription();
     if (!sub) return publish(gen, { state: { kind: "error", message: "No active subscription" } });
     const resp = await postPush("test", { endpoint: sub.endpoint });
