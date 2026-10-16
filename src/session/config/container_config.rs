@@ -11,7 +11,7 @@ use anyhow::{Context, Result};
 
 use crate::containers::{ContainerConfig, EnvEntry, NamedVolumeMount, RunPolicy, VolumeMount};
 use crate::git::GitWorktree;
-use crate::session::config::VolumeIgnoresStrategy;
+use crate::session::config::{SharedCredentialMode, VolumeIgnoresStrategy};
 
 use crate::hooks::SymlinkPolicy;
 use crate::session::environment::collect_environment;
@@ -725,7 +725,8 @@ fn read_credential_candidate(dir: &Path, name: &str, follow: SymlinkPolicy) -> O
 /// Which candidates a fold may put over a credential the shared file holds.
 /// The host file and the Keychain only ever seed a file holding none: a token
 /// copied from the host is the host's own refresh token, and the first side
-/// to refresh would log the other out.
+/// to refresh would log the other out. A caller that prepares a store applies
+/// [`CredentialFold::under`] with the configured `sandbox.shared_credential`.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum CredentialFold {
     /// A come-up, create or start: a fresher copy left in the store by an
@@ -734,6 +735,20 @@ pub(crate) enum CredentialFold {
     Freshest,
     /// Off a come-up: nothing replaces what the file holds.
     SeedOnly,
+    /// `sandbox.shared_credential = "separate_login"`: only a login made in
+    /// the sandboxes fills the file. No candidate is read, and an absent file is
+    /// created empty.
+    SeparateLogin,
+}
+
+impl CredentialFold {
+    /// The fold `mode` leaves. An agent without a shared credential file is unaffected.
+    pub(crate) fn under(self, mode: SharedCredentialMode) -> Self {
+        match mode {
+            SharedCredentialMode::HostSeed => self,
+            SharedCredentialMode::SeparateLogin => Self::SeparateLogin,
+        }
+    }
 }
 
 /// Whether `content` carries a credential a container could use.
@@ -755,7 +770,7 @@ fn holds_credential(content: &str) -> bool {
 /// `claudeAiOauth` replaces the file's, so what the agent keeps beside it
 /// survives. The file is written in place: a rename would leave every running
 /// container's bind mount on the old inode. An absent file is created
-/// empty-but-valid so the mount has a source; the agent's own login fills it.
+/// empty-but-valid so the mount has a source; the agent's login fills it.
 fn sync_shared_credential(
     mount: &AgentConfigMount,
     host_dir: &Path,
@@ -770,25 +785,14 @@ fn sync_shared_credential(
         return Ok(None);
     };
     std::fs::create_dir_all(root)?;
-
-    // Each candidate with whether it is a sandbox chain of its own.
-    let mut candidates = Vec::new();
-    candidates.extend(
-        read_credential_candidate(sandbox_dir, name, SymlinkPolicy::Never).map(|c| (c, true)),
+    let candidates = credential_candidates(
+        mount,
+        host_dir,
+        sandbox_dir,
+        name,
+        fold,
+        read_keychain_credential,
     );
-    candidates.extend(
-        read_credential_candidate(host_dir, name, SymlinkPolicy::Follow).map(|c| (c, false)),
-    );
-    if let Some((service, _)) = mount
-        .keychain_credential
-        .filter(|(_, filename)| *filename == name)
-    {
-        match read_keychain_credential(service) {
-            Ok(content) => candidates.extend(content.map(|c| (c, false))),
-            Err(e) => tracing::warn!(target: "session.profile",
-                "Failed to read keychain credential for {}: {}", mount.host_rel, e),
-        }
-    }
 
     // The candidates are gathered outside the lock (the Keychain read is a
     // subprocess); the file is read again under it, right before the write,
@@ -815,6 +819,39 @@ fn sync_shared_credential(
         }
     })?;
     Ok(Some(shared))
+}
+
+/// Each candidate `fold` lets [`sync_shared_credential`] read, with whether it
+/// is a sandbox chain of its own.
+fn credential_candidates(
+    mount: &AgentConfigMount,
+    host_dir: &Path,
+    sandbox_dir: &Path,
+    name: &str,
+    fold: CredentialFold,
+    read_keychain: impl FnOnce(&str) -> Result<Option<String>>,
+) -> Vec<(String, bool)> {
+    let mut candidates = Vec::new();
+    if fold == CredentialFold::SeparateLogin {
+        return candidates;
+    }
+    candidates.extend(
+        read_credential_candidate(sandbox_dir, name, SymlinkPolicy::Never).map(|c| (c, true)),
+    );
+    candidates.extend(
+        read_credential_candidate(host_dir, name, SymlinkPolicy::Follow).map(|c| (c, false)),
+    );
+    if let Some((service, _)) = mount
+        .keychain_credential
+        .filter(|(_, filename)| *filename == name)
+    {
+        match read_keychain(service) {
+            Ok(content) => candidates.extend(content.map(|c| (c, false))),
+            Err(e) => tracing::warn!(target: "session.profile",
+                "Failed to read keychain credential for {}: {}", mount.host_rel, e),
+        }
+    }
+    candidates
 }
 
 /// `winner` with everything `existing` held beside `claudeAiOauth` kept, so a
@@ -868,7 +905,7 @@ pub(crate) fn place_shadowed_credential_mountpoints(config: &ContainerConfig) {
         };
         // Only a store beside the shared file holds a shadowed copy. A user
         // extra_volumes entry at the config path replaces the store mount, and
-        // the credential under it is the user's own login.
+        // the credential under it is the user's login.
         if Path::new(&store.host_path).parent() != Path::new(&shared.host_path).parent() {
             continue;
         }
@@ -1941,6 +1978,7 @@ pub(crate) fn refresh_agent_configs_for_instance<'a>(
         return;
     };
     let declared = profile_config.session.agent_config_dir_for(tool, &home);
+    let fold = fold.under(profile_config.sandbox.shared_credential);
     for mount in AGENT_CONFIG_MOUNTS
         .iter()
         .filter(|mount| mount.tool_name == agent.name)
@@ -2705,6 +2743,10 @@ pub(crate) fn build_container_config(
         profile_config,
         Path::new(&workspace_path),
     )?;
+    // Global-only and read without the repo merge.
+    let credential_fold = agent_selection
+        .credential_fold
+        .under(profile_config.sandbox.shared_credential);
     for mount in AGENT_CONFIG_MOUNTS
         .iter()
         .filter(|m| m.tool_name == config_tool)
@@ -2717,7 +2759,7 @@ pub(crate) fn build_container_config(
                 directory.clone(),
                 directory.join(SANDBOX_PRIVATE_SUBDIR).join(instance_id),
                 &home,
-                agent_selection.credential_fold,
+                credential_fold,
                 auto_propagate,
                 profile_session_config,
                 Path::new(&workspace_path),
@@ -2726,7 +2768,7 @@ pub(crate) fn build_container_config(
                 mount,
                 &home,
                 Some(instance_id),
-                agent_selection.credential_fold,
+                credential_fold,
                 auto_propagate,
                 profile_session_config,
                 Path::new(&workspace_path),
@@ -4898,6 +4940,225 @@ mod tests {
 
     #[test]
     #[serial_test::serial]
+    fn separate_login_never_folds_a_candidate_into_the_shared_file() {
+        let (_hook_guard, _, _application) = BaseGuard::ready();
+        let home = TempDir::new().unwrap();
+        let host = home.path().join(".claude");
+        let mount = claude_mount_without_keychain();
+        let root = host.join(SANDBOX_PRIVATE_SUBDIR);
+        let store = root.join("aaaaaaaaaaaaaaaa");
+        let shared = root.join(".credentials.json");
+        let private = store.join(".credentials.json");
+        fs::create_dir_all(&store).unwrap();
+        // Written in an order and spacing a re-serializing merge would change.
+        let held = format!(
+            "{{ \"designOauth\": {{\"k\": \"v\"}}, \"claudeAiOauth\": {} }}\n",
+            r#"{"refreshToken":"refresh-a","accessToken":"access-a","expiresAt":1000}"#
+        );
+        // (case, shared file before, expected after)
+        let cases = [
+            ("never seeds from the host", None, "{}".to_string()),
+            (
+                "leaves a blanked file blank",
+                Some(blanked_credential(900)),
+                blanked_credential(900),
+            ),
+            (
+                "leaves an existing credential untouched",
+                Some(held.clone()),
+                held,
+            ),
+        ];
+        for (case, before, expected) in cases {
+            for fold in [CredentialFold::Freshest, CredentialFold::SeedOnly] {
+                fs::write(host.join(".credentials.json"), credential(5000)).unwrap();
+                fs::write(&private, credential(4000)).unwrap();
+                match &before {
+                    Some(content) => fs::write(&shared, content).unwrap(),
+                    None => {
+                        let _ = fs::remove_file(&shared);
+                    }
+                }
+                prepare_owned_fixture_from(
+                    &mount,
+                    host.clone(),
+                    store.clone(),
+                    home.path(),
+                    fold.under(SharedCredentialMode::SeparateLogin),
+                    &crate::session::config::SessionConfig::default(),
+                    home.path(),
+                )
+                .unwrap();
+                assert_eq!(
+                    fs::read_to_string(&shared).unwrap(),
+                    expected,
+                    "{case} ({fold:?})"
+                );
+            }
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn host_seed_is_the_default_and_still_seeds_from_the_host() {
+        let (_hook_guard, _, _application) = BaseGuard::ready();
+        let default_mode = crate::session::config::SandboxConfig::default().shared_credential;
+        assert_eq!(default_mode, SharedCredentialMode::HostSeed);
+        let home = TempDir::new().unwrap();
+        let host = home.path().join(".claude");
+        let mount = claude_mount_without_keychain();
+        let root = host.join(SANDBOX_PRIVATE_SUBDIR);
+        let store = root.join("aaaaaaaaaaaaaaaa");
+        let shared = root.join(".credentials.json");
+        fs::create_dir_all(&store).unwrap();
+        fs::write(host.join(".credentials.json"), credential(100)).unwrap();
+        for fold in [CredentialFold::Freshest, CredentialFold::SeedOnly] {
+            assert_eq!(fold.under(default_mode), fold);
+            fs::write(&shared, blanked_credential(900)).unwrap();
+            prepare_owned_fixture_from(
+                &mount,
+                host.clone(),
+                store.clone(),
+                home.path(),
+                fold.under(default_mode),
+                &crate::session::config::SessionConfig::default(),
+                home.path(),
+            )
+            .unwrap();
+            assert_eq!(
+                fs::read_to_string(&shared).unwrap(),
+                credential(100),
+                "{fold:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn separate_login_never_reads_the_keychain_or_a_candidate_file() {
+        let home = TempDir::new().unwrap();
+        let host = home.path().join(".claude");
+        let store = host.join(SANDBOX_PRIVATE_SUBDIR).join("aaaaaaaaaaaaaaaa");
+        fs::create_dir_all(&store).unwrap();
+        fs::write(host.join(".credentials.json"), credential(5000)).unwrap();
+        fs::write(store.join(".credentials.json"), credential(4000)).unwrap();
+        let mount = AGENT_CONFIG_MOUNTS
+            .iter()
+            .find(|mount| mount.tool_name == "claude")
+            .unwrap();
+        assert!(mount.keychain_credential.is_some());
+        // (fold, Keychain read expected, candidates expected)
+        for (fold, keychain_read, candidates) in [
+            (
+                CredentialFold::Freshest.under(SharedCredentialMode::SeparateLogin),
+                false,
+                0,
+            ),
+            (
+                CredentialFold::SeedOnly.under(SharedCredentialMode::SeparateLogin),
+                false,
+                0,
+            ),
+            (CredentialFold::Freshest, true, 3),
+            (CredentialFold::SeedOnly, true, 3),
+        ] {
+            let read = std::cell::Cell::new(false);
+            let gathered =
+                credential_candidates(mount, &host, &store, ".credentials.json", fold, |_| {
+                    read.set(true);
+                    Ok(Some(credential(3000)))
+                });
+            assert_eq!(read.get(), keychain_read, "{fold:?}");
+            assert_eq!(gathered.len(), candidates, "{fold:?}");
+        }
+    }
+
+    /// Both production paths, a come-up and the status poll, take the global
+    /// mode; neither a profile nor a repo config can switch it back.
+    #[test]
+    #[serial_test::serial]
+    fn separate_login_reaches_the_come_up_and_the_poll() {
+        let (_hg, _, _tmp_base) = BaseGuard::ready();
+        let temp_home = TempDir::new().unwrap();
+        let _home_guard = crate::session::test_support::isolate_home(temp_home.path());
+        let host = temp_home.path().join(".claude");
+        fs::create_dir_all(&host).unwrap();
+        fs::write(host.join(".credentials.json"), credential(now_ms() + 1000)).unwrap();
+        crate::session::config::update_config(|config| {
+            config.sandbox.shared_credential = SharedCredentialMode::SeparateLogin;
+        })
+        .unwrap();
+        let profile = crate::session::config::effective_profile("");
+        crate::session::config::profile_config::save_profile_config(
+            &profile,
+            &serde_json::from_value(
+                serde_json::json!({"sandbox": {"shared_credential": "host_seed"}}),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let project_dir = TempDir::new().unwrap();
+        let repo_config = project_dir.path().join(".agent-of-empires");
+        fs::create_dir_all(&repo_config).unwrap();
+        fs::write(
+            repo_config.join("config.toml"),
+            "[sandbox]\nshared_credential = \"host_seed\"\n",
+        )
+        .unwrap();
+        git2::Repository::init(project_dir.path()).unwrap();
+        let sandbox_info = crate::session::instance::SandboxInfo {
+            provider: None,
+            enabled: true,
+            container_id: None,
+            image: "test:latest".to_string(),
+            container_name: "test-container".to_string(),
+            extra_env: None,
+            custom_instruction: None,
+            before_start_env: Vec::new(),
+            before_start_hook_env: Vec::new(),
+            container_workdir: None,
+        };
+        let instance_id = "separate-login-a";
+        let store = host.join(SANDBOX_PRIVATE_SUBDIR).join(instance_id);
+        fs::create_dir_all(&store).unwrap();
+        certify_fixture_content(&store, ".claude").unwrap();
+        let shared = host.join(SANDBOX_PRIVATE_SUBDIR).join(".credentials.json");
+        let come_up = || {
+            build_container_config(
+                project_dir.path().to_str().unwrap(),
+                &sandbox_info,
+                ContainerAgentSelection::new("claude", None),
+                SandboxYolo::default(),
+                instance_id,
+                None,
+                "",
+            )
+            .unwrap();
+        };
+        let poll = || {
+            refresh_agent_configs_for_instance(
+                &crate::session::config::profile_config::resolve_config_or_warn(&profile),
+                instance_id,
+                "claude",
+                None,
+                CredentialFold::SeedOnly,
+                project_dir.path(),
+            );
+        };
+
+        come_up();
+        assert_eq!(fs::read_to_string(&shared).unwrap(), "{}");
+        fs::write(&shared, blanked_credential(900)).unwrap();
+        poll();
+        come_up();
+        assert_eq!(
+            fs::read_to_string(&shared).unwrap(),
+            blanked_credential(900)
+        );
+        crate::hooks::cleanup_hook_status_dir(instance_id);
+    }
+
+    #[test]
+    #[serial_test::serial]
     fn claude_sandboxes_share_one_credential_mount() {
         let (_hg, _, _tmp_base) = BaseGuard::ready();
         let temp_home = TempDir::new().unwrap();
@@ -4991,7 +5252,7 @@ mod tests {
             ..Default::default()
         };
         // A user extra_volumes entry at the config path replaces the store
-        // mount; its host copy is the user's own login, not a shadowed one.
+        // mount; its host copy is the user's login, not a shadowed one.
         for (dir, emptied) in [(&store, true), (&host, false)] {
             let copy = dir.join(".credentials.json");
             fs::write(&copy, credential(1)).unwrap();
