@@ -28,6 +28,7 @@ let cachedSettingsAt = 0;
 const SETTINGS_TTL_MS = 30_000;
 
 const soundUrls = new Map<string, string>();
+const pendingSoundUrls = new Map<string, Promise<string | null>>();
 let availableSounds: string[] | null = null;
 
 // Bumped on every clear, so a read started before a save cannot re-cache the old value.
@@ -40,6 +41,7 @@ export function clearSoundCache(): void {
   availableSounds = null;
   for (const url of soundUrls.values()) URL.revokeObjectURL(url);
   soundUrls.clear();
+  pendingSoundUrls.clear();
 }
 
 // A saved sound choice applies to the next sound, not after the cache expires.
@@ -76,15 +78,25 @@ async function resolveSoundName(sound: SoundSettings, event: SoundEvent): Promis
   return availableSounds[Math.floor(Math.random() * availableSounds.length)] ?? null;
 }
 
-async function ensureSoundUrl(name: string): Promise<string | null> {
+function ensureSoundUrl(name: string): Promise<string | null> {
   const cached = soundUrls.get(name);
-  if (cached) return cached;
-  // `<audio src>` bypasses the fetch auth interceptor, so load the bytes via fetch.
-  const blob = await fetchSoundBlob(name);
-  if (!blob) return null;
-  const url = URL.createObjectURL(blob);
-  soundUrls.set(name, url);
-  return url;
+  if (cached) return Promise.resolve(cached);
+  const pending = pendingSoundUrls.get(name);
+  if (pending) return pending;
+  const generation = cacheGeneration;
+  const load = (async () => {
+    // `<audio src>` bypasses the fetch auth interceptor, so load the bytes via fetch.
+    const blob = await fetchSoundBlob(name);
+    if (!blob || generation !== cacheGeneration) return null;
+    const url = URL.createObjectURL(blob);
+    soundUrls.set(name, url);
+    return url;
+  })();
+  pendingSoundUrls.set(name, load);
+  void load.finally(() => {
+    if (pendingSoundUrls.get(name) === load) pendingSoundUrls.delete(name);
+  });
+  return load;
 }
 
 /** Resolves true when the sound started playing. */

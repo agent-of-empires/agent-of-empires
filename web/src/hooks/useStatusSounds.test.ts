@@ -119,6 +119,20 @@ describe("useStatusSounds", () => {
     expect(played).toHaveLength(0);
   });
 
+  it("loads a shared sound file once when several events use it", async () => {
+    fetchSettings.mockResolvedValue({
+      sound: { enabled: true, browser_enabled: true, on_idle: "same", on_error: "same" },
+    });
+    await walk(
+      [at("a", "Running"), at("b", "Running")],
+      [at("a", "Idle"), at("b", "Error")],
+      [at("a", "Idle"), at("b", "Error")],
+    );
+    expect(played).toHaveLength(2);
+    expect(fetchSoundBlob).toHaveBeenCalledTimes(1);
+    expect(URL.createObjectURL).toHaveBeenCalledTimes(1);
+  });
+
   it("picks a random sound when none is chosen for the event", async () => {
     fetchSettings.mockResolvedValue({ sound: { enabled: true, browser_enabled: true } });
     await walk([at("a", "Running")], [at("a", "Idle")], [at("a", "Idle")]);
