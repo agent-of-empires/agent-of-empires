@@ -398,4 +398,16 @@ describe("PluginPageView", () => {
     fireEvent.load(frame);
     expect(screen.queryByTestId("host-menu")).toBeNull();
   });
+
+  it("opens no menu for a call still checking its session when the frame reloads", async () => {
+    let listed!: (v: unknown) => void;
+    h.sessions.mockReturnValue(new Promise((resolve) => (listed = resolve)));
+    const { frame, request } = await readyFrame();
+    fireEvent.load(frame);
+    await request({ aoeBridge: 1, id: 2, method: "session.contextMenu", params: { id: "s", x: 0, y: 0 } });
+    await waitFor(() => expect(h.sessions).toHaveBeenCalled());
+    fireEvent.load(frame);
+    await act(async () => listed({ sessions: [{ id: "s" }] }));
+    expect(h.renderSessionMenu).not.toHaveBeenCalled();
+  });
 });

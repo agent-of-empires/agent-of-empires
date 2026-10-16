@@ -212,7 +212,12 @@ export function PluginPageView({
         channel.postMessage(bridgeError(call.id, resolved.error, resolved.message));
         return;
       }
-      runCall(resolved.call, page.plugin_id, host).then(
+      // A call that outlives its frame must not open a menu over the next one.
+      const live: PageHost = {
+        ...host,
+        openMenu: (r) => (port.current === channel ? host.openMenu(r) : Promise.resolve(null)),
+      };
+      runCall(resolved.call, page.plugin_id, live).then(
         (result) => channel.postMessage(bridgeReply(call.id, result)),
         (e: unknown) =>
           channel.postMessage(
