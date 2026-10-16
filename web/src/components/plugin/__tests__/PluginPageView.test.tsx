@@ -387,4 +387,15 @@ describe("PluginPageView", () => {
       ),
     );
   });
+
+  it("drops the host session menu when the frame loads a second document", async () => {
+    h.sessions.mockResolvedValue({ sessions: [{ id: "s" }] });
+    h.renderSessionMenu.mockReturnValue(<div data-testid="host-menu" />);
+    const { frame, request } = await readyFrame();
+    fireEvent.load(frame);
+    await request({ aoeBridge: 1, id: 2, method: "session.contextMenu", params: { id: "s", x: 0, y: 0 } });
+    await screen.findByTestId("host-menu");
+    fireEvent.load(frame);
+    expect(screen.queryByTestId("host-menu")).toBeNull();
+  });
 });

@@ -258,6 +258,8 @@ export function PluginPageView({
     loads.current += 1;
     if (loads.current > 1) {
       closePort(port);
+      menuResolve.current?.(null);
+      setMenuRequest(null);
       setLost(true);
     }
   };
