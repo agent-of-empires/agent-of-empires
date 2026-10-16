@@ -366,16 +366,19 @@ describe("PluginPageView", () => {
   it("opens the host session menu at the frame's offset and replies with the pick", async () => {
     h.sessions.mockResolvedValue({ sessions: [{ id: "s" }] });
     const { frame, port, request } = await readyFrame();
-    frame.getBoundingClientRect = () => ({ left: 100, top: 48 }) as DOMRect;
+    frame.getBoundingClientRect = () => ({ left: 100, top: 48, width: 300, height: 200 }) as DOMRect;
     const items = [{ id: "move:done", label: "Move to Done" }];
     await request({ aoeBridge: 1, id: 2, method: "session.contextMenu", params: { id: "s", x: 10, y: 20, items } });
     await waitFor(() => expect(h.renderSessionMenu).toHaveBeenCalled());
     const first = h.renderSessionMenu.mock.lastCall![0];
-    expect(first).toMatchObject({ sessionId: "s", x: 110, y: 68, items });
+    expect(first).toMatchObject({ sessionId: "s", x: 110, y: 68, items, source: "Board" });
 
     // A second menu supersedes the first, which resolves with nothing picked.
-    await request({ aoeBridge: 1, id: 3, method: "session.contextMenu", params: { id: "s", x: 0, y: 0 } });
-    await waitFor(() => expect(h.renderSessionMenu.mock.lastCall![0].key).toBe(first.key + 1));
+    // Clamped to the frame, so a page cannot float the menu over the rest of the dashboard.
+    await request({ aoeBridge: 1, id: 3, method: "session.contextMenu", params: { id: "s", x: 5000, y: 5000 } });
+    await waitFor(() =>
+      expect(h.renderSessionMenu.mock.lastCall![0]).toMatchObject({ key: first.key + 1, x: 400, y: 248 }),
+    );
     await waitFor(() => expect(port.postMessage).toHaveBeenCalledWith({ aoeBridge: 1, id: 2, result: null }));
     act(() => h.renderSessionMenu.mock.lastCall![0].onClose("move:done"));
     await waitFor(() => expect(port.postMessage).toHaveBeenCalledWith({ aoeBridge: 1, id: 3, result: "move:done" }));

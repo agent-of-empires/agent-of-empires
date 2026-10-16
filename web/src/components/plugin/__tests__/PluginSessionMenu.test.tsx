@@ -11,7 +11,16 @@ const handlers = { onStop: vi.fn(), onDelete: vi.fn() };
 
 function open(over: Partial<SessionMenuRequest> = {}) {
   const onClose = vi.fn();
-  const request: SessionMenuRequest = { key: 1, sessionId: "s1", x: 40, y: 50, items: [], onClose, ...over };
+  const request: SessionMenuRequest = {
+    key: 1,
+    sessionId: "s1",
+    x: 40,
+    y: 50,
+    items: [],
+    source: "Board",
+    onClose,
+    ...over,
+  };
   render(<PluginSessionMenu request={request} workspaces={workspaces} readOnly={false} handlers={handlers} />);
   return onClose;
 }
@@ -36,6 +45,8 @@ describe("PluginSessionMenu", () => {
   it("shields the menu until armed, then a page item resolves with its id", () => {
     const onClose = open({ items: [{ id: "move:done", label: "Move to Done" }] });
     expect(screen.getByTestId("sidebar-context-menu")).toBeTruthy();
+    // The page's items sit under its title, apart from the dashboard's actions.
+    expect(screen.getByText("Board")).toBeTruthy();
     expect(backdrop().className).toContain("z-[60]");
     expect(backdrop().dataset.armed).toBeUndefined();
     fireEvent.mouseDown(backdrop());
@@ -123,7 +134,7 @@ describe("PluginSessionMenu", () => {
     ];
     const show = () => {
       cleanup();
-      const request = { key: 1, sessionId: "s2", x: 0, y: 0, items: [], onClose: vi.fn() };
+      const request = { key: 1, sessionId: "s2", x: 0, y: 0, items: [], source: "Board", onClose: vi.fn() };
       render(<PluginSessionMenu request={request} workspaces={shared} readOnly={false} handlers={handlers} />);
       arm();
     };

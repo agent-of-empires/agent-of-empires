@@ -5,7 +5,7 @@ import { renameSession } from "../../lib/api";
 import type { PageMenuItem } from "../../lib/pluginBridge";
 import { reportError, reportInfo } from "../../lib/toastBus";
 import type { Workspace } from "../../lib/types";
-import { MenuItem, MenuSeparator } from "../ContextMenu";
+import { MenuHeading, MenuItem, MenuSeparator } from "../ContextMenu";
 import { useContextMenu } from "../useContextMenu";
 import { SessionActionsMenu, type SessionActionHandlers, type SessionMenuState } from "../sidebar/SessionActions";
 import { useSessionRowModel } from "../sidebar/useSessionRowModel";
@@ -23,6 +23,8 @@ export interface SessionMenuRequest {
   x: number;
   y: number;
   items: PageMenuItem[];
+  /** The page's title, heading its items so they never pass for the dashboard's own. */
+  source: string;
   /** Called when the menu closes, with the picked page item's id or null. */
   onClose: (picked: string | null) => void;
 }
@@ -147,6 +149,7 @@ function HostMenu({
           request.items.length > 0 && (
             <>
               <MenuSeparator />
+              <MenuHeading>{request.source}</MenuHeading>
               {request.items.map((item) => (
                 <MenuItem
                   key={item.id}

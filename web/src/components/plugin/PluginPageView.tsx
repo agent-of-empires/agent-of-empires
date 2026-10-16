@@ -41,10 +41,12 @@ interface Props {
   renderSessionMenu: (request: SessionMenuRequest) => ReactNode;
 }
 
+type MenuArgs = Omit<SessionMenuRequest, "key" | "onClose">;
+
 interface PageHost {
   openSession: (id: string) => void;
   /** Resolves with the picked page item's id, or null. */
-  openMenu: (request: Omit<SessionMenuRequest, "key" | "onClose">) => Promise<string | null>;
+  openMenu: (request: Omit<MenuArgs, "source">) => Promise<string | null>;
 }
 
 const SPLIT_HEIGHT_KEY = "aoe-plugin-page-split-height";
@@ -160,10 +162,10 @@ export function PluginPageView({
   const [menuRequest, setMenuRequest] = useState<SessionMenuRequest | null>(null);
   const menuResolve = useRef<((picked: string | null) => void) | null>(null);
   const menuKey = useRef(0);
-  const [host] = useState<PageHost>(() => ({
-    openSession: (id) => openSessionRef.current(id),
-    openMenu: ({ x, y, ...rest }) => {
-      // The page sends frame coordinates; the menu floats in the dashboard viewport.
+  const [host] = useState(() => ({
+    openSession: (id: string) => openSessionRef.current(id),
+    openMenu: ({ x, y, ...rest }: MenuArgs): Promise<string | null> => {
+      // The page sends frame coordinates, kept inside its frame; the menu floats in the dashboard viewport.
       const rect = frameRef.current?.getBoundingClientRect();
       menuResolve.current?.(null);
       return new Promise((resolve) => {
@@ -171,8 +173,8 @@ export function PluginPageView({
         menuKey.current += 1;
         setMenuRequest({
           key: menuKey.current,
-          x: x + (rect?.left ?? 0),
-          y: y + (rect?.top ?? 0),
+          x: (rect?.left ?? 0) + Math.min(x, rect?.width ?? 0),
+          y: (rect?.top ?? 0) + Math.min(y, rect?.height ?? 0),
           ...rest,
           onClose: resolve,
         });
@@ -214,8 +216,9 @@ export function PluginPageView({
       }
       // A call that outlives its frame must not open a menu over the next one.
       const live: PageHost = {
-        ...host,
-        openMenu: (r) => (port.current === channel ? host.openMenu(r) : Promise.resolve(null)),
+        openSession: host.openSession,
+        openMenu: (r) =>
+          port.current === channel ? host.openMenu({ ...r, source: page.title }) : Promise.resolve(null),
       };
       runCall(resolved.call, page.plugin_id, live).then(
         (result) => channel.postMessage(bridgeReply(call.id, result)),
