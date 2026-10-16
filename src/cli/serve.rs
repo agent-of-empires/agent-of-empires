@@ -770,6 +770,21 @@ pub(crate) enum DaemonStatus {
 }
 
 pub(crate) fn daemon_status() -> DaemonStatus {
+    daemon_status_with(
+        |pid| {
+            classify_daemon_probe(nix::sys::signal::kill(
+                nix::unistd::Pid::from_raw(pid),
+                None,
+            ))
+        },
+        inspect_daemon_process,
+    )
+}
+
+fn daemon_status_with(
+    probe: impl FnOnce(i32) -> DaemonProbeDisposition,
+    inspect: impl FnOnce(i32) -> DaemonProcessIdentity,
+) -> DaemonStatus {
     let Ok(path) = pid_file_path() else {
         return DaemonStatus::Unverified;
     };
@@ -782,9 +797,8 @@ pub(crate) fn daemon_status() -> DaemonStatus {
         return DaemonStatus::Unverified;
     };
 
-    let probe = nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None);
-    match classify_daemon_probe(probe) {
-        DaemonProbeDisposition::VerifyIdentity => match inspect_daemon_process(pid) {
+    match probe(pid) {
+        DaemonProbeDisposition::VerifyIdentity => match inspect(pid) {
             DaemonProcessIdentity::Verified => DaemonStatus::Verified(pid as u32),
             DaemonProcessIdentity::Foreign => DaemonStatus::Absent,
             DaemonProcessIdentity::Indeterminate => DaemonStatus::Unverified,
@@ -1265,6 +1279,14 @@ pub async fn restart_daemon() -> Result<()> {
     start_daemon(&launch.profile, &args)
 }
 
+fn report_stale_cleanup(pid: i32) {
+    if clear_serve_state(pid) {
+        println!("Daemon was not running (stale PID file cleaned up)");
+    } else {
+        println!("Daemon was not running; serve state changed meanwhile and was preserved");
+    }
+}
+
 #[tracing::instrument(target = "serve.shutdown", skip_all)]
 pub(crate) async fn stop_daemon() -> Result<()> {
     let path = pid_file_path()?;
@@ -1281,6 +1303,17 @@ pub(crate) async fn stop_daemon() -> Result<()> {
     let pid = parse_positive_pid(&pid_str)
         .ok_or_else(|| anyhow::anyhow!("Invalid PID in {}: {}", path.display(), pid_str.trim()))?;
     tracing::info!(target: "serve.shutdown", pid, "sending SIGTERM to daemon");
+
+    if matches!(
+        classify_daemon_probe(nix::sys::signal::kill(
+            nix::unistd::Pid::from_raw(pid),
+            None
+        )),
+        DaemonProbeDisposition::Stale
+    ) {
+        report_stale_cleanup(pid);
+        return Ok(());
+    }
 
     match inspect_daemon_process(pid) {
         DaemonProcessIdentity::Verified => {
@@ -1334,11 +1367,7 @@ pub(crate) async fn stop_daemon() -> Result<()> {
             println!("Stopped aoe serve daemon (PID {})", pid);
         }
         Err(nix::errno::Errno::ESRCH) => {
-            if clear_serve_state(pid) {
-                println!("Daemon was not running (stale PID file cleaned up)");
-            } else {
-                println!("Daemon was not running; serve state changed meanwhile and was preserved");
-            }
+            report_stale_cleanup(pid);
         }
         Err(e) => bail!("Failed to stop daemon (PID {}): {}", pid, e),
     }
@@ -1879,6 +1908,51 @@ mod tests {
 
             let _ = foreign.kill();
             let _ = foreign.wait();
+        }
+
+        #[test]
+        #[serial]
+        fn replacement_survives_a_probe_held_across_its_publication() {
+            let _guard = crate::session::test_support::isolate_app_dir();
+            let dir = crate::session::get_app_dir().unwrap();
+
+            for (name, disposition) in [
+                ("foreign", DaemonProbeDisposition::VerifyIdentity),
+                ("exited", DaemonProbeDisposition::Stale),
+            ] {
+                publish(&dir, 4242);
+                let (observed_tx, observed_rx) = std::sync::mpsc::channel();
+                let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+
+                let status = std::thread::scope(|scope| {
+                    let old_probe = scope.spawn(move || {
+                        daemon_status_with(
+                            |_| {
+                                observed_tx.send(()).unwrap();
+                                release_rx.recv().unwrap();
+                                disposition
+                            },
+                            |_| DaemonProcessIdentity::Foreign,
+                        )
+                    });
+                    observed_rx.recv().unwrap();
+                    {
+                        let _lock = lock_serve_state().unwrap();
+                        publish(&dir, 4343);
+                    }
+                    release_tx.send(()).unwrap();
+                    old_probe.join().unwrap()
+                });
+
+                assert_eq!(status, DaemonStatus::Absent, "{name}");
+                assert!(!clear_serve_state(4242), "{name}: stale cleaner must skip");
+                assert_published(&dir, 4343);
+                assert_eq!(
+                    read_serve_urls().first().map(|u| u.url.as_str()),
+                    Some("serve.url of 4343"),
+                    "{name}: discovery"
+                );
+            }
         }
 
         #[test]
