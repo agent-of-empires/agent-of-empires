@@ -28,3 +28,9 @@ pub(crate) fn open_repo_at(path: &Path) -> std::result::Result<git2::Repository,
         std::iter::empty::<&OsStr>(),
     )
 }
+
+/// An existing directory that is not itself a Repository. Like `open_repo_at`
+/// this never searches parents, so a subdirectory of a Repository counts.
+pub(crate) fn is_outside_repository(path: &Path) -> bool {
+    path.is_dir() && !GitWorktree::is_git_repo(path)
+}

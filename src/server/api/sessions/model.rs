@@ -62,6 +62,10 @@ impl SessionResponse {
                 .and_then(|w| w.base_branch.clone()),
             base_branch_override: inst.base_branch_override.clone(),
             is_sandboxed: inst.is_sandboxed(),
+            // Worktree and workspace creation refuse a path that is not a Repository.
+            outside_repository: inst.worktree_info.is_none()
+                && inst.workspace_info.is_none()
+                && outside_repository_cached(&inst.project_path),
             scratch: inst.scratch,
             favorited: inst.is_favorited(),
             color: inst.color.clone(),
@@ -185,6 +189,29 @@ impl SessionResponse {
             monitor_description,
         }
     }
+}
+
+/// Clients poll the Session list every few seconds, so a probe is reused
+/// briefly instead of opening every Working directory on each poll.
+fn outside_repository_cached(path: &str) -> bool {
+    use std::sync::{Mutex, OnceLock};
+    use std::time::{Duration, Instant};
+    const TTL: Duration = Duration::from_secs(30);
+    static CACHE: OnceLock<Mutex<HashMap<String, (Instant, bool)>>> = OnceLock::new();
+    let cache = CACHE.get_or_init(Default::default);
+
+    if let Some((at, outside)) = cache.lock().ok().and_then(|c| c.get(path).copied()) {
+        if at.elapsed() < TTL {
+            return outside;
+        }
+    }
+    let outside = crate::git::is_outside_repository(std::path::Path::new(path));
+    if let Ok(mut c) = cache.lock() {
+        // Sweep on write so paths of deleted Sessions cannot accumulate.
+        c.retain(|_, (at, _)| at.elapsed() < TTL);
+        c.insert(path.to_string(), (Instant::now(), outside));
+    }
+    outside
 }
 
 /// Project a stored `Plan` into the `PlanSummary` the sidebar consumes.
