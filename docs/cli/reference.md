@@ -172,7 +172,7 @@ Run without arguments to launch the TUI dashboard.
 * `acp` — Manage the ACP structured-view workers (doctor, ps, logs, prompt, approve, ...)
 * `uninstall` — Uninstall Agent of Empires
 * `update` — Update aoe to the latest release
-* `migrate` — Run pending data migrations now, showing progress. A sandboxed session moves its own agent store when it starts; use this to move every eligible store at once instead. Trashed and archived sessions are skipped; each moves when it is started, or restore or unarchive it and run this again
+* `migrate` — Run pending data migrations now, showing progress. A sandboxed session moves its own agent store when it starts; use this to move every eligible store at once instead. Trashed and archived sessions are skipped; each moves when it is started, or restore or unarchive it and run this again. Refuses while the aoe serve daemon runs; stop it with `aoe serve --stop` first
 * `completion` — Generate shell completions
 
 ###### **Options:**
@@ -1949,7 +1949,7 @@ Update aoe to the latest release
 
 ## `aoe migrate`
 
-Run pending data migrations now, showing progress. A sandboxed session moves its own agent store when it starts; use this to move every eligible store at once instead. Trashed and archived sessions are skipped; each moves when it is started, or restore or unarchive it and run this again
+Run pending data migrations now, showing progress. A sandboxed session moves its own agent store when it starts; use this to move every eligible store at once instead. Trashed and archived sessions are skipped; each moves when it is started, or restore or unarchive it and run this again. Refuses while the aoe serve daemon runs; stop it with `aoe serve --stop` first
 
 **Usage:** `aoe migrate`
 
