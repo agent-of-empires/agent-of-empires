@@ -560,6 +560,7 @@ function AppContent({
   // of tabs (diff, one-or-more terminals, plugin panes) with one active body.
   // The tab membership + active tab + terminal count are persisted per session;
   // dock sizes stay global (Dock/BottomDock own those localStorage keys).
+  const activeOutsideRepository = sessions.some((s) => s.id === activeSessionId && s.outside_repository);
   const {
     layout: paneLayout,
     openTab,
@@ -572,7 +573,7 @@ function AppContent({
     togglePlugin,
     syncPlugins,
     setDockCollapsed,
-  } = usePaneLayout(activeSessionId);
+  } = usePaneLayout(activeSessionId, activeOutsideRepository);
   const pluginPanes = usePluginPanes(activeSessionId);
   const pluginPaneById = useMemo(() => {
     const m = new Map<string, PluginPane>();

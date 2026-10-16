@@ -70,6 +70,24 @@ describe("header and empty states", () => {
     expect(screen.queryByTitle("Switch to flat list")).toBeNull();
   });
 
+  it("shows one neutral message naming the path, with no header or base, only outside a repository (#4574)", () => {
+    const neutral = "The working directory (/plain) isn't a git repository, so there's nothing to compare.";
+    const cases: [string, RepoBase, boolean][] = [
+      ["outside a repository", { outside_repository: true, repo_path: "/plain" }, true],
+      ["repository", { base_branch: "main", repo_path: "/repo" }, false],
+    ];
+    for (const [label, base, outside] of cases) {
+      const { container } = renderList({ perRepoBases: [base], sessionId: "s1", repoPath: base.repo_path });
+      expect(container.textContent?.includes(neutral), label).toBe(outside);
+      expect(screen.queryByText("No diff") !== null, label).toBe(outside);
+      expect(screen.queryByText("Changes") !== null, label).toBe(!outside);
+      expect(screen.queryByText(/No changes vs/) !== null, label).toBe(!outside);
+      expect(screen.queryByRole("button", { name: /Change diff base/ }) !== null, label).toBe(!outside);
+      expect(document.querySelector(".text-status-waiting"), label).toBeNull();
+      cleanup();
+    }
+  });
+
   it("lists every repo with its base when a workspace has no changes", () => {
     renderList({
       perRepoBases: [
@@ -81,6 +99,18 @@ describe("header and empty states", () => {
     expect(screen.getAllByText("vs origin/develop")).toHaveLength(2);
     expect(screen.getByText("vs origin/main")).toBeTruthy();
     expect(screen.getAllByText("No changes in this repo.")).toHaveLength(3);
+  });
+
+  it("labels a workspace member outside a repository instead of naming a base (#4574)", () => {
+    renderList({
+      perRepoBases: [
+        { repo_name: "api", base_branch: "main", repo_path: "/ws/api" },
+        { repo_name: "notes", outside_repository: true, repo_path: "/ws/notes" },
+      ],
+    });
+    expect(screen.getByText("vs main")).toBeTruthy();
+    expect(screen.getByText("not a git repository")).toBeTruthy();
+    expect(screen.queryByText(/vs undefined/)).toBeNull();
   });
 
   it("renders counts, totals, base chip and warning", () => {

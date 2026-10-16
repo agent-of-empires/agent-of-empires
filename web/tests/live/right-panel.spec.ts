@@ -43,6 +43,30 @@ test("files pane renders a Markdown file in a scratch session", async ({ page, s
   await expect(page.getByRole("listitem").filter({ hasText: "step one" }).first()).toBeVisible();
 });
 
+test("diff pane in a non-git session stays closed until opened, then shows one neutral message", async ({
+  page,
+  spawnServe,
+}) => {
+  // #4574: the git case, where Diff auto-opens, is the diff viewer test below.
+  const serve = await spawnServe({
+    seedFn: seedSessionViaAoeAdd({ title: "rp-non-git", subdir: "plain-project", git: false }),
+  });
+  const [session] = await listSessions(serve.baseUrl);
+  expect(session!.outside_repository).toBe(true);
+  await openSession(page, serve, "rp-non-git");
+
+  // The seeded terminal proves the layout is seeded, so Diff's absence is not a race.
+  await expect(page.getByTestId("pane-toggle-terminal").first()).toHaveAttribute("aria-pressed", "true");
+  const diffToggle = page.getByTestId("pane-toggle-diff").first();
+  await expect(diffToggle).toHaveAttribute("aria-pressed", "false");
+
+  await diffToggle.click();
+  await expect(page.getByText(/isn't a git repository, so there's nothing to compare\./).first()).toBeVisible({
+    timeout: 10_000,
+  });
+  await expect(page.getByText(/No changes vs|Could not open repository/)).toHaveCount(0);
+});
+
 test("files pane numbers the lines of a source file", async ({ page, spawnServe }) => {
   // #4003: the file pane renders through the shared diff renderer, so it numbers lines like the diff pane.
   const serve = await spawnServe({

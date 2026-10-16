@@ -2176,7 +2176,8 @@
         "web/src/components/diff/comments/CommentMarkdown.tsx",
         "web/src/components/diff/comments/CommentsBanner.tsx",
         "web/src/components/diff/comments/DiffCommentsUserCard.tsx",
-        "web/src/components/diff/comments/SendCommentsDialog.tsx"
+        "web/src/components/diff/comments/SendCommentsDialog.tsx",
+        "web/src/lib/paneLayout.ts"
       ]
     },
     {
