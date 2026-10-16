@@ -2474,6 +2474,7 @@ function AppContent({
         {welcome.showWelcome && (
           <ThemeIntro
             onDone={welcome.dismissWelcome}
+            tourFollows={!isCoarse}
             onSkipTour={() => {
               handleTourSeen();
               welcome.dismissWelcome();

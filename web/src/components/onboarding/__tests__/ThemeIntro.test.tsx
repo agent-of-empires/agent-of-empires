@@ -23,10 +23,10 @@ afterEach(() => {
   updateTheme.mockImplementation(() => Promise.resolve(true));
 });
 
-async function mount() {
+async function mount(tourFollows = true) {
   const onDone = vi.fn();
   const onSkipTour = vi.fn();
-  render(<ThemeIntro onDone={onDone} onSkipTour={onSkipTour} />);
+  render(<ThemeIntro onDone={onDone} onSkipTour={onSkipTour} tourFollows={tourFollows} />);
   await waitFor(() => expect(screen.getByRole("option", { name: "modus-vivendi" })).toBeTruthy());
   return { onDone, onSkipTour };
 }
@@ -65,6 +65,16 @@ describe("ThemeIntro", () => {
       dismiss();
       expect(handlers[expected], how).toHaveBeenCalledTimes(1);
       expect(handlers[expected === "onDone" ? "onSkipTour" : "onDone"], how).not.toHaveBeenCalled();
+      cleanup();
+    }
+  });
+
+  it("promises the tour only where it auto-launches", async () => {
+    for (const tourFollows of [true, false]) {
+      await mount(tourFollows);
+      expect(screen.queryByText("Next: a short tour · Esc skips") !== null, `tourFollows=${tourFollows}`).toBe(
+        tourFollows,
+      );
       cleanup();
     }
   });

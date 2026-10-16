@@ -59,10 +59,12 @@ interface Props {
   onDone: () => void;
   /** Escape: dismiss and skip the tour too, as the footer says. */
   onSkipTour: () => void;
+  /** The tour auto-launches on desktop only, so the footer promises it only there. */
+  tourFollows: boolean;
 }
 
 /** First-run theme picker. Picking persists and repaints live, so the grid is the preview. */
-export function ThemeIntro({ onDone, onSkipTour }: Props) {
+export function ThemeIntro({ onDone, onSkipTour, tourFollows }: Props) {
   const [themes, setThemes] = useState<string[]>([]);
   const [selected, setSelected] = useState<string | null>(
     () => (typeof document !== "undefined" ? document.documentElement.dataset.theme : undefined) ?? null,
@@ -157,8 +159,8 @@ export function ThemeIntro({ onDone, onSkipTour }: Props) {
               )}
             </div>
 
-            <div className="flex items-center justify-between gap-3 px-5 py-4 border-t border-surface-700">
-              <p className="text-xs text-text-dim">Next: a short tour · Esc skips</p>
+            <div className="flex items-center justify-end gap-3 px-5 py-4 border-t border-surface-700">
+              {tourFollows && <p className="mr-auto text-xs text-text-subtle">Next: a short tour · Esc skips</p>}
               <button
                 ref={continueRef}
                 type="button"
