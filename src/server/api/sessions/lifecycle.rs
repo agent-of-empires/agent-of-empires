@@ -3,6 +3,23 @@
 
 use super::*;
 
+async fn release_unmirrored_trash(
+    request: crate::session::trash::TrashRequest,
+) -> anyhow::Result<()> {
+    tokio::task::spawn_blocking(move || {
+        #[cfg(test)]
+        if let Some(sender) = BEFORE_TRASH_CLEANUP_LOCK.lock().take() {
+            let _ = sender.send(());
+        }
+        request.cancel()
+    })
+    .await?
+}
+
+#[cfg(test)]
+static BEFORE_TRASH_CLEANUP_LOCK: parking_lot::Mutex<Option<tokio::sync::oneshot::Sender<()>>> =
+    parking_lot::Mutex::new(None);
+
 #[derive(Deserialize)]
 pub struct UpdatePinBody {
     pub pinned: bool,
@@ -364,12 +381,12 @@ pub async fn update_session_archive(
     (StatusCode::OK, Json(serde_json::json!(response))).into_response()
 }
 
-/// `POST /api/sessions/:id/trash`. The per-instance lifecycle flock is held
-/// from the durable Trash reservation through teardown, relocation, and final commit.
+/// Trash releases the reservation locks before SDK shutdown, then reacquires exclusive
+/// ownership and revalidates the physical profile and durable row before relocation.
 pub async fn trash_session(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
-    body: Option<Json<TrashSessionBody>>,
+    body: Result<Option<Json<TrashSessionBody>>, axum::extract::rejection::JsonRejection>,
 ) -> impl IntoResponse {
     if let Some(response) = cityhall_block_non_structured(&state, &id).await {
         return response;
@@ -377,7 +394,10 @@ pub async fn trash_session(
     if state.read_only {
         return crate::server::api::read_only_response();
     }
-    let body = body.map(|Json(body)| body).unwrap_or_default();
+    let body = match body {
+        Ok(body) => body.map(|Json(body)| body).unwrap_or_default(),
+        Err(error) => return error.into_response(),
+    };
 
     let Some(_submission) = state
         .session_service
@@ -388,22 +408,27 @@ pub async fn trash_session(
     };
     let lock = state.instance_lock(&id).await;
     let _guard = lock.lock().await;
-    let (profile, snapshot) = {
+    let profile = {
         let instances = state.instances.read().await;
         let Some(instance) = instances.iter().find(|instance| instance.id == id) else {
             return session_not_found();
         };
-        (instance.source_profile.clone(), instance.clone())
+        instance.source_profile.clone()
     };
 
     let reserve_profile = profile.clone();
     let reserve_id = id.clone();
     let file_watch = state.file_watch.clone();
-    let (storage, lifecycle_lock, generation) = match tokio::task::spawn_blocking(
-        move || -> anyhow::Result<_> {
-            let storage = Storage::new(&reserve_profile, file_watch)?;
-            let lifecycle_lock = storage.acquire_instance_lifecycle_lock(&reserve_id)?;
-            let generation = storage.update(|instances, _groups| {
+    let request = match tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
+        let storage = Storage::open(&reserve_profile, file_watch)?;
+        let (generation, snapshot) = {
+            let root = crate::session::storage::acquire_ownership_lock()?;
+            let _identity =
+                crate::session::storage::acquire_session_identity_lock_with_ownership(&root)?;
+            let _lifecycle =
+                storage.acquire_instance_lifecycle_lock_with_ownership(&root, &reserve_id)?;
+            storage.load_strict_for_worktree_ownership()?;
+            storage.update_with_ownership(&root, |instances, _groups| {
                 let Some(instance) = instances
                     .iter_mut()
                     .find(|instance| instance.id == reserve_id)
@@ -418,11 +443,11 @@ pub async fn trash_session(
                     )
                     .map_err(anyhow::Error::new)?;
                 instance.trash();
-                Ok(instance.lifecycle_generation)
-            })?;
-            Ok((storage, lifecycle_lock, generation))
-        },
-    )
+                Ok((instance.lifecycle_generation, instance.clone()))
+            })?
+        };
+        crate::session::trash::prepare_trash(&storage, &snapshot, generation)
+    })
     .await
     {
         Ok(Ok(reserved)) => reserved,
@@ -435,15 +460,33 @@ pub async fn trash_session(
             return persist_failed_response();
         }
     };
+    let storage = request.storage.clone();
+    let snapshot = request.instance.clone();
+    let generation = request.generation;
 
     let was_structured_view = snapshot.is_structured();
-    {
+    let mirrored = {
         let mut instances = state.instances.write().await;
-        let Some(instance) = instances.iter_mut().find(|instance| instance.id == id) else {
-            return crate::server::api::session_gone_after_persist();
-        };
-        instance.trash();
-        instance.lifecycle_generation = generation;
+        if let Some(instance) = instances
+            .iter_mut()
+            .find(|instance| instance.id == id && instance.created_at == snapshot.created_at)
+        {
+            instance.trashed_at = snapshot.trashed_at;
+            instance.trash_lifecycle_id = snapshot.trash_lifecycle_id.clone();
+            instance.lifecycle_generation = generation;
+            instance.lifecycle_reservation = snapshot.lifecycle_reservation.clone();
+            true
+        } else {
+            false
+        }
+    };
+    if !mirrored {
+        drop(_guard);
+        drop(_submission);
+        if let Err(error) = release_unmirrored_trash(request).await {
+            tracing::warn!(target: "http.api.sessions", session = %id, "trash reservation cleanup failed: {error:#}");
+        }
+        return crate::server::api::session_gone_after_persist();
     }
 
     if was_structured_view {
@@ -460,43 +503,14 @@ pub async fn trash_session(
     let work_id = id.clone();
     let kill_pane = body.kill_pane;
     let transition = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
-        let _lifecycle_lock = lifecycle_lock;
-        let mut instance = snapshot;
-        if kill_pane {
-            if was_structured_view {
-                instance.kill_ancillary_tmux_sessions_locked();
-            } else {
-                instance.kill_all_tmux_sessions_locked();
+        let outcome = crate::session::trash::trash_transition(&request, |instance| {
+            if kill_pane {
+                if was_structured_view {
+                    instance.kill_ancillary_tmux_sessions_locked();
+                } else {
+                    instance.kill_all_tmux_sessions_locked();
+                }
             }
-        }
-        let outcome = crate::session::trash::prepare_trashed_worktree(&mut instance);
-        let relocation = match &outcome {
-            crate::session::trash::RelocateOutcome::Relocated { .. } => {
-                Some(crate::session::trash::TrashRelocation {
-                    new_project_path: instance.project_path.clone(),
-                    pre_trash_project_path: instance.pre_trash_project_path.clone(),
-                })
-            }
-            crate::session::trash::RelocateOutcome::Skipped
-            | crate::session::trash::RelocateOutcome::Failed { .. } => None,
-        };
-        storage.update(|instances, _groups| {
-            if let Some(relocation) = &relocation {
-                let commit = crate::session::claim::commit_trash_relocation(
-                    instances, &work_id, generation, relocation,
-                );
-                anyhow::ensure!(
-                    commit == crate::session::claim::RelocationCommit::Persisted,
-                    "trash relocation reservation was superseded"
-                );
-            } else if let Some(stored) = instances
-                .iter_mut()
-                .find(|candidate| candidate.id == work_id)
-            {
-                stored
-                    .release_lifecycle_reservation_if_owned(LifecycleOperation::Trash, generation);
-            }
-            Ok(())
         })?;
         let durable = storage
             .load()?
@@ -542,8 +556,8 @@ pub async fn trash_session(
     (StatusCode::OK, Json(serde_json::json!(response))).into_response()
 }
 
-/// `POST /api/sessions/:id/restore`. The lifecycle flock covers reservation
-/// acquisition, worktree restoration, and durable untrash as one transition.
+/// `POST /api/sessions/:id/restore`. Reserve, preflight without fences, then
+/// revalidate and commit under the original profile's lifecycle and ownership fences.
 pub async fn restore_session(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
@@ -557,105 +571,21 @@ pub async fn restore_session(
 
     let lock = state.instance_lock(&id).await;
     let _guard = lock.lock().await;
-    let profile = {
+    let baseline = {
         let instances = state.instances.read().await;
         let Some(instance) = instances.iter().find(|instance| instance.id == id) else {
             return session_not_found();
         };
-        instance.source_profile.clone()
+        instance.clone()
     };
 
-    enum RestoreTransitionError {
-        NotFound,
-        Busy(String),
-        Worktree(String),
-        Persist(String),
-    }
-
-    let restore_profile = profile.clone();
-    let restore_id = id.clone();
+    use crate::session::trash::RestoreError as RestoreTransitionError;
+    let restore_profile = baseline.source_profile.clone();
     let file_watch = state.file_watch.clone();
     let restored = tokio::task::spawn_blocking(move || {
-        let run = || -> Result<Instance, RestoreTransitionError> {
-            let storage = Storage::new(&restore_profile, file_watch)
-                .map_err(|error| RestoreTransitionError::Persist(error.to_string()))?;
-            let _lifecycle_lock = storage
-                .acquire_instance_lifecycle_lock(&restore_id)
-                .map_err(|error| RestoreTransitionError::Persist(error.to_string()))?;
-            let decision = storage
-                .update(|instances, _groups| {
-                    crate::session::claim::decide_restore_claim(
-                        instances,
-                        &restore_id,
-                        chrono::Utc::now(),
-                    )
-                    .map_err(anyhow::Error::new)
-                })
-                .map_err(|error| RestoreTransitionError::Persist(error.to_string()))?;
-            let generation = match decision {
-                crate::session::claim::RestoreClaimDecision::Claimed(generation) => generation,
-                crate::session::claim::RestoreClaimDecision::AlreadyGone => {
-                    return Err(RestoreTransitionError::NotFound);
-                }
-                crate::session::claim::RestoreClaimDecision::Busy(holder) => {
-                    return Err(RestoreTransitionError::Busy(holder.busy_reason()));
-                }
-            };
-            let Some(mut instance) = storage
-                .load()
-                .map_err(|error| RestoreTransitionError::Persist(error.to_string()))?
-                .into_iter()
-                .find(|candidate| candidate.id == restore_id)
-            else {
-                return Err(RestoreTransitionError::NotFound);
-            };
-            if let crate::session::trash::RestoreOutcome::Failed { reason } =
-                crate::session::trash::restore_worktree_location(&mut instance)
-            {
-                let _ = storage.update(|instances, _groups| {
-                    if let Some(stored) = instances
-                        .iter_mut()
-                        .find(|candidate| candidate.id == restore_id)
-                    {
-                        stored.release_lifecycle_reservation_if_owned(
-                            LifecycleOperation::Restore,
-                            generation,
-                        );
-                    }
-                    Ok(())
-                });
-                return Err(RestoreTransitionError::Worktree(reason));
-            }
-            let restored_path = instance.project_path.clone();
-            let restored_pre = instance.pre_trash_project_path.clone();
-            let commit = storage
-                .update(|instances, _groups| {
-                    Ok(crate::session::claim::finalize_restore_commit(
-                        instances,
-                        &restore_id,
-                        generation,
-                        &restored_path,
-                        &restored_pre,
-                    ))
-                })
-                .map_err(|error| RestoreTransitionError::Persist(error.to_string()))?;
-            match commit {
-                crate::session::claim::RestoreCommit::Committed => {
-                    instance.untrash();
-                    instance.lifecycle_reservation = None;
-                    Ok(instance)
-                }
-                crate::session::claim::RestoreCommit::Superseded => {
-                    Err(RestoreTransitionError::Busy(
-                        crate::session::NEWER_GENERATION_BUSY_REASON.to_string(),
-                    ))
-                }
-                crate::session::claim::RestoreCommit::AlreadyGone => {
-                    Err(RestoreTransitionError::NotFound)
-                }
-            }
-        };
-        run()
+        let storage =
+            Storage::open(&restore_profile, file_watch).map_err(RestoreTransitionError::Persist)?;
+        crate::session::trash::restore_transition(&storage, &baseline, None)
     })
     .await;
 
@@ -691,6 +621,12 @@ pub async fn restore_session(
         let Some(instance) = instances.iter_mut().find(|instance| instance.id == id) else {
             return crate::server::api::session_gone_after_persist();
         };
+        if instance.created_at != restored.created_at
+            || instance.source_profile != restored.source_profile
+            || instance.lifecycle_generation > restored.lifecycle_generation
+        {
+            return crate::server::api::session_gone_after_persist();
+        }
         instance.project_path = restored.project_path;
         instance.pre_trash_project_path = restored.pre_trash_project_path;
         instance.lifecycle_generation = restored.lifecycle_generation;
@@ -1512,4 +1448,72 @@ pub async fn update_session_unread(
         }
     };
     (StatusCode::OK, Json(serde_json::json!(response))).into_response()
+}
+
+#[cfg(test)]
+mod reservation_cleanup_tests {
+    use super::*;
+
+    #[tokio::test(flavor = "current_thread")]
+    #[serial_test::serial]
+    async fn unmirrored_trash_cleanup_keeps_tokio_responsive_and_rejects_supersession() {
+        let _app = crate::session::test_support::isolate_app_dir();
+        let storage = Storage::new_unwatched("default").unwrap();
+        for superseded in [false, true] {
+            let mut row = Instance::new("trashed", "/unmirrored");
+            row.source_profile = storage.profile().to_owned();
+            row.trash();
+            let generation = row
+                .try_acquire_lifecycle_reservation(
+                    LifecycleOperation::Trash,
+                    Instance::LIFECYCLE_RESERVATION_TTL,
+                    chrono::Utc::now(),
+                )
+                .unwrap();
+            storage
+                .update(|rows, _| {
+                    *rows = vec![row.clone()];
+                    Ok(())
+                })
+                .unwrap();
+            let request = crate::session::trash::prepare_trash(&storage, &row, generation).unwrap();
+            if superseded {
+                assert!(storage
+                    .update(|rows, _| {
+                        rows[0].release_lifecycle_reservation_if_owned(
+                            LifecycleOperation::Trash,
+                            generation,
+                        );
+                        rows[0].try_acquire_lifecycle_reservation(
+                            LifecycleOperation::Launch,
+                            Instance::LIFECYCLE_RESERVATION_TTL,
+                            chrono::Utc::now(),
+                        )?;
+                        Ok(())
+                    })
+                    .is_err());
+            }
+            let root = crate::session::storage::acquire_ownership_lock().unwrap();
+            let (entered, gate) = tokio::sync::oneshot::channel();
+            *BEFORE_TRASH_CLEANUP_LOCK.lock() = Some(entered);
+            let cleanup = tokio::spawn(release_unmirrored_trash(request));
+            tokio::time::timeout(std::time::Duration::from_secs(2), gate)
+                .await
+                .unwrap()
+                .unwrap();
+            tokio::time::timeout(std::time::Duration::from_millis(100), async {
+                tokio::task::yield_now().await;
+            })
+            .await
+            .expect("cleanup must not block the Tokio worker while waiting for root ownership");
+            assert!(!cleanup.is_finished());
+            drop(root);
+            cleanup.await.unwrap().unwrap();
+            let current = storage.load().unwrap().remove(0);
+            assert_eq!(current.created_at, row.created_at);
+            assert_eq!(current.lifecycle_generation, generation);
+            assert!(current.is_trashed());
+            assert!(current.lifecycle_reservation.is_none());
+        }
+    }
 }

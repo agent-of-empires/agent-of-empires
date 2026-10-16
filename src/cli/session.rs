@@ -5,10 +5,7 @@ use clap::{Args, Subcommand};
 use serde::Serialize;
 use std::collections::HashSet;
 
-use crate::session::{
-    acquire_session_identity_lock, duplicate_session_error, is_duplicate_session, GroupTree,
-    Instance, LifecycleOperation, ResumeIntent, StartOutcome, Storage,
-};
+use crate::session::{GroupTree, Instance, ResumeIntent, StartOutcome, Storage};
 
 #[derive(Subcommand)]
 pub enum SessionCommands {
@@ -508,72 +505,27 @@ async fn restore_session(profile: &str, args: SessionIdArgs) -> Result<()> {
         .filter(|i| i.is_trashed())
         .cloned()
         .collect();
-    let mut inst = super::resolve_session(&args.identifier, &trashed)
+    let inst = super::resolve_session(&args.identifier, &trashed)
         .map_err(|_| anyhow::anyhow!("No trashed session matching '{}'", args.identifier))?
         .clone();
-    let restore_id = inst.id.clone();
-
-    let _lifecycle_lock = storage
-        .acquire_instance_lifecycle_lock(&restore_id)
-        .context("failed to acquire instance restore lock")?;
-    let decision = storage.update(|instances, _groups| {
-        crate::session::claim::decide_restore_claim(instances, &restore_id, chrono::Utc::now())
-            .map_err(anyhow::Error::new)
-    })?;
-    let restore_generation = match decision {
-        crate::session::claim::RestoreClaimDecision::AlreadyGone => {
-            anyhow::bail!("No trashed session matching '{}'", args.identifier)
+    match crate::session::trash::restore_transition(&storage, &inst, None) {
+        Ok(restored) => println!("Restored: {}", restored.title),
+        Err(crate::session::trash::RestoreError::NotFound) => {
+            bail!("No trashed session matching '{}'", args.identifier)
         }
-        crate::session::claim::RestoreClaimDecision::Busy(holder) => anyhow::bail!(
-            "Session {} is {}, so it was not restored",
-            inst.title,
-            holder.busy_reason()
-        ),
-        crate::session::claim::RestoreClaimDecision::Claimed(generation) => generation,
-    };
-
-    if let crate::session::trash::RestoreOutcome::Failed { reason } =
-        crate::session::trash::restore_worktree_location(&mut inst)
-    {
-        release_restore_reservation(&storage, &restore_id, restore_generation);
-        anyhow::bail!("Cannot restore worktree: {reason}");
-    }
-    let restored_path = inst.project_path.clone();
-    let restored_pre = inst.pre_trash_project_path.clone();
-
-    let commit = storage.update(|instances, _groups| {
-        Ok(crate::session::claim::finalize_restore_commit(
-            instances,
-            &restore_id,
-            restore_generation,
-            &restored_path,
-            &restored_pre,
-        ))
-    })?;
-    match commit {
-        crate::session::claim::RestoreCommit::Committed => {}
-        crate::session::claim::RestoreCommit::Superseded => anyhow::bail!(
-            "Session {} lost its lifecycle reservation during restore",
-            inst.title
-        ),
-        crate::session::claim::RestoreCommit::AlreadyGone => {
-            anyhow::bail!("No trashed session matching '{}'", args.identifier)
+        Err(crate::session::trash::RestoreError::Busy(reason)) => {
+            bail!(
+                "Session {} is {}, so it was not restored",
+                inst.title,
+                reason
+            )
         }
+        Err(crate::session::trash::RestoreError::Worktree(reason)) => {
+            bail!("Cannot restore worktree: {reason}")
+        }
+        Err(crate::session::trash::RestoreError::Persist(error)) => return Err(error),
     }
-    println!("Restored: {}", inst.title);
     Ok(())
-}
-
-fn release_restore_reservation(storage: &Storage, restore_id: &str, generation: u64) {
-    let _ = storage.update(|instances, _groups| {
-        if let Some(stored) = instances
-            .iter_mut()
-            .find(|instance| instance.id == restore_id)
-        {
-            stored.release_lifecycle_reservation_if_owned(LifecycleOperation::Restore, generation);
-        }
-        Ok(())
-    });
 }
 
 async fn list_trash(profile: &str) -> Result<()> {
@@ -616,6 +568,7 @@ async fn empty_trash(profile: &str) -> Result<()> {
     let mut removed = 0usize;
     let mut restored_after_teardown = 0usize;
     let mut kept_for_retry = 0usize;
+    let mut cleanup_pending = 0usize;
     let mut being_restored_elsewhere = 0usize;
     let mut being_purged_elsewhere = 0usize;
     for inst in &trashed {
@@ -657,13 +610,18 @@ async fn empty_trash(profile: &str) -> Result<()> {
                 continue;
             }
         };
-        let result = transaction.run_hooks().complete_with(|instance| {
-            super::purge_acp_transcript(instance).map_err(|error| {
-                format!("transcript not purged, keeping session in trash: {error}")
-            })
-        });
+        let result = transaction.run_hooks().complete();
         for err in &result.errors {
             eprintln!("Warning ({}): {}", inst.title, err);
+        }
+        if result.disposition == crate::session::deletion::DeletionDisposition::Removed
+            && !result.success
+        {
+            cleanup_pending += 1;
+            eprintln!(
+                "Warning ({}): session removed; cleanup remains pending recovery",
+                inst.title
+            );
         }
         match result.disposition {
             crate::session::deletion::DeletionDisposition::Removed => removed += 1,
@@ -694,7 +652,10 @@ async fn empty_trash(profile: &str) -> Result<()> {
             outcome.restored_after_teardown
         );
     }
-    let mut parts = vec![format!("purged {} session(s)", outcome.removed)];
+    let mut parts = vec![format!("removed {} session record(s)", outcome.removed)];
+    if cleanup_pending > 0 {
+        parts.push(format!("{cleanup_pending} cleanup(s) pending recovery"));
+    }
     if outcome.kept_for_retry > 0 {
         parts.push(format!("kept {} for retry", outcome.kept_for_retry));
     }
@@ -1673,277 +1634,59 @@ async fn rename_session(profile: &str, args: RenameArgs) -> Result<()> {
         }
     };
 
-    let id = inst.id.clone();
     let title_requested = args.title.is_some();
-    let session_lock_required = title_requested || args.rename_branch || args.branch.is_some();
-
-    let _identity_lock = acquire_session_identity_lock()?;
-    let _session_title_lock = if session_lock_required {
-        Some(
-            crate::session::acquire_session_title_lock(&id)
-                .context("failed to acquire session title lock")?,
-        )
-    } else {
-        None
-    };
-    let _lifecycle_lock = if session_lock_required {
-        Some(
-            storage
-                .acquire_instance_lifecycle_lock(&id)
-                .context("failed to acquire session lifecycle lock")?,
-        )
-    } else {
-        None
-    };
-    let (authoritative_instances, _groups) = storage.load_with_groups()?;
-    let inst = authoritative_instances
-        .iter()
-        .find(|instance| instance.id == id)
-        .ok_or_else(|| anyhow::anyhow!("Session not found: {}", id))?;
-    let mut inst = inst.clone();
-    if let Err(error) = crate::session::worktree_reconcile::reconcile_and_persist(
-        &storage,
-        &mut inst,
-        &mut Default::default(),
-    ) {
-        tracing::warn!(target: "cli.session", session = %id, "worktree path reconciliation skipped: {error}");
-    }
-    let old_title = inst.title.clone();
-    let effective_title = args
-        .title
-        .clone()
-        .unwrap_or_else(|| old_title.clone())
-        .trim()
-        .to_string();
-    let new_group = args.group.as_ref().map(|g| g.trim().to_string());
-    let title_changed = old_title != effective_title;
-
-    let config = crate::session::config::profile_config::resolve_config_or_warn(profile);
-    let tied = inst.tie_workdir_applies(config.session.tie_workdir_to_name);
-    let tied_edit = args.branch.is_none() && tied && (args.title.is_some() || args.rename_branch);
-    let duplicate_path = if tied_edit {
-        crate::session::worktree_edit::derived_worktree_path(
-            std::path::Path::new(&inst.project_path),
-            &effective_title,
-        )
-    } else {
-        inst.project_path.clone()
-    };
-    let pair_changed = title_changed
-        || duplicate_path.trim_end_matches('/') != inst.project_path.trim_end_matches('/');
-    if pair_changed
-        && is_duplicate_session(
-            authoritative_instances.iter(),
-            &effective_title,
-            &duplicate_path,
-            Some(&id),
-        )
-    {
-        return Err(duplicate_session_error(&effective_title));
-    }
-
-    let mut new_path: Option<String> = None;
-    let mut new_branch: Option<String> = None;
-    if let Some(branch) = &args.branch {
-        let info = inst
-            .worktree_info
-            .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("Branch-only rename requires a managed worktree"))?;
-        if branch != &info.branch {
-            let path = std::path::Path::new(&inst.project_path).canonicalize()?;
-            let repo = std::path::Path::new(&info.main_repo_path).canonicalize()?;
-            let same_branch = |main_repo: &str, name: &str| {
-                name == info.branch
-                    && std::path::Path::new(main_repo).canonicalize().ok().as_ref() == Some(&repo)
-            };
-            for other_profile in crate::session::list_profiles()? {
-                let rows = Storage::open_unwatched(&other_profile)?.load()?;
-                if rows.iter().any(|other| {
-                    other.id != id
-                        && !other.is_trashed()
-                        && (std::path::Path::new(&other.project_path)
-                            .canonicalize()
-                            .ok()
-                            .as_ref()
-                            == Some(&path)
-                            || other
-                                .worktree_info
-                                .as_ref()
-                                .is_some_and(|wt| same_branch(&wt.main_repo_path, &wt.branch))
-                            || other.workspace_info.as_ref().is_some_and(|workspace| {
-                                workspace
-                                    .repos
-                                    .iter()
-                                    .any(|wt| same_branch(&wt.main_repo_path, &wt.branch))
-                            }))
-                }) {
-                    bail!("Another session shares this branch or worktree in profile {other_profile}; rename is not isolated");
-                }
-            }
-        }
-        if crate::session::worktree_edit::rename_worktree_branch(
-            info,
-            std::path::Path::new(&inst.project_path),
-            branch,
-        )? {
-            new_branch = Some(branch.clone());
-        }
-    } else if tied_edit {
-        let current_path = inst.project_path.clone();
-        let worktree_info = inst
-            .worktree_info
-            .clone()
-            .expect("tie_workdir_applies implies worktree_info is Some");
-        let leaf = crate::session::worktree_edit::worktree_leaf_from_title(&effective_title);
-        let moves_worktree = crate::session::worktree_edit::worktree_move_required(
-            std::path::Path::new(&current_path),
-            &leaf,
-        );
-        let renames_branch = crate::session::worktree_edit::worktree_branch_rename_required(
-            &worktree_info,
-            &leaf,
-            args.rename_branch,
-        );
-        let is_sandboxed = inst.is_sandboxed();
-        if moves_worktree || renames_branch {
-            let mut live = inst.clone();
-            live.source_profile = profile.to_string();
-            crate::tmux::refresh_session_cache();
-            live.update_status_with_metadata(None, None);
-            let container_holds = !live.status.blocks_worktree_edit()
-                && moves_worktree
-                && crate::session::worktree_edit::ensure_sandbox_container_released(
-                    &id,
-                    is_sandboxed,
-                );
-            if live.status.blocks_worktree_edit() || container_holds {
-                bail!("Stop the session before renaming its worktree directory or branch. Disable session.tie_workdir_to_name to relabel a running session.");
-            }
-        }
-        match crate::session::worktree_edit::edit_worktree_workdir(
-            crate::session::worktree_edit::WorktreeEditRequest {
-                worktree_info: &worktree_info,
-                current_path: std::path::Path::new(&current_path),
-                new_name: &leaf,
-                rename_branch: args.rename_branch,
+    let branch_only = args.branch.is_some();
+    let baseline = inst;
+    let result = tokio::task::spawn_blocking(move || {
+        crate::session::rename::perform(
+            crate::session::rename::Request {
+                baseline,
+                edit: crate::session::rename::Edit::Session {
+                    title: args.title.map(|title| title.trim().to_string()),
+                    group: args.group.map(|group| group.trim().to_string()),
+                    profile: None,
+                    rename_branch: args.rename_branch,
+                    branch: args.branch,
+                },
+                file_watch: crate::file_watch::FileWatchService::noop(),
             },
-        ) {
-            Ok(outcome) => {
-                if outcome.new_path != std::path::Path::new(&current_path) {
-                    crate::session::worktree_edit::discard_sandbox_container_after_move(
-                        &id,
-                        is_sandboxed,
-                    );
-                }
-                new_path = Some(outcome.new_path.to_string_lossy().to_string());
-                new_branch = outcome.new_branch;
-            }
-            Err(crate::session::worktree_edit::WorktreeEditError::Unchanged) => {}
-            Err(e) => return Err(e.into()),
-        }
-    } else if args.rename_branch {
-        bail!("--rename-branch only applies to a tied aoe-managed worktree session (session.tie_workdir_to_name)");
+            |_, _| Ok(()),
+        )
+    })
+    .await??;
+    if let Some(warning) = result.warning {
+        eprintln!("Warning: {warning}");
     }
-
-    let persist = storage.update(|instances, groups| {
-        let inst = instances
-            .iter_mut()
-            .find(|i| i.id == id)
-            .ok_or_else(|| anyhow::anyhow!("Session not found: {}", id))?;
-        let persisted_old_title = inst.title.clone();
-        if title_requested {
-            inst.title = effective_title.clone();
-        }
-        if let Some(path) = &new_path {
-            inst.project_path = path.clone();
-        }
-        if let Some(branch) = &new_branch {
-            if let Some(wt) = inst.worktree_info.as_mut() {
-                wt.branch = branch.clone();
-            }
-        }
-        if let Some(group) = &new_group {
-            inst.group_path = group.clone();
-        }
-        let committed_title = inst.title.clone();
-        let group_path = inst.group_path.clone();
-        if !group_path.is_empty() {
-            let mut group_tree = GroupTree::new_with_groups(instances, groups);
-            group_tree.create_group(&group_path);
-            *groups = group_tree.get_all_groups();
-        }
-        Ok((persisted_old_title, committed_title))
-    });
-    let (persisted_old_title, committed_title) = match persist {
-        Ok(titles) => titles,
-        Err(error) => {
-            if args.branch.is_some() {
-                if let Some(branch) = &new_branch {
-                    let info = inst
-                        .worktree_info
-                        .as_ref()
-                        .expect("branch rename checked worktree metadata");
-                    let stored = storage.load().map_err(|_| anyhow::anyhow!("Session metadata write failed ({error}) and its state cannot be read. Branch is {branch}; directory unchanged. Inspect before retrying."))?;
-                    let persisted_branch = stored
-                        .iter()
-                        .find(|row| row.id == id)
-                        .and_then(|row| row.worktree_info.as_ref())
-                        .map(|wt| wt.branch.as_str());
-                    if persisted_branch == Some(info.branch.as_str()) {
-                        if let Err(rollback) =
-                            crate::session::worktree_edit::rollback_worktree_branch(
-                                info,
-                                std::path::Path::new(&inst.project_path),
-                                branch,
-                            )
-                        {
-                            bail!("Session metadata failed: {error}; branch rollback also failed: {rollback}. The directory is unchanged; inspect Git and session metadata before continuing.");
-                        }
-                    } else if persisted_branch != Some(branch.as_str()) {
-                        bail!("Session metadata failed: {error}; its branch changed concurrently. Directory unchanged; inspect before continuing.");
-                    }
-                }
-            }
-            if let Some(path) = &new_path {
-                bail!("Worktree was moved on disk to {path}, but persisting the new session metadata failed: {error}. Re-run to retry.");
-            }
-            return Err(error);
-        }
-    };
-    drop(_identity_lock);
-
-    let committed_title_changed = title_requested && persisted_old_title != committed_title;
-    if committed_title_changed {
-        let rekey_id = id.clone();
-        let rekey_old_title = persisted_old_title.clone();
-        let rekey_new_title = committed_title.clone();
-        match tokio::task::spawn_blocking(move || {
-            crate::tmux::rekey_session(&rekey_id, &rekey_old_title, &rekey_new_title)
-        })
-        .await
-        {
-            Ok(Ok(_)) => {}
-            Ok(Err(error)) => eprintln!("Warning: failed to rename tmux session: {error}"),
-            Err(error) => eprintln!("Warning: tmux rename task failed: {error}"),
-        }
+    let new_branch = result
+        .instance
+        .worktree_info
+        .as_ref()
+        .map(|info| &info.branch);
+    let old_branch = result
+        .original
+        .worktree_info
+        .as_ref()
+        .map(|info| &info.branch);
+    if branch_only && new_branch != old_branch {
+        println!(
+            "✓ Branch renamed to: {} (worktree directory unchanged)",
+            new_branch.unwrap()
+        );
     }
-
-    if args.branch.is_some() {
-        if let Some(branch) = &new_branch {
-            println!("✓ Branch renamed to: {branch} (worktree directory unchanged)");
-        }
-    }
-    if let Some(path) = &new_path {
-        println!("✓ Worktree moved to: {}", path);
-        if let Some(branch) = &new_branch {
-            println!("  Branch renamed to: {}", branch);
+    if result.instance.project_path != result.original.project_path {
+        println!("✓ Worktree moved to: {}", result.instance.project_path);
+        if new_branch != old_branch {
+            println!("  Branch renamed to: {}", new_branch.unwrap());
         }
     }
     println!(
         "{}",
-        rename_success_message(&persisted_old_title, &committed_title, title_requested,)
+        rename_success_message(
+            &result.original.title,
+            &result.instance.title,
+            title_requested
+        )
     );
-
     Ok(())
 }
 
@@ -2160,13 +1903,12 @@ mod rename_tests {
                     Ok(())
                 })
                 .unwrap();
-            let shared = rename_session(
+            rename_session(
                 "branch-only",
                 args(&id, Some("Must not apply"), None, Some("would-change-peer")),
             )
             .await
             .unwrap_err();
-            assert!(shared.to_string().contains("profile branch-peer"));
             assert_eq!(
                 git(&worktree, &["branch", "--show-current"]),
                 "olof/bemlo-123-task"
@@ -2191,44 +1933,6 @@ mod rename_tests {
             git(&worktree, &["branch", "--show-current"]),
             "olof/bemlo-123-task"
         );
-
-        let info = storage.load().unwrap()[0].worktree_info.clone().unwrap();
-        git(&worktree, &["branch", "-m", "rollback-source"]);
-        git(&worktree, &["checkout", "-b", "external-checkout"]);
-        let refs = git(&repo, &["show-ref", "--heads"]);
-        let error = crate::session::worktree_edit::rollback_worktree_branch(
-            &info,
-            &worktree,
-            "rollback-source",
-        )
-        .unwrap_err();
-        assert!(error.to_string().contains("changed concurrently"));
-        assert_eq!(git(&repo, &["show-ref", "--heads"]), refs);
-        assert_eq!(
-            git(&worktree, &["branch", "--show-current"]),
-            "external-checkout"
-        );
-        assert_eq!(
-            storage.load().unwrap()[0]
-                .worktree_info
-                .as_ref()
-                .unwrap()
-                .branch,
-            info.branch
-        );
-        git(&worktree, &["checkout", "rollback-source"]);
-        crate::session::worktree_edit::rollback_worktree_branch(
-            &info,
-            &worktree,
-            "rollback-source",
-        )
-        .unwrap();
-        assert_eq!(git(&worktree, &["branch", "--show-current"]), info.branch);
-        assert_eq!(git(&worktree, &["rev-parse", "HEAD"]), head);
-        assert_eq!(
-            std::fs::read_to_string(worktree.join("uncommitted.txt")).unwrap(),
-            "keep me"
-        );
     }
 
     #[tokio::test]
@@ -2252,9 +1956,10 @@ mod rename_tests {
         )
         .await
         .unwrap_err();
-        assert!(error
-            .to_string()
-            .contains("Session already exists with same title and path"));
+        assert!(matches!(
+            error.downcast_ref::<crate::session::rename::RenameRejected>(),
+            Some(crate::session::rename::RenameRejected::Duplicate(_))
+        ));
 
         rename_session(
             "rename-duplicate",
@@ -2294,9 +1999,10 @@ mod rename_tests {
         )
         .await
         .unwrap_err();
-        assert!(error
-            .to_string()
-            .contains("Session already exists with same title and path"));
+        assert!(matches!(
+            error.downcast_ref::<crate::session::rename::RenameRejected>(),
+            Some(crate::session::rename::RenameRejected::Duplicate(_))
+        ));
         let tied = storage
             .load()
             .unwrap()
@@ -2341,6 +2047,51 @@ mod rename_tests {
 
     #[tokio::test]
     #[serial]
+    async fn metadata_only_rename_allows_unavailable_managed_checkout() {
+        let _guard = crate::session::test_support::isolate_app_dir();
+        let _tie_guard = crate::session::test_support::TieWorkdirToNameGuard::set(false);
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Storage::new_unwatched("metadata-only").unwrap();
+        let mut row = Instance::new(
+            "before",
+            dir.path().join("missing-checkout").to_str().unwrap(),
+        );
+        row.status = Status::Running;
+        row.worktree_info = Some(crate::session::WorktreeInfo {
+            branch: "before".into(),
+            main_repo_path: dir
+                .path()
+                .join("missing-repo")
+                .to_string_lossy()
+                .into_owned(),
+            managed_by_aoe: true,
+            created_at: chrono::Utc::now(),
+            base_branch: None,
+        });
+        storage
+            .update(|rows, _| {
+                rows.push(row.clone());
+                Ok(())
+            })
+            .unwrap();
+        rename_session(
+            "metadata-only",
+            args(&row.id, Some("after"), Some("work"), None),
+        )
+        .await
+        .unwrap();
+        let renamed = storage.load().unwrap().remove(0);
+        assert_eq!(renamed.title, "after");
+        assert_eq!(renamed.group_path, "work");
+        assert_eq!(renamed.project_path, row.project_path);
+        assert_eq!(renamed.worktree_info, row.worktree_info);
+        assert!(renamed.lifecycle_reservation.is_none());
+        assert!(!dir.path().join("missing-checkout").exists());
+        assert!(!dir.path().join("missing-repo").exists());
+    }
+
+    #[tokio::test]
+    #[serial]
     async fn worktree_edit_consults_profile_status_rules() {
         if crate::tmux::tmux_command().arg("-V").output().is_err() {
             eprintln!("Skipping: tmux not available");
@@ -2368,12 +2119,18 @@ mod rename_tests {
 
         let dir = tempfile::tempdir().unwrap();
         let worktree = dir.path().join("agent-old");
-        std::fs::create_dir(&worktree).unwrap();
+        let (repo_dir, repo) = crate::git::test_support::init_repo();
+        let base = repo.head().unwrap().shorthand().unwrap().to_string();
+        crate::git::GitWorktree::new(repo_dir.path().to_path_buf())
+            .unwrap()
+            .with_init_submodules(false)
+            .create_worktree("agent-old", &worktree, true, Some(&base))
+            .unwrap();
         let mut target = Instance::new("Busy", worktree.to_str().unwrap());
         target.tool = AGENT.to_string();
         target.worktree_info = Some(crate::session::WorktreeInfo {
             branch: "agent-old".into(),
-            main_repo_path: dir.path().join("repo").to_str().unwrap().into(),
+            main_repo_path: repo_dir.path().to_str().unwrap().into(),
             managed_by_aoe: true,
             created_at: chrono::Utc::now(),
             base_branch: None,
@@ -2427,15 +2184,14 @@ mod rename_tests {
         )
         .await
         .unwrap_err();
-        assert!(
-            error.to_string().contains("while the session is active"),
-            "{error}"
-        );
+        assert!(matches!(
+            error.downcast_ref::<crate::session::rename::RenameRejected>(),
+            Some(crate::session::rename::RenameRejected::Active)
+        ));
         assert!(worktree.is_dir());
-        assert_eq!(
-            storage.load().unwrap()[0].project_path,
-            worktree.to_str().unwrap()
-        );
+        let unchanged = storage.load().unwrap().remove(0);
+        assert_eq!(unchanged.project_path, worktree.to_str().unwrap());
+        assert!(unchanged.lifecycle_reservation.is_none());
     }
 
     #[test]
@@ -2468,111 +2224,40 @@ async fn set_worktree_name(profile: &str, args: SetWorktreeNameArgs) -> Result<(
         }
     };
 
-    let id = inst.id.clone();
-    let _identity_lock = acquire_session_identity_lock()?;
-    let _lifecycle_lock = storage
-        .acquire_instance_lifecycle_lock(&id)
-        .context("failed to acquire worktree rename lifecycle lock")?;
-    let authoritative_instances = storage.load()?;
-    let inst = authoritative_instances
-        .iter()
-        .find(|instance| instance.id == id)
-        .ok_or_else(|| anyhow::anyhow!("Session not found: {}", id))?;
-    let mut inst = inst.clone();
-    if let Err(error) = crate::session::worktree_reconcile::reconcile_and_persist(
-        &storage,
-        &mut inst,
-        &mut Default::default(),
-    ) {
-        tracing::warn!(target: "cli.session", session = %id, "worktree path reconciliation skipped: {error}");
-    }
-    let current_path = inst.project_path.clone();
-    let Some(worktree_info) = inst.worktree_info.clone() else {
-        bail!("Session does not use a worktree");
-    };
-    if inst.tie_workdir_applies(
-        crate::session::config::profile_config::resolve_config_or_warn(profile)
-            .session
-            .tie_workdir_to_name,
-    ) {
-        bail!("Renaming is unified while session.tie_workdir_to_name is on; use 'aoe session rename --title <name>' instead, and the worktree directory follows. Disable the setting to edit the directory independently.");
-    }
-    let duplicate_path = crate::session::worktree_edit::target_worktree_path(
-        std::path::Path::new(&current_path),
-        args.name.trim(),
-    )
-    .unwrap_or_else(|| std::path::PathBuf::from(&current_path))
-    .to_string_lossy()
-    .into_owned();
-    if duplicate_path.trim_end_matches('/') != current_path.trim_end_matches('/')
-        && is_duplicate_session(
-            authoritative_instances.iter(),
-            &inst.title,
-            &duplicate_path,
-            Some(&id),
+    let baseline = inst.clone();
+    let committed = tokio::task::spawn_blocking(move || {
+        crate::session::rename::perform(
+            crate::session::rename::Request {
+                baseline,
+                edit: crate::session::rename::Edit::Workdir {
+                    name: args.name.trim().to_string(),
+                    rename_branch: args.rename_branch,
+                },
+                file_watch: crate::file_watch::FileWatchService::noop(),
+            },
+            |_, _| Ok(()),
         )
+    })
+    .await??;
+    println!("✓ Worktree moved to: {}", committed.instance.project_path);
+    if committed
+        .original
+        .worktree_info
+        .as_ref()
+        .map(|info| &info.branch)
+        != committed
+            .instance
+            .worktree_info
+            .as_ref()
+            .map(|info| &info.branch)
     {
-        return Err(duplicate_session_error(&inst.title));
-    }
-    let mut live = inst.clone();
-    live.source_profile = profile.to_string();
-    crate::tmux::refresh_session_cache();
-    live.update_status_with_metadata(None, None);
-    let moves_worktree = crate::session::worktree_edit::worktree_move_required(
-        std::path::Path::new(&current_path),
-        args.name.trim(),
-    );
-    if live.status.blocks_worktree_edit()
-        || (moves_worktree
-            && crate::session::worktree_edit::ensure_sandbox_container_released(
-                &id,
-                live.is_sandboxed(),
-            ))
-    {
-        bail!("Cannot edit the workdir name while the session is active; stop it first");
-    }
-
-    let outcome = crate::session::worktree_edit::edit_worktree_workdir(
-        crate::session::worktree_edit::WorktreeEditRequest {
-            worktree_info: &worktree_info,
-            current_path: std::path::Path::new(&current_path),
-            new_name: args.name.trim(),
-            rename_branch: args.rename_branch,
-        },
-    )?;
-    if outcome.new_path != std::path::Path::new(&current_path) {
-        crate::session::worktree_edit::discard_sandbox_container_after_move(
-            &id,
-            live.is_sandboxed(),
+        println!(
+            "  Branch renamed to: {}",
+            committed.instance.worktree_info.as_ref().unwrap().branch
         );
     }
-    let new_path = outcome.new_path.to_string_lossy().to_string();
-    let new_branch = outcome.new_branch.clone();
-
-    storage
-        .update(|instances, _groups| {
-            let inst = instances
-                .iter_mut()
-                .find(|i| i.id == id)
-                .ok_or_else(|| anyhow::anyhow!("Session not found: {}", id))?;
-            inst.project_path = new_path.clone();
-            if let Some(branch) = &new_branch {
-                if let Some(wt) = inst.worktree_info.as_mut() {
-                    wt.branch = branch.clone();
-                }
-            }
-            Ok(())
-        })
-        .map_err(|e| {
-            anyhow::anyhow!(
-                "Worktree was moved on disk to {new_path}, but persisting the new session metadata failed: {e}. Re-run to retry."
-            )
-        })?;
-    drop(_identity_lock);
-
-    println!("✓ Worktree moved to: {}", new_path);
-    if let Some(branch) = &new_branch {
-        println!("  Branch renamed to: {}", branch);
+    if let Some(warning) = committed.warning {
+        eprintln!("Warning: {warning}");
     }
     Ok(())
 }
@@ -2690,7 +2375,6 @@ async fn add_project(profile: &str, args: AddProjectArgs) -> Result<()> {
     let inst = super::resolve_session(&args.identifier, &instances)?;
     let id = inst.id.clone();
     let title = inst.title.clone();
-    let is_sandboxed = inst.is_sandboxed();
 
     if inst.status.blocks_worktree_edit() {
         bail!(
@@ -2718,19 +2402,26 @@ async fn add_project(profile: &str, args: AddProjectArgs) -> Result<()> {
         crate::session::attach_project::ExistingBranch::Refuse
     };
 
-    let plan = crate::session::attach_project::plan(inst, profile, &repo_path, on_existing)?;
-    let restarts = crate::session::attach_project::needs_restart(&plan, is_sandboxed);
+    let mut plan = crate::session::attach_project::plan(inst, profile, &repo_path, on_existing)?;
+    let inst = crate::session::attach_project::reserve_attach(&storage, &mut plan)?;
+    let restarts = crate::session::attach_project::needs_restart(&plan, inst.is_sandboxed());
     let quiesced = if restarts {
         println!("Stopping '{title}' so its working directory can move...");
-        crate::session::attach_project::quiesce_for_conversion(&storage, inst)?
+        crate::session::attach_project::quiesce_for_conversion(&storage, &plan)
+            .map_err(|error| crate::session::attach_project::cancel_attach(&plan, error))?
     } else {
-        crate::session::attach_project::Quiesced::default()
+        crate::session::attach_project::Quiesced {
+            attach_generation: inst.lifecycle_generation,
+            ..Default::default()
+        }
     };
 
-    let outcome = match crate::session::attach_project::attach_planned(&storage, &id, inst, plan) {
+    let outcome = match crate::session::attach_project::attach_planned(&storage, &id, &inst, plan) {
         Ok(outcome) => outcome,
         Err(e) => {
-            crate::session::attach_project::resume_after_conversion(&storage, &id, quiesced);
+            crate::session::attach_project::resume_after_conversion(
+                &storage, &inst, quiesced, None,
+            );
             return Err(e);
         }
     };
@@ -2762,8 +2453,12 @@ async fn add_project(profile: &str, args: AddProjectArgs) -> Result<()> {
     } else {
         println!("The agent is already working in this directory, so nothing was restarted.");
     }
-    for warning in crate::session::attach_project::resume_after_conversion(&storage, &id, quiesced)
-    {
+    for warning in crate::session::attach_project::resume_after_conversion(
+        &storage,
+        &inst,
+        quiesced,
+        Some(&outcome),
+    ) {
         println!("  Warning:  {warning}");
     }
 

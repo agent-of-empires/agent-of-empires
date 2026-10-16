@@ -54,6 +54,10 @@ impl TrashPoller {
     pub(crate) fn is_pending(&self, id: &str) -> bool {
         self.worker.is_pending(id)
     }
+    #[cfg(test)]
+    pub(crate) fn finish_for_test(&mut self) -> std::thread::Result<()> {
+        self.worker.finish_for_test()
+    }
 }
 
 impl Default for TrashPoller {
@@ -72,7 +76,7 @@ mod tests {
 
     impl Drop for TestPoller {
         fn drop(&mut self) {
-            if let Some(poller) = self.0.take() {
+            if let Some(mut poller) = self.0.take() {
                 let _ = poller.worker.finish_for_test();
             }
         }
@@ -116,13 +120,10 @@ mod tests {
         let poller = held.0.as_mut().unwrap();
         let session_id = instance.id.clone();
 
-        poller.request_trash(TrashRequest {
-            session_id: session_id.clone(),
-            instance,
-            generation,
-        });
-        assert_eq!(poller.take_pending(), vec![session_id.clone()]);
-        assert!(poller.take_pending().is_empty(), "take_pending drains");
+        let storage = crate::session::Storage::open_unwatched("default").unwrap();
+        poller.request_trash(
+            crate::session::trash::prepare_trash(&storage, &instance, generation).unwrap(),
+        );
 
         let result = loop {
             match poller.try_recv_result() {
@@ -131,8 +132,17 @@ mod tests {
                 Err(error) => panic!("trash worker disconnected: {error}"),
             }
         };
-        assert_eq!(result.session_id, session_id);
-        assert!(result.relocation.is_none());
+        let durable = storage
+            .load()
+            .unwrap()
+            .into_iter()
+            .find(|row| row.id == session_id)
+            .unwrap();
+        assert_eq!(durable.created_at, instance.created_at);
+        assert_eq!(durable.lifecycle_generation, generation);
+        assert!(durable.is_trashed());
+        assert!(durable.lifecycle_reservation.is_none());
+        assert!(crate::session::move_journal::scan().entries.is_empty());
         assert!(
             result.relocate_warning.is_none(),
             "{:?}",

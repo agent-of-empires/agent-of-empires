@@ -58,7 +58,7 @@ fn captured_env(name: &str) -> Option<String> {
     crate::tmux::env::get_hidden_env(name, crate::tmux::env::AOE_CAPTURED_SESSION_ID_KEY)
 }
 
-fn build_view_with_inst(profile: &str, inst: &Instance) -> HomeView {
+fn build_view_with_inst(profile: &str, inst: &Instance) -> lifecycle::TestHomeView {
     use crate::session::config::GroupByMode;
     let storage = Storage::new_unwatched(profile).unwrap();
     storage

@@ -304,6 +304,9 @@ async fn run(
         Some(Commands::Uninstall(args)) => return cli::uninstall::run(args).await,
         Some(Commands::Update(args)) => return cli::update::run(args).await,
         Some(Commands::Migrate) => return cli::migrate::run(),
+        Some(Commands::Intents { command }) => {
+            return cli::intents::run(cli.profile.as_deref().unwrap_or_default(), command);
+        }
 
         Some(Commands::Stop { .. }) => return cli::killall::stop_trap(),
         _ => {}
@@ -328,6 +331,32 @@ async fn run(
         agent_of_empires::session::poller::configure_session_id_poller_max_threads(
             agent_of_empires::session::poller::configured_session_id_poller_max_threads(&profile),
         );
+    }
+
+    if matches!(
+        cli.command.as_ref(),
+        Some(
+            Commands::Add(_)
+                | Commands::List(_)
+                | Commands::Ps(_)
+                | Commands::Remove(_)
+                | Commands::Send(_)
+                | Commands::Status(_)
+                | Commands::Session { .. }
+                | Commands::Group { .. }
+                | Commands::Project { .. }
+                | Commands::Worktree { .. }
+        )
+    ) {
+        let conflicts = tokio::task::spawn_blocking(|| {
+            agent_of_empires::session::Storage::recover_pending_moves(
+                agent_of_empires::file_watch::FileWatchService::noop(),
+            )
+        })
+        .await??;
+        for conflict in conflicts {
+            eprintln!("warning: {conflict}");
+        }
     }
 
     // Unknown keys are only reported here; parse failures only when no subscriber is up.

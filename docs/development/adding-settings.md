@@ -36,7 +36,7 @@ A new section struct is not the one-edit case: add it to `build_schema` in `sett
 
 Beyond `label`, `desc` (defaults to the doc comment), `widget`, `options`, `min` / `max` / `step`, and `multiline` / `mono`:
 
-- `validate`: the server-authoritative check (`range:MIN[:MAX]`, `nonempty`, `memory_limit`, `volume_list`, `env_list`, `port_mapping_list`, `capability_list`, `security_opt_list`, `network`, `systemd_slice`). If none fits, add a `ValidationKind` variant and a `validate=` keyword; that one rule drives both the client UX validator and the server gate.
+- `validate`: the server-authoritative check (`range:MIN[:MAX]`, `nonempty`, `memory_limit`, `volume_list`, `env_list`, `port_mapping_list`, `capability_list`, `security_opt_list`, `sync_path_list`, `network`, `systemd_slice`). If none fits, add a `ValidationKind` variant and a `validate=` keyword; that one rule drives both the client UX validator and the server gate.
 - `web`: `elevation:<reason>` (passphrase step-up to save from the web) or `local_only:<reason>` (a host-execution surface the server rejects and the dashboard never renders, such as a binary path or command argv). Omit for a plain allow.
 - `repo`: `allow` or `deny`, defaulting to the section's `repo_default`. Global-only fields are never repo-settable.
 - `category` overrides the section's TUI tab, `advanced` groups the field under an Advanced fold, `tui_only` marks a field only the TUI reads so the web folds it under "Terminal UI", `global_only` shows it but makes it non-overridable per profile, and `skip` excludes it from the schema entirely.

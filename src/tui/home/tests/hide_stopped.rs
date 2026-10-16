@@ -469,9 +469,8 @@ fn a_session_menu_closes_when_its_session_is_hidden() {
     let id = select_session(&mut env, "util-live");
     env.view.list_inner_area = ratatui::layout::Rect::new(1, 1, 28, 20);
     env.view.list_area = ratatui::layout::Rect::new(0, 0, 30, 22);
-    assert!(env
-        .view
-        .handle_right_click(5, env.view.list_inner_area.y + env.view.cursor as u16));
+    let row = env.view.list_inner_area.y + env.view.cursor as u16;
+    assert!(env.view.handle_right_click(5, row));
     assert_eq!(env.view.selected_session.as_deref(), Some(id.as_str()));
     assert!(env.view.context_menu.is_some());
 
@@ -680,6 +679,15 @@ fn restoring_a_session_the_filter_hides_selects_its_own_header() {
         ("trash", |view, id| {
             view.selected_session = Some(id.to_string());
             view.trash_session_by_id(id);
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while view.trash_poller.is_pending(id) {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "trash result never drained"
+                );
+                view.apply_trash_results();
+                std::thread::yield_now();
+            }
             assert!(view.get_instance(id).unwrap().is_trashed());
         }),
     ];
@@ -698,11 +706,16 @@ fn restoring_a_session_the_filter_hides_selects_its_own_header() {
         );
 
         env.view.toggle_archive_at_cursor().unwrap();
+        env.view.finish_restore_for_test();
 
         let inst = env.view.get_instance(&id).unwrap();
         assert!(
             !inst.is_archived() && !inst.is_trashed(),
-            "{case}: restored"
+            "{case}: restored; info_dialog={:?}",
+            env.view
+                .info_dialog
+                .as_ref()
+                .map(|dialog| (dialog.title(), dialog.message())),
         );
         assert_eq!(
             inst.status,

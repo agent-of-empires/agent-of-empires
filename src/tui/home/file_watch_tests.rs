@@ -33,7 +33,7 @@ fn watcher_err(profile: Option<&str>, message: &str) -> WatcherInitError {
 }
 
 struct Env {
-    view: HomeView,
+    view: super::lifecycle::TestHomeView,
     live: Arc<FileWatchService>,
     temp: TempDir,
     _home: HomeGuard,

@@ -168,32 +168,6 @@ impl Instance {
         combine_teardown_results(pane, native)
     }
 
-    pub(crate) fn kill_clean(&self) -> Result<()> {
-        let profile = self.effective_profile();
-        let storage = crate::session::storage::Storage::new(&profile, self.resolve_file_watch())
-            .context("failed to open lifecycle lock storage")?;
-        let _lifecycle_lock = storage
-            .acquire_instance_lifecycle_lock(&self.id)
-            .context("failed to acquire instance kill lock")?;
-        let mut lifecycle = self.clone();
-        lifecycle.acquire_lifecycle_reservation(&storage, LifecycleOperation::Stop, None)?;
-        match self.kill_clean_locked() {
-            Ok(()) => lifecycle.commit_lifecycle_status(
-                &storage,
-                LifecycleOperation::Stop,
-                Status::Stopped,
-            ),
-            Err(error) => {
-                let _ = lifecycle.commit_lifecycle_status(
-                    &storage,
-                    LifecycleOperation::Stop,
-                    Status::Error,
-                );
-                Err(error)
-            }
-        }
-    }
-
     pub(crate) fn kill_locked(&self) -> Result<()> {
         self.stop_poller();
         let pane = self.tmux_session().and_then(|session| {
@@ -253,6 +227,10 @@ impl Instance {
                     return;
                 }
             };
+        self.kill_all_tmux_sessions_with(&storage);
+    }
+
+    pub(crate) fn kill_all_tmux_sessions_with(&self, storage: &crate::session::Storage) {
         let _lifecycle_lock = match storage.acquire_instance_lifecycle_lock(&self.id) {
             Ok(lock) => lock,
             Err(error) => {
@@ -265,7 +243,7 @@ impl Instance {
                 return;
             }
         };
-        self.stop_all_tmux_sessions_locked(&storage);
+        self.stop_all_tmux_sessions_locked(storage);
     }
 
     /// [`Self::kill_all_tmux_sessions`] for a caller already holding this instance's lifecycle
@@ -521,7 +499,8 @@ mod tests {
                 .success());
             crate::tmux::refresh_session_cache();
             let result = if clean {
-                inst.kill_clean()
+                let _lifecycle = storage.acquire_instance_lifecycle_lock(&inst.id).unwrap();
+                inst.kill_clean_locked()
             } else {
                 inst.kill()
             };
@@ -537,7 +516,10 @@ mod tests {
                 .into_iter()
                 .find(|row| row.id == inst.id)
                 .unwrap();
-            assert_eq!(persisted.status, Status::Error);
+            assert_eq!(
+                persisted.status,
+                if clean { inst.status } else { Status::Error }
+            );
             assert_eq!(
                 persisted.prime_runtime().unwrap().directory,
                 runtime.directory

@@ -40,6 +40,10 @@ impl StopPoller {
     pub fn take_pending(&mut self) -> Vec<String> {
         self.worker.take_pending()
     }
+    #[cfg(test)]
+    pub(crate) fn finish_for_test(&mut self) -> std::thread::Result<()> {
+        self.worker.finish_for_test()
+    }
 }
 
 impl Default for StopPoller {
@@ -58,7 +62,7 @@ mod tests {
 
     impl Drop for TestPoller {
         fn drop(&mut self) {
-            if let Some(poller) = self.0.take() {
+            if let Some(mut poller) = self.0.take() {
                 let _ = poller.worker.finish_for_test();
             }
         }

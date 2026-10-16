@@ -222,6 +222,8 @@ pub enum ValidationKind {
     PortMappingList,
     CapabilityList,
     SecurityOptList,
+    /// `path` or `agent:path` entries relative to an agent's host config dir.
+    SyncPathList,
     /// Empty, `none`, `bridge`, or a named network; `host` would defeat isolation.
     Network,
     /// A systemd slice unit name ending in `.slice`.

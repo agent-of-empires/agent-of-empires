@@ -562,7 +562,7 @@ pub fn refresh_session_cache() -> SessionCacheRefresh {
 
 /// Existence of the selected agent session, where an ambiguous resolution is
 /// Unknown rather than Absent.
-fn resolved_agent_existence(
+pub(crate) fn resolved_agent_existence(
     id: &str,
     session: &Session,
     refresh: SessionCacheRefresh,

@@ -6,6 +6,7 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use crate::git::{GitWorktree, WorktreeEntry};
+use crate::session::environment::shell_escape_script_word;
 use crate::session::Storage;
 
 #[derive(Subcommand)]
@@ -275,35 +276,64 @@ async fn cleanup_orphaned(profile: &str, force: bool) -> Result<()> {
         return Ok(());
     }
 
+    let ownership = crate::session::storage::acquire_ownership_lock()?;
+    let _identity =
+        crate::session::storage::acquire_session_identity_lock_with_ownership(&ownership)?;
+    storage.verify_profile_available()?;
     let mut removed_count = 0;
 
     if !orphaned_sessions.is_empty() {
-        let orphan_ids: HashSet<String> = orphaned_sessions.iter().map(|o| o.id.clone()).collect();
-        storage.update(|all_instances, _groups| {
-            all_instances.retain(|inst| !orphan_ids.contains(&inst.id));
-            Ok(())
+        let removed = storage.update_with_ownership(&ownership, |all_instances, _groups| {
+            let before = all_instances.len();
+            all_instances.retain(|inst| {
+                let Some(snapshot) = orphaned_sessions.iter().find(|old| old.id == inst.id) else {
+                    return true;
+                };
+                if inst.created_at != snapshot.created_at
+                    || inst.project_path != snapshot.project_path
+                    || inst.workspace_info.as_ref().map(|workspace| {
+                        (
+                            &workspace.workspace_dir,
+                            &workspace.branch,
+                            &workspace.repos,
+                            workspace.created_at,
+                            workspace.cleanup_on_delete,
+                        )
+                    }) != snapshot.workspace_info.as_ref().map(|workspace| {
+                        (
+                            &workspace.workspace_dir,
+                            &workspace.branch,
+                            &workspace.repos,
+                            workspace.created_at,
+                            workspace.cleanup_on_delete,
+                        )
+                    })
+                    || inst.worktree_info != snapshot.worktree_info
+                    || inst.lifecycle_reservation != snapshot.lifecycle_reservation
+                {
+                    return true;
+                }
+                let path = inst
+                    .workspace_info
+                    .as_ref()
+                    .map_or(Path::new(&inst.project_path), |workspace| {
+                        Path::new(&workspace.workspace_dir)
+                    });
+                !matches!(path.try_exists(), Ok(false))
+            });
+            Ok(before - all_instances.len())
         })?;
-
-        removed_count += orphaned_sessions.len();
-        println!("✓ Removed {} orphaned sessions", orphaned_sessions.len());
+        removed_count += removed;
+        println!("✓ Removed {removed} orphaned sessions");
     }
+    drop(_identity);
+    drop(ownership);
 
     if !orphaned_worktrees.is_empty() {
         let current_dir = std::env::current_dir()?;
         let main_repo = GitWorktree::find_main_repo(&current_dir)?;
         let git_wt = GitWorktree::new(main_repo)?;
-
-        for wt in &orphaned_worktrees {
-            match git_wt.remove_worktree(&wt.path, true) {
-                Ok(_) => {
-                    println!("✓ Removed worktree: {}", wt.path.display());
-                    removed_count += 1;
-                }
-                Err(e) => {
-                    eprintln!("✗ Failed to remove {}: {}", wt.path.display(), e);
-                }
-            }
-        }
+        removed_count += cleanup_worktrees(&git_wt, &orphaned_worktrees, storage.profile())?;
     }
 
     println!("\n✓ Cleanup complete: {} items removed", removed_count);
@@ -311,9 +341,245 @@ async fn cleanup_orphaned(profile: &str, force: bool) -> Result<()> {
     Ok(())
 }
 
+fn cleanup_worktrees(
+    git_wt: &GitWorktree,
+    candidates: &[WorktreeEntry],
+    profile: &str,
+) -> Result<usize> {
+    use crate::session::move_journal::{
+        self, EffectPhase, EffectRecord, JournalScope, MoveAuthority, MoveJournalEntry,
+        ProfileAuthority, ResourceEffect, ResourceKey, MOVE_JOURNAL_VERSION,
+    };
+    let (journal, mut entry) = {
+        let ownership = crate::session::storage::acquire_ownership_lock()?;
+        let storage = Storage::open_unwatched_with_ownership(profile, &ownership)?;
+        let claims =
+            crate::session::deletion::paths_in_use_except_with_ownership(&ownership, profile, &[]);
+        let live = git_wt.list_worktrees()?;
+        let protected = git_wt.protected_default_branch_names()?;
+        let main = crate::session::deletion::resolve_claim_path(&git_wt.repo_path)
+            .ok_or_else(|| anyhow::anyhow!("main checkout path cannot be resolved"))?;
+        let mut effects = Vec::new();
+        let mut resources = Vec::new();
+        for wt in candidates {
+            if claims.covers(&wt.path)
+                || crate::session::deletion::resolve_claim_path(&wt.path).as_ref() == Some(&main)
+                || !live
+                    .iter()
+                    .any(|current| current.path == wt.path && current.branch == wt.branch)
+                || wt
+                    .branch
+                    .as_ref()
+                    .is_some_and(|branch| protected.contains(branch))
+            {
+                println!(
+                    "Retained claimed or changed worktree: {}",
+                    wt.path.display()
+                );
+                continue;
+            }
+            let effect = ResourceEffect::RemoveWorktree {
+                repository: git_wt.repo_path.clone(),
+                path: wt.path.clone(),
+                force: true,
+            };
+            resources.push(ResourceKey::path(&wt.path, true)?);
+            if let Some(branch) = &wt.branch {
+                resources.push(ResourceKey::branch(&git_wt.repo_path, branch)?);
+            }
+            effects.push(EffectRecord {
+                effect,
+                phase: EffectPhase::Prepared,
+                before: None,
+                after: None,
+                error: None,
+                compensation: false,
+                retained: false,
+            });
+        }
+        if effects.is_empty() {
+            return Ok(0);
+        }
+        let inventory = move_journal::resource_inventory()?;
+        for (path, entry) in inventory {
+            anyhow::ensure!(
+                !resources.iter().any(|key| entry.reserved_resources().iter().any(|held| key.intent_overlaps(held))),
+                "cleanup resource is busy in {}; inspect with `aoe intents list`; clear with `aoe intents clear {} --actors-stopped`",
+                path.display(), shell_escape_script_word(&path.to_string_lossy())
+            );
+        }
+        resources.sort_unstable();
+        resources.dedup();
+        let authority = ProfileAuthority::capture(&storage)?;
+        let entry = MoveJournalEntry {
+            version: MOVE_JOURNAL_VERSION,
+            ids: Vec::new(),
+            source_profile: profile.to_owned(),
+            target_profile: profile.to_owned(),
+            source_sessions_path: authority.sessions_path.clone(),
+            target_sessions_path: authority.sessions_path.clone(),
+            group_move_source_path: String::new(),
+            group_move_target_path: String::new(),
+            group_move_subtree: false,
+            created_at_epoch_ms: u64::try_from(chrono::Utc::now().timestamp_millis())?,
+            authority: MoveAuthority::Cleanup {
+                scope: JournalScope {
+                    profiles: vec![authority],
+                    resources,
+                },
+                effects,
+                abandoned: false,
+                conflict: None,
+            },
+        };
+        let journal = move_journal::record_live(&ownership, &entry)?;
+        (journal, entry)
+    };
+    let mut removed = 0;
+    let count = match &entry.authority {
+        MoveAuthority::Cleanup { effects, .. } => effects.len(),
+        _ => unreachable!(),
+    };
+    for index in 0..count {
+        let effect = {
+            let root = crate::session::storage::acquire_ownership_lock()?;
+            root.require_exclusive()?;
+            let MoveAuthority::Cleanup { effects, .. } = &mut entry.authority else {
+                unreachable!()
+            };
+            let record = &mut effects[index];
+            record.before = Some(record.effect.observe()?);
+            record.phase = EffectPhase::Pending;
+            let effect = record.effect.clone();
+            journal.rewrite(&entry)?;
+            effect
+        };
+        let ResourceEffect::RemoveWorktree { path, .. } = &effect else {
+            unreachable!()
+        };
+        let result = git_wt.remove_worktree(path, true);
+        let observed = effect.observe();
+        {
+            let root = crate::session::storage::acquire_ownership_lock()?;
+            root.require_exclusive()?;
+            let MoveAuthority::Cleanup { effects, .. } = &mut entry.authority else {
+                unreachable!()
+            };
+            let record = &mut effects[index];
+            record.error = result.as_ref().err().map(ToString::to_string);
+            match observed {
+                Ok(after) => {
+                    record.after = Some(after);
+                    record.phase = EffectPhase::Applied;
+                }
+                Err(error) => {
+                    record.phase = EffectPhase::Conflict;
+                    record.error = Some(format!("effect observation failed: {error:#}"));
+                }
+            }
+            journal.rewrite(&entry)?;
+        }
+        match result {
+            Ok(_) => {
+                println!("✓ Removed worktree: {}", path.display());
+                removed += 1;
+            }
+            Err(error) => eprintln!("✗ Failed to remove {}: {error}", path.display()),
+        }
+    }
+    if !crate::session::storage::recover_cleanup_journal(&journal, entry)? {
+        anyhow::bail!("cleanup intent retained at {}; inspect with `aoe intents list`; clear with `aoe intents clear {} --actors-stopped`", journal.path.display(), shell_escape_script_word(&journal.path.to_string_lossy()));
+    }
+    Ok(removed)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[serial_test::serial]
+    fn confirmed_cleanup_rechecks_late_and_unreadable_peer_claims() -> Result<()> {
+        let _app = crate::session::test_support::isolate_app_dir();
+        let temp = tempfile::tempdir()?;
+        let repo_path = temp.path().join("repo");
+        let repo = git2::Repository::init(&repo_path)?;
+        let signature = git2::Signature::now("Test", "test@example.invalid")?;
+        let tree_id = repo.index()?.write_tree()?;
+        repo.commit(
+            Some("HEAD"),
+            &signature,
+            &signature,
+            "initial",
+            &repo.find_tree(tree_id)?,
+            &[],
+        )?;
+        let base = repo.head()?.shorthand().unwrap().to_owned();
+        let git = GitWorktree::new(repo_path)?;
+        let path = temp.path().join("candidate");
+        git.create_worktree("candidate", &path, true, Some(&base))?;
+        let candidates: Vec<_> = git
+            .list_worktrees()?
+            .into_iter()
+            .filter(|worktree| worktree.branch.as_deref() == Some("candidate"))
+            .collect();
+        let cleaner = Storage::new_unwatched("cleaner")?;
+        let peer = Storage::new_unwatched("late-peer")?;
+        peer.update(|rows, _| {
+            rows.push(crate::session::Instance::new(
+                "peer",
+                path.to_str().unwrap(),
+            ));
+            Ok(())
+        })?;
+        assert_eq!(cleanup_worktrees(&git, &candidates, cleaner.profile())?, 0);
+        assert!(path.is_dir());
+        assert_eq!(peer.load()?[0].project_path, path.to_string_lossy());
+        std::fs::write(
+            peer.sessions_path(),
+            r#"[{"project_path":"/unreadable-owner"}]"#,
+        )?;
+        assert_eq!(cleanup_worktrees(&git, &candidates, cleaner.profile())?, 0);
+        assert!(path.is_dir());
+        std::fs::write(peer.sessions_path(), "[]")?;
+        let gate = crate::session::test_support::GitCommandGate::new(
+            temp.path(),
+            "[ \"$1\" = worktree ] && [ \"$2\" = remove ]",
+            false,
+        );
+        let worker_git = GitWorktree::new(git.repo_path.clone())?;
+        let profile = cleaner.profile().to_owned();
+        let worker =
+            std::thread::spawn(move || cleanup_worktrees(&worker_git, &candidates, &profile));
+        let entered = gate.wait_entered();
+        let root_free = crate::session::storage::try_acquire_ownership_lock()?.is_some();
+        let adoption_refused = root_free
+            && peer
+                .update(|rows, _| {
+                    rows.push(crate::session::Instance::new(
+                        "late adopter",
+                        path.to_str().unwrap(),
+                    ));
+                    Ok(())
+                })
+                .is_err();
+        let namespace_refused =
+            root_free && crate::session::rename_profile("cleaner", "moved-cleaner").is_err();
+        gate.release();
+        let count = worker.join().unwrap()?;
+        assert!(entered, "cleanup did not reach git worktree remove");
+        assert!(root_free, "cleanup retained Root during Git removal");
+        assert!(adoption_refused, "cleanup did not reserve the rowless path");
+        assert!(
+            namespace_refused,
+            "cleanup did not fence its participating profile"
+        );
+        assert_eq!(count, 1);
+        assert!(crate::session::move_journal::scan().entries.is_empty());
+        assert!(!path.exists());
+        assert!(git.branch_exists("candidate")?);
+        Ok(())
+    }
 
     fn entry(path: &str, branch: Option<&str>) -> WorktreeEntry {
         WorktreeEntry {

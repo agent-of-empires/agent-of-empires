@@ -508,37 +508,37 @@ impl SessionService {
             }
             (inst.source_profile.clone(), wake, was_idle_dormant)
         };
-        if let Ok(storage) = crate::session::Storage::new(&profile, self.file_watch.clone()) {
-            let id_clone = id.to_string();
-            let outcome = tokio::task::spawn_blocking(move || {
-                storage.update(|instances, _groups| {
-                    let Some(inst) = instances.iter_mut().find(|i| i.id == id_clone) else {
-                        return Ok(None);
-                    };
-                    // A peer (e.g. the CLI) may have archived or trashed the row since the
-                    // memory check; waking it here would clear that.
-                    if let Err(blocked) = inst.ensure_startable() {
-                        return Ok(Some(blocked));
-                    }
-                    apply_prompt_persist_to_disk(inst, wake);
-                    Ok(None)
-                })
+        let file_watch = self.file_watch.clone();
+        let id_clone = id.to_string();
+        let outcome = tokio::task::spawn_blocking(move || {
+            let storage = crate::session::Storage::new(&profile, file_watch)?;
+            storage.update(|instances, _groups| {
+                let Some(inst) = instances.iter_mut().find(|i| i.id == id_clone) else {
+                    return Ok(None);
+                };
+                // A peer (e.g. the CLI) may have archived or trashed the row since the
+                // memory check; waking it here would clear that.
+                if let Err(blocked) = inst.ensure_startable() {
+                    return Ok(Some(blocked));
+                }
+                apply_prompt_persist_to_disk(inst, wake);
+                Ok(None)
             })
-            .await;
-            match outcome {
-                Ok(Ok(None)) => {}
-                Ok(Ok(Some(blocked))) => return PromptTouch::Blocked(blocked),
-                Ok(Err(e)) => tracing::warn!(
-                    target: "server.session_service",
-                    session = %id,
-                    "failed to save after prompt touch and wake: {e}"
-                ),
-                Err(join_err) => tracing::warn!(
-                    target: "server.session_service",
-                    session = %id,
-                    "spawn_blocking join error during prompt touch save: {join_err}"
-                ),
-            }
+        })
+        .await;
+        match outcome {
+            Ok(Ok(None)) => {}
+            Ok(Ok(Some(blocked))) => return PromptTouch::Blocked(blocked),
+            Ok(Err(e)) => tracing::warn!(
+                target: "server.session_service",
+                session = %id,
+                "failed to save after prompt touch and wake: {e}"
+            ),
+            Err(join_err) => tracing::warn!(
+                target: "server.session_service",
+                session = %id,
+                "spawn_blocking join error during prompt touch save: {join_err}"
+            ),
         }
         PromptTouch::Touched {
             idle_dormant: woke_idle_dormant,
@@ -758,33 +758,25 @@ impl SessionService {
                 self.invalidate_disk_snapshots();
             }
         }
-        match crate::session::Storage::new(&profile, self.file_watch.clone()) {
-            Ok(storage) => {
-                let id_persist = id.to_string();
-                let persisted = tokio::task::spawn_blocking(move || {
-                    storage.update(|instances, _groups| {
-                        if let Some(inst) = instances.iter_mut().find(|i| i.id == id_persist) {
-                            inst.pending_initial_turn = None;
-                        }
-                        Ok(())
-                    })
-                })
-                .await;
-                if !matches!(persisted, Ok(Ok(()))) {
-                    tracing::warn!(
-                        target: "acp.supervisor",
-                        session = %id,
-                        "failed to persist pending initial turn clear; a daemon restart re-delivers it"
-                    );
+        let file_watch = Arc::clone(&self.file_watch);
+        let id_persist = id.to_owned();
+        let persisted = tokio::task::spawn_blocking(move || {
+            let storage = crate::session::Storage::new(&profile, file_watch)?;
+            storage.update(|instances, _groups| {
+                if let Some(inst) = instances.iter_mut().find(|i| i.id == id_persist) {
+                    inst.pending_initial_turn = None;
                 }
-            }
-            Err(e) => {
-                tracing::warn!(
-                    target: "acp.supervisor",
-                    session = %id,
-                    "failed to open storage to clear pending initial turn: {e}"
-                );
-            }
+                Ok(())
+            })
+        })
+        .await;
+        if !matches!(persisted, Ok(Ok(()))) {
+            tracing::warn!(
+                target: "acp.supervisor",
+                session = %id,
+                outcome = ?persisted,
+                "failed to persist pending initial turn clear; a daemon restart re-delivers it"
+            );
         }
     }
 
@@ -813,33 +805,25 @@ impl SessionService {
                 _ => return,
             }
         };
-        match crate::session::Storage::new(&profile, self.file_watch.clone()) {
-            Ok(storage) => {
-                let id_persist = id.to_string();
-                let persisted = tokio::task::spawn_blocking(move || {
-                    storage.update(|instances, _groups| {
-                        if let Some(inst) = instances.iter_mut().find(|i| i.id == id_persist) {
-                            inst.pending_initial_turn = Some(turn);
-                        }
-                        Ok(())
-                    })
-                })
-                .await;
-                if !matches!(persisted, Ok(Ok(()))) {
-                    tracing::warn!(
-                        target: "acp.supervisor",
-                        session = %id,
-                        "failed to persist resume continuation turn; it still drains this daemon life"
-                    );
+        let file_watch = Arc::clone(&self.file_watch);
+        let id_persist = id.to_owned();
+        let persisted = tokio::task::spawn_blocking(move || {
+            let storage = crate::session::Storage::new(&profile, file_watch)?;
+            storage.update(|instances, _groups| {
+                if let Some(inst) = instances.iter_mut().find(|i| i.id == id_persist) {
+                    inst.pending_initial_turn = Some(turn);
                 }
-            }
-            Err(e) => {
-                tracing::warn!(
-                    target: "acp.supervisor",
-                    session = %id,
-                    "failed to open storage for resume continuation turn: {e}"
-                );
-            }
+                Ok(())
+            })
+        })
+        .await;
+        if !matches!(persisted, Ok(Ok(()))) {
+            tracing::warn!(
+                target: "acp.supervisor",
+                session = %id,
+                outcome = ?persisted,
+                "failed to persist resume continuation turn; it still drains this daemon life"
+            );
         }
     }
 
@@ -857,33 +841,25 @@ impl SessionService {
                 _ => return,
             }
         };
-        match crate::session::Storage::new(&profile, self.file_watch.clone()) {
-            Ok(storage) => {
-                let id_persist = id.to_string();
-                let persisted = tokio::task::spawn_blocking(move || {
-                    storage.update(|instances, _groups| {
-                        if let Some(inst) = instances.iter_mut().find(|i| i.id == id_persist) {
-                            inst.pending_initial_turn = None;
-                        }
-                        Ok(())
-                    })
-                })
-                .await;
-                if !matches!(persisted, Ok(Ok(()))) {
-                    tracing::warn!(
-                        target: "acp.supervisor",
-                        session = %id,
-                        "failed to persist pending-turn clear; the drain re-checks liveness before delivery"
-                    );
+        let file_watch = Arc::clone(&self.file_watch);
+        let id_persist = id.to_owned();
+        let persisted = tokio::task::spawn_blocking(move || {
+            let storage = crate::session::Storage::new(&profile, file_watch)?;
+            storage.update(|instances, _groups| {
+                if let Some(inst) = instances.iter_mut().find(|i| i.id == id_persist) {
+                    inst.pending_initial_turn = None;
                 }
-            }
-            Err(e) => {
-                tracing::warn!(
-                    target: "acp.supervisor",
-                    session = %id,
-                    "failed to open storage to clear pending turn: {e}"
-                );
-            }
+                Ok(())
+            })
+        })
+        .await;
+        if !matches!(persisted, Ok(Ok(()))) {
+            tracing::warn!(
+                target: "acp.supervisor",
+                session = %id,
+                outcome = ?persisted,
+                "failed to persist pending-turn clear; the drain re-checks liveness before delivery"
+            );
         }
     }
 
@@ -930,31 +906,24 @@ impl SessionService {
                 transaction,
             )
         };
-        match crate::session::Storage::new(&profile, self.file_watch.clone()) {
-            Ok(storage) => {
-                let id_persist = id.to_string();
-                let persisted = tokio::task::spawn_blocking(move || {
-                    let _transaction = transaction;
-                    storage.update(|instances, _groups| {
-                        if let Some(inst) = instances.iter_mut().find(|i| i.id == id_persist) {
-                            inst.queued_prompts = mirrored.queued_prompts;
-                            inst.queued_prompt_next_seq = mirrored.queued_prompt_next_seq;
-                            inst.idle_dormant_since = mirrored.idle_dormant_since;
-                            // Monotone max, never `touch_last_accessed()`.
-                            inst.last_accessed_at =
-                                inst.last_accessed_at.max(mirrored.last_accessed_at);
-                        }
-                        Ok(())
-                    })
-                })
-                .await;
-                if !matches!(persisted, Ok(Ok(()))) {
-                    tracing::warn!(target: "acp.queue", session = %id, "queue mutation was not persisted; a later reload may discard it");
+        let file_watch = Arc::clone(&self.file_watch);
+        let id_persist = id.to_owned();
+        let persisted = tokio::task::spawn_blocking(move || {
+            let _transaction = transaction;
+            let storage = crate::session::Storage::new(&profile, file_watch)?;
+            storage.update(|instances, _groups| {
+                if let Some(inst) = instances.iter_mut().find(|i| i.id == id_persist) {
+                    inst.queued_prompts = mirrored.queued_prompts;
+                    inst.queued_prompt_next_seq = mirrored.queued_prompt_next_seq;
+                    inst.idle_dormant_since = mirrored.idle_dormant_since;
+                    inst.last_accessed_at = inst.last_accessed_at.max(mirrored.last_accessed_at);
                 }
-            }
-            Err(e) => {
-                tracing::warn!(target: "acp.queue", session = %id, "failed to open storage for queue mutation: {e}");
-            }
+                Ok(())
+            })
+        })
+        .await;
+        if !matches!(persisted, Ok(Ok(()))) {
+            tracing::warn!(target: "acp.queue", session = %id, outcome = ?persisted, "queue mutation was not persisted; a later reload may discard it");
         }
         Some(result)
     }
@@ -2745,8 +2714,9 @@ mod tests {
 
     /// A disk reload whose snapshot predates an in-memory row change must not
     /// replace that change with the stale disk row.
-    #[tokio::test]
-    async fn a_stale_disk_reload_keeps_in_memory_row_changes() {
+    #[tokio::test(flavor = "current_thread")]
+    #[serial_test::serial]
+    async fn pending_turn_and_queue_persistence_leave_runtime_responsive_and_reject_stale_reload() {
         use crate::session::PendingInitialTurn;
         let _app_dir = crate::session::test_support::isolate_app_dir();
         let pending = || PendingInitialTurn {
@@ -2806,11 +2776,61 @@ mod tests {
             inst.pending_initial_turn = pending_turn;
             inst.idle_dormant_since = dormant.then(chrono::Utc::now);
             let state = crate::server::test_support::build_test_app_state(vec![inst.clone()]);
+            let storage = crate::session::Storage::new_unwatched(&inst.source_profile).unwrap();
+            storage
+                .update(|rows, _| {
+                    *rows = vec![inst.clone()];
+                    Ok(())
+                })
+                .unwrap();
             let read_epoch = state
                 .mutation_epoch
                 .load(std::sync::atomic::Ordering::SeqCst);
 
-            mutate(Arc::clone(&state.session_service)).await;
+            let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+            let (release_tx, release_rx) = std::sync::mpsc::channel();
+            let (held_tx, held_rx) = std::sync::mpsc::channel();
+            let holder = std::thread::spawn(move || {
+                let root = crate::session::storage::acquire_ownership_lock().unwrap();
+                ready_tx.send(()).unwrap();
+                let requested = release_rx
+                    .recv_timeout(std::time::Duration::from_secs(3))
+                    .is_ok();
+                drop(root);
+                held_tx.send(requested).unwrap();
+            });
+            ready_rx.recv().unwrap();
+            let (contended_tx, contended_rx) = std::sync::mpsc::channel();
+            let observer = crate::session::storage::observe_root_contention_for_test(contended_tx);
+            let mutation = tokio::spawn(mutate(Arc::clone(&state.session_service)));
+            let observed = tokio::task::spawn_blocking(move || {
+                contended_rx.recv_timeout(std::time::Duration::from_secs(3))
+            })
+            .await
+            .unwrap();
+            tokio::task::yield_now().await;
+            let (witness_tx, witness_rx) = tokio::sync::oneshot::channel();
+            tokio::spawn(async move {
+                let _ = witness_tx.send(());
+            });
+            witness_rx.await.unwrap();
+            let _ = release_tx.send(());
+            let returned_while_held = held_rx.recv().unwrap();
+            holder.join().unwrap();
+            mutation.await.unwrap();
+            drop(observer);
+            assert!(
+                observed.is_ok(),
+                "{name}: persistence did not encounter the held root"
+            );
+            assert!(
+                returned_while_held,
+                "{name}: storage admission blocked the runtime"
+            );
+            assert!(
+                check(&storage.load().unwrap()[0]),
+                "{name}: durable result missing"
+            );
             crate::server::reload::reload_state_instances_from_disk(
                 &state,
                 vec![inst],

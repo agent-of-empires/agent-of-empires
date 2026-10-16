@@ -74,6 +74,9 @@ This document contains the help content for the `aoe` command-line program.
 * [`aoe worktree list`↴](#aoe-worktree-list)
 * [`aoe worktree info`↴](#aoe-worktree-info)
 * [`aoe worktree cleanup`↴](#aoe-worktree-cleanup)
+* [`aoe intents`↴](#aoe-intents)
+* [`aoe intents list`↴](#aoe-intents-list)
+* [`aoe intents clear`↴](#aoe-intents-clear)
 * [`aoe tmux`↴](#aoe-tmux)
 * [`aoe tmux status`↴](#aoe-tmux-status)
 * [`aoe sounds`↴](#aoe-sounds)
@@ -159,6 +162,7 @@ Run without arguments to launch the TUI dashboard.
 * `project` — Manage the project registry used by multi-repo session pickers
 * `sandbox` — Inspect and reclaim per-session sandbox agent stores
 * `worktree` — Manage git worktrees for parallel development
+* `intents` — Inspect and explicitly clear interrupted resource intents
 * `tmux` — tmux integration utilities
 * `sounds` — Manage sound effects for agent state transitions
 * `theme` — Manage color themes (list, export, customize)
@@ -1216,6 +1220,45 @@ Cleanup orphaned worktrees
 ###### **Options:**
 
 * `-f`, `--force` — Actually remove worktrees (default is dry-run)
+
+
+
+## `aoe intents`
+
+Inspect and explicitly clear interrupted resource intents
+
+**Usage:** `aoe intents <COMMAND>`
+
+###### **Subcommands:**
+
+* `list` — List current, legacy and unreadable intents and orphaned session bindings
+* `clear` — Archive and abandon one intent without deleting any checkout, branch or container
+
+
+
+## `aoe intents list`
+
+List current, legacy and unreadable intents and orphaned session bindings
+
+**Usage:** `aoe intents list`
+
+
+
+## `aoe intents clear`
+
+Archive and abandon one intent without deleting any checkout, branch or container
+
+**Usage:** `aoe intents clear [OPTIONS] [PATH]`
+
+###### **Arguments:**
+
+* `<PATH>` — Exact JSON path printed by `aoe intents list`
+
+###### **Options:**
+
+* `--orphan-binding <ORPHAN_BINDING>` — Release only this session's reservation when its referenced JSON is missing
+* `--actors-stopped` — Attest that AoE producers and surviving Git/hook children are stopped and affected state has been inspected and reconciled. A free parent lease does not establish this
+* `--reason <REASON>` — Operator's explanation, printed with the resolution receipt
 
 
 

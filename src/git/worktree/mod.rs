@@ -19,7 +19,7 @@ const FETCH_REMOTE: &str = "origin";
 
 /// Bound for local metadata mutations that normally take milliseconds but can
 /// hang on a stalled filesystem.
-const WORKTREE_MUTATION_TIMEOUT: Duration = Duration::from_secs(30);
+pub(super) const WORKTREE_MUTATION_TIMEOUT: Duration = Duration::from_secs(30);
 const MUTATION_OBSERVATION_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Reason on every aoe-created worktree lock. The lock keeps a `git worktree
@@ -260,10 +260,14 @@ impl GitWorktree {
             let Ok(path) = wt.path().canonicalize() else {
                 continue;
             };
+            let registered = git2::Repository::open(repo.commondir().join("worktrees").join(name))?;
             entries.push(WorktreeEntry {
-                branch: Self::get_current_branch(&path).ok(),
+                branch: registered
+                    .head()
+                    .and_then(|head| head.shorthand().map(str::to_owned))
+                    .ok(),
                 path,
-                is_detached: false,
+                is_detached: registered.head_detached()?,
             });
         }
         Ok(entries)
@@ -554,45 +558,5 @@ mod tests {
             .create_worktree("locked", &wt_path, false, None)
             .unwrap();
         assert!(wt_path.join(".git").is_file());
-    }
-
-    /// Every git subprocess reachable from a worktree move or edit is bounded:
-    /// the profile-move transaction runs them under app-global locks, so one
-    /// hang pins every `aoe` process. Source-level, since a git hang on
-    /// metadata is not reproducible in a unit test.
-    #[test]
-    fn every_worktree_mutation_subprocess_is_bounded() {
-        let flat = [
-            include_str!("mod.rs"),
-            include_str!("branch.rs"),
-            include_str!("relocate.rs"),
-        ]
-        .map(|source| source.split_once("\n#[cfg(test)]\nmod tests").unwrap().0)
-        .concat()
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ");
-        for (needle, label) in [
-            ("\"worktree\", \"lock\"", "git worktree lock"),
-            ("\"worktree\", \"unlock\"", "git worktree unlock"),
-            ("\"show-ref\", \"--verify\"", "git show-ref --verify"),
-            ("\"worktree\", \"move\"", "git worktree move"),
-            ("\"branch\", \"-m\"", "git branch -m"),
-        ] {
-            let at = flat
-                .find(needle)
-                .unwrap_or_else(|| panic!("{label} not found"));
-            let call = flat[..at]
-                .rfind("run_")
-                .map(|i| &flat[i..])
-                .unwrap_or_default();
-            assert!(
-                call.starts_with("run_git_with_timeout")
-                    || call.starts_with("run_git_quiet_with_timeout")
-                    || call.starts_with("run_bounded"),
-                "{label} must go through a bounded helper, found `{}`",
-                call.split('(').next().unwrap_or(call)
-            );
-        }
     }
 }

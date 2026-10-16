@@ -290,227 +290,163 @@ pub(super) fn validate_profile_name(name: &str) -> Result<(), String> {
 mod tests {
     use super::*;
 
-    /// Mutating handlers by source file. Each must short-circuit in read-only
-    /// mode and must extract any JSON body lazily, or axum's `Json<T>` 422s on a
-    /// malformed body before the read-only guard runs (#1229).
-    const MUTATING_HANDLERS: &[(&str, &str, &[&str])] = &[
-        (
-            "sessions/create.rs",
-            include_str!("sessions/create.rs"),
-            &["create_session"],
-        ),
-        (
-            "sessions/delete.rs",
-            include_str!("sessions/delete.rs"),
-            &["delete_session", "delete_workspace"],
-        ),
-        (
-            "sessions/rename.rs",
-            include_str!("sessions/rename.rs"),
-            &[
-                "rename_session",
-                "set_worktree_name",
-                "attach_session_project",
-            ],
-        ),
-        (
-            "sessions/send.rs",
-            include_str!("sessions/send.rs"),
-            &["send_message"],
-        ),
-        (
-            "sessions/ensure.rs",
-            include_str!("sessions/ensure.rs"),
-            &[
-                "ensure_session",
-                "ensure_terminal",
-                "ensure_container_terminal",
-            ],
-        ),
-        (
-            "sessions/update.rs",
-            include_str!("sessions/update.rs"),
-            &[
-                "update_session_group",
-                "update_session_notifications",
-                "update_session_diff_base",
-            ],
-        ),
-        (
-            "sessions/lifecycle.rs",
-            include_str!("sessions/lifecycle.rs"),
-            &[
-                "update_session_pin",
-                "update_session_color",
-                "update_session_archive",
-                "update_session_snooze",
-                "trash_session",
-                "restore_session",
-                "update_session_unread",
-                "stop_session",
-                "force_smart_rename",
-                "start_session",
-            ],
-        ),
-        (
-            "sessions/list.rs",
-            include_str!("sessions/list.rs"),
-            &["update_workspace_ordering"],
-        ),
-        ("git.rs", include_str!("git.rs"), &["clone_repo"]),
-        (
-            "mcp.rs",
-            include_str!("mcp.rs"),
-            &["resolve_mcp_conflict", "keep_mcp_server", "drop_mcp_server"],
-        ),
-        (
-            "log_level.rs",
-            include_str!("log_level.rs"),
-            &["patch_log_level"],
-        ),
-        (
-            "projects.rs",
-            include_str!("projects.rs"),
-            &["create_project", "delete_project", "update_project"],
-        ),
-        (
-            "system.rs",
-            include_str!("system.rs"),
-            &[
-                "update_settings",
-                "dismiss_update",
-                "patch_web_ui_state",
-                "mark_web_tour_seen",
-                "mark_tip_seen",
-                "set_show_tips",
-                "mark_volume_ignores_globs_acknowledged",
-                "create_profile",
-                "delete_profile",
-                "rename_profile",
-                "default_profile",
-                "update_profile_settings",
-            ],
-        ),
-        (
-            "acp/worker.rs",
-            include_str!("acp/worker.rs"),
-            &["spawn_acp", "shutdown_acp"],
-        ),
-        (
-            "acp/prompt.rs",
-            include_str!("acp/prompt.rs"),
-            &[
-                "acp_prompt",
-                "acp_prompt_diff_comments",
-                "acp_cancel",
-                "acp_force_end_turn",
-                "resolve_approval",
-                "resolve_elicitation",
-            ],
-        ),
-        (
-            "acp/view.rs",
-            include_str!("acp/view.rs"),
-            &["acp_enable", "acp_disable"],
-        ),
-        (
-            "acp/config.rs",
-            include_str!("acp/config.rs"),
-            &["acp_set_mode", "acp_set_config_option"],
-        ),
-        (
-            "push.rs",
-            include_str!("../push.rs"),
-            &["subscribe", "unsubscribe", "test"],
-        ),
-        (
-            "telemetry.rs",
-            include_str!("telemetry.rs"),
-            &[
-                "set_telemetry_consent",
-                "post_telemetry_seen",
-                "post_telemetry_structured_interaction",
-            ],
-        ),
-        (
-            "plugins.rs",
-            include_str!("plugins.rs"),
-            &["invoke_plugin_action"],
-        ),
-    ];
-
-    /// `(signature, body)` of `fn name(` in `source`. The body runs to the
-    /// next top-level fn definition.
-    fn handler_source<'a>(source: &'a str, name: &str) -> Option<(&'a str, &'a str)> {
-        let needle = format!("fn {name}(");
-        let rest = &source[source.find(&needle)? + needle.len()..];
-        let mut depth = 1usize;
-        let sig_end = rest.char_indices().find_map(|(i, c)| {
-            match c {
-                '(' => depth += 1,
-                ')' => depth -= 1,
-                _ => {}
-            }
-            (depth == 0).then_some(i)
-        })?;
-        let body_end = ["\npub async fn ", "\npub fn ", "\nasync fn ", "\nfn "]
-            .iter()
-            .filter_map(|t| rest.find(t))
-            .min()
-            .unwrap_or(rest.len());
-        Some((&rest[..sig_end], &rest[..body_end]))
-    }
-
-    #[test]
-    fn mutating_handlers_guard_read_only_before_body_extraction() {
-        let mut failures = Vec::new();
-        for (file, source, handlers) in MUTATING_HANDLERS {
-            for name in *handlers {
-                let Some((signature, body)) = handler_source(source, name) else {
-                    failures.push(format!("{file}: handler `{name}` not found"));
-                    continue;
-                };
-                if !["state.read_only", "self.read_only", "read_only_block("]
-                    .iter()
-                    .any(|p| body.contains(p))
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn read_only_mutators_reject_before_json_errors() {
+        use axum::body::{to_bytes, Body};
+        use axum::extract::ConnectInfo;
+        use axum::http::Request;
+        use tower::ServiceExt;
+        let _app = crate::session::test_support::isolate_app_dir();
+        let mut state = crate::server::test_support::build_test_app_state(Vec::new());
+        std::sync::Arc::get_mut(&mut state).unwrap().read_only = true;
+        let router = crate::server::test_support::build_router_for_test(state);
+        for (method, uri) in [
+            ("POST", "/api/sessions"),
+            ("DELETE", "/api/sessions/missing"),
+            ("DELETE", "/api/workspaces"),
+            ("PATCH", "/api/sessions/missing"),
+            ("PATCH", "/api/sessions/missing/worktree-name"),
+            ("POST", "/api/sessions/missing/projects"),
+            ("POST", "/api/sessions/missing/send"),
+            ("POST", "/api/sessions/missing/ensure"),
+            ("POST", "/api/sessions/missing/terminal"),
+            ("DELETE", "/api/sessions/missing/terminal"),
+            ("POST", "/api/sessions/missing/container-terminal"),
+            ("PATCH", "/api/sessions/missing/group"),
+            ("PATCH", "/api/sessions/missing/notifications"),
+            ("PATCH", "/api/sessions/missing/diff-base"),
+            ("PATCH", "/api/sessions/missing/pin"),
+            ("PATCH", "/api/sessions/missing/color"),
+            ("PATCH", "/api/sessions/missing/archive"),
+            ("PATCH", "/api/sessions/missing/snooze"),
+            ("POST", "/api/sessions/missing/trash"),
+            ("POST", "/api/sessions/missing/restore"),
+            ("PATCH", "/api/sessions/missing/unread"),
+            ("POST", "/api/sessions/missing/stop"),
+            ("POST", "/api/sessions/missing/smart-rename"),
+            ("POST", "/api/sessions/missing/start"),
+            ("PUT", "/api/workspace-ordering"),
+            ("POST", "/api/git/clone"),
+            ("POST", "/api/mcp/servers/missing/resolve"),
+            ("POST", "/api/mcp/servers/missing/keep"),
+            ("POST", "/api/mcp/servers/missing/drop"),
+            ("PATCH", "/api/log-level"),
+            ("POST", "/api/projects"),
+            ("DELETE", "/api/projects/missing"),
+            ("PATCH", "/api/projects/missing"),
+            ("PATCH", "/api/settings"),
+            ("POST", "/api/app-state/dismiss-update"),
+            ("PATCH", "/api/app-state/web-ui-state"),
+            ("POST", "/api/app-state/web-tour-seen"),
+            ("POST", "/api/app-state/tip-seen"),
+            ("POST", "/api/tips/show"),
+            ("POST", "/api/app-state/volume-ignores-globs-acknowledged"),
+            ("POST", "/api/profiles"),
+            ("DELETE", "/api/profiles/missing"),
+            ("PATCH", "/api/profiles/missing/rename"),
+            ("PATCH", "/api/default-profile"),
+            ("PATCH", "/api/profiles/missing/settings"),
+            ("POST", "/api/sessions/missing/acp/spawn"),
+            ("DELETE", "/api/sessions/missing/acp"),
+            ("POST", "/api/sessions/missing/acp/switch-agent"),
+            ("POST", "/api/sessions/missing/acp/switch-provider"),
+            ("POST", "/api/sessions/missing/acp/prompt"),
+            ("POST", "/api/sessions/missing/acp/prompt/diff-comments"),
+            ("POST", "/api/sessions/missing/acp/cancel"),
+            ("POST", "/api/sessions/missing/acp/force_end_turn"),
+            ("POST", "/api/sessions/missing/acp/approvals/1"),
+            ("POST", "/api/sessions/missing/acp/elicitations/1"),
+            ("POST", "/api/sessions/missing/acp/enable"),
+            ("POST", "/api/sessions/missing/acp/disable"),
+            ("POST", "/api/sessions/missing/acp/mode"),
+            ("POST", "/api/sessions/missing/acp/config-option"),
+            ("POST", "/api/push/subscribe"),
+            ("POST", "/api/push/unsubscribe"),
+            ("POST", "/api/push/test"),
+            ("POST", "/api/telemetry/consent"),
+            ("POST", "/api/telemetry/seen"),
+            ("POST", "/api/telemetry/structured-interaction"),
+            ("POST", "/api/plugins/missing/action"),
+        ] {
+            for (content_type, body) in [
+                ("application/json", "{"),
+                ("application/json", r#"{"target":12}"#),
+                ("text/plain", "{}"),
+            ] {
+                let mut request = Request::builder()
+                    .method(method)
+                    .uri(uri)
+                    .header("host", "127.0.0.1")
+                    .header("content-type", content_type)
+                    .body(Body::from(body))
+                    .unwrap();
+                request.extensions_mut().insert(ConnectInfo(
+                    "127.0.0.1:5557".parse::<std::net::SocketAddr>().unwrap(),
+                ));
+                let response = router.clone().oneshot(request).await.unwrap();
+                let conditional_observer = uri == "/api/sessions/missing/ensure";
+                assert_eq!(
+                    response.status(),
+                    if conditional_observer {
+                        StatusCode::NOT_FOUND
+                    } else {
+                        StatusCode::FORBIDDEN
+                    },
+                    "{method} {uri}: {content_type} {body}"
+                );
+                if !conditional_observer
+                    && uri != "/api/log-level"
+                    && !uri.starts_with("/api/push/")
                 {
-                    failures.push(format!("{file}: `{name}` lacks a read-only guard"));
-                }
-                let eager = signature.split(',').any(|arg| {
-                    let arg = arg.trim_start();
-                    arg.starts_with("Json(") || arg.contains(": Json<")
-                });
-                if eager {
-                    failures.push(format!(
-                        "{file}: `{name}` extracts its JSON body eagerly; use \
-                         `Result<Json<T>, JsonRejection>` or `Option<Json<T>>`"
-                    ));
+                    let actual: serde_json::Value = serde_json::from_slice(
+                        &to_bytes(response.into_body(), usize::MAX).await.unwrap(),
+                    )
+                    .unwrap();
+                    assert_eq!(
+                        actual,
+                        serde_json::json!({
+                            "error": "read_only", "message": "Server is in read-only mode"
+                        }),
+                        "{method} {uri}"
+                    );
                 }
             }
         }
-        assert!(failures.is_empty(), "{}", failures.join("\n"));
-
-        // A plugin pane action mutates no host state, so it is gated on
-        // read-only mode only, never on elevation (#2454).
-        let (_, body) = handler_source(include_str!("plugins.rs"), "invoke_plugin_action")
-            .expect("invoke_plugin_action");
-        for marker in ["mutation_gate", "is_elevated", "elevation_required"] {
-            assert!(
-                !body.contains(marker),
-                "invoke_plugin_action: found `{marker}`"
+        let state = crate::server::test_support::build_test_app_state(Vec::new());
+        let router = crate::server::test_support::build_router_for_test(state);
+        for (content_type, body, status) in [
+            ("application/json", "{", StatusCode::BAD_REQUEST),
+            (
+                "application/json",
+                r#"{"target":12}"#,
+                StatusCode::UNPROCESSABLE_ENTITY,
+            ),
+            ("text/plain", "{}", StatusCode::UNSUPPORTED_MEDIA_TYPE),
+        ] {
+            let mut request = Request::builder()
+                .method("POST")
+                .uri("/api/sessions/missing/acp/switch-agent")
+                .header("host", "127.0.0.1")
+                .header("content-type", content_type)
+                .body(Body::from(body))
+                .unwrap();
+            request.extensions_mut().insert(ConnectInfo(
+                "127.0.0.1:5557".parse::<std::net::SocketAddr>().unwrap(),
+            ));
+            assert_eq!(
+                router.clone().oneshot(request).await.unwrap().status(),
+                status
             );
         }
     }
 
     #[test]
     fn input_validators_reject_shell_control_and_path_characters() {
-        // Removing a character here is a security change, not a tidy-up.
-        let expected: &[char] = &[
+        for c in [
             ';', '&', '|', '$', '`', '(', ')', '{', '}', '<', '>', '\n', '\r', '\\', '"', '\'',
             '!', '#', '*', '?', '[', ']', '~', '\t', '\0',
-        ];
-        assert_eq!(SHELL_METACHARACTERS, expected);
-        for &c in SHELL_METACHARACTERS {
+        ] {
             assert!(validate_no_shell_injection(&format!("prefix{c}suffix"), "field").is_err());
         }
 

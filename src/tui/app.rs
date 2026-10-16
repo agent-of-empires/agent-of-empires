@@ -1212,6 +1212,7 @@ impl App {
             full |= self.home.apply_deletion_results();
             full |= self.home.apply_stop_results();
             full |= self.home.apply_trash_results();
+            full |= self.home.apply_restore_results();
             full |= self.home.apply_drop_results();
             full |= self.home.apply_reconcile_results();
 
@@ -1228,6 +1229,7 @@ impl App {
                 full = true;
             }
             full |= self.home.apply_attach_project_results();
+            full |= self.home.apply_rename_results();
 
             let store_move = self.home.poll_store_move();
             full |= store_move.changed;

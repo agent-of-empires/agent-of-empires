@@ -10,6 +10,7 @@ pub mod graft;
 pub mod group;
 pub mod hooks;
 pub mod init;
+pub mod intents;
 pub mod killall;
 pub mod list;
 pub mod log_level;
@@ -92,45 +93,6 @@ pub fn resolve_session<'a>(identifier: &str, instances: &'a [Instance]) -> Resul
     }
 
     bail!("Session not found: {}", identifier)
-}
-
-pub(crate) fn purge_acp_transcript(inst: &Instance) -> Result<()> {
-    let app_dir = crate::session::get_app_dir()
-        .map_err(|e| anyhow::anyhow!("acp transcript purge: resolve app dir: {e}"))?;
-    let db_path = app_dir.join("acp_events.db");
-    if !db_path.exists() {
-        return Ok(());
-    }
-    purge_acp_transcript_rows(&db_path, &inst.id)
-}
-
-fn purge_acp_transcript_rows(db_path: &std::path::Path, session_id: &str) -> Result<()> {
-    let mut conn = rusqlite::Connection::open(db_path)
-        .map_err(|e| anyhow::anyhow!("acp transcript purge: open event store: {e}"))?;
-    conn.busy_timeout(std::time::Duration::from_secs(5))
-        .map_err(|e| anyhow::anyhow!("acp transcript purge: set busy_timeout: {e}"))?;
-    let tx = conn
-        .transaction()
-        .map_err(|e| anyhow::anyhow!("acp transcript purge: begin transaction: {e}"))?;
-    let schema = crate::events::Schema::new("acp")
-        .map_err(|e| anyhow::anyhow!("acp transcript purge: schema: {e}"))?;
-    for table in [schema.events_table(), schema.attachments_table()] {
-        match tx.execute(
-            &format!("DELETE FROM {table} WHERE session_id = ?1"),
-            rusqlite::params![session_id],
-        ) {
-            Ok(_) => {}
-            Err(rusqlite::Error::SqliteFailure(_, Some(msg))) if msg.contains("no such table") => {}
-            Err(e) => {
-                return Err(anyhow::anyhow!(
-                    "acp transcript purge: delete from {table}: {e}"
-                ))
-            }
-        }
-    }
-    tx.commit()
-        .map_err(|e| anyhow::anyhow!("acp transcript purge: commit: {e}"))?;
-    Ok(())
 }
 
 pub(crate) struct EmptyTrashOutcome {
@@ -235,56 +197,5 @@ mod tests {
         assert!(!purge_restored_row_must_be_kept(true, true));
         assert!(!purge_restored_row_must_be_kept(false, false));
         assert!(!purge_restored_row_must_be_kept(false, true));
-    }
-
-    #[test]
-    fn purge_acp_transcript_rows_deletes_only_target_session() {
-        let dir = tempfile::tempdir().unwrap();
-        let db_path = dir.path().join("acp_events.db");
-        let conn = rusqlite::Connection::open(&db_path).unwrap();
-        conn.execute_batch(
-            "CREATE TABLE acp_events (session_id TEXT, seq INTEGER, event_json TEXT);
-             CREATE TABLE acp_attachments (session_id TEXT, attachment_id TEXT, data BLOB);
-             INSERT INTO acp_events VALUES ('keep', 0, '{}'), ('drop', 0, '{}'), ('drop', 1, '{}');
-             INSERT INTO acp_attachments VALUES ('keep', 'a0', x'00'), ('drop', 'a1', x'01');",
-        )
-        .unwrap();
-        drop(conn);
-
-        purge_acp_transcript_rows(&db_path, "drop").unwrap();
-
-        let conn = rusqlite::Connection::open(&db_path).unwrap();
-        let events: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM acp_events WHERE session_id = 'drop'",
-                [],
-                |r| r.get(0),
-            )
-            .unwrap();
-        let attachments: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM acp_attachments WHERE session_id = 'drop'",
-                [],
-                |r| r.get(0),
-            )
-            .unwrap();
-        let kept_events: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM acp_events WHERE session_id = 'keep'",
-                [],
-                |r| r.get(0),
-            )
-            .unwrap();
-        assert_eq!(events, 0, "target event rows should be deleted");
-        assert_eq!(attachments, 0, "target attachment blobs should be deleted");
-        assert_eq!(kept_events, 1, "other session must be untouched");
-    }
-
-    #[test]
-    fn purge_acp_transcript_rows_tolerates_missing_table() {
-        let dir = tempfile::tempdir().unwrap();
-        let db_path = dir.path().join("acp_events.db");
-        rusqlite::Connection::open(&db_path).unwrap();
-        purge_acp_transcript_rows(&db_path, "whatever").unwrap();
     }
 }

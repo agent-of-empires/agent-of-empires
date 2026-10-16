@@ -484,6 +484,7 @@ export type SettingsValidation =
   | { rule: "port_mapping_list" }
   | { rule: "capability_list" }
   | { rule: "security_opt_list" }
+  | { rule: "sync_path_list" }
   | { rule: "network" }
   | { rule: "systemd_slice" }
   | { rule: "cron" }

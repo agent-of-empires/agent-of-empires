@@ -729,6 +729,84 @@ fn unread_flag_survives_sink_round_trip() {
     inst.unsnooze();
     assert!(inst.is_unread(), "unsnooze must keep unread");
 }
+#[test]
+#[serial]
+fn user_actions_retry_without_blocking_a_peer_ownership_fence() {
+    use std::sync::mpsc;
+    use std::time::{Duration, Instant};
+    crate::session::set_unread_enabled(true);
+    let mut env = create_test_env_with_sessions(2);
+    let id = env
+        .view
+        .flat_items
+        .iter()
+        .find_map(|item| match item {
+            Item::Session { id, .. } => Some(id.clone()),
+            _ => None,
+        })
+        .unwrap();
+    env.view.select_session_by_id(&id);
+    env.view
+        .apply_user_action(&id, Instance::mark_unread)
+        .unwrap();
+    let storage = Storage::new_unwatched("test").unwrap();
+    let (held_tx, held_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel();
+    let peer = std::thread::spawn(move || {
+        let fence = crate::session::storage::acquire_ownership_lock().unwrap();
+        held_tx.send(()).unwrap();
+        let released_by_request = release_rx.recv_timeout(Duration::from_secs(5)).is_ok();
+        drop(fence);
+        released_by_request
+    });
+    held_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    let favorite = env.view.toggle_favorite_at_cursor();
+    let snooze = env.view.snooze_session_for(&id, 30);
+    let unread = env.view.toggle_unread_at_cursor();
+    let bulk = env
+        .view
+        .bulk_apply_user_action(std::slice::from_ref(&id), Instance::favorite);
+    let row = env.view.get_instance(&id).unwrap();
+    let unchanged = !row.is_favorited() && !row.is_snoozed() && row.is_unread();
+    let visible_retry = env.view.info_dialog.is_some();
+    env.view.handle_key(key(KeyCode::Esc), None);
+    env.view.handle_key(key(KeyCode::Down), None);
+    let navigated = env.view.selected_session.as_deref() != Some(id.as_str());
+    env.view.handle_key(key(KeyCode::Up), None);
+    let navigated = navigated && env.view.selected_session.as_deref() == Some(id.as_str());
+    let rendered_while_held = !render_home_to_string(&mut env.view, 120, 40).is_empty();
+    let start = Instant::now();
+    assert!(!env.view.tick_unread_dwell(start));
+    let dwell_while_held = env
+        .view
+        .tick_unread_dwell(start + crate::tui::home::UNREAD_DWELL);
+    let unread_while_held = env.view.get_instance(&id).unwrap().is_unread();
+    release_tx.send(()).ok();
+    let fence_stayed_held = peer.join().unwrap();
+    assert!(
+        fence_stayed_held,
+        "input did not finish before the peer's failure deadline"
+    );
+    assert!(favorite.is_err() && snooze.is_err() && unread.is_err() && bulk.is_err());
+    assert!(unchanged && visible_retry);
+    assert!(
+        navigated && rendered_while_held,
+        "navigation and render must finish while the fence stays held"
+    );
+    assert!(!dwell_while_held && unread_while_held);
+    let disk = storage.load().unwrap();
+    let disk = disk.iter().find(|row| row.id == id).unwrap();
+    assert!(!disk.is_favorited() && !disk.is_snoozed() && disk.is_unread());
+    env.view.toggle_favorite_at_cursor().unwrap();
+    env.view.snooze_session_for(&id, 30).unwrap();
+    env.view.apply_user_action(&id, Instance::unsnooze).unwrap();
+    assert!(env
+        .view
+        .tick_unread_dwell(start + crate::tui::home::UNREAD_DWELL));
+    let disk = storage.load().unwrap();
+    let disk = disk.iter().find(|row| row.id == id).unwrap();
+    assert!(disk.is_favorited() && !disk.is_unread());
+}
 
 /// Dwell-to-read clears an unread row that stays selected past `UNREAD_DWELL`; moving the
 /// selection first spares it, so arrowing through a list doesn't read everything you pass.

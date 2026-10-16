@@ -1394,6 +1394,83 @@ fn seed_legacy_codex_auth(sandbox_dir: &Path, home: &Path) {
     }
 }
 
+pub(super) fn is_sync_agent(name: &str) -> bool {
+    AGENT_CONFIG_MOUNTS.iter().any(|m| m.tool_name == name)
+}
+
+/// Whether a relative `entry` is, contains, or lies inside the path or glob
+/// `protected`. Components are compared pairwise, so a shared prefix overlaps.
+fn overlaps_protected(entry: &Path, protected: &str) -> bool {
+    let options = glob::MatchOptions {
+        require_literal_separator: true,
+        ..glob::MatchOptions::new()
+    };
+    entry
+        .components()
+        .zip(Path::new(protected).components())
+        .all(|(e, p)| {
+            glob::Pattern::new(&p.as_os_str().to_string_lossy()).is_ok_and(|pattern| {
+                pattern.matches_with(&e.as_os_str().to_string_lossy(), options)
+            })
+        })
+}
+
+/// User-declared extra paths for one mount, from `sandbox.sync_extra_*`.
+#[derive(Default)]
+struct ExtraSync {
+    files: Vec<String>,
+    dirs: Vec<String>,
+}
+
+impl ExtraSync {
+    /// Entries scoped to `mount` or unscoped, refused when they overlap
+    /// anything the registry treats as state, credentials or its own sources.
+    fn for_mount(mount: &AgentConfigMount, sandbox: &super::SandboxConfig) -> Result<Self> {
+        let protected: Vec<&str> = mount
+            .native_state_paths
+            .iter()
+            .chain(mount.copy_files)
+            .chain(mount.shared_credential_files)
+            .chain(mount.sqlite_seed_files)
+            .chain(mount.preserve_files)
+            .copied()
+            .chain(mount.seed_files.iter().map(|(name, _)| *name))
+            .chain(mount.home_seed_files.iter().map(|(name, _)| *name))
+            .chain(
+                mount
+                    .credential_pairs
+                    .iter()
+                    .flat_map(|(file, key)| [*file, *key]),
+            )
+            .chain(mount.keychain_credential.map(|(_, file)| file))
+            .collect();
+        let select = |entries: &[String]| -> Result<Vec<String>> {
+            let mut out = Vec::new();
+            for entry in entries {
+                super::profile_config::validate_sync_path_format(entry)
+                    .map_err(|reason| anyhow::anyhow!("sandbox sync entry '{entry}': {reason}"))?;
+                let (agent, path) = super::profile_config::split_sync_entry(entry);
+                if agent.is_some_and(|agent| agent != mount.tool_name) {
+                    continue;
+                }
+                anyhow::ensure!(
+                    !protected
+                        .iter()
+                        .any(|p| overlaps_protected(Path::new(path), p)),
+                    "sandbox sync entry '{entry}' overlaps native state or credentials of {}",
+                    mount.host_rel
+                );
+                out.push(path.to_string());
+            }
+            Ok(out)
+        };
+        Ok(Self {
+            files: select(&sandbox.sync_extra_files)?,
+            dirs: select(&sandbox.sync_extra_dirs)?,
+        })
+    }
+}
+
 /// Sync a single agent's host config into its sandbox directory.
 /// Handles config file sync, keychain credential extraction, and home-level seed files.
 fn prepare_sandbox_dir(
@@ -1402,6 +1479,7 @@ fn prepare_sandbox_dir(
     instance_id: Option<&str>,
     fold: CredentialFold,
     session_config: &super::SessionConfig,
+    sandbox: &super::SandboxConfig,
     workspace: &Path,
 ) -> Result<PathBuf> {
     let host_dir = home.join(mount.host_rel);
@@ -1413,10 +1491,12 @@ fn prepare_sandbox_dir(
         home,
         fold,
         session_config,
+        sandbox,
         workspace,
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn prepare_sandbox_dir_from(
     mount: &AgentConfigMount,
     host_dir: PathBuf,
@@ -1424,6 +1504,7 @@ fn prepare_sandbox_dir_from(
     home: &Path,
     fold: CredentialFold,
     session_config: &super::SessionConfig,
+    sandbox: &super::SandboxConfig,
     workspace: &Path,
 ) -> Result<PathBuf> {
     let _admission = crate::migrations::v033_isolate_sandbox_content::guard_preparation(
@@ -1438,10 +1519,12 @@ fn prepare_sandbox_dir_from(
         home,
         fold,
         session_config,
+        sandbox,
         workspace,
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn seed_sandbox_dir_from(
     mount: &AgentConfigMount,
     host_dir: PathBuf,
@@ -1449,9 +1532,11 @@ fn seed_sandbox_dir_from(
     home: &Path,
     fold: CredentialFold,
     session_config: &super::SessionConfig,
+    sandbox: &super::SandboxConfig,
     workspace: &Path,
 ) -> Result<PathBuf> {
     std::fs::create_dir_all(&sandbox_dir)?;
+    let extra = ExtraSync::for_mount(mount, sandbox)?;
 
     if host_dir.exists() {
         // Codex writes `trusted_hash` into `[hooks.state]` of the sandbox
@@ -1482,12 +1567,24 @@ fn seed_sandbox_dir_from(
         seed::retry_source_change(|| {
             let boundary =
                 NativeStateBoundary::new(&host_dir, mount, home, session_config, &sandbox_dir)?;
+            let files: Vec<&str> = mount
+                .copy_files
+                .iter()
+                .copied()
+                .chain(extra.files.iter().map(String::as_str))
+                .collect();
+            let dirs: Vec<&str> = mount
+                .copy_dirs
+                .iter()
+                .copied()
+                .chain(extra.dirs.iter().map(String::as_str))
+                .collect();
             sync_agent_config(
                 &host_dir,
                 &sandbox_dir,
-                mount.copy_files,
+                &files,
                 mount.seed_files,
-                mount.copy_dirs,
+                &dirs,
                 mount.preserve_files,
                 &boundary,
             )?;
@@ -1918,6 +2015,7 @@ pub(crate) fn refresh_agent_configs_for_instance(
                 &home,
                 fold,
                 &profile_config.session,
+                &profile_config.sandbox,
                 workspace,
             ),
             None => prepare_sandbox_dir(
@@ -1926,6 +2024,7 @@ pub(crate) fn refresh_agent_configs_for_instance(
                 Some(instance_id),
                 fold,
                 &profile_config.session,
+                &profile_config.sandbox,
                 workspace,
             ),
         };
@@ -2704,6 +2803,7 @@ pub(crate) fn build_container_config(
                 &home,
                 agent_selection.credential_fold,
                 profile_session_config,
+                &profile_config.sandbox,
                 Path::new(&workspace_path),
             ),
             None => prepare_sandbox_dir(
@@ -2712,6 +2812,7 @@ pub(crate) fn build_container_config(
                 Some(instance_id),
                 agent_selection.credential_fold,
                 profile_session_config,
+                &profile_config.sandbox,
                 Path::new(&workspace_path),
             ),
         }
@@ -3705,7 +3806,16 @@ mod tests {
         workspace: &Path,
     ) -> Result<PathBuf> {
         certify_fixture_content(&sandbox, mount.container_suffix)?;
-        super::prepare_sandbox_dir_from(mount, host, sandbox, home, fold, session, workspace)
+        super::prepare_sandbox_dir_from(
+            mount,
+            host,
+            sandbox,
+            home,
+            fold,
+            session,
+            &super::super::SandboxConfig::default(),
+            workspace,
+        )
     }
     fn setup_host_dir(dir: &TempDir) -> std::path::PathBuf {
         let host = dir.path().join("host");
@@ -3773,10 +3883,139 @@ mod tests {
         assert!(sandbox.join("settings.json").exists());
     }
 
+    fn mount_for(tool: &str) -> &'static AgentConfigMount {
+        AGENT_CONFIG_MOUNTS
+            .iter()
+            .find(|m| m.tool_name == tool)
+            .unwrap()
+    }
+
+    #[test]
+    fn test_extra_sync_scope_and_protected_paths() {
+        let sandbox = |files: &[&str], dirs: &[&str]| crate::session::config::SandboxConfig {
+            sync_extra_files: files.iter().map(|s| s.to_string()).collect(),
+            sync_extra_dirs: dirs.iter().map(|s| s.to_string()).collect(),
+            ..Default::default()
+        };
+        let extra = ExtraSync::for_mount(
+            mount_for("claude"),
+            &sandbox(&["a.md", "codex:b.md"], &["agents"]),
+        )
+        .unwrap();
+        assert_eq!(
+            (extra.files, extra.dirs),
+            (vec!["a.md".into()], vec!["agents".into()])
+        );
+        assert!(
+            ExtraSync::for_mount(mount_for("claude"), &sandbox(&[], &[]))
+                .unwrap()
+                .files
+                .is_empty()
+        );
+
+        for (tool, entry) in [
+            ("claude", "projects"),
+            ("claude", "projects/x/y.jsonl"),
+            ("claude", "history.jsonl"),
+            ("claude", ".credentials.json"),
+            ("claude", "claude:settings.json"),
+            ("codex", "auth.json"),
+            ("codex", "sessions"),
+            ("pi", "agent"),
+            ("omp", "agent/agent.db"),
+            ("droid", "auth.v2.key"),
+        ] {
+            let mount = mount_for(tool);
+            assert!(
+                ExtraSync::for_mount(mount, &sandbox(&[entry], &[])).is_err(),
+                "{tool}: {entry} files"
+            );
+            assert!(
+                ExtraSync::for_mount(mount, &sandbox(&[], &[entry])).is_err(),
+                "{tool}: {entry} dirs"
+            );
+        }
+        // Hand-edited config skips schema validation, so malformed entries fail here.
+        for entry in ["a/../projects", "/etc/passwd", "nope:agents", "../x"] {
+            assert!(
+                ExtraSync::for_mount(mount_for("claude"), &sandbox(&[entry], &[])).is_err(),
+                "{entry}"
+            );
+        }
+        // Another agent's scope is never evaluated against this mount.
+        assert!(
+            ExtraSync::for_mount(mount_for("claude"), &sandbox(&["codex:auth.json"], &[])).is_ok()
+        );
+    }
+
+    #[test]
+    fn test_sync_path_format() {
+        for (entry, ok) in [
+            ("agents", true),
+            ("agents/review.md", true),
+            ("claude:agents", true),
+            ("", false),
+            ("claude:", false),
+            ("/etc/passwd", false),
+            ("../x", false),
+            ("a/../../x", false),
+            ("nope:agents", false),
+            ("a/*.md", false),
+            ("a:b:c", false),
+        ] {
+            assert_eq!(
+                crate::session::validate_sync_path_format(entry).is_ok(),
+                ok,
+                "{entry}"
+            );
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_extra_sync_copies_scoped_extras_and_keeps_state_out() {
+        let (_hook_guard, _, _application) = BaseGuard::ready();
+        let _app = crate::session::test_support::isolate_app_dir();
+        let dir = TempDir::new().unwrap();
+        let host = dir.path().join(".claude");
+        fs::create_dir_all(host.join("agents")).unwrap();
+        fs::create_dir_all(host.join("projects")).unwrap();
+        fs::write(host.join("agents/review.md"), "agent").unwrap();
+        fs::write(host.join("notes.md"), "notes").unwrap();
+        fs::write(host.join("other.md"), "other").unwrap();
+        fs::write(host.join("projects/p.jsonl"), "history").unwrap();
+
+        let sandbox_config = crate::session::config::SandboxConfig {
+            sync_extra_files: vec!["claude:notes.md".into(), "codex:other.md".into()],
+            sync_extra_dirs: vec!["agents".into()],
+            ..Default::default()
+        };
+        let mount = mount_for("claude");
+        let sandbox = sandbox_dir_for(mount, dir.path(), Some("extra-sync")).unwrap();
+        certify_fixture_content(&sandbox, mount.container_suffix).unwrap();
+        let out = super::prepare_sandbox_dir_from(
+            mount,
+            host.clone(),
+            sandbox,
+            dir.path(),
+            CredentialFold::Freshest,
+            &crate::session::config::SessionConfig::default(),
+            &sandbox_config,
+            dir.path(),
+        )
+        .unwrap();
+
+        assert_eq!(fs::read(out.join("notes.md")).unwrap(), b"notes");
+        assert_eq!(fs::read(out.join("agents/review.md")).unwrap(), b"agent");
+        assert!(!out.join("other.md").exists());
+        assert!(!out.join("projects").exists());
+    }
+
     #[test]
     #[serial_test::serial]
     fn test_hermes_mount_skips_runtime_dirs() {
         let (_hook_guard, _, _application) = BaseGuard::ready();
+        let _app = crate::session::test_support::isolate_app_dir();
         let dir = TempDir::new().unwrap();
         let host = dir.path().join(".hermes");
         fs::create_dir_all(&host).unwrap();
@@ -3807,7 +4046,7 @@ mod tests {
         let sandbox = prepare_owned_fixture(
             mount,
             dir.path(),
-            None,
+            Some("hermes-runtime-exclusion"),
             CredentialFold::Freshest,
             &crate::session::config::SessionConfig::default(),
             dir.path(),
@@ -3826,6 +4065,13 @@ mod tests {
             );
         }
         assert!(!sandbox.join("state.db").exists());
+        for runtime_dir in runtime_dirs {
+            assert_eq!(
+                fs::read(host.join(runtime_dir).join("runtime.txt")).unwrap(),
+                b"runtime"
+            );
+        }
+        assert_eq!(fs::read(host.join("state.db")).unwrap(), b"sqlite-bytes");
     }
 
     #[test]

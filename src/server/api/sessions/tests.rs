@@ -35,7 +35,7 @@ fn remove_instance_bumps_the_epoch_only_when_it_removes_a_row() {
 }
 fn build_rename_test_state(
     persisted: Vec<Instance>,
-    cached: Vec<Instance>,
+    mut cached: Vec<Instance>,
 ) -> (Storage, std::sync::Arc<crate::server::AppState>) {
     let storage = Storage::new_unwatched("default").unwrap();
     storage
@@ -44,8 +44,79 @@ fn build_rename_test_state(
             Ok(())
         })
         .unwrap();
+    for instance in &mut cached {
+        instance.source_profile = storage.profile().to_string();
+    }
     let state = crate::server::test_support::build_test_app_state(cached);
     (storage, state)
+}
+
+fn real_rename_worktree(root: &std::path::Path, leaf: &str) -> String {
+    let main = root.join("repo");
+    let repo = git2::Repository::init(&main).unwrap();
+    let signature = git2::Signature::now("fixture", "fixture@example.invalid").unwrap();
+    let tree = repo.index().unwrap().write_tree().unwrap();
+    repo.commit(
+        Some("HEAD"),
+        &signature,
+        &signature,
+        "base",
+        &repo.find_tree(tree).unwrap(),
+        &[],
+    )
+    .unwrap();
+    let base = repo.head().unwrap().shorthand().unwrap().to_string();
+    crate::git::GitWorktree::new(main.clone())
+        .unwrap()
+        .with_init_submodules(false)
+        .create_worktree(leaf, &root.join(leaf), true, Some(&base))
+        .unwrap();
+    main.to_string_lossy().into_owned()
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn readonly_rename_routes_reject_malformed_json_before_body_errors() {
+    use axum::body::{to_bytes, Body};
+    use axum::extract::ConnectInfo;
+    use axum::http::Request;
+    use tower::ServiceExt;
+
+    let _app = crate::session::test_support::isolate_app_dir();
+    for read_only in [true, false] {
+        let mut state = crate::server::test_support::build_test_app_state(Vec::new());
+        Arc::get_mut(&mut state).unwrap().read_only = read_only;
+        let router = crate::server::test_support::build_router_for_test(state);
+        for uri in [
+            "/api/sessions/missing",
+            "/api/sessions/missing/worktree-name",
+        ] {
+            let mut request = Request::builder()
+                .method("PATCH")
+                .uri(uri)
+                .header("host", "127.0.0.1")
+                .header("content-type", "application/json")
+                .body(Body::from("{"))
+                .unwrap();
+            request.extensions_mut().insert(ConnectInfo(
+                "127.0.0.1:5557".parse::<std::net::SocketAddr>().unwrap(),
+            ));
+            let response = router.clone().oneshot(request).await.unwrap();
+            if read_only {
+                assert_eq!(response.status(), StatusCode::FORBIDDEN, "{uri}");
+                let body: serde_json::Value = serde_json::from_slice(
+                    &to_bytes(response.into_body(), usize::MAX).await.unwrap(),
+                )
+                .unwrap();
+                assert_eq!(
+                    body,
+                    serde_json::json!({"error": "read_only", "message": "Server is in read-only mode"})
+                );
+            } else {
+                assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{uri}");
+            }
+        }
+    }
 }
 
 /// #3411: a rename to a duplicate title, or a tied rename whose derived path
@@ -443,6 +514,62 @@ mod artifact_route {
         let body = to_bytes(resp.into_body(), 1024).await.unwrap();
         assert!(body.is_empty(), "unexpected body: {body:?}");
     }
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn readonly_ensure_observes_live_sessions_but_never_restarts_stopped_sessions() {
+    use crate::tmux::test_helpers::{
+        only_pane_id, require_tmux, wait_for_pane_command, TmuxTestSession,
+    };
+    let _home = crate::session::test_support::isolate_app_dir();
+    require_tmux!();
+    let mut instance = make_test_instance();
+    instance.command = "sleep 300".into();
+    let id = instance.id.clone();
+    let name = crate::tmux::Session::generate_name(&id, &instance.title);
+    let session = TmuxTestSession::from_name(name);
+    let created = crate::tmux::tmux_command()
+        .args(["new-session", "-d", "-s", session.name(), "sleep 300"])
+        .output()
+        .unwrap();
+    assert!(
+        created.status.success(),
+        "{}",
+        String::from_utf8_lossy(&created.stderr)
+    );
+    let pane = only_pane_id(session.name());
+    wait_for_pane_command(&pane, "sleep");
+    let mut state = crate::server::test_support::build_test_app_state(vec![instance]);
+    std::sync::Arc::get_mut(&mut state).unwrap().read_only = true;
+    assert_eq!(
+        ensure_session(State(state.clone()), Path("missing".into()))
+            .await
+            .into_response()
+            .status(),
+        StatusCode::NOT_FOUND,
+    );
+    let alive = ensure_session(State(state.clone()), Path(id.clone()))
+        .await
+        .into_response();
+    assert_eq!(alive.status(), StatusCode::OK);
+    let body: serde_json::Value =
+        serde_json::from_slice(&axum::body::to_bytes(alive.into_body(), 1024).await.unwrap())
+            .unwrap();
+    assert_eq!(body["status"], "alive");
+    let killed = crate::tmux::tmux_command()
+        .args(["kill-session", "-t", session.name()])
+        .output()
+        .unwrap();
+    assert!(killed.status.success());
+    assert_eq!(
+        ensure_session(State(state), Path(id.clone()))
+            .await
+            .into_response()
+            .status(),
+        StatusCode::FORBIDDEN,
+    );
+    assert!(!crate::tmux::Session::from_name(session.name()).exists());
 }
 
 fn make_test_instance() -> Instance {
@@ -1736,10 +1863,37 @@ fn rename_cache_patch_publishes_only_rename_owned_fields() {
 #[tokio::test]
 #[serial_test::serial]
 async fn rename_session_distinguishes_cwd_stable_title_and_branch_changes() {
+    if !crate::tmux::tmux_command()
+        .arg("-V")
+        .output()
+        .is_ok_and(|out| out.status.success())
+    {
+        return;
+    }
     let _app_dir = crate::session::test_support::isolate_app_dir();
     let paths = tempfile::tempdir().unwrap();
+    let _tmux = crate::session::test_support::EnvGuard::set(&[(
+        "AOE_TMUX_SOCKET",
+        paths.path().join("rename-api-tmux.sock"),
+    )]);
     let title_path = paths.path().join("my-session");
     let branch_path = paths.path().join("branch-only");
+    let branch_main = real_rename_worktree(paths.path(), "branch-only");
+    {
+        let checkout = git2::Repository::open(&branch_path).unwrap();
+        checkout
+            .find_branch("branch-only", git2::BranchType::Local)
+            .unwrap()
+            .rename("existing-branch", false)
+            .unwrap();
+    }
+    let main_repo = git2::Repository::open(&branch_main).unwrap();
+    let base = main_repo.head().unwrap().shorthand().unwrap().to_owned();
+    crate::git::GitWorktree::new(std::path::PathBuf::from(&branch_main))
+        .unwrap()
+        .with_init_submodules(false)
+        .create_worktree("my-session", &title_path, true, Some(&base))
+        .unwrap();
     let title_id = "rename-title-only".to_string();
     let branch_id = "rename-branch-only".to_string();
 
@@ -1750,15 +1904,7 @@ async fn rename_session_distinguishes_cwd_stable_title_and_branch_changes() {
     title_only.id = title_id.clone();
     title_only.status = Status::Running;
     title_only.view = crate::session::View::Structured;
-    title_only.worktree_info = Some(worktree(
-        "my-session",
-        paths
-            .path()
-            .join("missing-repo")
-            .to_string_lossy()
-            .into_owned(),
-        None,
-    ));
+    title_only.worktree_info = Some(worktree("my-session", branch_main.clone(), None));
 
     let mut branch_only = Instance::new(
         "Branch Only",
@@ -1766,20 +1912,51 @@ async fn rename_session_distinguishes_cwd_stable_title_and_branch_changes() {
     );
     branch_only.id = branch_id.clone();
     branch_only.status = Status::Running;
-    branch_only.worktree_info = Some(worktree(
-        "existing-branch",
-        paths
-            .path()
-            .join("missing-repo")
-            .to_string_lossy()
-            .into_owned(),
-        None,
-    ));
+    branch_only.tool = "rename-api-status-agent".into();
+    branch_only.worktree_info = Some(worktree("existing-branch", branch_main, None));
 
-    let (_storage, state) = build_rename_test_state(
+    let (storage, state) = build_rename_test_state(
         vec![title_only.clone(), branch_only.clone()],
         vec![title_only, branch_only],
     );
+    let _registry = crate::tmux::status_rules::ProfileRegistryGuard::take(storage.profile());
+    let profile_config =
+        crate::session::config::profile_config::get_profile_config_path(storage.profile()).unwrap();
+    std::fs::write(&profile_config,
+        "[[agents.rename-api-status-agent.status_rules]]\nstatus = \"running\"\ncontains = \"api-agent-busy\"\n",
+    ).unwrap();
+    let tmux_name = crate::tmux::Session::generate_name(&branch_id, "Branch Only");
+    let _kill = crate::tmux::test_helpers::TmuxTestSession::from_name(tmux_name.clone());
+    let created = crate::tmux::tmux_command()
+        .args([
+            "new-session",
+            "-d",
+            "-s",
+            &tmux_name,
+            "printf 'api-agent-busy\\n'; sleep 300",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        created.status.success(),
+        "{}",
+        String::from_utf8_lossy(&created.stderr)
+    );
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let captured = crate::tmux::tmux_command()
+            .args(["capture-pane", "-p", "-t", &tmux_name])
+            .output()
+            .unwrap();
+        if String::from_utf8_lossy(&captured.stdout).contains("api-agent-busy") {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "agent pane never painted"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
     state.acp_supervisor.test_insert_worker(&title_id).await;
 
     // The title changes, but its slug already matches both the cwd leaf
@@ -1846,17 +2023,17 @@ async fn rename_session_distinguishes_cwd_stable_title_and_branch_changes() {
         Some("existing-branch"),
         "the active branch-only request must be rejected before git mutation"
     );
+    assert_eq!(
+        crate::git::GitWorktree::get_current_branch(&branch_path).unwrap(),
+        "existing-branch",
+    );
 }
 
 #[tokio::test]
 #[serial_test::serial]
 async fn worktree_edits_quiesce_structured_worker_only_when_its_cwd_moves() {
     {
-        // Invariant #2260: a live structured worker is pinned to its cwd, so a
-        // tied rename that MOVES the worktree must stop the worker first, while one
-        // that leaves the cwd in place must not interrupt it. The quiesce runs
-        // before the git edit, so the assertion holds even though the edit then
-        // fails on a fixture with no real worktree to move.
+        // A structured worker's cwd changes only after authoritative admission (#2260).
         let _app_dir = crate::session::test_support::isolate_app_dir();
 
         struct Case {
@@ -1887,6 +2064,7 @@ async fn worktree_edits_quiesce_structured_worker_only_when_its_cwd_moves() {
         for case in cases {
             let paths = tempfile::tempdir().unwrap();
             let project_path = paths.path().join(case.leaf);
+            let main_repo = real_rename_worktree(paths.path(), case.leaf);
             let mut inst = Instance::new(
                 "Original title",
                 project_path.to_str().expect("UTF-8 temp path"),
@@ -1897,15 +2075,7 @@ async fn worktree_edits_quiesce_structured_worker_only_when_its_cwd_moves() {
             // misses and quiesce closes.
             inst.status = Status::Idle;
             inst.view = crate::session::View::Structured;
-            inst.worktree_info = Some(worktree(
-                case.leaf,
-                paths
-                    .path()
-                    .join("missing-repo")
-                    .to_string_lossy()
-                    .into_owned(),
-                None,
-            ));
+            inst.worktree_info = Some(worktree(case.leaf, main_repo, None));
 
             let (_storage, state) = build_rename_test_state(vec![inst.clone()], vec![inst]);
             state.acp_supervisor.test_insert_worker(case.id).await;
@@ -1936,10 +2106,7 @@ async fn worktree_edits_quiesce_structured_worker_only_when_its_cwd_moves() {
         }
     }
     {
-        // The standalone-endpoint mirror of the rename_session gate above: both
-        // stop a live structured worker only when the edit actually moves the cwd
-        // (#2260). The quiesce precedes the git edit, so the assertion holds even
-        // though the edit then fails on a fixture with no real worktree.
+        // The standalone route shares the same reservation and quiescence phase.
         let _app_dir = crate::session::test_support::isolate_app_dir();
         // set_worktree_name refuses a tied managed worktree (tied callers must
         // go through rename_session), so untie the profile to reach the worker
@@ -1985,6 +2152,7 @@ async fn worktree_edits_quiesce_structured_worker_only_when_its_cwd_moves() {
         for case in cases {
             let paths = tempfile::tempdir().unwrap();
             let project_path = paths.path().join(case.leaf);
+            let main_repo = real_rename_worktree(paths.path(), case.leaf);
             let mut inst = Instance::new(
                 "Original title",
                 project_path.to_str().expect("UTF-8 temp path"),
@@ -1993,15 +2161,7 @@ async fn worktree_edits_quiesce_structured_worker_only_when_its_cwd_moves() {
             inst.source_profile = "test".to_string();
             inst.status = Status::Idle;
             inst.view = crate::session::View::Structured;
-            inst.worktree_info = Some(worktree(
-                case.leaf,
-                paths
-                    .path()
-                    .join("missing-repo")
-                    .to_string_lossy()
-                    .into_owned(),
-                None,
-            ));
+            inst.worktree_info = Some(worktree(case.leaf, main_repo, None));
 
             let storage = Storage::new_unwatched("test").unwrap();
             storage
@@ -2573,7 +2733,7 @@ async fn permanent_deletion_waits_for_an_in_flight_submission() {
             delete_session(
                 State(state),
                 Path("sess-3650-direct".to_string()),
-                Some(Json(DeleteSessionBody::default())),
+                Ok(Some(Json(DeleteSessionBody::default()))),
             )
             .await
             .into_response()
@@ -2740,7 +2900,7 @@ async fn worker_stopping_handlers_wait_for_an_in_flight_submission() {
     ) -> axum::response::Response {
         match which {
             "stop" => stop_session(State(state), Path(id)).await.into_response(),
-            "trash" => trash_session(State(state), Path(id), None)
+            "trash" => trash_session(State(state), Path(id), Ok(None))
                 .await
                 .into_response(),
             "archive" => update_session_archive(
@@ -2938,7 +3098,7 @@ async fn delete_session_notifies_plugins_that_the_session_is_deleting() {
     delete_session(
         State(std::sync::Arc::clone(&state)),
         Path("sess-delete-notify".to_string()),
-        Some(Json(DeleteSessionBody::default())),
+        Ok(Some(Json(DeleteSessionBody::default()))),
     )
     .await;
 
@@ -4083,8 +4243,23 @@ fn rename_persistence_reports_missing_authoritative_row() {
     let _ = crate::session::get_app_dir().expect("isolated app dir");
     let storage = Storage::new_unwatched("rename-missing").unwrap();
 
-    let outcome = persist_rename_metadata(&storage, "missing-id", "New title", None, None).unwrap();
-    assert_eq!(outcome, RenamePersistOutcome::Missing);
+    let mut baseline = Instance::new("missing", "/tmp/missing");
+    baseline.source_profile = storage.profile().to_string();
+    let outcome = crate::session::rename::perform(
+        crate::session::rename::Request {
+            baseline,
+            edit: crate::session::rename::Edit::Session {
+                title: Some("New title".into()),
+                group: None,
+                profile: None,
+                rename_branch: false,
+                branch: None,
+            },
+            file_watch: crate::file_watch::FileWatchService::noop(),
+        },
+        |_, _| Ok(()),
+    );
+    assert!(outcome.is_err());
     assert!(
         storage.load().unwrap().is_empty(),
         "a missing row must not be synthesized by rename persistence"
@@ -4637,12 +4812,12 @@ async fn permanent_delete_keeps_a_worktree_a_surviving_session_uses() {
         let resp = if workspace_endpoint {
             delete_workspace(
                 State(state.clone()),
-                Some(Json(DeleteWorkspaceBody {
+                Ok(Some(Json(DeleteWorkspaceBody {
                     session_ids,
                     delete_worktree: true,
                     delete_branch: true,
                     ..Default::default()
-                })),
+                }))),
             )
             .await
             .into_response()
@@ -4650,11 +4825,11 @@ async fn permanent_delete_keeps_a_worktree_a_surviving_session_uses() {
             delete_session(
                 State(state.clone()),
                 Path(owner.id.clone()),
-                Some(Json(DeleteSessionBody {
+                Ok(Some(Json(DeleteSessionBody {
                     delete_worktree: true,
                     delete_branch: true,
                     ..Default::default()
-                })),
+                }))),
             )
             .await
             .into_response()

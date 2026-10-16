@@ -304,7 +304,7 @@ impl GitWorktree {
 
     /// The registered checkout path holding `branch`, including a stale locked
     /// entry whose checkout no longer exists.
-    pub(super) fn worktree_path_for_branch(&self, branch: &str) -> Result<Option<PathBuf>> {
+    pub(crate) fn worktree_path_for_branch(&self, branch: &str) -> Result<Option<PathBuf>> {
         let output = run_git(&self.repo_path, ["worktree", "list", "--porcelain", "-z"])?;
         if !output.status.success() {
             return Err(GitError::WorktreeCommandFailed(format!(
@@ -332,6 +332,17 @@ impl GitWorktree {
     fn reap_worktree_entry(&self, path: &Path) {
         self.unlock_worktree(path);
         let _ = self.prune_worktrees();
+    }
+
+    /// Metadata-only revalidation under ownership. Discovery still uses `branch_exists`.
+    pub(crate) fn branch_ref_exists(&self, branch: &str) -> Result<bool> {
+        let repo = crate::git::open_repo_at(&self.repo_path)?;
+        let reference = repo.find_reference(&format!("refs/heads/{branch}"));
+        match reference {
+            Ok(_) => Ok(true),
+            Err(error) if error.code() == git2::ErrorCode::NotFound => Ok(false),
+            Err(error) => Err(error.into()),
+        }
     }
 
     /// Whether `refs/heads/<branch>` exists. `Err` means the check itself
@@ -385,12 +396,12 @@ impl GitWorktree {
             repo = %self.repo_path.display(),
             "rename_branch: invoking `git branch -m`"
         );
-        let Some(output) = run_git_with_timeout(
+        let output = run_git_with_timeout(
             &self.repo_path,
             ["branch", "-m", old, new],
             WORKTREE_MUTATION_TIMEOUT,
-        )?
-        else {
+        )?;
+        let Some(output) = output else {
             let outcome = classify_ref_observations(
                 observe_local_branch_ref(&self.repo_path, old),
                 observe_local_branch_ref(&self.repo_path, new),
@@ -411,6 +422,30 @@ impl GitWorktree {
                 }
             };
         };
+        if !output.status.success() {
+            return Err(super::command_failed(&output));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn create_branch_ref_if_absent(
+        &self,
+        branch: &str,
+        original_tip: &str,
+    ) -> Result<()> {
+        let args = [
+            "update-ref".to_owned(),
+            format!("refs/heads/{branch}"),
+            original_tip.to_owned(),
+            "0".repeat(original_tip.len()),
+        ];
+        let output = run_git_with_timeout(&self.repo_path, &args, WORKTREE_MUTATION_TIMEOUT)?
+            .ok_or_else(|| {
+                GitError::WorktreeCommandFailed(
+                    "Original reference creation timed out; its outcome requires reconciliation"
+                        .into(),
+                )
+            })?;
         if !output.status.success() {
             return Err(super::command_failed(&output));
         }

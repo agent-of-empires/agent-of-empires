@@ -29,6 +29,9 @@ use linux as platform;
 use macos as platform;
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
 mod platform {
+    pub(super) fn running_image() -> std::io::Result<std::path::PathBuf> {
+        std::env::current_exe()
+    }
     pub(super) fn configure_process_group(_: &mut std::process::Command) {}
 
     pub(super) fn kill_process_group(_: &std::process::Child) {}

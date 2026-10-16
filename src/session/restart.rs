@@ -35,6 +35,20 @@ pub struct RestartResult {
 }
 
 pub fn perform_restart(request: RestartRequest) -> RestartResult {
+    perform_restart_inner(request, None)
+}
+
+pub(crate) fn perform_restart_with_storage(
+    request: RestartRequest,
+    storage: &crate::session::Storage,
+) -> RestartResult {
+    perform_restart_inner(request, Some(storage))
+}
+
+fn perform_restart_inner(
+    request: RestartRequest,
+    storage: Option<&crate::session::Storage>,
+) -> RestartResult {
     let RestartRequest {
         session_id,
         mut instance,
@@ -59,14 +73,22 @@ pub fn perform_restart(request: RestartRequest) -> RestartResult {
                 crate::session::recovery::recovery_hook_timeout(),
             )
         });
-        instance
-            .restart_discarding_sandbox_container(
+        let result = match storage {
+            Some(storage) => instance.restart_with_original_storage(
+                storage,
                 size,
                 skip_on_launch,
                 discard_sandbox_container,
                 conversation_carry,
-            )
-            .map_err(|e| e.to_string())
+            ),
+            None => instance.restart_discarding_sandbox_container(
+                size,
+                skip_on_launch,
+                discard_sandbox_container,
+                conversation_carry,
+            ),
+        };
+        result.map_err(|e| e.to_string())
     };
 
     // On a successful restart, send the wake-up keys on a detached thread so the result (and the
@@ -142,6 +164,89 @@ mod tests {
         Instance::new("Test Session", "/tmp/test-project")
     }
 
+    #[test]
+    #[serial_test::serial]
+    fn bound_attach_restart_rejects_profile_replacement_after_resume_admission() {
+        for replace in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let _home = crate::session::test_support::isolate_app_dir_at(temp.path());
+            let profile = "bound-attach-resume";
+            crate::session::create_profile(profile).unwrap();
+            let storage = crate::session::Storage::open_unwatched(profile).unwrap();
+            let mut instance = test_instance();
+            instance.source_profile = profile.into();
+            storage
+                .update(|rows, _| {
+                    rows.push(instance.clone());
+                    Ok(())
+                })
+                .unwrap();
+            let admitted = crate::session::attach_project::resume_instance(
+                &storage,
+                &instance,
+                instance.lifecycle_generation,
+                None,
+            )
+            .unwrap();
+            crate::session::rename_profile(profile, "bound-attach-original").unwrap();
+            let replacement = if replace {
+                crate::session::create_profile(profile).unwrap();
+                let replacement = crate::session::Storage::open_unwatched(profile).unwrap();
+                let mut replacement_row = instance.clone();
+                replacement_row.created_at += chrono::Duration::seconds(1);
+                replacement
+                    .update(|rows, _| {
+                        rows.push(replacement_row.clone());
+                        Ok(())
+                    })
+                    .unwrap();
+                Some((replacement, replacement_row))
+            } else {
+                None
+            };
+            let result = perform_restart_with_storage(
+                RestartRequest {
+                    session_id: admitted.id.clone(),
+                    instance: admitted,
+                    size: None,
+                    wake_message: String::new(),
+                    skip_on_launch: false,
+                    bound_hooks: true,
+                    discard_sandbox_container: false,
+                    conversation_carry: None,
+                },
+                &storage,
+            );
+            assert!(
+                result.outcome.is_err(),
+                "restart accepted a replacement profile"
+            );
+            if let Some((replacement, expected)) = replacement {
+                let rows = replacement.load_strict_for_worktree_ownership().unwrap();
+                assert_eq!(rows.len(), 1);
+                let current = &rows[0];
+                assert_eq!(current.id, expected.id);
+                assert_eq!(current.created_at, expected.created_at);
+                assert_eq!(current.title, expected.title);
+                assert_eq!(current.project_path, expected.project_path);
+                assert_eq!(current.group_path, expected.group_path);
+                assert_eq!(current.lifecycle_generation, expected.lifecycle_generation);
+                assert_eq!(
+                    current.lifecycle_reservation,
+                    expected.lifecycle_reservation
+                );
+                assert_eq!(current.status, expected.status);
+            } else {
+                assert!(
+                    !crate::session::get_profile_dir_path(profile)
+                        .unwrap()
+                        .exists(),
+                    "bound restart recreated the renamed profile"
+                );
+            }
+        }
+    }
+
     #[cfg(unix)]
     #[test]
     #[serial_test::serial]
@@ -193,6 +298,7 @@ mod tests {
                     op: LifecycleOperation::Launch,
                     generation: 1,
                     at: chrono::Utc::now(),
+                    resource_intent: None,
                 });
             }
             storage

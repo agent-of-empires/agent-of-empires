@@ -776,6 +776,8 @@ fn apply_terminal_title(
     let rekey = storage.update(|instances, _groups| {
         let mut rekey = None;
         if let Some(index) = instances.iter().position(|instance| instance.id == id) {
+            anyhow::ensure!(!instances[index].has_fresh_lifecycle_reservation(chrono::Utc::now()),
+                "Session has a lifecycle operation in progress");
             instances[index].smart_rename_attempted = true;
             if let Some(title) = &new_title {
                 let should_write = title_is_auto_overwritable(&instances[index], force)
@@ -1260,6 +1262,9 @@ mod serve {
                 else {
                     return Ok(Err(skipped("Session not found")));
                 };
+                if instances[index].has_fresh_lifecycle_reservation(chrono::Utc::now()) {
+                    return Ok(Err(skipped("Session has a lifecycle operation in progress")));
+                }
                 if instances[index].title == title_owned {
                     return Ok(Ok(false));
                 }

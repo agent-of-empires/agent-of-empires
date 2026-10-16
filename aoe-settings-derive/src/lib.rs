@@ -327,6 +327,7 @@ fn build_validation(
         "port_mapping_list" => quote!(ValidationKind::PortMappingList),
         "capability_list" => quote!(ValidationKind::CapabilityList),
         "security_opt_list" => quote!(ValidationKind::SecurityOptList),
+        "sync_path_list" => quote!(ValidationKind::SyncPathList),
         "network" => quote!(ValidationKind::Network),
         "systemd_slice" => quote!(ValidationKind::SystemdSlice),
         range if range.starts_with("range:") => {

@@ -46,9 +46,8 @@ where
         cwd = %cwd.display(),
         "running git"
     );
-    // Callers classify several Git failures. Keep diagnostics deterministic
-    // instead of depending on the launching shell's locale.
     let mut command = Command::new("git");
+    // Worktree classifiers parse Git's English diagnostics.
     command.args(&argv).current_dir(cwd).env("LC_ALL", "C");
     if throttled {
         crate::process::throttle_child(&mut command);

@@ -131,11 +131,11 @@ async fn set_dormant_in_memory(state: &AppState, id: &str, dormant: bool) -> boo
 }
 
 async fn persist_dormant(state: &AppState, profile: &str, id: &str, dormant: bool) -> bool {
-    let Ok(storage) = crate::session::Storage::new(profile, state.file_watch.clone()) else {
-        return false;
-    };
+    let profile = profile.to_string();
+    let file_watch = state.file_watch.clone();
     let id = id.to_string();
     tokio::task::spawn_blocking(move || {
+        let storage = crate::session::Storage::new(&profile, file_watch)?;
         storage.update(|instances, _groups| {
             if let Some(inst) = instances.iter_mut().find(|i| i.id == id) {
                 set_dormant(inst, dormant);

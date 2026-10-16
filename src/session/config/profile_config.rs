@@ -119,6 +119,7 @@ pub(crate) fn overrides_ignored_keys(overrides: &serde_json::Value) -> Vec<Strin
 /// possibly stale copy must go through [`update_profile_config`] instead.
 pub fn save_profile_config(profile: &str, config: &ProfileConfig) -> Result<()> {
     let path = get_profile_config_path(profile)?;
+    let _ownership = crate::session::storage::acquire_ownership_read()?;
     let content = toml::to_string_pretty(config)?;
     crate::session::atomic_write(&path, content.as_bytes())?;
     Ok(())
@@ -295,6 +296,39 @@ pub fn validate_security_opt_format(opt: &str) -> Result<(), String> {
     if opt.is_empty() || opt.chars().any(char::is_whitespace) || opt.starts_with('-') {
         return Err(
             "Must be a security option, e.g. seccomp=unconfined or no-new-privileges:true"
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
+/// Split a `sandbox.sync_extra_files` / `sync_extra_dirs` entry into its
+/// optional agent scope and relative path.
+pub(crate) fn split_sync_entry(entry: &str) -> (Option<&str>, &str) {
+    match entry.split_once(':') {
+        Some((agent, path)) => (Some(agent), path),
+        None => (None, entry),
+    }
+}
+
+/// Validate a sync entry: `path` or `agent:path`, relative to the agent's host
+/// config directory. Mount policy (native state, credentials) is enforced when
+/// the entry is applied.
+pub fn validate_sync_path_format(entry: &str) -> Result<(), String> {
+    let (agent, path) = split_sync_entry(entry);
+    if let Some(agent) = agent {
+        if !super::container_config::is_sync_agent(agent) {
+            return Err(format!("Unknown agent '{agent}'"));
+        }
+    }
+    let components: Vec<_> = std::path::Path::new(path).components().collect();
+    let plain = !components.is_empty()
+        && components
+            .iter()
+            .all(|c| matches!(c, std::path::Component::Normal(_)));
+    if !plain || path.contains(['\0', '*', '?', '[', ':']) {
+        return Err(
+            "Must be a relative path inside the agent config dir, optionally agent:path"
                 .to_string(),
         );
     }

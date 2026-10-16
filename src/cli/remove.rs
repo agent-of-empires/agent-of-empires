@@ -81,87 +81,39 @@ pub async fn run(profile: &str, args: RemoveArgs) -> Result<()> {
     );
 
     if config.session.delete_to_trash && !args.purge {
-        let _lifecycle_lock = storage
-            .acquire_instance_lifecycle_lock(&removed_id)
-            .map_err(|error| anyhow::anyhow!("failed to acquire instance trash lock: {error}"))?;
-        let trash_generation = storage.update(|all_instances, _groups| {
-            let stored = all_instances
-                .iter_mut()
-                .find(|instance| instance.id == removed_id)
-                .ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "Session {removed_title} was removed by another process before it could be trashed"
-                    )
-                })?;
-            let generation = stored
-                .try_acquire_lifecycle_reservation(
+        let (trash_generation, inst) = {
+            let ownership = crate::session::storage::acquire_ownership_read()?;
+            let _identity_lock =
+                crate::session::storage::acquire_session_identity_lock_with_ownership(&ownership)?;
+            let _lifecycle_lock =
+                storage.acquire_instance_lifecycle_lock_with_ownership(&ownership, &removed_id)?;
+            storage.load_strict_for_worktree_ownership()?;
+            storage.update_with_ownership(&ownership, |instances, _| {
+                let stored = instances
+                    .iter_mut()
+                    .find(|instance| instance.id == removed_id)
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("Session {removed_title} disappeared before trash")
+                    })?;
+                let generation = stored.try_acquire_lifecycle_reservation(
                     LifecycleOperation::Trash,
                     Instance::LIFECYCLE_RESERVATION_TTL,
                     Utc::now(),
-                )
-                .map_err(|error| anyhow::anyhow!("Session {removed_title}: {error}"))?;
-            stored.trash();
-            Ok(generation)
+                )?;
+                stored.trash();
+                Ok((generation, stored.clone()))
+            })?
+        };
+        let request = crate::session::trash::prepare_trash(&storage, &inst, trash_generation)?;
+        let outcome = crate::session::trash::trash_transition(&request, |inst| {
+            if let Err(error) = inst.kill_locked() {
+                eprintln!("Warning: failed to kill agent tmux session: {error}");
+            }
+            inst.kill_ancillary_tmux_sessions_locked();
+            inst.release_scope();
         })?;
-        if let Err(error) = inst.kill_locked() {
-            eprintln!("Warning: failed to kill agent tmux session: {error}");
-        }
-        inst.kill_ancillary_tmux_sessions_locked();
-        inst.release_scope();
-
-        let mut inst = inst;
-        inst.trash();
-        inst.source_profile = storage.profile().to_string();
-        match crate::session::trash::prepare_trashed_worktree(&mut inst) {
-            crate::session::trash::RelocateOutcome::Relocated { .. } => {
-                let reloc = crate::session::trash::TrashRelocation {
-                    new_project_path: inst.project_path.clone(),
-                    pre_trash_project_path: inst.pre_trash_project_path.clone(),
-                };
-                let mut decided: Option<crate::session::claim::RelocationCommit> = None;
-                let update_result = storage.update(|all_instances, _groups| {
-                    decided = Some(crate::session::claim::commit_trash_relocation(
-                        all_instances,
-                        &removed_id,
-                        trash_generation,
-                        &reloc,
-                    ));
-                    Ok(())
-                });
-                if let Err(e) = &update_result {
-                    eprintln!(
-                        "  Note: could not persist the trash relocation ({e}); it will be reconciled on next load."
-                    );
-                }
-                if matches!(
-                    decided,
-                    Some(crate::session::claim::RelocationCommit::Superseded)
-                ) {
-                    match crate::session::trash::undo_raced_relocation(&inst, &reloc) {
-                        crate::session::trash::RestoreOutcome::Failed { reason } => {
-                            eprintln!(
-                                "  Note: a concurrent restore superseded the trash; could not move the worktree back ({reason})."
-                            );
-                        }
-                        _ => {
-                            eprintln!(
-                                "  Note: a concurrent restore superseded the trash; the worktree was left in place."
-                            );
-                        }
-                    }
-                    println!(
-                        "  Session was restored by another process; it was not moved to the trash."
-                    );
-                    return Ok(());
-                }
-            }
-            crate::session::trash::RelocateOutcome::Failed { reason } => {
-                eprintln!("  Note: left worktree in place ({reason}).");
-                release_trash_reservation_best_effort(&storage, &removed_id, trash_generation);
-            }
-            crate::session::trash::RelocateOutcome::Skipped => {
-                release_trash_reservation_best_effort(&storage, &removed_id, trash_generation);
-            }
+        if let crate::session::trash::RelocateOutcome::Failed { reason } = outcome {
+            eprintln!("  Note: left worktree in place ({reason}).");
         }
 
         println!(
@@ -211,14 +163,7 @@ pub async fn run(profile: &str, args: RemoveArgs) -> Result<()> {
             anyhow::bail!("{detail}: {removed_title}");
         }
     };
-    let result = transaction.run_hooks().complete_with(|instance| {
-        super::purge_acp_transcript(instance).map_err(|error| {
-            format!(
-                "Session teardown succeeded but its transcript could not be purged, so the session \
-                 record was kept (retry, or remove it once the event store is reachable): {error}"
-            )
-        })
-    });
+    let result = transaction.run_hooks().complete();
 
     for msg in &result.messages {
         println!("  {}", msg);
@@ -240,6 +185,11 @@ pub async fn run(profile: &str, args: RemoveArgs) -> Result<()> {
         return Ok(());
     }
     if !result.success {
+        if result.disposition == crate::session::deletion::DeletionDisposition::Removed {
+            anyhow::bail!(
+                "Session removed, but cleanup is incomplete; its durable recovery intent was retained"
+            );
+        }
         anyhow::bail!(
             "Session teardown failed, so the session record was kept (retry, or fix the \
              underlying cause and remove it again)"
@@ -291,13 +241,6 @@ pub async fn run(profile: &str, args: RemoveArgs) -> Result<()> {
     );
 
     Ok(())
-}
-
-fn release_trash_reservation_best_effort(storage: &Storage, removed_id: &str, generation: u64) {
-    let _ = storage.update(|all_instances, _groups| {
-        crate::session::claim::release_trash_reservation(all_instances, removed_id, generation);
-        Ok(())
-    });
 }
 
 #[cfg(test)]

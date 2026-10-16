@@ -3,7 +3,52 @@
 
 use super::*;
 
+#[cfg(test)]
+pub(crate) struct TestHomeView(pub(super) HomeView);
+
+#[cfg(test)]
+impl std::ops::Deref for TestHomeView {
+    type Target = HomeView;
+    fn deref(&self) -> &HomeView {
+        &self.0
+    }
+}
+
+#[cfg(test)]
+impl std::ops::DerefMut for TestHomeView {
+    fn deref_mut(&mut self) -> &mut HomeView {
+        &mut self.0
+    }
+}
+
+#[cfg(test)]
+impl Drop for TestHomeView {
+    fn drop(&mut self) {
+        self.0.join_background_workers_for_test();
+    }
+}
+
 impl HomeView {
+    #[cfg(test)]
+    fn join_background_workers_for_test(&mut self) {
+        let _ = self.status_poller.finish_for_test();
+        let _ = self.metrics_poller.finish_for_test();
+        let _ = self.session_feed.join_for_test();
+        let _ = self.structured_approval_poller.finish_for_test();
+        let _ = self.deletion_poller.finish_for_test();
+        let _ = self.stop_poller.finish_for_test();
+        let _ = self.trash_poller.finish_for_test();
+        let _ = self.restore_worker.finish_for_test();
+        let _ = self.drop_poller.finish_for_test();
+        let _ = self.reconcile_poller.finish_for_test();
+        let _ = self.restart_poller.finish_for_test();
+        let _ = self.store_move_poller.finish_for_test();
+        let _ = self.attach_project_poller.finish_for_test();
+        let _ = self.rename_worker.finish_for_test();
+        let _ = self.creation_poller.finish_for_test();
+        let _ = self.serve_probe.finish_for_test();
+    }
+
     pub fn new(
         active_profile: Option<String>,
         available_tools: AvailableTools,
@@ -22,14 +67,14 @@ impl HomeView {
         active_profile: Option<String>,
         available_tools: AvailableTools,
         file_watch: std::sync::Arc<crate::file_watch::FileWatchService>,
-    ) -> anyhow::Result<Self> {
+    ) -> anyhow::Result<TestHomeView> {
         let mut view =
             Self::new_with_reconcile(active_profile, available_tools, file_watch, || {
                 crate::tui::reconcile_poller::ReconcilePoller::with_result_for_test(false)
             })?;
         // Unit fixtures do not own background disk healing or agent recovery.
         view.startup_recovery_gate = None;
-        Ok(view)
+        Ok(TestHomeView(view))
     }
 
     /// Load visible profiles and global UI state with an injectable reconciliation worker.
@@ -110,7 +155,7 @@ impl HomeView {
         // Duplicate detection across every loaded profile runs before any loaded state is
         // published (#3459): journal-guided repairs fix durable state under lock here, so
         // the reload below publishes exactly one row per session.
-        let legacy_duplicate_reports = {
+        let (legacy_duplicate_reports, move_intent_conflicts) = {
             let loads_view: Vec<(&str, &[Instance])> = profile_loads
                 .iter()
                 .map(|(name, instances, _)| (name.as_str(), instances.as_slice()))
@@ -131,7 +176,7 @@ impl HomeView {
                 }
             }
             log_legacy_duplicates_once(&outcome.reports);
-            outcome.reports
+            (outcome.reports, outcome.conflicts)
         };
         for (profile_name, instances, groups) in &profile_loads {
             let tree = GroupTree::new_with_groups(instances, groups);
@@ -203,6 +248,12 @@ impl HomeView {
             handles: HashMap::new(),
         };
 
+        let recovery_dialog = (!move_intent_conflicts.is_empty()).then(|| {
+            crate::tui::dialogs::InfoDialog::new(
+                "Worktree Recovery Conflict",
+                &move_intent_conflicts.join("\n\n"),
+            )
+        });
         let mut view = Self {
             storages,
             active_profile,
@@ -212,6 +263,7 @@ impl HomeView {
             pending_added: HashMap::new(),
             group_trees,
             legacy_duplicate_reports,
+            move_intent_conflicts,
             flat_items: Vec::new(),
             cursor: 0,
             selected_session: None,
@@ -275,7 +327,7 @@ impl HomeView {
             pending_intro_theme: None,
             no_agents_dialog: None,
             changelog_dialog: None,
-            info_dialog: None,
+            info_dialog: recovery_dialog,
             snooze_duration_dialog: None,
             pending_snooze_session: None,
             profile_picker_dialog: None,
@@ -378,6 +430,10 @@ impl HomeView {
             failed_deletes: HashMap::new(),
             stop_poller: StopPoller::new(),
             trash_poller: crate::tui::trash_poller::TrashPoller::new(),
+            restore_worker: crate::tui::worker::TrackedWorker::spawn(
+                "aoe-restore",
+                super::operations::perform_restore,
+            ),
             drop_poller: crate::tui::worker::TrackedWorker::spawn(
                 "aoe-drop-poller",
                 super::operations::perform_drop,
@@ -395,12 +451,18 @@ impl HomeView {
             store_move_bypass: None,
             attach_project_poller: crate::tui::attach_project_poller::AttachProjectPoller::new(),
             attach_project_in_flight: std::collections::HashSet::new(),
+            rename_worker: crate::tui::worker::TrackedWorker::spawn(
+                "aoe-rename",
+                super::operations::perform_rename,
+            ),
             creation_poller: CreationPoller::new(),
             creation_cancel: None,
             on_launch_hooks_ran: HashSet::new(),
             creating_hook_progress: HashMap::new(),
             creating_stub_id: None,
+            creating_provisional_creation: None,
             creating_provisional_group_paths: HashSet::new(),
+            cancelled_creations: HashMap::new(),
             preview_cache: PreviewCache::default(),
             preview_timings: PreviewTimings::default(),
             terminal_preview_cache: PreviewCache::default(),
@@ -722,6 +784,24 @@ impl HomeView {
         }
         log_legacy_duplicates_once(&outcome.reports);
         self.legacy_duplicate_reports = outcome.reports;
+        if !outcome.conflicts.is_empty() && outcome.conflicts != self.move_intent_conflicts {
+            self.info_dialog = Some(crate::tui::dialogs::InfoDialog::new(
+                "Worktree Recovery Conflict",
+                &outcome.conflicts.join("\n\n"),
+            ));
+        }
+        self.move_intent_conflicts = outcome.conflicts;
+        for (profile, instances, _) in &mut loads {
+            instances.retain(|row| {
+                !self
+                    .cancelled_creations
+                    .get(&row.id)
+                    .is_some_and(|cancelled| {
+                        cancelled.profile == *profile
+                            && matches!(cancelled.provisional.matches_instance(row), Ok(true))
+                    })
+            });
+        }
 
         for (profile_name, instances, groups) in &loads {
             // Rebuild this profile's tree from disk, preserving any collapsed

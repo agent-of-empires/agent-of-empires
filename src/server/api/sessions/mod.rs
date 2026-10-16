@@ -20,8 +20,8 @@ use crate::daemon::{
 use crate::git::error::GitError;
 use crate::session::config::SessionConfig;
 use crate::session::{
-    duplicate_session_error, is_duplicate_session, EnsureReadyError, EnsureReadyOutcome, Instance,
-    LifecycleOperation, Status, Storage, TerminalContextResume,
+    EnsureReadyError, EnsureReadyOutcome, Instance, LifecycleOperation, Status, Storage,
+    TerminalContextResume,
 };
 
 use crate::server::push::publish_status_change;

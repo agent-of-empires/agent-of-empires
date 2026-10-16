@@ -38,6 +38,7 @@ environment = ["ANTHROPIC_API_KEY"]
 | `volume_ignores` | `[]` | Paths excluded from the project mount (see [Volume ignores](#volume-ignores)) |
 | `volume_ignores_strategy` | `"anonymous"` | `"anonymous"` or `"named"` (see [Volume ignores](#volume-ignores)) |
 | `extra_volumes` | `[]` | Additional volume mounts |
+| `sync_extra_files` / `sync_extra_dirs` | `[]` | Extra agent config copied into each store (see [Extra config](#extra-config)) |
 | `port_mappings` | `[]` | Published ports, e.g. `"3000:3000"` |
 | `mount_ssh` | `false` | Mount `~/.ssh/` read-only |
 | `selinux_relabel` | `false` | Append `:z` to every bind mount (Docker and Podman only) |
@@ -161,6 +162,18 @@ changes throughout isolation, that session remains pending; `aoe migrate`
 continues with other sessions and retries later. A running sandbox whose mounts
 AoE cannot prove clear of `.aoe-sandbox-recovery` holds back moving any original
 there, and `aoe migrate` names it; launches that retire no original proceed.
+
+### Extra config
+
+`sync_extra_files` and `sync_extra_dirs` copy more of the host agent config directory (for example `~/.claude/agents` or `~/.claude/commands`) into each session's store. Entries are paths relative to that directory; prefix one with `claude:` to apply it to a single agent. Files are refreshed on every start; directories are copied only while absent. A missing source is skipped.
+
+```toml
+[sandbox]
+sync_extra_dirs = ["agents", "commands"]
+sync_extra_files = ["claude:notes.md"]
+```
+
+Anything an agent treats as its own history or credentials (`projects`, `history.jsonl`, `auth.json`, ...), or a parent of one, is refused and the session fails to start. Copied content is readable by the agent inside the container. These settings are global or per-profile only; a repo's config cannot set them.
 
 ### Shared credentials
 

@@ -35,6 +35,10 @@ impl MetricsPoller {
     pub fn try_recv_updates(&self) -> Result<MetricsSnapshot, std::sync::mpsc::TryRecvError> {
         self.worker.try_recv()
     }
+    #[cfg(test)]
+    pub(crate) fn finish_for_test(&mut self) -> std::thread::Result<()> {
+        self.worker.finish_for_test()
+    }
 }
 
 impl Default for MetricsPoller {

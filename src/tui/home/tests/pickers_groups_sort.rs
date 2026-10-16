@@ -196,8 +196,19 @@ fn group_header_count_tracks_trash_and_restore() {
         "trashed session drops out of the count"
     );
 
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while env.view.trash_poller.is_pending(&target) {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "trash result never drained"
+        );
+        env.view.apply_trash_results();
+        std::thread::yield_now();
+    }
+
     env.view.select_session_by_id(&target);
     env.view.toggle_archive_at_cursor().unwrap();
+    env.view.finish_restore_for_test();
     assert_eq!(work_count(&env), 3, "restored session returns to the count");
 }
 
@@ -571,6 +582,7 @@ fn test_delete_group_with_sessions_updates_groups_field() {
         op: LifecycleOperation::Launch,
         generation: 1,
         at: chrono::Utc::now(),
+        resource_intent: None,
     });
     storage
         .update(|instances, groups| {

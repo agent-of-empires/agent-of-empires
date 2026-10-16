@@ -289,6 +289,218 @@ impl Instance {
         splice(&mut self.extra_args, &pre.extra_args, &post.extra_args);
     }
 
+    /// Apply an intent's delta without replacing annotations refreshed during Git.
+    pub(crate) fn merge_resource_diff(
+        &mut self,
+        pre: &Self,
+        post: &Self,
+        account_swap: bool,
+    ) -> anyhow::Result<()> {
+        let worktree_base = pre
+            .worktree_info
+            .as_ref()
+            .zip(post.worktree_info.as_ref())
+            .filter(|(before, after)| before.base_branch == after.base_branch)
+            .and_then(|_| {
+                self.worktree_info
+                    .as_ref()
+                    .map(|info| info.base_branch.clone())
+            });
+        let conversion_metadata = (pre.workspace_info.is_none() && post.workspace_info.is_some())
+            .then(|| {
+                (
+                    self.base_branch_override.clone(),
+                    self.worktree_info
+                        .as_ref()
+                        .map(|info| info.base_branch.clone()),
+                )
+            });
+        self.merge_profile_move_diff(pre, post, account_swap);
+        if let (Some(info), Some(base)) = (&mut self.worktree_info, worktree_base) {
+            info.base_branch = base;
+        }
+        match (
+            &mut self.workspace_info,
+            &pre.workspace_info,
+            &post.workspace_info,
+        ) {
+            (Some(current), Some(before), Some(after)) => {
+                splice(&mut current.branch, &before.branch, &after.branch);
+                splice(
+                    &mut current.workspace_dir,
+                    &before.workspace_dir,
+                    &after.workspace_dir,
+                );
+                splice(
+                    &mut current.created_at,
+                    &before.created_at,
+                    &after.created_at,
+                );
+                splice(
+                    &mut current.cleanup_on_delete,
+                    &before.cleanup_on_delete,
+                    &after.cleanup_on_delete,
+                );
+                for original in &before.repos {
+                    let position = current
+                        .repos
+                        .iter()
+                        .position(|repo| {
+                            repo.main_repo_path == original.main_repo_path
+                                && repo.worktree_path == original.worktree_path
+                                && repo.branch == original.branch
+                        })
+                        .ok_or_else(|| {
+                            anyhow::anyhow!(
+                                "workspace repository changed during resource operation"
+                            )
+                        })?;
+                    let Some(planned) = after.repos.iter().find(|repo| repo.name == original.name)
+                    else {
+                        current.repos.remove(position);
+                        continue;
+                    };
+                    let repo = &mut current.repos[position];
+                    splice(&mut repo.name, &original.name, &planned.name);
+                    splice(
+                        &mut repo.source_path,
+                        &original.source_path,
+                        &planned.source_path,
+                    );
+                    splice(&mut repo.branch, &original.branch, &planned.branch);
+                    splice(
+                        &mut repo.worktree_path,
+                        &original.worktree_path,
+                        &planned.worktree_path,
+                    );
+                    splice(
+                        &mut repo.main_repo_path,
+                        &original.main_repo_path,
+                        &planned.main_repo_path,
+                    );
+                    splice(
+                        &mut repo.managed_by_aoe,
+                        &original.managed_by_aoe,
+                        &planned.managed_by_aoe,
+                    );
+                    splice(
+                        &mut repo.branch_preexisting,
+                        &original.branch_preexisting,
+                        &planned.branch_preexisting,
+                    );
+                    splice(
+                        &mut repo.base_branch,
+                        &original.base_branch,
+                        &planned.base_branch,
+                    );
+                    splice(
+                        &mut repo.base_branch_override,
+                        &original.base_branch_override,
+                        &planned.base_branch_override,
+                    );
+                }
+                for planned in &after.repos {
+                    if !before.repos.iter().any(|repo| repo.name == planned.name) {
+                        anyhow::ensure!(
+                            !current.repos.iter().any(|repo| repo.name == planned.name),
+                            "workspace repository name was claimed during resource operation"
+                        );
+                        current.repos.push(planned.clone());
+                    }
+                }
+            }
+            (_, None, Some(after)) => {
+                let mut workspace = after.clone();
+                if let (Some(primary), Some((override_value, base))) =
+                    (workspace.repos.first_mut(), conversion_metadata)
+                {
+                    if primary.base_branch_override == pre.base_branch_override {
+                        primary.base_branch_override = override_value;
+                    }
+                    if let Some(base) = base {
+                        if pre
+                            .worktree_info
+                            .as_ref()
+                            .is_some_and(|info| info.base_branch == primary.base_branch)
+                        {
+                            primary.base_branch = base;
+                        }
+                    }
+                }
+                self.workspace_info = Some(workspace);
+            }
+            (_, Some(_), None) => self.workspace_info = None,
+            _ => {}
+        }
+        splice(&mut self.status, &pre.status, &post.status);
+        splice(
+            &mut self.idle_dormant_since,
+            &pre.idle_dormant_since,
+            &post.idle_dormant_since,
+        );
+        Ok(())
+    }
+
+    /// Merge frontend initialization without replaying unrelated peer annotations.
+    pub(crate) fn merge_creation_diff(&mut self, pre: &Self, post: &Self) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            pre.sandbox_info.is_some() == post.sandbox_info.is_some(),
+            "creation sandbox mode changed after admission"
+        );
+        macro_rules! fields {
+            ($($field:ident),* $(,)?) => {
+                $(splice(&mut self.$field, &pre.$field, &post.$field);)*
+            };
+        }
+        fields!(
+            parent_session_id,
+            created_by_plugin,
+            plugin_create_idempotency,
+            pending_initial_turn,
+            acp_mode_id,
+            callback_url,
+            idempotency_key,
+            view,
+            agent_name,
+            agent_model,
+            agent_provider,
+            acp_effort,
+            acp_session_id,
+            import_pending,
+            fork_pending,
+        );
+        if let (Some(current), Some(before), Some(after)) = (
+            &mut self.sandbox_info,
+            &pre.sandbox_info,
+            &post.sandbox_info,
+        ) {
+            splice(
+                &mut current.container_id,
+                &before.container_id,
+                &after.container_id,
+            );
+            splice(&mut current.image, &before.image, &after.image);
+            splice(
+                &mut current.container_name,
+                &before.container_name,
+                &after.container_name,
+            );
+            splice(&mut current.extra_env, &before.extra_env, &after.extra_env);
+            splice(
+                &mut current.custom_instruction,
+                &before.custom_instruction,
+                &after.custom_instruction,
+            );
+            splice(
+                &mut current.container_workdir,
+                &before.container_workdir,
+                &after.container_workdir,
+            );
+            splice(&mut current.provider, &before.provider, &after.provider);
+        }
+        Ok(())
+    }
+
     /// Per-field-conditional splice: copy `post.X` onto `self.X` only when `pre.X != post.X`.
     pub fn merge_user_action_diff(&mut self, pre: &Self, post: &Self) {
         debug_assert_eq!(
@@ -629,6 +841,7 @@ mod tests {
                 op,
                 generation: 4,
                 at: Utc::now(),
+                resource_intent: None,
             });
             reserved.merge_runtime_from_reload(&deleting);
             assert_eq!(reserved.lifecycle_generation, 4);

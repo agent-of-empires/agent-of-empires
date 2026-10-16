@@ -115,6 +115,9 @@ pub fn validate_value(kind: &ValidationKind, value: &Value) -> Result<(), Valida
         ValidationKind::SecurityOptList => {
             validate_string_list(value, crate::session::validate_security_opt_format)
         }
+        ValidationKind::SyncPathList => {
+            validate_string_list(value, crate::session::validate_sync_path_format)
+        }
         ValidationKind::Network => {
             let s = value
                 .as_str()

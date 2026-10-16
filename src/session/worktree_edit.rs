@@ -3,7 +3,6 @@
 use std::path::{Path, PathBuf};
 
 use crate::containers::{DockerContainer, Probe, Teardown};
-use crate::git::error::GitError;
 use crate::git::template::sanitize_branch_name;
 use crate::git::GitWorktree;
 use crate::session::builder::git_sanitize_branch_name;
@@ -20,17 +19,6 @@ pub(crate) fn target_worktree_path(current_path: &Path, new_name: &str) -> Optio
     let parent = current_path.parent()?;
     let new_leaf = sanitize_branch_name(&git_sanitize_branch_name(new_name));
     Some(parent.join(new_leaf))
-}
-
-/// The tied-rename destination directory for `title`, as a string: the path
-/// [`edit_worktree_workdir`] would move `current_path` to, or `current_path` unchanged when it has
-/// no parent to rename within.
-pub(crate) fn derived_worktree_path(current_path: &Path, title: &str) -> String {
-    let leaf = worktree_leaf_from_title(title);
-    target_worktree_path(current_path, &leaf)
-        .unwrap_or_else(|| current_path.to_path_buf())
-        .to_string_lossy()
-        .into_owned()
 }
 
 /// Whether a workdir edit for `new_name` would actually move the worktree directory.
@@ -146,30 +134,10 @@ pub fn stop_sandbox_container(session_id: &str, is_sandboxed: bool) -> anyhow::R
     Ok(())
 }
 
-/// Inputs for an in-place worktree workdir edit.
-pub struct WorktreeEditRequest<'a> {
-    /// The session's current worktree metadata.
-    pub worktree_info: &'a WorktreeInfo,
-    /// The session's current `project_path` (the worktree directory).
-    pub current_path: &'a Path,
-    /// User-supplied new workdir name (raw; sanitized here).
-    pub new_name: &'a str,
-    /// Whether to also rename the git branch to match the new name.
-    pub rename_branch: bool,
-}
-
-/// Result of a successful edit: the values the caller must persist.
-#[derive(Debug)]
-pub struct WorktreeEditOutcome {
-    /// New worktree directory; assign to `Instance.project_path`.
-    pub new_path: PathBuf,
-    /// `Some(new_branch)` when the branch was renamed; assign to
-    /// `worktree_info.branch`. `None` means the branch was left untouched.
-    pub new_branch: Option<String>,
-}
-
 #[derive(Debug, thiserror::Error)]
 pub enum WorktreeEditError {
+    #[error("{0}")]
+    Ownership(String),
     #[error("this worktree is not managed by aoe; its workdir name cannot be edited")]
     NotManaged,
     #[error("the new workdir name is empty")]
@@ -184,103 +152,62 @@ pub enum WorktreeEditError {
     TargetExists(PathBuf),
     #[error("branch '{0}' already exists")]
     BranchExists(String),
-    #[error(
-        "worktree move failed ({move_err}), and rolling the branch rename back to '{branch}' also failed ({rollback_err}); the repo may be left on the new branch"
-    )]
-    RollbackFailed {
-        move_err: String,
-        rollback_err: String,
-        branch: String,
-    },
-    #[error(transparent)]
-    Git(#[from] GitError),
 }
 
-/// Validate and apply an in-place worktree workdir edit.
-pub fn edit_worktree_workdir(
-    req: WorktreeEditRequest,
-) -> Result<WorktreeEditOutcome, WorktreeEditError> {
-    if !req.worktree_info.managed_by_aoe {
-        return Err(WorktreeEditError::NotManaged);
-    }
-    if req.new_name.trim().is_empty() {
-        return Err(WorktreeEditError::EmptyName);
-    }
-
-    // The new branch name uses the same git-ref sanitizer as creation; the directory leaf uses the
-    // path-safe sanitizer (slashes become dashes), mirroring how `resolve_template` derives a leaf
-    // from a branch.
-    let new_branch = git_sanitize_branch_name(req.new_name);
-
-    let new_path = target_worktree_path(req.current_path, req.new_name)
-        .ok_or_else(|| WorktreeEditError::NoParent(req.current_path.to_path_buf()))?;
-
-    let branch_changes =
-        worktree_branch_rename_required(req.worktree_info, req.new_name, req.rename_branch);
-    let path_changes = new_path != req.current_path;
-    if !branch_changes && !path_changes {
-        return Err(WorktreeEditError::Unchanged);
-    }
-
-    let git = GitWorktree::new(PathBuf::from(&req.worktree_info.main_repo_path))?;
-
-    if !req.current_path.exists() {
-        return Err(WorktreeEditError::SourceMissing(
-            req.current_path.to_path_buf(),
-        ));
-    }
-    // fail-closed gate: swallowing `Err` as "absent" would clobber a branch that actually existed
-    // or explode inside `rename_branch`.
-    if branch_changes && git.branch_exists(&new_branch)? {
-        return Err(WorktreeEditError::BranchExists(new_branch));
-    }
-    if path_changes && new_path.exists() {
-        return Err(WorktreeEditError::TargetExists(new_path));
-    }
-
-    // Branch first: a ref rename is cheap to undo if the directory move
-    // (the riskier step) then fails.
-    let mut renamed_branch = false;
-    if branch_changes {
-        git.rename_branch(&req.worktree_info.branch, &new_branch)?;
-        renamed_branch = true;
-    }
-
-    if path_changes {
-        if let Err(e) = git.move_worktree(req.current_path, &new_path) {
-            if renamed_branch {
-                if let Err(rollback) = git.rename_branch(&new_branch, &req.worktree_info.branch) {
-                    tracing::error!(
-                        target: "git.worktree",
-                        new = %new_branch,
-                        old = %req.worktree_info.branch,
-                        "worktree edit: branch-rename rollback failed after move error: {rollback}"
-                    );
-                    // The repo is now on `new_branch` with the directory still at its old path.
-                    return Err(WorktreeEditError::RollbackFailed {
-                        move_err: e.to_string(),
-                        rollback_err: rollback.to_string(),
-                        branch: new_branch.clone(),
-                    });
-                }
-            }
-            return Err(e.into());
+pub(crate) fn ensure_worktree_unshared(
+    ownership: &super::storage::OwnershipGuard,
+    profile: &str,
+    id: &str,
+    path: &Path,
+    info: &WorktreeInfo,
+    destination: Option<&Path>,
+    renames_branch: bool,
+) -> Result<(), WorktreeEditError> {
+    if destination.is_some() || renames_branch {
+        let claims = super::deletion::paths_in_use_except_with_ownership(ownership, profile, &[id]);
+        if claims.covers(path) || destination.is_some_and(|target| claims.covers(target)) {
+            return Err(WorktreeEditError::Ownership(
+                "Another session claims the worktree source or destination, or its owners could not be checked".to_string(),
+            ));
         }
     }
-
-    Ok(WorktreeEditOutcome {
-        new_path,
-        new_branch: renamed_branch.then_some(new_branch),
-    })
+    if renames_branch {
+        let in_use = super::deletion::branch_in_use_with_ownership(
+            ownership,
+            profile,
+            &[id],
+            Path::new(&info.main_repo_path),
+            &info.branch,
+        )
+        .map_err(|error| WorktreeEditError::Ownership(error.to_string()))?;
+        if in_use {
+            return Err(WorktreeEditError::Ownership(
+                "Another session shares this branch".to_string(),
+            ));
+        }
+    }
+    Ok(())
 }
 
-/// Rename a managed branch without moving its directory or touching its files.
-/// The caller holds the session identity and lifecycle locks and persists the result.
-pub fn rename_worktree_branch(
+pub(crate) fn prepare_worktree_branch_rename(
     info: &WorktreeInfo,
     path: &Path,
     branch: &str,
-) -> anyhow::Result<bool> {
+) -> anyhow::Result<Option<GitWorktree>> {
+    let git = revalidate_worktree_branch_rename(info, path, branch)?;
+    if let Some(git) = &git {
+        if git.branch_exists(branch)? {
+            return Err(WorktreeEditError::BranchExists(branch.to_owned()).into());
+        }
+    }
+    Ok(git)
+}
+
+pub(crate) fn revalidate_worktree_branch_rename(
+    info: &WorktreeInfo,
+    path: &Path,
+    branch: &str,
+) -> anyhow::Result<Option<GitWorktree>> {
     anyhow::ensure!(
         info.managed_by_aoe,
         "Branch-only rename requires a managed worktree"
@@ -312,7 +239,7 @@ pub fn rename_worktree_branch(
         "Worktree branch changed; refresh session metadata before renaming"
     );
     if branch == info.branch {
-        return Ok(false);
+        return Ok(None);
     }
     let protected = git.protected_default_branch_names()?;
     anyhow::ensure!(
@@ -326,33 +253,105 @@ pub fn rename_worktree_branch(
         }),
         "Source branch is shared by another Git worktree"
     );
-    anyhow::ensure!(
-        !git.branch_exists(branch)?,
-        "Target branch already exists: {branch}"
-    );
-    git.rename_branch(&info.branch, branch)?;
-    Ok(true)
-}
-
-/// Roll back a branch rename only while the worktree still uses the renamed branch.
-pub fn rollback_worktree_branch(
-    info: &WorktreeInfo,
-    path: &Path,
-    renamed_branch: &str,
-) -> anyhow::Result<()> {
-    anyhow::ensure!(
-        GitWorktree::get_current_branch(path)? == renamed_branch,
-        "Worktree branch changed concurrently; refusing branch rollback"
-    );
-    GitWorktree::new(PathBuf::from(&info.main_repo_path))?
-        .rename_branch(renamed_branch, &info.branch)?;
-    Ok(())
+    if git.branch_ref_exists(branch)? {
+        return Err(WorktreeEditError::BranchExists(branch.to_owned()).into());
+    }
+    Ok(Some(git))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use chrono::Utc;
+    #[test]
+    #[serial_test::serial]
+    fn worktree_move_refuses_same_id_owner_in_another_profile() {
+        for restore_destination in [false, true] {
+            let app = tempfile::tempdir().unwrap();
+            let _home = crate::session::test_support::isolate_app_dir_at(app.path());
+            crate::session::config::update_config(|config| {
+                config.session.tie_workdir_to_name = false;
+            })
+            .unwrap();
+            let dirs = tempfile::tempdir().unwrap();
+            let main = dirs.path().join("repo");
+            let path = dirs.path().join("checkout");
+            let repo = git2::Repository::init(&main).unwrap();
+            let signature = git2::Signature::now("Test", "test@example.com").unwrap();
+            let tree_id = repo.index().unwrap().write_tree().unwrap();
+            let tree = repo.find_tree(tree_id).unwrap();
+            repo.commit(Some("HEAD"), &signature, &signature, "initial", &tree, &[])
+                .unwrap();
+            let git = GitWorktree::new(main.clone()).unwrap();
+            let base = repo.head().unwrap().shorthand().unwrap().to_owned();
+            git.create_worktree("feature", &path, true, Some(&base))
+                .unwrap();
+            let info = wt_info("feature", &main.to_string_lossy(), true);
+            let mut original = crate::session::Instance::new("original", &path.to_string_lossy());
+            original.worktree_info = Some(info.clone());
+            original.status = crate::session::Status::Stopped;
+            let id = original.id.clone();
+            let a = crate::session::Storage::new_unwatched("rename-a").unwrap();
+            let b = crate::session::Storage::new_unwatched("rename-b").unwrap();
+            a.update(|rows, _| {
+                rows.push(original.clone());
+                Ok(())
+            })
+            .unwrap();
+            let mut peer = original;
+            if restore_destination {
+                let holding = dirs.path().join("holding");
+                git.create_worktree("peer", &holding, true, Some(&base))
+                    .unwrap();
+                peer.project_path = holding.to_string_lossy().into_owned();
+                peer.worktree_info = Some(wt_info("peer", &main.to_string_lossy(), true));
+                peer.trashed_at = Some(Utc::now());
+                peer.pre_trash_project_path =
+                    Some(dirs.path().join("moved").to_string_lossy().into_owned());
+            }
+            b.update(|rows, _| {
+                rows.push(peer);
+                Ok(())
+            })
+            .unwrap();
+            let mut baseline = a
+                .load()
+                .unwrap()
+                .into_iter()
+                .find(|row| row.id == id)
+                .unwrap();
+            baseline.source_profile = a.profile().to_owned();
+            let request = || crate::session::rename::Request {
+                baseline: baseline.clone(),
+                edit: crate::session::rename::Edit::Workdir {
+                    name: "moved".to_owned(),
+                    rename_branch: true,
+                },
+                file_watch: a.file_watch(),
+            };
+            let error = crate::session::rename::perform(request(), |_, _| Ok(()))
+                .err()
+                .expect("shared source or destination must be rejected");
+            assert!(matches!(
+                error.downcast_ref::<WorktreeEditError>(),
+                Some(WorktreeEditError::Ownership(_))
+            ));
+            assert!(path.is_dir());
+            assert!(!dirs.path().join("moved").exists());
+            assert!(git.branch_exists("feature").unwrap());
+            assert!(!git.branch_exists("moved").unwrap());
+            b.update(|rows, _| {
+                rows.clear();
+                Ok(())
+            })
+            .unwrap();
+            let outcome = crate::session::rename::perform(request(), |_, _| Ok(())).unwrap();
+            let new_path = PathBuf::from(&outcome.instance.project_path);
+            assert_eq!(new_path, dirs.path().join("moved"));
+            assert!(!path.exists());
+            assert_eq!(GitWorktree::get_current_branch(&new_path).unwrap(), "moved");
+        }
+    }
 
     fn wt_info(branch: &str, main_repo: &str, managed: bool) -> WorktreeInfo {
         WorktreeInfo {
@@ -470,26 +469,63 @@ mod tests {
     }
 
     #[test]
-    fn edit_worktree_workdir_rejects_invalid_requests() {
-        let cases = [
+    #[serial_test::serial]
+    fn canonical_workdir_rename_rejects_invalid_requests() {
+        for (managed, name, expected) in [
             (false, "new", WorktreeEditError::NotManaged),
             (true, "   ", WorktreeEditError::EmptyName),
             (true, "old", WorktreeEditError::Unchanged),
-        ];
-        for (managed, new_name, want) in cases {
-            let info = wt_info("old", "/tmp/repo", managed);
-            let err = edit_worktree_workdir(WorktreeEditRequest {
-                worktree_info: &info,
-                current_path: Path::new("/tmp/wt/old"),
-                new_name,
-                rename_branch: false,
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let _home = crate::session::test_support::isolate_app_dir_at(&temp.path().join("home"));
+            crate::session::config::update_config(|config| {
+                config.session.tie_workdir_to_name = false;
             })
-            .unwrap_err();
+            .unwrap();
+            let main = temp.path().join("repo");
+            let path = temp.path().join("old");
+            let repo = git2::Repository::init(&main).unwrap();
+            let signature = git2::Signature::now("Test", "test@example.com").unwrap();
+            let tree = repo
+                .find_tree(repo.index().unwrap().write_tree().unwrap())
+                .unwrap();
+            repo.commit(Some("HEAD"), &signature, &signature, "initial", &tree, &[])
+                .unwrap();
+            let base = repo.head().unwrap().shorthand().unwrap().to_owned();
+            let git = GitWorktree::new(main.clone()).unwrap();
+            git.create_worktree("old", &path, true, Some(&base))
+                .unwrap();
+            let storage = crate::session::Storage::new_unwatched("edit").unwrap();
+            let mut row = crate::session::Instance::new("original", &path.to_string_lossy());
+            row.source_profile = storage.profile().to_owned();
+            row.status = crate::session::Status::Stopped;
+            row.worktree_info = Some(wt_info("old", &main.to_string_lossy(), managed));
+            storage
+                .update(|rows, _| {
+                    rows.push(row.clone());
+                    Ok(())
+                })
+                .unwrap();
+            let error = crate::session::rename::perform(
+                crate::session::rename::Request {
+                    baseline: row,
+                    edit: crate::session::rename::Edit::Workdir {
+                        name: name.to_owned(),
+                        rename_branch: false,
+                    },
+                    file_watch: storage.file_watch(),
+                },
+                |_, _| Ok(()),
+            )
+            .err()
+            .expect("invalid edit must be rejected");
             assert_eq!(
-                std::mem::discriminant(&err),
-                std::mem::discriminant(&want),
-                "{new_name:?}"
+                std::mem::discriminant(error.downcast_ref::<WorktreeEditError>().unwrap()),
+                std::mem::discriminant(&expected)
             );
+            assert!(path.is_dir());
+            assert_eq!(GitWorktree::get_current_branch(&path).unwrap(), "old");
+            assert!(storage.load().unwrap()[0].lifecycle_reservation.is_none());
         }
     }
 }

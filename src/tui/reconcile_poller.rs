@@ -54,6 +54,10 @@ impl ReconcilePoller {
             ),
         }
     }
+    #[cfg(test)]
+    pub(crate) fn finish_for_test(&mut self) -> std::thread::Result<()> {
+        self.worker.finish_for_test()
+    }
 }
 
 impl Default for ReconcilePoller {

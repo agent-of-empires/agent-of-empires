@@ -10,6 +10,7 @@ use super::extract_session_id::ExtractSessionIdArgs;
 use super::group::GroupCommands;
 use super::hooks::HooksCommands;
 use super::init::InitArgs;
+use super::intents::IntentCommands;
 use super::killall::KillallArgs;
 use super::list::ListArgs;
 use super::log_level::LogLevelArgs;
@@ -165,6 +166,12 @@ pub enum Commands {
         command: WorktreeCommands,
     },
 
+    /// Inspect and explicitly clear interrupted resource intents
+    Intents {
+        #[command(subcommand)]
+        command: IntentCommands,
+    },
+
     /// tmux integration utilities
     Tmux {
         #[command(subcommand)]
@@ -305,6 +312,7 @@ pub const CLI_COMMAND_NAMES: &[&str] = &[
     "uninstall",
     "update",
     "migrate",
+    "intents",
     "completion",
 ];
 
@@ -346,6 +354,7 @@ pub fn command_name(command: &Commands) -> Option<&'static str> {
         Commands::Uninstall(_) => "uninstall",
         Commands::Update(_) => "update",
         Commands::Migrate => "migrate",
+        Commands::Intents { .. } => "intents",
         Commands::Completion { .. } => "completion",
     })
 }

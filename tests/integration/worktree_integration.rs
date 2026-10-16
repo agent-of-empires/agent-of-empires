@@ -57,9 +57,9 @@ fn test_error_when_worktree_already_exists() {
 
 // --- Edit-workdir-name (#1723) ---
 
-use agent_of_empires::session::worktree_edit::{
-    edit_worktree_workdir, WorktreeEditError, WorktreeEditRequest,
-};
+use agent_of_empires::cli::session::{self, SessionCommands};
+use agent_of_empires::session::worktree_edit::WorktreeEditError;
+use anyhow::Context as _;
 
 fn managed_info(branch: &str, repo: &std::path::Path) -> WorktreeInfo {
     WorktreeInfo {
@@ -71,9 +71,53 @@ fn managed_info(branch: &str, repo: &std::path::Path) -> WorktreeInfo {
     }
 }
 
+fn seed_edit_session(info: &WorktreeInfo, path: &std::path::Path) -> (Storage, String) {
+    agent_of_empires::session::config::update_config(|config| {
+        config.session.tie_workdir_to_name = false;
+    })
+    .unwrap();
+    let storage = Storage::new_unwatched("worktree-edit").unwrap();
+    let mut instance = Instance::new("Edit", &path.to_string_lossy());
+    instance.worktree_info = Some(info.clone());
+    let id = instance.id.clone();
+    storage
+        .update(|rows, _| {
+            rows.push(instance);
+            Ok(())
+        })
+        .unwrap();
+    (storage, id)
+}
+
+fn edit_workdir(
+    storage: &Storage,
+    id: &str,
+    name: &str,
+    rename_branch: bool,
+) -> anyhow::Result<Instance> {
+    use clap::Parser;
+    #[derive(Parser)]
+    struct Command {
+        #[command(subcommand)]
+        session: SessionCommands,
+    }
+    let args = Command::try_parse_from(
+        ["session", "set-worktree-name", id, "--name", name]
+            .into_iter()
+            .chain(rename_branch.then_some("--rename-branch")),
+    )?;
+    tokio::runtime::Runtime::new()?.block_on(session::run(storage.profile(), args.session))?;
+    storage
+        .load()?
+        .into_iter()
+        .find(|row| row.id == id)
+        .context("edited session disappeared")
+}
+
 #[test]
 #[serial]
 fn edit_workdir_moves_dir_and_optionally_renames_branch() {
+    let _home = crate::common::setup_temp_home();
     let (repo_dir, _repo, _config_dir) = setup_test_environment();
     let git_wt = GitWorktree::new(repo_dir.path().to_path_buf()).unwrap();
 
@@ -83,32 +127,24 @@ fn edit_workdir_moves_dir_and_optionally_renames_branch() {
         .unwrap();
     assert!(old_path.exists());
     let info = managed_info("old-name", repo_dir.path());
+    let (storage, id) = seed_edit_session(&info, &old_path);
 
     // Path-only edit: directory moves, branch untouched.
-    let outcome = edit_worktree_workdir(WorktreeEditRequest {
-        worktree_info: &info,
-        current_path: &old_path,
-        new_name: "fresh-name",
-        rename_branch: false,
-    })
-    .unwrap();
+    let outcome = edit_workdir(&storage, &id, "fresh-name", false).unwrap();
     let fresh_path = repo_dir.path().join("fresh-name");
-    assert_eq!(outcome.new_path, fresh_path);
-    assert_eq!(outcome.new_branch, None);
+    assert_eq!(
+        std::path::Path::new(&outcome.project_path),
+        fresh_path.as_path()
+    );
+    assert_eq!(outcome.worktree_info.as_ref().unwrap().branch, "old-name");
     assert!(!old_path.exists());
     assert!(fresh_path.exists());
     assert!(git_wt.branch_exists("old-name").unwrap());
 
     // Branch rename opted in: directory moves and branch is renamed.
-    let outcome2 = edit_worktree_workdir(WorktreeEditRequest {
-        worktree_info: &info,
-        current_path: &fresh_path,
-        new_name: "renamed",
-        rename_branch: true,
-    })
-    .unwrap();
+    let outcome2 = edit_workdir(&storage, &id, "renamed", true).unwrap();
     let renamed_path = repo_dir.path().join("renamed");
-    assert_eq!(outcome2.new_branch.as_deref(), Some("renamed"));
+    assert_eq!(outcome2.worktree_info.as_ref().unwrap().branch, "renamed");
     assert!(!fresh_path.exists());
     assert!(renamed_path.exists());
     assert!(git_wt.branch_exists("renamed").unwrap());
@@ -142,6 +178,7 @@ fn tie_workdir_applies_only_for_managed_worktrees() {
 #[test]
 #[serial]
 fn edit_workdir_rejects_invalid_cases_without_partial_changes() {
+    let _home = crate::common::setup_temp_home();
     let (repo_dir, _repo, _config_dir) = setup_test_environment();
     let git_wt = GitWorktree::new(repo_dir.path().to_path_buf()).unwrap();
 
@@ -154,28 +191,23 @@ fn edit_workdir_rejects_invalid_cases_without_partial_changes() {
         .create_worktree("bbb", &occupied, true, None)
         .unwrap();
     let info = managed_info("aaa", repo_dir.path());
+    let (storage, id) = seed_edit_session(&info, &old_path);
 
     // Target directory already exists: nothing moves.
-    let err = edit_worktree_workdir(WorktreeEditRequest {
-        worktree_info: &info,
-        current_path: &old_path,
-        new_name: "bbb",
-        rename_branch: false,
-    })
-    .unwrap_err();
-    assert!(matches!(err, WorktreeEditError::TargetExists(_)));
+    let err = edit_workdir(&storage, &id, "bbb", false).unwrap_err();
+    assert!(matches!(
+        err.downcast_ref::<WorktreeEditError>(),
+        Some(WorktreeEditError::TargetExists(_))
+    ));
     assert!(old_path.exists());
 
     // Branch rename onto an existing branch is rejected; the source
     // directory and branch are untouched.
-    let err = edit_worktree_workdir(WorktreeEditRequest {
-        worktree_info: &info,
-        current_path: &old_path,
-        new_name: "test-feature",
-        rename_branch: true,
-    })
-    .unwrap_err();
-    assert!(matches!(err, WorktreeEditError::BranchExists(_)));
+    let err = edit_workdir(&storage, &id, "test-feature", true).unwrap_err();
+    assert!(matches!(
+        err.downcast_ref::<WorktreeEditError>(),
+        Some(WorktreeEditError::BranchExists(_))
+    ));
     assert!(old_path.exists());
     assert!(git_wt.branch_exists("aaa").unwrap());
 
@@ -184,14 +216,20 @@ fn edit_workdir_rejects_invalid_cases_without_partial_changes() {
         managed_by_aoe: false,
         ..info.clone()
     };
-    let err = edit_worktree_workdir(WorktreeEditRequest {
-        worktree_info: &unmanaged,
-        current_path: &old_path,
-        new_name: "ccc",
-        rename_branch: false,
-    })
-    .unwrap_err();
-    assert!(matches!(err, WorktreeEditError::NotManaged));
+    storage
+        .update(|rows, _| {
+            rows.iter_mut()
+                .find(|row| row.id == id)
+                .unwrap()
+                .worktree_info = Some(unmanaged);
+            Ok(())
+        })
+        .unwrap();
+    let err = edit_workdir(&storage, &id, "ccc", false).unwrap_err();
+    assert!(matches!(
+        err.downcast_ref::<WorktreeEditError>(),
+        Some(WorktreeEditError::NotManaged)
+    ));
     assert!(old_path.exists());
 }
 
@@ -270,18 +308,6 @@ fn reconcile_heals_a_worktree_moved_outside_aoe() {
     assert!(!created.exists());
     assert!(relocated.exists());
 
-    // The pre-reconcile behavior, pinned: `edit_worktree_workdir` is untouched
-    // by the reconcile work, so calling it with the recorded path is exactly
-    // what every surface did before and it still refuses.
-    let before = edit_worktree_workdir(WorktreeEditRequest {
-        worktree_info: &info,
-        current_path: &created,
-        new_name: "settled-name",
-        rename_branch: false,
-    })
-    .unwrap_err();
-    assert!(matches!(before, WorktreeEditError::SourceMissing(_)));
-
     let mut stale = instance.clone();
     assert_eq!(
         reconcile_and_persist(&storage, &mut stale, &mut Default::default()).unwrap(),
@@ -298,30 +324,27 @@ fn reconcile_heals_a_worktree_moved_outside_aoe() {
         relocated.canonicalize().unwrap()
     );
 
-    // The rename that returned SourceMissing before the reconcile now lands,
-    // renaming within the directory's real parent.
-    let outcome = edit_worktree_workdir(WorktreeEditRequest {
-        worktree_info: &info,
-        current_path: std::path::Path::new(&stale.project_path),
-        new_name: "settled-name",
-        rename_branch: false,
+    agent_of_empires::session::config::update_config(|config| {
+        config.session.tie_workdir_to_name = false;
     })
     .unwrap();
+    let outcome = edit_workdir(&storage, &instance.id, "settled-name", false).unwrap();
+    let settled_path = relocated
+        .parent()
+        .unwrap()
+        .canonicalize()
+        .unwrap()
+        .join("settled-name");
     assert_eq!(
-        outcome.new_path,
-        relocated
-            .parent()
-            .unwrap()
-            .canonicalize()
-            .unwrap()
-            .join("settled-name")
+        std::path::Path::new(&outcome.project_path),
+        settled_path.as_path()
     );
-    assert!(outcome.new_path.exists());
+    assert!(settled_path.exists());
 
     // Reconciling again is a no-op: the recorded path is present, so git is
     // never consulted.
     let mut settled = stale.clone();
-    settled.project_path = outcome.new_path.to_string_lossy().into_owned();
+    settled.project_path = outcome.project_path;
     assert_eq!(
         reconcile_and_persist(&storage, &mut settled, &mut Default::default()).unwrap(),
         WorktreePathResolution::Current
@@ -460,4 +483,177 @@ fn reconcile_refuses_a_checkout_another_session_records() {
     assert_eq!(stale_row.project_path, stale.project_path);
     let live_row = reloaded.iter().find(|i| i.id == live.id).unwrap();
     assert_eq!(live_row.project_path, live.project_path);
+}
+
+#[cfg(unix)]
+#[test]
+#[serial_test::parallel]
+fn cli_publishes_and_removes_detached_without_owning_a_local_branch_label() {
+    use std::os::unix::fs::PermissionsExt;
+    use std::process::Command;
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path().join("home");
+    let xdg = temp.path().join("xdg");
+    let bin = temp.path().join("bin");
+    for path in [&home, &xdg, &bin] {
+        std::fs::create_dir(path).unwrap();
+    }
+    let repo_path = temp.path().join("repo");
+    let repo = git2::Repository::init(&repo_path).unwrap();
+    let signature = git2::Signature::now("fixture", "fixture@example.com").unwrap();
+    let tree = repo.index().unwrap().write_tree().unwrap();
+    let tip = repo
+        .commit(
+            Some("HEAD"),
+            &signature,
+            &signature,
+            "fixture",
+            &repo.find_tree(tree).unwrap(),
+            &[],
+        )
+        .unwrap();
+    repo.reference("refs/remotes/origin/main", tip, true, "fixture")
+        .unwrap();
+    let hook = repo.path().join("hooks/post-checkout");
+    std::fs::write(
+        &hook,
+        "#!/bin/sh\nprintf complete > \"$AOE_TEST_POSTCHECKOUT_MARKER\"\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let agent = bin.join("claude");
+    std::fs::write(
+        &agent,
+        "#!/bin/sh\nprintf denied > \"$AOE_TEST_AGENT_LOG\"\nexit 97\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&agent, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let app = xdg.join(if cfg!(debug_assertions) {
+        "agent-of-empires-dev"
+    } else {
+        "agent-of-empires"
+    });
+    std::fs::create_dir_all(app.join("profiles/owner")).unwrap();
+    crate::common::disable_systemd_scopes(&app);
+    let marker = temp.path().join("hook-completed");
+    let agent_log = temp.path().join("agent-invocations");
+    let path = std::env::join_paths(std::iter::once(bin).chain(std::env::split_paths(
+        &std::env::var_os("PATH").unwrap_or_default(),
+    )))
+    .unwrap();
+    let cli = || {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_aoe"));
+        command
+            .args(["-p", "owner"])
+            .current_dir(temp.path())
+            .env("HOME", &home)
+            .env("XDG_CONFIG_HOME", &xdg)
+            .env("AOE_TMUX_SOCKET", temp.path().join("tmux.sock"))
+            .env("AOE_TEST_POSTCHECKOUT_MARKER", &marker)
+            .env("AOE_TEST_AGENT_LOG", &agent_log)
+            .env("PATH", &path)
+            .env_remove("AGENT_OF_EMPIRES_PROFILE")
+            .env_remove("GIT_DIR")
+            .env_remove("GIT_WORK_TREE")
+            .env_remove("GIT_PREFIX");
+        command
+    };
+    let mut command = cli();
+    command.arg("add").arg(&repo_path).args([
+        "--title",
+        "detached-publication",
+        "--worktree",
+        "origin/main",
+        "--cmd",
+        "claude",
+        "--trust-hooks",
+        "--no-submodules",
+    ]);
+    let output = agent_of_empires::process::run_with_timeout_process_group(
+        &mut command,
+        std::time::Duration::from_secs(30),
+    )
+    .unwrap()
+    .expect("detached CLI creation exceeded its deadline");
+    assert!(
+        output.status.success(),
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(std::fs::read(&marker).unwrap(), b"complete");
+    assert!(!agent_log.exists());
+    let rows: Vec<Instance> =
+        serde_json::from_slice(&std::fs::read(app.join("profiles/owner/sessions.json")).unwrap())
+            .unwrap();
+    assert_eq!(rows.len(), 1);
+    let info = rows[0].worktree_info.as_ref().unwrap();
+    assert_eq!(info.branch, "origin/main");
+    assert!(info.managed_by_aoe);
+    let checkout = git2::Repository::open(&rows[0].project_path).unwrap();
+    assert!(checkout.head_detached().unwrap());
+    assert_eq!(checkout.head().unwrap().peel_to_commit().unwrap().id(), tip);
+    assert!(checkout.path().join("locked").is_file());
+    assert!(GitWorktree::new(repo_path)
+        .unwrap()
+        .list_worktrees()
+        .unwrap()
+        .iter()
+        .any(|entry| entry.is_detached
+            && entry.path.canonicalize().ok()
+                == std::path::Path::new(&rows[0].project_path)
+                    .canonicalize()
+                    .ok()));
+    assert!(repo.find_reference("refs/heads/origin/main").is_err());
+    assert_eq!(
+        repo.find_reference("refs/remotes/origin/main")
+            .unwrap()
+            .target(),
+        Some(tip)
+    );
+    repo.reference(
+        "refs/heads/origin/main",
+        tip,
+        true,
+        "later independent local branch",
+    )
+    .unwrap();
+    let mut remove = cli();
+    remove.args([
+        "remove",
+        rows[0].id.as_str(),
+        "--delete-worktree",
+        "--delete-branch",
+        "--purge",
+    ]);
+    let removed = agent_of_empires::process::run_with_timeout_process_group(
+        &mut remove,
+        std::time::Duration::from_secs(30),
+    )
+    .unwrap()
+    .expect("detached CLI deletion exceeded its deadline");
+    assert!(
+        removed.status.success(),
+        "{}{}",
+        String::from_utf8_lossy(&removed.stdout),
+        String::from_utf8_lossy(&removed.stderr)
+    );
+    assert!(!std::path::Path::new(&rows[0].project_path).exists());
+    let remaining: Vec<Instance> =
+        serde_json::from_slice(&std::fs::read(app.join("profiles/owner/sessions.json")).unwrap())
+            .unwrap();
+    assert!(remaining.is_empty());
+    assert_eq!(
+        repo.find_reference("refs/heads/origin/main")
+            .unwrap()
+            .target(),
+        Some(tip)
+    );
+    assert_eq!(
+        repo.find_reference("refs/remotes/origin/main")
+            .unwrap()
+            .target(),
+        Some(tip)
+    );
+    assert!(!agent_log.exists());
 }

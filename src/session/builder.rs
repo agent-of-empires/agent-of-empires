@@ -5,7 +5,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use anyhow::{bail, Result};
+use anyhow::{bail, Context, Result};
 use chrono::Utc;
 
 use crate::containers;
@@ -85,10 +85,75 @@ pub struct InstanceParams {
     /// One-shot fork seed. When `Some`, the freshly-built instance is set up
     /// to fork its parent on first launch instead of starting fresh.
     pub fork_seed: Option<crate::session::ForkSeed>,
+    /// Exact originating placeholder, if creation is queued by the TUI.
+    pub provisional_creation: Option<std::sync::Arc<ProvisionalCreation>>,
+    /// The caller's retained hook plan contains external prepublication callbacks.
+    pub has_creation_callbacks: bool,
+}
+
+/// Logical identity of the originating durable Creating placeholder.
+#[derive(Debug)]
+pub struct ProvisionalCreation {
+    profile: super::move_journal::ProfileAuthority,
+    id: String,
+    created_at: chrono::DateTime<Utc>,
+    generation: u64,
+}
+
+impl ProvisionalCreation {
+    pub(crate) fn capture(storage: &super::Storage, row: &Instance) -> Result<Self> {
+        anyhow::ensure!(
+            row.status == super::Status::Creating
+                && row.lifecycle_reservation_is_owned(
+                    super::LifecycleOperation::Create,
+                    row.lifecycle_generation
+                )
+                && row
+                    .lifecycle_reservation
+                    .as_ref()
+                    .is_some_and(|lease| lease.resource_intent.is_none()),
+            "Creating placeholder has no unbound creation reservation"
+        );
+        Ok(Self {
+            profile: super::move_journal::ProfileAuthority::capture(storage)?,
+            id: row.id.clone(),
+            created_at: row.created_at,
+            generation: row.lifecycle_generation,
+        })
+    }
+
+    pub(crate) fn instance_id(&self) -> &str {
+        &self.id
+    }
+
+    pub(crate) fn verify_profile(&self, storage: &super::Storage) -> Result<()> {
+        anyhow::ensure!(
+            self.profile.matches(storage)?,
+            "Creating placeholder profile changed"
+        );
+        Ok(())
+    }
+
+    pub(crate) fn matches_instance(&self, row: &Instance) -> Result<bool> {
+        Ok(row.id == self.id
+            && row.created_at == self.created_at
+            && row.lifecycle_generation == self.generation
+            && row.status == super::Status::Creating
+            && !row.is_trashed()
+            && row
+                .lifecycle_reservation_is_owned(super::LifecycleOperation::Create, self.generation))
+    }
 }
 
 /// Result of building an instance, tracking what was created for cleanup purposes.
 pub struct BuildResult {
+    pub(crate) profile_storage: super::Storage,
+    pub(crate) transaction: Option<std::sync::Arc<super::claim::ResourceReservation>>,
+    on_create_effect: Option<usize>,
+    on_create_started: bool,
+    on_create_completed: bool,
+    ready_status: super::Status,
+    initial_metadata: Option<Instance>,
     pub instance: Instance,
     /// Path to worktree if one was created and managed by aoe
     pub created_worktree: Option<CreatedWorktree>,
@@ -99,6 +164,433 @@ pub struct BuildResult {
     pub warnings: Vec<String>,
 }
 
+impl BuildResult {
+    pub(crate) fn provision(
+        profile_storage: super::Storage,
+        mut instance: Instance,
+        mut effects: Vec<super::move_journal::ResourceEffect>,
+        has_creation_callbacks: bool,
+        provisional: Option<&ProvisionalCreation>,
+        allocations: (Option<CreatedWorktree>, Vec<CreatedWorktree>),
+        warnings: Vec<String>,
+    ) -> Result<Self> {
+        use super::move_journal::{
+            CallbackCheckout, IntentOwner, ProfileAuthority, ResourceEffect, ResourceIntent,
+        };
+        instance.source_profile = profile_storage.profile().to_owned();
+        let ready_status = instance.status;
+        let (transaction, admitted, on_create_effect) = {
+            let root = super::storage::acquire_ownership_lock()?;
+            let _identity = super::storage::acquire_session_identity_lock_with_ownership(&root)?;
+            let _lifecycle = profile_storage
+                .acquire_instance_lifecycle_lock_with_ownership(&root, &instance.id)?;
+            let before = if let Some(provisional) = provisional {
+                provisional.verify_profile(&profile_storage)?;
+                let current = profile_storage
+                    .load_strict_for_worktree_ownership()?
+                    .into_iter()
+                    .find(|row| row.id == instance.id)
+                    .context("Creating placeholder disappeared before admission")?;
+                anyhow::ensure!(
+                    provisional.matches_instance(&current)?
+                        && current
+                            .lifecycle_reservation
+                            .as_ref()
+                            .is_some_and(|lease| lease.resource_intent.is_none()),
+                    "Creating placeholder was superseded"
+                );
+                Some(current)
+            } else {
+                None
+            };
+            let mut reserved = instance.clone();
+            if let Some(before) = &before {
+                reserved.lifecycle_generation = before.lifecycle_generation;
+                reserved.lifecycle_reservation = before.lifecycle_reservation.clone();
+                let path = std::mem::take(&mut reserved.project_path);
+                let worktree = reserved.worktree_info.take();
+                reserved.merge_user_action_diff(&instance, before);
+                reserved.project_path = path;
+                reserved.worktree_info = worktree;
+            } else {
+                reserved.try_acquire_lifecycle_reservation(
+                    super::LifecycleOperation::Create,
+                    Instance::LIFECYCLE_RESERVATION_TTL,
+                    Utc::now(),
+                )?;
+            }
+            reserved.status = super::Status::Creating;
+            instance.lifecycle_generation = reserved.lifecycle_generation;
+            instance.lifecycle_reservation = None;
+            if effects.is_empty() && !instance.is_sandboxed() && !has_creation_callbacks {
+                validate_creation_paths(&instance)?;
+                let admitted = profile_storage.update_with_ownership(&root, |rows, _| {
+                    if let Some(current) = rows.iter_mut().find(|row| row.id == reserved.id) {
+                        let before = before
+                            .as_ref()
+                            .context("Creation identity already exists")?;
+                        anyhow::ensure!(
+                            super::move_journal::row_resources_match(current, before)
+                                && current.lifecycle_reservation == before.lifecycle_reservation,
+                            "Creating placeholder changed before admission"
+                        );
+                        *current = reserved;
+                        Ok(current.clone())
+                    } else {
+                        anyhow::ensure!(
+                            before.is_none(),
+                            "Creating placeholder disappeared before admission"
+                        );
+                        rows.push(reserved);
+                        Ok(rows.last().expect("Creating row inserted").clone())
+                    }
+                })?;
+                (None, admitted, None)
+            } else {
+                let checkout = |repository: &str, path: &str, branch: &str| {
+                    let detached = effects.iter().any(|effect| matches!(effect,
+                        ResourceEffect::CreateWorktree { path: planned, expected_detached: true, .. }
+                            if planned == Path::new(path)));
+                    CallbackCheckout {
+                        repository: repository.into(),
+                        path: path.into(),
+                        branch: (!detached).then(|| branch.to_owned()),
+                    }
+                };
+                let mut checkouts = Vec::new();
+                if let Some(workspace) = &instance.workspace_info {
+                    checkouts.extend(workspace.repos.iter().map(|repo| {
+                        checkout(&repo.main_repo_path, &repo.worktree_path, &repo.branch)
+                    }));
+                } else if let Some(worktree) = &instance.worktree_info {
+                    checkouts.push(checkout(
+                        &worktree.main_repo_path,
+                        &instance.project_path,
+                        &worktree.branch,
+                    ));
+                }
+                let index = effects.len();
+                effects.push(ResourceEffect::Callback {
+                    name: "creation-callbacks".to_owned(),
+                    directory: instance.project_path.clone().into(),
+                    checkouts,
+                });
+                let profile = ProfileAuthority::capture(&profile_storage)?;
+                let intent = ResourceIntent::new(
+                    IntentOwner {
+                        profile: profile.clone(),
+                        id: instance.id.clone(),
+                        created_at: instance.created_at,
+                        generation: reserved.lifecycle_generation,
+                    },
+                    profile,
+                    super::LifecycleOperation::Create,
+                    before,
+                    Some(instance),
+                    effects,
+                    Vec::new(),
+                )?;
+                let admitted = super::claim::ResourceReservation::admit_with_ownership(
+                    &profile_storage,
+                    &root,
+                    intent,
+                    reserved,
+                )?;
+                (Some(admitted.transaction), admitted.instance, Some(index))
+            }
+        };
+        let initial_metadata = transaction.is_none().then(|| admitted.clone());
+        let mut result = Self {
+            profile_storage,
+            transaction,
+            on_create_effect,
+            on_create_started: false,
+            on_create_completed: false,
+            ready_status,
+            initial_metadata,
+            instance: admitted,
+            created_worktree: allocations.0,
+            created_workspace_worktrees: allocations.1,
+            warnings,
+        };
+        if let Err(error) = result.execute_allocations() {
+            return match result.rollback() {
+                Ok(()) => Err(error),
+                Err(cleanup) => {
+                    Err(error.context(format!("Creation rollback could not finish: {cleanup:#}")))
+                }
+            };
+        }
+        Ok(result)
+    }
+
+    fn execute_allocations(&mut self) -> Result<()> {
+        use super::move_journal::ResourceEffect;
+        let Some(transaction) = self.transaction.as_ref() else {
+            return Ok(());
+        };
+        let mut jobs = Vec::new();
+        for index in 0..self
+            .on_create_effect
+            .context("Creation callback phase is missing")?
+        {
+            let effect = transaction.effect(index)?;
+            match effect {
+                ResourceEffect::CreateWorktree { .. } => jobs.push((index, effect)),
+                ResourceEffect::CreateDirectory { .. } => {
+                    let scratch = self.instance.scratch;
+                    transaction.run_effect(index, || {
+                        if scratch {
+                            super::scratch::provision_scratch_dir(&self.instance.id)?;
+                            Ok((Vec::new(), None))
+                        } else {
+                            effect.execute().map(|warnings| (warnings, None))
+                        }
+                    })??;
+                }
+                _ => bail!("Creation plan contains a non-allocation effect"),
+            }
+        }
+        let outcomes = std::thread::scope(|scope| {
+            let handles: Vec<_> = jobs
+                .into_iter()
+                .map(|(index, effect)| {
+                    scope.spawn(move || {
+                        let label = match &effect {
+                            ResourceEffect::CreateWorktree { repository, .. } => {
+                                repository.display().to_string()
+                            }
+                            _ => unreachable!("only checkout allocations are parallel"),
+                        };
+                        transaction
+                            .run_effect(index, || effect.execute().map(|warnings| (warnings, None)))
+                            .and_then(std::convert::identity)
+                            .map_err(|error| format!("{label}: {error:#}"))
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|handle| {
+                    handle.join().unwrap_or_else(|_| {
+                        Err("worktree worker panicked; its Pending intent was retained".to_owned())
+                    })
+                })
+                .collect::<Vec<_>>()
+        });
+        let mut errors = Vec::new();
+        for outcome in outcomes {
+            match outcome {
+                Ok(warnings) => self.warnings.extend(warnings),
+                Err(error) => errors.push(error),
+            }
+        }
+        anyhow::ensure!(
+            errors.is_empty(),
+            "Failed to create worktrees:\n{}",
+            errors.join("\n")
+        );
+        Ok(())
+    }
+
+    fn owns_ordinary_row(&self, row: &Instance) -> bool {
+        row.id == self.instance.id
+            && row.created_at == self.instance.created_at
+            && row.lifecycle_generation == self.instance.lifecycle_generation
+            && row.lifecycle_reservation_is_owned(
+                super::LifecycleOperation::Create,
+                self.instance.lifecycle_generation,
+            )
+            && row
+                .lifecycle_reservation
+                .as_ref()
+                .is_some_and(|lease| lease.resource_intent.is_none())
+            && self
+                .initial_metadata
+                .as_ref()
+                .is_some_and(|before| super::move_journal::same_namespace(before, row))
+    }
+
+    fn replace_live(&mut self, mut latest: Instance) {
+        let status = latest.status;
+        latest.merge_runtime_for_profile_move(&self.instance);
+        latest.status = status;
+        self.instance = latest;
+    }
+
+    fn flush_metadata(&mut self) -> Result<()> {
+        let latest = {
+            let root = super::storage::acquire_ownership_lock()?;
+            let _identity = super::storage::acquire_session_identity_lock_with_ownership(&root)?;
+            let _lifecycle = self
+                .profile_storage
+                .acquire_instance_lifecycle_lock_with_ownership(&root, &self.instance.id)?;
+            if let Some(transaction) = &self.transaction {
+                transaction.update_creation_metadata_with_ownership(&root, &self.instance)?
+            } else {
+                let before = self
+                    .initial_metadata
+                    .as_ref()
+                    .context("Creation has already been published")?;
+                anyhow::ensure!(
+                    super::move_journal::same_namespace(before, &self.instance),
+                    "Creation initialization changed its namespace"
+                );
+                self.profile_storage
+                    .update_with_ownership(&root, |rows, _| {
+                        let current = rows
+                            .iter_mut()
+                            .find(|row| row.id == self.instance.id)
+                            .context("Creating owner disappeared")?;
+                        anyhow::ensure!(
+                            self.owns_ordinary_row(current),
+                            "Creating owner was superseded"
+                        );
+                        current.merge_creation_diff(before, &self.instance)?;
+                        Ok(current.clone())
+                    })?
+            }
+        };
+        if self.transaction.is_none() {
+            self.initial_metadata = Some(latest.clone());
+        }
+        self.replace_live(latest);
+        Ok(())
+    }
+
+    pub(crate) fn run_on_create<T>(
+        &mut self,
+        callback: impl FnOnce(&mut Instance) -> Result<T>,
+    ) -> Result<T> {
+        anyhow::ensure!(
+            !self.on_create_started,
+            "Creation callbacks have already started"
+        );
+        self.flush_metadata()?;
+        self.on_create_started = true;
+        let outcome = if let Some(transaction) = &self.transaction {
+            transaction.run_effect(
+                self.on_create_effect
+                    .context("Creation callback phase is missing")?,
+                || callback(&mut self.instance).map(|value| (value, None)),
+            )?
+        } else {
+            callback(&mut self.instance)
+        };
+        match (outcome, self.flush_metadata()) {
+            (Ok(value), Ok(())) => {
+                self.on_create_completed = true;
+                Ok(value)
+            }
+            (Err(error), Ok(())) | (Ok(_), Err(error)) => Err(error),
+            (Err(error), Err(persistence)) => Err(error.context(format!(
+                "Creation metadata could not be saved: {persistence:#}"
+            ))),
+        }
+    }
+
+    pub(crate) fn publish(&mut self) -> Result<()> {
+        anyhow::ensure!(
+            self.on_create_completed,
+            "Creation callbacks have not completed"
+        );
+        self.flush_metadata()?;
+        let latest = {
+            let root = super::storage::acquire_ownership_lock()?;
+            let _identity = super::storage::acquire_session_identity_lock_with_ownership(&root)?;
+            let _lifecycle = self
+                .profile_storage
+                .acquire_instance_lifecycle_lock_with_ownership(&root, &self.instance.id)?;
+            let validate = |rows: &[Instance], candidate: &Instance| -> Result<()> {
+                if super::is_duplicate_session(
+                    rows.iter(),
+                    &candidate.title,
+                    &candidate.project_path,
+                    Some(candidate.id.as_str()),
+                ) {
+                    return Err(super::duplicate_session_error(&candidate.title));
+                }
+                validate_creation_paths(candidate)
+            };
+            if let Some(transaction) = &self.transaction {
+                transaction
+                    .publish_with_ownership(&root, validate)?
+                    .context("Creation publication removed its row")?
+            } else {
+                self.profile_storage
+                    .update_with_ownership(&root, |rows, groups| {
+                        let index = rows
+                            .iter()
+                            .position(|row| row.id == self.instance.id)
+                            .context("Creating owner disappeared")?;
+                        anyhow::ensure!(
+                            self.owns_ordinary_row(&rows[index]),
+                            "Creating owner was superseded"
+                        );
+                        rows[index].status = self.ready_status;
+                        if rows[index].is_archived() {
+                            rows[index].settle_archived_status();
+                        }
+                        rows[index].lifecycle_reservation = None;
+                        validate(rows, &rows[index])?;
+                        let committed = rows[index].clone();
+                        let mut tree = super::GroupTree::new_with_groups(rows, groups);
+                        tree.create_group(&committed.group_path);
+                        *groups = tree.get_all_groups();
+                        Ok(committed)
+                    })?
+            }
+        };
+        self.replace_live(latest);
+        self.transaction = None;
+        self.initial_metadata = None;
+        Ok(())
+    }
+
+    pub(crate) fn rollback(&mut self) -> Result<()> {
+        if let Some(transaction) = &self.transaction {
+            if let Err(error) = transaction.rollback() {
+                let diagnostic = {
+                    let root = super::storage::acquire_ownership_lock()?;
+                    transaction.note_conflict_with_ownership(&root, format!("{error:#}"))
+                };
+                return match diagnostic {
+                    Ok(()) => Err(error),
+                    Err(recording) => Err(error.context(format!(
+                        "Creation conflict could not be recorded: {recording:#}"
+                    ))),
+                };
+            }
+        } else {
+            anyhow::ensure!(
+                self.initial_metadata.is_some(),
+                "Published creation resources were retained"
+            );
+            let root = super::storage::acquire_ownership_lock()?;
+            let _identity = super::storage::acquire_session_identity_lock_with_ownership(&root)?;
+            let _lifecycle = self
+                .profile_storage
+                .acquire_instance_lifecycle_lock_with_ownership(&root, &self.instance.id)?;
+            self.profile_storage
+                .update_with_ownership(&root, |rows, _| {
+                    let index = rows
+                        .iter()
+                        .position(|row| row.id == self.instance.id)
+                        .context("Creating owner disappeared")?;
+                    anyhow::ensure!(
+                        self.owns_ordinary_row(&rows[index]),
+                        "Creating owner was superseded"
+                    );
+                    rows.remove(index);
+                    Ok(())
+                })?;
+        }
+        self.transaction = None;
+        self.initial_metadata = None;
+        Ok(())
+    }
+}
+
 /// A worktree provisioned during instance building and owned by this build.
 pub struct CreatedWorktree {
     pub path: PathBuf,
@@ -107,14 +599,12 @@ pub struct CreatedWorktree {
     pub owned_branch: Option<String>,
 }
 
-/// Result of creating a multi-repo workspace.
-pub struct WorkspaceResult {
-    pub workspace_info: WorkspaceInfo,
-    pub created_worktrees: Vec<CreatedWorktree>,
-    pub workspace_path: PathBuf,
-    /// Non-fatal warnings from worktree creation (e.g. post-checkout hook
-    /// failures where the worktree itself was created successfully).
-    pub warnings: Vec<String>,
+/// A complete workspace plan, before any checkout allocation.
+pub(crate) struct WorkspacePlan {
+    pub(crate) workspace_info: WorkspaceInfo,
+    pub(crate) created_worktrees: Vec<CreatedWorktree>,
+    pub(crate) workspace_path: PathBuf,
+    pub(crate) effects: Vec<super::move_journal::ResourceEffect>,
 }
 
 /// Normalize a base-branch string, treating empty/whitespace as unset.
@@ -229,214 +719,92 @@ pub struct WorkspaceRepoSpec {
     pub base_branch: Option<String>,
 }
 
-/// Create a multi-repo workspace with worktrees for each repository.
-pub fn create_workspace(
+/// Plan every workspace checkout before publishing its Creating owner.
+pub(crate) fn plan_workspace(
     primary: &WorkspaceRepoSpec,
     extra_repos: &[WorkspaceRepoSpec],
     branch: &str,
     create_new_branch: bool,
     workspace_template: &str,
     init_submodules: bool,
-) -> Result<WorkspaceResult> {
-    let primary_main_repo = GitWorktree::find_main_repo(&primary.path)?;
-    let primary_git_wt = GitWorktree::new(primary_main_repo)?;
-
-    let session_id = uuid::Uuid::new_v4().to_string();
-    let session_id_short = &session_id[..8];
-
-    let workspace_path =
-        primary_git_wt.compute_path(branch, workspace_template, session_id_short)?;
-    let workspace_dir = workspace_path.to_string_lossy().to_string();
-    std::fs::create_dir_all(&workspace_path)?;
-
-    // (canonicalized path, resolved base branch) for the primary repo followed by every extra repo.
-    let all_repos: Vec<(PathBuf, Option<String>)> =
-        std::iter::once((primary.path.clone(), primary.base_branch.clone()))
-            .chain(extra_repos.iter().map(|r| {
-                (
-                    r.path.canonicalize().unwrap_or_else(|_| r.path.clone()),
-                    r.base_branch.clone(),
-                )
-            }))
-            .collect();
-
-    // Check for duplicate repo directory names
-    let mut seen_names = std::collections::HashSet::new();
-    for (repo_path, _) in &all_repos {
-        let name = repo_path
-            .file_name()
-            .map(|n| n.to_string_lossy().to_string())
-            .unwrap_or_else(|| "repo".to_string());
-        if !seen_names.insert(name.clone()) {
-            let _ = std::fs::remove_dir_all(&workspace_path);
-            bail!(
-                "Duplicate repository name '{}' in workspace\n\
-                 Tip: Rename one of the directories to avoid the collision",
-                name
-            );
-        }
-    }
-
-    let cleanup = |created: &[CreatedWorktree], ws_path: &std::path::Path| {
-        let protection = CleanupProtection::default();
-        for worktree in created {
-            cleanup_created_worktree(worktree, "workspace worktree", &protection);
-        }
-        let _ = std::fs::remove_dir_all(ws_path);
-    };
-
-    // Pre-validate every repo and resolve metadata sequentially. This is cheap
-    // (no network) and lets us fail fast before kicking off any worktree work.
-    struct RepoPlan {
-        repo_path: PathBuf,
-        repo_name: String,
-        main_repo_path: PathBuf,
-        worktree_subdir: PathBuf,
-        base_branch: Option<String>,
-    }
-    let mut plans: Vec<RepoPlan> = Vec::with_capacity(all_repos.len());
-    for (repo_path, base_branch) in &all_repos {
-        if !GitWorktree::is_git_repo(repo_path) {
-            cleanup(&[], &workspace_path);
-            bail!(
-                "Path is not in a git repository: {}\n\
-                 Tip: All --repo paths must be git repositories",
-                repo_path.display()
-            );
-        }
-
-        let main_repo_path_raw = GitWorktree::find_main_repo(repo_path)?;
-        let main_repo_path = main_repo_path_raw
+    instance_id: &str,
+) -> Result<WorkspacePlan> {
+    use super::move_journal::ResourceEffect;
+    super::validate_instance_id(instance_id)?;
+    let main = GitWorktree::find_main_repo(&primary.path)?;
+    let workspace_path = GitWorktree::new(main)?.compute_path(
+        branch,
+        workspace_template,
+        &instance_id[..instance_id.len().min(8)],
+    )?;
+    let mut effects = vec![ResourceEffect::CreateDirectory {
+        path: workspace_path.clone(),
+    }];
+    let mut repos = Vec::with_capacity(extra_repos.len() + 1);
+    let mut created_worktrees = Vec::with_capacity(extra_repos.len() + 1);
+    let mut names = HashSet::new();
+    for spec in std::iter::once(primary).chain(extra_repos) {
+        let path = spec
+            .path
             .canonicalize()
-            .unwrap_or(main_repo_path_raw);
-
-        let repo_name = repo_path
+            .unwrap_or_else(|_| spec.path.clone());
+        if !GitWorktree::is_git_repo(&path) {
+            bail!("Path is not in a git repository: {}\nTip: All --repo paths must be git repositories",
+                path.display());
+        }
+        let name = path
             .file_name()
-            .map(|n| n.to_string_lossy().to_string())
-            .unwrap_or_else(|| "repo".to_string());
-
-        let worktree_subdir = workspace_path.join(&repo_name);
-
-        plans.push(RepoPlan {
-            repo_path: repo_path.clone(),
-            repo_name,
-            main_repo_path,
-            worktree_subdir,
-            base_branch: base_branch.clone(),
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "repo".to_owned());
+        anyhow::ensure!(
+            names.insert(name.clone()),
+            "Duplicate repository name '{name}' in workspace"
+        );
+        let main = GitWorktree::find_main_repo(&path)?.canonicalize()?;
+        let checkout = workspace_path.join(&name);
+        anyhow::ensure!(
+            !checkout.try_exists()?,
+            "Worktree already exists: {}",
+            checkout.display()
+        );
+        effects.push(ResourceEffect::create_worktree(
+            main.clone(),
+            checkout.clone(),
+            branch.to_owned(),
+            create_new_branch,
+            spec.base_branch.clone(),
+            init_submodules,
+        )?);
+        created_worktrees.push(CreatedWorktree {
+            path: checkout.clone(),
+            main_repo_path: main.clone(),
+            owned_branch: create_new_branch.then(|| branch.to_owned()),
+        });
+        repos.push(WorkspaceRepo {
+            name,
+            source_path: path.to_string_lossy().into_owned(),
+            branch: branch.to_owned(),
+            worktree_path: checkout.to_string_lossy().into_owned(),
+            main_repo_path: main.to_string_lossy().into_owned(),
+            managed_by_aoe: true,
+            branch_preexisting: !create_new_branch,
+            base_branch: create_new_branch
+                .then(|| spec.base_branch.clone())
+                .flatten(),
+            base_branch_override: None,
         });
     }
-
-    // Run create_worktree for every repo concurrently.
-    let create_start = std::time::Instant::now();
-    let parallel_results: Vec<std::result::Result<Vec<String>, String>> =
-        std::thread::scope(|scope| {
-            let handles: Vec<_> = plans
-                .iter()
-                .map(|plan| {
-                    let branch = branch.to_string();
-                    let base = plan.base_branch.clone();
-                    let main_repo_path = plan.main_repo_path.clone();
-                    let worktree_subdir = plan.worktree_subdir.clone();
-                    let repo_name = plan.repo_name.clone();
-                    scope.spawn(move || -> std::result::Result<Vec<String>, String> {
-                        let repo_start = std::time::Instant::now();
-                        let result = (|| -> std::result::Result<Vec<String>, String> {
-                            let git_wt = GitWorktree::new(main_repo_path)
-                                .map_err(|e| format!("{}: {}", repo_name, e))?
-                                .with_init_submodules(init_submodules);
-                            git_wt
-                                .create_worktree(
-                                    &branch,
-                                    &worktree_subdir,
-                                    create_new_branch,
-                                    base.as_deref(),
-                                )
-                                .map_err(|e| format!("{}: {}", repo_name, e))
-                        })();
-                        tracing::info!(target: "session.create",
-                            "workspace create: repo={} elapsed={:?} ok={}",
-                            repo_name,
-                            repo_start.elapsed(),
-                            result.is_ok()
-                        );
-                        result
-                    })
-                })
-                .collect();
-            handles
-                .into_iter()
-                .map(|h| match h.join() {
-                    Ok(r) => r,
-                    Err(_) => Err("worktree thread panicked".to_string()),
-                })
-                .collect()
-        });
-    tracing::info!(target: "session.create",
-        "workspace create: {} repos completed in {:?}",
-        plans.len(),
-        create_start.elapsed()
-    );
-
-    let mut warnings: Vec<String> = Vec::new();
-    let mut errors: Vec<String> = Vec::new();
-    let mut created_worktrees: Vec<CreatedWorktree> = Vec::new();
-    let mut repos: Vec<WorkspaceRepo> = Vec::with_capacity(plans.len());
-
-    for (plan, result) in plans.iter().zip(parallel_results) {
-        match result {
-            Ok(w) => {
-                warnings.extend(w);
-                created_worktrees.push(CreatedWorktree {
-                    path: plan.worktree_subdir.clone(),
-                    main_repo_path: plan.main_repo_path.clone(),
-                    owned_branch: create_new_branch.then(|| branch.to_string()),
-                });
-                repos.push(WorkspaceRepo {
-                    name: plan.repo_name.clone(),
-                    source_path: plan.repo_path.to_string_lossy().to_string(),
-                    branch: branch.to_string(),
-                    worktree_path: plan.worktree_subdir.to_string_lossy().to_string(),
-                    main_repo_path: plan.main_repo_path.to_string_lossy().to_string(),
-                    managed_by_aoe: true,
-                    // The builder always creates the branch it names, so branch and worktree
-                    // ownership coincide for a repo present at creation.
-                    branch_preexisting: false,
-                    // The ref this repo's branch was forked from, so the diff view can default to
-                    // it per repo.
-                    base_branch: create_new_branch
-                        .then(|| plan.base_branch.clone())
-                        .flatten(),
-                    base_branch_override: None,
-                });
-            }
-            Err(msg) => errors.push(msg),
-        }
-    }
-
-    if !errors.is_empty() {
-        cleanup(&created_worktrees, &workspace_path);
-        if errors.len() == 1 {
-            bail!("Failed to create worktree for {}", errors.remove(0));
-        } else {
-            bail!(
-                "Failed to create worktrees ({} repos):\n  - {}",
-                errors.len(),
-                errors.join("\n  - ")
-            );
-        }
-    }
-
-    Ok(WorkspaceResult {
+    Ok(WorkspacePlan {
         workspace_info: WorkspaceInfo {
-            branch: branch.to_string(),
-            workspace_dir,
+            branch: branch.to_owned(),
+            workspace_dir: workspace_path.to_string_lossy().into_owned(),
             repos,
             created_at: Utc::now(),
             cleanup_on_delete: true,
         },
-        created_worktrees,
         workspace_path,
-        warnings,
+        created_worktrees,
+        effects,
     })
 }
 
@@ -447,6 +815,15 @@ pub fn build_instance(
     existing_branches: &[&str],
     profile: &str,
 ) -> Result<BuildResult> {
+    use super::move_journal::ResourceEffect;
+    let profile_storage = if params.provisional_creation.is_some() {
+        super::Storage::open_unwatched(profile)?
+    } else {
+        super::Storage::new_unwatched(profile)?
+    };
+    if let Some(provisional) = &params.provisional_creation {
+        provisional.verify_profile(&profile_storage)?;
+    }
     // Host-only agents (e.g. settl) cannot run in a sandbox or use worktrees.
     let is_host_only = crate::agents::get_agent(&params.tool).is_some_and(|a| a.host_only);
     if is_host_only && params.sandbox {
@@ -507,6 +884,7 @@ pub fn build_instance(
     let mut created_worktree = None;
     let mut workspace_info = None;
     let mut created_workspace_worktrees: Vec<CreatedWorktree> = Vec::new();
+    let mut effects = Vec::new();
     let mut warnings: Vec<String> = Vec::new();
     let taken_branches = collect_taken_branches_for_derived_dedupe(
         existing_branches,
@@ -540,6 +918,23 @@ pub fn build_instance(
             }
         }
     };
+    let mut instance = if let Some(provisional) = &params.provisional_creation {
+        let current = profile_storage
+            .load_strict_for_worktree_ownership()?
+            .into_iter()
+            .find(|row| row.id == provisional.id)
+            .context("Creating placeholder disappeared before planning")?;
+        anyhow::ensure!(
+            provisional.matches_instance(&current)?,
+            "Creating placeholder was superseded"
+        );
+        current
+    } else {
+        Instance::new(&final_title, &final_path)
+    };
+    instance.title.clone_from(&final_title);
+    instance.status = super::Status::Idle;
+    super::validate_instance_id(&instance.id)?;
 
     if let Some(branch) = &effective_worktree_branch {
         if !params.extra_repo_paths.is_empty() {
@@ -580,19 +975,20 @@ pub fn build_instance(
                 })
                 .collect();
 
-            let ws_result = create_workspace(
+            let ws_result = plan_workspace(
                 &primary,
                 &extra_repos,
                 branch,
                 params.create_new_branch,
                 &config.worktree.workspace_path_template,
                 config.worktree.init_submodules,
+                &instance.id,
             )?;
 
             final_path = ws_result.workspace_path.to_string_lossy().to_string();
             workspace_info = Some(ws_result.workspace_info);
             created_workspace_worktrees = ws_result.created_worktrees;
-            warnings.extend(ws_result.warnings);
+            effects.extend(ws_result.effects);
         } else {
             // Single worktree mode (existing logic)
             let path = PathBuf::from(&params.path);
@@ -636,11 +1032,22 @@ pub fn build_instance(
                         base_branch: None,
                     });
                 } else {
-                    let session_id = uuid::Uuid::new_v4().to_string();
-                    let worktree_path = git_wt.compute_path(branch, template, &session_id[..8])?;
-
-                    let w = git_wt.create_worktree(branch, &worktree_path, false, None)?;
-                    warnings.extend(w);
+                    let worktree_path = git_wt.compute_path(
+                        branch,
+                        template,
+                        &instance.id[..instance.id.len().min(8)],
+                    )?;
+                    if worktree_path.try_exists()? {
+                        return Err(GitError::WorktreeAlreadyExists(worktree_path).into());
+                    }
+                    effects.push(ResourceEffect::create_worktree(
+                        main_repo_path.clone(),
+                        worktree_path.clone(),
+                        branch.clone(),
+                        false,
+                        None,
+                        config.worktree.init_submodules,
+                    )?);
 
                     final_path = worktree_path.to_string_lossy().to_string();
                     created_worktree = Some(CreatedWorktree {
@@ -657,8 +1064,11 @@ pub fn build_instance(
                     });
                 }
             } else {
-                let session_id = uuid::Uuid::new_v4().to_string();
-                let worktree_path = git_wt.compute_path(branch, template, &session_id[..8])?;
+                let worktree_path = git_wt.compute_path(
+                    branch,
+                    template,
+                    &instance.id[..instance.id.len().min(8)],
+                )?;
 
                 if worktree_path.exists() {
                     return Err(GitError::WorktreeAlreadyExists(worktree_path.clone()).into());
@@ -681,8 +1091,14 @@ pub fn build_instance(
                     )
                 });
 
-                let w = git_wt.create_worktree(branch, &worktree_path, true, base.as_deref())?;
-                warnings.extend(w);
+                effects.push(ResourceEffect::create_worktree(
+                    main_repo_path.clone(),
+                    worktree_path.clone(),
+                    branch.clone(),
+                    true,
+                    base.clone(),
+                    config.worktree.init_submodules,
+                )?);
 
                 final_path = worktree_path.to_string_lossy().to_string();
                 created_worktree = Some(CreatedWorktree {
@@ -701,9 +1117,7 @@ pub fn build_instance(
         }
     }
 
-    // For scratch sessions, `final_path` is intentionally empty here; the scratch directory is
-    // provisioned below after `Instance::new` runs (we need the instance id to name the directory).
-    if !params.scratch {
+    if !params.scratch && effects.is_empty() {
         let final_path_buf = PathBuf::from(&final_path);
         if !final_path_buf.exists() {
             bail!("Project path does not exist: {}", final_path);
@@ -713,10 +1127,16 @@ pub fn build_instance(
         }
     }
 
-    let mut instance = Instance::new(&final_title, &final_path);
+    instance.project_path = final_path;
     instance.first_launch_names_agent = params.title_typed;
     if params.scratch {
-        let dir = super::scratch::provision_scratch_dir(&instance.id)?;
+        let dir = super::scratch::scratch_root()?.join(&instance.id);
+        anyhow::ensure!(
+            !dir.try_exists()?,
+            "Scratch directory already exists: {}",
+            dir.display()
+        );
+        effects.push(ResourceEffect::CreateDirectory { path: dir.clone() });
         instance.project_path = dir.to_string_lossy().to_string();
         instance.scratch = true;
     }
@@ -824,162 +1244,80 @@ pub fn build_instance(
         }
     }
 
-    Ok(BuildResult {
+    BuildResult::provision(
+        profile_storage,
         instance,
-        created_worktree,
-        created_workspace_worktrees,
+        effects,
+        params.has_creation_callbacks,
+        params.provisional_creation.as_deref(),
+        (created_worktree, created_workspace_worktrees),
         warnings,
-    })
+    )
 }
 
-#[derive(Default)]
-struct CleanupProtection<'a> {
-    owner: Option<&'a Instance>,
-}
-
-impl CleanupProtection<'_> {
-    fn paths_equal(left: &Path, right: &Path) -> bool {
-        left == right
-            || left
-                .canonicalize()
-                .ok()
-                .zip(right.canonicalize().ok())
-                .is_some_and(|(left, right)| left == right)
-    }
-
-    /// Exact matches protect a winner-owned worktree; containment protects a
-    /// winner path nested under a workspace root from recursive root cleanup.
-    fn path_references_target(reference: &Path, target: &Path) -> bool {
-        if reference == target || reference.starts_with(target) {
-            return true;
-        }
-        reference
-            .canonicalize()
-            .ok()
-            .zip(target.canonicalize().ok())
-            .is_some_and(|(reference, target)| reference == target || reference.starts_with(target))
-    }
-
-    fn references_path(&self, target: &Path) -> bool {
-        let Some(owner) = self.owner else {
-            return false;
-        };
-        if Self::path_references_target(Path::new(&owner.project_path), target) {
-            return true;
-        }
-        owner.workspace_info.as_ref().is_some_and(|workspace| {
-            Self::path_references_target(Path::new(&workspace.workspace_dir), target)
-                || workspace.repos.iter().any(|repo| {
-                    Self::path_references_target(Path::new(&repo.worktree_path), target)
-                })
-        })
-    }
-
-    fn references_branch(&self, main_repo_path: &Path, branch: &str) -> bool {
-        let Some(owner) = self.owner else {
-            return false;
-        };
-        owner.worktree_info.as_ref().is_some_and(|worktree| {
-            Self::paths_equal(Path::new(&worktree.main_repo_path), main_repo_path)
-                && worktree.branch == branch
-        }) || owner.workspace_info.as_ref().is_some_and(|workspace| {
-            workspace.repos.iter().any(|repo| {
-                Self::paths_equal(Path::new(&repo.main_repo_path), main_repo_path)
-                    && repo.branch == branch
-            })
-        })
-    }
-}
-
-/// Remove a worktree and then its build-owned branch. The branch stays intact
-/// when worktree removal fails because Git still considers it checked out.
-fn cleanup_created_worktree(
-    created: &CreatedWorktree,
-    label: &str,
-    protection: &CleanupProtection<'_>,
-) {
-    if protection.references_path(&created.path) {
-        tracing::debug!(
-            target: "session.create",
-            path = %created.path.display(),
-            "Preserving {label} referenced by the persisted uniqueness winner"
-        );
-        return;
-    }
-    let Ok(worktree) = GitWorktree::new(created.main_repo_path.clone()) else {
-        return;
-    };
-    if let Err(error) = worktree.remove_worktree(&created.path, false) {
-        tracing::warn!(target: "session.create", "Failed to clean up {label}: {error}");
-        return;
-    }
-    if let Some(branch) = created
-        .owned_branch
-        .as_deref()
-        .filter(|branch| !protection.references_branch(&created.main_repo_path, branch))
-    {
-        if let Err(error) = worktree.delete_branch(branch) {
-            tracing::warn!(target: "session.create", branch, "Failed to clean up branch: {error}");
-        }
-    }
-}
-
-/// Clean up resources created during a failed or cancelled instance build.
-pub fn cleanup_instance(
-    instance: &Instance,
-    created_worktree: Option<&CreatedWorktree>,
-    created_workspace_worktrees: &[CreatedWorktree],
-    protected_owner: Option<&Instance>,
-) {
-    // The loser may never have reached storage, so lifecycle-coordinated stop cannot reserve its
-    // row.
-    instance.kill_all_tmux_sessions_without_lifecycle_row();
-
-    if let Some(sandbox) = &instance.sandbox_info {
-        if sandbox.enabled {
-            // Direct idempotent teardown, never gated on a separate existence probe.
-            let container = containers::DockerContainer::from_session_id(&instance.id);
-            if let containers::Teardown::Failed(e) = container.teardown(&instance.id) {
-                tracing::warn!(target: "session.create", "Failed to clean up container: {}", e);
-            }
-        }
-    }
-
-    let protection = CleanupProtection {
-        owner: protected_owner,
-    };
-
-    // Scratch dirs are provisioned eagerly inside `build_instance` (well before this helper's other
-    // cleanup targets exist), so an abort between provisioning and the caller finishing the session
-    // would otherwise leak the directory on disk.
-    if instance.scratch {
-        let scratch_path = PathBuf::from(&instance.project_path);
-        if !protection.references_path(&scratch_path)
-            && super::scratch::is_scratch_path(&scratch_path)
-        {
-            if let Err(e) = std::fs::remove_dir_all(&scratch_path) {
-                tracing::warn!(
-                    target: "session.create",
-                    "Failed to clean up scratch dir: {}",
-                    e
-                );
-            }
-        }
-    }
-
-    if let Some(worktree) = created_worktree {
-        cleanup_created_worktree(worktree, "worktree", &protection);
-    }
-
-    for worktree in created_workspace_worktrees {
-        cleanup_created_worktree(worktree, "workspace worktree", &protection);
-    }
+fn validate_creation_paths(instance: &Instance) -> Result<()> {
+    anyhow::ensure!(
+        Path::new(&instance.project_path).is_dir(),
+        "Session working directory disappeared before publication"
+    );
     if let Some(workspace) = &instance.workspace_info {
-        let workspace_dir = Path::new(&workspace.workspace_dir);
-        if !protection.references_path(workspace_dir) {
-            let _ = std::fs::remove_dir_all(workspace_dir);
+        anyhow::ensure!(
+            Path::new(&workspace.workspace_dir).is_dir(),
+            "Session workspace disappeared before publication"
+        );
+        for repo in &workspace.repos {
+            validate_checkout(
+                &repo.main_repo_path,
+                &repo.worktree_path,
+                &repo.branch,
+                repo.managed_by_aoe,
+            )?;
         }
+    } else if let Some(worktree) = &instance.worktree_info {
+        validate_checkout(
+            &worktree.main_repo_path,
+            &instance.project_path,
+            &worktree.branch,
+            worktree.managed_by_aoe,
+        )?;
     }
+    Ok(())
+}
+
+fn validate_checkout(main_repo: &str, path: &str, branch: &str, allocated: bool) -> Result<()> {
+    let path = Path::new(path).canonicalize()?;
+    let repo = crate::git::open_repo_at(&path)?;
+    let main = crate::git::open_repo_at(Path::new(main_repo))?;
+    anyhow::ensure!(
+        repo.commondir().canonicalize()? == main.commondir().canonicalize()?,
+        "Session checkout belongs to another repository"
+    );
+    let detached = repo.head_detached()?;
+    if detached {
+        anyhow::ensure!(
+            allocated,
+            "Reused checkout no longer uses its requested branch"
+        );
+    } else {
+        anyhow::ensure!(
+            repo.find_reference("HEAD")?
+                .symbolic_target()?
+                .and_then(|name| name.strip_prefix("refs/heads/"))
+                == Some(branch),
+            "Session checkout branch changed before publication"
+        );
+    }
+    anyhow::ensure!(
+        GitWorktree::new(PathBuf::from(main_repo))?
+            .list_worktrees()?
+            .iter()
+            .any(
+                |entry| entry.path.canonicalize().ok().as_ref() == Some(&path)
+                    && entry.is_detached == detached
+            ),
+        "Session checkout registration changed before publication"
+    );
+    Ok(())
 }
 
 /// Structured-view (ACP) helpers for the TUI create paths.
@@ -1326,6 +1664,171 @@ pub(crate) fn branch_name_from_title(title: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn provision_worktree_for_test(main: &Path, path: &Path, branch: &str) -> Result<BuildResult> {
+        let mut instance = Instance::new("worktree-test", &path.to_string_lossy());
+        instance.worktree_info = Some(WorktreeInfo {
+            branch: branch.to_owned(),
+            main_repo_path: main.to_string_lossy().into_owned(),
+            managed_by_aoe: true,
+            created_at: Utc::now(),
+            base_branch: Some("release".into()),
+        });
+        let effect = super::super::move_journal::ResourceEffect::create_worktree(
+            main.to_path_buf(),
+            path.to_path_buf(),
+            branch.to_owned(),
+            true,
+            Some("release".into()),
+            false,
+        )?;
+        BuildResult::provision(
+            super::super::Storage::new_unwatched("default")?,
+            instance,
+            vec![effect],
+            false,
+            None,
+            (
+                Some(CreatedWorktree {
+                    path: path.to_path_buf(),
+                    main_repo_path: main.to_path_buf(),
+                    owned_branch: Some(branch.to_owned()),
+                }),
+                Vec::new(),
+            ),
+            Vec::new(),
+        )
+    }
+
+    fn provision_workspace_for_test(
+        primary: &WorkspaceRepoSpec,
+        extra: &[WorkspaceRepoSpec],
+        branch: &str,
+        create_branch: bool,
+        template: &str,
+        init_submodules: bool,
+    ) -> Result<BuildResult> {
+        let mut instance = Instance::new("workspace-test", "");
+        let WorkspacePlan {
+            workspace_info,
+            created_worktrees,
+            workspace_path,
+            effects,
+        } = plan_workspace(
+            primary,
+            extra,
+            branch,
+            create_branch,
+            template,
+            init_submodules,
+            &instance.id,
+        )?;
+        instance.project_path = workspace_path.to_string_lossy().into_owned();
+        instance.workspace_info = Some(workspace_info);
+        BuildResult::provision(
+            super::super::Storage::new_unwatched("default")?,
+            instance,
+            effects,
+            false,
+            None,
+            (None, created_worktrees),
+            Vec::new(),
+        )
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn creation_publication_rejects_removed_checkout() {
+        let _home = super::super::test_support::isolate_app_dir();
+        let (parent, _) = init_repo_with_branch("publication", "release");
+        let main = parent.path().join("publication");
+        let path = parent.path().join("checkout");
+        let mut result = provision_worktree_for_test(&main, &path, "publication-branch").unwrap();
+        result.run_on_create(|_| Ok(())).unwrap();
+        let git = GitWorktree::new(main).unwrap();
+        git.remove_worktree(&path, false).unwrap();
+        assert!(result.publish().is_err());
+        assert!(result.rollback().is_err());
+        assert!(!path.exists());
+        assert!(git.branch_exists("publication-branch").unwrap());
+        git.delete_branch("publication-branch").unwrap();
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn creation_reservation_blocks_cross_profile_checkout_adoption() {
+        let _home = super::super::test_support::isolate_app_dir();
+        let (parent, _) = init_repo_with_branch("creation-owner", "release");
+        let main = parent.path().join("creation-owner");
+        let path = parent.path().join("checkout");
+        let mut result = provision_worktree_for_test(&main, &path, "claimed-branch").unwrap();
+        let peer = super::super::Storage::new_unwatched("later-owner").unwrap();
+        assert!(peer
+            .update(|rows, _| {
+                rows.push(Instance::new("peer", &path.to_string_lossy()));
+                Ok(())
+            })
+            .is_err());
+        result.rollback().unwrap();
+        assert!(!path.exists());
+        assert!(!GitWorktree::new(main)
+            .unwrap()
+            .branch_exists("claimed-branch")
+            .unwrap());
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn creation_reservation_distinguishes_point_and_recursive_claims() {
+        for claim in ["ancestor", "aliased-ancestor", "child", "workspace"] {
+            let app = tempfile::tempdir().unwrap();
+            let _home = super::super::test_support::isolate_app_dir_at(app.path());
+            let (parent, _) = init_repo_with_branch("rollback-claims", "release");
+            let main = parent.path().join("rollback-claims");
+            let path = parent.path().join("checkout");
+            let reference = match claim {
+                "ancestor" | "workspace" => parent.path().to_path_buf(),
+                "aliased-ancestor" => {
+                    let alias = parent.path().join("alias");
+                    std::os::unix::fs::symlink(parent.path(), &alias).unwrap();
+                    alias
+                }
+                "child" => path.join("nested"),
+                _ => unreachable!(),
+            };
+            let peer = super::super::Storage::new_unwatched("raw-peer").unwrap();
+            peer.update(|rows, _| {
+                let mut row = Instance::new("raw", &reference.to_string_lossy());
+                if claim == "workspace" {
+                    row.workspace_info = Some(super::super::WorkspaceInfo {
+                        branch: "main".into(),
+                        workspace_dir: reference.to_string_lossy().into_owned(),
+                        repos: Vec::new(),
+                        created_at: Utc::now(),
+                        cleanup_on_delete: true,
+                    });
+                }
+                rows.push(row);
+                Ok(())
+            })
+            .unwrap();
+            let result = provision_worktree_for_test(&main, &path, "claimed-branch");
+            if matches!(claim, "ancestor" | "aliased-ancestor") {
+                let mut result = result.unwrap();
+                assert!(path.is_dir());
+                result.rollback().unwrap();
+            } else {
+                assert!(result.is_err(), "{claim}: overlapping claim admitted");
+            }
+            assert!(
+                !path.exists(),
+                "{claim}: checkout survived rollback/refusal"
+            );
+            assert!(!GitWorktree::new(main)
+                .unwrap()
+                .branch_exists("claimed-branch")
+                .unwrap());
+        }
+    }
 
     fn roman_for_test(n: u32) -> String {
         let mut remaining = n;
@@ -1517,75 +2020,6 @@ mod tests {
         );
     }
 
-    fn init_repo_with_commit(name: &str) -> tempfile::TempDir {
-        let parent = tempfile::Builder::new()
-            .prefix("aoe-test-")
-            .tempdir()
-            .unwrap();
-        let dir = parent.path().join(name);
-        std::fs::create_dir(&dir).unwrap();
-        let repo = git2::Repository::init(&dir).unwrap();
-        let sig = git2::Signature::now("Test", "test@example.com").unwrap();
-        std::fs::write(dir.join("README.md"), format!("{name}\n")).unwrap();
-        let tree_id = {
-            let mut index = repo.index().unwrap();
-            index.add_path(std::path::Path::new("README.md")).unwrap();
-            index.write_tree().unwrap()
-        };
-        let tree = repo.find_tree(tree_id).unwrap();
-        repo.commit(Some("HEAD"), &sig, &sig, "init", &tree, &[])
-            .unwrap();
-        parent
-    }
-
-    #[test]
-    fn test_create_workspace_reports_all_concurrent_failures() {
-        let parent_a = init_repo_with_commit("repo-a-fail");
-        let parent_b = init_repo_with_commit("repo-b-fail");
-        let repo_a = parent_a.path().join("repo-a-fail");
-        let repo_b = parent_b.path().join("repo-b-fail");
-        let workspaces_root = tempfile::TempDir::new().unwrap();
-        let template = workspaces_root
-            .path()
-            .join("{branch}")
-            .to_string_lossy()
-            .into_owned();
-
-        let result = create_workspace(
-            &WorkspaceRepoSpec {
-                path: repo_a,
-                base_branch: None,
-            },
-            &[WorkspaceRepoSpec {
-                path: repo_b,
-                base_branch: None,
-            }],
-            "nonexistent-branch",
-            false,
-            &template,
-            true,
-        );
-
-        let err = match result {
-            Ok(_) => panic!("workspace creation should fail when no repo has the branch"),
-            Err(e) => e,
-        };
-        let msg = format!("{err}");
-        assert!(
-            msg.contains("Failed to create worktrees"),
-            "multi-error bail! prefix missing: {msg}"
-        );
-        assert!(msg.contains("(2 repos)"), "should report repo count: {msg}");
-        assert!(
-            msg.contains("repo-a-fail"),
-            "first repo name missing from message: {msg}"
-        );
-        assert!(
-            msg.contains("repo-b-fail"),
-            "second repo name missing from message: {msg}"
-        );
-    }
-
     #[test]
     fn resolve_base_branch_precedence() {
         assert_eq!(
@@ -1684,11 +2118,11 @@ mod tests {
 
     #[test]
     fn create_workspace_honors_per_repo_base_branch() {
+        let _home = crate::session::test_support::isolate_app_dir();
         let (parent_primary, _) = init_repo_with_branch("primary", "release");
         let (parent_extra, extra_release_tip) = init_repo_with_branch("extra", "release");
         let primary = parent_primary.path().join("primary");
         let extra = parent_extra.path().join("extra");
-
         let workspaces_root = tempfile::TempDir::new().unwrap();
         let template = workspaces_root
             .path()
@@ -1696,7 +2130,7 @@ mod tests {
             .to_string_lossy()
             .into_owned();
 
-        let result = create_workspace(
+        let mut result = provision_workspace_for_test(
             &WorkspaceRepoSpec {
                 path: primary,
                 base_branch: None,
@@ -1712,39 +2146,45 @@ mod tests {
         )
         .expect("workspace creation should succeed");
 
-        let extra_repo = result
-            .workspace_info
+        let workspace = result.instance.workspace_info.as_ref().unwrap();
+        let extra_repo = workspace
             .repos
             .iter()
-            .find(|r| r.name == "extra")
+            .find(|repo| repo.name == "extra")
             .expect("extra repo present in workspace");
-        let wt = git2::Repository::open(&extra_repo.worktree_path).unwrap();
-        let head = wt.head().unwrap().peel_to_commit().unwrap();
+        let checkout = git2::Repository::open(&extra_repo.worktree_path).unwrap();
         assert_eq!(
-            head.id(),
+            checkout.head().unwrap().peel_to_commit().unwrap().id(),
             extra_release_tip,
             "extra repo worktree should branch from its configured `release` base"
         );
         assert_eq!(extra_repo.base_branch.as_deref(), Some("release"));
         assert_eq!(
-            result
-                .workspace_info
+            workspace
                 .repos
                 .iter()
-                .find(|r| r.name == "primary")
+                .find(|repo| repo.name == "primary")
                 .unwrap()
                 .base_branch,
             None,
             "a repo with no configured base records none, so the diff falls through to detection"
         );
         assert!(result
-            .created_worktrees
+            .created_workspace_worktrees
             .iter()
             .all(|worktree| worktree.owned_branch.as_deref() == Some("feature-x")));
-        for worktree in &result.created_worktrees {
-            cleanup_created_worktree(worktree, "test worktree", &CleanupProtection::default());
-            let repo = git2::Repository::open(&worktree.main_repo_path).unwrap();
-            assert!(repo
+        let created = result
+            .created_workspace_worktrees
+            .iter()
+            .map(|worktree| (worktree.path.clone(), worktree.main_repo_path.clone()))
+            .collect::<Vec<_>>();
+        drop(checkout);
+
+        result.rollback().unwrap();
+        for (path, repository) in created {
+            assert!(!path.exists());
+            assert!(git2::Repository::open(repository)
+                .unwrap()
                 .find_branch("feature-x", git2::BranchType::Local)
                 .is_err());
         }
@@ -1752,6 +2192,7 @@ mod tests {
 
     #[test]
     fn create_workspace_records_no_base_when_attaching_an_existing_branch() {
+        let _home = crate::session::test_support::isolate_app_dir();
         let (parent_primary, _) = init_repo_with_branch("primary", "feature-x");
         let primary = parent_primary.path().join("primary");
         let workspaces_root = tempfile::TempDir::new().unwrap();
@@ -1761,7 +2202,7 @@ mod tests {
             .to_string_lossy()
             .into_owned();
 
-        let result = create_workspace(
+        let mut result = provision_workspace_for_test(
             &WorkspaceRepoSpec {
                 path: primary,
                 base_branch: Some("main".to_string()),
@@ -1774,34 +2215,48 @@ mod tests {
         )
         .expect("workspace creation should succeed");
 
-        assert_eq!(result.workspace_info.repos[0].base_branch, None);
-        assert_eq!(result.created_worktrees[0].owned_branch, None);
-        let worktree = &result.created_worktrees[0];
-        cleanup_created_worktree(worktree, "test worktree", &CleanupProtection::default());
-        let repo = git2::Repository::open(&worktree.main_repo_path).unwrap();
-        assert!(repo
+        assert_eq!(
+            result.instance.workspace_info.as_ref().unwrap().repos[0].base_branch,
+            None
+        );
+        assert_eq!(result.created_workspace_worktrees[0].owned_branch, None);
+        let path = result.created_workspace_worktrees[0].path.clone();
+        let repository = result.created_workspace_worktrees[0].main_repo_path.clone();
+
+        result.rollback().unwrap();
+        assert!(!path.exists());
+        assert!(git2::Repository::open(repository)
+            .unwrap()
             .find_branch("feature-x", git2::BranchType::Local)
             .is_ok());
     }
 
     #[test]
-    fn cleanup_keeps_owned_branch_when_worktree_removal_fails() {
+    #[serial_test::serial]
+    fn creation_rollback_keeps_owned_branch_when_worktree_removal_fails() {
+        let _home = super::super::test_support::isolate_app_dir();
         let (parent, _) = init_repo_with_branch("cleanup", "release");
         let main_repo_path = parent.path().join("cleanup");
-        let worktree_path = parent.path().join("dirty-worktree");
-        let git = GitWorktree::new(main_repo_path.clone()).unwrap();
-        git.create_worktree("rollback-branch", &worktree_path, true, None)
-            .unwrap();
+        let mut result = provision_workspace_for_test(
+            &WorkspaceRepoSpec {
+                path: main_repo_path.clone(),
+                base_branch: Some("release".to_owned()),
+            },
+            &[],
+            "rollback-branch",
+            true,
+            parent.path().join("workspace/{branch}").to_str().unwrap(),
+            false,
+        )
+        .unwrap();
+        let worktree_path = result.created_workspace_worktrees[0].path.clone();
         std::fs::write(worktree_path.join("README.md"), "dirty\n").unwrap();
 
-        let created = CreatedWorktree {
-            path: worktree_path.clone(),
-            main_repo_path: main_repo_path.clone(),
-            owned_branch: Some("rollback-branch".to_string()),
-        };
-        cleanup_created_worktree(&created, "test worktree", &CleanupProtection::default());
-
-        assert!(worktree_path.exists(), "dirty worktree must survive");
+        assert!(result.rollback().is_err());
+        assert_eq!(
+            std::fs::read(worktree_path.join("README.md")).unwrap(),
+            b"dirty\n"
+        );
         let repo = git2::Repository::open(&main_repo_path).unwrap();
         assert!(
             repo.find_branch("rollback-branch", git2::BranchType::Local)
@@ -1809,6 +2264,7 @@ mod tests {
             "owned branch must not be deleted while its worktree remains"
         );
 
+        let git = GitWorktree::new(main_repo_path).unwrap();
         git.remove_worktree(&worktree_path, true).unwrap();
         git.delete_branch("rollback-branch").unwrap();
     }
@@ -1900,6 +2356,8 @@ mod tests {
 
     fn custom_agent_params(project_path: &std::path::Path, tool: &str) -> InstanceParams {
         InstanceParams {
+            provisional_creation: None,
+            has_creation_callbacks: false,
             title: "custom session".to_string(),
             title_typed: false,
             path: project_path.to_string_lossy().to_string(),
@@ -2109,6 +2567,8 @@ mod tests {
         use crate::session::ForkSeed;
         let _registry = crate::tmux::status_rules::ProfileRegistryGuard::take("default");
         let params = InstanceParams {
+            provisional_creation: None,
+            has_creation_callbacks: false,
             title: "Forked".into(),
             title_typed: false,
             path: "/tmp".into(),
@@ -2165,6 +2625,8 @@ mod tests {
             transcript_path: None,
         };
         let params = InstanceParams {
+            provisional_creation: None,
+            has_creation_callbacks: false,
             title: "Forked".into(),
             title_typed: false,
             path: "/tmp".into(),
@@ -2287,5 +2749,168 @@ mod tests {
             refused.contains("codex") && refused.contains("claude"),
             "the refusal must name both agents: {refused}"
         );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn detached_creation_supports_multiple_remote_refs_without_local_branches() {
+        let _home = super::super::test_support::isolate_app_dir();
+        let (parent, tip) = init_repo_with_branch("detached-specs", "release");
+        let main = parent.path().join("detached-specs");
+        let repo = git2::Repository::open(&main).unwrap();
+        repo.reference("refs/remotes/origin/main", tip, true, "fixture")
+            .unwrap();
+        let base_tip = repo.find_commit(tip).unwrap().parent_id(0).unwrap();
+        repo.reference("refs/remotes/upstream/topic", base_tip, true, "fixture")
+            .unwrap();
+
+        for requested in ["origin/main", "upstream/topic"] {
+            let expected = repo
+                .revparse_single(requested)
+                .unwrap()
+                .peel_to_commit()
+                .unwrap()
+                .id();
+            let mut params = custom_agent_params(&main, "claude");
+            params.worktree_enabled = true;
+            params.worktree_branch = Some(requested.into());
+            params.create_new_branch = false;
+            let mut result = build_instance(params, &[], &[], "default").unwrap();
+            let path = result.created_worktree.as_ref().unwrap().path.clone();
+
+            assert_eq!(
+                result.instance.worktree_info.as_ref().unwrap().branch,
+                requested
+            );
+            let checkout = git2::Repository::open(&path).unwrap();
+            assert!(checkout.head_detached().unwrap(), "{requested}");
+            assert_eq!(
+                checkout.head().unwrap().peel_to_commit().unwrap().id(),
+                expected
+            );
+            drop(checkout);
+            result.rollback().unwrap();
+            assert!(!path.exists(), "{requested}: checkout was not rolled back");
+        }
+
+        assert_eq!(
+            repo.find_reference("refs/remotes/origin/main")
+                .unwrap()
+                .target(),
+            Some(tip)
+        );
+        assert!(repo.find_reference("refs/heads/origin/main").is_err());
+        assert_eq!(
+            repo.find_reference("refs/remotes/upstream/topic")
+                .unwrap()
+                .target(),
+            Some(base_tip)
+        );
+        assert!(repo.find_reference("refs/heads/upstream/topic").is_err());
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn remote_suffix_and_explicit_remote_publish_their_actual_checkout_kinds() {
+        let _home = super::super::test_support::isolate_app_dir();
+        let (parent, tip) = init_repo_with_branch("remote-mode", "release");
+        let main = parent.path().join("remote-mode");
+        let repo = git2::Repository::open(&main).unwrap();
+        repo.remote("origin", main.to_str().unwrap()).unwrap();
+        repo.reference("refs/remotes/origin/remote-topic", tip, true, "fixture")
+            .unwrap();
+
+        for (requested, detached) in [("origin/remote-topic", true), ("remote-topic", false)] {
+            let mut params = custom_agent_params(&main, "claude");
+            params.worktree_enabled = true;
+            params.worktree_branch = Some(requested.into());
+            params.create_new_branch = false;
+            let mut result = build_instance(params, &[], &[], "default").unwrap();
+            let path = result.created_worktree.as_ref().unwrap().path.clone();
+
+            let checkout = git2::Repository::open(&path).unwrap();
+            assert_eq!(checkout.head_detached().unwrap(), detached, "{requested}");
+            assert_eq!(checkout.head().unwrap().peel_to_commit().unwrap().id(), tip);
+            if !detached {
+                assert_eq!(
+                    checkout.head().unwrap().name().unwrap(),
+                    "refs/heads/remote-topic"
+                );
+            }
+            drop(checkout);
+            result.rollback().unwrap();
+            assert!(!path.exists(), "{requested}: checkout was not rolled back");
+        }
+
+        assert_eq!(
+            repo.find_reference("refs/remotes/origin/remote-topic")
+                .unwrap()
+                .target(),
+            Some(tip)
+        );
+        assert_eq!(
+            repo.find_reference("refs/heads/remote-topic")
+                .unwrap()
+                .target(),
+            Some(tip)
+        );
+        assert!(repo
+            .find_reference("refs/heads/origin/remote-topic")
+            .is_err());
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn detached_hook_commit_is_published() {
+        use std::os::unix::fs::PermissionsExt;
+        let _home = super::super::test_support::isolate_app_dir();
+        let (parent, tip) = init_repo_with_branch("detached-commit", "release");
+        let main = parent.path().join("detached-commit");
+        let repo = git2::Repository::open(&main).unwrap();
+        repo.reference("refs/remotes/origin/main", tip, true, "fixture")
+            .unwrap();
+        let marker = parent.path().join("hook-completed");
+        let hook = repo.path().join("hooks/post-checkout");
+        std::fs::write(&hook, format!(
+            "#!/bin/sh\nunset GIT_DIR GIT_WORK_TREE GIT_PREFIX GIT_INDEX_FILE\ngit -C \"$PWD\" -c user.name=fixture -c user.email=fixture@example.com commit --allow-empty -m detached-hook >/dev/null || exit 91\nprintf complete > {}\n",
+            super::super::environment::shell_escape(&marker.to_string_lossy()),
+        )).unwrap();
+        std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let mut params = custom_agent_params(&main, "claude");
+        params.worktree_enabled = true;
+        params.worktree_branch = Some("origin/main".into());
+        params.create_new_branch = false;
+        let mut result = build_instance(params, &[], &[], "default").unwrap();
+        let path = result.created_worktree.as_ref().unwrap().path.clone();
+        let checkout = git2::Repository::open(&path).unwrap();
+        let committed = checkout.head().unwrap().peel_to_commit().unwrap().id();
+        assert!(checkout.head_detached().unwrap());
+        assert_ne!(committed, tip);
+        assert_eq!(std::fs::read(&marker).unwrap(), b"complete");
+        assert_eq!(
+            repo.find_reference("refs/remotes/origin/main")
+                .unwrap()
+                .target(),
+            Some(tip)
+        );
+        drop(checkout);
+        result.run_on_create(|_| Ok(())).unwrap();
+        result.publish().unwrap();
+        assert_eq!(
+            git2::Repository::open(&path)
+                .unwrap()
+                .head()
+                .unwrap()
+                .peel_to_commit()
+                .unwrap()
+                .id(),
+            committed,
+        );
+        assert!(result
+            .profile_storage
+            .load()
+            .unwrap()
+            .iter()
+            .any(|row| row.id == result.instance.id && row.project_path == path.to_string_lossy()));
     }
 }

@@ -111,9 +111,9 @@ async fn purge_session_artifacts(
         .await
         .map_err(|e| format!("Deletion hook task failed: {e}"))?;
 
-    let transcript_purged = instance.is_structured();
+    let structured = instance.is_structured();
 
-    let deletion_result = if transcript_purged {
+    let deletion_result = if structured {
         // Commit the row removal before deleting the ACP transcript, so a lost
         // restore/generation race leaves both intact and a successful commit
         // makes later cleanup failures non-restorable by construction.
@@ -146,7 +146,6 @@ async fn purge_session_artifacts(
                     }
                 }
                 state.acp_supervisor.forget_session(id);
-                state.acp_event_store.delete_session(id);
 
                 tokio::task::spawn_blocking(move || committed.finish())
                     .await
@@ -187,9 +186,6 @@ async fn purge_session_artifacts(
         } else {
             deletion_result.errors.join("; ")
         };
-        if !transcript_purged {
-            return Err(errs);
-        }
         tracing::warn!(
             target: "http.api.sessions",
             session = %id,
@@ -318,9 +314,28 @@ pub(crate) async fn reconcile_trashed_worktrees(state: &Arc<AppState>) {
                 _ => continue,
             }
         };
+        let profile = snapshot.source_profile.clone();
+        let file_watch = state.file_watch.clone();
+        let storage = match tokio::task::spawn_blocking(move || {
+            anyhow::ensure!(!profile.is_empty(), "session has no source profile");
+            crate::session::Storage::open(&profile, file_watch)
+        })
+        .await
+        {
+            Ok(Ok(storage)) => storage,
+            Ok(Err(error)) => {
+                tracing::warn!(target: "http.api.sessions", session = %id, "trash reconcile profile unavailable: {error}");
+                continue;
+            }
+            Err(error) => {
+                tracing::warn!(target: "http.api.sessions", session = %id, "trash reconcile profile join failed: {error}");
+                continue;
+            }
+        };
         let reconciled = match tokio::task::spawn_blocking(move || {
             let mut instance = snapshot;
-            let changed = crate::session::trash::reconcile_trashed_transition(&mut instance)?;
+            let changed =
+                crate::session::trash::reconcile_trashed_transition(&storage, &mut instance)?;
             anyhow::Ok((changed, instance))
         })
         .await
@@ -461,7 +476,7 @@ pub(crate) fn trash_sweep_interval() -> std::time::Duration {
 pub async fn delete_session(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
-    body: Option<Json<DeleteSessionBody>>,
+    body: Result<Option<Json<DeleteSessionBody>>, axum::extract::rejection::JsonRejection>,
 ) -> impl IntoResponse {
     if let Some(resp) = cityhall_block_non_structured(&state, &id).await {
         return resp;
@@ -470,7 +485,10 @@ pub async fn delete_session(
         return crate::server::api::read_only_response();
     }
 
-    let body = body.map(|Json(b)| b).unwrap_or_default();
+    let body = match body {
+        Ok(body) => body.map(|Json(body)| body).unwrap_or_default(),
+        Err(error) => return error.into_response(),
+    };
 
     // Serialize concurrent mutations, prompt submission first: a queue drain
     // snapshots an idle turn under that guard and never takes `instance_lock`,
@@ -641,8 +659,17 @@ pub(super) fn order_workspace_deletion(
 /// removed, so its dirtiness does not block. Returns the first dirty message.
 async fn workspace_dirty_message(instance: Instance, session_ids: Vec<String>) -> Option<String> {
     tokio::task::spawn_blocking(move || {
+        let ownership = match crate::session::storage::acquire_ownership_read() {
+            Ok(ownership) => ownership,
+            Err(error) => return Some(format!("ownership check failed: {error}")),
+        };
         let ids: Vec<&str> = session_ids.iter().map(String::as_str).collect();
-        let kept = crate::session::deletion::paths_in_use_except(&ids);
+        let kept = crate::session::deletion::paths_in_use_except_with_ownership(
+            &ownership,
+            &instance.source_profile,
+            &ids,
+        );
+        drop(ownership);
         workspace_dirty_message_blocking(&instance, &kept)
     })
     .await
@@ -790,13 +817,16 @@ pub(super) async fn purge_workspace_artifacts(
 /// cannot leave it half-removed (#2536).
 pub async fn delete_workspace(
     State(state): State<Arc<AppState>>,
-    body: Option<Json<DeleteWorkspaceBody>>,
+    body: Result<Option<Json<DeleteWorkspaceBody>>, axum::extract::rejection::JsonRejection>,
 ) -> impl IntoResponse {
     if state.read_only {
         return crate::server::api::read_only_response();
     }
 
-    let body = body.map(|Json(b)| b).unwrap_or_default();
+    let body = match body {
+        Ok(body) => body.map(|Json(body)| body).unwrap_or_default(),
+        Err(error) => return error.into_response(),
+    };
     // Dedupe up front so a repeated id cannot have the owner deleted with
     // sibling flags and then skipped (#2536 review).
     let mut session_ids = dedupe_session_ids(&body.session_ids);

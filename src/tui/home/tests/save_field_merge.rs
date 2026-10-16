@@ -2,7 +2,10 @@ use super::*;
 use crate::session::Status;
 use chrono::Utc;
 
-fn boot_view_with_one_session(title: &str, path: &str) -> (TempDir, AppDirGuard, HomeView, String) {
+fn boot_view_with_one_session(
+    title: &str,
+    path: &str,
+) -> (TempDir, AppDirGuard, lifecycle::TestHomeView, String) {
     let temp = TempDir::new().unwrap();
     let guard = setup_test_home(&temp);
     let storage = Storage::new_unwatched("test").unwrap();
@@ -280,8 +283,15 @@ fn test_move_to_profile_commits_without_pending_bookkeeping() {
 
     let mut requested = view.get_instance(&id).unwrap().clone();
     requested.group_path = "moved/group".to_string();
-    view.move_to_profile(&id, "target", requested, None, false)
-        .unwrap();
+    view.move_to_profile_with_ownership(
+        &crate::session::storage::acquire_ownership_lock().unwrap(),
+        &id,
+        "target",
+        requested,
+        None,
+        false,
+    )
+    .unwrap();
     view.reload_preserving_profile_move_runtime(std::slice::from_ref(&id))
         .unwrap();
 
@@ -321,8 +331,15 @@ fn test_move_to_profile_save_roundtrip_persists_under_target() {
 
     let mut requested = view.get_instance(&id).unwrap().clone();
     requested.group_path = "newgrp".to_string();
-    view.move_to_profile(&id, "test", requested, None, false)
-        .unwrap();
+    view.move_to_profile_with_ownership(
+        &crate::session::storage::acquire_ownership_lock().unwrap(),
+        &id,
+        "test",
+        requested,
+        None,
+        false,
+    )
+    .unwrap();
     assert!(
         !view
             .pending_deletions
@@ -338,8 +355,15 @@ fn test_move_to_profile_save_roundtrip_persists_under_target() {
     );
     let mut requested = view.get_instance(&id).unwrap().clone();
     requested.group_path.clear();
-    view.move_to_profile(&id, "target", requested, None, false)
-        .unwrap();
+    view.move_to_profile_with_ownership(
+        &crate::session::storage::acquire_ownership_lock().unwrap(),
+        &id,
+        "target",
+        requested,
+        None,
+        false,
+    )
+    .unwrap();
     view.save().expect("save must succeed across profiles");
 
     let old_disk = Storage::new_unwatched("test").unwrap().load().unwrap();
@@ -474,15 +498,20 @@ fn profile_only_move_seeds_target_from_authoritative_title_and_lifecycle() {
         })
         .unwrap();
 
-    let _guards = view.lock_session_mutation_and_reload(&id).unwrap();
+    let ownership = crate::session::storage::acquire_ownership_lock().unwrap();
+    let guards = view
+        .try_lock_session_mutation_and_reload_with_ownership(&ownership, &id)
+        .unwrap();
     let authoritative = view.get_instance(&id).cloned().unwrap();
     assert_eq!(authoritative.title, "peer-new-title");
     assert_eq!(authoritative.lifecycle_generation, 7);
     assert_eq!(authoritative.status, Status::Running);
 
     let requested = authoritative.clone();
-    view.move_to_profile(&id, "target", requested, None, false)
+    view.move_to_profile_with_ownership(&ownership, &id, "target", requested, None, false)
         .unwrap();
+    drop(guards);
+    drop(ownership);
     view.save().unwrap();
 
     let target = Storage::new_unwatched("target")
@@ -510,6 +539,7 @@ fn profile_move_blocks_fresh_but_allows_stale_lifecycle_reservation() {
         op: LifecycleOperation::Launch,
         generation: 1,
         at: chrono::Utc::now(),
+        resource_intent: None,
     };
     view.mutate_instance(&id, |row| {
         row.lifecycle_generation = 1;
@@ -527,15 +557,14 @@ fn profile_move_blocks_fresh_but_allows_stale_lifecycle_reservation() {
         })
         .unwrap();
 
-    let _guards = view.lock_session_mutation_and_reload(&id).unwrap();
-    let requested = view.get_instance(&id).cloned().unwrap();
-    let error = view
-        .move_to_profile(&id, "target", requested, None, false)
-        .expect_err("reserved session must not move profiles");
-
-    assert!(error
-        .to_string()
-        .contains("lifecycle operation is in progress"));
+    assert!(
+        view.try_lock_session_mutation_and_reload_with_ownership(
+            &crate::session::storage::acquire_ownership_lock().unwrap(),
+            &id
+        )
+        .is_err(),
+        "a fresh reservation must reject profile-move admission"
+    );
     assert_eq!(view.get_instance(&id).unwrap().source_profile, "test");
     assert!(view
         .pending_deletions
@@ -569,8 +598,15 @@ fn profile_move_blocks_fresh_but_allows_stale_lifecycle_reservation() {
 
     let requested = view.get_instance(&id).unwrap().clone();
     let baseline = requested.clone();
-    view.move_to_profile(&id, "target", requested, Some(&baseline), false)
-        .expect("stale reservation must not block profile move");
+    view.move_to_profile_with_ownership(
+        &crate::session::storage::acquire_ownership_lock().unwrap(),
+        &id,
+        "target",
+        requested,
+        Some(&baseline),
+        false,
+    )
+    .expect("stale reservation must not block profile move");
     assert!(source.load().unwrap().is_empty());
     assert!(Storage::new_unwatched("target")
         .unwrap()
@@ -936,8 +972,10 @@ fn rename_profile_move_validates_complete_candidate_before_commit() {
     view.storages.insert("target".to_string(), target);
     view.selected_session = Some(id.clone());
 
-    let result = view.rename_selected("new-name", Some("renamed/group"), Some("target"), false);
-    assert!(result.is_err());
+    view.rename_selected("new-name", Some("renamed/group"), Some("target"), false)
+        .unwrap();
+    view.finish_rename_for_test();
+    assert!(view.info_dialog.is_some());
 
     let (source_rows, source_groups) = Storage::new_unwatched("test")
         .unwrap()
@@ -1005,9 +1043,10 @@ fn tied_cross_profile_collision_rejects_before_worktree_effects() {
     view.storages.insert("target".to_string(), target);
     view.selected_session = Some(id.clone());
 
-    let result = view.rename_selected("new-name", None, Some("target"), true);
-
-    assert!(result.is_err());
+    view.rename_selected("new-name", None, Some("target"), true)
+        .unwrap();
+    view.finish_rename_for_test();
+    assert!(view.info_dialog.is_some());
     assert!(old_path.exists());
     assert_eq!(
         std::fs::read(old_path.join("sentinel")).unwrap(),
