@@ -552,7 +552,16 @@ function AppContent({
      *  FileContentViewer instead of the git-diff viewer. See #3088. */
     external?: boolean;
   } | null>(null);
-  const [diffComparison, setDiffComparison] = useState<DiffComparison>("base");
+  const [diffComparisons, setDiffComparisons] = useState<Record<string, DiffComparison>>({});
+  const diffComparison = activeSessionId ? (diffComparisons[activeSessionId] ?? "base") : "base";
+  const setDiffComparison = useCallback(
+    (comparison: DiffComparison) => {
+      if (activeSessionId) {
+        setDiffComparisons((current) => ({ ...current, [activeSessionId]: comparison }));
+      }
+    },
+    [activeSessionId],
+  );
   const selectedFilePath = selectedFile?.path ?? null;
   const selectedFileExternal = selectedFile?.external ?? false;
   const selectedRepoName = selectedFile?.repoName;

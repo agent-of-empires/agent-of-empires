@@ -4,6 +4,7 @@ import { sessionDiffRawFileUrl } from "../../lib/api";
 import { buildDiffTree } from "../../lib/diffTree";
 import { useWebSettings } from "../../hooks/useWebSettings";
 import { BasePicker } from "./BasePicker";
+import { DiffComparisonSelect } from "./DiffComparisonSelect";
 import { FileContextMenu, type PathMenuState } from "./FileContextMenu";
 import { Chevron, FlatList, LineCounts, TreeView } from "./DiffFileRows";
 
@@ -191,17 +192,7 @@ export function DiffFileList({
         <div className="flex items-center gap-2 flex-wrap">
           <span className="font-mono text-[11px] uppercase tracking-wider text-text-dim">Changes</span>
           {onComparisonChange && (
-            <select
-              aria-label="Diff comparison"
-              value={comparison}
-              onChange={(event) => onComparisonChange(event.target.value as DiffComparison)}
-              className="rounded border border-surface-700 bg-surface-800 px-1.5 py-1 font-mono text-[10px] text-text-primary focus:border-brand-500 focus:outline-none"
-            >
-              <option value="base">Base</option>
-              <option value="origin_main">origin/main</option>
-              <option value="uncommitted">Uncommitted</option>
-              <option value="upstream">Tracking branch</option>
-            </select>
+            <DiffComparisonSelect comparison={comparison} onComparisonChange={onComparisonChange} />
           )}
           {isMultiRepo ? (
             <span className={CHIP}>{perRepoBases.length} repos</span>

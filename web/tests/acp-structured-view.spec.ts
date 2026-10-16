@@ -588,15 +588,6 @@ test.describe("tool run folding", () => {
     expect(firstVisible).toBeLessThanOrEqual(10);
     await expect(opened).toBeInViewport();
     const before = await opened.boundingBox();
-    const beforeState = await viewport.evaluate((el) => ({
-      scrollTop: el.scrollTop,
-      scrollHeight: el.scrollHeight,
-      clientHeight: el.clientHeight,
-      cards: [...el.querySelectorAll<HTMLElement>("[data-tool-id]")].map((card) => ({
-        id: card.dataset.toolId,
-        top: Math.round(card.getBoundingClientRect().top - el.getBoundingClientRect().top),
-      })),
-    }));
 
     // Enough text that the transcript can still scroll after the fold.
     mock.pushEvents([agentMessageChunk(Array.from({ length: 60 }, (_, i) => `After ${i + 1}.`).join("\n\n"))]);
@@ -606,20 +597,7 @@ test.describe("tool run folding", () => {
 
     await expect(opened).toContainText("line 1");
     const after = await opened.boundingBox();
-    const afterState = await viewport.evaluate((el) => ({
-      scrollTop: el.scrollTop,
-      scrollHeight: el.scrollHeight,
-      clientHeight: el.clientHeight,
-      cards: [...el.querySelectorAll<HTMLElement>("[data-tool-id]")].map((card) => ({
-        id: card.dataset.toolId,
-        top: Math.round(card.getBoundingClientRect().top - el.getBoundingClientRect().top),
-      })),
-    }));
-
-    expect(
-      Math.abs(after!.y - before!.y),
-      `opened card moved; before=${JSON.stringify(beforeState)} after=${JSON.stringify(afterState)}`,
-    ).toBeLessThanOrEqual(1);
+    expect(Math.abs(after!.y - before!.y)).toBeLessThanOrEqual(1);
   });
 
   // The fold lands while following the bottom. Anchors it left behind must not

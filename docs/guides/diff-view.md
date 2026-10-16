@@ -34,9 +34,9 @@ The **Files** pane (folder icon in the activity bar) browses the session's whole
 
 ### Comparison modes (web)
 
-The browser diff selector offers **Base**, **origin/main**, **Uncommitted**, and **Tracking branch**. Base uses the repo's configured and auto-detected base behavior described above, including session overrides. **Uncommitted** compares `HEAD` with the index and working tree, including untracked files, so committed branch changes are omitted. **origin/main** and **Tracking branch** compare from the merge base with the selected remote branch, including uncommitted work. Tracking branch uses this checkout's configured upstream. These modes do not fetch; an unavailable reference is reported instead of silently choosing another base.
+The browser diff selector offers **Base**, **Uncommitted**, and **Tracking branch**. **Base** uses the repo's configured and auto-detected base behavior described above, including session overrides. A literal `HEAD` base override resolves to the local checkout, not `origin/HEAD`. **Uncommitted** compares `HEAD` with the index and working tree, including untracked files, so committed branch changes are omitted. **Tracking branch** compares from the merge base with this checkout's configured upstream, including uncommitted work. These modes do not fetch; an unavailable reference is reported instead of silently choosing another base.
 
-The selection applies to both the changed-file list and the selected file's contents. In multi-repo workspaces, availability warnings are shown on the affected repository without hiding other repositories' results. The base picker is available only in Base mode.
+The selection is kept separately for each session and applies to both the changed-file list and the selected file's contents. In multi-repo workspaces, availability warnings are shown on the affected repository without hiding other repositories' results. The base picker is available only in Base mode.
 
 ### Split view
 

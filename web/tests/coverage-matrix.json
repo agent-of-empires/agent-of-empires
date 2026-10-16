@@ -2168,6 +2168,7 @@
       "components": [
         "web/src/components/DiffPane.tsx",
         "web/src/components/diff/DiffFileList.tsx",
+        "web/src/components/diff/DiffComparisonSelect.tsx",
         "web/src/components/diff/DiffFileViewer.tsx",
         "web/src/components/diff/DiffLine.tsx",
         "web/src/components/diff/StringDiff.tsx",
@@ -2177,7 +2178,8 @@
         "web/src/components/diff/comments/CommentsBanner.tsx",
         "web/src/components/diff/comments/DiffCommentsUserCard.tsx",
         "web/src/components/diff/comments/SendCommentsDialog.tsx"
-      ]
+      ],
+      "notes": "Base, Uncommitted and Tracking branch apply to lists and contents; missing upstream never falls back. Session switches preserve each session's own comparison without leaking into a checkout with no upstream."
     },
     {
       "id": "right-panel.markdown-viewer",

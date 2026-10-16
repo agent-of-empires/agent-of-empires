@@ -661,18 +661,13 @@ pub(super) mod tests {
     #[test]
     fn create_worktree_turns_fetch_and_hook_failures_into_warnings() {
         use std::os::unix::fs::PermissionsExt;
-        let (dir, repo) = init_repo();
-        let hook_dir = dir.path().join(".git/hooks");
-        repo.config()
-            .unwrap()
-            .set_str("core.hooksPath", hook_dir.to_str().unwrap())
-            .unwrap();
+        let (dir, _repo) = init_repo();
         let bogus = dir.path().join("does-not-exist.git");
         run_git(
             dir.path(),
             &["remote", "add", "origin", bogus.to_str().unwrap()],
         );
-        let hook = hook_dir.join("post-checkout");
+        let hook = dir.path().join(".git/hooks/post-checkout");
         std::fs::create_dir_all(hook.parent().unwrap()).unwrap();
         std::fs::write(
             &hook,

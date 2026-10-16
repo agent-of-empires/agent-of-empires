@@ -1433,34 +1433,41 @@ fn diff_comparisons_require_explicit_refs() {
         .unwrap();
     repo.set_head("refs/heads/main").unwrap();
 
-    let missing_origin = resolve_diff_comparison(
-        DiffComparison::OriginMain,
-        "ignored".to_string(),
-        tmp.path(),
-    )
-    .unwrap_err();
-    assert!(missing_origin.contains("refs/remotes/origin/main"));
+    assert_eq!(
+        resolve_diff_comparison(DiffComparison::Base, "base".to_string(), tmp.path()).unwrap(),
+        "base"
+    );
+    assert_eq!(
+        resolve_diff_comparison(
+            DiffComparison::Uncommitted,
+            "ignored".to_string(),
+            tmp.path()
+        )
+        .unwrap(),
+        "HEAD"
+    );
 
     let missing_upstream =
         resolve_diff_comparison(DiffComparison::Upstream, "ignored".to_string(), tmp.path())
             .unwrap_err();
     assert!(missing_upstream.contains("no configured upstream"));
 
+    repo.remote("fork", ".").unwrap();
     repo.reference(
-        "refs/remotes/origin/main",
+        "refs/remotes/fork/review",
         commit_id,
         true,
-        "test origin main",
+        "test tracking branch",
     )
     .unwrap();
+    repo.find_branch("main", git2::BranchType::Local)
+        .unwrap()
+        .set_upstream(Some("fork/review"))
+        .unwrap();
     assert_eq!(
-        resolve_diff_comparison(
-            DiffComparison::OriginMain,
-            "ignored".to_string(),
-            tmp.path()
-        )
-        .unwrap(),
-        "refs/remotes/origin/main"
+        resolve_diff_comparison(DiffComparison::Upstream, "ignored".to_string(), tmp.path())
+            .unwrap(),
+        "refs/remotes/fork/review"
     );
 
     repo.set_head_detached(commit_id).unwrap();
@@ -1468,6 +1475,40 @@ fn diff_comparisons_require_explicit_refs() {
         resolve_diff_comparison(DiffComparison::Upstream, "ignored".to_string(), tmp.path())
             .unwrap_err();
     assert!(detached_upstream.contains("detached"));
+}
+
+#[test]
+fn diff_comparison_opens_only_the_exact_repository_path() {
+    let parent = tempfile::tempdir().unwrap();
+    git2::Repository::init(parent.path()).unwrap();
+    let nested = parent.path().join("not-a-repository");
+    std::fs::create_dir(&nested).unwrap();
+
+    assert_eq!(
+        resolve_diff_comparison(DiffComparison::Base, "base".to_string(), &nested).unwrap(),
+        "base"
+    );
+    assert_eq!(
+        resolve_diff_comparison(DiffComparison::Uncommitted, "ignored".to_string(), &nested)
+            .unwrap_err(),
+        "Could not open repository."
+    );
+}
+
+#[test]
+fn repo_base_omits_absent_optional_fields() {
+    let serialized = serde_json::to_value(RepoBase {
+        repo_name: None,
+        base_branch: "main".to_string(),
+        repo_path: "/work/repo".to_string(),
+        base_override: None,
+        warning: None,
+    })
+    .unwrap();
+    assert_eq!(serialized["base_branch"], "main");
+    assert_eq!(serialized["repo_path"], "/work/repo");
+    assert!(serialized.get("base_override").is_none());
+    assert!(serialized.get("warning").is_none());
 }
 
 /// Each workspace member carries its own override and recorded base, and the

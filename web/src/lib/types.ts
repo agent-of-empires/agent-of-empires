@@ -194,7 +194,7 @@ export interface TimingPongMessage {
 }
 
 /** Baseline used by both diff listing and file-content requests. */
-export type DiffComparison = "base" | "origin_main" | "uncommitted" | "upstream";
+export type DiffComparison = "base" | "uncommitted" | "upstream";
 
 /** Rich diff file info with addition/deletion stats */
 export interface RichDiffFile {

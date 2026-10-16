@@ -6,6 +6,7 @@ import { BackgroundAgentsPanel } from "./acp/BackgroundAgentsPanel";
 import { FilesPane } from "./FilesPane";
 import { DiffFileList } from "./diff/DiffFileList";
 import { DiffFileViewer } from "./diff/DiffFileViewer";
+import { DiffComparisonSelect } from "./diff/DiffComparisonSelect";
 import { CommentsBanner } from "./diff/comments/CommentsBanner";
 import { SendCommentsDialog } from "./diff/comments/SendCommentsDialog";
 import { PluginPaneBody } from "./plugin/PluginPane";
@@ -118,17 +119,11 @@ export function MobileMainPane({
           </button>
           <span className="text-xs text-text-dim">{viewLabel}</span>
           {view === "diff" && selectedFilePath && (
-            <select
-              aria-label="Diff comparison"
-              value={comparison}
-              onChange={(event) => onComparisonChange(event.target.value as DiffComparison)}
-              className="ml-auto max-w-36 rounded border border-surface-700 bg-surface-800 px-1.5 py-1 font-mono text-[10px] text-text-primary focus:border-brand-500 focus:outline-none"
-            >
-              <option value="base">Base</option>
-              <option value="origin_main">origin/main</option>
-              <option value="uncommitted">Uncommitted</option>
-              <option value="upstream">Tracking branch</option>
-            </select>
+            <DiffComparisonSelect
+              comparison={comparison}
+              onComparisonChange={onComparisonChange}
+              className="ml-auto max-w-36"
+            />
           )}
         </div>
       )}

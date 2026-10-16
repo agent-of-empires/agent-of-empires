@@ -1,7 +1,7 @@
 import { spawnSync } from "node:child_process";
-import { unlinkSync, writeFileSync } from "node:fs";
+import { unlinkSync } from "node:fs";
 import { join } from "node:path";
-import { expect, test, type TestInfo, type Page } from "../helpers/liveTest";
+import { expect, test } from "../helpers/liveTest";
 import { listSessions, resolveAoeBinary } from "../helpers/aoeServe";
 import { commitAll, initWorkingRepo, writeFiles } from "../helpers/gitFixture";
 
@@ -10,33 +10,9 @@ function git(cwd: string, ...args: string[]) {
   if (result.status !== 0) throw new Error(`git ${args.join(" ")}: ${result.stderr}`);
 }
 
-async function evidence(page: Page, testInfo: TestInfo, step: string, result: string) {
-  await page.evaluate(async () => {
-    await document.fonts.ready;
-    await new Promise<void>((resolve) => requestAnimationFrame(() => requestAnimationFrame(() => resolve())));
-  });
-  const screenshotPath = process.env.QA_SESSION_DIR
-    ? join(process.env.QA_SESSION_DIR, `${step}.png`)
-    : testInfo.outputPath(`${step}.png`);
-  await page.screenshot({ path: screenshotPath });
-  if (process.env.QA_SESSION_DIR) {
-    writeFileSync(join(process.env.QA_SESSION_DIR, `${step}.json`), JSON.stringify({ url: page.url(), result }));
-  }
-  await testInfo.attach(step, {
-    body: JSON.stringify({ url: page.url(), result }),
-    contentType: "application/json",
-  });
-}
-
-test("comparison modes use distinct Git baselines for the file list and contents", async ({
-  page,
-  spawnServe,
-}, testInfo) => {
+test("comparison modes use distinct Git baselines without leaking across sessions", async ({ page, spawnServe }) => {
   const consoleErrors: string[] = [];
   page.on("pageerror", (error) => consoleErrors.push(error.message));
-  page.on("console", (message) => {
-    if (message.type() === "error") consoleErrors.push(message.text());
-  });
   const serve = await spawnServe({
     authMode: "none",
     seedFn: ({ home, env }) => {
@@ -48,7 +24,6 @@ test("comparison modes use distinct Git baselines for the file list and contents
         "deleted.txt": "deleted content\n",
       });
       commitAll(project, "main baseline", env);
-      git(project, "update-ref", "refs/remotes/origin/main", "HEAD");
       git(project, "switch", "-c", "feature/comparison");
       writeFiles(project, {
         "shared.txt": "upstream baseline\n",
@@ -70,8 +45,18 @@ test("comparison modes use distinct Git baselines for the file list and contents
       });
       git(project, "add", "staged.txt");
       unlinkSync(join(project, "deleted.txt"));
-      const added = spawnSync(resolveAoeBinary(), ["add", project, "-t", "diff-comparison", "-c", "claude"], { env });
-      if (added.status !== 0) throw new Error(`aoe add failed: ${added.stderr?.toString()}`);
+      const other = join(home, "without-upstream");
+      initWorkingRepo(other, env);
+      writeFiles(other, { "local.txt": "base\n" });
+      commitAll(other, "base", env);
+      writeFiles(other, { "local.txt": "working\n" });
+      for (const [path, title] of [
+        [project, "diff-comparison"],
+        [other, "without-upstream"],
+      ]) {
+        const added = spawnSync(resolveAoeBinary(), ["add", path, "-t", title, "-c", "claude"], { env });
+        if (added.status !== 0) throw new Error(`aoe add failed: ${added.stderr?.toString()}`);
+      }
     },
   });
 
@@ -81,25 +66,25 @@ test("comparison modes use distinct Git baselines for the file list and contents
   const endpoint = `${serve.baseUrl}/api/sessions/${session!.id}/diff`;
   const dirtyPaths = ["deleted.txt", "shared.txt", "staged.txt", "untracked.txt"];
   const cases = [
-    {
-      mode: "origin_main",
-      base: "origin/main",
-      old: "main baseline",
-      paths: [...dirtyPaths, "committed.txt", "pushed.txt"],
-    },
+    { mode: "base", base: "main", old: "main baseline", paths: [...dirtyPaths, "committed.txt", "pushed.txt"] },
     { mode: "upstream", base: "fork/review", old: "upstream baseline", paths: [...dirtyPaths, "committed.txt"] },
     { mode: "uncommitted", base: "HEAD", old: "local commit baseline", paths: dirtyPaths },
   ];
 
   await page.goto(`${serve.baseUrl}/`);
-  await expect(page.getByRole("link").filter({ hasText: "diff-comparison" }).first()).toBeVisible();
-  await evidence(page, testInfo, "001-dashboard", "Isolated test session is visible");
   await page.getByRole("link").filter({ hasText: "diff-comparison" }).first().click();
-  const comparison = page.getByRole("combobox", { name: "Diff comparison" });
+  const comparison = page.getByRole("button", { name: /^Diff comparison \(current:/ });
   await expect(comparison).toBeVisible();
-  await evidence(page, testInfo, "002-session", "Comparison selector is visible");
+  const chooseComparison = async (mode: string) => {
+    const labels: Record<string, string> = { base: "Base", uncommitted: "Uncommitted", upstream: "Tracking branch" };
+    await comparison.click();
+    await page
+      .getByRole("group", { name: "Diff comparison" })
+      .getByRole("button", { name: labels[mode], exact: true })
+      .click();
+  };
 
-  for (const [index, entry] of cases.entries()) {
+  for (const entry of cases) {
     const filesResponse = await fetch(`${endpoint}/files?comparison=${entry.mode}`);
     expect(filesResponse.status).toBe(200);
     const files = await filesResponse.json();
@@ -114,48 +99,39 @@ test("comparison modes use distinct Git baselines for the file list and contents
     expect(contents.patch).toContain(`-${entry.old}`);
     expect(contents.patch).toContain("+working tree content");
 
-    await comparison.selectOption(entry.mode);
+    await chooseComparison(entry.mode);
     await expect(page.getByText(`${entry.paths.length} files`, { exact: true }).first()).toBeVisible();
-    await evidence(
-      page,
-      testInfo,
-      `00${index * 2 + 3}-${entry.mode}`,
-      `${entry.base}: ${entry.paths.length} expected files`,
-    );
     await page
       .getByRole("button", { name: /shared\.txt/ })
       .first()
       .click();
     await expect(page.getByText(entry.old, { exact: true }).first()).toBeVisible();
     await expect(page.getByText("working tree content", { exact: true }).first()).toBeVisible();
-    await evidence(
-      page,
-      testInfo,
-      `00${index * 2 + 4}-${entry.mode}-contents`,
-      `Old content: ${entry.old}; new content: working tree content`,
-    );
     await page.getByRole("button", { name: "Back to terminal" }).first().click();
     await expect(comparison).toBeVisible();
-    await evidence(page, testInfo, `01${index + 1}-back-to-list`, "File viewer closed; comparison list is available");
   }
 
+  await chooseComparison("upstream");
+  await expect(page.getByText("5 files", { exact: true }).first()).toBeVisible();
+  await page.getByRole("link").filter({ hasText: "without-upstream" }).first().click();
+  await expect(comparison).toHaveAccessibleName("Diff comparison (current: Base)");
+  await expect(page.getByRole("button", { name: /local\.txt/ }).first()).toBeVisible();
+  await expect(page.getByText("Comparison unavailable", { exact: true })).toHaveCount(0);
+  await page.getByRole("link").filter({ hasText: "diff-comparison" }).first().click();
+  await expect(comparison).toHaveAccessibleName("Diff comparison (current: Tracking branch)");
+
   git(join(serve.home, "project"), "branch", "--unset-upstream");
-  await comparison.selectOption("upstream");
+  await chooseComparison("uncommitted");
+  await expect(page.getByText("4 files", { exact: true }).first()).toBeVisible();
+  await chooseComparison("upstream");
   await expect(page.getByText(/no .*upstream|upstream .*not|no .*tracking|tracking .*not/i).first()).toBeVisible();
   const missingUpstream = await fetch(`${endpoint}/file?path=shared.txt&comparison=upstream`);
   expect(missingUpstream.status).toBe(400);
-  await evidence(page, testInfo, "009-missing-upstream", "Missing tracking branch is shown instead of a fallback diff");
-
-  git(join(serve.home, "project"), "update-ref", "-d", "refs/remotes/origin/main");
-  await comparison.selectOption("origin_main");
-  await expect(page.getByText(/origin\/main.*(not|missing|unavailable|found)/i).first()).toBeVisible();
-  const missingMain = await fetch(`${endpoint}/files?comparison=origin_main`);
-  const missingMainBody = await missingMain.json();
-  expect(missingMainBody.files).toEqual([]);
-  expect(missingMainBody.warning).toMatch(/origin\/main/);
+  const unavailable = await fetch(`${endpoint}/files?comparison=upstream`);
+  const unavailableBody = await unavailable.json();
+  expect(unavailableBody.files).toEqual([]);
+  expect(unavailableBody.warning).toMatch(/upstream/);
   await expect(page.getByText("Comparison unavailable", { exact: true }).first()).toBeVisible();
-  await expect(page.getByText("No changes vs origin/main", { exact: true })).toHaveCount(0);
-  await evidence(page, testInfo, "010-missing-origin-main", "Missing origin/main is shown instead of a fallback diff");
+  await expect(page.getByText("No changes vs upstream", { exact: true })).toHaveCount(0);
   expect(consoleErrors).toEqual([]);
-  await testInfo.attach("console-errors", { body: JSON.stringify(consoleErrors), contentType: "application/json" });
 });

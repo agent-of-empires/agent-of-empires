@@ -27,6 +27,7 @@ pub struct RepoBase {
     pub base_branch: String,
     /// Worktree path this entry's diff was computed in.
     pub repo_path: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub base_override: Option<String>,
     /// Warning for this repository's comparison or scan, if unavailable.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -72,7 +73,6 @@ const MAX_CONTENTS_LINES: usize = 200_000;
 pub(super) enum DiffComparison {
     #[default]
     Base,
-    OriginMain,
     Uncommitted,
     Upstream,
 }
@@ -81,7 +81,6 @@ impl DiffComparison {
     fn label(self) -> &'static str {
         match self {
             Self::Base => "base",
-            Self::OriginMain => "origin/main",
             Self::Uncommitted => "HEAD",
             Self::Upstream => "upstream",
         }
@@ -99,74 +98,56 @@ pub(super) fn resolve_diff_comparison(
     base_branch: String,
     repo_path: &std::path::Path,
 ) -> Result<String, String> {
-    match comparison {
-        DiffComparison::Base => Ok(base_branch),
-        DiffComparison::Uncommitted => {
-            let repo = git2::Repository::open(repo_path)
-                .map_err(|_| "Could not open repository.".to_string())?;
-            repo.head()
-                .and_then(|head| head.peel_to_commit())
-                .map_err(|_| {
-                    "Cannot compare uncommitted changes: HEAD does not resolve to a commit."
-                        .to_string()
-                })?;
-            Ok("HEAD".to_string())
-        }
-        DiffComparison::OriginMain => {
-            let repo = git2::Repository::open(repo_path)
-                .map_err(|_| "Could not open repository.".to_string())?;
-            let reference = "refs/remotes/origin/main";
-            repo.find_reference(reference)
-                .and_then(|reference| reference.peel_to_commit())
-                .map_err(|_| {
-                    format!(
-                        "Comparison ref '{reference}' is missing or does not point to a commit."
-                    )
-                })?;
-            Ok(reference.to_string())
-        }
-        DiffComparison::Upstream => {
-            let repo = git2::Repository::open(repo_path)
-                .map_err(|_| "Could not open repository.".to_string())?;
-            let head = repo.head().map_err(|_| {
-                "Cannot compare upstream: HEAD is detached or unresolved.".to_string()
-            })?;
-            if !head.is_branch() {
-                return Err("Cannot compare upstream: HEAD is detached.".to_string());
-            }
-            let branch_name = head.shorthand().map_err(|_| {
-                "Cannot compare upstream: current branch name is unavailable.".to_string()
-            })?;
-            let branch = repo
-                .find_branch(branch_name, git2::BranchType::Local)
-                .map_err(|_| {
-                    "Cannot compare upstream: current local branch is unavailable.".to_string()
-                })?;
-            let upstream = branch.upstream().map_err(|_| {
-                let configured = repo.config().ok().is_some_and(|config| {
-                    config.get_string(&format!("branch.{branch_name}.remote")).is_ok()
-                        && config.get_string(&format!("branch.{branch_name}.merge")).is_ok()
-                });
-                if configured {
-                    format!("Cannot compare upstream: configured upstream for branch '{branch_name}' is missing.")
-                } else {
-                    format!("Cannot compare upstream: branch '{branch_name}' has no configured upstream.")
-                }
-            })?;
-            let reference = upstream.get().name().map_err(|_| {
-                "Cannot compare upstream: configured upstream ref name is unavailable.".to_string()
-            })?;
-            if !reference.starts_with("refs/remotes/") {
-                return Err(format!(
-                    "Cannot compare upstream: configured upstream '{reference}' is not a remote-tracking branch."
-                ));
-            }
-            upstream.get().peel_to_commit().map_err(|_| {
-                format!("Cannot compare upstream: configured upstream '{reference}' is missing or does not point to a commit.")
-            })?;
-            Ok(reference.to_string())
-        }
+    if matches!(comparison, DiffComparison::Base) {
+        return Ok(base_branch);
     }
+
+    let repo = crate::git::open_repo_at(repo_path)
+        .map_err(|_| "Could not open repository.".to_string())?;
+    if matches!(comparison, DiffComparison::Uncommitted) {
+        repo.head()
+            .and_then(|head| head.peel_to_commit())
+            .map_err(|_| {
+                "Cannot compare uncommitted changes: HEAD does not resolve to a commit.".to_string()
+            })?;
+        return Ok("HEAD".to_string());
+    }
+
+    let head = repo
+        .head()
+        .map_err(|_| "Cannot compare upstream: HEAD is detached or unresolved.".to_string())?;
+    if !head.is_branch() {
+        return Err("Cannot compare upstream: HEAD is detached.".to_string());
+    }
+    let branch_name = head
+        .shorthand()
+        .map_err(|_| "Cannot compare upstream: current branch name is unavailable.".to_string())?;
+    let branch = repo
+        .find_branch(branch_name, git2::BranchType::Local)
+        .map_err(|_| "Cannot compare upstream: current local branch is unavailable.".to_string())?;
+    let upstream = branch.upstream().map_err(|_| {
+        let configured = repo.config().ok().is_some_and(|config| {
+            config.get_string(&format!("branch.{branch_name}.remote")).is_ok()
+                && config.get_string(&format!("branch.{branch_name}.merge")).is_ok()
+        });
+        if configured {
+            format!("Cannot compare upstream: configured upstream for branch '{branch_name}' is missing.")
+        } else {
+            format!("Cannot compare upstream: branch '{branch_name}' has no configured upstream.")
+        }
+    })?;
+    let reference = upstream.get().name().map_err(|_| {
+        "Cannot compare upstream: configured upstream ref name is unavailable.".to_string()
+    })?;
+    if !reference.starts_with("refs/remotes/") {
+        return Err(format!(
+            "Cannot compare upstream: configured upstream '{reference}' is not a remote-tracking branch."
+        ));
+    }
+    upstream.get().peel_to_commit().map_err(|_| {
+        format!("Cannot compare upstream: configured upstream '{reference}' is missing or does not point to a commit.")
+    })?;
+    Ok(reference.to_string())
 }
 
 /// Validate a user-supplied relative file path against a workdir.
@@ -380,7 +361,6 @@ pub async fn session_diff_files(
             let (base_branch, display_base) = match resolved {
                 Ok(base_branch) => {
                     let display_base = match comparison {
-                        DiffComparison::OriginMain => "origin/main".to_string(),
                         DiffComparison::Uncommitted => "HEAD".to_string(),
                         DiffComparison::Upstream => base_branch
                             .strip_prefix("refs/remotes/")
@@ -421,6 +401,7 @@ pub async fn session_diff_files(
                 }
                 Err(error) => {
                     tracing::warn!(
+                        target: "http.api.sessions",
                         repo_path = %path.display(),
                         repo_name = ?repo.name,
                         error = %error,

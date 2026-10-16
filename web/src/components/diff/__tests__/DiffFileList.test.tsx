@@ -107,17 +107,53 @@ describe("header and empty states", () => {
     expect(screen.getByText("No upstream configured.")).toBeTruthy();
   });
 
-  it("shows the comparison selector and hides the base picker outside base mode", () => {
+  it("offers the three comparison choices and hides the base picker outside base mode", () => {
     const onComparisonChange = vi.fn();
-    renderList({
+    const props = {
       files: [file({ path: "a.ts" })],
       sessionId: "s1",
       repoPath: "/repo",
-      comparison: "origin_main",
+      comparison: "base" as const,
       onComparisonChange,
-    });
-    fireEvent.change(screen.getByRole("combobox", { name: "Diff comparison" }), { target: { value: "uncommitted" } });
+    };
+    const { rerender } = renderList(props);
+    expect(screen.getByRole("button", { name: /Change diff base/ })).toBeTruthy();
+
+    const trigger = screen.getByRole("button", { name: "Diff comparison (current: Base)" });
+    expect(trigger.getAttribute("aria-expanded")).toBe("false");
+    fireEvent.click(trigger);
+    expect(trigger.getAttribute("aria-expanded")).toBe("true");
+    expect(screen.getByRole("button", { name: "Base", exact: true }).getAttribute("aria-pressed")).toBe("true");
+    for (const label of ["Base", "Uncommitted", "Tracking branch"]) {
+      expect(screen.getByRole("button", { name: label, exact: true })).toBeTruthy();
+    }
+    fireEvent.keyDown(screen.getByRole("button", { name: "Uncommitted", exact: true }), { key: "Escape" });
+    expect(screen.queryByRole("button", { name: "Uncommitted", exact: true })).toBeNull();
+    expect(trigger.getAttribute("aria-expanded")).toBe("false");
+    expect(document.activeElement).toBe(trigger);
+    expect(onComparisonChange).not.toHaveBeenCalled();
+
+    fireEvent.click(trigger);
+    fireEvent.mouseDown(document.body);
+    expect(screen.queryByRole("button", { name: "Uncommitted", exact: true })).toBeNull();
+    expect(onComparisonChange).not.toHaveBeenCalled();
+
+    fireEvent.click(trigger);
+    fireEvent.click(screen.getByRole("button", { name: "Uncommitted", exact: true }));
     expect(onComparisonChange).toHaveBeenCalledWith("uncommitted");
+    expect(document.activeElement).toBe(trigger);
+    rerender(
+      <DiffFileList
+        {...props}
+        comparison="uncommitted"
+        perRepoBases={[{ base_branch: "main" }]}
+        warning={null}
+        selectedPath={null}
+        selectedRepoName={undefined}
+        loading={false}
+        onSelectFile={vi.fn()}
+      />,
+    );
     expect(screen.queryByRole("button", { name: /Change diff base/ })).toBeNull();
   });
 });

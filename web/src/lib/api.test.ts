@@ -579,8 +579,8 @@ describe("request shapes", () => {
 describe("diff comparison requests", () => {
   it("uses the requested comparison for diff file lists", async () => {
     fetchSpy.mockResolvedValueOnce(json({ files: [] }));
-    await api.getSessionDiffFiles("s1", "origin_main");
-    expect(lastCall().url).toBe("/api/sessions/s1/diff/files?comparison=origin_main");
+    await api.getSessionDiffFiles("s1", "upstream");
+    expect(lastCall().url).toBe("/api/sessions/s1/diff/files?comparison=upstream");
   });
 
   it("uses the requested comparison and repo for file contents", async () => {

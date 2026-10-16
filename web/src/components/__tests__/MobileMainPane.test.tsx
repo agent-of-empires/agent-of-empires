@@ -28,7 +28,6 @@ vi.mock("../diff/DiffFileList", () => ({
         onChange={(event) => onComparisonChange(event.target.value as DiffComparison)}
       >
         <option value="base">Base</option>
-        <option value="origin_main">origin/main</option>
         <option value="uncommitted">Uncommitted</option>
         <option value="upstream">Tracking branch</option>
       </select>
@@ -175,10 +174,12 @@ describe("MobileMainPane", () => {
     cleanup();
 
     setup({ view: "diff", selectedFilePath: "src/foo.ts", comparison: "uncommitted", onComparisonChange });
-    const viewerComparison = screen.getByRole("combobox", { name: "Diff comparison" });
-    expect((viewerComparison as HTMLSelectElement).value).toBe("uncommitted");
-    fireEvent.change(viewerComparison, { target: { value: "origin_main" } });
-    expect(onComparisonChange).toHaveBeenCalledWith("origin_main");
+    const viewerTrigger = screen.getByRole("button", { name: "Diff comparison (current: Uncommitted)" });
+    fireEvent.click(viewerTrigger);
+    expect(screen.getByRole("button", { name: "Uncommitted", exact: true }).getAttribute("aria-pressed")).toBe("true");
+    fireEvent.click(screen.getByRole("button", { name: "Tracking branch", exact: true }));
+    expect(onComparisonChange).toHaveBeenCalledWith("upstream");
+    expect(document.activeElement).toBe(viewerTrigger);
   });
 
   it("renders the plugin pane body and its title for a plugin view", () => {

@@ -1040,15 +1040,6 @@ mod tests {
     fn init_repo_with_commit() -> (tempfile::TempDir, std::path::PathBuf) {
         let dir = tempfile::TempDir::new().unwrap();
         let repo = git2::Repository::init(dir.path()).unwrap();
-        // Keep dirty fixture files visible regardless of user/system Git excludes.
-        let excludes = repo.path().join("test-excludes");
-        std::fs::write(&excludes, "").unwrap();
-        repo.config()
-            .unwrap()
-            .open_level(git2::ConfigLevel::Local)
-            .unwrap()
-            .set_str("core.excludesFile", excludes.to_str().unwrap())
-            .unwrap();
         let sig = git2::Signature::now("Test", "test@example.com").unwrap();
         let tree_id = {
             let mut index = repo.index().unwrap();

@@ -1114,7 +1114,7 @@ mod tests {
 
     #[test]
     fn prime_quiescence_accepts_observed_owned_zombies() {
-        use std::os::unix::process::CommandExt as _;
+        use std::io::{BufRead as _, Write as _};
         struct OwnedChild(std::process::Child);
         impl Drop for OwnedChild {
             fn drop(&mut self) {
@@ -1126,40 +1126,25 @@ mod tests {
         let marker = format!("TMPDIR={}", root.path().display());
         let socket = root.path().join("daemon.sock");
         let mut child = OwnedChild(
-            Command::new("/bin/cat")
-                // Route through argv too, rather than relying on KERN_PROCARGS2
-                // exposing the child's environment.
-                .arg0(socket.as_os_str())
+            Command::new("sh")
+                .args(["-c", "printf 'ready\n'; IFS= read -r line"])
                 .env("TMPDIR", root.path())
                 .stdin(std::process::Stdio::piped())
-                .stdout(std::process::Stdio::null())
+                .stdout(std::process::Stdio::piped())
                 .spawn()
                 .unwrap(),
         );
-        // Keep a directly executed process alive until the production census has
-        // attested its ownership; only then let EOF turn it into a zombie.
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
-        let owned = loop {
-            let observed = prime_processes(&marker, &socket, &[]).unwrap_or_else(|error| {
-                panic!("owned child {} census failed: {error:#}", child.0.id())
-            });
-            if let Some(identity) = observed
-                .iter()
-                .find(|identity| identity.pid == child.0.id())
-            {
-                break identity.clone();
-            }
-            assert!(
-                std::time::Instant::now() < deadline,
-                "owned child {} was not observed before timeout; last census: {observed:?}; \
-                 launch marker: {:?}; native identity: {:?}",
-                child.0.id(),
-                prime_launch_marker(child.0.id(), &marker, &socket, &mut Vec::new()),
-                process_start_id(child.0.id())
-            );
-            std::thread::sleep(std::time::Duration::from_millis(10));
-        };
-        drop(child.0.stdin.take());
+        let mut ready = String::new();
+        std::io::BufReader::new(child.0.stdout.take().unwrap())
+            .read_line(&mut ready)
+            .unwrap();
+        assert_eq!(ready, "ready\n");
+        let owned = prime_processes(&marker, &socket, &[])
+            .unwrap()
+            .into_iter()
+            .find(|identity| identity.pid == child.0.id())
+            .unwrap();
+        child.0.stdin.as_mut().unwrap().write_all(b"\n").unwrap();
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
         loop {
             let mut probe = Command::new("ps");

@@ -150,7 +150,7 @@ describe("useFileContents", () => {
       error: "bad_request",
       message: "Comparison ref is missing.",
     });
-    const { result } = renderHook(() => useFileContents("s1", "a.ts", undefined, undefined, "origin_main"));
+    const { result } = renderHook(() => useFileContents("s1", "a.ts", undefined, undefined, "upstream"));
     await waitFor(() => expect(result.current.error).toBe("Comparison ref is missing."));
     expect(result.current.contents).toBeNull();
   });
