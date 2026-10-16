@@ -336,6 +336,20 @@ describe("PluginPageView", () => {
     expect(screen.getByText("No session selected")).toBeTruthy();
   });
 
+  it("drops the split's session when the frame reloads itself and takes the pane with it", async () => {
+    const { frame, request } = await readyFrame();
+    fireEvent.load(frame);
+    fireEvent.click(screen.getByRole("button", { name: "Split view" }));
+    await request({ aoeBridge: 1, id: 2, method: "openSession", params: { id: "s" } });
+    expect(screen.getByText("session s")).toBeTruthy();
+    fireEvent.load(frame);
+    expect(screen.queryByText("session s")).toBeNull();
+    // The split stays on, so the reopened page shows it empty.
+    expect(screen.getByRole("button", { name: "Split view" }).getAttribute("aria-pressed")).toBe("true");
+    fireEvent.click(screen.getByText("Reopen"));
+    expect(await screen.findByText("No session selected")).toBeTruthy();
+  });
+
   it("saves the split height a divider drag settles on, clamped", async () => {
     await readyFrame();
     fireEvent.click(screen.getByRole("button", { name: "Split view" }));

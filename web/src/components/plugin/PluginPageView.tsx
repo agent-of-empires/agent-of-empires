@@ -150,7 +150,11 @@ export function PluginPageView({
   // Split view: the page's openSession fills a bottom pane instead of leaving the page.
   const wide = useIsWideViewport();
   const [splitPref, toggleSplit] = usePersistedFlag(`aoe-plugin-page-split:${pluginId}/${pageId}`, false);
-  const split = wide && splitPref;
+  const splitOn = wide && splitPref;
+  const ticket = page && minted?.url === page.url && minted.attempt === attempt ? minted : null;
+  // The split lives inside the framed page; an error in its place takes the session pane with it.
+  const framed = !lost && !(pages !== null && !page) && ticket?.ok !== false;
+  const split = splitOn && framed;
   const shown = split ? selectedSessionId : null;
   // Keyed by session, so a pane closed while maximized opens the next session in the split.
   const [maximizedId, setMaximizedId] = useState<string | null>(null);
@@ -160,9 +164,9 @@ export function PluginPageView({
   useEffect(() => {
     openSessionRef.current = split ? onSelectSession : requestOpenSession;
   }, [split, onSelectSession]);
-  // Off, whether toggled or on a narrowed viewport, the split drops its session, so the dashboard stops treating it as open.
+  // Off, whether toggled, on a narrowed viewport or with the page gone, the split drops its session, so the dashboard stops treating it as open.
   useEffect(() => {
-    // A viewport narrowing has no handler to do this in.
+    // Narrowing and frame loss have no handler to do this in.
     // eslint-disable-next-line react-you-might-not-need-an-effect/no-event-handler
     if (!split && selectedSessionId) onSelectSession(null);
   }, [split, selectedSessionId, onSelectSession]);
@@ -290,7 +294,6 @@ export function PluginPageView({
     setAttempt((a) => a + 1);
   };
 
-  const ticket = page && minted?.url === page.url && minted.attempt === attempt ? minted : null;
   let body = null;
   if (pages !== null && !page) {
     body = <Empty title="Page not found" detail={`No active plugin ${pluginId} declares a page ${pageId}.`} />;
@@ -350,12 +353,12 @@ export function PluginPageView({
           <button
             onClick={toggleSplit}
             className={`w-8 h-8 shrink-0 flex items-center justify-center rounded-md cursor-pointer transition-colors ${
-              split
+              splitOn
                 ? "text-text-primary bg-surface-700/60"
                 : "text-text-muted hover:text-text-secondary hover:bg-surface-700/50"
             }`}
             aria-label="Split view"
-            aria-pressed={split}
+            aria-pressed={splitOn}
             title="Split view"
           >
             <PanelBottom size={16} strokeWidth={1.5} aria-hidden="true" />
