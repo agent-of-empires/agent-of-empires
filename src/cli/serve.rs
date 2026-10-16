@@ -740,24 +740,26 @@ fn lock_serve_state() -> Result<std::fs::File> {
 }
 
 /// Deletes the serve state only while `serve.pid` still names `expected_pid`.
-fn clear_serve_state(expected_pid: i32) {
+/// Returns whether it did.
+fn clear_serve_state(expected_pid: i32) -> bool {
     let (Ok(_lock), Ok(pid_path), Ok(dir)) = (
         lock_serve_state(),
         pid_file_path(),
         crate::session::get_app_dir(),
     ) else {
-        return;
+        return false;
     };
     let recorded = std::fs::read_to_string(&pid_path)
         .ok()
         .and_then(|raw| parse_positive_pid(&raw));
     if recorded != Some(expected_pid) {
-        return;
+        return false;
     }
     let _ = std::fs::remove_file(&pid_path);
     for name in SERVE_STATE_FILES {
         let _ = std::fs::remove_file(dir.join(name));
     }
+    true
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1291,10 +1293,11 @@ pub(crate) async fn stop_daemon() -> Result<()> {
             }
         }
         DaemonProcessIdentity::Foreign => {
-            clear_serve_state(pid);
+            if clear_serve_state(pid) {
+                bail!("PID {pid} belongs to a different process (stale PID file). Cleaned up.");
+            }
             bail!(
-                "PID {} belongs to a different process (stale PID file). Cleaned up.",
-                pid
+                "PID {pid} belongs to a different process; serve state changed meanwhile and was preserved."
             );
         }
         DaemonProcessIdentity::Indeterminate => {
@@ -1331,8 +1334,11 @@ pub(crate) async fn stop_daemon() -> Result<()> {
             println!("Stopped aoe serve daemon (PID {})", pid);
         }
         Err(nix::errno::Errno::ESRCH) => {
-            clear_serve_state(pid);
-            println!("Daemon was not running (stale PID file cleaned up)");
+            if clear_serve_state(pid) {
+                println!("Daemon was not running (stale PID file cleaned up)");
+            } else {
+                println!("Daemon was not running; serve state changed meanwhile and was preserved");
+            }
         }
         Err(e) => bail!("Failed to stop daemon (PID {}): {}", pid, e),
     }
@@ -1882,10 +1888,10 @@ mod tests {
             let dir = crate::session::get_app_dir().unwrap();
 
             publish(&dir, 4242);
-            clear_serve_state(4243);
+            assert!(!clear_serve_state(4243));
             assert_published(&dir, 4242);
 
-            clear_serve_state(4242);
+            assert!(clear_serve_state(4242));
             for name in [
                 "serve.pid",
                 "serve.url",
