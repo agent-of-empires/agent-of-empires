@@ -11,7 +11,7 @@ use std::path::Path;
 use std::sync::{Mutex, MutexGuard};
 
 use anyhow::{Context, Result};
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension};
 use tracing::{debug, trace, warn};
 
 use super::state::Event;
@@ -23,8 +23,8 @@ pub use replay::ReplayPage;
 pub use search::ContentHit;
 pub use turns::{TerminalRepairProbe, UnresolvedBackgroundAgentLaunch};
 
-/// Lifecycle and metadata events that neither count as session activity nor
-/// fall to the retention prune.
+/// Lifecycle and metadata events that do not count as session activity. All
+/// of them are also retention-pinned.
 const NON_SUBSTANTIVE_EVENT_DISCRIMINANTS: &[&str] = &[
     "AvailableCommandsUpdated",
     "ModesAvailable",
@@ -32,6 +32,37 @@ const NON_SUBSTANTIVE_EVENT_DISCRIMINANTS: &[&str] = &[
     "AcpSessionAssigned",
     "PromptCapabilities",
     "AuthStatusUpdated",
+];
+
+/// Background work as its (start, end, id field) events. Teardown and cold
+/// folds find open work by pairing them, so the retention prune pins both
+/// halves, and [`prune_completed_background_work`] drops a pair once it ends.
+const BACKGROUND_WORK_EVENTS: &[(&str, &str, &str)] = &[
+    ("BackgroundTaskStarted", "BackgroundTaskFinished", "task_id"),
+    (
+        "BackgroundAgentLaunched",
+        "BackgroundAgentCompleted",
+        "agent_id",
+    ),
+];
+
+/// How often (in seqs) a session's completed background work is swept, which
+/// amortizes the delete scans.
+const COMPLETED_WORK_SWEEP_INTERVAL: u64 = 64;
+
+/// Rows the retention prune keeps: the non-substantive events above, plus the
+/// background work events of [`BACKGROUND_WORK_EVENTS`].
+const RETENTION_PINNED_EVENT_DISCRIMINANTS: &[&str] = &[
+    "AvailableCommandsUpdated",
+    "ModesAvailable",
+    "CurrentModeChanged",
+    "AcpSessionAssigned",
+    "PromptCapabilities",
+    "AuthStatusUpdated",
+    "BackgroundAgentLaunched",
+    "BackgroundAgentCompleted",
+    "BackgroundTaskStarted",
+    "BackgroundTaskFinished",
 ];
 
 /// SQLite-backed structured view event log.
@@ -104,8 +135,16 @@ impl EventStore {
             &self.schema,
             session_id,
             self.max_events_per_session,
-            NON_SUBSTANTIVE_EVENT_DISCRIMINANTS,
+            RETENTION_PINNED_EVENT_DISCRIMINANTS,
         );
+        if self.max_events_per_session != 0 && seq.is_multiple_of(COMPLETED_WORK_SWEEP_INTERVAL) {
+            prune_completed_background_work(
+                &conn,
+                &self.schema,
+                session_id,
+                self.max_events_per_session,
+            );
+        }
         Ok(())
     }
 
@@ -174,6 +213,57 @@ impl EventStore {
             deleted,
             "deleted session events"
         );
+    }
+}
+
+/// Deletes background work that has ended and fell past the retention cutoff,
+/// leaving open work pinned. Starts go first, so an end is never removed while
+/// its start survives (that start would then read as open).
+fn prune_completed_background_work(
+    conn: &Connection,
+    schema: &events::Schema,
+    session_id: &str,
+    max_events: usize,
+) {
+    let events = schema.events_table();
+    // The same cutoff `events::prune_retention` uses.
+    let cutoff: Option<i64> = conn
+        .query_row(
+            &format!(
+                "SELECT seq FROM {events} WHERE session_id = ?1
+                 ORDER BY seq DESC LIMIT 1 OFFSET ?2"
+            ),
+            rusqlite::params![session_id, max_events as i64],
+            |row| row.get(0),
+        )
+        .optional()
+        .unwrap_or(None);
+    let Some(cutoff) = cutoff else {
+        return;
+    };
+    for (start, end, id) in BACKGROUND_WORK_EVENTS {
+        // An end closes only the starts before it: ids may be reused.
+        let delete_started = format!(
+            "DELETE FROM {events} AS started
+             WHERE started.session_id = ?1 AND started.seq <= ?2
+               AND started.discriminant = '{start}'
+               AND EXISTS (
+                   SELECT 1 FROM {events} AS ended
+                   WHERE ended.session_id = ?1 AND ended.discriminant = '{end}'
+                     AND ended.seq > started.seq
+                     AND json_extract(ended.event_json, '$.{end}.{id}') =
+                         json_extract(started.event_json, '$.{start}.{id}'))"
+        );
+        let delete_ended = format!(
+            "DELETE FROM {events}
+             WHERE session_id = ?1 AND seq <= ?2 AND discriminant = '{end}'"
+        );
+        for sql in [delete_started, delete_ended] {
+            if let Err(e) = conn.execute(&sql, rusqlite::params![session_id, cutoff]) {
+                warn!(target: "acp.event_store", "prune completed work {session_id}: {e}");
+                return;
+            }
+        }
     }
 }
 
@@ -259,6 +349,16 @@ pub(super) mod test_support {
 mod tests {
     use super::test_support::*;
     use super::*;
+
+    #[test]
+    fn every_non_substantive_event_is_retention_pinned() {
+        for name in NON_SUBSTANTIVE_EVENT_DISCRIMINANTS {
+            assert!(
+                RETENTION_PINNED_EVENT_DISCRIMINANTS.contains(name),
+                "{name}"
+            );
+        }
+    }
 
     #[test]
     fn record_is_idempotent_and_persisted_shapes_stay_readable() {

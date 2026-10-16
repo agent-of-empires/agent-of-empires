@@ -304,6 +304,9 @@ impl<S: BroadcastSink> Drain<S> {
             drop(guard);
             let settlement =
                 tear_down_runner(&*self.process_control, &self.session_id, identity).await;
+            // Before the settle admits a replacement, whose own work the
+            // sweep would otherwise finish.
+            self.detach_stopped_worker_work();
             settle_sweeping_if_owed(
                 &self.process_control,
                 &self.lifecycle,
@@ -314,24 +317,33 @@ impl<S: BroadcastSink> Drain<S> {
             .await;
             true
         } else {
-            let dropped = lock_recover(&self.lifecycle).release_running(lease);
-            if dropped {
+            let current = lock_recover(&self.lifecycle)
+                .running(&self.session_id)
+                .is_some_and(|(running, _)| &running == lease);
+            if current {
                 guard.remove(&self.session_id);
+                // Under the workers lock and ahead of the release: a stop that
+                // finds the session unowned, or a replacement, waits for it.
+                self.detach_stopped_worker_work();
+                lock_recover(&self.lifecycle).release_running(lease);
             }
             drop(guard);
-            dropped
+            current
         };
-        if dropped {
-            if self.clear_pending_context_reset() {
-                self.notify.notify_waiters();
-            }
-            super::publish::detach_orphaned_background_agents_on(
-                &*self.sink,
-                &self.next_seqs,
-                &self.session_id,
-                "the worker that was tracking this sub-agent stopped; tracking stopped",
-            );
+        if dropped && self.clear_pending_context_reset() {
+            self.notify.notify_waiters();
         }
+    }
+
+    /// The closed worker's tailer and task tracking died with it, so the
+    /// sub-agents and tasks it left open will never report their end.
+    fn detach_stopped_worker_work(&self) {
+        super::publish::detach_orphaned_background_agents_on(
+            &*self.sink,
+            &self.next_seqs,
+            &self.session_id,
+            "the worker that was tracking this sub-agent stopped; tracking stopped",
+        );
     }
 
     /// Decide whether the closed worker respawns, publishing why when it does not.

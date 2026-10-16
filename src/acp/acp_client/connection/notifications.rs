@@ -16,7 +16,9 @@ use crate::acp::acp_client::lifecycle::{
     forward_lifecycle_signals, LifecycleEnvelope, TerminalClaim,
 };
 use crate::acp::acp_client::rate_limit::rate_limit_rejection_from_meta;
-use crate::acp::acp_client::session_identity::SessionIngress;
+use crate::acp::acp_client::session_identity::{
+    AsyncTaskNotification, IngressUpdate, SessionIngress,
+};
 use crate::acp::acp_client::session_sandbox::SessionSandbox;
 use crate::acp::acp_client::tool_context::{
     restore_wake_tool_title, update_tool_context_cache, ToolCallContextCache, ToolContextCache,
@@ -121,6 +123,18 @@ impl Shared {
         let _ = self.event_tx.send(event).await;
     }
 
+    /// Task frames a history replay re-sends describe no live work and are
+    /// dropped. Like transcript events, that covers every frame until the
+    /// first user prompt after a `session/load`, which ends the replay window.
+    pub(super) async fn handle_async_task(&self, task: AsyncTaskNotification) {
+        if self.suppress_history_replay.load(Ordering::Relaxed) {
+            return;
+        }
+        if let Some(event) = task.into_event() {
+            self.emit(event).await;
+        }
+    }
+
     /// Publish the native session the lifecycle selected and apply the
     /// updates buffered while it was still pending.
     pub(super) async fn commit_session(
@@ -138,9 +152,14 @@ impl Shared {
     }
 
     /// Replayed updates carry no local prompt, so they only rebuild state.
-    pub(super) async fn apply_replay(&self, replay: Vec<SessionNotification>) {
-        for notification in replay {
-            self.handle_notification(notification, false).await;
+    pub(super) async fn apply_replay(&self, replay: Vec<IngressUpdate>) {
+        for update in replay {
+            match update {
+                IngressUpdate::Session(notification) => {
+                    self.handle_notification(*notification, false).await;
+                }
+                IngressUpdate::Task(task) => self.handle_async_task(task).await,
+            }
         }
     }
 

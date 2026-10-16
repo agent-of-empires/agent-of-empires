@@ -448,6 +448,9 @@ pub struct AcpState {
     pub session_notices: Vec<SessionNotice>,
     #[serde(default)]
     pub background_agents: Vec<BackgroundAgentRecord>,
+    /// Ids of running background tasks that are not sub-agents.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub background_tasks: Vec<String>,
 
     /// Whether the main turn is in flight. Dispatch (`acp::dispatch::decide`)
     /// and the queue drain gate on this directly, so it tracks only the main
@@ -673,6 +676,18 @@ pub enum Event {
         warning: Option<String>,
         ended_at: DateTime<Utc>,
     },
+    /// A background task that is not a sub-agent (Bash `run_in_background`)
+    /// started, reported through the adapter's `asyncTasks` extension.
+    BackgroundTaskStarted {
+        task_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tool_call_id: Option<String>,
+        description: String,
+    },
+    /// A background task reached a terminal state.
+    BackgroundTaskFinished {
+        task_id: String,
+    },
     /// The adapter runtime failed a prompt before emitting any transcript.
     PromptRuntimeError {
         message: String,
@@ -799,12 +814,14 @@ impl AcpState {
         }
     }
 
-    /// Whether any background sub-agent is still in flight. Keyed on
-    /// `ended_at`, not `status`: a terminal `BackgroundAgentCompleted` can
-    /// carry `status: Stalled` (the tailer's abort timeout gives up without a
-    /// clean `end_turn`), and that record is done like any other (#4001).
+    /// Whether any background sub-agent or task is still in flight. Agents
+    /// are keyed on `ended_at`, not `status`: a terminal
+    /// `BackgroundAgentCompleted` can carry `status: Stalled` (the tailer's
+    /// abort timeout gives up without a clean `end_turn`), and that record is
+    /// done like any other (#4001).
     pub fn has_active_background_agent(&self) -> bool {
-        self.background_agents.iter().any(|a| a.ended_at.is_none())
+        !self.background_tasks.is_empty()
+            || self.background_agents.iter().any(|a| a.ended_at.is_none())
     }
 
     /// Apply a single event; returns the new `last_seq`.
@@ -1052,6 +1069,14 @@ impl AcpState {
                         a.tools = tools;
                     }
                 }
+            }
+            Event::BackgroundTaskStarted { task_id, .. } => {
+                if !self.background_tasks.contains(&task_id) {
+                    self.background_tasks.push(task_id);
+                }
+            }
+            Event::BackgroundTaskFinished { task_id } => {
+                self.background_tasks.retain(|id| *id != task_id);
             }
             // Titles live on `Instance`; wakeups and monitors are read from the log.
             Event::SessionTitleSuggested { .. }
@@ -1811,6 +1836,26 @@ mod tests {
             assert!(agent.ended_at.is_some(), "{status:?}");
             assert!(!s.has_active_background_agent(), "{status:?}");
         }
+    }
+
+    /// A backgrounded command keeps the session busy after the turn that
+    /// started it ends, until its own finish event.
+    #[test]
+    fn a_background_task_holds_the_busy_signal_until_it_finishes() {
+        let started = |id: &str| Event::BackgroundTaskStarted {
+            task_id: id.into(),
+            tool_call_id: None,
+            description: "sleep".into(),
+        };
+        let finished = |id: &str| Event::BackgroundTaskFinished { task_id: id.into() };
+        let mut s = applied([prompt("go"), started("t-1"), started("t-2"), stopped("end")]);
+        assert!(!s.turn_active);
+        assert!(s.has_active_background_agent());
+
+        s.apply_event(finished("t-1")).unwrap();
+        assert!(s.has_active_background_agent(), "t-2 still runs");
+        s.apply_event(finished("t-2")).unwrap();
+        assert!(!s.has_active_background_agent());
     }
 
     /// #4001: `turn_active` gates prompt dispatch and the queue drain, not
