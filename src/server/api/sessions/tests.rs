@@ -4335,6 +4335,13 @@ fn public_create_session_error_forwards_whitelisted_git_errors_only() {
         "Branch 'feature/foo' is already in use by another worktree"
     );
 
+    let template: anyhow::Error =
+        GitError::InvalidTemplate("environment variable `X` is unset or empty".to_string()).into();
+    assert_eq!(
+        public_create_session_error(&template),
+        "Invalid worktree path template: environment variable `X` is unset or empty"
+    );
+
     // Whitelisted variants survive an anyhow::Context wrapper too.
     let wrapped = anyhow::Error::from(GitError::BranchNotFound("nope".to_string()))
         .context("while creating worktree");
