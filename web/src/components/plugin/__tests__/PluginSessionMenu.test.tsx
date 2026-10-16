@@ -9,7 +9,7 @@ const workspaces = [makeWorkspace("w1", [makeSession({ id: "s1", title: "Ethiopi
 
 const handlers = { onStop: vi.fn(), onDelete: vi.fn() };
 
-function open(over: Partial<SessionMenuRequest> = {}) {
+function open(over: Partial<SessionMenuRequest> = {}, readOnly = false) {
   const onClose = vi.fn();
   const request: SessionMenuRequest = {
     key: 1,
@@ -21,7 +21,7 @@ function open(over: Partial<SessionMenuRequest> = {}) {
     onClose,
     ...over,
   };
-  render(<PluginSessionMenu request={request} workspaces={workspaces} readOnly={false} handlers={handlers} />);
+  render(<PluginSessionMenu request={request} workspaces={workspaces} readOnly={readOnly} handlers={handlers} />);
   return onClose;
 }
 
@@ -89,6 +89,14 @@ describe("PluginSessionMenu", () => {
     const [url, init] = fetchSpy.mock.calls[0];
     expect(String(url)).toContain("/api/sessions/s1");
     expect(init).toMatchObject({ method: "PATCH", body: JSON.stringify({ title: "Britons" }) });
+  });
+
+  it("offers no write action on a read-only dashboard, rename included", () => {
+    open({}, true);
+    expect(screen.getByTestId("sidebar-context-menu")).toBeTruthy();
+    for (const id of ["rename", "stop", "delete", "snooze"]) {
+      expect(screen.queryByTestId(`sidebar-context-menu-${id}`)).toBeNull();
+    }
   });
 
   it("snoozes the workspace with a picked preset", async () => {
