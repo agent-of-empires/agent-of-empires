@@ -24,7 +24,7 @@ pub fn resolve_agent_command(
     command: &str,
     app_dir: Option<&std::path::Path>,
 ) -> Option<ResolvedAgentCommand> {
-    if command.contains('/') || command.contains('\\') || command.contains("${") {
+    if !is_bare_command(command) {
         return None;
     }
 
@@ -90,6 +90,11 @@ pub fn resolve_agent_command(
         }
     }
     None
+}
+
+/// A plain name to look up, as opposed to a path or a `${placeholder}`.
+pub(super) fn is_bare_command(command: &str) -> bool {
+    !(command.contains('/') || command.contains('\\') || command.contains("${"))
 }
 
 /// The npm `.bin` shim is `#!/usr/bin/env node`, so the interpreter must also
