@@ -199,7 +199,11 @@ function AcpChrome({
   }
   return (
     <StructuredViewRoot>
-      <AttentionChime approvals={state.pendingApprovals.length} elicitations={state.pendingElicitations.length} />
+      <AttentionChime
+        sessionId={sessionId}
+        approvals={state.pendingApprovals.length}
+        elicitations={state.pendingElicitations.length}
+      />
       <PlanStrip plan={state.plan} />
 
       <RateLimitRecoverySection

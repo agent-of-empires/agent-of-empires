@@ -13,6 +13,7 @@ vi.mock("../lib/api", () => ({
 
 import { useApprovalSound, clearApprovalSoundCache } from "./useApprovalSound";
 import { notifySettingsChanged } from "../lib/settingsEvents";
+import { approvalChimedRecently } from "../lib/soundPlayer";
 
 const REPLAY_QUIET_MS = 1500;
 
@@ -81,10 +82,28 @@ describe("useApprovalSound", () => {
     expect(audioInstances).toHaveLength(3);
   });
 
+  it("records the chime for the session so its Waiting sound can be skipped", async () => {
+    const view = renderHook((p: number) => useApprovalSound(p, "sess-1"), { initialProps: 0 });
+    await act(async () => {
+      vi.advanceTimersByTime(REPLAY_QUIET_MS);
+    });
+    expect(approvalChimedRecently("sess-1")).toBe(false);
+    view.rerender(1);
+    await flushPlayback();
+    expect(approvalChimedRecently("sess-1")).toBe(true);
+    expect(approvalChimedRecently("other")).toBe(false);
+  });
+
   it("swallows an edge during the replay grace window", async () => {
     const { rerender } = renderHook((p: number) => useApprovalSound(p), { initialProps: 0 });
     rerender(2);
     await flushPlayback();
+    expect(audioInstances).toHaveLength(0);
+  });
+
+  it("stays silent when browser sounds are off", async () => {
+    fetchSettings.mockResolvedValue({ sound: { enabled: true, browser_enabled: false, on_approval: "ding" } });
+    await walk(1);
     expect(audioInstances).toHaveLength(0);
   });
 

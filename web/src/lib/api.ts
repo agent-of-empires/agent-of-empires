@@ -1653,8 +1653,8 @@ export async function logout(): Promise<void> {
     }
     // Don't leak the previous user's cached approval sound to the next user of this tab.
     try {
-      const { clearApprovalSoundCache } = await import("../hooks/useApprovalSound");
-      clearApprovalSoundCache();
+      const { clearSoundCache } = await import("./soundPlayer");
+      clearSoundCache();
     } catch {
       // ignore
     }

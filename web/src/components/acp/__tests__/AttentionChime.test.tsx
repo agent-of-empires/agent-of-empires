@@ -58,17 +58,17 @@ afterEach(() => {
 
 describe("AttentionChime", () => {
   it("chimes once when a question arrives (0 -> >=1 combined edge)", async () => {
-    const { rerender } = render(<AttentionChime approvals={0} elicitations={0} />);
+    const { rerender } = render(<AttentionChime sessionId="s1" approvals={0} elicitations={0} />);
     await vi.advanceTimersByTimeAsync(1500);
-    rerender(<AttentionChime approvals={0} elicitations={1} />);
+    rerender(<AttentionChime sessionId="s1" approvals={0} elicitations={1} />);
     await vi.runAllTimersAsync();
     expect(audioCount).toBe(1);
   });
 
   it("does not re-chime when a second item arrives (>=1 -> >=2)", async () => {
-    const { rerender } = render(<AttentionChime approvals={1} elicitations={0} />);
+    const { rerender } = render(<AttentionChime sessionId="s1" approvals={1} elicitations={0} />);
     await vi.advanceTimersByTimeAsync(1500);
-    rerender(<AttentionChime approvals={1} elicitations={1} />);
+    rerender(<AttentionChime sessionId="s1" approvals={1} elicitations={1} />);
     await vi.runAllTimersAsync();
     expect(audioCount).toBe(0);
   });
