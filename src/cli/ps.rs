@@ -804,6 +804,23 @@ fn detail_row(profile: &str, profile_explicit: bool, identifier: &str) -> Result
     }))
 }
 
+/// Runs `frame` until it returns `false` or `shutdown` completes. `shutdown`
+/// is held across frames so a signal arriving mid-frame is still delivered.
+async fn watch_loop(
+    interval: std::time::Duration,
+    shutdown: impl std::future::Future<Output = ()>,
+    mut frame: impl FnMut() -> Result<bool>,
+) -> Result<()> {
+    tokio::pin!(shutdown);
+    while frame()? {
+        tokio::select! {
+            _ = tokio::time::sleep(interval) => {}
+            _ = &mut shutdown => break,
+        }
+    }
+    Ok(())
+}
+
 #[tracing::instrument(target = "cli.ps", skip_all, fields(profile = %profile))]
 pub async fn run(profile: &str, profile_explicit: bool, args: PsArgs) -> Result<()> {
     if let Some(identifier) = &args.session {
@@ -825,20 +842,25 @@ pub async fn run(profile: &str, profile_explicit: bool, args: PsArgs) -> Result<
     };
 
     let tty = std::io::IsTerminal::is_terminal(&std::io::stdout());
-    loop {
-        let mut instances = load_instances(profile, profile_explicit);
-        let rows = collect_rows(&mut instances, filter, args.dead);
-        let body = render_rows(&rows, args.acp, args.json, args.watch)?;
-        if !args.watch {
-            print!("{body}");
-            return Ok(());
-        }
-        print!("{}", watch_frame(body, args.json, tty));
-        tokio::select! {
-            _ = tokio::time::sleep(std::time::Duration::from_secs(args.interval)) => {}
-            _ = tokio::signal::ctrl_c() => return Ok(()),
-        }
-    }
+    let shutdown = async {
+        let _ = tokio::signal::ctrl_c().await;
+    };
+    watch_loop(
+        std::time::Duration::from_secs(args.interval),
+        shutdown,
+        || {
+            let mut instances = load_instances(profile, profile_explicit);
+            let rows = collect_rows(&mut instances, filter, args.dead);
+            let body = render_rows(&rows, args.acp, args.json, args.watch)?;
+            if args.watch {
+                print!("{}", watch_frame(body, args.json, tty));
+            } else {
+                print!("{body}");
+            }
+            Ok(args.watch)
+        },
+    )
+    .await
 }
 
 #[cfg(test)]
@@ -1285,6 +1307,41 @@ mod tests {
         let picked = pick_row(vec![tmux, acp], "acp-id-1", Substrate::Acp).unwrap();
         assert_eq!(picked.pid, Some(2));
         assert!(pick_row(vec![row("other", "", false)], "acp-id-1", Substrate::Acp).is_none());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn watch_loop_sees_a_shutdown_delivered_during_a_frame() {
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+        let mut tx = Some(tx);
+        let mut frames = 0;
+        let interval = std::time::Duration::from_secs(3600);
+        watch_loop(
+            interval,
+            async {
+                let _ = rx.await;
+            },
+            || {
+                frames += 1;
+                assert!(frames <= 2, "shutdown was lost");
+                if frames == 2 {
+                    let _ = tx.take().unwrap().send(());
+                }
+                Ok(true)
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(frames, 2);
+
+        let mut frames = 0;
+        let never = std::future::pending::<()>();
+        watch_loop(interval, never, || {
+            frames += 1;
+            Ok(false)
+        })
+        .await
+        .unwrap();
+        assert_eq!(frames, 1, "a false frame ends the loop without waiting");
     }
 
     #[test]
