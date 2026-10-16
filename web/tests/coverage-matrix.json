@@ -790,7 +790,8 @@
       "kind": "vitest",
       "risk": "high",
       "specs": ["src/hooks/usePushSubscription.test.ts", "src/lib/pushHealth.test.ts"],
-      "components": ["web/src/hooks/usePushSubscription.ts", "web/src/lib/pushHealth.ts"]
+      "components": ["web/src/hooks/usePushSubscription.ts", "web/src/lib/pushHealth.ts"],
+      "notes": "Deferred-operation tests cover an enable that settles after every consumer unmounted and remounted, and refresh registration POSTs (one or two overlapping) that must not land after disable."
     },
     {
       "id": "notifications.push-health-banner",
