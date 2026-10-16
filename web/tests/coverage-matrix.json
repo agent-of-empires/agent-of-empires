@@ -801,6 +801,13 @@
       "components": ["web/src/components/SettingsView.tsx", "web/src/hooks/useSettingsCommands.ts"]
     },
     {
+      "id": "settings.shared-credential",
+      "kind": "vitest",
+      "risk": "medium",
+      "specs": ["src/components/settings/__tests__/SharedCredentialSetting.test.tsx"],
+      "components": ["web/src/components/SettingsView.tsx", "web/src/components/settings/FormFields.tsx"]
+    },
+    {
       "id": "settings.session-auto-stop-idle",
       "kind": "vitest",
       "risk": "medium",
