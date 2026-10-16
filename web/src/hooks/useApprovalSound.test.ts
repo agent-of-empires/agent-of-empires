@@ -11,9 +11,9 @@ vi.mock("../lib/api", () => ({
   fetchSoundBlob: (...args: unknown[]) => fetchSoundBlob(...args),
 }));
 
-import { useApprovalSound, clearApprovalSoundCache } from "./useApprovalSound";
+import { useApprovalSound } from "./useApprovalSound";
 import { notifySettingsChanged } from "../lib/settingsEvents";
-import { approvalChimedRecently } from "../lib/soundPlayer";
+import { approvalChimedRecently, clearSoundCache } from "../lib/soundPlayer";
 
 const REPLAY_QUIET_MS = 1500;
 
@@ -47,7 +47,7 @@ describe("useApprovalSound", () => {
     vi.stubGlobal("Audio", FakeAudio);
     vi.spyOn(URL, "createObjectURL").mockReturnValue("blob:fake-url");
     vi.spyOn(URL, "revokeObjectURL").mockImplementation(() => {});
-    clearApprovalSoundCache();
+    clearSoundCache();
     vi.mocked(URL.revokeObjectURL).mockClear();
   });
 
@@ -139,12 +139,12 @@ describe("useApprovalSound", () => {
     expect(URL.createObjectURL).toHaveBeenCalledTimes(1);
   });
 
-  it("clearApprovalSoundCache revokes the blob URL and forces a refetch", async () => {
-    clearApprovalSoundCache();
+  it("clearSoundCache revokes the blob URL and forces a refetch", async () => {
+    clearSoundCache();
     expect(URL.revokeObjectURL).not.toHaveBeenCalled();
 
     const { rerender } = await walk(1);
-    act(() => clearApprovalSoundCache());
+    act(() => clearSoundCache());
     expect(URL.revokeObjectURL).toHaveBeenCalledWith("blob:fake-url");
     for (const count of [0, 1]) {
       rerender(count);

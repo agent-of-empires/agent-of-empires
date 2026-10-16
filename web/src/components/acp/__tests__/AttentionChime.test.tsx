@@ -21,13 +21,13 @@ vi.mock("../../../lib/api", () => ({
 }));
 
 import { AttentionChime } from "../AttentionChime";
-import { clearApprovalSoundCache } from "../../../hooks/useApprovalSound";
+import { clearSoundCache } from "../../../lib/soundPlayer";
 
 let audioCount = 0;
 
 beforeEach(() => {
   audioCount = 0;
-  clearApprovalSoundCache();
+  clearSoundCache();
   vi.useFakeTimers();
   // jsdom has no Audio / object-URL plumbing; stub the minimum the hook
   // touches so a successful play() path is observable by counting builds.

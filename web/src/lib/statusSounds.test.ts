@@ -92,6 +92,26 @@ describe("nextStatusSoundState", () => {
     expect(due.flat()).toEqual([]);
   });
 
+  it.each([
+    ["idle", "notify_on_idle"],
+    ["waiting", "notify_on_waiting"],
+    ["error", "notify_on_error"],
+  ] as const)("is silent for a session muted for %s", (event, flag) => {
+    const status = { idle: "Idle", waiting: "Waiting", error: "Error" }[event] as SessionStatus;
+    for (const [value, expected] of [
+      [false, []],
+      [null, [{ id: "a", event }]],
+      [true, [{ id: "a", event }]],
+    ] as const) {
+      const due = run(
+        [0, [at("a", "Running", { [flag]: value })]],
+        [1000, [at("a", status, { [flag]: value })]],
+        [9000, [at("a", status, { [flag]: value })]],
+      );
+      expect(due.flat(), `${flag}=${value}`).toEqual(expected);
+    }
+  });
+
   it("reports each due session separately", () => {
     const due = run(
       [0, [at("a", "Running"), at("b", "Running")]],

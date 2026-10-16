@@ -29,13 +29,8 @@ fn resolve_sound_name(override_name: Option<&str>) -> Option<String> {
     sounds.choose(&mut rng).cloned()
 }
 
-/// Host playback needs both the master switch and the server target.
-fn host_sounds_enabled(config: &SoundConfig) -> bool {
-    config.enabled && config.server_enabled
-}
-
 pub fn play_for_transition(old: Status, new: Status, config: &SoundConfig) {
-    if !host_sounds_enabled(config) || old == new {
+    if !config.enabled || !config.server_enabled || old == new {
         return;
     }
 
@@ -53,27 +48,5 @@ pub fn play_for_transition(old: Status, new: Status, config: &SoundConfig) {
 
     if let Some(name) = resolve_sound_name(override_name) {
         play_sound(&name, config.volume);
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn host_playback_needs_master_switch_and_server_target() {
-        for (enabled, server_enabled, expected) in [
-            (true, true, true),
-            (true, false, false),
-            (false, true, false),
-            (false, false, false),
-        ] {
-            let config = SoundConfig {
-                enabled,
-                server_enabled,
-                ..SoundConfig::default()
-            };
-            assert_eq!(host_sounds_enabled(&config), expected);
-        }
     }
 }

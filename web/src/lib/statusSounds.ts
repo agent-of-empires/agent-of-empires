@@ -24,9 +24,18 @@ export interface DueSound {
   event: StatusSoundEvent;
 }
 
+const MUTE_FLAG = {
+  waiting: "notify_on_waiting",
+  idle: "notify_on_idle",
+  error: "notify_on_error",
+} as const;
+
 function eventFor(s: SessionResponse): StatusSoundEvent | undefined {
   if (s.archived_at != null || s.snoozed_until != null || s.trashed_at != null) return undefined;
-  return EVENT_FOR_STATUS[s.status];
+  const event = EVENT_FOR_STATUS[s.status];
+  // A session muted for push notifications is muted here too.
+  if (event && s[MUTE_FLAG[event]] === false) return undefined;
+  return event;
 }
 
 /**

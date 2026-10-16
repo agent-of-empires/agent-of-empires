@@ -1,7 +1,5 @@
 import { useEffect, useState } from "react";
-import { clearSoundCache, noteApprovalChime, playSoundFor } from "../lib/soundPlayer";
-
-export { clearSoundCache as clearApprovalSoundCache };
+import { noteApprovalChime, playSoundFor } from "../lib/soundPlayer";
 
 // The WS replays stored events on connect; don't chime for approvals that were already pending.
 const REPLAY_QUIET_MS = 1500;
