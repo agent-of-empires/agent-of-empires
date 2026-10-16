@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import { useSidebarTriage } from "../../hooks/useSidebarTriage";
 import { renameSession } from "../../lib/api";
@@ -36,10 +36,20 @@ interface Props {
   handlers: Omit<SessionActionHandlers, TriageHandlers>;
 }
 
+/** A workspace groups sessions on one branch and its row acts on the first or all of them; a page names one session. */
+function scopeTo(workspaces: readonly Workspace[], sessionId: string): Workspace[] {
+  for (const ws of workspaces) {
+    const session = ws.sessions.find((s) => s.id === sessionId);
+    if (session) return [{ ...ws, sessions: [session] }];
+  }
+  return [];
+}
+
 /** The sidebar's session menu, opened for a plugin page. Stays mounted after closing so its pickers can finish. */
 export function PluginSessionMenu({ request, workspaces, readOnly, handlers }: Props) {
-  const triage = useSidebarTriage(workspaces);
-  const workspace = workspaces.find((ws) => ws.sessions.some((s) => s.id === request.sessionId));
+  const scoped = useMemo(() => scopeTo(workspaces, request.sessionId), [workspaces, request.sessionId]);
+  const triage = useSidebarTriage(scoped);
+  const [workspace] = scoped;
   if (!workspace) return <Unknown key={request.key} onClose={request.onClose} />;
   return (
     <HostMenu

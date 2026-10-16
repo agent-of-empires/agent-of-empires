@@ -114,6 +114,39 @@ describe("PluginSessionMenu", () => {
     );
   });
 
+  it("acts only on the requested session of a workspace that groups several", async () => {
+    const shared = [
+      makeWorkspace("w1", [
+        makeSession({ id: "s1", title: "First", status: "Running" }),
+        makeSession({ id: "s2", title: "Second", status: "Running" }),
+      ]),
+    ];
+    const show = () => {
+      cleanup();
+      const request = { key: 1, sessionId: "s2", x: 0, y: 0, items: [], onClose: vi.fn() };
+      render(<PluginSessionMenu request={request} workspaces={shared} readOnly={false} handlers={handlers} />);
+      arm();
+    };
+
+    show();
+    fireEvent.click(screen.getByTestId("sidebar-context-menu-stop"));
+    expect(handlers.onStop).toHaveBeenCalledExactlyOnceWith("s2");
+    show();
+    fireEvent.click(screen.getByTestId("sidebar-context-menu-delete"));
+    expect(handlers.onDelete).toHaveBeenCalledExactlyOnceWith(["s2"]);
+    show();
+    fireEvent.click(screen.getByTestId("sidebar-context-menu-rename"));
+    expect((screen.getByTestId("rename-modal-input") as HTMLInputElement).value).toBe("Second");
+    fireEvent.change(screen.getByTestId("rename-modal-input"), { target: { value: "Renamed" } });
+    show();
+    vi.useRealTimers();
+    fireEvent.click(screen.getByTestId("sidebar-context-menu-archive"));
+    await waitFor(() => expect(fetchSpy).toHaveBeenCalled());
+    expect(fetchSpy.mock.calls.map(([url]) => String(url))).toEqual([
+      expect.stringContaining("/api/sessions/s2/archive"),
+    ]);
+  });
+
   it("opens the group picker from More", () => {
     open();
     arm();
