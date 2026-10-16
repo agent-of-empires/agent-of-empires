@@ -969,7 +969,7 @@ pub async fn run(profile: &str, mut args: ServeArgs, serve_lock: Option<ServeLoc
     );
 
     if let Ok(path) = pid_file_path() {
-        let _lock = lock_serve_state().ok();
+        let _lock = lock_serve_state()?;
         let _ = std::fs::write(&path, std::process::id().to_string());
         tracing::debug!(target: "serve.lifecycle", path = %path.display(), pid = std::process::id(), "wrote pid file");
     }
