@@ -5,7 +5,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { PluginPage } from "../../../lib/api";
 import type { ResolvedTheme } from "../../../lib/theme";
 import { THEME_CHANGED_EVENT } from "../../../lib/theme";
-import type { ReactNode } from "react";
+import { useState, type ReactNode } from "react";
 import { PluginPageView } from "../PluginPageView";
 import type { SessionMenuRequest } from "../PluginSessionMenu";
 
@@ -17,7 +17,7 @@ const h = vi.hoisted(() => ({
   archive: vi.fn(),
   trash: vi.fn(),
   openSession: vi.fn(),
-  renderSession: vi.fn<(id: string) => ReactNode>(),
+  renderSession: vi.fn<(id: string) => { title: string; view: ReactNode } | null>(),
   renderSessionMenu: vi.fn<(request: SessionMenuRequest) => ReactNode>(),
 }));
 vi.mock("../../../hooks/useIsWideViewport", () => ({ useIsWideViewport: () => true }));
@@ -41,19 +41,26 @@ const board: PluginPage = {
   capabilities: ["session.read"],
 };
 
-const view = () =>
-  render(
+/** The dashboard's side: it keeps the split pane's selection, as App does in `?session=`. */
+function Host({ readOnly = false }: { readOnly?: boolean }) {
+  const [selected, setSelected] = useState<string | null>(null);
+  return (
     <PluginPageView
       pluginId="acme.kit"
       pageId="board"
       onBack={() => {}}
-      readOnly={false}
+      readOnly={readOnly}
       cityhall={false}
       theme={null}
-      renderSession={h.renderSession}
+      selectedSessionId={selected}
+      onSelectSession={setSelected}
+      renderSession={() => h.renderSession(selected!)}
       renderSessionMenu={h.renderSessionMenu}
-    />,
+    />
   );
+}
+
+const view = () => render(<Host />);
 
 const darkTheme = {
   name: "night",
@@ -94,7 +101,7 @@ beforeEach(() => {
   h.archive.mockReset();
   h.trash.mockReset();
   h.openSession.mockReset();
-  h.renderSession.mockReset().mockImplementation((id) => <p>session {id}</p>);
+  h.renderSession.mockReset().mockImplementation((id) => ({ title: `Title ${id}`, view: <p>session {id}</p> }));
   h.renderSessionMenu.mockReset().mockReturnValue(null);
   localStorage.clear();
 });
@@ -214,18 +221,7 @@ describe("PluginPageView", () => {
     const { frame, rerender } = await openFrame();
     fireEvent.load(frame);
     h.pages = [{ ...board, title: "Renamed" }];
-    rerender(
-      <PluginPageView
-        pluginId="acme.kit"
-        pageId="board"
-        onBack={() => {}}
-        readOnly={false}
-        cityhall={false}
-        theme={null}
-        renderSession={h.renderSession}
-        renderSessionMenu={h.renderSessionMenu}
-      />,
-    );
+    rerender(<Host />);
     expect(screen.getByTestId("plugin-page-frame")).toBe(frame);
     expect(h.mint).toHaveBeenCalledTimes(1);
   });
@@ -278,18 +274,7 @@ describe("PluginPageView", () => {
     const { send, rerender, nonce } = await openFrame();
     const { port, request } = fakePort();
     await send({ aoeBridge: 1, id: "r", method: "ready", params: { nonce } }, [port]);
-    rerender(
-      <PluginPageView
-        pluginId="acme.kit"
-        pageId="board"
-        onBack={() => {}}
-        readOnly={true}
-        cityhall={false}
-        theme={null}
-        renderSession={h.renderSession}
-        renderSessionMenu={h.renderSessionMenu}
-      />,
-    );
+    rerender(<Host readOnly />);
     await request({ aoeBridge: 1, id: 2, method: "action", params: { method: "move" } });
     expect(port.postMessage).toHaveBeenLastCalledWith(
       expect.objectContaining({ id: 2, error: expect.objectContaining({ code: "read_only" }) }),
@@ -308,19 +293,33 @@ describe("PluginPageView", () => {
     expect(screen.getByText("No session selected")).toBeTruthy();
     await request({ aoeBridge: 1, id: 3, method: "openSession", params: { id: "s" } });
     expect(screen.getByText("session s")).toBeTruthy();
+    expect(screen.getByTestId("plugin-page-split-title").textContent).toBe("Title s");
     expect(h.openSession).toHaveBeenCalledTimes(1);
     expect(pushes(port, "selection")).toEqual([{ sessionId: null }, { sessionId: "s" }]);
+
+    // Maximized, the page hides but stays mounted, and the divider goes.
+    const frame = screen.getByTestId("plugin-page-frame");
+    fireEvent.click(screen.getByRole("button", { name: "Maximize session" }));
+    expect(frame.parentElement!.className).toContain("hidden");
+    expect(screen.getByTestId("plugin-page-split-session").style.height).toBe("100%");
+    expect(screen.getByTestId("plugin-page-split-resize").hidden).toBe(true);
+    fireEvent.click(screen.getByRole("button", { name: "Restore split" }));
+    expect(screen.getByTestId("plugin-page-frame")).toBe(frame);
+    expect(frame.parentElement!.className).not.toContain("hidden");
 
     fireEvent.click(screen.getByRole("button", { name: "Open full" }));
     expect(h.openSession.mock.calls).toEqual([["s"], ["s"]]);
     fireEvent.click(screen.getByRole("button", { name: "Close session" }));
     expect(pushes(port, "selection").at(-1)).toEqual({ sessionId: null });
 
-    await request({ aoeBridge: 1, id: 4, method: "openSession", params: { id: "gone" } });
     h.renderSession.mockReturnValue(null);
-    fireEvent.click(screen.getByRole("button", { name: "Split view" }));
-    fireEvent.click(screen.getByRole("button", { name: "Split view" }));
+    await request({ aoeBridge: 1, id: 4, method: "openSession", params: { id: "gone" } });
     expect(screen.getByText("Session not found")).toBeTruthy();
+
+    // Leaving the split drops its session.
+    fireEvent.click(screen.getByRole("button", { name: "Split view" }));
+    fireEvent.click(screen.getByRole("button", { name: "Split view" }));
+    expect(screen.getByText("No session selected")).toBeTruthy();
   });
 
   it("saves the split height a divider drag settles on, clamped", async () => {

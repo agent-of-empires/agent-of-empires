@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState, type ReactNode } from "react";
-import { Maximize2, PanelBottom, X } from "lucide-react";
+import { ExternalLink, Maximize2, Minimize2, PanelBottom, X } from "lucide-react";
 import {
   fetchPluginUiState,
   fetchPluginSessions,
@@ -35,8 +35,11 @@ interface Props {
   readOnly: boolean;
   cityhall: boolean;
   theme: ResolvedTheme | null;
-  /** The session's main view for the split pane, or null when the dashboard does not know it. */
-  renderSession: (sessionId: string) => ReactNode;
+  /** The split pane's session, kept by the dashboard so its docks follow it. */
+  selectedSessionId: string | null;
+  onSelectSession: (id: string | null) => void;
+  /** The selected session's title and full view, or null when the dashboard does not know it. */
+  renderSession: () => { title: string; view: ReactNode } | null;
   /** The host session menu for `session.contextMenu`. */
   renderSessionMenu: (request: SessionMenuRequest) => ReactNode;
 }
@@ -124,6 +127,8 @@ export function PluginPageView({
   readOnly,
   cityhall,
   theme,
+  selectedSessionId,
+  onSelectSession,
   renderSession,
   renderSessionMenu,
 }: Props) {
@@ -146,13 +151,15 @@ export function PluginPageView({
   const wide = useIsWideViewport();
   const [splitPref, toggleSplit] = usePersistedFlag(`aoe-plugin-page-split:${pluginId}/${pageId}`, false);
   const split = wide && splitPref;
-  const [selected, setSelected] = useState<string | null>(null);
-  const shown = split ? selected : null;
+  const shown = split ? selectedSessionId : null;
+  // Keyed by session, so a pane closed while maximized opens the next session in the split.
+  const [maximizedId, setMaximizedId] = useState<string | null>(null);
+  const maximized = shown !== null && maximizedId === shown;
   const shownRef = useRef(shown);
   const openSessionRef = useRef<(id: string) => void>(requestOpenSession);
   useEffect(() => {
-    openSessionRef.current = split ? setSelected : requestOpenSession;
-  }, [split]);
+    openSessionRef.current = split ? onSelectSession : requestOpenSession;
+  }, [split, onSelectSession]);
   useEffect(() => {
     shownRef.current = shown;
     port.current?.postMessage(bridgePush("selection", { sessionId: shown }));
@@ -295,6 +302,7 @@ export function PluginPageView({
     body = (
       <SplitLayout
         split={split}
+        maximized={maximized}
         top={(dragging) => (
           <iframe
             key={attempt}
@@ -310,27 +318,13 @@ export function PluginPageView({
         )}
         bottom={
           shown ? (
-            <>
-              <div className="shrink-0 flex items-center justify-end gap-1 px-2 h-8 border-b border-surface-700/60 bg-surface-850">
-                <button
-                  onClick={() => requestOpenSession(shown)}
-                  className="w-6 h-6 flex items-center justify-center rounded cursor-pointer text-text-muted hover:text-text-primary hover:bg-surface-700/50"
-                  aria-label="Open full"
-                  title="Open full"
-                >
-                  <Maximize2 size={14} aria-hidden="true" />
-                </button>
-                <button
-                  onClick={() => setSelected(null)}
-                  className="w-6 h-6 flex items-center justify-center rounded cursor-pointer text-text-muted hover:text-text-primary hover:bg-surface-700/50"
-                  aria-label="Close session"
-                  title="Close session"
-                >
-                  <X size={14} aria-hidden="true" />
-                </button>
-              </div>
-              {renderSession(shown) ?? <Empty title="Session not found" detail="It may have been deleted." />}
-            </>
+            <SessionPane
+              session={renderSession()}
+              maximized={maximized}
+              onToggleMaximized={() => setMaximizedId(maximized ? null : shown)}
+              onOpenFull={() => requestOpenSession(shown)}
+              onClose={() => onSelectSession(null)}
+            />
           ) : (
             <Empty title="No session selected" detail="Open a session from the page to show it here." />
           )
@@ -348,7 +342,11 @@ export function PluginPageView({
         <span className="flex-1 text-xs font-mono text-text-bright truncate">{page?.title ?? pageId}</span>
         {wide && (
           <button
-            onClick={toggleSplit}
+            onClick={() => {
+              // Leaving the split drops its session, so the dashboard stops treating it as open.
+              if (split) onSelectSession(null);
+              toggleSplit();
+            }}
             className={`w-8 h-8 shrink-0 flex items-center justify-center rounded-md cursor-pointer transition-colors ${
               split
                 ? "text-text-primary bg-surface-700/60"
@@ -371,10 +369,13 @@ export function PluginPageView({
 /** The top pane stays at one tree position, so toggling the split never reloads the page frame. */
 function SplitLayout({
   split,
+  maximized,
   top,
   bottom,
 }: {
   split: boolean;
+  /** The session pane takes the whole height; the page stays mounted, hidden. */
+  maximized: boolean;
   top: (dragging: boolean) => ReactNode;
   bottom: ReactNode;
 }) {
@@ -426,12 +427,18 @@ function SplitLayout({
     };
   }, [dragging]);
 
+  // Terminals re-fit on resize.
+  useEffect(() => {
+    window.dispatchEvent(new Event("resize"));
+  }, [maximized]);
+
   return (
     <div ref={ref} className="flex-1 min-h-0 flex flex-col">
-      {top(dragging)}
+      <div className={maximized ? "hidden" : "flex-1 min-h-0 flex flex-col"}>{top(dragging)}</div>
       {split && (
         <>
           <div
+            hidden={maximized}
             role="separator"
             aria-orientation="horizontal"
             aria-label="Resize split"
@@ -454,7 +461,7 @@ function SplitLayout({
           />
           <div
             className="shrink-0 min-h-0 flex flex-col overflow-hidden"
-            style={{ height: `${percent}%` }}
+            style={{ height: maximized ? "100%" : `${percent}%` }}
             data-testid="plugin-page-split-session"
           >
             {bottom}
@@ -472,5 +479,53 @@ function Empty({ title, detail, children }: { title: string; detail: string; chi
       <p className="mt-1 text-[13px] text-text-muted">{detail}</p>
       {children}
     </div>
+  );
+}
+
+const PANE_BUTTON =
+  "w-6 h-6 shrink-0 flex items-center justify-center rounded cursor-pointer text-text-muted hover:text-text-primary hover:bg-surface-700/50";
+
+function SessionPane({
+  session,
+  maximized,
+  onToggleMaximized,
+  onOpenFull,
+  onClose,
+}: {
+  session: { title: string; view: ReactNode } | null;
+  maximized: boolean;
+  onToggleMaximized: () => void;
+  onOpenFull: () => void;
+  onClose: () => void;
+}) {
+  const MaxIcon = maximized ? Minimize2 : Maximize2;
+  const maxLabel = maximized ? "Restore split" : "Maximize session";
+  return (
+    <>
+      <div className="shrink-0 flex items-center gap-1 pl-3 pr-2 h-8 border-b border-surface-700/60 bg-surface-850">
+        <span
+          className="flex-1 min-w-0 truncate text-xs font-mono text-text-bright"
+          data-testid="plugin-page-split-title"
+        >
+          {session?.title}
+        </span>
+        <button
+          onClick={onToggleMaximized}
+          className={PANE_BUTTON}
+          aria-label={maxLabel}
+          aria-pressed={maximized}
+          title={maxLabel}
+        >
+          <MaxIcon size={14} aria-hidden="true" />
+        </button>
+        <button onClick={onOpenFull} className={PANE_BUTTON} aria-label="Open full" title="Open full">
+          <ExternalLink size={14} aria-hidden="true" />
+        </button>
+        <button onClick={onClose} className={PANE_BUTTON} aria-label="Close session" title="Close session">
+          <X size={14} aria-hidden="true" />
+        </button>
+      </div>
+      {session?.view ?? <Empty title="Session not found" detail="It may have been deleted." />}
+    </>
   );
 }

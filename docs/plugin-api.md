@@ -348,7 +348,7 @@ A request is `{ "aoeBridge": 1, "id", "method", "params"? }`, where `id` is a nu
 | `sessions.list` | none | `session.read` | The sessions, in the rows a worker's [`sessions.list`](#session-listing) returns |
 | `plugins.uiState` | none | `session.read` | The `GET /api/plugins/ui-state` body, including other plugins' entries |
 | `action` | `{ "method", "params"?, "sessionId"? }` | not read-only or CityHall | `{ "baselineRevision" }`; the call goes to this plugin's own worker, as a [pane action](#pane-actions) does |
-| `openSession` | `{ "id" }` | none | `null`; the dashboard navigates to the session, or shows it below the page when the user turned on split view |
+| `openSession` | `{ "id" }` | none | `null`; the dashboard navigates to the session, or shows it below the page, with its side panels, when the user turned on split view |
 | `session.archive` | `{ "id" }` | `session.read` and `session.write`, not read-only or CityHall | `null`; archives the session and stops its pane |
 | `session.trash` | `{ "id" }` | `session.read` and `session.write`, not read-only or CityHall | `null`; moves the session to the trash and stops its pane |
 | `session.contextMenu` | `{ "id", "x", "y", "items"? }` | `session.read` | The picked item's `id`, or `null`. Opens the sidebar's session menu at frame coordinates `x`, `y`, clamped to the frame; every action in it is the user's own and follows the dashboard's modes, and it ignores clicks for 300 ms after opening so a page cannot time one onto an item. `items`, at most 20 `{ "id", "label" }`, are appended to the menu under the page's title. Resolves when the menu closes |

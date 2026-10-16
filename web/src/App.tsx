@@ -357,9 +357,29 @@ function AppContent({
   const settingsRootMatch = useMatch("/settings");
   const settingsTabMatch = useMatch("/settings/:tab");
   const profilesMatch = useMatch("/profiles");
-  const activeSessionId = sessionMatch?.params.sessionId ?? null;
-  const showSettings = settingsRootMatch !== null || settingsTabMatch !== null;
   const pluginPageMatch = useMatch("/plugins/:pluginId/:pageId");
+  // A plugin page's split pane shows `?session=` as the routed session, docks and all.
+  const activeSessionId = sessionMatch?.params.sessionId ?? (pluginPageMatch ? searchParams.get("session") : null);
+  const selectPluginPageSession = useCallback(
+    (id: string | null) =>
+      setSearchParams(
+        (prev) => {
+          const next = new URLSearchParams(prev);
+          if (id) next.set("session", id);
+          else next.delete("session");
+          return next;
+        },
+        { replace: true },
+      ),
+    [setSearchParams],
+  );
+  // Off a removed session: back to the dashboard, or on a plugin page just out of its split pane.
+  const onPluginPage = pluginPageMatch !== null;
+  const leaveActiveSession = useCallback(
+    () => (onPluginPage ? selectPluginPageSession(null) : navigate("/")),
+    [onPluginPage, selectPluginPageSession, navigate],
+  );
+  const showSettings = settingsRootMatch !== null || settingsTabMatch !== null;
   // Settings and plugin pages take the full width, sidebar and session panels hidden.
   const fullPageView = showSettings || pluginPageMatch !== null;
   const settingsTab = settingsTabMatch?.params.tab ?? null;
@@ -1193,7 +1213,7 @@ function AppContent({
         clearDraft(id);
         clearStoredComments(id);
       },
-      navigateHome: () => navigate("/"),
+      navigateHome: leaveActiveSession,
       notify: toastBus.handler,
     });
   };
@@ -1240,7 +1260,7 @@ function AppContent({
               clearDraft(id);
               clearStoredComments(id);
             },
-            navigateHome: () => navigate("/"),
+            navigateHome: leaveActiveSession,
             notify,
           },
         );
@@ -1251,7 +1271,7 @@ function AppContent({
     toastBus.handler?.[anyFailed ? "error" : "info"](
       anyFailed ? "Some trashed sessions could not be deleted" : "Emptied trash",
     );
-  }, [trashedWorkspaces, activeSessionId, setSessionStatus, navigate]);
+  }, [trashedWorkspaces, activeSessionId, setSessionStatus, leaveActiveSession]);
 
   // Move-to-trash path (#2489): the safe default. Unlike permanent delete it
   // deliberately KEEPS the per-session acp cache, draft, and stored comments
@@ -1265,7 +1285,7 @@ function AppContent({
     setDeletingSessionIds(null);
     for (const id of ids) setSessionStatus(id, "Stopped");
     if (wasActive) {
-      navigate("/");
+      leaveActiveSession();
     }
 
     // The returned snapshot re-buckets each row into Trash immediately
@@ -1857,41 +1877,178 @@ function AppContent({
     [conversationHits, sessions, activeSessionId, handleSelectSession],
   );
 
-  /** A session's chat or terminal. Only the routed session (`primary`) owns the file viewer, agents pane and persistent terminals. */
-  const renderSessionView = (session: SessionResponse | undefined, sessionId: string, primary: boolean) =>
-    session?.view === "structured" ? (
-      <Suspense fallback={<AcpLoadingFallback />}>
-        <StructuredView
-          key={sessionId}
-          sessionId={sessionId}
-          acpWorkerState={session.acp_worker_state ?? "absent"}
-          rateLimitAutoResume={session.rate_limit_auto_resume}
-          tool={session.tool}
-          acpAgent={session.acp_agent ?? null}
-          acpProvider={session.acp_provider ?? null}
-          clearAliases={session.clear_aliases}
-          archivedAt={session.archived_at ?? null}
-          snoozedUntil={session.snoozed_until ?? null}
-          trashedAt={session.trashed_at ?? null}
-          onRestore={
-            session.trashed_at
-              ? () => handleRestoreSession(trashedWorkspaceRestoreIds(workspaces, sessionId))
-              : undefined
-          }
-          onOpenFileRef={primary ? handleOpenFileRef : undefined}
-          fileRefSession={primary ? session : undefined}
-          onOpenAgentsPane={primary ? openAgentsPane : undefined}
-          isSandboxed={session.is_sandboxed}
+  /** The routed session with its docks: the session route, or a plugin page's split pane. */
+  const renderSessionLayout = () => {
+    // Render a pane body by id. Passed to the docks as a callback (rather than
+    // building an array of {icon, body} objects here) so the per-session JSX is
+    // constructed inside the dock, not threaded through a prop object.
+    const renderPaneBody = (id: string): ReactNode => {
+      const plugin = pluginPaneById.get(id);
+      if (plugin) return <PluginPaneBody entry={plugin.entry} />;
+      if (id === "agents") {
+        return <BackgroundAgentsPanel sessionId={activeSessionId} />;
+      }
+      if (id === "files") {
+        // Remount on session switch so the selected file (and any in-flight
+        // read) resets instead of requesting the old path from the new
+        // session. See #3088 review.
+        return <FilesPane key={activeSessionId ?? "none"} sessionId={activeSessionId} />;
+      }
+      if (id === "diff") {
+        return (
+          <DiffPane
+            session={activeSession ?? null}
+            sessionId={activeSessionId}
+            files={diffFiles}
+            perRepoBases={perRepoBases}
+            warning={warning}
+            filesLoading={diffFilesLoading}
+            selectedFilePath={selectedFilePath}
+            selectedRepoName={selectedRepoName}
+            onSelectFile={handleSelectFile}
+            onDiffRefresh={refreshDiffFiles}
+            commentsEnabled={commentsEnabled}
+            commentsCount={diffComments.count}
+            commentsSendEnabled={commentSendEnabled}
+            commentsSendDisabledReason={commentSendDisabledReason}
+            onOpenSendDialog={() => setSendDialogOpen(true)}
+            onDiscardAllComments={diffComments.clearComments}
+          />
+        );
+      }
+      return (
+        <PairedShellPane
+          session={activeSession ?? null}
+          sessionId={activeSessionId}
+          terminalIndex={isTerminalTabId(id) ? terminalIndexOf(id) : 0}
         />
-      </Suspense>
-    ) : (
-      <TerminalSessionStack
-        activeSessionId={sessionId}
-        sessions={primary ? sessions.filter((s) => s.view !== "structured") : session ? [session] : []}
-        persistent={primary && webSettings.persistentTerminals}
-        maxPersistentTerminals={webSettings.maxPersistentTerminals}
-      />
+      );
+    };
+    return (
+      <div className="flex-1 flex flex-col min-h-0">
+        <PaneDndController groupsByDock={groupsByDock} descriptorFor={paneDescriptor} onPlaceTab={placeVisibleTab}>
+          <ContentSplit
+            collapsed={rightDockCollapsed}
+            onToggleCollapse={toggleRightDock}
+            left={
+              <div className="flex-1 flex flex-col min-h-0 overflow-hidden relative">
+                <div className={selectedFilePath ? "hidden" : "flex-1 flex flex-col min-h-0 overflow-hidden"}>
+                  {activeSession?.view === "structured" ? (
+                    <Suspense fallback={<AcpLoadingFallback />}>
+                      <StructuredView
+                        key={activeSessionId}
+                        sessionId={activeSessionId!}
+                        acpWorkerState={activeSession.acp_worker_state ?? "absent"}
+                        rateLimitAutoResume={activeSession.rate_limit_auto_resume}
+                        tool={activeSession.tool}
+                        acpAgent={activeSession.acp_agent ?? null}
+                        acpProvider={activeSession.acp_provider ?? null}
+                        clearAliases={activeSession.clear_aliases}
+                        archivedAt={activeSession.archived_at ?? null}
+                        snoozedUntil={activeSession.snoozed_until ?? null}
+                        trashedAt={activeSession.trashed_at ?? null}
+                        onRestore={
+                          activeSession.trashed_at
+                            ? () => handleRestoreSession(trashedWorkspaceRestoreIds(workspaces, activeSessionId!))
+                            : undefined
+                        }
+                        onOpenFileRef={handleOpenFileRef}
+                        fileRefSession={activeSession}
+                        onOpenAgentsPane={openAgentsPane}
+                        isSandboxed={activeSession.is_sandboxed}
+                      />
+                    </Suspense>
+                  ) : (
+                    <TerminalSessionStack
+                      activeSessionId={activeSessionId!}
+                      sessions={sessions.filter((session) => session.view !== "structured")}
+                      persistent={webSettings.persistentTerminals}
+                      maxPersistentTerminals={webSettings.maxPersistentTerminals}
+                    />
+                  )}
+                </div>
+
+                {selectedFilePath &&
+                  activeSessionId &&
+                  (selectedFileExternal ? (
+                    <FileContentViewer
+                      sessionId={activeSessionId}
+                      filePath={selectedFilePath}
+                      onBack={handleCloseFile}
+                    />
+                  ) : (
+                    <DiffFileViewer
+                      sessionId={activeSessionId}
+                      filePath={selectedFilePath}
+                      repoName={selectedRepoName}
+                      targetLine={selectedFileLine}
+                      revision={revision}
+                      onClose={handleCloseFile}
+                      commentsEnabled={commentsEnabled}
+                      commentsStore={diffComments}
+                    />
+                  ))}
+              </div>
+            }
+            right={
+              <div {...tourAnchor(TOUR_ANCHORS.rightPanel)} className="flex min-h-0 min-w-0 flex-1">
+                <DockGroups
+                  location="right"
+                  groups={rightGroups}
+                  descriptorFor={paneDescriptor}
+                  renderBody={renderPaneBody}
+                  onActivate={(id) => activateTab("right", id)}
+                  onMove={movePaneAny}
+                  onClose={closePaneAny}
+                  onNewTerminal={serverAbout?.read_only ? undefined : () => addTerminal("right")}
+                />
+              </div>
+            }
+          />
+          {bottomGroups.length > 0 && (
+            <BottomDock
+              groups={bottomGroups}
+              descriptorFor={paneDescriptor}
+              renderBody={renderPaneBody}
+              onActivate={(id) => activateTab("bottom", id)}
+              onMove={movePaneAny}
+              onClose={closePaneAny}
+              onNewTerminal={serverAbout?.read_only ? undefined : () => addTerminal("bottom")}
+            />
+          )}
+        </PaneDndController>
+        {sendDialogOpen && commentsEnabled && activeSessionId && (
+          <SendCommentsDialog
+            sessionId={activeSessionId}
+            delivery={activeSession?.view === "structured" ? "structured" : "terminal"}
+            comments={diffComments.comments}
+            isMultiRepo={commentsIsMultiRepo}
+            sendEnabled={commentSendEnabled}
+            sendDisabledReason={commentSendDisabledReason}
+            introDraft={diffComments.introDraft}
+            outroDraft={diffComments.outroDraft}
+            clearAfterSend={diffComments.clearAfterSend}
+            onChangeIntro={diffComments.setIntroDraft}
+            onChangeOutro={diffComments.setOutroDraft}
+            onChangeClearAfterSend={diffComments.setClearAfterSend}
+            onClose={() => setSendDialogOpen(false)}
+            onSent={() => {
+              if (diffComments.clearAfterSend) {
+                diffComments.clearComments();
+                diffComments.setIntroDraft("");
+                diffComments.setOutroDraft("");
+              }
+              setSendDialogOpen(false);
+              // Close the diff viewer to show the agent transcript or terminal
+              // after dispatching feedback. The file remains in the diff list.
+              setSelectedFile(null);
+              toastBus.handler?.info("Comments sent to agent");
+            }}
+          />
+        )}
+      </div>
     );
+  };
 
   const renderContent = () => {
     if (pluginPageMatch) {
@@ -1904,9 +2061,11 @@ function AppContent({
           readOnly={serverAbout?.read_only ?? false}
           cityhall={caps.cityhall}
           theme={resolvedTheme}
-          renderSession={(id) => {
-            const session = sessions.find((s) => s.id === id);
-            return session ? renderSessionView(session, id, false) : null;
+          selectedSessionId={activeSessionId}
+          onSelectSession={selectPluginPageSession}
+          renderSession={() => {
+            if (!sessionsLoaded) return { title: "", view: <MainPaneSkeleton /> };
+            return activeSession ? { title: activeSession.title, view: renderSessionLayout() } : null;
           }}
           renderSessionMenu={(request) => (
             <PluginSessionMenu
@@ -2029,143 +2188,7 @@ function AppContent({
       );
     }
 
-    // Render a pane body by id. Passed to the docks as a callback (rather than
-    // building an array of {icon, body} objects here) so the per-session JSX is
-    // constructed inside the dock, not threaded through a prop object.
-    const renderPaneBody = (id: string): ReactNode => {
-      const plugin = pluginPaneById.get(id);
-      if (plugin) return <PluginPaneBody entry={plugin.entry} />;
-      if (id === "agents") {
-        return <BackgroundAgentsPanel sessionId={activeSessionId} />;
-      }
-      if (id === "files") {
-        // Remount on session switch so the selected file (and any in-flight
-        // read) resets instead of requesting the old path from the new
-        // session. See #3088 review.
-        return <FilesPane key={activeSessionId ?? "none"} sessionId={activeSessionId} />;
-      }
-      if (id === "diff") {
-        return (
-          <DiffPane
-            session={activeSession ?? null}
-            sessionId={activeSessionId}
-            files={diffFiles}
-            perRepoBases={perRepoBases}
-            warning={warning}
-            filesLoading={diffFilesLoading}
-            selectedFilePath={selectedFilePath}
-            selectedRepoName={selectedRepoName}
-            onSelectFile={handleSelectFile}
-            onDiffRefresh={refreshDiffFiles}
-            commentsEnabled={commentsEnabled}
-            commentsCount={diffComments.count}
-            commentsSendEnabled={commentSendEnabled}
-            commentsSendDisabledReason={commentSendDisabledReason}
-            onOpenSendDialog={() => setSendDialogOpen(true)}
-            onDiscardAllComments={diffComments.clearComments}
-          />
-        );
-      }
-      return (
-        <PairedShellPane
-          session={activeSession ?? null}
-          sessionId={activeSessionId}
-          terminalIndex={isTerminalTabId(id) ? terminalIndexOf(id) : 0}
-        />
-      );
-    };
-    return (
-      <div className="flex-1 flex flex-col min-h-0">
-        <PaneDndController groupsByDock={groupsByDock} descriptorFor={paneDescriptor} onPlaceTab={placeVisibleTab}>
-          <ContentSplit
-            collapsed={rightDockCollapsed}
-            onToggleCollapse={toggleRightDock}
-            left={
-              <div className="flex-1 flex flex-col min-h-0 overflow-hidden relative">
-                <div className={selectedFilePath ? "hidden" : "flex-1 flex flex-col min-h-0 overflow-hidden"}>
-                  {renderSessionView(activeSession, activeSessionId!, true)}
-                </div>
-
-                {selectedFilePath &&
-                  activeSessionId &&
-                  (selectedFileExternal ? (
-                    <FileContentViewer
-                      sessionId={activeSessionId}
-                      filePath={selectedFilePath}
-                      onBack={handleCloseFile}
-                    />
-                  ) : (
-                    <DiffFileViewer
-                      sessionId={activeSessionId}
-                      filePath={selectedFilePath}
-                      repoName={selectedRepoName}
-                      targetLine={selectedFileLine}
-                      revision={revision}
-                      onClose={handleCloseFile}
-                      commentsEnabled={commentsEnabled}
-                      commentsStore={diffComments}
-                    />
-                  ))}
-              </div>
-            }
-            right={
-              <div {...tourAnchor(TOUR_ANCHORS.rightPanel)} className="flex min-h-0 min-w-0 flex-1">
-                <DockGroups
-                  location="right"
-                  groups={rightGroups}
-                  descriptorFor={paneDescriptor}
-                  renderBody={renderPaneBody}
-                  onActivate={(id) => activateTab("right", id)}
-                  onMove={movePaneAny}
-                  onClose={closePaneAny}
-                  onNewTerminal={serverAbout?.read_only ? undefined : () => addTerminal("right")}
-                />
-              </div>
-            }
-          />
-          {bottomGroups.length > 0 && (
-            <BottomDock
-              groups={bottomGroups}
-              descriptorFor={paneDescriptor}
-              renderBody={renderPaneBody}
-              onActivate={(id) => activateTab("bottom", id)}
-              onMove={movePaneAny}
-              onClose={closePaneAny}
-              onNewTerminal={serverAbout?.read_only ? undefined : () => addTerminal("bottom")}
-            />
-          )}
-        </PaneDndController>
-        {sendDialogOpen && commentsEnabled && activeSessionId && (
-          <SendCommentsDialog
-            sessionId={activeSessionId}
-            delivery={activeSession?.view === "structured" ? "structured" : "terminal"}
-            comments={diffComments.comments}
-            isMultiRepo={commentsIsMultiRepo}
-            sendEnabled={commentSendEnabled}
-            sendDisabledReason={commentSendDisabledReason}
-            introDraft={diffComments.introDraft}
-            outroDraft={diffComments.outroDraft}
-            clearAfterSend={diffComments.clearAfterSend}
-            onChangeIntro={diffComments.setIntroDraft}
-            onChangeOutro={diffComments.setOutroDraft}
-            onChangeClearAfterSend={diffComments.setClearAfterSend}
-            onClose={() => setSendDialogOpen(false)}
-            onSent={() => {
-              if (diffComments.clearAfterSend) {
-                diffComments.clearComments();
-                diffComments.setIntroDraft("");
-                diffComments.setOutroDraft("");
-              }
-              setSendDialogOpen(false);
-              // Close the diff viewer to show the agent transcript or terminal
-              // after dispatching feedback. The file remains in the diff list.
-              setSelectedFile(null);
-              toastBus.handler?.info("Comments sent to agent");
-            }}
-          />
-        )}
-      </div>
-    );
+    return renderSessionLayout();
   };
 
   // No root-height pin remains: every mobile terminal surface (agent,

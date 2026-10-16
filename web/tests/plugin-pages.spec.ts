@@ -291,9 +291,19 @@ test.describe("Plugin pages (#4460)", () => {
     await expect(page.getByTestId("plugin-page-split-session")).toContainText("No session selected");
 
     await frame.evaluate("call('openSession', { id: 'sess-a' })");
-    await expect(page.getByRole("button", { name: "Open full" })).toBeVisible();
-    await expect(page).toHaveURL("/plugins/acme.kit/board");
+    const pane = page.getByTestId("plugin-page-split-session");
+    await expect(pane.getByTestId("plugin-page-split-title")).toHaveText("Ethiopians");
+    // The pane is the session's full view, docks included.
+    await expect(pane.getByTestId("pane-tab-diff")).toBeVisible();
+    await expect(page).toHaveURL("/plugins/acme.kit/board?session=sess-a");
     await expect.poll(selections).toEqual([{ sessionId: null }, { sessionId: "sess-a" }]);
+
+    // Maximized, the page hides without reloading.
+    await page.getByRole("button", { name: "Maximize session" }).click();
+    await expect(page.getByTestId("plugin-page-frame")).toBeHidden();
+    await page.getByRole("button", { name: "Restore split" }).click();
+    await expect(page.getByTestId("plugin-page-frame")).toBeVisible();
+    expect(await frame.evaluate("pushes.filter((m) => m.event === 'selection').length")).toBe(2);
 
     await page.getByRole("button", { name: "Open full" }).click();
     await expect(page).toHaveURL("/session/sess-a");
