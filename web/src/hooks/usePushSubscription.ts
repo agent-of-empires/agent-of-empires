@@ -127,7 +127,7 @@ const listeners = new Set<() => void>();
 let busy = false;
 // Bumped by every refresh and action; writes from an older generation are dropped.
 let generation = 0;
-// A refresh's re-registration POST; actions wait for it so it cannot land after them.
+// Every pending refresh re-registration POST; actions wait for all so none lands after them.
 let registration: Promise<unknown> = Promise.resolve();
 
 function reset() {
@@ -185,7 +185,7 @@ async function refresh() {
     // Re-binds the sub to the current token (#3386) or restores one the server dropped.
     if (sub && perm === "granted" && (next === "server-forgot" || (next === "healthy" && !status.subscription))) {
       const post = postPush("subscribe", subscribeBody(sub)).catch(() => null);
-      registration = post;
+      registration = Promise.all([registration, post]);
       if ((await post)?.ok) next = "healthy";
     }
     if (perm === "denied") publish(gen, { health: next, state: { kind: "denied" } });

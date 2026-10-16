@@ -769,4 +769,52 @@ describe("usePushSubscription mutations that outlive their consumers", () => {
     expect(result.current.state).toEqual({ kind: "off" });
     expect(result.current.health).toBe("not-wanted");
   });
+
+  it("waits for every overlapping refresh registration before disable unsubscribes", async () => {
+    installFetch(statusWith(serverSub({ registered: false })));
+    const real = fetch;
+    const serverEndpoints = new Set<string>();
+    const releases: (() => void)[] = [];
+    let bothStarted!: () => void;
+    const started = new Promise<void>((r) => (bothStarted = r));
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = String(input);
+        const endpoint = init?.body ? (JSON.parse(String(init.body)) as { endpoint?: string }).endpoint : undefined;
+        if (url.endsWith("/api/push/subscribe")) {
+          await new Promise<void>((resolve) => {
+            releases.push(resolve);
+            if (releases.length === 2) bothStarted();
+          });
+        }
+        const resp = await real(input, init);
+        if (endpoint && url.endsWith("/api/push/subscribe")) serverEndpoints.add(endpoint);
+        if (endpoint && url.endsWith("/api/push/unsubscribe")) serverEndpoints.delete(endpoint);
+        return resp;
+      }),
+    );
+    const { result } = renderHook(() => usePushSubscription());
+    await act(async () => {
+      await new Promise((r) => setTimeout(r, 0));
+      while (releases.length < 1) await new Promise((r) => setTimeout(r, 0));
+      document.dispatchEvent(new Event("visibilitychange"));
+      await started;
+    });
+
+    let disabling!: Promise<void>;
+    await act(async () => {
+      disabling = result.current.disable();
+    });
+    await act(async () => {
+      releases[1]();
+      await new Promise((r) => setTimeout(r, 0));
+      releases[0]();
+      await disabling;
+    });
+
+    expect(currentSub).toBeNull();
+    expect([...serverEndpoints]).toEqual([]);
+    expect(result.current.state).toEqual({ kind: "off" });
+  });
 });
