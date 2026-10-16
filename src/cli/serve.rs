@@ -722,20 +722,41 @@ const SERVE_STATE_FILES: [&str; 4] = [
     "serve.launch",
 ];
 
-fn remove_stale_serve_state(pid_path: &std::path::Path) {
-    let _ = std::fs::remove_file(pid_path);
-    if let Ok(dir) = crate::session::get_app_dir() {
-        for name in SERVE_STATE_FILES {
-            let _ = std::fs::remove_file(dir.join(name));
-        }
-    }
+/// Publishers hold this from before spawning until the pid and launch files are
+/// written; cleanup holds it across its ownership check and deletion.
+fn lock_serve_state() -> Result<std::fs::File> {
+    use fs2::FileExt as _;
+    let path = crate::session::get_app_dir()?.join("serve.lock");
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&path)
+        .with_context(|| format!("opening {}", path.display()))?;
+    file.lock_exclusive()
+        .with_context(|| format!("locking {}", path.display()))?;
+    Ok(file)
 }
 
-async fn clear_serve_state() {
-    if let Ok(dir) = crate::session::get_app_dir() {
-        for name in SERVE_STATE_FILES {
-            let _ = tokio::fs::remove_file(dir.join(name)).await;
-        }
+/// Deletes the serve state only while `serve.pid` still names `expected_pid`.
+fn clear_serve_state(expected_pid: i32) {
+    let (Ok(_lock), Ok(pid_path), Ok(dir)) = (
+        lock_serve_state(),
+        pid_file_path(),
+        crate::session::get_app_dir(),
+    ) else {
+        return;
+    };
+    let recorded = std::fs::read_to_string(&pid_path)
+        .ok()
+        .and_then(|raw| parse_positive_pid(&raw));
+    if recorded != Some(expected_pid) {
+        return;
+    }
+    let _ = std::fs::remove_file(&pid_path);
+    for name in SERVE_STATE_FILES {
+        let _ = std::fs::remove_file(dir.join(name));
     }
 }
 
@@ -763,16 +784,10 @@ pub(crate) fn daemon_status() -> DaemonStatus {
     match classify_daemon_probe(probe) {
         DaemonProbeDisposition::VerifyIdentity => match inspect_daemon_process(pid) {
             DaemonProcessIdentity::Verified => DaemonStatus::Verified(pid as u32),
-            DaemonProcessIdentity::Foreign => {
-                remove_stale_serve_state(&path);
-                DaemonStatus::Absent
-            }
+            DaemonProcessIdentity::Foreign => DaemonStatus::Absent,
             DaemonProcessIdentity::Indeterminate => DaemonStatus::Unverified,
         },
-        DaemonProbeDisposition::Stale => {
-            remove_stale_serve_state(&path);
-            DaemonStatus::Absent
-        }
+        DaemonProbeDisposition::Stale => DaemonStatus::Absent,
         DaemonProbeDisposition::Indeterminate => DaemonStatus::Unverified,
     }
 }
@@ -938,7 +953,8 @@ pub async fn run(profile: &str, mut args: ServeArgs, serve_lock: Option<ServeLoc
     );
 
     if let Ok(path) = pid_file_path() {
-        let _ = tokio::fs::write(&path, std::process::id().to_string()).await;
+        let _lock = lock_serve_state().ok();
+        let _ = std::fs::write(&path, std::process::id().to_string());
         tracing::debug!(target: "serve.lifecycle", path = %path.display(), pid = std::process::id(), "wrote pid file");
     }
 
@@ -961,17 +977,7 @@ pub async fn run(profile: &str, mut args: ServeArgs, serve_lock: Option<ServeLoc
     })
     .await;
 
-    if let Ok(path) = pid_file_path() {
-        let is_ours = tokio::fs::read_to_string(&path)
-            .await
-            .ok()
-            .and_then(|s| s.trim().parse::<u32>().ok())
-            .is_some_and(|pid| pid == std::process::id());
-        if is_ours {
-            let _ = tokio::fs::remove_file(&path).await;
-            clear_serve_state().await;
-        }
-    }
+    clear_serve_state(std::process::id() as i32);
 
     result
 }
@@ -1067,6 +1073,7 @@ async fn fetch_cityhall_bundle(url: &str, token: &str) -> Result<String> {
 fn start_daemon(profile: &str, args: &ServeArgs) -> Result<()> {
     use std::process::{Command, Stdio};
 
+    let _state_lock = lock_serve_state()?;
     let exe = std::env::current_exe()?;
     let instance_id = uuid::Uuid::new_v4().to_string();
     let mut cmd = Command::new(exe);
@@ -1284,7 +1291,7 @@ pub(crate) async fn stop_daemon() -> Result<()> {
             }
         }
         DaemonProcessIdentity::Foreign => {
-            remove_stale_serve_state(&path);
+            clear_serve_state(pid);
             bail!(
                 "PID {} belongs to a different process (stale PID file). Cleaned up.",
                 pid
@@ -1320,13 +1327,11 @@ pub(crate) async fn stop_daemon() -> Result<()> {
                     _ => {}
                 }
             }
-            let _ = tokio::fs::remove_file(&path).await;
-            clear_serve_state().await;
+            clear_serve_state(pid);
             println!("Stopped aoe serve daemon (PID {})", pid);
         }
         Err(nix::errno::Errno::ESRCH) => {
-            tokio::fs::remove_file(&path).await?;
-            clear_serve_state().await;
+            clear_serve_state(pid);
             println!("Daemon was not running (stale PID file cleaned up)");
         }
         Err(e) => bail!("Failed to stop daemon (PID {}): {}", pid, e),
@@ -1821,6 +1826,76 @@ mod tests {
         launch.auth_mode = AuthMode::Token;
         launch.remote = false;
         assert!(!launch_needs_passphrase(&launch));
+    }
+
+    mod serve_state_cleanup {
+        use super::super::*;
+        use serial_test::serial;
+
+        fn publish(dir: &std::path::Path, pid: u32) {
+            std::fs::write(dir.join("serve.pid"), pid.to_string()).unwrap();
+            for name in SERVE_STATE_FILES {
+                std::fs::write(dir.join(name), format!("{name} of {pid}")).unwrap();
+            }
+        }
+
+        fn assert_published(dir: &std::path::Path, pid: u32) {
+            assert_eq!(
+                std::fs::read_to_string(dir.join("serve.pid")).unwrap(),
+                pid.to_string()
+            );
+            for name in SERVE_STATE_FILES {
+                assert_eq!(
+                    std::fs::read_to_string(dir.join(name)).unwrap(),
+                    format!("{name} of {pid}")
+                );
+            }
+        }
+
+        #[test]
+        #[serial]
+        fn status_probe_leaves_the_published_state_alone() {
+            let _guard = crate::session::test_support::isolate_app_dir();
+            let dir = crate::session::get_app_dir().unwrap();
+
+            let mut exited = std::process::Command::new("true").spawn().unwrap();
+            exited.wait().unwrap();
+            let mut foreign = std::process::Command::new("sleep")
+                .arg("60")
+                .spawn()
+                .unwrap();
+
+            for (name, pid) in [("exited", exited.id()), ("foreign", foreign.id())] {
+                publish(&dir, pid);
+                assert_eq!(daemon_status(), DaemonStatus::Absent, "{name}");
+                assert_published(&dir, pid);
+            }
+
+            let _ = foreign.kill();
+            let _ = foreign.wait();
+        }
+
+        #[test]
+        #[serial]
+        fn cleanup_deletes_only_the_state_it_inspected() {
+            let _guard = crate::session::test_support::isolate_app_dir();
+            let dir = crate::session::get_app_dir().unwrap();
+
+            publish(&dir, 4242);
+            clear_serve_state(4243);
+            assert_published(&dir, 4242);
+
+            clear_serve_state(4242);
+            for name in [
+                "serve.pid",
+                "serve.url",
+                "serve.mode",
+                "serve.passphrase",
+                "serve.launch",
+            ] {
+                assert!(!dir.join(name).exists(), "{name} should be removed");
+            }
+        }
     }
 
     mod profile_guard {
