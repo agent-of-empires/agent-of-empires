@@ -4,7 +4,6 @@ prompt_marker = ['^\s*╭[─-]*\s+\S']
 [markers.composer_top]
 line_regex = ['^\s*╭[─-]*\s+\S']
 
-
 [markers.selector_footer]
 line_regex = ['(?i)^\s*[│|].*(?:navigate|scroll|select|confirm|open).*(?:esc|⎋|cancel).*[│|]\s*$']
 max_depth = 12
@@ -252,6 +251,7 @@ not = [
   { region = "bottom_non_empty_lines(3)", contains_any = ["⟦esc⟧", "⟨esc⟩", "[esc]", "(esc to cancel)"] },
   { region = "bottom_non_empty_lines(3)", line_regex = ['(?i)^\s*retrying \d+/\d+ (?:in|now):'] },
 ]
+
 [[rules]]
 id = "selector_panel"
 state = "waiting"

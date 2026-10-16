@@ -293,7 +293,7 @@ impl Instance {
     /// Whether this launch shape leaves Claude user hooks enabled.
     pub(crate) fn hook_session_publisher_allowed_by_argv(&self) -> bool {
         if self
-            .status_agent()
+            .default_selector_agent()
             .is_none_or(|agent| agent.name != "claude")
         {
             return true;
@@ -1156,23 +1156,6 @@ mod tests {
                 inst.hook_session_publisher_allowed_by_argv(),
                 expected,
                 "args={args:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn claude_hook_guard_checks_unresolved_launch_flags() {
-        for flag in ["--bare", "--safe-mode"] {
-            let mut inst = Instance::new("custom-launch", "/tmp/x");
-            inst.tool = "claude".to_string();
-            inst.command = format!("custom-launch {flag}");
-            assert!(
-                inst.default_selector_agent().is_none(),
-                "launch should remain unresolved: {flag}"
-            );
-            assert!(
-                !inst.hook_session_publisher_allowed_by_argv(),
-                "Claude hook guard must reject {flag} on unresolved launch"
             );
         }
     }

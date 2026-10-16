@@ -8,11 +8,6 @@
 #   ./scripts/capture-fixtures.sh claude running aoe_myproject_abc12345
 #   ./scripts/capture-fixtures.sh claude running aoe_myproject_abc12345 "tool_call"
 #   ./scripts/capture-fixtures.sh opencode waiting_question aoe_task_def67890 "clarification"
-# OMP approval overlay:
-#   ./scripts/capture-fixtures.sh --write-omp-approval-overlay /tmp/omp-approval.yml [status-line-preset]
-# Optional presets: default, minimal, compact, full, nerd, ascii, custom.
-# Pass the generated file to OMP with --config; it does not edit OMP's persistent config.
-# Existing status-line settings are preserved when no preset is supplied.
 #
 # States: running, waiting_question, waiting_permission, idle
 #
@@ -40,8 +35,6 @@ tmux() {
 
 usage() {
     echo "Usage: $0 <tool> <state> <tmux_session> [description]"
-    echo "       $0 --write-omp-approval-overlay <output.yml> [status-line-preset]"
-    echo "       Status-line presets: default, minimal, compact, full, nerd, ascii, custom"
     echo ""
     echo "Arguments:"
     echo "  tool          Tool name: 'claude', 'claude_code', 'opencode', or 'omp'"
@@ -54,7 +47,6 @@ usage() {
     echo "  $0 opencode waiting_question aoe_task_def67890 clarification"
     echo "  $0 omp waiting_permission aoe_myproject_abc12345 tool_approval_custom"
     echo "  $0 omp waiting_permission aoe_myproject_abc12345 tool_approval_compact"
-    echo "  $0 --write-omp-approval-overlay /tmp/omp-approval.yml compact"
     echo ""
     echo "Output filename format: NNN_description.txt (e.g., 001_capture.txt, 002_tool_call.txt)"
     echo ""
@@ -66,50 +58,6 @@ usage() {
     echo "  5. Run 'cargo test --test integration status_detection' to verify detection works"
     exit 1
 }
-
-# Generate an ephemeral approval overlay before starting an OMP fixture session.
-if [[ "${1:-}" == "--write-omp-approval-overlay" ]]; then
-    if [[ $# -lt 2 || $# -gt 3 ]]; then
-        usage
-    fi
-    if [[ $# -eq 3 ]]; then
-        case "$3" in
-            default|minimal|compact|full|nerd|ascii|custom) ;;
-            *)
-                echo "Error: invalid OMP status-line preset '$3'."
-                echo "Valid presets: default, minimal, compact, full, nerd, ascii, custom"
-                exit 1
-                ;;
-        esac
-    fi
-    if [[ -L "$2" ]]; then
-        echo "Error: overlay output '$2' must not be a symlink."
-        exit 1
-    fi
-    set -o noclobber
-    if ! { exec 9>"$2"; }; then
-        echo "Error: overlay output '$2' already exists or cannot be created."
-        exit 1
-    fi
-    printf '%s\n' \
-        'tools:' \
-        '  approvalMode: always-ask' \
-        '  approval:' \
-        '    bash: prompt' >&9
-    if [[ $# -eq 3 ]]; then
-        printf '%s\n' 'statusLine:' "  preset: $3" >&9
-    fi
-    exec 9>&-
-    set +o noclobber
-    echo "Wrote temporary OMP approval overlay: $2"
-    if [[ $# -eq 3 ]]; then
-        echo "Status-line preset: $3"
-    else
-        echo "Status-line settings preserved."
-    fi
-    echo "Launch OMP with --config '$2'; remove the overlay after the capture."
-    exit 0
-fi
 
 # Validate arguments
 if [ $# -lt 3 ] || [ $# -gt 4 ]; then

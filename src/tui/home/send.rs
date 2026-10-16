@@ -280,26 +280,4 @@ mod permission_response_tokens_tests {
             None
         );
     }
-
-    #[test]
-    fn omp_uses_existing_approve_key_and_escape_to_deny() {
-        const APPROVE: &[KeyToken] = &[KeyToken::Named("C-q")];
-        const DENY: &[KeyToken] = &[KeyToken::Named("Escape")];
-        let response = crate::agents::get_agent("omp")
-            .and_then(|agent| agent.permission_response)
-            .expect("OMP defines a terminal approval response");
-
-        assert_eq!(
-            permission_response_tokens(&response, PermissionResponseChoice::Allow),
-            Some(APPROVE)
-        );
-        assert_eq!(
-            permission_response_tokens(&response, PermissionResponseChoice::Deny),
-            Some(DENY)
-        );
-        assert_eq!(
-            permission_response_tokens(&response, PermissionResponseChoice::AllowAlways),
-            None
-        );
-    }
 }

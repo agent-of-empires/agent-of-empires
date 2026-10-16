@@ -55,7 +55,6 @@
                 ./assets
                 ./docker
                 ./web/tests/helpers/fakeAcpAgent.mjs
-                ./scripts/capture-fixtures.sh
               ];
             };
             strictDeps = true;
