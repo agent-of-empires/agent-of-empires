@@ -275,7 +275,11 @@ List all sessions
 
 Show a substrate-agnostic runtime view of in-flight sessions (tmux agent panes and ACP structured-view workers), one row each
 
-**Usage:** `aoe ps [OPTIONS]`
+**Usage:** `aoe ps [OPTIONS] [SESSION]`
+
+###### **Arguments:**
+
+* `<SESSION>` — Show one session in detail, including dead runtimes (id, id prefix, title, or path)
 
 ###### **Options:**
 
@@ -283,6 +287,10 @@ Show a substrate-agnostic runtime view of in-flight sessions (tmux agent panes a
 * `--tmux` — Show only tmux-backed sessions
 * `--acp` — Show only ACP (structured-view) workers, with their ACP-specific columns (BUILD, MODEL, CWD, SOCKET); `--json` adds `substrate`, `state`, `age_secs`, and `model` to the keys the removed `aoe acp ps` emitted, but sorts by substrate, then title, then id rather than by `started_at`. Dead and orphaned workers are hidden unless `--dead` is also passed; the worker registry is global, so with an explicit `-p` the workers of other profiles surface as orphans (also hidden without `--dead`)
 * `--dead` — Include dead sessions and orphaned substrate entries (hidden by default)
+* `--watch` — Redraw continuously until Ctrl-C; with `--json`, print one compact JSON array per line instead of clearing the screen
+* `--interval <INTERVAL>` — Seconds between `--watch` redraws
+
+  Default value: `2`
 
 
 

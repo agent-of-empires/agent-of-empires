@@ -43,6 +43,25 @@ pub struct PsArgs {
     /// Include dead sessions and orphaned substrate entries (hidden by default)
     #[arg(long)]
     dead: bool,
+
+    /// Redraw continuously until Ctrl-C; with `--json`, print one compact
+    /// JSON array per line instead of clearing the screen
+    #[arg(long, conflicts_with = "session")]
+    watch: bool,
+
+    /// Seconds between `--watch` redraws
+    #[arg(
+        long,
+        requires = "watch",
+        default_value_t = 2,
+        value_parser = clap::value_parser!(u64).range(1..)
+    )]
+    interval: u64,
+
+    /// Show one session in detail, including dead runtimes (id, id prefix,
+    /// title, or path)
+    #[arg(conflicts_with_all = ["tmux", "acp"])]
+    session: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -473,11 +492,11 @@ fn load_instances(profile: &str, profile_explicit: bool) -> Vec<Instance> {
     out
 }
 
-fn is_agent_session_name(name: &str) -> bool {
+/// The `@aoe_kind` marker disambiguates an agent titled `term Foo` from the
+/// terminal of `Foo`; unmarked legacy sessions fall back to the name shape.
+fn is_agent_session_name(name: &str, marker: Option<&str>) -> bool {
     name.starts_with(crate::tmux::SESSION_PREFIX)
-        && !name.starts_with(crate::tmux::TERMINAL_PREFIX)
-        && !name.starts_with(crate::tmux::CONTAINER_TERMINAL_PREFIX)
-        && !name.starts_with(crate::tmux::TOOL_PREFIX)
+        && crate::tmux::SessionKind::of(name, marker) == Some(crate::tmux::SessionKind::Agent)
 }
 
 fn collect_tmux_states(instances: &mut [Instance]) -> Vec<TmuxState> {
@@ -502,6 +521,12 @@ fn collect_tmux_states(instances: &mut [Instance]) -> Vec<TmuxState> {
             return Vec::new();
         }
     };
+
+    let live = crate::tmux::probe_live_sessions();
+    let markers: std::collections::HashMap<&str, Option<&str>> = live
+        .as_ref()
+        .map(|live| crate::tmux::marked_names(live).collect())
+        .unwrap_or_default();
 
     let mut states = Vec::new();
     let mut known: HashSet<String> = HashSet::new();
@@ -534,7 +559,8 @@ fn collect_tmux_states(instances: &mut [Instance]) -> Vec<TmuxState> {
     }
 
     for (name, m) in &meta {
-        if known.contains(name) || !is_agent_session_name(name) {
+        let marker = markers.get(name.as_str()).copied().flatten();
+        if known.contains(name) || !is_agent_session_name(name, marker) {
             continue;
         }
         states.push(TmuxState {
@@ -585,23 +611,16 @@ fn collect_acp_states() -> Vec<AcpState> {
         .collect()
 }
 
-#[tracing::instrument(target = "cli.ps", skip_all, fields(profile = %profile))]
-pub async fn run(profile: &str, profile_explicit: bool, args: PsArgs) -> Result<()> {
-    let filter = if args.tmux {
-        SubstrateFilter::Tmux
-    } else if args.acp {
-        SubstrateFilter::Acp
-    } else {
-        SubstrateFilter::All
-    };
-
-    let mut instances = load_instances(profile, profile_explicit);
+fn collect_rows(
+    instances: &mut [Instance],
+    filter: SubstrateFilter,
+    include_dead: bool,
+) -> Vec<Row> {
     let now = now_secs();
-
     let tmux_states = if matches!(filter, SubstrateFilter::Acp) {
         Vec::new()
     } else {
-        collect_tmux_states(&mut instances)
+        collect_tmux_states(instances)
     };
     let acp_states = if matches!(filter, SubstrateFilter::Tmux) {
         Vec::new()
@@ -618,32 +637,199 @@ pub async fn run(profile: &str, profile_explicit: bool, args: PsArgs) -> Result<
         })
         .collect();
 
-    let rows = merge_rows(
+    merge_rows(
         &instance_rows,
         &tmux_states,
         acp_states,
         now,
         filter,
-        args.dead,
-    );
+        include_dead,
+    )
+}
 
-    if args.json {
-        if args.acp {
-            super::output::print_json(&acp_rows_json(&rows))?;
-            return Ok(());
-        }
-        super::output::print_json(&rows_json(&rows))?;
-    } else if rows.is_empty() {
-        println!("No running sessions.");
+fn render_rows(rows: &[Row], acp: bool, json: bool, compact: bool) -> Result<String> {
+    if json {
+        let mut out = if acp {
+            to_json(&acp_rows_json(rows), compact)?
+        } else {
+            to_json(&rows_json(rows), compact)?
+        };
+        out.push('\n');
+        return Ok(out);
+    }
+    Ok(if rows.is_empty() {
+        "No running sessions.\n".to_string()
+    } else if acp {
+        render_table_acp(rows)
     } else {
-        if args.acp {
-            print!("{}", render_table_acp(&rows));
-            return Ok(());
+        render_table(rows)
+    })
+}
+
+fn to_json<T: Serialize>(value: &T, compact: bool) -> Result<String> {
+    Ok(if compact {
+        serde_json::to_string(value)?
+    } else {
+        serde_json::to_string_pretty(value)?
+    })
+}
+
+fn watch_frame(body: String, json: bool, tty: bool) -> String {
+    if tty && !json {
+        format!("\x1b[2J\x1b[H{body}")
+    } else {
+        body
+    }
+}
+
+#[derive(Serialize)]
+struct AcpDetailJson {
+    build_version: String,
+    build_stale: bool,
+    socket: std::path::PathBuf,
+    cwd: std::path::PathBuf,
+    model: Option<String>,
+    alive: bool,
+    started_at: u64,
+    last_attached_at: Option<u64>,
+    detached_at: Option<u64>,
+}
+
+#[derive(Serialize)]
+struct DetailJson {
+    session: String,
+    title: String,
+    substrate: &'static str,
+    state: &'static str,
+    pid: Option<u32>,
+    age_secs: Option<u64>,
+    agent: String,
+    #[serde(flatten)]
+    acp: Option<AcpDetailJson>,
+}
+
+fn detail_json(row: &Row) -> DetailJson {
+    DetailJson {
+        session: row.id.clone(),
+        title: row.title.clone(),
+        substrate: row.substrate.as_str(),
+        state: row.state,
+        pid: row.pid,
+        age_secs: row.age_secs,
+        agent: row.agent.clone(),
+        acp: row.acp_extra.as_ref().map(|e| AcpDetailJson {
+            build_version: e.build_version.clone(),
+            build_stale: e.build_stale,
+            socket: e.socket.clone(),
+            cwd: e.cwd.clone(),
+            model: e.model.clone(),
+            alive: e.alive,
+            started_at: row.started_at,
+            last_attached_at: e.last_attached_at,
+            detached_at: e.detached_at,
+        }),
+    }
+}
+
+fn render_detail(row: &Row) -> String {
+    use std::fmt::Write;
+    let dash = |v: Option<String>| v.unwrap_or_else(|| "-".to_string());
+    let mut out = String::new();
+    let mut line = |key: &str, value: String| {
+        let _ = writeln!(out, "{key:<14}{value}");
+    };
+    line("Session:", row.id.clone());
+    line("Title:", row.title.clone());
+    line("Substrate:", row.substrate.as_str().to_string());
+    line("State:", row.state.to_string());
+    line("PID:", dash(row.pid.map(|p| p.to_string())));
+    line("Age:", format_age(row.age_secs));
+    line(
+        "Agent:",
+        dash(Some(row.agent.clone()).filter(|a| !a.is_empty())),
+    );
+    if let Some(e) = &row.acp_extra {
+        line("Build:", render_build_cell(&e.build_version, e.build_stale));
+        line("Model:", dash(e.model.clone()));
+        line("CWD:", e.cwd.display().to_string());
+        line("Socket:", e.socket.display().to_string());
+        line("Alive:", e.alive.to_string());
+        line(
+            "Last attached:",
+            dash(e.last_attached_at.map(|t| t.to_string())),
+        );
+        line("Detached:", dash(e.detached_at.map(|t| t.to_string())));
+    }
+    out
+}
+
+/// The row for `identifier`, or a dead placeholder when the instance resolves
+/// but no live runtime does.
+fn detail_row(profile: &str, profile_explicit: bool, identifier: &str) -> Result<Row> {
+    let mut instances = load_instances(profile, profile_explicit);
+    let inst = super::resolve_session(identifier, &instances)?;
+    let (id, title, structured, tool) = (
+        inst.id.clone(),
+        inst.title.clone(),
+        inst.is_structured(),
+        inst.tool.clone(),
+    );
+    let created = inst.created_at.timestamp().max(0) as u64;
+
+    let rows = collect_rows(&mut instances, SubstrateFilter::All, true);
+    Ok(rows.into_iter().find(|r| r.id == id).unwrap_or(Row {
+        id,
+        title,
+        substrate: if structured {
+            Substrate::Acp
+        } else {
+            Substrate::Tmux
+        },
+        state: "dead",
+        pid: None,
+        age_secs: Some(now_secs().saturating_sub(created)),
+        agent: tool,
+        is_orphan: false,
+        acp_extra: None,
+        started_at: 0,
+    }))
+}
+
+#[tracing::instrument(target = "cli.ps", skip_all, fields(profile = %profile))]
+pub async fn run(profile: &str, profile_explicit: bool, args: PsArgs) -> Result<()> {
+    if let Some(identifier) = &args.session {
+        let row = detail_row(profile, profile_explicit, identifier)?;
+        if args.json {
+            super::output::print_json(&detail_json(&row))?;
+        } else {
+            print!("{}", render_detail(&row));
         }
-        print!("{}", render_table(&rows));
+        return Ok(());
     }
 
-    Ok(())
+    let filter = if args.tmux {
+        SubstrateFilter::Tmux
+    } else if args.acp {
+        SubstrateFilter::Acp
+    } else {
+        SubstrateFilter::All
+    };
+
+    let tty = std::io::IsTerminal::is_terminal(&std::io::stdout());
+    loop {
+        let mut instances = load_instances(profile, profile_explicit);
+        let rows = collect_rows(&mut instances, filter, args.dead);
+        let body = render_rows(&rows, args.acp, args.json, args.watch)?;
+        if !args.watch {
+            print!("{body}");
+            return Ok(());
+        }
+        print!("{}", watch_frame(body, args.json, tty));
+        tokio::select! {
+            _ = tokio::time::sleep(std::time::Duration::from_secs(args.interval)) => {}
+            _ = tokio::signal::ctrl_c() => return Ok(()),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1026,6 +1212,98 @@ mod tests {
         assert_eq!(obj["substrate"], "acp");
         assert!(obj["last_attached_at"].is_null());
         assert!(obj["detached_at"].is_null());
+    }
+
+    #[test]
+    fn agent_session_name_uses_marker_then_name_shape() {
+        use crate::tmux::{SESSION_PREFIX, TERMINAL_PREFIX, TOOL_PREFIX};
+        let cases = [
+            (format!("{SESSION_PREFIX}Foo_abcd1234"), None, true),
+            (
+                format!("{TERMINAL_PREFIX}Foo_abcd1234"),
+                Some("agent"),
+                true,
+            ),
+            (
+                format!("{TERMINAL_PREFIX}Foo_abcd1234"),
+                Some("term"),
+                false,
+            ),
+            (format!("{TERMINAL_PREFIX}Foo_abcd1234"), None, false),
+            (format!("{TOOL_PREFIX}lazygit_Foo_abcd1234"), None, false),
+            (format!("{TOOL_PREFIX}Foo_abcd1234"), Some("agent"), true),
+            ("other_Foo_abcd1234".to_string(), Some("agent"), false),
+        ];
+        for (name, marker, expected) in cases {
+            assert_eq!(
+                is_agent_session_name(&name, marker),
+                expected,
+                "{name} {marker:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn detail_renders_text_and_json_with_acp_extras_only_for_acp() {
+        let instances = vec![inst("abcd1234ef567890", "T"), inst("acp-id-1", "A")];
+        let tmux = vec![tmux_state("aoe_T_abcd1234", Status::Running)];
+        let acp = vec![acp_state("acp-id-1", "attached", 0)];
+        let rows = merge_rows(&instances, &tmux, acp, 2000, SubstrateFilter::All, true);
+
+        let text = render_detail(&rows[0]);
+        assert!(text.contains("Session:") && text.contains("abcd1234ef567890"));
+        assert!(!text.contains("Socket:"), "tmux detail has no ACP fields");
+        let v = serde_json::to_value(detail_json(&rows[0])).unwrap();
+        assert!(v.get("socket").is_none());
+        assert_eq!(v["session"], "abcd1234ef567890");
+
+        let text = render_detail(&rows[1]);
+        for cell in ["Socket:", "/tmp/w.sock", "claude-opus-4-7", "1.9.5+gabc123"] {
+            assert!(text.contains(cell), "missing {cell}: {text}");
+        }
+        let v = serde_json::to_value(detail_json(&rows[1])).unwrap();
+        assert_eq!(v["socket"], "/tmp/w.sock");
+        assert_eq!(v["substrate"], "acp");
+    }
+
+    #[test]
+    fn watch_frame_clears_only_table_output_on_a_tty() {
+        assert!(watch_frame("x".into(), false, true).starts_with("\x1b[2J\x1b[H"));
+        assert_eq!(watch_frame("x".into(), false, false), "x");
+        assert_eq!(watch_frame("[]\n".into(), true, true), "[]\n");
+    }
+
+    #[test]
+    fn render_rows_json_is_compact_only_when_asked() {
+        let rows = vec![row("abcd1234ef567890", "T", false)];
+        let compact = render_rows(&rows, false, true, true).unwrap();
+        assert_eq!(compact.trim_end().lines().count(), 1);
+        let pretty = render_rows(&rows, false, true, false).unwrap();
+        assert!(pretty.lines().count() > 1);
+        assert_eq!(
+            render_rows(&[], false, false, false).unwrap(),
+            "No running sessions.\n"
+        );
+    }
+
+    #[test]
+    fn clap_validates_watch_interval_and_detail_conflicts() {
+        use clap::Parser;
+        #[derive(Parser)]
+        struct W {
+            #[command(flatten)]
+            args: PsArgs,
+        }
+        let ok =
+            |a: &[&str]| W::try_parse_from(std::iter::once("ps").chain(a.iter().copied())).is_ok();
+        assert!(ok(&[]));
+        assert!(ok(&["--watch", "--interval", "5", "--json"]));
+        assert!(ok(&["abcd"]));
+        assert!(!ok(&["--interval", "5"]), "interval needs --watch");
+        assert!(!ok(&["--watch", "--interval", "0"]));
+        assert!(!ok(&["--watch", "abcd"]));
+        assert!(!ok(&["--tmux", "abcd"]));
+        assert!(!ok(&["--acp", "abcd"]));
     }
 
     #[test]
