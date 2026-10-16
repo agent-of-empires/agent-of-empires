@@ -77,7 +77,7 @@ Except for [managed native Prime](../structured-view.md#prime-runtime-ownership)
 | OpenCode with an unlisted release/build identity | May be recorded; explicit resume refused | Refused | Use an identity listed in [OpenCode](#supported-managed-contexts) for explicit operations; `Default` restarts degrade with the recorded ID, without guessing a table from its presence or from help |
 | Sandboxed OpenCode fork, or a current-generation wrapper-mediated store fork | n/a | Refused | Disable the sandbox; for a current-generation store fork, launch `opencode` directly |
 | Legacy-generation OpenCode with `session.opencode_preassign_session_id` | n/a | n/a | Preassignment stays disabled: generation alone cannot establish whether the build exposes the `/api` session-create endpoint |
-| Prime Agent fork on a host terminal | n/a | Refused | Run Prime in a sandbox: it mints the child id, and only the sandbox captures it. The fork launches `prime-agent --fork <parent-id>` |
+| Prime Agent fork on a host terminal | n/a | Refused | Run Prime in a sandbox: it mints the child id, and only the sandbox captures it. The fork launches `prime-agent --fork <parent-id>` after AoE copies the parent's persisted transcript into the child's own sandbox store; a parent whose transcript cannot be found there refuses the fork |
 | Any agent in an Apple Container sandbox | Refused | Refused | Set `sandbox.container_runtime` to Docker or Podman, per [Configuration](sandbox.md#configuration) |
 | An opaque wrapper missing `session.agent_execution_as` or `session.agent_config_dir` | Refused | Refused | Declare the wrapper contract, per [Execution identity and wrappers](#execution-identity-and-wrappers) |
 
