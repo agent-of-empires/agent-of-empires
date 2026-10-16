@@ -59,16 +59,19 @@ async function step(sessions: SessionResponse[]) {
 }
 
 /**
- * Proves the sound pipeline had time to run: enables sounds, then walks a fresh session into Idle and waits for its
- * sound. Anything else in `played` would have come from the case under test.
+ * Proves the sound pipeline had time to run: enables sounds with a distinct probe sound, walks a fresh session into
+ * Idle and waits for the probe to load. Any sound the case under test wrongly played would have fetched its own file
+ * first, so the fetched names must be exactly the probe.
  */
 async function expectOnlyProbeSounds(base: SessionResponse[]) {
-  fetchSettings.mockResolvedValue({ sound: ENABLED });
+  fetchSettings.mockResolvedValue({ sound: { ...ENABLED, on_idle: "probe" } });
   act(() => notifySettingsChanged());
   await step([...base, at("probe", "Running")]);
   await step([...base, at("probe", "Idle")]);
   await step([...base, at("probe", "Idle")]);
+  await vi.waitFor(() => expect(fetchSoundBlob).toHaveBeenCalledWith("probe"));
   await vi.waitFor(() => expect(played).toHaveLength(1));
+  expect(fetchSoundBlob.mock.calls.map(([name]) => name)).toEqual(["probe"]);
 }
 
 describe("useStatusSounds", () => {
