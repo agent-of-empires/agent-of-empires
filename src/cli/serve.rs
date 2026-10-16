@@ -722,11 +722,12 @@ const SERVE_STATE_FILES: [&str; 4] = [
     "serve.launch",
 ];
 
-/// Publishers hold this from before spawning until the pid and launch files are
-/// written; cleanup holds it across its ownership check and deletion.
+/// Separate from the lifetime lock a running server holds, which this state is
+/// published and cleared under. Publishers hold it from before spawning until the pid
+/// and launch files are written; cleanup holds it across its ownership check and deletion.
 fn lock_serve_state() -> Result<std::fs::File> {
     use fs2::FileExt as _;
-    let path = crate::session::get_app_dir()?.join("serve.lock");
+    let path = crate::session::get_app_dir()?.join("serve.state.lock");
     let file = std::fs::OpenOptions::new()
         .read(true)
         .write(true)
@@ -1956,6 +1957,30 @@ mod tests {
                     "{name}: discovery"
                 );
             }
+        }
+
+        #[test]
+        #[serial]
+        fn state_publication_and_cleanup_run_under_the_server_lifetime_lock() {
+            let _guard = crate::session::test_support::isolate_app_dir();
+            let dir = crate::session::get_app_dir().unwrap();
+            let lifetime = try_lock_serve().unwrap().expect("lifetime lock is free");
+
+            let (done_tx, done_rx) = std::sync::mpsc::channel();
+            let worker = std::thread::spawn(move || {
+                {
+                    let _lock = lock_serve_state().unwrap();
+                    publish(&dir, 4242);
+                }
+                let cleared = clear_serve_state(4242);
+                done_tx.send(cleared).unwrap();
+            });
+            let cleared = done_rx
+                .recv_timeout(std::time::Duration::from_secs(10))
+                .expect("state lock must not wait on the lifetime lock");
+            assert!(cleared);
+            worker.join().unwrap();
+            drop(lifetime);
         }
 
         #[test]
