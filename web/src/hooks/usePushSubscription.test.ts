@@ -687,3 +687,86 @@ describe("usePushSubscription shared state and stale writes", () => {
     expect(second.result.current.health).toBe("healthy");
   });
 });
+
+describe("usePushSubscription mutations that outlive their consumers", () => {
+  const WANTED = "aoe.push.wanted";
+
+  it("finishes enable and reconciles a consumer remounted while it was in flight", async () => {
+    noSubscription();
+    const first = await mountAndSettle();
+    let finishSubscribe!: () => void;
+    const subscribeStarted = new Promise<void>((started) => {
+      subscribeImpl = () =>
+        new Promise((resolve) => {
+          started();
+          finishSubscribe = () => resolve((currentSub = makeSubscription()));
+        });
+    });
+    let enabling!: Promise<void>;
+    await act(async () => {
+      enabling = first.result.current.enable();
+      await subscribeStarted;
+    });
+    first.unmount();
+    const second = await mountAndSettle();
+    expect(second.result.current.state).toEqual({ kind: "subscribing" });
+
+    await act(async () => {
+      finishSubscribe();
+      await enabling;
+    });
+
+    expect(second.result.current.state).toEqual({ kind: "enabled" });
+    expect(second.result.current.health).toBe("healthy");
+    expect(currentSub).not.toBeNull();
+    expect(localStorage.getItem(WANTED)).toBe("1");
+    expect(called("/api/push/subscribe")).toBe(true);
+  });
+
+  it("does not let a refresh registration land after disable removed the subscription", async () => {
+    installFetch(statusWith(serverSub({ registered: false })));
+    const real = fetch;
+    const serverEndpoints = new Set<string>();
+    let release!: () => void;
+    const released = new Promise<void>((r) => (release = r));
+    let postStarted!: () => void;
+    const started = new Promise<void>((r) => (postStarted = r));
+    let held = false;
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = String(input);
+        const endpoint = init?.body ? (JSON.parse(String(init.body)) as { endpoint?: string }).endpoint : undefined;
+        if (url.endsWith("/api/push/subscribe") && !held) {
+          held = true;
+          postStarted();
+          await released;
+        }
+        const resp = await real(input, init);
+        if (endpoint && url.endsWith("/api/push/subscribe")) serverEndpoints.add(endpoint);
+        if (endpoint && url.endsWith("/api/push/unsubscribe")) serverEndpoints.delete(endpoint);
+        return resp;
+      }),
+    );
+    const { result } = renderHook(() => usePushSubscription());
+    await act(async () => {
+      await new Promise((r) => setTimeout(r, 0));
+      await started;
+    });
+
+    let disabling!: Promise<void>;
+    await act(async () => {
+      disabling = result.current.disable();
+    });
+    await act(async () => {
+      release();
+      await disabling;
+    });
+
+    expect(currentSub).toBeNull();
+    expect([...serverEndpoints]).toEqual([]);
+    expect(localStorage.getItem(WANTED)).toBeNull();
+    expect(result.current.state).toEqual({ kind: "off" });
+    expect(result.current.health).toBe("not-wanted");
+  });
+});
