@@ -314,6 +314,7 @@ export function useTranscriptScroll({
             remountedElement = next;
             remountedOffset = anchor.offset;
             remountedAnchor = anchor;
+            break;
           }
         }
         if (remountedElement === null) {
@@ -324,7 +325,7 @@ export function useTranscriptScroll({
         }
       }
       pendingFoldAnchorMissRef.current = false;
-      if (folding ? anchorIntentRef.current : wasAtBottomRef.current) {
+      if (!folding && wasAtBottomRef.current) {
         vp.scrollTop = vp.scrollHeight;
         resample();
         return;
