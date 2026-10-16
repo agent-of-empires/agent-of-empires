@@ -10,6 +10,7 @@ import { PluginPageView } from "../PluginPageView";
 import type { SessionMenuRequest } from "../PluginSessionMenu";
 
 const h = vi.hoisted(() => ({
+  wide: true,
   pages: null as PluginPage[] | null,
   mint: vi.fn<(url: string) => Promise<boolean>>(),
   sessions: vi.fn(),
@@ -20,7 +21,7 @@ const h = vi.hoisted(() => ({
   renderSession: vi.fn<(id: string) => { title: string; view: ReactNode } | null>(),
   renderSessionMenu: vi.fn<(request: SessionMenuRequest) => ReactNode>(),
 }));
-vi.mock("../../../hooks/useIsWideViewport", () => ({ useIsWideViewport: () => true }));
+vi.mock("../../../hooks/useIsWideViewport", () => ({ useIsWideViewport: () => h.wide }));
 vi.mock("../../../lib/sessionRoute", () => ({ requestOpenSession: (id: string) => h.openSession(id) }));
 vi.mock("../../../lib/pluginUiContext", () => ({ usePluginPages: () => h.pages }));
 vi.mock("../../../lib/api", () => ({
@@ -101,6 +102,7 @@ beforeEach(() => {
   h.archive.mockReset();
   h.trash.mockReset();
   h.openSession.mockReset();
+  h.wide = true;
   h.renderSession.mockReset().mockImplementation((id) => ({ title: `Title ${id}`, view: <p>session {id}</p> }));
   h.renderSessionMenu.mockReset().mockReturnValue(null);
   localStorage.clear();
@@ -319,6 +321,18 @@ describe("PluginPageView", () => {
     // Leaving the split drops its session.
     fireEvent.click(screen.getByRole("button", { name: "Split view" }));
     fireEvent.click(screen.getByRole("button", { name: "Split view" }));
+    expect(screen.getByText("No session selected")).toBeTruthy();
+  });
+
+  it("drops the split's session when a narrowed viewport turns the split off", async () => {
+    const { request, rerender } = await readyFrame();
+    fireEvent.click(screen.getByRole("button", { name: "Split view" }));
+    await request({ aoeBridge: 1, id: 2, method: "openSession", params: { id: "s" } });
+    expect(screen.getByText("session s")).toBeTruthy();
+    h.wide = false;
+    rerender(<Host />);
+    h.wide = true;
+    rerender(<Host />);
     expect(screen.getByText("No session selected")).toBeTruthy();
   });
 

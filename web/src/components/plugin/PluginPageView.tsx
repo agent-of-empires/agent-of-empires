@@ -160,6 +160,12 @@ export function PluginPageView({
   useEffect(() => {
     openSessionRef.current = split ? onSelectSession : requestOpenSession;
   }, [split, onSelectSession]);
+  // Off, whether toggled or on a narrowed viewport, the split drops its session, so the dashboard stops treating it as open.
+  useEffect(() => {
+    // A viewport narrowing has no handler to do this in.
+    // eslint-disable-next-line react-you-might-not-need-an-effect/no-event-handler
+    if (!split && selectedSessionId) onSelectSession(null);
+  }, [split, selectedSessionId, onSelectSession]);
   useEffect(() => {
     shownRef.current = shown;
     port.current?.postMessage(bridgePush("selection", { sessionId: shown }));
@@ -342,11 +348,7 @@ export function PluginPageView({
         <span className="flex-1 text-xs font-mono text-text-bright truncate">{page?.title ?? pageId}</span>
         {wide && (
           <button
-            onClick={() => {
-              // Leaving the split drops its session, so the dashboard stops treating it as open.
-              if (split) onSelectSession(null);
-              toggleSplit();
-            }}
+            onClick={toggleSplit}
             className={`w-8 h-8 shrink-0 flex items-center justify-center rounded-md cursor-pointer transition-colors ${
               split
                 ? "text-text-primary bg-surface-700/60"
