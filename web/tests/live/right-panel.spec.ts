@@ -53,12 +53,40 @@ test("diff pane in a non-git session stays closed until opened, then shows one n
   });
   const [session] = await listSessions(serve.baseUrl);
   expect(session!.outside_repository).toBe(true);
-  // A deep link mounts the layout before the Session list arrives, the order that once pinned Diff.
-  await page.goto(`${serve.baseUrl}/session/${encodeURIComponent(session!.id)}`);
+  const storedTabs = () =>
+    page.evaluate((id) => {
+      const store = JSON.parse(localStorage.getItem("aoe-pane-layout-v2") ?? "{}");
+      const layout = store.sessions?.[id];
+      return layout ? [...layout.right, ...layout.bottom].flatMap((g: { tabs: string[] }) => g.tabs) : null;
+    }, session!.id);
 
-  // The seeded terminal proves the layout is seeded, so Diff's absence is not a race.
-  await expect(page.getByTestId("pane-toggle-terminal").first()).toHaveAttribute("aria-pressed", "true");
+  // Hold the browser's first Session list so the unknown state is observable: a
+  // deep link mounts the layout before that list arrives.
+  let release!: () => void;
+  const gate = new Promise<void>((r) => (release = r));
+  let held = false;
+  await page.route("**/api/sessions", async (route) => {
+    if (!held && route.request().method() === "GET") {
+      held = true;
+      await gate;
+    }
+    await route.continue();
+  });
+  const diffFilesRequested = page.waitForRequest((r) => r.url().includes(`/sessions/${session!.id}/diff/files`));
+  await page.goto(`${serve.baseUrl}/session/${encodeURIComponent(session!.id)}`);
+  // The diff-files fetch starts from an effect, so the layout effects of that
+  // commit have run: an unknown Session must leave nothing pinned.
+  await diffFilesRequested;
+  expect(held).toBe(true);
+  expect(await storedTabs()).toBeNull();
   const diffToggle = page.getByTestId("pane-toggle-diff").first();
+  await expect(diffToggle).toHaveAttribute("aria-pressed", "false");
+
+  release();
+  await expect.poll(storedTabs).not.toBeNull();
+  const pinned = (await storedTabs())!;
+  expect(pinned.some((t) => t.startsWith("terminal:"))).toBe(true);
+  expect(pinned).not.toContain("diff");
   await expect(diffToggle).toHaveAttribute("aria-pressed", "false");
 
   await diffToggle.click();
