@@ -1194,6 +1194,7 @@ mod tests {
         assert_eq!(entry(&all, &active_id)["trashed"], json!(false));
 
         let plain = entry(&all, &active_id);
+        assert_eq!(plain["unread"], json!(false));
         assert_eq!(plain["workspace_repos"], json!([]));
         assert!(plain.get("worktree").is_none());
         let multi = entry(&all, &multi_id);
