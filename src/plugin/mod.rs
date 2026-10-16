@@ -13,6 +13,7 @@ pub mod registry;
 pub mod source;
 pub mod update_check;
 pub mod view;
+pub mod worker_logs;
 
 pub(crate) mod automation_policy;
 pub mod host;

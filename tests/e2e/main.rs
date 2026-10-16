@@ -66,5 +66,6 @@ mod stop_confirm;
 #[cfg(target_os = "linux")]
 mod systemd_scope;
 mod tool_sessions;
+mod tui_daemon_sidebar_e2e;
 mod unified_view;
 mod update_command;

@@ -204,10 +204,11 @@ An item field takes the same keys as a top-level setting (`key`, `label`, `descr
 | `id`, `title`, `tool`, `status` | string | Identity and current status. |
 | `project_path` | string | The session's own working directory; for a worktree session this is the worktree, not the main repo. |
 | `archived`, `snoozed`, `trashed` | bool | Lifecycle flags. |
+| `unread` | bool | The session carries the unread marker; always `false` while `session.unread_indicator` is off. |
 | `workspace_repos` | array | One `{ source_path, branch }` per repo checkout of a multi-repo workspace; empty otherwise. |
 | `worktree` | object | `{ branch, main_repo_path, managed_by_aoe }`; present only for worktree sessions. |
 
-`trashed`, `workspace_repos` and `worktree` were added after the first release; they are additive RPC fields and do not change the manifest `api_version`. Treat a missing key as absent on an older host.
+`trashed`, `unread`, `workspace_repos` and `worktree` were added after the first release; they are additive RPC fields and do not change the manifest `api_version`. Treat a missing key as absent on an older host.
 
 ## Session-driving RPCs
 
@@ -599,3 +600,7 @@ bin = "my-plugin-worker"
 |---|---|---|---|
 | `asset` | string | yes | Asset-name template; `${os}`, `${arch}`, `${target}` are substituted before matching the release. |
 | `bin` | string | no | Executable path inside the extracted archive. Omit to run the downloaded asset directly (a raw, non-archive binary). |
+
+### Worker logs
+
+The worker's stdout carries JSON-RPC only; write diagnostics to stderr. The host captures stderr in `<app_dir>/plugin-workers/<plugin-id>_<worker-uuid>.log`, one file per start, and `aoe plugin logs <id>` prints the newest path. Only the five newest logs per plugin are kept. See [Worker logs](plugins.md#worker-logs).

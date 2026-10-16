@@ -3495,6 +3495,13 @@
       "components": ["web/src/components/WorkspaceSidebar.tsx"]
     },
     {
+      "id": "story.sidebar-keyboard-row-navigation",
+      "kind": "mocked-playwright",
+      "risk": "medium",
+      "specs": ["tests/sidebar-keyboard-navigation.spec.ts"],
+      "components": ["web/src/components/WorkspaceSidebar.tsx", "web/src/components/sidebar/SessionRow.tsx"]
+    },
+    {
       "id": "story.sidebar-plan-progress",
       "kind": "live-playwright",
       "risk": "high",

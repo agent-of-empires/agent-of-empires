@@ -49,7 +49,7 @@ pub use confirm::ConfirmDialog;
 pub use context_menu::{ContextMenuAction, ContextMenuDialog};
 pub use custom_instruction::CustomInstructionDialog;
 pub use delete_options::{DeleteDialogConfig, DeleteOptions, UnifiedDeleteDialog};
-pub use group_delete_options::{GroupDeleteOptions, GroupDeleteOptionsDialog};
+pub use group_delete_options::{GroupDeleteAction, GroupDeleteOptions, GroupDeleteOptionsDialog};
 pub use hooks_install::HooksInstallDialog;
 pub use info::InfoDialog;
 pub use intro::{IntroDialog, IntroOutcome};

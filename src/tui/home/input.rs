@@ -19,11 +19,11 @@ use crate::tui::app::Action;
 use crate::tui::dialogs::ServeAction;
 use crate::tui::dialogs::{
     builtin_commands, CommandPaletteDialog, ConfirmDialog, ContextMenuAction, ContextMenuDialog,
-    DeleteDialogConfig, DialogResult, GroupDeleteOptionsDialog, HooksInstallDialog, InfoDialog,
-    IntroOutcome, NewSessionData, NewSessionDialog, NoAgentsAction, PaletteAction, PaletteCommand,
-    PaletteGroup, ProfilePickerAction, ProjectsDialog, RenameDialog, RenameMode, RepoTrustAction,
-    RestartDialog, SendMessageDialog, TipsDialog, TipsOutcome, UnifiedDeleteDialog,
-    WorktreeNameDialog,
+    DeleteDialogConfig, DialogResult, GroupDeleteOptions, GroupDeleteOptionsDialog,
+    HooksInstallDialog, InfoDialog, IntroOutcome, NewSessionData, NewSessionDialog, NoAgentsAction,
+    PaletteAction, PaletteCommand, PaletteGroup, ProfilePickerAction, ProjectsDialog, RenameDialog,
+    RenameMode, RepoTrustAction, RestartDialog, SendMessageDialog, TipsDialog, TipsOutcome,
+    UnifiedDeleteDialog, WorktreeNameDialog,
 };
 use crate::tui::diff::{DiffAction, DiffView};
 use crate::tui::responsive;
@@ -1014,7 +1014,7 @@ impl HomeView {
     pub(super) fn dispatch_confirm_submit(&mut self, action: &str) -> Option<Action> {
         match action {
             "delete_group" => {
-                if let Err(e) = self.delete_selected_group() {
+                if let Err(e) = self.delete_selected_group(&GroupDeleteOptions::default()) {
                     tracing::error!(target: "tui.input", "Failed to delete group: {}", e);
                 }
                 None
@@ -1533,11 +1533,7 @@ impl HomeView {
                     }
                     DialogResult::Submit(options) => {
                         self.group_delete_options_dialog = None;
-                        if options.delete_sessions {
-                            if let Err(e) = self.delete_group_with_sessions(&options) {
-                                tracing::error!(target: "tui.input", "Failed to delete group with sessions: {}", e);
-                            }
-                        } else if let Err(e) = self.delete_selected_group() {
+                        if let Err(e) = self.delete_selected_group(&options) {
                             tracing::error!(target: "tui.input", "Failed to delete group: {}", e);
                         }
                     }
@@ -2217,11 +2213,7 @@ impl HomeView {
                 }
                 DialogResult::Submit(options) => {
                     self.group_delete_options_dialog = None;
-                    if options.delete_sessions {
-                        if let Err(e) = self.delete_group_with_sessions(&options) {
-                            tracing::error!(target: "tui.input", "Failed to delete group with sessions: {}", e);
-                        }
-                    } else if let Err(e) = self.delete_selected_group() {
+                    if let Err(e) = self.delete_selected_group(&options) {
                         tracing::error!(target: "tui.input", "Failed to delete group: {}", e);
                     }
                 }

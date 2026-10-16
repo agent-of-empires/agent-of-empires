@@ -377,3 +377,22 @@ describe("SessionRow color label (#2383)", () => {
     }
   });
 });
+describe("SessionRow keyboard navigation", () => {
+  it("prevents page scrolling at the last visible row", () => {
+    const { container } = renderRow(ws());
+    const sidebar = document.createElement("nav");
+    sidebar.setAttribute("role", "navigation");
+    sidebar.setAttribute("aria-label", "Sessions sidebar");
+    container.parentElement!.insertBefore(sidebar, container);
+    sidebar.appendChild(container);
+
+    const row = screen.getByTestId("sidebar-session-row");
+    vi.spyOn(row, "getClientRects").mockReturnValue([{} as DOMRect] as unknown as DOMRectList);
+    row.focus();
+    const event = new KeyboardEvent("keydown", { key: "ArrowDown", bubbles: true, cancelable: true });
+    row.dispatchEvent(event);
+
+    expect(event.defaultPrevented).toBe(true);
+    expect(document.activeElement).toBe(row);
+  });
+});

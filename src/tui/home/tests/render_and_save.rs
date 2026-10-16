@@ -554,7 +554,8 @@ fn test_group_delete_scoped_to_owning_profile() {
     view.confirm_dialog = None;
 
     select_work(&mut view, "alpha");
-    view.delete_selected_group().unwrap();
+    view.delete_selected_group(&crate::tui::dialogs::GroupDeleteOptions::default())
+        .unwrap();
     assert!(
         !view.group_trees.get("alpha").unwrap().group_exists("work"),
         "alpha's 'work' group should be deleted"

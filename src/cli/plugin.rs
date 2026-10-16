@@ -12,6 +12,11 @@ pub enum PluginCommands {
         /// Plugin id, e.g. `aoe.web`
         id: String,
     },
+    /// Print the path of a plugin worker's most recent log
+    Logs {
+        /// Plugin id
+        id: String,
+    },
     /// Enable a plugin's contributions
     Enable {
         /// Plugin id
@@ -68,6 +73,7 @@ pub async fn run(command: PluginCommands) -> Result<()> {
     match command {
         PluginCommands::List => run_list(),
         PluginCommands::Info { id } => run_info(&id),
+        PluginCommands::Logs { id } => run_logs(&id),
         PluginCommands::Enable { id } => run_set_enabled(&id, true).await,
         PluginCommands::Disable { id } => run_set_enabled(&id, false).await,
         PluginCommands::Install { source, yes } => run_install(&source, yes).await,
@@ -82,6 +88,15 @@ pub async fn run(command: PluginCommands) -> Result<()> {
 fn run_hash(path: &str) -> Result<()> {
     let hash = crate::plugin::integrity::tree_hash(std::path::Path::new(path))?;
     println!("{hash}");
+    Ok(())
+}
+
+fn run_logs(id: &str) -> Result<()> {
+    let dir = crate::session::get_app_dir()?.join("plugin-workers");
+    let Some(path) = crate::plugin::worker_logs::latest(&dir, id) else {
+        anyhow::bail!("no worker log for plugin {id:?}; workers only run under `aoe serve`");
+    };
+    println!("{}", path.display());
     Ok(())
 }
 

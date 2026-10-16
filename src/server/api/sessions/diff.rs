@@ -24,7 +24,12 @@ pub struct RepoBase {
     /// None for single-repo sessions; Some for each workspace member.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub repo_name: Option<String>,
-    pub base_branch: String,
+    /// Absent when `outside_repository`, since there is nothing to diff against.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub base_branch: Option<String>,
+    /// The Working directory is not a Repository (#4574).
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub outside_repository: bool,
     /// Worktree path this entry's diff was computed in. The web base picker
     /// queries it so a workspace member's typeahead lists its own branches
     /// rather than the launch repo's (#3329).
@@ -269,6 +274,16 @@ pub async fn session_diff_files(
 
         for repo in &ctx.repos {
             let path = std::path::Path::new(&repo.path);
+            if crate::git::is_outside_repository(path) {
+                per_repo_bases.push(RepoBase {
+                    repo_name: repo.name.clone(),
+                    base_branch: None,
+                    outside_repository: true,
+                    repo_path: repo.path.clone(),
+                    base_override: repo.base_override.clone(),
+                });
+                continue;
+            }
             let base_branch = resolve_diff_base(
                 repo.base_override.as_deref(),
                 repo.recorded_base.as_deref(),
@@ -292,7 +307,8 @@ pub async fn session_diff_files(
             }
             per_repo_bases.push(RepoBase {
                 repo_name: repo.name.clone(),
-                base_branch: base_branch.clone(),
+                base_branch: Some(base_branch.clone()),
+                outside_repository: false,
                 repo_path: repo.path.clone(),
                 base_override: repo.base_override.clone(),
             });

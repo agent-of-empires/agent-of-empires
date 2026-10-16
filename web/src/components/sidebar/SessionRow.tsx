@@ -182,6 +182,29 @@ export const SessionRow = memo(function SessionRow(props: SessionRowProps) {
         data-testid="sidebar-session-row"
         title={model.needsAttention ? `${label} · ${model.attentionHint}` : label}
         draggable={false}
+        onKeyDown={(e) => {
+          if (
+            (e.key !== "ArrowDown" && e.key !== "ArrowUp") ||
+            e.altKey ||
+            e.ctrlKey ||
+            e.metaKey ||
+            e.shiftKey ||
+            e.target !== e.currentTarget
+          ) {
+            return;
+          }
+          const sidebar = e.currentTarget.closest<HTMLElement>('[role="navigation"][aria-label="Sessions sidebar"]');
+          if (!sidebar) return;
+          const rows = Array.from(
+            sidebar.querySelectorAll<HTMLAnchorElement>(
+              '[data-testid="sidebar-session-row"]:not([aria-disabled="true"])',
+            ),
+          ).filter((row) => row.getClientRects().length > 0);
+          const index = rows.indexOf(e.currentTarget);
+          if (index === -1) return;
+          e.preventDefault();
+          rows[index + (e.key === "ArrowDown" ? 1 : -1)]?.focus();
+        }}
         onClick={(e) => {
           // Middle-click and Alt+click keep the browser's href behavior.
           if (e.button !== 0 || e.altKey) return;
