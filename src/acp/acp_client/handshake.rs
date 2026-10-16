@@ -40,6 +40,15 @@ pub(super) fn build_initialize_request() -> InitializeRequest {
             ClientSessionCapabilities::new()
                 .notices(NoticeCapabilities::new())
                 .compaction(CompactionCapabilities::new()),
+        )
+        // claude-agent-acp reports a backgrounded command's lifecycle as
+        // `async_task_*` updates only to a client that declares this.
+        .meta(
+            serde_json::json!({
+                "jetbrains": {"air": {"version": 1, "capabilities": ["asyncTasks"]}}
+            })
+            .as_object()
+            .cloned(),
         );
     InitializeRequest::new(ProtocolVersion::V1)
         .client_capabilities(capabilities)
@@ -150,5 +159,17 @@ mod tests {
                 "session {key} capability missing from {wire}"
             );
         }
+    }
+
+    /// Without the AIR `asyncTasks` opt-in the adapter sends no lifecycle for
+    /// a backgrounded command, so the session reads idle while it runs.
+    #[test]
+    fn initialize_opts_into_async_tasks() {
+        let wire = serde_json::to_value(build_initialize_request()).expect("serialize");
+        assert_eq!(
+            wire.pointer("/clientCapabilities/_meta/jetbrains/air"),
+            Some(&serde_json::json!({"version": 1, "capabilities": ["asyncTasks"]})),
+            "asyncTasks opt-in missing from {wire}"
+        );
     }
 }

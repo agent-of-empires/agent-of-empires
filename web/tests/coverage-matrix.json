@@ -2508,6 +2508,13 @@
       ]
     },
     {
+      "id": "acp.background-tasks",
+      "kind": "vitest",
+      "risk": "medium",
+      "specs": ["src/lib/acpTypes.test.ts", "src/lib/acpTypes.reducer.test.ts"],
+      "components": ["web/src/lib/acpTypes.ts", "web/src/components/acp/AcpRuntime.tsx"]
+    },
+    {
       "id": "acp.background-agent-composer",
       "kind": "mocked-playwright",
       "risk": "high",

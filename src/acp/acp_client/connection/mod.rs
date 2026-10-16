@@ -232,6 +232,14 @@ pub(super) async fn run_connection_task<W, R>(
                                     .await;
                                 return Ok(());
                             }
+                            SessionIngressNotification::AsyncTask(task) => {
+                                if let Some((task, _guard)) =
+                                    shared.ingress.task(task, control_notifications).await?
+                                {
+                                    shared.handle_async_task(task).await;
+                                }
+                                return Ok(());
+                            }
                             SessionIngressNotification::Update(params) => params,
                         };
                         let (notification, wire_bytes) = SessionIngressNotification::decode_update(

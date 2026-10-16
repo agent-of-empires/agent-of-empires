@@ -13,7 +13,7 @@ use super::errors::acp_internal_error;
 use crate::acp::control_protocol::{
     PromptCompletedMarker, SessionReplayed, MAX_CONTROL_QUEUE_BYTES, MAX_CONTROL_QUEUE_FRAMES,
 };
-use crate::acp::state::{AuthStatus, AUTH_STATUS_UPDATE_METHOD};
+use crate::acp::state::{AuthStatus, Event, AUTH_STATUS_UPDATE_METHOD};
 
 // The replayed backlog a reattach flushes is exactly the runner's detached
 // control queue, so this buffer is sized against the same contract: a
@@ -45,6 +45,160 @@ pub(super) enum SessionIngressNotification {
     /// `_auth/status_update`: the agent's own identity. Connection-scoped, so
     /// it carries no session id and never passes the ingress fence (#4241).
     AuthStatus(AuthStatus),
+    /// An `async_task_*` `session/update` of the adapter's `asyncTasks`
+    /// extension, which the typed `SessionUpdate` enum has no variant for.
+    AsyncTask(AsyncTaskNotification),
+}
+
+/// A session-scoped `async_task_*` update, reduced to what aoe tracks.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct AsyncTaskNotification {
+    pub(super) session_id: SessionId,
+    update: AsyncTaskUpdate,
+    /// The frame as received, for re-serialization.
+    raw: serde_json::Value,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum AsyncTaskUpdate {
+    Spawned {
+        task_id: String,
+        tool_call_id: Option<String>,
+        description: String,
+    },
+    Finished {
+        task_id: String,
+    },
+    /// Progress or a non-terminal state: nothing to track.
+    Ignored,
+}
+
+/// A session-scoped update that waits for native identity: an ordinary typed
+/// update or an `async_task_*` frame.
+#[derive(Clone, Debug)]
+pub(super) enum IngressUpdate {
+    Session(Box<SessionNotification>),
+    Task(AsyncTaskNotification),
+}
+
+impl IngressUpdate {
+    fn session_id(&self) -> &SessionId {
+        match self {
+            Self::Session(notification) => &notification.session_id,
+            Self::Task(task) => &task.session_id,
+        }
+    }
+
+    fn serialize_into(&self, writer: impl std::io::Write) -> serde_json::Result<()> {
+        match self {
+            Self::Session(notification) => serde_json::to_writer(writer, notification),
+            Self::Task(task) => serde_json::to_writer(writer, &task.raw),
+        }
+    }
+}
+
+impl From<SessionNotification> for IngressUpdate {
+    fn from(notification: SessionNotification) -> Self {
+        Self::Session(Box::new(notification))
+    }
+}
+
+impl AsyncTaskNotification {
+    /// The daemon control reader's byte count for this frame, absent on stdio.
+    pub(super) fn wire_bytes(&self) -> Option<usize> {
+        self.raw
+            .get(CONTROL_FRAME_BYTES_FIELD)
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|bytes| usize::try_from(bytes).ok())
+    }
+
+    pub(super) fn into_event(self) -> Option<Event> {
+        match self.update {
+            AsyncTaskUpdate::Spawned {
+                task_id,
+                tool_call_id,
+                description,
+            } => Some(Event::BackgroundTaskStarted {
+                task_id,
+                tool_call_id,
+                description,
+            }),
+            AsyncTaskUpdate::Finished { task_id } => {
+                Some(Event::BackgroundTaskFinished { task_id })
+            }
+            AsyncTaskUpdate::Ignored => None,
+        }
+    }
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AsyncTaskParams {
+    session_id: SessionId,
+    update: AsyncTaskWire,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(tag = "sessionUpdate", rename_all_fields = "camelCase")]
+enum AsyncTaskWire {
+    #[serde(rename = "async_task_spawned")]
+    Spawned {
+        async_task_id: String,
+        #[serde(default)]
+        tool_call_id: Option<String>,
+        #[serde(default)]
+        description: Option<String>,
+        #[serde(default)]
+        name: Option<String>,
+    },
+    #[serde(rename = "async_task_progress")]
+    Progress {},
+    #[serde(rename = "async_task_state_update")]
+    StateUpdate {
+        async_task_id: String,
+        state: String,
+    },
+}
+
+const ASYNC_TASK_UPDATE_PREFIX: &str = "async_task_";
+
+/// `session/update` params whose update is an `async_task_*` frame. The
+/// daemon's control relay adds its byte-count field beside `update`, which
+/// the typed parse below ignores.
+fn is_async_task_update(params: &serde_json::Value) -> bool {
+    params
+        .get("update")
+        .and_then(|update| update.get("sessionUpdate"))
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|kind| kind.starts_with(ASYNC_TASK_UPDATE_PREFIX))
+}
+
+fn parse_async_task(params: serde_json::Value) -> serde_json::Result<AsyncTaskNotification> {
+    let parsed: AsyncTaskParams = serde_json::from_value(params.clone())?;
+    let update = match parsed.update {
+        AsyncTaskWire::Spawned {
+            async_task_id,
+            tool_call_id,
+            description,
+            name,
+        } => AsyncTaskUpdate::Spawned {
+            description: description.or(name).unwrap_or_default(),
+            task_id: async_task_id,
+            tool_call_id,
+        },
+        AsyncTaskWire::StateUpdate {
+            async_task_id,
+            state,
+        } if !matches!(state.as_str(), "running" | "paused") => AsyncTaskUpdate::Finished {
+            task_id: async_task_id,
+        },
+        AsyncTaskWire::StateUpdate { .. } | AsyncTaskWire::Progress {} => AsyncTaskUpdate::Ignored,
+    };
+    Ok(AsyncTaskNotification {
+        session_id: parsed.session_id,
+        update,
+        raw: params,
+    })
 }
 
 /// Params of `_auth/status_update`. Unknown fields, including the upstream
@@ -69,6 +223,7 @@ impl JsonRpcMessage for SessionIngressNotification {
             Self::Replayed(marker) => marker.method(),
             Self::PromptCompleted(marker) => marker.method(),
             Self::AuthStatus(_) => AUTH_STATUS_UPDATE_METHOD,
+            Self::AsyncTask(_) => "session/update",
         }
     }
 
@@ -80,6 +235,7 @@ impl JsonRpcMessage for SessionIngressNotification {
             Self::AuthStatus(status) => {
                 UntypedMessage::new(self.method(), serde_json::json!({ "authStatus": status }))
             }
+            Self::AsyncTask(task) => UntypedMessage::new(self.method(), &task.raw),
         }
     }
 
@@ -104,7 +260,11 @@ impl JsonRpcMessage for SessionIngressNotification {
         if !SessionNotification::matches_method(method) {
             return Err(agent_client_protocol::Error::method_not_found());
         }
-        Ok(Self::Update(serde_json::to_value(params)?))
+        let params = serde_json::to_value(params)?;
+        if is_async_task_update(&params) {
+            return Ok(Self::AsyncTask(parse_async_task(params)?));
+        }
+        Ok(Self::Update(params))
     }
 }
 
@@ -157,7 +317,7 @@ struct IdentityState {
 struct Establishment {
     generation: u64,
     candidate: Option<SessionId>,
-    updates: Vec<SessionNotification>,
+    updates: Vec<IngressUpdate>,
     encoded_bytes: usize,
 }
 
@@ -234,7 +394,7 @@ impl SessionIngress {
     pub(super) fn finish(
         &self,
         id: Option<SessionId>,
-    ) -> agent_client_protocol::Result<Vec<SessionNotification>> {
+    ) -> agent_client_protocol::Result<Vec<IngressUpdate>> {
         let mut state = self.state.lock().unwrap();
         if state.failed {
             return Err(Self::overflow_error());
@@ -244,7 +404,7 @@ impl SessionIngress {
             .take()
             .map(|pending| pending.updates)
             .unwrap_or_default();
-        updates.retain(|notification| Some(&notification.session_id) == id.as_ref());
+        updates.retain(|update| Some(update.session_id()) == id.as_ref());
         state.current = id;
         drop(state);
         self.changed.notify_waiters();
@@ -257,20 +417,53 @@ impl SessionIngress {
         notification: SessionNotification,
         wire_bytes: Option<usize>,
     ) -> agent_client_protocol::Result<Option<(SessionNotification, MutexGuard<'_, ()>)>> {
-        let Some(notification) = self.route(notification, wire_bytes)? else {
+        Ok(self
+            .admit(notification.into(), wire_bytes)
+            .await?
+            .and_then(|(update, guard)| match update {
+                IngressUpdate::Session(notification) => Some((*notification, guard)),
+                IngressUpdate::Task(_) => None,
+            }))
+    }
+
+    /// An `async_task_*` frame takes the same pending buffer and identity
+    /// fence as an ordinary update, so one sent between `SessionReady` and the
+    /// identity commit is replayed at the commit instead of dropped.
+    pub(super) async fn task(
+        &self,
+        task: AsyncTaskNotification,
+        control_transport: bool,
+    ) -> agent_client_protocol::Result<Option<(AsyncTaskNotification, MutexGuard<'_, ()>)>> {
+        // Only the daemon's control reader writes the byte count.
+        let wire_bytes = control_transport.then(|| task.wire_bytes()).flatten();
+        Ok(self
+            .admit(IngressUpdate::Task(task), wire_bytes)
+            .await?
+            .and_then(|(update, guard)| match update {
+                IngressUpdate::Task(task) => Some((task, guard)),
+                IngressUpdate::Session(_) => None,
+            }))
+    }
+
+    async fn admit(
+        &self,
+        update: IngressUpdate,
+        wire_bytes: Option<usize>,
+    ) -> agent_client_protocol::Result<Option<(IngressUpdate, MutexGuard<'_, ()>)>> {
+        let Some(update) = self.route(update, wire_bytes)? else {
             return Ok(None);
         };
         let guard = self.fence.lock().await;
         Ok(self
-            .route(notification, wire_bytes)?
-            .map(|notification| (notification, guard)))
+            .route(update, wire_bytes)?
+            .map(|update| (update, guard)))
     }
 
     fn route(
         &self,
-        notification: SessionNotification,
+        notification: IngressUpdate,
         wire_bytes: Option<usize>,
-    ) -> agent_client_protocol::Result<Option<SessionNotification>> {
+    ) -> agent_client_protocol::Result<Option<IngressUpdate>> {
         let mut state = self.state.lock().unwrap();
         if state.failed {
             return Ok(None);
@@ -287,7 +480,8 @@ impl SessionIngress {
                     written: 0,
                     limit: MAX_PENDING_BYTES - pending.encoded_bytes,
                 };
-                serde_json::to_writer(&mut count, &notification)
+                notification
+                    .serialize_into(&mut count)
                     .ok()
                     .map(|()| count.written)
             };
@@ -304,7 +498,7 @@ impl SessionIngress {
             pending.updates.push(notification);
             return Ok(None);
         }
-        Ok((state.current.as_ref() == Some(&notification.session_id)).then_some(notification))
+        Ok((state.current.as_ref() == Some(notification.session_id())).then_some(notification))
     }
 
     fn request_admission(&self, id: &SessionId) -> RequestAdmission {
@@ -480,6 +674,160 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn async_task_updates_parse_into_task_events() {
+        let frame = |update: serde_json::Value| serde_json::json!({"sessionId": "s-1", "update": update, CONTROL_FRAME_BYTES_FIELD: 120});
+        let cases = [
+            (
+                "spawned",
+                frame(serde_json::json!({
+                    "sessionUpdate": "async_task_spawned",
+                    "asyncTaskId": "t-1",
+                    "name": "Run delayed echo",
+                    "taskType": "shell",
+                    "description": "Run delayed echo in background",
+                    "showInTranscript": false,
+                    "canStop": true,
+                    "toolCallId": "toolu_1",
+                })),
+                Some(Event::BackgroundTaskStarted {
+                    task_id: "t-1".into(),
+                    tool_call_id: Some("toolu_1".into()),
+                    description: "Run delayed echo in background".into(),
+                }),
+            ),
+            (
+                "progress",
+                frame(serde_json::json!({
+                    "sessionUpdate": "async_task_progress",
+                    "asyncTaskId": "t-1",
+                    "outputFilePath": "/tmp/t-1.output",
+                })),
+                None,
+            ),
+            (
+                "still running",
+                frame(serde_json::json!({
+                    "sessionUpdate": "async_task_state_update",
+                    "asyncTaskId": "t-1",
+                    "state": "running",
+                })),
+                None,
+            ),
+            (
+                "completed",
+                frame(serde_json::json!({
+                    "sessionUpdate": "async_task_state_update",
+                    "asyncTaskId": "t-1",
+                    "state": "completed",
+                })),
+                Some(Event::BackgroundTaskFinished {
+                    task_id: "t-1".into(),
+                }),
+            ),
+            (
+                "failed",
+                frame(serde_json::json!({
+                    "sessionUpdate": "async_task_state_update",
+                    "asyncTaskId": "t-1",
+                    "state": "failed",
+                    "summary": "exit 1",
+                })),
+                Some(Event::BackgroundTaskFinished {
+                    task_id: "t-1".into(),
+                }),
+            ),
+        ];
+        for (name, params, want) in cases {
+            let parsed = SessionIngressNotification::parse_message("session/update", &params)
+                .unwrap_or_else(|e| panic!("{name}: {e}"));
+            let SessionIngressNotification::AsyncTask(task) = parsed else {
+                panic!("{name}: expected AsyncTask, got {parsed:?}");
+            };
+            assert_eq!(task.session_id, SessionId::from("s-1"), "{name}");
+            assert_eq!(
+                task.into_event().map(|e| serde_json::to_value(e).unwrap()),
+                want.map(|e| serde_json::to_value(e).unwrap()),
+                "{name}"
+            );
+        }
+    }
+
+    fn task_frame(session: &str, update: serde_json::Value) -> AsyncTaskNotification {
+        parse_async_task(serde_json::json!({"sessionId": session, "update": update}))
+            .expect("task frame parses")
+    }
+
+    fn spawned(session: &str, id: &str) -> AsyncTaskNotification {
+        task_frame(
+            session,
+            serde_json::json!({"sessionUpdate": "async_task_spawned", "asyncTaskId": id}),
+        )
+    }
+
+    fn completed(session: &str, id: &str) -> AsyncTaskNotification {
+        task_frame(
+            session,
+            serde_json::json!({
+                "sessionUpdate": "async_task_state_update",
+                "asyncTaskId": id,
+                "state": "completed",
+            }),
+        )
+    }
+
+    /// A runner sends `SessionReady` ahead of the identity commit, so a task
+    /// start or finish arriving in between must wait for the commit.
+    #[test]
+    fn task_frames_before_the_identity_commit_replay_in_order() {
+        let ingress = SessionIngress::default();
+        ingress.begin();
+        ingress.resolve(None, SessionId::from("s"));
+        for task in [
+            spawned("s", "t-1"),
+            spawned("other", "t-9"),
+            completed("s", "t-1"),
+        ] {
+            assert!(ingress
+                .route(IngressUpdate::Task(task), None)
+                .unwrap()
+                .is_none());
+        }
+
+        let replay = ingress.finish(Some(SessionId::from("s"))).unwrap();
+        let events: Vec<serde_json::Value> = replay
+            .into_iter()
+            .map(|update| match update {
+                IngressUpdate::Task(task) => {
+                    serde_json::to_value(task.into_event().unwrap()).unwrap()
+                }
+                IngressUpdate::Session(_) => panic!("only task frames were sent"),
+            })
+            .collect();
+        assert_eq!(
+            events,
+            [
+                serde_json::json!({"BackgroundTaskStarted": {"task_id": "t-1", "description": ""}}),
+                serde_json::json!({"BackgroundTaskFinished": {"task_id": "t-1"}}),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn task_frames_after_the_commit_pass_only_for_the_current_session() {
+        let ingress = SessionIngress::new(Some(SessionId::from("s")));
+        assert!(ingress
+            .task(spawned("s", "t-1"), false)
+            .await
+            .unwrap()
+            .is_some());
+        assert!(ingress
+            .task(spawned("other", "t-2"), false)
+            .await
+            .unwrap()
+            .is_none());
+    }
+
     #[tokio::test]
     async fn pending_replay_and_wire_budget_are_bounded() {
         let ingress = SessionIngress::new(Some(SessionId::from("s")));
@@ -505,7 +853,7 @@ mod tests {
             ingress.begin();
             for _ in 0..2 {
                 ingress
-                    .route(notif("s"), Some(MAX_PENDING_BYTES / 2))
+                    .route(notif("s").into(), Some(MAX_PENDING_BYTES / 2))
                     .unwrap();
             }
             assert_eq!(ingress.finish(Some(SessionId::from("s"))).unwrap().len(), 2);
@@ -516,7 +864,7 @@ mod tests {
             ingress.begin();
             for _ in 0..MAX_CONTROL_QUEUE_FRAMES {
                 ingress
-                    .route(notif("s"), None)
+                    .route(notif("s").into(), None)
                     .expect("a full detach-queue backlog fits");
             }
             let replay = ingress
@@ -530,9 +878,11 @@ mod tests {
                 let ingress = SessionIngress::default();
                 ingress.begin();
                 for _ in 0..MAX_CONTROL_QUEUE_FRAMES {
-                    ingress.route(notif("s"), None).expect("under the cap");
+                    ingress
+                        .route(notif("s").into(), None)
+                        .expect("under the cap");
                 }
-                assert!(ingress.route(notif("s"), None).is_err());
+                assert!(ingress.route(notif("s").into(), None).is_err());
             }
         }
     }
