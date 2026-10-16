@@ -355,6 +355,32 @@ pub fn pid_file_path() -> Result<PathBuf> {
     Ok(dir.join("serve.pid"))
 }
 
+/// Held by a foreground `aoe serve` for its lifetime and by `aoe migrate` for its run,
+/// so the two never overlap. The OS drops it with the process.
+#[derive(Debug)]
+pub(crate) struct ServeLock {
+    _file: std::fs::File,
+}
+
+pub(crate) fn try_lock_serve() -> Result<Option<ServeLock>> {
+    try_lock_serve_at(&crate::session::get_app_dir()?.join("serve.lock"))
+}
+
+fn try_lock_serve_at(path: &std::path::Path) -> Result<Option<ServeLock>> {
+    use fs2::FileExt as _;
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(path)?;
+    match file.try_lock_exclusive() {
+        Ok(()) => Ok(Some(ServeLock { _file: file })),
+        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => Ok(None),
+        Err(e) => Err(e.into()),
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct ServeLaunch {
     pub schema: u32,
@@ -876,6 +902,10 @@ pub async fn run(profile: &str, mut args: ServeArgs) -> Result<()> {
         return start_daemon(profile, &args);
     }
 
+    let Some(_serve_lock) = try_lock_serve()? else {
+        bail!("another aoe serve or `aoe migrate` is starting or running; retry once it finishes");
+    };
+
     apply_cityhall_bundle().await?;
 
     tracing::info!(
@@ -1393,6 +1423,20 @@ mod tests {
         for (command, expected) in cases {
             assert_eq!(command_is_aoe_serve(command), *expected, "{command:?}");
         }
+    }
+
+    #[test]
+    fn serve_and_migrate_exclude_each_other_in_both_orders() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("serve.lock");
+        let daemon = try_lock_serve_at(&path).unwrap().expect("first holder");
+        assert!(try_lock_serve_at(&path).unwrap().is_none());
+        drop(daemon);
+        let migrate = try_lock_serve_at(&path)
+            .unwrap()
+            .expect("free after release");
+        assert!(try_lock_serve_at(&path).unwrap().is_none());
+        drop(migrate);
     }
 
     #[test]

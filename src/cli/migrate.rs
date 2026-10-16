@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{bail, Result};
 
-use crate::cli::serve::{daemon_status, DaemonStatus};
+use crate::cli::serve::{daemon_status, try_lock_serve, DaemonStatus};
 use crate::migrations::progress::{fit_width, ConsoleProgress, Event, Reporter};
 
 const QUIET_FOR: Duration = Duration::from_millis(1500);
@@ -111,6 +111,10 @@ fn refuse_while_daemon_runs(status: DaemonStatus) -> Result<()> {
 
 pub fn run() -> Result<()> {
     refuse_while_daemon_runs(daemon_status())?;
+    // The status check can go stale; the lock keeps a daemon from starting mid-migration.
+    let Some(_serve_lock) = try_lock_serve()? else {
+        bail!("an aoe serve daemon is starting; retry `aoe migrate` once it is up and stopped");
+    };
     if !crate::migrations::has_pending_migrations() {
         eprintln!("{PREFIX}data schema is current; retrying any deferred migration work");
     }
