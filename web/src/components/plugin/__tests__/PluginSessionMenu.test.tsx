@@ -7,10 +7,12 @@ import { PluginSessionMenu, type SessionMenuRequest } from "../PluginSessionMenu
 
 const workspaces = [makeWorkspace("w1", [makeSession({ id: "s1", title: "Ethiopians" })])];
 
+const handlers = { onStop: vi.fn(), onDelete: vi.fn() };
+
 function open(over: Partial<SessionMenuRequest> = {}) {
   const onClose = vi.fn();
   const request: SessionMenuRequest = { key: 1, sessionId: "s1", x: 40, y: 50, items: [], onClose, ...over };
-  render(<PluginSessionMenu request={request} workspaces={workspaces} readOnly={false} handlers={{}} />);
+  render(<PluginSessionMenu request={request} workspaces={workspaces} readOnly={false} handlers={handlers} />);
   return onClose;
 }
 
@@ -21,6 +23,8 @@ let fetchSpy: ReturnType<typeof stubFetch>;
 beforeEach(() => {
   vi.useFakeTimers();
   fetchSpy = stubFetch();
+  handlers.onStop.mockReset();
+  handlers.onDelete.mockReset();
 });
 afterEach(() => {
   cleanup();
@@ -74,10 +78,45 @@ describe("PluginSessionMenu", () => {
     expect(init).toMatchObject({ method: "PATCH", body: JSON.stringify({ title: "Britons" }) });
   });
 
-  it("opens the snooze picker from the menu", () => {
+  it("snoozes the workspace with a picked preset", async () => {
     open();
     arm();
     fireEvent.click(screen.getByTestId("sidebar-context-menu-snooze"));
-    expect(screen.getByTestId("snooze-modal")).toBeTruthy();
+    vi.useRealTimers();
+    fireEvent.click(screen.getByRole("button", { name: "1 hour" }));
+    expect(screen.queryByTestId("snooze-modal")).toBeNull();
+    await waitFor(() => expect(String(fetchSpy.mock.calls[0]?.[0])).toContain("/api/sessions/s1/snooze"));
+  });
+
+  it.each([
+    { item: "sidebar-context-menu-stop", called: () => handlers.onStop, args: ["s1"] },
+    { item: "sidebar-context-menu-delete", called: () => handlers.onDelete, args: [["s1"]] },
+  ])("$item calls back with the session", ({ item, called, args }) => {
+    const onClose = open();
+    arm();
+    fireEvent.click(screen.getByTestId(item));
+    expect(called()).toHaveBeenCalledExactlyOnceWith(...args);
+    expect(onClose).toHaveBeenCalledExactlyOnceWith(null);
+  });
+
+  it.each([
+    ["sidebar-context-menu-archive", "/api/sessions/s1/archive"],
+    ["sidebar-context-menu-pin", "/api/sessions/s1/pin"],
+  ])("%s goes through the optimistic triage", async (item, path) => {
+    open();
+    arm();
+    vi.useRealTimers();
+    fireEvent.click(screen.getByTestId(item));
+    await waitFor(() =>
+      expect(fetchSpy.mock.calls.map(([url]) => String(url))).toContainEqual(expect.stringContaining(path)),
+    );
+  });
+
+  it("opens the group picker from More", () => {
+    open();
+    arm();
+    fireEvent.click(screen.getByTestId("sidebar-context-menu-more"));
+    fireEvent.click(screen.getByTestId("sidebar-context-menu-edit-group"));
+    expect(screen.getByTestId("session-group-modal-input")).toBeTruthy();
   });
 });

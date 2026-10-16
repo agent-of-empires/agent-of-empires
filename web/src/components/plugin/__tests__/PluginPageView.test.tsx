@@ -5,7 +5,9 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { PluginPage } from "../../../lib/api";
 import type { ResolvedTheme } from "../../../lib/theme";
 import { THEME_CHANGED_EVENT } from "../../../lib/theme";
+import type { ReactNode } from "react";
 import { PluginPageView } from "../PluginPageView";
+import type { SessionMenuRequest } from "../PluginSessionMenu";
 
 const h = vi.hoisted(() => ({
   pages: null as PluginPage[] | null,
@@ -14,7 +16,12 @@ const h = vi.hoisted(() => ({
   action: vi.fn(),
   archive: vi.fn(),
   trash: vi.fn(),
+  openSession: vi.fn(),
+  renderSession: vi.fn<(id: string) => ReactNode>(),
+  renderSessionMenu: vi.fn<(request: SessionMenuRequest) => ReactNode>(),
 }));
+vi.mock("../../../hooks/useIsWideViewport", () => ({ useIsWideViewport: () => true }));
+vi.mock("../../../lib/sessionRoute", () => ({ requestOpenSession: (id: string) => h.openSession(id) }));
 vi.mock("../../../lib/pluginUiContext", () => ({ usePluginPages: () => h.pages }));
 vi.mock("../../../lib/api", () => ({
   mintPluginPageTicket: (url: string) => h.mint(url),
@@ -43,6 +50,8 @@ const view = () =>
       readOnly={false}
       cityhall={false}
       theme={null}
+      renderSession={h.renderSession}
+      renderSessionMenu={h.renderSessionMenu}
     />,
   );
 
@@ -84,7 +93,24 @@ beforeEach(() => {
   h.action.mockReset();
   h.archive.mockReset();
   h.trash.mockReset();
+  h.openSession.mockReset();
+  h.renderSession.mockReset().mockImplementation((id) => <p>session {id}</p>);
+  h.renderSessionMenu.mockReset().mockReturnValue(null);
+  localStorage.clear();
 });
+
+async function readyFrame() {
+  const opened = await openFrame();
+  const channel = fakePort();
+  await opened.send({ aoeBridge: 1, id: "r", method: "ready", params: { nonce: opened.nonce } }, [channel.port]);
+  return { ...opened, ...channel };
+}
+
+const pushes = (port: ReturnType<typeof fakePort>["port"], event: string) =>
+  port.postMessage.mock.calls
+    .map(([m]) => m)
+    .filter((m) => m.event === event)
+    .map((m) => m.data);
 
 describe("PluginPageView", () => {
   it("frames the page, sandboxed to scripts only, once its ticket is minted", async () => {
@@ -196,6 +222,8 @@ describe("PluginPageView", () => {
         readOnly={false}
         cityhall={false}
         theme={null}
+        renderSession={h.renderSession}
+        renderSessionMenu={h.renderSessionMenu}
       />,
     );
     expect(screen.getByTestId("plugin-page-frame")).toBe(frame);
@@ -258,6 +286,8 @@ describe("PluginPageView", () => {
         readOnly={true}
         cityhall={false}
         theme={null}
+        renderSession={h.renderSession}
+        renderSessionMenu={h.renderSessionMenu}
       />,
     );
     await request({ aoeBridge: 1, id: 2, method: "action", params: { method: "move" } });
@@ -265,5 +295,73 @@ describe("PluginPageView", () => {
       expect.objectContaining({ id: 2, error: expect.objectContaining({ code: "read_only" }) }),
     );
     expect(h.action).not.toHaveBeenCalled();
+  });
+
+  it("navigates on openSession, or with split view on, shows the session below and pushes the selection", async () => {
+    const { port, request } = await readyFrame();
+    expect(pushes(port, "selection")).toEqual([{ sessionId: null }]);
+    await request({ aoeBridge: 1, id: 2, method: "openSession", params: { id: "s" } });
+    expect(h.openSession.mock.calls).toEqual([["s"]]);
+
+    fireEvent.click(screen.getByRole("button", { name: "Split view" }));
+    expect(localStorage.getItem("aoe-plugin-page-split:acme.kit/board")).toBe("true");
+    expect(screen.getByText("No session selected")).toBeTruthy();
+    await request({ aoeBridge: 1, id: 3, method: "openSession", params: { id: "s" } });
+    expect(screen.getByText("session s")).toBeTruthy();
+    expect(h.openSession).toHaveBeenCalledTimes(1);
+    expect(pushes(port, "selection")).toEqual([{ sessionId: null }, { sessionId: "s" }]);
+
+    fireEvent.click(screen.getByRole("button", { name: "Open full" }));
+    expect(h.openSession.mock.calls).toEqual([["s"], ["s"]]);
+    fireEvent.click(screen.getByRole("button", { name: "Close session" }));
+    expect(pushes(port, "selection").at(-1)).toEqual({ sessionId: null });
+
+    await request({ aoeBridge: 1, id: 4, method: "openSession", params: { id: "gone" } });
+    h.renderSession.mockReturnValue(null);
+    fireEvent.click(screen.getByRole("button", { name: "Split view" }));
+    fireEvent.click(screen.getByRole("button", { name: "Split view" }));
+    expect(screen.getByText("Session not found")).toBeTruthy();
+  });
+
+  it("saves the split height a divider drag settles on, clamped", async () => {
+    await readyFrame();
+    fireEvent.click(screen.getByRole("button", { name: "Split view" }));
+    const pane = screen.getByTestId("plugin-page-split-session");
+    const container = pane.parentElement!;
+    container.getBoundingClientRect = () => ({ bottom: 1000, height: 1000 }) as DOMRect;
+    fireEvent.mouseDown(screen.getByTestId("plugin-page-split-resize"));
+    expect(screen.getByTestId("plugin-page-frame").className).toContain("pointer-events-none");
+    fireEvent.mouseMove(document, { clientY: 700 });
+    expect(pane.style.height).toBe("30%");
+    fireEvent.mouseMove(document, { clientY: 50 });
+    fireEvent.mouseUp(document);
+    expect(pane.style.height).toBe("80%");
+    expect(localStorage.getItem("aoe-plugin-page-split-height")).toBe("0.8");
+    expect(screen.getByTestId("plugin-page-frame").className).not.toContain("pointer-events-none");
+  });
+
+  it("opens the host session menu at the frame's offset and replies with the pick", async () => {
+    h.sessions.mockResolvedValue({ sessions: [{ id: "s" }] });
+    const { frame, port, request } = await readyFrame();
+    frame.getBoundingClientRect = () => ({ left: 100, top: 48 }) as DOMRect;
+    const items = [{ id: "move:done", label: "Move to Done" }];
+    await request({ aoeBridge: 1, id: 2, method: "session.contextMenu", params: { id: "s", x: 10, y: 20, items } });
+    await waitFor(() => expect(h.renderSessionMenu).toHaveBeenCalled());
+    const first = h.renderSessionMenu.mock.lastCall![0];
+    expect(first).toMatchObject({ sessionId: "s", x: 110, y: 68, items });
+
+    // A second menu supersedes the first, which resolves with nothing picked.
+    await request({ aoeBridge: 1, id: 3, method: "session.contextMenu", params: { id: "s", x: 0, y: 0 } });
+    await waitFor(() => expect(h.renderSessionMenu.mock.lastCall![0].key).toBe(first.key + 1));
+    await waitFor(() => expect(port.postMessage).toHaveBeenCalledWith({ aoeBridge: 1, id: 2, result: null }));
+    act(() => h.renderSessionMenu.mock.lastCall![0].onClose("move:done"));
+    await waitFor(() => expect(port.postMessage).toHaveBeenCalledWith({ aoeBridge: 1, id: 3, result: "move:done" }));
+
+    await request({ aoeBridge: 1, id: 4, method: "session.contextMenu", params: { id: "other", x: 0, y: 0 } });
+    await waitFor(() =>
+      expect(port.postMessage).toHaveBeenCalledWith(
+        expect.objectContaining({ id: 4, error: expect.objectContaining({ code: "invalid_params" }) }),
+      ),
+    );
   });
 });
