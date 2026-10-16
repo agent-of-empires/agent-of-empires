@@ -49,7 +49,11 @@ interface PageHost {
 
 const SPLIT_HEIGHT_KEY = "aoe-plugin-page-split-height";
 const DEFAULT_SPLIT = 0.5;
-const clampSplit = (f: number) => Math.min(0.8, Math.max(0.2, f));
+const MIN_SPLIT = 0.2;
+const MAX_SPLIT = 0.8;
+const SPLIT_STEP = 0.05;
+// Rounded so arrow steps land on whole percents.
+const clampSplit = (f: number) => Math.round(Math.min(MAX_SPLIT, Math.max(MIN_SPLIT, f)) * 100) / 100;
 
 function closePort(port: { current: MessagePort | null }) {
   port.current?.close();
@@ -372,6 +376,21 @@ function SplitLayout({
   const ref = useRef<HTMLDivElement>(null);
   const latest = useRef(fraction);
 
+  const settle = (next: number) => {
+    latest.current = next;
+    setFraction(next);
+    safeSetItem(SPLIT_HEIGHT_KEY, String(next));
+    // Terminals re-fit on resize.
+    window.dispatchEvent(new Event("resize"));
+  };
+  const percent = Math.round(fraction * 100);
+  const keySteps: Record<string, number> = {
+    ArrowUp: fraction + SPLIT_STEP,
+    ArrowDown: fraction - SPLIT_STEP,
+    Home: MIN_SPLIT,
+    End: MAX_SPLIT,
+  };
+
   useEffect(() => {
     if (!dragging) return;
     const onMove = (e: MouseEvent) => {
@@ -383,7 +402,6 @@ function SplitLayout({
     const onUp = () => {
       setDragging(false);
       safeSetItem(SPLIT_HEIGHT_KEY, String(latest.current));
-      // Terminals re-fit on resize.
       window.dispatchEvent(new Event("resize"));
     };
     document.addEventListener("mousemove", onMove);
@@ -407,16 +425,26 @@ function SplitLayout({
             role="separator"
             aria-orientation="horizontal"
             aria-label="Resize split"
+            aria-valuemin={MIN_SPLIT * 100}
+            aria-valuemax={MAX_SPLIT * 100}
+            aria-valuenow={percent}
+            tabIndex={0}
             data-testid="plugin-page-split-resize"
             onMouseDown={(e) => {
               e.preventDefault();
               setDragging(true);
             }}
-            className="h-1 shrink-0 cursor-row-resize bg-surface-700/60 hover:bg-brand-600/50 transition-colors duration-75"
+            onKeyDown={(e) => {
+              const next = keySteps[e.key];
+              if (next === undefined) return;
+              e.preventDefault();
+              settle(clampSplit(next));
+            }}
+            className="h-1 shrink-0 cursor-row-resize bg-surface-700/60 hover:bg-brand-600/50 transition-colors duration-75 focus-visible:outline-none focus-visible:bg-brand-500"
           />
           <div
             className="shrink-0 min-h-0 flex flex-col overflow-hidden"
-            style={{ height: `${fraction * 100}%` }}
+            style={{ height: `${percent}%` }}
             data-testid="plugin-page-split-session"
           >
             {bottom}

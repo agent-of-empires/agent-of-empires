@@ -340,6 +340,29 @@ describe("PluginPageView", () => {
     expect(screen.getByTestId("plugin-page-frame").className).not.toContain("pointer-events-none");
   });
 
+  it("resizes the split from the keyboard within its bounds, saving each step", async () => {
+    await readyFrame();
+    fireEvent.click(screen.getByRole("button", { name: "Split view" }));
+    const divider = screen.getByRole("separator", { name: "Resize split" });
+    const pane = screen.getByTestId("plugin-page-split-session");
+    expect(divider.tabIndex).toBe(0);
+    expect(divider.getAttribute("aria-valuenow")).toBe("50");
+
+    fireEvent.keyDown(divider, { key: "ArrowUp" });
+    expect(pane.style.height).toBe("55%");
+    expect(divider.getAttribute("aria-valuenow")).toBe("55");
+    expect(localStorage.getItem("aoe-plugin-page-split-height")).toBe("0.55");
+    fireEvent.keyDown(divider, { key: "ArrowDown" });
+    fireEvent.keyDown(divider, { key: "ArrowDown" });
+    expect(pane.style.height).toBe("45%");
+    fireEvent.keyDown(divider, { key: "End" });
+    fireEvent.keyDown(divider, { key: "ArrowUp" });
+    expect(pane.style.height).toBe("80%");
+    fireEvent.keyDown(divider, { key: "Home" });
+    expect(pane.style.height).toBe("20%");
+    expect(localStorage.getItem("aoe-plugin-page-split-height")).toBe("0.2");
+  });
+
   it("opens the host session menu at the frame's offset and replies with the pick", async () => {
     h.sessions.mockResolvedValue({ sessions: [{ id: "s" }] });
     const { frame, port, request } = await readyFrame();
