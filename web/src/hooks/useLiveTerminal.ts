@@ -55,6 +55,8 @@ export interface LiveTerminalState {
   isOwner: boolean;
   ownerKnown: boolean;
   transport: "grid" | "snapshot" | null;
+  /** The agent exited and left a dead pane; redialing cannot help until it is restarted. */
+  paneDead: boolean;
   stats: LiveStats;
 }
 
@@ -68,6 +70,7 @@ const INITIAL_STATE: LiveTerminalState = {
   isOwner: false,
   ownerKnown: false,
   transport: null,
+  paneDead: false,
   stats: { frames: 0, patches: 0, wireBytes: 0, resyncs: 0 },
 };
 
@@ -172,6 +175,7 @@ export function useLiveTerminal(
           ...prev,
           connected: true,
           reconnecting: false,
+          paneDead: false,
         }));
         ws.send(JSON.stringify({ type: "claim_if_vacant" }));
         const desired = desiredRef.current;
@@ -302,8 +306,9 @@ export function useLiveTerminal(
         if (disposed || wsRef.current !== ws) return;
         disposeInflater();
         ownerKnownRef.current = false;
-        setState((prev) => ({ ...prev, connected: false, isOwner: false, ownerKnown: false }));
-        if (event.code === CLOSE_CODE_PTY_DEAD) {
+        const paneDead = event.code === CLOSE_CODE_PTY_DEAD;
+        setState((prev) => ({ ...prev, connected: false, isOwner: false, ownerKnown: false, paneDead }));
+        if (paneDead) {
           retryCountRef.current = MAX_RETRIES;
         }
         if (retryCountRef.current < MAX_RETRIES) {

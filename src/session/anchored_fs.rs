@@ -13,6 +13,8 @@ use std::os::fd::OwnedFd;
 use std::os::unix::ffi::OsStringExt;
 use std::path::{Component, Path, PathBuf};
 
+const CONFLICT_NAME_ATTEMPTS: u32 = 100;
+
 pub(crate) struct AnchoredDir {
     root: PathBuf,
     fd: OwnedFd,
@@ -25,6 +27,8 @@ pub(crate) struct FilePublication<'a> {
 
 #[cfg(test)]
 thread_local! {
+    /// Runs between the replace and its post-check in `publish_staged`.
+    static AFTER_REPLACE: std::cell::RefCell<Option<Box<dyn Fn()>>> = const { std::cell::RefCell::new(None) };
     pub(crate) static FAIL_SYNC_ONCE: std::cell::RefCell<Option<PathBuf>> = const { std::cell::RefCell::new(None) };
 }
 
@@ -261,9 +265,23 @@ impl AnchoredDir {
         matches!(self.regular_lookup(relative), Ok(Some(true)))
     }
 
+    /// Whether two entries are the same file, without following links.
+    fn same_file(&self, a: &Path, b: &Path) -> Result<bool> {
+        let mut ids = [None, None];
+        for (id, path) in ids.iter_mut().zip([a, b]) {
+            let (parent, leaf) = self.open_parent(path)?;
+            *id = match fstatat(&parent, leaf.as_os_str(), AtFlags::AT_SYMLINK_NOFOLLOW) {
+                Ok(stat) => Some((stat.st_dev, stat.st_ino)),
+                Err(Errno::ENOENT) => None,
+                Err(error) => return Err(error).context("inspecting anchored file"),
+            };
+        }
+        Ok(ids[0].is_some() && ids[0] == ids[1])
+    }
+
     /// Publish the staging file `from` at `to` and drop the staging name.
-    /// `false` means something was already at `to` and was left untouched,
-    /// which only happens when `replace` is unset.
+    /// `false` means `to` kept its live copy: something was already there
+    /// (no `replace`), or it changed after `replace` was observed.
     ///
     /// Makes a file visible only once it is complete, so a process killed
     /// mid-write leaves a staging name rather than a half file under the real
@@ -272,10 +290,61 @@ impl AnchoredDir {
     /// existence check and this call would lose its file.
     /// `renameat2(RENAME_NOREPLACE)` would also answer, but it is Linux-only
     /// and this has to hold on macOS.
-    pub(crate) fn publish_staged(&self, from: &Path, to: &Path, replace: bool) -> Result<bool> {
+    ///
+    /// `replace` is the modification time the caller saw on `to`. The old file
+    /// is hard-linked to `.aoe-prev` before the rename and unlinked only if it
+    /// is still unchanged after it. A change means a writer got in: the carry
+    /// is kept at the first free `.aoe-conflict[.N]` and the old file is put back, so no version
+    /// is unlinked unseen. A leftover `.aoe-prev` that is
+    /// a link to the live file is dropped; any other fails the next replace
+    /// rather than being overwritten. A writer that holds
+    /// the old file open past the post-check is not covered, nor is one
+    /// that replaces `to` by path (rename over it, or unlink and recreate)
+    /// between the backup link and the rename.
+    pub(crate) fn publish_staged(
+        &self,
+        from: &Path,
+        to: &Path,
+        replace: Option<std::time::SystemTime>,
+    ) -> Result<bool> {
         let (from_parent, from_leaf) = self.open_parent(from)?;
         let (to_parent, to_leaf) = self.open_parent(to)?;
-        if replace {
+        if let Some(observed) = replace {
+            let prev = with_suffix(to, ".aoe-prev");
+            let (prev_parent, prev_leaf) = self.open_parent(&prev)?;
+            let mut recovered = false;
+            loop {
+                match linkat(
+                    &to_parent,
+                    to_leaf.as_os_str(),
+                    &prev_parent,
+                    prev_leaf.as_os_str(),
+                    AtFlags::empty(),
+                ) {
+                    Ok(()) => break,
+                    // `to` vanished after it was observed: publish as a first copy.
+                    Err(Errno::ENOENT) => return self.publish_staged(from, to, None),
+                    // A link to the live file is a replace that died before its
+                    // rename: nothing was displaced.
+                    Err(Errno::EEXIST) if !recovered && self.same_file(to, &prev)? => {
+                        self.remove_file(&prev)?;
+                        recovered = true;
+                    }
+                    Err(Errno::EEXIST) => bail!(
+                        "an interrupted carry left {} (the live copy it replaced) next to {} \
+                         (the carried copy); keep the one you want and delete {}",
+                        prev.display(),
+                        to.display(),
+                        prev.display()
+                    ),
+                    Err(error) => return Err(error).context("preserving anchored file"),
+                }
+            }
+            if self.regular_modified(&prev)? != Some(observed) {
+                self.remove_file(&prev)?;
+                self.remove_file(from)?;
+                return Ok(false);
+            }
             renameat(
                 &from_parent,
                 from_leaf.as_os_str(),
@@ -283,7 +352,52 @@ impl AnchoredDir {
                 to_leaf.as_os_str(),
             )
             .context("replacing anchored file")?;
-            return Ok(true);
+            #[cfg(test)]
+            AFTER_REPLACE.with(|hook| hook.borrow().as_ref().map(|hook| hook()));
+            if self.regular_modified(&prev)? == Some(observed) {
+                self.remove_file(&prev)?;
+                return Ok(true);
+            }
+            let mut preserved = None;
+            for attempt in 0..CONFLICT_NAME_ATTEMPTS {
+                let mut conflict = to_leaf.clone();
+                conflict.push(match attempt {
+                    0 => ".aoe-conflict".to_string(),
+                    n => format!(".aoe-conflict.{n}"),
+                });
+                match linkat(
+                    &to_parent,
+                    to_leaf.as_os_str(),
+                    &to_parent,
+                    conflict.as_os_str(),
+                    AtFlags::empty(),
+                ) {
+                    Ok(()) => {
+                        preserved = Some(conflict);
+                        break;
+                    }
+                    Err(Errno::EEXIST) => {}
+                    Err(error) => return Err(error).context("preserving the carried file"),
+                }
+            }
+            let Some(conflict) = preserved else {
+                bail!("no free name to preserve the carried file under");
+            };
+            renameat(
+                &prev_parent,
+                prev_leaf.as_os_str(),
+                &to_parent,
+                to_leaf.as_os_str(),
+            )
+            .context("restoring anchored file")?;
+            tracing::warn!(
+                target: "session.store",
+                destination = %to.display(),
+                conflict = %conflict.to_string_lossy(),
+                "a writer changed the destination transcript during the carry; kept it \
+                 and saved the carried copy beside it"
+            );
+            return Ok(false);
         }
         let published = match linkat(
             &from_parent,
@@ -539,6 +653,12 @@ fn normal_components(path: &Path) -> Result<Vec<std::ffi::OsString>> {
     Ok(result)
 }
 
+fn with_suffix(path: &Path, suffix: &str) -> PathBuf {
+    let mut name = path.as_os_str().to_os_string();
+    name.push(suffix);
+    PathBuf::from(name)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -573,6 +693,136 @@ mod tests {
                 .identity()
                 .unwrap()
         );
+    }
+
+    /// The old file is replaced only while untouched; a writer on either
+    /// inode, or an interrupted earlier replace, never costs a version.
+    #[cfg(unix)]
+    #[test]
+    fn replace_publish_never_unlinks_an_unseen_version() {
+        use std::fs::FileTimes;
+        use std::io::Write;
+        use std::time::{Duration, SystemTime};
+
+        struct Reset;
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                AFTER_REPLACE.set(None);
+            }
+        }
+        let _reset = Reset;
+        let now = SystemTime::now();
+        let stale = now - Duration::from_secs(3600);
+        let set_mtime = |path: &Path, at: SystemTime| {
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(path)
+                .unwrap()
+                .set_times(FileTimes::new().set_modified(at))
+                .unwrap();
+        };
+        let read = |root: &Path, name: &str| std::fs::read(root.join(name)).ok();
+        let (target, staging) = (Path::new("conv.jsonl"), Path::new("conv.jsonl.aoe-carry"));
+
+        // (case, published, target, conflict, prev)
+        type Case<'a> = (&'a str, bool, &'a [u8], Option<&'a [u8]>, Option<&'a [u8]>);
+        let cases: [Case; 7] = [
+            ("untouched", true, b"carry\n", None, None),
+            ("changed before", false, b"live\n", None, None),
+            (
+                "writers during the replace",
+                false,
+                b"old\nfd\n",
+                Some(b"carry\npath\n"),
+                None,
+            ),
+            (
+                "earlier conflict",
+                false,
+                b"old\nfd\n",
+                Some(b"earlier\n"),
+                None,
+            ),
+            (
+                "interrupted earlier",
+                false,
+                b"old\n",
+                None,
+                Some(b"displaced\n"),
+            ),
+            ("deleted", true, b"carry\n", None, None),
+            ("leftover link", true, b"carry\n", None, None),
+        ];
+        for (case, published, expected, conflict, prev) in cases {
+            let temp = tempfile::tempdir().unwrap();
+            let root = temp.path();
+            let anchored = AnchoredDir::open(root).unwrap();
+            std::fs::write(root.join(target), b"old\n").unwrap();
+            set_mtime(&root.join(target), stale);
+            let observed = anchored.regular_modified(target).unwrap().unwrap();
+            std::fs::write(root.join(staging), b"carry\n").unwrap();
+            match case {
+                "changed before" => {
+                    std::fs::write(root.join(target), b"live\n").unwrap();
+                    set_mtime(&root.join(target), now);
+                }
+                "writers during the replace" | "earlier conflict" => {
+                    if case == "earlier conflict" {
+                        std::fs::write(root.join("conv.jsonl.aoe-conflict"), b"earlier\n").unwrap();
+                    }
+                    let held = std::fs::OpenOptions::new()
+                        .append(true)
+                        .open(root.join(target))
+                        .unwrap();
+                    let path = root.join(target);
+                    AFTER_REPLACE.set(Some(Box::new(move || {
+                        (&held).write_all(b"fd\n").unwrap();
+                        let mut through_path = std::fs::OpenOptions::new()
+                            .append(true)
+                            .open(&path)
+                            .unwrap();
+                        through_path.write_all(b"path\n").unwrap();
+                    })));
+                }
+                "interrupted earlier" => {
+                    std::fs::write(root.join("conv.jsonl.aoe-prev"), b"displaced\n").unwrap();
+                }
+                "deleted" => std::fs::remove_file(root.join(target)).unwrap(),
+                "leftover link" => {
+                    std::fs::hard_link(root.join(target), root.join("conv.jsonl.aoe-prev"))
+                        .unwrap();
+                }
+                _ => {}
+            }
+
+            let result = anchored.publish_staged(staging, target, Some(observed));
+            AFTER_REPLACE.set(None);
+
+            assert_eq!(result.is_err(), case == "interrupted earlier", "{case}");
+            if let Ok(result) = result {
+                assert_eq!(result, published, "{case}");
+            }
+            assert_eq!(
+                read(root, "conv.jsonl").as_deref(),
+                Some(expected),
+                "{case}"
+            );
+            assert_eq!(
+                read(root, "conv.jsonl.aoe-conflict").as_deref(),
+                conflict,
+                "{case}"
+            );
+            assert_eq!(read(root, "conv.jsonl.aoe-prev").as_deref(), prev, "{case}");
+            if case == "earlier conflict" {
+                assert_eq!(
+                    read(root, "conv.jsonl.aoe-conflict.1").as_deref(),
+                    Some(&b"carry\npath\n"[..])
+                );
+            }
+            if case != "interrupted earlier" {
+                assert!(read(root, "conv.jsonl.aoe-carry").is_none(), "{case}");
+            }
+        }
     }
 
     #[cfg(unix)]

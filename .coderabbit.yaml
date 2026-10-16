@@ -58,10 +58,9 @@ reviews:
   labeling_instructions: []
   auto_apply_labels: false
 
-  # Solo maintainer today; harmless but inert. Leave on so it works the day a
-  # second maintainer joins.
-  suggested_reviewers: true
-  auto_assign_reviewers: true
+  # Reviewer routing is handled by CODEOWNERS teams.
+  suggested_reviewers: false
+  auto_assign_reviewers: false
 
   in_progress_fortune: false
   poem: false

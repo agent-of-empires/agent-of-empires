@@ -49,7 +49,7 @@ Capabilities gate runtime resource access. They are prompted once at install and
 |---|---|
 | `runtime.worker` | Running any plugin code at all (host RPCs the worker initiates). Any worker needs this. |
 | `session.read` | Reading sessions of the host's profile: the attached session, `sessions.list`, and the `session.status.changed` notifications (`api_version >= 14`). |
-| `session.write` | Mutating the attached session. |
+| `session.write` | Mutating any session of the profile: `session.meta.set`/`cas`, and archive/trash from a plugin page. |
 | `config.read` | Reading host or other-plugin configuration (not the plugin's own settings). |
 | `config.write` | Writing host or other-plugin configuration. |
 | `process.spawn` | Spawning processes beyond the plugin's own worker. |
@@ -349,8 +349,10 @@ A request is `{ "aoeBridge": 1, "id", "method", "params"? }`, where `id` is a nu
 | `plugins.uiState` | none | `session.read` | The `GET /api/plugins/ui-state` body, including other plugins' entries |
 | `action` | `{ "method", "params"?, "sessionId"? }` | not read-only or CityHall | `{ "baselineRevision" }`; the call goes to this plugin's own worker, as a [pane action](#pane-actions) does |
 | `openSession` | `{ "id" }` | none | `null`; the dashboard navigates to the session |
+| `session.archive` | `{ "id" }` | `session.read` and `session.write`, not read-only or CityHall | `null`; archives the session and stops its pane |
+| `session.trash` | `{ "id" }` | `session.read` and `session.write`, not read-only or CityHall | `null`; moves the session to the trash and stops its pane |
 
-Error codes: `unknown_method`, `invalid_params`, `capability_denied` (the plugin does not declare the required capability), `read_only`, `cityhall_mode`, and `failed` (the dashboard's request failed). An `action` result only acknowledges delivery; its effect arrives in `plugins.uiState` once the worker updates its state.
+Error codes: `unknown_method`, `invalid_params` (also an `id` that `sessions.list` does not return), `capability_denied` (the plugin does not declare the required capability), `read_only`, `cityhall_mode`, and `failed` (the dashboard's request failed). An `action` result only acknowledges delivery; its effect arrives in `plugins.uiState` once the worker updates its state.
 
 The dashboard pushes `{ "aoeBridge": 1, "event", "data" }` messages, with no `id`:
 

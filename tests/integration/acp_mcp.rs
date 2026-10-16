@@ -13,7 +13,8 @@ use agent_of_empires::acp::acp_client::{AcpClient, SpawnConfig};
 use agent_of_empires::acp::agent_registry::AgentSpec;
 use agent_of_empires::acp::mcp_config;
 use agent_of_empires::acp::state::AcpSessionId;
-use agent_of_empires::session::mcp::mcp_model;
+use agent_of_empires::session::mcp::mcp_model::{self, McpProvenance, ResolvedMcpServer};
+use agent_of_empires::session::mcp::project_mcp::parse_standard_mcp_servers;
 
 use crate::common::{shim_path, shim_ready};
 
@@ -110,7 +111,19 @@ enabled = false
     let record_path = record_dir.path().join("record.json");
     let mut config = base_config(std::env::temp_dir(), &record_path);
     config.agent_key = "codex".into();
-    config.mcp_servers = mcp_config::project_servers_to_acp(native);
+    config.mcp_servers = mcp_config::project_servers_to_acp(
+        native
+            .into_iter()
+            .map(|def| ResolvedMcpServer {
+                def,
+                provenance: McpProvenance::AgentNative {
+                    agent: "codex".into(),
+                },
+                shadowed: Vec::new(),
+            })
+            .collect(),
+        &[],
+    );
 
     let client = AcpClient::spawn(config, AcpSessionId("mcp-codex-disabled".into()))
         .await
@@ -125,4 +138,69 @@ enabled = false
         .map(|server| server["name"].as_str().unwrap())
         .collect::<Vec<_>>();
     assert_eq!(names, vec!["explicit_true", "omitted"], "got {body}");
+}
+
+#[tokio::test]
+#[serial_test::parallel]
+async fn new_session_receives_expanded_and_unresolved_mcp_auth_headers() {
+    if let Err(reason) = shim_ready() {
+        eprintln!("skipping: {reason}");
+        return;
+    }
+
+    let servers = parse_standard_mcp_servers(
+        r#"{"mcpServers":{
+            "missing":{"type":"http","url":"https://missing.mcp.invalid","headers":{
+                "Authorization":"Bearer ${MISSING_TOKEN}",
+                "X-Reference":"${MISSING_TOKEN}"
+            }},
+            "resolved":{"type":"http","url":"https://resolved.mcp.invalid","headers":{
+                "Authorization":"Bearer ${GITHUB_TOKEN}"
+            }}
+        }}"#,
+    )
+    .unwrap()
+    .into_iter()
+    .map(|def| ResolvedMcpServer {
+        def,
+        provenance: McpProvenance::Profile {
+            name: "test".into(),
+        },
+        shadowed: Vec::new(),
+    })
+    .collect();
+
+    let record_dir = tempfile::tempdir().unwrap();
+    let record_path = record_dir.path().join("record.json");
+    let session_env = vec![("GITHUB_TOKEN".into(), "synthetic-token".into())];
+    let mut config = base_config(std::env::temp_dir(), &record_path);
+    config
+        .provider_env
+        .push(("SHIM_MCP_CAPABILITY".into(), "http".into()));
+    config.host_environment = session_env.clone();
+    config.mcp_servers = mcp_config::project_servers_to_acp(servers, &session_env);
+
+    let client = AcpClient::spawn(config, AcpSessionId("mcp-header-expansion".into()))
+        .await
+        .expect("spawn shim agent");
+
+    let body = read_record(&record_path);
+    let _ = client.shutdown().await;
+    let servers: serde_json::Value = serde_json::from_str(&body).expect("mcp servers are JSON");
+    let servers = servers.as_array().expect("mcp servers are an array");
+    let resolved = servers
+        .iter()
+        .find(|server| server["name"] == "resolved")
+        .expect("resolved server reached session/new");
+    assert_eq!(
+        resolved["headers"][0]["value"], "Bearer synthetic-token",
+        "{body}"
+    );
+    let missing = servers
+        .iter()
+        .find(|server| server["name"] == "missing")
+        .expect("server with missing auth remains in session/new");
+    assert_eq!(missing["headers"].as_array().unwrap().len(), 1, "{body}");
+    assert_eq!(missing["headers"][0]["name"], "X-Reference");
+    assert_eq!(missing["headers"][0]["value"], "${MISSING_TOKEN}");
 }

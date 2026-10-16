@@ -38,8 +38,8 @@ vi.mock("../../lib/api", () => ({
   fetchPlugins: vi.fn(() => Promise.resolve(null)),
   fetchSettings: vi.fn(),
   getSettingsSchema: vi.fn(() => Promise.resolve(SESSION_SCHEMA)),
-  updateSettings: vi.fn(() => Promise.resolve(true)),
-  updateProfileSettings: vi.fn(() => Promise.resolve(true)),
+  updateSettings: vi.fn(() => Promise.resolve("committed" as const)),
+  updateProfileSettings: vi.fn(() => Promise.resolve("committed" as const)),
   setDefaultProfile: vi.fn(() => Promise.resolve(true)),
   createProfile: vi.fn(() => Promise.resolve(true)),
   renameProfile: vi.fn(() => Promise.resolve(true)),
@@ -89,6 +89,10 @@ const autoStopInput = (container: HTMLElement) =>
 
 const expectSaved = (patch: Record<string, unknown>) =>
   waitFor(() => expect(vi.mocked(api.updateSettings)).toHaveBeenCalledWith(patch, "main"));
+
+import { resetSettingsStore } from "../../lib/settingsStore";
+
+beforeEach(resetSettingsStore);
 
 describe("Session tab", () => {
   beforeEach(() => vi.clearAllMocks());

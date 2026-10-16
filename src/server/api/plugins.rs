@@ -371,10 +371,12 @@ pub async fn plugin_sessions(
             format!("Plugin {id} does not declare {CAP_SESSION_READ}"),
         );
     }
+    // The worker's `sessions.list` scope: the host's profile, and only structured sessions in CityHall.
+    let profile = crate::session::config::effective_profile(&state.profile);
     let instances = state.instances.read().await;
-    // Same scope as `GET /api/sessions`: CityHall sees only structured sessions.
     let sessions: Vec<_> = instances
         .iter()
+        .filter(|inst| inst.effective_profile() == profile)
         .filter(|inst| !state.cityhall_mode || inst.is_structured())
         .map(plugin::host_api::session_summary)
         .collect();
@@ -1543,7 +1545,7 @@ id = "voice"
 
     #[tokio::test]
     #[serial_test::serial]
-    async fn plugin_sessions_serve_worker_rows_only_with_session_read() {
+    async fn plugin_sessions_serve_host_profile_worker_rows_only_with_session_read() {
         use tower::ServiceExt;
         let _app_dir = AppDirEnvGuard::new();
         let reader_caps = ["runtime.worker", CAP_SESSION_READ];
@@ -1569,9 +1571,12 @@ id = "voice"
         update_config(|c| *c = config).expect("save config");
         crate::plugin::reload_registry();
 
-        let inst = crate::session::Instance::new("alpha", "/tmp/alpha");
+        let mut inst = crate::session::Instance::new("alpha", "/tmp/alpha");
+        inst.source_profile = "test".into();
         let expected = json!([crate::plugin::host_api::session_summary(&inst)]);
-        let state = crate::server::test_support::build_test_app_state(vec![inst]);
+        let mut other = crate::session::Instance::new("beta", "/tmp/beta");
+        other.source_profile = "other".into();
+        let state = crate::server::test_support::build_test_app_state(vec![inst, other]);
         let app = crate::server::test_support::build_router_for_test(state);
         let get =
             |path: &str| {

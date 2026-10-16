@@ -165,6 +165,7 @@ impl HomeView {
             crate::tui::styles::idle_decay_window(resolved.theme.idle_decay_minutes);
         crate::session::set_unread_enabled(resolved.session.unread_indicator);
         crate::session::set_favorites_first(resolved.session.favorites_first);
+        crate::session::set_preview_link_prefixes(&resolved.session.preview_link_prefixes);
         let user_config = load_config().ok().flatten();
         let sort_order = user_config
             .as_ref()
@@ -198,6 +199,7 @@ impl HomeView {
 
         let config_watch = ConfigWatchState {
             dirty: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            link_policy_dirty: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             handles: HashMap::new(),
         };
 
@@ -349,6 +351,7 @@ impl HomeView {
             pending_status_refresh: false,
             show_diagnostics: resolved.session.show_diagnostics_pane,
             show_shortcut_bar: resolved.session.show_shortcut_bar,
+            preview_link_prefixes: resolved.session.preview_link_prefixes.clone(),
             metrics_poller: crate::tui::metrics_poller::MetricsPoller::new(),
             pending_metrics_refresh: false,
             metrics: crate::process::metrics::MetricsSnapshot::default(),
@@ -427,9 +430,9 @@ impl HomeView {
             confirm_before_quit,
             host_tab_title,
             active_tui_count: 1,
-            serve_badge: None,
+            serve_running: false,
             serve_probe: crate::tui::worker::Worker::spawn("aoe-serve-probe", |()| {
-                crate::cli::serve::serve_badge()
+                crate::cli::serve::daemon_pid().is_some()
             }),
             serve_probe_in_flight: false,
             idle_decay_window,
@@ -454,6 +457,12 @@ impl HomeView {
                 .as_ref()
                 .and_then(|c| c.app_state.show_preview_info)
                 .unwrap_or(true),
+            split_terminal: user_config
+                .as_ref()
+                .and_then(|c| c.app_state.home_split_terminal)
+                .unwrap_or(false),
+            split_capture_worker: None,
+            split_capture_target: None,
             archived_section_collapsed: user_config
                 .as_ref()
                 .and_then(|c| c.app_state.archived_section_collapsed)
@@ -462,6 +471,7 @@ impl HomeView {
             hide_stopped_in_groups: false,
             group_totals: HashMap::new(),
             recovery_rx: None,
+            opener_exits: Vec::new(),
             recovery_lock: None,
             recovery_in_flight: std::collections::HashSet::new(),
             restart_cooldown_at: std::collections::HashMap::new(),

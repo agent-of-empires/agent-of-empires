@@ -22,7 +22,7 @@ Copy relies on the browser Clipboard API, which needs a secure context: HTTPS or
 
 ## Paired terminal
 
-Each session can open a **paired terminal**: a host shell (or, for a sandboxed session, one inside the container) rooted at the session's working directory. On desktop it shares the split with the agent terminal; on mobile it is one of the right-panel views. It stays alive in the background when you switch away.
+Each session can open a **paired terminal**: a host shell (or, for a sandboxed session, one inside the container) rooted at the session's working directory. On desktop it shares the split with the agent terminal; on mobile it is one of the right-panel views. It stays alive in the background when you switch away. Its terminal 1 is the same shell the TUI opens with `T`, in the matching Host or Container mode.
 
 The **Container** tab launches the container user's preferred shell, resolved inside the container from the passwd entry, then `$SHELL`, then bash or sh. Candidates must be regular executables that either have a recognized shell name or appear in `/etc/shells`; known-compatible shells run in login mode.
 

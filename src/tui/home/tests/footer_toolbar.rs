@@ -106,12 +106,13 @@ fn buttons_map_clicks_hover_and_yield_to_overlays() {
 
 /// Strict-hotkey mode shifts the chords: Diff becomes Ctrl+D and Delete
 /// becomes an uppercase 'D', and the buttons synthesize those exactly.
+/// Rendered wide enough that every hint fits beside the tips badge.
 #[test]
 #[serial]
 fn strict_mode_buttons_carry_shifted_chords() {
     let mut env = create_test_env_with_sessions(3);
     env.view.strict_hotkeys = true;
-    render_at(&mut env, 120, 12);
+    render_at(&mut env, 160, 12);
 
     let diff = button_key(&env, KeyCode::Char('d')).expect("Diff button (strict ^D)");
     assert_eq!(
@@ -159,4 +160,69 @@ fn live_send_banner_names_space_chords_and_hides_buttons() {
     env.view.live_send_pending_leader = true;
     let screen = render_home_to_string(&mut env.view, 120, 12);
     assert!(screen.contains("Ctrl+Space:"), "{screen}");
+}
+
+/// The running server status outlasts the other priority-0 hints: at 48 columns with tips
+/// and a committed search, the search cue fills the space `?` would need, not the status.
+#[test]
+#[serial]
+fn running_web_status_survives_a_committed_search_on_a_narrow_footer() {
+    let mut env = create_test_env_with_sessions(3);
+    env.view.tips_unseen = 3;
+    for c in ['/', 's', 'e', 's', 's'] {
+        env.view.handle_key(key(KeyCode::Char(c)), None);
+    }
+    env.view.handle_key(key(KeyCode::Enter), None);
+    let shown = |env: &TestEnv, code| env.view.footer_buttons.iter().any(|(k, _)| k.code == code);
+    render_at(&mut env, 48, 12);
+    assert!(shown(&env, KeyCode::Char('n')), "search cue kept");
+    assert!(!shown(&env, KeyCode::Char('R')), "idle hint drops first");
+    env.view.serve_running = true;
+    render_at(&mut env, 48, 12);
+    assert!(shown(&env, KeyCode::Char('R')), "running status kept");
+    assert!(shown(&env, KeyCode::Enter), "Enter kept");
+}
+
+/// The web dashboard entry and New survive the narrow footers the bar is tuned for: with a
+/// tips badge showing, `R` (strict: Ctrl+R), New and Msg stay at 80 and 60 columns, and
+/// Fav, now below them, is the one that drops.
+#[test]
+#[serial]
+fn web_entry_and_new_survive_narrow_footers() {
+    let mut env = create_test_env_with_sessions(1);
+    let original = crate::session::favorites_first();
+    crate::session::set_favorites_first(true);
+    env.view.tips_unseen = 3;
+    let plain = |c| (KeyCode::Char(c), KeyModifiers::NONE);
+    for (strict, width, fav_kept) in [
+        (false, 120, true),
+        (false, 80, false),
+        (false, 60, false),
+        (true, 80, false),
+    ] {
+        env.view.strict_hotkeys = strict;
+        render_at(&mut env, width, 12);
+        let shown = |(code, modifiers): (KeyCode, KeyModifiers)| {
+            env.view
+                .footer_buttons
+                .iter()
+                .any(|(k, _)| k.code == code && k.modifiers == modifiers)
+        };
+        let (web, new, msg, fav) = if strict {
+            (
+                (KeyCode::Char('r'), KeyModifiers::CONTROL),
+                plain('N'),
+                plain('M'),
+                plain('F'),
+            )
+        } else {
+            (plain('R'), plain('n'), plain('m'), plain('f'))
+        };
+        let case = format!("strict={strict} width={width}");
+        assert!(shown(web), "web entry kept: {case}");
+        assert!(shown(new), "New kept: {case}");
+        assert!(shown(msg), "Msg kept: {case}");
+        assert_eq!(shown(fav), fav_kept, "Fav: {case}");
+    }
+    crate::session::set_favorites_first(original);
 }

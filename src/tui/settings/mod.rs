@@ -8,8 +8,8 @@ use tui_input::Input;
 
 use crate::session::{
     list_profiles_for_display, load_profile_config, load_repo_config, merge_configs,
-    profile_to_repo_config, repo_config_to_profile, save_profile_config, save_repo_config,
-    sort_profiles_for_display, update_app_state, update_config, Config, ProfileConfig, RepoConfig,
+    profile_to_repo_config, repo_config_to_profile, save_repo_config, sort_profiles_for_display,
+    update_app_state, update_config, update_profile_config, Config, ProfileConfig, RepoConfig,
 };
 use crate::tui::dialogs::CustomInstructionDialog;
 
@@ -861,7 +861,22 @@ impl SettingsView {
                 crate::telemetry::apply_opt_in_change(self.global_config.telemetry.enabled);
             }
             SettingsScope::Profile => {
-                save_profile_config(&self.profile, &self.profile_config)?;
+                // Same changed-leaves write-back as the global scope: a whole-struct
+                // save would revert edits another writer made while this pane was open.
+                let edited = config_to_json(&self.profile_config);
+                let baseline = self.baseline_profile.clone();
+                self.profile_config = update_profile_config(&self.profile, |p| {
+                    let mut fresh = serde_json::to_value(&*p)?;
+                    crate::session::config::settings_schema::apply_changed_leaves(
+                        &mut fresh, &baseline, &edited,
+                    );
+                    *p = serde_json::from_value(fresh)?;
+                    Ok(p.clone())
+                })?;
+                // Show what is on disk, including other writers' edits merged in.
+                self.resolved_base =
+                    merge_configs(self.global_config.clone(), &self.profile_config);
+                self.rebuild_fields();
             }
             SettingsScope::Repo => {
                 if let (Some(ref project_path), Some(ref repo_config)) =

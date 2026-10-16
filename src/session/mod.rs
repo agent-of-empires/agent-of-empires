@@ -130,11 +130,31 @@ pub fn set_favorites_first(on: bool) {
     FAVORITES_FIRST.store(on, Ordering::Relaxed);
 }
 
+/// Process-wide cache of `session.preview_link_prefixes`, read where OSC 8
+/// targets are extracted, off the TUI thread.
+static PREVIEW_LINK_PREFIXES: std::sync::RwLock<Vec<String>> = std::sync::RwLock::new(Vec::new());
+
+/// Whether a pane link to `url` is worth keeping under the cached prefixes.
+pub fn preview_link_openable(url: &str) -> bool {
+    let prefixes = PREVIEW_LINK_PREFIXES
+        .read()
+        .unwrap_or_else(|e| e.into_inner());
+    crate::util::is_openable_link(url, &prefixes)
+}
+
+/// Update the cached preview link prefixes from resolved config.
+pub fn set_preview_link_prefixes(prefixes: &[String]) {
+    *PREVIEW_LINK_PREFIXES
+        .write()
+        .unwrap_or_else(|e| e.into_inner()) = prefixes.to_vec();
+}
+
 pub use config::profile_config::{
     load_profile_config, merge_configs, resolve_config, resolve_config_or_warn,
-    save_profile_config, validate_capability_format, validate_check_interval, validate_env_format,
-    validate_memory_limit, validate_network_format, validate_port_mapping_format,
-    validate_security_opt_format, validate_systemd_slice, validate_volume_format, ProfileConfig,
+    save_profile_config, update_profile_config, validate_capability_format,
+    validate_check_interval, validate_env_format, validate_memory_limit, validate_network_format,
+    validate_port_mapping_format, validate_security_opt_format, validate_systemd_slice,
+    validate_volume_format, ProfileConfig,
 };
 pub use config::repo_config::{
     check_repo_trust, execute_hooks, execute_hooks_in_container, load_repo_config,
