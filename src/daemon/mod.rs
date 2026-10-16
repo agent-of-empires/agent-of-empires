@@ -1,5 +1,6 @@
 //! Reusable client and shared wire contract for the daemon REST API.
 
+pub mod live;
 mod wire;
 
 use std::fmt;
