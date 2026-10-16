@@ -415,6 +415,19 @@ describe("attachment drafts (#2493)", () => {
     expect(await listAttachmentSessionIds()).toEqual([]);
   });
 
+  it("keeps the clear's revision fence when the tombstone only fits after the stale bytes are freed", async () => {
+    const real = await vi.importActual<typeof import("./attachmentStore")>("./attachmentStore");
+    await real.saveAttachments("s-1", [img("OLD")], [100, "a"]);
+    vi.spyOn(IDBObjectStore.prototype, "put").mockImplementationOnce(() => {
+      throw new DOMException("The quota has been exceeded.", "QuotaExceededError");
+    });
+    await setDraftAttachments("s-1", []);
+    // A tab that read the marker before the clear now commits its older save into the freed space.
+    await real.saveAttachments("s-1", [img("STALE")], [200, "a"]);
+    expect(await loadState("s-1")).toMatchObject({ saved: false });
+    expect(await real.loadAttachments("s-1")).toEqual([]);
+  });
+
   it("reconciles the marker under a per-session cross-tab lock when the browser has one", async () => {
     const names: string[] = [];
     Object.defineProperty(navigator, "locks", {
