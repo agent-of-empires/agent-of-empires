@@ -11,8 +11,9 @@ vi.mock("../lib/api", () => ({
   fetchSoundBlob: (...args: unknown[]) => fetchSoundBlob(...args),
 }));
 
-import { useApprovalSound, clearApprovalSoundCache } from "./useApprovalSound";
+import { useApprovalSound } from "./useApprovalSound";
 import { notifySettingsChanged } from "../lib/settingsEvents";
+import { approvalChimedRecently, clearSoundCache } from "../lib/soundPlayer";
 
 const REPLAY_QUIET_MS = 1500;
 
@@ -46,7 +47,7 @@ describe("useApprovalSound", () => {
     vi.stubGlobal("Audio", FakeAudio);
     vi.spyOn(URL, "createObjectURL").mockReturnValue("blob:fake-url");
     vi.spyOn(URL, "revokeObjectURL").mockImplementation(() => {});
-    clearApprovalSoundCache();
+    clearSoundCache();
     vi.mocked(URL.revokeObjectURL).mockClear();
   });
 
@@ -81,10 +82,28 @@ describe("useApprovalSound", () => {
     expect(audioInstances).toHaveLength(3);
   });
 
+  it("records the chime for the session so its Waiting sound can be skipped", async () => {
+    const view = renderHook((p: number) => useApprovalSound(p, "sess-1"), { initialProps: 0 });
+    await act(async () => {
+      vi.advanceTimersByTime(REPLAY_QUIET_MS);
+    });
+    expect(approvalChimedRecently("sess-1")).toBe(false);
+    view.rerender(1);
+    await flushPlayback();
+    expect(approvalChimedRecently("sess-1")).toBe(true);
+    expect(approvalChimedRecently("other")).toBe(false);
+  });
+
   it("swallows an edge during the replay grace window", async () => {
     const { rerender } = renderHook((p: number) => useApprovalSound(p), { initialProps: 0 });
     rerender(2);
     await flushPlayback();
+    expect(audioInstances).toHaveLength(0);
+  });
+
+  it("stays silent when browser sounds are off", async () => {
+    fetchSettings.mockResolvedValue({ sound: { enabled: true, browser_enabled: false, on_approval: "ding" } });
+    await walk(1);
     expect(audioInstances).toHaveLength(0);
   });
 
@@ -120,12 +139,12 @@ describe("useApprovalSound", () => {
     expect(URL.createObjectURL).toHaveBeenCalledTimes(1);
   });
 
-  it("clearApprovalSoundCache revokes the blob URL and forces a refetch", async () => {
-    clearApprovalSoundCache();
+  it("clearSoundCache revokes the blob URL and forces a refetch", async () => {
+    clearSoundCache();
     expect(URL.revokeObjectURL).not.toHaveBeenCalled();
 
     const { rerender } = await walk(1);
-    act(() => clearApprovalSoundCache());
+    act(() => clearSoundCache());
     expect(URL.revokeObjectURL).toHaveBeenCalledWith("blob:fake-url");
     for (const count of [0, 1]) {
       rerender(count);

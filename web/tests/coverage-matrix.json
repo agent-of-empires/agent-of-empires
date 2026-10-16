@@ -801,6 +801,13 @@
       "components": ["web/src/components/PushHealthBanner.tsx"]
     },
     {
+      "id": "notifications.status-sounds",
+      "kind": "vitest",
+      "risk": "medium",
+      "specs": ["src/lib/statusSounds.test.ts", "src/hooks/useStatusSounds.test.ts"],
+      "components": ["web/src/lib/statusSounds.ts", "web/src/hooks/useStatusSounds.ts", "web/src/lib/soundPlayer.ts"]
+    },
+    {
       "id": "settings.security-readonly",
       "kind": "vitest",
       "risk": "low",
@@ -2587,8 +2594,12 @@
       "id": "acp.attention-chime",
       "kind": "vitest",
       "risk": "medium",
-      "specs": ["src/components/acp/__tests__/AttentionChime.test.tsx"],
-      "components": ["web/src/components/acp/AttentionChime.tsx", "web/src/components/acp/StructuredView.tsx"]
+      "specs": ["src/components/acp/__tests__/AttentionChime.test.tsx", "src/hooks/useApprovalSound.test.ts"],
+      "components": [
+        "web/src/components/acp/AttentionChime.tsx",
+        "web/src/components/acp/StructuredView.tsx",
+        "web/src/hooks/useApprovalSound.ts"
+      ]
     },
     {
       "id": "acp.elicitation-card",
