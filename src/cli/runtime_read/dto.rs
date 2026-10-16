@@ -496,8 +496,7 @@ pub(crate) fn validate_hello(hello: &HelloData) -> Result<(), &'static str> {
     Ok(())
 }
 
-/// How many rows one session's ancestry may span. Far above any chain a fork
-/// can produce and far below the point where the walk costs anything.
+/// Bound ancestry walks on received session rows.
 const MAX_SESSION_DEPTH: usize = 64;
 pub(crate) fn validate_snapshot(snapshot: &SnapshotData) -> Result<(), &'static str> {
     if !valid_namespace(&snapshot.namespace)
@@ -544,11 +543,6 @@ pub(crate) fn validate_snapshot(snapshot: &SnapshotData) -> Result<(), &'static 
 
     validate_freshness(&snapshot.status_freshness)?;
     validate_projects(&snapshot.global_projects, ProjectScope::Global)?;
-    let profile_names: HashSet<&str> = snapshot
-        .profiles
-        .iter()
-        .map(|profile| profile.name.as_str())
-        .collect();
     let mut profile_groups: HashMap<&str, HashSet<&str>> = HashMap::new();
     let mut profile_projects: HashMap<&str, HashSet<&str>> = HashMap::new();
     // Every project path a session of that profile uses, so an unregistered
@@ -597,19 +591,10 @@ pub(crate) fn validate_snapshot(snapshot: &SnapshotData) -> Result<(), &'static 
         .iter()
         .map(|project| project.path.as_str())
         .collect();
-    let mut parents: HashMap<(&str, &str), Option<&str>> = HashMap::new();
+    if !invalid_session_profiles(&snapshot.sessions).is_empty() {
+        return Err("schema_invalid");
+    }
     for session in &snapshot.sessions {
-        if parents
-            .insert(
-                (session.profile.as_str(), session.id.as_str()),
-                session.parent_session_id.as_deref(),
-            )
-            .is_some()
-            || !profile_names.contains(session.profile.as_str())
-        {
-            return Err("schema_invalid");
-        }
-        validate_session(session)?;
         let groups = profile_groups
             .get(session.profile.as_str())
             .ok_or("schema_invalid")?;
@@ -623,21 +608,43 @@ pub(crate) fn validate_snapshot(snapshot: &SnapshotData) -> Result<(), &'static 
             return Err("schema_invalid");
         }
     }
-    for ((profile, id), parent) in &parents {
-        if parent.is_some() {
-            let mut seen = HashSet::new();
-            let mut cursor = Some(*id);
-            let mut depth = 0usize;
-            while let Some(node) = cursor {
-                if !seen.insert(node) || depth >= MAX_SESSION_DEPTH {
-                    return Err("schema_invalid");
-                }
-                depth += 1;
-                cursor = parents.get(&(*profile, node)).copied().flatten();
-            }
+    Ok(())
+}
+
+/// Shared by producer admission and validation of arbitrary peers.
+pub(crate) fn invalid_session_profiles(sessions: &[SessionRead]) -> HashSet<&str> {
+    let mut rejected = HashSet::new();
+    let mut parents: HashMap<(&str, &str), Option<&str>> = HashMap::with_capacity(sessions.len());
+    for session in sessions {
+        if parents
+            .insert(
+                (session.profile.as_str(), session.id.as_str()),
+                session.parent_session_id.as_deref(),
+            )
+            .is_some()
+            || validate_session(session).is_err()
+        {
+            rejected.insert(session.profile.as_str());
         }
     }
-    Ok(())
+    let mut seen = HashSet::new();
+    for ((profile, id), parent) in &parents {
+        if parent.is_none() || rejected.contains(profile) {
+            continue;
+        }
+        seen.clear();
+        let mut cursor = Some(*id);
+        let mut depth = 0;
+        while let Some(node) = cursor {
+            if !seen.insert(node) || depth >= MAX_SESSION_DEPTH {
+                rejected.insert(*profile);
+                break;
+            }
+            depth += 1;
+            cursor = parents.get(&(*profile, node)).copied().flatten();
+        }
+    }
+    rejected
 }
 
 pub(crate) fn validate_cross_message(
@@ -1343,9 +1350,11 @@ mod tests {
         let mut value = parent_chain_snapshot(1);
         value.sessions[0].command = "printf 'one\tvalue'\nprintf 'two\n'".into();
         assert_eq!(validate_snapshot(&value), Ok(()));
-        let mut bad_id = value.clone();
-        bad_id.sessions[0].id.push('\n');
-        assert_eq!(validate_snapshot(&bad_id), Err("schema_invalid"));
+        for id in ["bad\nid", "bad\u{202e}id"] {
+            let mut bad_id = value.clone();
+            bad_id.sessions[0].id = id.into();
+            assert_eq!(validate_snapshot(&bad_id), Err("schema_invalid"));
+        }
     }
 
     #[test]
@@ -1539,6 +1548,13 @@ mod tests {
             Ok(()),
             "a descending stored order reaches the wire and must be kept"
         );
+        for path in ["/src/a/", "/src/./a", "/src/a/../b"] {
+            assert_eq!(
+                validate_session(&session_with_repos(vec![repo("a", path)])),
+                Err("schema_invalid"),
+                "{path}"
+            );
+        }
         assert_eq!(
             validate_session(&session_with_repos(vec![
                 repo("a\t", "/srv/a"),

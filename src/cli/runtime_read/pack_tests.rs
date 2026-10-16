@@ -270,18 +270,20 @@ async fn all_recorded_exchanges_preserve_the_cli_answers() {
             ReadOutcome::from(failure)
         } else {
             let frames = pack::application_frames(fixture.wire);
-            let mut expected = super::ExpectedPeer::Remote;
+            let expected = super::ExpectedPeer::Remote;
             #[cfg(target_os = "linux")]
-            if name == "uds-list-nominal" {
+            let expected = if name == "uds-list-nominal" {
                 let hello = parse_hello(frames[0].as_bytes()).unwrap();
-                expected = super::ExpectedPeer::Local(super::uds::UdsIdentity {
+                super::ExpectedPeer::Local(super::uds::UdsIdentity {
                     namespace: hello.namespace,
                     prebind_instance_id: hello.prebind_instance_id,
                     runtime_instance_id: hello.runtime_instance_id,
                     runtime_epoch: hello.runtime_epoch,
                     owner_uid: 501,
-                });
-            }
+                })
+            } else {
+                expected
+            };
             let (client, peer) = tokio::io::duplex(64 * 1024);
             let server = tokio::spawn(async move {
                 let mut socket =

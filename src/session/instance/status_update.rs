@@ -916,23 +916,24 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn update_status_reconciles_running_hook_to_waiting_on_claude_approval_prompt() {
+        let home = crate::session::test_support::isolate_app_dir();
         if !tmux_available() {
             eprintln!("skipping: tmux not available");
             return;
         }
 
         let mut inst = Instance::new("aoe_test_1913_wait", "/tmp");
-        assert_eq!(inst.tool, "claude");
+        inst.tool = "claude".into();
+        inst.view = crate::session::View::Terminal;
 
-        // Pane shows the approval prompt with the live spinner still active below it, the exact
-        // shape from the issue screenshot.
+        // The approval prompt remains visible above the live spinner.
         let pane = "  Bash command\n    \
 touch /tmp/aoe_test_1913/marker.txt\n    Create marker file\n  \
 Do you want to proceed?\n  \u{276f} 1. Yes\n    \
 2. Yes, and always allow access to this project\n    3. No\n  \
 Esc to cancel \u{b7} Tab to amend \u{b7} ctrl+e to explain\n\
 \u{2736} Herding\u{2026} (53s \u{b7} \u{2193} 7.0k tokens)\n";
-        let pane_file = std::env::temp_dir().join(format!("aoe_test_1913_{}.txt", inst.id));
+        let pane_file = home.path().join("pane.txt");
         std::fs::write(&pane_file, pane).expect("write pane fixture");
 
         let session_name = tmux::Session::generate_name(&inst.id, &inst.title);
@@ -941,7 +942,7 @@ Esc to cancel \u{b7} Tab to amend \u{b7} ctrl+e to explain\n\
             &format!("cat {}; sleep 300", shell_quote(&pane_file)),
         );
 
-        // The clobbered hook state that produced the green row.
+        // A stale running hook must not hide a visible approval prompt.
         write_hook_status(&inst.id, "running");
         assert_eq!(
             crate::hooks::read_hook_status(&inst.id),
@@ -955,7 +956,6 @@ Esc to cancel \u{b7} Tab to amend \u{b7} ctrl+e to explain\n\
         crate::tmux::refresh_session_cache();
         inst.update_status_with_metadata(None, None);
 
-        std::fs::remove_file(&pane_file).ok();
         crate::hooks::cleanup_hook_status_dir(&inst.id);
 
         assert_eq!(
@@ -1095,22 +1095,22 @@ Esc to cancel \u{b7} Tab to amend \u{b7} ctrl+e to explain\n\
         assert_eq!(inst.last_error.as_deref(), Some("agent crashed"));
     }
 
-    /// `#{window_activity}` is an epoch second and the poller runs twice a second, so a turn's last
-    /// running frame and the idle frame that follows it can share one value.
+    /// A turn's running and idle frames can share tmux's activity second.
     #[test]
     #[serial_test::serial]
     fn idle_frame_sharing_an_activity_second_is_still_observed() {
+        let home = crate::session::test_support::isolate_app_dir();
         if !tmux_available() {
             eprintln!("skipping: tmux not available");
             return;
         }
 
         let mut inst = Instance::new("aoe_test_3624_activity", "/tmp");
-        assert_eq!(inst.tool, "claude");
+        inst.tool = "claude".into();
+        inst.view = crate::session::View::Terminal;
 
-        // The running frame is Claude's `active_spinner` shape. The idle frame matches no rule at
-        // all, which is the unwitnessed Idle that has to wait for a confirming poll.
-        let dir = std::env::temp_dir().join(format!("aoe_test_3624_{}", inst.id));
+        // The idle frame has no visible completion witness.
+        let dir = home.path().join("frames");
         std::fs::create_dir_all(&dir).expect("create fixture dir");
         let running_file = dir.join("running.txt");
         let idle_file = dir.join("idle.txt");
@@ -1135,7 +1135,9 @@ Esc to cancel \u{b7} Tab to amend \u{b7} ctrl+e to explain\n\
         let cache = crate::tmux::SessionCacheGuard::capture();
         cache.force_present(&[session_name.as_str()]);
 
+        // Presence TTL is not the activity clock under test.
         let poll = |inst: &mut Instance, activity: Option<i64>| {
+            cache.force_present(&[session_name.as_str()]);
             let metadata = agent_pane_metadata("claude", activity);
             inst.update_status_with_metadata_inner(Some(&metadata), Some(&session_name));
         };
@@ -1165,11 +1167,12 @@ Esc to cancel \u{b7} Tab to amend \u{b7} ctrl+e to explain\n\
         assert_eq!(
             inst.detection.pending,
             Some(Status::Idle),
-            "the final frame must be captured, not skipped as unchanged (#3624)"
+            "idle frame was not proposed; detection {:?}; pane {:?}",
+            inst.detection,
+            tmux::Session::from_name(&session_name).capture_pane(50)
         );
 
         poll(&mut inst, Some(shared));
-        std::fs::remove_dir_all(&dir).ok();
 
         assert_eq!(
             inst.status,
@@ -1178,24 +1181,23 @@ Esc to cancel \u{b7} Tab to amend \u{b7} ctrl+e to explain\n\
         );
     }
 
-    /// `aoe ps`, `aoe status` and the worktree-edit guards observe a session once and exit, so the
-    /// confirming poll an unwitnessed `Running -> Idle` waits for never arrives.
+    /// One-shot readers must publish an unwitnessed Idle without a confirming poll.
     #[test]
     #[serial_test::serial]
     fn a_single_observation_publishes_an_unwitnessed_idle() {
+        let home = crate::session::test_support::isolate_app_dir();
         if !tmux_available() {
             eprintln!("skipping: tmux not available");
             return;
         }
 
         let mut polled = Instance::new("aoe_test_3712_polled", "/tmp");
-        // Guard, not a constant assertion: the manifest path is only reached
-        // for a tool that has one.
-        assert_eq!(polled.tool, "claude");
+        polled.tool = "claude".into();
+        polled.view = crate::session::View::Terminal;
 
         // A parked Claude prompt carrying half-typed text.
         let pane = "earlier output\n\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\n\u{276f} half typed prompt\n\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\n  \u{23f5}\u{23f5} auto mode on (shift+tab to cycle)\n";
-        let pane_file = std::env::temp_dir().join(format!("aoe_test_3712_{}.txt", polled.id));
+        let pane_file = home.path().join("pane.txt");
         std::fs::write(&pane_file, pane).expect("write pane fixture");
 
         let session_name = tmux::Session::generate_name(&polled.id, &polled.title);
@@ -1204,7 +1206,6 @@ Esc to cancel \u{b7} Tab to amend \u{b7} ctrl+e to explain\n\
             &format!("cat {}; sleep 300", shell_quote(&pane_file)),
         );
         let painted = wait_for_pane(&session_name, "half typed prompt");
-        std::fs::remove_file(&pane_file).ok();
         assert!(painted, "parked prompt never painted into the tmux pane");
 
         let cache = crate::tmux::SessionCacheGuard::capture();
@@ -1213,6 +1214,7 @@ Esc to cancel \u{b7} Tab to amend \u{b7} ctrl+e to explain\n\
 
         // Both rows come off disk on `Running`, which is what the CLI reads.
         polled.status = Status::Running;
+        cache.force_present(&[session_name.as_str()]);
         polled.update_status_with_metadata(Some(&metadata), Some(&session_name));
         assert_eq!(
             polled.status,
@@ -1224,7 +1226,10 @@ Esc to cancel \u{b7} Tab to amend \u{b7} ctrl+e to explain\n\
         // A one-shot reader starts from a bare disk load: no proposal on
         // record, and none it can ever meet.
         let mut once = Instance::new("aoe_test_3712_once", "/tmp");
+        once.tool = "claude".into();
+        once.view = crate::session::View::Terminal;
         once.status = Status::Running;
+        cache.force_present(&[session_name.as_str()]);
         once.update_status_once(Some(&metadata), Some(&session_name));
         assert_eq!(
             once.status,

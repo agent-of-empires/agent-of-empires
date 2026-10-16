@@ -55,7 +55,7 @@ mod platform {
         )
     }
 }
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(target_os = "linux")]
 pub(crate) fn effective_uid() -> u32 {
     platform::effective_uid()
 }

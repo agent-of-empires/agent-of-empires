@@ -1,7 +1,7 @@
 //! Daemon-owned publisher and listener for the local runtime read.
 //!
-//! `publisher.lock` stays exclusive from claim through retraction, including
-//! the wait for retained readers and the lifetime-lock downgrade.
+//! `publisher.lock` stays exclusive from publication through retraction, but
+//! is released while waiting for retained readers.
 //! `lifetime.lock` is exclusive while publishing, then shared while serving.
 //! Markers are atomically replaced; rollback and shutdown remove only matching
 //! publication identities and the socket inode created by this publisher.
@@ -209,29 +209,8 @@ pub(crate) async fn publish_when_available(
     shutdown: &tokio_util::sync::CancellationToken,
 ) -> Result<Option<PublishedRuntime>, PublishError> {
     let (dir, owner) = open_namespace()?;
-    loop {
-        if shutdown.is_cancelled() {
-            return Ok(None);
-        }
-        if lock_exclusive(&owner)? {
-            break;
-        }
-        // Shared absence observers are not exclusive publishers.
-        match fs2::FileExt::try_lock_shared(&owner) {
-            Ok(()) => fs2::FileExt::unlock(&owner)
-                .map_err(|error| PublishError::new("lock_io", error.to_string()))?,
-            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                return Err(PublishError::new(
-                    "namespace_busy",
-                    "another publisher owns the namespace",
-                ));
-            }
-            Err(error) => return Err(PublishError::new("lock_io", error.to_string())),
-        }
-        tokio::select! {
-            _ = shutdown.cancelled() => return Ok(None),
-            _ = tokio::time::sleep(std::time::Duration::from_millis(50)) => {}
-        }
+    if !claim_publisher(&owner, shutdown).await? {
+        return Ok(None);
     }
     let lock = open_lock(dir.as_raw_fd(), LOCK_FILE)?;
     loop {
@@ -241,10 +220,47 @@ pub(crate) async fn publish_when_available(
         if lock_exclusive(&lock)? {
             return publish_locked(dir, lock, owner).map(Some);
         }
-        tokio::select! {
-            _ = shutdown.cancelled() => return Ok(None),
-            _ = tokio::time::sleep(std::time::Duration::from_millis(50)) => {}
+        fs2::FileExt::unlock(&owner)
+            .map_err(|error| PublishError::new("lock_io", error.to_string()))?;
+        if !wait_for_retry(shutdown).await || !claim_publisher(&owner, shutdown).await? {
+            return Ok(None);
         }
+    }
+}
+
+async fn claim_publisher(
+    owner: &File,
+    shutdown: &tokio_util::sync::CancellationToken,
+) -> Result<bool, PublishError> {
+    loop {
+        if shutdown.is_cancelled() {
+            return Ok(false);
+        }
+        if lock_exclusive(owner)? {
+            return Ok(true);
+        }
+        // Shared absence observers are not exclusive publishers.
+        match fs2::FileExt::try_lock_shared(owner) {
+            Ok(()) => fs2::FileExt::unlock(owner)
+                .map_err(|error| PublishError::new("lock_io", error.to_string()))?,
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                return Err(PublishError::new(
+                    "namespace_busy",
+                    "another publisher owns the namespace",
+                ));
+            }
+            Err(error) => return Err(PublishError::new("lock_io", error.to_string())),
+        }
+        if !wait_for_retry(shutdown).await {
+            return Ok(false);
+        }
+    }
+}
+
+async fn wait_for_retry(shutdown: &tokio_util::sync::CancellationToken) -> bool {
+    tokio::select! {
+        _ = shutdown.cancelled() => false,
+        _ = tokio::time::sleep(Duration::from_millis(50)) => true,
     }
 }
 

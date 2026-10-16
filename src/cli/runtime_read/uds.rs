@@ -563,7 +563,7 @@ async fn connect_admission(
         Err(error) => return Err(error),
     };
     let Some(postbind) = postbind else {
-        // A pending owner is not absence, including while it waits for old readers.
+        // A prebind marker still describes an in-progress publication.
         if let Some(prebind) = &prebind {
             if os::process_identity_state(prebind.pid, &prebind.process_start_identity)
                 == ProcessIdentityState::Dead

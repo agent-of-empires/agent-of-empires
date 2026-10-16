@@ -1184,38 +1184,6 @@ mod tests {
             .unwrap();
         fs2::FileExt::try_lock_shared(&reader).unwrap();
 
-        let successor = publish_runtime_uds(&state)
-            .expect("a transient client lock must not permanently disable local reads");
-        tokio::time::timeout(Duration::from_secs(5), async {
-            loop {
-                if let Ok(owner) = OpenOptions::new()
-                    .read(true)
-                    .write(true)
-                    .open(app.join("publisher.lock"))
-                {
-                    match fs2::FileExt::try_lock_exclusive(&owner) {
-                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
-                        Ok(()) => fs2::FileExt::unlock(&owner).unwrap(),
-                        Err(error) => panic!("owner probe: {error}"),
-                    }
-                }
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("the successor owns publication while waiting for the reader");
-        for name in [PREBIND_FILE, POSTBIND_FILE, SOCKET_FILE] {
-            assert!(
-                !app.join(name).exists(),
-                "publication must wait for reader release: {name}"
-            );
-        }
-        match crate::server::runtime_uds::try_publish() {
-            Err(error) => assert_eq!(error.code(), "namespace_busy"),
-            Ok(_) => panic!("a competing publisher acquired the waiting successor's namespace"),
-        }
-        drop(reader);
-
         let cli = Cli::parse_from(["aoe", "session", "show", "successor-read", "--json"]);
         let source = ReadRequestSource {
             explicit_url: None,
@@ -1224,6 +1192,50 @@ mod tests {
             explicit_profile: Some("main".into()),
             env_profile: None,
         };
+
+        let successor = publish_runtime_uds(&state)
+            .expect("a transient client lock must not permanently disable local reads");
+        let owner_probe = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let Ok(owner) = OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .open(app.join("publisher.lock"))
+                {
+                    match fs2::FileExt::try_lock_shared(&owner) {
+                        Ok(()) => break owner,
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+                        Err(error) => panic!("owner probe: {error}"),
+                    }
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("a waiting successor leaves the publisher role available");
+        for name in [PREBIND_FILE, POSTBIND_FILE, SOCKET_FILE] {
+            assert!(
+                !app.join(name).exists(),
+                "publication must wait for reader release: {name}"
+            );
+        }
+        let local = tokio::time::timeout(
+            Duration::from_secs(2),
+            attempt(classify(cli.command.as_ref()).unwrap(), &source),
+        )
+        .await
+        .expect("a retained reader must not stall local discovery");
+        assert!(matches!(local, ScopedRead::NoLocalPublication(None)));
+        drop(owner_probe);
+        drop(reader);
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !app.join(POSTBIND_FILE).exists() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the successor publishes after the retained reader leaves");
+
         let outcome = match attempt(classify(cli.command.as_ref()).unwrap(), &source).await {
             ScopedRead::Answered(outcome) => outcome,
             ScopedRead::NoLocalPublication(_) => {

@@ -20,6 +20,7 @@ use tokio::time::Instant;
 
 use futures_util::{SinkExt, StreamExt};
 use tokio::io::{AsyncRead, AsyncWrite};
+#[cfg(any(target_os = "linux", test))]
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::error::{CapacityError, Error as WsError, ProtocolError};
 use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
@@ -171,6 +172,7 @@ impl ReadFailure {
     }
 
     /// Pre-admission diagnosis; it does not authorize a connection.
+    #[cfg(target_os = "linux")]
     pub(crate) fn pre_exact(code: &'static str, message: impl Into<String>) -> Self {
         let mut failure = Self::refusal(code, 2, false);
         failure.exact = Some(message.into());
@@ -206,6 +208,7 @@ impl ReadFailure {
         Self::refuse(RENDERER_INTERNAL, exit, message)
     }
 
+    #[cfg(any(target_os = "linux", test))]
     pub(crate) fn code(&self) -> &str {
         self.code
     }

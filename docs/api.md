@@ -28,7 +28,9 @@ Runtime-read session identity and parent relationships are scoped to a profile. 
 
 Profile stores and alias targets must remain responsive. Filesystem operations on a stalled mount can delay daemon status refresh and snapshot sampling. The exchange deadline does not cancel those filesystem operations.
 
-An explicitly selected unreadable profile fails rather than returning an empty successful result. All-profile listing skips unreadable profiles, matching local listing behavior. Group and project registries have independent health, so an unrelated failure does not prevent a healthy read.
+An explicitly selected unreadable profile fails rather than returning an empty successful result. All-profile listing skips unreadable profiles, matching local listing behavior. Stored sessions outside the wire contract make only their profile's session data unreadable; read sampling does not rewrite the store. Group and project registries have independent health, so an unrelated failure does not prevent a healthy read.
+
+Newly listed profile stores are read on a cache miss without replacing existing live session rows or accepting a retargeted alias before the cache reload.
 
 Wire members declared nullable must still be present. CLI JSON is a separate contract; for example, `session show --json` omits an unknown `agent_session_id`. A `systemd_unit` glob in local list JSON describes an expected scope name, not proof that the unit exists; remote snapshots omit it.
 

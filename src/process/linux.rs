@@ -1307,9 +1307,12 @@ pub(crate) mod runtime_io {
         let Some(close) = stat.rfind(')') else {
             return ProcessStart::Unprovable;
         };
-        match stat[close + 1..]
-            .split_whitespace()
-            .nth(19)
+        let mut fields = stat[close + 1..].split_whitespace();
+        if matches!(fields.next(), Some("Z" | "X")) {
+            return ProcessStart::Absent;
+        }
+        match fields
+            .nth(18)
             .filter(|value| !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit()))
         {
             Some(ticks) => ProcessStart::Ticks(ticks.to_owned()),
@@ -1563,5 +1566,76 @@ mod runtime_identity_tests {
             process_identity_state(pid, &live),
             ProcessIdentityState::Unprovable
         );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn stopped_publishers_remain_live_but_unreaped_zombies_are_dead() {
+        use std::process::{Child, Command, Stdio};
+        use std::time::{Duration, Instant};
+
+        struct Reap(Child);
+        impl Drop for Reap {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        fn observe_without_reaping(pid: u32, event: libc::c_int) {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                let mut info = std::mem::MaybeUninit::<libc::siginfo_t>::zeroed();
+                // WNOWAIT establishes the transition without releasing the PID.
+                let result = unsafe {
+                    libc::waitid(
+                        libc::P_PID,
+                        pid,
+                        info.as_mut_ptr(),
+                        event | libc::WNOWAIT | libc::WNOHANG,
+                    )
+                };
+                if result == -1 {
+                    let error = std::io::Error::last_os_error();
+                    assert_eq!(error.raw_os_error(), Some(libc::EINTR), "{error}");
+                } else if unsafe { info.assume_init().si_pid() } == pid as libc::pid_t {
+                    return;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "process {pid} did not change state"
+                );
+                std::thread::yield_now();
+            }
+        }
+
+        let mut child = Reap(
+            Command::new("/bin/cat")
+                .stdin(Stdio::piped())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .unwrap(),
+        );
+        let pid = child.0.id();
+        let identity = process_start_identity(pid).unwrap();
+        assert_eq!(
+            process_identity_state(pid, &identity),
+            ProcessIdentityState::Live
+        );
+        assert_eq!(unsafe { libc::kill(pid as libc::pid_t, libc::SIGSTOP) }, 0);
+        observe_without_reaping(pid, libc::WSTOPPED);
+        assert_eq!(
+            process_identity_state(pid, &identity),
+            ProcessIdentityState::Live
+        );
+
+        drop(child.0.stdin.take());
+        assert_eq!(unsafe { libc::kill(pid as libc::pid_t, libc::SIGCONT) }, 0);
+        observe_without_reaping(pid, libc::WEXITED);
+        assert_eq!(
+            process_identity_state(pid, &identity),
+            ProcessIdentityState::Dead
+        );
+        child.0.wait().unwrap();
     }
 }

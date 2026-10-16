@@ -18,9 +18,6 @@ pub(super) fn open_read_nonblocking(path: &std::path::Path) -> std::io::Result<s
         .open(path)
 }
 
-pub(super) fn effective_uid() -> u32 {
-    unsafe { libc::geteuid() }
-}
 pub(super) fn metadata_identity(metadata: &std::fs::Metadata) -> (u64, u64) {
     use std::os::unix::fs::MetadataExt;
     (metadata.dev(), metadata.ino())

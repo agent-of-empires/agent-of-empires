@@ -1236,6 +1236,7 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn a_proposal_survives_the_tick_that_reloads_its_row_from_disk() {
+        let _app = crate::session::test_support::isolate_app_dir();
         if !tmux_available() {
             eprintln!("skipping: tmux not available");
             return;
@@ -1244,21 +1245,27 @@ mod tests {
         let mut on_disk = Instance::new("aoe_test_3642_tick", "/tmp");
         on_disk.status = Status::Running;
         on_disk.tool = "claude".into();
+        on_disk.view = crate::session::View::Terminal;
 
         let session_name = crate::tmux::Session::generate_name(&on_disk.id, &on_disk.title);
         let _kill = crate::tmux::test_helpers::TmuxTestSession::from_name(session_name.clone());
+        let mut args = [
+            "new-session",
+            "-d",
+            "-s",
+            &session_name,
+            "-x",
+            "120",
+            "-y",
+            "40",
+            "printf 'turn over\n'; sleep 300",
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .collect();
+        crate::tmux::utils::append_pane_base_index_args(&mut args, &session_name);
         let created = crate::tmux::tmux_command()
-            .args([
-                "new-session",
-                "-d",
-                "-s",
-                &session_name,
-                "-x",
-                "120",
-                "-y",
-                "40",
-                "printf 'turn over\n'; sleep 300",
-            ])
+            .args(&args)
             .output()
             .expect("spawn tmux");
         assert!(
@@ -1268,6 +1275,15 @@ mod tests {
         );
         let cache = crate::tmux::SessionCacheGuard::capture();
         cache.force_present(&[session_name.as_str()]);
+        let pane = crate::tmux::Session::from_name(&session_name);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !pane.capture_pane(2).unwrap().contains("turn over") {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "fixture output did not reach the agent pane"
+            );
+            std::thread::yield_now();
+        }
 
         let mut prev = std::collections::HashMap::from([(on_disk.id.clone(), Status::Running)]);
         let mut tracking = std::collections::HashMap::from([(
@@ -1275,8 +1291,9 @@ mod tests {
             PriorTickTracking::of(&on_disk),
         )]);
 
-        // Each tick reloads disk state while retaining the prior detector state.
+        // A forced presence snapshot cannot refresh itself after its TTL.
         let mut tick = |window_activity: Option<i64>| {
+            cache.force_present(&[session_name.as_str()]);
             let metadata = std::collections::HashMap::from([(
                 session_name.clone(),
                 crate::tmux::PaneMetadata {
@@ -1360,6 +1377,7 @@ mod tests {
         )]);
         let mut instances = vec![fresh];
         seed_tick_tracking(&mut instances, &tracking);
+        cache.force_present(&[pane.name()]);
         apply_tick_status_decisions(
             &mut instances,
             &mut prev,

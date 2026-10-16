@@ -19,7 +19,9 @@ use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::State;
 use axum::response::{IntoResponse, Response};
 use chrono::{DateTime, Utc};
-use futures_util::{SinkExt, StreamExt};
+#[cfg(any(target_os = "linux", test))]
+use futures_util::SinkExt;
+use futures_util::StreamExt;
 
 use serde::Serialize;
 #[cfg(any(target_os = "linux", test))]
@@ -354,6 +356,7 @@ impl RuntimeState {
 static RUNTIME: LazyLock<RuntimeState> = LazyLock::new(RuntimeState::new);
 
 /// Handshake identities shared with the local publisher's marker pair.
+#[cfg(target_os = "linux")]
 pub(crate) fn identity() -> &'static RuntimeIdentity {
     &RUNTIME.identity
 }
@@ -460,6 +463,32 @@ fn build_snapshot(
         }
         if !changed {
             break;
+        }
+    }
+    let mut accepted_now = HashSet::new();
+    if !cache.health.enumeration_failed {
+        for profile in current.iter().filter(|profile| profile.listed) {
+            if cache.inventory.iter().any(|prior| {
+                prior.identity == profile.identity
+                    || prior.name == profile.name
+                    || prior.aliases.contains(&profile.name)
+            }) {
+                continue;
+            }
+            let Ok(mut rows) = Storage::open_unwatched(&profile.name)
+                .and_then(|storage| storage.load_instances_readonly())
+            else {
+                continue;
+            };
+            let cached_ids: HashSet<&str> = sessions
+                .iter()
+                .filter(|row| row.profile == profile.name)
+                .map(|row| row.id.as_str())
+                .collect();
+            rows.retain(|row| !cached_ids.contains(row.id.as_str()));
+            drop(cached_ids);
+            sessions.extend(rows.iter().map(SessionRead::from_instance));
+            accepted_now.insert(profile.identity);
         }
     }
     for row in &mut sessions {
@@ -596,6 +625,15 @@ fn build_snapshot(
         .map(|(name, _)| name.as_str())
         .collect();
     reconcile_legacy_rows(&mut sessions);
+    let rejected: HashSet<String> =
+        crate::cli::runtime_read::dto::invalid_session_profiles(&sessions)
+            .into_iter()
+            .map(str::to_owned)
+            .collect();
+    for profile in &rejected {
+        tracing::warn!(target: "runtime.ws", ?profile, "stored sessions violate the runtime read contract");
+    }
+    sessions.retain(|row| !rejected.contains(&row.profile));
 
     let mut profile_reads = Vec::with_capacity(inventory.len());
     let mut profile_health = BTreeMap::new();
@@ -621,12 +659,14 @@ fn build_snapshot(
             profile_enumeration: component(groups_healthy, HealthCode::ProfileEnumeration),
             metadata: component(projects_healthy, HealthCode::Metadata),
             profile_data: component(
-                !cache.health.enumeration_failed
+                !rejected.contains(&name)
+                    && !cache.health.enumeration_failed
                     && inventory[&name].as_ref().is_some_and(|profile| {
-                        cache.inventory.iter().any(|accepted| {
-                            accepted.identity == profile.identity
-                                && !cache.health.unreadable_profiles.contains(&accepted.name)
-                        })
+                        accepted_now.contains(&profile.identity)
+                            || cache.inventory.iter().any(|accepted| {
+                                accepted.identity == profile.identity
+                                    && !cache.health.unreadable_profiles.contains(&accepted.name)
+                            })
                     }),
                 HealthCode::ProfileEnumeration,
             ),
@@ -1232,6 +1272,250 @@ mod tests {
             .find(|row| row.name == profile)
             .unwrap();
         crate::cli::runtime_read::dto::profile_component_healthy(&profile.health.profile_data)
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn stored_rows_outside_the_contract_degrade_only_their_profile() {
+        use crate::cli::runtime_read::dto::profile_component_healthy;
+
+        let home = TempHome::new();
+        Storage::new_unwatched("healthy").unwrap();
+        let storage = Storage::new_unwatched("broken").unwrap();
+        let directory = home.app_dir().join("profiles/broken");
+        std::fs::write(
+            directory.join("groups.json"),
+            serde_json::to_vec(&[Group::new("kept", "kept")]).unwrap(),
+        )
+        .unwrap();
+        std::fs::write(
+            directory.join("projects.json"),
+            br#"[{"name":"kept","path":"/srv/kept","scope":"profile"}]"#,
+        )
+        .unwrap();
+        let healthy = named("healthy-row", "healthy");
+        for case in [
+            "workspace-trailing",
+            "workspace-dot",
+            "workspace-parent",
+            "workspace-duplicate",
+            "relative-project",
+            "tilde-project",
+            "relative-worktree",
+            "control-id",
+            "bidi-id",
+            "bidi-parent",
+            "bidi-agent-id",
+            "duplicate-id",
+            "deep-parent-chain",
+        ] {
+            let mut bad = named("bad-row", "broken");
+            let mut rows = vec![named("otherwise-valid", "broken")];
+            match case {
+                "workspace-trailing"
+                | "workspace-dot"
+                | "workspace-parent"
+                | "workspace-duplicate" => {
+                    let source = match case {
+                        "workspace-trailing" => "/src/a/",
+                        "workspace-dot" => "/src/./a",
+                        "workspace-parent" => "/src/a/../b",
+                        _ => "/src/a",
+                    };
+                    let repository = repo("a", source);
+                    bad.workspace_info = Some(WorkspaceInfo {
+                        branch: "main".into(),
+                        workspace_dir: "/workspace".into(),
+                        created_at: Utc::now(),
+                        cleanup_on_delete: true,
+                        repos: if case == "workspace-duplicate" {
+                            vec![repository.clone(), repository]
+                        } else {
+                            vec![repository]
+                        },
+                    });
+                }
+                "relative-project" => bad.project_path = "relative/repo".into(),
+                "tilde-project" => bad.project_path = "~/repo".into(),
+                "relative-worktree" => {
+                    bad.worktree_info = Some(WorktreeInfo {
+                        branch: "main".into(),
+                        main_repo_path: "relative/repo".into(),
+                        managed_by_aoe: true,
+                        created_at: Utc::now(),
+                        base_branch: None,
+                    });
+                }
+                "control-id" => bad.id = "bad\nid".into(),
+                "bidi-id" => bad.id = "bad\u{202e}id".into(),
+                "bidi-parent" => bad.parent_session_id = Some("bad\u{202e}parent".into()),
+                "bidi-agent-id" => bad.agent_session_id = Some("bad\u{202e}agent".into()),
+                "duplicate-id" => rows.push(bad.clone()),
+                "deep-parent-chain" => {
+                    for index in 0..65 {
+                        let mut row = named(&format!("chain-{index}"), "broken");
+                        row.parent_session_id =
+                            (index < 64).then(|| format!("chain-{}", index + 1));
+                        rows.push(row);
+                    }
+                }
+                _ => unreachable!(),
+            }
+            rows.push(bad);
+            let stored = serde_json::to_vec(&rows).unwrap();
+            std::fs::write(directory.join("sessions.json"), &stored).unwrap();
+            let loaded = storage.load_instances_readonly().unwrap();
+            assert_eq!(
+                loaded.iter().map(|row| row.id.as_str()).collect::<Vec<_>>(),
+                rows.iter().map(|row| row.id.as_str()).collect::<Vec<_>>(),
+                "{case}: the store must accept the regression input"
+            );
+            let instances = std::iter::once(&healthy).chain(loaded.iter());
+            let sampled = build_snapshot(
+                &RuntimeState::new(),
+                instances.map(SessionRead::from_instance).collect(),
+                Owner::remote(),
+                Utc::now(),
+                &crate::server::reload::RuntimeReadCache::accepted_inventory(),
+            );
+            let hello = parse_hello(&hello_frame(&sampled)).unwrap();
+            let snapshot = parse_snapshot(&snapshot_frame(&sampled)).unwrap();
+            validate_hello(&hello).unwrap();
+            validate_snapshot(&snapshot).unwrap();
+            validate_cross_message(&hello, &snapshot, None).unwrap();
+            assert_eq!(
+                snapshot
+                    .sessions
+                    .iter()
+                    .map(|row| row.id.as_str())
+                    .collect::<Vec<_>>(),
+                ["healthy-row"],
+                "{case}"
+            );
+            assert!(cached_data_healthy(&snapshot, "healthy"), "{case}");
+            assert!(!cached_data_healthy(&snapshot, "broken"), "{case}");
+            let broken = snapshot
+                .profiles
+                .iter()
+                .find(|row| row.name == "broken")
+                .unwrap();
+            assert!(profile_component_healthy(&broken.health.metadata), "{case}");
+            assert!(
+                profile_component_healthy(&broken.health.profile_enumeration),
+                "{case}"
+            );
+            assert!(
+                broken.groups.iter().any(|group| group.path == "kept"),
+                "{case}"
+            );
+            assert!(
+                broken
+                    .projects
+                    .iter()
+                    .any(|project| project.path == "/srv/kept"),
+                "{case}"
+            );
+            assert_eq!(
+                std::fs::read(directory.join("sessions.json")).unwrap(),
+                stored,
+                "{case}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn new_listed_profiles_read_their_store_without_replacing_live_rows() {
+        let home = TempHome::new();
+        let mut overlay = named("overlay", "main");
+        overlay.title = "live overlay".into();
+        let state = super::super::test_support::build_test_app_state(Vec::new());
+        Storage::new_unwatched("main").unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink("main", home.app_dir().join("profiles/retarget")).unwrap();
+        super::super::test_support::accept_runtime_read_cache_for_test(&state).await;
+        *state.instances.write().await = vec![overlay];
+        let accepted_names: Vec<_> = state
+            .runtime_read_cache
+            .read()
+            .unwrap()
+            .inventory
+            .iter()
+            .map(|profile| profile.name.clone())
+            .collect();
+        crate::session::create_profile("empty").unwrap();
+        let fresh = Storage::new_unwatched("fresh").unwrap();
+        fresh
+            .update(|rows, _| {
+                *rows = vec![named("fresh-row", "fresh")];
+                Ok(())
+            })
+            .unwrap();
+        let mut fresh_live = named("fresh-row", "fresh");
+        fresh_live.title = "live fresh title".into();
+        state.instances.write().await.push(fresh_live);
+        #[cfg(unix)]
+        {
+            std::fs::remove_file(home.app_dir().join("profiles/retarget")).unwrap();
+            Storage::new_unwatched("retarget")
+                .unwrap()
+                .update(|rows, _| {
+                    *rows = vec![named("retargeted-row", "retarget")];
+                    Ok(())
+                })
+                .unwrap();
+        }
+        Storage::new_unwatched("corrupt").unwrap();
+        let corrupt = home.app_dir().join("profiles/corrupt/sessions.json");
+        std::fs::write(&corrupt, b"not json").unwrap();
+        let before = std::fs::read(fresh.sessions_path()).unwrap();
+
+        for _ in 0..2 {
+            let snapshot = cached_snapshot(&state).await;
+            assert!(cached_data_healthy(&snapshot, "empty"));
+            assert!(cached_data_healthy(&snapshot, "fresh"));
+            assert!(!cached_data_healthy(&snapshot, "corrupt"));
+            #[cfg(unix)]
+            assert!(!cached_data_healthy(&snapshot, "retarget"));
+            let rows: Vec<_> = snapshot
+                .sessions
+                .iter()
+                .map(|row| (row.profile.as_str(), row.id.as_str()))
+                .collect();
+            assert_eq!(rows, [("main", "overlay"), ("fresh", "fresh-row")]);
+            assert_eq!(
+                snapshot
+                    .sessions
+                    .iter()
+                    .find(|row| row.profile == "fresh")
+                    .unwrap()
+                    .title,
+                "live fresh title"
+            );
+            let live = state.instances.read().await;
+            assert_eq!(
+                live.iter()
+                    .map(|row| (row.id.as_str(), row.title.as_str()))
+                    .collect::<Vec<_>>(),
+                [
+                    ("overlay", "live overlay"),
+                    ("fresh-row", "live fresh title")
+                ]
+            );
+            assert_eq!(
+                state
+                    .runtime_read_cache
+                    .read()
+                    .unwrap()
+                    .inventory
+                    .iter()
+                    .map(|profile| profile.name.clone())
+                    .collect::<Vec<_>>(),
+                accepted_names
+            );
+            assert_eq!(std::fs::read(fresh.sessions_path()).unwrap(), before);
+            assert_eq!(std::fs::read(&corrupt).unwrap(), b"not json");
+        }
     }
 
     #[tokio::test]
