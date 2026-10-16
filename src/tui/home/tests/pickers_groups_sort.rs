@@ -3062,6 +3062,13 @@ fn same_named_groups_across_profiles_are_tagged_and_listed_once() {
 
     assert_eq!(view.all_group_paths(), vec!["solo", "work"]);
 
+    view.open_new_session_dialog();
+    let dialog = view.new_dialog.as_mut().expect("new session dialog");
+    dialog.focus_group();
+    dialog.handle_key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL));
+    assert_eq!(dialog.group_picker_items(), vec!["solo", "work"]);
+    view.new_dialog = None;
+
     let theme = crate::tui::styles::Theme::default();
     let labels: Vec<String> = view
         .flat_items
