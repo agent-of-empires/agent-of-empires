@@ -351,7 +351,7 @@ A request is `{ "aoeBridge": 1, "id", "method", "params"? }`, where `id` is a nu
 | `openSession` | `{ "id" }` | none | `null`; the dashboard navigates to the session, or shows it below the page when the user turned on split view |
 | `session.archive` | `{ "id" }` | `session.read` and `session.write`, not read-only or CityHall | `null`; archives the session and stops its pane |
 | `session.trash` | `{ "id" }` | `session.read` and `session.write`, not read-only or CityHall | `null`; moves the session to the trash and stops its pane |
-| `session.contextMenu` | `{ "id", "x", "y", "items"? }` | `session.read` | The picked item's `id`, or `null`. Opens the sidebar's session menu at frame coordinates `x`, `y`; every action in it is the user's own and follows the dashboard's modes. `items`, at most 20 `{ "id", "label" }`, are appended to the menu. Resolves when the menu closes |
+| `session.contextMenu` | `{ "id", "x", "y", "items"? }` | `session.read` | The picked item's `id`, or `null`. Opens the sidebar's session menu at frame coordinates `x`, `y`; every action in it is the user's own and follows the dashboard's modes, and it ignores clicks for 300 ms after opening so a page cannot time one onto an item. `items`, at most 20 `{ "id", "label" }`, are appended to the menu. Resolves when the menu closes |
 
 Error codes: `unknown_method`, `invalid_params` (also an `id` that `sessions.list` does not return), `capability_denied` (the plugin does not declare the required capability), `read_only`, `cityhall_mode`, and `failed` (the dashboard's request failed). An `action` result only acknowledges delivery; its effect arrives in `plugins.uiState` once the worker updates its state.
 

@@ -12,6 +12,9 @@ import { useSessionRowModel } from "../sidebar/useSessionRowModel";
 import { SidebarModal } from "../sidebar/SidebarModal";
 import { MODAL_CANCEL, MODAL_INPUT, MODAL_PRIMARY } from "../sidebar/styles";
 
+// The page picks when and where the menu opens, so it could put an item under a click it asked for.
+const ARM_MS = 300;
+
 export interface SessionMenuRequest {
   /** Unique per call, so each call mounts a fresh menu. */
   key: number;
@@ -80,10 +83,13 @@ function HostMenu({
   const [renaming, setRenaming] = useState(false);
   const picked = useRef<string | null>(null);
   const opened = useRef(false);
+  const [armed, setArmed] = useState(false);
   const { onClose } = request;
 
   useEffect(() => {
     openMenu({ x: request.x, y: request.y, scope: { kind: "single" } });
+    const timer = setTimeout(() => setArmed(true), ARM_MS);
+    return () => clearTimeout(timer);
   }, [openMenu, request]);
 
   useEffect(() => {
@@ -96,18 +102,18 @@ function HostMenu({
 
   return (
     <>
-      {/* The menu opens from a click inside the page frame, whose events never reach this document: the backdrop
-          takes the dismissing click instead. */}
+      {/* Takes the dismissing click, which inside the page frame would never reach this document. Until armed it
+          covers the menu too and swallows clicks. */}
       {menu &&
         createPortal(
           <div
-            className="fixed inset-0 z-40"
+            className={`fixed inset-0 ${armed ? "z-40" : "z-[60]"}`}
             aria-hidden="true"
             data-testid="plugin-session-menu-backdrop"
-            onMouseDown={closeMenu}
+            onMouseDown={() => armed && closeMenu()}
             onContextMenu={(e) => {
               e.preventDefault();
-              closeMenu();
+              if (armed) closeMenu();
             }}
           />,
           document.body,
