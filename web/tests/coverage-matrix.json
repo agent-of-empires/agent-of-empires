@@ -43,14 +43,14 @@
       "kind": "live-playwright",
       "risk": "high",
       "specs": ["tests/live/settings-panels.spec.ts"],
-      "components": ["web/src/components/McpServers.tsx"]
+      "components": ["web/src/components/McpServers.tsx", "web/src/components/McpServerForm.tsx"]
     },
     {
       "id": "settings.mcp-servers.handlers",
       "kind": "vitest",
       "risk": "high",
       "specs": ["src/components/__tests__/McpServers.test.tsx", "src/lib/api.test.ts"],
-      "components": ["web/src/components/McpServers.tsx"]
+      "components": ["web/src/components/McpServers.tsx", "web/src/components/McpServerForm.tsx"]
     },
     {
       "id": "settings.skills-management",
