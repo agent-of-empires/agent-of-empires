@@ -423,11 +423,47 @@ describe("attachment drafts (#2493)", () => {
     vi.spyOn(IDBObjectStore.prototype, "put").mockImplementationOnce(() => {
       throw new DOMException("The quota has been exceeded.", "QuotaExceededError");
     });
-    await setDraftAttachments("s-1", []);
-    // A tab that read the marker before the clear now commits its older save into the freed space.
-    await real.saveAttachments("s-1", [img("STALE")], [200, "a"]);
+    let clears = 0;
+    saveGate.onClear = async () => {
+      // The second clear is the retry: a tab that read the marker before the clear now writes its
+      // stale marker and commits its older save into the freed space.
+      if (++clears === 2) {
+        localStorage.setItem("acp:draft-attachments-v2:s-1", "S:200:a");
+        await real.saveAttachments("s-1", [img("STALE")], [200, "a"]);
+      }
+    };
+    const clear = setDraftAttachments("s-1", []);
+    const clearMarker = localStorage.getItem("acp:draft-attachments-v2:s-1");
+    try {
+      await clear;
+    } finally {
+      saveGate.onClear = null;
+    }
+    expect(clears).toBe(2);
     expect(await loadState("s-1")).toMatchObject({ saved: false });
     expect(await real.loadAttachments("s-1")).toEqual([]);
+    expect(localStorage.getItem("acp:draft-attachments-v2:s-1")).toBe(clearMarker);
+  });
+
+  it("leaves no stale bytes or tombstone when interrupted before the cleanup retry", async () => {
+    const real = await vi.importActual<typeof import("./attachmentStore")>("./attachmentStore");
+    await real.saveAttachments("s-1", [img("OLD")], [100, "a"]);
+    vi.spyOn(IDBObjectStore.prototype, "put").mockImplementationOnce(() => {
+      throw new DOMException("The quota has been exceeded.", "QuotaExceededError");
+    });
+    let clears = 0;
+    saveGate.onClear = async () => {
+      if (++clears === 2) throw new Error("interrupted before tombstone retry");
+    };
+    try {
+      await setDraftAttachments("s-1", []);
+    } finally {
+      saveGate.onClear = null;
+      vi.restoreAllMocks();
+    }
+    expect(clears).toBe(2);
+    expect(await real.loadAttachments("s-1")).toBeUndefined();
+    expect(await listAttachmentSessionIds()).toEqual([]);
   });
 
   it("keeps a newer draft saved after the cleanup freed the bytes and before the tombstone retry", async () => {
