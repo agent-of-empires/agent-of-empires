@@ -113,9 +113,9 @@ fn test_respond_to_omp_approval_uses_approval_shortcuts() {
     let fake_omp = h.home_path().join("fake-omp");
     let script = "#!/bin/sh\n\
 for request in 1 2; do\n\
-  printf 'Allow tool: bash\\n'\n\
-  printf 'Command: printf approval-%s\\n' \"$request\"\n\
-  printf 'Ctrl+Enter / Ctrl+Q approve · Esc deny\\n'\n\
+  printf '╭─ Allow tool: bash ─────────────────────╮\\n'\n\
+  printf '│ Command: printf approval-%s            │\\n' \"$request\"\n\
+  printf '│ Ctrl+Enter / Ctrl+Q approve · Esc deny │\\n'\n\
   stty -icanon -echo -ixon min 1 time 0 2>/dev/null\n\
   first=$(dd bs=1 count=1 2>/dev/null | od -An -tx1 | tr -d '[:space:]')\n\
   stty min 0 time 5 2>/dev/null\n\

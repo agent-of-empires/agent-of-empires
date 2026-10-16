@@ -236,7 +236,9 @@ not = [
   ] },
 ]
 
-# Current OMP tool approvals use a docked action prompt, not a selector list.
+# OMP's title plus eight detail rows, divider, and footer fit within 12 lines.
+# The editor caps at 18 rows, placing the footer at most 20 lines from bottom;
+# 24 leaves four lines of slack, and the 40-line window includes the whole panel.
 [[rules]]
 id = "tool_approval"
 state = "waiting"
@@ -244,9 +246,11 @@ priority = 970
 positional = true
 region = "bottom_non_empty_lines(40)"
 max_position = 24
-wrap = 12
 visible = true
-contains = ["Allow tool:", "approve", "deny"]
+line_regex = ['^\s*[│|].*approve\s+·.*deny.*[│|]\s*$']
+all = [
+  { region = "bottom_non_empty_lines(40)", line_regex = ['^\s*╭─+\s*Allow tool:'] },
+]
 not = [
   { region = "bottom_non_empty_lines(3)", contains_any = ["⟦esc⟧", "⟨esc⟩", "[esc]", "(esc to cancel)"] },
   { region = "bottom_non_empty_lines(3)", line_regex = ['(?i)^\s*retrying \d+/\d+ (?:in|now):'] },

@@ -176,16 +176,33 @@ mod tests {
     }
 
     #[test]
-    fn omp_stale_approval_outside_bounded_live_area_is_not_waiting() {
-        let mut lines = vec![
-            "╭─ Allow tool: bash ──────────────────────────────────────╮".to_string(),
-            "│ Command: printf approval-1                              │".to_string(),
-            "│ ⌃⏎/⌃Q approve · ⎋ deny                                 │".to_string(),
+    fn omp_tool_approval_requires_a_bounded_panel_footer() {
+        let panel = [
+            "╭─ Allow tool: bash ──────────────────────────────────────╮",
+            "│ Command: printf approval-1                              │",
+            "├─────────────────────────────────────────────────────────┤",
+            "│ ⌃⏎/⌃Q approve · ⎋ deny                                 │",
+            "╰─────────────────────────────────────────────────────────╯",
         ];
-        lines.extend((0..37).map(|line| format!("new prompt content {line}")));
-        let screen = lines.join("\n");
-        let detection = detect("omp", &screen, "", None).expect("OMP manifest");
 
+        for (trailing_lines, expected) in [(22, true), (23, false)] {
+            let mut lines = panel.map(str::to_string).to_vec();
+            lines.extend((0..trailing_lines).map(|line| format!("new prompt content {line}")));
+            let detection = detect("omp", &lines.join("\n"), "", None).expect("OMP manifest");
+            assert_eq!(
+                detection.status == Some(Status::Waiting),
+                expected,
+                "footer position should be {}",
+                trailing_lines + 2
+            );
+        }
+
+        let prose = [
+            "The old answer discussed Allow tool: bash and said approve or deny.",
+            "No approval is currently open.",
+        ]
+        .join("\n");
+        let detection = detect("omp", &prose, "", None).expect("OMP manifest");
         assert_ne!(detection.status, Some(Status::Waiting));
     }
 }
