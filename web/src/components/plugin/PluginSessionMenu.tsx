@@ -48,7 +48,12 @@ function scopeTo(workspaces: readonly Workspace[], sessionId: string): Workspace
 }
 
 /** The sidebar's session menu, opened for a plugin page. Stays mounted after closing so its pickers can finish. */
-export function PluginSessionMenu({ request, workspaces, readOnly, handlers }: Props) {
+export function PluginSessionMenu(props: Props) {
+  // Scoped workspaces keep their shared id, so a new target remounts rather than inheriting another session's optimistic triage.
+  return <ScopedMenu key={props.request.sessionId} {...props} />;
+}
+
+function ScopedMenu({ request, workspaces, readOnly, handlers }: Props) {
   const scoped = useMemo(() => scopeTo(workspaces, request.sessionId), [workspaces, request.sessionId]);
   const triage = useSidebarTriage(scoped);
   const [workspace] = scoped;

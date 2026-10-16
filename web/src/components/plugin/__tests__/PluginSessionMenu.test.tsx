@@ -166,6 +166,33 @@ describe("PluginSessionMenu", () => {
     ]);
   });
 
+  it("does not carry one session's optimistic triage to another in the same workspace", () => {
+    const shared = [
+      makeWorkspace("w1", [
+        makeSession({ id: "s1", title: "First", status: "Running" }),
+        makeSession({ id: "s2", title: "Second", status: "Running" }),
+      ]),
+    ];
+    const request = (key: number, sessionId: string) => ({
+      key,
+      sessionId,
+      x: 0,
+      y: 0,
+      items: [],
+      source: "Board",
+      onClose: vi.fn(),
+    });
+    const { rerender } = render(
+      <PluginSessionMenu request={request(1, "s1")} workspaces={shared} readOnly={false} handlers={handlers} />,
+    );
+    arm();
+    fireEvent.click(screen.getByTestId("sidebar-context-menu-pin"));
+    // The server has not reported s1 pinned yet, so the pin is still only optimistic.
+    rerender(<PluginSessionMenu request={request(2, "s2")} workspaces={shared} readOnly={false} handlers={handlers} />);
+    arm();
+    expect(screen.getByTestId("sidebar-context-menu-pin").getAttribute("aria-pressed")).toBe("false");
+  });
+
   it("opens the group picker from More", () => {
     open();
     arm();
