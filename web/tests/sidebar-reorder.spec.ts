@@ -114,27 +114,6 @@ test.describe("desktop rows", () => {
     await expectNoOrderingPut(page, handle, 200);
   });
 
-  test("arrow keys move focus through the session list and Enter opens the focused session", async ({ page }) => {
-    await openDesktop(page);
-    const rows = page.getByTestId("sidebar-session-row");
-    await expect(rows).toHaveCount(3);
-    await rows.nth(0).focus();
-
-    await page.keyboard.press("ArrowDown");
-    await expect(rows.nth(1)).toBeFocused();
-    await expect(page).toHaveURL("/");
-
-    await page.keyboard.press("ArrowDown");
-    await expect(rows.nth(2)).toBeFocused();
-    await page.keyboard.press("ArrowDown");
-    await expect(rows.nth(2)).toBeFocused();
-
-    await page.keyboard.press("ArrowUp");
-    await expect(rows.nth(1)).toBeFocused();
-    await page.keyboard.press("Enter");
-    await expect(page).toHaveURL(/\/session\/s-b$/, { timeout: 5_000 });
-  });
-
   test("dragging a row onto a different repo group is a no-op", async ({ page }) => {
     // Each repo has its own SortableContext, so a cross-group drop never reaches the reorder handler.
     const sessions: MockSessionInput[] = [

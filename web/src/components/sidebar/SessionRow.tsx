@@ -193,8 +193,10 @@ export const SessionRow = memo(function SessionRow(props: SessionRowProps) {
           ) {
             return;
           }
+          const sidebar = e.currentTarget.closest<HTMLElement>('[role="navigation"][aria-label="Sessions sidebar"]');
+          if (!sidebar) return;
           const rows = Array.from(
-            document.querySelectorAll<HTMLAnchorElement>(
+            sidebar.querySelectorAll<HTMLAnchorElement>(
               '[data-testid="sidebar-session-row"]:not([aria-disabled="true"])',
             ),
           ).filter((row) => row.getClientRects().length > 0);
