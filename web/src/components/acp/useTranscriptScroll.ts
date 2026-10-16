@@ -38,6 +38,9 @@ export function useTranscriptScroll({
   // Sampled on scroll: by the time a ResizeObserver fires, layout has already
   // settled, so pinned-ness must be read before the resize.
   const wasAtBottomRef = useRef<boolean>(true);
+  const lastScrollTopRef = useRef(0);
+  const lastScrollHeightRef = useRef(0);
+  const lastClientHeightRef = useRef(0);
   // Last time we sampled at the bottom. iOS fires an interim scroll during a
   // keyboard resize that clears `wasAtBottomRef` but cannot clear this.
   const lastAtBottomAtRef = useRef(0);
@@ -128,9 +131,11 @@ export function useTranscriptScroll({
     const below = belowViewportRef.current;
     const content = messagesContentRef.current;
     if (!vp || !below) return;
-    // On coarse pointers the browser fires "scroll" for programmatic and
-    // resize-driven scrolls too, so the stick intent is only re-sampled during
-    // a real touch/wheel gesture there.
+    lastScrollTopRef.current = vp.scrollTop;
+    lastScrollHeightRef.current = vp.scrollHeight;
+    lastClientHeightRef.current = vp.clientHeight;
+    // On coarse pointers, scroll events include programmatic changes. Only real input
+    // gestures update the pinned state there.
     let gestureActive = false;
     let gestureClearTimer = 0;
     const scheduleGestureClear = () => {
@@ -143,17 +148,32 @@ export function useTranscriptScroll({
       gestureActive = true;
       scheduleGestureClear();
     };
-    const sample = (force = false) => {
+    const markKeyboardGesture = (event: KeyboardEvent) => {
+      if (event.target !== vp) return;
+      switch (event.key) {
+        case "ArrowDown":
+        case "ArrowUp":
+        case "PageDown":
+        case "PageUp":
+        case "Home":
+        case "End":
+        case " ":
+          markGesture();
+      }
+    };
+    const sample = (force = false, updatePinned = true) => {
       if (force || !isCoarse || gestureActive) {
         const pinned = isPinnedToBottom(vp.scrollTop, vp.clientHeight, vp.scrollHeight);
-        const prevStuck = wasAtBottomRef.current;
-        wasAtBottomRef.current = pinned;
-        if (pinned) lastAtBottomAtRef.current = performance.now();
-        setAtBottom((prev) => (prev === pinned ? prev : pinned));
-        // Gated on the restore having run: the forced mount sample reads a tall
-        // transcript at scrollTop 0 as unpinned and would clobber the saved intent.
-        if (pinned !== prevStuck && didRestoreScrollRef.current) {
-          saveScrollState(sessionId, { stuck: pinned, top: vp.scrollTop });
+        if (updatePinned) {
+          const prevStuck = wasAtBottomRef.current;
+          wasAtBottomRef.current = pinned;
+          if (pinned) lastAtBottomAtRef.current = performance.now();
+          setAtBottom((prev) => (prev === pinned ? prev : pinned));
+          // Gated on the restore having run: the forced mount sample reads a tall
+          // transcript at scrollTop 0 as unpinned and would clobber the saved intent.
+          if (pinned !== prevStuck && didRestoreScrollRef.current) {
+            saveScrollState(sessionId, { stuck: pinned, top: vp.scrollTop });
+          }
         }
         // Momentum scrolling fires with no fresh touchmove; keep the gesture alive.
         if (gestureActive) scheduleGestureClear();
@@ -172,23 +192,46 @@ export function useTranscriptScroll({
     };
     const onScroll = () => {
       const previous = toolAnchorsRef.current;
-      const folded = previous.some(({ el }) => !el.isConnected);
-      if (folded && gestureActive) {
-        pendingFoldAnchorMissRef.current = false;
-        pendingFoldCorrectionStableRef.current = false;
-        sample();
-        toolAnchorsRef.current = sampleToolAnchors(vp);
-        anchorIntentRef.current = wasAtBottomRef.current;
-        return;
+      const folding = previous.some(({ el }) => !el.isConnected);
+      const layoutChanged =
+        vp.scrollHeight !== lastScrollHeightRef.current || vp.clientHeight !== lastClientHeightRef.current;
+      const scrollChanged = vp.scrollTop !== lastScrollTopRef.current;
+      const wasPinned = wasAtBottomRef.current || (folding && anchorIntentRef.current);
+      const foldLayoutChanged = folding && layoutChanged;
+      let readerMoved = false;
+      if (folding && scrollChanged && (gestureActive || !layoutChanged)) {
+        const maxScrollTop = vp.scrollHeight - vp.clientHeight;
+        const sampledScrollTop = layoutChanged
+          ? Math.min(lastScrollTopRef.current, maxScrollTop)
+          : lastScrollTopRef.current;
+        const readerDelta = vp.scrollTop - sampledScrollTop;
+        if (readerDelta !== 0) {
+          readerMoved = true;
+          toolAnchorsRef.current = previous.map((anchor) => ({
+            ...anchor,
+            offset: anchor.offset - readerDelta,
+            scrollTop: vp.scrollTop,
+          }));
+        }
       }
-      sample();
-      toolAnchorsRef.current = resampleToolAnchors(vp, previous);
-      if (toolAnchorsRef.current !== previous) anchorIntentRef.current = wasAtBottomRef.current;
+      sample(readerMoved, !foldLayoutChanged || readerMoved);
+      if (!folding) {
+        toolAnchorsRef.current = resampleToolAnchors(vp, previous);
+      }
+      if (layoutChanged && wasPinned && !gestureActive && !folding) {
+        pinToBottom("auto");
+      } else if (readerMoved || (!foldLayoutChanged && (gestureActive || (!layoutChanged && scrollChanged)))) {
+        anchorIntentRef.current = wasAtBottomRef.current;
+      }
+      lastScrollTopRef.current = vp.scrollTop;
+      lastScrollHeightRef.current = vp.scrollHeight;
+      lastClientHeightRef.current = vp.clientHeight;
     };
     sample(true);
     vp.addEventListener("scroll", onScroll, { passive: true });
     vp.addEventListener("wheel", markGesture, { passive: true });
     vp.addEventListener("touchmove", markGesture, { passive: true });
+    vp.addEventListener("keydown", markKeyboardGesture);
     // Pin on every visualViewport resize frame so the transcript tracks the
     // soft keyboard animation in lockstep.
     const vv = typeof window !== "undefined" ? window.visualViewport : null;
@@ -251,7 +294,13 @@ export function useTranscriptScroll({
       }
       // Mid-fold the pin flag may come from the clamp, so go by the intent from before it.
       const folding = toolAnchorsRef.current.some(({ el }) => !el.isConnected);
+      if (folding && anchorIntentRef.current) {
+        pinToBottom("auto");
+        resample();
+        return;
+      }
       let remountedElement: Element | null = null;
+      let remountedAnchor: ToolAnchor | null = null;
       let remountedOffset: number | null = null;
       let survivingAnchor = false;
       if (folding) {
@@ -264,7 +313,7 @@ export function useTranscriptScroll({
           if (next) {
             remountedElement = next;
             remountedOffset = anchor.offset;
-            break;
+            remountedAnchor = anchor;
           }
         }
         if (remountedElement === null) {
@@ -272,10 +321,6 @@ export function useTranscriptScroll({
           if (survivingAnchor || pendingFoldAnchorMissRef.current) resample();
           else pendingFoldAnchorMissRef.current = true;
           return;
-        }
-        // Browser scroll changes during folding are layout shifts, not reader movement.
-        for (const anchor of toolAnchorsRef.current) {
-          anchor.scrollTop = vp.scrollTop;
         }
       }
       pendingFoldAnchorMissRef.current = false;
@@ -287,9 +332,17 @@ export function useTranscriptScroll({
       const delta = toolAnchorDelta(vp, toolAnchorsRef.current);
       const beforeCorrection = vp.scrollTop;
       vp.scrollTop = beforeCorrection + delta;
+      lastScrollTopRef.current = vp.scrollTop;
       if (folding) {
+        const appliedDelta = vp.scrollTop - beforeCorrection;
+        const maxScrollTop = vp.scrollHeight - vp.clientHeight;
+        // Advance only our correction, so later user scrolling remains in the delta.
+        for (const anchor of toolAnchorsRef.current) {
+          anchor.scrollTop = Math.min(anchor.scrollTop, maxScrollTop) + appliedDelta;
+        }
         const currentOffset = remountedElement!.getBoundingClientRect().top - vp.getBoundingClientRect().top;
-        if (Math.abs(currentOffset - remountedOffset!) > 1) {
+        const expectedOffset = remountedOffset! - (vp.scrollTop - Math.min(remountedAnchor!.scrollTop, maxScrollTop));
+        if (Math.abs(currentOffset - expectedOffset) > 1) {
           pendingFoldCorrectionStableRef.current = false;
           return;
         }
@@ -309,13 +362,14 @@ export function useTranscriptScroll({
       vp.removeEventListener("scroll", onScroll);
       vp.removeEventListener("wheel", markGesture);
       vp.removeEventListener("touchmove", markGesture);
+      vp.removeEventListener("keydown", markKeyboardGesture);
       vv?.removeEventListener("resize", onVvResize);
       window.removeEventListener("pagehide", saveScroll);
       document.removeEventListener("visibilitychange", onVisibility);
       saveScroll();
       if (gestureClearTimer) window.clearTimeout(gestureClearTimer);
     };
-  }, [requestEarlierHistory, isCoarse, sessionId]);
+  }, [requestEarlierHistory, isCoarse, pinToBottom, sessionId]);
 
   // Hold the bottom pin through a keyboard or composer-collapse transition.
   // `wasAtBottomRef` covers sitting idle at the bottom; the timestamp covers an

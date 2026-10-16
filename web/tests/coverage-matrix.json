@@ -3061,7 +3061,8 @@
         "tests/acp-structured-view.spec.ts",
         "src/components/acp/ToolExpansion.test.tsx",
         "src/components/acp/activityMessages.test.ts",
-        "src/lib/toolAnchor.test.ts"
+        "src/lib/toolAnchor.test.ts",
+        "src/components/acp/useTranscriptScroll.test.tsx"
       ],
       "components": [
         "web/src/components/acp/ToolExpansion.tsx",
