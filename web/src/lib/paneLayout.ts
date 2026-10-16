@@ -400,8 +400,8 @@ export function seedLayout(template: DockLayout, prefs: AutoOpenPanePrefs): Dock
   return l;
 }
 
-/** `outsideRepository` drops Diff from the seed only, so a Diff tab the user opened stays. */
-export function usePaneLayout(sessionId: string | null, outsideRepository = false): PaneLayoutApi {
+/** `outsideRepository` drops Diff from the seed only, so a Diff tab the user opened stays; `null` (not yet known) seeds no Diff. */
+export function usePaneLayout(sessionId: string | null, outsideRepository: boolean | null = false): PaneLayoutApi {
   const [store, setStore] = useState(loadStore);
   const { settings } = useWebSettings();
   const { autoOpenDiffPane, autoOpenTerminalPane } = settings;
@@ -414,7 +414,10 @@ export function usePaneLayout(sessionId: string | null, outsideRepository = fals
     () =>
       sessionId
         ? (store.sessions[sessionId] ??
-          seedLayout(store.template, { diff: autoOpenDiffPane && !outsideRepository, terminal: autoOpenTerminalPane }))
+          seedLayout(store.template, {
+            diff: autoOpenDiffPane && outsideRepository === false,
+            terminal: autoOpenTerminalPane,
+          }))
         : emptyDockLayout(),
     [store, sessionId, autoOpenDiffPane, autoOpenTerminalPane, outsideRepository],
   );
@@ -428,7 +431,7 @@ export function usePaneLayout(sessionId: string | null, outsideRepository = fals
         const current =
           s.sessions[sessionId] ??
           seedLayout(s.template, {
-            diff: prefs.autoOpenDiffPane && !outsideRepositoryRef.current,
+            diff: prefs.autoOpenDiffPane && outsideRepositoryRef.current === false,
             terminal: prefs.autoOpenTerminalPane,
           });
         const updated = fn(current);

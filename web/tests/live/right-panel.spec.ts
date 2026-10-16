@@ -53,7 +53,8 @@ test("diff pane in a non-git session stays closed until opened, then shows one n
   });
   const [session] = await listSessions(serve.baseUrl);
   expect(session!.outside_repository).toBe(true);
-  await openSession(page, serve, "rp-non-git");
+  // A deep link mounts the layout before the Session list arrives, the order that once pinned Diff.
+  await page.goto(`${serve.baseUrl}/session/${encodeURIComponent(session!.id)}`);
 
   // The seeded terminal proves the layout is seeded, so Diff's absence is not a race.
   await expect(page.getByTestId("pane-toggle-terminal").first()).toHaveAttribute("aria-pressed", "true");
@@ -61,9 +62,8 @@ test("diff pane in a non-git session stays closed until opened, then shows one n
   await expect(diffToggle).toHaveAttribute("aria-pressed", "false");
 
   await diffToggle.click();
-  await expect(page.getByText(/isn't a git repository, so there's nothing to compare\./).first()).toBeVisible({
-    timeout: 10_000,
-  });
+  const neutral = `The working directory (${String(session!.project_path)}) isn't a git repository, so there's nothing to compare.`;
+  await expect(page.getByText(neutral, { exact: true }).first()).toBeVisible({ timeout: 10_000 });
   await expect(page.getByText(/No changes vs|Could not open repository/)).toHaveCount(0);
 });
 

@@ -237,6 +237,8 @@ describe("usePaneLayout outside a repository (#4574)", () => {
   it.each([
     // [outside, autoOpenTerminalPane, seeded tabs]
     [false, true, ["diff", "terminal:0"]],
+    // Not yet known: Diff waits for the Session row.
+    [null, true, ["terminal:0"]],
     [true, true, ["terminal:0"]],
     [true, false, []],
   ])("outside=%s terminal=%s seeds %o, whatever autoOpenDiffPane says", (outside, terminal, expected) => {
