@@ -268,19 +268,14 @@ fn test_delete_selected_group_updates_groups_field() {
         .group_exists("work"));
 
     // Verify self.groups is updated (this is the bug fix)
-    let all_groups = env.view.all_groups();
-    let group_paths: Vec<_> = all_groups.iter().map(|g| g.path.as_str()).collect();
+    let all_groups = env.view.all_group_paths();
+    let group_paths: Vec<_> = all_groups.iter().map(String::as_str).collect();
     assert!(!group_paths.contains(&"work"));
     assert!(!group_paths.contains(&"work/projects"));
 
     // A reload from storage agrees with the in-memory tree.
     env.view.reload().unwrap();
-    let reloaded_groups: Vec<_> = env
-        .view
-        .all_groups()
-        .iter()
-        .map(|g| g.path.clone())
-        .collect();
+    let reloaded_groups = env.view.all_group_paths();
     let tree_groups: Vec<_> = env
         .view
         .group_trees
