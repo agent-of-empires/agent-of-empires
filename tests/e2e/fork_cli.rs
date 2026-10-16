@@ -267,7 +267,7 @@ fn fork_from_refusals_persist_nothing() {
             parent: Parent::Seeded("gemini"),
             title: "Parent",
             args: &["--tool", "gemini"],
-            expect: "Forkable agents: claude, codex, opencode",
+            expect: "no native fork capability",
         },
         Case {
             parent: Parent::Seeded("claude"),
