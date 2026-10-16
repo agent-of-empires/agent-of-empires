@@ -242,13 +242,14 @@ id = "tool_approval"
 state = "waiting"
 priority = 970
 positional = true
-region = "bottom_non_empty_lines(8)"
-wrap = 8
+region = "bottom_non_empty_lines(14)"
+wrap = 12
 visible = true
 contains = ["Allow tool:", "approve", "deny"]
-
-
-# Generic OMP selectors use a selected row, multiple options, and a keyboard footer.
+not = [
+  { region = "bottom_non_empty_lines(3)", contains_any = ["⟦esc⟧", "⟨esc⟩", "[esc]", "(esc to cancel)"] },
+  { region = "bottom_non_empty_lines(3)", line_regex = ['(?i)^\s*retrying \d+/\d+ (?:in|now):'] },
+]
 [[rules]]
 id = "selector_panel"
 state = "waiting"

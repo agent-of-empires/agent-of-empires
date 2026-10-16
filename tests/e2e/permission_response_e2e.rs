@@ -109,6 +109,7 @@ fn test_respond_to_omp_approval_uses_approval_shortcuts() {
     require_tmux!();
 
     let mut h = TuiTestHarness::new("omp_perm_resp");
+    h.install_path_command("omp");
     let fake_omp = h.home_path().join("fake-omp");
     let script = "#!/bin/sh\n\
 for request in 1 2; do\n\

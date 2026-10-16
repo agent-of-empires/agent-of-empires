@@ -14,6 +14,8 @@
 //! Modules behind `#[cfg(debug_assertions)]` use test hooks and helpers that
 //! only debug builds compile, so release test builds (the Nix checks) skip them.
 
+#[cfg(unix)]
+mod capture_fixture_script;
 mod common;
 #[cfg(unix)]
 mod frozen_environment;

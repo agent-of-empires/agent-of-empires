@@ -48,11 +48,14 @@ aoe session start omp-fixture-compact
 ```
 
 Ask OMP in each session to run a harmless shell command such as `pwd`, then
-capture both panes while their approval prompts are visible:
+capture while the approval prompt is visible. To capture expanded details,
+ask OMP for a harmless command with a long argument, press `Ctrl+O` in the
+pane, then capture the expanded approval:
 
 ```sh
 ./scripts/capture-fixtures.sh omp waiting_permission <custom-tmux-session> tool_approval_custom
 ./scripts/capture-fixtures.sh omp waiting_permission <compact-tmux-session> tool_approval_compact
+./scripts/capture-fixtures.sh omp waiting_permission <expanded-tmux-session> tool_approval_expanded
 rm "$custom_overlay" "$compact_overlay"
 rmdir "$overlay_dir"
 ```

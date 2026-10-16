@@ -82,22 +82,25 @@ if [[ "${1:-}" == "--write-omp-approval-overlay" ]]; then
                 ;;
         esac
     fi
-    if [[ -e "$2" ]]; then
-        echo "Error: overlay output '$2' already exists."
+    if [[ -L "$2" ]]; then
+        echo "Error: overlay output '$2' must not be a symlink."
         exit 1
     fi
-    cat > "$2" <<'EOF'
-tools:
-  approvalMode: always-ask
-  approval:
-    bash: prompt
-EOF
-    if [[ $# -eq 3 ]]; then
-        cat >> "$2" <<EOF
-statusLine:
-  preset: $3
-EOF
+    set -o noclobber
+    if ! { exec 9>"$2"; }; then
+        echo "Error: overlay output '$2' already exists or cannot be created."
+        exit 1
     fi
+    printf '%s\n' \
+        'tools:' \
+        '  approvalMode: always-ask' \
+        '  approval:' \
+        '    bash: prompt' >&9
+    if [[ $# -eq 3 ]]; then
+        printf '%s\n' 'statusLine:' "  preset: $3" >&9
+    fi
+    exec 9>&-
+    set +o noclobber
     echo "Wrote temporary OMP approval overlay: $2"
     if [[ $# -eq 3 ]]; then
         echo "Status-line preset: $3"
