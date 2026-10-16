@@ -274,6 +274,7 @@ pub(super) fn build_fork_flags(
                 _ => String::new(),
             }
         }
+        ForkStrategy::ValueFlag(fork_flag) => format!("{fork_flag} {parent_id}"),
         ForkStrategy::ServeFork
         | ForkStrategy::EitherGeneration { .. }
         | ForkStrategy::Unsupported => String::new(),
@@ -1785,6 +1786,20 @@ mod tests {
             ),
             ("pi", "$(rm -rf /)", "child", AgentGeneration::Current, ""),
             ("pi", "parent", "; echo pwned", AgentGeneration::Current, ""),
+            (
+                "prime-agent",
+                "parent-id",
+                "ignored-child",
+                AgentGeneration::Current,
+                "--fork parent-id",
+            ),
+            (
+                "prime-agent",
+                "$(rm -rf /)",
+                "child",
+                AgentGeneration::Current,
+                "",
+            ),
         ] {
             assert_eq!(
                 build_fork_flags(tool, parent, child, generation),

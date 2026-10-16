@@ -29,6 +29,9 @@ pub enum ForkSeed {
 pub enum ForkDenied {
     /// The agent's CLI has no fork capability (terminal path).
     AgentCannotFork { agent: String },
+    /// The agent mints the fork's child id, and AoE cannot capture it where the
+    /// parent runs (or cannot tell where that is).
+    ChildNotCapturable { agent: String },
     /// The parent names no single conversation to fork: no row carries the id,
     /// or the rows that do name different conversations.
     NoParentSession,
@@ -61,7 +64,10 @@ impl ForkDenied {
     pub fn user_message(&self, title: &str, id: &str, profile: &str) -> String {
         match self {
             Self::AgentCannotFork { agent } => format!(
-                "Nothing to fork: session '{title}' runs agent '{agent}', which has no native fork capability. Forkable agents: claude, codex, opencode, pi."
+                "Nothing to fork: session '{title}' runs agent '{agent}', which has no native fork capability."
+            ),
+            Self::ChildNotCapturable { agent } => format!(
+                "Nothing to fork: session '{title}' runs agent '{agent}', which mints the forked conversation id, and that id can only be captured for sandboxed sessions."
             ),
             Self::NoParentSession => format!(
                 "Nothing to fork: session '{title}' has no single captured conversation to fork from: it has captured none, or more than one session records this conversation id."
@@ -270,6 +276,17 @@ pub fn terminal_fork_seed(
             agent: agent.to_owned(),
         });
     }
+    // An unattributed parent records no execution, so the fork has to be
+    // capturable in both contexts.
+    let capturable = get_agent(agent).is_some_and(|def| match &parent.execution {
+        Some(execution) => def.can_fork_in(execution.filesystem != "host"),
+        None => def.can_fork_in(true) && def.can_fork_in(false),
+    });
+    if !capturable {
+        return Err(ForkDenied::ChildNotCapturable {
+            agent: agent.to_owned(),
+        });
+    }
     Ok(ForkSeed::Terminal {
         parent: Box::new(parent.clone()),
         child_session_id,
@@ -401,6 +418,37 @@ mod tests {
         }
     }
 
+    /// Prime mints the child id and AoE captures it only in a sandbox, so the
+    /// parent's own context decides, and an unattributed parent decides nothing.
+    #[test]
+    fn a_minted_child_fork_needs_a_capturable_parent_context() {
+        let mut parent = bound(ConversationProvenance::Observed);
+        parent.execution.as_mut().unwrap().agent = "prime-agent".into();
+        let seed = |parent: &ConversationBinding| {
+            terminal_fork_seed(Some(ForkParentRef::Bound(parent)), "child-uuid".into())
+        };
+        let denied = Err(ForkDenied::ChildNotCapturable {
+            agent: "prime-agent".into(),
+        });
+
+        assert_eq!(seed(&parent).map(|_| ()), denied, "host");
+        parent.execution.as_mut().unwrap().filesystem = "container".into();
+        assert!(
+            matches!(seed(&parent), Ok(ForkSeed::Terminal { .. })),
+            "sandbox"
+        );
+
+        let unknown = ConversationBinding::unknown("parent-uuid");
+        let unattributed = terminal_fork_seed(
+            Some(ForkParentRef::Unattributed {
+                binding: &unknown,
+                agent: "prime-agent",
+            }),
+            "child-uuid".into(),
+        );
+        assert_eq!(unattributed.map(|_| ()), denied, "unattributed");
+    }
+
     /// Every refusal state names the remedy that comes back to it, and no
     /// other state's remedy: a preallocated id has no conversation to qualify,
     /// so it is told to send a message, and the rest are told to re-assert one.
@@ -418,7 +466,7 @@ mod tests {
                 ForkDenied::AgentCannotFork {
                     agent: "gemini".into(),
                 },
-                vec![agent_cannot_fork, "Forkable agents: claude"],
+                vec![agent_cannot_fork],
             ),
             (ForkDenied::NoParentSession, vec![no_parent]),
             (

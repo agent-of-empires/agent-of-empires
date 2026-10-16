@@ -3239,7 +3239,10 @@ impl HomeView {
                 Ok(s) => s,
                 Err(denied) => {
                     let dialog_title = match denied {
-                        crate::session::ForkDenied::AgentCannotFork { .. } => "Fork not supported",
+                        crate::session::ForkDenied::AgentCannotFork { .. }
+                        | crate::session::ForkDenied::ChildNotCapturable { .. } => {
+                            "Fork not supported"
+                        }
                         crate::session::ForkDenied::NoParentSession
                         | crate::session::ForkDenied::UnlaunchedFork => "Nothing to fork yet",
                         crate::session::ForkDenied::UnqualifiedParent { .. } => {
