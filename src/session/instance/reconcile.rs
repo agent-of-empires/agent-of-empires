@@ -16,7 +16,7 @@ impl Instance {
     /// [`Self::reconcile_from_disk`] that reports a storage failure. `Ok(false)`
     /// means the row is gone from disk and `self` is unchanged.
     pub(super) fn try_reconcile_from_disk(&mut self) -> Result<bool> {
-        let storage = crate::session::storage::Storage::new(
+        let storage = crate::session::storage::Storage::open(
             &self.effective_profile(),
             self.resolve_file_watch(),
         )
@@ -46,6 +46,7 @@ impl Instance {
         disk.adopt_poller_repair(self);
         disk.pane_dead_observed = self.pane_dead_observed;
         disk.force_fresh_next_launch = self.force_fresh_next_launch;
+        disk.terminal_handoff_completion = self.terminal_handoff_completion;
         disk.pending_host_env = std::mem::take(&mut self.pending_host_env);
         disk.identity_publisher_launched = self.identity_publisher_launched;
         disk.source_profile = std::mem::take(&mut self.source_profile);
@@ -204,6 +205,7 @@ mod tests {
         inst.ever_confirmed_present = true;
         let unknown_since = now - std::time::Duration::from_secs(5);
         inst.unknown_since = Some(unknown_since);
+        inst.terminal_handoff_completion = true;
 
         inst.reconcile_from_disk();
 
@@ -214,6 +216,7 @@ mod tests {
             vec![("GH_TOKEN".to_string(), "ghs_minted".to_string())]
         );
         assert!(inst.ever_confirmed_present);
+        assert!(inst.terminal_handoff_completion);
         assert_eq!(inst.unknown_since, Some(unknown_since));
     }
 

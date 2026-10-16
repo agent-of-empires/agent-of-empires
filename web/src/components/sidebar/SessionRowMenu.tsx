@@ -186,7 +186,11 @@ export function SingleRowMenuItems({
       )}
       {canSwitchView && (
         <MenuItem onClick={a.switchView} testId="sidebar-context-menu-switch-view" icon={icon(SquareTerminal)}>
-          {first!.view === "structured" ? "Switch to terminal" : "Switch to structured view"}
+          {first!.terminal_handoff_pending
+            ? "Retry terminal handoff"
+            : first!.view === "structured"
+              ? "Switch to terminal"
+              : "Switch to structured view"}
         </MenuItem>
       )}
       {canFork && (

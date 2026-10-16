@@ -165,15 +165,43 @@ impl EventStore {
         collected
     }
 
-    /// Drop every event for a session, cascading to its attachment blobs.
+    /// Remove all durable structured state for a session atomically.
     pub fn delete_session(&self, session_id: &str) {
-        let deleted = events::delete_topic(&self.conn(), &self.schema, session_id);
+        if let Err(error) = self.delete_session_fallible(session_id) {
+            warn!(
+                target: "acp.event_store",
+                session = %session_id,
+                %error,
+                "failed to delete session events"
+            );
+        }
+    }
+
+    pub(crate) fn delete_session_fallible(&self, session_id: &str) -> Result<()> {
+        let mut conn = self.conn();
+        let tx = conn
+            .transaction()
+            .context("begin structured session event cleanup")?;
+        for table in [
+            self.schema.events_table(),
+            self.schema.attachments_table(),
+            self.schema.pending_attachments_table(),
+            self.schema.rate_limit_budgets_table(),
+        ] {
+            tx.execute(
+                &format!("DELETE FROM {table} WHERE session_id = ?1"),
+                rusqlite::params![session_id],
+            )
+            .with_context(|| format!("delete structured session rows from {table}"))?;
+        }
+        tx.commit()
+            .context("commit structured session event cleanup")?;
         debug!(
             target: "acp.event_store",
             session = %session_id,
-            deleted,
             "deleted session events"
         );
+        Ok(())
     }
 }
 
@@ -259,6 +287,67 @@ pub(super) mod test_support {
 mod tests {
     use super::test_support::*;
     use super::*;
+
+    #[test]
+    fn fallible_session_delete_removes_only_that_sessions_event_store_rows() {
+        let (_tmp, store) = open_store(1000);
+        store.record("target", 1, &Event::ThinkingStarted).unwrap();
+        store
+            .record("retained", 1, &Event::ThinkingStarted)
+            .unwrap();
+        {
+            let conn = store.conn();
+            conn.execute(
+                "INSERT INTO acp_attachments
+                 (session_id, seq, attachment_id, kind, mime_type, data, created_at)
+                 VALUES ('target', 1, 'target-a', 'file', 'text/plain', x'01', 0),
+                        ('retained', 1, 'retained-a', 'file', 'text/plain', x'02', 0)",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO acp_pending_attachments
+                 (session_id, ref_id, attachment_id, kind, mime_type, data, created_at)
+                 VALUES ('target', 'target-r', 'target-p', 'file', 'text/plain', x'03', 0),
+                        ('retained', 'retained-r', 'retained-p', 'file', 'text/plain', x'04', 0)",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO acp_rate_limit_budgets VALUES ('target', 2, 1), ('retained', 3, 1)",
+                [],
+            )
+            .unwrap();
+        }
+
+        store.delete_session_fallible("target").unwrap();
+
+        assert_eq!(store.highest_seq("target"), 0);
+        assert_eq!(store.highest_seq("retained"), 1);
+        let conn = store.conn();
+        for table in [
+            store.schema.attachments_table(),
+            store.schema.pending_attachments_table(),
+            store.schema.rate_limit_budgets_table(),
+        ] {
+            let target_count: i64 = conn
+                .query_row(
+                    &format!("SELECT COUNT(*) FROM {table} WHERE session_id = 'target'"),
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            let retained_count: i64 = conn
+                .query_row(
+                    &format!("SELECT COUNT(*) FROM {table} WHERE session_id = 'retained'"),
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(target_count, 0, "rows remain in {table}");
+            assert_eq!(retained_count, 1, "sibling rows were deleted from {table}");
+        }
+    }
 
     #[test]
     fn record_is_idempotent_and_persisted_shapes_stay_readable() {

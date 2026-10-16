@@ -488,6 +488,7 @@ mod tests {
                     let mut durable = cached.clone();
                     durable.view = crate::session::View::Structured;
                     durable.acp_session_id = Some("11111111-1111-4111-8111-111111111111".into());
+                    durable.archived_at = Some(chrono::Utc::now());
                     let storage = crate::session::Storage::new_unwatched(profile).unwrap();
                     storage
                         .update(|all, _| {
@@ -573,6 +574,7 @@ mod tests {
         inst.source_profile = profile.into();
         inst.view = crate::session::View::Structured;
         inst.acp_session_id = Some("original-acp".into());
+        inst.archived_at = Some(chrono::Utc::now());
         inst.agent_session_id = Some("native-preserved".into());
         let id = inst.id.clone();
         let expected = inst.conversation_state();

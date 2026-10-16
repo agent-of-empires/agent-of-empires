@@ -639,36 +639,43 @@ fn directory_bytes(root: &Path) -> u64 {
 /// shared legacy store owns no per-instance directory to remove, and v027 may
 /// be publishing the private one it will own, so it is left to the reclaim
 /// pass.
-pub(crate) fn remove_stores_for(
-    instance: &crate::session::Instance,
-) -> Result<(Vec<PathBuf>, u64)> {
+pub(crate) fn store_paths_for(instance: &crate::session::Instance) -> Result<Vec<PathBuf>> {
     if instance.sandbox_store_generation
         < crate::session::config::container_config::CURRENT_SANDBOX_STORE_GENERATION
     {
-        return Ok((Vec::new(), 0));
+        return Ok(Vec::new());
     }
     let home = dirs::home_dir().context("home directory unavailable for store removal")?;
-    let config = crate::session::config::profile_config::resolve_config_or_warn(
-        &instance.effective_profile(),
-    );
+    let config =
+        crate::session::config::profile_config::resolve_config(&instance.effective_profile())?;
     let Some(agent) = crate::session::config::container_config::resolve_active_agent(
         &instance.tool,
         Some(instance.get_tool_command()),
         &config.session,
     ) else {
-        return Ok((Vec::new(), 0));
+        return Ok(Vec::new());
     };
     let declared = config.session.agent_config_dir_for(&instance.tool, &home);
-    let app = crate::session::get_app_dir()?;
-    let other_namespaces = also_owned(&app);
-    let mut removed = Vec::new();
-    let mut freed = 0;
-    for path in crate::session::config::container_config::sandbox_store_dirs(
+    crate::session::config::container_config::sandbox_store_dirs(
         agent.name,
         &home,
         declared.as_deref(),
         &instance.id,
-    )? {
+    )
+}
+
+pub(crate) fn remove_stores_for(
+    instance: &crate::session::Instance,
+) -> Result<(Vec<PathBuf>, u64)> {
+    let paths = store_paths_for(instance)?;
+    if paths.is_empty() {
+        return Ok((Vec::new(), 0));
+    }
+    let app = crate::session::get_app_dir()?;
+    let other_namespaces = also_owned(&app);
+    let mut removed = Vec::new();
+    let mut freed = 0;
+    for path in paths {
         match fs::symlink_metadata(&path) {
             Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {}
             Ok(_) => {

@@ -52,6 +52,7 @@ fn env_seeded(profile: &str, seed_dirs: &[&str], seed: impl FnOnce(&Arc<FileWatc
     for dir in seed_dirs {
         crate::session::get_profile_dir(dir).expect("seed dir");
     }
+    crate::session::get_profile_dir(profile).expect("active profile");
     seed(&live);
     let view = HomeView::new_for_test(
         Some(profile.to_string()),

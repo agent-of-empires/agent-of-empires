@@ -29,13 +29,14 @@ pub(super) fn load_all_instances(
             return Ok(Vec::new());
         }
     };
+    Ok(read_profile_snapshot(&profiles, file_watch))
+}
+
+fn read_profile_snapshot(profiles: &[String], file_watch: &Arc<FileWatchService>) -> Vec<Instance> {
     let mut all = Vec::new();
-    for profile in &profiles {
-        match Storage::new(profile, file_watch.clone()).and_then(|s| s.load()) {
-            Ok(mut instances) => {
-                for inst in &mut instances {
-                    inst.source_profile = profile.clone();
-                }
+    for profile in profiles {
+        match load_profile_instances(profile, file_watch) {
+            Ok(instances) => {
                 all.extend(instances);
             }
             Err(e) => {
@@ -49,7 +50,18 @@ pub(super) fn load_all_instances(
             }
         }
     }
-    Ok(all)
+    all
+}
+
+fn load_profile_instances(
+    profile: &str,
+    file_watch: &Arc<FileWatchService>,
+) -> anyhow::Result<Vec<Instance>> {
+    let mut instances = Storage::open(profile, Arc::clone(file_watch))?.load()?;
+    for instance in &mut instances {
+        instance.source_profile = profile.to_string();
+    }
+    Ok(instances)
 }
 
 /// Carry over the in-memory-only fields from the prior `state.instances` entry into the
@@ -67,10 +79,10 @@ pub(super) fn merge_runtime_fields(prior: Instance, mut fresh: Instance) -> Inst
     fresh
 }
 
-/// The prior tick's `#[serde(skip)]` status bookkeeping for one row, the
-/// input to [`seed_tick_tracking`].
+/// Coherent prior-tick lifecycle and runtime status bookkeeping.
 #[derive(Debug, Clone, Copy, Default)]
 pub(super) struct PriorTickTracking {
+    lifecycle_generation: u64,
     ever_confirmed_present: bool,
     unknown_since: Option<std::time::Instant>,
     detection: crate::session::DetectionState,
@@ -79,6 +91,7 @@ pub(super) struct PriorTickTracking {
 impl PriorTickTracking {
     pub(super) fn of(inst: &Instance) -> Self {
         Self {
+            lifecycle_generation: inst.lifecycle_generation,
             ever_confirmed_present: inst.ever_confirmed_present,
             unknown_since: inst.unknown_since,
             detection: inst.detection,
@@ -105,10 +118,18 @@ pub(super) fn seed_tick_tracking(
 pub(super) fn apply_tick_status_decisions(
     instances: &mut [Instance],
     prev: &std::collections::HashMap<String, crate::session::Status>,
+    prev_tracking: &std::collections::HashMap<String, PriorTickTracking>,
     suppressed_ids: &std::collections::HashSet<String>,
     pane_metadata: Option<&std::collections::HashMap<String, crate::tmux::PaneMetadata>>,
 ) {
     for inst in instances.iter_mut() {
+        if prev_tracking
+            .get(&inst.id)
+            .is_some_and(|prior| inst.lifecycle_generation > prior.lifecycle_generation)
+        {
+            inst.live_status_baseline = None;
+            continue;
+        }
         if suppressed_ids.contains(&inst.id) {
             inst.status = Status::Starting;
             continue;
@@ -271,7 +292,13 @@ pub(crate) async fn reload_state_instances_from_disk(
 
     let mut merged: Vec<Instance> = Vec::with_capacity(fresh.len());
     for mut row in fresh {
+        let mut lifecycle_advanced = false;
         if let Some(prior) = prior_by_id.get(&row.id).cloned() {
+            if row.lifecycle_generation < prior.lifecycle_generation {
+                merged.push(prior);
+                continue;
+            }
+            lifecycle_advanced = row.lifecycle_generation > prior.lifecycle_generation;
             let prior_status = prior.status;
             let prior_last_accessed = prior.last_accessed_at;
             let prior_idle_entered = prior.idle_entered_at;
@@ -279,8 +306,10 @@ pub(crate) async fn reload_state_instances_from_disk(
             row = merge_runtime_fields(prior, row);
             match status_source {
                 StatusSource::DiskOnly => {
-                    row.status = prior_status;
-                    row.idle_entered_at = prior_idle_entered.or(row.idle_entered_at);
+                    if !lifecycle_advanced {
+                        row.status = prior_status;
+                        row.idle_entered_at = prior_idle_entered.or(row.idle_entered_at);
+                    }
                     // `row` here is a raw disk load (no tmux scrape ran), so
                     // the `#[serde(skip)]` tracking fields are still at their
                     // zeroed defaults; restore the prior tick's.
@@ -295,7 +324,7 @@ pub(crate) async fn reload_state_instances_from_disk(
             }
             row.last_accessed_at = prior_last_accessed.max(row.last_accessed_at);
         }
-        if suppressed_ids.contains(&row.id) {
+        if suppressed_ids.contains(&row.id) && !lifecycle_advanced {
             row.status = Status::Starting;
         }
         merged.push(row);
@@ -332,9 +361,11 @@ pub(super) fn apply_acp_overlay_inplace(prior_by_id: &PriorById, merged: &mut [I
         let Some(prior) = prior_by_id.get(&inst.id) else {
             continue;
         };
-        inst.status = prior.status;
-        inst.last_accessed_at = prior.last_accessed_at;
-        inst.idle_entered_at = prior.idle_entered_at;
+        inst.last_accessed_at = inst.last_accessed_at.max(prior.last_accessed_at);
+        if inst.lifecycle_generation <= prior.lifecycle_generation {
+            inst.status = prior.status;
+            inst.idle_entered_at = prior.idle_entered_at;
+        }
     }
 }
 
@@ -342,6 +373,100 @@ pub(super) fn apply_acp_overlay_inplace(prior_by_id: &PriorById, merged: &mut [I
 mod tests {
     use super::*;
     use chrono::Utc;
+
+    #[cfg(unix)]
+    #[test]
+    #[serial_test::serial]
+    fn stale_profile_snapshot_does_not_recreate_renamed_kept_profile() {
+        use crate::session::lifecycle_journal::{
+            self, LifecycleDeletionOptions, LifecycleJournalEntry, LifecyclePhase,
+        };
+        use std::os::unix::fs::MetadataExt;
+
+        let _home = crate::session::test_support::isolate_app_dir();
+        let storage = Storage::new_unwatched("kept-before").unwrap();
+        storage.update(|_, _| Ok(())).unwrap();
+        let old_dir = storage.sessions_path().parent().unwrap().to_path_buf();
+        let identity = std::fs::metadata(&old_dir).unwrap();
+        let scratch = crate::session::scratch::provision_scratch_dir("kept-reload").unwrap();
+        let retained = scratch.join("retained");
+        std::fs::write(&retained, b"preserved scratch").unwrap();
+        let mut row = Instance::new("kept", scratch.to_str().unwrap());
+        row.id = "kept-reload".into();
+        row.source_profile = "kept-before".into();
+        row.scratch = true;
+        row.status = Status::Deleting;
+        row.lifecycle_generation = 1;
+        let entry = LifecycleJournalEntry::deletion(
+            row,
+            Status::Idle,
+            storage.sessions_path().to_path_buf(),
+            LifecycleDeletionOptions {
+                generation: 1,
+                delete_worktree: false,
+                delete_branch: false,
+                delete_sandbox: false,
+                force_delete: false,
+                detach_hooks: true,
+                keep_scratch: true,
+                purge_acp_transcript: false,
+            },
+        )
+        .with_phase(LifecyclePhase::Kept)
+        .with_kept_resources(vec![format!("scratch directory {}", scratch.display())]);
+        let journal = lifecycle_journal::record(&entry).unwrap();
+        assert!(storage.load().unwrap().is_empty());
+
+        let witness = Storage::new_unwatched("witness").unwrap();
+        let mut witness_row = Instance::new("witness", "/tmp/reload-witness");
+        witness_row.source_profile = "witness".into();
+        witness
+            .update(|rows, _| {
+                rows.push(witness_row.clone());
+                Ok(())
+            })
+            .unwrap();
+        let snapshot = crate::session::list_profiles().unwrap();
+        crate::session::rename_profile("kept-before", "kept-after").unwrap();
+        assert!(!old_dir.exists());
+        let destination = crate::session::get_profile_dir_path("kept-after").unwrap();
+        let moved_journal = destination.join(journal.strip_prefix(&old_dir).unwrap());
+        let journal_before_read = std::fs::read(&moved_journal).unwrap();
+
+        let rows = read_profile_snapshot(&snapshot, &FileWatchService::noop());
+
+        assert!(
+            !old_dir.exists(),
+            "a stale reader recreated the renamed profile"
+        );
+        let destination_identity = std::fs::metadata(&destination).unwrap();
+        assert_eq!(destination_identity.dev(), identity.dev());
+        assert_eq!(destination_identity.ino(), identity.ino());
+        assert_eq!(std::fs::read(&retained).unwrap(), b"preserved scratch");
+        assert_eq!(std::fs::read(&moved_journal).unwrap(), journal_before_read);
+        assert_eq!(
+            rows.iter()
+                .map(|row| (row.id.as_str(), row.source_profile.as_str()))
+                .collect::<Vec<_>>(),
+            vec![(witness_row.id.as_str(), "witness")]
+        );
+    }
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn reload_of_a_renamed_profile_does_not_recreate_its_old_directory() {
+        let _home = crate::session::test_support::isolate_app_dir();
+        let file_watch = FileWatchService::new().unwrap();
+        Storage::new_unwatched("reload-before").unwrap();
+        let old_path = crate::session::get_profile_dir_path("reload-before").unwrap();
+
+        crate::session::rename_profile("reload-before", "reload-after").unwrap();
+
+        assert!(load_profile_instances("reload-before", &file_watch).is_err());
+        assert!(!old_path.exists());
+        assert!(crate::session::get_profile_dir_path("reload-after")
+            .unwrap()
+            .is_dir());
+    }
 
     fn terminal_row(status: Status) -> Instance {
         let mut row = Instance::new("reload-publish", "/tmp/aoe-reload-publish");
@@ -394,6 +519,106 @@ mod tests {
 
             let got = rx.try_recv().ok().map(|c| (c.old, c.new));
             assert_eq!(got, want, "live={live:?} snapshot={snapshot:?} {source:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_peer_purge_rollback_rearms_a_cached_deleting_structured_row() {
+        use std::collections::HashMap;
+        for source in [StatusSource::DiskOnly, StatusSource::TmuxApplied] {
+            for case in ["rollback", "purge", "equal", "stale"] {
+                let mut idle = terminal_row(Status::Idle);
+                idle.view = crate::session::View::Structured;
+                idle.idle_entered_at = Some(Utc::now() - chrono::Duration::seconds(5));
+                let mut deleting = idle.clone();
+                let generation = deleting
+                    .try_acquire_lifecycle_reservation(
+                        crate::session::LifecycleOperation::Purge,
+                        Instance::LIFECYCLE_RESERVATION_TTL,
+                        Utc::now(),
+                    )
+                    .unwrap();
+                deleting.status = Status::Deleting;
+                let mut completed = deleting.clone();
+                assert!(completed
+                    .finish_owned_purge(generation, Status::Idle)
+                    .unwrap());
+                completed.idle_entered_at = Some(Utc::now());
+                let mut runtime = completed.clone();
+                runtime.status = Status::Running;
+                runtime.idle_entered_at = None;
+                let (prior, incoming, expected) = match case {
+                    "rollback" => (deleting, completed.clone(), completed),
+                    "purge" => (idle, deleting.clone(), deleting),
+                    "equal" => (runtime.clone(), completed, runtime),
+                    "stale" => (runtime.clone(), deleting, runtime),
+                    _ => unreachable!(),
+                };
+                let id = prior.id.clone();
+                let state = crate::server::test_support::build_test_app_state(vec![prior.clone()]);
+                if case != "equal" {
+                    crate::session::recovery::mark_recently_restarted(
+                        &state.recently_restarted,
+                        &id,
+                    );
+                }
+                let mut fresh = vec![incoming];
+                if matches!(source, StatusSource::TmuxApplied) {
+                    let prev = HashMap::from([(id.clone(), prior.status)]);
+                    let tracking = HashMap::from([(id.clone(), PriorTickTracking::of(&prior))]);
+                    let suppressed = crate::session::recovery::snapshot_recently_restarted(
+                        &state.recently_restarted,
+                    );
+                    seed_tick_tracking(&mut fresh, &tracking);
+                    apply_tick_status_decisions(
+                        &mut fresh,
+                        &prev,
+                        &tracking,
+                        &suppressed,
+                        Some(&HashMap::new()),
+                    );
+                }
+                let read_epoch = state
+                    .mutation_epoch
+                    .load(std::sync::atomic::Ordering::SeqCst);
+                reload_state_instances_from_disk(&state, fresh, Vec::new(), source, read_epoch)
+                    .await;
+
+                let rows = state.instances.read().await;
+                assert_eq!(rows[0].status, expected.status, "{case} {source:?}");
+                assert_eq!(rows[0].lifecycle_generation, expected.lifecycle_generation);
+                assert_eq!(
+                    rows[0].lifecycle_reservation,
+                    expected.lifecycle_reservation
+                );
+                assert_eq!(rows[0].idle_entered_at, expected.idle_entered_at);
+                drop(rows);
+                if case != "purge" {
+                    crate::session::recovery::unmark_recently_restarted(
+                        &state.recently_restarted,
+                        &id,
+                    );
+                    {
+                        let mut rows = state.instances.write().await;
+                        rows[0].status = Status::Waiting;
+                        rows[0].idle_entered_at = None;
+                    }
+                    let mut same_generation = expected;
+                    same_generation.status = Status::Idle;
+                    same_generation.idle_entered_at = Some(Utc::now());
+                    reload_state_instances_from_disk(
+                        &state,
+                        vec![same_generation],
+                        Vec::new(),
+                        source,
+                        read_epoch,
+                    )
+                    .await;
+                    let rows = state.instances.read().await;
+                    assert_eq!(rows[0].status, Status::Waiting, "{case} {source:?}");
+                    assert_eq!(rows[0].idle_entered_at, None);
+                }
+            }
         }
     }
 
@@ -531,9 +756,8 @@ mod tests {
     async fn reload_repair_rejects_a_registry_sample_retired_after_the_disk_read() {
         let _home = crate::session::test_support::isolate_app_dir();
         let (state, row, record, storage) = live_repair_fixture();
-        // The reload sampled the runner during teardown; disable finished
-        // before this reload could acquire the transition lock.
-        crate::process::worker_registry::delete_if_owned(&row.id, std::process::id()).unwrap();
+        // Teardown retired the runner after this reload sampled it.
+        crate::process::worker_registry::retire_if_owned(&record.0).unwrap();
         reload_state_instances_from_disk(
             &state,
             vec![row],
@@ -642,9 +866,10 @@ mod tests {
         for (name, inst, prev_status, restarted, metadata, want, transitions) in cases {
             let id = inst.id.clone();
             let prev: HashMap<_, _> = prev_status.map(|s| (id.clone(), s)).into_iter().collect();
+            let tracking = HashMap::from([(id.clone(), PriorTickTracking::of(&inst))]);
             let suppressed: HashSet<_> = restarted.then_some(id).into_iter().collect();
             let mut instances = vec![inst];
-            apply_tick_status_decisions(&mut instances, &prev, &suppressed, metadata);
+            apply_tick_status_decisions(&mut instances, &prev, &tracking, &suppressed, metadata);
             assert_eq!(instances[0].status, want, "{name}");
             assert_eq!(
                 observed_transitions(&instances, &prev),
@@ -684,60 +909,6 @@ mod tests {
             tmux.last_error.as_deref(),
             Some(crate::session::TMUX_SESSION_GONE_ERROR),
             "the poller still needs the tmux error"
-        );
-    }
-
-    #[test]
-    fn seed_tick_tracking_carries_prior_tick_fields_onto_fresh_instance() {
-        // `load_all_instances` always resets these `#[serde(skip)]` fields to
-        // their defaults, mimicking status_poll_loop's fresh disk load.
-        let mut fresh = vec![
-            Instance::new("sess-1", "/tmp/seed"),
-            Instance::new("sess-unseen", "/tmp/seed"),
-        ];
-
-        let confirmed_at = std::time::Instant::now() - std::time::Duration::from_secs(3);
-        let mut prev = std::collections::HashMap::new();
-        prev.insert(
-            fresh[0].id.clone(),
-            PriorTickTracking {
-                ever_confirmed_present: true,
-                unknown_since: Some(confirmed_at),
-                detection: crate::session::DetectionState {
-                    pending: Some(Status::Idle),
-                    ..Default::default()
-                },
-            },
-        );
-
-        seed_tick_tracking(&mut fresh, &prev);
-
-        assert!(
-            fresh[0].ever_confirmed_present,
-            "prior tick's ever_confirmed_present must seed the fresh instance \
-             before update_status_with_metadata runs on it"
-        );
-        assert_eq!(
-            fresh[0].unknown_since,
-            Some(confirmed_at),
-            "prior tick's unknown_since must seed the fresh instance so the \
-             Unknown->Error escalation window can actually accumulate elapsed \
-             time across ticks (#2865)"
-        );
-        assert_eq!(
-            fresh[0].detection.pending,
-            Some(Status::Idle),
-            "prior tick's proposal must seed the fresh instance so the poll \
-             that agrees with it can publish it (#3642)"
-        );
-        assert!(
-            !fresh[1].ever_confirmed_present,
-            "an unseen id is untouched"
-        );
-        assert_eq!(fresh[1].unknown_since, None);
-        assert_eq!(
-            fresh[1].detection,
-            crate::session::DetectionState::default()
         );
     }
 
@@ -813,6 +984,7 @@ mod tests {
             apply_tick_status_decisions(
                 &mut instances,
                 &prev,
+                &tracking,
                 &std::collections::HashSet::new(),
                 Some(&metadata),
             );

@@ -48,6 +48,33 @@ fn build_rename_test_state(
     (storage, state)
 }
 
+#[tokio::test]
+#[serial_test::serial]
+async fn stale_terminal_stop_does_not_recreate_a_renamed_profile() {
+    let _home = crate::session::test_support::isolate_app_dir();
+    let mut instance = Instance::new("stale-stop", "/tmp/stale-stop");
+    instance.source_profile = "default".into();
+    instance.view = crate::session::View::Terminal;
+    instance.status = Status::Running;
+    let id = instance.id.clone();
+    let (_storage, state) = build_rename_test_state(vec![instance.clone()], vec![instance.clone()]);
+    crate::session::rename_profile("default", "after-stop-rename").unwrap();
+    assert!(instance.stop().is_err());
+    let response = stop_session(State(state), Path(id)).await.into_response();
+    assert!(!response.status().is_success());
+    assert!(!crate::session::get_profile_dir_path("default")
+        .unwrap()
+        .exists());
+    assert_eq!(
+        Storage::open_unwatched("after-stop-rename")
+            .unwrap()
+            .load()
+            .unwrap()
+            .len(),
+        1
+    );
+}
+
 /// #3411: a rename to a duplicate title, or a tied rename whose derived path
 /// collides with another session's worktree, is refused.
 #[tokio::test]
@@ -1941,6 +1968,7 @@ async fn worktree_edits_quiesce_structured_worker_only_when_its_cwd_moves() {
         // (#2260). The quiesce precedes the git edit, so the assertion holds even
         // though the edit then fails on a fixture with no real worktree.
         let _app_dir = crate::session::test_support::isolate_app_dir();
+        crate::session::create_profile("test").unwrap();
         // set_worktree_name refuses a tied managed worktree (tied callers must
         // go through rename_session), so untie the profile to reach the worker
         // gate that this test exercises.
@@ -2851,6 +2879,7 @@ impl PluginStatusFeed {
 #[tokio::test]
 async fn archive_session_notifies_plugins_of_the_idle_it_settles_to() {
     let _home = crate::session::test_support::isolate_app_dir();
+    crate::session::create_profile("default").unwrap();
     let mut running = make_test_instance();
     running.source_profile = "default".to_string();
     let mut idle = make_test_instance();
@@ -2891,6 +2920,7 @@ async fn archive_session_notifies_plugins_of_the_idle_it_settles_to() {
 #[tokio::test]
 async fn stop_session_notifies_plugins() {
     let _home = crate::session::test_support::isolate_app_dir();
+    crate::session::create_profile("default").unwrap();
     let mut inst = make_test_instance();
     inst.view = crate::session::View::Structured;
     inst.source_profile = "default".to_string();
@@ -2922,7 +2952,16 @@ async fn start_session_notifies_plugins() {
     let state = crate::server::test_support::build_test_app_state(vec![inst]);
     let mut feed = PluginStatusFeed::attach(&state, "default").await;
 
-    start_session(State(std::sync::Arc::clone(&state)), Path(id)).await;
+    crate::process::worker_registry::seed_settled_stop_intent(&id).unwrap();
+    let response = start_session(State(std::sync::Arc::clone(&state)), Path(id.clone()))
+        .await
+        .into_response();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(
+        !crate::process::worker_registry::stop_requested(&id),
+        "explicit start did not clear the settled ACP stop fence"
+    );
 
     assert_eq!(feed.next().await, ("Stopped".into(), "Idle".into()));
 }
@@ -2967,6 +3006,7 @@ async fn failed_delete_notifies_plugins_of_the_error() {
 #[tokio::test]
 async fn stop_session_clears_a_pending_plugin_revival() {
     let _home = crate::session::test_support::isolate_app_dir();
+    crate::session::create_profile("default").unwrap();
     let mut inst = make_test_instance();
     inst.view = crate::session::View::Structured;
     inst.plugin_revival_pending = true;
@@ -4963,6 +5003,64 @@ async fn a_retry_across_a_restart_is_fenced_before_profile_validation() {
     assert_eq!(status, axum::http::StatusCode::CONFLICT, "{refused}");
     assert_eq!(refused["error"], "create_outcome_unknown");
     assert_eq!(effects(), 1);
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn create_does_not_recreate_a_profile_deleted_during_its_hook() {
+    use crate::server::test_support as support;
+    for explicit_profile in [true, false] {
+        let _home = crate::session::test_support::isolate_app_dir();
+        let gate = tempfile::tempdir().unwrap();
+        let ready = gate.path().join("ready");
+        let release = gate.path().join("release");
+        let hook = format!(
+            ": > '{}'; while [ ! -e '{}' ]; do sleep 0.01; done",
+            ready.display(),
+            release.display()
+        );
+        let project = project_with_on_create_hooks(&[hook.as_str()]);
+        crate::session::create_profile("keeper").unwrap();
+        crate::session::create_profile("victim").unwrap();
+        crate::session::set_default_profile("victim").unwrap();
+        support::seed_instances_on_disk_for_test("victim", Vec::new());
+        let profile_dir = crate::session::get_profile_dir_path("victim").unwrap();
+        let (launcher, _) = support::counting_failing_launcher();
+        let mut state = support::build_test_app_state_with_launcher(Vec::new(), launcher);
+        std::sync::Arc::get_mut(&mut state).unwrap().profile = "victim".into();
+        let create = tokio::spawn(async move {
+            post_create(
+                &state,
+                serde_json::json!({
+                    "title": "deleted-profile",
+                    "path": project.path(),
+                    "tool": "claude",
+                    "view": "structured",
+                    "profile": explicit_profile.then_some("victim"),
+                    "trust_hooks": true,
+                }),
+            )
+            .await
+        });
+        wait_for("the create hook", || ready.exists()).await;
+        let deleted = crate::session::delete_profile("victim");
+        std::fs::write(&release, "").unwrap();
+        let (status, response) = create.await.unwrap();
+        deleted.unwrap();
+        assert!(
+            !profile_dir.exists(),
+            "create resurrected the deleted profile; explicit={explicit_profile}"
+        );
+        assert!(!status.is_success(), "{status}: {response}");
+        assert!(
+            crate::session::Storage::open_unwatched("keeper")
+                .unwrap()
+                .load()
+                .unwrap()
+                .is_empty(),
+            "failed create wrote into the survivor; explicit={explicit_profile}"
+        );
+    }
 }
 
 #[tokio::test]

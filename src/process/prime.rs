@@ -36,10 +36,15 @@ else
     [[ -n $start ]] || exit 1
     start="ps:$start"
 fi
-(umask 077; printf '%s\t%s\n' "$$" "$start" > "$identity") || exit 1
+tmp=$(umask 077; mktemp "${identity}.tmp.XXXXXX") || exit 1
+trap 'rm -f -- "$tmp"' EXIT HUP INT TERM
+printf '%s\t%s\n' "$$" "$start" > "$tmp" || exit 1
+mv -f -- "$tmp" "$identity" || exit 1
+trap - EXIT HUP INT TERM
 exec "$@""#;
 
 const PRIME_GUEST_CONTROL: &str = include_str!("../../assets/prime-control.py");
+pub(crate) const PREPARED_RUNTIME_ENV: &str = "AOE_PRIME_RUNTIME_PREPARED";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PrimeContainer {
@@ -60,11 +65,17 @@ pub struct PrimeRuntime {
     observation: Arc<Mutex<PrimeRuntimeState>>,
 }
 
+fn legacy_prime_proof_was_adopted() -> bool {
+    true
+}
+
 #[derive(Serialize, Deserialize)]
 struct PrimeCleanupProof {
     route: String,
     processes: Vec<crate::process::PrimeProcessIdentity>,
     settled: bool,
+    #[serde(default = "legacy_prime_proof_was_adopted")]
+    adopted: bool,
     #[serde(default)]
     epoch: Option<String>,
     #[serde(default)]
@@ -231,6 +242,7 @@ impl PrimeRuntime {
             route: self.proof_route()?,
             processes: Vec::new(),
             settled: false,
+            adopted: false,
             epoch: Some(epoch.clone()),
             launch_epoch: Some(epoch),
         };
@@ -258,6 +270,62 @@ impl PrimeRuntime {
             };
         }
         Ok(())
+    }
+
+    pub(crate) fn adopt_prepared(&self) -> Result<()> {
+        self.validate()?;
+        let _lock = self.lock_proof()?;
+        let mut proof = self.read_proof()?;
+        let epoch = self.process_epoch()?;
+        anyhow::ensure!(!proof.settled, "Prime cleanup ledger is already settled");
+        anyhow::ensure!(
+            proof.epoch.as_ref() == Some(&epoch) && proof.launch_epoch.as_ref() == Some(&epoch),
+            "Prime cleanup ledger belongs to another launch epoch"
+        );
+        anyhow::ensure!(
+            self.directory_exists(false)?,
+            "Prime runtime directory disappeared before launch"
+        );
+        proof.adopted = true;
+        self.write_proof(&proof)
+    }
+
+    pub(crate) fn rollback_prepared(&self) -> Result<()> {
+        self.validate()?;
+        let _lock = self.lock_proof()?;
+        let mut proof = self.read_proof()?;
+        let epoch = self.process_epoch()?;
+        anyhow::ensure!(
+            proof.epoch.as_ref() == Some(&epoch) && proof.launch_epoch.as_ref() == Some(&epoch),
+            "Prime cleanup ledger belongs to another launch epoch"
+        );
+        anyhow::ensure!(
+            !proof.adopted,
+            "Prime launch was adopted; use normal owned-process cleanup"
+        );
+        anyhow::ensure!(
+            proof.processes.is_empty(),
+            "Prime launch acquired native processes; retaining ownership evidence"
+        );
+        if self.directory_exists(proof.settled)? {
+            if let Some(container) = &self.container {
+                let mut command = container.transport.command(&[]);
+                command
+                    .args(["exec", &container.id, "rm", "-rf", "--"])
+                    .arg(&self.directory);
+                crate::session::capture::run_with_timeout_limit(
+                    command,
+                    Duration::from_secs(5),
+                    "Prime pre-launch rollback",
+                    8192,
+                )?;
+            } else {
+                std::fs::remove_dir_all(&self.directory)
+                    .context("rolling back prepared Prime runtime")?;
+            }
+        }
+        proof.settled = true;
+        self.write_proof(&proof)
     }
 
     fn guest_control(&self, action: &str) -> Result<Command> {
@@ -466,7 +534,8 @@ impl PrimeRuntime {
 
     fn write_proof(&self, proof: &PrimeCleanupProof) -> Result<()> {
         let path = self.control_path()?;
-        crate::session::atomic_write(path, &serde_json::to_vec(proof)?)
+        crate::session::atomic_write(path, &serde_json::to_vec(proof)?)?;
+        crate::session::sync_parent_directory(path)
     }
 
     fn worker_descriptor_dir(&self) -> PathBuf {
@@ -598,42 +667,124 @@ socket=$2
 known=$3
 seen=$'\n'
 rows=()
+process_executing() {
+    directory=$1
+    found=0
+    for task in "$directory"/task/[0-9]*; do
+        [[ -e $task ]] || continue
+        if ! task_stat=$(<"$task/stat"); then
+            [[ ! -d $task ]] && continue
+            return 2
+        fi
+        read -r -a task_fields <<< "${task_stat##*) }"
+        [[ -n ${task_fields[0]} ]] || return 2
+        [[ ${task_fields[0]} == Z ]] || return 0
+        found=1
+    done
+    [[ $found == 1 || ! -d $directory ]] && return 1
+    return 2
+}
 [[ -r /proc/self/stat ]] || exit 1
+proc_fields=()
+while IFS= read -r mount; do
+    read -r -a fields <<< "$mount"
+    [[ ${fields[4]} == /proc ]] || continue
+    proc_fields=("${fields[@]}")
+    break
+done < /proc/self/mountinfo
+[[ ${#proc_fields[@]} -gt 0 ]] || exit 1
+separator=0
+while [[ $separator -lt ${#proc_fields[@]} && ${proc_fields[$separator]} != - ]]; do
+    ((separator += 1))
+done
+[[ ${proc_fields[$((separator + 1))]} == proc ]] || exit 1
+for options in "${proc_fields[5]}" "${proc_fields[$((separator + 3))]}"; do
+    case ",$options," in
+        *,hidepid=0,*) ;;
+        *,hidepid=*,*) exit 1 ;;
+    esac
+done
 for directory in /proc/[0-9]*; do
     pid=${directory#/proc/}
     [[ $pid != $BASHPID ]] || continue
-    if ! IFS= read -r stat < "$directory/stat"; then
+    if ! stat=$(<"$directory/stat"); then
         [[ ! -d $directory ]] && continue
         [[ $known != *$'\n'"$pid"$'\t'* ]] || exit 1
         continue
     fi
     read -r -a fields <<< "${stat##*) }"
-    [[ ${fields[0]} != Z ]] || continue
     [[ -n ${fields[19]} && -n ${fields[1]} ]] || exit 1
+    parent_start=-
+    for _ in 1 2 3; do
+        parent=${fields[1]}
+        start=${fields[19]}
+        parent_before=
+        if parent_stat=$(<"/proc/$parent/stat"); then
+            read -r -a parent_fields <<< "${parent_stat##*) }"
+            parent_before=${parent_fields[19]}
+        fi
+        parent_after=
+        if child_stat=$(<"$directory/stat"); then
+            read -r -a child_fields <<< "${child_stat##*) }"
+            [[ -n ${child_fields[19]} && -n ${child_fields[1]} ]] || exit 1
+            fields=("${child_fields[@]}")
+            if parent_stat=$(<"/proc/$parent/stat"); then
+                read -r -a parent_fields <<< "${parent_stat##*) }"
+                parent_after=${parent_fields[19]}
+            fi
+        fi
+        if [[ -n $parent_before && $parent_before == "$parent_after" &&
+              ${fields[1]} == "$parent" && ${fields[19]} == "$start" ]]; then
+            parent_start="proc:$parent_before"
+            break
+        fi
+    done
+    process_executing "$directory"
+    case $? in 0) ;; 1) continue ;; *) exit 1 ;; esac
     marked=0
     grep -z -F -x -- "$marker" "$directory/environ" >/dev/null 2>&1 && marked=1
     grep -z -F -x -- "$socket" "$directory/cmdline" >/dev/null 2>&1 && marked=1
-    printf -v row '%s\tproc:%s\t%s\t%s' "$pid" "${fields[19]}" "${fields[1]}" "$marked"
+    printf -v row '%s\tproc:%s\t%s\t%s\t%s' "$pid" "${fields[19]}" "${fields[1]}" "$parent_start" "$marked"
     rows+=("$row")
     seen+="$pid"$'\t'"proc:${fields[19]}"$'\n'
 done
 while IFS=$'\t' read -r pid start; do
-    [[ -z $pid || ! -d /proc/$pid ]] && continue
-    IFS= read -r stat < /proc/$pid/stat || { [[ ! -d /proc/$pid ]] && continue; exit 1; }
-    read -r -a fields <<< "${stat##*) }"
-    [[ ${fields[0]} == Z || "proc:${fields[19]}" != "$start" ]] && continue
-    [[ $seen == *$'\n'"$pid"$'\t'"$start"$'\n'* ]] || exit 1
+    [[ -z $pid ]] && continue
+    if stat=$(<"/proc/$pid/stat"); then
+        read -r -a fields <<< "${stat##*) }"
+        if [[ "proc:${fields[19]}" == "$start" ]]; then
+            process_executing "/proc/$pid"
+            case $? in
+                0) [[ $seen == *$'\n'"$pid"$'\t'"$start"$'\n'* ]] || exit 1 ;;
+                1) ;;
+                *) exit 1 ;;
+            esac
+        fi
+    elif [[ -d /proc/$pid ]]; then
+        exit 1
+    fi
 done <<< "$known"
 for row in "${rows[@]}"; do
-    IFS=$'\t' read -r pid start parent marked <<< "$row"
-    if ! IFS= read -r stat < "/proc/$pid/stat"; then
-        [[ ! -d /proc/$pid ]] && continue
-        [[ $marked == 0 && $known != *$'\n'"$pid"$'\t'* ]] || exit 1
-        continue
+    IFS=$'\t' read -r pid start parent parent_start marked <<< "$row"
+    if ! stat=$(<"/proc/$pid/stat"); then
+        if [[ ! -d /proc/$pid ]]; then
+            printf '%s\t0\n' "$row"
+            continue
+        fi
+        exit 1
     fi
     read -r -a fields <<< "${stat##*) }"
-    [[ ${fields[0]} != Z && "proc:${fields[19]}" == "$start" ]] || continue
-    printf '%s\n' "$row"
+    if [[ "proc:${fields[19]}" != "$start" ]]; then
+        printf '%s\t0\n' "$row"
+        continue
+    fi
+    process_executing "/proc/$pid"
+    case $? in
+        0) ;;
+        1) printf '%s\t0\n' "$row"; continue ;;
+        *) exit 1 ;;
+    esac
+    printf '%s\t1\n' "$row"
 done"#;
             let known_wire = known
                 .iter()
@@ -654,6 +805,7 @@ done"#;
                 1024 * 1024,
             )?;
             let mut samples = Vec::new();
+            let mut live = std::collections::HashSet::new();
             for line in std::str::from_utf8(&bytes)?.lines() {
                 let mut fields = line.split('\t');
                 let pid = fields.next().context("missing process PID")?.parse()?;
@@ -662,19 +814,36 @@ done"#;
                     .context("missing process identity")?
                     .to_owned();
                 let parent = fields.next().context("missing process parent")?.parse()?;
+                let parent_start_id =
+                    match fields.next().context("missing process parent identity")? {
+                        "-" => None,
+                        start => Some(start.to_owned()),
+                    };
                 let marked = match fields.next() {
                     Some("1") => true,
                     Some("0") => false,
                     _ => anyhow::bail!("invalid process launch marker"),
                 };
+                let executing = match fields.next() {
+                    Some("1") => true,
+                    Some("0") => false,
+                    _ => anyhow::bail!("invalid process liveness"),
+                };
                 anyhow::ensure!(fields.next().is_none(), "invalid process snapshot row");
+                let identity = crate::process::PrimeProcessIdentity { pid, start_id };
+                if executing {
+                    live.insert(identity.clone());
+                }
                 samples.push(crate::process::PrimeProcessSample {
-                    identity: crate::process::PrimeProcessIdentity { pid, start_id },
+                    identity,
                     parent,
+                    parent_start_id,
                     marked,
                 });
             }
-            return Ok(crate::process::select_prime_processes(samples, known));
+            let mut selected = crate::process::select_prime_processes(samples, known);
+            selected.retain(|identity| live.contains(identity));
+            return Ok(selected);
         }
         crate::process::prime_processes(&marker, &self.socket(), known)
     }
@@ -909,6 +1078,14 @@ done"#;
                 return Ok(());
             }
         }
+        if !proof.adopted {
+            anyhow::ensure!(
+                self.process_snapshot(&proof.processes)?.is_empty(),
+                "unadopted Prime launch acquired native processes; retained ownership evidence"
+            );
+            proof.settled = true;
+            self.write_proof(&proof)?;
+        }
         let exists = self.directory_exists(proof.settled)?;
         let epoch = self.process_epoch()?;
         if proof
@@ -1037,9 +1214,6 @@ impl Drop for PrimeCleanupGuard {
     fn drop(&mut self) {
         if let Some(child) = &self.1 {
             if let Ok(mut child) = child.try_lock() {
-                if let Some(pid) = child.id() {
-                    crate::process::kill_process_tree(pid);
-                }
                 child.start_kill().ok();
             }
         }
@@ -1073,7 +1247,12 @@ pub struct PrimeRunnerArgs {
 pub async fn run(args: PrimeRunnerArgs) -> Result<()> {
     use tokio::signal::unix::{signal, SignalKind};
     let runtime: PrimeRuntime = serde_json::from_str(&args.runtime)?;
-    runtime.prepare()?;
+    if std::env::var_os(PREPARED_RUNTIME_ENV).is_some() {
+        runtime.adopt_prepared()?;
+    } else {
+        runtime.prepare()?;
+        runtime.adopt_prepared()?;
+    }
     let mut guard = PrimeCleanupGuard(Some(runtime.clone()), None);
     let mut owned_daemon = None;
     let result: Result<()> = async {
@@ -1313,6 +1492,7 @@ exit 42
                             start_id: "guest:obsolete".into(),
                         }],
                         settled: false,
+                        adopted: true,
                         epoch: Some("original-guest".into()),
                         launch_epoch: Some("original-guest".into()),
                     })
@@ -1418,6 +1598,7 @@ exit 42
         let runtime =
             PrimeRuntime::new("/bin/false".into(), root.path().join("agent"), None).unwrap();
         runtime.prepare().unwrap();
+        runtime.adopt_prepared().unwrap();
         let mut worker = CleanupProbe::spawn(root.path(), false);
         let identity = worker.identity();
         let descriptors = runtime.worker_descriptor_dir();
@@ -1447,6 +1628,7 @@ exit 42
         let runtime =
             PrimeRuntime::new("/bin/false".into(), root.path().join("agent"), None).unwrap();
         runtime.prepare().unwrap();
+        runtime.adopt_prepared().unwrap();
         let mut foreign = CleanupProbe::spawn(root.path(), false);
         let identity = foreign.identity();
         let mut fresh = CleanupProbe::spawn(&runtime.directory, false);
@@ -1497,6 +1679,7 @@ printf '{"failed":[]}\n'
             let runtime =
                 PrimeRuntime::new(program.clone(), root.path().join("agent"), None).unwrap();
             runtime.prepare().unwrap();
+            runtime.adopt_prepared().unwrap();
             let mut auxiliary = CleanupProbe::spawn(&runtime.directory, ignore_term);
             let mut foreign = CleanupProbe::spawn(root.path(), false);
             let mut wrong = auxiliary.identity();
@@ -1638,6 +1821,25 @@ printf '{"failed":[]}\n'
         assert!(restored.prepare().is_err());
         assert_eq!(std::fs::read(&marker).unwrap(), b"retained");
         std::fs::remove_dir_all(&restored.directory).unwrap();
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn prepared_runtime_rolls_back_until_launch_is_adopted() {
+        let root = tempfile::tempdir().unwrap();
+        let _home = crate::session::test_support::isolate_app_dir_at(root.path());
+        let prepared = PrimeRuntime::new("/bin/false".into(), root.path().into(), None).unwrap();
+        prepared.prepare().unwrap();
+        prepared.rollback_prepared().unwrap();
+        assert!(!prepared.directory.exists());
+        assert!(prepared.read_proof().unwrap().settled);
+
+        let adopted = PrimeRuntime::new("/bin/false".into(), root.path().into(), None).unwrap();
+        adopted.prepare().unwrap();
+        adopted.adopt_prepared().unwrap();
+        assert!(adopted.rollback_prepared().is_err());
+        assert!(adopted.directory.exists());
+        std::fs::remove_dir_all(&adopted.directory).unwrap();
     }
 
     #[test]

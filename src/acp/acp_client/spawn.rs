@@ -494,9 +494,9 @@ pub(super) fn spawn_subprocess(
             .get_envs()
             .filter_map(|(key, value)| value.map(|value| (key.to_owned(), value.to_owned())))
             .collect();
-        let mut owned = tokio::process::Command::new(
-            std::env::current_exe().map_err(|e| AcpError::Spawn(e.to_string()))?,
-        );
+        let executable = crate::process::executable_for_native_launch()
+            .map_err(|error| AcpError::Spawn(error.to_string()))?;
+        let mut owned = tokio::process::Command::new(executable);
         owned
             .arg("__prime-agent")
             .arg("--runtime")

@@ -26,7 +26,7 @@ def capture(pid, expected):
             if poll.poll(0):
                 return None
             raise
-        if fields[0] == b"Z" or b"proc:" + fields[19] != expected.encode() or poll.poll(0):
+        if b"proc:" + fields[19] != expected.encode() or poll.poll(0):
             return None
         accepted = True
         return fd

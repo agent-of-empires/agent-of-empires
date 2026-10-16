@@ -1,6 +1,7 @@
 //! Session and workspace deletion, plus worktree/trash reconciliation.
 
 use super::*;
+use anyhow::Context as _;
 
 // --- Delete session ---
 
@@ -32,6 +33,86 @@ pub(super) async fn mark_delete_error(state: &AppState, id: &str, message: Strin
         publish_status_change(&state.status_tx, inst, old_status);
     }
 }
+#[derive(Debug)]
+struct PurgeArtifactsError {
+    message: String,
+    teardown_started: bool,
+    retained_instance: Option<Box<Instance>>,
+}
+
+impl PurgeArtifactsError {
+    fn from_result(result: crate::session::deletion::DeletionResult) -> Self {
+        Self {
+            message: if result.errors.is_empty() {
+                "Unknown error".to_string()
+            } else {
+                result.errors.join("; ")
+            },
+            teardown_started: result.teardown_started,
+            retained_instance: result.retained_instance.map(Box::new),
+        }
+    }
+}
+
+impl From<String> for PurgeArtifactsError {
+    fn from(message: String) -> Self {
+        Self {
+            message,
+            teardown_started: false,
+            retained_instance: None,
+        }
+    }
+}
+
+impl std::fmt::Display for PurgeArtifactsError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+async fn apply_purge_failure(state: &AppState, id: &str, failure: &PurgeArtifactsError) {
+    let profile = state
+        .instances
+        .read()
+        .await
+        .iter()
+        .find(|row| row.id == id)
+        .map(|row| row.source_profile.clone());
+    let lookup_id = id.to_owned();
+    let durable = tokio::task::spawn_blocking(move || -> anyhow::Result<Option<Instance>> {
+        let profile = profile.context("session profile unavailable after purge failure")?;
+        Ok(Storage::open_unwatched(&profile)?
+            .load()?
+            .into_iter()
+            .find(|row| row.id == lookup_id))
+    })
+    .await;
+    let retained = match durable {
+        Ok(Ok(Some(row))) => Some(row),
+        _ => failure.retained_instance.as_deref().cloned(),
+    };
+    if let Some(retained) = retained {
+        let mut instances = state.instances.write().await;
+        if let Some(live) = instances.iter_mut().find(|row| row.id == id) {
+            if retained.lifecycle_generation >= live.lifecycle_generation {
+                let old_status = live.status;
+                *live = retained;
+                live.last_error = Some(failure.message.clone());
+                publish_status_change(&state.status_tx, live, old_status);
+            }
+        }
+    } else if !failure.teardown_started {
+        let deleting = state
+            .instances
+            .read()
+            .await
+            .iter()
+            .any(|row| row.id == id && row.status == Status::Deleting);
+        if !deleting {
+            mark_delete_error(state, id, failure.message.clone()).await;
+        }
+    }
+}
 
 /// Permanently purge a session: irreversible ACP teardown, optional sidecar
 /// cleanup per `body`, and removal from both `sessions.json` and the in-memory
@@ -49,12 +130,13 @@ async fn purge_session_artifacts(
     instance: Instance,
     body: &DeleteSessionBody,
     recent_entry: Option<crate::session::RecentProjectEntry>,
-) -> Result<(bool, Vec<String>), String> {
+) -> Result<(bool, Vec<String>), PurgeArtifactsError> {
     let profile = instance.source_profile.clone();
     if profile.is_empty() {
         return Err(
             "Session has no source profile; refusing to acquire a default-profile purge lock"
-                .to_string(),
+                .to_string()
+                .into(),
         );
     }
     let delete_request = crate::session::deletion::DeletionRequest {
@@ -70,10 +152,13 @@ async fn purge_session_artifacts(
     let file_watch = state.file_watch.clone();
     let reserve_profile = profile.clone();
     let reservation = tokio::task::spawn_blocking(move || {
-        let storage = Storage::new(&reserve_profile, file_watch)
+        let storage = Storage::open(&reserve_profile, file_watch)
             .map_err(|e| format!("Storage init failed before session teardown: {e}"))?;
-        crate::session::deletion::PurgeTransaction::reserve(storage, delete_request)
-            .map_err(|e| format!("Failed to reserve session purge: {e}"))
+        crate::session::deletion::PurgeTransaction::reserve_with_authoritative_acp_transcript(
+            storage,
+            delete_request,
+        )
+        .map_err(|e| format!("Failed to reserve session purge: {e}"))
     })
     .await
     .map_err(|e| format!("Deletion reservation task failed: {e}"))??;
@@ -82,59 +167,56 @@ async fn purge_session_artifacts(
         crate::session::deletion::PurgeReservation::Rejected(result) => {
             return match result.disposition {
                 crate::session::deletion::DeletionDisposition::AlreadyGone => {
-                    remove_instance(
-                        &mut *state.instances.write().await,
-                        id,
-                        &state.mutation_epoch,
-                    );
+                    let mut instances = state.instances.write().await;
+                    if instances.iter().any(|row| {
+                        row.id == id
+                            && (row.source_profile != instance.source_profile
+                                || row.lifecycle_generation != instance.lifecycle_generation)
+                    }) {
+                        return Ok((false, result.messages));
+                    }
+                    remove_instance(&mut instances, id, &state.mutation_epoch);
+                    drop(instances);
                     state.instance_locks.write().await.remove(id);
                     state.session_service.forget_prompt_lock(id).await;
                     Ok((true, result.messages))
                 }
                 crate::session::deletion::DeletionDisposition::KeptRestored => {
-                    Err("Session is being restored, so it was not purged".to_string())
+                    Err("Session is being restored, so it was not purged"
+                        .to_string()
+                        .into())
                 }
-                crate::session::deletion::DeletionDisposition::Busy => {
-                    Err(result.errors.first().cloned().unwrap_or_else(|| {
+                crate::session::deletion::DeletionDisposition::Busy => Err(result
+                    .errors
+                    .first()
+                    .cloned()
+                    .unwrap_or_else(|| {
                         "Session is busy with another lifecycle operation, so it was not purged"
                             .to_string()
-                    }))
-                }
+                    })
+                    .into()),
                 crate::session::deletion::DeletionDisposition::Failed
                 | crate::session::deletion::DeletionDisposition::Removed => {
-                    Err(result.errors.join("; "))
+                    Err(result.errors.join("; ").into())
                 }
             };
         }
     };
+    let transcript_purged = transaction.purges_acp_transcript();
     let transaction = tokio::task::spawn_blocking(move || transaction.run_hooks())
         .await
         .map_err(|e| format!("Deletion hook task failed: {e}"))?;
 
-    let transcript_purged = instance.is_structured();
-
     let deletion_result = if transcript_purged {
-        // Commit the row removal before deleting the ACP transcript, so a lost
-        // restore/generation race leaves both intact and a successful commit
-        // makes later cleanup failures non-restorable by construction.
+        // Keep the durable row and journal until transcript and sidecar cleanup finish.
         let committed = tokio::task::spawn_blocking(move || transaction.begin_irreversible())
             .await
             .map_err(|e| format!("Irreversible deletion commit task failed: {e}"))?;
         match committed {
             Err(result) => *result,
             Ok(committed) => {
-                // Remove the local mirror before awaiting ACP so the reconciler
-                // cannot surface a durable row that no longer exists. The epoch
-                // bump is under the same lock: ACP teardown is slow, and a
-                // reload landing inside it would otherwise restore the row.
-                remove_instance(
-                    &mut *state.instances.write().await,
-                    id,
-                    &state.mutation_epoch,
-                );
-
-                // The worker may still use the worktree, so ACP teardown stays
-                // ahead of sidecar cleanup.
+                // The worker may still use the worktree, so ACP shutdown stays
+                // ahead of transcript and sidecar cleanup.
                 match state.acp_supervisor.shutdown_and_delete(id).await {
                     Ok(()) | Err(crate::acp::supervisor::SupervisorError::UnknownSession(_)) => {}
                     Err(e) => {
@@ -146,11 +228,15 @@ async fn purge_session_artifacts(
                     }
                 }
                 state.acp_supervisor.forget_session(id);
-                state.acp_event_store.delete_session(id);
 
-                tokio::task::spawn_blocking(move || committed.finish())
-                    .await
-                    .map_err(|e| format!("Deletion cleanup task failed: {e}"))?
+                let acp_event_store = state.acp_event_store.clone();
+                tokio::task::spawn_blocking(move || {
+                    committed.finish_with_transcript_cleanup(|instance| {
+                        acp_event_store.delete_session_fallible(&instance.id)
+                    })
+                })
+                .await
+                .map_err(|e| format!("Deletion cleanup task failed: {e}"))?
             }
         }
     } else {
@@ -159,7 +245,7 @@ async fn purge_session_artifacts(
             .map_err(|e| format!("Deletion task failed: {e}"))?
     };
 
-    let mut messages = deletion_result.messages.clone();
+    let messages = deletion_result.messages.clone();
     match deletion_result.disposition {
         crate::session::deletion::DeletionDisposition::KeptRestored
         | crate::session::deletion::DeletionDisposition::Busy => {
@@ -171,35 +257,29 @@ async fn purge_session_artifacts(
             return Ok((false, messages));
         }
         crate::session::deletion::DeletionDisposition::Failed => {
-            let errs = if deletion_result.errors.is_empty() {
-                "Unknown error".to_string()
-            } else {
-                deletion_result.errors.join("; ")
-            };
-            return Err(errs);
+            return Err(PurgeArtifactsError::from_result(deletion_result));
         }
         crate::session::deletion::DeletionDisposition::Removed
         | crate::session::deletion::DeletionDisposition::AlreadyGone => {}
     }
-    if !deletion_result.success {
-        let errs = if deletion_result.errors.is_empty() {
-            "Unknown error".to_string()
-        } else {
-            deletion_result.errors.join("; ")
-        };
-        if !transcript_purged {
-            return Err(errs);
-        }
-        tracing::warn!(
-            target: "http.api.sessions",
-            session = %id,
-            "purge sidecar cleanup failed after durable removal; session stays removed: {errs}"
-        );
-        messages.push(format!(
-            "Cleanup incomplete (session removed anyway): {errs}"
-        ));
+    if !deletion_result.success
+        && deletion_result.disposition != crate::session::deletion::DeletionDisposition::AlreadyGone
+    {
+        return Err(PurgeArtifactsError::from_result(deletion_result));
     }
 
+    let durable = Storage::open_unwatched(&instance.source_profile)
+        .and_then(|storage| storage.load())
+        .map_err(|error| PurgeArtifactsError::from(error.to_string()))?;
+    if let Some(row) = durable.into_iter().find(|row| row.id == id) {
+        let mut instances = state.instances.write().await;
+        if let Some(live) = instances.iter_mut().find(|live| live.id == id) {
+            if row.lifecycle_generation >= live.lifecycle_generation {
+                *live = row;
+            }
+        }
+        return Ok((false, messages));
+    }
     {
         // The row is gone from disk and memory, so a reloader carrying an older
         // `sessions.json` snapshot must drop it rather than fold the row back
@@ -208,6 +288,13 @@ async fn purge_session_artifacts(
         // between removal and bump. See invariant 8 on
         // `reload_state_instances_from_disk`.
         let mut instances = state.instances.write().await;
+        if instances.iter().any(|row| {
+            row.id == id
+                && (row.source_profile != instance.source_profile
+                    || row.lifecycle_generation > instance.lifecycle_generation.saturating_add(1))
+        }) {
+            return Ok((false, messages));
+        }
         remove_instance(&mut instances, id, &state.mutation_epoch);
     }
     state.instance_locks.write().await.remove(id);
@@ -427,11 +514,14 @@ pub(crate) async fn purge_expired_trash(state: &Arc<AppState>) {
                 session = %id,
                 "auto-purged expired trashed session"
             ),
-            Err(e) => tracing::warn!(
-                target: "http.api.sessions",
-                session = %id,
-                "auto-purge of expired trash failed: {e}"
-            ),
+            Err(error) => {
+                apply_purge_failure(state, &id, &error).await;
+                tracing::warn!(
+                    target: "http.api.sessions",
+                    session = %id,
+                    "auto-purge of expired trash failed: {error}"
+                );
+            }
         }
     }
 }
@@ -528,14 +618,14 @@ pub async fn delete_session(
                     "messages": messages,
                 })),
             ),
-            Err(msg) => {
-                mark_delete_error(&state, &id, msg.clone()).await;
-                tracing::error!(target: "http.api.sessions", "delete failed: {msg}");
+            Err(error) => {
+                apply_purge_failure(&state, &id, &error).await;
+                tracing::error!(target: "http.api.sessions", "delete failed: {error}");
                 (
                     StatusCode::INTERNAL_SERVER_ERROR,
                     Json(serde_json::json!({
                         "error": "deletion_failed",
-                        "message": msg,
+                        "message": error.message,
                     })),
                 )
             }
@@ -767,11 +857,11 @@ pub(super) async fn purge_workspace_artifacts(
                     deleted.push(id.clone());
                 }
             }
-            Err(msg) => {
-                mark_delete_error(state, &id, msg.clone()).await;
+            Err(error) => {
+                apply_purge_failure(state, &id, &error).await;
                 failed.push(WorkspaceDeleteFailure {
                     id: id.clone(),
-                    error: msg,
+                    error: error.message,
                 });
                 // Stop before the remaining plan entries. The owner is last, so
                 // a sibling failure leaves the shared worktree intact with its

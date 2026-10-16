@@ -607,6 +607,7 @@ mod workspace_ordering_tests {
             notify_on_idle: None,
             notify_on_error: None,
             view: crate::session::View::Terminal,
+            terminal_handoff_pending: false,
             pending_approvals: Vec::new(),
             acp_worker_state: crate::daemon::AcpWorkerState::Absent,
             context_resume: Some(ContextResumeAvailability::Unavailable {

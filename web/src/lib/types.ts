@@ -61,6 +61,8 @@ export interface SessionResponse {
   notify_on_idle: boolean | null;
   notify_on_error: boolean | null;
   view?: "structured" | "terminal";
+  /** A structured-to-terminal transition must be retried through disable. */
+  terminal_handoff_pending?: boolean;
   /** Absent on older daemons. */
   context_resume?: ContextResumeAvailability;
   acp_worker_state?: AcpWorkerState;

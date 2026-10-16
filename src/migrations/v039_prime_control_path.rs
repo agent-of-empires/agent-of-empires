@@ -31,7 +31,11 @@ fn pin(runtime: &mut Value, workers: &Path) -> Result<bool> {
 }
 
 fn read_json(path: &Path) -> Result<Option<Value>> {
-    let content = fs::read(path)?;
+    let content = match fs::read(path) {
+        Ok(content) => content,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
     match serde_json::from_slice(&content) {
         Ok(value) => Ok(Some(value)),
         Err(error) => {
@@ -47,6 +51,10 @@ fn persist(path: &Path, value: &Value) -> Result<()> {
 }
 
 fn run_in(app_dir: &Path) -> Result<()> {
+    let _transition = crate::session::acquire_storage_shared_flock(
+        app_dir,
+        super::v027_isolate_sandbox_stores::LOCK,
+    )?;
     let workers = app_dir.canonicalize()?.join("acp-workers");
     for path in super::sessions_file::session_files(app_dir)? {
         if !path.try_exists()? {

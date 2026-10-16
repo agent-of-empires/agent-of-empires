@@ -1,6 +1,6 @@
 //! `agent-of-empires remove` command implementation
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use chrono::Utc;
 use clap::Args;
 
@@ -84,7 +84,7 @@ pub async fn run(profile: &str, args: RemoveArgs) -> Result<()> {
         let _lifecycle_lock = storage
             .acquire_instance_lifecycle_lock(&removed_id)
             .map_err(|error| anyhow::anyhow!("failed to acquire instance trash lock: {error}"))?;
-        let trash_generation = storage.update(|all_instances, _groups| {
+        let (trash_generation, was_trashed) = storage.update(|all_instances, _groups| {
             let stored = all_instances
                 .iter_mut()
                 .find(|instance| instance.id == removed_id)
@@ -93,6 +93,7 @@ pub async fn run(profile: &str, args: RemoveArgs) -> Result<()> {
                         "Session {removed_title} was removed by another process before it could be trashed"
                     )
                 })?;
+            let was_trashed = stored.is_trashed();
             let generation = stored
                 .try_acquire_lifecycle_reservation(
                     LifecycleOperation::Trash,
@@ -101,10 +102,33 @@ pub async fn run(profile: &str, args: RemoveArgs) -> Result<()> {
                 )
                 .map_err(|error| anyhow::anyhow!("Session {removed_title}: {error}"))?;
             stored.trash();
-            Ok(generation)
+            Ok((generation, was_trashed))
         })?;
-        if let Err(error) = inst.kill_locked() {
-            eprintln!("Warning: failed to kill agent tmux session: {error}");
+        if let Err(error) = inst.kill_locked(&storage) {
+            let rollback = storage.update(|all_instances, _groups| {
+                if let Some(stored) = all_instances.iter_mut().find(|row| row.id == removed_id) {
+                    if stored
+                        .lifecycle_reservation_is_owned(LifecycleOperation::Trash, trash_generation)
+                    {
+                        if !was_trashed {
+                            stored.untrash();
+                        }
+                        stored.release_lifecycle_reservation_if_owned(
+                            LifecycleOperation::Trash,
+                            trash_generation,
+                        );
+                    }
+                }
+                Ok(())
+            });
+            return match rollback {
+                Ok(()) => Err(error).context(
+                    "live session teardown is not settled; retained worktree and session",
+                ),
+                Err(rollback) => Err(error).context(format!(
+                    "live session teardown is not settled; retained worktree, but could not roll back the trash reservation: {rollback:#}"
+                )),
+            };
         }
         inst.kill_ancillary_tmux_sessions_locked();
         inst.release_scope();
@@ -187,7 +211,7 @@ pub async fn run(profile: &str, args: RemoveArgs) -> Result<()> {
         && config.sandbox.auto_cleanup;
 
     let storage_profile = storage.profile().to_string();
-    let reservation = crate::session::deletion::PurgeTransaction::reserve(
+    let reservation = crate::session::deletion::PurgeTransaction::reserve_with_acp_transcript(
         storage,
         crate::session::deletion::DeletionRequest {
             session_id: inst.id.clone(),
@@ -211,14 +235,10 @@ pub async fn run(profile: &str, args: RemoveArgs) -> Result<()> {
             anyhow::bail!("{detail}: {removed_title}");
         }
     };
-    let result = transaction.run_hooks().complete_with(|instance| {
-        super::purge_acp_transcript(instance).map_err(|error| {
-            format!(
-                "Session teardown succeeded but its transcript could not be purged, so the session \
-                 record was kept (retry, or remove it once the event store is reachable): {error}"
-            )
-        })
-    });
+    let result = match transaction.run_hooks().begin_irreversible() {
+        Ok(committed) => committed.finish(),
+        Err(result) => *result,
+    };
 
     for msg in &result.messages {
         println!("  {}", msg);
@@ -337,6 +357,72 @@ mod tests {
             keep_scratch: false,
             purge: false,
         }
+    }
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn trash_retains_session_and_worktree_when_native_cleanup_is_unproven() {
+        let root = tempfile::tempdir().unwrap();
+        let _app = crate::session::test_support::isolate_app_dir_at(root.path());
+        let profile = "trash-native-cleanup-failure";
+        let project = root.path().join("project");
+        std::fs::create_dir(&project).unwrap();
+        let runtime =
+            crate::process::prime::PrimeRuntime::new("/bin/false".into(), root.path().into(), None)
+                .unwrap();
+        runtime.prepare().unwrap();
+        runtime.adopt_prepared().unwrap();
+        std::fs::write(runtime.directory.join("frontend.identity"), "invalid").unwrap();
+        let mut instance = Instance::new("Prime", project.to_str().unwrap());
+        instance.source_profile = profile.into();
+        instance.active_execution = Some(crate::session::ActiveExecution {
+            launch_id: "launch".into(),
+            binding: crate::session::ExecutionBinding {
+                agent: "prime-agent".into(),
+                stores: Vec::new(),
+                configuration: Vec::new(),
+                cwd: project.clone(),
+                cwd_filesystem: "host".into(),
+                filesystem: "host".into(),
+                exported_default_store: None,
+            },
+            capture: Some(crate::session::CaptureContext::PrimeStatus(runtime.clone())),
+            container: None,
+        });
+        let id = instance.id.clone();
+        let storage = Storage::new_unwatched(profile).unwrap();
+        storage
+            .update(|instances, _groups| {
+                instances.push(instance);
+                Ok(())
+            })
+            .unwrap();
+
+        let result = run(
+            profile,
+            RemoveArgs {
+                identifier: id.clone(),
+                delete_worktree: true,
+                delete_branch: false,
+                force: false,
+                keep_container: false,
+                keep_scratch: false,
+                purge: false,
+            },
+        )
+        .await;
+
+        assert!(result.is_err());
+        let retained = storage
+            .load()
+            .unwrap()
+            .into_iter()
+            .find(|row| row.id == id)
+            .unwrap();
+        assert!(!retained.is_trashed());
+        assert!(retained.lifecycle_reservation.is_none());
+        assert!(project.exists());
+        assert!(runtime.directory.exists());
+        std::fs::remove_dir_all(&runtime.directory).unwrap();
     }
 
     #[test]

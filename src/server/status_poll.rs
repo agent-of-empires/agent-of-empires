@@ -145,9 +145,20 @@ pub(super) async fn status_poll_loop(state: Arc<AppState>) {
     loop {
         interval.tick().await;
 
-        let prev: std::collections::HashMap<String, crate::session::Status> = {
+        let (prev, prev_tracking): (
+            std::collections::HashMap<String, Status>,
+            std::collections::HashMap<String, PriorTickTracking>,
+        ) = {
             let instances = state.instances.read().await;
-            instances.iter().map(|i| (i.id.clone(), i.status)).collect()
+            instances
+                .iter()
+                .map(|i| {
+                    (
+                        (i.id.clone(), i.status),
+                        (i.id.clone(), PriorTickTracking::of(i)),
+                    )
+                })
+                .unzip()
         };
 
         // GC the reconciler's persistent per-session maps against the live instance set
@@ -161,16 +172,6 @@ pub(super) async fn status_poll_loop(state: Arc<AppState>) {
             &mut acp_parked,
             &mut acp_capacity_deferred,
         );
-        // Snapshot of the prior tick's status bookkeeping, taken from the same in-memory
-        // `state.instances` this tick's `load_all_instances()` call is about to reset to
-        // defaults.
-        let prev_tracking: std::collections::HashMap<String, PriorTickTracking> = {
-            let instances = state.instances.read().await;
-            instances
-                .iter()
-                .map(|i| (i.id.clone(), PriorTickTracking::of(i)))
-                .collect()
-        };
 
         // Snapshot suppression BEFORE `batch_pane_metadata()` so a worker that unmarks
         // between the scrape and the per-instance decision cannot combine "pane missing"
@@ -203,6 +204,7 @@ pub(super) async fn status_poll_loop(state: Arc<AppState>) {
             apply_tick_status_decisions(
                 &mut instances,
                 &prev_for_poll,
+                &prev_tracking,
                 &suppressed_ids,
                 pane_metadata.as_ref().ok(),
             );

@@ -164,7 +164,13 @@ test.describe("Sidebar multi-select (#1724, #2312)", () => {
 // POSTs acp enable/disable. The backend round-trip is covered by Rust and live
 // specs; this pins the menu presence, the confirm gate, and each request.
 test.describe("Sidebar Switch view (#2252)", () => {
-  const session = (id: string, title: string, view: "structured" | "terminal", acpCapable: boolean) => ({
+  const session = (
+    id: string,
+    title: string,
+    view: "structured" | "terminal",
+    acpCapable: boolean,
+    terminalHandoffPending = false,
+  ) => ({
     id,
     title,
     project_path: "/tmp/repo",
@@ -174,6 +180,7 @@ test.describe("Sidebar Switch view (#2252)", () => {
       acp_agent: "claude",
       view,
       acp_capable: acpCapable,
+      terminal_handoff_pending: terminalHandoffPending,
       // Server-computed context-preservation gate: `claude` resumes its
       // conversation in both directions, so the daemon reports true here.
       keeps_context: true,
@@ -195,6 +202,7 @@ test.describe("Sidebar Switch view (#2252)", () => {
         session("sess-1", "Switch sess-1", "structured", true),
         session("sess-2", "Switch sess-2", "terminal", true),
         session("sess-3", "Plain terminal", "terminal", false),
+        session("sess-4", "Retry handoff", "terminal", true, true),
       ],
     });
     const posted: string[] = [];
@@ -211,16 +219,22 @@ test.describe("Sidebar Switch view (#2252)", () => {
     await openSwitchMenu(page, "Switch sess-1");
     const dialog = page.locator("[data-testid='switch-view-dialog']");
     await expect(dialog).toBeVisible();
-    // Claude keeps context: the confirm copy must say so, not threaten loss.
-    await expect(dialog).toContainText("continues in the terminal");
     await page.locator("[data-testid='switch-view-confirm']").click();
     await expect.poll(() => posted).toEqual(["sess-1/disable"]);
-    await expect(page.getByText("Switched to terminal")).toBeVisible();
+    await expect(dialog).toBeHidden();
 
     await rows(page).filter({ hasText: "Switch sess-2" }).first().click({ button: "right" });
     await page.locator("[data-testid='sidebar-context-menu-switch-view']").click();
     await page.locator("[data-testid='switch-view-confirm']").click();
     await expect.poll(() => posted).toEqual(["sess-1/disable", "sess-2/enable"]);
+    await expect(dialog).toBeHidden();
+
+    await rows(page).filter({ hasText: "Retry handoff" }).first().click({ button: "right" });
+    const retry = page.locator("[data-testid='sidebar-context-menu-switch-view']");
+    await retry.click();
+    await page.locator("[data-testid='switch-view-confirm']").click();
+    await expect.poll(() => posted).toEqual(["sess-1/disable", "sess-2/enable", "sess-4/disable"]);
+    await expect(dialog).toBeHidden();
 
     await rows(page).filter({ hasText: "Plain terminal" }).first().click({ button: "right" });
     await expect(menu(page)).toBeVisible();

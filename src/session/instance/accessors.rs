@@ -75,6 +75,8 @@ impl Instance {
             base_branch_override: None,
             color: None,
             view: View::Terminal,
+            terminal_handoff_pending: false,
+            terminal_handoff_completion: false,
             agent_name: None,
             agent_model: None,
             agent_provider: None,
@@ -117,7 +119,7 @@ impl Instance {
     /// stored field as it is.
     pub(crate) fn persist_sandbox_provider(&self) -> anyhow::Result<()> {
         let provider = self.sandbox_info.as_ref().and_then(|s| s.provider.clone());
-        crate::session::Storage::new(&self.source_profile, self.resolve_file_watch())?.update(
+        crate::session::Storage::open(&self.source_profile, self.resolve_file_watch())?.update(
             |instances, _groups| {
                 if let Some(sandbox) = instances
                     .iter_mut()
@@ -585,6 +587,9 @@ impl Instance {
     /// are healed on reload by the server's structured row repair path.
     pub fn is_structured(&self) -> bool {
         self.view == View::Structured
+    }
+    pub(crate) fn requires_acp_settlement(&self) -> bool {
+        self.is_structured() || self.terminal_handoff_pending
     }
 
     /// Move a structured row to the terminal view, keeping the store an

@@ -8,17 +8,29 @@ pub fn run() -> Result<()> {
     run_in(&crate::session::get_app_dir()?)
 }
 
+fn read_regular(path: &Path) -> Result<Option<Vec<u8>>> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    if !metadata.file_type().is_file() || metadata.file_type().is_symlink() {
+        return Ok(None);
+    }
+    match fs::read(path) {
+        Ok(bytes) => Ok(Some(bytes)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error.into()),
+    }
+}
+
 fn run_in(app: &Path) -> Result<()> {
     let workers = app.join("acp-workers");
     if !workers.try_exists()? {
         return Ok(());
     }
     for entry in fs::read_dir(&workers)? {
-        let entry = entry?;
-        if !entry.file_type()?.is_file() {
-            continue;
-        }
-        let path = entry.path();
+        let path = entry?.path();
         let is_record = path
             .extension()
             .is_some_and(|extension| extension == "json");
@@ -38,7 +50,9 @@ fn run_in(app: &Path) -> Result<()> {
                 .into_owned()
         };
         let _lock = crate::session::acquire_storage_flock(&workers, &lock_name)?;
-        let bytes = fs::read(&path)?;
+        let Some(bytes) = read_regular(&path)? else {
+            continue;
+        };
         let mut value: Value = match serde_json::from_slice(&bytes) {
             Ok(value) => value,
             Err(error) => {

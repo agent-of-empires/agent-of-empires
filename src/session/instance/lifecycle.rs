@@ -63,6 +63,9 @@ impl Instance {
         ttl: chrono::Duration,
         now: DateTime<Utc>,
     ) -> Result<u64, LifecycleReservationError> {
+        if self.status == Status::Deleting {
+            return Err(LifecycleReservationError::Busy(LifecycleOperation::Purge));
+        }
         if let Some(reservation) = self.lifecycle_reservation.as_ref().filter(|reservation| {
             reservation.generation == self.lifecycle_generation && (now - reservation.at) < ttl
         }) {
@@ -104,6 +107,37 @@ impl Instance {
         )
     }
 
+    /// Refresh an owned reservation while a bounded or user-defined hook runs. The generation
+    /// remains the identity of the operation; only its liveness timestamp moves forward.
+    pub(crate) fn renew_lifecycle_reservation_if_owned(
+        &mut self,
+        operation: LifecycleOperation,
+        generation: u64,
+        now: DateTime<Utc>,
+    ) -> bool {
+        if self.lifecycle_reservation_is_owned(operation, generation) {
+            if let Some(reservation) = self.lifecycle_reservation.as_mut() {
+                reservation.at = now;
+                return true;
+            }
+        }
+        false
+    }
+
+    pub(crate) fn start_reservation_heartbeat(
+        &self,
+        storage: &crate::session::storage::Storage,
+        operation: LifecycleOperation,
+    ) -> Result<crate::session::ReservationHeartbeat> {
+        crate::session::ReservationHeartbeat::start(
+            storage,
+            &self.id,
+            operation,
+            self.lifecycle_generation,
+            std::time::Duration::from_secs(60),
+        )
+    }
+
     pub(crate) fn has_fresh_launch_reservation(&self, now: DateTime<Utc>) -> bool {
         self.has_fresh_lifecycle_reservation(now)
             && self
@@ -125,6 +159,26 @@ impl Instance {
         }
     }
 
+    /// Publish a retained purge result beyond peers' Deleting observation.
+    pub(crate) fn finish_owned_purge(
+        &mut self,
+        generation: u64,
+        status_before: Status,
+    ) -> Result<bool, LifecycleReservationError> {
+        if !self.lifecycle_reservation_is_owned(LifecycleOperation::Purge, generation) {
+            return Ok(false);
+        }
+        let completed = generation
+            .checked_add(1)
+            .ok_or(LifecycleReservationError::GenerationOverflow)?;
+        if self.status == Status::Deleting {
+            self.status = status_before;
+        }
+        self.lifecycle_reservation = None;
+        self.lifecycle_generation = completed;
+        Ok(true)
+    }
+
     /// Clear a crashed owner's expired reservation. The generation is
     /// deliberately retained as the monotonic cache/result revision.
     pub fn clear_expired_lifecycle_reservation(
@@ -135,7 +189,9 @@ impl Instance {
         if matches!(
             &self.lifecycle_reservation,
             Some(reservation)
-                if reservation.generation == self.lifecycle_generation
+                if reservation.op != LifecycleOperation::Purge
+                    && self.status != Status::Deleting
+                    && reservation.generation == self.lifecycle_generation
                     && (now - reservation.at) >= ttl
         ) {
             self.lifecycle_reservation = None;
@@ -193,6 +249,14 @@ impl Instance {
             let Some(stored) = instances.iter_mut().find(|instance| instance.id == self.id) else {
                 return Ok(());
             };
+            if stored.status == Status::Deleting
+                && matches!(
+                    operation,
+                    LifecycleOperation::Launch | LifecycleOperation::Stop
+                )
+            {
+                return Err(StartBlocked::Deleting.into());
+            }
             let generation = stored
                 .try_acquire_lifecycle_reservation(operation, Self::LIFECYCLE_RESERVATION_TTL, now)
                 .map_err(|error| match error {
@@ -397,7 +461,7 @@ impl Instance {
             return;
         }
         if cleanup_pane {
-            let _ = self.kill_clean_locked();
+            let _ = self.kill_clean_locked(storage);
             // Escapees of the discarded launch outlive its pane. The
             // reservation still excludes a replacement the sweep would catch.
             self.release_scope();
@@ -717,7 +781,7 @@ mod tests {
         let mut kept_pane = reserved("kept-pane");
         kept_pane.fail_reserved_launch(&storage, &error, false);
         let restarted = reserved("restarted");
-        restarted.kill_clean_locked().unwrap();
+        restarted.kill_clean_locked(&storage).unwrap();
         let mut superseded = reserved("superseded");
         storage
             .update(|instances, _groups| {

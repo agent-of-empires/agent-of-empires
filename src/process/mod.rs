@@ -54,6 +54,99 @@ mod platform {
             "process replacement requires Linux or macOS",
         )
     }
+
+    pub(super) fn directory_identity(
+        metadata: &std::fs::Metadata,
+    ) -> std::io::Result<super::DirectoryIdentity> {
+        #[cfg(not(unix))]
+        {
+            Ok(super::DirectoryIdentity {
+                created: metadata.created()?,
+            })
+        }
+        #[cfg(unix)]
+        {
+            let _ = metadata;
+            Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "directory identity requires Linux or macOS",
+            ))
+        }
+    }
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct DirectoryIdentity {
+    #[cfg(unix)]
+    device: u64,
+    #[cfg(unix)]
+    inode: u64,
+    #[cfg(not(unix))]
+    created: std::time::SystemTime,
+}
+
+impl DirectoryIdentity {
+    pub(crate) fn from_metadata(metadata: &std::fs::Metadata) -> std::io::Result<Self> {
+        platform::directory_identity(metadata)
+    }
+
+    pub(crate) fn read(path: &Path) -> anyhow::Result<Option<Self>> {
+        let metadata = match std::fs::symlink_metadata(path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error.into()),
+        };
+        anyhow::ensure!(metadata.is_dir(), "profile is not a directory");
+        Ok(Some(platform::directory_identity(&metadata)?))
+    }
+}
+
+#[cfg(unix)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct SocketArtifactIdentity {
+    device: u64,
+    inode: u64,
+    created: Option<std::time::SystemTime>,
+}
+
+#[cfg(unix)]
+pub(crate) struct SocketArtifactPin {
+    #[cfg(target_os = "linux")]
+    _file: std::fs::File,
+}
+
+#[cfg(unix)]
+pub(crate) fn socket_artifact_identity(
+    path: &std::path::Path,
+) -> std::io::Result<Option<SocketArtifactIdentity>> {
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    return platform::socket_artifact_identity(path);
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        let _ = path;
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "socket artifact identity is unsupported",
+        ))
+    }
+}
+
+#[cfg(unix)]
+pub(crate) fn pin_socket_artifact(
+    path: &std::path::Path,
+    expected: SocketArtifactIdentity,
+) -> std::io::Result<SocketArtifactPin> {
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    return platform::pin_socket_artifact(path, expected);
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        let _ = (path, expected);
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "socket artifact pinning is unsupported",
+        ))
+    }
 }
 
 pub(crate) const LIVE_PANE_ENV_KEYS: [&str; 3] = ["TERM", "TMUX", "TMUX_PANE"];
@@ -279,7 +372,7 @@ pub(crate) fn terminate_and_reap_process_group(
 /// Both names are relative to retained directory descriptors; there is no
 /// check-then-rename fallback on platforms without an exclusive rename syscall.
 #[cfg(unix)]
-pub(crate) fn rename_exclusive(
+pub(crate) fn rename_exclusive_at(
     source_dir: &std::os::fd::OwnedFd,
     source: &std::ffi::OsStr,
     destination_dir: &std::os::fd::OwnedFd,
@@ -296,6 +389,40 @@ pub(crate) fn rename_exclusive(
             std::io::ErrorKind::Unsupported,
             "exclusive directory publication is unsupported on this platform",
         ))
+    }
+}
+
+pub(crate) fn rename_exclusive_path(
+    source: &std::path::Path,
+    destination: &std::path::Path,
+) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        let source_parent = source.parent().ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::InvalidInput, "source has no parent")
+        })?;
+        let destination_parent = destination.parent().ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "destination has no parent",
+            )
+        })?;
+        let source_name = source.file_name().ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::InvalidInput, "source has no file name")
+        })?;
+        let destination_name = destination.file_name().ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "destination has no file name",
+            )
+        })?;
+        let source_dir: std::os::fd::OwnedFd = std::fs::File::open(source_parent)?.into();
+        let destination_dir: std::os::fd::OwnedFd = std::fs::File::open(destination_parent)?.into();
+        rename_exclusive_at(&source_dir, source_name, &destination_dir, destination_name)
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::rename(source, destination)
     }
 }
 
@@ -520,7 +647,7 @@ pub fn processes_matching(
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub(crate) struct PrimeProcessIdentity {
     pub pid: u32,
     pub start_id: String,
@@ -529,6 +656,7 @@ pub(crate) struct PrimeProcessIdentity {
 pub(super) struct PrimeProcessSample {
     pub identity: PrimeProcessIdentity,
     pub parent: u32,
+    pub parent_start_id: Option<String>,
     pub marked: bool,
 }
 
@@ -541,11 +669,16 @@ fn prime_selection_mask(
         .iter()
         .map(|identity| (identity.pid, &identity.start_id))
         .collect();
-    let mut children: HashMap<u32, Vec<usize>> = HashMap::new();
+    let mut children: HashMap<(u32, &str), Vec<usize>> = HashMap::new();
     let mut selected = vec![false; samples.len()];
     let mut pending = Vec::new();
     for (index, sample) in samples.iter().enumerate() {
-        children.entry(sample.parent).or_default().push(index);
+        if let Some(parent_start_id) = sample.parent_start_id.as_deref() {
+            children
+                .entry((sample.parent, parent_start_id))
+                .or_default()
+                .push(index);
+        }
         if sample.marked
             || known
                 .get(&sample.identity.pid)
@@ -556,7 +689,8 @@ fn prime_selection_mask(
         }
     }
     while let Some(index) = pending.pop() {
-        if let Some(descendants) = children.get(&samples[index].identity.pid) {
+        let parent = &samples[index].identity;
+        if let Some(descendants) = children.get(&(parent.pid, parent.start_id.as_str())) {
             for &child in descendants {
                 if !selected[child] {
                     selected[child] = true;
@@ -615,7 +749,7 @@ pub(super) fn select_stable_prime_processes(
     if let Some(error) = failure {
         return Err(error);
     }
-    Ok(select_prime_processes(samples, known))
+    Ok(samples.into_iter().map(|sample| sample.identity).collect())
 }
 
 pub(crate) fn prime_processes(
@@ -1267,14 +1401,16 @@ mod tests {
 
     #[test]
     fn prime_process_selection_preserves_scope_across_pid_reuse() {
-        let sample = |pid, parent, start: &str, marked| PrimeProcessSample {
-            identity: PrimeProcessIdentity {
-                pid,
-                start_id: start.into(),
-            },
-            parent,
-            marked,
-        };
+        let sample =
+            |pid, parent, parent_start: Option<&str>, start: &str, marked| PrimeProcessSample {
+                identity: PrimeProcessIdentity {
+                    pid,
+                    start_id: start.into(),
+                },
+                parent,
+                parent_start_id: parent_start.map(str::to_owned),
+                marked,
+            };
         let known = PrimeProcessIdentity {
             pid: 10,
             start_id: "proc:100".into(),
@@ -1282,10 +1418,10 @@ mod tests {
         for (start, expected) in [("proc:100", vec![10, 11, 12]), ("proc:200", vec![])] {
             let selected = select_prime_processes(
                 vec![
-                    sample(10, 1, start, false),
-                    sample(11, 10, "proc:101", false),
-                    sample(12, 11, "proc:102", false),
-                    sample(20, 1, "proc:103", false),
+                    sample(10, 1, None, start, false),
+                    sample(11, 10, Some(start), "proc:101", false),
+                    sample(12, 11, Some("proc:101"), "proc:102", false),
+                    sample(20, 1, None, "proc:103", false),
                 ],
                 std::slice::from_ref(&known),
             );
@@ -1299,11 +1435,11 @@ mod tests {
         }
         let selected = select_prime_processes(
             vec![
-                sample(10, 1, "proc:200", false),
-                sample(30, 1, "proc:300", true),
-                sample(31, 30, "proc:301", false),
+                sample(10, 1, None, "proc:200", false),
+                sample(30, 1, None, "proc:300", true),
+                sample(31, 30, Some("proc:300"), "proc:301", false),
             ],
-            &[known],
+            std::slice::from_ref(&known),
         );
         assert_eq!(
             selected
@@ -1311,6 +1447,29 @@ mod tests {
                 .map(|identity| identity.pid)
                 .collect::<Vec<_>>(),
             [30, 31]
+        );
+        let selected = select_prime_processes(
+            vec![
+                sample(10, 1, None, "proc:100", false),
+                sample(11, 10, Some("proc:999"), "proc:101", false),
+            ],
+            std::slice::from_ref(&known),
+        );
+        assert_eq!(selected.as_slice(), std::slice::from_ref(&known));
+        let independently_owned = select_prime_processes(
+            vec![
+                sample(10, 999, None, "proc:100", false),
+                sample(30, 999, None, "proc:300", true),
+                sample(31, 999, None, "proc:301", false),
+            ],
+            std::slice::from_ref(&known),
+        );
+        assert_eq!(
+            independently_owned
+                .iter()
+                .map(|identity| identity.pid)
+                .collect::<Vec<_>>(),
+            [10, 30]
         );
     }
 

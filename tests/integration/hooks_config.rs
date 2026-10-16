@@ -26,6 +26,7 @@ fn hooks(config: &agent_of_empires::session::Config) -> [Vec<String>; 3] {
 #[serial]
 fn hooks_resolve_per_field_across_global_profile_and_repo() -> Result<()> {
     let _temp = setup_temp_home();
+    agent_of_empires::session::create_profile("default")?;
     let s = |v: &str| vec![v.to_string()];
 
     update_config(|global| {

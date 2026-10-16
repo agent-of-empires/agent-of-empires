@@ -62,7 +62,7 @@ impl HomeView {
         }
     }
 
-    /// Why the session's agent must not start or take input, if it is archived or trashed.
+    /// Durable lifecycle state that blocks this session's agent start or input.
     pub(super) fn start_blocked(&self, session_id: &str) -> Option<crate::session::StartBlocked> {
         self.get_instance(session_id)?.ensure_startable().err()
     }

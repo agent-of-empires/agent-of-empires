@@ -799,7 +799,8 @@ pub async fn run(profile: &str, mut args: ServeArgs, serve_lock: Option<ServeLoc
         return restart_daemon().await;
     }
 
-    crate::session::require_known_profile(profile)?;
+    let admitted_profile = crate::session::admit_profile(profile)?;
+    let profile = admitted_profile.as_str();
 
     args.cityhall = args.cityhall || std::env::var_os("AOE_CITYHALL_MODE").is_some();
 

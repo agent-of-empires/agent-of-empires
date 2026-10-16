@@ -31,6 +31,7 @@ const SESSION_TITLE_LOCK_PREFIX: &str = ".session-title-";
 /// Emit a tracing warn if the cross-process `flock` is held by a peer for longer than this.
 const FLOCK_WAIT_WARN_AFTER: Duration = Duration::from_secs(1);
 
+pub(crate) const ATOMIC_WRITE_TEMP_PREFIX: &str = ".aoe-tmp-";
 /// Write `content` atomically (temp file + data/metadata fsync + rename + best-effort dir
 /// fsync).
 pub(crate) fn atomic_write(path: &Path, content: &[u8]) -> Result<()> {
@@ -46,7 +47,9 @@ fn atomic_write_resolved(path: &Path, content: &[u8]) -> Result<()> {
         )
     })?;
     let existing_perms = fs::metadata(path).ok().map(|m| m.permissions());
-    let mut tmp = tempfile::NamedTempFile::new_in(dir)?;
+    let mut tmp = tempfile::Builder::new()
+        .prefix(ATOMIC_WRITE_TEMP_PREFIX)
+        .tempfile_in(dir)?;
     tmp.write_all(content)?;
     if let Some(perms) = existing_perms {
         tmp.as_file().set_permissions(perms)?;
@@ -321,7 +324,7 @@ where
 }
 
 /// Process-wide registry of per-profile save mutexes.
-fn save_lock_for(profile: &str) -> Arc<Mutex<()>> {
+pub(crate) fn save_lock_for(profile: &str) -> Arc<Mutex<()>> {
     static REGISTRY: OnceLock<Mutex<HashMap<String, Arc<Mutex<()>>>>> = OnceLock::new();
     let registry = REGISTRY.get_or_init(|| Mutex::new(HashMap::new()));
     let mut guard = registry
@@ -365,12 +368,25 @@ fn acquire_transition_flocks_for_profile_dirs(profile_dirs: &[&Path]) -> Result<
         .collect();
     app_dirs.sort();
     app_dirs.dedup();
-    app_dirs
+    let guards: Vec<StorageFlock> = app_dirs
         .iter()
         .map(|dir| {
             acquire_storage_shared_flock(dir, crate::migrations::v027_isolate_sandbox_stores::LOCK)
         })
-        .collect()
+        .collect::<Result<_>>()?;
+    for dir in profile_dirs {
+        if dir
+            .parent()
+            .is_some_and(|parent| parent.file_name().is_some_and(|name| name == "profiles"))
+        {
+            let profile = dir
+                .file_name()
+                .and_then(|name| name.to_str())
+                .context("invalid profile directory")?;
+            super::profile_rename::ensure_profile_available(profile)?;
+        }
+    }
+    Ok(guards)
 }
 
 #[cfg(unix)]
@@ -406,7 +422,14 @@ fn existing_paths_share_filesystem_identity(left: &Path, right: &Path) -> Result
 }
 
 fn open_storage_lock_file(dir: &Path, name: &str) -> Result<(fs::File, PathBuf)> {
-    fs::create_dir_all(dir)?;
+    if dir
+        .parent()
+        .is_some_and(|parent| parent.file_name().is_some_and(|name| name == "profiles"))
+    {
+        anyhow::ensure!(fs::metadata(dir)?.is_dir(), "profile directory is absent");
+    } else {
+        fs::create_dir_all(dir)?;
+    }
     let path = dir.join(name);
     #[cfg(unix)]
     let file = {
@@ -584,6 +607,9 @@ pub(crate) fn acquire_session_identity_lock() -> Result<StorageFlock> {
     acquire_storage_flock(&get_app_dir()?, SESSION_IDENTITY_LOCK_FILENAME)
 }
 
+pub(crate) fn try_acquire_session_identity_lock() -> Result<Option<StorageFlock>> {
+    try_acquire_storage_flock(&get_app_dir()?, SESSION_IDENTITY_LOCK_FILENAME)
+}
 /// Serialize one session's title commit and post-commit tmux rekey across profiles and
 /// processes.
 pub(crate) fn acquire_session_title_lock(instance_id: &str) -> Result<StorageFlock> {
@@ -608,7 +634,7 @@ pub(crate) fn arm_test_crash_point(name: &str) {
 }
 
 #[cfg(test)]
-fn test_crash_point(name: &str) {
+pub(super) fn test_crash_point(name: &str) {
     let armed = TEST_CRASH_POINTS.with(|points| points.borrow().iter().any(|armed| armed == name));
     if armed {
         panic!("simulated crash at crash point `{name}`");
@@ -619,7 +645,6 @@ fn test_crash_point(name: &str) {
 pub(crate) fn disarm_test_crash_points() {
     TEST_CRASH_POINTS.with(|points| points.borrow_mut().clear());
 }
-
 /// RAII wrapper so a failing assertion between arm and disarm can never leave
 /// an armed point panicking an unrelated test scheduled on the same thread.
 #[cfg(test)]
@@ -721,6 +746,7 @@ pub(crate) fn try_acquire_storage_flock(dir: &Path, name: &str) -> Result<Option
     }
 }
 
+#[derive(Clone)]
 pub struct Storage {
     profile: String,
     sessions_path: PathBuf,
@@ -728,6 +754,51 @@ pub struct Storage {
     file_watch: Arc<FileWatchService>,
     #[cfg(test)]
     fail_writes_for_test: bool,
+}
+
+pub(crate) struct ProfileIncarnation {
+    profile: String,
+    directory: fs::File,
+}
+
+impl ProfileIncarnation {
+    fn open(profile: &str, path: &Path) -> Result<Self> {
+        let mut options = fs::OpenOptions::new();
+        options.read(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            options.custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC);
+        }
+        let directory = options
+            .open(path)
+            .with_context(|| format!("opening existing profile '{}'", profile))?;
+        anyhow::ensure!(directory.metadata()?.is_dir(), "profile is not a directory");
+        Ok(Self {
+            profile: profile.to_owned(),
+            directory,
+        })
+    }
+
+    fn matches(&self, profile: &str, path: &Path) -> Result<bool> {
+        if self.profile != profile {
+            return Ok(false);
+        }
+        let expected = self.directory.metadata()?;
+        let current = fs::symlink_metadata(path)?;
+        if current.file_type().is_symlink() || !current.is_dir() {
+            return Ok(false);
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt as _;
+            Ok(expected.dev() == current.dev() && expected.ino() == current.ino())
+        }
+        #[cfg(not(unix))]
+        {
+            Ok(expected.created()? == current.created()?)
+        }
+    }
 }
 
 // Cross-device-syncable sidebar ordering.
@@ -893,6 +964,38 @@ impl Storage {
         Self::open(profile, FileWatchService::noop())
     }
 
+    pub(crate) fn open_profile_delete_recovery(profile: &str, existing_dir: &Path) -> Result<Self> {
+        let directory = fs::symlink_metadata(existing_dir)?;
+        anyhow::ensure!(
+            directory.is_dir() && !directory.file_type().is_symlink(),
+            "profile delete recovery path is not a directory"
+        );
+        Ok(Self {
+            profile: profile.to_owned(),
+            sessions_path: existing_dir.join("sessions.json"),
+            save_lock: save_lock_for(profile),
+            file_watch: FileWatchService::noop(),
+            #[cfg(test)]
+            fail_writes_for_test: false,
+        })
+    }
+
+    pub(crate) fn pin_incarnation(&self) -> Result<ProfileIncarnation> {
+        let profile_dir = self
+            .sessions_path
+            .parent()
+            .context("profile has no directory")?;
+        ProfileIncarnation::open(&self.profile, profile_dir)
+    }
+
+    pub(crate) fn try_acquire_purge_owner_lock(
+        &self,
+        instance_id: &str,
+    ) -> Result<Option<StorageFlock>> {
+        super::validate_instance_id(instance_id)?;
+        try_acquire_storage_flock(&get_app_dir()?, &format!(".purge-owner-{instance_id}.lock"))
+    }
+
     /// Serialize launch/restart and explicit resume-target mutation for one instance across
     /// every process using this profile.
     pub(crate) fn acquire_instance_lifecycle_lock(
@@ -906,6 +1009,24 @@ impl Storage {
             .parent()
             .ok_or_else(|| anyhow!("sessions path has no profile directory"))?;
         acquire_storage_flock(
+            profile_dir,
+            &format!("{INSTANCE_LIFECYCLE_LOCK_PREFIX}{instance_id}.lock"),
+        )
+    }
+
+    /// Try to acquire one instance's lifecycle flock without waiting. Startup recovery uses
+    /// this form so a live daemon that is still finishing a hook does not block its own reload.
+    pub(crate) fn try_acquire_instance_lifecycle_lock(
+        &self,
+        instance_id: &str,
+    ) -> Result<Option<StorageFlock>> {
+        super::validate_instance_id(instance_id)
+            .context("refusing lifecycle lock for invalid instance id")?;
+        let profile_dir = self
+            .sessions_path
+            .parent()
+            .ok_or_else(|| anyhow!("sessions path has no profile directory"))?;
+        try_acquire_storage_flock(
             profile_dir,
             &format!("{INSTANCE_LIFECYCLE_LOCK_PREFIX}{instance_id}.lock"),
         )
@@ -1070,6 +1191,20 @@ impl Storage {
     where
         F: FnOnce(&mut Vec<Instance>, &mut Vec<Group>) -> Result<R>,
     {
+        self.update_guarded(None, f)
+    }
+
+    pub(crate) fn update_pinned<F, R>(&self, pin: &ProfileIncarnation, f: F) -> Result<R>
+    where
+        F: FnOnce(&mut Vec<Instance>, &mut Vec<Group>) -> Result<R>,
+    {
+        self.update_guarded(Some(pin), f)
+    }
+
+    fn update_guarded<F, R>(&self, pin: Option<&ProfileIncarnation>, f: F) -> Result<R>
+    where
+        F: FnOnce(&mut Vec<Instance>, &mut Vec<Group>) -> Result<R>,
+    {
         #[cfg(test)]
         report_update_for_test(self);
         #[cfg(test)]
@@ -1092,8 +1227,49 @@ impl Storage {
             app_dir_for_profile_dir(profile_dir),
             crate::migrations::v027_isolate_sandbox_stores::LOCK,
         )?;
+        super::profile_rename::ensure_profile_available(&self.profile)?;
+        if let Some(pin) = pin {
+            anyhow::ensure!(
+                pin.matches(&self.profile, profile_dir)?,
+                "profile incarnation changed before storage commit"
+            );
+        }
         let _flock = acquire_storage_flock(profile_dir, STORAGE_LOCK_FILENAME)?;
         self.update_under_lock(f)
+    }
+
+    pub(crate) fn with_profile_rename_locked<R>(&self, f: impl FnOnce() -> Result<R>) -> Result<R> {
+        let _mu = self
+            .save_lock
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let _transition = acquire_storage_flock(
+            &get_app_dir()?,
+            crate::migrations::v027_isolate_sandbox_stores::LOCK,
+        )?;
+        let dir = self
+            .sessions_path
+            .parent()
+            .context("profile has no directory")?;
+        let _storage_lock = acquire_storage_flock(dir, STORAGE_LOCK_FILENAME)?;
+        f()
+    }
+
+    pub(crate) fn with_profile_delete_recovery_locked<R>(
+        profile: &str,
+        existing_dir: Option<&Path>,
+        f: impl FnOnce() -> Result<R>,
+    ) -> Result<R> {
+        let save_lock = save_lock_for(profile);
+        let _mu = save_lock.lock().unwrap_or_else(|error| error.into_inner());
+        let _transition = acquire_storage_flock(
+            &get_app_dir()?,
+            crate::migrations::v027_isolate_sandbox_stores::LOCK,
+        )?;
+        let _storage_lock = existing_dir
+            .map(|dir| acquire_storage_flock(dir, STORAGE_LOCK_FILENAME))
+            .transpose()?;
+        f()
     }
 
     /// Apply one storage mutation while the caller already owns this profile's
@@ -1245,6 +1421,8 @@ impl Storage {
             .ok_or_else(|| anyhow!("sessions path has no parent"))?;
         let _transition_flocks =
             acquire_transition_flocks_for_profile_dirs(&[first_dir, second_dir])?;
+        super::profile_rename::ensure_profile_available(&self.profile)?;
+        super::profile_rename::ensure_profile_available(&target.profile)?;
         let (first_lock_file, first_lock_path) =
             open_storage_lock_file(first_dir, STORAGE_LOCK_FILENAME)?;
         let (second_lock_file, second_lock_path) =
@@ -1282,6 +1460,10 @@ impl Storage {
                 .iter()
                 .find(|instance| instance.id == before.id)
                 .ok_or_else(|| anyhow!("Session not found in source profile"))?;
+            anyhow::ensure!(
+                source.status != super::Status::Deleting,
+                super::StartBlocked::Deleting,
+            );
             if target_instances
                 .iter()
                 .any(|instance| instance.id == before.id)
@@ -1942,6 +2124,10 @@ pub(crate) fn reconcile_profile_duplicates(
     if !opaque_failure {
         let mut blocked_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
         for (path, entry) in valid_entries {
+            if super::profile_rename::ensure_move_available(&entry).is_err() {
+                blocked_ids.extend(entry.ids.iter().cloned());
+                continue;
+            }
             if entry.ids.iter().any(|id| blocked_ids.contains(id)) {
                 // Shadowing is transitive across a multi-id batch.
                 blocked_ids.extend(entry.ids.iter().cloned());
@@ -2140,7 +2326,6 @@ pub(crate) fn with_storages_locked<R>(storages: &[Storage], f: impl FnOnce() -> 
                 .sessions_path
                 .parent()
                 .ok_or_else(|| anyhow!("sessions path has no parent"))?;
-            fs::create_dir_all(dir)?;
             Ok((dir.canonicalize()?, storage))
         })
         .collect::<Result<Vec<_>>>()?;
@@ -2158,6 +2343,9 @@ pub(crate) fn with_storages_locked<R>(storages: &[Storage], f: impl FnOnce() -> 
         .collect();
     let dirs: Vec<&Path> = sorted.iter().map(|(dir, _)| dir.as_path()).collect();
     let _transition_flocks = acquire_transition_flocks_for_profile_dirs(&dirs)?;
+    for (_, storage) in &sorted {
+        super::profile_rename::ensure_profile_available(storage.profile())?;
+    }
     let mut held: Vec<(fs::Metadata, StorageFlock)> = Vec::with_capacity(dirs.len());
     for dir in dirs {
         let (file, path) = open_storage_lock_file(dir, STORAGE_LOCK_FILENAME)?;
@@ -3037,6 +3225,33 @@ mod tests {
 
         crate::session::create_profile("known").unwrap();
         assert_eq!(Storage::open_unwatched("known").unwrap().profile(), "known");
+    }
+
+    #[test]
+    #[serial]
+    fn pinned_update_rejects_delete_and_recreate_of_the_same_profile_name() {
+        let temp = tempdir().unwrap();
+        let _guard = setup_test_home(temp.path());
+        crate::session::create_profile("keeper").unwrap();
+        crate::session::create_profile("victim").unwrap();
+        let storage = Storage::open_unwatched("victim").unwrap();
+        let pin = storage.pin_incarnation().unwrap();
+
+        crate::session::delete_profile("victim").unwrap();
+        crate::session::create_profile("victim").unwrap();
+        let err = storage
+            .update_pinned(&pin, |rows, _| {
+                rows.push(Instance::new("stale", "/tmp/stale"));
+                Ok(())
+            })
+            .unwrap_err();
+
+        assert!(err.to_string().contains("incarnation changed"), "{err}");
+        assert!(Storage::open_unwatched("victim")
+            .unwrap()
+            .load()
+            .unwrap()
+            .is_empty());
     }
 
     #[test]

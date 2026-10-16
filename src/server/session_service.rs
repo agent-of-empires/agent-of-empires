@@ -254,7 +254,7 @@ pub(crate) enum PromptTouch {
     /// `no_revive` was set and the session needed snoozed/idle-dormant
     /// revival to accept this prompt; refused before any mutation.
     RevivalRefused,
-    /// The session is archived or trashed; refused before any mutation.
+    /// Durable lifecycle state refused the operation before mutation.
     Blocked(crate::session::StartBlocked),
 }
 
@@ -474,9 +474,9 @@ impl SessionService {
         }
     }
 
-    /// Record that a prompt is arriving. An archived or trashed session is
-    /// refused, never woken. `no_revive` refuses atomically, under the same
-    /// per-session lock, rather than waking a snoozed/idle-dormant session
+    /// Record that a prompt is arriving. A lifecycle-blocked session is
+    /// refused, never woken. `no_revive` refuses atomically under the same
+    /// per-session lock rather than waking a snoozed or idle-dormant session
     /// (#4081 review: a client-side liveness check before this call would
     /// race a concurrent archive, snooze, or wake).
     pub(crate) async fn touch_and_wake_on_prompt(&self, id: &str, no_revive: bool) -> PromptTouch {
@@ -508,7 +508,7 @@ impl SessionService {
             }
             (inst.source_profile.clone(), wake, was_idle_dormant)
         };
-        if let Ok(storage) = crate::session::Storage::new(&profile, self.file_watch.clone()) {
+        if let Ok(storage) = crate::session::Storage::open(&profile, self.file_watch.clone()) {
             let id_clone = id.to_string();
             let outcome = tokio::task::spawn_blocking(move || {
                 storage.update(|instances, _groups| {
@@ -758,7 +758,7 @@ impl SessionService {
                 self.invalidate_disk_snapshots();
             }
         }
-        match crate::session::Storage::new(&profile, self.file_watch.clone()) {
+        match crate::session::Storage::open(&profile, self.file_watch.clone()) {
             Ok(storage) => {
                 let id_persist = id.to_string();
                 let persisted = tokio::task::spawn_blocking(move || {
@@ -813,7 +813,7 @@ impl SessionService {
                 _ => return,
             }
         };
-        match crate::session::Storage::new(&profile, self.file_watch.clone()) {
+        match crate::session::Storage::open(&profile, self.file_watch.clone()) {
             Ok(storage) => {
                 let id_persist = id.to_string();
                 let persisted = tokio::task::spawn_blocking(move || {
@@ -857,7 +857,7 @@ impl SessionService {
                 _ => return,
             }
         };
-        match crate::session::Storage::new(&profile, self.file_watch.clone()) {
+        match crate::session::Storage::open(&profile, self.file_watch.clone()) {
             Ok(storage) => {
                 let id_persist = id.to_string();
                 let persisted = tokio::task::spawn_blocking(move || {
@@ -930,7 +930,7 @@ impl SessionService {
                 transaction,
             )
         };
-        match crate::session::Storage::new(&profile, self.file_watch.clone()) {
+        match crate::session::Storage::open(&profile, self.file_watch.clone()) {
             Ok(storage) => {
                 let id_persist = id.to_string();
                 let persisted = tokio::task::spawn_blocking(move || {

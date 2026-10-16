@@ -408,7 +408,7 @@ impl Instance {
         expected_prior: Option<&str>,
     ) -> bool {
         let storage =
-            match crate::session::storage::Storage::new(profile, self.resolve_file_watch()) {
+            match crate::session::storage::Storage::open(profile, self.resolve_file_watch()) {
                 Ok(storage) => storage,
                 Err(error) => {
                     tracing::warn!(

@@ -45,6 +45,7 @@ async fn patch(app: &axum::Router, uri: &str, body: Value, expected: StatusCode)
 #[serial_test::serial]
 async fn settings_only_reload_changed_log_filters() {
     let _home = crate::common::setup_temp_home();
+    session::create_profile("main").unwrap();
     if logging::controller().is_none() {
         let init = logging::init_subscriber(logging::SubscriberTarget::Stdout, "off".into());
         logging::install_controller(init.controller.expect("reloadable subscriber"));
@@ -200,6 +201,7 @@ async fn settings_only_reload_changed_log_filters() {
 #[serial_test::serial]
 async fn profile_settings_reject_global_only_fields_without_writing() {
     let _home = crate::common::setup_temp_home();
+    session::create_profile("main").unwrap();
     session::update_config(|config| *config = Config::default()).unwrap();
     session::save_profile_config("main", &session::ProfileConfig::default()).unwrap();
     let app = build_router_for_test(build_test_app_state(Vec::new()));

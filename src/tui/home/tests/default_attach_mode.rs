@@ -402,6 +402,15 @@ fn switch_view_target_gates_by_view_and_state() {
         inst.view = crate::session::View::Terminal;
     });
     assert_eq!(env.view.session_switch_view_target(&id), Some(false));
+    env.view
+        .mutate_instance(&id, |inst| inst.terminal_handoff_pending = true);
+    assert_eq!(
+        env.view.session_switch_view_target(&id),
+        Some(true),
+        "a pending handoff retries terminal disable"
+    );
+    env.view
+        .mutate_instance(&id, |inst| inst.terminal_handoff_pending = false);
     // Mid-lifecycle rows are excluded.
     env.view.mutate_instance(&id, |inst| {
         inst.status = crate::session::Status::Creating;

@@ -1234,8 +1234,10 @@ mod serve {
         let lock = state.instance_lock(id).await;
         let _serialized = lock.lock().await;
 
-        let storage = match crate::session::storage::Storage::new(profile, state.file_watch.clone())
-        {
+        let storage = match crate::session::storage::Storage::open(
+            profile,
+            state.file_watch.clone(),
+        ) {
             Ok(s) => s,
             Err(e) => {
                 tracing::warn!(target: "smart_rename", session = %id, "storage open failed: {e}");

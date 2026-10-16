@@ -357,7 +357,9 @@ function buildRowActions(
     editWorkdir: after(() => setModal("workdir")),
     addProject: after(() => setModal("addProject")),
     editGroup: after(() => setModal("group")),
-    switchView: after(() => first && props.onSwitchView?.(first.id, first.view !== "structured")),
+    switchView: after(
+      () => first && props.onSwitchView?.(first.id, first.view !== "structured" && !first.terminal_handoff_pending),
+    ),
     // The dialog lives in the session's Composer, so navigate first; a pending latch opens it on mount.
     switchAgent: after(() => {
       if (!acp) return;

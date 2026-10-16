@@ -6,7 +6,7 @@ use serde::Serialize;
 use std::path::PathBuf;
 
 use crate::session::projects;
-use crate::session::{resolve_existing_profile, Project, ProjectScope};
+use crate::session::{admit_profile, resolve_existing_profile, Project, ProjectScope};
 
 #[derive(Subcommand)]
 pub enum ProjectCommands {
@@ -174,7 +174,7 @@ async fn add(profile: &str, profile_explicit: bool, args: ProjectAddArgs) -> Res
     };
     let resolved_profile = match scope {
         ProjectScope::Global => None,
-        ProjectScope::Profile => Some(resolve_existing_profile(profile)?),
+        ProjectScope::Profile => Some(admit_profile(profile)?),
     };
     let profile = resolved_profile.as_deref().unwrap_or(profile);
 

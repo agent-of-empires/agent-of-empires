@@ -968,6 +968,13 @@
       "components": ["web/src/components/settings/ProfileSelector.tsx"]
     },
     {
+      "id": "profiles.rename-kept-resources",
+      "kind": "live-playwright",
+      "risk": "high",
+      "specs": ["tests/live/settings-panels.spec.ts"],
+      "components": ["web/src/components/profiles/ProfilesSection.tsx"]
+    },
+    {
       "id": "profiles.page",
       "kind": "mocked-playwright",
       "risk": "high",
@@ -2856,6 +2863,9 @@
       "components": [
         "web/src/components/WorkspaceSidebar.tsx",
         "web/src/components/SwitchViewDialog.tsx",
+        "web/src/components/sidebar/SessionRow.tsx",
+        "web/src/components/sidebar/SessionRowMenu.tsx",
+        "web/src/lib/types.ts",
         "web/src/App.tsx"
       ]
     },

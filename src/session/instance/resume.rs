@@ -137,7 +137,7 @@ impl Instance {
             return Ok(StartOutcome::Fresh);
         }
         let profile = self.effective_profile();
-        let storage = crate::session::storage::Storage::new(&profile, self.resolve_file_watch())
+        let storage = crate::session::storage::Storage::open(&profile, self.resolve_file_watch())
             .context("failed to open lifecycle lock storage")?;
 
         let title_lock = crate::session::storage::acquire_session_title_lock(&self.id)
@@ -163,6 +163,14 @@ impl Instance {
             LifecycleOperation::Launch,
             Some(Status::Starting),
         )?;
+        let heartbeat = match self.start_reservation_heartbeat(&storage, LifecycleOperation::Launch)
+        {
+            Ok(heartbeat) => heartbeat,
+            Err(error) => {
+                self.fail_reserved_launch(&storage, &error, false);
+                return Err(error);
+            }
+        };
         if restart {
             self.stop_and_flush_poller_lifecycle_locked();
             self.capture_omp_before_restart(&profile);
@@ -179,6 +187,7 @@ impl Instance {
         drop(lifecycle_lock);
         drop(title_lock);
         let hook_result = self.run_pre_launch_hooks(skip_on_launch, &profile);
+        heartbeat.stop();
         let (_title_lock, _lifecycle_lock) =
             self.reacquire_launch_locks_after_hooks(&storage, hook_result)?;
         self.reconcile_sidecar_into_disk();
@@ -186,8 +195,9 @@ impl Instance {
         let expected = self.apply_fresh_launch_intent();
 
         let result = (|| {
-            let prepared = self.stop_carry_and_prepare(restart, conversation_carry, expected)?;
-            let launch_outcome = self.spawn_prepared_launch(size, &profile, prepared)?;
+            let prepared =
+                self.stop_carry_and_prepare(&storage, restart, conversation_carry, expected)?;
+            let launch_outcome = self.spawn_prepared_launch(size, &profile, &storage, prepared)?;
             let outcome =
                 self.finish_resume_launch(launch_outcome, skipped_failed_resume_sid, &profile)?;
             self.commit_lifecycle_launch(&storage, restart)?;
@@ -214,6 +224,7 @@ impl Instance {
     /// (#3399).
     fn stop_carry_and_prepare(
         &mut self,
+        storage: &crate::session::storage::Storage,
         restart: bool,
         conversation_carry: Option<ConversationCarry>,
         expected: ConversationState,
@@ -224,7 +235,7 @@ impl Instance {
             None
         };
         if restart {
-            self.kill_clean_locked()?;
+            self.kill_clean_locked(storage)?;
         }
         if let Some(carry) = conversation_carry {
             self.absorb_published_prime_session(publication);
@@ -407,7 +418,8 @@ impl Instance {
                 self.id,
             );
         }
-        let killed = self.kill_clean_locked();
+        let storage = crate::session::storage::Storage::open(profile, self.resolve_file_watch())?;
+        let killed = self.kill_clean_locked(&storage);
         // Only the sid is kept for the retry; the reservation still fences
         // a replacement from the sweep.
         self.release_scope();
@@ -536,6 +548,7 @@ mod tests {
         let profile = crate::session::config::effective_profile("");
         let _registry = crate::tmux::status_rules::ProfileRegistryGuard::take(&profile);
         crate::session::config::profile_config::resolve_config_or_warn(&profile);
+        let storage = crate::session::storage::Storage::new_unwatched(&profile).unwrap();
 
         let project = home.join("project");
         std::fs::create_dir_all(&project).expect("project");
@@ -566,7 +579,7 @@ mod tests {
         inst.swap_account("claude-2");
         let expected = inst.conversation_state();
         let prepared = inst
-            .stop_carry_and_prepare(false, Some(carry), expected)
+            .stop_carry_and_prepare(&storage, false, Some(carry), expected)
             .expect("prepare");
 
         assert!(

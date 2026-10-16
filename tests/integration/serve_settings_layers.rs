@@ -50,6 +50,7 @@ fn profile_default_tool(profile: &str) -> Option<Value> {
 #[serial_test::serial]
 async fn settings_read_and_save_agree_on_the_layer() {
     let _home = crate::common::setup_temp_home();
+    session::create_profile("test").unwrap();
     let app = build_router_for_test(build_test_app_state(Vec::new()));
     let (_, about) = call(&app, "GET", "/api/about", None).await;
     let served = about["profile"]

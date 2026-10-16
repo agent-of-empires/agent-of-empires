@@ -133,6 +133,9 @@ pub(crate) async fn spawn_structured_session(
             fork_seed,
             progress,
         } = spec;
+        let storage = Storage::open(&profile, file_watch_for_create.clone())?;
+        let profile_incarnation = storage.pin_incarnation()?;
+
 
         let config = Config::load_or_warn();
         let sandbox_image = sandbox_image.unwrap_or_else(|| {
@@ -346,13 +349,11 @@ pub(crate) async fn spawn_structured_session(
         }
 
         // Anything that fails between here and the final `Ok(..)` would otherwise orphan
-        // the scratch directory `build_instance` already provisioned (Storage::new,
-        // storage.update, instance.start). Wrap the tail in an IIFE-equivalent closure so
-        // we can run cleanup on Err once, regardless of which step tripped.
+        // the scratch directory `build_instance` already provisioned. Wrap the tail in an
+        // IIFE-equivalent closure so cleanup runs once for every failure.
         let mut persist_and_start = || -> anyhow::Result<()> {
-            let storage = Storage::new(&profile, file_watch_for_create.clone())?;
             let to_persist = instance.clone();
-            storage.update(|all, _groups| {
+            storage.update_pinned(&profile_incarnation, |all, _groups| {
                 all.push(to_persist);
                 Ok(())
             })?;

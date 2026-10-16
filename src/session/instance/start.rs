@@ -108,7 +108,7 @@ impl Instance {
             return Ok(LaunchSidOutcome::Skipped);
         }
         let profile = self.effective_profile();
-        let storage = crate::session::storage::Storage::new(&profile, self.resolve_file_watch())
+        let storage = crate::session::storage::Storage::open(&profile, self.resolve_file_watch())
             .context("failed to open lifecycle lock storage")?;
 
         let title_lock = crate::session::storage::acquire_session_title_lock(&self.id)
@@ -135,12 +135,21 @@ impl Instance {
             LifecycleOperation::Launch,
             Some(Status::Starting),
         )?;
+        let heartbeat = match self.start_reservation_heartbeat(&storage, LifecycleOperation::Launch)
+        {
+            Ok(heartbeat) => heartbeat,
+            Err(error) => {
+                self.fail_reserved_launch(&storage, &error, false);
+                return Err(error);
+            }
+        };
 
         // The durable reservation excludes peer launches while user hooks run. Both flocks must be
         // absent because a hook may invoke aoe for this same session.
         drop(lifecycle_lock);
         drop(title_lock);
         let hook_result = self.run_pre_launch_hooks(skip_on_launch, &profile);
+        heartbeat.stop();
         let (_title_lock, _lifecycle_lock) =
             self.reacquire_launch_locks_after_hooks(&storage, hook_result)?;
         self.reconcile_sidecar_into_disk();
@@ -156,11 +165,11 @@ impl Instance {
         let result = (|| {
             if corpse_pane {
                 let publication = self.prime_root_publication(true);
-                self.kill_clean_locked()?;
+                self.kill_clean_locked(&storage)?;
                 prepared =
                     self.refresh_prepared_prime_launch_after_pane_stop(prepared, publication)?;
             }
-            let outcome = self.spawn_prepared_launch(size, &profile, prepared)?;
+            let outcome = self.spawn_prepared_launch(size, &profile, &storage, prepared)?;
             self.commit_lifecycle_launch(&storage, false)?;
             Ok(outcome)
         })();
@@ -210,10 +219,89 @@ impl Instance {
         )
     }
 
+    fn prepare_prime_runtime_for_launch(
+        &mut self,
+        storage: &crate::session::storage::Storage,
+        prepared: &mut PreparedLaunch,
+    ) -> Result<()> {
+        let Some(execution) = prepared.execution.as_ref() else {
+            return Ok(());
+        };
+        let runtime = match execution.capture.as_ref() {
+            Some(CaptureContext::Prime {
+                runtime: Some(runtime),
+                ..
+            })
+            | Some(CaptureContext::PrimeStatus(runtime)) => runtime.clone(),
+            _ => return Ok(()),
+        };
+        let active = ActiveExecution {
+            launch_id: execution.inputs.launch_id.clone(),
+            binding: execution.binding.clone(),
+            capture: execution.capture.clone(),
+            container: execution.inputs.container.clone(),
+        };
+        let previous = storage
+            .load()?
+            .into_iter()
+            .find(|stored| stored.id == self.id)
+            .context("session disappeared before Prime preparation")?;
+        if previous
+            .prime_runtime()
+            .is_some_and(|prior| prior.directory != runtime.directory)
+        {
+            self.kill_clean_locked(storage)
+                .context("settling previous terminal Prime ownership")?;
+            self.release_scope();
+        }
+
+        runtime
+            .prepare()
+            .context("preparing durable terminal Prime ownership")?;
+        let generation = self.lifecycle_generation;
+        let persisted = storage.update(|instances, _groups| {
+            let Some(stored) = instances.iter_mut().find(|stored| stored.id == self.id) else {
+                return Ok(None);
+            };
+            if !stored.lifecycle_reservation_is_owned(LifecycleOperation::Launch, generation) {
+                return Ok(None);
+            }
+            stored.active_execution = Some(active.clone());
+            Ok(Some(stored.conversation_state()))
+        });
+        let persistence_error = match persisted {
+            Ok(Some(expected)) => {
+                prepared.expected_conversation = expected;
+                None
+            }
+            Ok(None) => Some(anyhow::anyhow!(
+                "session {} disappeared or lost its lifecycle reservation before Prime preparation",
+                self.id
+            )),
+            Err(error) => Some(error.context("persisting prepared terminal Prime ownership")),
+        };
+        if let Some(error) = persistence_error {
+            return match runtime.rollback_prepared() {
+                Ok(()) => Err(error),
+                Err(rollback) => {
+                    Err(error.context(format!("Prime preparation rollback failed: {rollback:#}")))
+                }
+            };
+        }
+
+        self.active_execution = Some(active);
+        prepared.launch_env.pane.push(tmux::PaneEnvMutation::set(
+            crate::process::prime::PREPARED_RUNTIME_ENV.to_string(),
+            "1".to_string(),
+        ));
+        Ok(())
+    }
+
     pub(super) fn spawn_prepared_launch(
         &mut self,
         size: Option<(u16, u16)>,
         profile: &str,
+        storage: &crate::session::storage::Storage,
         mut prepared: PreparedLaunch,
     ) -> Result<LaunchSidOutcome> {
         let session = self.tmux_session()?;
@@ -223,6 +311,7 @@ impl Instance {
                 self.id
             );
         }
+        self.prepare_prime_runtime_for_launch(storage, &mut prepared)?;
 
         // A takeover can replace the pane without changing the agent or the execution, and a poller
         // for either would then be watching the pane this launch is replacing.
@@ -652,6 +741,134 @@ fn attested_default_store(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    #[serial_test::serial]
+    fn terminal_prime_route_is_durable_before_spawn() {
+        let root = tempfile::tempdir().unwrap();
+        let _app = crate::session::test_support::isolate_app_dir_at(root.path());
+        let profile = "terminal-prime-preparation";
+        let project = root.path().join("project");
+        std::fs::create_dir(&project).unwrap();
+        let mut instance = Instance::new("Prime", project.to_str().unwrap());
+        instance.source_profile = profile.into();
+        instance.tool = "prime-agent".into();
+        let storage = crate::session::storage::Storage::new_unwatched(profile).unwrap();
+        storage
+            .update(|instances, _groups| {
+                instances.push(instance.clone());
+                Ok(())
+            })
+            .unwrap();
+        instance
+            .acquire_lifecycle_reservation(
+                &storage,
+                LifecycleOperation::Launch,
+                Some(Status::Starting),
+            )
+            .unwrap();
+        let previous =
+            crate::process::prime::PrimeRuntime::new("/bin/false".into(), root.path().into(), None)
+                .unwrap();
+        previous.prepare().unwrap();
+        storage
+            .update(|instances, _groups| {
+                instances[0].active_execution = Some(ActiveExecution {
+                    launch_id: "previous".into(),
+                    binding: ExecutionBinding {
+                        agent: "prime-agent".into(),
+                        stores: Vec::new(),
+                        configuration: Vec::new(),
+                        cwd: root.path().into(),
+                        cwd_filesystem: "host".into(),
+                        filesystem: "host".into(),
+                        exported_default_store: None,
+                    },
+                    capture: Some(CaptureContext::PrimeStatus(previous.clone())),
+                    container: None,
+                });
+                Ok(())
+            })
+            .unwrap();
+
+        let runtime =
+            crate::process::prime::PrimeRuntime::new("/bin/false".into(), root.path().into(), None)
+                .unwrap();
+        let binding = ExecutionBinding {
+            agent: "prime-agent".into(),
+            stores: vec![root.path().into()],
+            configuration: Vec::new(),
+            cwd: project.clone(),
+            cwd_filesystem: "host".into(),
+            filesystem: "host".into(),
+            exported_default_store: None,
+        };
+        let execution = super::super::execution::NativeExecution {
+            agent: crate::agents::get_agent("prime-agent").unwrap(),
+            binding: binding.clone(),
+            routing: Vec::new(),
+            case_insensitive_routing: &[],
+            omp: None,
+            inputs: super::super::execution::NativeLaunchInputs {
+                launch_id: "terminal-prime-launch".into(),
+                environment: std::collections::HashMap::new(),
+                raw_environment: Vec::new(),
+                cwd: project,
+                profile: profile.into(),
+                container: None,
+                docker_env: None,
+                pane_env: Vec::new(),
+                identity_extension: None,
+            },
+            program: "/bin/false".into(),
+            capture: Some(CaptureContext::PrimeStatus(runtime.clone())),
+            pi_transcript_path: None,
+            namespace_arguments: Vec::new(),
+            target_session_id: None,
+            resolved_target_session_id: None,
+            pi_pinnable: false,
+            opencode_preassign: false,
+            opencode_schema: None,
+            store_override: None,
+        };
+        let mut prepared = PreparedLaunch {
+            command: None,
+            is_existing: false,
+            omp_capture_plan: None,
+            fork_mints_child: false,
+            launch_env: super::super::launch_command::LaunchEnvironment::default(),
+            expected_conversation: instance.conversation_state(),
+            sandbox_context_reset: None,
+            canonical_conversation: None,
+            expected_prior_omp_generation: None,
+            execution: Some(execution),
+            require_conversation_publication: false,
+        };
+
+        instance
+            .prepare_prime_runtime_for_launch(&storage, &mut prepared)
+            .unwrap();
+        assert!(
+            !previous.directory.exists(),
+            "the previous native route must settle before replacement"
+        );
+
+        let persisted = storage.load().unwrap().remove(0);
+        assert_eq!(
+            persisted.prime_runtime().unwrap().directory,
+            runtime.directory
+        );
+        assert!(
+            prepared.expected_conversation.matches(&persisted),
+            "final launch publication must compare against the prepared ownership row"
+        );
+        assert!(runtime.directory.exists());
+        assert!(prepared.launch_env.pane.iter().any(|mutation| matches!(
+            mutation,
+            crate::tmux::PaneEnvMutation::Set { key, value }
+                if key == crate::process::prime::PREPARED_RUNTIME_ENV && value == "1"
+        )));
+        runtime.rollback_prepared().unwrap();
+    }
 
     #[cfg(unix)]
     fn frozen_test_helper(
@@ -664,6 +881,144 @@ mod tests {
         std::fs::write(&helper, format!("#!/bin/sh\nAOE_FROZEN_NATIVE_TEST_CHILD=1 exec {} --exact {} --nocapture --test-threads=1\n", crate::session::environment::shell_escape(std::env::current_exe().unwrap().to_str().unwrap()), crate::session::environment::shell_escape(&format!("{module}::{entry}")))).unwrap();
         std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o700)).unwrap();
         crate::process::test_support::NativeLaunchExecutable::install(helper)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[serial_test::serial]
+    fn pending_native_capture_cannot_supersede_committed_purge() {
+        if std::env::var_os("AOE_FROZEN_NATIVE_TEST_CHILD").is_some() {
+            crate::process::exec_frozen_environment().unwrap();
+            return;
+        }
+        crate::tmux::test_helpers::require_tmux!();
+        use crate::session::deletion::{DeletionRequest, PurgeReservation, PurgeTransaction};
+        use crate::session::instance::test_helpers::{seed_disk_for_sidecar_test, tool_instance};
+        use crate::session::{LifecycleOperation, Storage};
+
+        let (_hooks, _base, directory) = crate::hooks::test_support::BaseGuard::ready();
+        let _home = crate::session::test_support::isolate_app_dir_at(directory.path());
+        crate::session::config::update_app_state(|state| {
+            state.has_acknowledged_agent_hooks = true;
+        })
+        .unwrap();
+        let project = directory.path().join("project");
+        std::fs::create_dir(&project).unwrap();
+        let project = std::fs::canonicalize(project).unwrap();
+        let _path = crate::session::test_support::install_login_shell_path_command(
+            directory.path(),
+            "claude",
+            "#!/bin/sh\ncase \"$1\" in\n--version) printf '2.0.0\\n'; exit 0;;\n--help) printf '%s\\n' '--session-id --resume'; exit 0;;\nesac\nread -r release\n",
+        );
+        let _helper = frozen_test_helper(
+            directory.path(),
+            "pending_native_capture_cannot_supersede_committed_purge",
+        );
+        let profile = "pending-capture-purge";
+        let mut peer = tool_instance("claude", project.to_str().unwrap());
+        peer.source_profile = profile.into();
+        peer.view = crate::session::View::Terminal;
+        seed_disk_for_sidecar_test(profile, &peer);
+        let session = peer.tmux_session().unwrap();
+        let _pane = crate::tmux::test_helpers::TmuxTestSession::from_name(session.name());
+        peer.start().unwrap();
+        assert!(peer.session_id_poller_is_running());
+        let sid = uuid::Uuid::new_v4().to_string();
+        crate::hooks::write_session_id_via_guard(
+            &peer.id,
+            &sid,
+            Some(&peer.active_execution.as_ref().unwrap().launch_id),
+        )
+        .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !crate::session::sync::pending_poller_observation_matches(&peer, |observation| {
+            observation.sid == sid && observation.execution == peer.active_execution
+        }) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "real native poller did not observe the guarded Codex hook publication"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+
+        let storage = Storage::open_unwatched(profile).unwrap();
+        let producer = storage
+            .load()
+            .unwrap()
+            .into_iter()
+            .find(|row| row.id == peer.id)
+            .unwrap();
+        let connection = rusqlite::Connection::open(
+            crate::session::get_app_dir().unwrap().join("acp_events.db"),
+        )
+        .unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE acp_events (unexpected TEXT);
+                 CREATE TABLE acp_attachments (unexpected TEXT);",
+            )
+            .unwrap();
+        drop(connection);
+        let transaction = match PurgeTransaction::reserve_with_acp_transcript(
+            storage.clone(),
+            DeletionRequest {
+                session_id: peer.id.clone(),
+                instance: producer,
+                delete_worktree: false,
+                delete_branch: false,
+                delete_sandbox: false,
+                force_delete: false,
+                detach_hooks: true,
+                keep_scratch: true,
+            },
+        )
+        .unwrap()
+        {
+            PurgeReservation::Reserved(transaction) => transaction,
+            PurgeReservation::Rejected(result) => panic!("unexpected rejection: {result:?}"),
+        };
+        let result = transaction
+            .run_hooks()
+            .begin_irreversible()
+            .unwrap()
+            .finish();
+        assert!(!result.success);
+        assert!(result.teardown_started);
+        let generation = storage
+            .update(|rows, _| {
+                let row = rows.iter_mut().find(|row| row.id == peer.id).unwrap();
+                assert_eq!(row.status, Status::Deleting);
+                let generation = row.lifecycle_generation;
+                assert!(row.lifecycle_reservation_is_owned(LifecycleOperation::Purge, generation));
+                row.lifecycle_reservation.as_mut().unwrap().at =
+                    chrono::Utc::now() - chrono::Duration::days(1);
+                Ok(generation)
+            })
+            .unwrap();
+        let journal = crate::session::lifecycle_journal::path_for(
+            storage.sessions_path(),
+            &peer.id,
+            generation,
+        );
+        let journal_before = std::fs::read(&journal).unwrap();
+
+        crate::session::sync::drain_and_persist_session_ids(
+            std::slice::from_mut(&mut peer),
+            &crate::file_watch::FileWatchService::noop(),
+        );
+        let stored = storage
+            .load()
+            .unwrap()
+            .into_iter()
+            .find(|row| row.id == peer.id)
+            .unwrap();
+        assert!(
+            stored.lifecycle_reservation_is_owned(LifecycleOperation::Purge, generation),
+            "background capture changed committed purge authority: {stored:?}"
+        );
+        assert_eq!(stored.status, Status::Deleting);
+        assert_eq!(std::fs::read(journal).unwrap(), journal_before);
+        peer.stop_poller();
     }
 
     #[cfg(unix)]
@@ -1009,11 +1364,10 @@ else:
         assert_eq!(outcome, LaunchSidOutcome::Skipped);
     }
 
-    /// #4116: every launch funnel rereads the row and refuses an archived or
-    /// trashed session, even when the caller holds a stale live copy.
+    /// Every launch funnel rereads durable lifecycle state before deciding.
     #[test]
     #[serial_test::serial]
-    fn launch_funnels_refuse_archived_and_trashed_sessions() {
+    fn launch_funnels_refuse_durable_start_blocks() {
         type Launch = fn(&mut Instance) -> Option<StartBlocked>;
         let launches: &[(&str, Launch)] = &[
             ("start", |i| i.start().err()?.downcast_ref().copied()),
@@ -1038,6 +1392,11 @@ else:
                 Instance::trash,
                 StartBlocked::Trashed,
                 "session is in trash; restore it first",
+            ),
+            (
+                |instance| instance.terminal_handoff_pending = true,
+                StartBlocked::HandoffPending,
+                "terminal handoff is still settling; retry shortly",
             ),
         ];
         for (shelve, want, message) in shelves {

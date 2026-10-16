@@ -331,6 +331,10 @@ pub struct Instance {
     pub sort_index: Option<u32>,
     #[serde(default, skip_serializing_if = "View::is_terminal")]
     pub view: View,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub(crate) terminal_handoff_pending: bool,
+    #[serde(skip)]
+    pub(crate) terminal_handoff_completion: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_name: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

@@ -53,6 +53,15 @@ fn record_and_check_respawn_budget(
     false
 }
 
+fn refund_respawn_attempt(history: &mut HashMap<String, Vec<Instant>>, id: &str) {
+    if let Some(entries) = history.get_mut(id) {
+        entries.pop();
+        if entries.is_empty() {
+            history.remove(id);
+        }
+    }
+}
+
 /// Clean slate for `id`: re-armed, un-parked, budget and capacity marker reset.
 fn forget_session_budget(
     id: &str,
@@ -90,6 +99,8 @@ enum ResumeOutcome {
     /// Spawn finished with or without error; `attempted` stays set so a
     /// permanently failing spawn does not loop.
     SpawnFinished,
+    /// A lifecycle fence is transient. Retry after the purge either commits or rolls back.
+    PurgeDeferred,
     /// `CapacityFull` is transient, not a crash: re-arm and publish the banner
     /// once. `message` is its Display, matched by the front-end regex (#1027).
     CapacityDeferred {
@@ -113,9 +124,12 @@ fn due(last: &mut Option<Instant>, interval: Duration) -> bool {
     true
 }
 
-/// Structured and not archived, snoozed or trashed.
 fn is_untriaged_structured(i: &Instance) -> bool {
-    i.is_structured() && !i.is_archived() && !i.is_snoozed() && !i.is_trashed()
+    i.is_structured()
+        && i.status != crate::session::Status::Deleting
+        && !i.is_archived()
+        && !i.is_snoozed()
+        && !i.is_trashed()
 }
 
 /// Eligible for a reconciler-driven worker.
@@ -345,18 +359,17 @@ pub async fn reconcile_acp_workers(
             }
             Ok((id, ResumeOutcome::CapacityDeferred { message })) => {
                 // Refund only this tick's budget entry so prior crash history survives.
-                if let Some(entries) = respawn_history.get_mut(&id) {
-                    entries.pop();
-                    if entries.is_empty() {
-                        respawn_history.remove(&id);
-                    }
-                }
+                refund_respawn_attempt(respawn_history, &id);
                 // Never pin: `attempted` would skip the session forever.
                 attempted.remove(&id);
                 // `publish_startup_error` does not dedup, so publish once per transition.
                 if capacity_deferred.insert(id.clone()) {
                     supervisor.publish_startup_error(&id, message);
                 }
+            }
+            Ok((id, ResumeOutcome::PurgeDeferred)) => {
+                refund_respawn_attempt(respawn_history, &id);
+                attempted.remove(&id);
             }
             Ok((id, ResumeOutcome::Attached | ResumeOutcome::SpawnFinished)) => {
                 capacity_deferred.remove(&id);
@@ -433,6 +446,9 @@ async fn readopt_orphan_runners(state: &Arc<AppState>, attempted: &mut HashSet<S
         if state.acp_supervisor.is_owned(id).await {
             continue;
         }
+        if crate::process::worker_registry::is_purge_fenced(id).unwrap_or(true) {
+            continue;
+        }
         if matches!(
             crate::process::worker_registry::load(id),
             Ok(Some(record)) if crate::process::worker_registry::is_record_live(&record)
@@ -460,41 +476,89 @@ impl Drop for OrphanCleanupClaim {
     }
 }
 
-/// Reaps registry entries whose session no longer exists.
+/// Reaps registry entries that no resumable or supervisor-owned session can use.
 async fn sweep_orphan_workers(state: &Arc<AppState>, live: &HashSet<&String>) {
-    let Ok(records) = crate::process::worker_registry::list() else {
-        return;
+    use crate::process::worker_registry;
+    #[cfg(unix)]
+    let records = worker_registry::list_for_reaping();
+    #[cfg(not(unix))]
+    let records = worker_registry::list();
+    let records = match records {
+        Ok(records) => records,
+        Err(error) => {
+            tracing::warn!(target: "acp.supervisor", error = %error, "cannot enumerate orphan workers");
+            return;
+        }
     };
     for record in records {
+        #[cfg(unix)]
+        let reclaimable = {
+            let reclaimable = match worker_registry::orphan_tracking_state(&record) {
+                Ok(worker_registry::OrphanTracking::Reclaimed) => continue,
+                Ok(
+                    worker_registry::OrphanTracking::Untracked
+                    | worker_registry::OrphanTracking::Pending,
+                ) => false,
+                Ok(worker_registry::OrphanTracking::Reclaimable) => true,
+                Err(error) => {
+                    tracing::warn!(target: "acp.supervisor", session = %record.session_id, error = %error, "cannot inspect orphan tracking");
+                    continue;
+                }
+            };
+            if !reclaimable
+                && (live.contains(&record.session_id)
+                    || state.acp_supervisor.is_owned(&record.session_id).await)
+            {
+                continue;
+            }
+            reclaimable
+        };
+        #[cfg(not(unix))]
         if live.contains(&record.session_id)
             || state.acp_supervisor.is_owned(&record.session_id).await
         {
             continue;
         }
-        let identity = (record.session_id.clone(), record.pid, record.generation);
-        if !state
-            .acp_orphan_cleanups
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .insert(identity.clone())
+        tracing::info!(target: "acp.supervisor", session = %record.session_id, pid = record.pid, "sweeping orphan worker (no matching session on disk)");
+        #[cfg(unix)]
         {
-            continue;
-        }
-        let claim = Arc::new(OrphanCleanupClaim {
-            state: Arc::clone(state),
-            identity,
-        });
-        tracing::info!(target: "acp.supervisor", session = %record.session_id, pid = record.pid,
-            "orphan acp worker; settling owned native runtime");
-        tokio::spawn(async move {
-            let session_id = record.session_id.clone();
-            if let Err(error) =
-                crate::process::worker_registry::terminate_record_and_wait(record, claim).await
+            let identity = (record.session_id.clone(), record.pid, record.generation);
+            if !state
+                .acp_orphan_cleanups
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .insert(identity.clone())
             {
-                tracing::warn!(target: "acp.supervisor", session = %session_id, %error,
-                    "orphan native cleanup unproven; retaining registry route");
+                continue;
             }
-        });
+            let claim = OrphanCleanupClaim {
+                state: state.clone(),
+                identity,
+            };
+            tokio::spawn(async move {
+                let _claim = claim;
+                let session_id = record.session_id.clone();
+                let pid = record.pid;
+                let cleanup = async move {
+                    if reclaimable {
+                        tokio::task::spawn_blocking(move || {
+                            worker_registry::cleanup_dead_orphan_tracking(&record)
+                        })
+                        .await??;
+                        Ok(())
+                    } else {
+                        worker_registry::terminate_orphan_and_confirm_stopped(&record)
+                            .await
+                            .map(|_| ())
+                    }
+                };
+                if let Err(error) = cleanup.await {
+                    tracing::warn!(target: "acp.supervisor", session = %session_id, pid, error = %error, "orphan runner exit could not be confirmed; retaining stop evidence");
+                }
+            });
+        }
+        #[cfg(not(unix))]
+        worker_registry::delete(&record.session_id).ok();
     }
 }
 
@@ -529,6 +593,7 @@ mod tests {
                 crate::process::prime::PrimeRuntime::new(program, project.path().into(), None)
                     .unwrap();
             native.prepare().unwrap();
+            native.adopt_prepared().unwrap();
             struct RuntimeDirectory(std::path::PathBuf);
             impl Drop for RuntimeDirectory {
                 fn drop(&mut self) {
@@ -626,6 +691,78 @@ mod tests {
                 .unwrap()
                 .contains(&identity));
         });
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn pending_orphan_cleanup_retries_for_a_nonresumable_row() {
+        use std::os::unix::process::CommandExt as _;
+
+        let id = "pending-archived-orphan";
+        let (_home, state, project) = test_state(id);
+        state.instances.write().await[0].archived_at = Some(chrono::Utc::now());
+        let socket = crate::process::worker_registry::socket_path_for(id).unwrap();
+        let control = crate::process::worker::control_socket_sibling(&socket);
+        let marker = project.path().join("orphan-term-marker");
+        let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+        command
+            .args([
+                "--exact",
+                "process::worker_registry::tests::control_socket_runner_helper",
+                "--nocapture",
+            ])
+            .env("AOE_TEST_CONTROL_RUNNER_SOCKET", &control)
+            .env("AOE_TEST_CONTROL_RUNNER_MARKER", &marker)
+            .process_group(0);
+        let mut child = command.spawn().unwrap();
+        let ready_deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        while !control.exists() && tokio::time::Instant::now() < ready_deadline {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        if !control.exists() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        assert!(control.exists(), "control runner did not become ready");
+        let record = crate::process::worker_registry::WorkerRecord::new(
+            id.to_string(),
+            child.id(),
+            socket,
+            "claude-agent-acp".to_string(),
+            "claude-code".to_string(),
+            project.path().to_path_buf(),
+            None,
+            vec![],
+            vec![],
+            None,
+            None,
+        );
+        crate::process::worker_registry::save(&record).unwrap();
+        crate::process::worker_registry::mark_orphan_pending_for_test(&record).unwrap();
+
+        sweep_orphan_workers(&state, &HashSet::new()).await;
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        let stopped = loop {
+            let exited = child.try_wait().unwrap().is_some();
+            let retired = crate::process::worker_registry::load(id).unwrap().is_none();
+            if exited && retired {
+                break true;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                break false;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        };
+        if !stopped {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        assert!(
+            stopped,
+            "pending cleanup was not retried for the archived session"
+        );
     }
 
     #[test]
@@ -737,6 +874,30 @@ mod tests {
         }
         assert_eq!(tick.respawn_history.get("s-cap").map(Vec::len), Some(2));
         assert_eq!(capacity_startup_errors(&state, "s-cap"), 1);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn purge_fence_deferral_rearms_without_spending_respawn_budget() {
+        let id = "s-purge-deferred";
+        let (_home, state, _project) = test_state(id);
+        let mut tick = Tick::default();
+        let now = Instant::now();
+        tick.respawn_history.insert(id.to_string(), vec![now, now]);
+        crate::process::worker_registry::fence_for_purge(id, &state.profile, 1).unwrap();
+
+        tick.run(&state).await;
+
+        assert!(!tick.attempted.contains(id));
+        assert_eq!(tick.respawn_history.get(id).map(Vec::len), Some(2));
+        assert!(state.acp_event_store.replay_from(id, 0).is_empty());
+
+        crate::process::worker_registry::clear_purge_fence_if_owned(id, &state.profile, 1).unwrap();
+        tick.run(&state).await;
+
+        assert!(tick.attempted.contains(id));
+        assert_eq!(tick.respawn_history.get(id).map(Vec::len), Some(3));
+        assert_eq!(state.acp_event_store.replay_from(id, 0).len(), 1);
     }
 
     /// The capacity marker clears both when a slot frees (the SpawnFinished

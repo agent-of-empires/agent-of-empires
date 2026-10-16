@@ -26,7 +26,31 @@ Invariants worth knowing before touching this code:
 
 `session/delete` fires only on permanent removal (a purge, or disabling the structured view, which discards the conversation). Reversible teardown (`aoe acp stop`, snooze, archive, trash, idle auto-stop) deliberately does not fire it, so the transcript stays on disk and the next respawn resumes through `session/load`.
 
-Trash is the reversible middle state: a delete moves the session there by default (`session.delete_to_trash`), keeping its transcript, worktree, branch, and container until it is restored, purged, or auto-purged after `session.trash_retention_minutes`. Retention is enforced by the daemon (a startup sweep, then one every tenth of the shortest window, between a minute and an hour), so without one, expired trash waits for the next daemon start or a manual purge. When the daemon permanently deletes a structured session it sends a best-effort `session/delete` (2s timeout) so adapters that implement it can release their own state, then proceeds with cancel, SIGTERM, and on-disk cleanup. CLI purges have no running worker, so they delete the local transcript only.
+Trash is the reversible middle state: a delete moves the session there by default (`session.delete_to_trash`), keeping its transcript, worktree, branch, and container until it is restored, purged, or auto-purged after `session.trash_retention_minutes`. Retention is enforced by the daemon (a startup sweep, then one every tenth of the shortest window, between a minute and an hour), so without one, expired trash waits for the next daemon start or a manual purge. When the daemon permanently deletes a structured session it sends a best-effort `session/delete` (2s timeout) so adapters that implement it can release their own state, then proceeds with cancel, SIGTERM, and on-disk cleanup. CLI purges stop any registered detached runner before deleting its local transcript.
+
+Permanent purge records intent before destruction. Once `TeardownStarted` is durable,
+errors retain the `Deleting` row, exact lifecycle generation, journal and runner fence
+until recovery can prove owned process and native-runtime settlement. Expired leases
+alone never authorize a replacement launch, capture or destructive recovery. Restore
+may abandon only an expired, owner-free pre-teardown purge with matching durable evidence.
+
+Runner admission preserves an existing owner. Signals require incarnation-bound ownership;
+unknown ownership or unreadable membership preserves evidence and resources. A pending
+structured-to-terminal handoff blocks ordinary launch/input until settlement and completion.
+
+Profile rename/delete serialize with affected lifecycle owners. Readable unresolved
+transitions fence their endpoints and affected sessions; unreadable authority fails closed.
+If recovery reports ambiguous directory identity, preserve the checkpoint and directories,
+restore the verified original directory layout from your backup, then retry the profile
+operation. Do not delete the checkpoint to bypass ownership checks.
+Admitted-profile operations never recreate a missing profile.
+
+`Kept` checkpoints have no age expiry. Each recognized scratch, workspace or agent-store
+resource must be proven absent beneath an independently admitted namespace before its
+checkpoint is consumed. Ambient aliases above that namespace are allowed; symlinks or
+unreadable components beneath it retain the checkpoint. Unknown namespaces, descriptors,
+I/O errors and ambiguous siblings retain it. Force Remove abandons
+matching destructive intent before dropping only the row, preserving promised resources.
 
 ## Who owns the state
 

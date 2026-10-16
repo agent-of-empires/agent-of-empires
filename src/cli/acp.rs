@@ -842,8 +842,10 @@ fn recover(session: &str, confirm_prime_stopped: bool, confirm_worker_stopped: b
         confirm_prime_stopped,
         "external Prime shutdown must be confirmed"
     );
-    let record = crate::process::worker_registry::load(session)?
-        .ok_or_else(|| anyhow::anyhow!("No agent worker registry entry for session {session}"))?;
+    let record =
+        crate::process::worker_registry::load_recovery_candidate(session)?.ok_or_else(|| {
+            anyhow::anyhow!("No agent worker ownership evidence for session {session}")
+        })?;
     crate::process::worker_registry::recover_untracked_prime(&record)?;
     println!(
         "Retired untracked Prime record for {} (PID {}, generation {}) on operator confirmation; AoE did not verify native shutdown.",

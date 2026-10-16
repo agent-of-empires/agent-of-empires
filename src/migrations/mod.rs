@@ -47,6 +47,8 @@ mod v037_trash_lifecycle_id;
 mod v038_prime_native_runtime;
 mod v039_prime_control_path;
 mod v040_worker_ownership;
+mod v041_kernel_process_identity;
+mod v042_lifecycle_cutover;
 
 /// Fixtures shared by the migrations that rewrite agent hook files.
 #[cfg(test)]
@@ -92,7 +94,7 @@ use anyhow::Result;
 use std::fs;
 use tracing::{debug, info};
 
-const CURRENT_VERSION: u32 = 40;
+const CURRENT_VERSION: u32 = 42;
 const VERSION_FILE: &str = ".schema_version";
 
 /// Version, log name, and the one-time transformation to run.
@@ -231,6 +233,12 @@ const MIGRATIONS: &[Migration] = &[
     (38, "prime_native_runtime", v038_prime_native_runtime::run),
     (39, "prime_control_path", v039_prime_control_path::run),
     (40, "worker_ownership", v040_worker_ownership::run),
+    (
+        41,
+        "kernel_process_identity",
+        v041_kernel_process_identity::run,
+    ),
+    (42, "lifecycle_cutover", v042_lifecycle_cutover::run),
 ];
 
 /// The data-schema version this build targets, i.e. the version every install
@@ -393,6 +401,38 @@ mod tests {
         let error = run_migrations().unwrap_err().to_string();
 
         assert!(error.contains("refusing to downgrade"));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn author_schema_41_runs_the_lifecycle_identity_cutover() {
+        for previous_version in [41, 40] {
+            let temp = tempfile::tempdir().unwrap();
+            let _guard = crate::session::test_support::isolate_app_dir_at(temp.path());
+            let app = crate::session::get_app_dir().unwrap();
+            let workers = crate::process::worker_registry::workers_dir().unwrap();
+            fs::write(app.join(VERSION_FILE), previous_version.to_string()).unwrap();
+            let path = workers.join("legacy.json");
+            fs::write(
+                &path,
+                br#"{"pid":42,"process_identity":null,"runner_identity":{"boot_id":"boot","start_id":"audit:0000000100000002"},"extension":{"keep":true}}"#,
+            )
+            .unwrap();
+
+            run_migrations().unwrap();
+
+            let bytes = fs::read(&path).unwrap();
+            let migrated: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            assert!(
+                migrated["runner_identity"].is_null(),
+                "schema {previous_version} retained obsolete audit ownership"
+            );
+            assert!(migrated.get("process_identity").is_none());
+            assert_eq!(migrated["extension"], serde_json::json!({"keep": true}));
+            assert!(get_current_version() > 41);
+            run_migrations().unwrap();
+            assert_eq!(fs::read(path).unwrap(), bytes);
+        }
     }
 
     /// Upgrading preserves the sort order, and a second run leaves state untouched.

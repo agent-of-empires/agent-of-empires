@@ -27,6 +27,7 @@ pub(super) struct ResumeTarget {
     stored_acp_session_id: Option<String>,
     source_profile: String,
     pub(super) in_flight_turn: bool,
+    lifecycle_generation: u64,
     yolo_mode: bool,
     /// The resolved launch command, honored like tmux does (#1766).
     command: String,
@@ -42,6 +43,7 @@ impl ResumeTarget {
             stored_acp_session_id: inst.acp_session_id.clone(),
             source_profile: inst.source_profile.clone(),
             in_flight_turn: false,
+            lifecycle_generation: inst.lifecycle_generation,
             yolo_mode: inst.yolo_mode,
             command: inst.command.clone(),
         }
@@ -134,16 +136,54 @@ async fn admit(
         Err(e @ SupervisorError::CapacityFull { .. }) => Err(ResumeOutcome::CapacityDeferred {
             message: e.to_string(),
         }),
+        Err(e) if worker_registry::is_purge_fenced(id).unwrap_or(true) => {
+            tracing::debug!(target: "acp.supervisor", session = %id, "resume deferred by purge fence: {e}");
+            Err(ResumeOutcome::PurgeDeferred)
+        }
         Err(e) => {
             tracing::debug!(target: "acp.supervisor", session = %id, "resume not admitted: {e}");
             Err(ResumeOutcome::SpawnFinished)
         }
     }
 }
+async fn lifecycle_changed_during_resume(target: &ResumeTarget) -> bool {
+    if worker_registry::is_purge_fenced(&target.id).unwrap_or(true) {
+        return true;
+    }
+    let id = target.id.clone();
+    let profile = target.source_profile.clone();
+    let observed_generation = target.lifecycle_generation;
+    match tokio::task::spawn_blocking(move || -> anyhow::Result<Option<u64>> {
+        let storage = crate::session::Storage::open_unwatched(&profile)?;
+        Ok(storage
+            .load()?
+            .into_iter()
+            .find(|row| row.id == id)
+            .map(|row| row.lifecycle_generation))
+    })
+    .await
+    {
+        Ok(Ok(Some(current_generation))) => current_generation != observed_generation,
+        Ok(Ok(None)) => false,
+        Ok(Err(_)) | Err(_) => false,
+    }
+}
+
+async fn teardown_failure_outcome(target: &ResumeTarget) -> ResumeOutcome {
+    if lifecycle_changed_during_resume(target).await {
+        ResumeOutcome::PurgeDeferred
+    } else {
+        ResumeOutcome::RetryAfterAttachTimeout
+    }
+}
 
 pub(super) async fn resume_one(state: Arc<AppState>, target: ResumeTarget) -> ResumeOutcome {
     let id = target.id.clone();
     let in_flight_turn = target.in_flight_turn;
+
+    if worker_registry::is_purge_fenced(&id).unwrap_or(true) {
+        return ResumeOutcome::PurgeDeferred;
+    }
 
     // Take the lease before any preparation so a stop landing from here on is honored.
     let record = worker_registry::load(&id).ok().flatten();
@@ -163,13 +203,20 @@ pub(super) async fn resume_one(state: Arc<AppState>, target: ResumeTarget) -> Re
         Ok(r) => r,
         Err(outcome) => return outcome,
     };
-    // The snapshot may predate an archive, snooze, trash or stop.
+    // The snapshot may predate an archive, snooze, trash, stop or purge.
     if resume_target_for_session(&state.session_service, &id)
         .await
         .is_none()
     {
         tracing::debug!(target: "acp.supervisor", session = %id, "session left the resume set after the snapshot; not resuming");
+        if lifecycle_changed_during_resume(&target).await {
+            return ResumeOutcome::PurgeDeferred;
+        }
         return ResumeOutcome::SpawnFinished;
+    }
+    if worker_registry::is_purge_fenced(&id).unwrap_or(true) {
+        tracing::debug!(target: "acp.supervisor", session = %id, "session entered purge after the snapshot; deferring resume");
+        return ResumeOutcome::PurgeDeferred;
     }
 
     if let Some(record) = record {
@@ -226,7 +273,7 @@ pub(super) async fn resume_one(state: Arc<AppState>, target: ResumeTarget) -> Re
                             .await
                             .is_err()
                         {
-                            return ResumeOutcome::RetryAfterAttachTimeout;
+                            return teardown_failure_outcome(&target).await;
                         }
                     }
                     Err(_) => {
@@ -235,7 +282,7 @@ pub(super) async fn resume_one(state: Arc<AppState>, target: ResumeTarget) -> Re
                             .await
                             .is_err()
                         {
-                            return ResumeOutcome::RetryAfterAttachTimeout;
+                            return teardown_failure_outcome(&target).await;
                         }
                         return ResumeOutcome::RetryAfterAttachTimeout;
                     }
@@ -258,7 +305,7 @@ pub(super) async fn resume_one(state: Arc<AppState>, target: ResumeTarget) -> Re
                     .await
                     .is_err()
                 {
-                    return ResumeOutcome::RetryAfterAttachTimeout;
+                    return teardown_failure_outcome(&target).await;
                 }
             }
             AdoptDecision::RespawnStaleIdle => {
@@ -273,7 +320,7 @@ pub(super) async fn resume_one(state: Arc<AppState>, target: ResumeTarget) -> Re
                     .await
                     .is_err()
                 {
-                    return ResumeOutcome::RetryAfterAttachTimeout;
+                    return teardown_failure_outcome(&target).await;
                 }
             }
             // A dead record can still hold a live pid whose socket vanished.
@@ -282,7 +329,7 @@ pub(super) async fn resume_one(state: Arc<AppState>, target: ResumeTarget) -> Re
                     .await
                     .is_err()
                 {
-                    return ResumeOutcome::RetryAfterAttachTimeout;
+                    return teardown_failure_outcome(&target).await;
                 }
             }
         }
@@ -290,15 +337,26 @@ pub(super) async fn resume_one(state: Arc<AppState>, target: ResumeTarget) -> Re
 
     publish_orphaned_turn_stop(&state.acp_supervisor, &id, decision, in_flight_turn);
     requeue_interrupted_monitor(&state, &id).await;
-    let Ok(req) = build_spawn_request(&state.session_service, &target).await else {
-        return ResumeOutcome::SpawnFinished;
+    let req = match build_spawn_request(&state.session_service, &target).await {
+        Ok(request) => request,
+        Err(()) if lifecycle_changed_during_resume(&target).await => {
+            return ResumeOutcome::PurgeDeferred;
+        }
+        Err(()) => return ResumeOutcome::SpawnFinished,
     };
+    if worker_registry::is_purge_fenced(&id).unwrap_or(true) {
+        return ResumeOutcome::PurgeDeferred;
+    }
     let agent = req.agent.clone();
-    match state.acp_supervisor.spawn_inner(req, reservation).await {
+    let spawn = state.acp_supervisor.spawn_inner(req, reservation).await;
+    if spawn.is_err() && lifecycle_changed_during_resume(&target).await {
+        return ResumeOutcome::PurgeDeferred;
+    }
+    match spawn {
         Err(e @ SupervisorError::CapacityFull { .. }) => {
             return ResumeOutcome::CapacityDeferred {
                 message: e.to_string(),
-            }
+            };
         }
         // The supervisor already parked the session; a startup error would bury it.
         Err(SupervisorError::Acp(crate::acp::acp_client::AcpError::RateLimited(_))) | Ok(()) => {}
@@ -835,5 +893,76 @@ mod tests {
                 .map(|t| t.synthesized);
             assert_eq!(synthesized, armed.then_some(true), "armed={armed}");
         }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn late_lifecycle_change_rearms_a_failed_resume() {
+        let id = "s-late-lifecycle-change";
+        let (_home, state, project) = test_state(id);
+        let profile = "late-lifecycle-change";
+        let mut instance = structured_instance(id, &project.path().to_string_lossy());
+        instance.source_profile = profile.to_string();
+        let storage = crate::session::Storage::new_unwatched(profile).unwrap();
+        storage
+            .update(|rows, _groups| {
+                *rows = vec![instance.clone()];
+                Ok(())
+            })
+            .unwrap();
+        state.instances.write().await[0] = instance;
+        let target = ResumeTarget::from_instance(&state.instances.read().await[0]);
+        storage
+            .update(|rows, _groups| {
+                rows[0].lifecycle_generation += 1;
+                Ok(())
+            })
+            .unwrap();
+
+        assert!(matches!(
+            teardown_failure_outcome(&target).await,
+            ResumeOutcome::PurgeDeferred
+        ));
+
+        let outcome = resume_one(Arc::clone(&state), target).await;
+
+        assert!(matches!(outcome, ResumeOutcome::PurgeDeferred));
+        assert!(state.acp_event_store.replay_from(id, 0).is_empty());
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn late_lifecycle_change_during_eligibility_check_defers_resume() {
+        let id = "s-late-eligibility-change";
+        let (_home, state, project) = test_state(id);
+        let profile = "late-eligibility-change";
+        let mut instance = structured_instance(id, &project.path().to_string_lossy());
+        instance.source_profile = profile.to_string();
+        let storage = crate::session::Storage::new_unwatched(profile).unwrap();
+        storage
+            .update(|rows, _groups| {
+                *rows = vec![instance.clone()];
+                Ok(())
+            })
+            .unwrap();
+        state.instances.write().await[0] = instance;
+        let target = ResumeTarget::from_instance(&state.instances.read().await[0]);
+        storage
+            .update(|rows, _groups| {
+                rows[0].lifecycle_generation += 1;
+                rows[0].status = crate::session::Status::Deleting;
+                Ok(())
+            })
+            .unwrap();
+        {
+            let mut instances = state.instances.write().await;
+            instances[0].lifecycle_generation += 1;
+            instances[0].status = crate::session::Status::Deleting;
+        }
+
+        let outcome = resume_one(Arc::clone(&state), target).await;
+
+        assert!(matches!(outcome, ResumeOutcome::PurgeDeferred));
+        assert!(state.acp_event_store.replay_from(id, 0).is_empty());
     }
 }

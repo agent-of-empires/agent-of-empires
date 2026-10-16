@@ -219,8 +219,7 @@ pub async fn run(profile: &str, startup_warning: Option<String>) -> Result<()> {
         return remote_home::run_standalone(endpoint).await;
     }
 
-    // Opening the store creates the profile directory, so refuse unknown names first.
-    crate::session::require_known_profile(profile)?;
+    crate::session::admit_tui_profiles(profile)?;
 
     // The spinner writes nothing unless a migration reports progress.
     {
@@ -259,6 +258,14 @@ pub async fn run(profile: &str, startup_warning: Option<String>) -> Result<()> {
                 }
             }
         }
+    }
+
+    if let Err(error) = crate::session::deletion::start_lifecycle_recovery_worker() {
+        tracing::warn!(
+            target: "session.delete_recovery",
+            %error,
+            "lifecycle journal recovery worker could not start"
+        );
     }
 
     if !crate::tmux::is_tmux_available() {

@@ -501,7 +501,7 @@ impl Instance {
         native_alive.then_some(Status::Unknown)
     }
 
-    pub(super) fn prime_runtime(&self) -> Option<&crate::process::prime::PrimeRuntime> {
+    pub(crate) fn prime_runtime(&self) -> Option<&crate::process::prime::PrimeRuntime> {
         match self.active_execution.as_ref()?.capture.as_ref()? {
             CaptureContext::Prime { runtime, .. } => runtime.as_ref(),
             CaptureContext::PrimeStatus(runtime) => Some(runtime),

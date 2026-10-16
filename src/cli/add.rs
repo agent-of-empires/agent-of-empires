@@ -255,7 +255,7 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
     let mut worktree_info_opt = None;
     let mut workspace_info_opt = None;
 
-    let storage = Storage::new_unwatched(profile)?;
+    let storage = Storage::open_unwatched(profile)?;
     let (instances, _groups) = storage.load_with_groups()?;
     let worktree_session_id = uuid::Uuid::new_v4().to_string()[..8].to_string();
     let final_title =

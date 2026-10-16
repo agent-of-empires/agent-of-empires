@@ -58,7 +58,7 @@ pub(super) fn repair_structured_rows_from_live_workers(
 
     let mut repairs = Vec::new();
     for inst in merged.iter_mut() {
-        if inst.is_structured() {
+        if inst.is_structured() || inst.terminal_handoff_pending {
             continue;
         }
         let Some((record, acp_session_id)) = live_by_id.get(&inst.id) else {
@@ -137,7 +137,7 @@ pub(super) fn persist_structured_row_repairs(
                     .map(|repair| repair.session_id.clone())
                     .collect();
                 let save_result = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
-                    let storage = crate::session::Storage::new(&profile, file_watch)?;
+                    let storage = crate::session::Storage::open(&profile, file_watch)?;
                     storage.update(|all, _groups| {
                         for repair in repairs {
                             if let Some(inst) = all.iter_mut().find(|i| i.id == repair.session_id) {
@@ -227,12 +227,14 @@ mod tests {
         save_worker("repair-existing", Some("gpt-5"), Some("acp-session-2"));
         save_worker("repair-no-id", None, None);
         save_worker("repair-empty-id", None, Some(""));
+        save_worker("repair-pending-handoff", None, Some("acp-session-3"));
 
         let mut rows = vec![
             Instance::new("repair-live", "/tmp/repo"),
             Instance::new("repair-existing", "/tmp/repo"),
             Instance::new("repair-no-id", "/tmp/repo"),
             Instance::new("repair-empty-id", "/tmp/repo"),
+            Instance::new("repair-pending-handoff", "/tmp/repo"),
         ];
         rows[0].id = "repair-live".to_string();
         rows[0].acp_load_session_capable = Some(true);
@@ -241,6 +243,8 @@ mod tests {
         rows[1].agent_model = Some("custom-model".to_string());
         rows[2].id = "repair-no-id".to_string();
         rows[3].id = "repair-empty-id".to_string();
+        rows[4].id = "repair-pending-handoff".to_string();
+        rows[4].terminal_handoff_pending = true;
 
         let live_records = live_structured_worker_records();
         let repairs = repair_structured_rows_from_live_workers(&mut rows, live_records);
@@ -261,5 +265,7 @@ mod tests {
         assert_eq!(rows[2].acp_session_id, None);
         assert_eq!(rows[3].view, crate::session::View::Terminal);
         assert_eq!(rows[3].acp_session_id, None);
+        assert_eq!(rows[4].view, crate::session::View::Terminal);
+        assert!(rows[4].terminal_handoff_pending);
     }
 }
