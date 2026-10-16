@@ -23,6 +23,8 @@ Each transition plays its per-transition override when one is set, and a random 
 
 ## Playback
 
+Sounds are files in the sounds folder on the machine running aoe, for both targets. `aoe sounds install` on that machine fetches a starter pack, or add your own. With no files installed, or `enabled` off (the default), nothing plays anywhere, the browser included. The dashboard cannot install them for you.
+
 Status sounds play in two places, each with its own switch under the master `enabled`:
 
 - **Server** (`server_enabled`): the machine running aoe, through `afplay` on macOS and `aplay` or `paplay` on Linux (`apt install alsa-utils pulseaudio-utils`). Only the TUI triggers these, and audio does not work over SSH.
