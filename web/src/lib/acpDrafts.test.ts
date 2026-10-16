@@ -23,6 +23,7 @@ import { toastBus } from "./toastBus";
 const saveGate = vi.hoisted(() => ({
   hold: null as Promise<void> | null,
   deleteHold: null as Promise<void> | null,
+  onClear: null as (() => Promise<void>) | null,
   fail: false,
 }));
 vi.mock("./attachmentStore", async (importOriginal) => {
@@ -36,6 +37,7 @@ vi.mock("./attachmentStore", async (importOriginal) => {
     },
     clearAttachments: async (...args: Parameters<typeof real.clearAttachments>) => {
       await saveGate.deleteHold;
+      await saveGate.onClear?.();
       return real.clearAttachments(...args);
     },
   };
@@ -426,6 +428,26 @@ describe("attachment drafts (#2493)", () => {
     await real.saveAttachments("s-1", [img("STALE")], [200, "a"]);
     expect(await loadState("s-1")).toMatchObject({ saved: false });
     expect(await real.loadAttachments("s-1")).toEqual([]);
+  });
+
+  it("keeps a newer draft saved after the cleanup freed the bytes and before the tombstone retry", async () => {
+    const real = await vi.importActual<typeof import("./attachmentStore")>("./attachmentStore");
+    await real.saveAttachments("s-1", [img("OLD")], [100, "a"]);
+    vi.spyOn(IDBObjectStore.prototype, "put").mockImplementationOnce(() => {
+      throw new DOMException("The quota has been exceeded.", "QuotaExceededError");
+    });
+    let clears = 0;
+    saveGate.onClear = async () => {
+      // The second clear is the retry, so the other tab's save lands between the delete and it.
+      if (++clears === 2) await real.saveAttachments("s-1", [img("NEWER")], [Date.now() + 10_000, "other-tab"]);
+    };
+    try {
+      await setDraftAttachments("s-1", []);
+    } finally {
+      saveGate.onClear = null;
+    }
+    expect(clears).toBe(2);
+    expect(await real.loadAttachments("s-1")).toEqual([img("NEWER")]);
   });
 
   it("reconciles the marker under a per-session cross-tab lock when the browser has one", async () => {
