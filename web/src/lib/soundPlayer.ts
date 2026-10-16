@@ -68,14 +68,22 @@ async function loadSettings(): Promise<SoundSettings | null> {
   return sound;
 }
 
-async function resolveSoundName(sound: SoundSettings, event: SoundEvent): Promise<string | null> {
+// An empty list may be a failed request, so only a non-empty one is kept; the next sound asks again.
+async function discoverSounds(generation: number): Promise<string[]> {
+  if (availableSounds) return availableSounds;
+  const sounds = await fetchSounds();
+  if (generation !== cacheGeneration) return [];
+  if (sounds.length > 0) availableSounds = sounds;
+  return sounds;
+}
+
+async function resolveSoundName(sound: SoundSettings, event: SoundEvent, generation: number): Promise<string | null> {
   const override = sound[`on_${event}` as const]?.trim();
   if (override) return override;
   // Approvals only chime when a sound is chosen. Status sounds pick at random, like the host does.
   if (event === "approval") return null;
-  availableSounds ??= await fetchSounds();
-  if (availableSounds.length === 0) return null;
-  return availableSounds[Math.floor(Math.random() * availableSounds.length)] ?? null;
+  const sounds = await discoverSounds(generation);
+  return sounds[Math.floor(Math.random() * sounds.length)] ?? null;
 }
 
 function ensureSoundUrl(name: string): Promise<string | null> {
@@ -99,14 +107,16 @@ function ensureSoundUrl(name: string): Promise<string | null> {
   return load;
 }
 
-/** Resolves true when the sound started playing. */
+/** Resolves true when the sound started playing. A settings save or cache clear mid-way drops it. */
 export async function playSoundFor(event: SoundEvent): Promise<boolean> {
+  const generation = cacheGeneration;
   const sound = await loadSettings();
+  if (generation !== cacheGeneration) return false;
   if (!sound || !sound.enabled || sound.browser_enabled === false) return false;
-  const name = await resolveSoundName(sound, event);
-  if (!name) return false;
+  const name = await resolveSoundName(sound, event, generation);
+  if (!name || generation !== cacheGeneration) return false;
   const url = await ensureSoundUrl(name);
-  if (!url) return false;
+  if (!url || generation !== cacheGeneration) return false;
   const audio = new Audio(url);
   const volume = typeof sound.volume === "number" ? sound.volume : 1.0;
   // The host scale tops out at 1.5; HTMLAudioElement at 1.0.
