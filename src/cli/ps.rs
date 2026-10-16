@@ -804,6 +804,16 @@ fn detail_row(profile: &str, profile_explicit: bool, identifier: &str) -> Result
     }))
 }
 
+/// Writes and flushes `text`; `false` means the consumer closed the pipe
+/// (`| head`), which ends the stream quietly.
+fn write_out(out: &mut impl std::io::Write, text: &str) -> Result<bool> {
+    match out.write_all(text.as_bytes()).and_then(|()| out.flush()) {
+        Ok(()) => Ok(true),
+        Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => Ok(false),
+        Err(e) => Err(e.into()),
+    }
+}
+
 /// Runs `frame` until it returns `false` or `shutdown` completes. `shutdown`
 /// is held across frames so a signal arriving mid-frame is still delivered.
 async fn watch_loop(
@@ -852,12 +862,12 @@ pub async fn run(profile: &str, profile_explicit: bool, args: PsArgs) -> Result<
             let mut instances = load_instances(profile, profile_explicit);
             let rows = collect_rows(&mut instances, filter, args.dead);
             let body = render_rows(&rows, args.acp, args.json, args.watch)?;
-            if args.watch {
-                print!("{}", watch_frame(body, args.json, tty));
+            let text = if args.watch {
+                watch_frame(body, args.json, tty)
             } else {
-                print!("{body}");
-            }
-            Ok(args.watch)
+                body
+            };
+            Ok(write_out(&mut std::io::stdout().lock(), &text)? && args.watch)
         },
     )
     .await
@@ -1342,6 +1352,25 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(frames, 1, "a false frame ends the loop without waiting");
+    }
+
+    #[test]
+    fn write_out_treats_a_closed_consumer_as_normal_completion() {
+        struct Failing(std::io::ErrorKind);
+        impl std::io::Write for Failing {
+            fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+                Err(self.0.into())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let mut ok = Vec::new();
+        assert!(write_out(&mut ok, "frame\n").unwrap());
+        assert_eq!(ok, b"frame\n");
+        assert!(!write_out(&mut Failing(std::io::ErrorKind::BrokenPipe), "x").unwrap());
+        assert!(write_out(&mut Failing(std::io::ErrorKind::PermissionDenied), "x").is_err());
     }
 
     #[test]
