@@ -6,6 +6,7 @@ import {
   gridGeometry,
   lastResizeCols,
   liveMatches,
+  liveTexts,
   openLiveTerminal,
   scroller as liveScroller,
 } from "./helpers/liveTerminal";
@@ -89,6 +90,19 @@ test.describe("Desktop live terminal input", () => {
     });
     await expectScrollMode(page, "forward");
     const first = (await page.getByText("first", { exact: true }).boundingBox())!;
+    // The gutter belongs to the pane: a click there focuses it and is not forwarded to the mouse app.
+    const pane = page.locator('[data-term="agent"]').first();
+    await page.locator('textarea[aria-label="Live terminal input"]').first().blur();
+    await expect(pane).not.toHaveAttribute("data-pane-focused", "true");
+    const frame = (await page.locator("[data-pane-frame]").first().boundingBox())!;
+    const beforeGutter = handle.liveMessages.length;
+    await page.mouse.click(frame.x + g.frameWidth + 1, first.y + first.height / 2);
+    await expect(pane).toHaveAttribute("data-pane-focused", "true");
+    expect(
+      liveTexts(handle)
+        .slice(beforeGutter)
+        .some((s) => /\x1b(\[<|\[M)/.test(s)),
+    ).toBe(false);
     // Late in cell 0, where a pane-relative origin would already read column 2.
     await page.mouse.click(box.x + g.cell * 0.9, first.y + first.height / 2);
     await expect.poll(() => liveMatches(handle, /\x1b\[<0;1;1M/)).toBe(true);
