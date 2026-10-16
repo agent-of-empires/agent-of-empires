@@ -47,6 +47,66 @@ pub fn storage_leaf(plugin_id: &str, field: &str, leaf: Value) -> Value {
     json!({ "plugins": { plugin_id: { "settings": { field: leaf } } } })
 }
 
+/// Where a resolved plugin setting value came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PluginSettingSource {
+    Project,
+    Global,
+    Default,
+}
+
+impl PluginSettingSource {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            PluginSettingSource::Project => "project",
+            PluginSettingSource::Global => "global",
+            PluginSettingSource::Default => "default",
+        }
+    }
+}
+
+/// Resolve a plugin setting: the project's value, then the global value, then the
+/// declared default. A `per_project` setting is the only one with a project layer
+/// or a default fallback; any other key reads the global value as stored.
+pub fn resolve_plugin_setting(
+    plugin_id: &str,
+    key: &str,
+    decl: Option<&SettingContribution>,
+    project: Option<&crate::session::Project>,
+    global: Option<Value>,
+) -> Option<(Value, PluginSettingSource)> {
+    let Some(decl) = decl.filter(|d| d.per_project) else {
+        return global.map(|v| (v, PluginSettingSource::Global));
+    };
+    project
+        .and_then(|p| p.overrides.plugin_settings.get(plugin_id)?.get(key))
+        .filter(|v| !v.is_null())
+        .map(|v| (v.clone(), PluginSettingSource::Project))
+        .or_else(|| global.map(|v| (v, PluginSettingSource::Global)))
+        .or_else(|| {
+            let default = serde_json::to_value(decl.default.as_ref()?).ok()?;
+            Some((default, PluginSettingSource::Default))
+        })
+}
+
+/// Check a per-project value against its manifest declaration, with the same
+/// validation a global write gets. `decl` is the plugin's setting for `key`, if any.
+pub fn validate_project_plugin_setting(
+    plugin_id: &str,
+    key: &str,
+    decl: Option<&SettingContribution>,
+    value: &Value,
+) -> Result<(), String> {
+    let decl = decl
+        .filter(|d| d.per_project)
+        .ok_or_else(|| format!("{plugin_id}.{key} is not a per-project setting"))?;
+    let descriptor = plugin_field_descriptors(plugin_id, std::slice::from_ref(decl))
+        .pop()
+        .expect("one declaration yields one descriptor");
+    super::validate_value(&descriptor.validation, value)
+        .map_err(|e| format!("{plugin_id}.{key}: {e}"))
+}
+
 /// Rewrite a settings PATCH body in place: every top-level `plugin:<id>`
 /// section is folded into `plugins.<id>.settings.*`, matching on-disk storage.
 /// Core sections are left untouched. Call after validation, before merge.
@@ -128,6 +188,7 @@ pub fn plugin_field_descriptors(
                     .default
                     .as_ref()
                     .and_then(|t| serde_json::to_value(t).ok()),
+                per_project: s.per_project,
             }
         })
         .collect()
@@ -325,6 +386,7 @@ mod tests {
             item_id_key: None,
             min_items: None,
             max_items: None,
+            per_project: false,
         }
     }
 
@@ -448,5 +510,104 @@ mod tests {
         rewrite_plugin_sections(&mut body);
         assert!(body.get("plugin:acme.kit").is_none());
         assert_eq!(body["plugins"]["acme.kit"]["settings"]["retries"], json!(4));
+    }
+    #[test]
+    fn plugin_setting_resolves_project_then_global_then_default() {
+        let mut project =
+            crate::session::Project::new("p", "/tmp/p", crate::session::ProjectScope::Global);
+        project
+            .overrides
+            .set_plugin_setting("acme.kit", "depth", Some(json!(7)));
+        let per_project = SettingContribution {
+            per_project: true,
+            default: Some(toml::Value::Integer(1)),
+            ..contrib("depth", SettingType::Integer)
+        };
+        let global_only = SettingContribution {
+            default: Some(toml::Value::Integer(1)),
+            ..contrib("depth", SettingType::Integer)
+        };
+        let resolve = |decl, project, global| {
+            resolve_plugin_setting("acme.kit", "depth", decl, project, global)
+                .map(|(v, s)| (v, s.as_str()))
+        };
+
+        let mut nulled = project.clone();
+        nulled
+            .overrides
+            .set_plugin_setting("acme.kit", "depth", Some(serde_json::Value::Null));
+
+        let cases = [
+            (
+                "a stored null inherits",
+                resolve(Some(&per_project), Some(&nulled), Some(json!(3))),
+                Some((json!(3), "global")),
+            ),
+            (
+                "project wins",
+                resolve(Some(&per_project), Some(&project), Some(json!(3))),
+                Some((json!(7), "project")),
+            ),
+            (
+                "global without project",
+                resolve(Some(&per_project), None, Some(json!(3))),
+                Some((json!(3), "global")),
+            ),
+            (
+                "default last",
+                resolve(Some(&per_project), None, None),
+                Some((json!(1), "default")),
+            ),
+            (
+                "flag off ignores project and default",
+                resolve(Some(&global_only), Some(&project), None),
+                None,
+            ),
+            (
+                "flag off reads global",
+                resolve(Some(&global_only), Some(&project), Some(json!(3))),
+                Some((json!(3), "global")),
+            ),
+            (
+                "undeclared key reads global",
+                resolve(None, Some(&project), Some(json!(3))),
+                Some((json!(3), "global")),
+            ),
+        ];
+        for (label, got, want) in cases {
+            assert_eq!(got, want, "{label}");
+        }
+    }
+
+    #[test]
+    fn project_value_is_validated_like_a_global_one() {
+        let mut depth = contrib("depth", SettingType::Integer);
+        depth.per_project = true;
+        depth.max = Some(5);
+        let global_only = contrib("other", SettingType::Integer);
+        let check =
+            |decl, key, value| validate_project_plugin_setting("acme.kit", key, decl, &value);
+
+        assert!(check(Some(&depth), "depth", json!(3)).is_ok());
+        assert!(check(Some(&depth), "depth", json!(9)).is_err());
+        assert!(check(Some(&depth), "depth", json!("x")).is_err());
+        assert!(check(Some(&global_only), "other", json!(1)).is_err());
+        assert!(check(None, "missing", json!(1)).is_err());
+    }
+
+    #[test]
+    fn plugin_descriptor_carries_per_project_flag() {
+        let per_project = SettingContribution {
+            per_project: true,
+            ..contrib("depth", SettingType::Integer)
+        };
+        let descs = plugin_field_descriptors(
+            "acme.kit",
+            &[per_project, contrib("x", SettingType::String)],
+        );
+        assert_eq!(
+            descs.iter().map(|d| d.per_project).collect::<Vec<_>>(),
+            [true, false]
+        );
     }
 }

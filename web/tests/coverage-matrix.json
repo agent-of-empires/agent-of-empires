@@ -3305,7 +3305,7 @@
       "kind": "vitest",
       "risk": "low",
       "specs": ["src/components/__tests__/ProjectFormModal.test.tsx"],
-      "components": ["web/src/components/ProjectFormModal.tsx"]
+      "components": ["web/src/components/ProjectFormModal.tsx", "web/src/components/ProjectPluginSettings.tsx"]
     },
     {
       "id": "scratch-overrides-modal",

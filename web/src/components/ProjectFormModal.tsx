@@ -2,6 +2,7 @@ import { useState } from "react";
 import type { ProjectInfo } from "../lib/types";
 import { createProject, updateProject } from "../lib/api";
 import { DirectoryBrowser } from "./DirectoryBrowser";
+import { type PluginSettingsDraft, ProjectPluginSettings } from "./ProjectPluginSettings";
 
 interface Props {
   /** The project to edit, or null/undefined to add a new one. */
@@ -35,6 +36,7 @@ export function ProjectFormModal({ initial, onClose, onSaved }: Props) {
   const [worktreeOverride, setWorktreeOverride] = useState<OverrideChoice>(initialWorktreeChoice);
   const [smartRenameOverride, setSmartRenameOverride] = useState<OverrideChoice>(initialSmartRenameChoice);
   const [sandboxOverride, setSandboxOverride] = useState<OverrideChoice>(initialSandboxChoice);
+  const [pluginDraft, setPluginDraft] = useState<PluginSettingsDraft>({});
 
   const close = () => {
     if (submitting) return;
@@ -48,13 +50,15 @@ export function ProjectFormModal({ initial, onClose, onSaved }: Props) {
       const overridesChanged =
         worktreeOverride !== initialWorktreeChoice ||
         smartRenameOverride !== initialSmartRenameChoice ||
-        sandboxOverride !== initialSandboxChoice;
+        sandboxOverride !== initialSandboxChoice ||
+        Object.keys(pluginDraft).length > 0;
       const toPatchValue = (c: OverrideChoice): boolean | null => (c === "inherit" ? null : c === "on");
       const result = overridesChanged
         ? await updateProject(initial.name, initial.scope, baseBranch.trim() || null, {
             worktree_enabled: toPatchValue(worktreeOverride),
             smart_rename: toPatchValue(smartRenameOverride),
             sandbox_enabled: toPatchValue(sandboxOverride),
+            ...(Object.keys(pluginDraft).length > 0 ? { plugin_settings: pluginDraft } : {}),
           })
         : await updateProject(initial.name, initial.scope, baseBranch.trim() || null);
       if (!result.ok) {
@@ -81,6 +85,7 @@ export function ProjectFormModal({ initial, onClose, onSaved }: Props) {
         worktree_enabled: worktreeOverride === "inherit" ? undefined : worktreeOverride === "on",
         smart_rename: smartRenameOverride === "inherit" ? undefined : smartRenameOverride === "on",
         sandbox_enabled: sandboxOverride === "inherit" ? undefined : sandboxOverride === "on",
+        plugin_settings: Object.keys(pluginDraft).length > 0 ? pluginDraft : undefined,
       },
     });
     if (!result.ok) {
@@ -212,6 +217,12 @@ export function ProjectFormModal({ initial, onClose, onSaved }: Props) {
           <option value="on">On</option>
           <option value="off">Off</option>
         </select>
+
+        <ProjectPluginSettings
+          stored={initial?.overrides?.plugin_settings}
+          draft={pluginDraft}
+          onChange={setPluginDraft}
+        />
 
         <label className="block text-[12px] text-text-dim mb-1">Scope</label>
         {isEdit ? (
