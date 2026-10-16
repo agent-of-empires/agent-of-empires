@@ -142,12 +142,12 @@ impl Region {
             .strip_prefix("bottom_non_empty_lines(")
             .and_then(|r| r.strip_suffix(')'))
         {
-            // Zero is a manifest bug, reported at build time by `manifests_compile`.
+            // Keep manifest bounds within the available capture window.
             return n
                 .trim()
                 .parse()
                 .ok()
-                .filter(|n| *n > 0)
+                .filter(|n| (1..=EXTENDED_REGION_LINES).contains(n))
                 .map(Region::BottomLines);
         }
         Some(match raw {
@@ -401,4 +401,24 @@ pub(super) fn collapse_ascii_whitespace(text: &str) -> String {
         out.push(c);
     }
     out
+}
+#[cfg(test)]
+mod tests {
+    use super::{Region, EXTENDED_REGION_LINES};
+
+    #[test]
+    fn bottom_lines_region_rejects_values_outside_capture_window() {
+        assert_eq!(
+            Region::parse(&format!("bottom_non_empty_lines({EXTENDED_REGION_LINES})")),
+            Some(Region::BottomLines(EXTENDED_REGION_LINES))
+        );
+        assert_eq!(
+            Region::parse(&format!(
+                "bottom_non_empty_lines({})",
+                EXTENDED_REGION_LINES + 1
+            )),
+            None
+        );
+        assert_eq!(Region::parse("bottom_non_empty_lines(0)"), None);
+    }
 }
