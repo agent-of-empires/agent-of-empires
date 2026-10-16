@@ -1090,6 +1090,9 @@ fn start_daemon(profile: &str, args: &ServeArgs) -> Result<()> {
     use std::process::{Command, Stdio};
 
     let _state_lock = lock_serve_state()?;
+    if let Some(existing) = daemon_pid() {
+        bail!("aoe serve daemon already running (PID {existing}); not starting another");
+    }
     let exe = std::env::current_exe()?;
     let instance_id = uuid::Uuid::new_v4().to_string();
     let mut cmd = Command::new(exe);
