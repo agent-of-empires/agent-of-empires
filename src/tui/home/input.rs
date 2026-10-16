@@ -2960,8 +2960,7 @@ impl HomeView {
             });
 
         if prefill_path.is_some() || prefill_group.is_some() {
-            let existing_groups: Vec<String> =
-                self.all_groups().iter().map(|g| g.path.clone()).collect();
+            let existing_groups: Vec<String> = self.all_group_paths();
             let current_profile = self
                 .profile_for_cursor(self.cursor)
                 .unwrap_or_else(|| self.config_profile());
@@ -3255,8 +3254,7 @@ impl HomeView {
             }
         };
 
-        let existing_groups: Vec<String> =
-            self.all_groups().iter().map(|g| g.path.clone()).collect();
+        let existing_groups: Vec<String> = self.all_group_paths();
         let current_profile = self
             .profile_for_cursor(self.cursor)
             .unwrap_or_else(|| self.config_profile());
@@ -4944,8 +4942,7 @@ impl HomeView {
         if self.selected_session.is_some() || self.selected_group.is_some() {
             self.record_new_session_with_selection();
         }
-        let existing_groups: Vec<String> =
-            self.all_groups().iter().map(|g| g.path.clone()).collect();
+        let existing_groups: Vec<String> = self.all_group_paths();
         let current_profile = self.config_profile();
         let profiles =
             list_profiles_for_display().unwrap_or_else(|_| vec![current_profile.clone()]);
@@ -5196,8 +5193,7 @@ impl HomeView {
 
             let profiles =
                 list_profiles_for_display().unwrap_or_else(|_| vec![current_profile.clone()]);
-            let existing_groups: Vec<String> =
-                self.all_groups().iter().map(|g| g.path.clone()).collect();
+            let existing_groups: Vec<String> = self.all_group_paths();
             let mut dialog = RenameDialog::new(
                 &title,
                 &group_path,

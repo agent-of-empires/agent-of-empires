@@ -3030,3 +3030,63 @@ fn test_a_hidden_destination_falls_back_to_the_header_in_its_own_profile() {
         "the header the selection lands on is in the moving row's own profile"
     );
 }
+
+#[test]
+#[serial]
+fn same_named_groups_across_profiles_are_tagged_and_listed_once() {
+    use crate::session::{GroupTree, Item};
+
+    let temp = TempDir::new().unwrap();
+    let _guard = setup_test_home(&temp);
+
+    for (profile, groups) in [("alpha", &["work", "solo"][..]), ("beta", &["work"][..])] {
+        let insts: Vec<Instance> = groups
+            .iter()
+            .map(|g| {
+                let mut i = Instance::new(&format!("{profile}-{g}"), "/tmp/x");
+                i.group_path = g.to_string();
+                i
+            })
+            .collect();
+        let tree = GroupTree::new_with_groups(&insts, &[]);
+        Storage::new_unwatched(profile)
+            .unwrap()
+            .update(|i, g| {
+                *i = insts.clone();
+                *g = tree.get_all_groups();
+                Ok(())
+            })
+            .unwrap();
+    }
+
+    let tools = AvailableTools::with_tools(&["claude"]);
+    let mut view =
+        HomeView::new_for_test(None, tools, crate::file_watch::FileWatchService::noop()).unwrap();
+    view.group_by = crate::session::config::GroupByMode::Manual;
+    view.flat_items = view.build_flat_items();
+
+    assert_eq!(view.all_group_paths(), vec!["solo", "work"]);
+
+    let theme = crate::tui::styles::Theme::default();
+    let labels: Vec<String> = view
+        .flat_items
+        .iter()
+        .filter(|item| matches!(item, Item::Group { .. }))
+        .map(|item| {
+            view.render_item_line(item, false, false, &theme, 200, false)
+                .spans
+                .iter()
+                .map(|s| s.content.as_ref())
+                .collect::<String>()
+        })
+        .collect();
+    let tagged = |tag: &str| labels.iter().filter(|l| l.contains(tag)).count();
+    assert_eq!(tagged("work (1) [alpha]"), 1, "{labels:?}");
+    assert_eq!(tagged("work (1) [beta]"), 1, "{labels:?}");
+    assert!(
+        labels
+            .iter()
+            .any(|l| l.contains("solo (1)") && !l.contains('[')),
+        "{labels:?}"
+    );
+}

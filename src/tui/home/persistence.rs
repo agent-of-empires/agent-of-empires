@@ -156,6 +156,17 @@ impl HomeView {
             .collect()
     }
 
+    /// Sorted group paths across all profiles, each path once.
+    pub(in crate::tui) fn all_group_paths(&self) -> Vec<String> {
+        let paths: std::collections::BTreeSet<String> = self
+            .group_trees
+            .values()
+            .flat_map(|t| t.get_all_groups())
+            .map(|g| g.path)
+            .collect();
+        paths.into_iter().collect()
+    }
+
     /// Check if any profile has groups, without collecting them all.
     pub(in crate::tui) fn has_any_groups(&self) -> bool {
         self.group_trees
