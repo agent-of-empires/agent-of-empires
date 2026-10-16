@@ -694,6 +694,17 @@ describe("usePushSubscription mutations that outlive their consumers", () => {
   it("finishes enable and reconciles a consumer remounted while it was in flight", async () => {
     noSubscription();
     const first = await mountAndSettle();
+    const real = fetch;
+    const serverEndpoints = new Set<string>();
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+        const endpoint = init?.body ? (JSON.parse(String(init.body)) as { endpoint?: string }).endpoint : undefined;
+        const response = await real(input, init);
+        if (response.ok && endpoint && String(input).endsWith("/api/push/subscribe")) serverEndpoints.add(endpoint);
+        return response;
+      }),
+    );
     let finishSubscribe!: () => void;
     const subscribeStarted = new Promise<void>((started) => {
       subscribeImpl = () =>
@@ -720,7 +731,7 @@ describe("usePushSubscription mutations that outlive their consumers", () => {
     expect(second.result.current.health).toBe("healthy");
     expect(currentSub).not.toBeNull();
     expect(localStorage.getItem(WANTED)).toBe("1");
-    expect(called("/api/push/subscribe")).toBe(true);
+    expect([...serverEndpoints]).toEqual([currentSub!.endpoint]);
   });
 
   it("does not let a refresh registration land after disable removed the subscription", async () => {
