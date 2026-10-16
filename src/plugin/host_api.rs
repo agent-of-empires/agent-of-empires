@@ -478,6 +478,7 @@ pub(crate) fn session_summary(i: &crate::session::Instance) -> Value {
         "archived": i.is_archived(),
         "snoozed": i.is_snoozed(),
         "trashed": i.is_trashed(),
+        "unread": i.is_unread() && crate::session::unread_enabled(),
         "workspace_repos": i
             .all_repos()
             .iter()
@@ -1037,6 +1038,21 @@ mod tests {
         assert_eq!(events[0]["seq"], json!(2));
         assert_eq!(events[0]["payload"]["n"], json!(2));
         assert_eq!(got["high_seq"], json!(3));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn session_summary_reports_unread_only_while_the_indicator_is_enabled() {
+        let mut inst = crate::session::Instance::new("t", "/tmp/plugin-host-test");
+        let unread = |inst: &crate::session::Instance| session_summary(inst)["unread"].clone();
+
+        crate::session::set_unread_enabled(true);
+        assert_eq!(unread(&inst), json!(false));
+        inst.mark_unread();
+        assert_eq!(unread(&inst), json!(true));
+        crate::session::set_unread_enabled(false);
+        assert_eq!(unread(&inst), json!(false));
+        crate::session::set_unread_enabled(true);
     }
 
     #[test]
