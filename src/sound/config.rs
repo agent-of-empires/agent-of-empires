@@ -6,9 +6,9 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Serialize, Deserialize, SettingsSection)]
 #[setting_section(name = "sound", category = "Sound")]
 pub struct SoundConfig {
-    /// Play sounds on agent state transitions. Needs `.wav` or `.ogg` files in the
-    /// sounds folder on the machine running aoe; `aoe sounds install` there
-    /// fetches a starter pack.
+    /// Play sounds on agent state transitions. Needs .wav or .ogg files in the
+    /// sounds folder on the machine running aoe; run "aoe sounds install" there
+    /// for a starter pack.
     #[serde(default)]
     #[setting(label = "Enabled", widget = "toggle")]
     pub enabled: bool,
