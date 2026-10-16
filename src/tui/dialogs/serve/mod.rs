@@ -177,6 +177,39 @@ impl ServeMouse {
     }
 }
 
+/// What a restart does to signed-in Devices. Agents keep running either way.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RestartEffect {
+    KeepsLogins,
+    /// A quick Cloudflare tunnel returns on a new host, which the old cookie is not sent to.
+    NewLink,
+    /// `auth.persist_sessions` is off, so a Tunnel restart drops every login.
+    SignsOut,
+}
+
+impl RestartEffect {
+    /// Local mode signs in with the stable access token, so only Tunnels can lose logins.
+    fn of(mode: ServeMode, urls: &[ServeUrl], keeps_logins: bool) -> Self {
+        if mode == ServeMode::Local {
+            RestartEffect::KeepsLogins
+        } else if urls.iter().any(|u| is_quick_tunnel(&u.url)) {
+            RestartEffect::NewLink
+        } else if keeps_logins {
+            RestartEffect::KeepsLogins
+        } else {
+            RestartEffect::SignsOut
+        }
+    }
+}
+
+/// Quick tunnels get a fresh `*.trycloudflare.com` host each start; named ones keep theirs.
+fn is_quick_tunnel(url: &str) -> bool {
+    let rest = url.split_once("://").map_or(url, |(_, rest)| rest);
+    rest.split(['/', '?', '#', ':'])
+        .next()
+        .is_some_and(|host| host.ends_with(".trycloudflare.com"))
+}
+
 /// A destructive action awaiting a second press of its key.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PendingConfirm {
@@ -193,6 +226,8 @@ pub struct ServeView {
     mouse: RefCell<ServeMouse>,
     /// The label of the value a click last copied, shown for `FLASH_TTL`.
     copied: Option<(&'static str, Instant)>,
+    /// `auth.persist_sessions`: whether a Tunnel restart keeps Devices signed in.
+    keeps_logins: bool,
 }
 
 impl Default for ServeView {
@@ -222,6 +257,10 @@ impl ServeView {
             show_help: false,
             mouse: RefCell::default(),
             copied: None,
+            keeps_logins: crate::session::config::load_config()
+                .ok()
+                .flatten()
+                .is_none_or(|config| config.auth.persist_sessions),
         }
     }
 
@@ -469,7 +508,7 @@ impl ServeView {
                     self.pending_confirm = Some((PendingConfirm::NewPassphrase, Instant::now()));
                 }
             }
-            // Tunnel restarts clear all login sessions; Local rebinds the port.
+            // Reusing the passphrase keeps persisted logins; see `RestartEffect`.
             KeyCode::Char('r' | 'R') => {
                 if confirmed == Some(PendingConfirm::Restart) {
                     let pp = (mode == ServeMode::Tunnel).then(|| {

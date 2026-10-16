@@ -9,8 +9,8 @@ use crossterm::event::{KeyCode, KeyEvent};
 
 use super::daemon::error_mentions_tailscale;
 use super::{
-    Flash, PendingConfirm, ServeMode, ServeMouse, ServeView, ServeViewState, TransportStatus,
-    TunnelTransport, FLASH_TTL,
+    Flash, PendingConfirm, RestartEffect, ServeMode, ServeMouse, ServeView, ServeViewState,
+    TransportStatus, TunnelTransport, FLASH_TTL,
 };
 use crate::tui::components::hint_buttons::scan_spaced_hints;
 use crate::tui::components::hover::paint_hover_bg;
@@ -58,13 +58,14 @@ pub(super) fn render(view: &ServeView, frame: &mut Frame, area: Rect, theme: &Th
         ServeViewState::Starting {
             mode, started_at, ..
         } => render_starting(frame, area, theme, &mut mouse, *mode, started_at.elapsed()),
-        ServeViewState::Active { mode, .. } => {
+        ServeViewState::Active { mode, urls, .. } => {
             render_active(view, frame, area, theme, &mut mouse);
             if view.show_help {
                 // Any click closes the overlay, so nothing beneath is a target.
                 mouse.keys.clear();
                 mouse.copies.clear();
-                render_help_overlay(frame, area, theme, *mode);
+                let effect = RestartEffect::of(*mode, urls, view.keeps_logins);
+                render_help_overlay(frame, area, theme, *mode, effect);
             }
         }
         ServeViewState::Error(msg) => render_error(frame, area, theme, &mut mouse, msg),
@@ -643,13 +644,39 @@ fn render_active(
         .border_style(Style::default().fg(theme.border));
     let footer_inner = footer_block.inner(footer);
     frame.render_widget(footer_block, footer);
-    let footer_line = match view.pending_confirm.map(|(action, _)| action) {
+    let footer_text = match view.pending_confirm.map(|(action, _)| action) {
         Some(action) => {
-            let text = match action {
-                PendingConfirm::NewPassphrase => "Press G again to confirm new passphrase (clients will need it). Any other key cancels.",
-                PendingConfirm::Restart => "Press R again to confirm restart (clears all sessions). Any other key cancels.",
+            let effect = RestartEffect::of(*mode, urls, view.keeps_logins);
+            let link = (effect == RestartEffect::NewLink)
+                .then_some("The link changes: re-scan and sign in again.");
+            let (first, effects): (&str, &[&str]) = match (action, effect) {
+                (PendingConfirm::NewPassphrase, _) => (
+                    "Press G again for a new passphrase.",
+                    &["Every Device signs out."],
+                ),
+                (PendingConfirm::Restart, RestartEffect::KeepsLogins) => (
+                    "Press R again to restart.",
+                    &["Devices stay signed in; agents keep running."],
+                ),
+                (PendingConfirm::Restart, RestartEffect::NewLink) => {
+                    ("Press R again to restart.", &["Agents keep running."])
+                }
+                (PendingConfirm::Restart, RestartEffect::SignsOut) => (
+                    "Press R again to restart.",
+                    &["Every Device signs out; agents keep running."],
+                ),
             };
-            Line::styled(text, Style::default().fg(theme.waiting).bold())
+            let rest = effects
+                .iter()
+                .copied()
+                .chain(link)
+                .chain(["Any other key cancels."]);
+            let mut spans = vec![Span::styled(
+                first,
+                Style::default().fg(theme.waiting).bold(),
+            )];
+            spans.extend(rest.map(|s| Span::styled(format!(" {s}"), dimmed)));
+            Text::from(Line::from(spans))
         }
         None => {
             let mut keys = Vec::new();
@@ -665,24 +692,33 @@ fn render_active(
                 ("?", ": help  "),
                 ("Esc", ": close"),
             ]);
-            Line::from(
+            Text::from(Line::from(
                 keys.into_iter()
                     .flat_map(|(key, desc)| [Span::styled(key, accent), Span::styled(desc, dimmed)])
                     .collect::<Vec<_>>(),
-            )
+            ))
         }
     };
+    // A confirm may wrap onto the footer's second line.
     frame.render_widget(
-        Paragraph::new(footer_line).alignment(Alignment::Center),
+        Paragraph::new(footer_text)
+            .alignment(Alignment::Center)
+            .wrap(Wrap { trim: true }),
         footer_inner,
     );
     record_hints(frame, mouse, footer_inner);
 }
 
-fn render_help_overlay(frame: &mut Frame, area: Rect, theme: &Theme, mode: ServeMode) {
+fn render_help_overlay(
+    frame: &mut Frame,
+    area: Rect,
+    theme: &Theme,
+    mode: ServeMode,
+    effect: RestartEffect,
+) {
     let is_tunnel = mode == ServeMode::Tunnel;
     let width = 72.min(area.width.saturating_sub(4));
-    let height = (if is_tunnel { 20 } else { 14 }).min(area.height.saturating_sub(4));
+    let height = (if is_tunnel { 20 } else { 15 }).min(area.height.saturating_sub(4));
     let dialog_area = centered_rect(area, width, height);
 
     let heading = Style::default()
@@ -702,13 +738,26 @@ fn render_help_overlay(frame: &mut Frame, area: Rect, theme: &Theme, mode: Serve
     let text = Style::default().fg(theme.text);
     let mut shortcuts = Vec::new();
     if is_tunnel {
-        shortcuts.push(("G", "New random passphrase and restart server"));
+        shortcuts.push(("G", "New passphrase (signs every Device out)"));
     }
     shortcuts.extend([
-        ("R", "Restart server (clears all client sessions)"),
-        ("S", "Stop server, return to mode picker"),
+        (
+            "R",
+            match effect {
+                RestartEffect::KeepsLogins => {
+                    "Restart the Daemon (Devices stay signed in; agents keep running)"
+                }
+                RestartEffect::NewLink => {
+                    "Restart the Daemon (new link, sign in again; agents keep running)"
+                }
+                RestartEffect::SignsOut => {
+                    "Restart the Daemon (every Device signs out; agents keep running)"
+                }
+            },
+        ),
+        ("S", "Stop the Daemon, return to mode picker"),
         ("Tab", "Cycle URLs (when multiple available)"),
-        ("Esc / q", "Close this view (server keeps running)"),
+        ("Esc / q", "Close this view (the Daemon keeps running)"),
         ("?", "Toggle this help"),
     ]);
 
@@ -717,12 +766,26 @@ fn render_help_overlay(frame: &mut Frame, area: Rect, theme: &Theme, mode: Serve
         Line::styled("Keyboard Shortcuts", heading),
         Line::from(""),
     ];
-    lines.extend(shortcuts.into_iter().map(|(key, desc)| {
-        Line::from(vec![
-            Span::styled(format!("  {:14}", key), Style::default().fg(theme.waiting)),
-            Span::styled(desc, text),
-        ])
-    }));
+    // A long description continues under itself, not under the key column.
+    const KEY_COL: u16 = 16;
+    for (key, desc) in shortcuts {
+        let mut rows = Vec::new();
+        crate::tui::markdown::wrap_line_into(
+            Line::styled(desc, text),
+            inner.width.saturating_sub(KEY_COL),
+            &mut rows,
+        );
+        for (i, row) in rows.into_iter().enumerate() {
+            let lead = if i == 0 {
+                format!("  {key:14}")
+            } else {
+                " ".repeat(KEY_COL as usize)
+            };
+            let mut spans = vec![Span::styled(lead, Style::default().fg(theme.waiting))];
+            spans.extend(row.spans);
+            lines.push(Line::from(spans));
+        }
+    }
     lines.push(Line::from(""));
     if is_tunnel {
         lines.extend([
@@ -843,6 +906,7 @@ mod tests {
             show_help: false,
             mouse: Default::default(),
             copied: None,
+            keeps_logins: true,
         };
         let mut term = Terminal::new(TestBackend::new(72, 26)).unwrap();
         term.draw(|f| render(&view, f, f.area(), &Theme::default()))
@@ -890,6 +954,7 @@ mod tests {
             show_help: false,
             mouse: Default::default(),
             copied: None,
+            keeps_logins: true,
         }
     }
 
@@ -969,6 +1034,161 @@ mod tests {
         view.show_help = true;
         draw(&view);
         assert_eq!(view.handle_click(0, 0).map(|k| k.code), Some(KeyCode::Esc));
+    }
+
+    /// The text drawn in `rect`, rows joined and box borders blanked, so a wrapped sentence matches.
+    fn text_in(buf: &ratatui::buffer::Buffer, rect: Rect) -> String {
+        let rows: Vec<String> = (rect.y..rect.bottom())
+            .map(|y| {
+                (rect.x..rect.right())
+                    .map(|x| buf[(x, y)].symbol())
+                    .map(|sym| {
+                        if "│─╭╮╰╯".contains(sym) {
+                            " "
+                        } else {
+                            sym
+                        }
+                    })
+                    .collect()
+            })
+            .collect();
+        rows.join(" ")
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
+    #[test]
+    fn restart_and_passphrase_copy_say_what_happens_to_devices() {
+        use PendingConfirm::{NewPassphrase as G, Restart as R};
+        use ServeMode::{Local, Tunnel};
+        let lan = "http://192.168.1.42:8080/?token=t";
+        let funnel = "https://host.tailnet.ts.net/?token=t";
+        let named = "https://aoe.example.com/?token=t";
+        let quick = "https://a-b-c.trycloudflare.com/?token=t";
+        let kept = "Devices stay signed in; agents keep running";
+        let link = "The link changes: re-scan and sign in again.";
+        // (mode, url, auth.persist_sessions, key pressed once, confirm after the first sentence, help R)
+        let cases = [
+            // Local signs in with the stable token, so the setting does not apply.
+            (Local, lan, false, R, format!("{kept}."), kept.to_string()),
+            (
+                Tunnel,
+                funnel,
+                true,
+                R,
+                format!("{kept}."),
+                kept.to_string(),
+            ),
+            // A named Cloudflare tunnel keeps its host.
+            (Tunnel, named, true, R, format!("{kept}."), kept.to_string()),
+            (
+                Tunnel,
+                quick,
+                true,
+                R,
+                format!("Agents keep running. {link}"),
+                "new link, sign in again; agents keep running".to_string(),
+            ),
+            (
+                Tunnel,
+                funnel,
+                false,
+                R,
+                "Every Device signs out; agents keep running.".to_string(),
+                "every Device signs out; agents keep running".to_string(),
+            ),
+            (
+                Tunnel,
+                funnel,
+                true,
+                G,
+                "Every Device signs out.".to_string(),
+                kept.to_string(),
+            ),
+            (
+                Tunnel,
+                quick,
+                true,
+                G,
+                format!("Every Device signs out. {link}"),
+                String::new(),
+            ),
+        ];
+        let theme = crate::tui::styles::load_theme("empire");
+        for (mode, url, keeps_logins, key, effects, help_restart) in cases {
+            let case = format!("{mode:?} {url} persist={keeps_logins} {key:?}");
+            let mut view = view(ServeViewState::Active {
+                mode,
+                transport: None,
+                urls: vec![ServeUrl {
+                    label: None,
+                    url: url.to_string(),
+                }],
+                url_index: 0,
+                passphrase: (mode == Tunnel).then(|| "correct-horse".to_string()),
+                opened_at: Instant::now(),
+                log_offset: 0,
+            });
+            view.keeps_logins = keeps_logins;
+            view.pending_confirm = Some((key, Instant::now()));
+            let first = match key {
+                G => "Press G again for a new passphrase.",
+                R => "Press R again to restart.",
+            };
+            for width in [80, 120] {
+                let buf = crate::tui::dialogs::test_render::draw(width, 24, |f, theme| {
+                    render(&view, f, f.area(), theme)
+                });
+                let footer = text_in(&buf, Rect::new(0, 22, width, 2));
+                assert_eq!(
+                    footer,
+                    format!("{first} {effects} Any other key cancels."),
+                    "{case} at {width}"
+                );
+                let (x, y) = crate::tui::dialogs::test_render::find(&buf, first);
+                assert_eq!(buf[(x, y)].fg, theme.waiting, "{case}");
+                let (x, y) = crate::tui::dialogs::test_render::find(&buf, "cancels.");
+                assert_eq!(buf[(x, y)].fg, theme.dimmed, "{case}");
+            }
+
+            if help_restart.is_empty() {
+                continue;
+            }
+            view.pending_confirm = None;
+            view.show_help = true;
+            let buf = crate::tui::dialogs::test_render::draw(80, 24, |f, theme| {
+                render(&view, f, f.area(), theme)
+            });
+            let help = text_in(
+                &buf,
+                centered_rect(
+                    Rect::new(0, 0, 80, 24),
+                    72,
+                    if mode == Tunnel { 20 } else { 15 },
+                ),
+            );
+            for want in [
+                format!("R Restart the Daemon ({help_restart})"),
+                "Esc / q Close this view (the Daemon keeps running)".to_string(),
+                "Press any key to close".to_string(),
+            ] {
+                assert!(help.contains(&want), "{case}: {want:?}\n{help}");
+            }
+            // A wrapped description continues under its own column, not under the key.
+            let (desc_x, desc_y) =
+                crate::tui::dialogs::test_render::find(&buf, "Restart the Daemon");
+            let cell = |x: u16| buf[(x, desc_y + 1)].symbol().trim().to_string();
+            assert!(
+                cell(desc_x - 1).is_empty() && !cell(desc_x).is_empty(),
+                "{case}\n{help}"
+            );
+            assert_eq!(
+                help.contains("G New passphrase (signs every Device out)"),
+                mode == Tunnel,
+                "{case}\n{help}"
+            );
+        }
     }
 
     #[test]
