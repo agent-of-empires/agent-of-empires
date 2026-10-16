@@ -1224,6 +1224,13 @@
       ]
     },
     {
+      "id": "wizard.profile-agent-defaults",
+      "kind": "vitest",
+      "risk": "medium",
+      "specs": ["src/components/session-wizard/__tests__/SessionWizard.test.tsx"],
+      "components": ["web/src/components/session-wizard/profileDefaults.ts"]
+    },
+    {
       "id": "wizard.agent-allowlist",
       "kind": "vitest",
       "risk": "high",
