@@ -140,7 +140,7 @@ pub async fn serve_plugin_icon(Path(id): Path<String>) -> Response {
 /// Page policy from ADR 0005: only the bundle's own inline script and style run,
 /// and only the dashboard may frame it. `sandbox` gives the document an opaque
 /// origin even on a direct visit, not only inside the dashboard's iframe.
-const PLUGIN_PAGE_CSP: &str = "sandbox allow-scripts; default-src 'none'; \
+const PLUGIN_PAGE_CSP: &str = "sandbox allow-scripts allow-downloads; default-src 'none'; \
     script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src data: blob:; \
     connect-src 'none'; form-action 'none'; base-uri 'none'; frame-ancestors 'self'";
 
@@ -1130,7 +1130,7 @@ mod tests {
         let cases = [
             (
                 "/page",
-                "sandbox allow-scripts; default-src 'none'; script-src 'unsafe-inline'; \
+                "sandbox allow-scripts allow-downloads; default-src 'none'; script-src 'unsafe-inline'; \
                  style-src 'unsafe-inline'; img-src data: blob:; connect-src 'none'; \
                  form-action 'none'; base-uri 'none'; frame-ancestors 'self'",
                 "SAMEORIGIN",

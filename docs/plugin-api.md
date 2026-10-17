@@ -8,7 +8,7 @@ A manifest carries two independent version axes.
 
 | Key | Meaning |
 |---|---|
-| `api_version` | The manifest *schema* version. The current schema is `17`. The host rejects a manifest whose `api_version` is newer than it supports. |
+| `api_version` | The manifest *schema* version. The current schema is `18`. The host rejects a manifest whose `api_version` is newer than it supports. |
 | `aoe_version` | A semver requirement on the *host app* version, e.g. `">=1.11.0, <2.0.0"`. The host refuses to install, and skips loading, a plugin whose requirement excludes the running version. Optional; requires `api_version >= 4`. |
 
 Each key below notes the `api_version` it needs. Target the newest schema your plugin uses, and set `aoe_version` to the host range you have tested.
@@ -30,7 +30,7 @@ capabilities = ["runtime.worker"]
 | `id` | string | yes | Plugin id (see [Plugin id](#plugin-id)). Namespaces config, events, and action names. |
 | `name` | string | yes | Human-readable display name. |
 | `version` | string | yes | Semantic version of the plugin. |
-| `api_version` | integer | yes | Manifest schema version, `1` to `17`. |
+| `api_version` | integer | yes | Manifest schema version, `1` to `18`. |
 | `description` | string | no | Shown in plugin listings. Defaults to empty. |
 | `aoe_version` | string | no | Host-app semver requirement. Requires `api_version >= 4`. |
 | `capabilities` | array of string | no | Runtime grants the worker needs (see [Capabilities](#capabilities)). Static contributions need none. |
@@ -331,9 +331,9 @@ entry = "dist/board.html"
 
 A page `id` uses only letters, digits, `-` and `_`, and is unique among the plugin's pages. `entry` follows the [screenshot path rules](#screenshots) with an `.html` extension and must resolve inside the plugin directory. A plugin may declare several pages.
 
-The entry must be one self-contained file: inline every script and style, and embed images as `data:` or `blob:` URLs. The host serves only that file, at `GET /api/plugins/{id}/pages/{page_id}` for an active plugin, uncached. Its policy sandboxes the document (`sandbox allow-scripts`), so it gets an opaque origin even when the URL is opened directly, runs the inline script and style and `data:`/`blob:` images, and blocks every other resource load, connection and form submission. As a second layer, the URL refuses any query string and any request whose `Sec-Fetch-Dest` is present and not `iframe`, and only the dashboard may frame it. Browsers send `Sec-Fetch-Dest` only over HTTPS or to localhost, so a dashboard reached over plain HTTP by LAN IP relies on the sandbox alone.
+The entry must be one self-contained file: inline every script and style, and embed images as `data:` or `blob:` URLs. The host serves only that file, at `GET /api/plugins/{id}/pages/{page_id}` for an active plugin, uncached. Its policy sandboxes the document (`sandbox allow-scripts allow-downloads`), so it gets an opaque origin even when the URL is opened directly, runs the inline script and style and `data:`/`blob:` images, and blocks every other resource load, connection and form submission. As a second layer, the URL refuses any query string and any request whose `Sec-Fetch-Dest` is present and not `iframe`, and only the dashboard may frame it. Browsers send `Sec-Fetch-Dest` only over HTTPS or to localhost, so a dashboard reached over plain HTTP by LAN IP relies on the sandbox alone.
 
-The dashboard opens a page at `/plugins/{id}/{page_id}`, from its button beside the TopBar search or the command palette, in an iframe with `sandbox="allow-scripts"` and nothing else. The page cannot read dashboard storage or cookies, call the API, submit forms, open windows or navigate the dashboard; its only data path is the bridge. A page that reloads itself more than 60 seconds after opening loses its authentication when device binding is on; reopen it from the dashboard instead.
+The dashboard opens a page at `/plugins/{id}/{page_id}`, from its button beside the TopBar search or the command palette, in an iframe with `sandbox="allow-scripts allow-downloads"` and nothing else. The page cannot read dashboard storage or cookies, call the API, submit forms, open windows or navigate the dashboard; its only data path is the bridge. It can save a file by clicking an `<a download>` on a `blob:` URL. `allow-downloads` does not require a user gesture, so a page can also start a download from script; the browser's own download protections apply and vary by browser, and Safari can block a download started after an `await`. Start downloads from a click handler. A manifest with `api_version >= 18` can rely on downloads being allowed. A page that reloads itself more than 60 seconds after opening loses its authentication when device binding is on; reopen it from the dashboard instead.
 
 A worker may push state for a page with `ui.state.set` (`slot = "page"`, `id` = the page id, no `session_id`). The payload is any JSON object up to 64 KiB, stored unvalidated; `ui.state.remove` clears it. It appears in `GET /api/plugins/ui-state` as a global entry, `{ "plugin_id", "slot": "page", "id", "payload" }`, which the page reads through `plugins.uiState`.
 
