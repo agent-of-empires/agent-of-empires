@@ -238,24 +238,6 @@ pub fn create_workspace(
     workspace_template: &str,
     init_submodules: bool,
 ) -> Result<WorkspaceResult> {
-    create_workspace_with_path(
-        primary,
-        extra_repos,
-        branch,
-        create_new_branch,
-        workspace_template,
-        init_submodules,
-    )
-}
-
-fn create_workspace_with_path(
-    primary: &WorkspaceRepoSpec,
-    extra_repos: &[WorkspaceRepoSpec],
-    branch: &str,
-    create_new_branch: bool,
-    workspace_template: &str,
-    init_submodules: bool,
-) -> Result<WorkspaceResult> {
     let primary_main_repo = GitWorktree::find_main_repo(&primary.path)?;
     let primary_git_wt = GitWorktree::new(primary_main_repo)?;
 
@@ -580,7 +562,7 @@ pub fn build_instance(
                 })
                 .collect();
 
-            let ws_result = create_workspace_with_path(
+            let ws_result = create_workspace(
                 &primary,
                 &extra_repos,
                 branch,

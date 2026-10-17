@@ -40,14 +40,14 @@ fn print_status(profile: &str) -> Result<()> {
         println!("  Run `aoe hooks approve` to let AoE write them, or accept the");
         println!("  dialog the TUI shows when you create a host session.");
     }
-    print_disclosure(profile)?;
+    print_disclosure(profile, true)?;
     Ok(())
 }
 
 fn approve(profile: &str) -> Result<()> {
     // Always disclose, even on a repeat run, so the output can be used to
     // review what the standing approval covers for another profile.
-    print_disclosure(profile)?;
+    print_disclosure(profile, false)?;
     if approved()? {
         println!();
         println!("Agent hooks already approved for this installation");
@@ -63,7 +63,7 @@ fn approve(profile: &str) -> Result<()> {
 
 /// Print the files and hook commands this profile resolves, for every tool it
 /// installs hooks for. The printed caveat is the bound on that list.
-fn print_disclosure(profile: &str) -> Result<()> {
+fn print_disclosure(profile: &str, continue_on_resolution_error: bool) -> Result<()> {
     let profile = crate::session::config::effective_profile(profile);
     let config = crate::session::config::profile_config::resolve_config_or_warn(&profile);
     let status_hooks = config.session.agent_status_hooks;
@@ -77,6 +77,7 @@ fn print_disclosure(profile: &str) -> Result<()> {
     // vanish from the enumeration without a trace. Keep its name: the user
     // cannot otherwise tell "no extra agent" from "an agent I could not name".
     let mut unresolved: Vec<&str> = Vec::new();
+    let mut unresolved_paths = Vec::new();
     let disclosures: Vec<_> = tool_names
         .into_iter()
         .map(|tool_name| {
@@ -92,7 +93,14 @@ fn print_disclosure(profile: &str) -> Result<()> {
             if !crate::agents::hook_install_required(agent, status_hooks) {
                 return Ok(None);
             }
-            let disclosure = host_hook_disclosure_for_profile(tool_name, agent, &config)?;
+            let disclosure = match host_hook_disclosure_for_profile(tool_name, agent, &config) {
+                Ok(disclosure) => disclosure,
+                Err(error) if continue_on_resolution_error => {
+                    unresolved_paths.push((tool_name, error));
+                    return Ok(None);
+                }
+                Err(error) => return Err(error),
+            };
             Ok((!disclosure.settings_paths.is_empty()).then_some((tool_name, disclosure)))
         })
         .collect::<Result<Vec<_>>>()?
@@ -140,6 +148,13 @@ fn print_disclosure(profile: &str) -> Result<()> {
             .any(|path| path.starts_with("<launch cwd>/"))
     }) {
         println!("  <launch cwd> paths are resolved against the launch cwd for each session.");
+    }
+    if !unresolved_paths.is_empty() {
+        println!();
+        println!("Unresolved hook targets:");
+        for (tool_name, error) in &unresolved_paths {
+            println!("  {tool_name}: {error}");
+        }
     }
 
     if !unresolved.is_empty() {

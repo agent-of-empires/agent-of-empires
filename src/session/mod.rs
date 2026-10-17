@@ -69,6 +69,8 @@ pub use groups::{
     TRASH_SECTION_PATH,
 };
 #[cfg(test)]
+pub(crate) use instance::host_hook_disclosure;
+#[cfg(test)]
 pub(crate) use instance::install_aliases;
 #[cfg(test)]
 pub(crate) use instance::test_helpers::publish_host_pi_transcript;
@@ -80,10 +82,9 @@ pub(crate) use instance::{
     NEWER_GENERATION_BUSY_REASON,
 };
 pub(crate) use instance::{
-    host_hook_agent, host_hook_disclosure, host_hook_disclosure_config_with_repo,
-    host_hook_disclosure_for_launch, host_hook_disclosure_for_profile,
-    host_hook_post_install_notes, resolved_agent_for, ConversationState, HostHookDisclosure,
-    ResumeAttemptPolicy, TerminalContextResume,
+    host_hook_agent, host_hook_disclosure_config_with_repo, host_hook_disclosure_for_launch,
+    host_hook_disclosure_for_profile, host_hook_post_install_notes, resolved_agent_for,
+    ConversationState, HostHookDisclosure, ResumeAttemptPolicy, TerminalContextResume,
 };
 pub use instance::{
     is_valid_session_color, ConversationBinding, ConversationProvenance, DetectionState,

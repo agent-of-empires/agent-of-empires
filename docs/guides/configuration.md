@@ -158,6 +158,10 @@ The approval is per installation and is not bound to a profile, so every profile
 Turning `agent_status_hooks` off stops AoE installing status hooks, but it does not end the gate: identity hooks, which native resume depends on, stay installed. How many agents remain gated then depends on which ones declare an identity event, so check `aoe hooks status` for the list under a given profile. A session launched with its own command resolves the file that command names, which the TUI creation dialog describes exactly. `aoe hooks status` has neither a session nor a project directory: it resolves each tool from the profile config, so for a repository that sets `session.agent_detect_as` it can name a different agent than the same session launched inside that repository.
 For OMP, `aoe hooks status` uses `--profile` from the configured launch command. If `PI_CODING_AGENT_DIR` is relative, it shows `<launch cwd>/...` because the target depends on where the session starts.
 
+If an OMP launch uses `--no-session` or shell syntax that AoE cannot resolve, it skips status hook installation and uses pane detection instead of blocking the session. `aoe hooks status` lists unresolved targets alongside the other agents; `aoe hooks approve` still fails if it cannot disclose a target.
+
+Sandboxed OMP sessions stage the hook in the selected OMP profile's agent directory, including a profile selected through extra arguments or sandbox environment variables.
+
 ## Custom agents
 
 Custom agents name commands AoE cannot detect as a built-in binary: SSH wrappers, local scripts, or a CLI pointed at a second account. Configure them once, then pick the name in the TUI picker, `aoe add --tool <name>`, or the web wizard.

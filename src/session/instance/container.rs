@@ -499,6 +499,7 @@ impl Instance {
                 &self.tool,
                 Some(self.get_tool_command()),
             )
+            .with_extra_args(&self.extra_args)
             .with_selected_agent(selected_agent.as_deref())
             .with_credential_fold(fold),
             container_config::SandboxYolo {

@@ -26,16 +26,6 @@ pub struct HooksInstallDialog {
 }
 
 impl HooksInstallDialog {
-    pub fn new(
-        tool_name: &str,
-        agent: &'static crate::agents::AgentDef,
-        config: &crate::session::config::Config,
-    ) -> Self {
-        Self::from_disclosure(crate::session::host_hook_disclosure(
-            tool_name, agent, config,
-        ))
-    }
-
     pub fn new_for_launch(
         tool_name: &str,
         agent: &'static crate::agents::AgentDef,
@@ -379,7 +369,9 @@ mod tests {
         )
         .or_else(|| crate::agents::get_agent(tool_name))
         .unwrap_or_else(|| panic!("{tool_name} must name a known agent"));
-        HooksInstallDialog::new(tool_name, agent, &config)
+        HooksInstallDialog::from_disclosure(crate::session::host_hook_disclosure(
+            tool_name, agent, &config,
+        ))
     }
     #[test]
     fn the_accept_and_cancel_keys_decide_the_dialog() {

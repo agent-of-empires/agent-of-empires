@@ -293,6 +293,24 @@ fn hooks_cli_discloses_omp_profile_and_relative_agent_dir() {
             );
         }
     }
+    write_config(
+        &xdg,
+        "[session.agent_command_override]\nomp = \"omp --profile\"\n",
+    );
+    let status = run_aoe(&home, &xdg, &stub, &socket, &["hooks", "status"]);
+    assert_eq!(status.code, Some(0), "{}", status.all());
+    assert!(
+        status.stdout.contains("Unresolved hook targets:\n  omp:")
+            && status.stdout.contains("  claude: "),
+        "status must continue and identify an unresolved OMP path: {}",
+        status.stdout
+    );
+    let approval = run_aoe(&home, &xdg, &stub, &socket, &["hooks", "approve"]);
+    assert_ne!(
+        approval.code,
+        Some(0),
+        "approval must fail when an OMP hook target cannot be resolved"
+    );
 }
 
 /// #4159: the approval is install-wide while this command has no project

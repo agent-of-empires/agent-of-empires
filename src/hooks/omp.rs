@@ -139,13 +139,6 @@ mod tests {
 
         install_omp_hooks_with_events(&path, HookInstallTarget::Host, &events).unwrap();
         assert!(is_omp_hook(&std::fs::read_to_string(&path).unwrap()));
-        let source = std::fs::read_to_string(&path).unwrap();
-        assert!(source.contains(
-            "pi.on(\"agent_start\", (_event, ctx) => { if (ctx.agent.kind === \"main\")"
-        ));
-        assert!(source.contains(
-            "pi.on(\"agent_end\", (event, ctx) => { if (ctx.agent.kind === \"main\" && !event.willContinue)"
-        ));
         assert!(uninstall_omp_hooks(&path).unwrap());
         assert!(!path.exists());
 

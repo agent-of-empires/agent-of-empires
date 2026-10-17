@@ -149,7 +149,7 @@ pub(crate) fn host_hook_disclosure_for_profile(
         "",
     )?;
     let configured = config.session.agent_config_dir_for(tool_name, &home);
-    let root = if let Some(root) = configured.as_ref().filter(|root| root.is_absolute()) {
+    let root = if let Some(root) = configured.as_ref() {
         root.clone()
     } else {
         let environment = crate::session::capture::host_launcher_environment(host_env);
@@ -730,7 +730,7 @@ fn host_hook_config_path(
     if let Some(sidecar) = agent.sidecar_hooks.as_ref() {
         let configured = session_cfg.agent_config_dir_for(tool, home);
         if agent.name == "omp" {
-            if let Some(root) = configured.as_deref().filter(|root| root.is_absolute()) {
+            if let Some(root) = configured.as_deref() {
                 return Some(crate::hooks::sidecar_host_config_path_in(
                     home,
                     sidecar,
@@ -815,7 +815,7 @@ fn host_hook_config_path_for_launch(
         } else {
             launch.command_override.to_owned()
         };
-        let context = super::omp::resolve_host_omp_layout_for_launch(
+        let context = match super::omp::resolve_host_omp_layout_for_launch(
             tool,
             host_environment,
             home,
@@ -823,7 +823,14 @@ fn host_hook_config_path_for_launch(
             session_cfg,
             &command_override,
             launch.extra_args,
-        )?;
+        ) {
+            Ok(context) => context,
+            Err(error) => {
+                tracing::warn!(target: "session.store",
+                    "Skipping OMP status hooks because its launch path cannot be resolved: {error}");
+                return Ok(None);
+            }
+        };
         return Ok(Some(crate::hooks::sidecar_host_config_path_in(
             home,
             sidecar,
@@ -1913,6 +1920,7 @@ mod tests {
                     None,
                 ));
             }
+
             if let Some(config) = profile {
                 write_profile("hook-gate", config);
                 inst.source_profile = "hook-gate".to_string();
@@ -1938,6 +1946,49 @@ mod tests {
         assert!(failures.is_empty(), "{failures:#?}");
     }
 
+    #[test]
+    #[serial_test::serial]
+    fn unresolved_omp_hook_paths_do_not_block_launch() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _app = crate::session::test_support::isolate_app_dir_at(&tmp.path().join("app"));
+        let _home = crate::session::test_support::isolate_home(tmp.path());
+        let _env = EnvGuard::unset(&crate::session::capture::OMP_STORE_ENV_KEYS[1..]);
+        write_profile(
+            "unresolved-omp-hooks",
+            "[session]\nagent_status_hooks = true\n",
+        );
+        acknowledge_hooks();
+
+        let agent = crate::agents::get_agent("omp").unwrap();
+        let config =
+            crate::session::config::profile_config::resolve_config_or_warn("unresolved-omp-hooks");
+        for (command, extra_args) in [("", "--no-session"), ("$HOME/.local/bin/omp", "")] {
+            let mut instance = tool_instance("omp", tmp.path().to_str().unwrap());
+            instance.source_profile = "unresolved-omp-hooks".to_string();
+            instance.command = command.to_string();
+            instance.extra_args = extra_args.to_string();
+            let disclosure = host_hook_disclosure_for_launch(
+                "omp",
+                agent,
+                &config,
+                tmp.path(),
+                command,
+                extra_args,
+            )
+            .unwrap();
+            assert!(disclosure.settings_paths.is_empty());
+            instance
+                .ensure_disclosed_host_hook_path(Some(agent))
+                .unwrap();
+            instance.install_agent_status_hooks(Some(agent), None);
+            assert!(
+                !tmp.path()
+                    .join(".omp/agent/hooks/pre/aoe-status.ts")
+                    .exists(),
+                "unresolved launch must skip installing hooks"
+            );
+        }
+    }
     #[test]
     #[serial_test::serial]
     fn identity_hooks_remain_when_status_hooks_are_disabled() {

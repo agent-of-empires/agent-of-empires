@@ -629,12 +629,6 @@ pub(super) struct NativeLaunchInputs {
     pub(super) identity_extension: Option<(String, String)>,
 }
 
-pub(super) fn canonicalize_host_path(
-    path: &std::path::Path,
-    cwd: &std::path::Path,
-) -> Result<PathBuf> {
-    NativeLaunchInputs::canonicalize_host_path(path, cwd)
-}
 impl NativeLaunchInputs {
     /// Whether the pane runs `program` as the binary AoE's own PATH resolves `binary` to, which
     /// is what a host `--help` probe of `binary` describes.
@@ -1213,7 +1207,7 @@ impl NativeLaunchInputs {
         }
     }
 
-    pub(super) fn physical_location(&self, canonical_path: &std::path::Path) -> ExecutionLocation {
+    fn physical_location(&self, canonical_path: &std::path::Path) -> ExecutionLocation {
         match &self.container {
             Some(container) => {
                 let (filesystem, path) = container.physical_path(canonical_path);

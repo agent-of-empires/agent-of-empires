@@ -14,7 +14,7 @@ pub(super) fn resolve_host_omp_store_layout(
     declared_agent_dir: Option<&Path>,
 ) -> Result<crate::session::capture::OmpResolvedContext> {
     let declared_agent_dir = declared_agent_dir
-        .map(|path| super::execution::canonicalize_host_path(path, cwd))
+        .map(|path| super::execution::NativeLaunchInputs::canonicalize_host_path(path, cwd))
         .transpose()?;
     if let Some(directory) = &declared_agent_dir {
         environment.insert(
@@ -34,8 +34,10 @@ pub(super) fn resolve_host_omp_store_layout(
     )?;
     if let Some(declared_agent_dir) = declared_agent_dir {
         anyhow::ensure!(
-            super::execution::canonicalize_host_path(&context.agent_dir, Path::new(cwd))?
-                == declared_agent_dir,
+            super::execution::NativeLaunchInputs::canonicalize_host_path(
+                &context.agent_dir,
+                Path::new(cwd),
+            )? == declared_agent_dir,
             "OMP profile or dotenv overrides the declared wrapper namespace"
         );
     }

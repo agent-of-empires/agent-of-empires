@@ -1537,7 +1537,7 @@ mod tests {
         .unwrap();
     }
 
-    // The sidecar env var has to survive into the docker argv; no CI container would catch it.
+    // The resolved directory must reach the native host launch environment.
     #[test]
     #[serial_test::serial]
     fn omp_launch_uses_resolved_agent_dir_when_dotenv_conflicts() {
