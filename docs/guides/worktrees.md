@@ -115,6 +115,8 @@ If an operation is interrupted, AoE may keep its affected session, checkout or b
 
 Clearing archives the original evidence and releases the operation's matching reservation. It never deletes checkouts, branches, containers or agent stores. A live producer lease or changed session owner makes it refuse the clear. The `--actors-stopped` flag attests to the inspection and shutdown above; obtaining a free lease is not a substitute.
 
+If clearing completes, failures in the subsequent diagnostic scan appear as warnings and do not change its success status. Inspect the reported profile or journal before rerunning diagnostics; do not repeat an already completed clear.
+
 After clearing malformed evidence, a session can still hold an orphaned binding. `aoe intents list` prints the exact command for each one: `aoe --profile='<profile>' intents clear --orphan-binding=<session-id> --actors-stopped`. This releases only that session's reservation and refuses if its journal still exists. Reload the session and inspect its state before retrying the original operation.
 
 ## Warnings during create

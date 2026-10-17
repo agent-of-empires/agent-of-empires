@@ -71,7 +71,7 @@ pub fn run(profile: &str, command: IntentCommands) -> Result<()> {
             if let Some(reason) = reason {
                 println!("Operator reason: {reason}");
             }
-            report_orphan_bindings(&root)?;
+            report_orphan_bindings(&root);
             Ok(())
         }
     }
@@ -104,7 +104,8 @@ fn list() -> Result<()> {
             }
         }
     }
-    report_orphan_bindings(&root)
+    report_orphan_bindings(&root);
+    Ok(())
 }
 
 fn clear_path(root: &OwnershipGuard, path: &Path) -> Result<()> {
@@ -151,33 +152,73 @@ fn clear_path(root: &OwnershipGuard, path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn report_orphan_bindings(root: &OwnershipGuard) -> Result<()> {
-    for profile in crate::session::list_profiles_for_worktree_inventory()? {
-        let storage = Storage::open_with_ownership(
+fn report_orphan_bindings(root: &OwnershipGuard) {
+    let profiles = match crate::session::list_profiles_for_worktree_inventory() {
+        Ok(profiles) => profiles,
+        Err(error) => {
+            eprintln!("Warning: could not inventory orphan bindings: {error:#}");
+            return;
+        }
+    };
+    for profile in profiles {
+        let rows = Storage::open_with_ownership(
             &profile,
             crate::file_watch::FileWatchService::noop(),
             root,
-        )?;
-        for row in storage.load_strict_for_worktree_ownership()? {
+        )
+        .and_then(|storage| storage.load_strict_for_worktree_ownership());
+        let rows = match rows {
+            Ok(rows) => rows,
+            Err(error) => {
+                eprintln!(
+                    "Warning: could not inspect orphan bindings in profile {profile}: {error:#}"
+                );
+                continue;
+            }
+        };
+        for row in rows {
             let Some(reservation) = &row.lifecycle_reservation else {
                 continue;
             };
             let Some(binding) = &reservation.resource_intent else {
                 continue;
             };
-            let path = move_journal::binding_path(binding)?;
-            if matches!(std::fs::symlink_metadata(&path), Err(error) if error.kind() == std::io::ErrorKind::NotFound)
-            {
-                println!("Orphan binding: profile={profile} session={} operation={:?} generation={} journal={binding}; lease={:?}", row.id, reservation.op, reservation.generation, move_journal::lease_state(&path)?);
-                println!(
-                    "  aoe --profile={} intents clear --orphan-binding={} --actors-stopped",
-                    shell_escape_script_word(&profile),
-                    row.id
-                );
+            let path = match move_journal::binding_path(binding) {
+                Ok(path) => path,
+                Err(error) => {
+                    eprintln!("Warning: could not inspect orphan binding for profile {profile}, session {}: {error:#}", row.id);
+                    continue;
+                }
+            };
+            match std::fs::symlink_metadata(&path) {
+                Ok(_) => continue,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    eprintln!(
+                        "Warning: could not inspect journal {}: {error}",
+                        path.display()
+                    );
+                    continue;
+                }
             }
+            let lease = match move_journal::lease_state(&path) {
+                Ok(state) => format!("{state:?}"),
+                Err(error) => {
+                    eprintln!(
+                        "Warning: could not inspect journal lease {}: {error:#}",
+                        path.display()
+                    );
+                    "unreadable".into()
+                }
+            };
+            println!("Orphan binding: profile={profile} session={} operation={:?} generation={} journal={binding}; lease={lease}", row.id, reservation.op, reservation.generation);
+            println!(
+                "  aoe --profile={} intents clear --orphan-binding={} --actors-stopped",
+                shell_escape_script_word(&profile),
+                row.id
+            );
         }
     }
-    Ok(())
 }
 
 #[cfg(test)]
@@ -231,6 +272,43 @@ mod tests {
         intent.phase = move_journal::EffectPhase::Pending;
         admitted.transaction.journal().rewrite(&entry)?;
         Ok((storage, before, admitted))
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn completed_clear_survives_unreadable_peer_reporting() -> Result<()> {
+        for orphan in [false, true] {
+            let _app = crate::session::test_support::isolate_app_dir();
+            let (storage, _, admitted) = pending_fixture()?;
+            let path = admitted.transaction.journal().path.clone();
+            drop(admitted);
+            let mut expected = storage.load()?;
+            let command = if orphan {
+                std::fs::remove_file(&path)?;
+                IntentCommands::Clear {
+                    path: None,
+                    orphan_binding: Some(expected[0].id.clone()),
+                    actors_stopped: true,
+                    reason: None,
+                }
+            } else {
+                clear(&path, true)
+            };
+            let peer = Storage::new_unwatched("unreadable-report")?;
+            let unreadable = b"{invalid peer profile";
+            std::fs::write(peer.sessions_path(), unreadable)?;
+
+            run("owner", command)?;
+
+            assert!(!path.exists());
+            expected[0].lifecycle_reservation = None;
+            assert_eq!(
+                serde_json::to_value(storage.load()?)?,
+                serde_json::to_value(expected)?
+            );
+            assert_eq!(std::fs::read(peer.sessions_path())?, unreadable);
+        }
+        Ok(())
     }
 
     #[test]
