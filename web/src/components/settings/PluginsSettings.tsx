@@ -54,6 +54,15 @@ export function PluginsSettings({ readOnly = false }: { readOnly?: boolean } = {
     return () => clearTimeout(timer);
   }, [reload]);
 
+  useEffect(() => {
+    if (!confirmUninstall) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") setConfirmUninstall(null);
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [confirmUninstall]);
+
   const onToggle = async (plugin: PluginView, enabled: boolean) => {
     setBusy(true);
     setError(null);

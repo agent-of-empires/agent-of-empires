@@ -3,6 +3,19 @@
   "description": "Surface/flow coverage matrix for the agent-of-empires web dashboard. Every component file under web/src/components/** must appear in at least one entry's `components` list (covered, deferred, or out-of-scope), or in coverage-matrix.exempt.json. CI validates this on every PR via tests/validate-coverage-matrix.mjs.",
   "surfaces": [
     {
+      "id": "settings.dialog-escape",
+      "kind": "mocked-playwright",
+      "risk": "high",
+      "specs": ["tests/settings-dialog-escape.spec.ts"],
+      "components": [
+        "web/src/App.tsx",
+        "web/src/components/settings/PluginsSettings.tsx",
+        "web/src/components/settings/PluginDetailModal.tsx",
+        "web/src/components/AboutModal.tsx"
+      ],
+      "notes": "Real Escape keys dismiss uninstall, plugin details and its nested lightbox, and Web dashboard disable confirmation without leaving Settings or issuing a mutation; Escape without a dialog still closes Settings."
+    },
+    {
       "id": "terminal.paired-shell",
       "kind": "vitest",
       "risk": "medium",
