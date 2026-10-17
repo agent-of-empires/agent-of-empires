@@ -444,6 +444,40 @@ fn each_pending_opener_is_kept_until_its_own_exit_arrives() {
     assert!(env.view.opener_exits.is_empty());
 }
 
+#[cfg(unix)]
+#[test]
+fn every_opener_failure_ready_before_a_poll_is_reported() {
+    use crate::tui::home::overlays::opener_failure_feedback;
+    use std::os::unix::process::ExitStatusExt;
+    let mut env = create_test_env_empty();
+    for (url, code) in [("vscode://file/a", 1), ("vscode://file/b", 2)] {
+        let (tx, rx) = std::sync::mpsc::channel();
+        tx.send(std::process::ExitStatus::from_raw(code << 8))
+            .unwrap();
+        env.view.opener_exits.push((url.to_string(), rx));
+    }
+    let failed = env.view.take_failed_openers();
+    assert!(env.view.opener_exits.is_empty());
+    let urls: Vec<&str> = failed.iter().map(|(url, _)| url.as_str()).collect();
+    assert_eq!(urls, ["vscode://file/a", "vscode://file/b"]);
+    assert_eq!(
+        opener_failure_feedback(&failed),
+        Some((
+            "vscode://file/a\nvscode://file/b".to_string(),
+            "nothing opened 2 links; copied vscode://file/a vscode://file/b".to_string()
+        ))
+    );
+    let status = failed[0].1;
+    assert_eq!(
+        opener_failure_feedback(&failed[..1]),
+        Some((
+            "vscode://file/a".to_string(),
+            format!("nothing opened it ({status}); copied vscode://file/a")
+        ))
+    );
+    assert_eq!(opener_failure_feedback(&[]), None);
+}
+
 #[test]
 #[serial]
 fn the_link_policy_reloads_on_its_own() {
