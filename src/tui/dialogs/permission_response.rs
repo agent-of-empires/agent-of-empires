@@ -76,9 +76,14 @@ const ALL_CHOICES: [(&str, PermissionResponseChoice); 3] = [
 impl PermissionResponseDialog {
     pub fn new(
         session_title: &str,
-        allow_always: Option<&'static [crate::agents::KeyToken]>,
+        allow_always: Option<&'static [crate::agents::KeyToken<'static>]>,
     ) -> Self {
         Self::build(session_title, allow_always.is_some(), None)
+    }
+
+    /// Construct a provider-owned approval dialog with its declared choices.
+    pub fn new_with_allow_always(session_title: &str, allow_always: bool) -> Self {
+        Self::build(session_title, allow_always, None)
     }
 
     /// Show the ACP tool, target and destructive flag before resolving its request.
@@ -272,7 +277,7 @@ mod tests {
     /// Stand-in for a real agent's `allow_always` mapping. `Some(&[])` would
     /// also satisfy `.is_some()` but reads as "supported with zero
     /// keystrokes", a footgun if copy-pasted into a real `AgentDef`.
-    const ALLOW_ALWAYS: Option<&[crate::agents::KeyToken]> =
+    const ALLOW_ALWAYS: Option<&[crate::agents::KeyToken<'static>]> =
         Some(&[crate::agents::KeyToken::Literal("2")]);
 
     fn dialog() -> PermissionResponseDialog {

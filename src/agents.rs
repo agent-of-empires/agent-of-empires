@@ -377,16 +377,16 @@ pub struct AgentDef {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum KeyToken {
-    Literal(&'static str),
-    Named(&'static str),
+pub enum KeyToken<'a> {
+    Literal(&'a str),
+    Named(&'a str),
 }
 
 #[derive(Clone, Copy, Debug)]
 pub struct PermissionResponse {
-    pub allow: &'static [KeyToken],
-    pub allow_always: Option<&'static [KeyToken]>,
-    pub deny: &'static [KeyToken],
+    pub allow: &'static [KeyToken<'static>],
+    pub allow_always: Option<&'static [KeyToken<'static>]>,
+    pub deny: &'static [KeyToken<'static>],
 }
 
 const fn hook(name: &'static str, status: HookStatus) -> HookEvent {

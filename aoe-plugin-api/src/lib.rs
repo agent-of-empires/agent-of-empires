@@ -1,6 +1,7 @@
 //! Plugin manifest types for the Agent of Empires plugin system.
 
 pub mod acp;
+pub mod agent_integration;
 mod capability;
 mod id;
 mod manifest;
@@ -15,4 +16,5 @@ pub use manifest::{
     SettingType, StatusContribution, ThemeContribution, UiContribution, UiSlot, MAX_SCREENSHOTS,
 };
 
-pub const API_VERSION: u32 = 17;
+/// Provider-native agent integration status and user-requested prompt replies.
+pub const API_VERSION: u32 = 18;

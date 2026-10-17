@@ -42,6 +42,12 @@ Every update, including the opt-in auto-update, restarts the plugin's worker in 
 
 The web dashboard's Plugins settings does the same things, with a marketplace searching the `aoe-plugin` GitHub topic; every mutating action confirms the plugin's capabilities first.
 
+## OMP integration
+
+The optional companion package in `plugins/agent-omp/` connects the OMP runtime extension to AoE's terminal session list. It requires an AoE release with plugin API v18 and the separately installed OMP runtime extension. Older AoE hosts reject its manifest; upgrade AoE before installing the package.
+
+The integration reports OMP-native session status and exposes OMP approval and question prompts to the AoE response dialog. AoE sends a user-selected reply to OMP; it does not approve tools automatically. Installing the integration does not restart existing OMP sessions.
+
 ## Trust and capabilities
 
 Bundled plugins are `builtin` and fully trusted. Installed plugins are `community` and untrusted: the manifest declares the capabilities they need (network, filesystem, spawning processes, and so on) and install prompts once to grant that exact set. `--yes` grants without prompting, and a capability this version does not recognize is rejected rather than granted. An external plugin cannot claim the reserved `aoe.*` or `agent-of-empires.*` id namespace.

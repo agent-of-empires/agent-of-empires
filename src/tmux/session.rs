@@ -1061,7 +1061,7 @@ impl Session {
 
     /// Send exactly these tokens, with no implicit Enter, to answer an agent's own
     /// permission prompt.
-    pub fn send_key_tokens(&self, tokens: &[crate::agents::KeyToken]) -> Result<()> {
+    pub fn send_key_tokens(&self, tokens: &[crate::agents::KeyToken<'_>]) -> Result<()> {
         if !self.exists() {
             bail!("Session does not exist: {}", self.name);
         }

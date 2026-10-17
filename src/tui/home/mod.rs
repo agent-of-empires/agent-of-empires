@@ -99,7 +99,14 @@ pub(super) struct GroupRenameContext {
 
 pub(super) enum PermissionResponseTarget {
     Terminal(String),
-    Structured { session_id: String, nonce: String },
+    Structured {
+        session_id: String,
+        nonce: String,
+    },
+    Integration {
+        session_id: String,
+        snapshot: aoe_plugin_api::agent_integration::AgentIntegrationSnapshot,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -220,6 +227,7 @@ pub struct HomeView {
     pub(super) tips_badge_hovered: bool,
     pub(super) send_message_dialog: Option<super::dialogs::SendMessageDialog>,
     pub(super) permission_response_dialog: Option<super::dialogs::PermissionResponseDialog>,
+    pub(super) agent_question_dialog: Option<super::dialogs::AgentQuestionDialog>,
     pub(super) pending_permission_response: Option<PermissionResponseTarget>,
     pub(super) pending_send_session: Option<String>,
     pub(super) pending_send_target: live_send::LiveSendTarget,

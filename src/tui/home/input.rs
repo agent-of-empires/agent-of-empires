@@ -1655,6 +1655,9 @@ impl HomeView {
             self.press_dialog_key(key);
             return true;
         }
+        if self.agent_question_dialog.is_some() {
+            return true;
+        }
         if let Some(dialog) = &self.permission_response_dialog {
             let key = dialog.handle_click(col, row);
             self.press_dialog_key(key);
@@ -2475,6 +2478,38 @@ impl HomeView {
             return None;
         }
 
+        if let Some(dialog) = &mut self.agent_question_dialog {
+            match dialog.handle_key(key) {
+                DialogResult::Continue => {}
+                DialogResult::Cancel => {
+                    self.agent_question_dialog = None;
+                    self.pending_permission_response = None;
+                }
+                DialogResult::Submit(answers) => {
+                    self.agent_question_dialog = None;
+                    if let Some(PermissionResponseTarget::Integration {
+                        session_id,
+                        snapshot,
+                    }) = self.pending_permission_response.take()
+                    {
+                        let response =
+                            aoe_plugin_api::agent_integration::AgentIntegrationResponse::Question {
+                                answers,
+                            };
+                        if let Some(instance) = self.get_instance(&session_id) {
+                            if let Err(error) = crate::plugin::agent_integration::respond(
+                                instance, &snapshot, response,
+                            ) {
+                                self.info_dialog =
+                                    Some(InfoDialog::new("Response Not Sent", &error.to_string()));
+                            }
+                        }
+                    }
+                }
+            }
+            return None;
+        }
+
         // Permission response dialog
         if let Some(dialog) = &mut self.permission_response_dialog {
             match dialog.handle_key(key) {
@@ -2492,6 +2527,27 @@ impl HomeView {
                             }
                             PermissionResponseTarget::Structured { session_id, nonce } => {
                                 self.resolve_structured_approval(session_id, nonce, choice);
+                            }
+                            PermissionResponseTarget::Integration {
+                                session_id,
+                                snapshot,
+                            } => {
+                                let instance = self.get_instance(&session_id)?;
+                                let response = aoe_plugin_api::agent_integration::AgentIntegrationResponse::Approval {
+                                    choice: match choice {
+                                        crate::tui::dialogs::PermissionResponseChoice::Allow => aoe_plugin_api::agent_integration::IntegrationApprovalChoice::Allow,
+                                        crate::tui::dialogs::PermissionResponseChoice::AllowAlways => aoe_plugin_api::agent_integration::IntegrationApprovalChoice::AllowAlways,
+                                        crate::tui::dialogs::PermissionResponseChoice::Deny => aoe_plugin_api::agent_integration::IntegrationApprovalChoice::Deny,
+                                    },
+                                };
+                                if let Err(error) = crate::plugin::agent_integration::respond(
+                                    instance, &snapshot, response,
+                                ) {
+                                    self.info_dialog = Some(InfoDialog::new(
+                                        "Response Not Sent",
+                                        &error.to_string(),
+                                    ));
+                                }
                             }
                         }
                     }
@@ -5912,6 +5968,10 @@ impl HomeView {
             dialog.handle_paste(text);
             return;
         }
+        if let Some(dialog) = &mut self.agent_question_dialog {
+            dialog.handle_paste(text);
+            return;
+        }
         if let Some(ref mut dialog) = self.new_dialog {
             dialog.handle_paste(text);
             return;
@@ -6422,6 +6482,56 @@ impl HomeView {
             });
             return;
         }
+        // An approved integration owns responses. Missing or invalid reports fail closed
+        // rather than falling through to provider-specific terminal keystrokes.
+        if crate::plugin::agent_integration::configured(inst) {
+            let Some(snapshot) = crate::plugin::agent_integration::snapshot(inst) else {
+                self.info_dialog = Some(InfoDialog::new(
+                    "Integration Unavailable",
+                    "The approved provider report is missing, stale, or invalid. No response was sent.",
+                ));
+                return;
+            };
+            if let Some(prompt) = snapshot.prompt.clone() {
+                match prompt {
+                    aoe_plugin_api::agent_integration::AgentIntegrationPrompt::Approval {
+                        allow_always,
+                        ..
+                    } => {
+                        self.pending_permission_response =
+                            Some(PermissionResponseTarget::Integration {
+                                session_id: id,
+                                snapshot,
+                            });
+                        self.permission_response_dialog = Some(
+                            crate::tui::dialogs::PermissionResponseDialog::new_with_allow_always(
+                                &title,
+                                allow_always,
+                            ),
+                        );
+                    }
+                    prompt @ aoe_plugin_api::agent_integration::AgentIntegrationPrompt::Question {
+                        ..
+                    } => {
+                        self.pending_permission_response =
+                            Some(PermissionResponseTarget::Integration {
+                                session_id: id,
+                                snapshot,
+                            });
+                        self.agent_question_dialog =
+                            Some(crate::tui::dialogs::AgentQuestionDialog::new(prompt));
+                    }
+                }
+                return;
+            }
+            // An approved integration never falls back to provider-specific key mappings.
+            self.info_dialog = Some(InfoDialog::new(
+                "Integration Unavailable",
+                "The approved provider report has no active prompt. No response was sent.",
+            ));
+            return;
+        }
+
         let Some(response) = crate::agents::get_agent(&tool).and_then(|a| a.permission_response)
         else {
             self.info_dialog = Some(InfoDialog::new(

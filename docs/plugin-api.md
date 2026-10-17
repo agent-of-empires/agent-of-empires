@@ -8,7 +8,7 @@ A manifest carries two independent version axes.
 
 | Key | Meaning |
 |---|---|
-| `api_version` | The manifest *schema* version. The current schema is `17`. The host rejects a manifest whose `api_version` is newer than it supports. |
+| `api_version` | The manifest *schema* version. The current schema is `18`. The host rejects a manifest whose `api_version` is newer than it supports. |
 | `aoe_version` | A semver requirement on the *host app* version, e.g. `">=1.11.0, <2.0.0"`. The host refuses to install, and skips loading, a plugin whose requirement excludes the running version. Optional; requires `api_version >= 4`. |
 
 Each key below notes the `api_version` it needs. Target the newest schema your plugin uses, and set `aoe_version` to the host range you have tested.
@@ -30,12 +30,31 @@ capabilities = ["runtime.worker"]
 | `id` | string | yes | Plugin id (see [Plugin id](#plugin-id)). Namespaces config, events, and action names. |
 | `name` | string | yes | Human-readable display name. |
 | `version` | string | yes | Semantic version of the plugin. |
-| `api_version` | integer | yes | Manifest schema version, `1` to `17`. |
+| `api_version` | integer | yes | Manifest schema version, `1` to `18`. |
 | `description` | string | no | Shown in plugin listings. Defaults to empty. |
 | `aoe_version` | string | no | Host-app semver requirement. Requires `api_version >= 4`. |
-| `capabilities` | array of string | no | Runtime grants the worker needs (see [Capabilities](#capabilities)). Static contributions need none. |
+| `capabilities` | array of string | no | Runtime grants the worker needs (see [Capabilities](#capabilities)). Static contributions need none; agent integrations require `session.integration`. |
 | `screenshots` | array | no | Up to 8. Requires `api_version >= 5`. See [Screenshots](#screenshots). |
 | `setting_defaults` | table | no | Overrides for core host settings, keyed by canonical path (e.g. `"theme.idle_decay_minutes"`). Resolution is user value, then plugin override, then core default. |
+| `agent_integrations` | array of tables | no | Provider-native status and prompt replies for supported agents. Requires `api_version >= 18` and `session.integration`. |
+
+## Agent integrations
+
+An agent integration connects a plugin to provider-native status and prompt replies for one supported terminal agent. It is separate from ACP and worker RPCs. The user still chooses each response; declaring an integration does not approve tools automatically.
+
+```toml
+capabilities = ["session.integration"]
+
+[[agent_integrations]]
+tool = "omp"
+```
+
+| Key | Type | Required | Notes |
+|---|---|---|---|
+| `tool` | string | yes | Lowercase agent id supported by the host. The current host supports `omp`; each tool may appear only once per plugin. |
+
+The host uses this declaration only for matching terminal sessions. The current provider integration is `omp`; its companion package and OMP runtime extension must both be installed. See [OMP integration](plugins.md#omp-integration).
+The provider report's `reply_keys` must contain only function-key names from `F1` through `F12`. AoE sends those keys only after the user submits a response.
 
 ## Plugin id
 
@@ -43,7 +62,7 @@ A dotted, lowercase ASCII identifier such as `dev.example.review-helper`. Each d
 
 ## Capabilities
 
-Capabilities gate runtime resource access. They are prompted once at install and pinned to the manifest hash, so an update that widens them must be re-approved. Declare only what the worker uses; static contributions (commands, keybinds, themes, ui, status) need none.
+Capabilities gate plugin resource access and host interactions. They are prompted once at install and pinned to the manifest hash, so an update that widens them must be re-approved. Declare only the capabilities the plugin uses; static contributions (commands, keybinds, themes, ui, status) need none.
 
 | Capability | Grants |
 |---|---|
@@ -68,6 +87,7 @@ Capabilities gate runtime resource access. They are prompted once at install and
 | `session.prompt` | Delivering a turn to a session the plugin created via `sessions.turn.send`, and the initial turn on `sessions.create` (`api_version >= 9`). |
 | `session.unattended` | Creating a session in a host-classified *unattended* approval mode. A distinct, high-severity grant, never implied by `session.create` or `session.prompt` (`api_version >= 9`). See [Session-driving RPCs](#session-driving-rpcs). |
 | `session.message` | Pushing a text message into **any** session, including ones the plugin did not create, via `sessions.message.send`. A structured session shows the message as sent by the plugin, and the call reaches sessions the plugin did not create, so it is a separate grant, never implied by `session.prompt` (`api_version >= 15`). |
+| `session.integration` | Declaring provider-native status and user-requested replies for a supported terminal agent (`api_version >= 18`). |
 
 A capability this host version does not recognize is rejected, not granted.
 

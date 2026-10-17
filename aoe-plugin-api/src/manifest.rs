@@ -52,6 +52,11 @@ pub struct PluginManifest {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub status: Vec<StatusContribution>,
 
+    /// Provider-native status and terminal prompt replies. Requires API v18
+    /// and the `session.integration` capability.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub agent_integrations: Vec<crate::agent_integration::AgentIntegrationContribution>,
+
     /// Host-rendered UI slots the plugin may populate.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub ui: Vec<UiContribution>,
@@ -950,6 +955,39 @@ impl PluginManifest {
                 format!("status[{i}].id must not be empty"),
             );
         }
+        let mut integration_tools = std::collections::HashSet::new();
+        for (i, integration) in self.agent_integrations.iter().enumerate() {
+            check(
+                !integration.tool.is_empty()
+                    && integration.tool.bytes().all(|c| {
+                        c.is_ascii_lowercase() || c.is_ascii_digit() || c == b'-' || c == b'_'
+                    }),
+                format!("agent_integrations[{i}].tool must be a nonempty lowercase agent id"),
+            );
+            check(
+                crate::agent_integration::SUPPORTED_AGENT_INTEGRATION_TOOLS
+                    .contains(&integration.tool.as_str()),
+                format!(
+                    "agent_integrations[{i}].tool {:?} is not supported by this host",
+                    integration.tool
+                ),
+            );
+            check(
+                integration_tools.insert(integration.tool.as_str()),
+                format!(
+                    "agent_integrations must not repeat tool {:?}",
+                    integration.tool
+                ),
+            );
+        }
+        if !self.agent_integrations.is_empty() {
+            check(
+                self.capabilities
+                    .iter()
+                    .any(|c| c.as_str() == "session.integration"),
+                "agent_integrations require the session.integration capability".into(),
+            );
+        }
         check(
             self.screenshots.len() <= MAX_SCREENSHOTS,
             format!(
@@ -1079,6 +1117,19 @@ impl PluginManifest {
             check(
                 self.ui.iter().all(|u| u.slot != UiSlot::HeaderStart),
                 "header-start UI slots require api_version >= 17".into(),
+            );
+        }
+        if self.api_version < 18 {
+            check(
+                self.agent_integrations.is_empty(),
+                "agent_integrations require api_version >= 18".into(),
+            );
+            check(
+                !self
+                    .capabilities
+                    .iter()
+                    .any(|c| c.as_str() == "session.integration"),
+                "the session.integration capability requires api_version >= 18".into(),
             );
         }
         for key in self.setting_defaults.keys() {

@@ -95,6 +95,7 @@ impl HomeView {
             || self.tool_picker_dialog.is_some()
             || self.send_message_dialog.is_some()
             || self.permission_response_dialog.is_some()
+            || self.agent_question_dialog.is_some()
             || self.update_confirm_dialog.is_some()
             || self.telemetry_consent_dialog.is_some()
             || self.tips_dialog.is_some()

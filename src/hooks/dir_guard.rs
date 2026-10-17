@@ -351,6 +351,36 @@ pub(crate) fn read_file_at(
     Ok(Some(buf))
 }
 
+/// Read a bounded regular file and return metadata from the same opened inode.
+pub(crate) fn read_file_with_metadata_at(
+    dir: BorrowedFd<'_>,
+    name: &str,
+    max_bytes: usize,
+) -> Result<Option<(Metadata, Vec<u8>)>> {
+    use std::io::Read;
+    validate_hook_leaf(name)?;
+    let fd = match openat(
+        dir,
+        name,
+        OFlag::O_RDONLY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC | OFlag::O_NONBLOCK,
+        Mode::empty(),
+    ) {
+        Ok(fd) => fd,
+        Err(Errno::ENOENT) | Err(Errno::ELOOP) => return Ok(None),
+        Err(e) => return Err(e).with_context(|| format!("openat read {name}")),
+    };
+    let mut file = std::fs::File::from(fd);
+    let metadata = file.metadata()?;
+    if !metadata.is_file() {
+        return Ok(None);
+    }
+    let mut bytes = Vec::with_capacity(max_bytes.min(4096));
+    file.by_ref()
+        .take(u64::try_from(max_bytes).unwrap_or(u64::MAX))
+        .read_to_end(&mut bytes)?;
+    Ok(Some((metadata, bytes)))
+}
+
 /// `fstatat(AT_SYMLINK_NOFOLLOW)` view for mtime gating. Returns `Ok(None)` on
 /// missing or symlinked entries.
 pub(crate) fn metadata_at(dir: BorrowedFd<'_>, name: &str) -> Result<Option<Metadata>> {

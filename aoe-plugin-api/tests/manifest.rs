@@ -35,6 +35,72 @@ fn minimal_manifest_parses_and_round_trips() {
 }
 
 #[test]
+fn agent_integrations_require_api_capability_and_unique_valid_tools() {
+    let base = r#"
+id = "acme.omp"
+name = "OMP"
+version = "0.1.0"
+api_version = {api_version}
+capabilities = {capabilities}
+[[agent_integrations]]
+tool = "omp"
+"#;
+    let valid = base
+        .replace("{api_version}", "18")
+        .replace("{capabilities}", r#"["session.integration"]"#);
+    let parsed = PluginManifest::from_toml_str(&valid).expect("valid integration parses");
+    assert_eq!(parsed.agent_integrations[0].tool, "omp");
+
+    let cases = [
+        (
+            base.replace("{api_version}", "17")
+                .replace("{capabilities}", r#"["session.integration"]"#),
+            "require api_version >= 18",
+        ),
+        (
+            base.replace("{api_version}", "18")
+                .replace("{capabilities}", "[]"),
+            "require the session.integration capability",
+        ),
+        (
+            base.replace("{api_version}", "18")
+                .replace("{capabilities}", r#"["session.integration"]"#)
+                .replace("tool = \"omp\"", "tool = \"OMP\""),
+            "lowercase agent id",
+        ),
+        (
+            format!("{valid}\n[[agent_integrations]]\ntool = \"omp\"\n"),
+            "must not repeat tool",
+        ),
+        (
+            base.replace("{api_version}", "18")
+                .replace("{capabilities}", r#"["session.integration"]"#)
+                .replace("tool = \"omp\"", "tool = \"\""),
+            "must be a nonempty lowercase agent id",
+        ),
+        (
+            base.replace("{api_version}", "18")
+                .replace("{capabilities}", r#"["session.integration"]"#)
+                .replace("tool = \"omp\"", "tool = \"claude\""),
+            "not supported by this host",
+        ),
+        (
+            base.replace("{api_version}", "17")
+                .replace("{capabilities}", r#"["session.integration"]"#)
+                .replace("\n[[agent_integrations]]\ntool = \"omp\"\n", "\n"),
+            "session.integration capability requires api_version >= 18",
+        ),
+    ];
+    for (toml, expected_error) in cases {
+        let error = PluginManifest::from_toml_str(&toml).unwrap_err();
+        assert!(
+            matches!(&error, ManifestError::Invalid(errors) if errors.iter().any(|item| item.contains(expected_error))),
+            "expected {expected_error:?}, got {error:?}"
+        );
+    }
+}
+
+#[test]
 fn contribution_sections_parse() {
     let m = parse(
         4,
