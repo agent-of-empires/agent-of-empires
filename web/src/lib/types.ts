@@ -336,6 +336,8 @@ export interface ProjectOverrides {
   worktree_enabled?: boolean;
   smart_rename?: boolean;
   sandbox_enabled?: boolean;
+  /** Values of plugin settings declared `per_project`, by plugin id then setting key. */
+  plugin_settings?: Record<string, Record<string, unknown>>;
 }
 
 export interface ProjectInfo {
@@ -512,4 +514,6 @@ export interface SettingsFieldDescriptor {
   tui_only?: boolean;
   /** Present only on plugin fields, which have no stored value until saved. */
   default?: unknown;
+  /** Plugin field that can also be set per registered project. */
+  per_project?: boolean;
 }

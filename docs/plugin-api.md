@@ -8,7 +8,7 @@ A manifest carries two independent version axes.
 
 | Key | Meaning |
 |---|---|
-| `api_version` | The manifest *schema* version. The current schema is `17`. The host rejects a manifest whose `api_version` is newer than it supports. |
+| `api_version` | The manifest *schema* version. The current schema is `18`. The host rejects a manifest whose `api_version` is newer than it supports. |
 | `aoe_version` | A semver requirement on the *host app* version, e.g. `">=1.11.0, <2.0.0"`. The host refuses to install, and skips loading, a plugin whose requirement excludes the running version. Optional; requires `api_version >= 4`. |
 
 Each key below notes the `api_version` it needs. Target the newest schema your plugin uses, and set `aoe_version` to the host range you have tested.
@@ -30,7 +30,7 @@ capabilities = ["runtime.worker"]
 | `id` | string | yes | Plugin id (see [Plugin id](#plugin-id)). Namespaces config, events, and action names. |
 | `name` | string | yes | Human-readable display name. |
 | `version` | string | yes | Semantic version of the plugin. |
-| `api_version` | integer | yes | Manifest schema version, `1` to `17`. |
+| `api_version` | integer | yes | Manifest schema version, `1` to `18`. |
 | `description` | string | no | Shown in plugin listings. Defaults to empty. |
 | `aoe_version` | string | no | Host-app semver requirement. Requires `api_version >= 4`. |
 | `capabilities` | array of string | no | Runtime grants the worker needs (see [Capabilities](#capabilities)). Static contributions need none. |
@@ -141,6 +141,7 @@ max = 86400
 | `fields` | array | no | Item fields of an `object_list` (`api_version >= 9`). |
 | `item_id_key` | string | no | Item field holding each `object_list` row's stable id; defaults to `_id` (host-generated) (`api_version >= 9`). |
 | `min_items` / `max_items` | integer | no | Inclusive item-count bounds for an `object_list` (`api_version >= 9`). |
+| `per_project` | bool | no | Also settable per registered project, falling back to the global value. Defaults to `false` (`api_version >= 18`). See [Per-project settings](#per-project-settings). |
 
 Setting types:
 
@@ -194,6 +195,20 @@ required = true
 ```
 
 An item field takes the same keys as a top-level setting (`key`, `label`, `description`, `type`, `options`, `min`, `max`, `default`, `multiline`, `option_source`, `depends_on`) plus `required`. It may be a `dynamic_multi_select` (`api_version >= 11`), whose stored value is an array of the chosen option values, or a `string_list` (`api_version >= 14`), whose stored value is an array of freeform user-typed strings.
+
+### Per-project settings
+
+A top-level setting with `per_project = true` (`api_version >= 18`) can also be set for a registered project. The value is stored in that project's registry entry (`projects.json`), validated like a global write, and edited in the web project form. A profile-scoped registry entry shadows a global one for the same path.
+
+A worker reads the resolved value with `config.get`, passing the project's repository path:
+
+```json
+{ "key": "depth", "project_path": "/home/me/work/repo" }
+```
+
+The result is `{ "value", "scope", "revision" }`. `scope` is `"project"` when the project sets the key, else `"global"` when the global value is set, else `"default"` for the manifest `default`; `value` and `scope` are `null` when none applies. Without `project_path`, or for a path that is not a registered project, the project step is skipped. A key that is not `per_project` only ever returns its stored global value, with no `default` fallback and `project_path` ignored.
+
+Writing a per-project value sends `plugin.settings.changed` with the usual `{ revision, changed_keys }` plus the registry's `project_path`. Re-read those keys with `config.get` and that `project_path`.
 
 ## Session listing
 

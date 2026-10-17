@@ -129,6 +129,9 @@ pub struct SettingContribution {
     pub min_items: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_items: Option<u32>,
+    /// Also settable per registered project, falling back to the global value (API v18).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub per_project: bool,
 }
 
 /// A host option source a `dynamic_select` draws its choices from (API v9).
@@ -1081,6 +1084,12 @@ impl PluginManifest {
                 "header-start UI slots require api_version >= 17".into(),
             );
         }
+        if self.api_version < 18 {
+            check(
+                self.settings.iter().all(|s| !s.per_project),
+                "per_project settings require api_version >= 18".into(),
+            );
+        }
         for key in self.setting_defaults.keys() {
             check(
                 key.contains('.') && !key.starts_with('.') && !key.ends_with('.'),
@@ -1283,6 +1292,22 @@ mod tests {
         };
         rejects(&[("session.message below v15", toml(14), "api_version >= 15")]);
         PluginManifest::from_toml_str(&toml(15)).expect("v15 parses");
+    }
+
+    #[test]
+    fn per_project_setting_requires_api_version_18() {
+        let toml = |v: u32| {
+            format!(
+                "{HEAD}{v}\n\n[[settings]]\nkey = \"depth\"\ntype = \"integer\"\nper_project = true\n"
+            )
+        };
+        rejects(&[(
+            "per_project below v18",
+            toml(17),
+            "per_project settings require api_version >= 18",
+        )]);
+        let m = PluginManifest::from_toml_str(&toml(18)).expect("per_project parses from v18");
+        assert!(m.settings[0].per_project);
     }
 
     #[test]
