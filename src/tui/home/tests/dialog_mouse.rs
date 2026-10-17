@@ -151,8 +151,8 @@ fn a_follow_up_dialog_over_new_session_takes_its_own_clicks() {
     env.view.open_new_session_dialog();
     let config = crate::session::config::Config::default();
     let agent = crate::agents::get_agent("claude").expect("built-in agent");
-    env.view.hooks_install_dialog = Some(crate::tui::dialogs::HooksInstallDialog::new(
-        "claude", agent, &config,
+    env.view.hooks_install_dialog = Some(crate::tui::dialogs::HooksInstallDialog::from_disclosure(
+        crate::session::host_hook_disclosure("claude", agent, &config),
     ));
     let buf = render(&mut env);
     let (x, y) = find(&buf, "[Cancel (Esc)]");

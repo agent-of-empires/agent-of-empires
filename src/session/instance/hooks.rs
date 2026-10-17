@@ -59,34 +59,6 @@ fn generic_host_config_path_for(
     }
 }
 
-fn sidecar_host_config_path_for(
-    tool_name: &str,
-    agent: &crate::agents::AgentDef,
-    sidecar: &crate::agents::SidecarHooks,
-    home: &Path,
-    session_cfg: &crate::session::config::SessionConfig,
-    host_environment: &[String],
-) -> std::path::PathBuf {
-    let relative: std::path::PathBuf = Path::new(sidecar.host_config_subpath)
-        .components()
-        .skip(1)
-        .collect();
-    if let Some(root) = session_cfg.agent_config_dir_for(tool_name, home) {
-        return root.join(relative);
-    }
-    if agent.name == "cursor" {
-        if let Some(root) = crate::session::environment::resolve_host_environment_value(
-            host_environment,
-            "CURSOR_CONFIG_DIR",
-        )
-        .filter(|root| !root.is_empty())
-        {
-            return std::path::PathBuf::from(root).join(relative);
-        }
-    }
-    home.join(sidecar.host_config_subpath)
-}
-
 /// What a launch would write into one agent's own host config, and what each
 /// hook does. Shared by the TUI approval dialog and `aoe hooks approve`, so
 /// both describe the same install from the same resolution.
@@ -150,6 +122,86 @@ pub(crate) fn host_hook_disclosure(
     agent: &'static crate::agents::AgentDef,
     config: &crate::session::config::Config,
 ) -> HostHookDisclosure {
+    let host_env = config.environment.as_slice();
+    let home = host_home(host_env).unwrap_or_else(|| std::path::PathBuf::from("~"));
+    let path = host_hook_config_path(tool_name, agent, &home, &config.session, host_env);
+    host_hook_disclosure_for_path(agent, config, path)
+}
+
+/// The CLI has no launch cwd: name profile targets exactly, and leave a
+/// relative OMP directory relative to the future launch rather than HOME.
+pub(crate) fn host_hook_disclosure_for_profile(
+    tool_name: &str,
+    agent: &'static crate::agents::AgentDef,
+    config: &crate::session::config::Config,
+) -> anyhow::Result<HostHookDisclosure> {
+    if agent.name != "omp" {
+        return Ok(host_hook_disclosure(tool_name, agent, config));
+    }
+    let host_env = config.environment.as_slice();
+    let home = host_home(host_env).unwrap_or_else(|| std::path::PathBuf::from("~"));
+    let sidecar = agent
+        .sidecar_hooks
+        .as_ref()
+        .context("OMP status hooks require sidecar metadata")?;
+    let options = crate::session::capture::OmpCliCaptureOptions::parse_launch(
+        &config.session.launch_command_for(tool_name),
+        "",
+    )?;
+    let configured = config.session.agent_config_dir_for(tool_name, &home);
+    let root = if let Some(root) = configured.as_ref() {
+        root.clone()
+    } else {
+        let environment = crate::session::capture::host_launcher_environment(host_env);
+        let effective_profile =
+            crate::session::capture::resolve_omp_profile(options.profile.as_deref(), &environment)?;
+        let relative = effective_profile
+            .is_none()
+            .then(|| environment.get("PI_CODING_AGENT_DIR"))
+            .flatten()
+            .filter(|dir| !dir.is_empty() && !Path::new(dir).is_absolute());
+        match relative {
+            Some(dir) => Path::new("<launch cwd>").join(dir),
+            None => crate::hooks::context_free_agent_dir(&home, host_env, &options)
+                .context("cannot resolve OMP hook target without launch cwd")?,
+        }
+    };
+    let path = crate::hooks::sidecar_host_config_path_in(&home, sidecar, Some(&root), host_env);
+    Ok(host_hook_disclosure_for_path(agent, config, Some(path)))
+}
+
+/// Resolve the disclosure against the cwd and argv this new session will launch.
+pub(crate) fn host_hook_disclosure_for_launch(
+    tool_name: &str,
+    agent: &'static crate::agents::AgentDef,
+    config: &crate::session::config::Config,
+    launch_cwd: &Path,
+    command_override: &str,
+    extra_args: &str,
+) -> anyhow::Result<HostHookDisclosure> {
+    let host_env = config.environment.as_slice();
+    let home = host_home(host_env).unwrap_or_else(|| std::path::PathBuf::from("~"));
+    let path = host_hook_config_path_for_launch(
+        tool_name,
+        agent,
+        &home,
+        &config.session,
+        host_env,
+        HostHookLaunchContext {
+            cwd: launch_cwd,
+            command_override,
+            extra_args,
+            execution: None,
+        },
+    )?;
+    Ok(host_hook_disclosure_for_path(agent, config, path))
+}
+
+fn host_hook_disclosure_for_path(
+    agent: &'static crate::agents::AgentDef,
+    config: &crate::session::config::Config,
+    path: Option<std::path::PathBuf>,
+) -> HostHookDisclosure {
     let mut disclosure = HostHookDisclosure {
         settings_paths: Vec::new(),
         hook_commands: Vec::new(),
@@ -158,14 +210,7 @@ pub(crate) fn host_hook_disclosure(
         disabled_by_agent: None,
         extra_settings_paths: Vec::new(),
     };
-    let host_env = config.environment.as_slice();
-    let home = host_home(host_env).unwrap_or_else(|| std::path::PathBuf::from("~"));
-    let session_config = &config.session;
-
-    // The installer picks the target through this function, sidecar first, so
-    // the disclosure cannot name a different file than the one written.
-    let Some(path) = host_hook_config_path(tool_name, agent, &home, session_config, host_env)
-    else {
+    let Some(path) = path else {
         return disclosure;
     };
     let is_codex_json = agent
@@ -212,7 +257,7 @@ pub(crate) fn host_hook_disclosure(
                 effects.push(format!(
                     "runs aoe __extract-session-id --field {}{}",
                     crate::hooks::identity_field_name(field),
-                    crate::hooks::identity_publisher_arg(event.publisher),
+                    crate::hooks::identity_publisher_arg(event.publisher)
                 ));
             }
             if let Some(status) = event.status {
@@ -410,20 +455,29 @@ impl Instance {
             .context("home directory unavailable for disclosed hook path")?;
         let resolved_home = host_home(&resolved_environment)
             .context("home directory unavailable for resolved hook path")?;
-        let disclosed = host_hook_config_path(
+        let cwd = Path::new(&self.project_path);
+        let launch = HostHookLaunchContext {
+            cwd,
+            command_override: &self.command,
+            extra_args: &self.extra_args,
+            execution: None,
+        };
+        let disclosed = host_hook_config_path_for_launch(
             &self.tool,
             agent,
             &profile_home,
             &config.session,
             &profile_environment,
-        );
-        let resolved = host_hook_config_path(
+            launch,
+        )?;
+        let resolved = host_hook_config_path_for_launch(
             &self.tool,
             agent,
             &resolved_home,
             &config.session,
             &resolved_environment,
-        );
+            launch,
+        )?;
         if let (Some(disclosed), Some(resolved)) = (disclosed, resolved) {
             if !same_hook_target(&disclosed, &resolved) {
                 bail!(
@@ -508,6 +562,7 @@ impl Instance {
                 session_cfg,
                 host_environment,
                 events,
+                execution,
             );
         }
         let Some(hook_cfg) = agent.hook_config.as_ref() else {
@@ -591,23 +646,37 @@ impl Instance {
         session_cfg: &crate::session::config::SessionConfig,
         host_environment: &[String],
         events: &[crate::agents::ResolvedHookEvent],
+        execution: Option<&super::execution::NativeExecution>,
     ) -> bool {
+        let Some(agent) = self.status_agent() else {
+            return false;
+        };
+        let config_path = match host_hook_config_path_for_launch(
+            &self.tool,
+            agent,
+            home,
+            session_cfg,
+            host_environment,
+            HostHookLaunchContext {
+                cwd: Path::new(&self.project_path),
+                command_override: &self.command,
+                extra_args: &self.extra_args,
+                execution,
+            },
+        ) {
+            Ok(Some(path)) => path,
+            Ok(None) => return false,
+            Err(error) => {
+                tracing::warn!(target: "session.store",
+                    "Failed to resolve {} hook path: {}", self.tool, error);
+                return false;
+            }
+        };
         if session_cfg.merge_hooks_into_selected_agent {
             if let Some(selected) = sidecar.selected_agent_hooks.as_ref() {
                 if let Some(name) =
                     crate::agents::parse_selected_agent(&self.selected_agent_args(), selected.flag)
                 {
-                    let Some(agent) = self.status_agent() else {
-                        return false;
-                    };
-                    let config_path = sidecar_host_config_path_for(
-                        &self.tool,
-                        agent,
-                        sidecar,
-                        home,
-                        session_cfg,
-                        host_environment,
-                    );
                     let agents_dir = config_path.parent().unwrap_or(Path::new("."));
                     let path = (selected.resolve_config_file)(agents_dir, &name);
                     return match (sidecar.install)(
@@ -630,17 +699,6 @@ impl Instance {
             }
         }
 
-        let Some(agent) = self.status_agent() else {
-            return false;
-        };
-        let config_path = sidecar_host_config_path_for(
-            &self.tool,
-            agent,
-            sidecar,
-            home,
-            session_cfg,
-            host_environment,
-        );
         match (sidecar.install)(&config_path, crate::hooks::HookInstallTarget::Host, events) {
             Ok(()) => {
                 tracing::info!(target: "session.store",
@@ -670,18 +728,123 @@ fn host_hook_config_path(
     host_environment: &[String],
 ) -> Option<std::path::PathBuf> {
     if let Some(sidecar) = agent.sidecar_hooks.as_ref() {
-        return Some(sidecar_host_config_path_for(
-            tool,
-            agent,
-            sidecar,
+        let configured = session_cfg.agent_config_dir_for(tool, home);
+        if agent.name == "omp" {
+            if let Some(root) = configured.as_deref() {
+                return Some(crate::hooks::sidecar_host_config_path_in(
+                    home,
+                    sidecar,
+                    Some(root),
+                    host_environment,
+                ));
+            }
+            if let Some(root) = crate::hooks::context_free_agent_dir(
+                home,
+                host_environment,
+                &crate::session::capture::OmpCliCaptureOptions::default(),
+            ) {
+                return Some(crate::hooks::sidecar_host_config_path_in(
+                    home,
+                    sidecar,
+                    Some(&root),
+                    host_environment,
+                ));
+            }
+        }
+        return Some(crate::hooks::sidecar_host_config_path_in(
             home,
-            session_cfg,
+            sidecar,
+            configured.as_deref(),
             host_environment,
         ));
     }
     agent.hook_config.as_ref().map(|hook_cfg| {
         generic_host_config_path_for(tool, hook_cfg, home, session_cfg, host_environment)
     })
+}
+
+#[derive(Clone, Copy)]
+struct HostHookLaunchContext<'a> {
+    cwd: &'a Path,
+    command_override: &'a str,
+    extra_args: &'a str,
+    execution: Option<&'a super::execution::NativeExecution>,
+}
+
+fn prepared_omp_agent_dir<'a>(
+    execution_agent: &str,
+    binding: &'a super::execution::ExecutionBinding,
+) -> Option<&'a Path> {
+    if execution_agent != "omp" || binding.agent != "omp" {
+        return None;
+    }
+    binding
+        .configuration
+        .iter()
+        .find(|location| location.filesystem == "host")
+        .map(|location| location.path.as_path())
+}
+
+fn host_hook_config_path_for_launch(
+    tool: &str,
+    agent: &crate::agents::AgentDef,
+    home: &Path,
+    session_cfg: &crate::session::config::SessionConfig,
+    host_environment: &[String],
+    launch: HostHookLaunchContext<'_>,
+) -> anyhow::Result<Option<std::path::PathBuf>> {
+    if agent.name == "omp" {
+        let sidecar = agent
+            .sidecar_hooks
+            .as_ref()
+            .context("OMP status hooks require sidecar metadata")?;
+        if let Some(root) = launch
+            .execution
+            .filter(|execution| execution.agent.name == "omp")
+            .and_then(|execution| prepared_omp_agent_dir(execution.agent.name, &execution.binding))
+        {
+            return Ok(Some(crate::hooks::sidecar_host_config_path_in(
+                home,
+                sidecar,
+                Some(root),
+                host_environment,
+            )));
+        }
+        let command_override = if launch.command_override.is_empty() {
+            session_cfg.launch_command_for(tool)
+        } else {
+            launch.command_override.to_owned()
+        };
+        let context = match super::omp::resolve_host_omp_layout_for_launch(
+            tool,
+            host_environment,
+            home,
+            launch.cwd,
+            session_cfg,
+            &command_override,
+            launch.extra_args,
+        ) {
+            Ok(context) => context,
+            Err(error) => {
+                tracing::warn!(target: "session.store",
+                    "Skipping OMP status hooks because its launch path cannot be resolved: {error}");
+                return Ok(None);
+            }
+        };
+        return Ok(Some(crate::hooks::sidecar_host_config_path_in(
+            home,
+            sidecar,
+            Some(&context.agent_dir),
+            host_environment,
+        )));
+    }
+    Ok(host_hook_config_path(
+        tool,
+        agent,
+        home,
+        session_cfg,
+        host_environment,
+    ))
 }
 
 pub(super) fn host_home(host_environment: &[String]) -> Option<std::path::PathBuf> {
@@ -1037,12 +1200,13 @@ mod tests {
             .unwrap();
 
         assert_eq!(
-            sidecar_host_config_path_for(
-                &inst.tool,
-                inst.resolved_agent().unwrap(),
-                sidecar,
+            crate::hooks::sidecar_host_config_path_in(
                 temp.path(),
-                &config.session,
+                sidecar,
+                config
+                    .session
+                    .agent_config_dir_for(&inst.tool, temp.path())
+                    .as_deref(),
                 &inst.resolved_host_environment(),
             ),
             temp.path().join("undisclosed-dynamic-path/hooks.json")
@@ -1251,6 +1415,216 @@ mod tests {
         });
 
         assert_eq!(writes, [false, false, true]);
+    }
+
+    #[test]
+    fn prepared_omp_binding_selects_host_config_root() {
+        let host_root = Path::new("/prepared/agent");
+        let binding = super::super::execution::ExecutionBinding {
+            agent: "omp".into(),
+            stores: Vec::new(),
+            configuration: vec![
+                super::super::execution::ExecutionLocation {
+                    filesystem: "container".into(),
+                    path: Path::new("/root/.omp/agent").to_path_buf(),
+                },
+                super::super::execution::ExecutionLocation {
+                    filesystem: "host".into(),
+                    path: host_root.to_path_buf(),
+                },
+            ],
+            cwd: Path::new("/repo").to_path_buf(),
+            cwd_filesystem: "host".into(),
+            filesystem: "host".into(),
+            exported_default_store: None,
+        };
+        assert_eq!(prepared_omp_agent_dir("omp", &binding), Some(host_root));
+        assert_eq!(prepared_omp_agent_dir("claude", &binding), None);
+    }
+
+    #[test]
+    fn omp_launch_disclosure_uses_launch_cwd_and_profile_args() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("home");
+        let project = tmp.path().join("repo");
+        let launch_cwd = tmp.path().join("launch");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::create_dir_all(&launch_cwd).unwrap();
+        let environment = crate::session::capture::OMP_STORE_ENV_KEYS
+            .iter()
+            .map(|key| match *key {
+                "HOME" => format!("HOME={}", home.display()),
+                "PI_CODING_AGENT_DIR" => "PI_CODING_AGENT_DIR=relative-agent".into(),
+                _ => format!("{key}="),
+            })
+            .collect();
+        let config = crate::session::config::Config {
+            environment,
+            ..crate::session::config::Config::default()
+        };
+        let agent = crate::agents::get_agent("omp").unwrap();
+        let launch = host_hook_disclosure_for_launch(
+            "omp",
+            agent,
+            &config,
+            &project,
+            "omp",
+            "--cwd ../launch",
+        )
+        .unwrap();
+        // OMP's --cwd selects the conversation cwd, not the process cwd used by relative env paths.
+        let expected = crate::session::capture::canonicalize_or_raw(project.to_str().unwrap())
+            .join("relative-agent/hooks/pre/aoe-status.ts");
+        assert_eq!(
+            launch.settings_paths,
+            [expected.to_string_lossy().into_owned()]
+        );
+
+        let mut profile_config = config.clone();
+        profile_config
+            .environment
+            .retain(|entry| !entry.starts_with("PI_CODING_AGENT_DIR="));
+        profile_config
+            .environment
+            .push("PI_CODING_AGENT_DIR=".into());
+        profile_config
+            .session
+            .agent_command_override
+            .insert("omp".into(), "omp --profile work".into());
+        let profile =
+            host_hook_disclosure_for_launch("omp", agent, &profile_config, &project, "", "")
+                .unwrap();
+        assert_eq!(
+            profile.settings_paths,
+            [home
+                .join(".omp/profiles/work/agent/hooks/pre/aoe-status.ts")
+                .to_string_lossy()
+                .into_owned()]
+        );
+
+        let context_free = host_hook_disclosure("omp", agent, &config);
+        assert_eq!(
+            context_free.settings_paths,
+            [home
+                .join(".omp/agent/hooks/pre/aoe-status.ts")
+                .to_string_lossy()
+                .into_owned()]
+        );
+        let wrapper = "omp-wrapper";
+        let wrapper_root = home.join("wrapper-agent");
+        std::fs::create_dir_all(&wrapper_root).unwrap();
+        let mut wrapper_config = config.clone();
+        wrapper_config
+            .session
+            .agent_config_dir
+            .insert(wrapper.into(), wrapper_root.to_str().unwrap().into());
+        let wrapper_launch =
+            host_hook_disclosure_for_launch(wrapper, agent, &wrapper_config, &project, "omp", "")
+                .unwrap();
+        assert_eq!(
+            wrapper_launch.settings_paths,
+            [
+                crate::session::capture::canonicalize_or_raw(wrapper_root.to_str().unwrap())
+                    .join("hooks/pre/aoe-status.ts")
+                    .to_string_lossy()
+                    .into_owned()
+            ]
+        );
+    }
+    #[test]
+    #[serial_test::serial]
+    fn omp_installer_uses_created_worktree_for_relative_agent_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _app = crate::session::test_support::isolate_app_dir_at(&tmp.path().join("app"));
+        let _home_guard = crate::session::test_support::isolate_home(tmp.path());
+        let _env = EnvGuard::unset(&crate::session::capture::OMP_STORE_ENV_KEYS[1..]);
+        let home = tmp.path().join("home");
+        let source = tmp.path().join("source");
+        let worktree = tmp.path().join("worktree");
+        for path in [&home, &source, &worktree] {
+            std::fs::create_dir_all(path).unwrap();
+        }
+        std::fs::write(source.join(".env"), "PI_CODING_AGENT_DIR=relative-agent\n").unwrap();
+        std::fs::write(
+            worktree.join(".env"),
+            "PI_CODING_AGENT_DIR=relative-agent\n",
+        )
+        .unwrap();
+        let profile = "omp-worktree-relative-dir";
+        write_profile(
+            profile,
+            &format!("environment = [\"HOME={}\"]\n", home.display()),
+        );
+        acknowledge_hooks();
+
+        let mut inst = hook_inst("omp");
+        inst.source_profile = profile.into();
+        inst.project_path = worktree.to_string_lossy().into_owned();
+        let agent = crate::agents::get_agent("omp");
+        assert!(inst.ensure_disclosed_host_hook_path(agent).is_ok());
+        inst.install_agent_status_hooks(agent, None);
+
+        assert!(worktree
+            .join("relative-agent/hooks/pre/aoe-status.ts")
+            .is_file());
+        assert!(!source
+            .join("relative-agent/hooks/pre/aoe-status.ts")
+            .exists());
+    }
+
+    #[test]
+    fn omp_profile_cli_disclosure_matches_launch_resolution() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("home");
+        let project = tmp.path().join("project");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(&project).unwrap();
+        let agent = crate::agents::get_agent("omp").unwrap();
+
+        for (omp_profile, pi_profile, launch_command) in [
+            ("work", "legacy", None),
+            ("work", "legacy", Some("omp --profile default")),
+            ("", "work", None),
+        ] {
+            let environment = crate::session::capture::OMP_STORE_ENV_KEYS
+                .iter()
+                .map(|key| match *key {
+                    "HOME" => format!("HOME={}", home.display()),
+                    "OMP_PROFILE" => format!("OMP_PROFILE={omp_profile}"),
+                    "PI_PROFILE" => format!("PI_PROFILE={pi_profile}"),
+                    "PI_CODING_AGENT_DIR" => "PI_CODING_AGENT_DIR=relative-agent".into(),
+                    _ => format!("{key}="),
+                })
+                .collect();
+            let mut config = crate::session::config::Config {
+                environment,
+                ..crate::session::config::Config::default()
+            };
+            if let Some(command) = launch_command {
+                config
+                    .session
+                    .agent_command_override
+                    .insert("omp".into(), command.into());
+            }
+
+            let cli = host_hook_disclosure_for_profile("omp", agent, &config).unwrap();
+            let launched =
+                host_hook_disclosure_for_launch("omp", agent, &config, &project, "", "").unwrap();
+            let launch_cwd =
+                crate::session::capture::canonicalize_or_raw(project.to_str().unwrap())
+                    .to_string_lossy()
+                    .into_owned();
+            let cli_paths: Vec<_> = cli
+                .settings_paths
+                .iter()
+                .map(|path| path.replace("<launch cwd>", &launch_cwd))
+                .collect();
+            assert_eq!(
+                cli_paths, launched.settings_paths,
+                "OMP_PROFILE={omp_profile:?}, PI_PROFILE={pi_profile:?}, command={launch_command:?}"
+            );
+        }
     }
 
     /// #4159: an event can install both an identity extractor and a status
@@ -1546,6 +1920,7 @@ mod tests {
                     None,
                 ));
             }
+
             if let Some(config) = profile {
                 write_profile("hook-gate", config);
                 inst.source_profile = "hook-gate".to_string();
@@ -1571,6 +1946,49 @@ mod tests {
         assert!(failures.is_empty(), "{failures:#?}");
     }
 
+    #[test]
+    #[serial_test::serial]
+    fn unresolved_omp_hook_paths_do_not_block_launch() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _app = crate::session::test_support::isolate_app_dir_at(&tmp.path().join("app"));
+        let _home = crate::session::test_support::isolate_home(tmp.path());
+        let _env = EnvGuard::unset(&crate::session::capture::OMP_STORE_ENV_KEYS[1..]);
+        write_profile(
+            "unresolved-omp-hooks",
+            "[session]\nagent_status_hooks = true\n",
+        );
+        acknowledge_hooks();
+
+        let agent = crate::agents::get_agent("omp").unwrap();
+        let config =
+            crate::session::config::profile_config::resolve_config_or_warn("unresolved-omp-hooks");
+        for (command, extra_args) in [("", "--no-session"), ("$HOME/.local/bin/omp", "")] {
+            let mut instance = tool_instance("omp", tmp.path().to_str().unwrap());
+            instance.source_profile = "unresolved-omp-hooks".to_string();
+            instance.command = command.to_string();
+            instance.extra_args = extra_args.to_string();
+            let disclosure = host_hook_disclosure_for_launch(
+                "omp",
+                agent,
+                &config,
+                tmp.path(),
+                command,
+                extra_args,
+            )
+            .unwrap();
+            assert!(disclosure.settings_paths.is_empty());
+            instance
+                .ensure_disclosed_host_hook_path(Some(agent))
+                .unwrap();
+            instance.install_agent_status_hooks(Some(agent), None);
+            assert!(
+                !tmp.path()
+                    .join(".omp/agent/hooks/pre/aoe-status.ts")
+                    .exists(),
+                "unresolved launch must skip installing hooks"
+            );
+        }
+    }
     #[test]
     #[serial_test::serial]
     fn identity_hooks_remain_when_status_hooks_are_disabled() {
@@ -1854,7 +2272,7 @@ mod tests {
 
     #[test]
     fn status_hook_env_prefix_is_set_for_hook_agents_only() {
-        for agent in ["codex", "hermes", "settl", "claude", "kiro", "kimi"] {
+        for agent in ["codex", "hermes", "settl", "claude", "kiro", "kimi", "omp"] {
             let binary = crate::agents::get_agent(agent).unwrap().binary;
             for program in [None, Some(binary)] {
                 assert_eq!(

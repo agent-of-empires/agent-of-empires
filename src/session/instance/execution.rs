@@ -628,6 +628,7 @@ pub(super) struct NativeLaunchInputs {
     pub(super) pane_env: Vec<crate::tmux::PaneEnvMutation>,
     pub(super) identity_extension: Option<(String, String)>,
 }
+
 impl NativeLaunchInputs {
     /// Whether the pane runs `program` as the binary AoE's own PATH resolves `binary` to, which
     /// is what a host `--help` probe of `binary` describes.
@@ -1192,47 +1193,17 @@ impl NativeLaunchInputs {
         }
         Ok(())
     }
-
     pub(super) fn canonical_path(&self, path: &std::path::Path) -> Result<PathBuf> {
-        let path = if path.is_absolute() {
-            path.to_path_buf()
-        } else {
-            self.cwd.join(path)
-        };
         match &self.container {
-            Some(container) => container.runtime.canonical_path(&container.id, &path),
-            None => {
-                let mut ancestor = path.as_path();
-                loop {
-                    match ancestor.canonicalize() {
-                        Ok(mut resolved) => {
-                            for component in path.strip_prefix(ancestor)?.components() {
-                                match component {
-                                    std::path::Component::ParentDir => {
-                                        resolved.pop();
-                                    }
-                                    std::path::Component::CurDir => {}
-                                    component => resolved.push(component.as_os_str()),
-                                }
-                            }
-                            return Ok(resolved);
-                        }
-                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                            match std::fs::symlink_metadata(ancestor) {
-                                Ok(_) => {
-                                    bail!("native path cannot be resolved: {}", ancestor.display())
-                                }
-                                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                                Err(error) => return Err(error.into()),
-                            }
-                            ancestor = ancestor
-                                .parent()
-                                .context("native path has no existing ancestor")?;
-                        }
-                        Err(error) => return Err(error.into()),
-                    }
-                }
+            Some(container) => {
+                let path = if path.is_absolute() {
+                    path.to_path_buf()
+                } else {
+                    self.cwd.join(path)
+                };
+                container.runtime.canonical_path(&container.id, &path)
             }
+            None => Self::canonicalize_host_path(path, &self.cwd),
         }
     }
 
@@ -1248,7 +1219,44 @@ impl NativeLaunchInputs {
             },
         }
     }
-
+    pub(super) fn canonicalize_host_path(
+        path: &std::path::Path,
+        cwd: &std::path::Path,
+    ) -> Result<PathBuf> {
+        let path = if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            cwd.join(path)
+        };
+        let mut ancestor = path.as_path();
+        loop {
+            match ancestor.canonicalize() {
+                Ok(mut resolved) => {
+                    for component in path.strip_prefix(ancestor)?.components() {
+                        match component {
+                            std::path::Component::ParentDir => {
+                                resolved.pop();
+                            }
+                            std::path::Component::CurDir => {}
+                            component => resolved.push(component.as_os_str()),
+                        }
+                    }
+                    return Ok(resolved);
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    match std::fs::symlink_metadata(ancestor) {
+                        Ok(_) => bail!("native path cannot be resolved: {}", ancestor.display()),
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                        Err(error) => return Err(error.into()),
+                    }
+                    ancestor = ancestor
+                        .parent()
+                        .context("native path has no existing ancestor")?;
+                }
+                Err(error) => return Err(error.into()),
+            }
+        }
+    }
     fn native_transcript_path(
         &self,
         file: &std::path::Path,
@@ -2142,46 +2150,25 @@ impl Instance {
         }
         let path = value("PATH");
         let omp = if agent.name == "omp" {
-            let args = if self.command.is_empty() {
-                crate::session::config::quote_model_value_in_args(&self.extra_args)
-            } else {
-                self.selected_agent_args()
-            };
-            let options = super::OmpCliCaptureOptions::parse(&args)?;
-            if let Some(declared) = &declared {
-                let directory = inputs.canonical_path(declared)?;
-                inputs.environment.insert(
-                    "PI_CODING_AGENT_DIR".into(),
-                    directory
-                        .to_str()
-                        .context("declared OMP directory is not UTF-8")?
-                        .into(),
-                );
-            }
+            let options =
+                super::OmpCliCaptureOptions::parse_launch(&self.command, &self.extra_args)?;
             let environment = std::mem::take(&mut inputs.environment);
-            let cwd = inputs.cwd.to_str().context("native cwd is not UTF-8")?;
             let mut context = if let Some(container) = &inputs.container {
                 crate::session::capture::resolve_omp_store_layout_in_container_with_environment(
                     &container.runtime,
                     &container.id,
-                    cwd,
+                    inputs.cwd.to_str().context("native cwd is not UTF-8")?,
                     environment,
                     &options,
                 )?
             } else {
-                crate::session::capture::resolve_omp_store_layout_with_environment(
+                super::omp::resolve_host_omp_store_layout(
                     environment,
-                    cwd,
+                    &inputs.cwd,
                     &options,
+                    declared.as_deref(),
                 )?
             };
-            if let Some(declared) = &declared {
-                anyhow::ensure!(
-                    inputs.canonical_path(&context.agent_dir)?
-                        == inputs.canonical_path(declared)?,
-                    "OMP profile or dotenv overrides the declared wrapper namespace"
-                );
-            }
             context.layout.sessions = inputs.canonical_path(&context.layout.sessions)?;
             if let Some((sid, binding, _)) = target {
                 let binding = binding.context("OMP resume requires a bound transcript")?;

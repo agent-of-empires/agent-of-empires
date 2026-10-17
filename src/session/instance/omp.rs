@@ -3,6 +3,64 @@
 
 use super::*;
 
+use anyhow::Context;
+use std::collections::HashMap;
+use std::path::Path;
+
+pub(super) fn resolve_host_omp_store_layout(
+    mut environment: HashMap<String, String>,
+    cwd: &Path,
+    options: &OmpCliCaptureOptions,
+    declared_agent_dir: Option<&Path>,
+) -> Result<crate::session::capture::OmpResolvedContext> {
+    let declared_agent_dir = declared_agent_dir
+        .map(|path| super::execution::NativeLaunchInputs::canonicalize_host_path(path, cwd))
+        .transpose()?;
+    if let Some(directory) = &declared_agent_dir {
+        environment.insert(
+            "PI_CODING_AGENT_DIR".into(),
+            directory
+                .to_str()
+                .context("declared OMP directory is not UTF-8")?
+                .into(),
+        );
+    }
+
+    let cwd = cwd.to_str().context("native cwd is not UTF-8")?;
+    let context = crate::session::capture::resolve_omp_store_layout_with_environment(
+        environment,
+        cwd,
+        options,
+    )?;
+    if let Some(declared_agent_dir) = declared_agent_dir {
+        anyhow::ensure!(
+            super::execution::NativeLaunchInputs::canonicalize_host_path(
+                &context.agent_dir,
+                Path::new(cwd),
+            )? == declared_agent_dir,
+            "OMP profile or dotenv overrides the declared wrapper namespace"
+        );
+    }
+    Ok(context)
+}
+
+pub(super) fn resolve_host_omp_layout_for_launch(
+    tool: &str,
+    host_environment: &[String],
+    home: &Path,
+    cwd: &Path,
+    session_config: &crate::session::config::SessionConfig,
+    command_override: &str,
+    extra_args: &str,
+) -> Result<crate::session::capture::OmpResolvedContext> {
+    let options = OmpCliCaptureOptions::parse_launch(command_override, extra_args)?;
+    let environment = crate::session::capture::host_launcher_environment(host_environment);
+    let cwd = crate::session::capture::canonicalize_or_raw(
+        cwd.to_str().context("OMP launch cwd is not UTF-8")?,
+    );
+    let declared_agent_dir = session_config.agent_config_dir_for(tool, home);
+    resolve_host_omp_store_layout(environment, &cwd, &options, declared_agent_dir.as_deref())
+}
 /// Build a post-login routing fingerprint check without embedding any routing value in argv.
 fn omp_routing_fingerprint_check(plan: &OmpCapturePlan) -> String {
     let keys = crate::session::capture::OMP_STORE_ENV_KEYS.join(" ");
@@ -184,8 +242,7 @@ impl Instance {
         if self.resolved_capture_backend() != Some(crate::agents::SessionCaptureBackend::Omp) {
             return None;
         }
-        let args = crate::session::config::quote_model_value_in_args(&self.extra_args);
-        OmpCliCaptureOptions::parse(&args).ok()
+        OmpCliCaptureOptions::parse_launch(&self.command, &self.extra_args).ok()
     }
 
     /// Instrument the already resolved launch without resolving routing again.

@@ -65,6 +65,10 @@ fn run_aoe(home: &Path, xdg: &Path, stub: &Path, socket: &Path, args: &[&str]) -
         .env_remove("CURSOR_CONFIG_DIR")
         .env_remove("COPILOT_CONFIG_DIR")
         .env_remove("KIRO_CONFIG_DIR")
+        .env_remove("PI_CONFIG_DIR")
+        .env_remove("PI_CODING_AGENT_DIR")
+        .env_remove("PI_PROFILE")
+        .env_remove("OMP_PROFILE")
         .env_remove("AGENT_OF_EMPIRES_PROFILE")
         .output()
         .expect("run aoe");
@@ -203,6 +207,110 @@ fn hooks_disclosure_follows_the_effective_config() {
             }
         }
     }
+}
+
+#[test]
+fn hooks_cli_discloses_omp_profile_and_relative_agent_dir() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path().join("home");
+    let xdg = tmp.path().join("xdg");
+    let stub = tmp.path().join("stub");
+    for dir in [&home, &xdg, &stub] {
+        std::fs::create_dir_all(dir).unwrap();
+    }
+    let socket = tmp.path().join("tmux.sock");
+    let default = home.join(".omp/agent/hooks/pre/aoe-status.ts");
+    let profile = home.join(".omp/profiles/work/agent/hooks/pre/aoe-status.ts");
+
+    write_config(
+        &xdg,
+        &format!(
+            "environment = [\"HOME={}\"]\n\n[session.agent_command_override]\nomp = \"omp --profile work\"\n",
+            home.display()
+        ),
+    );
+    for args in [&["hooks", "status"][..], &["hooks", "approve"][..]] {
+        let result = run_aoe(&home, &xdg, &stub, &socket, args);
+        assert_eq!(result.code, Some(0), "{}", result.all());
+        assert!(
+            result
+                .stdout
+                .contains(&format!("  omp: {}", profile.display())),
+            "{}",
+            result.stdout
+        );
+        assert!(!result.stdout.contains(&default.display().to_string()));
+    }
+
+    write_config(
+        &xdg,
+        &format!(
+            "environment = [\"HOME={}\", \"PI_CODING_AGENT_DIR=relative-agent\"]\n",
+            home.display()
+        ),
+    );
+    for args in [&["hooks", "status"][..], &["hooks", "approve"][..]] {
+        let result = run_aoe(&home, &xdg, &stub, &socket, args);
+        assert_eq!(result.code, Some(0), "{}", result.all());
+        assert!(
+            result
+                .stdout
+                .contains("  omp: <launch cwd>/relative-agent/hooks/pre/aoe-status.ts"),
+            "{}",
+            result.stdout
+        );
+        assert!(result.stdout.contains("resolved against the launch cwd"));
+        assert!(!result.stdout.contains(&default.display().to_string()));
+    }
+    let relative = "<launch cwd>/relative-agent/hooks/pre/aoe-status.ts".to_string();
+    for (omp_profile, pi_profile, launch_command, expected) in [
+        (
+            "work",
+            "legacy",
+            None,
+            profile.to_string_lossy().into_owned(),
+        ),
+        ("", "work", None, relative.clone()),
+        ("work", "legacy", Some("omp --profile default"), relative),
+    ] {
+        let command_config = launch_command.map_or_else(String::new, |command| {
+            format!("\n[session.agent_command_override]\nomp = \"{command}\"\n")
+        });
+        write_config(
+            &xdg,
+            &format!(
+                "environment = [\"HOME={}\", \"OMP_PROFILE={omp_profile}\", \"PI_PROFILE={pi_profile}\", \"PI_CODING_AGENT_DIR=relative-agent\"]\n{command_config}",
+                home.display()
+            ),
+        );
+        for args in [&["hooks", "status"][..], &["hooks", "approve"][..]] {
+            let result = run_aoe(&home, &xdg, &stub, &socket, args);
+            assert_eq!(result.code, Some(0), "{}", result.all());
+            assert!(
+                result.stdout.contains(&format!("  omp: {expected}")),
+                "{}",
+                result.stdout
+            );
+        }
+    }
+    write_config(
+        &xdg,
+        "[session.agent_command_override]\nomp = \"omp --profile\"\n",
+    );
+    let status = run_aoe(&home, &xdg, &stub, &socket, &["hooks", "status"]);
+    assert_eq!(status.code, Some(0), "{}", status.all());
+    assert!(
+        status.stdout.contains("Unresolved hook targets:\n  omp:")
+            && status.stdout.contains("  claude: "),
+        "status must continue and identify an unresolved OMP path: {}",
+        status.stdout
+    );
+    let approval = run_aoe(&home, &xdg, &stub, &socket, &["hooks", "approve"]);
+    assert_ne!(
+        approval.code,
+        Some(0),
+        "approval must fail when an OMP hook target cannot be resolved"
+    );
 }
 
 /// #4159: the approval is install-wide while this command has no project

@@ -903,6 +903,27 @@ impl Instance {
             launch_env.pane.extend(omp_host_routing_environment(
                 &self.resolved_host_environment(),
             ));
+            if let Some(execution) = execution.as_ref() {
+                if let Some(context) = execution.omp.as_ref() {
+                    let agent_dir = context
+                        .agent_dir
+                        .to_str()
+                        .context("OMP agent directory is not UTF-8")?
+                        .to_owned();
+                    launch_env.pane.retain(|mutation| {
+                        !matches!(
+                            mutation,
+                            tmux::PaneEnvMutation::Set { key, .. }
+                                | tmux::PaneEnvMutation::Unset { key }
+                                if key == "PI_CODING_AGENT_DIR"
+                        )
+                    });
+                    launch_env.pane.push(tmux::PaneEnvMutation::set(
+                        "PI_CODING_AGENT_DIR".into(),
+                        agent_dir,
+                    ));
+                }
+            }
         }
         let require_conversation_publication = execution
             .as_ref()
@@ -1516,6 +1537,74 @@ mod tests {
         .unwrap();
     }
 
+    // The resolved directory must reach the native host launch environment.
+    #[test]
+    #[serial_test::serial]
+    fn omp_launch_uses_resolved_agent_dir_when_dotenv_conflicts() {
+        let temp = tempfile::tempdir().unwrap();
+        let _home = crate::session::test_support::isolate_home(temp.path());
+        let _omp_env = EnvGuard::unset(&[
+            "PI_CODING_AGENT_DIR",
+            "PI_CODING_AGENT_SESSION_DIR",
+            "PI_CONFIG_DIR",
+            "PI_PROFILE",
+            "OMP_PROFILE",
+            "XDG_DATA_HOME",
+            "XDG_STATE_HOME",
+            "NODE_ENV",
+        ]);
+        let _omp = crate::session::test_support::install_login_shell_path_command(
+            temp.path(),
+            "omp",
+            "#!/bin/sh\nexit 0\n",
+        );
+        let project = temp.path().join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::write(project.join(".env"), "PI_CODING_AGENT_DIR=dotenv-store\n").unwrap();
+
+        let configured = temp.path().join("configured-store");
+        std::fs::create_dir_all(&configured).unwrap();
+        let profile = "omp-dotenv-agent-dir";
+        let profile_path =
+            crate::session::config::profile_config::get_profile_config_path(profile).unwrap();
+        std::fs::create_dir_all(profile_path.parent().unwrap()).unwrap();
+        std::fs::write(
+            profile_path,
+            format!(
+                "[session.agent_config_dir]\nomp = {:?}\n",
+                configured.to_str().unwrap()
+            ),
+        )
+        .unwrap();
+
+        let mut inst = Instance::new("omp-dotenv-agent-dir", project.to_str().unwrap());
+        inst.tool = "omp".into();
+        inst.command = "omp".into();
+        inst.source_profile = profile.into();
+        inst.view = crate::session::View::Structured;
+
+        let prepared = inst
+            .prepare_launch_command(inst.conversation_state())
+            .unwrap();
+
+        let agent_dir = prepared
+            .launch_env
+            .pane
+            .iter()
+            .rev()
+            .find_map(|mutation| match mutation {
+                tmux::PaneEnvMutation::Set { key, value } if key == "PI_CODING_AGENT_DIR" => {
+                    Some(value)
+                }
+                _ => None,
+            });
+        assert_eq!(
+            agent_dir.map(String::as_str),
+            Some(configured.canonicalize().unwrap().to_str().unwrap()),
+            "launch env must match the store AoE resolved despite the conflicting dotenv value"
+        );
+    }
+
     // The sidecar env var has to survive into the docker argv; no CI container would catch it.
     #[test]
     #[serial_test::serial]
@@ -1546,6 +1635,7 @@ mod tests {
             inst.id
         );
 
+        // Native container launches carry the publisher through the exec environment file.
         let execution = inst.resolve_native_execution(None).unwrap();
         let docker_env = execution.inputs.docker_env.as_ref().unwrap();
         let value = |key| {

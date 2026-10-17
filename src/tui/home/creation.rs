@@ -2,6 +2,7 @@
 //! cancel or a quit has to do.
 
 use super::*;
+use crate::tui::creation_poller::CreationResult;
 
 pub(super) fn cleanup_creation_resources(
     instance: &Instance,
@@ -22,6 +23,23 @@ pub(super) fn cleanup_creation_resources(
     );
 }
 
+fn cleanup_uncommitted_creation(result: &CreationResult) {
+    if let CreationResult::Success {
+        instance,
+        created_worktree,
+        created_workspace_worktrees,
+        ..
+    } = result
+    {
+        cleanup_creation_resources(
+            instance,
+            created_worktree.as_ref(),
+            created_workspace_worktrees,
+            None,
+        );
+    }
+}
+
 pub(super) enum CreationCommit {
     Inserted,
     Duplicate(Box<Instance>),
@@ -36,6 +54,82 @@ pub(in crate::tui) struct SessionMutationGuards {
     pub(super) _lifecycle: crate::session::StorageFlock,
 }
 
+pub(super) fn resolve_creation_title<'a>(
+    data: &mut NewSessionData,
+    instances: impl Iterator<Item = &'a Instance>,
+) -> anyhow::Result<()> {
+    if !data.title.is_empty() {
+        return Ok(());
+    }
+
+    let profile_instances: Vec<&Instance> = instances
+        .filter(|instance| instance.source_profile == data.profile)
+        .collect();
+    let existing_titles: Vec<&str> = profile_instances
+        .iter()
+        .map(|instance| instance.title.as_str())
+        .collect();
+    let existing_branches: Vec<&str> = profile_instances
+        .iter()
+        .filter_map(|instance| instance.worktree_info.as_ref().map(|w| w.branch.as_str()))
+        .collect();
+    let taken_branches = crate::session::builder::collect_taken_branches_for_derived_dedupe(
+        &existing_branches,
+        &data.path,
+        &data.extra_repo_paths,
+        data.worktree_enabled,
+        data.create_new_branch,
+        data.scratch,
+    );
+    data.title = crate::session::builder::resolve_title(
+        &data.title,
+        data.worktree_branch.as_deref(),
+        data.worktree_enabled,
+        &existing_titles,
+        &taken_branches,
+    )?;
+    Ok(())
+}
+
+pub(super) fn hook_approval_disclosure_for_created_instance(
+    instance: &Instance,
+) -> anyhow::Result<Option<crate::session::HostHookDisclosure>> {
+    if instance.is_sandboxed() {
+        return Ok(None);
+    }
+
+    let launch_cwd = std::path::Path::new(&instance.project_path);
+    let config =
+        crate::session::host_hook_disclosure_config_with_repo(&instance.source_profile, launch_cwd);
+    let command = if instance.command.is_empty() {
+        config.session.launch_command_for(&instance.tool)
+    } else {
+        instance.command.clone()
+    };
+    let Some(agent) = crate::session::host_hook_agent(&instance.tool, &command, &config.session)
+    else {
+        return Ok(None);
+    };
+    if !crate::agents::hook_install_required(agent, config.session.agent_status_hooks)
+        || load_config()
+            .ok()
+            .flatten()
+            .is_some_and(|config| config.app_state.has_acknowledged_agent_hooks)
+    {
+        return Ok(None);
+    }
+
+    crate::session::host_hook_disclosure_for_launch(
+        &instance.tool,
+        agent,
+        &config,
+        launch_cwd,
+        &command,
+        &instance.extra_args,
+    )
+    .map(Some)
+}
+
 impl HomeView {
     /// Request background session creation, used for sandbox sessions so the UI does not
     /// block. A `Status::Creating` stub appears in the list, so progress shows in the
@@ -48,35 +142,8 @@ impl HomeView {
         // Pre-resolve the title with the logic the builder will run, so the stub, the
         // background creation and the final instance agree; otherwise an empty title shows
         // as the path basename in the stub and a civilization name in the instance.
-        if data.title.is_empty() {
-            let existing_titles: Vec<&str> = self
-                .instances()
-                .filter(|i| i.source_profile == data.profile)
-                .map(|i| i.title.as_str())
-                .collect();
-            let existing_branches: Vec<&str> = self
-                .instances()
-                .filter(|i| i.source_profile == data.profile)
-                .filter_map(|i| i.worktree_info.as_ref().map(|w| w.branch.as_str()))
-                .collect();
-            let taken_branches = crate::session::builder::collect_taken_branches_for_derived_dedupe(
-                &existing_branches,
-                &data.path,
-                &data.extra_repo_paths,
-                data.worktree_enabled,
-                data.create_new_branch,
-                data.scratch,
-            );
-            if let Ok(title) = crate::session::builder::resolve_title(
-                &data.title,
-                data.worktree_branch.as_deref(),
-                data.worktree_enabled,
-                &existing_titles,
-                &taken_branches,
-            ) {
-                data.title = title;
-            }
-        }
+        let _ = resolve_creation_title(&mut data, self.instances());
+
         let stub_title = data.title.clone();
         let mut stub = Instance::new(&stub_title, &data.path);
         stub.tool = if data.tool.is_empty() {
@@ -186,11 +253,16 @@ impl HomeView {
         self.creation_poller.request_creation(request);
     }
 
-    /// Cancel the current creation; the worker stops at its next step and rolls back.
+    /// Cancel a pending creation or hook approval and remove uncommitted resources.
     pub fn cancel_creation(&mut self) {
         if let Some(cancel) = self.creation_cancel.take() {
             cancel.cancel();
         }
+        if let Some(result) = self.pending_hook_approval_creation.take() {
+            cleanup_uncommitted_creation(&result);
+        }
+        self.hooks_install_dialog = None;
+        self.pending_hooks_install_data = None;
         // Remove the stub instance
         if let Some(stub_id) = self.creating_stub_id.take() {
             self.creating_provisional_group_paths.clear();
@@ -206,32 +278,58 @@ impl HomeView {
     /// Apply any pending creation results from the background poller.
     /// Returns Some(session_id) if creation succeeded and we should attach.
     pub fn apply_creation_results(&mut self) -> Option<String> {
-        use crate::tui::creation_poller::CreationResult;
-
         let outcome = self.creation_poller.try_recv_result()?;
-        let result = outcome.result;
+        let mut result = outcome.result;
 
         // A cancelled request's stub is already gone; the fields below may belong to a
         // newer request, so leave them alone.
         if outcome.cancelled || matches!(result, CreationResult::Cancelled) {
-            if let CreationResult::Success {
-                ref instance,
-                ref created_worktree,
-                ref created_workspace_worktrees,
-                ..
-            } = result
-            {
-                cleanup_creation_resources(
-                    instance,
-                    created_worktree.as_ref(),
-                    created_workspace_worktrees,
-                    None,
-                );
-            }
+            cleanup_uncommitted_creation(&result);
             return None;
         }
 
         self.creation_cancel = None;
+        let target_profile = self.creation_poller.last_profile().unwrap_or_else(|| {
+            self.active_profile
+                .clone()
+                .unwrap_or_else(crate::session::config::resolve_default_profile)
+        });
+        if let CreationResult::Success { instance, .. } = &mut result {
+            instance.source_profile = target_profile;
+        }
+        let disclosure = match &result {
+            CreationResult::Success { instance, .. } => {
+                hook_approval_disclosure_for_created_instance(instance)
+            }
+            _ => Ok(None),
+        };
+        match disclosure {
+            Ok(Some(disclosure)) => {
+                self.hooks_install_dialog = Some(HooksInstallDialog::from_disclosure(disclosure));
+                self.pending_hook_approval_creation = Some(result);
+                return None;
+            }
+            Ok(None) => {}
+            Err(error) => {
+                cleanup_uncommitted_creation(&result);
+                self.cancel_creation();
+                self.info_dialog = Some(InfoDialog::sized_to_fit(
+                    "Cannot resolve agent hook path",
+                    &error.to_string(),
+                ));
+                return None;
+            }
+        }
+
+        self.apply_creation_result(result)
+    }
+
+    pub(super) fn resume_hook_approved_creation(&mut self) -> Option<String> {
+        let result = self.pending_hook_approval_creation.take()?;
+        self.apply_creation_result(result)
+    }
+
+    fn apply_creation_result(&mut self, result: CreationResult) -> Option<String> {
         let stub_id = self.creating_stub_id.take();
         // Taken, not borrowed, so every early return leaves the field empty: the
         // provisional group paths belong to this stub alone and must not carry into the
@@ -469,9 +567,9 @@ impl HomeView {
         self.on_launch_hooks_ran.remove(session_id)
     }
 
-    /// Check if there's a pending creation operation
+    /// Check if creation or its hook approval is pending.
     pub fn is_creation_pending(&self) -> bool {
-        self.creation_poller.is_pending()
+        self.pending_hook_approval_creation.is_some() || self.creation_poller.is_pending()
     }
 
     /// Check if the currently selected session is the in-flight creating stub
@@ -546,17 +644,10 @@ impl HomeView {
     /// subprocess completes on its own and orphaned Creating stubs are cleaned up on the
     /// next launch.
     pub fn cleanup_pending_creation(&mut self) {
+        self.cancel_creation();
         if !self.creation_poller.is_pending() {
             return;
         }
-        if let Some(cancel) = self.creation_cancel.take() {
-            cancel.cancel();
-        }
-        if let Some(stub_id) = self.creating_stub_id.take() {
-            self.remove_instance(&stub_id);
-            self.creating_hook_progress.remove(&stub_id);
-        }
-
         // Every request is cancelled now, so each one rolls back unless it finished first.
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
         while self.creation_poller.is_pending() {

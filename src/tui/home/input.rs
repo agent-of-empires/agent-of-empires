@@ -1270,6 +1270,9 @@ impl HomeView {
                     DialogResult::Cancel => {
                         self.hooks_install_dialog = None;
                         self.pending_hooks_install_data = None;
+                        if self.pending_hook_approval_creation.is_some() {
+                            self.cancel_creation();
+                        }
                     }
                     DialogResult::Submit(_) => {
                         match crate::session::config::update_app_state(|state| {
@@ -1277,7 +1280,11 @@ impl HomeView {
                         }) {
                             Ok(()) => {
                                 self.hooks_install_dialog = None;
-                                if let Some(data) = self.pending_hooks_install_data.take() {
+                                if self.pending_hook_approval_creation.is_some() {
+                                    self.pending_dialog_click_action = self
+                                        .resume_hook_approved_creation()
+                                        .map(Action::AttachAfterCreate);
+                                } else if let Some(data) = self.pending_hooks_install_data.take() {
                                     self.pending_dialog_click_action =
                                         self.maybe_confirm_volume_ignores_globs(data);
                                 }
@@ -1721,15 +1728,35 @@ impl HomeView {
                     // A sandboxed session stages its hooks in its own container
                     // config and the launch gate never asks, so asking here
                     // would consent to a write that cannot happen.
+                    // Worktrees and scratch sessions can launch from a different
+                    // directory than the wizard's source path. Build first so the
+                    // approval names the cwd the installer will actually use.
                     if !data.sandbox
+                        && !data.worktree_enabled
+                        && !data.scratch
                         && crate::agents::hook_install_required(hook_agent, hooks_enabled)
                         && !acknowledged
                     {
-                        self.hooks_install_dialog = Some(HooksInstallDialog::new(
+                        let launch_cwd = std::path::PathBuf::from(&data.path);
+                        let dialog = match HooksInstallDialog::new_for_launch(
                             &tool_name,
                             hook_agent,
                             &resolved_config,
-                        ));
+                            &launch_cwd,
+                            &command,
+                            &data.extra_args,
+                        ) {
+                            Ok(dialog) => dialog,
+                            Err(error) => {
+                                if let Some(new_dialog) = &mut self.new_dialog {
+                                    new_dialog.set_error(format!(
+                                        "Cannot resolve agent hook path: {error}"
+                                    ));
+                                }
+                                return None;
+                            }
+                        };
+                        self.hooks_install_dialog = Some(dialog);
                         self.pending_hooks_install_data = Some(data);
                         return None;
                     }
@@ -2069,12 +2096,16 @@ impl HomeView {
             return None;
         }
 
+        let pending_hook_creation = self.pending_hook_approval_creation.is_some();
         if let Some(dialog) = &mut self.hooks_install_dialog {
             match dialog.handle_key(key) {
                 DialogResult::Continue => {}
                 DialogResult::Cancel => {
                     self.hooks_install_dialog = None;
                     self.pending_hooks_install_data = None;
+                    if pending_hook_creation {
+                        self.cancel_creation();
+                    }
                 }
                 DialogResult::Submit(_) => {
                     match crate::session::config::update_app_state(|state| {
@@ -2082,6 +2113,11 @@ impl HomeView {
                     }) {
                         Ok(()) => {
                             self.hooks_install_dialog = None;
+                            if pending_hook_creation {
+                                return self
+                                    .resume_hook_approved_creation()
+                                    .map(Action::AttachAfterCreate);
+                            }
                             if let Some(data) = self.pending_hooks_install_data.take() {
                                 return self.maybe_confirm_volume_ignores_globs(data);
                             }
@@ -6821,7 +6857,7 @@ impl HomeView {
         let has_hooks = hooks
             .as_ref()
             .is_some_and(|h| !h.hooks().on_create.is_empty() || !h.hooks().on_launch.is_empty());
-        let has_worktree = data.worktree_enabled;
+        let has_worktree = data.worktree_enabled || data.scratch;
 
         if data.sandbox || has_hooks || has_worktree {
             self.request_creation(data, hooks);
@@ -7333,5 +7369,274 @@ mod tests {
             HomeView::volume_ignores_glob_confirm_message(&glob_session_data(path)).is_none(),
             "literal-only ignores must not trigger the gate"
         );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn hook_approval_discloses_relative_omp_dir_from_created_worktree_cwd() {
+        let temp_home = tempfile::TempDir::new().unwrap();
+        let _home = crate::session::test_support::isolate_home(temp_home.path());
+        let _env = crate::session::test_support::EnvGuard::unset(
+            &crate::session::capture::OMP_STORE_ENV_KEYS[1..],
+        );
+        let repo_parent = tempfile::TempDir::new().unwrap();
+        let project = repo_parent.path().join("source");
+        std::fs::create_dir_all(&project).unwrap();
+        let repo = git2::Repository::init(&project).unwrap();
+        let signature = git2::Signature::now("Test", "test@example.com").unwrap();
+        std::fs::write(project.join("README.md"), "source\n").unwrap();
+        std::fs::write(project.join(".env"), "PI_CODING_AGENT_DIR=relative-agent\n").unwrap();
+        let tree_id = {
+            let mut index = repo.index().unwrap();
+            index.add_path(std::path::Path::new("README.md")).unwrap();
+            index.add_path(std::path::Path::new(".env")).unwrap();
+            index.write_tree().unwrap()
+        };
+        let tree = repo.find_tree(tree_id).unwrap();
+        repo.commit(Some("HEAD"), &signature, &signature, "init", &tree, &[])
+            .unwrap();
+
+        let mut data = glob_session_data(project.to_str().unwrap());
+        data.profile = "default".to_string();
+        data.title = "Hook cwd".to_string();
+        data.tool = "omp".to_string();
+        data.worktree_enabled = true;
+        data.worktree_branch = Some("hook-cwd".to_string());
+        data.create_new_branch = true;
+        data.sandbox = false;
+
+        let profile_dir = crate::session::get_profile_dir("default").unwrap();
+        std::fs::create_dir_all(&profile_dir).unwrap();
+        std::fs::write(
+            profile_dir.join("config.toml"),
+            format!("environment = [\"HOME={}\"]\n", temp_home.path().display()),
+        )
+        .unwrap();
+        let mut view = HomeView::new_for_test(
+            Some("default".to_string()),
+            crate::tmux::AvailableTools::with_tools(&["omp"]),
+            crate::file_watch::FileWatchService::noop(),
+        )
+        .unwrap();
+        assert!(view
+            .apply_new_dialog_result(DialogResult::Submit(data))
+            .is_none());
+        assert!(
+            view.hooks_install_dialog.is_none(),
+            "worktree approval waits for the created launch directory"
+        );
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        loop {
+            let session_id = view.apply_creation_results();
+            assert!(
+                session_id.is_none(),
+                "creation must pause for hook approval before attach"
+            );
+            if view.hooks_install_dialog.is_some() {
+                break;
+            }
+            assert!(
+                view.is_creation_pending(),
+                "creation ended without presenting hook approval"
+            );
+            assert!(
+                std::time::Instant::now() < deadline,
+                "timed out waiting for hook approval"
+            );
+            std::thread::yield_now();
+        }
+
+        let pending = view
+            .pending_hook_approval_creation
+            .as_ref()
+            .expect("approval retains the completed creation");
+        let instance = match pending {
+            crate::tui::creation_poller::CreationResult::Success { instance, .. } => instance,
+            _ => panic!("hook approval must retain a successful creation"),
+        };
+        let final_cwd = std::path::PathBuf::from(&instance.project_path);
+        assert_ne!(final_cwd, project);
+        let disclosure =
+            super::super::creation::hook_approval_disclosure_for_created_instance(instance)
+                .unwrap()
+                .expect("host OMP hooks require first-use approval");
+        let expected_path = final_cwd.join("relative-agent/hooks/pre/aoe-status.ts");
+        assert_eq!(
+            disclosure.settings_paths,
+            vec![expected_path.to_string_lossy().into_owned()]
+        );
+        assert!(final_cwd.is_dir());
+        assert!(
+            !expected_path.exists(),
+            "approval does not install hooks early"
+        );
+
+        assert!(matches!(
+            view.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), None),
+            Some(Action::AttachAfterCreate(_))
+        ));
+        assert!(view.pending_hook_approval_creation.is_none());
+        assert!(view.hooks_install_dialog.is_none());
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn hook_approval_resolves_scratch_cwd_after_provisioning() {
+        let temp_home = tempfile::TempDir::new().unwrap();
+        let _home = crate::session::test_support::isolate_home(temp_home.path());
+        let _env = crate::session::test_support::EnvGuard::unset(&[
+            "PI_CODING_AGENT_DIR",
+            "OMP_PROFILE",
+            "PI_PROFILE",
+        ]);
+
+        let profile_dir = crate::session::get_profile_dir("default").unwrap();
+        std::fs::create_dir_all(&profile_dir).unwrap();
+        std::fs::write(
+            profile_dir.join("config.toml"),
+            format!(
+                "environment = [\"HOME={}\", \"PI_CODING_AGENT_DIR=relative-agent\"]\n",
+                temp_home.path().display()
+            ),
+        )
+        .unwrap();
+        let config = crate::session::config::profile_config::resolve_config_or_warn("default");
+
+        let mut data = glob_session_data("");
+        data.profile = "default".to_string();
+        data.title = "Hook scratch".to_string();
+        data.tool = "omp".to_string();
+        data.scratch = true;
+        data.sandbox = false;
+
+        let mut view = HomeView::new_for_test(
+            Some("default".to_string()),
+            crate::tmux::AvailableTools::with_tools(&["omp"]),
+            crate::file_watch::FileWatchService::noop(),
+        )
+        .unwrap();
+        assert!(view
+            .apply_new_dialog_result(DialogResult::Submit(data))
+            .is_none());
+        assert!(
+            view.hooks_install_dialog.is_none(),
+            "scratch approval waits for the provisioned launch directory"
+        );
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while view.hooks_install_dialog.is_none() {
+            assert!(
+                view.is_creation_pending(),
+                "scratch creation ended without presenting hook approval"
+            );
+            assert!(
+                std::time::Instant::now() < deadline,
+                "timed out waiting for scratch hook approval"
+            );
+            std::thread::yield_now();
+            assert!(
+                view.apply_creation_results().is_none(),
+                "creation must pause for hook approval before attach"
+            );
+        }
+
+        let pending = view
+            .pending_hook_approval_creation
+            .as_ref()
+            .expect("approval retains the completed scratch creation");
+        let instance = match pending {
+            crate::tui::creation_poller::CreationResult::Success { instance, .. } => instance,
+            _ => panic!("hook approval must retain a successful creation"),
+        };
+        let final_cwd = std::path::PathBuf::from(&instance.project_path);
+        assert!(instance.scratch);
+        assert!(final_cwd.is_dir());
+        let disclosure =
+            super::super::creation::hook_approval_disclosure_for_created_instance(instance)
+                .unwrap()
+                .expect("host OMP hooks require first-use approval");
+        let installed_target = crate::session::host_hook_disclosure_for_launch(
+            "omp",
+            crate::agents::get_agent("omp").expect("OMP agent"),
+            &config,
+            &final_cwd,
+            &instance.command,
+            &instance.extra_args,
+        )
+        .unwrap();
+        let canonicalize_target = |path: &std::path::Path| {
+            let mut missing = Vec::new();
+            let mut existing = path;
+            while !existing.exists() {
+                missing.push(existing.file_name().unwrap().to_os_string());
+                existing = existing.parent().unwrap();
+            }
+            let mut resolved = existing.canonicalize().unwrap();
+            for component in missing.into_iter().rev() {
+                resolved.push(component);
+            }
+            resolved
+        };
+        let expected_path = final_cwd.join("relative-agent/hooks/pre/aoe-status.ts");
+        let disclosed_path = std::path::Path::new(&disclosure.settings_paths[0]);
+        let installed_path = std::path::Path::new(&installed_target.settings_paths[0]);
+        assert_eq!(
+            canonicalize_target(disclosed_path),
+            canonicalize_target(&expected_path)
+        );
+        assert_eq!(
+            canonicalize_target(disclosed_path),
+            canonicalize_target(installed_path)
+        );
+
+        assert!(view
+            .handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), None)
+            .is_none());
+        assert!(view.hooks_install_dialog.is_none());
+        assert!(view.pending_hook_approval_creation.is_none());
+        assert!(!final_cwd.exists(), "declining approval cleans up scratch");
+
+        let mut shutdown_data = glob_session_data("");
+        shutdown_data.profile = "default".to_string();
+        shutdown_data.title = "Hook scratch shutdown".to_string();
+        shutdown_data.tool = "omp".to_string();
+        shutdown_data.scratch = true;
+        shutdown_data.sandbox = false;
+        assert!(view
+            .apply_new_dialog_result(DialogResult::Submit(shutdown_data))
+            .is_none());
+
+        let shutdown_deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while view.hooks_install_dialog.is_none() {
+            assert!(
+                view.is_creation_pending(),
+                "scratch creation ended without presenting shutdown approval"
+            );
+            assert!(
+                std::time::Instant::now() < shutdown_deadline,
+                "timed out waiting for shutdown hook approval"
+            );
+            std::thread::yield_now();
+            assert!(
+                view.apply_creation_results().is_none(),
+                "creation must pause for hook approval before attach"
+            );
+        }
+        let pending = view
+            .pending_hook_approval_creation
+            .as_ref()
+            .expect("shutdown approval retains the scratch creation");
+        let instance = match pending {
+            crate::tui::creation_poller::CreationResult::Success { instance, .. } => instance,
+            _ => panic!("hook approval must retain a successful creation"),
+        };
+        let shutdown_cwd = std::path::PathBuf::from(&instance.project_path);
+        assert!(shutdown_cwd.is_dir());
+        view.cleanup_pending_creation();
+        assert!(!shutdown_cwd.exists(), "shutdown cleans up pending scratch");
+        assert!(view.hooks_install_dialog.is_none());
+        assert!(view.pending_hook_approval_creation.is_none());
+        assert!(view.creating_stub_id.is_none());
     }
 }

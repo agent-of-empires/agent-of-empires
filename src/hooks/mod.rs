@@ -11,6 +11,7 @@ mod hermes_yaml;
 mod json_settings;
 mod kimi;
 mod kiro;
+mod omp;
 mod settl;
 mod status_file;
 mod targets;
@@ -50,6 +51,8 @@ pub use kiro::{
     install_kiro_hooks_with_events, resolve_kiro_agent_file, set_kiro_default_agent_if_builtin,
     uninstall_kiro_hooks, KIRO_HOOKS_AGENT_FILE,
 };
+pub(crate) use omp::{context_free_agent_dir, is_omp_hook};
+pub use omp::{install_omp_hooks_with_events, uninstall_omp_hooks};
 pub use settl::{install_settl_hooks_with_events, uninstall_settl_hooks};
 pub use status_file::{
     cleanup_hook_status_dir, hook_status_dir, read_hook_session_id, read_hook_session_id_any_age,
@@ -112,6 +115,51 @@ pub(crate) fn resolve_config_dir_override(var: &str, host_env: &[String]) -> Opt
     crate::session::environment::resolve_host_environment_value(host_env, var)
         .or_else(|| std::env::var(var).ok())
         .filter(|v| !v.is_empty())
+}
+
+/// Resolves a sidecar hook path using a session config directory, its declared
+/// environment override, then the home-relative default.
+pub(crate) fn sidecar_host_config_path_in(
+    home: &Path,
+    sidecar: &crate::agents::SidecarHooks,
+    configured_agent_dir: Option<&Path>,
+    host_env: &[String],
+) -> PathBuf {
+    let relative_path = sidecar
+        .host_config_dir_override
+        .map(|override_| PathBuf::from(override_.path_from_dir))
+        .unwrap_or_else(|| {
+            Path::new(sidecar.host_config_subpath)
+                .components()
+                .skip(1)
+                .collect()
+        });
+
+    if let Some(dir) = configured_agent_dir {
+        return dir.join(relative_path);
+    }
+
+    if let Some(override_) = sidecar.host_config_dir_override {
+        if let Some(dir) = resolve_config_dir_override(override_.env_var, host_env) {
+            let dir = Path::new(&dir);
+            let dir = if dir.is_absolute() {
+                Some(dir.to_path_buf())
+            } else {
+                match override_.relative_base {
+                    crate::agents::SidecarHostConfigDirRelativeBase::Home => {
+                        let relative = dir.strip_prefix("~").unwrap_or(dir);
+                        Some(home.join(relative))
+                    }
+                    crate::agents::SidecarHostConfigDirRelativeBase::LaunchCwd => None,
+                }
+            };
+            if let Some(dir) = dir {
+                return dir.join(override_.path_from_dir);
+            }
+        }
+    }
+
+    home.join(sidecar.host_config_subpath)
 }
 
 /// Remove AoE hooks from every known agent config and the hook status base.
@@ -217,6 +265,58 @@ mod tests {
             assert_eq!(
                 codex_hooks_json_path_in(home, &host_env),
                 Path::new(codex_want)
+            );
+        }
+    }
+
+    #[test]
+    #[serial_test::serial(shell_env)]
+    fn sidecar_paths_follow_configured_and_agent_directories() {
+        let _env = EnvGuard::unset(&["PI_CODING_AGENT_DIR"]);
+        let home = Path::new("/home/me");
+        let sidecar = crate::agents::get_agent("omp")
+            .unwrap()
+            .sidecar_hooks
+            .as_ref()
+            .unwrap();
+        let configured = Path::new("/profile/omp-agent");
+        // Without launch cwd, a relative OMP directory cannot be resolved safely.
+        let cases: [(Option<&Path>, &[&str], &str); 6] = [
+            (None, &[], "/home/me/.omp/agent/hooks/pre/aoe-status.ts"),
+            (
+                Some(configured),
+                &["PI_CODING_AGENT_DIR=/ignored"],
+                "/profile/omp-agent/hooks/pre/aoe-status.ts",
+            ),
+            (
+                None,
+                &["PI_CODING_AGENT_DIR=/custom/omp"],
+                "/custom/omp/hooks/pre/aoe-status.ts",
+            ),
+            (
+                None,
+                &["PI_CODING_AGENT_DIR=custom/omp"],
+                "/home/me/.omp/agent/hooks/pre/aoe-status.ts",
+            ),
+            (
+                None,
+                &["PI_CODING_AGENT_DIR=~/custom/omp"],
+                "/home/me/.omp/agent/hooks/pre/aoe-status.ts",
+            ),
+            (
+                None,
+                &["PI_CODING_AGENT_DIR="],
+                "/home/me/.omp/agent/hooks/pre/aoe-status.ts",
+            ),
+        ];
+        for (configured, host_env, expected) in cases {
+            let host_env = host_env
+                .iter()
+                .map(|value| value.to_string())
+                .collect::<Vec<_>>();
+            assert_eq!(
+                sidecar_host_config_path_in(home, sidecar, configured, &host_env),
+                Path::new(expected),
             );
         }
     }

@@ -26,15 +26,27 @@ pub struct HooksInstallDialog {
 }
 
 impl HooksInstallDialog {
-    /// `agent` is the one the gate resolved for this session, and `config` the
-    /// one the gate read, so the dialog describes the same install the launch
-    /// would install rather than a second derivation of it.
-    pub fn new(
+    pub fn new_for_launch(
         tool_name: &str,
         agent: &'static crate::agents::AgentDef,
         config: &crate::session::config::Config,
-    ) -> Self {
-        let disclosure = crate::session::host_hook_disclosure(tool_name, agent, config);
+        launch_cwd: &std::path::Path,
+        command_override: &str,
+        extra_args: &str,
+    ) -> anyhow::Result<Self> {
+        Ok(Self::from_disclosure(
+            crate::session::host_hook_disclosure_for_launch(
+                tool_name,
+                agent,
+                config,
+                launch_cwd,
+                command_override,
+                extra_args,
+            )?,
+        ))
+    }
+
+    pub(crate) fn from_disclosure(disclosure: crate::session::HostHookDisclosure) -> Self {
         Self {
             settings_paths: disclosure.settings_paths,
             hook_commands: disclosure.hook_commands,
@@ -357,7 +369,9 @@ mod tests {
         )
         .or_else(|| crate::agents::get_agent(tool_name))
         .unwrap_or_else(|| panic!("{tool_name} must name a known agent"));
-        HooksInstallDialog::new(tool_name, agent, &config)
+        HooksInstallDialog::from_disclosure(crate::session::host_hook_disclosure(
+            tool_name, agent, &config,
+        ))
     }
     #[test]
     fn the_accept_and_cancel_keys_decide_the_dialog() {

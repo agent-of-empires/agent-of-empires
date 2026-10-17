@@ -242,10 +242,8 @@ pub fn create_workspace(
     let primary_git_wt = GitWorktree::new(primary_main_repo)?;
 
     let session_id = uuid::Uuid::new_v4().to_string();
-    let session_id_short = &session_id[..8];
-
     let workspace_path =
-        primary_git_wt.compute_path(branch, workspace_template, session_id_short)?;
+        primary_git_wt.compute_path(branch, workspace_template, &session_id[..8])?;
     let workspace_dir = workspace_path.to_string_lossy().to_string();
     std::fs::create_dir_all(&workspace_path)?;
 
@@ -523,25 +521,9 @@ pub fn build_instance(
         existing_titles,
         &taken_branches,
     )?;
-    let branch_source = resolve_worktree_branch(
-        params.worktree_enabled,
-        params.worktree_branch.as_deref(),
-        &final_title,
-    );
+    let worktree_branch = effective_worktree_branch(&params, &final_title, &taken_branches);
 
-    let effective_worktree_branch: Option<String> = match branch_source {
-        None => None,
-        Some(BranchSource::Explicit(name)) => Some(name),
-        Some(BranchSource::Derived(name)) => {
-            if params.create_new_branch {
-                Some(dedupe_branch_name(&name, &taken_branches))
-            } else {
-                Some(name)
-            }
-        }
-    };
-
-    if let Some(branch) = &effective_worktree_branch {
+    if let Some(branch) = &worktree_branch {
         if !params.extra_repo_paths.is_empty() {
             let primary_path = PathBuf::from(&params.path)
                 .canonicalize()
@@ -1161,6 +1143,25 @@ fn resolve_worktree_branch(
             None => BranchSource::Derived(branch_name_from_title(final_title)),
         },
     )
+}
+
+fn effective_worktree_branch(
+    params: &InstanceParams,
+    final_title: &str,
+    taken_branches: &HashSet<String>,
+) -> Option<String> {
+    match resolve_worktree_branch(
+        params.worktree_enabled,
+        params.worktree_branch.as_deref(),
+        final_title,
+    )? {
+        BranchSource::Explicit(name) => Some(name),
+        BranchSource::Derived(name) => Some(if params.create_new_branch {
+            dedupe_branch_name(&name, taken_branches)
+        } else {
+            name
+        }),
+    }
 }
 
 /// Replace characters that git ref names cannot contain (per `git-check-ref-format(1)`) with '-'.

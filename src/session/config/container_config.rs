@@ -2230,6 +2230,7 @@ fn agent_config_container_path(
 pub(crate) struct ContainerAgentSelection<'a> {
     tool: &'a str,
     command: Option<&'a str>,
+    extra_args: &'a str,
     /// The agent name a user selected via the agent's selected-agent flag (e.g.
     /// Kiro's `--agent NAME`), if any. When set, sidecar status hooks are
     /// installed into that agent's sandbox config file rather than the
@@ -2246,6 +2247,7 @@ impl<'a> ContainerAgentSelection<'a> {
         Self {
             tool,
             command,
+            extra_args: "",
             selected_agent: None,
             credential_fold: CredentialFold::Freshest,
         }
@@ -2261,6 +2263,11 @@ impl<'a> ContainerAgentSelection<'a> {
     /// Set the user-selected agent name (see [`Self::selected_agent`]).
     pub(crate) fn with_selected_agent(mut self, selected_agent: Option<&'a str>) -> Self {
         self.selected_agent = selected_agent;
+        self
+    }
+
+    pub(crate) fn with_extra_args(mut self, extra_args: &'a str) -> Self {
+        self.extra_args = extra_args;
         self
     }
 }
@@ -2825,9 +2832,46 @@ pub(crate) fn build_container_config(
                         .as_ref()
                         .and_then(|(mount, sandbox_dir)| {
                             let prefix = Path::new(mount.host_rel).join(SANDBOX_SUBDIR);
-                            let relative = Path::new(sidecar.sandbox_config_subpath)
-                                .strip_prefix(prefix)
-                                .ok()?;
+                            let config_subpath = if agent.name == "omp" {
+                                let command = agent_selection
+                                    .command
+                                    .map(std::borrow::Cow::Borrowed)
+                                    .unwrap_or_else(|| {
+                                        std::borrow::Cow::Owned(
+                                            profile_session_config
+                                                .launch_command_for(agent_selection.tool),
+                                        )
+                                    });
+                                let options =
+                                    crate::session::capture::OmpCliCaptureOptions::parse_launch(
+                                        &command,
+                                        agent_selection.extra_args,
+                                    )
+                                    .ok()?;
+                                let resolved_environment = environment
+                                    .iter()
+                                    .filter(|entry| {
+                                        matches!(entry.key(), "OMP_PROFILE" | "PI_PROFILE")
+                                    })
+                                    .map(|entry| (entry.key().to_owned(), entry.value().to_owned()))
+                                    .collect::<std::collections::HashMap<_, _>>();
+                                match crate::session::capture::resolve_omp_profile(
+                                    options.profile.as_deref(),
+                                    &resolved_environment,
+                                )
+                                .ok()?
+                                {
+                                    Some(profile) => PathBuf::from(mount.host_rel)
+                                        .join(SANDBOX_SUBDIR)
+                                        .join("profiles")
+                                        .join(profile)
+                                        .join("agent/hooks/pre/aoe-status.ts"),
+                                    None => PathBuf::from(sidecar.sandbox_config_subpath),
+                                }
+                            } else {
+                                PathBuf::from(sidecar.sandbox_config_subpath)
+                            };
+                            let relative = config_subpath.strip_prefix(&prefix).ok()?;
                             sidecar
                                 .selected_agent_hooks
                                 .as_ref()
@@ -6130,6 +6174,72 @@ codex-work = "{}"
             crate::hooks::cleanup_hook_status_dir(&instance_id);
         }
     }
+
+    #[test]
+    #[serial_test::serial]
+    fn omp_sandbox_hooks_load_from_the_selected_profile() {
+        let _home = IsolatedHome::new();
+        let _env = crate::session::test_support::EnvGuard::set(&[("OMP_PROFILE", "host-only")]);
+        let project = TempDir::new().unwrap();
+        git2::Repository::init(project.path()).unwrap();
+        for (index, (command, extra_args, profile, agent_dir)) in [
+            (
+                "omp --profile work",
+                "",
+                None,
+                "/root/.omp/profiles/work/agent",
+            ),
+            (
+                "omp",
+                "--profile work",
+                None,
+                "/root/.omp/profiles/work/agent",
+            ),
+            ("omp", "", Some("work"), "/root/.omp/profiles/work/agent"),
+            (
+                "omp --profile default",
+                "",
+                Some("work"),
+                "/root/.omp/agent",
+            ),
+            ("omp", "", None, "/root/.omp/agent"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let id = format!("omp-profile-hooks-{index}");
+            let mut info = test_sandbox_info();
+            info.extra_env = Some(
+                profile
+                    .map(|profile| vec![format!("OMP_PROFILE={profile}")])
+                    .unwrap_or_default(),
+            );
+            let config = Build::select(
+                ContainerAgentSelection::new("omp", Some(command)).with_extra_args(extra_args),
+            )
+            .info(info)
+            .instance(&id)
+            .run(project.path())
+            .unwrap();
+            let loaded_hook = Path::new(agent_dir).join("hooks/pre/aoe-status.ts");
+            let staged_hook = config
+                .volumes
+                .iter()
+                .find_map(|volume| {
+                    loaded_hook
+                        .strip_prefix(&volume.container_path)
+                        .ok()
+                        .map(|relative| Path::new(&volume.host_path).join(relative))
+                })
+                .expect("OMP's hook directory must be backed by the private config mount");
+            assert!(
+                crate::hooks::is_omp_hook(&fs::read_to_string(&staged_hook).unwrap()),
+                "OMP must load the managed hook through its selected profile: {command} {extra_args}"
+            );
+            crate::hooks::cleanup_hook_status_dir(&id);
+        }
+    }
+
     #[test]
     #[serial_test::serial]
     fn sandbox_identity_hooks_remain_when_status_hooks_are_disabled() {

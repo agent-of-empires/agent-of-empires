@@ -298,10 +298,24 @@ pub struct AgentHookConfig {
     pub format: HookFormat,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SidecarHostConfigDirRelativeBase {
+    Home,
+    LaunchCwd,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct SidecarHostConfigDirOverride {
+    pub env_var: &'static str,
+    pub path_from_dir: &'static str,
+    pub relative_base: SidecarHostConfigDirRelativeBase,
+}
+
 /// An agent has at most one of `hook_config` or `sidecar_hooks`.
 #[derive(Debug)]
 pub struct SidecarHooks {
     pub host_config_subpath: &'static str,
+    pub host_config_dir_override: Option<SidecarHostConfigDirOverride>,
     pub sandbox_config_subpath: &'static str,
     pub install: fn(
         &std::path::Path,
@@ -343,6 +357,7 @@ pub enum SidecarFormat {
     HermesYaml,
     KiroJson,
     KimiToml,
+    OmpTypescript,
 }
 
 pub struct AgentDef {
@@ -526,6 +541,12 @@ pub(crate) const KIMI_SIDECAR_EVENTS: &[SidecarHookEvent] = &[
     sidecar("PermissionResult", HookStatus::Running),
     sidecar("Stop", HookStatus::Idle),
     sidecar("StopFailure", HookStatus::Idle),
+];
+
+pub(crate) const OMP_SIDECAR_EVENTS: &[SidecarHookEvent] = &[
+    sidecar("session_start", HookStatus::Idle),
+    sidecar("agent_start", HookStatus::Running),
+    sidecar("agent_end", HookStatus::Idle),
 ];
 
 const fn session_support(
@@ -740,6 +761,11 @@ pub const AGENTS: &[AgentDef] = &[
         container_env: &[("CURSOR_CONFIG_DIR", "/root/.cursor")],
         sidecar_hooks: Some(SidecarHooks {
             host_config_subpath: ".cursor/hooks.json",
+            host_config_dir_override: Some(SidecarHostConfigDirOverride {
+                env_var: "CURSOR_CONFIG_DIR",
+                path_from_dir: "hooks.json",
+                relative_base: SidecarHostConfigDirRelativeBase::Home,
+            }),
             sandbox_config_subpath: ".cursor/sandbox/hooks.json",
             install: crate::hooks::install_cursor_hooks_with_events,
             uninstall: crate::hooks::uninstall_cursor_hooks,
@@ -803,6 +829,7 @@ pub const AGENTS: &[AgentDef] = &[
         yolo: Some(YoloMode::AlwaysYolo),
         sidecar_hooks: Some(SidecarHooks {
             host_config_subpath: ".settl/config.toml",
+            host_config_dir_override: None,
             sandbox_config_subpath: "",
             install: crate::hooks::install_settl_hooks_with_events,
             uninstall: crate::hooks::uninstall_settl_hooks,
@@ -826,6 +853,7 @@ pub const AGENTS: &[AgentDef] = &[
         container_env: &[("HERMES_ACCEPT_HOOKS", "1")],
         sidecar_hooks: Some(SidecarHooks {
             host_config_subpath: ".hermes/config.yaml",
+            host_config_dir_override: None,
             sandbox_config_subpath: ".hermes/sandbox/config.yaml",
             install: crate::hooks::install_hermes_hooks_with_events,
             uninstall: crate::hooks::uninstall_hermes_hooks,
@@ -858,6 +886,7 @@ pub const AGENTS: &[AgentDef] = &[
         container_env: &[("KIRO_CONFIG_DIR", "/root/.kiro")],
         sidecar_hooks: Some(SidecarHooks {
             host_config_subpath: crate::hooks::KIRO_HOOKS_AGENT_FILE,
+            host_config_dir_override: None,
             sandbox_config_subpath: ".kiro/sandbox/agents/aoe-hooks.json",
             install: crate::hooks::install_kiro_hooks_with_events,
             uninstall: crate::hooks::uninstall_kiro_hooks,
@@ -905,6 +934,7 @@ pub const AGENTS: &[AgentDef] = &[
         container_env: &[("KIMI_CODE_HOME", "/root/.kimi-code")],
         sidecar_hooks: Some(SidecarHooks {
             host_config_subpath: ".kimi-code/config.toml",
+            host_config_dir_override: None,
             sandbox_config_subpath: ".kimi-code/sandbox/config.toml",
             install: crate::hooks::install_kimi_hooks_with_events,
             uninstall: crate::hooks::uninstall_kimi_hooks,
@@ -933,6 +963,23 @@ pub const AGENTS: &[AgentDef] = &[
         instruction_flag: Some("--append-system-prompt {}"),
         detect_status: status_detection::detect_omp_status,
         container_env: &[("PI_CODING_AGENT_DIR", "/root/.omp/agent")],
+        sidecar_hooks: Some(SidecarHooks {
+            host_config_subpath: ".omp/agent/hooks/pre/aoe-status.ts",
+            host_config_dir_override: Some(SidecarHostConfigDirOverride {
+                env_var: "PI_CODING_AGENT_DIR",
+                path_from_dir: "hooks/pre/aoe-status.ts",
+                relative_base: SidecarHostConfigDirRelativeBase::LaunchCwd,
+            }),
+            sandbox_config_subpath: ".omp/sandbox/agent/hooks/pre/aoe-status.ts",
+            install: crate::hooks::install_omp_hooks_with_events,
+            uninstall: crate::hooks::uninstall_omp_hooks,
+            post_install_host: None,
+            selected_agent_hooks: None,
+            format: SidecarFormat::OmpTypescript,
+            events: OMP_SIDECAR_EVENTS,
+            sibling_settings: &[],
+            post_install_note: None,
+        }),
         session_support: session_support(
             ResumeStrategy::Flag("--resume"),
             SessionCaptureBackend::Omp,
