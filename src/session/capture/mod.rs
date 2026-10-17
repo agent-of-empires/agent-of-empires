@@ -135,7 +135,7 @@ pub(crate) fn compose_exclusion_with_persisted_peers(
         &live,
         source,
     );
-    let Ok(storage) = crate::session::storage::Storage::new_unwatched(profile) else {
+    let Ok(storage) = crate::session::storage::Storage::open_unwatched(profile) else {
         return set;
     };
     let Ok(instances) = storage.load() else {
@@ -384,6 +384,11 @@ mod tests {
         const PROFILE: &str = "capture-parked-alias-test";
         let app = tempfile::tempdir().unwrap();
         let _app = crate::session::test_support::isolate_app_dir_at(app.path());
+        let _socket = crate::session::test_support::EnvGuard::set(&[(
+            crate::tmux::TMUX_SOCKET_ENV,
+            app.path().join("owned-private.sock"),
+        )]);
+        let _budget = crate::session::poller::test_support::IsolatedBudget::with_ceiling(1);
         let _registry = crate::tmux::status_rules::ProfileRegistryGuard::take(PROFILE);
         let mut config = crate::session::Config::default();
         config
@@ -406,10 +411,43 @@ mod tests {
                 acp_session_id: None,
             },
         );
+        let runtime = crate::process::prime::PrimeRuntime::new(
+            "/bin/false".into(),
+            app.path().join("native-agent"),
+            Some(crate::process::prime::PrimeContainer {
+                transport: crate::containers::RuntimeExecutionSnapshot {
+                    kind: crate::session::ContainerRuntimeName::Podman,
+                    program: "/bin/false".into(),
+                    cwd: app.path().into(),
+                    endpoint: "inactive-native-endpoint".into(),
+                    local_mounts: true,
+                    routing: Vec::new(),
+                    global_arguments: Vec::new(),
+                },
+                id: "inactive-native-container".into(),
+                cwd: "/workspace".into(),
+            }),
+        )
+        .unwrap();
+        let mut execution =
+            crate::session::test_support::prime_execution(&runtime, std::path::Path::new(project));
+        execution.capture = Some(crate::session::CaptureContext::Prime {
+            plan: crate::session::instance::PrimeAgentCapturePlan {
+                store: app.path().join("native-agent"),
+                session_dir: "sessions".into(),
+                container_session_dir: "/root/.prime/agent/sessions".into(),
+                container_cwd: "/workspace".into(),
+            },
+            runtime: Some(runtime),
+        });
+        let mut native_peer = crate::session::Instance::new("native-peer", project);
+        native_peer.source_profile = PROFILE.into();
+        native_peer.tool = "prime-agent".into();
+        native_peer.active_execution = Some(execution);
         let storage = crate::session::Storage::new_unwatched(PROFILE).unwrap();
         storage
             .update(|instances, groups| {
-                *instances = vec![peer.clone()];
+                *instances = vec![peer, native_peer];
                 *groups =
                     crate::session::GroupTree::new_with_groups(instances, &[]).get_all_groups();
                 Ok(())
@@ -418,14 +456,34 @@ mod tests {
         // Ownership must survive the alias being removed before the peer swaps back.
         crate::tmux::status_rules::install_from_config(PROFILE, &crate::session::Config::default());
 
-        let exclusions = compose_exclusion_with_persisted_peers(
-            "current",
-            project,
-            PROFILE,
-            &HashSet::new(),
+        let (observed_tx, observed_rx) = std::sync::mpsc::channel();
+        let mut poller = crate::session::poller::SessionPoller::new(
+            "capture-peer-exclusions".into(),
+            "prime-agent".into(),
             None,
         );
-        assert!(exclusions.contains(parked_sid));
+        assert_eq!(
+            poller.start(
+                "current".into(),
+                Box::new(move || {
+                    let exclusions = compose_exclusion_with_persisted_peers(
+                        "current",
+                        project,
+                        PROFILE,
+                        &HashSet::new(),
+                        None,
+                    );
+                    observed_tx.send(exclusions).unwrap();
+                    None
+                }),
+                Box::new(|_| {}),
+                None,
+            ),
+            crate::session::poller::PollerSpawn::Spawned
+        );
+        poller.stop();
+        let exclusions = observed_rx.try_recv().expect("poller exclusion result");
+        assert_eq!(exclusions, HashSet::from([parked_sid.to_string()]));
     }
 
     #[test]

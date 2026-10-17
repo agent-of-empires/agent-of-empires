@@ -340,13 +340,16 @@ pub async fn update_session_archive(
         }
     } else if kill_pane {
         let inst_for_kill = inst_clone.clone();
-        if let Err(e) =
-            tokio::task::spawn_blocking(move || inst_for_kill.kill_all_tmux_sessions()).await
-        {
-            tracing::warn!(
+        match tokio::task::spawn_blocking(move || inst_for_kill.kill_all_tmux_sessions()).await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => tracing::warn!(
                 target: "http.api.sessions",
-                "Archive: tmux kill join failed: {e}"
-            );
+                "Archive: tmux kill failed: {error}"
+            ),
+            Err(error) => tracing::warn!(
+                target: "http.api.sessions",
+                "Archive: tmux kill join failed: {error}"
+            ),
         }
     }
 
@@ -362,6 +365,19 @@ pub async fn update_session_archive(
         }
     };
     (StatusCode::OK, Json(serde_json::json!(response))).into_response()
+}
+
+fn adopt_durable_trash_state(cached: &mut Instance, durable: Instance) {
+    if durable.lifecycle_generation < cached.lifecycle_generation {
+        return;
+    }
+    cached.status = durable.status;
+    cached.trashed_at = durable.trashed_at;
+    cached.trash_lifecycle_id = durable.trash_lifecycle_id;
+    cached.project_path = durable.project_path;
+    cached.pre_trash_project_path = durable.pre_trash_project_path;
+    cached.lifecycle_generation = durable.lifecycle_generation;
+    cached.lifecycle_reservation = durable.lifecycle_reservation;
 }
 
 /// `POST /api/sessions/:id/trash`. The per-instance lifecycle flock is held
@@ -399,11 +415,11 @@ pub async fn trash_session(
     let reserve_profile = profile.clone();
     let reserve_id = id.clone();
     let file_watch = state.file_watch.clone();
-    let (storage, lifecycle_lock, generation) = match tokio::task::spawn_blocking(
+    let (storage, lifecycle_lock, generation, was_trashed) = match tokio::task::spawn_blocking(
         move || -> anyhow::Result<_> {
-            let storage = Storage::new(&reserve_profile, file_watch)?;
+            let storage = Storage::open(&reserve_profile, file_watch)?;
             let lifecycle_lock = storage.acquire_instance_lifecycle_lock(&reserve_id)?;
-            let generation = storage.update(|instances, _groups| {
+            let (generation, was_trashed) = storage.update(|instances, _groups| {
                 let Some(instance) = instances
                     .iter_mut()
                     .find(|instance| instance.id == reserve_id)
@@ -417,10 +433,11 @@ pub async fn trash_session(
                         chrono::Utc::now(),
                     )
                     .map_err(anyhow::Error::new)?;
+                let was_trashed = instance.is_trashed();
                 instance.trash();
-                Ok(instance.lifecycle_generation)
+                Ok((instance.lifecycle_generation, was_trashed))
             })?;
-            Ok((storage, lifecycle_lock, generation))
+            Ok((storage, lifecycle_lock, generation, was_trashed))
         },
     )
     .await
@@ -442,8 +459,10 @@ pub async fn trash_session(
         let Some(instance) = instances.iter_mut().find(|instance| instance.id == id) else {
             return crate::server::api::session_gone_after_persist();
         };
-        instance.trash();
-        instance.lifecycle_generation = generation;
+        if instance.lifecycle_generation <= generation {
+            instance.trash();
+            instance.lifecycle_generation = generation;
+        }
     }
 
     if was_structured_view {
@@ -466,7 +485,23 @@ pub async fn trash_session(
             if was_structured_view {
                 instance.kill_ancillary_tmux_sessions_locked();
             } else {
-                instance.kill_all_tmux_sessions_locked();
+                if let Err(error) = instance.kill_all_tmux_sessions_locked(&storage) {
+                    let release = storage.update(|instances, _groups| {
+                        crate::session::claim::rollback_trash_reservation(
+                            instances,
+                            &work_id,
+                            generation,
+                            was_trashed,
+                        );
+                        Ok(())
+                    });
+                    return match release {
+                        Ok(()) => Err(error),
+                        Err(release) => Err(anyhow::anyhow!(
+                            "{error:#}; could not release failed trash reservation: {release:#}"
+                        )),
+                    };
+                }
             }
         }
         let outcome = crate::session::trash::prepare_trashed_worktree(&mut instance);
@@ -506,14 +541,22 @@ pub async fn trash_session(
     })
     .await;
 
+    let transition = match transition {
+        Ok(result) => result,
+        Err(error) => Err(anyhow::Error::new(error)),
+    };
     let (outcome, durable) = match transition {
-        Ok(Ok(result)) => result,
-        Ok(Err(error)) => {
-            tracing::warn!(target: "http.api.sessions", session = %id, "trash transition failed: {error}");
-            return persist_failed_response();
-        }
+        Ok(result) => result,
         Err(error) => {
-            tracing::warn!(target: "http.api.sessions", session = %id, "trash transition join failed: {error}");
+            tracing::warn!(target: "http.api.sessions", session = %id, "trash transition failed: {error}");
+            if let Ok(Some(durable)) =
+                crate::server::api::load_persisted_instance(&state, &profile, &id).await
+            {
+                let mut instances = state.instances.write().await;
+                if let Some(instance) = instances.iter_mut().find(|instance| instance.id == id) {
+                    adopt_durable_trash_state(instance, durable);
+                }
+            }
             return persist_failed_response();
         }
     };
@@ -533,10 +576,7 @@ pub async fn trash_session(
         let Some(instance) = instances.iter_mut().find(|instance| instance.id == id) else {
             return crate::server::api::session_gone_after_persist();
         };
-        instance.project_path = durable.project_path;
-        instance.pre_trash_project_path = durable.pre_trash_project_path;
-        instance.lifecycle_generation = durable.lifecycle_generation;
-        instance.lifecycle_reservation = durable.lifecycle_reservation;
+        adopt_durable_trash_state(instance, durable);
         SessionResponse::from_instance(instance, crate::claude_settings::read_tui_fullscreen())
     };
     (StatusCode::OK, Json(serde_json::json!(response))).into_response()
@@ -577,7 +617,7 @@ pub async fn restore_session(
     let file_watch = state.file_watch.clone();
     let restored = tokio::task::spawn_blocking(move || {
         let run = || -> Result<Instance, RestoreTransitionError> {
-            let storage = Storage::new(&restore_profile, file_watch)
+            let storage = Storage::open(&restore_profile, file_watch)
                 .map_err(|error| RestoreTransitionError::Persist(error.to_string()))?;
             let _lifecycle_lock = storage
                 .acquire_instance_lifecycle_lock(&restore_id)
@@ -585,6 +625,7 @@ pub async fn restore_session(
             let decision = storage
                 .update(|instances, _groups| {
                     crate::session::claim::decide_restore_claim(
+                        &storage,
                         instances,
                         &restore_id,
                         chrono::Utc::now(),
@@ -691,11 +732,14 @@ pub async fn restore_session(
         let Some(instance) = instances.iter_mut().find(|instance| instance.id == id) else {
             return crate::server::api::session_gone_after_persist();
         };
-        instance.project_path = restored.project_path;
-        instance.pre_trash_project_path = restored.pre_trash_project_path;
-        instance.lifecycle_generation = restored.lifecycle_generation;
-        instance.lifecycle_reservation = restored.lifecycle_reservation;
-        instance.untrash();
+        if restored.lifecycle_generation >= instance.lifecycle_generation {
+            instance.status = restored.status;
+            instance.project_path = restored.project_path;
+            instance.pre_trash_project_path = restored.pre_trash_project_path;
+            instance.lifecycle_generation = restored.lifecycle_generation;
+            instance.lifecycle_reservation = restored.lifecycle_reservation;
+            instance.untrash();
+        }
         SessionResponse::from_instance(instance, crate::claude_settings::read_tui_fullscreen())
     };
     (StatusCode::OK, Json(serde_json::json!(response))).into_response()
@@ -964,12 +1008,36 @@ pub async fn stop_session(
         let structured = inst.is_structured();
         // Mirror the TUI's `stop_selected` guard: a session already stopped or
         // mid-lifecycle has nothing to stop.
-        let already = matches!(
-            inst.status,
-            Status::Stopped | Status::Deleting | Status::Creating
-        );
+        let already = matches!(inst.status, Status::Stopped | Status::Creating);
         (inst.source_profile.clone(), structured, already)
     };
+
+    let guard_profile = profile.clone();
+    let guard_id = id.clone();
+    let durable_deleting = match tokio::task::spawn_blocking(move || -> anyhow::Result<bool> {
+        let storage = Storage::open_unwatched(&guard_profile)?;
+        let _lifecycle_lock = storage.acquire_instance_lifecycle_lock(&guard_id)?;
+        Ok(storage
+            .load()?
+            .into_iter()
+            .find(|instance| instance.id == guard_id)
+            .is_some_and(|instance| instance.status == Status::Deleting))
+    })
+    .await
+    {
+        Ok(Ok(deleting)) => deleting,
+        Ok(Err(error)) => {
+            tracing::warn!(target: "http.api.sessions", session = %id, "stop admission failed: {error:#}");
+            return persist_failed_response();
+        }
+        Err(error) => {
+            tracing::warn!(target: "http.api.sessions", session = %id, "stop admission task failed: {error}");
+            return persist_failed_response();
+        }
+    };
+    if durable_deleting {
+        return crate::server::api::start_blocked_response(crate::session::StartBlocked::Deleting);
+    }
 
     if already_stopped {
         let instances = state.instances.read().await;
@@ -988,6 +1056,8 @@ pub async fn stop_session(
     // persist their dormant stop before asking the supervisor to shut down.
     // Plain sessions delegate the full sequence to `Instance::stop` below.
     if is_structured {
+        let blocked = Arc::new(std::sync::OnceLock::new());
+        let blocked_for_persist = Arc::clone(&blocked);
         let persist_id = id.clone();
         if persist_session_update(
             profile.clone(),
@@ -995,6 +1065,10 @@ pub async fn stop_session(
             state.file_watch.clone(),
             move |instances| {
                 if let Some(inst) = instances.iter_mut().find(|i| i.id == persist_id) {
+                    if inst.status == Status::Deleting {
+                        let _ = blocked_for_persist.set(crate::session::StartBlocked::Deleting);
+                        return;
+                    }
                     inst.status = Status::Stopped;
                     inst.mark_idle_dormant();
                 }
@@ -1004,6 +1078,9 @@ pub async fn stop_session(
         .is_err()
         {
             return persist_failed_response();
+        }
+        if let Some(blocked) = blocked.get() {
+            return crate::server::api::start_blocked_response(*blocked);
         }
     }
 
@@ -1050,7 +1127,7 @@ pub async fn stop_session(
         let stop_id = id.clone();
         match tokio::task::spawn_blocking(move || {
             let stop_result = inst_for_stop.stop();
-            let disk_result = Storage::new_unwatched(&stop_profile)
+            let disk_result = Storage::open_unwatched(&stop_profile)
                 .and_then(|storage| storage.load())
                 .map(|instances| {
                     instances
@@ -1063,7 +1140,11 @@ pub async fn stop_session(
         {
             Ok((stop_result, disk_result)) => {
                 if let Err(e) = stop_result {
-                    tracing::warn!(target: "http.api.sessions", "Stop: session stop failed: {e}");
+                    if let Some(blocked) = e.downcast_ref::<crate::session::StartBlocked>() {
+                        return crate::server::api::start_blocked_response(*blocked);
+                    }
+                    return (StatusCode::CONFLICT, format!("Session stop failed: {e:#}"))
+                        .into_response();
                 }
                 match disk_result {
                     Ok(Some(stopped)) => {
@@ -1082,10 +1163,13 @@ pub async fn stop_session(
                     ),
                 }
             }
-            Err(e) => tracing::warn!(
-                target: "http.api.sessions",
-                "Stop: stop join failed: {e}"
-            ),
+            Err(e) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("Session stop task failed: {e}"),
+                )
+                    .into_response()
+            }
         }
     }
 
@@ -1172,7 +1256,7 @@ pub async fn start_session(
         let stored = Arc::new(std::sync::OnceLock::new());
         let stored_on_disk = Arc::clone(&stored);
         if persist_session_update(
-            profile,
+            profile.clone(),
             "start session",
             state.file_watch.clone(),
             move |instances| {
@@ -1198,17 +1282,68 @@ pub async fn start_session(
             Some(Err(refusal)) => return crate::server::api::start_blocked_response(*refusal),
             Some(Ok(())) => {}
         }
+        let old_status = {
+            let mut instances = state.instances.write().await;
+            let Some(inst) = instances.iter_mut().find(|i| i.id == id) else {
+                return session_not_found();
+            };
+            let old_status = inst.status;
+            inst.idle_dormant_since = None;
+            inst.status = Status::Idle;
+            inst.last_error = None;
+            old_status
+        };
+        if let Err(error) = crate::server::acp_reconciler::trigger_resume_background(
+            &state.session_service,
+            &id,
+            crate::process::worker_registry::ResumeAuthority::Explicit,
+        )
+        .await
+        {
+            let rollback_id = id.clone();
+            let rollback_idle_dormant_since = instance.idle_dormant_since;
+            let rollback_last_error = instance.last_error.clone();
+            if persist_session_update(
+                profile,
+                "rollback failed start session",
+                state.file_watch.clone(),
+                move |instances| {
+                    if let Some(inst) = instances
+                        .iter_mut()
+                        .find(|inst| inst.id == rollback_id && inst.status == Status::Idle)
+                    {
+                        inst.status = Status::Stopped;
+                        inst.idle_dormant_since = rollback_idle_dormant_since;
+                        inst.last_error = rollback_last_error;
+                    }
+                },
+            )
+            .await
+            .is_err()
+            {
+                return persist_failed_response();
+            }
+            let mut instances = state.instances.write().await;
+            if let Some(inst) = instances
+                .iter_mut()
+                .find(|inst| inst.id == id && inst.status == Status::Idle)
+            {
+                inst.status = Status::Stopped;
+                inst.idle_dormant_since = instance.idle_dormant_since;
+                inst.last_error = instance.last_error.clone();
+            }
+            return (
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({ "error": error.to_string() })),
+            )
+                .into_response();
+        }
         {
             let mut instances = state.instances.write().await;
             if let Some(inst) = instances.iter_mut().find(|i| i.id == id) {
-                let old_status = inst.status;
-                inst.idle_dormant_since = None;
-                inst.status = Status::Idle;
-                inst.last_error = None;
                 publish_status_change(&state.status_tx, inst, old_status);
             }
         }
-        state.acp_supervisor.request_respawn(&id);
         let instances = state.instances.read().await;
         let response = match instances.iter().find(|i| i.id == id) {
             Some(inst) => {

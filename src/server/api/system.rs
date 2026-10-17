@@ -2242,6 +2242,54 @@ mod tests {
     use axum::body::to_bytes;
     use std::collections::HashMap;
 
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn stale_profile_settings_request_does_not_recreate_a_renamed_profile() {
+        let _home = crate::session::test_support::isolate_app_dir();
+        let profile = "before-settings";
+        crate::session::create_profile(profile).unwrap();
+        let state = crate::server::test_support::build_test_app_state(Vec::new());
+        let initial = update_profile_settings(
+            State(state.clone()),
+            axum::extract::Path(profile.into()),
+            HeaderMap::new(),
+            None,
+            None,
+            Ok(Json(
+                serde_json::json!({"description": "retained settings"}),
+            )),
+        )
+        .await
+        .into_response();
+        assert!(initial.status().is_success());
+        let before = crate::session::get_profile_dir_path(profile).unwrap();
+        crate::session::rename_profile(profile, "after-settings").unwrap();
+        let retained =
+            crate::session::config::profile_config::get_profile_config_path("after-settings")
+                .unwrap();
+        let config_before = std::fs::read(&retained).unwrap();
+        assert!(!before.exists());
+
+        let response = update_profile_settings(
+            State(state),
+            axum::extract::Path(profile.into()),
+            HeaderMap::new(),
+            None,
+            None,
+            Ok(Json(serde_json::json!({"description": "stale request"}))),
+        )
+        .await
+        .into_response();
+
+        assert!(
+            !before.exists(),
+            "stale settings PATCH recreated the renamed profile ({})",
+            response.status()
+        );
+        assert_eq!(std::fs::read(retained).unwrap(), config_before);
+        assert!(!response.status().is_success());
+    }
+
     #[test]
     fn settings_save_routes_each_leaf_to_its_layer() {
         use serde_json::json;
@@ -2277,6 +2325,7 @@ mod tests {
         use serde_json::json;
         let home = tempfile::TempDir::new().unwrap();
         let _home = crate::session::test_support::isolate_home(home.path());
+        crate::session::create_profile("test").unwrap();
         let mut state = crate::server::test_support::build_test_app_state(Vec::new());
         Arc::get_mut(&mut state).expect("fresh state").login_manager =
             Arc::new(crate::server::login::LoginManager::new(Some("pw")));

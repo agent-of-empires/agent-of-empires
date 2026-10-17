@@ -201,6 +201,8 @@ pub struct SessionResponse {
     pub notify_on_error: Option<bool>,
     #[serde(default, skip_serializing_if = "crate::session::View::is_terminal")]
     pub view: crate::session::View,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub terminal_handoff_pending: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context_resume: Option<ContextResumeAvailability>,
     #[serde(default)]

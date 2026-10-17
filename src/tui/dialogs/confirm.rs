@@ -162,11 +162,6 @@ impl ConfirmDialog {
         self.yes_button_area
     }
 
-    #[cfg(test)]
-    pub(crate) fn checkbox_labels_for_test(&self) -> Vec<&str> {
-        self.checkboxes.iter().map(|c| c.label.as_str()).collect()
-    }
-
     /// Whether `c` is the opt-in confirm key, ignoring ASCII case.
     fn is_confirm_char(&self, c: char) -> bool {
         self.confirm_char

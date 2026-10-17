@@ -2362,9 +2362,8 @@ impl Default for AuthConfig {
 }
 
 /// Serde default for `Config.default_profile`. Empty means "not explicitly
-/// chosen"; the active profile is then resolved at runtime by
-/// `resolve_default_profile`, which picks the first existing profile or
-/// bootstraps one. There is no magic profile name.
+/// chosen"; runtime resolution selects an existing profile without creating it.
+/// Launch admission materializes `main` only on a genuine first run.
 fn default_profile() -> String {
     String::new()
 }
@@ -3781,47 +3780,34 @@ pub fn resolve_theme_palette_mode() -> bool {
     Config::load_or_warn().theme_palette_mode()
 }
 
-/// Resolve the active profile name.
+/// Resolve the active profile name without creating storage.
 ///
-/// If the user has explicitly set `config.default_profile`, that name is
-/// returned verbatim. Otherwise this returns the first profile directory
-/// found under `<app_dir>/profiles/` (sorted, so the choice is
-/// deterministic). On a genuine first run, when no profile directory exists
-/// yet, one is bootstrapped (see `ensure_bootstrap_profile`).
+/// An explicit default wins, followed by the first existing profile in
+/// deterministic order. A new installation reports `main`; admission is
+/// responsible for materializing that profile.
 pub fn resolve_default_profile() -> String {
+    default_profile_name()
+}
+
+pub(crate) fn default_profile_name() -> String {
+    default_profile_candidate().unwrap_or_else(|| BOOTSTRAP_PROFILE.to_owned())
+}
+
+fn default_profile_candidate() -> Option<String> {
     let config = Config::load_or_warn();
     if !config.default_profile.is_empty() {
-        return config.default_profile;
+        return Some(config.default_profile);
     }
-    match super::list_profiles() {
-        Ok(profiles) => match profiles.into_iter().next() {
-            Some(first) => first,
-            None => ensure_bootstrap_profile(),
-        },
-        Err(_) => ensure_bootstrap_profile(),
-    }
+    super::list_profiles().ok()?.into_iter().next()
 }
 
 /// Name of the profile created on a genuine first run.
 const BOOTSTRAP_PROFILE: &str = "main";
 
-/// Create the first profile on a genuine first run and return its name.
-///
-/// AoE always needs at least one profile (somewhere to file sessions). When
-/// `profiles/` has no entries, this creates `main`. It is idempotent: calling
-/// it when `main` already exists just returns the name.
-fn ensure_bootstrap_profile() -> String {
-    let _ = super::get_profile_dir(BOOTSTRAP_PROFILE);
-    BOOTSTRAP_PROFILE.to_string()
-}
-
-/// Return `profile` if non-empty, otherwise the user's globally configured
-/// default profile. Used at start-time config-resolution sites that prefer
-/// an instance's `source_profile` but tolerate it being unset (e.g. tests
-/// or pre-`source_profile`-wiring callers).
+/// Resolve a profile name without creating its directory.
 pub fn effective_profile(profile: &str) -> String {
     if profile.is_empty() {
-        resolve_default_profile()
+        default_profile_name()
     } else {
         profile.to_string()
     }

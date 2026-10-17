@@ -23,6 +23,23 @@ pub fn is_pid_alive(_pid: u32) -> bool {
     false
 }
 
+#[cfg(unix)]
+pub fn is_process_group_alive(pgid: u32) -> bool {
+    use nix::errno::Errno;
+    use nix::sys::signal::killpg;
+    use nix::unistd::Pid;
+    match killpg(Pid::from_raw(pgid as i32), None) {
+        Ok(()) => true,
+        Err(Errno::ESRCH) => false,
+        Err(_) => true,
+    }
+}
+
+#[cfg(not(unix))]
+pub fn is_process_group_alive(_pgid: u32) -> bool {
+    false
+}
+
 /// `EPERM` counts as dead here: a pid we cannot signal is a reused pid, not our runner.
 #[cfg(unix)]
 pub fn is_pid_alive_and_ours(pid: u32) -> bool {

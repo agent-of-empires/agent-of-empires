@@ -27,6 +27,15 @@ impl StopPoller {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn with_handler_for_test(
+        handler: impl FnMut(StopRequest) -> StopResult + Send + 'static,
+    ) -> Self {
+        Self {
+            worker: TrackedWorker::spawn("aoe-stop-poller-test", handler),
+        }
+    }
+
     pub fn request_stop(&mut self, request: StopRequest) {
         self.worker.request(request.session_id.clone(), request);
     }

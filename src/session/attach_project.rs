@@ -780,8 +780,8 @@ pub fn needs_restart(plan: &AttachPlan, is_sandboxed: bool) -> bool {
 /// puts back exactly that and nothing else.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct Quiesced {
-    /// A structured worker was signalled to stop. Its restart marker is
-    /// deliberately not written here; see [`quiesce_for_conversion`].
+    /// A structured worker was settled. Its restart marker is deliberately not
+    /// written here; see [`quiesce_for_conversion`].
     pub worker_was_running: bool,
     /// Generation of the stopped worker, so the restart marker written after
     /// the move authorizes only that runner's respawn.
@@ -796,21 +796,28 @@ pub fn quiesce_for_conversion(storage: &Storage, instance: &super::Instance) -> 
 
     // The worker registry only exists in a build with the structured view, and
     // without it there is no ACP worker to stop.
-    if let Ok(Some(record)) = crate::process::worker_registry::load(&instance.id) {
-        crate::process::worker_registry::delete(&instance.id).ok();
-        crate::process::worker::terminate_process_group(record.pid);
+    if let Some(record) = crate::process::worker_registry::load(&instance.id)? {
+        crate::process::worker_registry::terminate(&instance.id).with_context(|| {
+            format!(
+                "could not settle structured worker '{}' before workspace conversion",
+                instance.title
+            )
+        })?;
         quiesced.worker_was_running = true;
         quiesced.worker_generation = record.generation;
     }
 
-    if instance.tmux_session().is_ok_and(|s| s.exists()) {
+    let pane_was_live = instance
+        .tmux_session()
+        .is_ok_and(|session| session.exists());
+    if pane_was_live || instance.prime_runtime().is_some() {
         instance.kill_clean().with_context(|| {
             format!(
                 "could not stop '{}' before moving it into a workspace",
                 instance.title
             )
         })?;
-        quiesced.pane_was_live = true;
+        quiesced.pane_was_live = pane_was_live;
     }
 
     reset_sandbox_container(storage, &instance.id, instance.is_sandboxed())?;
@@ -1041,6 +1048,46 @@ mod tests {
             cleanup_on_delete: true,
         });
         inst
+    }
+    #[test]
+    #[serial_test::serial]
+    fn conversion_settles_prime_runtime_after_pane_disappears() {
+        let root = tempfile::tempdir().unwrap();
+        let _app = crate::session::test_support::isolate_app_dir_at(root.path());
+        let profile = "attach-prime-without-pane";
+        let storage = Storage::new_unwatched(profile).unwrap();
+        let runtime =
+            crate::process::prime::PrimeRuntime::new("/bin/false".into(), root.path().into(), None)
+                .unwrap();
+        runtime.prepare().unwrap();
+        let mut instance = Instance::new("Prime", root.path().to_str().unwrap());
+        instance.source_profile = profile.into();
+        instance.active_execution = Some(crate::session::ActiveExecution {
+            launch_id: "launch".into(),
+            binding: crate::session::ExecutionBinding {
+                agent: "prime-agent".into(),
+                stores: Vec::new(),
+                configuration: Vec::new(),
+                cwd: root.path().into(),
+                cwd_filesystem: "host".into(),
+                filesystem: "host".into(),
+                exported_default_store: None,
+            },
+            capture: Some(crate::session::CaptureContext::PrimeStatus(runtime.clone())),
+            container: None,
+        });
+        storage
+            .update(|instances, _groups| {
+                instances.push(instance.clone());
+                Ok(())
+            })
+            .unwrap();
+        assert!(!instance.tmux_session().unwrap().exists());
+
+        let quiesced = quiesce_for_conversion(&storage, &instance).unwrap();
+
+        assert!(!quiesced.pane_was_live);
+        assert!(!runtime.directory.exists());
     }
 
     #[test]

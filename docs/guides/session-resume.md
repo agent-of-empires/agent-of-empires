@@ -25,6 +25,8 @@ Hermes host identity hooks validate the complete JSON payload while retaining on
 
 Sandbox config and conversation stores are staged per AoE instance, including custom `agent_config_dir` roots, and a cross-process lease guards each managed store, so two sessions in the same directory cannot claim each other's conversation.
 
+Qualified capture exclusions read complete persisted execution metadata, including native runtime ownership; peer ownership checks remain required before adopting a conversation.
+
 `agent_detect_as` controls status detection and ACP adapter inheritance, not terminal execution identity. Direct built-in commands identify their native agent independently. Opaque wrappers need the explicit contract described below for explicit resume or fork and capture from shared stores.
 
 ## Execution identity and wrappers

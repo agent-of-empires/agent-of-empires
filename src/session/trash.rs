@@ -226,6 +226,7 @@ pub struct TrashRequest {
     pub session_id: String,
     pub instance: Instance,
     pub generation: u64,
+    pub was_trashed: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -276,7 +277,24 @@ pub fn perform_trash(request: &TrashRequest) -> TrashResult {
     }
 
     let mut inst = request.instance.clone();
-    inst.kill_all_tmux_sessions_locked();
+    if let Err(error) = inst.kill_all_tmux_sessions_locked(&storage) {
+        let release = storage.update(|instances, _groups| {
+            crate::session::claim::rollback_trash_reservation(
+                instances,
+                &request.session_id,
+                request.generation,
+                request.was_trashed,
+            );
+            Ok(())
+        });
+        let reason = match release {
+            Ok(()) => format!("live session teardown is not settled; retained worktree: {error:#}"),
+            Err(release) => format!(
+                "live session teardown is not settled; retained worktree, but could not release the trash reservation: {error:#}; {release:#}"
+            ),
+        };
+        return failed(reason);
+    }
     let outcome = prepare_trashed_worktree(&mut inst);
     let relocation = match &outcome {
         RelocateOutcome::Relocated { .. } => Some(TrashRelocation {
@@ -777,11 +795,101 @@ pub fn expired_trashed_ids(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::session::Storage;
 
     fn trashed_days_ago(days: i64) -> Instance {
         let mut inst = Instance::new("s", "/tmp/x");
         inst.trashed_at = Some(Utc::now() - chrono::Duration::days(days));
         inst
+    }
+    #[test]
+    #[serial_test::serial]
+    fn failed_native_teardown_rolls_back_only_new_trash() {
+        for was_trashed in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let _app = crate::session::test_support::isolate_app_dir_at(root.path());
+            let profile = "trash-release-native-failure";
+            let project = root.path().join("project");
+            std::fs::create_dir(&project).unwrap();
+            std::fs::write(project.join("sentinel"), b"retained project").unwrap();
+            let runtime = crate::process::prime::PrimeRuntime::new(
+                "/bin/false".into(),
+                root.path().into(),
+                None,
+            )
+            .unwrap();
+            runtime.prepare().unwrap();
+            runtime.adopt_prepared().unwrap();
+            std::fs::write(runtime.directory.join("frontend.identity"), "invalid").unwrap();
+            let proof_before = std::fs::read(runtime.proof_path.as_ref().unwrap()).unwrap();
+            let mut instance = Instance::new("Prime", project.to_str().unwrap());
+            instance.source_profile = profile.into();
+            instance.status = crate::session::Status::Running;
+            instance.view = crate::session::View::Terminal;
+            instance.active_execution = Some(crate::session::test_support::prime_execution(
+                &runtime, &project,
+            ));
+            if was_trashed {
+                instance.trash();
+            }
+            let prior_trash = (instance.trashed_at, instance.trash_lifecycle_id.clone());
+            let id = instance.id.clone();
+            let storage = Storage::new_unwatched(profile).unwrap();
+            storage
+                .update(|instances, _| {
+                    instances.push(instance);
+                    Ok(())
+                })
+                .unwrap();
+            let (generation, request_instance, was_trashed) = storage
+                .update(|instances, _| {
+                    let stored = instances.iter_mut().find(|row| row.id == id).unwrap();
+                    let was_trashed = stored.is_trashed();
+                    let generation = stored.try_acquire_lifecycle_reservation(
+                        crate::session::LifecycleOperation::Trash,
+                        Instance::LIFECYCLE_RESERVATION_TTL,
+                        Utc::now(),
+                    )?;
+                    stored.trash();
+                    Ok((generation, stored.clone(), was_trashed))
+                })
+                .unwrap();
+
+            let result = perform_trash(&TrashRequest {
+                session_id: id.clone(),
+                instance: request_instance,
+                generation,
+                was_trashed,
+            });
+
+            assert!(result.relocate_warning.is_some());
+            assert!(result.relocation.is_none());
+            let retained = storage
+                .load()
+                .unwrap()
+                .into_iter()
+                .find(|row| row.id == id)
+                .unwrap();
+            assert_eq!(
+                (retained.trashed_at, retained.trash_lifecycle_id),
+                prior_trash
+            );
+            assert_eq!(retained.status, crate::session::Status::Running);
+            assert_eq!(retained.lifecycle_generation, generation);
+            assert!(retained.lifecycle_reservation.is_none());
+            assert_eq!(
+                std::fs::read(project.join("sentinel")).unwrap(),
+                b"retained project"
+            );
+            assert_eq!(
+                std::fs::read(runtime.directory.join("frontend.identity")).unwrap(),
+                b"invalid"
+            );
+            assert_eq!(
+                std::fs::read(runtime.proof_path.as_ref().unwrap()).unwrap(),
+                proof_before
+            );
+        }
     }
 
     #[test]

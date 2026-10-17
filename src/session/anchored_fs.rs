@@ -261,6 +261,20 @@ impl AnchoredDir {
         }
     }
 
+    /// Only a missing component proves absence; hostile links and unreadable paths do not.
+    pub(crate) fn proves_absent(&self, relative: &Path) -> Result<bool> {
+        let (parent, leaf) = match self.open_parent(relative) {
+            Ok(parent) => parent,
+            Err(error) if error.downcast_ref::<Errno>() == Some(&Errno::ENOENT) => return Ok(true),
+            Err(error) => return Err(error),
+        };
+        match fstatat(&parent, leaf.as_os_str(), AtFlags::AT_SYMLINK_NOFOLLOW) {
+            Ok(_) => Ok(false),
+            Err(Errno::ENOENT) => Ok(true),
+            Err(error) => Err(error).context("proving anchored path absence"),
+        }
+    }
+
     pub(crate) fn regular_exists(&self, relative: &Path) -> bool {
         matches!(self.regular_lookup(relative), Ok(Some(true)))
     }
@@ -469,7 +483,7 @@ impl AnchoredDir {
             if replace {
                 nix::fcntl::renameat(staging, temporary.as_str(), &parent, leaf.as_os_str())?;
             } else {
-                match crate::process::rename_exclusive(
+                match crate::process::rename_exclusive_at(
                     staging,
                     temporary.as_ref(),
                     &parent,
@@ -503,7 +517,7 @@ impl AnchoredDir {
     ) -> Result<bool> {
         let (source_parent, source_leaf) = source.open_parent(stage)?;
         let (target_parent, target_leaf) = self.open_parent(destination)?;
-        match crate::process::rename_exclusive(
+        match crate::process::rename_exclusive_at(
             &source_parent,
             source_leaf.as_os_str(),
             &target_parent,

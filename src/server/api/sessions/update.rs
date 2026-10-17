@@ -182,7 +182,7 @@ async fn persist_with<F>(
 where
     F: FnOnce(&mut Vec<Instance>) + Send + 'static,
 {
-    let storage = match Storage::new(&profile, file_watch) {
+    let storage = match Storage::open(&profile, file_watch) {
         Ok(s) => s,
         Err(e) => {
             tracing::error!(

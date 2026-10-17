@@ -2208,7 +2208,7 @@ impl App {
         let Some(inst) = self.home.get_instance(session_id) else {
             return;
         };
-        let to_structured = !inst.is_structured();
+        let to_structured = !inst.is_structured() && !inst.terminal_handoff_pending;
         let title = inst.title.clone();
 
         let endpoint = match require_daemon().await {
@@ -3205,6 +3205,7 @@ mod tests {
     async fn drain_paste_forwards_to_the_mounted_view_and_keeps_other_targets() {
         let temp = tempfile::TempDir::new().unwrap();
         let _guard = crate::session::test_support::isolate_app_dir_at(temp.path());
+        crate::session::create_profile("test").unwrap();
         let mut app = App::new(
             "test",
             crate::tmux::AvailableTools::with_tools(&["claude"]),

@@ -110,6 +110,7 @@ impl SessionResponse {
             notify_on_idle: inst.notify_on_idle,
             notify_on_error: inst.notify_on_error,
             view: inst.view,
+            terminal_handoff_pending: inst.terminal_handoff_pending,
             context_resume: Some(context_resume_for(inst)),
             queued_prompts: {
                 let mut q = inst.queued_prompts.clone();

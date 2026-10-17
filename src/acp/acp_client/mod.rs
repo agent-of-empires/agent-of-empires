@@ -807,9 +807,6 @@ impl AcpClient {
         if let Some(runtime) = native {
             if let Some(child) = &self._child {
                 let mut child = child.lock().await;
-                if let Some(pid) = child.id() {
-                    crate::process::kill_process_tree(pid);
-                }
                 child.start_kill().ok();
             }
             let runtime = runtime.clone();

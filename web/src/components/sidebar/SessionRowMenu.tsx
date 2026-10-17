@@ -157,7 +157,8 @@ export function SingleRowMenuItems({
   const moreId = useId();
   const { firstSession: first, acpSession: acp } = model;
   const write = !readOnly;
-  const canSwitchView = write && !!first && (first.view === "structured" || first.acp_capable);
+  const canSwitchView =
+    write && !!first && (first.view === "structured" || first.acp_capable || first.terminal_handoff_pending);
   const canFork = write && !!acp?.acp_session_id && acp.acp_can_fork;
   const more = write && {
     switchAgent: !!acp,
@@ -188,7 +189,11 @@ export function SingleRowMenuItems({
       )}
       {canSwitchView && (
         <MenuItem onClick={a.switchView} testId="sidebar-context-menu-switch-view" icon={icon(SquareTerminal)}>
-          {first!.view === "structured" ? "Switch to terminal" : "Switch to structured view"}
+          {first!.terminal_handoff_pending
+            ? "Retry terminal handoff"
+            : first!.view === "structured"
+              ? "Switch to terminal"
+              : "Switch to structured view"}
         </MenuItem>
       )}
       {canFork && (

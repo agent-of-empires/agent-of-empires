@@ -4,7 +4,7 @@ use anyhow::{bail, Result};
 use clap::{Args, Subcommand};
 use serde::Serialize;
 
-use crate::session::{GroupTree, Storage};
+use crate::session::{admit_profile, GroupTree, Storage};
 
 #[derive(Subcommand)]
 pub enum GroupCommands {
@@ -121,7 +121,8 @@ async fn list_groups(profile: &str, args: GroupListArgs) -> Result<()> {
 }
 
 async fn create_group(profile: &str, args: GroupCreateArgs) -> Result<()> {
-    let storage = Storage::open_unwatched(profile)?;
+    let profile = admit_profile(profile)?;
+    let storage = Storage::open_unwatched(&profile)?;
 
     let name = args.name.trim().to_string();
     let group_path = if let Some(parent) = &args.parent {

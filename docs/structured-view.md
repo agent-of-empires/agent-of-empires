@@ -54,11 +54,22 @@ Each built-in adapter receives only the provider variables it is known to read, 
 
 Native Prime Agent 0.10.x uses a daemon owned by each structured execution. Ownership follows the resolved ACP backend, including inherited custom agents, rather than the session tool label. The daemon and frontend receive the same effective environment and use the original agent directory for credentials, settings, skills, and history. Sandboxed preparation resolves Prime with the frontend’s executable, environment, working directory, and pinned container ID. AoE does not reuse a daemon launched with another session’s credentials.
 
+`TMPDIR` points to the private runtime directory in the native process's filesystem; sandbox transports keep their inherited host `TMPDIR` and inject the guest path only inside the container.
+
+The native subagent-activity boolean is required; `true` counts as running even when root activity is idle, while missing, malformed or conflicting fields leave the observation unproven.
+
 Stopping or restarting a session requires process settlement before replacement. Runner retirement is bound to its registry generation, kernel birth identity, and boot. Linux uses pidfds; macOS uses audit-token PID versions. Linux 6.9 and newer can signal the original process group through a retained pidfd after the leader exits. A cold collector without an attested group anchor retains ownership. Foreign-user permission errors do not establish ownership; an uninspectable owned incarnation blocks retirement. Positively scoped native auxiliaries are fenced even if they detached with setsid. Detached runner expiry removes its record and sockets only after cleanup succeeds.
 
 Successful cleanup removes the private runtime directory and retains a compact termination receipt in the AoE worker directory. The receipt binds launch evidence to its original host boot or guest PID namespace. A changed epoch invalidates old descriptors and launch PID files across retries. A missing runtime directory can settle only after the current census proves no owned processes remain. Definitive absence of the pinned container on its recorded runtime endpoint settles that guest's obligations without signalling host PIDs; stopped, paused, and unreachable containers are not treated as absent. The receipt’s absolute host path is pinned before applying the agent environment, and preparation commits it before launching native processes. Failure rolls back only the directory created by that attempt.
 
 Container images must provide Bash and GNU grep for scoped process inspection, plus Python 3.9 or newer with `os.pidfd_open` and `signal.pidfd_send_signal` on the guest kernel. AoE probes pidfd signalling during preparation and binds guest signals to the recorded incarnation, without a numeric PID fallback. Missing capabilities refuse launch. Stopping `aoe serve` only detaches; an admitted turn continues and the next daemon reattaches to the same worker.
+
+Guest marker inspection distinguishes a positive match, two successful non-matches, and
+unreadable evidence. A live process with inconclusive markers blocks cleanup unless its
+incarnation is independently owned or linked through proven owned ancestry. This is
+deliberately conservative even for an unrelated or foreign-user guest process: preserve
+the runtime and receipt, restore complete process visibility, then retry. An unreadable
+PID that still exists is not an absent process.
 
 On Apple Container, worker descriptor snapshots are streamed as a tar archive by the guest Python helper. Symlinks and non-regular descriptors are refused; no host copy destination is used.
 
@@ -137,6 +148,11 @@ aoe acp doctor --fix --all-adapters       # every bundled adapter
 - **Web wizard**: structured view by default (set [`acp.default_new_session_view`](guides/configuration.md) to change it); turn off **Use structured view** for the terminal.
 - **CLI / TUI**: terminal view by default; opt in with `--structured-view` or `--agent`, or the **Structured** field in the TUI new-session dialog.
 - **An existing session** can switch either way from the web sidebar's right-click menu or the TUI context menu (which needs a running `aoe serve`). Both confirm first, and the worktree, files, and commits are always preserved. For a **claude** session, the conversation is kept in both directions only when AoE can resolve a shared native store. A terminal switch whose store cannot be resolved, or which the structured worker does not share, is refused with HTTP 409 and `set-session-id --store` recovery guidance. Every other agent starts fresh on the target surface.
+
+If the menu offers **Retry terminal handoff**, settlement has not finished. With write
+permission, that retry remains available even if the agent can no longer enable structured
+view. It repeats the confirmed terminal handoff rather than enabling a new structured
+session; ordinary launch and input remain blocked until settlement completes.
 
 ### Launch command and session naming
 

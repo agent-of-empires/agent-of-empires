@@ -309,8 +309,45 @@ test.describe("Plugin pages (#4460)", () => {
     await expect(page).toHaveURL("/session/sess-a");
   });
 
-  test("session.contextMenu opens the sidebar's session menu over the page", async ({ page }) => {
+  test("session.contextMenu scopes actions to its session and retries a pending terminal handoff", async ({ page }) => {
     await mockApis(page, [PAGE]);
+    // Page actions must not target the shared workspace's first session.
+    await page.route("**/api/sessions", (r) =>
+      r.fulfill({
+        json: {
+          sessions: [
+            sessionResponse({
+              id: "sess-first",
+              title: "Workspace first",
+              project_path: "/tmp/agent-of-empires",
+              branch: "shared-menu",
+              view: "structured",
+              acp_capable: true,
+            }),
+            sessionResponse({
+              id: "sess-a",
+              title: "Ethiopians",
+              project_path: "/tmp/agent-of-empires",
+              branch: "shared-menu",
+              view: "terminal",
+              acp_agent: "claude",
+              acp_capable: false,
+              terminal_handoff_pending: true,
+              keeps_context: true,
+            }),
+          ],
+          workspace_ordering: [],
+        },
+      }),
+    );
+    const switches: { target: string; body: string | null }[] = [];
+    await page.route("**/api/sessions/*/acp/*", (r) => {
+      const request = r.request();
+      const match = request.url().match(/\/api\/sessions\/([^/]+)\/acp\/(enable|disable)$/);
+      if (!match || request.method() !== "POST") return r.fulfill({ status: 400 });
+      switches.push({ target: `${match[1]}/${match[2]}`, body: request.postData() });
+      return r.fulfill({ json: { session_id: match[1], view: match[2] === "enable" ? "structured" : "terminal" } });
+    });
     await page.route(`**${PAGE.url}`, (r) =>
       r.fulfill({ contentType: "text/html", headers: { "content-security-policy": PAGE_CSP }, body: BRIDGE_FIXTURE }),
     );
@@ -345,6 +382,20 @@ test.describe("Plugin pages (#4460)", () => {
     await menu.getByRole("button", { name: "Move to Done" }).click();
     await expect(menu).toHaveCount(0);
     await expect.poll(menuReply).toMatchObject({ result: "move:done" });
+
+    await open();
+    const retry = page.getByTestId("sidebar-context-menu-switch-view");
+    await expect(retry).toHaveText("Retry terminal handoff");
+    await retry.click();
+    const dialog = page.getByTestId("switch-view-dialog");
+    await expect(dialog).toBeVisible();
+    await expect(dialog).toContainText("Ethiopians");
+    await expect(dialog.getByRole("heading", { name: "Switch to terminal", exact: true })).toBeVisible();
+    await expect.poll(menuReply).toMatchObject({ result: null });
+    expect(switches).toEqual([]);
+    await page.getByTestId("switch-view-confirm").click();
+    await expect.poll(() => switches).toEqual([{ target: "sess-a/disable", body: null }]);
+    await expect(dialog).toBeHidden();
 
     await open();
     await page.getByTestId("sidebar-context-menu-snooze").click();

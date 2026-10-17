@@ -264,7 +264,7 @@ impl HomeView {
                 instance.source_profile = target_profile.clone();
 
                 if !self.storages.contains_key(&target_profile) {
-                    match Storage::new(&target_profile, self.file_watch.clone()) {
+                    match Storage::open(&target_profile, self.file_watch.clone()) {
                         Ok(storage) => {
                             self.storages.insert(target_profile.clone(), storage);
                         }

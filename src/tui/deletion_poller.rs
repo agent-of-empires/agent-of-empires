@@ -7,24 +7,53 @@ pub use crate::session::deletion::{DeletionRequest, DeletionResult};
 use crate::tui::worker::Worker;
 
 pub struct DeletionPoller {
-    worker: Worker<DeletionRequest, DeletionResult>,
+    worker: Worker<(u64, DeletionRequest), (u64, DeletionResult)>,
 }
 
 impl DeletionPoller {
     pub fn new() -> Self {
         Self {
-            worker: Worker::spawn("aoe-deletion-poller", execute_deletion),
+            worker: Worker::spawn("aoe-deletion-poller", |(attempt_id, request)| {
+                (attempt_id, execute_deletion(request))
+            }),
         }
     }
 
-    pub fn request_deletion(&self, request: DeletionRequest) {
-        self.worker.request(request);
+    #[cfg(test)]
+    pub(crate) fn seeded_for_test(attempt_id: u64, result: DeletionResult) -> Self {
+        Self {
+            worker: Worker::seeded_for_test("aoe-deletion-test", (attempt_id, result)),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_handler_for_test(
+        mut handler: impl FnMut(DeletionRequest) -> DeletionResult + Send + 'static,
+    ) -> Self {
+        Self {
+            worker: Worker::spawn("aoe-deletion-test", move |(attempt_id, request)| {
+                (attempt_id, handler(request))
+            }),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn crashing_for_test() -> Self {
+        Self {
+            worker: Worker::spawn("aoe-deletion-crash-test", |_| {
+                panic!("simulated deletion worker failure")
+            }),
+        }
+    }
+
+    pub fn request_deletion(&self, attempt_id: u64, request: DeletionRequest) {
+        self.worker.request((attempt_id, request));
     }
 
     /// Non-blocking poll for a completed deletion. Surfaces `Disconnected`
     /// (see `Worker::try_recv`) so the caller can recover rows stuck on
     /// `Status::Deleting` when the worker dies.
-    pub fn try_recv_result(&self) -> Result<DeletionResult, TryRecvError> {
+    pub fn try_recv_result(&self) -> Result<(u64, DeletionResult), TryRecvError> {
         self.worker.try_recv()
     }
 }
@@ -32,48 +61,5 @@ impl DeletionPoller {
 impl Default for DeletionPoller {
     fn default() -> Self {
         Self::new()
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::session::Instance;
-    use std::time::Duration;
-
-    fn create_test_instance() -> Instance {
-        Instance::new("Test Session", "/tmp/test-project")
-    }
-
-    #[test]
-    fn deletion_poller_round_trips_a_request() {
-        let poller = DeletionPoller::new();
-        assert!(matches!(poller.try_recv_result(), Err(TryRecvError::Empty)));
-        let instance = create_test_instance();
-        let session_id = instance.id.clone();
-
-        poller.request_deletion(DeletionRequest {
-            session_id: session_id.clone(),
-            instance,
-            delete_worktree: false,
-            delete_branch: false,
-            delete_sandbox: false,
-            force_delete: false,
-            detach_hooks: true,
-            keep_scratch: false,
-        });
-
-        let mut result = None;
-        for _ in 0..50 {
-            if let Ok(r) = poller.try_recv_result() {
-                result = Some(r);
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(20));
-        }
-        let result = result.expect("Timed out waiting for deletion result");
-
-        assert_eq!(result.session_id, session_id);
-        assert!(!result.success);
     }
 }

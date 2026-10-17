@@ -74,12 +74,7 @@ impl Instance {
     /// Carry runtime-only state across a storage reload without constructing a lifecycle snapshot
     /// from two different generations.
     pub(crate) fn merge_runtime_from_reload(&mut self, previous: &Self) {
-        let purge_in_flight = previous.status == Status::Deleting
-            && self.lifecycle_reservation_is_owned(
-                LifecycleOperation::Purge,
-                self.lifecycle_generation,
-            );
-        if self.lifecycle_generation <= previous.lifecycle_generation || purge_in_flight {
+        if self.lifecycle_generation <= previous.lifecycle_generation {
             self.status = previous.status;
             self.idle_entered_at = previous.idle_entered_at;
         }
@@ -613,27 +608,6 @@ mod tests {
         same_generation.capture_started_at = floor(2_000_000);
         same_generation.merge_runtime_from_reload(&previous);
         assert_eq!(same_generation.capture_started_at, floor(2_000_000));
-
-        // Only a Purge reservation preserves the Deleting overlay.
-        let mut deleting = inst();
-        deleting.lifecycle_generation = 3;
-        deleting.status = Status::Deleting;
-        for (op, expected) in [
-            (LifecycleOperation::Purge, Status::Deleting),
-            (LifecycleOperation::Launch, Status::Stopped),
-        ] {
-            let mut reserved = deleting.clone();
-            reserved.lifecycle_generation = 4;
-            reserved.status = Status::Stopped;
-            reserved.lifecycle_reservation = Some(LifecycleReservation {
-                op,
-                generation: 4,
-                at: Utc::now(),
-            });
-            reserved.merge_runtime_from_reload(&deleting);
-            assert_eq!(reserved.lifecycle_generation, 4);
-            assert_eq!(reserved.status, expected, "{op:?}");
-        }
     }
 
     #[test]

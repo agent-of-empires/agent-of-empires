@@ -107,6 +107,7 @@ fn hook_trust_follows_the_config_content() {
 fn repo_layer_resolves_only_repo_settable_fields() {
     let temp_home = TempDir::new().unwrap();
     let _home = set_temp_home(temp_home.path());
+    agent_of_empires::session::create_profile("default").unwrap();
 
     let profile: agent_of_empires::session::ProfileConfig =
         serde_json::from_value(serde_json::json!({

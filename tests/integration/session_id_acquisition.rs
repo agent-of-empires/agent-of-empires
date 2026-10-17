@@ -94,6 +94,7 @@ fn start_with_size_opts_returns_skipped_when_pane_preexists() {
         return;
     }
     let _temp = IsolatedHome::new();
+    agent_of_empires::session::create_profile("main").unwrap();
     let mut inst = Instance::new("F1Regression", "/tmp/aoe-f1-regression");
     inst.tool = "claude".to_string();
     // Make is_existing=true the path acquire would take if reached, so any

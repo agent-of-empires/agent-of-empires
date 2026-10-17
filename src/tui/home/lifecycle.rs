@@ -52,7 +52,7 @@ impl HomeView {
         };
 
         for profile_name in &profile_names {
-            let storage = Storage::new(profile_name, file_watch.clone())?;
+            let storage = Storage::open(profile_name, file_watch.clone())?;
             let (mut instances, groups) = storage.load_with_groups()?;
             for inst in &mut instances {
                 inst.source_profile = profile_name.clone();
@@ -66,8 +66,31 @@ impl HomeView {
             let mut expired: Vec<String> = instances
                 .iter()
                 .filter(|instance| {
-                    instance.lifecycle_reservation.is_some()
-                        && !instance.has_fresh_lifecycle_reservation(now)
+                    let Some(reservation) = instance.lifecycle_reservation.as_ref() else {
+                        return false;
+                    };
+                    if instance.status == crate::session::Status::Deleting
+                        && reservation.op == crate::session::LifecycleOperation::Purge
+                    {
+                        match crate::session::lifecycle_journal::deletion_exists(
+                            storage.sessions_path(),
+                            &instance.id,
+                            reservation.generation,
+                        ) {
+                            Ok(true) => return false,
+                            Ok(false) => {}
+                            Err(error) => {
+                                tracing::warn!(
+                                    target: "session.delete_recovery",
+                                    session = %instance.id,
+                                    %error,
+                                    "could not verify purge journal; preserving its reservation"
+                                );
+                                return false;
+                            }
+                        }
+                    }
+                    !instance.has_fresh_lifecycle_reservation(now)
                 })
                 .map(|instance| instance.id.clone())
                 .collect();
@@ -84,19 +107,48 @@ impl HomeView {
                 // `retain` can empty this when every lock failed; writing then would
                 // rewrite sessions.json and notify subscribers for no change.
                 if !expired.is_empty() {
+                    let mut cleared_ids = std::collections::HashSet::new();
                     let cleared = storage.update(|disk, _groups| {
                         for id in &expired {
-                            if let Some(stored) =
+                            let Some(stored) =
                                 disk.iter_mut().find(|candidate| &candidate.id == id)
-                            {
-                                stored.clear_expired_lifecycle_reservation(ttl, now);
+                            else {
+                                continue;
+                            };
+                            if stored.status == crate::session::Status::Deleting {
+                                if let Some(reservation) = stored.lifecycle_reservation.as_ref() {
+                                    if reservation.op
+                                        == crate::session::LifecycleOperation::Purge
+                                    {
+                                        match crate::session::lifecycle_journal::deletion_exists(
+                                            storage.sessions_path(),
+                                            &stored.id,
+                                            reservation.generation,
+                                        ) {
+                                            Ok(true) => continue,
+                                            Ok(false) => {}
+                                            Err(error) => {
+                                                tracing::warn!(
+                                                    target: "session.delete_recovery",
+                                                    session = %stored.id,
+                                                    %error,
+                                                    "could not verify purge journal under lifecycle lock; preserving its reservation"
+                                                );
+                                                continue;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            if stored.clear_expired_lifecycle_reservation(ttl, now) {
+                                cleared_ids.insert(id.clone());
                             }
                         }
                         Ok(())
                     });
                     if cleared.is_ok() {
                         for instance in &mut instances {
-                            if expired.contains(&instance.id) {
+                            if cleared_ids.contains(&instance.id) {
                                 instance.clear_expired_lifecycle_reservation(ttl, now);
                             }
                         }
@@ -375,6 +427,7 @@ impl HomeView {
             sidebar_source: crate::tui::session_feed::SidebarSource::Storage,
             deletion_poller: DeletionPoller::new(),
             deletes_in_flight: HashMap::new(),
+            next_delete_attempt_id: 0,
             failed_deletes: HashMap::new(),
             stop_poller: StopPoller::new(),
             trash_poller: crate::tui::trash_poller::TrashPoller::new(),
@@ -677,7 +730,7 @@ impl HomeView {
             for name in &current_profiles {
                 if !self.storages.contains_key(name) {
                     self.storages
-                        .insert(name.clone(), Storage::new(name, self.file_watch.clone())?);
+                        .insert(name.clone(), Storage::open(name, self.file_watch.clone())?);
                 }
             }
             self.storages.retain(|k, _| current_profiles.contains(k));

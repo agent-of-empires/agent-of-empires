@@ -48,6 +48,149 @@ fn build_rename_test_state(
     (storage, state)
 }
 
+#[tokio::test]
+#[serial_test::serial]
+async fn trash_native_failure_adopts_durable_rollback_and_preserves_newer_cache() {
+    use crate::session::{LifecycleOperation, LifecycleReservation};
+
+    for was_trashed in [false, true] {
+        for (kill_pane, newer_cache) in [(true, false), (false, false), (true, true), (false, true)]
+        {
+            let root = tempfile::tempdir().unwrap();
+            let _home = crate::session::test_support::isolate_app_dir_at(root.path());
+            let project = root.path().join("project");
+            std::fs::create_dir(&project).unwrap();
+            std::fs::write(project.join("sentinel"), b"retained project").unwrap();
+            let runtime = crate::process::prime::PrimeRuntime::new(
+                "/bin/false".into(),
+                root.path().into(),
+                None,
+            )
+            .unwrap();
+            runtime.prepare().unwrap();
+            runtime.adopt_prepared().unwrap();
+            std::fs::write(runtime.directory.join("frontend.identity"), b"invalid").unwrap();
+            let proof_before = std::fs::read(runtime.proof_path.as_ref().unwrap()).unwrap();
+            let mut instance = Instance::new("native-trash", project.to_str().unwrap());
+            instance.source_profile = "default".into();
+            instance.view = crate::session::View::Terminal;
+            instance.status = Status::Running;
+            instance.active_execution = Some(crate::session::test_support::prime_execution(
+                &runtime, &project,
+            ));
+            if was_trashed {
+                instance.trash();
+            }
+            let prior_trash = (instance.trashed_at, instance.trash_lifecycle_id.clone());
+            let id = instance.id.clone();
+            let mut cached = instance.clone();
+            cached.untrash();
+            cached.status = Status::Idle;
+            cached.last_error_check = Some(std::time::Instant::now());
+            let runtime_check = cached.last_error_check;
+            let (storage, state) = build_rename_test_state(vec![instance], vec![cached]);
+            let lifecycle_lock = storage.acquire_instance_lifecycle_lock(&id).unwrap();
+            let request = trash_session(
+                State(state.clone()),
+                Path(id.clone()),
+                Some(Json(TrashSessionBody { kill_pane })),
+            );
+            tokio::pin!(request);
+            assert!(futures_util::poll!(&mut request).is_pending());
+            let newer = if newer_cache {
+                let mut instances = state.instances.write().await;
+                let cached = instances.iter_mut().find(|row| row.id == id).unwrap();
+                cached.lifecycle_generation = 10;
+                cached.lifecycle_reservation = Some(LifecycleReservation {
+                    op: LifecycleOperation::Purge,
+                    generation: 10,
+                    at: chrono::Utc::now(),
+                });
+                cached.status = Status::Deleting;
+                cached.trash();
+                Some(cached.clone())
+            } else {
+                None
+            };
+            drop(lifecycle_lock);
+
+            let response = request.await.into_response();
+
+            assert_eq!(
+                response.status(),
+                if kill_pane {
+                    StatusCode::INTERNAL_SERVER_ERROR
+                } else {
+                    StatusCode::OK
+                }
+            );
+            let durable = storage
+                .load()
+                .unwrap()
+                .into_iter()
+                .find(|row| row.id == id)
+                .unwrap();
+            assert_eq!(durable.is_trashed(), was_trashed || !kill_pane);
+            if was_trashed || kill_pane {
+                assert_eq!(
+                    (durable.trashed_at, durable.trash_lifecycle_id.clone()),
+                    prior_trash
+                );
+            }
+            assert_eq!(durable.lifecycle_generation, 1);
+            assert!(durable.lifecycle_reservation.is_none());
+            let expected = newer.as_ref().unwrap_or(&durable);
+            let instances = state.instances.read().await;
+            let cached = instances.iter().find(|row| row.id == id).unwrap();
+            assert_eq!(cached.status, expected.status);
+            assert_eq!(cached.lifecycle_generation, expected.lifecycle_generation);
+            assert_eq!(cached.lifecycle_reservation, expected.lifecycle_reservation);
+            assert_eq!(cached.trashed_at, expected.trashed_at);
+            assert_eq!(cached.trash_lifecycle_id, expected.trash_lifecycle_id);
+            assert_eq!(cached.last_error_check, runtime_check);
+            assert_eq!(
+                std::fs::read(project.join("sentinel")).unwrap(),
+                b"retained project"
+            );
+            assert_eq!(
+                std::fs::read(runtime.directory.join("frontend.identity")).unwrap(),
+                b"invalid"
+            );
+            assert_eq!(
+                std::fs::read(runtime.proof_path.as_ref().unwrap()).unwrap(),
+                proof_before
+            );
+        }
+    }
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn stale_terminal_stop_does_not_recreate_a_renamed_profile() {
+    let _home = crate::session::test_support::isolate_app_dir();
+    let mut instance = Instance::new("stale-stop", "/tmp/stale-stop");
+    instance.source_profile = "default".into();
+    instance.view = crate::session::View::Terminal;
+    instance.status = Status::Running;
+    let id = instance.id.clone();
+    let (_storage, state) = build_rename_test_state(vec![instance.clone()], vec![instance.clone()]);
+    crate::session::rename_profile("default", "after-stop-rename").unwrap();
+    assert!(instance.stop().is_err());
+    let response = stop_session(State(state), Path(id)).await.into_response();
+    assert!(!response.status().is_success());
+    assert!(!crate::session::get_profile_dir_path("default")
+        .unwrap()
+        .exists());
+    assert_eq!(
+        Storage::open_unwatched("after-stop-rename")
+            .unwrap()
+            .load()
+            .unwrap()
+            .len(),
+        1
+    );
+}
+
 /// #3411: a rename to a duplicate title, or a tied rename whose derived path
 /// collides with another session's worktree, is refused.
 #[tokio::test]
@@ -1941,6 +2084,7 @@ async fn worktree_edits_quiesce_structured_worker_only_when_its_cwd_moves() {
         // (#2260). The quiesce precedes the git edit, so the assertion holds even
         // though the edit then fails on a fixture with no real worktree.
         let _app_dir = crate::session::test_support::isolate_app_dir();
+        crate::session::create_profile("test").unwrap();
         // set_worktree_name refuses a tied managed worktree (tied callers must
         // go through rename_session), so untie the profile to reach the worker
         // gate that this test exercises.
@@ -2851,6 +2995,7 @@ impl PluginStatusFeed {
 #[tokio::test]
 async fn archive_session_notifies_plugins_of_the_idle_it_settles_to() {
     let _home = crate::session::test_support::isolate_app_dir();
+    crate::session::create_profile("default").unwrap();
     let mut running = make_test_instance();
     running.source_profile = "default".to_string();
     let mut idle = make_test_instance();
@@ -2891,6 +3036,7 @@ async fn archive_session_notifies_plugins_of_the_idle_it_settles_to() {
 #[tokio::test]
 async fn stop_session_notifies_plugins() {
     let _home = crate::session::test_support::isolate_app_dir();
+    crate::session::create_profile("default").unwrap();
     let mut inst = make_test_instance();
     inst.view = crate::session::View::Structured;
     inst.source_profile = "default".to_string();
@@ -2922,7 +3068,16 @@ async fn start_session_notifies_plugins() {
     let state = crate::server::test_support::build_test_app_state(vec![inst]);
     let mut feed = PluginStatusFeed::attach(&state, "default").await;
 
-    start_session(State(std::sync::Arc::clone(&state)), Path(id)).await;
+    crate::process::worker_registry::seed_settled_stop_intent(&id).unwrap();
+    let response = start_session(State(std::sync::Arc::clone(&state)), Path(id.clone()))
+        .await
+        .into_response();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(
+        !crate::process::worker_registry::stop_requested(&id),
+        "explicit start did not clear the settled ACP stop fence"
+    );
 
     assert_eq!(feed.next().await, ("Stopped".into(), "Idle".into()));
 }
@@ -2959,6 +3114,137 @@ async fn failed_delete_notifies_plugins_of_the_error() {
     assert_eq!(feed.next().await, ("Deleting".into(), "Error".into()));
 }
 
+#[tokio::test]
+#[serial_test::serial]
+#[cfg(unix)]
+async fn delete_retry_keeps_rowless_terminal_authority_failed_until_explicit_recovery() {
+    use crate::session::deletion::{
+        DeletionDisposition, DeletionRequest, PurgeReservation, PurgeTransaction,
+    };
+    use crate::session::lifecycle_journal::LifecyclePhase;
+    let _home = crate::session::test_support::isolate_app_dir();
+    crate::session::create_profile("default").unwrap();
+    let storage = Storage::open_unwatched("default").unwrap();
+    let mut instance = Instance::new("terminal retry", "/tmp/terminal-retry");
+    instance.source_profile = "default".into();
+    instance.view = crate::session::View::Structured;
+    instance.scratch = true;
+    let id = instance.id.clone();
+    let workspace = crate::session::scratch::provision_scratch_dir(&id).unwrap();
+    instance.project_path = workspace.to_string_lossy().into_owned();
+    std::fs::write(workspace.join("protected"), b"irreversible cleanup").unwrap();
+    storage
+        .update(|rows, _| {
+            rows.push(instance.clone());
+            Ok(())
+        })
+        .unwrap();
+    let transaction = match PurgeTransaction::reserve(
+        storage.clone(),
+        DeletionRequest {
+            session_id: id.clone(),
+            instance,
+            delete_worktree: false,
+            delete_branch: false,
+            delete_sandbox: false,
+            force_delete: false,
+            detach_hooks: true,
+            keep_scratch: false,
+        },
+    )
+    .unwrap()
+    {
+        PurgeReservation::Reserved(transaction) => transaction,
+        PurgeReservation::Rejected(result) => panic!("{result:?}"),
+    };
+    let cached = storage.load().unwrap().remove(0);
+    let generation = cached.lifecycle_generation;
+    let committed = transaction.run_hooks().begin_irreversible().unwrap();
+    let failed_path = storage.sessions_path().to_path_buf();
+    let sync = crate::session::intercept_directory_sync_for_test(move |path| {
+        if path == failed_path {
+            anyhow::bail!(std::io::Error::from_raw_os_error(libc::EIO));
+        }
+        Ok(())
+    });
+    let result = committed.finish();
+    assert_eq!(result.disposition, DeletionDisposition::Failed);
+    assert!(result.teardown_started);
+    assert!(result.retained_instance.is_none());
+    assert!(!workspace.exists());
+    assert!(storage.load().unwrap().is_empty());
+    let journal =
+        crate::session::lifecycle_journal::path_for(storage.sessions_path(), &id, generation);
+    let entry = crate::session::lifecycle_journal::read_deletion(&journal)
+        .unwrap()
+        .unwrap();
+    assert_eq!(entry.phase, LifecyclePhase::TeardownComplete);
+    let journal_before = std::fs::read(&journal).unwrap();
+    let fence_path = crate::process::worker_registry::workers_dir()
+        .unwrap()
+        .join(format!("{id}.purge-fence"));
+    let fence_before = std::fs::read(&fence_path).unwrap();
+    drop(sync);
+    // The transient fault is repaired, but row absence does not retire the retained intent.
+    let state = crate::server::test_support::build_test_app_state(vec![cached]);
+    let epoch = state
+        .mutation_epoch
+        .load(std::sync::atomic::Ordering::SeqCst);
+    for _ in 0..2 {
+        let response = delete_session(
+            State(state.clone()),
+            Path(id.clone()),
+            Some(Json(DeleteSessionBody::default())),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["error"], "deletion_failed");
+        assert!(body["message"]
+            .as_str()
+            .unwrap()
+            .contains("retained lifecycle authority"));
+        let instances = state.instances.read().await;
+        assert_eq!(instances.len(), 1);
+        assert_eq!(instances[0].id, id);
+        assert_eq!(instances[0].status, Status::Deleting);
+        assert!(instances[0]
+            .lifecycle_reservation_is_owned(crate::session::LifecycleOperation::Purge, generation));
+        drop(instances);
+        assert_eq!(
+            state
+                .mutation_epoch
+                .load(std::sync::atomic::Ordering::SeqCst),
+            epoch
+        );
+        assert_eq!(std::fs::read(&journal).unwrap(), journal_before);
+        assert_eq!(std::fs::read(&fence_path).unwrap(), fence_before);
+        assert!(storage.load().unwrap().is_empty());
+    }
+    crate::session::deletion::recover_lifecycle_journals_once().unwrap();
+    assert!(!journal.exists());
+    assert!(!crate::process::worker_registry::is_purge_fenced(&id).unwrap());
+    let response = delete_session(
+        State(state.clone()),
+        Path(id.clone()),
+        Some(Json(DeleteSessionBody::default())),
+    )
+    .await
+    .into_response();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+        .await
+        .unwrap();
+    let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(body["status"], "deleted");
+    assert!(state.instances.read().await.is_empty());
+    assert!(storage.load().unwrap().is_empty());
+}
+
 /// A direct stop sets `Stopped` on the live in-memory row without going through
 /// `apply_status_intent`, which normally releases a plugin's pending revival mark on reaching
 /// a terminal status; `stop_session` must do the same itself, on that same in-memory row (the
@@ -2967,6 +3253,7 @@ async fn failed_delete_notifies_plugins_of_the_error() {
 #[tokio::test]
 async fn stop_session_clears_a_pending_plugin_revival() {
     let _home = crate::session::test_support::isolate_app_dir();
+    crate::session::create_profile("default").unwrap();
     let mut inst = make_test_instance();
     inst.view = crate::session::View::Structured;
     inst.plugin_revival_pending = true;
@@ -4963,6 +5250,64 @@ async fn a_retry_across_a_restart_is_fenced_before_profile_validation() {
     assert_eq!(status, axum::http::StatusCode::CONFLICT, "{refused}");
     assert_eq!(refused["error"], "create_outcome_unknown");
     assert_eq!(effects(), 1);
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn create_does_not_recreate_a_profile_deleted_during_its_hook() {
+    use crate::server::test_support as support;
+    for explicit_profile in [true, false] {
+        let _home = crate::session::test_support::isolate_app_dir();
+        let gate = tempfile::tempdir().unwrap();
+        let ready = gate.path().join("ready");
+        let release = gate.path().join("release");
+        let hook = format!(
+            ": > '{}'; while [ ! -e '{}' ]; do sleep 0.01; done",
+            ready.display(),
+            release.display()
+        );
+        let project = project_with_on_create_hooks(&[hook.as_str()]);
+        crate::session::create_profile("keeper").unwrap();
+        crate::session::create_profile("victim").unwrap();
+        crate::session::set_default_profile("victim").unwrap();
+        support::seed_instances_on_disk_for_test("victim", Vec::new());
+        let profile_dir = crate::session::get_profile_dir_path("victim").unwrap();
+        let (launcher, _) = support::counting_failing_launcher();
+        let mut state = support::build_test_app_state_with_launcher(Vec::new(), launcher);
+        std::sync::Arc::get_mut(&mut state).unwrap().profile = "victim".into();
+        let create = tokio::spawn(async move {
+            post_create(
+                &state,
+                serde_json::json!({
+                    "title": "deleted-profile",
+                    "path": project.path(),
+                    "tool": "claude",
+                    "view": "structured",
+                    "profile": explicit_profile.then_some("victim"),
+                    "trust_hooks": true,
+                }),
+            )
+            .await
+        });
+        wait_for("the create hook", || ready.exists()).await;
+        let deleted = crate::session::delete_profile("victim");
+        std::fs::write(&release, "").unwrap();
+        let (status, response) = create.await.unwrap();
+        deleted.unwrap();
+        assert!(
+            !profile_dir.exists(),
+            "create resurrected the deleted profile; explicit={explicit_profile}"
+        );
+        assert!(!status.is_success(), "{status}: {response}");
+        assert!(
+            crate::session::Storage::open_unwatched("keeper")
+                .unwrap()
+                .load()
+                .unwrap()
+                .is_empty(),
+            "failed create wrote into the survivor; explicit={explicit_profile}"
+        );
+    }
 }
 
 #[tokio::test]

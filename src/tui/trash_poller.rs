@@ -120,6 +120,7 @@ mod tests {
             session_id: session_id.clone(),
             instance,
             generation,
+            was_trashed: false,
         });
         assert_eq!(poller.take_pending(), vec![session_id.clone()]);
         assert!(poller.take_pending().is_empty(), "take_pending drains");

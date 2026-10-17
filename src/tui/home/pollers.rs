@@ -2,6 +2,33 @@
 
 use super::*;
 
+fn record_deletion_failure(
+    instance: &mut Instance,
+    retained: Option<Instance>,
+    error: Option<String>,
+    teardown_started: bool,
+) -> bool {
+    let missing_irreversible_row = teardown_started && retained.is_none();
+    if let Some(retained) = retained {
+        instance.status = retained.status;
+        instance.lifecycle_generation = retained.lifecycle_generation;
+        instance.lifecycle_reservation = retained.lifecycle_reservation;
+    }
+    let pending_purge = missing_irreversible_row
+        || (instance.status == crate::session::Status::Deleting
+            && instance.lifecycle_reservation_is_owned(
+                crate::session::LifecycleOperation::Purge,
+                instance.lifecycle_generation,
+            ));
+    instance.status = if pending_purge {
+        crate::session::Status::Deleting
+    } else {
+        crate::session::Status::Error
+    };
+    instance.last_error = error;
+    pending_purge
+}
+
 impl HomeView {
     pub fn apply_deletion_results(&mut self) -> bool {
         use crate::session::deletion::DeletionDisposition;
@@ -9,14 +36,66 @@ impl HomeView {
         use std::sync::mpsc::TryRecvError;
 
         match self.deletion_poller.try_recv_result() {
-            Ok(result) => {
-                let attempt = self.deletes_in_flight.remove(&result.session_id);
-                if result.disposition == DeletionDisposition::Failed {
-                    if let Some(attempt) = attempt {
-                        self.failed_deletes
-                            .insert(result.session_id.clone(), attempt);
+            Ok((attempt_id, mut result)) => {
+                let matches_attempt =
+                    self.deletes_in_flight
+                        .get(&result.session_id)
+                        .is_some_and(|ticket| {
+                            ticket.worker == DeleteWorker::Purge && ticket.attempt_id == attempt_id
+                        });
+                if !matches_attempt {
+                    return true;
+                }
+                let attempt = self
+                    .deletes_in_flight
+                    .remove(&result.session_id)
+                    .expect("matched deletion attempt must be present");
+                let completion_generation = result
+                    .retained_instance
+                    .as_ref()
+                    .map(|retained| retained.lifecycle_generation)
+                    .unwrap_or_else(|| attempt.lifecycle_generation.saturating_add(1));
+                if self
+                    .instances
+                    .get(&result.session_id)
+                    .is_some_and(|current| {
+                        current.source_profile != attempt.source_profile
+                            || current.lifecycle_generation > completion_generation
+                            || (result.disposition != DeletionDisposition::KeptRestored
+                                && attempt.trashed_at.is_some()
+                                && (current.trashed_at != attempt.trashed_at
+                                    || current.trash_lifecycle_id != attempt.trash_lifecycle_id))
+                    })
+                {
+                    return true;
+                }
+                if let Some(durable) = self.load_durable_instance(&result.session_id) {
+                    if matches!(
+                        result.disposition,
+                        DeletionDisposition::Removed | DeletionDisposition::AlreadyGone
+                    ) {
+                        if let Some(current) = self.instances.get_mut(&result.session_id) {
+                            if durable.lifecycle_generation >= current.lifecycle_generation {
+                                *current = durable;
+                            }
+                        }
+                        return true;
                     }
-                } else {
+                    if durable.lifecycle_generation > completion_generation {
+                        return true;
+                    }
+                    result.retained_instance = Some(durable);
+                }
+                if result.retained_instance.as_ref().is_some_and(|retained| {
+                    self.instances
+                        .get(&result.session_id)
+                        .is_some_and(|current| {
+                            retained.lifecycle_generation < current.lifecycle_generation
+                        })
+                }) {
+                    return true;
+                }
+                if result.disposition != DeletionDisposition::Failed {
                     self.failed_deletes.remove(&result.session_id);
                 }
                 match result.disposition {
@@ -67,59 +146,118 @@ impl HomeView {
                         } else {
                             Some(result.errors.join("; "))
                         };
-                        self.mutate_instance(&result.session_id, |inst| {
-                            inst.status = Status::Error;
-                            inst.last_error = error;
-                        });
+                        if let Some(current) = self.instances.get_mut(&result.session_id) {
+                            if record_deletion_failure(
+                                current,
+                                result.retained_instance,
+                                error,
+                                result.teardown_started,
+                            ) {
+                                self.failed_deletes.remove(&result.session_id);
+                                self.info_dialog = Some(InfoDialog::new(
+                                    "Delete failed",
+                                    current.last_error.as_deref().unwrap_or(
+                                        "Deletion remains pending; inspect recovery before retrying.",
+                                    ),
+                                ));
+                            } else {
+                                self.failed_deletes
+                                    .insert(result.session_id.clone(), attempt);
+                            }
+                        } else if result.teardown_started {
+                            self.failed_deletes.remove(&result.session_id);
+                            self.info_dialog = Some(InfoDialog::new(
+                                "Delete failed",
+                                error.as_deref().unwrap_or(
+                                    "Deletion remains pending; inspect recovery before retrying.",
+                                ),
+                            ));
+                        }
                     }
                 }
                 true
             }
             Err(TryRecvError::Empty) => false,
             Err(TryRecvError::Disconnected) => {
-                let stuck: Vec<String> = self
-                    .instances
-                    .values()
-                    .filter(|instance| instance.status == Status::Deleting)
-                    .map(|instance| instance.id.clone())
-                    .collect();
-                if stuck.is_empty() {
+                let mut changed = 0;
+                for (id, attempt) in self
+                    .deletes_in_flight
+                    .extract_if(|_, attempt| attempt.worker == DeleteWorker::Purge)
+                {
+                    let Some(current) = self.instances.get_mut(&id) else {
+                        continue;
+                    };
+                    if current.status != Status::Deleting
+                        || current.trashed_at != attempt.trashed_at
+                        || current.trash_lifecycle_id != attempt.trash_lifecycle_id
+                    {
+                        continue;
+                    }
+                    let durable = crate::session::Storage::open_unwatched(&current.source_profile)
+                        .and_then(|storage| storage.load())
+                        .ok()
+                        .and_then(|rows| rows.into_iter().find(|row| row.id == id));
+                    let pending = record_deletion_failure(
+                        current,
+                        durable,
+                        Some(
+                            "Deletion worker stopped; inspect pending recovery before retrying"
+                                .into(),
+                        ),
+                        false,
+                    );
+                    if !pending {
+                        self.failed_deletes.insert(id, attempt);
+                    }
+                    changed += 1;
+                }
+                if changed == 0 {
                     return false;
                 }
                 tracing::error!(
                     target: "tui.home",
-                    rows = stuck.len(),
-                    "deletion poller worker gone; marking stuck Deleting rows Error",
+                    rows = changed,
+                    "deletion worker stopped before reporting its results",
                 );
-                for id in &stuck {
-                    self.mutate_instance(id, |inst| {
-                        inst.status = Status::Error;
-                        inst.last_error =
-                            Some("Deletion worker crashed; session was not deleted".to_string());
-                    });
-                }
+                self.info_dialog = Some(InfoDialog::new(
+                    "Delete worker stopped",
+                    "Inspect pending recovery before retrying. Some teardown may already have completed.",
+                ));
                 true
             }
         }
     }
 
+    fn apply_stop_outcome(&mut self, id: &str, error: Option<String>) {
+        let durable = self.load_durable_instance(id);
+        let Some(instance) = self.instances.get_mut(id) else {
+            return;
+        };
+        if let Some(durable) = durable {
+            if durable.lifecycle_generation < instance.lifecycle_generation {
+                return;
+            }
+            instance.merge_post_start(&durable);
+            instance.status = durable.status;
+            instance.lifecycle_generation = durable.lifecycle_generation;
+            instance.lifecycle_reservation = durable.lifecycle_reservation;
+        } else if error.is_some() && instance.status != crate::session::Status::Deleting {
+            instance.status = crate::session::Status::Error;
+        }
+        instance.last_error = error;
+    }
+
     pub fn apply_stop_results(&mut self) -> bool {
-        use crate::session::Status;
         use std::sync::mpsc::TryRecvError;
 
         match self.stop_poller.try_recv_result() {
             Ok(result) => {
-                if let Some(committed) = self.load_durable_instance(&result.session_id) {
-                    self.mutate_instance(&result.session_id, |instance| {
-                        instance.merge_post_start(&committed);
-                    });
+                self.apply_stop_outcome(&result.session_id, result.error);
+                if result.success {
+                    return true;
                 }
-                if !result.success {
-                    self.set_instance_error(&result.session_id, result.error);
-                    self.set_instance_status(&result.session_id, Status::Error);
-                    if let Err(e) = self.save() {
-                        tracing::error!(target: "tui.home", "Failed to save after stop: {}", e);
-                    }
+                if let Err(e) = self.save() {
+                    tracing::error!(target: "tui.home", "Failed to save after stop: {}", e);
                 }
                 true
             }
@@ -132,14 +270,13 @@ impl HomeView {
                 tracing::error!(
                     target: "tui.home",
                     rows = stuck.len(),
-                    "stop poller worker gone; marking in-flight stops Error",
+                    "stop poller worker gone; reloading durable lifecycle authority",
                 );
                 for id in &stuck {
-                    self.set_instance_error(
+                    self.apply_stop_outcome(
                         id,
                         Some("Stop worker crashed; the session may not have stopped".to_string()),
                     );
-                    self.set_instance_status(id, Status::Error);
                 }
                 if let Err(e) = self.save() {
                     tracing::error!(target: "tui.home", "Failed to save after stop: {}", e);
@@ -162,20 +299,31 @@ impl HomeView {
         match self.trash_poller.try_recv_result() {
             Ok(result) => {
                 let mut changed = false;
-                if let Some(relocation) = result.relocation {
-                    let durable = self.load_durable_instance(&result.session_id);
-                    if let Some(durable) = durable.filter(|instance| {
-                        instance.is_trashed()
-                            && instance.project_path == relocation.new_project_path
-                    }) {
-                        if let Some(instance) = self.instances.get_mut(&result.session_id) {
-                            instance.project_path = durable.project_path;
-                            instance.pre_trash_project_path = durable.pre_trash_project_path;
-                            instance.lifecycle_generation = durable.lifecycle_generation;
-                            instance.lifecycle_reservation = durable.lifecycle_reservation;
-                            changed = true;
-                        }
+                let durable = self.load_durable_instance(&result.session_id);
+                if let (Some(instance), Some(durable)) =
+                    (self.instances.get_mut(&result.session_id), durable.as_ref())
+                {
+                    if durable.lifecycle_generation < instance.lifecycle_generation {
+                        return false;
                     }
+                    if result.relocation.as_ref().is_some_and(|relocation| {
+                        durable.is_trashed() && durable.project_path == relocation.new_project_path
+                    }) {
+                        instance.project_path.clone_from(&durable.project_path);
+                        instance
+                            .pre_trash_project_path
+                            .clone_from(&durable.pre_trash_project_path);
+                    }
+                    instance.status = durable.status;
+                    instance.lifecycle_generation = durable.lifecycle_generation;
+                    instance
+                        .lifecycle_reservation
+                        .clone_from(&durable.lifecycle_reservation);
+                    instance.trashed_at = durable.trashed_at;
+                    instance
+                        .trash_lifecycle_id
+                        .clone_from(&durable.trash_lifecycle_id);
+                    changed = true;
                 }
                 if let Some(reason) = result.relocate_warning {
                     tracing::warn!(

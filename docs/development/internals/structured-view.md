@@ -26,7 +26,52 @@ Invariants worth knowing before touching this code:
 
 `session/delete` fires only on permanent removal (a purge, or disabling the structured view, which discards the conversation). Reversible teardown (`aoe acp stop`, snooze, archive, trash, idle auto-stop) deliberately does not fire it, so the transcript stays on disk and the next respawn resumes through `session/load`.
 
-Trash is the reversible middle state: a delete moves the session there by default (`session.delete_to_trash`), keeping its transcript, worktree, branch, and container until it is restored, purged, or auto-purged after `session.trash_retention_minutes`. Retention is enforced by the daemon (a startup sweep, then one every tenth of the shortest window, between a minute and an hour), so without one, expired trash waits for the next daemon start or a manual purge. When the daemon permanently deletes a structured session it sends a best-effort `session/delete` (2s timeout) so adapters that implement it can release their own state, then proceeds with cancel, SIGTERM, and on-disk cleanup. CLI purges have no running worker, so they delete the local transcript only.
+Trash is the reversible middle state: a delete moves the session there by default (`session.delete_to_trash`), keeping its transcript, worktree, branch, and container until it is restored, purged, or auto-purged after `session.trash_retention_minutes`. Retention is enforced by the daemon (a startup sweep, then one every tenth of the shortest window, between a minute and an hour), so without one, expired trash waits for the next daemon start or a manual purge. When the daemon permanently deletes a structured session it sends a best-effort `session/delete` (2s timeout) so adapters that implement it can release their own state, then proceeds with cancel, SIGTERM, and on-disk cleanup. CLI purges stop any registered detached runner before deleting its local transcript.
+
+If native teardown fails during Trash, only the failed attempt's exact reservation is
+rolled back: newly trashed rows return to their prior bucket, already-trashed rows keep
+their trash identity, and resources/native evidence remain. Consumers adopt durable state
+without overwriting a newer lifecycle generation.
+
+Permanent purge records intent before destruction. Recovery replays hooks and revalidates
+preflight before committing `TeardownStarted`; pre-teardown abandonment never settles native
+execution. Loaded irreversible checkpoints must be confirmed durable again before signalling.
+Once that boundary is durable, failures retain the exact generation's journal
+and runner fence until owned process/native-runtime settlement and the final sessions
+directory sync succeed. A failed directory sync can leave the row already absent: absence
+is not success, and recovery retains its terminal proof until a durable retry.
+A rowless API retry refuses unresolved matching intent; repairing durability alone does
+not confirm deletion. Complete lifecycle recovery from a healthy process, or at the next
+daemon startup, before retrying confirmation. A valid `Kept` record describes completed
+deletion with intentionally retained resources, not an unresolved attempt.
+Expired leases alone never authorize replacement launch, capture or destruction. Restore
+may abandon only an expired, owner-free pre-teardown purge with matching durable evidence.
+
+TUI Purge and Drop requests carry immutable, local attempt identities separate from durable
+lifecycle generations. Only a matching worker/attempt retires its ticket, even when a reload
+or profile move makes the payload obsolete; a predecessor cannot mutate a successor attempt.
+Force Remove cannot replace an outstanding local deletion; owner-free stuck rows without
+a local attempt still use the backend's ownership and generation guards.
+
+Runner admission preserves an existing owner. Signals require incarnation-bound ownership;
+unknown ownership or unreadable membership preserves evidence and resources. A pending
+structured-to-terminal handoff blocks ordinary launch/input until settlement and completion.
+A write-authorized retry uses `acp/disable` even if the durable view is already terminal
+or the agent no longer supports enabling structured view; it never enables a new session.
+
+Profile rename/delete serialize with affected lifecycle owners. Readable unresolved
+transitions fence their endpoints and affected sessions; unreadable authority fails closed.
+If recovery reports ambiguous directory identity, preserve the checkpoint and directories,
+restore the verified original directory layout from your backup, then retry the profile
+operation. Do not delete the checkpoint to bypass ownership checks.
+Admitted-profile operations never recreate a missing profile.
+
+`Kept` checkpoints have no age expiry. Each recognized scratch, workspace or agent-store
+resource must be proven absent beneath an independently admitted namespace before its
+checkpoint is consumed. Ambient aliases above that namespace are allowed; symlinks or
+unreadable components beneath it retain the checkpoint. Unknown namespaces, descriptors,
+I/O errors and ambiguous siblings retain it. Force Remove abandons
+matching destructive intent before dropping only the row, preserving promised resources.
 
 ## Who owns the state
 

@@ -349,6 +349,10 @@ impl HomeView {
         let before = baseline.cloned().unwrap_or_else(|| current.clone());
         let old_profile = before.source_profile.clone();
         requested.source_profile = old_profile.clone();
+        anyhow::ensure!(
+            current.status != crate::session::Status::Deleting,
+            crate::session::StartBlocked::Deleting,
+        );
         if old_profile == target {
             requested.source_profile = target.to_string();
             self.instances.insert(id.to_string(), requested);

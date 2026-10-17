@@ -933,7 +933,10 @@ pub fn cleanup_instance(
 ) {
     // The loser may never have reached storage, so lifecycle-coordinated stop cannot reserve its
     // row.
-    instance.kill_all_tmux_sessions_without_lifecycle_row();
+    if let Err(error) = instance.kill_all_tmux_sessions_without_lifecycle_row() {
+        tracing::warn!(target: "session.create", "Failed to settle abandoned session: {error:#}");
+        return;
+    }
 
     if let Some(sandbox) = &instance.sandbox_info {
         if sandbox.enabled {

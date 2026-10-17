@@ -607,7 +607,6 @@ impl SessionPoller {
 
         let handle = std::thread::Builder::new()
             .name(thread_label.clone())
-            .stack_size(128 * 1024)
             .spawn(move || {
                 // Rebind so the closure captures `_guard` and the counter only decrements when the
                 // thread exits (including via panic).

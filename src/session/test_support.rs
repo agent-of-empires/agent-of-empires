@@ -234,6 +234,10 @@ pub(crate) struct AppDirGuard {
 }
 
 impl AppDirGuard {
+    pub(crate) fn with_temp(temp: TempDir) -> Self {
+        install_env_vars(temp.path().to_path_buf(), Some(temp))
+    }
+
     pub(crate) fn path(&self) -> &Path {
         &self.path
     }
@@ -279,9 +283,7 @@ fn restore_or_remove(key: &str, prev: Option<OsString>) {
 }
 
 pub(crate) fn isolate_app_dir() -> AppDirGuard {
-    let temp_home = TempDir::new().expect("create tempdir for AppDirGuard");
-    let path = temp_home.path().to_path_buf();
-    install_env_vars(path, Some(temp_home))
+    AppDirGuard::with_temp(TempDir::new().expect("create tempdir for AppDirGuard"))
 }
 
 /// Isolate the app dir for one test against a caller-owned path.
@@ -384,6 +386,26 @@ impl LogCapture {
     pub(crate) fn contents(&self) -> String {
         String::from_utf8_lossy(&self.buf.lock().unwrap_or_else(PoisonError::into_inner))
             .into_owned()
+    }
+}
+
+pub(crate) fn prime_execution(
+    runtime: &crate::process::prime::PrimeRuntime,
+    cwd: &Path,
+) -> super::ActiveExecution {
+    super::ActiveExecution {
+        launch_id: "launch".into(),
+        binding: super::ExecutionBinding {
+            agent: "prime-agent".into(),
+            stores: Vec::new(),
+            configuration: Vec::new(),
+            cwd: cwd.to_path_buf(),
+            cwd_filesystem: "host".into(),
+            filesystem: "host".into(),
+            exported_default_store: None,
+        },
+        capture: Some(super::CaptureContext::PrimeStatus(runtime.clone())),
+        container: None,
     }
 }
 

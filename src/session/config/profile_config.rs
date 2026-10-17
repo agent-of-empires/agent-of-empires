@@ -8,7 +8,6 @@ use serde::{Deserialize, Serialize};
 use std::fs;
 
 use super::Config;
-use crate::session::get_profile_dir;
 
 /// Profile-specific settings, stored as a sparse override tree (#1692).
 ///
@@ -118,10 +117,23 @@ pub(crate) fn overrides_ignored_keys(overrides: &serde_json::Value) -> Vec<Strin
 /// Save profile-specific config, replacing the whole file. Callers holding a
 /// possibly stale copy must go through [`update_profile_config`] instead.
 pub fn save_profile_config(profile: &str, config: &ProfileConfig) -> Result<()> {
+    let base = crate::session::get_app_dir()?;
+    let _transition = crate::session::storage::acquire_storage_shared_flock(
+        &base,
+        crate::migrations::v027_isolate_sandbox_stores::LOCK,
+    )?;
+    let profile = crate::session::resolve_existing_profile(profile)?;
+    crate::session::profile_rename::ensure_profile_available(&profile)?;
+    let dir = crate::session::get_profile_dir_path(&profile)?;
+    let _flock = crate::session::acquire_storage_flock(&dir, PROFILE_CONFIG_LOCK_FILENAME)?;
+    save_profile_config_locked(&profile, config)
+}
+
+fn save_profile_config_locked(profile: &str, config: &ProfileConfig) -> Result<()> {
     let path = get_profile_config_path(profile)?;
     let content = toml::to_string_pretty(config)?;
     crate::session::atomic_write(&path, content.as_bytes())?;
-    Ok(())
+    crate::session::sync_parent_directory(&path)
 }
 
 /// Sidecar lock in the profile directory serialising [`update_profile_config`].
@@ -137,21 +149,25 @@ pub fn update_profile_config<R>(
     profile: &str,
     f: impl FnOnce(&mut ProfileConfig) -> Result<R>,
 ) -> Result<R> {
-    let dir = get_profile_dir(profile)?;
+    let base = crate::session::get_app_dir()?;
+    let _transition = crate::session::storage::acquire_storage_shared_flock(
+        &base,
+        crate::migrations::v027_isolate_sandbox_stores::LOCK,
+    )?;
+    let profile = crate::session::resolve_existing_profile(profile)?;
+    crate::session::profile_rename::ensure_profile_available(&profile)?;
+    let dir = crate::session::get_profile_dir_path(&profile)?;
     let _flock = crate::session::acquire_storage_flock(&dir, PROFILE_CONFIG_LOCK_FILENAME)?;
-    let mut config = load_profile_config(profile)?;
+    let mut config = load_profile_config(&profile)?;
     let result = f(&mut config)?;
     validate_overrides_typecheck(&config.overrides_value())?;
-    save_profile_config(profile, &config)?;
+    save_profile_config_locked(&profile, &config)?;
     Ok(result)
 }
 
-/// Get the path to a profile's config file. This goes through the
-/// creating [`get_profile_dir`] because the only remaining caller is
-/// [`save_profile_config`], which needs the directory to exist before
-/// the atomic write.
+/// Resolve a config path without creating a profile.
 pub fn get_profile_config_path(profile: &str) -> Result<std::path::PathBuf> {
-    Ok(get_profile_dir(profile)?.join("config.toml"))
+    Ok(crate::session::get_profile_dir_path(profile)?.join("config.toml"))
 }
 
 /// Check if a profile has any overrides set
@@ -366,6 +382,61 @@ pub fn validate_check_interval(hours: u64) -> Result<(), String> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    #[serial_test::serial]
+    fn empty_profile_read_does_not_bootstrap_under_transition_lock() {
+        use std::sync::mpsc;
+        use std::time::{Duration, Instant};
+        let temp = tempfile::TempDir::new().unwrap();
+        let _home = crate::session::test_support::isolate_app_dir_at(temp.path());
+        let app = crate::session::get_app_dir().unwrap();
+        std::fs::write(
+            app.join("config.toml"),
+            "[session]\ndefault_tool = \"global-proof\"\n",
+        )
+        .unwrap();
+        let held = crate::session::acquire_storage_flock(
+            &app,
+            crate::migrations::v027_isolate_sandbox_stores::LOCK,
+        )
+        .unwrap();
+        let (blocked_tx, blocked) = mpsc::channel();
+        let (done_tx, done) = mpsc::channel();
+        let reader = std::thread::spawn(move || {
+            let _observer = crate::session::storage::observe_lock_contention_for_test(blocked_tx);
+            let result = resolve_config("");
+            done_tx.send(()).unwrap();
+            result
+        });
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let completed_while_locked = loop {
+            if done.try_recv().is_ok() {
+                break true;
+            }
+            if blocked.try_recv().is_ok() {
+                break false;
+            }
+            if Instant::now() >= deadline {
+                break false;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        };
+        drop(held);
+        let result = reader.join().unwrap();
+        assert!(
+            completed_while_locked,
+            "pure profile read attempted bootstrap while transition was exclusive"
+        );
+        assert_eq!(
+            result.unwrap().session.default_tool.as_deref(),
+            Some("global-proof")
+        );
+        assert!(
+            !app.join("profiles").exists(),
+            "read-only lookup created a bootstrap profile"
+        );
+    }
 
     /// Build a `ProfileConfig` from a sparse override object (the on-disk shape).
     fn profile_from(overrides: serde_json::Value) -> ProfileConfig {
@@ -758,6 +829,7 @@ mod tests {
     #[serial_test::serial]
     fn update_profile_config_keeps_disjoint_writers_edits() {
         let _guard = crate::session::test_support::isolate_app_dir();
+        crate::session::create_profile("work").unwrap();
         let (inside_tx, inside_rx) = std::sync::mpsc::channel();
         let (go_tx, go_rx) = std::sync::mpsc::channel::<()>();
         let (started_tx, started_rx) = std::sync::mpsc::channel();
@@ -802,6 +874,7 @@ mod tests {
     #[serial_test::serial]
     fn update_profile_config_writes_nothing_when_the_update_fails() {
         let _guard = crate::session::test_support::isolate_app_dir();
+        crate::session::create_profile("work").unwrap();
         update_profile_config("work", |p| {
             set_leaf(p, "sound", "enabled", json!(true));
             Ok(())
@@ -822,5 +895,29 @@ mod tests {
         let saved = load_profile_config("work").unwrap();
         assert_eq!(saved.overrides["sound"]["enabled"], json!(true));
         assert!(saved.overrides.get("diff").is_none());
+    }
+    #[test]
+    #[serial_test::serial]
+    fn admitted_config_writers_never_recreate_a_renamed_profile() {
+        let _home = crate::session::test_support::isolate_app_dir();
+        crate::session::create_profile("before-config").unwrap();
+        update_profile_config("before-config", |config| {
+            config.description = Some("retained".into());
+            Ok(())
+        })
+        .unwrap();
+        crate::session::rename_profile("before-config", "after-config").unwrap();
+        assert!(save_profile_config("before-config", &ProfileConfig::default()).is_err());
+        assert!(update_profile_config("before-config", |_| Ok(())).is_err());
+        assert!(!crate::session::get_profile_dir_path("before-config")
+            .unwrap()
+            .exists());
+        assert_eq!(
+            load_profile_config("after-config")
+                .unwrap()
+                .description
+                .as_deref(),
+            Some("retained")
+        );
     }
 }

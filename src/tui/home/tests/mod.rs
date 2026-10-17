@@ -94,6 +94,9 @@ fn test_home() -> (TempDir, AppDirGuard) {
 }
 
 fn test_view(profile: Option<&str>) -> HomeView {
+    if let Some(profile) = profile {
+        crate::session::get_profile_dir(profile).unwrap();
+    }
     HomeView::new_for_test(
         profile.map(str::to_string),
         AvailableTools::with_tools(&["claude"]),
@@ -545,5 +548,154 @@ pub(super) fn live_send_state(
         target: super::live_send::LiveSendTarget::Agent,
         exit_chords: super::live_send::parse_chord_list(super::live_send::DEFAULT_EXIT_CHORD),
         leader: None,
+    }
+}
+#[test]
+#[serial]
+fn force_remove_preserves_scratch_worktree_branch_and_reloaded_successor() {
+    let _git_env = crate::session::test_support::EnvGuard::set(&[
+        ("GIT_CONFIG_GLOBAL", "/dev/null"),
+        ("GIT_CONFIG_NOSYSTEM", "1"),
+    ]);
+    for (scratch, successor) in [(true, false), (false, false), (false, true)] {
+        let (temp, guard) = test_home();
+        let repository = (!scratch).then(crate::git::test_support::init_repo);
+        let workspace = if let Some((repo_dir, _)) = &repository {
+            let path = temp.path().join("kept-worktree");
+            crate::git::test_support::run_git(
+                repo_dir.path(),
+                &[
+                    "-c",
+                    "core.hooksPath=/dev/null",
+                    "worktree",
+                    "add",
+                    "-b",
+                    "kept-branch",
+                    path.to_str().unwrap(),
+                ],
+            );
+            path
+        } else {
+            crate::session::scratch::provision_scratch_dir("force-kept").unwrap()
+        };
+        let retained = b"force remove does not authorize later cleanup";
+        std::fs::write(workspace.join("retained"), retained).unwrap();
+        let mut row = Instance::new("force-kept", workspace.to_str().unwrap());
+        row.id = "force-kept".into();
+        row.source_profile = "test".into();
+        row.scratch = scratch;
+        if let Some((repo_dir, _)) = &repository {
+            row.worktree_info = Some(crate::session::WorktreeInfo {
+                branch: "kept-branch".into(),
+                main_repo_path: repo_dir.path().to_string_lossy().into_owned(),
+                managed_by_aoe: true,
+                created_at: chrono::Utc::now(),
+                base_branch: None,
+            });
+        }
+        let generation = row
+            .try_acquire_lifecycle_reservation(
+                LifecycleOperation::Purge,
+                Instance::LIFECYCLE_RESERVATION_TTL,
+                chrono::Utc::now(),
+            )
+            .unwrap();
+        row.status = Status::Deleting;
+        let mut env = seeded_env((temp, guard), &[row.clone()], false);
+        let storage = Storage::open_unwatched("test").unwrap();
+        let entry = crate::session::lifecycle_journal::LifecycleJournalEntry::deletion(
+            row.clone(),
+            Status::Idle,
+            storage.sessions_path().to_path_buf(),
+            crate::session::lifecycle_journal::LifecycleDeletionOptions {
+                generation,
+                delete_worktree: !scratch,
+                delete_branch: !scratch,
+                delete_sandbox: false,
+                force_delete: true,
+                detach_hooks: true,
+                keep_scratch: false,
+                purge_acp_transcript: false,
+            },
+        )
+        .with_phase(crate::session::lifecycle_journal::LifecyclePhase::TeardownStarted);
+        crate::session::lifecycle_journal::record(&entry).unwrap();
+        env.view.view_mode = ViewMode::Structured;
+        env.view.strict_hotkeys = false;
+        env.view.selected_session = Some("force-kept".into());
+        env.view.handle_key(key(KeyCode::Char('d')), None);
+        assert_eq!(
+            env.view
+                .confirm_dialog
+                .as_ref()
+                .map(|dialog| dialog.action()),
+            Some("force_remove_session")
+        );
+        assert_eq!(
+            env.view.pending_force_remove_session.as_deref(),
+            Some("force-kept")
+        );
+        env.view.handle_key(key(KeyCode::Char('y')), None);
+        assert!(env.view.confirm_dialog.is_none());
+        let attempt_id = env.view.deletes_in_flight["force-kept"].attempt_id;
+        let counter = env.view.next_delete_attempt_id;
+        assert!(env.view.deletes_in_flight["force-kept"].worker == super::DeleteWorker::Drop);
+        env.view.handle_key(key(KeyCode::Char('d')), None);
+        assert_eq!(
+            env.view.info_dialog.as_ref().map(InfoDialog::title),
+            Some("Deletion pending")
+        );
+        assert!(env.view.confirm_dialog.is_none());
+        assert!(env.view.pending_force_remove_session.is_none());
+        let error = env.view.force_remove_session("force-kept").unwrap_err();
+        assert!(error.to_string().contains("pending deletion"));
+        assert_eq!(
+            env.view.deletes_in_flight["force-kept"].attempt_id,
+            attempt_id
+        );
+        assert_eq!(env.view.next_delete_attempt_id, counter);
+        assert!(env.view.drop_poller.is_pending("force-kept"));
+        env.view.handle_key(key(KeyCode::Esc), None);
+        assert!(env.view.info_dialog.is_none());
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        if successor {
+            while !storage.load().unwrap().is_empty() {
+                assert!(std::time::Instant::now() < deadline, "drop did not commit");
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            assert!(row.finish_owned_purge(generation, Status::Idle).unwrap());
+            storage
+                .update(|rows, _| {
+                    rows.push(row.clone());
+                    Ok(())
+                })
+                .unwrap();
+            env.view.reload_storage_only().unwrap();
+        }
+        while !env.view.apply_drop_results() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "force-remove worker did not settle"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert_eq!(
+            env.view.instances.contains_key("force-kept"),
+            successor,
+            "completed old removal erased a reloaded successor"
+        );
+        crate::session::deletion::recover_lifecycle_journals_once().unwrap();
+        assert_eq!(std::fs::read(workspace.join("retained")).unwrap(), retained);
+        assert_eq!(storage.load().unwrap().len(), usize::from(successor));
+        if let Some((_, repo)) = &repository {
+            assert!(repo
+                .find_branch("kept-branch", git2::BranchType::Local)
+                .is_ok());
+            let worktree = git2::Repository::open(&workspace).unwrap();
+            assert_eq!(
+                worktree.workdir().unwrap().canonicalize().unwrap(),
+                workspace.canonicalize().unwrap()
+            );
+        }
     }
 }

@@ -509,6 +509,7 @@ done
         .unwrap();
         let _env = crate::session::test_support::isolate_home(tmp.path()).and_set("PATH", path);
         for name in ["a", "b"] {
+            crate::session::create_profile(name).unwrap();
             let profile: crate::session::config::profile_config::ProfileConfig = toml::from_str(
                 &format!(r#"environment = ["PI_CODING_AGENT_DIR=/stores/{name}"]"#),
             )

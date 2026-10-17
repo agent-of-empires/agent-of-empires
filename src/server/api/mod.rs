@@ -102,7 +102,7 @@ pub(crate) async fn load_persisted_instance(
     let file_watch = state.file_watch.clone();
     let persisted = tokio::task::spawn_blocking(
         move || -> anyhow::Result<Option<crate::session::Instance>> {
-            let storage = crate::session::Storage::new(&profile_for_load, file_watch)?;
+            let storage = crate::session::Storage::open(&profile_for_load, file_watch)?;
             Ok(storage
                 .load()?
                 .into_iter()
@@ -123,7 +123,7 @@ pub(crate) async fn load_persisted_instance(
     ))
 }
 
-/// 409 for a start or resume refused because the session is archived or trashed.
+/// 409 for a start or resume refused by durable lifecycle state.
 pub(crate) fn start_blocked_response(blocked: crate::session::StartBlocked) -> Response {
     api_error(StatusCode::CONFLICT, blocked.code(), blocked.to_string())
 }

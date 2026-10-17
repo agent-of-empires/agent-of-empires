@@ -9,6 +9,10 @@ pub fn run() -> Result<()> {
 }
 
 fn run_in(app_dir: &Path) -> Result<()> {
+    let _transition = crate::session::acquire_storage_shared_flock(
+        app_dir,
+        super::v027_isolate_sandbox_stores::LOCK,
+    )?;
     for path in super::sessions_file::session_files(app_dir)? {
         if !path.try_exists()? {
             continue;

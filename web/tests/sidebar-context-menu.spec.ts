@@ -164,7 +164,13 @@ test.describe("Sidebar multi-select (#1724, #2312)", () => {
 // POSTs acp enable/disable. The backend round-trip is covered by Rust and live
 // specs; this pins the menu presence, the confirm gate, and each request.
 test.describe("Sidebar Switch view (#2252)", () => {
-  const session = (id: string, title: string, view: "structured" | "terminal", acpCapable: boolean) => ({
+  const session = (
+    id: string,
+    title: string,
+    view: "structured" | "terminal",
+    acpCapable: boolean,
+    terminalHandoffPending = false,
+  ) => ({
     id,
     title,
     project_path: "/tmp/repo",
@@ -174,6 +180,7 @@ test.describe("Sidebar Switch view (#2252)", () => {
       acp_agent: "claude",
       view,
       acp_capable: acpCapable,
+      terminal_handoff_pending: terminalHandoffPending,
       // Server-computed context-preservation gate: `claude` resumes its
       // conversation in both directions, so the daemon reports true here.
       keeps_context: true,
@@ -189,15 +196,17 @@ test.describe("Sidebar Switch view (#2252)", () => {
     await page.locator("[data-testid='sidebar-context-menu-switch-view']").click();
   }
 
-  test("switches each way after confirm; a non-acp-capable session has no item", async ({ page }) => {
+  test("switches each way after confirm; only non-pending incapable terminals have no item", async ({ page }) => {
     await installSidebarMocks(page, {
       sessions: [
         session("sess-1", "Switch sess-1", "structured", true),
         session("sess-2", "Switch sess-2", "terminal", true),
         session("sess-3", "Plain terminal", "terminal", false),
+        session("sess-4", "Retry handoff", "terminal", false, true),
       ],
     });
     const posted: string[] = [];
+    const bodies: (string | null)[] = [];
     await page.route("**/api/sessions/*/acp/*", (r) => {
       const m = r
         .request()
@@ -205,26 +214,59 @@ test.describe("Sidebar Switch view (#2252)", () => {
         .match(/\/api\/sessions\/([^/]+)\/acp\/(enable|disable)$/);
       if (!m || r.request().method() !== "POST") return r.fulfill({ status: 400 });
       posted.push(`${m[1]}/${m[2]}`);
+      bodies.push(r.request().postData());
       return r.fulfill({ json: { session_id: m[1], view: m[2] === "enable" ? "structured" : "terminal" } });
     });
 
     await openSwitchMenu(page, "Switch sess-1");
     const dialog = page.locator("[data-testid='switch-view-dialog']");
     await expect(dialog).toBeVisible();
-    // Claude keeps context: the confirm copy must say so, not threaten loss.
-    await expect(dialog).toContainText("continues in the terminal");
+    expect(posted).toEqual([]);
     await page.locator("[data-testid='switch-view-confirm']").click();
     await expect.poll(() => posted).toEqual(["sess-1/disable"]);
-    await expect(page.getByText("Switched to terminal")).toBeVisible();
+    await expect(dialog).toBeHidden();
 
     await rows(page).filter({ hasText: "Switch sess-2" }).first().click({ button: "right" });
+    await expect(page.locator("[data-testid='sidebar-context-menu-switch-view']")).toHaveText(
+      "Switch to structured view",
+    );
     await page.locator("[data-testid='sidebar-context-menu-switch-view']").click();
+    await expect(dialog).toBeVisible();
+    expect(posted).toEqual(["sess-1/disable"]);
     await page.locator("[data-testid='switch-view-confirm']").click();
     await expect.poll(() => posted).toEqual(["sess-1/disable", "sess-2/enable"]);
+    await expect(dialog).toBeHidden();
+
+    await rows(page).filter({ hasText: "Retry handoff" }).first().click({ button: "right" });
+    const retry = page.locator("[data-testid='sidebar-context-menu-switch-view']");
+    await expect(retry).toHaveText("Retry terminal handoff");
+    await retry.click();
+    await expect(dialog).toBeVisible();
+    await expect(dialog.getByRole("heading", { name: "Switch to terminal", exact: true })).toBeVisible();
+    expect(posted).toEqual(["sess-1/disable", "sess-2/enable"]);
+    await page.locator("[data-testid='switch-view-confirm']").click();
+    await expect.poll(() => posted).toEqual(["sess-1/disable", "sess-2/enable", "sess-4/disable"]);
+    await expect(dialog).toBeHidden();
+    expect(bodies).toEqual([null, null, null]);
 
     await rows(page).filter({ hasText: "Plain terminal" }).first().click({ button: "right" });
     await expect(menu(page)).toBeVisible();
     await expect(page.locator("[data-testid='sidebar-context-menu-switch-view']")).toHaveCount(0);
+  });
+
+  test("read-only hides an incapable session's pending handoff retry", async ({ page }) => {
+    await installSidebarMocks(page, {
+      readOnly: true,
+      sessions: [session("sess-pending", "Pending read-only", "terminal", false, true)],
+    });
+    const about = page.waitForResponse("**/api/about");
+    await page.goto("/");
+    await about;
+    await expect(page.getByText("This dashboard is in read-only mode.")).toBeVisible();
+    await rows(page).filter({ hasText: "Pending read-only" }).first().click({ button: "right" });
+    await expect(menu(page)).toBeVisible();
+    await expect(page.getByTestId("sidebar-context-menu-switch-view")).toHaveCount(0);
+    await expect(page.getByTestId("switch-view-dialog")).toHaveCount(0);
   });
 
   test("failed switches to terminal surface the refusal guidance, else the generic error", async ({ page }) => {

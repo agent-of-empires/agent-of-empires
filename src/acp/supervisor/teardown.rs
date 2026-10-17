@@ -246,25 +246,25 @@ impl<S: BroadcastSink> Supervisor<S> {
                 Ok(None) => false,
                 Err(_) => true,
             };
-            if !native_unproven
-                && claim.attempts > TEARDOWN_RETRY_CAP
-                && claim
+            if !native_unproven && claim.attempts > TEARDOWN_RETRY_CAP {
+                if let Some(identity) = claim
                     .identity
-                    .is_none_or(|identity| !self.process_control.is_alive(identity))
-            {
-                warn!(
-                    target: "acp.supervisor",
-                    session = %id,
-                    pid,
-                    attempts = claim.attempts,
-                    "runner is dead but its registry record could not be settled; releasing the session"
-                );
-                if let Some(identity) = claim.identity {
-                    self.process_control.forget(identity);
+                    .filter(|identity| !self.process_control.is_alive(*identity))
+                {
+                    if worker_registry::delete_if_owned_by(&id, identity) {
+                        warn!(
+                            target: "acp.supervisor",
+                            session = %id,
+                            pid,
+                            attempts = claim.attempts,
+                            "runner is dead and its registry route was settled; releasing the session"
+                        );
+                        self.process_control.forget(identity);
+                        self.settle_sweeping_if_owed(&claim.lease, Settlement::Proven)
+                            .await;
+                        continue;
+                    }
                 }
-                self.settle_sweeping_if_owed(&claim.lease, Settlement::Proven)
-                    .await;
-                continue;
             }
             match claim.identity {
                 // Loud for the first few ticks; past that the process is in the kernel's hands.
@@ -1041,7 +1041,8 @@ mod tests {
             "old runner cleanup removed the replacement control socket"
         );
         drop(listener);
-        worker_registry::delete_if_owned(session_id, std::process::id()).unwrap();
+        worker_registry::retire_if_owned(&worker_registry::load(session_id).unwrap().unwrap())
+            .unwrap();
     }
 
     #[tokio::test]
@@ -1596,5 +1597,36 @@ mod tests {
             AcpWorkerState::Stopping,
             "unreadable ownership evidence cannot prove native settlement"
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    #[serial_test::serial]
+    async fn a_lost_teardown_driver_requires_the_registry_runner_to_be_dead_past_the_retry_cap() {
+        let _home = isolate_home();
+        let control = Arc::new(FakeProcessControl::default());
+        control.immortal(5758);
+        let sup = Supervisor::new(VecSink::new()).with_process_control(control.clone());
+        save_record("s-no-identity", 5758, 5);
+        lock_recover(&sup.lifecycle).adopt_for_stop("s-no-identity");
+
+        for _ in 0..=TEARDOWN_RETRY_CAP {
+            lock_recover(&sup.lifecycle).age_stopping("s-no-identity", TEARDOWN_ORPHAN_GRACE);
+            sup.retry_pending_teardowns().await;
+            assert_eq!(
+                sup.worker_state("s-no-identity").await,
+                AcpWorkerState::Stopping,
+                "missing cached identity cannot prove the registry runner stopped"
+            );
+        }
+        assert!(worker_registry::load("s-no-identity").unwrap().is_some());
+
+        control.exit(5758);
+        lock_recover(&sup.lifecycle).age_stopping("s-no-identity", TEARDOWN_ORPHAN_GRACE);
+        sup.retry_pending_teardowns().await;
+        assert_eq!(
+            sup.worker_state("s-no-identity").await,
+            AcpWorkerState::Absent
+        );
+        assert!(worker_registry::load("s-no-identity").unwrap().is_none());
     }
 }

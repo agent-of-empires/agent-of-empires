@@ -21,7 +21,9 @@ pub(super) fn structured_instance(id: &str, project_path: &str) -> Instance {
 /// App state with one structured session, under an isolated app dir so the
 /// worker registry cannot see real entries.
 pub(super) fn test_state(id: &str) -> (AppDirGuard, Arc<AppState>, tempfile::TempDir) {
-    let home = crate::session::test_support::isolate_app_dir();
+    // Keep real worker socket paths below macOS sun_path limits.
+    let root = tempfile::TempDir::with_prefix_in("aoe-r-", "/tmp").unwrap();
+    let home = AppDirGuard::with_temp(root);
     let project = tempfile::TempDir::new().unwrap();
     let inst = structured_instance(id, &project.path().to_string_lossy());
     let state = crate::server::test_support::build_test_app_state(vec![inst]);

@@ -219,9 +219,6 @@ pub async fn run(profile: &str, startup_warning: Option<String>) -> Result<()> {
         return remote_home::run_standalone(endpoint).await;
     }
 
-    // Opening the store creates the profile directory, so refuse unknown names first.
-    crate::session::require_known_profile(profile)?;
-
     // The spinner writes nothing unless a migration reports progress.
     {
         let console = std::sync::Arc::new(std::sync::Mutex::new(
@@ -259,6 +256,16 @@ pub async fn run(profile: &str, startup_warning: Option<String>) -> Result<()> {
                 }
             }
         }
+    }
+
+    crate::session::admit_tui_profiles(profile)?;
+
+    if let Err(error) = crate::session::deletion::start_lifecycle_recovery_worker() {
+        tracing::warn!(
+            target: "session.delete_recovery",
+            %error,
+            "lifecycle journal recovery worker could not start"
+        );
     }
 
     if !crate::tmux::is_tmux_available() {
@@ -344,6 +351,34 @@ pub async fn run(profile: &str, startup_warning: Option<String>) -> Result<()> {
     // `_terminal_guard` restores the terminal on drop.
     drop(terminal);
     result
+}
+
+#[cfg(test)]
+mod startup_tests {
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn future_schema_refusal_does_not_admit_a_tui_profile() {
+        let _home = crate::session::test_support::isolate_app_dir();
+        let _remote = crate::session::test_support::EnvGuard::unset(&["AOE_DAEMON_URL"]);
+        let app = crate::session::get_app_dir().unwrap();
+        let version = (crate::migrations::current_schema_version() + 1).to_string();
+        std::fs::write(app.join(".schema_version"), &version).unwrap();
+        std::fs::write(app.join("future-data"), b"preserved future schema data").unwrap();
+        assert!(!app.join("profiles").exists());
+
+        let error = super::run("", None).await.unwrap_err();
+
+        assert!(format!("{error:#}").contains("refusing to downgrade"));
+        assert!(!app.join("profiles").exists());
+        assert_eq!(
+            std::fs::read(app.join(".schema_version")).unwrap(),
+            version.as_bytes()
+        );
+        assert_eq!(
+            std::fs::read(app.join("future-data")).unwrap(),
+            b"preserved future schema data"
+        );
+    }
 }
 
 #[cfg(test)]

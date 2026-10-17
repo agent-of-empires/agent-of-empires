@@ -1180,6 +1180,7 @@ mod tests {
         // needs its own app dir: HOME is process-global, and running the full suite races this
         // against every other test that installs or restores it.
         let _home = crate::session::test_support::isolate_app_dir();
+        crate::session::create_profile("test").unwrap();
         // Past runs default to `Status::Idle` and are kept around, unarchived, for the user
         // to review; they must not count against the concurrency limit like `sess-1` does.
         let mut prior: Vec<Instance> = (0..MAX_ACTIVE_PLUGIN_SESSIONS)

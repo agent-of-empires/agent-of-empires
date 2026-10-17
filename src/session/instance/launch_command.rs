@@ -85,7 +85,8 @@ fn wrap_prime_launch(
     else {
         return Ok(command.to_owned());
     };
-    let exe = std::env::current_exe()?;
+    let exe = crate::process::executable_for_native_launch()
+        .context("resolving AoE executable for Prime launch")?;
     let encoded = serde_json::to_string(runtime)?;
     let daemon = daemon_command
         .map(|command| {
@@ -2101,6 +2102,7 @@ mod tests {
     fn unknown_opencode_routes_refuse_preparation_and_preserve_the_conversation() {
         let home = tempfile::tempdir().unwrap();
         let _app = crate::session::test_support::isolate_app_dir_at(home.path());
+        crate::session::create_profile("unknown-opencode-route").unwrap();
         let version_file = home.path().join("native-version");
         let help_file = home.path().join("native-help");
         let script = format!(
@@ -3040,6 +3042,7 @@ mod tests {
     fn a_typed_title_names_the_agent_only_when_the_setting_is_on() {
         let temp_home = tempfile::tempdir().unwrap();
         let _home = crate::session::test_support::isolate_home(temp_home.path());
+        crate::session::create_profile("main").unwrap();
         let project = temp_home.path().join("proj");
         std::fs::create_dir_all(&project).unwrap();
         let probed = temp_home.path().join("probed");
@@ -3072,6 +3075,7 @@ mod tests {
     fn the_agent_name_is_withheld_where_it_would_not_land_as_a_name() {
         let temp_home = tempfile::tempdir().unwrap();
         let _home = crate::session::test_support::isolate_home(temp_home.path());
+        crate::session::create_profile("main").unwrap();
         let _env = EnvGuard::unset(&["CLAUDE_CONFIG_DIR"]);
         let project = temp_home.path().join("proj");
         std::fs::create_dir_all(&project).unwrap();
