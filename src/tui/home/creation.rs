@@ -15,6 +15,19 @@ pub(super) struct CancelledCreation {
     finished: bool,
 }
 
+pub(super) enum PendingCreationCompletion {
+    Unpublished {
+        outcome: crate::tui::creation_poller::CreationOutcome,
+        rollback: Option<RollbackCause>,
+    },
+    PublishedAwaitingProjection(crate::tui::creation_poller::CreationOutcome),
+}
+
+pub(super) enum RollbackCause {
+    Cancelled,
+    Failed(String),
+}
+
 #[derive(Debug, PartialEq, Eq)]
 enum ProvisionalRetirement {
     Settled,
@@ -85,9 +98,7 @@ impl HomeView {
         }
     }
 
-    /// Request background session creation, used for sandbox sessions so the UI does not
-    /// block. A `Status::Creating` stub appears in the list, so progress shows in the
-    /// preview pane while the TUI stays usable.
+    /// Admit creation without waiting, then provision it on the owned worker.
     pub fn request_creation(
         &mut self,
         mut data: NewSessionData,
@@ -303,6 +314,15 @@ impl HomeView {
 
     /// Hide the cancelled creation while its worker finishes the hook and verified rollback.
     pub fn cancel_creation(&mut self) {
+        let cancelled_owner = self.creating_provisional_creation.clone();
+        let completed = matches!(
+            &self.pending_creation_completion,
+            Some(PendingCreationCompletion::Unpublished { outcome, .. })
+                if cancelled_owner.as_ref().is_some_and(|owner| {
+                    outcome.provisional_creation.as_ref()
+                        .is_some_and(|provisional| std::sync::Arc::ptr_eq(owner, provisional))
+                })
+        );
         if let Some(cancel) = self.creation_cancel.take() {
             cancel.cancel();
         }
@@ -323,22 +343,25 @@ impl HomeView {
                         finished: false,
                     },
                 );
-                let cancelled = self.cancelled_creations.get(&stub_id).unwrap();
-                if let Err(error) = retire_provisional_stub(
-                    &cancelled.profile,
-                    &stub_id,
-                    &cancelled.provisional,
-                    &cancelled.groups,
-                ) {
-                    self.info_dialog = Some(InfoDialog::sized_to_fit(
-                        "Cancellation cleanup failed",
-                        &format!("{error:#}"),
-                    ));
-                } else if let Err(error) = self.reload() {
-                    self.info_dialog = Some(InfoDialog::sized_to_fit(
-                        "Cancellation reload failed",
-                        &format!("{error:#}"),
-                    ));
+                if !completed {
+                    let cancelled = self.cancelled_creations.get(&stub_id).unwrap();
+                    if let Err(error) = retire_provisional_stub(
+                        &cancelled.profile,
+                        &stub_id,
+                        &cancelled.provisional,
+                        &cancelled.groups,
+                    ) {
+                        self.info_dialog = Some(InfoDialog::sized_to_fit(
+                            "Cancellation cleanup failed",
+                            &format!("{error:#}"),
+                        ));
+                    } else if let Err(error) = self.project_loaded_storages() {
+                        self.pending_journal_reload = true;
+                        self.info_dialog = Some(InfoDialog::sized_to_fit(
+                            "Cancellation reload failed",
+                            &format!("{error:#}"),
+                        ));
+                    }
                 }
             }
             self.creating_hook_progress.remove(&stub_id);
@@ -347,6 +370,24 @@ impl HomeView {
             self.update_selected();
         }
         self.new_dialog = None;
+        if let Some(pending) = self.pending_creation_completion.take() {
+            match pending {
+                PendingCreationCompletion::Unpublished { outcome, rollback }
+                    if cancelled_owner.as_ref().is_some_and(|owner| {
+                        outcome
+                            .provisional_creation
+                            .as_ref()
+                            .is_some_and(|provisional| std::sync::Arc::ptr_eq(owner, provisional))
+                    }) =>
+                {
+                    self.queue_creation_rollback(
+                        outcome,
+                        rollback.unwrap_or(RollbackCause::Cancelled),
+                    );
+                }
+                pending => self.pending_creation_completion = Some(pending),
+            }
+        }
     }
 
     fn retire_finished_cancelled_creations(&mut self) {
@@ -369,7 +410,8 @@ impl HomeView {
             ) {
                 Ok(ProvisionalRetirement::Settled) => {
                     self.cancelled_creations.remove(&id);
-                    if let Err(error) = self.reload() {
+                    if let Err(error) = self.project_loaded_storages() {
+                        self.pending_journal_reload = true;
                         self.info_dialog = Some(InfoDialog::sized_to_fit(
                             "Cancellation reload failed",
                             &format!("{error:#}"),
@@ -387,227 +429,204 @@ impl HomeView {
         }
     }
 
-    /// Apply any pending creation results from the background poller.
-    /// Returns Some(session_id) if creation succeeded and we should attach.
+    fn owns_creation_outcome(
+        &self,
+        outcome: &crate::tui::creation_poller::CreationOutcome,
+    ) -> bool {
+        match (
+            &self.creating_provisional_creation,
+            &outcome.provisional_creation,
+        ) {
+            (Some(current), Some(provisional)) => std::sync::Arc::ptr_eq(current, provisional),
+            _ => false,
+        }
+    }
+
+    fn queue_creation_rollback(
+        &mut self,
+        outcome: crate::tui::creation_poller::CreationOutcome,
+        cause: RollbackCause,
+    ) {
+        let cause = match cause {
+            RollbackCause::Cancelled => None,
+            RollbackCause::Failed(error) => Some(error),
+        };
+        if let Err((outcome, cause)) = self.creation_poller.request_rollback(outcome, cause) {
+            self.pending_creation_completion = Some(PendingCreationCompletion::Unpublished {
+                outcome,
+                rollback: Some(
+                    cause
+                        .map(RollbackCause::Failed)
+                        .unwrap_or(RollbackCause::Cancelled),
+                ),
+            });
+            self.info_dialog = Some(InfoDialog::new(
+                "Creation Failed",
+                "Creation worker disconnected; rollback remains pending.",
+            ));
+        }
+    }
+
+    /// Publish without waiting, then attach only after authoritative projection.
     pub fn apply_creation_results(&mut self) -> Option<String> {
         use crate::tui::creation_poller::CreationResult;
         self.retire_finished_cancelled_creations();
-
-        let outcome = match self.creation_poller.try_recv_result() {
-            Ok(outcome) => outcome,
-            Err(std::sync::mpsc::TryRecvError::Empty) => return None,
-            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                if self.creating_stub_id.is_some() || !self.cancelled_creations.is_empty() {
-                    self.cancel_creation();
-                    self.cancelled_creations.clear();
-                    let recovery = Storage::recover_pending_moves(self.file_watch.clone());
-                    let message = match recovery {
-                        Ok(notices) => {
-                            format!("Creation worker disconnected.\n{}", notices.join("\n"))
+        let pending = match self.pending_creation_completion.take() {
+            Some(pending) => pending,
+            None => match self.creation_poller.try_recv_result() {
+                Ok(outcome) => PendingCreationCompletion::Unpublished {
+                    outcome,
+                    rollback: None,
+                },
+                Err(std::sync::mpsc::TryRecvError::Empty) => return None,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    if self.creating_stub_id.is_some()
+                        || self
+                            .cancelled_creations
+                            .values()
+                            .any(|cancelled| !cancelled.finished)
+                    {
+                        self.cancel_creation();
+                        for cancelled in self.cancelled_creations.values_mut() {
+                            cancelled.finished = true;
                         }
-                        Err(error) => {
-                            format!("Creation worker disconnected; recovery failed: {error:#}")
-                        }
-                    };
-                    if let Err(error) = self.reload() {
-                        tracing::warn!(target: "tui.home", "Creation disconnect reload failed: {error:#}");
-                    }
-                    self.info_dialog = Some(InfoDialog::sized_to_fit("Creation Failed", &message));
-                }
-                return None;
-            }
-        };
-        let result = outcome.result;
-
-        // A late result must settle its own cancelled placeholder, never a newer request's.
-        if outcome.cancelled || matches!(result, CreationResult::Cancelled) {
-            match result {
-                CreationResult::Success(mut success) => {
-                    if let Err(error) = success.build_result.rollback() {
-                        self.info_dialog = Some(InfoDialog::sized_to_fit(
-                            "Cancellation cleanup failed",
-                            &format!("{error:#}"),
+                        self.request_journal_recovery(true);
+                        self.info_dialog = Some(InfoDialog::new(
+                            "Creation Failed",
+                            "Creation worker disconnected; recovery was queued.",
                         ));
                     }
-                }
-                CreationResult::Error(error) => {
-                    self.info_dialog = Some(InfoDialog::sized_to_fit("Creation Failed", &error));
-                }
-                CreationResult::Cancelled => {}
-            }
-            if let Some(provisional) = outcome.provisional_creation {
-                let id = provisional.instance_id();
-                if self.cancelled_creations.get(id).is_some_and(|cancelled| {
-                    std::sync::Arc::ptr_eq(&cancelled.provisional, &provisional)
-                }) {
-                    self.cancelled_creations.get_mut(id).unwrap().finished = true;
-                    self.retire_finished_cancelled_creations();
-                }
-            }
-            return None;
-        }
-
-        self.creation_cancel = None;
-        let stub_id = self.creating_stub_id.take();
-        let provisional = self.creating_provisional_creation.take();
-        // Taken, not borrowed, so every early return leaves the field empty: the
-        // provisional group paths belong to this stub alone and must not carry into the
-        // next creation.
-        let provisional_group_paths = std::mem::take(&mut self.creating_provisional_group_paths);
-        if let Some(ref id) = stub_id {
-            self.creating_hook_progress.remove(id);
-        }
-
-        match result {
-            CreationResult::Success(success) => {
-                let crate::tui::creation_poller::CreationSuccess {
-                    mut build_result,
-                    on_launch_hooks_ran,
-                } = *success;
-                if let Err(mut error) = build_result.publish() {
-                    if let Err(cleanup) = build_result.rollback() {
-                        error = error
-                            .context(format!("Creation rollback could not finish: {cleanup:#}"));
-                    }
-                    if let (Some(id), Some(provisional)) = (stub_id, provisional) {
-                        self.forget_creation_stub(&id, Some(&provisional));
-                        self.cancelled_creations.insert(
-                            id.clone(),
-                            CancelledCreation {
-                                profile: build_result.profile_storage.profile().to_owned(),
-                                provisional,
-                                groups: provisional_group_paths,
-                                finished: true,
-                            },
-                        );
-                        let cancelled = self.cancelled_creations.get(&id).unwrap();
-                        match retire_provisional_stub(
-                            &cancelled.profile,
-                            &id,
-                            &cancelled.provisional,
-                            &cancelled.groups,
-                        ) {
-                            Ok(ProvisionalRetirement::Settled) => {
-                                self.cancelled_creations.remove(&id);
-                            }
-                            Ok(ProvisionalRetirement::Deferred) => {}
-                            Err(cleanup) => {
-                                error = error
-                                    .context(format!("Placeholder cleanup failed: {cleanup:#}"));
-                            }
-                        }
-                    }
-                    if let Err(reload) = self.reload() {
-                        error = error.context(format!("Authoritative reload failed: {reload:#}"));
-                    }
-                    self.info_dialog = Some(InfoDialog::sized_to_fit(
-                        "Creation Failed",
-                        &format!("{error:#}"),
-                    ));
-                    self.new_dialog = None;
                     return None;
                 }
-                let mut instance = build_result.instance;
-                let session_id = instance.id.clone();
-                let target_profile = build_result.profile_storage.profile().to_owned();
-                self.storages
-                    .insert(target_profile, build_result.profile_storage);
-                crate::tips::record_session_creations(1);
-                self.publish_persisted_instance(instance.clone());
-                self.rebuild_group_trees();
-                if on_launch_hooks_ran {
-                    self.on_launch_hooks_ran.insert(session_id.clone());
+            },
+        };
+        let outcome = match pending {
+            PendingCreationCompletion::PublishedAwaitingProjection(outcome) => outcome,
+            PendingCreationCompletion::Unpublished {
+                mut outcome,
+                rollback,
+            } => {
+                if let Some(cause) = rollback {
+                    self.queue_creation_rollback(outcome, cause);
+                    return None;
                 }
-                if let Err(error) = self.reload() {
-                    tracing::warn!(target: "tui.home", "Failed to reload session state: {error:#}");
-                }
-                let minted = instance
-                    .sandbox_info
-                    .as_mut()
-                    .map(|sandbox| std::mem::take(&mut sandbox.before_start_env))
-                    .unwrap_or_default();
-                if !minted.is_empty() {
-                    self.mutate_instance(&session_id, |instance| {
-                        if let Some(sandbox) = instance.sandbox_info.as_mut() {
-                            sandbox.before_start_env = minted.clone();
+                let owned = self.owns_creation_outcome(&outcome);
+                if let CreationResult::Success(success) = &mut outcome.result {
+                    if outcome.cancelled || !owned {
+                        self.queue_creation_rollback(outcome, RollbackCause::Cancelled);
+                        return None;
+                    }
+                    match success.build_result.try_publish() {
+                        Ok(None) => {
+                            self.pending_creation_completion =
+                                Some(PendingCreationCompletion::Unpublished {
+                                    outcome,
+                                    rollback: None,
+                                });
+                            return None;
                         }
-                    });
-                }
-                self.select_and_reveal_session(&session_id);
-                self.new_dialog = None;
-                if !build_result.warnings.is_empty() {
-                    self.info_dialog = Some(InfoDialog::sized_to_fit(
-                        "Session warnings",
-                        &format!(
-                            "Session was created, but setup emitted warnings:\n\n{}",
-                            build_result.warnings.join("\n\n")
-                        ),
-                    ));
-                }
-                Some(session_id)
-            }
-            CreationResult::Error(mut error) => {
-                if let Some(id) = stub_id {
-                    let profile = self
-                        .get_instance(&id)
-                        .map(|instance| instance.source_profile.clone());
-                    let had_provisional = provisional.is_some();
-                    self.forget_creation_stub(&id, provisional.as_deref());
-                    if let Some(profile) = profile {
-                        let instances = self.cloned_instances_for_profile(&profile);
-                        if let Some(tree) = self.group_trees.get_mut(&profile) {
-                            let mut groups = tree.get_all_groups();
-                            groups.retain(|group| !provisional_group_paths.contains(&group.path));
-                            *tree = GroupTree::new_with_groups(&instances, &groups);
+                        Err(error) => {
+                            self.pending_creation_completion =
+                                Some(PendingCreationCompletion::Unpublished {
+                                    outcome,
+                                    rollback: Some(RollbackCause::Failed(format!("{error:#}"))),
+                                });
+                            self.cancel_creation();
+                            return None;
                         }
-                        if let Some(provisional) = provisional {
-                            self.cancelled_creations.insert(
-                                id.clone(),
-                                CancelledCreation {
-                                    profile,
-                                    provisional,
-                                    groups: provisional_group_paths,
-                                    finished: true,
-                                },
+                        Ok(Some(())) => {
+                            let instance = success.build_result.instance.clone();
+                            self.storages.insert(
+                                success.build_result.profile_storage.profile().to_owned(),
+                                success.build_result.profile_storage.clone(),
                             );
-                            let cancelled = self.cancelled_creations.get(&id).unwrap();
-                            match retire_provisional_stub(
-                                &cancelled.profile,
-                                &id,
-                                &cancelled.provisional,
-                                &cancelled.groups,
-                            ) {
-                                Ok(ProvisionalRetirement::Settled) => {
-                                    self.cancelled_creations.remove(&id);
-                                }
-                                Ok(ProvisionalRetirement::Deferred) => {}
-                                Err(retire_error) => {
-                                    error.push_str(&format!(
-                                        "\nFailed to retire creation placeholder: {retire_error:#}"
-                                    ));
-                                }
+                            self.creation_cancel = None;
+                            self.creating_stub_id = None;
+                            self.creating_provisional_creation = None;
+                            self.creating_provisional_group_paths.clear();
+                            self.creating_hook_progress.remove(&instance.id);
+                            crate::tips::record_session_creations(1);
+                            self.publish_persisted_instance(instance);
+                        }
+                    }
+                } else {
+                    if owned {
+                        self.cancel_creation();
+                    }
+                    if let Some(provisional) = &outcome.provisional_creation {
+                        if let Some(cancelled) =
+                            self.cancelled_creations.get_mut(provisional.instance_id())
+                        {
+                            if std::sync::Arc::ptr_eq(&cancelled.provisional, provisional) {
+                                cancelled.finished = true;
                             }
                         }
                     }
-                    if had_provisional && !self.cancelled_creations.contains_key(&id) {
-                        if let Err(reload_error) = self.reload() {
-                            error.push_str(&format!(
-                                "\nFailed to reload authoritative state: {reload_error:#}"
-                            ));
-                        }
+                    self.retire_finished_cancelled_creations();
+                    if let Err(error) = self.project_loaded_storages() {
+                        self.pending_journal_reload = true;
+                        tracing::warn!(target: "tui.home", "Creation projection failed: {error:#}");
                     }
-                    self.rebuild_flat_items();
-                    self.update_selected();
-                    self.info_dialog = Some(InfoDialog::sized_to_fit("Creation Failed", &error));
-                } else if let Some(dialog) = &mut self.new_dialog {
-                    dialog.set_loading(false);
-                    dialog.set_error(error);
+                    if let CreationResult::Error(error) = outcome.result {
+                        self.info_dialog =
+                            Some(InfoDialog::sized_to_fit("Creation Failed", &error));
+                    }
+                    return None;
                 }
-                None
+                outcome
             }
-            // Returned early above.
-            CreationResult::Cancelled => None,
+        };
+        self.pending_creation_completion = Some(
+            PendingCreationCompletion::PublishedAwaitingProjection(outcome),
+        );
+        if let Err(error) = self.project_loaded_storages() {
+            tracing::warn!(target: "tui.home", "Creation projection pending: {error:#}");
+            return None;
         }
+        let Some(PendingCreationCompletion::PublishedAwaitingProjection(outcome)) =
+            self.pending_creation_completion.take()
+        else {
+            unreachable!("published completion remains owned during projection");
+        };
+        let CreationResult::Success(success) = outcome.result else {
+            unreachable!("only success awaits projection");
+        };
+        let instance = &success.build_result.instance;
+        let session_id = instance.id.clone();
+        let survives = self.get_instance(&session_id).is_some_and(|current| {
+            current.created_at == instance.created_at
+                && current.lifecycle_generation == instance.lifecycle_generation
+                && current.source_profile == instance.source_profile
+                && crate::session::move_journal::same_namespace(current, instance)
+        });
+        if !survives {
+            return None;
+        }
+        if let Some(sandbox) = &instance.sandbox_info {
+            if !sandbox.before_start_env.is_empty() {
+                let minted = sandbox.before_start_env.clone();
+                self.mutate_instance(&session_id, |instance| {
+                    if let Some(sandbox) = &mut instance.sandbox_info {
+                        sandbox.before_start_env = minted;
+                    }
+                });
+            }
+        }
+        if success.on_launch_hooks_ran {
+            self.on_launch_hooks_ran.insert(session_id.clone());
+        }
+        self.select_and_reveal_session(&session_id);
+        self.new_dialog = None;
+        if !success.build_result.warnings.is_empty() {
+            self.info_dialog = Some(InfoDialog::sized_to_fit(
+                "Session warnings",
+                &format!(
+                    "Session was created, but setup emitted warnings:\n\n{}",
+                    success.build_result.warnings.join("\n\n")
+                ),
+            ));
+        }
+        Some(session_id)
     }
 
     /// Check if on_launch hooks already ran for this session (and consume the flag).
@@ -617,7 +636,7 @@ impl HomeView {
 
     /// Check if there's a pending creation operation
     pub fn is_creation_pending(&self) -> bool {
-        self.creation_poller.is_pending()
+        self.creation_poller.is_pending() || self.pending_creation_completion.is_some()
     }
 
     /// Check if the currently selected session is the in-flight creating stub
@@ -689,26 +708,63 @@ impl HomeView {
 
     /// Cancel pending creation and drain rollback results until the shutdown deadline.
     pub fn cleanup_pending_creation(&mut self) {
-        if !self.creation_poller.is_pending() {
+        if !self.is_creation_pending() {
             return;
         }
         self.cancel_creation();
-
+        if matches!(
+            self.pending_creation_completion,
+            Some(PendingCreationCompletion::Unpublished { .. })
+        ) {
+            self.apply_creation_results();
+        }
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
         while self.creation_poller.is_pending() {
-            let Some(outcome) = self
+            let Some(mut outcome) = self
                 .creation_poller
                 .recv_result_timeout(deadline.saturating_duration_since(std::time::Instant::now()))
             else {
                 break;
             };
-            if let crate::tui::creation_poller::CreationResult::Success(mut success) =
-                outcome.result
-            {
-                if let Err(error) = success.build_result.rollback() {
-                    tracing::error!(target: "tui.home", "Cancelled creation exit cleanup failed: {error:#}");
-                }
+            outcome.cancelled = true;
+            self.pending_creation_completion = Some(PendingCreationCompletion::Unpublished {
+                outcome,
+                rollback: None,
+            });
+            self.apply_creation_results();
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn drain_creation_for_test(&mut self) {
+        self.cancel_creation();
+        if matches!(
+            self.pending_creation_completion,
+            Some(PendingCreationCompletion::PublishedAwaitingProjection(_))
+        ) {
+            self.pending_creation_completion = None;
+        }
+        while self.is_creation_pending() {
+            if self.pending_creation_completion.is_some() {
+                self.apply_creation_results();
+                continue;
             }
+            let Some(mut outcome) = self
+                .creation_poller
+                .recv_result_timeout(std::time::Duration::from_secs(30))
+            else {
+                assert!(
+                    !self.creation_poller.is_pending(),
+                    "creation did not settle before fixture restoration"
+                );
+                break;
+            };
+            outcome.cancelled = true;
+            self.pending_creation_completion = Some(PendingCreationCompletion::Unpublished {
+                outcome,
+                rollback: None,
+            });
+            self.apply_creation_results();
         }
     }
 }

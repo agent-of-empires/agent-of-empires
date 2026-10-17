@@ -2514,9 +2514,6 @@ impl App {
             Action::AttachSession(id) => {
                 self.attach_session(&id, terminal)?;
             }
-            Action::AttachAfterCreate(id) => {
-                self.dispatch_new_session_attach(&id, terminal)?;
-            }
             Action::AttachTerminal(id, mode) => {
                 self.attach_terminal(&id, mode, terminal)?;
             }
@@ -3119,8 +3116,6 @@ pub enum Action {
     /// Deferred so the loop can show "Reviving..." before `ensure_pane_ready`.
     SendMessage(String, String),
     EnterLiveSend(String),
-    /// A session from the synchronous create path, routed through the new-session mode.
-    AttachAfterCreate(String),
     /// (session id, tool name indexing `Config.tools`).
     AttachToolSession(String, String),
     /// Run a tool command detached in the session's workdir.

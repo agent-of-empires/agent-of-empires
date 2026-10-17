@@ -1,15 +1,12 @@
-//! Session operations for HomeView (create, delete, rename)
+//! Session mutation operations for HomeView.
 
-use crate::session::builder::{self, InstanceParams};
 use crate::session::conversation_carry;
 use crate::session::{
     duplicate_session_error, is_duplicate_session, list_profiles, GroupMovePlan, GroupTree,
     Instance, Item, LifecycleOperation, StartBlocked, Status, Storage,
 };
 use crate::tui::deletion_poller::DeletionRequest;
-use crate::tui::dialogs::{
-    DeleteOptions, GroupDeleteAction, GroupDeleteOptions, InfoDialog, NewSessionData,
-};
+use crate::tui::dialogs::{DeleteOptions, GroupDeleteAction, GroupDeleteOptions, InfoDialog};
 use crate::tui::restart_poller::RestartRequest;
 
 use super::HomeView;
@@ -194,68 +191,6 @@ impl HomeView {
                 target_path
             ))),
         }
-    }
-
-    pub(super) fn create_session(&mut self, data: NewSessionData) -> anyhow::Result<String> {
-        let target_profile = data.profile.clone();
-
-        // In unified mode, all instances are loaded, so use them for title dedup.
-        // For the target profile, filter to that profile's instances.
-        let existing_titles: Vec<&str> = self
-            .instances()
-            .filter(|i| i.source_profile == target_profile)
-            .map(|i| i.title.as_str())
-            .collect();
-        let existing_branches: Vec<&str> = self
-            .instances()
-            .filter(|i| i.source_profile == target_profile)
-            .filter_map(|i| i.worktree_info.as_ref().map(|w| w.branch.as_str()))
-            .collect();
-
-        // `structured` is applied post-build (mirrors the web create
-        // handler); read it off before the params conversion consumes data.
-        let structured = data.structured;
-        let params = InstanceParams::from(data);
-
-        let mut build_result = builder::build_instance(
-            params,
-            &existing_titles,
-            &existing_branches,
-            &target_profile,
-        )?;
-        if structured {
-            builder::structured::apply_structured_choice(&mut build_result.instance);
-        }
-        let completion = build_result
-            .run_on_create(|_| Ok(()))
-            .and_then(|()| build_result.publish());
-        if let Err(error) = completion {
-            return match build_result.rollback() {
-                Ok(()) => Err(error),
-                Err(cleanup) => {
-                    Err(error.context(format!("Creation rollback could not finish: {cleanup:#}")))
-                }
-            };
-        }
-        let instance = build_result.instance;
-        let session_id = instance.id.clone();
-        self.storages
-            .insert(target_profile.clone(), build_result.profile_storage);
-        self.publish_persisted_instance(instance.clone());
-        self.rebuild_group_trees();
-        if !instance.group_path.is_empty() {
-            if let Some(tree) = self.group_trees.get_mut(&target_profile) {
-                tree.create_group(&instance.group_path);
-            }
-        }
-
-        crate::tips::record_session_creations(1);
-        self.reload()?;
-        // reload()'s selection fallback lands on the nearest index, often the new
-        // session's group folder, so pin the selection the caller attaches to. Same as
-        // the async branch in apply_creation_results.
-        self.select_and_reveal_session(&session_id);
-        Ok(session_id)
     }
 
     /// A trashed/archived row's agent was stopped deliberately, so refuse a start

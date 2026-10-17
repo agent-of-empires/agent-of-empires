@@ -1593,12 +1593,13 @@ esac
             }
             (_, result) => panic!("{scenario}: unexpected producer outcome: {result:?}"),
         }
+        poller.finish_for_test().unwrap();
     }
 }
 
 #[test]
 #[serial]
-fn creation_admission_returns_busy_before_root_or_nested_locks_are_released() {
+fn plain_dispatch_returns_busy_and_renders_before_peer_ownership_release() {
     for layer in [
         "root-exclusive",
         "root-shared",
@@ -1609,6 +1610,7 @@ fn creation_admission_returns_busy_before_root_or_nested_locks_are_released() {
         let mut env = setup_creation_test_env();
         let app = crate::session::get_app_dir().unwrap();
         let profile = env.storage.sessions_path().parent().unwrap().to_path_buf();
+        let before = std::fs::read(env.storage.sessions_path()).ok();
         let (ready_tx, ready_rx) = std::sync::mpsc::channel();
         let (release_tx, release_rx) = std::sync::mpsc::channel();
         let (released_tx, released_rx) = std::sync::mpsc::channel();
@@ -1646,7 +1648,7 @@ fn creation_admission_returns_busy_before_root_or_nested_locks_are_released() {
         });
         ready_rx.recv().unwrap();
         let queued = env.view.creation_poller.observe_next_queued_result();
-        env.view.request_creation(
+        let action = env.view.create_session_with_hooks(
             creation_data(&env.project_dir, "Busy retry", "unpublished"),
             None,
         );
@@ -1656,10 +1658,21 @@ fn creation_admission_returns_busy_before_root_or_nested_locks_are_released() {
             .as_ref()
             .map(|dialog| dialog.title().to_string());
         let no_pending = !env.view.is_creation_pending() && env.view.creating_stub_id.is_none();
+        env.view.handle_key(key(KeyCode::Esc), None);
+        env.view.handle_key(key(KeyCode::Char('?')), None);
+        let rendered_help = env.view.show_help
+            && render_home_to_string(&mut env.view, 120, 35).contains("Keyboard Shortcuts");
+        let unchanged = std::fs::read(env.storage.sessions_path()).ok() == before;
         let _ = release_tx.send(());
         let returned_while_held = released_rx.recv().unwrap();
         holder.join().unwrap();
         assert!(returned_while_held, "{layer}: input waited for the holder");
+        assert_eq!(action, None, "{layer}");
+        assert!(
+            rendered_help,
+            "{layer}: input and draw must complete while held"
+        );
+        assert!(unchanged, "{layer}: rejected admission must not write");
         assert_eq!(
             busy_title.as_deref(),
             Some("Session operation in progress"),
@@ -1673,12 +1686,324 @@ fn creation_admission_returns_busy_before_root_or_nested_locks_are_released() {
         );
         assert!(env.view.creating_provisional_group_paths.is_empty());
         env.view.info_dialog = None;
+        env.view.show_help = false;
         env.view
-            .request_creation(creation_data(&env.project_dir, "Busy retry", ""), None);
+            .create_session_with_hooks(creation_data(&env.project_dir, "Busy retry", ""), None);
         assert!(
             env.view.is_creation_pending(),
             "{layer}: retry should be admitted"
         );
         assert!(drain_creation_result(&mut env.view).is_some(), "{layer}");
+    }
+}
+
+#[test]
+#[serial]
+fn completion_defers_under_every_publication_lock_then_attaches_same_identity_once() {
+    use super::super::creation::PendingCreationCompletion;
+    use crate::tui::creation_poller::CreationResult;
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    for managed in [false, true] {
+        for layer in [
+            "root",
+            "identity",
+            "lifecycle",
+            "transition",
+            "storage",
+            "save",
+            "entry",
+        ] {
+            if layer == "entry" && !managed {
+                continue;
+            }
+            let mut env = setup_creation_test_env();
+            let mut data = creation_data(&env.project_dir, "Deferred completion", "deferred");
+            data.worktree_enabled = managed;
+            if managed {
+                data.worktree_branch = Some("deferred-worktree".into());
+                data.create_new_branch = true;
+            }
+            let queued = env.view.creation_poller.observe_next_queued_result();
+            env.view.request_creation(data, None);
+            let id = env.view.creating_stub_id.clone().unwrap();
+            let provisional = env.view.creating_provisional_creation.clone().unwrap();
+            queued.recv_timeout(Duration::from_secs(10)).unwrap();
+            let outcome = env.view.creation_poller.try_recv_result().unwrap();
+            let CreationResult::Success(success) = &outcome.result else {
+                panic!("real build failed: {:?}", outcome.result);
+            };
+            let before = success.build_result.instance.clone();
+            let transaction = success.build_result.transaction.clone();
+            env.view.pending_creation_completion = Some(PendingCreationCompletion::Unpublished {
+                outcome,
+                rollback: None,
+            });
+            let app = crate::session::get_app_dir().unwrap();
+            let profile = env.storage.sessions_path().parent().unwrap().to_path_buf();
+            let storage = env.storage.clone();
+            let held_id = id.clone();
+            let (ready_tx, ready_rx) = mpsc::channel();
+            let (release_tx, release_rx) = mpsc::channel();
+            let (released_tx, released_rx) = mpsc::channel();
+            let holder = std::thread::spawn(move || {
+                let hold = || {
+                    ready_tx.send(()).unwrap();
+                    release_rx.recv_timeout(Duration::from_secs(3)).is_ok()
+                };
+                let released = match layer {
+                    "save" => storage.with_save_lock_for_test(hold),
+                    "entry" => transaction.unwrap().with_entry_lock_for_test(hold),
+                    _ => {
+                        let held: Box<dyn std::any::Any> = match layer {
+                            "root" => {
+                                Box::new(crate::session::storage::acquire_ownership_lock().unwrap())
+                            }
+                            "identity" => Box::new(
+                                crate::session::storage::acquire_storage_flock(
+                                    &app,
+                                    ".title-mutation.lock",
+                                )
+                                .unwrap(),
+                            ),
+                            "lifecycle" => Box::new(
+                                crate::session::storage::acquire_storage_flock(
+                                    &profile,
+                                    &format!(".instance-lifecycle-{held_id}.lock"),
+                                )
+                                .unwrap(),
+                            ),
+                            "transition" => Box::new(
+                                crate::session::storage::acquire_storage_flock(
+                                    &app,
+                                    crate::migrations::v027_isolate_sandbox_stores::LOCK,
+                                )
+                                .unwrap(),
+                            ),
+                            "storage" => Box::new(
+                                crate::session::storage::acquire_storage_flock(
+                                    &profile,
+                                    ".storage.lock",
+                                )
+                                .unwrap(),
+                            ),
+                            _ => unreachable!(),
+                        };
+                        let released = hold();
+                        drop(held);
+                        released
+                    }
+                };
+                released_tx.send(released).unwrap();
+            });
+            ready_rx.recv_timeout(Duration::from_secs(3)).unwrap();
+            let attached = env.view.apply_creation_results();
+            let retained = matches!(
+                &env.view.pending_creation_completion,
+                Some(PendingCreationCompletion::Unpublished { outcome, rollback: None })
+                    if outcome.provisional_creation.as_ref()
+                        .is_some_and(|same| std::sync::Arc::ptr_eq(same, &provisional))
+            );
+            let creating = env.view.get_instance(&id).unwrap().status == Status::Creating;
+            env.view.handle_key(key(KeyCode::Char('?')), None);
+            let rendered_help = env.view.show_help
+                && render_home_to_string(&mut env.view, 120, 35).contains("Keyboard Shortcuts");
+            let _ = release_tx.send(());
+            let returned_while_held = released_rx.recv().unwrap();
+            holder.join().unwrap();
+            assert!(returned_while_held, "{managed}/{layer}: callback blocked");
+            assert_eq!(attached, None, "{managed}/{layer}");
+            assert!(
+                retained && creating,
+                "{managed}/{layer}: exact Creating owner must remain pending"
+            );
+            assert!(rendered_help, "{managed}/{layer}");
+            env.view.show_help = false;
+            assert_eq!(drain_creation_result(&mut env.view), Some(id.clone()));
+            assert_eq!(
+                env.view.apply_creation_results(),
+                None,
+                "attach is delivered once"
+            );
+            let rows = env.storage.load().unwrap();
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].id, id);
+            assert_eq!(rows[0].created_at, before.created_at);
+            assert_eq!(rows[0].lifecycle_generation, before.lifecycle_generation);
+            assert_ne!(rows[0].status, Status::Creating);
+            assert!(rows[0].lifecycle_reservation.is_none());
+        }
+    }
+}
+
+#[test]
+#[serial]
+fn cancelling_deferred_completion_queues_rollback_without_stealing_new_request() {
+    use std::sync::mpsc;
+    use std::time::Duration;
+    for disconnected in [false, true] {
+        let mut env = setup_creation_test_env();
+        let mut data = creation_data(&env.project_dir, "Cancelled completion", "cancelled");
+        data.worktree_enabled = true;
+        data.worktree_branch = Some("cancelled-completion".into());
+        data.create_new_branch = true;
+        let queued = env.view.creation_poller.observe_next_queued_result();
+        env.view.request_creation(data, None);
+        let old = env.view.creating_stub_id.clone().unwrap();
+        queued.recv_timeout(Duration::from_secs(10)).unwrap();
+        if disconnected {
+            env.view.creation_poller.disconnect_for_test();
+        }
+        let path = std::path::PathBuf::from(&env.storage.load().unwrap()[0].project_path);
+        let (ready_tx, ready_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let (released_tx, released_rx) = mpsc::channel();
+        let holder = std::thread::spawn(move || {
+            let root = crate::session::storage::acquire_ownership_lock().unwrap();
+            ready_tx.send(()).unwrap();
+            let released = release_rx.recv_timeout(Duration::from_secs(3)).is_ok();
+            drop(root);
+            released_tx.send(released).unwrap();
+        });
+        ready_rx.recv().unwrap();
+        assert_eq!(env.view.apply_creation_results(), None);
+        env.view.cancel_creation();
+        let rolled_back = env.view.creation_poller.observe_next_queued_result();
+        let hidden = env.view.get_instance(&old).is_none();
+        env.view.handle_key(key(KeyCode::Esc), None);
+        env.view.handle_key(key(KeyCode::Char('?')), None);
+        let rendered_help = env.view.show_help
+            && render_home_to_string(&mut env.view, 120, 35).contains("Keyboard Shortcuts");
+        let pending = env.view.is_creation_pending();
+        let _ = release_tx.send(());
+        let returned_while_held = released_rx.recv().unwrap();
+        holder.join().unwrap();
+        assert!(returned_while_held && hidden && rendered_help && pending);
+        rolled_back.recv_timeout(Duration::from_secs(10)).unwrap();
+        assert!(
+            !path.exists(),
+            "owned worktree rollback must finish on worker"
+        );
+        env.view.show_help = false;
+        env.view
+            .request_creation(creation_data(&env.project_dir, "Newer request", ""), None);
+        let new = env.view.creating_stub_id.clone().unwrap();
+        assert_ne!(old, new);
+        assert_eq!(
+            env.view.apply_creation_results(),
+            None,
+            "old terminal result cannot attach"
+        );
+        assert_eq!(env.view.creating_stub_id.as_deref(), Some(new.as_str()));
+        assert_eq!(drain_creation_result(&mut env.view), Some(new.clone()));
+        assert!(env.view.get_instance(&old).is_none());
+        let rows = env.storage.load().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].id, new);
+    }
+}
+
+#[test]
+#[serial]
+fn published_completion_retries_projection_without_republish_cancel_or_resurrection() {
+    use super::super::creation::PendingCreationCompletion;
+    for deleted in [false, true] {
+        let mut env = setup_creation_test_env();
+        let other = Storage::new_unwatched("other").unwrap();
+        other
+            .update(|rows, groups| {
+                rows.push(Instance::new("unrelated", "/unrelated"));
+                groups.push(Group::new("unrelated", "unrelated"));
+                Ok(())
+            })
+            .unwrap();
+        env.view.storages.insert("other".into(), other.clone());
+        let groups = other.sessions_path().with_file_name("groups.json");
+        let backup = groups.with_extension("saved");
+        std::fs::rename(&groups, &backup).unwrap();
+        std::fs::create_dir(&groups).unwrap();
+        let count = crate::session::config::AppStateConfig::load()
+            .unwrap()
+            .sessions_created;
+        let queued = env.view.creation_poller.observe_next_queued_result();
+        env.view.request_creation(
+            creation_data(&env.project_dir, "Projection retry", ""),
+            None,
+        );
+        let id = env.view.creating_stub_id.clone().unwrap();
+        queued
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .unwrap();
+        assert_eq!(env.view.apply_creation_results(), None);
+        assert!(matches!(
+            env.view.pending_creation_completion,
+            Some(PendingCreationCompletion::PublishedAwaitingProjection(_))
+        ));
+        assert_ne!(env.storage.load().unwrap()[0].status, Status::Creating);
+        env.view.cancel_creation();
+        assert!(
+            env.view.get_instance(&id).is_some(),
+            "commit won before cancellation"
+        );
+        assert_eq!(
+            env.view.apply_creation_results(),
+            None,
+            "failed projection remains pending"
+        );
+        if deleted {
+            env.storage
+                .update(|rows, _| {
+                    rows.retain(|row| row.id != id);
+                    Ok(())
+                })
+                .unwrap();
+        }
+        std::fs::remove_dir(&groups).unwrap();
+        std::fs::rename(&backup, &groups).unwrap();
+        env.view.active_profile = None;
+        let late = Storage::new_unwatched("undiscovered").unwrap();
+        late.update(|rows, _| {
+            rows.push(Instance::new("late peer", "/late-peer"));
+            Ok(())
+        })
+        .unwrap();
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let (released_tx, released_rx) = std::sync::mpsc::channel();
+        let holder = std::thread::spawn(move || {
+            let root = crate::session::storage::acquire_ownership_lock().unwrap();
+            ready_tx.send(()).unwrap();
+            let released = release_rx
+                .recv_timeout(std::time::Duration::from_secs(3))
+                .is_ok();
+            drop(root);
+            released_tx.send(released).unwrap();
+        });
+        ready_rx.recv().unwrap();
+        let attached = env.view.apply_creation_results();
+        env.view.handle_key(key(KeyCode::Char('?')), None);
+        let rendered_help = env.view.show_help
+            && render_home_to_string(&mut env.view, 120, 35).contains("Keyboard Shortcuts");
+        let _ = release_tx.send(());
+        let returned_while_held = released_rx.recv().unwrap();
+        holder.join().unwrap();
+        assert!(
+            returned_while_held && rendered_help,
+            "projection must use only bound read storage"
+        );
+        assert!(!env.view.storages.contains_key("undiscovered"));
+        assert_eq!(attached, (!deleted).then_some(id.clone()));
+        assert_eq!(env.view.apply_creation_results(), None);
+        assert!(!env.view.is_creation_pending());
+        assert_eq!(
+            crate::session::config::AppStateConfig::load()
+                .unwrap()
+                .sessions_created,
+            count + 1
+        );
+        assert_eq!(env.view.get_instance(&id).is_none(), deleted);
+        env.view.save().unwrap();
+        assert_eq!(env.storage.load().unwrap().is_empty(), deleted);
     }
 }

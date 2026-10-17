@@ -419,14 +419,21 @@ impl BuildResult {
     }
 
     fn flush_metadata(&mut self) -> Result<()> {
+        let root = super::storage::acquire_ownership_lock()?;
+        let _identity = super::storage::acquire_session_identity_lock_with_ownership(&root)?;
+        let _lifecycle = self
+            .profile_storage
+            .acquire_instance_lifecycle_lock_with_ownership(&root, &self.instance.id)?;
+        self.flush_metadata_with_ownership(&root)
+    }
+
+    fn flush_metadata_with_ownership(
+        &mut self,
+        root: &super::storage::OwnershipGuard,
+    ) -> Result<()> {
         let latest = {
-            let root = super::storage::acquire_ownership_lock()?;
-            let _identity = super::storage::acquire_session_identity_lock_with_ownership(&root)?;
-            let _lifecycle = self
-                .profile_storage
-                .acquire_instance_lifecycle_lock_with_ownership(&root, &self.instance.id)?;
             if let Some(transaction) = &self.transaction {
-                transaction.update_creation_metadata_with_ownership(&root, &self.instance)?
+                transaction.update_creation_metadata_with_ownership(root, &self.instance)?
             } else {
                 let before = self
                     .initial_metadata
@@ -437,7 +444,7 @@ impl BuildResult {
                     "Creation initialization changed its namespace"
                 );
                 self.profile_storage
-                    .update_with_ownership(&root, |rows, _| {
+                    .update_with_ownership(root, |rows, _| {
                         let current = rows
                             .iter_mut()
                             .find(|row| row.id == self.instance.id)
@@ -494,13 +501,53 @@ impl BuildResult {
             self.on_create_completed,
             "Creation callbacks have not completed"
         );
-        self.flush_metadata()?;
+        let root = super::storage::acquire_ownership_lock()?;
+        let _identity = super::storage::acquire_session_identity_lock_with_ownership(&root)?;
+        let _lifecycle = self
+            .profile_storage
+            .acquire_instance_lifecycle_lock_with_ownership(&root, &self.instance.id)?;
+        self.publish_with_ownership(&root)
+    }
+
+    /// Try all required locks without waiting. `None` retains this armed creation for retry.
+    /// Physical rollback must run off the input thread.
+    pub(crate) fn try_publish(&mut self) -> Result<Option<()>> {
+        anyhow::ensure!(
+            self.on_create_completed,
+            "Creation callbacks have not completed"
+        );
+        let Some(root) = super::storage::try_acquire_ownership_lock()? else {
+            return Ok(None);
+        };
+        let Some(_identity) =
+            super::storage::try_acquire_session_identity_lock_with_ownership(&root)?
+        else {
+            return Ok(None);
+        };
+        let Some(_lifecycle) = self
+            .profile_storage
+            .try_acquire_instance_lifecycle_lock_with_ownership(&root, &self.instance.id)?
+        else {
+            return Ok(None);
+        };
+        match self.publish_with_ownership(&root) {
+            Ok(()) => Ok(Some(())),
+            Err(error)
+                if error.chain().any(|cause| {
+                    cause
+                        .downcast_ref::<std::io::Error>()
+                        .is_some_and(|error| error.kind() == std::io::ErrorKind::WouldBlock)
+                }) =>
+            {
+                Ok(None)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    fn publish_with_ownership(&mut self, root: &super::storage::OwnershipGuard) -> Result<()> {
+        self.flush_metadata_with_ownership(root)?;
         let latest = {
-            let root = super::storage::acquire_ownership_lock()?;
-            let _identity = super::storage::acquire_session_identity_lock_with_ownership(&root)?;
-            let _lifecycle = self
-                .profile_storage
-                .acquire_instance_lifecycle_lock_with_ownership(&root, &self.instance.id)?;
             let validate = |rows: &[Instance], candidate: &Instance| -> Result<()> {
                 if super::is_duplicate_session(
                     rows.iter(),
@@ -514,11 +561,11 @@ impl BuildResult {
             };
             if let Some(transaction) = &self.transaction {
                 transaction
-                    .publish_with_ownership(&root, validate)?
+                    .publish_with_ownership(root, validate)?
                     .context("Creation publication removed its row")?
             } else {
                 self.profile_storage
-                    .update_with_ownership(&root, |rows, groups| {
+                    .update_with_ownership(root, |rows, groups| {
                         let index = rows
                             .iter()
                             .position(|row| row.id == self.instance.id)

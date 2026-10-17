@@ -1,7 +1,4 @@
-//! Background session creation handler for TUI responsiveness
-//!
-//! This handles the potentially slow Docker operations (image pull, container creation)
-//! in a background thread so the UI remains responsive.
+//! Owned background session provisioning and rollback.
 
 use std::sync::mpsc;
 use std::thread;
@@ -55,8 +52,16 @@ pub struct CreationOutcome {
     pub provisional_creation: Option<std::sync::Arc<builder::ProvisionalCreation>>,
 }
 
+enum CreationCommand {
+    Create(Box<CreationRequest>, mpsc::Sender<HookProgress>),
+    Rollback {
+        outcome: CreationOutcome,
+        cause: Option<String>,
+    },
+}
+
 pub struct CreationPoller {
-    request_tx: mpsc::Sender<(CreationRequest, mpsc::Sender<HookProgress>)>,
+    request_tx: mpsc::Sender<CreationCommand>,
     result_rx: mpsc::Receiver<(CreationOutcome, CancellationToken)>,
     progress_rx: mpsc::Receiver<HookProgress>,
     progress_tx: mpsc::Sender<HookProgress>,
@@ -78,8 +83,15 @@ fn on_create_error(e: &anyhow::Error, hooks: &ResolvedHooks) -> String {
 
 impl CreationPoller {
     pub fn new() -> Self {
-        let (request_tx, request_rx) =
-            mpsc::channel::<(CreationRequest, mpsc::Sender<HookProgress>)>();
+        Self::new_after(None, None, 0)
+    }
+
+    fn new_after(
+        predecessor: Option<thread::JoinHandle<()>>,
+        previous_results: Option<mpsc::Receiver<(CreationOutcome, CancellationToken)>>,
+        in_flight: usize,
+    ) -> Self {
+        let (request_tx, request_rx) = mpsc::channel::<CreationCommand>();
         let (result_tx, result_rx) = mpsc::channel::<(CreationOutcome, CancellationToken)>();
         let (progress_tx, progress_rx) = mpsc::channel::<HookProgress>();
         #[cfg(test)]
@@ -89,7 +101,51 @@ impl CreationPoller {
         let queued_observer = result_queued_observer.clone();
 
         let handle = thread::spawn(move || {
-            while let Ok((request, prog_tx)) = request_rx.recv() {
+            if let Some(predecessor) = predecessor {
+                let _ = predecessor.join();
+            }
+            if let Some(previous_results) = previous_results {
+                while let Ok(received) = previous_results.recv() {
+                    if let Err(error) = result_tx.send(received) {
+                        if let CreationResult::Success(mut success) = error.0 .0.result {
+                            if let Err(error) = success.build_result.rollback() {
+                                tracing::error!(target: "session.create", "Disconnected predecessor rollback failed: {error:#}");
+                            }
+                        }
+                    }
+                }
+            }
+            while let Ok(command) = request_rx.recv() {
+                let (request, prog_tx) = match command {
+                    CreationCommand::Create(request, progress) => (*request, progress),
+                    CreationCommand::Rollback { mut outcome, cause } => {
+                        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            let CreationResult::Success(success) = &mut outcome.result else {
+                                unreachable!("only unpublished success can require rollback");
+                            };
+                            match (success.build_result.rollback(), cause) {
+                                (Ok(()), None) => CreationResult::Cancelled,
+                                (Ok(()), Some(cause)) => CreationResult::Error(cause),
+                                (Err(error), cause) => CreationResult::Error(format!(
+                                    "{}Creation rollback could not finish: {error:#}",
+                                    cause.map(|cause| format!("{cause}\n")).unwrap_or_default()
+                                )),
+                            }
+                        }));
+                        outcome.result = result.unwrap_or_else(|_| {
+                            CreationResult::Error("Creation rollback worker panicked".into())
+                        });
+                        let cancel = CancellationToken::new();
+                        if result_tx.send((outcome, cancel)).is_err() {
+                            break;
+                        }
+                        #[cfg(test)]
+                        if let Some(observer) = queued_observer.lock().unwrap().take() {
+                            let _ = observer.send(());
+                        }
+                        continue;
+                    }
+                };
                 let cancel = request.cancel.clone();
                 let provisional_creation = request.provisional_creation.clone();
                 let mut active = None;
@@ -150,10 +206,16 @@ impl CreationPoller {
             progress_rx,
             progress_tx,
             _handle: Some(handle),
-            in_flight: 0,
+            in_flight,
             #[cfg(test)]
             result_queued_observer,
         }
+    }
+
+    fn restart_disconnected(&mut self) {
+        let (_, closed_rx) = mpsc::channel();
+        let previous_results = std::mem::replace(&mut self.result_rx, closed_rx);
+        *self = Self::new_after(self._handle.take(), Some(previous_results), self.in_flight);
     }
 
     #[cfg(test)]
@@ -163,6 +225,24 @@ impl CreationPoller {
         match self._handle.take() {
             Some(handle) => handle.join(),
             None => Ok(()),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn disconnect_for_test(&mut self) {
+        let (closed, _) = mpsc::channel();
+        drop(std::mem::replace(&mut self.request_tx, closed));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while self
+            ._handle
+            .as_ref()
+            .is_some_and(|handle| !handle.is_finished())
+        {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "creation worker did not disconnect"
+            );
+            std::thread::yield_now();
         }
     }
 
@@ -306,10 +386,41 @@ impl CreationPoller {
 
     pub fn request_creation(&mut self, request: CreationRequest) -> anyhow::Result<()> {
         self.request_tx
-            .send((request, self.progress_tx.clone()))
+            .send(CreationCommand::Create(
+                Box::new(request),
+                self.progress_tx.clone(),
+            ))
             .map_err(|error| anyhow::anyhow!("Failed to send creation request: {error}"))?;
         self.in_flight += 1;
         Ok(())
+    }
+
+    pub fn request_rollback(
+        &mut self,
+        outcome: CreationOutcome,
+        cause: Option<String>,
+    ) -> Result<(), (CreationOutcome, Option<String>)> {
+        let command = match self
+            .request_tx
+            .send(CreationCommand::Rollback { outcome, cause })
+        {
+            Ok(()) => {
+                self.in_flight += 1;
+                return Ok(());
+            }
+            Err(error) => error.0,
+        };
+        self.restart_disconnected();
+        match self.request_tx.send(command) {
+            Ok(()) => {
+                self.in_flight += 1;
+                Ok(())
+            }
+            Err(mpsc::SendError(CreationCommand::Rollback { outcome, cause })) => {
+                Err((outcome, cause))
+            }
+            Err(_) => unreachable!("rollback send returned a different command"),
+        }
     }
 
     #[cfg(test)]

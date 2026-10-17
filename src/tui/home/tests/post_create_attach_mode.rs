@@ -66,14 +66,10 @@ fn resolves_new_session_mode() {
     );
 }
 
-/// A minimal `NewSessionData` for the sync create path: no sandbox, no hooks, no worktree.
-/// That combination bypasses `creation_poller` and runs `create_session` inline, which is
-/// the path that originally emitted `Action::AttachSession` and bypassed the attach-mode
-/// setting.
-fn sync_path_session_data(project: &str) -> crate::tui::dialogs::NewSessionData {
+fn plain_session_data(project: &str) -> crate::tui::dialogs::NewSessionData {
     crate::tui::dialogs::NewSessionData {
         profile: "test".to_string(),
-        title: "sync-path-test".to_string(),
+        title: "plain-create-test".to_string(),
         title_typed: false,
         path: project.to_string(),
         group: String::new(),
@@ -97,19 +93,29 @@ fn sync_path_session_data(project: &str) -> crate::tui::dialogs::NewSessionData 
 
 #[test]
 #[serial]
-fn sync_create_path_emits_attach_after_create_not_attach_session() {
-    // Regression guard: `Action::AttachSession` skips the attach-mode dispatch, and only
-    // `Action::AttachAfterCreate` routes through it, so a refactor flipping this back would
-    // silently stop the live-mode setting on plain creates. e2e covers the live-mode end;
-    // this covers the action plumbing without tmux.
+fn plain_creation_completes_through_configured_attach_mode() {
     let mut env = create_test_env_empty();
-    let project_dir = env._temp.path().join("sync-project");
+    let project_dir = env._temp.path().join("plain-project");
     std::fs::create_dir_all(&project_dir).unwrap();
-    let data = sync_path_session_data(project_dir.to_str().unwrap());
-    let action = env.view.create_session_with_hooks(data, None);
-    assert!(
-        matches!(action, Some(Action::AttachAfterCreate(_))),
-        "sync create path must emit AttachAfterCreate (route through attach-mode setting), got {:?}",
-        action
-    );
+    for (default, creation, expected) in [
+        (
+            AttachMode::Tmux,
+            NewSessionMode::LiveSend,
+            AttachMode::LiveSend,
+        ),
+        (AttachMode::LiveSend, NewSessionMode::Tmux, AttachMode::Tmux),
+    ] {
+        write_session_modes(default, creation);
+        let mut data = plain_session_data(project_dir.to_str().unwrap());
+        data.title = format!("{expected:?}");
+        assert_eq!(env.view.create_session_with_hooks(data, None), None);
+        let id = drain_creation_result(&mut env.view).expect("plain creation committed");
+        assert_eq!(env.view.new_session_attach_mode(&id), Some(expected));
+        assert_ne!(env.view.get_instance(&id).unwrap().status, Status::Creating);
+        assert_eq!(
+            env.view.apply_creation_results(),
+            None,
+            "attach is delivered once"
+        );
+    }
 }

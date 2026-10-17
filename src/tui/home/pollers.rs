@@ -257,22 +257,81 @@ impl HomeView {
         self.maybe_start_startup_recovery();
     }
 
+    pub(super) fn request_journal_recovery(&mut self, all_pending: bool) {
+        self.journal_recovery_dirty = true;
+        self.journal_recovery_all_pending |= all_pending;
+        self.start_journal_recovery();
+    }
+
+    fn start_journal_recovery(&mut self) {
+        if self.journal_recovery_inflight || !self.journal_recovery_dirty {
+            return;
+        }
+        self.reconcile_poller.request_journal(
+            self.storages.values().cloned().collect(),
+            self.storage_namespace.clone(),
+            std::mem::take(&mut self.journal_recovery_all_pending),
+        );
+        self.journal_recovery_dirty = false;
+        self.journal_recovery_inflight = true;
+    }
+
+    #[cfg(test)]
+    pub(super) fn finish_journal_recovery_for_test(&mut self) {
+        self.reconcile_poller.request_journal(
+            self.storages.values().cloned().collect(),
+            self.storage_namespace.clone(),
+            true,
+        );
+        let _ = self.reconcile_poller.finish_for_test();
+    }
+
     /// Reload once load-time healing lands. A pending repair keeps the recovery gate shut,
     /// so recovery never runs against rows the sweep already fixed on disk.
     pub fn apply_reconcile_results(&mut self) -> bool {
         use std::sync::mpsc::TryRecvError;
 
         let mut sweep_landed = self.pending_reconcile_reload;
-        if !sweep_landed {
+        loop {
             match self.reconcile_poller.try_recv_result() {
-                Ok(result) => {
+                Ok(crate::tui::reconcile_poller::ReconcileResult::Healing { changed }) => {
                     sweep_landed = true;
-                    self.pending_reconcile_reload = result.changed;
+                    self.pending_reconcile_reload |= changed;
                 }
-                Err(TryRecvError::Disconnected) => sweep_landed = true,
-                Err(TryRecvError::Empty) => {}
+                Ok(crate::tui::reconcile_poller::ReconcileResult::Journal { notices }) => {
+                    self.journal_recovery_inflight = false;
+                    self.pending_journal_reload = true;
+                    match notices {
+                        Ok(notices)
+                            if !notices.is_empty() && notices != self.move_intent_conflicts =>
+                        {
+                            self.info_dialog = Some(InfoDialog::new(
+                                "Worktree Recovery Conflict",
+                                &notices.join("\n\n"),
+                            ));
+                        }
+                        Err(error) => {
+                            self.info_dialog = Some(InfoDialog::new("Recovery Failed", &error));
+                        }
+                        _ => {}
+                    }
+                }
+                Err(TryRecvError::Disconnected) => {
+                    if self.journal_recovery_inflight {
+                        self.pending_journal_reload = true;
+                        self.info_dialog = Some(InfoDialog::new(
+                            "Recovery Failed",
+                            "Recovery worker disconnected; unfinished intents were retained.",
+                        ));
+                    }
+                    self.journal_recovery_inflight = false;
+                    sweep_landed = true;
+                    break;
+                }
+                Err(TryRecvError::Empty) => break,
             }
         }
+        self.start_journal_recovery();
 
         if self.live_send.is_some() {
             if !self.pending_reconcile_reload {
@@ -282,16 +341,28 @@ impl HomeView {
         }
 
         let mut reloaded = false;
-        if self.pending_reconcile_reload {
+        if self.pending_reconcile_reload
+            || self.pending_journal_reload
+            || self.pending_storage_discovery
+        {
             if self
                 .reconcile_reload_retry_at
                 .is_some_and(|at| std::time::Instant::now() < at)
             {
                 return false;
             }
-            match self.reload_storage_only() {
+            let projection = if self.pending_storage_discovery {
+                self.reload_storage_only()
+            } else {
+                self.project_loaded_storages()
+            };
+            match projection {
                 Ok(()) => {
+                    if self.pending_storage_discovery {
+                        return false;
+                    }
                     self.pending_reconcile_reload = false;
+                    self.pending_journal_reload = false;
                     self.reconcile_reload_retry_at = None;
                     reloaded = true;
                 }
@@ -306,7 +377,9 @@ impl HomeView {
                 }
             }
         }
-        self.release_startup_recovery_gate(sweep_landed);
+        if !self.pending_reconcile_reload {
+            self.release_startup_recovery_gate(sweep_landed);
+        }
         reloaded
     }
 

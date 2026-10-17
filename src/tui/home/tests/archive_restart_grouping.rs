@@ -3365,8 +3365,9 @@ fn reconcile_reload_waits_for_live_send_to_finish() {
     use crate::tui::home::live_send::{LiveSendState, LiveSendTarget};
 
     let mut env = create_test_env_empty();
-    env.view.reconcile_poller =
-        crate::tui::reconcile_poller::ReconcilePoller::with_result_for_test(true);
+    env.view
+        .reconcile_poller
+        .set_healing_result_for_test(Some(true));
     env.view.live_send = Some(LiveSendState {
         session_id: "s".to_string(),
         title: "s".to_string(),
@@ -3429,9 +3430,12 @@ fn startup_recovery_waits_for_the_first_reconcile_sweep() {
             }
         }
     };
-    assert!(!result.changed, "empty storage needs no repair");
-    view.reconcile_poller =
-        crate::tui::reconcile_poller::ReconcilePoller::with_result_for_test(result.changed);
+    let crate::tui::reconcile_poller::ReconcileResult::Healing { changed } = result else {
+        panic!("initial result must be the healing sweep");
+    };
+    assert!(!changed, "empty storage needs no repair");
+    view.reconcile_poller
+        .set_healing_result_for_test(Some(changed));
     assert!(!view.apply_reconcile_results());
     assert!(
         view.startup_recovery_gate.is_none(),
@@ -3439,8 +3443,8 @@ fn startup_recovery_waits_for_the_first_reconcile_sweep() {
     );
 
     // Released exactly once, so later ticks cannot re-run recovery.
-    view.reconcile_poller =
-        crate::tui::reconcile_poller::ReconcilePoller::with_result_for_test(false);
+    view.reconcile_poller
+        .set_healing_result_for_test(Some(false));
     assert!(!view.apply_reconcile_results());
     assert!(view.startup_recovery_gate.is_none());
 }
@@ -3463,7 +3467,7 @@ fn startup_recovery_gate_expires_when_the_sweep_never_lands() {
         )
         .unwrap();
         // No request is queued: only the gate deadline can release recovery.
-        view.reconcile_poller = crate::tui::reconcile_poller::ReconcilePoller::new();
+        view.reconcile_poller.set_healing_result_for_test(None);
         view.startup_recovery_gate = Some(std::time::Instant::now());
 
         assert!(!view.apply_reconcile_results());
@@ -3544,8 +3548,8 @@ fn a_queued_repair_keeps_the_gate_armed_while_live_send_holds_the_reload() {
             Ok(())
         })
         .unwrap();
-    view.reconcile_poller =
-        crate::tui::reconcile_poller::ReconcilePoller::with_result_for_test(true);
+    view.reconcile_poller
+        .set_healing_result_for_test(Some(true));
     view.startup_recovery_gate =
         Some(std::time::Instant::now() - HomeView::STARTUP_RECOVERY_GATE_TIMEOUT);
     view.live_send = Some(LiveSendState {
@@ -3608,8 +3612,8 @@ fn a_failed_reload_keeps_the_repair_pending_and_the_gate_shut() {
                 Ok(())
             })
             .unwrap();
-        view.reconcile_poller =
-            crate::tui::reconcile_poller::ReconcilePoller::with_result_for_test(true);
+        view.reconcile_poller
+            .set_healing_result_for_test(Some(true));
 
         view.startup_recovery_gate = Some(std::time::Instant::now());
 
@@ -3670,8 +3674,8 @@ fn a_failed_reload_keeps_the_repair_pending_and_the_gate_shut() {
             crate::file_watch::FileWatchService::noop(),
         )
         .unwrap();
-        view.reconcile_poller =
-            crate::tui::reconcile_poller::ReconcilePoller::with_result_for_test(true);
+        view.reconcile_poller
+            .set_healing_result_for_test(Some(true));
 
         let groups = crate::session::get_app_dir()
             .unwrap()

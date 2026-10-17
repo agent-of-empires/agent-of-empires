@@ -388,7 +388,8 @@ fn test_create_session_in_all_mode_is_findable() {
         structured: false,
     };
 
-    let session_id = view.create_session(data).unwrap();
+    view.request_creation(data, None);
+    let session_id = drain_creation_result(&mut view).expect("creation committed");
     assert_eq!(
         crate::session::config::AppStateConfig::load()
             .unwrap()

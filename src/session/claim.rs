@@ -369,13 +369,37 @@ impl ResourceReservation {
             .map_err(|_| anyhow::anyhow!("resource intent state is poisoned"))
     }
 
+    #[cfg(test)]
+    pub(crate) fn with_entry_lock_for_test<R>(&self, f: impl FnOnce() -> R) -> R {
+        let _held = self.lock_entry().unwrap();
+        f()
+    }
+
+    fn lock_entry_with_ownership(
+        &self,
+        root: &super::storage::OwnershipGuard,
+    ) -> anyhow::Result<MutexGuard<'_, MoveJournalEntry>> {
+        if !root.is_nonblocking() {
+            return self.lock_entry();
+        }
+        match self.entry.try_lock() {
+            Ok(entry) => Ok(entry),
+            Err(std::sync::TryLockError::WouldBlock) => {
+                Err(std::io::Error::from(std::io::ErrorKind::WouldBlock).into())
+            }
+            Err(std::sync::TryLockError::Poisoned(_)) => {
+                Err(anyhow::anyhow!("resource intent state is poisoned"))
+            }
+        }
+    }
+
     pub(crate) fn update_creation_metadata_with_ownership(
         &self,
         root: &super::storage::OwnershipGuard,
         edited: &Instance,
     ) -> anyhow::Result<Instance> {
         root.require_exclusive()?;
-        let mut entry = self.lock_entry()?;
+        let mut entry = self.lock_entry_with_ownership(root)?;
         let MoveAuthority::Resource { intent } = &mut entry.authority else {
             anyhow::bail!("creation has no resource intent")
         };
@@ -840,7 +864,7 @@ impl ResourceReservation {
         F: FnMut(&[Instance], &Instance) -> anyhow::Result<()>,
     {
         root.require_exclusive()?;
-        let mut entry = self.lock_entry()?;
+        let mut entry = self.lock_entry_with_ownership(root)?;
         let MoveAuthority::Resource { intent } = &mut entry.authority else {
             anyhow::bail!("resource transaction has no resource intent")
         };

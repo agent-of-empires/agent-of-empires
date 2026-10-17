@@ -1,58 +1,103 @@
-//! Background load-time healing for trashed and relocated worktrees.
-//!
-//! Both sweeps below repair durable state that a crash, an older aoe version,
-//! or a `git worktree move` from another shell left inconsistent. Neither
-//! belongs on the first-frame path: a broken row costs a lifecycle flock, a
-//! storage write, and git spawns, so a store with a few hundred trashed rows
-//! held the TUI at a blank screen for seconds before it could paint (#3611,
-//! #3554). It is healing work, not render input, so it runs on a worker and
-//! `HomeView::apply_reconcile_results` reloads once the sweep lands.
+//! Owned background load-time healing and durable intent recovery.
 
 use std::sync::mpsc::TryRecvError;
 
 use crate::tui::worker::Worker;
 
-pub struct ReconcileRequest {
-    /// Profiles to sweep, in the order the view loaded them.
-    pub profiles: Vec<String>,
+pub enum ReconcileRequest {
+    Healing {
+        profiles: Vec<String>,
+    },
+    Journal {
+        storages: Vec<crate::session::Storage>,
+        app_dir: std::path::PathBuf,
+        all_pending: bool,
+    },
 }
 
-pub struct ReconcileResult {
-    /// True when a durable row changed, so the view must reload to show it.
-    pub changed: bool,
+pub enum ReconcileResult {
+    Healing {
+        changed: bool,
+    },
+    Journal {
+        notices: Result<Vec<String>, String>,
+    },
 }
 
 pub struct ReconcilePoller {
     worker: Worker<ReconcileRequest, ReconcileResult>,
+    #[cfg(test)]
+    seeded_result: Option<ReconcileResult>,
+    #[cfg(test)]
+    skip_healing: bool,
 }
 
 impl ReconcilePoller {
     pub fn new() -> Self {
         Self {
-            worker: Worker::spawn("aoe-reconcile-poller", |request: ReconcileRequest| {
-                ReconcileResult {
-                    changed: sweep(&request.profiles),
-                }
-            }),
+            worker: Worker::spawn(
+                "aoe-reconcile-poller",
+                |request: ReconcileRequest| match request {
+                    ReconcileRequest::Healing { profiles } => ReconcileResult::Healing {
+                        changed: sweep(&profiles),
+                    },
+                    ReconcileRequest::Journal {
+                        storages,
+                        app_dir,
+                        all_pending,
+                    } => ReconcileResult::Journal {
+                        notices: recover(&storages, &app_dir, all_pending)
+                            .map_err(|error| format!("{error:#}")),
+                    },
+                },
+            ),
+            #[cfg(test)]
+            seeded_result: None,
+            #[cfg(test)]
+            skip_healing: false,
         }
     }
 
     pub fn request(&mut self, profiles: Vec<String>) {
-        self.worker.request(ReconcileRequest { profiles });
+        #[cfg(test)]
+        if self.skip_healing {
+            return;
+        }
+        self.worker.request(ReconcileRequest::Healing { profiles });
+    }
+
+    pub fn request_journal(
+        &mut self,
+        storages: Vec<crate::session::Storage>,
+        app_dir: std::path::PathBuf,
+        all_pending: bool,
+    ) {
+        self.worker.request(ReconcileRequest::Journal {
+            storages,
+            app_dir,
+            all_pending,
+        });
     }
 
     pub fn try_recv_result(&mut self) -> Result<ReconcileResult, TryRecvError> {
+        #[cfg(test)]
+        if let Some(result) = self.seeded_result.take() {
+            return Ok(result);
+        }
         self.worker.try_recv()
     }
 
     #[cfg(test)]
     pub(crate) fn with_result_for_test(changed: bool) -> Self {
-        Self {
-            worker: Worker::seeded_for_test(
-                "aoe-reconcile-poller-test",
-                ReconcileResult { changed },
-            ),
-        }
+        let mut poller = Self::new();
+        poller.seeded_result = Some(ReconcileResult::Healing { changed });
+        poller.skip_healing = true;
+        poller
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_healing_result_for_test(&mut self, changed: Option<bool>) {
+        self.seeded_result = changed.map(|changed| ReconcileResult::Healing { changed });
     }
     #[cfg(test)]
     pub(crate) fn finish_for_test(&mut self) -> std::thread::Result<()> {
@@ -64,6 +109,35 @@ impl Default for ReconcilePoller {
     fn default() -> Self {
         Self::new()
     }
+}
+
+fn recover(
+    storages: &[crate::session::Storage],
+    app_dir: &std::path::Path,
+    all_pending: bool,
+) -> anyhow::Result<Vec<String>> {
+    anyhow::ensure!(
+        app_dir.canonicalize()? == crate::session::get_app_dir_path()?.canonicalize()?,
+        "recovery namespace changed"
+    );
+    if all_pending {
+        return crate::session::Storage::recover_pending_moves(
+            crate::file_watch::FileWatchService::noop(),
+        );
+    }
+    let loaded = storages
+        .iter()
+        .map(|storage| storage.load().map(|rows| (storage.profile(), rows)))
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    let loads = loaded
+        .iter()
+        .map(|(profile, rows)| (*profile, rows.as_slice()))
+        .collect::<Vec<_>>();
+    let stores = storages
+        .iter()
+        .map(|storage| (storage.profile(), storage))
+        .collect::<Vec<_>>();
+    Ok(crate::session::reconcile_profile_duplicates(&loads, &stores).conflicts)
 }
 
 /// Run both healing sweeps over `profiles`. Returns true when anything changed.

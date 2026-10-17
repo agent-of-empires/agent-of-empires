@@ -314,6 +314,11 @@ pub struct HomeView {
     pub(super) startup_recovery_gate: Option<std::time::Instant>,
     pub(super) pending_reconcile_reload: bool,
     pub(super) reconcile_reload_retry_at: Option<std::time::Instant>,
+    pub(super) journal_recovery_dirty: bool,
+    pub(super) journal_recovery_inflight: bool,
+    pub(super) journal_recovery_all_pending: bool,
+    pub(super) pending_journal_reload: bool,
+    pub(super) pending_storage_discovery: bool,
 
     pub(super) restart_poller: RestartPoller,
     pub(super) restart_in_flight: std::collections::HashSet<String>,
@@ -332,6 +337,7 @@ pub struct HomeView {
     >,
 
     pub(super) creation_poller: CreationPoller,
+    pending_creation_completion: Option<creation::PendingCreationCompletion>,
     /// Cancels the request behind `creating_stub_id`.
     pub(super) creation_cancel: Option<tokio_util::sync::CancellationToken>,
     pub(super) on_launch_hooks_ran: HashSet<String>,
@@ -457,6 +463,7 @@ pub struct HomeView {
     pub(super) tool_picker_dialog: Option<super::dialogs::ToolPickerDialog>,
 
     pub(super) file_watch: std::sync::Arc<crate::file_watch::FileWatchService>,
+    pub(super) storage_namespace: std::path::PathBuf,
     pub(super) disk_watch: DiskWatchState,
     pub(super) config_watch: ConfigWatchState,
     pub(super) watcher_config_refresh_count: std::sync::atomic::AtomicU64,

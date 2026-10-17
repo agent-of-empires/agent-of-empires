@@ -40,12 +40,13 @@ impl HomeView {
         let _ = self.trash_poller.finish_for_test();
         let _ = self.restore_worker.finish_for_test();
         let _ = self.drop_poller.finish_for_test();
-        let _ = self.reconcile_poller.finish_for_test();
         let _ = self.restart_poller.finish_for_test();
         let _ = self.store_move_poller.finish_for_test();
         let _ = self.attach_project_poller.finish_for_test();
         let _ = self.rename_worker.finish_for_test();
+        self.drain_creation_for_test();
         let _ = self.creation_poller.finish_for_test();
+        self.finish_journal_recovery_for_test();
         let _ = self.serve_probe.finish_for_test();
     }
 
@@ -152,10 +153,8 @@ impl HomeView {
             storages.insert(profile_name.clone(), storage);
         }
 
-        // Duplicate detection across every loaded profile runs before any loaded state is
-        // published (#3459): journal-guided repairs fix durable state under lock here, so
-        // the reload below publishes exactly one row per session.
-        let (legacy_duplicate_reports, move_intent_conflicts) = {
+        // Ambiguous copies stay excluded until the owned worker settles their journal.
+        let (legacy_duplicate_reports, move_intent_conflicts, recovery_needed) = {
             let loads_view: Vec<(&str, &[Instance])> = profile_loads
                 .iter()
                 .map(|(name, instances, _)| (name.as_str(), instances.as_slice()))
@@ -164,19 +163,10 @@ impl HomeView {
                 .iter()
                 .map(|(name, storage)| (name.as_str(), storage))
                 .collect();
-            let outcome = crate::session::reconcile_profile_duplicates(&loads_view, &storages_view);
-            if outcome.repaired {
-                for (name, instances, groups) in &mut profile_loads {
-                    let (mut fresh, fresh_groups) = storages[name].load_with_groups()?;
-                    for inst in &mut fresh {
-                        inst.source_profile = name.clone();
-                    }
-                    *instances = fresh;
-                    *groups = fresh_groups;
-                }
-            }
+            let outcome =
+                crate::session::storage::inspect_profile_duplicates(&loads_view, &storages_view);
             log_legacy_duplicates_once(&outcome.reports);
-            (outcome.reports, outcome.conflicts)
+            (outcome.reports, outcome.conflicts, outcome.recovery_needed)
         };
         for (profile_name, instances, groups) in &profile_loads {
             let tree = GroupTree::new_with_groups(instances, groups);
@@ -254,6 +244,7 @@ impl HomeView {
                 &move_intent_conflicts.join("\n\n"),
             )
         });
+        let storage_namespace = crate::session::get_app_dir_path()?.canonicalize()?;
         let mut view = Self {
             storages,
             active_profile,
@@ -442,6 +433,11 @@ impl HomeView {
             startup_recovery_gate: None,
             pending_reconcile_reload: false,
             reconcile_reload_retry_at: None,
+            journal_recovery_dirty: false,
+            journal_recovery_inflight: false,
+            journal_recovery_all_pending: false,
+            pending_journal_reload: false,
+            pending_storage_discovery: false,
             restart_poller: RestartPoller::new(),
             restart_in_flight: std::collections::HashSet::new(),
             attach_after_restart: std::collections::HashSet::new(),
@@ -456,6 +452,7 @@ impl HomeView {
                 super::operations::perform_rename,
             ),
             creation_poller: CreationPoller::new(),
+            pending_creation_completion: None,
             creation_cancel: None,
             on_launch_hooks_ran: HashSet::new(),
             creating_hook_progress: HashMap::new(),
@@ -544,6 +541,7 @@ impl HomeView {
             tool_hotkey_cache: Vec::new(),
             tool_picker_dialog: None,
             file_watch,
+            storage_namespace,
             disk_watch,
             config_watch,
             watcher_config_refresh_count: std::sync::atomic::AtomicU64::new(0),
@@ -658,6 +656,9 @@ impl HomeView {
         // write per broken row, so they sweep the loaded profiles on a worker and never
         // delay the first frame (#3611).
         view.reconcile_poller.request(initial_disk_profiles.clone());
+        if recovery_needed {
+            view.request_journal_recovery(false);
+        }
         // Startup auto-recovery restarts resume-capable sessions whose pane is missing,
         // launching each from its recorded `project_path` and recording the attempt in a
         // boot-scoped ledger that is not retried. It must wait for the sweep above: a row
@@ -702,10 +703,8 @@ impl HomeView {
     pub(in crate::tui) fn reload_storage_only(&mut self) -> anyhow::Result<()> {
         use crate::session::list_profiles;
 
-        let mut all_instances = Vec::new();
-
-        let current_profiles = match list_profiles() {
-            Ok(profiles) => profiles,
+        let (current_profiles, discovery_complete) = match list_profiles() {
+            Ok(profiles) => (profiles, true),
             Err(error) => {
                 tracing::warn!(
                     target: "tui.file_watch",
@@ -714,7 +713,7 @@ impl HomeView {
                 );
                 let mut keys: Vec<String> = self.storages.keys().cloned().collect();
                 keys.sort();
-                keys
+                (keys, false)
             }
         };
 
@@ -736,17 +735,36 @@ impl HomeView {
         // Storage rebuild is unified mode only: single-profile mode keeps the scope set at
         // startup, with only the active profile in memory.
         if self.active_profile.is_none() {
-            for name in &current_profiles {
-                if !self.storages.contains_key(name) {
-                    self.storages
-                        .insert(name.clone(), Storage::new(name, self.file_watch.clone())?);
-                }
+            if current_profiles
+                .iter()
+                .any(|name| !self.storages.contains_key(name))
+            {
+                self.pending_storage_discovery = true;
+                let Some(root) = crate::session::storage::try_acquire_ownership_read()? else {
+                    return Ok(());
+                };
+                let opened = current_profiles
+                    .iter()
+                    .filter(|name| !self.storages.contains_key(*name))
+                    .map(|name| {
+                        Storage::open_with_ownership(name, self.file_watch.clone(), &root)
+                            .map(|storage| (name.clone(), storage))
+                    })
+                    .collect::<anyhow::Result<Vec<_>>>()?;
+                self.storages.extend(opened);
             }
             self.storages.retain(|k, _| current_profiles.contains(k));
         }
+        self.pending_storage_discovery = !discovery_complete;
+        self.request_journal_recovery(false);
+        self.project_loaded_storages()
+    }
 
-        // Collect per-profile state without publishing it, so duplicate detection (#3459)
-        // can run journal-guided repairs before anything reaches the unified map.
+    /// Project authoritative rows without discovering profiles or running recovery.
+    pub(super) fn project_loaded_storages(&mut self) -> anyhow::Result<()> {
+        let mut all_instances = Vec::new();
+
+        // Read all profiles before replacing the current projection.
         type ProfileLoads = Vec<(String, Vec<Instance>, Vec<Group>)>;
         let collect_loads = |storages: &HashMap<String, Storage>,
                              prev: &indexmap::IndexMap<String, Instance>|
@@ -776,12 +794,8 @@ impl HomeView {
             .iter()
             .map(|(name, storage)| (name.as_str(), storage))
             .collect();
-        let outcome = crate::session::reconcile_profile_duplicates(&loads_view, &storages_view);
-        if outcome.repaired {
-            // Durable state changed under lock; reload so exactly one row per
-            // session is published.
-            loads = collect_loads(&self.storages, &self.instances)?;
-        }
+        let outcome =
+            crate::session::storage::inspect_profile_duplicates(&loads_view, &storages_view);
         log_legacy_duplicates_once(&outcome.reports);
         self.legacy_duplicate_reports = outcome.reports;
         if !outcome.conflicts.is_empty() && outcome.conflicts != self.move_intent_conflicts {

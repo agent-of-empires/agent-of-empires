@@ -449,7 +449,7 @@ fn drain_creation_result(view: &mut HomeView) -> Option<String> {
             start.elapsed() < std::time::Duration::from_secs(10),
             "background creation timed out"
         );
-        std::thread::sleep(std::time::Duration::from_millis(10));
+        std::thread::yield_now();
     }
 }
 

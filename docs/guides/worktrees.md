@@ -103,7 +103,7 @@ Git hooks may call AoE. Commands that touch a checkout or branch reserved by the
 
 AoE runs Git with the repository's configured hooks. Its busy checks coordinate AoE commands, not independent Git commands or filesystem edits.
 
-Cancelling creation hides its pending row while the hook stops and cleanup finishes. A purge can remove a session before all cleanup succeeds; recovery retries completed, observed failures without bringing the session back.
+In the TUI, an admitted creation stays **Creating** if another operation delays its final save. You can keep using the TUI while it waits; AoE attaches only after the creation is saved. Cancelling a pending creation hides its row while any running hook stops and background cleanup finishes. A purge can remove a session before all cleanup succeeds; recovery retries completed, observed failures in the background without bringing the session back.
 
 ## Interrupted operations
 

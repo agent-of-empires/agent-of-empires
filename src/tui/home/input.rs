@@ -6815,37 +6815,14 @@ impl HomeView {
         None
     }
 
-    /// Create a session with optional hooks, delegating to the background
-    /// `CreationPoller` when hooks are present, the session is sandboxed, or a worktree
-    /// branch is requested, so a slow `post-checkout` can't freeze the TUI.
+    /// Queue creation after try-only admission.
     pub(super) fn create_session_with_hooks(
         &mut self,
         data: NewSessionData,
         hooks: Option<repo_config::ResolvedHooks>,
     ) -> Option<Action> {
-        let has_hooks = hooks
-            .as_ref()
-            .is_some_and(|h| !h.hooks().on_create.is_empty() || !h.hooks().on_launch.is_empty());
-        let has_worktree = data.worktree_enabled;
-
-        if data.sandbox || has_hooks || has_worktree {
-            self.request_creation(data, hooks);
-            return None;
-        }
-
-        match self.create_session(data) {
-            Ok(session_id) => {
-                self.new_dialog = None;
-                Some(Action::AttachAfterCreate(session_id))
-            }
-            Err(e) => {
-                tracing::error!(target: "tui.input", "Failed to create session: {}", e);
-                if let Some(dialog) = &mut self.new_dialog {
-                    dialog.set_error(e.to_string());
-                }
-                None
-            }
-        }
+        self.request_creation(data, hooks);
+        None
     }
 }
 

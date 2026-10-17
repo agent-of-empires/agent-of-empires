@@ -371,6 +371,10 @@ pub(crate) struct OwnershipGuard {
 }
 
 impl OwnershipGuard {
+    pub(crate) fn is_nonblocking(&self) -> bool {
+        self.nonblocking
+    }
+
     pub(crate) fn app_dir(&self) -> &Path {
         self._held
             .path
@@ -583,7 +587,7 @@ fn lock_save_mutex(lock: &Mutex<()>, nonblocking: bool) -> Result<std::sync::Mut
             Ok(guard) => Ok(guard),
             Err(std::sync::TryLockError::Poisoned(error)) => Ok(error.into_inner()),
             Err(std::sync::TryLockError::WouldBlock) => {
-                anyhow::bail!("Session operation in progress")
+                Err(std::io::Error::from(std::io::ErrorKind::WouldBlock).into())
             }
         }
     } else {
@@ -1436,6 +1440,12 @@ impl Storage {
         Ok(())
     }
 
+    #[cfg(test)]
+    pub(crate) fn with_save_lock_for_test<R>(&self, f: impl FnOnce() -> R) -> R {
+        let _held = self.save_lock.lock().unwrap();
+        f()
+    }
+
     /// Whether some holder currently has `instance_id`'s lifecycle lock.
     #[cfg(test)]
     pub(crate) fn instance_lifecycle_lock_is_held_for_test(&self, instance_id: &str) -> bool {
@@ -1726,7 +1736,7 @@ impl Storage {
             );
             return self
                 .try_update_scoped(ownership, intent, f)?
-                .context("Session operation in progress");
+                .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::WouldBlock).into());
         }
         ownership.verify()?;
         self.verify_profile_available()?;
@@ -2589,6 +2599,7 @@ pub(crate) struct ReconciliationOutcome {
     /// Duplicates that lack arbitration evidence and remain excluded.
     pub(crate) reports: Vec<DuplicateIdReport>,
     pub(crate) conflicts: Vec<String>,
+    pub(crate) recovery_needed: bool,
 }
 
 /// One ambiguous copy of a duplicated session id.
@@ -2719,11 +2730,26 @@ fn entry_age(entry: &super::move_journal::MoveJournalEntry) -> std::time::Durati
     std::time::Duration::from_millis(now_ms.saturating_sub(entry.created_at_epoch_ms))
 }
 
+pub(crate) fn inspect_profile_duplicates(
+    loaded: &[(&str, &[Instance])],
+    storages: &[(&str, &Storage)],
+) -> ReconciliationOutcome {
+    reconcile_profile_duplicates_inner(loaded, storages, false)
+}
+
 /// Detect duplicates across the loaded profiles, run journal-guided repair for the cases
 /// with durable evidence, and return reports for whatever remains ambiguous.
 pub(crate) fn reconcile_profile_duplicates(
     loaded: &[(&str, &[Instance])],
     storages: &[(&str, &Storage)],
+) -> ReconciliationOutcome {
+    reconcile_profile_duplicates_inner(loaded, storages, true)
+}
+
+fn reconcile_profile_duplicates_inner(
+    loaded: &[(&str, &[Instance])],
+    storages: &[(&str, &Storage)],
+    recover: bool,
 ) -> ReconciliationOutcome {
     let mut outcome = ReconciliationOutcome::default();
     // Normalize to a name-sorted view so report and copy ordering are
@@ -2732,6 +2758,7 @@ pub(crate) fn reconcile_profile_duplicates(
     normalized.sort_by(|left, right| left.0.cmp(right.0));
     let duplicated = !detect_duplicate_ids(normalized.iter().copied()).is_empty();
     let scan = super::move_journal::scan();
+    outcome.recovery_needed = !scan.entries.is_empty() || !scan.unreadable_dirs.is_empty();
     let mut opaque_failure = !scan.unreadable_dirs.is_empty();
     for (dir, error) in scan.unreadable_dirs {
         outcome.conflicts.push(format!(
@@ -2823,6 +2850,25 @@ pub(crate) fn reconcile_profile_duplicates(
                     ids = %entry.ids.join(","),
                     "expired move journal entry is insufficient evidence for arbitration; duplicates stay surfaced"
                 );
+                continue;
+            }
+            if !recover {
+                let reason = match &entry.authority {
+                    super::move_journal::MoveAuthority::Resource { intent } => {
+                        intent.conflict.as_deref()
+                    }
+                    super::move_journal::MoveAuthority::Cleanup { conflict, .. } => {
+                        conflict.as_deref()
+                    }
+                    _ => None,
+                };
+                if let Some(reason) = reason {
+                    outcome.conflicts.push(format!(
+                        "Move intent conflict at {}: {reason}; resources were preserved. Inspect with `aoe intents list`",
+                        path.display()
+                    ));
+                }
+                blocked_ids.extend(entry.ids.iter().cloned());
                 continue;
             }
             match repair_journal_entry(&mut entry, storages, &path) {
