@@ -43,6 +43,58 @@ test("files pane renders a Markdown file in a scratch session", async ({ page, s
   await expect(page.getByRole("listitem").filter({ hasText: "step one" }).first()).toBeVisible();
 });
 
+test("diff pane in a non-git session stays closed until opened, then shows one neutral message", async ({
+  page,
+  spawnServe,
+}) => {
+  // #4574: the git case, where Diff auto-opens, is the diff viewer test below.
+  const serve = await spawnServe({
+    seedFn: seedSessionViaAoeAdd({ title: "rp-non-git", subdir: "plain-project", git: false }),
+  });
+  const [session] = await listSessions(serve.baseUrl);
+  expect(session!.outside_repository).toBe(true);
+  const storedTabs = () =>
+    page.evaluate((id) => {
+      const store = JSON.parse(localStorage.getItem("aoe-pane-layout-v2") ?? "{}");
+      const layout = store.sessions?.[id];
+      return layout ? [...layout.right, ...layout.bottom].flatMap((g: { tabs: string[] }) => g.tabs) : null;
+    }, session!.id);
+
+  // Hold the browser's first Session list so the unknown state is observable: a
+  // deep link mounts the layout before that list arrives.
+  let release!: () => void;
+  const gate = new Promise<void>((r) => (release = r));
+  let held = false;
+  await page.route("**/api/sessions", async (route) => {
+    if (!held && route.request().method() === "GET") {
+      held = true;
+      await gate;
+    }
+    await route.continue();
+  });
+  const diffFilesRequested = page.waitForRequest((r) => r.url().includes(`/sessions/${session!.id}/diff/files`));
+  await page.goto(`${serve.baseUrl}/session/${encodeURIComponent(session!.id)}`);
+  // The diff-files fetch starts from an effect, so the layout effects of that
+  // commit have run: an unknown Session must leave nothing pinned.
+  await diffFilesRequested;
+  expect(held).toBe(true);
+  expect(await storedTabs()).toBeNull();
+  const diffToggle = page.getByTestId("pane-toggle-diff").first();
+  await expect(diffToggle).toHaveAttribute("aria-pressed", "false");
+
+  release();
+  await expect.poll(storedTabs).not.toBeNull();
+  const pinned = (await storedTabs())!;
+  expect(pinned.some((t) => t.startsWith("terminal:"))).toBe(true);
+  expect(pinned).not.toContain("diff");
+  await expect(diffToggle).toHaveAttribute("aria-pressed", "false");
+
+  await diffToggle.click();
+  const neutral = `The working directory (${String(session!.project_path)}) isn't a git repository, so there's nothing to compare.`;
+  await expect(page.getByText(neutral, { exact: true }).first()).toBeVisible({ timeout: 10_000 });
+  await expect(page.getByText(/No changes vs|Could not open repository/)).toHaveCount(0);
+});
+
 test("files pane numbers the lines of a source file", async ({ page, spawnServe }) => {
   // #4003: the file pane renders through the shared diff renderer, so it numbers lines like the diff pane.
   const serve = await spawnServe({
