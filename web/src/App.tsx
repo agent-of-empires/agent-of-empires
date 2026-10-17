@@ -1773,7 +1773,8 @@ function AppContent({
           }
           setShowSessionWizard(false);
           setShowHelp(false);
-          if (showSettings) handleCloseSettings();
+          // Settings dialogs handle Escape after this capture-phase shortcut.
+          if (showSettings && !document.querySelector('[aria-modal="true"]')) handleCloseSettings();
           setShowAbout(false);
           setSelectedFile(null);
         },
