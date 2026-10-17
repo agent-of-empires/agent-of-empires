@@ -28,6 +28,11 @@ Invariants worth knowing before touching this code:
 
 Trash is the reversible middle state: a delete moves the session there by default (`session.delete_to_trash`), keeping its transcript, worktree, branch, and container until it is restored, purged, or auto-purged after `session.trash_retention_minutes`. Retention is enforced by the daemon (a startup sweep, then one every tenth of the shortest window, between a minute and an hour), so without one, expired trash waits for the next daemon start or a manual purge. When the daemon permanently deletes a structured session it sends a best-effort `session/delete` (2s timeout) so adapters that implement it can release their own state, then proceeds with cancel, SIGTERM, and on-disk cleanup. CLI purges stop any registered detached runner before deleting its local transcript.
 
+If native teardown fails during Trash, only the failed attempt's exact reservation is
+rolled back: newly trashed rows return to their prior bucket, already-trashed rows keep
+their trash identity, and resources/native evidence remain. Consumers adopt durable state
+without overwriting a newer lifecycle generation.
+
 Permanent purge records intent before destruction. Once `TeardownStarted` is durable,
 errors retain the `Deleting` row, exact lifecycle generation, journal and runner fence
 until recovery can prove owned process and native-runtime settlement. Expired leases

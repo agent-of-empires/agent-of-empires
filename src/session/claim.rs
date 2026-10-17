@@ -195,6 +195,23 @@ pub(crate) fn finalize_restore_commit(
     RestoreCommit::Committed
 }
 
+pub(crate) fn rollback_trash_reservation(
+    all: &mut [Instance],
+    id: &str,
+    generation: u64,
+    was_trashed: bool,
+) {
+    if let Some(row) = all.iter_mut().find(|instance| {
+        instance.id == id
+            && instance.lifecycle_reservation_is_owned(LifecycleOperation::Trash, generation)
+    }) {
+        if !was_trashed {
+            row.untrash();
+        }
+        row.release_lifecycle_reservation_if_owned(LifecycleOperation::Trash, generation);
+    }
+}
+
 pub(crate) fn release_trash_reservation(all: &mut [Instance], id: &str, generation: u64) {
     if let Some(row) = all.iter_mut().find(|instance| instance.id == id) {
         row.release_lifecycle_reservation_if_owned(LifecycleOperation::Trash, generation);
@@ -244,6 +261,49 @@ mod tests {
         crate::session::trash::TrashRelocation {
             new_project_path: "/tmp/.aoe-trash/session".to_string(),
             pre_trash_project_path: Some("/tmp/worktree".to_string()),
+        }
+    }
+
+    #[test]
+    fn failed_trash_rollback_cannot_change_a_successor_claim() {
+        for operation in [
+            LifecycleOperation::Restore,
+            LifecycleOperation::Trash,
+            LifecycleOperation::Purge,
+        ] {
+            for was_trashed in [false, true] {
+                let mut row = trashed("session");
+                let old_generation = row
+                    .try_acquire_lifecycle_reservation(
+                        LifecycleOperation::Trash,
+                        Instance::LIFECYCLE_RESERVATION_TTL,
+                        Utc::now(),
+                    )
+                    .unwrap();
+                row.release_lifecycle_reservation_if_owned(
+                    LifecycleOperation::Trash,
+                    old_generation,
+                );
+                row.untrash();
+                let generation = row
+                    .try_acquire_lifecycle_reservation(
+                        operation,
+                        Instance::LIFECYCLE_RESERVATION_TTL,
+                        Utc::now(),
+                    )
+                    .unwrap();
+                if operation != LifecycleOperation::Restore {
+                    row.trash();
+                }
+                if operation == LifecycleOperation::Purge {
+                    row.status = crate::session::Status::Deleting;
+                }
+                let before = serde_json::to_value(&row).unwrap();
+                let mut rows = vec![row];
+                rollback_trash_reservation(&mut rows, "session", old_generation, was_trashed);
+                assert_eq!(serde_json::to_value(&rows[0]).unwrap(), before);
+                assert!(rows[0].lifecycle_reservation_is_owned(operation, generation));
+            }
         }
     }
 

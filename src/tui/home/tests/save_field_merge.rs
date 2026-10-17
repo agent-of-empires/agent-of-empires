@@ -58,6 +58,134 @@ fn delete_action_does_not_wait_for_lifecycle_flock() {
 
 #[test]
 #[serial]
+fn failed_native_trash_result_adopts_rollback_without_downgrading_newer_cache() {
+    use crate::session::{LifecycleOperation, LifecycleReservation};
+    use crate::tui::trash_poller::TrashPoller;
+    use std::sync::mpsc;
+    use std::time::{Duration, Instant};
+
+    for was_trashed in [false, true] {
+        for newer_cache in [false, true] {
+            let (temp, _home, mut view, id) =
+                boot_view_with_one_session("native-trash", "/tmp/native-trash");
+            let project = temp.path().join("project");
+            std::fs::create_dir(&project).unwrap();
+            std::fs::write(project.join("sentinel"), b"retained project").unwrap();
+            let runtime = crate::process::prime::PrimeRuntime::new(
+                "/bin/false".into(),
+                temp.path().into(),
+                None,
+            )
+            .unwrap();
+            runtime.prepare().unwrap();
+            runtime.adopt_prepared().unwrap();
+            std::fs::write(runtime.directory.join("frontend.identity"), b"invalid").unwrap();
+            let proof_before = std::fs::read(runtime.proof_path.as_ref().unwrap()).unwrap();
+            let storage = Storage::open_unwatched("test").unwrap();
+            let durable = storage
+                .update(|rows, _| {
+                    let row = rows.iter_mut().find(|row| row.id == id).unwrap();
+                    row.source_profile = "test".into();
+                    row.project_path = project.to_string_lossy().into_owned();
+                    row.status = Status::Running;
+                    row.view = crate::session::View::Terminal;
+                    row.active_execution = Some(crate::session::test_support::prime_execution(
+                        &runtime, &project,
+                    ));
+                    if was_trashed {
+                        row.trash();
+                    }
+                    Ok(row.clone())
+                })
+                .unwrap();
+            let prior_trash = (durable.trashed_at, durable.trash_lifecycle_id.clone());
+            let mut cached = durable;
+            // Pre-admission trash state must come from disk, not this stale cache.
+            cached.untrash();
+            view.instances.insert(id.clone(), cached);
+            let (ready_tx, ready_rx) = mpsc::channel();
+            let (release_tx, release_rx) = mpsc::channel();
+            view.trash_poller = TrashPoller::with_handler_for_test(move |request| {
+                let result = crate::session::trash::perform_trash(&request);
+                assert!(result.relocate_warning.is_some());
+                ready_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+                result
+            });
+            view.trash_session_by_id(&id);
+            ready_rx.recv_timeout(Duration::from_secs(3)).unwrap();
+            let durable = storage
+                .load()
+                .unwrap()
+                .into_iter()
+                .find(|row| row.id == id)
+                .unwrap();
+            let generation = durable.lifecycle_generation;
+            assert_eq!(
+                (durable.trashed_at, durable.trash_lifecycle_id.clone()),
+                prior_trash
+            );
+            assert!(durable.lifecycle_reservation.is_none());
+            if newer_cache {
+                let cached = view.instances.get_mut(&id).unwrap();
+                cached.lifecycle_generation = generation + 1;
+                cached.lifecycle_reservation = Some(LifecycleReservation {
+                    op: LifecycleOperation::Purge,
+                    generation: generation + 1,
+                    at: Utc::now(),
+                });
+                cached.status = Status::Deleting;
+                cached.untrash();
+                cached.trash();
+            }
+            let expected = if newer_cache {
+                view.get_instance(&id).unwrap().clone()
+            } else {
+                durable
+            };
+            release_tx.send(()).unwrap();
+            let deadline = Instant::now() + Duration::from_secs(3);
+            while view.trash_poller.is_pending(&id) {
+                view.apply_trash_results();
+                assert!(Instant::now() < deadline, "trash result was not delivered");
+                std::thread::yield_now();
+            }
+            let cached = view.get_instance(&id).unwrap();
+            assert_eq!(cached.status, expected.status);
+            assert_eq!(cached.lifecycle_generation, expected.lifecycle_generation);
+            assert_eq!(cached.lifecycle_reservation, expected.lifecycle_reservation);
+            assert_eq!(cached.trashed_at, expected.trashed_at);
+            assert_eq!(cached.trash_lifecycle_id, expected.trash_lifecycle_id);
+            if !newer_cache {
+                view.save().unwrap();
+                let saved = storage
+                    .load()
+                    .unwrap()
+                    .into_iter()
+                    .find(|row| row.id == id)
+                    .unwrap();
+                assert_eq!((saved.trashed_at, saved.trash_lifecycle_id), prior_trash);
+                assert_eq!(saved.lifecycle_generation, generation);
+                assert!(saved.lifecycle_reservation.is_none());
+            }
+            assert_eq!(
+                std::fs::read(project.join("sentinel")).unwrap(),
+                b"retained project"
+            );
+            assert_eq!(
+                std::fs::read(runtime.directory.join("frontend.identity")).unwrap(),
+                b"invalid"
+            );
+            assert_eq!(
+                std::fs::read(runtime.proof_path.as_ref().unwrap()).unwrap(),
+                proof_before
+            );
+        }
+    }
+}
+
+#[test]
+#[serial]
 fn queued_trash_result_cannot_downgrade_a_failed_irreversible_purge() {
     use crate::session::deletion::{DeletionRequest, PurgeReservation, PurgeTransaction};
     use crate::session::LifecycleOperation;
@@ -104,6 +232,7 @@ fn queued_trash_result_cannot_downgrade_a_failed_irreversible_purge() {
             session_id: id.clone(),
             generation: trashed.lifecycle_generation,
             instance: trashed,
+            was_trashed: false,
         });
         ready_rx.recv_timeout(Duration::from_secs(3)).unwrap();
         let current = storage.load().unwrap().remove(0);

@@ -261,10 +261,16 @@ fn parse_process_stat(bytes: &[u8]) -> anyhow::Result<(bool, u32)> {
 }
 
 fn ensure_procfs_census_complete(mounts: &str) -> anyhow::Result<()> {
-    let mount = mounts
+    let mut proc_mounts = mounts
         .lines()
-        .find(|line| line.split_whitespace().nth(4) == Some("/proc"))
+        .filter(|line| line.split_whitespace().nth(4) == Some("/proc"));
+    let mount = proc_mounts
+        .next()
         .context("process namespace mount identity unavailable")?;
+    anyhow::ensure!(
+        proc_mounts.next().is_none(),
+        "process namespace has ambiguous procfs mounts"
+    );
     let (vfs, filesystem) = mount.split_once(" - ").context("invalid process mount")?;
     anyhow::ensure!(
         filesystem.split_whitespace().next() == Some("proc"),
@@ -936,14 +942,37 @@ mod tests {
     }
 
     #[test]
-    fn group_census_rejects_hidden_proc_mounts() {
-        let visible = "1 2 0:3 / /proc rw,nosuid,nodev,noexec,relatime - proc proc rw,hidepid=0";
-        assert!(ensure_procfs_census_complete(visible).is_ok());
-        for hidden in [
-            "1 2 0:3 / /proc rw,nosuid,hidepid=2 - proc proc rw",
-            "1 2 0:3 / /proc rw,nosuid - proc proc rw,hidepid=invisible",
+    fn group_census_requires_unambiguous_visible_proc_mount() {
+        let visible = "10 1 0:3 / /proc rw,nosuid shared:1 - proc proc rw,hidepid=0";
+        let hidden = "11 10 0:4 / /proc rw - proc proc rw,hidepid=2";
+        let unrelated = "12 1 0:5 / /sys rw - sysfs sysfs rw";
+        for (mounts, accepted) in [
+            (format!("{visible}\n"), true),
+            ("10 1 0:3 / /proc rw - proc proc rw\n".into(), true),
+            (format!("{hidden}\n"), false),
+            (
+                "10 1 0:3 / /proc rw,hidepid=invisible - proc proc rw\n".into(),
+                false,
+            ),
+            (format!("{unrelated}\n"), false),
+            ("10 1 0:3 / /proc rw - tmpfs tmpfs rw\n".into(), false),
+            (format!("{visible}\n{hidden}\n"), false),
+            (format!("{hidden}\n{visible}\n"), false),
+            (
+                format!("{visible}\n11 10 0:4 / /proc rw - proc proc rw,hidepid=0\n"),
+                false,
+            ),
+            (
+                format!("{hidden}\n12 11 0:5 / /proc rw - proc proc rw,hidepid=2\n"),
+                false,
+            ),
+            (format!("{unrelated}\n{visible}\n"), true),
         ] {
-            assert!(ensure_procfs_census_complete(hidden).is_err());
+            assert_eq!(
+                ensure_procfs_census_complete(&mounts).is_ok(),
+                accepted,
+                "{mounts}"
+            );
         }
     }
 

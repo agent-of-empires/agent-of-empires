@@ -43,6 +43,34 @@ mv -f -- "$tmp" "$identity" || exit 1
 trap - EXIT HUP INT TERM
 exec "$@""#;
 
+macro_rules! procfs_census_guard {
+    () => {
+        r#"ensure_procfs_census_complete() {
+    local mount separator options
+    local -a proc_fields=() fields=()
+    while IFS= read -r mount; do
+        read -r -a fields <<< "$mount"
+        [[ ${fields[4]} == /proc ]] || continue
+        [[ ${#proc_fields[@]} == 0 ]] || return 1
+        proc_fields=("${fields[@]}")
+    done
+    [[ ${#proc_fields[@]} -gt 0 ]] || return 1
+    separator=0
+    while [[ $separator -lt ${#proc_fields[@]} && ${proc_fields[$separator]} != - ]]; do
+        ((separator += 1))
+    done
+    [[ ${proc_fields[$((separator + 1))]} == proc ]] || return 1
+    for options in "${proc_fields[5]}" "${proc_fields[$((separator + 3))]}"; do
+        case ",$options," in
+            *,hidepid=0,*) ;;
+            *,hidepid=*,*) return 1 ;;
+        esac
+    done
+}
+"#
+    };
+}
+
 const PRIME_GUEST_CONTROL: &str = include_str!("../../assets/prime-control.py");
 pub(crate) const PREPARED_RUNTIME_ENV: &str = "AOE_PRIME_RUNTIME_PREPARED";
 
@@ -662,7 +690,9 @@ impl PrimeRuntime {
     ) -> Result<Vec<crate::process::PrimeProcessIdentity>> {
         let marker = format!("TMPDIR={}", self.directory.display());
         if let Some(container) = &self.container {
-            let script = r#"marker=$1
+            let script = concat!(
+                procfs_census_guard!(),
+                r#"marker=$1
 socket=$2
 known=$3
 seen=$'\n'
@@ -685,25 +715,7 @@ process_executing() {
     return 2
 }
 [[ -r /proc/self/stat ]] || exit 1
-proc_fields=()
-while IFS= read -r mount; do
-    read -r -a fields <<< "$mount"
-    [[ ${fields[4]} == /proc ]] || continue
-    proc_fields=("${fields[@]}")
-    break
-done < /proc/self/mountinfo
-[[ ${#proc_fields[@]} -gt 0 ]] || exit 1
-separator=0
-while [[ $separator -lt ${#proc_fields[@]} && ${proc_fields[$separator]} != - ]]; do
-    ((separator += 1))
-done
-[[ ${proc_fields[$((separator + 1))]} == proc ]] || exit 1
-for options in "${proc_fields[5]}" "${proc_fields[$((separator + 3))]}"; do
-    case ",$options," in
-        *,hidepid=0,*) ;;
-        *,hidepid=*,*) exit 1 ;;
-    esac
-done
+ensure_procfs_census_complete < /proc/self/mountinfo || exit 1
 for directory in /proc/[0-9]*; do
     pid=${directory#/proc/}
     [[ $pid != $BASHPID ]] || continue
@@ -785,7 +797,8 @@ for row in "${rows[@]}"; do
         *) exit 1 ;;
     esac
     printf '%s\t1\n' "$row"
-done"#;
+done"#
+            );
             let known_wire = known
                 .iter()
                 .fold(String::from("\n"), |mut value, identity| {
@@ -1426,6 +1439,56 @@ pub async fn run(args: PrimeRunnerArgs) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn guest_census_requires_unambiguous_visible_proc_mount() {
+        let visible = "10 1 0:3 / /proc rw,nosuid shared:1 - proc proc rw,hidepid=0";
+        let hidden = "11 10 0:4 / /proc rw - proc proc rw,hidepid=2";
+        let unrelated = "12 1 0:5 / /sys rw - sysfs sysfs rw";
+        for (mounts, accepted) in [
+            (format!("{visible}\n"), true),
+            ("10 1 0:3 / /proc rw - proc proc rw\n".into(), true),
+            (format!("{hidden}\n"), false),
+            (
+                "10 1 0:3 / /proc rw,hidepid=invisible - proc proc rw\n".into(),
+                false,
+            ),
+            (format!("{unrelated}\n"), false),
+            ("10 1 0:3 / /proc rw - tmpfs tmpfs rw\n".into(), false),
+            (format!("{visible}\n{hidden}\n"), false),
+            (format!("{hidden}\n{visible}\n"), false),
+            (
+                format!("{visible}\n11 10 0:4 / /proc rw - proc proc rw,hidepid=0\n"),
+                false,
+            ),
+            (
+                format!("{hidden}\n12 11 0:5 / /proc rw - proc proc rw,hidepid=2\n"),
+                false,
+            ),
+            (format!("{unrelated}\n{visible}\n"), true),
+        ] {
+            let fixture = tempfile::NamedTempFile::new().unwrap();
+            std::fs::write(fixture.path(), &mounts).unwrap();
+            let output = Command::new("bash")
+                .env_remove("BASH_ENV")
+                .args([
+                    "--noprofile",
+                    "--norc",
+                    "-c",
+                    concat!(procfs_census_guard!(), "\nensure_procfs_census_complete"),
+                ])
+                .stdin(Stdio::from(std::fs::File::open(fixture.path()).unwrap()))
+                .output()
+                .unwrap();
+            assert_eq!(
+                output.status.success(),
+                accepted,
+                "{mounts}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(output.stdout.is_empty());
+        }
+    }
 
     #[test]
     #[serial_test::serial]

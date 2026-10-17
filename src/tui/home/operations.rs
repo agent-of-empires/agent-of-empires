@@ -2040,22 +2040,25 @@ impl HomeView {
                         chrono::Utc::now(),
                     )
                     .map_err(anyhow::Error::new)?;
+                let was_trashed = stored.is_trashed();
                 stored.trash();
                 Ok((
                     generation,
+                    was_trashed,
                     stored.lifecycle_reservation.clone(),
                     stored.trashed_at,
                     stored.trash_lifecycle_id.clone(),
                 ))
             })
         })();
-        let (generation, reservation, trashed_at, trash_lifecycle_id) = match acquisition {
-            Ok(acquired) => acquired,
-            Err(error) => {
-                tracing::warn!(target: "tui.session", session = %id, "trash failed: {error}");
-                return;
-            }
-        };
+        let (generation, was_trashed, reservation, trashed_at, trash_lifecycle_id) =
+            match acquisition {
+                Ok(acquired) => acquired,
+                Err(error) => {
+                    tracing::warn!(target: "tui.session", session = %id, "trash failed: {error}");
+                    return;
+                }
+            };
 
         // Copy the durable stamp so later lifecycle checks match the stored row.
         request_instance.trashed_at = trashed_at;
@@ -2073,6 +2076,7 @@ impl HomeView {
                 session_id: id.to_string(),
                 instance: request_instance,
                 generation,
+                was_trashed,
             });
         self.rebuild_flat_items();
         self.cursor = self.cursor.min(self.flat_items.len().saturating_sub(1));

@@ -106,19 +106,12 @@ pub async fn run(profile: &str, args: RemoveArgs) -> Result<()> {
         })?;
         if let Err(error) = inst.kill_locked(&storage) {
             let rollback = storage.update(|all_instances, _groups| {
-                if let Some(stored) = all_instances.iter_mut().find(|row| row.id == removed_id) {
-                    if stored
-                        .lifecycle_reservation_is_owned(LifecycleOperation::Trash, trash_generation)
-                    {
-                        if !was_trashed {
-                            stored.untrash();
-                        }
-                        stored.release_lifecycle_reservation_if_owned(
-                            LifecycleOperation::Trash,
-                            trash_generation,
-                        );
-                    }
-                }
+                crate::session::claim::rollback_trash_reservation(
+                    all_instances,
+                    &removed_id,
+                    trash_generation,
+                    was_trashed,
+                );
                 Ok(())
             });
             return match rollback {

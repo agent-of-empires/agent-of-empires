@@ -688,15 +688,7 @@ fn deletion_inventory(
     let registry =
         crate::process::worker_registry::acquire_profile_deletion_registry_guards(profile, &ids)?;
     let mut consumable = Vec::new();
-    for row in storage.load()? {
-        if let Some(runtime) = row.prime_runtime() {
-            runtime.cleanup()?;
-        }
-    }
     for (path, entry) in &journals {
-        if let Some(runtime) = entry.instance.prime_runtime() {
-            runtime.cleanup()?;
-        }
         match entry.phase {
             LifecyclePhase::Abandoned => consumable.push(path),
             LifecyclePhase::RowRemoved | LifecyclePhase::Kept
@@ -709,6 +701,16 @@ fn deletion_inventory(
                 anyhow::bail!("profile has retained session resources");
             }
             _ => anyhow::bail!("profile has a pending session lifecycle operation"),
+        }
+    }
+    for row in storage.load()? {
+        if let Some(runtime) = row.prime_runtime() {
+            runtime.cleanup()?;
+        }
+    }
+    for (_, entry) in &journals {
+        if let Some(runtime) = entry.instance.prime_runtime() {
+            runtime.cleanup()?;
         }
     }
     for path in consumable {
@@ -1578,54 +1580,115 @@ mod tests {
 
     #[test]
     #[serial]
-    fn profile_delete_validates_all_journals_before_consuming_terminal_authority() {
-        let temp = tempfile::tempdir().unwrap();
-        let _home = crate::session::test_support::isolate_app_dir_at(temp.path());
-        crate::session::create_profile("keeper").unwrap();
-        crate::session::create_profile("victim").unwrap();
-        let storage = Storage::open_unwatched("victim").unwrap();
-        let kept = temp.path().join("kept-terminal");
-        fs::create_dir(&kept).unwrap();
-        let mut row = Instance::new("terminal", kept.to_str().unwrap());
-        row.id = "terminal".into();
-        row.source_profile = "victim".into();
-        row.scratch = true;
-        let terminal = LifecycleJournalEntry::deletion(
-            row,
-            Status::Deleting,
-            storage.sessions_path().to_path_buf(),
-            lifecycle_journal::LifecycleDeletionOptions {
-                generation: 10,
-                delete_worktree: false,
-                delete_branch: false,
-                delete_sandbox: false,
-                force_delete: false,
-                detach_hooks: true,
-                keep_scratch: true,
-                purge_acp_transcript: false,
-            },
-        )
-        .with_phase(LifecyclePhase::RowRemoved)
-        .with_kept_resources(vec![format!(
-            "Scratch directory kept at: {}",
-            kept.display()
-        )]);
-        let terminal_path = lifecycle_journal::record(&terminal).unwrap();
-        let mut older = terminal
-            .with_phase(LifecyclePhase::TeardownStarted)
-            .with_kept_resources(Vec::new());
-        older.generation = 9;
-        older.instance.lifecycle_generation = 9;
-        if let Some(reservation) = older.instance.lifecycle_reservation.as_mut() {
-            reservation.generation = 9;
-        }
-        older.keep_scratch = false;
-        let older_path = lifecycle_journal::record(&older).unwrap();
+    fn profile_delete_validates_all_journals_before_native_cleanup_or_consumption() {
+        for stored_runtime in [false, true] {
+            for phase in [LifecyclePhase::Kept, LifecyclePhase::TeardownStarted] {
+                let temp = tempfile::tempdir().unwrap();
+                let _home = crate::session::test_support::isolate_app_dir_at(temp.path());
+                crate::session::create_profile("keeper").unwrap();
+                crate::session::create_profile("victim").unwrap();
+                let storage = Storage::open_unwatched("victim").unwrap();
+                let kept = temp.path().join("kept-terminal");
+                fs::create_dir(&kept).unwrap();
+                fs::write(kept.join("sentinel"), b"retained scratch").unwrap();
+                let runtime = crate::process::prime::PrimeRuntime::new(
+                    "/bin/false".into(),
+                    temp.path().into(),
+                    None,
+                )
+                .unwrap();
+                runtime.prepare().unwrap();
+                runtime.adopt_prepared().unwrap();
+                let proof_path = runtime.proof_path.as_ref().unwrap();
+                // Settlement may finish before runtime-directory disposal.
+                let mut proof: serde_json::Value =
+                    serde_json::from_slice(&fs::read(proof_path).unwrap()).unwrap();
+                proof["settled"] = serde_json::json!(true);
+                fs::write(proof_path, serde_json::to_vec(&proof).unwrap()).unwrap();
+                let proof_before = fs::read(proof_path).unwrap();
+                let sentinel = runtime.directory.join("sentinel");
+                fs::write(&sentinel, b"retained native runtime").unwrap();
+                let mut native = Instance::new("native", temp.path().to_str().unwrap());
+                native.id = "aaa-native".into();
+                native.source_profile = "victim".into();
+                native.active_execution = Some(crate::session::test_support::prime_execution(
+                    &runtime,
+                    temp.path(),
+                ));
+                storage
+                    .update(|rows, _| {
+                        if stored_runtime {
+                            rows.push(native.clone());
+                        }
+                        Ok(())
+                    })
+                    .unwrap();
+                let rows_before = serde_json::to_value(storage.load().unwrap()).unwrap();
+                let journal_entry = |row, generation| {
+                    LifecycleJournalEntry::deletion(
+                        row,
+                        Status::Deleting,
+                        storage.sessions_path().to_path_buf(),
+                        lifecycle_journal::LifecycleDeletionOptions {
+                            generation,
+                            delete_worktree: false,
+                            delete_branch: false,
+                            delete_sandbox: false,
+                            force_delete: false,
+                            detach_hooks: true,
+                            keep_scratch: true,
+                            purge_acp_transcript: false,
+                        },
+                    )
+                };
+                let earlier = journal_entry(native, 1).with_phase(LifecyclePhase::RowRemoved);
+                let earlier_path = lifecycle_journal::record(&earlier).unwrap();
+                let mut blocked = Instance::new("blocked", kept.to_str().unwrap());
+                blocked.id = "zzz-blocked".into();
+                blocked.source_profile = "victim".into();
+                blocked.scratch = true;
+                let blocked = journal_entry(blocked, 2)
+                    .with_phase(phase)
+                    .with_kept_resources(if phase == LifecyclePhase::Kept {
+                        vec![format!("Scratch directory kept at: {}", kept.display())]
+                    } else {
+                        Vec::new()
+                    });
+                let blocked_path = lifecycle_journal::record(&blocked).unwrap();
+                let journals_before = [
+                    fs::read(&earlier_path).unwrap(),
+                    fs::read(&blocked_path).unwrap(),
+                ];
 
-        assert!(crate::session::delete_profile("victim").is_err());
-        assert!(terminal_path.exists());
-        assert!(older_path.exists());
-        assert!(kept.exists());
+                let error = crate::session::delete_profile("victim").unwrap_err();
+
+                assert!(
+                    format!("{error:#}").contains(if phase == LifecyclePhase::Kept {
+                        "retained session resources"
+                    } else {
+                        "pending session lifecycle operation"
+                    })
+                );
+                assert!(crate::session::get_profile_dir_path("victim")
+                    .unwrap()
+                    .is_dir());
+                assert_eq!(
+                    serde_json::to_value(storage.load().unwrap()).unwrap(),
+                    rows_before
+                );
+                assert_eq!(fs::read(&sentinel).unwrap(), b"retained native runtime");
+                assert_eq!(fs::read(proof_path).unwrap(), proof_before);
+                assert_eq!(
+                    fs::read(kept.join("sentinel")).unwrap(),
+                    b"retained scratch"
+                );
+                assert_eq!(fs::read(&earlier_path).unwrap(), journals_before[0]);
+                assert_eq!(fs::read(&blocked_path).unwrap(), journals_before[1]);
+                // Settlement alone must not dispose of a refused deletion's runtime.
+                runtime.cleanup().unwrap();
+                assert!(!runtime.directory.exists());
+            }
+        }
     }
 
     #[test]

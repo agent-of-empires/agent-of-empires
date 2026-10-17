@@ -50,6 +50,122 @@ fn build_rename_test_state(
 
 #[tokio::test]
 #[serial_test::serial]
+async fn trash_native_failure_adopts_durable_rollback_and_preserves_newer_cache() {
+    use crate::session::{LifecycleOperation, LifecycleReservation};
+
+    for was_trashed in [false, true] {
+        for (kill_pane, newer_cache) in [(true, false), (false, false), (true, true), (false, true)]
+        {
+            let root = tempfile::tempdir().unwrap();
+            let _home = crate::session::test_support::isolate_app_dir_at(root.path());
+            let project = root.path().join("project");
+            std::fs::create_dir(&project).unwrap();
+            std::fs::write(project.join("sentinel"), b"retained project").unwrap();
+            let runtime = crate::process::prime::PrimeRuntime::new(
+                "/bin/false".into(),
+                root.path().into(),
+                None,
+            )
+            .unwrap();
+            runtime.prepare().unwrap();
+            runtime.adopt_prepared().unwrap();
+            std::fs::write(runtime.directory.join("frontend.identity"), b"invalid").unwrap();
+            let proof_before = std::fs::read(runtime.proof_path.as_ref().unwrap()).unwrap();
+            let mut instance = Instance::new("native-trash", project.to_str().unwrap());
+            instance.source_profile = "default".into();
+            instance.view = crate::session::View::Terminal;
+            instance.status = Status::Running;
+            instance.active_execution = Some(crate::session::test_support::prime_execution(
+                &runtime, &project,
+            ));
+            if was_trashed {
+                instance.trash();
+            }
+            let prior_trash = (instance.trashed_at, instance.trash_lifecycle_id.clone());
+            let id = instance.id.clone();
+            let mut cached = instance.clone();
+            cached.untrash();
+            cached.status = Status::Idle;
+            cached.last_error_check = Some(std::time::Instant::now());
+            let runtime_check = cached.last_error_check;
+            let (storage, state) = build_rename_test_state(vec![instance], vec![cached]);
+            let lifecycle_lock = storage.acquire_instance_lifecycle_lock(&id).unwrap();
+            let request = trash_session(
+                State(state.clone()),
+                Path(id.clone()),
+                Some(Json(TrashSessionBody { kill_pane })),
+            );
+            tokio::pin!(request);
+            assert!(futures_util::poll!(&mut request).is_pending());
+            let newer = if newer_cache {
+                let mut instances = state.instances.write().await;
+                let cached = instances.iter_mut().find(|row| row.id == id).unwrap();
+                cached.lifecycle_generation = 10;
+                cached.lifecycle_reservation = Some(LifecycleReservation {
+                    op: LifecycleOperation::Purge,
+                    generation: 10,
+                    at: chrono::Utc::now(),
+                });
+                cached.status = Status::Deleting;
+                cached.trash();
+                Some(cached.clone())
+            } else {
+                None
+            };
+            drop(lifecycle_lock);
+
+            let response = request.await.into_response();
+
+            assert_eq!(
+                response.status(),
+                if kill_pane {
+                    StatusCode::INTERNAL_SERVER_ERROR
+                } else {
+                    StatusCode::OK
+                }
+            );
+            let durable = storage
+                .load()
+                .unwrap()
+                .into_iter()
+                .find(|row| row.id == id)
+                .unwrap();
+            assert_eq!(durable.is_trashed(), was_trashed || !kill_pane);
+            if was_trashed || kill_pane {
+                assert_eq!(
+                    (durable.trashed_at, durable.trash_lifecycle_id.clone()),
+                    prior_trash
+                );
+            }
+            assert_eq!(durable.lifecycle_generation, 1);
+            assert!(durable.lifecycle_reservation.is_none());
+            let expected = newer.as_ref().unwrap_or(&durable);
+            let instances = state.instances.read().await;
+            let cached = instances.iter().find(|row| row.id == id).unwrap();
+            assert_eq!(cached.status, expected.status);
+            assert_eq!(cached.lifecycle_generation, expected.lifecycle_generation);
+            assert_eq!(cached.lifecycle_reservation, expected.lifecycle_reservation);
+            assert_eq!(cached.trashed_at, expected.trashed_at);
+            assert_eq!(cached.trash_lifecycle_id, expected.trash_lifecycle_id);
+            assert_eq!(cached.last_error_check, runtime_check);
+            assert_eq!(
+                std::fs::read(project.join("sentinel")).unwrap(),
+                b"retained project"
+            );
+            assert_eq!(
+                std::fs::read(runtime.directory.join("frontend.identity")).unwrap(),
+                b"invalid"
+            );
+            assert_eq!(
+                std::fs::read(runtime.proof_path.as_ref().unwrap()).unwrap(),
+                proof_before
+            );
+        }
+    }
+}
+
+#[tokio::test]
+#[serial_test::serial]
 async fn stale_terminal_stop_does_not_recreate_a_renamed_profile() {
     let _home = crate::session::test_support::isolate_app_dir();
     let mut instance = Instance::new("stale-stop", "/tmp/stale-stop");

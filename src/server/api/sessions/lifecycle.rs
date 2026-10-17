@@ -367,6 +367,19 @@ pub async fn update_session_archive(
     (StatusCode::OK, Json(serde_json::json!(response))).into_response()
 }
 
+fn adopt_durable_trash_state(cached: &mut Instance, durable: Instance) {
+    if durable.lifecycle_generation < cached.lifecycle_generation {
+        return;
+    }
+    cached.status = durable.status;
+    cached.trashed_at = durable.trashed_at;
+    cached.trash_lifecycle_id = durable.trash_lifecycle_id;
+    cached.project_path = durable.project_path;
+    cached.pre_trash_project_path = durable.pre_trash_project_path;
+    cached.lifecycle_generation = durable.lifecycle_generation;
+    cached.lifecycle_reservation = durable.lifecycle_reservation;
+}
+
 /// `POST /api/sessions/:id/trash`. The per-instance lifecycle flock is held
 /// from the durable Trash reservation through teardown, relocation, and final commit.
 pub async fn trash_session(
@@ -402,11 +415,11 @@ pub async fn trash_session(
     let reserve_profile = profile.clone();
     let reserve_id = id.clone();
     let file_watch = state.file_watch.clone();
-    let (storage, lifecycle_lock, generation) = match tokio::task::spawn_blocking(
+    let (storage, lifecycle_lock, generation, was_trashed) = match tokio::task::spawn_blocking(
         move || -> anyhow::Result<_> {
             let storage = Storage::open(&reserve_profile, file_watch)?;
             let lifecycle_lock = storage.acquire_instance_lifecycle_lock(&reserve_id)?;
-            let generation = storage.update(|instances, _groups| {
+            let (generation, was_trashed) = storage.update(|instances, _groups| {
                 let Some(instance) = instances
                     .iter_mut()
                     .find(|instance| instance.id == reserve_id)
@@ -420,10 +433,11 @@ pub async fn trash_session(
                         chrono::Utc::now(),
                     )
                     .map_err(anyhow::Error::new)?;
+                let was_trashed = instance.is_trashed();
                 instance.trash();
-                Ok(instance.lifecycle_generation)
+                Ok((instance.lifecycle_generation, was_trashed))
             })?;
-            Ok((storage, lifecycle_lock, generation))
+            Ok((storage, lifecycle_lock, generation, was_trashed))
         },
     )
     .await
@@ -445,8 +459,10 @@ pub async fn trash_session(
         let Some(instance) = instances.iter_mut().find(|instance| instance.id == id) else {
             return crate::server::api::session_gone_after_persist();
         };
-        instance.trash();
-        instance.lifecycle_generation = generation;
+        if instance.lifecycle_generation <= generation {
+            instance.trash();
+            instance.lifecycle_generation = generation;
+        }
     }
 
     if was_structured_view {
@@ -471,8 +487,11 @@ pub async fn trash_session(
             } else {
                 if let Err(error) = instance.kill_all_tmux_sessions_locked(&storage) {
                     let release = storage.update(|instances, _groups| {
-                        crate::session::claim::release_trash_reservation(
-                            instances, &work_id, generation,
+                        crate::session::claim::rollback_trash_reservation(
+                            instances,
+                            &work_id,
+                            generation,
+                            was_trashed,
                         );
                         Ok(())
                     });
@@ -522,14 +541,22 @@ pub async fn trash_session(
     })
     .await;
 
+    let transition = match transition {
+        Ok(result) => result,
+        Err(error) => Err(anyhow::Error::new(error)),
+    };
     let (outcome, durable) = match transition {
-        Ok(Ok(result)) => result,
-        Ok(Err(error)) => {
-            tracing::warn!(target: "http.api.sessions", session = %id, "trash transition failed: {error}");
-            return persist_failed_response();
-        }
+        Ok(result) => result,
         Err(error) => {
-            tracing::warn!(target: "http.api.sessions", session = %id, "trash transition join failed: {error}");
+            tracing::warn!(target: "http.api.sessions", session = %id, "trash transition failed: {error}");
+            if let Ok(Some(durable)) =
+                crate::server::api::load_persisted_instance(&state, &profile, &id).await
+            {
+                let mut instances = state.instances.write().await;
+                if let Some(instance) = instances.iter_mut().find(|instance| instance.id == id) {
+                    adopt_durable_trash_state(instance, durable);
+                }
+            }
             return persist_failed_response();
         }
     };
@@ -549,10 +576,7 @@ pub async fn trash_session(
         let Some(instance) = instances.iter_mut().find(|instance| instance.id == id) else {
             return crate::server::api::session_gone_after_persist();
         };
-        instance.project_path = durable.project_path;
-        instance.pre_trash_project_path = durable.pre_trash_project_path;
-        instance.lifecycle_generation = durable.lifecycle_generation;
-        instance.lifecycle_reservation = durable.lifecycle_reservation;
+        adopt_durable_trash_state(instance, durable);
         SessionResponse::from_instance(instance, crate::claude_settings::read_tui_fullscreen())
     };
     (StatusCode::OK, Json(serde_json::json!(response))).into_response()
