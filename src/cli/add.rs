@@ -311,6 +311,7 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
         let seed = crate::session::fork::terminal_fork_seed(
             parent_ref,
             crate::session::capture::generate_session_uuid(),
+            source.is_sandboxed(),
         )
         .map_err(|denied| {
             let profile = source.effective_profile();

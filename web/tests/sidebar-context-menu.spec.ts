@@ -206,6 +206,7 @@ test.describe("Sidebar Switch view (#2252)", () => {
       ],
     });
     const posted: string[] = [];
+    const bodies: (string | null)[] = [];
     await page.route("**/api/sessions/*/acp/*", (r) => {
       const m = r
         .request()
@@ -213,28 +214,40 @@ test.describe("Sidebar Switch view (#2252)", () => {
         .match(/\/api\/sessions\/([^/]+)\/acp\/(enable|disable)$/);
       if (!m || r.request().method() !== "POST") return r.fulfill({ status: 400 });
       posted.push(`${m[1]}/${m[2]}`);
+      bodies.push(r.request().postData());
       return r.fulfill({ json: { session_id: m[1], view: m[2] === "enable" ? "structured" : "terminal" } });
     });
 
     await openSwitchMenu(page, "Switch sess-1");
     const dialog = page.locator("[data-testid='switch-view-dialog']");
     await expect(dialog).toBeVisible();
+    expect(posted).toEqual([]);
     await page.locator("[data-testid='switch-view-confirm']").click();
     await expect.poll(() => posted).toEqual(["sess-1/disable"]);
     await expect(dialog).toBeHidden();
 
     await rows(page).filter({ hasText: "Switch sess-2" }).first().click({ button: "right" });
+    await expect(page.locator("[data-testid='sidebar-context-menu-switch-view']")).toHaveText(
+      "Switch to structured view",
+    );
     await page.locator("[data-testid='sidebar-context-menu-switch-view']").click();
+    await expect(dialog).toBeVisible();
+    expect(posted).toEqual(["sess-1/disable"]);
     await page.locator("[data-testid='switch-view-confirm']").click();
     await expect.poll(() => posted).toEqual(["sess-1/disable", "sess-2/enable"]);
     await expect(dialog).toBeHidden();
 
     await rows(page).filter({ hasText: "Retry handoff" }).first().click({ button: "right" });
     const retry = page.locator("[data-testid='sidebar-context-menu-switch-view']");
+    await expect(retry).toHaveText("Retry terminal handoff");
     await retry.click();
+    await expect(dialog).toBeVisible();
+    await expect(dialog.getByRole("heading", { name: "Switch to terminal", exact: true })).toBeVisible();
+    expect(posted).toEqual(["sess-1/disable", "sess-2/enable"]);
     await page.locator("[data-testid='switch-view-confirm']").click();
     await expect.poll(() => posted).toEqual(["sess-1/disable", "sess-2/enable", "sess-4/disable"]);
     await expect(dialog).toBeHidden();
+    expect(bodies).toEqual([null, null, null]);
 
     await rows(page).filter({ hasText: "Plain terminal" }).first().click({ button: "right" });
     await expect(menu(page)).toBeVisible();

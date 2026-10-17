@@ -42,6 +42,8 @@ may abandon only an expired, owner-free pre-teardown purge with matching durable
 Runner admission preserves an existing owner. Signals require incarnation-bound ownership;
 unknown ownership or unreadable membership preserves evidence and resources. A pending
 structured-to-terminal handoff blocks ordinary launch/input until settlement and completion.
+A retry uses `acp/disable` even if the durable view is already terminal; it never enables
+a new structured session.
 
 Profile rename/delete serialize with affected lifecycle owners. Readable unresolved
 transitions fence their endpoints and affected sessions; unreadable authority fails closed.

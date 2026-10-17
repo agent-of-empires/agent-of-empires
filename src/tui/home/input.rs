@@ -3015,19 +3015,18 @@ impl HomeView {
         if inst.is_structured() {
             crate::session::fork::structured_fork_capable(&inst.tool, inst.agent_name.as_deref())
         } else {
+            let sandboxed = inst.is_sandboxed();
             inst.fork_parent_ref().ok().flatten().is_some_and(|parent| {
                 let agent = match parent {
-                    crate::session::fork::ForkParentRef::Unattributed { agent, .. } => agent,
-                    _ => {
-                        return parent
-                            .binding()
-                            .and_then(|binding| binding.execution.as_ref())
-                            .is_some_and(|execution| {
-                                crate::session::fork::terminal_agent_can_fork(&execution.agent)
-                            })
-                    }
+                    crate::session::fork::ForkParentRef::Unattributed { agent, .. } => Some(agent),
+                    _ => parent
+                        .binding()
+                        .and_then(|binding| binding.execution.as_ref())
+                        .map(|execution| execution.agent.as_str()),
                 };
-                crate::session::fork::terminal_agent_can_fork(agent)
+                agent.is_some_and(|agent| {
+                    crate::session::fork::terminal_agent_can_fork_in(agent, sandboxed)
+                })
             })
         }
     }
@@ -3198,6 +3197,7 @@ impl HomeView {
         let parent_agent_name = parent.agent_name.clone();
         let parent_acp_session_id = parent.acp_session_id.clone();
         let parent_profile = parent.effective_profile();
+        let parent_sandboxed = parent.is_sandboxed();
 
         let seed = if parent_is_structured {
             // A structured parent forks via the ACP `session/fork` handshake rather than
@@ -3233,7 +3233,9 @@ impl HomeView {
         } else {
             let child_id = crate::session::capture::generate_session_uuid();
             let seed = match parent_ref {
-                Ok(parent_ref) => crate::session::fork::terminal_fork_seed(parent_ref, child_id),
+                Ok(parent_ref) => {
+                    crate::session::fork::terminal_fork_seed(parent_ref, child_id, parent_sandboxed)
+                }
                 Err(error) => {
                     self.info_dialog = Some(InfoDialog::new("Fork not supported", &error));
                     return;
@@ -3243,7 +3245,10 @@ impl HomeView {
                 Ok(s) => s,
                 Err(denied) => {
                     let dialog_title = match denied {
-                        crate::session::ForkDenied::AgentCannotFork { .. } => "Fork not supported",
+                        crate::session::ForkDenied::AgentCannotFork { .. }
+                        | crate::session::ForkDenied::ChildNotCapturable { .. } => {
+                            "Fork not supported"
+                        }
                         crate::session::ForkDenied::NoParentSession
                         | crate::session::ForkDenied::UnlaunchedFork => "Nothing to fork yet",
                         crate::session::ForkDenied::UnqualifiedParent { .. } => {

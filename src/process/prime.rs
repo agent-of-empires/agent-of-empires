@@ -141,6 +141,7 @@ pub(crate) struct PrimeObservation {
     activity: String,
     is_streaming: bool,
     is_compacting: bool,
+    #[serde(alias = "hasRunningRlmChildren")]
     has_running_subagents: bool,
     is_bash_running: bool,
     is_session_active: bool,
@@ -1298,8 +1299,10 @@ pub async fn run(args: PrimeRunnerArgs) -> Result<()> {
                 .arg(runtime.socket());
             cmd
         };
+        if runtime.container.is_none() {
+            daemon.env("TMPDIR", &runtime.directory);
+        }
         daemon
-            .env("TMPDIR", &runtime.directory)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -1388,13 +1391,15 @@ pub async fn run(args: PrimeRunnerArgs) -> Result<()> {
                 command
             }
         };
+        if runtime.container.is_none() {
+            frontend.env("TMPDIR", &runtime.directory);
+        }
         frontend
             .args(if runtime.container.is_none() {
                 &argv[..]
             } else {
                 &argv[1..]
             })
-            .env("TMPDIR", &runtime.directory)
             .stdin(Stdio::inherit())
             .stdout(Stdio::inherit())
             .stderr(Stdio::inherit())
@@ -2061,6 +2066,36 @@ printf '{"failed":[]}\n'
                 expected,
                 "{field}"
             );
+        }
+        for field in ["hasRunningSubagents", "hasRunningRlmChildren"] {
+            for (value, expected) in [
+                (serde_json::json!(false), Some(Status::Idle)),
+                (serde_json::json!(true), Some(Status::Running)),
+                (serde_json::Value::Null, None),
+                (serde_json::json!("false"), None),
+            ] {
+                let mut changed = row.clone();
+                let fields = changed.as_object_mut().unwrap();
+                fields.remove("hasRunningSubagents");
+                fields.insert(field.to_owned(), value);
+                let bytes = serde_json::to_vec(&serde_json::json!({"sessions":[changed]})).unwrap();
+                assert_eq!(
+                    foreground_observation(&bytes).map(|root| root.status()),
+                    expected,
+                    "{field}"
+                );
+            }
+        }
+        let mut missing = row.clone();
+        missing
+            .as_object_mut()
+            .unwrap()
+            .remove("hasRunningSubagents");
+        let mut contradictory = row.clone();
+        contradictory["hasRunningRlmChildren"] = serde_json::json!(true);
+        for rejected in [missing, contradictory] {
+            let bytes = serde_json::to_vec(&serde_json::json!({"sessions":[rejected]})).unwrap();
+            assert!(foreground_observation(&bytes).is_none());
         }
         let mut peer = row.clone();
         peer["sessionId"] = serde_json::json!("peer-root");

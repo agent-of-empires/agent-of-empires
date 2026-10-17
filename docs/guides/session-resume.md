@@ -25,6 +25,8 @@ Hermes host identity hooks validate the complete JSON payload while retaining on
 
 Sandbox config and conversation stores are staged per AoE instance, including custom `agent_config_dir` roots, and a cross-process lease guards each managed store, so two sessions in the same directory cannot claim each other's conversation.
 
+Qualified capture exclusions read complete persisted execution metadata, including native runtime ownership; peer ownership checks remain required before adopting a conversation.
+
 `agent_detect_as` controls status detection and ACP adapter inheritance, not terminal execution identity. Direct built-in commands identify their native agent independently. Opaque wrappers need the explicit contract described below for explicit resume or fork and capture from shared stores.
 
 ## Execution identity and wrappers
@@ -77,6 +79,7 @@ Except for [managed native Prime](../structured-view.md#prime-runtime-ownership)
 | OpenCode with an unlisted release/build identity | May be recorded; explicit resume refused | Refused | Use an identity listed in [OpenCode](#supported-managed-contexts) for explicit operations; `Default` restarts degrade with the recorded ID, without guessing a table from its presence or from help |
 | Sandboxed OpenCode fork, or a current-generation wrapper-mediated store fork | n/a | Refused | Disable the sandbox; for a current-generation store fork, launch `opencode` directly |
 | Legacy-generation OpenCode with `session.opencode_preassign_session_id` | n/a | n/a | Preassignment stays disabled: generation alone cannot establish whether the build exposes the `/api` session-create endpoint |
+| Prime Agent fork on a host terminal | n/a | Refused | Run Prime in a sandbox: it mints the child id, and only the sandbox captures it. The fork launches `prime-agent --fork <parent-id>` after AoE copies the parent's persisted transcript into the child's own sandbox store; a parent whose transcript cannot be found there refuses the fork |
 | Any agent in an Apple Container sandbox | Refused | Refused | Set `sandbox.container_runtime` to Docker or Podman, per [Configuration](sandbox.md#configuration) |
 | An opaque wrapper missing `session.agent_execution_as` or `session.agent_config_dir` | Refused | Refused | Declare the wrapper contract, per [Execution identity and wrappers](#execution-identity-and-wrappers) |
 
@@ -130,7 +133,7 @@ Launch success requires confirmation that the adopted child is durably published
 A returned parent, missing child, or unsupported route preserves the pending fork.
 Automatic recovery still depends on the agent's capture capability and supported execution context; dispatching a native fork adds no new child-ID discovery path.
 
-Forking needs an agent that can branch a conversation: claude, codex, opencode, and pi in the supported managed contexts, and the Claude adapter for structured sessions. Resume-only agents (gemini, vibe, copilot) and agents without resume in AoE (cursor, droid, kiro, qwen) hide or refuse the action.
+Forking needs an agent that can branch a conversation: claude, codex, opencode, pi, and prime-agent in the supported managed contexts, and the Claude adapter for structured sessions. Resume-only agents (gemini, vibe, copilot) and agents without resume in AoE (cursor, droid, kiro, qwen) hide or refuse the action.
 
 Pi terminal forks require the same working directory and an attested host `pi` on `PATH` that supports both `--fork` and `--session-id`. AoE assigns the child id before launch. A sandboxed Pi, an unattestable wrapper, or a Pi without either flag refuses the fork rather than creating an untracked conversation. The child copies the parent's saved transcript, starting from the last persisted message. Forking into a new worktree is not supported for Pi.
 

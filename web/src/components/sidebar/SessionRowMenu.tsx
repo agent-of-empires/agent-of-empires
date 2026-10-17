@@ -171,9 +171,11 @@ export function SingleRowMenuItems({
     <>
       {write && <TriageRow model={model} unreadEnabled={unreadEnabled} actions={a} />}
       <MenuSeparator />
-      <MenuItem onClick={a.rename} testId="sidebar-context-menu-rename" icon={icon(Pencil)}>
-        Rename
-      </MenuItem>
+      {write && (
+        <MenuItem onClick={a.rename} testId="sidebar-context-menu-rename" icon={icon(Pencil)}>
+          Rename
+        </MenuItem>
+      )}
       {write && model.canStop && (
         <MenuItem onClick={a.stop} testId="sidebar-context-menu-stop" icon={icon(CircleStop)}>
           Stop

@@ -200,6 +200,16 @@ fn check_auth_gate(
     )
 }
 
+/// A daemon started without a passphrase must not inherit a dead predecessor's.
+async fn sync_passphrase_file(path: &std::path::Path, passphrase: Option<&str>) {
+    match passphrase {
+        Some(pp) => write_secret_file(path, pp).await,
+        None => {
+            let _ = tokio::fs::remove_file(path).await;
+        }
+    }
+}
+
 /// systemd `Type=notify` readiness. No-op unless `NOTIFY_SOCKET` is set.
 #[cfg(unix)]
 async fn notify_ready(addr: &str) {
@@ -322,10 +332,8 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
 
     // Persist the plaintext passphrase so the TUI can display it on reopen, including after
     // a TUI restart or when the daemon was started from the CLI.
-    if let Some(pp) = passphrase {
-        if let Ok(app_dir) = crate::session::get_app_dir() {
-            write_secret_file(&app_dir.join("serve.passphrase"), pp).await;
-        }
+    if let Ok(app_dir) = crate::session::get_app_dir() {
+        sync_passphrase_file(&app_dir.join("serve.passphrase"), passphrase).await;
     }
 
     // Push notifications.
@@ -1097,6 +1105,18 @@ async fn remote_rotation_loop(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn passphraseless_start_retires_a_predecessors_passphrase() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("serve.passphrase");
+
+        sync_passphrase_file(&path, Some("hunter2")).await;
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "hunter2");
+
+        sync_passphrase_file(&path, None).await;
+        assert!(!path.exists());
+    }
 
     #[cfg(unix)]
     #[tokio::test(flavor = "current_thread")]

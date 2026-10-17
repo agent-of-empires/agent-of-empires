@@ -2264,6 +2264,7 @@ mod tests {
         let seed = crate::session::fork::terminal_fork_seed(
             parent.fork_parent_ref().unwrap(),
             "child-uuid".into(),
+            false,
         )
         .expect("an unattributed parent is admitted");
 
