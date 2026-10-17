@@ -197,7 +197,7 @@ async fn purge_session_artifacts(
                     .into()),
                 crate::session::deletion::DeletionDisposition::Failed
                 | crate::session::deletion::DeletionDisposition::Removed => {
-                    Err(result.errors.join("; ").into())
+                    Err(PurgeArtifactsError::from_result(result))
                 }
             };
         }

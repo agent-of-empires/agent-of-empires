@@ -157,7 +157,8 @@ export function SingleRowMenuItems({
   const moreId = useId();
   const { firstSession: first, acpSession: acp } = model;
   const write = !readOnly;
-  const canSwitchView = write && !!first && (first.view === "structured" || first.acp_capable);
+  const canSwitchView =
+    write && !!first && (first.view === "structured" || first.acp_capable || first.terminal_handoff_pending);
   const canFork = write && !!acp?.acp_session_id && acp.acp_can_fork;
   const more = write && {
     switchAgent: !!acp,

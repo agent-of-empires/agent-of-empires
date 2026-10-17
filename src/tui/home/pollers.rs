@@ -6,20 +6,25 @@ fn record_deletion_failure(
     instance: &mut Instance,
     retained: Option<Instance>,
     error: Option<String>,
+    teardown_started: bool,
 ) -> bool {
+    let missing_irreversible_row = teardown_started && retained.is_none();
     if let Some(retained) = retained {
         instance.status = retained.status;
         instance.lifecycle_generation = retained.lifecycle_generation;
         instance.lifecycle_reservation = retained.lifecycle_reservation;
     }
-    let pending_purge = instance.status == crate::session::Status::Deleting
-        && instance.lifecycle_reservation_is_owned(
-            crate::session::LifecycleOperation::Purge,
-            instance.lifecycle_generation,
-        );
-    if !pending_purge {
-        instance.status = crate::session::Status::Error;
-    }
+    let pending_purge = missing_irreversible_row
+        || (instance.status == crate::session::Status::Deleting
+            && instance.lifecycle_reservation_is_owned(
+                crate::session::LifecycleOperation::Purge,
+                instance.lifecycle_generation,
+            ));
+    instance.status = if pending_purge {
+        crate::session::Status::Deleting
+    } else {
+        crate::session::Status::Error
+    };
     instance.last_error = error;
     pending_purge
 }
@@ -31,18 +36,37 @@ impl HomeView {
         use std::sync::mpsc::TryRecvError;
 
         match self.deletion_poller.try_recv_result() {
-            Ok(mut result) => {
-                let ticket = self.deletes_in_flight.get(&result.session_id);
-                if ticket.is_some_and(|ticket| {
-                    ticket.worker != DeleteWorker::Purge
-                        || self
-                            .instances
-                            .get(&result.session_id)
-                            .is_some_and(|current| {
-                                current.lifecycle_generation
-                                    > ticket.lifecycle_generation.saturating_add(1)
-                            })
-                }) {
+            Ok((attempt_id, mut result)) => {
+                let matches_attempt =
+                    self.deletes_in_flight
+                        .get(&result.session_id)
+                        .is_some_and(|ticket| {
+                            ticket.worker == DeleteWorker::Purge && ticket.attempt_id == attempt_id
+                        });
+                if !matches_attempt {
+                    return true;
+                }
+                let attempt = self
+                    .deletes_in_flight
+                    .remove(&result.session_id)
+                    .expect("matched deletion attempt must be present");
+                let completion_generation = result
+                    .retained_instance
+                    .as_ref()
+                    .map(|retained| retained.lifecycle_generation)
+                    .unwrap_or_else(|| attempt.lifecycle_generation.saturating_add(1));
+                if self
+                    .instances
+                    .get(&result.session_id)
+                    .is_some_and(|current| {
+                        current.source_profile != attempt.source_profile
+                            || current.lifecycle_generation > completion_generation
+                            || (result.disposition != DeletionDisposition::KeptRestored
+                                && attempt.trashed_at.is_some()
+                                && (current.trashed_at != attempt.trashed_at
+                                    || current.trash_lifecycle_id != attempt.trash_lifecycle_id))
+                    })
+                {
                     return true;
                 }
                 if let Some(durable) = self.load_durable_instance(&result.session_id) {
@@ -55,20 +79,13 @@ impl HomeView {
                                 *current = durable;
                             }
                         }
-                        self.deletes_in_flight.remove(&result.session_id);
+                        return true;
+                    }
+                    if durable.lifecycle_generation > completion_generation {
                         return true;
                     }
                     result.retained_instance = Some(durable);
                 }
-                let attempt = if self
-                    .deletes_in_flight
-                    .get(&result.session_id)
-                    .is_some_and(|attempt| attempt.worker == DeleteWorker::Purge)
-                {
-                    self.deletes_in_flight.remove(&result.session_id)
-                } else {
-                    None
-                };
                 if result.retained_instance.as_ref().is_some_and(|retained| {
                     self.instances
                         .get(&result.session_id)
@@ -130,7 +147,12 @@ impl HomeView {
                             Some(result.errors.join("; "))
                         };
                         if let Some(current) = self.instances.get_mut(&result.session_id) {
-                            if record_deletion_failure(current, result.retained_instance, error) {
+                            if record_deletion_failure(
+                                current,
+                                result.retained_instance,
+                                error,
+                                result.teardown_started,
+                            ) {
                                 self.failed_deletes.remove(&result.session_id);
                                 self.info_dialog = Some(InfoDialog::new(
                                     "Delete failed",
@@ -138,10 +160,18 @@ impl HomeView {
                                         "Deletion remains pending; inspect recovery before retrying.",
                                     ),
                                 ));
-                            } else if let Some(attempt) = attempt {
+                            } else {
                                 self.failed_deletes
                                     .insert(result.session_id.clone(), attempt);
                             }
+                        } else if result.teardown_started {
+                            self.failed_deletes.remove(&result.session_id);
+                            self.info_dialog = Some(InfoDialog::new(
+                                "Delete failed",
+                                error.as_deref().unwrap_or(
+                                    "Deletion remains pending; inspect recovery before retrying.",
+                                ),
+                            ));
                         }
                     }
                 }
@@ -174,6 +204,7 @@ impl HomeView {
                             "Deletion worker stopped; inspect pending recovery before retrying"
                                 .into(),
                         ),
+                        false,
                     );
                     if !pending {
                         self.failed_deletes.insert(id, attempt);

@@ -11,7 +11,7 @@ use crate::git::cleanup::remove_managed_worktree;
 use crate::git::GitWorktree;
 use crate::session::config::repo_config;
 use crate::session::lifecycle_journal::LifecyclePhase;
-use crate::session::storage::StorageFlock;
+use crate::session::storage::{sync_parent_directory, StorageFlock};
 use crate::session::{Instance, LifecycleOperation, ReservationHeartbeat, Status, Storage};
 
 pub struct DeletionRequest {
@@ -172,6 +172,7 @@ impl PurgeTransaction {
         let now = Utc::now();
         let mut reserved = None;
         let mut rejected = None;
+        let mut rejected_teardown_started = false;
         let mut journal_path = None;
         let mut journal_entry = None;
         let reserve_result = storage.update(|instances, _groups| {
@@ -209,11 +210,52 @@ impl PurgeTransaction {
                     return Ok(());
                 }
                 crate::session::claim::PurgeClaimDecision::AlreadyGone => {
-                    rejected = Some((
-                        DeletionDisposition::AlreadyGone,
-                        "Session was already removed by another process".to_string(),
-                        None,
-                    ));
+                    let scan = crate::session::lifecycle_journal::scan([
+                        storage.sessions_path().to_path_buf(),
+                    ]);
+                    anyhow::ensure!(
+                        scan.unreadable_dirs.is_empty(),
+                        "Cannot confirm purge completion: lifecycle intents cannot be enumerated"
+                    );
+                    let mut pending = false;
+                    for (path, parsed) in scan.entries {
+                        let key = crate::session::lifecycle_journal::filename_key(&path)
+                            .context("Cannot confirm purge completion: unscopable lifecycle intent")?;
+                        let entry = match parsed {
+                            Ok(entry) => entry,
+                            Err(_) if key.session_id() != id => continue,
+                            Err(error) => anyhow::bail!(
+                                "Cannot confirm purge completion: unreadable session intent: {error}"
+                            ),
+                        };
+                        anyhow::ensure!(
+                            key.session_id() == entry.session_id
+                                && key.generation == entry.generation
+                                && entry.session_id == entry.instance.id
+                                && entry.source_profile == storage.profile()
+                                && paths_refer_to_same_sessions_file(
+                                    &entry.sessions_path, storage.sessions_path()
+                                ),
+                            "Cannot confirm purge completion: lifecycle intent identity is ambiguous"
+                        );
+                        if entry.session_id == id && entry.phase != LifecyclePhase::Kept {
+                            pending = true;
+                            rejected_teardown_started |= entry.phase.teardown_started();
+                        }
+                    }
+                    rejected = Some(if pending {
+                        (
+                            DeletionDisposition::Failed,
+                            "Interrupted purge recovery remains incomplete; retained lifecycle authority must settle before deletion can be confirmed".to_string(),
+                            None,
+                        )
+                    } else {
+                        (
+                            DeletionDisposition::AlreadyGone,
+                            "Session was already removed by another process".to_string(),
+                            None,
+                        )
+                    });
                     return Ok(());
                 }
             };
@@ -267,12 +309,9 @@ impl PurgeTransaction {
         }
 
         if let Some((disposition, message, retained_instance)) = rejected {
-            return Ok(PurgeReservation::Rejected(DeletionResult::rejected(
-                id,
-                disposition,
-                message,
-                retained_instance,
-            )));
+            let mut result = DeletionResult::rejected(id, disposition, message, retained_instance);
+            result.teardown_started = rejected_teardown_started;
+            return Ok(PurgeReservation::Rejected(result));
         }
         let (generation, snapshot, status_before) =
             reserved.ok_or_else(|| anyhow::anyhow!("purge reservation produced no outcome"))?;
@@ -393,6 +432,15 @@ impl PurgeTransaction {
         if !matches_owner {
             self.journal_path = None;
             self.journal_entry = None;
+            return;
+        }
+        if let Err(error) = sync_parent_directory(self.storage.sessions_path()) {
+            tracing::warn!(
+                target: "session.delete",
+                path = %path.display(),
+                error = %error,
+                "purge journal retained because final session state is not durably published"
+            );
             return;
         }
         if let Err(error) = self.clear_runner_fence() {
@@ -701,40 +749,44 @@ impl CommittedPurge {
         let was_trashed = self.request.instance.is_trashed();
         let status_before = self.status_before;
         let mut gate = None;
-        let commit_result = self.storage.update(|instances, _groups| {
-            let Some(index) = instances.iter().position(|instance| instance.id == id) else {
-                gate = Some((CompletionGate::AlreadyGone, None));
-                return Ok(());
-            };
-            let restored = crate::session::claim::purge_restored_row_must_be_kept(
-                was_trashed,
-                instances[index].is_trashed(),
-            );
-            let owns = instances[index]
-                .lifecycle_reservation_is_owned(LifecycleOperation::Purge, generation);
-            if restored {
-                if owns {
-                    instances[index].finish_owned_purge(generation, status_before)?;
+        let commit_result = self
+            .storage
+            .update(|instances, _groups| {
+                let Some(index) = instances.iter().position(|instance| instance.id == id) else {
+                    gate = Some((CompletionGate::AlreadyGone, None));
+                    return Ok(());
+                };
+                let restored = crate::session::claim::purge_restored_row_must_be_kept(
+                    was_trashed,
+                    instances[index].is_trashed(),
+                );
+                let owns = instances[index]
+                    .lifecycle_reservation_is_owned(LifecycleOperation::Purge, generation);
+                if restored {
+                    if owns {
+                        instances[index].finish_owned_purge(generation, status_before)?;
+                    }
+                    gate = Some((CompletionGate::KeptRestored, Some(instances[index].clone())));
+                } else if !owns || instances[index].status != Status::Deleting {
+                    if owns {
+                        instances[index].finish_owned_purge(generation, status_before)?;
+                    }
+                    gate = Some((CompletionGate::Superseded, Some(instances[index].clone())));
+                } else {
+                    instances.remove(index);
+                    gate = Some((CompletionGate::Proceed, None));
                 }
-                gate = Some((CompletionGate::KeptRestored, Some(instances[index].clone())));
-            } else if !owns || instances[index].status != Status::Deleting {
-                if owns {
-                    instances[index].finish_owned_purge(generation, status_before)?;
-                }
-                gate = Some((CompletionGate::Superseded, Some(instances[index].clone())));
-            } else {
-                instances.remove(index);
-                gate = Some((CompletionGate::Proceed, None));
-            }
-            Ok(())
-        });
+                Ok(())
+            })
+            .and_then(|()| sync_parent_directory(self.storage.sessions_path()));
         match commit_result {
             Err(error) => {
                 result.success = false;
                 result.disposition = DeletionDisposition::Failed;
                 result.errors.push(format!(
-                    "Sidecar teardown completed, but sessions.json could not be updated: {error}"
+                    "Session teardown completed, but its final session state could not be made durable; purge intent retained: {error:#}"
                 ));
+                result.retained_instance = self.retained_instance();
             }
             Ok(()) => match gate {
                 Some((CompletionGate::Proceed | CompletionGate::AlreadyGone, _)) => {
@@ -937,9 +989,14 @@ impl Drop for PurgeTransaction {
         let acp_owned = self.request.instance.requires_acp_settlement();
         let owner_lock = self.owner_lock.take();
         let journal_path = self.journal_path.clone();
+        #[cfg(test)]
+        let directory_sync_hook = crate::session::storage::directory_sync_hook_for_test();
         let _ = std::thread::Builder::new()
             .name("aoe-purge-reservation-release".to_string())
             .spawn(move || {
+                #[cfg(test)]
+                let _directory_sync_scope = directory_sync_hook
+                    .map(crate::session::storage::intercept_directory_sync_for_test);
                 let _owner_lock = owner_lock;
                 let Ok(storage) = Storage::open_unwatched(&profile) else {
                     return;
@@ -971,7 +1028,10 @@ impl Drop for PurgeTransaction {
                     }
                     Ok(())
                 });
-                if update.is_ok() {
+                if update
+                    .and_then(|()| sync_parent_directory(storage.sessions_path()))
+                    .is_ok()
+                {
                     if let Some(path) = journal_path.as_deref() {
                         let owned = crate::session::lifecycle_journal::read_deletion(path)
                             .ok()
@@ -1456,6 +1516,9 @@ fn recover_lifecycle_entry(
         if kept_resources_are_reclaimed(&current_entry) {
             let siblings = inspect_recovery_siblings(path, &current_entry, storage)?;
             if !siblings.newer {
+                sync_parent_directory(storage.sessions_path()).context(
+                    "reclaimed session state is not durably published; kept intent retained",
+                )?;
                 for (older_path, older) in siblings.older {
                     if older.phase != LifecyclePhase::Kept || !kept_resources_are_reclaimed(&older)
                     {
@@ -1557,8 +1620,6 @@ fn recover_lifecycle_entry(
             current_entry.generation,
         )?;
     }
-
-    stop_acp_runner_for_purge(&current_entry.instance, current_entry.generation)?;
 
     let replayed_hooks = !current_entry.phase.hooks_are_complete();
     if replayed_hooks {
@@ -1682,10 +1743,13 @@ fn recover_lifecycle_entry(
         return Ok(RecoveryOutcome::Unprocessed);
     }
 
+    if current_entry.phase.teardown_started() {
+        sync_parent_directory(&current_path).context(
+            "Loaded teardown checkpoint is not confirmed durable; purge authority retained",
+        )?;
+    }
+
     if !current_entry.phase.teardown_complete() {
-        if replayed_hooks {
-            stop_acp_runner_for_purge(&current_entry.instance, current_entry.generation)?;
-        }
         let irreversible = current_entry.phase.teardown_started();
         let mut request_instance = current_entry.instance.clone();
         request_instance.source_profile = current_entry.source_profile.clone();
@@ -1711,6 +1775,7 @@ fn recover_lifecycle_entry(
             current_entry = current_entry.with_phase(LifecyclePhase::TeardownStarted);
             crate::session::lifecycle_journal::update(&current_path, &current_entry)?;
         }
+        stop_acp_runner_for_purge(&current_entry.instance, current_entry.generation)?;
         if current_entry.purge_acp_transcript {
             if !current_entry.phase.transcript_cleanup_started() {
                 let started = current_entry.with_phase(LifecyclePhase::TranscriptCleanupStarted);
@@ -1732,6 +1797,8 @@ fn recover_lifecycle_entry(
             .with_kept_resources(kept_resources)
             .with_phase(LifecyclePhase::TeardownComplete);
         crate::session::lifecycle_journal::update(&current_path, &current_entry)?;
+    } else {
+        stop_acp_runner_for_purge(&current_entry.instance, current_entry.generation)?;
     }
 
     let latest = crate::session::lifecycle_journal::read_deletion(&current_path)?
@@ -1785,6 +1852,9 @@ fn recover_lifecycle_entry(
         return Ok(RecoveryOutcome::Unprocessed);
     }
 
+    sync_parent_directory(storage.sessions_path())
+        .context("final recovered session state is not durable; purge intent retained")?;
+
     let removed = current_entry.with_phase(LifecyclePhase::RowRemoved);
     crate::session::lifecycle_journal::update(&current_path, &removed)?;
     clear_recovery_fence(&removed)?;
@@ -1832,7 +1902,11 @@ fn consume_lifecycle_journal_if_owned(
 fn clear_recovery_fence(
     entry: &crate::session::lifecycle_journal::LifecycleJournalEntry,
 ) -> Result<()> {
-    if let Some(runtime) = entry.instance.prime_runtime() {
+    if let Some(runtime) = entry
+        .instance
+        .prime_runtime()
+        .filter(|_| entry.phase.teardown_complete())
+    {
         runtime.cleanup()?;
     }
     if entry.instance.requires_acp_settlement() {
@@ -1879,6 +1953,8 @@ fn abandon_recovery_entry(
         }
         Ok(())
     })?;
+    sync_parent_directory(storage.sessions_path())
+        .context("abandoned session state is not durable; purge intent retained")?;
     clear_recovery_fence(&abandoned)?;
     consume_lifecycle_journal_if_owned(path, &abandoned)?;
     Ok(())
@@ -3152,6 +3228,738 @@ mod tests {
         snapshot.lifecycle_reservation = row.lifecycle_reservation.clone();
         (snapshot, row, generation)
     }
+
+    #[test]
+    #[serial]
+    #[cfg(unix)]
+    fn recovery_preflight_and_checkpoint_failure_leave_the_live_runner_untouched() {
+        use crate::session::config::profile_config::{save_profile_config, ProfileConfig};
+        struct Writer(
+            u32,
+            Option<std::thread::JoinHandle<std::process::ExitStatus>>,
+        );
+        impl Drop for Writer {
+            fn drop(&mut self) {
+                if let Some(waiter) = self.1.take() {
+                    crate::process::worker::kill_process_group(self.0);
+                    waiter.join().unwrap();
+                }
+            }
+        }
+        for (phase, fail_checkpoint) in [
+            (LifecyclePhase::Reserved, false),
+            (LifecyclePhase::HooksStarted, false),
+            (LifecyclePhase::HooksComplete, false),
+            (LifecyclePhase::HooksComplete, true),
+            (LifecyclePhase::TranscriptCleanupStarted, true),
+            (LifecyclePhase::TeardownComplete, true),
+            (LifecyclePhase::RowRemoved, true),
+        ] {
+            let app = tempfile::TempDir::with_prefix_in("aoe-order-", "/tmp").unwrap();
+            let _home = isolate_app_dir_at(app.path());
+            let storage = Storage::new_unwatched("runner-order").unwrap();
+            let (_worktree, _main, project, mut instance) = worktree_fixture("runner-order");
+            instance.source_profile = "runner-order".into();
+            instance.view = View::Structured;
+            let output = app.path().join("writer-output");
+            let socket = crate::process::worker_registry::socket_path_for(&instance.id).unwrap();
+            let (pid, waiter) = spawn_live_acp_writer(&socket, &output);
+            let mut writer = Writer(pid, Some(waiter));
+            let record = crate::process::worker_registry::WorkerRecord::new(
+                instance.id.clone(),
+                pid,
+                socket,
+                "codex-acp".into(),
+                "codex".into(),
+                project.clone(),
+                None,
+                Vec::new(),
+                Vec::new(),
+                None,
+                Some("runner-order".into()),
+            )
+            .with_generation(1);
+            crate::process::worker_registry::save(&record).unwrap();
+            let record_path = crate::process::worker_registry::record_path(&instance.id).unwrap();
+            let record_before = std::fs::read(&record_path).unwrap();
+            let marker = app.path().join("hook-observed-live");
+            let config: ProfileConfig = serde_json::from_value(serde_json::json!({
+                "hooks": { "on_destroy": [format!("kill -0 {pid} && printf live > '{}'", marker.display())] }
+            })).unwrap();
+            save_profile_config("runner-order", &config).unwrap();
+            let dirty = project.join("untracked-protected");
+            if !fail_checkpoint {
+                std::fs::write(&dirty, b"preflight must retain this worktree").unwrap();
+            }
+            let journal = seed_expired_purge(&storage, instance.clone(), phase);
+            let mut entry = crate::session::lifecycle_journal::read_deletion(&journal)
+                .unwrap()
+                .unwrap();
+            entry.delete_worktree = true;
+            crate::session::lifecycle_journal::update(&journal, &entry).unwrap();
+            let failure_path = journal.clone();
+            let sync = crate::session::storage::intercept_directory_sync_for_test(move |path| {
+                if fail_checkpoint
+                    && path == failure_path
+                    && crate::session::lifecycle_journal::read_deletion(path)?
+                        .is_some_and(|entry| entry.phase.teardown_started())
+                {
+                    return Err(std::io::Error::from_raw_os_error(libc::EIO).into());
+                }
+                Ok(())
+            });
+            recover_lifecycle_journals_once().unwrap();
+            assert!(crate::process::worker_registry::is_record_live(&record));
+            assert!(project.is_dir());
+            if !phase.hooks_are_complete() {
+                assert_eq!(std::fs::read(&marker).unwrap(), b"live");
+            }
+            let row = storage.load().unwrap().remove(0);
+            if fail_checkpoint {
+                assert_eq!(row.status, Status::Deleting);
+                assert!(
+                    row.lifecycle_reservation_is_owned(LifecycleOperation::Purge, entry.generation)
+                );
+                assert_eq!(
+                    crate::session::lifecycle_journal::read_deletion(&journal)
+                        .unwrap()
+                        .unwrap()
+                        .phase,
+                    if phase.teardown_started() {
+                        phase
+                    } else {
+                        LifecyclePhase::TeardownStarted
+                    },
+                );
+                assert!(crate::process::worker_registry::is_purge_fenced(&instance.id).unwrap());
+                let journal_before = std::fs::read(&journal).unwrap();
+                let fence_path = crate::process::worker_registry::workers_dir()
+                    .unwrap()
+                    .join(format!("{}.purge-fence", instance.id));
+                let fence_before = std::fs::read(&fence_path).unwrap();
+                let fence: serde_json::Value = serde_json::from_slice(&fence_before).unwrap();
+                assert_eq!(fence["source_profile"], "runner-order");
+                assert_eq!(fence["lifecycle_generation"], entry.generation);
+                assert_eq!(fence["runner_pid"], pid);
+                assert_eq!(
+                    fence["runner_record"],
+                    serde_json::from_slice::<serde_json::Value>(&record_before).unwrap()
+                );
+                recover_lifecycle_journals_once().unwrap();
+                assert!(crate::process::worker_registry::is_record_live(&record));
+                let control = crate::process::worker::control_socket_sibling(&record.socket_path);
+                assert_eq!(
+                    crate::process::worker::peer_pid_from_socket(&control),
+                    Some(pid)
+                );
+                assert!(project.is_dir());
+                assert_eq!(std::fs::read(&record_path).unwrap(), record_before);
+                assert_eq!(std::fs::read(&journal).unwrap(), journal_before);
+                assert_eq!(std::fs::read(&fence_path).unwrap(), fence_before);
+                let retained = storage.load().unwrap().remove(0);
+                assert_eq!(retained.status, Status::Deleting);
+                assert!(retained
+                    .lifecycle_reservation_is_owned(LifecycleOperation::Purge, entry.generation));
+                drop(sync);
+                recover_lifecycle_journals_once().unwrap();
+                assert!(!crate::process::worker_registry::is_record_live(&record));
+                assert!(!writer.1.take().unwrap().join().unwrap().success());
+                assert!(!journal.exists());
+                assert!(!crate::process::worker_registry::is_purge_fenced(&instance.id).unwrap());
+                assert!(storage.load().unwrap().is_empty());
+                assert_eq!(project.is_dir(), phase.teardown_complete());
+            } else {
+                assert_eq!(
+                    std::fs::read(&dirty).unwrap(),
+                    b"preflight must retain this worktree"
+                );
+                assert_eq!(row.status, Status::Idle);
+                assert!(row.lifecycle_reservation.is_none());
+                assert!(!journal.exists());
+                assert!(!crate::process::worker_registry::is_purge_fenced(&instance.id).unwrap());
+            }
+        }
+    }
+
+    #[test]
+    #[serial]
+    #[cfg(unix)]
+    fn terminal_purge_retirement_waits_for_the_resolved_sessions_directory_sync() {
+        for replay in [false, true] {
+            for linked in [false, true] {
+                let app = tempfile::tempdir().unwrap();
+                let _home = isolate_app_dir_at(app.path());
+                let external = tempfile::tempdir().unwrap();
+                let storage = Storage::new_unwatched("terminal-sync").unwrap();
+                let mut instance = stored_instance(&storage, "terminal-sync", "/tmp/terminal-sync");
+                let workspace =
+                    crate::session::scratch::provision_scratch_dir(&instance.id).unwrap();
+                instance.project_path = workspace.to_string_lossy().into_owned();
+                instance.scratch = true;
+                instance.view = View::Structured;
+                storage
+                    .update(|rows, _| {
+                        rows[0] = instance.clone();
+                        Ok(())
+                    })
+                    .unwrap();
+                let target = if linked {
+                    let target = external.path().join("sessions.json");
+                    std::fs::copy(storage.sessions_path(), &target).unwrap();
+                    std::fs::remove_file(storage.sessions_path()).unwrap();
+                    std::os::unix::fs::symlink(&target, storage.sessions_path()).unwrap();
+                    target
+                } else {
+                    storage.sessions_path().to_path_buf()
+                };
+                let (journal, generation, committed) = if replay {
+                    storage
+                        .update(|rows, _| {
+                            rows.clear();
+                            Ok(())
+                        })
+                        .unwrap();
+                    let journal = seed_expired_purge(
+                        &storage,
+                        instance.clone(),
+                        LifecyclePhase::TeardownStarted,
+                    );
+                    let generation = storage.load().unwrap()[0].lifecycle_generation;
+                    (journal, generation, None)
+                } else {
+                    let transaction = reserve("terminal-sync", instance.clone()).run_hooks();
+                    let generation = storage.load().unwrap()[0].lifecycle_generation;
+                    let journal = crate::session::lifecycle_journal::path_for(
+                        storage.sessions_path(),
+                        &instance.id,
+                        generation,
+                    );
+                    (
+                        journal,
+                        generation,
+                        Some(transaction.begin_irreversible().unwrap()),
+                    )
+                };
+                let failed_target = target.clone();
+                let sync =
+                    crate::session::storage::intercept_directory_sync_for_test(move |path| {
+                        if path == failed_target {
+                            anyhow::bail!(std::io::Error::from_raw_os_error(libc::EIO));
+                        }
+                        Ok(())
+                    });
+                if let Some(committed) = committed {
+                    let result = committed.finish();
+                    assert!(!result.success);
+                    assert_eq!(result.disposition, DeletionDisposition::Failed);
+                    assert!(result.teardown_started);
+                    assert!(result.retained_instance.is_none());
+                    assert!(result
+                        .errors
+                        .join("; ")
+                        .contains("could not be made durable"));
+                } else {
+                    recover_lifecycle_journals_once().unwrap();
+                }
+                assert!(!workspace.exists());
+                assert!(storage.load().unwrap().is_empty());
+                let terminal = crate::session::lifecycle_journal::read_deletion(&journal)
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(terminal.session_id, instance.id);
+                assert_eq!(terminal.generation, generation);
+                assert_eq!(terminal.phase, LifecyclePhase::TeardownComplete);
+                assert!(crate::process::worker_registry::is_purge_fenced(&instance.id).unwrap());
+                let journal_bytes = std::fs::read(&journal).unwrap();
+                let fence_path = crate::process::worker_registry::workers_dir()
+                    .unwrap()
+                    .join(format!("{}.purge-fence", instance.id));
+                let fence_bytes = std::fs::read(&fence_path).unwrap();
+                for _ in 0..2 {
+                    let retry =
+                        PurgeTransaction::reserve(storage.clone(), request(instance.clone()))
+                            .unwrap();
+                    let PurgeReservation::Rejected(result) = retry else {
+                        panic!("rowless pending purge was reserved again");
+                    };
+                    assert_eq!(result.disposition, DeletionDisposition::Failed);
+                    assert!(!result.success);
+                    assert!(result.teardown_started);
+                    assert!(result.retained_instance.is_none());
+                    assert_eq!(std::fs::read(&journal).unwrap(), journal_bytes);
+                    assert_eq!(std::fs::read(&fence_path).unwrap(), fence_bytes);
+                    assert!(storage.load().unwrap().is_empty());
+                }
+                recover_lifecycle_journals_once().unwrap();
+                assert_eq!(std::fs::read(&journal).unwrap(), journal_bytes);
+                assert!(crate::process::worker_registry::is_purge_fenced(&instance.id).unwrap());
+                drop(sync);
+                recover_lifecycle_journals_once().unwrap();
+                assert!(storage.load().unwrap().is_empty());
+                assert!(!journal.exists());
+                assert!(!crate::process::worker_registry::is_purge_fenced(&instance.id).unwrap());
+                let retry =
+                    PurgeTransaction::reserve(storage.clone(), request(instance.clone())).unwrap();
+                let PurgeReservation::Rejected(result) = retry else {
+                    panic!("settled rowless purge acquired a new reservation");
+                };
+                assert_eq!(result.disposition, DeletionDisposition::AlreadyGone);
+                if linked {
+                    assert!(std::fs::symlink_metadata(storage.sessions_path())
+                        .unwrap()
+                        .is_symlink());
+                    assert_eq!(
+                        serde_json::from_slice::<Vec<serde_json::Value>>(
+                            &std::fs::read(&target).unwrap()
+                        )
+                        .unwrap(),
+                        Vec::<serde_json::Value>::new()
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn rowless_retry_distinguishes_completed_kept_from_unresolved_and_ambiguous_authority() {
+        let _home = isolate_app_dir();
+        let storage = Storage::new_unwatched("rowless-authority").unwrap();
+        let mut instance = Instance::new("kept", "/tmp/kept");
+        instance.source_profile = "rowless-authority".into();
+        instance.scratch = true;
+        instance.view = View::Structured;
+        let workspace = crate::session::scratch::provision_scratch_dir(&instance.id).unwrap();
+        instance.project_path = workspace.to_string_lossy().into_owned();
+        std::fs::write(workspace.join("protected"), b"intentionally retained").unwrap();
+        storage
+            .update(|rows, _| {
+                rows.push(instance.clone());
+                Ok(())
+            })
+            .unwrap();
+        let mut initial_request = request(instance.clone());
+        initial_request.keep_scratch = true;
+        let transaction = match PurgeTransaction::reserve(storage.clone(), initial_request).unwrap()
+        {
+            PurgeReservation::Reserved(transaction) => transaction,
+            PurgeReservation::Rejected(result) => panic!("{result:?}"),
+        };
+        let generation = storage.load().unwrap()[0].lifecycle_generation;
+        let result = transaction.run_hooks().complete();
+        assert!(result.success, "{:?}", result.errors);
+        assert!(storage.load().unwrap().is_empty());
+        let journal = crate::session::lifecycle_journal::path_for(
+            storage.sessions_path(),
+            &instance.id,
+            generation,
+        );
+        let kept = crate::session::lifecycle_journal::read_deletion(&journal)
+            .unwrap()
+            .unwrap();
+        assert_eq!(kept.phase, LifecyclePhase::Kept);
+        let retry = || PurgeTransaction::reserve(storage.clone(), request(instance.clone()));
+        for phase in [
+            LifecyclePhase::Kept,
+            LifecyclePhase::Reserved,
+            LifecyclePhase::HooksStarted,
+            LifecyclePhase::HooksComplete,
+            LifecyclePhase::TeardownStarted,
+            LifecyclePhase::TranscriptCleanupStarted,
+            LifecyclePhase::TeardownComplete,
+            LifecyclePhase::RowRemoved,
+            LifecyclePhase::Abandoned,
+        ] {
+            crate::session::lifecycle_journal::update(&journal, &kept.clone().with_phase(phase))
+                .unwrap();
+            let before = std::fs::read(&journal).unwrap();
+            let PurgeReservation::Rejected(result) = retry().unwrap() else {
+                panic!("rowless retry acquired a new reservation");
+            };
+            assert_eq!(
+                result.disposition,
+                if phase == LifecyclePhase::Kept {
+                    DeletionDisposition::AlreadyGone
+                } else {
+                    DeletionDisposition::Failed
+                },
+                "{phase:?}"
+            );
+            assert_eq!(
+                result.teardown_started,
+                phase != LifecyclePhase::Kept && phase.teardown_started()
+            );
+            assert!(result.retained_instance.is_none());
+            assert_eq!(std::fs::read(&journal).unwrap(), before);
+            assert_eq!(
+                std::fs::read(workspace.join("protected")).unwrap(),
+                b"intentionally retained"
+            );
+        }
+        for case in [
+            "malformed",
+            "unsupported",
+            "generation",
+            "session",
+            "snapshot",
+            "profile",
+            "sessions-path",
+        ] {
+            let mut invalid = kept.clone();
+            match case {
+                "unsupported" => invalid.version += 1,
+                "generation" => invalid.generation += 1,
+                "session" => invalid.session_id = "other".into(),
+                "snapshot" => invalid.instance.id = "other".into(),
+                "profile" => invalid.source_profile = "other".into(),
+                "sessions-path" => {
+                    invalid.sessions_path = storage.sessions_path().with_file_name("other.json")
+                }
+                _ => {}
+            }
+            crate::session::lifecycle_journal::update(&journal, &invalid).unwrap();
+            if case == "malformed" {
+                std::fs::write(&journal, b"malformed").unwrap();
+            }
+            let before = std::fs::read(&journal).unwrap();
+            let Err(error) = retry() else {
+                panic!("ambiguous {case} authority was treated as completed");
+            };
+            assert!(
+                format!("{error:#}").contains("Cannot confirm purge completion"),
+                "{case}: {error:#}"
+            );
+            assert_eq!(std::fs::read(&journal).unwrap(), before);
+        }
+        crate::session::lifecycle_journal::update(&journal, &kept).unwrap();
+        let saved_journal = journal.with_extension("saved");
+        std::fs::rename(&journal, &saved_journal).unwrap();
+        std::fs::create_dir(&journal).unwrap();
+        let Err(error) = retry() else {
+            panic!("unreadable matching intent was treated as completed");
+        };
+        assert!(format!("{error:#}").contains("unreadable session intent"));
+        assert!(journal.is_dir());
+        assert_eq!(
+            crate::session::lifecycle_journal::read_deletion(&saved_journal)
+                .unwrap()
+                .unwrap()
+                .phase,
+            LifecyclePhase::Kept,
+        );
+        std::fs::remove_dir(&journal).unwrap();
+        std::fs::rename(saved_journal, &journal).unwrap();
+        let unrelated_path = crate::session::lifecycle_journal::path_for(
+            storage.sessions_path(),
+            "unrelated",
+            generation,
+        );
+        std::fs::write(&unrelated_path, b"malformed unrelated").unwrap();
+        let PurgeReservation::Rejected(result) = retry().unwrap() else {
+            panic!("completed Kept acquired a reservation");
+        };
+        assert_eq!(result.disposition, DeletionDisposition::AlreadyGone);
+        assert_eq!(
+            std::fs::read(&unrelated_path).unwrap(),
+            b"malformed unrelated"
+        );
+        std::fs::remove_file(unrelated_path).unwrap();
+
+        let unknown = journal.with_file_name("unknown.json");
+        std::fs::rename(&journal, &unknown).unwrap();
+        let Err(error) = retry() else {
+            panic!("unscopable authority was treated as absent");
+        };
+        assert!(format!("{error:#}").contains("unscopable lifecycle intent"));
+        std::fs::rename(unknown, &journal).unwrap();
+        let directory = journal.parent().unwrap();
+        let saved_directory = directory.with_file_name("saved-lifecycle-journal");
+        std::fs::rename(directory, &saved_directory).unwrap();
+        std::fs::write(directory, b"not a directory").unwrap();
+        let Err(error) = retry() else {
+            panic!("unreadable authority directory was treated as absent");
+        };
+        assert!(format!("{error:#}").contains("cannot be enumerated"));
+        assert_eq!(std::fs::read(directory).unwrap(), b"not a directory");
+        std::fs::remove_file(directory).unwrap();
+        std::fs::rename(saved_directory, directory).unwrap();
+
+        let mut pending = kept.clone().with_phase(LifecyclePhase::TeardownComplete);
+        pending.generation += 1;
+        pending.instance.lifecycle_generation = pending.generation;
+        if let Some(reservation) = pending.instance.lifecycle_reservation.as_mut() {
+            reservation.generation = pending.generation;
+        }
+        let pending_path = crate::session::lifecycle_journal::record(&pending).unwrap();
+        let kept_before = std::fs::read(&journal).unwrap();
+        let pending_before = std::fs::read(&pending_path).unwrap();
+        let PurgeReservation::Rejected(result) = retry().unwrap() else {
+            panic!("Kept incorrectly exempted a second unresolved generation");
+        };
+        assert_eq!(result.disposition, DeletionDisposition::Failed);
+        assert!(result.teardown_started);
+        assert_eq!(std::fs::read(&journal).unwrap(), kept_before);
+        assert_eq!(std::fs::read(&pending_path).unwrap(), pending_before);
+        assert_eq!(
+            std::fs::read(workspace.join("protected")).unwrap(),
+            b"intentionally retained"
+        );
+        assert!(storage.load().unwrap().is_empty());
+    }
+
+    #[test]
+    #[serial]
+    #[cfg(unix)]
+    fn rollback_and_drop_retain_abandoned_authority_until_sync_without_native_cleanup() {
+        struct NativeRoot(PathBuf);
+        impl Drop for NativeRoot {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        for dropped in [false, true] {
+            for successor in [false, true] {
+                let app = tempfile::tempdir().unwrap();
+                let _home = isolate_app_dir_at(app.path());
+                let storage = Storage::new_unwatched("rollback-sync").unwrap();
+                let (_worktree, _main, project, mut instance) = worktree_fixture("rollback-sync");
+                std::fs::write(project.join("protected"), b"dirty worktree").unwrap();
+                instance.source_profile = "rollback-sync".into();
+                instance.view = View::Structured;
+                let runtime = crate::process::prime::PrimeRuntime::new(
+                    "/bin/false".into(),
+                    app.path().join("agent"),
+                    None,
+                )
+                .unwrap();
+                let _native = NativeRoot(runtime.directory.clone());
+                runtime.prepare().unwrap();
+                runtime.adopt_prepared().unwrap();
+                // Settlement can precede directory disposal, which abandonment must not perform.
+                let proof_path = runtime.proof_path.as_ref().unwrap();
+                let mut proof: serde_json::Value =
+                    serde_json::from_slice(&std::fs::read(proof_path).unwrap()).unwrap();
+                proof["settled"] = serde_json::json!(true);
+                std::fs::write(proof_path, serde_json::to_vec(&proof).unwrap()).unwrap();
+                std::fs::write(runtime.directory.join("sentinel"), b"native state").unwrap();
+                let proof_before = std::fs::read(runtime.proof_path.as_ref().unwrap()).unwrap();
+                instance.active_execution = Some(crate::session::test_support::prime_execution(
+                    &runtime, &project,
+                ));
+                storage
+                    .update(|rows, _| {
+                        rows.push(instance.clone());
+                        Ok(())
+                    })
+                    .unwrap();
+                let mut deletion = request(instance.clone());
+                deletion.delete_worktree = true;
+                let transaction =
+                    match PurgeTransaction::reserve(storage.clone(), deletion).unwrap() {
+                        PurgeReservation::Reserved(transaction) => transaction,
+                        PurgeReservation::Rejected(result) => panic!("{result:?}"),
+                    };
+                let generation = storage.load().unwrap()[0].lifecycle_generation;
+                let journal = crate::session::lifecycle_journal::path_for(
+                    storage.sessions_path(),
+                    &instance.id,
+                    generation,
+                );
+                if successor {
+                    storage
+                        .update(|rows, _| {
+                            rows[0].finish_owned_purge(generation, Status::Stopped)?;
+                            Ok(())
+                        })
+                        .unwrap();
+                }
+                let failed_path = storage.sessions_path().to_path_buf();
+                let (synced_tx, synced_rx) = std::sync::mpsc::channel();
+                let sync =
+                    crate::session::storage::intercept_directory_sync_for_test(move |path| {
+                        if path == failed_path {
+                            let _ = synced_tx.send(());
+                            anyhow::bail!(std::io::Error::from_raw_os_error(libc::EIO));
+                        }
+                        Ok(())
+                    });
+                if dropped {
+                    drop(transaction);
+                    synced_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+                    while storage
+                        .try_acquire_purge_owner_lock(&instance.id)
+                        .unwrap()
+                        .is_none()
+                    {
+                        assert!(
+                            std::time::Instant::now() < deadline,
+                            "rollback kept its owner lock"
+                        );
+                        std::thread::yield_now();
+                    }
+                } else {
+                    let result = transaction.run_hooks().complete();
+                    assert!(!result.success);
+                    assert!(!result.teardown_started);
+                }
+                let restored = storage.load().unwrap().remove(0);
+                assert_eq!(
+                    restored.status,
+                    if successor {
+                        Status::Stopped
+                    } else {
+                        Status::Idle
+                    }
+                );
+                assert!(restored.lifecycle_generation > generation);
+                assert!(restored.lifecycle_reservation.is_none());
+                assert_eq!(
+                    crate::session::lifecycle_journal::read_deletion(&journal)
+                        .unwrap()
+                        .unwrap()
+                        .phase,
+                    if successor && !dropped {
+                        LifecyclePhase::HooksComplete
+                    } else {
+                        LifecyclePhase::Abandoned
+                    },
+                );
+                assert!(crate::process::worker_registry::is_purge_fenced(&instance.id).unwrap());
+                recover_lifecycle_journals_once().unwrap();
+                assert!(journal.is_file());
+                assert!(crate::process::worker_registry::is_purge_fenced(&instance.id).unwrap());
+                drop(sync);
+                recover_lifecycle_journals_once().unwrap();
+                assert!(!journal.exists());
+                assert!(!crate::process::worker_registry::is_purge_fenced(&instance.id).unwrap());
+                let after = storage.load().unwrap().remove(0);
+                assert_eq!(after.lifecycle_generation, restored.lifecycle_generation);
+                assert_eq!(after.status, restored.status);
+                assert_eq!(
+                    std::fs::read(project.join("protected")).unwrap(),
+                    b"dirty worktree"
+                );
+                assert_eq!(
+                    std::fs::read(runtime.directory.join("sentinel")).unwrap(),
+                    b"native state"
+                );
+                assert_eq!(
+                    std::fs::read(runtime.proof_path.as_ref().unwrap()).unwrap(),
+                    proof_before
+                );
+                runtime.cleanup().unwrap();
+                assert!(!runtime.directory.exists());
+            }
+        }
+    }
+
+    #[test]
+    #[serial]
+    #[cfg(unix)]
+    fn recovery_abandonment_retains_proof_until_the_restored_row_directory_is_synced() {
+        let _home = isolate_app_dir();
+        let storage = Storage::new_unwatched("abandon-sync").unwrap();
+        let (_worktree, _main, project, mut instance) = worktree_fixture("abandon-sync");
+        std::fs::write(project.join("protected"), b"dirty worktree").unwrap();
+        instance.source_profile = "abandon-sync".into();
+        instance.view = View::Structured;
+        let journal = seed_expired_purge(&storage, instance.clone(), LifecyclePhase::HooksComplete);
+        let mut entry = crate::session::lifecycle_journal::read_deletion(&journal)
+            .unwrap()
+            .unwrap();
+        entry.delete_worktree = true;
+        crate::session::lifecycle_journal::update(&journal, &entry).unwrap();
+        let failed_path = storage.sessions_path().to_path_buf();
+        let sync = crate::session::storage::intercept_directory_sync_for_test(move |path| {
+            if path == failed_path {
+                anyhow::bail!(std::io::Error::from_raw_os_error(libc::EIO));
+            }
+            Ok(())
+        });
+        recover_lifecycle_journals_once().unwrap();
+        let restored = storage.load().unwrap().remove(0);
+        assert_eq!(restored.status, Status::Idle);
+        assert_eq!(restored.lifecycle_generation, entry.generation + 1);
+        assert!(restored.lifecycle_reservation.is_none());
+        let abandoned = crate::session::lifecycle_journal::read_deletion(&journal)
+            .unwrap()
+            .unwrap();
+        assert_eq!(abandoned.phase, LifecyclePhase::Abandoned);
+        assert_eq!(abandoned.generation, entry.generation);
+        assert!(crate::process::worker_registry::is_purge_fenced(&instance.id).unwrap());
+        recover_lifecycle_journals_once().unwrap();
+        assert!(journal.is_file());
+        assert_eq!(
+            storage.load().unwrap()[0].lifecycle_generation,
+            restored.lifecycle_generation
+        );
+        drop(sync);
+        recover_lifecycle_journals_once().unwrap();
+        assert!(!journal.exists());
+        assert!(!crate::process::worker_registry::is_purge_fenced(&instance.id).unwrap());
+        assert_eq!(storage.load().unwrap()[0].status, Status::Idle);
+        assert_eq!(
+            std::fs::read(project.join("protected")).unwrap(),
+            b"dirty worktree"
+        );
+    }
+
+    #[test]
+    #[serial]
+    #[cfg(unix)]
+    fn reclaimed_kept_intent_waits_for_sessions_directory_sync_before_retiring() {
+        let _home = isolate_app_dir();
+        let storage = Storage::new_unwatched("kept-sync").unwrap();
+        let mut instance = Instance::new("kept", "/tmp/kept-sync");
+        instance.source_profile = "kept-sync".into();
+        instance.scratch = true;
+        instance.view = View::Structured;
+        let workspace = crate::session::scratch::provision_scratch_dir(&instance.id).unwrap();
+        instance.project_path = workspace.to_string_lossy().into_owned();
+        let journal = seed_expired_purge(&storage, instance.clone(), LifecyclePhase::Kept);
+        let mut entry = crate::session::lifecycle_journal::read_deletion(&journal)
+            .unwrap()
+            .unwrap();
+        entry.kept_resources = vec![format!(
+            "Scratch directory kept at: {}",
+            instance.project_path
+        )];
+        crate::session::lifecycle_journal::update(&journal, &entry).unwrap();
+        storage
+            .update(|rows, _| {
+                rows.clear();
+                Ok(())
+            })
+            .unwrap();
+        std::fs::remove_dir_all(&workspace).unwrap();
+        crate::process::worker_registry::fence_for_purge(
+            &instance.id,
+            "kept-sync",
+            entry.generation,
+        )
+        .unwrap();
+        let failed_path = storage.sessions_path().to_path_buf();
+        let sync = crate::session::storage::intercept_directory_sync_for_test(move |path| {
+            if path == failed_path {
+                anyhow::bail!(std::io::Error::from_raw_os_error(libc::EIO));
+            }
+            Ok(())
+        });
+        recover_lifecycle_journals_once().unwrap();
+        let retained = crate::session::lifecycle_journal::read_deletion(&journal)
+            .unwrap()
+            .unwrap();
+        assert_eq!(retained.session_id, instance.id);
+        assert_eq!(retained.generation, entry.generation);
+        assert_eq!(retained.phase, LifecyclePhase::Kept);
+        assert!(crate::process::worker_registry::is_purge_fenced(&instance.id).unwrap());
+        drop(sync);
+        recover_lifecycle_journals_once().unwrap();
+        assert!(!journal.exists());
+        assert!(!crate::process::worker_registry::is_purge_fenced(&instance.id).unwrap());
+    }
+
     #[test]
     #[serial]
     fn pending_terminal_handoff_is_fenced_during_purge_reservation() {
@@ -5091,7 +5899,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             journal.1.as_ref().unwrap().phase,
-            LifecyclePhase::HooksComplete
+            LifecyclePhase::TeardownStarted
         );
         std::fs::remove_file(&control).unwrap();
         storage

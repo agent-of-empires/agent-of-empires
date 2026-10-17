@@ -331,7 +331,7 @@ test.describe("Plugin pages (#4460)", () => {
               branch: "shared-menu",
               view: "terminal",
               acp_agent: "claude",
-              acp_capable: true,
+              acp_capable: false,
               terminal_handoff_pending: true,
               keeps_context: true,
             }),

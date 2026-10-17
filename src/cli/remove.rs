@@ -254,8 +254,8 @@ pub async fn run(profile: &str, args: RemoveArgs) -> Result<()> {
     }
     if !result.success {
         anyhow::bail!(
-            "Session teardown failed, so the session record was kept (retry, or fix the \
-             underlying cause and remove it again)"
+            "Session purge did not complete; inspect the errors and any retained purge intent \
+             before retrying"
         );
     }
 

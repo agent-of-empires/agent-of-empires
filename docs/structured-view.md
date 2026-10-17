@@ -64,6 +64,13 @@ Successful cleanup removes the private runtime directory and retains a compact t
 
 Container images must provide Bash and GNU grep for scoped process inspection, plus Python 3.9 or newer with `os.pidfd_open` and `signal.pidfd_send_signal` on the guest kernel. AoE probes pidfd signalling during preparation and binds guest signals to the recorded incarnation, without a numeric PID fallback. Missing capabilities refuse launch. Stopping `aoe serve` only detaches; an admitted turn continues and the next daemon reattaches to the same worker.
 
+Guest marker inspection distinguishes a positive match, two successful non-matches, and
+unreadable evidence. A live process with inconclusive markers blocks cleanup unless its
+incarnation is independently owned or linked through proven owned ancestry. This is
+deliberately conservative even for an unrelated or foreign-user guest process: preserve
+the runtime and receipt, restore complete process visibility, then retry. An unreadable
+PID that still exists is not an absent process.
+
 On Apple Container, worker descriptor snapshots are streamed as a tar archive by the guest Python helper. Symlinks and non-regular descriptors are refused; no host copy destination is used.
 
 CLI stop and kill persist a stop intent before signalling. Reattachment, automatic respawn, queued turns, and runner publication respect that fence. Only an explicit resume after settled retirement can clear the stop intent it observed; a newer stop remains authoritative. For a tracked runtime that cannot prove settlement, externally stop only that execution on its original host or pinned container and retry `aoe acp stop <id>`.
@@ -141,6 +148,11 @@ aoe acp doctor --fix --all-adapters       # every bundled adapter
 - **Web wizard**: structured view by default (set [`acp.default_new_session_view`](guides/configuration.md) to change it); turn off **Use structured view** for the terminal.
 - **CLI / TUI**: terminal view by default; opt in with `--structured-view` or `--agent`, or the **Structured** field in the TUI new-session dialog.
 - **An existing session** can switch either way from the web sidebar's right-click menu or the TUI context menu (which needs a running `aoe serve`). Both confirm first, and the worktree, files, and commits are always preserved. For a **claude** session, the conversation is kept in both directions only when AoE can resolve a shared native store. A terminal switch whose store cannot be resolved, or which the structured worker does not share, is refused with HTTP 409 and `set-session-id --store` recovery guidance. Every other agent starts fresh on the target surface.
+
+If the menu offers **Retry terminal handoff**, settlement has not finished. With write
+permission, that retry remains available even if the agent can no longer enable structured
+view. It repeats the confirmed terminal handoff rather than enabling a new structured
+session; ordinary launch and input remain blocked until settlement completes.
 
 ### Launch command and session naming
 

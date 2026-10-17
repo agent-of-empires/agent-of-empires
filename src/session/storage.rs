@@ -665,6 +665,41 @@ impl Drop for ArmedCrashPoint {
     }
 }
 
+#[cfg(test)]
+type DirectorySyncHook = std::sync::Arc<dyn Fn(&Path) -> Result<()> + Send + Sync>;
+
+#[cfg(test)]
+thread_local! {
+    static DIRECTORY_SYNC_HOOK: std::cell::RefCell<Option<DirectorySyncHook>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+pub(crate) fn intercept_directory_sync_for_test(
+    hook: impl Fn(&Path) -> Result<()> + Send + Sync + 'static,
+) -> impl Drop {
+    struct Guard(std::marker::PhantomData<std::rc::Rc<()>>);
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            DIRECTORY_SYNC_HOOK.with(|slot| slot.borrow_mut().take());
+        }
+    }
+    DIRECTORY_SYNC_HOOK.with(|slot| {
+        assert!(slot
+            .borrow_mut()
+            .replace(std::sync::Arc::new(hook))
+            .is_none());
+    });
+    Guard(std::marker::PhantomData)
+}
+
+#[cfg(test)]
+pub(crate) fn directory_sync_hook_for_test() -> Option<impl Fn(&Path) -> Result<()> + Send + Sync> {
+    DIRECTORY_SYNC_HOOK
+        .with(|slot| slot.borrow().clone())
+        .map(|hook| move |path: &Path| hook(path))
+}
+
 pub(crate) fn sync_parent_directory(path: &Path) -> Result<()> {
     let resolved = resolve_symlink_chain(path)?;
     sync_resolved_parent_directory(&resolved)
@@ -672,6 +707,14 @@ pub(crate) fn sync_parent_directory(path: &Path) -> Result<()> {
 
 #[cfg(unix)]
 fn sync_resolved_parent_directory(path: &Path) -> Result<()> {
+    #[cfg(test)]
+    DIRECTORY_SYNC_HOOK.with(|slot| {
+        if let Some(hook) = slot.borrow().as_ref() {
+            hook(path)
+        } else {
+            Ok(())
+        }
+    })?;
     let parent = path
         .parent()
         .ok_or_else(|| anyhow!("path has no parent: {}", path.display()))?;

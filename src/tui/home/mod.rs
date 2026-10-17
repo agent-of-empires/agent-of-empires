@@ -90,9 +90,11 @@ pub(super) enum DeleteWorker {
     Drop,
 }
 
-/// A delete attempt's worker and trash-lifecycle identity.
+/// Local request identity, distinct from the durable lifecycle/trash snapshot.
 #[derive(Clone)]
 pub(super) struct DeleteAttempt {
+    pub(super) attempt_id: u64,
+    pub(super) source_profile: String,
     pub(super) worker: DeleteWorker,
     pub(super) lifecycle_generation: u64,
     pub(super) forced: bool,
@@ -306,6 +308,7 @@ pub struct HomeView {
 
     pub(super) deletion_poller: DeletionPoller,
     pub(super) deletes_in_flight: HashMap<String, DeleteAttempt>,
+    pub(super) next_delete_attempt_id: u64,
     /// Each session's last failed deletion, so Empty Trash can escalate: a failed delete
     /// is offered a forced retry, a failed forced delete removal from aoe without cleanup.
     pub(super) failed_deletes: HashMap<String, DeleteAttempt>,

@@ -878,18 +878,39 @@ impl HomeView {
         Ok(())
     }
 
-    pub(super) fn request_deletion(&mut self, request: DeletionRequest) {
+    fn track_delete_attempt(
+        &mut self,
+        instance: &Instance,
+        worker: super::DeleteWorker,
+        forced: bool,
+    ) -> u64 {
+        self.next_delete_attempt_id = self
+            .next_delete_attempt_id
+            .checked_add(1)
+            .expect("TUI delete attempt identity exhausted");
+        let attempt_id = self.next_delete_attempt_id;
         self.deletes_in_flight.insert(
-            request.session_id.clone(),
+            instance.id.clone(),
             super::DeleteAttempt {
-                worker: super::DeleteWorker::Purge,
-                lifecycle_generation: request.instance.lifecycle_generation,
-                forced: request.force_delete,
-                trashed_at: request.instance.trashed_at,
-                trash_lifecycle_id: request.instance.trash_lifecycle_id.clone(),
+                attempt_id,
+                source_profile: instance.source_profile.clone(),
+                worker,
+                lifecycle_generation: instance.lifecycle_generation,
+                forced,
+                trashed_at: instance.trashed_at,
+                trash_lifecycle_id: instance.trash_lifecycle_id.clone(),
             },
         );
-        self.deletion_poller.request_deletion(request);
+        attempt_id
+    }
+
+    pub(super) fn request_deletion(&mut self, request: DeletionRequest) {
+        let attempt_id = self.track_delete_attempt(
+            &request.instance,
+            super::DeleteWorker::Purge,
+            request.force_delete,
+        );
+        self.deletion_poller.request_deletion(attempt_id, request);
     }
 
     /// Whether a trashed row's last delete was forced, when it failed in the row's current
@@ -914,19 +935,11 @@ impl HomeView {
         let Some(instance) = self.instances.get(session_id).cloned() else {
             return Ok(());
         };
-        self.deletes_in_flight.insert(
-            instance.id.clone(),
-            super::DeleteAttempt {
-                worker: super::DeleteWorker::Drop,
-                lifecycle_generation: instance.lifecycle_generation,
-                forced: true,
-                trashed_at: instance.trashed_at,
-                trash_lifecycle_id: instance.trash_lifecycle_id.clone(),
-            },
-        );
+        let attempt_id = self.track_delete_attempt(&instance, super::DeleteWorker::Drop, true);
         self.drop_poller.request(
             instance.id.clone(),
             DropRequest {
+                attempt_id,
                 instance,
                 force_remove: true,
             },
@@ -938,20 +951,12 @@ impl HomeView {
     /// cleanup. The guarded transaction runs on the drop worker, since a peer purge can
     /// hold the lifecycle lock for its whole teardown; `apply_drop_results` lands it.
     fn drop_failed_trashed_session(&mut self, inst: &Instance) {
-        self.deletes_in_flight.insert(
-            inst.id.clone(),
-            super::DeleteAttempt {
-                worker: super::DeleteWorker::Drop,
-                lifecycle_generation: inst.lifecycle_generation,
-                forced: true,
-                trashed_at: inst.trashed_at,
-                trash_lifecycle_id: inst.trash_lifecycle_id.clone(),
-            },
-        );
+        let attempt_id = self.track_delete_attempt(inst, super::DeleteWorker::Drop, true);
         self.set_instance_status(&inst.id, Status::Deleting);
         self.drop_poller.request(
             inst.id.clone(),
             DropRequest {
+                attempt_id,
                 instance: inst.clone(),
                 force_remove: false,
             },
@@ -963,20 +968,13 @@ impl HomeView {
             return false;
         };
         let inst = result.instance;
-        if self
-            .deletes_in_flight
-            .get(&inst.id)
-            .is_some_and(|attempt| attempt.worker != super::DeleteWorker::Drop)
-        {
+        let matches_attempt = self.deletes_in_flight.get(&inst.id).is_some_and(|attempt| {
+            attempt.worker == super::DeleteWorker::Drop && attempt.attempt_id == result.attempt_id
+        });
+        if !matches_attempt {
             return true;
         }
-        if self
-            .deletes_in_flight
-            .get(&inst.id)
-            .is_some_and(|attempt| attempt.worker == super::DeleteWorker::Drop)
-        {
-            self.deletes_in_flight.remove(&inst.id);
-        }
+        self.deletes_in_flight.remove(&inst.id);
         if self.instances.get(&inst.id).is_some_and(|current| {
             current.source_profile != inst.source_profile
                 || current.lifecycle_generation != inst.lifecycle_generation
@@ -2503,11 +2501,13 @@ fn restore_from_trash_with_storage(
 }
 
 pub(in crate::tui) struct DropRequest {
+    attempt_id: u64,
     instance: Instance,
     force_remove: bool,
 }
 
 pub(in crate::tui) struct DropResult {
+    attempt_id: u64,
     instance: Instance,
     dropped: anyhow::Result<bool>,
 }
@@ -2560,6 +2560,7 @@ pub(super) fn perform_drop(request: DropRequest) -> DropResult {
         })
     })();
     DropResult {
+        attempt_id: request.attempt_id,
         instance: inst,
         dropped,
     }

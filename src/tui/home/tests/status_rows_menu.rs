@@ -1439,9 +1439,12 @@ fn failed_delete_retry_identity_survives_storage_and_rejects_peer_retrash() {
         .unwrap();
     env.view.reload().unwrap();
     let requested = env.view.get_instance(&id).unwrap().clone();
+    env.view.next_delete_attempt_id = 1;
     env.view.failed_deletes.insert(
         id.clone(),
         super::super::DeleteAttempt {
+            attempt_id: 1,
+            source_profile: requested.source_profile.clone(),
             worker: super::super::DeleteWorker::Purge,
             lifecycle_generation: requested.lifecycle_generation,
             forced: true,

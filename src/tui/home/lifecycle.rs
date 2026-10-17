@@ -427,6 +427,7 @@ impl HomeView {
             sidebar_source: crate::tui::session_feed::SidebarSource::Storage,
             deletion_poller: DeletionPoller::new(),
             deletes_in_flight: HashMap::new(),
+            next_delete_attempt_id: 0,
             failed_deletes: HashMap::new(),
             stop_poller: StopPoller::new(),
             trash_poller: crate::tui::trash_poller::TrashPoller::new(),

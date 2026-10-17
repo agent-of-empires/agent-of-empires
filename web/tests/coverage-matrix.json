@@ -2881,7 +2881,7 @@
         "web/src/lib/types.ts",
         "web/src/App.tsx"
       ],
-      "notes": "Sidebar and plugin-page menus confirm before a bodyless enable/disable POST through App. A durable pending terminal handoff is labeled Retry terminal handoff and dispatches disable, including a plugin target that is not the workspace's first session."
+      "notes": "Sidebar and plugin-page menus confirm before a bodyless enable/disable POST through App. A durable pending terminal handoff is labeled Retry terminal handoff and dispatches disable even when ACP enable capability is false, including a plugin target that is not the workspace's first session. Read-only menus hide the retry."
     },
     {
       "id": "acp.switch-view-api",

@@ -3114,6 +3114,137 @@ async fn failed_delete_notifies_plugins_of_the_error() {
     assert_eq!(feed.next().await, ("Deleting".into(), "Error".into()));
 }
 
+#[tokio::test]
+#[serial_test::serial]
+#[cfg(unix)]
+async fn delete_retry_keeps_rowless_terminal_authority_failed_until_explicit_recovery() {
+    use crate::session::deletion::{
+        DeletionDisposition, DeletionRequest, PurgeReservation, PurgeTransaction,
+    };
+    use crate::session::lifecycle_journal::LifecyclePhase;
+    let _home = crate::session::test_support::isolate_app_dir();
+    crate::session::create_profile("default").unwrap();
+    let storage = Storage::open_unwatched("default").unwrap();
+    let mut instance = Instance::new("terminal retry", "/tmp/terminal-retry");
+    instance.source_profile = "default".into();
+    instance.view = crate::session::View::Structured;
+    instance.scratch = true;
+    let id = instance.id.clone();
+    let workspace = crate::session::scratch::provision_scratch_dir(&id).unwrap();
+    instance.project_path = workspace.to_string_lossy().into_owned();
+    std::fs::write(workspace.join("protected"), b"irreversible cleanup").unwrap();
+    storage
+        .update(|rows, _| {
+            rows.push(instance.clone());
+            Ok(())
+        })
+        .unwrap();
+    let transaction = match PurgeTransaction::reserve(
+        storage.clone(),
+        DeletionRequest {
+            session_id: id.clone(),
+            instance,
+            delete_worktree: false,
+            delete_branch: false,
+            delete_sandbox: false,
+            force_delete: false,
+            detach_hooks: true,
+            keep_scratch: false,
+        },
+    )
+    .unwrap()
+    {
+        PurgeReservation::Reserved(transaction) => transaction,
+        PurgeReservation::Rejected(result) => panic!("{result:?}"),
+    };
+    let cached = storage.load().unwrap().remove(0);
+    let generation = cached.lifecycle_generation;
+    let committed = transaction.run_hooks().begin_irreversible().unwrap();
+    let failed_path = storage.sessions_path().to_path_buf();
+    let sync = crate::session::intercept_directory_sync_for_test(move |path| {
+        if path == failed_path {
+            anyhow::bail!(std::io::Error::from_raw_os_error(libc::EIO));
+        }
+        Ok(())
+    });
+    let result = committed.finish();
+    assert_eq!(result.disposition, DeletionDisposition::Failed);
+    assert!(result.teardown_started);
+    assert!(result.retained_instance.is_none());
+    assert!(!workspace.exists());
+    assert!(storage.load().unwrap().is_empty());
+    let journal =
+        crate::session::lifecycle_journal::path_for(storage.sessions_path(), &id, generation);
+    let entry = crate::session::lifecycle_journal::read_deletion(&journal)
+        .unwrap()
+        .unwrap();
+    assert_eq!(entry.phase, LifecyclePhase::TeardownComplete);
+    let journal_before = std::fs::read(&journal).unwrap();
+    let fence_path = crate::process::worker_registry::workers_dir()
+        .unwrap()
+        .join(format!("{id}.purge-fence"));
+    let fence_before = std::fs::read(&fence_path).unwrap();
+    drop(sync);
+    // The transient fault is repaired, but row absence does not retire the retained intent.
+    let state = crate::server::test_support::build_test_app_state(vec![cached]);
+    let epoch = state
+        .mutation_epoch
+        .load(std::sync::atomic::Ordering::SeqCst);
+    for _ in 0..2 {
+        let response = delete_session(
+            State(state.clone()),
+            Path(id.clone()),
+            Some(Json(DeleteSessionBody::default())),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["error"], "deletion_failed");
+        assert!(body["message"]
+            .as_str()
+            .unwrap()
+            .contains("retained lifecycle authority"));
+        let instances = state.instances.read().await;
+        assert_eq!(instances.len(), 1);
+        assert_eq!(instances[0].id, id);
+        assert_eq!(instances[0].status, Status::Deleting);
+        assert!(instances[0]
+            .lifecycle_reservation_is_owned(crate::session::LifecycleOperation::Purge, generation));
+        drop(instances);
+        assert_eq!(
+            state
+                .mutation_epoch
+                .load(std::sync::atomic::Ordering::SeqCst),
+            epoch
+        );
+        assert_eq!(std::fs::read(&journal).unwrap(), journal_before);
+        assert_eq!(std::fs::read(&fence_path).unwrap(), fence_before);
+        assert!(storage.load().unwrap().is_empty());
+    }
+    crate::session::deletion::recover_lifecycle_journals_once().unwrap();
+    assert!(!journal.exists());
+    assert!(!crate::process::worker_registry::is_purge_fenced(&id).unwrap());
+    let response = delete_session(
+        State(state.clone()),
+        Path(id.clone()),
+        Some(Json(DeleteSessionBody::default())),
+    )
+    .await
+    .into_response();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+        .await
+        .unwrap();
+    let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(body["status"], "deleted");
+    assert!(state.instances.read().await.is_empty());
+    assert!(storage.load().unwrap().is_empty());
+}
+
 /// A direct stop sets `Stopped` on the live in-memory row without going through
 /// `apply_status_intent`, which normally releases a plugin's pending revival mark on reaching
 /// a terminal status; `stop_session` must do the same itself, on that same in-memory row (the

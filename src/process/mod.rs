@@ -702,18 +702,6 @@ fn prime_selection_mask(
     selected
 }
 
-pub(crate) fn select_prime_processes(
-    samples: Vec<PrimeProcessSample>,
-    known: &[PrimeProcessIdentity],
-) -> Vec<PrimeProcessIdentity> {
-    let selected = prime_selection_mask(&samples, known);
-    samples
-        .into_iter()
-        .zip(selected)
-        .filter_map(|(sample, selected)| selected.then_some(sample.identity))
-        .collect()
-}
-
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 pub(super) fn select_stable_prime_processes(
     mut samples: Vec<PrimeProcessSample>,
@@ -1415,9 +1403,12 @@ mod tests {
             pid: 10,
             start_id: "proc:100".into(),
         };
-        for (start, expected) in [("proc:100", vec![10, 11, 12]), ("proc:200", vec![])] {
-            let selected = select_prime_processes(
-                vec![
+        for (start, expected) in [
+            ("proc:100", [true, true, true, false]),
+            ("proc:200", [false, false, false, false]),
+        ] {
+            let selected = prime_selection_mask(
+                &[
                     sample(10, 1, None, start, false),
                     sample(11, 10, Some(start), "proc:101", false),
                     sample(12, 11, Some("proc:101"), "proc:102", false),
@@ -1425,52 +1416,34 @@ mod tests {
                 ],
                 std::slice::from_ref(&known),
             );
-            assert_eq!(
-                selected
-                    .into_iter()
-                    .map(|identity| identity.pid)
-                    .collect::<Vec<_>>(),
-                expected
-            );
+            assert_eq!(selected, expected);
         }
-        let selected = select_prime_processes(
-            vec![
+        let selected = prime_selection_mask(
+            &[
                 sample(10, 1, None, "proc:200", false),
                 sample(30, 1, None, "proc:300", true),
                 sample(31, 30, Some("proc:300"), "proc:301", false),
             ],
             std::slice::from_ref(&known),
         );
-        assert_eq!(
-            selected
-                .into_iter()
-                .map(|identity| identity.pid)
-                .collect::<Vec<_>>(),
-            [30, 31]
-        );
-        let selected = select_prime_processes(
-            vec![
+        assert_eq!(selected, [false, true, true]);
+        let selected = prime_selection_mask(
+            &[
                 sample(10, 1, None, "proc:100", false),
                 sample(11, 10, Some("proc:999"), "proc:101", false),
             ],
             std::slice::from_ref(&known),
         );
-        assert_eq!(selected.as_slice(), std::slice::from_ref(&known));
-        let independently_owned = select_prime_processes(
-            vec![
+        assert_eq!(selected, [true, false]);
+        let independently_owned = prime_selection_mask(
+            &[
                 sample(10, 999, None, "proc:100", false),
                 sample(30, 999, None, "proc:300", true),
                 sample(31, 999, None, "proc:301", false),
             ],
             std::slice::from_ref(&known),
         );
-        assert_eq!(
-            independently_owned
-                .iter()
-                .map(|identity| identity.pid)
-                .collect::<Vec<_>>(),
-            [10, 30]
-        );
+        assert_eq!(independently_owned, [true, true, false]);
     }
 
     #[cfg(target_os = "macos")]
