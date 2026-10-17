@@ -55,12 +55,14 @@ function DiffPreview() {
 }
 
 interface Props {
-  /** Continue or Escape; the caller owns the seen flag. */
+  /** Continue: the tour follows. The caller owns the seen flags. */
   onDone: () => void;
+  /** Escape: dismiss and skip the tour too, as the footer says. */
+  onSkipTour: () => void;
 }
 
 /** First-run theme picker. Picking persists and repaints live, so the grid is the preview. */
-export function ThemeIntro({ onDone }: Props) {
+export function ThemeIntro({ onDone, onSkipTour }: Props) {
   const [themes, setThemes] = useState<string[]>([]);
   const [selected, setSelected] = useState<string | null>(
     () => (typeof document !== "undefined" ? document.documentElement.dataset.theme : undefined) ?? null,
@@ -82,11 +84,11 @@ export function ThemeIntro({ onDone }: Props) {
 
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
-      if (e.key === "Escape") onDone();
+      if (e.key === "Escape") onSkipTour();
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [onDone]);
+  }, [onSkipTour]);
 
   const pick = useCallback(
     async (name: string) => {
@@ -117,10 +119,11 @@ export function ThemeIntro({ onDone }: Props) {
           <div className="lg:flex-1 lg:min-w-[380px]">
             <div className="px-5 py-4 border-b border-surface-700">
               <h2 id="theme-intro-title" className="text-sm font-semibold text-text-bright">
-                Welcome! Choose your theme
+                Welcome to Agent of Empires
               </h2>
               <p className="mt-1 text-xs text-text-dim">
-                Pick a look for the dashboard and TUI. You can change it any time from Settings, under Appearance.
+                Run AI coding agents side by side, each in its own session. First, pick a look. It applies here and in
+                the terminal app (TUI), and you can change it later in Settings › Theme.
               </p>
             </div>
 
@@ -154,7 +157,8 @@ export function ThemeIntro({ onDone }: Props) {
               )}
             </div>
 
-            <div className="flex justify-end px-5 py-4 border-t border-surface-700">
+            <div className="flex items-center justify-between gap-3 px-5 py-4 border-t border-surface-700">
+              <p className="text-xs text-text-dim">Next: a short tour · Esc skips</p>
               <button
                 ref={continueRef}
                 type="button"

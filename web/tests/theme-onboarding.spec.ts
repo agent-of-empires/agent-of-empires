@@ -1,12 +1,12 @@
 // First-run theme selection as part of onboarding (issue #1834): a fresh
-// browser shows a "Choose your theme" modal before the tour. Picking a theme
+// browser shows a theme welcome modal before the tour. Picking a theme
 // repaints the dashboard live and PATCHes the global /api/theme endpoint;
-// dismissing hands off to the tour. The modal is suppressed in automated
+// Continue hands off to the tour and Escape skips it. The modal is suppressed in automated
 // sessions, like the tour. Ported from live to the mocked suite: stateful
 // stubs for /api/theme(+current) and the app_state tour flag let the reload
 // assertions exercise the same fetch-and-reapply path the real backend feeds.
 
-import { test, expect } from "./helpers/mockedTest";
+import { test, expect, observeFor } from "./helpers/mockedTest";
 import type { Page } from "@playwright/test";
 
 interface ResolvedThemePayload {
@@ -121,7 +121,7 @@ test("theme onboarding: pick, persist, hand off to tour", async ({ page }) => {
   await page.goto("/");
 
   // The welcome modal appears first, with the available themes as options.
-  await expect(page.getByText("Choose your theme")).toBeVisible();
+  await expect(page.getByRole("heading", { name: "Welcome to Agent of Empires" })).toBeVisible();
   // Desktop viewport (>= lg): the composer and diff preview panels flank the
   // picker so the user sees the chosen theme on representative surfaces.
   await expect(page.getByText("Composer")).toBeVisible();
@@ -137,9 +137,9 @@ test("theme onboarding: pick, persist, hand off to tour", async ({ page }) => {
 
   // Continue dismisses the modal and hands off to the tour.
   await page.getByRole("button", { name: "Continue" }).click();
-  await expect(page.getByText("Choose your theme")).toBeHidden();
-  await expect(page.getByText("Command bar")).toBeVisible();
-  await page.getByRole("button", { name: "Skip" }).click();
+  await expect(page.getByRole("heading", { name: "Welcome to Agent of Empires" })).toBeHidden();
+  await expect(page.getByRole("alertdialog", { name: "Search and commands", exact: true })).toBeVisible();
+  await page.getByRole("button", { name: "Skip tour", exact: true }).click();
   await expect.poll(() => handle.tourSeen).toBe(true);
 
   // The pick persisted: a reload re-applies it via /api/theme/current and
@@ -148,8 +148,27 @@ test("theme onboarding: pick, persist, hand off to tour", async ({ page }) => {
   await page.reload();
   await expect(page.getByRole("button", { name: "Go to dashboard" })).toBeVisible();
   await expect.poll(() => datasetTheme(page)).toBe("dracula");
-  await expect(page.getByText("Choose your theme")).toBeHidden();
-  await expect(page.getByText("Command bar")).toBeHidden();
+  await expect(page.getByRole("heading", { name: "Welcome to Agent of Empires" })).toBeHidden();
+  await expect(page.getByRole("alertdialog", { name: "Search and commands", exact: true })).toBeHidden();
+});
+
+test("theme onboarding: Escape on the welcome skips the tour too", async ({ page }) => {
+  const handle = await installOnboardingMocks(page);
+  await page.addInitScript(() => {
+    Object.defineProperty(navigator, "webdriver", { get: () => false });
+  });
+  await page.goto("/");
+
+  const welcome = page.getByRole("heading", { name: "Welcome to Agent of Empires" });
+  await expect(welcome).toBeVisible();
+  await expect(page.getByText("Next: a short tour · Esc skips")).toBeVisible();
+  await page.keyboard.press("Escape");
+  await expect(welcome).toBeHidden();
+  await expect.poll(() => handle.tourSeen).toBe(true);
+  // Continue mounts the first step promptly (the test above); after Escape it never does.
+  await observeFor(page, 1500, async () => {
+    await expect(page.getByRole("alertdialog", { name: "Search and commands", exact: true })).toHaveCount(0);
+  });
 });
 
 test("theme onboarding: suppressed in automated sessions", async ({ page }) => {
@@ -159,5 +178,5 @@ test("theme onboarding: suppressed in automated sessions", async ({ page }) => {
   // modal must never appear and the dashboard must be reachable.
   await page.goto("/");
   await expect(page.getByRole("button", { name: "Go to dashboard" })).toBeVisible();
-  await expect(page.getByText("Choose your theme")).toBeHidden();
+  await expect(page.getByRole("heading", { name: "Welcome to Agent of Empires" })).toBeHidden();
 });

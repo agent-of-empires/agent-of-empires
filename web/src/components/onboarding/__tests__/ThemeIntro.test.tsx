@@ -25,9 +25,10 @@ afterEach(() => {
 
 async function mount() {
   const onDone = vi.fn();
-  render(<ThemeIntro onDone={onDone} />);
+  const onSkipTour = vi.fn();
+  render(<ThemeIntro onDone={onDone} onSkipTour={onSkipTour} />);
   await waitFor(() => expect(screen.getByRole("option", { name: "modus-vivendi" })).toBeTruthy());
-  return { onDone };
+  return { onDone, onSkipTour };
 }
 
 const option = (name: string) => screen.getByRole("option", { name });
@@ -54,9 +55,17 @@ describe("ThemeIntro", () => {
     expect(option("empire").getAttribute("aria-selected")).toBe("false");
   });
 
-  it("dismisses via Escape", async () => {
-    const { onDone } = await mount();
-    fireEvent.keyDown(window, { key: "Escape" });
-    expect(onDone).toHaveBeenCalledTimes(1);
+  it("Continue hands off to the tour; Escape skips it", async () => {
+    const cases: Array<[string, () => void, "onDone" | "onSkipTour"]> = [
+      ["Continue", () => fireEvent.click(screen.getByRole("button", { name: "Continue" })), "onDone"],
+      ["Escape", () => fireEvent.keyDown(window, { key: "Escape" }), "onSkipTour"],
+    ];
+    for (const [how, dismiss, expected] of cases) {
+      const handlers = await mount();
+      dismiss();
+      expect(handlers[expected], how).toHaveBeenCalledTimes(1);
+      expect(handlers[expected === "onDone" ? "onSkipTour" : "onDone"], how).not.toHaveBeenCalled();
+      cleanup();
+    }
   });
 });
