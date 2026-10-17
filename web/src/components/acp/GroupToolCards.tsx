@@ -21,6 +21,7 @@ import { useToolDisplayMode } from "./ToolDisplayMode";
 import { useToolExpansionStore } from "./ToolExpansion";
 import { ToolCard } from "./ToolCards";
 import { ToolErrorBody } from "./ToolErrorBody";
+import { ToolOutputMedia } from "./ToolOutputMedia";
 
 const ICON = "h-3.5 w-3.5";
 
@@ -164,38 +165,41 @@ export function SubagentCard({ tool, result, children }: ToolCardProps & { child
   const [open, setOpen] = useToolCardExpansion(status);
 
   return (
-    <CardChrome
-      status={status}
-      {...spanTimes([{ tool, result }, ...children])}
-      icon={<Sparkles className={ICON} />}
-      label="subagent"
-      primary={
-        <>
-          <span className="truncate">{description}</span>
-          {hasChildren && (
-            <span className="ml-2 text-text-dim">
-              · {children.length} {children.length === 1 ? "tool" : "tools"}
-            </span>
-          )}
-        </>
-      }
-      expanded={open}
-      onToggle={() => setOpen((v) => !v)}
-      body={
-        open &&
-        (hasChildren ? (
-          <ChildCards items={children} nested />
-        ) : (
-          <ToolErrorBody status={status} errorText={result?.text}>
-            {prompt && <HighlightedBlock text={prompt} language="markdown" maxLines={8} />}
-            {status === "err" ? null : report ? (
-              <HighlightedBlock text={report} language="markdown" maxLines={20} />
-            ) : (
-              <PlaceholderLine>{status === "running" ? "Running…" : "(no result)"}</PlaceholderLine>
+    <>
+      <CardChrome
+        status={status}
+        {...spanTimes([{ tool, result }, ...children])}
+        icon={<Sparkles className={ICON} />}
+        label="subagent"
+        primary={
+          <>
+            <span className="truncate">{description}</span>
+            {hasChildren && (
+              <span className="ml-2 text-text-dim">
+                · {children.length} {children.length === 1 ? "tool" : "tools"}
+              </span>
             )}
-          </ToolErrorBody>
-        ))
-      }
-    />
+          </>
+        }
+        expanded={open}
+        onToggle={() => setOpen((v) => !v)}
+        body={
+          open &&
+          (hasChildren ? (
+            <ChildCards items={children} nested />
+          ) : (
+            <ToolErrorBody status={status} errorText={result?.text}>
+              {prompt && <HighlightedBlock text={prompt} language="markdown" maxLines={8} />}
+              {status === "err" ? null : report ? (
+                <HighlightedBlock text={report} language="markdown" maxLines={20} />
+              ) : (
+                <PlaceholderLine>{status === "running" ? "Running…" : "(no result)"}</PlaceholderLine>
+              )}
+            </ToolErrorBody>
+          ))
+        }
+      />
+      {result?.output?.length ? <ToolOutputMedia blocks={result.output} /> : null}
+    </>
   );
 }

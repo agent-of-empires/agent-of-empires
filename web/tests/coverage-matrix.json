@@ -3966,6 +3966,18 @@
       ]
     },
     {
+      "id": "acp.tool-output-media",
+      "kind": "mocked-playwright",
+      "risk": "medium",
+      "specs": [
+        "src/components/acp/activityMessages.test.ts",
+        "src/components/acp/ThreadMessages.test.tsx",
+        "tests/acp-tool-output-media.spec.ts"
+      ],
+      "components": ["web/src/components/acp/ThreadMessages.tsx", "web/src/components/acp/ToolOutputMedia.tsx"],
+      "notes": "A tool result's image, audio, link and resource blocks reach the card through the thread's tool part, so they render under it."
+    },
+    {
       "id": "acp.story.edit-card-diff-scroll",
       "kind": "mocked-playwright",
       "risk": "medium",
