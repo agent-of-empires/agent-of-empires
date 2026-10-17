@@ -20,6 +20,7 @@ use crate::plugin::sandbox::{NoSandbox, SandboxBackend};
 use crate::plugin::worker_logs;
 use crate::process::worker;
 use crate::server::push::StatusChange;
+use crate::session::lifecycle::LifecycleChange;
 
 const EVENT_RETENTION_PER_TOPIC: usize = 10_000;
 const MAX_WORKERS: usize = 32;
@@ -34,8 +35,10 @@ const REAP_GRACE: Duration = if cfg!(test) {
 
 /// First manifest schema version whose workers receive `session.status.changed`.
 const SESSION_STATUS_API_VERSION: u32 = 14;
-/// Status notifications a worker may have queued unread before further ones are dropped.
-const STATUS_QUEUE_CAP: usize = 64;
+/// First manifest schema version whose workers also receive `session.lifecycle.changed`.
+const SESSION_LIFECYCLE_API_VERSION: u32 = 18;
+/// Session notifications a worker may have queued unread before further ones are dropped.
+const EVENT_QUEUE_CAP: usize = 64;
 
 struct RunningWorker {
     supervisor_id: u64,
@@ -44,9 +47,11 @@ struct RunningWorker {
     inbound: Option<mpsc::UnboundedSender<String>>,
     ui_generation: Option<u64>,
     /// Bounded and separate from `inbound`, so a worker that stops reading stdin cannot grow
-    /// daemon memory through status events. `None` unless the plugin opted in.
-    status_inbound: Option<mpsc::Sender<String>>,
-    /// Status events dropped since the worker last accepted one, so a stalled worker logs once
+    /// daemon memory through session events. `None` unless the plugin opted in.
+    events_inbound: Option<mpsc::Sender<String>>,
+    /// Whether the plugin also opted into `session.lifecycle.changed`.
+    lifecycle_events: bool,
+    /// Session events dropped since the worker last accepted one, so a stalled worker logs once
     /// and the total on recovery instead of a line per event.
     dropped_events: u64,
 }
@@ -69,6 +74,22 @@ fn inactive_launch_diagnostic(enabled: bool, granted: bool) -> (tracing::Level, 
 
 fn wants_session_status(api_version: u32, granted: &[String]) -> bool {
     api_version >= SESSION_STATUS_API_VERSION && granted.iter().any(|c| c == CAP_SESSION_READ)
+}
+
+fn wants_session_lifecycle(api_version: u32, granted: &[String]) -> bool {
+    api_version >= SESSION_LIFECYCLE_API_VERSION && granted.iter().any(|c| c == CAP_SESSION_READ)
+}
+
+fn session_lifecycle_changed_params(change: &LifecycleChange) -> Value {
+    let mut params = serde_json::json!({
+        "session_id": change.session_id,
+        "kind": change.kind.as_str(),
+        "at": change.at.to_rfc3339(),
+    });
+    if let Some(summary) = &change.summary {
+        params["summary"] = summary.clone();
+    }
+    params
 }
 
 fn session_status_changed_params(change: &StatusChange) -> Value {
@@ -178,22 +199,56 @@ impl PluginHost {
     /// `sessions.list` only exposes the host's own profile, so a session from another profile is
     /// not pushed either.
     pub async fn emit_session_status_changed(&self, change: &StatusChange) {
-        if crate::session::config::effective_profile(self.api.profile()) != change.effective_profile
-        {
+        self.push_session_event(
+            "session.status.changed",
+            session_status_changed_params(change),
+            &change.effective_profile,
+            false,
+        )
+        .await;
+    }
+
+    /// Same scoping and delivery as [`Self::emit_session_status_changed`], to workers that
+    /// target `api_version >= 18`.
+    pub async fn emit_session_lifecycle_changed(&self, change: &LifecycleChange) {
+        self.push_session_event(
+            "session.lifecycle.changed",
+            session_lifecycle_changed_params(change),
+            &change.effective_profile,
+            true,
+        )
+        .await;
+    }
+
+    /// Queue one notification on every opted-in worker's bounded session-event queue, dropping
+    /// it for a worker that is not draining. `session_profile` is the session's effective
+    /// profile: `sessions.list` only exposes the host's own profile, so a session from another
+    /// profile is not pushed either.
+    async fn push_session_event(
+        &self,
+        method: &'static str,
+        params: Value,
+        session_profile: &str,
+        lifecycle: bool,
+    ) {
+        if crate::session::config::effective_profile(self.api.profile()) != session_profile {
             return;
         }
         let line = serde_json::json!({
             "jsonrpc": "2.0",
-            "method": "session.status.changed",
-            "params": session_status_changed_params(change),
+            "method": method,
+            "params": params,
         })
         .to_string()
             + "\n";
         let mut table = self.state.lock().await;
         for (plugin_id, worker) in table.running.iter_mut() {
-            let Some(queue) = &worker.status_inbound else {
+            let Some(queue) = &worker.events_inbound else {
                 continue;
             };
+            if lifecycle && !worker.lifecycle_events {
+                continue;
+            }
             match queue.try_send(line.clone()) {
                 Ok(()) => {
                     if worker.dropped_events > 0 {
@@ -201,7 +256,7 @@ impl PluginHost {
                             target: "plugin.host",
                             plugin = %plugin_id,
                             dropped = worker.dropped_events,
-                            "worker is draining its status queue again; session.status.changed events were dropped meanwhile, resync with sessions.list"
+                            "worker is draining its session event queue again; events were dropped meanwhile, resync with sessions.list"
                         );
                         worker.dropped_events = 0;
                     }
@@ -212,7 +267,8 @@ impl PluginHost {
                         tracing::warn!(
                             target: "plugin.host",
                             plugin = %plugin_id,
-                            "session.status.changed dropped: worker is not draining its queue; sessions.list is the fallback"
+                            method,
+                            "session event dropped: worker is not draining its queue; sessions.list is the fallback"
                         );
                     }
                     worker.dropped_events += 1;
@@ -220,7 +276,8 @@ impl PluginHost {
                 Err(mpsc::error::TrySendError::Closed(_)) => tracing::debug!(
                     target: "plugin.host",
                     plugin = %plugin_id,
-                    "session.status.changed not delivered (no live worker); sessions.list is the fallback"
+                    method,
+                    "session event not delivered (no live worker); sessions.list is the fallback"
                 ),
             }
         }
@@ -304,7 +361,8 @@ impl PluginHost {
                         task: tokio::spawn(async {}),
                         inbound: None,
                         ui_generation: None,
-                        status_inbound: None,
+                        events_inbound: None,
+                        lifecycle_events: false,
                         dropped_events: 0,
                     },
                 );
@@ -351,7 +409,8 @@ impl PluginHost {
                 task,
                 inbound: None,
                 ui_generation: None,
-                status_inbound: None,
+                events_inbound: None,
+                lifecycle_events: false,
                 dropped_events: 0,
             },
         );
@@ -479,6 +538,7 @@ impl PluginHost {
             .map(|c| c.as_str().to_string())
             .collect();
         let session_status = wants_session_status(plugin.manifest.api_version, &granted);
+        let session_lifecycle = wants_session_lifecycle(plugin.manifest.api_version, &granted);
         let ui_contributions: HashSet<(UiSlot, String)> = plugin
             .manifest
             .ui
@@ -536,7 +596,7 @@ impl PluginHost {
         let stdout = child.stdout.take().context("worker stdout missing")?;
 
         let (inbound_tx, mut inbound_rx) = mpsc::unbounded_channel::<String>();
-        let (status_tx, mut status_rx) = mpsc::channel::<String>(STATUS_QUEUE_CAP);
+        let (status_tx, mut status_rx) = mpsc::channel::<String>(EVENT_QUEUE_CAP);
         let status_tx = session_status.then_some(status_tx);
         let writer = tokio::spawn(async move {
             let mut stdin = stdin;
@@ -562,7 +622,8 @@ impl PluginHost {
                     w.pid = pid;
                     w.inbound = Some(inbound_tx.clone());
                     w.ui_generation = Some(ui_generation);
-                    w.status_inbound = status_tx;
+                    w.events_inbound = status_tx;
+                    w.lifecycle_events = session_lifecycle;
                     true
                 }
                 _ => false,
@@ -604,7 +665,8 @@ impl PluginHost {
             if let Some(w) = table.running.get_mut(plugin_id) {
                 if w.supervisor_id == supervisor_id {
                     w.inbound = None;
-                    w.status_inbound = None;
+                    w.events_inbound = None;
+                    w.lifecycle_events = false;
                     w.ui_generation = None;
                 }
             }
@@ -791,14 +853,34 @@ async fn serve_connection(
 
 #[cfg(test)]
 impl PluginHost {
-    /// Registers a fake worker and returns the receiver of its status queue. `None` models a
+    /// Registers a fake worker and returns the receiver of its session-event queue. `None` models a
     /// plugin that did not opt in, so the receiver never gets a line.
     pub(crate) async fn register_test_worker(
         &self,
         plugin_id: &str,
-        status_capacity: Option<usize>,
+        event_capacity: Option<usize>,
     ) -> mpsc::Receiver<String> {
-        let (tx, rx) = mpsc::channel(status_capacity.unwrap_or(1));
+        self.register_fake_worker(plugin_id, event_capacity, false)
+            .await
+    }
+
+    /// [`Self::register_test_worker`] for a worker that also opted into lifecycle events.
+    pub(crate) async fn register_lifecycle_test_worker(
+        &self,
+        plugin_id: &str,
+        event_capacity: usize,
+    ) -> mpsc::Receiver<String> {
+        self.register_fake_worker(plugin_id, Some(event_capacity), true)
+            .await
+    }
+
+    async fn register_fake_worker(
+        &self,
+        plugin_id: &str,
+        event_capacity: Option<usize>,
+        lifecycle_events: bool,
+    ) -> mpsc::Receiver<String> {
+        let (tx, rx) = mpsc::channel(event_capacity.unwrap_or(1));
         let mut table = self.state.lock().await;
         let supervisor_id = table.next_supervisor_id;
         table.next_supervisor_id += 1;
@@ -810,7 +892,8 @@ impl PluginHost {
                 task: tokio::spawn(async {}),
                 inbound: None,
                 ui_generation: None,
-                status_inbound: status_capacity.map(|_| tx),
+                events_inbound: event_capacity.map(|_| tx),
+                lifecycle_events,
                 dropped_events: 0,
             },
         );
@@ -829,7 +912,7 @@ impl PluginHost {
         table
             .running
             .get(plugin_id)
-            .is_some_and(|w| w.status_inbound.is_some())
+            .is_some_and(|w| w.events_inbound.is_some())
     }
 }
 
@@ -838,6 +921,7 @@ mod tests {
     use super::*;
     use crate::plugin::host_api::PluginRpcContext;
     use crate::server::push::StatusChange;
+    use crate::session::lifecycle::LifecycleKind;
     use crate::session::Status;
     use serde_json::json;
 
@@ -852,6 +936,143 @@ mod tests {
                 .unwrap()
                 .with_timezone(&chrono::Utc),
         }
+    }
+
+    fn lifecycle_change(kind: LifecycleKind, profile: &str) -> LifecycleChange {
+        let summary = json!({
+            "id": "sess-1",
+            "title": "My session",
+            "project_path": "/work/a",
+            "tool": "claude",
+            "status": "Idle",
+            "archived": false,
+            "snoozed": false,
+            "trashed": false,
+            "workspace_repos": [{ "source_path": "/work/a", "branch": "main" }],
+            "worktree": {
+                "branch": "feature/x",
+                "main_repo_path": "/work/a",
+                "managed_by_aoe": true
+            }
+        });
+        LifecycleChange {
+            session_id: "sess-1".to_string(),
+            effective_profile: profile.to_string(),
+            kind,
+            at: chrono::DateTime::parse_from_rfc3339("2026-10-05T12:00:00Z")
+                .unwrap()
+                .with_timezone(&chrono::Utc),
+            summary: (kind != LifecycleKind::Deleted).then_some(summary),
+        }
+    }
+
+    #[test]
+    fn session_lifecycle_gating() {
+        let caps = |c: &[&str]| c.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let cases = [
+            (18, caps(&["runtime.worker", "session.read"]), true),
+            (17, caps(&["runtime.worker", "session.read"]), false),
+            (14, caps(&["runtime.worker", "session.read"]), false),
+            (18, caps(&["runtime.worker"]), false),
+        ];
+        for (api_version, granted, want) in cases {
+            assert_eq!(
+                wants_session_lifecycle(api_version, &granted),
+                want,
+                "api_version={api_version} granted={granted:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn session_lifecycle_params_carry_the_sessions_list_entry() {
+        let created =
+            session_lifecycle_changed_params(&lifecycle_change(LifecycleKind::Created, "default"));
+        assert_eq!(
+            created,
+            json!({
+                "session_id": "sess-1",
+                "kind": "created",
+                "at": "2026-10-05T12:00:00+00:00",
+                "summary": {
+                    "id": "sess-1",
+                    "title": "My session",
+                    "project_path": "/work/a",
+                    "tool": "claude",
+                    "status": "Idle",
+                    "archived": false,
+                    "snoozed": false,
+                    "trashed": false,
+                    "workspace_repos": [{ "source_path": "/work/a", "branch": "main" }],
+                    "worktree": {
+                        "branch": "feature/x",
+                        "main_repo_path": "/work/a",
+                        "managed_by_aoe": true
+                    }
+                }
+            })
+        );
+
+        let deleted =
+            session_lifecycle_changed_params(&lifecycle_change(LifecycleKind::Deleted, "default"));
+        assert_eq!(
+            deleted,
+            json!({
+                "session_id": "sess-1",
+                "kind": "deleted",
+                "at": "2026-10-05T12:00:00+00:00",
+            }),
+            "a deleted session carries no summary"
+        );
+    }
+
+    #[tokio::test]
+    async fn emit_session_lifecycle_changed_reaches_lifecycle_workers_of_the_host_profile() {
+        let tmp = tempfile::tempdir().unwrap();
+        let host = PluginHost::new(tmp.path(), "default", None).unwrap();
+        let mut lifecycle = host
+            .register_lifecycle_test_worker("acme.lifecycle", 8)
+            .await;
+        // Opted into status events only (api_version 14): no lifecycle notifications.
+        let mut status_only = host.register_test_worker("acme.status", Some(8)).await;
+
+        host.emit_session_lifecycle_changed(&lifecycle_change(LifecycleKind::Archived, "other"))
+            .await;
+        assert!(
+            lifecycle.try_recv().is_err(),
+            "another profile is not pushed"
+        );
+
+        host.emit_session_lifecycle_changed(&lifecycle_change(LifecycleKind::Archived, "default"))
+            .await;
+        let line = lifecycle.try_recv().expect("lifecycle worker gets a line");
+        let msg: serde_json::Value = serde_json::from_str(line.trim_end()).unwrap();
+        assert_eq!(msg["method"], json!("session.lifecycle.changed"));
+        assert!(msg.get("id").is_none(), "must be a notification");
+        assert_eq!(msg["params"]["kind"], json!("archived"));
+        assert!(status_only.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn status_and_lifecycle_events_share_one_bounded_queue() {
+        let tmp = tempfile::tempdir().unwrap();
+        let host = PluginHost::new(tmp.path(), "default", None).unwrap();
+        let mut stuck = host.register_lifecycle_test_worker("acme.stuck", 2).await;
+
+        host.emit_session_status_changed(&status_change(Status::Running, Status::Idle))
+            .await;
+        host.emit_session_lifecycle_changed(&lifecycle_change(LifecycleKind::Renamed, "default"))
+            .await;
+        host.emit_session_lifecycle_changed(&lifecycle_change(LifecycleKind::Trashed, "default"))
+            .await;
+
+        assert!(stuck.try_recv().is_ok());
+        assert!(stuck.try_recv().is_ok());
+        assert!(
+            stuck.try_recv().is_err(),
+            "the third event is dropped, not queued"
+        );
+        assert_eq!(host.dropped_events("acme.stuck").await, Some(1));
     }
 
     #[test]
