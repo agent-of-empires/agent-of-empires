@@ -3,9 +3,17 @@
 import { act, renderHook } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-import { emptyAcpState, type AcpState, type BackgroundAgent } from "../../lib/acpTypes";
+import {
+  applyEvent,
+  emptyAcpState,
+  type AcpEvent,
+  type AcpState,
+  type ActivityRow,
+  type BackgroundAgent,
+} from "../../lib/acpTypes";
 import { STORAGE_KEY_PREFIX } from "../../lib/acpStateStorage";
 import {
+  cacheGet,
   cacheSet,
   clearAcpCache,
   evictOldestPersistedAcpState,
@@ -39,10 +47,83 @@ describe("loadPersistedState", () => {
 
   it("preserves stored values", () => {
     const elicitation = { nonce: "e-1", message: "Pick", questions: [], resolved: null };
-    writeEntry("seq", { ...emptyAcpState(), oldestSeq: 42, pendingElicitations: [elicitation] });
+    const activity = [{ id: "u", kind: "user_prompt", text: "u", at: "t" }];
+    writeEntry("seq", { ...emptyAcpState(), oldestSeq: 42, activity, pendingElicitations: [elicitation] });
     const loaded = loadPersistedState("seq");
     expect(loaded?.oldestSeq).toBe(42);
     expect(loaded?.pendingElicitations.map((e) => e.nonce)).toEqual(["e-1"]);
+  });
+});
+
+describe("loadPersistedState mid-turn cache (#4530)", () => {
+  const act = (id: string, kind: ActivityRow["kind"]): ActivityRow => ({ id, kind, text: id, at: "t" }) as ActivityRow;
+  const queued = [{ id: "q1", text: "next", queuedAt: "2026-01-01T00:00:00Z" }];
+  const configOptions = [
+    { id: "model", name: "Model", category: "model", current_value: "opus", options: [] },
+  ] as AcpState["configOptions"];
+  const backgroundAgents = [{ agentId: "a1", toolCallId: "tc1", status: "running" }] as AcpState["backgroundAgents"];
+  const entry = (activity: ActivityRow[], oldestSeq: number) => ({
+    ...emptyAcpState(),
+    lastSeq: 900,
+    oldestSeq,
+    activity,
+    queuedPrompts: queued,
+    configOptions,
+    backgroundAgents,
+  });
+
+  it.each([
+    ["no prompt, older history pending", [act("t", "tool_start")], 40, false],
+    ["prompt loaded", [act("u", "user_prompt"), act("t", "tool_start")], 40, true],
+    ["no prompt, whole history loaded", [act("t", "tool_start")], 1, true],
+  ])("%s", (_name, activity, oldestSeq, kept) => {
+    writeEntry("mid", entry(activity, oldestSeq));
+    const loaded = loadPersistedState("mid")!;
+    expect(loaded.queuedPrompts).toEqual(queued);
+    expect(loaded.configOptions).toEqual(configOptions);
+    expect(loaded.backgroundAgents).toEqual(backgroundAgents);
+    if (kept) expect(loaded).toMatchObject({ lastSeq: 900, oldestSeq, activity });
+    else expect(loaded).toMatchObject({ lastSeq: 900, oldestSeq: 0, activity: [] });
+  });
+});
+
+describe("mid-turn reset keeps usage accounting (#4530)", () => {
+  const usage = (amount: number): AcpEvent => ({
+    UsageUpdated: { usage: { used: 1, size: 200_000, cost: { amount, currency: "USD" } } },
+  });
+  const frame = (seq: number, event: AcpEvent) => ({ session_id: "s", seq, event });
+  const reopened = () => {
+    const activity = [{ id: "t", kind: "tool_start", text: "t", at: "t" }];
+    const sessionUsage = { used: 1, size: 200_000, cost: { amount: 2, currency: "USD" } };
+    const state = {
+      ...emptyAcpState(),
+      lastSeq: 900,
+      oldestSeq: 40,
+      activity,
+      sessionUsage,
+      usageBaseline: { cost: 10 },
+    };
+    writeEntry("usage", state);
+    return loadPersistedState("usage")!;
+  };
+
+  it("folds a boundary after the cached cursor into the cached usage", () => {
+    const state = [frame(901, "ConversationCompacted"), frame(902, usage(13))].reduce(applyEvent, reopened());
+    expect(state.sessionUsage?.cost?.amount).toBeCloseTo(1, 6);
+  });
+
+  it("drops a boundary the cache already accounted for", () => {
+    const state = [frame(800, "ConversationCompacted"), frame(801, usage(12))].reduce(applyEvent, reopened());
+    expect(state).toMatchObject({ usageBaseline: { cost: 10 }, sessionUsage: { cost: { amount: 2 } } });
+  });
+});
+
+describe("cacheGet mid-turn in-memory entry (#4530)", () => {
+  it("resets an in-memory entry without a prompt but keeps queued prompts", () => {
+    const queued = [{ id: "q1", text: "next", queuedAt: "2026-01-01T00:00:00Z" }];
+    const activity = [{ id: "t", kind: "tool_start", text: "t", at: "t" }] as ActivityRow[];
+    cacheSet("mem", { ...emptyAcpState(), lastSeq: 900, oldestSeq: 40, activity, queuedPrompts: queued });
+    expect(cacheGet("mem")).toMatchObject({ lastSeq: 900, oldestSeq: 0, activity: [], queuedPrompts: queued });
   });
 });
 

@@ -1,6 +1,7 @@
 // Per-session ACP state: an in-memory LRU backed by versioned localStorage entries.
 
 import { useCallback, useSyncExternalStore } from "react";
+import { lastUserBoundaryIndex } from "../../lib/acpHistoryWindow";
 import { emptyAcpState, normaliseTurnState, type AcpState, type BackgroundAgent } from "../../lib/acpTypes";
 import {
   STORAGE_KEY_PREFIX,
@@ -86,6 +87,13 @@ export function persistState(sessionId: string, state: AcpState): void {
   }
 }
 
+// Rows with no user prompt and older history pending would open mid-turn. Drop the rows and cursor so replay
+// reloads the transcript from the tail; folded control state keeps its own cursor and is untouched.
+function reopenState(state: AcpState): AcpState {
+  if (state.oldestSeq > 1 && lastUserBoundaryIndex(state.activity) < 0) return { ...state, activity: [], oldestSeq: 0 };
+  return state;
+}
+
 export function loadPersistedState(sessionId: string): AcpState | undefined {
   if (typeof window === "undefined") return undefined;
   try {
@@ -102,7 +110,7 @@ export function loadPersistedState(sessionId: string): AcpState | undefined {
       return undefined;
     }
     // Merge over defaults so entries from an older bundle gain newly added fields.
-    return normaliseTurnState({ ...emptyAcpState(), ...(state as AcpState) });
+    return reopenState(normaliseTurnState({ ...emptyAcpState(), ...(state as AcpState) }));
   } catch {
     return undefined;
   }
@@ -141,12 +149,12 @@ function lruInsert(sessionId: string, value: AcpState): void {
 }
 
 export function cacheGet(sessionId: string): AcpState | undefined {
-  const value = stateCache.get(sessionId) ?? loadPersistedState(sessionId);
+  const memory = stateCache.get(sessionId);
+  const value = memory ? reopenState(memory) : loadPersistedState(sessionId);
   if (value === undefined) return undefined;
-  const fromStorage = !stateCache.has(sessionId);
   lruInsert(sessionId, value);
-  // Wake subscribers that rendered before the cache was primed; deferred so it never fires mid-render.
-  if (fromStorage) queueMicrotask(() => notifyStateListeners(sessionId));
+  // Wake subscribers that rendered before the cache was primed or saw a pre-reset entry; deferred so it never fires mid-render.
+  if (value !== memory) queueMicrotask(() => notifyStateListeners(sessionId));
   return value;
 }
 

@@ -245,7 +245,7 @@ export function useAcpConnection(
       const controller = new AbortController();
       replayAbortRef.current = controller;
       return {
-        done: fetchReplay(sessionId, lastSeqRef, dispatch, setHasMoreOlder, controller.signal),
+        done: fetchReplay(sessionId, lastSeqRef, oldestSeqRef.current, dispatch, setHasMoreOlder, controller.signal),
         abort: () => controller.abort(),
       };
     };

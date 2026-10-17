@@ -37,20 +37,28 @@ const readRows = async (res: Response): Promise<TranscriptRow[]> =>
   ((await res.json()) as ReplayPageResponse).rows ?? [];
 
 /**
- * Catch up from `lastSeq.current`, updating it on a cold open. Errors are swallowed; a later lagged notice retries.
+ * Catch up from `lastSeq.current`, updating it on a cold open. A state with a cursor but no loaded history
+ * (`oldestSeq` 0) recovers its transcript from the tail first, then folds frames forward from its own cursor.
+ * Errors are swallowed; a later lagged notice retries.
  * Aborting `signal` cancels the requests and stops every later state write, so a stale snapshot cannot land
  * over newer socket content.
  */
 export async function fetchReplay(
   sid: string,
   lastSeq: { current: number },
+  oldestSeq: number,
   dispatch: Dispatch,
   setHasMoreOlder: (value: boolean) => void,
   signal: AbortSignal,
 ): Promise<void> {
   try {
-    if (lastSeq.current === 0) await fetchTail(sid, lastSeq, dispatch, setHasMoreOlder, signal);
-    else await fetchForward(sid, lastSeq.current, dispatch, signal);
+    if (lastSeq.current === 0) await fetchTail(sid, lastSeq, true, dispatch, setHasMoreOlder, signal);
+    else if (oldestSeq === 0) {
+      // Rows only: the cached control state is cursor-aware and must see each frame once, from its own cursor.
+      const from = lastSeq.current;
+      await fetchTail(sid, lastSeq, false, dispatch, setHasMoreOlder, signal);
+      await fetchForward(sid, from, dispatch, signal);
+    } else await fetchForward(sid, lastSeq.current, dispatch, signal);
   } catch {
     // Best effort.
   }
@@ -59,6 +67,7 @@ export async function fetchReplay(
 async function fetchTail(
   sid: string,
   lastSeq: { current: number },
+  applyFrames: boolean,
   dispatch: Dispatch,
   setHasMoreOlder: (value: boolean) => void,
   signal: AbortSignal,
@@ -76,7 +85,7 @@ async function fetchTail(
   let cursor = tail.next_cursor ?? 0;
   let hasMore = tail.has_more ?? false;
   // The handshake lives at the start of the log, which row pages do not carry.
-  const needsHandshake = hasMore && cursor > 1;
+  const needsHandshake = applyFrames && hasMore && cursor > 1;
   // Page back until the last user prompt is loaded, so the first window can open on the whole last turn.
   for (
     let pages = 0;
@@ -98,9 +107,9 @@ async function fetchTail(
     cursor = next;
   }
   signal.throwIfAborted();
-  dispatch({ kind: "frames", frames: tail.frames ?? [], rows, oldestSeq: cursor });
+  dispatch({ kind: "frames", frames: applyFrames ? (tail.frames ?? []) : [], rows, oldestSeq: cursor });
   setHasMoreOlder(hasMore);
-  if (tail.highest_seq > lastSeq.current) lastSeq.current = tail.highest_seq;
+  if (applyFrames && tail.highest_seq > lastSeq.current) lastSeq.current = tail.highest_seq;
   if (needsHandshake) {
     const hsRes = await getReplay(sid, `since=0&limit=${HANDSHAKE_PREFIX_SIZE}`, signal);
     if (hsRes.ok) {

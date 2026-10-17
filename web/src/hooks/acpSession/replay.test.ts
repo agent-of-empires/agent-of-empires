@@ -31,17 +31,44 @@ function mockReplay(pages: Record<string, Page>) {
   return requests;
 }
 
-async function coldOpen(signal = new AbortController().signal) {
-  const actions: { kind: string; rows?: ActivityRow[]; oldestSeq?: number }[] = [];
+async function reopen(signal = new AbortController().signal, lastSeq = 0, oldestSeq = 0) {
+  const actions: { kind: string; frames?: unknown[]; rows?: ActivityRow[]; oldestSeq?: number }[] = [];
   const handshakes = () => actions.filter((a) => a.kind === "handshake");
   const setHasMore = vi.fn();
-  await fetchReplay("sid", { current: 0 }, (a) => actions.push(a as (typeof actions)[number]), setHasMore, signal);
-  return { frames: actions.filter((a) => a.kind === "frames"), setHasMore, handshakes };
+  const cursor = { current: lastSeq };
+  await fetchReplay("sid", cursor, oldestSeq, (a) => actions.push(a as (typeof actions)[number]), setHasMore, signal);
+  return { frames: actions.filter((a) => a.kind === "frames"), setHasMore, handshakes, cursor };
 }
+const coldOpen = (signal?: AbortSignal) => reopen(signal);
 
 const TAIL = String(Number.MAX_SAFE_INTEGER);
 
 afterEach(() => vi.unstubAllGlobals());
+
+describe("rows recovery for a cached cursor without history", () => {
+  it("loads the transcript from the tail, then folds frames forward from the cached cursor", async () => {
+    const requests = mockReplay({
+      [TAIL]: { rows: [row("t1", "tool_start")], next_cursor: 80, has_more: true },
+      "80": { rows: [row("u", "user_prompt")], next_cursor: 40, has_more: true },
+    });
+    const { frames, cursor, handshakes } = await reopen(undefined, 900);
+    expect(frames[0]).toMatchObject({ frames: [], oldestSeq: 40 });
+    expect(frames[0]!.rows!.map((r) => r.id)).toEqual(["u", "t1"]);
+    expect(cursor.current).toBe(900);
+    expect(handshakes()).toEqual([]);
+    expect(requests.some((u) => u.includes("since=850&"))).toBe(true);
+    expect(requests.findIndex((u) => u.includes("before="))).toBeLessThan(
+      requests.findIndex((u) => u.includes("since=")),
+    );
+  });
+
+  it("only folds forward when history is already loaded", async () => {
+    const requests = mockReplay({});
+    await reopen(undefined, 900, 40);
+    expect(requests.some((u) => u.includes("before="))).toBe(false);
+    expect(requests.some((u) => u.includes("since=850&"))).toBe(true);
+  });
+});
 
 describe("fetchTail", () => {
   it("keeps paging older until the page holds a user prompt, then dispatches once", async () => {
