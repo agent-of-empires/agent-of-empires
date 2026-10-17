@@ -1210,6 +1210,13 @@ mod tests {
     #[serial]
     fn interrupted_rename_settles_before_purge_and_cannot_recreate_its_profile() {
         use std::os::unix::process::CommandExt as _;
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::WARN)
+            .with_test_writer()
+            .with_ansi(false)
+            .finish();
+        let _tracing = tracing::subscriber::set_default(subscriber);
+        tracing::callsite::rebuild_interest_cache();
         for point in [
             "profile-rename-after-journals",
             "profile-rename-after-registry",
@@ -1457,7 +1464,78 @@ mod tests {
                 crate::session::deletion::recover_lifecycle_journals_once().unwrap();
                 assert!(
                     !workspace.exists(),
-                    "{point}, rowless={rowless}: settled journal did not complete purge"
+                    "{point}, rowless={rowless}: settled journal did not complete purge\n{}",
+                    {
+                        let scan = lifecycle_journal::scan([
+                            storage.sessions_path().to_path_buf(),
+                            target.sessions_path().to_path_buf(),
+                            witness.sessions_path().to_path_buf(),
+                        ]);
+                        let journals = scan
+                            .entries
+                            .iter()
+                            .map(|(path, entry)| {
+                                (
+                                    path,
+                                    entry.as_ref().map(|entry| {
+                                        (
+                                            &entry.source_profile,
+                                            &entry.sessions_path,
+                                            entry.phase,
+                                            entry.generation,
+                                            &entry.instance.source_profile,
+                                        )
+                                    }),
+                                    lifecycle_journal::read_deletion(path)
+                                        .map(|entry| {
+                                            entry.map(|entry| entry.instance.source_profile)
+                                        })
+                                        .map_err(|error| format!("{error:#}")),
+                                )
+                            })
+                            .collect::<Vec<_>>();
+                        let rows = target
+                            .load()
+                            .map(|rows| {
+                                rows.into_iter()
+                                    .map(|row| {
+                                        (
+                                            row.id,
+                                            row.source_profile,
+                                            row.status,
+                                            row.lifecycle_generation,
+                                            row.lifecycle_reservation,
+                                        )
+                                    })
+                                    .collect::<Vec<_>>()
+                            })
+                            .map_err(|error| format!("{error:#}"));
+                        let registry =
+                            crate::process::worker_registry::record_path("renamed").map(|path| {
+                                let raw = fs::read_to_string(&path);
+                                (path, raw)
+                            });
+                        let fence = crate::process::worker_registry::workers_dir().map(|dir| {
+                            let path = dir.join("renamed.purge-fence");
+                            let raw = fs::read_to_string(&path);
+                            (path, raw)
+                        });
+                        let checkpoint = checkpoint_path().map(|path| {
+                            let raw = fs::read_to_string(&path);
+                            (path, raw)
+                        });
+                        format!(
+                            "journals (path, scan(profile,sessions_path,phase,generation,snapshot_profile), hydrated_snapshot_profile)={journals:#?}\n\
+                             unreadable_journal_dirs={:#?}\n\
+                             rows (id,profile,status,generation,reservation)={rows:#?}\n\
+                             registry={registry:#?}\n\
+                             orphan {orphan_path:?}={:#?}\n\
+                             purge_fence={fence:#?}\n\
+                             rename_checkpoint={checkpoint:#?}",
+                            scan.unreadable_dirs,
+                            fs::read_to_string(&orphan_path),
+                        )
+                    }
                 );
                 assert!(target.load().unwrap().is_empty());
                 assert!(!orphan_path.exists());
