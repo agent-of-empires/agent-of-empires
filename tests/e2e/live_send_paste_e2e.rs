@@ -1,4 +1,4 @@
-//! e2e coverage for multi-line paste in live-send mode.
+//! e2e coverage for live-send input forwarding.
 //!
 //! aoe used to hand-roll the xterm bracketed-paste markers (`ESC[200~` /
 //! `ESC[201~`) into a raw `send-keys -H` payload, so every pane received them
@@ -130,4 +130,61 @@ fn test_live_send_paste_into_non_bracketed_pane_has_no_marker_debris() {
         "bracketed-paste markers must not reach a pane that never set \
          DECSET 2004 (this is the `00~` / `01~` bug), got:\n{pane}"
     );
+}
+
+/// Ctrl+Enter must remain distinct from Enter when live-send forwards keys.
+#[test]
+#[parallel]
+fn test_live_send_forwards_ctrl_enter_as_csi_u() {
+    require_tmux!();
+
+    let mut h = TuiTestHarness::new("live_send_ctrl_enter");
+    write_live_send_config(&h);
+
+    let bin = h.install_path_command("omp");
+    std::fs::write(
+        bin.join("omp"),
+        "#!/bin/sh\n\
+stty -echo -icanon min 1 time 0 2>/dev/null\n\
+dd bs=1 count=7 2>/dev/null | od -An -tx1 | tr -d '[:space:]' > ctrl-enter-capture\n\
+sleep 60\n",
+    )
+    .expect("write key capture stub");
+
+    let project = h.project_path();
+    let add = h.run_cli(&[
+        "add",
+        project.to_str().unwrap(),
+        "-t",
+        "CtrlEnter",
+        "--tool",
+        "omp",
+    ]);
+    assert!(
+        add.status.success(),
+        "aoe add failed: {}",
+        String::from_utf8_lossy(&add.stderr)
+    );
+
+    h.spawn_tui();
+    h.wait_for("CtrlEnter");
+    h.send_keys("Enter");
+    h.wait_for_timeout("LIVE", Duration::from_secs(10));
+    h.send_hex_keys(&["1b", "5b", "31", "33", "3b", "35", "75"]);
+
+    let capture = project.join("ctrl-enter-capture");
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let bytes = loop {
+        if let Ok(bytes) = std::fs::read_to_string(&capture) {
+            if !bytes.is_empty() {
+                break bytes;
+            }
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "Ctrl+Enter did not reach the live-send pane"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    assert_eq!(bytes, "1b5b31333b3575");
 }

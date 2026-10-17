@@ -55,6 +55,7 @@
                 ./assets
                 ./docker
                 ./web/tests/helpers/fakeAcpAgent.mjs
+                ./tests/fixtures/omp
               ];
             };
             strictDeps = true;

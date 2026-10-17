@@ -951,9 +951,9 @@ pub const AGENTS: &[AgentDef] = &[
             SessionCaptureContext::PaneScoped,
         ),
         permission_response: Some(PermissionResponse {
-            allow: &[KeyToken::Named("Enter")],
+            allow: &[KeyToken::Named("C-q")],
             allow_always: None,
-            deny: &[KeyToken::Named("Down"), KeyToken::Named("Enter")],
+            deny: &[KeyToken::Named("Escape")],
         }),
         ..agent("omp", "omp", "curl -fsSL https://omp.sh/install | sh")
     },

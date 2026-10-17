@@ -1,0 +1,32 @@
+# FIXTURE: OMP - Waiting_permission State
+# Captured from: omp/18.11.0
+# Capture date: 2026-10-15
+# Verified against: omp/18.11.0 (last check: 2026-10-15)
+# To add more: scripts/capture-fixtures.sh omp waiting_permission <tmux_session> [description]
+#
+# Expected status: Waiting
+# Status line preset: custom
+# Key indicators: Allow tool panel with Ctrl+Enter/Ctrl+Q approve, Esc deny, Ctrl+O details, type-to-steer footer, and custom status line
+
+────────────────────────────────────────────────────────────────────────────────
+Update Available
+New version 18.11.1 is available. Run: omp update
+────────────────────────────────────────────────────────────────────────────────
+
+
+ Run pwd in the shell and do nothing else.
+
+
+╭──────────────────────────────────────────────────────────────────────────────╮
+│ $ pwd                                                                        │
+╰──────────────────────────────────────────────────────────────────────────────╯
+
+ ⎋ Printing working directory
+
+╭─ Allow tool: bash ───────────────────────────────────────────────────────────╮
+│ Command: pwd                                                                 │
+├──────────────────────────────────────────────────────────────────────────────┤
+│ ⌃⏎/⌃Q approve · ⎋ deny · ⌃O details · type to steer instead                  │
+╰──────────────────────────────────────────────────────────────────────────────╯
+╭── ◕ GPT-6.1-Sol > 🏃 Prewalk ─────────────────────────────────┃───── S0.04 ──╮
+╰─                                                                            ─╯

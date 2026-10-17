@@ -5058,9 +5058,9 @@ impl HomeView {
 
     /// Present without consuming a key or interrupting agent input or another action.
     pub(in crate::tui) fn try_present_shortcut_bar_tip(&mut self) -> bool {
-        if !self
+        if self
             .pending_tip_pop
-            .is_some_and(|tip| tip.id == crate::tips::SHORTCUT_BAR_TIP_ID)
+            .is_none_or(|tip| tip.id != crate::tips::SHORTCUT_BAR_TIP_ID)
             || self.has_dialog()
             || self.is_creation_pending()
             || self.structured_preview_pending
@@ -6082,6 +6082,10 @@ impl HomeView {
     /// exit + info dialog instead.
     fn handle_live_send_key(&mut self, key: KeyEvent) -> Option<Action> {
         let state = self.live_send.clone()?;
+        let use_omp_approval_chord = matches!(&state.target, live_send::LiveSendTarget::Agent)
+            && self
+                .get_instance(&state.session_id)
+                .is_some_and(|inst| inst.tool == "omp");
 
         // Leader menu: a prior keystroke matched the configured leader
         // (tmux-style prefix, default Ctrl+B), so this key picks a
@@ -6094,7 +6098,12 @@ impl HomeView {
             // leader never fully steals the chord from downstream programs.
             if let Some(leader) = state.leader {
                 if live_send::chord_matches(leader, key) {
-                    if let live_send::LiveDispatch::Send(tmux_key) = live_send::translate(key) {
+                    let dispatch = if use_omp_approval_chord {
+                        live_send::translate_with_omp_approval_chord(key)
+                    } else {
+                        live_send::translate(key)
+                    };
+                    if let live_send::LiveDispatch::Send(tmux_key) = dispatch {
                         if let Some(worker) = &self.live_send_worker {
                             worker.send(tmux_key);
                         }
@@ -6177,7 +6186,12 @@ impl HomeView {
         // the user learns the keystroke landed on the agent; re-armed per press (#2894).
         let is_ctrl_c =
             matches!(key.code, KeyCode::Char('c')) && key.modifiers.contains(KeyModifiers::CONTROL);
-        match live_send::translate(key) {
+        let dispatch = if use_omp_approval_chord {
+            live_send::translate_with_omp_approval_chord(key)
+        } else {
+            live_send::translate(key)
+        };
+        match dispatch {
             live_send::LiveDispatch::Ignore => {}
             live_send::LiveDispatch::Send(tmux_key) => {
                 if let Some(worker) = &self.live_send_worker {

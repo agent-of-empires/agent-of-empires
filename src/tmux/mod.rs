@@ -28,6 +28,9 @@ pub use utils::{attach_return_hint, tmux_prefix_display};
 
 pub(crate) use session_kind::{append_session_kind_args, SessionKind};
 
+/// Ctrl+Enter in CSI-u mode, kept distinct from the ordinary Enter key.
+pub(crate) const CSI_U_CTRL_ENTER: &[u8] = b"\x1b[13;5u";
+
 /// Change count of `session`'s advertised OSC 8 links; always 0 off unix.
 pub(crate) fn pane_links_generation(session: &str) -> u64 {
     #[cfg(unix)]

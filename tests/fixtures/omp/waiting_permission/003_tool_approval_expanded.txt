@@ -1,0 +1,83 @@
+# FIXTURE: OMP - Waiting_permission State
+# Captured from: omp/18.11.1
+# Capture date: 2026-10-15
+# Verified against: omp/18.11.1 (last check: 2026-10-15)
+# To add more: scripts/capture-fixtures.sh omp waiting_permission <tmux_session> [description]
+#
+# Expected status: Waiting
+# Key indicators: expanded long command details wrap to eight rows; docked approval title and shortcut footer remain visible
+
+ approval-detail-05 approval-detail-06 approval-detail-07 approval-detail-08
+ approval-detail-09 approval-detail-10 approval-detail-11 approval-detail-12
+ approval-detail-13 approval-detail-14 approval-detail-15 approval-detail-16
+ approval-detail-17 approval-detail-18 approval-detail-19 approval-detail-20
+ approval-detail-21 approval-detail-22 approval-detail-23 approval-detail-24
+ approval-detail-25 approval-detail-26 approval-detail-27 approval-detail-28
+ approval-detail-29 approval-detail-30 approval-detail-31 approval-detail-32
+ approval-detail-33 approval-detail-34 approval-detail-35 approval-detail-36
+ approval-detail-37 approval-detail-38 approval-detail-39 approval-detail-40
+ approval-detail-41 approval-detail-42 approval-detail-43 approval-detail-44
+ approval-detail-45 approval-detail-46 approval-detail-47 approval-detail-48
+ approval-detail-49 approval-detail-50 approval-detail-51 approval-detail-52
+ approval-detail-53 approval-detail-54 approval-detail-55 approval-detail-56
+ approval-detail-57 approval-detail-58 approval-detail-59 approval-detail-60
+ approval-detail-61 approval-detail-62 approval-detail-63 approval-detail-64
+ approval-detail-65 approval-detail-66 approval-detail-67 approval-detail-68
+ approval-detail-69 approval-detail-70 approval-detail-71 approval-detail-72
+ approval-detail-73 approval-detail-74 approval-detail-75 approval-detail-76
+ approval-detail-77 approval-detail-78 approval-detail-79 approval-detail-80 '
+
+
+The earlier command was denied; it will not be retried. No files or symbols are
+involved.
+
+Plan:
+1. Verify the format is exactly '%s\n'.
+2. Verify the single argument contains approval-detail-01 through
+   approval-detail-80, in order.
+3. Preserve the space after approval-detail-80 and the closing quote.
+4. Run your exact command once, without additions.
+5. Check the tool result: success should produce one line containing the
+   supplied argument, including its trailing space. If approval is denied, stop
+   without retrying or bypassing the gate.
+
+No files, tests, or verification assets will be changed; no additional shell
+commands will run.
+
+╭─── ☑ Todo 5 tasks ───────────────────────────────────────────────────────────╮
+│ ├─ ☑ Verify the single argument contains approval-detail-01 through          │
+│ │  approval-detail-80 in order.                                              │
+│ ├─ ☐ Verify the trailing space and closing quote are preserved.              │
+│ ├─ ☐ Execute the exact requested command once without additions.             │
+│ └─ ☐ Verify the command result without running additional commands.          │
+╰──────────────────────────────────────────────────────────────────────────────╯
+
+ *
+ Run printf with a long fixed argument of eighty distinct approval-detail-NN
+ words, and do nothing else. It must be one shell command.
+
+
+ ├─ Tasks · 2/5
+ │  ├─ ☑ Verify the single argument contains approval-detail-01 through
+approval-detail-80 in order.
+ │  ├─ ☐ Verify the trailing space and closing quote are preserved.
+ │  ├─ ☐ Execute the exact requested command once without additions.
+ │  └─ ☐ Verify the command result without running additional commands.
+ └─────
+
+ ⎋ Running requested printf command
+
+╭─ Allow tool: bash ───────────────────────────────────────────────────────────╮
+│ Command: printf '%s\n' 'approval-detail-01 approval-detail-02              █ │
+│ approval-detail-03 approval-detail-04 approval-detail-05 approval-detail-06█ │
+│ approval-detail-07 approval-detail-08 approval-detail-09 approval-detail-10█ │
+│ approval-detail-11 approval-detail-12 approval-detail-13 approval-detail-14│ │
+│ approval-detail-15 approval-detail-16 approval-detail-17 approval-detail-18│ │
+│ approval-detail-19 approval-detail-20 approval-detail-21 approval-detail-22│ │
+│ approval-detail-23 approval-detail-24 approval-detail-25 approval-detail-26│ │
+│ approval-detail-27 approval-detail-28 approval-detail-29 approval-detail-30│ │
+├──────────────────────────────────────────────────────────────────────────────┤
+│ ⌃⏎/⌃Q approve · ⎋ deny · ⌃O less · ↑/↓ scroll · type to steer instead        │
+╰──────────────────────────────────────────────────────────────────────────────╯
+╭── ◕ GPT-6.1-Sol > 🏃 Prewalk ─────────────────────────────────┃───── S0.08 ──╮
+╰─                                                                            ─╯

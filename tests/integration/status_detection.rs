@@ -110,3 +110,24 @@ mod opencode {
         }
     }
 }
+
+mod omp {
+    use super::*;
+
+    fn detect(content: &str) -> Status {
+        let agent = agents::get_agent("omp").unwrap();
+        (agent.detect_status)(content)
+    }
+
+    #[test]
+    #[serial_test::parallel]
+    fn approval_dialog_fixture_detects_waiting() {
+        test_all_fixtures_in_dir(
+            "omp",
+            "waiting_permission",
+            Status::Waiting,
+            identity,
+            detect,
+        );
+    }
+}

@@ -154,9 +154,9 @@ describe("MobileLiveTerminal paste", () => {
 describe("MobileLiveTerminal key sequences", () => {
   it.each([
     ["Enter", {}, "\r"],
-    // Shift and Ctrl Enter insert a soft newline for agents.
-    ["Enter", { ctrlKey: true }, "\x1b\r"],
+    ["Enter", { ctrlKey: true }, "\x1b[13;5u"],
     ["Enter", { shiftKey: true }, "\x1b\r"],
+    ["Enter", { ctrlKey: true, shiftKey: true }, "\x1b\r"],
     ["Backspace", { altKey: true }, "\x1b\x7f"],
     ["Backspace", { ctrlKey: true }, "\x7f"],
     ["Tab", {}, "\t"],

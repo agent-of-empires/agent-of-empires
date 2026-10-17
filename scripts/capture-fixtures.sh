@@ -23,14 +23,21 @@ capitalize() {
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"
-FIXTURES_DIR="$PROJECT_ROOT/tests/fixtures"
+FIXTURES_DIR="${AOE_FIXTURES_DIR:-$PROJECT_ROOT/tests/fixtures}"
+
+tmux() {
+    if [[ -n "${AOE_TMUX_SOCKET:-}" ]]; then
+        command tmux -S "$AOE_TMUX_SOCKET" "$@"
+    else
+        command tmux "$@"
+    fi
+}
 
 usage() {
     echo "Usage: $0 <tool> <state> <tmux_session> [description]"
     echo ""
     echo "Arguments:"
-    echo "  tool          Tool name: 'claude' or 'opencode'"
-    echo "  state         State to capture: 'running', 'waiting_question', 'waiting_permission', 'idle'"
+    echo "  tool          Tool name: 'claude', 'claude_code', 'opencode', or 'omp'"
     echo "  tmux_session  Name of the tmux session to capture from"
     echo "  description   Optional description for the fixture filename (e.g., 'tool_call')"
     echo ""
@@ -38,6 +45,8 @@ usage() {
     echo "  $0 claude running aoe_myproject_abc12345"
     echo "  $0 claude running aoe_myproject_abc12345 tool_call"
     echo "  $0 opencode waiting_question aoe_task_def67890 clarification"
+    echo "  $0 omp waiting_permission aoe_myproject_abc12345 tool_approval_custom"
+    echo "  $0 omp waiting_permission aoe_myproject_abc12345 tool_approval_compact"
     echo ""
     echo "Output filename format: NNN_description.txt (e.g., 001_capture.txt, 002_tool_call.txt)"
     echo ""
@@ -73,8 +82,12 @@ case "$TOOL" in
         TOOL_DIR="opencode"
         TOOL_DISPLAY="OpenCode"
         ;;
+    omp)
+        TOOL_DIR="omp"
+        TOOL_DISPLAY="OMP"
+        ;;
     *)
-        echo "Error: Invalid tool '$TOOL'. Must be 'claude' or 'opencode'."
+        echo "Error: Invalid tool '$TOOL'. Must be 'claude', 'opencode', or 'omp'."
         exit 1
         ;;
 esac
@@ -126,6 +139,9 @@ get_version() {
         opencode)
             opencode --version 2>/dev/null | head -1 || echo "unknown"
             ;;
+        omp)
+            omp --version 2>/dev/null | head -1 || echo "unknown"
+            ;;
     esac
 }
 
@@ -173,5 +189,5 @@ echo "  1. Review the captured content: cat $OUTPUT_FILE"
 echo "  2. Update the 'Key indicators' comment if needed"
 echo "  3. Run tests: cargo test --test integration status_detection"
 echo ""
-echo "If tests fail, you may need to update the detection logic in:"
-echo "  src/tmux/session.rs (detect_claude_status or detect_opencode_status)"
+echo "If tests fail, update the relevant detector under:"
+echo "  src/tmux/detect/"

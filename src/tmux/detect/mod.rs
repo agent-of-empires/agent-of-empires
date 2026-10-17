@@ -130,4 +130,79 @@ mod tests {
         }
         assert_eq!(manifests().len(), MANIFEST_SOURCES.len());
     }
+
+    #[test]
+    fn omp_docked_tool_approval_is_waiting_with_wrapped_composer() {
+        let screen = [
+            "Earlier command was denied; it will not be retried.",
+            "Plan:",
+            "1. Verify the command.",
+            "╭─── ☑ Todo 5 tasks ─────────────────────────────────────╮",
+            "│ ├─ ☑ Verify the command.                               │",
+            "╰────────────────────────────────────────────────────────╯",
+            "* Run printf with a long fixed argument.",
+            "⎋ Running requested printf command",
+            "╭─ Allow tool: bash ──────────────────────────────────────╮",
+            "│ Command: printf approval-1                              │",
+            "├─────────────────────────────────────────────────────────┤",
+            "│ ⌃⏎/⌃Q approve · ⎋ deny · ⌃O less                       │",
+            "╰─────────────────────────────────────────────────────────╯",
+            "draft line one",
+            "draft line two",
+            "draft line three",
+            "draft line four",
+            "draft line five",
+            "draft line six",
+            "draft line seven",
+            "draft line eight",
+            "draft line nine",
+            "draft line ten",
+            "draft line eleven",
+            "draft line twelve",
+            "draft line thirteen",
+            "draft line fourteen",
+            "draft line fifteen",
+            "draft line sixteen",
+            "draft line seventeen",
+            "draft line eighteen",
+            "╭── GPT-6.1-Sol > Prewalk ────────────────────────────────╮",
+            "╰─────────────────────────────────────────────────────────╯",
+        ]
+        .join("\n");
+        let detection = detect("omp", &screen, "", None).expect("OMP manifest");
+
+        assert_eq!(detection.status, Some(Status::Waiting));
+        assert_eq!(detection.rule, "tool_approval");
+    }
+
+    #[test]
+    fn omp_tool_approval_requires_a_bounded_panel_footer() {
+        let panel = [
+            "╭─ Allow tool: bash ──────────────────────────────────────╮",
+            "│ Command: printf approval-1                              │",
+            "├─────────────────────────────────────────────────────────┤",
+            "│ ⌃⏎/⌃Q approve · ⎋ deny                                 │",
+            "╰─────────────────────────────────────────────────────────╯",
+        ];
+
+        for (trailing_lines, expected) in [(22, true), (23, false)] {
+            let mut lines = panel.map(str::to_string).to_vec();
+            lines.extend((0..trailing_lines).map(|line| format!("new prompt content {line}")));
+            let detection = detect("omp", &lines.join("\n"), "", None).expect("OMP manifest");
+            assert_eq!(
+                detection.status == Some(Status::Waiting),
+                expected,
+                "footer position should be {}",
+                trailing_lines + 2
+            );
+        }
+
+        let prose = [
+            "The old answer discussed Allow tool: bash and said approve or deny.",
+            "No approval is currently open.",
+        ]
+        .join("\n");
+        let detection = detect("omp", &prose, "", None).expect("OMP manifest");
+        assert_ne!(detection.status, Some(Status::Waiting));
+    }
 }

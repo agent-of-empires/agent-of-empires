@@ -60,7 +60,8 @@ function navigationKeySequence(e: TerminalKeyLike): string | null {
 export function specialKeySequence(e: TerminalKeyLike): string | null {
   switch (e.key) {
     case "Enter":
-      // Shift/Ctrl+Enter inserts a soft newline (ESC CR, as Alt+Enter) instead of submitting.
+      if (e.ctrlKey && !e.shiftKey && !e.altKey && !e.metaKey) return "\x1b[13;5u";
+      // Shift+Enter stays a soft newline; Ctrl+Enter needs CSI-u to retain its modifier.
       return (e.shiftKey || e.ctrlKey) && !e.altKey && !e.metaKey ? "\x1b\r" : "\r";
     case "Backspace":
       return e.altKey && !e.ctrlKey && !e.metaKey ? "\x1b\x7f" : "\x7f";

@@ -7,9 +7,12 @@ use std::sync::OnceLock;
 pub(super) struct Screen<'a> {
     /// The most recent [`RECENT_LINES`] non-empty lines.
     recent: Vec<&'a str>,
-    /// Whether a blank row sat above each [`Self::recent`] line.
+    /// A larger explicit bottom window for tall, bounded panels.
+    extended_recent: Vec<&'a str>,
+    /// Whether a blank row sat above each recent line.
     blank_before: Vec<bool>,
     osc_title: &'a str,
+    extended_joined: OnceLock<String>,
     joined: OnceLock<String>,
     collapsed: OnceLock<String>,
     unstacked: OnceLock<String>,
@@ -21,6 +24,7 @@ pub(super) struct Screen<'a> {
 }
 
 const RECENT_LINES: usize = 30;
+const EXTENDED_REGION_LINES: usize = 40;
 
 /// A landmark line (a turn divider, an input box rule, a banner) that regions
 /// like `after(<name>)` and `above(<name>, n)` resolve through.
@@ -138,12 +142,12 @@ impl Region {
             .strip_prefix("bottom_non_empty_lines(")
             .and_then(|r| r.strip_suffix(')'))
         {
-            // Zero is a manifest bug, reported at build time by `manifests_compile`.
+            // Keep manifest bounds within the available capture window.
             return n
                 .trim()
                 .parse()
                 .ok()
-                .filter(|n| *n > 0)
+                .filter(|n| (1..=EXTENDED_REGION_LINES).contains(n))
                 .map(Region::BottomLines);
         }
         Some(match raw {
@@ -174,13 +178,16 @@ impl<'a> Screen<'a> {
             non_empty.push(line);
             blank_before.push(std::mem::take(&mut after_blank));
         }
-        let start = non_empty.len().saturating_sub(RECENT_LINES);
+        let recent_start = non_empty.len().saturating_sub(RECENT_LINES);
+        let extended_start = non_empty.len().saturating_sub(EXTENDED_REGION_LINES);
         Self {
-            recent: non_empty[start..].to_vec(),
-            blank_before: blank_before[start..].to_vec(),
+            recent: non_empty[recent_start..].to_vec(),
+            extended_recent: non_empty[extended_start..].to_vec(),
+            blank_before: blank_before[recent_start..].to_vec(),
             osc_title,
             joined: OnceLock::new(),
             collapsed: OnceLock::new(),
+            extended_joined: OnceLock::new(),
             unstacked: OnceLock::new(),
             above_input_box: OnceLock::new(),
             prompt_box_body: OnceLock::new(),
@@ -206,12 +213,23 @@ impl<'a> Screen<'a> {
                 .unstacked
                 .get_or_init(|| unstack(&self.recent, &self.blank_before)),
             Region::BottomLines(n) => {
-                let start = self.recent.len().saturating_sub(n);
+                let lines = if n > RECENT_LINES {
+                    &self.extended_recent
+                } else {
+                    &self.recent
+                };
+                let joined = if n > RECENT_LINES {
+                    self.extended_joined
+                        .get_or_init(|| self.extended_recent.join("\n"))
+                } else {
+                    self.joined()
+                };
+                let start = lines.len().saturating_sub(n);
                 if start == 0 {
-                    return std::borrow::Cow::Borrowed(self.joined());
+                    return std::borrow::Cow::Borrowed(joined);
                 }
-                let skipped: usize = self.recent[..start].iter().map(|l| l.len() + 1).sum();
-                &self.joined()[skipped..]
+                let skipped: usize = lines[..start].iter().map(|l| l.len() + 1).sum();
+                &joined[skipped..]
             }
             Region::AboveInputBox => self
                 .above_input_box
@@ -383,4 +401,24 @@ pub(super) fn collapse_ascii_whitespace(text: &str) -> String {
         out.push(c);
     }
     out
+}
+#[cfg(test)]
+mod tests {
+    use super::{Region, EXTENDED_REGION_LINES};
+
+    #[test]
+    fn bottom_lines_region_rejects_values_outside_capture_window() {
+        assert_eq!(
+            Region::parse(&format!("bottom_non_empty_lines({EXTENDED_REGION_LINES})")),
+            Some(Region::BottomLines(EXTENDED_REGION_LINES))
+        );
+        assert_eq!(
+            Region::parse(&format!(
+                "bottom_non_empty_lines({})",
+                EXTENDED_REGION_LINES + 1
+            )),
+            None
+        );
+        assert_eq!(Region::parse("bottom_non_empty_lines(0)"), None);
+    }
 }
