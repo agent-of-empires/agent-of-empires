@@ -43,6 +43,13 @@ pub async fn acp_set_mode(
         Ok(j) => j,
         Err(rej) => return rej.into_response(),
     };
+    let Some(_submission) = state
+        .session_service
+        .prompt_submission_for_session(&id)
+        .await
+    else {
+        return session_not_found();
+    };
     match state.acp_supervisor.set_mode(&id, &req.mode_id).await {
         Ok(()) => {
             count_plan_mode(&state, &req.mode_id);
@@ -86,12 +93,16 @@ async fn persist_selector(
     selector: PersistedSelector,
     value: &str,
 ) {
+    let _reload = state.session_service.disk_mutation_guard().await;
     let profile = {
         let mut instances = state.instances.write().await;
         let Some(inst) = instances.iter_mut().find(|i| i.id == id) else {
             return;
         };
         selector.apply(inst, value.to_string());
+        state
+            .mutation_epoch
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         inst.source_profile.clone()
     };
     match crate::session::Storage::new(&profile, state.file_watch.clone()) {
@@ -164,6 +175,13 @@ pub async fn acp_set_config_option(
         Ok(j) => j,
         Err(rej) => return rej.into_response(),
     };
+    let Some(_submission) = state
+        .session_service
+        .prompt_submission_for_session(&id)
+        .await
+    else {
+        return session_not_found();
+    };
     if let Err(e) = state
         .acp_supervisor
         .set_config_option(&id, &req.config_id, &req.value)
@@ -172,8 +190,7 @@ pub async fn acp_set_config_option(
         return supervisor_error_response("set_config_option failed", &e);
     }
     count_plan_mode(&state, &req.value);
-    // The reconciler re-applies these fields on every spawn, so without the
-    // write-back a respawn reverts the pick (#3086).
+    // Respawns reuse persisted selector picks.
     let selector = if req.config_id == "model" {
         Some(PersistedSelector::Model)
     } else {
@@ -226,7 +243,19 @@ mod tests {
                 .unwrap();
 
             let state = crate::server::test_support::build_test_app_state(vec![inst]);
+            let read_epoch = state
+                .mutation_epoch
+                .load(std::sync::atomic::Ordering::SeqCst);
+            let stale = crate::server::reload::load_all_instances(&state.file_watch);
             persist_selector(&state, &id, selector, value).await;
+            crate::server::reload::reload_state_instances_from_disk(
+                &state,
+                stale,
+                vec![],
+                crate::server::state::StatusSource::DiskOnly,
+                read_epoch,
+            )
+            .await;
 
             let field = |inst: &crate::session::Instance| match selector {
                 PersistedSelector::Model => inst.agent_model.clone(),
@@ -243,6 +272,29 @@ mod tests {
                 .unwrap();
             let on_disk = reloaded.iter().find(|i| i.id == id).unwrap();
             assert_eq!(field(on_disk).as_deref(), Some(value), "{selector:?}");
+            let storage = crate::session::Storage::new_unwatched("default").unwrap();
+            storage
+                .update(|rows, _| {
+                    rows.iter_mut().find(|row| row.id == id).unwrap().title =
+                        "accepted fresh reload".into();
+                    Ok(())
+                })
+                .unwrap();
+            let epoch = state
+                .mutation_epoch
+                .load(std::sync::atomic::Ordering::SeqCst);
+            let fresh = crate::server::reload::load_all_instances(&state.file_watch);
+            crate::server::reload::reload_state_instances_from_disk(
+                &state,
+                fresh,
+                vec![],
+                crate::server::state::StatusSource::DiskOnly,
+                epoch,
+            )
+            .await;
+            let live = state.instances.read().await;
+            assert_eq!(live[0].title, "accepted fresh reload");
+            assert_eq!(field(&live[0]).as_deref(), Some(value));
         }
     }
 

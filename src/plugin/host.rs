@@ -1038,7 +1038,9 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::parallel]
     async fn worker_subprocess_round_trip_and_capability_gate() {
+        let _env = crate::session::test_support::EnvGuard::read_lock();
         if which::which("node").is_err() {
             eprintln!("skipping: node not found on PATH");
             return;
@@ -1079,7 +1081,9 @@ process.stdout.write(JSON.stringify({jsonrpc:"2.0",id:1,method:"session.meta.set
     }
 
     #[tokio::test]
+    #[serial_test::parallel]
     async fn host_initiated_notification_reaches_worker() {
+        let _env = crate::session::test_support::EnvGuard::read_lock();
         if which::which("node").is_err() {
             eprintln!("skipping: node not found on PATH");
             return;

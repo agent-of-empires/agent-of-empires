@@ -54,6 +54,7 @@
                 ./acp-worker/test-shim/shim.mjs
                 ./assets
                 ./docker
+                ./tests/fixtures/cli-read
                 ./web/tests/helpers/fakeAcpAgent.mjs
               ];
             };

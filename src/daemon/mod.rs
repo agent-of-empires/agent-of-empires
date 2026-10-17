@@ -214,17 +214,29 @@ impl DaemonClient {
 }
 
 pub(crate) fn is_loopback_url(url: &Url) -> bool {
-    let Some(host) = url.host_str() else {
-        return false;
-    };
-    let ip_host = host
-        .strip_prefix('[')
+    url.host_str().is_some_and(is_loopback_host)
+}
+
+/// The host half of [`is_loopback_url`], for the callers that have read a host
+/// rather than a URL. A name equal to `localhost` whatever its case, or a
+/// loopback address.
+pub(crate) fn is_loopback_host(host: &str) -> bool {
+    host.eq_ignore_ascii_case("localhost") || is_loopback_address(host)
+}
+
+/// The address half, for the callers that need to know whether the peer is the
+/// machine they are on rather than whether it is named something friendly. A
+/// name is not an answer here, because nothing in this predicate resolves one,
+/// so a name the caller cannot check is not a loopback peer: only an address
+/// that parses as a loopback `IpAddr`, so the whole of `127.0.0.0/8` and `::1`
+/// and nothing else. A bracketed IPv6 authority keeps its brackets in a URL, so
+/// they come off before the address is read.
+pub(crate) fn is_loopback_address(host: &str) -> bool {
+    host.strip_prefix('[')
         .and_then(|host| host.strip_suffix(']'))
-        .unwrap_or(host);
-    host.eq_ignore_ascii_case("localhost")
-        || ip_host
-            .parse::<std::net::IpAddr>()
-            .is_ok_and(|ip| ip.is_loopback())
+        .unwrap_or(host)
+        .parse::<std::net::IpAddr>()
+        .is_ok_and(|ip| ip.is_loopback())
 }
 
 fn sessions_url(base_url: &str) -> Result<Url, DaemonClientError> {

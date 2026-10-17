@@ -178,8 +178,10 @@ Run without arguments to launch the TUI dashboard.
 
 ###### **Options:**
 
-* `-p`, `--profile <PROFILE>` — Profile to use (separate workspace with its own sessions). Commands that consume or create profile state require an existing profile: an unknown name is refused, not created (make one with `aoe profile create`). Profile-independent commands such as `list --all` and `serve --stop` ignore it
-* `--daemon-url <DAEMON_URL>` — Attach to a remote agent daemon instead of using the local session list. Equivalent to setting `AOE_DAEMON_URL`; pair with `AOE_DAEMON_TOKEN` for the bearer token. The session list goes through a bearer-only client, so `AOE_DAEMON_PASSPHRASE` does not work here yet; it works for `aoe acp <verb>` against the same `AOE_DAEMON_URL`. Only meaningful at the no-subcommand `aoe` invocation (the TUI dashboard); ignored otherwise
+* `-p`, `--profile <PROFILE>` — Profile to use (separate workspace with its own sessions). Commands that consume or create profile state require an existing profile: an unknown name is refused, not created (make one with `aoe profile create`). Profile-independent commands such as `list --all` and `serve --stop` ignore it. `AGENT_OF_EMPIRES_PROFILE` names one too, and an explicit `-p` wins over it
+* `--daemon-url <DAEMON_URL>` — Select a daemon endpoint for read-only CLI commands or the TUI
+
+   Explicit CLI endpoints never fall back. `AOE_DAEMON_URL` discovery may fall back to local storage before reaching a TCP peer, with a notice. Authenticate CLI reads with `AOE_DAEMON_TOKEN` or `AOE_DAEMON_PASSPHRASE`; TUI session lists support bearer tokens only. An unauthenticated daemon needs neither. See the HTTP API reference for transport and fallback rules.
 
 
 
@@ -369,6 +371,8 @@ Send a message to a running agent session
 ## `aoe status`
 
 Show session status summary
+
+JSON takes precedence over quiet, which takes precedence over verbose.
 
 **Usage:** `aoe status [OPTIONS]`
 

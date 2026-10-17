@@ -656,7 +656,11 @@
       "kind": "live-playwright",
       "risk": "medium",
       "specs": ["tests/live/settings-persistence.spec.ts"],
-      "components": ["web/src/components/SettingsView.tsx", "web/src/components/settings/SchemaSection.tsx"]
+      "components": [
+        "web/src/components/SettingsView.tsx",
+        "web/src/components/settings/SchemaSection.tsx",
+        "web/src/components/settings/customWidgets.tsx"
+      ]
     },
     {
       "id": "settings.tui-shortcut-bar",
@@ -1369,6 +1373,13 @@
     },
     {
       "id": "wizard.scratch-delete-cleans-tempdir",
+      "kind": "live-playwright",
+      "risk": "high",
+      "specs": ["tests/live/session-create.spec.ts"],
+      "components": ["web/src/components/session-wizard/SessionWizard.tsx"]
+    },
+    {
+      "id": "wizard.scratch-resolves-configured-default-profile",
       "kind": "live-playwright",
       "risk": "high",
       "specs": ["tests/live/session-create.spec.ts"],

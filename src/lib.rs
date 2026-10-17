@@ -26,6 +26,9 @@ mod status_hooks;
 pub mod task_util;
 pub mod telemetry;
 pub mod terminal;
+/// Shared exclusion for the participating server/session environment guards.
+#[cfg(any(test, debug_assertions))]
+pub(crate) mod test_env_lock;
 pub mod tips;
 pub mod tmux;
 pub mod tui;
