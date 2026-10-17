@@ -477,6 +477,9 @@ async fn archive_session(profile: &str, args: ArchiveArgs) -> Result<()> {
         }
         inst.kill_ancillary_tmux_sessions_locked();
         inst.release_scope();
+        if inst.is_structured() {
+            super::acp::stop_runner(&id).await;
+        }
     }
 
     let landed = storage.update(|instances, _groups| {
@@ -657,6 +660,9 @@ async fn empty_trash(profile: &str) -> Result<()> {
                 continue;
             }
         };
+        if inst.is_structured() {
+            super::acp::stop_runner(&inst.id).await;
+        }
         let result = transaction.run_hooks().complete_with(|instance| {
             super::purge_acp_transcript(instance).map_err(|error| {
                 format!("transcript not purged, keeping session in trash: {error}")

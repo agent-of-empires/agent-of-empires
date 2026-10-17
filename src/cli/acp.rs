@@ -802,6 +802,21 @@ pub(crate) async fn stop_all_workers(timeout_secs: u64) -> Result<usize> {
     Ok(targets.len())
 }
 
+/// Stops a structured session's runner from outside the daemon, then its scope.
+/// The registry record goes first so the supervisor reads a user stop, not a crash to respawn.
+pub(crate) async fn stop_runner(session_id: &str) {
+    use crate::process::worker_registry;
+    match worker_registry::load(session_id) {
+        Ok(Some(record)) => {
+            worker_registry::delete(session_id).ok();
+            signal_and_wait(&record, 5).await;
+        }
+        Ok(None) => {}
+        Err(error) => eprintln!("Warning: could not read the worker registry: {error}"),
+    }
+    crate::process::systemd::release(session_id);
+}
+
 async fn stop_worker_records(
     targets: &[crate::process::worker_registry::WorkerRecord],
     timeout_secs: u64,
@@ -1206,6 +1221,42 @@ fn event_kind(event: &crate::acp::Event) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::process::CommandExt;
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn stop_runner_deletes_the_record_and_ends_the_runner() {
+        use crate::process::worker_registry;
+        let tmp = tempfile::TempDir::with_prefix_in("aoe-stop-runner-", "/tmp").unwrap();
+        let _home = crate::session::test_support::isolate_app_dir_at(tmp.path());
+        let mut child = std::process::Command::new("sleep")
+            .arg("60")
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        worker_registry::save(&worker_registry::WorkerRecord::new(
+            "sess-stop".into(),
+            pid,
+            tmp.path().join("sock"),
+            "aoe-agent".into(),
+            "aoe-agent".into(),
+            std::path::PathBuf::from("/repo"),
+            None,
+            vec![],
+            vec![],
+            None,
+            None,
+        ))
+        .unwrap();
+
+        let reaper = std::thread::spawn(move || child.wait().unwrap());
+        stop_runner("sess-stop").await;
+
+        assert!(worker_registry::load("sess-stop").unwrap().is_none());
+        assert!(!worker_registry::is_pid_alive(pid));
+        reaper.join().unwrap();
+    }
 
     #[tokio::test]
     #[serial_test::serial]

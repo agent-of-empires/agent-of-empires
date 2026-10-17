@@ -108,6 +108,9 @@ pub async fn run(profile: &str, args: RemoveArgs) -> Result<()> {
         }
         inst.kill_ancillary_tmux_sessions_locked();
         inst.release_scope();
+        if inst.is_structured() {
+            super::acp::stop_runner(&removed_id).await;
+        }
 
         let mut inst = inst;
         inst.trash();
@@ -211,6 +214,9 @@ pub async fn run(profile: &str, args: RemoveArgs) -> Result<()> {
             anyhow::bail!("{detail}: {removed_title}");
         }
     };
+    if inst.is_structured() {
+        super::acp::stop_runner(&removed_id).await;
+    }
     let result = transaction.run_hooks().complete_with(|instance| {
         super::purge_acp_transcript(instance).map_err(|error| {
             format!(

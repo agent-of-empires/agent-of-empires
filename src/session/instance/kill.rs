@@ -322,7 +322,7 @@ impl Instance {
     }
 
     /// Stops the session's scope, sweeping processes that escaped the pane.
-    /// Structured sessions are released by the ACP teardown.
+    /// Structured sessions are released by the ACP teardown or `cli::acp::stop_runner`.
     pub(crate) fn release_scope(&self) {
         if !self.is_structured() {
             crate::process::systemd::release(&self.id);
