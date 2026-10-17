@@ -3,7 +3,7 @@
 use tracing::{info, warn};
 
 use super::errors::AcpError;
-use super::resolve_command::resolve_agent_command;
+use super::resolve_command::{is_bare_command, resolve_agent_command};
 use super::session_sandbox::{build_sandbox_docker_argv, SessionSandbox};
 use super::spawn::{
     apply_claude_store_route, apply_env_filter, host_environment_denyreason, prepend_path_dirs,
@@ -121,6 +121,28 @@ fn append_to_log(path: &std::path::Path) -> std::process::Stdio {
     }
 }
 
+/// A Worker started for a bare adapter name that resolved nowhere can only exit
+/// before its Hello, which loses the cause (#4576). Paths and `${placeholder}`
+/// commands resolve elsewhere, and a sandbox resolves inside its container.
+fn refuse_unresolved_adapter(
+    config: &SpawnConfig,
+    sandboxed: bool,
+    resolved: bool,
+) -> Result<(), AcpError> {
+    if sandboxed || resolved || !is_bare_command(&config.spec.command) {
+        return Ok(());
+    }
+    if !config.cwd.exists() {
+        return Err(AcpError::ProjectPathMissing {
+            path: config.cwd.clone(),
+        });
+    }
+    Err(AcpError::missing_binary_spawn_error(
+        &std::io::Error::from(std::io::ErrorKind::NotFound),
+        &config.spec.command,
+    ))
+}
+
 /// The runner owns the agent subprocess and outlives the daemon, so no `Child`
 /// handle is kept: the daemon reaches it over the unix socket, and the OS keeps
 /// it alive across `aoe serve` restarts.
@@ -186,6 +208,7 @@ pub(super) async fn spawn_runner_detached(
         let app_dir = crate::session::get_app_dir().ok();
         resolve_agent_command(&config.spec.command, app_dir.as_deref())
     };
+    refuse_unresolved_adapter(config, sandbox_argv.is_some(), resolved.is_some())?;
     let (spawn_command, extra_path_dirs): (String, Vec<std::path::PathBuf>) =
         match (&sandbox_argv, &resolved) {
             (Some(s), _) => (s.docker_binary.clone(), Vec::new()),
@@ -592,6 +615,112 @@ mod tests {
             let mut want = vec!["A=1".to_string()];
             want.extend(own.map(|v| format!("INVOCATION_ID={v}")));
             assert_eq!(seen, want, "own INVOCATION_ID {own:?}");
+        }
+    }
+
+    /// #4576: an unresolved bare adapter name fails before a Worker starts,
+    /// naming that adapter's own install command.
+    #[test]
+    fn refuse_unresolved_adapter_cases() {
+        let cwd = tempfile::tempdir().unwrap();
+        let missing = cwd.path().join("gone");
+        let hint = |cmd: &str| crate::acp::install_hints::install_hint_for(cmd).unwrap();
+        let cases: [(&str, &std::path::Path, bool, bool, Option<String>); 8] = [
+            // (command, cwd, sandboxed, resolved, expected error text)
+            (
+                "codex-acp",
+                cwd.path(),
+                false,
+                false,
+                Some(hint("codex-acp").into()),
+            ),
+            (
+                "claude-agent-acp",
+                cwd.path(),
+                false,
+                false,
+                Some(hint("claude-agent-acp").into()),
+            ),
+            (
+                "aoe-test-unknown-adapter",
+                cwd.path(),
+                false,
+                false,
+                Some("binary `aoe-test-unknown-adapter` not found".into()),
+            ),
+            (
+                "codex-acp",
+                &missing,
+                false,
+                false,
+                Some("ProjectPathMissing".into()),
+            ),
+            ("codex-acp", cwd.path(), true, false, None),
+            ("codex-acp", cwd.path(), false, true, None),
+            ("/opt/agents/codex-acp", cwd.path(), false, false, None),
+            ("${HOME}/bin/codex-acp", cwd.path(), false, false, None),
+        ];
+        for (command, dir, sandboxed, resolved, expected) in cases {
+            let label = format!(
+                "{command} sandboxed={sandboxed} resolved={resolved} cwd={}",
+                dir.display()
+            );
+            let mut config = super::super::test_helpers::env_test_spawn_config(dir.to_path_buf());
+            config.spec.command = command.into();
+            let got = refuse_unresolved_adapter(&config, sandboxed, resolved)
+                .err()
+                .map(|e| match e {
+                    AcpError::ProjectPathMissing { path } => {
+                        assert_eq!(path, missing, "{label}");
+                        "ProjectPathMissing".to_string()
+                    }
+                    AcpError::Spawn(msg) => msg,
+                    other => panic!("{label}: unexpected {other:?}"),
+                });
+            match (&got, &expected) {
+                (Some(msg), Some(want)) => assert!(msg.contains(want.as_str()), "{label}: {msg}"),
+                _ => assert_eq!(got.is_some(), expected.is_some(), "{label}: {got:?}"),
+            }
+        }
+        // Each adapter gets its own command, not another adapter's.
+        let mut config =
+            super::super::test_helpers::env_test_spawn_config(cwd.path().to_path_buf());
+        config.spec.command = "codex-acp".into();
+        let msg = format!("{:?}", refuse_unresolved_adapter(&config, false, false));
+        assert!(!msg.contains(hint("claude-agent-acp")), "{msg}");
+    }
+
+    /// #4576: the refusal leaves no Worker record, socket or log behind.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn spawn_refuses_an_unresolved_adapter_before_starting_a_worker() {
+        let _guard = crate::session::test_support::isolate_app_dir();
+        let cwd = tempfile::tempdir().unwrap();
+        let session = format!("aoe-test-missing-adapter-{}", std::process::id());
+        let socket = crate::process::worker_registry::socket_path_for(&session).unwrap();
+        let mut config =
+            super::super::test_helpers::env_test_spawn_config(cwd.path().to_path_buf());
+        config.spec.command = format!("aoe-test-no-such-adapter-{}", std::process::id());
+        config.socket_path = Some(socket.clone());
+
+        let err = super::super::AcpClient::spawn(
+            config,
+            crate::acp::state::AcpSessionId(session.clone()),
+        )
+        .await
+        .err()
+        .expect("spawn must fail");
+        assert!(
+            matches!(&err, AcpError::Spawn(msg) if msg.contains("not found on the daemon's PATH")),
+            "{err:?}"
+        );
+        for path in [
+            socket.clone(),
+            crate::process::worker::control_socket_sibling(&socket),
+            crate::process::worker_registry::log_path_for(&session).unwrap(),
+            crate::process::worker_registry::record_path(&session).unwrap(),
+        ] {
+            assert!(!path.exists(), "left behind: {}", path.display());
         }
     }
 }
