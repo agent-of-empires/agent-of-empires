@@ -153,10 +153,15 @@ impl SessionFeed {
     }
 
     #[cfg(test)]
-    pub(crate) fn finish_for_test(self) {
+    pub(crate) fn finish_for_test(mut self) {
         self.worker
             .finish_for_test()
             .expect("session feed worker panicked");
+    }
+
+    #[cfg(test)]
+    pub(crate) fn join_for_test(&mut self) -> std::thread::Result<()> {
+        self.worker.finish_for_test()
     }
 
     /// Feed with one pre-seeded result and no daemon behind it.

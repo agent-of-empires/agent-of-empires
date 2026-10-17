@@ -331,25 +331,35 @@ async fn persist_agent_switch(
             switch(inst);
         }
     }
-    match crate::session::Storage::new(profile, state.file_watch.clone()) {
-        Ok(storage) => {
-            if let Err(e) = storage.update(|instances, _groups| {
-                if let Some(inst) = instances.iter_mut().find(|i| i.id == id) {
-                    switch(inst);
-                }
-                Ok(())
-            }) {
-                tracing::error!(
-                    target: "http.api.acp",
-                    session = %id,
-                    "failed to persist agent_name after switch: {e}"
-                );
+    let profile = profile.to_string();
+    let id_owned = id.to_string();
+    let target = target.to_string();
+    let model = model.map(str::to_string);
+    let file_watch = state.file_watch.clone();
+    let outcome = tokio::task::spawn_blocking(move || {
+        crate::session::Storage::new(&profile, file_watch)?.update(|instances, _groups| {
+            if let Some(inst) = instances.iter_mut().find(|i| i.id == id_owned) {
+                inst.agent_name = Some(target);
+                inst.acp_session_id = None;
+                inst.import_pending = None;
+                inst.acp_effort = None;
+                inst.agent_model = model;
             }
-        }
+            Ok(())
+        })
+    })
+    .await;
+    match outcome {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => tracing::error!(
+            target: "http.api.acp",
+            session = %id,
+            "failed to persist agent_name after switch: {e}"
+        ),
         Err(e) => tracing::error!(
             target: "http.api.acp",
             session = %id,
-            "failed to open storage to persist agent_name after switch: {e}"
+            "agent switch persistence task failed: {e}"
         ),
     }
 }
@@ -359,7 +369,7 @@ async fn persist_agent_switch(
 pub async fn switch_acp_agent(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
-    Json(req): Json<SwitchAgentRequest>,
+    req: Result<Json<SwitchAgentRequest>, axum::extract::rejection::JsonRejection>,
 ) -> impl IntoResponse {
     if let Some(resp) = read_only_block(&state) {
         return resp;
@@ -367,6 +377,10 @@ pub async fn switch_acp_agent(
     if let Some(resp) = cityhall_block(&state) {
         return resp;
     }
+    let Json(req) = match req {
+        Ok(json) => json,
+        Err(rejection) => return rejection.into_response(),
+    };
     let target = req.target.trim().to_string();
     if target.is_empty() {
         return (StatusCode::BAD_REQUEST, "target is required").into_response();
@@ -516,14 +530,20 @@ async fn persist_provider_switch(
         inst.agent_provider = Some(provider.to_string());
         inst.agent_model = Some(PROVIDER_DEFAULT_MODEL.to_string());
     };
-    crate::session::Storage::new(profile, state.file_watch.clone())?.update(
-        |instances, _groups| {
-            if let Some(inst) = instances.iter_mut().find(|i| i.id == id) {
-                switch(inst);
+    let profile = profile.to_string();
+    let id_owned = id.to_string();
+    let provider_owned = provider.to_string();
+    let file_watch = state.file_watch.clone();
+    tokio::task::spawn_blocking(move || {
+        crate::session::Storage::new(&profile, file_watch)?.update(|instances, _groups| {
+            if let Some(inst) = instances.iter_mut().find(|i| i.id == id_owned) {
+                inst.agent_provider = Some(provider_owned);
+                inst.agent_model = Some(PROVIDER_DEFAULT_MODEL.to_string());
             }
             Ok(())
-        },
-    )?;
+        })
+    })
+    .await??;
     let mut instances = state.instances.write().await;
     if let Some(inst) = instances.iter_mut().find(|i| i.id == id) {
         switch(inst);
@@ -749,6 +769,33 @@ mod tests {
             assert_eq!(live.agent_model.as_deref(), expected);
             assert_eq!(live.agent_name.as_deref(), Some("codex"));
         }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    #[serial_test::serial]
+    async fn provider_switch_keeps_tokio_responsive_under_root_contention() {
+        let _tmp = crate::session::test_support::isolate_app_dir();
+        let inst = crate::session::Instance::new("claude", "/tmp/aoe-provider-contention");
+        let id = inst.id.clone();
+        crate::server::test_support::seed_instances_on_disk_for_test("default", vec![inst.clone()]);
+        let state = crate::server::test_support::build_test_app_state(vec![inst]);
+        crate::server::test_support::assert_root_contention_responsive(persist_provider_switch(
+            &state, "default", &id, "vertex",
+        ))
+        .await
+        .unwrap();
+        let disk = crate::server::test_support::load_instances_from_disk_for_test("default");
+        assert_eq!(disk[0].agent_provider.as_deref(), Some("vertex"));
+        assert_eq!(
+            state.instances.read().await[0].agent_provider.as_deref(),
+            Some("vertex")
+        );
+        assert_eq!(
+            state
+                .mutation_epoch
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
     }
 
     /// The pick reaches both stores, and the model resets to the provider's

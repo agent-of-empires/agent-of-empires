@@ -119,6 +119,7 @@ pub(crate) fn overrides_ignored_keys(overrides: &serde_json::Value) -> Vec<Strin
 /// possibly stale copy must go through [`update_profile_config`] instead.
 pub fn save_profile_config(profile: &str, config: &ProfileConfig) -> Result<()> {
     let path = get_profile_config_path(profile)?;
+    let _ownership = crate::session::storage::acquire_ownership_read()?;
     let content = toml::to_string_pretty(config)?;
     crate::session::atomic_write(&path, content.as_bytes())?;
     Ok(())

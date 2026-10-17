@@ -3777,6 +3777,7 @@ mod tests {
     #[serial_test::serial]
     fn test_hermes_mount_skips_runtime_dirs() {
         let (_hook_guard, _, _application) = BaseGuard::ready();
+        let _app = crate::session::test_support::isolate_app_dir();
         let dir = TempDir::new().unwrap();
         let host = dir.path().join(".hermes");
         fs::create_dir_all(&host).unwrap();
@@ -3807,7 +3808,7 @@ mod tests {
         let sandbox = prepare_owned_fixture(
             mount,
             dir.path(),
-            None,
+            Some("hermes-runtime-exclusion"),
             CredentialFold::Freshest,
             &crate::session::config::SessionConfig::default(),
             dir.path(),
@@ -3826,6 +3827,13 @@ mod tests {
             );
         }
         assert!(!sandbox.join("state.db").exists());
+        for runtime_dir in runtime_dirs {
+            assert_eq!(
+                fs::read(host.join(runtime_dir).join("runtime.txt")).unwrap(),
+                b"runtime"
+            );
+        }
+        assert_eq!(fs::read(host.join("state.db")).unwrap(), b"sqlite-bytes");
     }
 
     #[test]

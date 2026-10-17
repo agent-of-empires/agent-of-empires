@@ -182,17 +182,8 @@ async fn persist_with<F>(
 where
     F: FnOnce(&mut Vec<Instance>) + Send + 'static,
 {
-    let storage = match Storage::new(&profile, file_watch) {
-        Ok(s) => s,
-        Err(e) => {
-            tracing::error!(
-                target: "http.api.sessions",
-                "Failed to open storage for {label}: {e}"
-            );
-            return Err(());
-        }
-    };
     match tokio::task::spawn_blocking(move || {
+        let storage = Storage::new(&profile, file_watch)?;
         persist_blocking(&storage, lock_id.as_deref(), mutate)
     })
     .await
@@ -461,3 +452,26 @@ pub async fn update_session_diff_base(
 // down the tmux pane and, for structured sessions, the worker. Mutual-exclusion
 // invariants live in the `Instance` methods, so the handlers never set fields
 // directly (#1581).
+
+#[cfg(test)]
+mod persistence_tests {
+    use super::*;
+
+    #[tokio::test(flavor = "current_thread")]
+    #[serial_test::serial]
+    async fn session_update_keeps_tokio_responsive_under_root_contention() {
+        let _tmp = crate::session::test_support::isolate_app_dir();
+        let inst = Instance::new("claude", "/tmp/aoe-update-contention");
+        crate::server::test_support::seed_instances_on_disk_for_test("default", vec![inst]);
+        crate::server::test_support::assert_root_contention_responsive(persist_session_update(
+            "default".into(),
+            "Root contention regression",
+            crate::file_watch::FileWatchService::noop(),
+            |instances| instances[0].title = "durable".into(),
+        ))
+        .await
+        .unwrap();
+        let disk = crate::server::test_support::load_instances_from_disk_for_test("default");
+        assert_eq!(disk[0].title, "durable");
+    }
+}

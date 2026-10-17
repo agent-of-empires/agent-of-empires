@@ -387,6 +387,63 @@ impl LogCapture {
     }
 }
 
+pub(crate) struct GitCommandGate {
+    ready: PathBuf,
+    release: PathBuf,
+    _path: EnvGuard,
+}
+
+impl GitCommandGate {
+    pub(crate) fn new(directory: &Path, condition: &str, after: bool) -> Self {
+        use std::os::unix::fs::PermissionsExt;
+        let real_git = std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
+            .map(|directory| directory.join("git"))
+            .find(|path| path.is_file())
+            .expect("git executable");
+        let bin = directory.join("git-gate-bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let ready = directory.join("git-entered");
+        let release = directory.join("git-release");
+        let escape = |path: &Path| super::environment::shell_escape(&path.to_string_lossy());
+        let before_gate = if after {
+            format!("{} \"$@\"; status=$?\n", escape(&real_git))
+        } else {
+            String::new()
+        };
+        let after_gate = if after { "exit \"$status\"\n" } else { "" };
+        let script = format!(
+            "#!/bin/sh\nif {condition}; then\n{before_gate}: > {}\ni=0\nwhile [ ! -e {} ] && [ \"$i\" -lt 400 ]; do i=$((i+1)); sleep 0.01; done\n{after_gate}fi\nexec {} \"$@\"\n",
+            escape(&ready), escape(&release), escape(&real_git),
+        );
+        let executable = bin.join("git");
+        std::fs::write(&executable, script).unwrap();
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755)).unwrap();
+        Self {
+            ready,
+            release,
+            _path: path_prepended(&bin),
+        }
+    }
+
+    pub(crate) fn wait_entered(&self) -> bool {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        while !self.ready.exists() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        self.ready.exists()
+    }
+
+    pub(crate) fn release(&self) {
+        std::fs::write(&self.release, b"release").unwrap();
+    }
+}
+
+impl Drop for GitCommandGate {
+    fn drop(&mut self) {
+        let _ = std::fs::write(&self.release, b"release");
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

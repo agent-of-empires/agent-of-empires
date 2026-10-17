@@ -27,24 +27,39 @@ fn boot_ambiguous_state(with_journal: bool) -> (TempDir, AppDirGuard, String) {
     })
     .unwrap();
     if with_journal {
-        crate::session::record_move_journal(
-            &crate::session::MoveJournalEntry {
-                version: crate::session::MOVE_JOURNAL_VERSION,
-                ids: vec![id.clone()],
-                source_profile: "alpha".to_string(),
-                target_profile: "beta".to_string(),
-                source_sessions_path: alpha.sessions_path().to_path_buf(),
-                target_sessions_path: beta.sessions_path().to_path_buf(),
-                group_move_source_path: "work".to_string(),
-                group_move_target_path: "moved".to_string(),
-                group_move_subtree: false,
-                created_at_epoch_ms: std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_millis() as u64)
-                    .unwrap_or_default(),
+        crate::session::record_move_journal(&crate::session::MoveJournalEntry {
+            version: crate::session::MOVE_JOURNAL_VERSION,
+            ids: vec![id.clone()],
+            source_profile: "alpha".to_string(),
+            target_profile: "beta".to_string(),
+            source_sessions_path: alpha.sessions_path().to_path_buf(),
+            target_sessions_path: beta.sessions_path().to_path_buf(),
+            group_move_source_path: "work".to_string(),
+            group_move_target_path: "moved".to_string(),
+            group_move_subtree: false,
+            created_at_epoch_ms: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or_default(),
+            authority: crate::session::move_journal::MoveAuthority::Metadata {
+                source: crate::session::move_journal::ProfileAuthority::capture(&alpha).unwrap(),
+                target: crate::session::move_journal::ProfileAuthority::capture(&beta).unwrap(),
+                rows: vec![crate::session::move_journal::RowDelta {
+                    before: alpha
+                        .load()
+                        .unwrap()
+                        .into_iter()
+                        .find(|row| row.id == id)
+                        .unwrap(),
+                    after: beta
+                        .load()
+                        .unwrap()
+                        .into_iter()
+                        .find(|row| row.id == id)
+                        .unwrap(),
+                }],
             },
-            alpha.sessions_path(),
-        )
+        })
         .unwrap();
     }
     (temp, guard, id)
@@ -119,4 +134,60 @@ fn legacy_duplicate_stays_excluded_and_is_surfaced() {
         out.contains("\u{26a0} 1 ambiguous"),
         "the list title must flag ambiguous sessions.\nFull buffer:\n{out}"
     );
+}
+
+#[test]
+#[serial]
+fn legacy_intent_conflict_is_visible_at_startup_and_not_reopened_on_unchanged_reload() {
+    let (_temp, _guard, id) = boot_ambiguous_state(false);
+    let alpha = Storage::open_unwatched("alpha").unwrap();
+    let beta = Storage::open_unwatched("beta").unwrap();
+    let before_alpha = std::fs::read(alpha.sessions_path()).unwrap();
+    let before_beta = std::fs::read(beta.sessions_path()).unwrap();
+    crate::session::record_move_journal(&crate::session::MoveJournalEntry {
+        version: crate::session::MOVE_JOURNAL_VERSION,
+        ids: vec![id.clone()],
+        source_profile: "alpha".into(),
+        target_profile: "beta".into(),
+        source_sessions_path: alpha.sessions_path().to_path_buf(),
+        target_sessions_path: beta.sessions_path().to_path_buf(),
+        group_move_source_path: "work".into(),
+        group_move_target_path: "moved".into(),
+        group_move_subtree: false,
+        created_at_epoch_ms: chrono::Utc::now().timestamp_millis() as u64,
+        authority: crate::session::move_journal::MoveAuthority::LegacyConflict {
+            legacy: serde_json::json!({"version": 1, "ids": [id]}),
+            reason: "legacy v1 intent has no original incarnation authority".into(),
+            scope: crate::session::move_journal::JournalScope {
+                profiles: vec![
+                    crate::session::move_journal::ProfileAuthority::capture(&alpha).unwrap(),
+                    crate::session::move_journal::ProfileAuthority::capture(&beta).unwrap(),
+                ],
+                resources: Vec::new(),
+            },
+        },
+    })
+    .unwrap();
+    let mut view = HomeView::new_for_test(
+        None,
+        AvailableTools::with_tools(&["claude"]),
+        crate::file_watch::FileWatchService::noop(),
+    )
+    .unwrap();
+    assert_eq!(
+        view.info_dialog.as_ref().map(|dialog| dialog.title()),
+        Some("Worktree Recovery Conflict")
+    );
+    assert_eq!(view.move_intent_conflicts.len(), 1);
+    assert!(view.instances.get(&id).is_none());
+    assert_eq!(std::fs::read(alpha.sessions_path()).unwrap(), before_alpha);
+    assert_eq!(std::fs::read(beta.sessions_path()).unwrap(), before_beta);
+    view.info_dialog = None;
+    view.reload_storage_only().unwrap();
+    assert!(
+        view.info_dialog.is_none(),
+        "an unchanged conflict must not reopen a dismissed dialog"
+    );
+    assert_eq!(view.move_intent_conflicts.len(), 1);
+    assert_eq!(crate::session::move_journal::scan().entries.len(), 1);
 }

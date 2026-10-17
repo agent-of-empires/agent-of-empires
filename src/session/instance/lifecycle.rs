@@ -7,12 +7,15 @@ use super::*;
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum LifecycleOperation {
+    Create,
+    Attach,
     Launch,
     Capture,
     Stop,
     Purge,
     Restore,
     Trash,
+    Rename,
 }
 
 impl LifecycleOperation {
@@ -49,11 +52,12 @@ pub struct LifecycleReservation {
     pub op: LifecycleOperation,
     pub generation: u64,
     pub at: DateTime<Utc>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resource_intent: Option<String>,
 }
 
 impl Instance {
-    /// Longer than any bounded hook, teardown, or worktree move. A crashed owner cannot retain the
-    /// reservation forever.
+    /// Only unjournaled lifecycle leases expire; resource intents are explicitly settled.
     pub const LIFECYCLE_RESERVATION_TTL: chrono::Duration = chrono::Duration::minutes(10);
 
     /// Acquire exclusive durable ownership of the next lifecycle generation.
@@ -64,7 +68,9 @@ impl Instance {
         now: DateTime<Utc>,
     ) -> Result<u64, LifecycleReservationError> {
         if let Some(reservation) = self.lifecycle_reservation.as_ref().filter(|reservation| {
-            reservation.generation == self.lifecycle_generation && (now - reservation.at) < ttl
+            reservation.resource_intent.is_some()
+                || (reservation.generation == self.lifecycle_generation
+                    && (now - reservation.at) < ttl)
         }) {
             return Err(LifecycleReservationError::Busy(reservation.op));
         }
@@ -78,6 +84,7 @@ impl Instance {
             op: operation,
             generation,
             at: now,
+            resource_intent: None,
         });
         Ok(generation)
     }
@@ -99,8 +106,9 @@ impl Instance {
         matches!(
             &self.lifecycle_reservation,
             Some(reservation)
-                if reservation.generation == self.lifecycle_generation
-                    && (now - reservation.at) < Self::LIFECYCLE_RESERVATION_TTL
+                if reservation.resource_intent.is_some()
+                    || (reservation.generation == self.lifecycle_generation
+                        && (now - reservation.at) < Self::LIFECYCLE_RESERVATION_TTL)
         )
     }
 
@@ -136,6 +144,7 @@ impl Instance {
             &self.lifecycle_reservation,
             Some(reservation)
                 if reservation.generation == self.lifecycle_generation
+                    && reservation.resource_intent.is_none()
                     && (now - reservation.at) >= ttl
         ) {
             self.lifecycle_reservation = None;
@@ -416,6 +425,7 @@ mod tests {
             op,
             generation: 1,
             at,
+            resource_intent: None,
         })
     }
 
@@ -908,6 +918,7 @@ mod tests {
                 op: LifecycleOperation::Purge,
                 generation,
                 at: now,
+                resource_intent: None,
             })
         );
     }
@@ -946,6 +957,41 @@ mod tests {
         assert!(instance.lifecycle_reservation_is_owned(LifecycleOperation::Purge, generation));
         assert!(
             instance.release_lifecycle_reservation_if_owned(LifecycleOperation::Purge, generation)
+        );
+    }
+
+    #[test]
+    fn resource_intent_does_not_expire_or_allow_generation_reuse() {
+        let ttl = Instance::LIFECYCLE_RESERVATION_TTL;
+        let now = Utc::now();
+        let mut instance = Instance::new("protected", "/tmp/protected");
+        let generation = instance
+            .try_acquire_lifecycle_reservation(
+                LifecycleOperation::Purge,
+                ttl,
+                now - chrono::Duration::days(1),
+            )
+            .unwrap();
+        instance
+            .lifecycle_reservation
+            .as_mut()
+            .unwrap()
+            .resource_intent = Some("move-purge.json".into());
+
+        assert!(instance.has_fresh_lifecycle_reservation(now));
+        assert!(!instance.clear_expired_lifecycle_reservation(ttl, now));
+        assert_eq!(
+            instance.try_acquire_lifecycle_reservation(LifecycleOperation::Restore, ttl, now),
+            Err(LifecycleReservationError::Busy(LifecycleOperation::Purge)),
+        );
+        assert_eq!(instance.lifecycle_generation, generation);
+
+        instance.lifecycle_generation += 1;
+        assert!(instance.has_fresh_lifecycle_reservation(now));
+        assert!(!instance.clear_expired_lifecycle_reservation(ttl, now));
+        assert_eq!(
+            instance.try_acquire_lifecycle_reservation(LifecycleOperation::Launch, ttl, now),
+            Err(LifecycleReservationError::Busy(LifecycleOperation::Purge)),
         );
     }
 

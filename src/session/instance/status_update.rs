@@ -767,6 +767,7 @@ mod tests {
                 op,
                 generation: inst.lifecycle_generation,
                 at,
+                resource_intent: None,
             });
             inst.update_status_with_metadata(None, None);
             assert_eq!(inst.status, want, "{op:?} at {at}");

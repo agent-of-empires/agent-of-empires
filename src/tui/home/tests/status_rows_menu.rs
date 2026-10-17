@@ -1009,9 +1009,20 @@ fn trash_then_restore_round_trip() {
         "Trash section header must be present after trashing"
     );
 
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while env.view.trash_poller.is_pending(&id) {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "trash result never drained"
+        );
+        env.view.apply_trash_results();
+        std::thread::yield_now();
+    }
+
     // Restore via the shelve/unshelve key.
     env.view.select_session_by_id(&id);
     env.view.toggle_archive_at_cursor().unwrap();
+    env.view.finish_restore_for_test();
     assert!(
         !env.view.get_instance(&id).unwrap().is_trashed(),
         "session must be restored out of trash"
@@ -1128,22 +1139,43 @@ fn trash_teardown_release_clears_durable_claim() {
     );
 }
 
-/// Restore takes over a fresh Trash reservation before the queued teardown starts.
+/// Restore refuses an unresolved Trash intent and ignores its late result after retry.
 #[test]
 #[serial]
 fn trash_then_immediate_restore_hands_off_cleanly() {
     use std::sync::mpsc;
     use std::time::{Duration, Instant};
 
+    struct Release(Option<mpsc::Sender<()>>);
+    impl Release {
+        fn release(&mut self) {
+            if let Some(sender) = self.0.take() {
+                let _ = sender.send(());
+            }
+        }
+    }
+    impl Drop for Release {
+        fn drop(&mut self) {
+            self.release();
+        }
+    }
+
     let mut env = create_test_env_with_sessions(2);
     let id = env.view.instance_at(0).id.clone();
     let (entered_tx, entered_rx) = mpsc::channel();
     let (release_tx, release_rx) = mpsc::channel();
+    let (completed_tx, completed_rx) = mpsc::channel();
+    let (deliver_tx, deliver_rx) = mpsc::channel();
+    let mut release = Release(Some(release_tx));
+    let mut deliver = Release(Some(deliver_tx));
     env.view.trash_poller =
         crate::tui::trash_poller::TrashPoller::with_handler_for_test(move |request| {
-            entered_tx.send(()).unwrap();
-            release_rx.recv().expect("release teardown");
-            crate::session::trash::perform_trash(&request)
+            let _ = entered_tx.send(());
+            let _ = release_rx.recv();
+            let result = crate::session::trash::perform_trash(&request);
+            let _ = completed_tx.send(());
+            let _ = deliver_rx.recv();
+            result
         });
     let row = |view: &HomeView| {
         view.storages
@@ -1152,7 +1184,7 @@ fn trash_then_immediate_restore_hands_off_cleanly() {
             .load()
             .unwrap()
             .into_iter()
-            .find(|i| i.id == id)
+            .find(|row| row.id == id)
             .unwrap()
     };
 
@@ -1165,36 +1197,75 @@ fn trash_then_immediate_restore_hands_off_cleanly() {
     assert!(trashed.is_trashed());
     assert!(trashed.lifecycle_reservation_is_owned(
         crate::session::LifecycleOperation::Trash,
-        trashed.lifecycle_generation,
+        trashed.lifecycle_generation
     ));
-
+    assert!(trashed
+        .lifecycle_reservation
+        .as_ref()
+        .unwrap()
+        .resource_intent
+        .is_some());
+    let before = std::fs::read(env.view.storages.get("test").unwrap().sessions_path()).unwrap();
     env.view.selected_session = Some(id.clone());
     env.view.restore_selected_from_trash();
-    let restored = row(&env.view);
-    assert!(
-        !restored.is_trashed(),
-        "restore must seize the held Trash claim"
+    env.view.finish_restore_for_test();
+    assert!(env.view.info_dialog.is_some());
+    assert_eq!(
+        std::fs::read(env.view.storages.get("test").unwrap().sessions_path()).unwrap(),
+        before,
+        "restore cannot seize an unresolved durable Trash intent"
     );
-    assert!(restored.lifecycle_generation > trashed.lifecycle_generation);
-    assert_eq!(restored.lifecycle_reservation, None);
+    assert!(env.view.get_instance(&id).unwrap().is_trashed());
+    env.view.info_dialog = None;
 
-    release_tx.send(()).unwrap();
-    let deadline = Instant::now() + Duration::from_secs(2);
+    release.release();
+    completed_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("real trash transition completed before restore retry");
+    let completed = row(&env.view);
+    assert!(completed.is_trashed());
+    assert_eq!(completed.lifecycle_reservation, None);
+    assert_eq!(completed.lifecycle_generation, trashed.lifecycle_generation);
+    env.view.selected_session = Some(id.clone());
+    env.view.restore_selected_from_trash();
+    env.view.finish_restore_for_test();
+    let restored = row(&env.view);
+    assert!(!restored.is_trashed());
+    assert!(restored.lifecycle_generation > trashed.lifecycle_generation);
+    assert_eq!(restored.created_at, trashed.created_at);
+    assert_eq!(restored.project_path, trashed.project_path);
+    assert_eq!(restored.lifecycle_reservation, None);
+    assert!(!env.view.get_instance(&id).unwrap().is_trashed());
+    assert_eq!(
+        env.view.get_instance(&id).unwrap().lifecycle_reservation,
+        None
+    );
+
+    deliver.release();
+    let deadline = Instant::now() + Duration::from_secs(5);
     while env.view.trash_poller.is_pending(&id) {
-        assert!(Instant::now() < deadline, "teardown result never drained");
-        env.view.apply_trash_results();
+        assert!(Instant::now() < deadline, "late trash result never drained");
+        assert!(
+            !env.view.apply_trash_results(),
+            "stale trash generation must be ignored"
+        );
         std::thread::yield_now();
     }
     let final_row = row(&env.view);
     assert!(
         !final_row.is_trashed(),
-        "stale teardown must not undo restore"
+        "late trash result must not undo restore"
     );
     assert_eq!(
         final_row.lifecycle_generation,
         restored.lifecycle_generation
     );
     assert_eq!(final_row.lifecycle_reservation, None);
+    assert!(!env.view.get_instance(&id).unwrap().is_trashed());
+    assert_eq!(
+        env.view.get_instance(&id).unwrap().lifecycle_generation,
+        restored.lifecycle_generation
+    );
 }
 
 /// The Trash and Archived sections render in the pinned shelf. Right-clicking their synthetic
@@ -1380,7 +1451,15 @@ fn empty_trash_escalates_a_row_that_keeps_failing() {
         let id = env.view.instance_at(0).id.clone();
         let storage = Storage::new_unwatched("test").unwrap();
         let durable = |storage: &Storage| storage.load().unwrap().into_iter().find(|i| i.id == id);
-        // The deletion worker reads the durable row, so the dead repo goes on disk.
+        // Exercise a planning failure, before irreversible row retirement.
+        let mut config = crate::session::Config::default();
+        config.worktree.auto_cleanup = true;
+        config.worktree.delete_branch_on_cleanup = true;
+        std::fs::write(
+            crate::session::get_app_dir().unwrap().join("config.toml"),
+            toml::to_string(&config).unwrap(),
+        )
+        .unwrap();
         storage
             .update(|instances, _| {
                 let inst = instances.iter_mut().find(|i| i.id == id).unwrap();
@@ -1391,24 +1470,14 @@ fn empty_trash_escalates_a_row_that_keeps_failing() {
                     created_at: chrono::Utc::now(),
                     base_branch: None,
                 });
+                inst.trash();
                 Ok(())
             })
             .unwrap();
         env.view.reload().unwrap();
-        env.view.trash_session_by_id(&id);
-        // A held Trash reservation would turn the first purge into Busy, not Failed.
-        let deadline = Instant::now() + Duration::from_secs(10);
-        while env.view.trash_poller.is_pending(&id) {
-            assert!(Instant::now() < deadline, "trash never finished");
-            env.view.apply_trash_results();
-            std::thread::yield_now();
-        }
         let trashed = durable(&storage).unwrap();
         assert!(trashed.is_trashed());
-        assert_eq!(
-            trashed.lifecycle_reservation, None,
-            "trash reservation released"
-        );
+        assert!(trashed.lifecycle_reservation.is_none());
 
         // (checkbox labels offered, forced delete expected in flight); each offered box is ticked.
         let rounds: [(&[&str], bool); 3] = [
@@ -1539,6 +1608,30 @@ fn failed_delete_retry_identity_survives_storage_and_rejects_peer_retrash() {
 #[test]
 #[serial]
 fn empty_trash_confirm_purges_every_trashed_row() {
+    fn finish_trash(view: &mut HomeView, ids: &[&str]) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while ids.iter().any(|id| view.trash_poller.is_pending(id)) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "trash results never drained"
+            );
+            view.apply_trash_results();
+            std::thread::yield_now();
+        }
+        for id in ids {
+            let live = view.get_instance(id).unwrap();
+            let rows = view
+                .storages
+                .get(&live.source_profile)
+                .unwrap()
+                .load()
+                .unwrap();
+            let durable = rows.iter().find(|row| row.id == *id).unwrap();
+            assert!(durable.is_trashed());
+            assert!(durable.lifecycle_reservation.is_none());
+            assert!(live.lifecycle_reservation.is_none());
+        }
+    }
     // Empty Trash confirm.
     {
         use crate::session::Status;
@@ -1546,7 +1639,9 @@ fn empty_trash_confirm_purges_every_trashed_row() {
         let a = env.view.instance_at(0).id.clone();
         let b = env.view.instance_at(1).id.clone();
         env.view.trash_session_by_id(&a);
+        finish_trash(&mut env.view, &[&a]);
         env.view.trash_session_by_id(&b);
+        finish_trash(&mut env.view, &[&b]);
 
         env.view.prompt_empty_trash();
         let dialog = env
@@ -1585,7 +1680,9 @@ fn empty_trash_confirm_purges_every_trashed_row() {
         let a = env.view.instance_at(0).id.clone();
         let b = env.view.instance_at(1).id.clone();
         env.view.trash_session_by_id(&a);
+        finish_trash(&mut env.view, &[&a]);
         env.view.trash_session_by_id(&b);
+        finish_trash(&mut env.view, &[&b]);
         assert_eq!(
             env.view
                 .instances
@@ -1596,6 +1693,7 @@ fn empty_trash_confirm_purges_every_trashed_row() {
         );
 
         env.view.restore_all_from_trash();
+        env.view.finish_restore_for_test();
         assert_eq!(
             env.view
                 .instances
@@ -1605,6 +1703,18 @@ fn empty_trash_confirm_purges_every_trashed_row() {
             0,
             "Restore All must un-trash every row"
         );
+        let rows = env.view.storages.get("test").unwrap().load().unwrap();
+        for id in [&a, &b] {
+            let row = rows.iter().find(|row| &row.id == id).unwrap();
+            assert!(!row.is_trashed());
+            assert!(row.lifecycle_reservation.is_none());
+            assert!(env
+                .view
+                .get_instance(id)
+                .unwrap()
+                .lifecycle_reservation
+                .is_none());
+        }
     }
     // Restore All from Archived.
     {

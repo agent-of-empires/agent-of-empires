@@ -46,7 +46,7 @@ use crate::session::{
 };
 use crate::tmux::AvailableTools;
 
-use super::creation_poller::{CreatedWorktreeInfo, CreationPoller, CreationRequest};
+use super::creation_poller::{CreationPoller, CreationRequest};
 use super::deletion_poller::DeletionPoller;
 use super::dialogs::ServeView;
 use super::dialogs::{
@@ -147,6 +147,7 @@ pub struct HomeView {
     pending_added: HashMap<String, HashSet<String>>,
     pub(super) group_trees: HashMap<String, GroupTree>,
     pub(super) legacy_duplicate_reports: Vec<crate::session::DuplicateIdReport>,
+    pub(super) move_intent_conflicts: Vec<String>,
     pub(super) flat_items: Vec<Item>,
 
     pub(super) cursor: usize,
@@ -305,6 +306,8 @@ pub struct HomeView {
     pub(super) stop_poller: StopPoller,
 
     pub(super) trash_poller: crate::tui::trash_poller::TrashPoller,
+    restore_worker:
+        crate::tui::worker::TrackedWorker<operations::RestoreRequest, operations::RestoreResult>,
     pub(super) drop_poller:
         crate::tui::worker::TrackedWorker<operations::DropRequest, operations::DropResult>,
     pub(super) reconcile_poller: crate::tui::reconcile_poller::ReconcilePoller,
@@ -323,6 +326,10 @@ pub struct HomeView {
 
     pub(super) attach_project_poller: crate::tui::attach_project_poller::AttachProjectPoller,
     pub(super) attach_project_in_flight: std::collections::HashSet<String>,
+    rename_worker: crate::tui::worker::TrackedWorker<
+        crate::session::rename::Request,
+        operations::RenameResult,
+    >,
 
     pub(super) creation_poller: CreationPoller,
     /// Cancels the request behind `creating_stub_id`.
@@ -331,7 +338,10 @@ pub struct HomeView {
 
     pub(super) creating_hook_progress: HashMap<String, CreatingHookProgress>,
     pub(super) creating_stub_id: Option<String>,
+    creating_provisional_creation:
+        Option<std::sync::Arc<crate::session::builder::ProvisionalCreation>>,
     creating_provisional_group_paths: HashSet<String>,
+    cancelled_creations: HashMap<String, creation::CancelledCreation>,
 
     pub(super) preview_cache: PreviewCache,
     pub(super) terminal_preview_cache: PreviewCache,

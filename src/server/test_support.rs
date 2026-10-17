@@ -9,10 +9,41 @@ use crate::server::rate_limit::RateLimiter;
 use crate::session::Instance;
 use crate::session::Storage;
 use std::collections::HashMap;
+#[cfg(test)]
+use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{broadcast, RwLock};
 use tokio_util::sync::CancellationToken;
+
+/// The OS holder releases Root only after a witness runs on the contending runtime.
+#[cfg(test)]
+pub(crate) async fn assert_root_contention_responsive<F: Future>(operation: F) -> F::Output {
+    let root = crate::session::storage::acquire_ownership_lock().unwrap();
+    let (contended_tx, contended_rx) = std::sync::mpsc::channel();
+    let _observer = crate::session::storage::observe_root_contention_for_test(contended_tx);
+    let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+    let (witness_tx, witness_rx) = std::sync::mpsc::channel();
+    let holder = std::thread::spawn(move || {
+        let contention = contended_rx.recv_timeout(Duration::from_secs(5));
+        let _ = ready_tx.send(());
+        let witness = witness_rx.recv_timeout(Duration::from_secs(5));
+        drop(root);
+        assert!(
+            contention.is_ok(),
+            "persistence never reached Root contention"
+        );
+        assert!(witness.is_ok(), "Root contention blocked the Tokio witness");
+    });
+    let witness = async {
+        ready_rx.await.unwrap();
+        tokio::task::yield_now().await;
+        let _ = witness_tx.send(());
+    };
+    let (result, ()) = tokio::join!(operation, witness);
+    holder.join().unwrap();
+    result
+}
 
 /// Build a minimal `Arc<AppState>` for helper-equivalence tests.
 pub fn build_test_app_state(prior: Vec<Instance>) -> Arc<AppState> {

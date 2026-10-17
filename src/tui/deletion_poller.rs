@@ -27,6 +27,10 @@ impl DeletionPoller {
     pub fn try_recv_result(&self) -> Result<DeletionResult, TryRecvError> {
         self.worker.try_recv()
     }
+    #[cfg(test)]
+    pub(crate) fn finish_for_test(&mut self) -> std::thread::Result<()> {
+        self.worker.finish_for_test()
+    }
 }
 
 impl Default for DeletionPoller {

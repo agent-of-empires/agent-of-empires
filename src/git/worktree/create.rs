@@ -47,13 +47,15 @@ impl GitWorktree {
     /// `git fetch <remote> <branch>` with stdin nulled (no passphrase prompts)
     /// and a 10 second bound.
     fn fetch_branch(&self, remote: &str, branch: &str) -> FetchOutcome {
-        let mut cmd = std::process::Command::new("git");
-        cmd.args(["fetch", remote, branch])
-            .current_dir(&self.repo_path)
-            .stdin(std::process::Stdio::null());
         let timeout = std::time::Duration::from_secs(10);
         let start = Instant::now();
-        match crate::process::run_with_timeout(&mut cmd, timeout) {
+        let mut command = std::process::Command::new("git");
+        command
+            .args(["fetch", remote, branch])
+            .current_dir(&self.repo_path)
+            .stdin(std::process::Stdio::null());
+        let output = crate::process::run_with_timeout(&mut command, timeout);
+        match output {
             Ok(Some(output)) if output.status.success() => {
                 tracing::info!(target: "git.worktree", "git fetch {remote}/{branch} ok in {:?}", start.elapsed());
                 FetchOutcome::Ok
@@ -69,26 +71,18 @@ impl GitWorktree {
                 })
             }
             Ok(None) => {
-                tracing::warn!(target: "git.worktree",
-                    "git fetch {remote}/{branch} timed out after {}s",
-                    timeout.as_secs()
-                );
+                tracing::warn!(target: "git.worktree", "git fetch {remote}/{branch} timed out after {}s", timeout.as_secs());
                 FetchOutcome::TimedOut
             }
-            Err(e) => {
-                tracing::warn!(
-                    target: "git.command",
-                    remote = %remote,
-                    branch = %branch,
-                    error = %e,
-                    "git fetch spawn failed"
-                );
-                FetchOutcome::Skipped(format!("spawn failed: {e}"))
+            Err(error) => {
+                tracing::warn!(target: "git.command", remote = %remote, branch = %branch,
+                    error = %error, "git fetch spawn failed");
+                FetchOutcome::Skipped(format!("spawn failed: {error}"))
             }
         }
     }
 
-    /// Fetches `branch` and records a non-`Ok` outcome as a warning.
+    /// Fetch failures are warnings, so an available local base remains usable.
     fn fetch_with_warning(&self, warnings: &mut Vec<String>, remote: &str, branch: &str) {
         let detail = match self.fetch_branch(remote, branch) {
             FetchOutcome::Ok => return,
@@ -285,10 +279,8 @@ impl GitWorktree {
     /// exists; that worktree is usable, so the failure becomes a warning.
     fn add_worktree(&self, branch: &str, path: &Path, warnings: &mut Vec<String>) -> Result<()> {
         let t = Instant::now();
-        let output = crate::git::command::run_git(
-            &self.repo_path,
-            ["worktree", "add", path_str(path)?, branch],
-        )?;
+        let args = ["worktree", "add", path_str(path)?, branch];
+        let output = crate::git::command::run_git(&self.repo_path, args)?;
         let add_elapsed = t.elapsed();
 
         if !output.status.success() {
@@ -553,7 +545,6 @@ pub(super) mod tests {
             git_wt.fetch_branch("origin", "main"),
             FetchOutcome::Failed(_)
         ));
-
         let (_dirs, local, _, _) = fork_upstream_layout("main");
         let git_wt = GitWorktree::new(local).unwrap();
         assert_eq!(git_wt.fetch_branch("origin", "main"), FetchOutcome::Ok);

@@ -98,14 +98,15 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn waits_for_an_in_flight_storage_update() {
         use crate::session::{Instance, Status, Storage};
         use std::sync::mpsc;
         use std::time::Duration;
 
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("sessions.json");
-        let storage = Storage::new_for_test_path("v028-in-flight", path.clone());
+        let _app = crate::session::test_support::isolate_app_dir();
+        let storage = Storage::new_for_test_profile("v028-in-flight");
+        let path = storage.sessions_path().to_path_buf();
         storage
             .update(|instances, _| {
                 let mut frozen = Instance::new("frozen", "/tmp/frozen");

@@ -703,12 +703,14 @@ fn restart_tool_swap_refuses_a_foreign_pending_fork() {
             Ok(())
         })
         .unwrap();
-    let mut view = HomeView::new(
-        Some(profile.into()),
-        AvailableTools::with_tools(&["claude", "codex"]),
-        crate::file_watch::FileWatchService::noop(),
-    )
-    .unwrap();
+    let mut view = lifecycle::TestHomeView(
+        HomeView::new(
+            Some(profile.into()),
+            AvailableTools::with_tools(&["claude", "codex"]),
+            crate::file_watch::FileWatchService::noop(),
+        )
+        .unwrap(),
+    );
     view.update_selected();
     view.selected_session = Some(id.clone());
     view.restart_selected_session(None, Some("codex"), None, None)
@@ -2316,9 +2318,10 @@ fn profile_move_group_metadata_survives_reload() {
             .entry("alpha".to_string())
             .or_default()
             .insert("moved".to_string());
+        let grouped_instances = view.cloned_instances();
         view.group_trees.insert(
             "alpha".to_string(),
-            GroupTree::new_with_groups(&view.cloned_instances(), &[]),
+            GroupTree::new_with_groups(&grouped_instances, &[]),
         );
         view.save().unwrap();
 
@@ -2326,8 +2329,15 @@ fn profile_move_group_metadata_survives_reload() {
             .entry("beta".to_string())
             .or_insert_with(|| GroupTree::new_with_groups(&[], &[]));
         let requested = view.instances["moved"].clone();
-        view.move_to_profile("moved", "beta", requested, None, false)
-            .unwrap();
+        view.move_to_profile_with_ownership(
+            &crate::session::storage::acquire_ownership_lock().unwrap(),
+            "moved",
+            "beta",
+            requested,
+            None,
+            false,
+        )
+        .unwrap();
     }
 
     let reloaded =
@@ -3321,12 +3331,14 @@ fn trashed_row_healing_lands_through_the_reconcile_poller() {
         })
         .unwrap();
 
-    let mut view = HomeView::new(
-        Some("test".to_string()),
-        AvailableTools::with_tools(&["claude"]),
-        crate::file_watch::FileWatchService::noop(),
-    )
-    .unwrap();
+    let mut view = lifecycle::TestHomeView(
+        HomeView::new(
+            Some("test".to_string()),
+            AvailableTools::with_tools(&["claude"]),
+            crate::file_watch::FileWatchService::noop(),
+        )
+        .unwrap(),
+    );
 
     let mut applied = false;
     for _ in 0..100 {
@@ -3386,12 +3398,14 @@ fn startup_recovery_waits_for_the_first_reconcile_sweep() {
     let temp = TempDir::new().unwrap();
     let _guard = setup_test_home(&temp);
     let _storage = Storage::new_unwatched("test").unwrap();
-    let mut view = HomeView::new(
-        Some("test".to_string()),
-        AvailableTools::with_tools(&["claude"]),
-        crate::file_watch::FileWatchService::noop(),
-    )
-    .unwrap();
+    let mut view = lifecycle::TestHomeView(
+        HomeView::new(
+            Some("test".to_string()),
+            AvailableTools::with_tools(&["claude"]),
+            crate::file_watch::FileWatchService::noop(),
+        )
+        .unwrap(),
+    );
 
     assert!(
         view.startup_recovery_gate.is_some(),

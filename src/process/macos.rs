@@ -1,6 +1,7 @@
 //! macOS-specific process utilities.
 
 pub(crate) const HAS_CODEX_MANAGED_PREFERENCES: bool = true;
+
 use anyhow::Context as _;
 use std::collections::HashMap;
 use std::process::Command;

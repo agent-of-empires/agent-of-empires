@@ -78,9 +78,9 @@ fn structured_session_reuses_the_permission_dialog() {
         "structured sessions must use the existing permission dialog"
     );
     assert!(matches!(
-        env.view.pending_permission_response,
+        env.view.pending_permission_response.as_ref(),
         Some(PermissionResponseTarget::Structured { session_id, nonce: opened })
-            if session_id == id && opened == nonce
+            if session_id == &id && opened == &nonce
     ));
 }
 

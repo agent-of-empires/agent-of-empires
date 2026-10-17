@@ -1,5 +1,6 @@
 //! Tests for HomeView
 
+use super::lifecycle;
 use super::watchers::ConfigWatchKey;
 use super::{ConfigRefreshOrigin, HomeView, PreviewSelection, ViewMode};
 use crate::session::test_support::{isolate_app_dir_at, AppDirGuard};
@@ -81,7 +82,7 @@ fn setup_test_home(temp: &TempDir) -> AppDirGuard {
 }
 
 struct TestEnv {
-    view: HomeView,
+    view: lifecycle::TestHomeView,
     _guard: AppDirGuard,
     _temp: TempDir,
 }
@@ -93,7 +94,7 @@ fn test_home() -> (TempDir, AppDirGuard) {
     (temp, guard)
 }
 
-fn test_view(profile: Option<&str>) -> HomeView {
+fn test_view(profile: Option<&str>) -> lifecycle::TestHomeView {
     HomeView::new_for_test(
         profile.map(str::to_string),
         AvailableTools::with_tools(&["claude"]),
@@ -370,7 +371,7 @@ fn rendered_single_session_text(
 
 /// Fixture for async-creation finalization: a single-commit git repo and a `default` profile view.
 struct CreationTestEnv {
-    view: HomeView,
+    view: lifecycle::TestHomeView,
     storage: Storage,
     project_dir: std::path::PathBuf,
     _guard: AppDirGuard,

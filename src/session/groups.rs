@@ -104,6 +104,22 @@ impl Group {
     }
 }
 
+/// The same source-group pruning rule serves durable moves and their UI publication.
+pub(crate) fn group_is_unused<'a, 'b>(
+    path: &str,
+    mut instance_paths: impl Iterator<Item = &'a str>,
+    mut group_paths: impl Iterator<Item = &'b str>,
+) -> bool {
+    let descendant = |other: &str| {
+        other
+            .strip_prefix(path)
+            .is_some_and(|suffix| suffix.starts_with('/'))
+    };
+    !path.is_empty()
+        && !instance_paths.any(|other| other == path || descendant(other))
+        && !group_paths.any(descendant)
+}
+
 #[derive(Debug, Clone)]
 pub struct GroupTree {
     roots: Vec<Group>,
@@ -234,6 +250,22 @@ impl GroupTree {
         self.insertion_order.retain(|p| !to_remove.contains(p));
 
         self.rebuild_tree();
+    }
+
+    pub(crate) fn prune_empty_group<'a>(
+        &mut self,
+        path: &str,
+        instance_paths: impl Iterator<Item = &'a str>,
+    ) {
+        if group_is_unused(
+            path,
+            instance_paths,
+            self.groups_by_path.keys().map(String::as_str),
+        ) {
+            self.groups_by_path.remove(path);
+            self.insertion_order.retain(|existing| existing != path);
+            self.rebuild_tree();
+        }
     }
 
     pub fn group_exists(&self, path: &str) -> bool {
@@ -1751,6 +1783,31 @@ mod tests {
                 .map(|b| project_group_display_name(&b.0))
                 .collect();
             assert_eq!(labels, expected, "{order:?}");
+        }
+    }
+    #[test]
+    fn profile_move_pruning_preserves_members_and_explicit_descendants() {
+        for mode in ["empty", "member", "descendant"] {
+            let mut groups = vec![Group::new("work", "work"), Group::new("other", "other")];
+            groups[1].collapsed = true;
+            if mode == "descendant" {
+                groups.push(Group::new("empty", "work/empty"));
+            }
+            let mut tree = GroupTree::new_with_groups(&[], &groups);
+            let occupied = (mode == "member").then_some("work/member");
+            tree.prune_empty_group("work", occupied.into_iter());
+            assert_eq!(tree.group_exists("work"), mode != "empty", "{mode}");
+            assert!(tree.group_exists("other"));
+            assert!(
+                tree.get_all_groups()
+                    .iter()
+                    .find(|group| group.path == "other")
+                    .unwrap()
+                    .collapsed
+            );
+            if mode == "descendant" {
+                assert!(tree.group_exists("work/empty"));
+            }
         }
     }
 }

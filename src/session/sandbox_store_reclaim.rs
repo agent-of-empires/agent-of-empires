@@ -639,59 +639,86 @@ fn directory_bytes(root: &Path) -> u64 {
 /// shared legacy store owns no per-instance directory to remove, and v027 may
 /// be publishing the private one it will own, so it is left to the reclaim
 /// pass.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub(crate) struct StoreRemoval {
+    app: PathBuf,
+    roots: Vec<PathBuf>,
+}
+
+impl StoreRemoval {
+    pub(crate) fn capture(instance: &crate::session::Instance) -> Result<Self> {
+        let app = crate::session::get_app_dir()?;
+        let mut roots = Vec::new();
+        if instance.sandbox_store_generation
+            < crate::session::config::container_config::CURRENT_SANDBOX_STORE_GENERATION
+        {
+            return Ok(Self { app, roots });
+        }
+        let home = dirs::home_dir().context("home directory unavailable for store removal")?;
+        let config =
+            crate::session::config::profile_config::resolve_config(&instance.effective_profile())?;
+        let Some(agent) = crate::session::config::container_config::resolve_active_agent(
+            &instance.tool,
+            Some(instance.get_tool_command()),
+            &config.session,
+        ) else {
+            return Ok(Self { app, roots });
+        };
+        let declared = config.session.agent_config_dir_for(&instance.tool, &home);
+        for path in crate::session::config::container_config::sandbox_store_dirs(
+            agent.name,
+            &home,
+            declared.as_deref(),
+            &instance.id,
+        )? {
+            match fs::symlink_metadata(&path) {
+                Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {}
+                Ok(_) => continue,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => {
+                    return Err(error).with_context(|| format!("inspecting {}", path.display()))
+                }
+            }
+            roots.push(path);
+        }
+        Ok(Self { app, roots })
+    }
+
+    pub(crate) fn remove(&self, id: &str) -> Result<(Vec<PathBuf>, u64)> {
+        let other_namespaces = also_owned(&self.app);
+        let mut removed = Vec::new();
+        let mut freed = 0;
+        for path in &self.roots {
+            // A previous completed attempt may have removed an earlier root.
+            // Never resolve replacement authority from current configuration.
+            let root = match AnchoredDir::open(path) {
+                Ok(root) => root,
+                Err(_error)
+                    if matches!(fs::symlink_metadata(path),
+                    Err(missing) if missing.kind() == std::io::ErrorKind::NotFound) =>
+                {
+                    continue
+                }
+                Err(error) => return Err(error),
+            };
+            if !has_content_owner(&self.app, &other_namespaces, id, &root)? {
+                tracing::warn!(target: "session.store", path = %path.display(), "preserving sandbox original with unproven native content ownership");
+                continue;
+            }
+            let bytes = directory_bytes(path);
+            remove_owned_store(&self.app, &other_namespaces, id, path)?;
+            freed += bytes;
+            removed.push(path.clone());
+        }
+        Ok((removed, freed))
+    }
+}
+
+#[cfg(test)]
 pub(crate) fn remove_stores_for(
     instance: &crate::session::Instance,
 ) -> Result<(Vec<PathBuf>, u64)> {
-    if instance.sandbox_store_generation
-        < crate::session::config::container_config::CURRENT_SANDBOX_STORE_GENERATION
-    {
-        return Ok((Vec::new(), 0));
-    }
-    let home = dirs::home_dir().context("home directory unavailable for store removal")?;
-    let config = crate::session::config::profile_config::resolve_config_or_warn(
-        &instance.effective_profile(),
-    );
-    let Some(agent) = crate::session::config::container_config::resolve_active_agent(
-        &instance.tool,
-        Some(instance.get_tool_command()),
-        &config.session,
-    ) else {
-        return Ok((Vec::new(), 0));
-    };
-    let declared = config.session.agent_config_dir_for(&instance.tool, &home);
-    let app = crate::session::get_app_dir()?;
-    let other_namespaces = also_owned(&app);
-    let mut removed = Vec::new();
-    let mut freed = 0;
-    for path in crate::session::config::container_config::sandbox_store_dirs(
-        agent.name,
-        &home,
-        declared.as_deref(),
-        &instance.id,
-    )? {
-        match fs::symlink_metadata(&path) {
-            Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {}
-            Ok(_) => {
-                tracing::warn!(target: "session.store",
-                    "leaving agent store {}: not a plain directory", path.display());
-                continue;
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(error) => {
-                return Err(error).with_context(|| format!("inspecting {}", path.display()))
-            }
-        }
-        let root = AnchoredDir::open(&path)?;
-        if !has_content_owner(&app, &other_namespaces, &instance.id, &root)? {
-            tracing::warn!(target: "session.store", path = %path.display(), "preserving sandbox original with unproven native content ownership");
-            continue;
-        }
-        let bytes = directory_bytes(&path);
-        remove_owned_store(&app, &other_namespaces, &instance.id, &path)?;
-        freed += bytes;
-        removed.push(path);
-    }
-    Ok((removed, freed))
+    StoreRemoval::capture(instance)?.remove(&instance.id)
 }
 
 #[cfg(test)]
@@ -1102,6 +1129,90 @@ mod tests {
         assert_eq!(removed, vec![link.clone()]);
         assert!(!link.exists());
         assert_eq!(fs::read(target.join("keep")).unwrap(), b"keep");
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn committed_store_receipt_keeps_original_config_route_and_directory() {
+        for replace in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let _home = crate::session::test_support::isolate_app_dir_at(dir.path());
+            let storage = crate::session::Storage::new_unwatched("owner").unwrap();
+            let declared = dir.path().join("original-config");
+            fs::write(
+                storage
+                    .sessions_path()
+                    .parent()
+                    .unwrap()
+                    .join("config.toml"),
+                format!(
+                    "[session.agent_config_dir]\nclaude = {:?}\n",
+                    declared.to_str().unwrap()
+                ),
+            )
+            .unwrap();
+            let mut instance = crate::session::Instance::new("owner", "/unrelated");
+            instance.tool = "claude".into();
+            instance.source_profile = "owner".into();
+            instance.sandbox_store_generation =
+                crate::session::config::container_config::CURRENT_SANDBOX_STORE_GENERATION;
+            let path = declared.join("sandbox-v2").join(&instance.id);
+            fs::create_dir_all(&path).unwrap();
+            fs::write(path.join("credentials"), "original").unwrap();
+            let app = crate::session::get_app_dir().unwrap();
+            content::certify_owned_test_root(&app, &instance.id, &path).unwrap();
+            let receipt = StoreRemoval::capture(&instance).unwrap();
+            crate::session::rename_profile("owner", "renamed").unwrap();
+            crate::session::Storage::new_unwatched("owner").unwrap();
+            if replace {
+                fs::rename(&path, path.with_extension("original")).unwrap();
+                fs::create_dir(&path).unwrap();
+                fs::write(path.join("sentinel"), "replacement").unwrap();
+            }
+            let result = receipt.remove(&instance.id);
+            if replace {
+                let (removed, freed) = result.unwrap();
+                assert!(removed.is_empty());
+                assert_eq!(freed, 0);
+                assert_eq!(fs::read(path.join("sentinel")).unwrap(), b"replacement");
+                assert_eq!(
+                    fs::read(path.with_extension("original").join("credentials")).unwrap(),
+                    b"original"
+                );
+            } else {
+                assert_eq!(result.unwrap().0, vec![path.clone()]);
+                assert!(!path.exists());
+            }
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn durable_store_receipt_retries_after_a_partially_completed_removal() {
+        let directory = tempfile::tempdir().unwrap();
+        let _home = crate::session::test_support::isolate_app_dir_at(directory.path());
+        let app = crate::session::get_app_dir().unwrap();
+        fs::create_dir_all(&app).unwrap();
+        app_with_rows(&app, &[]);
+        let id = "1111111111111111";
+        let first = owned_store(&app, &directory.path().join("first-home"), id, 40);
+        let second_home = directory.path().join("second-home");
+        let second = second_home.join(".claude/sandbox-v2").join(id);
+        fs::create_dir_all(second.parent().unwrap()).unwrap();
+        fs::write(&second, b"temporarily not a directory").unwrap();
+        let receipt = StoreRemoval {
+            app: app.clone(),
+            roots: vec![first.clone(), second.clone()],
+        };
+        let encoded = serde_json::to_vec(&receipt).unwrap();
+        assert!(receipt.remove(id).is_err());
+        assert!(!first.exists(), "first root was already removed");
+        fs::remove_file(&second).unwrap();
+        assert_eq!(owned_store(&app, &second_home, id, 20), second);
+        let restored: StoreRemoval = serde_json::from_slice(&encoded).unwrap();
+        assert_eq!(restored.remove(id).unwrap().0, vec![second.clone()]);
+        assert!(!second.exists());
+        assert!(restored.remove(id).unwrap().0.is_empty());
     }
 
     /// Removing one store takes time, and a container for a later candidate

@@ -22,6 +22,44 @@ pub use rate_limit::RateLimitPark;
 pub use replay::ReplayPage;
 pub use search::ContentHit;
 pub use turns::{TerminalRepairProbe, UnresolvedBackgroundAgentLaunch};
+/// Delete a permanently removed session's transcript without creating or migrating a database.
+pub(crate) fn purge_acp_transcript_rows(db_path: &Path, session_id: &str) -> Result<()> {
+    if !db_path.try_exists()? {
+        return Ok(());
+    }
+    let mut conn =
+        Connection::open_with_flags(db_path, rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE)
+            .context("acp transcript purge: open event store")?;
+    conn.busy_timeout(std::time::Duration::from_secs(5))
+        .map_err(|e| anyhow::anyhow!("acp transcript purge: set busy_timeout: {e}"))?;
+    let tx = conn
+        .transaction()
+        .map_err(|e| anyhow::anyhow!("acp transcript purge: begin transaction: {e}"))?;
+    let schema = crate::events::Schema::new("acp")
+        .map_err(|e| anyhow::anyhow!("acp transcript purge: schema: {e}"))?;
+    for table in [
+        schema.events_table(),
+        schema.attachments_table(),
+        schema.pending_attachments_table(),
+        schema.rate_limit_budgets_table(),
+    ] {
+        let exists: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1)",
+            [table],
+            |row| row.get(0),
+        )?;
+        if exists {
+            tx.execute(
+                &format!("DELETE FROM {table} WHERE session_id = ?1"),
+                rusqlite::params![session_id],
+            )
+            .with_context(|| format!("acp transcript purge: delete from {table}"))?;
+        }
+    }
+    tx.commit()
+        .map_err(|e| anyhow::anyhow!("acp transcript purge: commit: {e}"))?;
+    Ok(())
+}
 
 /// Lifecycle and metadata events that neither count as session activity nor
 /// fall to the retention prune.
@@ -389,5 +427,110 @@ mod tests {
             let json = serde_json::to_string(&event).unwrap();
             assert!(json.starts_with(&format!("{{\"{name}\":")), "{json}");
         }
+    }
+}
+
+#[cfg(test)]
+mod purge_tests {
+    use super::*;
+    #[test]
+    fn purge_acp_transcript_rows_deletes_only_target_session() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("acp_events.db");
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE acp_events (session_id TEXT, seq INTEGER, event_json TEXT);
+             CREATE TABLE acp_attachments (session_id TEXT, attachment_id TEXT, data BLOB);
+             INSERT INTO acp_events VALUES ('keep', 0, '{}'), ('drop', 0, '{}'), ('drop', 1, '{}');
+             INSERT INTO acp_attachments VALUES ('keep', 'a0', x'00'), ('drop', 'a1', x'01');",
+        )
+        .unwrap();
+        drop(conn);
+
+        purge_acp_transcript_rows(&db_path, "drop").unwrap();
+
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        let events: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM acp_events WHERE session_id = 'drop'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let attachments: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM acp_attachments WHERE session_id = 'drop'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let kept_events: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM acp_events WHERE session_id = 'keep'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(events, 0, "target event rows should be deleted");
+        assert_eq!(attachments, 0, "target attachment blobs should be deleted");
+        assert_eq!(kept_events, 1, "other session must be untouched");
+    }
+
+    #[test]
+    fn purge_acp_transcript_rows_tolerates_missing_table() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("acp_events.db");
+        rusqlite::Connection::open(&db_path).unwrap();
+        purge_acp_transcript_rows(&db_path, "whatever").unwrap();
+    }
+
+    #[test]
+    fn transcript_purge_is_atomic_and_absence_never_creates_a_database() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = directory.path().join("acp_events.db");
+        purge_acp_transcript_rows(&database, "drop").unwrap();
+        assert!(!database.exists());
+        let conn = Connection::open(&database).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE acp_events (session_id TEXT);
+            CREATE TABLE acp_attachments (session_id TEXT);
+            CREATE TABLE acp_pending_attachments (session_id TEXT);
+            CREATE TABLE acp_rate_limit_budgets (session_id TEXT);
+            INSERT INTO acp_events VALUES ('drop'), ('keep');
+            INSERT INTO acp_attachments VALUES ('drop'), ('keep');
+            INSERT INTO acp_pending_attachments VALUES ('drop'), ('keep');
+            INSERT INTO acp_rate_limit_budgets VALUES ('drop'), ('keep');
+            CREATE TRIGGER refuse_cleanup BEFORE DELETE ON acp_rate_limit_budgets
+                BEGIN SELECT RAISE(ABORT, 'temporary cleanup failure'); END;",
+        )
+        .unwrap();
+        assert!(purge_acp_transcript_rows(&database, "drop").is_err());
+        let tables = [
+            "acp_events",
+            "acp_attachments",
+            "acp_pending_attachments",
+            "acp_rate_limit_budgets",
+        ];
+        for table in tables {
+            let count: i64 = conn
+                .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            assert_eq!(count, 2, "failure must roll back {table}");
+        }
+        conn.execute_batch("DROP TRIGGER refuse_cleanup").unwrap();
+        purge_acp_transcript_rows(&database, "drop").unwrap();
+        for table in tables {
+            let session: String = conn
+                .query_row(&format!("SELECT session_id FROM {table}"), [], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            assert_eq!(session, "keep");
+        }
+        drop(conn);
+        std::fs::write(&database, b"not a sqlite database").unwrap();
+        assert!(purge_acp_transcript_rows(&database, "drop").is_err());
     }
 }

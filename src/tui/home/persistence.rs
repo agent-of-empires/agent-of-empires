@@ -250,37 +250,38 @@ impl HomeView {
         }
     }
 
-    /// Acquire the per-session title flock and then the source profile's per-instance
-    /// lifecycle flock, and replace the TUI snapshot with the authoritative source row.
-    /// Only TUI-owned launch configuration is merged from the snapshot; lifecycle and
-    /// runtime fields stay as reloaded under the lifecycle lock.
-    pub(in crate::tui) fn lock_session_mutation_and_reload(
+    /// The caller retains namespace ownership until these guards are released.
+    pub(in crate::tui) fn try_lock_session_mutation_and_reload_with_ownership(
         &mut self,
+        ownership: &crate::session::storage::OwnershipGuard,
         id: &str,
-    ) -> anyhow::Result<SessionMutationGuards> {
+    ) -> anyhow::Result<Option<SessionMutationGuards>> {
         let snapshot = self
             .instances
             .get(id)
             .cloned()
             .ok_or_else(|| anyhow::anyhow!("Session not found: {id}"))?;
         let source_profile = snapshot.source_profile.clone();
-        let session_title = crate::session::acquire_session_title_lock(id)
-            .map_err(|error| anyhow::anyhow!("failed to acquire session title lock: {error}"))?;
+        let Some(session_title) =
+            crate::session::storage::try_acquire_session_title_lock_with_ownership(ownership, id)?
+        else {
+            return Ok(None);
+        };
         if !self.storages.contains_key(&source_profile) {
             self.storages.insert(
                 source_profile.clone(),
-                Storage::open(&source_profile, self.file_watch.clone())?,
+                Storage::open_with_ownership(&source_profile, self.file_watch.clone(), ownership)?,
             );
         }
         let storage = self
             .storages
             .get(&source_profile)
             .expect("source storage was registered above");
-        let lifecycle = storage
-            .acquire_instance_lifecycle_lock(id)
-            .map_err(|error| {
-                anyhow::anyhow!("failed to acquire session lifecycle lock: {error}")
-            })?;
+        let Some(lifecycle) =
+            storage.try_acquire_instance_lifecycle_lock_with_ownership(ownership, id)?
+        else {
+            return Ok(None);
+        };
         // Read-only: both flocks are already held, so a plain `load()` gives the
         // authoritative row without `update()`, which would rewrite sessions.json and fire
         // `notify_local_change` even when nothing changed. `move_group_to_profile` acquires
@@ -290,6 +291,10 @@ impl HomeView {
             .into_iter()
             .find(|instance| instance.id == id)
             .ok_or_else(|| anyhow::anyhow!("Session not found in source profile: {id}"))?;
+        anyhow::ensure!(
+            !authoritative.has_fresh_lifecycle_reservation(chrono::Utc::now()),
+            "Session has a lifecycle operation in progress"
+        );
         let authoritative_generation = authoritative.lifecycle_generation;
         let authoritative_status = authoritative.status;
         let authoritative_idle_entered_at = authoritative.idle_entered_at;
@@ -303,70 +308,42 @@ impl HomeView {
         authoritative.last_accessed_at =
             authoritative_last_accessed_at.max(snapshot.last_accessed_at);
         self.instances.insert(id.to_string(), authoritative);
-        Ok(SessionMutationGuards {
+        Ok(Some(SessionMutationGuards {
             _session_title: session_title,
             _lifecycle: lifecycle,
-        })
+        }))
     }
 
     /// Move a row between profiles as one dual-locked storage transaction,
     /// then publish the committed row in memory.
-    pub(in crate::tui) fn move_to_profile(
+    pub(in crate::tui) fn move_to_profile_with_ownership(
         &mut self,
-        id: &str,
-        target: &str,
-        requested: Instance,
-        baseline: Option<&Instance>,
-        account_swap: bool,
-    ) -> anyhow::Result<()> {
-        self.move_to_profile_with_effect(id, target, requested, baseline, account_swap, |_| Ok(()))
-    }
-
-    /// Cross-profile move: structurally distinct from `mutate_instance` because the source
-    /// row and group metadata must be removed in the same transaction that durably
-    /// publishes the target row and metadata.
-    ///
-    /// `before_commit` runs after authoritative target validation while both profile
-    /// storage locks are held; it may perform only bounded worktree/container effects and
-    /// must not re-enter storage or rekey tmux. Callers retain [`SessionMutationGuards`]
-    /// around the transaction and any post-persist rekey.
-    pub(in crate::tui) fn move_to_profile_with_effect<B>(
-        &mut self,
+        ownership: &crate::session::storage::OwnershipGuard,
         id: &str,
         target: &str,
         mut requested: Instance,
         baseline: Option<&Instance>,
         account_swap: bool,
-        before_commit: B,
-    ) -> anyhow::Result<()>
-    where
-        B: FnOnce(&Instance) -> anyhow::Result<()>,
-    {
+    ) -> anyhow::Result<()> {
         let Some(current) = self.instances.get(id).cloned() else {
             return Ok(());
         };
-        let lifecycle_reserved = current.has_fresh_lifecycle_reservation(chrono::Utc::now());
         let before = baseline.cloned().unwrap_or_else(|| current.clone());
         let old_profile = before.source_profile.clone();
         requested.source_profile = old_profile.clone();
         if old_profile == target {
-            requested.source_profile = target.to_string();
             self.instances.insert(id.to_string(), requested);
             return Ok(());
         }
         anyhow::ensure!(
-            current.status != crate::session::Status::Creating,
-            "Cannot move session {id} between profiles while it is being created"
-        );
-        anyhow::ensure!(
-            !lifecycle_reserved,
+            current.status != crate::session::Status::Creating
+                && !current.has_fresh_lifecycle_reservation(chrono::Utc::now()),
             "Cannot move session {id} between profiles while a lifecycle operation is in progress"
         );
-
         if !self.storages.contains_key(target) {
             self.storages.insert(
                 target.to_string(),
-                Storage::open(target, self.file_watch.clone())?,
+                Storage::open_with_ownership(target, self.file_watch.clone(), ownership)?,
             );
         }
         let source = self
@@ -377,10 +354,10 @@ impl HomeView {
             .storages
             .get(target)
             .ok_or_else(|| anyhow::anyhow!("Target profile storage is not loaded"))?;
-        let mut moved = source.move_instance_to_with_effect(
+        let mut moved = source.move_instance_to_with_ownership(
+            ownership,
             target_storage,
-            &before,
-            &requested,
+            (&before, &requested),
             account_swap,
             |instances, candidate| {
                 if crate::session::is_duplicate_session(
@@ -389,11 +366,11 @@ impl HomeView {
                     &candidate.project_path,
                     None,
                 ) {
-                    return Err(crate::session::duplicate_session_error(&candidate.title));
+                    anyhow::bail!(crate::session::duplicate_session_error(&candidate.title));
                 }
                 Ok(())
             },
-            before_commit,
+            None,
         )?;
         moved.merge_runtime_for_profile_move(&current);
         moved.source_profile = target.to_string();

@@ -94,30 +94,32 @@ async fn persist_selector(
         selector.apply(inst, value.to_string());
         inst.source_profile.clone()
     };
-    match crate::session::Storage::new(&profile, state.file_watch.clone()) {
-        Ok(storage) => {
-            if let Err(e) = storage.update(|instances, _groups| {
-                if let Some(inst) = instances.iter_mut().find(|i| i.id == id) {
-                    selector.apply(inst, value.to_string());
-                }
-                Ok(())
-            }) {
-                tracing::error!(
-                    target: "http.api.acp",
-                    session = %id,
-                    field = selector.field(),
-                    "failed to persist selector after config-option pick: {e}"
-                );
+    let id_owned = id.to_string();
+    let value = value.to_string();
+    let file_watch = state.file_watch.clone();
+    let outcome = tokio::task::spawn_blocking(move || {
+        crate::session::Storage::new(&profile, file_watch)?.update(|instances, _groups| {
+            if let Some(inst) = instances.iter_mut().find(|i| i.id == id_owned) {
+                selector.apply(inst, value);
             }
-        }
-        Err(e) => {
-            tracing::error!(
-                target: "http.api.acp",
-                session = %id,
-                field = selector.field(),
-                "failed to open storage to persist selector after config-option pick: {e}"
-            );
-        }
+            Ok(())
+        })
+    })
+    .await;
+    match outcome {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => tracing::error!(
+            target: "http.api.acp",
+            session = %id,
+            field = selector.field(),
+            "failed to persist selector after config-option pick: {e}"
+        ),
+        Err(e) => tracing::error!(
+            target: "http.api.acp",
+            session = %id,
+            field = selector.field(),
+            "selector persistence task failed: {e}"
+        ),
     }
 }
 

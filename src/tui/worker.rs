@@ -17,7 +17,9 @@ pub struct Worker<Req, Res> {
     name: String,
     request_tx: mpsc::Sender<Req>,
     result_rx: mpsc::Receiver<Res>,
-    _handle: thread::JoinHandle<()>,
+    _handle: Option<thread::JoinHandle<()>>,
+    #[cfg(test)]
+    finish_observer: Option<mpsc::Sender<()>>,
 }
 
 impl<Req: Send + 'static, Res: Send + 'static> Worker<Req, Res> {
@@ -59,7 +61,9 @@ impl<Req: Send + 'static, Res: Send + 'static> Worker<Req, Res> {
             name: thread_name.to_string(),
             request_tx,
             result_rx,
-            _handle: handle,
+            _handle: Some(handle),
+            #[cfg(test)]
+            finish_observer: None,
         }
     }
 
@@ -95,17 +99,23 @@ impl<Req: Send + 'static, Res: Send + 'static> Worker<Req, Res> {
     }
 
     #[cfg(test)]
-    pub(crate) fn finish_for_test(self) -> thread::Result<()> {
-        let Self {
-            request_tx,
-            result_rx,
-            _handle,
-            ..
-        } = self;
-        drop(request_tx);
-        let result = _handle.join();
-        drop(result_rx);
-        result
+    pub(crate) fn finish_for_test(&mut self) -> thread::Result<()> {
+        let (closed, _) = mpsc::channel();
+        drop(std::mem::replace(&mut self.request_tx, closed));
+        if let Some(observer) = self.finish_observer.take() {
+            let _ = observer.send(());
+        }
+        match self._handle.take() {
+            Some(handle) => handle.join(),
+            None => Ok(()),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn observe_finish_for_test(&mut self) -> mpsc::Receiver<()> {
+        let (sender, receiver) = mpsc::channel();
+        self.finish_observer = Some(sender);
+        receiver
     }
     /// Test-only worker with one pre-seeded result; requests are ignored.
     #[cfg(test)]
@@ -126,7 +136,8 @@ impl<Req: Send + 'static, Res: Send + 'static> Worker<Req, Res> {
             name: thread_name.to_string(),
             request_tx,
             result_rx,
-            _handle: handle,
+            _handle: Some(handle),
+            finish_observer: None,
         }
     }
 }
@@ -170,14 +181,18 @@ impl<Req: Send + 'static, Res: SessionScoped + Send + 'static> TrackedWorker<Req
         self.pending.drain().collect()
     }
 
-    #[cfg(test)]
     pub(crate) fn is_pending(&self, id: &str) -> bool {
         self.pending.contains(id)
     }
 
     #[cfg(test)]
-    pub(crate) fn finish_for_test(self) -> thread::Result<()> {
+    pub(crate) fn finish_for_test(&mut self) -> thread::Result<()> {
         self.worker.finish_for_test()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn observe_finish_for_test(&mut self) -> mpsc::Receiver<()> {
+        self.worker.observe_finish_for_test()
     }
 }
 

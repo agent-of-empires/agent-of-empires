@@ -156,6 +156,25 @@ fn right_click_trashed_row_offers_restore() {
     env.view.trash_session_by_id(&id);
     assert!(env.view.get_instance(&id).unwrap().is_trashed());
 
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while env.view.trash_poller.is_pending(&id) {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "trash result never drained"
+        );
+        env.view.apply_trash_results();
+        std::thread::yield_now();
+    }
+    let durable = env.view.storages.get("test").unwrap().load().unwrap();
+    let trashed = durable.iter().find(|row| row.id == id).unwrap();
+    assert!(trashed.lifecycle_reservation.is_none());
+    assert!(env
+        .view
+        .get_instance(&id)
+        .unwrap()
+        .lifecycle_reservation
+        .is_none());
+
     let idx = env
         .view
         .flat_items
@@ -166,20 +185,26 @@ fn right_click_trashed_row_offers_restore() {
     let row = shelf_row_for_idx(&env.view, idx);
     assert!(env.view.handle_right_click(5, row));
     let menu = env.view.context_menu.as_ref().expect("menu open");
-    assert_eq!(
+    assert!(matches!(
         menu.items_for_test(),
-        &[
-            (ContextMenuAction::Restore, "Restore"),
-            (ContextMenuAction::Delete, "Delete"),
+        [
+            (ContextMenuAction::Restore, _),
+            (ContextMenuAction::Delete, _)
         ]
-    );
+    ));
 
     env.view.handle_key(key(KeyCode::Enter), None);
+    env.view.finish_restore_for_test();
     assert!(env.view.context_menu.is_none());
     assert!(
         !env.view.get_instance(&id).unwrap().is_trashed(),
         "context-menu Restore must restore the session"
     );
+    let durable = env.view.storages.get("test").unwrap().load().unwrap();
+    let restored = durable.iter().find(|row| row.id == id).unwrap();
+    assert!(!restored.is_trashed());
+    assert!(restored.lifecycle_reservation.is_none());
+    assert!(restored.lifecycle_generation > trashed.lifecycle_generation);
 }
 
 #[test]

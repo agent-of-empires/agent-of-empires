@@ -4,9 +4,28 @@
 use super::*;
 
 impl HomeView {
-    /// Atomic per-action mutate: update memory once, then merge the user-owned
-    /// diff under the storage flock. Roll memory back if persistence fails.
+    fn user_action_ownership(&mut self) -> anyhow::Result<crate::session::storage::OwnershipGuard> {
+        crate::session::storage::try_acquire_ownership_read()?.ok_or_else(|| {
+            let message = "Another session operation is in progress. No changes were saved. Try again when it finishes.";
+            self.info_dialog = Some(InfoDialog::new("Session operation in progress", message));
+            anyhow::anyhow!(message)
+        })
+    }
+
     pub(in crate::tui) fn apply_user_action<F>(&mut self, id: &str, mutate: F) -> anyhow::Result<()>
+    where
+        F: FnOnce(&mut Instance),
+    {
+        let ownership = self.user_action_ownership()?;
+        self.apply_user_action_with_ownership(&ownership, id, mutate)
+    }
+
+    pub(in crate::tui) fn apply_user_action_with_ownership<F>(
+        &mut self,
+        ownership: &crate::session::storage::OwnershipGuard,
+        id: &str,
+        mutate: F,
+    ) -> anyhow::Result<()>
     where
         F: FnOnce(&mut Instance),
     {
@@ -26,7 +45,7 @@ impl HomeView {
 
         let id_owned = id.to_string();
         let result = if let Some(storage) = self.storages.get(&profile) {
-            storage.update(|instances, _groups| {
+            storage.update_with_ownership(ownership, |instances, _groups| {
                 if let Some(disk) = instances
                     .iter_mut()
                     .find(|instance| instance.id == id_owned)
@@ -67,28 +86,31 @@ impl HomeView {
         }
     }
 
-    /// Clear the unread marker because the user engaged with the session (live-send, attach,
-    /// or dwell). Runs regardless of the feature flag so a stale marker can't survive a
-    /// disable and reappear, and writes only when the session is actually unread.
+    /// Viewing clears unread when ownership is available; dwell retries contention.
     pub(crate) fn clear_unread_on_view(&mut self, id: &str) {
-        // Engaging with the row ends its manual-flag visit, so drop any hold;
-        // otherwise a stale hold could later suppress an auto mark on this row.
         if self.manual_unread_hold.as_deref() == Some(id) {
             self.manual_unread_hold = None;
         }
         let is_unread = self.get_instance(id).is_some_and(|i| i.is_unread());
         if is_unread {
-            let _ = self.apply_user_action(id, |i| i.mark_read());
+            match crate::session::storage::try_acquire_ownership_read() {
+                Ok(Some(ownership)) => {
+                    if let Err(error) =
+                        self.apply_user_action_with_ownership(&ownership, id, |i| i.mark_read())
+                    {
+                        tracing::warn!(target: "tui.home", %error, "Could not mark session read");
+                    }
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    tracing::warn!(target: "tui.home", %error, "Could not acquire session ownership")
+                }
+            }
         }
     }
 
-    /// Dwell-to-read: clear the selected session's unread marker once it has stayed selected,
-    /// with the list in the foreground, for `UNREAD_DWELL`, separating "scrolled past it"
-    /// from "stopped to read it". Driven from the app tick loop; true when it cleared one.
-    ///
-    /// The clock is suspended and reset whenever the feature is off, a dialog or live-send is
-    /// up, or nothing is selected, and it restarts when the selection moves. A row the user
-    /// just flagged by hand is held until the cursor leaves it (`manual_unread_hold`).
+    /// Dwell-to-read retries while ownership is busy, without blocking input.
+    /// Manual unread holds last until the cursor leaves the row.
     pub fn tick_unread_dwell(&mut self, now: std::time::Instant) -> bool {
         if !crate::session::unread_enabled() || self.has_dialog() {
             self.unread_dwell = None;
@@ -125,13 +147,12 @@ impl HomeView {
         }
         if self.get_instance(&id).is_some_and(|i| i.is_unread()) {
             self.clear_unread_on_view(&id);
-            return true;
+            return self.get_instance(&id).is_some_and(|i| !i.is_unread());
         }
         false
     }
 
-    /// Bulk `apply_user_action`: one `Storage::update` per affected
-    /// profile (single flock cycle), grouping ids by `source_profile`.
+    /// Merge one user-owned diff per affected profile under a shared ownership lease.
     pub(in crate::tui) fn bulk_apply_user_action<F>(
         &mut self,
         ids: &[String],
@@ -140,6 +161,7 @@ impl HomeView {
     where
         F: Fn(&mut Instance),
     {
+        let ownership = self.user_action_ownership()?;
         let mut by_profile: HashMap<String, Vec<(String, Instance, Instance)>> = HashMap::new();
         for id in ids {
             let Some(inst) = self.instances.get_mut(id) else {
@@ -169,7 +191,7 @@ impl HomeView {
                 .get(&profile)
                 .cloned()
                 .unwrap_or_default();
-            let res = storage.update(|insts, _groups| {
+            let res = storage.update_with_ownership(&ownership, |insts, _groups| {
                 let mut missing: Vec<String> = Vec::new();
                 for (id, pre, post) in &items {
                     if let Some(disk) = insts.iter_mut().find(|i| i.id == *id) {

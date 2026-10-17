@@ -3789,17 +3789,22 @@ pub fn resolve_theme_palette_mode() -> bool {
 /// deterministic). On a genuine first run, when no profile directory exists
 /// yet, one is bootstrapped (see `ensure_bootstrap_profile`).
 pub fn resolve_default_profile() -> String {
+    configured_default_profile().unwrap_or_else(ensure_bootstrap_profile)
+}
+
+/// Resolve a name without creating a profile while a namespace fence is held.
+pub(crate) fn default_profile_name() -> String {
+    configured_default_profile().unwrap_or_else(|| BOOTSTRAP_PROFILE.to_owned())
+}
+
+fn configured_default_profile() -> Option<String> {
     let config = Config::load_or_warn();
     if !config.default_profile.is_empty() {
-        return config.default_profile;
+        return Some(config.default_profile);
     }
-    match super::list_profiles() {
-        Ok(profiles) => match profiles.into_iter().next() {
-            Some(first) => first,
-            None => ensure_bootstrap_profile(),
-        },
-        Err(_) => ensure_bootstrap_profile(),
-    }
+    super::list_profiles()
+        .ok()
+        .and_then(|profiles| profiles.into_iter().next())
 }
 
 /// Name of the profile created on a genuine first run.
@@ -3821,7 +3826,7 @@ fn ensure_bootstrap_profile() -> String {
 /// or pre-`source_profile`-wiring callers).
 pub fn effective_profile(profile: &str) -> String {
     if profile.is_empty() {
-        resolve_default_profile()
+        default_profile_name()
     } else {
         profile.to_string()
     }

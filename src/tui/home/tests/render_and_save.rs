@@ -405,6 +405,33 @@ fn test_create_session_in_all_mode_is_findable() {
         view.get_instance(&session_id).unwrap().source_profile,
         "alpha"
     );
+    storage
+        .update(|rows, _| {
+            rows.retain(|row| row.id != session_id);
+            Ok(())
+        })
+        .unwrap();
+    assert!(!storage
+        .load()
+        .unwrap()
+        .iter()
+        .any(|row| row.id == session_id));
+    view.save().unwrap();
+    assert!(
+        !storage
+            .load()
+            .unwrap()
+            .iter()
+            .any(|row| row.id == session_id),
+        "saving must not resurrect a peer-deleted committed session"
+    );
+    assert!(view.get_instance(&session_id).is_none());
+    assert_ne!(view.selected_session.as_deref(), Some(session_id.as_str()));
+    assert!(storage
+        .load()
+        .unwrap()
+        .iter()
+        .any(|row| row.title == "Existing"));
 }
 
 #[test]
@@ -623,6 +650,8 @@ fn test_rename_selected_rejects_all_identity_collisions_and_allows_group_only_ch
 
     view.rename_selected("main branch", None, None, false)
         .unwrap();
+    view.finish_rename_for_test();
+    view.reload().unwrap();
     assert!(view.info_dialog.is_some());
     assert_eq!(view.get_instance(&target_id).unwrap().title, "throwaway");
     assert_eq!(
@@ -632,6 +661,7 @@ fn test_rename_selected_rejects_all_identity_collisions_and_allows_group_only_ch
 
     view.info_dialog = None;
     view.rename_selected("", Some("work"), None, false).unwrap();
+    view.finish_rename_for_test();
     assert!(view.info_dialog.is_none());
     assert_eq!(view.get_instance(&target_id).unwrap().group_path, "work");
     let stored = storage.load().unwrap();
@@ -666,6 +696,7 @@ fn test_rename_selected_rejects_all_identity_collisions_and_allows_group_only_ch
     view.info_dialog = None;
     view.rename_selected("main branch", None, None, false)
         .unwrap();
+    view.finish_rename_for_test();
     assert!(
         view.info_dialog.is_some(),
         "tied derived-destination collision must be rejected"
@@ -704,14 +735,13 @@ fn test_rename_selected_rejects_all_identity_collisions_and_allows_group_only_ch
     )
     .unwrap();
     unified.selected_session = Some(source_id.clone());
-    let error = unified
+    unified
         .rename_selected("occupied", None, Some("beta"), false)
-        .expect_err("target-profile identity collision must reject the transaction");
+        .unwrap();
+    unified.finish_rename_for_test();
     assert!(
-        error
-            .to_string()
-            .contains("Session already exists with same title and path"),
-        "unexpected collision error: {error:#}"
+        unified.info_dialog.is_some(),
+        "target-profile identity collision must reject the transaction"
     );
     assert_eq!(
         alpha
@@ -761,6 +791,7 @@ fn test_rename_profile_change_prunes_source_group() {
 
     // Move the session alpha -> beta, keeping the same group name.
     view.rename_selected("", None, Some("beta"), false).unwrap();
+    view.finish_rename_for_test();
 
     let moved = view.get_instance(&id).unwrap();
     assert_eq!(moved.source_profile, "beta");
@@ -986,4 +1017,211 @@ fn test_session_context_menu_new_session_prefills_from_session() {
         .expect("NewFromSelection should open the new-session dialog");
     assert_eq!(dialog.path_value(), "/tmp/work");
     assert_eq!(dialog.group_value(), "work");
+}
+
+#[test]
+#[serial]
+fn rename_submission_keeps_help_responsive_while_root_is_contended() {
+    let mut row = Instance::new("before rename", "/tmp/metadata-rename");
+    row.view = crate::session::View::Structured;
+    let id = row.id.clone();
+    let mut env = seeded_env(test_home(), &[row], true);
+    env.view.selected_session = Some(id.clone());
+    let (ready, entered) = std::sync::mpsc::channel();
+    let (release, gate) = std::sync::mpsc::channel();
+    let holder = std::thread::spawn(move || {
+        let _root = crate::session::storage::acquire_ownership_lock().unwrap();
+        ready.send(()).unwrap();
+        let _ = gate.recv_timeout(std::time::Duration::from_secs(1));
+    });
+    entered
+        .recv_timeout(std::time::Duration::from_secs(2))
+        .unwrap();
+    let started = std::time::Instant::now();
+    env.view
+        .rename_selected("after rename", None, None, false)
+        .unwrap();
+    let returned_promptly = started.elapsed() < std::time::Duration::from_millis(200);
+    let pending = env.view.rename_worker.is_pending(&id);
+    env.view.handle_key(key(KeyCode::Char('?')), None);
+    let help_opened = env.view.show_help;
+    let _ = release.send(());
+    holder.join().unwrap();
+    env.view.finish_rename_for_test();
+    assert!(
+        returned_promptly,
+        "submitting a rename must not wait for root ownership"
+    );
+    assert!(pending);
+    assert!(
+        help_opened,
+        "input must remain live while the rename worker waits"
+    );
+    assert_eq!(env.view.get_instance(&id).unwrap().title, "after rename");
+    assert_eq!(
+        Storage::open_unwatched("test").unwrap().load().unwrap()[0].title,
+        "after rename"
+    );
+}
+
+#[test]
+#[serial]
+fn selected_and_bulk_restore_keep_input_live_under_real_root_contention() {
+    for bulk in [false, true] {
+        let mut rows = Vec::new();
+        for title in ["restore-one", "restore-two"] {
+            let mut row = Instance::new(title, "/tmp/restore-contention");
+            row.status = crate::session::Status::Stopped;
+            row.view = crate::session::View::Structured;
+            row.trash();
+            rows.push(row);
+        }
+        let mut env = seeded_env(test_home(), &rows, true);
+        let id = rows[0].id.clone();
+        env.view.selected_session = Some(id.clone());
+        let root = crate::session::storage::acquire_ownership_lock().unwrap();
+        let (contended_tx, contended_rx) = std::sync::mpsc::channel();
+        let _observer = crate::session::storage::observe_root_contention_for_test(contended_tx);
+        let (release, gate) = std::sync::mpsc::channel();
+        let holder = std::thread::spawn(move || {
+            let released = gate.recv_timeout(std::time::Duration::from_secs(5));
+            drop(root);
+            assert!(released.is_ok(), "restore submission blocked input on Root");
+        });
+        if bulk {
+            env.view.restore_all_from_trash();
+        } else {
+            env.view.restore_selected_from_trash();
+        }
+        contended_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .unwrap();
+        assert_eq!(env.view.selected_session.as_deref(), Some(id.as_str()));
+        assert!(env.view.restore_worker.is_pending(&id));
+        env.view.handle_key(key(KeyCode::Char('?')), None);
+        assert!(env.view.show_help);
+        release.send(()).unwrap();
+        holder.join().unwrap();
+        env.view.finish_restore_for_test();
+        let stored = Storage::open_unwatched("test").unwrap().load().unwrap();
+        for row in &stored {
+            let expected_restored = bulk || row.id == id;
+            assert_eq!(!row.is_trashed(), expected_restored);
+            let memory = env.view.get_instance(&row.id).unwrap();
+            assert_eq!(memory.is_trashed(), row.is_trashed());
+            assert_eq!(memory.status, crate::session::Status::Stopped);
+        }
+    }
+}
+
+#[test]
+#[serial]
+fn restore_result_does_not_overwrite_a_newer_memory_incarnation_or_generation() {
+    for replace_incarnation in [false, true] {
+        let mut row = Instance::new("restore-result", "/tmp/restore-result");
+        row.status = crate::session::Status::Stopped;
+        row.trash();
+        let id = row.id.clone();
+        let mut env = seeded_env(test_home(), &[row], true);
+        env.view.selected_session = Some(id.clone());
+        let (finished_tx, finished_rx) = std::sync::mpsc::channel();
+        env.view.restore_worker =
+            crate::tui::worker::TrackedWorker::spawn("restore-result-gate", move |request| {
+                let result = super::super::operations::perform_restore(request);
+                finished_tx.send(()).unwrap();
+                result
+            });
+        env.view.restore_selected_from_trash();
+        finished_rx
+            .recv_timeout(std::time::Duration::from_secs(3))
+            .unwrap();
+        let current = env.view.instances.get_mut(&id).unwrap();
+        if replace_incarnation {
+            current.created_at += chrono::Duration::seconds(1);
+        } else {
+            current.lifecycle_generation += 2;
+        }
+        current.title = "peer replacement".into();
+        env.view.finish_restore_for_test();
+        let current = env.view.get_instance(&id).unwrap();
+        assert!(current.is_trashed());
+        assert_eq!(current.title, "peer replacement");
+    }
+}
+
+#[test]
+#[serial]
+fn disconnected_restore_worker_clears_pending_and_reports_failure() {
+    let mut row = Instance::new("restore-disconnected", "/tmp/restore-disconnected");
+    row.trash();
+    let id = row.id.clone();
+    let mut env = seeded_env(test_home(), &[row], true);
+    env.view.selected_session = Some(id.clone());
+    env.view.restore_worker =
+        crate::tui::worker::TrackedWorker::spawn("restore-disconnected", |_| {
+            panic!("injected worker disconnect");
+        });
+    env.view.restore_selected_from_trash();
+    env.view.finish_restore_for_test();
+    assert!(!env.view.restore_worker.is_pending(&id));
+    assert!(env.view.get_instance(&id).unwrap().is_trashed());
+    assert_eq!(
+        env.view.info_dialog.as_ref().map(|dialog| dialog.title()),
+        Some("Restore Failed")
+    );
+}
+
+#[test]
+#[serial]
+fn rename_result_preserves_a_newer_authoritative_generation_without_stale_save() {
+    let mut row = Instance::new("before rename", "/tmp/generation-rename");
+    row.view = crate::session::View::Structured;
+    let id = row.id.clone();
+    let mut env = seeded_env(test_home(), &[row], true);
+    env.view.selected_session = Some(id.clone());
+    let storage = Storage::open_unwatched("test").unwrap();
+    env.view
+        .rename_selected("worker title", None, None, false)
+        .unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+    loop {
+        if storage.load().unwrap()[0].title == "worker title" {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "worker did not commit"
+        );
+        std::thread::yield_now();
+    }
+    let generation = {
+        let root = crate::session::storage::acquire_ownership_read().unwrap();
+        let _identity =
+            crate::session::storage::acquire_session_identity_lock_with_ownership(&root).unwrap();
+        let _title =
+            crate::session::storage::acquire_session_title_lock_with_ownership(&root, &id).unwrap();
+        let _lifecycle = storage
+            .acquire_instance_lifecycle_lock_with_ownership(&root, &id)
+            .unwrap();
+        storage
+            .update_with_ownership(&root, |rows, _| {
+                let row = &mut rows[0];
+                row.title = "newer title".into();
+                row.try_acquire_lifecycle_reservation(
+                    LifecycleOperation::Launch,
+                    Instance::LIFECYCLE_RESERVATION_TTL,
+                    chrono::Utc::now(),
+                )
+                .map_err(anyhow::Error::from)
+            })
+            .unwrap()
+    };
+    env.view.reload().unwrap();
+    env.view.finish_rename_for_test();
+    let current = env.view.get_instance(&id).unwrap();
+    assert_eq!(current.title, "newer title");
+    assert_eq!(current.lifecycle_generation, generation);
+    let durable = storage.load().unwrap().remove(0);
+    assert_eq!(durable.title, "newer title");
+    assert_eq!(durable.lifecycle_generation, generation);
 }

@@ -336,12 +336,13 @@ fn capture_frames_carry_their_own_targets_through_the_parse() {
     );
     let text = env.view.preview_cache.parsed_text.as_ref().unwrap();
     assert_eq!(text.lines[0].to_string(), "see the AoE repo now");
+    let total_lines = text.lines.len();
 
     env.view.preview_area = PANE;
     env.view.preview_text_view = PreviewTextView {
         pane: PANE,
         first_line: 0,
-        total_lines: text.lines.len(),
+        total_lines,
     };
     assert_eq!(
         env.view.preview_link_at(PANE.x + 4, PANE.y),

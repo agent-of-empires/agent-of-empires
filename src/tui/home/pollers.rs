@@ -24,6 +24,12 @@ impl HomeView {
                         self.instances.shift_remove(&result.session_id);
                         self.rebuild_group_trees();
                         self.rebuild_flat_items();
+                        if !result.success && !result.errors.is_empty() {
+                            self.info_dialog = Some(InfoDialog::sized_to_fit(
+                                "Session removed; cleanup incomplete",
+                                &result.errors.join("; "),
+                            ));
+                        }
                     }
                     DeletionDisposition::KeptRestored => {
                         if let (Some(current), Some(retained)) = (
@@ -162,18 +168,38 @@ impl HomeView {
         match self.trash_poller.try_recv_result() {
             Ok(result) => {
                 let mut changed = false;
-                if let Some(relocation) = result.relocation {
-                    let durable = self.load_durable_instance(&result.session_id);
-                    if let Some(durable) = durable.filter(|instance| {
-                        instance.is_trashed()
-                            && instance.project_path == relocation.new_project_path
-                    }) {
-                        if let Some(instance) = self.instances.get_mut(&result.session_id) {
+                let matches_owner = |instance: &Instance| {
+                    instance.source_profile == result.source_profile
+                        && instance.created_at == result.created_at
+                        && instance.lifecycle_generation == result.generation
+                        && instance.trash_lifecycle_id == result.trash_lifecycle_id
+                };
+                if !self
+                    .instances
+                    .get(&result.session_id)
+                    .is_some_and(matches_owner)
+                {
+                    return false;
+                }
+                let durable = self.load_durable_instance(&result.session_id);
+                if let Some(durable) =
+                    durable.filter(|instance| matches_owner(instance) && instance.is_trashed())
+                {
+                    if let Some(instance) = self.instances.get_mut(&result.session_id) {
+                        let same_path = instance.project_path == durable.project_path
+                            && instance.pre_trash_project_path == durable.pre_trash_project_path;
+                        let relocated = result.relocation.as_ref().is_some_and(|relocation| {
+                            durable.project_path == relocation.new_project_path
+                        });
+                        if same_path || relocated {
+                            changed = instance.project_path != durable.project_path
+                                || instance.pre_trash_project_path
+                                    != durable.pre_trash_project_path
+                                || instance.lifecycle_reservation != durable.lifecycle_reservation;
                             instance.project_path = durable.project_path;
                             instance.pre_trash_project_path = durable.pre_trash_project_path;
                             instance.lifecycle_generation = durable.lifecycle_generation;
                             instance.lifecycle_reservation = durable.lifecycle_reservation;
-                            changed = true;
                         }
                     }
                 }
@@ -195,7 +221,7 @@ impl HomeView {
                 tracing::error!(
                     target: "tui.home",
                     rows = stuck.len(),
-                    "trash poller worker gone; transitions recover after reservation expiry",
+                    "trash poller worker gone; durable intents retain unfinished transitions",
                 );
                 false
             }
