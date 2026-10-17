@@ -26,7 +26,16 @@ export type BridgeCall =
   | { method: "plugins.uiState" }
   | { method: "action"; action: string; params: Record<string, unknown>; sessionId?: string }
   | { method: "openSession"; sessionId: string }
-  | { method: "session.archive" | "session.trash"; sessionId: string };
+  | { method: "session.archive" | "session.trash"; sessionId: string }
+  | { method: "session.contextMenu"; sessionId: string; x: number; y: number; items: PageMenuItem[] };
+
+/** A page-supplied entry appended to the host session menu; picking it resolves the call with its id. */
+export interface PageMenuItem {
+  id: string;
+  label: string;
+}
+
+const MAX_MENU_ITEMS = 20;
 
 export interface BridgeGrants {
   capabilities: readonly string[];
@@ -55,6 +64,19 @@ type Parse = (params: Record<string, unknown>) => BridgeCall | null;
 // The target must be a session sessions.list returns, so the page needs to read it too.
 const TARGET_CAPS = ["session.read", "session.write"];
 
+const isCoord = (v: unknown): v is number => typeof v === "number" && Number.isFinite(v) && v >= 0;
+
+const isMenuItem = (v: unknown): v is PageMenuItem =>
+  isRecord(v) && isText(v.id) && v.id.length <= 128 && isText(v.label) && v.label.length <= 80;
+
+const parseContextMenu: Parse = ({ id, x, y, items }) => {
+  if (!isText(id) || !isCoord(x) || !isCoord(y)) return null;
+  if (items !== undefined && !(Array.isArray(items) && items.length <= MAX_MENU_ITEMS && items.every(isMenuItem))) {
+    return null;
+  }
+  return { method: "session.contextMenu", sessionId: id, x, y, items: items ?? [] };
+};
+
 const sessionTarget =
   (method: "session.archive" | "session.trash"): Parse =>
   ({ id }) =>
@@ -78,6 +100,8 @@ const METHODS = new Map<string, { capabilities?: string[]; mutates?: boolean; pa
   ["openSession", { parse: ({ id }) => (isText(id) ? { method: "openSession", sessionId: id } : null) }],
   ["session.archive", { capabilities: TARGET_CAPS, mutates: true, parse: sessionTarget("session.archive") }],
   ["session.trash", { capabilities: TARGET_CAPS, mutates: true, parse: sessionTarget("session.trash") }],
+  // Not `mutates`: the user picks every action in the host's own menu, which applies the dashboard's modes itself.
+  ["session.contextMenu", { capabilities: ["session.read"], parse: parseContextMenu }],
 ]);
 
 /** Validates params, then gates on the plugin's capabilities and the dashboard mode. */
@@ -110,7 +134,11 @@ export const bridgeError = (id: BridgeId, code: BridgeErrorCode, message: string
   error: { code, message },
 });
 
-export const bridgePush = (event: "context" | "theme", data: unknown) => ({ aoeBridge: BRIDGE_VERSION, event, data });
+export const bridgePush = (event: "context" | "theme" | "selection", data: unknown) => ({
+  aoeBridge: BRIDGE_VERSION,
+  event,
+  data,
+});
 
 export const themePayload = (theme: ResolvedTheme) => ({
   appearance: theme.appearance,

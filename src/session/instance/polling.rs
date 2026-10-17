@@ -1300,8 +1300,12 @@ mod tests {
             crate::session::sync::drain_and_persist_session_ids(instances, &file_watch).touched()
         };
         let forkable = |row: &Instance| {
-            crate::session::fork::terminal_fork_seed(row.fork_parent_ref().unwrap(), "child".into())
-                .is_ok()
+            crate::session::fork::terminal_fork_seed(
+                row.fork_parent_ref().unwrap(),
+                "child".into(),
+                row.is_sandboxed(),
+            )
+            .is_ok()
         };
 
         assert!(

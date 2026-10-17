@@ -29,7 +29,8 @@ async function mount(path: string | null, body?: string, rev?: number) {
   const open = async (next: string, nextBody: string, nextRev = rev) => {
     spy.mockResolvedValueOnce(contents(next, nextBody));
     hook.rerender({ path: next, rev: nextRev });
-    await waitFor(() => expect(shown()).toBe(nextBody));
+    // Boolean compare: a failed `toBe` on the 33 MB body builds a huge diff each poll and starves the fetch.
+    await waitFor(() => expect(shown() === nextBody).toBe(true));
   };
   return { ...hook, shown, open };
 }

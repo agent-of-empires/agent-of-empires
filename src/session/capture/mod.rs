@@ -37,8 +37,9 @@ pub(crate) use omp::*;
 pub(crate) use opencode::{fork_opencode_session_id, preassign_opencode_session_id};
 pub(crate) use pi::{extract_pi_header_fields, pi_sidecar_poll_fn, read_pi_session_observation};
 pub(crate) use prime::{
-    prime_agent_poll_fn_sandboxed, root_session_header, PrimeRootPublication,
-    PRIME_AGENT_HEADER_SCAN_BYTES, PRIME_AGENT_MAX_SESSION_FILES,
+    hand_off_root_transcript as hand_off_prime_root_transcript, prime_agent_poll_fn_sandboxed,
+    root_session_header, PrimeRootPublication, PRIME_AGENT_HEADER_SCAN_BYTES,
+    PRIME_AGENT_MAX_SESSION_FILES,
 };
 
 /// Canonicalizes an existing path, else normalizes lexically so an unnormalized

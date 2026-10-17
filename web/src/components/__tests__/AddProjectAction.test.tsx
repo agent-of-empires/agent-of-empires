@@ -76,7 +76,7 @@ describe("SessionRow Add project entry", () => {
       openRowMenu(ws(over), options);
       expect(screen.queryByTestId("sidebar-context-menu-add-project") != null).toBe(offered);
       // The menu opened, so a hidden entry is the per-entry gate.
-      expect(screen.queryByTestId("sidebar-context-menu-rename")).not.toBeNull();
+      expect(screen.queryByTestId("sidebar-context-menu")).not.toBeNull();
     },
   );
 
