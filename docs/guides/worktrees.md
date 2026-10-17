@@ -79,6 +79,8 @@ Deleting a session prompts to remove an aoe-managed worktree (or pass `--delete-
 
 **Trashing relocates the worktree** into a sibling `.aoe-trash/<session-id>` holding directory with `git worktree move`, so trashed sessions stop cluttering the active checkouts while staying previewable. Restoring moves it back, and is refused if that path is now occupied. Purging removes it.
 
+**Purging first moves the worktree** to a sibling `.aoe-purge-<session-id>` locked as `aoe purge in progress`, which `git worktree list` still shows but aoe hides from sessions, then removes it. A failed removal moves it back; one interrupted by a crash is finished on the next purge attempt.
+
 **The default branch's checkout is never removed.** In a bare-repo layout the default branch lives in a linked worktree other tooling expects to stay put, so aoe refuses to remove that checkout or delete its branch, reports the refusal, and deletes the session anyway. Force does not bypass this, including trash auto-purge and `aoe session empty-trash`, and `aoe worktree cleanup` lists such a checkout as skipped. Detection uses what git states: the bare repo's own `HEAD` plus every remote's `refs/remotes/<remote>/HEAD`, falling back to `main` and `master` by convention when neither exists. To remove one anyway, do it with git and then delete the session.
 
 An externally placed `git worktree lock` is not a deletion guard: aoe locks every worktree it creates and unlocks before each intentional remove or move, so it unlocks yours too.

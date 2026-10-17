@@ -127,6 +127,7 @@ impl GitWorktree {
         // skips locked entries; siblings keep their locks.
         self.unlock_worktree(path);
         let t = Instant::now();
+        self.reap_abandoned_purges();
         self.prune_worktrees()?;
         tracing::info!(target: "git.worktree", "worktree create: prune done in {:?}", t.elapsed());
 
@@ -561,6 +562,89 @@ pub(super) mod tests {
             git_wt.fetch_branch("origin", "nonexistent-branch"),
             FetchOutcome::Failed(_)
         ));
+    }
+
+    #[test]
+    fn create_worktree_reaps_purges_whose_process_died() {
+        use std::os::unix::fs::PermissionsExt;
+        let mut exited = std::process::Command::new("true").spawn().unwrap();
+        exited.wait().unwrap();
+        let (dead, live) = (exited.id(), std::process::id());
+        // (case, purging pid, flags, written after marking, reaped)
+        for (label, owner, flags, dirty, reaped) in [
+            (
+                "dead purger, row removed",
+                dead,
+                ", row removed",
+                false,
+                true,
+            ),
+            ("live purger", live, ", row removed, force", false, false),
+            ("row still retained", dead, "", false, false),
+            ("checkout unstattable", dead, ", row removed", false, false),
+            (
+                "unforced purge dirtied later",
+                dead,
+                ", row removed",
+                true,
+                false,
+            ),
+            (
+                "forced purge dirtied later",
+                dead,
+                ", row removed, force",
+                true,
+                true,
+            ),
+        ] {
+            let (dir, _repo) = init_repo();
+            let git_wt = GitWorktree::new(dir.path().to_path_buf()).unwrap();
+            let parent = TempDir::new().unwrap();
+            let aside = parent.path().join(".aoe-purge-x");
+            git_wt.create_worktree("feat", &aside, true, None).unwrap();
+            let aside_str = aside.to_str().unwrap();
+            if owner == live {
+                let lock = super::super::PurgeLock {
+                    row_removed: flags.contains("row removed"),
+                    force: flags.contains("force"),
+                };
+                git_wt.lock_for_purge(&aside, lock).unwrap();
+                let admin = crate::git::cleanup::read_linked_worktree_gitdir(&aside).unwrap();
+                let written = std::fs::read_to_string(admin.join("locked")).unwrap();
+                assert_eq!(
+                    GitWorktree::purge_lock(&written),
+                    Some((live, lock)),
+                    "{label}"
+                );
+            } else {
+                run_git(dir.path(), &["worktree", "unlock", aside_str]);
+                let reason = format!("{}{owner}{flags}", super::super::PURGE_LOCK_PREFIX);
+                run_git(
+                    dir.path(),
+                    &["worktree", "lock", "--reason", &reason, aside_str],
+                );
+            }
+            if dirty {
+                std::fs::write(aside.join("late-edit"), "").unwrap();
+            }
+
+            let unstattable = label == "checkout unstattable";
+            let set_mode = |mode| {
+                std::fs::set_permissions(parent.path(), std::fs::Permissions::from_mode(mode))
+                    .unwrap()
+            };
+            if unstattable {
+                set_mode(0o000);
+            }
+            let elsewhere = TempDir::new().unwrap();
+            let created =
+                git_wt.create_worktree("feat", &elsewhere.path().join("new"), false, None);
+            if unstattable {
+                set_mode(0o755);
+            }
+            assert_eq!(created.is_ok(), reaped, "{label}: {created:?}");
+            assert_eq!(aside.exists(), !reaped, "{label}");
+        }
     }
 
     #[test]

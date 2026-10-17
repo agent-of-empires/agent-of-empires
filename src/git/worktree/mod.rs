@@ -28,6 +28,21 @@ const MUTATION_OBSERVATION_TIMEOUT: Duration = Duration::from_secs(5);
 /// intentional remove or move.
 const WORKTREE_LOCK_REASON: &str = "aoe-managed worktree (prevents cross-boundary prune)";
 
+/// Lock reason on a worktree whose purge is in progress, followed by the purging pid and its
+/// [`PurgeLock`] flags. Listings skip it so no session can adopt it.
+const PURGE_LOCK_REASON: &str = "aoe purge in progress";
+const PURGE_LOCK_PREFIX: &str = "aoe purge in progress, pid ";
+const ROW_REMOVED_FLAG: &str = "row removed";
+const FORCE_FLAG: &str = "force";
+
+/// The terms an abandoned purge may be finished on: only once its session row is gone, and
+/// discarding changes only when the purge was forced.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct PurgeLock {
+    pub row_removed: bool,
+    pub force: bool,
+}
+
 pub struct WorktreeEntry {
     pub path: PathBuf,
     pub branch: Option<String>,
@@ -174,18 +189,98 @@ impl GitWorktree {
     /// Lock `path`'s admin entry (see `WORKTREE_LOCK_REASON`). A failure only
     /// forfeits prune protection, so callers surface it as a warning.
     pub fn lock_worktree(&self, path: &Path) -> Result<()> {
+        self.lock_with_reason(path, WORKTREE_LOCK_REASON)
+    }
+
+    /// Return a purge-locked worktree to an ordinary aoe-managed one.
+    pub fn relock_as_managed(&self, path: &Path) -> Result<()> {
+        self.unlock_worktree(path);
+        self.lock_worktree(path)
+    }
+
+    /// Relock `path` as purging, hiding it from `list_worktrees`.
+    pub fn lock_for_purge(&self, path: &Path, lock: PurgeLock) -> Result<()> {
+        self.unlock_worktree(path);
+        let mut reason = format!("{PURGE_LOCK_PREFIX}{}", std::process::id());
+        for (set, flag) in [
+            (lock.row_removed, ROW_REMOVED_FLAG),
+            (lock.force, FORCE_FLAG),
+        ] {
+            if set {
+                reason.push_str(", ");
+                reason.push_str(flag);
+            }
+        }
+        self.lock_with_reason(path, &reason)
+    }
+
+    fn lock_with_reason(&self, path: &Path, reason: &str) -> Result<()> {
         run_bounded(
             &self.repo_path,
-            [
-                "worktree",
-                "lock",
-                "--reason",
-                WORKTREE_LOCK_REASON,
-                path_str(path)?,
-            ],
+            ["worktree", "lock", "--reason", reason, path_str(path)?],
             "git worktree lock",
         )
         .map(drop)
+    }
+
+    fn purge_lock(lock_reason: &str) -> Option<(u32, PurgeLock)> {
+        let mut fields = lock_reason
+            .trim()
+            .strip_prefix(PURGE_LOCK_PREFIX)?
+            .split(", ");
+        let pid = fields.next()?.parse().ok()?;
+        let flags: Vec<&str> = fields.collect();
+        let lock = PurgeLock {
+            row_removed: flags.contains(&ROW_REMOVED_FLAG),
+            force: flags.contains(&FORCE_FLAG),
+        };
+        Some((pid, lock))
+    }
+
+    fn is_purging(path: &Path) -> bool {
+        crate::git::cleanup::read_linked_worktree_gitdir(path)
+            .and_then(|admin| std::fs::read_to_string(admin.join("locked")).ok())
+            .is_some_and(|reason| reason.trim().starts_with(PURGE_LOCK_REASON))
+    }
+
+    /// Remove the checkouts of purges whose process died after their row was removed, since nothing
+    /// else retries them and they still hold their branch. A purge whose row remains is retried
+    /// through it instead. The branch and other session resources are left behind.
+    pub fn reap_abandoned_purges(&self) {
+        let Ok(repo) = open_repo_at(&self.repo_path) else {
+            return;
+        };
+        let Ok(names) = repo.worktrees() else {
+            return;
+        };
+        for name in names.iter().filter_map(|name| name.ok().flatten()) {
+            let Ok(wt) = repo.find_worktree(name) else {
+                continue;
+            };
+            let Ok(git2::WorktreeLockStatus::Locked(Some(reason))) = wt.is_locked() else {
+                continue;
+            };
+            let Some((pid, lock)) = Self::purge_lock(&reason) else {
+                continue;
+            };
+            if !lock.row_removed || crate::process::worker::is_pid_alive(pid) {
+                continue;
+            }
+            let path = wt.path().to_path_buf();
+            tracing::info!(target: "git.worktree", path = %path.display(), pid, "reaping abandoned purge");
+            // Only a confirmed absence may skip the dirty guard; the caller prunes after unlocking.
+            let removed = match path.try_exists() {
+                Ok(true) => self.remove_worktree(&path, lock.force),
+                Ok(false) => {
+                    self.unlock_worktree(&path);
+                    Ok(())
+                }
+                Err(error) => Err(error.into()),
+            };
+            if let Err(error) = removed {
+                tracing::warn!(target: "git.worktree", path = %path.display(), %error, "could not reap abandoned purge");
+            }
+        }
     }
 
     /// Unlock `path`'s admin entry, best-effort and idempotent. Must precede
@@ -260,6 +355,9 @@ impl GitWorktree {
             let Ok(path) = wt.path().canonicalize() else {
                 continue;
             };
+            if Self::is_purging(&path) {
+                continue;
+            }
             entries.push(WorktreeEntry {
                 branch: Self::get_current_branch(&path).ok(),
                 path,
@@ -273,11 +371,23 @@ impl GitWorktree {
         if !path.exists() {
             return Err(GitError::WorktreeNotFound(path.to_path_buf()));
         }
-        // A single `--force` does not override a lock.
-        self.unlock_worktree(path);
         let mut args = vec!["worktree", "remove"];
-        if force {
-            args.push("--force");
+        // Stays locked so it stays hidden; `--force` twice overrides the lock and dirtiness alike.
+        if Self::is_purging(path) {
+            if !force {
+                let dirty = crate::git::cleanup::checked_dirty_worktree_message(path)
+                    .unwrap_or_else(|error| Some(format!("could not check for changes: {error}")));
+                if let Some(message) = dirty {
+                    return Err(GitError::WorktreeCommandFailed(message));
+                }
+            }
+            args.extend(["--force", "--force"]);
+        } else {
+            // A single `--force` does not override a lock.
+            self.unlock_worktree(path);
+            if force {
+                args.push("--force");
+            }
         }
         args.push(path_str(path)?);
         let output = super::command::run_git_throttled(&self.repo_path, &args)?;

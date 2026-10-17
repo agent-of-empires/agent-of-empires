@@ -154,26 +154,23 @@ pub fn is_not_a_worktree_error(error: &str) -> bool {
 /// entries. Empty when the path is not a repo or the status walk fails, which
 /// callers read as "no list available".
 pub fn list_dirty_files(worktree_path: &Path) -> Vec<String> {
-    let Ok(repo) = open_repo_at(worktree_path) else {
-        return Vec::new();
-    };
+    try_list_dirty_files(worktree_path).unwrap_or_default()
+}
 
+fn try_list_dirty_files(worktree_path: &Path) -> Result<Vec<String>, git2::Error> {
+    let repo = open_repo_at(worktree_path)?;
     let mut opts = git2::StatusOptions::new();
     opts.include_untracked(true)
         .recurse_untracked_dirs(true)
         .include_ignored(false);
-
-    let Ok(statuses) = repo.statuses(Some(&mut opts)) else {
-        return Vec::new();
-    };
-
-    let mut out = Vec::new();
-    for entry in statuses.iter() {
-        let path = entry.path().unwrap_or("<unreadable path>").to_string();
-        let label = describe_status(entry.status());
-        out.push(format!("{} {}", label, path));
-    }
-    out
+    let statuses = repo.statuses(Some(&mut opts))?;
+    Ok(statuses
+        .iter()
+        .map(|entry| {
+            let path = entry.path().unwrap_or("<unreadable path>");
+            format!("{} {}", describe_status(entry.status()), path)
+        })
+        .collect())
 }
 
 fn describe_status(status: git2::Status) -> &'static str {
@@ -203,7 +200,15 @@ fn describe_status(status: git2::Status) -> &'static str {
 /// worktree unconditionally, which would violate `force_delete=false` for a
 /// user with untracked files.
 pub fn dirty_worktree_message(worktree_path: &Path) -> Option<String> {
-    let dirty = list_dirty_files(worktree_path);
+    describe_dirty_files(list_dirty_files(worktree_path))
+}
+
+/// [`dirty_worktree_message`], except a failed status scan is an error rather than clean.
+pub fn checked_dirty_worktree_message(worktree_path: &Path) -> Result<Option<String>, git2::Error> {
+    try_list_dirty_files(worktree_path).map(describe_dirty_files)
+}
+
+fn describe_dirty_files(dirty: Vec<String>) -> Option<String> {
     if dirty.is_empty() {
         return None;
     }

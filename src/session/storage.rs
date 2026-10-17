@@ -911,6 +911,15 @@ impl Storage {
         )
     }
 
+    #[cfg(test)]
+    pub(crate) fn save_locks_are_free_for_test(&self) -> bool {
+        let profile_dir = self.sessions_path.parent().expect("profile directory");
+        self.save_lock.try_lock().is_ok()
+            && try_acquire_storage_flock(profile_dir, STORAGE_LOCK_FILENAME)
+                .expect("probe storage lock")
+                .is_some()
+    }
+
     /// Whether some holder currently has `instance_id`'s lifecycle lock.
     #[cfg(test)]
     pub(crate) fn instance_lifecycle_lock_is_held_for_test(&self, instance_id: &str) -> bool {
