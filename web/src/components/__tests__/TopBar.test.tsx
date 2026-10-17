@@ -2,6 +2,7 @@
 
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { cleanup, fireEvent, render } from "@testing-library/react";
+import { MemoryRouter } from "react-router-dom";
 
 import { TopBar } from "../TopBar";
 import type { SessionResponse, Workspace } from "../../lib/types";
@@ -59,7 +60,7 @@ function topBarProps(overrides: TopBarOverrides = {}) {
 }
 
 function renderTopBar(overrides: TopBarOverrides = {}) {
-  return render(<TopBar {...topBarProps(overrides)} />);
+  return render(<TopBar {...topBarProps(overrides)} />, { wrapper: MemoryRouter });
 }
 
 describe("TopBar", () => {
@@ -83,7 +84,7 @@ describe("TopBar", () => {
 
     localStorage.setItem("aoe-web-settings", JSON.stringify({ sidebarCompact: true }));
     try {
-      const compact = render(<TopBar {...topBarProps()} sidebarColumnVisible />);
+      const compact = render(<TopBar {...topBarProps()} sidebarColumnVisible />, { wrapper: MemoryRouter });
       expect(group(compact.container)?.className).toContain("md:hidden");
       expect(group(compact.container)?.className).not.toContain("md:flex");
     } finally {
