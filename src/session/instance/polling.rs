@@ -931,7 +931,7 @@ mod tests {
             None,
         );
         assert!(
-            inst.has_live_tmux_pane_in(&live),
+            inst.tmux_env_session_name_in(&live).is_some(),
             "fixture pane must read live"
         );
         assert!(inst.supports_session_poller());

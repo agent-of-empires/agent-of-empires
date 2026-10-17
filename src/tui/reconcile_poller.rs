@@ -1,12 +1,4 @@
-//! Background load-time healing for trashed and relocated worktrees.
-//!
-//! Both sweeps below repair durable state that a crash, an older aoe version,
-//! or a `git worktree move` from another shell left inconsistent. Neither
-//! belongs on the first-frame path: a broken row costs a lifecycle flock, a
-//! storage write, and git spawns, so a store with a few hundred trashed rows
-//! held the TUI at a blank screen for seconds before it could paint (#3611,
-//! #3554). It is healing work, not render input, so it runs on a worker and
-//! `HomeView::apply_reconcile_results` reloads once the sweep lands.
+//! Background startup healing and tmux identity publication, before auto-recovery.
 
 use std::sync::mpsc::TryRecvError;
 
@@ -30,9 +22,9 @@ impl ReconcilePoller {
     pub fn new() -> Self {
         Self {
             worker: Worker::spawn("aoe-reconcile-poller", |request: ReconcileRequest| {
-                ReconcileResult {
-                    changed: sweep(&request.profiles),
-                }
+                let changed = sweep(&request.profiles);
+                publish_session_environment(&request.profiles);
+                ReconcileResult { changed }
             }),
         }
     }
@@ -52,6 +44,53 @@ impl ReconcilePoller {
                 "aoe-reconcile-poller-test",
                 ReconcileResult { changed },
             ),
+        }
+    }
+}
+
+fn publish_session_environment(profiles: &[String]) {
+    use crate::session::Storage;
+    use crate::tmux::env::{AOE_CAPTURED_SESSION_ID_KEY, AOE_INSTANCE_ID_KEY};
+
+    let live = crate::tmux::LiveSessionSnapshot::new();
+    let mut set_batch = Vec::new();
+    let mut unset_batch = Vec::new();
+    for profile in profiles {
+        let instances = match Storage::open_unwatched(profile).and_then(|storage| storage.load()) {
+            Ok(instances) => instances,
+            Err(error) => {
+                tracing::warn!(target: "tui.home", %profile, %error, "tmux identity publication skipped");
+                continue;
+            }
+        };
+        for instance in instances {
+            let Some(name) = instance.tmux_env_session_name_in_or_probe(&live) else {
+                continue;
+            };
+            set_batch.push((name.clone(), AOE_INSTANCE_ID_KEY, instance.id));
+            if let Some(sid) = instance.agent_session_id {
+                set_batch.push((name, AOE_CAPTURED_SESSION_ID_KEY, sid));
+            } else {
+                unset_batch.push((name, AOE_CAPTURED_SESSION_ID_KEY));
+            }
+        }
+    }
+    if !set_batch.is_empty() {
+        let refs: Vec<_> = set_batch
+            .iter()
+            .map(|(name, key, value)| (name.as_str(), *key, value.as_str()))
+            .collect();
+        if let Err(error) = crate::tmux::env::set_hidden_env_batch(&refs) {
+            tracing::warn!(target: "tui.home", %error, "tmux identity publication failed");
+        }
+    }
+    if !unset_batch.is_empty() {
+        let refs: Vec<_> = unset_batch
+            .iter()
+            .map(|(name, key)| (name.as_str(), *key))
+            .collect();
+        if let Err(error) = crate::tmux::env::remove_hidden_env_batch(&refs) {
+            tracing::warn!(target: "tui.home", %error, "tmux identity removal failed");
         }
     }
 }

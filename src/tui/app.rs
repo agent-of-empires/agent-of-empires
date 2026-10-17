@@ -96,6 +96,12 @@ pub type TuiBackend = crate::tui::hyperlink::HyperlinkBackend<std::io::Stdout>;
 
 pub struct App {
     home: HomeView,
+    tool_detection: Option<ToolDetection>,
+    available_tools_rx: Option<tokio::sync::oneshot::Receiver<AvailableTools>>,
+    pending_forced_tool_detection: bool,
+    startup_dialogs_pending: bool,
+    suppress_first_run_dialogs: bool,
+    force_update_check: bool,
     should_quit: bool,
     theme: Theme,
     /// Guards `set_theme`: the config watcher re-dispatches the theme on every
@@ -141,17 +147,20 @@ pub struct App {
     last_installed_version_in_session: Option<String>,
 }
 
-/// Previous version when the changelog should be shown.
-pub fn check_version_change() -> Result<Option<String>> {
-    let config = Config::load_or_warn();
-    let current_version = env!("CARGO_PKG_VERSION");
+struct ToolDetection {
+    cancel: tokio_util::sync::CancellationToken,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
 
-    if config.app_state.has_seen_welcome
-        && config.app_state.last_seen_version.as_deref() != Some(current_version)
-    {
-        Ok(config.app_state.last_seen_version)
-    } else {
-        Ok(None)
+impl Drop for ToolDetection {
+    fn drop(&mut self) {
+        self.cancel.cancel();
+        // The worker reaps its independently grouped probe before the TUI can exit.
+        if let Some(thread) = self.thread.take() {
+            if thread.join().is_err() {
+                tracing::warn!(target: "tui.startup", "agent detection worker panicked during shutdown");
+            }
+        }
     }
 }
 
@@ -267,58 +276,35 @@ impl App {
         mosh_active: bool,
         file_watch: std::sync::Arc<crate::file_watch::FileWatchService>,
     ) -> Result<Self> {
-        let no_agents = !available_tools.any_available();
         let active_profile = if profile.is_empty() {
             None
         } else {
             Some(profile.to_string())
         };
-        let mut home = HomeView::new(active_profile, available_tools, file_watch)?;
+        #[cfg(not(test))]
+        let home = HomeView::new(active_profile, available_tools, file_watch)?;
+        #[cfg(test)]
+        let home = HomeView::new_for_test(active_profile, available_tools, file_watch)?;
 
         let config = Config::load_or_warn();
         // Theme is a global preference, never profile-merged.
         let theme_name = config.effective_theme_name();
         let palette_mode = config.theme_palette_mode();
         let theme = crate::tui::styles::load_theme_with_mode(&theme_name, palette_mode);
-        let current_version = env!("CARGO_PKG_VERSION").to_string();
-
-        if no_agents {
-            home.show_no_agents();
-        } else if suppress_first_run_dialogs {
-            // The caller shows a startup warning first.
-        } else if !config.app_state.has_seen_welcome {
-            home.show_intro(&theme_name);
-            if let Err(e) = update_app_state(|state| {
-                state.has_seen_welcome = true;
-                state.last_seen_version = Some(current_version.clone());
-            }) {
-                tracing::warn!(
-                    target: "tui.startup",
-                    error = %e,
-                    "failed to persist has_seen_welcome/last_seen_version"
-                );
-            }
-        } else if config.app_state.last_seen_version.as_deref() != Some(&current_version) {
-            home.show_changelog(config.app_state.last_seen_version.clone());
-            if let Err(e) = update_app_state(|state| {
-                state.last_seen_version = Some(current_version.clone());
-            }) {
-                tracing::warn!(
-                    target: "tui.startup",
-                    error = %e,
-                    "failed to persist last_seen_version"
-                );
-            }
-        } else if !config.app_state.has_responded_to_telemetry {
-            // One-time opt-in for users who finished onboarding before telemetry existed.
-            home.show_telemetry_consent();
-        }
+        let force_update_check = config.app_state.has_seen_welcome
+            && config.app_state.last_seen_version.as_deref() != Some(env!("CARGO_PKG_VERSION"));
 
         let dismissed_update_version = config.app_state.dismissed_update_version.clone();
         let dismissed_image_digest = config.app_state.dismissed_image_digest.clone();
 
-        Ok(Self {
+        let mut app = Self {
             home,
+            tool_detection: None,
+            available_tools_rx: None,
+            pending_forced_tool_detection: false,
+            startup_dialogs_pending: true,
+            suppress_first_run_dialogs,
+            force_update_check,
             should_quit: false,
             theme,
             theme_name,
@@ -347,7 +333,101 @@ impl App {
             smart_rename_rx: None,
             pending_install_version: None,
             last_installed_version_in_session: None,
-        })
+        };
+        app.finish_startup_dialogs(false);
+        Ok(app)
+    }
+
+    fn finish_startup_dialogs(&mut self, detection_finished: bool) -> bool {
+        if !self.startup_dialogs_pending || self.home.has_dialog() {
+            return false;
+        }
+        if !self.home.available_tools.any_available() && !detection_finished {
+            return false;
+        }
+        self.startup_dialogs_pending = false;
+        if !self.home.available_tools.any_available() {
+            self.home.show_no_agents();
+            return true;
+        }
+        if self.suppress_first_run_dialogs {
+            return false;
+        }
+        let config = Config::load_or_warn();
+        let version = env!("CARGO_PKG_VERSION");
+        if !config.app_state.has_seen_welcome {
+            self.home.show_intro(&self.theme_name);
+        } else if config.app_state.last_seen_version.as_deref() != Some(version) {
+            self.home
+                .show_changelog(config.app_state.last_seen_version.clone());
+        } else if !config.app_state.has_responded_to_telemetry {
+            self.home.show_telemetry_consent();
+        }
+        if !config.app_state.has_seen_welcome
+            || config.app_state.last_seen_version.as_deref() != Some(version)
+        {
+            if let Err(error) = update_app_state(|state| {
+                state.has_seen_welcome = true;
+                state.last_seen_version = Some(version.to_string());
+            }) {
+                tracing::warn!(target: "tui.startup", %error, "failed to persist onboarding state");
+            }
+        }
+        true
+    }
+
+    fn spawn_tool_detection(&mut self, force: bool) {
+        if self.available_tools_rx.is_some() {
+            self.pending_forced_tool_detection |= force;
+            return;
+        }
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        self.available_tools_rx = Some(rx);
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let worker_cancel = cancel.clone();
+        match std::thread::Builder::new()
+            .name("aoe-agent-detection".into())
+            .spawn(move || {
+                let _ = tx.send(AvailableTools::detect_cancellable(&worker_cancel, force));
+            }) {
+            Ok(thread) => {
+                self.tool_detection = Some(ToolDetection {
+                    cancel,
+                    thread: Some(thread),
+                })
+            }
+            Err(error) => {
+                tracing::warn!(target: "tui.startup", %error, "could not start agent detection")
+            }
+        }
+    }
+
+    fn poll_tool_detection(&mut self) -> bool {
+        if let Some(rx) = self.available_tools_rx.as_mut() {
+            match rx.try_recv() {
+                Ok(tools) => {
+                    if self.home.no_agents_dialog.is_some() {
+                        if tools.any_available() {
+                            self.home.no_agents_dialog = None;
+                        } else {
+                            self.startup_dialogs_pending = false;
+                        }
+                    }
+                    self.home.set_available_tools(tools);
+                }
+                Err(tokio::sync::oneshot::error::TryRecvError::Empty) => return false,
+                Err(tokio::sync::oneshot::error::TryRecvError::Closed) => {}
+            }
+            self.available_tools_rx = None;
+            self.tool_detection = None;
+            if std::mem::take(&mut self.pending_forced_tool_detection) {
+                self.spawn_tool_detection(true);
+            } else {
+                self.finish_startup_dialogs(true);
+            }
+            return true;
+        }
+        self.finish_startup_dialogs(true)
     }
 
     fn sync_mouse_capture(&mut self, terminal: &mut Terminal<TuiBackend>) -> Result<()> {
@@ -538,6 +618,9 @@ impl App {
         self.draw(terminal)?;
         #[cfg(feature = "e2e-tests")]
         e2e_render_ack(true)?;
+
+        self.spawn_tool_detection(false);
+        crate::plugin::auto_update::spawn_if_enabled(&Config::load_or_warn(), None);
 
         // `None` when checks are off, so enabling them later checks immediately.
         let settings = get_update_settings();
@@ -1180,6 +1263,7 @@ impl App {
             refresh_needed |= self.home.tick_unread_dwell(std::time::Instant::now());
 
             // Banner changes shift the layout, so they need a full clear.
+            full |= self.poll_tool_detection();
             let banner_changed = self.poll_update_check()
                 | self.poll_update_status()
                 | self.poll_image_update_check()
@@ -1393,6 +1477,7 @@ impl App {
             }
         }
 
+        self.tool_detection = None;
         self.home.apply_session_id_updates();
         // Persist the final restart snapshot instead of a stale `Starting` row.
         self.home.apply_restart_results();
@@ -1492,9 +1577,10 @@ impl App {
     fn spawn_update_check(&mut self) {
         let (tx, rx) = tokio::sync::oneshot::channel();
         self.update_rx = Some(rx);
+        let force = std::mem::take(&mut self.force_update_check);
         tokio::spawn(async move {
             let version = env!("CARGO_PKG_VERSION");
-            let mut result = check_for_update(version, false).await;
+            let mut result = check_for_update(version, force).await;
             // Homebrew formulas lag releases; hide the banner until `brew upgrade` can act.
             if let Ok(info) = &mut result {
                 if info.available {
@@ -1513,19 +1599,27 @@ impl App {
         });
     }
 
-    /// True when a fresh, non-snoozed update just arrived.
+    /// True when the update banner or an open changelog needs a redraw.
     fn poll_update_check(&mut self) -> bool {
+        let was_pending = self.update_rx.is_some();
         let (update_info, update_rx, received) =
             poll_update_receiver(self.update_rx.take(), self.update_info.take());
         self.update_info = update_info;
         self.update_rx = update_rx;
 
+        let mut changelog_changed = false;
+        if was_pending && self.update_rx.is_none() {
+            if let Some(dialog) = self.home.changelog_dialog.as_mut() {
+                dialog.refresh();
+                changelog_changed = true;
+            }
+        }
         if !received {
-            return false;
+            return changelog_changed;
         }
 
         let Some(info) = self.update_info.as_ref() else {
-            return false;
+            return changelog_changed;
         };
 
         if self.last_installed_version_in_session.as_deref() == Some(info.latest_version.as_str()) {
@@ -1535,7 +1629,7 @@ impl App {
                 "skipping: already installed this version this session, restart aoe to use it"
             );
             self.update_info = None;
-            return false;
+            return changelog_changed;
         }
 
         // Auto mode installs in the background; the new binary runs on next launch.
@@ -1545,12 +1639,12 @@ impl App {
         {
             self.maybe_kick_off_auto_install(info.latest_version.clone());
             self.update_info = None;
-            return false;
+            return changelog_changed;
         }
 
         if self.dismissed_update_version.as_deref() == Some(info.latest_version.as_str()) {
             self.update_info = None;
-            return false;
+            return changelog_changed;
         }
 
         true
@@ -2509,6 +2603,7 @@ impl App {
     ) -> Result<()> {
         match action {
             Action::Quit => self.should_quit = true,
+            Action::RecheckAgents => self.spawn_tool_detection(true),
             Action::AttachSession(id) => {
                 self.attach_session(&id, terminal)?;
             }
@@ -3105,6 +3200,7 @@ fn wait_for_background_tool(session_id: &str, tool_name: &str, mut child: std::p
 #[derive(Debug, Clone, PartialEq)]
 pub enum Action {
     Quit,
+    RecheckAgents,
     AttachSession(String),
     AttachTerminal(String, TerminalMode),
     EditFile(PathBuf),
@@ -3149,6 +3245,323 @@ fn smart_rename_failure(e: &crate::acp::client::HttpError) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    #[cfg(unix)]
+    #[serial_test::serial]
+    async fn forced_recheck_survives_an_in_flight_detection() {
+        use std::os::unix::fs::PermissionsExt;
+        const CHILD_ENV: &str = "AOE_RECHECK_TEST_CHILD";
+        let thread = std::thread::current();
+        let test = thread.name().expect("named test thread");
+        if std::env::var_os(CHILD_ENV).as_deref() != Some(std::ffi::OsStr::new(test)) {
+            let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+            command
+                .args(["--exact", test, "--nocapture"])
+                .env_clear()
+                .env(CHILD_ENV, test)
+                .env("PATH", "/usr/bin:/bin")
+                .stdin(std::process::Stdio::null());
+            let output = crate::process::run_with_timeout_process_group(
+                &mut command,
+                Duration::from_secs(30),
+            )
+            .unwrap()
+            .expect("isolated recheck test timed out");
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let _home = crate::session::test_support::isolate_app_dir_at(temp.path());
+        let memo = crate::tmux::AgentAvailabilityGuard::capture();
+        let bin = temp.path().join("bin");
+        std::fs::create_dir(&bin).unwrap();
+        for (name, script) in [
+            ("which", "#!/bin/sh\n[ \"$1\" = claude ]\n"),
+            ("login-shell", "#!/bin/sh\nexit 0\n"),
+        ] {
+            let path = bin.join(name);
+            std::fs::write(&path, script).unwrap();
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let _env = crate::session::test_support::EnvGuard::set(&[
+            ("PATH", bin.to_str().unwrap().to_string()),
+            (
+                "SHELL",
+                bin.join("login-shell").to_str().unwrap().to_string(),
+            ),
+        ]);
+
+        for deliver_result in [true, false] {
+            for agent in crate::agents::AGENTS {
+                memo.seed(agent.name, false);
+            }
+            assert!(
+                !AvailableTools::detect().any_available(),
+                "the ordinary probe uses cached negatives"
+            );
+            let mut app = App::new(
+                "test",
+                AvailableTools::with_tools(&[]),
+                true,
+                false,
+                crate::file_watch::FileWatchService::noop(),
+            )
+            .unwrap();
+            app.home.show_no_agents();
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            app.available_tools_rx = Some(rx);
+            let action = app
+                .home
+                .handle_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE), None)
+                .unwrap();
+            assert_eq!(action, Action::RecheckAgents);
+            app.spawn_tool_detection(true);
+            app.spawn_tool_detection(true);
+            assert!(
+                !app.poll_tool_detection(),
+                "Recheck must not wait for the active probe"
+            );
+
+            if deliver_result {
+                tx.send(AvailableTools::with_tools(&[])).unwrap();
+            } else {
+                drop(tx);
+            }
+            assert!(app.poll_tool_detection());
+            assert!(
+                app.available_tools_rx.is_some(),
+                "the forced recheck must run after the current probe finishes or closes"
+            );
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            while app.available_tools_rx.is_some() {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "forced detection did not finish"
+                );
+                app.poll_tool_detection();
+                tokio::task::yield_now().await;
+            }
+            assert_eq!(app.home.available_tools.available_list(), &["claude"]);
+            assert!(app.home.no_agents_dialog.is_none());
+            assert!(
+                !app.poll_tool_detection(),
+                "repeated requests coalesce into one forced probe"
+            );
+        }
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    #[serial_test::serial]
+    async fn startup_detection_shutdown_reaps_an_in_flight_probe() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::tempdir().unwrap();
+        let _home = crate::session::test_support::isolate_app_dir_at(temp.path());
+        let _memo = crate::tmux::AgentAvailabilityGuard::capture();
+        crate::tmux::invalidate_agent_availability();
+        let bin = temp.path().join("bin");
+        std::fs::create_dir(&bin).unwrap();
+        let gate = temp.path().join("gate");
+        nix::unistd::mkfifo(
+            &gate,
+            nix::sys::stat::Mode::S_IRUSR | nix::sys::stat::Mode::S_IWUSR,
+        )
+        .unwrap();
+        let pid_file = temp.path().join("probe-pid");
+        let probe = bin.join("vibe");
+        std::fs::write(
+            &probe,
+            format!(
+                "#!/bin/sh\necho $$ > {}\nread gate < {}\n",
+                shell_words::quote(pid_file.to_str().unwrap()),
+                shell_words::quote(gate.to_str().unwrap())
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(probe, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let _path = crate::session::test_support::EnvGuard::set(&[(
+            "PATH",
+            format!("{}:/usr/bin:/bin", bin.display()),
+        )]);
+        let mut app = App::new(
+            "test",
+            AvailableTools::with_tools(&["claude"]),
+            true,
+            false,
+            crate::file_watch::FileWatchService::noop(),
+        )
+        .unwrap();
+        app.spawn_tool_detection(false);
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let pid = loop {
+            if let Ok(value) = std::fs::read_to_string(&pid_file) {
+                if let Ok(pid) = value.trim().parse::<i32>() {
+                    break pid;
+                }
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "probe did not reach its gate"
+            );
+            std::thread::yield_now();
+        };
+        app.home.show_no_agents();
+        assert_eq!(
+            app.home
+                .handle_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE), None),
+            Some(Action::RecheckAgents)
+        );
+        let worker_id = app
+            .tool_detection
+            .as_ref()
+            .unwrap()
+            .thread
+            .as_ref()
+            .unwrap()
+            .thread()
+            .id();
+        app.spawn_tool_detection(true);
+        assert_eq!(
+            app.tool_detection
+                .as_ref()
+                .unwrap()
+                .thread
+                .as_ref()
+                .unwrap()
+                .thread()
+                .id(),
+            worker_id
+        );
+        app.tool_detection = None;
+        assert_eq!(
+            nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None),
+            Err(nix::errno::Errno::ESRCH)
+        );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn current_version_update_result_refreshes_the_open_changelog() {
+        let temp = tempfile::tempdir().unwrap();
+        let _guard = crate::session::test_support::isolate_app_dir_at(temp.path());
+        let mut app = App::new(
+            "test",
+            AvailableTools::with_tools(&["claude"]),
+            true,
+            false,
+            crate::file_watch::FileWatchService::noop(),
+        )
+        .unwrap();
+        app.home.show_changelog(Some("1.18.0".into()));
+        let cache = serde_json::json!({
+            "checked_at": chrono::Utc::now(),
+            "latest_version": "1.19.0",
+            "releases": [{"version": "1.19.0", "body": "### Performance\n- Faster startup", "published_at": null}]
+        });
+        std::fs::write(
+            crate::session::get_app_dir()
+                .unwrap()
+                .join("update_cache.json"),
+            cache.to_string(),
+        )
+        .unwrap();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        app.update_rx = Some(rx);
+        tx.send(Ok(UpdateInfo {
+            available: false,
+            current_version: "1.19.0".into(),
+            latest_version: "1.19.0".into(),
+        }))
+        .unwrap();
+        assert!(
+            app.poll_update_check(),
+            "new release notes require a redraw even without an update banner"
+        );
+        assert!(app.update_info.is_none());
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(100, 35)).unwrap();
+        terminal
+            .draw(|frame| {
+                app.home
+                    .changelog_dialog
+                    .as_mut()
+                    .unwrap()
+                    .render(frame, frame.area(), &app.theme);
+            })
+            .unwrap();
+        let text: String = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(text.contains("Faster startup"));
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn startup_waits_for_full_detection_before_declaring_no_agents() {
+        for (tools, suppress) in [
+            (&[][..], false),
+            (&["claude"][..], false),
+            (&[][..], true),
+            (&["claude"][..], true),
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let _guard = crate::session::test_support::isolate_app_dir_at(temp.path());
+            let mut app = App::new(
+                "test",
+                AvailableTools::with_tools(&[]),
+                suppress,
+                false,
+                crate::file_watch::FileWatchService::noop(),
+            )
+            .unwrap();
+            if suppress {
+                app.home.info_dialog = Some(crate::tui::dialogs::InfoDialog::new(
+                    "Configuration Warning",
+                    "fixture startup warning",
+                ));
+            }
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            app.available_tools_rx = Some(rx);
+            assert!(!app.poll_tool_detection());
+            assert!(app.home.no_agents_dialog.is_none());
+            assert!(app.home.intro_dialog.is_none());
+            assert!(!Config::load_or_warn().app_state.has_seen_welcome);
+
+            tx.send(AvailableTools::with_tools(tools)).unwrap();
+            assert!(app.poll_tool_detection());
+            if suppress {
+                assert!(
+                    app.home.no_agents_dialog.is_none(),
+                    "the startup warning keeps priority"
+                );
+                app.home.info_dialog = None;
+                assert_eq!(app.poll_tool_detection(), tools.is_empty());
+            }
+            assert_eq!(app.home.available_tools.available_list().len(), tools.len());
+            assert_eq!(app.home.no_agents_dialog.is_some(), tools.is_empty());
+            assert_eq!(
+                app.home.intro_dialog.is_some(),
+                !tools.is_empty() && !suppress
+            );
+            assert_eq!(
+                Config::load_or_warn().app_state.has_seen_welcome,
+                !tools.is_empty() && !suppress
+            );
+            assert!(
+                !app.poll_tool_detection(),
+                "completion is applied only once"
+            );
+        }
+    }
     use crate::telemetry::SendOutcome;
     use std::sync::atomic::{AtomicBool, Ordering};
 
