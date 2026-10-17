@@ -113,3 +113,26 @@ test("Escape still closes the global About dialog without leaving Settings", asy
   await expect(dialog).toBeHidden();
   await expect(page).toHaveURL(/\/settings\/plugins$/);
 });
+
+test("Escape closes the palette before the underlying uninstall confirmation", async ({ page }) => {
+  await page.getByTestId("plugin-uninstall-example.plugin").click();
+  const uninstall = page.getByRole("dialog", { name: "Uninstall Example", exact: true });
+  await expect(uninstall).toBeVisible();
+  await page.keyboard.press("ControlOrMeta+k");
+  const palette = page.getByRole("dialog", { name: "Command palette", exact: true });
+  await expect(palette).toBeVisible();
+
+  await page.keyboard.press("Escape");
+  await expect(palette).toBeHidden();
+  await expect(uninstall).toBeVisible();
+  await expect(page).toHaveURL(/\/settings\/plugins$/);
+  expect(await publishedRequests(page, "/api/plugins/example.plugin/uninstall", "POST")).toEqual([]);
+
+  await page.keyboard.press("Escape");
+  await expect(uninstall).toBeHidden();
+  await expect(page).toHaveURL(/\/settings\/plugins$/);
+  expect(await publishedRequests(page, "/api/plugins/example.plugin/uninstall", "POST")).toEqual([]);
+
+  await page.keyboard.press("Escape");
+  await expect(page).toHaveURL(/\/$/);
+});

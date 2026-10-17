@@ -11,9 +11,10 @@
         "web/src/App.tsx",
         "web/src/components/settings/PluginsSettings.tsx",
         "web/src/components/settings/PluginDetailModal.tsx",
-        "web/src/components/AboutModal.tsx"
+        "web/src/components/AboutModal.tsx",
+        "web/src/components/command-palette/CommandPalette.tsx"
       ],
-      "notes": "Real Escape keys dismiss uninstall, plugin details and its nested lightbox, and Web dashboard disable confirmation without leaving Settings or issuing a mutation; Escape without a dialog still closes Settings."
+      "notes": "Real Escape keys dismiss uninstall, plugin details and its nested lightbox, and Web dashboard disable confirmation without leaving Settings or issuing a mutation; Escape in the command palette preserves the underlying uninstall confirmation; Escape without a dialog still closes Settings."
     },
     {
       "id": "terminal.paired-shell",
