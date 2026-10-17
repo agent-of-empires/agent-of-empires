@@ -167,6 +167,46 @@ fn apply_first_launch_agent_name(
     }
 }
 
+/// Keep a host agent's app server in its own process so its hooks run under this pane's env.
+/// Withheld unless the launch's own executable and environment can be probed; the launch then
+/// runs that executable.
+fn apply_no_daemon_flag(
+    cmd: &mut String,
+    agent: Option<&crate::agents::AgentDef>,
+    inst: &Instance,
+    execution: Option<&super::execution::NativeExecution>,
+) {
+    let Some(agent) = agent else {
+        return;
+    };
+    let Some(command) = inst.host_agent_command(agent, execution) else {
+        return;
+    };
+    let Ok(mut words) = shell_words::split(cmd) else {
+        return;
+    };
+    if words.is_empty() {
+        return;
+    }
+    // Past `--` every word is a positional, so only the options before it count.
+    let options_end = words.iter().position(|w| w == "--").unwrap_or(words.len());
+    let options = &words[1..options_end];
+    let Some(flag) = agent.supported_no_daemon_flag(&command, options) else {
+        return;
+    };
+    if options.iter().any(|w| w == flag) {
+        return;
+    }
+    // The pane runs this through a login shell whose startup files may change PATH, so name the
+    // executable that was probed.
+    let Some(program) = command.get_program().to_str() else {
+        return;
+    };
+    words[0] = program.to_owned();
+    words.insert(options_end, flag.to_owned());
+    *cmd = shell_words::join(words);
+}
+
 /// Write the Pi session-id extension into the app dir and return its path.
 pub(super) fn session_identity_extension_path() -> Result<PathBuf> {
     const SOURCE: &str = crate::session::instance::SESSION_IDENTITY_EXTENSION;
@@ -1323,6 +1363,7 @@ impl Instance {
                         }
                     }
                     apply_first_launch_agent_name(&mut cmd, agent, self, execution, is_existing);
+                    apply_no_daemon_flag(&mut cmd, agent, self, execution);
                     apply_agent_launch_env(&mut cmd, agent);
                     let raw_command = format!(
                         "{}{}",
@@ -1416,6 +1457,7 @@ impl Instance {
                 }
             }
             apply_first_launch_agent_name(&mut cmd, agent, self, execution, is_existing);
+            apply_no_daemon_flag(&mut cmd, agent, self, execution);
             apply_agent_launch_env(&mut cmd, agent);
             let raw_command = format!(
                 "{}{}",
@@ -3063,6 +3105,235 @@ mod tests {
             "want: {expected}\ngot:  {command}"
         );
         assert!(probed.exists(), "the setting on probes the agent");
+    }
+
+    /// A shared Codex daemon runs hooks under its spawner's env, so every session's status would
+    /// land on one pane's id. The flag must follow the Codex the session launches, not AoE's own.
+    #[test]
+    #[serial_test::serial]
+    fn codex_runs_its_own_app_server_only_where_the_selected_install_has_the_flag() {
+        let temp_home = tempfile::tempdir().unwrap();
+        let _home = crate::session::test_support::isolate_home(temp_home.path());
+        let project = temp_home.path().join("proj");
+        std::fs::create_dir_all(&project).unwrap();
+        let stub = |help: &str| {
+            format!(
+                "#!/bin/sh\ncase \"$1\" in --help) printf '%s\\n' {};; esac\nexit 0\n",
+                shell_escape(help),
+            )
+        };
+        let install_at = |dir: &std::path::Path, help: &str| {
+            std::fs::create_dir_all(dir).unwrap();
+            let path = dir.join("codex");
+            std::fs::write(&path, stub(help)).unwrap();
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        };
+        let with_flag = "      --no-daemon  Run without the shared background server";
+        let without_flag = "      --model <MODEL>";
+        let ambient = temp_home.path().join("ambient");
+        let profile = temp_home.path().join("profile");
+        let _path = crate::session::test_support::EnvGuard::set(&[(
+            "PATH",
+            format!("{}:/usr/bin:/bin", ambient.display()),
+        )]);
+        let mut codex = tool_instance("codex", project.to_str().unwrap());
+        let select_profile_path = |codex: &Instance| {
+            let mut config = crate::session::config::profile_config::ProfileConfig::default();
+            config.overrides.insert(
+                "environment".to_string(),
+                serde_json::json!([format!("PATH={}:/usr/bin:/bin", profile.display())]),
+            );
+            crate::session::config::profile_config::save_profile_config(
+                &codex.effective_profile(),
+                &config,
+            )
+            .unwrap();
+        };
+
+        install_at(&ambient, with_flag);
+        crate::agents::forget_agent_help_for_test();
+        let command = host_command(&mut codex);
+        assert_eq!(command.matches("--no-daemon").count(), 1, "{command}");
+
+        codex.extra_args = "--no-daemon".into();
+        let command = host_command(&mut codex);
+        assert_eq!(command.matches("--no-daemon").count(), 1, "{command}");
+        codex.extra_args = String::new();
+
+        install_at(&profile, without_flag);
+        select_profile_path(&codex);
+        crate::agents::forget_agent_help_for_test();
+        let command = host_command(&mut codex);
+        assert!(
+            !command.contains("--no-daemon"),
+            "the profile selects an older install: {command}"
+        );
+
+        install_at(&ambient, without_flag);
+        install_at(&profile, with_flag);
+        crate::agents::forget_agent_help_for_test();
+        let command = host_command(&mut codex);
+        assert_eq!(
+            command.matches("--no-daemon").count(),
+            1,
+            "the profile selects a newer install: {command}"
+        );
+    }
+
+    /// After `--` the flag would be a second positional, not the option.
+    #[test]
+    #[serial_test::serial]
+    fn codex_no_daemon_flag_lands_before_an_argument_terminator() {
+        let temp_home = tempfile::tempdir().unwrap();
+        let _home = crate::session::test_support::isolate_home(temp_home.path());
+        let project = temp_home.path().join("proj");
+        std::fs::create_dir_all(&project).unwrap();
+        crate::agents::forget_agent_help_for_test();
+        let _codex = crate::session::test_support::install_login_shell_path_command(
+            temp_home.path(),
+            "codex",
+            "#!/bin/sh\ncase \"$1\" in --help) echo '      --no-daemon  Run without the daemon';; esac\nexit 0\n",
+        );
+        let launch_words = |command: &str| {
+            let exec = command.lines().find(|l| l.starts_with("exec ")).unwrap();
+            shell_words::split(exec).unwrap()
+        };
+        let mut codex = tool_instance("codex", project.to_str().unwrap());
+
+        codex.extra_args = "-- 'fix the build'".into();
+        let words = launch_words(&host_command(&mut codex));
+        let terminator = words.iter().position(|w| w == "--").unwrap();
+        let flag = words.iter().position(|w| w == "--no-daemon").unwrap();
+        assert!(flag < terminator, "{words:?}");
+        assert_eq!(&words[terminator..], ["--", "fix the build"], "{words:?}");
+
+        codex.extra_args = "-- --no-daemon".into();
+        let words = launch_words(&host_command(&mut codex));
+        let terminator = words.iter().position(|w| w == "--").unwrap();
+        assert_eq!(
+            words.iter().filter(|w| *w == "--no-daemon").count(),
+            2,
+            "a positional --no-daemon is not the option: {words:?}"
+        );
+        assert!(
+            words[..terminator].iter().any(|w| w == "--no-daemon"),
+            "{words:?}"
+        );
+    }
+
+    /// `--no-daemon` belongs to the TUI, `resume` and `fork`; other subcommands reject it.
+    #[test]
+    #[serial_test::serial]
+    fn codex_no_daemon_flag_is_withheld_from_subcommands_that_reject_it() {
+        let temp_home = tempfile::tempdir().unwrap();
+        let _home = crate::session::test_support::isolate_home(temp_home.path());
+        let project = temp_home.path().join("proj");
+        std::fs::create_dir_all(&project).unwrap();
+        crate::agents::forget_agent_help_for_test();
+        let _codex = crate::session::test_support::install_login_shell_path_command(
+            temp_home.path(),
+            "codex",
+            "#!/bin/sh\ncase \"$1\" in --help) echo '      --no-daemon  Run without the daemon';; esac\nexit 0\n",
+        );
+        let mut codex = tool_instance("codex", project.to_str().unwrap());
+
+        for (extra_args, injected) in [
+            ("", true),
+            ("-m o3", true),
+            ("resume --last", true),
+            ("fork --last", true),
+            ("resume 019a1b2c-0000-7000-8000-000000000000 review", true),
+            ("resume review", true),
+            ("fork --last exec", true),
+            ("resume --last --remote ws://localhost:9000", false),
+            ("-- 'review'", true),
+            ("-C agents", true),
+            ("--cd review", true),
+            ("-m o3 -C agents resume --last", true),
+            ("-C agents exec 'fix the build'", false),
+            ("--remote ws://localhost:9000", false),
+            ("--remote=ws://localhost:9000", false),
+            ("cloud-tasks list", false),
+            ("execpolicy check x", false),
+            ("tcp-tunnel", false),
+            ("exec 'fix the build'", false),
+            ("-m o3 exec 'fix the build'", false),
+            ("agents", false),
+            ("review", false),
+            ("mcp list", false),
+        ] {
+            codex.extra_args = extra_args.into();
+            let command = host_command(&mut codex);
+            assert_eq!(
+                command.contains("--no-daemon"),
+                injected,
+                "extra_args {extra_args:?}: {command}"
+            );
+        }
+    }
+
+    /// The pane runs the launch through a login shell, so the executable probed for the flag must
+    /// be the one that runs even when the shell's startup files put another install first.
+    #[test]
+    #[serial_test::serial]
+    fn codex_no_daemon_runs_the_probed_install_despite_a_login_shell_path() {
+        let temp_home = tempfile::tempdir().unwrap();
+        let _home = crate::session::test_support::isolate_home(temp_home.path());
+        let project = temp_home.path().join("proj");
+        std::fs::create_dir_all(&project).unwrap();
+        let ran = temp_home.path().join("ran");
+        let install = |dir: &str, help: &str| {
+            let dir = temp_home.path().join(dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            let path = dir.join("codex");
+            std::fs::write(
+                &path,
+                format!(
+                    "#!/bin/sh\ncase \"$1\" in --help) printf '%s\\n' {};; *) echo \"{}: $*\" > {};; esac\nexit 0\n",
+                    shell_escape(help),
+                    dir.display(),
+                    shell_escape(ran.to_str().unwrap()),
+                ),
+            )
+            .unwrap();
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+            dir
+        };
+        let probed = install("probed", "      --no-daemon  Run without the daemon");
+        let login = install("login", "      --model <MODEL>");
+        std::fs::write(
+            temp_home.path().join(".profile"),
+            format!(
+                "export PATH={}:$PATH\n",
+                shell_escape(login.to_str().unwrap())
+            ),
+        )
+        .unwrap();
+        let _env = crate::session::test_support::EnvGuard::set(&[
+            ("PATH", format!("{}:/usr/bin:/bin", probed.display())),
+            ("SHELL", "/bin/sh".to_string()),
+        ]);
+        crate::agents::forget_agent_help_for_test();
+        let mut codex = tool_instance("codex", project.to_str().unwrap());
+        let command = host_command(&mut codex);
+
+        let status = std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg(&command)
+            .env("HOME", temp_home.path())
+            .env("PATH", format!("{}:/usr/bin:/bin", probed.display()))
+            .stdin(std::process::Stdio::null())
+            .status()
+            .unwrap();
+        assert!(status.success(), "{command}");
+        let ran = std::fs::read_to_string(&ran).unwrap();
+        assert_eq!(
+            ran.trim(),
+            format!("{}: --no-daemon", probed.display()),
+            "{command}"
+        );
     }
 
     /// Each case starts from a launch that is named, then changes one thing that must keep the

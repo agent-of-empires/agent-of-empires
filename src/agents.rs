@@ -1066,6 +1066,40 @@ impl AgentDef {
         with_agent_help(command, false, |help| help_advertises_flag(help, flag)).then_some(flag)
     }
 
+    /// Flag keeping the agent's app server inside the launched process. A shared daemon runs
+    /// hooks under the env of the pane that spawned it, so every session's status lands on that
+    /// pane's `AOE_INSTANCE_ID`. `command` is the launch's own executable and environment: older
+    /// installs reject the flag. `options` are the arguments before any `--`; the flag is
+    /// withheld when they name a subcommand that does not define it.
+    pub(crate) fn supported_no_daemon_flag(
+        &self,
+        command: &std::process::Command,
+        options: &[String],
+    ) -> Option<&'static str> {
+        let flag = match self.name {
+            "codex" => "--no-daemon",
+            _ => return None,
+        };
+        // The first positional word selects the mode; later ones are its operands (a session id
+        // or prompt) and may spell a subcommand name.
+        let mut mode_known = false;
+        let mut words = options.iter();
+        while let Some(word) = words.next() {
+            // A remote TUI has no local app server, and Codex rejects the combination.
+            if word == "--remote" || word.starts_with("--remote=") {
+                return None;
+            } else if CODEX_VALUE_OPTIONS.contains(&word.as_str()) {
+                words.next();
+            } else if !word.starts_with('-') && !mode_known {
+                mode_known = true;
+                if CODEX_NON_TUI_SUBCOMMANDS.contains(&word.as_str()) {
+                    return None;
+                }
+            }
+        }
+        agent_help_advertises(command, flag).then_some(flag)
+    }
+
     pub fn launch_base_command(&self) -> String {
         match self.launch_subcommand {
             Some(sub) => format!("{} {}", self.binary, sub),
@@ -1150,6 +1184,68 @@ fn with_agent_help<R>(
         inspect,
     )
 }
+
+/// Codex subcommands, and their aliases, outside the interactive TUI. `--no-daemon` is defined on
+/// the TUI, `resume` and `fork` only; the others reject it.
+const CODEX_NON_TUI_SUBCOMMANDS: &[&str] = &[
+    "agents",
+    "exec",
+    "e",
+    "review",
+    "login",
+    "logout",
+    "mcp",
+    "mcp-server",
+    "plugin",
+    "app-server",
+    "remote-control",
+    "app",
+    "completion",
+    "update",
+    "doctor",
+    "sandbox",
+    "debug",
+    "apply",
+    "a",
+    "queue",
+    "archive",
+    "delete",
+    "migrate-rollouts",
+    "unarchive",
+    "cloud",
+    "cloud-tasks",
+    "execpolicy",
+    "responses-api-proxy",
+    "stdio-to-uds",
+    "tcp-tunnel",
+    "exec-server",
+    "features",
+    "help",
+];
+
+/// Codex options that take their value as the next word, which is not a subcommand.
+const CODEX_VALUE_OPTIONS: &[&str] = &[
+    "-c",
+    "--config",
+    "--enable",
+    "--disable",
+    "--remote",
+    "--remote-auth-token-env",
+    "-i",
+    "--image",
+    "-m",
+    "--model",
+    "--local-provider",
+    "-p",
+    "--profile",
+    "-s",
+    "--sandbox",
+    "-C",
+    "--cd",
+    "--add-dir",
+    "-a",
+    "--ask-for-approval",
+];
 
 /// A flag the older generation's help lists and the current one's does not.
 const LEGACY_GENERATION_MARKER: &str = "--fork";
