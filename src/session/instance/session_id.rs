@@ -739,6 +739,11 @@ impl Instance {
                 .fork_strategy
                 .resolve(generation)
                 .expect("the unknown generation bailed above");
+            anyhow::ensure!(
+                agent.can_fork_in(self.is_sandboxed()),
+                "{} mints the forked conversation id, and AoE can capture that id only in a sandbox",
+                agent.name
+            );
             if matches!(fork_strategy, crate::agents::ForkStrategy::ServeFork) {
                 if self.stored_fork_child().is_none() {
                     self.fork_session_in_store(execution, &from, expected)
@@ -1674,6 +1679,48 @@ work-opencode = "opencode"
             assert!(initial.matches(&sandboxed));
             assert_eq!(command, "opencode", "a refused fork must not alter argv");
         }
+    }
+
+    /// Prime mints the child id, so the fork carries only the parent, and only a
+    /// sandbox can capture what it mints.
+    #[test]
+    #[serial_test::serial]
+    fn prime_fork_launches_with_the_parent_only_and_only_in_a_sandbox() {
+        let home = tempfile::tempdir().unwrap();
+        let _app = crate::session::test_support::isolate_app_dir_at(home.path());
+        let project = home.path().join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        let agent = crate::agents::get_agent("prime-agent").expect("prime is a builtin agent");
+        let generation = crate::agents::AgentGeneration::Current;
+
+        let fork = |sandboxed: bool| {
+            let mut inst = tool_instance("prime-agent", project.to_str().unwrap());
+            if sandboxed {
+                inst.sandbox_info =
+                    Some(super::super::test_helpers::test_sandbox("prime-fork", None));
+            }
+            inst.resume_intent = ResumeIntent::Fork {
+                from: "parent-1111".to_string(),
+            };
+            inst.agent_session_id = Some("child-2222".to_string());
+            let mut command = "prime-agent".to_string();
+            let result = inst.apply_session_flags(
+                &mut command,
+                "prime fork",
+                Some(agent),
+                None,
+                &super::execution::AgentLaunchContext::resolved(generation),
+                &mut inst.conversation_state(),
+            );
+            (result, command)
+        };
+
+        let (result, command) = fork(false);
+        assert!(result.is_err());
+        assert_eq!(command, "prime-agent", "a refused fork must not alter argv");
+        let (result, command) = fork(true);
+        assert!(result.is_ok(), "{result:?}");
+        assert_eq!(command, "prime-agent --fork parent-1111");
     }
 
     /// An attested host launch forks whatever binary it resolved, even when the

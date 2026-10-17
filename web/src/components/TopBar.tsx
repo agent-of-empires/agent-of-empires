@@ -4,7 +4,7 @@ import { PaletteTriggerPill } from "./PaletteTriggerPill";
 import { OverflowMenu, type OverflowItem } from "./OverflowMenu";
 import { TOUR_ANCHORS, tourAnchor } from "../lib/tourSteps";
 import { PluginHeaderStartSegments, PluginStatusBarSegments } from "./plugin/PluginSlots";
-import { PluginPagesMenu } from "./plugin/PluginPagesMenu";
+import { PluginPageButtons } from "./plugin/PluginPageButtons";
 import { ActivityBar } from "./ActivityBar";
 import type { PaneDisplay } from "./Dock";
 import { useWebSettings } from "../hooks/useWebSettings";
@@ -182,11 +182,12 @@ export function TopBar({
         </div>
       </div>
 
-      {/* Center zone: palette trigger; carries the bottom border across the
+      {/* Center zone: palette trigger and plugin page buttons; carries the bottom border across the
           middle, between the two column-aligned zones. */}
       <div className="flex-1 flex items-center px-3 min-w-0 border-b border-surface-700/60">
-        <div className="flex-1 flex justify-center px-2">
+        <div className="flex-1 flex justify-center items-center gap-1 px-2">
           <PaletteTriggerPill onClick={onOpenPalette} />
+          <PluginPageButtons />
         </div>
       </div>
 
@@ -235,7 +236,6 @@ export function TopBar({
           </>
         )}
 
-        <PluginPagesMenu />
         <OverflowMenu items={overflowItems} triggerDataTour={TOUR_ANCHORS.topbarMore} />
       </div>
     </header>

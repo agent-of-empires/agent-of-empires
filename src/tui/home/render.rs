@@ -1713,12 +1713,22 @@ impl HomeView {
                     Some(total) if total > session_count => format!("{session_count}/{total}"),
                     _ => session_count.to_string(),
                 };
+                // Same path in several profiles: lead with the profile so truncation never hides it.
+                let profile_tag = profile
+                    .as_ref()
+                    .filter(|p| {
+                        self.group_trees
+                            .iter()
+                            .any(|(other, t)| other != *p && t.group_exists(path))
+                    })
+                    .map(|p| format!("[{p}] "))
+                    .unwrap_or_default();
                 let text = if let Some(glyph) = section_glyph {
                     Cow::Owned(format!("{} {} ({})", glyph, name, session_count))
                 } else if pinned {
                     Cow::Owned(format!("{} ({}) {}", name, session_count, ICON_PINNED))
                 } else {
-                    Cow::Owned(format!("{} ({})", name, session_count))
+                    Cow::Owned(format!("{}{} ({})", profile_tag, name, session_count))
                 };
                 let mut style = Style::default().fg(theme.group).bold();
                 // Shelf headers and their nested project sub-folders sit below the sort
