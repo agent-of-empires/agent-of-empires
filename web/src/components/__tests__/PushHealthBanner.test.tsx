@@ -64,4 +64,16 @@ describe("PushHealthBanner", () => {
     rerender(<PushHealthBanner />);
     expect(screen.queryByRole("alert")).not.toBeNull();
   });
+
+  it("shows a recurrence after the dismissed failure recovered", () => {
+    const { rerender } = render(<PushHealthBanner />);
+    fireEvent.click(screen.getByRole("button", { name: "Dismiss notifications notice" }));
+    expect(screen.queryByRole("alert")).toBeNull();
+
+    hook.health = "healthy";
+    rerender(<PushHealthBanner />);
+    hook.health = "revoked";
+    rerender(<PushHealthBanner />);
+    expect(screen.queryByRole("alert")).not.toBeNull();
+  });
 });

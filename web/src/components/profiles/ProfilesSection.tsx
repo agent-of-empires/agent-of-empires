@@ -61,7 +61,7 @@ export function ProfilesSection({ readOnly }: Props) {
       .then(([profile, global]) => {
         if (seq !== loadSeq.current) return;
         setProfileSettings(profile);
-        setGlobalHooks(global?.hooks as HooksOverride | undefined);
+        setGlobalHooks(global?.hooks);
         setError(null);
         if (!descriptionDirty.current) {
           setDescription(typeof profile?.description === "string" ? profile.description : "");
@@ -125,8 +125,11 @@ export function ProfilesSection({ readOnly }: Props) {
   const handleSaveDescription = async () => {
     setError(null);
     const trimmed = description.trim();
-    if (!(await updateProfileSettings(selected, { description: trimmed ? trimmed : null }))) {
-      return setError("Failed to save description");
+    const outcome = await updateProfileSettings(selected, { description: trimmed ? trimmed : null });
+    if (outcome !== "committed") {
+      return setError(
+        outcome === "uncertain" ? "Could not confirm the description was saved" : "Failed to save description",
+      );
     }
     descriptionDirty.current = false;
     await reload();

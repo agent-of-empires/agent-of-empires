@@ -272,6 +272,17 @@ pub(in crate::tui) enum LiveSendTarget {
     Tool(String),
 }
 
+impl LiveSendTarget {
+    /// The home view that previews this target's pane.
+    pub(in crate::tui) fn view_mode(&self) -> super::ViewMode {
+        match self {
+            Self::Agent => super::ViewMode::Structured,
+            Self::Terminal | Self::ContainerTerminal => super::ViewMode::Terminal,
+            Self::Tool(name) => super::ViewMode::Tool(name.clone()),
+        }
+    }
+}
+
 /// Format a `(title, target)` label so the compose dialog header and the live banner stay
 /// in lockstep: Agent keeps the bare title, terminal variants get a short parenthetical
 /// naming the pane the keystrokes land on.

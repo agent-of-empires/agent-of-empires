@@ -166,6 +166,7 @@ fn is_login_session_exempt(path: &str) -> bool {
     path == "/"
         || path == "/login"
         || path.starts_with("/session/")
+        || path.starts_with("/plugins/")
         || path == "/api/login"
         || path == "/api/login/status"
         || path == "/api/logout"
@@ -375,6 +376,60 @@ pub(crate) async fn handler_elevated(
     )
 }
 
+/// A plugin page frame load and the page tickets it carries.
+struct PageTicketClaim {
+    plugin_id: String,
+    page_id: String,
+    tickets: Vec<String>,
+}
+
+/// Set only for a GET of exactly `/api/plugins/{id}/pages/{page_id}`.
+fn page_ticket_claim(request: &Request) -> Option<PageTicketClaim> {
+    if request.method() != axum::http::Method::GET {
+        return None;
+    }
+    let rest = request.uri().path().strip_prefix("/api/plugins/")?;
+    let (plugin_id, rest) = rest.split_once('/')?;
+    let page_id = rest.strip_prefix("pages/")?;
+    if plugin_id.is_empty() || page_id.is_empty() || page_id.contains('/') {
+        return None;
+    }
+    Some(PageTicketClaim {
+        plugin_id: plugin_id.to_string(),
+        page_id: page_id.to_string(),
+        tickets: super::login::extract_page_tickets(request),
+    })
+}
+
+/// A bound session presents its binding. A frame load cannot, so on a plugin page route
+/// a ticket that session minted for that exact page stands in for it.
+async fn session_valid(
+    state: &AppState,
+    session_id: &str,
+    binding: Option<&[u8]>,
+    claim: Option<PageTicketClaim>,
+) -> bool {
+    if let Some(binding) = binding {
+        return state
+            .login_manager
+            .validate_session(session_id, binding)
+            .await;
+    }
+    let Some(claim) = claim else {
+        return false;
+    };
+    for ticket in &claim.tickets {
+        if state
+            .login_manager
+            .page_ticket_valid(ticket, session_id, &claim.plugin_id, &claim.page_id)
+            .await
+        {
+            return true;
+        }
+    }
+    false
+}
+
 /// Passphrase login wall used when the token gate is disabled (`--auth=passphrase`).
 async fn run_passphrase_wall(
     state: &AppState,
@@ -397,9 +452,12 @@ async fn run_passphrase_wall(
     let session_id = super::login::extract_login_session(&request);
     let presented_binding = extract_device_binding(&request);
 
-    let has_valid_session = match (&session_id, &presented_binding) {
-        (Some(id), Some(binding)) => state.login_manager.validate_session(id, binding).await,
-        _ => false,
+    let has_valid_session = match &session_id {
+        Some(id) => {
+            let claim = page_ticket_claim(&request);
+            session_valid(state, id, presented_binding.as_deref(), claim).await
+        }
+        None => false,
     };
 
     if !has_valid_session {
@@ -561,13 +619,12 @@ pub async fn auth_middleware(
     } else {
         None
     };
-    let session_valid = if login_enabled {
-        match (&presented_session_id, &presented_binding) {
-            (Some(id), Some(b)) => state.login_manager.validate_session(id, b).await,
-            _ => false,
+    let session_valid = match &presented_session_id {
+        Some(id) => {
+            let claim = page_ticket_claim(&request);
+            session_valid(&state, id, presented_binding.as_deref(), claim).await
         }
-    } else {
-        false
+        None => false,
     };
 
     if session_valid {
@@ -1087,6 +1144,7 @@ mod tests {
             "/login",
             "/session/abc",
             "/session/2626c6af68754732",
+            "/plugins/github/prs",
             "/api/login",
             "/api/login/status",
             "/api/logout",
@@ -1112,6 +1170,9 @@ mod tests {
         // and `/logins` is not `/login`.
         let gated = [
             "/api/sessions",
+            "/api/plugins",
+            "/api/plugins/github/pages/prs",
+            "/pluginsx",
             "/api/sessions/abc/acp/ws",
             "/api/settings",
             "/api/login/elevate",
@@ -1218,6 +1279,58 @@ mod tests {
         ];
         for (method, path) in ungated {
             assert!(!requires_elevation(&method, path), "{method} {path}");
+        }
+    }
+
+    /// Plugin page deep links are document navigations that cannot carry a device binding
+    /// header, so the shell must load on a bare session cookie while APIs stay gated.
+    #[tokio::test]
+    async fn plugin_page_shell_loads_remote_without_binding_header() {
+        use crate::server::login::LoginManager;
+        use tower::ServiceExt;
+
+        for token in [None, Some("secret-token")] {
+            let mut state = crate::server::test_support::build_test_app_state_with_policy(
+                Vec::new(),
+                vec!["localhost".to_string()],
+                Vec::new(),
+                token.map(str::to_string),
+            );
+            let login = Arc::new(LoginManager::new(Some("passphrase")));
+            let session_id = login
+                .create_session(&[0xAB; 32], "203.0.113.7", "test-agent")
+                .await;
+            Arc::get_mut(&mut state)
+                .expect("unique state")
+                .login_manager = login;
+            let cookie = match token {
+                Some(t) => format!("aoe_session={session_id}; aoe_token={t}"),
+                None => format!("aoe_session={session_id}"),
+            };
+
+            let get = |uri: &str| {
+                let mut req = Request::builder()
+                    .uri(uri)
+                    .header("host", "localhost")
+                    .header("cookie", &cookie)
+                    .body(axum::body::Body::empty())
+                    .unwrap();
+                req.extensions_mut().insert(ConnectInfo(
+                    "203.0.113.7:5555".parse::<SocketAddr>().unwrap(),
+                ));
+                let app = crate::server::test_support::build_router_for_test(state.clone());
+                async move { app.oneshot(req).await.unwrap().status() }
+            };
+
+            // 404 when the build embeds no dashboard; either way auth let it through.
+            let shell = get("/plugins/github/prs").await;
+            assert!(
+                matches!(shell, StatusCode::OK | StatusCode::NOT_FOUND),
+                "{token:?}: {shell}"
+            );
+            for api in ["/api/sessions", "/api/plugins/github/pages/prs"] {
+                assert_eq!(get(api).await, StatusCode::UNAUTHORIZED, "{token:?} {api}");
+            }
         }
     }
 }

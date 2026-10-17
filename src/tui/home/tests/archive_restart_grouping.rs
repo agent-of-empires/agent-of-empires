@@ -1045,7 +1045,7 @@ fn delete_selected_refused_during_restart() {
 
     env.view
         .delete_group_with_sessions(&GroupDeleteOptions {
-            delete_sessions: true,
+            action: crate::tui::dialogs::GroupDeleteAction::DeleteSessions,
             delete_worktrees: false,
             delete_branches: false,
             delete_containers: false,
@@ -1082,7 +1082,7 @@ fn delete_selected_refused_during_restart() {
 
     env.view
         .delete_group_with_sessions(&GroupDeleteOptions {
-            delete_sessions: true,
+            action: crate::tui::dialogs::GroupDeleteAction::DeleteSessions,
             delete_worktrees: false,
             delete_branches: false,
             delete_containers: false,

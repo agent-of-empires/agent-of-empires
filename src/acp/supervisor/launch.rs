@@ -936,7 +936,7 @@ fn resolve_mcp_layers(
             "forwarding MCP servers"
         );
     }
-    crate::acp::mcp_config::project_servers_to_acp(merged.into_iter().map(|s| s.def).collect())
+    crate::acp::mcp_config::project_servers_to_acp(merged, session_env)
 }
 
 /// Apply current model pins and effort defaults to a cached respawn config,

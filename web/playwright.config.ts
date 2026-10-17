@@ -1,5 +1,6 @@
 import { defineConfig } from "@playwright/test";
 
+const previewPort = Number(process.env.PLAYWRIGHT_PORT ?? "4173");
 export default defineConfig({
   testDir: "./tests",
   testIgnore: ["**/live/**", "**/capture/**"],
@@ -10,13 +11,13 @@ export default defineConfig({
   fullyParallel: true,
   workers: process.env.CI ? 6 : undefined,
   use: {
-    baseURL: "http://localhost:4173",
+    baseURL: `http://localhost:${previewPort}`,
     headless: true,
     screenshot: "only-on-failure",
   },
   webServer: {
-    command: "npx vite preview --port 4173",
-    port: 4173,
+    command: `npx vite preview --port ${previewPort}`,
+    port: previewPort,
     reuseExistingServer: !process.env.CI,
   },
   reporter: process.env.CI

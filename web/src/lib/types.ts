@@ -1,6 +1,7 @@
 import type { RateLimitInfo } from "./acpTypes";
 import type { RepoColor } from "./repoAppearance";
 import type { AgentLifecycleInfo } from "./agentProfiles";
+import type { SchemaSettings } from "./generated/settingsKeys";
 
 export interface SessionResponse {
   id: string;
@@ -309,11 +310,10 @@ export interface HooksOverride {
 }
 
 /** Serialized ProfileConfig; only the fields the dashboard reads are typed. */
-export interface ProfileSettingsResponse {
+export type ProfileSettingsResponse = SchemaSettings & {
   description?: string | null;
   hooks?: HooksOverride;
-  [key: string]: unknown;
-}
+};
 
 export interface DirEntry {
   name: string;

@@ -200,25 +200,35 @@ fn check_auth_gate(
     )
 }
 
+/// A daemon started without a passphrase must not inherit a dead predecessor's.
+async fn sync_passphrase_file(path: &std::path::Path, passphrase: Option<&str>) {
+    match passphrase {
+        Some(pp) => write_secret_file(path, pp).await,
+        None => {
+            let _ = tokio::fs::remove_file(path).await;
+        }
+    }
+}
+
 /// systemd `Type=notify` readiness. No-op unless `NOTIFY_SOCKET` is set.
 #[cfg(unix)]
-fn notify_ready(status: &str) {
-    use sd_notify::NotifyState;
-    if let Err(e) = sd_notify::notify(&[NotifyState::Ready, NotifyState::Status(status)]) {
+async fn notify_ready(addr: &str) {
+    let message = format!("READY=1\nSTATUS=listening on {addr}\n");
+    if let Err(e) = crate::process::systemd::notify::send(message).await {
         tracing::warn!(target: "serve.lifecycle", "sd_notify READY failed: {e}");
     }
 }
 
 #[cfg(not(unix))]
-fn notify_ready(_status: &str) {}
+async fn notify_ready(_status: &str) {}
 
 #[cfg(unix)]
-fn notify_stopping() {
-    let _ = sd_notify::notify(&[sd_notify::NotifyState::Stopping]);
+async fn notify_stopping() {
+    let _ = crate::process::systemd::notify::send(b"STOPPING=1\n").await;
 }
 
 #[cfg(not(unix))]
-fn notify_stopping() {}
+async fn notify_stopping() {}
 
 pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
     let ServerConfig {
@@ -322,10 +332,8 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
 
     // Persist the plaintext passphrase so the TUI can display it on reopen, including after
     // a TUI restart or when the daemon was started from the CLI.
-    if let Some(pp) = passphrase {
-        if let Ok(app_dir) = crate::session::get_app_dir() {
-            write_secret_file(&app_dir.join("serve.passphrase"), pp).await;
-        }
+    if let Ok(app_dir) = crate::session::get_app_dir() {
+        sync_passphrase_file(&app_dir.join("serve.passphrase"), passphrase).await;
     }
 
     // Push notifications.
@@ -967,7 +975,7 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
             let _ = tokio::signal::ctrl_c().await;
             tracing::info!(target: "serve.shutdown", "received ctrl-c, shutting down");
         }
-        notify_stopping();
+        notify_stopping().await;
         let plugin_host = shutdown_state.plugin_host.clone();
         run_shutdown_sequence(
             &shutdown_state.shutdown,
@@ -982,8 +990,8 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
         .await;
     };
 
-    notify_ready(&format!("listening on {addr}"));
-    // Replaces the readiness text, and runs after it so the reconcile task's first push cannot be overwritten.
+    notify_ready(&addr).await;
+    // Publish counts after readiness so its initial status cannot overwrite them.
     super::systemd_reconcile::push_status(&state).await;
 
     axum::serve(
@@ -1098,25 +1106,58 @@ async fn remote_rotation_loop(
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn passphraseless_start_retires_a_predecessors_passphrase() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("serve.passphrase");
+
+        sync_passphrase_file(&path, Some("hunter2")).await;
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "hunter2");
+
+        sync_passphrase_file(&path, None).await;
+        assert!(!path.exists());
+    }
+
     #[cfg(unix)]
-    #[test]
-    fn notify_ready_sends_ready_and_status_to_notify_socket() {
+    #[tokio::test(flavor = "current_thread")]
+    #[serial_test::parallel]
+    async fn notifications_send_ready_status_and_stopping_to_notify_socket() {
+        use std::os::unix::net::UnixDatagram;
+        let _exclusion = crate::session::test_support::EnvGuard::read_lock();
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("notify.sock");
-        let socket = std::os::unix::net::UnixDatagram::bind(&path).unwrap();
-        socket
-            .set_read_timeout(Some(Duration::from_secs(5)))
-            .unwrap();
-        std::env::set_var("NOTIFY_SOCKET", &path);
-
-        notify_ready("listening on 127.0.0.1:1");
-
-        let mut buf = [0u8; 256];
-        let n = socket.recv(&mut buf).unwrap();
-        assert_eq!(
-            std::str::from_utf8(&buf[..n]).unwrap(),
-            "READY=1\nSTATUS=listening on 127.0.0.1:1\n"
-        );
+        let destinations = vec![(
+            path.clone().into_os_string(),
+            UnixDatagram::bind(&path).unwrap(),
+        )];
+        #[cfg(target_os = "linux")]
+        let destinations = {
+            use std::os::linux::net::SocketAddrExt;
+            let mut destinations = destinations;
+            let name = format!("aoe-notify-{}", uuid::Uuid::new_v4());
+            let addr = std::os::unix::net::SocketAddr::from_abstract_name(name.as_bytes()).unwrap();
+            destinations.push((
+                std::ffi::OsString::from(format!("@{name}")),
+                UnixDatagram::bind_addr(&addr).unwrap(),
+            ));
+            destinations
+        };
+        for (destination, socket) in destinations {
+            socket
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let _env = crate::session::test_support::EnvGuard::set(&[(
+                "NOTIFY_SOCKET",
+                destination.as_os_str(),
+            )]);
+            notify_ready("127.0.0.1:1").await;
+            let mut buf = [0u8; 256];
+            let n = socket.recv(&mut buf).unwrap();
+            assert_eq!(&buf[..n], b"READY=1\nSTATUS=listening on 127.0.0.1:1\n");
+            notify_stopping().await;
+            let n = socket.recv(&mut buf).unwrap();
+            assert_eq!(&buf[..n], b"STOPPING=1\n");
+        }
     }
 
     /// The sweep fires at its interval, not the next recheck, and a window

@@ -278,4 +278,34 @@ describe("size owner", () => {
       vi.useRealTimers();
     }
   });
+  it("flags a dead pane on close 4001 without redialing, and clears it when a socket opens again", () => {
+    vi.useFakeTimers();
+    try {
+      const { result, ws } = mount();
+      ws.readyState = FakeWS.CLOSED;
+      act(() => ws.onclose?.(new CloseEvent("close", { code: 4001 })));
+      expect(result.current.state).toMatchObject({ paneDead: true, reconnecting: false });
+      act(() => vi.advanceTimersByTime(60_000));
+      expect(FakeWS.sockets).toHaveLength(1);
+
+      act(() => result.current.manualReconnect());
+      FakeWS.sockets[1]!.open();
+      expect(result.current.state.paneDead).toBe(false);
+    } finally {
+      vi.clearAllTimers();
+      vi.useRealTimers();
+    }
+  });
+
+  it("keeps retrying other closes without flagging a dead pane", () => {
+    vi.useFakeTimers();
+    try {
+      const { result, ws } = mount();
+      act(() => ws.onclose?.(new CloseEvent("close", { code: 1006 })));
+      expect(result.current.state).toMatchObject({ paneDead: false, reconnecting: true });
+    } finally {
+      vi.clearAllTimers();
+      vi.useRealTimers();
+    }
+  });
 });

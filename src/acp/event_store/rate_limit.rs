@@ -127,8 +127,9 @@ impl EventStore {
         })
     }
 
-    /// The prompt a rate limit interrupted: the latest `UserPromptSent`
-    /// whose next terminal event is `Stopped { reason: "rate_limited" }`.
+    /// The prompt a rate limit interrupted: the latest `UserPromptSent` or
+    /// diff-comments submission whose next terminal event is
+    /// `Stopped { reason: "rate_limited" }`.
     pub fn rate_limited_turn_prompt(
         &self,
         session_id: &str,
@@ -138,7 +139,7 @@ impl EventStore {
             conn.query_row(
                 "SELECT seq, event_json FROM acp_events
                  WHERE session_id = ?1
-                   AND json_extract(event_json, '$.UserPromptSent') IS NOT NULL
+                   AND discriminant IN ('UserPromptSent', 'UserDiffCommentsPrompt')
                  ORDER BY seq DESC
                  LIMIT 1",
                 params![session_id],
@@ -149,11 +150,15 @@ impl EventStore {
             session_id,
         )
         .flatten()?;
-        let Event::UserPromptSent {
-            text, attachments, ..
-        } = decode(&prompt_json)?
-        else {
-            return None;
+        let (text, attachments) = match decode(&prompt_json)? {
+            Event::UserPromptSent {
+                text, attachments, ..
+            } => (text, attachments),
+            // The agent received only the assembled markdown.
+            Event::UserDiffCommentsPrompt {
+                assembled_markdown, ..
+            } => (assembled_markdown, Vec::new()),
+            _ => return None,
         };
         let terminator: Option<String> = logged(
             conn.query_row(
@@ -178,6 +183,50 @@ impl EventStore {
             }
             _ => None,
         }
+    }
+
+    /// Whether the latest `Stopped { rate_limited }` ended a turn nobody
+    /// prompted: the agent worked since the previous terminal event, with no
+    /// user prompt to redeliver.
+    pub fn rate_limit_interrupted_agent_turn(&self, session_id: &str) -> bool {
+        let conn = self.conn();
+        let Some(stop_seq) = logged(
+            conn.query_row(
+                "SELECT MAX(seq) FROM acp_events
+                 WHERE session_id = ?1
+                   AND json_extract(event_json, '$.Stopped.reason') = 'rate_limited'",
+                params![session_id],
+                |row| row.get::<_, Option<i64>>(0),
+            )
+            .optional(),
+            "rate_limit_interrupted_agent_turn stop query",
+            session_id,
+        )
+        .flatten()
+        .flatten() else {
+            return false;
+        };
+        logged(
+            conn.query_row(
+                "SELECT IFNULL(SUM(discriminant IN ('UserPromptSent', 'UserDiffCommentsPrompt')), 0),
+                        IFNULL(SUM(discriminant IN ('AgentMessageChunk', 'ToolCallStarted')), 0)
+                 FROM acp_events
+                 WHERE session_id = ?1
+                   AND seq < ?2
+                   AND seq > (
+                       SELECT IFNULL(MAX(seq), 0) FROM acp_events
+                       WHERE session_id = ?1
+                         AND seq < ?2
+                         AND discriminant IN ('Stopped', 'AgentStartupError'))",
+                params![session_id, stop_seq],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+            )
+            .optional(),
+            "rate_limit_interrupted_agent_turn window query",
+            session_id,
+        )
+        .flatten()
+        .is_some_and(|(prompts, worked)| prompts == 0 && worked > 0)
     }
 
     /// Redeliveries in the current streak: automatic resumes that re-sent the
@@ -505,6 +554,19 @@ mod tests {
                 vec![with_attachment, stopped("rate_limited")],
                 Some(("look at this", vec![attachment])),
             ),
+            (
+                vec![
+                    Event::UserDiffCommentsPrompt {
+                        intro: String::new(),
+                        outro: String::new(),
+                        is_multi_repo: false,
+                        comments: Vec::new(),
+                        assembled_markdown: "review notes".into(),
+                    },
+                    stopped("rate_limited"),
+                ],
+                Some(("review notes", vec![])),
+            ),
             (vec![user_prompt("go"), stopped("prompt_complete")], None),
             // An agent-initiated turn hit the limit after a completed prompt.
             (
@@ -736,5 +798,83 @@ mod tests {
             .record("s-seed", 23, &user_prompt("run the nightly task"))
             .unwrap();
         assert_eq!(store.rate_limit_redelivery_streak("s-seed"), 2);
+    }
+
+    #[test]
+    fn interrupted_agent_turn_needs_agent_work_and_no_prompt() {
+        let chunk = || Event::AgentMessageChunk { text: "x".into() };
+        let diff_comments = || Event::UserDiffCommentsPrompt {
+            intro: String::new(),
+            outro: String::new(),
+            is_multi_repo: false,
+            comments: Vec::new(),
+            assembled_markdown: "review notes".into(),
+        };
+        let limit = || Event::RateLimit {
+            info: RateLimitInfo {
+                status: "limited".into(),
+                resets_at: None,
+                kind: "usage".into(),
+            },
+        };
+        let cases: Vec<(&str, Vec<Event>, bool)> = vec![
+            (
+                "agent turn",
+                vec![chunk(), limit(), stopped("rate_limited")],
+                true,
+            ),
+            (
+                "after a finished turn",
+                vec![
+                    user_prompt("old"),
+                    stopped("end_turn"),
+                    chunk(),
+                    limit(),
+                    stopped("rate_limited"),
+                ],
+                true,
+            ),
+            (
+                "prompted turn",
+                vec![
+                    user_prompt("work"),
+                    chunk(),
+                    limit(),
+                    stopped("rate_limited"),
+                ],
+                false,
+            ),
+            (
+                "no agent work, as a startup limit",
+                vec![limit(), stopped("rate_limited")],
+                false,
+            ),
+            (
+                "work belongs to the earlier turn",
+                vec![
+                    chunk(),
+                    stopped("agent_idle"),
+                    limit(),
+                    stopped("rate_limited"),
+                ],
+                false,
+            ),
+            ("never limited", vec![chunk(), stopped("agent_idle")], false),
+            (
+                "diff-comments turn",
+                vec![diff_comments(), chunk(), limit(), stopped("rate_limited")],
+                false,
+            ),
+        ];
+        for (i, (label, events, want)) in cases.into_iter().enumerate() {
+            let (_tmp, store) = open_store(1000);
+            let id = format!("s-{i}");
+            record_from(&store, &id, 1, events);
+            assert_eq!(
+                store.rate_limit_interrupted_agent_turn(&id),
+                want,
+                "{label}"
+            );
+        }
     }
 }

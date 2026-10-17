@@ -478,6 +478,7 @@ pub(crate) fn session_summary(i: &crate::session::Instance) -> Value {
         "archived": i.is_archived(),
         "snoozed": i.is_snoozed(),
         "trashed": i.is_trashed(),
+        "unread": i.is_unread() && crate::session::unread_enabled(),
         "workspace_repos": i
             .all_repos()
             .iter()
@@ -1041,6 +1042,21 @@ mod tests {
 
     #[test]
     #[serial_test::serial]
+    fn session_summary_reports_unread_only_while_the_indicator_is_enabled() {
+        let mut inst = crate::session::Instance::new("t", "/tmp/plugin-host-test");
+        let unread = |inst: &crate::session::Instance| session_summary(inst)["unread"].clone();
+
+        crate::session::set_unread_enabled(true);
+        assert_eq!(unread(&inst), json!(false));
+        inst.mark_unread();
+        assert_eq!(unread(&inst), json!(true));
+        crate::session::set_unread_enabled(false);
+        assert_eq!(unread(&inst), json!(false));
+        crate::session::set_unread_enabled(true);
+    }
+
+    #[test]
+    #[serial_test::serial]
     fn session_meta_is_namespaced_and_sessions_list_honors_dormancy() {
         use crate::session::{Instance, Storage};
 
@@ -1178,6 +1194,7 @@ mod tests {
         assert_eq!(entry(&all, &active_id)["trashed"], json!(false));
 
         let plain = entry(&all, &active_id);
+        assert_eq!(plain["unread"], json!(false));
         assert_eq!(plain["workspace_repos"], json!([]));
         assert!(plain.get("worktree").is_none());
         let multi = entry(&all, &multi_id);

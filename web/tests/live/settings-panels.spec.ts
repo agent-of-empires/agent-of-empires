@@ -112,6 +112,11 @@ test.describe("plugins", () => {
     return web!.enabled;
   }
   const webToggle = (page: Page) => page.getByLabel("Enable Web Dashboard");
+  // Unchecking aoe.web asks first (#4582); only Turn off sends the request.
+  const turnOffWeb = async (page: Page) => {
+    await webToggle(page).click();
+    await page.getByTestId("web-dashboard-off-confirm").click();
+  };
 
   test("disabling a builtin plugin persists to the backend and survives a reload", async ({ serve, page }) => {
     // #268, #2090
@@ -120,7 +125,7 @@ test.describe("plugins", () => {
     await expect(webToggle(page)).toBeVisible({ timeout: 10_000 });
     await expect(webToggle(page)).toBeChecked();
     // The checkbox only flips after the async round-trip, so click rather than uncheck.
-    await webToggle(page).click();
+    await turnOffWeb(page);
     await expect(async () => {
       expect(await webEnabled(serve)).toBe(false);
     }).toPass({ timeout: 5_000 });
@@ -141,7 +146,7 @@ test.describe("plugins", () => {
     });
     await expect(webToggle(page)).toBeVisible({ timeout: 10_000 });
     await expect(webToggle(page)).toBeChecked();
-    await webToggle(page).click();
+    await turnOffWeb(page);
     await expect(async () => {
       expect(await webEnabled(servePreauthed)).toBe(false);
     }).toPass({ timeout: 5_000 });

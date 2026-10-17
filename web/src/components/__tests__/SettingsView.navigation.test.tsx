@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi, beforeEach } from "vitest";
 import { cleanup, fireEvent, render, screen, within } from "@testing-library/react";
 import { SettingsView } from "../SettingsView";
 
@@ -24,8 +24,8 @@ vi.mock("../../lib/api", () => ({
   fetchProfiles: vi.fn(() => Promise.resolve([{ name: "main", is_default: true }])),
   fetchSettings: vi.fn(() => Promise.resolve({ sandbox: {}, updates: {} })),
   getSettingsSchema: vi.fn(() => Promise.resolve(SCHEMA)),
-  updateProfileSettings: vi.fn(() => Promise.resolve(true)),
-  updateSettings: vi.fn(() => Promise.resolve(true)),
+  updateProfileSettings: vi.fn(() => Promise.resolve("committed" as const)),
+  updateSettings: vi.fn(() => Promise.resolve("committed" as const)),
   setDefaultProfile: vi.fn(() => Promise.resolve(true)),
 }));
 
@@ -48,6 +48,10 @@ function renderView(tab: string | null) {
   );
   return { onSelectTab, onShowList };
 }
+
+import { resetSettingsStore } from "../../lib/settingsStore";
+
+beforeEach(resetSettingsStore);
 
 describe("SettingsView navigation", () => {
   it("without a tab lists grouped sections, remembering the pick for the next open", () => {

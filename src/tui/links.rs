@@ -10,8 +10,9 @@
 //! filled it, so a link once printed as `[docs](x)` makes every later standalone
 //! `docs` on screen resolve to `x`. `MIN_LINK_TEXT` and word alignment rule out
 //! the worst of it, but not a common word. Hovering shows the target first and
-//! only http/https ever opens, which keeps this misleading rather than
-//! dangerous; removing it needs per-cell positions `vt100` does not keep.
+//! only a [`crate::util::is_openable_link`] target ever opens, which keeps this
+//! misleading rather than dangerous; removing it needs per-cell positions
+//! `vt100` does not keep.
 //!
 //! The result never overlaps itself: the painter and the click hit-test must
 //! agree about which candidate owns a cell, or the terminal advertises one
@@ -36,6 +37,10 @@ const TRAILING_TRIM: &[char] = &['.', ',', ';', ':', '!', '?', '\'', '"', '>', '
 
 /// Find where `links` and any bare URLs sit on one rendered row.
 ///
+/// Only a link [`crate::util::is_openable_link`] accepts under `extra_prefixes`
+/// is placed, so the painter, the click hit-test and the OSC 8 re-emitted to the
+/// host terminal all see the same set.
+///
 /// Matching on text is what makes the OSC 8 half survive scrolling, a reseed
 /// from `capture-pane`, or the sequence having left the stream: none of those
 /// preserve cell positions. A link whose text wraps two rows matches on neither.
@@ -43,6 +48,7 @@ pub(crate) fn link_spans_for_line(
     line: &ratatui::text::Line,
     width: u16,
     links: &[crate::tmux::osc8::PaneLink],
+    extra_prefixes: &[String],
 ) -> Vec<LinkSpan> {
     if width == 0 {
         return Vec::new();
@@ -57,7 +63,9 @@ pub(crate) fn link_spans_for_line(
         .iter()
         .filter(|l| {
             let needle = matchable(l);
-            !needle.is_empty() && plain.contains(needle)
+            !needle.is_empty()
+                && plain.contains(needle)
+                && crate::util::is_openable_link(&l.uri, extra_prefixes)
         })
         .collect();
     if usable.is_empty() && !holds_scheme(&plain) {
@@ -262,7 +270,17 @@ mod tests {
     }
 
     fn spans(row: &str, width: u16, links: &[crate::tmux::osc8::PaneLink]) -> Vec<LinkSpan> {
-        link_spans_for_line(&Line::from(row.to_string()), width, links)
+        link_spans_for_line(&Line::from(row.to_string()), width, links, &[])
+    }
+
+    #[test]
+    fn a_non_web_target_is_placed_only_under_an_allowed_prefix() {
+        let line = Line::from("see notes/a.md here");
+        let links = [link("notes/a.md", "vscode://file/Users/u/notes/a.md")];
+        assert!(link_spans_for_line(&line, 40, &links, &[]).is_empty());
+        let found = link_spans_for_line(&line, 40, &links, &["vscode://file/".to_string()]);
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].uri, "vscode://file/Users/u/notes/a.md");
     }
 
     #[test]
@@ -303,7 +321,7 @@ mod tests {
             Span::styled("the AoE", Style::default().fg(Color::Green)),
             Span::raw(" repo"),
         ]);
-        let found = link_spans_for_line(&line, 40, &[link("the AoE repo", "https://a.co")]);
+        let found = link_spans_for_line(&line, 40, &[link("the AoE repo", "https://a.co")], &[]);
         assert_eq!(
             found,
             vec![LinkSpan {

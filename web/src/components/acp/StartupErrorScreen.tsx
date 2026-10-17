@@ -32,7 +32,7 @@ export function StartupErrorScreen({ detail, sessionId, isSandboxed = false }: P
     let alive = true;
     fetchSettings().then((s) => {
       if (alive) {
-        setAllowInstall(Boolean((s as { acp?: { allow_agent_install?: boolean } } | null)?.acp?.allow_agent_install));
+        setAllowInstall(s?.acp?.allow_agent_install === true);
       }
     });
     return () => {
@@ -98,13 +98,30 @@ export function StartupErrorScreen({ detail, sessionId, isSandboxed = false }: P
             <div className="text-[11px] font-medium uppercase tracking-wide text-text-dim">
               This session runs in a sandbox
             </div>
-            <p className="mt-1 text-sm text-text-secondary">
-              The adapter lives inside the container, so a host{" "}
-              <code className="rounded bg-surface-950 px-1 font-mono text-[12px]">npm install</code> would not reach it.
-              Use <span className="font-medium text-text-secondary">Update &amp; restart</span> below to install the
-              adapter <span className="font-medium text-text-secondary">inside the container</span> and reload the
-              session.
-            </p>
+            {autoInstallable ? (
+              <p className="mt-1 text-sm text-text-secondary">
+                The adapter lives inside the container, so a host{" "}
+                <code className="rounded bg-surface-950 px-1 font-mono text-[12px]">npm install</code> would not reach
+                it. Use <span className="font-medium text-text-secondary">Update &amp; restart</span> below to install
+                the adapter <span className="font-medium text-text-secondary">inside the container</span> and reload the
+                session.
+              </p>
+            ) : (
+              <>
+                <p className="mt-1 text-sm text-text-secondary">
+                  The adapter lives inside the container, so installing it on the host would not reach it.
+                </p>
+                <div className="mt-3 text-[11px] font-medium uppercase tracking-wide text-text-dim">
+                  Run this inside the container, then press Restart agent
+                </div>
+                <pre
+                  data-testid="startup-error-sandbox-install-command"
+                  className="mt-1 overflow-x-auto rounded-md border border-surface-700 bg-surface-950 p-2 font-mono text-[12px] text-text-primary"
+                >
+                  {installCommand}
+                </pre>
+              </>
+            )}
             <p className="mt-2 text-xs text-text-dim">
               This updates the running container only. To keep new sessions from hitting this, refresh the sandbox
               image: the aoe TUI shows a "sandbox image update available" banner that pulls the right image with your

@@ -304,3 +304,111 @@ async fn auth_events(mode: ConnectMode, reports: bool) -> Vec<bool> {
     let _ = tokio::join!(agent, connection);
     seen
 }
+
+/// A limit that ends an agent-initiated turn must end the connection, or the
+/// drain loop never drops the worker and the reaper skips it as still running
+/// (#4373).
+#[tokio::test]
+async fn rate_limit_on_an_agent_initiated_turn_ends_the_connection() {
+    let (daemon_write, agent_read) = tokio::io::duplex(64 * 1024);
+    let (agent_write, daemon_read) = tokio::io::duplex(64 * 1024);
+    let agent_write: SharedWrite = Arc::new(Mutex::new(agent_write));
+    let (event_tx, mut event_rx) = mpsc::channel(64);
+    let (_cmd_tx, cmd_rx) = mpsc::channel::<ClientCmd>(1);
+    let (ready_tx, _ready_rx) = oneshot::channel();
+    let temp = tempfile::tempdir().unwrap();
+    let cwd = temp.path().to_path_buf();
+    let params = ConnectionParams {
+        event_tx,
+        cmd_rx,
+        child: None,
+        pending_responders: Arc::new(Mutex::new(HashMap::new())),
+        resources: SessionResources {
+            fs_policy: Arc::new(FsPolicy::new(vec![cwd.clone()])),
+            terminals: TerminalManager::new(),
+            cwd,
+            label: "s-limit".to_string(),
+            sandbox: None,
+        },
+        mode: ConnectMode::Fresh {
+            stored_acp_session_id: None,
+            seed_history_replay: false,
+            fork_from: None,
+        },
+        ready_tx,
+        profile: &crate::acp::agent_profiles::GEMINI,
+        expected_agent: ExpectedAgent::Gemini,
+        source_profile: None,
+        default_effort: None,
+        default_mode: None,
+        default_model: None,
+        mcp_servers: Vec::new(),
+        runner: None,
+    };
+    let transport = ByteStreams::new(daemon_write.compat_write(), daemon_read.compat());
+    let connection = tokio::spawn(run_connection_task(transport, params));
+    let handshake_write = agent_write.clone();
+    let agent = tokio::spawn(async move {
+        let mut lines = BufReader::new(agent_read).lines();
+        while let Ok(Some(line)) = lines.next_line().await {
+            let msg: serde_json::Value = serde_json::from_str(&line).unwrap();
+            let id = &msg["id"];
+            let reply = match msg["method"].as_str() {
+                Some("initialize") => format!(
+                    r#"{{"jsonrpc":"2.0","id":{id},"result":{{"protocolVersion":1,"agentCapabilities":{{}}}}}}"#
+                ),
+                Some("session/new") => {
+                    format!(r#"{{"jsonrpc":"2.0","id":{id},"result":{{"sessionId":"s-limit"}}}}"#)
+                }
+                _ => continue,
+            };
+            write_line(&handshake_write, &reply).await;
+        }
+    });
+
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while !matches!(
+            event_rx.recv().await.expect("connection remains open"),
+            Event::AcpSessionAssigned { .. }
+        ) {}
+    })
+    .await
+    .expect("session commits");
+
+    // Accounting for a turn nobody prompted, carrying a rejected window.
+    let resets_at = chrono::Utc::now().timestamp() + 3600;
+    write_line(
+        &agent_write,
+        &format!(
+            r#"{{"jsonrpc":"2.0","method":"session/update","params":{{"sessionId":"s-limit","update":{{"sessionUpdate":"usage_update","used":10,"size":100,"cost":{{"amount":0.1,"currency":"USD"}},"_meta":{{"_claude/rateLimit":{{"status":"rejected","rateLimitType":"five_hour","resetsAt":{resets_at}}}}}}}}}}}"#
+        ),
+    )
+    .await;
+
+    // The idle grace is wall-clock, so the deadline covers it with margin.
+    let mut seen = Vec::new();
+    tokio::time::timeout(Duration::from_secs(30), async {
+        while let Some(event) = event_rx.recv().await {
+            seen.push(event);
+        }
+    })
+    .await
+    .expect("the connection must end after parking, closing the event channel");
+    tokio::time::timeout(Duration::from_secs(10), connection)
+        .await
+        .expect("connection task ends")
+        .expect("connection task does not panic");
+
+    let limit = seen.iter().position(|e| {
+        matches!(e, Event::RateLimit { info } if info.resets_at.map(|t| t.timestamp()) == Some(resets_at))
+    });
+    let stopped = seen
+        .iter()
+        .position(|e| matches!(e, Event::Stopped { reason } if reason == "rate_limited"));
+    assert!(
+        limit.is_some() && limit < stopped,
+        "RateLimit then Stopped(rate_limited) expected: {seen:?}"
+    );
+    agent.abort();
+    let _ = agent.await;
+}

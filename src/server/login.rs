@@ -37,6 +37,10 @@ const BINDING_SECRET_BYTES: usize = 32;
 /// Filename for the persisted login-session store under the app dir.
 const SESSIONS_FILE: &str = "login_sessions.toml";
 
+/// How long a plugin page ticket lets its frame load. Reusable until then so a reload or a
+/// second tab within the window still loads.
+const PAGE_TICKET_LIFETIME: Duration = Duration::from_secs(60);
+
 /// Schema version stamped into the persisted store.
 const SESSIONS_SCHEMA_VERSION: u32 = 1;
 
@@ -65,6 +69,15 @@ struct LoginSession {
     last_persisted_expires_at: Instant,
 }
 
+/// A frame load cannot send the device-binding header, so a bound request mints this to
+/// stand in for it on one plugin page route.
+struct PageTicket {
+    session_id: String,
+    plugin_id: String,
+    page_id: String,
+    expires_at: Instant,
+}
+
 /// Threshold for the per-session elevation rate limiter.
 const MAX_ELEVATION_FAILURES: u32 = 3;
 const ELEVATION_LOCKOUT: Duration = Duration::from_secs(15 * 60);
@@ -73,6 +86,8 @@ const ELEVATION_LOCKOUT: Duration = Duration::from_secs(15 * 60);
 pub struct LoginManager {
     passphrase_hash: Option<String>,
     sessions: RwLock<HashMap<String, LoginSession>>,
+    /// Keyed by the SHA-256 of the ticket value; never persisted.
+    page_tickets: RwLock<HashMap<[u8; 32], PageTicket>>,
     /// Path to the on-disk session store, when persistence is enabled and an app dir is
     /// available.
     sessions_path: Option<PathBuf>,
@@ -103,6 +118,7 @@ impl LoginManager {
         Self {
             passphrase_hash: passphrase.map(hash_passphrase),
             sessions: RwLock::new(HashMap::new()),
+            page_tickets: RwLock::new(HashMap::new()),
             sessions_path: None,
         }
     }
@@ -134,6 +150,7 @@ impl LoginManager {
         Self {
             passphrase_hash,
             sessions: RwLock::new(sessions),
+            page_tickets: RwLock::new(HashMap::new()),
             sessions_path: Some(sessions_path),
         }
     }
@@ -241,6 +258,52 @@ impl LoginManager {
             }
         }
         valid
+    }
+
+    /// Mint a ticket that lets `session_id` load one plugin page frame without the binding.
+    pub async fn mint_page_ticket(
+        &self,
+        session_id: &str,
+        plugin_id: &str,
+        page_id: &str,
+    ) -> String {
+        let ticket = super::generate_token();
+        self.page_tickets.write().await.insert(
+            Sha256::digest(ticket.as_bytes()).into(),
+            PageTicket {
+                session_id: session_id.to_string(),
+                plugin_id: plugin_id.to_string(),
+                page_id: page_id.to_string(),
+                expires_at: Instant::now() + PAGE_TICKET_LIFETIME,
+            },
+        );
+        ticket
+    }
+
+    /// Whether `ticket` was minted by the still-live `session_id` for this exact page.
+    /// Does not slide the session window.
+    pub async fn page_ticket_valid(
+        &self,
+        ticket: &str,
+        session_id: &str,
+        plugin_id: &str,
+        page_id: &str,
+    ) -> bool {
+        let key: [u8; 32] = Sha256::digest(ticket.as_bytes()).into();
+        let now = Instant::now();
+        let matches = self.page_tickets.read().await.get(&key).is_some_and(|t| {
+            now < t.expires_at
+                && t.session_id == session_id
+                && t.plugin_id == plugin_id
+                && t.page_id == page_id
+        });
+        matches
+            && self
+                .sessions
+                .read()
+                .await
+                .get(session_id)
+                .is_some_and(|s| now < s.expires_at)
     }
 
     /// Mark a session as elevated (passphrase confirmed) for `ELEVATION_LIFETIME`.
@@ -418,6 +481,10 @@ impl LoginManager {
             sessions.retain(|_, s| now < s.expires_at);
             after = sessions.len();
         }
+        self.page_tickets
+            .write()
+            .await
+            .retain(|_, t| Instant::now() < t.expires_at);
         if after != before {
             self.persist().await;
         }
@@ -1236,6 +1303,32 @@ pub fn build_login_cookie(session_id: &str, secure: bool) -> String {
         cookie.push_str("; Secure");
     }
     cookie
+}
+
+/// Build the Set-Cookie header carrying a plugin page ticket, scoped to that page's URL.
+pub fn build_page_ticket_cookie(ticket: &str, page_path: &str, secure: bool) -> String {
+    let mut cookie = format!(
+        "aoe_page_ticket={ticket}; HttpOnly; SameSite=Strict; Path={page_path}; Max-Age={}",
+        PAGE_TICKET_LIFETIME.as_secs()
+    );
+    if secure {
+        cookie.push_str("; Secure");
+    }
+    cookie
+}
+
+/// Every `aoe_page_ticket` cookie value on the request; an older ticket can share the name.
+pub fn extract_page_tickets(request: &axum::extract::Request) -> Vec<String> {
+    request
+        .headers()
+        .get_all(header::COOKIE)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .flat_map(|s| s.split(';'))
+        .filter_map(|c| c.trim().strip_prefix("aoe_page_ticket="))
+        .filter(|v| !v.is_empty())
+        .map(str::to_string)
+        .collect()
 }
 
 #[cfg(test)]

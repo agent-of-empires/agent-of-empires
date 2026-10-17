@@ -348,3 +348,117 @@ fn capture_frames_carry_their_own_targets_through_the_parse() {
         Some("https://example.com/aoe".to_string())
     );
 }
+
+#[test]
+#[serial]
+fn a_non_web_target_stays_inert_until_a_prefix_allows_it() {
+    // Extraction, the config reload, painting, the click hit-test and the hand-off
+    // to the host terminal all follow `session.preview_link_prefixes`.
+    use crate::session::config::update_config;
+    use ratatui::style::Modifier;
+    const VSCODE: &str = "vscode://file/Users/u/notes/a.md:12";
+    let mut env = create_test_env_empty();
+    let frame = format!(
+        "see \x1b]8;;{VSCODE}\x1b\\notes/a.md\x1b]8;;\x1b\\ now\n\
+         and \x1b]8;;javascript:alert(1)\x1b\\click me\x1b]8;;\x1b\\ too\n"
+    );
+    for (prefixes, live) in [
+        (vec![], false),
+        (vec!["vscode://file/".to_string()], true),
+        (vec![], false),
+    ] {
+        update_config(|c| c.session.preview_link_prefixes = prefixes.clone()).unwrap();
+        env.view.try_refresh_from_config_watcher().unwrap();
+        env.view.preview_cache = crate::tui::home::PreviewCache::default();
+        env.view.preview_cache.store_capture(
+            frame.clone(),
+            "s1".to_string(),
+            "aoe_s1".to_string(),
+            1,
+            (40, 4),
+            None,
+        );
+        env.view.preview_cache.ensure_parsed();
+        let total_lines = env
+            .view
+            .preview_cache
+            .parsed_text
+            .as_ref()
+            .unwrap()
+            .lines
+            .len();
+        env.view.preview_area = PANE;
+        env.view.preview_text_view = PreviewTextView {
+            pane: PANE,
+            first_line: 0,
+            total_lines,
+        };
+        env.view.hyperlink_cells.lock().unwrap().clear();
+        let mut buf = ratatui::buffer::Buffer::empty(Rect::new(0, 0, 60, 10));
+        env.view.paint_preview_links(&mut buf);
+        let underlined =
+            |row: u16| (0..60).any(|col| buf[(col, row)].modifier.contains(Modifier::UNDERLINED));
+
+        assert_eq!(underlined(PANE.y), live, "{prefixes:?}: underline");
+        assert_eq!(
+            env.view.preview_link_at(PANE.x + 4, PANE.y).as_deref(),
+            live.then_some(VSCODE),
+            "{prefixes:?}: click target"
+        );
+        assert_eq!(
+            !env.view.hyperlink_cells.lock().unwrap().is_empty(),
+            live,
+            "{prefixes:?}: passed to the host terminal"
+        );
+        assert!(
+            !underlined(PANE.y + 1),
+            "{prefixes:?}: javascript underline"
+        );
+        assert_eq!(env.view.preview_link_at(PANE.x + 4, PANE.y + 1), None);
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn each_pending_opener_is_kept_until_its_own_exit_arrives() {
+    use std::os::unix::process::ExitStatusExt;
+    let mut env = create_test_env_empty();
+    let (first_tx, first_rx) = std::sync::mpsc::channel();
+    let (second_tx, second_rx) = std::sync::mpsc::channel();
+    env.view
+        .opener_exits
+        .push(("vscode://file/a".to_string(), first_rx));
+    env.view
+        .opener_exits
+        .push(("vscode://file/b".to_string(), second_rx));
+    assert!(!env.view.tick_opener(), "nothing yet");
+    assert_eq!(env.view.opener_exits.len(), 2);
+    second_tx
+        .send(std::process::ExitStatus::from_raw(0))
+        .unwrap();
+    assert!(!env.view.tick_opener(), "a success leaves the opened flash");
+    assert_eq!(env.view.opener_exits.len(), 1);
+    assert_eq!(env.view.opener_exits[0].0, "vscode://file/a");
+    drop(first_tx);
+    assert!(!env.view.tick_opener());
+    assert!(env.view.opener_exits.is_empty());
+}
+
+#[test]
+#[serial]
+fn the_link_policy_reloads_on_its_own() {
+    // `refresh_link_policy` is what the main loop runs during live-send, when the
+    // full config reload waits.
+    use crate::session::config::update_config;
+    let mut env = create_test_env_empty();
+    update_config(|c| c.session.preview_link_prefixes = vec!["vscode://file/".to_string()])
+        .unwrap();
+    assert!(env.view.refresh_link_policy());
+    assert_eq!(env.view.preview_link_prefixes, ["vscode://file/"]);
+    assert!(crate::session::preview_link_openable("vscode://file/x"));
+    assert!(!env.view.refresh_link_policy(), "unchanged");
+    update_config(|c| c.session.preview_link_prefixes = Vec::new()).unwrap();
+    assert!(env.view.refresh_link_policy());
+    assert!(env.view.preview_link_prefixes.is_empty());
+    assert!(!crate::session::preview_link_openable("vscode://file/x"));
+}

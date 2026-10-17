@@ -3,7 +3,8 @@ import type { SessionResponse, Workspace } from "../lib/types";
 import { PaletteTriggerPill } from "./PaletteTriggerPill";
 import { OverflowMenu, type OverflowItem } from "./OverflowMenu";
 import { TOUR_ANCHORS, tourAnchor } from "../lib/tourSteps";
-import { PluginStatusBarSegments } from "./plugin/PluginSlots";
+import { PluginHeaderStartSegments, PluginStatusBarSegments } from "./plugin/PluginSlots";
+import { PluginPageButtons } from "./plugin/PluginPageButtons";
 import { ActivityBar } from "./ActivityBar";
 import type { PaneDisplay } from "./Dock";
 import { useWebSettings } from "../hooks/useWebSettings";
@@ -162,7 +163,7 @@ export function TopBar({
 
         <button
           onClick={onGoDashboard}
-          className="flex items-center gap-1.5 min-w-0 text-text-muted hover:text-text-secondary transition-colors cursor-pointer"
+          className="flex items-center gap-1.5 shrink-0 text-text-muted hover:text-text-secondary transition-colors cursor-pointer"
           aria-label="Go to dashboard"
         >
           <img src="/icon-192.png" alt="" width="18" height="18" className="rounded-sm shrink-0" />
@@ -170,13 +171,23 @@ export function TopBar({
              toggle and the logo: it would sit flush against the divider and read as clipped. */}
           <span className={`font-mono text-xs leading-none truncate ${hideWordmark ? "md:hidden" : ""}`}>aoe</span>
         </button>
+        {/* The left zone is content-sized unless the sidebar column is showing, so the chips are capped and hidden
+           below md instead of pushing the core controls off-screen. Also hidden with the wordmark: the compact rail
+           leaves no room beside the logo. */}
+        <div
+          data-testid="topbar-header-start"
+          className={`hidden ${hideWordmark ? "md:hidden" : "md:flex"} items-center gap-1.5 min-w-0 max-w-48 overflow-hidden`}
+        >
+          <PluginHeaderStartSegments />
+        </div>
       </div>
 
-      {/* Center zone: palette trigger; carries the bottom border across the
+      {/* Center zone: palette trigger and plugin page buttons; carries the bottom border across the
           middle, between the two column-aligned zones. */}
       <div className="flex-1 flex items-center px-3 min-w-0 border-b border-surface-700/60">
-        <div className="flex-1 flex justify-center px-2">
+        <div className="flex-1 flex justify-center items-center gap-1 px-2">
           <PaletteTriggerPill onClick={onOpenPalette} />
+          <PluginPageButtons />
         </div>
       </div>
 

@@ -8,11 +8,17 @@ To build one, see [Writing Plugins](development/writing-plugins.md) and the [Plu
 
 Three equivalent surfaces:
 
-- **CLI**: `aoe plugin list | info <id> | enable <id> | disable <id> | install <source> | update <id> | uninstall <id>`.
+- **CLI**: `aoe plugin list | info <id> | logs <id> | enable <id> | disable <id> | install <source> | update <id> | uninstall <id>`.
 - **TUI**: "Manage plugins" in the command palette, or the Plugins settings tab. Space toggles enable and disable.
 - **Web**: the Plugins settings tab. Enabling or disabling needs an elevated (passphrase) session when login is enabled and is blocked in read-only mode; localhost browsers skip the passphrase, matching the CLI's same-host trust.
 
 A plugin's enable-state lives under `[plugins."<id>"]` in `config.toml`.
+
+## Worker logs
+
+A plugin worker's stderr goes to `<app_dir>/plugin-workers/<plugin-id>_<worker-uuid>.log`, one file per worker start. `aoe plugin logs <id>` prints the path of the most recent one, which is the live worker's while it runs, so `tail -f "$(aoe plugin logs <id>)"` follows it. Workers only run under `aoe serve`, so a plugin that never ran has no log.
+
+The host keeps the five newest logs per plugin and removes older ones when a worker starts; a running worker's log is never removed. Logs from before names carried the plugin id are removed once a week old.
 
 ## Bundled plugins
 

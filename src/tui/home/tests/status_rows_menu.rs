@@ -2063,3 +2063,22 @@ fn confirm_delete_dialog_cancel_leaves_session() {
         "cancelling must clear the pending trash target"
     );
 }
+
+#[test]
+#[serial]
+fn serve_status_renders_from_the_probe_worker() {
+    let what = if cfg!(feature = "web") { "Web" } else { "API" };
+    let mut env = create_test_env_with_sessions(1);
+    let idle = render_home_to_string(&mut env.view, 160, 40);
+    assert!(idle.contains(&format!("R {what}")), "{idle}");
+
+    env.view.serve_probe = crate::tui::worker::Worker::seeded_for_test("serve-probe-test", true);
+    env.view.request_serve_probe();
+    assert!(
+        env.view.apply_serve_probe(),
+        "a running daemon requests a redraw"
+    );
+    assert!(!env.view.serve_probe_in_flight);
+    let screen = render_home_to_string(&mut env.view, 160, 40);
+    assert!(screen.contains(&format!("R \u{25CF} {what}")), "{screen}");
+}

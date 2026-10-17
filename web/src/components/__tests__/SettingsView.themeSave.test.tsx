@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi, beforeEach } from "vitest";
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { SettingsView } from "../SettingsView";
 
@@ -52,7 +52,7 @@ const THEME_SCHEMA = [
 ];
 
 const updateTheme = vi.fn(() => Promise.resolve(true));
-const updateSettings = vi.fn(() => Promise.resolve(true));
+const updateSettings = vi.fn(() => Promise.resolve("committed" as const));
 
 vi.mock("../../lib/api", () => ({
   fetchProfiles: vi.fn(() => Promise.resolve(PROFILES)),
@@ -99,6 +99,10 @@ function inputByLabel(text: string): HTMLInputElement {
   if (!input) throw new Error(`no <input> under label "${text}"`);
   return input;
 }
+
+import { resetSettingsStore } from "../../lib/settingsStore";
+
+beforeEach(resetSettingsStore);
 
 describe("SettingsView theme tab save routing", () => {
   it("writes the theme name to /api/theme, not the profile", async () => {

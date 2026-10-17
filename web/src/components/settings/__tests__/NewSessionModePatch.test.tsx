@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 
-import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, afterEach, beforeAll, describe, expect, it, beforeEach } from "vitest";
 import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { http, HttpResponse } from "msw";
 import { setupServer } from "msw/node";
@@ -33,6 +33,10 @@ const server = setupServer();
 beforeAll(() => server.listen({ onUnhandledRequest: "error" }));
 afterEach(() => server.resetHandlers());
 afterAll(() => server.close());
+
+import { resetSettingsStore } from "../../../lib/settingsStore";
+
+beforeEach(resetSettingsStore);
 
 describe("New Session Mode setting", () => {
   it("sends the selected mode in the profile settings PATCH", async () => {

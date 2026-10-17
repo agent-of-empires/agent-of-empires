@@ -59,11 +59,13 @@ export function activityToThreadMessages(
   const start = showClearedTurns ? -1 : lastClearIndex(rows);
   const effectiveRows = start >= 0 ? rows.slice(start) : rows;
 
-  const messages: ThreadMessageLike[] = [];
+  // Builders stay open until the end so background subagent children can land in their parent's message.
+  const messages: (ThreadMessageLike | AssistantBuilder)[] = [];
   let currentAssistant: AssistantBuilder | null = null;
-  const flushAssistant = (tail = false) => {
+  const builderByToolId = new Map<string, AssistantBuilder>();
+  const flushAssistant = () => {
     if (!currentAssistant) return;
-    messages.push(currentAssistant.build(todosEnabled, profile, tail));
+    messages.push(currentAssistant);
     currentAssistant = null;
   };
   const pushUser = (
@@ -129,12 +131,16 @@ export function activityToThreadMessages(
       continue;
     }
 
-    currentAssistant ??= new AssistantBuilder(row.id, row.at);
     if (row.kind === "tool_start" && row.tool) {
-      currentAssistant.appendToolCall(row.tool);
+      const parentBuilder = builderByToolId.get(row.tool.parent_tool_call_id ?? "");
+      const builder = parentBuilder ?? (currentAssistant ??= new AssistantBuilder(row.id, row.at));
+      builder.appendToolCall(row.tool, !!parentBuilder);
+      builderByToolId.set(row.tool.id, builder);
     } else if (row.kind === "tool_complete" || row.kind === "tool_error" || row.kind === "tool_stopped") {
-      currentAssistant.completeToolCall(
-        row.toolCallId ?? row.id.replace(/^(done|stopped)-/, ""),
+      const toolCallId = row.toolCallId ?? row.id.replace(/^(done|stopped)-/, "");
+      const builder = builderByToolId.get(toolCallId) ?? (currentAssistant ??= new AssistantBuilder(row.id, row.at));
+      builder.completeToolCall(
+        toolCallId,
         row.kind === "tool_error",
         row.kind === "tool_stopped",
         row.text,
@@ -143,19 +149,22 @@ export function activityToThreadMessages(
       );
     } else if (row.kind === "empty_output") {
       // A turn with no output (interactive-only slash commands) gets a muted note.
-      currentAssistant.appendText(`_${row.text}_`);
+      (currentAssistant ??= new AssistantBuilder(row.id, row.at)).appendText(`_${row.text}_`);
     } else if (row.kind !== "thinking") {
       // Thinking shows in the spinner; message and unknown kinds render as text.
-      currentAssistant.appendText(row.text);
+      (currentAssistant ??= new AssistantBuilder(row.id, row.at)).appendText(row.text);
     }
   }
-  flushAssistant(visiblyBusy);
+  flushAssistant();
 
-  const last = messages[messages.length - 1];
+  const built = messages.map((m, i) =>
+    m instanceof AssistantBuilder ? m.build(todosEnabled, profile, visiblyBusy && i === messages.length - 1) : m,
+  );
+  const last = built[built.length - 1];
   if (visiblyBusy && last?.role === "assistant") {
-    messages[messages.length - 1] = { ...last, status: { type: "running" } };
+    built[built.length - 1] = { ...last, status: { type: "running" } };
   }
-  return messages;
+  return built;
 }
 
 type ToolResult = { content: string; endedAt?: string; stopped?: boolean; async?: boolean };
@@ -177,6 +186,8 @@ class AssistantBuilder {
   private id: string;
   private createdAt?: Date;
   private parts: DraftPart[] = [];
+  /** Subagent children, kept out of `parts` so they never split the text around them. */
+  private children: ToolPart[] = [];
 
   constructor(id: string, createdAtIso: string) {
     this.id = `assistant-${id}`;
@@ -191,7 +202,7 @@ class AssistantBuilder {
   }
 
   /** assistant-ui parts carry no timestamps or titles, so they travel as namespaced args. */
-  appendToolCall(tool: ToolCall) {
+  appendToolCall(tool: ToolCall, isChild = false) {
     const argsObj = parseJsonObject(tool.args_preview) ?? {};
     if (tool.name) argsObj._aoe_title = tool.name;
     if (tool.started_at) argsObj._aoe_started_at = tool.started_at;
@@ -199,12 +210,13 @@ class AssistantBuilder {
     // The wire name survives later retitles, so subagent launches stay recognisable.
     if (tool.raw_name) argsObj._aoe_raw_tool_name = tool.raw_name;
     if (tool.memory_recall) argsObj._aoe_memory_recall = tool.memory_recall;
-    this.parts.push({
+    const part: ToolPart = {
       type: "tool-call",
       toolCallId: tool.id,
       toolName: tool.kind || "other",
       argsText: JSON.stringify(argsObj),
-    });
+    };
+    (isChild ? this.children : this.parts).push(part);
   }
 
   completeToolCall(
@@ -215,7 +227,9 @@ class AssistantBuilder {
     endedAt: string,
     async: boolean,
   ) {
-    const part = this.parts.find((p): p is ToolPart => p.type === "tool-call" && p.toolCallId === toolCallId);
+    const part = [...this.parts, ...this.children].find(
+      (p): p is ToolPart => p.type === "tool-call" && p.toolCallId === toolCallId,
+    );
     if (!part) return;
     part.result = { content: resultText, endedAt, stopped: stopped || undefined, async: async || undefined };
     part.isError = isError || undefined;
@@ -223,7 +237,7 @@ class AssistantBuilder {
 
   /** `tail` marks the thread's last message while the agent is busy, whose trailing run may still grow. */
   build(todosEnabled: boolean, profile: AgentProfile = DEFAULT_AGENT_PROFILE, tail = false): ThreadMessageLike {
-    const grouped = collapseToolRuns(collapseSubagents(this.parts, profile), todosEnabled, tail);
+    const grouped = collapseToolRuns(collapseSubagents(this.parts, this.children, profile), todosEnabled, tail);
     return {
       id: this.id,
       role: "assistant",
@@ -265,8 +279,8 @@ function subagentPart(parent: ToolPart, children: ToolPart[], async?: true): Too
 /** Fold each subagent into one synthetic part: a parent with inline children
  *  (linked by `_aoe_parent_tool_call_id`), an async launch, or a profile-declared
  *  off-protocol subagent tool. Children whose parent is elsewhere stay put. */
-function collapseSubagents(parts: DraftPart[], profile: AgentProfile): DraftPart[] {
-  const toolParts = parts.filter((p): p is ToolPart => p.type === "tool-call");
+function collapseSubagents(parts: DraftPart[], routedChildren: ToolPart[], profile: AgentProfile): DraftPart[] {
+  const toolParts = [...parts.filter((p): p is ToolPart => p.type === "tool-call"), ...routedChildren];
   const presentIds = new Set(toolParts.map((p) => p.toolCallId));
   const childrenByParent = new Map<string, ToolPart[]>();
   for (const p of toolParts) {

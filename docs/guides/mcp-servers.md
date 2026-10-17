@@ -4,7 +4,7 @@ AoE forwards your configured [MCP](https://modelcontextprotocol.io) servers to s
 
 ## Configuration
 
-Create `mcp.json` in the AoE app directory (`$XDG_CONFIG_HOME/agent-of-empires/mcp.json` on Linux, `~/.agent-of-empires/mcp.json` otherwise). It uses the standard `mcpServers` shape, so definitions you keep elsewhere can be reused verbatim:
+Create `mcp.json` in the AoE app directory (`$XDG_CONFIG_HOME/agent-of-empires/mcp.json` on Linux, `~/.agent-of-empires/mcp.json` otherwise). It uses the standard `mcpServers` shape for the fields AoE forwards:
 
 ```json
 {
@@ -24,6 +24,10 @@ Create `mcp.json` in the AoE app directory (`$XDG_CONFIG_HOME/agent-of-empires/m
 ```
 
 Each entry is **stdio** (the default; `command` required, `args` and `env` optional), **http**, or **sse** (`url` required, `headers` optional). The same list is forwarded for fresh and resumed sessions, but only the agent-native layer of a resumed conversation is read from the store it recorded rather than from the current entry.
+
+For remote servers, AoE expands `${NAME}` in header values from the effective session environment (profile environment and `before_session` hook values), then forwards the resulting URL and headers through ACP. It does not inherit the daemon environment wholesale. Sandboxed sessions pass no host environment to this expansion step, so their references remain unresolved. If a reference is missing, AoE logs only the server, header, and variable names; an unresolved `Authorization` header is omitted so the receiving agent can use URL-based auth, while unresolved non-Authorization placeholders remain literal. Project-local `.mcp.json` headers are not expanded because repo trust review shows header names, not referenced environment variables; the server remains configured and its unresolved `Authorization` header is omitted.
+
+ACP has no field for an MCP server's OAuth grant, refresh token, or credential-store reference, so AoE does not transfer OAuth credentials from a native CLI config or store. The receiving agent may authenticate independently; otherwise configure a valid static header (for example, `Authorization: Bearer <token>`).
 
 ## Layers and precedence
 

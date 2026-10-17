@@ -2,6 +2,7 @@
 
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { cleanup, fireEvent, render } from "@testing-library/react";
+import { MemoryRouter } from "react-router-dom";
 
 import { TopBar } from "../TopBar";
 import type { SessionResponse, Workspace } from "../../lib/types";
@@ -59,7 +60,7 @@ function topBarProps(overrides: TopBarOverrides = {}) {
 }
 
 function renderTopBar(overrides: TopBarOverrides = {}) {
-  return render(<TopBar {...topBarProps(overrides)} />);
+  return render(<TopBar {...topBarProps(overrides)} />, { wrapper: MemoryRouter });
 }
 
 describe("TopBar", () => {
@@ -72,6 +73,23 @@ describe("TopBar", () => {
     expect(getByText("DEV")).toBeTruthy();
     expect(getByLabelText("Debug build")).toBeTruthy();
     expect(getByText("offline")).toBeTruthy();
+  });
+
+  it("bounds the header-start group: hidden below md, capped above, and hidden on the compact rail", () => {
+    const group = (container: HTMLElement) => container.querySelector('[data-testid="topbar-header-start"]');
+    const roomy = renderTopBar();
+    expect(group(roomy.container)?.className).toMatch(/\bhidden\b.*\bmd:flex\b.*\bmax-w-48\b.*\boverflow-hidden\b/);
+    expect(group(roomy.container)?.className).not.toContain("md:hidden");
+    roomy.unmount();
+
+    localStorage.setItem("aoe-web-settings", JSON.stringify({ sidebarCompact: true }));
+    try {
+      const compact = render(<TopBar {...topBarProps()} sidebarColumnVisible />, { wrapper: MemoryRouter });
+      expect(group(compact.container)?.className).toContain("md:hidden");
+      expect(group(compact.container)?.className).not.toContain("md:flex");
+    } finally {
+      localStorage.removeItem("aoe-web-settings");
+    }
   });
 
   it("does not render the workspace/repo breadcrumb even with an active workspace and session", () => {

@@ -1,14 +1,4 @@
-//! Regression test for issue #1962: inside a git worktree the build script
-//! must watch the *real* per-worktree `HEAD`, not the literal `.git/HEAD`
-//! (which does not exist there). A missing `rerun-if-changed` input makes
-//! cargo treat the build script as perpetually stale, recompiling the lib +
-//! binary on every build.
-//!
-//! The test drives the actual watch-path logic used by `build.rs`
-//! (`build_git_watch.rs`, shared via `include!`) against a temporary git
-//! worktree and asserts every watched path exists on disk. It also pins the
-//! two halves of the trigger contract: a revision change must disturb a
-//! watched file, and a plain `git status` (which rewrites `index`) must not.
+//! Build-version watches must resolve worktree HEAD and ignore index churn.
 
 #[path = "../../build_git_watch.rs"]
 mod build_git_watch;
@@ -17,12 +7,32 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 fn git(dir: &Path, args: &[&str]) -> std::process::Output {
-    Command::new("git")
+    let output = Command::new("git")
         .arg("-C")
         .arg(dir)
         .args(args)
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_SYSTEM", "/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env_remove("GIT_CONFIG")
+        .env_remove("GIT_CONFIG_COUNT")
+        .env_remove("GIT_CONFIG_PARAMETERS")
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .env_remove("GIT_COMMON_DIR")
+        .env_remove("GIT_INDEX_FILE")
+        .env_remove("GIT_OBJECT_DIRECTORY")
+        .env_remove("GIT_ALTERNATE_OBJECT_DIRECTORIES")
+        .env_remove("GIT_PREFIX")
+        .env("GIT_TEMPLATE_DIR", "")
         .output()
-        .expect("failed to run git")
+        .expect("failed to run git");
+    assert!(
+        output.status.success(),
+        "git {args:?} failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    output
 }
 
 fn git_available() -> bool {
@@ -57,30 +67,22 @@ fn watch_paths_resolve_in_a_git_worktree() {
     let main_repo = tmp.path().join("main");
     std::fs::create_dir(&main_repo).expect("create main repo dir");
 
-    assert!(git(&main_repo, &["init", "-q"]).status.success());
-    // Identity + a commit so HEAD points at something and a worktree can branch.
+    git(&main_repo, &["init", "-q"]);
     git(&main_repo, &["config", "user.email", "test@example.com"]);
     git(&main_repo, &["config", "user.name", "Test"]);
-    assert!(git(&main_repo, &["commit", "--allow-empty", "-qm", "init"])
-        .status
-        .success());
+    git(&main_repo, &["commit", "--allow-empty", "-qm", "init"]);
 
     let worktree = tmp.path().join("wt");
-    assert!(
-        git(
-            &main_repo,
-            &[
-                "worktree",
-                "add",
-                "-q",
-                worktree.to_str().unwrap(),
-                "-b",
-                "wt-branch",
-            ],
-        )
-        .status
-        .success(),
-        "failed to create worktree"
+    git(
+        &main_repo,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            worktree.to_str().unwrap(),
+            "-b",
+            "wt-branch",
+        ],
     );
 
     // Sanity: in a worktree `.git` is a file, so the naive hardcoded path the
@@ -116,6 +118,92 @@ fn watch_paths_resolve_in_a_git_worktree() {
 
 #[test]
 #[serial_test::parallel]
+fn watch_paths_ignore_inherited_repository_context() {
+    const CHILD_DIR: &str = "AOE_BUILD_WATCH_CHILD_DIR";
+    const CHILD_RECORD: &str = "AOE_BUILD_WATCH_CHILD_RECORD";
+    if let (Some(directory), Some(record)) =
+        (std::env::var_os(CHILD_DIR), std::env::var_os(CHILD_RECORD))
+    {
+        let paths = build_git_watch::git_watch_paths(Path::new(&directory));
+        std::fs::write(record, serde_json::to_vec(&paths).unwrap()).unwrap();
+        return;
+    }
+    if !git_available() {
+        eprintln!("skipping: git not available");
+        return;
+    }
+
+    let temporary = tempfile::tempdir().unwrap();
+    let target = temporary.path().join("target");
+    let foreign = temporary.path().join("foreign");
+    for repository in [&target, &foreign] {
+        std::fs::create_dir(repository).unwrap();
+        git(repository, &["init", "-q"]);
+        git(repository, &["config", "user.email", "test@example.com"]);
+        git(repository, &["config", "user.name", "Test"]);
+        git(repository, &["commit", "--allow-empty", "-qm", "init"]);
+    }
+    let foreign_git = foreign.join(".git");
+    let record = temporary.path().join("observed.json");
+    let configuration = temporary.path().join("git-config");
+    std::fs::write(&configuration, "").unwrap();
+    let output = Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "build_version_rerun::watch_paths_ignore_inherited_repository_context",
+            "--nocapture",
+        ])
+        .env(CHILD_DIR, &target)
+        .env(CHILD_RECORD, &record)
+        .env("GIT_DIR", &foreign_git)
+        .env("GIT_WORK_TREE", &foreign)
+        .env("GIT_COMMON_DIR", &foreign_git)
+        .env("GIT_INDEX_FILE", foreign_git.join("index"))
+        .env("GIT_OBJECT_DIRECTORY", foreign_git.join("objects"))
+        .env(
+            "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+            foreign_git.join("objects"),
+        )
+        .env("GIT_NAMESPACE", "foreign")
+        .env("GIT_CONFIG_GLOBAL", &configuration)
+        .env("GIT_CONFIG_SYSTEM", &configuration)
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env_remove("GIT_CONFIG")
+        .env_remove("GIT_CONFIG_COUNT")
+        .env_remove("GIT_CONFIG_PARAMETERS")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let paths: Vec<String> = serde_json::from_slice(&std::fs::read(record).unwrap()).unwrap();
+    let mut observed: Vec<_> = paths
+        .iter()
+        .map(|path| {
+            let path = Path::new(path);
+            if path.is_absolute() {
+                path.to_path_buf()
+            } else {
+                target.join(path)
+            }
+            .canonicalize()
+            .unwrap()
+        })
+        .collect();
+    let mut expected: Vec<_> = ["HEAD", "logs/HEAD"]
+        .iter()
+        .map(|path| target.join(".git").join(path).canonicalize().unwrap())
+        .collect();
+    observed.sort();
+    expected.sort();
+    assert_eq!(observed, expected);
+}
+
+#[test]
+#[serial_test::parallel]
 fn git_watch_paths_empty_when_git_cannot_resolve() {
     if !git_available() {
         eprintln!("skipping: git not available");
@@ -147,12 +235,12 @@ fn watched_paths_move_on_a_commit_but_not_on_a_plain_status() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let repo = tmp.path().join("repo");
     std::fs::create_dir(&repo).expect("create repo dir");
-    assert!(git(&repo, &["init", "-q"]).status.success());
+    git(&repo, &["init", "-q"]);
     git(&repo, &["config", "user.email", "test@example.com"]);
     git(&repo, &["config", "user.name", "Test"]);
     std::fs::write(repo.join("tracked.txt"), "one\n").expect("write tracked file");
-    assert!(git(&repo, &["add", "tracked.txt"]).status.success());
-    assert!(git(&repo, &["commit", "-qm", "init"]).status.success());
+    git(&repo, &["add", "tracked.txt"]);
+    git(&repo, &["commit", "-qm", "init"]);
 
     let snapshot = |repo: &Path| -> Vec<(String, Vec<u8>)> {
         build_git_watch::git_watch_paths(repo)
@@ -184,7 +272,7 @@ fn watched_paths_move_on_a_commit_but_not_on_a_plain_status() {
                 .set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(1)),
         )
         .expect("backdate tracked file");
-    assert!(git(&repo, &["status", "--porcelain"]).status.success());
+    git(&repo, &["status", "--porcelain"]);
     assert_ne!(
         index_before,
         std::fs::read(&index).expect("read index"),
@@ -198,9 +286,7 @@ fn watched_paths_move_on_a_commit_but_not_on_a_plain_status() {
 
     // A commit advances the branch ref; `HEAD` itself never changes, so the
     // reflog is what keeps the embedded version from going stale.
-    assert!(git(&repo, &["commit", "-qm", "second", "--allow-empty"])
-        .status
-        .success());
+    git(&repo, &["commit", "-qm", "second", "--allow-empty"]);
     assert_ne!(
         before,
         snapshot(&repo),

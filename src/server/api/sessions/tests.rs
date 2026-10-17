@@ -1484,6 +1484,124 @@ fn diff_repos_of_scopes_bases_per_workspace_repo() {
     assert_eq!(repos[0].recorded_base.as_deref(), Some("develop"));
 }
 
+/// #4574: a Working directory that is not itself a Repository gets a typed
+/// flag instead of a warning and a fake `main` base; every other path keeps
+/// today's response.
+#[tokio::test]
+#[serial_test::serial]
+async fn session_diff_files_flags_a_working_directory_outside_any_repository() {
+    use axum::body::to_bytes;
+    use axum::extract::Path as AxumPath;
+
+    let _guard = crate::session::test_support::isolate_app_dir();
+    let plain = tempfile::tempdir().unwrap();
+    let (repo, _repo) = crate::git::test_support::init_repo();
+    let subdir = repo.path().join("pkg");
+    std::fs::create_dir(&subdir).unwrap();
+    let broken_worktree = plain.path().join("broken-worktree");
+    std::fs::create_dir(&broken_worktree).unwrap();
+    std::fs::write(
+        broken_worktree.join(".git"),
+        "gitdir: /nonexistent/repo/.git/worktrees/w\n",
+    )
+    .unwrap();
+    let (unreadable, _unreadable_repo) = crate::git::test_support::init_repo();
+    let unreadable_git = unreadable.path().join(".git");
+    let set_mode = |mode| {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&unreadable_git, std::fs::Permissions::from_mode(mode)).unwrap();
+    };
+    set_mode(0o000);
+    let cases = [
+        // (label, Working directory, outside a Repository)
+        ("plain dir", plain.path().to_path_buf(), true),
+        // The diff never searches parents, so it cannot diff a subdirectory.
+        ("subdir of a repository", subdir, true),
+        ("repository root", repo.path().to_path_buf(), false),
+        ("missing dir", plain.path().join("gone"), false),
+        // Git metadata that exists but cannot be opened is not evidence of no Repository.
+        (
+            "linked worktree with a missing gitdir",
+            broken_worktree,
+            false,
+        ),
+        ("unreadable .git", unreadable.path().to_path_buf(), false),
+    ];
+    let instances: Vec<Instance> = cases
+        .iter()
+        .map(|(label, path, _)| Instance::new(label, path.to_str().unwrap()))
+        .collect();
+    let state = crate::server::test_support::build_test_app_state(instances.clone());
+
+    for ((label, path, outside), inst) in cases.iter().zip(&instances) {
+        let resp = session_diff_files(State(state.clone()), AxumPath(inst.id.clone()))
+            .await
+            .into_response();
+        let body = to_bytes(resp.into_body(), 1 << 16).await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let base = &body["per_repo_bases"][0];
+        if *outside {
+            assert_eq!(base["outside_repository"], true, "{label}");
+            assert!(base.get("base_branch").is_none(), "{label}: no fake base");
+            assert!(body.get("warning").is_none(), "{label}");
+        } else {
+            assert!(base.get("outside_repository").is_none(), "{label}");
+            let base_branch = base["base_branch"].as_str().expect(label);
+            assert_eq!(
+                body["warning"].as_str().map(str::to_string),
+                crate::git::diff::check_merge_base_status(path, base_branch),
+                "{label}: warning unchanged"
+            );
+        }
+    }
+    set_mode(0o755);
+}
+
+/// #4574: the Web dashboard skips Diff auto-open for a Session outside any
+/// Repository. Worktree and workspace Sessions are Repositories by
+/// construction, and a path this host cannot see is never claimed as outside.
+#[test]
+fn session_response_flags_a_working_directory_outside_any_repository() {
+    let plain = tempfile::tempdir().unwrap();
+    let plain_path = plain.path().to_str().unwrap();
+    let (repo, _repo) = crate::git::test_support::init_repo();
+    let missing = plain.path().join("gone");
+
+    let mut in_worktree = Instance::new("t", plain_path);
+    in_worktree.worktree_info = Some(worktree("feature/x", "/src/only", None));
+    let mut in_workspace = Instance::new("t", plain_path);
+    in_workspace.workspace_info = Some(crate::session::WorkspaceInfo {
+        branch: "feature/x".to_string(),
+        workspace_dir: plain_path.to_string(),
+        repos: Vec::new(),
+        created_at: chrono::Utc::now(),
+        cleanup_on_delete: true,
+    });
+
+    let cases = [
+        ("plain dir", Instance::new("t", plain_path), true),
+        (
+            "repository root",
+            Instance::new("t", repo.path().to_str().unwrap()),
+            false,
+        ),
+        (
+            "missing dir",
+            Instance::new("t", missing.to_str().unwrap()),
+            false,
+        ),
+        ("worktree session", in_worktree, false),
+        ("workspace session", in_workspace, false),
+    ];
+    for (label, inst, outside) in cases {
+        assert_eq!(
+            SessionResponse::from_instance(&inst, false).outside_repository,
+            outside,
+            "{label}"
+        );
+    }
+}
+
 /// The PATCH write lands on exactly the named repo, and the unnamed
 /// target still writes the session field. See #3329.
 #[test]

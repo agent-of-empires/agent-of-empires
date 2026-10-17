@@ -149,7 +149,9 @@
         "tests/mobile-panes.spec.ts",
         "tests/keyboard-auto-resize.spec.ts",
         "tests/mobile-keyboard.spec.ts",
-        "src/hooks/useMobileViewportLock.test.ts"
+        "src/hooks/useMobileViewportLock.test.ts",
+        "src/components/__tests__/LiveTerminalView.recover.test.tsx",
+        "src/components/__tests__/LiveTerminalView.restart.test.tsx"
       ],
       "components": [
         "web/src/App.tsx",
@@ -465,6 +467,22 @@
       "components": ["web/src/lib/api.ts", "web/src/lib/settingsEvents.ts", "web/src/hooks/useApprovalSound.ts"]
     },
     {
+      "id": "settings.save-coordination",
+      "kind": "vitest",
+      "risk": "high",
+      "specs": [
+        "src/lib/settingsStore.test.ts",
+        "src/lib/api.test.ts",
+        "src/components/settings/__tests__/PluginSettingsSections.test.tsx"
+      ],
+      "components": [
+        "web/src/lib/settingsStore.ts",
+        "web/src/lib/api.ts",
+        "web/src/components/SettingsView.tsx",
+        "web/src/components/settings/PluginSettingsSections.tsx"
+      ]
+    },
+    {
       "id": "settings.theme-persistence",
       "kind": "live-playwright",
       "risk": "high",
@@ -772,7 +790,8 @@
       "kind": "vitest",
       "risk": "high",
       "specs": ["src/hooks/usePushSubscription.test.ts", "src/lib/pushHealth.test.ts"],
-      "components": ["web/src/hooks/usePushSubscription.ts", "web/src/lib/pushHealth.ts"]
+      "components": ["web/src/hooks/usePushSubscription.ts", "web/src/lib/pushHealth.ts"],
+      "notes": "Deferred-operation tests cover an enable that settles after every consumer unmounted and remounted, and refresh registration POSTs (one or two overlapping) that must not land after disable."
     },
     {
       "id": "notifications.push-health-banner",
@@ -866,6 +885,13 @@
         "web/src/lib/contrastColor.ts",
         "web/src/lib/attentionBadgeColors.ts"
       ]
+    },
+    {
+      "id": "app-shell.topbar-header-start",
+      "kind": "vitest",
+      "risk": "low",
+      "specs": ["src/components/__tests__/TopBar.test.tsx", "src/components/plugin/__tests__/PluginSlots.test.tsx"],
+      "components": ["web/src/components/TopBar.tsx", "web/src/components/plugin/PluginSlots.tsx"]
     },
     {
       "id": "app-shell.activity-bar",
@@ -1007,7 +1033,11 @@
       "id": "wizard",
       "kind": "mocked-playwright",
       "risk": "high",
-      "specs": ["tests/wizard.spec.ts", "tests/wizard-project.spec.ts"],
+      "specs": [
+        "tests/wizard.spec.ts",
+        "tests/wizard-project.spec.ts",
+        "src/components/session-wizard/__tests__/SessionWizard.test.tsx"
+      ],
       "components": [
         "web/src/components/DirectoryBrowser.tsx",
         "web/src/components/session-wizard/SessionWizard.tsx",
@@ -1196,6 +1226,13 @@
         "web/src/components/session-wizard/steps/AgentPanel.tsx",
         "web/src/components/session-wizard/wizardReducer.ts"
       ]
+    },
+    {
+      "id": "wizard.profile-agent-defaults",
+      "kind": "vitest",
+      "risk": "medium",
+      "specs": ["src/components/session-wizard/__tests__/SessionWizard.test.tsx"],
+      "components": ["web/src/components/session-wizard/profileDefaults.ts"]
     },
     {
       "id": "wizard.agent-allowlist",
@@ -1846,6 +1883,22 @@
       "notes": "A plugin-supplied UI link's internal/external classification and path resolution (src/lib/pluginHref.ts) is unit-tested in src/lib/__tests__/pluginHref.test.ts; this covers the browser-level click behavior: an internal relative href navigates via the router (no full page load), a session-shaped href goes through the same session-selection flow a sidebar click uses, an external href opens a new tab, and a modified click is not intercepted."
     },
     {
+      "id": "plugins.pages",
+      "kind": "mocked-playwright",
+      "risk": "high",
+      "specs": ["tests/plugin-pages.spec.ts"],
+      "components": [
+        "web/src/components/plugin/PluginPageButtons.tsx",
+        "web/src/components/plugin/PluginPageView.tsx",
+        "web/src/components/plugin/PluginSessionMenu.tsx",
+        "web/src/components/sidebar/SessionActions.tsx",
+        "web/src/lib/pluginBridge.ts",
+        "web/src/components/TopBar.tsx",
+        "web/src/App.tsx"
+      ],
+      "notes": "TopBar page buttons and palette entries appear only with a declared page, the button marking the open page; the route hides the sidebar, mints a page ticket before framing, and Back pops history. A fixture page served under the daemon's page CSP proves the sandboxed frame cannot read storage, cookies or call the API. A bridge fixture page round-trips ready, sessions.list, plugins.uiState, its own action, session.archive, session.trash and openSession, a page without session.write is refused both lifecycle calls, and it receives a theme change without reloading; with split view on, openSession shows the session below the page with its docks, in `?session=` rather than navigating, pushes the selection, maximizes over the page without reloading it, and Open full navigates; session.contextMenu opens the sidebar's session menu at the frame-relative point, resolves with a picked page item or null, opens the snooze picker and a rename dialog that PATCHes the title, and a click over the frame dismisses it; a page that navigates to another plugin's page before ready never hands that page the bridge. Mint ordering, empty states, the nonce-checked ready-only channel handoff, theme pushes, teardown on a second load and remount resets are unit-tested in PluginPageView.test.tsx; envelope validation and gating in pluginBridge.test.ts; the ticket's server side in src/server/api/plugins.rs."
+    },
+    {
       "id": "sidebar.plugin-row-slots",
       "kind": "mocked-playwright",
       "risk": "medium",
@@ -2252,10 +2305,12 @@
         "src/lib/acpHistoryWindow.test.ts",
         "src/hooks/__tests__/useHistoryWindow.test.tsx",
         "src/lib/historyScroll.test.ts",
-        "src/hooks/useAcpSession.test.ts"
+        "src/hooks/useAcpSession.test.ts",
+        "src/hooks/acpSession/replay.test.ts"
       ],
       "components": [
         "web/src/lib/acpHistoryWindow.ts",
+        "web/src/hooks/acpSession/replay.ts",
         "web/src/lib/historyScroll.ts",
         "web/src/hooks/useHistoryWindow.ts",
         "web/src/hooks/useAcpSession.ts",
@@ -3437,6 +3492,13 @@
       "risk": "medium",
       "specs": ["tests/sidebar-reorder.spec.ts"],
       "components": ["web/src/components/WorkspaceSidebar.tsx"]
+    },
+    {
+      "id": "story.sidebar-keyboard-row-navigation",
+      "kind": "mocked-playwright",
+      "risk": "medium",
+      "specs": ["tests/sidebar-keyboard-navigation.spec.ts"],
+      "components": ["web/src/components/WorkspaceSidebar.tsx", "web/src/components/sidebar/SessionRow.tsx"]
     },
     {
       "id": "story.sidebar-plan-progress",

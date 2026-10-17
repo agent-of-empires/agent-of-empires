@@ -80,19 +80,21 @@ fn subscribe(
     file_watch: &Arc<FileWatchService>,
     spec: WatchSpec,
     capacity: usize,
-    dirty: &Arc<AtomicBool>,
+    latches: &[Arc<AtomicBool>],
     span: tracing::Span,
 ) -> Result<DiskWatchEntry, crate::file_watch::WatchError> {
     use tracing::Instrument;
     let dir = spec.dir.clone();
     let (mut rx, handle) = file_watch.subscribe_channel(spec, capacity)?;
-    let dirty = Arc::clone(dirty);
+    let latches = latches.to_vec();
     let join = crate::task_util::spawn_supervised(
         task_name,
         crate::task_util::PanicPolicy::Log,
         async move {
             while rx.recv().await.is_some() {
-                dirty.store(true, Ordering::Release);
+                for latch in &latches {
+                    latch.store(true, Ordering::Release);
+                }
             }
         }
         .instrument(span),
@@ -166,6 +168,9 @@ pub(in crate::tui) struct DiskWatchState {
 /// Global and per-profile `config.toml` subscriptions and the latch their forwarders set.
 pub(in crate::tui) struct ConfigWatchState {
     pub(in crate::tui) dirty: Arc<AtomicBool>,
+    /// Set with `dirty` but taken even during live-send, which defers the full
+    /// reload: a removed `session.preview_link_prefixes` entry stops at once.
+    pub(in crate::tui) link_policy_dirty: Arc<AtomicBool>,
     pub(in crate::tui) handles: HashMap<ConfigWatchKey, DiskWatchEntry>,
 }
 
@@ -204,7 +209,14 @@ impl DiskWatchState {
             let span = tracing::debug_span!("tui.disk_watch.forwarder", profile = %name);
             let name_ = "tui.disk_watch.forwarder";
             let spec = watch_spec(&dir, matcher, 75);
-            match subscribe(name_, file_watch, spec, 16, &self.dirty, span) {
+            match subscribe(
+                name_,
+                file_watch,
+                spec,
+                16,
+                std::slice::from_ref(&self.dirty),
+                span,
+            ) {
                 Ok(entry) => {
                     self.handles.insert(name.clone(), entry);
                 }
@@ -238,6 +250,10 @@ impl DiskWatchState {
 }
 
 impl ConfigWatchState {
+    fn latches(&self) -> [Arc<AtomicBool>; 2] {
+        [Arc::clone(&self.dirty), Arc::clone(&self.link_policy_dirty)]
+    }
+
     /// Keep the global subscription (rebuilt only if the app dir was recreated) and set-diff the
     /// per-profile ones against `current`.
     pub(in crate::tui) fn rewire(
@@ -285,7 +301,7 @@ impl ConfigWatchState {
                     let span = tracing::debug_span!("tui.config_watch.global.forwarder");
                     let name_ = "tui.config_watch.global.forwarder";
                     let spec = watch_spec(&app_dir, matcher, 100);
-                    match subscribe(name_, file_watch, spec, 4, &self.dirty, span) {
+                    match subscribe(name_, file_watch, spec, 4, &self.latches(), span) {
                         Ok(entry) => {
                             self.handles.insert(ConfigWatchKey::Global, entry);
                         }
@@ -332,7 +348,7 @@ impl ConfigWatchState {
             let span = tracing::debug_span!("tui.config_watch.profile.forwarder", profile = %name);
             let name_ = "tui.config_watch.profile.forwarder";
             let spec = watch_spec(&dir, matcher, 100);
-            match subscribe(name_, file_watch, spec, 4, &self.dirty, span) {
+            match subscribe(name_, file_watch, spec, 4, &self.latches(), span) {
                 Ok(entry) => {
                     self.handles.insert(ConfigWatchKey::profile(name), entry);
                 }

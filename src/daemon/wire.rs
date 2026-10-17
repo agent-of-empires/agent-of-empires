@@ -152,6 +152,10 @@ pub struct SessionResponse {
     pub base_branch_override: Option<String>,
     #[serde(default)]
     pub is_sandboxed: bool,
+    /// The Working directory is not a Repository. Negative so a row from a
+    /// daemon without this field decodes as a Repository (#4574).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub outside_repository: bool,
     #[serde(default)]
     pub scratch: bool,
     #[serde(default)]

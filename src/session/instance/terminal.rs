@@ -211,7 +211,7 @@ impl Instance {
         // An archived or trashed session must not bring its container back (#4116).
         drop(self.lock_for_input()?);
 
-        let container = self.get_container_for_instance()?;
+        let container = self.get_container_admitted()?;
         let sandbox = self
             .sandbox_info
             .as_ref()
