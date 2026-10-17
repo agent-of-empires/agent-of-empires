@@ -620,7 +620,43 @@ fn force_remove_preserves_scratch_worktree_branch_and_reloaded_successor() {
         )
         .with_phase(crate::session::lifecycle_journal::LifecyclePhase::TeardownStarted);
         crate::session::lifecycle_journal::record(&entry).unwrap();
-        env.view.force_remove_session("force-kept").unwrap();
+        env.view.view_mode = ViewMode::Structured;
+        env.view.strict_hotkeys = false;
+        env.view.selected_session = Some("force-kept".into());
+        env.view.handle_key(key(KeyCode::Char('d')), None);
+        assert_eq!(
+            env.view
+                .confirm_dialog
+                .as_ref()
+                .map(|dialog| dialog.action()),
+            Some("force_remove_session")
+        );
+        assert_eq!(
+            env.view.pending_force_remove_session.as_deref(),
+            Some("force-kept")
+        );
+        env.view.handle_key(key(KeyCode::Char('y')), None);
+        assert!(env.view.confirm_dialog.is_none());
+        let attempt_id = env.view.deletes_in_flight["force-kept"].attempt_id;
+        let counter = env.view.next_delete_attempt_id;
+        assert!(env.view.deletes_in_flight["force-kept"].worker == super::DeleteWorker::Drop);
+        env.view.handle_key(key(KeyCode::Char('d')), None);
+        assert_eq!(
+            env.view.info_dialog.as_ref().map(InfoDialog::title),
+            Some("Deletion pending")
+        );
+        assert!(env.view.confirm_dialog.is_none());
+        assert!(env.view.pending_force_remove_session.is_none());
+        let error = env.view.force_remove_session("force-kept").unwrap_err();
+        assert!(error.to_string().contains("pending deletion"));
+        assert_eq!(
+            env.view.deletes_in_flight["force-kept"].attempt_id,
+            attempt_id
+        );
+        assert_eq!(env.view.next_delete_attempt_id, counter);
+        assert!(env.view.drop_poller.is_pending("force-kept"));
+        env.view.handle_key(key(KeyCode::Esc), None);
+        assert!(env.view.info_dialog.is_none());
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
         if successor {
             while !storage.load().unwrap().is_empty() {

@@ -5331,6 +5331,13 @@ impl HomeView {
                     return;
                 }
                 if inst.status == Status::Deleting {
+                    if self.deletes_in_flight.contains_key(session_id) {
+                        self.info_dialog = Some(InfoDialog::new(
+                            "Deletion pending",
+                            "This session already has a pending deletion. Wait for it to finish.",
+                        ));
+                        return;
+                    }
                     let message = format!(
                         "'{}' is stuck deleting. Force remove it from the session list? \
                          (the sandbox container is torn down; worktrees and branches will not be cleaned up)",

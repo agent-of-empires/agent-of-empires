@@ -69,6 +69,233 @@ fn boot_view_with_dirty_worktree() -> (TempDir, AppDirGuard, HomeView, String, T
 
 #[test]
 #[serial]
+fn pending_purge_rejects_force_remove_and_applies_its_real_success_or_failure() {
+    use super::super::DeleteWorker;
+    use crate::session::deletion::{execute_deletion, DeletionDisposition};
+    use std::sync::mpsc;
+    use std::time::{Duration, Instant};
+    let _git_env = crate::session::test_support::EnvGuard::set(&[
+        ("GIT_CONFIG_GLOBAL", "/dev/null"),
+        ("GIT_CONFIG_NOSYSTEM", "1"),
+    ]);
+    for forced in [false, true] {
+        let (_temp, _home, mut view, id, repository) = boot_view_with_dirty_worktree();
+        let storage = Storage::open_unwatched("test").unwrap();
+        let before = storage.load().unwrap().remove(0);
+        let before_bytes = std::fs::read(storage.sessions_path()).unwrap();
+        let project = std::path::PathBuf::from(&before.project_path);
+        view.trashed_section_collapsed = false;
+        view.rebuild_flat_items();
+        view.cursor = view
+            .flat_items
+            .iter()
+            .position(
+                |item| matches!(item, Item::Session { id: candidate, .. } if candidate == &id),
+            )
+            .unwrap();
+        view.update_selected();
+        view.view_mode = ViewMode::Structured;
+        view.strict_hotkeys = false;
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let (finished_tx, finished_rx) = mpsc::channel();
+        view.deletion_poller =
+            crate::tui::deletion_poller::DeletionPoller::with_handler_for_test(move |request| {
+                assert!(request.delete_worktree);
+                assert_eq!(request.force_delete, forced);
+                entered_tx.send(()).unwrap();
+                release_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                let result = execute_deletion(request);
+                assert_eq!(
+                    result.disposition,
+                    if forced {
+                        DeletionDisposition::Removed
+                    } else {
+                        DeletionDisposition::Failed
+                    }
+                );
+                finished_tx.send(result.errors.join("; ")).unwrap();
+                result
+            });
+        view.handle_key(key(KeyCode::Char('d')), None);
+        assert!(view.unified_delete_dialog.is_some());
+        if forced {
+            view.handle_key(key(KeyCode::Tab), None);
+            view.handle_key(key(KeyCode::Char(' ')), None);
+        }
+        view.handle_key(key(KeyCode::Char('y')), None);
+        assert!(view.unified_delete_dialog.is_none());
+        entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let attempt = view.deletes_in_flight[&id].clone();
+        let counter = view.next_delete_attempt_id;
+        assert!(attempt.worker == DeleteWorker::Purge);
+        assert_eq!(view.instances[&id].status, Status::Deleting);
+        assert_eq!(
+            std::fs::read(storage.sessions_path()).unwrap(),
+            before_bytes
+        );
+        assert!(before.lifecycle_reservation.is_none());
+
+        view.handle_key(key(KeyCode::Char('d')), None);
+        assert_eq!(
+            view.info_dialog.as_ref().map(InfoDialog::title),
+            Some("Deletion pending")
+        );
+        assert!(view.confirm_dialog.is_none());
+        assert!(view.pending_force_remove_session.is_none());
+        view.handle_key(key(KeyCode::Char('y')), None);
+        if view.info_dialog.is_some() {
+            view.handle_key(key(KeyCode::Esc), None);
+        }
+        assert!(view.info_dialog.is_none());
+        let error = view.force_remove_session(&id).unwrap_err();
+        assert!(error.to_string().contains("pending deletion"));
+        let current = &view.deletes_in_flight[&id];
+        assert!(current.worker == DeleteWorker::Purge);
+        assert_eq!(current.attempt_id, attempt.attempt_id);
+        assert_eq!(current.source_profile, attempt.source_profile);
+        assert_eq!(current.lifecycle_generation, attempt.lifecycle_generation);
+        assert_eq!(current.forced, attempt.forced);
+        assert_eq!(current.trashed_at, attempt.trashed_at);
+        assert_eq!(current.trash_lifecycle_id, attempt.trash_lifecycle_id);
+        assert_eq!(view.next_delete_attempt_id, counter);
+        assert!(!view.drop_poller.is_pending(&id));
+        assert!(view.failed_deletes.is_empty());
+        assert_eq!(
+            std::fs::read(storage.sessions_path()).unwrap(),
+            before_bytes
+        );
+
+        release_tx.send(()).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while view.deletes_in_flight.contains_key(&id) {
+            view.apply_deletion_results();
+            assert!(
+                Instant::now() < deadline,
+                "original purge completion was not applied"
+            );
+            std::thread::yield_now();
+        }
+        let error = finished_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(
+            view.info_dialog.is_none(),
+            "no refused Drop should replace the original result"
+        );
+        if forced {
+            assert!(error.is_empty());
+            assert!(!view.instances.contains_key(&id));
+            assert!(storage.load().unwrap().is_empty());
+            assert!(!project.exists());
+        } else {
+            assert!(!error.is_empty());
+            let durable = storage.load().unwrap().remove(0);
+            let cached = &view.instances[&id];
+            assert_eq!(cached.status, Status::Error);
+            assert_eq!(cached.last_error.as_deref(), Some(error.as_str()));
+            assert_eq!(cached.lifecycle_generation, before.lifecycle_generation + 2);
+            assert_eq!(cached.lifecycle_generation, durable.lifecycle_generation);
+            assert!(durable.lifecycle_reservation.is_none());
+            assert_eq!(view.failed_delete_forced(cached), Some(false));
+            assert_eq!(
+                std::fs::read(project.join("protected")).unwrap(),
+                b"dirty worktree"
+            );
+        }
+        assert!(git2::Repository::open(repository.path())
+            .unwrap()
+            .find_branch("retry-kept", git2::BranchType::Local)
+            .is_ok());
+    }
+}
+
+#[test]
+#[serial]
+fn failed_forced_trash_purge_can_still_drop_its_row_without_worktree_cleanup() {
+    use super::super::DeleteWorker;
+    use crate::session::deletion::execute_deletion;
+    use crate::session::lifecycle_journal::{filename_key, read_deletion, LifecyclePhase};
+    use crate::tui::dialogs::DeleteOptions;
+    use std::time::{Duration, Instant};
+    let _git_env = crate::session::test_support::EnvGuard::set(&[
+        ("GIT_CONFIG_GLOBAL", "/dev/null"),
+        ("GIT_CONFIG_NOSYSTEM", "1"),
+    ]);
+    let (_temp, _home, mut view, id, repository) = boot_view_with_dirty_worktree();
+    let storage = Storage::open_unwatched("test").unwrap();
+    let before = storage.load().unwrap().remove(0);
+    let project = std::path::PathBuf::from(&before.project_path);
+    let failed_id = id.clone();
+    view.deletion_poller =
+        crate::tui::deletion_poller::DeletionPoller::with_handler_for_test(move |request| {
+            let failed_id = failed_id.clone();
+            let _sync = crate::session::intercept_directory_sync_for_test(move |path| {
+                if filename_key(path).is_ok_and(|key| key.session_id() == failed_id)
+                    && read_deletion(path)?
+                        .is_some_and(|entry| entry.phase == LifecyclePhase::HooksStarted)
+                {
+                    anyhow::bail!(std::io::Error::from_raw_os_error(libc::EIO));
+                }
+                Ok(())
+            });
+            execute_deletion(request)
+        });
+    view.selected_session = Some(id.clone());
+    view.delete_selected(&DeleteOptions {
+        delete_worktree: true,
+        force_delete: true,
+        ..Default::default()
+    })
+    .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while view.deletes_in_flight.contains_key(&id) {
+        view.apply_deletion_results();
+        assert!(
+            Instant::now() < deadline,
+            "forced preparation failure did not arrive"
+        );
+        std::thread::yield_now();
+    }
+    assert_eq!(view.instances[&id].status, Status::Error);
+    assert!(view.instances[&id]
+        .last_error
+        .as_deref()
+        .unwrap()
+        .contains("hook start"));
+    assert_eq!(
+        view.instances[&id].lifecycle_generation,
+        before.lifecycle_generation + 2
+    );
+    assert_eq!(view.failed_delete_forced(&view.instances[&id]), Some(true));
+    let durable = storage.load().unwrap().remove(0);
+    assert!(durable.same_trash_lifecycle(&before));
+    assert!(durable.lifecycle_reservation.is_none());
+    view.empty_trash_all(false, true);
+    assert!(view.deletes_in_flight[&id].worker == DeleteWorker::Drop);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while view.deletes_in_flight.contains_key(&id) {
+        view.apply_drop_results();
+        assert!(
+            Instant::now() < deadline,
+            "failed-forced-trash Drop did not complete"
+        );
+        std::thread::yield_now();
+    }
+    assert!(!view.instances.contains_key(&id));
+    assert!(!view.failed_deletes.contains_key(&id));
+    assert!(storage.load().unwrap().is_empty());
+    crate::session::deletion::recover_lifecycle_journals_once().unwrap();
+    assert_eq!(
+        std::fs::read(project.join("protected")).unwrap(),
+        b"dirty worktree"
+    );
+    assert!(git2::Repository::open(repository.path())
+        .unwrap()
+        .find_branch("retry-kept", git2::BranchType::Local)
+        .is_ok());
+}
+
+#[test]
+#[serial]
 fn dirty_purge_rollback_retires_the_request_after_reload_and_preserves_a_profile_move() {
     use crate::session::deletion::{execute_deletion, DeletionDisposition};
     use std::sync::mpsc;
@@ -180,7 +407,7 @@ fn dirty_purge_rollback_retires_the_request_after_reload_and_preserves_a_profile
 
 #[test]
 #[serial]
-fn late_purge_and_drop_results_cannot_retire_or_modify_a_successor_attempt() {
+fn late_purge_and_drop_results_cannot_retire_or_modify_a_successor_purge() {
     use super::super::{operations::perform_drop, DeleteWorker};
     use crate::session::deletion::{execute_deletion, DeletionRequest};
     use crate::tui::worker::TrackedWorker;
@@ -191,129 +418,109 @@ fn late_purge_and_drop_results_cannot_retire_or_modify_a_successor_attempt() {
         ("GIT_CONFIG_NOSYSTEM", "1"),
     ]);
     for predecessor in [DeleteWorker::Purge, DeleteWorker::Drop] {
-        for successor in [DeleteWorker::Purge, DeleteWorker::Drop] {
-            let (_temp, _home, mut view, id, _repository) = boot_view_with_dirty_worktree();
-            let storage = Storage::open_unwatched("test").unwrap();
-            let project = std::path::PathBuf::from(&view.instances[&id].project_path);
-            let (ready_tx, ready_rx) = mpsc::channel();
-            let (purge_tx, purge_rx) = mpsc::channel();
-            let (drop_tx, drop_rx) = mpsc::channel();
-            let purge_ready = ready_tx.clone();
-            let mut first_purge = true;
-            view.deletion_poller =
-                crate::tui::deletion_poller::DeletionPoller::with_handler_for_test(
-                    move |request| {
-                        let is_predecessor = first_purge && predecessor == DeleteWorker::Purge;
-                        first_purge = false;
-                        if !is_predecessor {
-                            purge_rx.recv_timeout(Duration::from_secs(5)).unwrap();
-                        }
-                        let result = execute_deletion(request);
-                        if is_predecessor {
-                            purge_ready.send(()).unwrap();
-                            purge_rx.recv_timeout(Duration::from_secs(5)).unwrap();
-                        }
-                        result
-                    },
-                );
-            let mut first_drop = true;
-            view.drop_poller = TrackedWorker::spawn("tagged-drop-test", move |request| {
-                let is_predecessor = first_drop && predecessor == DeleteWorker::Drop;
-                first_drop = false;
+        let (_temp, _home, mut view, id, _repository) = boot_view_with_dirty_worktree();
+        let storage = Storage::open_unwatched("test").unwrap();
+        let project = std::path::PathBuf::from(&view.instances[&id].project_path);
+        let (ready_tx, ready_rx) = mpsc::channel();
+        let (purge_tx, purge_rx) = mpsc::channel();
+        let (drop_tx, drop_rx) = mpsc::channel();
+        let purge_ready = ready_tx.clone();
+        let mut first_purge = true;
+        view.deletion_poller =
+            crate::tui::deletion_poller::DeletionPoller::with_handler_for_test(move |request| {
+                let is_predecessor = first_purge && predecessor == DeleteWorker::Purge;
+                first_purge = false;
                 if !is_predecessor {
-                    drop_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                    purge_rx.recv_timeout(Duration::from_secs(5)).unwrap();
                 }
-                let result = perform_drop(request);
+                let result = execute_deletion(request);
                 if is_predecessor {
-                    ready_tx.send(()).unwrap();
-                    drop_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                    purge_ready.send(()).unwrap();
+                    purge_rx.recv_timeout(Duration::from_secs(5)).unwrap();
                 }
                 result
             });
-            let queue = |view: &mut HomeView, worker| {
-                let requested = view.instances[&id].clone();
-                view.set_instance_status(&id, Status::Deleting);
-                if worker == DeleteWorker::Drop {
-                    view.force_remove_session(&id).unwrap();
-                } else {
-                    view.request_deletion(DeletionRequest {
-                        session_id: id.clone(),
-                        instance: requested,
-                        delete_worktree: true,
-                        delete_branch: false,
-                        delete_sandbox: false,
-                        force_delete: false,
-                        detach_hooks: true,
-                        keep_scratch: false,
-                    });
-                }
-            };
-            queue(&mut view, predecessor);
-            ready_rx.recv_timeout(Duration::from_secs(5)).unwrap();
-            let first_id = view.deletes_in_flight[&id].attempt_id;
-            view.reload_storage_only().unwrap();
-            queue(&mut view, successor);
-            let next = view.deletes_in_flight[&id].clone();
-            assert_ne!(next.attempt_id, first_id);
-            let durable_before = std::fs::read(storage.sessions_path()).unwrap();
-            if predecessor == DeleteWorker::Purge {
-                purge_tx.send(()).unwrap();
+        view.drop_poller = TrackedWorker::spawn("tagged-drop-test", move |request| {
+            let result = perform_drop(request);
+            ready_tx.send(()).unwrap();
+            drop_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            result
+        });
+        let queue = |view: &mut HomeView, worker| {
+            let requested = view.instances[&id].clone();
+            view.set_instance_status(&id, Status::Deleting);
+            if worker == DeleteWorker::Drop {
+                view.force_remove_session(&id).unwrap();
             } else {
-                drop_tx.send(()).unwrap();
+                view.request_deletion(DeletionRequest {
+                    session_id: id.clone(),
+                    instance: requested,
+                    delete_worktree: true,
+                    delete_branch: false,
+                    delete_sandbox: false,
+                    force_delete: false,
+                    detach_hooks: true,
+                    keep_scratch: false,
+                });
             }
-            let deadline = Instant::now() + Duration::from_secs(5);
-            loop {
-                let applied = if predecessor == DeleteWorker::Purge {
-                    view.apply_deletion_results()
-                } else {
-                    view.apply_drop_results()
-                };
-                if applied {
-                    break;
-                }
-                assert!(
-                    Instant::now() < deadline,
-                    "predecessor result was not delivered"
-                );
-                std::thread::yield_now();
-            }
-            assert_eq!(view.deletes_in_flight[&id].attempt_id, next.attempt_id);
-            assert!(view.deletes_in_flight[&id].worker == successor);
-            assert_eq!(view.instances[&id].status, Status::Deleting);
-            assert!(view.instances[&id].last_error.is_none());
-            assert!(view.info_dialog.is_none());
-            assert!(!view.failed_deletes.contains_key(&id));
-            assert_eq!(
-                std::fs::read(storage.sessions_path()).unwrap(),
-                durable_before
-            );
-            assert_eq!(
-                std::fs::read(project.join("protected")).unwrap(),
-                b"dirty worktree"
-            );
-            if successor == DeleteWorker::Purge {
-                purge_tx.send(()).unwrap();
-            } else {
-                drop_tx.send(()).unwrap();
-            }
-            let deadline = Instant::now() + Duration::from_secs(5);
-            while view.deletes_in_flight.contains_key(&id) {
-                if successor == DeleteWorker::Purge {
-                    view.apply_deletion_results();
-                } else {
-                    view.apply_drop_results();
-                }
-                assert!(
-                    Instant::now() < deadline,
-                    "successor result was not delivered"
-                );
-                std::thread::yield_now();
-            }
-            assert_eq!(
-                std::fs::read(project.join("protected")).unwrap(),
-                b"dirty worktree"
-            );
+        };
+        queue(&mut view, predecessor);
+        ready_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let first_id = view.deletes_in_flight[&id].attempt_id;
+        view.reload_storage_only().unwrap();
+        queue(&mut view, DeleteWorker::Purge);
+        let next = view.deletes_in_flight[&id].clone();
+        assert_ne!(next.attempt_id, first_id);
+        let durable_before = std::fs::read(storage.sessions_path()).unwrap();
+        if predecessor == DeleteWorker::Purge {
+            purge_tx.send(()).unwrap();
+        } else {
+            drop_tx.send(()).unwrap();
         }
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let applied = if predecessor == DeleteWorker::Purge {
+                view.apply_deletion_results()
+            } else {
+                view.apply_drop_results()
+            };
+            if applied {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "predecessor result was not delivered"
+            );
+            std::thread::yield_now();
+        }
+        assert_eq!(view.deletes_in_flight[&id].attempt_id, next.attempt_id);
+        assert!(view.deletes_in_flight[&id].worker == DeleteWorker::Purge);
+        assert_eq!(view.instances[&id].status, Status::Deleting);
+        assert!(view.instances[&id].last_error.is_none());
+        assert!(view.info_dialog.is_none());
+        assert!(!view.failed_deletes.contains_key(&id));
+        assert_eq!(
+            std::fs::read(storage.sessions_path()).unwrap(),
+            durable_before
+        );
+        assert_eq!(
+            std::fs::read(project.join("protected")).unwrap(),
+            b"dirty worktree"
+        );
+        purge_tx.send(()).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while view.deletes_in_flight.contains_key(&id) {
+            view.apply_deletion_results();
+            assert!(
+                Instant::now() < deadline,
+                "successor result was not delivered"
+            );
+            std::thread::yield_now();
+        }
+        assert_eq!(
+            std::fs::read(project.join("protected")).unwrap(),
+            b"dirty worktree"
+        );
     }
 }
 
@@ -754,7 +961,7 @@ fn stale_removed_purge_result_retires_its_ticket_without_erasing_a_durable_succe
 fn failed_terminal_checkpoint_survives_tui_result_application_and_save() {
     use crate::session::deletion::{DeletionRequest, PurgeReservation, PurgeTransaction};
 
-    for delivery in ["retained", "missing", "stale", "drop-ticket"] {
+    for delivery in ["retained", "missing", "stale", "force-after-result"] {
         let (temp, _guard, mut view, id) = boot_view_with_one_session("pending", "/tmp/pending");
         let storage = Storage::open_unwatched("test").unwrap();
         let workspace = crate::session::scratch::provision_scratch_dir(&id).unwrap();
@@ -849,18 +1056,39 @@ fn failed_terminal_checkpoint_survives_tui_result_application_and_save() {
         }
         std::fs::remove_dir(&journal).unwrap();
         std::fs::rename(saved_journal, &journal).unwrap();
-        if delivery == "drop-ticket" {
-            view.force_remove_session(&id).unwrap();
+        if delivery == "force-after-result" {
+            let before = std::fs::read(&journal).unwrap();
+            let error = view.force_remove_session(&id).unwrap_err();
+            assert!(error.to_string().contains("pending deletion"));
+            assert_eq!(view.deletes_in_flight[&id].attempt_id, attempt_id);
+            assert!(view.deletes_in_flight[&id].worker == super::super::DeleteWorker::Purge);
+            assert_eq!(view.next_delete_attempt_id, attempt_id);
+            assert!(!view.drop_poller.is_pending(&id));
+            assert_eq!(std::fs::read(&journal).unwrap(), before);
         }
         view.deletion_poller =
             crate::tui::deletion_poller::DeletionPoller::seeded_for_test(attempt_id, result);
 
         assert!(view.apply_deletion_results());
-        if delivery == "drop-ticket" {
-            assert!(matches!(
-                view.deletes_in_flight[&id].worker,
-                super::super::DeleteWorker::Drop,
+        if delivery == "force-after-result" {
+            assert!(!view.deletes_in_flight.contains_key(&id));
+            assert_eq!(view.instances[&id].status, Status::Deleting);
+            assert!(view.instances[&id].lifecycle_reservation_is_owned(
+                crate::session::LifecycleOperation::Purge,
+                generation,
             ));
+            assert!(view.info_dialog.is_some());
+            assert!(view.instances[&id].last_error.is_some());
+            let retained = storage.load().unwrap().remove(0);
+            assert_eq!(retained.status, Status::Deleting);
+            assert!(retained.lifecycle_reservation_is_owned(
+                crate::session::LifecycleOperation::Purge,
+                generation,
+            ));
+            assert!(journal.is_file());
+            view.force_remove_session(&id).unwrap();
+            assert!(view.deletes_in_flight[&id].attempt_id > attempt_id);
+            assert!(view.deletes_in_flight[&id].worker == super::super::DeleteWorker::Drop);
             assert!(!view.failed_deletes.contains_key(&id));
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
             while !view.apply_drop_results() {
@@ -872,6 +1100,16 @@ fn failed_terminal_checkpoint_survives_tui_result_application_and_save() {
             }
             assert!(!view.instances.contains_key(&id));
             assert!(!view.deletes_in_flight.contains_key(&id));
+            let abandoned = crate::session::lifecycle_journal::read_deletion(&journal)
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                abandoned.phase,
+                crate::session::lifecycle_journal::LifecyclePhase::Abandoned
+            );
+            assert_eq!(abandoned.generation, generation);
+            crate::session::deletion::recover_lifecycle_journals_once().unwrap();
+            assert!(!journal.exists());
             continue;
         }
         if delivery == "stale" {

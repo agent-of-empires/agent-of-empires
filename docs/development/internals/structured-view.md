@@ -50,6 +50,8 @@ may abandon only an expired, owner-free pre-teardown purge with matching durable
 TUI Purge and Drop requests carry immutable, local attempt identities separate from durable
 lifecycle generations. Only a matching worker/attempt retires its ticket, even when a reload
 or profile move makes the payload obsolete; a predecessor cannot mutate a successor attempt.
+Force Remove cannot replace an outstanding local deletion; owner-free stuck rows without
+a local attempt still use the backend's ownership and generation guards.
 
 Runner admission preserves an existing owner. Signals require incarnation-bound ownership;
 unknown ownership or unreadable membership preserves evidence and resources. A pending

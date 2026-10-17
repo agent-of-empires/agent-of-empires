@@ -932,6 +932,10 @@ impl HomeView {
 
     /// Queue a guarded row removal without worktree, branch or scratch cleanup.
     pub(super) fn force_remove_session(&mut self, session_id: &str) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            !self.deletes_in_flight.contains_key(session_id),
+            "This session already has a pending deletion. Wait for it to finish."
+        );
         let Some(instance) = self.instances.get(session_id).cloned() else {
             return Ok(());
         };
