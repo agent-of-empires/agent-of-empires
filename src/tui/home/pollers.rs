@@ -318,7 +318,7 @@ impl HomeView {
     }
 
     pub fn repair_session_id_pollers(&mut self) {
-        let live = crate::tmux::LiveSessionSnapshot::new();
+        let live = crate::tmux::LiveSessionSnapshot::from_display_caches();
         for instance in self.instances.values_mut() {
             instance.repair_session_id_poller_if_needed(&live);
         }

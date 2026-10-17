@@ -288,12 +288,15 @@ static PANE_META_REFRESH_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::A
 static PANE_META_CACHE: RwLock<PaneMetaCache> = RwLock::new(PaneMetaCache {
     data: None,
     time: None,
+    published: None,
     refresh_id: 0,
 });
 
 struct PaneMetaCache {
     data: Option<std::sync::Arc<HashMap<String, PaneMetadata>>>,
     time: Option<Instant>,
+    /// When the snapshot landed; `time` predates the fork.
+    published: Option<Instant>,
     refresh_id: u64,
 }
 pub(crate) const TMUX_COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
@@ -736,12 +739,47 @@ pub(crate) type MarkedSessionName = (String, Option<SessionKind>);
 #[derive(Default)]
 pub(crate) struct LiveSessionSnapshot {
     sessions: OnceLock<Option<Vec<MarkedSessionName>>>,
-    panes: OnceLock<Option<HashMap<String, PaneMetadata>>>,
+    panes: OnceLock<Option<std::sync::Arc<HashMap<String, PaneMetadata>>>>,
 }
+
+/// Whether the last display snapshot was stale, so a skip logs once per outage.
+static STALE_LOGGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 impl LiveSessionSnapshot {
     pub(crate) fn new() -> Self {
         Self::default()
+    }
+
+    /// Never forks tmux; caches older than `DISPLAY_SNAPSHOT_MAX_AGE` read as unreachable.
+    pub(crate) fn from_display_caches() -> Self {
+        let fresh =
+            |time: Option<Instant>| time.is_some_and(|at| at.elapsed() <= DISPLAY_SNAPSHOT_MAX_AGE);
+        let panes = PANE_META_CACHE
+            .read()
+            .ok()
+            .filter(|cache| fresh(cache.published))
+            .and_then(|cache| cache.data.clone());
+        let was_stale = STALE_LOGGED.swap(panes.is_none(), std::sync::atomic::Ordering::Relaxed);
+        if panes.is_none() && !was_stale {
+            tracing::debug!(target: "tmux.cache", "display caches stale; skipping snapshot consumers");
+        }
+        let sessions = SESSION_CACHE
+            .read()
+            .ok()
+            .filter(|cache| fresh(cache.time) && cache.outcome == SessionCacheRefresh::Populated)
+            .and_then(|cache| {
+                cache.data.as_ref().map(|sessions| {
+                    sessions
+                        .iter()
+                        .map(|(name, session)| (name.clone(), session.kind))
+                        .collect()
+                })
+            })
+            .filter(|_| panes.is_some());
+        let snapshot = Self::new();
+        let _ = snapshot.sessions.set(sessions);
+        let _ = snapshot.panes.set(panes);
+        snapshot
     }
 
     #[cfg(test)]
@@ -762,7 +800,7 @@ impl LiveSessionSnapshot {
     ) -> Self {
         let snapshot = Self::new();
         let _ = snapshot.sessions.set(names);
-        let _ = snapshot.panes.set(panes);
+        let _ = snapshot.panes.set(panes.map(std::sync::Arc::new));
         snapshot
     }
 
@@ -792,7 +830,7 @@ impl LiveSessionSnapshot {
     /// From the batched metadata; an absent entry reads as alive.
     pub(crate) fn pane_dead(&self, name: &str) -> bool {
         self.panes
-            .get_or_init(|| batch_pane_metadata().ok())
+            .get_or_init(|| batch_pane_metadata().ok().map(std::sync::Arc::new))
             .as_ref()
             .and_then(|panes| panes.get(name))
             .map(|meta| meta.pane_dead)
@@ -1445,6 +1483,7 @@ impl Drop for SessionCacheGuard {
 pub(crate) struct PaneMetaCacheGuard {
     prev_data: Option<std::sync::Arc<HashMap<String, PaneMetadata>>>,
     prev_time: Option<Instant>,
+    prev_published: Option<Instant>,
     prev_refresh_id: u64,
 }
 
@@ -1455,6 +1494,7 @@ impl PaneMetaCacheGuard {
         Self {
             prev_data: cache.data.clone(),
             prev_time: cache.time,
+            prev_published: cache.published,
             prev_refresh_id: cache.refresh_id,
         }
     }
@@ -1463,11 +1503,14 @@ impl PaneMetaCacheGuard {
         if let Ok(mut cache) = PANE_META_CACHE.write() {
             cache.data = None;
             cache.time = Some(Instant::now());
+            cache.published = cache.time;
         }
     }
     pub(crate) fn force_stale(&self) {
         if let Ok(mut cache) = PANE_META_CACHE.write() {
-            cache.time = Some(Instant::now() - CACHE_TTL - Duration::from_secs(1));
+            let stale = Instant::now() - CACHE_TTL - Duration::from_secs(1);
+            cache.time = Some(stale);
+            cache.published = Some(stale);
         }
     }
 }
@@ -1477,6 +1520,7 @@ impl Drop for PaneMetaCacheGuard {
         if let Ok(mut cache) = PANE_META_CACHE.write() {
             cache.data = self.prev_data.take();
             cache.time = self.prev_time;
+            cache.published = self.prev_published;
             cache.refresh_id = self.prev_refresh_id;
         }
     }
@@ -1584,6 +1628,9 @@ impl Drop for AgentAvailabilityGuard {
 
 /// How long a [`SESSION_CACHE`] snapshot is trusted.
 const CACHE_TTL: Duration = Duration::from_secs(2);
+
+/// Bound on the latest completed display refresh; only guards a dead refresh thread.
+const DISPLAY_SNAPSHOT_MAX_AGE: Duration = Duration::from_secs(30);
 
 pub fn session_exists_from_cache(name: &str) -> Option<bool> {
     let cache = SESSION_CACHE.read().ok()?;
@@ -1710,6 +1757,7 @@ fn publish_pane_meta_cache(
     }
     cache.data = data;
     cache.time = Some(taken_at);
+    cache.published = Some(Instant::now());
     cache.refresh_id = refresh_id;
     true
 }
@@ -3910,6 +3958,69 @@ mod tests {
             }
         }
     }
+    #[test]
+    #[serial_test::serial]
+    fn display_cache_snapshot_answers_from_fresh_caches_only() {
+        let sessions = SessionCacheGuard::capture();
+        let panes = PaneMetaCacheGuard::capture();
+        let name = format!("{P}Agent_{ID8}");
+        sessions.force_present(&[name.as_str()]);
+        let _ = fork_probe::take();
+        let probe = fork_probe::arm();
+
+        // A list-panes fork slower than CACHE_TTL still publishes a usable snapshot.
+        // Slow scans leave each cache older than CACHE_TTL when the other lands.
+        for (label, taken_ago, published_ago) in [
+            ("fast", Duration::ZERO, Duration::ZERO),
+            ("slow fork", CACHE_TTL * 2, Duration::ZERO),
+            (
+                "both published past CACHE_TTL",
+                CACHE_TTL * 2,
+                CACHE_TTL * 2,
+            ),
+        ] {
+            sessions.force_stale();
+            let mut cache = PANE_META_CACHE.write().expect("pane meta cache lock");
+            cache.data = Some(std::sync::Arc::new(HashMap::from([(
+                name.clone(),
+                PaneMetadata {
+                    pane_dead: true,
+                    pane_current_command: None,
+                    pane_start_command_is_protected: false,
+                    pane_pid: None,
+                    pane_title: None,
+                    window_activity: None,
+                    window_size: None,
+                },
+            )])));
+            cache.time = Some(Instant::now() - taken_ago);
+            cache.published = Some(Instant::now() - published_ago);
+            drop(cache);
+
+            let snapshot = LiveSessionSnapshot::from_display_caches();
+            assert_eq!(
+                snapshot.names().unwrap().collect::<Vec<_>>(),
+                vec![name.as_str()],
+                "{label}"
+            );
+            assert!(snapshot.pane_dead(&name), "{label}");
+        }
+
+        panes.force_stale();
+        PANE_META_CACHE
+            .write()
+            .expect("pane meta cache lock")
+            .published = Some(Instant::now() - DISPLAY_SNAPSHOT_MAX_AGE - Duration::from_secs(1));
+        assert!(
+            LiveSessionSnapshot::from_display_caches()
+                .sessions()
+                .is_none(),
+            "a pane cache past the max age must skip the cycle, not fork tmux"
+        );
+        drop(probe);
+        assert_eq!(fork_probe::take(), 0, "display snapshots must never fork");
+    }
+
     #[test]
     #[serial_test::serial]
     fn a_failed_pane_snapshot_is_an_answer_so_rows_do_not_re_fork() {

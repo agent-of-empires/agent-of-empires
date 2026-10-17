@@ -301,6 +301,10 @@ fn repair_session_id_pollers_skips_structured_and_repairs_live_terminal() {
         .unwrap()
         .session_id_poller = Some(structured_stopped.clone());
     let _tmux = TmuxSession::create(&terminal.id, &terminal.title);
+    let _session_cache = crate::tmux::SessionCacheGuard::capture_restore_only();
+    let _pane_cache = crate::tmux::PaneMetaCacheGuard::capture();
+    crate::tmux::refresh_session_cache();
+    crate::tmux::refresh_pane_meta_cache().expect("pane metadata refresh");
 
     assert!(!view.apply_session_id_updates());
     assert!(
