@@ -469,7 +469,7 @@ impl Rule {
             // Newline-joined so `line_regex` still sees individual lines.
             let window = lines[start..=idx].join("\n");
             let lower = window.to_lowercase();
-            let position = lines.len() - idx;
+            let position = lines.len() - idx + screen.region_bottom_offset(self.region);
             (self.max_position.is_none_or(|max| position <= max)
                 && self.matcher.matches(&window, &lower, &ctx))
             .then_some(position)

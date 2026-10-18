@@ -1579,23 +1579,30 @@ async fn capture_session(profile: &str, args: CaptureArgs) -> Result<()> {
             }
         });
         let status = if crate::tmux::detect::has_manifest(manifest_tool) {
-            let status_raw;
-            let status_content = if args.lines >= 50 {
-                raw.as_str()
-            } else {
-                status_raw = tmux_session
-                    .capture_pane(50)
-                    .unwrap_or_else(|_| raw.clone());
-                status_raw.as_str()
-            };
+            let builtin_omp = manifest_tool == "omp"
+                && !crate::tmux::status_rules::has_rules(profile, &rules_tool);
+            let status_raw =
+                if (builtin_omp && args.lines == 0) || (!builtin_omp && args.lines >= 50) {
+                    None
+                } else {
+                    tmux_session
+                        .capture_pane(if builtin_omp { 0 } else { 50 })
+                        .ok()
+                };
+            let status_content = status_raw.as_deref().unwrap_or(&raw);
             let osc_title = crate::tmux::utils::pane_title(tmux_session.name()).unwrap_or_default();
+            let observation = crate::tmux::Observation::new(
+                &osc_title,
+                hook,
+                !builtin_omp
+                    || inst.allow_live_omp_cues(&tmux_session, None, tmux_session.is_pane_dead()),
+            );
             crate::tmux::detect_with_rules(
                 profile,
                 &rules_tool,
                 manifest_tool,
                 &crate::tmux::utils::strip_ansi(status_content),
-                &osc_title,
-                hook,
+                &observation,
             )
             .and_then(|d| d.status)
             .unwrap_or_default()
