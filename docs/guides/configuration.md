@@ -218,9 +218,11 @@ Each rule sets `status` (`running`, `waiting`, `idle`, `error`) and exactly one 
 
 ### OMP terminal status
 
-Built-in OMP detection reads the visible pane and locates activity, blocking dialogs,
-and pinned errors relative to the current composer. Extension status rows, including
-plugin badges, do not need agent-specific matching rules.
+Built-in OMP detection reads the visible pane and locates activity, pinned errors,
+and blocking dialogs relative to the current composer. Question dialogs remain
+waiting when paging hides the selected option; session pickers accept bracketed
+key legends. Extension status rows, including plugin badges, do not need
+agent-specific matching rules.
 Editable composer text is excluded from dialog controls, even without status segments.
 
 A recognized working terminal title supplements visible controls; it does not
@@ -228,11 +230,12 @@ override a blocking dialog or pinned error. Visible retry and compaction control
 can indicate activity even when the turn timer is stopped. Disabling OMP title
 updates or terminal program-status reports does not disable visible-control detection.
 
-Custom editors or widgets can hide or replace these controls. Compact working rows
-without a recognizable turn timer or working title can look identical to passive
-widget text; an ambiguous row does not supply a positive working cue. Use the
-explicit status rules above for such interfaces; they remain authoritative,
-including their no-match behavior.
+Untimed interrupt hints must start in the native two-space key column; alignment
+padding alone does not supply activity evidence.
+Custom editors or widgets can hide or replace these controls. Without a recognizable
+turn timer or working title, passive text that exactly reproduces a loader row
+remains indistinguishable from that control. Use the explicit status rules above
+for such interfaces; they remain authoritative, including their no-match behavior.
 
 ### Running a custom agent in the structured view
 

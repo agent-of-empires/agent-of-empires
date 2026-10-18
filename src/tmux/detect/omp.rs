@@ -385,14 +385,21 @@ fn dialog_footer(lines: &[&str], composer: Composer) -> Option<usize> {
             return false;
         }
         let body = rail_body(lines[i]);
+        let body = body
+            .strip_prefix('[')
+            .and_then(|inner| inner.strip_suffix(']'))
+            .map(str::trim)
+            .unwrap_or(body);
         let keyed = key_led(body);
         let approval_action = approval
             && ((body.contains("approve") && body.contains("deny"))
                 || (has_selection && body.contains("deny and send")));
+        let separate_footer = i > composer.start && i + 1 == composer.end && divider(lines[i - 1]);
         let action = body.contains("submit")
+            || ((has_selection || separate_footer)
+                && (body.contains("select") || body.contains("toggle")))
             || (has_selection
-                && (body.contains("select")
-                    || body.contains("confirm")
+                && (body.contains("confirm")
                     || body.contains("open")
                     || body.contains("scroll")
                     || body.contains("navigate")));
@@ -578,8 +585,11 @@ impl<'a> Surface<'a> {
                 let explicit_maintenance = maintenance(text);
                 let regular = !explicit_maintenance
                     && !parked
-                    // The interrupt frame adds a column; compact rows need a live timer.
-                    && (text.starts_with("  ") || timed)
+                    // The interrupt frame and padding each add one column.
+                    && (text
+                        .strip_prefix("  ")
+                        .is_some_and(|key| !key.starts_with(char::is_whitespace))
+                        || timed)
                     && key_message(text).is_some_and(|message| {
                         let mut words = message.split_whitespace();
                         let first = words.next();

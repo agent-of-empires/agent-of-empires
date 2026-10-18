@@ -3601,6 +3601,8 @@ Final prose line.\n";
                     Status::Running,
                 ),
                 (" ", "", "Any activity label", Status::Idle),
+                ("   ", "", "Any activity label", Status::Idle),
+                ("  \t", "", "Any activity label", Status::Idle),
                 ("  ", "", "to retry", Status::Idle),
             ] {
                 let pane = format!(
@@ -3713,6 +3715,30 @@ Final prose line.\n";
     }
 
     #[test]
+    fn omp_right_aligned_idle_title_hud_is_not_activity() {
+        for name in ["Daily notes", "I am done.", "Enter the meeting notes"] {
+            for width in [80, 120] {
+                let pane = format!(
+                    "\n{name:>width$}\n ⬢ Local ▶──────7%────────32K─\n╰─\n{}",
+                    "PLUGIN\n".repeat(12)
+                );
+                for title in ["", &format!("π: {name}")] {
+                    assert_eq!(
+                        observed_omp(&pane, title, true),
+                        Status::Idle,
+                        "{pane}: {title}"
+                    );
+                }
+                assert_eq!(
+                    observed_omp(&pane, "π ⠋ Task", true),
+                    Status::Running,
+                    "{pane}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn omp_box_drafts_cannot_supply_modal_controls() {
         for composer in [
             "╭────────────────────╮\n│ Normal draft       │\n│ Enter submit · Esc cancel │\n╰─ Other draft      ─╯",
@@ -3786,6 +3812,128 @@ Final prose line.\n";
         }
         let clipped = format!("│ continued input │\n│ Ctrl+Q/Ctrl+Enter submit  Esc cancel │\n│                 │\n╰─────────────────╯\n{}", "PLUGIN\n".repeat(12));
         assert_eq!(observed_omp(&clipped, "π ⠋ Task", true), Status::Waiting);
+    }
+
+    #[test]
+    fn omp_checkbox_questions_preserve_waiting_without_scroll_hints() {
+        for (ascii, cursor, controls) in [
+            (true, ">", "Space toggle · Enter next · Up/Down move · Tab/Left/Right question · Esc cancel · Alt+H hide"),
+            (false, "❯", "␣ toggle · ⏎ next · ↑/↓ move · ⇥/←/→ question · ⎋ cancel · Alt+H hide"),
+            (false, "\u{f054}", "\u{f1050} toggle · \u{f0311} next · ↑/↓ move · \u{f0312}/←/→ question · \u{f12b7} cancel"),
+        ] {
+            let (top, side, bottom) = if ascii {
+                ("+- Ask ------------------+", "|", "+------------------------+")
+            } else {
+                ("╭─ Ask ──────────────────╮", "│", "╰────────────────────────╯")
+            };
+            let pane = format!(
+                "{top}\n{side} first · second · Submit {side}\n{side} {cursor} [ ] Alpha {side}\n{side}   [ ] Beta {side}\n{side} {controls} {side}\n{bottom}\n{}",
+                "PLUGIN\n".repeat(12)
+            );
+            for title in ["", "π ⠋ Task"] {
+                assert_eq!(observed_omp(&pane, title, true), Status::Waiting, "{pane}: {title}");
+            }
+        }
+
+        for pane in [
+            "╭─ Ask ──────────────────╮\n│ [ ] Alpha │\n│ Space toggle · Enter next · Esc cancel │\n╰────────────────────────╯",
+            "╭────────────────────────╮\n│ > [ ] Alpha │\n│ Space toggle · Enter next · Esc cancel │\n╰─ Draft text ────────────╯",
+        ] {
+            for (title, expected) in [("", Status::Idle), ("π ⠋ Task", Status::Running)] {
+                assert_eq!(observed_omp(pane, title, true), expected, "{pane}: {title}");
+            }
+        }
+    }
+
+    #[test]
+    fn omp_paged_questions_wait_without_a_visible_selection() {
+        for (top, side, separator, bottom, controls) in [
+            (
+                "+- Ask --------+",
+                "|",
+                "+--------------+",
+                "+--------------+",
+                "Enter select · n note · Up/Down · Esc cancel · PgUp/PgDn ↕",
+            ),
+            (
+                "+- Ask --------+",
+                "|",
+                "+--------------+",
+                "+--------------+",
+                "Space toggle · Enter next · Tab/Left/Right question · Esc cancel",
+            ),
+            (
+                "╭─ Ask ────────╮",
+                "│",
+                "├──────────────┤",
+                "╰──────────────╯",
+                "⏎ select · n note · ↑/↓ · ⎋ cancel",
+            ),
+            (
+                "╭─ Ask (9s) ───╮",
+                "│",
+                "├──────────────┤",
+                "╰──────────────╯",
+                "\u{f1050} toggle · \u{f0311} next · \u{f0312}/←/→ question · \u{f12b7} cancel",
+            ),
+            (
+                "╭─ Ask ────────╮",
+                "│",
+                "├──────────────┤",
+                "╰──────────────╯",
+                "Ctrl+T toggle · Ctrl+J next · k/j question · Ctrl+C cancel",
+            ),
+        ] {
+            for clipped in [false, true] {
+                let header = if clipped {
+                    String::new()
+                } else {
+                    format!("{top}\n")
+                };
+                let pane = format!("{header}{side} preview line 20 {side}\n{side} preview line 21 {side}\n{separator}\n{side} {controls} {side}\n{bottom}\n{}", "PLUGIN\n".repeat(12));
+                for title in ["", "π ⠋ Task"] {
+                    assert_eq!(
+                        observed_omp(&pane, title, true),
+                        Status::Waiting,
+                        "{pane}: {title}"
+                    );
+                }
+            }
+        }
+        for pane in [
+            "╭─ Ask ────────╮\n│ preview │\n├──────────────┤\n│ Enter select │\n╰──────────────╯",
+            "╭──────────────╮\n│ preview │\n│ ├──────────┤ │\n│ Enter select · Esc cancel │\n╰──────────────╯",
+        ] {
+            assert_eq!(observed_omp(pane, "", true), Status::Idle, "{pane}");
+        }
+    }
+
+    #[test]
+    fn omp_session_picker_accepts_bracketed_controls() {
+        for controls in [
+            "Delete/Backspace delete · Enter select · Tab all projects · Esc cancel",
+            "⏎ select · ⇥ current folder · ⎋ cancel",
+            "\u{f0311} select · \u{f0312} all projects · \u{f12b7} cancel",
+            "Ctrl+[ select · Ctrl+C cancel",
+        ] {
+            let pane = format!("╭─ Resume Session ───╮\n│ > Saved task │\n│ just now · 1kB │\n│ [{controls}] │\n╰────────────────────╯\n{}", "PLUGIN\n".repeat(12));
+            for title in ["", "π ⠋ Task"] {
+                assert_eq!(
+                    observed_omp(&pane, title, true),
+                    Status::Waiting,
+                    "{pane}: {title}"
+                );
+            }
+        }
+        for controls in [
+            "[Delete/Backspace delete · Enter select · Esc cancel",
+            "[[Delete/Backspace delete · Enter select · Esc cancel]]",
+        ] {
+            let pane = format!(
+                "╭─ Resume Session ───╮\n│ > Saved task │\n│ {controls} │\n╰────────────────────╯"
+            );
+            assert_eq!(observed_omp(&pane, "", true), Status::Idle, "{pane}");
+        }
     }
 
     #[test]
