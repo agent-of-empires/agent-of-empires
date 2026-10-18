@@ -2175,11 +2175,9 @@ mod tests {
             let _ = session.kill();
 
             let err = result.expect_err(label);
-            // The recovery names the profile unless it is the default one (the first label's is).
             let mut expected =
                 crate::session::test_support::login_required_under("claude", temp.path());
-            expected.profile =
-                (profile != crate::session::config::effective_profile("")).then(|| profile.clone());
+            expected.profile = Some(profile.clone());
             assert_eq!(
                 err.downcast_ref::<SandboxLoginRequired>(),
                 Some(&expected),

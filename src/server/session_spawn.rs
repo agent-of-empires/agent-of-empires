@@ -1120,13 +1120,16 @@ fn report_failed_auto_spawn(
         tracing::warn!(target: "acp.supervisor", session = %id,
             "auto-spawn after create held: {blocked}");
         service.sandbox_login.hold(id, origin, blocked);
-    } else {
-        tracing::warn!(target: "acp.supervisor", session = %id,
-            "auto-spawn after create failed: {error}");
+        service.acp_supervisor.publish_login_required(id, blocked);
+        return;
     }
-    service
-        .acp_supervisor
-        .publish_startup_error(id, error.to_string());
+    tracing::warn!(target: "acp.supervisor", session = %id,
+        "auto-spawn after create failed: {error}");
+    service.acp_supervisor.publish_startup_error_with_cause(
+        id,
+        error.to_string(),
+        crate::session::SandboxLoginUnsupported::cause_of(error),
+    );
 }
 
 /// The sandbox login admission of the auto-spawn after a create, on the row the create

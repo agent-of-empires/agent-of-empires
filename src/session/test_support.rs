@@ -564,7 +564,7 @@ pub(crate) fn login_required_under(
         tool: tool.to_string(),
         credential: home.join(".claude/sandbox-v2/.credentials.json"),
         command: None,
-        profile: None,
+        profile: Some(crate::session::config::effective_profile("")),
     }
 }
 

@@ -495,6 +495,10 @@ pub(super) const CITYHALL_MUTATION_DENY: &[(&str, &str)] = &[
     ("DELETE", "/api/profiles/{name}"),
     ("PATCH", "/api/profiles/{name}/rename"),
     ("PATCH", "/api/default-profile"),
+    // The sandbox login runs a helper container on the host.
+    ("POST", "/api/sandbox/login"),
+    ("DELETE", "/api/sandbox/login/{login_id}"),
+    ("POST", "/api/sandbox/login/{login_id}/code"),
     // MCP mutations.
     ("POST", "/mcp"),
     ("PUT", "/mcp"),
