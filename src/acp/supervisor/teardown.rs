@@ -18,7 +18,7 @@ use crate::process::worker_registry;
 const TEARDOWN_TERM_GRACE: Duration = Duration::from_secs(2);
 const TEARDOWN_KILL_GRACE: Duration = Duration::from_millis(500);
 const TEARDOWN_POLL: Duration = Duration::from_millis(50);
-/// Retries after which a dead runner whose record cannot be settled is released anyway.
+/// Retries after which a dead runner's registry ownership is rechecked before release.
 const TEARDOWN_RETRY_CAP: u32 = 30;
 /// A teardown claimed this long without settling lost its driver; the retry pass takes over.
 const TEARDOWN_ORPHAN_GRACE: Duration = Duration::from_secs(15);
@@ -50,11 +50,36 @@ impl<S: BroadcastSink> Supervisor<S> {
         session_id: &str,
         deadline: Duration,
     ) -> Result<(), SupervisorError> {
+        self.shutdown_and_wait_with_mode(session_id, deadline, false)
+            .await
+    }
+
+    /// Stop a worker permanently, then wait until its teardown and ownership record are settled.
+    pub async fn shutdown_and_delete_and_wait(
+        &self,
+        session_id: &str,
+        deadline: Duration,
+    ) -> Result<(), SupervisorError> {
+        self.shutdown_and_wait_with_mode(session_id, deadline, true)
+            .await
+    }
+
+    async fn shutdown_and_wait_with_mode(
+        &self,
+        session_id: &str,
+        deadline: Duration,
+        delete_adapter_state: bool,
+    ) -> Result<(), SupervisorError> {
         let pid_before = worker_registry::pid_source_for(session_id);
         let start = Instant::now();
-        match self.shutdown(session_id).await {
+        let shutdown = if delete_adapter_state {
+            self.shutdown_and_delete(session_id).await
+        } else {
+            self.shutdown(session_id).await
+        };
+        match shutdown {
             Ok(()) => {}
-            Err(SupervisorError::UnknownSession(_)) => return Ok(()),
+            Err(SupervisorError::UnknownSession(_)) => {}
             Err(e) => return Err(e),
         }
         loop {
@@ -73,11 +98,37 @@ impl<S: BroadcastSink> Supervisor<S> {
             }
             let _ = tokio::time::timeout(remaining, notified).await;
         }
+        if self.worker_state(session_id).await != AcpWorkerState::Absent {
+            return Err(SupervisorError::TeardownPending(session_id.into()));
+        }
+        if worker_registry::load(session_id)
+            .map_err(|error| {
+                SupervisorError::Acp(crate::acp::acp_client::AcpError::Spawn(format!(
+                    "worker ownership could not be confirmed after shutdown: {error}"
+                )))
+            })?
+            .is_some()
+        {
+            return Err(SupervisorError::TeardownPending(session_id.into()));
+        }
         #[cfg(unix)]
         if let Some(pid) = pid_before {
             let start = Instant::now();
             while start.elapsed() < deadline && worker_registry::is_pid_alive(pid) {
                 tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            if worker_registry::is_pid_alive(pid) {
+                return Err(SupervisorError::TeardownPending(session_id.into()));
+            }
+            if worker_registry::load(session_id)
+                .map_err(|error| {
+                    SupervisorError::Acp(crate::acp::acp_client::AcpError::Spawn(format!(
+                        "worker ownership could not be confirmed after shutdown: {error}"
+                    )))
+                })?
+                .is_some()
+            {
+                return Err(SupervisorError::TeardownPending(session_id.into()));
             }
         }
         #[cfg(not(unix))]
@@ -246,11 +297,20 @@ impl<S: BroadcastSink> Supervisor<S> {
                 Ok(None) => false,
                 Err(_) => true,
             };
+            let registry_reconciled =
+                claim
+                    .identity
+                    .is_some_and(|identity| match worker_registry::load(&id) {
+                        Ok(None) => true,
+                        Ok(Some(record)) => identity.disowns_record(&record),
+                        Err(_) => false,
+                    });
             if !native_unproven
                 && claim.attempts > TEARDOWN_RETRY_CAP
                 && claim
                     .identity
                     .is_some_and(|identity| !self.process_control.is_alive(identity))
+                && registry_reconciled
             {
                 warn!(
                     target: "acp.supervisor",
@@ -962,13 +1022,18 @@ mod tests {
             sup.test_insert_worker(session_id).await;
             let shutdown = sup.shutdown_and_wait(session_id, Duration::from_secs(2));
             tokio::pin!(shutdown);
-            assert!(
-                matches!(
-                    futures_util::poll!(&mut shutdown),
-                    std::task::Poll::Ready(Ok(()))
-                ),
-                "{session_id}: without a PID source shutdown must not enter a poll wait"
-            );
+            let result = futures_util::poll!(&mut shutdown);
+            if unreadable_record {
+                assert!(
+                    matches!(result, std::task::Poll::Ready(Err(SupervisorError::Acp(_)))),
+                    "unreadable ownership cannot prove settlement"
+                );
+            } else {
+                assert!(
+                    matches!(result, std::task::Poll::Ready(Ok(()))),
+                    "without a PID source shutdown must not enter a poll wait"
+                );
+            }
         }
     }
 
@@ -1029,9 +1094,11 @@ mod tests {
             listener
         });
 
-        sup.shutdown_and_wait(session_id, Duration::from_millis(300))
-            .await
-            .unwrap();
+        assert!(matches!(
+            sup.shutdown_and_wait(session_id, Duration::from_millis(300))
+                .await,
+            Err(SupervisorError::TeardownPending(_))
+        ));
         let listener = tokio::time::timeout(Duration::from_secs(1), replacement)
             .await
             .expect("replacement must publish during shutdown wait")
@@ -1600,7 +1667,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     #[serial_test::serial]
-    async fn a_lost_teardown_driver_requires_the_registry_runner_to_be_dead_past_the_retry_cap() {
+    async fn a_lost_teardown_driver_retains_unknown_registry_ownership_past_the_retry_cap() {
         let _home = isolate_home();
         let control = Arc::new(FakeProcessControl::default());
         control.immortal(5758);
@@ -1624,8 +1691,9 @@ mod tests {
         sup.retry_pending_teardowns().await;
         assert_eq!(
             sup.worker_state("s-no-identity").await,
-            AcpWorkerState::Absent
+            AcpWorkerState::Stopping,
+            "an unattested registry record cannot be retired after a PID-only death observation"
         );
-        assert!(worker_registry::load("s-no-identity").unwrap().is_none());
+        assert!(worker_registry::load("s-no-identity").unwrap().is_some());
     }
 }

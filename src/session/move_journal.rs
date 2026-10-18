@@ -160,6 +160,71 @@ pub(crate) fn scan(sessions_paths: impl IntoIterator<Item = PathBuf>) -> ScanRes
     result
 }
 
+pub(crate) fn retarget_profile_references(
+    sessions_paths: impl IntoIterator<Item = PathBuf>,
+    old_profile: &str,
+    new_profile: &str,
+    target_profile: &str,
+) -> Result<()> {
+    let old_sessions = super::get_profile_dir_path(old_profile)?.join("sessions.json");
+    let new_sessions = super::get_profile_dir_path(new_profile)?.join("sessions.json");
+    let target_sessions = if target_profile == old_profile {
+        &old_sessions
+    } else {
+        anyhow::ensure!(
+            target_profile == new_profile,
+            "invalid profile rename target"
+        );
+        &new_sessions
+    };
+    let scan = scan(sessions_paths);
+    anyhow::ensure!(
+        scan.unreadable_dirs.is_empty(),
+        "profile move journals cannot be enumerated"
+    );
+    for (path, parsed) in scan.entries {
+        let mut entry = parsed.map_err(anyhow::Error::msg)?;
+        let source_named =
+            entry.source_profile == old_profile || entry.source_profile == new_profile;
+        let source_path = entry.source_sessions_path == old_sessions
+            || entry.source_sessions_path == new_sessions;
+        let target_named =
+            entry.target_profile == old_profile || entry.target_profile == new_profile;
+        let target_path = entry.target_sessions_path == old_sessions
+            || entry.target_sessions_path == new_sessions;
+        anyhow::ensure!(
+            source_named == source_path,
+            "move journal source profile/path mismatch"
+        );
+        anyhow::ensure!(
+            target_named == target_path,
+            "move journal target profile/path mismatch"
+        );
+
+        let mut changed = false;
+        if source_named {
+            changed |= entry.source_profile != target_profile
+                || entry.source_sessions_path != *target_sessions;
+            entry.source_profile = target_profile.to_owned();
+            entry.source_sessions_path = target_sessions.clone();
+        }
+        if target_named {
+            changed |= entry.target_profile != target_profile
+                || entry.target_sessions_path != *target_sessions;
+            entry.target_profile = target_profile.to_owned();
+            entry.target_sessions_path = target_sessions.clone();
+        }
+        if changed {
+            let bytes = serde_json::to_vec_pretty(&entry)?;
+            atomic_write_verified(&path, &bytes)
+                .with_context(|| format!("failed to update move journal {}", path.display()))?;
+            sync_parent_directory(&path)
+                .with_context(|| format!("move journal {} was not made durable", path.display()))?;
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -262,6 +327,45 @@ mod tests {
         assert_eq!(result.entries.len(), 1);
         assert_eq!(result.entries[0].0, path);
         assert_eq!(result.entries[0].1.as_ref().unwrap().ids, ["session-id"]);
+        Ok(())
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn profile_retarget_keeps_move_journal_path_and_record_shape() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let _home = crate::session::test_support::isolate_app_dir_at(temp.path());
+        let source = super::super::get_profile_dir_path("source")?.join("sessions.json");
+        let old_target = super::super::get_profile_dir_path("before")?.join("sessions.json");
+        let new_target = super::super::get_profile_dir_path("after")?.join("sessions.json");
+        fs::create_dir_all(source.parent().unwrap())?;
+        fs::create_dir_all(old_target.parent().unwrap())?;
+        let mut entry = entry(&source, &old_target);
+        entry.target_profile = "before".to_string();
+        let journal_path = record(&entry, &source)?;
+        let before: serde_json::Value = serde_json::from_slice(&fs::read(&journal_path)?)?;
+
+        retarget_profile_references(
+            [source.clone(), old_target.clone()],
+            "before",
+            "after",
+            "after",
+        )?;
+
+        let after: serde_json::Value = serde_json::from_slice(&fs::read(&journal_path)?)?;
+        assert_eq!(after["source_profile"], "source");
+        assert_eq!(after["target_profile"], "after");
+        assert_eq!(
+            after["target_sessions_path"],
+            new_target.to_string_lossy().as_ref()
+        );
+        assert_eq!(after["version"], before["version"]);
+        assert_eq!(after["ids"], before["ids"]);
+        assert_eq!(
+            journal_path.parent(),
+            Some(journal_dir_for(&source).as_path())
+        );
+        assert!(!journal_dir_for(&new_target).exists());
         Ok(())
     }
 

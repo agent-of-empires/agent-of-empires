@@ -513,12 +513,23 @@ async fn restore_session(profile: &str, args: SessionIdArgs) -> Result<()> {
         .clone();
     let restore_id = inst.id.clone();
 
-    let _lifecycle_lock = storage
-        .acquire_instance_lifecycle_lock(&restore_id)
-        .context("failed to acquire instance restore lock")?;
+    let Some((_purge_owner_lock, _lifecycle_lock)) =
+        storage.try_acquire_restore_locks(&restore_id)?
+    else {
+        anyhow::bail!(
+            "Session {} has an active purge or lifecycle operation, so it was not restored",
+            inst.title
+        );
+    };
     let decision = storage.update(|instances, _groups| {
-        crate::session::claim::decide_restore_claim(instances, &restore_id, chrono::Utc::now())
-            .map_err(anyhow::Error::new)
+        crate::session::claim::decide_restore_claim(
+            instances,
+            &restore_id,
+            storage.profile(),
+            storage.sessions_path(),
+            chrono::Utc::now(),
+        )
+        .map_err(anyhow::Error::new)
     })?;
     let restore_generation = match decision {
         crate::session::claim::RestoreClaimDecision::AlreadyGone => {

@@ -331,7 +331,7 @@ async fn persist_agent_switch(
             switch(inst);
         }
     }
-    match crate::session::Storage::new(profile, state.file_watch.clone()) {
+    match crate::session::Storage::open(profile, state.file_watch.clone()) {
         Ok(storage) => {
             if let Err(e) = storage.update(|instances, _groups| {
                 if let Some(inst) = instances.iter_mut().find(|i| i.id == id) {
@@ -516,7 +516,7 @@ async fn persist_provider_switch(
         inst.agent_provider = Some(provider.to_string());
         inst.agent_model = Some(PROVIDER_DEFAULT_MODEL.to_string());
     };
-    crate::session::Storage::new(profile, state.file_watch.clone())?.update(
+    crate::session::Storage::open(profile, state.file_watch.clone())?.update(
         |instances, _groups| {
             if let Some(inst) = instances.iter_mut().find(|i| i.id == id) {
                 switch(inst);

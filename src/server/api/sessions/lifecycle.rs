@@ -68,6 +68,20 @@ pub struct UpdateUnreadBody {
     pub unread: bool,
 }
 
+enum StructuredLifecycleUpdate {
+    Applied,
+    Missing,
+    Deleting,
+    Busy(LifecycleOperation),
+    StatusChanged,
+    NotStructured,
+    Blocked(crate::session::StartBlocked),
+}
+
+fn structured_lifecycle_busy_response(message: &str) -> axum::response::Response {
+    api_error(StatusCode::CONFLICT, "lifecycle_busy", message)
+}
+
 pub async fn update_session_pin(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
@@ -401,7 +415,7 @@ pub async fn trash_session(
     let file_watch = state.file_watch.clone();
     let (storage, lifecycle_lock, generation) = match tokio::task::spawn_blocking(
         move || -> anyhow::Result<_> {
-            let storage = Storage::new(&reserve_profile, file_watch)?;
+            let storage = Storage::open(&reserve_profile, file_watch)?;
             let lifecycle_lock = storage.acquire_instance_lifecycle_lock(&reserve_id)?;
             let generation = storage.update(|instances, _groups| {
                 let Some(instance) = instances
@@ -577,16 +591,23 @@ pub async fn restore_session(
     let file_watch = state.file_watch.clone();
     let restored = tokio::task::spawn_blocking(move || {
         let run = || -> Result<Instance, RestoreTransitionError> {
-            let storage = Storage::new(&restore_profile, file_watch)
+            let storage = Storage::open(&restore_profile, file_watch)
                 .map_err(|error| RestoreTransitionError::Persist(error.to_string()))?;
-            let _lifecycle_lock = storage
-                .acquire_instance_lifecycle_lock(&restore_id)
-                .map_err(|error| RestoreTransitionError::Persist(error.to_string()))?;
+            let Some((_purge_owner_lock, _lifecycle_lock)) = storage
+                .try_acquire_restore_locks(&restore_id)
+                .map_err(|error| RestoreTransitionError::Persist(error.to_string()))?
+            else {
+                return Err(RestoreTransitionError::Busy(
+                    "a purge or another lifecycle operation is active".to_string(),
+                ));
+            };
             let decision = storage
                 .update(|instances, _groups| {
                     crate::session::claim::decide_restore_claim(
                         instances,
                         &restore_id,
+                        storage.profile(),
+                        storage.sessions_path(),
                         chrono::Utc::now(),
                     )
                     .map_err(anyhow::Error::new)
@@ -972,39 +993,138 @@ pub async fn stop_session(
     };
 
     if already_stopped {
-        let instances = state.instances.read().await;
-        let response = match instances.iter().find(|i| i.id == id) {
-            Some(inst) => {
-                SessionResponse::from_instance(inst, crate::claude_settings::read_tui_fullscreen())
+        let storage_profile = profile.clone();
+        let storage_id = id.clone();
+        let file_watch = state.file_watch.clone();
+        let stored = match tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
+            let storage = Storage::open(&storage_profile, file_watch)?;
+            let lifecycle_lock = storage.acquire_instance_lifecycle_lock(&storage_id)?;
+            let stored = storage
+                .load()?
+                .into_iter()
+                .find(|instance| instance.id == storage_id);
+            Ok((lifecycle_lock, stored))
+        })
+        .await
+        {
+            Ok(Ok(result)) => result,
+            Ok(Err(error)) => {
+                tracing::error!(
+                    target: "http.api.sessions",
+                    session = %id,
+                    "Failed to read stored session before stop: {error:#}"
+                );
+                return api_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "internal",
+                    "failed to read session state",
+                );
             }
-            None => {
-                return session_not_found();
+            Err(error) => {
+                tracing::error!(
+                    target: "http.api.sessions",
+                    session = %id,
+                    "Read stored session before stop task failed: {error}"
+                );
+                return api_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "internal",
+                    "failed to read session state",
+                );
             }
         };
+        let (_lifecycle_lock, Some(stored)) = stored else {
+            return session_not_found();
+        };
+        if stored.status == Status::Deleting {
+            return structured_lifecycle_busy_response("session is being deleted");
+        }
+        if stored.has_fresh_lifecycle_reservation(chrono::Utc::now()) {
+            let operation = stored
+                .lifecycle_reservation
+                .as_ref()
+                .expect("fresh lifecycle reservation")
+                .op;
+            return structured_lifecycle_busy_response(&operation.busy_reason());
+        }
+        if stored.status == Status::Creating {
+            return structured_lifecycle_busy_response("session is still being created");
+        }
+        if stored.status != Status::Stopped {
+            return structured_lifecycle_busy_response(
+                "session status changed before stop could be applied",
+            );
+        }
+        if let Err(blocked) = stored.ensure_startable() {
+            return crate::server::api::start_blocked_response(blocked);
+        }
+        let response =
+            SessionResponse::from_instance(&stored, crate::claude_settings::read_tui_fullscreen());
         return (StatusCode::OK, Json(serde_json::json!(response))).into_response();
     }
 
+    let mut structured_lifecycle_lock = None;
     // Structured sessions have no tmux/container teardown transaction, so
-    // persist their dormant stop before asking the supervisor to shut down.
+    // hold the durable lifecycle lock through the stop request.
     // Plain sessions delegate the full sequence to `Instance::stop` below.
     if is_structured {
         let persist_id = id.clone();
-        if persist_session_update(
+        let (lifecycle_lock, update) = match persist_lifecycle_update(
             profile.clone(),
             "stop session",
             state.file_watch.clone(),
-            move |instances| {
-                if let Some(inst) = instances.iter_mut().find(|i| i.id == persist_id) {
-                    inst.status = Status::Stopped;
-                    inst.mark_idle_dormant();
+            id.clone(),
+            move |instances| -> anyhow::Result<_> {
+                let Some(inst) = instances.iter_mut().find(|i| i.id == persist_id) else {
+                    return Ok(StructuredLifecycleUpdate::Missing);
+                };
+                if inst.status == Status::Deleting {
+                    return Ok(StructuredLifecycleUpdate::Deleting);
                 }
+                if inst.has_fresh_lifecycle_reservation(chrono::Utc::now()) {
+                    let operation = inst
+                        .lifecycle_reservation
+                        .as_ref()
+                        .expect("fresh lifecycle reservation")
+                        .op;
+                    return Ok(StructuredLifecycleUpdate::Busy(operation));
+                }
+                if !inst.is_structured() {
+                    return Ok(StructuredLifecycleUpdate::NotStructured);
+                }
+                if inst.status == Status::Creating {
+                    return Ok(StructuredLifecycleUpdate::StatusChanged);
+                }
+                inst.status = Status::Stopped;
+                inst.mark_idle_dormant();
+                Ok(StructuredLifecycleUpdate::Applied)
             },
         )
         .await
-        .is_err()
         {
-            return persist_failed_response();
+            Ok(result) => result,
+            Err(()) => return persist_failed_response(),
+        };
+        match update {
+            StructuredLifecycleUpdate::Applied => {}
+            StructuredLifecycleUpdate::Missing => return session_not_found(),
+            StructuredLifecycleUpdate::Deleting => {
+                return structured_lifecycle_busy_response("session is being deleted")
+            }
+            StructuredLifecycleUpdate::Busy(operation) => {
+                return structured_lifecycle_busy_response(&operation.busy_reason())
+            }
+            StructuredLifecycleUpdate::StatusChanged => {
+                return structured_lifecycle_busy_response("session is still being created")
+            }
+            StructuredLifecycleUpdate::NotStructured => {
+                return structured_lifecycle_busy_response(
+                    "session view changed before stop could be applied",
+                )
+            }
+            StructuredLifecycleUpdate::Blocked(_) => unreachable!("stop cannot be start-blocked"),
         }
+        structured_lifecycle_lock = Some(lifecycle_lock);
     }
 
     let inst_clone = {
@@ -1050,7 +1170,7 @@ pub async fn stop_session(
         let stop_id = id.clone();
         match tokio::task::spawn_blocking(move || {
             let stop_result = inst_for_stop.stop();
-            let disk_result = Storage::new_unwatched(&stop_profile)
+            let disk_result = Storage::open_unwatched(&stop_profile)
                 .and_then(|storage| storage.load())
                 .map(|instances| {
                     instances
@@ -1088,6 +1208,8 @@ pub async fn stop_session(
             ),
         }
     }
+
+    let _structured_lifecycle_lock = structured_lifecycle_lock;
 
     // Re-read so the response reflects the Stopped status.
     let instances = state.instances.read().await;
@@ -1167,36 +1289,69 @@ pub async fn start_session(
         // reconciler's next tick respawns the worker against the preserved
         // transcript.
         let persist_id = id.clone();
-        // Unset when a peer purged the row; `Err` when it archived or trashed it since the
-        // memory check.
-        let stored = Arc::new(std::sync::OnceLock::new());
-        let stored_on_disk = Arc::clone(&stored);
-        if persist_session_update(
-            profile,
+        let (lifecycle_lock, update) = match persist_lifecycle_update(
+            profile.clone(),
             "start session",
             state.file_watch.clone(),
-            move |instances| {
-                if let Some(inst) = instances.iter_mut().find(|i| i.id == persist_id) {
-                    let startable = inst.ensure_startable();
-                    let _ = stored_on_disk.set(startable);
-                    if startable.is_err() {
-                        return;
-                    }
-                    inst.idle_dormant_since = None;
-                    inst.status = Status::Idle;
-                    inst.last_error = None;
+            id.clone(),
+            move |instances| -> anyhow::Result<_> {
+                let Some(inst) = instances.iter_mut().find(|i| i.id == persist_id) else {
+                    return Ok(StructuredLifecycleUpdate::Missing);
+                };
+                if inst.status == Status::Deleting {
+                    return Ok(StructuredLifecycleUpdate::Deleting);
                 }
+                if inst.has_fresh_lifecycle_reservation(chrono::Utc::now()) {
+                    let operation = inst
+                        .lifecycle_reservation
+                        .as_ref()
+                        .expect("fresh lifecycle reservation")
+                        .op;
+                    return Ok(StructuredLifecycleUpdate::Busy(operation));
+                }
+                if !inst.is_structured() {
+                    return Ok(StructuredLifecycleUpdate::NotStructured);
+                }
+                if inst.status != Status::Stopped {
+                    return Ok(StructuredLifecycleUpdate::StatusChanged);
+                }
+                if let Err(blocked) = inst.ensure_startable() {
+                    return Ok(StructuredLifecycleUpdate::Blocked(blocked));
+                }
+                inst.idle_dormant_since = None;
+                inst.status = Status::Idle;
+                inst.last_error = None;
+                Ok(StructuredLifecycleUpdate::Applied)
             },
         )
         .await
-        .is_err()
         {
-            return persist_failed_response();
-        }
-        match stored.get() {
-            None => return session_not_found(),
-            Some(Err(refusal)) => return crate::server::api::start_blocked_response(*refusal),
-            Some(Ok(())) => {}
+            Ok(result) => result,
+            Err(()) => return persist_failed_response(),
+        };
+        let _lifecycle_lock = lifecycle_lock;
+        match update {
+            StructuredLifecycleUpdate::Applied => {}
+            StructuredLifecycleUpdate::Missing => return session_not_found(),
+            StructuredLifecycleUpdate::Deleting => {
+                return structured_lifecycle_busy_response("session is being deleted")
+            }
+            StructuredLifecycleUpdate::Busy(operation) => {
+                return structured_lifecycle_busy_response(&operation.busy_reason())
+            }
+            StructuredLifecycleUpdate::Blocked(blocked) => {
+                return crate::server::api::start_blocked_response(blocked)
+            }
+            StructuredLifecycleUpdate::StatusChanged => {
+                return structured_lifecycle_busy_response(
+                    "session status changed before start could be applied",
+                )
+            }
+            StructuredLifecycleUpdate::NotStructured => {
+                return structured_lifecycle_busy_response(
+                    "session view changed before start could be applied",
+                )
+            }
         }
         {
             let mut instances = state.instances.write().await;

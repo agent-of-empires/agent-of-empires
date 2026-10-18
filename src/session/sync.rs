@@ -316,7 +316,7 @@ fn drain_and_persist_session_ids_inner(
             Ok(None)
         } else {
             (|| {
-                let storage = Storage::new(&update.profile, file_watch.clone())?;
+                let storage = Storage::open(&update.profile, file_watch.clone())?;
                 let lifecycle_lock = storage.acquire_instance_lifecycle_lock(&update.id)?;
                 let generation = storage.update(|instances, _groups| {
                     let Some(instance) = instances
@@ -723,7 +723,7 @@ fn reload_skipped_from_disk(
     id: &str,
     file_watch: &Arc<FileWatchService>,
 ) -> Option<Rollback> {
-    let storage = Storage::new(profile, file_watch.clone()).ok()?;
+    let storage = Storage::open(profile, file_watch.clone()).ok()?;
     let disk_insts = storage.load().ok()?;
     let disk_inst = disk_insts.iter().find(|i| i.id == id)?;
     Some(Rollback {
@@ -1234,6 +1234,45 @@ mod tests {
             Some(crate::session::LifecycleOperation::Trash)
         );
         assert_eq!(stored[0].lifecycle_generation, 1);
+    }
+
+    #[test]
+    #[serial]
+    fn drain_defers_stale_capture_while_purge_owns_lifecycle() {
+        let temp = tempdir().unwrap();
+        let _guard = storage_home_guard(&temp);
+        let profile = "sync-purge-owned";
+        let sid = "019342ab-1234-7def-8901-bbbbbbbbbbbb";
+        let mut stale_instance = Instance::new("purge-owned-title", "/tmp/x");
+        stale_instance.source_profile = profile.to_string();
+        stale_instance.status = Status::Running;
+        stale_instance.lifecycle_generation = 1;
+
+        let reservation = crate::session::LifecycleReservation {
+            op: crate::session::LifecycleOperation::Purge,
+            generation: 2,
+            at: chrono::Utc::now(),
+        };
+        let mut deleting_instance = stale_instance.clone();
+        deleting_instance.status = Status::Deleting;
+        deleting_instance.lifecycle_generation = reservation.generation;
+        deleting_instance.lifecycle_reservation = Some(reservation.clone());
+        seed_instance_on_disk(profile, &deleting_instance);
+        attach_poller_with_update(&mut stale_instance, sid);
+
+        let file_watch = FileWatchService::noop();
+        let mut instances = vec![stale_instance];
+        let outcome = drain_and_persist_session_ids(&mut instances, &file_watch);
+
+        assert_eq!(outcome.filtered, vec![instances[0].id.clone()]);
+        assert!(outcome.applied.is_empty());
+        assert!(outcome.rolled_back.is_empty());
+        assert!(outcome.lifecycle_advanced.is_empty());
+        let stored = Storage::new_unwatched(profile).unwrap().load().unwrap();
+        assert_eq!(stored[0].agent_session_id, None);
+        assert_eq!(stored[0].status, Status::Deleting);
+        assert_eq!(stored[0].lifecycle_generation, reservation.generation);
+        assert_eq!(stored[0].lifecycle_reservation, Some(reservation));
     }
 
     #[test]

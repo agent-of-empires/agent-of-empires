@@ -16,7 +16,7 @@ impl Instance {
     /// [`Self::reconcile_from_disk`] that reports a storage failure. `Ok(false)`
     /// means the row is gone from disk and `self` is unchanged.
     pub(super) fn try_reconcile_from_disk(&mut self) -> Result<bool> {
-        let storage = crate::session::storage::Storage::new(
+        let storage = crate::session::storage::Storage::open(
             &self.effective_profile(),
             self.resolve_file_watch(),
         )

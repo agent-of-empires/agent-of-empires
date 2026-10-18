@@ -7,85 +7,56 @@ use std::fs;
 use std::path::Path;
 use std::process::{Child, ChildStdin, Command, Stdio};
 
-pub(super) fn kernel_process_state(pid: u32) -> anyhow::Result<Option<super::KernelProcessState>> {
+fn parse_kernel_process_stat(stat: &[u8]) -> anyhow::Result<super::KernelProcessState> {
     use anyhow::Context as _;
-    let stat = match fs::read_to_string(format!("/proc/{pid}/stat")) {
-        Ok(stat) => stat,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(error.into()),
-    };
-    let (_, tail) = stat
-        .rsplit_once(')')
+
+    let close_paren = stat
+        .iter()
+        .rposition(|byte| *byte == b')')
         .context("malformed kernel process stat")?;
-    let mut fields = tail.split_whitespace();
-    let state = fields
-        .next()
-        .context("kernel process state absent")?
-        .as_bytes();
+    let mut fields = stat[close_paren + 1..].split_ascii_whitespace();
+    let state = fields.next().context("kernel process state absent")?;
     anyhow::ensure!(
         state.len() == 1 && state[0].is_ascii_alphabetic(),
         "invalid kernel process state"
     );
-    let group = fields
-        .nth(1)
-        .context("kernel process group absent")?
-        .parse()?;
-    let threads = fields
-        .nth(14)
-        .context("kernel process thread count absent")?
-        .parse::<u32>()?;
+    let group: u32 =
+        std::str::from_utf8(fields.nth(1).context("kernel process group absent")?)?.parse()?;
+    let threads: u32 = std::str::from_utf8(
+        fields
+            .nth(14)
+            .context("kernel process thread count absent")?,
+    )?
+    .parse()?;
     anyhow::ensure!(threads > 0, "invalid kernel process thread count");
-    let start_id = fields
-        .nth(1)
-        .context("kernel process birth absent")?
-        .parse()?;
-    Ok(Some(super::KernelProcessState {
+    let start_id: u64 =
+        std::str::from_utf8(fields.nth(1).context("kernel process birth absent")?)?.parse()?;
+    Ok(super::KernelProcessState {
         start_id,
         group,
-        // A zombie leader can still have live threads sharing its resources.
         writing: state[0] != b'Z' || threads > 1,
-    }))
+    })
 }
 
-pub(super) fn group_has_writers(group: u32) -> anyhow::Result<bool> {
-    use anyhow::Context as _;
-    let mounts = fs::read_to_string("/proc/self/mountinfo")?;
-    let mount = mounts
-        .lines()
-        .find(|line| line.split_whitespace().nth(4) == Some("/proc"))
-        .context("process namespace mount identity unavailable")?;
-    let (vfs, filesystem) = mount.split_once(" - ").context("invalid process mount")?;
-    anyhow::ensure!(
-        filesystem.split_whitespace().next() == Some("proc"),
-        "process mount is not procfs"
-    );
-    for options in [
-        vfs.split_whitespace().nth(5),
-        filesystem.split_whitespace().nth(2),
-    ]
-    .into_iter()
-    .flatten()
-    {
-        anyhow::ensure!(
-            !options
-                .split(',')
-                .any(|option| option.starts_with("hidepid=") && option != "hidepid=0"),
-            "process namespace hides group members"
-        );
-    }
-    for item in fs::read_dir("/proc")? {
-        let item = item?;
-        let name = item.file_name();
-        let Some(pid) = name.to_str().and_then(|name| name.parse::<u32>().ok()) else {
-            continue;
-        };
-        if let Some(state) = kernel_process_state(pid)? {
-            if state.group == group && state.writing {
-                return Ok(true);
-            }
-        }
-    }
-    Ok(false)
+#[derive(Debug, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub(crate) struct DirectoryIdentity {
+    device: u64,
+    inode: u64,
+}
+
+pub(crate) fn profile_directory_identity(path: &Path) -> anyhow::Result<Option<DirectoryIdentity>> {
+    use std::os::unix::fs::MetadataExt;
+
+    let metadata = match fs::metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    anyhow::ensure!(metadata.is_dir(), "profile is not a directory");
+    Ok(Some(DirectoryIdentity {
+        device: metadata.dev(),
+        inode: metadata.ino(),
+    }))
 }
 
 pub(super) use super::unix::{
@@ -269,22 +240,33 @@ fn process_disappeared(error: &std::io::Error) -> bool {
 }
 
 fn foreign_process_permission_error(error: &std::io::Error, owner: Option<u32>, euid: u32) -> bool {
-    matches!(error.raw_os_error(), Some(libc::EACCES | libc::EPERM))
+    matches!(error.raw_os_error(), Some(libc::EACCES) | Some(libc::EPERM))
         && owner.is_some_and(|uid| uid != euid)
 }
 
+fn runner_group_member_identity(
+    pid: u32,
+    stat: &[u8],
+    group: u32,
+) -> anyhow::Result<Option<super::PrimeProcessIdentity>> {
+    let process = parse_kernel_process_stat(stat)?;
+    if process.group != group || !process.writing {
+        return Ok(None);
+    }
+    Ok(Some(super::PrimeProcessIdentity {
+        pid,
+        start_id: format!("proc:{}", process.start_id),
+    }))
+}
+
 pub(super) fn runner_group_executing(group: u32) -> anyhow::Result<bool> {
-    use std::io::Read as _;
-    let mut bytes = [0u8; 1024];
     for entry in fs::read_dir("/proc")? {
         let entry = entry?;
-        if entry.file_name().to_string_lossy().parse::<u32>().is_err() {
+        let Ok(pid) = entry.file_name().to_string_lossy().parse::<u32>() else {
             continue;
-        }
-        let size = match fs::File::open(entry.path().join("stat"))
-            .and_then(|mut file| file.read(&mut bytes))
-        {
-            Ok(size) => size,
+        };
+        let stat = match fs::read(entry.path().join("stat")) {
+            Ok(stat) => stat,
             Err(error) if process_disappeared(&error) => continue,
             Err(error) => {
                 use std::os::unix::fs::MetadataExt as _;
@@ -295,17 +277,7 @@ pub(super) fn runner_group_executing(group: u32) -> anyhow::Result<bool> {
                 return Err(error).context("runner group census unavailable");
             }
         };
-        let offset = bytes[..size]
-            .windows(2)
-            .rposition(|pair| pair == b") ")
-            .context("invalid process stat")?;
-        let mut fields = std::str::from_utf8(&bytes[offset + 2..size])?.split_ascii_whitespace();
-        let state = fields.next().context("missing process state")?;
-        let process_group = fields
-            .nth(1)
-            .context("missing process group")?
-            .parse::<u32>()?;
-        if process_group == group && state != "Z" {
+        if runner_group_member_identity(pid, &stat, group)?.is_some() {
             return Ok(true);
         }
     }
@@ -462,7 +434,7 @@ pub(super) fn runner_group_identities(
         let Ok(pid) = entry.file_name().to_string_lossy().parse::<u32>() else {
             continue;
         };
-        let stat = match fs::read_to_string(entry.path().join("stat")) {
+        let stat = match fs::read(entry.path().join("stat")) {
             Ok(stat) => stat,
             Err(error) if process_disappeared(&error) => continue,
             Err(error) => {
@@ -473,19 +445,8 @@ pub(super) fn runner_group_identities(
                 return Err(error).context("inspecting owned runner group");
             }
         };
-        let (_, tail) = stat.rsplit_once(") ").context("invalid process stat")?;
-        let mut fields = tail.split_ascii_whitespace();
-        let state = fields.next().context("missing process state")?;
-        let pgrp = fields
-            .nth(1)
-            .context("missing process group")?
-            .parse::<u32>()?;
-        if state != "Z" && pgrp == group {
-            let start = fields.nth(16).context("missing process birth identity")?;
-            result.push(super::PrimeProcessIdentity {
-                pid,
-                start_id: format!("proc:{start}"),
-            });
+        if let Some(identity) = runner_group_member_identity(pid, &stat, group)? {
+            result.push(identity);
         }
     }
     Ok(result)
@@ -882,6 +843,15 @@ impl super::SleepInhibit for SystemdInhibitor {
 mod tests {
     use super::*;
 
+    fn runner_stat(state: u8, group: u32, threads: u32) -> Vec<u8> {
+        let mut stat = format!("1234 (worker) {} 1 {group} 56", state as char).into_bytes();
+        for _ in 0..13 {
+            stat.extend_from_slice(b" 0");
+        }
+        stat.extend_from_slice(format!(" {threads} 0 987654").as_bytes());
+        stat
+    }
+
     #[test]
     fn launch_executable_recovers_only_deleted_paths_with_a_live_replacement() {
         use std::os::unix::fs::PermissionsExt as _;
@@ -946,13 +916,46 @@ mod tests {
     }
 
     #[test]
+    fn runner_group_identity_census_matches_thread_settlement() {
+        for (state, threads, expected) in [(b'S', 1, true), (b'Z', 1, false), (b'Z', 2, true)] {
+            let stat = runner_stat(state, 55, threads);
+            let identity = runner_group_member_identity(1234, &stat, 55).unwrap();
+            assert_eq!(
+                identity.is_some(),
+                expected,
+                "state={state}, threads={threads}"
+            );
+            if expected {
+                assert_eq!(
+                    identity.unwrap(),
+                    super::super::PrimeProcessIdentity {
+                        pid: 1234,
+                        start_id: "proc:987654".into(),
+                    }
+                );
+            }
+            assert!(runner_group_member_identity(1234, &stat, 56)
+                .unwrap()
+                .is_none());
+        }
+    }
+
+    #[test]
     #[serial_test::serial]
     fn prime_quiescence_never_declares_an_uninspectable_owned_process_absent() {
         use std::io::{BufRead as _, Read as _, Write as _};
         use std::os::unix::fs::PermissionsExt as _;
         if std::env::var_os("AOE_PRIME_CENSUS_CHILD").is_some() {
             assert_eq!(
-                unsafe { libc::prctl(libc::PR_SET_NAME, c"\xffowned".as_ptr(), 0, 0, 0) },
+                unsafe {
+                    libc::prctl(
+                        libc::PR_SET_NAME,
+                        b"\xffowned\0".as_ptr().cast::<libc::c_char>(),
+                        0,
+                        0,
+                        0,
+                    )
+                },
                 0
             );
             let signal = |message: &[u8]| {
@@ -1165,7 +1168,6 @@ int main(int argc, char **argv) {
             assert!(Instant::now() < deadline, "leader did not exit");
             std::thread::sleep(Duration::from_millis(5));
         }
-        let identity = crate::process::kernel_process_identity(pid).unwrap();
         use crate::process::worker_registry as registry;
         let session_id = "zombie-thread";
         let record = registry::WorkerRecord::new(
@@ -1190,10 +1192,10 @@ int main(int argc, char **argv) {
             "purge confirmed stop while a thread could still write"
         );
         assert!(registry::load(session_id).unwrap().is_some());
-        assert!(crate::process::process_group_has_writers(pid, identity).unwrap());
+        assert!(crate::process::runner_group_executing(pid).unwrap());
         child.0.kill().unwrap();
         child.0.wait().unwrap();
-        assert!(!crate::process::process_group_has_writers(pid, identity).unwrap());
+        assert!(!crate::process::runner_group_executing(pid).unwrap());
         registry::terminate_and_confirm_stopped(session_id, "profile", 1).unwrap();
         assert!(registry::load(session_id).unwrap().is_none());
     }
@@ -1205,6 +1207,22 @@ int main(int argc, char **argv) {
         assert_eq!(parse_stat_field(stat, 3), Some(1233)); // ppid
         assert_eq!(parse_stat_field(stat, 4), Some(1234)); // pgrp
         assert_eq!(parse_stat_field(stat, 7), Some(1234)); // tpgid
+    }
+
+    #[test]
+    fn process_stat_parser_ignores_non_utf8_command_names() {
+        let mut stat = b"1234 (bad".to_vec();
+        stat.push(0xff);
+        stat.extend_from_slice(b" name) S 1 55 56");
+        for _ in 0..13 {
+            stat.extend_from_slice(b" 0");
+        }
+        stat.extend_from_slice(b" 2 0 987654");
+
+        let parsed = parse_kernel_process_stat(&stat).unwrap();
+        assert_eq!(parsed.group, 55);
+        assert_eq!(parsed.start_id, 987654);
+        assert!(parsed.writing);
     }
 
     const MEMINFO: &str = "\

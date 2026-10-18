@@ -172,6 +172,54 @@ where
     persist_with(profile, label, file_watch, Some(id), mutate).await
 }
 
+/// Persist a lifecycle mutation and return with its cross-process lock held so the caller can
+/// publish the corresponding in-memory change before another lifecycle operation proceeds.
+pub(crate) async fn persist_lifecycle_update<F, R>(
+    profile: String,
+    label: &'static str,
+    file_watch: std::sync::Arc<crate::file_watch::FileWatchService>,
+    id: String,
+    mutate: F,
+) -> Result<(crate::session::StorageFlock, R), ()>
+where
+    F: FnOnce(&mut Vec<Instance>) -> anyhow::Result<R> + Send + 'static,
+    R: Send + 'static,
+{
+    let storage = match Storage::open(&profile, file_watch) {
+        Ok(storage) => storage,
+        Err(error) => {
+            tracing::error!(
+                target: "http.api.sessions",
+                "Failed to open storage for {label}: {error}"
+            );
+            return Err(());
+        }
+    };
+    match tokio::task::spawn_blocking(move || {
+        let lifecycle_lock = storage.acquire_instance_lifecycle_lock(&id)?;
+        let result = storage.update(|instances, _groups| mutate(instances))?;
+        Ok::<_, anyhow::Error>((lifecycle_lock, result))
+    })
+    .await
+    {
+        Ok(Ok(result)) => Ok(result),
+        Ok(Err(error)) => {
+            tracing::error!(
+                target: "http.api.sessions",
+                "Failed to persist {label}: {error:#}"
+            );
+            Err(())
+        }
+        Err(error) => {
+            tracing::error!(
+                target: "http.api.sessions",
+                "Persist join failed for {label}: {error}"
+            );
+            Err(())
+        }
+    }
+}
+
 async fn persist_with<F>(
     profile: String,
     label: &'static str,
@@ -182,7 +230,7 @@ async fn persist_with<F>(
 where
     F: FnOnce(&mut Vec<Instance>) + Send + 'static,
 {
-    let storage = match Storage::new(&profile, file_watch) {
+    let storage = match Storage::open(&profile, file_watch) {
         Ok(s) => s,
         Err(e) => {
             tracing::error!(

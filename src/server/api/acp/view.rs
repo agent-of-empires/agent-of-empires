@@ -4,7 +4,7 @@ use serde::Serialize;
 
 use crate::server::api::{find_instance, instance_exists};
 use crate::server::push::publish_status_change;
-use crate::session::{Instance, ResumeIntent, Status, View};
+use crate::session::{Instance, ResumeIntent, StartBlocked, Status, View};
 
 use super::*;
 
@@ -15,6 +15,49 @@ pub struct ViewSwitchResponse {
 }
 
 type HandoffSnapshot = (View, Option<String>, crate::session::ConversationState);
+
+#[derive(Debug)]
+struct StructuredViewConflict(&'static str);
+
+impl std::fmt::Display for StructuredViewConflict {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.0)
+    }
+}
+
+impl std::error::Error for StructuredViewConflict {}
+
+fn validate_structured_view_transition(
+    durable: &Instance,
+    expected_generation: u64,
+) -> anyhow::Result<()> {
+    if durable.status == Status::Deleting {
+        return Err(anyhow::Error::new(StructuredViewConflict(
+            "session is being purged",
+        )));
+    }
+
+    let now = chrono::Utc::now();
+    let purge_reserved = durable.has_fresh_lifecycle_reservation(now)
+        && durable
+            .lifecycle_reservation
+            .as_ref()
+            .is_some_and(|reservation| reservation.op == crate::session::LifecycleOperation::Purge);
+    if purge_reserved {
+        return Err(anyhow::Error::new(StructuredViewConflict(
+            "session has an active purge reservation",
+        )));
+    }
+    if durable.lifecycle_generation != expected_generation {
+        return Err(anyhow::Error::new(StructuredViewConflict(
+            "session lifecycle changed; reload and retry the view switch",
+        )));
+    }
+    if let Err(blocked) = durable.ensure_startable() {
+        return Err(anyhow::Error::new(blocked));
+    }
+    Ok(())
+}
 
 fn view_response(session_id: String, view: View) -> Response {
     Json(ViewSwitchResponse { session_id, view }).into_response()
@@ -93,6 +136,9 @@ pub async fn acp_enable(
     let Some(mut instance) = find_instance(&state, &id).await else {
         return session_not_found();
     };
+    if instance.acp_handoff_pending {
+        return crate::server::api::start_blocked_response(StartBlocked::AcpHandoffPending);
+    }
     let selected_conversation = instance
         .selected_claude_conversation()
         .map(|(sid, execution)| (sid.to_owned(), execution.clone()));
@@ -166,12 +212,18 @@ async fn commit_structured_view(
     let file_watch = state.file_watch.clone();
     let binding_for_transition = selected_binding.cloned();
     let transition = tokio::task::spawn_blocking(move || -> anyhow::Result<u64> {
-        let storage = crate::session::Storage::new(&profile, file_watch)?;
+        let storage = crate::session::Storage::open(&profile, file_watch)?;
         let _lifecycle_lock = storage
             .acquire_instance_lifecycle_lock(&inst_for_transition.id)
             .map_err(|error| {
                 anyhow::anyhow!("failed to acquire terminal-to-ACP lifecycle lock: {error}")
             })?;
+        let durable = storage
+            .load()?
+            .into_iter()
+            .find(|candidate| candidate.id == inst_for_transition.id)
+            .ok_or_else(|| anyhow::anyhow!("session disappeared during terminal-to-ACP transition"))?;
+        validate_structured_view_transition(&durable, inst_for_transition.lifecycle_generation)?;
         if let Err(e) = inst_for_transition.kill_locked() {
             tracing::warn!(target: "acp.switch", session = %inst_for_transition.id, "kill tmux failed: {e}");
         }
@@ -186,6 +238,7 @@ async fn commit_structured_view(
             else {
                 anyhow::bail!("session disappeared during terminal-to-ACP transition");
             };
+            validate_structured_view_transition(slot, inst_for_transition.lifecycle_generation)?;
             slot.view = View::Structured;
             slot.resume_intent = ResumeIntent::Default;
             if let Some(binding) = &binding_for_transition {
@@ -204,6 +257,12 @@ async fn commit_structured_view(
     let lifecycle_generation = match transition {
         Ok(Ok(generation)) => generation,
         Ok(Err(error)) => {
+            if let Some(blocked) = error.downcast_ref::<StartBlocked>() {
+                return Err(crate::server::api::start_blocked_response(*blocked));
+            }
+            if let Some(conflict) = error.downcast_ref::<StructuredViewConflict>() {
+                return Err((StatusCode::CONFLICT, conflict.0).into_response());
+            }
             tracing::error!(target: "acp.switch", session = %id, "terminal-to-ACP transition failed: {error:#}");
             return Err(internal_error(
                 "failed to switch session to structured view",
@@ -393,6 +452,16 @@ pub async fn acp_disable(
             Ok(Some(durable)) if durable.is_structured() => {
                 instance = adopt_persisted_structured_instance(instance, durable, &profile);
             }
+            Ok(Some(mut durable)) if durable.acp_handoff_pending => {
+                durable.source_profile = profile;
+                let keep_context = durable.acp_session_id.is_some();
+                if let Err(response) =
+                    complete_terminal_handoff(&state, durable, keep_context).await
+                {
+                    return response;
+                }
+                return view_response(id, View::Terminal);
+            }
             Ok(Some(_)) => return view_response(id, View::Terminal),
             Ok(None) => return session_not_found(),
             Err(resp) => return resp,
@@ -440,6 +509,7 @@ pub async fn acp_disable(
             instance.import_pending = None;
         }
     }
+    instance.acp_handoff_pending = true;
 
     if let Err(response) = persist_terminal_view(
         &state,
@@ -453,34 +523,8 @@ pub async fn acp_disable(
     {
         return response;
     }
-
-    // Committed before shutdown so the reconciler cannot respawn a worker in
-    // the teardown window.
-    let shutdown_result = if keep_context {
-        state.acp_supervisor.shutdown(&id).await
-    } else {
-        state.acp_supervisor.shutdown_and_delete(&id).await
-    };
-    match shutdown_result {
-        Ok(()) | Err(SupervisorError::UnknownSession(_)) => {}
-        Err(e) => {
-            tracing::warn!(target: "acp.switch", session = %id, "shutdown structured view failed: {e}");
-        }
-    }
-    // The tmux pane reprints a kept conversation, so the ACP projection goes.
-    state.acp_supervisor.forget_session(&id);
-    state.acp_event_store.delete_session(&id);
-
-    match tokio::task::spawn_blocking(move || instance.start()).await {
-        Ok(Ok(())) => {}
-        // An archived or trashed session switches views without starting.
-        Ok(Err(e)) if e.downcast_ref::<crate::session::StartBlocked>().is_some() => {}
-        Ok(Err(e)) => {
-            tracing::warn!(target: "acp.switch", session = %id, "tmux start after disable: {e}");
-        }
-        Err(e) => {
-            tracing::error!(target: "acp.switch", session = %id, "spawn_blocking failed: {e}");
-        }
+    if let Err(response) = complete_terminal_handoff(&state, instance, keep_context).await {
+        return response;
     }
     view_response(id, View::Terminal)
 }
@@ -518,7 +562,7 @@ async fn persist_terminal_view(
     let profile_for_save = profile.to_string();
     let file_watch = state.file_watch.clone();
     let save_result = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
-        let storage = crate::session::Storage::new(&profile_for_save, file_watch)?;
+        let storage = crate::session::Storage::open(&profile_for_save, file_watch)?;
         storage.update(|all, _groups| {
             let Some(slot) = all.iter_mut().find(|candidate| candidate.id == snapshot.id) else {
                 anyhow::bail!("session disappeared during terminal handoff");
@@ -532,6 +576,7 @@ async fn persist_terminal_view(
             slot.view = View::Terminal;
             slot.acp_session_id = snapshot.acp_session_id.clone();
             slot.import_pending = snapshot.import_pending;
+            slot.acp_handoff_pending = true;
             if keep_context {
                 slot.adopt_conversation_state(persisted_conversation.clone());
             }
@@ -564,6 +609,7 @@ async fn persist_terminal_view(
         slot.acp_load_session_capable = None;
         slot.acp_session_id = instance.acp_session_id.clone();
         slot.import_pending = instance.import_pending;
+        slot.acp_handoff_pending = true;
         if keep_context {
             slot.adopt_conversation_state(instance.conversation_state());
         }
@@ -576,6 +622,110 @@ async fn persist_terminal_view(
             session = %instance.id,
             "session missing from cache after terminal handoff save; continuing teardown"
         );
+    }
+    Ok(())
+}
+
+async fn complete_terminal_handoff(
+    state: &Arc<AppState>,
+    mut instance: Instance,
+    keep_context: bool,
+) -> Result<(), Response> {
+    let id = instance.id.clone();
+    let timeout = std::time::Duration::from_secs(5);
+    let shutdown = if keep_context {
+        state.acp_supervisor.shutdown_and_wait(&id, timeout).await
+    } else {
+        state
+            .acp_supervisor
+            .shutdown_and_delete_and_wait(&id, timeout)
+            .await
+    };
+    if let Err(error) = shutdown {
+        tracing::warn!(target: "acp.switch", session = %id, "shutdown structured view remains pending: {error}");
+        return Err((
+            StatusCode::CONFLICT,
+            format!("structured worker has not settled; retry the terminal handoff: {error}"),
+        )
+            .into_response());
+    }
+
+    state.acp_supervisor.forget_session(&id);
+    if let Err(error) = state.acp_event_store.delete_session_fallible(&id) {
+        tracing::warn!(target: "acp.switch", session = %id, "structured event projection cleanup remains pending: {error:#}");
+        return Err((
+            StatusCode::CONFLICT,
+            "terminal handoff cleanup remains pending",
+        )
+            .into_response());
+    }
+
+    let profile = instance.source_profile.clone();
+    let persisted_id = id.clone();
+    let file_watch = state.file_watch.clone();
+    let persisted = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+        let storage = crate::session::Storage::open(&profile, file_watch)?;
+        let _lifecycle_lock = storage.acquire_instance_lifecycle_lock(&persisted_id)?;
+        storage.update(|all, _groups| {
+            let Some(slot) = all
+                .iter_mut()
+                .find(|candidate| candidate.id == persisted_id)
+            else {
+                anyhow::bail!("session disappeared while completing terminal handoff");
+            };
+            anyhow::ensure!(
+                slot.view == View::Terminal && slot.acp_handoff_pending,
+                "terminal handoff was superseded"
+            );
+            slot.acp_handoff_pending = false;
+            Ok(())
+        })?;
+        Ok(())
+    })
+    .await;
+    match persisted {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => {
+            tracing::warn!(target: "acp.switch", session = %id, "failed to clear terminal handoff marker: {error:#}");
+            return Err((
+                StatusCode::CONFLICT,
+                format!("terminal handoff cleanup remains pending: {error:#}"),
+            )
+                .into_response());
+        }
+        Err(error) => {
+            tracing::warn!(target: "acp.switch", session = %id, "terminal handoff marker task failed: {error}");
+            return Err((
+                StatusCode::CONFLICT,
+                "terminal handoff cleanup remains pending",
+            )
+                .into_response());
+        }
+    }
+
+    if let Some(slot) = state
+        .instances
+        .write()
+        .await
+        .iter_mut()
+        .find(|candidate| candidate.id == id)
+    {
+        slot.acp_handoff_pending = false;
+    }
+    instance.acp_handoff_pending = false;
+
+    match tokio::task::spawn_blocking(move || instance.start()).await {
+        Ok(Ok(())) => {}
+        Ok(Err(error))
+            if error
+                .downcast_ref::<crate::session::StartBlocked>()
+                .is_some() => {}
+        Ok(Err(error)) => {
+            tracing::warn!(target: "acp.switch", session = %id, "tmux start after disable: {error}");
+        }
+        Err(error) => {
+            tracing::error!(target: "acp.switch", session = %id, "spawn_blocking failed: {error}");
+        }
     }
     Ok(())
 }
@@ -658,6 +808,307 @@ mod tests {
         let change = rx.try_recv().expect("the live slot's move is published");
         assert_eq!(change.instance_id, inst.id);
         assert_eq!((change.old, change.new), (Status::Running, Status::Idle));
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn structured_view_rejects_deleting_session_with_purge_reservation() {
+        let _home = crate::session::test_support::isolate_app_dir();
+        let mut inst = Instance::new("switch-during-purge", "/tmp/aoe-switch-during-purge");
+        inst.source_profile = "default".to_string();
+        inst.view = View::Terminal;
+        inst.status = Status::Deleting;
+        inst.lifecycle_generation = 7;
+        inst.lifecycle_reservation = Some(crate::session::LifecycleReservation {
+            op: crate::session::LifecycleOperation::Purge,
+            generation: 7,
+            at: chrono::Utc::now(),
+        });
+        let id = inst.id.clone();
+        crate::server::test_support::seed_instances_on_disk_for_test("default", vec![inst.clone()]);
+        let state = crate::server::test_support::build_test_app_state(vec![inst.clone()]);
+        let mut working = inst;
+
+        let response = commit_structured_view(&state, &mut working, None)
+            .await
+            .expect_err("a purge reservation must fence the view transition");
+
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        assert_eq!(working.view, View::Terminal);
+        assert_eq!(working.status, Status::Deleting);
+        assert_eq!(working.lifecycle_generation, 7);
+        let stored = crate::session::Storage::open_unwatched("default")
+            .unwrap()
+            .load()
+            .unwrap()
+            .into_iter()
+            .find(|candidate| candidate.id == id)
+            .expect("purging row remains stored");
+        assert_eq!(stored.view, View::Terminal);
+        assert_eq!(stored.status, Status::Deleting);
+        assert_eq!(stored.lifecycle_generation, 7);
+        assert!(stored.lifecycle_reservation.is_some());
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn structured_view_rejects_durable_unstartable_state_from_stale_cache() {
+        let _home = crate::session::test_support::isolate_app_dir();
+        let mut cached_archived =
+            Instance::new("archived-stale-cache", "/tmp/aoe-archived-stale-cache");
+        cached_archived.source_profile = "default".to_string();
+        cached_archived.view = View::Terminal;
+        let mut durable_archived = cached_archived.clone();
+        durable_archived.archive();
+
+        let mut cached_trashed =
+            Instance::new("trashed-stale-cache", "/tmp/aoe-trashed-stale-cache");
+        cached_trashed.source_profile = "default".to_string();
+        cached_trashed.view = View::Terminal;
+        let mut durable_trashed = cached_trashed.clone();
+        durable_trashed.trash();
+
+        let mut cached_handoff =
+            Instance::new("handoff-stale-cache", "/tmp/aoe-handoff-stale-cache");
+        cached_handoff.source_profile = "default".to_string();
+        cached_handoff.view = View::Terminal;
+        let mut durable_handoff = cached_handoff.clone();
+        durable_handoff.acp_handoff_pending = true;
+
+        crate::server::test_support::seed_instances_on_disk_for_test(
+            "default",
+            vec![
+                durable_archived.clone(),
+                durable_trashed.clone(),
+                durable_handoff.clone(),
+            ],
+        );
+        let state = crate::server::test_support::build_test_app_state(vec![
+            cached_archived.clone(),
+            cached_trashed.clone(),
+            cached_handoff.clone(),
+        ]);
+
+        for (mut stale_cache, expected_error) in [
+            (cached_archived, "session_archived"),
+            (cached_trashed, "session_trashed"),
+            (cached_handoff, "acp_handoff_pending"),
+        ] {
+            let response = commit_structured_view(&state, &mut stale_cache, None)
+                .await
+                .expect_err("durable archived or handoff-pending rows must block enable");
+            assert_eq!(response.status(), StatusCode::CONFLICT);
+            assert_eq!(stale_cache.view, View::Terminal);
+            let body = axum::body::to_bytes(response.into_body(), 4096)
+                .await
+                .unwrap();
+            let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(body["error"], expected_error);
+        }
+
+        let stored = crate::session::Storage::open_unwatched("default")
+            .unwrap()
+            .load()
+            .unwrap();
+        assert!(stored
+            .iter()
+            .find(|row| row.id == durable_archived.id)
+            .expect("archived row remains stored")
+            .is_archived());
+        assert!(stored
+            .iter()
+            .find(|row| row.id == durable_trashed.id)
+            .expect("trashed row remains stored")
+            .is_trashed());
+        assert!(
+            stored
+                .iter()
+                .find(|row| row.id == durable_handoff.id)
+                .expect("handoff row remains stored")
+                .acp_handoff_pending
+        );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn unproven_shutdown_keeps_terminal_handoff_pending_and_projection() {
+        let _home = crate::session::test_support::isolate_app_dir();
+        let mut instance = Instance::new("handoff-pending", "/tmp/aoe-handoff-pending");
+        instance.source_profile = "default".into();
+        instance.view = View::Terminal;
+        instance.acp_handoff_pending = true;
+        let id = instance.id.clone();
+        crate::server::test_support::seed_instances_on_disk_for_test(
+            "default",
+            vec![instance.clone()],
+        );
+        let state = crate::server::test_support::build_test_app_state(vec![instance.clone()]);
+        state
+            .acp_event_store
+            .record(&id, 1, &crate::acp::state::Event::ThinkingStarted)
+            .unwrap();
+
+        let record_path = crate::process::worker_registry::record_path(&id).unwrap();
+        std::fs::create_dir_all(record_path.parent().unwrap()).unwrap();
+        std::fs::create_dir(&record_path).unwrap();
+
+        let response = complete_terminal_handoff(&state, instance, false)
+            .await
+            .expect_err("unreadable worker ownership must keep the handoff pending");
+
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        assert_eq!(state.acp_event_store.highest_seq(&id), 1);
+        let stored = crate::session::Storage::open_unwatched("default")
+            .unwrap()
+            .load()
+            .unwrap()
+            .into_iter()
+            .find(|candidate| candidate.id == id)
+            .expect("terminal row remains stored");
+        assert!(stored.acp_handoff_pending);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn settled_terminal_handoff_clears_pending_marker_from_storage_and_projection() {
+        let _home = crate::session::test_support::isolate_app_dir();
+        let mut instance = Instance::new("handoff-settled", "/tmp/aoe-handoff-settled");
+        instance.source_profile = "default".into();
+        instance.view = View::Terminal;
+        instance.acp_handoff_pending = true;
+        // Keep the post-handoff restart from launching a tmux pane in this test.
+        instance.archived_at = Some(chrono::Utc::now());
+        let id = instance.id.clone();
+        crate::server::test_support::seed_instances_on_disk_for_test(
+            "default",
+            vec![instance.clone()],
+        );
+        let state = crate::server::test_support::build_test_app_state(vec![instance.clone()]);
+
+        assert_eq!(
+            state.acp_supervisor.worker_state(&id).await,
+            crate::daemon::AcpWorkerState::Absent
+        );
+        assert!(crate::process::worker_registry::load(&id)
+            .unwrap()
+            .is_none());
+
+        complete_terminal_handoff(&state, instance, false)
+            .await
+            .expect("confirmed worker settlement should complete the terminal handoff");
+
+        assert_eq!(
+            state.acp_supervisor.worker_state(&id).await,
+            crate::daemon::AcpWorkerState::Absent,
+            "shutdown settlement must leave no supervisor worker"
+        );
+        assert!(
+            crate::process::worker_registry::load(&id)
+                .unwrap()
+                .is_none(),
+            "shutdown settlement must leave no worker ownership record"
+        );
+
+        let cached = state
+            .instances
+            .read()
+            .await
+            .iter()
+            .find(|candidate| candidate.id == id)
+            .cloned()
+            .expect("terminal row remains in the cache");
+        assert!(!cached.acp_handoff_pending);
+
+        let stored = crate::session::Storage::open_unwatched("default")
+            .unwrap()
+            .load()
+            .unwrap()
+            .into_iter()
+            .find(|candidate| candidate.id == id)
+            .expect("terminal row remains stored");
+        assert!(!stored.acp_handoff_pending);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn projection_delete_failure_keeps_terminal_handoff_pending_for_retry() {
+        let _home = crate::session::test_support::isolate_app_dir();
+        let mut instance =
+            Instance::new("handoff-delete-failure", "/tmp/aoe-handoff-delete-failure");
+        instance.source_profile = "default".into();
+        instance.view = View::Terminal;
+        instance.acp_handoff_pending = true;
+        instance.archived_at = Some(chrono::Utc::now());
+        let id = instance.id.clone();
+        crate::server::test_support::seed_instances_on_disk_for_test(
+            "default",
+            vec![instance.clone()],
+        );
+        let mut state = crate::server::test_support::build_test_app_state(vec![instance.clone()]);
+        let db_path = crate::session::get_app_dir().unwrap().join("acp_events.db");
+        let event_store =
+            Arc::new(crate::acp::event_store::EventStore::open(&db_path, 100).unwrap());
+        Arc::get_mut(&mut state)
+            .expect("test state has one owner")
+            .acp_event_store = event_store.clone();
+        event_store
+            .record(&id, 1, &crate::acp::state::Event::ThinkingStarted)
+            .unwrap();
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        conn.execute_batch(
+            "CREATE TRIGGER fail_acp_event_delete BEFORE DELETE ON acp_events \
+             BEGIN SELECT RAISE(ABORT, 'test projection delete failure'); END;",
+        )
+        .unwrap();
+
+        let response = complete_terminal_handoff(&state, instance.clone(), false)
+            .await
+            .expect_err("projection cleanup failure must leave the handoff pending");
+
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        assert_eq!(event_store.highest_seq(&id), 1);
+        let cached = state
+            .instances
+            .read()
+            .await
+            .iter()
+            .find(|candidate| candidate.id == id)
+            .cloned()
+            .expect("terminal row remains in the cache");
+        assert!(cached.acp_handoff_pending);
+        let stored = crate::session::Storage::open_unwatched("default")
+            .unwrap()
+            .load()
+            .unwrap()
+            .into_iter()
+            .find(|candidate| candidate.id == id)
+            .expect("terminal row remains stored");
+        assert!(stored.acp_handoff_pending);
+
+        conn.execute_batch("DROP TRIGGER fail_acp_event_delete")
+            .unwrap();
+        complete_terminal_handoff(&state, instance, false)
+            .await
+            .expect("handoff should complete after projection cleanup recovers");
+
+        assert_eq!(event_store.highest_seq(&id), 0);
+        let cached = state
+            .instances
+            .read()
+            .await
+            .iter()
+            .find(|candidate| candidate.id == id)
+            .cloned()
+            .expect("terminal row remains in the cache");
+        assert!(!cached.acp_handoff_pending);
+        let stored = crate::session::Storage::open_unwatched("default")
+            .unwrap()
+            .load()
+            .unwrap()
+            .into_iter()
+            .find(|candidate| candidate.id == id)
+            .expect("terminal row remains stored");
+        assert!(!stored.acp_handoff_pending);
     }
 
     #[test]

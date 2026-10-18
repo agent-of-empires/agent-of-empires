@@ -285,30 +285,36 @@ impl HomeView {
         Ok(session_id)
     }
 
-    /// A trashed/archived row's agent was stopped deliberately, so refuse a start
-    /// visibly and point at the restore key instead of swallowing the press.
+    /// Refuse starts visibly for shelved rows and pending handoffs instead of
+    /// swallowing the press.
     pub(in crate::tui) fn refuse_start_if_shelved(&mut self, id: &str) -> bool {
         let shelved = self.get_instance(id).and_then(|inst| {
             // A row mid-purge gets no restore hint: it would race the in-flight delete.
             if inst.status == Status::Deleting {
                 return None;
             }
+            let key = if self.strict_hotkeys { "Z" } else { "z" };
             match inst.ensure_startable() {
-                Err(StartBlocked::Trashed) => Some(("Session in trash", "in the trash", "restore")),
-                Err(StartBlocked::Archived) => Some(("Session archived", "archived", "unarchive")),
+                Err(StartBlocked::Trashed) => Some((
+                    "Session in trash",
+                    format!("This session is in the trash; its agent stays stopped. Press {key} to restore it first."),
+                )),
+                Err(StartBlocked::Archived) => Some((
+                    "Session archived",
+                    format!("This session is archived; its agent stays stopped. Press {key} to unarchive it first."),
+                )),
+                Err(StartBlocked::AcpHandoffPending) => Some((
+                    "Session handoff pending",
+                    "A profile handoff is in progress. Wait for it to finish before starting this session."
+                        .to_string(),
+                )),
                 Ok(()) => None,
             }
         });
-        let Some((dialog_title, state, verb)) = shelved else {
+        let Some((dialog_title, message)) = shelved else {
             return false;
         };
-        let key = if self.strict_hotkeys { "Z" } else { "z" };
-        self.info_dialog = Some(InfoDialog::new(
-            dialog_title,
-            &format!(
-                "This session is {state}; its agent stays stopped. Press {key} to {verb} it first."
-            ),
-        ));
+        self.info_dialog = Some(InfoDialog::new(dialog_title, &message));
         true
     }
 
@@ -316,7 +322,8 @@ impl HomeView {
     /// swapping the AI engine first.
     ///
     /// Guards: no selection and transient lifecycle (`Creating` / `Deleting`) drop;
-    /// archived and trashed rows refuse with an info dialog pointing at the restore key;
+    /// archived and trashed rows point at their restore key, while pending handoffs ask the
+    /// user to wait;
     /// pane-dead rows drop silently; snoozed rows drop only under `Attention` sort, since
     /// elsewhere the snooze surface is hidden, so the flag is cleared and the restart
     /// runs. A repeat within 1.5s is debounced: overlapping cascades would each spawn a
@@ -1271,7 +1278,7 @@ impl HomeView {
             .ok_or_else(|| anyhow::anyhow!("Session not found"))?;
         let source_profile = live.source_profile.clone();
         let _identity_lock = acquire_session_identity_lock()?;
-        let storage = Storage::new(&source_profile, self.file_watch.clone())?;
+        let storage = Storage::open(&source_profile, self.file_watch.clone())?;
         let _lifecycle_lock = storage.acquire_instance_lifecycle_lock(&id)?;
         let authoritative_instances = storage.load()?;
         let mut authoritative = authoritative_instances
@@ -1919,7 +1926,7 @@ impl HomeView {
         // through the archive so `aoe send` cannot relaunch or type into the session between.
         let lifecycle_lock = match self.instances.get(&id) {
             Some(inst) => {
-                let storage = Storage::new(&inst.effective_profile(), self.file_watch.clone())?;
+                let storage = Storage::open(&inst.effective_profile(), self.file_watch.clone())?;
                 let lock = storage.acquire_instance_lifecycle_lock(&id)?;
                 inst.stop_all_tmux_sessions_locked(&storage);
                 Some(lock)
@@ -2086,11 +2093,13 @@ impl HomeView {
             RestoreFromTrash::Restored {
                 project_path,
                 pre_trash_project_path,
+                lifecycle_generation,
             } => {
                 if let Some(inst) = self.instances.get_mut(&id) {
                     inst.project_path = project_path;
                     inst.pre_trash_project_path = pre_trash_project_path;
                     inst.untrash();
+                    inst.lifecycle_generation = lifecycle_generation;
                     inst.lifecycle_reservation = None;
                 }
                 self.rebuild_flat_items();
@@ -2305,7 +2314,7 @@ impl HomeView {
         lock_order.sort_by(|a, b| a.id.cmp(&b.id));
         let mut lifecycle_locks = Vec::with_capacity(lock_order.len());
         for inst in lock_order {
-            let storage = Storage::new(&inst.effective_profile(), self.file_watch.clone())?;
+            let storage = Storage::open(&inst.effective_profile(), self.file_watch.clone())?;
             lifecycle_locks.push(storage.acquire_instance_lifecycle_lock(&inst.id)?);
         }
         self.bulk_apply_user_action(&ids, |inst| inst.archive())?;
@@ -2343,6 +2352,7 @@ enum RestoreFromTrash {
     Restored {
         project_path: String,
         pre_trash_project_path: Option<String>,
+        lifecycle_generation: u64,
     },
     AlreadyGone,
     Busy(String),
@@ -2352,15 +2362,18 @@ enum RestoreFromTrash {
     PersistFailed,
 }
 
-/// Restore under one per-instance lifecycle flock. Acquisition, worktree move,
-/// and durable commit therefore form one serialized transition.
+/// Restore under the purge-owner and lifecycle flocks. Acquisition, worktree
+/// move, and durable commit therefore form one serialized transition.
 fn restore_from_trash_with_storage(
     storage: &Storage,
     id: &str,
     owned_trash_generation: Option<u64>,
 ) -> RestoreFromTrash {
-    let _lifecycle_lock = match storage.acquire_instance_lifecycle_lock(id) {
-        Ok(lock) => lock,
+    let (_owner_lock, _lifecycle_lock) = match storage.try_acquire_restore_locks(id) {
+        Ok(Some(locks)) => locks,
+        Ok(None) => {
+            return RestoreFromTrash::Busy("busy with another lifecycle operation".to_string());
+        }
         Err(error) => {
             tracing::warn!(target: "tui.home", id = %id, "restore lock failed: {error}");
             return RestoreFromTrash::PersistFailed;
@@ -2372,9 +2385,17 @@ fn restore_from_trash_with_storage(
                 instances,
                 id,
                 generation,
+                storage.profile(),
+                storage.sessions_path(),
                 chrono::Utc::now(),
             ),
-            None => crate::session::claim::decide_restore_claim(instances, id, chrono::Utc::now()),
+            None => crate::session::claim::decide_restore_claim(
+                instances,
+                id,
+                storage.profile(),
+                storage.sessions_path(),
+                chrono::Utc::now(),
+            ),
         };
         decision.map_err(anyhow::Error::new)
     }) {
@@ -2443,6 +2464,7 @@ fn restore_from_trash_with_storage(
         Ok(crate::session::claim::RestoreCommit::Committed) => RestoreFromTrash::Restored {
             project_path: restored_path,
             pre_trash_project_path: restored_pre,
+            lifecycle_generation: generation,
         },
         Ok(crate::session::claim::RestoreCommit::Superseded) => {
             RestoreFromTrash::Busy(crate::session::NEWER_GENERATION_BUSY_REASON.to_string())

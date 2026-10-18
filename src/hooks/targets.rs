@@ -101,7 +101,7 @@ pub(crate) fn iter_hook_targets() -> Vec<HookTarget> {
                         }
                     }
                 }
-                let instances = match crate::session::Storage::new_unwatched(&profile)
+                let instances = match crate::session::Storage::open_unwatched(&profile)
                     .and_then(|storage| storage.load())
                 {
                     Ok(instances) => instances,

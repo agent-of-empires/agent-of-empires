@@ -1177,6 +1177,17 @@ fn trash_then_immediate_restore_hands_off_cleanly() {
     );
     assert!(restored.lifecycle_generation > trashed.lifecycle_generation);
     assert_eq!(restored.lifecycle_reservation, None);
+    let restored_in_view = env.view.get_instance(&id).unwrap();
+    assert_eq!(
+        restored_in_view.lifecycle_generation, restored.lifecycle_generation,
+        "the live row must adopt the committed Restore generation"
+    );
+    assert_eq!(restored_in_view.lifecycle_reservation, None);
+    assert_eq!(restored_in_view.project_path, restored.project_path);
+    assert_eq!(
+        restored_in_view.pre_trash_project_path,
+        restored.pre_trash_project_path
+    );
 
     release_tx.send(()).unwrap();
     let deadline = Instant::now() + Duration::from_secs(2);
@@ -1716,6 +1727,27 @@ fn restart_on_trashed_row_surfaces_refusal() {
         env.view.info_dialog.is_some(),
         "restarting a trashed row must explain why nothing happened"
     );
+}
+
+#[test]
+#[serial]
+fn restart_on_handoff_pending_row_asks_user_to_wait() {
+    let mut env = create_test_env_with_sessions(2);
+    let id = env.view.instance_at(0).id.clone();
+    env.view
+        .mutate_instance(&id, |inst| inst.acp_handoff_pending = true);
+    env.view.select_session_by_id(&id);
+
+    env.view
+        .restart_selected_session(None, None, None, None)
+        .unwrap();
+    let dialog = env
+        .view
+        .info_dialog
+        .as_ref()
+        .expect("a pending handoff must explain why restart was refused");
+    assert_eq!(dialog.title(), "Session handoff pending");
+    assert!(dialog.message().contains("Wait for it to finish"));
 }
 
 /// While that delete is in flight, restart stays a silent drop: the "press z to restore it

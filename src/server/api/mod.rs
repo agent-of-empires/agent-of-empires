@@ -102,7 +102,7 @@ pub(crate) async fn load_persisted_instance(
     let file_watch = state.file_watch.clone();
     let persisted = tokio::task::spawn_blocking(
         move || -> anyhow::Result<Option<crate::session::Instance>> {
-            let storage = crate::session::Storage::new(&profile_for_load, file_watch)?;
+            let storage = crate::session::Storage::open(&profile_for_load, file_watch)?;
             Ok(storage
                 .load()?
                 .into_iter()
@@ -123,7 +123,7 @@ pub(crate) async fn load_persisted_instance(
     ))
 }
 
-/// 409 for a start or resume refused because the session is archived or trashed.
+/// 409 for a start or resume refused by the session lifecycle state.
 pub(crate) fn start_blocked_response(blocked: crate::session::StartBlocked) -> Response {
     api_error(StatusCode::CONFLICT, blocked.code(), blocked.to_string())
 }
@@ -289,6 +289,33 @@ pub(super) fn validate_profile_name(name: &str) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn load_persisted_instance_does_not_recreate_a_renamed_profile() {
+        let _home = crate::session::test_support::isolate_app_dir();
+        let mut instance = crate::session::Instance::new("renamed", "/tmp/renamed");
+        instance.source_profile = "api-rename-before".to_string();
+        let instance_id = instance.id.clone();
+        crate::session::Storage::new_unwatched("api-rename-before")
+            .unwrap()
+            .update(|instances, _groups| {
+                instances.push(instance);
+                Ok(())
+            })
+            .unwrap();
+        let old_profile_dir = crate::session::get_profile_dir_path("api-rename-before").unwrap();
+
+        crate::session::rename_profile("api-rename-before", "api-rename-after").unwrap();
+        let state = crate::server::test_support::build_test_app_state(Vec::new());
+
+        assert!(
+            load_persisted_instance(&state, "api-rename-before", &instance_id)
+                .await
+                .is_err()
+        );
+        assert!(!old_profile_dir.exists());
+    }
 
     /// Mutating handlers by source file. Each must short-circuit in read-only
     /// mode and must extract any JSON body lazily, or axum's `Json<T>` 422s on a

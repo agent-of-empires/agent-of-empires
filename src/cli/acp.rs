@@ -943,8 +943,8 @@ async fn restart(session: &str) -> Result<()> {
     worker_registry::mark_restart_pending(session, record.generation);
 
     println!(
-        "Stopped runner for {} (PID {}). `aoe serve` will respawn on its next reconciler tick.",
-        session, pid
+        "Stopped runner (PID {}). `aoe serve` will respawn on its next reconciler tick.",
+        pid
     );
     Ok(())
 }

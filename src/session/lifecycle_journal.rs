@@ -275,12 +275,26 @@ where
 }
 
 pub(crate) fn update(path: &Path, entry: &LifecycleJournalEntry) -> Result<()> {
+    #[cfg(test)]
+    if FAIL_NEXT_UPDATE.with(|fail| fail.replace(false)) {
+        anyhow::bail!("injected lifecycle journal update failure");
+    }
     let bytes =
         serde_json::to_vec_pretty(&LifecycleJournalRecord::Deleting(Box::new(entry.clone())))?;
     atomic_write_verified(path, &bytes)
         .with_context(|| format!("failed to update lifecycle journal {}", path.display()))?;
     sync_parent_directory(path)
         .with_context(|| format!("lifecycle journal {} was not made durable", path.display()))
+}
+
+#[cfg(test)]
+thread_local! {
+    static FAIL_NEXT_UPDATE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(test)]
+pub(crate) fn fail_next_update_for_test() {
+    FAIL_NEXT_UPDATE.with(|fail| fail.set(true));
 }
 
 pub(crate) fn consume(path: &Path) -> Result<()> {

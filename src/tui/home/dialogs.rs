@@ -42,7 +42,7 @@ impl HomeView {
         let mut entries: Vec<ProfileEntry> = profiles
             .into_iter()
             .map(|name| ProfileEntry {
-                session_count: Storage::new(&name, self.file_watch.clone())
+                session_count: Storage::open(&name, self.file_watch.clone())
                     .and_then(|s| s.load())
                     .map_or(0, |instances| instances.len()),
                 is_active: self.active_profile.as_deref() == Some(name.as_str()),

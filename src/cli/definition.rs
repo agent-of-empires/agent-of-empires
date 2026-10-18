@@ -462,6 +462,18 @@ mod tests {
             (&["aoe", "session", "import", "--dry-run"], false),
             (&["aoe", "acp", "history", "demo"], false),
             (&["aoe", "profile", "list"], false),
+            (
+                &[
+                    "aoe",
+                    "profile",
+                    "repair-rename-checkpoint",
+                    "--checkpoint",
+                    ".profile-rename.json",
+                    "--sha256",
+                    "0000000000000000000000000000000000000000000000000000000000000000",
+                ],
+                false,
+            ),
             (&["aoe", "serve"], false),
             (&["aoe", "stop"], false),
             (&["aoe", "__extract-session-id"], false),

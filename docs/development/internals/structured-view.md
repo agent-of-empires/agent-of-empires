@@ -49,10 +49,11 @@ a zombie leader with remaining threads is still potentially writing. Live descen
 and unreadable process membership retain resources.
 
 The orphan reaper records `.orphan-stop` evidence before signaling. Runner self-cleanup
-cannot erase that retry path. The marker neither authorizes signals nor prevents a new
-runner from publishing. Non-writing old groups can release their marker without touching
-a successor record or listener. An aborted purge keeps its fence and abandoned intent
-when clearing them would lose the last durable evidence of a writing group.
+cannot erase that retry path. The marker does not authorize signals and blocks new runner
+publication until the orphan reaper releases it. Non-writing old groups can release their
+marker without touching a successor record or listener. An aborted purge keeps its fence
+and abandoned intent when clearing them would lose the last durable evidence of a writing
+group.
 
 Listener binding and registry publication share the registry lock. Purge cleanup checks
 invocation-local socket identity again before unlinking sockets and then the record.

@@ -6,6 +6,8 @@ use std::collections::HashMap;
 use std::fs;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
+#[cfg(test)]
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -750,7 +752,7 @@ pub struct Storage {
     save_lock: Arc<Mutex<()>>,
     file_watch: Arc<FileWatchService>,
     #[cfg(test)]
-    fail_writes_for_test: bool,
+    fail_writes_for_test: Arc<AtomicBool>,
 }
 
 // Cross-device-syncable sidebar ordering.
@@ -874,7 +876,7 @@ impl Storage {
             save_lock,
             file_watch,
             #[cfg(test)]
-            fail_writes_for_test: false,
+            fail_writes_for_test: Arc::new(AtomicBool::new(false)),
         })
     }
 
@@ -890,7 +892,7 @@ impl Storage {
             sessions_path,
             save_lock: save_lock_for(profile),
             file_watch: FileWatchService::noop(),
-            fail_writes_for_test: false,
+            fail_writes_for_test: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -907,7 +909,7 @@ impl Storage {
             save_lock,
             file_watch,
             #[cfg(test)]
-            fail_writes_for_test: false,
+            fail_writes_for_test: Arc::new(AtomicBool::new(false)),
         })
     }
 
@@ -922,6 +924,20 @@ impl Storage {
     ) -> Result<Option<StorageFlock>> {
         super::validate_instance_id(instance_id)?;
         try_acquire_storage_flock(&get_app_dir()?, &format!(".purge-owner-{instance_id}.lock"))
+    }
+
+    /// Acquire both Restore locks without waiting, in the same order as purge.
+    pub(crate) fn try_acquire_restore_locks(
+        &self,
+        instance_id: &str,
+    ) -> Result<Option<(StorageFlock, StorageFlock)>> {
+        let Some(owner_lock) = self.try_acquire_purge_owner_lock(instance_id)? else {
+            return Ok(None);
+        };
+        let Some(lifecycle_lock) = self.try_acquire_instance_lifecycle_lock(instance_id)? else {
+            return Ok(None);
+        };
+        Ok(Some((owner_lock, lifecycle_lock)))
     }
 
     /// Serialize launch/restart and explicit resume-target mutation for one instance across
@@ -974,7 +990,7 @@ impl Storage {
 
     #[cfg(test)]
     pub(crate) fn set_fail_writes_for_test(&mut self, fail: bool) {
-        self.fail_writes_for_test = fail;
+        self.fail_writes_for_test.store(fail, Ordering::SeqCst);
     }
 
     pub fn profile(&self) -> &str {
@@ -1190,7 +1206,7 @@ impl Storage {
             self.file_watch.notify_local_change(&groups_path);
         }
         #[cfg(test)]
-        if self.fail_writes_for_test {
+        if self.fail_writes_for_test.load(Ordering::SeqCst) {
             anyhow::bail!("injected sessions write failure");
         }
 

@@ -27,6 +27,13 @@ impl DeletionPoller {
     pub fn try_recv_result(&self) -> Result<DeletionResult, TryRecvError> {
         self.worker.try_recv()
     }
+
+    #[cfg(test)]
+    pub(crate) fn with_result_for_test(result: DeletionResult) -> Self {
+        Self {
+            worker: Worker::seeded_for_test("aoe-deletion-poller-test", result),
+        }
+    }
 }
 
 impl Default for DeletionPoller {

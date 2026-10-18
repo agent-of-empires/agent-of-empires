@@ -52,7 +52,7 @@ impl HomeView {
         };
 
         for profile_name in &profile_names {
-            let storage = Storage::new(profile_name, file_watch.clone())?;
+            let storage = Storage::open(profile_name, file_watch.clone())?;
             let (mut instances, groups) = storage.load_with_groups()?;
             for inst in &mut instances {
                 inst.source_profile = profile_name.clone();
@@ -729,7 +729,7 @@ impl HomeView {
             for name in &current_profiles {
                 if !self.storages.contains_key(name) {
                     self.storages
-                        .insert(name.clone(), Storage::new(name, self.file_watch.clone())?);
+                        .insert(name.clone(), Storage::open(name, self.file_watch.clone())?);
                 }
             }
             self.storages.retain(|k, _| current_profiles.contains(k));

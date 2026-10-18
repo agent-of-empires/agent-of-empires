@@ -1,6 +1,7 @@
 //! Applying what the deletion, stop, trash, restart, recovery, and session-id pollers hand back.
 
 use super::*;
+use crate::session::Status;
 
 impl HomeView {
     pub fn apply_deletion_results(&mut self) -> bool {
@@ -10,6 +11,24 @@ impl HomeView {
 
         match self.deletion_poller.try_recv_result() {
             Ok(result) => {
+                if matches!(
+                    result.disposition,
+                    DeletionDisposition::Removed | DeletionDisposition::AlreadyGone
+                ) {
+                    if let Err(error) = self.reload_storage_only() {
+                        tracing::warn!(
+                            target: "tui.home",
+                            session = %result.session_id,
+                            error = %error,
+                            "could not reload session after deletion result; preserving cached state"
+                        );
+                        return true;
+                    }
+                    if self.instances.contains_key(&result.session_id) {
+                        return true;
+                    }
+                }
+
                 let attempt = self.deletes_in_flight.remove(&result.session_id);
                 if result.disposition == DeletionDisposition::Failed {
                     if let Some(attempt) = attempt {
@@ -21,22 +40,14 @@ impl HomeView {
                 }
                 match result.disposition {
                     DeletionDisposition::Removed | DeletionDisposition::AlreadyGone => {
-                        self.instances.shift_remove(&result.session_id);
-                        self.rebuild_group_trees();
-                        self.rebuild_flat_items();
+                        // A successful reload above already removed the deleted row.
                     }
                     DeletionDisposition::KeptRestored => {
                         if let (Some(current), Some(retained)) = (
                             self.instances.get_mut(&result.session_id),
                             result.retained_instance,
                         ) {
-                            current.lifecycle_generation = retained.lifecycle_generation;
-                            current.status = retained.status;
-                            current.trashed_at = retained.trashed_at;
-                            current.trash_lifecycle_id = retained.trash_lifecycle_id;
-                            current.project_path = retained.project_path;
-                            current.pre_trash_project_path = retained.pre_trash_project_path;
-                            current.lifecycle_reservation = retained.lifecycle_reservation;
+                            adopt_deletion_lifecycle(current, &retained);
                         }
                         let message = if result.teardown_started {
                             "This session was restored while its delete ran; the record was kept, but its worktree, branch, container, or transcript may already be gone. Inspect and repair it."
@@ -47,14 +58,13 @@ impl HomeView {
                         self.rebuild_flat_items();
                     }
                     DeletionDisposition::Busy => {
-                        if let Some(current) = self.instances.get_mut(&result.session_id) {
-                            if let Some(retained) = result.retained_instance {
-                                current.status = retained.status;
-                                current.lifecycle_generation = retained.lifecycle_generation;
-                                current.lifecycle_reservation = retained.lifecycle_reservation;
-                            } else {
-                                current.status = Status::Error;
-                            }
+                        let retained = result
+                            .retained_instance
+                            .or_else(|| self.load_durable_instance(&result.session_id));
+                        if let (Some(current), Some(retained)) =
+                            (self.instances.get_mut(&result.session_id), retained)
+                        {
+                            adopt_deletion_lifecycle(current, &retained);
                         }
                         self.info_dialog = Some(InfoDialog::new(
                             "Delete in progress",
@@ -67,10 +77,12 @@ impl HomeView {
                         } else {
                             Some(result.errors.join("; "))
                         };
-                        self.mutate_instance(&result.session_id, |inst| {
-                            inst.status = Status::Error;
-                            inst.last_error = error;
-                        });
+                        self.apply_failed_deletion(
+                            &result.session_id,
+                            result.retained_instance,
+                            result.teardown_started,
+                            error,
+                        );
                     }
                 }
                 true
@@ -89,14 +101,37 @@ impl HomeView {
                 tracing::error!(
                     target: "tui.home",
                     rows = stuck.len(),
-                    "deletion poller worker gone; marking stuck Deleting rows Error",
+                    "deletion poller worker gone; reconciling stuck Deleting rows",
                 );
+                let mut removed = false;
                 for id in &stuck {
-                    self.mutate_instance(id, |inst| {
-                        inst.status = Status::Error;
-                        inst.last_error =
-                            Some("Deletion worker crashed; session was not deleted".to_string());
-                    });
+                    let error = "Deletion worker crashed; session was not deleted".to_string();
+                    match self.try_load_durable_instance(id) {
+                        Ok(Some(durable)) => {
+                            self.mutate_instance(id, |inst| {
+                                inst.status = failed_deletion_status(inst, &durable, false);
+                                inst.lifecycle_generation = durable.lifecycle_generation;
+                                inst.lifecycle_reservation = durable.lifecycle_reservation.clone();
+                                inst.last_error = Some(error);
+                            });
+                        }
+                        Ok(None) => {
+                            self.instances.shift_remove(id);
+                            removed = true;
+                        }
+                        Err(load_error) => {
+                            tracing::warn!(target: "tui.home", session = %id,
+                                error = %load_error,
+                                "could not reload durable session after deletion worker exited");
+                            self.mutate_instance(id, |inst| {
+                                inst.last_error = Some(error);
+                            });
+                        }
+                    }
+                }
+                if removed {
+                    self.rebuild_group_trees();
+                    self.rebuild_flat_items();
                 }
                 true
             }
@@ -151,9 +186,59 @@ impl HomeView {
 
     /// The row as last committed to its profile's storage.
     fn load_durable_instance(&self, id: &str) -> Option<Instance> {
-        let profile = &self.instances.get(id)?.source_profile;
-        let instances = self.storages.get(profile)?.load().ok()?;
-        instances.into_iter().find(|instance| instance.id == id)
+        self.try_load_durable_instance(id).ok().flatten()
+    }
+
+    fn try_load_durable_instance(&self, id: &str) -> anyhow::Result<Option<Instance>> {
+        let instance = self
+            .instances
+            .get(id)
+            .ok_or_else(|| anyhow::anyhow!("session '{id}' is unavailable in the TUI"))?;
+        let profile = &instance.source_profile;
+        let storage = self
+            .storages
+            .get(profile)
+            .ok_or_else(|| anyhow::anyhow!("storage for profile '{profile}' is unavailable"))?;
+        Ok(storage
+            .load()?
+            .into_iter()
+            .find(|instance| instance.id == id))
+    }
+
+    fn apply_failed_deletion(
+        &mut self,
+        id: &str,
+        retained: Option<Instance>,
+        teardown_started: bool,
+        error: Option<String>,
+    ) {
+        let retained = match retained {
+            Some(retained) => Ok(Some(retained)),
+            None => self.try_load_durable_instance(id),
+        };
+        match retained {
+            Ok(Some(retained)) => {
+                self.mutate_instance(id, |inst| {
+                    let status = failed_deletion_status(inst, &retained, teardown_started);
+                    if adopt_deletion_lifecycle(inst, &retained) {
+                        inst.status = status;
+                        inst.last_error = error;
+                    }
+                });
+            }
+            Ok(None) => {
+                self.instances.shift_remove(id);
+                self.rebuild_group_trees();
+                self.rebuild_flat_items();
+            }
+            Err(load_error) => {
+                tracing::warn!(target: "tui.home", session = %id, error = %load_error,
+                    "could not reload durable session after delete failure");
+                self.mutate_instance(id, |inst| {
+                    inst.last_error = error;
+                });
+            }
+        }
     }
 
     pub fn apply_trash_results(&mut self) -> bool {
@@ -335,6 +420,8 @@ impl HomeView {
                 Ok(update) => {
                     let RecoveryUpdate {
                         instance_id,
+                        starting_source_profile,
+                        starting_lifecycle_generation,
                         title,
                         instance,
                         result,
@@ -372,10 +459,30 @@ impl HomeView {
                             );
                         }
                     }
-                    self.recovery_in_flight.remove(&instance_id);
+                    touched |= self.recovery_in_flight.remove(&instance_id);
                     if let Some(slot) = self.instances.get_mut(&instance_id) {
-                        *slot = *instance;
-                        touched = true;
+                        let same_starting_identity = slot.id == instance_id
+                            && slot.source_profile == starting_source_profile
+                            && slot.lifecycle_generation == starting_lifecycle_generation;
+                        let valid_worker_identity = instance.id == instance_id
+                            && instance.source_profile == starting_source_profile
+                            && instance.lifecycle_generation >= starting_lifecycle_generation;
+                        if same_starting_identity && valid_worker_identity {
+                            *slot = *instance;
+                            touched = true;
+                        } else {
+                            tracing::debug!(
+                                target: "session.startup_recovery",
+                                id = %instance_id,
+                                starting_profile = %starting_source_profile,
+                                starting_generation = starting_lifecycle_generation,
+                                current_profile = %slot.source_profile,
+                                current_generation = slot.lifecycle_generation,
+                                result_profile = %instance.source_profile,
+                                result_generation = instance.lifecycle_generation,
+                                "ignoring stale startup recovery update"
+                            );
+                        }
                     }
                 }
                 Err(std::sync::mpsc::TryRecvError::Empty) => break,
@@ -654,6 +761,8 @@ impl HomeView {
                     .await
                     .expect("recovery semaphore not closed");
                 let id = inst.id.clone();
+                let starting_source_profile = inst.source_profile.clone();
+                let starting_lifecycle_generation = inst.lifecycle_generation;
                 let title = inst.title.clone();
                 let inst_pre_panic = inst.clone();
                 let mut working = inst;
@@ -681,6 +790,8 @@ impl HomeView {
                 };
                 let _ = tx.send(RecoveryUpdate {
                     instance_id: id,
+                    starting_source_profile,
+                    starting_lifecycle_generation,
                     title,
                     instance: Box::new(instance),
                     result,
@@ -690,5 +801,78 @@ impl HomeView {
 
         self.recovery_rx = Some(rx);
         self.recovery_lock = Some(lock);
+    }
+}
+
+fn adopt_deletion_lifecycle(current: &mut Instance, retained: &Instance) -> bool {
+    if retained.lifecycle_generation < current.lifecycle_generation {
+        return false;
+    }
+    current.status = retained.status;
+    current.last_accessed_at = retained.last_accessed_at;
+    current.idle_entered_at = retained.idle_entered_at;
+    current.lifecycle_generation = retained.lifecycle_generation;
+    current.lifecycle_reservation = retained.lifecycle_reservation.clone();
+    current.trashed_at = retained.trashed_at;
+    current.trash_lifecycle_id = retained.trash_lifecycle_id.clone();
+    current.project_path.clone_from(&retained.project_path);
+    current.pre_trash_project_path = retained.pre_trash_project_path.clone();
+    true
+}
+
+fn failed_deletion_status(
+    current: &Instance,
+    durable: &Instance,
+    teardown_started: bool,
+) -> Status {
+    if durable.status == Status::Deleting
+        || teardown_started
+        || durable.lifecycle_generation > current.lifecycle_generation
+    {
+        durable.status
+    } else {
+        Status::Error
+    }
+}
+
+#[cfg(test)]
+mod deletion_failure_tests {
+    use super::*;
+
+    #[test]
+    fn failed_delete_keeps_durable_deleting_state() {
+        let current = Instance::new("session", "/tmp/session");
+        let mut durable = current.clone();
+        durable.status = Status::Deleting;
+        assert_eq!(
+            failed_deletion_status(&current, &durable, false),
+            Status::Deleting
+        );
+    }
+
+    #[test]
+    fn failed_delete_reports_error_only_before_irreversible_teardown() {
+        let current = Instance::new("session", "/tmp/session");
+        let durable = current.clone();
+        assert_eq!(
+            failed_deletion_status(&current, &durable, false),
+            Status::Error
+        );
+        assert_eq!(
+            failed_deletion_status(&current, &durable, true),
+            Status::Idle
+        );
+    }
+
+    #[test]
+    fn failed_delete_preserves_a_newer_durable_lifecycle() {
+        let current = Instance::new("session", "/tmp/session");
+        let mut durable = current.clone();
+        durable.lifecycle_generation += 1;
+        durable.status = Status::Running;
+        assert_eq!(
+            failed_deletion_status(&current, &durable, false),
+            Status::Running
+        );
     }
 }

@@ -29,6 +29,44 @@ use linux as platform;
 use macos as platform;
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
 mod platform {
+    use std::path::Path;
+
+    #[cfg(unix)]
+    #[derive(Debug, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+    pub(crate) struct DirectoryIdentity {
+        device: u64,
+        inode: u64,
+    }
+
+    #[cfg(not(unix))]
+    #[derive(Debug, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+    pub(crate) struct DirectoryIdentity {
+        created: std::time::SystemTime,
+    }
+
+    pub(crate) fn profile_directory_identity(
+        path: &Path,
+    ) -> anyhow::Result<Option<DirectoryIdentity>> {
+        let metadata = match std::fs::metadata(path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error.into()),
+        };
+        anyhow::ensure!(metadata.is_dir(), "profile is not a directory");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            Ok(Some(DirectoryIdentity {
+                device: metadata.dev(),
+                inode: metadata.ino(),
+            }))
+        }
+        #[cfg(not(unix))]
+        Ok(Some(DirectoryIdentity {
+            created: metadata.created()?,
+        }))
+    }
+
     pub(super) fn configure_process_group(_: &mut std::process::Command) {}
 
     pub(super) fn kill_process_group(_: &std::process::Child) {}
@@ -54,6 +92,12 @@ mod platform {
             "process replacement requires Linux or macOS",
         )
     }
+}
+
+pub(crate) use platform::DirectoryIdentity;
+
+pub(crate) fn profile_directory_identity(path: &Path) -> anyhow::Result<Option<DirectoryIdentity>> {
+    platform::profile_directory_identity(path)
 }
 
 pub(crate) const LIVE_PANE_ENV_KEYS: [&str; 3] = ["TERM", "TMUX", "TMUX_PANE"];
@@ -216,94 +260,6 @@ pub fn exec_post_login_opencode_yolo() -> anyhow::Result<()> {
     Err(platform::exec_command(&mut command).into())
 }
 
-#[derive(
-    Debug, Clone, Copy, serde::Serialize, serde::Deserialize, PartialEq, Eq, PartialOrd, Ord,
-)]
-pub struct KernelProcessIdentity {
-    boot_id: uuid::Uuid,
-    start_id: u64,
-}
-
-#[cfg(any(target_os = "linux", target_os = "macos"))]
-struct KernelProcessState {
-    start_id: u64,
-    group: u32,
-    writing: bool,
-}
-
-#[cfg(any(target_os = "linux", target_os = "macos"))]
-fn kernel_boot_id() -> anyhow::Result<uuid::Uuid> {
-    static BOOT: std::sync::OnceLock<uuid::Uuid> = std::sync::OnceLock::new();
-    if let Some(boot) = BOOT.get() {
-        return Ok(*boot);
-    }
-    let text =
-        platform::boot_id().ok_or_else(|| anyhow::anyhow!("kernel boot identity unavailable"))?;
-    let boot = uuid::Uuid::parse_str(&text)?;
-    let _ = BOOT.set(boot);
-    Ok(boot)
-}
-
-pub(crate) fn kernel_process_identity(pid: u32) -> anyhow::Result<Option<KernelProcessIdentity>> {
-    anyhow::ensure!(
-        pid > 0 && pid <= i32::MAX as u32,
-        "invalid process identity PID"
-    );
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
-    {
-        let Some(state) = platform::kernel_process_state(pid)? else {
-            return Ok(None);
-        };
-        Ok(Some(KernelProcessIdentity {
-            boot_id: kernel_boot_id()?,
-            start_id: state.start_id,
-        }))
-    }
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-    anyhow::bail!("kernel process identity unavailable on this platform")
-}
-
-pub(crate) fn process_group_has_writers(
-    pid: u32,
-    identity: Option<KernelProcessIdentity>,
-) -> anyhow::Result<bool> {
-    anyhow::ensure!(
-        pid > 0 && pid <= i32::MAX as u32,
-        "invalid process group PID"
-    );
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
-    {
-        if let Some(identity) = identity {
-            if identity.boot_id != kernel_boot_id()? {
-                return Ok(false);
-            }
-        }
-        if let Some(state) = platform::kernel_process_state(pid)? {
-            if state.writing {
-                let identity = identity.ok_or_else(|| {
-                    anyhow::anyhow!("live process group leader identity is unknown")
-                })?;
-                anyhow::ensure!(
-                    identity.start_id == state.start_id,
-                    "live process group leader identity changed"
-                );
-                if state.group == pid {
-                    return Ok(true);
-                }
-            }
-        }
-        if !worker::is_process_group_alive(pid) {
-            return Ok(false);
-        }
-        platform::group_has_writers(pid)
-    }
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-    {
-        let _ = identity;
-        anyhow::bail!("process group writer proof unavailable on this platform")
-    }
-}
-
 /// Lower the child's scheduling and I/O priority where the OS supports it.
 pub(crate) fn throttle_child(cmd: &mut std::process::Command) {
     #[cfg(target_os = "macos")]
@@ -384,6 +340,38 @@ pub(crate) fn rename_exclusive(
             std::io::ErrorKind::Unsupported,
             "exclusive directory publication is unsupported on this platform",
         ))
+    }
+}
+
+/// Move a profile directory without replacing an existing destination.
+/// Platform-specific rename mechanics belong in this module.
+pub(crate) fn rename_profile_directory(source: &Path, destination: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        let source_parent = source
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        let destination_parent = destination
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        let source_name = source.file_name().ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::InvalidInput, "source has no file name")
+        })?;
+        let destination_name = destination.file_name().ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "destination has no file name",
+            )
+        })?;
+        let source_dir: std::os::fd::OwnedFd = std::fs::File::open(source_parent)?.into();
+        let destination_dir: std::os::fd::OwnedFd = std::fs::File::open(destination_parent)?.into();
+        rename_exclusive(&source_dir, source_name, &destination_dir, destination_name)
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::rename(source, destination)
     }
 }
 
@@ -759,6 +747,14 @@ pub(crate) struct RunnerProcessGuard {
 }
 
 impl RunnerProcessGuard {
+    pub(crate) fn matches_identity(
+        &self,
+        pid: u32,
+        fingerprint: Option<ProcessBirthFingerprint>,
+    ) -> bool {
+        !self.obsolete && self.pid == pid && self.fingerprint == fingerprint
+    }
+
     pub(crate) fn capture(
         pid: u32,
         fingerprint: Option<ProcessBirthFingerprint>,
@@ -948,6 +944,10 @@ impl RunnerProcessGuard {
 
     pub(crate) fn settle(&self, grace: Duration) -> anyhow::Result<()> {
         self.signal(libc::SIGTERM)?;
+        self.settle_after_term(grace)
+    }
+
+    pub(crate) fn settle_after_term(&self, grace: Duration) -> anyhow::Result<()> {
         let term_deadline = Instant::now() + grace;
         let kill_deadline = term_deadline + Duration::from_secs(5);
         let mut killed = false;
@@ -1354,6 +1354,27 @@ mod tests {
     use super::*;
 
     #[test]
+    fn rename_profile_directory_preserves_an_existing_destination() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("source");
+        let destination = temp.path().join("destination");
+        std::fs::create_dir(&source).unwrap();
+        std::fs::create_dir(&destination).unwrap();
+        std::fs::write(source.join("value"), "source").unwrap();
+        std::fs::write(destination.join("value"), "destination").unwrap();
+
+        assert!(rename_profile_directory(&source, &destination).is_err());
+        assert_eq!(
+            std::fs::read_to_string(source.join("value")).unwrap(),
+            "source"
+        );
+        assert_eq!(
+            std::fs::read_to_string(destination.join("value")).unwrap(),
+            "destination"
+        );
+    }
+
+    #[test]
     fn prime_process_selection_preserves_scope_across_pid_reuse() {
         let sample = |pid, parent, start: &str, marked| PrimeProcessSample {
             identity: PrimeProcessIdentity {
@@ -1402,28 +1423,32 @@ mod tests {
         );
     }
 
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
-    fn live_process_group_leader_requires_its_recorded_birth_identity() {
-        use std::os::unix::process::CommandExt as _;
+    fn prime_process_selection_keeps_attested_child_when_parent_sample_is_missing() {
+        let child = PrimeProcessIdentity {
+            pid: 42,
+            start_id: "proc:420".into(),
+        };
+        let selected = select_prime_processes(
+            vec![
+                PrimeProcessSample {
+                    identity: child.clone(),
+                    parent: 99,
+                    marked: false,
+                },
+                PrimeProcessSample {
+                    identity: PrimeProcessIdentity {
+                        pid: 50,
+                        start_id: "proc:500".into(),
+                    },
+                    parent: 1,
+                    marked: false,
+                },
+            ],
+            std::slice::from_ref(&child),
+        );
 
-        let mut child = std::process::Command::new("sleep")
-            .arg("30")
-            .process_group(0)
-            .spawn()
-            .unwrap();
-        let pid = child.id();
-        let identity = kernel_process_identity(pid).unwrap().unwrap();
-        assert!(process_group_has_writers(pid, Some(identity)).unwrap());
-
-        let mut reused = identity;
-        reused.start_id += 1;
-        assert!(process_group_has_writers(pid, Some(reused)).is_err());
-        assert!(process_group_has_writers(pid, None).is_err());
-
-        child.kill().unwrap();
-        child.wait().unwrap();
-        assert!(!process_group_has_writers(pid, Some(identity)).unwrap());
+        assert_eq!(selected, [child]);
     }
 
     #[cfg(target_os = "macos")]

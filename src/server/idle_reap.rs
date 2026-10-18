@@ -114,7 +114,7 @@ pub(super) async fn reap_idle_sessions(
                     let file_watch_for_storage = file_watch.clone();
                     let _ = tokio::task::spawn_blocking(move || {
                         if let Ok(storage) =
-                            crate::session::Storage::new(&profile, file_watch_for_storage)
+                            crate::session::Storage::open(&profile, file_watch_for_storage)
                         {
                             let _ = storage.update(|instances, _groups| {
                                 if let Some(inst) = instances.iter_mut().find(|i| i.id == id) {

@@ -344,6 +344,9 @@ pub struct Instance {
     pub acp_effort: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub acp_session_id: Option<String>,
+    /// A terminal handoff is durable until the worker is stopped and its event projection is removed.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub(crate) acp_handoff_pending: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub import_pending: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

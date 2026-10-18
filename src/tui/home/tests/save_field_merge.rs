@@ -113,6 +113,169 @@ fn test_save_drops_explicitly_deleted_row() {
     );
 }
 
+#[test]
+#[serial]
+fn stale_delete_result_preserves_a_reloaded_successor_and_its_retry_state() {
+    use crate::session::deletion::{DeletionDisposition, DeletionResult};
+
+    let (_temp, _guard, mut view, id) = boot_view_with_one_session("original", "/tmp/original");
+    let storage = Storage::new_unwatched("test").unwrap();
+    let mut successor = storage
+        .load()
+        .unwrap()
+        .into_iter()
+        .find(|instance| instance.id == id)
+        .unwrap();
+    successor.lifecycle_generation += 1;
+    successor.title = "successor".to_string();
+    successor.status = Status::Running;
+    storage
+        .update(|instances, _| {
+            let current = instances
+                .iter_mut()
+                .find(|instance| instance.id == id)
+                .unwrap();
+            current.lifecycle_generation = successor.lifecycle_generation;
+            current.title = successor.title.clone();
+            current.status = successor.status;
+            Ok(())
+        })
+        .unwrap();
+    view.reload().unwrap();
+
+    let attempt = super::super::DeleteAttempt {
+        forced: true,
+        trashed_at: successor.trashed_at,
+        trash_lifecycle_id: successor.trash_lifecycle_id.clone(),
+    };
+    view.deletes_in_flight.insert(id.clone(), attempt.clone());
+    view.failed_deletes.insert(id.clone(), attempt);
+    view.deletion_poller =
+        crate::tui::deletion_poller::DeletionPoller::with_result_for_test(DeletionResult {
+            session_id: id.clone(),
+            success: true,
+            messages: Vec::new(),
+            errors: Vec::new(),
+            disposition: DeletionDisposition::Removed,
+            teardown_started: true,
+            retained_instance: None,
+        });
+
+    assert!(view.apply_deletion_results());
+
+    let current = view
+        .get_instance(&id)
+        .expect("successor must remain visible");
+    assert_eq!(current.lifecycle_generation, successor.lifecycle_generation);
+    assert_eq!(current.title, "successor");
+    assert_eq!(current.status, Status::Running);
+    assert!(view.deletes_in_flight.contains_key(&id));
+    assert!(view.failed_deletes.contains_key(&id));
+}
+
+#[test]
+#[serial]
+fn stale_busy_and_failed_delete_results_do_not_regress_a_reloaded_successor() {
+    use crate::session::deletion::{DeletionDisposition, DeletionResult};
+
+    for disposition in [
+        DeletionDisposition::Busy,
+        DeletionDisposition::KeptRestored,
+        DeletionDisposition::Failed,
+    ] {
+        let (_temp, _guard, mut view, id) = boot_view_with_one_session("original", "/tmp/original");
+        let storage = Storage::new_unwatched("test").unwrap();
+        let mut successor = storage.load().unwrap().remove(0);
+        successor.lifecycle_generation += 2;
+        successor.title = "successor".to_string();
+        successor.status = Status::Running;
+        successor.project_path = "/tmp/successor".to_string();
+        storage
+            .update(|instances, _| {
+                instances[0] = successor.clone();
+                Ok(())
+            })
+            .unwrap();
+        view.reload().unwrap();
+
+        let mut stale = successor.clone();
+        stale.lifecycle_generation -= 1;
+        stale.status = Status::Deleting;
+        stale.lifecycle_reservation = Some(crate::session::LifecycleReservation {
+            op: crate::session::LifecycleOperation::Purge,
+            generation: stale.lifecycle_generation,
+            at: Utc::now(),
+        });
+        stale.project_path = "/tmp/stale".to_string();
+        view.deletion_poller =
+            crate::tui::deletion_poller::DeletionPoller::with_result_for_test(DeletionResult {
+                session_id: id.clone(),
+                success: false,
+                messages: Vec::new(),
+                errors: vec!["stale deletion result".to_string()],
+                disposition,
+                teardown_started: true,
+                retained_instance: Some(stale),
+            });
+
+        assert!(view.apply_deletion_results());
+        let current = view.get_instance(&id).expect("successor remains visible");
+        assert_eq!(current.lifecycle_generation, successor.lifecycle_generation);
+        assert_eq!(current.title, successor.title);
+        assert_eq!(current.status, successor.status);
+        assert_eq!(current.project_path, successor.project_path);
+        assert_eq!(
+            current.lifecycle_reservation,
+            successor.lifecycle_reservation
+        );
+        assert_eq!(current.last_error, successor.last_error);
+    }
+}
+
+#[test]
+#[serial]
+fn stale_startup_recovery_update_does_not_replace_a_successor() {
+    for profile_changed in [false, true] {
+        let (_temp, _guard, mut view, id) = boot_view_with_one_session("original", "/tmp/original");
+        let starting = view.get_instance(&id).unwrap().clone();
+        let mut successor = starting.clone();
+        successor.title = "successor".to_string();
+        successor.project_path = "/tmp/successor".to_string();
+        successor.status = Status::Running;
+        if profile_changed {
+            successor.source_profile = "moved".to_string();
+        } else {
+            successor.lifecycle_generation += 1;
+        }
+        view.instances.insert(id.clone(), successor.clone());
+
+        let mut stale_result = starting.clone();
+        stale_result.title = "stale recovery result".to_string();
+        stale_result.status = Status::Error;
+        let (tx, rx) = std::sync::mpsc::channel();
+        let update = super::super::RecoveryUpdate {
+            instance_id: id.clone(),
+            starting_source_profile: starting.source_profile.clone(),
+            starting_lifecycle_generation: starting.lifecycle_generation,
+            title: stale_result.title.clone(),
+            instance: Box::new(stale_result),
+            result: Err("late recovery failure".to_string()),
+        };
+        assert!(tx.send(update).is_ok());
+        view.recovery_rx = Some(rx);
+        view.recovery_in_flight.insert(id.clone());
+
+        assert!(view.apply_recovery_updates());
+        let current = view.get_instance(&id).expect("successor remains present");
+        assert_eq!(current.title, "successor");
+        assert_eq!(current.project_path, "/tmp/successor");
+        assert_eq!(current.status, Status::Running);
+        assert_eq!(current.source_profile, successor.source_profile);
+        assert_eq!(current.lifecycle_generation, successor.lifecycle_generation);
+        assert!(!view.recovery_in_flight.contains(&id));
+    }
+}
+
 /// `apply_user_action` persists its own edit with a field-level merge, so unrelated peer
 /// writes survive.
 #[test]

@@ -400,7 +400,7 @@ impl Instance {
         }
         let file_watch = self.resolve_file_watch();
         let ownership: Result<_> = (|| {
-            let storage = crate::session::storage::Storage::new(profile, file_watch.clone())?;
+            let storage = crate::session::storage::Storage::open(profile, file_watch.clone())?;
             let lifecycle_lock = storage.acquire_instance_lifecycle_lock(&self.id)?;
             let generation = storage.update(|instances, _groups| {
                 let Some(stored) = instances.iter_mut().find(|instance| instance.id == self.id)
@@ -863,7 +863,7 @@ impl Instance {
     /// sid; the CAS guard keeps peer sid changes authoritative.
     pub(super) fn mark_resume_probe_failed(&mut self, profile: &str, sid: &str) -> SidWrite {
         let storage =
-            match crate::session::storage::Storage::new(profile, self.resolve_file_watch()) {
+            match crate::session::storage::Storage::open(profile, self.resolve_file_watch()) {
                 Ok(s) => s,
                 Err(e) => {
                     tracing::warn!(target: "session.store",

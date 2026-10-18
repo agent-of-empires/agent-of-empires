@@ -80,6 +80,7 @@ impl Instance {
             agent_provider: None,
             acp_effort: None,
             acp_session_id: None,
+            acp_handoff_pending: false,
             import_pending: None,
             fork_pending: None,
             acp_load_session_capable: None,
@@ -117,7 +118,7 @@ impl Instance {
     /// stored field as it is.
     pub(crate) fn persist_sandbox_provider(&self) -> anyhow::Result<()> {
         let provider = self.sandbox_info.as_ref().and_then(|s| s.provider.clone());
-        crate::session::Storage::new(&self.source_profile, self.resolve_file_watch())?.update(
+        crate::session::Storage::open(&self.source_profile, self.resolve_file_watch())?.update(
             |instances, _groups| {
                 if let Some(sandbox) = instances
                     .iter_mut()
