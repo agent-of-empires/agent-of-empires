@@ -123,7 +123,8 @@ fn append_to_log(path: &std::path::Path) -> std::process::Stdio {
 
 /// A Worker started for a bare adapter name that resolved nowhere can only exit
 /// before its Hello, which loses the cause (#4576). Paths and `${placeholder}`
-/// commands resolve elsewhere, and a sandbox resolves inside its container.
+/// commands resolve elsewhere, a sandbox resolves inside its container, and the
+/// runner searches the last configured `PATH` it applies to the adapter.
 fn refuse_unresolved_adapter(
     config: &SpawnConfig,
     sandboxed: bool,
@@ -132,10 +133,16 @@ fn refuse_unresolved_adapter(
     if sandboxed || resolved || !is_bare_command(&config.spec.command) {
         return Ok(());
     }
-    if !config.cwd.exists() {
-        return Err(AcpError::ProjectPathMissing {
-            path: config.cwd.clone(),
-        });
+    let configured_path = config
+        .host_environment
+        .iter()
+        .chain(&config.provider_routing)
+        .rev()
+        .find(|(key, _)| key == "PATH");
+    if configured_path.is_some_and(|(_, path)| {
+        which::which_in(&config.spec.command, Some(path), &config.cwd).is_ok()
+    }) {
+        return Ok(());
     }
     Err(AcpError::missing_binary_spawn_error(
         &std::io::Error::from(std::io::ErrorKind::NotFound),
@@ -622,63 +629,66 @@ mod tests {
     /// naming that adapter's own install command.
     #[test]
     fn refuse_unresolved_adapter_cases() {
+        use std::os::unix::fs::PermissionsExt;
         let cwd = tempfile::tempdir().unwrap();
-        let missing = cwd.path().join("gone");
-        let hint = |cmd: &str| crate::acp::install_hints::install_hint_for(cmd).unwrap();
-        let cases: [(&str, &std::path::Path, bool, bool, Option<String>); 8] = [
-            // (command, cwd, sandboxed, resolved, expected error text)
-            (
-                "codex-acp",
-                cwd.path(),
-                false,
-                false,
-                Some(hint("codex-acp").into()),
-            ),
+        // A directory only the configured agent PATH reaches.
+        let agent_bin = cwd.path().join("agent-bin");
+        std::fs::create_dir(&agent_bin).unwrap();
+        let adapter = agent_bin.join("codex-acp");
+        std::fs::write(&adapter, "#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&adapter, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let empty_bin = cwd.path().join("empty-bin");
+        std::fs::create_dir(&empty_bin).unwrap();
+        let (found, empty) = (Some(agent_bin.as_path()), Some(empty_bin.as_path()));
+        let hint = |cmd: &str| Some(crate::acp::install_hints::install_hint_for(cmd).unwrap());
+        let cases = [
+            // (command, sandboxed, resolved, environment PATH, provider routing PATH, expected error text)
+            ("codex-acp", false, false, None, None, hint("codex-acp")),
             (
                 "claude-agent-acp",
-                cwd.path(),
                 false,
                 false,
-                Some(hint("claude-agent-acp").into()),
+                None,
+                None,
+                hint("claude-agent-acp"),
             ),
             (
                 "aoe-test-unknown-adapter",
-                cwd.path(),
                 false,
                 false,
-                Some("binary `aoe-test-unknown-adapter` not found".into()),
+                None,
+                None,
+                Some("binary `aoe-test-unknown-adapter` not found"),
             ),
-            (
-                "codex-acp",
-                &missing,
-                false,
-                false,
-                Some("ProjectPathMissing".into()),
-            ),
-            ("codex-acp", cwd.path(), true, false, None),
-            ("codex-acp", cwd.path(), false, true, None),
-            ("/opt/agents/codex-acp", cwd.path(), false, false, None),
-            ("${HOME}/bin/codex-acp", cwd.path(), false, false, None),
+            ("codex-acp", true, false, None, None, None),
+            ("codex-acp", false, true, None, None, None),
+            ("/opt/agents/codex-acp", false, false, None, None, None),
+            ("${HOME}/bin/codex-acp", false, false, None, None, None),
+            // The runner applies the routing PATH after the environment one.
+            ("codex-acp", false, false, found, None, None),
+            ("codex-acp", false, false, empty, None, hint("codex-acp")),
+            ("codex-acp", false, false, None, found, None),
+            ("codex-acp", false, false, found, empty, hint("codex-acp")),
         ];
-        for (command, dir, sandboxed, resolved, expected) in cases {
+        for (command, sandboxed, resolved, env_path, routing_path, expected) in cases {
             let label = format!(
-                "{command} sandboxed={sandboxed} resolved={resolved} cwd={}",
-                dir.display()
+                "{command} sandboxed={sandboxed} resolved={resolved} \
+                 PATH={env_path:?} routing PATH={routing_path:?}"
             );
-            let mut config = super::super::test_helpers::env_test_spawn_config(dir.to_path_buf());
+            let mut config =
+                super::super::test_helpers::env_test_spawn_config(cwd.path().to_path_buf());
             config.spec.command = command.into();
+            let path_pair = |dir: &std::path::Path| ("PATH".to_string(), dir.display().to_string());
+            config.host_environment = env_path.map(path_pair).into_iter().collect();
+            config.provider_routing = routing_path.map(path_pair).into_iter().collect();
             let got = refuse_unresolved_adapter(&config, sandboxed, resolved)
                 .err()
                 .map(|e| match e {
-                    AcpError::ProjectPathMissing { path } => {
-                        assert_eq!(path, missing, "{label}");
-                        "ProjectPathMissing".to_string()
-                    }
                     AcpError::Spawn(msg) => msg,
                     other => panic!("{label}: unexpected {other:?}"),
                 });
-            match (&got, &expected) {
-                (Some(msg), Some(want)) => assert!(msg.contains(want.as_str()), "{label}: {msg}"),
+            match (&got, expected) {
+                (Some(msg), Some(want)) => assert!(msg.contains(want), "{label}: {msg}"),
                 _ => assert_eq!(got.is_some(), expected.is_some(), "{label}: {got:?}"),
             }
         }
@@ -687,7 +697,7 @@ mod tests {
             super::super::test_helpers::env_test_spawn_config(cwd.path().to_path_buf());
         config.spec.command = "codex-acp".into();
         let msg = format!("{:?}", refuse_unresolved_adapter(&config, false, false));
-        assert!(!msg.contains(hint("claude-agent-acp")), "{msg}");
+        assert!(!msg.contains(hint("claude-agent-acp").unwrap()), "{msg}");
     }
 
     /// #4576: the refusal leaves no Worker record, socket or log behind.
