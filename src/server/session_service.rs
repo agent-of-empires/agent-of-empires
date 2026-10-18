@@ -1706,6 +1706,7 @@ mod tests {
             custom_instruction: None,
             callback_url: None,
             idempotency_key: None,
+            source_refs: Vec::new(),
             profile: "default".to_string(),
             created_by_plugin: None,
             plugin_create_idempotency: None,

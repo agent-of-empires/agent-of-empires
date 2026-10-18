@@ -313,6 +313,10 @@ pub(super) const CITYHALL_MUTATION_ALLOW: &[(&str, &str)] = &[
 /// Mutating routes deliberately UNREACHABLE in CityHall.
 #[cfg(test)]
 pub(super) const CITYHALL_MUTATION_DENY: &[(&str, &str)] = &[
+    ("POST", "/api/suggestions/refresh"),
+    ("POST", "/api/suggestions/prepare"),
+    ("POST", "/api/suggestions/action"),
+    ("PATCH", "/api/suggestions/policy"),
     // Terminal surface.
     ("POST", "/api/sessions/{id}/ensure"),
     ("POST", "/api/sessions/{id}/send"),

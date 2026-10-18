@@ -60,6 +60,10 @@ pub struct PluginManifest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub runtime: Option<RuntimeSpec>,
 
+    /// Read-only work suggestions; grants no session execution authority.
+    #[serde(default)]
+    pub suggestions: bool,
+
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub aoe_version: Option<String>,
 }
@@ -1088,6 +1092,22 @@ impl PluginManifest {
             check(
                 self.settings.iter().all(|s| !s.per_project),
                 "per_project settings require api_version >= 18".into(),
+            );
+        }
+        if self.suggestions {
+            check(
+                self.api_version >= 19,
+                "suggestions require api_version >= 19".into(),
+            );
+            check(
+                self.runtime.is_some(),
+                "suggestions require a runtime worker".into(),
+            );
+            check(
+                self.capabilities
+                    .iter()
+                    .any(|cap| cap.as_str() == "runtime.worker"),
+                "suggestions require runtime.worker".into(),
             );
         }
         for key in self.setting_defaults.keys() {

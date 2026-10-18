@@ -15,8 +15,14 @@ mod projects;
 mod queue;
 pub(crate) mod sessions;
 mod skills;
+mod suggestions;
 pub(crate) mod system;
 mod telemetry;
+pub(crate) use suggestions::spawn_auto_create;
+pub use suggestions::{
+    get_suggestions, prepare_suggestion, refresh_suggestions, suggestion_action,
+    update_suggestion_policy,
+};
 
 pub(crate) use acp::structured_spawn_error_message;
 pub use acp::{

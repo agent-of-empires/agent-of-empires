@@ -724,6 +724,7 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
     });
 
     let app = build_router(state.clone());
+    api::spawn_auto_create(state.clone());
 
     // Acp workers for persisted sessions get auto-spawned by the reconciler in
     // `status_poll_loop`.

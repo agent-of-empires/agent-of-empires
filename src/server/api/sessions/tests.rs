@@ -4716,6 +4716,120 @@ async fn post_create(
     (status, serde_json::from_slice(&bytes).unwrap())
 }
 
+#[tokio::test]
+#[serial_test::serial]
+async fn suggestion_creation_keeps_normal_trust_and_deduplicates_concurrent_starts() {
+    use crate::plugin::{host::PluginHost, host_api::HostApiState};
+    use crate::server::test_support as support;
+    use crate::session::projects::{self, Project, ProjectScope};
+    let _home = crate::session::test_support::isolate_app_dir();
+    let gate = tempfile::tempdir().unwrap();
+    let hook_log = gate.path().join("hook-runs");
+    let hook = format!("printf x >> '{}'", hook_log.display());
+    let project = project_with_on_create_hooks(&[&hook]);
+    support::seed_instances_on_disk_for_test("test", Vec::new());
+    projects::add(
+        "test",
+        ProjectScope::Global,
+        Project {
+            name: "registered".into(),
+            path: project.path().to_string_lossy().into_owned(),
+            default_base_branch: None,
+            pinned: true,
+            overrides: Default::default(),
+            scope: ProjectScope::Global,
+        },
+        false,
+    )
+    .unwrap();
+    let app = crate::session::get_app_dir().unwrap();
+    let host = PluginHost::new(&app, "test", None).unwrap();
+    let publisher = HostApiState::open(&app.join("plugin_events.db"), "test", 100).unwrap();
+    let generation = publisher.begin_ui_generation("example.provider");
+    let source = "https://example.com/issues/42";
+    publisher
+        .publish_suggestions(
+            "example.provider",
+            generation,
+            "Example",
+            &[aoe_plugin_api::Suggestion {
+                id: "issue-42".into(),
+                title: "Fix issue".into(),
+                reason: "Assigned".into(),
+                source_url: source.into(),
+                source_ref: source.into(),
+                preview: "Source text".into(),
+                project: Some("registered".into()),
+                criterion: "assigned".into(),
+                draft: aoe_plugin_api::SuggestionDraft {
+                    title: "Fix issue".into(),
+                    prompt: "Investigate the assigned issue.".into(),
+                },
+            }],
+        )
+        .unwrap();
+    let (launcher, launches) = support::counting_failing_launcher();
+    let mut state = support::build_test_app_state_with_launcher(Vec::new(), launcher);
+    Arc::get_mut(&mut state).unwrap().plugin_host = Some(host.clone());
+    let mut body = serde_json::json!({
+        "path": project.path(), "tool":"claude", "view":"structured", "profile":"test",
+        "source_refs":["forged-client-source"], "trust_hooks":false,
+        "suggestion":{"provider_id":"example.provider","id":"issue-42","revision":1}
+    });
+    let (status, refused) = post_create(&state, body.clone()).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{refused}");
+    assert_eq!(refused["error"], "hooks_need_trust");
+    assert!(!hook_log.exists());
+    assert!(support::load_instances_from_disk_for_test("test").is_empty());
+    body["trust_hooks"] = serde_json::json!(true);
+    let (first, second) = tokio::join!(
+        post_create(&state, body.clone()),
+        post_create(&state, body.clone())
+    );
+    assert!(
+        matches!(
+            (first.0, second.0),
+            (StatusCode::CREATED, StatusCode::OK) | (StatusCode::OK, StatusCode::CREATED)
+        ),
+        "{first:?} {second:?}"
+    );
+    assert_eq!(first.1["id"], second.1["id"]);
+    wait_for("the failed startup attempt", || {
+        launches.load(std::sync::atomic::Ordering::SeqCst) > 0
+    })
+    .await;
+    let rows = support::load_instances_from_disk_for_test("test");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].source_refs, [source]);
+    assert!(rows[0].created_by_plugin.is_none());
+    assert_eq!(
+        rows[0].pending_initial_turn.as_ref().unwrap().text,
+        "Investigate the assigned issue."
+    );
+    assert_eq!(std::fs::read_to_string(&hook_log).unwrap(), "x");
+    assert_eq!(
+        host.suggestions_snapshot("test").unwrap()["items"][0]["session_id"],
+        rows[0].id
+    );
+    body["create_another"] = serde_json::json!(true);
+    body["title"] = serde_json::json!("Customized issue");
+    body["prompt"] = serde_json::json!("My reviewed instructions.");
+    let (status, another) = post_create(&state, body).await;
+    assert_eq!(status, StatusCode::CREATED, "{another}");
+    assert_ne!(another["id"], first.1["id"]);
+    let rows = support::load_instances_from_disk_for_test("test");
+    assert_eq!(rows.len(), 2);
+    let customized = rows
+        .iter()
+        .find(|row| row.title == "Customized issue")
+        .unwrap();
+    assert_eq!(
+        customized.pending_initial_turn.as_ref().unwrap().text,
+        "My reviewed instructions."
+    );
+    assert_eq!(customized.source_refs, [source]);
+}
+
 async fn wait_for(what: &str, mut ready: impl FnMut() -> bool) {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
     while !ready() {

@@ -39,6 +39,7 @@ impl Instance {
             pre_trash_project_path: None,
             lifecycle_reservation: None,
             plugin_meta: std::collections::BTreeMap::new(),
+            source_refs: Vec::new(),
             created_by_plugin: None,
             plugin_create_idempotency: None,
             plugin_revival_pending: false,

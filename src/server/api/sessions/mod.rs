@@ -41,7 +41,9 @@ mod model;
 mod rename;
 mod search;
 mod send;
+mod suggestion;
 mod update;
+pub(crate) use suggestion::{find_by_source_ref, resolve_registered_suggestion_project};
 
 pub use artifacts::*;
 pub use create::*;

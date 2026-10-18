@@ -25,12 +25,13 @@ const STORAGE_MAX_KEY_BYTES: usize = 256;
 const STORAGE_MAX_VALUE_BYTES: usize = 64 * 1024;
 
 pub struct HostApiState {
-    events: Mutex<Connection>,
+    pub(crate) events: Mutex<Connection>,
     schema: Schema,
     retention: usize,
     profile: String,
     ui: UiStore,
     settings_revision: std::sync::atomic::AtomicU64,
+    suggestion_generations: Mutex<crate::plugin::suggestions::Generations>,
 }
 
 impl HostApiState {
@@ -51,6 +52,7 @@ impl HostApiState {
              );",
         )
         .context("create plugin_storage table")?;
+        crate::plugin::suggestions::initialize(&conn)?;
         Ok(Self {
             events: Mutex::new(conn),
             schema,
@@ -58,6 +60,7 @@ impl HostApiState {
             profile: profile.to_string(),
             ui: UiStore::new(),
             settings_revision: std::sync::atomic::AtomicU64::new(0),
+            suggestion_generations: Mutex::new(crate::plugin::suggestions::Generations::default()),
         })
     }
 
@@ -81,10 +84,15 @@ impl HostApiState {
     }
 
     pub fn begin_ui_generation(&self, plugin_id: &str) -> u64 {
-        self.ui.begin_generation(plugin_id)
+        let generation = self.ui.begin_generation(plugin_id);
+        self.lock_suggestion_generations()
+            .begin(plugin_id, generation);
+        generation
     }
 
     pub fn clear_ui(&self, plugin_id: &str, generation: u64) -> bool {
+        self.lock_suggestion_generations()
+            .clear(plugin_id, generation);
         self.ui.clear_plugin(plugin_id, generation)
     }
 
@@ -104,6 +112,20 @@ impl HostApiState {
         body: Option<String>,
     ) {
         let _ = self.ui.notify(plugin_id, tone, title, body, None, None);
+    }
+}
+
+impl HostApiState {
+    pub(crate) fn suggestion_profile(&self) -> &str {
+        &self.profile
+    }
+
+    pub(crate) fn lock_suggestion_generations(
+        &self,
+    ) -> std::sync::MutexGuard<'_, crate::plugin::suggestions::Generations> {
+        self.suggestion_generations
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
     }
 }
 
@@ -180,6 +202,14 @@ pub fn dispatch(
     params: &Value,
 ) -> Result<Value, DispatchError> {
     match method {
+        "suggestions.set" => {
+            ctx.require(CAP_WORKER)?;
+            suggestions_set(state, ctx, params)
+        }
+        "suggestions.error" => {
+            ctx.require(CAP_WORKER)?;
+            suggestions_error(state, ctx, params)
+        }
         "events.publish" => {
             ctx.require(CAP_WORKER)?;
             events_publish(state, params)
@@ -261,6 +291,99 @@ fn optional_str_param<'a>(params: &'a Value, key: &str) -> Result<Option<&'a str
     }
 }
 
+fn suggestions_set(
+    state: &HostApiState,
+    ctx: &PluginRpcContext,
+    params: &Value,
+) -> Result<Value, DispatchError> {
+    let registry = crate::plugin::registry();
+    let provider_name = registry
+        .get(&ctx.plugin_id)
+        .filter(|p| p.active() && p.manifest.suggestions)
+        .map(|p| p.manifest.name.clone())
+        .ok_or_else(|| DispatchError {
+            code: codes::FORBIDDEN,
+            message: "plugin did not declare suggestions".into(),
+            data: None,
+        })?;
+    let request: aoe_plugin_api::SetSuggestions =
+        serde_json::from_value(params.clone()).map_err(|e| {
+            DispatchError::invalid_params(format!("invalid suggestions.set params: {e}"))
+        })?;
+    if request.items.len() > 500 {
+        return Err(DispatchError::invalid_params(
+            "suggestions.set accepts at most 500 items",
+        ));
+    }
+    if request.items.iter().any(|item| {
+        item.id.is_empty()
+            || item.id.len() > 256
+            || item.title.trim().is_empty()
+            || item.source_ref.trim().is_empty()
+    }) {
+        return Err(DispatchError::invalid_params(
+            "suggestion id, title, and source_ref must be non-empty; id is limited to 256 bytes",
+        ));
+    }
+    let applied = state
+        .publish_suggestions(
+            &ctx.plugin_id,
+            ctx.ui_generation,
+            &provider_name,
+            &request.items,
+        )
+        .map_err(|e| DispatchError::internal(e.to_string()))?;
+    if !applied {
+        return Err(DispatchError {
+            code: codes::FORBIDDEN,
+            message: "worker generation is no longer active".into(),
+            data: None,
+        });
+    }
+    Ok(json!({"ok": true}))
+}
+
+fn suggestions_error(
+    state: &HostApiState,
+    ctx: &PluginRpcContext,
+    params: &Value,
+) -> Result<Value, DispatchError> {
+    let registry = crate::plugin::registry();
+    let provider_name = registry
+        .get(&ctx.plugin_id)
+        .filter(|p| p.active() && p.manifest.suggestions)
+        .map(|p| p.manifest.name.clone())
+        .ok_or_else(|| DispatchError {
+            code: codes::FORBIDDEN,
+            message: "plugin did not declare suggestions".into(),
+            data: None,
+        })?;
+    let request: aoe_plugin_api::SuggestionsError = serde_json::from_value(params.clone())
+        .map_err(|e| {
+            DispatchError::invalid_params(format!("invalid suggestions.error params: {e}"))
+        })?;
+    if request.message.len() > 4096 {
+        return Err(DispatchError::invalid_params(
+            "suggestions.error message is limited to 4096 bytes",
+        ));
+    }
+    let applied = state
+        .report_suggestion_error(
+            &ctx.plugin_id,
+            ctx.ui_generation,
+            &provider_name,
+            &request.message,
+        )
+        .map_err(|e| DispatchError::internal(e.to_string()))?;
+    if !applied {
+        return Err(DispatchError {
+            code: codes::FORBIDDEN,
+            message: "worker generation is no longer active".into(),
+            data: None,
+        });
+    }
+    Ok(json!({"ok": true}))
+}
 fn events_publish(state: &HostApiState, params: &Value) -> Result<Value, DispatchError> {
     let topic = str_param(params, "topic")?;
     let payload = params
@@ -1435,5 +1558,72 @@ mod tests {
             "voice",
         );
         dispatch(&state, &c, "ui.state.set", &action(true)).unwrap();
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn suggestions_rpc_checks_provider_grant_and_host_owned_identity() {
+        use crate::session::config::{CapabilityGrant, PluginConfig};
+        let tmp = tempfile::tempdir().unwrap();
+        let _home = crate::session::test_support::isolate_app_dir_at(tmp.path());
+        let _reload = crate::plugin::ReloadRegistryOnDrop;
+        let dir = crate::plugin::plugins_dir().unwrap().join("acme.worker");
+        std::fs::create_dir_all(&dir).unwrap();
+        let manifest = "id = \"acme.worker\"\nname = \"Trusted name\"\nversion = \"1.0.0\"\napi_version = 19\nsuggestions = true\ncapabilities = [\"runtime.worker\"]\n[runtime]\nkind = \"command\"\ncommand = [\"./worker\"]\n";
+        std::fs::write(dir.join("aoe-plugin.toml"), manifest).unwrap();
+        crate::session::update_config(|config| {
+            config.plugins.insert(
+                "acme.worker".into(),
+                PluginConfig {
+                    grant: Some(CapabilityGrant {
+                        manifest_hash: aoe_plugin_api::PluginManifest::hash_bytes(
+                            manifest.as_bytes(),
+                        ),
+                        capabilities: vec![CAP_WORKER.into()],
+                        granted_at: chrono::Utc::now(),
+                    }),
+                    ..Default::default()
+                },
+            );
+        })
+        .unwrap();
+        assert!(crate::plugin::reload_registry()
+            .get("acme.worker")
+            .unwrap()
+            .active());
+        let state = state(tmp.path());
+        let mut context = ctx(&[CAP_WORKER]);
+        context.ui_generation = state.begin_ui_generation(&context.plugin_id);
+        let request = json!({"items":[{
+            "id":"42","title":"Review","reason":"Assigned","source_url":"https://example.com/42",
+            "source_ref":"https://example.com/42","preview":"untrusted source",
+            "criterion":"assigned","draft":{"title":"Review","prompt":"Review work"}
+        }]});
+        assert_eq!(
+            dispatch(&state, &ctx(&[]), "suggestions.set", &request)
+                .unwrap_err()
+                .code,
+            codes::FORBIDDEN
+        );
+        dispatch(&state, &context, "suggestions.set", &request).unwrap();
+        let snapshot = state.snapshot("default").unwrap();
+        assert_eq!(snapshot["items"][0]["provider_id"], "acme.worker");
+        assert_eq!(snapshot["items"][0]["provider_name"], "Trusted name");
+        let mut forged = request.clone();
+        forged["items"][0]["revision"] = json!(99);
+        assert_eq!(
+            dispatch(&state, &context, "suggestions.set", &forged)
+                .unwrap_err()
+                .code,
+            codes::INVALID_PARAMS
+        );
+        state.begin_ui_generation(&context.plugin_id);
+        assert_eq!(
+            dispatch(&state, &context, "suggestions.set", &json!({"items":[]}))
+                .unwrap_err()
+                .code,
+            codes::FORBIDDEN
+        );
+        assert_eq!(state.snapshot("default").unwrap(), snapshot);
     }
 }

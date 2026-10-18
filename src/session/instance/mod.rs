@@ -221,6 +221,8 @@ pub struct Instance {
     pub lifecycle_reservation: Option<LifecycleReservation>,
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub plugin_meta: std::collections::BTreeMap<String, serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub source_refs: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub created_by_plugin: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

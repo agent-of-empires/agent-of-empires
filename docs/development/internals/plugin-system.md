@@ -14,6 +14,7 @@ Host architecture and security boundaries. Plugin authors want [Writing plugins]
 | Worker RPCs | `host_api.rs`, `session_api.rs` |
 | Host-rendered UI state | `ui_state.rs` |
 | Automation policy | `automation_policy.rs` |
+| Suggested sessions | `suggestions.rs`, `src/server/api/suggestions.rs` |
 
 `src/plugin/mod.rs` owns a lazily loaded process-wide registry; reloading it after a config change updates the CLI, TUI, and web views from one `PluginView`. The standalone `aoe-plugin-api` crate is the source of truth for `aoe-plugin.toml`, and parsing is strict: unknown fields, unsupported API versions, invalid ids, and malformed contributions are rejected. `api_version` describes the manifest schema; `aoe_version` constrains the host application.
 
@@ -40,6 +41,16 @@ Workers are tied to the daemon lifetime, with no reattach socket or durable runn
 ## Host APIs and events
 
 The host exposes capability-checked RPCs for the plugin event bus, private session metadata, plugin settings, session listing, UI state, ACP capability discovery, and plugin-created sessions; the methods and payloads are in the [Plugin API reference](../../plugin-api.md). The event bus uses the protocol-neutral store in `src/events/` with its own schema and replay cursor. Session writes take the storage lock and become visible to other processes on their next reload. Each caller's plugin id comes from its host context, never from request parameters.
+
+Read-only suggestion providers publish host-normalized profile snapshots into
+`plugin_events.db`. Publication and worker-generation checks share a lock;
+replacement is transactional. Retractions hide live items while retaining
+revision history, dismissal and session links. Disable/uninstall removes the
+provider from public snapshots across profiles. User starts re-read the
+revision and exact source, resolve a registered project, then use the normal
+creation and prompt pipeline with profile-scoped source idempotency. Reviewed
+auto-create rules are separate from plugin session-driving grants and never
+approve repository trust or unattended agent modes.
 
 ## Unattended plugin sessions
 

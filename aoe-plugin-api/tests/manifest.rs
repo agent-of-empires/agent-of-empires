@@ -22,6 +22,27 @@ fn invalid(api_version: u32, body: &str) -> Vec<String> {
 }
 
 #[test]
+fn suggestions_require_current_schema_and_worker_without_session_grants() {
+    let body = "suggestions = true\ncapabilities = [\"runtime.worker\"]\n[runtime]\nkind = \"command\"\ncommand = [\"./worker\"]\n";
+    let parsed = parse(19, body);
+    assert!(parsed.suggestions);
+    assert_eq!(parsed.capabilities.len(), 1);
+    assert!(invalid(18, body)
+        .iter()
+        .any(|error| error.contains("api_version >= 19")));
+    assert!(invalid(19, "suggestions = true")
+        .iter()
+        .any(|error| error.contains("runtime worker")));
+    assert!(!parse(18, "").suggestions);
+    let forged = serde_json::json!({
+        "id":"work", "title":"Work", "reason":"Assigned", "source_url":"https://example.com/1",
+        "source_ref":"https://example.com/1", "preview":"body", "criterion":"assigned",
+        "draft":{"title":"Work","prompt":"Do work"}, "provider_id":"forged"
+    });
+    assert!(serde_json::from_value::<aoe_plugin_api::Suggestion>(forged).is_err());
+}
+
+#[test]
 fn minimal_manifest_parses_and_round_trips() {
     let m = parse(1, "description = \"d\"");
     assert_eq!(m.id.as_str(), "acme.thing");

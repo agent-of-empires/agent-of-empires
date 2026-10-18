@@ -4,6 +4,12 @@ All notable changes to Agent of Empires will be documented in this file.
 
 The format follows [Conventional Commits](https://www.conventionalcommits.org/).
 
+## Unreleased
+
+### Features
+
+- **plugin:** Add persistent, profile-scoped suggested sessions with shared start/customize, dismissal, exact-source deduplication, and opt-in reviewed automation.
+
 ## [1.20.0](https://github.com/agent-of-empires/agent-of-empires/releases/tag/v1.20.0) - 2026-10-15
 
 

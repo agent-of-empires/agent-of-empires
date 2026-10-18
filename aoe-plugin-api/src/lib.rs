@@ -5,6 +5,7 @@ mod capability;
 mod id;
 mod manifest;
 pub mod session;
+pub mod suggestions;
 
 pub use capability::{CapabilityId, TrustLevel, KNOWN_CAPABILITIES};
 pub use id::{InvalidPluginId, PluginId};
@@ -14,5 +15,6 @@ pub use manifest::{
     ObjectFieldType, OptionSource, PluginManifest, RuntimeSpec, Screenshot, SettingContribution,
     SettingType, StatusContribution, ThemeContribution, UiContribution, UiSlot, MAX_SCREENSHOTS,
 };
+pub use suggestions::{SetSuggestions, Suggestion, SuggestionDraft, SuggestionsError};
 
-pub const API_VERSION: u32 = 18;
+pub const API_VERSION: u32 = 19;
