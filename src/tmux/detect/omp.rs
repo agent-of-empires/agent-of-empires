@@ -359,6 +359,15 @@ fn find_composer(lines: &[&str], blank_before: &[bool], before: usize) -> Option
 
 fn dialog_footer(lines: &[&str], composer: Composer) -> Option<usize> {
     if !matches!(composer.body, Body::Box)
+        || !lines[composer.end]
+            .trim_end()
+            .chars()
+            .all(|c| matches!(c, '╰' | '─' | '╯' | '+' | '-'))
+        || lines[composer.start..composer.end].iter().any(|line| {
+            line.strip_prefix('│')
+                .or_else(|| line.strip_prefix('|'))
+                .is_some_and(|body| !body.trim_end().ends_with(['│', '|']))
+        })
         || composer.slot.is_some_and(|i| {
             (lines[i].starts_with("╭── ") || lines[i].starts_with("+-- "))
                 && (parked_pi(lines[i]) || timed_pi(lines[i]))
@@ -564,6 +573,8 @@ impl<'a> Surface<'a> {
                 let explicit_maintenance = maintenance(text);
                 let regular = !explicit_maintenance
                     && !parked
+                    // The interrupt frame adds a column; compact rows need a live timer.
+                    && (text.starts_with("  ") || timed)
                     && key_message(text).is_some_and(|message| {
                         let mut words = message.split_whitespace();
                         let first = words.next();

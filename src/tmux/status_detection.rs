@@ -3579,7 +3579,7 @@ Final prose line.\n";
     }
 
     #[test]
-    fn omp_native_key_formatting_keeps_activity_and_passive_retry_distinct() {
+    fn omp_interrupt_keys_require_a_loader_margin_or_timer() {
         for key in [
             "Ctrl+󰘶 Q",
             "󰘴 󰘵 Q",
@@ -3589,18 +3589,31 @@ Final prose line.\n";
             "PgUp",
             "Ins",
             "⌫",
+            "q",
+            "I",
         ] {
-            for (message, expected) in [
-                ("Any activity label", Status::Running),
-                ("to retry", Status::Idle),
+            for (margin, slot, message, expected) in [
+                ("  ", "", "Any activity label", Status::Running),
+                (
+                    " ",
+                    "\n ⠋ 1s > model",
+                    "Any activity label",
+                    Status::Running,
+                ),
+                (" ", "", "Any activity label", Status::Idle),
+                ("  ", "", "to retry", Status::Idle),
             ] {
                 let pane = format!(
-                    "Output\n\n {key} {message}\n\n╰─\n{}",
+                    "Output\n\n{margin}{key} {message}\n{slot}\n╰─\n{}",
                     "PLUGIN\n".repeat(12)
                 );
-                assert_eq!(observed_omp(&pane, "", true), expected, "{key}: {message}");
+                assert_eq!(observed_omp(&pane, "", true), expected, "{pane}");
             }
         }
+        assert_eq!(
+            observed_omp("Output\n\n  q Any activity label\n\n╰─\nCAVEMAN", "", false),
+            Status::Idle
+        );
     }
 
     #[test]
@@ -3673,15 +3686,8 @@ Final prose line.\n";
     }
 
     #[test]
-    fn omp_empty_or_wrapped_messages_keep_the_interrupt_key_and_widget_boundary() {
-        for working in [
-            "  ⎋",
-            "  󱊷",
-            "  Esc",
-            "  Ctrl+X",
-            "  q",
-            " Esc\nactivité longue\nsuite",
-        ] {
+    fn omp_empty_working_messages_keep_the_widget_boundary() {
+        for working in ["  ⎋", "  󱊷", "  Esc", "  Ctrl+X", "  q"] {
             let pane = format!("Output\n\n{working}\n\n╰─\nPLUGIN_A\nPLUGIN_B\nPLUGIN_C");
             assert_eq!(observed_omp(&pane, "", true), Status::Running, "{working}");
         }
@@ -3689,6 +3695,41 @@ Final prose line.\n";
             let pane = format!("Output\n\n  Esc Earlier activity\n\n{widget}\n\n╰─\nPLUGIN");
             assert_eq!(observed_omp(&pane, "", true), Status::Idle, "{widget}");
         }
+    }
+
+    #[test]
+    fn omp_passive_widget_keys_do_not_supply_working_controls() {
+        for widget in [
+            "I am done.",
+            "- Everything is done.",
+            "Enter the meeting notes",
+        ] {
+            for margin in ["", " "] {
+                let pane =
+                    format!("Output\n\n  Esc Earlier work\n\n{margin}{widget}\n\n╰─\nCAVEMAN");
+                assert_eq!(observed_omp(&pane, "", true), Status::Idle, "{pane}");
+            }
+        }
+    }
+
+    #[test]
+    fn omp_box_drafts_cannot_supply_modal_controls() {
+        for composer in [
+            "╭────────────────────╮\n│ Normal draft       │\n│ Enter submit · Esc cancel │\n╰─ Other draft      ─╯",
+            "╭────────────────────╮\n│ Normal draft       │\n│ Enter submit · Esc cancel │\n╰─                  ─╯",
+            "╭────────────────────╮\n│ Enter submit · Esc cancel │\n│ IME draft\n╰────────────────────╯",
+            "╭────────────────────╮\n│ Enter submit · Esc cancel │\n│ \n╰────────────────────╯",
+        ] {
+            for (title, expected) in [("", Status::Idle), ("π ⠋ Task", Status::Running)] {
+                assert_eq!(
+                    observed_omp(&format!("{composer}\nCAVEMAN"), title, true),
+                    expected,
+                    "{composer}: {title}"
+                );
+            }
+        }
+        let dialog = "╭────────────────────╮\n│ >                  │\n│ ⏎ submit  ⎋ cancel │\n│                    │\n╰────────────────────╯\nCAVEMAN";
+        assert_eq!(observed_omp(dialog, "", true), Status::Waiting);
     }
 
     #[test]
