@@ -30,7 +30,7 @@ const CAP_COMPOSER_READ: &str = "composer.read";
 const CAP_SESSION_READ: &str = "session.read";
 
 /// Apply mutation restrictions before resolving the authenticated principal.
-async fn mutation_gate(
+pub(super) async fn mutation_gate(
     state: &AppState,
     session: Option<&AuthenticatedBrowserSession>,
     local: Option<&Principal>,
