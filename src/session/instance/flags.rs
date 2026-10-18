@@ -58,15 +58,16 @@ impl StartBlocked {
 }
 
 /// A sandbox launch refused in `separate_login` mode while the shared credential its agent
-/// needs holds none. `tool` is the session's tool, which `aoe sandbox login --tool` takes.
-/// `profile` is the session's profile and `command` its own command for the tool: each is set
-/// only when the recovery needs it, `profile` when it is not the default one (the CLI runs
-/// under the default profile unless `-p` says otherwise) and `command` when `--tool` alone
-/// would log in another file than the one the launch waits for and `--command` with it reaches
-/// that file.
+/// needs holds none. `tool` is the session's tool, which `aoe sandbox login --tool` takes;
+/// `credential` is the shared file the launch waits for. `profile` is the session's profile
+/// and `command` its own command for the tool: each is set only when the recovery needs it,
+/// `profile` when it is not the default one (the CLI runs under the default profile unless
+/// `-p` says otherwise) and `command` when `--tool` alone would log in another file than the
+/// one the launch waits for and `--command` with it reaches that file.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SandboxLoginRequired {
     pub tool: String,
+    pub credential: std::path::PathBuf,
     pub profile: Option<String>,
     pub command: Option<String>,
 }

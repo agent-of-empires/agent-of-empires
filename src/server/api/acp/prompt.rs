@@ -60,6 +60,30 @@ fn no_revive_refused() -> Response {
         .into_response()
 }
 
+/// The admission's `host_hooks.before_start` hook failed: the prompt is kept in the queue
+/// (the pending initial turn stays too) and the hook's own error is the message.
+fn before_start_hook_failed_queued(message: &str, queued_id: &str) -> Response {
+    (
+        StatusCode::BAD_GATEWAY,
+        Json(serde_json::json!({
+            "error": "before_start_hook_failed",
+            "message": message,
+            "queued_id": queued_id,
+        })),
+    )
+        .into_response()
+}
+
+/// 409 for a prompt kept in the queue until the sandbox login exists.
+fn sandbox_login_required_queued(
+    blocked: &crate::session::SandboxLoginRequired,
+    queued_id: &str,
+) -> Response {
+    let mut body = crate::server::api::sandbox_login_required_body(blocked);
+    body["queued_id"] = serde_json::Value::String(queued_id.to_string());
+    (StatusCode::CONFLICT, Json(body)).into_response()
+}
+
 /// The queue row a "Send now" named is gone: the drain or another tab already delivered it.
 fn queued_prompt_gone() -> Response {
     (StatusCode::CONFLICT, "queued_prompt_gone").into_response()
@@ -131,7 +155,16 @@ pub async fn acp_prompt(
         Err(PromptSubmitError::QueuedPromptGone) => queued_prompt_gone(),
         Err(PromptSubmitError::QueuedPromptChanged) => queued_prompt_changed(),
         Err(PromptSubmitError::QueuedAttachmentsMissing) => queued_attachments_missing(),
+        Err(PromptSubmitError::LoginRequired { blocked, queued_id }) => {
+            sandbox_login_required_queued(&blocked, &queued_id)
+        }
+        Err(PromptSubmitError::HookFailed { message, queued_id }) => {
+            before_start_hook_failed_queued(&message, &queued_id)
+        }
         Err(PromptSubmitError::Turn(e)) => match e {
+            SendTurnError::LoginRequired(_) | SendTurnError::HookFailed(_) => {
+                unreachable!("submit_prompt keeps these prompts queued")
+            }
             SendTurnError::SessionNotFound => session_not_found(),
             SendTurnError::ResumeFailed(e) => resume_failed_response(&e),
             SendTurnError::WorkerNotReady | SendTurnError::WorkerLostAfterPublish => {
@@ -175,8 +208,9 @@ pub(crate) struct PromptSubmitted {
 ///
 /// Every `Turn` error for which [`SendTurnError::published`] holds comes after the pending
 /// initial turn was cleared, and the transcript may show a prompt the agent never received.
-/// The other variants leave the transcript, the queue and the pending initial turn as they
-/// were, though the session may already have been woken.
+/// The other variants leave the transcript and the pending initial turn as they were, and
+/// the queue too, except that `LoginRequired` and `HookFailed` keep the prompt in it for the
+/// delivery after the login. The session may already have been woken.
 pub(crate) enum PromptSubmitError {
     SessionNotFound,
     RevivalRefused,
@@ -186,8 +220,23 @@ pub(crate) enum PromptSubmitError {
     QueuedPromptGone,
     QueuedPromptChanged,
     QueuedAttachmentsMissing,
-    /// The dispatch chose the queue and the enqueue was refused, e.g. a full queue (429).
+    /// The dispatch chose the queue, or the prompt was held for the login or a failed hook,
+    /// and the enqueue was refused, e.g. a full queue (429).
     Enqueue(StatusCode, String),
+    /// The send needs the sandbox login; the prompt is kept in the queue under `queued_id`
+    /// (409).
+    LoginRequired {
+        blocked: crate::session::SandboxLoginRequired,
+        queued_id: String,
+    },
+    /// The admission's `host_hooks.before_start` hook failed; the prompt is kept in the
+    /// queue under `queued_id` (502).
+    HookFailed {
+        message: String,
+        queued_id: String,
+    },
+    /// Never `LoginRequired` or `HookFailed`: those are `Self::LoginRequired` and
+    /// `Self::HookFailed` with their queued copy.
     Turn(SendTurnError),
 }
 
@@ -374,12 +423,28 @@ pub(crate) async fn submit_prompt(
         )
         .await;
     // A fresh prompt supersedes a queued rate-limit continuation (#3028),
-    // but only once it is published: a prompt refused before that must leave
-    // the pending turn in place (#4081 review, #5253).
+    // but only once it is published: a prompt refused before that, including one held for
+    // the sandbox login, must leave the pending turn in place (#4081 review, #5253). After
+    // the login both the pending turn and the kept prompt are delivered.
     if outcome.as_ref().err().is_none_or(SendTurnError::published) {
         state.session_service.clear_pending_initial_turn(id).await;
     }
-    let seq = outcome.map_err(PromptSubmitError::Turn)?;
+    let seq = match outcome {
+        Ok(seq) => seq,
+        // Kept in the queue instead of refused: the sandbox login or the hook is the
+        // only thing missing, and the prompt is delivered once it is there.
+        Err(SendTurnError::LoginRequired(blocked)) => {
+            let queued_id =
+                keep_held_prompt(state, id, &req, queued_row, &attachments, origin_plugin).await?;
+            return Err(PromptSubmitError::LoginRequired { blocked, queued_id });
+        }
+        Err(SendTurnError::HookFailed(message)) => {
+            let queued_id =
+                keep_held_prompt(state, id, &req, queued_row, &attachments, origin_plugin).await?;
+            return Err(PromptSubmitError::HookFailed { message, queued_id });
+        }
+        Err(e) => return Err(PromptSubmitError::Turn(e)),
+    };
     tracing::info!(
         target: "acp.queue",
         session = %id,
@@ -401,6 +466,50 @@ pub(crate) async fn submit_prompt(
         queued_id: None,
         seq,
     })
+}
+
+/// Keep a prompt the send held back (login missing, hook failed) in the queue and return
+/// the row's id. A named "Send now" row already is the queued copy. An enqueue the queue
+/// refuses is the answer instead; the pending initial turn is kept either way.
+async fn keep_held_prompt(
+    state: &Arc<AppState>,
+    id: &str,
+    req: &PromptSubmission<'_>,
+    queued_row: Option<crate::daemon::QueuedPromptEntry>,
+    attachments: &[crate::acp::event_store::AttachmentBlob],
+    origin_plugin: Option<String>,
+) -> Result<String, PromptSubmitError> {
+    if let Some(row) = queued_row {
+        return Ok(row.id);
+    }
+    let prompt_id = req
+        .prompt_id
+        .clone()
+        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+    match super::super::queue::buffer_and_enqueue(
+        state,
+        id,
+        super::super::queue::QueuedPrompt {
+            prompt_id: &prompt_id,
+            text: req.text.to_string(),
+            blobs: attachments,
+            origin_device: None,
+            origin_plugin,
+            supersede_pending_turn: false,
+        },
+    )
+    .await
+    {
+        Ok(entry) => Ok(entry.id),
+        Err((status, msg)) => {
+            tracing::warn!(
+                target: "http.api.acp",
+                session = %id,
+                "prompt held for the sandbox login but enqueue failed: {msg}"
+            );
+            Err(PromptSubmitError::Enqueue(status, msg))
+        }
+    }
 }
 
 /// Why a diff-comments prompt cannot start a turn now; the dialog keeps the
@@ -478,6 +587,7 @@ pub async fn acp_prompt_diff_comments(
             &state.session_service,
             &id,
             crate::process::worker_registry::ResumeAuthority::Explicit,
+            crate::server::sandbox_login::LaunchOrigin::Interactive,
         )
         .await
         {

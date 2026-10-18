@@ -804,6 +804,22 @@ impl Instance {
         self.ensure_sandbox_login_for(None, &[])
     }
 
+    /// The hold decision of [`Self::ensure_sandbox_login`] on `config`, for the launch of the
+    /// stored agent: reads only what the session already holds (its fresh hook resolution,
+    /// never a hook run), so a poller can ask for every held session.
+    pub(crate) fn ensure_sandbox_login_with(
+        &self,
+        config: &crate::session::LaunchConfig,
+    ) -> Result<(), SandboxLoginRequired> {
+        let hook_env = self.trusted_before_start_env(config, std::time::Duration::ZERO);
+        match self.sandbox_login_gate_with(config, None, &[], hook_env) {
+            Some((container_config::LoginGate::LoginRequired, target)) => {
+                Err(self.login_required(&target))
+            }
+            _ => Ok(()),
+        }
+    }
+
     /// The launch configuration the files on disk give this row, for a test that decides on
     /// what a settings file says.
     #[cfg(test)]
@@ -1233,6 +1249,7 @@ impl Instance {
         let command = session_command.filter(|_| !reaches(None) && reaches(session_command));
         SandboxLoginRequired {
             tool: self.tool.clone(),
+            credential: target.credential.clone(),
             profile: (profile != crate::session::config::effective_profile(""))
                 .then(|| profile.clone()),
             command: command.map(str::to_string),
@@ -1815,13 +1832,19 @@ mod tests {
 
         assert_eq!(
             claude.ensure_sandbox_login(),
-            Err(crate::session::test_support::login_required("claude")),
+            Err(crate::session::test_support::login_required_under(
+                "claude",
+                home.path()
+            )),
             "no file"
         );
         write_shared_credential(home.path(), "{}");
         assert_eq!(
             claude.ensure_sandbox_login(),
-            Err(crate::session::test_support::login_required("claude"))
+            Err(crate::session::test_support::login_required_under(
+                "claude",
+                home.path()
+            ))
         );
         write_shared_credential(home.path(), &usable_credential());
         assert_eq!(claude.ensure_sandbox_login(), Ok(()));
@@ -1835,7 +1858,10 @@ mod tests {
             std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o600)).unwrap();
             assert_eq!(
                 unreadable,
-                Err(crate::session::test_support::login_required("claude")),
+                Err(crate::session::test_support::login_required_under(
+                    "claude",
+                    home.path()
+                )),
                 "unreadable file"
             );
         }
@@ -2542,6 +2568,7 @@ mod tests {
     fn sandbox_login_required_prints_profile_and_command_quoted_in_one_command() {
         let both = SandboxLoginRequired {
             tool: "personal".to_string(),
+            credential: "/x/.credentials.json".into(),
             profile: Some("my work".to_string()),
             command: Some("claude --model fast".to_string()),
         };
@@ -2592,6 +2619,10 @@ mod tests {
             login,
             home.path()
                 .join(".claude-personal/sandbox-v2/.credentials.json")
+        );
+        assert_eq!(
+            held.credential, login,
+            "the gate waits for the login's file"
         );
         assert_eq!(held.command, None, "plain --tool reaches it");
 
@@ -4001,7 +4032,10 @@ mod tests {
             let error = claude.test_launchable().unwrap_err();
             assert_eq!(
                 error.downcast_ref::<SandboxLoginRequired>(),
-                Some(&crate::session::test_support::login_required("claude")),
+                Some(&crate::session::test_support::login_required_under(
+                    "claude",
+                    home.path()
+                )),
                 "{runtime:?}"
             );
             assert!(claude.ensure_sandbox_login().is_err(), "{runtime:?}");

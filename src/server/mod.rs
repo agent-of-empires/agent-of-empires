@@ -32,6 +32,7 @@ pub(crate) mod reload;
 pub(crate) mod router;
 pub(crate) mod runtime;
 pub(crate) mod runtime_ws;
+pub(crate) mod sandbox_login;
 mod secure_store;
 pub(crate) mod serve_snapshot;
 pub(crate) mod session_identity;

@@ -12,6 +12,7 @@ use crate::acp::supervisor::{
     Supervisor, SupervisorError,
 };
 use crate::process::worker_registry;
+use crate::server::sandbox_login::LaunchOrigin;
 use crate::server::session_service::SessionService;
 use crate::session::Instance;
 
@@ -343,7 +344,9 @@ pub(super) async fn resume_one(state: Arc<AppState>, target: ResumeTarget) -> Re
         in_flight_turn || target.agent_turn_open,
     );
     requeue_interrupted_monitor(&state, &id).await;
-    let req = match build_spawn_request(&state.session_service, &target).await {
+    let req = match build_spawn_request(&state.session_service, &target, LaunchOrigin::Unattended)
+        .await
+    {
         Ok(req) => req,
         Err(PrepFailure::Reported) => return ResumeOutcome::SpawnFinished,
         Err(PrepFailure::Raced) => return ResumeOutcome::Retry,
@@ -415,9 +418,11 @@ enum PrepFailure {
 }
 
 /// Builds a fresh-spawn request; on sandbox failure publishes a startup error and returns `Err`.
+/// A launch refused for the sandbox login also holds the session under `origin`.
 async fn build_spawn_request(
     service: &Arc<SessionService>,
     target: &ResumeTarget,
+    origin: LaunchOrigin,
 ) -> Result<SpawnRequest, PrepFailure> {
     let state = service.native_state().map_err(|_| PrepFailure::Raced)?;
     let exclusion = crate::acp::sandbox::LaunchExclusion::acquire(state.clone(), &target.id, false)
@@ -494,6 +499,12 @@ async fn build_spawn_request(
     {
         Ok(info) => info,
         Err(e) => {
+            if let Some(blocked) = e.downcast_ref::<crate::session::SandboxLoginRequired>() {
+                tracing::warn!(target: "acp.supervisor", session = %target.id, "resume launch held: {blocked}");
+                service.sandbox_login.hold(&target.id, origin, blocked);
+                supervisor.publish_startup_error(&target.id, blocked.to_string());
+                return Err(PrepFailure::Reported);
+            }
             let message = format!("sandbox container ensure failed: {e}");
             tracing::warn!(target: "acp.supervisor", session = %target.id, "reconciler container ensure failed: {message}");
             let published = crate::server::api::publish_startup_error_if_current(
@@ -570,6 +581,7 @@ pub(crate) async fn trigger_resume_background(
     service: &Arc<SessionService>,
     id: &str,
     authority: crate::process::worker_registry::ResumeAuthority,
+    origin: LaunchOrigin,
 ) -> Result<ResumeTrigger, SupervisorError> {
     if service
         .instances
@@ -621,7 +633,7 @@ pub(crate) async fn trigger_resume_background(
                     .acp_supervisor
                     .synthesize_stopped_for_orphan(&target.id, "orphaned_at_restart");
             }
-            let Ok(req) = build_spawn_request(&service, &target).await else {
+            let Ok(req) = build_spawn_request(&service, &target, origin).await else {
                 return;
             };
             let agent = req.agent.clone();
@@ -718,7 +730,7 @@ mod tests {
         // The snapshot predates a worktree rename (#2260).
         let mut target = ResumeTarget::from_instance(&moved);
         target.project_path = "/tmp/aoe-2260-before-rename".to_string();
-        let req = build_spawn_request(&state.session_service, &target)
+        let req = build_spawn_request(&state.session_service, &target, LaunchOrigin::Unattended)
             .await
             .unwrap();
         assert_eq!(req.cwd, PathBuf::from("/tmp/aoe-2260-after-rename"));
@@ -727,6 +739,7 @@ mod tests {
         let req = build_spawn_request(
             &state.session_service,
             &ResumeTarget::from_instance(&unpinned),
+            LaunchOrigin::Unattended,
         )
         .await
         .unwrap();
@@ -744,7 +757,7 @@ mod tests {
             .find(|i| i.id == "sess-moved")
             .expect("fixture")
             .agent_model = Some("claude-opus-5".to_string());
-        let req = build_spawn_request(&state.session_service, &target)
+        let req = build_spawn_request(&state.session_service, &target, LaunchOrigin::Unattended)
             .await
             .unwrap();
         assert_eq!(req.model.as_deref(), Some("claude-opus-5"));
@@ -793,9 +806,10 @@ mod tests {
             let instances = state.instances.read().await;
             ResumeTarget::from_instance(&instances[0])
         };
-        let request = build_spawn_request(&state.session_service, &target)
-            .await
-            .unwrap();
+        let request =
+            build_spawn_request(&state.session_service, &target, LaunchOrigin::Unattended)
+                .await
+                .unwrap();
 
         assert_eq!(
             request
@@ -926,6 +940,7 @@ mod tests {
                 &state.session_service,
                 id,
                 crate::process::worker_registry::ResumeAuthority::Explicit,
+                LaunchOrigin::Interactive,
             )
             .await
             .expect("resume is admitted");
@@ -962,7 +977,13 @@ mod tests {
         let authority = crate::process::worker_registry::ResumeAuthority::Explicit;
 
         state.acp_event_store.test_set_unavailable(true);
-        let deferred = trigger_resume_background(&state.session_service, id, authority).await;
+        let deferred = trigger_resume_background(
+            &state.session_service,
+            id,
+            authority,
+            LaunchOrigin::Interactive,
+        )
+        .await;
         assert!(matches!(
             deferred,
             Err(SupervisorError::EventStoreUnavailable(_))
@@ -973,9 +994,14 @@ mod tests {
         );
 
         state.acp_event_store.test_set_unavailable(false);
-        let trigger = trigger_resume_background(&state.session_service, id, authority)
-            .await
-            .expect("the retry is admitted");
+        let trigger = trigger_resume_background(
+            &state.session_service,
+            id,
+            authority,
+            LaunchOrigin::Interactive,
+        )
+        .await
+        .expect("the retry is admitted");
         assert!(matches!(trigger, ResumeTrigger::Started));
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
         while state.acp_event_store.has_open_turn(id) != Some(false) {
