@@ -4,7 +4,7 @@ Live mode is a "feels attached" alternative to a full tmux attach: the home view
 
 ## Entering and leaving
 
-Press `Tab` on a runnable session, or set live mode as your default so `Enter` and a click drop straight into it. **New Session Mode** makes new sessions open in live mode without changing what `Enter` does. `Ctrl+Q` always leaves, in a single press, independent of the leader below. The status bar shows a `● LIVE → <session>` banner with the exit chord while you are relayed.
+Press `Tab` on a runnable session, or set live mode as your default so `Enter` and a click drop straight into it. **New Session Mode** makes new sessions open in live mode without changing what `Enter` does. The configured exit chord (`Ctrl+Q` by default) leaves in a single press, independent of the leader below. The status bar shows a `● LIVE → <session>` banner with the exit chord while you are relayed.
 
 Control chords reach the agent: `Ctrl+C` interrupts it rather than quitting AoE, and the banner flashes a brief reminder on each press. To quit AoE, leave live mode first.
 
@@ -68,4 +68,4 @@ live_send_exit_chord = "C-q"
 
 Specs are tmux-style (`C-b`, `C-a`, `M-x`, `F12`). A typo in the leader falls back to the default.
 
-`Ctrl+B` is the default because a prefix steals exactly one chord from the agent, and it is the one tmux users already know, leaving candidates like `Ctrl+K` free for the shell. If you run AoE inside your own tmux session that also uses `Ctrl+B`, the outer tmux claims it first: rebind `live_send_leader` (to `C-a` or `F1`, say), and remember that `Ctrl+Q` always exits.
+`Ctrl+B` is the default because a prefix steals exactly one chord from the agent, and it is the one tmux users already know, leaving candidates like `Ctrl+K` free for the shell. If you run AoE inside your own tmux session that also uses `Ctrl+B`, the outer tmux claims it first: rebind `live_send_leader` (to `C-a` or `F1`, say). The default exit chord is `Ctrl+Q`; `live_send_exit_chord` changes it independently.
