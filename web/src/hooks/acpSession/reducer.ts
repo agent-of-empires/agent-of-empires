@@ -42,6 +42,8 @@ export type Action =
   | { kind: "settle_inflight_prompt"; id: string }
   | { kind: "rollback_optimistic_prompt"; id: string }
   | { kind: "error"; message: string }
+  // A launch the daemon refused and kept the prompt for: shown through the startup banner.
+  | { kind: "blocked_launch"; message: string }
   | { kind: "clear_error" }
   | { kind: "approval_resolved_locally"; nonce: string }
   | { kind: "elicitation_resolved_locally"; nonce: string; resolution: ElicitationResolution }
@@ -191,6 +193,8 @@ export function reducer(state: AcpState, action: Action): AcpState {
       return { ...state, lagged: false };
     case "error":
       return { ...state, lastError: action.message };
+    case "blocked_launch":
+      return { ...state, startupError: action.message };
     case "clear_error":
       return { ...state, lastError: null };
     case "approval_resolved_locally": {

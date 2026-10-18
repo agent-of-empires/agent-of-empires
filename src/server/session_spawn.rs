@@ -460,12 +460,17 @@ pub(crate) async fn spawn_structured_session(
                 let cwd = std::path::PathBuf::from(project_path);
                 let supervisor = service.acp_supervisor.clone();
                 let service_for_check = service.clone();
-                let has_pending_initial_turn = {
+                let (has_pending_initial_turn, origin) = {
                     let instances = service.instances.read().await;
-                    instances
-                        .iter()
-                        .find(|i| i.id == id)
-                        .is_some_and(|i| i.pending_initial_turn.is_some())
+                    let row = instances.iter().find(|i| i.id == id);
+                    (
+                        row.is_some_and(|i| i.pending_initial_turn.is_some()),
+                        if row.is_some_and(|i| i.created_by_plugin.is_some()) {
+                            crate::server::sandbox_login::LaunchOrigin::Unattended
+                        } else {
+                            crate::server::sandbox_login::LaunchOrigin::Interactive
+                        },
+                    )
                 };
                 tokio::spawn(async move {
                     let inst_lock = service_for_check.instance_lock(&id).await;
@@ -480,6 +485,18 @@ pub(crate) async fn spawn_structured_session(
                     {
                         Ok(info) => info,
                         Err(e) => {
+                            if let Some(blocked) =
+                                e.downcast_ref::<crate::session::SandboxLoginRequired>()
+                            {
+                                tracing::warn!(
+                                    target: "acp.supervisor",
+                                    session = %id,
+                                    "auto-spawn after create held: {blocked}"
+                                );
+                                service_for_check.sandbox_login.hold(&id, origin, blocked);
+                                supervisor.publish_startup_error(&id, blocked.to_string());
+                                return;
+                            }
                             let message = format!("sandbox container ensure failed: {e}");
                             tracing::warn!(
                                 target: "acp.supervisor",
@@ -756,5 +773,107 @@ mod tests {
         .expect("the refused spawn reports a startup error");
         assert_eq!(launches.load(std::sync::atomic::Ordering::SeqCst), 0);
         assert!(!state.acp_supervisor.is_running(&id).await);
+    }
+
+    /// The auto-spawn after a create holds a session the login gate refuses: a
+    /// plugin-created one unattended (with the push notice), a user's interactive.
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn sandbox_login_hold_origin_by_site_create() {
+        use crate::server::sandbox_login::LaunchOrigin;
+        for (created_by_plugin, origin) in [
+            (None, LaunchOrigin::Interactive),
+            (Some("cron".to_string()), LaunchOrigin::Unattended),
+        ] {
+            let home = crate::session::test_support::isolate_app_dir();
+            let (_runtime, calls) =
+                crate::session::test_support::probing_container_runtime(home.path());
+            crate::session::config::update_config(|c| {
+                c.sandbox.shared_credential =
+                    crate::session::config::SharedCredentialMode::SeparateLogin;
+            })
+            .unwrap();
+            crate::server::test_support::seed_instances_on_disk_for_test("default", Vec::new());
+            let state = crate::server::test_support::build_test_app_state(Vec::new());
+            let login = &state.session_service.sandbox_login;
+            let mut notices = login.subscribe();
+            let spec = super::StructuredSessionSpec {
+                title: Some("login-hold".to_string()),
+                path: String::new(),
+                group: String::new(),
+                tool: "claude".to_string(),
+                worktree_enabled: false,
+                worktree_branch: None,
+                create_new_branch: false,
+                base_branch: None,
+                sandbox: true,
+                sandbox_image: Some("test:latest".to_string()),
+                yolo_mode: false,
+                extra_env: Vec::new(),
+                extra_args: String::new(),
+                command_override: String::new(),
+                extra_repo_paths: Vec::new(),
+                repo_base_branches: Vec::new(),
+                scratch: true,
+                trust_hooks: Some(false),
+                custom_instruction: None,
+                callback_url: None,
+                idempotency_key: None,
+                profile: "default".to_string(),
+                created_by_plugin: created_by_plugin.clone(),
+                plugin_create_idempotency: None,
+                pending_initial_turn: None,
+                acp_mode_id: None,
+                view: crate::session::View::Structured,
+                agent_name: Some("claude".to_string()),
+                agent_model: None,
+                agent_effort: None,
+                import_acp_session_id: None,
+                fork_seed: None,
+                progress: None,
+            };
+
+            let id = super::spawn_structured_session(&state.session_service, spec)
+                .await
+                .expect("the create succeeds")
+                .instance
+                .id;
+            let startup_errors = || -> Vec<String> {
+                state
+                    .acp_event_store
+                    .replay_from(&id, 0)
+                    .into_iter()
+                    .filter_map(|(_, e)| match e {
+                        crate::acp::Event::AgentStartupError { message } => Some(message),
+                        _ => None,
+                    })
+                    .collect()
+            };
+            tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                while startup_errors().is_empty() {
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("the refused auto-spawn reports a startup error");
+
+            assert_eq!(
+                login.held_origin(&id),
+                Some(origin),
+                "{created_by_plugin:?}"
+            );
+            assert_eq!(
+                notices.try_recv().is_ok(),
+                origin == LaunchOrigin::Unattended,
+                "{created_by_plugin:?}"
+            );
+            let messages = startup_errors();
+            assert_eq!(
+                messages,
+                vec![crate::session::test_support::login_required("claude").to_string()]
+            );
+            assert_eq!(std::fs::read_to_string(&calls).unwrap_or_default(), "");
+        }
     }
 }

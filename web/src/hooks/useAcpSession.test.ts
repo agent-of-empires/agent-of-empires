@@ -384,6 +384,57 @@ describe("sendPrompt outcomes", () => {
     });
   });
 
+  // The daemon kept the prompt for the sandbox login: a queue row, not a rejected send, and the
+  // banner says what to run.
+  it("treats a 409 login-required prompt with a queued_id as queued and shows the login guidance", async () => {
+    const message = `sandbox login required for claude: run \`aoe sandbox login --tool claude\``;
+    calls = installAcpFakes(({ url }) =>
+      url.includes("/acp/prompt")
+        ? json(
+            {
+              error: "sandbox_login_required",
+              message,
+              queued_id: "0b6f1c1e-3c55-4b8e-9a51-2f3d4c5b6a79",
+            },
+            409,
+          )
+        : undefined,
+    );
+    const { result } = render("sess-login", "absent", null, null);
+    await flushAsync();
+    await act(() => result.current.sendPrompt("after the login"));
+    await flushAsync();
+    expect(result.current.state.queuedPrompts.map((q) => q.text)).toEqual(["after the login"]);
+    expect(result.current.state.lastError).toBeNull();
+    expect(result.current.state.startupError).toBe(message);
+  });
+
+  // A failing `before_start` hook: the daemon kept the prompt (502 with a queue id). It is a queue
+  // row, not a rejected send, so a retry does not enqueue it twice, and the banner says so in plain
+  // words without the daemon's text.
+  it("treats a 502 before_start_hook_failed prompt with a queued_id as queued, with a plain message", async () => {
+    calls = installAcpFakes(({ url }) =>
+      url.includes("/acp/prompt")
+        ? json(
+            {
+              error: "before_start_hook_failed",
+              message: "the before_start hook failed",
+              queued_id: "5d1f0a52-9e0b-4a47-8d0e-6f1b2c3d4e5f",
+            },
+            502,
+          )
+        : undefined,
+    );
+    const { result } = render("sess-hook-failed", "absent", null, null);
+    await flushAsync();
+    await act(() => result.current.sendPrompt("once the hook works"));
+    await flushAsync();
+    expect(result.current.state.queuedPrompts.map((q) => q.text)).toEqual(["once the hook works"]);
+    expect(result.current.state.lastError).toBeNull();
+    expect(result.current.state.startupError).toMatch(/before_start hook failed; your message is queued/);
+    expect(result.current.state.startupError).not.toMatch(/502|\{/);
+  });
+
   // A 503 that is not `worker_not_ready` is a real failure: it keeps its banner and the prompt
   // is not silently parked on the queue.
   it("does not re-enqueue a 503 that is not worker_not_ready", async () => {

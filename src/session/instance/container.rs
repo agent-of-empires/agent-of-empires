@@ -588,7 +588,6 @@ impl Instance {
     ///
     /// This is the hold decision only: a launch the active runtime cannot log in at all
     /// ([`SandboxLoginUnsupported`]) is never held, see [`Self::ensure_sandbox_launchable_for`].
-    #[cfg(test)]
     pub(crate) fn ensure_sandbox_login(&self) -> Result<(), SandboxLoginRequired> {
         self.ensure_sandbox_login_for(None, &[])
     }
@@ -600,7 +599,6 @@ impl Instance {
     /// reads, and `None` is the stored agent. Both are read for this decision only, never
     /// stored; a launch without the request (a respawn, the reconciler) is admitted on what
     /// is stored.
-    #[cfg(test)]
     pub(crate) fn ensure_sandbox_login_for(
         &self,
         launch_agent: Option<&str>,
@@ -923,6 +921,7 @@ impl Instance {
         let command = session_command.filter(|_| !reaches(None) && reaches(session_command));
         SandboxLoginRequired {
             tool: self.tool.clone(),
+            credential: target.credential.clone(),
             profile: (profile != crate::session::config::effective_profile(""))
                 .then(|| profile.clone()),
             command: command.map(str::to_string),
@@ -936,7 +935,6 @@ impl Instance {
 
     /// The gate decision for this launch with the target it is gated on; `None` when the
     /// session is not sandboxed or its agent has no sandbox login.
-    #[cfg(test)]
     fn sandbox_login_gate(
         &self,
         launch_agent: Option<&str>,
@@ -1463,13 +1461,19 @@ mod tests {
 
         assert_eq!(
             claude.ensure_sandbox_login(),
-            Err(crate::session::test_support::login_required("claude")),
+            Err(crate::session::test_support::login_required_under(
+                "claude",
+                home.path()
+            )),
             "no file"
         );
         write_shared_credential(home.path(), "{}");
         assert_eq!(
             claude.ensure_sandbox_login(),
-            Err(crate::session::test_support::login_required("claude"))
+            Err(crate::session::test_support::login_required_under(
+                "claude",
+                home.path()
+            ))
         );
         write_shared_credential(home.path(), &usable_credential());
         assert_eq!(claude.ensure_sandbox_login(), Ok(()));
@@ -1483,7 +1487,10 @@ mod tests {
             std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o600)).unwrap();
             assert_eq!(
                 unreadable,
-                Err(crate::session::test_support::login_required("claude")),
+                Err(crate::session::test_support::login_required_under(
+                    "claude",
+                    home.path()
+                )),
                 "unreadable file"
             );
         }
@@ -1972,6 +1979,7 @@ mod tests {
     fn sandbox_login_required_prints_profile_and_command_quoted_in_one_command() {
         let both = SandboxLoginRequired {
             tool: "personal".to_string(),
+            credential: "/x/.credentials.json".into(),
             profile: Some("my work".to_string()),
             command: Some("claude --model fast".to_string()),
         };
@@ -2022,6 +2030,10 @@ mod tests {
             login,
             home.path()
                 .join(".claude-personal/sandbox-v2/.credentials.json")
+        );
+        assert_eq!(
+            held.credential, login,
+            "the gate waits for the login's file"
         );
         assert_eq!(held.command, None, "plain --tool reaches it");
 
@@ -3251,7 +3263,10 @@ mod tests {
             let error = claude.ensure_sandbox_launchable().unwrap_err();
             assert_eq!(
                 error.downcast_ref::<SandboxLoginRequired>(),
-                Some(&crate::session::test_support::login_required("claude")),
+                Some(&crate::session::test_support::login_required_under(
+                    "claude",
+                    home.path()
+                )),
                 "{runtime:?}"
             );
             assert!(claude.ensure_sandbox_login().is_err(), "{runtime:?}");

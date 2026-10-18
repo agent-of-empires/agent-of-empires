@@ -3641,7 +3641,7 @@ async fn start_paths_refuse_archived_and_trashed_sessions() {
 #[cfg(unix)]
 #[tokio::test]
 #[serial_test::serial]
-async fn sandbox_login_gate_tmux_start_and_ensure_are_409() {
+async fn sandbox_login_gate_tmux_start_ensure_and_send_are_409() {
     use axum::body::to_bytes;
     if !crate::tmux::tmux_command()
         .arg("-V")
@@ -3662,7 +3662,7 @@ async fn sandbox_login_gate_tmux_start_and_ensure_are_409() {
     std::fs::write(root.join(".credentials.json"), "{}").unwrap();
     let message = crate::session::test_support::login_required("claude").to_string();
 
-    for which in ["start", "ensure"] {
+    for which in ["start", "ensure", "send"] {
         let mut inst = make_test_instance();
         inst.title = format!("login-gate-{which}");
         inst.project_path = home.path().to_string_lossy().into_owned();
@@ -3687,9 +3687,20 @@ async fn sandbox_login_gate_tmux_start_and_ensure_are_409() {
             "start" => start_session(State(state.clone()), Path(id.clone()))
                 .await
                 .into_response(),
-            _ => ensure_session(State(state.clone()), Path(id.clone()))
+            "ensure" => ensure_session(State(state.clone()), Path(id.clone()))
                 .await
                 .into_response(),
+            // A terminal session has no queue: the send fails with the error text.
+            _ => send_message(
+                State(state.clone()),
+                Path(id.clone()),
+                Ok(Json(SendMessageRequest {
+                    message: "hello".into(),
+                    revive: true,
+                })),
+            )
+            .await
+            .into_response(),
         };
         let spawned = session.exists();
         let _ = session.kill();

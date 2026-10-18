@@ -1232,7 +1232,10 @@ mod tests {
         .expect_err("a launch that needs the login");
         assert_eq!(
             err.downcast_ref::<SandboxLoginRequired>(),
-            Some(&crate::session::test_support::login_required("claude")),
+            Some(&crate::session::test_support::login_required_under(
+                "claude",
+                app_dir.path()
+            )),
             "{err:#}"
         );
 
@@ -1358,6 +1361,14 @@ mod tests {
         assert!(
             !runtime_calls().is_empty(),
             "admitted: the launch reached the container runtime"
+        );
+        assert!(
+            state
+                .session_service
+                .sandbox_login
+                .held_origin(&id)
+                .is_none(),
+            "no hold record"
         );
 
         // Nothing of the key outlives the request.
@@ -1859,6 +1870,14 @@ mod tests {
             }))
         );
         assert!(!state.acp_supervisor.is_running(&id).await);
+        assert!(
+            state
+                .session_service
+                .sandbox_login
+                .held_origin(&id)
+                .is_none(),
+            "no hold, so no push and no kept-message episode"
+        );
         assert_eq!(
             std::fs::read_to_string(&calls).unwrap_or_default(),
             "",

@@ -12,6 +12,7 @@ use crate::acp::supervisor::{
     Supervisor, SupervisorError,
 };
 use crate::process::worker_registry;
+use crate::server::sandbox_login::LaunchOrigin;
 use crate::server::session_service::SessionService;
 use crate::session::Instance;
 
@@ -302,7 +303,9 @@ pub(super) async fn resume_one(state: Arc<AppState>, target: ResumeTarget) -> Re
 
     publish_orphaned_turn_stop(&state.acp_supervisor, &id, decision, in_flight_turn);
     requeue_interrupted_monitor(&state, &id).await;
-    let Ok(req) = build_spawn_request(&state.session_service, &target).await else {
+    let Ok(req) =
+        build_spawn_request(&state.session_service, &target, LaunchOrigin::Unattended).await
+    else {
         return ResumeOutcome::SpawnFinished;
     };
     let agent = req.agent.clone();
@@ -355,9 +358,11 @@ async fn report_spawn_failure(
 }
 
 /// Builds a fresh-spawn request; on sandbox failure publishes a startup error and returns `Err`.
+/// A launch refused for the sandbox login also holds the session under `origin`.
 async fn build_spawn_request(
     service: &Arc<SessionService>,
     target: &ResumeTarget,
+    origin: LaunchOrigin,
 ) -> Result<SpawnRequest, ()> {
     let supervisor = &service.acp_supervisor;
     let inst_lock = service.instance_lock(&target.id).await;
@@ -415,6 +420,12 @@ async fn build_spawn_request(
     {
         Ok(info) => info,
         Err(e) => {
+            if let Some(blocked) = e.downcast_ref::<crate::session::SandboxLoginRequired>() {
+                tracing::warn!(target: "acp.supervisor", session = %target.id, "resume launch held: {blocked}");
+                service.sandbox_login.hold(&target.id, origin, blocked);
+                supervisor.publish_startup_error(&target.id, blocked.to_string());
+                return Err(());
+            }
             let message = format!("sandbox container ensure failed: {e}");
             tracing::warn!(target: "acp.supervisor", session = %target.id, "reconciler container ensure failed: {message}");
             supervisor.publish_startup_error(&target.id, message);
@@ -484,6 +495,7 @@ pub(crate) async fn trigger_resume_background(
     service: &Arc<SessionService>,
     id: &str,
     authority: crate::process::worker_registry::ResumeAuthority,
+    origin: LaunchOrigin,
 ) -> Result<ResumeTrigger, SupervisorError> {
     let has_stored_id = service
         .instances
@@ -521,7 +533,7 @@ pub(crate) async fn trigger_resume_background(
                     .acp_supervisor
                     .synthesize_stopped_for_orphan(&target.id, "orphaned_at_restart");
             }
-            let Ok(req) = build_spawn_request(&service, &target).await else {
+            let Ok(req) = build_spawn_request(&service, &target, origin).await else {
                 return;
             };
             let agent = req.agent.clone();
@@ -599,7 +611,7 @@ mod tests {
         // The snapshot predates a worktree rename (#2260).
         let mut target = ResumeTarget::from_instance(&moved);
         target.project_path = "/tmp/aoe-2260-before-rename".to_string();
-        let req = build_spawn_request(&state.session_service, &target)
+        let req = build_spawn_request(&state.session_service, &target, LaunchOrigin::Unattended)
             .await
             .unwrap();
         assert_eq!(req.cwd, PathBuf::from("/tmp/aoe-2260-after-rename"));
@@ -608,6 +620,7 @@ mod tests {
         let req = build_spawn_request(
             &state.session_service,
             &ResumeTarget::from_instance(&unpinned),
+            LaunchOrigin::Unattended,
         )
         .await
         .unwrap();
@@ -625,7 +638,7 @@ mod tests {
             .find(|i| i.id == "sess-moved")
             .expect("fixture")
             .agent_model = Some("claude-opus-5".to_string());
-        let req = build_spawn_request(&state.session_service, &target)
+        let req = build_spawn_request(&state.session_service, &target, LaunchOrigin::Unattended)
             .await
             .unwrap();
         assert_eq!(req.model.as_deref(), Some("claude-opus-5"));
@@ -649,6 +662,7 @@ mod tests {
             let req = build_spawn_request(
                 &state.session_service,
                 &ResumeTarget::from_instance(&instance),
+                LaunchOrigin::Unattended,
             )
             .await
             .unwrap();
@@ -699,9 +713,10 @@ mod tests {
             let instances = state.instances.read().await;
             ResumeTarget::from_instance(&instances[0])
         };
-        let request = build_spawn_request(&state.session_service, &target)
-            .await
-            .unwrap();
+        let request =
+            build_spawn_request(&state.session_service, &target, LaunchOrigin::Unattended)
+                .await
+                .unwrap();
 
         assert_eq!(
             request
@@ -823,6 +838,7 @@ mod tests {
             &state.session_service,
             id,
             crate::process::worker_registry::ResumeAuthority::Explicit,
+            LaunchOrigin::Interactive,
         )
         .await
         .expect("resume is admitted");
