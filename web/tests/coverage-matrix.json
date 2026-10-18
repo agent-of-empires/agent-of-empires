@@ -3065,6 +3065,7 @@
         "src/components/acp/useTranscriptScroll.test.tsx"
       ],
       "components": [
+        "web/src/components/acp/StructuredView.tsx",
         "web/src/components/acp/ToolExpansion.tsx",
         "web/src/components/acp/GroupToolCards.tsx",
         "web/src/components/acp/useTranscriptScroll.ts",

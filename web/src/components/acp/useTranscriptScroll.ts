@@ -67,6 +67,7 @@ export function useTranscriptScroll({
     lastAtBottomAtRef.current = performance.now();
     setAtBottom(true);
     vp.scrollTo({ top: vp.scrollHeight, behavior });
+    lastScrollTopRef.current = vp.scrollTop;
   }, []);
   const scrollToBottom = useCallback(() => pinToBottom("smooth"), [pinToBottom]);
 
@@ -196,10 +197,8 @@ export function useTranscriptScroll({
       const layoutChanged =
         vp.scrollHeight !== lastScrollHeightRef.current || vp.clientHeight !== lastClientHeightRef.current;
       const scrollChanged = vp.scrollTop !== lastScrollTopRef.current;
-      const wasPinned = wasAtBottomRef.current || (folding && anchorIntentRef.current);
-      const foldLayoutChanged = folding && layoutChanged;
       let readerMoved = false;
-      if (folding && scrollChanged && (gestureActive || !layoutChanged)) {
+      if (scrollChanged) {
         const maxScrollTop = vp.scrollHeight - vp.clientHeight;
         const sampledScrollTop = layoutChanged
           ? Math.min(lastScrollTopRef.current, maxScrollTop)
@@ -207,20 +206,20 @@ export function useTranscriptScroll({
         const readerDelta = vp.scrollTop - sampledScrollTop;
         if (readerDelta !== 0) {
           readerMoved = true;
-          toolAnchorsRef.current = previous.map((anchor) => ({
-            ...anchor,
-            offset: anchor.offset - readerDelta,
-            scrollTop: vp.scrollTop,
-          }));
+          if (folding) {
+            toolAnchorsRef.current = previous.map((anchor) => ({
+              ...anchor,
+              offset: anchor.offset - readerDelta,
+              scrollTop: vp.scrollTop,
+            }));
+          }
         }
       }
-      sample(readerMoved, !foldLayoutChanged || readerMoved);
+      sample(readerMoved, !layoutChanged || readerMoved || gestureActive);
       if (!folding) {
         toolAnchorsRef.current = resampleToolAnchors(vp, previous);
       }
-      if (layoutChanged && wasPinned && !gestureActive && !folding) {
-        pinToBottom("auto");
-      } else if (readerMoved || (!foldLayoutChanged && (gestureActive || (!layoutChanged && scrollChanged)))) {
+      if (readerMoved || (scrollChanged && !layoutChanged)) {
         anchorIntentRef.current = wasAtBottomRef.current;
       }
       lastScrollTopRef.current = vp.scrollTop;
@@ -236,7 +235,10 @@ export function useTranscriptScroll({
     // soft keyboard animation in lockstep.
     const vv = typeof window !== "undefined" ? window.visualViewport : null;
     const onVvResize = () => {
-      if (wasAtBottomRef.current) vp.scrollTop = vp.scrollHeight;
+      if (wasAtBottomRef.current) {
+        vp.scrollTop = vp.scrollHeight;
+        lastScrollTopRef.current = vp.scrollTop;
+      }
     };
     vv?.addEventListener("resize", onVvResize);
 
@@ -251,7 +253,10 @@ export function useTranscriptScroll({
       // current stick intent so an intervening user scroll wins.
       const applyStart = () => {
         const top = restoredScrollTop(saved, wasAtBottomRef.current, vp.scrollHeight, vp.clientHeight);
-        if (top != null) vp.scrollTop = top;
+        if (top != null) {
+          vp.scrollTop = top;
+          lastScrollTopRef.current = vp.scrollTop;
+        }
       };
       applyStart();
       requestAnimationFrame(() => requestAnimationFrame(applyStart));
@@ -271,6 +276,7 @@ export function useTranscriptScroll({
     const wasAtBottom = () => wasAtBottomRef.current;
     const repin = () => {
       vp.scrollTop = vp.scrollHeight;
+      lastScrollTopRef.current = vp.scrollTop;
     };
     const ro = repinOnResize({ target: below, readHeight: () => below.offsetHeight, wasAtBottom, repin });
     const vpRo = repinOnResize({ target: vp, readHeight: () => vp.clientHeight, wasAtBottom, repin });
@@ -287,14 +293,16 @@ export function useTranscriptScroll({
       const anchor = pendingScrollAnchorRef.current;
       if (anchor != null) {
         const delta = scrollRestoreDelta(anchor, vp.scrollHeight, wasAtBottomRef.current);
-        if (delta > 0) vp.scrollTop += delta;
+        if (delta > 0) {
+          vp.scrollTop += delta;
+          lastScrollTopRef.current = vp.scrollTop;
+        }
         pendingScrollAnchorRef.current = null;
         resample();
         return;
       }
-      // Mid-fold the pin flag may come from the clamp, so go by the intent from before it.
       const folding = toolAnchorsRef.current.some(({ el }) => !el.isConnected);
-      if (folding && anchorIntentRef.current) {
+      if (anchorIntentRef.current && (folding || !wasAtBottomRef.current)) {
         pinToBottom("auto");
         resample();
         return;
@@ -327,6 +335,7 @@ export function useTranscriptScroll({
       pendingFoldAnchorMissRef.current = false;
       if (!folding && wasAtBottomRef.current) {
         vp.scrollTop = vp.scrollHeight;
+        lastScrollTopRef.current = vp.scrollTop;
         resample();
         return;
       }
@@ -338,11 +347,13 @@ export function useTranscriptScroll({
         const appliedDelta = vp.scrollTop - beforeCorrection;
         const maxScrollTop = vp.scrollHeight - vp.clientHeight;
         // Advance only our correction, so later user scrolling remains in the delta.
-        for (const anchor of toolAnchorsRef.current) {
-          anchor.scrollTop = Math.min(anchor.scrollTop, maxScrollTop) + appliedDelta;
-        }
+        const correctedScrollTop = Math.min(remountedAnchor!.scrollTop, maxScrollTop) + appliedDelta;
+        toolAnchorsRef.current = toolAnchorsRef.current.map((anchor) => ({
+          ...anchor,
+          scrollTop: Math.min(anchor.scrollTop, maxScrollTop) + appliedDelta,
+        }));
         const currentOffset = remountedElement!.getBoundingClientRect().top - vp.getBoundingClientRect().top;
-        const expectedOffset = remountedOffset! - (vp.scrollTop - Math.min(remountedAnchor!.scrollTop, maxScrollTop));
+        const expectedOffset = remountedOffset! - (vp.scrollTop - correctedScrollTop);
         if (Math.abs(currentOffset - expectedOffset) > 1) {
           pendingFoldCorrectionStableRef.current = false;
           return;
@@ -389,6 +400,7 @@ export function useTranscriptScroll({
     const start = performance.now();
     const pin = () => {
       vp.scrollTop = vp.scrollHeight;
+      lastScrollTopRef.current = vp.scrollTop;
       if (performance.now() - start < 500) raf = requestAnimationFrame(pin);
     };
     raf = requestAnimationFrame(pin);

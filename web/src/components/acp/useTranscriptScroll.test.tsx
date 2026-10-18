@@ -143,6 +143,31 @@ afterEach(() => {
 });
 
 describe("useTranscriptScroll fold corrections", () => {
+  it("preserves escape scrolling coalesced with the observer's bottom-following scroll", () => {
+    const metrics: Metrics = { clientHeight: 100, scrollHeight: 1200, scrollTop: 1100, cardPageTop: 1150 };
+    const sessionId = "streaming-reader-escape";
+    saveScrollState(sessionId, { stuck: true, top: metrics.scrollTop });
+    const view = render(
+      <Harness metrics={metrics} sessionId={sessionId} folded={false} closed={false} streamed={false} />,
+    );
+    const viewport = view.getByTestId("viewport") as HTMLDivElement;
+    const content = view.getByTestId("content");
+    act(() => viewport.dispatchEvent(new Event("scroll")));
+
+    metrics.scrollHeight = 1400;
+    act(() => contentObserver(content).fire());
+    expect(viewport.scrollTop).toBe(1300);
+    act(() => {
+      viewport.scrollTop -= 160;
+      viewport.dispatchEvent(new Event("scroll"));
+    });
+    expect(viewport.scrollTop).toBe(1140);
+
+    metrics.scrollHeight = 1600;
+    act(() => contentObserver(content).fire());
+    expect(viewport.scrollTop).toBe(1140);
+  });
+
   it("keeps pre-fold anchors across a gesture scroll and preserves later keyboard movement", () => {
     const metrics: Metrics = { clientHeight: 100, scrollHeight: 1200, scrollTop: 550, cardPageTop: 630 };
     const sessionId = "fold-anchor-reader-movement";
@@ -169,8 +194,6 @@ describe("useTranscriptScroll fold corrections", () => {
     act(() => contentObserver(content).fire());
     expect(offset(cardAfterFold, viewport)).toBe(beforeFold);
 
-    viewport.tabIndex = 0;
-    viewport.focus();
     act(() => {
       viewport.dispatchEvent(new KeyboardEvent("keydown", { key: "ArrowUp", bubbles: true }));
       viewport.scrollTop -= 40;

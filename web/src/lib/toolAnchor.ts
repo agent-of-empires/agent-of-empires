@@ -2,12 +2,12 @@
 // into a group), which the browser's own scroll anchoring cannot follow.
 
 export interface ToolAnchor {
-  id: string;
-  el: Element;
+  readonly id: string;
+  readonly el: Element;
   /** Offset of the card's top edge from the viewport's top edge. */
-  offset: number;
+  readonly offset: number;
   /** The viewport's scroll position when sampled. */
-  scrollTop: number;
+  readonly scrollTop: number;
 }
 
 const CARD = "[data-tool-id]";

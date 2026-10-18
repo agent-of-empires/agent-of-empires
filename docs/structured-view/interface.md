@@ -102,4 +102,6 @@ Two kinds of runs fold into collapsible cards:
 
 Folding only fires on an unbroken run of the same shape, and the threshold is three, so a status update between two real actions stays inline as its own card.
 
+In the dashboard, **Jump to latest** keeps following new output through folds. Scroll away to read earlier content without being pulled back by streaming text. Folding preserves an opened tool card's position; focus the transcript to scroll with the keyboard.
+
 The **Compact tools** toggle at the top of the transcript collapses every tool card to its header for scanning, and new cards arrive collapsed while it is on. The agent's narration stays visible, errored cards stay open, and you can still expand a single card. It is a per-browser preference.

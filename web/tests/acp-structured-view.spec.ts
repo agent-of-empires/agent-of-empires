@@ -517,6 +517,47 @@ test.describe("tool run folding", () => {
     ToolCallCompleted: { tool_call_id: `fold-${n}`, content: `OUTPUT-${n}` },
   });
 
+  test("escape scrolling after streamed growth remains unpinned", async ({ page }) => {
+    const mock = await mockAcpSession(page, {
+      title: "story-streaming-reader-escape",
+      initialEvents: [
+        liveTurn,
+        agentMessageChunk(Array.from({ length: 40 }, (_, i) => `Initial ${i + 1}.`).join("\n\n")),
+      ],
+    });
+    await openStructuredSession(page, mock);
+    const viewport = acpViewport(page);
+    const distanceToBottom = () => viewport.evaluate((el) => el.scrollHeight - el.clientHeight - el.scrollTop);
+    await expect(page.getByText(/Initial 40/)).toBeVisible();
+    await viewport.evaluate((el) => {
+      el.scrollTop = el.scrollHeight;
+    });
+    await expect.poll(distanceToBottom).toBeLessThanOrEqual(1);
+
+    await viewport.evaluate((el) => {
+      const content = el.firstElementChild!;
+      const previousHeight = content.getBoundingClientRect().height;
+      const observer = new ResizeObserver(() => {
+        if (content.getBoundingClientRect().height <= previousHeight) return;
+        observer.disconnect();
+        // Model a scrollbar movement before the observer's queued scroll event.
+        el.scrollTop -= 160;
+        el.dispatchEvent(new Event("scroll"));
+      });
+      observer.observe(content);
+    });
+    mock.pushEvents([agentMessageChunk("\n\nStreamed growth before escape.")]);
+    await expect(page.getByText(/Streamed growth before escape/)).toHaveCount(1);
+    await expect.poll(distanceToBottom).toBeGreaterThan(100);
+    const escapedTop = await viewport.evaluate((el) => el.scrollTop);
+
+    mock.pushEvents([agentMessageChunk("\n\nLater streamed growth.")]);
+    await expect(page.getByText(/Later streamed growth/)).toHaveCount(1);
+    await observeFor(page, 250, async () => {
+      expect(await viewport.evaluate((el) => el.scrollTop)).toBe(escapedTop);
+    });
+  });
+
   test("an opened card stays open and in place while its run folds", async ({ page }) => {
     const filler = Array.from({ length: 40 }, (_, i) => `Filler paragraph ${i + 1}.`).join("\n\n");
     const mock = await mockAcpSession(page, {
@@ -547,6 +588,7 @@ test.describe("tool run folding", () => {
 
     await expect(page.getByText("OUTPUT-2")).toBeVisible();
     await expect(page.getByText("OUTPUT-1")).toHaveCount(0);
+    await page.evaluate(() => new Promise<void>((resolve) => requestAnimationFrame(() => resolve())));
     const after = await card.boundingBox();
     expect(Math.abs(after!.y - before!.y)).toBeLessThanOrEqual(1);
     const scrollAfter = await viewport.evaluate((el) => el.scrollTop);
@@ -652,8 +694,8 @@ test.describe("tool run folding", () => {
     await expect(page.getByText("4 actions")).toBeVisible();
     await expect.poll(pendingResizeCallbacks).toBeGreaterThan(0);
 
-    await viewport.evaluate((el) => el.setAttribute("tabindex", "0"));
     await viewport.focus();
+    await expect(viewport).toBeFocused();
     const beforeKeyboard = await card.boundingBox();
     const scrollBefore = await viewport.evaluate((el) => el.scrollTop);
     await page.keyboard.press("ArrowUp");
@@ -848,6 +890,7 @@ test.describe("tool run folding", () => {
     mock.pushEvents([stopped()]);
     await expect(page.getByText("4 actions")).toBeVisible();
     await expect(page.getByText("OUTPUT-2")).toBeVisible();
+    await page.evaluate(() => new Promise<void>((resolve) => requestAnimationFrame(() => resolve())));
     expect(Math.abs((await card.boundingBox())!.y - before!.y)).toBeLessThanOrEqual(1);
   });
 
