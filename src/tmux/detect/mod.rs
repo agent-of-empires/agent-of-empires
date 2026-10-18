@@ -214,4 +214,44 @@ mod tests {
         let detection = detect("omp", &incomplete_panel, "", None).expect("OMP manifest");
         assert_ne!(detection.status, Some(Status::Waiting));
     }
+
+    #[test]
+    fn omp_narrow_approval_tracks_the_current_footer() {
+        for fixture in [
+            include_str!(
+                "../../../tests/fixtures/omp/waiting_permission/005_tool_approval_narrow_40.txt"
+            ),
+            include_str!(
+                "../../../tests/fixtures/omp/waiting_permission/006_tool_approval_narrow_deny.txt"
+            ),
+            include_str!(
+                "../../../tests/fixtures/omp/waiting_permission/007_tool_approval_narrow_draft.txt"
+            ),
+        ] {
+            let panel = fixture
+                .lines()
+                .filter(|line| !line.starts_with('#'))
+                .collect::<Vec<_>>()
+                .join("\n");
+            for (suffix, expected) in [
+                ("", Status::Waiting),
+                (
+                    "\nError: Retry budget exhausted after 10 retries",
+                    Status::Error,
+                ),
+                ("\nretrying 2/3 now: 429 Too Many Requests", Status::Running),
+            ] {
+                let screen = format!("{panel}{suffix}");
+                let detected = detect("omp", &screen, "", None).expect("OMP manifest");
+                assert_eq!(detected.status, Some(expected), "{screen}");
+            }
+            let stale = format!("{panel}{}", "\nnew prompt content".repeat(24));
+            assert_ne!(
+                detect("omp", &stale, "", None)
+                    .expect("OMP manifest")
+                    .status,
+                Some(Status::Waiting),
+            );
+        }
+    }
 }

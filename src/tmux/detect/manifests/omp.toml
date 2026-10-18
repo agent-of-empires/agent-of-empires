@@ -249,10 +249,9 @@ max_position = 24
 visible = true
 any = [
   { line_regex = ['^\s*[│|].*approve\s+·.*deny.*[│|]\s*$'] },
-  { region = "bottom_non_empty_lines(40)", all = [
-    { line_regex = ['^\s*[│|]\s*(?:[❯\x{276F}\x{f054}>]\s+)?Approve\s*[^│|]*[│|]\s*$'] },
-    { line_regex = ['^\s*[│|]\s+Deny\s*[^│|]*[│|]\s*$'] },
-    { line_regex = ['^\s*[│|].*choose\s+·.*select.*[│|]\s*$'] },
+  { line_regex = ['^\s*[│|].*(?:choose\s+·.*select|deny and send\s+·).*[│|]\s*$'], all = [
+    { region = "bottom_non_empty_lines(40)", line_regex = ['^\s*[│|]\s*(?:[\x{276F}\x{f054}>]\s+)?Approve\s*[│|]\s*$'] },
+    { region = "bottom_non_empty_lines(40)", line_regex = ['^\s*[│|]\s*(?:[\x{276F}\x{f054}>]\s+)?Deny(?: and send message)?\s*[│|]\s*$'] },
   ] },
 ]
 all = [

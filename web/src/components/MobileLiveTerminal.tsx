@@ -53,6 +53,8 @@ export interface MobileLiveTerminalProps {
   armAgentClipboard?: () => void;
   connected: boolean;
   active: boolean;
+  /** OMP agent panes accept distinct Ctrl+Enter; shells retain carriage return. */
+  ctrlEnterCsiU?: boolean;
   /** Off the live edge: the capture window is widened and the jump-to-latest button shows. */
   reading: boolean;
   sendResize: (cols: number, rows: number) => void;
@@ -116,6 +118,7 @@ export function MobileLiveTerminal({
   armAgentClipboard,
   connected,
   active,
+  ctrlEnterCsiU = false,
   reading,
   sendResize,
   setWindow,
@@ -656,6 +659,7 @@ export function MobileLiveTerminal({
 
   const input = useTerminalInput({
     active,
+    ctrlEnterCsiU,
     inputRef,
     ctrlActiveRef,
     clearCtrl,

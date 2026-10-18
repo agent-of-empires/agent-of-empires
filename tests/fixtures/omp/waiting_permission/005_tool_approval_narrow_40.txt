@@ -1,7 +1,7 @@
 # FIXTURE: OMP - Waiting_permission State
-# Source-derived from omp/18.11.3 approval-dialog layout at 40 columns
-# Source verified against omp/18.11.3 PanelRows and OverlayPanel rendering
-# Capture date: 2026-10-18
+# Rendered from: @oh-my-pi/pi-tui 18.11.3 ApprovalDialogComponent.render(40)
+# Render date: 2026-10-18
+# Input: Allow tool: bash\nCommand: pwd; default Approve selection
 # Expected status: Waiting
 # Key indicators: Bordered Allow tool panel with visible Approve and Deny choices; fixed-height footer clipped at 40 columns
 
@@ -10,7 +10,7 @@
 │ ❯ Approve                            │
 │   Deny                               │
 ├──────────────────────────────────────┤
-│ ↑/↓ choose · ⏎ select · ⌃⏎/⌃Q approve│
+│ ↑/↓ choose · ⏎ select · ⌃⏎/⌃Q appro… │
 ╰──────────────────────────────────────╯
 ╭─ OMP > Run pwd ──────────────────────╮
 ╰──────────────────────────────────────╯

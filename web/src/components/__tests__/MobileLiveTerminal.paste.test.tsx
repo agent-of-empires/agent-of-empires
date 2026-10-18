@@ -154,7 +154,7 @@ describe("MobileLiveTerminal paste", () => {
 describe("MobileLiveTerminal key sequences", () => {
   it.each([
     ["Enter", {}, "\r"],
-    ["Enter", { ctrlKey: true }, "\x1b[13;5u"],
+    ["Enter", { ctrlKey: true }, "\r"],
     ["Enter", { shiftKey: true }, "\x1b\r"],
     ["Enter", { ctrlKey: true, shiftKey: true }, "\x1b\r"],
     ["Backspace", { altKey: true }, "\x1b\x7f"],
@@ -176,6 +176,20 @@ describe("MobileLiveTerminal key sequences", () => {
     const { input, sendData } = renderTerm();
     expect(fireEvent.keyDown(input, { key, ...init })).toBe(false);
     expect(sendData).toHaveBeenCalledWith(expected);
+  });
+
+  it("preserves Ctrl+Enter only for an opted-in pane and keeps shifted Enter as a soft newline", () => {
+    const sendData = vi.fn<(data: string) => boolean>(() => true);
+    const view = renderLiveTerminal({ sendData, ctrlEnterCsiU: true });
+    const input = view.input();
+    for (const [modifiers, expected] of [
+      [{ ctrlKey: true }, "\x1b[13;5u"],
+      [{ shiftKey: true }, "\x1b\r"],
+      [{ ctrlKey: true, shiftKey: true }, "\x1b\r"],
+    ] as const) {
+      fireEvent.keyDown(input, { key: "Enter", ...modifiers });
+      expect(sendData).toHaveBeenLastCalledWith(expected);
+    }
   });
 
   it.each([

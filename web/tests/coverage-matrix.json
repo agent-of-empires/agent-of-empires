@@ -4449,6 +4449,8 @@
       "components": [
         "web/src/components/LiveTerminalView.tsx",
         "web/src/components/MobileLiveTerminal.tsx",
+        "web/src/components/live-terminal/keySequences.ts",
+        "web/src/components/live-terminal/useTerminalInput.ts",
         "web/src/hooks/useLiveTerminal.ts",
         "web/src/lib/clipboard.ts"
       ]

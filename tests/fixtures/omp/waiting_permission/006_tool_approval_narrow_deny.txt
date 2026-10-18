@@ -1,0 +1,13 @@
+# FIXTURE: OMP - Waiting_permission State
+# Rendered from: @oh-my-pi/pi-tui 18.11.3 ApprovalDialogComponent.render(40)
+# Render date: 2026-10-18
+# Input: Allow tool: bash\nCommand: pwd; ArrowDown selects Deny
+# Expected status: Waiting
+
+╭─ Allow tool: bash ───────────────────╮
+│ Command: pwd                         │
+│   Approve                            │
+│ ❯ Deny                               │
+├──────────────────────────────────────┤
+│ ↑/↓ choose · ⏎ select · ⌃⏎/⌃Q appro… │
+╰──────────────────────────────────────╯

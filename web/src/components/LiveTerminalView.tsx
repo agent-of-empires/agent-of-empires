@@ -366,6 +366,7 @@ export function LiveTerminalView({ session, active = true, surface = "agent", te
           armAgentClipboard={armAgentClipboard}
           connected={live.state.connected}
           active={active}
+          ctrlEnterCsiU={surface === "agent" && session.tool === "omp"}
           reading={live.state.reading}
           sendResize={live.sendResize}
           setWindow={live.setWindow}
