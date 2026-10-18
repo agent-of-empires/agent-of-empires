@@ -12,9 +12,10 @@
         "web/src/components/settings/PluginsSettings.tsx",
         "web/src/components/settings/PluginDetailModal.tsx",
         "web/src/components/AboutModal.tsx",
-        "web/src/components/command-palette/CommandPalette.tsx"
+        "web/src/components/command-palette/CommandPalette.tsx",
+        "web/src/components/settings/PluginJobProgressModal.tsx"
       ],
-      "notes": "Real Escape keys dismiss uninstall, plugin details and its nested lightbox, and Web dashboard disable confirmation without leaving Settings or issuing a mutation; Escape in the command palette preserves the underlying uninstall confirmation; Escape without a dialog still closes Settings."
+      "notes": "Real Escape keys dismiss uninstall, plugin details and its nested lightbox, and Web dashboard disable confirmation without leaving Settings or issuing a mutation; Escape in the command palette preserves the underlying uninstall confirmation; Escape without a dialog still closes Settings. Running plugin jobs retain their dialog; successful, failed and missing jobs dismiss through the existing close callback and reload plugins without leaving Settings. The command palette retains Escape priority over a completed job."
     },
     {
       "id": "terminal.paired-shell",

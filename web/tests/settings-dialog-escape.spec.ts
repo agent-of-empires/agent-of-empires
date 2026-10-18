@@ -121,6 +121,7 @@ test("Escape closes the palette before the underlying uninstall confirmation", a
   await page.keyboard.press("ControlOrMeta+k");
   const palette = page.getByRole("dialog", { name: "Command palette", exact: true });
   await expect(palette).toBeVisible();
+  await expect(palette.getByRole("combobox")).toBeFocused();
 
   await page.keyboard.press("Escape");
   await expect(palette).toBeHidden();
@@ -136,3 +137,63 @@ test("Escape closes the palette before the underlying uninstall confirmation", a
   await page.keyboard.press("Escape");
   await expect(page).toHaveURL(/\/$/);
 });
+
+for (const terminal of ["succeeded", "failed", "gone"] as const) {
+  test(`Escape keeps a running plugin job open and dismisses it when ${terminal}`, async ({ page }) => {
+    let state: "running" | typeof terminal = "running";
+    let pluginReloads = 0;
+    page.on("request", (request) => {
+      if (request.method() === "GET" && new URL(request.url()).pathname === "/api/plugins") pluginReloads++;
+    });
+    await page.route("**/api/plugins/example.plugin/uninstall", (route) =>
+      route.fulfill({ json: { job_id: "example-job" } }),
+    );
+    await page.route("**/api/plugins/jobs/example-job?*", (route) =>
+      state === "gone"
+        ? route.fulfill({ status: 404, json: { message: "Job no longer available." } })
+        : route.fulfill({
+            json: {
+              job: {
+                id: "example-job",
+                kind: "uninstall",
+                target: EXAMPLE.id,
+                status: state === "failed" ? { state, error: "Example job failed." } : { state },
+                started_at: 1,
+                finished_at: state === "running" ? null : 2,
+              },
+              log: { exists: true, tail: "Example job log", lines_returned: 1, truncated: false },
+            },
+          }),
+    );
+    await page.getByTestId("plugin-uninstall-example.plugin").click();
+    await page.getByTestId("plugin-uninstall-confirm-button").click();
+    const job = page.getByTestId("plugin-job-modal");
+    await expect(job).toBeVisible();
+    await expect(page.getByTestId("plugin-job-log")).toHaveText("Example job log");
+    await expect(page.getByTestId("plugin-job-close")).toBeDisabled();
+    await page.keyboard.press("Escape");
+    await expect(job).toBeVisible();
+    await expect(page).toHaveURL(/\/settings\/plugins$/);
+    expect(pluginReloads).toBe(0);
+
+    state = terminal;
+    await expect(page.getByTestId("plugin-job-close")).toBeEnabled();
+    if (terminal === "succeeded") {
+      await page.keyboard.press("ControlOrMeta+k");
+      const palette = page.getByRole("dialog", { name: "Command palette", exact: true });
+      await expect(palette).toBeVisible();
+      await expect(palette.getByRole("combobox")).toBeFocused();
+      await page.keyboard.press("Escape");
+      await expect(palette).toBeHidden();
+      await expect(job).toBeVisible();
+      expect(pluginReloads).toBe(0);
+    }
+    await page.keyboard.press("Escape");
+    await expect(job).toBeHidden();
+    await expect(page).toHaveURL(/\/settings\/plugins$/);
+    await expect.poll(() => pluginReloads).toBe(1);
+    expect(await publishedRequests(page, "/api/plugins/example.plugin/uninstall", "POST")).toHaveLength(1);
+    await page.keyboard.press("Escape");
+    await expect(page).toHaveURL(/\/$/);
+  });
+}
