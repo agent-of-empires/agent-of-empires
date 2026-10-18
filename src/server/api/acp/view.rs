@@ -386,6 +386,9 @@ async fn deferred_enable_request(
         Ok(info) => info,
         Err(e) => {
             tracing::warn!(target: "acp.switch", session = %session_id, "container ensure failed: {e}");
+            if let Some(login) = e.downcast_ref::<crate::session::SandboxLoginRequired>() {
+                return Some(Err(login.to_string()));
+            }
             return Some(Err(format!("container start failed: {e}")));
         }
     };
@@ -3408,6 +3411,57 @@ mod tests {
             assert!(retained.is_idle_dormant());
             assert_eq!(births.load(Ordering::SeqCst), 1);
         }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn sandbox_login_gate_enable_publishes_the_plain_message() {
+        let app_dir = crate::session::test_support::isolate_app_dir();
+        let (_runtime, _calls) =
+            crate::session::test_support::failing_container_runtime(app_dir.path());
+        crate::session::config::update_config(|c| {
+            c.sandbox.shared_credential =
+                crate::session::config::SharedCredentialMode::SeparateLogin;
+        })
+        .unwrap();
+        let mut inst = Instance::new("claude", "/tmp/aoe-login-gate-enable");
+        inst.view = crate::session::View::Structured;
+        inst.source_profile = "default".into();
+        inst.sandbox_info = Some(crate::session::SandboxInfo {
+            provider: None,
+            enabled: true,
+            container_id: None,
+            image: "test:latest".to_string(),
+            container_name: "aoe-login-gate-enable".to_string(),
+            extra_env: None,
+            custom_instruction: None,
+            before_start_env: Vec::new(),
+            before_start_hook_env: Vec::new(),
+            container_workdir: None,
+        });
+        crate::server::test_support::seed_instances_on_disk_for_test("default", vec![inst.clone()]);
+        let state = crate::server::test_support::build_test_app_state(vec![inst.clone()]);
+        crate::server::test_support::refresh_canonical_metadata_for_test(&state).await;
+        let exclusion =
+            crate::acp::sandbox::LaunchExclusion::acquire(state.clone(), &inst.id, true)
+                .await
+                .unwrap();
+
+        let message =
+            match deferred_enable_request(&state, &inst, "claude".to_string(), None, exclusion)
+                .await
+            {
+                Some(Err(message)) => message,
+                other => panic!(
+                    "expected a startup error, got {:?}",
+                    other.map(|r| r.is_ok())
+                ),
+            };
+        assert_eq!(
+            message,
+            crate::session::test_support::login_required("claude").to_string()
+        );
     }
 
     /// An enable queued behind the transition lock must spawn on a provider

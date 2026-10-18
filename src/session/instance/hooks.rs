@@ -326,6 +326,22 @@ impl Instance {
         self.run_launch_hooks(skip_on_launch, store, progress)
     }
 
+    /// [`Self::run_pre_launch_hooks`] for a launch of the agent: a sandboxed session first
+    /// needs its sandbox login (see [`Self::ensure_sandbox_launchable`]), refused before any
+    /// hook runs or any container comes up. The creation of a session runs the hooks without
+    /// that admission: it launches no agent, and its first launch is admitted on its own.
+    pub(crate) fn run_agent_launch_hooks(
+        &mut self,
+        skip_on_launch: bool,
+        store: &dyn SessionStore,
+        progress: Option<&dyn Fn(crate::session::config::repo_config::HookProgress)>,
+    ) -> Result<()> {
+        if self.is_sandboxed() {
+            self.ensure_sandbox_launchable(store)?;
+        }
+        self.run_pre_launch_hooks(skip_on_launch, store, progress)
+    }
+
     fn run_launch_hooks(
         &mut self,
         skip_on_launch: bool,
@@ -2005,6 +2021,136 @@ mod tests {
                 };
                 assert_eq!(stored.status, parked, "{label}");
             }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[serial_test::serial]
+    fn sandbox_login_gate_tmux_launch_fails_before_the_runtime() {
+        tmux_launch_is_refused_before_the_runtime(None);
+    }
+
+    /// With an unresolved `before_start` hook that supplies no auth route, a restart still
+    /// leaves the old pane and container alone: the hook runs once, before the locks, and
+    /// the refusal comes before anything is stopped or discarded.
+    #[cfg(unix)]
+    #[test]
+    #[serial_test::serial]
+    fn sandbox_login_gate_tmux_restart_resolves_the_hook_before_touching_anything() {
+        tmux_launch_is_refused_before_the_runtime(Some("echo FOO=bar"));
+    }
+
+    #[cfg(unix)]
+    fn tmux_launch_is_refused_before_the_runtime(hook_tail: Option<&str>) {
+        use crate::session::{SandboxInfo, SandboxLoginRequired, Status};
+        if !crate::tmux::tmux_command()
+            .arg("-V")
+            .output()
+            .is_ok_and(|output| output.status.success())
+        {
+            return;
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let _home = crate::session::test_support::isolate_app_dir_at(temp.path());
+        let (_runtime, calls) =
+            crate::session::test_support::failing_container_runtime(temp.path());
+        acknowledge_hooks();
+        crate::session::config::update_config(|c| {
+            c.sandbox.shared_credential =
+                crate::session::config::SharedCredentialMode::SeparateLogin;
+        })
+        .unwrap();
+        let root = temp.path().join(".claude").join("sandbox-v2");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join(".credentials.json"), "{}").unwrap();
+        let counter = temp.path().join("hook-runs");
+        if let Some(tail) = hook_tail {
+            let hook = format!(
+                "echo run >> {}; {tail}",
+                crate::session::environment::shell_escape(&counter.to_string_lossy())
+            );
+            crate::session::config::update_config(|c| c.host_hooks.before_start = vec![hook])
+                .unwrap();
+        }
+
+        // A restart, with or without the tool-swap container discard, is refused before the
+        // old pane or container is touched.
+        for label in ["start", "restart", "restart-discard"] {
+            let _ = std::fs::remove_file(&counter);
+            let profile = format!("sandbox-login-gate-{label}");
+            let storage = crate::session::storage::Storage::new_unwatched(&profile).unwrap();
+            let mut instance = Instance::new(label, temp.path().to_str().unwrap());
+            instance.source_profile = profile.clone();
+            instance.sandbox_info = Some(SandboxInfo {
+                provider: None,
+                enabled: true,
+                container_id: None,
+                image: "test:latest".to_string(),
+                container_name: format!("aoe-login-gate-{label}"),
+                extra_env: None,
+                custom_instruction: None,
+                before_start_env: Vec::new(),
+                before_start_hook_env: Vec::new(),
+                container_workdir: None,
+            });
+            storage
+                .update(|instances, _groups| {
+                    instances.push(instance.clone());
+                    Ok(())
+                })
+                .unwrap();
+            let session = instance.tmux_session().unwrap();
+            if label != "start" {
+                session
+                    .create(temp.path().to_str().unwrap(), Some("sleep 30"), &profile)
+                    .unwrap();
+            }
+
+            let result = match label {
+                "start" => instance.start_with_size_opts(None, true).map(|_| ()),
+                "restart" => instance.restart_with_size_opts(None, true).map(|_| ()),
+                _ => instance
+                    .restart_discarding_sandbox_container(None, true, true, None)
+                    .map(|_| ()),
+            };
+            let live_pane = session.exists() && !session.is_pane_dead();
+            let _ = session.kill();
+
+            let err = result.expect_err(label);
+            // The recovery names the profile unless it is the default one (the first label's is).
+            let mut expected = crate::session::test_support::login_required("claude");
+            expected.profile =
+                (profile != crate::session::config::effective_profile("")).then(|| profile.clone());
+            assert_eq!(
+                err.downcast_ref::<SandboxLoginRequired>(),
+                Some(&expected),
+                "{label}: {err:#}"
+            );
+            assert_eq!(
+                live_pane,
+                label != "start",
+                "{label}: a refused restart keeps the old pane, a refused start makes none"
+            );
+            assert_eq!(
+                std::fs::read_to_string(&calls).unwrap_or_default(),
+                "",
+                "{label}: the gate runs before any runtime call"
+            );
+            if hook_tail.is_some() {
+                let runs = std::fs::read_to_string(&counter)
+                    .map(|runs| runs.lines().count())
+                    .unwrap_or(0);
+                assert_eq!(runs, 1, "{label}: the hook ran once");
+            }
+            assert_eq!(
+                instance.last_error.as_deref(),
+                Some(expected.to_string().as_str()),
+                "{label}"
+            );
+            let stored = storage.load().unwrap().remove(0);
+            assert_eq!(stored.status, Status::Error, "{label}");
+            assert_eq!(stored.lifecycle_reservation, None, "{label}");
         }
     }
 

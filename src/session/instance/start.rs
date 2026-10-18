@@ -237,7 +237,7 @@ impl Instance {
         // Hooks may invoke aoe; retain the token, not the flocks, across them.
         drop(lifecycle_lock);
         drop(title_lock);
-        let hook_result = self.run_pre_launch_hooks(skip_on_launch, storage, None);
+        let hook_result = self.run_agent_launch_hooks(skip_on_launch, storage, None);
         let (_title_lock, _lifecycle_lock) =
             self.reacquire_launch_locks_after_hooks(storage, generation, hook_result)?;
         if let Some((key, _)) = handoff {

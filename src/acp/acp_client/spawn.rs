@@ -165,7 +165,12 @@ pub(super) fn is_host_only_path_env(key: &str) -> bool {
 /// The adapter's `env_allowlist` (#3238) resolved against the live env, with
 /// denied keys dropped. Shared by all three spawn paths.
 pub(super) fn allowlisted_env_pairs(config: &SpawnConfig) -> Vec<(String, String)> {
-    let Some(allowlist) = config.spec.env_allowlist.as_ref() else {
+    allowlisted_env_pairs_for(config.spec.env_allowlist.as_deref())
+}
+
+/// [`allowlisted_env_pairs`] for the allowlist of an adapter spec.
+pub(super) fn allowlisted_env_pairs_for(allowlist: Option<&[String]>) -> Vec<(String, String)> {
+    let Some(allowlist) = allowlist else {
         return Vec::new();
     };
     let mut pairs = Vec::new();

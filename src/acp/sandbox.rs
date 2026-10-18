@@ -69,16 +69,70 @@ impl LaunchExclusion {
     }
 }
 
-pub(crate) async fn ensure_container_for_session(
+/// The sandbox login admission of a launch, without bringing anything up: a refusal leaves
+/// the session's worker and container as they are. It resolves a `before_start` hook the
+/// cheap decision cannot see, once per session, so the launch that follows finds the
+/// resolution. The hook runs with the launch locks released, as the come-up's does.
+pub(crate) async fn admit_sandbox_launch(
     store: Arc<NativeSessionStore>,
     mut instance: Instance,
     mut exclusion: LaunchExclusion,
+    launch_agent: Option<String>,
+    request_env: Vec<(String, String)>,
+) -> Result<LaunchExclusion> {
+    tokio::task::spawn_blocking(move || {
+        validate_launch(&*store, &instance)?;
+        if instance.is_sandboxed() {
+            instance.ensure_sandbox_launchable_for(
+                &*store,
+                launch_agent.as_deref(),
+                &request_env,
+                &mut |instance: &mut Instance, config: &crate::session::LaunchConfig| {
+                    exclusion.mint_before_start(instance, config, &store)
+                },
+            )?;
+        }
+        Ok(exclusion)
+    })
+    .await
+    .context("sandbox login admission task failed to join")?
+}
+
+pub(crate) async fn ensure_container_for_session(
+    store: Arc<NativeSessionStore>,
+    instance: Instance,
+    exclusion: LaunchExclusion,
+) -> Result<(Option<crate::session::SandboxInfo>, LaunchExclusion)> {
+    ensure_container_for_session_with_request_env(store, instance, exclusion, None, Vec::new())
+        .await
+}
+
+/// [`ensure_container_for_session`] for a launch that carries a request's `provider_env` and
+/// the agent the request selected. The sandbox login admission counts a credential the
+/// request supplies for this launch, as the launch forwards it, and reads the allowlist of
+/// `launch_agent`'s adapter, the one the launch forwards host variables by (`None` is the
+/// stored agent). Both live in memory for the check only: they are neither stored nor
+/// logged, and a later launch without the request is admitted on what is stored.
+pub(crate) async fn ensure_container_for_session_with_request_env(
+    store: Arc<NativeSessionStore>,
+    mut instance: Instance,
+    mut exclusion: LaunchExclusion,
+    launch_agent: Option<String>,
+    request_env: Vec<(String, String)>,
 ) -> Result<(Option<crate::session::SandboxInfo>, LaunchExclusion)> {
     tokio::task::spawn_blocking(move || {
         validate_launch(&*store, &instance)?;
         if !instance.is_sandboxed() {
             return Ok((None, exclusion));
         }
+        instance.ensure_sandbox_launchable_for(
+            &*store,
+            launch_agent.as_deref(),
+            &request_env,
+            &mut |instance: &mut Instance, config: &crate::session::LaunchConfig| {
+                exclusion.mint_before_start(instance, config, &store)
+            },
+        )?;
         reconcile_provider_container_with(&mut instance, &*store, |id| {
             crate::containers::DockerContainer::from_session_id(id).discard()
         })?;
@@ -163,6 +217,32 @@ fn record_built_sandbox(store: &NativeSessionStore, instance: &Instance) -> Resu
     store
         .adopt_runtime_fields(instance)
         .context(crate::session::SessionCommitApplied)
+}
+
+/// The environment the sandboxed launch of `agent` runs with, as far as its authentication
+/// goes: `sandbox_env`, then the request's `provider_env`, then the adapter's allowlisted
+/// host variables, exactly as the launch claims them. The adapter spec is resolved as the
+/// supervisor resolves it: the registry entry, else a custom `agent_acp_cmd` (no allowlist),
+/// else the `agent_detect_as` base.
+pub(crate) fn effective_launch_env(
+    agent: &str,
+    session: &crate::session::config::SessionConfig,
+    sandbox_env: &[crate::containers::EnvEntry],
+    request_env: &[(String, String)],
+) -> Vec<crate::containers::EnvEntry> {
+    let registry = crate::acp::AgentRegistry::with_defaults();
+    let spec = registry.get(agent).or_else(|| {
+        if session.agent_acp_cmd.contains_key(agent) {
+            return None;
+        }
+        let base = crate::acp::inherited_acp_base(agent, &session.agent_detect_as)?;
+        registry.get(&base)
+    });
+    crate::acp::acp_client::effective_launch_env(
+        sandbox_env,
+        request_env,
+        spec.and_then(|s| s.env_allowlist.as_deref()),
+    )
 }
 
 /// Discard first, persist the new mount stamp second, then build. A failed
