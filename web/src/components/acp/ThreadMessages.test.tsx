@@ -187,3 +187,81 @@ describe("AssistantMessage group parts", () => {
     expect(groupParses()).toBe(afterMount);
   });
 });
+
+describe("AssistantMessage tool output media", () => {
+  const at = "2026-05-12T00:00:00Z";
+  // The file-level URL stub has no constructor, which link-scheme checks need.
+  beforeEach(() => vi.unstubAllGlobals());
+  const rows = (output: NonNullable<ActivityRow["output"]>): ActivityRow[] => [
+    { id: "u1", kind: "user_prompt", text: "go", at },
+    {
+      id: "start-t1",
+      kind: "tool_start",
+      text: "Read",
+      at,
+      toolCallId: "t1",
+      tool: { id: "t1", name: "Read", kind: "read", args_preview: '{"path":"a.rs"}', started_at: at },
+    },
+    { id: "done-t1", kind: "tool_complete", text: "Captured", at, toolCallId: "t1", output },
+  ];
+
+  it("renders a tool result's links and embedded text under its card", () => {
+    const { getByText, getByRole } = render(
+      <Harness
+        messages={activityToThreadMessages(
+          rows([
+            { kind: "resource_link", uri: "https://example.com/report", name: "Full report" },
+            { kind: "resource", uri: "file:///notes.md", mime_type: "text/markdown", text: "first finding" },
+          ]),
+          false,
+        )}
+      />,
+    );
+    expect(getByRole("link", { name: "Full report" }).getAttribute("href")).toBe("https://example.com/report");
+    getByText("first finding");
+  });
+
+  it.each([
+    ["with child cards", true],
+    ["without any", false],
+  ])("renders a subagent parent's own media under its card %s", (_name, withChild) => {
+    const tool = (id: string, extra: Partial<ToolCall> = {}) => ({
+      id,
+      name: "Task",
+      kind: "think",
+      args_preview: '{"description":"go"}',
+      started_at: at,
+      ...extra,
+    });
+    const link = { kind: "resource_link" as const, uri: "https://example.com/report", name: "Full report" };
+    const subagentRows: ActivityRow[] = [
+      { id: "u1", kind: "user_prompt", text: "go", at },
+      { id: "start-task-1", kind: "tool_start", text: "Task", at, toolCallId: "task-1", tool: tool("task-1") },
+      ...(withChild
+        ? ([
+            {
+              id: "start-c1",
+              kind: "tool_start",
+              text: "Read",
+              at,
+              toolCallId: "c1",
+              tool: tool("c1", { name: "Read", kind: "read", parent_tool_call_id: "task-1" }),
+            },
+            { id: "done-c1", kind: "tool_complete", text: "ok", at, toolCallId: "c1" },
+          ] as ActivityRow[])
+        : []),
+      { id: "done-task-1", kind: "tool_complete", text: "done", at, toolCallId: "task-1", output: [link] },
+    ];
+    const { getByRole } = render(<Harness messages={activityToThreadMessages(subagentRows, false)} />);
+    expect(getByRole("link", { name: "Full report" }).getAttribute("href")).toBe("https://example.com/report");
+  });
+
+  it("renders an inline image result", () => {
+    const { getByAltText } = render(
+      <Harness
+        messages={activityToThreadMessages(rows([{ kind: "image", mime_type: "image/png", data: "AAAA" }]), false)}
+      />,
+    );
+    expect(getByAltText("tool output image (image/png)").getAttribute("src")).toBe("data:image/png;base64,AAAA");
+  });
+});

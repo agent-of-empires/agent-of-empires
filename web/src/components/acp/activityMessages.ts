@@ -7,7 +7,7 @@ import type { ThreadMessageLike } from "@assistant-ui/react";
 
 import { hasTodoArrayArgsText, parseJsonObject } from "../../lib/acpArgs";
 import { lastClearIndex } from "../../lib/acpHistoryWindow";
-import type { ActivityRow, ToolCall } from "../../lib/acpTypes";
+import type { ActivityRow, ToolCall, ToolOutputBlock } from "../../lib/acpTypes";
 import { type AgentProfile, DEFAULT_AGENT_PROFILE, isSubagentToolName } from "../../lib/agentProfiles";
 
 /** Synthetic part for a subagent Task with its child tool calls. */
@@ -146,6 +146,7 @@ export function activityToThreadMessages(
         row.text,
         row.at,
         row.asyncSubagent ?? false,
+        row.output,
       );
     } else if (row.kind === "empty_output") {
       // A turn with no output (interactive-only slash commands) gets a muted note.
@@ -167,7 +168,14 @@ export function activityToThreadMessages(
   return built;
 }
 
-type ToolResult = { content: string; endedAt?: string; stopped?: boolean; async?: boolean };
+type ToolResult = {
+  content: string;
+  endedAt?: string;
+  stopped?: boolean;
+  async?: boolean;
+  /** Image, audio, link and resource blocks, which `content` does not carry. */
+  output?: ToolOutputBlock[];
+};
 
 // Loose part shape, cast at build time; the renderer parses argsText itself.
 type DraftPart =
@@ -226,12 +234,21 @@ class AssistantBuilder {
     resultText: string,
     endedAt: string,
     async: boolean,
+    output?: ToolOutputBlock[],
   ) {
     const part = [...this.parts, ...this.children].find(
       (p): p is ToolPart => p.type === "tool-call" && p.toolCallId === toolCallId,
     );
     if (!part) return;
-    part.result = { content: resultText, endedAt, stopped: stopped || undefined, async: async || undefined };
+    // A text block repeats `content`, except an embedded terminal's placeholder.
+    const media = output?.filter((block) => block.kind !== "text" || !resultText.includes(block.text));
+    part.result = {
+      content: resultText,
+      endedAt,
+      stopped: stopped || undefined,
+      async: async || undefined,
+      ...(media?.length ? { output: media } : {}),
+    };
     part.isError = isError || undefined;
   }
 

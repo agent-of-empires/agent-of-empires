@@ -175,6 +175,37 @@ test("files pane: Open file shows an unchanged file in a new tab", async ({ page
   await imageTab.close();
 });
 
+test("files pane: a binary file renders an image inline and downloads anything else", async ({ page, spawnServe }) => {
+  const serve = await spawnServe({
+    seedFn: seedSessionViaAoeAdd({
+      title: "rp-files-binary",
+      committed: { "docs/guide.md": "unchanged guide\n" },
+      prepare: (dir, env) => {
+        writeBinaryFile(dir, "logo.png", decodablePng);
+        writeBinaryFile(dir, "blob.bin", Buffer.from([0, 1, 2, 3, 0, 255]));
+        commitAll(dir, "binaries", env);
+      },
+    }),
+  });
+  await openSession(page, serve, "rp-files-binary");
+  await page.getByRole("button", { name: "Toggle Files pane" }).first().click();
+
+  await page.getByRole("button", { name: "logo.png" }).first().click();
+  const image = page.getByRole("img", { name: "logo.png" });
+  await expect(image).toBeVisible({ timeout: 10_000 });
+  await expect
+    .poll(() => image.evaluate((node) => (node as HTMLImageElement).naturalWidth), { timeout: 10_000 })
+    .toBeGreaterThan(0);
+
+  await page.getByRole("button", { name: "Back to files" }).first().click();
+  await page.getByRole("button", { name: "blob.bin" }).first().click();
+  const [download] = await Promise.all([
+    page.waitForEvent("download"),
+    page.getByRole("button", { name: "Download" }).first().click(),
+  ]);
+  expect(download.suggestedFilename()).toBe("blob.bin");
+});
+
 test("right panel notifications: structured view comments banner appears on stage, clears on discard", async ({
   page,
   spawnServe,

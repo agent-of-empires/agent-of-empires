@@ -119,4 +119,17 @@ describe("openInNewTab", () => {
     vi.runAllTimers();
     expect(URL.revokeObjectURL).toHaveBeenCalledWith("blob:mock-url");
   });
+
+  it("saves a file served inline when a download is forced", async () => {
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(new Response("x", { headers: { "Content-Type": "image/png" } })));
+    const tab = { location: { href: "" }, close: vi.fn() };
+    vi.stubGlobal(
+      "open",
+      vi.fn(() => tab),
+    );
+    const click = vi.spyOn(HTMLAnchorElement.prototype, "click").mockImplementation(() => {});
+    expect(await openInNewTab(URL_ANY, "broken.png", true)).toEqual({ ok: true });
+    expect(tab.close).toHaveBeenCalled();
+    expect((click.mock.contexts[0] as HTMLAnchorElement).download).toBe("broken.png");
+  });
 });
