@@ -57,12 +57,33 @@ function jsonPost(body: unknown): RequestInit {
   return { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) };
 }
 
-async function safeText(res: Response): Promise<string> {
+async function safeText(res: Response, limit = 200): Promise<string> {
   try {
-    return (await res.text()).slice(0, 200);
+    return (await res.text()).slice(0, limit);
   } catch {
     return "";
   }
+}
+
+/** Shown when the daemon kept a prompt because the session's `before_start` hook failed: plain words, never the hook's output. */
+const HOOK_FAILED_QUEUED_MESSAGE =
+  "The session's before_start hook failed; your message is queued and will be sent when it works.";
+
+/** The queue id of a prompt the daemon kept until the session can launch (sandbox login or `before_start` hook), with what to tell the user. */
+function keptPrompt(status: number, body: string): { queuedId: string; message: string } | undefined {
+  try {
+    const parsed = JSON.parse(body) as { error?: unknown; queued_id?: unknown; message?: unknown };
+    if (typeof parsed.queued_id !== "string") return undefined;
+    if (status === 409 && parsed.error === "sandbox_login_required") {
+      return { queuedId: parsed.queued_id, message: typeof parsed.message === "string" ? parsed.message : "" };
+    }
+    if (status === 502 && parsed.error === "before_start_hook_failed") {
+      return { queuedId: parsed.queued_id, message: HOOK_FAILED_QUEUED_MESSAGE };
+    }
+  } catch {
+    // Not JSON: a plain-text error.
+  }
+  return undefined;
 }
 
 function describeError(e: unknown): string {
@@ -196,10 +217,18 @@ export function useAcpSession(
           }),
         );
         if (!res.ok) {
-          const detail = await safeText(res);
+          const body = await safeText(res, Infinity);
+          const detail = body.slice(0, 200);
           if (res.status === 409 && detail.startsWith("queued_prompt_gone")) {
             dispatch({ kind: "rollback_optimistic_prompt", id: promptId });
             return { kind: "queued_gone" };
+          }
+          const kept = keptPrompt(res.status, body);
+          if (kept) {
+            dispatch({ kind: "rollback_optimistic_prompt", id: promptId });
+            // The queue cannot advance until the login: say what to run.
+            if (kept.message) dispatch({ kind: "blocked_launch", message: kept.message });
+            return { kind: "queued", queuedId: kept.queuedId };
           }
           const rejected = res.status >= 400 && res.status < 500;
           // The worker is not up yet (idle-stopped or parked): the caller re-queues it, so no banner.

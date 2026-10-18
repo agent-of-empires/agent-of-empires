@@ -719,10 +719,6 @@ fn rm_argv(kind: RuntimeKind, binary: &str, ids: &[String]) -> Vec<String> {
 /// CLI) kills only the client, and the container keeps waiting on its closed stdin.
 /// The daemon calls this at startup. `Busy` while a live helper of this file holds
 /// the login lock, in this or another process.
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "unused until the daemon sweeps at startup")
-)]
 pub(crate) async fn sweep_stale_helpers(
     runtime: &crate::containers::ContainerRuntime,
     shared: &Path,
