@@ -274,6 +274,7 @@ pub(super) fn build_fork_flags(
                 _ => String::new(),
             }
         }
+        ForkStrategy::ValueFlag(fork_flag) => format!("{fork_flag} {parent_id}"),
         ForkStrategy::ServeFork
         | ForkStrategy::EitherGeneration { .. }
         | ForkStrategy::Unsupported => String::new(),
@@ -789,8 +790,10 @@ impl Instance {
                         self.resume_intent,
                         ResumeIntent::Use(_) | ResumeIntent::Fork { .. }
                     ));
+            let mut handoff_prior = None;
             let execution = match self.resolve_native_execution(self.conversation_target()) {
                 Ok(execution) => {
+                    handoff_prior = self.hand_off_prime_fork_parent(&execution)?;
                     if validate_target {
                         self.validate_conversation_target(
                             &execution.binding,
@@ -827,7 +830,9 @@ impl Instance {
                     None
                 }
             };
-            let prior_canonical = if let Some(target) = execution
+            let prior_canonical = if handoff_prior.is_some() {
+                handoff_prior
+            } else if let Some(target) = execution
                 .as_ref()
                 .and_then(|execution| execution.resolved_target_session_id.as_ref())
             {
@@ -1785,6 +1790,20 @@ mod tests {
             ),
             ("pi", "$(rm -rf /)", "child", AgentGeneration::Current, ""),
             ("pi", "parent", "; echo pwned", AgentGeneration::Current, ""),
+            (
+                "prime-agent",
+                "parent-id",
+                "ignored-child",
+                AgentGeneration::Current,
+                "--fork parent-id",
+            ),
+            (
+                "prime-agent",
+                "$(rm -rf /)",
+                "child",
+                AgentGeneration::Current,
+                "",
+            ),
         ] {
             assert_eq!(
                 build_fork_flags(tool, parent, child, generation),

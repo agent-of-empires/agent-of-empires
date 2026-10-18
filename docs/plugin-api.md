@@ -8,7 +8,7 @@ A manifest carries two independent version axes.
 
 | Key | Meaning |
 |---|---|
-| `api_version` | The manifest *schema* version. The current schema is `17`. The host rejects a manifest whose `api_version` is newer than it supports. |
+| `api_version` | The manifest *schema* version. The current schema is `18`. The host rejects a manifest whose `api_version` is newer than it supports. |
 | `aoe_version` | A semver requirement on the *host app* version, e.g. `">=1.11.0, <2.0.0"`. The host refuses to install, and skips loading, a plugin whose requirement excludes the running version. Optional; requires `api_version >= 4`. |
 
 Each key below notes the `api_version` it needs. Target the newest schema your plugin uses, and set `aoe_version` to the host range you have tested.
@@ -30,7 +30,7 @@ capabilities = ["runtime.worker"]
 | `id` | string | yes | Plugin id (see [Plugin id](#plugin-id)). Namespaces config, events, and action names. |
 | `name` | string | yes | Human-readable display name. |
 | `version` | string | yes | Semantic version of the plugin. |
-| `api_version` | integer | yes | Manifest schema version, `1` to `17`. |
+| `api_version` | integer | yes | Manifest schema version, `1` to `18`. |
 | `description` | string | no | Shown in plugin listings. Defaults to empty. |
 | `aoe_version` | string | no | Host-app semver requirement. Requires `api_version >= 4`. |
 | `capabilities` | array of string | no | Runtime grants the worker needs (see [Capabilities](#capabilities)). Static contributions need none. |
@@ -141,6 +141,7 @@ max = 86400
 | `fields` | array | no | Item fields of an `object_list` (`api_version >= 9`). |
 | `item_id_key` | string | no | Item field holding each `object_list` row's stable id; defaults to `_id` (host-generated) (`api_version >= 9`). |
 | `min_items` / `max_items` | integer | no | Inclusive item-count bounds for an `object_list` (`api_version >= 9`). |
+| `per_project` | bool | no | Also settable per registered project, falling back to the global value. Defaults to `false` (`api_version >= 18`). See [Per-project settings](#per-project-settings). |
 
 Setting types:
 
@@ -194,6 +195,20 @@ required = true
 ```
 
 An item field takes the same keys as a top-level setting (`key`, `label`, `description`, `type`, `options`, `min`, `max`, `default`, `multiline`, `option_source`, `depends_on`) plus `required`. It may be a `dynamic_multi_select` (`api_version >= 11`), whose stored value is an array of the chosen option values, or a `string_list` (`api_version >= 14`), whose stored value is an array of freeform user-typed strings.
+
+### Per-project settings
+
+A top-level setting with `per_project = true` (`api_version >= 18`) can also be set for a registered project. The value is stored in that project's registry entry (`projects.json`), validated like a global write, and edited in the web project form. A profile-scoped registry entry shadows a global one for the same path.
+
+A worker reads the resolved value with `config.get`, passing the project's repository path:
+
+```json
+{ "key": "depth", "project_path": "/home/me/work/repo" }
+```
+
+The result is `{ "value", "scope", "revision" }`. `scope` is `"project"` when the project sets the key, else `"global"` when the global value is set, else `"default"` for the manifest `default`; `value` and `scope` are `null` when none applies. Without `project_path`, or for a path that is not a registered project, the project step is skipped. A key that is not `per_project` only ever returns its stored global value, with no `default` fallback and `project_path` ignored.
+
+Writing a per-project value sends `plugin.settings.changed` with the usual `{ revision, changed_keys }` plus the registry's `project_path`. Re-read those keys with `config.get` and that `project_path`.
 
 ## Session listing
 
@@ -333,7 +348,7 @@ A page `id` uses only letters, digits, `-` and `_`, and is unique among the plug
 
 The entry must be one self-contained file: inline every script and style, and embed images as `data:` or `blob:` URLs. The host serves only that file, at `GET /api/plugins/{id}/pages/{page_id}` for an active plugin, uncached. Its policy sandboxes the document (`sandbox allow-scripts`), so it gets an opaque origin even when the URL is opened directly, runs the inline script and style and `data:`/`blob:` images, and blocks every other resource load, connection and form submission. As a second layer, the URL refuses any query string and any request whose `Sec-Fetch-Dest` is present and not `iframe`, and only the dashboard may frame it. Browsers send `Sec-Fetch-Dest` only over HTTPS or to localhost, so a dashboard reached over plain HTTP by LAN IP relies on the sandbox alone.
 
-The dashboard opens a page at `/plugins/{id}/{page_id}` in an iframe with `sandbox="allow-scripts"` and nothing else. The page cannot read dashboard storage or cookies, call the API, submit forms, open windows or navigate the dashboard; its only data path is the bridge. A page that reloads itself more than 60 seconds after opening loses its authentication when device binding is on; reopen it from the dashboard instead.
+The dashboard opens a page at `/plugins/{id}/{page_id}`, from its button beside the TopBar search or the command palette, in an iframe with `sandbox="allow-scripts"` and nothing else. The page cannot read dashboard storage or cookies, call the API, submit forms, open windows or navigate the dashboard; its only data path is the bridge. A page that reloads itself more than 60 seconds after opening loses its authentication when device binding is on; reopen it from the dashboard instead.
 
 A worker may push state for a page with `ui.state.set` (`slot = "page"`, `id` = the page id, no `session_id`). The payload is any JSON object up to 64 KiB, stored unvalidated; `ui.state.remove` clears it. It appears in `GET /api/plugins/ui-state` as a global entry, `{ "plugin_id", "slot": "page", "id", "payload" }`, which the page reads through `plugins.uiState`.
 
@@ -349,9 +364,10 @@ A request is `{ "aoeBridge": 1, "id", "method", "params"? }`, where `id` is a nu
 | `sessions.list` | none | `session.read` | The sessions, in the rows a worker's [`sessions.list`](#session-listing) returns |
 | `plugins.uiState` | none | `session.read` | The `GET /api/plugins/ui-state` body, including other plugins' entries |
 | `action` | `{ "method", "params"?, "sessionId"? }` | not read-only or CityHall | `{ "baselineRevision" }`; the call goes to this plugin's own worker, as a [pane action](#pane-actions) does |
-| `openSession` | `{ "id" }` | none | `null`; the dashboard navigates to the session |
+| `openSession` | `{ "id" }` | none | `null`; the dashboard navigates to the session, or shows it below the page, with its side panels, when the user turned on split view |
 | `session.archive` | `{ "id" }` | `session.read` and `session.write`, not read-only or CityHall | `null`; archives the session and stops its pane |
 | `session.trash` | `{ "id" }` | `session.read` and `session.write`, not read-only or CityHall | `null`; moves the session to the trash and stops its pane |
+| `session.contextMenu` | `{ "id", "x", "y", "items"? }` | `session.read` | The picked item's `id`, or `null`. Opens the sidebar's session menu at frame coordinates `x`, `y`, clamped to the frame; every action in it is the user's own and follows the dashboard's modes, and it ignores clicks for 300 ms after opening so a page cannot time one onto an item. `items`, at most 20 `{ "id", "label" }`, are appended to the menu under the page's title. Resolves when the menu closes |
 
 Error codes: `unknown_method`, `invalid_params` (also an `id` that `sessions.list` does not return), `capability_denied` (the plugin does not declare the required capability), `read_only`, `cityhall_mode`, and `failed` (the dashboard's request failed). An `action` result only acknowledges delivery; its effect arrives in `plugins.uiState` once the worker updates its state.
 
@@ -359,6 +375,7 @@ The dashboard pushes `{ "aoeBridge": 1, "event", "data" }` messages, with no `id
 
 - `context`, once after `ready`: `{ "readOnly", "cityhall", "pluginId", "pageId", "bridgeVersion" }`.
 - `theme`, after `ready` and on every theme change: `{ "appearance": "dark" | "light", "cssVars": { "--name": "value" } }`, the dashboard's resolved CSS variables.
+- `selection`, after `ready` and whenever it changes: `{ "sessionId" }`, the session split view shows below the page, or `null`.
 
 When the frame loads a second document, because the page reloaded or navigated itself, the dashboard removes the frame and offers to reopen it. A minimal client:
 

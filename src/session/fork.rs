@@ -29,6 +29,9 @@ pub enum ForkSeed {
 pub enum ForkDenied {
     /// The agent's CLI has no fork capability (terminal path).
     AgentCannotFork { agent: String },
+    /// The agent mints the fork's child id, and AoE cannot capture it where the
+    /// parent runs (or cannot tell where that is).
+    ChildNotCapturable { agent: String },
     /// The parent names no single conversation to fork: no row carries the id,
     /// or the rows that do name different conversations.
     NoParentSession,
@@ -61,7 +64,10 @@ impl ForkDenied {
     pub fn user_message(&self, title: &str, id: &str, profile: &str) -> String {
         match self {
             Self::AgentCannotFork { agent } => format!(
-                "Nothing to fork: session '{title}' runs agent '{agent}', which has no native fork capability. Forkable agents: claude, codex, opencode, pi."
+                "Nothing to fork: session '{title}' runs agent '{agent}', which has no native fork capability."
+            ),
+            Self::ChildNotCapturable { agent } => format!(
+                "Nothing to fork: session '{title}' runs agent '{agent}', which mints the forked conversation id, and that id can only be captured for sandboxed sessions."
             ),
             Self::NoParentSession => format!(
                 "Nothing to fork: session '{title}' has no single captured conversation to fork from: it has captured none, or more than one session records this conversation id."
@@ -200,6 +206,14 @@ pub fn terminal_agent_can_fork(agent: &str) -> bool {
     })
 }
 
+/// Whether `agent` can fork from a parent running `sandboxed` or not: it forks
+/// at all, and when it mints the child id, that id can be captured there.
+/// `sandboxed` is the parent row's runtime context, not its store's filesystem:
+/// a sandbox whose store is mounted from the host records `host` there.
+pub fn terminal_agent_can_fork_in(agent: &str, sandboxed: bool) -> bool {
+    terminal_agent_can_fork(agent) && get_agent(agent).is_some_and(|def| def.can_fork_in(sandboxed))
+}
+
 /// Hold a fork child to the parent's identity when the parent is an
 /// unattributed id, which the launch cannot identity-check. `launched` is the
 /// agent the child's own command and profile actually resolve to, not the
@@ -224,9 +238,11 @@ pub fn ensure_child_matches_parent_agent(
 }
 
 /// Decide whether a terminal session can be forked, and produce its one-shot seed.
+/// `sandboxed` is whether the parent row runs in a sandbox.
 pub fn terminal_fork_seed(
     parent: Option<ForkParentRef<'_>>,
     child_session_id: String,
+    sandboxed: bool,
 ) -> Result<ForkSeed, ForkDenied> {
     // One refusal for every id nothing qualifies: only a binding can prove the
     // id was reserved and never published, and a row with no binding proves
@@ -270,6 +286,11 @@ pub fn terminal_fork_seed(
             agent: agent.to_owned(),
         });
     }
+    if !terminal_agent_can_fork_in(agent, sandboxed) {
+        return Err(ForkDenied::ChildNotCapturable {
+            agent: agent.to_owned(),
+        });
+    }
     Ok(ForkSeed::Terminal {
         parent: Box::new(parent.clone()),
         child_session_id,
@@ -310,7 +331,11 @@ mod tests {
         ] {
             let parent = bound(provenance.clone());
             assert_eq!(
-                terminal_fork_seed(Some(ForkParentRef::Bound(&parent)), "child-uuid".into()),
+                terminal_fork_seed(
+                    Some(ForkParentRef::Bound(&parent)),
+                    "child-uuid".into(),
+                    false
+                ),
                 Err(ForkDenied::UnqualifiedParent {
                     preallocated,
                     recorded: "parent-uuid".into(),
@@ -323,7 +348,8 @@ mod tests {
         assert_eq!(
             terminal_fork_seed(
                 Some(ForkParentRef::Recorded("legacy-uuid")),
-                "child-uuid".into()
+                "child-uuid".into(),
+                false
             ),
             Err(ForkDenied::UnqualifiedParent {
                 preallocated: false,
@@ -331,11 +357,11 @@ mod tests {
             })
         );
         assert_eq!(
-            terminal_fork_seed(Some(ForkParentRef::Unlaunched), "child-uuid".into()),
+            terminal_fork_seed(Some(ForkParentRef::Unlaunched), "child-uuid".into(), false),
             Err(ForkDenied::UnlaunchedFork)
         );
         assert_eq!(
-            terminal_fork_seed(None, "child-uuid".into()),
+            terminal_fork_seed(None, "child-uuid".into(), false),
             Err(ForkDenied::NoParentSession)
         );
     }
@@ -344,12 +370,20 @@ mod tests {
     fn fork_requires_a_qualified_parent_and_matching_native_capability() {
         let mut parent = bound(ConversationProvenance::Observed);
         assert!(matches!(
-            terminal_fork_seed(Some(ForkParentRef::Bound(&parent)), "child-uuid".into()),
+            terminal_fork_seed(
+                Some(ForkParentRef::Bound(&parent)),
+                "child-uuid".into(),
+                false
+            ),
             Ok(ForkSeed::Terminal { .. })
         ));
         parent.execution.as_mut().unwrap().agent = "gemini".into();
         assert_eq!(
-            terminal_fork_seed(Some(ForkParentRef::Bound(&parent)), "child-uuid".into()),
+            terminal_fork_seed(
+                Some(ForkParentRef::Bound(&parent)),
+                "child-uuid".into(),
+                false
+            ),
             Err(ForkDenied::AgentCannotFork {
                 agent: "gemini".into()
             })
@@ -360,8 +394,12 @@ mod tests {
     fn pi_forks_terminal_conversations_but_not_structured_sessions() {
         let mut parent = bound(ConversationProvenance::Observed);
         parent.execution.as_mut().unwrap().agent = "pi".into();
-        let seed = terminal_fork_seed(Some(ForkParentRef::Bound(&parent)), "child-uuid".into())
-            .expect("a qualified Pi conversation can fork");
+        let seed = terminal_fork_seed(
+            Some(ForkParentRef::Bound(&parent)),
+            "child-uuid".into(),
+            false,
+        )
+        .expect("a qualified Pi conversation can fork");
         assert_eq!(
             seed,
             ForkSeed::Terminal {
@@ -388,6 +426,7 @@ mod tests {
                     agent,
                 }),
                 "child-uuid".into(),
+                false,
             );
             match (seed, forked) {
                 (Ok(ForkSeed::Terminal { parent, .. }), true) => {
@@ -399,6 +438,57 @@ mod tests {
                 (seed, forked) => panic!("{agent} forked={forked}: {seed:?}"),
             }
         }
+    }
+
+    /// Prime mints the child id and AoE captures it only in a sandbox, so the
+    /// parent row's runtime context decides. A sandbox whose store is mounted
+    /// from the host records `host` as its filesystem and is still a sandbox.
+    #[test]
+    fn a_minted_child_fork_needs_a_capturable_parent_context() {
+        let mut parent = bound(ConversationProvenance::Observed);
+        parent.execution.as_mut().unwrap().agent = "prime-agent".into();
+        assert_eq!(parent.execution.as_ref().unwrap().filesystem, "host");
+        let seed = |parent: &ConversationBinding, sandboxed| {
+            terminal_fork_seed(
+                Some(ForkParentRef::Bound(parent)),
+                "child-uuid".into(),
+                sandboxed,
+            )
+        };
+
+        assert_eq!(
+            seed(&parent, false).map(|_| ()),
+            Err(ForkDenied::ChildNotCapturable {
+                agent: "prime-agent".into()
+            }),
+            "host parent"
+        );
+        assert!(
+            matches!(seed(&parent, true), Ok(ForkSeed::Terminal { .. })),
+            "host-mapped sandbox parent"
+        );
+
+        let unknown = ConversationBinding::unknown("parent-uuid");
+        let unattributed = |sandboxed| {
+            terminal_fork_seed(
+                Some(ForkParentRef::Unattributed {
+                    binding: &unknown,
+                    agent: "prime-agent",
+                }),
+                "child-uuid".into(),
+                sandboxed,
+            )
+        };
+        assert!(unattributed(false).is_err(), "unattributed host parent");
+        assert!(unattributed(true).is_ok(), "unattributed sandbox parent");
+        assert!(
+            terminal_agent_can_fork_in("claude", false),
+            "unaffected agent"
+        );
+        assert!(
+            !terminal_agent_can_fork_in("gemini", true),
+            "no fork at all"
+        );
     }
 
     /// Every refusal state names the remedy that comes back to it, and no
@@ -418,7 +508,7 @@ mod tests {
                 ForkDenied::AgentCannotFork {
                     agent: "gemini".into(),
                 },
-                vec![agent_cannot_fork, "Forkable agents: claude"],
+                vec![agent_cannot_fork],
             ),
             (ForkDenied::NoParentSession, vec![no_parent]),
             (

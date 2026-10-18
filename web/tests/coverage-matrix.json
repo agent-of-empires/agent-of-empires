@@ -1881,13 +1881,15 @@
       "risk": "high",
       "specs": ["tests/plugin-pages.spec.ts"],
       "components": [
-        "web/src/components/plugin/PluginPagesMenu.tsx",
+        "web/src/components/plugin/PluginPageButtons.tsx",
         "web/src/components/plugin/PluginPageView.tsx",
+        "web/src/components/plugin/PluginSessionMenu.tsx",
+        "web/src/components/sidebar/SessionActions.tsx",
         "web/src/lib/pluginBridge.ts",
         "web/src/components/TopBar.tsx",
         "web/src/App.tsx"
       ],
-      "notes": "Pages menu and palette entries appear only with a declared page; the route hides the sidebar, mints a page ticket before framing, and Back pops history. A fixture page served under the daemon's page CSP proves the sandboxed frame cannot read storage, cookies or call the API. A bridge fixture page round-trips ready, sessions.list, plugins.uiState, its own action, session.archive, session.trash and openSession, a page without session.write is refused both lifecycle calls, and it receives a theme change without reloading; a page that navigates to another plugin's page before ready never hands that page the bridge. Mint ordering, empty states, the nonce-checked ready-only channel handoff, theme pushes, teardown on a second load and remount resets are unit-tested in PluginPageView.test.tsx; envelope validation and gating in pluginBridge.test.ts; the ticket's server side in src/server/api/plugins.rs."
+      "notes": "TopBar page buttons and palette entries appear only with a declared page, the button marking the open page; the route hides the sidebar, mints a page ticket before framing, and Back pops history. A fixture page served under the daemon's page CSP proves the sandboxed frame cannot read storage, cookies or call the API. A bridge fixture page round-trips ready, sessions.list, plugins.uiState, its own action, session.archive, session.trash and openSession, a page without session.write is refused both lifecycle calls, and it receives a theme change without reloading; with split view on, openSession shows the session below the page with its docks, in `?session=` rather than navigating, pushes the selection, maximizes over the page without reloading it, and Open full navigates; session.contextMenu opens the sidebar's session menu at the frame-relative point, resolves with a picked page item or null, opens the snooze picker and a rename dialog that PATCHes the title, and a click over the frame dismisses it; a page that navigates to another plugin's page before ready never hands that page the bridge. Mint ordering, empty states, the nonce-checked ready-only channel handoff, theme pushes, teardown on a second load and remount resets are unit-tested in PluginPageView.test.tsx; envelope validation and gating in pluginBridge.test.ts; the ticket's server side in src/server/api/plugins.rs."
     },
     {
       "id": "sidebar.plugin-row-slots",
@@ -2196,12 +2198,14 @@
       "risk": "medium",
       "specs": [
         "src/components/diff/__tests__/FileContentViewer.test.tsx",
+        "src/components/diff/__tests__/BinaryFileView.test.tsx",
         "src/components/diff/__tests__/FullFileViewer.test.tsx",
         "src/components/__tests__/FilesPane.test.tsx"
       ],
       "components": [
         "web/src/components/FilesPane.tsx",
         "web/src/components/diff/FileContentViewer.tsx",
+        "web/src/components/diff/BinaryFileView.tsx",
         "web/src/components/diff/FullFileViewer.tsx"
       ]
     },
@@ -2221,6 +2225,7 @@
       "components": [
         "web/src/components/FilesPane.tsx",
         "web/src/components/diff/FileContentViewer.tsx",
+        "web/src/components/diff/BinaryFileView.tsx",
         "web/src/components/diff/MarkdownFileView.tsx",
         "web/src/components/diff/FullFileViewer.tsx",
         "web/src/App.tsx"
@@ -2545,6 +2550,7 @@
       "risk": "high",
       "specs": [
         "tests/live/acp-transcript.spec.ts",
+        "tests/acp-user-attachments.spec.ts",
         "src/components/acp/Composer.test.tsx",
         "src/components/acp/ThreadMessages.test.tsx"
       ],
@@ -3306,7 +3312,7 @@
       "kind": "vitest",
       "risk": "low",
       "specs": ["src/components/__tests__/ProjectFormModal.test.tsx"],
-      "components": ["web/src/components/ProjectFormModal.tsx"]
+      "components": ["web/src/components/ProjectFormModal.tsx", "web/src/components/ProjectPluginSettings.tsx"]
     },
     {
       "id": "scratch-overrides-modal",
@@ -3964,6 +3970,18 @@
         "web/src/components/acp/ToolCardChrome.tsx",
         "web/src/components/acp/ToolOutputMedia.tsx"
       ]
+    },
+    {
+      "id": "acp.tool-output-media",
+      "kind": "mocked-playwright",
+      "risk": "medium",
+      "specs": [
+        "src/components/acp/activityMessages.test.ts",
+        "src/components/acp/ThreadMessages.test.tsx",
+        "tests/acp-tool-output-media.spec.ts"
+      ],
+      "components": ["web/src/components/acp/ThreadMessages.tsx", "web/src/components/acp/ToolOutputMedia.tsx"],
+      "notes": "A tool result's image, audio, link and resource blocks reach the card through the thread's tool part, so they render under it."
     },
     {
       "id": "acp.story.edit-card-diff-scroll",
