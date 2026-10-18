@@ -204,5 +204,14 @@ mod tests {
         .join("\n");
         let detection = detect("omp", &prose, "", None).expect("OMP manifest");
         assert_ne!(detection.status, Some(Status::Waiting));
+        let incomplete_panel = [
+            "╭─ Allow tool: bash ───────────────────╮",
+            "│ ❯ Approve                            │",
+            "│ ordinary panel content               │",
+            "╰──────────────────────────────────────╯",
+        ]
+        .join("\n");
+        let detection = detect("omp", &incomplete_panel, "", None).expect("OMP manifest");
+        assert_ne!(detection.status, Some(Status::Waiting));
     }
 }

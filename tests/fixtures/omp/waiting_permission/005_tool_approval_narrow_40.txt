@@ -1,0 +1,16 @@
+# FIXTURE: OMP - Waiting_permission State
+# Source-derived from omp/18.11.3 approval-dialog layout at 40 columns
+# Source verified against omp/18.11.3 PanelRows and OverlayPanel rendering
+# Capture date: 2026-10-18
+# Expected status: Waiting
+# Key indicators: Bordered Allow tool panel with visible Approve and Deny choices; fixed-height footer clipped at 40 columns
+
+╭─ Allow tool: bash ───────────────────╮
+│ Command: pwd                         │
+│ ❯ Approve                            │
+│   Deny                               │
+├──────────────────────────────────────┤
+│ ↑/↓ choose · ⏎ select · ⌃⏎/⌃Q approve│
+╰──────────────────────────────────────╯
+╭─ OMP > Run pwd ──────────────────────╮
+╰──────────────────────────────────────╯
