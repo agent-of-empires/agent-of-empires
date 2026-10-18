@@ -4,9 +4,8 @@
 
 import { MarkdownTextPrimitive } from "@assistant-ui/react-markdown";
 import type { SyntaxHighlighterProps } from "@assistant-ui/react-markdown";
-import { Check, Copy as CopyIcon } from "lucide-react";
 import * as React from "react";
-import { createContext, useContext, useEffect, useMemo, useRef, useState } from "react";
+import { createContext, useContext, useEffect, useMemo, useState } from "react";
 import type { ExtraProps } from "react-markdown";
 import remarkBreaks from "remark-breaks";
 import remarkGfm from "remark-gfm";
@@ -19,6 +18,7 @@ import { parseFileRef, resolveArtifactUrl, resolveToRepoRelative } from "../../l
 import { useAcpFileRef } from "./AcpFileRefContext";
 import { openInNewTab } from "../../lib/openInNewTab";
 import { ArtifactImage } from "./artifactMedia";
+import { CopyMarkdownButton } from "./CopyMarkdownButton";
 import { WrapLines, WrapToggle, useWrapState } from "./WrapToggle";
 
 interface Props {
@@ -148,40 +148,17 @@ function TableWithScroll({ children, node, ...rest }: React.ComponentPropsWithou
   const received = useContext(TableSourceContext);
   const source = received && node ? tableSource(received.text, node, received.complete) : null;
   return (
-    <div className="acp-table-block">
+    <div className="acp-table-block acp-copy-host">
       <div className="acp-table-wrap">
         <table {...rest}>{children}</table>
       </div>
-      {source !== null && <CopyTableButton source={source} />}
+      {source !== null && (
+        // A row below the table, so it covers no cell and stays put while a wide table scrolls.
+        <div className="acp-copy-reveal flex justify-end">
+          <CopyMarkdownButton compact source={source} label="Copy table as markdown" />
+        </div>
+      )}
     </div>
-  );
-}
-
-/** Sits outside the scroll area so it stays put while a wide table scrolls. */
-function CopyTableButton({ source }: { source: string }) {
-  const [copied, setCopied] = useState(false);
-  const timer = useRef<ReturnType<typeof setTimeout>>(undefined);
-  useEffect(() => () => clearTimeout(timer.current), []);
-
-  async function copy() {
-    if (!(await writeClipboard(source))) return;
-    setCopied(true);
-    clearTimeout(timer.current);
-    timer.current = setTimeout(() => setCopied(false), 1500);
-  }
-
-  const label = copied ? "Copied" : "Copy table as markdown";
-  return (
-    <button
-      type="button"
-      aria-label={label}
-      title={label}
-      onClick={() => void copy()}
-      className="acp-table-copy absolute right-1 top-1 z-10 inline-flex min-h-8 min-w-8 items-center justify-center rounded bg-surface-900 p-1.5 text-text-dim hover:bg-surface-800 hover:text-text-secondary"
-      data-copied={copied}
-    >
-      {copied ? <Check className="h-3 w-3" /> : <CopyIcon className="h-3 w-3" />}
-    </button>
   );
 }
 
@@ -259,7 +236,7 @@ function CodeHeader({
         <button
           type="button"
           className="min-h-8 rounded px-2 py-0.5 hover:bg-surface-800 hover:text-text-secondary"
-          onClick={() => navigator.clipboard?.writeText(code).catch(() => {})}
+          onClick={() => void writeClipboard(code)}
         >
           copy
         </button>
