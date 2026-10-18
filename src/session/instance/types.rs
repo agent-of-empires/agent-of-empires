@@ -86,7 +86,7 @@ pub(crate) struct SandboxStoreTransitionPath {
     pub(crate) destination: PathBuf,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct SandboxInfo {
     pub enabled: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -111,6 +111,27 @@ pub struct SandboxInfo {
     /// built before the pick existed, so it matches no explicit pick.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider: Option<String>,
+}
+
+/// Never prints the `before_start` environment: it holds tokens a host hook minted, and a
+/// `{:?}` of a row must not be able to leak them.
+impl std::fmt::Debug for SandboxInfo {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SandboxInfo")
+            .field("enabled", &self.enabled)
+            .field("container_id", &self.container_id)
+            .field("image", &self.image)
+            .field("container_name", &self.container_name)
+            .field("extra_env", &self.extra_env)
+            .field("custom_instruction", &self.custom_instruction)
+            .field("container_workdir", &self.container_workdir)
+            .field(
+                "before_start_env",
+                &format_args!("<{} redacted>", self.before_start_env.len()),
+            )
+            .field("provider", &self.provider)
+            .finish()
+    }
 }
 
 /// Blank session ids deserialize as `None`.

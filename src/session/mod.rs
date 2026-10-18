@@ -29,6 +29,7 @@ pub(crate) mod projection;
 pub mod projects;
 pub(crate) mod recovery;
 pub mod restart;
+pub(crate) mod sandbox_login;
 pub mod sandbox_store_reclaim;
 pub mod scope;
 pub mod scratch;
@@ -81,6 +82,7 @@ pub(crate) use instance::{
     persist_session_to_storage, PassiveStatusPatch, ResumeIntent, SidWrite,
     NEWER_GENERATION_BUSY_REASON,
 };
+pub(crate) use instance::{forget_before_start_resolution, BeforeStartHookError};
 pub(crate) use instance::{
     host_hook_agent, host_hook_disclosure, host_hook_disclosure_config_with_repo,
     host_hook_post_install_notes, resolved_agent_for, ConversationState, ResumeAttemptPolicy,
@@ -90,10 +92,10 @@ pub use instance::{
     is_valid_session_color, ConversationBinding, ConversationProvenance, DetectionState,
     EnsureReadyError, EnsureReadyOutcome, ExecutionBinding, ExecutionLocation, Instance,
     LaunchSidOutcome, LifecycleOperation, LifecycleReservation, LifecycleReservationError,
-    PendingInitialTurn, PluginCreateIdempotency, PollerStart, SandboxInfo, SessionBucket,
-    SessionGone, StartBlocked, StartOutcome, Status, TerminalInfo, View, WorkspaceInfo,
-    WorkspaceRepo, WorktreeInfo, SESSION_COLORS, TMUX_SERVER_UNREACHABLE_ERROR,
-    TMUX_SESSION_GONE_ERROR,
+    PendingInitialTurn, PluginCreateIdempotency, PollerStart, SandboxInfo, SandboxLoginRequired,
+    SandboxLoginUnsupported, SessionBucket, SessionGone, StartBlocked, StartOutcome, Status,
+    TerminalInfo, View, WorkspaceInfo, WorkspaceRepo, WorktreeInfo, SESSION_COLORS,
+    TMUX_SERVER_UNREACHABLE_ERROR, TMUX_SESSION_GONE_ERROR,
 };
 #[cfg(test)]
 pub(crate) use move_journal::{

@@ -130,6 +130,27 @@ pub(crate) fn path_prepended(dir: &Path) -> EnvGuard {
     guard.and_set("PATH", path)
 }
 
+/// Puts `docker`, `podman` and `container` on PATH that log every call to the
+/// returned file and fail.
+#[cfg(unix)]
+pub(crate) fn failing_container_runtime(root: &Path) -> (EnvGuard, PathBuf) {
+    use std::os::unix::fs::PermissionsExt as _;
+    let bin = root.join("runtime-bin");
+    std::fs::create_dir_all(&bin).expect("create fake runtime directory");
+    let calls = root.join("runtime-calls");
+    let script = format!(
+        "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\nexit 1\n",
+        calls.display()
+    );
+    for name in ["docker", "podman", "container"] {
+        let path = bin.join(name);
+        std::fs::write(&path, &script).expect("write fake runtime");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+            .expect("make fake runtime executable");
+    }
+    (path_prepended(&bin), calls)
+}
+
 pub(crate) fn install_login_shell_path_command(root: &Path, name: &str, script: &str) -> EnvGuard {
     let bin = root.join("bin");
     std::fs::create_dir_all(&bin).expect("create test bin directory");
@@ -358,6 +379,15 @@ impl LogCapture {
     pub(crate) fn contents(&self) -> String {
         String::from_utf8_lossy(&self.buf.lock().unwrap_or_else(PoisonError::into_inner))
             .into_owned()
+    }
+}
+
+/// The error a launch of `tool` refused for the sandbox login carries.
+pub(crate) fn login_required(tool: &str) -> crate::session::SandboxLoginRequired {
+    crate::session::SandboxLoginRequired {
+        tool: tool.to_string(),
+        command: None,
+        profile: None,
     }
 }
 

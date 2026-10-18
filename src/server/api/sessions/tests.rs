@@ -3638,6 +3638,81 @@ async fn start_paths_refuse_archived_and_trashed_sessions() {
     }
 }
 
+#[cfg(unix)]
+#[tokio::test]
+#[serial_test::serial]
+async fn sandbox_login_gate_tmux_start_and_ensure_are_409() {
+    use axum::body::to_bytes;
+    if !crate::tmux::tmux_command()
+        .arg("-V")
+        .output()
+        .is_ok_and(|output| output.status.success())
+    {
+        return;
+    }
+    let home = crate::session::test_support::isolate_app_dir();
+    let (_runtime, calls) = crate::session::test_support::failing_container_runtime(home.path());
+    crate::session::config::update_app_state(|s| s.has_acknowledged_agent_hooks = true).unwrap();
+    crate::session::config::update_config(|c| {
+        c.sandbox.shared_credential = crate::session::config::SharedCredentialMode::SeparateLogin;
+    })
+    .unwrap();
+    let root = home.path().join(".claude").join("sandbox-v2");
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::write(root.join(".credentials.json"), "{}").unwrap();
+    let message = crate::session::test_support::login_required("claude").to_string();
+
+    for which in ["start", "ensure"] {
+        let mut inst = make_test_instance();
+        inst.title = format!("login-gate-{which}");
+        inst.project_path = home.path().to_string_lossy().into_owned();
+        inst.source_profile = "default".to_string();
+        inst.status = Status::Stopped;
+        inst.sandbox_info = Some(crate::session::SandboxInfo {
+            provider: None,
+            enabled: true,
+            container_id: None,
+            image: "test:latest".to_string(),
+            container_name: format!("aoe-login-gate-{which}"),
+            extra_env: None,
+            custom_instruction: None,
+            before_start_env: Vec::new(),
+            container_workdir: None,
+        });
+        let id = inst.id.clone();
+        crate::server::test_support::seed_instances_on_disk_for_test("default", vec![inst.clone()]);
+        let session = inst.tmux_session().unwrap();
+        let state = crate::server::test_support::build_test_app_state(vec![inst]);
+        let response = match which {
+            "start" => start_session(State(state.clone()), Path(id.clone()))
+                .await
+                .into_response(),
+            _ => ensure_session(State(state.clone()), Path(id.clone()))
+                .await
+                .into_response(),
+        };
+        let spawned = session.exists();
+        let _ = session.kill();
+        assert_eq!(response.status(), StatusCode::CONFLICT, "{which}");
+        let body: serde_json::Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), 1024).await.unwrap()).unwrap();
+        assert_eq!(
+            body,
+            serde_json::json!({"error": "sandbox_login_required", "message": message, "tool": "claude"}),
+            "{which}"
+        );
+        assert!(!spawned, "{which}");
+        let after = &state.instances.read().await[0];
+        assert_eq!(after.status, Status::Error, "{which}");
+        assert_eq!(
+            after.last_error.as_deref(),
+            Some(message.as_str()),
+            "{which}"
+        );
+    }
+    assert_eq!(std::fs::read_to_string(&calls).unwrap_or_default(), "");
+}
+
 /// #4116: a peer (e.g. `aoe session archive`) can shelve the stored row after the daemon's
 /// memory check. Structured start and prompt-wake recheck that row inside their write, refuse,
 /// and leave `archived_at` in place.

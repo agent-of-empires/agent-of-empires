@@ -134,6 +134,48 @@ pub(crate) fn start_blocked_response(blocked: crate::session::StartBlocked) -> R
     api_error(StatusCode::CONFLICT, blocked.code(), blocked.to_string())
 }
 
+/// The 409 body for a sandbox launch that needs the sandbox login first: the code, the
+/// instruction, the tool the login is for, and the `profile` and `command` its recovery needs.
+pub(crate) fn sandbox_login_required_body(
+    err: &crate::session::SandboxLoginRequired,
+) -> serde_json::Value {
+    let mut body = serde_json::json!({
+        "error": crate::session::SandboxLoginRequired::CODE,
+        "message": err.to_string(),
+        "tool": err.tool,
+    });
+    if let Some(command) = &err.command {
+        body["command"] = serde_json::Value::String(command.clone());
+    }
+    if let Some(profile) = &err.profile {
+        body["profile"] = serde_json::Value::String(profile.clone());
+    }
+    body
+}
+
+/// 409 for a sandbox launch that needs the sandbox login first.
+pub(crate) fn sandbox_login_required_response(
+    err: &crate::session::SandboxLoginRequired,
+) -> Response {
+    (
+        StatusCode::CONFLICT,
+        axum::Json(sandbox_login_required_body(err)),
+    )
+        .into_response()
+}
+
+/// 409 for a sandbox launch refused because it needs a sandbox login the active container
+/// runtime cannot perform; nothing is held, the setting or the runtime has to change.
+pub(crate) fn sandbox_login_unsupported_response(
+    err: &crate::session::SandboxLoginUnsupported,
+) -> Response {
+    api_error(
+        StatusCode::CONFLICT,
+        crate::session::SandboxLoginUnsupported::CODE,
+        err.to_string(),
+    )
+}
+
 pub(super) fn session_not_found() -> Response {
     api_error(StatusCode::NOT_FOUND, "not_found", "Session not found")
 }
@@ -295,6 +337,28 @@ pub(super) fn validate_profile_name(name: &str) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The 409 body of the queue endpoint names `profile` and `command` only when set.
+    #[tokio::test]
+    async fn sandbox_login_required_response_names_profile_and_command_only_when_set() {
+        let body = |response: Response| async move {
+            let bytes = axum::body::to_bytes(response.into_body(), 4096)
+                .await
+                .unwrap();
+            serde_json::from_slice::<serde_json::Value>(&bytes).unwrap()
+        };
+        let mut blocked = crate::session::test_support::login_required("claude");
+        let plain = body(sandbox_login_required_response(&blocked)).await;
+        assert_eq!(plain.get("profile"), None);
+        assert_eq!(plain.get("command"), None);
+
+        blocked.profile = Some("work".to_string());
+        blocked.command = Some("claude".to_string());
+        let named = body(sandbox_login_required_response(&blocked)).await;
+        assert_eq!(named["profile"], "work");
+        assert_eq!(named["command"], "claude");
+        assert_eq!(named["tool"], "claude");
+    }
 
     /// Mutating handlers by source file. Each must short-circuit in read-only
     /// mode and must extract any JSON body lazily, or axum's `Json<T>` 422s on a

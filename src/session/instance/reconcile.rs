@@ -47,6 +47,8 @@ impl Instance {
         disk.pane_dead_observed = self.pane_dead_observed;
         disk.force_fresh_next_launch = self.force_fresh_next_launch;
         disk.pending_host_env = std::mem::take(&mut self.pending_host_env);
+        disk.launch_admission = self.launch_admission.take();
+        disk.before_start_minted_for_launch = self.before_start_minted_for_launch;
         disk.identity_publisher_launched = self.identity_publisher_launched;
         disk.source_profile = std::mem::take(&mut self.source_profile);
         disk.ever_confirmed_present = self.ever_confirmed_present;

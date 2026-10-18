@@ -71,6 +71,7 @@ This document contains the help content for the `aoe` command-line program.
 * [`aoe project remove`↴](#aoe-project-remove)
 * [`aoe sandbox`↴](#aoe-sandbox)
 * [`aoe sandbox reclaim`↴](#aoe-sandbox-reclaim)
+* [`aoe sandbox login`↴](#aoe-sandbox-login)
 * [`aoe worktree`↴](#aoe-worktree)
 * [`aoe worktree list`↴](#aoe-worktree-list)
 * [`aoe worktree info`↴](#aoe-worktree-info)
@@ -162,7 +163,7 @@ Run without arguments to launch the TUI dashboard.
 * `plugin` — Manage plugins (list, info, enable, disable, install, update, uninstall)
 * `profile` — Manage profiles (separate workspaces)
 * `project` — Manage the project registry used by multi-repo session pickers
-* `sandbox` — Inspect and reclaim per-session sandbox agent stores
+* `sandbox` — Reclaim per-session sandbox agent stores and log agent sandboxes in
 * `worktree` — Manage git worktrees for parallel development
 * `tmux` — tmux integration utilities
 * `sounds` — Manage sound effects for agent state transitions
@@ -1187,13 +1188,14 @@ Remove a project from the registry
 
 ## `aoe sandbox`
 
-Inspect and reclaim per-session sandbox agent stores
+Reclaim per-session sandbox agent stores and log agent sandboxes in
 
 **Usage:** `aoe sandbox <COMMAND>`
 
 ###### **Subcommands:**
 
 * `reclaim` — Report per-session agent stores whose session no longer exists in any profile, and how much disk they hold. Reports only unless `--delete` is given: a store can hold a copy of that agent's credentials
+* `login` — Log an agent's sandboxes in (sandbox.shared_credential = "separate_login"): prints a sign-in link, then reads the code shown after sign-in. The login belongs to one shared credential file per profile and tool: an agent with its own `session.agent_config_dir` entry (a wrapper agent) has its own file, so a session of profile X running tool T waiting for the login needs `aoe sandbox login -p X --tool T`. The file follows the command T launches (`agent_command_override`, else `custom_agents`, else the built-in). Only agents that declare a sandbox login have one; today that is Claude
 
 
 
@@ -1206,6 +1208,21 @@ Report per-session agent stores whose session no longer exists in any profile, a
 ###### **Options:**
 
 * `--delete` — Remove the reported stores instead of only naming them
+
+
+
+## `aoe sandbox login`
+
+Log an agent's sandboxes in (sandbox.shared_credential = "separate_login"): prints a sign-in link, then reads the code shown after sign-in. The login belongs to one shared credential file per profile and tool: an agent with its own `session.agent_config_dir` entry (a wrapper agent) has its own file, so a session of profile X running tool T waiting for the login needs `aoe sandbox login -p X --tool T`. The file follows the command T launches (`agent_command_override`, else `custom_agents`, else the built-in). Only agents that declare a sandbox login have one; today that is Claude
+
+**Usage:** `aoe sandbox login [OPTIONS]`
+
+###### **Options:**
+
+* `--tool <TOOL>` — The agent whose sandboxes the login is for: the tool name of the sessions waiting for it. Defaults to the profile's default tool when it has a sandbox login, else the only agent that has one
+* `--command <COMMAND>` — The command the launch runs for `--tool` when a session overrides the profile's: the login lands in the file that launch is gated on. A session that waits for the login names it in the message it stops with; without `--command` the profile's command for the tool is used
+* `--check` — Only report whether the shared credential file needs a login: exit 0 when ok, 2 when needed, 3 when not applicable (`host_seed` mode, a tool without a shared credential file, or a login that is needed on Apple Container, which cannot run the login helper)
+* `--force` — Log in again even though the shared credential is usable
 
 
 

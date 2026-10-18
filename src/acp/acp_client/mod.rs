@@ -46,7 +46,7 @@ pub use list::{list_native_sessions, ListSessionsError};
 pub use reset::ResetSessionOutcome;
 pub use resolve_command::{resolve_agent_command, ResolvedAgentCommand, Unresolved};
 pub(crate) use runner::wrap_in_scope;
-pub use session_sandbox::SessionSandbox;
+pub use session_sandbox::{effective_launch_env, SessionSandbox};
 pub(crate) use spawn::host_environment_denyreason;
 pub use spawn::SpawnConfig;
 

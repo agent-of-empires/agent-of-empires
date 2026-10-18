@@ -337,6 +337,9 @@ async fn deferred_enable_request(
         Ok(info) => info,
         Err(e) => {
             tracing::warn!(target: "acp.switch", session = %session_id, "container ensure failed: {e}");
+            if let Some(login) = e.downcast_ref::<crate::session::SandboxLoginRequired>() {
+                return Some(Err(login.to_string()));
+            }
             return Some(Err(format!("container start failed: {e}")));
         }
     };
@@ -585,6 +588,47 @@ async fn persist_terminal_view(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn sandbox_login_gate_enable_publishes_the_plain_message() {
+        let app_dir = crate::session::test_support::isolate_app_dir();
+        let (_runtime, _calls) =
+            crate::session::test_support::failing_container_runtime(app_dir.path());
+        crate::session::config::update_config(|c| {
+            c.sandbox.shared_credential =
+                crate::session::config::SharedCredentialMode::SeparateLogin;
+        })
+        .unwrap();
+        let mut inst = Instance::new("claude", "/tmp/aoe-login-gate-enable");
+        inst.view = crate::session::View::Structured;
+        inst.sandbox_info = Some(crate::session::SandboxInfo {
+            provider: None,
+            enabled: true,
+            container_id: None,
+            image: "test:latest".to_string(),
+            container_name: "aoe-login-gate-enable".to_string(),
+            extra_env: None,
+            custom_instruction: None,
+            before_start_env: Vec::new(),
+            container_workdir: None,
+        });
+        let id = inst.id.clone();
+        let state = crate::server::test_support::build_test_app_state(vec![inst]);
+
+        let message = match deferred_enable_request(&state, &id, "claude".to_string(), None).await {
+            Some(Err(message)) => message,
+            other => panic!(
+                "expected a startup error, got {:?}",
+                other.map(|r| r.is_ok())
+            ),
+        };
+        assert_eq!(
+            message,
+            crate::session::test_support::login_required("claude").to_string()
+        );
+    }
 
     /// An enable queued behind the transition lock must spawn on a provider
     /// switch that committed while it waited, not on the row it was queued with.

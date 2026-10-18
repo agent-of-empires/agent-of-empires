@@ -30,6 +30,32 @@ pub async fn ensure_container_for_session_locked(
     session_id: &str,
     run_on_launch_hooks: bool,
 ) -> Result<Option<SandboxInfo>> {
+    ensure_container_for_session_with_request_env_locked(
+        instances,
+        mutation_epoch,
+        session_id,
+        run_on_launch_hooks,
+        None,
+        Vec::new(),
+    )
+    .await
+}
+
+/// [`ensure_container_for_session_locked`] for a launch that carries a request's
+/// `provider_env` and the agent the request selected. The sandbox login admission counts a
+/// credential the request supplies for this launch, as the launch forwards it, and reads
+/// the allowlist of `launch_agent`'s adapter, the one the launch forwards host variables
+/// by (`None` is the stored agent). Both live in memory for the check only: they are
+/// neither stored nor logged, and a later launch without the request is admitted on what
+/// is stored.
+pub async fn ensure_container_for_session_with_request_env_locked(
+    instances: &RwLock<Vec<Instance>>,
+    mutation_epoch: &AtomicU64,
+    session_id: &str,
+    run_on_launch_hooks: bool,
+    launch_agent: Option<String>,
+    request_env: Vec<(String, String)>,
+) -> Result<Option<SandboxInfo>> {
     // Phase 1: short read on the instance list.
     let mut instance_clone = {
         let guard = instances.read().await;
@@ -47,6 +73,7 @@ pub async fn ensure_container_for_session_locked(
     let session_id_owned = session_id.to_string();
     let (sandbox_info, container_workdir, hooks, hook_env, rebuilt) =
         tokio::task::spawn_blocking(move || -> Result<_> {
+            instance_clone.ensure_sandbox_launchable_for(launch_agent.as_deref(), &request_env)?;
             let rebuilt = reconcile_provider_container(&mut instance_clone)?;
             let _container = instance_clone
                 .get_container_for_instance()
@@ -141,6 +168,32 @@ async fn record_built_sandbox(
         sb.provider.clone_from(&info.provider);
         mutation_epoch.fetch_add(1, Ordering::SeqCst);
     }
+}
+
+/// The environment the sandboxed launch of `agent` runs with, as far as its authentication
+/// goes: `sandbox_env`, then the request's `provider_env`, then the adapter's allowlisted
+/// host variables, exactly as the launch claims them. The adapter spec is resolved as the
+/// supervisor resolves it: the registry entry, else a custom `agent_acp_cmd` (no allowlist),
+/// else the `agent_detect_as` base.
+pub(crate) fn effective_launch_env(
+    agent: &str,
+    session: &crate::session::config::SessionConfig,
+    sandbox_env: &[crate::containers::EnvEntry],
+    request_env: &[(String, String)],
+) -> Vec<crate::containers::EnvEntry> {
+    let registry = crate::acp::AgentRegistry::with_defaults();
+    let spec = registry.get(agent).or_else(|| {
+        if session.agent_acp_cmd.contains_key(agent) {
+            return None;
+        }
+        let base = crate::acp::inherited_acp_base(agent, &session.agent_detect_as)?;
+        registry.get(&base)
+    });
+    crate::acp::acp_client::effective_launch_env(
+        sandbox_env,
+        request_env,
+        spec.and_then(|s| s.env_allowlist.as_deref()),
+    )
 }
 
 /// Rebuild the container when the session's provider pick no longer matches the
