@@ -103,6 +103,17 @@ Responses are `200` with `{"id", "lines", "format", "content"}`, `400 format_inv
 
 Status transitions also reach `callback_url` and push subscribers.
 
+## MCP server
+
+With `[web] mcp_enabled = true` in `config.toml` (read at daemon startup), the daemon serves a [Model Context Protocol](https://modelcontextprotocol.io) server over Streamable HTTP at `POST /mcp`. With the setting off the route does not exist. It takes the same token as the rest of the API and reports `401` without one.
+
+| Tool | Arguments | Returns |
+| --- | --- | --- |
+| `list_sessions` | `state` (`live`, the default, or `all`), `group` (a group path, including everything beneath it), `children_of` (a session id) | The `GET /api/sessions` body, PascalCase `status` included. |
+| `whoami` | none | `null` until sessions get their own credential. |
+
+Both tools declare an `outputSchema` and return the result as `structuredContent`.
+
 ## Skills
 
 AoE discovers Agent Skills packages from its managed store and from supported user-level agent directories. A skill is a directory with a valid `SKILL.md` carrying `name` and `description` frontmatter. External packages are read-only; adopt one to get an editable copy in the managed store.

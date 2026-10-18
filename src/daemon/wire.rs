@@ -1,10 +1,11 @@
 //! Shared wire types for the daemon REST API.
 
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::session::SessionScope;
 /// Which ACP `ContentBlock` an attachment maps to; the lowercase form is the wire contract.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum PromptAttachmentKind {
     Image,
@@ -33,7 +34,7 @@ impl PromptAttachmentKind {
 
 /// Metadata only: the blob is fetched lazily from `GET /acp/attachments/{id}` so the event
 /// log stays small.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct PromptAttachmentRef {
     pub id: String,
     pub kind: PromptAttachmentKind,
@@ -44,7 +45,7 @@ pub struct PromptAttachmentRef {
 }
 
 /// One queued follow-up prompt, owned by the daemon so it drains with no tab open.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct QueuedPromptEntry {
     /// Client-minted, stable across edits; also the optimistic-echo reconcile key.
     pub id: String,
@@ -63,7 +64,7 @@ pub struct QueuedPromptEntry {
 }
 
 /// Ephemeral worker lifecycle; never persisted to the event log.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum AcpWorkerState {
     #[default]
@@ -73,7 +74,7 @@ pub enum AcpWorkerState {
     Stopping,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum ContextResumeUnavailableReason {
     AgentUnsupported,
@@ -86,7 +87,7 @@ pub enum ContextResumeUnavailableReason {
     NoTarget,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum ContextResumeIndeterminateReason {
     RuntimeCheckRequired,
@@ -94,7 +95,7 @@ pub enum ContextResumeIndeterminateReason {
 }
 
 /// Whether context survives a future lifecycle transition, not current start eligibility.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "state", rename_all = "snake_case")]
 pub enum ContextResumeAvailability {
     Available,
@@ -106,7 +107,7 @@ pub enum ContextResumeAvailability {
     },
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema)]
 pub struct PendingApproval {
     pub nonce: String,
     pub tool_name: String,
@@ -118,7 +119,7 @@ pub struct PendingApproval {
 }
 
 /// Decoding requires only `id`; every other field defaults so an older daemon cannot break the list.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct SessionResponse {
     pub id: String,
     #[serde(default)]
@@ -248,21 +249,21 @@ pub struct SessionResponse {
     pub monitor_description: Option<String>,
 }
 
-#[derive(Serialize, Deserialize, Clone, Debug)]
+#[derive(Serialize, Deserialize, Clone, Debug, JsonSchema)]
 pub struct PlanSummary {
     pub current_step_title: Option<String>,
     pub completed: u32,
     pub total: u32,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct WorkspaceRepoSummary {
     pub name: String,
     pub source_path: String,
     pub branch: String,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
 pub struct CleanupDefaults {
     pub delete_worktree: bool,
     pub delete_branch: bool,
@@ -270,7 +271,7 @@ pub struct CleanupDefaults {
     pub delete_to_trash: bool,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct SessionsEnvelope {
     pub sessions: Vec<SessionResponse>,
     #[serde(default)]

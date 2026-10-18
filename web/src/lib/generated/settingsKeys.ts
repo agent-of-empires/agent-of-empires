@@ -15,7 +15,7 @@ export interface SettingsKeys {
   theme: "color_mode" | "idle_decay_minutes" | "name";
   tmux: "clipboard" | "mouse" | "socket_name" | "status_bar" | "vt_live";
   updates: "auto_update_plugins" | "update_check_mode";
-  web: "notifications_enabled" | "notify_on_error" | "notify_on_idle" | "notify_on_waiting" | "notify_on_wake_fire";
+  web: "mcp_enabled" | "notifications_enabled" | "notify_on_error" | "notify_on_idle" | "notify_on_waiting" | "notify_on_wake_fire";
   worktree: "auto_cleanup" | "bare_repo_path_template" | "default_base_branch" | "delete_branch_on_cleanup" | "enabled" | "init_submodules" | "path_template" | "workspace_path_template";
 }
 

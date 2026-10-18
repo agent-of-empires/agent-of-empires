@@ -518,6 +518,17 @@
       ]
     },
     {
+      "id": "settings.mcp-server-toggle",
+      "kind": "vitest",
+      "risk": "medium",
+      "specs": ["src/components/__tests__/SettingsView.mcpToggle.test.tsx"],
+      "components": [
+        "web/src/components/SettingsView.tsx",
+        "web/src/components/settings/SchemaSection.tsx",
+        "src/server/mcp.rs"
+      ]
+    },
+    {
       "id": "settings.list-field",
       "kind": "mocked-playwright",
       "risk": "medium",

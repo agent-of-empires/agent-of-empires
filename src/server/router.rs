@@ -381,6 +381,12 @@ pub(super) fn build_router(state: Arc<AppState>) -> Router {
             get(api::list_importable_sessions),
         );
 
+    let app = if state.web_config.mcp_enabled {
+        app.route_service("/mcp", super::mcp::service(state.clone()))
+    } else {
+        app
+    };
+
     // Dashboard bundle (Vite build output) plus the SPA fallback.
     #[cfg(feature = "web")]
     let app = app
