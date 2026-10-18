@@ -230,14 +230,7 @@ fn launch_error_response(context: &str, error: &anyhow::Error) -> Response {
     }
     if let Some(hook) = error.downcast_ref::<crate::session::BeforeStartHookError>() {
         // The hook's own failure, in fixed words; a switch queues nothing.
-        return (
-            StatusCode::BAD_GATEWAY,
-            Json(serde_json::json!({
-                "error": "before_start_hook_failed",
-                "message": hook.to_string(),
-            })),
-        )
-            .into_response();
+        return crate::server::api::before_start_hook_failed_response(hook);
     }
     if error.is::<crate::session::SessionGone>() {
         return session_not_found();

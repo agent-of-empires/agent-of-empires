@@ -346,8 +346,12 @@ mod tests {
         );
     }
 
+    /// The session list carries paths under the app dir, so both publishes must read the same
+    /// one: a test that isolates the app dir meanwhile would otherwise change the second.
     #[tokio::test]
+    #[serial_test::serial]
     async fn queued_moves_sharing_a_snapshot_all_report_the_status_that_snapshot_has() {
+        let _app_dir = crate::session::test_support::isolate_app_dir();
         let mut row = crate::session::Instance::new("q", "/tmp/aoe-ws-q");
         row.status = Status::Running;
         let id = row.id.clone();

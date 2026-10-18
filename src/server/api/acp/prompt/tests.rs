@@ -1242,3 +1242,748 @@ async fn send_now_behind_a_busy_agent_keeps_the_one_queued_row() {
     assert_eq!(queue[0].id, "q1");
     assert_eq!(queue[0].origin_plugin.as_deref(), Some("cron"));
 }
+
+/// A diff-comments wake is the user's own launch: a login refusal holds the
+/// session as interactive and sends no push notice.
+#[cfg(unix)]
+#[tokio::test]
+#[serial_test::serial]
+async fn sandbox_login_hold_origin_by_site_diff_comments_wake() {
+    let app_dir = crate::session::test_support::isolate_app_dir();
+    let (_runtime, calls) = crate::session::test_support::failing_container_runtime(app_dir.path());
+    crate::session::config::update_config(|c| {
+        c.sandbox.shared_credential = crate::session::config::SharedCredentialMode::SeparateLogin;
+    })
+    .unwrap();
+    let id = "sess-login-diff".to_string();
+    let mut inst = structured_instance(&id, true);
+    // Only an idle-dormant (or parked) session is woken by diff comments.
+    inst.mark_idle_dormant();
+    inst.tool = "claude".to_string();
+    inst.sandbox_info = Some(crate::session::SandboxInfo {
+        provider: None,
+        enabled: true,
+        container_id: None,
+        image: "test:latest".to_string(),
+        container_name: "aoe-login-diff".to_string(),
+        extra_env: None,
+        custom_instruction: None,
+        before_start_env: Vec::new(),
+        before_start_hook_env: Vec::new(),
+        container_workdir: None,
+    });
+    let state = crate::server::test_support::build_native_test_app_state(vec![inst]).await;
+    let login = &state.session_service.sandbox_login;
+    let mut notices = login.subscribe();
+
+    let response = tokio::time::timeout(
+        Duration::from_secs(30),
+        acp_prompt_diff_comments(
+            State(Arc::clone(&state)),
+            Path(id.clone()),
+            diff_req("lgtm"),
+        ),
+    )
+    .await
+    .expect("the refused wake ends the handler")
+    .into_response();
+
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    // The detached resume publishes the refusal after it holds the session.
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while !published(&state, &id, |e| {
+            matches!(e, Event::AgentStartupError { message }
+                if *message == crate::session::test_support::login_required("claude").to_string())
+        }) {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the wake reached the login gate");
+    assert_eq!(
+        login.held_origin(&id),
+        Some(crate::server::sandbox_login::LaunchOrigin::Interactive)
+    );
+    assert!(
+        notices.try_recv().is_err(),
+        "no push for an interactive hold"
+    );
+    assert_eq!(std::fs::read_to_string(&calls).unwrap_or_default(), "");
+}
+
+/// A prompt that would wake a sandbox needing the login is kept in the queue, with its
+/// attachments, and the session's pending initial turn stays. "Send now" of a queued row
+/// keeps that one row.
+#[cfg(unix)]
+#[tokio::test]
+#[serial_test::serial]
+async fn sandbox_login_queue_keeps_http_prompt() {
+    use base64::Engine;
+    let app_dir = crate::session::test_support::isolate_app_dir();
+    let (_runtime, calls) = crate::session::test_support::failing_container_runtime(app_dir.path());
+    let id = "sess-login-http".to_string();
+    let mut inst = structured_instance(&id, true);
+    inst.mark_idle_dormant();
+    inst.pending_initial_turn = Some(crate::session::PendingInitialTurn {
+        text: "run the nightly task".to_string(),
+        attachments: Vec::new(),
+        synthesized: false,
+    });
+    crate::session::test_support::sandbox_needing_login(app_dir.path(), &mut inst);
+    let state = crate::server::test_support::build_native_test_app_state(vec![inst]).await;
+    // A previous run reported the agent's capabilities, so attachments are accepted.
+    state
+        .acp_event_store
+        .record(
+            &id,
+            1,
+            &Event::PromptCapabilities {
+                image: true,
+                audio: false,
+                embedded_context: false,
+                load_session: None,
+                steering: false,
+            },
+        )
+        .expect("seed the capabilities");
+    state.acp_supervisor.hydrate_seqs([(id.clone(), 1)]);
+    let message = crate::session::test_support::login_required("claude").to_string();
+    let body = |response: Response| async move {
+        let bytes = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .unwrap();
+        serde_json::from_slice::<serde_json::Value>(&bytes)
+            .unwrap_or_else(|e| panic!("{e}: {}", String::from_utf8_lossy(&bytes)))
+    };
+
+    let response = acp_prompt(
+        State(Arc::clone(&state)),
+        Path(id.clone()),
+        Ok(Json(PromptRequest {
+            text: "caption".into(),
+            attachments: vec![crate::acp::protocol::PromptAttachmentUpload {
+                kind: crate::daemon::PromptAttachmentKind::Image,
+                mime_type: "image/png".into(),
+                data: base64::engine::general_purpose::STANDARD.encode(b"\x89PNG\r\n\x1a\nfake"),
+                name: Some("shot.png".into()),
+            }],
+            prompt_id: Some("p-login".into()),
+            no_revive: false,
+            queued_prompt_id: None,
+        })),
+    )
+    .await
+    .into_response();
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    assert_eq!(
+        body(response).await,
+        serde_json::json!({
+            "error": "sandbox_login_required",
+            "message": message,
+            "tool": "claude",
+            "queued_id": "p-login",
+        })
+    );
+    // The queue cannot advance, so the log carries the recovery guidance once: it names the
+    // agent and the command to run.
+    let guidance = || -> Vec<String> {
+        state
+            .acp_event_store
+            .replay_from(&id, 0)
+            .into_iter()
+            .filter_map(|(_, e)| match e {
+                Event::AgentStartupError { message } => Some(message),
+                _ => None,
+            })
+            .collect()
+    };
+    assert_eq!(guidance(), vec![message.clone()]);
+    assert!(
+        message.contains("aoe sandbox login --tool claude"),
+        "{message}"
+    );
+    let queue = state.session_service.queued_prompts_snapshot(&id).await;
+    assert_eq!(queue.len(), 1);
+    assert_eq!(
+        (queue[0].id.as_str(), queue[0].text.as_str()),
+        ("p-login", "caption")
+    );
+    assert_eq!(queue[0].attachments.len(), 1);
+    assert_eq!(
+        state
+            .acp_event_store
+            .load_pending_attachments_for_ref(&id, "p-login")
+            .len(),
+        1
+    );
+    assert_eq!(
+        state.session_service.sandbox_login.held_origin(&id),
+        Some(crate::server::sandbox_login::LaunchOrigin::Interactive)
+    );
+
+    // The session is no longer dormant, so only a rate-limit park reaches `send_turn` again.
+    assert!(state.acp_supervisor.publish_stopped_if_seq(
+        &id,
+        crate::acp::state::RATE_LIMIT_EXHAUSTED_RETRIES_REASON,
+        2,
+    ));
+    let response = acp_prompt(
+        State(Arc::clone(&state)),
+        Path(id.clone()),
+        send_now_req("caption", "p-login"),
+    )
+    .await
+    .into_response();
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    assert_eq!(body(response).await["queued_id"], "p-login");
+    assert_eq!(
+        guidance().len(),
+        1,
+        "a session already held gets no second banner"
+    );
+    let queue = state.session_service.queued_prompts_snapshot(&id).await;
+    assert_eq!(
+        queue.iter().map(|q| q.id.as_str()).collect::<Vec<_>>(),
+        ["p-login"]
+    );
+
+    assert_eq!(
+        state.instances.read().await[0]
+            .pending_initial_turn
+            .as_ref()
+            .map(|t| t.text.as_str()),
+        Some("run the nightly task")
+    );
+    assert!(
+        !published(&state, &id, |e| matches!(e, Event::UserPromptSent { .. })),
+        "nothing reached the transcript"
+    );
+    assert_eq!(std::fs::read_to_string(&calls).unwrap_or_default(), "");
+}
+
+/// A session held for the login keeps no more prompts than the queue caps allow, on both
+/// ways a prompt reaches the queue: the login refusal of a dormant session and the dispatch
+/// to the queue once it is awake. A full queue and an oversize text are refused with the
+/// queue's own statuses, never with the login-required answer that says the prompt is
+/// queued; an id already in a full queue is replaced in place.
+#[cfg(unix)]
+#[tokio::test]
+#[serial_test::serial]
+async fn sandbox_login_queue_respects_the_queue_caps() {
+    use crate::server::session_service::{MAX_QUEUED_PROMPTS_PER_SESSION, MAX_QUEUED_TEXT_BYTES};
+    let app_dir = crate::session::test_support::isolate_app_dir();
+    let (_runtime, calls) = crate::session::test_support::failing_container_runtime(app_dir.path());
+    let fresh = |n: usize| {
+        let id = format!("sess-login-caps-{n}");
+        let mut inst = structured_instance(&id, true);
+        inst.mark_idle_dormant();
+        crate::session::test_support::sandbox_needing_login(app_dir.path(), &mut inst);
+        let state = crate::server::test_support::build_test_app_state(vec![inst]);
+        (id, state)
+    };
+    let fill = |state: Arc<AppState>, id: String| async move {
+        for n in 0..MAX_QUEUED_PROMPTS_PER_SESSION {
+            state
+                .session_service
+                .enqueue_prompt(
+                    &id,
+                    format!("fill-{n}"),
+                    format!("row {n}"),
+                    Vec::new(),
+                    None,
+                    None,
+                )
+                .await
+                .expect("the row is queued");
+        }
+    };
+    let post = |state: Arc<AppState>, id: String, text: String, prompt_id: &'static str| async move {
+        let response = acp_prompt(
+            State(state),
+            Path(id),
+            Ok(Json(PromptRequest {
+                text,
+                attachments: Vec::new(),
+                prompt_id: Some(prompt_id.to_string()),
+                no_revive: false,
+                queued_prompt_id: None,
+            })),
+        )
+        .await
+        .into_response();
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), 8192)
+            .await
+            .unwrap();
+        (status, String::from_utf8_lossy(&bytes).into_owned())
+    };
+    let oversize = "x".repeat(MAX_QUEUED_TEXT_BYTES + 1);
+
+    // The login refusal of a dormant session, one fresh session per case.
+    for (n, (text, prompt_id, status)) in [
+        ("one too many", "p-new", StatusCode::TOO_MANY_REQUESTS),
+        (oversize.as_str(), "p-new", StatusCode::PAYLOAD_TOO_LARGE),
+        ("replaced text", "fill-0", StatusCode::CONFLICT),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let (id, state) = fresh(n);
+        crate::server::test_support::seed_native_rows_for_test(&state).await;
+        fill(Arc::clone(&state), id.clone()).await;
+        let (got, body) = post(Arc::clone(&state), id.clone(), text.to_string(), prompt_id).await;
+        assert_eq!(got, status, "{prompt_id} {body}");
+        let queue = state.session_service.queued_prompts_snapshot(&id).await;
+        assert_eq!(queue.len(), MAX_QUEUED_PROMPTS_PER_SESSION);
+        if status == StatusCode::CONFLICT {
+            let body: serde_json::Value = serde_json::from_str(&body).unwrap();
+            assert_eq!(body["error"], "sandbox_login_required");
+            assert_eq!(body["queued_id"], "fill-0");
+            assert_eq!(
+                queue
+                    .iter()
+                    .find(|q| q.id == "fill-0")
+                    .map(|q| q.text.as_str()),
+                Some("replaced text")
+            );
+        } else {
+            assert!(!body.contains("sandbox_login_required"), "{body}");
+            assert!(
+                body.contains("queue is full") || body.contains("exceeds"),
+                "{body}"
+            );
+        }
+    }
+
+    // Once the refusal woke the session, the dispatch parks prompts on the same queue.
+    let (id, state) = fresh(9);
+    crate::server::test_support::seed_native_rows_for_test(&state).await;
+    let (got, _) = post(Arc::clone(&state), id.clone(), "first".into(), "p-first").await;
+    assert_eq!(
+        got,
+        StatusCode::CONFLICT,
+        "the login refusal woke the session"
+    );
+    state
+        .session_service
+        .remove_queued_prompt(&id, "p-first".to_string())
+        .await;
+    fill(Arc::clone(&state), id.clone()).await;
+    for (text, prompt_id, status) in [
+        ("one too many", "p-new", StatusCode::TOO_MANY_REQUESTS),
+        (oversize.as_str(), "p-new", StatusCode::PAYLOAD_TOO_LARGE),
+        ("replaced text", "fill-0", StatusCode::ACCEPTED),
+    ] {
+        let (got, body) = post(Arc::clone(&state), id.clone(), text.to_string(), prompt_id).await;
+        assert_eq!(got, status, "dispatch {prompt_id} {body}");
+        assert_eq!(
+            state
+                .session_service
+                .queued_prompts_snapshot(&id)
+                .await
+                .len(),
+            MAX_QUEUED_PROMPTS_PER_SESSION
+        );
+    }
+    assert_eq!(std::fs::read_to_string(&calls).unwrap_or_default(), "");
+}
+
+/// The shared enqueue refuses a full queue and an oversize text before it buffers any
+/// blob, and still enforces the per-session attachment cap.
+#[tokio::test]
+#[serial_test::serial]
+async fn buffer_and_enqueue_applies_every_cap_before_buffering() {
+    use crate::server::session_service::{MAX_QUEUED_PROMPTS_PER_SESSION, MAX_QUEUED_TEXT_BYTES};
+    let _app_dir = crate::session::test_support::isolate_app_dir();
+    let id = "sess-buffer-caps";
+    let state = structured_state(id, true).await;
+    let service = &state.session_service;
+    let blob = |len: usize| crate::acp::event_store::AttachmentBlob {
+        id: uuid::Uuid::new_v4().to_string(),
+        kind: crate::daemon::PromptAttachmentKind::Image,
+        mime_type: "image/png".into(),
+        name: None,
+        data: vec![0u8; len],
+    };
+    let enqueue = |prompt_id: &str, text: String, blobs: Vec<_>| {
+        let state = Arc::clone(&state);
+        let (id, prompt_id) = (id.to_string(), prompt_id.to_string());
+        async move {
+            crate::server::api::queue::buffer_and_enqueue(
+                &state, &id, &prompt_id, text, &blobs, None, None,
+            )
+            .await
+        }
+    };
+
+    let oversize = enqueue(
+        "p-big",
+        "x".repeat(MAX_QUEUED_TEXT_BYTES + 1),
+        vec![blob(8)],
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(oversize.0, StatusCode::PAYLOAD_TOO_LARGE);
+    assert!(
+        state
+            .acp_event_store
+            .load_pending_attachments_for_ref(id, "p-big")
+            .is_empty(),
+        "nothing was buffered for a refused prompt"
+    );
+
+    for n in 0..MAX_QUEUED_PROMPTS_PER_SESSION {
+        enqueue(&format!("fill-{n}"), format!("row {n}"), Vec::new())
+            .await
+            .unwrap();
+    }
+    let full = enqueue("p-new", "late".into(), vec![blob(8)])
+        .await
+        .unwrap_err();
+    assert_eq!(full.0, StatusCode::TOO_MANY_REQUESTS);
+    assert!(state
+        .acp_event_store
+        .load_pending_attachments_for_ref(id, "p-new")
+        .is_empty());
+    assert!(enqueue("fill-3", "same id, new text".into(), Vec::new())
+        .await
+        .is_ok());
+    assert_eq!(
+        service.queued_prompts_snapshot(id).await.len(),
+        MAX_QUEUED_PROMPTS_PER_SESSION
+    );
+
+    // The attachment byte cap is still the second bound, on a session with queue room.
+    let id2 = "sess-buffer-bytes";
+    let state2 = structured_state(id2, true).await;
+    let too_much = crate::server::api::queue::buffer_and_enqueue(
+        &state2,
+        id2,
+        "p-att",
+        "pic".into(),
+        &[blob(64 * 1024 * 1024 + 1)],
+        None,
+        None,
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(too_much.0, StatusCode::PAYLOAD_TOO_LARGE);
+    assert!(too_much.1.contains("per-session limit"), "{}", too_much.1);
+}
+
+/// The queued 409 body carries the recovery's `profile` and `command` when the session needs
+/// them, and neither when it does not.
+#[tokio::test]
+async fn sandbox_login_required_queued_body_names_profile_and_command_only_when_set() {
+    let body = |response: Response| async move {
+        let bytes = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .unwrap();
+        serde_json::from_slice::<serde_json::Value>(&bytes).unwrap()
+    };
+    let mut blocked = crate::session::test_support::login_required("claude");
+    let plain = body(sandbox_login_required_queued(&blocked, "p-1")).await;
+    assert_eq!(plain["queued_id"], "p-1");
+    assert_eq!(plain.get("profile"), None);
+    assert_eq!(plain.get("command"), None);
+
+    blocked.profile = Some("work".to_string());
+    blocked.command = Some("claude --model x".to_string());
+    let named = body(sandbox_login_required_queued(&blocked, "p-2")).await;
+    assert_eq!(named["profile"], "work");
+    assert_eq!(named["command"], "claude --model x");
+    assert_eq!(named["queued_id"], "p-2");
+    assert_eq!(
+        named["message"],
+        "sandbox login required for claude: run `aoe sandbox login -p work --tool claude --command 'claude --model x'`"
+    );
+}
+
+/// The queue refuses an enqueue (text too large, queue full) after the dispatch chose it: the
+/// pending initial turn it would have superseded stays, in memory and on disk, and so does
+/// the queue. A prompt that is queued supersedes it, once.
+#[tokio::test]
+#[serial_test::serial]
+async fn a_refused_enqueue_keeps_the_pending_initial_turn_and_a_queued_one_supersedes_it() {
+    use crate::server::session_service::{MAX_QUEUED_PROMPTS_PER_SESSION, MAX_QUEUED_TEXT_BYTES};
+    let _app = crate::session::test_support::isolate_app_dir();
+    let post = |state: Arc<AppState>, id: String, text: String| async move {
+        acp_prompt(State(state), Path(id), prompt_req(&text))
+            .await
+            .into_response()
+            .status()
+    };
+    let seed = |label: &str| {
+        let id = format!("sess-refused-enqueue-{label}");
+        let inst = structured_instance(&id, false);
+        // The row must exist on disk for the persisted pending turn to mean anything.
+        crate::server::test_support::seed_instances_on_disk_for_test(
+            &inst.source_profile,
+            vec![inst.clone()],
+        );
+        (
+            id,
+            crate::server::test_support::build_test_app_state(vec![inst]),
+        )
+    };
+    let oversize = "x".repeat(MAX_QUEUED_TEXT_BYTES + 1);
+
+    for (label, text, fill, expected) in [
+        (
+            "full",
+            "one too many".to_string(),
+            true,
+            StatusCode::TOO_MANY_REQUESTS,
+        ),
+        ("oversize", oversize, false, StatusCode::PAYLOAD_TOO_LARGE),
+    ] {
+        let (id, state) = seed(label);
+        crate::server::test_support::seed_native_rows_for_test(&state).await;
+        state
+            .session_service
+            .set_pending_initial_turn(&id, "continuation".into(), Vec::new())
+            .await;
+        if fill {
+            for n in 0..MAX_QUEUED_PROMPTS_PER_SESSION {
+                state
+                    .session_service
+                    .enqueue_prompt(
+                        &id,
+                        format!("fill-{n}"),
+                        format!("row {n}"),
+                        Vec::new(),
+                        None,
+                        None,
+                    )
+                    .await
+                    .expect("the row is queued");
+            }
+        }
+        let queued_before = state
+            .session_service
+            .queued_prompts_snapshot(&id)
+            .await
+            .len();
+        assert_eq!(
+            persisted_pending_turn(&state, &id).await.map(|t| t.text),
+            Some("continuation".to_string()),
+            "{label}: the turn is on disk before the refusal"
+        );
+
+        assert_eq!(
+            post(Arc::clone(&state), id.clone(), text).await,
+            expected,
+            "{label}"
+        );
+
+        let pending = state.instances.read().await[0].pending_initial_turn.clone();
+        assert_eq!(
+            pending.map(|t| t.text),
+            Some("continuation".to_string()),
+            "{label}: in memory"
+        );
+        assert_eq!(
+            persisted_pending_turn(&state, &id).await.map(|t| t.text),
+            Some("continuation".to_string()),
+            "{label}: on disk"
+        );
+        assert_eq!(
+            state
+                .session_service
+                .queued_prompts_snapshot(&id)
+                .await
+                .len(),
+            queued_before,
+            "{label}: the queue is unchanged"
+        );
+    }
+
+    // A prompt that is queued supersedes the turn.
+    let (id, state) = seed("accepted");
+    crate::server::test_support::seed_native_rows_for_test(&state).await;
+    state
+        .session_service
+        .set_pending_initial_turn(&id, "continuation".into(), Vec::new())
+        .await;
+    assert_eq!(
+        post(Arc::clone(&state), id.clone(), "hello".to_string()).await,
+        StatusCode::ACCEPTED
+    );
+    assert!(state.instances.read().await[0]
+        .pending_initial_turn
+        .is_none());
+    assert!(persisted_pending_turn(&state, &id).await.is_none());
+    let queue = state.session_service.queued_prompts_snapshot(&id).await;
+    assert_eq!(queue.len(), 1);
+    assert_eq!(queue[0].text, "hello");
+}
+
+/// A send to a dormant sandbox session whose `before_start` hook supplies no auth route is
+/// refused cleanly: the login refusal, the text queued, the pending initial turn kept, and
+/// the hook run once however often it is retried. A hook that supplies the key launches.
+#[cfg(unix)]
+#[tokio::test]
+#[serial_test::serial]
+async fn sandbox_login_send_resolves_the_before_start_hook_once_and_queues_on_refusal() {
+    let app_dir = crate::session::test_support::isolate_app_dir();
+    let (_runtime, _calls) =
+        crate::session::test_support::failing_container_runtime(app_dir.path());
+    let _unset = crate::session::test_support::EnvGuard::unset(&[
+        "CLAUDE_CODE_USE_BEDROCK",
+        "CLAUDE_CODE_USE_VERTEX",
+        "ANTHROPIC_AUTH_TOKEN",
+        "CLAUDE_CODE_OAUTH_TOKEN",
+        "ANTHROPIC_API_KEY",
+    ]);
+    let project = app_dir.path().join("project");
+    std::fs::create_dir_all(&project).unwrap();
+    let counter = app_dir.path().join("hook-runs");
+    let runs = || {
+        std::fs::read_to_string(&counter)
+            .map(|r| r.lines().count())
+            .unwrap_or(0)
+    };
+    let set_hook = |tail: &str| {
+        let hook = format!(
+            "echo run >> {}; {tail}",
+            crate::session::environment::shell_escape(&counter.to_string_lossy())
+        );
+        crate::session::config::update_config(|c| c.host_hooks.before_start = vec![hook]).unwrap();
+        let _ = std::fs::remove_file(&counter);
+    };
+    let fresh = |n: usize| {
+        let id = format!("sess-hook-send-{n}");
+        let mut inst = structured_instance(&id, true);
+        inst.project_path = project.to_string_lossy().into_owned();
+        inst.mark_idle_dormant();
+        crate::session::test_support::sandbox_needing_login(app_dir.path(), &mut inst);
+        crate::server::test_support::seed_instances_on_disk_for_test(
+            &inst.source_profile,
+            vec![inst.clone()],
+        );
+        let state = crate::server::test_support::build_test_app_state(vec![inst]);
+        (id, state)
+    };
+    let post = |state: Arc<AppState>, id: String, text: &'static str| async move {
+        let response = acp_prompt(State(state), Path(id), prompt_req(text))
+            .await
+            .into_response();
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), 8192)
+            .await
+            .unwrap();
+        (status, String::from_utf8_lossy(&bytes).into_owned())
+    };
+
+    // No auth route from the hook: the login refusal, queued, pending turn kept.
+    set_hook("echo FOO=bar");
+    let (id, state) = fresh(0);
+    crate::server::test_support::seed_native_rows_for_test(&state).await;
+    state
+        .session_service
+        .set_pending_initial_turn(&id, "continuation".into(), Vec::new())
+        .await;
+    let (status, body) = post(Arc::clone(&state), id.clone(), "hello").await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    let body: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(body["error"], "sandbox_login_required");
+    assert!(body["queued_id"].is_string(), "{body}");
+    assert_eq!(runs(), 1, "one hook run");
+    let queue = state.session_service.queued_prompts_snapshot(&id).await;
+    assert_eq!(queue.len(), 1);
+    assert_eq!(queue[0].text, "hello");
+    assert_eq!(
+        state.instances.read().await[0]
+            .pending_initial_turn
+            .as_ref()
+            .map(|t| t.text.as_str()),
+        Some("continuation"),
+        "the pending turn stays for after the login"
+    );
+    let (status, _) = post(Arc::clone(&state), id.clone(), "again").await;
+    // The refusal woke the session: the next prompt parks on the queue the held turn is on.
+    assert_eq!(status, StatusCode::ACCEPTED);
+    assert_eq!(runs(), 1, "a retry does not run the hook again");
+
+    // A hook that supplies the key: not refused for the login, and the hook ran once.
+    set_hook("echo ANTHROPIC_API_KEY=sk-hook");
+    let (id, state) = fresh(1);
+    crate::server::test_support::seed_native_rows_for_test(&state).await;
+    let (status, body) = post(Arc::clone(&state), id.clone(), "hello").await;
+    assert!(!body.contains("sandbox_login_required"), "{status}: {body}");
+    assert_eq!(runs(), 1, "the launch reused the hook's values");
+}
+
+/// A `before_start` hook that fails during the send's admission is its own error: the text
+/// is queued and the pending initial turn stays, as for a login refusal.
+#[cfg(unix)]
+#[tokio::test]
+#[serial_test::serial]
+async fn sandbox_login_send_keeps_the_turn_when_the_before_start_hook_fails() {
+    let app_dir = crate::session::test_support::isolate_app_dir();
+    let (_runtime, _calls) =
+        crate::session::test_support::failing_container_runtime(app_dir.path());
+    let _unset = crate::session::test_support::EnvGuard::unset(&[
+        "CLAUDE_CODE_USE_BEDROCK",
+        "CLAUDE_CODE_USE_VERTEX",
+        "ANTHROPIC_AUTH_TOKEN",
+        "CLAUDE_CODE_OAUTH_TOKEN",
+        "ANTHROPIC_API_KEY",
+    ]);
+    let project = app_dir.path().join("project");
+    std::fs::create_dir_all(&project).unwrap();
+    crate::session::config::update_config(|c| {
+        c.host_hooks.before_start = vec!["echo sekret-token >&2; exit 3".into()]
+    })
+    .unwrap();
+    let id = "sess-hook-fails".to_string();
+    let mut inst = structured_instance(&id, true);
+    inst.project_path = project.to_string_lossy().into_owned();
+    inst.mark_idle_dormant();
+    crate::session::test_support::sandbox_needing_login(app_dir.path(), &mut inst);
+    crate::server::test_support::seed_instances_on_disk_for_test(
+        &inst.source_profile,
+        vec![inst.clone()],
+    );
+    let state = crate::server::test_support::build_native_test_app_state(vec![inst]).await;
+    state
+        .session_service
+        .set_pending_initial_turn(&id, "continuation".into(), Vec::new())
+        .await;
+
+    let response = acp_prompt(
+        State(Arc::clone(&state)),
+        Path(id.clone()),
+        prompt_req("hello"),
+    )
+    .await
+    .into_response();
+    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    let bytes = axum::body::to_bytes(response.into_body(), 8192)
+        .await
+        .unwrap();
+    let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(body["error"], "before_start_hook_failed");
+    assert_eq!(body["message"], "the before_start hook failed");
+    assert!(!body.to_string().contains("sekret-token"), "{body}");
+    assert!(
+        state
+            .acp_event_store
+            .replay_from(&id, 0)
+            .iter()
+            .all(|frame| !format!("{frame:?}").contains("sekret-token")),
+        "no hook output reaches the event log"
+    );
+    assert!(body["queued_id"].is_string(), "{body}");
+    let queue = state.session_service.queued_prompts_snapshot(&id).await;
+    assert_eq!(queue.len(), 1);
+    assert_eq!(queue[0].text, "hello");
+    assert_eq!(
+        state.instances.read().await[0]
+            .pending_initial_turn
+            .as_ref()
+            .map(|t| t.text.as_str()),
+        Some("continuation"),
+        "the pending turn stays"
+    );
+}

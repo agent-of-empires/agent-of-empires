@@ -57,6 +57,30 @@ fn no_revive_refused() -> Response {
         .into_response()
 }
 
+/// The admission's `host_hooks.before_start` hook failed: the prompt is kept in the queue
+/// (the pending initial turn stays too) and the hook's own error is the message.
+fn before_start_hook_failed_queued(message: &str, queued_id: &str) -> Response {
+    (
+        StatusCode::BAD_GATEWAY,
+        Json(serde_json::json!({
+            "error": "before_start_hook_failed",
+            "message": message,
+            "queued_id": queued_id,
+        })),
+    )
+        .into_response()
+}
+
+/// 409 for a prompt kept in the queue until the sandbox login exists.
+fn sandbox_login_required_queued(
+    blocked: &crate::session::SandboxLoginRequired,
+    queued_id: &str,
+) -> Response {
+    let mut body = crate::server::api::sandbox_login_required_body(blocked);
+    body["queued_id"] = serde_json::Value::String(queued_id.to_string());
+    (StatusCode::CONFLICT, Json(body)).into_response()
+}
+
 /// The queue row a "Send now" named is gone: the drain or another tab already delivered it.
 fn queued_prompt_gone() -> Response {
     (StatusCode::CONFLICT, "queued_prompt_gone").into_response()
@@ -171,10 +195,11 @@ pub async fn acp_prompt(
     if let PromptDispatch::Queued { reason } = dispatch {
         // A fresh prompt supersedes a queued rate-limit continuation (#3028).
         // Only once queueing is certain: a `no_revive` refusal above must
-        // leave it in place (#4081 review).
-        state.session_service.clear_pending_initial_turn(&id).await;
+        // leave it in place (#4081 review), and so must an enqueue the queue
+        // refuses (too large, full) below: nothing would replace it.
         // The named row is already the parked copy; queueing again would duplicate it.
         if let Some(row) = &queued_row {
+            state.session_service.clear_pending_initial_turn(&id).await;
             return (
                 StatusCode::ACCEPTED,
                 Json(PromptDispatchResponse {
@@ -199,14 +224,18 @@ pub async fn acp_prompt(
         )
         .await
         {
-            Ok(entry) => (
-                StatusCode::ACCEPTED,
-                Json(PromptDispatchResponse {
-                    dispatch,
-                    queued_id: Some(entry.id),
-                }),
-            )
-                .into_response(),
+            Ok(entry) => {
+                // Superseded only now that the prompt is queued.
+                state.session_service.clear_pending_initial_turn(&id).await;
+                (
+                    StatusCode::ACCEPTED,
+                    Json(PromptDispatchResponse {
+                        dispatch,
+                        queued_id: Some(entry.id),
+                    }),
+                )
+                    .into_response()
+            }
             Err((status, msg)) => {
                 tracing::warn!(
                     target: "http.api.acp",
@@ -235,7 +264,7 @@ pub async fn acp_prompt(
         }
         None => attachments,
     };
-    let caller = match origin_plugin {
+    let caller = match origin_plugin.clone() {
         Some(plugin_id) => SessionCaller::PluginMessage { plugin_id },
         None => SessionCaller::User,
     };
@@ -256,9 +285,15 @@ pub async fn acp_prompt(
         )
         .await;
     // A fresh prompt supersedes a queued rate-limit continuation (#3028),
-    // but only once delivery is certain: a `no_revive` refusal must leave
-    // the pending turn in place (#4081 review).
-    if !matches!(outcome, Err(SendTurnError::RevivalRefused)) {
+    // but only once delivery is certain: a `no_revive` or login refusal must
+    // leave the pending turn in place (#4081 review). After the login both the
+    // pending turn and the kept prompt are delivered.
+    if !matches!(
+        outcome,
+        Err(SendTurnError::RevivalRefused
+            | SendTurnError::LoginRequired(_)
+            | SendTurnError::HookFailed(_))
+    ) {
         state.session_service.clear_pending_initial_turn(&id).await;
     }
     match outcome {
@@ -282,6 +317,48 @@ pub async fn acp_prompt(
         Err(SendTurnError::ResumeFailed(e)) => resume_failed_response(&e),
         Err(SendTurnError::WorkerNotReady) => worker_not_ready(),
         Err(SendTurnError::RevivalRefused) => no_revive_refused(),
+        Err(held @ (SendTurnError::LoginRequired(_) | SendTurnError::HookFailed(_))) => {
+            let queued_id = match queued_row {
+                // A named row is already the queued copy.
+                Some(row) => row.id,
+                None => {
+                    let prompt_id = req
+                        .prompt_id
+                        .clone()
+                        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+                    match super::super::queue::buffer_and_enqueue(
+                        &state,
+                        &id,
+                        &prompt_id,
+                        req.text.clone(),
+                        &attachments,
+                        None,
+                        origin_plugin,
+                    )
+                    .await
+                    {
+                        Ok(entry) => entry.id,
+                        Err((status, msg)) => {
+                            tracing::warn!(
+                                target: "http.api.acp",
+                                session = %id,
+                                "prompt held for the sandbox login but enqueue failed: {msg}"
+                            );
+                            return (status, msg).into_response();
+                        }
+                    }
+                }
+            };
+            match held {
+                SendTurnError::HookFailed(message) => {
+                    before_start_hook_failed_queued(&message, &queued_id)
+                }
+                SendTurnError::LoginRequired(blocked) => {
+                    sandbox_login_required_queued(&blocked, &queued_id)
+                }
+                _ => unreachable!("matched above"),
+            }
+        }
         // Unreachable for a User caller.
         Err(SendTurnError::NotOwner) => {
             (StatusCode::FORBIDDEN, "session not owned by caller").into_response()
@@ -365,6 +442,7 @@ pub async fn acp_prompt_diff_comments(
             &state.session_service,
             &id,
             crate::process::worker_registry::ResumeAuthority::Explicit,
+            crate::server::sandbox_login::LaunchOrigin::Interactive,
         )
         .await
         {

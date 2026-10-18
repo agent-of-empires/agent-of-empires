@@ -561,7 +561,15 @@ Before delivery, the HTTP endpoint removes bracketed-paste delimiters and remain
 | `409` | `{"error": "resume_failed", "message": "...", "resume_session_id": "..."}` | Auto-revive tried to resume a stored conversation, but the pane exited before AoE could prove the ID invalid. The ID is preserved for explicit retry or replacement. |
 | `409` | `{"error": "session_transient", "status": "..."}` | Session is mid-lifecycle and cannot accept input yet |
 | `409` | `{"error": "session_archived" \| "session_trashed", "message": "..."}` | Session is archived or trashed, even with a live pane or `revive: false`; unarchive or restore it first. `/start`, `/ensure`, `/container-terminal` and structured-view prompts refuse the same way. |
+| `409` | `{"error": "sandbox_login_required", "message", "tool", "profile"?, "command"?}` | Reviving a sandbox needs the sandbox login of its agent (`sandbox.shared_credential = "separate_login"`); `tool` is the one to log in. `profile` is present only when the session runs under a profile other than the default one (pass it as `-p <profile>`); `command` only when the session runs its own command for the tool and `aoe sandbox login --tool <tool>` alone would log in another file than the launch waits for (pass it as `--command <command>`). Terminal sessions have no queue, so the message is not kept; send it again after `aoe sandbox login --tool <tool>` |
 | `500` | `{"error": "tmux_error"}` or `{"error": "internal"}` | Unexpected failure (logged server-side) |
+
+A structured-view prompt (`POST /api/sessions/{id}/acp/prompt`) that would revive a sandbox needing the login answers `409` with `{"error": "sandbox_login_required", "message", "tool", "profile"?, "command"?, "queued_id"}` instead (`profile` and `command` as in the `409` above): the prompt is kept in the session's queue under `queued_id` and delivered after the login, so do not send it again. The session also shows the instruction as its startup error until the login exists.
+
+If the session's `host_hooks.before_start` hook fails while that launch is admitted, the prompt is kept the same way and the answer is `502` with `{"error": "before_start_hook_failed", "message", "queued_id"}`. Nothing is held: the next launch that works delivers the queue. `message` is fixed text and never carries the hook's command or output.
+
+`/start`, `/ensure`, `/restart`, `/recreate-container` and `/acp/spawn` refuse a launch that needs the login the same way (`409` `sandbox_login_required`, or `502` `before_start_hook_failed`), without `queued_id`. A restart or recreate is refused before the running agent is stopped or its container is discarded. With Apple Container, which cannot run the login helper, they answer `409` `{"error": "sandbox_login_unsupported", "message"}` instead, and nothing is held.
+
 
 Concurrent POSTs to the same `id` are serialized server-side, so two
 orchestrators racing on the same session won't interleave keystrokes
