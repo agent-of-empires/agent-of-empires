@@ -275,7 +275,14 @@ impl GitWorktree {
             "move_worktree: relocating a worktree with submodules by hand"
         );
         // Recorded while the pointers still resolve.
-        let checkouts = Self::populated_submodule_checkouts(from)?;
+        let checkouts = match Self::populated_submodule_checkouts(from) {
+            Ok(checkouts) => checkouts,
+            Err(e) => {
+                // `move_worktree`'s backstop has already unlocked the source.
+                let _ = self.lock_worktree(from);
+                return Err(e);
+            }
+        };
         self.unlock_worktree(from);
 
         if let Err(e) = std::fs::rename(from, to) {
@@ -854,5 +861,50 @@ mod tests {
         assert!(result.is_err());
         assert!(from.is_dir());
         assert!(!to.exists());
+    }
+
+    /// The backstop reaches the relocation after `move_worktree` has already
+    /// unlocked the source; an inventory failure must lock it again.
+    #[test]
+    #[serial_test::serial]
+    fn relocation_relocks_source_when_submodule_inventory_fails_after_unlock() {
+        let home_dir = TempDir::new().unwrap();
+        let _home = crate::session::test_support::isolate_home(home_dir.path());
+
+        let dirs = repo_with_nested_submodules("test-relock-inventory", Path::new(".claude"));
+        let git_wt = GitWorktree::new(dirs[0].path().to_path_buf())
+            .unwrap()
+            .allow_submodule_file_transport();
+        let parent = TempDir::new().unwrap();
+        let from = parent.path().join("source");
+        git_wt
+            .create_worktree("test-relock-inventory", &from, false, None)
+            .unwrap();
+
+        let gitfile = from.join(".claude/.git");
+        let original_gitfile = std::fs::read(&gitfile).unwrap();
+        std::fs::write(&gitfile, b"gitdir: missing\n").unwrap();
+        let to = parent.path().join("moved");
+
+        git_wt.unlock_worktree(&from);
+        let result = git_wt.relocate_worktree_with_submodules(&from, &to);
+        std::fs::write(&gitfile, original_gitfile).unwrap();
+
+        assert!(result.is_err());
+        assert!(!to.exists());
+        let listing = run_git(&git_wt.repo_path, &["worktree", "list", "--porcelain"]);
+        let record = listing
+            .split("\n\n")
+            .find(|record| {
+                record
+                    .lines()
+                    .next()
+                    .is_some_and(|l| l.ends_with("/source"))
+            })
+            .unwrap_or_else(|| panic!("{listing}"));
+        assert!(
+            record.lines().any(|line| line.starts_with("locked")),
+            "{listing}"
+        );
     }
 }

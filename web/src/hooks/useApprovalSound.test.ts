@@ -4,12 +4,10 @@ import { describe, expect, it, beforeEach, afterEach, vi } from "vitest";
 import { renderHook, act } from "@testing-library/react";
 
 const fetchSettings = vi.fn();
-const fetchSounds = vi.fn();
 const fetchSoundBlob = vi.fn();
 
 vi.mock("../lib/api", () => ({
   fetchSettings: (...args: unknown[]) => fetchSettings(...args),
-  fetchSounds: (...args: unknown[]) => fetchSounds(...args),
   fetchSoundBlob: (...args: unknown[]) => fetchSoundBlob(...args),
 }));
 
@@ -44,7 +42,6 @@ describe("useApprovalSound", () => {
     audioInstances = [];
     playImpl = () => Promise.resolve();
     fetchSettings.mockReset().mockResolvedValue({ sound: { enabled: true, volume: 1.0, on_approval: "ding" } });
-    fetchSounds.mockReset().mockResolvedValue(["ding", "chime"]);
     fetchSoundBlob.mockReset().mockResolvedValue(new Blob(["audio"], { type: "audio/wav" }));
     vi.stubGlobal("Audio", FakeAudio);
     vi.spyOn(URL, "createObjectURL").mockReturnValue("blob:fake-url");
@@ -95,27 +92,12 @@ describe("useApprovalSound", () => {
     ["sound is disabled", { sound: { enabled: false } }, undefined],
     ["settings have no sound block", {}, undefined],
     ["no sound name resolves", { sound: { enabled: true, on_approval: "   " } }, undefined],
-    [
-      "random mode has no sounds",
-      { sound: { enabled: true, mode: "random" } },
-      () => fetchSounds.mockResolvedValue([]),
-    ],
     ["the blob fetch returns null", undefined, () => fetchSoundBlob.mockResolvedValue(null)],
   ])("stays silent when %s", async (_label, settings, arrange) => {
     if (settings) fetchSettings.mockResolvedValue(settings);
     arrange?.();
     await walk(1);
     expect(audioInstances).toHaveLength(0);
-  });
-
-  it.each([
-    ["mode.specific", { mode: { specific: "chime" } }],
-    ["a random pick", { mode: "random" }],
-  ])("resolves the sound from %s", async (_label, sound) => {
-    fetchSettings.mockResolvedValue({ sound: { enabled: true, ...sound } });
-    vi.spyOn(Math, "random").mockReturnValue(0.99);
-    await walk(1);
-    expect(fetchSoundBlob).toHaveBeenCalledWith("chime");
   });
 
   it.each([1.5, undefined])("clamps volume %s into the 0..1 audio range", async (volume) => {

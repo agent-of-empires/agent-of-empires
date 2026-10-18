@@ -585,6 +585,7 @@ mod workspace_ordering_tests {
             base_branch: None,
             base_branch_override: None,
             is_sandboxed: false,
+            outside_repository: false,
             scratch: false,
             has_managed_worktree: false,
             has_cleanable_worktree: false,

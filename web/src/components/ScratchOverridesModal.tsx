@@ -51,10 +51,9 @@ export function ScratchOverridesModal({ profile, onClose }: Props) {
         setLoadedScope(scope);
         return;
       }
-      const session = settings.session as { scratch_smart_rename?: unknown } | undefined;
       setLoadError(false);
       setError(null);
-      const raw = session?.scratch_smart_rename;
+      const raw = settings.session?.scratch_smart_rename;
       setChoice(isStoredChoice(raw) ? raw : scope === "profile" ? "default" : "inherit");
       setLoadedScope(scope);
     });

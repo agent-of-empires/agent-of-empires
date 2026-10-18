@@ -2,7 +2,7 @@
 
 use crate::session::Status;
 
-use super::detect::{Detection, HookObservation};
+use super::detect::{Detection, HookObservation, Observation};
 use super::utils::strip_ansi;
 
 /// Configured rules for `(profile, tool)` outrank the built-in detector.
@@ -26,8 +26,7 @@ pub fn detect_with_rules(
     rules_tool: &str,
     agent: &str,
     clean: &str,
-    osc_title: &str,
-    hook: Option<HookObservation>,
+    observation: &Observation<'_>,
 ) -> Option<Detection> {
     if let Some(status) = super::status_rules::detect(profile, rules_tool, clean) {
         return Some(Detection {
@@ -36,7 +35,7 @@ pub fn detect_with_rules(
             rule: "configured_status_rule",
         });
     }
-    super::detect::detect(agent, clean, osc_title, hook)
+    super::detect::detect(agent, clean, observation)
 }
 
 /// Run an agent's manifest over one capture, Idle when no rule matches.
@@ -46,9 +45,13 @@ pub fn detect_via_manifest(
     osc_title: &str,
     hook: Option<HookObservation>,
 ) -> Status {
-    super::detect::detect(agent, &strip_ansi(raw_content), osc_title, hook)
-        .and_then(|d| d.status)
-        .unwrap_or(Status::Idle)
+    super::detect::detect(
+        agent,
+        &strip_ansi(raw_content),
+        &Observation::new(osc_title, hook, true),
+    )
+    .and_then(|d| d.status)
+    .unwrap_or(Status::Idle)
 }
 
 macro_rules! manifest_detectors {
@@ -112,8 +115,14 @@ mod tests {
             Status::Running,
             "fixture invariant: the manifest alone reads this screen as Running"
         );
-        let detection = detect_with_rules(PROFILE, "claude", "claude", running, "", None)
-            .expect("claude has a manifest");
+        let detection = detect_with_rules(
+            PROFILE,
+            "claude",
+            "claude",
+            running,
+            &Observation::new("", None, true),
+        )
+        .expect("claude has a manifest");
         assert_eq!(detection.status, Some(Status::Waiting));
         assert_eq!(detection.rule, "configured_status_rule");
 
@@ -123,8 +132,7 @@ mod tests {
             "claude",
             "claude",
             idle_screen,
-            "\u{2807}",
-            None,
+            &Observation::new("\u{2807}", None, true),
         )
         .expect("claude has a manifest");
         assert_eq!(titled.status, Some(Status::Running));
@@ -149,9 +157,13 @@ mod tests {
     }
 
     fn claude_rule(content: &str) -> &'static str {
-        super::super::detect::detect("claude", &strip_ansi(content), "", None)
-            .expect("claude has a manifest")
-            .rule
+        super::super::detect::detect(
+            "claude",
+            &strip_ansi(content),
+            &Observation::new("", None, true),
+        )
+        .expect("claude has a manifest")
+        .rule
     }
 
     fn claude_fresh_bound() -> std::time::Duration {
@@ -2561,8 +2573,12 @@ Final prose line.\n";
             assert_eq!(detect_omp_status(pane), Status::Idle, "case: {name}");
         }
 
-        let detection = crate::tmux::detect::detect("omp", MINIMAL_COMPOSER_BOX, "", None)
-            .expect("omp manifest");
+        let detection = crate::tmux::detect::detect(
+            "omp",
+            MINIMAL_COMPOSER_BOX,
+            &Observation::new("", None, true),
+        )
+        .expect("omp manifest");
         assert_eq!(detection.status, Some(Status::Idle));
         assert!(!detection.visible);
     }
@@ -3079,12 +3095,6 @@ Final prose line.\n";
                 format!("Yes or No?\n{composer}"),
                 Status::Idle,
             ),
-            (
-                "incomplete selector",
-                "╭─ Confirm operation ─╮\n│ ❯ Yes │\n│ ↑/↓ navigate  ⏎ select  ⎋ cancel │\n╰─────╯"
-                    .to_string(),
-                Status::Idle,
-            ),
         ];
         for (name, pane, expected) in cases {
             assert_eq!(detect_omp_status(&pane), expected, "case: {name}");
@@ -3249,11 +3259,6 @@ Final prose line.\n";
                 "output painted over the composer body",
                 active.replace("│ draft │", "Completed response."),
                 Status::Running,
-            ),
-            (
-                "interrupt outside capture window",
-                active.replace("│ draft │\n", &"│ draft │\n".repeat(28)),
-                Status::Idle,
             ),
             (
                 "lower terminal error",
@@ -3532,6 +3537,345 @@ Final prose line.\n";
         ];
         for (name, pane) in cases {
             assert_eq!(detect_omp_status(pane), Status::Waiting, "case: {name}");
+        }
+    }
+
+    #[test]
+    fn omp_activity_survives_rendering_tunables_and_plugin_footers() {
+        let cases = [
+            ("band", " ⠋ 1s > model\n╰─"),
+            ("box", "\n╭── ⠋ 1s > model ──╮\n╰────────────────────╯"),
+            (
+                "ascii box",
+                "\n+-- / 1s > model --+\n+- Shift+Tab to change thinking effort -+",
+            ),
+            (
+                "claude",
+                "\n────────────────────\n❯\n────────────────────\n ⠋ 1s > model",
+            ),
+            (
+                "pi",
+                "\n────────────────────\nAsk anything\n────────────────────\n ⠋ 1s > model",
+            ),
+            ("rule", "\n────────────────────\n❯\n ⠋ 1s > model"),
+            ("borderless", "\n❯ Ask anything\n ⠋ 1s > model"),
+            ("field", "\n▐ Ask anything ▌\n ⠋ 1s > model"),
+            ("rail", "\n▎ Ask anything\n ⠋ 1s > model"),
+            ("empty segments", "\n╰─"),
+            ("right-hand pi", " host > model > ⠋ 1s\n╰─"),
+        ];
+        for (name, composer) in cases {
+            let pane = format!(
+                "Previous output\n\n  ⎋ Une activité quelconque\n{composer}\nPLUGIN_A\nPLUGIN_B\nPLUGIN_C"
+            );
+            assert_eq!(detect_omp_status(&pane), Status::Running, "{name}: {pane}");
+        }
+    }
+
+    fn observed_omp(pane: &str, title: &str, owned: bool) -> Status {
+        super::super::detect::detect("omp", pane, &Observation::new(title, None, owned))
+            .and_then(|d| d.status)
+            .unwrap()
+    }
+
+    #[test]
+    fn omp_interrupt_keys_require_a_loader_margin_or_timer() {
+        for key in [
+            "Ctrl+󰘶 Q",
+            "󰘴 󰘵 Q",
+            "Option+Cmd+PgDn",
+            "Ctrl++",
+            "+",
+            "PgUp",
+            "Ins",
+            "⌫",
+            "q",
+            "I",
+        ] {
+            for (margin, slot, message, expected) in [
+                ("  ", "", "Any activity label", Status::Running),
+                (
+                    " ",
+                    "\n ⠋ 1s > model",
+                    "Any activity label",
+                    Status::Running,
+                ),
+                (" ", "", "Any activity label", Status::Idle),
+                ("  ", "", "to retry", Status::Idle),
+            ] {
+                let pane = format!(
+                    "Output\n\n{margin}{key} {message}\n{slot}\n╰─\n{}",
+                    "PLUGIN\n".repeat(12)
+                );
+                assert_eq!(observed_omp(&pane, "", true), expected, "{pane}");
+            }
+        }
+        assert_eq!(
+            observed_omp("Output\n\n  q Any activity label\n\n╰─\nCAVEMAN", "", false),
+            Status::Idle
+        );
+    }
+
+    #[test]
+    fn omp_native_maintenance_outlives_the_turn_meter_and_retained_error() {
+        let error = "--------------------\n AOE failure\n Dismissed when you send your next message.\n--------------------";
+        for widget in [
+            " ⠋ Retrying (1/2) in 1m… (⎋ to cancel)",
+            " ⠋ Compacting context... (q to cancel)",
+            " 󰔟 Any maintenance label (Ctrl+󰘶 Q to cancel)",
+            " ⠋ Any maintenance label ( to cancel)",
+            " ⠋ Any maintenance label\n (Ctrl+⇧Q to\n cancel)",
+            " ⠋ Retrying (1/2) in 1.5s…",
+            " ⠋ Retrying (1/2) in 2h30m…",
+            " ⠋ Auto server compaction…",
+        ] {
+            for slot in ["", " π > model"] {
+                let pane = format!("{error}\n\n{widget}\n{slot}\n╰─\n{}", "PLUGIN\n".repeat(12));
+                assert_eq!(
+                    observed_omp(&pane, "", true),
+                    Status::Running,
+                    "{widget}: {slot}"
+                );
+                assert_eq!(
+                    observed_omp(&pane, "", false),
+                    Status::Idle,
+                    "{widget}: unowned"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn omp_native_error_caption_survives_wrapping_clipping_and_footer_rows() {
+        for composer in [
+            " pi > model\n╰─",
+            "╭── pi > model ──╮\n╰────────────────╯",
+            "+-- pi > model --+\n+----------------+",
+            "────────────────────\n❯\n────────────────────\n pi > model",
+            "────────────────────\nAsk anything\n────────────────────\n pi > model",
+            "────────────────────\n❯\n pi > model",
+            "❯ Ask anything\n pi > model",
+            "▐ Ask anything ▌\n pi > model",
+            "▎ Ask anything\n pi > model",
+        ] {
+            for opener in ["--------------------\n AOE failure", "continued failure"] {
+                let pane = format!(
+                    "{opener}\n Dismissed when you\n send your next\n message.\n--------------------\n\n{composer}\n{}",
+                    "PLUGIN\n".repeat(12)
+                );
+                assert_eq!(
+                    observed_omp(&pane, "π > Task", true),
+                    Status::Error,
+                    "{composer}"
+                );
+                assert_eq!(
+                    observed_omp(&pane, "π > Task", false),
+                    Status::Idle,
+                    "{composer}: unowned"
+                );
+            }
+        }
+        assert_eq!(
+            observed_omp(
+                "Unknown editor\nDismissed when you send your next message.",
+                "",
+                false
+            ),
+            Status::Error
+        );
+    }
+
+    #[test]
+    fn omp_empty_working_messages_keep_the_widget_boundary() {
+        for working in ["  ⎋", "  󱊷", "  Esc", "  Ctrl+X", "  q"] {
+            let pane = format!("Output\n\n{working}\n\n╰─\nPLUGIN_A\nPLUGIN_B\nPLUGIN_C");
+            assert_eq!(observed_omp(&pane, "", true), Status::Running, "{working}");
+        }
+        for widget in ["Unknown widget", "CUSTOM WIDGET"] {
+            let pane = format!("Output\n\n  Esc Earlier activity\n\n{widget}\n\n╰─\nPLUGIN");
+            assert_eq!(observed_omp(&pane, "", true), Status::Idle, "{widget}");
+        }
+    }
+
+    #[test]
+    fn omp_passive_widget_keys_do_not_supply_working_controls() {
+        for widget in [
+            "I am done.",
+            "- Everything is done.",
+            "Enter the meeting notes",
+        ] {
+            for margin in ["", " "] {
+                let pane =
+                    format!("Output\n\n  Esc Earlier work\n\n{margin}{widget}\n\n╰─\nCAVEMAN");
+                assert_eq!(observed_omp(&pane, "", true), Status::Idle, "{pane}");
+            }
+        }
+    }
+
+    #[test]
+    fn omp_box_drafts_cannot_supply_modal_controls() {
+        for composer in [
+            "╭────────────────────╮\n│ Normal draft       │\n│ Enter submit · Esc cancel │\n╰─ Other draft      ─╯",
+            "╭────────────────────╮\n│ Normal draft       │\n│ Enter submit · Esc cancel │\n╰─                  ─╯",
+            "╭────────────────────╮\n│ Enter submit · Esc cancel │\n│ IME draft\n╰────────────────────╯",
+            "╭────────────────────╮\n│ Enter submit · Esc cancel │\n│ \n╰────────────────────╯",
+        ] {
+            for (title, expected) in [("", Status::Idle), ("π ⠋ Task", Status::Running)] {
+                assert_eq!(
+                    observed_omp(&format!("{composer}\nCAVEMAN"), title, true),
+                    expected,
+                    "{composer}: {title}"
+                );
+            }
+        }
+        let dialog = "╭────────────────────╮\n│ >                  │\n│ ⏎ submit  ⎋ cancel │\n│                    │\n╰────────────────────╯\nCAVEMAN";
+        assert_eq!(observed_omp(dialog, "", true), Status::Waiting);
+    }
+
+    #[test]
+    fn omp_title_supplements_missing_screen_evidence_without_inventing_attention() {
+        for (title, expected) in [
+            ("π ⠋ Task", Status::Running),
+            ("π ● Task", Status::Running),
+            ("π / Task", Status::Running),
+            ("π : Task", Status::Running),
+            ("π ⠋", Status::Running),
+            ("π: Task", Status::Idle),
+            ("π ! Task", Status::Idle),
+            ("π > Task", Status::Idle),
+            ("π ⠋not-a-frame", Status::Idle),
+            ("Other application", Status::Idle),
+        ] {
+            assert_eq!(
+                observed_omp("Custom editor\nPLUGIN", title, true),
+                expected,
+                "{title}"
+            );
+        }
+        assert_eq!(
+            observed_omp("Custom editor", "π ⠋ Task", false),
+            Status::Idle
+        );
+        let pane = format!(
+            "Output\n\n  Esc Busy\n ⠋ 1s > model\n╰─\n{}",
+            "PLUGIN\n".repeat(12)
+        );
+        assert_eq!(observed_omp(&pane, "π ⠋ Task", false), Status::Idle);
+    }
+
+    #[test]
+    fn omp_stock_dialogs_outrank_working_titles_even_when_clipped() {
+        for controls in [
+            "⏎ submit  ⎋ cancel",
+            "󰌑 submit  󱊷 cancel",
+            "Enter submit  Esc cancel",
+            "Ctrl+Q/Ctrl+Enter submit  Esc cancel  Ctrl+G external editor",
+            "Up/Down navigate  Enter select  Esc cancel",
+            "Enter select · n note · Up/Down move · Esc cancel · Alt+H hide",
+            "Esc to paste inline",
+        ] {
+            let pane = format!(
+                "Output\n\n  Esc Busy\n╭─ Question ─────╮\n│ > Proceed     │\n│   Stop        │\n│ {controls} │\n╰───────────────╯\n{}",
+                "PLUGIN\n".repeat(12)
+            );
+            assert_eq!(
+                observed_omp(&pane, "π ⠋ Task", true),
+                Status::Waiting,
+                "{controls}"
+            );
+        }
+        let clipped = format!("│ continued input │\n│ Ctrl+Q/Ctrl+Enter submit  Esc cancel │\n│                 │\n╰─────────────────╯\n{}", "PLUGIN\n".repeat(12));
+        assert_eq!(observed_omp(&clipped, "π ⠋ Task", true), Status::Waiting);
+    }
+
+    #[test]
+    fn omp_hidden_ask_stays_pending_until_independent_work_resumes() {
+        for hidden in [
+            "Ask hidden: Continue? · Alt+H/Enter show · Esc cancel",
+            "Ask (60s) hidden: ……",
+            "Ask hidden: Continue? · Finish or clear the current prompt to answer · Alt+J show · Esc cancel",
+        ] {
+            for draft in ["", "\n ⠋ 1s > model\n╰─ Draft"] {
+                let pane = format!("Output\n\n  Esc Busy\n{hidden}{draft}\nPLUGIN");
+                assert_eq!(observed_omp(&pane, "π ⠋ Task", true), Status::Waiting, "{pane}");
+                assert_eq!(observed_omp(&pane, "π: Task", true), Status::Waiting, "{pane}");
+            }
+            let resumed = format!("{hidden}\n\n  Esc New work\n ⠋ 2s > model\n╰─\nPLUGIN");
+            assert_eq!(observed_omp(&resumed, "", true), Status::Running);
+            let footer = format!(" pi > model\n╰─\n{hidden}");
+            assert_eq!(observed_omp(&footer, "", true), Status::Idle);
+            let draft = format!(" pi > model\n╰─ {hidden}\nPLUGIN");
+            assert_eq!(observed_omp(&draft, "", true), Status::Idle);
+        }
+    }
+
+    #[test]
+    fn omp_draft_data_and_passive_retry_hints_do_not_report_activity_or_errors() {
+        for draft in [
+            " pi > model\n╰─ Error: Retry budget exhausted after 10 retries\n   Esc Working...\n   F5 to retry",
+            "╭── pi > model ──╮\n│ Error: Retry budget exhausted after 10 retries │\n│ Esc Working... │\n╰─ F5 to retry ─╯",
+            "────────────────────\n❯ Error: Retry budget exhausted after 10 retries\n  Esc Working...\n────────────────────\n pi > model",
+            "────────────────────\n Error: Retry budget exhausted after 10 retries\n Esc Working...\n────────────────────\n pi > model",
+            "❯ Error: Retry budget exhausted after 10 retries\n  Esc Working...\n pi > model",
+            "▐ Error: Retry budget exhausted after 10 retries ▌\n▐ Esc Working... ▌\n pi > model",
+            "▎ Error: Retry budget exhausted after 10 retries\n▎ Esc Working...\n pi > model",
+            "❯ Draft\n  Error: Retry budget exhausted after 10 retries\n  Dismissed when you send your next message.\n  ⠋ 1s Working… [esc]",
+        ] {
+            assert_eq!(observed_omp(&format!("{draft}\nPLUGIN"), "", true), Status::Idle, "{draft}");
+        }
+        for hint in [
+            "F5 to retry",
+            "Ctrl+R to retry",
+            "q to retry",
+            "F5\n to retry",
+        ] {
+            let pane = format!("Output\n\n  {hint}\n╰─\nPLUGIN");
+            assert_eq!(observed_omp(&pane, "", true), Status::Idle, "{hint}");
+        }
+    }
+
+    #[test]
+    fn omp_attachment_cards_do_not_hide_activity_or_turn_preview_data_into_state() {
+        let card = "╭── 📄 #1 ───╮\n│  Esc Worki…│\n│⠋ 1s > not …│\n│Error: Retr…│\n│PASTE 000 x…│\n╰ +143 lines ╯";
+        for (prefix, expected) in [
+            ("Output\n\n  ⎋ Any label\n", Status::Running),
+            ("", Status::Idle),
+        ] {
+            let pane = format!("{prefix}{card}\n╰─ 📄 #1\nPLUGIN_A\nPLUGIN_B\nPLUGIN_C");
+            assert_eq!(observed_omp(&pane, "", true), expected, "{pane}");
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn omp_configured_rules_keep_original_draft_input_and_authoritative_nonmatches() {
+        const PROFILE: &str = "omp-configured-observation-test";
+        let _registry = super::super::status_rules::ProfileRegistryGuard::take(PROFILE);
+        let mut config = crate::session::Config::default();
+        config
+            .agents
+            .entry("omp".to_owned())
+            .or_default()
+            .status_rules = vec![crate::session::config::StatusRule {
+            status: crate::agents::HookStatus::Waiting,
+            contains: Some("DEPLOY".to_owned()),
+            regex: None,
+        }];
+        super::super::status_rules::install_from_config(PROFILE, &config);
+        for (draft, expected) in [
+            ("DEPLOY", Status::Waiting),
+            ("different draft", Status::Idle),
+        ] {
+            let pane = format!("Output\n\n  Esc Busy\n ⠋ 1s > model\n╰─ {draft}\nPLUGIN");
+            let detection = detect_with_rules(
+                PROFILE,
+                "omp",
+                "omp",
+                &pane,
+                &Observation::new("π ⠋ Task", None, true),
+            )
+            .unwrap();
+            assert_eq!(detection.status, Some(expected));
         }
     }
 }

@@ -687,3 +687,164 @@ describe("usePushSubscription shared state and stale writes", () => {
     expect(second.result.current.health).toBe("healthy");
   });
 });
+
+describe("usePushSubscription mutations that outlive their consumers", () => {
+  const WANTED = "aoe.push.wanted";
+
+  it("finishes enable and reconciles a consumer remounted while it was in flight", async () => {
+    noSubscription();
+    const first = await mountAndSettle();
+    const real = fetch;
+    const serverEndpoints = new Set<string>();
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+        const endpoint = init?.body ? (JSON.parse(String(init.body)) as { endpoint?: string }).endpoint : undefined;
+        const response = await real(input, init);
+        if (response.ok && endpoint && String(input).endsWith("/api/push/subscribe")) serverEndpoints.add(endpoint);
+        return response;
+      }),
+    );
+    let finishSubscribe!: () => void;
+    const subscribeStarted = new Promise<void>((started) => {
+      subscribeImpl = () =>
+        new Promise((resolve) => {
+          started();
+          finishSubscribe = () => resolve((currentSub = makeSubscription()));
+        });
+    });
+    let enabling!: Promise<void>;
+    await act(async () => {
+      enabling = first.result.current.enable();
+      await subscribeStarted;
+    });
+    first.unmount();
+    const second = await mountAndSettle();
+    expect(second.result.current.state).toEqual({ kind: "subscribing" });
+
+    await act(async () => {
+      finishSubscribe();
+      await enabling;
+    });
+
+    expect(second.result.current.state).toEqual({ kind: "enabled" });
+    expect(second.result.current.health).toBe("healthy");
+    expect(currentSub).not.toBeNull();
+    expect(localStorage.getItem(WANTED)).toBe("1");
+    expect([...serverEndpoints]).toEqual([currentSub!.endpoint]);
+  });
+
+  it("does not let a refresh registration land after disable removed the subscription", async () => {
+    installFetch(statusWith(serverSub({ registered: false })));
+    const real = fetch;
+    const serverEndpoints = new Set<string>();
+    let release!: () => void;
+    const released = new Promise<void>((r) => (release = r));
+    let postStarted!: () => void;
+    const started = new Promise<void>((r) => (postStarted = r));
+    let held = false;
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = String(input);
+        const endpoint = init?.body ? (JSON.parse(String(init.body)) as { endpoint?: string }).endpoint : undefined;
+        if (url.endsWith("/api/push/subscribe") && !held) {
+          held = true;
+          postStarted();
+          await released;
+        }
+        const resp = await real(input, init);
+        if (endpoint && url.endsWith("/api/push/subscribe")) serverEndpoints.add(endpoint);
+        if (endpoint && url.endsWith("/api/push/unsubscribe")) serverEndpoints.delete(endpoint);
+        return resp;
+      }),
+    );
+    const { result } = renderHook(() => usePushSubscription());
+    await act(async () => {
+      await new Promise((r) => setTimeout(r, 0));
+      await started;
+    });
+
+    let disabling!: Promise<void>;
+    await act(async () => {
+      disabling = result.current.disable();
+    });
+    await act(async () => {
+      release();
+      await disabling;
+    });
+
+    expect(currentSub).toBeNull();
+    expect([...serverEndpoints]).toEqual([]);
+    expect(localStorage.getItem(WANTED)).toBeNull();
+    expect(result.current.state).toEqual({ kind: "off" });
+    expect(result.current.health).toBe("not-wanted");
+  });
+
+  it("waits for every overlapping refresh registration before disable unsubscribes", async () => {
+    installFetch(statusWith(serverSub({ registered: false })));
+    const real = fetch;
+    const serverEndpoints = new Set<string>();
+    const events: string[] = [];
+    const posts: { release: () => void; committed: Promise<void> }[] = [];
+    const waiters: { count: number; resolve: () => void }[] = [];
+    const postsStarted = (count: number) =>
+      posts.length >= count ? Promise.resolve() : new Promise<void>((resolve) => waiters.push({ count, resolve }));
+    let unsubscribed!: () => void;
+    const unsubscribeDone = new Promise<void>((r) => (unsubscribed = r));
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = String(input);
+        const endpoint = init?.body ? (JSON.parse(String(init.body)) as { endpoint?: string }).endpoint : undefined;
+        if (url.endsWith("/api/push/subscribe")) {
+          const label = posts.length === 0 ? "A" : "B";
+          let release!: () => void;
+          let commit!: () => void;
+          const held = new Promise<void>((r) => (release = r));
+          posts.push({ release, committed: new Promise<void>((r) => (commit = r)) });
+          waiters.filter((w) => posts.length >= w.count).forEach((w) => w.resolve());
+          await held;
+          const resp = await real(input, init);
+          serverEndpoints.add(endpoint!);
+          events.push(`commit ${label}`);
+          commit();
+          return resp;
+        }
+        const resp = await real(input, init);
+        if (endpoint && url.endsWith("/api/push/unsubscribe")) {
+          serverEndpoints.delete(endpoint);
+          events.push("unsubscribe");
+          unsubscribed();
+        }
+        return resp;
+      }),
+    );
+    const { result } = renderHook(() => usePushSubscription());
+    await act(async () => {
+      await postsStarted(1);
+      document.dispatchEvent(new Event("visibilitychange"));
+      await postsStarted(2);
+    });
+
+    let disabling!: Promise<void>;
+    await act(async () => {
+      disabling = result.current.disable();
+    });
+    await act(async () => {
+      posts[1].release();
+      await posts[1].committed;
+      // Without the fix Disable unsubscribes as soon as B settles; with it Disable stays
+      // parked behind A, so the window below elapses with A still held.
+      await Promise.race([unsubscribeDone, new Promise((r) => setTimeout(r, 100))]);
+      posts[0].release();
+      await posts[0].committed;
+      await disabling;
+    });
+
+    expect(events).toEqual(["commit B", "commit A", "unsubscribe"]);
+    expect([...serverEndpoints]).toEqual([]);
+    expect(currentSub).toBeNull();
+    expect(result.current.state).toEqual({ kind: "off" });
+  });
+});

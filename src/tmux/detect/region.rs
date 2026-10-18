@@ -3,16 +3,18 @@
 
 use std::sync::OnceLock;
 
+use super::{omp, Observation, OmpCueState};
+
 /// The pane, sliced lazily once per capture.
 pub(super) struct Screen<'a> {
     /// The most recent [`RECENT_LINES`] non-empty lines.
     recent: Vec<&'a str>,
-    /// A larger explicit bottom window for tall, bounded panels.
-    extended_recent: Vec<&'a str>,
     /// Whether a blank row sat above each recent line.
     blank_before: Vec<bool>,
     osc_title: &'a str,
-    extended_joined: OnceLock<String>,
+    omp: Option<omp::Surface<'a>>,
+    omp_allowed: bool,
+    omp_working_title: bool,
     joined: OnceLock<String>,
     collapsed: OnceLock<String>,
     unstacked: OnceLock<String>,
@@ -24,7 +26,6 @@ pub(super) struct Screen<'a> {
 }
 
 const RECENT_LINES: usize = 30;
-const EXTENDED_REGION_LINES: usize = 40;
 
 /// A landmark line (a turn divider, an input box rule, a banner) that regions
 /// like `after(<name>)` and `above(<name>, n)` resolve through.
@@ -108,6 +109,11 @@ pub(super) enum Region {
     AfterLastRule,
     /// The OSC 0/2 terminal title.
     OscTitle,
+    OmpActivity,
+    OmpDialog,
+    OmpHiddenAsk,
+    OmpWorkingTitle,
+    OmpError,
     /// The `prompt_marker` line and below, else the whole window.
     FromPromptMarker,
     BeforePromptMarker,
@@ -147,7 +153,7 @@ impl Region {
                 .trim()
                 .parse()
                 .ok()
-                .filter(|n| (1..=EXTENDED_REGION_LINES).contains(n))
+                .filter(|n| (1..=RECENT_LINES).contains(n))
                 .map(Region::BottomLines);
         }
         Some(match raw {
@@ -158,6 +164,11 @@ impl Region {
             "prompt_box_body" => Region::PromptBoxBody,
             "after_last_horizontal_rule" => Region::AfterLastRule,
             "osc_title" => Region::OscTitle,
+            "omp_activity" => Region::OmpActivity,
+            "omp_dialog" => Region::OmpDialog,
+            "omp_hidden_ask" => Region::OmpHiddenAsk,
+            "omp_working_title" => Region::OmpWorkingTitle,
+            "omp_error" => Region::OmpError,
             "from_prompt_marker" => Region::FromPromptMarker,
             "before_prompt_marker" => Region::BeforePromptMarker,
             _ => return None,
@@ -166,7 +177,7 @@ impl Region {
 }
 
 impl<'a> Screen<'a> {
-    pub(super) fn new(clean_screen: &'a str, osc_title: &'a str) -> Self {
+    pub(super) fn new(clean_screen: &'a str, observation: &Observation<'a>, agent: &str) -> Self {
         let mut non_empty: Vec<&str> = Vec::new();
         let mut blank_before: Vec<bool> = Vec::new();
         let mut after_blank = false;
@@ -178,16 +189,20 @@ impl<'a> Screen<'a> {
             non_empty.push(line);
             blank_before.push(std::mem::take(&mut after_blank));
         }
-        let recent_start = non_empty.len().saturating_sub(RECENT_LINES);
-        let extended_start = non_empty.len().saturating_sub(EXTENDED_REGION_LINES);
+        let omp = (agent == "omp")
+            .then(|| omp::Surface::new(clean_screen, &mut non_empty, &blank_before));
+        let start = non_empty.len().saturating_sub(RECENT_LINES);
+        non_empty.drain(..start);
+        blank_before.drain(..start);
         Self {
-            recent: non_empty[recent_start..].to_vec(),
-            extended_recent: non_empty[extended_start..].to_vec(),
-            blank_before: blank_before[recent_start..].to_vec(),
-            osc_title,
+            recent: non_empty,
+            blank_before,
+            osc_title: observation.title,
+            omp,
+            omp_allowed: observation.allow_live_cues,
+            omp_working_title: agent == "omp" && observation.omp_cues() == OmpCueState::Working,
             joined: OnceLock::new(),
             collapsed: OnceLock::new(),
-            extended_joined: OnceLock::new(),
             unstacked: OnceLock::new(),
             above_input_box: OnceLock::new(),
             prompt_box_body: OnceLock::new(),
@@ -213,22 +228,12 @@ impl<'a> Screen<'a> {
                 .unstacked
                 .get_or_init(|| unstack(&self.recent, &self.blank_before)),
             Region::BottomLines(n) => {
-                let lines = if n > RECENT_LINES {
-                    &self.extended_recent
-                } else {
-                    &self.recent
-                };
-                let joined = if n > RECENT_LINES {
-                    self.extended_joined
-                        .get_or_init(|| self.extended_recent.join("\n"))
-                } else {
-                    self.joined()
-                };
-                let start = lines.len().saturating_sub(n);
+                let joined = self.joined();
+                let start = self.recent.len().saturating_sub(n);
                 if start == 0 {
                     return std::borrow::Cow::Borrowed(joined);
                 }
-                let skipped: usize = lines[..start].iter().map(|l| l.len() + 1).sum();
+                let skipped: usize = self.recent[..start].iter().map(|l| l.len() + 1).sum();
                 &joined[skipped..]
             }
             Region::AboveInputBox => self
@@ -245,6 +250,20 @@ impl<'a> Screen<'a> {
                 .after_last_rule
                 .get_or_init(|| self.compute_after_last_rule()),
             Region::OscTitle => self.osc_title,
+            Region::OmpActivity | Region::OmpDialog | Region::OmpHiddenAsk => self
+                .omp_fragment(region)
+                .filter(|_| self.omp_allowed)
+                .map_or("", |fragment| fragment.text),
+            Region::OmpWorkingTitle => {
+                if self.omp_working_title {
+                    self.osc_title
+                } else {
+                    ""
+                }
+            }
+            Region::OmpError => self
+                .omp_fragment(region)
+                .map_or("", |fragment| fragment.text),
             Region::FromPromptMarker => {
                 self.from_marker
                     .get_or_init(|| match self.marker_index(prompt_marker) {
@@ -289,6 +308,26 @@ impl<'a> Screen<'a> {
                 );
             }
         })
+    }
+
+    fn omp_fragment(&self, region: Region) -> Option<&omp::Fragment<'a>> {
+        let surface = self.omp.as_ref()?;
+        match region {
+            Region::OmpActivity => Some(&surface.activity),
+            Region::OmpDialog => Some(&surface.dialog),
+            Region::OmpHiddenAsk => Some(&surface.hidden_ask),
+            Region::OmpError => Some(if self.omp_allowed && !surface.error.text.is_empty() {
+                &surface.error
+            } else {
+                &surface.legacy_error
+            }),
+            _ => None,
+        }
+    }
+
+    pub(super) fn region_bottom_offset(&self, region: Region) -> usize {
+        self.omp_fragment(region)
+            .map_or(0, |fragment| fragment.bottom_offset)
     }
 
     fn marker_index(&self, prompt_marker: &[regex::Regex]) -> Option<usize> {
@@ -404,19 +443,16 @@ pub(super) fn collapse_ascii_whitespace(text: &str) -> String {
 }
 #[cfg(test)]
 mod tests {
-    use super::{Region, EXTENDED_REGION_LINES};
+    use super::{Region, RECENT_LINES};
 
     #[test]
     fn bottom_lines_region_rejects_values_outside_capture_window() {
         assert_eq!(
-            Region::parse(&format!("bottom_non_empty_lines({EXTENDED_REGION_LINES})")),
-            Some(Region::BottomLines(EXTENDED_REGION_LINES))
+            Region::parse(&format!("bottom_non_empty_lines({RECENT_LINES})")),
+            Some(Region::BottomLines(RECENT_LINES))
         );
         assert_eq!(
-            Region::parse(&format!(
-                "bottom_non_empty_lines({})",
-                EXTENDED_REGION_LINES + 1
-            )),
+            Region::parse(&format!("bottom_non_empty_lines({})", RECENT_LINES + 1)),
             None
         );
         assert_eq!(Region::parse("bottom_non_empty_lines(0)"), None);

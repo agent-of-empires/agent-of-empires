@@ -310,7 +310,7 @@ fn strip_display_delimiter(raw: &str) -> &str {
     raw.strip_suffix('\n').unwrap_or(raw)
 }
 
-fn pane_start_command_is_protected(session_name: &str) -> bool {
+pub(crate) fn pane_start_command_is_protected(session_name: &str) -> bool {
     display_first_pane(session_name, "#{pane_start_command}")
         .is_some_and(|command| command.contains(PANE_ENV_FILE_PREFIX))
 }

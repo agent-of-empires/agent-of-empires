@@ -103,7 +103,8 @@ describe("SessionWizard structured view payload", () => {
 
   it("sends profile-resolved agent model and effort defaults", async () => {
     vi.mocked(fetchSettings).mockResolvedValueOnce({
-      session: { default_tool: "opencode", acp_defaults: { opencode: { model: "openai/gpt-5.5", effort: "high" } } },
+      session: { default_tool: "opencode" },
+      acp: { acp_defaults: { opencode: { model: "openai/gpt-5.5", effort: "high" } } },
       sandbox: {},
     } as never);
     renderWizard({ path: "/tmp/proj" });

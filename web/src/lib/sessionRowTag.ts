@@ -1,5 +1,6 @@
 import { createContext, useContext } from "react";
 
+import type { SettingsResponse } from "./api";
 import type { Workspace, WorkspaceRepoSummary } from "./types";
 
 export type SessionRowTagMode = "none" | "auto" | "profile" | "sandbox" | "branch";
@@ -16,10 +17,8 @@ const BRANCH_TAG_WIDTH = 12;
 
 export const SessionRowTagContext = createContext<SessionRowTagMode>(DEFAULT_ROW_TAG_MODE);
 
-export function parseSessionRowTagMode(settings: Record<string, unknown> | null | undefined): SessionRowTagMode {
-  const session = settings?.session;
-  if (!session || typeof session !== "object") return DEFAULT_ROW_TAG_MODE;
-  const raw = (session as Record<string, unknown>).row_tag;
+export function parseSessionRowTagMode(settings: SettingsResponse | null | undefined): SessionRowTagMode {
+  const raw = settings?.session?.row_tag;
   switch (raw) {
     case "none":
     case "auto":

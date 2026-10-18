@@ -1,6 +1,7 @@
 import type { AgentLifecycleInfo } from "./agentProfiles";
 import { notifySettingsChanged } from "./settingsEvents";
 import { clientFormFactor } from "./formFactor";
+import type { SchemaSettings } from "./generated/settingsKeys";
 import type {
   SessionResponse,
   RichDiffFilesResponse,
@@ -8,6 +9,7 @@ import type {
   AgentInfo,
   ProfileInfo,
   ProfileSettingsResponse,
+  HooksOverride,
   BrowseResponse,
   GroupInfo,
   ProjectInfo,
@@ -267,15 +269,14 @@ export function sessionRawFileUrl(id: string, filePath: string): string {
 
 // --- Settings ---
 
-export interface SettingsResponse {
-  theme?: {
-    idle_decay_minutes?: number;
-  };
+/** Sections and fields come from the server schema (`SchemaSettings`, generated), so a name the
+ *  server lacks fails to compile. `app_state`, `hooks` and plugin sections are outside the schema. */
+export type SettingsResponse = SchemaSettings & {
   app_state?: {
     has_seen_web_tour?: boolean;
   };
-  [key: string]: unknown;
-}
+  hooks?: HooksOverride;
+} & { [K in `plugin:${string}`]?: Record<string, unknown> };
 
 export interface SystemHealthAgent {
   id: string;

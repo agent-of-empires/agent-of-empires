@@ -216,6 +216,24 @@ regex = "esc to interrupt|thinking"
 
 Each rule sets `status` (`running`, `waiting`, `idle`, `error`) and exactly one of `contains` (case-insensitive substring) or `regex` (Rust regex; use `(?i)` for case-insensitive). Rules are matched in order against the ANSI-stripped pane; first match wins and no match reports `idle`, so put the specific states before broad ones. Rules outrank `agent_detect_as`, a built-in detector of the same name, and a status hook the agent writes. Invalid rules are skipped with a warning and take effect on the next config resolve.
 
+### OMP terminal status
+
+Built-in OMP detection reads the visible pane and locates activity, blocking dialogs,
+and pinned errors relative to the current composer. Extension status rows, including
+plugin badges, do not need agent-specific matching rules.
+Editable composer text is excluded from dialog controls, even without status segments.
+
+A recognized working terminal title supplements visible controls; it does not
+override a blocking dialog or pinned error. Visible retry and compaction controls
+can indicate activity even when the turn timer is stopped. Disabling OMP title
+updates or terminal program-status reports does not disable visible-control detection.
+
+Custom editors or widgets can hide or replace these controls. Compact working rows
+without a recognizable turn timer or working title can look identical to passive
+widget text; an ambiguous row does not supply a positive working cue. Use the
+explicit status rules above for such interfaces; they remain authoritative,
+including their no-match behavior.
+
 ### Running a custom agent in the structured view
 
 Give the agent an ACP launch command; it must speak the [Agent Client Protocol](https://agentclientprotocol.com).

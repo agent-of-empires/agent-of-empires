@@ -74,7 +74,7 @@ test.describe("Desktop live terminal input", () => {
     await expect(pane).not.toHaveAttribute("data-pane-focused", "true");
   });
 
-  test("Ctrl+Shift+C copies the selection without ^C, and Ctrl+V pastes through tmux without ^V", async ({ page }) => {
+  test("Ctrl+Shift+C copies without ^C, and native paste reaches tmux without ^V", async ({ page }) => {
     // #2384: Ctrl+Shift+C copies the DOM selection; the focused hidden input would copy nothing, and Ctrl+C stays SIGINT.
     const handle = await mockTerminalApis(page);
     await page.context().grantPermissions(["clipboard-read", "clipboard-write"]);
@@ -118,13 +118,13 @@ test.describe("Desktop live terminal input", () => {
     const sentSigint = handle.liveMessages.slice(before).some((m) => m.toString("utf8") === "\x03");
     expect(sentSigint).toBe(false);
 
-    // #2384: Ctrl+V falls through to the native paste event instead of sending ^V.
+    // Native paste must reach the paste handler, not send ^V.
     await page.evaluate(() => navigator.clipboard.writeText("pasted text"));
     await page.evaluate(() => window.getSelection()?.removeAllRanges());
     await page.locator("[data-live-terminal]").first().click();
     await expect(page.locator('textarea[aria-label="Live terminal input"]').first()).toBeFocused();
     const beforePaste = handle.liveMessages.length;
-    await page.keyboard.press("Control+v");
+    await page.keyboard.press("ControlOrMeta+v");
     await expect
       .poll(() => handle.liveMessages.slice(beforePaste).map((m) => m.toString("utf8")))
       .toContainEqual(JSON.stringify({ type: "paste", text: "pasted text", submit: false }));

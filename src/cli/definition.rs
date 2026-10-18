@@ -259,7 +259,8 @@ pub enum Commands {
     /// moves its own agent store when it starts; use this to move every
     /// eligible store at once instead. Trashed and archived sessions are
     /// skipped; each moves when it is started, or restore or unarchive it
-    /// and run this again.
+    /// and run this again. Refuses while the aoe serve daemon runs; stop it
+    /// with `aoe serve --stop` first.
     Migrate,
 
     /// Generate shell completions

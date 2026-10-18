@@ -257,7 +257,9 @@ fn test_delete_selected_group_updates_groups_field() {
         .group_exists("work"));
 
     // Delete the group (this moves sessions to default)
-    env.view.delete_selected_group().unwrap();
+    env.view
+        .delete_selected_group(&crate::tui::dialogs::GroupDeleteOptions::default())
+        .unwrap();
 
     // Verify the group is removed from group_tree
     assert!(!env
@@ -268,19 +270,14 @@ fn test_delete_selected_group_updates_groups_field() {
         .group_exists("work"));
 
     // Verify self.groups is updated (this is the bug fix)
-    let all_groups = env.view.all_groups();
-    let group_paths: Vec<_> = all_groups.iter().map(|g| g.path.as_str()).collect();
+    let all_groups = env.view.all_group_paths();
+    let group_paths: Vec<_> = all_groups.iter().map(String::as_str).collect();
     assert!(!group_paths.contains(&"work"));
     assert!(!group_paths.contains(&"work/projects"));
 
     // A reload from storage agrees with the in-memory tree.
     env.view.reload().unwrap();
-    let reloaded_groups: Vec<_> = env
-        .view
-        .all_groups()
-        .iter()
-        .map(|g| g.path.clone())
-        .collect();
+    let reloaded_groups = env.view.all_group_paths();
     let tree_groups: Vec<_> = env
         .view
         .group_trees
@@ -291,6 +288,96 @@ fn test_delete_selected_group_updates_groups_field() {
         .map(|g| g.path.clone())
         .collect();
     assert_eq!(reloaded_groups, tree_groups);
+}
+
+#[test]
+#[serial]
+fn deleting_subgroups_moves_members_to_the_selected_destination() {
+    for (group_path, choose_default, target) in [
+        ("work/projects", false, "work"),
+        ("work/projects/topic", false, "work/projects"),
+        ("work/projects", true, ""),
+    ] {
+        let (_temp, _guard) = test_home();
+        let parent = group_path.rsplit_once('/').unwrap().0;
+        let nested_path = format!("{group_path}/nested");
+        let near_prefix = format!("{group_path}-other");
+        let mut archived = instance_in("archived", "/tmp/archived", &nested_path);
+        archived.archive();
+        let mut trashed = instance_in("trashed", "/tmp/trashed", group_path);
+        trashed.trash();
+        let instances = [
+            instance_in("direct", "/tmp/direct", group_path),
+            instance_in("nested", "/tmp/nested", &nested_path),
+            archived,
+            trashed,
+            instance_in("near-prefix", "/tmp/near-prefix", &near_prefix),
+            instance_in("parent", "/tmp/parent", parent),
+        ];
+        seed_profile("alpha", &instances);
+        seed_profile(
+            "beta",
+            &[instance_in("other-profile", "/tmp/other", group_path)],
+        );
+        let mut view = test_view(None);
+        view.group_by = crate::session::config::GroupByMode::Manual;
+        view.flat_items = view.build_flat_items();
+        view.cursor = view
+            .flat_items
+            .iter()
+            .position(|item| {
+                matches!(item, Item::Group { path, profile, .. }
+                if path == group_path && profile.as_deref() == Some("alpha"))
+            })
+            .expect("subgroup in alpha");
+        view.update_selected();
+        view.open_delete_for_selected();
+        assert!(view.group_delete_options_dialog.is_some());
+        if choose_default {
+            view.handle_key(key(KeyCode::Tab), None);
+            view.handle_key(key(KeyCode::Char(' ')), None);
+        }
+        view.handle_key(key(KeyCode::Enter), None);
+        assert!(view.group_delete_options_dialog.is_none());
+        view.reload().unwrap();
+
+        let (persisted, groups) = Storage::open_unwatched("alpha")
+            .unwrap()
+            .load_with_groups()
+            .unwrap();
+        assert_eq!(persisted.len(), instances.len());
+        for original in &instances {
+            let moved = original.group_path == group_path || original.group_path == nested_path;
+            let expected = if moved { target } else { &original.group_path };
+            let stored = persisted.iter().find(|i| i.id == original.id).unwrap();
+            assert_eq!(
+                stored.group_path, expected,
+                "{}: {group_path}",
+                stored.title
+            );
+            assert_eq!(stored.archived_at, original.archived_at);
+            assert_eq!(stored.trashed_at, original.trashed_at);
+            assert_eq!(
+                view.get_instance(&original.id).unwrap().group_path,
+                expected
+            );
+        }
+        assert!(groups.iter().any(|g| g.path == parent));
+        assert!(groups.iter().any(|g| g.path == near_prefix));
+        assert!(!groups
+            .iter()
+            .any(|g| g.path == group_path || g.path == nested_path));
+        let tree = view.group_trees.get("alpha").unwrap();
+        assert!(!tree.group_exists(group_path));
+        assert!(!tree.group_exists(&nested_path));
+
+        let (other_instances, other_groups) = Storage::open_unwatched("beta")
+            .unwrap()
+            .load_with_groups()
+            .unwrap();
+        assert_eq!(other_instances[0].group_path, group_path);
+        assert!(other_groups.iter().any(|g| g.path == group_path));
+    }
 }
 
 /// Archiving a manual group archives every session under it, including
@@ -536,7 +623,7 @@ fn test_delete_group_with_sessions_updates_groups_field() {
     assert_eq!(view.selected_group_profile.as_deref(), Some("test"));
 
     let options = GroupDeleteOptions {
-        delete_sessions: true,
+        action: crate::tui::dialogs::GroupDeleteAction::DeleteSessions,
         delete_worktrees: false,
         delete_branches: false,
         delete_containers: false,
@@ -3028,5 +3115,72 @@ fn test_a_hidden_destination_falls_back_to_the_header_in_its_own_profile() {
         view.selected_group_profile.as_deref(),
         Some("beta"),
         "the header the selection lands on is in the moving row's own profile"
+    );
+}
+
+#[test]
+#[serial]
+fn same_named_groups_across_profiles_are_tagged_and_listed_once() {
+    use crate::session::{GroupTree, Item};
+
+    let temp = TempDir::new().unwrap();
+    let _guard = setup_test_home(&temp);
+
+    for (profile, groups) in [("alpha", &["work", "solo"][..]), ("beta", &["work"][..])] {
+        let insts: Vec<Instance> = groups
+            .iter()
+            .map(|g| {
+                let mut i = Instance::new(&format!("{profile}-{g}"), "/tmp/x");
+                i.group_path = g.to_string();
+                i
+            })
+            .collect();
+        let tree = GroupTree::new_with_groups(&insts, &[]);
+        Storage::new_unwatched(profile)
+            .unwrap()
+            .update(|i, g| {
+                *i = insts.clone();
+                *g = tree.get_all_groups();
+                Ok(())
+            })
+            .unwrap();
+    }
+
+    let tools = AvailableTools::with_tools(&["claude"]);
+    let mut view =
+        HomeView::new_for_test(None, tools, crate::file_watch::FileWatchService::noop()).unwrap();
+    view.group_by = crate::session::config::GroupByMode::Manual;
+    view.flat_items = view.build_flat_items();
+
+    assert_eq!(view.all_group_paths(), vec!["solo", "work"]);
+
+    view.open_new_session_dialog();
+    let dialog = view.new_dialog.as_mut().expect("new session dialog");
+    dialog.focus_group();
+    dialog.handle_key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL));
+    assert_eq!(dialog.group_picker_items(), vec!["solo", "work"]);
+    view.new_dialog = None;
+
+    let theme = crate::tui::styles::Theme::default();
+    let labels: Vec<String> = view
+        .flat_items
+        .iter()
+        .filter(|item| matches!(item, Item::Group { .. }))
+        .map(|item| {
+            view.render_item_line(item, false, false, &theme, 200, false)
+                .spans
+                .iter()
+                .map(|s| s.content.as_ref())
+                .collect::<String>()
+        })
+        .collect();
+    let tagged = |tag: &str| labels.iter().filter(|l| l.contains(tag)).count();
+    assert_eq!(tagged("[alpha] work (1)"), 1, "{labels:?}");
+    assert_eq!(tagged("[beta] work (1)"), 1, "{labels:?}");
+    assert!(
+        labels
+            .iter()
+            .any(|l| l.contains("solo (1)") && !l.contains('[')),
+        "{labels:?}"
     );
 }

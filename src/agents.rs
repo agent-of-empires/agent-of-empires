@@ -123,6 +123,14 @@ pub enum SessionCaptureContext {
     ManagedExclusiveStore,
 }
 
+impl SessionCaptureContext {
+    /// Whether an id the agent mints after launch is captured authoritatively.
+    /// `Preassigned` names an id fixed before launch, so it proves nothing here.
+    const fn captures_minted_child(self) -> bool {
+        matches!(self, Self::PaneScoped | Self::ManagedExclusiveStore)
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SessionCaptureSpec {
     pub backend: SessionCaptureBackend,
@@ -161,6 +169,9 @@ pub enum ForkStrategy {
     CodexFork,
     PiFork,
     Flag(&'static str),
+    /// A root flag whose value is the parent id, with no resume flag; the agent
+    /// mints the child, so AoE can fork only where it can capture that id.
+    ValueFlag(&'static str),
     /// The agent's store mints the child over its own API before the launch, so
     /// the session that follows is still the interactive one.
     ServeFork,
@@ -179,7 +190,7 @@ impl ForkStrategy {
     /// pre-pinned for the fork a placeholder to drop. A root fork flag never
     /// carries that id, so the agent mints one of its own.
     pub(crate) const fn mints_child(self) -> bool {
-        matches!(self, Self::CodexFork | Self::Flag(_))
+        matches!(self, Self::CodexFork | Self::Flag(_) | Self::ValueFlag(_))
     }
 
     /// The mechanism the installed build understands. A strategy that spans two
@@ -961,8 +972,7 @@ pub const AGENTS: &[AgentDef] = &[
             SessionCaptureContext::Unsupported,
             SessionCaptureContext::ManagedExclusiveStore,
         ),
-        // Prime exposes no fork surface, so the parent id has nothing to carry.
-        fork_strategy: ForkStrategy::Unsupported,
+        fork_strategy: ForkStrategy::ValueFlag("--fork"),
         ..agent(
             "prime-agent",
             "prime-agent",
@@ -972,6 +982,24 @@ pub const AGENTS: &[AgentDef] = &[
 ];
 
 impl AgentDef {
+    /// Whether a fork can run in this context. A `ValueFlag` fork leaves the
+    /// child id to the agent, so it needs a capture context that can read it.
+    pub fn can_fork_in(&self, sandboxed: bool) -> bool {
+        if !matches!(self.fork_strategy, ForkStrategy::ValueFlag(_)) {
+            return true;
+        }
+        self.session_support
+            .and_then(|support| support.capture)
+            .is_some_and(|capture| {
+                if sandboxed {
+                    capture.sandbox
+                } else {
+                    capture.host
+                }
+                .captures_minted_child()
+            })
+    }
+
     pub fn lifecycle_label(&self) -> Option<&'static str> {
         match self.lifecycle {
             AgentLifecycle::Active => None,

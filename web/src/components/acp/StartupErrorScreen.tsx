@@ -32,7 +32,7 @@ export function StartupErrorScreen({ detail, sessionId, isSandboxed = false }: P
     let alive = true;
     fetchSettings().then((s) => {
       if (alive) {
-        setAllowInstall(Boolean((s as { acp?: { allow_agent_install?: boolean } } | null)?.acp?.allow_agent_install));
+        setAllowInstall(s?.acp?.allow_agent_install === true);
       }
     });
     return () => {

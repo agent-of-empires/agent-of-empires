@@ -10,6 +10,40 @@ max_depth = 12
 
 # OMP stacks live markers, so positional rules compete by screen position.
 
+[[rules]]
+id = "current_hidden_ask"
+state = "waiting"
+priority = 980
+region = "omp_hidden_ask"
+visible = true
+regex = ['\S']
+
+[[rules]]
+id = "current_activity"
+state = "running"
+priority = 970
+positional = true
+region = "omp_activity"
+visible = true
+regex = ['\S']
+
+[[rules]]
+id = "current_dialog"
+state = "waiting"
+priority = 970
+positional = true
+region = "omp_dialog"
+visible = true
+regex = ['\S']
+
+[[rules]]
+id = "osc_title_working"
+state = "running"
+priority = 969
+region = "omp_working_title"
+visible = true
+regex = ['\S']
+
 # The spinner-free Processing footer also carries a live interrupt token.
 [[rules]]
 id = "active_interrupt_hint"
@@ -202,9 +236,9 @@ id = "banner_dismissal"
 state = "error"
 priority = 970
 positional = true
-region = "bottom_non_empty_lines(6)"
+region = "omp_error"
 visible = true
-contains = ["dismissed when you send your next message"]
+regex = ['\S']
 
 [[rules]]
 id = "retry_exhausted"
@@ -234,32 +268,6 @@ not = [
   { region = "bottom_non_empty_lines(8)", line_regex = ['^\s*(?:╭|\+).*(?:π|\x{f0d57}|pi)\s*>'], not = [
     { line_regex = ['(?i)^\s*(?:╭[─-]*|\+[=-]*)\s*ask\b'] },
   ] },
-]
-
-# OMP's title plus eight detail rows, divider, and footer fit within 12 lines.
-# The editor caps at 18 rows, placing the footer at most 20 lines from bottom;
-# 24 leaves four lines of slack, and the 40-line window includes the whole panel.
-[[rules]]
-id = "tool_approval"
-state = "waiting"
-priority = 970
-positional = true
-region = "bottom_non_empty_lines(40)"
-max_position = 24
-visible = true
-any = [
-  { line_regex = ['^\s*[│|].*approve\s+·.*deny.*[│|]\s*$'] },
-  { line_regex = ['^\s*[│|].*(?:choose\s+·.*select|deny and send\s+·).*[│|]\s*$'], all = [
-    { region = "bottom_non_empty_lines(40)", line_regex = ['^\s*[│|]\s*(?:[\x{276F}\x{f054}>]\s+)?Approve\s*[│|]\s*$'] },
-    { region = "bottom_non_empty_lines(40)", line_regex = ['^\s*[│|]\s*(?:[\x{276F}\x{f054}>]\s+)?Deny(?: and send message)?\s*[│|]\s*$'] },
-  ] },
-]
-all = [
-  { region = "bottom_non_empty_lines(40)", line_regex = ['^\s*╭─+\s*Allow tool:'] },
-]
-not = [
-  { region = "bottom_non_empty_lines(3)", contains_any = ["⟦esc⟧", "⟨esc⟩", "[esc]", "(esc to cancel)"] },
-  { region = "bottom_non_empty_lines(3)", line_regex = ['(?i)^\s*retrying \d+/\d+ (?:in|now):'] },
 ]
 
 [[rules]]
@@ -294,4 +302,3 @@ any = [
   { line_regex = ['(?i)attempt \d+/\d+ \x{b7}'] },
 ]
 
-# A terminal failure banner: omp has stopped and is waiting to be dismissed.

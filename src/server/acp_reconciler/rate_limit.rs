@@ -651,7 +651,7 @@ mod tests {
     }
 
     /// A limit that ended an agent-initiated turn has no prompt to redeliver, so
-    /// the park resumes with a bare `continue` (#4373).
+    /// the park resumes with a bare `continue` once its worker is gone (#4373).
     #[tokio::test]
     #[serial_test::serial]
     async fn agent_initiated_park_installs_a_continue_prompt() {
@@ -682,19 +682,24 @@ mod tests {
             .acp_supervisor
             .hydrate_seqs([(id.to_string(), state.acp_event_store.highest_seq(id))]);
 
-        let outcome = install_rate_limit_continuation(
-            &state,
-            id,
-            state.session_service.prompt_submission(id).await,
-        )
-        .await;
+        let mut attempted: HashSet<String> = [id.to_string()].into();
 
-        assert!(matches!(outcome, ContinuationOutcome::Stands));
+        // A live worker keeps the park: the reaper must not resume over it.
+        state.acp_supervisor.test_insert_worker(id).await;
+        let released = reap_rate_limit_resumes(&state, &mut attempted, &HashSet::new()).await;
+        assert!(released.is_empty() && attempted.contains(id));
+        assert_eq!(pending_turn(&state, id).await, None);
+        assert_eq!(auto_resumed_breadcrumbs(&state, id), 0);
+
+        state.acp_supervisor.test_remove_worker(id).await;
+        let released = reap_rate_limit_resumes(&state, &mut attempted, &HashSet::new()).await;
+        assert!(released.contains(id) && !attempted.contains(id));
         let queued = state.instances.read().await[0]
             .pending_initial_turn
             .as_ref()
             .map(|t| (t.text.clone(), t.synthesized));
         assert_eq!(queued, Some((AGENT_TURN_CONTINUATION.to_string(), true)));
+        assert_eq!(auto_resumed_breadcrumbs(&state, id), 1);
     }
 
     fn auto_resumed_breadcrumbs(state: &AppState, id: &str) -> usize {

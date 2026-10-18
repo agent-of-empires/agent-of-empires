@@ -296,7 +296,8 @@ export function useAcpSession(
   );
 
   // The daemon owns and drains the queue; re-list on connect and at each turn change. The first
-  // list per session migrates rows queued locally before the server owned the queue.
+  // list per session re-sends rows the server never confirmed; a confirmed row missing from the
+  // server was drained and must not be re-created.
   const queueMigratedRef = useRef<Set<string>>(new Set());
   useEffect(() => {
     if (!sessionId || status !== "open") return;
@@ -306,6 +307,7 @@ export function useAcpSession(
         queueMigratedRef.current.add(sessionId);
         for (const q of queuedPromptsRef.current) {
           if (cancelled) return;
+          if (!q.pending) continue;
           await enqueueServerPrompt(sessionId, {
             id: q.id,
             text: q.text,

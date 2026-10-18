@@ -731,6 +731,20 @@ impl NewSessionDialog {
     }
 
     #[cfg(test)]
+    pub fn focus_group(&mut self) {
+        self.focused_field = self.field_indices().group;
+    }
+
+    #[cfg(test)]
+    pub fn group_picker_items(&self) -> Vec<String> {
+        self.group_picker
+            .filtered_items()
+            .into_iter()
+            .cloned()
+            .collect()
+    }
+
+    #[cfg(test)]
     pub fn group_value(&self) -> &str {
         self.group.value()
     }

@@ -7,7 +7,9 @@ use crate::session::{
     GroupMovePlan, Instance, Item, LifecycleOperation, StartBlocked, Status, Storage,
 };
 use crate::tui::deletion_poller::DeletionRequest;
-use crate::tui::dialogs::{DeleteOptions, GroupDeleteOptions, InfoDialog, NewSessionData};
+use crate::tui::dialogs::{
+    DeleteOptions, GroupDeleteAction, GroupDeleteOptions, InfoDialog, NewSessionData,
+};
 use crate::tui::restart_poller::RestartRequest;
 
 use super::HomeView;
@@ -658,19 +660,30 @@ impl HomeView {
         Ok(())
     }
 
-    pub(super) fn delete_selected_group(&mut self) -> anyhow::Result<()> {
+    pub(super) fn delete_selected_group(
+        &mut self,
+        options: &GroupDeleteOptions,
+    ) -> anyhow::Result<()> {
+        if options.action == GroupDeleteAction::DeleteSessions {
+            return self.delete_group_with_sessions(options);
+        }
         if let Some(group_path) = self.selected_group.take() {
+            let target_group = if options.action == GroupDeleteAction::MoveToParent {
+                group_path.rsplit_once('/').map_or("", |(parent, _)| parent)
+            } else {
+                ""
+            };
             let owning_profile = self.selected_group_profile.take();
             let prefix = format!("{}/", group_path);
             let is_member = group_membership(&group_path, &prefix, owning_profile.as_deref());
-            let ids_to_clear: Vec<String> = self
+            let ids_to_move: Vec<String> = self
                 .instances
                 .values()
                 .filter(|i| is_member(i))
                 .map(|i| i.id.clone())
                 .collect();
-            self.bulk_apply_user_action(&ids_to_clear, |inst| {
-                inst.group_path = String::new();
+            self.bulk_apply_user_action(&ids_to_move, |inst| {
+                inst.group_path = target_group.to_string();
             })?;
 
             self.rebuild_group_trees();

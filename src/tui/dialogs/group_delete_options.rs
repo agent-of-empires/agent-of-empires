@@ -9,9 +9,17 @@ use crate::tui::components::checkbox::{checkbox_line, CheckboxStyle};
 use crate::tui::components::hover::{paint_hover_bg, HoverState};
 use crate::tui::styles::Theme;
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum GroupDeleteAction {
+    MoveToParent,
+    #[default]
+    MoveToDefault,
+    DeleteSessions,
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct GroupDeleteOptions {
-    pub delete_sessions: bool,
+    pub action: GroupDeleteAction,
     pub delete_worktrees: bool,
     pub force_delete_worktrees: bool,
     pub delete_branches: bool,
@@ -40,12 +48,20 @@ impl GroupDeleteOptionsDialog {
         has_managed_worktrees: bool,
         has_containers: bool,
     ) -> Self {
+        let action = if group_path.contains('/') {
+            GroupDeleteAction::MoveToParent
+        } else {
+            GroupDeleteAction::MoveToDefault
+        };
         Self {
             group_path,
             session_count,
             has_managed_worktrees,
             has_containers,
-            options: GroupDeleteOptions::default(),
+            options: GroupDeleteOptions {
+                action,
+                ..Default::default()
+            },
             focused_field: 0,
             focusable_rects: Vec::new(),
             hover: HoverState::default(),
@@ -67,20 +83,34 @@ impl GroupDeleteOptionsDialog {
         self.hover.update(col, row, &rects)
     }
 
-    /// Mirror the Space-key branch's per-field toggle / radio logic so a
-    /// click produces byte-identical state changes.
+    fn actions(&self) -> &[GroupDeleteAction] {
+        if self.group_path.contains('/') {
+            &[
+                GroupDeleteAction::MoveToParent,
+                GroupDeleteAction::MoveToDefault,
+                GroupDeleteAction::DeleteSessions,
+            ]
+        } else {
+            &[
+                GroupDeleteAction::MoveToDefault,
+                GroupDeleteAction::DeleteSessions,
+            ]
+        }
+    }
+
     fn toggle_focused_field(&mut self) {
+        if let Some(action) = self.actions().get(self.focused_field).copied() {
+            if action == GroupDeleteAction::DeleteSessions {
+                self.options.action = action;
+            } else {
+                self.options = GroupDeleteOptions {
+                    action,
+                    ..Default::default()
+                };
+            }
+            return;
+        }
         match self.focused_field {
-            0 => {
-                self.options.delete_sessions = false;
-                self.options.delete_worktrees = false;
-                self.options.force_delete_worktrees = false;
-                self.options.delete_branches = false;
-                self.options.delete_containers = false;
-            }
-            1 => {
-                self.options.delete_sessions = true;
-            }
             f if Some(f) == self.worktree_field_index() => {
                 self.options.delete_worktrees = !self.options.delete_worktrees;
                 if !self.options.delete_worktrees {
@@ -101,10 +131,10 @@ impl GroupDeleteOptionsDialog {
     }
 
     fn max_field(&self) -> usize {
-        if !self.options.delete_sessions {
-            return 2; // move(0), delete(1)
+        let mut count = self.actions().len();
+        if self.options.action != GroupDeleteAction::DeleteSessions {
+            return count;
         }
-        let mut count = 2; // move(0), delete(1)
         if self.has_managed_worktrees {
             count += 2; // worktree checkbox + branch checkbox
             if self.options.delete_worktrees {
@@ -118,39 +148,35 @@ impl GroupDeleteOptionsDialog {
     }
 
     fn worktree_field_index(&self) -> Option<usize> {
-        if self.options.delete_sessions && self.has_managed_worktrees {
-            Some(2)
+        if self.options.action == GroupDeleteAction::DeleteSessions && self.has_managed_worktrees {
+            Some(self.actions().len())
         } else {
             None
         }
     }
 
     fn force_field_index(&self) -> Option<usize> {
-        if self.options.delete_sessions
+        if self.options.action == GroupDeleteAction::DeleteSessions
             && self.has_managed_worktrees
             && self.options.delete_worktrees
         {
-            Some(3)
+            Some(self.actions().len() + 1)
         } else {
             None
         }
     }
 
     fn branch_field_index(&self) -> Option<usize> {
-        if self.options.delete_sessions && self.has_managed_worktrees {
-            if self.options.delete_worktrees {
-                Some(4) // after force checkbox
-            } else {
-                Some(3)
-            }
+        if self.options.action == GroupDeleteAction::DeleteSessions && self.has_managed_worktrees {
+            Some(self.actions().len() + 1 + usize::from(self.options.delete_worktrees))
         } else {
             None
         }
     }
 
     fn container_field_index(&self) -> Option<usize> {
-        if self.options.delete_sessions && self.has_containers {
-            let base = 2;
+        if self.options.action == GroupDeleteAction::DeleteSessions && self.has_containers {
+            let base = self.actions().len();
             let mut offset = 0;
             if self.has_managed_worktrees {
                 offset += 2; // worktree + branch
@@ -204,11 +230,12 @@ impl GroupDeleteOptionsDialog {
 
     pub fn render(&mut self, frame: &mut Frame, area: Rect, theme: &Theme) {
         self.focusable_rects.clear();
-        let show_worktree_option = self.options.delete_sessions && self.has_managed_worktrees;
+        let deleting = self.options.action == GroupDeleteAction::DeleteSessions;
+        let show_worktree_option = deleting && self.has_managed_worktrees;
         let show_force_option = show_worktree_option && self.options.delete_worktrees;
-        let show_container_option = self.options.delete_sessions && self.has_containers;
+        let show_container_option = deleting && self.has_containers;
         let dialog_width = 50;
-        let mut dialog_height = 11; // Base height
+        let mut dialog_height = 9 + self.actions().len() as u16;
         if show_worktree_option {
             dialog_height += 2; // worktree + branch checkboxes
             if show_force_option {
@@ -226,9 +253,8 @@ impl GroupDeleteOptionsDialog {
         let mut constraints = vec![
             Constraint::Length(2), // Group info
             Constraint::Length(1), // Spacer
-            Constraint::Length(1), // Move option
-            Constraint::Length(1), // Delete option
         ];
+        constraints.extend(self.actions().iter().map(|_| Constraint::Length(1)));
         if show_worktree_option {
             constraints.push(Constraint::Length(1)); // Worktree checkbox
             if show_force_option {
@@ -266,44 +292,35 @@ impl GroupDeleteOptionsDialog {
         ]);
         frame.render_widget(Paragraph::new(info_line), chunks[0]);
 
-        // Move sessions option
-        let move_focused = self.focused_field == 0;
-        let move_selected = !self.options.delete_sessions;
-        let move_radio = if move_selected { "(•)" } else { "( )" };
-        let move_style = if move_focused {
-            Style::default().fg(theme.accent).underlined()
-        } else if move_selected {
-            Style::default().fg(theme.accent)
-        } else {
-            Style::default().fg(theme.dimmed)
-        };
-        let move_line = Line::from(vec![
-            Span::styled(move_radio, move_style),
-            Span::styled(" Move sessions to default group", move_style),
-        ]);
-        frame.render_widget(Paragraph::new(move_line), chunks[2]);
-        self.focusable_rects.push((0, chunks[2]));
-
-        // Delete sessions option
-        let delete_focused = self.focused_field == 1;
-        let delete_selected = self.options.delete_sessions;
-        let delete_radio = if delete_selected { "(•)" } else { "( )" };
-        let delete_style = if delete_focused {
-            Style::default().fg(theme.error).underlined()
-        } else if delete_selected {
-            Style::default().fg(theme.error)
-        } else {
-            Style::default().fg(theme.dimmed)
-        };
-        let delete_line = Line::from(vec![
-            Span::styled(delete_radio, delete_style),
-            Span::styled(" Delete all sessions", delete_style),
-        ]);
-        frame.render_widget(Paragraph::new(delete_line), chunks[3]);
-        self.focusable_rects.push((1, chunks[3]));
-
-        // Track current chunk index for optional checkboxes
-        let mut next_chunk = 4;
+        for (index, action) in self.actions().iter().enumerate() {
+            let focused = self.focused_field == index;
+            let selected = self.options.action == *action;
+            let radio = if selected { "(•)" } else { "( )" };
+            let color = if *action == GroupDeleteAction::DeleteSessions {
+                theme.error
+            } else {
+                theme.accent
+            };
+            let style = if focused {
+                Style::default().fg(color).underlined()
+            } else if selected {
+                Style::default().fg(color)
+            } else {
+                Style::default().fg(theme.dimmed)
+            };
+            let label = match action {
+                GroupDeleteAction::MoveToParent => " Move sessions to parent group",
+                GroupDeleteAction::MoveToDefault => " Move sessions to default group",
+                GroupDeleteAction::DeleteSessions => " Delete all sessions",
+            };
+            let line = Line::from(vec![Span::styled(radio, style), Span::styled(label, style)]);
+            frame.render_widget(Paragraph::new(line), chunks[index + 2]);
+        }
+        let action_count = self.actions().len();
+        for index in 0..action_count {
+            self.focusable_rects.push((index, chunks[index + 2]));
+        }
+        let mut next_chunk = action_count + 2;
 
         let style = CheckboxStyle::delete_group(theme);
 
@@ -418,7 +435,7 @@ mod tests {
     /// per-resource checkboxes).
     fn deleting(worktrees: bool, containers: bool) -> GroupDeleteOptionsDialog {
         let mut d = dialog(worktrees, containers);
-        d.options.delete_sessions = true;
+        d.options.action = GroupDeleteAction::DeleteSessions;
         d
     }
 
@@ -429,9 +446,16 @@ mod tests {
             d.handle_key(key(KeyCode::Esc)),
             DialogResult::Cancel
         ));
-        match dialog(false, false).handle_key(key(KeyCode::Enter)) {
-            DialogResult::Submit(opts) => assert!(!opts.delete_sessions),
-            _ => panic!("expected Submit"),
+        for (path, action) in [
+            ("work", GroupDeleteAction::MoveToDefault),
+            ("work/projects", GroupDeleteAction::MoveToParent),
+            ("work/projects/feature", GroupDeleteAction::MoveToParent),
+        ] {
+            let mut d = GroupDeleteOptionsDialog::new(path.to_string(), 3, false, false);
+            match d.handle_key(key(KeyCode::Enter)) {
+                DialogResult::Submit(opts) => assert_eq!(opts.action, action),
+                _ => panic!("expected Submit"),
+            }
         }
 
         let mut d = deleting(true, true);
@@ -441,7 +465,7 @@ mod tests {
         d.options.delete_containers = true;
         match d.handle_key(key(KeyCode::Enter)) {
             DialogResult::Submit(opts) => {
-                assert!(opts.delete_sessions);
+                assert_eq!(opts.action, GroupDeleteAction::DeleteSessions);
                 assert!(opts.delete_worktrees);
                 assert!(opts.force_delete_worktrees);
                 assert!(opts.delete_branches);
@@ -486,7 +510,7 @@ mod tests {
         {
             let mut d = dialog(worktrees, containers);
             assert_eq!(d.max_field(), 2, "move mode has no checkboxes");
-            d.options.delete_sessions = true;
+            d.options.action = GroupDeleteAction::DeleteSessions;
             assert_eq!(d.max_field(), deleting_max);
         }
 
@@ -506,10 +530,10 @@ mod tests {
         let mut d = dialog(false, false);
         d.handle_key(key(KeyCode::Tab));
         d.handle_key(key(KeyCode::Char(' ')));
-        assert!(d.options.delete_sessions);
+        assert_eq!(d.options.action, GroupDeleteAction::DeleteSessions);
         d.focused_field = 0;
         d.handle_key(key(KeyCode::Char(' ')));
-        assert!(!d.options.delete_sessions);
+        assert_eq!(d.options.action, GroupDeleteAction::MoveToDefault);
 
         // (worktrees, containers, focused row, the option it owns)
         type ToggleCase = (bool, bool, usize, fn(&GroupDeleteOptions) -> bool);
@@ -531,19 +555,115 @@ mod tests {
 
     #[test]
     fn switching_back_to_move_clears_every_delete_option() {
-        let mut d = deleting(true, true);
-        d.options.delete_worktrees = true;
-        d.options.force_delete_worktrees = true;
-        d.options.delete_branches = true;
-        d.options.delete_containers = true;
-        d.focused_field = 0;
+        for (path, field, action) in [
+            ("work", 0, GroupDeleteAction::MoveToDefault),
+            ("work/projects", 0, GroupDeleteAction::MoveToParent),
+            ("work/projects", 1, GroupDeleteAction::MoveToDefault),
+        ] {
+            let mut d = GroupDeleteOptionsDialog::new(path.to_string(), 3, true, true);
+            d.options = GroupDeleteOptions {
+                action: GroupDeleteAction::DeleteSessions,
+                delete_worktrees: true,
+                force_delete_worktrees: true,
+                delete_branches: true,
+                delete_containers: true,
+            };
+            d.focused_field = field;
 
-        d.handle_key(key(KeyCode::Char(' ')));
-        assert!(!d.options.delete_sessions);
-        assert!(!d.options.delete_worktrees);
-        assert!(!d.options.force_delete_worktrees);
-        assert!(!d.options.delete_branches);
-        assert!(!d.options.delete_containers);
+            d.handle_key(key(KeyCode::Char(' ')));
+            assert_eq!(d.options.action, action);
+            assert!(!d.options.delete_worktrees);
+            assert!(!d.options.force_delete_worktrees);
+            assert!(!d.options.delete_branches);
+            assert!(!d.options.delete_containers);
+            assert_eq!(d.max_field(), d.actions().len());
+        }
+    }
+
+    #[test]
+    fn subgroup_actions_render_in_order_and_clicks_select_them() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let mut d = GroupDeleteOptionsDialog::new("work/projects".to_string(), 3, true, true);
+        let theme = crate::tui::styles::load_theme("empire");
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        terminal.draw(|f| d.render(f, f.area(), &theme)).unwrap();
+        let buffer = terminal.backend().buffer();
+        for (index, label) in [
+            "(•) Move sessions to parent group",
+            "( ) Move sessions to default group",
+            "( ) Delete all sessions",
+        ]
+        .iter()
+        .enumerate()
+        {
+            let (field, rect) = d.focusable_rects[index];
+            assert_eq!(field, index);
+            let line: String = (rect.x..rect.right())
+                .map(|x| buffer[(x, rect.y)].symbol())
+                .collect();
+            assert!(line.starts_with(label), "{line:?}");
+            assert_eq!(rect.y, d.focusable_rects[0].1.y + index as u16);
+        }
+
+        for (index, action) in [
+            (1, GroupDeleteAction::MoveToDefault),
+            (2, GroupDeleteAction::DeleteSessions),
+            (0, GroupDeleteAction::MoveToParent),
+        ] {
+            let (_, rect) = d.focusable_rects[index];
+            assert!(matches!(
+                d.handle_click(rect.x, rect.y),
+                Some(DialogResult::Continue)
+            ));
+            match d.handle_key(key(KeyCode::Enter)) {
+                DialogResult::Submit(options) => assert_eq!(options.action, action),
+                _ => panic!("expected Submit"),
+            }
+        }
+    }
+
+    #[test]
+    fn subgroup_navigation_and_resource_checkboxes_follow_the_three_actions() {
+        for (worktrees, containers) in [(true, false), (false, true), (true, true)] {
+            let mut d = GroupDeleteOptionsDialog::new(
+                "work/projects".to_string(),
+                3,
+                worktrees,
+                containers,
+            );
+            for (field, action) in [
+                (1, GroupDeleteAction::MoveToDefault),
+                (2, GroupDeleteAction::DeleteSessions),
+            ] {
+                d.handle_key(key(KeyCode::Tab));
+                assert_eq!(d.focused_field, field);
+                d.handle_key(key(KeyCode::Char(' ')));
+                assert_eq!(d.options.action, action);
+            }
+            if worktrees {
+                d.handle_key(key(KeyCode::Tab));
+                d.handle_key(key(KeyCode::Char(' ')));
+                assert!(d.options.delete_worktrees);
+                assert_eq!(d.force_field_index(), Some(4));
+                d.handle_key(key(KeyCode::Tab));
+                d.handle_key(key(KeyCode::Char(' ')));
+                assert!(d.options.force_delete_worktrees);
+                d.handle_key(key(KeyCode::Tab));
+                d.handle_key(key(KeyCode::Char(' ')));
+                assert!(d.options.delete_branches);
+            }
+            if containers {
+                d.handle_key(key(KeyCode::Tab));
+                d.handle_key(key(KeyCode::Char(' ')));
+                assert!(d.options.delete_containers);
+            }
+            d.handle_key(key(KeyCode::Tab));
+            assert_eq!(d.focused_field, 0);
+            d.handle_key(key(KeyCode::BackTab));
+            assert_eq!(d.focused_field, d.max_field() - 1);
+        }
     }
 
     #[test]

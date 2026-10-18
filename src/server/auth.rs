@@ -166,6 +166,7 @@ fn is_login_session_exempt(path: &str) -> bool {
     path == "/"
         || path == "/login"
         || path.starts_with("/session/")
+        || path.starts_with("/plugins/")
         || path == "/api/login"
         || path == "/api/login/status"
         || path == "/api/logout"
@@ -1143,6 +1144,7 @@ mod tests {
             "/login",
             "/session/abc",
             "/session/2626c6af68754732",
+            "/plugins/github/prs",
             "/api/login",
             "/api/login/status",
             "/api/logout",
@@ -1168,6 +1170,9 @@ mod tests {
         // and `/logins` is not `/login`.
         let gated = [
             "/api/sessions",
+            "/api/plugins",
+            "/api/plugins/github/pages/prs",
+            "/pluginsx",
             "/api/sessions/abc/acp/ws",
             "/api/settings",
             "/api/login/elevate",
@@ -1274,6 +1279,58 @@ mod tests {
         ];
         for (method, path) in ungated {
             assert!(!requires_elevation(&method, path), "{method} {path}");
+        }
+    }
+
+    /// Plugin page deep links are document navigations that cannot carry a device binding
+    /// header, so the shell must load on a bare session cookie while APIs stay gated.
+    #[tokio::test]
+    async fn plugin_page_shell_loads_remote_without_binding_header() {
+        use crate::server::login::LoginManager;
+        use tower::ServiceExt;
+
+        for token in [None, Some("secret-token")] {
+            let mut state = crate::server::test_support::build_test_app_state_with_policy(
+                Vec::new(),
+                vec!["localhost".to_string()],
+                Vec::new(),
+                token.map(str::to_string),
+            );
+            let login = Arc::new(LoginManager::new(Some("passphrase")));
+            let session_id = login
+                .create_session(&[0xAB; 32], "203.0.113.7", "test-agent")
+                .await;
+            Arc::get_mut(&mut state)
+                .expect("unique state")
+                .login_manager = login;
+            let cookie = match token {
+                Some(t) => format!("aoe_session={session_id}; aoe_token={t}"),
+                None => format!("aoe_session={session_id}"),
+            };
+
+            let get = |uri: &str| {
+                let mut req = Request::builder()
+                    .uri(uri)
+                    .header("host", "localhost")
+                    .header("cookie", &cookie)
+                    .body(axum::body::Body::empty())
+                    .unwrap();
+                req.extensions_mut().insert(ConnectInfo(
+                    "203.0.113.7:5555".parse::<SocketAddr>().unwrap(),
+                ));
+                let app = crate::server::test_support::build_router_for_test(state.clone());
+                async move { app.oneshot(req).await.unwrap().status() }
+            };
+
+            // 404 when the build embeds no dashboard; either way auth let it through.
+            let shell = get("/plugins/github/prs").await;
+            assert!(
+                matches!(shell, StatusCode::OK | StatusCode::NOT_FOUND),
+                "{token:?}: {shell}"
+            );
+            for api in ["/api/sessions", "/api/plugins/github/pages/prs"] {
+                assert_eq!(get(api).await, StatusCode::UNAUTHORIZED, "{token:?} {api}");
+            }
         }
     }
 }

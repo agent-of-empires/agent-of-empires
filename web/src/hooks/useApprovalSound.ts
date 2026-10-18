@@ -1,11 +1,10 @@
 import { useEffect, useState } from "react";
-import { fetchSettings, fetchSounds, fetchSoundBlob } from "../lib/api";
+import { fetchSettings, fetchSoundBlob } from "../lib/api";
 import { onSettingsChanged } from "../lib/settingsEvents";
 
 interface SoundSettings {
   enabled?: boolean;
   volume?: number;
-  mode?: "random" | { specific: string };
   on_approval?: string | null;
 }
 
@@ -46,7 +45,14 @@ async function loadSettings(): Promise<SoundSettings | null> {
   }
   const generation = cacheGeneration;
   const data = await fetchSettings();
-  const sound = (data?.sound as SoundSettings | undefined) ?? null;
+  const raw = data?.sound;
+  const sound: SoundSettings | null = raw
+    ? {
+        enabled: raw.enabled as SoundSettings["enabled"],
+        volume: raw.volume as SoundSettings["volume"],
+        on_approval: raw.on_approval as SoundSettings["on_approval"],
+      }
+    : null;
   if (generation === cacheGeneration) {
     cachedSettings = sound;
     cachedSettingsAt = now;
@@ -57,16 +63,6 @@ async function loadSettings(): Promise<SoundSettings | null> {
 async function resolveSoundName(sound: SoundSettings): Promise<string | null> {
   const override = sound.on_approval?.trim();
   if (override) return override;
-  if (typeof sound.mode === "object" && sound.mode !== null) {
-    const specific = sound.mode.specific?.trim();
-    if (specific) return specific;
-  }
-  if (sound.mode === "random") {
-    const list = await fetchSounds();
-    if (list.length > 0) {
-      return list[Math.floor(Math.random() * list.length)] ?? null;
-    }
-  }
   return null;
 }
 
