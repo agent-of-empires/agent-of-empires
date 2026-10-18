@@ -3149,7 +3149,7 @@
       "kind": "mocked-playwright",
       "risk": "medium",
       "specs": ["tests/acp-mobile-jump-to-bottom.spec.ts"],
-      "components": ["web/src/components/acp/StructuredView.tsx"]
+      "components": ["web/src/components/acp/StructuredView.tsx", "web/src/components/acp/useTranscriptScroll.ts"]
     },
     {
       "id": "acp.tool-stopped-sweep",

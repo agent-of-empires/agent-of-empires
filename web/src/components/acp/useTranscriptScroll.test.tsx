@@ -261,16 +261,13 @@ describe("useTranscriptScroll fold corrections", () => {
 
     metrics.scrollHeight = 1100;
     metrics.scrollTop = metrics.scrollHeight - metrics.clientHeight;
-    act(() => {
-      view.rerender(<Harness metrics={metrics} sessionId={sessionId} folded={true} closed={true} streamed={false} />);
-      viewport.dispatchEvent(new Event("scroll"));
-      contentObserver(content).fire();
-    });
+    view.rerender(<Harness metrics={metrics} sessionId={sessionId} folded={true} closed={true} streamed={false} />);
     expect(view.container.querySelectorAll("[data-tool-id]")).toHaveLength(0);
 
     metrics.scrollHeight = 1250;
     act(() => {
       view.rerender(<Harness metrics={metrics} sessionId={sessionId} folded={true} closed={true} streamed={true} />);
+      viewport.dispatchEvent(new Event("scroll"));
       contentObserver(content).fire();
     });
     expect(metrics.scrollTop).toBe(metrics.scrollHeight - metrics.clientHeight);

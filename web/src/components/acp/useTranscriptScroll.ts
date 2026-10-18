@@ -247,6 +247,7 @@ export function useTranscriptScroll({
       const saved = loadScrollState(sessionId);
       const stick = !saved || saved.stuck;
       wasAtBottomRef.current = stick;
+      anchorIntentRef.current = stick;
       if (stick) lastAtBottomAtRef.current = performance.now();
       setAtBottom(stick);
       // Later passes catch content that lays out after paint; each rechecks the
@@ -382,6 +383,16 @@ export function useTranscriptScroll({
       if (gestureClearTimer) window.clearTimeout(gestureClearTimer);
     };
   }, [requestEarlierHistory, isCoarse, pinToBottom, sessionId]);
+
+  // A fold can clamp and regrow before its scroll event or resize observer runs.
+  useLayoutEffect(() => {
+    const vp = viewportRef.current;
+    if (!vp) return;
+    const maxScrollTop = vp.scrollHeight - vp.clientHeight;
+    if (lastScrollTopRef.current > maxScrollTop && vp.scrollTop === maxScrollTop) {
+      lastScrollTopRef.current = maxScrollTop;
+    }
+  });
 
   // Hold the bottom pin through a keyboard or composer-collapse transition.
   // `wasAtBottomRef` covers sitting idle at the bottom; the timestamp covers an

@@ -34,13 +34,16 @@ test.describe("mobile jump-to-bottom", () => {
 
     await expect(button).toBeHidden();
 
-    await userScroll(viewport, 0);
+    const readingTop = 240;
+    await userScroll(viewport, readingTop);
     await expect(button).toBeVisible();
+    await expect.poll(() => viewport.evaluate((el) => el.scrollTop)).toBe(readingTop);
 
     // Reopening (reload) preserves the scrolled-up position.
     await page.reload();
     await waitForComposerConnected(page);
     await expect(button).toBeVisible();
+    await expect.poll(() => viewport.evaluate((el) => el.scrollTop)).toBe(readingTop);
 
     await button.click();
     await expect(button).toBeHidden();
