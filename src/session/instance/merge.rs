@@ -27,6 +27,8 @@ impl Instance {
         self.retroactive_capture_excludes = prior.retroactive_capture_excludes;
         self.force_fresh_next_launch = prior.force_fresh_next_launch;
         self.pending_host_env = prior.pending_host_env;
+        self.launch_admission = prior.launch_admission;
+        self.before_start_minted_for_launch = prior.before_start_minted_for_launch;
         self.pi_extension_launched = prior.pi_extension_launched;
         self.identity_publisher_launched = prior.identity_publisher_launched;
         self.file_watch = self.file_watch.take().or(prior.file_watch);

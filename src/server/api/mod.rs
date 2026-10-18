@@ -171,6 +171,61 @@ pub(crate) fn start_blocked_response(
     api_error_with_code_header(code, blocked.to_string())
 }
 
+/// The 409 body for a sandbox launch that needs the sandbox login first: the code, the
+/// instruction, the tool the login is for, and the `profile` and `command` its recovery needs.
+pub(crate) fn sandbox_login_required_body(
+    err: &crate::session::SandboxLoginRequired,
+) -> serde_json::Value {
+    let mut body = serde_json::json!({
+        "error": crate::session::SandboxLoginRequired::CODE,
+        "message": err.to_string(),
+        "tool": err.tool,
+    });
+    if let Some(command) = &err.command {
+        body["command"] = serde_json::Value::String(command.clone());
+    }
+    if let Some(profile) = &err.profile {
+        body["profile"] = serde_json::Value::String(profile.clone());
+    }
+    body
+}
+
+/// 409 for a sandbox launch that needs the sandbox login first.
+pub(crate) fn sandbox_login_required_response(
+    err: &crate::session::SandboxLoginRequired,
+) -> Response {
+    use axum::response::IntoResponse as _;
+    (
+        StatusCode::CONFLICT,
+        axum::Json(sandbox_login_required_body(err)),
+    )
+        .into_response()
+}
+
+/// 409 for a sandbox launch refused because it needs a sandbox login the active container
+/// runtime cannot perform; nothing is held, the setting or the runtime has to change.
+pub(crate) fn sandbox_login_unsupported_response(
+    err: &crate::session::SandboxLoginUnsupported,
+) -> Response {
+    api_error(
+        StatusCode::CONFLICT,
+        crate::session::SandboxLoginUnsupported::CODE,
+        err.to_string(),
+    )
+}
+
+/// 502 for a launch whose `host_hooks.before_start` hook produced no environment. The
+/// message is the error's fixed words, never the command or its output.
+pub(crate) fn before_start_hook_failed_response(
+    err: &crate::session::BeforeStartHookError,
+) -> Response {
+    api_error(
+        StatusCode::BAD_GATEWAY,
+        "before_start_hook_failed",
+        err.to_string(),
+    )
+}
+
 pub(crate) fn api_error(
     status: axum::http::StatusCode,
     code: &str,
@@ -396,6 +451,28 @@ pub(super) fn validate_profile_name(name: &str) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The 409 body of the queue endpoint names `profile` and `command` only when set.
+    #[tokio::test]
+    async fn sandbox_login_required_response_names_profile_and_command_only_when_set() {
+        let body = |response: Response| async move {
+            let bytes = axum::body::to_bytes(response.into_body(), 4096)
+                .await
+                .unwrap();
+            serde_json::from_slice::<serde_json::Value>(&bytes).unwrap()
+        };
+        let mut blocked = crate::session::test_support::login_required("claude");
+        let plain = body(sandbox_login_required_response(&blocked)).await;
+        assert_eq!(plain.get("profile"), None);
+        assert_eq!(plain.get("command"), None);
+
+        blocked.profile = Some("work".to_string());
+        blocked.command = Some("claude".to_string());
+        let named = body(sandbox_login_required_response(&blocked)).await;
+        assert_eq!(named["profile"], "work");
+        assert_eq!(named["command"], "claude");
+        assert_eq!(named["tool"], "claude");
+    }
 
     // Write handlers and their existing rejection/extractor boundaries.
     const MUTATING_HANDLERS: &[(&str, &str, &[&str])] = &[
