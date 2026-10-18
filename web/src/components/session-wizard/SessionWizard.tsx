@@ -71,6 +71,10 @@ export interface WizardPrefill {
   group?: string;
   initialTab?: "recent" | "browse" | "clone";
   scratch?: boolean;
+  title?: string;
+  prompt?: string;
+  suggestion?: CreateSessionRequest["suggestion"];
+  sourceRefs?: string[];
   /** The registered project's worktree override for `path`; `undefined` means none. */
   worktreeEnabled?: boolean;
 }
@@ -88,6 +92,7 @@ function initialWizardData(prefill: WizardPrefill | undefined, nameOnly: boolean
   return {
     ...base,
     path: prefill.scratch ? "" : prefill.path || "",
+    title: prefill.title ?? base.title,
     tool: prefill.tool || base.tool,
     yoloMode: prefill.yoloMode ?? false,
     sandboxEnabled: prefill.sandboxEnabled ?? false,
@@ -182,6 +187,7 @@ export function SessionWizard({ onClose, onCreated, onCreatedInBackground, prefi
     !nameOnly && (prefill?.initialTab || (!state.data.path && !state.data.scratch)) ? "project" : null,
   );
   const [progress, setProgress] = useState<CreateProgress | null>(null);
+  const [draftPrompt, setDraftPrompt] = useState(prefill?.prompt ?? "");
   const [progressKey, setProgressKey] = useState<string | null>(null);
   const [showProgress, setShowProgress] = useState(false);
   // A create whose response never arrived; Launch and reconnects retry it under its key.
@@ -484,6 +490,9 @@ export function SessionWizard({ onClose, onCreated, onCreatedInBackground, prefi
           state.agents.find((a) => a.name === d.tool),
         ),
       ),
+      prompt: prefill?.suggestion ? draftPrompt : undefined,
+      suggestion: prefill?.suggestion,
+      source_refs: prefill?.sourceRefs,
       idempotency_key: newIdempotencyKey(),
     };
     // A failed preview counts as nothing to confirm, so it never blocks creation.
@@ -687,6 +696,23 @@ export function SessionWizard({ onClose, onCreated, onCreatedInBackground, prefi
           onOpen={openPanel("agent")}
         />
       </RowGroup>
+      {prefill?.suggestion && (
+        <div>
+          <label htmlFor="suggestion-prompt" className="block text-sm text-text-dim mb-1.5">
+            Draft task prompt
+          </label>
+          <textarea
+            id="suggestion-prompt"
+            value={draftPrompt}
+            onChange={(event) => setDraftPrompt(event.target.value)}
+            rows={5}
+            className="w-full rounded-md border border-surface-700 bg-surface-900 p-3 text-sm text-text-primary"
+          />
+          <p className="mt-1 text-xs text-text-muted">
+            Source content is untrusted. Review this prompt before creating the session.
+          </p>
+        </div>
+      )}
 
       <RowGroup>
         <SwitchRow

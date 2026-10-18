@@ -59,6 +59,7 @@ interface Props {
   onToggleGroup: (groupId: string) => void;
   onUpdateRepoAppearance: (repoId: string, update: RepoAppearanceUpdate) => void;
   onNew: () => void;
+  onSuggestions?: () => void;
   onCreateSession: (repoPath: string) => void;
   onPinProject?: (repoPath: string) => void;
   onUnpinProject?: (group: SidebarGroup) => void;
@@ -378,6 +379,19 @@ export function WorkspaceSidebar(props: Props) {
               onDelete={(ids) => props.onDeleteSession?.(ids)}
               onEmptyTrash={() => props.onEmptyTrash?.()}
             />
+          )}
+          {props.onSuggestions && (
+            <button
+              type="button"
+              onClick={props.onSuggestions}
+              className="w-8 h-8 shrink-0 flex items-center justify-center rounded-md text-text-secondary hover:bg-surface-800/50 hover:text-text-primary"
+              title="Suggested sessions"
+              aria-label="Suggested sessions"
+            >
+              <StrokeIcon size={16} strokeWidth="1.5">
+                <path d="m12 3 2.5 6.5L21 12l-6.5 2.5L12 21l-2.5-6.5L3 12l6.5-2.5L12 3Z" />
+              </StrokeIcon>
+            </button>
           )}
           <button
             onClick={props.onSettings}

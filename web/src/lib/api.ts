@@ -19,6 +19,10 @@ import type {
   CreateSessionRequest,
   ImportableSession,
   SettingsFieldDescriptor,
+  SuggestionsSnapshot,
+  SuggestionIdentity,
+  SuggestionPrepareResponse,
+  SuggestionActionResponse,
 } from "./types";
 import type { ConfigOptionDescriptor } from "./acpTypes";
 import type { ResolvedTheme } from "./theme";
@@ -101,6 +105,62 @@ async function okWithMessage(url: string, init: RequestInit): Promise<{ ok: bool
   const reply = await send(url, init).catch(() => null);
   if (!reply) return { ok: false };
   return reply.ok ? { ok: true } : { ok: false, message: stringField(reply.payload, "message") };
+}
+
+// --- Suggested sessions ---
+
+function suggestionsUrl(path: string, profile?: string): string {
+  const query = profile ? `?profile=${encodeURIComponent(profile)}` : "";
+  return `/api/suggestions${path}${query}`;
+}
+
+export function fetchSuggestions(profile?: string): Promise<SuggestionsSnapshot | null> {
+  return fetchJson<SuggestionsSnapshot>(suggestionsUrl("", profile));
+}
+
+export function refreshSuggestions(profile?: string): Promise<boolean> {
+  return fetchOk(suggestionsUrl("/refresh", profile), { method: "POST" });
+}
+
+export async function actOnSuggestion(
+  identity: SuggestionIdentity,
+  action: "dismiss" | "restore" | "start",
+  profile?: string,
+  createAnother = false,
+): Promise<{ ok: boolean; data?: SuggestionActionResponse; error?: string }> {
+  try {
+    const { ok, status, payload } = await send(
+      suggestionsUrl("/action", profile),
+      jsonInit("POST", { ...identity, action, ...(createAnother ? { create_another: true } : {}) }),
+    );
+    return ok
+      ? { ok: true, data: payload as SuggestionActionResponse }
+      : { ok: false, error: stringField(payload, "message") ?? `Request failed (${status})` };
+  } catch (error) {
+    return { ok: false, error: error instanceof Error ? error.message : "Network error" };
+  }
+}
+
+export async function prepareSuggestion(
+  identity: SuggestionIdentity,
+  profile?: string,
+): Promise<{ ok: true; data: SuggestionPrepareResponse } | { ok: false; error: string }> {
+  try {
+    const { ok, status, payload } = await send(suggestionsUrl("/prepare", profile), jsonInit("POST", identity));
+    return ok
+      ? { ok: true, data: payload as unknown as SuggestionPrepareResponse }
+      : { ok: false, error: stringField(payload, "message") ?? `Request failed (${status})` };
+  } catch (error) {
+    return { ok: false, error: error instanceof Error ? error.message : "Network error" };
+  }
+}
+
+export function updateSuggestionPolicy(
+  enabled: boolean,
+  rules: { provider_id: string; criterion: string }[],
+  profile?: string,
+): Promise<boolean> {
+  return fetchOk(suggestionsUrl("/policy", profile), jsonInit("PATCH", { enabled, rules }));
 }
 
 // --- Sessions ---

@@ -121,6 +121,53 @@ describe("SessionWizard structured view payload", () => {
   });
 });
 
+describe("SessionWizard suggestion handoff", () => {
+  it("submits the edited draft and exact source identity through normal saved defaults", async () => {
+    vi.mocked(fetchSettings).mockResolvedValueOnce({
+      session: { default_tool: "opencode", yolo_mode_default: false },
+      acp: { acp_defaults: { opencode: { model: "openai/gpt-5.5", effort: "high" } } },
+      worktree: { enabled: true },
+    } as never);
+    const suggestion = { provider_id: "github", id: "issue-4562", revision: 7 };
+    renderWizard({
+      path: "/tmp/proj",
+      title: "Source task",
+      prompt: "Original source prompt",
+      suggestion,
+      sourceRefs: ["https://example.test/issues/4562#comment-2"],
+      profile: "work",
+    });
+    await waitFor(() => expect(screen.getByTestId("wizard-agent-row").textContent).toContain("opencode"));
+    expect((screen.getByLabelText("Draft task prompt") as HTMLTextAreaElement).value).toBe("Original source prompt");
+    fireEvent.change(screen.getByLabelText("Draft task prompt"), { target: { value: "Reviewed exact prompt\n" } });
+    await launch();
+    await waitFor(() => expect(createSession).toHaveBeenCalledTimes(1));
+    expect(payload()).toMatchObject({
+      path: "/tmp/proj",
+      title: "Source task",
+      prompt: "Reviewed exact prompt\n",
+      suggestion,
+      source_refs: ["https://example.test/issues/4562#comment-2"],
+      profile: "work",
+      tool: "opencode",
+      agent_model: "openai/gpt-5.5",
+      agent_effort: "high",
+      yolo_mode: false,
+      worktree_enabled: true,
+    });
+  });
+
+  it("keeps ordinary creation independent of a suggestion prompt", async () => {
+    renderWizard();
+    expect(screen.queryByLabelText("Draft task prompt")).toBeNull();
+    await launch();
+    await waitFor(() => expect(createSession).toHaveBeenCalledTimes(1));
+    expect(payload().prompt).toBeUndefined();
+    expect(payload().suggestion).toBeUndefined();
+    expect(payload().source_refs).toBeUndefined();
+  });
+});
+
 describe("SessionWizard last instruction memory", () => {
   it("prefills the stored instruction into the create payload", async () => {
     localStorage.setItem(INSTRUCTION_KEY, "always be terse");

@@ -356,7 +356,70 @@ export interface DockerStatusResponse {
   runtime: string | null;
 }
 
+export interface SuggestionIdentity {
+  provider_id: string;
+  id: string;
+  revision: number;
+}
+
+export interface SuggestedSession {
+  id: string;
+  title: string;
+  reason: string;
+  source_url: string;
+  source_ref: string;
+  preview: string;
+  project?: string;
+  criterion: string;
+  draft: { title: string; prompt: string };
+}
+
+export interface SuggestionItem extends SuggestedSession {
+  provider_id: string;
+  provider_name: string;
+  revision: number;
+  dismissed: boolean;
+  session_id: string | null;
+  project_path: string | null;
+  can_start: boolean;
+  start_blocked_reason: string | null;
+}
+
+export interface SuggestionsSnapshot {
+  items: SuggestionItem[];
+  providers: {
+    provider_id: string;
+    provider_name: string;
+    status: string;
+    error: string | null;
+    updated_at: string | null;
+  }[];
+  auto_create: {
+    enabled: boolean;
+    rules: { provider_id: string; criterion: string }[];
+    last_error: string | null;
+  };
+}
+
+export interface SuggestionPrepareResponse {
+  project_path: string;
+  title: string;
+  prompt: string;
+  source_ref: string;
+  suggestion: SuggestionIdentity;
+}
+
+export interface SuggestionActionResponse {
+  session_id?: string;
+  created?: boolean;
+}
+
+/** Request body for POST /api/sessions. */
 export interface CreateSessionRequest {
+  prompt?: string;
+  suggestion?: SuggestionIdentity;
+  source_refs?: string[];
+  create_another?: boolean;
   title?: string;
   path: string;
   tool: string;
