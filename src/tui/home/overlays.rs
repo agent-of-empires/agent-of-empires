@@ -20,6 +20,7 @@ impl HomeView {
         use crate::session::config::repo_config::HookProgress;
 
         let mut changed = false;
+        changed |= self.tick_suggestions();
         if let Some(dialog) = &mut self.new_dialog {
             changed |= dialog.tick();
             if dialog.is_loading() {
@@ -68,6 +69,7 @@ impl HomeView {
         self.show_help
             || self.search_active
             || self.new_dialog.is_some()
+            || self.suggestions_view.is_some()
             || self.confirm_dialog.is_some()
             || self.unified_delete_dialog.is_some()
             || self.group_delete_options_dialog.is_some()

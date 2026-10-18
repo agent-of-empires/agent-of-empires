@@ -28,6 +28,7 @@ mod selection;
 mod send;
 mod status;
 mod store_move;
+mod suggestions;
 #[cfg(test)]
 mod tests;
 mod user_action;
@@ -180,6 +181,11 @@ pub struct HomeView {
     pub(super) show_help: bool,
     pub(super) help_scroll: u16,
     pub(super) new_dialog: Option<NewSessionDialog>,
+    pub(super) suggestions_view: Option<crate::tui::suggestions::SuggestionsView>,
+    pub(super) pending_suggestion_customization:
+        Option<(String, crate::tui::suggestions::PreparedSuggestion)>,
+    pub(super) pending_customized_session_create:
+        Option<std::sync::mpsc::Receiver<Result<String, String>>>,
     pub(super) confirm_dialog: Option<ConfirmDialog>,
     pub(super) unified_delete_dialog: Option<UnifiedDeleteDialog>,
     pub(super) group_delete_options_dialog: Option<GroupDeleteOptionsDialog>,

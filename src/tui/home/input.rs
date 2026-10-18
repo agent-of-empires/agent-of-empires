@@ -1675,11 +1675,18 @@ impl HomeView {
         match result {
             DialogResult::Continue => None,
             DialogResult::Cancel => {
+                if self.pending_customized_session_create.is_some() {
+                    if let Some(dialog) = &mut self.new_dialog {
+                        dialog.set_loading(true);
+                    }
+                    return None;
+                }
                 // If creation is pending, mark it as cancelled
                 if self.is_creation_pending() {
                     self.cancel_creation();
                 } else {
                     self.new_dialog = None;
+                    self.pending_suggestion_customization = None;
                     // Backing out of `n` with a selection is the most contextual
                     // moment for the new-from-selection tip; queue it (a no-op until
                     // earned). Submit skips the pop so creation isn't interrupted and
@@ -2606,6 +2613,9 @@ impl HomeView {
         key: KeyEvent,
         update_info: Option<&crate::update::UpdateInfo>,
     ) -> Option<Action> {
+        if self.suggestions_view.is_some() {
+            return self.handle_suggestions_key(key);
+        }
         // Dynamic tool session hotkeys (checked before everything else).
         if let Some(tool_name) = self.match_tool_hotkey(&key) {
             return self.activate_tool(tool_name, true);
@@ -2797,6 +2807,7 @@ impl HomeView {
                 self.update_selected();
             }
             ActionId::NewSession => self.open_new_session_dialog(),
+            ActionId::Suggestions => self.open_suggestions(),
             ActionId::NewFromSelection => self.open_new_from_selection(),
             ActionId::NewFromProject => self.open_project_session_picker(),
             ActionId::AttachTerminal => return self.attach_terminal_for_selected(),
@@ -6823,6 +6834,10 @@ impl HomeView {
         data: NewSessionData,
         hooks: Option<repo_config::ResolvedHooks>,
     ) -> Option<Action> {
+        if self.pending_suggestion_customization.is_some() {
+            self.request_customized_suggestion(&data);
+            return None;
+        }
         let has_hooks = hooks
             .as_ref()
             .is_some_and(|h| !h.hooks().on_create.is_empty() || !h.hooks().on_launch.is_empty());

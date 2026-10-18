@@ -30,6 +30,7 @@ mod stop_poller;
 mod store_move_poller;
 pub(crate) mod structured_view;
 pub(crate) mod styles;
+pub(crate) mod suggestions;
 mod trash_poller;
 mod worker;
 

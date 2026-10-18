@@ -1243,6 +1243,13 @@ impl App {
                 }
                 full = true;
             }
+            if let Some(result) = self.home.apply_suggestion_creation() {
+                full = true;
+                if let Ok(session_id) = result {
+                    self.home.reload()?;
+                    self.dispatch_new_session_attach(&session_id, terminal)?;
+                }
+            }
 
             full |= self.home.tick_dialog();
             full |= self.home.tick_settings_status();

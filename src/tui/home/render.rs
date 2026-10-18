@@ -1100,6 +1100,9 @@ impl HomeView {
             );
         }
 
+        if let Some(view) = &self.suggestions_view {
+            view.render(frame, area, theme);
+        }
         // Render dialogs on top
         if self.show_help {
             let live_on_enter = self.help_live_on_enter().unwrap_or(matches!(
@@ -1360,6 +1363,12 @@ impl HomeView {
                 Line::from("No sessions yet").style(Style::default().fg(theme.dimmed)),
                 Line::from(""),
                 Line::from("Press 'n' to create one").style(Style::default().fg(theme.hint)),
+                Line::from(if self.strict_hotkeys {
+                    "Ctrl+S: Suggested sessions"
+                } else {
+                    "S: Suggested sessions"
+                })
+                .style(Style::default().fg(theme.hint)),
                 Line::from("or 'aoe add .'").style(Style::default().fg(theme.hint)),
             ];
             let para = Paragraph::new(empty_text).alignment(Alignment::Center);
