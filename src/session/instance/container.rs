@@ -804,6 +804,22 @@ impl Instance {
         self.ensure_sandbox_login_for(None, &[])
     }
 
+    /// The hold decision of [`Self::ensure_sandbox_login`] on `config`, for the launch of the
+    /// stored agent: reads only what the session already holds (its fresh hook resolution,
+    /// never a hook run), so a poller can ask for every held session.
+    pub(crate) fn ensure_sandbox_login_with(
+        &self,
+        config: &crate::session::LaunchConfig,
+    ) -> Result<(), SandboxLoginRequired> {
+        let hook_env = self.trusted_before_start_env(config, std::time::Duration::ZERO);
+        match self.sandbox_login_gate_with(config, None, &[], hook_env) {
+            Some((container_config::LoginGate::LoginRequired, target)) => {
+                Err(self.login_required(&target))
+            }
+            _ => Ok(()),
+        }
+    }
+
     /// The launch configuration the files on disk give this row, for a test that decides on
     /// what a settings file says.
     #[cfg(test)]
@@ -1233,6 +1249,7 @@ impl Instance {
         let command = session_command.filter(|_| !reaches(None) && reaches(session_command));
         SandboxLoginRequired {
             tool: self.tool.clone(),
+            credential: target.credential.clone(),
             profile: (profile != crate::session::config::effective_profile(""))
                 .then(|| profile.clone()),
             command: command.map(str::to_string),
@@ -1815,13 +1832,19 @@ mod tests {
 
         assert_eq!(
             claude.ensure_sandbox_login(),
-            Err(crate::session::test_support::login_required("claude")),
+            Err(crate::session::test_support::login_required_under(
+                "claude",
+                home.path()
+            )),
             "no file"
         );
         write_shared_credential(home.path(), "{}");
         assert_eq!(
             claude.ensure_sandbox_login(),
-            Err(crate::session::test_support::login_required("claude"))
+            Err(crate::session::test_support::login_required_under(
+                "claude",
+                home.path()
+            ))
         );
         write_shared_credential(home.path(), &usable_credential());
         assert_eq!(claude.ensure_sandbox_login(), Ok(()));
@@ -1835,7 +1858,10 @@ mod tests {
             std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o600)).unwrap();
             assert_eq!(
                 unreadable,
-                Err(crate::session::test_support::login_required("claude")),
+                Err(crate::session::test_support::login_required_under(
+                    "claude",
+                    home.path()
+                )),
                 "unreadable file"
             );
         }
@@ -2542,6 +2568,7 @@ mod tests {
     fn sandbox_login_required_prints_profile_and_command_quoted_in_one_command() {
         let both = SandboxLoginRequired {
             tool: "personal".to_string(),
+            credential: "/x/.credentials.json".into(),
             profile: Some("my work".to_string()),
             command: Some("claude --model fast".to_string()),
         };
@@ -2592,6 +2619,10 @@ mod tests {
             login,
             home.path()
                 .join(".claude-personal/sandbox-v2/.credentials.json")
+        );
+        assert_eq!(
+            held.credential, login,
+            "the gate waits for the login's file"
         );
         assert_eq!(held.command, None, "plain --tool reaches it");
 
@@ -3256,27 +3287,47 @@ mod tests {
         let project = home.path().join("project");
         std::fs::create_dir_all(&project).unwrap();
         let counter = home.path().join("hook-runs");
+        let ready = home.path().join("hook-ready");
+        let release = home.path().join("hook-release");
         let hook = format!(
-            "echo run >> {c}; sleep 0.5; echo end >> {c}; echo ANTHROPIC_API_KEY=sk-hook",
-            c = crate::session::environment::shell_escape(&counter.to_string_lossy())
+            "echo run >> {c}; : > {ready}; while [ ! -e {release} ]; do sleep 0.01; done; \
+             echo end >> {c}; echo ANTHROPIC_API_KEY=sk-hook",
+            c = crate::session::environment::shell_escape(&counter.to_string_lossy()),
+            ready = crate::session::environment::shell_escape(&ready.to_string_lossy()),
+            release = crate::session::environment::shell_escape(&release.to_string_lossy()),
         );
         crate::session::config::update_config(|global| global.host_hooks.before_start = vec![hook])
             .unwrap();
         let mut row = sandboxed_instance("claude");
         row.project_path = project.to_string_lossy().into_owned();
+        let slot = resolution_slot(&row.id);
+        assert_eq!(
+            slot.waiters.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "nobody waits on the slot yet"
+        );
 
-        let come_up = {
-            let mut copy = row.clone();
-            std::thread::spawn(move || copy.test_ensure_before_start_env(true))
+        // The deadline bounds the hook, so a test that never releases it still ends.
+        let run = |mut copy: Instance, body: fn(&mut Instance) -> Result<()>| {
+            std::thread::spawn(move || {
+                let _deadline =
+                    crate::session::HookTimeoutScope::new(std::time::Duration::from_secs(5));
+                body(&mut copy)
+            })
         };
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-        while hook_runs(&counter) == 0 && std::time::Instant::now() < deadline {
-            std::thread::sleep(std::time::Duration::from_millis(10));
-        }
-        let resolver = {
-            let mut copy = row.clone();
-            std::thread::spawn(move || copy.test_launchable())
-        };
+        let come_up = run(row.clone(), |i| i.test_ensure_before_start_env(true));
+        wait_until("the come-up's hook to run", || ready.exists());
+        assert_eq!(hook_runs(&counter), 1, "only the come-up has run the hook");
+        let resolver = run(row.clone(), |i| i.test_launchable());
+        wait_until("the resolver to wait on the come-up's slot", || {
+            slot.waiters.load(std::sync::atomic::Ordering::SeqCst) == 1
+        });
+        assert_eq!(
+            hook_runs(&counter),
+            1,
+            "the resolver waits for the come-up's hook, it does not run beside it"
+        );
+        std::fs::write(&release, "").unwrap();
         come_up.join().unwrap().unwrap();
         resolver.join().unwrap().unwrap();
         assert_eq!(
@@ -4001,7 +4052,10 @@ mod tests {
             let error = claude.test_launchable().unwrap_err();
             assert_eq!(
                 error.downcast_ref::<SandboxLoginRequired>(),
-                Some(&crate::session::test_support::login_required("claude")),
+                Some(&crate::session::test_support::login_required_under(
+                    "claude",
+                    home.path()
+                )),
                 "{runtime:?}"
             );
             assert!(claude.ensure_sandbox_login().is_err(), "{runtime:?}");

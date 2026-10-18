@@ -30,7 +30,7 @@ pub(crate) static LOGIN: AgentLogin = AgentLogin {
 /// `provider_override_env`). Claude Code's own reading is not verified here, so the hold is
 /// lifted for any non-empty value: the launch is then not gated by aoe. `FOUNDRY` is from
 /// Claude Code's documented environment variables and appears nowhere else in this repo.
-const OTHER_AUTH_ROUTES: &[&str] = &[
+pub(crate) const OTHER_AUTH_ROUTES: &[&str] = &[
     "CLAUDE_CODE_USE_BEDROCK",
     "CLAUDE_CODE_USE_FOUNDRY",
     "CLAUDE_CODE_USE_VERTEX",

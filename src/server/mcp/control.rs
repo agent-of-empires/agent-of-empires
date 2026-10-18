@@ -734,6 +734,15 @@ fn prompt_refusal(id: &str, error: PromptSubmitError) -> CallToolResult {
             tool_error("busy", message)
         }
         PromptSubmitError::Blocked(blocked) => tool_error("invalid_request", blocked.to_string()),
+        // The prompt stays queued and goes out after the login; resending would queue it twice.
+        PromptSubmitError::LoginRequired { blocked, queued_id } => tool_error(
+            "send_failed",
+            format!("{blocked}; the prompt is kept in the queue as {queued_id}, don't resend it"),
+        ),
+        PromptSubmitError::HookFailed { message, queued_id } => tool_error(
+            "send_failed",
+            format!("{message}; the prompt is kept in the queue as {queued_id}, don't resend it"),
+        ),
         PromptSubmitError::Enqueue(_, message) | PromptSubmitError::Attachments(_, message) => {
             tool_error("invalid_request", message)
         }
@@ -745,6 +754,8 @@ fn prompt_refusal(id: &str, error: PromptSubmitError) -> CallToolResult {
         PromptSubmitError::RevivalRefused
         | PromptSubmitError::Turn(SendTurnError::RevivalRefused)
         | PromptSubmitError::Turn(SendTurnError::NotOwner)
+        | PromptSubmitError::Turn(SendTurnError::LoginRequired(_))
+        | PromptSubmitError::Turn(SendTurnError::HookFailed(_))
         | PromptSubmitError::QueuedPromptGone
         | PromptSubmitError::QueuedPromptChanged
         | PromptSubmitError::QueuedAttachmentsMissing => {

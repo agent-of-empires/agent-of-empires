@@ -394,6 +394,12 @@ async fn deferred_enable_request(
         Err(e) => {
             tracing::warn!(target: "acp.switch", session = %session_id, "container ensure failed: {e}");
             if let Some(login) = e.downcast_ref::<crate::session::SandboxLoginRequired>() {
+                // The user switched the view, so no push.
+                state.session_service.sandbox_login.hold(
+                    session_id,
+                    crate::server::sandbox_login::LaunchOrigin::Interactive,
+                    login,
+                );
                 return Some(Err(login.to_string()));
             }
             return Some(Err(format!("container start failed: {e}")));
@@ -3455,6 +3461,7 @@ mod tests {
     #[serial_test::serial]
     async fn sandbox_login_gate_enable_publishes_the_plain_message() {
         let app_dir = crate::session::test_support::isolate_app_dir();
+        let _auth = crate::session::test_support::unset_claude_auth_routes();
         let (_runtime, _calls) =
             crate::session::test_support::failing_container_runtime(app_dir.path());
         crate::session::config::update_config(|c| {
@@ -3480,6 +3487,9 @@ mod tests {
         crate::server::test_support::seed_instances_on_disk_for_test("default", vec![inst.clone()]);
         let state = crate::server::test_support::build_test_app_state(vec![inst.clone()]);
         crate::server::test_support::refresh_canonical_metadata_for_test(&state).await;
+        let id = inst.id.clone();
+        let login = &state.session_service.sandbox_login;
+        let mut notices = login.subscribe();
         let exclusion =
             crate::acp::sandbox::LaunchExclusion::acquire(state.clone(), &inst.id, true)
                 .await
@@ -3498,6 +3508,15 @@ mod tests {
         assert_eq!(
             message,
             crate::session::test_support::login_required("claude").to_string()
+        );
+        assert_eq!(
+            login.held_origin(&id),
+            Some(crate::server::sandbox_login::LaunchOrigin::Interactive),
+            "a view switch is the user's own launch"
+        );
+        assert!(
+            notices.try_recv().is_err(),
+            "no push for an interactive hold"
         );
     }
 

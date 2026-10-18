@@ -3540,6 +3540,7 @@ mod tests {
     async fn sandbox_login_gate_acp_ensure_is_409() {
         use crate::session::SandboxLoginRequired;
         let app_dir = crate::session::test_support::isolate_app_dir();
+        let _auth = crate::session::test_support::unset_claude_auth_routes();
         let (_runtime, calls) =
             crate::session::test_support::failing_container_runtime(app_dir.path());
         crate::session::config::update_config(|c| {
@@ -3589,7 +3590,10 @@ mod tests {
         };
         assert_eq!(
             err.downcast_ref::<SandboxLoginRequired>(),
-            Some(&crate::session::test_support::login_required("claude")),
+            Some(&crate::session::test_support::login_required_under(
+                "claude",
+                app_dir.path()
+            )),
             "{err:#}"
         );
 
@@ -3716,6 +3720,14 @@ mod tests {
         assert!(
             !runtime_calls().is_empty(),
             "admitted: the launch reached the container runtime"
+        );
+        assert!(
+            state
+                .session_service
+                .sandbox_login
+                .held_origin(&id)
+                .is_none(),
+            "no hold record"
         );
 
         // Nothing of the key outlives the request.
@@ -4222,6 +4234,14 @@ mod tests {
             }))
         );
         assert!(!state.acp_supervisor.is_running(&id).await);
+        assert!(
+            state
+                .session_service
+                .sandbox_login
+                .held_origin(&id)
+                .is_none(),
+            "no hold, so no push and no kept-message episode"
+        );
         assert_eq!(
             std::fs::read_to_string(&calls).unwrap_or_default(),
             "",
