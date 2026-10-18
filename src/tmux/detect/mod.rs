@@ -176,7 +176,7 @@ mod tests {
     }
 
     #[test]
-    fn omp_tool_approval_requires_a_bounded_panel_footer() {
+    fn omp_tool_approval_requires_bounded_panel_and_current_choice_footer() {
         let panel = [
             "╭─ Allow tool: bash ──────────────────────────────────────╮",
             "│ Command: printf approval-1                              │",
@@ -207,7 +207,7 @@ mod tests {
         let incomplete_panel = [
             "╭─ Allow tool: bash ───────────────────╮",
             "│ ❯ Approve                            │",
-            "│ ordinary panel content               │",
+            "│ up/down navigate  enter select  esc cancel │",
             "╰──────────────────────────────────────╯",
         ]
         .join("\n");

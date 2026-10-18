@@ -252,6 +252,7 @@ any = [
   { region = "bottom_non_empty_lines(40)", all = [
     { line_regex = ['^\s*[│|]\s*(?:[❯\x{276F}\x{f054}>]\s+)?Approve\s*[^│|]*[│|]\s*$'] },
     { line_regex = ['^\s*[│|]\s+Deny\s*[^│|]*[│|]\s*$'] },
+    { line_regex = ['^\s*[│|].*choose\s+·.*select.*[│|]\s*$'] },
   ] },
 ]
 all = [
