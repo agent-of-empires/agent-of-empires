@@ -2,7 +2,10 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { cleanup, fireEvent, render, waitFor } from "@testing-library/react";
 
+import { writeClipboard } from "../../../lib/clipboard";
 import { StartupErrorBanner } from "../StartupErrorBanner";
+
+vi.mock("../../../lib/clipboard", () => ({ writeClipboard: vi.fn().mockResolvedValue(true) }));
 
 afterEach(() => {
   cleanup();
@@ -92,5 +95,14 @@ describe("AgentLogDisclosure", () => {
     await waitFor(() => expect(fetchSpy).toHaveBeenCalledTimes(2));
     fireEvent.click(toggle);
     expect(queryByTestId("acp-agent-log-pre")).toBeNull();
+  });
+});
+
+describe("StartupErrorBanner copy", () => {
+  it("copies the manual install command", () => {
+    stubLog({ exists: false, tail: "" });
+    const { getByRole } = renderBanner("some unknown failure");
+    fireEvent.click(getByRole("button", { name: "Copy command" }));
+    expect(writeClipboard).toHaveBeenCalledWith("npm install -g @agentclientprotocol/claude-agent-acp@latest");
   });
 });

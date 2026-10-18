@@ -3,6 +3,7 @@ import { useEffect, useState } from "react";
 import type { IncompatibleAgentDetail } from "../../lib/acpTypes";
 import { fetchSettings, installAcpAgent } from "../../lib/api";
 import { useRespawnSession } from "../../hooks/useRespawnSession";
+import { CopyRow } from "./CopyRow";
 
 interface Props {
   detail: IncompatibleAgentDetail;
@@ -84,12 +85,14 @@ export function StartupErrorScreen({ detail, sessionId, isSandboxed = false }: P
             <div className="text-[11px] font-medium uppercase tracking-wide text-text-dim">
               Run this, then restart the agent
             </div>
-            <pre
-              data-testid="startup-error-install-command"
-              className="mt-1 overflow-x-auto rounded-md border border-surface-700 bg-surface-950 p-2 font-mono text-[12px] text-text-primary"
-            >
-              {installCommand}
-            </pre>
+            <CopyRow source={installCommand} label="Copy command">
+              <pre
+                data-testid="startup-error-install-command"
+                className="mt-1 overflow-x-auto rounded-md border border-surface-700 bg-surface-950 p-2 font-mono text-[12px] text-text-primary"
+              >
+                {installCommand}
+              </pre>
+            </CopyRow>
           </div>
         )}
 
@@ -114,12 +117,14 @@ export function StartupErrorScreen({ detail, sessionId, isSandboxed = false }: P
                 <div className="mt-3 text-[11px] font-medium uppercase tracking-wide text-text-dim">
                   Run this inside the container, then press Restart agent
                 </div>
-                <pre
-                  data-testid="startup-error-sandbox-install-command"
-                  className="mt-1 overflow-x-auto rounded-md border border-surface-700 bg-surface-950 p-2 font-mono text-[12px] text-text-primary"
-                >
-                  {installCommand}
-                </pre>
+                <CopyRow source={installCommand} label="Copy command">
+                  <pre
+                    data-testid="startup-error-sandbox-install-command"
+                    className="mt-1 overflow-x-auto rounded-md border border-surface-700 bg-surface-950 p-2 font-mono text-[12px] text-text-primary"
+                  >
+                    {installCommand}
+                  </pre>
+                </CopyRow>
               </>
             )}
             <p className="mt-2 text-xs text-text-dim">

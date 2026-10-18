@@ -2,12 +2,21 @@ import { useState } from "react";
 import { ChevronDown, ListChecks } from "lucide-react";
 
 import type { Plan } from "../../lib/acpTypes";
+import { checklistMarkdown, type ChecklistStatus } from "../../lib/checklistMarkdown";
+import { CopyMarkdownButton } from "./CopyMarkdownButton";
 
 const STEP_GLYPHS: Record<Plan["steps"][number]["status"], [string, string]> = {
   Done: ["text-status-running", "✓"],
   InProgress: ["text-brand-500", "●"],
   Cancelled: ["text-text-dim", "⊘"],
   Pending: ["text-text-dim", "○"],
+};
+
+const PLAN_CHECKLIST_STATUS: Record<Plan["steps"][number]["status"], ChecklistStatus> = {
+  Done: "done",
+  InProgress: "in_progress",
+  Cancelled: "cancelled",
+  Pending: "pending",
 };
 
 const STEP_TITLE_CLASS: Partial<Record<Plan["steps"][number]["status"], string>> = {
@@ -63,6 +72,15 @@ export function PlanStrip({ plan }: { plan: Plan | null }) {
               );
             })}
           </ul>
+          <div className="flex justify-end">
+            <CopyMarkdownButton
+              compact
+              source={checklistMarkdown(
+                plan.steps.map((s) => ({ text: s.title, status: PLAN_CHECKLIST_STATUS[s.status] })),
+              )}
+              label="Copy plan"
+            />
+          </div>
         </div>
       )}
     </div>
