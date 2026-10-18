@@ -384,12 +384,18 @@ fn dialog_footer(lines: &[&str], composer: Composer) -> Option<usize> {
             return false;
         }
         let body = rail_body(lines[i]);
+        let body = body
+            .strip_prefix('[')
+            .and_then(|inner| inner.strip_suffix(']'))
+            .map(str::trim)
+            .unwrap_or(body);
         let keyed = key_led(body);
+        let separate_footer = i > composer.start && i + 1 == composer.end && divider(lines[i - 1]);
         let action = body.contains("submit")
+            || ((has_selection || separate_footer)
+                && (body.contains("select") || body.contains("toggle")))
             || (has_selection
-                && (body.contains("select")
-                    || body.contains("toggle")
-                    || body.contains("confirm")
+                && (body.contains("confirm")
                     || body.contains("open")
                     || body.contains("scroll")
                     || body.contains("navigate")));

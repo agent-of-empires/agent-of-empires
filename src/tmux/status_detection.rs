@@ -3820,6 +3820,97 @@ Final prose line.\n";
     }
 
     #[test]
+    fn omp_paged_questions_wait_without_a_visible_selection() {
+        for (top, side, separator, bottom, controls) in [
+            (
+                "+- Ask --------+",
+                "|",
+                "+--------------+",
+                "+--------------+",
+                "Enter select · n note · Up/Down · Esc cancel · PgUp/PgDn ↕",
+            ),
+            (
+                "+- Ask --------+",
+                "|",
+                "+--------------+",
+                "+--------------+",
+                "Space toggle · Enter next · Tab/Left/Right question · Esc cancel",
+            ),
+            (
+                "╭─ Ask ────────╮",
+                "│",
+                "├──────────────┤",
+                "╰──────────────╯",
+                "⏎ select · n note · ↑/↓ · ⎋ cancel",
+            ),
+            (
+                "╭─ Ask (9s) ───╮",
+                "│",
+                "├──────────────┤",
+                "╰──────────────╯",
+                "\u{f1050} toggle · \u{f0311} next · \u{f0312}/←/→ question · \u{f12b7} cancel",
+            ),
+            (
+                "╭─ Ask ────────╮",
+                "│",
+                "├──────────────┤",
+                "╰──────────────╯",
+                "Ctrl+T toggle · Ctrl+J next · k/j question · Ctrl+C cancel",
+            ),
+        ] {
+            for clipped in [false, true] {
+                let header = if clipped {
+                    String::new()
+                } else {
+                    format!("{top}\n")
+                };
+                let pane = format!("{header}{side} preview line 20 {side}\n{side} preview line 21 {side}\n{separator}\n{side} {controls} {side}\n{bottom}\n{}", "PLUGIN\n".repeat(12));
+                for title in ["", "π ⠋ Task"] {
+                    assert_eq!(
+                        observed_omp(&pane, title, true),
+                        Status::Waiting,
+                        "{pane}: {title}"
+                    );
+                }
+            }
+        }
+        for pane in [
+            "╭─ Ask ────────╮\n│ preview │\n├──────────────┤\n│ Enter select │\n╰──────────────╯",
+            "╭──────────────╮\n│ preview │\n│ ├──────────┤ │\n│ Enter select · Esc cancel │\n╰──────────────╯",
+        ] {
+            assert_eq!(observed_omp(pane, "", true), Status::Idle, "{pane}");
+        }
+    }
+
+    #[test]
+    fn omp_session_picker_accepts_bracketed_controls() {
+        for controls in [
+            "Delete/Backspace delete · Enter select · Tab all projects · Esc cancel",
+            "⏎ select · ⇥ current folder · ⎋ cancel",
+            "\u{f0311} select · \u{f0312} all projects · \u{f12b7} cancel",
+            "Ctrl+[ select · Ctrl+C cancel",
+        ] {
+            let pane = format!("╭─ Resume Session ───╮\n│ > Saved task │\n│ just now · 1kB │\n│ [{controls}] │\n╰────────────────────╯\n{}", "PLUGIN\n".repeat(12));
+            for title in ["", "π ⠋ Task"] {
+                assert_eq!(
+                    observed_omp(&pane, title, true),
+                    Status::Waiting,
+                    "{pane}: {title}"
+                );
+            }
+        }
+        for controls in [
+            "[Delete/Backspace delete · Enter select · Esc cancel",
+            "[[Delete/Backspace delete · Enter select · Esc cancel]]",
+        ] {
+            let pane = format!(
+                "╭─ Resume Session ───╮\n│ > Saved task │\n│ {controls} │\n╰────────────────────╯"
+            );
+            assert_eq!(observed_omp(&pane, "", true), Status::Idle, "{pane}");
+        }
+    }
+
+    #[test]
     fn omp_hidden_ask_stays_pending_until_independent_work_resumes() {
         for hidden in [
             "Ask hidden: Continue? · Alt+H/Enter show · Esc cancel",
