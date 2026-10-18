@@ -33,6 +33,7 @@ mod projects;
 mod rename;
 mod repo_trust;
 mod restart;
+mod sandbox_login;
 mod send_message;
 mod serve;
 mod skills_manager;
@@ -71,6 +72,7 @@ pub use projects::ProjectsDialog;
 pub use rename::{RenameData, RenameDialog, RenameMode};
 pub use repo_trust::{RepoTrustAction, RepoTrustDialog};
 pub use restart::{RestartData, RestartDialog};
+pub(crate) use sandbox_login::{LoginRequest, SandboxLoginDialog};
 pub use send_message::SendMessageDialog;
 pub use serve::{
     served_via, DashboardLaunch, ServeAction, ServeLaunchRequest, ServeStopRequest, ServeView,

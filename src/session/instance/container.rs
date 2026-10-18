@@ -1231,6 +1231,18 @@ impl Instance {
         )
     }
 
+    /// What a login for this session's launch is: the refusal its sandbox launch would get
+    /// from the gate, with the recovery that runs the same login. Resolves the file the
+    /// gate waits on (the session's profile, tool and own command), whether or not it
+    /// holds a login now; `None` when the tool declares no sandbox login.
+    pub(crate) fn sandbox_login_request(&self) -> Option<SandboxLoginRequired> {
+        let profile = self.effective_profile();
+        let session_command = Some(self.command.as_str()).filter(|c| !c.is_empty());
+        let target =
+            container_config::login_target_with_command(&profile, &self.tool, session_command)?;
+        Some(self.login_required(&target))
+    }
+
     /// [`Self::ensure_sandbox_launchable_for`] for a launch without a request.
     pub(crate) fn ensure_sandbox_launchable(
         &mut self,
