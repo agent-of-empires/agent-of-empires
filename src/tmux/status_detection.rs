@@ -3601,6 +3601,8 @@ Final prose line.\n";
                     Status::Running,
                 ),
                 (" ", "", "Any activity label", Status::Idle),
+                ("   ", "", "Any activity label", Status::Idle),
+                ("  \t", "", "Any activity label", Status::Idle),
                 ("  ", "", "to retry", Status::Idle),
             ] {
                 let pane = format!(
@@ -3708,6 +3710,30 @@ Final prose line.\n";
                 let pane =
                     format!("Output\n\n  Esc Earlier work\n\n{margin}{widget}\n\n╰─\nCAVEMAN");
                 assert_eq!(observed_omp(&pane, "", true), Status::Idle, "{pane}");
+            }
+        }
+    }
+
+    #[test]
+    fn omp_right_aligned_idle_title_hud_is_not_activity() {
+        for name in ["Daily notes", "I am done.", "Enter the meeting notes"] {
+            for width in [80, 120] {
+                let pane = format!(
+                    "\n{name:>width$}\n ⬢ Local ▶──────7%────────32K─\n╰─\n{}",
+                    "PLUGIN\n".repeat(12)
+                );
+                for title in ["", &format!("π: {name}")] {
+                    assert_eq!(
+                        observed_omp(&pane, title, true),
+                        Status::Idle,
+                        "{pane}: {title}"
+                    );
+                }
+                assert_eq!(
+                    observed_omp(&pane, "π ⠋ Task", true),
+                    Status::Running,
+                    "{pane}"
+                );
             }
         }
     }

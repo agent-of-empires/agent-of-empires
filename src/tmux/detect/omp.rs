@@ -580,8 +580,11 @@ impl<'a> Surface<'a> {
                 let explicit_maintenance = maintenance(text);
                 let regular = !explicit_maintenance
                     && !parked
-                    // The interrupt frame adds a column; compact rows need a live timer.
-                    && (text.starts_with("  ") || timed)
+                    // The interrupt frame and padding each add one column.
+                    && (text
+                        .strip_prefix("  ")
+                        .is_some_and(|key| !key.starts_with(char::is_whitespace))
+                        || timed)
                     && key_message(text).is_some_and(|message| {
                         let mut words = message.split_whitespace();
                         let first = words.next();
