@@ -2804,13 +2804,18 @@
       "id": "acp.tool-output-media",
       "kind": "vitest",
       "risk": "medium",
-      "specs": ["src/lib/acpTypes.test.ts", "src/components/acp/ToolCards.render.test.tsx"],
+      "specs": [
+        "src/lib/acpTypes.test.ts",
+        "src/components/acp/ToolCards.render.test.tsx",
+        "src/components/acp/ReadFileResult.test.tsx"
+      ],
       "components": [
         "web/src/components/acp/ToolCards.tsx",
         "web/src/lib/acpTypes.ts",
         "web/src/components/acp/CoreToolCards.tsx",
         "web/src/components/acp/GroupToolCards.tsx",
         "web/src/components/acp/NamedToolCards.tsx",
+        "web/src/components/acp/ReadFileResult.tsx",
         "web/src/components/acp/TodoCards.tsx",
         "web/src/components/acp/ToolCardChrome.tsx",
         "web/src/components/acp/ToolOutputMedia.tsx"

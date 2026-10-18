@@ -20,9 +20,13 @@ import {
   useToolCardExpansion,
   type ToolCardProps,
 } from "./ToolCardChrome";
+import { ReadFileResult } from "./ReadFileResult";
 import { ToolErrorBody } from "./ToolErrorBody";
 
 const ICON = "h-3.5 w-3.5";
+
+/** The text `completion_row` in src/acp/transcript.rs stands in with when a call returned nothing. */
+const COMPLETED_PLACEHOLDER = "completed";
 const META = "hidden md:inline text-[11px] text-text-dim";
 
 /** Fallback chain for a header's key field: real arg, then the ACP title, then the tool name. */
@@ -103,7 +107,12 @@ export function ReadToolCard({ tool, result }: ToolCardProps) {
   const path = useFilePath(rawPath);
   const range = formatRange(args);
   const ext = argPath?.match(/\.([a-z0-9]+)$/i)?.[1]?.toLowerCase();
-  const content = result?.text ?? "";
+  const text = result?.text ?? "";
+  const content = text === COMPLETED_PLACEHOLDER ? "" : text;
+  const { fileRefSession } = useAcpFileRef();
+  // An adapter that sends a Read no text leaves the card empty; the session still has the file.
+  const fetchFrom =
+    status === "ok" && !content && !result?.output?.length && argPath?.startsWith("/") ? fileRefSession?.id : undefined;
   const [open, setOpen] = useToolCardExpansion(status);
 
   return (
@@ -121,10 +130,19 @@ export function ReadToolCard({ tool, result }: ToolCardProps) {
         </>
       }
       expanded={open}
-      onToggle={status === "err" || content ? () => setOpen((v) => !v) : undefined}
+      onToggle={status === "err" || content || fetchFrom ? () => setOpen((v) => !v) : undefined}
       body={
         <ToolErrorBody status={status} errorText={result?.text}>
           {content && status !== "err" && <HighlightedBlock text={content} language={ext} maxLines={16} />}
+          {fetchFrom && (
+            <ReadFileResult
+              sessionId={fetchFrom}
+              path={argPath!}
+              offset={typeof args?.offset === "number" ? args.offset : undefined}
+              limit={typeof args?.limit === "number" ? args.limit : undefined}
+              language={ext}
+            />
+          )}
         </ToolErrorBody>
       }
     />

@@ -1,15 +1,9 @@
 import { useState } from "react";
 import { sessionRawFileUrl } from "../../lib/api";
+import { isImagePath } from "../../lib/imagePath";
 import { openInNewTab } from "../../lib/openInNewTab";
 import { useArtifactObjectUrl } from "../../hooks/useArtifactObjectUrl";
 import { Centered } from "./viewerChrome";
-
-// SVG is absent: the server never serves scriptable types inline.
-const IMAGE_EXTENSIONS = new Set(["png", "jpg", "jpeg", "gif", "webp", "avif", "bmp", "ico"]);
-
-function isImage(filePath: string): boolean {
-  return IMAGE_EXTENSIONS.has(filePath.slice(filePath.lastIndexOf(".") + 1).toLowerCase());
-}
 
 function basename(filePath: string): string {
   return filePath.slice(filePath.lastIndexOf("/") + 1);
@@ -17,7 +11,7 @@ function basename(filePath: string): string {
 
 /** A binary session file: images inline, anything else as a download. */
 export function BinaryFileView({ sessionId, filePath }: { sessionId: string; filePath: string }) {
-  return isImage(filePath) ? (
+  return isImagePath(filePath) ? (
     <ImageView key={`${sessionId} ${filePath}`} sessionId={sessionId} filePath={filePath} />
   ) : (
     <DownloadView sessionId={sessionId} filePath={filePath} />
