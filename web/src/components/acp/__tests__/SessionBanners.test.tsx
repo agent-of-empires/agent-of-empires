@@ -87,6 +87,76 @@ describe("WorkerRestartingBanner", () => {
   });
 });
 
+describe("SessionBanners login-required startup error", () => {
+  it("logs in the tool of the session it belongs to", async () => {
+    const fetchSpy = vi.fn().mockResolvedValue({
+      ok: true,
+      status: 200,
+      json: async () => ({ login_id: "login-1", url: "https://login.example.test/authorize?code=true" }),
+    });
+    vi.stubGlobal("fetch", fetchSpy);
+    render(
+      <SessionBanners
+        sessionId="s-1"
+        tool="claude-personal"
+        state={{
+          ...emptyAcpState(),
+          startupError: "sandbox login required for claude-personal: run `aoe sandbox login --tool claude-personal`",
+          startupCause: { kind: "sandbox_login_required" },
+        }}
+        acpWorkerState="absent"
+        trashedAt={null}
+        archivedAt={null}
+        snoozedUntil={null}
+        dismissError={() => {}}
+      />,
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Log in" }));
+    await waitFor(() =>
+      expect(fetchSpy).toHaveBeenCalledWith(
+        "/api/sandbox/login",
+        expect.objectContaining({ body: JSON.stringify({ force: false, tool: "claude-personal" }) }),
+      ),
+    );
+  });
+});
+
+describe("SessionBanners login-required startup error command and profile", () => {
+  it("hands the command and profile of the error to the login it starts", async () => {
+    const fetchSpy = vi.fn().mockResolvedValue({
+      ok: true,
+      status: 200,
+      json: async () => ({ login_id: "login-1", url: "https://login.example.test/authorize?code=true" }),
+    });
+    vi.stubGlobal("fetch", fetchSpy);
+    render(
+      <SessionBanners
+        sessionId="s-1"
+        tool="personal"
+        state={{
+          ...emptyAcpState(),
+          startupError: "sandbox login required for personal: run `aoe sandbox login --tool personal --command claude`",
+          startupCause: { kind: "sandbox_login_required", command: "claude", profile: "work" },
+        }}
+        acpWorkerState="absent"
+        trashedAt={null}
+        archivedAt={null}
+        snoozedUntil={null}
+        dismissError={() => {}}
+      />,
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Log in" }));
+    await waitFor(() =>
+      expect(fetchSpy).toHaveBeenCalledWith(
+        "/api/sandbox/login",
+        expect.objectContaining({
+          body: JSON.stringify({ force: false, tool: "personal", command: "claude", profile: "work" }),
+        }),
+      ),
+    );
+  });
+});
+
 describe("ScheduledWakeupBanner", () => {
   it("shows Waking… once fired, then self-dismisses after the grace window", () => {
     vi.useFakeTimers();

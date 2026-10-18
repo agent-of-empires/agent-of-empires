@@ -3583,3 +3583,114 @@ export function updateSetup(patch: SetupPatch): Promise<{ ok: boolean; message?:
 export function fetchSetupRuntimes(): Promise<RuntimeStatus[] | null> {
   return fetchJson<RuntimeStatus[]>("/api/setup/runtimes");
 }
+
+// --- Sandbox login ---
+
+export type SandboxLoginState = "needed" | "ok" | "not_applicable";
+
+export interface SandboxLoginStatus {
+  state: SandboxLoginState;
+  running: boolean;
+  heldSessions: number;
+}
+
+/**
+ * Null when the status cannot be read. Needs no elevation and never carries the link.
+ * `tool` is the agent whose shared credential file to read; the server picks the profile's default login tool when omitted.
+ * `command` is the one a session's launch runs for `tool` when it overrides the profile's, as the server named it.
+ * `profile` is the session's profile as the server named it in its error; the daemon's profile when omitted.
+ */
+export async function getSandboxLoginStatus(
+  tool?: string,
+  command?: string,
+  profile?: string,
+): Promise<SandboxLoginStatus | null> {
+  const params = new URLSearchParams();
+  if (tool) params.set("tool", tool);
+  // Only with its tool: the server refuses a command for no tool.
+  if (tool && command) params.set("command", command);
+  if (profile) params.set("profile", profile);
+  const query = params.toString() ? `?${params}` : "";
+  const body = await fetchJson<{
+    status?: { state?: SandboxLoginState };
+    running?: { login_id?: string } | null;
+    held_sessions?: number;
+  }>(`/api/sandbox/login${query}`, { headers: ACCEPT_JSON });
+  const state = body?.status?.state;
+  if (!state) return null;
+  return { state, running: Boolean(body?.running), heldSessions: body?.held_sessions ?? 0 };
+}
+
+/** A failed call: the server's `error` code and `message`, or only `message` on a network failure. */
+export interface SandboxLoginFailure {
+  kind: "error";
+  status: number;
+  code?: string;
+  message: string;
+}
+
+function sandboxLoginFailure(reply: Reply | null, fallback: string): SandboxLoginFailure {
+  if (!reply) return { kind: "error", status: 0, message: "Network error." };
+  return {
+    kind: "error",
+    status: reply.status,
+    code: stringField(reply.payload, "error"),
+    message: stringField(reply.payload, "message") ?? `${fallback} (HTTP ${reply.status}).`,
+  };
+}
+
+/**
+ * Start a login, or get the running one. `force` logs in although the credential is usable;
+ * `tool` names the agent whose shared credential file to log in (the server picks the profile's default login tool when omitted);
+ * `command` is the one a session's launch runs for `tool` when it overrides the profile's, as the server named it in its error;
+ * `profile` is the session's profile, as the server named it too (the daemon's profile when omitted).
+ */
+export async function startSandboxLogin(
+  force = false,
+  tool?: string,
+  command?: string,
+  profile?: string,
+): Promise<{ kind: "started"; loginId: string; lease?: string; url: string } | SandboxLoginFailure> {
+  const reply = await send("/api/sandbox/login", jsonInit("POST", { force, tool, command, profile })).catch(() => null);
+  const loginId = stringField(reply?.payload, "login_id");
+  const url = stringField(reply?.payload, "url");
+  if (reply?.ok && loginId && url) return { kind: "started", loginId, lease: stringField(reply.payload, "lease"), url };
+  return sandboxLoginFailure(reply, "Could not start the login");
+}
+
+/** Hand the code to the login client. `invalid_code` (400) leaves the login running; every other failure ended it. */
+export async function submitSandboxLoginCode(
+  loginId: string,
+  code: string,
+): Promise<{ kind: "ok" } | SandboxLoginFailure> {
+  const reply = await send(`/api/sandbox/login/${encodeURIComponent(loginId)}/code`, jsonInit("POST", { code })).catch(
+    () => null,
+  );
+  if (reply?.ok) return { kind: "ok" };
+  return sandboxLoginFailure(reply, "Could not submit the code");
+}
+
+/**
+ * What the code exchange of a login came to, for a client that lost the answer to its code.
+ * `null` when the server could not be asked.
+ */
+export async function getSandboxLoginOutcome(
+  loginId: string,
+): Promise<"succeeded" | "failed" | "pending" | "unknown" | null> {
+  const body = await fetchJson<{ outcome?: string }>(`/api/sandbox/login/${encodeURIComponent(loginId)}`, {
+    headers: ACCEPT_JSON,
+  });
+  const outcome = body?.outcome;
+  return outcome === "succeeded" || outcome === "failed" || outcome === "pending" || outcome === "unknown"
+    ? outcome
+    : null;
+}
+
+/**
+ * Best effort: the server also answers 204 for a login that already ended. The login is shared by
+ * the dialogs for one credential, so `lease` (from the start) leaves only this dialog's part of it.
+ */
+export async function cancelSandboxLogin(loginId: string, lease?: string): Promise<void> {
+  const query = lease ? `?lease=${encodeURIComponent(lease)}` : "";
+  await fetchOk(`/api/sandbox/login/${encodeURIComponent(loginId)}${query}`, { method: "DELETE" });
+}
