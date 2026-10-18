@@ -3789,6 +3789,37 @@ Final prose line.\n";
     }
 
     #[test]
+    fn omp_checkbox_questions_preserve_waiting_without_scroll_hints() {
+        for (ascii, cursor, controls) in [
+            (true, ">", "Space toggle · Enter next · Up/Down move · Tab/Left/Right question · Esc cancel · Alt+H hide"),
+            (false, "❯", "␣ toggle · ⏎ next · ↑/↓ move · ⇥/←/→ question · ⎋ cancel · Alt+H hide"),
+            (false, "\u{f054}", "\u{f1050} toggle · \u{f0311} next · ↑/↓ move · \u{f0312}/←/→ question · \u{f12b7} cancel"),
+        ] {
+            let (top, side, bottom) = if ascii {
+                ("+- Ask ------------------+", "|", "+------------------------+")
+            } else {
+                ("╭─ Ask ──────────────────╮", "│", "╰────────────────────────╯")
+            };
+            let pane = format!(
+                "{top}\n{side} first · second · Submit {side}\n{side} {cursor} [ ] Alpha {side}\n{side}   [ ] Beta {side}\n{side} {controls} {side}\n{bottom}\n{}",
+                "PLUGIN\n".repeat(12)
+            );
+            for title in ["", "π ⠋ Task"] {
+                assert_eq!(observed_omp(&pane, title, true), Status::Waiting, "{pane}: {title}");
+            }
+        }
+
+        for pane in [
+            "╭─ Ask ──────────────────╮\n│ [ ] Alpha │\n│ Space toggle · Enter next · Esc cancel │\n╰────────────────────────╯",
+            "╭────────────────────────╮\n│ > [ ] Alpha │\n│ Space toggle · Enter next · Esc cancel │\n╰─ Draft text ────────────╯",
+        ] {
+            for (title, expected) in [("", Status::Idle), ("π ⠋ Task", Status::Running)] {
+                assert_eq!(observed_omp(pane, title, true), expected, "{pane}: {title}");
+            }
+        }
+    }
+
+    #[test]
     fn omp_hidden_ask_stays_pending_until_independent_work_resumes() {
         for hidden in [
             "Ask hidden: Continue? · Alt+H/Enter show · Esc cancel",

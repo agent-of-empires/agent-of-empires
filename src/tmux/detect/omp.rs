@@ -388,6 +388,7 @@ fn dialog_footer(lines: &[&str], composer: Composer) -> Option<usize> {
         let action = body.contains("submit")
             || (has_selection
                 && (body.contains("select")
+                    || body.contains("toggle")
                     || body.contains("confirm")
                     || body.contains("open")
                     || body.contains("scroll")

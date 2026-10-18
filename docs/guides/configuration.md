@@ -218,9 +218,10 @@ Each rule sets `status` (`running`, `waiting`, `idle`, `error`) and exactly one 
 
 ### OMP terminal status
 
-Built-in OMP detection reads the visible pane and locates activity, blocking dialogs,
-and pinned errors relative to the current composer. Extension status rows, including
-plugin badges, do not need agent-specific matching rules.
+Built-in OMP detection reads the visible pane and locates activity, pinned errors,
+and blocking dialogs, including multi-question checkbox dialogs, relative to the
+current composer. Extension status rows, including plugin badges, do not need
+agent-specific matching rules.
 Editable composer text is excluded from dialog controls, even without status segments.
 
 A recognized working terminal title supplements visible controls; it does not
