@@ -1,9 +1,10 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-import type { ActivityRow, TranscriptRow } from "../../lib/acpTypes";
+import { emptyAcpState, type ActivityRow, type TranscriptRow } from "../../lib/acpTypes";
+import { reducer } from "./reducer";
 import { fetchReplay } from "./replay";
 
-type Page = { rows: TranscriptRow[]; next_cursor: number | null; has_more: boolean };
+type Page = { rows: TranscriptRow[]; next_cursor: number | null; has_more: boolean; highest_seq?: number };
 
 const row = (id: string, kind: TranscriptRow["kind"]): TranscriptRow => ({
   id,
@@ -14,13 +15,18 @@ const row = (id: string, kind: TranscriptRow["kind"]): TranscriptRow => ({
 });
 
 // `pages` are keyed by the `before` cursor they answer; the tail answers `before=MAX_SAFE_INTEGER`.
-function mockReplay(pages: Record<string, Page>) {
+// `since` pages answer `since=N` by cursor; the rows view carries `rows`, the frames view none.
+function mockReplay(pages: Record<string, Page>, since: Record<string, TranscriptRow[]> = {}) {
   const requests: string[] = [];
   vi.stubGlobal(
     "fetch",
     vi.fn(async (url: string) => {
       requests.push(url);
       const params = new URLSearchParams(url.split("?")[1]);
+      if (params.has("since")) {
+        const rows = params.get("view") === "rows" ? (since[params.get("since")!] ?? []) : null;
+        return new Response(JSON.stringify({ frames: [], rows, lost: false, highest_seq: 3000 }));
+      }
       const page = pages[params.get("before") ?? ""] ?? { rows: [], next_cursor: null, has_more: false };
       const body = params.has("before")
         ? { frames: [], rows: params.get("view") === "rows" ? page.rows : null, lost: false, highest_seq: 100, ...page }
@@ -60,6 +66,31 @@ describe("rows recovery for a cached cursor without history", () => {
     expect(requests.findIndex((u) => u.includes("before="))).toBeLessThan(
       requests.findIndex((u) => u.includes("since=")),
     );
+  });
+
+  it("keeps older forward rows out of the recovered transcript, but takes rows newer than the tail", async () => {
+    // The tail ends at seq 3000 (highest_seq); frames from the cached cursor 900 would replay older turns.
+    const requests = mockReplay(
+      {
+        [TAIL]: {
+          rows: [row("u2", "user_prompt"), row("t2", "tool_start")],
+          next_cursor: 2100,
+          has_more: true,
+          highest_seq: 3000,
+        },
+      },
+      {
+        "850": [row("u1", "user_prompt"), row("t1", "tool_start")],
+        "2950": [row("t2", "tool_start"), row("new", "agent_message")],
+      },
+    );
+    const actions: Parameters<typeof reducer>[1][] = [];
+    const cursor = { current: 900 };
+    await fetchReplay("sid", cursor, 0, (a) => actions.push(a), vi.fn(), new AbortController().signal);
+    const state = actions.reduce(reducer, { ...emptyAcpState(), lastSeq: 900 });
+    expect(state.activity.map((r) => r.id)).toEqual(["u2", "t2", "new"]);
+    expect(requests.some((u) => u.includes("since=850") && u.includes("view=rows"))).toBe(false);
+    expect(requests.some((u) => u.includes("since=2950") && u.includes("view=rows"))).toBe(true);
   });
 
   it("only folds forward when history is already loaded", async () => {

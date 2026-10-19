@@ -54,10 +54,12 @@ export async function fetchReplay(
   try {
     if (lastSeq.current === 0) await fetchTail(sid, lastSeq, true, dispatch, setHasMoreOlder, signal);
     else if (oldestSeq === 0) {
-      // Rows only: the cached control state is cursor-aware and must see each frame once, from its own cursor.
+      // Cached control state is cursor-aware and must see each frame once, from its own cursor. Forward rows
+      // from that cursor would append older turns after the recovered tail, so rows resume at the tail's end.
       const from = lastSeq.current;
-      await fetchTail(sid, lastSeq, false, dispatch, setHasMoreOlder, signal);
-      await fetchForward(sid, from, dispatch, signal);
+      const tailEnd = await fetchTail(sid, lastSeq, false, dispatch, setHasMoreOlder, signal);
+      await fetchForward(sid, from, dispatch, signal, "frames");
+      if (tailEnd !== null) await fetchForward(sid, tailEnd, dispatch, signal, "rows");
     } else await fetchForward(sid, lastSeq.current, dispatch, signal);
   } catch {
     // Best effort.
@@ -71,16 +73,16 @@ async function fetchTail(
   dispatch: Dispatch,
   setHasMoreOlder: (value: boolean) => void,
   signal: AbortSignal,
-): Promise<void> {
+): Promise<number | null> {
   const [tailRes, tailRowsRes] = await getReplayPair(sid, `before=${TAIL_BEFORE}&limit=${REPLAY_PAGE_SIZE}`, signal);
-  if (!tailRes.ok) return;
+  if (!tailRes.ok) return null;
   const tail = (await tailRes.json()) as ReplayPageResponse;
   signal.throwIfAborted();
   if (tail.lost) {
     dispatch({ kind: "lagged", skipped: tail.highest_seq });
-    return;
+    return null;
   }
-  if (!tailRowsRes.ok) return;
+  if (!tailRowsRes.ok) return null;
   let rows = toActivityRows(await readRows(tailRowsRes), sid);
   let cursor = tail.next_cursor ?? 0;
   let hasMore = tail.has_more ?? false;
@@ -119,17 +121,32 @@ async function fetchTail(
     }
   }
   dispatch({ kind: "lagged_resolved" });
+  return tail.highest_seq;
 }
 
-async function fetchForward(sid: string, lastSeq: number, dispatch: Dispatch, signal: AbortSignal): Promise<void> {
+type ForwardLegs = "both" | "frames" | "rows";
+
+async function fetchForward(
+  sid: string,
+  lastSeq: number,
+  dispatch: Dispatch,
+  signal: AbortSignal,
+  legs: ForwardLegs = "both",
+): Promise<void> {
   const firstSince = Math.max(0, lastSeq - REPLAY_OVERLAP);
   let cursor = firstSince;
   let target: number | null = null;
   for (;;) {
-    const [res, rowsRes] = await getReplayPair(sid, `since=${cursor}&limit=${REPLAY_PAGE_SIZE}`, signal);
-    if (!res.ok || !rowsRes.ok) return;
+    const params = `since=${cursor}&limit=${REPLAY_PAGE_SIZE}`;
+    // `rows` mode reads only the rows view, which also carries the cursor fields.
+    const rowsOnly = legs === "rows";
+    const [res, rowsRes] = await Promise.all([
+      getReplay(sid, rowsOnly ? `${params}&view=rows` : params, signal),
+      legs === "both" ? getReplay(sid, `${params}&view=rows`, signal) : null,
+    ]);
+    if (!res.ok || (rowsRes && !rowsRes.ok)) return;
     const data = (await res.json()) as ReplayPageResponse;
-    const pageRows = await readRows(rowsRes);
+    const pageRows = rowsOnly ? (data.rows ?? []) : rowsRes ? await readRows(rowsRes) : [];
     signal.throwIfAborted();
     if (target === null) {
       target = data.highest_seq;
@@ -140,8 +157,8 @@ async function fetchForward(sid: string, lastSeq: number, dispatch: Dispatch, si
       dispatch({ kind: "lagged", skipped: data.highest_seq });
       return;
     }
-    if (data.frames.length > 0 || pageRows.length > 0) {
-      dispatch({ kind: "frames", frames: data.frames, rows: toActivityRows(pageRows, sid) });
+    if ((data.frames ?? []).length > 0 || pageRows.length > 0) {
+      dispatch({ kind: "frames", frames: data.frames ?? [], rows: toActivityRows(pageRows, sid) });
     }
     const next = data.next_cursor;
     if (!(data.has_more && next != null && next > cursor && next < target)) break;
