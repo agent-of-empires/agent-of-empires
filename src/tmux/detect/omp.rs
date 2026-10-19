@@ -5,14 +5,74 @@ use std::sync::LazyLock;
 use regex::Regex;
 use unicode_width::UnicodeWidthStr;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum OmpCueState {
-    Unowned,
-    Unmarked,
-    Working,
+use super::adapter::Adapter;
+use super::region::{Evidence, Rows, Screen};
+use super::{CapturePolicy, CaptureScope, Observation};
+
+pub(super) static ADAPTER: Adapter = Adapter {
+    capture: CapturePolicy {
+        scope: CaptureScope::Visible,
+        fetch_missing_title: true,
+        observe_ownership: true,
+    },
+    evidence_names: &["activity", "dialog", "hidden_ask", "working_title", "error"],
+    observation_token: |observation| {
+        Some(if !observation.live_owned {
+            0
+        } else if title_is_working(observation.title) {
+            2
+        } else {
+            1
+        })
+    },
+    evaluate: |manifest, rows, observation| {
+        with_screen(rows, observation, |screen| {
+            manifest.evaluate(screen, observation.hook)
+        })
+    },
+    #[cfg(test)]
+    rule_matches: |manifest, rule, rows, observation| {
+        with_screen(rows, observation, |screen| {
+            manifest.rule_matches(rule, screen, observation.hook)
+        })
+    },
+};
+
+fn with_screen<'a, T>(
+    mut rows: Rows<'a>,
+    observation: &Observation<'a>,
+    evaluate: impl FnOnce(&Screen<'_>) -> T,
+) -> T {
+    let surface = Surface::new(rows.source, &mut rows.non_empty, &rows.blank_before);
+    let live = |evidence| {
+        if observation.live_owned {
+            evidence
+        } else {
+            Evidence::default()
+        }
+    };
+    let evidence = [
+        live(surface.activity),
+        live(surface.dialog),
+        live(surface.hidden_ask),
+        if observation.live_owned && title_is_working(observation.title) {
+            Evidence {
+                text: observation.title,
+                bottom_offset: 0,
+            }
+        } else {
+            Evidence::default()
+        },
+        if observation.live_owned && !surface.error.text.is_empty() {
+            surface.error
+        } else {
+            surface.legacy_error
+        },
+    ];
+    evaluate(&Screen::new(rows, observation.title, &evidence))
 }
 
-pub(super) fn title_is_working(title: &str) -> bool {
+fn title_is_working(title: &str) -> bool {
     let Some(rest) = title.strip_prefix("π ") else {
         return false;
     };
@@ -25,28 +85,20 @@ pub(super) fn title_is_working(title: &str) -> bool {
     ) && (rest.len() == frame.len_utf8() || rest[frame.len_utf8()..].starts_with(' '))
 }
 
-#[derive(Default)]
-pub(super) struct Fragment<'a> {
-    pub text: &'a str,
-    pub bottom_offset: usize,
-}
-
-impl<'a> Fragment<'a> {
-    fn line(lines: &[&'a str], index: usize) -> Self {
-        Self {
-            text: lines[index],
-            bottom_offset: lines.len() - index - 1,
-        }
+fn line_evidence<'a>(lines: &[&'a str], index: usize) -> Evidence<'a> {
+    Evidence {
+        text: lines[index],
+        bottom_offset: lines.len() - index - 1,
     }
 }
 
 #[derive(Default)]
-pub(super) struct Surface<'a> {
-    pub activity: Fragment<'a>,
-    pub dialog: Fragment<'a>,
-    pub hidden_ask: Fragment<'a>,
-    pub error: Fragment<'a>,
-    pub legacy_error: Fragment<'a>,
+struct Surface<'a> {
+    activity: Evidence<'a>,
+    dialog: Evidence<'a>,
+    hidden_ask: Evidence<'a>,
+    error: Evidence<'a>,
+    legacy_error: Evidence<'a>,
 }
 
 #[derive(Clone, Copy)]
@@ -529,7 +581,7 @@ fn maintenance(text: &str) -> bool {
 }
 
 impl<'a> Surface<'a> {
-    pub fn new(source: &'a str, lines: &mut [&'a str], blank_before: &[bool]) -> Self {
+    fn new(source: &'a str, lines: &mut [&'a str], blank_before: &[bool]) -> Self {
         let current = find_composer(lines, blank_before, lines.len());
         let mut dialog = current
             .and_then(|composer| dialog_footer(lines, composer).map(|footer| (composer, footer)));
@@ -547,8 +599,8 @@ impl<'a> Surface<'a> {
                     .rev()
                     .find(|&i| error_caption_start(lines, blank_before, i).is_some())
             })
-            .map_or_else(Fragment::default, |close| Fragment::line(lines, close));
-        let mut activity = Fragment::default();
+            .map_or_else(Evidence::default, |close| line_evidence(lines, close));
+        let mut activity = Evidence::default();
         let mut activity_start = None;
         let mut cards = None;
         if let Some(composer) = current {
@@ -601,7 +653,7 @@ impl<'a> Surface<'a> {
                         .filter(|&i| i < composer.start && !blank_before[i])
                         .unwrap_or(end - 1)
                         .max(end - 1);
-                    activity = Fragment::line(lines, marker);
+                    activity = line_evidence(lines, marker);
                     activity_start = Some(start);
                     break;
                 }
@@ -652,13 +704,13 @@ impl<'a> Surface<'a> {
                     .windows(DISMISSAL.len())
                     .any(|window| window.eq_ignore_ascii_case(DISMISSAL.as_bytes()))
             })
-            .map_or_else(Fragment::default, |(i, _)| Fragment::line(lines, i));
+            .map_or_else(Evidence::default, |(i, _)| line_evidence(lines, i));
         Self {
             activity,
-            dialog: dialog.map_or_else(Fragment::default, |(_, footer)| {
-                Fragment::line(lines, footer)
+            dialog: dialog.map_or_else(Evidence::default, |(_, footer)| {
+                line_evidence(lines, footer)
             }),
-            hidden_ask: hidden.map_or_else(Fragment::default, |i| Fragment::line(lines, i)),
+            hidden_ask: hidden.map_or_else(Evidence::default, |i| line_evidence(lines, i)),
             error,
             legacy_error,
         }

@@ -14,7 +14,7 @@ max_depth = 12
 id = "current_hidden_ask"
 state = "waiting"
 priority = 980
-region = "omp_hidden_ask"
+region = "evidence(hidden_ask)"
 visible = true
 regex = ['\S']
 
@@ -23,7 +23,7 @@ id = "current_activity"
 state = "running"
 priority = 970
 positional = true
-region = "omp_activity"
+region = "evidence(activity)"
 visible = true
 regex = ['\S']
 
@@ -32,7 +32,7 @@ id = "current_dialog"
 state = "waiting"
 priority = 970
 positional = true
-region = "omp_dialog"
+region = "evidence(dialog)"
 visible = true
 regex = ['\S']
 
@@ -40,7 +40,7 @@ regex = ['\S']
 id = "osc_title_working"
 state = "running"
 priority = 969
-region = "omp_working_title"
+region = "evidence(working_title)"
 visible = true
 regex = ['\S']
 
@@ -236,7 +236,7 @@ id = "banner_dismissal"
 state = "error"
 priority = 970
 positional = true
-region = "omp_error"
+region = "evidence(error)"
 visible = true
 regex = ['\S']
 

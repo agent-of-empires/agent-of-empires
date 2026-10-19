@@ -18,11 +18,11 @@ pub(crate) mod utils;
 pub(crate) mod vt;
 
 pub use composite::PaneGeom;
-pub use detect::{HookObservation, Observation, OmpCueState};
+pub use detect::{HookObservation, Observation, ObservationKey};
 pub(crate) use session::{peel_trailing_semicolons, submit_text, SubmitText};
 pub use session::{PaneCursor, PaneEnvMutation, Session, SIZE_OWNER_HEARTBEAT, SIZE_OWNER_TTL};
 pub use status_bar::{get_session_info_for_current, get_status_for_current_session};
-pub use status_detection::{detect_status_from_content_in, detect_with_rules};
+pub use status_detection::{detect_status_from_content_in, DetectionPlan};
 pub use terminal_session::{kill_all_terminals_for_id, ContainerTerminalSession, TerminalSession};
 pub use tool_session::{kill_all_tool_sessions_for_id, ToolSession};
 pub use utils::{attach_return_hint, tmux_prefix_display};
@@ -3841,7 +3841,13 @@ mod tests {
             instance.detection = crate::session::DetectionState {
                 activity: Some(1),
                 captured_at: Some(2),
-                omp_cues: Some(OmpCueState::Unmarked),
+                observation_key: DetectionPlan::for_manifest(
+                    &instance.source_profile,
+                    "omp",
+                    "omp",
+                )
+                .unwrap()
+                .observation_key(&Observation::new("", None, true)),
                 ..Default::default()
             };
             let _ = fork_probe::take();

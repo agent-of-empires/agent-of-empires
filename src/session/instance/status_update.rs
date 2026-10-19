@@ -10,8 +10,8 @@ fn skip_capture(
     last_capture_second: Option<i64>,
     has_hook: bool,
     pending: bool,
-    omp_cues: Option<tmux::OmpCueState>,
-    last_omp_cues: Option<tmux::OmpCueState>,
+    observation_key: Option<tmux::ObservationKey>,
+    last_observation_key: Option<tmux::ObservationKey>,
 ) -> bool {
     let Some(activity) = activity else {
         return false;
@@ -20,7 +20,7 @@ fn skip_capture(
         && last_capture_second.is_some_and(|taken| taken > activity)
         && !has_hook
         && !pending
-        && omp_cues == last_omp_cues
+        && observation_key == last_observation_key
 }
 
 /// How long a `running` hook write keeps its authority for an agent that is still on a hand-written
@@ -405,7 +405,7 @@ impl Instance {
             .unwrap_or_else(|| session.is_pane_running_shell())
     }
 
-    pub(crate) fn allow_live_omp_cues(
+    pub(crate) fn live_pane_owned(
         &self,
         session: &tmux::Session,
         metadata: Option<&tmux::PaneMetadata>,
@@ -445,31 +445,30 @@ impl Instance {
         is_dead: bool,
     ) {
         let activity = metadata.and_then(|m| m.window_activity);
-        let builtin_omp =
-            agent == "omp" && !tmux::status_rules::has_rules(&self.source_profile, rules_tool);
+        let plan = tmux::DetectionPlan::for_manifest(&self.source_profile, rules_tool, agent)
+            .expect("manifest was resolved before polling");
+        let policy = plan.capture_policy();
         let fetched_title;
         let osc_title = match metadata.and_then(|m| m.pane_title.as_deref()) {
             Some(title) => title,
-            None if builtin_omp => {
+            None if policy.fetch_missing_title => {
                 fetched_title = tmux::utils::pane_title(session.name()).unwrap_or_default();
                 &fetched_title
             }
             None => "",
         };
-        let observation = tmux::Observation::new(
-            osc_title,
-            hook,
-            !builtin_omp || self.allow_live_omp_cues(session, metadata, is_dead),
-        );
-        let omp_cues = builtin_omp.then(|| observation.omp_cues());
+        let live_owned =
+            !policy.observe_ownership || self.live_pane_owned(session, metadata, is_dead);
+        let observation = tmux::Observation::new(osc_title, hook, live_owned);
+        let observation_key = plan.observation_key(&observation);
         let screen_unchanged = skip_capture(
             activity,
             self.detection.activity,
             self.detection.captured_at,
             hook.is_some(),
             self.detection.pending.is_some(),
-            omp_cues,
-            self.detection.omp_cues,
+            observation_key,
+            self.detection.observation_key,
         );
 
         if screen_unchanged {
@@ -482,17 +481,10 @@ impl Instance {
         // Stamped before the capture, never after.
         let captured_at = Utc::now().timestamp();
         let pane_content = session
-            .capture_pane(if builtin_omp { 0 } else { 50 })
+            .capture_pane(policy.scope.lines())
             .unwrap_or_default();
         let clean = tmux::utils::strip_ansi(&pane_content);
-        let detection = tmux::detect_with_rules(
-            &self.source_profile,
-            rules_tool,
-            agent,
-            &clean,
-            &observation,
-        )
-        .unwrap_or_else(tmux::detect::Detection::idle_by_default);
+        let detection = plan.detect(&clean, &observation);
 
         let Some(candidate) = detection.status else {
             // The screen is an agent-owned viewer; the last known status
@@ -500,7 +492,7 @@ impl Instance {
             self.detection.activity = activity;
             self.detection.captured_at = Some(captured_at);
             self.detection.rule = Some(detection.rule);
-            self.detection.omp_cues = omp_cues;
+            self.detection.observation_key = observation_key;
             return;
         };
 
@@ -511,8 +503,8 @@ impl Instance {
             || (candidate == Status::Waiting && !detection.visible))
             && !has_command_override
             && !is_dead
-            && if builtin_omp {
-                omp_cues == Some(tmux::OmpCueState::Unowned)
+            && if policy.observe_ownership {
+                !live_owned
             } else {
                 self.pane_is_stale_shell(metadata, session)
             };
@@ -539,7 +531,7 @@ impl Instance {
         self.detection.activity = activity;
         self.detection.captured_at = Some(captured_at);
         self.detection.rule = Some(detection.rule);
-        self.detection.omp_cues = omp_cues;
+        self.detection.observation_key = observation_key;
         tracing::trace!(target: "session.store",
             "status '{}': manifest rule={} candidate={:?} visible={} -> {:?}",
             self.title, detection.rule, candidate, detection.visible, self.status);
@@ -598,20 +590,27 @@ mod tests {
     }
 
     #[test]
-    fn omp_cue_changes_invalidate_cached_status_in_both_directions() {
-        use tmux::OmpCueState::{Unmarked, Unowned, Working};
+    fn observation_changes_invalidate_cached_status_in_both_directions() {
+        let plan =
+            tmux::DetectionPlan::for_manifest("observation-cache-test", "omp", "omp").unwrap();
+        let unmarked = plan.observation_key(&tmux::Observation::new("", None, true));
+        let working = plan.observation_key(&tmux::Observation::new("π ⠋ Task", None, true));
+        let next_frame =
+            plan.observation_key(&tmux::Observation::new("π / Other title", None, true));
+        let unowned = plan.observation_key(&tmux::Observation::new("π ⠋ Task", None, false));
         for (current, previous, skip) in [
-            (Some(Unmarked), Some(Unmarked), true),
-            (Some(Working), Some(Working), true),
-            (Some(Unowned), Some(Unowned), true),
-            (Some(Working), Some(Unmarked), false),
-            (Some(Unmarked), Some(Working), false),
-            (Some(Unowned), Some(Working), false),
-            (Some(Working), Some(Unowned), false),
-            (Some(Unowned), Some(Unmarked), false),
-            (Some(Unmarked), Some(Unowned), false),
-            (Some(Unmarked), None, false),
-            (None, Some(Working), false),
+            (unmarked, unmarked, true),
+            (working, working, true),
+            (next_frame, working, true),
+            (unowned, unowned, true),
+            (working, unmarked, false),
+            (unmarked, working, false),
+            (unowned, working, false),
+            (working, unowned, false),
+            (unowned, unmarked, false),
+            (unmarked, unowned, false),
+            (unmarked, None, false),
+            (None, working, false),
         ] {
             assert_eq!(
                 skip_capture(

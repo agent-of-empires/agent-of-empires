@@ -3,7 +3,39 @@
 
 use std::sync::OnceLock;
 
-use super::{omp, Observation, OmpCueState};
+/// Capture rows before surface preprocessing and recent-window truncation.
+pub(super) struct Rows<'a> {
+    pub source: &'a str,
+    pub non_empty: Vec<&'a str>,
+    pub blank_before: Vec<bool>,
+}
+
+impl<'a> Rows<'a> {
+    pub fn new(source: &'a str) -> Self {
+        let mut non_empty = Vec::new();
+        let mut blank_before = Vec::new();
+        let mut after_blank = false;
+        for line in source.lines() {
+            if line.trim().is_empty() {
+                after_blank = true;
+                continue;
+            }
+            non_empty.push(line);
+            blank_before.push(std::mem::take(&mut after_blank));
+        }
+        Self {
+            source,
+            non_empty,
+            blank_before,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Default)]
+pub(super) struct Evidence<'a> {
+    pub text: &'a str,
+    pub bottom_offset: usize,
+}
 
 /// The pane, sliced lazily once per capture.
 pub(super) struct Screen<'a> {
@@ -12,9 +44,7 @@ pub(super) struct Screen<'a> {
     /// Whether a blank row sat above each [`Self::recent`] line.
     blank_before: Vec<bool>,
     osc_title: &'a str,
-    omp: Option<omp::Surface<'a>>,
-    omp_allowed: bool,
-    omp_working_title: bool,
+    evidence: &'a [Evidence<'a>],
     joined: OnceLock<String>,
     collapsed: OnceLock<String>,
     unstacked: OnceLock<String>,
@@ -109,11 +139,8 @@ pub(super) enum Region {
     AfterLastRule,
     /// The OSC 0/2 terminal title.
     OscTitle,
-    OmpActivity,
-    OmpDialog,
-    OmpHiddenAsk,
-    OmpWorkingTitle,
-    OmpError,
+    /// A borrowed surface fragment supplied by the registered adapter.
+    Evidence(usize),
     /// The `prompt_marker` line and below, else the whole window.
     FromPromptMarker,
     BeforePromptMarker,
@@ -126,7 +153,16 @@ pub(super) enum Region {
 
 impl Region {
     /// Marker region names are leaked once at compile time (process lifetime).
-    pub(super) fn parse(raw: &str) -> Option<Self> {
+    pub(super) fn parse(raw: &str, evidence_names: &[&str]) -> Option<Self> {
+        if let Some(name) = raw
+            .strip_prefix("evidence(")
+            .and_then(|rest| rest.strip_suffix(')'))
+        {
+            return evidence_names
+                .iter()
+                .position(|declared| *declared == name.trim())
+                .map(Region::Evidence);
+        }
         if let Some(rest) = raw.strip_prefix("after(").and_then(|r| r.strip_suffix(')')) {
             let (name, limit) = match rest.split_once(',') {
                 Some((name, n)) => (name, Some(n.trim().parse().ok()?)),
@@ -164,11 +200,6 @@ impl Region {
             "prompt_box_body" => Region::PromptBoxBody,
             "after_last_horizontal_rule" => Region::AfterLastRule,
             "osc_title" => Region::OscTitle,
-            "omp_activity" => Region::OmpActivity,
-            "omp_dialog" => Region::OmpDialog,
-            "omp_hidden_ask" => Region::OmpHiddenAsk,
-            "omp_working_title" => Region::OmpWorkingTitle,
-            "omp_error" => Region::OmpError,
             "from_prompt_marker" => Region::FromPromptMarker,
             "before_prompt_marker" => Region::BeforePromptMarker,
             _ => return None,
@@ -177,30 +208,19 @@ impl Region {
 }
 
 impl<'a> Screen<'a> {
-    pub(super) fn new(clean_screen: &'a str, observation: &Observation<'a>, agent: &str) -> Self {
-        let mut non_empty: Vec<&str> = Vec::new();
-        let mut blank_before: Vec<bool> = Vec::new();
-        let mut after_blank = false;
-        for line in clean_screen.lines() {
-            if line.trim().is_empty() {
-                after_blank = true;
-                continue;
-            }
-            non_empty.push(line);
-            blank_before.push(std::mem::take(&mut after_blank));
-        }
-        let omp = (agent == "omp")
-            .then(|| omp::Surface::new(clean_screen, &mut non_empty, &blank_before));
-        let start = non_empty.len().saturating_sub(RECENT_LINES);
-        non_empty.drain(..start);
-        blank_before.drain(..start);
+    pub(super) fn new(
+        mut rows: Rows<'a>,
+        osc_title: &'a str,
+        evidence: &'a [Evidence<'a>],
+    ) -> Self {
+        let start = rows.non_empty.len().saturating_sub(RECENT_LINES);
+        rows.non_empty.drain(..start);
+        rows.blank_before.drain(..start);
         Self {
-            recent: non_empty,
-            blank_before,
-            osc_title: observation.title,
-            omp,
-            omp_allowed: observation.allow_live_cues,
-            omp_working_title: agent == "omp" && observation.omp_cues() == OmpCueState::Working,
+            recent: rows.non_empty,
+            blank_before: rows.blank_before,
+            osc_title,
+            evidence,
             joined: OnceLock::new(),
             collapsed: OnceLock::new(),
             unstacked: OnceLock::new(),
@@ -249,20 +269,7 @@ impl<'a> Screen<'a> {
                 .after_last_rule
                 .get_or_init(|| self.compute_after_last_rule()),
             Region::OscTitle => self.osc_title,
-            Region::OmpActivity | Region::OmpDialog | Region::OmpHiddenAsk => self
-                .omp_fragment(region)
-                .filter(|_| self.omp_allowed)
-                .map_or("", |fragment| fragment.text),
-            Region::OmpWorkingTitle => {
-                if self.omp_working_title {
-                    self.osc_title
-                } else {
-                    ""
-                }
-            }
-            Region::OmpError => self
-                .omp_fragment(region)
-                .map_or("", |fragment| fragment.text),
+            Region::Evidence(index) => self.evidence[index].text,
             Region::FromPromptMarker => {
                 self.from_marker
                     .get_or_init(|| match self.marker_index(prompt_marker) {
@@ -309,24 +316,11 @@ impl<'a> Screen<'a> {
         })
     }
 
-    fn omp_fragment(&self, region: Region) -> Option<&omp::Fragment<'a>> {
-        let surface = self.omp.as_ref()?;
-        match region {
-            Region::OmpActivity => Some(&surface.activity),
-            Region::OmpDialog => Some(&surface.dialog),
-            Region::OmpHiddenAsk => Some(&surface.hidden_ask),
-            Region::OmpError => Some(if self.omp_allowed && !surface.error.text.is_empty() {
-                &surface.error
-            } else {
-                &surface.legacy_error
-            }),
-            _ => None,
-        }
-    }
-
     pub(super) fn region_bottom_offset(&self, region: Region) -> usize {
-        self.omp_fragment(region)
-            .map_or(0, |fragment| fragment.bottom_offset)
+        match region {
+            Region::Evidence(index) => self.evidence[index].bottom_offset,
+            _ => 0,
+        }
     }
 
     fn marker_index(&self, prompt_marker: &[regex::Regex]) -> Option<usize> {
