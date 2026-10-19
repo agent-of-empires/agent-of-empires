@@ -6,7 +6,7 @@ use std::sync::Mutex;
 
 use serde::{Deserialize, Serialize};
 
-use crate::acp::state::ConfigOptionDescriptor;
+use crate::acp::state::{ConfigOptionCategory, ConfigOptionDescriptor};
 
 const CATALOG_VERSION: u32 = 1;
 const CATALOG_FILE: &str = "acp_option_catalog.json";
@@ -59,6 +59,21 @@ pub fn load() -> OptionCatalog {
         Ok(catalog) if catalog.version == CATALOG_VERSION => catalog,
         _ => OptionCatalog::default(),
     }
+}
+
+/// Every effort value `agent` has advertised on a thought-level option; empty
+/// when the agent or such an option has not been observed.
+pub fn thought_level_choices(agent: &str) -> Vec<String> {
+    let mut choices: Vec<String> = load()
+        .agents
+        .get(agent)
+        .into_iter()
+        .flat_map(|entry| entry.options.iter())
+        .filter(|opt| opt.category == ConfigOptionCategory::ThoughtLevel)
+        .flat_map(|opt| opt.options.iter().map(|choice| choice.value.clone()))
+        .collect();
+    choices.dedup();
+    choices
 }
 
 /// Options with `current_value` cleared, for storage and comparison.
@@ -120,7 +135,7 @@ fn write(catalog: &OptionCatalog) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::acp::state::{ConfigOptionCategory, ConfigOptionChoice};
+    use crate::acp::state::ConfigOptionChoice;
     use crate::session::test_support::isolate_app_dir;
     use serial_test::serial;
 
@@ -167,5 +182,37 @@ mod tests {
 
         record("", &[descriptor("gpt-5")], "2026-07-03T00:00:00Z".into()).unwrap();
         assert_eq!(load().agents.len(), 1, "an empty agent name is ignored");
+    }
+
+    #[test]
+    #[serial]
+    fn thought_level_choices_collects_only_thought_level_options() {
+        let _tmp = isolate_app_dir();
+        let effort = |id: &str, values: &[&str]| ConfigOptionDescriptor {
+            id: id.into(),
+            name: id.into(),
+            description: None,
+            category: ConfigOptionCategory::ThoughtLevel,
+            current_value: String::new(),
+            options: values
+                .iter()
+                .map(|value| ConfigOptionChoice {
+                    value: (*value).into(),
+                    name: (*value).into(),
+                    description: None,
+                })
+                .collect(),
+        };
+        record(
+            "codex",
+            &[descriptor(""), effort("reasoning", &["low", "high"])],
+            "2026-07-03T00:00:00Z".into(),
+        )
+        .unwrap();
+        record("claude", &[descriptor("")], "2026-07-03T00:00:00Z".into()).unwrap();
+
+        assert_eq!(thought_level_choices("codex"), ["low", "high"]);
+        assert!(thought_level_choices("claude").is_empty());
+        assert!(thought_level_choices("missing").is_empty());
     }
 }

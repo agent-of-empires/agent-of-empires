@@ -4538,6 +4538,7 @@ mod tests {
             (Some(&flat), Some("  "), Some(""), Some("def"), Some("lo")),
             (Some(&keyed), None, None, Some("def"), Some("hi")),
             (Some(&keyed), Some("req"), None, Some("req"), Some("lo")),
+            (Some(&keyed), None, Some("med"), Some("def"), Some("med")),
             (
                 Some(&bare),
                 Some(" def "),

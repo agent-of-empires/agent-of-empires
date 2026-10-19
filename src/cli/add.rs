@@ -162,6 +162,12 @@ pub struct AddArgs {
     #[arg(long = "model")]
     model: Option<String>,
 
+    /// Reasoning effort for the ACP agent (e.g., low, medium, high). Checked
+    /// against the agent's known thought-level choices when cached. Structured
+    /// view only.
+    #[arg(long = "effort")]
+    effort: Option<String>,
+
     /// Create the session in a fresh scratch directory under
     /// `<app_dir>/scratch/<id>/` instead of a project path. The directory is
     /// removed when the session is deleted (unless `aoe rm` is given
@@ -672,14 +678,56 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
         }
     }
 
+    let explicit_effort = args
+        .effort
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+
+    if let Some(effort) = explicit_effort.as_deref() {
+        let checked = if instance.is_structured() {
+            check_effort(
+                &agent_name,
+                effort,
+                &crate::acp::option_catalog::thought_level_choices(&agent_name),
+            )
+        } else {
+            Err(anyhow::anyhow!(
+                "--effort needs the structured view, but this session uses the terminal view.\n\
+                 Pass --agent or --structured-view with an installed ACP adapter."
+            ))
+        };
+        match checked {
+            Ok(Some(warning)) => eprintln!("warning: {warning}"),
+            Ok(None) => {}
+            Err(e) => {
+                cleanup_partial_session(
+                    &path,
+                    instance.worktree_info.as_ref(),
+                    instance.workspace_info.as_ref(),
+                    args.create_branch,
+                    if instance.scratch {
+                        Some(std::path::Path::new(&instance.project_path))
+                    } else {
+                        None
+                    },
+                    None,
+                );
+                return Err(e);
+            }
+        }
+    }
+
     if instance.is_structured() {
         let defaults = config.acp.acp_defaults_for(&agent_name);
         instance.agent_model = crate::session::config::resolve_spawn_model_effort(
             defaults,
             instance.agent_model.take(),
-            None,
+            explicit_effort.clone(),
         )
         .0;
+        instance.acp_effort = explicit_effort;
     }
 
     if let Some(seed) = fork_seed {
@@ -1196,6 +1244,23 @@ fn prompt_session_title(default_title: &str) -> Result<String> {
     })
 }
 
+/// Fail when the agent's thought-level choices are known and `effort` is not
+/// one of them; warn when they are not known yet.
+fn check_effort(agent: &str, effort: &str, choices: &[String]) -> Result<Option<String>> {
+    if choices.is_empty() {
+        return Ok(Some(format!(
+            "no known effort choices for ACP agent `{agent}`; passing `{effort}` through unchecked"
+        )));
+    }
+    if choices.iter().any(|choice| choice == effort) {
+        return Ok(None);
+    }
+    bail!(
+        "effort `{effort}` is not offered by ACP agent `{agent}`. Valid values: {}",
+        choices.join(", ")
+    );
+}
+
 fn cleanup_partial_session(
     path: &std::path::Path,
     worktree_info: Option<&crate::session::WorktreeInfo>,
@@ -1444,7 +1509,8 @@ fn resolve_sandbox_image(
 #[cfg(test)]
 mod tests {
     use super::{
-        hooks_when_trust_declined, override_launch_binary, parse_repo_base, resolve_sandbox_image,
+        check_effort, hooks_when_trust_declined, override_launch_binary, parse_repo_base,
+        resolve_sandbox_image,
     };
     use crate::session::config::repo_config::TrustSurface;
     use crate::session::config::SessionConfig;
@@ -1977,5 +2043,17 @@ mod tests {
                 "a known profile must reach path validation, got: {msg}"
             );
         }
+    }
+
+    #[test]
+    fn check_effort_validates_only_against_known_choices() {
+        let known = ["low".to_string(), "high".to_string()];
+        assert_eq!(check_effort("codex", "high", &known).unwrap(), None);
+        let err = check_effort("codex", "ultra", &known)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("low, high"), "{err}");
+        let warning = check_effort("codex", "ultra", &[]).unwrap();
+        assert!(warning.is_some_and(|w| w.contains("unchecked")));
     }
 }
