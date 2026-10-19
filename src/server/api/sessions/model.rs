@@ -1,6 +1,34 @@
 //! The `SessionResponse` wire model and per-request config resolution.
 
 use super::*;
+pub(super) struct SessionResponseContext {
+    claude_fullscreen: bool,
+    plan_summary: Option<PlanSummary>,
+    acp_worker_state: crate::daemon::AcpWorkerState,
+    next_wakeup_at: Option<String>,
+    next_wakeup_reason: Option<String>,
+    active_monitor: Option<Option<String>>,
+}
+
+impl SessionResponseContext {
+    pub(super) fn new(
+        claude_fullscreen: bool,
+        plan_summary: Option<PlanSummary>,
+        acp_worker_state: crate::daemon::AcpWorkerState,
+        next_wakeup_at: Option<String>,
+        next_wakeup_reason: Option<String>,
+        active_monitor: Option<Option<String>>,
+    ) -> Self {
+        Self {
+            claude_fullscreen,
+            plan_summary,
+            acp_worker_state,
+            next_wakeup_at,
+            next_wakeup_reason,
+            active_monitor,
+        }
+    }
+}
 
 impl SessionResponse {
     /// Build a response from a session instance plus the user's Claude Code
@@ -27,10 +55,47 @@ impl SessionResponse {
         acp_worker_state: crate::daemon::AcpWorkerState,
         next_wakeup_at: Option<String>,
         next_wakeup_reason: Option<String>,
-        // `Some(description)` when the session has an armed `Monitor`, `None`
-        // otherwise, mirroring `EventStore::latest_active_monitor`.
         active_monitor: Option<Option<String>>,
     ) -> Self {
+        Self::from_instance_with_context(
+            inst,
+            SessionResponseContext::new(
+                claude_fullscreen,
+                plan_summary,
+                acp_worker_state,
+                next_wakeup_at,
+                next_wakeup_reason,
+                active_monitor,
+            ),
+            inst.supports_ctrl_enter(),
+        )
+    }
+
+    pub(super) fn from_instance_with_plan_and_config(
+        inst: &Instance,
+        context: SessionResponseContext,
+        config: &crate::session::config::SessionConfig,
+    ) -> Self {
+        let supports_ctrl_enter = !inst.is_structured()
+            && Instance::execution_agent_for(&inst.tool, inst.get_tool_command(), config)
+                .ok()
+                .is_some_and(crate::agents::AgentDef::supports_ctrl_enter);
+        Self::from_instance_with_context(inst, context, supports_ctrl_enter)
+    }
+
+    fn from_instance_with_context(
+        inst: &Instance,
+        context: SessionResponseContext,
+        supports_ctrl_enter: bool,
+    ) -> Self {
+        let SessionResponseContext {
+            claude_fullscreen,
+            plan_summary,
+            acp_worker_state,
+            next_wakeup_at,
+            next_wakeup_reason,
+            active_monitor,
+        } = context;
         let (monitor_active, monitor_description) = match active_monitor {
             Some(description) => (true, description),
             None => (false, None),
@@ -44,7 +109,7 @@ impl SessionResponse {
                 .unwrap_or_default(),
             group_path: inst.group_path.clone(),
             tool: inst.tool.clone(),
-            supports_ctrl_enter: inst.supports_ctrl_enter(),
+            supports_ctrl_enter,
             status: inst.status.wire_str().to_string(),
             dormant: inst.is_shown_dormant(),
             yolo_mode: inst.yolo_mode,

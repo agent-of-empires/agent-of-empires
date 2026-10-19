@@ -185,6 +185,10 @@ impl Instance {
     pub(crate) fn resolved_agent(&self) -> Option<&'static crate::agents::AgentDef> {
         self.execution_agent().ok()
     }
+    pub(crate) fn permission_response(&self) -> Option<crate::agents::PermissionResponse> {
+        self.resolved_agent()
+            .and_then(|agent| agent.permission_response)
+    }
 
     pub(crate) fn supports_ctrl_enter(&self) -> bool {
         !self.is_structured()

@@ -178,9 +178,9 @@ describe("MobileLiveTerminal key sequences", () => {
     expect(sendData).toHaveBeenCalledWith(expected);
   });
 
-  it("preserves Ctrl+Enter only for an opted-in pane and keeps shifted Enter as a soft newline", () => {
+  it("preserves CSI-u for OMP panes and keeps shifted Enter as a soft newline", () => {
     const sendData = vi.fn<(data: string) => boolean>(() => true);
-    const view = renderLiveTerminal({ sendData, ctrlEnterCsiU: true });
+    const view = renderLiveTerminal({ sendData, ctrlEnterMode: "csi-u" });
     const input = view.input();
     for (const [modifiers, expected] of [
       [{ ctrlKey: true }, "\x1b[13;5u"],
@@ -190,6 +190,13 @@ describe("MobileLiveTerminal key sequences", () => {
       fireEvent.keyDown(input, { key: "Enter", ...modifiers });
       expect(sendData).toHaveBeenLastCalledWith(expected);
     }
+  });
+
+  it("sends ESC+CR for Ctrl+Enter on non-OMP agent panes", () => {
+    const sendData = vi.fn<(data: string) => boolean>(() => true);
+    const view = renderLiveTerminal({ sendData, ctrlEnterMode: "soft-newline" });
+    fireEvent.keyDown(view.input(), { key: "Enter", ctrlKey: true });
+    expect(sendData).toHaveBeenCalledWith("\x1b\r");
   });
 
   it.each([

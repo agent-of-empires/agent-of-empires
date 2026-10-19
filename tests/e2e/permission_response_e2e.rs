@@ -107,11 +107,26 @@ fn test_respond_to_permission_allow_sends_bare_digit() {
 #[parallel]
 fn test_respond_to_omp_approval_uses_approval_shortcuts() {
     require_tmux!();
+    run_omp_approval_shortcut_case("omp", "omp_perm_resp");
+}
 
-    let mut h = TuiTestHarness::new("omp_perm_resp");
-    h.install_path_command("omp");
-    let fake_omp = h.home_path().join("fake-omp");
+#[test]
+#[parallel]
+fn test_respond_to_omp_alias_uses_approval_shortcuts() {
+    require_tmux!();
+    run_omp_approval_shortcut_case("corp-omp", "corp_omp_perm_resp");
+}
+
+fn run_omp_approval_shortcut_case(tool: &str, test_name: &str) {
+    let mut h = TuiTestHarness::new(test_name);
+    let path_bin = h.install_path_command("omp");
+    let fake_omp = if tool == "omp" {
+        path_bin.join("omp")
+    } else {
+        h.home_path().join("fake-omp")
+    };
     let script = "#!/bin/sh\n\
+case \"${1-}\" in --help|--version) exit 0 ;; esac\n\
 for request in 1 2; do\n\
   printf '╭─ Allow tool: bash ─────────────────────╮\\n'\n\
   printf '│ Command: printf approval-%s            │\\n' \"$request\"\n\
@@ -136,16 +151,35 @@ sleep 60\n";
     }
 
     let project = h.project_path();
-    let session_id = h.add_session(&[
-        project.to_str().unwrap(),
-        "-t",
-        "OmpPermRespTest",
-        "--tool",
-        "omp",
-        "--cmd-override",
-        fake_omp.to_str().unwrap(),
-        "--launch",
-    ]);
+    let session_id = if tool == "omp" {
+        h.add_session(&[
+            project.to_str().unwrap(),
+            "-t",
+            "OmpPermRespTest",
+            "--tool",
+            tool,
+            "--launch",
+        ])
+    } else {
+        let store = h.home_path().join("omp-store");
+        std::fs::create_dir_all(&store).expect("create OMP config directory");
+        h.append_config(&format!(
+            "[session.custom_agents]\ncorp-omp = \"{}\"\n\
+\n[session.agent_execution_as]\ncorp-omp = \"omp\"\n\
+\n[session.agent_config_dir]\ncorp-omp = \"{}\"\n\
+\n[session.agent_detect_as]\ncorp-omp = \"omp\"\n",
+            fake_omp.display(),
+            store.display()
+        ));
+        h.add_session(&[
+            project.to_str().unwrap(),
+            "-t",
+            "OmpPermRespTest",
+            "--tool",
+            tool,
+            "--launch",
+        ])
+    };
 
     h.spawn_tui();
     h.wait_for(" aoe ");

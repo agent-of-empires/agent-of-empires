@@ -41,6 +41,7 @@ export function liveProps(over: Partial<MobileLiveTerminalProps> = {}): MobileLi
     frame: liveFrame(),
     connected: true,
     active: true,
+    ctrlEnterMode: "submit",
     reading: false,
     sendResize: vi.fn(),
     setWindow: vi.fn(),

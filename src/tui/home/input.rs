@@ -6443,11 +6443,7 @@ impl HomeView {
             });
             return;
         }
-        let Some(response) = inst
-            .resolved_agent()
-            .or_else(|| crate::agents::get_agent(&tool))
-            .and_then(|a| a.permission_response)
-        else {
+        let Some(response) = inst.permission_response() else {
             self.info_dialog = Some(InfoDialog::new(
                 "Not Supported",
                 &format!("{} doesn't support quick permission responses yet.", tool),

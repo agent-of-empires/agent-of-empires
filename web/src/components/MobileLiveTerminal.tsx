@@ -19,6 +19,7 @@ import { FORWARD_TOUCH_GAIN, useForwardInput } from "./live-terminal/useForwardI
 import { Row } from "./live-terminal/TermRow";
 import { LIVE_WINDOW_SCREENS, useLiveEdgeScroll } from "./live-terminal/useLiveEdgeScroll";
 import { useTerminalInput } from "./live-terminal/useTerminalInput";
+import type { CtrlEnterMode } from "./live-terminal/keySequences";
 import { InputTraceOverlay } from "./live-terminal/InputTraceOverlay";
 import { StrokeIcon } from "./icons";
 
@@ -53,8 +54,8 @@ export interface MobileLiveTerminalProps {
   armAgentClipboard?: () => void;
   connected: boolean;
   active: boolean;
-  /** OMP agent panes accept distinct Ctrl+Enter; shells retain carriage return. */
-  ctrlEnterCsiU?: boolean;
+  /** Ctrl+Enter encoding for this pane. */
+  ctrlEnterMode: CtrlEnterMode;
   /** Off the live edge: the capture window is widened and the jump-to-latest button shows. */
   reading: boolean;
   sendResize: (cols: number, rows: number) => void;
@@ -118,7 +119,7 @@ export function MobileLiveTerminal({
   armAgentClipboard,
   connected,
   active,
-  ctrlEnterCsiU = false,
+  ctrlEnterMode,
   reading,
   sendResize,
   setWindow,
@@ -659,7 +660,7 @@ export function MobileLiveTerminal({
 
   const input = useTerminalInput({
     active,
-    ctrlEnterCsiU,
+    ctrlEnterMode,
     inputRef,
     ctrlActiveRef,
     clearCtrl,

@@ -41,6 +41,14 @@ pub async fn list_sessions(
         .filter(|inst| !state.cityhall_mode || inst.is_structured())
         .filter(|inst| crate::session::SessionScope::matches(query.state, inst))
         .collect();
+    // Share resolved config across capability projection and the remaining
+    // overlays; repeated profile/project pairs resolve once per request.
+    let misses_before = state
+        .list_sessions_resolver_misses
+        .load(std::sync::atomic::Ordering::Relaxed);
+    let mut session_cfg_cache = SessionCfgCache::new(&state.list_sessions_resolver_misses);
+    let mut project_override_cache = ProjectRegistryCache::new();
+
     let mut sessions: Vec<SessionResponse> = scoped_instances
         .iter()
         .copied()
@@ -75,15 +83,31 @@ pub async fn list_sessions(
                 .get(&inst.id)
                 .copied()
                 .unwrap_or(crate::daemon::AcpWorkerState::Absent);
-            let mut session = SessionResponse::from_instance_with_plan(
-                inst,
-                claude_fullscreen,
-                plan_summary,
-                acp_worker_state,
-                next_wakeup_at,
-                next_wakeup_reason,
-                active_monitor,
-            );
+            let mut session = if inst.is_structured() {
+                SessionResponse::from_instance_with_plan(
+                    inst,
+                    claude_fullscreen,
+                    plan_summary,
+                    acp_worker_state,
+                    next_wakeup_at,
+                    next_wakeup_reason,
+                    active_monitor,
+                )
+            } else {
+                let config = session_cfg_cache.resolve(&inst.source_profile, &inst.project_path);
+                SessionResponse::from_instance_with_plan_and_config(
+                    inst,
+                    SessionResponseContext::new(
+                        claude_fullscreen,
+                        plan_summary,
+                        acp_worker_state,
+                        next_wakeup_at,
+                        next_wakeup_reason,
+                        active_monitor,
+                    ),
+                    config,
+                )
+            };
             if structured_live && acp_worker_state == crate::daemon::AcpWorkerState::Running {
                 // Gate on a live worker: a pending nonce only exists on a
                 // running worker, and spawn/attach sweep orphaned nonces out of
@@ -108,16 +132,6 @@ pub async fn list_sessions(
             session
         })
         .collect();
-
-    // Share resolved config between the ACP-capability and smart-rename
-    // overlays, halving disk reads when a profile/project pair repeats in the
-    // 3s sidebar poll (#2603). Monotonic, so the delta below is this request's
-    // own count and no reset can race a concurrent request.
-    let misses_before = state
-        .list_sessions_resolver_misses
-        .load(std::sync::atomic::Ordering::Relaxed);
-    let mut session_cfg_cache = SessionCfgCache::new(&state.list_sessions_resolver_misses);
-    let mut project_override_cache = ProjectRegistryCache::new();
 
     // Overlay custom-agent ACP capability; built-ins were resolved in the
     // constructor. Distinct `(profile, project_path)` pairs resolve once via

@@ -57,10 +57,16 @@ function navigationKeySequence(e: TerminalKeyLike): string | null {
   return final === "~" ? `\x1b[${param}~` : `\x1b[${final}`;
 }
 
-export function specialKeySequence(e: TerminalKeyLike, ctrlEnterCsiU: boolean): string | null {
+export type CtrlEnterMode = "submit" | "soft-newline" | "csi-u";
+
+export function specialKeySequence(e: TerminalKeyLike, ctrlEnterMode: CtrlEnterMode): string | null {
   switch (e.key) {
     case "Enter":
-      if (e.ctrlKey && !e.shiftKey && !e.altKey && !e.metaKey) return ctrlEnterCsiU ? "\x1b[13;5u" : "\r";
+      if (e.ctrlKey && !e.shiftKey && !e.altKey && !e.metaKey) {
+        if (ctrlEnterMode === "csi-u") return "\x1b[13;5u";
+        if (ctrlEnterMode === "soft-newline") return "\x1b\r";
+        return "\r";
+      }
       return e.shiftKey && !e.altKey && !e.metaKey ? "\x1b\r" : "\r";
     case "Backspace":
       return e.altKey && !e.ctrlKey && !e.metaKey ? "\x1b\x7f" : "\x7f";

@@ -219,9 +219,7 @@ impl HomeView {
         if inst.is_structured() {
             return;
         }
-        let Some(response) =
-            crate::agents::get_agent(&inst.tool).and_then(|a| a.permission_response)
-        else {
+        let Some(response) = inst.permission_response() else {
             return;
         };
         let Some(tokens) = permission_response_tokens(&response, choice) else {

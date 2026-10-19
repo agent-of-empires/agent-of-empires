@@ -582,20 +582,57 @@ async fn list_sessions_shares_config_resolution_across_overlays() {
     let a = mk("default", "/tmp/repo-a-2603");
     let a2 = mk("default", "/tmp/repo-a-2603");
     let b = mk("default", "/tmp/repo-b-2603");
+    let config_dir = crate::session::get_app_dir().unwrap();
+    std::fs::create_dir_all(&config_dir).unwrap();
+    std::fs::write(
+        config_dir.join("config.toml"),
+        "[session.agent_execution_as]\ncorp-omp = \"omp\"\n\n[session.agent_config_dir]\ncorp-omp = \"~/.omp\"\n",
+    )
+    .unwrap();
+    let mk_omp = |id: &str| {
+        let mut inst = Instance::new("OMP alias", "/tmp/repo-a-2603");
+        inst.id = id.to_string();
+        inst.tool = "corp-omp".to_string();
+        inst.command = "omp-wrapper".to_string();
+        inst.source_profile = "default".to_string();
+        inst
+    };
+    let corp_omp_a = mk_omp("corp-omp-a");
+    let corp_omp_b = mk_omp("corp-omp-b");
 
     // The counter lives on this state, so no concurrent test can bump it.
-    let state = crate::server::test_support::build_test_app_state(vec![a, a2, b]);
+    let state =
+        crate::server::test_support::build_test_app_state(vec![a, a2, b, corp_omp_a, corp_omp_b]);
 
-    let _envelope = list_sessions(
+    let envelope = list_sessions(
         axum::extract::State(state.clone()),
         axum::extract::Query(ListSessionsQuery { state: None }),
     )
     .await;
+    assert_eq!(
+        envelope
+            .0
+            .sessions
+            .iter()
+            .filter(|s| s.tool == "corp-omp")
+            .count(),
+        2,
+        "both configured OMP aliases should be listed",
+    );
+    assert!(
+        envelope
+            .0
+            .sessions
+            .iter()
+            .filter(|s| s.tool == "corp-omp")
+            .all(|s| s.supports_ctrl_enter),
+        "the list response should project Ctrl+Enter from the configured execution identity",
+    );
     let misses = state.list_sessions_resolver_misses.load(Ordering::Relaxed);
 
     assert_eq!(
         misses, 2,
-        "shared cache must resolve once per unique (profile, project_path) across both overlays; got {misses}",
+        "shared cache must resolve once per unique (profile, project_path) across row construction and overlays; got {misses}",
     );
 }
 

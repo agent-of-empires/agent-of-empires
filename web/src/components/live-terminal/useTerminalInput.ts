@@ -13,6 +13,7 @@ import {
   controlCode,
   escapePastePath,
   specialKeySequence,
+  type CtrlEnterMode,
   type KeyboardLayoutReader,
 } from "./keySequences";
 
@@ -21,7 +22,7 @@ const textareaOf = (e: Event) => (e.target instanceof HTMLTextAreaElement ? e.ta
 /** Keyboard, IME, and paste handling for the hidden terminal input and App's persistent keyboard proxy. */
 export function useTerminalInput({
   active,
-  ctrlEnterCsiU,
+  ctrlEnterMode,
   inputRef,
   ctrlActiveRef,
   clearCtrl,
@@ -30,7 +31,7 @@ export function useTerminalInput({
   uploadPastedImage,
 }: {
   active: boolean;
-  ctrlEnterCsiU: boolean;
+  ctrlEnterMode: CtrlEnterMode;
   inputRef: RefObject<HTMLTextAreaElement | null>;
   ctrlActiveRef: RefObject<boolean>;
   clearCtrl: () => void;
@@ -104,7 +105,7 @@ export function useTerminalInput({
       if (composingRef.current || e.isComposing) return;
       // A plain Backspace edits the textarea natively, so autorepeat and word deletes reach the pane as a diff.
       if (e.key === "Backspace" && !e.altKey && !e.ctrlKey && !e.metaKey) return;
-      const seq = specialKeySequence(e, ctrlEnterCsiU);
+      const seq = specialKeySequence(e, ctrlEnterMode);
       if (seq) {
         e.preventDefault();
         // Enter submits and other special keys rewrite the line, so the IME shadow is stale either way.
@@ -127,7 +128,7 @@ export function useTerminalInput({
         sendData(ctrl);
       }
     },
-    [sendData, ctrlEnterCsiU],
+    [sendData, ctrlEnterMode],
   );
 
   // Capture phase, so printable Alt chords beat browser accelerators such as Alt+V.

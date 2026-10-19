@@ -367,7 +367,9 @@ export function LiveTerminalView({ session, active = true, surface = "agent", te
           armAgentClipboard={armAgentClipboard}
           connected={live.state.connected}
           active={active}
-          ctrlEnterCsiU={surface === "agent" && session.supports_ctrl_enter === true}
+          ctrlEnterMode={
+            surface === "agent" ? (session.supports_ctrl_enter === true ? "csi-u" : "soft-newline") : "submit"
+          }
           reading={live.state.reading}
           sendResize={live.sendResize}
           setWindow={live.setWindow}

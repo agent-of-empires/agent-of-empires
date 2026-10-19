@@ -29,7 +29,7 @@ test.describe("Desktop live terminal input", () => {
       const input = page.getByRole("textbox", { name: "Live terminal input" }).first();
       await input.focus();
       for (const [key, expected] of [
-        ["Control+Enter", supportsCtrlEnter ? "\x1b[13;5u" : "\r"],
+        ["Control+Enter", supportsCtrlEnter ? "\x1b[13;5u" : "\x1b\r"],
         ["Shift+Enter", "\x1b\r"],
         ["Control+Shift+Enter", "\x1b\r"],
       ]) {
