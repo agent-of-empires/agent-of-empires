@@ -9,8 +9,8 @@ use crossterm::event::{KeyCode, KeyEvent};
 
 use super::daemon::error_mentions_tailscale;
 use super::{
-    Flash, PendingConfirm, RestartEffect, ServeMode, ServeMouse, ServeView, ServeViewState,
-    TransportStatus, TunnelTransport, FLASH_TTL,
+    Flash, LinkChange, Logins, PendingConfirm, RestartEffect, ServeMode, ServeMouse, ServeView,
+    ServeViewState, TransportStatus, TunnelTransport, FLASH_TTL,
 };
 use crate::tui::components::hint_buttons::scan_spaced_hints;
 use crate::tui::components::hover::paint_hover_bg;
@@ -64,14 +64,8 @@ pub(super) fn render(view: &ServeView, frame: &mut Frame, area: Rect, theme: &Th
                 // Any click closes the overlay, so nothing beneath is a target.
                 mouse.keys.clear();
                 mouse.copies.clear();
-                let effect = RestartEffect::of(
-                    *mode,
-                    urls,
-                    view.restart_on_funnel,
-                    view.restart_port,
-                    view.running_persists,
-                    view.next_persists,
-                );
+                let effect =
+                    RestartEffect::of(*mode, urls, &view.restart_probe, view.running_persists);
                 render_help_overlay(frame, area, theme, *mode, effect);
             }
         }
@@ -654,47 +648,35 @@ fn render_active(
     frame.render_widget(footer_block, footer);
     let footer_text = match view.pending_confirm.map(|(action, _)| action) {
         Some(action) => {
-            let effect = RestartEffect::of(
-                *mode,
-                urls,
-                view.restart_on_funnel,
-                view.restart_port,
-                view.running_persists,
-                view.next_persists,
-            );
-            let link = match effect {
-                RestartEffect::NewLink => Some("The link changes: re-scan and sign in again."),
-                RestartEffect::NewLocalLink => Some("The link changes: re-scan it."),
-                _ => None,
-            };
-            let (first, effects): (&str, &[&str]) = match (action, effect) {
-                (PendingConfirm::NewPassphrase, _) => (
+            let effect = RestartEffect::of(*mode, urls, &view.restart_probe, view.running_persists);
+            let (first, effect_text) = match action {
+                PendingConfirm::NewPassphrase => (
                     "Press G again for a new passphrase.",
-                    &["Every Device signs out."],
+                    "Every Device signs out.",
                 ),
-                (PendingConfirm::Restart, RestartEffect::KeepsLogins) => (
-                    "Press R again to restart.",
-                    &["Devices stay signed in; agents keep running."],
-                ),
-                (PendingConfirm::Restart, RestartEffect::NewLink) => {
-                    ("Press R again to restart.", &["Agents keep running."])
+                PendingConfirm::Restart if effect.link == LinkChange::NewHost => {
+                    ("Press R again to restart.", "Agents keep running.")
                 }
-                (PendingConfirm::Restart, RestartEffect::SignsOut) => (
+                PendingConfirm::Restart => (
                     "Press R again to restart.",
-                    &["Every Device signs out; agents keep running."],
-                ),
-                (PendingConfirm::Restart, RestartEffect::MaySignOut) => (
-                    "Press R again to restart.",
-                    &["Devices may have to sign in again; agents keep running."],
-                ),
-                (PendingConfirm::Restart, RestartEffect::NewLocalLink) => (
-                    "Press R again to restart.",
-                    &["Devices stay signed in; agents keep running."],
+                    match effect.logins {
+                        Logins::Kept => "Devices stay signed in; agents keep running.",
+                        Logins::Lost => "Every Device signs out; agents keep running.",
+                        Logins::Unknown => {
+                            "Devices may have to sign in again; agents keep running."
+                        }
+                    },
                 ),
             };
-            let rest = effects
-                .iter()
-                .copied()
+            let link = match effect.link {
+                LinkChange::Same => None,
+                LinkChange::NewHost if effect.passphrase => {
+                    Some("The link changes: re-scan and sign in again.")
+                }
+                LinkChange::NewHost | LinkChange::NewPort => Some("The link changes: re-scan it."),
+            };
+            let rest = [effect_text]
+                .into_iter()
                 .chain(link)
                 .chain(["Any other key cancels."]);
             let mut spans = vec![Span::styled(
@@ -735,6 +717,22 @@ fn render_active(
     record_hints(frame, mouse, footer_inner);
 }
 
+/// The help row for R, matching the confirm's sentences.
+fn restart_help(effect: RestartEffect) -> String {
+    let logins = match effect.logins {
+        Logins::Kept => "Devices stay signed in",
+        Logins::Lost => "every Device signs out",
+        Logins::Unknown => "Devices may have to sign in again",
+    };
+    let what = match effect.link {
+        LinkChange::NewHost if effect.passphrase => "new link, sign in again".to_string(),
+        LinkChange::NewHost => "new link".to_string(),
+        LinkChange::NewPort => format!("new link; {logins}"),
+        LinkChange::Same => logins.to_string(),
+    };
+    format!("Restart the Daemon ({what}; agents keep running)")
+}
+
 fn render_help_overlay(
     frame: &mut Frame,
     area: Rect,
@@ -762,31 +760,13 @@ fn render_help_overlay(
     frame.render_widget(block, dialog_area);
 
     let text = Style::default().fg(theme.text);
+    let restart = restart_help(effect);
     let mut shortcuts = Vec::new();
     if is_tunnel {
         shortcuts.push(("G", "New passphrase (signs every Device out)"));
     }
     shortcuts.extend([
-        (
-            "R",
-            match effect {
-                RestartEffect::KeepsLogins => {
-                    "Restart the Daemon (Devices stay signed in; agents keep running)"
-                }
-                RestartEffect::NewLink => {
-                    "Restart the Daemon (new link, sign in again; agents keep running)"
-                }
-                RestartEffect::SignsOut => {
-                    "Restart the Daemon (every Device signs out; agents keep running)"
-                }
-                RestartEffect::MaySignOut => {
-                    "Restart the Daemon (Devices may sign in again; agents keep running)"
-                }
-                RestartEffect::NewLocalLink => {
-                    "Restart the Daemon (new link; Devices stay signed in; agents keep running)"
-                }
-            },
-        ),
+        ("R", restart.as_str()),
         ("S", "Stop the Daemon, return to mode picker"),
         ("Tab", "Cycle URLs (when multiple available)"),
         ("Esc / q", "Close this view (the Daemon keeps running)"),
@@ -803,7 +783,7 @@ fn render_help_overlay(
     for (key, desc) in shortcuts {
         let mut rows = Vec::new();
         crate::tui::markdown::wrap_line_into(
-            Line::styled(desc, text),
+            Line::styled(desc.to_string(), text),
             inner.width.saturating_sub(KEY_COL),
             &mut rows,
         );
@@ -938,10 +918,8 @@ mod tests {
             show_help: false,
             mouse: Default::default(),
             copied: None,
-            next_persists: true,
             running_persists: Some(true),
-            restart_port: None,
-            restart_on_funnel: false,
+            restart_probe: Default::default(),
         };
         let mut term = Terminal::new(TestBackend::new(72, 26)).unwrap();
         term.draw(|f| render(&view, f, f.area(), &Theme::default()))
@@ -989,10 +967,8 @@ mod tests {
             show_help: false,
             mouse: Default::default(),
             copied: None,
-            next_persists: true,
             running_persists: Some(true),
-            restart_port: None,
-            restart_on_funnel: false,
+            restart_probe: Default::default(),
         }
     }
 
@@ -1098,6 +1074,7 @@ mod tests {
 
     #[test]
     fn restart_and_passphrase_copy_say_what_happens_to_devices() {
+        use super::super::RestartProbe;
         use PendingConfirm::{NewPassphrase as G, Restart as R};
         use ServeMode::{Local, Tunnel};
         let lan = "http://192.168.1.42:8080/?token=t";
@@ -1106,6 +1083,7 @@ mod tests {
         let quick = "https://a-b-c.trycloudflare.com/?token=t";
         let kept = "Devices stay signed in; agents keep running";
         let link = "The link changes: re-scan and sign in again.";
+        let rescan = "The link changes: re-scan it.";
         let moved = (
             format!("Agents keep running. {link}"),
             "new link, sign in again; agents keep running".to_string(),
@@ -1115,91 +1093,172 @@ mod tests {
             "Every Device signs out; agents keep running.".to_string(),
             "every Device signs out; agents keep running".to_string(),
         );
-        let on = Some(true);
-        let local_moved = (
-            "Devices stay signed in; agents keep running. The link changes: re-scan it."
-                .to_string(),
-            "new link; Devices stay signed in; agents keep running".to_string(),
+        let unknown = (
+            "Devices may have to sign in again; agents keep running.".to_string(),
+            "Devices may have to sign in again; agents keep running".to_string(),
         );
-        // (mode, url, restart takes the Funnel path, port the restart reuses (None = random),
-        //  running daemon's persist_sessions (None = reattached), next start's
-        //  persist_sessions, key pressed once, confirm after the first sentence, help R)
+        let local_moved = (format!("{kept}. {rescan}"), format!("new link; {kept}"));
+        let on = Some(true);
+        // What the next start does: (takes the Funnel path, port it reuses (None = random),
+        // still has the link's LAN address, inherits AOE_SERVE_PASSPHRASE, persist_sessions).
+        let probe = |on_funnel, port, same_host: bool, local_passphrase, persists| RestartProbe {
+            on_funnel,
+            persists,
+            port,
+            local_hosts: vec![
+                if same_host {
+                    "192.168.1.42"
+                } else {
+                    "10.0.0.7"
+                }
+                .to_string(),
+                "localhost".to_string(),
+            ],
+            local_passphrase,
+        };
+        let tunnel = |on_funnel, persists| probe(on_funnel, None, true, false, persists);
+        // (mode, url, next start, running daemon's persist_sessions (None = reattached), key
+        //  pressed once, confirm after the first sentence, help R)
         let cases = [
-            // Local signs in with the stable token, so only a port change matters.
-            (Local, lan, false, Some(8080), None, false, R, stays.clone()),
+            // Without a passphrase, Local signs in with the stable token in the link, so only
+            // the link itself can change.
+            (
+                Local,
+                lan,
+                probe(false, Some(8080), true, false, false),
+                None,
+                R,
+                stays.clone(),
+            ),
             // A CLI-started Local daemon on another port, or no saved port, moves the link.
             (
                 Local,
                 lan,
-                false,
-                Some(51234),
+                probe(false, Some(51234), true, false, false),
                 None,
-                false,
                 R,
                 local_moved.clone(),
             ),
-            (Local, lan, false, None, None, false, R, local_moved.clone()),
-            (Tunnel, funnel, true, None, on, true, R, stays.clone()),
+            (
+                Local,
+                lan,
+                probe(false, None, true, false, true),
+                on,
+                R,
+                local_moved,
+            ),
+            // The interface lost its address: the old host's cookie is never sent again.
+            (
+                Local,
+                lan,
+                probe(false, Some(8080), false, false, true),
+                on,
+                R,
+                (
+                    format!("Agents keep running. {rescan}"),
+                    "new link; agents keep running".to_string(),
+                ),
+            ),
+            (
+                Local,
+                lan,
+                probe(false, Some(8080), false, true, true),
+                on,
+                R,
+                moved.clone(),
+            ),
+            // A Local daemon behind AOE_SERVE_PASSPHRASE has LAN Devices sign in, so the same
+            // host and port keep them only when the sign-ins persist.
+            (
+                Local,
+                lan,
+                probe(false, Some(8080), true, true, false),
+                on,
+                R,
+                signs_out.clone(),
+            ),
+            (
+                Local,
+                lan,
+                probe(false, Some(8080), true, true, true),
+                Some(false),
+                R,
+                signs_out.clone(),
+            ),
+            (
+                Local,
+                lan,
+                probe(false, Some(8080), true, true, true),
+                None,
+                R,
+                unknown.clone(),
+            ),
+            (
+                Local,
+                lan,
+                probe(false, Some(8080), true, true, true),
+                on,
+                R,
+                stays.clone(),
+            ),
+            // The cookie isn't scoped by port, so a new port loses only what persistence loses.
+            (
+                Local,
+                lan,
+                probe(false, None, true, true, false),
+                on,
+                R,
+                (
+                    format!("Every Device signs out; agents keep running. {rescan}"),
+                    "new link; every Device signs out; agents keep running".to_string(),
+                ),
+            ),
+            (Tunnel, funnel, tunnel(true, true), on, R, stays.clone()),
             // Tailscale went away (or Cloudflare was picked): the restart opens a quick tunnel.
-            (Tunnel, funnel, false, None, on, true, R, moved.clone()),
+            (Tunnel, funnel, tunnel(false, true), on, R, moved.clone()),
             // spawn_daemon never re-creates a named tunnel, whether or not Funnel replaces it.
-            (Tunnel, named, false, None, on, true, R, moved.clone()),
-            (Tunnel, named, true, None, on, true, R, moved.clone()),
-            (Tunnel, quick, false, None, on, true, R, moved.clone()),
-            (Tunnel, funnel, true, None, on, false, R, signs_out.clone()),
+            (Tunnel, named, tunnel(false, true), on, R, moved.clone()),
+            (Tunnel, named, tunnel(true, true), on, R, moved.clone()),
+            (Tunnel, quick, tunnel(false, true), on, R, moved.clone()),
+            (
+                Tunnel,
+                funnel,
+                tunnel(true, false),
+                on,
+                R,
+                signs_out.clone(),
+            ),
             // Logins the running daemon held only in memory are gone, whatever the next start reads.
             (
                 Tunnel,
                 funnel,
-                true,
-                None,
+                tunnel(true, true),
                 Some(false),
-                true,
                 R,
-                signs_out.clone(),
+                signs_out,
             ),
             // A reattached daemon's persistence is unknown.
+            (Tunnel, funnel, tunnel(true, true), None, R, unknown),
             (
                 Tunnel,
                 funnel,
-                true,
-                None,
-                None,
-                true,
-                R,
-                (
-                    "Devices may have to sign in again; agents keep running.".to_string(),
-                    "Devices may sign in again; agents keep running".to_string(),
-                ),
-            ),
-            (
-                Tunnel,
-                funnel,
-                true,
-                None,
+                tunnel(true, true),
                 on,
-                true,
                 G,
                 ("Every Device signs out.".to_string(), kept.to_string()),
             ),
             (
                 Tunnel,
                 quick,
-                false,
-                None,
+                tunnel(false, true),
                 on,
-                true,
                 G,
                 (format!("Every Device signs out. {link}"), String::new()),
             ),
         ];
         let theme = crate::tui::styles::load_theme("empire");
-        for (mode, url, restart_on_funnel, port, running, next, key, (effects, help_restart)) in
-            cases
-        {
-            let case = format!(
-                "{mode:?} {url} funnel={restart_on_funnel} port={port:?} running={running:?} next={next} {key:?}"
-            );
+        for (mode, url, probe, running, key, (effects, help_restart)) in cases {
+            let case = format!("{mode:?} {url} {probe:?} running={running:?} {key:?}");
             let mut view = view(ServeViewState::Active {
                 mode,
                 transport: None,
@@ -1212,10 +1271,8 @@ mod tests {
                 opened_at: Instant::now(),
                 log_offset: 0,
             });
-            view.restart_port = port;
+            view.restart_probe = probe;
             view.running_persists = running;
-            view.next_persists = next;
-            view.restart_on_funnel = restart_on_funnel;
             view.pending_confirm = Some((key, Instant::now()));
             let first = match key {
                 G => "Press G again for a new passphrase.",
@@ -1265,8 +1322,10 @@ mod tests {
             let (desc_x, desc_y) =
                 crate::tui::dialogs::test_render::find(&buf, "Restart the Daemon");
             let cell = |x: u16| buf[(x, desc_y + 1)].symbol().trim().to_string();
+            let wrapped =
+                crate::tui::dialogs::test_render::find(&buf, "Stop the Daemon").1 > desc_y + 1;
             assert!(
-                cell(desc_x - 1).is_empty() && !cell(desc_x).is_empty(),
+                !wrapped || (cell(desc_x - 1).is_empty() && !cell(desc_x).is_empty()),
                 "{case}\n{help}"
             );
             assert_eq!(
