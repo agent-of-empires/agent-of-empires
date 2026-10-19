@@ -6443,7 +6443,10 @@ impl HomeView {
             });
             return;
         }
-        let Some(response) = crate::agents::get_agent(&tool).and_then(|a| a.permission_response)
+        let Some(response) = inst
+            .resolved_agent()
+            .or_else(|| crate::agents::get_agent(&tool))
+            .and_then(|a| a.permission_response)
         else {
             self.info_dialog = Some(InfoDialog::new(
                 "Not Supported",
