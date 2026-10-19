@@ -355,9 +355,15 @@ function TargetedItem({
       </MenuItem>
       <div id={pickerId} hidden={!open} className="pl-3">
         {targets.map((s) => (
-          <MenuItem key={s.id} onClick={() => onRun(s.id)} testId={`${testId}-target`} indent>
+          <MenuItem
+            key={s.id}
+            onClick={() => onRun(s.id)}
+            testId={`${testId}-target`}
+            indent
+            className="text-text-primary hover:bg-surface-700/50"
+          >
             <span className="truncate">{s.title.trim() || "Untitled session"}</span>
-            <span className="ml-2 shrink-0 text-xs text-text-dim">{detail(s)}</span>
+            <span className="ml-2 shrink-0 text-xs">{detail(s)}</span>
           </MenuItem>
         ))}
       </div>
