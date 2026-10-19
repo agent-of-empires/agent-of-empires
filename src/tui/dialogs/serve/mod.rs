@@ -205,6 +205,15 @@ impl RestartEffect {
     }
 }
 
+/// The restarted daemon reads the setting afresh, so this is re-read whenever R, G or help
+/// states the restart's effect, alongside the Funnel probe.
+fn persist_sessions() -> bool {
+    crate::session::config::load_config()
+        .ok()
+        .flatten()
+        .is_none_or(|config| config.auth.persist_sessions)
+}
+
 /// Mirrors the server's choice: `--no-tailscale` for an explicit Cloudflare pick, otherwise
 /// Funnel whenever `tailscale` is installed and logged in.
 fn restart_on_funnel(mode: ServeMode, transport: Option<TunnelTransport>) -> bool {
@@ -239,8 +248,8 @@ pub struct ServeView {
     copied: Option<(&'static str, Instant)>,
     /// `auth.persist_sessions`: whether a Tunnel restart keeps Devices signed in.
     keeps_logins: bool,
-    /// Whether a restart now would take the server's Funnel path; probed when R, G or help
-    /// is pressed, since it shells out to `tailscale`.
+    /// Whether a restart now would take the server's Funnel path. Both fields are refreshed
+    /// when R, G or help is pressed: the probe shells out to `tailscale`.
     restart_on_funnel: bool,
 }
 
@@ -271,10 +280,7 @@ impl ServeView {
             show_help: false,
             mouse: RefCell::default(),
             copied: None,
-            keeps_logins: crate::session::config::load_config()
-                .ok()
-                .flatten()
-                .is_none_or(|config| config.auth.persist_sessions),
+            keeps_logins: persist_sessions(),
             restart_on_funnel: false,
         }
     }
@@ -521,6 +527,7 @@ impl ServeView {
                     self.restart(mode, transport, Some(new_pp));
                 } else {
                     self.restart_on_funnel = restart_on_funnel(mode, transport);
+                    self.keeps_logins = persist_sessions();
                     self.pending_confirm = Some((PendingConfirm::NewPassphrase, Instant::now()));
                 }
             }
@@ -535,12 +542,14 @@ impl ServeView {
                     self.restart(mode, transport, pp);
                 } else {
                     self.restart_on_funnel = restart_on_funnel(mode, transport);
+                    self.keeps_logins = persist_sessions();
                     self.pending_confirm = Some((PendingConfirm::Restart, Instant::now()));
                 }
             }
             KeyCode::Tab if urls.len() > 1 => *url_index = (*url_index + 1) % urls.len(),
             KeyCode::Char('?') => {
                 self.restart_on_funnel = restart_on_funnel(mode, transport);
+                self.keeps_logins = persist_sessions();
                 self.show_help = true;
             }
             KeyCode::Esc | KeyCode::Char('q') => return ServeAction::Close,
@@ -704,5 +713,48 @@ mod tests {
         }
         assert_eq!(ServeMode::from_file_token("garbage"), None);
         assert_eq!(ServeMode::from_file_token(""), None);
+    }
+
+    /// The restarted daemon reads `auth.persist_sessions` afresh, so a change made while the
+    /// view is open must reach the confirm and help.
+    #[test]
+    #[serial_test::serial]
+    fn r_g_and_help_reread_persist_sessions() {
+        let _tmp = crate::session::test_support::isolate_app_dir();
+        for key in ['R', 'G', '?'] {
+            let mut view = ServeView {
+                state: ServeViewState::Active {
+                    mode: ServeMode::Tunnel,
+                    // Cloudflare skips the `tailscale` probe.
+                    transport: Some(TunnelTransport::Cloudflare),
+                    urls: vec![ServeUrl {
+                        label: None,
+                        url: "https://host.tailnet.ts.net/".to_string(),
+                    }],
+                    url_index: 0,
+                    passphrase: Some("correct-horse".to_string()),
+                    opened_at: Instant::now(),
+                    log_offset: 0,
+                },
+                pending_passphrase: String::new(),
+                pending_confirm: None,
+                show_help: false,
+                mouse: RefCell::default(),
+                copied: None,
+                keeps_logins: true,
+                restart_on_funnel: false,
+            };
+            crate::session::config::update_config(|c| c.auth.persist_sessions = false).unwrap();
+            view.handle_key(KeyEvent::from(KeyCode::Char(key)));
+            assert!(
+                !view.keeps_logins,
+                "{key} kept the value read when the view opened"
+            );
+            crate::session::config::update_config(|c| c.auth.persist_sessions = true).unwrap();
+            view.pending_confirm = None;
+            view.show_help = false;
+            view.handle_key(KeyEvent::from(KeyCode::Char(key)));
+            assert!(view.keeps_logins, "{key}");
+        }
     }
 }
