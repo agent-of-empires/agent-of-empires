@@ -2242,24 +2242,45 @@ enter to select · esc to cancel";
         );
 
         let mcp = format!("{parked}✻ Ran 3 tools · 2 MCP tasks still running\n");
-        let monitor = "\
-✻ Sautéed for 39s · 1 monitor still running\n\
+        assert!(claude_rule_matches("background_mcp_task", &mcp));
+        assert_eq!(
+            detect_via_manifest("claude", &mcp, "", None),
+            Status::Running
+        );
+
+        let quoted = format!("{mcp}Do you want to proceed?\n❯ 1. Yes\n  2. No\n");
+        assert!(!claude_rule_matches("background_mcp_task", &quoted));
+
+        let boxed = |status: &str| {
+            format!(
+                "{status}\n\
 ──────────────────────────────\n\
 ❯ \n\
 ──────────────────────────────\n\
-  ⏵⏵ bypass permissions on · PR #444 · 1 monitor · ← for agents · ↓ to manage";
-        let monitors = format!("{parked}✻ Worked for 2m 3s · 2 monitors still running\n");
-        for pane in [mcp.as_str(), monitor, &monitors] {
-            assert!(claude_rule_matches("background_task", pane), "{pane}");
-            // The `Stop` hook writes idle whatever is still running.
+  ⏵⏵ bypass permissions on · PR #444 · 1 monitor · ← for agents · ↓ to manage"
+            )
+        };
+        // The `Stop` hook writes idle whatever is still running.
+        let idle_hook = || hook(Status::Idle, None);
+        for status in [
+            "✻ Sautéed for 39s · 1 monitor still running",
+            "✻ Worked for 2m 3s · 2 monitors still running",
+        ] {
+            let pane = boxed(status);
+            assert!(claude_rule_matches("background_monitor", &pane), "{pane}");
             assert_eq!(
-                detect_via_manifest("claude", pane, "", hook(Status::Idle, None)),
+                detect_via_manifest("claude", &pane, "", idle_hook()),
                 Status::Running,
                 "{pane}"
             );
-            let quoted = format!("{pane}\nDo you want to proceed?\n❯ 1. Yes\n  2. No\n");
-            assert!(!claude_rule_matches("background_task", &quoted), "{pane}");
         }
+        let stale =
+            boxed("✻ Sautéed for 39s · 1 monitor still running\n  monitor fired\n✻ Worked for 12s");
+        assert!(!claude_rule_matches("background_monitor", &stale));
+        assert_eq!(
+            detect_via_manifest("claude", &stale, "", idle_hook()),
+            Status::Idle
+        );
     }
 
     #[test]
