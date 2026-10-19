@@ -41,7 +41,16 @@ export function makeLiveFrame(
 }
 
 function liveFrameMessage(seq: number, frame: LiveFrameFields): LiveServerMessage {
-  return { type: "frame", seq, cursor: null, altScreen: false, mouse: false, mouseSgr: false, pane0: null, ...frame };
+  return {
+    ...frame,
+    type: "frame",
+    seq,
+    cursor: frame.cursor ?? null,
+    altScreen: frame.altScreen ?? false,
+    mouse: frame.mouse ?? false,
+    mouseSgr: frame.mouseSgr ?? false,
+    pane0: frame.pane0 ?? null,
+  };
 }
 
 export async function mockTerminalApis(
