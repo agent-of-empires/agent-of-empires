@@ -428,6 +428,25 @@ const requestCases: RequestCase[] = [
     { body: { agent: "claude" }, result: true },
   ],
   [
+    "POST /api/mcp/servers",
+    () => api.createMcpServer("fs", { transport: "stdio", command: "c", args: [], env: [{ name: "T", value: "v" }] }),
+    {
+      body: { name: "fs", transport: "stdio", command: "c", args: [], env: [{ name: "T", value: "v" }] },
+      respond: json({}, 201),
+      result: { ok: true, status: 201 },
+    },
+  ],
+  [
+    "PUT /api/mcp/servers/a%2Fb",
+    () => api.updateMcpServer("a/b", { transport: "http", url: "https://e", headers: [{ name: "Authorization" }] }),
+    {
+      body: { transport: "http", url: "https://e", headers: [{ name: "Authorization" }] },
+      respond: json({}),
+      result: { ok: true, status: 200 },
+    },
+  ],
+  ["DELETE /api/mcp/servers/fs", () => api.deleteMcpServer("fs"), { result: { ok: true, status: 200 } }],
+  [
     "GET /api/skills",
     () => api.fetchSkills(),
     { respond: json({ skills: [], roots: [] }), result: { skills: [], roots: [] } },
@@ -1026,6 +1045,17 @@ describe("deleteWorkspace errors", () => {
 it("resolveMcpConflict maps 409 to stale", async () => {
   fetchSpy.mockResolvedValueOnce(empty(409));
   expect(await api.resolveMcpConflict("n", "a", "native", "fp")).toBe("stale");
+});
+
+it("mcp mutations keep the status and message", async () => {
+  fetchSpy.mockResolvedValueOnce(json({ message: "already exists" }, 409));
+  expect(await api.createMcpServer("fs", { transport: "sse", url: "u", headers: [] })).toEqual({
+    ok: false,
+    error: "already exists",
+    status: 409,
+  });
+  offline();
+  expect(await api.deleteMcpServer("fs")).toEqual({ ok: false, error: "Network error: offline" });
 });
 
 it("skill mutations keep the status and message", async () => {

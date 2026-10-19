@@ -64,6 +64,13 @@ describe("FileContentViewer", () => {
     expect(screen.queryByRole("button", { name: "Rendered" })).toBeNull();
   });
 
+  it("hands a binary file to the binary view instead of the text view", async () => {
+    vi.spyOn(api, "getSessionFile").mockResolvedValue({ content: "", is_binary: true, truncated: false });
+    render(<FileContentViewer sessionId="s1" filePath="/tmp/a.zip" />);
+    await screen.findByRole("button", { name: "Download" });
+    expect(screen.queryByTestId("full-file")).toBeNull();
+  });
+
   it("shows an error when the fetch fails", async () => {
     vi.spyOn(api, "getSessionFile").mockResolvedValue(null);
     render(<FileContentViewer sessionId="s1" filePath="/tmp/x.md" />);

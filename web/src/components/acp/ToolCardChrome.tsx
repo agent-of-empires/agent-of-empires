@@ -327,10 +327,13 @@ export function HighlightedBlock({
   text,
   language,
   maxLines = 20,
+  unwrapFence = true,
 }: {
   text: string;
   language?: string;
   maxLines?: number;
+  /** Adapters fence their output; a file's own fences are content. */
+  unwrapFence?: boolean;
 }) {
   // Keyed by the inputs that produced it, so a superseded request resolving
   // before its effect cleanup renders nothing. Theme is left out of the key so
@@ -341,7 +344,7 @@ export function HighlightedBlock({
   const [showAll, setShowAll] = useState(false);
   const [wrapped, toggleWrap] = useWrapState();
   const shiki = useShikiTheme();
-  const unwrapped = unwrapMarkdownFence(text);
+  const unwrapped = unwrapFence ? unwrapMarkdownFence(text) : { text, lang: null };
   const effectiveLang = unwrapped.lang ?? language;
   const lines = unwrapped.text.split("\n");
   const limit = showAll ? 1_000_000 : maxLines;

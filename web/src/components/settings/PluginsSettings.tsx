@@ -31,6 +31,7 @@ export function PluginsSettings({ readOnly = false }: { readOnly?: boolean } = {
   const [tab, setTab] = useState<"installed" | "marketplace">("installed");
   const [detail, setDetail] = useState<DetailTarget | null>(null);
   const [confirmUninstall, setConfirmUninstall] = useState<PluginView | null>(null);
+  const uninstallDialogRef = useRef<HTMLDivElement | null>(null);
   const [confirmWebOff, setConfirmWebOff] = useState<PluginView | null>(null);
   const [job, setJob] = useState<PluginJobRef | null>(null);
   const updates = usePluginUpdates(setError, setJob);
@@ -53,6 +54,20 @@ export function PluginsSettings({ readOnly = false }: { readOnly?: boolean } = {
     }, 0);
     return () => clearTimeout(timer);
   }, [reload]);
+
+  useEffect(() => {
+    if (!confirmUninstall) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key !== "Escape") return;
+      const dialog = e
+        .composedPath()
+        .find((node) => node instanceof HTMLElement && node.getAttribute("aria-modal") === "true");
+      if (dialog && dialog !== uninstallDialogRef.current) return;
+      setConfirmUninstall(null);
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [confirmUninstall]);
 
   const onToggle = async (plugin: PluginView, enabled: boolean) => {
     setBusy(true);
@@ -217,6 +232,7 @@ export function PluginsSettings({ readOnly = false }: { readOnly?: boolean } = {
 
       {confirmUninstall && (
         <div
+          ref={uninstallDialogRef}
           className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 p-4"
           role="dialog"
           aria-modal="true"

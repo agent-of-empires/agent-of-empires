@@ -2,6 +2,7 @@ import type { ReactNode } from "react";
 import { FileDown, Image as ImageIcon, Link as LinkIcon, Music } from "lucide-react";
 
 import type { ToolOutputBlock } from "../../lib/acpTypes";
+import { ExpandableImage } from "./artifactMedia";
 import { SAFE_LINK_SCHEMES, SAFE_MEDIA_SCHEMES, safeUri } from "./ToolCardChrome";
 
 /** Structured completion payload rendered under any tool card. A block with no
@@ -55,7 +56,7 @@ function ToolOutputBlockView({ block }: { block: ToolOutputBlock }) {
         return <MediaPlaceholder icon={<ImageIcon className={ICON} />} label={`image (${block.mime_type})`} />;
       }
       return (
-        <img
+        <ExpandableImage
           src={src}
           alt={`tool output image (${block.mime_type})`}
           className="max-h-80 max-w-full rounded border border-surface-700 object-contain"

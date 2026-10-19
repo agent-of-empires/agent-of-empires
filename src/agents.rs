@@ -1371,6 +1371,21 @@ fn pi_help_advertises(flag: &str) -> bool {
         .is_some_and(|program| agent_help_advertises(&ambient_help_command(&program), flag))
 }
 
+/// Whether the opencode at `program` has `--standalone` (2.x), which runs one command on a
+/// private server instead of the shared background service. Asked from `cwd`, the launch
+/// directory, because a version-manager shim picks its install by directory.
+pub(crate) fn opencode_supports_standalone(
+    program: &std::path::Path,
+    cwd: &std::path::Path,
+) -> bool {
+    let mut command = ambient_help_command(program);
+    command.current_dir(cwd);
+    // Uncached on success, like the generation probe: a shim can change what it runs.
+    with_agent_help(&command, false, |help| {
+        help_advertises_flag(help, "--standalone")
+    })
+}
+
 pub(crate) fn pi_supports_extension_flag() -> bool {
     pi_help_advertises("--extension")
 }
@@ -1832,6 +1847,34 @@ mod tests {
             !agent_help_advertises(&ambient_help_command(&older), "--name"),
             "an answer cached for one install was reused for another"
         );
+        forget_agent_help_for_test();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[serial_test::serial]
+    fn standalone_support_is_probed_in_the_launch_cwd() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let temp = tempfile::tempdir().unwrap();
+        // A version-manager shim: which opencode answers depends on the directory.
+        let shim = temp.path().join("opencode");
+        std::fs::write(
+            &shim,
+            "#!/bin/sh\nif [ -e .v2 ]; then echo '  --standalone  private server'; else echo '  --fork'; fi\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let (v2, v1) = (temp.path().join("v2"), temp.path().join("v1"));
+        for dir in [&v2, &v1] {
+            std::fs::create_dir(dir).unwrap();
+        }
+        std::fs::write(v2.join(".v2"), "").unwrap();
+        forget_agent_help_for_test();
+        assert!(opencode_supports_standalone(&shim, &v2));
+        assert!(!opencode_supports_standalone(&shim, &v1));
+        // The shim now dispatches to 2.x here: a cached answer must not outlive that.
+        std::fs::write(v1.join(".v2"), "").unwrap();
+        assert!(opencode_supports_standalone(&shim, &v1));
         forget_agent_help_for_test();
     }
 

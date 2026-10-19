@@ -27,6 +27,8 @@ export interface SessionResponse {
   /** Per-session diff base override. */
   base_branch_override?: string | null;
   is_sandboxed: boolean;
+  /** The Working directory is not a Repository, so Diff does not auto-open. */
+  outside_repository?: boolean;
   /** True when the session was created in scratch mode (`aoe add
    *  --scratch` or the wizard toggle). The `project_path` points
    *  at an auto-provisioned directory under `<app_dir>/scratch/<id>/`,
@@ -208,7 +210,10 @@ export interface RichDiffFile {
 export interface RepoBase {
   /** Omitted for single-repo sessions. */
   repo_name?: string;
-  base_branch: string;
+  /** Absent when `outside_repository`. */
+  base_branch?: string;
+  /** The Working directory is not a Repository, so there is nothing to diff. */
+  outside_repository?: boolean;
   /** Worktree path this repo's diff was computed in. */
   repo_path: string;
   base_override?: string;
@@ -338,6 +343,8 @@ export interface ProjectOverrides {
   worktree_enabled?: boolean;
   smart_rename?: boolean;
   sandbox_enabled?: boolean;
+  /** Values of plugin settings declared `per_project`, by plugin id then setting key. */
+  plugin_settings?: Record<string, Record<string, unknown>>;
 }
 
 export interface ProjectInfo {
@@ -514,4 +521,6 @@ export interface SettingsFieldDescriptor {
   tui_only?: boolean;
   /** Present only on plugin fields, which have no stored value until saved. */
   default?: unknown;
+  /** Plugin field that can also be set per registered project. */
+  per_project?: boolean;
 }

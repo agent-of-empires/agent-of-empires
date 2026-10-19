@@ -7,7 +7,7 @@ import type { ThreadMessageLike } from "@assistant-ui/react";
 
 import { hasTodoArrayArgsText, parseJsonObject } from "../../lib/acpArgs";
 import { lastClearIndex } from "../../lib/acpHistoryWindow";
-import type { ActivityRow, ToolCall } from "../../lib/acpTypes";
+import type { ActivityRow, ToolCall, ToolOutputBlock } from "../../lib/acpTypes";
 import { type AgentProfile, DEFAULT_AGENT_PROFILE, isSubagentToolName } from "../../lib/agentProfiles";
 
 /** Synthetic part for a subagent Task with its child tool calls. */
@@ -105,14 +105,21 @@ export function activityToThreadMessages(
       continue;
     }
     if (row.kind === "user_prompt") {
-      // Images become image parts; other attachments show as a labelled line.
+      // Images become image parts; other attachments become file parts.
+      // Attachments lead so the user bubble shows them above the message text.
       const parts = [
-        ...(row.text ? [{ type: "text" as const, text: row.text }] : []),
         ...(row.attachments ?? []).map((att) =>
           att.kind === "image"
             ? { type: "image" as const, image: att.url }
-            : { type: "text" as const, text: `📎 ${att.name ?? att.kind} (${att.mimeType})` },
+            : {
+                type: "file" as const,
+                data: att.url,
+                mimeType: att.mimeType,
+                filename: att.name ?? att.kind,
+                sourceType: "url" as const,
+              },
         ),
+        ...(row.text ? [{ type: "text" as const, text: row.text }] : []),
       ];
       pushUser(
         row,
@@ -146,6 +153,7 @@ export function activityToThreadMessages(
         row.text,
         row.at,
         row.asyncSubagent ?? false,
+        row.output,
       );
     } else if (row.kind === "empty_output") {
       // A turn with no output (interactive-only slash commands) gets a muted note.
@@ -167,7 +175,14 @@ export function activityToThreadMessages(
   return built;
 }
 
-type ToolResult = { content: string; endedAt?: string; stopped?: boolean; async?: boolean };
+type ToolResult = {
+  content: string;
+  endedAt?: string;
+  stopped?: boolean;
+  async?: boolean;
+  /** Image, audio, link and resource blocks, which `content` does not carry. */
+  output?: ToolOutputBlock[];
+};
 
 // Loose part shape, cast at build time; the renderer parses argsText itself.
 type DraftPart =
@@ -226,12 +241,21 @@ class AssistantBuilder {
     resultText: string,
     endedAt: string,
     async: boolean,
+    output?: ToolOutputBlock[],
   ) {
     const part = [...this.parts, ...this.children].find(
       (p): p is ToolPart => p.type === "tool-call" && p.toolCallId === toolCallId,
     );
     if (!part) return;
-    part.result = { content: resultText, endedAt, stopped: stopped || undefined, async: async || undefined };
+    // A text block repeats `content`, except an embedded terminal's placeholder.
+    const media = output?.filter((block) => block.kind !== "text" || !resultText.includes(block.text));
+    part.result = {
+      content: resultText,
+      endedAt,
+      stopped: stopped || undefined,
+      async: async || undefined,
+      ...(media?.length ? { output: media } : {}),
+    };
     part.isError = isError || undefined;
   }
 
