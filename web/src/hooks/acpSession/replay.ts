@@ -59,9 +59,11 @@ export async function fetchReplay(
       // Cached control state is cursor-aware and must see each frame once, from its own cursor. Forward rows
       // from that cursor would append older turns after the recovered tail, so rows resume exactly at the tail's end.
       const from = lastSeq.current;
-      const catchUp: CatchUp = async (tailEnd, emit) =>
-        (await fetchForward(sid, from, emit, signal, "frames")) &&
-        (await fetchForward(sid, tailEnd, emit, signal, "rows", 0));
+      const catchUp: CatchUp = async (tailEnd, emit) => {
+        const reached = await fetchForward(sid, from, emit, signal, "frames");
+        if (reached === null || (await fetchForward(sid, tailEnd, emit, signal, "rows", 0)) === null) return null;
+        return reached;
+      };
       await fetchTail(sid, lastSeq, catchUp, dispatch, setHasMoreOlder, signal);
     } else await fetchForward(sid, lastSeq.current, dispatch, signal);
   } catch {
@@ -69,8 +71,8 @@ export async function fetchReplay(
   }
 }
 
-/** Runs after the tail loads and before it publishes; false withholds the tail. */
-type CatchUp = (tailEnd: number, emit: Dispatch) => Promise<boolean>;
+/** Runs after the tail loads and before it publishes. Null withholds the tail; else the seq the controls reached. */
+type CatchUp = (tailEnd: number, emit: Dispatch) => Promise<number | null>;
 
 async function fetchTail(
   sid: string,
@@ -117,7 +119,8 @@ async function fetchTail(
   }
   signal.throwIfAborted();
   const caughtUp: Action[] = [];
-  if (catchUp && !(await catchUp(tail.highest_seq, (a) => caughtUp.push(a)))) {
+  const reached = catchUp ? await catchUp(tail.highest_seq, (a) => caughtUp.push(a)) : null;
+  if (catchUp && reached === null) {
     signal.throwIfAborted();
     caughtUp.filter((a) => a.kind === "lagged").forEach(dispatch);
     return;
@@ -125,6 +128,8 @@ async function fetchTail(
   signal.throwIfAborted();
   dispatch({ kind: "frames", frames: applyFrames ? (tail.frames ?? []) : [], rows, oldestSeq: cursor });
   caughtUp.forEach(dispatch);
+  // The dial reads this ref before React commits the dispatches above, so hand the cursor over explicitly.
+  if (reached !== null && reached > lastSeq.current) lastSeq.current = reached;
   setHasMoreOlder(hasMore);
   if (applyFrames && tail.highest_seq > lastSeq.current) lastSeq.current = tail.highest_seq;
   if (needsHandshake) {
@@ -140,7 +145,7 @@ async function fetchTail(
 
 type ForwardLegs = "both" | "frames" | "rows";
 
-/** Returns whether the catch-up completed; a failed request or a lost log ends it early with false. */
+/** Returns the seq the catch-up reached, or null when a failed request or a lost log ended it early. */
 async function fetchForward(
   sid: string,
   lastSeq: number,
@@ -148,7 +153,7 @@ async function fetchForward(
   signal: AbortSignal,
   legs: ForwardLegs = "both",
   overlap = REPLAY_OVERLAP,
-): Promise<boolean> {
+): Promise<number | null> {
   const firstSince = Math.max(0, lastSeq - overlap);
   let cursor = firstSince;
   let target: number | null = null;
@@ -160,7 +165,7 @@ async function fetchForward(
       getReplay(sid, rowsOnly ? `${params}&view=rows` : params, signal),
       legs === "both" ? getReplay(sid, `${params}&view=rows`, signal) : null,
     ]);
-    if (!res.ok || (rowsRes && !rowsRes.ok)) return false;
+    if (!res.ok || (rowsRes && !rowsRes.ok)) return null;
     const data = (await res.json()) as ReplayPageResponse;
     const pageRows = rowsOnly ? (data.rows ?? []) : rowsRes ? await readRows(rowsRes) : [];
     signal.throwIfAborted();
@@ -171,7 +176,7 @@ async function fetchForward(
     }
     if (data.lost) {
       dispatch({ kind: "lagged", skipped: data.highest_seq });
-      return false;
+      return null;
     }
     if ((data.frames ?? []).length > 0 || pageRows.length > 0) {
       dispatch({ kind: "frames", frames: data.frames ?? [], rows: toActivityRows(pageRows, sid) });
@@ -181,7 +186,7 @@ async function fetchForward(
     cursor = next;
   }
   dispatch({ kind: "lagged_resolved" });
-  return true;
+  return target;
 }
 
 /** Fetch the page below `before`. Returns whether more older history remains, or null on failure. */

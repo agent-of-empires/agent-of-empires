@@ -60,7 +60,7 @@ describe("rows recovery for a cached cursor without history", () => {
     const { frames, cursor, handshakes } = await reopen(undefined, 900);
     expect(frames[0]).toMatchObject({ frames: [], oldestSeq: 40 });
     expect(frames[0]!.rows!.map((r) => r.id)).toEqual(["u", "t1"]);
-    expect(cursor.current).toBe(900);
+    expect(cursor.current).toBe(3000);
     expect(handshakes()).toEqual([]);
     expect(requests.some((u) => u.includes("since=850&"))).toBe(true);
     expect(requests.findIndex((u) => u.includes("before="))).toBeLessThan(
@@ -90,6 +90,8 @@ describe("rows recovery for a cached cursor without history", () => {
     await fetchReplay("sid", cursor, 0, (a) => actions.push(a), vi.fn(), new AbortController().signal);
     const state = actions.reduce(reducer, { ...emptyAcpState(), lastSeq: 900 });
     expect(state.activity.map((r) => r.id)).toEqual(["u2", "t2", "new"]);
+    // The dial reads this ref before React commits, so it must already be at what the controls reached.
+    expect(cursor.current).toBe(3000);
     expect(requests.some((u) => u.includes("since=850") && u.includes("view=rows"))).toBe(false);
     expect(requests.some((u) => u.includes("since=2950") && u.includes("view=rows"))).toBe(false);
     expect(requests.some((u) => u.includes("since=3000") && u.includes("view=rows"))).toBe(true);
@@ -112,16 +114,10 @@ describe("rows recovery for a cached cursor without history", () => {
         url.includes("since=850") && !url.includes("view=rows") ? (onFrames(url) ?? impl(url)) : impl(url),
       );
     };
+    const cursor = { current: 900 };
     const run = async (signal?: AbortSignal) => {
       const actions: Parameters<typeof reducer>[1][] = [];
-      await fetchReplay(
-        "sid",
-        { current: 900 },
-        0,
-        (a) => actions.push(a),
-        vi.fn(),
-        signal ?? new AbortController().signal,
-      );
+      await fetchReplay("sid", cursor, 0, (a) => actions.push(a), vi.fn(), signal ?? new AbortController().signal);
       return actions;
     };
     // What the socket sends when it dials with since=900: the whole transcript, oldest first.
@@ -138,6 +134,7 @@ describe("rows recovery for a cached cursor without history", () => {
       interrupt(respond ?? (() => abort.abort()));
       const actions = await run(abort.signal);
       expect(actions.filter((a) => a.kind === "frames")).toEqual([]);
+      expect(cursor.current).toBe(900);
       const state = [...actions, snapshot].reduce(reducer, { ...emptyAcpState(), lastSeq: 900 });
       expect(state.activity.map((r) => r.id)).toEqual(["u1", "u2"]);
     });
