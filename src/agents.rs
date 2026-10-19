@@ -1052,8 +1052,9 @@ impl AgentDef {
             "codex" => "--no-daemon",
             _ => return None,
         };
-        // The first positional word selects the mode; later ones are its operands (a session id
-        // or prompt) and may spell a subcommand name.
+        // After an explicit `resume` or `fork`, later positionals are operands (a session id or
+        // prompt) that may spell a subcommand name. A root prompt does not shield a later
+        // subcommand: Codex still dispatches it.
         let mut mode_known = false;
         let mut words = options.iter().peekable();
         while let Some(word) = words.next() {
@@ -1065,10 +1066,10 @@ impl AgentDef {
             } else if CODEX_VARIADIC_OPTIONS.contains(&word.as_str()) {
                 while words.next_if(|next| !next.starts_with('-')).is_some() {}
             } else if !word.starts_with('-') && !mode_known {
-                mode_known = true;
                 if CODEX_NON_TUI_SUBCOMMANDS.contains(&word.as_str()) {
                     return None;
                 }
+                mode_known = matches!(word.as_str(), "resume" | "fork");
             }
         }
         agent_help_advertises(command, flag).then_some(flag)
