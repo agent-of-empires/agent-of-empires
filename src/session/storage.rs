@@ -168,8 +168,18 @@ fn split_no_follow_rel<'a>(
 /// Read `root`/`rel` as UTF-8 without ever traversing a symlink below `root`.
 #[cfg(unix)]
 pub(crate) fn read_file_no_follow(root: &Path, rel: &Path) -> Result<Option<String>> {
-    use nix::fcntl::{open, openat, AtFlags, OFlag};
-    use nix::sys::stat::{fstat, fstatat, Mode};
+    read_file_no_follow_impl(root, rel, || {})
+}
+
+/// `after_inspect` runs once the final entry has been classified, before it is opened.
+#[cfg(unix)]
+fn read_file_no_follow_impl(
+    root: &Path,
+    rel: &Path,
+    after_inspect: impl FnOnce(),
+) -> Result<Option<String>> {
+    use nix::fcntl::{open, openat, OFlag};
+    use nix::sys::stat::{fstat, Mode};
     use std::io::Read;
 
     let (dirs, file_name) = split_no_follow_rel(rel, "read_file_no_follow")?;
@@ -187,19 +197,55 @@ pub(crate) fn read_file_no_follow(root: &Path, rel: &Path) -> Result<Option<Stri
 
     let regular = |mode| mode & libc::S_IFMT == libc::S_IFREG;
 
-    // Stat the name on the descriptor first.
-    let Ok(before) = fstatat(&dir, file_name, AtFlags::AT_SYMLINK_NOFOLLOW) else {
-        return Ok(None);
+    // `O_PATH` pins the entry without invoking a FIFO or device open, so a swap after
+    // this point cannot redirect the read.
+    #[cfg(target_os = "linux")]
+    let (before, mut file) = {
+        let pinned = openat(
+            &dir,
+            file_name,
+            OFlag::O_PATH | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC,
+            Mode::empty(),
+        );
+        let Ok(pinned) = pinned else {
+            return Ok(None);
+        };
+        let Ok(before) = fstat(&pinned) else {
+            return Ok(None);
+        };
+        if !regular(before.st_mode) {
+            return Ok(None);
+        }
+        after_inspect();
+        // No `O_NOFOLLOW`: the proc entry is a magic link to the pinned object.
+        let proc_path = format!("/proc/self/fd/{}", std::os::fd::AsRawFd::as_raw_fd(&pinned));
+        let flags = OFlag::O_RDONLY | OFlag::O_CLOEXEC | OFlag::O_NONBLOCK;
+        let Ok(fd) = open(proc_path.as_str(), flags, Mode::empty()) else {
+            return Ok(None);
+        };
+        (before, fs::File::from(fd))
     };
-    if !regular(before.st_mode) {
-        return Ok(None);
-    }
 
-    let flags = OFlag::O_RDONLY | OFlag::O_CLOEXEC | OFlag::O_NOFOLLOW | OFlag::O_NONBLOCK;
-    let Ok(fd) = openat(&dir, file_name, flags, Mode::empty()) else {
-        return Ok(None);
+    // No `O_PATH` here, so a swap between the stat and the open can still open a
+    // special file; the `fstat` below only rejects it afterwards.
+    #[cfg(not(target_os = "linux"))]
+    let (before, mut file) = {
+        use nix::fcntl::AtFlags;
+        use nix::sys::stat::fstatat;
+        let Ok(before) = fstatat(&dir, file_name, AtFlags::AT_SYMLINK_NOFOLLOW) else {
+            return Ok(None);
+        };
+        if !regular(before.st_mode) {
+            return Ok(None);
+        }
+        after_inspect();
+        let flags = OFlag::O_RDONLY | OFlag::O_CLOEXEC | OFlag::O_NOFOLLOW | OFlag::O_NONBLOCK;
+        let Ok(fd) = openat(&dir, file_name, flags, Mode::empty()) else {
+            return Ok(None);
+        };
+        (before, fs::File::from(fd))
     };
-    let mut file = fs::File::from(fd);
+
     let Ok(after) = fstat(&file) else {
         return Ok(None);
     };
@@ -2943,6 +2989,28 @@ mod tests {
             read_file_no_follow(&root, Path::new("../outside/host-secret")).is_err(),
             "a path that leaves the anchor is rejected"
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn read_file_no_follow_does_not_open_entry_swapped_after_inspection() {
+        let tmp = tempdir().unwrap();
+        let path = tmp.path().join("config.json");
+        fs::write(&path, "original").unwrap();
+
+        let content = read_file_no_follow_impl(tmp.path(), Path::new("config.json"), || {
+            fs::remove_file(&path).unwrap();
+            nix::unistd::mkfifo(&path, nix::sys::stat::Mode::from_bits_truncate(0o600)).unwrap();
+        })
+        .unwrap();
+        assert_eq!(content.as_deref(), Some("original"));
+
+        let writer = nix::fcntl::open(
+            &path,
+            nix::fcntl::OFlag::O_WRONLY | nix::fcntl::OFlag::O_NONBLOCK,
+            nix::sys::stat::Mode::empty(),
+        );
+        assert_eq!(writer.unwrap_err(), nix::errno::Errno::ENXIO, "no reader");
     }
 
     #[cfg(unix)]
