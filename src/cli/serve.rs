@@ -1993,7 +1993,7 @@ mod tests {
     }
 
     mod profile_guard {
-        use super::super::run;
+        use super::super::{run, run_control};
         use crate::cli::{Cli, Commands};
         use clap::Parser;
         use serial_test::serial;
@@ -2020,8 +2020,8 @@ mod tests {
         async fn lifecycle_verbs_never_consult_the_profile() {
             let (_guard, profiles) = armed_profiles_dir();
             for verb in ["--stop", "--status", "--restart"] {
-                let (profile, args) = dispatch_argv(&["aoe", "serve", verb, "-p", "ghost-profile"]);
-                if let Err(e) = run(&profile, args, None).await {
+                let (_, args) = dispatch_argv(&["aoe", "serve", verb, "-p", "ghost-profile"]);
+                if let Some(Err(e)) = run_control(&args).await {
                     let msg = e.to_string();
                     assert!(
                         !msg.contains("does not exist") && !msg.contains("aoe profile create"),
