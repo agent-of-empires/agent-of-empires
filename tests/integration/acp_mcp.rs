@@ -51,6 +51,7 @@ fn base_config(cwd: std::path::PathBuf, record_path: &std::path::Path) -> SpawnC
         stored_acp_session_id: None,
         fork_from: None,
         seed_history_replay: false,
+        prior_conversation: false,
         generation: 0,
         artifact_dir: None,
         sandbox_info: None,

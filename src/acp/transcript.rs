@@ -9,6 +9,10 @@ use super::elicitations::ElicitationAnswer;
 use super::state::{notice_id, DiffComment, DiffPreview, Event, ToolCall, ToolOutputBlock};
 use crate::daemon::PromptAttachmentRef;
 
+/// Reasons with this prefix are hidden before the first prompt, since a never-prompted
+/// session can legitimately fail `session/load`.
+pub(crate) const LOAD_FAILED_PREFIX: &str = "session/load failed";
+
 /// One renderable row of the transcript.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TranscriptRow {
@@ -342,7 +346,7 @@ impl TranscriptModel {
                     )
                 });
                 if !has_prior_prompt
-                    && (reason.is_empty() || reason.starts_with("session/load failed"))
+                    && (reason.is_empty() || reason.starts_with(LOAD_FAILED_PREFIX))
                 {
                     return Vec::new();
                 }
@@ -982,6 +986,15 @@ mod tests {
         assert!(fold([reset("session/load failed: bad id")])
             .rows()
             .is_empty());
+
+        // A view switch cleared the history, but the worker knew a conversation existed.
+        let m = fold([reset(
+            "Conversation context reset; session/load failed: bad id",
+        )]);
+        assert_eq!(
+            m.rows().last().unwrap().kind,
+            TranscriptRowKind::ContextReset
+        );
 
         let isolated = fold([reset("Sandbox native history was isolated")]);
         let last = isolated.rows().last().unwrap();

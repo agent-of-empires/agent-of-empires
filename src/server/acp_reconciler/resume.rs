@@ -427,6 +427,7 @@ async fn build_spawn_request(
         acp_mode_id,
         agent_command_override: command_override_for_spawn(&target.tool, &target.command),
         seed_history_replay,
+        prior_conversation: false,
         claude_store_pin,
     })
 }

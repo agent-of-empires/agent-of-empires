@@ -53,6 +53,8 @@ pub struct SpawnConfig {
     /// Seed an empty event store from the load replay instead of suppressing
     /// it (first spawn of an imported session, #2276).
     pub seed_history_replay: bool,
+    /// A conversation existed before this launch, so replacing it must be announced.
+    pub prior_conversation: bool,
     /// Exported as `AOE_ARTIFACT_DIR` to host agents (#2587).
     pub artifact_dir: Option<PathBuf>,
     /// `(wrapper, base)` when an `agent_detect_as` wrapper runs its base

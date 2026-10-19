@@ -401,6 +401,7 @@ impl AcpClient {
                 stored_acp_session_id: config.stored_acp_session_id.clone(),
                 seed_history_replay: config.seed_history_replay,
                 fork_from: config.fork_from.clone(),
+                prior_conversation: config.prior_conversation,
             },
             session_id: session_id.clone(),
             cwd: config.cwd.clone(),
