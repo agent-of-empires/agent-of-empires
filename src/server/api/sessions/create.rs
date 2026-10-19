@@ -681,7 +681,12 @@ pub async fn create_session(
         if let Some(resp) = existing {
             return (StatusCode::OK, Json(resp)).into_response();
         }
-        if let Some(failure) = state.create_progress.recent_failure(key) {
+        if body.suggestion.is_some() {
+            // Suggestion retries reuse this key to serialize starts and find a
+            // session already created for this source. Clear a failed attempt only
+            // after locking and checking for an existing session above.
+            state.create_progress.clear_failure(key);
+        } else if let Some(failure) = state.create_progress.recent_failure(key) {
             return api_error(failure.status, failure.code, failure.message);
         }
         if body

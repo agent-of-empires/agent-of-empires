@@ -10,6 +10,10 @@ The format follows [Conventional Commits](https://www.conventionalcommits.org/).
 
 - **plugin:** Add persistent, profile-scoped suggested sessions with shared start/customize, dismissal, exact-source deduplication, and opt-in reviewed automation.
 
+### Bug Fixes
+
+- **plugin:** Resolve suggestion requests without an explicit profile against the daemon's effective default.
+
 ## [1.20.0](https://github.com/agent-of-empires/agent-of-empires/releases/tag/v1.20.0) - 2026-10-15
 
 

@@ -5,18 +5,22 @@ import { SuggestionsView } from "../SuggestionsView";
 import { setServerDown } from "../../lib/connectionState";
 import type { SuggestionPrepareResponse } from "../../lib/types";
 
-const fetchSuggestions = vi.fn();
-const prepareSuggestion = vi.fn();
-const actOnSuggestion = vi.fn();
-const refreshSuggestions = vi.fn();
-const updateSuggestionPolicy = vi.fn();
+const { fetchSuggestions, prepareSuggestion, actOnSuggestion, refreshSuggestions, updateSuggestionPolicy } = vi.hoisted(
+  () => ({
+    fetchSuggestions: vi.fn(),
+    prepareSuggestion: vi.fn(),
+    actOnSuggestion: vi.fn(),
+    refreshSuggestions: vi.fn(),
+    updateSuggestionPolicy: vi.fn(),
+  }),
+);
 
 vi.mock("../../lib/api", () => ({
-  fetchSuggestions: (...args: unknown[]) => fetchSuggestions(...args),
-  prepareSuggestion: (...args: unknown[]) => prepareSuggestion(...args),
-  actOnSuggestion: (...args: unknown[]) => actOnSuggestion(...args),
-  refreshSuggestions: (...args: unknown[]) => refreshSuggestions(...args),
-  updateSuggestionPolicy: (...args: unknown[]) => updateSuggestionPolicy(...args),
+  fetchSuggestions,
+  prepareSuggestion,
+  actOnSuggestion,
+  refreshSuggestions,
+  updateSuggestionPolicy,
 }));
 
 const item = {
@@ -49,7 +53,7 @@ const snapshot = {
 afterEach(() => {
   cleanup();
   setServerDown(false);
-  vi.clearAllMocks();
+  vi.resetAllMocks();
 });
 
 describe("SuggestionsView", () => {
@@ -103,7 +107,14 @@ describe("SuggestionsView", () => {
   });
 
   it("keeps automation off until an explicit provider and criterion are reviewed", async () => {
-    fetchSuggestions.mockResolvedValue(snapshot);
+    fetchSuggestions.mockResolvedValueOnce(snapshot).mockResolvedValue({
+      ...snapshot,
+      auto_create: {
+        enabled: false,
+        rules: [{ provider_id: "github", criterion: "assigned-to-me" }],
+        last_error: null,
+      },
+    });
     updateSuggestionPolicy.mockResolvedValue(true);
     render(<SuggestionsView onPrepare={vi.fn()} onOpenSession={vi.fn()} />);
 
@@ -117,11 +128,63 @@ describe("SuggestionsView", () => {
         undefined,
       ),
     );
+    await waitFor(() =>
+      expect(
+        (screen.getByRole("group", { name: "Reviewed providers and criteria" }) as HTMLFieldSetElement).disabled,
+      ).toBe(false),
+    );
+
+    fireEvent.click(enabled);
+    await waitFor(() =>
+      expect(updateSuggestionPolicy).toHaveBeenLastCalledWith(
+        true,
+        [{ provider_id: "github", criterion: "assigned-to-me" }],
+        undefined,
+      ),
+    );
+  });
+
+  it("serializes policy updates while preserving provider display names", async () => {
+    const { promise: update, resolve: resolveUpdate } = Promise.withResolvers<boolean>();
+    fetchSuggestions.mockResolvedValue({
+      ...snapshot,
+      items: [item, { ...item, id: "other", criterion: "review-requested", provider_name: "GitHub" }],
+      auto_create: {
+        enabled: false,
+        rules: [{ provider_id: "github", criterion: "assigned-to-me" }],
+        last_error: null,
+      },
+    });
+    updateSuggestionPolicy.mockReturnValue(update);
+    render(<SuggestionsView onPrepare={vi.fn()} onOpenSession={vi.fn()} />);
+
+    const criterion = await screen.findByRole("checkbox", { name: "GitHub · assigned-to-me" });
+    fireEvent.click(criterion);
+    await waitFor(() => expect(updateSuggestionPolicy).toHaveBeenCalledTimes(1));
+    expect(updateSuggestionPolicy.mock.results[0]?.value).toBe(update);
+    await waitFor(() =>
+      expect(
+        (screen.getByRole("group", { name: "Reviewed providers and criteria" }) as HTMLFieldSetElement).disabled,
+      ).toBe(true),
+    );
+    fireEvent.click(screen.getByRole("checkbox", { name: "GitHub · review-requested" }));
+    expect(updateSuggestionPolicy).toHaveBeenCalledTimes(1);
+    await act(async () => {
+      resolveUpdate(true);
+      await update;
+    });
   });
   it("opens a linked session and only creates another on explicit request", async () => {
     fetchSuggestions.mockResolvedValue({
       ...snapshot,
-      items: [{ ...item, session_id: "existing-session" }],
+      items: [
+        {
+          ...item,
+          session_id: "existing-session",
+          can_start: false,
+          start_blocked_reason: "This exact source is already linked to a session",
+        },
+      ],
     });
     actOnSuggestion.mockResolvedValue({ ok: true, data: { session_id: "new-session", created: true } });
     const onOpenSession = vi.fn();
@@ -170,6 +233,44 @@ describe("SuggestionsView", () => {
     fireEvent.click(screen.getByRole("button", { name: "Refresh" }));
     expect((await screen.findByRole("alert")).textContent).toContain("last successful snapshot");
     expect(screen.getByText("Fix session lifecycle")).toBeTruthy();
+  });
+
+  it("ignores an initial profile snapshot that resolves after a newer profile snapshot", async () => {
+    const { promise: initial, resolve: resolveInitial } = Promise.withResolvers<typeof snapshot>();
+    const refreshed = { ...snapshot, items: [{ ...item, title: "New snapshot" }] };
+    fetchSuggestions.mockImplementation((profile: string | undefined) =>
+      profile === "work" ? initial : Promise.resolve(refreshed),
+    );
+    const props = { onPrepare: vi.fn(), onOpenSession: vi.fn() };
+    const { rerender } = render(<SuggestionsView {...props} profile="work" />);
+    rerender(<SuggestionsView {...props} profile="other" />);
+
+    expect(await screen.findByText("New snapshot")).toBeTruthy();
+    await act(async () => {
+      resolveInitial(snapshot);
+      await initial;
+    });
+
+    expect(screen.getByText("New snapshot")).toBeTruthy();
+    expect(screen.queryByText("Fix session lifecycle")).toBeNull();
+  });
+  it("ignores an older overlapping snapshot response after a newer load", async () => {
+    const { promise: initial, resolve: resolveInitial } = Promise.withResolvers<typeof snapshot>();
+    const newer = { ...snapshot, items: [{ ...item, title: "New snapshot" }] };
+    fetchSuggestions.mockReturnValueOnce(initial).mockResolvedValueOnce(newer);
+    refreshSuggestions.mockResolvedValue(true);
+    render(<SuggestionsView onPrepare={vi.fn()} onOpenSession={vi.fn()} />);
+
+    fireEvent.click(screen.getByRole("button", { name: "Refresh" }));
+    await waitFor(() => expect(fetchSuggestions).toHaveBeenCalledTimes(2));
+    expect(await screen.findByText("New snapshot")).toBeTruthy();
+    await act(async () => {
+      resolveInitial(snapshot);
+      await initial;
+    });
+
+    expect(screen.getByText("New snapshot")).toBeTruthy();
+    expect(screen.queryByText("Fix session lifecycle")).toBeNull();
   });
   it("does not report a failed initial load as a true empty result", async () => {
     fetchSuggestions.mockResolvedValue(null);

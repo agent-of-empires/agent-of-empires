@@ -35,11 +35,15 @@ function SuggestionsViewForProfile({ profile, readOnly = false, onPrepare, onOpe
   const [sourceFilter, setSourceFilter] = useState("all");
   const [busyKey, setBusyKey] = useState<string | null>(null);
   const current = useRef(true);
+  const loadSequence = useRef(0);
+  const policyBusyRef = useRef(false);
+  const [policyBusy, setPolicyBusy] = useState(false);
 
   const load = useCallback(
     async (retainRefreshError = false) => {
+      const sequence = ++loadSequence.current;
       const data = await fetchSuggestions(profile);
-      if (!current.current) return;
+      if (!current.current || sequence !== loadSequence.current) return;
       if (data) {
         setSnapshot(data);
         if (!retainRefreshError) setError(null);
@@ -53,8 +57,9 @@ function SuggestionsViewForProfile({ profile, readOnly = false, onPrepare, onOpe
 
   useEffect(() => {
     current.current = true;
+    const sequence = ++loadSequence.current;
     void fetchSuggestions(profile).then((data) => {
-      if (!current.current) return;
+      if (!current.current || sequence !== loadSequence.current) return;
       if (data) {
         setSnapshot(data);
         setError(null);
@@ -149,28 +154,33 @@ function SuggestionsViewForProfile({ profile, readOnly = false, onPrepare, onOpe
   };
 
   const changePolicy = async (enabled: boolean, rules: { provider_id: string; criterion: string }[]) => {
-    if (!snapshot || readOnly || offline) return;
-    const ok = await updateSuggestionPolicy(enabled, rules, profile);
-    if (!current.current) return;
-    if (!ok) {
-      setActionError("Policy update failed; the existing policy remains in effect.");
-      return;
+    if (!snapshot || readOnly || offline || policyBusyRef.current) return;
+    policyBusyRef.current = true;
+    setPolicyBusy(true);
+    try {
+      const ok = await updateSuggestionPolicy(enabled, rules, profile);
+      if (!current.current) return;
+      if (!ok) setActionError("Policy update failed; the existing policy remains in effect.");
+      else await load();
+    } finally {
+      policyBusyRef.current = false;
+      if (current.current) setPolicyBusy(false);
     }
-    await load();
   };
 
   const policyRules = snapshot?.auto_create.rules ?? [];
   const criteria = [
     ...new Map([
+      ...policyRules.map(
+        (rule) =>
+          [`${rule.provider_id}\\u0000${rule.criterion}`, { ...rule, provider_name: rule.provider_id }] as const,
+      ),
       ...items.map(
         (item) =>
           [
-            `${item.provider_id}\u0000${item.criterion}`,
+            `${item.provider_id}\\u0000${item.criterion}`,
             { provider_id: item.provider_id, provider_name: item.provider_name, criterion: item.criterion },
           ] as const,
-      ),
-      ...policyRules.map(
-        (rule) => [`${rule.provider_id}\u0000${rule.criterion}`, { ...rule, provider_name: rule.provider_id }] as const,
       ),
     ]).values(),
   ];
@@ -248,15 +258,17 @@ function SuggestionsViewForProfile({ profile, readOnly = false, onPrepare, onOpe
               <input
                 type="checkbox"
                 checked={snapshot?.auto_create.enabled ?? false}
-                disabled={!snapshot || readOnly || offline}
-                title={unavailableTitle}
+                disabled={!snapshot || readOnly || offline || policyBusy}
                 onChange={(event) => void changePolicy(event.target.checked, policyRules)}
               />
               Enable eligible rules
             </label>
           </div>
           {criteria.length > 0 && (
-            <fieldset className="mt-3 grid gap-2 sm:grid-cols-2" disabled={!snapshot || readOnly || offline}>
+            <fieldset
+              className="mt-3 grid gap-2 sm:grid-cols-2"
+              disabled={!snapshot || readOnly || offline || policyBusy}
+            >
               <legend className="sr-only">Reviewed providers and criteria</legend>
               {criteria.map((item) => {
                 const checked = policyRules.some(
@@ -427,8 +439,8 @@ function SuggestionsViewForProfile({ profile, readOnly = false, onPrepare, onOpe
                               <button
                                 type="button"
                                 onClick={() => void performAction(item, "start", true)}
-                                disabled={busy || !item.can_start || readOnly || offline}
-                                title={unavailableTitle || item.start_blocked_reason || undefined}
+                                disabled={busy || !item.project_path || readOnly || offline}
+                                title={unavailableTitle}
                                 className="min-h-10 rounded-md border border-surface-700 px-3 text-sm disabled:opacity-50"
                               >
                                 Create another

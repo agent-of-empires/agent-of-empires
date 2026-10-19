@@ -468,6 +468,12 @@ impl SuggestionsView {
             return SuggestionsCommand::None;
         }
         if self.is_busy() {
+            let only_refreshing = self.pending_action.is_none()
+                && self.pending_prepare.is_none()
+                && self.pending_policy.is_none();
+            if only_refreshing && key.code == KeyCode::Esc {
+                return SuggestionsCommand::Close;
+            }
             return SuggestionsCommand::None;
         }
         match key.code {
@@ -508,7 +514,7 @@ impl SuggestionsView {
                 }
             }),
             KeyCode::Char('a') => self.selected().map_or(SuggestionsCommand::None, |item| {
-                if item.can_start {
+                if item.can_start || (item.session_id.is_some() && item.project_path.is_some()) {
                     SuggestionsCommand::CreateAnother(identity(item))
                 } else {
                     SuggestionsCommand::Blocked(
@@ -1025,6 +1031,30 @@ mod tests {
     }
 
     #[test]
+    fn escape_closes_during_refresh_but_not_during_session_actions() {
+        let (refresh_tx, refresh_rx) = std::sync::mpsc::channel();
+        let mut refreshing = SuggestionsView {
+            pending_refresh: Some(refresh_rx),
+            ..SuggestionsView::default()
+        };
+        assert_eq!(
+            refreshing.handle_key(key(crossterm::event::KeyCode::Esc)),
+            SuggestionsCommand::Close
+        );
+        drop(refresh_tx);
+
+        let (_action_tx, action_rx) = std::sync::mpsc::channel();
+        let mut starting = SuggestionsView {
+            pending_action: Some(action_rx),
+            ..SuggestionsView::default()
+        };
+        assert_eq!(
+            starting.handle_key(key(crossterm::event::KeyCode::Esc)),
+            SuggestionsCommand::None
+        );
+    }
+
+    #[test]
     fn suggestion_keys_cover_linked_create_another_dismiss_restore_and_filter() {
         use crossterm::event::KeyCode;
         let mut view = loaded_view();
@@ -1042,6 +1072,10 @@ mod tests {
             SuggestionsCommand::Dismiss(id.clone())
         );
         view.snapshot.as_mut().unwrap().items[0].session_id = Some("linked".into());
+        view.snapshot.as_mut().unwrap().items[0].can_start = false;
+        view.snapshot.as_mut().unwrap().items[0].project_path = Some("/repo".into());
+        view.snapshot.as_mut().unwrap().items[0].start_blocked_reason =
+            Some("This exact source is already linked to a session".into());
         assert_eq!(
             view.handle_key(key(KeyCode::Enter)),
             SuggestionsCommand::OpenLinked("linked".into())

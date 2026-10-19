@@ -162,3 +162,22 @@ fn suggestion_customization_uses_normal_wizard_data_without_changing_security_de
     assert_eq!(body["create_another"], false);
     assert!(!body.as_object().unwrap().contains_key("hooks_trusted"));
 }
+
+#[test]
+#[serial]
+fn paste_routes_to_suggestions_filter_instead_of_the_selected_session() {
+    let mut env = create_test_env_with_sessions(1);
+    let mut view = SuggestionsView::default();
+    view.filtering = true;
+    view.selected = 2;
+    view.preview_scroll = 9;
+    env.view.suggestions_view = Some(view);
+
+    env.view.handle_paste("follow-up\ntext");
+
+    let view = env.view.suggestions_view.as_ref().unwrap();
+    assert_eq!(view.query, "follow-uptext");
+    assert_eq!(view.selected, 0);
+    assert_eq!(view.preview_scroll, 0);
+    assert!(env.view.send_message_dialog.is_none());
+}

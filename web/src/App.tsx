@@ -2470,7 +2470,7 @@ function AppContent({
                 setShowSessionWizard(true);
               }}
               onSuggestions={() => {
-                setSidebarOpen(false);
+                if (window.innerWidth < 768) setSidebarOpen(false);
                 const profile = searchParams.get("profile");
                 navigate(`/suggestions${profile ? `?profile=${encodeURIComponent(profile)}` : ""}`);
               }}

@@ -4770,9 +4770,11 @@ async fn suggestion_creation_keeps_normal_trust_and_deduplicates_concurrent_star
         .unwrap();
     let (launcher, launches) = support::counting_failing_launcher();
     let mut state = support::build_test_app_state_with_launcher(Vec::new(), launcher);
-    Arc::get_mut(&mut state).unwrap().plugin_host = Some(host.clone());
+    let app_state = Arc::get_mut(&mut state).unwrap();
+    app_state.plugin_host = Some(host.clone());
+    app_state.profile.clear();
     let mut body = serde_json::json!({
-        "path": project.path(), "tool":"claude", "view":"structured", "profile":"test",
+        "path": project.path(), "tool":"claude", "view":"structured",
         "source_refs":["forged-client-source"], "trust_hooks":false,
         "suggestion":{"provider_id":"example.provider","id":"issue-42","revision":1}
     });
@@ -4828,6 +4830,93 @@ async fn suggestion_creation_keeps_normal_trust_and_deduplicates_concurrent_star
         "My reviewed instructions."
     );
     assert_eq!(customized.source_refs, [source]);
+}
+#[tokio::test]
+#[serial_test::serial]
+async fn a_failed_suggestion_start_can_retry_after_its_hook_recovers() {
+    use crate::plugin::{host::PluginHost, host_api::HostApiState};
+    use crate::server::test_support as support;
+    use crate::session::projects::{self, Project, ProjectScope};
+
+    let _home = crate::session::test_support::isolate_app_dir();
+    let marker = tempfile::tempdir().unwrap();
+    let recovered = marker.path().join("recovered");
+    let hook = format!(
+        "if [ ! -e '{}' ]; then touch '{}'; exit 1; fi",
+        recovered.display(),
+        recovered.display()
+    );
+    let project = project_with_on_create_hooks(&[hook.as_str()]);
+    support::seed_instances_on_disk_for_test("test", Vec::new());
+    projects::add(
+        "test",
+        ProjectScope::Global,
+        Project {
+            name: "registered".into(),
+            path: project.path().to_string_lossy().into_owned(),
+            default_base_branch: None,
+            pinned: true,
+            overrides: Default::default(),
+            scope: ProjectScope::Global,
+        },
+        false,
+    )
+    .unwrap();
+
+    let app = crate::session::get_app_dir().unwrap();
+    let host = PluginHost::new(&app, "test", None).unwrap();
+    let publisher = HostApiState::open(&app.join("plugin_events.db"), "test", 100).unwrap();
+    let generation = publisher.begin_ui_generation("example.provider");
+    let source = "https://example.com/issues/43";
+    publisher
+        .publish_suggestions(
+            "example.provider",
+            generation,
+            "Example",
+            &[aoe_plugin_api::Suggestion {
+                id: "issue-43".into(),
+                title: "Fix issue".into(),
+                reason: "Assigned".into(),
+                source_url: source.into(),
+                source_ref: source.into(),
+                preview: "Source text".into(),
+                project: Some("registered".into()),
+                criterion: "assigned".into(),
+                draft: aoe_plugin_api::SuggestionDraft {
+                    title: "Fix issue".into(),
+                    prompt: "Investigate the assigned issue.".into(),
+                },
+            }],
+        )
+        .unwrap();
+    let (launcher, _launches) = support::counting_failing_launcher();
+    let mut state = support::build_test_app_state_with_launcher(Vec::new(), launcher);
+    Arc::get_mut(&mut state).unwrap().plugin_host = Some(host.clone());
+    let body = serde_json::json!({
+        "path": project.path(), "tool":"claude", "view":"structured", "profile":"test",
+        "trust_hooks":true,
+        "suggestion":{"provider_id":"example.provider","id":"issue-43","revision":1}
+    });
+
+    let (failed_status, failed) = post_create(&state, body.clone()).await;
+    assert_eq!(failed_status, StatusCode::BAD_REQUEST, "{failed}");
+    assert!(
+        recovered.exists(),
+        "the hook's first attempt must fail and mark recovery"
+    );
+
+    // The same source-derived idempotency key must retry the now-recovered create,
+    // rather than replaying its previous failure.
+    let (retry_status, retried) = post_create(&state, body).await;
+    assert_eq!(retry_status, StatusCode::CREATED, "{retried}");
+    let rows = support::load_instances_from_disk_for_test("test");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].source_refs, [source]);
+    assert_eq!(retried["id"], rows[0].id);
+    assert_eq!(
+        host.suggestions_snapshot("test").unwrap()["items"][0]["session_id"],
+        rows[0].id
+    );
 }
 
 async fn wait_for(what: &str, mut ready: impl FnMut() -> bool) {

@@ -59,20 +59,23 @@ Providers cannot publish host-owned fields or create sessions through this
 contribution. `runtime.worker` plus `suggestions = true` does not grant
 `session.create`, `session.prompt`, or `session.unattended`.
 
-User clients read `GET /api/suggestions?profile=...`, request refresh with
+User clients read `GET /api/suggestions`, request refresh with
 `POST /api/suggestions/refresh`, and send a flat
 `{ provider_id, id, revision, action, create_another }` body to
 `POST /api/suggestions/action?profile=...`. Actions are `start`, `dismiss`,
 and `restore`. `POST /api/suggestions/prepare?profile=...` takes
 `{ provider_id, id, revision }` and returns
 `{ project_path, title, prompt, source_ref, suggestion }` for the ordinary
-new-session form. An unresolved project is null, never a scratch fallback.
+new-session form. The `profile` query is optional on these routes; omission
+uses the daemon's effective profile (explicit `--profile`, otherwise the
+configured default). An unresolved project is null, never a scratch fallback.
 The ordinary sessions POST accepts `suggestion`, `prompt`, `source_refs`,
 and explicit `create_another`; source identity is re-read from host storage.
 Concurrent starts deduplicate by exact source within the selected profile.
 
 Automation is off by default. `PATCH /api/suggestions/policy?profile=...`
-accepts `{ enabled, rules: [{ provider_id, criterion }] }`; only explicit,
+accepts `{ enabled, rules: [{ provider_id, criterion }] }`; its optional
+`profile` query uses the same effective-profile default. Only explicit,
 reviewed provider-and-criterion pairs qualify. Automatic creation respects
 normal repository trust, worktree, sandbox, agent policy and approval gates;
 it does not enable unattended execution. Read-only and CityHall modes reject

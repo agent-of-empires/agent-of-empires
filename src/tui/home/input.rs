@@ -5932,6 +5932,13 @@ impl HomeView {
             dialog.handle_paste(text);
             return;
         }
+        if let Some(view) = self.suggestions_view.as_mut() {
+            // This filter is single-line; discard pasted control characters.
+            view.query.extend(text.chars().filter(|c| !c.is_control()));
+            view.selected = 0;
+            view.preview_scroll = 0;
+            return;
+        }
         if let Some(ref mut settings) = self.settings_view {
             settings.handle_paste(text);
             return;

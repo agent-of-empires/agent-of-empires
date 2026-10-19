@@ -87,10 +87,14 @@ pub(super) async fn normalize_suggestion(
             "A suggestion cannot create a scratch session",
         ));
     }
-    let profile = body.profile.as_deref().unwrap_or(&state.profile);
-    if let Some(response) = crate::server::api::unknown_profile_response(profile) {
+    let profile = body
+        .profile
+        .clone()
+        .unwrap_or_else(|| crate::session::config::effective_profile(&state.profile));
+    if let Some(response) = crate::server::api::unknown_profile_response(&profile) {
         return Err(response);
     }
+    body.profile = Some(profile.clone());
     let prepared = state
         .plugin_host
         .as_ref()
@@ -101,7 +105,7 @@ pub(super) async fn normalize_suggestion(
                 "Plugin host is unavailable",
             )
         })?
-        .prepare_suggestion(profile, identity)
+        .prepare_suggestion(&profile, identity)
         .map_err(|error| {
             api_error(
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -128,7 +132,7 @@ pub(super) async fn normalize_suggestion(
             "Suggestion must map to an exact registered project",
         )
     })?;
-    body.path = resolve_registered_suggestion_project(profile, project)
+    body.path = resolve_registered_suggestion_project(&profile, project)
         .await
         .map_err(|message| {
             api_error(
@@ -154,7 +158,7 @@ pub(super) async fn normalize_suggestion(
     })?;
     body.source_refs = vec![source_ref.to_owned()];
     if !body.create_another {
-        body.idempotency_key = Some(suggestion_source_key(profile, source_ref));
+        body.idempotency_key = Some(suggestion_source_key(&profile, source_ref));
     }
     Ok(())
 }

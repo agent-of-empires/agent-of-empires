@@ -16,7 +16,9 @@ fn resolve_profile(
     query: ProfileQuery,
     state: &AppState,
 ) -> Result<String, axum::response::Response> {
-    let profile = query.profile.unwrap_or_else(|| state.profile.clone());
+    let profile = query
+        .profile
+        .unwrap_or_else(|| crate::session::config::effective_profile(&state.profile));
     if let Some(response) = super::unknown_profile_response(&profile) {
         return Err(response);
     }
@@ -53,24 +55,45 @@ pub async fn get_suggestions(
         .get_mut("items")
         .and_then(serde_json::Value::as_array_mut)
     {
-        let instances = state.instances.read().await;
-        for item in items {
-            let source_ref = item.get("source_ref").and_then(serde_json::Value::as_str);
-            let linked = source_ref.and_then(|source| {
-                super::sessions::find_by_source_ref(&instances, &profile, source)
-            });
-            if let Some(instance) = linked {
-                item["session_id"] = serde_json::json!(instance.id);
-                item["project_path"] = serde_json::json!(instance.project_path);
+        let links: Vec<Option<(String, String)>> = {
+            let instances = state.instances.read().await;
+            items
+                .iter()
+                .map(|item| {
+                    item.get("source_ref")
+                        .and_then(serde_json::Value::as_str)
+                        .and_then(|source| {
+                            super::sessions::find_by_source_ref(&instances, &profile, source)
+                        })
+                        .map(|instance| (instance.id.clone(), instance.project_path.clone()))
+                })
+                .collect()
+        };
+        let mut resolved_projects: std::collections::HashMap<
+            String,
+            Result<std::path::PathBuf, String>,
+        > = std::collections::HashMap::new();
+        for (item, linked) in items.iter_mut().zip(links) {
+            if let Some((session_id, project_path)) = linked {
+                item["session_id"] = serde_json::json!(session_id);
+                item["project_path"] = serde_json::json!(project_path);
                 item["can_start"] = serde_json::json!(false);
                 item["start_blocked_reason"] =
                     serde_json::json!("This exact source is already linked to a session");
             } else {
                 let project = item.get("project").and_then(serde_json::Value::as_str);
                 if let Some(project) = project {
-                    match super::sessions::resolve_registered_suggestion_project(&profile, project)
-                        .await
-                    {
+                    let result = if let Some(result) = resolved_projects.get(project) {
+                        result.clone()
+                    } else {
+                        let result = super::sessions::resolve_registered_suggestion_project(
+                            &profile, project,
+                        )
+                        .await;
+                        resolved_projects.insert(project.to_owned(), result.clone());
+                        result
+                    };
+                    match result {
                         Ok(path) => {
                             item["project_path"] = serde_json::json!(path);
                             item["can_start"] = serde_json::json!(true);
@@ -221,14 +244,23 @@ pub async fn suggestion_action(
                 )
                     .into_response();
             }
-            let prepared = match state
-                .plugin_host
-                .as_ref()
-                .and_then(|h| h.prepare_suggestion(&profile, &body.suggestion).ok())
-                .flatten()
-            {
-                Some(prepared) => prepared,
-                None => {
+            let Some(host) = state.plugin_host.as_ref() else {
+                return super::api_error(
+                    axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                    "unavailable",
+                    "Plugin host is unavailable",
+                );
+            };
+            let prepared = match host.prepare_suggestion(&profile, &body.suggestion) {
+                Ok(Some(prepared)) => prepared,
+                Err(error) => {
+                    return super::api_error(
+                        axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                        "internal",
+                        error.to_string(),
+                    );
+                }
+                Ok(None) => {
                     return (
                         axum::http::StatusCode::CONFLICT,
                         Json(serde_json::json!({"error":"stale_suggestion","message":"Suggestion was retracted or changed; refresh before starting it"})),
@@ -472,7 +504,7 @@ async fn run_auto_create(state: Arc<AppState>) {
     let Some(host) = state.plugin_host.as_ref() else {
         return;
     };
-    let profile = state.profile.clone();
+    let profile = crate::session::config::effective_profile(&state.profile);
     let snapshot = match host.suggestions_snapshot(&profile) {
         Ok(snapshot) => snapshot,
         Err(error) => {
@@ -591,6 +623,26 @@ mod tests {
         assert_eq!(body.suggestion.revision, 3);
         assert_eq!(body.action, "start");
         assert!(!body.create_another);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn suggestions_without_explicit_profile_use_the_default_profile() {
+        let _home = crate::session::test_support::isolate_app_dir();
+        crate::server::test_support::seed_instances_on_disk_for_test("test", Vec::new());
+        let mut state = crate::server::test_support::build_test_app_state(Vec::new());
+        Arc::get_mut(&mut state).unwrap().profile.clear();
+
+        let response = get_suggestions(State(state), Query(ProfileQuery { profile: None }))
+            .await
+            .into_response();
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+
+        let body = axum::body::to_bytes(response.into_body(), 16 * 1024)
+            .await
+            .unwrap();
+        let snapshot: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(snapshot["items"], serde_json::json!([]));
     }
 
     #[tokio::test]
