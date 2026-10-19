@@ -64,7 +64,8 @@ pub(super) fn render(view: &ServeView, frame: &mut Frame, area: Rect, theme: &Th
                 // Any click closes the overlay, so nothing beneath is a target.
                 mouse.keys.clear();
                 mouse.copies.clear();
-                let effect = RestartEffect::of(*mode, urls, view.keeps_logins);
+                let effect =
+                    RestartEffect::of(*mode, urls, view.restart_on_funnel, view.keeps_logins);
                 render_help_overlay(frame, area, theme, *mode, effect);
             }
         }
@@ -510,7 +511,8 @@ fn render_active(
     let [header, content, footer] = Layout::vertical([
         Constraint::Length(3),
         Constraint::Min(10),
-        Constraint::Length(3),
+        // A pending confirm can wrap to three rows on a narrow terminal.
+        Constraint::Length(if view.pending_confirm.is_some() { 4 } else { 3 }),
     ])
     .areas(area);
 
@@ -646,7 +648,7 @@ fn render_active(
     frame.render_widget(footer_block, footer);
     let footer_text = match view.pending_confirm.map(|(action, _)| action) {
         Some(action) => {
-            let effect = RestartEffect::of(*mode, urls, view.keeps_logins);
+            let effect = RestartEffect::of(*mode, urls, view.restart_on_funnel, view.keeps_logins);
             let link = (effect == RestartEffect::NewLink)
                 .then_some("The link changes: re-scan and sign in again.");
             let (first, effects): (&str, &[&str]) = match (action, effect) {
@@ -907,6 +909,7 @@ mod tests {
             mouse: Default::default(),
             copied: None,
             keeps_logins: true,
+            restart_on_funnel: false,
         };
         let mut term = Terminal::new(TestBackend::new(72, 26)).unwrap();
         term.draw(|f| render(&view, f, f.area(), &Theme::default()))
@@ -955,6 +958,7 @@ mod tests {
             mouse: Default::default(),
             copied: None,
             keeps_logins: true,
+            restart_on_funnel: false,
         }
     }
 
@@ -1068,56 +1072,55 @@ mod tests {
         let quick = "https://a-b-c.trycloudflare.com/?token=t";
         let kept = "Devices stay signed in; agents keep running";
         let link = "The link changes: re-scan and sign in again.";
-        // (mode, url, auth.persist_sessions, key pressed once, confirm after the first sentence, help R)
+        let moved = (
+            format!("Agents keep running. {link}"),
+            "new link, sign in again; agents keep running".to_string(),
+        );
+        let stays = (format!("{kept}."), kept.to_string());
+        // (mode, url, restart takes the Funnel path, auth.persist_sessions, key pressed once,
+        //  confirm after the first sentence, help R)
         let cases = [
-            // Local signs in with the stable token, so the setting does not apply.
-            (Local, lan, false, R, format!("{kept}."), kept.to_string()),
+            // Local signs in with the stable token, so neither flag applies.
+            (Local, lan, false, false, R, stays.clone()),
+            (Tunnel, funnel, true, true, R, stays.clone()),
+            // Tailscale went away (or Cloudflare was picked): the restart opens a quick tunnel.
+            (Tunnel, funnel, false, true, R, moved.clone()),
+            // spawn_daemon never re-creates a named tunnel, whether or not Funnel replaces it.
+            (Tunnel, named, false, true, R, moved.clone()),
+            (Tunnel, named, true, true, R, moved.clone()),
+            (Tunnel, quick, false, true, R, moved.clone()),
             (
                 Tunnel,
                 funnel,
                 true,
-                R,
-                format!("{kept}."),
-                kept.to_string(),
-            ),
-            // A named Cloudflare tunnel keeps its host.
-            (Tunnel, named, true, R, format!("{kept}."), kept.to_string()),
-            (
-                Tunnel,
-                quick,
-                true,
-                R,
-                format!("Agents keep running. {link}"),
-                "new link, sign in again; agents keep running".to_string(),
-            ),
-            (
-                Tunnel,
-                funnel,
                 false,
                 R,
-                "Every Device signs out; agents keep running.".to_string(),
-                "every Device signs out; agents keep running".to_string(),
+                (
+                    "Every Device signs out; agents keep running.".to_string(),
+                    "every Device signs out; agents keep running".to_string(),
+                ),
             ),
             (
                 Tunnel,
                 funnel,
                 true,
+                true,
                 G,
-                "Every Device signs out.".to_string(),
-                kept.to_string(),
+                ("Every Device signs out.".to_string(), kept.to_string()),
             ),
             (
                 Tunnel,
                 quick,
+                false,
                 true,
                 G,
-                format!("Every Device signs out. {link}"),
-                String::new(),
+                (format!("Every Device signs out. {link}"), String::new()),
             ),
         ];
         let theme = crate::tui::styles::load_theme("empire");
-        for (mode, url, keeps_logins, key, effects, help_restart) in cases {
-            let case = format!("{mode:?} {url} persist={keeps_logins} {key:?}");
+        for (mode, url, restart_on_funnel, keeps_logins, key, (effects, help_restart)) in cases {
+            let case =
+                format!("{mode:?} {url} funnel={restart_on_funnel} persist={keeps_logins} {key:?}");
             let mut view = view(ServeViewState::Active {
                 mode,
                 transport: None,
@@ -1131,16 +1134,18 @@ mod tests {
                 log_offset: 0,
             });
             view.keeps_logins = keeps_logins;
+            view.restart_on_funnel = restart_on_funnel;
             view.pending_confirm = Some((key, Instant::now()));
             let first = match key {
                 G => "Press G again for a new passphrase.",
                 R => "Press R again to restart.",
             };
-            for width in [80, 120] {
+            // 60 columns wraps the longest confirm onto a third footer row.
+            for width in [60, 80, 120] {
                 let buf = crate::tui::dialogs::test_render::draw(width, 24, |f, theme| {
                     render(&view, f, f.area(), theme)
                 });
-                let footer = text_in(&buf, Rect::new(0, 22, width, 2));
+                let footer = text_in(&buf, Rect::new(0, 21, width, 3));
                 assert_eq!(
                     footer,
                     format!("{first} {effects} Any other key cancels."),

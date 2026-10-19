@@ -181,18 +181,21 @@ impl ServeMouse {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RestartEffect {
     KeepsLogins,
-    /// A quick Cloudflare tunnel returns on a new host, which the old cookie is not sent to.
+    /// The Tunnel comes back on another host, which the old host-only cookie is not sent to.
     NewLink,
     /// `auth.persist_sessions` is off, so a Tunnel restart drops every login.
     SignsOut,
 }
 
 impl RestartEffect {
-    /// Local mode signs in with the stable access token, so only Tunnels can lose logins.
-    fn of(mode: ServeMode, urls: &[ServeUrl], keeps_logins: bool) -> Self {
+    /// Local mode signs in with the stable access token. A Tunnel keeps its host only when it
+    /// is on Funnel and the restart takes the Funnel path again: `spawn_daemon` never
+    /// re-creates a named Cloudflare tunnel, and without Funnel the server opens a fresh
+    /// quick tunnel.
+    fn of(mode: ServeMode, urls: &[ServeUrl], restart_on_funnel: bool, keeps_logins: bool) -> Self {
         if mode == ServeMode::Local {
             RestartEffect::KeepsLogins
-        } else if urls.iter().any(|u| is_quick_tunnel(&u.url)) {
+        } else if !(restart_on_funnel && urls.iter().any(|u| is_funnel_link(&u.url))) {
             RestartEffect::NewLink
         } else if keeps_logins {
             RestartEffect::KeepsLogins
@@ -202,12 +205,20 @@ impl RestartEffect {
     }
 }
 
-/// Quick tunnels get a fresh `*.trycloudflare.com` host each start; named ones keep theirs.
-fn is_quick_tunnel(url: &str) -> bool {
+/// Mirrors the server's choice: `--no-tailscale` for an explicit Cloudflare pick, otherwise
+/// Funnel whenever `tailscale` is installed and logged in.
+fn restart_on_funnel(mode: ServeMode, transport: Option<TunnelTransport>) -> bool {
+    mode == ServeMode::Tunnel
+        && transport != Some(TunnelTransport::Cloudflare)
+        && crate::server::tunnel::tailscale_available_sync()
+}
+
+/// Funnel serves the machine's stable `https://<host>.<tailnet>.ts.net` origin.
+fn is_funnel_link(url: &str) -> bool {
     let rest = url.split_once("://").map_or(url, |(_, rest)| rest);
     rest.split(['/', '?', '#', ':'])
         .next()
-        .is_some_and(|host| host.ends_with(".trycloudflare.com"))
+        .is_some_and(|host| host.ends_with(".ts.net"))
 }
 
 /// A destructive action awaiting a second press of its key.
@@ -228,6 +239,9 @@ pub struct ServeView {
     copied: Option<(&'static str, Instant)>,
     /// `auth.persist_sessions`: whether a Tunnel restart keeps Devices signed in.
     keeps_logins: bool,
+    /// Whether a restart now would take the server's Funnel path; probed when R, G or help
+    /// is pressed, since it shells out to `tailscale`.
+    restart_on_funnel: bool,
 }
 
 impl Default for ServeView {
@@ -261,6 +275,7 @@ impl ServeView {
                 .ok()
                 .flatten()
                 .is_none_or(|config| config.auth.persist_sessions),
+            restart_on_funnel: false,
         }
     }
 
@@ -505,6 +520,7 @@ impl ServeView {
                     self.pending_passphrase = new_pp.clone();
                     self.restart(mode, transport, Some(new_pp));
                 } else {
+                    self.restart_on_funnel = restart_on_funnel(mode, transport);
                     self.pending_confirm = Some((PendingConfirm::NewPassphrase, Instant::now()));
                 }
             }
@@ -518,11 +534,15 @@ impl ServeView {
                     });
                     self.restart(mode, transport, pp);
                 } else {
+                    self.restart_on_funnel = restart_on_funnel(mode, transport);
                     self.pending_confirm = Some((PendingConfirm::Restart, Instant::now()));
                 }
             }
             KeyCode::Tab if urls.len() > 1 => *url_index = (*url_index + 1) % urls.len(),
-            KeyCode::Char('?') => self.show_help = true,
+            KeyCode::Char('?') => {
+                self.restart_on_funnel = restart_on_funnel(mode, transport);
+                self.show_help = true;
+            }
             KeyCode::Esc | KeyCode::Char('q') => return ServeAction::Close,
             _ => {}
         }
