@@ -396,11 +396,102 @@ pub(crate) async fn run_oneshot(
     cwd: &str,
     timeout: std::time::Duration,
 ) -> Result<String, String> {
-    use tokio::process::Command;
-    let program = &argv[0];
-    let mut cmd = Command::new(program);
-    cmd.args(&argv[1..])
-        .stdin(std::process::Stdio::null())
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    // Its own scope id: releasing the session's id would also stop its worker's scope.
+    let scope_id = format!(
+        "oneshot.{session_id}.{}",
+        SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    );
+    // Host runs only: a container run's argv is the `docker exec` client's.
+    let host = !cwd.is_empty();
+    let (argv, launch_cwd) = (argv.to_vec(), cwd.to_string());
+    let prepared = tokio::task::spawn_blocking(move || {
+        // Resolved once from the launch cwd; the capability probe, the scope check and the spawn
+        // all use this program.
+        let program = host
+            .then(|| resolve_host_program(&argv[0], std::env::var_os("PATH"), &launch_cwd))
+            .flatten();
+        let mut argv = with_standalone(argv, || {
+            program.as_deref().is_some_and(|program| {
+                agents::opencode_supports_standalone(program, Path::new(&launch_cwd))
+            })
+        });
+        let scope = scope_if_startable(scope_id, program.as_deref(), |id| {
+            crate::process::systemd::scope_prefix_for(id, "")
+        });
+        if let Some(program) = program {
+            argv[0] = program.to_string_lossy().into_owned();
+        }
+        (argv, scope)
+    })
+    .await;
+    let Ok((argv, scope)) = prepared else {
+        return Err("Couldn't prepare the one-shot".to_string());
+    };
+    run_oneshot_in(session_id, &argv, cwd, timeout, scope).await
+}
+
+/// `program` as the one-shot's child resolves it: on `path`, with relative entries taken against
+/// `cwd`. `None` when it cannot be found.
+fn resolve_host_program(
+    program: &str,
+    path: Option<std::ffi::OsString>,
+    cwd: &str,
+) -> Option<PathBuf> {
+    which::which_in(program, path, cwd).ok()
+}
+
+/// A scope for a host run of the resolved `program`. None for a container run (`docker exec`
+/// leaves nothing on the host to scope) and for a program that cannot be found, where
+/// `systemd-run` would hide the missing binary behind its own non-zero exit and lose the
+/// "Couldn't start" error.
+fn scope_if_startable(
+    scope_id: String,
+    program: Option<&Path>,
+    prefix: impl FnOnce(&str) -> Option<crate::process::systemd::ScopePrefix>,
+) -> Option<(String, crate::process::systemd::ScopePrefix)> {
+    program?;
+    prefix(&scope_id).map(|prefix| (scope_id, prefix))
+}
+
+/// Releases a one-shot's scope when dropped, so a caller's deadline dropping the future still
+/// stops what the one-shot left behind.
+struct ReleaseOnDrop(String);
+
+impl Drop for ReleaseOnDrop {
+    fn drop(&mut self) {
+        crate::process::systemd::release(&self.0);
+    }
+}
+
+/// Runs the one-shot in `scope` (its id and prefix) when given, and releases the scope afterwards
+/// whatever the outcome, including cancellation.
+async fn run_oneshot_in(
+    session_id: &str,
+    argv: &[String],
+    cwd: &str,
+    timeout: std::time::Duration,
+    scope: Option<(String, crate::process::systemd::ScopePrefix)>,
+) -> Result<String, String> {
+    let prefix = scope.as_ref().map(|(_, prefix)| prefix);
+    let _release = scope.as_ref().map(|(id, _)| ReleaseOnDrop(id.clone()));
+    exec_oneshot(session_id, argv, cwd, timeout, prefix).await
+}
+
+async fn exec_oneshot(
+    session_id: &str,
+    argv: &[String],
+    cwd: &str,
+    timeout: std::time::Duration,
+    prefix: Option<&crate::process::systemd::ScopePrefix>,
+) -> Result<String, String> {
+    // The resolved path stays out of the user-facing reasons.
+    let program = Path::new(&argv[0])
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(&argv[0]);
+    let mut cmd = oneshot_command(argv, prefix);
+    cmd.stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .kill_on_drop(true);
@@ -436,6 +527,35 @@ pub(crate) async fn run_oneshot(
                 timeout.as_secs()
             ))
         }
+    }
+}
+
+/// opencode 2.x `run` starts the shared background service unless it runs `--standalone`; that
+/// service would outlive the one-shot.
+fn with_standalone(mut argv: Vec<String>, supported: impl FnOnce() -> bool) -> Vec<String> {
+    let is_opencode_run = agents::get_agent("opencode").is_some_and(|agent| {
+        argv.first().is_some_and(|program| program == agent.binary)
+            && argv.get(1).map(String::as_str) == agent.oneshot_flag
+    });
+    if is_opencode_run && supported() {
+        argv.insert(2, "--standalone".to_string());
+    }
+    argv
+}
+
+/// `argv` as a command with the daemon's full environment, run inside `prefix`'s scope when given.
+fn oneshot_command(
+    argv: &[String],
+    prefix: Option<&crate::process::systemd::ScopePrefix>,
+) -> tokio::process::Command {
+    let mut cmd = tokio::process::Command::new(&argv[0]);
+    cmd.args(&argv[1..]);
+    match prefix {
+        Some(prefix) => {
+            cmd.env_clear().envs(std::env::vars_os());
+            crate::acp::acp_client::wrap_in_scope(cmd, prefix)
+        }
+        None => cmd,
     }
 }
 
@@ -1457,6 +1577,151 @@ mod serve {
                     .await
                     .unwrap_err();
                 assert!(err.starts_with(want), "{err:?} should start with {want:?}");
+            }
+        }
+
+        fn strings(v: &[&str]) -> Vec<String> {
+            v.iter().map(|s| s.to_string()).collect()
+        }
+
+        #[test]
+        fn standalone_is_added_only_to_a_supported_opencode_run() {
+            let opencode = strings(&["opencode", "run", "-m", "x", "prompt"]);
+            let with = strings(&["opencode", "run", "--standalone", "-m", "x", "prompt"]);
+            let cases = [
+                (opencode.clone(), true, with),
+                (opencode.clone(), false, opencode),
+                (
+                    strings(&["claude", "-p", "x"]),
+                    true,
+                    strings(&["claude", "-p", "x"]),
+                ),
+                (
+                    strings(&["docker", "exec", "c", "opencode", "run", "x"]),
+                    true,
+                    strings(&["docker", "exec", "c", "opencode", "run", "x"]),
+                ),
+            ];
+            for (argv, supported, want) in cases {
+                let asked = std::cell::Cell::new(false);
+                let got = with_standalone(argv.clone(), || {
+                    asked.set(true);
+                    supported
+                });
+                assert_eq!(got, want, "{argv:?}");
+                // Only an opencode `run` pays for the capability probe.
+                assert_eq!(asked.get(), argv[0] == "opencode", "{argv:?}");
+            }
+        }
+
+        fn fake_prefix() -> crate::process::systemd::ScopePrefix {
+            let env = which::which("env").unwrap().to_string_lossy().into_owned();
+            crate::process::systemd::ScopePrefix {
+                argv: vec![env.clone(), "INVOCATION_ID=injected".to_string()],
+                env_bin: env,
+            }
+        }
+
+        #[test]
+        fn oneshot_command_runs_inside_the_scope_prefix() {
+            let argv = strings(&["sh", "-c", "true"]);
+            let prefix = fake_prefix();
+            let plain = oneshot_command(&argv, None);
+            assert_eq!(plain.as_std().get_program(), "sh");
+            let scoped = oneshot_command(&argv, Some(&prefix));
+            assert_eq!(scoped.as_std().get_program(), prefix.argv[0].as_str());
+            let args: Vec<_> = scoped
+                .as_std()
+                .get_args()
+                .map(|a| a.to_string_lossy().into_owned())
+                .collect();
+            assert_eq!(args[..1], prefix.argv[1..]);
+            assert_eq!(args[args.len() - 3..], argv[..]);
+        }
+
+        #[test]
+        fn scope_is_skipped_without_a_resolved_host_program() {
+            let calls = std::cell::Cell::new(0);
+            let make = |_: &str| {
+                calls.set(calls.get() + 1);
+                Some(fake_prefix())
+            };
+            assert!(scope_if_startable("s".into(), None, make).is_none());
+            assert_eq!(calls.get(), 0, "no scope prefix without a program");
+            assert!(scope_if_startable("s".into(), Some(Path::new("/bin/sh")), make).is_some());
+            assert_eq!(calls.get(), 1);
+        }
+
+        #[cfg(unix)]
+        #[test]
+        fn host_program_resolves_relative_path_entries_against_the_launch_cwd() {
+            use std::os::unix::fs::PermissionsExt as _;
+            let project = tempfile::tempdir().unwrap();
+            let bin = project.path().join("bin");
+            std::fs::create_dir(&bin).unwrap();
+            let tool = bin.join("aoe-project-local-tool");
+            std::fs::write(&tool, "#!/bin/sh\n").unwrap();
+            std::fs::set_permissions(&tool, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let elsewhere = tempfile::tempdir().unwrap();
+            let resolve = |path: &str, cwd: &Path| {
+                resolve_host_program(
+                    "aoe-project-local-tool",
+                    Some(path.into()),
+                    &cwd.to_string_lossy(),
+                )
+            };
+            let found = resolve("bin", project.path()).expect("found from the project");
+            assert_eq!(found.canonicalize().unwrap(), tool.canonicalize().unwrap());
+            assert_eq!(resolve("bin", elsewhere.path()), None);
+            assert_eq!(resolve("", project.path()), None);
+        }
+
+        #[tokio::test]
+        async fn run_oneshot_releases_its_scope_when_cancelled() {
+            let released = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+            let _probe = {
+                let released = released.clone();
+                crate::process::systemd::release_probe::install(move |id| {
+                    released.borrow_mut().push(id.to_string())
+                })
+            };
+            let argv = strings(&["sh", "-c", "exec sleep 30"]);
+            let scope = ("oneshot.session-a.0".to_string(), fake_prefix());
+            // The caller's deadline firing drops the future mid-run.
+            let outcome = tokio::time::timeout(
+                Duration::from_millis(200),
+                run_oneshot_in("session-a", &argv, "", Duration::from_secs(60), Some(scope)),
+            )
+            .await;
+            assert!(outcome.is_err(), "the deadline must fire first");
+            assert_eq!(*released.borrow(), ["oneshot.session-a.0"]);
+        }
+
+        #[tokio::test]
+        async fn run_oneshot_releases_its_scope_on_every_outcome() {
+            for (script, ok) in [("echo hi", true), ("exit 1", false)] {
+                let released = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+                let _probe = {
+                    let released = released.clone();
+                    crate::process::systemd::release_probe::install(move |id| {
+                        released.borrow_mut().push(id.to_string())
+                    })
+                };
+                let argv = strings(&["sh", "-c", script]);
+                let out = run_oneshot_in(
+                    "session-a",
+                    &argv,
+                    "",
+                    Duration::from_secs(60),
+                    Some(("oneshot.session-a.0".to_string(), fake_prefix())),
+                )
+                .await;
+                assert_eq!(out.is_ok(), ok, "{script}");
+                let released = released.borrow();
+                assert_eq!(released.len(), 1, "{script}: {released:?}");
+                // Never the session's own id: that would stop its worker's scope.
+                assert_ne!(released[0], "session-a");
+                assert!(released[0].contains("session-a"), "{released:?}");
             }
         }
 

@@ -55,7 +55,7 @@ pub(super) fn take_injected_fresh_handshake_failure() -> bool {
 /// `systemd-run` injects. Stdio and `pre_exec` are not carried over: set them
 /// on the result. A program containing `=` stays unscoped, since `env` would
 /// read it as an assignment.
-pub(super) fn wrap_in_scope(
+pub(crate) fn wrap_in_scope(
     cmd: tokio::process::Command,
     prefix: &crate::process::systemd::ScopePrefix,
 ) -> tokio::process::Command {

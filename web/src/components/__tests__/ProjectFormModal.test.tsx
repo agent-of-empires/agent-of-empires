@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 
 import { ProjectFormModal } from "../ProjectFormModal";
@@ -8,12 +8,30 @@ import { ProjectFormModal } from "../ProjectFormModal";
 vi.mock("../../lib/api", () => ({
   createProject: vi.fn(),
   updateProject: vi.fn(),
+  getSettingsSchema: vi.fn(),
+  fetchMachineSettings: vi.fn(),
+  resolvePluginOptions: vi.fn(),
 }));
 
-import { createProject, updateProject } from "../../lib/api";
+import {
+  createProject,
+  fetchMachineSettings,
+  getSettingsSchema,
+  resolvePluginOptions,
+  updateProject,
+} from "../../lib/api";
 
 const mockCreate = createProject as ReturnType<typeof vi.fn>;
 const mockUpdate = updateProject as ReturnType<typeof vi.fn>;
+const mockSchema = getSettingsSchema as ReturnType<typeof vi.fn>;
+const mockSettings = fetchMachineSettings as ReturnType<typeof vi.fn>;
+const mockResolve = resolvePluginOptions as ReturnType<typeof vi.fn>;
+
+beforeEach(() => {
+  mockSchema.mockResolvedValue([]);
+  mockSettings.mockResolvedValue(null);
+  mockResolve.mockResolvedValue([]);
+});
 
 afterEach(() => {
   cleanup();
@@ -202,5 +220,124 @@ describe("ProjectFormModal", () => {
 
     const smartRenameSelect = screen.getByText("Smart session rename").nextElementSibling as HTMLSelectElement;
     expect(smartRenameSelect.value).toBe("off");
+  });
+
+  describe("per-project plugin settings", () => {
+    const field = {
+      section: "plugin:acme.kit",
+      field: "label",
+      category: "Plugins",
+      label: "Label",
+      description: "",
+      widget: { kind: "text" },
+      web_write: { policy: "allow" },
+      profile_overridable: false,
+      validation: { rule: "none" },
+      advanced: false,
+      per_project: true,
+    };
+    const globalOnly = { ...field, field: "other", label: "Other", per_project: undefined };
+
+    beforeEach(() => {
+      mockSchema.mockResolvedValue([field, globalOnly]);
+      mockSettings.mockResolvedValue({ plugins: { "acme.kit": { settings: { label: "global-label" } } } });
+    });
+
+    const editProject = (overrides?: object) =>
+      render(
+        <ProjectFormModal
+          initial={{ name: "extra", path: "/repo/extra", scope: "global", pinned: false, overrides }}
+          onClose={() => {}}
+          onSaved={() => {}}
+        />,
+      );
+
+    it("lists only per_project fields, seeded with the global value", async () => {
+      editProject();
+      await screen.findByDisplayValue("global-label");
+      expect(screen.queryByText("Other")).toBeNull();
+      expect(screen.getByText("Using the global value")).toBeTruthy();
+    });
+
+    it("PATCHes a changed project value under overrides.plugin_settings", async () => {
+      mockUpdate.mockResolvedValue({ ok: true });
+      editProject();
+      const input = await screen.findByDisplayValue("global-label");
+      fireEvent.focus(input);
+      fireEvent.change(input, { target: { value: "mine" } });
+      fireEvent.keyDown(input, { key: "Enter" });
+      fireEvent.click(screen.getByRole("button", { name: "Save" }));
+
+      await waitFor(() =>
+        expect(mockUpdate).toHaveBeenCalledWith("extra", "global", null, {
+          worktree_enabled: null,
+          smart_rename: null,
+          sandbox_enabled: null,
+          plugin_settings: { "acme.kit": { label: "mine" } },
+        }),
+      );
+    });
+
+    it("'Use global' clears a saved project value with null", async () => {
+      mockUpdate.mockResolvedValue({ ok: true });
+      editProject({ plugin_settings: { "acme.kit": { label: "saved" } } });
+      await screen.findByDisplayValue("saved");
+      fireEvent.click(screen.getByRole("button", { name: "Use global" }));
+      expect(screen.getByDisplayValue("global-label")).toBeTruthy();
+      fireEvent.click(screen.getByRole("button", { name: "Save" }));
+
+      await waitFor(() =>
+        expect(mockUpdate).toHaveBeenCalledWith(
+          "extra",
+          "global",
+          null,
+          expect.objectContaining({ plugin_settings: { "acme.kit": { label: null } } }),
+        ),
+      );
+    });
+
+    it("resolves a dependent control from the effective sibling values, global-only ones included", async () => {
+      const agent = { ...field, field: "agent", label: "Agent" };
+      const mode = { ...field, field: "mode", label: "Mode", per_project: undefined };
+      const model = {
+        ...field,
+        field: "model",
+        label: "Model",
+        widget: { kind: "dynamic_select", source: "acp.models", depends_on: ["agent", "mode"] },
+      };
+      mockSchema.mockResolvedValue([agent, mode, model]);
+      mockSettings.mockResolvedValue({ plugins: { "acme.kit": { settings: { agent: "claude", mode: "fast" } } } });
+      editProject();
+
+      const input = await screen.findByDisplayValue("claude");
+      await waitFor(() => expect(mockResolve).toHaveBeenLastCalledWith("acme.kit", "acp.models", ["claude", "fast"]));
+
+      fireEvent.focus(input);
+      fireEvent.change(input, { target: { value: "codex" } });
+      fireEvent.keyDown(input, { key: "Enter" });
+      await waitFor(() => expect(mockResolve).toHaveBeenLastCalledWith("acme.kit", "acp.models", ["codex", "fast"]));
+
+      fireEvent.click(screen.getAllByRole("button", { name: "Use global" })[0]!);
+      await waitFor(() => expect(mockResolve).toHaveBeenLastCalledWith("acme.kit", "acp.models", ["claude", "fast"]));
+    });
+
+    it("sends the value in the create payload", async () => {
+      mockCreate.mockResolvedValue({ ok: true });
+      render(<ProjectFormModal onClose={() => {}} onSaved={() => {}} />);
+      const input = await screen.findByDisplayValue("global-label");
+      fireEvent.change(screen.getByPlaceholderText("/path/to/repo"), { target: { value: "/repo/extra" } });
+      fireEvent.focus(input);
+      fireEvent.change(input, { target: { value: "mine" } });
+      fireEvent.keyDown(input, { key: "Enter" });
+      fireEvent.click(screen.getByRole("button", { name: "Add" }));
+
+      await waitFor(() =>
+        expect(mockCreate).toHaveBeenCalledWith(
+          expect.objectContaining({
+            overrides: expect.objectContaining({ plugin_settings: { "acme.kit": { label: "mine" } } }),
+          }),
+        ),
+      );
+    });
   });
 });

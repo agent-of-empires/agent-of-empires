@@ -180,6 +180,11 @@ jobs:
           cargo xtask gen-settings-keys
           git diff --exit-code web/src/lib/generated/settingsKeys.ts \
             || (echo "::error::Web setting names are out of date. Run 'cargo xtask gen-settings-keys' and commit." && exit 1)
+      - name: Check live wire types are up-to-date
+        run: |
+          cargo xtask gen-live-wire
+          git diff --exit-code web/src/lib/generated/liveWire.ts \
+            || (echo "::error::Live wire types are out of date. Run 'cargo xtask gen-live-wire' and commit." && exit 1)
       - name: Check rustdoc is warning-clean
         env:
           RUSTDOCFLAGS: "-D warnings"

@@ -206,8 +206,14 @@ async fn daemon_client_http_contract() {
     ));
     assert!(matches!(
         DaemonClient::new("http://example.test", Some("secret-token")),
-        Err(DaemonClientError::InsecureBearerTransport)
+        Err(DaemonClientError::InsecureCredentialTransport)
     ));
+    assert!(matches!(
+        DaemonClient::with_session("http://example.test", "aoe_session=x", "binding"),
+        Err(DaemonClientError::InsecureCredentialTransport)
+    ));
+    assert!(DaemonClient::with_session("https://example.test", "aoe_session=x", "binding").is_ok());
+    assert!(DaemonClient::with_session("http://127.0.0.1:1", "aoe_session=x", "binding").is_ok());
     assert!(DaemonClient::new("http://example.test", None).is_ok());
     assert!(DaemonClient::new("https://example.test", Some("secret-token")).is_ok());
     for invalid_token in ["bad value", "tøken"] {

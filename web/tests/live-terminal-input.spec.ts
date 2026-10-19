@@ -5,6 +5,8 @@ import { mockTerminalApis, seedSettings, fireTouches, type MockHandle } from "./
 import { DESKTOP, iPhone13 } from "./helpers/viewports";
 import {
   expectScrollMode,
+  gridGeometry,
+  lastResizeCols,
   liveContent,
   liveMatches,
   liveTexts,
@@ -312,6 +314,24 @@ test.describe("Live terminal link taps (mobile)", () => {
       expect(opened).toEqual([]);
       expect(page.context().pages()).toHaveLength(1);
     });
+  });
+});
+
+// #4575: touch draws no pane frame, so a 375px phone gives up at most one column to the grid's side inset.
+test.describe("Live terminal grid inset (touch)", () => {
+  test.use({ ...iPhone13, viewport: { width: 375, height: 667 } });
+
+  test("the grid keeps all but one column of the pane and sizes tmux to its width", async ({ page }) => {
+    const handle = await openLiveTerminal(page, { mobile: true });
+    const g = await gridGeometry(page);
+    expect(g.frameWidth).toBe(0);
+    for (const inset of [g.left, g.right]) {
+      expect(inset).toBeGreaterThanOrEqual(0);
+      expect(inset).toBeLessThanOrEqual(4);
+    }
+    const cols = Math.floor(g.gridWidth / g.cell);
+    expect(Math.floor(g.paneWidth / g.cell) - cols).toBeLessThanOrEqual(1);
+    await expect.poll(() => lastResizeCols(handle)).toBe(cols);
   });
 });
 

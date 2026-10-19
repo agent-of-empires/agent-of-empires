@@ -223,6 +223,50 @@ describe("usePaneLayout migration + persistence", () => {
   });
 });
 
+describe("usePaneLayout outside a repository (#4574)", () => {
+  const seededTemplate = () =>
+    localStorage.setItem(
+      "aoe-pane-layout-v2",
+      JSON.stringify({
+        version: 2,
+        template: { ...layout(["diff", "terminal:0"]), nextTerminalIndex: 1 },
+        sessions: {},
+      }),
+    );
+
+  it.each([
+    // [outside, autoOpenTerminalPane, seeded tabs]
+    [false, true, ["diff", "terminal:0"]],
+    // Not yet known: Diff waits for the Session row.
+    [null, true, ["terminal:0"]],
+    [true, true, ["terminal:0"]],
+    [true, false, []],
+  ])("outside=%s terminal=%s seeds %o, whatever autoOpenDiffPane says", (outside, terminal, expected) => {
+    seededTemplate();
+    localStorage.setItem(
+      "aoe-web-settings",
+      JSON.stringify({ autoOpenDiffPane: true, autoOpenTerminalPane: terminal }),
+    );
+    const { result } = renderHook(() => usePaneLayout("s1", outside));
+    expect(dockTabs(result.current.layout, "right")).toEqual(expected);
+  });
+
+  it("applies a flag that arrives after seeding, but never closes a Diff the user opened", () => {
+    seededTemplate();
+    const { result, rerender } = renderHook(({ outside }) => usePaneLayout("s1", outside), {
+      initialProps: { outside: false },
+    });
+    expect(dockTabs(result.current.layout, "right")).toContain("diff");
+    rerender({ outside: true });
+    expect(dockTabs(result.current.layout, "right")).not.toContain("diff");
+
+    act(() => result.current.openTab("diff", "right"));
+    rerender({ outside: true });
+    expect(dockOf(result.current.layout, "diff")).toBe("right");
+    expect(isDockCollapsed(result.current.layout, "right")).toBe(false);
+  });
+});
+
 describe("seedLayout (auto-open pane prefs, #3035)", () => {
   it.each([
     [true, true, ["diff", "terminal:0", "terminal:1"]],

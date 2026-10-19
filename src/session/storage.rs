@@ -282,8 +282,35 @@ pub(crate) fn resolve_symlink_chain(path: &Path) -> Result<PathBuf> {
 pub(crate) fn locked_update<T, R, E>(
     path: &Path,
     parse: impl FnOnce(&str) -> Result<T>,
-    serialize: impl FnOnce(&T) -> Result<String>,
+    serialize: impl Fn(&T) -> Result<String>,
     mutate: impl FnOnce(&mut T) -> std::result::Result<R, E>,
+) -> Result<std::result::Result<R, E>>
+where
+    T: Default,
+{
+    locked_update_inner(path, parse, serialize, mutate, false)
+}
+
+/// [`locked_update`] that leaves the file untouched when the mutation changed nothing, for holding
+/// the lock of a file that is only read.
+pub(crate) fn locked_update_if_changed<T, R, E>(
+    path: &Path,
+    parse: impl FnOnce(&str) -> Result<T>,
+    serialize: impl Fn(&T) -> Result<String>,
+    mutate: impl FnOnce(&mut T) -> std::result::Result<R, E>,
+) -> Result<std::result::Result<R, E>>
+where
+    T: Default,
+{
+    locked_update_inner(path, parse, serialize, mutate, true)
+}
+
+fn locked_update_inner<T, R, E>(
+    path: &Path,
+    parse: impl FnOnce(&str) -> Result<T>,
+    serialize: impl Fn(&T) -> Result<String>,
+    mutate: impl FnOnce(&mut T) -> std::result::Result<R, E>,
+    skip_unchanged: bool,
 ) -> Result<std::result::Result<R, E>>
 where
     T: Default,
@@ -308,9 +335,14 @@ where
         Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
     };
 
+    let before = skip_unchanged.then(|| serialize(&value)).transpose()?;
     let result = mutate(&mut value);
     if result.is_ok() {
-        atomic_write(path, serialize(&value)?.as_bytes())?;
+        let content = serialize(&value)?;
+        if before.as_deref() == Some(content.as_str()) {
+            return Ok(result);
+        }
+        atomic_write(path, content.as_bytes())?;
         // Best-effort here, unlike atomic_write's "every fallible mutation before the
         // rename" contract.
         #[cfg(unix)]

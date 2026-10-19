@@ -500,29 +500,47 @@ fn config_get(
     ctx: &PluginRpcContext,
     params: &Value,
 ) -> Result<Value, DispatchError> {
+    use crate::session::config::settings_schema::resolve_plugin_setting;
+
     let key = str_param(params, "key")?;
-    let mut value = Value::Null;
+    let project_path = optional_str_param(params, "project_path")?;
+    let registry = crate::plugin::registry();
+    let decl = registry
+        .get(&ctx.plugin_id)
+        .and_then(|p| p.manifest.settings.iter().find(|s| s.key == key));
+    let mut resolved = None;
     let mut revision = state.settings_revision();
     // Retry when a settings write lands mid-load so the value and revision stay paired.
     for _ in 0..8 {
         let rev_before = revision;
         let config =
             crate::session::Config::load().map_err(|e| DispatchError::internal(e.to_string()))?;
-        value = match config
+        let global = config
             .plugins
             .get(&ctx.plugin_id)
             .and_then(|plugin| plugin.settings.get(key))
-        {
-            Some(toml_value) => serde_json::to_value(toml_value)
-                .map_err(|e| DispatchError::internal(e.to_string()))?,
-            None => Value::Null,
+            .map(serde_json::to_value)
+            .transpose()
+            .map_err(|e| DispatchError::internal(e.to_string()))?;
+        let project = match project_path.filter(|_| decl.is_some_and(|d| d.per_project)) {
+            Some(path) => crate::session::projects::find_by_canonical_path_strict(
+                &state.profile,
+                std::path::Path::new(path),
+            )
+            .map_err(|e| DispatchError::internal(e.to_string()))?,
+            None => None,
         };
+        resolved = resolve_plugin_setting(&ctx.plugin_id, key, decl, project.as_ref(), global);
         revision = state.settings_revision();
         if revision == rev_before {
             break;
         }
     }
-    Ok(json!({ "value": value, "revision": revision }))
+    let (value, scope) = match resolved {
+        Some((value, scope)) => (value, json!(scope.as_str())),
+        None => (Value::Null, Value::Null),
+    };
+    Ok(json!({ "value": value, "scope": scope, "revision": revision }))
 }
 
 fn storage_key(params: &Value) -> Result<String, DispatchError> {

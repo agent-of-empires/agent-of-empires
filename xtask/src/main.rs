@@ -19,6 +19,8 @@ enum Commands {
     GenDocs,
     /// Generate the web dashboard's setting-name types from the settings schema
     GenSettingsKeys,
+    /// Generate the web dashboard's live-stream wire types from the Rust ones
+    GenLiveWire,
     /// Check that contrib skill files reference valid CLI commands
     CheckSkill,
     /// Run the web dashboard backend and Vite dev server together (Ctrl-C stops both)
@@ -49,6 +51,7 @@ fn main() {
     match args.command {
         Commands::GenDocs => generate_cli_docs(),
         Commands::GenSettingsKeys => generate_settings_keys(),
+        Commands::GenLiveWire => generate_live_wire(),
         Commands::CheckSkill => check_skill(),
         Commands::Dev(dev) => run_dev(dev),
     }
@@ -328,6 +331,19 @@ fn generate_cli_docs() {
     fs::write(&output_path, markdown).expect("Failed to write CLI reference");
 
     println!("Generated CLI documentation at {}", output_path.display());
+}
+
+const LIVE_WIRE_PATH: &str = "web/src/lib/generated/liveWire.ts";
+
+fn generate_live_wire() {
+    let path = Path::new(LIVE_WIRE_PATH);
+    fs::create_dir_all(path.parent().unwrap()).expect("Failed to create generated directory");
+    fs::write(
+        path,
+        agent_of_empires::daemon::live::typescript_declarations(),
+    )
+    .expect("Failed to write live wire types");
+    println!("Generated live wire types at {}", path.display());
 }
 
 const SETTINGS_KEYS_PATH: &str = "web/src/lib/generated/settingsKeys.ts";

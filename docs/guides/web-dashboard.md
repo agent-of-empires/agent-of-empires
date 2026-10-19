@@ -96,7 +96,7 @@ Responses carry `X-Frame-Options: DENY`, `X-Content-Type-Options: nosniff`, and 
 
 ### Plugin pages
 
-A plugin page is framed with `sandbox="allow-scripts"` and served under its own policy (see [Pages](../plugin-api.md#pages)), so its script runs in an opaque origin: it cannot read the dashboard's token, binding secret, storage or cookies, call the API, or navigate the dashboard. Because a frame load cannot send the device-binding header, the dashboard first mints a page ticket through a bound request. The ticket rides an `HttpOnly` cookie scoped to that page's URL, lasts 60 seconds, and authenticates only that page for the still-signed-in session that minted it; it never appears in the frame URL or document. That route is the only one framable, and only by the dashboard.
+A plugin page is framed with `sandbox="allow-scripts allow-downloads"` and served under its own policy (see [Pages](../plugin-api.md#pages)), so its script runs in an opaque origin: it cannot read the dashboard's token, binding secret, storage or cookies, call the API, or navigate the dashboard; it can save files to the downloads folder, subject to the browser's download protections. Because a frame load cannot send the device-binding header, the dashboard first mints a page ticket through a bound request. The ticket rides an `HttpOnly` cookie scoped to that page's URL, lasts 60 seconds, and authenticates only that page for the still-signed-in session that minted it; it never appears in the frame URL or document. That route is the only one framable, and only by the dashboard.
 
 ### DNS rebinding
 
