@@ -922,16 +922,18 @@ mod tests {
     fn policy_review_and_toggle_have_explicit_keyboard_commands() {
         use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
-        let mut view = SuggestionsView::default();
-        view.snapshot = Some(SuggestionsResponse {
-            items: vec![suggestion("Fix docs", "repo")],
-            providers: vec![],
-            auto_create: SuggestionPolicy {
-                enabled: false,
-                rules: vec![],
-                last_error: None,
-            },
-        });
+        let mut view = SuggestionsView {
+            snapshot: Some(SuggestionsResponse {
+                items: vec![suggestion("Fix docs", "repo")],
+                providers: vec![],
+                auto_create: SuggestionPolicy {
+                    enabled: false,
+                    rules: vec![],
+                    last_error: None,
+                },
+            }),
+            ..Default::default()
+        };
         assert_eq!(
             view.handle_key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::NONE)),
             SuggestionsCommand::ReviewPolicy
@@ -952,16 +954,18 @@ mod tests {
         let mut blocked = suggestion("Fix docs", "missing");
         blocked.can_start = false;
         blocked.start_blocked_reason = Some("Project is not registered".into());
-        let mut view = SuggestionsView::default();
-        view.snapshot = Some(SuggestionsResponse {
-            items: vec![blocked],
-            providers: vec![],
-            auto_create: SuggestionPolicy {
-                enabled: false,
-                rules: vec![],
-                last_error: None,
-            },
-        });
+        let mut view = SuggestionsView {
+            snapshot: Some(SuggestionsResponse {
+                items: vec![blocked],
+                providers: vec![],
+                auto_create: SuggestionPolicy {
+                    enabled: false,
+                    rules: vec![],
+                    last_error: None,
+                },
+            }),
+            ..Default::default()
+        };
 
         let expected = SuggestionsCommand::Blocked("Project is not registered".into());
         assert_eq!(

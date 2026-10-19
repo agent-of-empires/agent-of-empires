@@ -183,6 +183,27 @@ impl HttpClient {
         Ok(res.json().await?)
     }
 
+    pub(crate) async fn daemon_json<T: DeserializeOwned>(
+        &self,
+        method: Method,
+        path: &str,
+        body: Option<&serde_json::Value>,
+    ) -> Result<T, HttpError> {
+        let response = self
+            .send(
+                || {
+                    let request = self.request(method.clone(), path);
+                    match body {
+                        Some(body) => request.json(body),
+                        None => request,
+                    }
+                },
+                Scope::Global,
+            )
+            .await?;
+        Ok(response.json().await?)
+    }
+
     /// POST/PATCH/DELETE to a session endpoint, discarding the body.
     async fn session_call(
         &self,
