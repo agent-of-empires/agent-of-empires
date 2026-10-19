@@ -1331,6 +1331,12 @@ path: /workspace/secrets.env
     #[test]
     fn claude_hook_reconciliation_table() {
         let parked_over_completion = "\
+✻ Sautéed for 39s\n\
+──────────────────────────────\n\
+❯ stop the monitor\n\
+──────────────────────────────\n\
+  ⏵⏵ bypass permissions on · PR #444 · 1 monitor · ← for agents · ↓ to manage";
+        let monitor_over_completion = "\
 ✻ Sautéed for 39s · 1 monitor still running\n\
 ──────────────────────────────\n\
 ❯ stop the monitor\n\
@@ -1375,7 +1381,7 @@ path: /workspace/secrets.env
             &["✻ Worked for 1m 52s\n❯\n  ? for shortcuts", "  \n \n"],
         );
         // A stale running hook yields to parked evidence under a typed prompt,
-        // never to a blank pane or to prose still streaming.
+        // never to a blank pane, prose still streaming, or a running monitor.
         assert_hook_all(
             "claude",
             running_stale,
@@ -1386,7 +1392,12 @@ path: /workspace/secrets.env
             "claude",
             running_stale,
             Status::Running,
-            &["   \n\n  ", streaming_over_prompt, streaming_over_chrome],
+            &[
+                "   \n\n  ",
+                streaming_over_prompt,
+                streaming_over_chrome,
+                monitor_over_completion,
+            ],
         );
         // The freshness bound is exclusive.
         assert_hook_all(
@@ -2231,14 +2242,24 @@ enter to select · esc to cancel";
         );
 
         let mcp = format!("{parked}✻ Ran 3 tools · 2 MCP tasks still running\n");
-        assert!(claude_rule_matches("background_mcp_task", &mcp));
-        assert_eq!(
-            detect_via_manifest("claude", &mcp, "", None),
-            Status::Running
-        );
-
-        let quoted = format!("{mcp}Do you want to proceed?\n❯ 1. Yes\n  2. No\n");
-        assert!(!claude_rule_matches("background_mcp_task", &quoted));
+        let monitor = "\
+✻ Sautéed for 39s · 1 monitor still running\n\
+──────────────────────────────\n\
+❯ \n\
+──────────────────────────────\n\
+  ⏵⏵ bypass permissions on · PR #444 · 1 monitor · ← for agents · ↓ to manage";
+        let monitors = format!("{parked}✻ Worked for 2m 3s · 2 monitors still running\n");
+        for pane in [mcp.as_str(), monitor, &monitors] {
+            assert!(claude_rule_matches("background_task", pane), "{pane}");
+            // The `Stop` hook writes idle whatever is still running.
+            assert_eq!(
+                detect_via_manifest("claude", pane, "", hook(Status::Idle, None)),
+                Status::Running,
+                "{pane}"
+            );
+            let quoted = format!("{pane}\nDo you want to proceed?\n❯ 1. Yes\n  2. No\n");
+            assert!(!claude_rule_matches("background_task", &quoted), "{pane}");
+        }
     }
 
     #[test]
