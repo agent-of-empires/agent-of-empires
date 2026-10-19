@@ -5,7 +5,7 @@ import { InstallAgentError, installAcpAgent } from "../../lib/api";
 /** Copy for each `install-agent` refusal; any other failure shows the server's message. */
 const REFUSAL_COPY: Record<string, string> = {
   install_disabled:
-    "Installing from the dashboard is off. Turn on acp.allow_agent_install in the aoe TUI settings to allow it.",
+    'Installing from the dashboard is off. Turn on "Allow agent install from web" in the aoe TUI settings (Global, Acp tab, Advanced) to allow it.',
   npm_missing:
     "npm isn't on the Daemon's PATH. Restart aoe serve from a shell where `which npm` works, or run the install command yourself.",
   not_npm_installable:

@@ -98,6 +98,16 @@ describe("StartupErrorBanner layout", () => {
       actions: ["Retry", "Use Terminal view"],
     },
     {
+      label: "the missing-binary error names its cause",
+      info: claude(),
+      message: `Failed to start structured view agent "claude": acp client error: agent spawn failed: entity not found (binary \`claude-agent-acp\` not found on the daemon's PATH or in any known node-manager bin dir)`,
+      headline: "Claude couldn't start in Structured view",
+      command: CLAUDE_NPM,
+      texts: ["Claude's ACP adapter isn't installed where the Daemon runs."],
+      absent: ["usually missing or out of date"],
+      actions: ["Retry", "Use Terminal view"],
+    },
+    {
       label: "install on: Install and retry replaces the command",
       info: claude({ install_allowed: true }),
       headline: "Claude couldn't start in Structured view",
@@ -200,7 +210,7 @@ describe("StartupErrorBanner install", () => {
     ["npm_missing", "npm isn't on the Daemon's PATH"],
     ["not_npm_installable", "The Daemon can't install this ACP adapter with npm"],
     ["container_not_running", "The Session's sandbox container isn't running"],
-    ["install_disabled", "Installing from the dashboard is off"],
+    ["install_disabled", 'Turn on "Allow agent install from web" in the aoe TUI settings (Global, Acp tab, Advanced)'],
     ["install_timeout", "`npm install -g` did not finish within 180s."],
   ])("a %s refusal shows its own message and doesn't respawn", async (code, text) => {
     const spy = stubApi({
@@ -233,6 +243,16 @@ describe("StartupErrorBanner install", () => {
     const { findByTestId } = renderBanner();
     fireEvent.click(await findByTestId("startup-error-banner-install"));
     await waitFor(() => expect(calls(spy, "/acp/spawn")).toBe(1));
+  });
+});
+
+describe("StartupErrorBanner Retry", () => {
+  it("says what happens next once the respawn is accepted", async () => {
+    stubApi({ info: json(claude()), spawn: json({}) });
+    const { getByTestId, findByText, queryByTestId } = renderBanner();
+    fireEvent.click(getByTestId("startup-error-banner-retry"));
+    await findByText("Retrying. Events will appear when Claude starts.");
+    expect(queryByTestId("startup-error-banner-details-body")).toBeNull();
   });
 });
 

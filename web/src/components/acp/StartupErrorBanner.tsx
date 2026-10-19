@@ -92,6 +92,8 @@ function specificRemediation(message: string): React.ReactNode {
 
 /** The Agent named in a spawn failure ("Failed to start structured view agent \"x\""). */
 const AGENT_IN_MESSAGE = /structured view agent "([^"]+)"/;
+/** The Daemon's missing-adapter error (#4654), which names its cause. */
+const ADAPTER_NOT_FOUND = /binary `[^`]+` not found/;
 
 export function StartupErrorBanner({
   sessionId,
@@ -166,12 +168,15 @@ export function StartupErrorBanner({
       <div role="alert">
         <h2 className="text-sm font-semibold">{name} couldn't start in Structured view</h2>
         <div className="mt-1 text-xs text-text-secondary">
-          {specific ?? (
-            <>
-              The ACP adapter, the program that connects AoE to {name}, didn't start. It's usually missing or out of
-              date.
-            </>
-          )}
+          {specific ??
+            (ADAPTER_NOT_FOUND.test(message) ? (
+              <>{name}'s ACP adapter isn't installed where the Daemon runs.</>
+            ) : (
+              <>
+                The ACP adapter, the program that connects AoE to {name}, didn't start. It's usually missing or out of
+                date.
+              </>
+            ))}
         </div>
       </div>
       {!specific && !canInstall && <InstallSteps info={info} />}
@@ -181,9 +186,7 @@ export function StartupErrorBanner({
         install={install}
       />
       {retryState === "ok" && (
-        <div className="mt-2 text-xs text-status-running">
-          Spawn requested. New events should start streaming shortly.
-        </div>
+        <div className="mt-2 text-xs text-status-running">Retrying. Events will appear when {name} starts.</div>
       )}
       <div className="mt-3 border-t border-status-error/30 pt-2">
         <button

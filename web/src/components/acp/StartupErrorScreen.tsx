@@ -58,7 +58,8 @@ export function StartupErrorScreen({ detail, sessionId, isSandboxed = false }: P
     onClick: () => {},
     testId: "startup-error-update-restart-disabled",
     disabled: true,
-    title: "Enable acp.allow_agent_install in the aoe TUI settings (Advanced) to install from the dashboard",
+    title:
+      'Turn on "Allow agent install from web" in the aoe TUI settings (Global, Acp tab, Advanced) to install from the dashboard',
   };
   const canUpdate = autoInstallable && allowInstall;
 
