@@ -10,7 +10,8 @@
 | Releases | `release` | @njbrake | @Seluj78 |
 
 [CODEOWNERS](.github/CODEOWNERS) maps paths to these `@agent-of-empires`
-teams; each auto-assigns one reviewer. Only @njbrake and @Seluj78 cut
+teams; each auto-assigns one reviewer. Paths no area claims, such as
+`CONTRIBUTING.md`, go to the `maintainers` team. Only @njbrake and @Seluj78 cut
 [releases](docs/development/releases.md). @njbrake sets project direction.
 
 ## Merging
