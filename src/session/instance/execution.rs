@@ -3271,6 +3271,18 @@ mod tests {
             .is_none());
         let error = inputs.read_native_file(&present).unwrap_err().to_string();
         assert!(error.contains("exists inside the container"), "{error}");
+        // Root bypasses directory permissions, so only a non-root run can lock the parent.
+        let locked = root.join("locked");
+        std::fs::create_dir(&locked).unwrap();
+        std::fs::write(locked.join("hidden.toml"), "x").unwrap();
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let unreadable = std::fs::read(locked.join("hidden.toml")).is_err();
+        if unreadable {
+            assert!(inputs
+                .read_native_file(&locked.join("hidden.toml"))
+                .is_err());
+        }
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o700)).unwrap();
     }
 
     #[test]

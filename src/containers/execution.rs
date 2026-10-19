@@ -412,14 +412,18 @@ printf '%s%s\n' "$PWD" "$suffix""#;
         Ok(path)
     }
 
-    /// Whether `path` exists inside the container, symlinks included.
+    /// Whether `path` exists inside the container, symlinks included. A path under an
+    /// unsearchable directory is an error, not absent.
     pub(crate) fn path_exists(&self, name: &str, path: &std::path::Path) -> anyhow::Result<bool> {
         anyhow::ensure!(path.is_absolute(), "container path must be absolute");
         let path = path
             .to_str()
             .ok_or_else(|| anyhow::anyhow!("container path is not UTF-8"))?;
         let script = r#"PATH=/usr/bin:/bin; export PATH
-if [ -e "$1" ] || [ -L "$1" ]; then exit 0; fi
+p=$1
+while [ ! -e "$p" ] && [ ! -L "$p" ]; do p=${p%/*}; [ -n "$p" ] || p=/; done
+[ "$p" = "$1" ] && exit 0
+if [ -d "$p" ] && [ ! -x "$p" ]; then exit 4; fi
 exit 3"#;
         let args = ["/bin/sh", "-c", script, "aoe-path", path].map(str::to_owned);
         let output = self
