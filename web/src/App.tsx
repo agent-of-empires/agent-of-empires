@@ -1347,6 +1347,9 @@ function AppContent({
   const handleSwitchView = useCallback((sessionId: string, toStructured: boolean) => {
     setSwitchViewTarget({ sessionId, toStructured });
   }, []);
+  // The startup error banner's way out, where the server allows the switch. Each
+  // mounted Structured view switches its own Session.
+  const canSwitchToTerminal = !serverAbout?.read_only && caps.canUseTerminal;
 
   const handleConfirmSwitchView = useCallback(async () => {
     if (!switchViewTarget) return;
@@ -1990,6 +1993,9 @@ function AppContent({
                             fileRefSession={session}
                             onOpenAgentsPane={openAgentsPane}
                             isSandboxed={session.is_sandboxed}
+                            onSwitchToTerminal={
+                              canSwitchToTerminal ? () => handleSwitchView(session.id, false) : undefined
+                            }
                           />
                         </Suspense>
                       )}
@@ -2202,6 +2208,7 @@ function AppContent({
           pluginPanes={pluginPanes}
           onBackToAgent={() => handlePickView("agent")}
           onOpenAgentsPane={() => handlePickView("agents")}
+          onSwitchToTerminal={canSwitchToTerminal ? (id) => handleSwitchView(id, false) : undefined}
           pairedMounted={pairedMounted}
           activeSession={activeSession ?? null}
           activeSessionId={activeSessionId}

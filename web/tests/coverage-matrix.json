@@ -3489,14 +3489,29 @@
       "kind": "vitest",
       "risk": "high",
       "specs": ["src/components/acp/__tests__/StartupErrorScreen.test.tsx"],
-      "components": ["web/src/components/acp/StartupErrorScreen.tsx"]
+      "components": ["web/src/components/acp/StartupErrorScreen.tsx", "web/src/components/acp/RecoveryActionRow.tsx"]
     },
     {
       "id": "acp.startup-error-banner",
       "kind": "vitest",
       "risk": "high",
       "specs": ["src/components/acp/__tests__/StartupErrorBanner.test.tsx"],
-      "components": ["web/src/components/acp/StructuredView.tsx", "web/src/components/acp/StartupErrorBanner.tsx"]
+      "components": [
+        "web/src/components/acp/StructuredView.tsx",
+        "web/src/components/acp/StartupErrorBanner.tsx",
+        "web/src/components/acp/RecoveryActionRow.tsx"
+      ]
+    },
+    {
+      "id": "acp.startup-error-banner-actions",
+      "kind": "mocked-playwright",
+      "risk": "medium",
+      "specs": ["tests/acp-startup-error-banner.spec.ts"],
+      "components": [
+        "web/src/components/acp/StartupErrorBanner.tsx",
+        "web/src/components/acp/RecoveryActionRow.tsx",
+        "web/src/App.tsx"
+      ]
     },
     {
       "id": "acp.startup-error-banner-live",
