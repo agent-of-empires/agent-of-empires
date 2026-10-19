@@ -71,6 +71,7 @@ pub use skills_manager::SkillsManagerDialog;
 pub use snooze_duration::SnoozeDurationDialog;
 pub use telemetry_consent::TelemetryConsentDialog;
 pub use tips::{TipsDialog, TipsOutcome};
+pub use tool_picker::ToolPickerAction;
 pub use tool_picker::ToolPickerDialog;
 pub use update_confirm::UpdateConfirmDialog;
 pub use worktree_name::{WorktreeNameData, WorktreeNameDialog};

@@ -15,6 +15,9 @@ pub(crate) mod markdown;
 mod metrics_poller;
 pub(crate) mod open_url;
 pub(crate) mod plugin_ui;
+#[cfg(feature = "web")]
+mod plugin_ui_poller;
+
 pub(crate) mod remote_home;
 pub(crate) mod responsive;
 mod session_feed;

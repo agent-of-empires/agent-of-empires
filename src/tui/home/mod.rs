@@ -567,6 +567,9 @@ pub struct HomeView {
     // Compact system-health strip controlled by `session.show_diagnostics_pane`.
     // The poller samples host resources and agent counts off the UI thread;
     // `metrics` holds the latest sample for the strip and detail view.
+    #[cfg(feature = "web")]
+    pub(super) plugin_ui: crate::tui::plugin_ui_poller::PluginUiState,
+
     pub(super) show_diagnostics: bool,
     pub(super) show_shortcut_bar: bool,
     pub(super) preview_link_prefixes: Vec<String>,

@@ -917,6 +917,30 @@ fn title_width_for_column(
     (title_width.min(budget), false)
 }
 
+#[cfg(feature = "serve")]
+const MAX_PLUGIN_STATUS_WIDTH: usize = 32;
+
+#[cfg(feature = "serve")]
+fn plugin_status_width<'a>(
+    statuses: impl Iterator<Item = (&'a str, Option<crate::plugin::ui_state::Tone>)>,
+    budget: usize,
+) -> usize {
+    let mut used = 0;
+    for (status, _) in statuses {
+        let available = budget.saturating_sub(used).saturating_sub(2);
+        if available == 0 {
+            break;
+        }
+        let status_width = rendered_width(status);
+        let visible_width = status_width.min(available);
+        used += 2 + visible_width;
+        if visible_width < status_width {
+            break;
+        }
+    }
+    used
+}
+
 /// The activity column's text: remaining snooze under Attention sort, else the age of a
 /// resting (Idle or Unknown) row, else blank. `last_accessed_at` is only a fallback for a
 /// missing `idle_entered_at`; on an active row it reads as idle time.
@@ -1988,6 +2012,7 @@ impl HomeView {
         line_spans.push(Span::styled(format!("{} ", icon), icon_style));
         let prefix_width: usize = line_spans.iter().map(|s| s.width()).sum();
         let room = (list_width as usize).saturating_sub(prefix_width);
+        let text_width = rendered_width(&text);
 
         let inst = match item {
             Item::Session { id, .. } => self.get_instance(id).map(|inst| (id, inst)),
@@ -2052,18 +2077,63 @@ impl HomeView {
             LAST_ACTIVITY_SLOT
         };
 
-        let (title_width, keep_tag) = title_width_for_column(
-            rendered_width(&text),
-            room,
-            tag_span.as_ref().map_or(0, |s| s.width()),
-            slot_width + badge_width + LAST_ACTIVITY_RIGHT_MARGIN,
+        let tag_width = tag_span.as_ref().map_or(0, |span| span.width());
+        let fixed_trailing = slot_width + badge_width + LAST_ACTIVITY_RIGHT_MARGIN;
+        #[cfg(feature = "serve")]
+        let status_budget = room
+            .saturating_sub(tag_width + fixed_trailing + text_width.min(MIN_TITLE_CELLS))
+            .min(MAX_PLUGIN_STATUS_WIDTH);
+        #[cfg(feature = "serve")]
+        let plugin_status_width = plugin_status_width(
+            crate::tui::plugin_ui::session_row_statuses(&self.plugin_ui.snapshot, id),
+            status_budget,
         );
+        #[cfg(not(feature = "serve"))]
+        let plugin_status_width = 0;
+
+        let (title_width, keep_tag) = if plugin_status_width > 0 {
+            (
+                text_width
+                    .min(room.saturating_sub(tag_width + fixed_trailing + plugin_status_width)),
+                true,
+            )
+        } else {
+            title_width_for_column(text_width, room, tag_width, fixed_trailing)
+        };
         line_spans.push(Span::styled(
             truncate_to_width(&text, title_width),
             text_style,
         ));
         line_spans.extend(tag_span.filter(|_| keep_tag));
 
+        #[cfg(feature = "serve")]
+        if plugin_status_width > 0 {
+            let mut remaining = plugin_status_width;
+            for (status, tone) in
+                crate::tui::plugin_ui::session_row_statuses(&self.plugin_ui.snapshot, id)
+            {
+                let available = remaining.saturating_sub(2);
+                if available == 0 {
+                    break;
+                }
+                let status_width = rendered_width(status);
+                let visible_width = status_width.min(available);
+                line_spans.push(Span::raw("  "));
+                let status_style = crate::tui::plugin_ui::tone_style(tone, theme);
+                line_spans.push(Span::styled(
+                    truncate_to_width(status, visible_width),
+                    if is_selected {
+                        selected_row_style(status_style, theme)
+                    } else {
+                        status_style
+                    },
+                ));
+                remaining -= 2 + visible_width;
+                if visible_width < status_width {
+                    break;
+                }
+            }
+        }
         let used_width: usize = line_spans.iter().map(|s| s.width()).sum();
         let column_pad = activity_column_padding(used_width, list_width, slot_width, badge_width);
         let column_fits = column_pad.is_some();
