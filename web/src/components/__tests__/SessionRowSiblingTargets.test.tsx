@@ -109,4 +109,25 @@ describe("shared-worktree row session actions (#3387)", () => {
     click("sidebar-context-menu-start");
     expect(onStart).toHaveBeenCalledWith("s1");
   });
+
+  it("tells apart siblings with the same title and status by id, and acts on the chosen one", () => {
+    const onStop = vi.fn();
+    openRowMenu(
+      makeWorkspace("w", [
+        sibling("aaaaaaaa-1", { title: "feature/auth", status: "Running" }),
+        sibling("bbbbbbbb-2", { title: "feature/auth", status: "Running" }),
+        sibling("cccccccc-3", { title: "other", status: "Running" }),
+      ]),
+      { onStop },
+    );
+    click("sidebar-context-menu-stop");
+    const rows = screen.getAllByTestId("sidebar-context-menu-stop-target");
+    expect(rows.map((r) => r.textContent)).toEqual([
+      "feature/authRunning #aaaaaaaa",
+      "feature/authRunning #bbbbbbbb",
+      "otherRunning",
+    ]);
+    fireEvent.click(rows[1]!);
+    expect(onStop).toHaveBeenCalledWith("bbbbbbbb-2");
+  });
 });

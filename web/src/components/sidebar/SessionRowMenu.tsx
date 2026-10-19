@@ -332,6 +332,10 @@ function TargetedItem({
   onRun,
 }: TargetedItemProps) {
   const pickerId = useId();
+  const titleOf = (s: SessionResponse) => s.title.trim() || "Untitled session";
+  // Siblings can share a title (a worktree's default is its branch) and a status; an id tells them apart.
+  const clashes = (s: SessionResponse) =>
+    targets.some((t) => t !== s && titleOf(t) === titleOf(s) && detail(t) === detail(s));
   if (targets.length === 0) return null;
   if (targets.length === 1) {
     const only = targets[0]!;
@@ -362,8 +366,11 @@ function TargetedItem({
             indent
             className="text-text-primary hover:bg-surface-700/50"
           >
-            <span className="truncate">{s.title.trim() || "Untitled session"}</span>
-            <span className="ml-2 shrink-0 text-xs">{detail(s)}</span>
+            <span className="truncate">{titleOf(s)}</span>
+            <span className="ml-2 shrink-0 text-xs">
+              {detail(s)}
+              {clashes(s) && ` #${s.id.slice(0, 8)}`}
+            </span>
           </MenuItem>
         ))}
       </div>
