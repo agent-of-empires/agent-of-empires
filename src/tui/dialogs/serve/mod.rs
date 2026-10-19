@@ -188,6 +188,9 @@ enum RestartEffect {
     SignsOut,
     /// A reattached daemon's login persistence is unknown, so retention can't be promised.
     MaySignOut,
+    /// A Local daemon comes back on another port: the token cookie still applies, but the
+    /// link and its QR code change.
+    NewLocalLink,
 }
 
 impl RestartEffect {
@@ -200,11 +203,18 @@ impl RestartEffect {
         mode: ServeMode,
         urls: &[ServeUrl],
         restart_on_funnel: bool,
+        restart_port: Option<u16>,
         running_persists: Option<bool>,
         next_persists: bool,
     ) -> Self {
         if mode == ServeMode::Local {
-            RestartEffect::KeepsLogins
+            let same_port = restart_port
+                .is_some_and(|port| urls.iter().all(|u| link_port(&u.url) == Some(port)));
+            if same_port {
+                RestartEffect::KeepsLogins
+            } else {
+                RestartEffect::NewLocalLink
+            }
         } else if !(restart_on_funnel && urls.iter().any(|u| is_funnel_link(&u.url))) {
             RestartEffect::NewLink
         } else if !next_persists {
@@ -236,6 +246,13 @@ fn restart_on_funnel(mode: ServeMode, transport: Option<TunnelTransport>) -> boo
         && crate::server::tunnel::tailscale_available_sync()
 }
 
+/// The explicit port in a Local link such as `http://192.168.1.42:51234/?token=…`.
+fn link_port(url: &str) -> Option<u16> {
+    let rest = url.split_once("://").map_or(url, |(_, rest)| rest);
+    let authority = rest.split(['/', '?', '#']).next()?;
+    authority.rsplit_once(':')?.1.parse().ok()
+}
+
 /// Funnel serves the machine's stable `https://<host>.<tailnet>.ts.net` origin.
 fn is_funnel_link(url: &str) -> bool {
     let rest = url.split_once("://").map_or(url, |(_, rest)| rest);
@@ -265,9 +282,12 @@ pub struct ServeView {
     /// The setting the running daemon started with, when this view started it; `None` for a
     /// reattached daemon.
     running_persists: Option<bool>,
-    /// Whether a restart now would take the server's Funnel path. Both fields are refreshed
-    /// when R, G or help is pressed: the probe shells out to `tailscale`.
+    /// Whether a restart now would take the server's Funnel path. Refreshed with
+    /// `next_persists` and `restart_port` when R, G or help is pressed: the probe shells out
+    /// to `tailscale`.
     restart_on_funnel: bool,
+    /// The port a restart reuses (`serve.last_port`); `None` means a fresh random one.
+    restart_port: Option<u16>,
 }
 
 impl Default for ServeView {
@@ -299,6 +319,7 @@ impl ServeView {
             copied: None,
             next_persists: persist_sessions(),
             running_persists: None,
+            restart_port: None,
             restart_on_funnel: false,
         }
     }
@@ -549,6 +570,7 @@ impl ServeView {
                 } else {
                     self.restart_on_funnel = restart_on_funnel(mode, transport);
                     self.next_persists = persist_sessions();
+                    self.restart_port = saved_port();
                     self.pending_confirm = Some((PendingConfirm::NewPassphrase, Instant::now()));
                 }
             }
@@ -564,6 +586,7 @@ impl ServeView {
                 } else {
                     self.restart_on_funnel = restart_on_funnel(mode, transport);
                     self.next_persists = persist_sessions();
+                    self.restart_port = saved_port();
                     self.pending_confirm = Some((PendingConfirm::Restart, Instant::now()));
                 }
             }
@@ -571,6 +594,7 @@ impl ServeView {
             KeyCode::Char('?') => {
                 self.restart_on_funnel = restart_on_funnel(mode, transport);
                 self.next_persists = persist_sessions();
+                self.restart_port = saved_port();
                 self.show_help = true;
             }
             KeyCode::Esc | KeyCode::Char('q') => return ServeAction::Close,
@@ -767,6 +791,7 @@ mod tests {
                 next_persists: true,
                 running_persists: Some(true),
                 restart_on_funnel: false,
+                restart_port: None,
             };
             crate::session::config::update_config(|c| c.auth.persist_sessions = false).unwrap();
             view.handle_key(KeyEvent::from(KeyCode::Char(key)));

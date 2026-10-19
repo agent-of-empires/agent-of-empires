@@ -68,6 +68,7 @@ pub(super) fn render(view: &ServeView, frame: &mut Frame, area: Rect, theme: &Th
                     *mode,
                     urls,
                     view.restart_on_funnel,
+                    view.restart_port,
                     view.running_persists,
                     view.next_persists,
                 );
@@ -657,11 +658,15 @@ fn render_active(
                 *mode,
                 urls,
                 view.restart_on_funnel,
+                view.restart_port,
                 view.running_persists,
                 view.next_persists,
             );
-            let link = (effect == RestartEffect::NewLink)
-                .then_some("The link changes: re-scan and sign in again.");
+            let link = match effect {
+                RestartEffect::NewLink => Some("The link changes: re-scan and sign in again."),
+                RestartEffect::NewLocalLink => Some("The link changes: re-scan it."),
+                _ => None,
+            };
             let (first, effects): (&str, &[&str]) = match (action, effect) {
                 (PendingConfirm::NewPassphrase, _) => (
                     "Press G again for a new passphrase.",
@@ -681,6 +686,10 @@ fn render_active(
                 (PendingConfirm::Restart, RestartEffect::MaySignOut) => (
                     "Press R again to restart.",
                     &["Devices may have to sign in again; agents keep running."],
+                ),
+                (PendingConfirm::Restart, RestartEffect::NewLocalLink) => (
+                    "Press R again to restart.",
+                    &["Devices stay signed in; agents keep running."],
                 ),
             };
             let rest = effects
@@ -772,6 +781,9 @@ fn render_help_overlay(
                 }
                 RestartEffect::MaySignOut => {
                     "Restart the Daemon (Devices may sign in again; agents keep running)"
+                }
+                RestartEffect::NewLocalLink => {
+                    "Restart the Daemon (new link; Devices stay signed in; agents keep running)"
                 }
             },
         ),
@@ -928,6 +940,7 @@ mod tests {
             copied: None,
             next_persists: true,
             running_persists: Some(true),
+            restart_port: None,
             restart_on_funnel: false,
         };
         let mut term = Terminal::new(TestBackend::new(72, 26)).unwrap();
@@ -978,6 +991,7 @@ mod tests {
             copied: None,
             next_persists: true,
             running_persists: Some(true),
+            restart_port: None,
             restart_on_funnel: false,
         }
     }
@@ -1102,25 +1116,43 @@ mod tests {
             "every Device signs out; agents keep running".to_string(),
         );
         let on = Some(true);
-        // (mode, url, restart takes the Funnel path, running daemon's persist_sessions
-        //  (None = reattached), next start's persist_sessions, key pressed once,
-        //  confirm after the first sentence, help R)
+        let local_moved = (
+            "Devices stay signed in; agents keep running. The link changes: re-scan it."
+                .to_string(),
+            "new link; Devices stay signed in; agents keep running".to_string(),
+        );
+        // (mode, url, restart takes the Funnel path, port the restart reuses (None = random),
+        //  running daemon's persist_sessions (None = reattached), next start's
+        //  persist_sessions, key pressed once, confirm after the first sentence, help R)
         let cases = [
-            // Local signs in with the stable token, so none of the flags apply.
-            (Local, lan, false, None, false, R, stays.clone()),
-            (Tunnel, funnel, true, on, true, R, stays.clone()),
+            // Local signs in with the stable token, so only a port change matters.
+            (Local, lan, false, Some(8080), None, false, R, stays.clone()),
+            // A CLI-started Local daemon on another port, or no saved port, moves the link.
+            (
+                Local,
+                lan,
+                false,
+                Some(51234),
+                None,
+                false,
+                R,
+                local_moved.clone(),
+            ),
+            (Local, lan, false, None, None, false, R, local_moved.clone()),
+            (Tunnel, funnel, true, None, on, true, R, stays.clone()),
             // Tailscale went away (or Cloudflare was picked): the restart opens a quick tunnel.
-            (Tunnel, funnel, false, on, true, R, moved.clone()),
+            (Tunnel, funnel, false, None, on, true, R, moved.clone()),
             // spawn_daemon never re-creates a named tunnel, whether or not Funnel replaces it.
-            (Tunnel, named, false, on, true, R, moved.clone()),
-            (Tunnel, named, true, on, true, R, moved.clone()),
-            (Tunnel, quick, false, on, true, R, moved.clone()),
-            (Tunnel, funnel, true, on, false, R, signs_out.clone()),
+            (Tunnel, named, false, None, on, true, R, moved.clone()),
+            (Tunnel, named, true, None, on, true, R, moved.clone()),
+            (Tunnel, quick, false, None, on, true, R, moved.clone()),
+            (Tunnel, funnel, true, None, on, false, R, signs_out.clone()),
             // Logins the running daemon held only in memory are gone, whatever the next start reads.
             (
                 Tunnel,
                 funnel,
                 true,
+                None,
                 Some(false),
                 true,
                 R,
@@ -1131,6 +1163,7 @@ mod tests {
                 Tunnel,
                 funnel,
                 true,
+                None,
                 None,
                 true,
                 R,
@@ -1143,6 +1176,7 @@ mod tests {
                 Tunnel,
                 funnel,
                 true,
+                None,
                 on,
                 true,
                 G,
@@ -1152,6 +1186,7 @@ mod tests {
                 Tunnel,
                 quick,
                 false,
+                None,
                 on,
                 true,
                 G,
@@ -1159,9 +1194,11 @@ mod tests {
             ),
         ];
         let theme = crate::tui::styles::load_theme("empire");
-        for (mode, url, restart_on_funnel, running, next, key, (effects, help_restart)) in cases {
+        for (mode, url, restart_on_funnel, port, running, next, key, (effects, help_restart)) in
+            cases
+        {
             let case = format!(
-                "{mode:?} {url} funnel={restart_on_funnel} running={running:?} next={next} {key:?}"
+                "{mode:?} {url} funnel={restart_on_funnel} port={port:?} running={running:?} next={next} {key:?}"
             );
             let mut view = view(ServeViewState::Active {
                 mode,
@@ -1175,6 +1212,7 @@ mod tests {
                 opened_at: Instant::now(),
                 log_offset: 0,
             });
+            view.restart_port = port;
             view.running_persists = running;
             view.next_persists = next;
             view.restart_on_funnel = restart_on_funnel;

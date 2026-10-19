@@ -313,16 +313,23 @@ fn load_or_generate_port() -> u16 {
 }
 
 fn load_or_generate_port_in(dir: &Path) -> u16 {
-    let path = dir.join("serve.last_port");
-    let saved = std::fs::read_to_string(&path)
-        .ok()
-        .and_then(|raw| raw.trim().parse::<u16>().ok())
-        .filter(|port| *port >= 49152);
-    saved.unwrap_or_else(|| {
+    saved_port_in(dir).unwrap_or_else(|| {
         let port = random_port();
-        let _ = std::fs::write(&path, port.to_string());
+        let _ = std::fs::write(dir.join("serve.last_port"), port.to_string());
         port
     })
+}
+
+/// The port the next spawn reuses, if any; `None` means it picks a random one.
+pub(super) fn saved_port() -> Option<u16> {
+    saved_port_in(&crate::session::get_app_dir().ok()?)
+}
+
+fn saved_port_in(dir: &Path) -> Option<u16> {
+    std::fs::read_to_string(dir.join("serve.last_port"))
+        .ok()
+        .and_then(|raw| raw.trim().parse::<u16>().ok())
+        .filter(|port| *port >= 49152)
 }
 
 fn random_port() -> u16 {
@@ -500,6 +507,9 @@ mod tests {
             if let Some(saved) = saved {
                 std::fs::write(&path, saved).unwrap();
             }
+            // The read-only probe agrees with what the next spawn reuses, and writes nothing.
+            assert_eq!(saved_port_in(tmp.path()), reused, "{saved:?}");
+            assert_eq!(path.exists(), saved.is_some(), "{saved:?}");
             let port = load_or_generate_port_in(tmp.path());
             match reused {
                 Some(expected) => assert_eq!(port, expected),
