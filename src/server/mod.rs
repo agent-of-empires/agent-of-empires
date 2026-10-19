@@ -4,6 +4,7 @@ pub(crate) mod access;
 pub(crate) mod acp_events;
 pub mod acp_reconciler;
 pub mod acp_ws;
+pub(crate) mod alias_io;
 pub mod api;
 #[cfg(feature = "web")]
 pub(crate) mod assets;

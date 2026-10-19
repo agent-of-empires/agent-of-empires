@@ -556,29 +556,20 @@ fn build_snapshot(
                         .iter()
                         .any(|prior| prior.identity == profile.identity)
             });
-            let projects = if accepted {
-                crate::session::projects::load_profile(name)
-                    .map(|projects| {
-                        projects
-                            .into_iter()
-                            .map(|project| ProjectRead {
-                                merge_key: crate::session::projects::canonical_key(&project.path),
-                                name: project.name,
-                                path: project.path,
-                                scope: ProjectScope::Profile,
-                                default_base_branch: project.default_base_branch,
-                                registered: true,
-                            })
-                            .collect()
-                    })
-                    .map_err(|_| ())
+            let external = profile.as_ref().is_some_and(|profile| !profile.listed);
+            let projects = if accepted && external {
+                let owned = name.clone();
+                alias_sample(name, "projects", move || load_profile_projects(&owned))
+            } else if accepted {
+                load_profile_projects(name)
             } else {
                 Err(())
             };
-            let groups = if accepted {
-                Storage::open_unwatched(name)
-                    .and_then(|storage| storage.load_groups_readonly())
-                    .map_err(|_| ())
+            let groups = if accepted && external {
+                let owned = name.clone();
+                alias_sample(name, "groups", move || load_profile_groups(&owned))
+            } else if accepted {
+                load_profile_groups(name)
             } else {
                 Err(())
             };
@@ -771,6 +762,46 @@ fn build_snapshot(
 }
 
 /// Omit stored paths that cannot represent an absolute native directory.
+fn load_profile_projects(name: &str) -> Result<Vec<ProjectRead>, ()> {
+    crate::session::projects::load_profile(name)
+        .map(|projects| {
+            projects
+                .into_iter()
+                .map(|project| ProjectRead {
+                    merge_key: crate::session::projects::canonical_key(&project.path),
+                    name: project.name,
+                    path: project.path,
+                    scope: ProjectScope::Profile,
+                    default_base_branch: project.default_base_branch,
+                    registered: true,
+                })
+                .collect()
+        })
+        .map_err(|_| ())
+}
+
+fn load_profile_groups(name: &str) -> Result<Vec<crate::session::Group>, ()> {
+    Storage::open_unwatched(name)
+        .and_then(|storage| storage.load_groups_readonly())
+        .map_err(|_| ())
+}
+
+/// A stale alias read is unavailable, never mixed into a fresh snapshot.
+fn alias_sample<T>(
+    name: &str,
+    kind: &'static str,
+    work: impl FnOnce() -> Result<T, ()> + Send + 'static,
+) -> Result<T, ()>
+where
+    T: Clone + Send + Sync + 'static,
+{
+    let sampled = super::alias_io::sample(name, kind, work);
+    match sampled.value {
+        Some(value) if sampled.fresh => (*value).clone(),
+        _ => Err(()),
+    }
+}
+
 fn drop_unusable_projects(projects: &mut Vec<ProjectRead>) {
     projects
         .retain(|project| crate::cli::runtime_read::dto::valid_stored_project_path(&project.path));
@@ -1606,6 +1637,43 @@ mod tests {
             assert_eq!(std::fs::read(fresh.sessions_path()).unwrap(), before);
             assert_eq!(std::fs::read(&corrupt).unwrap(), b"not json");
         }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_blocked_alias_degrades_only_its_own_metadata_in_the_snapshot() {
+        use crate::cli::runtime_read::dto::profile_component_healthy;
+        use crate::server::alias_io::{held::Hold, in_flight_for_test, wait_idle_for_test};
+        let home = TempHome::new();
+        Storage::new_unwatched("main").unwrap();
+        let external = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink(external.path(), home.app_dir().join("profiles/ext")).unwrap();
+        Storage::open_unwatched("ext").unwrap();
+        let state = super::super::test_support::build_test_app_state(Vec::new());
+        super::super::test_support::accept_runtime_read_cache_for_test(&state).await;
+        let metadata_healthy = |snapshot: &crate::cli::runtime_read::dto::SnapshotData, name| {
+            let profile = snapshot
+                .profiles
+                .iter()
+                .find(|row| row.name == name)
+                .unwrap();
+            profile_component_healthy(&profile.health.metadata)
+        };
+        let healthy = cached_snapshot(&state).await;
+        assert!(metadata_healthy(&healthy, "ext"));
+
+        let hold = Hold::install("ext", "projects");
+        for _ in 0..2 {
+            let blocked = cached_snapshot(&state).await;
+            assert!(metadata_healthy(&blocked, "main"));
+            assert!(!metadata_healthy(&blocked, "ext"));
+        }
+        hold.wait_entered();
+        assert_eq!(in_flight_for_test("ext"), 1, "no second worker starts");
+
+        hold.release();
+        wait_idle_for_test("ext");
+        assert!(metadata_healthy(&cached_snapshot(&state).await, "ext"));
     }
 
     #[tokio::test]
