@@ -77,9 +77,40 @@ impl AcpError {
         AcpError::Spawn(format!("{err} (command `{spawn_command}`)"))
     }
 
+    /// Why a bare adapter name could not launch. A bundled copy aoe refuses
+    /// needs a reinstall or a newer Node, not the adapter's install command (#4696).
+    pub(super) fn unresolved_adapter_spawn_error(
+        err: &std::io::Error,
+        command: &str,
+        reason: &super::resolve_command::Unresolved,
+    ) -> Self {
+        use super::resolve_command::Unresolved;
+        match reason {
+            Unresolved::NotBare | Unresolved::NotFound => {
+                Self::missing_binary_spawn_error(err, command)
+            }
+            Unresolved::StaleBundle => AcpError::Spawn(format!(
+                "aoe's installed copy of `{command}` predates this aoe build, so it is \
+                 refused until it is reinstalled. Reinstall it with: \
+                 aoe acp doctor --fix --adapter {command}"
+            )),
+            Unresolved::NodeTooOld(found) => {
+                let too_old = crate::acp::adapters::AdapterError::NodeTooOld {
+                    adapter: command.to_string(),
+                    major: crate::acp::node::MIN_NODE_MAJOR,
+                    minor: crate::acp::node::MIN_NODE_MINOR,
+                    found: found.clone(),
+                };
+                AcpError::Spawn(format!(
+                    "{too_old}. Upgrade Node, or point AOE_ACP_NODE at a newer one, then retry"
+                ))
+            }
+        }
+    }
+
     /// Appends the exact install command for a known ACP adapter so the web
     /// banner shows a copyable line instead of a guess (#2109).
-    pub(super) fn missing_binary_spawn_error(err: &std::io::Error, command: &str) -> Self {
+    fn missing_binary_spawn_error(err: &std::io::Error, command: &str) -> Self {
         let hint = crate::acp::install_hints::install_hint_for(command)
             .map(|cmd| format!(". Install with: {cmd}"))
             .unwrap_or_default();
