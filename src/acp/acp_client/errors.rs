@@ -90,7 +90,7 @@ impl AcpError {
                 Self::missing_binary_spawn_error(err, command)
             }
             Unresolved::StaleBundle => AcpError::Spawn(format!(
-                "aoe's installed copy of `{command}` predates this aoe build, so it is \
+                "aoe's bundled ACP adapter `{command}` predates this aoe build, so it is \
                  refused until it is reinstalled. Reinstall it with: \
                  aoe acp doctor --fix --adapter {command}"
             )),
