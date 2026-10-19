@@ -216,6 +216,27 @@ regex = "esc to interrupt|thinking"
 
 Each rule sets `status` (`running`, `waiting`, `idle`, `error`) and exactly one of `contains` (case-insensitive substring) or `regex` (Rust regex; use `(?i)` for case-insensitive). Rules are matched in order against the ANSI-stripped pane; first match wins and no match reports `idle`, so put the specific states before broad ones. Rules outrank `agent_detect_as`, a built-in detector of the same name, and a status hook the agent writes. Invalid rules are skipped with a warning and take effect on the next config resolve.
 
+### OMP terminal status
+
+Built-in OMP detection reads the visible pane and locates activity, pinned errors,
+and blocking dialogs relative to the current composer. Question dialogs remain
+waiting when paging hides the selected option; session pickers accept bracketed
+key legends. Extension status rows, including plugin badges, do not need
+agent-specific matching rules.
+Editable composer text is excluded from dialog controls, even without status segments.
+
+A recognized working terminal title supplements visible controls; it does not
+override a blocking dialog or pinned error. Visible retry and compaction controls
+can indicate activity even when the turn timer is stopped. Disabling OMP title
+updates or terminal program-status reports does not disable visible-control detection.
+
+Untimed interrupt hints must start in the native two-space key column; alignment
+padding alone does not supply activity evidence.
+Custom editors or widgets can hide or replace these controls. Without a recognizable
+turn timer or working title, passive text that exactly reproduces a loader row
+remains indistinguishable from that control. Use the explicit status rules above
+for such interfaces; they remain authoritative, including their no-match behavior.
+
 ### Running a custom agent in the structured view
 
 Give the agent an ACP launch command; it must speak the [Agent Client Protocol](https://agentclientprotocol.com).
@@ -307,9 +328,12 @@ To see what a running daemon can forward, read its environment: `tr '\0' '\n' < 
 [host_hooks]
 before_start   = ['echo "GH_TOKEN=$(my-mint-tool "$AOE_REPO_SLUG")"']  # sandboxed sessions
 before_session = ['my-account-switcher env --profile "$AOE_PROFILE"']  # host sessions
+before_destroy = ['sync-transcripts "$AOE_SESSION_ID"']                 # any session, at purge
 ```
 
 A launch runs exactly one of them, chosen by whether the session is sandboxed. `before_start` runs when a container is created or restarted (attaching to a running container reuses the last values); `before_session` runs on every host agent launch, including a restart or a view switch, and persists nothing. A plain tool session is not an agent launch and runs neither.
+
+`before_destroy` is not a launch hook: it runs on the host for every session, sandboxed or not, when the session is purged, before container and worktree cleanup. With `session.delete_to_trash` on (the default), moving a session to trash does not run it; it runs when retention expires, on `empty-trash`, or on `aoe remove --purge`. Its output is ignored and never logged. A failure is logged without blocking removal, and a command still running after 2 minutes is killed.
 
 Each `KEY=VALUE` line the command prints to stdout becomes an environment variable for the agent; other lines are ignored, stdout is never logged (so it is safe to print a secret), and a non-zero exit aborts the launch. A key that is a single token but not a valid identifier is dropped with a warning. Minted pairs are applied after the static `environment` list, so they win over a same-keyed entry.
 

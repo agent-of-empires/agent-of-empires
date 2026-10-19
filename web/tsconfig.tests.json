@@ -1,0 +1,11 @@
+{
+  "extends": "./tsconfig.app.json",
+  "compilerOptions": {
+    "tsBuildInfoFile": "./node_modules/.tmp/tsconfig.tests.tsbuildinfo",
+    "types": ["node"]
+  },
+  // Only the live-ws mock helper, so the wire types it uses are enforced
+  // while the rest of web/tests stays unchecked.
+  "include": ["tests/helpers/terminal-mocks.ts"],
+  "exclude": []
+}

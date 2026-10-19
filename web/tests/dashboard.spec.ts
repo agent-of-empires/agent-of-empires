@@ -1,4 +1,4 @@
-import { test, expect } from "./helpers/mockedTest";
+import { test, expect, pressShortcut } from "./helpers/mockedTest";
 import { sessionResponse } from "./helpers/sessions";
 
 const NEW_SESSION_PANE_NAME = /New session Pick a project, then launch a new session/i;
@@ -58,8 +58,7 @@ test.describe("Create session from home screen", () => {
   test("opens with keyboard shortcut n", async ({ page }) => {
     await page.setViewportSize({ width: 1280, height: 720 });
     await page.goto("/");
-    await page.locator("body").click();
-    await page.keyboard.press("n");
+    await pressShortcut(page, "n");
     await expect(page.getByRole("heading", { name: "New session" })).toBeVisible();
   });
 
@@ -100,8 +99,7 @@ test.describe("Settings", () => {
   test("settings opens with keyboard shortcut s", async ({ page }) => {
     await page.setViewportSize({ width: 1280, height: 720 });
     await page.goto("/");
-    await page.locator("body").click();
-    await page.keyboard.press("s");
+    await pressShortcut(page, "s");
     await expect(page.getByTestId("settings-header").getByRole("button", { name: "← Back" })).toBeVisible();
   });
 });
@@ -110,10 +108,7 @@ test.describe("Keyboard shortcuts", () => {
   test("escape closes help overlay", async ({ page }) => {
     await page.setViewportSize({ width: 1280, height: 720 });
     await page.goto("/");
-    await page.locator("body").click();
-    await page.evaluate(() => {
-      document.dispatchEvent(new KeyboardEvent("keydown", { key: "?", bubbles: true }));
-    });
+    await pressShortcut(page, "?");
     await expect(page.getByRole("heading", { name: "Help" })).toBeVisible();
     await page.keyboard.press("Escape");
     await expect(page.getByRole("heading", { name: "Help" })).not.toBeVisible();

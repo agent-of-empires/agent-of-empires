@@ -60,9 +60,6 @@ dotenv-ng-core = "1.0"
 # File watching
 notify = "8.2"
 
-# PTY handling
-portable-pty = "0.9"
-
 # Fuzzy matching
 nucleo-matcher = "0.3"
 
@@ -104,9 +101,6 @@ percent-encoding = "2"
 
 # Unix sockets + futures-compat for ACP byte streams
 tokio-util = { version = "0.7", features = ["codec", "compat"] }
-
-# Process handling
-nix = { version = "0.31", features = ["signal", "process", "net", "fs", "resource", "dir", "user", "poll"] }
 
 # Unicode width + normalization (NFKD used to fold accents in title-derived branch names)
 unicode-normalization = "0.1"
@@ -184,9 +178,7 @@ tar = "0.4"
 flate2 = "1"
 xz2 = "0.1"
 
-# WebSocket client for the structured view-in-TUI view: subscribes to the daemon's
-# `/sessions/{id}/acp/ws` stream and pumps frames into the local reducer. The
-# daemon itself uses axum's built-in WS support and never pulls this in.
+# WebSockets for daemon clients and the daemon's local UDS transport.
 tokio-tungstenite = { version = "0.30", default-features = false, features = ["rustls-tls-webpki-roots", "connect"] }
 
 # Capability-safe file opens for the session file-read endpoint (#3088): open
@@ -197,6 +189,7 @@ cap-std = "4.0.2"
 # Unix-only: O_NOFOLLOW for capability-safe filesystem operations.
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
+nix = { version = "0.31", features = ["signal", "process", "net", "fs", "resource", "dir", "user", "poll"] }
 
 [features]
 # The daemon (REST/WS API, auth, Web Push, ACP, structured view) is core: a
@@ -231,6 +224,7 @@ typescript = ["dep:ts-rs"]
 
 [dev-dependencies]
 serial_test = "4.0"
+jsonschema = { version = "0.59.0", default-features = false }
 # Test-only tokio clock control (`start_paused`), so the token-rotation
 # loop's grace deadline can be asserted without sleeping through it.
 # `cargo build` and released binaries never enable `test-util`.

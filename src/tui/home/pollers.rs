@@ -524,8 +524,18 @@ impl HomeView {
         }
     }
 
+    /// Applies before requesting so a queued result frees the in-flight slot
+    /// for a due probe. True when the running state changed.
+    pub fn tick_serve_probe(&mut self, due: bool) -> bool {
+        let changed = self.apply_serve_probe();
+        if due {
+            self.request_serve_probe();
+        }
+        changed
+    }
+
     /// True when the running state changed.
-    pub fn apply_serve_probe(&mut self) -> bool {
+    fn apply_serve_probe(&mut self) -> bool {
         match self.serve_probe.try_recv() {
             Ok(running) => {
                 self.serve_probe_in_flight = false;

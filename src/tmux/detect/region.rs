@@ -3,6 +3,42 @@
 
 use std::sync::OnceLock;
 
+/// Capture rows before surface preprocessing and recent-window truncation.
+pub(super) struct Rows<'a> {
+    pub source: &'a str,
+    pub non_empty: Vec<&'a str>,
+    pub blank_before: Vec<bool>,
+}
+
+impl<'a> Rows<'a> {
+    pub fn new(source: &'a str) -> Self {
+        let mut non_empty = Vec::new();
+        let mut blank_before = Vec::new();
+        let mut after_blank = false;
+        for line in source.lines() {
+            if line.trim().is_empty() {
+                after_blank = true;
+                continue;
+            }
+            non_empty.push(line);
+            blank_before.push(std::mem::take(&mut after_blank));
+        }
+        Self {
+            source,
+            non_empty,
+            blank_before,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Default)]
+pub(super) struct Evidence<'a> {
+    pub text: &'a str,
+    pub bottom_offset: usize,
+    /// Human-readable source text belonging to this evidence, before masking.
+    pub diagnostic: Option<&'a str>,
+}
+
 /// The pane, sliced lazily once per capture.
 pub(super) struct Screen<'a> {
     /// The most recent [`RECENT_LINES`] non-empty lines.
@@ -10,6 +46,7 @@ pub(super) struct Screen<'a> {
     /// Whether a blank row sat above each [`Self::recent`] line.
     blank_before: Vec<bool>,
     osc_title: &'a str,
+    evidence: &'a [Evidence<'a>],
     joined: OnceLock<String>,
     collapsed: OnceLock<String>,
     unstacked: OnceLock<String>,
@@ -104,6 +141,8 @@ pub(super) enum Region {
     AfterLastRule,
     /// The OSC 0/2 terminal title.
     OscTitle,
+    /// A borrowed surface fragment supplied by the registered adapter.
+    Evidence(usize),
     /// The `prompt_marker` line and below, else the whole window.
     FromPromptMarker,
     BeforePromptMarker,
@@ -116,7 +155,16 @@ pub(super) enum Region {
 
 impl Region {
     /// Marker region names are leaked once at compile time (process lifetime).
-    pub(super) fn parse(raw: &str) -> Option<Self> {
+    pub(super) fn parse(raw: &str, evidence_names: &[&str]) -> Option<Self> {
+        if let Some(name) = raw
+            .strip_prefix("evidence(")
+            .and_then(|rest| rest.strip_suffix(')'))
+        {
+            return evidence_names
+                .iter()
+                .position(|declared| *declared == name.trim())
+                .map(Region::Evidence);
+        }
         if let Some(rest) = raw.strip_prefix("after(").and_then(|r| r.strip_suffix(')')) {
             let (name, limit) = match rest.split_once(',') {
                 Some((name, n)) => (name, Some(n.trim().parse().ok()?)),
@@ -162,23 +210,19 @@ impl Region {
 }
 
 impl<'a> Screen<'a> {
-    pub(super) fn new(clean_screen: &'a str, osc_title: &'a str) -> Self {
-        let mut non_empty: Vec<&str> = Vec::new();
-        let mut blank_before: Vec<bool> = Vec::new();
-        let mut after_blank = false;
-        for line in clean_screen.lines() {
-            if line.trim().is_empty() {
-                after_blank = true;
-                continue;
-            }
-            non_empty.push(line);
-            blank_before.push(std::mem::take(&mut after_blank));
-        }
-        let start = non_empty.len().saturating_sub(RECENT_LINES);
+    pub(super) fn new(
+        mut rows: Rows<'a>,
+        osc_title: &'a str,
+        evidence: &'a [Evidence<'a>],
+    ) -> Self {
+        let start = rows.non_empty.len().saturating_sub(RECENT_LINES);
+        rows.non_empty.drain(..start);
+        rows.blank_before.drain(..start);
         Self {
-            recent: non_empty[start..].to_vec(),
-            blank_before: blank_before[start..].to_vec(),
+            recent: rows.non_empty,
+            blank_before: rows.blank_before,
             osc_title,
+            evidence,
             joined: OnceLock::new(),
             collapsed: OnceLock::new(),
             unstacked: OnceLock::new(),
@@ -227,6 +271,7 @@ impl<'a> Screen<'a> {
                 .after_last_rule
                 .get_or_init(|| self.compute_after_last_rule()),
             Region::OscTitle => self.osc_title,
+            Region::Evidence(index) => self.evidence[index].text,
             Region::FromPromptMarker => {
                 self.from_marker
                     .get_or_init(|| match self.marker_index(prompt_marker) {
@@ -271,6 +316,13 @@ impl<'a> Screen<'a> {
                 );
             }
         })
+    }
+
+    pub(super) fn region_bottom_offset(&self, region: Region) -> usize {
+        match region {
+            Region::Evidence(index) => self.evidence[index].bottom_offset,
+            _ => 0,
+        }
     }
 
     fn marker_index(&self, prompt_marker: &[regex::Regex]) -> Option<usize> {

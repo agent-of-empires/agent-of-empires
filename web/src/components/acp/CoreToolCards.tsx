@@ -93,7 +93,7 @@ function formatRange(args: Record<string, unknown> | null): string | null {
   if (!args) return null;
   const offset = typeof args.offset === "number" ? args.offset : null;
   const limit = typeof args.limit === "number" ? args.limit : null;
-  if (offset !== null && limit !== null) return `L${offset}–${offset + limit}`;
+  if (offset !== null && limit !== null) return `L${offset}–${offset + limit - 1}`;
   if (offset !== null) return `from L${offset}`;
   if (limit !== null) return `${limit} lines`;
   return null;

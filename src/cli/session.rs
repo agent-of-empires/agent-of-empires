@@ -233,11 +233,17 @@ pub struct SetWorktreeNameArgs {
 #[derive(Args)]
 pub struct ShowArgs {
     /// Session ID or title (optional, auto-detects in tmux)
-    identifier: Option<String>,
+    pub(crate) identifier: Option<String>,
 
     /// Output as JSON
     #[arg(long)]
-    json: bool,
+    pub(crate) json: bool,
+}
+
+impl ShowArgs {
+    pub(crate) fn identifier(&self) -> Option<&str> {
+        self.identifier.as_deref()
+    }
 }
 
 #[derive(Args)]
@@ -588,7 +594,7 @@ async fn list_trash(profile: &str) -> Result<()> {
     for inst in trashed {
         let when = inst
             .trashed_at
-            .map(|t| t.to_rfc3339())
+            .map(|value| value.to_rfc3339())
             .unwrap_or_else(|| "?".to_string());
         println!("  {}  {}  (trashed {})", inst.id, inst.title, when);
     }
@@ -1498,7 +1504,7 @@ async fn show_session(profile: &str, args: ShowArgs) -> Result<()> {
             println!(
                 "  State:   {} ({})",
                 super::list::state_tag(&inst),
-                at.to_rfc3339()
+                at.format("%+")
             );
         }
         println!("  Profile: {}", storage.profile());
@@ -1578,26 +1584,28 @@ async fn capture_session(profile: &str, args: CaptureArgs) -> Result<()> {
                 age: crate::hooks::read_hook_status_age(&inst.id),
             }
         });
-        let status = if crate::tmux::detect::has_manifest(manifest_tool) {
-            let status_raw;
-            let status_content = if args.lines >= 50 {
-                raw.as_str()
+        let status = if let Some(plan) =
+            crate::tmux::DetectionPlan::for_manifest(profile, &rules_tool, manifest_tool)
+        {
+            let policy = plan.capture_policy();
+            let status_raw = if policy.scope.can_reuse(args.lines) {
+                None
             } else {
-                status_raw = tmux_session
-                    .capture_pane(50)
-                    .unwrap_or_else(|_| raw.clone());
-                status_raw.as_str()
+                tmux_session.capture_pane(policy.scope.lines()).ok()
             };
+            let status_content = status_raw.as_deref().unwrap_or(&raw);
             let osc_title = crate::tmux::utils::pane_title(tmux_session.name()).unwrap_or_default();
-            crate::tmux::detect_with_rules(
-                profile,
-                &rules_tool,
-                manifest_tool,
-                &crate::tmux::utils::strip_ansi(status_content),
+            let observation = crate::tmux::Observation::new(
                 &osc_title,
                 hook,
+                !policy.observe_ownership
+                    || inst.live_pane_owned(&tmux_session, None, tmux_session.is_pane_dead()),
+            );
+            plan.detect(
+                &crate::tmux::utils::strip_ansi(status_content),
+                &observation,
             )
-            .and_then(|d| d.status)
+            .status
             .unwrap_or_default()
         } else {
             let hook = hook.filter(|_| !crate::tmux::status_rules::has_rules(profile, &rules_tool));

@@ -18,7 +18,7 @@ export interface TourRunnerProps {
   onNavigate: (tab: TourSettingsTab | null) => void;
 }
 
-const LOCALE = { skip: "Skip", last: "Done", next: "Next", back: "Back" };
+const LOCALE = { skip: "Skip tour", last: "Done", next: "Next", back: "Back" };
 
 // Settings tabs always exist, so a longer wait means a crash or removed tab.
 const ANCHOR_WAIT_MS = 3000;

@@ -145,9 +145,22 @@ pub(super) async fn status_poll_loop(state: Arc<AppState>) {
     loop {
         interval.tick().await;
 
-        let prev: std::collections::HashMap<String, crate::session::Status> = {
+        let (mut prev, prev_tracking, supplementary_prev) = {
             let instances = state.instances.read().await;
-            instances.iter().map(|i| (i.id.clone(), i.status)).collect()
+            let cache = state
+                .runtime_read_cache
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let prev: std::collections::HashMap<String, Status> = instances
+                .iter()
+                .map(|row| (row.id.clone(), row.status))
+                .collect();
+            let tracking: std::collections::HashMap<String, PriorTickTracking> = instances
+                .iter()
+                .map(|row| (row.id.clone(), PriorTickTracking::of(row)))
+                .collect();
+            let supplementary = super::reload::supplementary_tick_tracking(&cache);
+            (prev, tracking, supplementary)
         };
 
         // GC the reconciler's persistent per-session maps against the live instance set
@@ -161,16 +174,6 @@ pub(super) async fn status_poll_loop(state: Arc<AppState>) {
             &mut acp_parked,
             &mut acp_capacity_deferred,
         );
-        // Snapshot of the prior tick's status bookkeeping, taken from the same in-memory
-        // `state.instances` this tick's `load_all_instances()` call is about to reset to
-        // defaults.
-        let prev_tracking: std::collections::HashMap<String, PriorTickTracking> = {
-            let instances = state.instances.read().await;
-            instances
-                .iter()
-                .map(|i| (i.id.clone(), PriorTickTracking::of(i)))
-                .collect()
-        };
 
         // Snapshot suppression BEFORE `batch_pane_metadata()` so a worker that unmarks
         // between the scrape and the per-instance decision cannot combine "pane missing"
@@ -179,18 +182,15 @@ pub(super) async fn status_poll_loop(state: Arc<AppState>) {
         let suppressed_ids =
             crate::session::recovery::snapshot_recently_restarted(&state.recently_restarted);
         let file_watch_for_poll = state.file_watch.clone();
-        // Seed each freshly-disk-loaded instance's live status baseline from `prev` (the
-        // true previous-tick live status) rather than letting `update_status_with_metadata`
-        // fall back to comparing against its own possibly-stale disk-loaded `status`.
-        let prev_for_poll = prev.clone();
+        // Reuse a terminal baseline only within its lifecycle generation.
         let snapshot_guard = state.session_service.disk_reload_guard().await;
         let read_epoch = state
             .mutation_epoch
             .load(std::sync::atomic::Ordering::SeqCst);
         let updated = tokio::task::spawn_blocking(move || {
-            let mut instances = load_all_instances(&file_watch_for_poll).unwrap_or_default();
+            let mut loaded = load_all_instances(&file_watch_for_poll);
             drop(snapshot_guard);
-            seed_tick_tracking(&mut instances, &prev_tracking);
+            seed_tick_tracking(&mut loaded.instances, &prev_tracking);
             crate::tmux::refresh_session_cache();
             let pane_metadata = crate::tmux::batch_pane_metadata();
             if let Err(error) = &pane_metadata {
@@ -201,16 +201,23 @@ pub(super) async fn status_poll_loop(state: Arc<AppState>) {
                 );
             }
             apply_tick_status_decisions(
-                &mut instances,
-                &prev_for_poll,
+                &mut loaded.instances,
+                &mut prev,
+                &prev_tracking,
                 &suppressed_ids,
                 pane_metadata.as_ref().ok(),
             );
-            (instances, live_structured_worker_records())
+            super::reload::apply_supplementary_tick(
+                &mut loaded.cache,
+                &supplementary_prev,
+                pane_metadata.as_ref().ok(),
+            );
+            (loaded, live_structured_worker_records(), prev)
         })
         .await;
 
-        if let Ok((mut instances, live_worker_records)) = updated {
+        if let Ok((mut loaded, live_worker_records, prev)) = updated {
+            let instances = &mut loaded.instances;
             // Diff BEFORE `reload_state_instances_from_disk`.
             let unread_enabled = crate::session::unread_enabled();
             // Passive status transitions observed this tick, batched per profile so one
@@ -218,7 +225,7 @@ pub(super) async fn status_poll_loop(state: Arc<AppState>) {
             // (plus its unread mark when applicable).
             let mut bundles: std::collections::HashMap<String, PassiveTransitionWrites> =
                 std::collections::HashMap::new();
-            for (idx, old) in observed_transitions(&instances, &prev) {
+            for (idx, old) in observed_transitions(instances, &prev) {
                 let inst = &instances[idx];
                 // First turn's `Running -> Idle` edge.
                 if old == Status::Running && inst.status == Status::Idle {
@@ -242,12 +249,11 @@ pub(super) async fn status_poll_loop(state: Arc<AppState>) {
                     bundle.unread_ids.push(inst.id.clone());
                 }
             }
-            flush_passive_transition_writes(state.file_watch.clone(), &mut instances, bundles)
-                .await;
+            flush_passive_transition_writes(state.file_watch.clone(), instances, bundles).await;
 
             reload_state_instances_from_disk(
                 &state,
-                instances,
+                loaded,
                 live_worker_records,
                 StatusSource::TmuxApplied,
                 read_epoch,

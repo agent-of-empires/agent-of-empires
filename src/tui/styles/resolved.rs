@@ -257,13 +257,14 @@ fn web_projection(theme: &Theme, appearance: ThemeAppearance) -> CssVarProjectio
     css.insert("--color-text-secondary".into(), hex(theme.hint));
     css.insert("--color-text-muted".into(), hex(theme.hint));
     css.insert("--color-text-dim".into(), hex(theme.dimmed));
-    // Dimmed lifted to body-text AA, for small text that cannot use the raw slot.
+    // Dimmed lifted to body-text AA on surface-900, -850 and the modal surface-800,
+    // for small text that cannot use the raw slot.
     css.insert(
         "--color-text-subtle".into(),
         hex(lift_until(
             theme.dimmed,
             bg,
-            &[bg, elevated_1],
+            &[bg, elevated_1, elevated_2],
             TEXT_CONTRAST_RATIO,
         )),
     );
@@ -611,6 +612,14 @@ mod tests {
                     );
                 }
             }
+            // Dialog hints, such as the onboarding footer and the tour's Skip button, sit on the
+            // modal surface.
+            let subtle_on_modal =
+                contrast_ratio(var("--color-text-subtle"), var("--color-surface-800"));
+            assert!(
+                subtle_on_modal >= TEXT_CONTRAST_RATIO,
+                "{name}: --color-text-subtle on --color-surface-800 is {subtle_on_modal:.2}, below body-text AA"
+            );
             let frame = var("--color-session-active");
             let fill = var("--color-surface-800");
             // The third surface is the fill an open row takes while it is also

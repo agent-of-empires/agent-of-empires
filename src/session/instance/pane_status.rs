@@ -97,6 +97,11 @@ pub(super) fn summarize_error_from_pane(pane_content: &str) -> String {
     "Agent stopped responding and the pane is empty.".to_string()
 }
 
+/// Present an adapter-selected diagnostic without interpreting the agent's UI.
+pub(super) fn summarize_error_diagnostic(diagnostic: &str) -> String {
+    truncate_error_line(diagnostic)
+}
+
 fn truncate_error_line(line: &str) -> String {
     const MAX: usize = 200;
     let trimmed = line.trim();
@@ -208,6 +213,20 @@ mod tests {
     use super::*;
 
     const AGENT_UI: &str = "ctrl+p commands \u{2022} OpenCode 1.3.13+650d0db";
+
+    #[test]
+    fn selected_error_diagnostic_preserves_rows_and_truncates_utf8_safely() {
+        assert_eq!(
+            summarize_error_diagnostic(
+                " \nProvider denied request\n  quota exceeded\n\nretry later \n"
+            ),
+            "Provider denied request\n  quota exceeded\n\nretry later"
+        );
+        assert_eq!(
+            summarize_error_diagnostic(&"é".repeat(101)),
+            format!("{}…", "é".repeat(100))
+        );
+    }
 
     #[test]
     fn summarize_error_from_pane_handles_banner_shapes() {

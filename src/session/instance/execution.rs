@@ -641,10 +641,17 @@ impl NativeLaunchInputs {
     fn read_native_file(&self, path: &std::path::Path) -> Result<Option<Vec<u8>>> {
         let native = self.canonical_path(path)?;
         let location = self.physical_location(&native);
-        anyhow::ensure!(
-            location.filesystem == "host",
-            "native configuration requires a local filesystem projection"
-        );
+        if location.filesystem != "host" {
+            let container = self
+                .container
+                .as_ref()
+                .context("native configuration requires a local filesystem projection")?;
+            anyhow::ensure!(
+                !container.runtime.path_exists(&container.id, &native)?,
+                "native configuration exists inside the container and requires a local filesystem projection"
+            );
+            return Ok(None);
+        }
         match std::fs::symlink_metadata(&location.path) {
             Ok(_) => {}
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -1931,7 +1938,7 @@ impl Instance {
                 let auth: serde_json::Map<String, serde_json::Value> = serde_json::from_slice(&bytes)?;
                 anyhow::ensure!(["tokens", "agent_identity", "personal_access_token"].iter().all(|key| auth.get(*key).is_none_or(serde_json::Value::is_null))
                     && auth.get("auth_mode").is_none_or(|mode| mode.is_null() || mode.as_str() == Some("apikey"))
-                    && auth.get("OPENAI_API_KEY").and_then(serde_json::Value::as_str).is_some_and(|key| !key.trim().is_empty()), "Codex is not authenticated with a local OpenAI API key; set OPENAI_API_KEY in the auth.json of its resolved configuration directory (session.agent_config_dir on a host launch, else CODEX_HOME, else ~/.codex) and re-run");
+                    && auth.get("OPENAI_API_KEY").and_then(serde_json::Value::as_str).is_some_and(|key| !key.trim().is_empty()), "Codex is not authenticated with a local OpenAI API key (a ChatGPT login cannot be attested, because it may select cloud-managed requirements); replace the credentials with an OpenAI API key (OPENAI_API_KEY, no ChatGPT tokens) in the auth.json of its resolved configuration directory (session.agent_config_dir on a host launch, else CODEX_HOME, else ~/.codex) and re-run");
                 configuration.push(auth_file);
                 let sqlite = inputs.canonical_path(&sqlite)?;
                 routing.push(("CODEX_HOME".into(), Some(root.to_str().context("Codex home is not UTF-8")?.into())));
@@ -2758,6 +2765,7 @@ impl Instance {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ConversationState {
+    pub(crate) tool: String,
     pub(crate) session_id: Option<String>,
     pub(crate) binding: Option<ConversationBinding>,
     pub(crate) intent: ResumeIntent,
@@ -2768,7 +2776,8 @@ pub(crate) struct ConversationState {
 
 impl ConversationState {
     pub(crate) fn matches(&self, instance: &Instance) -> bool {
-        self.session_id == instance.agent_session_id
+        self.tool == instance.tool
+            && self.session_id == instance.agent_session_id
             && self.binding == instance.agent_session_binding
             && self.intent == instance.resume_intent
             && self.resume_binding == instance.resume_binding
@@ -2780,6 +2789,7 @@ impl ConversationState {
 impl Instance {
     pub(crate) fn conversation_state(&self) -> ConversationState {
         ConversationState {
+            tool: self.tool.clone(),
             session_id: self.agent_session_id.clone(),
             binding: self.agent_session_binding.clone(),
             intent: self.resume_intent.clone(),
@@ -3220,6 +3230,62 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(error.contains("local database projection"), "{error}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn container_native_file_is_absent_only_when_the_container_says_so() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let transport = root.join("transport");
+        std::fs::write(&transport, "#!/bin/sh\n[ \"$1\" = exec ] && [ \"$2\" = -w ] && [ \"$3\" = / ] && [ \"$4\" = fixture-id ] || exit 2\nshift 4\nexec \"$@\"\n").unwrap();
+        std::fs::set_permissions(&transport, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let present = root.join("present.toml");
+        std::fs::write(&present, "x").unwrap();
+        let inputs = NativeLaunchInputs {
+            launch_id: "review".into(),
+            environment: std::collections::HashMap::new(),
+            raw_environment: Vec::new(),
+            cwd: root.clone(),
+            profile: "default".into(),
+            container: Some(crate::containers::ContainerExecutionSnapshot {
+                runtime: crate::containers::RuntimeExecutionSnapshot {
+                    kind: crate::session::ContainerRuntimeName::Docker,
+                    program: transport,
+                    cwd: root.clone(),
+                    endpoint: String::new(),
+                    local_mounts: true,
+                    routing: Vec::new(),
+                    global_arguments: Vec::new(),
+                },
+                name: "fixture".into(),
+                id: "fixture-id".into(),
+                mounts: Vec::new(),
+                shadow_mounts: Vec::new(),
+            }),
+            docker_env: None,
+            pane_env: Vec::new(),
+            identity_extension: None,
+        };
+        assert!(inputs
+            .read_native_file(&root.join("absent.toml"))
+            .unwrap()
+            .is_none());
+        let error = inputs.read_native_file(&present).unwrap_err().to_string();
+        assert!(error.contains("exists inside the container"), "{error}");
+        // Root bypasses directory permissions, so only a non-root run can lock the parent.
+        let locked = root.join("locked");
+        std::fs::create_dir(&locked).unwrap();
+        std::fs::write(locked.join("hidden.toml"), "x").unwrap();
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let unreadable = std::fs::read(locked.join("hidden.toml")).is_err();
+        if unreadable {
+            assert!(inputs
+                .read_native_file(&locked.join("hidden.toml"))
+                .is_err());
+        }
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o700)).unwrap();
     }
 
     #[test]
