@@ -138,53 +138,99 @@ fn test_live_send_paste_into_non_bracketed_pane_has_no_marker_debris() {
 fn test_live_send_forwards_ctrl_enter_as_csi_u() {
     require_tmux!();
 
-    let mut h = TuiTestHarness::new("live_send_ctrl_enter");
-    write_live_send_config(&h);
-
-    let bin = h.install_path_command("omp");
-    std::fs::write(
-        bin.join("omp"),
-        "#!/bin/sh\n\
-stty -echo -icanon min 1 time 0 2>/dev/null\n\
-dd bs=1 count=7 2>/dev/null | od -An -tx1 | tr -d '[:space:]' > ctrl-enter-capture\n\
+    for (case, tool, command, declared, detect_only, expected) in [
+        ("builtin", "omp", "omp", false, false, "1b5b31333b3575"),
+        ("direct", "corp-omp", "omp", false, false, "1b5b31333b3575"),
+        (
+            "wrapper",
+            "corp-omp",
+            "corp-omp-wrapper",
+            true,
+            false,
+            "1b5b31333b3575",
+        ),
+        (
+            "detection",
+            "corp-omp",
+            "corp-omp-wrapper",
+            false,
+            true,
+            "0d",
+        ),
+        ("legacy", "claude", "claude", false, false, "0d"),
+    ] {
+        let mut h = TuiTestHarness::new(&format!("live_send_ctrl_enter_{case}"));
+        write_live_send_config(&h);
+        let bin = h.install_path_command(command);
+        std::fs::write(
+            bin.join(command),
+            "#!/bin/sh\n\
+case \"${1-}\" in --help|--version) exit 0 ;; esac\n\
+stty -echo -icanon -icrnl min 1 time 0 2>/dev/null\n\
+printf 'KEY_CAPTURE_READY\\n'\n\
+first=$(dd bs=1 count=1 2>/dev/null | od -An -tx1 | tr -d '[:space:]')\n\
+rest=''\n\
+if [ \"$first\" = '1b' ]; then\n\
+  rest=$(dd bs=1 count=6 2>/dev/null | od -An -tx1 | tr -d '[:space:]')\n\
+fi\n\
+printf '%s%s' \"$first\" \"$rest\" > ctrl-enter-capture\n\
 sleep 60\n",
-    )
-    .expect("write key capture stub");
-
-    let project = h.project_path();
-    let add = h.run_cli(&[
-        "add",
-        project.to_str().unwrap(),
-        "-t",
-        "CtrlEnter",
-        "--tool",
-        "omp",
-    ]);
-    assert!(
-        add.status.success(),
-        "aoe add failed: {}",
-        String::from_utf8_lossy(&add.stderr)
-    );
-
-    h.spawn_tui();
-    h.wait_for("CtrlEnter");
-    h.send_keys("Enter");
-    h.wait_for_timeout("LIVE", Duration::from_secs(10));
-    h.send_hex_keys(&["1b", "5b", "31", "33", "3b", "35", "75"]);
-
-    let capture = project.join("ctrl-enter-capture");
-    let deadline = std::time::Instant::now() + Duration::from_secs(10);
-    let bytes = loop {
-        if let Ok(bytes) = std::fs::read_to_string(&capture) {
-            if !bytes.is_empty() {
-                break bytes;
+        )
+        .expect("write key capture stub");
+        if tool == "corp-omp" {
+            let config_path = app_dir_in(h.home_path()).join("config.toml");
+            let mut config = std::fs::read_to_string(&config_path).unwrap();
+            config.push_str(&format!(
+                "\n[session.custom_agents]\ncorp-omp = \"{command}\"\n"
+            ));
+            if declared {
+                let store = h.home_path().join("omp-store");
+                std::fs::create_dir_all(&store).unwrap();
+                config.push_str(&format!(
+                    "\n[session.agent_execution_as]\ncorp-omp = \"omp\"\n\
+\n[session.agent_config_dir]\ncorp-omp = \"{}\"\n",
+                    store.display()
+                ));
             }
+            if detect_only {
+                config.push_str("\n[session.agent_detect_as]\ncorp-omp = \"omp\"\n");
+            }
+            std::fs::write(config_path, config).unwrap();
         }
+        let project = h.project_path();
+        let add = h.run_cli(&[
+            "add",
+            project.to_str().unwrap(),
+            "-t",
+            "CtrlEnter",
+            "--tool",
+            tool,
+        ]);
         assert!(
-            std::time::Instant::now() < deadline,
-            "Ctrl+Enter did not reach the live-send pane"
+            add.status.success(),
+            "{case}: aoe add failed: {}",
+            String::from_utf8_lossy(&add.stderr)
         );
-        std::thread::sleep(Duration::from_millis(50));
-    };
-    assert_eq!(bytes, "1b5b31333b3575");
+        h.spawn_tui();
+        h.wait_for("CtrlEnter");
+        h.send_keys("Enter");
+        h.wait_for_timeout("KEY_CAPTURE_READY", Duration::from_secs(10));
+        h.send_hex_keys(&["1b", "5b", "31", "33", "3b", "35", "75"]);
+
+        let capture = project.join("ctrl-enter-capture");
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let bytes = loop {
+            if let Ok(bytes) = std::fs::read_to_string(&capture) {
+                if !bytes.is_empty() {
+                    break bytes;
+                }
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "{case}: Ctrl+Enter did not reach the live-send pane"
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        };
+        assert_eq!(bytes, expected, "{case}: native execution capability");
+    }
 }

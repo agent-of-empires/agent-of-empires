@@ -186,6 +186,13 @@ impl Instance {
         self.execution_agent().ok()
     }
 
+    pub(crate) fn supports_ctrl_enter(&self) -> bool {
+        !self.is_structured()
+            && self
+                .resolved_agent()
+                .is_some_and(crate::agents::AgentDef::supports_ctrl_enter)
+    }
+
     pub(crate) fn status_agent(&self) -> Option<&'static crate::agents::AgentDef> {
         self.resolved_agent()
             .or_else(|| crate::agents::get_agent(&self.tool))

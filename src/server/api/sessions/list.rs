@@ -573,6 +573,7 @@ mod workspace_ordering_tests {
             artifact_dir: String::new(),
             group_path: String::new(),
             tool: "claude".to_string(),
+            supports_ctrl_enter: false,
             status: "Idle".to_string(),
             dormant: false,
             yolo_mode: false,

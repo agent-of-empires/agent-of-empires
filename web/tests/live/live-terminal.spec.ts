@@ -1,12 +1,12 @@
 // The live terminal view against a real server and tmux: frame transport, compression, size ownership, scrollback.
 
 import { spawnSync } from "node:child_process";
-import { existsSync, readFileSync } from "node:fs";
+import { appendFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { randomUUID } from "node:crypto";
 import { devices, type Page } from "@playwright/test";
 import { test, expect, type ServeHandle, type ServeOptions } from "../helpers/liveTest";
-import { seedSessionViaAoeAdd, waitForSessions } from "../helpers/aoeServe";
+import { appDirFor, resolveAoeBinary, seedSessionViaAoeAdd, waitForSessions } from "../helpers/aoeServe";
 import { clickSidebarSession, openMobileSidebar } from "../helpers/sidebar";
 
 test.use({ ...devices["iPhone 13"] });
@@ -36,6 +36,53 @@ async function expectGridTransport(page: Page) {
     .not.toBeNull();
   expect(await reportedTransport(page), "the VT grid armed; a snapshot fallback cannot hold a repaint").toBe("grid");
 }
+
+test.describe("native execution keyboard capability", () => {
+  test.use({ viewport: { width: 1280, height: 800 }, isMobile: false, hasTouch: false });
+
+  test("a custom OMP wrapper receives distinct Ctrl+Enter through the real API", async ({ page, spawnServe }) => {
+    const serve = await spawnServe({
+      seedFn: (seed) => {
+        const projectDir = join(seed.home, "project");
+        const script = join(seed.shimBin, "corp-omp-wrapper");
+        mkdirSync(projectDir, { recursive: true });
+        writeFileSync(
+          script,
+          `#!/bin/bash
+stty -echo -icanon -icrnl min 1 time 0
+printf 'KEY_CAPTURE_READY\\n'
+first=$(dd bs=1 count=1 2>/dev/null | od -An -tx1 | tr -d '[:space:]')
+rest=''
+if [ "$first" = '1b' ]; then
+  rest=$(dd bs=1 count=6 2>/dev/null | od -An -tx1 | tr -d '[:space:]')
+fi
+printf '%s%s' "$first" "$rest" > ctrl-enter-capture
+sleep 60
+`,
+          { mode: 0o755 },
+        );
+        appendFileSync(
+          join(appDirFor(seed.home, seed.xdg, resolveAoeBinary()), "config.toml"),
+          `\n[session.custom_agents]\ncorp-omp = ${JSON.stringify(script)}\n\n[session.agent_execution_as]\ncorp-omp = "omp"\n\n[session.agent_config_dir]\ncorp-omp = ${JSON.stringify(join(seed.home, "omp-store"))}\n`,
+        );
+        const added = spawnSync(resolveAoeBinary(), ["add", projectDir, "-t", "native-input", "--tool", "corp-omp"], {
+          env: seed.env,
+        });
+        expect(added.status, added.stderr?.toString()).toBe(0);
+      },
+    });
+    const session = (await waitForSessions(serve.baseUrl)).find((item) => item.title === "native-input");
+    expect(session?.tool).toBe("corp-omp");
+    expect(session?.supports_ctrl_enter).toBe(true);
+    await page.goto(serve.baseUrl);
+    await clickSidebarSession(page, "native-input");
+    await expect(page.locator('[data-term="agent"] [data-live-content]')).toContainText("KEY_CAPTURE_READY");
+    await page.getByRole("textbox", { name: "Live terminal input" }).first().focus();
+    await page.keyboard.press("Control+Enter");
+    const captured = join(serve.home, "project", "ctrl-enter-capture");
+    await expect.poll(() => (existsSync(captured) ? readFileSync(captured, "utf8") : "")).toBe("1b5b31333b3575");
+  });
+});
 
 test.describe("grid transport", () => {
   test("synchronized-output brackets publish whole frames only", async ({ page, spawnServe }) => {

@@ -44,6 +44,7 @@ impl SessionResponse {
                 .unwrap_or_default(),
             group_path: inst.group_path.clone(),
             tool: inst.tool.clone(),
+            supports_ctrl_enter: inst.supports_ctrl_enter(),
             status: inst.status.wire_str().to_string(),
             dormant: inst.is_shown_dormant(),
             yolo_mode: inst.yolo_mode,

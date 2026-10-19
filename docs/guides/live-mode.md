@@ -40,6 +40,8 @@ When your terminal reports `Ctrl+Enter` distinctly, AoE forwards it as `CSI-u` t
 
 The web terminal also preserves `Ctrl+Enter` for OMP agent panes. Other agents and paired shells receive a normal carriage return; `Shift+Enter` and `Ctrl+Shift+Enter` remain soft newlines.
 
+This follows native execution identity, not the logical tool name or `agent_detect_as`. Custom OMP commands and [declared wrappers](session-resume.md#execution-identity-and-wrappers) inherit the same keyboard behavior.
+
 ## Split windows
 
 If the session's tmux window is split, by hand or by an agent that spawns a pane per teammate, the preview composites every pane onto the window grid with borders in the gaps, so nothing is hidden. Two things change while it is split: scrolling history is unavailable, because panes keep independent scrollbacks with no coherent way to stack them, and input still goes to the first pane, so a click or wheel aimed at a neighbouring pane does nothing. Attach to the session to interact with the other panes.

@@ -6,16 +6,21 @@ import { clickSidebarSession } from "./helpers/sidebar";
 test.describe("Desktop live terminal input", () => {
   test.use({ viewport: { width: 1280, height: 800 }, hasTouch: false });
 
-  for (const tool of ["omp", "claude"]) {
-    test(`Ctrl+Enter preserves the ${tool} pane's keyboard encoding`, async ({ page }) => {
-      const handle = await mockTerminalApis(page, { tool });
+  for (const [label, tool, supportsCtrlEnter] of [
+    ["builtin OMP", "omp", true],
+    ["custom OMP", "corp-omp", true],
+    ["non-OMP", "claude", false],
+    ["unresolved OMP wrapper", "omp", false],
+  ] as const) {
+    test(`Ctrl+Enter preserves the ${label} pane's keyboard encoding`, async ({ page }) => {
+      const handle = await mockTerminalApis(page, { tool, sessionFields: { supports_ctrl_enter: supportsCtrlEnter } });
       await page.goto("/");
       await clickSidebarSession(page, "pinch-test");
       await handle.waitForLiveReady();
       const input = page.getByRole("textbox", { name: "Live terminal input" }).first();
       await input.focus();
       for (const [key, expected] of [
-        ["Control+Enter", tool === "omp" ? "\x1b[13;5u" : "\r"],
+        ["Control+Enter", supportsCtrlEnter ? "\x1b[13;5u" : "\r"],
         ["Shift+Enter", "\x1b\r"],
         ["Control+Shift+Enter", "\x1b\r"],
       ]) {
@@ -23,7 +28,7 @@ test.describe("Desktop live terminal input", () => {
         await page.keyboard.press(key);
         await expect.poll(() => Buffer.concat(handle.liveInput.slice(before)).toString()).toBe(expected);
       }
-      if (tool === "omp") {
+      if (tool === "omp" && supportsCtrlEnter) {
         await page.keyboard.press("ControlOrMeta+`");
         const shellInput = page.locator('[data-term="paired"]:visible textarea').first();
         await expect(shellInput).toBeFocused();

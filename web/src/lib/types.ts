@@ -11,6 +11,8 @@ export interface SessionResponse {
   artifact_dir: string;
   group_path: string;
   tool: string;
+  /** Resolved native agent capability, independent of the logical tool name. */
+  supports_ctrl_enter?: boolean;
   status: SessionStatus;
   /** Worker auto-stopped for inactivity (resumable), unlike a deliberate Stop. */
   dormant: boolean;

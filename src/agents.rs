@@ -982,6 +982,10 @@ pub const AGENTS: &[AgentDef] = &[
 ];
 
 impl AgentDef {
+    pub(crate) fn supports_ctrl_enter(&self) -> bool {
+        self.name == "omp"
+    }
+
     /// Whether a fork can run in this context. A `ValueFlag` fork leaves the
     /// child id to the agent, so it needs a capture context that can read it.
     pub fn can_fork_in(&self, sandboxed: bool) -> bool {

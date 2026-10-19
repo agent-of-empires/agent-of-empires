@@ -131,6 +131,9 @@ pub struct SessionResponse {
     pub group_path: String,
     #[serde(default)]
     pub tool: String,
+    /// The resolved native agent accepts distinct CSI-u Ctrl+Enter input.
+    #[serde(default)]
+    pub supports_ctrl_enter: bool,
     #[serde(default)]
     pub status: String,
     #[serde(default)]

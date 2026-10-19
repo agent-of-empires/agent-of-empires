@@ -6082,10 +6082,12 @@ impl HomeView {
     /// exit + info dialog instead.
     fn handle_live_send_key(&mut self, key: KeyEvent) -> Option<Action> {
         let state = self.live_send.clone()?;
-        let use_omp_approval_chord = matches!(&state.target, live_send::LiveSendTarget::Agent)
+        let use_omp_approval_chord = key.code == KeyCode::Enter
+            && key.modifiers == KeyModifiers::CONTROL
+            && matches!(&state.target, live_send::LiveSendTarget::Agent)
             && self
                 .get_instance(&state.session_id)
-                .is_some_and(|inst| inst.tool == "omp");
+                .is_some_and(|inst| inst.supports_ctrl_enter());
 
         // Leader menu: a prior keystroke matched the configured leader
         // (tmux-style prefix, default Ctrl+B), so this key picks a
