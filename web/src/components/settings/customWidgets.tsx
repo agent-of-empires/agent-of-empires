@@ -116,6 +116,7 @@ const KNOWN_TARGETS: { value: string; group: string }[] = [
   { value: "auth.middleware", group: "Auth" },
   { value: "auth.rate_limit", group: "Auth" },
   { value: "auth.passphrase", group: "Auth" },
+  { value: "auth.passkey", group: "Auth" },
   { value: "auth.device", group: "Auth" },
   { value: "auth.ip", group: "Auth" },
   { value: "process.signal", group: "Process" },

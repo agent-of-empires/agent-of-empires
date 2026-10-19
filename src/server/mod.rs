@@ -18,6 +18,7 @@ pub mod live_ws;
 pub mod login;
 mod mcp;
 mod pane;
+pub mod passkeys;
 pub mod plugin_status;
 pub mod push;
 pub mod push_send;
@@ -27,6 +28,7 @@ pub(crate) mod router;
 #[cfg(target_os = "linux")]
 pub(crate) mod runtime_uds;
 pub(crate) mod runtime_ws;
+mod secure_store;
 pub(crate) mod serve_snapshot;
 pub(crate) mod session_identity;
 pub(crate) mod session_service;

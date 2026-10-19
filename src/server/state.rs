@@ -82,6 +82,7 @@ pub struct AppState {
     pub session_service: Arc<session_service::SessionService>,
     pub token_manager: Arc<TokenManager>,
     pub login_manager: Arc<login::LoginManager>,
+    pub passkey_manager: Arc<super::passkeys::PasskeyManager>,
     pub rate_limiter: Arc<RateLimiter>,
     pub behind_tunnel: bool,
     /// Coarse auth mode resolved once at launch (`"token"` / `"passphrase"` / `"none"`).

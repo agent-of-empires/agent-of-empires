@@ -314,6 +314,10 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
     } else {
         login::LoginManager::new(passphrase)
     });
+    let passkey_manager = Arc::new(match crate::session::get_app_dir() {
+        Ok(app_dir) => super::passkeys::PasskeyManager::with_persistence(&app_dir),
+        Err(_) => super::passkeys::PasskeyManager::in_memory(),
+    });
     let rate_limiter = Arc::new(RateLimiter::new());
 
     // Fail closed before anything binds.
@@ -668,6 +672,7 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
         session_service,
         token_manager: Arc::clone(&token_manager),
         login_manager: Arc::clone(&login_manager),
+        passkey_manager,
         rate_limiter: Arc::clone(&rate_limiter),
         behind_tunnel: remote || behind_proxy,
         auth_mode,

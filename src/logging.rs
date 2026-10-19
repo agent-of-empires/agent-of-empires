@@ -129,6 +129,7 @@ pub const KNOWN_SUB_TARGETS: &[&str] = &[
     "auth.middleware",
     "auth.rate_limit",
     "auth.passphrase",
+    "auth.passkey",
     "auth.device",
     "auth.ip",
     "process.signal",
