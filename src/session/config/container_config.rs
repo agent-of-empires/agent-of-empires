@@ -65,7 +65,7 @@ const AGENT_CONFIG_MOUNTS: &[AgentConfigMount] = &[
         container_suffix: ".claude",
         copy_files: &["settings.json", "CLAUDE.md", "keybindings.json"],
         seed_files: &[],
-        copy_dirs: &["plugins", "skills", "hooks"],
+        copy_dirs: &["plugins", "skills", "hooks", "agents", "commands"],
         // Keychain credentials seed the existing shared OAuth-token mount.
         keychain_credential: Some(("Claude Code-credentials", ".credentials.json")),
         // Onboarding is home-level. IS_SANDBOX makes Claude use the separately
@@ -4088,6 +4088,35 @@ mod tests {
             sandbox.join("hooks").join("secret-guard.sh").exists(),
             "hook script referenced by settings.json must be copied into the sandbox"
         );
+    }
+
+    #[test]
+    fn test_claude_mount_copies_agents_and_commands() {
+        let claude_mount = AGENT_CONFIG_MOUNTS
+            .iter()
+            .find(|m| m.tool_name == "claude")
+            .expect("claude mount must exist");
+
+        let dir = TempDir::new().unwrap();
+        let host = dir.path().join("host");
+        for (sub, file) in [("agents", "review.md"), ("commands", "ship.md")] {
+            fs::create_dir_all(host.join(sub)).unwrap();
+            fs::write(host.join(sub).join(file), sub).unwrap();
+        }
+
+        let sandbox = dir.path().join("sandbox");
+        sync_fixture(
+            &host,
+            &sandbox,
+            claude_mount.copy_files,
+            &[],
+            claude_mount.copy_dirs,
+            claude_mount.preserve_files,
+        )
+        .unwrap();
+
+        assert!(sandbox.join("agents").join("review.md").exists());
+        assert!(sandbox.join("commands").join("ship.md").exists());
     }
 
     #[test]
