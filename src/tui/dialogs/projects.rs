@@ -327,6 +327,7 @@ impl ProjectsDialog {
                     worktree_enabled: self.add_worktree_override,
                     smart_rename: self.add_smart_rename_override,
                     sandbox_enabled: self.add_sandbox_override,
+                    ..Default::default()
                 };
                 let project =
                     Project::new(name.clone(), canonical.to_string_lossy(), self.add_scope)

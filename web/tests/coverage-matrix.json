@@ -3,6 +3,21 @@
   "description": "Surface/flow coverage matrix for the agent-of-empires web dashboard. Every component file under web/src/components/** must appear in at least one entry's `components` list (covered, deferred, or out-of-scope), or in coverage-matrix.exempt.json. CI validates this on every PR via tests/validate-coverage-matrix.mjs.",
   "surfaces": [
     {
+      "id": "settings.dialog-escape",
+      "kind": "mocked-playwright",
+      "risk": "high",
+      "specs": ["tests/settings-dialog-escape.spec.ts"],
+      "components": [
+        "web/src/App.tsx",
+        "web/src/components/settings/PluginsSettings.tsx",
+        "web/src/components/settings/PluginDetailModal.tsx",
+        "web/src/components/AboutModal.tsx",
+        "web/src/components/command-palette/CommandPalette.tsx",
+        "web/src/components/settings/PluginJobProgressModal.tsx"
+      ],
+      "notes": "Real Escape keys dismiss uninstall, plugin details and its nested lightbox, and Web dashboard disable confirmation without leaving Settings or issuing a mutation; Escape in the command palette preserves the underlying uninstall confirmation; Escape without a dialog still closes Settings. Running plugin jobs retain their dialog; successful, failed and missing jobs dismiss through the existing close callback and reload plugins without leaving Settings. The command palette retains Escape priority over a completed job."
+    },
+    {
       "id": "terminal.paired-shell",
       "kind": "vitest",
       "risk": "medium",
@@ -43,14 +58,14 @@
       "kind": "live-playwright",
       "risk": "high",
       "specs": ["tests/live/settings-panels.spec.ts"],
-      "components": ["web/src/components/McpServers.tsx"]
+      "components": ["web/src/components/McpServers.tsx", "web/src/components/McpServerForm.tsx"]
     },
     {
       "id": "settings.mcp-servers.handlers",
       "kind": "vitest",
       "risk": "high",
       "specs": ["src/components/__tests__/McpServers.test.tsx", "src/lib/api.test.ts"],
-      "components": ["web/src/components/McpServers.tsx"]
+      "components": ["web/src/components/McpServers.tsx", "web/src/components/McpServerForm.tsx"]
     },
     {
       "id": "settings.skills-management",
@@ -2190,7 +2205,8 @@
         "web/src/components/diff/comments/CommentMarkdown.tsx",
         "web/src/components/diff/comments/CommentsBanner.tsx",
         "web/src/components/diff/comments/DiffCommentsUserCard.tsx",
-        "web/src/components/diff/comments/SendCommentsDialog.tsx"
+        "web/src/components/diff/comments/SendCommentsDialog.tsx",
+        "web/src/lib/paneLayout.ts"
       ]
     },
     {
@@ -2209,12 +2225,14 @@
       "risk": "medium",
       "specs": [
         "src/components/diff/__tests__/FileContentViewer.test.tsx",
+        "src/components/diff/__tests__/BinaryFileView.test.tsx",
         "src/components/diff/__tests__/FullFileViewer.test.tsx",
         "src/components/__tests__/FilesPane.test.tsx"
       ],
       "components": [
         "web/src/components/FilesPane.tsx",
         "web/src/components/diff/FileContentViewer.tsx",
+        "web/src/components/diff/BinaryFileView.tsx",
         "web/src/components/diff/FullFileViewer.tsx"
       ]
     },
@@ -2234,6 +2252,7 @@
       "components": [
         "web/src/components/FilesPane.tsx",
         "web/src/components/diff/FileContentViewer.tsx",
+        "web/src/components/diff/BinaryFileView.tsx",
         "web/src/components/diff/MarkdownFileView.tsx",
         "web/src/components/diff/FullFileViewer.tsx",
         "web/src/App.tsx"
@@ -2558,6 +2577,7 @@
       "risk": "high",
       "specs": [
         "tests/live/acp-transcript.spec.ts",
+        "tests/acp-user-attachments.spec.ts",
         "src/components/acp/Composer.test.tsx",
         "src/components/acp/ThreadMessages.test.tsx"
       ],
@@ -2811,13 +2831,18 @@
       "id": "acp.tool-output-media",
       "kind": "vitest",
       "risk": "medium",
-      "specs": ["src/lib/acpTypes.test.ts", "src/components/acp/ToolCards.render.test.tsx"],
+      "specs": [
+        "src/lib/acpTypes.test.ts",
+        "src/components/acp/ToolCards.render.test.tsx",
+        "src/components/acp/ReadFileResult.test.tsx"
+      ],
       "components": [
         "web/src/components/acp/ToolCards.tsx",
         "web/src/lib/acpTypes.ts",
         "web/src/components/acp/CoreToolCards.tsx",
         "web/src/components/acp/GroupToolCards.tsx",
         "web/src/components/acp/NamedToolCards.tsx",
+        "web/src/components/acp/ReadFileResult.tsx",
         "web/src/components/acp/TodoCards.tsx",
         "web/src/components/acp/ToolCardChrome.tsx",
         "web/src/components/acp/ToolOutputMedia.tsx"
@@ -3319,7 +3344,7 @@
       "kind": "vitest",
       "risk": "low",
       "specs": ["src/components/__tests__/ProjectFormModal.test.tsx"],
-      "components": ["web/src/components/ProjectFormModal.tsx"]
+      "components": ["web/src/components/ProjectFormModal.tsx", "web/src/components/ProjectPluginSettings.tsx"]
     },
     {
       "id": "scratch-overrides-modal",
@@ -3977,6 +4002,18 @@
         "web/src/components/acp/ToolCardChrome.tsx",
         "web/src/components/acp/ToolOutputMedia.tsx"
       ]
+    },
+    {
+      "id": "acp.tool-output-media",
+      "kind": "mocked-playwright",
+      "risk": "medium",
+      "specs": [
+        "src/components/acp/activityMessages.test.ts",
+        "src/components/acp/ThreadMessages.test.tsx",
+        "tests/acp-tool-output-media.spec.ts"
+      ],
+      "components": ["web/src/components/acp/ThreadMessages.tsx", "web/src/components/acp/ToolOutputMedia.tsx"],
+      "notes": "A tool result's image, audio, link and resource blocks reach the card through the thread's tool part, so they render under it."
     },
     {
       "id": "acp.story.edit-card-diff-scroll",

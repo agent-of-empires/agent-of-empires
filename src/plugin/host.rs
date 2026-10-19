@@ -152,16 +152,23 @@ impl PluginHost {
         }
     }
 
-    pub async fn emit_settings_changed(&self, changes: &[(String, Vec<String>)]) {
+    pub async fn emit_settings_changed(
+        &self,
+        changes: &[(String, Vec<String>)],
+        project_path: Option<&str>,
+    ) {
         if changes.is_empty() {
             return;
         }
         let revision = self.api.bump_settings_revision();
         for (plugin_id, changed_keys) in changes {
-            let params = serde_json::json!({
+            let mut params = serde_json::json!({
                 "revision": revision,
                 "changed_keys": changed_keys,
             });
+            if let Some(path) = project_path {
+                params["project_path"] = serde_json::json!(path);
+            }
             let delivered = self
                 .notify_worker(plugin_id, "plugin.settings.changed", params)
                 .await;

@@ -5,7 +5,7 @@ export type OpenResult = { ok: true } | { ok: false; status?: number };
 const REVOKE_DOWNLOAD_URL_MS = 40_000;
 
 // Open a same-origin file through the token-injecting fetch, since a bare navigation lacks the Authorization header. The blob URL is left to the new tab.
-export async function openInNewTab(url: string, downloadName?: string): Promise<OpenResult> {
+export async function openInNewTab(url: string, downloadName?: string, forceDownload = false): Promise<OpenResult> {
   // Open synchronously while the click's activation is live, or the popup is blocked. `noopener` would make window.open return null.
   const tab = window.open("about:blank", "_blank");
   try {
@@ -17,7 +17,7 @@ export async function openInNewTab(url: string, downloadName?: string): Promise<
     const blob = await r.blob();
     const objectUrl = URL.createObjectURL(blob);
     // A blob URL drops Content-Disposition, so save an attachment here under its own name instead of an anonymous blob.
-    if (r.headers.get("Content-Disposition")?.startsWith("attachment")) {
+    if (forceDownload || r.headers.get("Content-Disposition")?.startsWith("attachment")) {
       tab?.close();
       const link = document.createElement("a");
       link.href = objectUrl;

@@ -52,6 +52,7 @@ export function DiffFileList({
 }: Props) {
   const isMultiRepo = perRepoBases.length > 1;
   const singleBaseBranch = perRepoBases[0]?.base_branch ?? "main";
+  const outsideRepository = !isMultiRepo && Boolean(perRepoBases[0]?.outside_repository);
   const [collapsedRepos, setCollapsedRepos] = useState<Set<string>>(() => new Set());
   const { settings, update } = useWebSettings();
   const viewMode = settings.diffViewMode;
@@ -173,6 +174,18 @@ export function DiffFileList({
     body = <FlatList files={files} focusedIndex={clampedFocusedIndex} onFocusIndex={setFocusedIndex} {...listProps} />;
   }
 
+  if (outsideRepository) {
+    return (
+      <div className="flex flex-col items-center justify-center h-full bg-surface-900 px-4 text-center text-sm">
+        <p className="font-medium text-text-secondary">No diff</p>
+        <p className="mt-1 text-text-muted">
+          The working directory (<span className="font-mono break-all">{perRepoBases[0]?.repo_path}</span>) isn't a git
+          repository, so there's nothing to compare.
+        </p>
+      </div>
+    );
+  }
+
   return (
     <div className="flex flex-col h-full bg-surface-900 overflow-hidden" onContextMenu={handleContextMenu}>
       <FileContextMenu menu={pathMenu} onClose={closePathMenu} />
@@ -284,7 +297,9 @@ function RepoGroup({
           <Chevron collapsed={collapsed} />
           <span className="font-mono text-[12px] truncate">{repo.repo_name ?? "(default)"}</span>
         </button>
-        {sessionId ? (
+        {repo.base_branch === undefined ? (
+          <span className="font-mono text-[10px] text-text-dim">not a git repository</span>
+        ) : sessionId ? (
           <BasePicker
             sessionId={sessionId}
             repoPath={repo.repo_path}

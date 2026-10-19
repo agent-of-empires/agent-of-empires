@@ -67,6 +67,22 @@ pub(crate) fn replace_file_no_follow(root: &Path, rel: &Path, content: &[u8]) ->
     replace_file_no_follow_as(root, rel, content, 0o644)
 }
 
+/// Windows has no `O_NOFOLLOW` walk here; the sandbox this guards against is
+/// Linux and macOS only. Kept so the module compiles.
+#[cfg(not(unix))]
+pub(crate) fn replace_file_no_follow(root: &Path, rel: &Path, content: &[u8]) -> Result<()> {
+    let path = root.join(rel);
+    let dir = path
+        .parent()
+        .ok_or_else(|| anyhow!("replace_file_no_follow needs a path with a parent"))?;
+    fs::create_dir_all(dir)?;
+    let mut tmp = tempfile::NamedTempFile::new_in(dir)?;
+    tmp.write_all(content)?;
+    tmp.as_file().sync_all()?;
+    tmp.persist(&path)?;
+    Ok(())
+}
+
 /// [`replace_file_no_follow`] with an explicit mode, for content that must not
 /// stay world readable.
 #[cfg(unix)]
@@ -210,11 +226,6 @@ pub(crate) fn read_file_no_follow(root: &Path, rel: &Path) -> Result<Option<Stri
     Ok(file.read_to_string(&mut content).ok().map(|_| content))
 }
 
-/// Serial for the per-attempt temp name in [`replace_file_no_follow`], so two
-/// writers in one process cannot pick the same one inside a clock tick.
-#[cfg(unix)]
-static NO_FOLLOW_TMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-
 /// Windows keeps the check-then-open the unix arm closes; the sandbox this guards against
 /// is Linux and macOS only.
 #[cfg(not(unix))]
@@ -227,21 +238,10 @@ pub(crate) fn read_file_no_follow(root: &Path, rel: &Path) -> Result<Option<Stri
         .flatten())
 }
 
-/// Windows has no `O_NOFOLLOW` walk here; the sandbox this guards against is
-/// Linux and macOS only. Kept so the module compiles.
-#[cfg(not(unix))]
-pub(crate) fn replace_file_no_follow(root: &Path, rel: &Path, content: &[u8]) -> Result<()> {
-    let path = root.join(rel);
-    let dir = path
-        .parent()
-        .ok_or_else(|| anyhow!("replace_file_no_follow needs a path with a parent"))?;
-    fs::create_dir_all(dir)?;
-    let mut tmp = tempfile::NamedTempFile::new_in(dir)?;
-    tmp.write_all(content)?;
-    tmp.as_file().sync_all()?;
-    tmp.persist(&path)?;
-    Ok(())
-}
+/// Serial for the per-attempt temp name in [`replace_file_no_follow`], so two
+/// writers in one process cannot pick the same one inside a clock tick.
+#[cfg(unix)]
+static NO_FOLLOW_TMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Resolve `path` through a symlink chain to the underlying target file.
 pub(crate) fn resolve_symlink_chain(path: &Path) -> Result<PathBuf> {
@@ -280,8 +280,35 @@ pub(crate) fn resolve_symlink_chain(path: &Path) -> Result<PathBuf> {
 pub(crate) fn locked_update<T, R, E>(
     path: &Path,
     parse: impl FnOnce(&str) -> Result<T>,
-    serialize: impl FnOnce(&T) -> Result<String>,
+    serialize: impl Fn(&T) -> Result<String>,
     mutate: impl FnOnce(&mut T) -> std::result::Result<R, E>,
+) -> Result<std::result::Result<R, E>>
+where
+    T: Default,
+{
+    locked_update_inner(path, parse, serialize, mutate, false)
+}
+
+/// [`locked_update`] that leaves the file untouched when the mutation changed nothing, for holding
+/// the lock of a file that is only read.
+pub(crate) fn locked_update_if_changed<T, R, E>(
+    path: &Path,
+    parse: impl FnOnce(&str) -> Result<T>,
+    serialize: impl Fn(&T) -> Result<String>,
+    mutate: impl FnOnce(&mut T) -> std::result::Result<R, E>,
+) -> Result<std::result::Result<R, E>>
+where
+    T: Default,
+{
+    locked_update_inner(path, parse, serialize, mutate, true)
+}
+
+fn locked_update_inner<T, R, E>(
+    path: &Path,
+    parse: impl FnOnce(&str) -> Result<T>,
+    serialize: impl Fn(&T) -> Result<String>,
+    mutate: impl FnOnce(&mut T) -> std::result::Result<R, E>,
+    skip_unchanged: bool,
 ) -> Result<std::result::Result<R, E>>
 where
     T: Default,
@@ -306,9 +333,14 @@ where
         Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
     };
 
+    let before = skip_unchanged.then(|| serialize(&value)).transpose()?;
     let result = mutate(&mut value);
     if result.is_ok() {
-        atomic_write(path, serialize(&value)?.as_bytes())?;
+        let content = serialize(&value)?;
+        if before.as_deref() == Some(content.as_str()) {
+            return Ok(result);
+        }
+        atomic_write(path, content.as_bytes())?;
         // Best-effort here, unlike atomic_write's "every fallible mutation before the
         // rename" contract.
         #[cfg(unix)]

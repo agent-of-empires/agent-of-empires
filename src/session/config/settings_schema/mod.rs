@@ -13,9 +13,9 @@ mod validate;
 
 pub use merge::{apply_changed_leaves, clear_path, merge_json};
 pub use plugin::{
-    plugin_field_descriptors, plugin_section_id, rewrite_plugin_sections, section_plugin_id,
-    storage_leaf as plugin_storage_leaf, storage_value as plugin_storage_value, PLUGIN_CATEGORY,
-    PLUGIN_SECTION_PREFIX,
+    plugin_field_descriptors, plugin_section_id, resolve_plugin_setting, rewrite_plugin_sections,
+    section_plugin_id, storage_leaf as plugin_storage_leaf, storage_value as plugin_storage_value,
+    validate_project_plugin_setting, PluginSettingSource, PLUGIN_CATEGORY, PLUGIN_SECTION_PREFIX,
 };
 pub use policy::{strip_local_only, validate_patch, validate_patch_with, PatchRejection, Scope};
 pub use registry::{descriptor, runtime_schema, schema, schema_ref, section_in_schema};
@@ -267,6 +267,9 @@ pub struct FieldDescriptor {
     /// Manifest default for plugin fields; core fields always have a value in `Config`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default: Option<serde_json::Value>,
+    /// Plugin field that can also be set per registered project.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub per_project: bool,
 }
 
 impl FieldDescriptor {

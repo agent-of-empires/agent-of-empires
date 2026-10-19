@@ -80,6 +80,7 @@ fn expand(input: DeriveInput) -> syn::Result<proc_macro2::TokenStream> {
                 advanced: #advanced,
                 tui_only: #tui_only,
                 default: ::core::option::Option::None,
+                per_project: false,
             }
         });
     }

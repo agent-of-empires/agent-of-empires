@@ -36,7 +36,14 @@ pub(super) fn build_router(state: Arc<AppState>) -> Router {
         // Atomic multi-session workspace delete.
         .route("/api/workspaces", delete(api::delete_workspace))
         // Unified MCP management surface (#1996)
-        .route("/api/mcp/servers", get(api::get_mcp_servers))
+        .route(
+            "/api/mcp/servers",
+            get(api::get_mcp_servers).post(api::create_mcp_server),
+        )
+        .route(
+            "/api/mcp/servers/{name}",
+            put(api::edit_mcp_server).delete(api::delete_mcp_server),
+        )
         .route(
             "/api/mcp/servers/{name}/resolve",
             post(api::resolve_mcp_conflict),

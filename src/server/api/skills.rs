@@ -1,14 +1,14 @@
 //! Skills management REST API.
 
-use axum::extract::{FromRequestParts, Path};
-use axum::http::{request::Parts, StatusCode};
+use axum::extract::Path;
+use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use serde::Deserialize;
 use serde_json::json;
 
-use super::{api_error, AppState};
-use crate::server::auth::{handler_elevated, AuthenticatedSession, LoopbackTrusted};
+use super::api_error;
+use super::mutation_guard::ElevatedMutationGuard;
 use crate::session::skills_model::{self, SkillError, SkillProvenance};
 
 fn skill_error(error: SkillError) -> Response {
@@ -37,45 +37,6 @@ fn task_error(error: tokio::task::JoinError) -> Response {
         "internal",
         error.to_string(),
     )
-}
-
-async fn mutation_gate(
-    state: &AppState,
-    session: Option<&AuthenticatedSession>,
-    loopback_trusted: bool,
-) -> Result<(), Response> {
-    if state.read_only {
-        return Err(super::read_only_response());
-    }
-    if let Some(response) = super::cityhall_block(state) {
-        return Err(response);
-    }
-    if !handler_elevated(state, session, loopback_trusted).await {
-        return Err(api_error(
-            StatusCode::FORBIDDEN,
-            "elevation_required",
-            "Re-enter the passphrase to continue",
-        ));
-    }
-    Ok(())
-}
-
-/// Parts-only extractor that rejects forbidden mutations before Axum reads or
-/// parses the request body.
-pub struct SkillMutationGuard;
-
-impl FromRequestParts<std::sync::Arc<AppState>> for SkillMutationGuard {
-    type Rejection = Response;
-
-    async fn from_request_parts(
-        parts: &mut Parts,
-        state: &std::sync::Arc<AppState>,
-    ) -> Result<Self, Self::Rejection> {
-        let session = parts.extensions.get::<AuthenticatedSession>();
-        let loopback_trusted = parts.extensions.get::<LoopbackTrusted>().is_some();
-        mutation_gate(state, session, loopback_trusted).await?;
-        Ok(Self)
-    }
 }
 
 fn source_provenance(source: &str) -> Result<SkillProvenance, String> {
@@ -146,7 +107,7 @@ pub struct CreateSkillBody {
 
 /// `POST /api/skills`: create a new AoE-managed skill.
 pub async fn create_skill(
-    _guard: SkillMutationGuard,
+    _guard: ElevatedMutationGuard,
     Json(body): Json<CreateSkillBody>,
 ) -> Response {
     let directory = body.directory;
@@ -166,7 +127,7 @@ pub struct EditSkillBody {
 
 /// `PUT /api/skills/{directory}`: edit an AoE-managed skill.
 pub async fn edit_skill(
-    _guard: SkillMutationGuard,
+    _guard: ElevatedMutationGuard,
     Path(directory): Path<String>,
     Json(body): Json<EditSkillBody>,
 ) -> Response {
@@ -182,7 +143,10 @@ pub async fn edit_skill(
 }
 
 /// `DELETE /api/skills/{directory}`: delete an AoE-managed skill.
-pub async fn delete_skill(_guard: SkillMutationGuard, Path(directory): Path<String>) -> Response {
+pub async fn delete_skill(
+    _guard: ElevatedMutationGuard,
+    Path(directory): Path<String>,
+) -> Response {
     let result = tokio::task::spawn_blocking(move || {
         let home = dirs::home_dir().ok_or_else(|| {
             SkillError::Io(anyhow::anyhow!("could not resolve home dir for skills"))
@@ -202,7 +166,7 @@ pub struct AdoptSkillBody {
 /// `POST /api/skills/{source}/{directory}/adopt`: copy an external skill into
 /// the AoE-managed store.
 pub async fn adopt_skill(
-    _guard: SkillMutationGuard,
+    _guard: ElevatedMutationGuard,
     Path((source, directory)): Path<(String, String)>,
     Json(body): Json<AdoptSkillBody>,
 ) -> Response {
@@ -256,7 +220,10 @@ pub struct SyncSkillsBody {
 /// Returns one outcome per skill per root rather than failing on the first
 /// conflict: a destination AoE does not own is a normal result the user needs to
 /// see, not an error that should abandon the remaining roots.
-pub async fn sync_skills(_guard: SkillMutationGuard, Json(body): Json<SyncSkillsBody>) -> Response {
+pub async fn sync_skills(
+    _guard: ElevatedMutationGuard,
+    Json(body): Json<SyncSkillsBody>,
+) -> Response {
     for root in &body.roots {
         if skills_model::skill_root(root).is_none() {
             return api_error(
