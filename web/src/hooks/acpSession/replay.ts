@@ -38,7 +38,9 @@ const readRows = async (res: Response): Promise<TranscriptRow[]> =>
 
 /**
  * Catch up from `lastSeq.current`, updating it on a cold open. A state with a cursor but no loaded history
- * (`oldestSeq` 0) recovers its transcript from the tail first, then folds frames forward from its own cursor.
+ * (`oldestSeq` 0) recovers its transcript from the tail, then folds frames forward from its own cursor; the
+ * tail is published only once that catch-up succeeds, so a failed one cannot leave a tail the socket snapshot
+ * would append older rows after.
  * Errors are swallowed; a later lagged notice retries.
  * Aborting `signal` cancels the requests and stops every later state write, so a stale snapshot cannot land
  * over newer socket content.
@@ -52,37 +54,42 @@ export async function fetchReplay(
   signal: AbortSignal,
 ): Promise<void> {
   try {
-    if (lastSeq.current === 0) await fetchTail(sid, lastSeq, true, dispatch, setHasMoreOlder, signal);
+    if (lastSeq.current === 0) await fetchTail(sid, lastSeq, null, dispatch, setHasMoreOlder, signal);
     else if (oldestSeq === 0) {
       // Cached control state is cursor-aware and must see each frame once, from its own cursor. Forward rows
       // from that cursor would append older turns after the recovered tail, so rows resume exactly at the tail's end.
       const from = lastSeq.current;
-      const tailEnd = await fetchTail(sid, lastSeq, false, dispatch, setHasMoreOlder, signal);
-      await fetchForward(sid, from, dispatch, signal, "frames");
-      if (tailEnd !== null) await fetchForward(sid, tailEnd, dispatch, signal, "rows", 0);
+      const catchUp: CatchUp = async (tailEnd, emit) =>
+        (await fetchForward(sid, from, emit, signal, "frames")) &&
+        (await fetchForward(sid, tailEnd, emit, signal, "rows", 0));
+      await fetchTail(sid, lastSeq, catchUp, dispatch, setHasMoreOlder, signal);
     } else await fetchForward(sid, lastSeq.current, dispatch, signal);
   } catch {
     // Best effort.
   }
 }
 
+/** Runs after the tail loads and before it publishes; false withholds the tail. */
+type CatchUp = (tailEnd: number, emit: Dispatch) => Promise<boolean>;
+
 async function fetchTail(
   sid: string,
   lastSeq: { current: number },
-  applyFrames: boolean,
+  catchUp: CatchUp | null,
   dispatch: Dispatch,
   setHasMoreOlder: (value: boolean) => void,
   signal: AbortSignal,
-): Promise<number | null> {
+): Promise<void> {
+  const applyFrames = catchUp === null;
   const [tailRes, tailRowsRes] = await getReplayPair(sid, `before=${TAIL_BEFORE}&limit=${REPLAY_PAGE_SIZE}`, signal);
-  if (!tailRes.ok) return null;
+  if (!tailRes.ok) return;
   const tail = (await tailRes.json()) as ReplayPageResponse;
   signal.throwIfAborted();
   if (tail.lost) {
     dispatch({ kind: "lagged", skipped: tail.highest_seq });
-    return null;
+    return;
   }
-  if (!tailRowsRes.ok) return null;
+  if (!tailRowsRes.ok) return;
   let rows = toActivityRows(await readRows(tailRowsRes), sid);
   let cursor = tail.next_cursor ?? 0;
   let hasMore = tail.has_more ?? false;
@@ -109,7 +116,15 @@ async function fetchTail(
     cursor = next;
   }
   signal.throwIfAborted();
+  const caughtUp: Action[] = [];
+  if (catchUp && !(await catchUp(tail.highest_seq, (a) => caughtUp.push(a)))) {
+    signal.throwIfAborted();
+    caughtUp.filter((a) => a.kind === "lagged").forEach(dispatch);
+    return;
+  }
+  signal.throwIfAborted();
   dispatch({ kind: "frames", frames: applyFrames ? (tail.frames ?? []) : [], rows, oldestSeq: cursor });
+  caughtUp.forEach(dispatch);
   setHasMoreOlder(hasMore);
   if (applyFrames && tail.highest_seq > lastSeq.current) lastSeq.current = tail.highest_seq;
   if (needsHandshake) {
@@ -121,11 +136,11 @@ async function fetchTail(
     }
   }
   dispatch({ kind: "lagged_resolved" });
-  return tail.highest_seq;
 }
 
 type ForwardLegs = "both" | "frames" | "rows";
 
+/** Returns whether the catch-up completed; a failed request or a lost log ends it early with false. */
 async function fetchForward(
   sid: string,
   lastSeq: number,
@@ -133,7 +148,7 @@ async function fetchForward(
   signal: AbortSignal,
   legs: ForwardLegs = "both",
   overlap = REPLAY_OVERLAP,
-): Promise<void> {
+): Promise<boolean> {
   const firstSince = Math.max(0, lastSeq - overlap);
   let cursor = firstSince;
   let target: number | null = null;
@@ -145,7 +160,7 @@ async function fetchForward(
       getReplay(sid, rowsOnly ? `${params}&view=rows` : params, signal),
       legs === "both" ? getReplay(sid, `${params}&view=rows`, signal) : null,
     ]);
-    if (!res.ok || (rowsRes && !rowsRes.ok)) return;
+    if (!res.ok || (rowsRes && !rowsRes.ok)) return false;
     const data = (await res.json()) as ReplayPageResponse;
     const pageRows = rowsOnly ? (data.rows ?? []) : rowsRes ? await readRows(rowsRes) : [];
     signal.throwIfAborted();
@@ -156,7 +171,7 @@ async function fetchForward(
     }
     if (data.lost) {
       dispatch({ kind: "lagged", skipped: data.highest_seq });
-      return;
+      return false;
     }
     if ((data.frames ?? []).length > 0 || pageRows.length > 0) {
       dispatch({ kind: "frames", frames: data.frames ?? [], rows: toActivityRows(pageRows, sid) });
@@ -166,6 +181,7 @@ async function fetchForward(
     cursor = next;
   }
   dispatch({ kind: "lagged_resolved" });
+  return true;
 }
 
 /** Fetch the page below `before`. Returns whether more older history remains, or null on failure. */

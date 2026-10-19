@@ -95,6 +95,54 @@ describe("rows recovery for a cached cursor without history", () => {
     expect(requests.some((u) => u.includes("since=3000") && u.includes("view=rows"))).toBe(true);
   });
 
+  describe("interrupted catch-up", () => {
+    const tailPage = {
+      [TAIL]: {
+        rows: [row("u2", "user_prompt"), row("t2", "tool_start")],
+        next_cursor: 2100,
+        has_more: true,
+        highest_seq: 3000,
+      },
+    };
+    const interrupt = (onFrames: (url: string) => Response | void) => {
+      mockReplay(tailPage, { "3000": [row("new", "agent_message")] });
+      const fetchMock = globalThis.fetch as unknown as ReturnType<typeof vi.fn>;
+      const impl = fetchMock.getMockImplementation()!;
+      fetchMock.mockImplementation(async (url: string) =>
+        url.includes("since=850") && !url.includes("view=rows") ? (onFrames(url) ?? impl(url)) : impl(url),
+      );
+    };
+    const run = async (signal?: AbortSignal) => {
+      const actions: Parameters<typeof reducer>[1][] = [];
+      await fetchReplay(
+        "sid",
+        { current: 900 },
+        0,
+        (a) => actions.push(a),
+        vi.fn(),
+        signal ?? new AbortController().signal,
+      );
+      return actions;
+    };
+    // What the socket sends when it dials with since=900: the whole transcript, oldest first.
+    const snapshot = {
+      kind: "transcript_snapshot" as const,
+      rows: [row("u1", "user_prompt"), row("u2", "user_prompt")],
+    };
+
+    it.each([
+      ["a failed frames request", () => new Response("", { status: 500 })],
+      ["an abort", undefined],
+    ])("publishes no recovered tail after %s, so the socket snapshot stays chronological", async (_name, respond) => {
+      const abort = new AbortController();
+      interrupt(respond ?? (() => abort.abort()));
+      const actions = await run(abort.signal);
+      expect(actions.filter((a) => a.kind === "frames")).toEqual([]);
+      const state = [...actions, snapshot].reduce(reducer, { ...emptyAcpState(), lastSeq: 900 });
+      expect(state.activity.map((r) => r.id)).toEqual(["u1", "u2"]);
+    });
+  });
+
   it("only folds forward when history is already loaded", async () => {
     const requests = mockReplay({});
     await reopen(undefined, 900, 40);
