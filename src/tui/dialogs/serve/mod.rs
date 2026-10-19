@@ -183,24 +183,38 @@ enum RestartEffect {
     KeepsLogins,
     /// The Tunnel comes back on another host, which the old host-only cookie is not sent to.
     NewLink,
-    /// `auth.persist_sessions` is off, so a Tunnel restart drops every login.
+    /// Every login is dropped: the next start doesn't persist them, or the running daemon
+    /// only ever held them in memory.
     SignsOut,
+    /// A reattached daemon's login persistence is unknown, so retention can't be promised.
+    MaySignOut,
 }
 
 impl RestartEffect {
     /// Local mode signs in with the stable access token. A Tunnel keeps its host only when it
     /// is on Funnel and the restart takes the Funnel path again: `spawn_daemon` never
     /// re-creates a named Cloudflare tunnel, and without Funnel the server opens a fresh
-    /// quick tunnel.
-    fn of(mode: ServeMode, urls: &[ServeUrl], restart_on_funnel: bool, keeps_logins: bool) -> Self {
+    /// quick tunnel. Logins then survive only if the running daemon wrote them to disk and the
+    /// next start reads them back.
+    fn of(
+        mode: ServeMode,
+        urls: &[ServeUrl],
+        restart_on_funnel: bool,
+        running_persists: Option<bool>,
+        next_persists: bool,
+    ) -> Self {
         if mode == ServeMode::Local {
             RestartEffect::KeepsLogins
         } else if !(restart_on_funnel && urls.iter().any(|u| is_funnel_link(&u.url))) {
             RestartEffect::NewLink
-        } else if keeps_logins {
-            RestartEffect::KeepsLogins
-        } else {
+        } else if !next_persists {
             RestartEffect::SignsOut
+        } else {
+            match running_persists {
+                Some(true) => RestartEffect::KeepsLogins,
+                Some(false) => RestartEffect::SignsOut,
+                None => RestartEffect::MaySignOut,
+            }
         }
     }
 }
@@ -246,8 +260,11 @@ pub struct ServeView {
     mouse: RefCell<ServeMouse>,
     /// The label of the value a click last copied, shown for `FLASH_TTL`.
     copied: Option<(&'static str, Instant)>,
-    /// `auth.persist_sessions`: whether a Tunnel restart keeps Devices signed in.
-    keeps_logins: bool,
+    /// `auth.persist_sessions` as the next start will read it.
+    next_persists: bool,
+    /// The setting the running daemon started with, when this view started it; `None` for a
+    /// reattached daemon.
+    running_persists: Option<bool>,
     /// Whether a restart now would take the server's Funnel path. Both fields are refreshed
     /// when R, G or help is pressed: the probe shells out to `tailscale`.
     restart_on_funnel: bool,
@@ -280,7 +297,8 @@ impl ServeView {
             show_help: false,
             mouse: RefCell::default(),
             copied: None,
-            keeps_logins: persist_sessions(),
+            next_persists: persist_sessions(),
+            running_persists: None,
             restart_on_funnel: false,
         }
     }
@@ -472,8 +490,11 @@ impl ServeView {
         // Taken before spawning so only the new daemon's output counts as progress.
         let log_offset = log_file_size();
         let passphrase = (mode == ServeMode::Tunnel).then(|| self.pending_passphrase.clone());
+        // Read just before the daemon reads it at startup.
+        let persists = persist_sessions();
         self.state = match spawn_daemon(mode, passphrase.as_deref(), transport) {
             Ok(()) => {
+                self.running_persists = Some(persists);
                 remember_last_mode(mode);
                 ServeViewState::Starting {
                     mode,
@@ -527,7 +548,7 @@ impl ServeView {
                     self.restart(mode, transport, Some(new_pp));
                 } else {
                     self.restart_on_funnel = restart_on_funnel(mode, transport);
-                    self.keeps_logins = persist_sessions();
+                    self.next_persists = persist_sessions();
                     self.pending_confirm = Some((PendingConfirm::NewPassphrase, Instant::now()));
                 }
             }
@@ -542,14 +563,14 @@ impl ServeView {
                     self.restart(mode, transport, pp);
                 } else {
                     self.restart_on_funnel = restart_on_funnel(mode, transport);
-                    self.keeps_logins = persist_sessions();
+                    self.next_persists = persist_sessions();
                     self.pending_confirm = Some((PendingConfirm::Restart, Instant::now()));
                 }
             }
             KeyCode::Tab if urls.len() > 1 => *url_index = (*url_index + 1) % urls.len(),
             KeyCode::Char('?') => {
                 self.restart_on_funnel = restart_on_funnel(mode, transport);
-                self.keeps_logins = persist_sessions();
+                self.next_persists = persist_sessions();
                 self.show_help = true;
             }
             KeyCode::Esc | KeyCode::Char('q') => return ServeAction::Close,
@@ -594,8 +615,10 @@ impl ServeView {
         passphrase: Option<String>,
     ) {
         let log_offset = log_file_size();
+        let persists = persist_sessions();
         self.state = match restart_daemon(mode, passphrase.as_deref(), transport) {
             Ok(()) => {
+                self.running_persists = Some(persists);
                 if let Some(pp) = &passphrase {
                     remember_passphrase(pp);
                 }
@@ -741,20 +764,21 @@ mod tests {
                 show_help: false,
                 mouse: RefCell::default(),
                 copied: None,
-                keeps_logins: true,
+                next_persists: true,
+                running_persists: Some(true),
                 restart_on_funnel: false,
             };
             crate::session::config::update_config(|c| c.auth.persist_sessions = false).unwrap();
             view.handle_key(KeyEvent::from(KeyCode::Char(key)));
             assert!(
-                !view.keeps_logins,
+                !view.next_persists,
                 "{key} kept the value read when the view opened"
             );
             crate::session::config::update_config(|c| c.auth.persist_sessions = true).unwrap();
             view.pending_confirm = None;
             view.show_help = false;
             view.handle_key(KeyEvent::from(KeyCode::Char(key)));
-            assert!(view.keeps_logins, "{key}");
+            assert!(view.next_persists, "{key}");
         }
     }
 }

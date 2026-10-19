@@ -64,8 +64,13 @@ pub(super) fn render(view: &ServeView, frame: &mut Frame, area: Rect, theme: &Th
                 // Any click closes the overlay, so nothing beneath is a target.
                 mouse.keys.clear();
                 mouse.copies.clear();
-                let effect =
-                    RestartEffect::of(*mode, urls, view.restart_on_funnel, view.keeps_logins);
+                let effect = RestartEffect::of(
+                    *mode,
+                    urls,
+                    view.restart_on_funnel,
+                    view.running_persists,
+                    view.next_persists,
+                );
                 render_help_overlay(frame, area, theme, *mode, effect);
             }
         }
@@ -648,7 +653,13 @@ fn render_active(
     frame.render_widget(footer_block, footer);
     let footer_text = match view.pending_confirm.map(|(action, _)| action) {
         Some(action) => {
-            let effect = RestartEffect::of(*mode, urls, view.restart_on_funnel, view.keeps_logins);
+            let effect = RestartEffect::of(
+                *mode,
+                urls,
+                view.restart_on_funnel,
+                view.running_persists,
+                view.next_persists,
+            );
             let link = (effect == RestartEffect::NewLink)
                 .then_some("The link changes: re-scan and sign in again.");
             let (first, effects): (&str, &[&str]) = match (action, effect) {
@@ -666,6 +677,10 @@ fn render_active(
                 (PendingConfirm::Restart, RestartEffect::SignsOut) => (
                     "Press R again to restart.",
                     &["Every Device signs out; agents keep running."],
+                ),
+                (PendingConfirm::Restart, RestartEffect::MaySignOut) => (
+                    "Press R again to restart.",
+                    &["Devices may have to sign in again; agents keep running."],
                 ),
             };
             let rest = effects
@@ -754,6 +769,9 @@ fn render_help_overlay(
                 }
                 RestartEffect::SignsOut => {
                     "Restart the Daemon (every Device signs out; agents keep running)"
+                }
+                RestartEffect::MaySignOut => {
+                    "Restart the Daemon (Devices may sign in again; agents keep running)"
                 }
             },
         ),
@@ -908,7 +926,8 @@ mod tests {
             show_help: false,
             mouse: Default::default(),
             copied: None,
-            keeps_logins: true,
+            next_persists: true,
+            running_persists: Some(true),
             restart_on_funnel: false,
         };
         let mut term = Terminal::new(TestBackend::new(72, 26)).unwrap();
@@ -957,7 +976,8 @@ mod tests {
             show_help: false,
             mouse: Default::default(),
             copied: None,
-            keeps_logins: true,
+            next_persists: true,
+            running_persists: Some(true),
             restart_on_funnel: false,
         }
     }
@@ -1077,33 +1097,53 @@ mod tests {
             "new link, sign in again; agents keep running".to_string(),
         );
         let stays = (format!("{kept}."), kept.to_string());
-        // (mode, url, restart takes the Funnel path, auth.persist_sessions, key pressed once,
+        let signs_out = (
+            "Every Device signs out; agents keep running.".to_string(),
+            "every Device signs out; agents keep running".to_string(),
+        );
+        let on = Some(true);
+        // (mode, url, restart takes the Funnel path, running daemon's persist_sessions
+        //  (None = reattached), next start's persist_sessions, key pressed once,
         //  confirm after the first sentence, help R)
         let cases = [
-            // Local signs in with the stable token, so neither flag applies.
-            (Local, lan, false, false, R, stays.clone()),
-            (Tunnel, funnel, true, true, R, stays.clone()),
+            // Local signs in with the stable token, so none of the flags apply.
+            (Local, lan, false, None, false, R, stays.clone()),
+            (Tunnel, funnel, true, on, true, R, stays.clone()),
             // Tailscale went away (or Cloudflare was picked): the restart opens a quick tunnel.
-            (Tunnel, funnel, false, true, R, moved.clone()),
+            (Tunnel, funnel, false, on, true, R, moved.clone()),
             // spawn_daemon never re-creates a named tunnel, whether or not Funnel replaces it.
-            (Tunnel, named, false, true, R, moved.clone()),
-            (Tunnel, named, true, true, R, moved.clone()),
-            (Tunnel, quick, false, true, R, moved.clone()),
+            (Tunnel, named, false, on, true, R, moved.clone()),
+            (Tunnel, named, true, on, true, R, moved.clone()),
+            (Tunnel, quick, false, on, true, R, moved.clone()),
+            (Tunnel, funnel, true, on, false, R, signs_out.clone()),
+            // Logins the running daemon held only in memory are gone, whatever the next start reads.
             (
                 Tunnel,
                 funnel,
                 true,
-                false,
+                Some(false),
+                true,
+                R,
+                signs_out.clone(),
+            ),
+            // A reattached daemon's persistence is unknown.
+            (
+                Tunnel,
+                funnel,
+                true,
+                None,
+                true,
                 R,
                 (
-                    "Every Device signs out; agents keep running.".to_string(),
-                    "every Device signs out; agents keep running".to_string(),
+                    "Devices may have to sign in again; agents keep running.".to_string(),
+                    "Devices may sign in again; agents keep running".to_string(),
                 ),
             ),
             (
                 Tunnel,
                 funnel,
                 true,
+                on,
                 true,
                 G,
                 ("Every Device signs out.".to_string(), kept.to_string()),
@@ -1112,15 +1152,17 @@ mod tests {
                 Tunnel,
                 quick,
                 false,
+                on,
                 true,
                 G,
                 (format!("Every Device signs out. {link}"), String::new()),
             ),
         ];
         let theme = crate::tui::styles::load_theme("empire");
-        for (mode, url, restart_on_funnel, keeps_logins, key, (effects, help_restart)) in cases {
-            let case =
-                format!("{mode:?} {url} funnel={restart_on_funnel} persist={keeps_logins} {key:?}");
+        for (mode, url, restart_on_funnel, running, next, key, (effects, help_restart)) in cases {
+            let case = format!(
+                "{mode:?} {url} funnel={restart_on_funnel} running={running:?} next={next} {key:?}"
+            );
             let mut view = view(ServeViewState::Active {
                 mode,
                 transport: None,
@@ -1133,7 +1175,8 @@ mod tests {
                 opened_at: Instant::now(),
                 log_offset: 0,
             });
-            view.keeps_logins = keeps_logins;
+            view.running_persists = running;
+            view.next_persists = next;
             view.restart_on_funnel = restart_on_funnel;
             view.pending_confirm = Some((key, Instant::now()));
             let first = match key {
