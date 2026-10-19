@@ -1065,6 +1065,15 @@ export function fetchBranches(path: string, includeRemote = false): Promise<Bran
   return fetchJson<BranchInfo[]>(`/api/git/branches?${params.toString()}`);
 }
 
+export interface WorktreeInfo {
+  branch: string;
+  path: string;
+}
+
+export function fetchWorktrees(path: string): Promise<WorktreeInfo[] | null> {
+  return fetchJson<WorktreeInfo[]>(`/api/git/worktrees?${new URLSearchParams({ path }).toString()}`);
+}
+
 /** Null on a transient failure so callers stay optimistic. */
 export async function fetchIsGitRepo(path: string): Promise<boolean | null> {
   const params = new URLSearchParams({ path });

@@ -1,13 +1,15 @@
 // @vitest-environment jsdom
 
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 
 import { WorktreePanel } from "../steps/WorktreePanel";
 import { initialData, type WizardData } from "../wizardReducer";
 
+const fetchWorktrees = vi.hoisted(() => vi.fn().mockResolvedValue([]));
 vi.mock("../../../lib/api", () => ({
   fetchBranches: vi.fn().mockResolvedValue([]),
+  fetchWorktrees,
 }));
 
 afterEach(cleanup);
@@ -37,5 +39,27 @@ describe("WorktreePanel", () => {
   it("hides the base branch picker when attaching to an existing branch", () => {
     renderPanel({ attachExisting: true });
     expect(screen.queryByLabelText("Base branch")).toBeNull();
+  });
+
+  it("lists existing worktrees when attaching and fills the branch on pick", async () => {
+    fetchWorktrees.mockResolvedValue([
+      { branch: "main", path: "/repo/alpha" },
+      { branch: "feat/x", path: "/repo/alpha-wt/feat-x" },
+    ]);
+    const { onChange } = renderPanel({ attachExisting: true });
+    fireEvent.click(await screen.findByText("feat/x"));
+    expect(fetchWorktrees).toHaveBeenCalledWith("/repo/alpha");
+    expect(screen.getByText("/repo/alpha-wt/feat-x")).toBeTruthy();
+    expect(onChange).toHaveBeenCalledWith("worktreeBranch", "feat/x");
+  });
+
+  it("does not fetch worktrees when creating, and says so when none exist", async () => {
+    fetchWorktrees.mockClear();
+    renderPanel();
+    expect(fetchWorktrees).not.toHaveBeenCalled();
+    cleanup();
+    fetchWorktrees.mockResolvedValue(null);
+    renderPanel({ attachExisting: true });
+    await waitFor(() => expect(screen.getByText("No existing worktrees found.")).toBeTruthy());
   });
 });

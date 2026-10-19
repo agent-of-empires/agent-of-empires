@@ -1,4 +1,5 @@
-import { useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
+import { fetchWorktrees, type WorktreeInfo } from "../../../lib/api";
 import { useBranchSuggestions } from "./branchSuggestions";
 import { ToggleRow } from "./Toggle";
 import type { WizardData } from "../wizardReducer";
@@ -24,6 +25,7 @@ export function WorktreePanel({ data, onChange }: Props) {
         className="w-full bg-surface-900 border border-surface-700 rounded-lg px-3 py-2.5 text-base md:text-sm font-mono text-text-primary placeholder:text-text-dim focus:border-brand-600 focus:outline-none"
       />
       <p className="text-xs text-text-dim mt-1">The branch name is also the worktree directory name.</p>
+      {data.attachExisting && <ExistingWorktrees data={data} onChange={onChange} />}
 
       <ToggleRow
         className="mt-4 cursor-pointer"
@@ -35,6 +37,54 @@ export function WorktreePanel({ data, onChange }: Props) {
 
       {!data.attachExisting && <BaseBranchPicker data={data} onChange={onChange} />}
     </div>
+  );
+}
+
+/** Worktrees already on disk for the project; picking one fills the branch name. */
+function ExistingWorktrees({
+  data,
+  onChange,
+}: {
+  data: WizardData;
+  onChange: (field: string, value: unknown) => void;
+}) {
+  const [loaded, setLoaded] = useState<{ path: string; rows: WorktreeInfo[] } | null>(null);
+
+  useEffect(() => {
+    if (!data.path) return;
+    let cancelled = false;
+    fetchWorktrees(data.path).then((rows) => {
+      if (!cancelled) setLoaded({ path: data.path, rows: rows ?? [] });
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [data.path]);
+
+  if (loaded?.path !== data.path) return <p className="text-xs text-text-dim mt-2">Loading worktrees...</p>;
+  if (loaded.rows.length === 0) return <p className="text-xs text-text-dim mt-2">No existing worktrees found.</p>;
+
+  return (
+    <ul
+      aria-label="Existing worktrees"
+      className="mt-2 max-h-48 overflow-y-auto border border-surface-700/60 rounded-lg"
+    >
+      {loaded.rows.map((wt) => (
+        <li key={wt.path}>
+          <button
+            type="button"
+            aria-pressed={data.worktreeBranch === wt.branch}
+            onClick={() => onChange("worktreeBranch", wt.branch)}
+            className={`w-full text-left px-3 py-1.5 cursor-pointer ${
+              data.worktreeBranch === wt.branch ? "bg-surface-800" : "hover:bg-surface-800/60"
+            }`}
+          >
+            <span className="block text-sm font-mono text-text-primary truncate">{wt.branch}</span>
+            <span className="block text-xs font-mono text-text-dim truncate">{wt.path}</span>
+          </button>
+        </li>
+      ))}
+    </ul>
   );
 }
 

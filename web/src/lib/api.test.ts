@@ -156,6 +156,7 @@ const requestCases: RequestCase[] = [
   ["POST /api/app-state/web-tour-seen", () => api.markWebTourSeen(), { result: true }],
   ["GET /api/git/branches?path=%2Frepo", () => api.fetchBranches("/repo")],
   ["GET /api/git/branches?path=%2Frepo&include_remote=true", () => api.fetchBranches("/repo", true)],
+  ["GET /api/git/worktrees?path=%2Frepo", () => api.fetchWorktrees("/repo")],
   [
     "GET /api/git/is-repo?path=%2Fr",
     () => api.fetchIsGitRepo("/r"),
