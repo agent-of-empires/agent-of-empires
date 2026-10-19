@@ -20,8 +20,8 @@ these guidelines do not guarantee acceptance.
 - Fix the responsible layer, respect user configuration, and keep approved
   opt-in behavior opt-in. Reuse existing sources of truth; justify new dependencies
   and explain which build paths need them.
-- Keep unrelated improvements separate. Show the changed behavior working,
-  following the [testing guidance](AGENTS.md).
+- Keep unrelated improvements separate. Provide reproducible evidence and show
+  changed behavior working, following the [testing guidance](AGENTS.md).
 
 ## Setup
 
