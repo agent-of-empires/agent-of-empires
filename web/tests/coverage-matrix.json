@@ -1634,8 +1634,8 @@
       "id": "sidebar.project-row-header",
       "kind": "vitest",
       "risk": "medium",
-      "specs": ["src/components/__tests__/SidebarGroupHeader.test.tsx"],
-      "components": ["web/src/components/WorkspaceSidebar.tsx"]
+      "specs": ["src/components/__tests__/SidebarGroupHeader.test.tsx", "src/lib/__tests__/githubAvatar.test.ts"],
+      "components": ["web/src/components/WorkspaceSidebar.tsx", "web/src/components/OwnerAvatar.tsx"]
     },
     {
       "id": "sidebar.empty-state",

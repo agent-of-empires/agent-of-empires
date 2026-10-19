@@ -250,7 +250,7 @@ describe("buildOrgGroups", () => {
       ["zeta-corp@example.com", ["/repo-z"]],
       [NO_ORG_GROUP_ID, ["/repo-none", MULTI_REPO_GROUP_ID, SCRATCH_GROUP_ID]],
     ]);
-    expect(orgs[2]!.org).toMatchObject({ displayName: "No organization", remoteOwner: null });
+    expect(orgs[2]!.org).toMatchObject({ displayName: "No organization", remoteOwnerKey: null });
   });
 
   it("keeps same-named owners on different hosts apart", () => {
@@ -261,6 +261,11 @@ describe("buildOrgGroups", () => {
     expect(orgs.map((o) => [o.org.id, o.org.displayName, o.repos.map((r) => r.id)])).toEqual([
       ["acme@github.com", "acme", ["/repo-gh"]],
       ["acme@gitlab.com", "acme", ["/repo-gl"]],
+    ]);
+    // The host-scoped key reaches both headers, so the avatar can tell GitHub from GitLab.
+    expect(orgs.map((o) => [o.org.remoteOwnerKey, o.repos.map((r) => r.remoteOwnerKey)])).toEqual([
+      ["acme@github.com", ["acme@github.com"]],
+      ["acme@gitlab.com", ["acme@gitlab.com"]],
     ]);
   });
 

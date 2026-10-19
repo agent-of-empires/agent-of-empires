@@ -26,10 +26,6 @@
       "reason": "Toast presentation primitive; flows exercise it implicitly"
     },
     {
-      "path": "web/src/components/OwnerAvatar.tsx",
-      "reason": "Pure presentational avatar"
-    },
-    {
       "path": "web/src/components/OverflowMenu.tsx",
       "reason": "Presentational primitive; covered indirectly by sidebar specs"
     },
