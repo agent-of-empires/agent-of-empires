@@ -320,6 +320,10 @@ pub(super) fn build_router(state: Arc<AppState>) -> Router {
             "/api/sessions/{id}/acp/install-agent",
             post(api::install_agent),
         )
+        .route(
+            "/api/sessions/{id}/acp/install-info",
+            get(api::agent_install_info),
+        )
         .route("/api/sessions/{id}/acp", delete(api::shutdown_acp))
         .route(
             "/api/sessions/{id}/acp/switch-agent",
