@@ -87,8 +87,8 @@ pub struct PluginManifest {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub status: Vec<StatusContribution>,
 
-    /// Provider-native status and terminal prompt replies. Requires API v13
-    /// and the `session.integration` capability.
+    /// Provider-native status and terminal prompt replies require API v13;
+    /// approval-policy controls require v14. Both use `session.integration`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub agent_integrations: Vec<crate::agent_integration::AgentIntegrationContribution>,
 

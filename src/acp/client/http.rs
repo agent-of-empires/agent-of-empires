@@ -334,6 +334,26 @@ impl HttpClient {
         Ok(())
     }
 
+    /// Wait for the native adapter to acknowledge a reversible approval change.
+    pub async fn set_auto_approve(
+        &self,
+        session_id: &str,
+        enabled: bool,
+    ) -> Result<crate::session::auto_approve::AutoApproveResult, HttpError> {
+        let url = format!(
+            "{}/api/sessions/{}/auto-approve",
+            self.endpoint.base_url, session_id
+        );
+        let res = self
+            .auth(self.http.post(&url))
+            .timeout(std::time::Duration::from_secs(180))
+            .json(&serde_json::json!({ "enabled": enabled }))
+            .send()
+            .await?;
+        let res = check_status(res, session_id).await?;
+        Ok(res.json().await?)
+    }
+
     /// `POST /api/sessions/{id}/acp/enable`: switch a terminal-mode
     /// session to the structured view. The daemon tears down the tmux
     /// pane, persists `view = Structured`, and its reconciler spawns the

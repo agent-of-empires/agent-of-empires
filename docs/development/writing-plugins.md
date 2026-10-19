@@ -56,7 +56,7 @@ id = "my_plugin_pane"
 ```
 
 Pick an `id` outside the reserved `aoe.*` and `agent-of-empires.*` namespaces.
-Set `api_version` to the schema version you target (currently `13`) and
+Set `api_version` to the schema version you target (currently `14`) and
 `aoe_version` to the host range you have tested against. Every key is documented
 in the [Plugin API Reference](../plugin-api.md).
 

@@ -13,6 +13,8 @@ type Prompt =
 type Snapshot = {
   schema_version: 1; instance_id: string; provider_session_id: string; writer_pid: number;
   revision: number; status: "running" | "waiting" | "idle" | "error"; reply_keys: Key[]; prompt: Prompt | null;
+  auto_approve?: { enabled: boolean; reversible: boolean };
+  control_ack?: { request_id: string; revision: number; enabled: boolean; error: string | null };
 };
 type Reply = {
   schema_version: 1; instance_id: string; provider_session_id: string; writer_pid: number;
@@ -21,9 +23,34 @@ type Reply = {
 };
 type AskState = { id: string; questions: ExtensionAskDialogQuestion[]; accept: (result: ExtensionAskDialogResult) => boolean };
 type ApprovalState = { id: string; title: string; replyable: boolean };
+type Control = { schema_version: 1; instance_id: string; provider_session_id: string; writer_pid: number; revision: number; request_id: string; enabled: boolean };
+type ApprovalMode = "always-ask" | "write" | "yolo";
+type ApprovalSetting = { get(settings: unknown): ApprovalMode; override(settings: unknown, value: ApprovalMode): void };
+type ApprovalController = { state(): { enabled: boolean; reversible: boolean }; set(enabled: boolean): void };
+
+export function approvalController(setting: ApprovalSetting, settings: unknown, forced: boolean): ApprovalController {
+  const prior = setting.get(settings);
+  const safe = prior === "yolo" ? "always-ask" : prior;
+  return {
+    state: () => ({ enabled: forced || setting.get(settings) === "yolo", reversible: !forced }),
+    set(enabled: boolean) {
+      if (!enabled && forced) throw new Error("OMP was launched with --auto-approve/--yolo; restart and resume without the force flag to disable");
+      setting.override(settings, enabled ? "yolo" : safe);
+      if (this.state().enabled !== enabled) throw new Error("OMP did not acknowledge the requested approval policy");
+    },
+  };
+}
+
+export function validateControl(value: unknown, snapshot: Snapshot): value is Control {
+  return isRecord(value) && value.schema_version === 1 && value.instance_id === snapshot.instance_id &&
+    value.provider_session_id === snapshot.provider_session_id && value.writer_pid === snapshot.writer_pid &&
+    value.revision === snapshot.revision && typeof value.enabled === "boolean" &&
+    typeof value.request_id === "string" && UUID.test(value.request_id);
+}
 
 const SNAPSHOT_NAME = "integration-omp.agent-of-empires.json";
 const REPLY_NAME = "integration-omp.agent-of-empires.reply.json";
+const CONTROL_NAME = "integration-omp.agent-of-empires.control.json";
 const HEARTBEAT_MS = 5_000;
 const MAX_REPLY_BYTES = 1_048_576;
 const KEY: Key = { kind: "named", value: "F12" };
@@ -93,6 +120,20 @@ function readReply(file: string, uid: number, current: Snapshot): Reply | undefi
     if (!stat.isFile() || stat.uid !== uid || (stat.mode & 0o7777) !== 0o600 || stat.size > MAX_REPLY_BYTES) return undefined;
     const value: unknown = JSON.parse(readFileSync(descriptor, "utf8"));
     return validateReply(value, current) ? value : undefined;
+  } catch { return undefined; }
+  finally { if (descriptor !== undefined) closeSync(descriptor); }
+}
+
+function readControl(file: string, uid: number, current: Snapshot): Control | undefined {
+  let descriptor: number | undefined;
+  try {
+    descriptor = openSync(file, constants.O_RDONLY | constants.O_NOFOLLOW);
+    const stat = fstatSync(descriptor);
+    const age = Date.now() - stat.mtimeMs;
+    if (!stat.isFile() || stat.uid !== uid || (stat.mode & 0o7777) !== 0o600 ||
+        stat.size > MAX_REPLY_BYTES || age < 0 || age > 15_000) return undefined;
+    const value: unknown = JSON.parse(readFileSync(descriptor, "utf8"));
+    return validateControl(value, current) ? value : undefined;
   } catch { return undefined; }
   finally { if (descriptor !== undefined) closeSync(descriptor); }
 }
@@ -211,6 +252,7 @@ export default function (pi: ExtensionAPI): void {
   const dir = integrationDirectory(uid, instanceId);
   const snapshotPath = path.join(dir, SNAPSHOT_NAME);
   const replyPath = path.join(dir, REPLY_NAME);
+  const controlPath = path.join(dir, CONTROL_NAME);
   let sessionId = "";
   let revision = 0;
   let prompt: Prompt | null = null;
@@ -223,9 +265,20 @@ export default function (pi: ExtensionAPI): void {
   let approvalBindings: string[] = [];
   let cancelBindings: string[] = [];
   let handledPromptId: string | undefined;
+  let approval: ApprovalController | undefined;
+  let controlAck: Snapshot["control_ack"];
+  let controlPoll: NodeJS.Timeout | undefined;
+  let controlling = false;
+  let observedApproval: Snapshot["auto_approve"];
 
-  const currentSnapshot = (): Snapshot => ({ schema_version: 1, instance_id: instanceId, provider_session_id: sessionId,
-    writer_pid: process.pid, revision, status, reply_keys: [KEY], prompt });
+  const currentSnapshot = (): Snapshot => {
+    const policy = approval?.state();
+    if (observedApproval && policy && (policy.enabled !== observedApproval.enabled || policy.reversible !== observedApproval.reversible)) revision++;
+    observedApproval = policy;
+    return { schema_version: 1, instance_id: instanceId, provider_session_id: sessionId,
+      writer_pid: process.pid, revision, status, reply_keys: [KEY], prompt,
+      ...(policy ? { auto_approve: policy } : {}), ...(controlAck ? { control_ack: controlAck } : {}) };
+  };
   let writeQueue = Promise.resolve();
   const writeSnapshot = (): Promise<void> => {
     writeQueue = writeQueue.then(async () => {
@@ -280,6 +333,12 @@ export default function (pi: ExtensionAPI): void {
   pi.on("session_start", async (_event, ctx) => {
     sessionId = ctx.sessionManager.getSessionId();
     try {
+      // Optional host module: old OMP binaries and standalone plugin tests do not provide it.
+      const { lookup } = await import("@oh-my-pi/pi-coding-agent/config/registry");
+      approval = approvalController(lookup("tools.approvalMode"), pi.pi.settings,
+        process.argv.some(arg => ["--auto-approve", "--yolo", "-y"].includes(arg.split("=")[0])));
+    } catch { /* Older OMP versions expose no verified runtime policy control. */ }
+    try {
       const [{ appApproveKeys }, { getKeybindings }] = await Promise.all([
         import("@oh-my-pi/pi-tui/keybinding-matchers"),
         import("@oh-my-pi/pi-tui/keybindings"),
@@ -331,6 +390,22 @@ export default function (pi: ExtensionAPI): void {
     });
     await writeSnapshot();
     heartbeat = setInterval(() => void writeSnapshot(), HEARTBEAT_MS);
+    // A sidecar is polled rather than injecting keys or answering an open dialog.
+    if (approval) controlPoll = setInterval(async () => {
+      if (controlling || !safeDirectorySync(root, uid) || !safeDirectorySync(dir, uid)) return;
+      const control = readControl(controlPath, uid, currentSnapshot());
+      if (!control || controlAck?.request_id === control.request_id) return;
+      controlling = true;
+      try {
+        await unlink(controlPath);
+        let error: string | null = null;
+        try { approval!.set(control.enabled); } catch (cause) { error = cause instanceof Error ? cause.message : String(cause); }
+        controlAck = { request_id: control.request_id, revision: control.revision, enabled: approval!.state().enabled, error };
+        revision++;
+        await writeSnapshot();
+      } catch { /* A removed/replaced request is not authority to change policy. */ }
+      finally { controlling = false; }
+    }, 100);
   });
 
   pi.on("tool_approval_requested", event => {
@@ -343,6 +418,7 @@ export default function (pi: ExtensionAPI): void {
   pi.on("agent_end", () => { if (prompt === null) publish(null, "idle"); });
   pi.on("session_shutdown", async () => {
     clearInterval(heartbeat);
+    clearInterval(controlPoll);
     unlisten?.();
     await writeQueue;
     if (safeDirectorySync(root, uid) && safeDirectorySync(dir, uid) &&

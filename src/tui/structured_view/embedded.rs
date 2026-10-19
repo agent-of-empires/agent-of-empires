@@ -181,7 +181,7 @@ impl EmbeddedView {
     /// expire the toast and surface the next queued plugin
     /// notification. Returns `true` when something visible changed.
     pub fn tick(&mut self) -> bool {
-        let mut changed = false;
+        let mut changed = super::poll_auto_approve(&mut self.state, &mut self.toast_deadline);
         if let Some(deadline) = self.toast_deadline {
             if Instant::now() >= deadline {
                 self.state.toast = None;

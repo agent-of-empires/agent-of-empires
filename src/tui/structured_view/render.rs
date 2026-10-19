@@ -93,8 +93,10 @@ fn render_choice_picker(
     picker: &super::state::ChoicePicker,
 ) {
     const CHOICE_PICKER_MAX_ROWS: usize = 8;
+    let auto_approve = matches!(picker.purpose, super::state::ChoicePurpose::AutoApprove);
+    let notice_rows = if auto_approve { 2 } else { 0 };
     let max_rows = (composer_area.y as usize)
-        .saturating_sub(2)
+        .saturating_sub(2 + notice_rows)
         .min(CHOICE_PICKER_MAX_ROWS);
     if max_rows == 0 || picker.options.is_empty() {
         return;
@@ -121,6 +123,16 @@ fn render_choice_picker(
             } else {
                 Style::default()
             },
+        )));
+    }
+    if auto_approve {
+        lines.push(Line::from(Span::styled(
+            "May restart/resume, interrupting the turn.",
+            Style::default().fg(theme.waiting),
+        )));
+        lines.push(Line::from(Span::styled(
+            "Codex: changes apply on the next turn.",
+            Style::default().fg(theme.hint),
         )));
     }
     let desired = lines.len() as u16 + 2;
@@ -1156,7 +1168,7 @@ fn render_composer(
             "Editing queued message {pos} of {total} (Enter=save, Esc=restore draft, ↑/↓=browse)"
         )
     } else if active {
-        String::new()
+        "F4 auto-approve".to_string()
     } else {
         "Press Enter to reply".to_string()
     };

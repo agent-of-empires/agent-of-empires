@@ -40,6 +40,10 @@ pub struct AgentIntegrationSnapshot {
     pub status: AgentIntegrationStatus,
     pub reply_keys: Vec<AgentIntegrationKey>,
     pub prompt: Option<AgentIntegrationPrompt>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto_approve: Option<IntegrationAutoApprove>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub control_ack: Option<IntegrationControlAck>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -122,4 +126,33 @@ pub struct AgentIntegrationReply<'a> {
     pub prompt_id: &'a str,
     pub response_id: String,
     pub response: AgentIntegrationResponse,
+}
+
+/// An observed runtime policy, not the session's intended launch setting.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct IntegrationAutoApprove {
+    pub enabled: bool,
+    pub reversible: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct IntegrationControlAck {
+    pub request_id: String,
+    pub revision: u64,
+    pub enabled: bool,
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct IntegrationControl<'a> {
+    pub schema_version: u32,
+    pub instance_id: &'a str,
+    pub provider_session_id: &'a str,
+    pub writer_pid: u32,
+    pub revision: u64,
+    pub request_id: &'a str,
+    pub enabled: bool,
 }

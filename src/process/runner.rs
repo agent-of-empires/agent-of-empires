@@ -1298,16 +1298,31 @@ impl RunnerShared {
         if let Some(cached) = self.handshake.lock().await.session.clone() {
             return Ok(cached);
         }
+        // Load responses omit identity; the request names the conversation.
+        let loaded_session_id = if method == "session/load" {
+            Some(
+                request
+                    .get("sessionId")
+                    .and_then(|value| value.as_str())
+                    .ok_or_else(|| transport_error("session/load request missing sessionId"))?
+                    .to_owned(),
+            )
+        } else {
+            None
+        };
         let response = self
             .agent_request(agent_stdin, method, request)
             .await
             .ok_or_else(|| transport_error(&format!("agent closed before answering {method}")))?;
         let result = handshake_result(&response)?;
-        let acp_session_id = result
-            .get("sessionId")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| transport_error(&format!("{method} response missing sessionId")))?
-            .to_string();
+        let acp_session_id = match loaded_session_id {
+            Some(id) => id,
+            None => result
+                .get("sessionId")
+                .and_then(|value| value.as_str())
+                .ok_or_else(|| transport_error(&format!("{method} response missing sessionId")))?
+                .to_owned(),
+        };
         let cached = (acp_session_id, result);
         self.handshake.lock().await.session = Some(cached.clone());
         Ok(cached)

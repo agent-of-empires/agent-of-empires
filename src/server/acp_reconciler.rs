@@ -1593,7 +1593,15 @@ async fn build_spawn_request(
     // while this respawn was queued still lands: the handshake re-applies it
     // through the agent's thought-level config option, and a None means the
     // session inherits whatever the configured default resolves to.
-    let (cwd, seed_history_replay, fork_from, acp_mode_id, acp_effort) = {
+    let (
+        cwd,
+        seed_history_replay,
+        fork_from,
+        acp_mode_id,
+        acp_effort,
+        yolo_mode,
+        auto_approve_managed,
+    ) = {
         let _guard = inst_lock.lock().await;
         let instances = service.instances.read().await;
         let Some(inst) = instances.iter().find(|i| i.id == target.id) else {
@@ -1605,6 +1613,8 @@ async fn build_spawn_request(
             inst.fork_pending.clone(),
             inst.acp_mode_id.clone(),
             inst.acp_effort.clone(),
+            inst.yolo_mode,
+            inst.auto_approve_managed,
         )
     };
     let agent = supervisor
@@ -1653,7 +1663,8 @@ async fn build_spawn_request(
         fork_from,
         sandbox_info,
         source_profile: Some(target.source_profile.clone()),
-        yolo_mode: target.yolo_mode,
+        yolo_mode,
+        auto_approve_managed,
         acp_mode_id,
         agent_command_override: command_override_for_spawn(&target.tool, &target.command),
         seed_history_replay,
@@ -1939,7 +1950,7 @@ mod tests {
     /// current project_path under the instance_lock so the respawn lands at
     /// the new path; using the stale target path is the crash-loop in #2260.
     #[tokio::test]
-    async fn build_spawn_request_uses_live_project_path_not_stale_target() {
+    async fn build_spawn_request_uses_live_path_and_approval_policy_over_stale_target() {
         use super::{build_spawn_request, ResumeTarget};
         use crate::server::test_support::build_test_app_state;
         use crate::session::{Instance, View};
@@ -1949,19 +1960,22 @@ mod tests {
         let mut inst = Instance::new("renamed", new_path);
         inst.id = "sess-2260".to_string();
         inst.view = View::Structured; // structured, non-sandboxed
+        inst.tool = "omp".into();
+        inst.yolo_mode = false;
+        inst.auto_approve_managed = true;
         let state = build_test_app_state(vec![inst]);
 
         // The reconciler snapshotted the pre-move path a tick ago.
         let target = ResumeTarget {
             id: "sess-2260".to_string(),
-            tool: "claude".to_string(),
-            agent_override: Some("claude".to_string()),
+            tool: "omp".to_string(),
+            agent_override: Some("omp".to_string()),
             model: None,
             project_path: "/tmp/aoe-2260-before-rename".to_string(),
             stored_acp_session_id: None,
             source_profile: "default".to_string(),
             in_flight_turn: false,
-            yolo_mode: false,
+            yolo_mode: true,
             command: String::new(),
         };
 
@@ -1972,6 +1986,10 @@ mod tests {
             req.cwd,
             PathBuf::from(new_path),
             "respawn must target the current project_path, not the stale snapshot"
+        );
+        assert!(
+            !req.yolo_mode && req.auto_approve_managed,
+            "a queued respawn must not re-enable the stale bypass policy"
         );
     }
 

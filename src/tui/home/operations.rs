@@ -424,6 +424,7 @@ impl HomeView {
             if target_tool != current_tool {
                 self.mutate_instance(&id, |inst| {
                     inst.tool = target_tool.to_string();
+                    inst.auto_approve_managed = false;
                 });
             }
         }
@@ -551,37 +552,40 @@ impl HomeView {
                 return Ok(());
             }
 
-            // #2541: a permanent delete of a trashed session is a purge that can
-            // race a restore from another process. Win the Purge claim under the
-            // flock before the unlocked teardown; refuse if a peer restore holds
-            // a fresh claim. A live-session delete has no restore to race, so it
-            // skips the claim.
+            // Permanent deletion must claim live and trashed rows alike so an
+            // in-flight policy change cannot race teardown. Preserve the
+            // snapshot for the restore-race commit on trashed rows.
             let was_trashed = self.get_instance(&id).is_some_and(|i| i.is_trashed());
-            if was_trashed {
-                match self.claim_trashed_purge(&id, was_trashed) {
-                    Ok(crate::session::claim::PurgeClaimDecision::Claimed) => {
-                        self.purge_claimed.insert(id.clone());
-                    }
-                    Ok(crate::session::claim::PurgeClaimDecision::Restored)
-                    | Ok(crate::session::claim::PurgeClaimDecision::RestoreInProgress) => {
-                        self.info_dialog = Some(InfoDialog::new(
-                            "Restore in progress",
-                            "This session is being restored by another process; it was not deleted.",
-                        ));
-                        return Ok(());
-                    }
-                    Ok(crate::session::claim::PurgeClaimDecision::AlreadyGone) => {
-                        self.drop_peer_deleted_rows(std::slice::from_ref(&id));
-                        self.rebuild_flat_items();
-                        return Ok(());
-                    }
-                    Err(()) => {
-                        self.info_dialog = Some(InfoDialog::new(
-                            "Delete Failed",
-                            "Could not claim the delete under the storage lock. Try again.",
-                        ));
-                        return Ok(());
-                    }
+            match self.claim_trashed_purge(&id, was_trashed) {
+                Ok(crate::session::claim::PurgeClaimDecision::Claimed) => {
+                    self.purge_claimed.insert(id.clone(), was_trashed);
+                }
+                Ok(crate::session::claim::PurgeClaimDecision::Restored)
+                | Ok(crate::session::claim::PurgeClaimDecision::RestoreInProgress) => {
+                    self.info_dialog = Some(InfoDialog::new(
+                        "Restore in progress",
+                        "This session is being restored by another process; it was not deleted.",
+                    ));
+                    return Ok(());
+                }
+                Ok(crate::session::claim::PurgeClaimDecision::AutoApproveInProgress) => {
+                    self.info_dialog = Some(InfoDialog::new(
+                        "Auto-approve change in progress",
+                        "Wait for this session's approval change before deleting it.",
+                    ));
+                    return Ok(());
+                }
+                Ok(crate::session::claim::PurgeClaimDecision::AlreadyGone) => {
+                    self.drop_peer_deleted_rows(std::slice::from_ref(&id));
+                    self.rebuild_flat_items();
+                    return Ok(());
+                }
+                Err(()) => {
+                    self.info_dialog = Some(InfoDialog::new(
+                        "Delete Failed",
+                        "Could not claim the delete under the storage lock. Try again.",
+                    ));
+                    return Ok(());
                 }
             }
 
@@ -646,7 +650,11 @@ impl HomeView {
     /// Purge claim, else drop the row. `Ok(true)` = kept (restored mid-purge),
     /// `Ok(false)` = removed, `Err(())` = storage failure (the row is untouched
     /// on disk, so the caller must not treat it as removed). See #2541.
-    pub(super) fn finalize_claimed_purge(&mut self, id: &str) -> Result<bool, ()> {
+    pub(super) fn finalize_claimed_purge(
+        &mut self,
+        id: &str,
+        was_trashed: bool,
+    ) -> Result<bool, ()> {
         let Some(profile) = self.instances.get(id).map(|i| i.source_profile.clone()) else {
             return Ok(false);
         };
@@ -656,7 +664,7 @@ impl HomeView {
         storage
             .update(|insts, _groups| {
                 Ok(matches!(
-                    crate::session::claim::finalize_purge_removal(insts, id, true),
+                    crate::session::claim::finalize_purge_removal(insts, id, was_trashed),
                     crate::session::claim::PurgeCommit::KeptRestored
                 ))
             })
@@ -1675,34 +1683,57 @@ impl HomeView {
     /// `Instance::stop` runs on the `StopPoller`, #1496). A structured-view
     /// worker is reaped by the daemon reconciler once the row reads trashed.
     pub(super) fn trash_session_by_id(&mut self, id: &str) {
-        // The trash marker and the in-flight Trash claim land in ONE flock
-        // acquisition (the same-flock post_disk hook), mirroring the CLI and
-        // server sites, so a peer can never read a trashed row without its
-        // claim. The claim goes through the hook rather than the mutate
-        // because `merge_user_action_diff` deliberately drops `op_claim`
-        // (#2541). Best-effort: a refused claim (fresh peer purge/restore)
-        // still tears down, gated by the pre-move re-check and the locked
-        // relocation commit.
-        let outcome = self.apply_user_action_with(
-            id,
-            |inst| inst.trash(),
-            |disk| {
-                if let Err(holder) = disk.try_claim(
-                    crate::session::ClaimOp::Trash,
-                    crate::session::Instance::OP_CLAIM_TTL,
-                    chrono::Utc::now(),
-                ) {
-                    tracing::info!(
-                        target: "tui.session",
-                        session = %disk.id,
-                        "trash teardown runs unclaimed; a fresh {holder:?} claim holds the row"
-                    );
-                }
-            },
-        );
-        if let Err(e) = outcome {
-            tracing::warn!(target: "tui.session", session = %id, "trash failed: {e}");
+        let Some(profile) = self
+            .instances
+            .get(id)
+            .map(|inst| inst.source_profile.clone())
+        else {
             return;
+        };
+        let Some(storage) = self.storages.get(&profile) else {
+            tracing::warn!(target: "tui.session", session = %id, "trash claim has no storage");
+            return;
+        };
+        let claim_id = id.to_owned();
+        let decision = storage.update(|instances, _groups| {
+            Ok(crate::session::claim::decide_trash_claim(
+                instances,
+                &claim_id,
+                chrono::Utc::now(),
+            ))
+        });
+        match decision {
+            Ok(crate::session::claim::TrashClaimDecision::Claimed) => {}
+            Ok(crate::session::claim::TrashClaimDecision::AutoApproveInProgress) => {
+                self.info_dialog = Some(InfoDialog::new(
+                    "Auto-approve change in progress",
+                    "Wait for this session's approval change before moving it to trash.",
+                ));
+                return;
+            }
+            Ok(crate::session::claim::TrashClaimDecision::PurgeInProgress)
+            | Ok(crate::session::claim::TrashClaimDecision::RestoreInProgress) => {
+                self.info_dialog = Some(InfoDialog::new(
+                    "Session lifecycle operation in progress",
+                    "Wait for the current operation before moving this session to trash.",
+                ));
+                return;
+            }
+            Ok(crate::session::claim::TrashClaimDecision::AlreadyGone) => {
+                self.drop_peer_deleted_rows(&[id.to_string()]);
+                return;
+            }
+            Err(error) => {
+                tracing::warn!(target: "tui.session", session = %id, "trash claim failed: {error}");
+                self.info_dialog = Some(InfoDialog::new(
+                    "Trash Failed",
+                    "Could not claim this session under the storage lock. Try again.",
+                ));
+                return;
+            }
+        }
+        if let Some(inst) = self.instances.get_mut(id) {
+            inst.trash();
         }
         // The row is durably trashed; hand the blocking teardown (tmux kill,
         // container stop, worktree relocation) to the worker. The relocated
@@ -1775,6 +1806,12 @@ impl HomeView {
                 self.info_dialog = Some(crate::tui::dialogs::InfoDialog::new(
                     "Restore Failed",
                     "This session is being purged by another process; it was not restored.",
+                ));
+            }
+            RestoreFromTrash::AutoApproveInProgress => {
+                self.info_dialog = Some(crate::tui::dialogs::InfoDialog::new(
+                    "Restore Failed",
+                    "This session is changing auto-approve; it was not restored.",
                 ));
             }
             RestoreFromTrash::WorktreeFailed { reason } => {
@@ -1871,10 +1908,11 @@ impl HomeView {
             }
             match self.claim_trashed_purge(&id, true) {
                 Ok(crate::session::claim::PurgeClaimDecision::Claimed) => {
-                    self.purge_claimed.insert(id.clone());
+                    self.purge_claimed.insert(id.clone(), true);
                 }
                 Ok(crate::session::claim::PurgeClaimDecision::Restored)
-                | Ok(crate::session::claim::PurgeClaimDecision::RestoreInProgress) => continue,
+                | Ok(crate::session::claim::PurgeClaimDecision::RestoreInProgress)
+                | Ok(crate::session::claim::PurgeClaimDecision::AutoApproveInProgress) => continue,
                 Ok(crate::session::claim::PurgeClaimDecision::AlreadyGone) => {
                     self.drop_peer_deleted_rows(std::slice::from_ref(&id));
                     continue;
@@ -2006,6 +2044,7 @@ enum RestoreFromTrash {
     },
     AlreadyGone,
     PurgeInProgress,
+    AutoApproveInProgress,
     WorktreeFailed {
         reason: String,
     },
@@ -2039,6 +2078,9 @@ fn restore_from_trash_with_storage(storage: &Storage, id: &str) -> RestoreFromTr
         }
         crate::session::claim::RestoreClaimDecision::PurgeInProgress => {
             return RestoreFromTrash::PurgeInProgress
+        }
+        crate::session::claim::RestoreClaimDecision::AutoApproveInProgress => {
+            return RestoreFromTrash::AutoApproveInProgress
         }
     }
 

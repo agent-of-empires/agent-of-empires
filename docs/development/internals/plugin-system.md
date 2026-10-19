@@ -187,15 +187,16 @@ dependency arrow runs consumer -> substrate):
 `PluginManifest` extends past identity to the contribution sections a plugin
 declares: `capabilities`, `commands`, `keybinds`, `settings`, `ui`,
 `agent_integrations`, and a `runtime` worker entrypoint. They are defined in
-`aoe-plugin-api` and parsed and validated by the host. `api_version` is now 13
+`aoe-plugin-api` and parsed and validated by the host. `api_version` is now 14
 (bumped to 2 for the contribution sections, 3 when the `detail-panel` slot
 became the dockable `pane` slot, 4 for `status` and `aoe_version`, 5 for
 screenshots, 6 for command actions, 7 for identity icons, 8 for the
 `composer-action` slot, 9 for ACP-capability discovery, host-owned sessions,
 plugin-private storage, and structured settings widgets, 10 for the
 `settings-page` and `tool-card-badge` slots, 11 for ACP capability probes and
-related session and setting fields, 12 for richer pane blocks, and 13 for
-provider-native session integrations). Older manifests still load as long as
+related session and setting fields, 12 for richer pane blocks, 13 for
+provider-native session integrations, and 14 for native approval-policy controls
+and acknowledgements). Older manifests still load as long as
 they target no newer field. Unknown top-level keys remain a hard parse error
 (`deny_unknown_fields`).
 
@@ -333,8 +334,17 @@ data, host state, the OS, or the network. The v1 set
 `browser_open`, `composer.read`, `composer.write`, `session.integration`, and
 ACP capabilities. A plugin's own declared settings need no `config.*`; that
 gates host/global or other-plugin config. `session.integration` grants
-provider status observation and user-requested terminal replies for a declared
-agent; it does not grant OMP plugin code or bypass native approval.
+provider status observation, user-requested terminal replies, and explicit
+approval-policy controls for a declared agent. It does not authorize OMP plugin
+code or make AoE an approval broker.
+
+API 14 integration snapshots can advertise `auto_approve` (`enabled`,
+`reversible`) and `control_ack` (`request_id`, request `revision`, observed
+`enabled`, optional `error`). A private `integration-<plugin-id>.control.json`
+request binds the instance, provider session, writer PID, revision, and UUID.
+The native provider validates ownership, mode, freshness, and identity before
+changing its policy; AoE waits for the matching acknowledgement before writing
+the session's launch policy. Controls do not inject keys or answer open prompts.
 
 Capabilities are open strings (`CapabilityId`), so a follow-up can add one
 without an `api_version` bump. An unknown capability still parses (forward

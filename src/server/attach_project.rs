@@ -348,6 +348,7 @@ async fn spawn_worker(state: &Arc<AppState>, id: &str) -> WorkerOutcome {
             sandbox_info: inst.sandbox_info.clone(),
             source_profile: Some(inst.source_profile.clone()),
             yolo_mode: inst.yolo_mode,
+            auto_approve_managed: inst.auto_approve_managed,
             acp_mode_id: inst.acp_mode_id.clone(),
             agent_command_override: crate::server::acp_reconciler::command_override_for_spawn(
                 &inst.tool,

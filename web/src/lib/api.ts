@@ -2301,6 +2301,36 @@ export async function setSessionPin(id: string, pinned: boolean): Promise<Sessio
   }
 }
 
+export interface AutoApproveResult {
+  enabled: boolean;
+  restarted: boolean;
+}
+
+/** Change runtime approval policy; only the acknowledged response is authoritative. */
+export async function setSessionAutoApprove(id: string, enabled: boolean): Promise<AutoApproveResult> {
+  const res = await fetch(`/api/sessions/${encodeURIComponent(id)}/auto-approve`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ enabled }),
+  });
+  if (!res.ok) {
+    const text = await res.text();
+    let message = text;
+    try {
+      const detail = JSON.parse(text);
+      message = detail.message || detail.error || text;
+    } catch {
+      // Proxies may return a plain-text rejection.
+    }
+    throw new Error(message || `Auto-approve failed (HTTP ${res.status})`);
+  }
+  const result = (await res.json()) as AutoApproveResult;
+  if (result?.enabled !== enabled || typeof result?.restarted !== "boolean") {
+    throw new Error("Agent did not acknowledge the auto-approve change");
+  }
+  return result;
+}
+
 /** Set (or clear, with `null`) a session's color label. Rendered as a colored
  *  status dot in the sidebar; the palette is `red` / `amber` / `green`. Also
  *  settable from the CLI via `aoe session color`. See #2383. */

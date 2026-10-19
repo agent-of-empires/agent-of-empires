@@ -88,38 +88,40 @@ pub async fn run(profile: &str, args: RemoveArgs) -> Result<()> {
     // artifact so it can be restored. Mirrors the archive CLI's tmux
     // teardown. See #2489.
     if config.session.delete_to_trash && !args.purge {
+        let decision = storage.update(|all_instances, _groups| {
+            Ok(crate::session::claim::decide_trash_claim(
+                all_instances,
+                &removed_id,
+                Utc::now(),
+            ))
+        })?;
+        match decision {
+            crate::session::claim::TrashClaimDecision::Claimed => {}
+            crate::session::claim::TrashClaimDecision::AutoApproveInProgress => {
+                anyhow::bail!(
+                    "Session {} has an auto-approve change in progress",
+                    removed_title
+                );
+            }
+            crate::session::claim::TrashClaimDecision::PurgeInProgress
+            | crate::session::claim::TrashClaimDecision::RestoreInProgress => {
+                anyhow::bail!(
+                    "Session {} has another lifecycle operation in progress",
+                    removed_title
+                );
+            }
+            crate::session::claim::TrashClaimDecision::AlreadyGone => {
+                anyhow::bail!(
+                    "Session {} was removed by another process before it could be trashed",
+                    removed_title
+                );
+            }
+        }
+
         if let Err(e) = inst.kill() {
             eprintln!("Warning: failed to kill agent tmux session: {}", e);
         }
         inst.kill_ancillary_tmux_sessions();
-
-        let landed = storage.update(|all_instances, _groups| {
-            if let Some(stored) = all_instances.iter_mut().find(|i| i.id == removed_id) {
-                stored.trash();
-                // Mark the teardown in flight (ClaimOp::Trash) so peers
-                // observe it as durable state. Best-effort: a refused claim
-                // still tears down, gated by the pre-move re-check and the
-                // locked relocation commit.
-                if let Err(holder) =
-                    stored.try_claim(ClaimOp::Trash, Instance::OP_CLAIM_TTL, Utc::now())
-                {
-                    tracing::info!(
-                        target: "cli.session",
-                        session = %stored.id,
-                        "trash teardown runs unclaimed; a fresh {holder:?} claim holds the row"
-                    );
-                }
-                Ok(true)
-            } else {
-                Ok(false)
-            }
-        })?;
-        if !landed {
-            anyhow::bail!(
-                "Session {} was removed by another process before it could be trashed",
-                removed_title
-            );
-        }
 
         // The session is durably trashed; stop its sandbox container (so it
         // doesn't keep running for the whole retention window) and move its
@@ -253,6 +255,12 @@ pub async fn run(profile: &str, args: RemoveArgs) -> Result<()> {
         crate::session::claim::PurgeClaimDecision::RestoreInProgress => {
             anyhow::bail!(
                 "Session {} is being restored by another process, so it was not purged",
+                removed_title
+            );
+        }
+        crate::session::claim::PurgeClaimDecision::AutoApproveInProgress => {
+            anyhow::bail!(
+                "Session {} is changing auto-approve, so it was not purged",
                 removed_title
             );
         }

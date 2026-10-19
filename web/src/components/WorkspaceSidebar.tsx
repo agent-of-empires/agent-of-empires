@@ -128,6 +128,7 @@ import { StatusGlyph } from "./StatusGlyph";
 import { OwnerAvatar } from "./OwnerAvatar";
 import { EmptyTrashConfirm } from "./EmptyTrashConfirm";
 import { SessionGroupModal } from "./SessionGroupModal";
+import { AutoApproveDialog } from "./AutoApproveDialog";
 import { SidebarSortPicker } from "./SidebarSortPicker";
 import { Tooltip } from "./Tooltip";
 import { PluginRowLine } from "./plugin/PluginSlots";
@@ -354,6 +355,7 @@ interface Props {
   onStartSession?: (workspaceId: string) => void;
   onSwitchView?: (sessionId: string, toStructured: boolean) => void;
   readOnly?: boolean;
+  cityhall?: boolean;
   /** When false (CityHall client mode), the Projects management section is
    *  hidden so end users cannot add, edit, or remove projects. Defaults to
    *  true. See #7. */
@@ -846,6 +848,7 @@ function SortableSessionRow({
   onSwitchView?: (sessionId: string, toStructured: boolean) => void;
   onCreateSession?: (repoPath: string) => void;
   readOnly?: boolean;
+  cityhall?: boolean;
   dragDisabled?: boolean;
   optimistic: OptimisticTriage;
   onPinToggle: (ws: Workspace, pinned: boolean) => void;
@@ -970,6 +973,7 @@ export const SessionRow = memo(function SessionRow({
   onSwitchView,
   onCreateSession,
   readOnly,
+  cityhall,
   indented,
   optimistic,
   onPinToggle,
@@ -996,6 +1000,7 @@ export const SessionRow = memo(function SessionRow({
   // and the latest session's options), mirroring the per-project "+" button.
   onCreateSession?: (repoPath: string) => void;
   readOnly?: boolean;
+  cityhall?: boolean;
   indented?: boolean;
   // Optimistic triage overlay for this row plus the parent-owned mutation
   // callbacks. Triage state used to live in the row as three `useState`s;
@@ -1279,6 +1284,7 @@ export const SessionRow = memo(function SessionRow({
     scope: RowContextScope;
   } | null>(null);
   const [renaming, setRenaming] = useState(false);
+  const [autoApproveOpen, setAutoApproveOpen] = useState(false);
   const [renameValue, setRenameValue] = useState(label);
   const renameRef = useRef<HTMLInputElement>(null);
   const sessionGroup = firstSession?.group_path ?? "";
@@ -1783,6 +1789,18 @@ export const SessionRow = memo(function SessionRow({
                     Edit group
                   </button>
                 )}
+                {!readOnly && !cityhall && firstSession && (
+                  <button
+                    onClick={() => {
+                      setContextMenu(null);
+                      setAutoApproveOpen(true);
+                    }}
+                    data-testid="sidebar-context-menu-auto-approve"
+                    className={CTX_ITEM}
+                  >
+                    Auto-approve…
+                  </button>
+                )}
                 {!readOnly && firstSession && (firstSession.view === "structured" || firstSession.acp_capable) && (
                   <button
                     onClick={handleSwitchView}
@@ -2030,6 +2048,18 @@ export const SessionRow = memo(function SessionRow({
             title={label}
             onCancel={() => setSnoozeModalOpen(false)}
             onPick={(minutes) => void applySnooze(minutes)}
+          />,
+          document.body,
+        )}
+      {autoApproveOpen &&
+        !readOnly &&
+        !cityhall &&
+        firstSession &&
+        createPortal(
+          <AutoApproveDialog
+            sessionId={firstSession.id}
+            sessionTitle={sessionTitle || label}
+            onClose={() => setAutoApproveOpen(false)}
           />,
           document.body,
         )}
@@ -3111,6 +3141,7 @@ export function WorkspaceSidebar({
   onStartSession,
   onSwitchView,
   readOnly,
+  cityhall = false,
   canManageProjects = true,
   sortMode,
   onSortModeChange,
@@ -3900,6 +3931,7 @@ export function WorkspaceSidebar({
                                     onSwitchView={onSwitchView}
                                     onCreateSession={onCreateSession}
                                     readOnly={readOnly}
+                                    cityhall={cityhall}
                                     optimistic={triage.optimisticFor(v.workspace.id)}
                                     onPinToggle={triage.pinToggle}
                                     onArchiveToggle={triage.archiveToggle}
@@ -4008,6 +4040,7 @@ export function WorkspaceSidebar({
                                 onStart={onStartSession}
                                 onSwitchView={onSwitchView}
                                 readOnly={readOnly}
+                                cityhall={cityhall}
                                 optimistic={triage.optimisticFor(v.workspace.id)}
                                 onPinToggle={triage.pinToggle}
                                 onArchiveToggle={triage.archiveToggle}
@@ -4088,6 +4121,7 @@ export function WorkspaceSidebar({
                       onStart={onStartSession}
                       onSwitchView={onSwitchView}
                       readOnly={readOnly}
+                      cityhall={cityhall}
                       optimistic={triage.optimisticFor(v.workspace.id)}
                       onPinToggle={triage.pinToggle}
                       onArchiveToggle={triage.archiveToggle}

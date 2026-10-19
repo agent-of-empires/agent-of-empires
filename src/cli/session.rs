@@ -18,6 +18,12 @@ pub enum SessionCommands {
     /// Restart session (or all sessions with `--all`)
     Restart(RestartArgs),
 
+    /// Change approval policy, preserving a running session's conversation
+    ///
+    /// Uses live controls when supported; otherwise restarts and resumes the
+    /// recorded conversation, interrupting its current turn. Never starts fresh.
+    AutoApprove(AutoApproveArgs),
+
     /// Attach to session interactively
     Attach(SessionIdArgs),
 
@@ -167,6 +173,14 @@ pub struct ArchiveArgs {
 pub struct SessionIdArgs {
     /// Session ID or title
     identifier: String,
+}
+
+#[derive(Args)]
+pub struct AutoApproveArgs {
+    /// Session ID or title
+    pub identifier: String,
+    #[arg(value_parser = ["on", "off"])]
+    pub policy: String,
 }
 
 #[derive(Args)]
@@ -342,6 +356,7 @@ pub async fn run(profile: &str, command: SessionCommands) -> Result<()> {
         SessionCommands::Start(args) => start_session(profile, args).await,
         SessionCommands::Stop(args) => stop_session(profile, args).await,
         SessionCommands::Restart(args) => restart_session_dispatch(profile, args).await,
+        SessionCommands::AutoApprove(args) => auto_approve_session(profile, args).await,
         SessionCommands::Attach(args) => attach_session(profile, args).await,
         SessionCommands::Show(args) => show_session(profile, args).await,
         SessionCommands::Capture(args) => capture_session(profile, args).await,
@@ -363,6 +378,43 @@ pub async fn run(profile: &str, command: SessionCommands) -> Result<()> {
         SessionCommands::ListTrash => list_trash(profile).await,
         SessionCommands::EmptyTrash => empty_trash(profile).await,
     }
+}
+
+async fn auto_approve_session(profile: &str, args: AutoApproveArgs) -> Result<()> {
+    let storage = Storage::open_unwatched(profile)?;
+    let instances = storage.load()?;
+    let instance = super::resolve_session(&args.identifier, &instances)?;
+    let enabled = args.policy == "on";
+    let result = if instance.is_structured() {
+        #[cfg(feature = "serve")]
+        {
+            let endpoint = crate::acp::client::require_daemon().await?;
+            crate::acp::client::HttpClient::new(endpoint)?
+                .set_auto_approve(&instance.id, enabled)
+                .await?
+        }
+        #[cfg(not(feature = "serve"))]
+        bail!("structured approval control requires a build with --features serve");
+    } else {
+        crate::session::auto_approve::set_terminal_auto_approve(profile, &instance.id, enabled)?
+    };
+    let live = !instance.is_structured()
+        && instance
+            .tmux_session()
+            .is_ok_and(|s| s.exists() && !s.is_pane_dead());
+    println!(
+        "Auto-approve {}: {}{}",
+        if result.enabled { "on" } else { "off" },
+        instance.title,
+        if result.restarted {
+            " (restarted and resumed; no wake prompt)"
+        } else if !instance.is_structured() && !live {
+            " (next launch only; no live process)"
+        } else {
+            ""
+        }
+    );
+    Ok(())
 }
 
 async fn favorite_session(profile: &str, args: SessionIdArgs) -> Result<()> {
@@ -503,6 +555,10 @@ async fn restore_session(profile: &str, args: SessionIdArgs) -> Result<()> {
             "Session {} is being purged by another process, so it was not restored",
             inst.title
         ),
+        crate::session::claim::RestoreClaimDecision::AutoApproveInProgress => anyhow::bail!(
+            "Session {} is changing approval policy; retry after it finishes",
+            inst.title
+        ),
         crate::session::claim::RestoreClaimDecision::Claimed => {}
     }
 
@@ -597,6 +653,7 @@ async fn empty_trash(profile: &str) -> Result<()> {
     // (Restored). Either way we never tore anything down, so they are benign and
     // reported as one figure.
     let mut being_restored_elsewhere = 0usize;
+    let mut changing_approval = 0usize;
     for inst in &trashed {
         // Per-row claim just before each teardown (#2541), via the shared
         // decision. A single up-front batch claim would risk overrunning the
@@ -616,6 +673,10 @@ async fn empty_trash(profile: &str) -> Result<()> {
             crate::session::claim::PurgeClaimDecision::RestoreInProgress
             | crate::session::claim::PurgeClaimDecision::Restored => {
                 being_restored_elsewhere += 1;
+                continue;
+            }
+            crate::session::claim::PurgeClaimDecision::AutoApproveInProgress => {
+                changing_approval += 1;
                 continue;
             }
             crate::session::claim::PurgeClaimDecision::AlreadyGone => continue,
@@ -709,6 +770,9 @@ async fn empty_trash(profile: &str) -> Result<()> {
         parts.push(format!(
             "{being_restored_elsewhere} being restored by another process"
         ));
+    }
+    if changing_approval > 0 {
+        parts.push(format!("{changing_approval} changing approval policy"));
     }
     if outcome.restored_after_teardown > 0 {
         parts.push(format!(

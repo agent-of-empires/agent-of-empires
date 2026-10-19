@@ -144,6 +144,11 @@ pub struct App {
     update_rx: Option<tokio::sync::oneshot::Receiver<anyhow::Result<UpdateInfo>>>,
     update_status: Option<UpdateStatus>,
     update_status_rx: Option<tokio::sync::oneshot::Receiver<anyhow::Result<()>>>,
+    auto_approve_rx: Option<
+        tokio::sync::oneshot::Receiver<
+            anyhow::Result<crate::session::auto_approve::AutoApproveResult>,
+        >,
+    >,
     /// Latest version the user dismissed via Ctrl+x. Persisted to
     /// `app_state.dismissed_update_version` so the snooze survives
     /// `aoe` restarts (per #1140). The banner stays hidden while the
@@ -479,6 +484,7 @@ impl App {
             update_rx: None,
             update_status: None,
             update_status_rx: None,
+            auto_approve_rx: None,
             dismissed_update_version,
             image_update: None,
             image_update_rx: None,
@@ -1751,6 +1757,11 @@ impl App {
                 refresh_needed = true;
                 needs_full_refresh = true;
             }
+            if self.poll_auto_approve() {
+                self.needs_redraw = true;
+                refresh_needed = true;
+                needs_full_refresh = true;
+            }
             // The sandbox-image banner and its pull toast share the same
             // bottom-row layout slot, so treat their changes as full-refresh
             // work too.
@@ -2418,6 +2429,84 @@ impl App {
                 true
             }
         }
+    }
+
+    fn start_auto_approve(
+        &mut self,
+        session_id: String,
+        profile: String,
+        enabled: bool,
+        structured: bool,
+    ) {
+        if self.auto_approve_rx.is_some() {
+            self.update_status = Some(UpdateStatus::transient(
+                "An auto-approve change is already in progress.".into(),
+            ));
+            return;
+        }
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        self.auto_approve_rx = Some(rx);
+        self.update_status = Some(UpdateStatus::persistent(
+            "Changing auto-approve; the agent may restart and resume…".into(),
+        ));
+        tokio::spawn(async move {
+            let result: anyhow::Result<_> = async {
+                if structured {
+                    #[cfg(feature = "serve")]
+                    {
+                        use crate::acp::client::{require_daemon, HttpClient};
+                        let http = HttpClient::new(require_daemon().await?)?;
+                        return Ok(http.set_auto_approve(&session_id, enabled).await?);
+                    }
+                    #[cfg(not(feature = "serve"))]
+                    anyhow::bail!(
+                        "Changing structured-session approvals requires a serve-enabled build"
+                    );
+                }
+                tokio::task::spawn_blocking(move || {
+                    crate::session::auto_approve::set_terminal_auto_approve(
+                        &profile,
+                        &session_id,
+                        enabled,
+                    )
+                })
+                .await?
+            }
+            .await;
+            let _ = tx.send(result);
+        });
+    }
+
+    fn poll_auto_approve(&mut self) -> bool {
+        let Some(mut rx) = self.auto_approve_rx.take() else {
+            return false;
+        };
+        let message = match rx.try_recv() {
+            Ok(Ok(result)) => {
+                if let Err(error) = self.home.reload() {
+                    tracing::warn!(%error, "failed to refresh sessions after approval change");
+                }
+                format!(
+                    "Auto-approve {}{}",
+                    if result.enabled { "on" } else { "off" },
+                    if result.restarted {
+                        "; agent restarted and resumed"
+                    } else {
+                        ""
+                    }
+                )
+            }
+            Ok(Err(error)) => format!("Auto-approve change failed: {error}"),
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty) => {
+                self.auto_approve_rx = Some(rx);
+                return false;
+            }
+            Err(tokio::sync::oneshot::error::TryRecvError::Closed) => {
+                "Auto-approve change ended unexpectedly".into()
+            }
+        };
+        self.update_status = Some(UpdateStatus::transient(message));
+        true
     }
 
     /// Kick off a background install when `update_check_mode = "auto"` and a
@@ -3536,6 +3625,12 @@ impl App {
                 // Same stash pattern: the daemon POST must be awaited.
                 self.pending_smart_rename = Some(id);
             }
+            Action::SetAutoApprove {
+                session_id,
+                profile,
+                enabled,
+                structured,
+            } => self.start_auto_approve(session_id, profile, enabled, structured),
         }
         Ok(())
     }
@@ -4134,6 +4229,12 @@ pub enum Action {
     SetTheme(String),
     SpawnUpdate(crate::update::install::InstallMethod, String),
     SetTransientStatus(String),
+    SetAutoApprove {
+        session_id: String,
+        profile: String,
+        enabled: bool,
+        structured: bool,
+    },
     /// Pull the sandbox image after the user accepts the "image update
     /// available" banner's confirm. Deferred to `execute_action` so the loop
     /// can show a "pulling…" status before the blocking pull starts.

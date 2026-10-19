@@ -208,6 +208,9 @@ pub enum PromptDisposition {
 /// See #1038.
 pub trait BroadcastSink: Send + Sync + 'static {
     fn publish(&self, session_id: &str, seq: u64, event: &Event);
+    fn approval_metadata(&self, _session_id: &str) -> Vec<Event> {
+        Vec::new()
+    }
     /// Like `publish`, but reports whether the event write reached the
     /// durable event store. Default assumes success for sinks that don't
     /// persist (tests / in-memory fixtures).
@@ -358,6 +361,7 @@ pub struct Supervisor<S: BroadcastSink> {
     registry: Arc<Mutex<AgentRegistry>>,
     workers: Arc<Mutex<HashMap<String, WorkerHandle>>>,
     next_seqs: Arc<SeqMap>,
+    approval_options: Arc<std::sync::Mutex<HashMap<String, super::auto_approve::ApprovalOptions>>>,
     /// Reservation map: a session_id present here means another task is
     /// mid-resume (spawn OR attach) for it. The `ResumeKind` lets the
     /// capacity check distinguish fresh spawns (which contribute to the
@@ -545,6 +549,8 @@ pub struct SpawnRequest {
     /// Best-effort: adapters that don't advertise bypass mode log a
     /// warning and stay in default. See #1142.
     pub yolo_mode: bool,
+    /// An explicit approval change pinned the native launch policy.
+    pub auto_approve_managed: bool,
     /// Explicit ACP session mode to apply after the handshake, sourced from
     /// `Instance.acp_mode_id` (#2897). Takes precedence over `yolo_mode`;
     /// like it, applied best-effort via `session/set_mode` and re-asserted on
@@ -667,6 +673,7 @@ impl<S: BroadcastSink> Supervisor<S> {
             registry: Arc::new(Mutex::new(AgentRegistry::with_defaults())),
             workers: Arc::new(Mutex::new(HashMap::new())),
             next_seqs: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            approval_options: Arc::new(std::sync::Mutex::new(HashMap::new())),
             pending_resumes: Arc::new(std::sync::Mutex::new(HashMap::new())),
             cancelled_resumes: Arc::new(std::sync::Mutex::new(HashSet::new())),
             warmed_up_agents: Arc::new(std::sync::Mutex::new(HashSet::new())),
@@ -1444,6 +1451,7 @@ impl<S: BroadcastSink> Supervisor<S> {
             sandbox_info,
             source_profile,
             yolo_mode,
+            auto_approve_managed,
             acp_mode_id,
             agent_command_override,
             seed_history_replay,
@@ -1530,7 +1538,14 @@ impl<S: BroadcastSink> Supervisor<S> {
         let acp_defaults = resolved_cfg.acp.acp_defaults_for(&agent);
         let (model, effort) =
             crate::session::config::resolve_spawn_model_effort(acp_defaults, model, effort);
-        let default_mode = acp_defaults.and_then(|defaults| defaults.mode());
+        let default_mode = acp_mode_id
+            .clone()
+            .or_else(|| acp_defaults.and_then(|defaults| defaults.mode()));
+        if agent == "omp" && auto_approve_managed {
+            // Untouched older OMP installations must not receive new CLI flags.
+            super::auto_approve::configure_omp_approval(&mut spec, yolo_mode)
+                .map_err(SupervisorError::InvalidAgentCommand)?;
+        }
 
         // `Config.environment` is trusted global/profile configuration; repo
         // overrides cannot contribute it. Mirror terminal-view behavior for
@@ -1661,6 +1676,7 @@ impl<S: BroadcastSink> Supervisor<S> {
             default_mode,
             socket_path: Some(socket_path),
             stored_acp_session_id: stored_acp_session_id.clone(),
+            strict_resume: agent == "omp" && auto_approve_managed,
             fork_from,
             sandbox_info,
             source_profile,
@@ -1746,8 +1762,13 @@ impl<S: BroadcastSink> Supervisor<S> {
             drop(client);
             return Err(SupervisorError::SpawnCancelled(session_id));
         }
-        let drain_task = self.start_drain_task(session_id.clone(), inbound);
-        let client_for_mode = (acp_mode_id.is_some() || yolo_mode).then(|| Arc::clone(&client));
+        let drain_task = self.start_drain_task(session_id.clone(), inbound, false);
+        let policy_applied_before_prompts = acp_mode_id
+            .as_deref()
+            .is_some_and(|mode| super::auto_approve::is_native_approval_mode(&agent, mode));
+        let client_for_mode = (!policy_applied_before_prompts
+            && (acp_mode_id.is_some() || yolo_mode))
+            .then(|| Arc::clone(&client));
         workers.insert(
             session_id.clone(),
             WorkerHandle {
@@ -1809,11 +1830,20 @@ impl<S: BroadcastSink> Supervisor<S> {
         &self,
         session_id: String,
         initial_inbound: mpsc::Receiver<Event>,
+        reattaching: bool,
     ) -> JoinHandle<()> {
         let sink = Arc::clone(&self.sink);
         let workers = Arc::clone(&self.workers);
         let next_seqs = Arc::clone(&self.next_seqs);
         let incompatible_binaries = Arc::clone(&self.incompatible_binaries);
+        let approval_options = Arc::clone(&self.approval_options);
+        let mut metadata = super::auto_approve::ApprovalOptions::default();
+        if reattaching {
+            for event in self.sink.approval_metadata(&session_id) {
+                metadata.apply(&event);
+            }
+        }
+        lock_recover(&approval_options).insert(session_id.clone(), metadata);
         crate::task_util::spawn_supervised(
             "supervisor.drain",
             crate::task_util::PanicPolicy::Log,
@@ -1846,6 +1876,10 @@ impl<S: BroadcastSink> Supervisor<S> {
                     // #1281.
                     let mut rate_limited = false;
                     while let Some(event) = inbound.recv().await {
+                        lock_recover(&approval_options)
+                            .entry(session_id.clone())
+                            .or_default()
+                            .apply(&event);
                         if let Event::Stopped { reason } = &event {
                             if reason == "agent_unresponsive"
                                 || reason == "prompt_orphaned"
@@ -2296,6 +2330,7 @@ impl<S: BroadcastSink> Supervisor<S> {
                                 return;
                             }
                         };
+                    lock_recover(&approval_options).remove(&session_id);
                     let new_inbound = match new_client.take_inbound() {
                         Some(rx) => rx,
                         None => {
@@ -2560,6 +2595,180 @@ impl<S: BroadcastSink> Supervisor<S> {
     ) -> Result<(), SupervisorError> {
         let client = self.ready_client(session_id).await?;
         client.set_config_option(config_id, value).await?;
+        Ok(())
+    }
+
+    /// Change a verified native approval control and wait for its response.
+    /// The caller owns the session's durable AutoApprove claim and API mutex.
+    /// Returns the accepted mode (None for OMP's separate approval policy) and
+    /// whether a strict conversation-preserving restart was needed.
+    pub async fn set_auto_approve(
+        &self,
+        session_id: &str,
+        enabled: bool,
+    ) -> Result<(Option<String>, bool), SupervisorError> {
+        let client = self.ready_client(session_id).await?;
+        let agent = {
+            let workers = self.workers.lock().await;
+            match workers.get(session_id).map(|worker| &worker.kind) {
+                Some(WorkerKind::Runner { spawn_config }) => spawn_config.agent_key.clone(),
+                _ => crate::process::worker_registry::load(session_id)
+                    .ok()
+                    .flatten()
+                    .map(|record| record.agent_key)
+                    .filter(|key| !key.is_empty())
+                    .ok_or_else(|| {
+                        SupervisorError::InvalidAgentCommand(
+                            "Cannot identify this worker's native approval adapter".into(),
+                        )
+                    })?,
+            }
+        };
+        if agent == "omp" {
+            let mode = lock_recover(&self.approval_options)
+                .get(session_id)
+                .and_then(|metadata| metadata.current_mode())
+                .map(str::to_string);
+            self.restart_omp_approval(session_id, client, enabled, mode.as_deref())
+                .await?;
+            return Ok((None, true));
+        }
+        let target = lock_recover(&self.approval_options)
+            .get(session_id)
+            .map_or_else(
+                || super::auto_approve::ApprovalOptions::default().target(&agent, enabled),
+                |metadata| metadata.target(&agent, enabled),
+            )
+            .map_err(SupervisorError::InvalidAgentCommand)?;
+        let mode_id = target.mode_id.clone();
+        client.set_approval(target).await?;
+        let mut workers = self.workers.lock().await;
+        let handle = workers.get_mut(session_id).filter(|worker| Arc::ptr_eq(&worker.client, &client))
+            .ok_or_else(|| SupervisorError::InvalidAgentCommand(
+                "Worker changed while awaiting approval acknowledgement; retry against the current worker".into()))?;
+        if let WorkerKind::Runner { spawn_config } = &mut handle.kind {
+            spawn_config.default_mode = Some(mode_id.clone());
+        }
+        Ok((Some(mode_id), false))
+    }
+
+    async fn restart_omp_approval(
+        &self,
+        session_id: &str,
+        client: Arc<AcpClient>,
+        enabled: bool,
+        mode: Option<&str>,
+    ) -> Result<(), SupervisorError> {
+        let (conversation, can_load, version) = client.session_ready().await?;
+        if !can_load
+            || !semver::Version::parse(&version)
+                .is_ok_and(|version| version >= semver::Version::new(18, 10, 3))
+        {
+            return Err(SupervisorError::InvalidAgentCommand(
+                "OMP approval switching requires OMP 18.10.3 or newer with native session/load support".into()));
+        }
+        let mut workers = self.workers.lock().await;
+        let mut config = match workers.get(session_id) {
+            Some(WorkerHandle { client: current, kind: WorkerKind::Runner { spawn_config }, .. })
+                if Arc::ptr_eq(current, &client) => (**spawn_config).clone(),
+            _ => return Err(SupervisorError::InvalidAgentCommand(
+                "OMP approval restart is unavailable for an adopted or changing worker; restart the worker first".into())),
+        };
+        super::auto_approve::configure_omp_approval(&mut config.spec, enabled)
+            .map_err(SupervisorError::InvalidAgentCommand)?;
+        config.stored_acp_session_id = Some(conversation.clone());
+        config.strict_resume = true;
+        config.fork_from = None;
+        config.seed_history_replay = false;
+        config.default_mode = mode.map(str::to_string);
+        {
+            let mut pending = lock_recover(&self.pending_resumes);
+            if pending.contains_key(session_id) {
+                return Err(SupervisorError::AlreadyRunning(session_id.into()));
+            }
+            pending.insert(session_id.into(), ResumeKind::Spawn);
+        }
+        let _reservation = ResumeReservation {
+            pending: Arc::clone(&self.pending_resumes),
+            session_id: session_id.into(),
+            notify: Arc::clone(&self.worker_notify),
+        };
+        let old = workers.remove(session_id).expect("worker checked above");
+        let old_pid = crate::process::worker_registry::pid_source_for(session_id);
+        drop(workers);
+        old.drain_task.abort();
+        let _ = old.drain_task.await;
+        let _ = old.client.shutdown().await;
+        terminate_runner_for_session(session_id);
+        self.cancel_orphaned_elicitations(session_id);
+        if !self.cancel_orphaned_approvals(session_id) {
+            self.publish_next(
+                session_id,
+                &Event::Stopped {
+                    reason: "cancelled".into(),
+                },
+            );
+        }
+        if let Some(pid) = old_pid {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while crate::process::worker_registry::is_pid_alive(pid) {
+                if Instant::now() >= deadline {
+                    return Err(SupervisorError::InvalidAgentCommand(
+                        "The old OMP worker did not exit; approval policy was not changed".into(),
+                    ));
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        }
+        let mut replacement =
+            AcpClient::spawn(config.clone(), AcpSessionId(session_id.into())).await?;
+        let inbound = replacement
+            .take_inbound()
+            .expect("new client has an inbound receiver");
+        let replacement = Arc::new(replacement);
+        let drain_task = self.start_drain_task(session_id.into(), inbound, false);
+        let resumed = replacement.session_ready().await;
+        let accepted = matches!(&resumed, Ok((id, true, _)) if id == &conversation);
+        if !accepted {
+            drain_task.abort();
+            let _ = replacement.shutdown().await;
+            terminate_runner_for_session(session_id);
+            return Err(SupervisorError::InvalidAgentCommand(format!(
+                "OMP did not acknowledge resuming the same conversation: {resumed:?}"
+            )));
+        }
+        if let Some(mode_id) = mode {
+            if let Err(error) = replacement
+                .set_approval(super::auto_approve::ApprovalTarget {
+                    config_id: None,
+                    mode_id: mode_id.into(),
+                })
+                .await
+            {
+                drain_task.abort();
+                let _ = replacement.shutdown().await;
+                terminate_runner_for_session(session_id);
+                return Err(error.into());
+            }
+        }
+        let mut workers = self.workers.lock().await;
+        if lock_recover(&self.cancelled_resumes).remove(session_id) {
+            drain_task.abort();
+            let _ = replacement.shutdown().await;
+            terminate_runner_for_session(session_id);
+            return Err(SupervisorError::SpawnCancelled(session_id.into()));
+        }
+        workers.insert(
+            session_id.into(),
+            WorkerHandle {
+                client: replacement,
+                drain_task,
+                restart_history: vec![],
+                kind: WorkerKind::Runner {
+                    spawn_config: Box::new(config),
+                },
+            },
+        );
         Ok(())
     }
 
@@ -2983,7 +3192,7 @@ impl<S: BroadcastSink> Supervisor<S> {
             drop(client);
             return Err(SupervisorError::SpawnCancelled(session_id));
         }
-        let drain_task = self.start_drain_task(session_id.clone(), inbound);
+        let drain_task = self.start_drain_task(session_id.clone(), inbound, true);
         workers.insert(
             session_id.clone(),
             WorkerHandle {
@@ -3013,34 +3222,21 @@ impl<S: BroadcastSink> Supervisor<S> {
         Ok(())
     }
 
-    /// Cancel approvals that were on screen when the previous daemon
-    /// died. The responder oneshot was parked in the old daemon's
-    /// `pending_responders` map and dropped with the process. Without
-    /// this sweep, clicking allow/deny in the UI races the new daemon's
-    /// empty map and 404s, leaving the agent wedged on the original
-    /// JSON-RPC request id. Emit a synthetic `ApprovalResolved {
-    /// decision: Cancelled }` per dead nonce so the frontend reducer
-    /// drops the card, then a single synthetic `Stopped { reason:
-    /// "approval_cancelled_on_restart" }` so the sidebar dot flips to
-    /// Idle and the in-structured view "Working" spinner clears (the turn the
-    /// approval was parked on is over; the agent was unblocked by a
-    /// synthetic Cancelled response when the previous daemon died).
-    /// The reason string is distinct so it does NOT trip the
-    /// "Stopped" / "Restarting…" banners (those gate on
-    /// reason="user_stopped" / "restart_pending"). The agent-side
-    /// wedge (parked `session/request_permission`) is unblocked
-    /// separately by the runner's outstanding-request cancellation on
-    /// detach. No-op when there are no stale nonces.
-    fn cancel_orphaned_approvals(&self, session_id: &str) {
+    /// The owning connection can no longer answer its stale approval nonces.
+    /// Cancel their cards and end the interrupted turn for live and replaying
+    /// clients without granting or denying the old requests. The distinct
+    /// reason avoids the user_stopped/restart_pending reconnect banners.
+    /// Returns whether a terminal stop was published.
+    fn cancel_orphaned_approvals(&self, session_id: &str) -> bool {
         let stale_nonces = self.sink.unresolved_approval_nonces(session_id);
         if stale_nonces.is_empty() {
-            return;
+            return false;
         }
         info!(
             target: "acp.supervisor",
             session = %session_id,
             stale = stale_nonces.len(),
-            "cancelling approvals orphaned by daemon restart"
+            "cancelling approvals orphaned by a disconnected worker"
         );
         for nonce in stale_nonces {
             self.publish_next(
@@ -3057,6 +3253,7 @@ impl<S: BroadcastSink> Supervisor<S> {
                 reason: "approval_cancelled_on_restart".to_string(),
             },
         );
+        true
     }
 
     /// Cancel elicitations (AskUserQuestion) that were on screen when the
@@ -3392,6 +3589,9 @@ fn inheritable_rate_limit_reset(
 }
 
 impl BroadcastSink for ChannelSink {
+    fn approval_metadata(&self, session_id: &str) -> Vec<Event> {
+        self.event_store.latest_approval_metadata(session_id)
+    }
     fn publish(&self, session_id: &str, seq: u64, event: &Event) {
         let _ = self.publish_persisted(session_id, seq, event);
     }
@@ -3903,6 +4103,7 @@ mod tests {
                 sandbox_info: None,
                 source_profile: None,
                 yolo_mode: false,
+                auto_approve_managed: false,
                 acp_mode_id: None,
                 agent_command_override: None,
             })
@@ -3947,6 +4148,7 @@ mod tests {
                 sandbox_info: None,
                 source_profile: None,
                 yolo_mode: false,
+                auto_approve_managed: false,
                 acp_mode_id: None,
                 agent_command_override: None,
             })
@@ -4163,6 +4365,7 @@ mod tests {
             default_mode: None,
             socket_path: Some(socket_path.clone()),
             stored_acp_session_id: None,
+            strict_resume: false,
             fork_from: None,
             seed_history_replay: false,
             artifact_dir: None,
@@ -4260,6 +4463,7 @@ mod tests {
             default_mode: None,
             socket_path: Some(tmp.path().join("dummy.sock")),
             stored_acp_session_id: None,
+            strict_resume: false,
             fork_from: None,
             seed_history_replay: false,
             artifact_dir: None,
@@ -4340,6 +4544,7 @@ mod tests {
             default_mode: None,
             socket_path: Some(tmp.path().join("dummy.sock")),
             stored_acp_session_id: None,
+            strict_resume: false,
             fork_from: None,
             seed_history_replay: false,
             artifact_dir: None,
@@ -4420,6 +4625,7 @@ mod tests {
             default_mode: None,
             socket_path: Some(tmp.path().join("dummy.sock")),
             stored_acp_session_id: None,
+            strict_resume: false,
             fork_from: None,
             seed_history_replay: false,
             artifact_dir: None,
@@ -4554,6 +4760,7 @@ mod tests {
             default_mode: None,
             socket_path: Some(tmp.path().join("dummy.sock")),
             stored_acp_session_id: None,
+            strict_resume: false,
             fork_from: None,
             seed_history_replay: false,
             artifact_dir: None,
@@ -4608,7 +4815,7 @@ mod tests {
         let sup = Supervisor::new(sink.clone());
 
         let (inbound_tx, inbound_rx) = tokio::sync::mpsc::channel::<Event>(16);
-        let drain = sup.start_drain_task("s-rl".into(), inbound_rx);
+        let drain = sup.start_drain_task("s-rl".into(), inbound_rx, false);
         {
             let mut workers = sup.workers.lock().await;
             let (client, _client_tx) = AcpClient::fake_for_test(AcpSessionId("s-rl".into()));
@@ -5939,6 +6146,7 @@ mod tests {
                 sandbox_info: None,
                 source_profile: None,
                 yolo_mode: false,
+                auto_approve_managed: false,
                 acp_mode_id: None,
                 agent_command_override: None,
             })
@@ -6017,6 +6225,7 @@ mod tests {
                 sandbox_info: None,
                 source_profile: None,
                 yolo_mode: false,
+                auto_approve_managed: false,
                 acp_mode_id: None,
                 agent_command_override: None,
             })
@@ -6274,6 +6483,7 @@ mod tests {
                 sandbox_info: None,
                 source_profile: None,
                 yolo_mode: false,
+                auto_approve_managed: false,
                 acp_mode_id: None,
                 agent_command_override: None,
             })
@@ -6331,6 +6541,7 @@ mod tests {
                 sandbox_info: None,
                 source_profile: None,
                 yolo_mode: false,
+                auto_approve_managed: false,
                 acp_mode_id: None,
                 agent_command_override: None,
             })

@@ -543,6 +543,7 @@ pub enum ClaimOp {
     Purge,
     Restore,
     Trash,
+    AutoApprove,
 }
 
 /// A durable ownership marker for an in-flight purge, restore, or trash
@@ -607,6 +608,9 @@ pub struct Instance {
     pub detect_as: String,
     #[serde(default)]
     pub yolo_mode: bool,
+    /// An explicit approval switch also pins the safe OFF launch policy.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub auto_approve_managed: bool,
     #[serde(default)]
     pub status: Status,
     pub created_at: DateTime<Utc>,
@@ -1420,6 +1424,7 @@ impl Instance {
             tool: "claude".to_string(),
             detect_as: String::new(),
             yolo_mode: false,
+            auto_approve_managed: false,
             status: Status::Idle,
             created_at: Utc::now(),
             last_accessed_at: None,
@@ -1750,6 +1755,9 @@ impl Instance {
         // required: `reconcile_from_disk`'s `*self = disk` reload runs on every
         // launch, so a swap that never reached disk is silently reverted and
         // the session respawns with its original tool. See #switching-tools.
+        if self.tool != src.tool {
+            self.auto_approve_managed = false;
+        }
         self.tool = src.tool.clone();
         self.command = src.command.clone();
         self.extra_args = src.extra_args.clone();
@@ -3207,6 +3215,15 @@ impl Instance {
         size: Option<(u16, u16)>,
         skip_on_launch: bool,
     ) -> Result<LaunchSidOutcome> {
+        self.start_with_approval_policy(size, skip_on_launch, None)
+    }
+
+    fn start_with_approval_policy(
+        &mut self,
+        size: Option<(u16, u16)>,
+        skip_on_launch: bool,
+        approval: Option<(bool, &str, &OpClaim)>,
+    ) -> Result<LaunchSidOutcome> {
         // Validate before any shell-command construction in
         // `build_launch_command` (covers `status_hook_env_prefix` and
         // the sandbox docker_args interpolation). Runs before the
@@ -3255,6 +3272,28 @@ impl Instance {
         // `agent_session_id` (Claude UUID generation); capture before that.
         let expected_prior_sid = self.agent_session_id.clone();
         let expected_prior_intent = self.resume_intent.clone();
+        if let Some((enabled, sid, claim)) = approval {
+            anyhow::ensure!(
+                self.op_claim.as_ref() == Some(claim),
+                "auto-approve lifecycle reservation was lost"
+            );
+            anyhow::ensure!(
+                self.agent_session_id.as_deref() == Some(sid)
+                    && (self.resume_intent == ResumeIntent::Default
+                        || matches!(&self.resume_intent, ResumeIntent::Use(pinned) if pinned == sid)),
+                "conversation changed before auto-approve restart"
+            );
+            self.resume_intent = ResumeIntent::Use(sid.to_owned());
+            self.yolo_mode = enabled;
+            self.auto_approve_managed = true;
+        } else {
+            anyhow::ensure!(
+                !self.op_claim.as_ref().is_some_and(
+                    |c| c.op == ClaimOp::AutoApprove && Utc::now() - c.at < Self::OP_CLAIM_TTL
+                ),
+                "auto-approve change is in progress"
+            );
+        }
 
         let profile = self.effective_profile();
         // Mint `host_hooks.before_session` before the command is assembled:
@@ -3378,6 +3417,12 @@ impl Instance {
                 } else {
                     base_cmd
                 }
+            } else if self.auto_approve_managed {
+                format!(
+                    "{} {}",
+                    base_cmd,
+                    super::auto_approve::safe_off_args(&self.tool)?
+                )
             } else {
                 base_cmd
             };
@@ -3724,6 +3769,12 @@ impl Instance {
                         if let Some(ref yolo) = a.yolo {
                             apply_yolo_mode(&mut cmd, yolo, false);
                         }
+                    } else if self.auto_approve_managed {
+                        cmd = format!(
+                            "{} {}",
+                            cmd,
+                            super::auto_approve::safe_off_args(&self.tool)?
+                        );
                     }
                     let is_existing = self.apply_session_flags(&mut cmd, "host agent");
                     apply_agent_launch_env(&mut cmd, agent);
@@ -4673,6 +4724,49 @@ impl Instance {
         self.restart_with_size_opts(size, false)
     }
 
+    /// Strict approval-policy restart: never drops a captured conversation,
+    /// consults ambient auto-resume settings, or submits a wake-up prompt.
+    pub(crate) fn restart_with_auto_approve(
+        &mut self,
+        enabled: bool,
+        sid: &str,
+    ) -> Result<StartOutcome> {
+        let claim = self
+            .op_claim
+            .clone()
+            .context("missing auto-approve lifecycle reservation")?;
+        anyhow::ensure!(
+            claim.op == ClaimOp::AutoApprove,
+            "invalid auto-approve lifecycle reservation"
+        );
+        anyhow::ensure!(
+            should_attempt_resume(Some(sid), &self.tool),
+            "agent cannot resume this conversation"
+        );
+        let _scope =
+            super::recovery::HookTimeoutScope::new(super::recovery::recovery_hook_timeout());
+        self.stop_poller();
+        self.session_id_poller = None;
+        self.kill_clean()?;
+        let launch = self.start_with_approval_policy(None, true, Some((enabled, sid, &claim)));
+        anyhow::ensure!(matches!(launch?, LaunchSidOutcome::Existing { sid: ref actual } if actual == sid),
+            "approval restart did not resume the captured conversation; no fresh fallback was attempted");
+        if matches!(
+            self.probe_settle(RESUME_PROBE_MAX, RESUME_PROBE_POLL)?,
+            ProbeResult::Dead
+        ) || self.tmux_session()?.is_pane_running_shell()
+        {
+            self.stop_poller();
+            self.session_id_poller = None;
+            self.status = Status::Error;
+            self.last_error = Some(format!(
+                "approval restart could not resume {sid}; conversation preserved"
+            ));
+            anyhow::bail!("approval restart failed to resume {sid}; no fresh fallback or wake prompt was sent");
+        }
+        Ok(StartOutcome::Resumed)
+    }
+
     /// Tear down the current tmux session cleanly so a fresh
     /// `start_with_size_opts` can recreate it.
     ///
@@ -4739,6 +4833,13 @@ impl Instance {
         skip_on_launch: bool,
         resume_policy: ResumeAttemptPolicy,
     ) -> Result<StartOutcome> {
+        self.reconcile_from_disk();
+        anyhow::ensure!(
+            !self.op_claim.as_ref().is_some_and(
+                |c| c.op == ClaimOp::AutoApprove && Utc::now() - c.at < Self::OP_CLAIM_TTL
+            ),
+            "auto-approve change is in progress"
+        );
         self.stop_poller();
         self.session_id_poller = None;
         self.kill_clean()?;
@@ -8066,27 +8167,16 @@ mod tests {
     }
 
     #[test]
-    fn test_merge_from_tui_syncs_launch_config_swap() {
-        // The restart dialog mutates tool/command/extra_args in the TUI's
-        // in-memory row. save() -> merge_from_tui must carry those onto disk,
-        // otherwise reconcile_from_disk reverts the swap on the next launch and
-        // the session respawns with its original tool.
+    fn agent_swap_discards_only_the_previous_agents_managed_approval_policy() {
         let mut stored = Instance::new("session", "/tmp/test");
-        stored.tool = "claude".to_string();
-        stored.command = String::new();
-        stored.extra_args = String::new();
-
-        let mut src = Instance::new("session", "/tmp/test");
-        src.id = stored.id.clone();
-        src.tool = "codex".to_string();
-        src.command = "codex-wrapper".to_string();
-        src.extra_args = "--foo".to_string();
-
+        stored.auto_approve_managed = true;
+        let mut src = stored.clone();
+        src.tool = "codex".into();
         stored.merge_from_tui(&src);
-
-        assert_eq!(stored.tool, "codex");
-        assert_eq!(stored.command, "codex-wrapper");
-        assert_eq!(stored.extra_args, "--foo");
+        assert!(!stored.auto_approve_managed);
+        stored.auto_approve_managed = true;
+        stored.merge_from_tui(&src);
+        assert!(stored.auto_approve_managed);
     }
 
     #[test]

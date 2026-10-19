@@ -766,7 +766,7 @@ pub struct HomeView {
     /// before dispatching the teardown. Their delete finalize applies the #2534
     /// restore-race recheck and releases the claim (ownership-guarded), instead
     /// of the plain live-session removal.
-    pub(super) purge_claimed: std::collections::HashSet<String>,
+    pub(super) purge_claimed: std::collections::HashMap<String, bool>,
 
     // Performance: background session creation (for sandbox)
     pub(super) creation_poller: CreationPoller,
@@ -2255,7 +2255,7 @@ impl HomeView {
             restart_in_flight: std::collections::HashSet::new(),
             attach_project_poller: crate::tui::attach_project_poller::AttachProjectPoller::new(),
             attach_project_in_flight: std::collections::HashSet::new(),
-            purge_claimed: std::collections::HashSet::new(),
+            purge_claimed: std::collections::HashMap::new(),
             creation_poller: CreationPoller::new(),
             creation_cancelled: false,
             on_launch_hooks_ran: HashSet::new(),
@@ -3186,8 +3186,8 @@ impl HomeView {
                     // than dropping it. Otherwise it removes the row on disk itself,
                     // so the normal in-memory removal is skipped in favor of a
                     // reload that converges with disk.
-                    if self.purge_claimed.remove(&result.session_id) {
-                        match self.finalize_claimed_purge(&result.session_id) {
+                    if let Some(was_trashed) = self.purge_claimed.remove(&result.session_id) {
+                        match self.finalize_claimed_purge(&result.session_id, was_trashed) {
                             Ok(true) => {
                                 self.info_dialog = Some(InfoDialog::new(
                                     "Session restored",
@@ -3239,7 +3239,7 @@ impl HomeView {
                     // A claimed trashed-purge whose teardown failed keeps the row
                     // for retry; release our owned Purge claim so it is not wedged
                     // (a peer restore is then free to win). See #2541.
-                    if self.purge_claimed.remove(&result.session_id) {
+                    if self.purge_claimed.remove(&result.session_id).is_some() {
                         self.release_trashed_purge_claim(&result.session_id);
                     }
                     let error = if result.errors.is_empty() {
@@ -3270,7 +3270,7 @@ impl HomeView {
                 // The dead worker will never finalize any purge we claimed;
                 // release every owned claim so peers are not wedged until the
                 // claim TTL expires (#2541).
-                let claimed: Vec<String> = self.purge_claimed.drain().collect();
+                let claimed: Vec<String> = self.purge_claimed.drain().map(|(id, _)| id).collect();
                 for id in &claimed {
                     self.release_trashed_purge_claim(id);
                 }

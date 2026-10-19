@@ -508,6 +508,9 @@ function resolveAgentInfo() {
   if (process.env.FAKE_ACP_IMPERSONATE === "codex") {
     return { name: "@agentclientprotocol/codex-acp", version: "1.1.4" };
   }
+  if (process.env.FAKE_ACP_IMPERSONATE === "omp") {
+    return { name: "omp", version: "18.10.3" };
+  }
   if (STEERING_ENABLED) {
     return { ...INITIALIZE_RESULT.agentInfo, version: STEERING_MIN_VERSION };
   }

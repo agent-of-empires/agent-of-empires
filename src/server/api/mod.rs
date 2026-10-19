@@ -13,6 +13,8 @@ pub(super) use super::AppState;
 #[cfg(feature = "serve")]
 mod acp;
 #[cfg(feature = "serve")]
+mod auto_approve;
+#[cfg(feature = "serve")]
 mod client_log;
 #[cfg(feature = "serve")]
 mod file_provenance;
@@ -37,6 +39,8 @@ pub use acp::{
     list_claude_sessions, resolve_approval, resolve_elicitation, shutdown_acp, spawn_acp,
     switch_acp_agent,
 };
+#[cfg(feature = "serve")]
+pub use auto_approve::set_auto_approve;
 
 #[cfg(feature = "serve")]
 pub use client_log::post_client_log;

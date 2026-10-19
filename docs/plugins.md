@@ -70,12 +70,18 @@ cancel keybindings; question replies resolve OMP's native `askDialog` with the
 user's selected options or custom text. If observation or reply delivery fails,
 the native OMP UI and approval flow remain available.
 
-OMP retains approval authority. The extension observes OMP's native approval
-and question surfaces; it does not intercept tool execution, approve calls on
-AoE's behalf, or enable `--auto-approve`. AoE adds no approval broker or
-per-tool gate. The manifest grant authorizes AoE's integration with the
-provider-owned report and reply path; it does not authorize OMP's in-process
-plugin code. Install each artifact with its respective plugin manager.
+OMP retains approval authority. The extension observes native approval and
+question surfaces and applies explicit user-requested policy changes through
+OMP's runtime settings API. It does not intercept tool execution or answer
+pending approval cards when auto-approve changes. AoE adds no approval broker or
+per-tool gate. The manifest grant authorizes the provider-owned report, reply,
+and control paths; it does not authorize OMP's in-process plugin code.
+Install each artifact with its respective plugin manager.
+
+Approval controls require AoE plugin API 14. Upgrade AoE and both paired
+artifacts together; older hosts cannot read the additional policy report fields.
+See [mid-session auto-approve](structured-view/controls.md#changing-auto-approve-during-a-session)
+for live controls, strict restart/resume, and unsupported configurations.
 
 This prototype has no marketplace bundle, coordinated upgrade, or OMP plugin
 release workflow. It is not a general extension bridge.

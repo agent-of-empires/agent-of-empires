@@ -479,6 +479,7 @@ pub async fn run_for_endpoint(
                         toast_deadline = None;
                     }
                 }
+                poll_auto_approve(&mut state, &mut toast_deadline);
                 // A freed slot lets the next buffered plugin notification show.
                 drain_plugin_toast(&mut state, &mut toast_deadline);
                 redraw(terminal, theme, &mut state)?;
@@ -1002,6 +1003,10 @@ async fn handle_terminal_event(
             open_mode_picker(state);
             Ok(false)
         }
+        Intent::OpenAutoApprovePicker => {
+            open_auto_approve_picker(state);
+            Ok(false)
+        }
         Intent::AnswerElicitation => {
             start_elicitation_answer(state, toast_deadline);
             Ok(false)
@@ -1115,6 +1120,52 @@ fn open_mode_picker(state: &mut StructuredViewState) {
         selected,
         purpose: ChoicePurpose::Mode,
     });
+}
+
+fn open_auto_approve_picker(state: &mut StructuredViewState) {
+    state.choice = Some(ChoicePicker {
+        title: " Auto-approve · Enter=set · Esc=close ".into(),
+        options: vec![
+            ("off".into(), "Turn off auto-approve".into()),
+            ("on".into(), "Turn on auto-approve".into()),
+        ],
+        selected: 0,
+        purpose: ChoicePurpose::AutoApprove,
+    });
+}
+
+fn poll_auto_approve(
+    state: &mut StructuredViewState,
+    toast_deadline: &mut Option<Instant>,
+) -> bool {
+    let Some(mut rx) = state.auto_approve_rx.take() else {
+        return false;
+    };
+    let (message, kind) = match rx.try_recv() {
+        Ok(Ok(result)) => (
+            format!(
+                "auto-approve {}{}",
+                if result.enabled { "on" } else { "off" },
+                if result.restarted {
+                    "; restarted and resumed the conversation"
+                } else {
+                    ""
+                }
+            ),
+            ToastKind::Info,
+        ),
+        Ok(Err(error)) => (format!("auto-approve failed: {error}"), ToastKind::Error),
+        Err(tokio::sync::oneshot::error::TryRecvError::Empty) => {
+            state.auto_approve_rx = Some(rx);
+            return false;
+        }
+        Err(tokio::sync::oneshot::error::TryRecvError::Closed) => (
+            "auto-approve change ended unexpectedly".into(),
+            ToastKind::Error,
+        ),
+    };
+    set_toast(state, toast_deadline, message, kind);
+    true
 }
 
 /// Start the native answer flow for the oldest pending elicitation, when
@@ -1240,6 +1291,36 @@ async fn accept_choice(state: &mut StructuredViewState, toast_deadline: &mut Opt
     match picker.purpose {
         // The plugin-link picker: `value` is the chosen URL.
         ChoicePurpose::OpenLink => open_link(state, toast_deadline, &value),
+        ChoicePurpose::AutoApprove => {
+            if state.auto_approve_rx.is_some() {
+                set_toast(
+                    state,
+                    toast_deadline,
+                    "An auto-approve change is already in progress.".into(),
+                    ToastKind::Info,
+                );
+                return;
+            }
+            let http = state.http.clone();
+            let session_id = state.session_id.clone();
+            let enabled = value == "on";
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            state.auto_approve_rx = Some(rx);
+            tokio::spawn(async move {
+                let result = http
+                    .set_auto_approve(&session_id, enabled)
+                    .await
+                    .map_err(|error| error.to_string());
+                let _ = tx.send(result);
+            });
+            set_toast(
+                state,
+                toast_deadline,
+                "Changing auto-approve; the agent may restart and resume…".into(),
+                ToastKind::Info,
+            );
+            *toast_deadline = None;
+        }
         ChoicePurpose::Mode => match state.http.set_mode(&state.session_id, &value).await {
             Ok(()) => {
                 // Pessimistic like the web: the title chip updates when the
@@ -1921,7 +2002,7 @@ mod tests {
                 assert!(remaining.is_empty());
                 assert!(answers.is_empty());
             }
-            ChoicePurpose::Mode | ChoicePurpose::OpenLink => {
+            ChoicePurpose::Mode | ChoicePurpose::AutoApprove | ChoicePurpose::OpenLink => {
                 panic!("expected elicitation purpose")
             }
         }
@@ -1984,9 +2065,75 @@ mod tests {
                 assert_eq!(remaining.len(), 1);
                 assert_eq!(remaining[0].field_key, "question_1");
             }
-            ChoicePurpose::Mode | ChoicePurpose::OpenLink => {
+            ChoicePurpose::Mode | ChoicePurpose::AutoApprove | ChoicePurpose::OpenLink => {
                 panic!("expected elicitation purpose")
             }
         }
+    }
+
+    #[tokio::test]
+    async fn pending_auto_approve_keeps_composer_responsive_until_acknowledged() {
+        use axum::{routing::post, Json, Router};
+        use std::sync::Arc;
+
+        let (release, wait) = tokio::sync::oneshot::channel();
+        let gate = Arc::new(tokio::sync::Mutex::new(Some(wait)));
+        let app = Router::new().route(
+            "/api/sessions/s-1/auto-approve",
+            post(move || {
+                let gate = gate.clone();
+                async move {
+                    let wait = gate.lock().await.take().unwrap();
+                    let _ = wait.await;
+                    Json(serde_json::json!({ "enabled": true, "restarted": false }))
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = DaemonEndpoint::new(
+            format!("http://{}", listener.local_addr().unwrap()),
+            None,
+            Source::Env,
+        );
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let http = HttpClient::new(endpoint.clone()).unwrap();
+        let mut state = StructuredViewState::new("s-1".into(), endpoint, http, None);
+        let mut deadline = None;
+        open_auto_approve_picker(&mut state);
+        state.choice.as_mut().unwrap().selected = 1;
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            accept_choice(&mut state, &mut deadline),
+        )
+        .await
+        .expect("approval changes must not block terminal input");
+        assert!(!poll_auto_approve(&mut state, &mut deadline));
+        handle_terminal_event(
+            &mut state,
+            CrosstermEvent::Key(crossterm::event::KeyEvent::new(
+                crossterm::event::KeyCode::Char('x'),
+                crossterm::event::KeyModifiers::NONE,
+            )),
+            &mut deadline,
+        )
+        .await
+        .unwrap();
+        assert_eq!(composer_text(&state), "x");
+        assert!(state.auto_approve_rx.is_some());
+        release.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !poll_auto_approve(&mut state, &mut deadline) {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(state.auto_approve_rx.is_none());
+        assert!(matches!(
+            state.toast.as_ref().unwrap().kind,
+            ToastKind::Info
+        ));
+        assert_eq!(composer_text(&state), "x");
+        server.abort();
     }
 }

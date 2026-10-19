@@ -115,3 +115,61 @@ test.describe("Sidebar Switch view (#2252)", () => {
     await expect(page.locator("[data-testid='sidebar-context-menu-switch-view']")).toHaveCount(0);
   });
 });
+
+test.describe("Sidebar auto-approve", () => {
+  test("terminal and structured rows open an explicit, keyboard-safe approval dialog", async ({ page }) => {
+    await mockApis(page, [
+      { id: "terminal", title: "Terminal agent", view: "terminal", acp_capable: false },
+      { id: "structured", title: "Structured agent", view: "structured", acp_capable: true },
+    ]);
+    await page.goto("/");
+    for (const title of ["Terminal agent", "Structured agent"]) {
+      const row = page.getByTestId("sidebar-session-row").filter({ hasText: title });
+      await row.click({ button: "right" });
+      await page.getByTestId("sidebar-context-menu-auto-approve").click();
+      const dialog = page.getByRole("dialog", { name: "Auto-approve" });
+      await expect(dialog).toBeVisible();
+      await expect(dialog.getByRole("button", { name: "Cancel" })).toBeFocused();
+      await page.keyboard.press("Tab");
+      await expect(dialog.getByRole("button", { name: "Turn off auto-approve" })).toBeFocused();
+      await page.keyboard.press("Tab");
+      await expect(dialog.getByRole("button", { name: "Turn on auto-approve" })).toBeFocused();
+      await page.keyboard.press("Tab");
+      await expect(dialog.getByRole("button", { name: "Cancel" })).toBeFocused();
+      await page.keyboard.press("Escape");
+      await expect(dialog).toHaveCount(0);
+    }
+  });
+
+  test("rejected approval changes keep reverse tabbing and Escape inside the dialog", async ({ page }) => {
+    await mockApis(page, [{ id: "s1", title: "Working agent", view: "terminal", acp_capable: false }]);
+    await page.route("**/api/sessions/s1/auto-approve", (route) =>
+      route.fulfill({ status: 409, json: { message: "Cannot resume this agent" } }),
+    );
+    await page.goto("/");
+    await page.getByTestId("sidebar-session-row").filter({ hasText: "Working agent" }).click({ button: "right" });
+    await page.getByTestId("sidebar-context-menu-auto-approve").click();
+    const dialog = page.getByRole("dialog", { name: "Auto-approve" });
+    await dialog.getByRole("button", { name: "Turn on auto-approve" }).click();
+    await expect(dialog.getByRole("alert")).toHaveText("Cannot resume this agent");
+    await page.keyboard.press("Shift+Tab");
+    await expect(dialog.getByRole("button", { name: "Turn on auto-approve" })).toBeFocused();
+    await page.keyboard.press("Tab");
+    await expect(dialog.getByRole("button", { name: "Cancel" })).toBeFocused();
+    await page.keyboard.press("Shift+Tab");
+    await expect(dialog.getByRole("button", { name: "Turn on auto-approve" })).toBeFocused();
+    await page.keyboard.press("Escape");
+    await expect(dialog).toHaveCount(0);
+  });
+
+  test("read-only and CityHall hide the approval action", async ({ page }) => {
+    for (const about of [{ read_only: true }, { cityhall_mode: true }]) {
+      await mockApis(page, [{ id: "s1", title: "Locked session", view: "terminal", acp_capable: true }]);
+      await page.route("**/api/about", (r) => r.fulfill({ json: about }));
+      await page.goto("/");
+      await page.getByTestId("sidebar-session-row").filter({ hasText: "Locked session" }).click({ button: "right" });
+      await expect(page.getByTestId("sidebar-context-menu")).toBeVisible();
+      await expect(page.getByTestId("sidebar-context-menu-auto-approve")).toHaveCount(0);
+    }
+  });
+});

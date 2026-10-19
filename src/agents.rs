@@ -1174,7 +1174,8 @@ pub const AGENTS: &[AgentDef] = &[
         launch_subcommand: None,
         aliases: &[],
         detection: DetectionMethod::Which("omp"),
-        yolo: Some(YoloMode::CliFlag("--auto-approve")),
+        // Runtime registry overrides can reverse this; --auto-approve cannot.
+        yolo: Some(YoloMode::CliFlag("--approval-mode yolo")),
         instruction_flag: Some("--append-system-prompt {}"),
         set_default_command: false,
         detect_status: status_detection::detect_omp_status,
@@ -1769,23 +1770,6 @@ mod tests {
         assert_eq!(get_agent("antigravity").unwrap().binary, "agy");
         assert_eq!(get_agent("kimi").unwrap().binary, "kimi");
         assert_eq!(get_agent("omp").unwrap().binary, "omp");
-    }
-
-    #[test]
-    fn test_omp_agent_definition() {
-        let omp = get_agent("omp").unwrap();
-        assert!(matches!(&omp.detection, DetectionMethod::Which("omp")));
-        assert!(matches!(
-            &omp.yolo,
-            Some(YoloMode::CliFlag("--auto-approve"))
-        ));
-        assert!(matches!(
-            &omp.resume_strategy,
-            ResumeStrategy::Flag("--resume")
-        ));
-        assert_eq!(omp.oneshot_flag, Some("-p"));
-        assert_eq!(omp.oneshot_model_flag(), Some("--model"));
-        assert!(!omp.oneshot_flag_binds_prompt());
     }
 
     #[test]

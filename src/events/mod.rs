@@ -293,13 +293,25 @@ pub fn prune_retention(
     max_events: usize,
     pinned_prefixes: &[&str],
 ) {
+    prune_retention_with_latest(conn, schema, topic, max_events, pinned_prefixes, &[]);
+}
+
+/// Prune old events while preserving the newest event for each
+/// `latest_only_prefixes` discriminant.
+pub fn prune_retention_with_latest(
+    conn: &Connection,
+    schema: &Schema,
+    topic: &str,
+    max_events: usize,
+    pinned_prefixes: &[&str],
+    latest_only_prefixes: &[&str],
+) {
     if max_events == 0 {
         return;
     }
     // Compute the prune cutoff seq once so the events delete and the
     // attachments delete agree on the same threshold. Doing the events
-    // delete first would shift the OFFSET row out from under the
-    // attachments delete and leave orphaned blobs.
+    // delete first would shift the OFFSET row out from under the attachments delete.
     let events = schema.events_table();
     let attachments = schema.attachments_table();
     let cutoff: Option<i64> = conn
@@ -319,12 +331,29 @@ pub fn prune_retention(
         return;
     };
     let (clauses, patterns) = not_like_clauses(pinned_prefixes);
+    let latest_clauses = latest_only_prefixes
+        .iter()
+        .map(|_| {
+            format!(
+                "AND (event_json NOT LIKE ? OR seq != (SELECT MAX(seq) FROM {events} WHERE session_id = ? AND event_json LIKE ?))"
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
     // Prune the events first. If this fails, return before touching
     // attachments: deleting blobs while their owning events survive would
     // leave replay events pointing at missing data.
-    let prune_sql = format!("DELETE FROM {events} WHERE session_id = ? AND seq <= ? {clauses}");
+    let prune_sql = format!(
+        "DELETE FROM {events} WHERE session_id = ? AND seq <= ? {clauses} {latest_clauses}"
+    );
     let mut prune_params: Vec<Value> = vec![Value::Text(topic.to_owned()), Value::Integer(cutoff)];
     prune_params.extend(patterns.into_iter().map(Value::Text));
+    for prefix in latest_only_prefixes {
+        let pattern = Value::Text(format!("{{\"{prefix}\":%"));
+        prune_params.push(pattern.clone());
+        prune_params.push(Value::Text(topic.to_owned()));
+        prune_params.push(pattern);
+    }
     match conn.execute(&prune_sql, params_from_iter(prune_params)) {
         Ok(0) => return,
         Ok(pruned) => {

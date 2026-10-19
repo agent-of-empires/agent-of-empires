@@ -78,6 +78,7 @@ pub async fn probe_agent(agent: &str) -> anyhow::Result<bool> {
         // In-process stdio: no detached runner, no persistent worker entry.
         socket_path: None,
         stored_acp_session_id: None,
+        strict_resume: false,
         fork_from: None,
         sandbox_info: None,
         source_profile: None,

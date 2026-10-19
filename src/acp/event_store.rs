@@ -78,6 +78,7 @@ const NON_SUBSTANTIVE_EVENT_DISCRIMINANTS: &[&str] = &[
     "AvailableCommandsUpdated",
     "ModesAvailable",
     "CurrentModeChanged",
+    "ConfigOptionsUpdated",
     "AcpSessionAssigned",
     "PromptCapabilities",
 ];
@@ -247,17 +248,21 @@ impl EventStore {
         }
         // Prune oldest beyond the retention cap on every insert so the
         // per-session disk bound stays strict rather than amortised.
-        // NON_SUBSTANTIVE_EVENT_DISCRIMINANTS are exempt: the agent emits
-        // those snapshot events (slash-command list, mode list, ACP session
-        // id) once per session lifecycle near the start of the seq range, so
-        // a long session would otherwise evict them and leave the composer's
-        // `/` palette and the mode picker empty on reconnect. See #1049.
-        events::prune_retention(
+        // Keep the newest configuration snapshot outside the replay cap so a
+        // reattached client can restore approval controls, but let older
+        // snapshots age out like ordinary metadata.
+        let retained = NON_SUBSTANTIVE_EVENT_DISCRIMINANTS
+            .iter()
+            .copied()
+            .filter(|kind| *kind != "ConfigOptionsUpdated")
+            .collect::<Vec<_>>();
+        events::prune_retention_with_latest(
             &conn,
             &self.schema,
             session_id,
             self.max_events_per_session,
-            NON_SUBSTANTIVE_EVENT_DISCRIMINANTS,
+            &retained,
+            &["ConfigOptionsUpdated"],
         );
         Ok(())
     }
@@ -1064,6 +1069,40 @@ impl EventStore {
                 None
             });
         json.and_then(|s| serde_json::from_str(&s).ok())
+    }
+
+    /// Bounded snapshots for an adopted, unchanged worker's native controls.
+    #[cfg(feature = "serve")]
+    pub(crate) fn latest_approval_metadata(&self, session_id: &str) -> Vec<Event> {
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut snapshots = [
+            "$.ModesAvailable",
+            "$.CurrentModeChanged",
+            "$.ConfigOptionsUpdated",
+        ]
+        .map(|path| {
+            conn.query_row(
+                "SELECT seq, event_json FROM acp_events WHERE session_id = ?1
+                     AND json_extract(event_json, ?2) IS NOT NULL ORDER BY seq DESC LIMIT 1",
+                params![session_id, path],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()
+            .unwrap_or_else(|error| {
+                warn!(target: "acp.event_store", "approval metadata query for {session_id}: {error}");
+                None
+            })
+            .and_then(|(seq, json)| serde_json::from_str(&json).ok().map(|event| (seq, event)))
+        });
+        snapshots.sort_unstable_by_key(|event| event.as_ref().map(|(seq, _)| *seq));
+        snapshots
+            .into_iter()
+            .flatten()
+            .map(|(_, event)| event)
+            .collect()
     }
 
     /// Latest event for `session_id` that the sidebar status derivation
@@ -1926,6 +1965,100 @@ mod tests {
         let path = tmp.path().join("acp.db");
         let store = EventStore::open(&path, max).unwrap();
         (tmp, store)
+    }
+
+    #[cfg(feature = "serve")]
+    #[test]
+    fn approval_metadata_replays_native_channels_in_sequence_order() {
+        use crate::acp::auto_approve::ApprovalOptions;
+        use crate::acp::state::{ConfigOptionCategory, ConfigOptionDescriptor};
+
+        let (_tmp, store) = open_store(100);
+        store
+            .record(
+                "s",
+                10,
+                &Event::ConfigOptionsUpdated {
+                    options: vec![ConfigOptionDescriptor {
+                        id: "mode".into(),
+                        name: "Mode".into(),
+                        description: None,
+                        category: ConfigOptionCategory::Mode,
+                        current_value: "default".into(),
+                        options: Vec::new(),
+                    }],
+                },
+            )
+            .unwrap();
+        store
+            .record(
+                "s",
+                11,
+                &Event::CurrentModeChanged {
+                    current_mode_id: "plan".into(),
+                },
+            )
+            .unwrap();
+        store
+            .record(
+                "other",
+                20,
+                &Event::CurrentModeChanged {
+                    current_mode_id: "default".into(),
+                },
+            )
+            .unwrap();
+        let mut metadata = ApprovalOptions::default();
+        for event in store.latest_approval_metadata("s") {
+            metadata.apply(&event);
+        }
+        assert_eq!(metadata.current_mode(), Some("plan"));
+    }
+
+    #[cfg(feature = "serve")]
+    #[test]
+    fn approval_config_snapshot_survives_finite_event_retention() {
+        let (_tmp, store) = open_store(2);
+        let config_event = |current_value: &str| Event::ConfigOptionsUpdated {
+            options: vec![crate::acp::state::ConfigOptionDescriptor {
+                id: "approval".into(),
+                name: "Approval".into(),
+                description: None,
+                category: crate::acp::state::ConfigOptionCategory::Mode,
+                current_value: current_value.into(),
+                options: vec![],
+            }],
+        };
+        store.record("s", 1, &config_event("safe")).unwrap();
+        for seq in 2..=8 {
+            let event = if seq == 5 {
+                config_event("strict")
+            } else {
+                agent_chunk("activity")
+            };
+            store.record("s", seq, &event).unwrap();
+        }
+        let rows = store.replay_page("s", 0, None).events;
+        let metadata = store.latest_approval_metadata("s");
+        assert!(
+            matches!(
+                metadata.as_slice(),
+                [Event::ConfigOptionsUpdated { options }]
+                    if options.iter().any(|option| option.id == "approval" && option.current_value == "strict")
+            ),
+            "unexpected retained approval metadata: {metadata:?}; rows: {rows:?}"
+        );
+        assert!(
+            rows.len() <= 3,
+            "two replay rows plus the latest config snapshot"
+        );
+        let (_tmp_unlimited, unlimited) = open_store(0);
+        for seq in 1..=3 {
+            unlimited
+                .record("unlimited", seq, &agent_chunk("activity"))
+                .unwrap();
+        }
+        assert_eq!(unlimited.replay_page("unlimited", 0, None).events.len(), 3);
     }
 
     fn agent_chunk(text: &str) -> Event {

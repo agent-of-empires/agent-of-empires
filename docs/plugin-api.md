@@ -19,7 +19,7 @@ A manifest carries two independent version axes.
 
 | Key | Meaning |
 |---|---|
-| `api_version` | The manifest *schema* version. The current schema is `13`. The host rejects a manifest whose `api_version` is newer than it supports. Bump it as you adopt newer sections (see below). |
+| `api_version` | The manifest *schema* version. The current schema is `14`. The host rejects a manifest whose `api_version` is newer than it supports. Bump it as you adopt newer sections (see below). |
 | `aoe_version` | A semver requirement on the *host app* version, e.g. `">=1.11.0, <2.0.0"`. The host refuses to install, and skips loading, a plugin whose requirement excludes the running version. Optional; requires `api_version >= 4`. |
 
 Schema additions by `api_version`: `2` added contributions (commands, keybinds, settings, ui), `3` added the `pane` UI slot, `4` added `status` and `aoe_version`, `5` added `screenshots`, `6` added a command `action`, `7` added identity icons, `8` added the `composer-action` UI slot, `9` added session-driving worker RPCs (see [Session-driving RPCs](#session-driving-rpcs)), plugin-private storage, and the `dynamic_select` / `object_list` / `cron` settings widgets, `10` added the `tool-card-badge` UI slot, `11` added the `acp.capabilities.probe` RPC + capability, a `thinking` (thought-level) list on the capability response, the `dynamic_multi_select` object-list field widget, and an optional `project_path` (empty = scratch session), `extra_project_paths`, and a `sandbox` flag on `sessions.create`, plus a `multiline` attribute for `string` settings fields, `12` grew the pane block vocabulary (see [Pane payload](#pane-payload)): the `callout`, `bar` and `columns` kinds, clickable `row`s carrying `params`, header summaries and scrollable bodies on `section`, `disabled` / `variant` / `href` on `action`, and a pane-level `footer`, `13` added `agent_integrations` for provider-native session status and user-requested terminal prompt replies.
@@ -41,7 +41,7 @@ capabilities = ["runtime.worker"]
 | `id` | string | yes | Plugin id (see [Plugin id](#plugin-id)). Namespaces config, events, and action names. |
 | `name` | string | yes | Human-readable display name. |
 | `version` | string | yes | Semantic version of the plugin. |
-| `api_version` | integer | yes | Manifest schema version, `1` to `13`. |
+| `api_version` | integer | yes | Manifest schema version, `1` to `14`. |
 | `description` | string | no | Shown in plugin listings. Defaults to empty. |
 | `aoe_version` | string | no | Host-app semver requirement. Requires `api_version >= 4`. |
 | `capabilities` | array of string | no | Runtime grants the worker needs (see [Capabilities](#capabilities)). Static contributions need none. |

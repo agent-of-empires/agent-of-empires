@@ -66,7 +66,7 @@ pub const KNOWN_CAPABILITIES: &[&str] = &[
     // Reading and mutating the session the plugin is attached to.
     "session.read",
     "session.write",
-    // Provider-native status and explicitly user-requested prompt replies.
+    // Provider-native status, explicit prompt replies, and approval-policy controls.
     "session.integration",
     // Host/global or other-plugin configuration (NOT the plugin's own settings).
     "config.read",

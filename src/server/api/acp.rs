@@ -456,6 +456,7 @@ pub async fn spawn_acp(
             sandbox_info,
             source_profile,
             yolo_mode,
+            auto_approve_managed: instance.auto_approve_managed,
             acp_mode_id,
             agent_command_override: crate::server::acp_reconciler::command_override_for_spawn(
                 &instance.tool,
@@ -949,6 +950,8 @@ pub async fn switch_acp_agent(
             .into_response();
     }
 
+    let inst_lock = state.instance_lock(&id).await;
+    let _guard = inst_lock.lock().await;
     let instance = {
         let instances = state.instances.read().await;
         match instances.iter().find(|i| i.id == id).cloned() {
@@ -987,10 +990,8 @@ pub async fn switch_acp_agent(
     }
 
     let cwd = PathBuf::from(&instance.project_path);
-    let inst_lock = state.instance_lock(&id).await;
-    let sandbox_info = match crate::acp::sandbox::ensure_container_for_session(
+    let sandbox_info = match crate::acp::sandbox::ensure_container_for_session_locked(
         &state.instances,
-        &inst_lock,
         &id,
         false,
     )
@@ -1034,7 +1035,8 @@ pub async fn switch_acp_agent(
             sandbox_info,
             source_profile,
             yolo_mode: instance.yolo_mode,
-            acp_mode_id: instance.acp_mode_id.clone(),
+            auto_approve_managed: false,
+            acp_mode_id: None,
             // Gated in the supervisor: only applies when the selected
             // agent equals the instance tool and its binary matches, so
             // an explicit switch to a different agent is unaffected.
@@ -1068,6 +1070,9 @@ pub async fn switch_acp_agent(
         if let Some(inst) = instances.iter_mut().find(|i| i.id == id) {
             inst.agent_name = Some(target_for_save.clone());
             inst.acp_session_id = None;
+            // Approval controls and their safe-OFF launch pins are agent-specific.
+            inst.acp_mode_id = None;
+            inst.auto_approve_managed = false;
             // Switching backend abandons any pending import (#2276), else a
             // later spawn/reconciler pass treats this as an import and clears
             // the store before spawning.
@@ -1087,6 +1092,8 @@ pub async fn switch_acp_agent(
                 if let Some(inst) = instances.iter_mut().find(|i| i.id == id_for_save) {
                     inst.agent_name = Some(target_for_save.clone());
                     inst.acp_session_id = None;
+                    inst.acp_mode_id = None;
+                    inst.auto_approve_managed = false;
                     inst.import_pending = None;
                     inst.acp_effort = None;
                 }
@@ -1899,6 +1906,7 @@ pub async fn acp_enable(
     let model = instance.agent_model.clone();
     let effort = instance.acp_effort.clone();
     let yolo_mode = instance.yolo_mode;
+    let auto_approve_managed = instance.auto_approve_managed;
     let acp_mode_id = instance.acp_mode_id.clone();
     // #2252 direction B: a claude terminal session's resumable transcript lives
     // in `agent_session_id`, not `acp_session_id`. When present on the host (the
@@ -1976,6 +1984,7 @@ pub async fn acp_enable(
                 sandbox_info,
                 source_profile,
                 yolo_mode,
+                auto_approve_managed,
                 acp_mode_id,
                 agent_command_override: command_override,
                 seed_history_replay,
@@ -2043,6 +2052,17 @@ pub async fn acp_disable(
             view: crate::session::View::Terminal,
         })
         .into_response();
+    }
+    if instance.auto_approve_managed && !instance.yolo_mode {
+        if let Err(error) = crate::session::auto_approve::safe_off_args(&instance.tool) {
+            return (
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({
+                    "message": format!("Cannot preserve auto-approve OFF in terminal view: {error}")
+                })),
+            )
+                .into_response();
+        }
     }
 
     // A real acp -> terminal transition is now committed (the idempotent

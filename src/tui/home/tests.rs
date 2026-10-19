@@ -8239,6 +8239,40 @@ fn trash_then_restore_round_trip() {
         "session must be restored out of trash"
     );
 }
+/// A live approval-policy claim prevents trash from marking or tearing down
+/// the session until the provider acknowledges the policy change.
+#[test]
+#[serial]
+fn trash_refuses_an_in_flight_auto_approve_change() {
+    let mut env = create_test_env_with_sessions(1);
+    let id = env.view.instance_at(0).id.clone();
+    {
+        let storage = env.view.storages.get("test").unwrap();
+        storage
+            .update(|instances, _groups| {
+                let inst = instances.iter_mut().find(|inst| inst.id == id).unwrap();
+                inst.try_claim(
+                    crate::session::ClaimOp::AutoApprove,
+                    Instance::OP_CLAIM_TTL,
+                    chrono::Utc::now(),
+                )
+                .unwrap();
+                Ok(())
+            })
+            .unwrap();
+    }
+
+    env.view.trash_session_by_id(&id);
+
+    assert!(!env.view.get_instance(&id).unwrap().is_trashed());
+    let persisted = env.view.storages.get("test").unwrap().load().unwrap();
+    let inst = persisted.iter().find(|inst| inst.id == id).unwrap();
+    assert!(!inst.is_trashed());
+    assert_eq!(
+        inst.op_claim.as_ref().map(|claim| claim.op),
+        Some(crate::session::ClaimOp::AutoApprove)
+    );
+}
 
 /// Regression for #2489: trashing a session must not re-expand a Trash
 /// section the user has collapsed. Like single-row archive, the section
@@ -8521,7 +8555,7 @@ fn empty_trash_confirm_purges_every_trashed_row() {
             "each trashed row must be claimed and marked Deleting"
         );
         assert!(
-            env.view.purge_claimed.contains(id),
+            env.view.purge_claimed.contains_key(id),
             "each row's purge claim must be owned"
         );
     }
@@ -18300,6 +18334,8 @@ mod permission_response_dialog {
             revision: 7,
             status: AgentIntegrationStatus::Waiting,
             reply_keys: Vec::new(),
+            auto_approve: None,
+            control_ack: None,
             prompt: Some(AgentIntegrationPrompt::Question {
                 id: "prompt-1".into(),
                 title: "Choose".into(),

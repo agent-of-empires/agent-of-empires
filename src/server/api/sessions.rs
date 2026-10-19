@@ -2695,36 +2695,35 @@ pub async fn trash_session(
         inst.source_profile.clone()
     };
 
-    let persist_id = id.clone();
-    if persist_session_update(
-        profile,
-        "trash",
-        state.file_watch.clone(),
-        move |instances| {
-            if let Some(inst) = instances.iter_mut().find(|i| i.id == persist_id) {
-                inst.trash();
-                // Mark the teardown in flight (ClaimOp::Trash) so peers
-                // observe it as durable state. Best-effort: a refused claim
-                // still tears down, gated by the pre-move re-check and the
-                // locked relocation commit.
-                if let Err(holder) = inst.try_claim(
-                    crate::session::ClaimOp::Trash,
-                    Instance::OP_CLAIM_TTL,
-                    chrono::Utc::now(),
-                ) {
-                    tracing::info!(
-                        target: "http.api.sessions",
-                        session = %inst.id,
-                        "trash teardown runs unclaimed; a fresh {holder:?} claim holds the row"
-                    );
-                }
-            }
-        },
-    )
+    let claim_id = id.clone();
+    let decision = match with_locked_storage(&state, &profile, move |instances| {
+        crate::session::claim::decide_trash_claim(instances, &claim_id, chrono::Utc::now())
+    })
     .await
-    .is_err()
     {
-        return persist_failed_response();
+        Ok(decision) => decision,
+        Err(()) => return persist_failed_response(),
+    };
+    match decision {
+        crate::session::claim::TrashClaimDecision::Claimed => {}
+        crate::session::claim::TrashClaimDecision::AutoApproveInProgress => {
+            return (
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({"message": "Auto-approve change is in progress"})),
+            )
+                .into_response();
+        }
+        crate::session::claim::TrashClaimDecision::PurgeInProgress
+        | crate::session::claim::TrashClaimDecision::RestoreInProgress => {
+            return (
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({"message": "Session lifecycle operation is in progress"})),
+            )
+                .into_response();
+        }
+        crate::session::claim::TrashClaimDecision::AlreadyGone => {
+            return super::session_not_found();
+        }
     }
 
     // Disk durable; apply to memory and snapshot what teardown needs.
@@ -2970,6 +2969,13 @@ pub async fn restore_session(
                     "error": "purge_in_progress",
                     "message": "Session is being purged; restore was refused"
                 })),
+            )
+                .into_response();
+        }
+        Ok(crate::session::claim::RestoreClaimDecision::AutoApproveInProgress) => {
+            return (
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({ "message": "Auto-approve change is in progress" })),
             )
                 .into_response();
         }
@@ -3940,6 +3946,9 @@ async fn purge_session_artifacts(
         | Ok(crate::session::claim::PurgeClaimDecision::RestoreInProgress) => {
             return Err("Session is being restored, so it was not purged".to_string())
         }
+        Ok(crate::session::claim::PurgeClaimDecision::AutoApproveInProgress) => {
+            return Err("Auto-approve change is in progress".to_string())
+        }
         Err(()) => {
             return Err("Failed to acquire the purge claim under the storage lock".to_string())
         }
@@ -4311,6 +4320,7 @@ pub async fn delete_session(
             }
         }
 
+        let prior_status = instance.status;
         match purge_session_artifacts(&state, &id, instance, &body, recent_entry).await {
             Ok((removed, messages)) => (
                 StatusCode::OK,
@@ -4322,6 +4332,21 @@ pub async fn delete_session(
                 })),
             ),
             Err(msg) => {
+                if msg == "Auto-approve change is in progress" {
+                    if let Some(instance) = state
+                        .instances
+                        .write()
+                        .await
+                        .iter_mut()
+                        .find(|instance| instance.id == id)
+                    {
+                        instance.status = prior_status;
+                    }
+                    return (
+                        StatusCode::CONFLICT,
+                        Json(serde_json::json!({ "message": msg })),
+                    );
+                }
                 mark_delete_error(&state, &id, msg.clone()).await;
                 tracing::error!(target: "http.api.sessions", "delete failed: {msg}");
                 (
@@ -4542,6 +4567,8 @@ async fn purge_workspace_artifacts(
         }
 
         let recent_entry = crate::session::recent_project_entry_for(&instance);
+        let prior_status = instance.status;
+        let prior_error = instance.last_error.clone();
         match purge_session_artifacts(state, &id, instance, &body, recent_entry).await {
             Ok((removed, mut msgs)) => {
                 messages.append(&mut msgs);
@@ -4553,7 +4580,15 @@ async fn purge_workspace_artifacts(
                 }
             }
             Err(msg) => {
-                mark_delete_error(state, &id, msg.clone()).await;
+                if msg == "Auto-approve change is in progress" {
+                    let mut instances = state.instances.write().await;
+                    if let Some(inst) = instances.iter_mut().find(|inst| inst.id == id) {
+                        inst.status = prior_status;
+                        inst.last_error = prior_error.clone();
+                    }
+                } else {
+                    mark_delete_error(state, &id, msg.clone()).await;
+                }
                 failed.push(WorkspaceDeleteFailure {
                     id: id.clone(),
                     error: msg,
@@ -4649,7 +4684,14 @@ pub async fn delete_workspace(
                     .join("; ");
                 tracing::error!(target: "http.api.sessions", "workspace delete failed: {msg}");
                 return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
+                    if failed
+                        .iter()
+                        .all(|failure| failure.error.contains("Auto-approve change is in progress"))
+                    {
+                        StatusCode::CONFLICT
+                    } else {
+                        StatusCode::INTERNAL_SERVER_ERROR
+                    },
                     Json(serde_json::json!({
                         "error": "deletion_failed",
                         "message": msg,

@@ -2115,6 +2115,7 @@ function AppContent({
               onStartSession={handleStartSession}
               onSwitchView={handleSwitchView}
               readOnly={serverAbout?.read_only}
+              cityhall={caps.cityhall}
               canManageProjects={caps.canManageProjects}
               sortMode={sidebarSortMode}
               onSortModeChange={selectSidebarSortMode}

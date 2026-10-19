@@ -1971,6 +1971,10 @@ fn build_router(state: Arc<AppState>) -> Router {
         )
         .route("/api/sessions/{id}/acp/mode", post(api::acp_set_mode))
         .route(
+            "/api/sessions/{id}/auto-approve",
+            post(api::set_auto_approve),
+        )
+        .route(
             "/api/sessions/{id}/acp/config-option",
             post(api::acp_set_config_option),
         )
@@ -2498,6 +2502,7 @@ const CITYHALL_MUTATION_DENY: &[(&str, &str)] = &[
     ("POST", "/api/sessions/{id}/acp/enable"),
     ("POST", "/api/sessions/{id}/acp/install-agent"),
     ("POST", "/api/sessions/{id}/acp/mode"),
+    ("POST", "/api/sessions/{id}/auto-approve"),
     ("POST", "/api/sessions/{id}/acp/spawn"),
     ("POST", "/api/sessions/{id}/acp/switch-agent"),
     // Global settings / ops / shared workspace ordering.

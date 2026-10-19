@@ -456,6 +456,8 @@ pub struct SpawnConfig {
     /// load failure the task falls back to `session/new` and emits a
     /// `SessionContextReset` event.
     pub stored_acp_session_id: Option<String>,
+    /// Refuse session/new when a recorded conversation cannot be loaded.
+    pub strict_resume: bool,
     /// When `Some`, this spawn is a structured fork: instead of `session/new`
     /// or `session/load`, the connection task sends `session/fork` with this
     /// parent ACP session id (provided the agent advertises the fork
@@ -591,6 +593,11 @@ enum ClientCmd {
         config_id: String,
         value: String,
     },
+    SetApproval {
+        target: super::auto_approve::ApprovalTarget,
+        respond_to: oneshot::Sender<Result<(), String>>,
+    },
+    SessionReady(oneshot::Sender<(String, bool, String)>),
     /// Send the experimental `session/delete` RPC for the given ACP
     /// session id and report the outcome via `respond_to`. Issued by
     /// the supervisor before the existing shutdown path during structured view
@@ -657,6 +664,7 @@ pub enum ResetSessionOutcome {
 enum ConnectMode {
     Fresh {
         stored_acp_session_id: Option<String>,
+        strict_resume: bool,
         /// Seed the event store from the `session/load` history replay
         /// instead of suppressing it (imported session, empty store). See
         /// #2276.
@@ -2370,6 +2378,15 @@ impl AcpClient {
                     ClientCmd::ForceStop => "force_stop",
                     ClientCmd::SetMode(_) => "set_mode",
                     ClientCmd::SetConfigOption { .. } => "set_config_option",
+                    ClientCmd::SetApproval { respond_to, .. } => {
+                        let _ =
+                            respond_to.send(Err("fake adapter has no approval controls".into()));
+                        "set_approval"
+                    }
+                    ClientCmd::SessionReady(respond_to) => {
+                        let _ = respond_to.send(("fake-id".into(), false, String::new()));
+                        "session_ready"
+                    }
                     ClientCmd::DeleteSession { respond_to, .. } => {
                         let _ = respond_to.send(DeleteSessionOutcome::UnsupportedMethod);
                         "delete_session"
@@ -2462,6 +2479,7 @@ impl AcpClient {
         //    a real `aoe` binary, and as a safety valve.
         let mode = ConnectMode::Fresh {
             stored_acp_session_id: config.stored_acp_session_id.clone(),
+            strict_resume: config.strict_resume,
             seed_history_replay: config.seed_history_replay,
             fork_from: config.fork_from.clone(),
         };
@@ -2962,6 +2980,43 @@ impl AcpClient {
                 value: value.to_string(),
             })
             .await
+            .map_err(|_| AcpError::AgentExited)
+    }
+
+    pub(crate) async fn set_approval(
+        &self,
+        target: super::auto_approve::ApprovalTarget,
+    ) -> Result<(), AcpError> {
+        let (respond_to, rx) = oneshot::channel();
+        self.cmd_tx
+            .as_ref()
+            .ok_or(AcpError::NotRunning)?
+            .send(ClientCmd::SetApproval { target, respond_to })
+            .await
+            .map_err(|_| AcpError::AgentExited)?;
+        tokio::time::timeout(std::time::Duration::from_secs(15), rx)
+            .await
+            .map_err(|_| {
+                AcpError::Protocol(
+                    "Approval change acknowledgement timed out; policy is unknown".into(),
+                )
+            })?
+            .map_err(|_| AcpError::AgentExited)?
+            .map_err(AcpError::Protocol)
+    }
+
+    /// Completes only after session/new or session/load has actually returned.
+    pub(crate) async fn session_ready(&self) -> Result<(String, bool, String), AcpError> {
+        let (respond_to, rx) = oneshot::channel();
+        self.cmd_tx
+            .as_ref()
+            .ok_or(AcpError::NotRunning)?
+            .send(ClientCmd::SessionReady(respond_to))
+            .await
+            .map_err(|_| AcpError::AgentExited)?;
+        tokio::time::timeout(std::time::Duration::from_secs(30), rx)
+            .await
+            .map_err(|_| AcpError::Protocol("Session resume acknowledgement timed out".into()))?
             .map_err(|_| AcpError::AgentExited)
     }
 
@@ -3721,17 +3776,22 @@ fn spawn_runner_detached(
         "spawning detached structured view runner"
     );
 
-    cmd.spawn().map_err(|e| {
-        warn!(
-            target: "acp.protocol.spawn",
-            session = %session_id,
-            "runner spawn failed: {e}"
-        );
-        AcpError::Spawn(format!("spawn runner: {e}"))
-    })?;
-    // Drop the std::process::Child here. std::process::Command doesn't
-    // wait on drop, so the runner stays alive. setsid + nohup-equivalent
-    // make this an actual detach.
+    let mut child = tokio::process::Command::from(cmd)
+        .kill_on_drop(false)
+        .spawn()
+        .map_err(|e| {
+            warn!(
+                target: "acp.protocol.spawn",
+                session = %session_id,
+                "runner spawn failed: {e}"
+            );
+            AcpError::Spawn(format!("spawn runner: {e}"))
+        })?;
+    // Reap while the daemon lives without tying the runner's lifetime to it.
+    // An unreaped child still looks alive to the restart's PID probe.
+    tokio::spawn(async move {
+        let _ = child.wait().await;
+    });
     Ok(())
 }
 
@@ -6223,6 +6283,65 @@ fn resolve_mode_set_target<'a>(
     }
 }
 
+/// Persist approval changes only after the adapter accepts, and config
+/// selectors confirm the actual value rather than merely accepting an RPC.
+fn dispatch_set_approval(
+    connection: &ConnectionTo<Agent>,
+    session_id: &SessionId,
+    target: super::auto_approve::ApprovalTarget,
+    event_tx: mpsc::Sender<Event>,
+    respond_to: oneshot::Sender<Result<(), String>>,
+) {
+    if let Some(config_id) = target.config_id {
+        let sent = connection.send_request(SetSessionConfigOptionRequest::new(
+            session_id.clone(),
+            SessionConfigId::new(config_id.clone()),
+            SessionConfigValueId::new(target.mode_id.clone()),
+        ));
+        tokio::spawn(async move {
+            let result = match sent.block_task().await {
+                Ok(response) => {
+                    let options: Vec<_> = response
+                        .config_options
+                        .into_iter()
+                        .filter_map(map_acp_config_option)
+                        .collect();
+                    let accepted = options.iter().any(|option| {
+                        option.id == config_id && option.current_value == target.mode_id
+                    });
+                    let _ = event_tx.send(Event::ConfigOptionsUpdated { options }).await;
+                    if accepted {
+                        Ok(())
+                    } else {
+                        Err("Adapter did not acknowledge the requested approval value".into())
+                    }
+                }
+                Err(error) => Err(error.to_string()),
+            };
+            let _ = respond_to.send(result);
+        });
+    } else {
+        let sent = connection.send_request(SetSessionModeRequest::new(
+            session_id.clone(),
+            target.mode_id.clone(),
+        ));
+        tokio::spawn(async move {
+            let result = match sent.block_task().await {
+                Ok(_) => {
+                    let _ = event_tx
+                        .send(Event::CurrentModeChanged {
+                            current_mode_id: target.mode_id,
+                        })
+                        .await;
+                    Ok(())
+                }
+                Err(error) => Err(error.to_string()),
+            };
+            let _ = respond_to.send(result);
+        });
+    }
+}
+
 fn dispatch_set_mode(
     connection: &ConnectionTo<Agent>,
     acp_session_id: &SessionId,
@@ -7135,6 +7254,7 @@ async fn run_connection_task<W, R>(
                 }
                 ConnectMode::Fresh {
                     stored_acp_session_id,
+                    strict_resume,
                     seed_history_replay,
                     fork_from,
                 } => {
@@ -7288,6 +7408,9 @@ async fn run_connection_task<W, R>(
                             .await;
                     }
 
+                    if strict_resume && stored_acp_session_id.is_some() && !load_session_capable {
+                        return Err(acp_internal_error("Cannot preserve this conversation: session/load is not supported".into()));
+                    }
                     if acp_session_id.is_none() && load_session_capable {
                         if let Some(stored) = stored_acp_session_id.clone() {
                             info!(
@@ -7347,6 +7470,15 @@ async fn run_connection_task<W, R>(
                                     if modes.is_some() {
                                         available_mode_ids = modes;
                                     }
+                                    if let Some(modes) = resp.modes.as_ref() {
+                                        let _ = event_tx_for_block.send(Event::ModesAvailable {
+                                            current_mode_id: modes.current_mode_id.0.to_string(),
+                                            modes: modes.available_modes.iter().map(|mode| ModeInfo {
+                                                id: mode.id.0.to_string(), name: mode.name.clone(),
+                                                description: mode.description.clone(),
+                                            }).collect(),
+                                        }).await;
+                                    }
                                     mode_config_option_id = resp
                                         .config_options
                                         .as_deref()
@@ -7381,22 +7513,14 @@ async fn run_connection_task<W, R>(
                                     }
                                     acp_session_id = Some(SessionId::from(stored));
                                 }
-                                Err(e) if seed_history_replay => {
-                                    // Import seed (#2276): the replay may have
-                                    // partially populated the (otherwise empty)
-                                    // event store before load failed. Falling
-                                    // back to session/new would leave a fresh
-                                    // session inheriting that partial external
-                                    // transcript, so fail the import instead.
-                                    // import_pending stays set (no
-                                    // AcpSessionAssigned), and the next spawn
-                                    // clears the store and re-seeds before
-                                    // retrying.
+                                Err(e) if seed_history_replay || strict_resume => {
+                                    // Imports and approval restarts must not replace
+                                    // the recorded conversation with a fresh one.
                                     warn!(
                                         target: "acp.protocol",
                                         session = %session_label,
                                         stored_id = %stored,
-                                        "session/load failed for imported session; failing import (no session/new fallback): {e}"
+                                        "session/load failed; strict resume refuses session/new fallback: {e}"
                                     );
                                     return Err(e);
                                 }
@@ -7507,7 +7631,7 @@ async fn run_connection_task<W, R>(
                         // mode channels are intentionally not driven from
                         // defaults here (see #2631).
                         if let (Some(mode_value), Some(options)) =
-                            (default_mode.as_deref(), config_options.as_deref())
+                            (default_mode.as_deref().filter(|mode| !super::auto_approve::is_native_approval_mode(profile.key, mode)), config_options.as_deref())
                         {
                             if let Some(config_id) = mode_config_id(options) {
                                 info!(
@@ -7561,6 +7685,26 @@ async fn run_connection_task<W, R>(
                     }
                 }
             };
+
+            // Reassert safe-OFF after new/load before any queued prompt can run.
+            if let Some(mode_id) = default_mode.as_deref()
+                .filter(|mode| super::auto_approve::is_native_approval_mode(profile.key, mode))
+            {
+                let target = resolve_mode_set_target(mode_id, &available_mode_ids, mode_config_option_id.as_deref())
+                    .ok_or_else(|| acp_internal_error(format!("Stored approval mode {mode_id:?} is no longer advertised")))?;
+                let config_id = match target {
+                    ModeSetTarget::ConfigOption(id) => Some(id.to_string()),
+                    ModeSetTarget::SessionMode => None,
+                };
+                let (respond_to, response) = oneshot::channel();
+                dispatch_set_approval(&connection, &acp_session_id,
+                    super::auto_approve::ApprovalTarget { config_id, mode_id: mode_id.into() },
+                    event_tx_for_block.clone(), respond_to);
+                tokio::time::timeout(Duration::from_secs(15), response).await
+                    .map_err(|_| acp_internal_error("Stored approval policy acknowledgement timed out".into()))?
+                    .map_err(|_| acp_internal_error("Stored approval policy acknowledgement was lost".into()))?
+                    .map_err(acp_internal_error)?;
+            }
 
             // Apply the session's reasoning effort ("thought level") once, after
             // whichever establish call ran. This sits outside the branches on
@@ -8428,6 +8572,13 @@ async fn run_connection_task<W, R>(
                                             shutdown = true;
                                             break;
                                         }
+                                        Some(ClientCmd::SetApproval { target, respond_to }) => {
+                                            dispatch_set_approval(&connection, &acp_session_id, target, event_tx_for_block.clone(), respond_to);
+                                        }
+                                        Some(ClientCmd::SessionReady(respond_to)) => {
+                                            let version = init.agent_info.as_ref().filter(|info| info.name == "omp").map(|info| info.version.clone()).unwrap_or_default();
+                                            let _ = respond_to.send((acp_session_id.0.to_string(), load_session_capable, version));
+                                        }
                                         Some(ClientCmd::SetConfigOption { config_id, value }) => {
                                             dispatch_set_config_option(
                                                 &connection,
@@ -8759,6 +8910,13 @@ async fn run_connection_task<W, R>(
                         adopted_turn_active.store(false, Ordering::Relaxed);
                         between_prompt_active.store(false, Ordering::Relaxed);
                         let _ = send_session_cancel!();
+                    }
+                    Some(ClientCmd::SetApproval { target, respond_to }) => {
+                        dispatch_set_approval(&connection, &acp_session_id, target, event_tx_for_block.clone(), respond_to);
+                    }
+                    Some(ClientCmd::SessionReady(respond_to)) => {
+                        let version = init.agent_info.as_ref().filter(|info| info.name == "omp").map(|info| info.version.clone()).unwrap_or_default();
+                        let _ = respond_to.send((acp_session_id.0.to_string(), load_session_capable, version));
                     }
                     Some(ClientCmd::SetMode(mode_id)) => {
                         dispatch_set_mode(
@@ -11628,6 +11786,7 @@ mod tests {
             default_mode: None,
             socket_path: None,
             stored_acp_session_id: None,
+            strict_resume: false,
             fork_from: None,
             seed_history_replay: false,
             artifact_dir: None,
@@ -11703,6 +11862,7 @@ mod tests {
             default_mode: None,
             socket_path: None,
             stored_acp_session_id: None,
+            strict_resume: false,
             fork_from: None,
             seed_history_replay: false,
             artifact_dir: None,
@@ -11780,6 +11940,7 @@ mod tests {
             default_mode: None,
             socket_path: None,
             stored_acp_session_id: None,
+            strict_resume: false,
             fork_from: None,
             seed_history_replay: false,
             artifact_dir: None,
@@ -11882,7 +12043,7 @@ while IFS= read -r line; do
   id=$(printf '%s' "$line" | sed -En 's/.*"id":("[^"]*"|[0-9]+).*/\1/p')
   case $line in
     *'"method":"initialize"'*)
-      printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":1,"agentCapabilities":{"loadSession":false}}}\n' "$id"
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":1,"agentCapabilities":{"loadSession":%s}}}\n' "$id" "${FAKE_ACP_LOAD_SESSION:-false}"
       ;;
     *'"method":"session/new"'*)
       count=$((count+1))
@@ -11890,10 +12051,30 @@ while IFS= read -r line; do
       printf '{"jsonrpc":"2.0","id":%s,"result":{"sessionId":"sid-%d","configOptions":[{"id":"effort","name":"Reasoning Effort","category":"thought_level","type":"select","currentValue":"default","options":[{"value":"default","name":"Default"},{"value":"high","name":"High"}]}]}}\n' "$id" "$count"
       __INITIAL_NOTIFICATION__
       ;;
+    *'"method":"session/load"'*)
+      if [ "${FAKE_ACP_LOAD_FAIL:-0}" = 1 ]; then
+        printf '{"jsonrpc":"2.0","id":%s,"error":{"code":-32000,"message":"conversation unavailable"}}\n' "$id"
+        continue
+      fi
+      count=1
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"modes":{"currentModeId":"agent-full-access","availableModes":[{"id":"agent","name":"Agent"},{"id":"agent-full-access","name":"Full access"}]},"configOptions":[]}}\n' "$id"
+      ;;
     *'"method":"session/set_config_option"'*)
       config_count=$((config_count+1))
       if [ "$config_count" -eq 2 ] && [ "$RESET_CONFIG_DELAY" -gt 0 ]; then sleep "$RESET_CONFIG_DELAY"; fi
-      printf '{"jsonrpc":"2.0","id":%s,"result":{"configOptions":[]}}\n' "$id"
+      case $line in
+        *'"configId":"mode"'*)
+          case $line in
+            *'"value":"agent-full-access"'*) mode=agent-full-access ;;
+            *) mode=agent ;;
+          esac
+          printf '{"jsonrpc":"2.0","id":%s,"result":{"configOptions":[{"id":"mode","name":"Mode","category":"mode","type":"select","currentValue":"%s","options":[{"value":"agent","name":"Agent"},{"value":"agent-full-access","name":"Full access"}]}]}}\n' "$id" "$mode"
+          ;;
+        *) printf '{"jsonrpc":"2.0","id":%s,"result":{"configOptions":[]}}\n' "$id" ;;
+      esac
+      ;;
+    *'"method":"session/set_mode"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{}}\n' "$id"
       ;;
     *'"method":"session/prompt"'*)
       printf '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"sid-%d","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"working"}}}}\n' "$count"
@@ -11999,12 +12180,106 @@ done
             default_mode: None,
             socket_path: None,
             stored_acp_session_id: None,
+            strict_resume: false,
             fork_from: None,
             seed_history_replay: false,
             artifact_dir: None,
             sandbox_info: None,
             source_profile: None,
             mcp_servers: Vec::new(),
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn approval_rejects_unconfirmed_config_and_replays_safe_policy_before_prompts() {
+        for resume in [false, true] {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let (script, capture) = write_reset_fake_agent(tmp.path(), 0, 0, 0);
+            let mut config = reset_fake_spawn_config(&script, tmp.path());
+            config.default_mode = Some("agent".into());
+            if resume {
+                config.stored_acp_session_id = Some("sid-1".into());
+                config
+                    .provider_env
+                    .push(("FAKE_ACP_LOAD_SESSION".into(), "true".into()));
+            }
+            let client = AcpClient::spawn(config, AcpSessionId("approval-round-trip".into()))
+                .await
+                .unwrap();
+            client.session_ready().await.unwrap();
+            client
+                .send_prompt("verify safe startup", &[])
+                .await
+                .unwrap();
+            for config_id in [None, Some("mode".to_string())] {
+                for mode_id in ["agent-full-access", "agent"] {
+                    client
+                        .set_approval(super::super::auto_approve::ApprovalTarget {
+                            config_id: config_id.clone(),
+                            mode_id: mode_id.into(),
+                        })
+                        .await
+                        .unwrap();
+                }
+            }
+            let rejected = client
+                .set_approval(super::super::auto_approve::ApprovalTarget {
+                    config_id: Some("unconfirmed".into()),
+                    mode_id: "agent-full-access".into(),
+                })
+                .await
+                .unwrap_err();
+            assert!(matches!(rejected, AcpError::Protocol(_)));
+            let wire = std::fs::read_to_string(capture).unwrap();
+            assert!(
+                wire.find("\"method\":\"session/set_mode\"").unwrap()
+                    < wire.find("\"method\":\"session/prompt\"").unwrap(),
+                "safe approval policy must be acknowledged before the first prompt"
+            );
+            let _ = client.shutdown().await;
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn strict_approval_resume_refuses_fresh_fallback_without_changing_normal_omp_resumes() {
+        for strict_resume in [false, true] {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let (script, _) = write_reset_fake_agent(tmp.path(), 0, 0, 0);
+            let mut config = reset_fake_spawn_config(&script, tmp.path());
+            config.agent_key = "omp".into();
+            config.stored_acp_session_id = Some("old-conversation".into());
+            config.strict_resume = strict_resume;
+            config.provider_env.extend([
+                ("FAKE_ACP_LOAD_SESSION".into(), "true".into()),
+                ("FAKE_ACP_LOAD_FAIL".into(), "1".into()),
+            ]);
+            let mut client = AcpClient::spawn(config, AcpSessionId("strict-resume".into()))
+                .await
+                .unwrap();
+            let mut events = client.take_inbound().unwrap();
+            let ready = client.session_ready().await;
+            if strict_resume {
+                assert!(
+                    ready.is_err(),
+                    "approval resume must fail before a fresh session becomes ready"
+                );
+            } else {
+                assert_eq!(ready.unwrap().0, "sid-1");
+                tokio::time::timeout(Duration::from_secs(5), async {
+                    loop {
+                        match events.recv().await {
+                            Some(Event::SessionContextReset { .. }) => break,
+                            Some(_) => {}
+                            None => panic!("normal resume fallback must notify the consumer"),
+                        }
+                    }
+                })
+                .await
+                .unwrap();
+            }
+            let _ = client.shutdown().await;
         }
     }
 
@@ -12596,6 +12871,7 @@ done
             default_mode: None,
             socket_path: None,
             stored_acp_session_id: None,
+            strict_resume: false,
             fork_from: None,
             seed_history_replay: false,
             artifact_dir: None,
@@ -12634,6 +12910,7 @@ done
             default_mode: None,
             socket_path: None,
             stored_acp_session_id: None,
+            strict_resume: false,
             fork_from: None,
             seed_history_replay: false,
             artifact_dir: None,
@@ -15137,6 +15414,7 @@ done
             default_mode: None,
             socket_path: None,
             stored_acp_session_id: None,
+            strict_resume: false,
             fork_from: None,
             seed_history_replay: false,
             artifact_dir: None,

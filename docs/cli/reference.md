@@ -20,6 +20,7 @@ This document contains the help content for the `aoe` command-line program.
 * [`aoe session start`↴](#aoe-session-start)
 * [`aoe session stop`↴](#aoe-session-stop)
 * [`aoe session restart`↴](#aoe-session-restart)
+* [`aoe session auto-approve`↴](#aoe-session-auto-approve)
 * [`aoe session attach`↴](#aoe-session-attach)
 * [`aoe session show`↴](#aoe-session-show)
 * [`aoe session rename`↴](#aoe-session-rename)
@@ -370,6 +371,7 @@ Manage session lifecycle (start, stop, attach, etc.)
 * `start` — Start a session's tmux process
 * `stop` — Stop session process
 * `restart` — Restart session (or all sessions with `--all`)
+* `auto-approve` — Change approval policy, preserving a running session's conversation
 * `attach` — Attach to session interactively
 * `show` — Show session details
 * `rename` — Rename a session
@@ -433,6 +435,24 @@ Restart session (or all sessions with `--all`)
 * `--parallel <PARALLEL>` — Concurrency cap for `--all`. Restarting many sandboxed sessions in parallel pressures dockerd, so the default is intentionally modest. Ignored when `--all` is not set
 
   Default value: `3`
+
+
+
+## `aoe session auto-approve`
+
+Change approval policy, preserving a running session's conversation
+
+Uses live controls when supported; otherwise restarts and resumes the recorded conversation, interrupting its current turn. Never starts fresh.
+
+**Usage:** `aoe session auto-approve <IDENTIFIER> <POLICY>`
+
+###### **Arguments:**
+
+* `<IDENTIFIER>` — Session ID or title
+* `<POLICY>`
+
+  Possible values: `on`, `off`
+
 
 
 

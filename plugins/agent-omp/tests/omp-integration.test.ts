@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test";
-import { ensurePrivateDirectories, integrationDirectory, nativeApprovalKey, observeApproval, observeAskDialog, validateReply } from "../omp-extension/index.ts";
+import { approvalController, ensurePrivateDirectories, integrationDirectory, nativeApprovalKey, observeApproval, observeAskDialog, validateControl, validateReply } from "../omp-extension/index.ts";
 import { chmodSync, mkdtempSync, rmSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -138,5 +138,30 @@ test("provider creates owner-only directories and uses the shared /tmp hook path
     expect(await ensurePrivateDirectories(root, dir, uid)).toBe(false);
   } finally {
     rmSync(scratch, { recursive: true, force: true });
+  }
+});
+
+test("approval controls restore a safe prior policy and cannot negate force-on launch flags", () => {
+  for (const initial of ["always-ask", "write", "yolo"] as const) {
+    let mode = initial as "always-ask" | "write" | "yolo";
+    const setting = { get: () => mode, override(_settings: unknown, value: typeof mode) { mode = value; } };
+    const control = approvalController(setting, {}, false);
+    control.set(true);
+    expect(control.state()).toEqual({ enabled: true, reversible: true });
+    control.set(false);
+    expect(mode).toBe(initial === "yolo" ? "always-ask" : initial);
+    const forced = approvalController(setting, {}, true);
+    expect(() => forced.set(false)).toThrow("restart");
+    expect(forced.state()).toEqual({ enabled: true, reversible: false });
+  }
+});
+
+test("policy control requests bind identity, writer, revision, nonce and boolean intent", () => {
+  const control = { schema_version: 1, instance_id: snapshot.instance_id, provider_session_id: snapshot.provider_session_id,
+    writer_pid: snapshot.writer_pid, revision: snapshot.revision, request_id: validReply.response_id, enabled: true };
+  expect(validateControl(control, snapshot)).toBe(true);
+  for (const patch of [{ instance_id: "other" }, { provider_session_id: "other" }, { writer_pid: 456 },
+    { revision: 6 }, { request_id: "invalid" }, { enabled: "on" }]) {
+    expect(validateControl({ ...control, ...patch }, snapshot)).toBe(false);
   }
 });

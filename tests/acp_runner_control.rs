@@ -202,7 +202,7 @@ fn find_python3() -> Option<PathBuf> {
 
 /// #2976 Phase B: the runner owns the ACP handshake. Drive it as a v2
 /// daemon over the control channel across two attaches and assert the
-/// agent is handshaken (initialize + session/new) exactly once, that the
+/// agent is handshaken (initialize + session/new or session/load) exactly once, that the
 /// second attach replays the cache without touching the agent, and that a
 /// prompt completes natively.
 #[test]
@@ -215,18 +215,19 @@ fn runner_owns_handshake_and_caches_across_attaches() {
         return;
     };
 
-    let scratch = Scratch::new("hs");
-    let home = scratch.0.join("home");
-    let xdg = scratch.0.join("xdg");
-    std::fs::create_dir_all(&home).unwrap();
-    std::fs::create_dir_all(&xdg).unwrap();
+    for method in ["session/new", "session/load"] {
+        let scratch = Scratch::new("hs");
+        let home = scratch.0.join("home");
+        let xdg = scratch.0.join("xdg");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(&xdg).unwrap();
 
-    // A minimal ACP agent: responds to the runner-issued handshake and
-    // prompt requests and appends each received method to a log so the test
-    // can assert the agent saw each exactly once.
-    let agent_log = scratch.0.join("agent-methods.log");
-    let agent_py = scratch.0.join("fake_agent.py");
-    std::fs::write(
+        // A minimal ACP agent: responds to the runner-issued handshake and
+        // prompt requests and appends each received method to a log so the test
+        // can assert the agent saw each exactly once.
+        let agent_log = scratch.0.join("agent-methods.log");
+        let agent_py = scratch.0.join("fake_agent.py");
+        std::fs::write(
         &agent_py,
         r#"
 import sys, json, os
@@ -246,9 +247,11 @@ for line in sys.stdin:
     with open(log, "a") as f:
         f.write(method + "\n")
     if method == "initialize":
-        result = {"protocolVersion": 1, "agentCapabilities": {"loadSession": False, "promptCapabilities": {}}}
+        result = {"protocolVersion": 1, "agentCapabilities": {"loadSession": True, "promptCapabilities": {}}}
     elif method == "session/new":
         result = {"sessionId": "sess-fake-1"}
+    elif method == "session/load":
+        result = {}
     elif method == "session/prompt":
         result = {"stopReason": "end_turn"}
     else:
@@ -259,126 +262,137 @@ for line in sys.stdin:
     )
     .unwrap();
 
-    let session_id = "shs00001";
-    let workers = app_dir(&home, &xdg).join("acp-workers");
-    let socket = workers.join(format!("{session_id}.sock"));
-    let control = workers.join(format!("{session_id}.control.sock"));
-    let record = workers.join(format!("{session_id}.json"));
+        let session_id = "shs00001";
+        let workers = app_dir(&home, &xdg).join("acp-workers");
+        let socket = workers.join(format!("{session_id}.sock"));
+        let control = workers.join(format!("{session_id}.control.sock"));
+        let record = workers.join(format!("{session_id}.json"));
 
-    let bin = env!("CARGO_BIN_EXE_aoe");
-    let _child = KillOnDrop(
-        Command::new(bin)
-            .args([
-                "__acp-runner",
-                "--socket",
-                socket.to_str().unwrap(),
-                "--session-id",
-                session_id,
-                "--agent-name",
-                "fake-agent",
-                "--cwd",
-                home.to_str().unwrap(),
-                "--",
-                python3.to_str().unwrap(),
-                agent_py.to_str().unwrap(),
-            ])
-            .env("HOME", &home)
-            .env("XDG_CONFIG_HOME", &xdg)
-            .env("AOE_FAKE_AGENT_LOG", &agent_log)
-            .env("AOE_ACP_WATCHDOG_POLL_MS", "150")
-            .spawn()
-            .expect("spawn acp runner"),
-    );
-
-    wait_for(&record, "registry record");
-    wait_for(&control, "control socket");
-
-    let v2 = serde_json::json!(2);
-
-    // --- First attach: the runner runs the handshake against the agent. ---
-    {
-        let mut ctl = UnixStream::connect(&control).expect("connect control socket");
-        ctl.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
-        let hello = read_frame(&mut ctl);
-        assert_eq!(hello["kind"], "hello");
-        assert_eq!(hello["control_protocol_version"], v2);
-
-        write_frame(
-            &mut ctl,
-            &serde_json::json!({"kind": "attach", "control_protocol_version": 2}),
+        let bin = env!("CARGO_BIN_EXE_aoe");
+        let _child = KillOnDrop(
+            Command::new(bin)
+                .args([
+                    "__acp-runner",
+                    "--socket",
+                    socket.to_str().unwrap(),
+                    "--session-id",
+                    session_id,
+                    "--agent-name",
+                    "fake-agent",
+                    "--cwd",
+                    home.to_str().unwrap(),
+                    "--",
+                    python3.to_str().unwrap(),
+                    agent_py.to_str().unwrap(),
+                ])
+                .env("HOME", &home)
+                .env("XDG_CONFIG_HOME", &xdg)
+                .env("AOE_FAKE_AGENT_LOG", &agent_log)
+                .env("AOE_ACP_WATCHDOG_POLL_MS", "150")
+                .spawn()
+                .expect("spawn acp runner"),
         );
-        write_frame(
-            &mut ctl,
-            &serde_json::json!({"kind": "initialize", "request": {"protocolVersion": 1}}),
-        );
-        let initialized = read_frame(&mut ctl);
-        assert_eq!(initialized["kind"], "initialized");
-        assert!(initialized["result"].is_object());
 
-        write_frame(
-            &mut ctl,
-            &serde_json::json!({"kind": "establish_session", "method": "session/new", "request": {"cwd": home.to_str().unwrap()}}),
-        );
-        let ready = read_frame(&mut ctl);
-        assert_eq!(ready["kind"], "session_ready");
-        assert_eq!(ready["acp_session_id"], "sess-fake-1");
+        wait_for(&record, "registry record");
+        wait_for(&control, "control socket");
 
-        write_frame(
-            &mut ctl,
-            &serde_json::json!({"kind": "prompt", "request": {"sessionId": "sess-fake-1", "prompt": []}}),
+        let v2 = serde_json::json!(2);
+
+        // --- First attach: the runner runs the handshake against the agent. ---
+        {
+            let mut ctl = UnixStream::connect(&control).expect("connect control socket");
+            ctl.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+            let hello = read_frame(&mut ctl);
+            assert_eq!(hello["kind"], "hello");
+            assert_eq!(hello["control_protocol_version"], v2);
+
+            write_frame(
+                &mut ctl,
+                &serde_json::json!({"kind": "attach", "control_protocol_version": 2}),
+            );
+            write_frame(
+                &mut ctl,
+                &serde_json::json!({"kind": "initialize", "request": {"protocolVersion": 1}}),
+            );
+            let initialized = read_frame(&mut ctl);
+            assert_eq!(initialized["kind"], "initialized");
+            assert!(initialized["result"].is_object());
+
+            let mut request = serde_json::json!({"cwd": home.to_str().unwrap()});
+            if method == "session/load" {
+                request["sessionId"] = serde_json::json!("sess-fake-1");
+            }
+            write_frame(
+                &mut ctl,
+                &serde_json::json!({"kind": "establish_session", "method": method, "request": request}),
+            );
+            let ready = read_frame(&mut ctl);
+            assert_eq!(ready["kind"], "session_ready");
+            assert_eq!(ready["acp_session_id"], "sess-fake-1");
+
+            write_frame(
+                &mut ctl,
+                &serde_json::json!({"kind": "prompt", "request": {"sessionId": "sess-fake-1", "prompt": []}}),
+            );
+            let completed = read_frame(&mut ctl);
+            assert_eq!(completed["kind"], "prompt_completed");
+            assert_eq!(completed["outcome"]["status"], "completed");
+            assert_eq!(completed["outcome"]["stop_reason"], "end_turn");
+        }
+
+        // --- Second attach: the runner replays the cache, no agent contact. ---
+        {
+            let mut ctl = UnixStream::connect(&control).expect("reconnect control socket");
+            ctl.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+            let hello = read_frame(&mut ctl);
+            assert_eq!(hello["kind"], "hello");
+
+            write_frame(
+                &mut ctl,
+                &serde_json::json!({"kind": "attach", "control_protocol_version": 2}),
+            );
+            write_frame(
+                &mut ctl,
+                &serde_json::json!({"kind": "initialize", "request": {"protocolVersion": 1}}),
+            );
+            let initialized = read_frame(&mut ctl);
+            assert_eq!(initialized["kind"], "initialized");
+
+            write_frame(
+                &mut ctl,
+                &serde_json::json!({"kind": "establish_session", "method": "session/new", "request": {}}),
+            );
+            let ready = read_frame(&mut ctl);
+            assert_eq!(ready["kind"], "session_ready");
+            assert_eq!(ready["acp_session_id"], "sess-fake-1");
+        }
+
+        // The agent saw the handshake exactly once despite two attaches; the
+        // second attach was served entirely from the runner's cache.
+        let methods = std::fs::read_to_string(&agent_log).unwrap_or_default();
+        let count = |m: &str| methods.lines().filter(|l| *l == m).count();
+        assert_eq!(
+            count("initialize"),
+            1,
+            "initialize sent to agent once: {methods:?}"
         );
-        let completed = read_frame(&mut ctl);
-        assert_eq!(completed["kind"], "prompt_completed");
-        assert_eq!(completed["outcome"]["status"], "completed");
-        assert_eq!(completed["outcome"]["stop_reason"], "end_turn");
+        assert_eq!(count(method), 1, "{method} sent to agent once: {methods:?}");
+        let unused_method = if method == "session/new" {
+            "session/load"
+        } else {
+            "session/new"
+        };
+        assert_eq!(
+            count(unused_method),
+            0,
+            "must not replace the conversation: {methods:?}"
+        );
+        assert_eq!(
+            count("session/prompt"),
+            1,
+            "session/prompt sent to agent once: {methods:?}"
+        );
     }
-
-    // --- Second attach: the runner replays the cache, no agent contact. ---
-    {
-        let mut ctl = UnixStream::connect(&control).expect("reconnect control socket");
-        ctl.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
-        let hello = read_frame(&mut ctl);
-        assert_eq!(hello["kind"], "hello");
-
-        write_frame(
-            &mut ctl,
-            &serde_json::json!({"kind": "attach", "control_protocol_version": 2}),
-        );
-        write_frame(
-            &mut ctl,
-            &serde_json::json!({"kind": "initialize", "request": {"protocolVersion": 1}}),
-        );
-        let initialized = read_frame(&mut ctl);
-        assert_eq!(initialized["kind"], "initialized");
-
-        write_frame(
-            &mut ctl,
-            &serde_json::json!({"kind": "establish_session", "method": "session/new", "request": {}}),
-        );
-        let ready = read_frame(&mut ctl);
-        assert_eq!(ready["kind"], "session_ready");
-        assert_eq!(ready["acp_session_id"], "sess-fake-1");
-    }
-
-    // The agent saw the handshake exactly once despite two attaches; the
-    // second attach was served entirely from the runner's cache.
-    let methods = std::fs::read_to_string(&agent_log).unwrap_or_default();
-    let count = |m: &str| methods.lines().filter(|l| *l == m).count();
-    assert_eq!(
-        count("initialize"),
-        1,
-        "initialize sent to agent once: {methods:?}"
-    );
-    assert_eq!(
-        count("session/new"),
-        1,
-        "session/new sent to agent once: {methods:?}"
-    );
-    assert_eq!(
-        count("session/prompt"),
-        1,
-        "session/prompt sent to agent once: {methods:?}"
-    );
 }
 
 /// #2976 Phase B regression: when the agent answers `session/new` with a

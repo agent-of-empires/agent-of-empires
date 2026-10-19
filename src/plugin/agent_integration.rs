@@ -11,6 +11,7 @@ use anyhow::{bail, ensure, Context, Result};
 use aoe_plugin_api::agent_integration::{
     AgentIntegrationKey, AgentIntegrationPrompt, AgentIntegrationReply, AgentIntegrationResponse,
     AgentIntegrationSnapshot, AgentIntegrationStatus, IntegrationApprovalChoice,
+    IntegrationControl,
 };
 
 use crate::hooks::dir_guard;
@@ -352,6 +353,88 @@ pub fn respond(
     tmux.send_key_tokens(&tokens)
 }
 
+/// Change policy only through an authenticated native provider acknowledgment.
+/// No key is sent: providers poll controls independently of open prompt dialogs.
+pub fn set_auto_approve(instance: &Instance, enabled: bool) -> Result<()> {
+    ensure!(
+        supports_provider_integration(instance),
+        "native approval control is unavailable"
+    );
+    let registry = super::registry();
+    let plugin = provider(&registry, &instance.tool)?
+        .context("provider integration is not enabled and approved")?;
+    let current =
+        read_report(&instance.id, plugin)?.context("provider integration report is unavailable")?;
+    let policy = current
+        .auto_approve
+        .as_ref()
+        .context("provider does not advertise runtime approval control")?;
+    ensure!(
+        enabled || policy.reversible,
+        "provider requires restart to disable forced auto-approve"
+    );
+    let tmux = instance.tmux_session()?;
+    ensure!(
+        tmux.exists() && !tmux.is_pane_dead(),
+        "target session is not live"
+    );
+    let request_id = uuid::Uuid::new_v4().to_string();
+    let request = IntegrationControl {
+        schema_version: 1,
+        instance_id: &current.instance_id,
+        provider_session_id: &current.provider_session_id,
+        writer_pid: current.writer_pid,
+        revision: current.revision,
+        request_id: &request_id,
+        enabled,
+    };
+    let dir = dir_guard::open_instance_dir(&instance.id)?;
+    let filename = format!("integration-{}.control.json", plugin.id());
+    dir_guard::write_atomic(dir.as_fd(), &filename, &serde_json::to_vec(&request)?)?;
+    let deadline = std::time::Instant::now() + Duration::from_secs(3);
+    let outcome = (|| loop {
+        let report = read_report(&instance.id, plugin)?
+            .context("provider report disappeared before acknowledgment")?;
+        ensure!(
+            report.provider_session_id == current.provider_session_id
+                && report.writer_pid == current.writer_pid,
+            "provider session changed before acknowledgment"
+        );
+        if let Some(ack) = report
+            .control_ack
+            .as_ref()
+            .filter(|ack| ack.request_id == request_id)
+        {
+            ensure!(
+                ack.revision == current.revision,
+                "control acknowledgment revision mismatch"
+            );
+            if let Some(error) = &ack.error {
+                break Err(anyhow::anyhow!("{error}"));
+            }
+            ensure!(
+                ack.enabled == enabled
+                    && report
+                        .auto_approve
+                        .as_ref()
+                        .is_some_and(|p| p.enabled == enabled),
+                "provider did not acknowledge requested approval policy"
+            );
+            break Ok(());
+        }
+        if std::time::Instant::now() >= deadline {
+            break Err(anyhow::anyhow!("provider did not acknowledge approval control; live state is unknown, metadata was not changed"));
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    })();
+    let _ = nix::unistd::unlinkat(
+        dir.as_fd(),
+        filename.as_str(),
+        nix::unistd::UnlinkatFlags::NoRemoveDir,
+    );
+    outcome
+}
+
 pub(crate) fn forget(instance_id: &str) {
     CACHE
         .lock()
@@ -375,6 +458,8 @@ mod tests {
             revision: 1,
             status: AgentIntegrationStatus::Waiting,
             reply_keys: vec![AgentIntegrationKey::Named("F12".into())],
+            auto_approve: None,
+            control_ack: None,
             prompt: Some(AgentIntegrationPrompt::Approval {
                 id: "approval-1".into(),
                 title: "Bash".into(),

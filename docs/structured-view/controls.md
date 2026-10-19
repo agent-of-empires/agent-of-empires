@@ -17,7 +17,39 @@ A session runs in one of the modes its ACP adapter advertises. The mode picker s
 
 Other adapters report their own ids (Gemini's `auto_edit` and `yolo` map onto `acceptEdits` and `bypassPermissions`).
 
-Turning on `[session] yolo_mode_default` (or the wizard's "Auto-approve actions" toggle) asks the adapter to start in `bypassPermissions`. This is best-effort: if the adapter accepts, the picker flips and approval cards stop; if it rejects, an amber notice appears and the session keeps running in whatever mode it landed on. `claude-agent-acp` only offers `bypassPermissions` when `aoe serve` was launched with `ALLOW_BYPASS=1` in its environment; without it, use `acceptEdits` or approve as you go.
+Turning on `[session] yolo_mode_default` (or the wizard's "Auto-approve actions" toggle) asks the adapter to start in its agent-specific bypass mode. This startup default is best-effort: an unsupported adapter keeps its normal mode. `claude-agent-acp` only offers `bypassPermissions` when `aoe serve` was launched with `ALLOW_BYPASS=1`; without it, use `acceptEdits` or approve as you go.
+
+### Changing auto-approve during a session
+
+Choose an explicit **On** or **Off** policy without creating a new AoE session:
+
+- **Session list:** use **Enable auto-approve** or **Disable auto-approve** in the command palette.
+- **Native structured view:** press **F4**, choose the policy, then press Enter.
+- **Web dashboard:** open the session's sidebar context menu, then **Auto-approve…**.
+- **CLI:**
+
+  ```sh
+  aoe session auto-approve my-session on
+  aoe session auto-approve my-session off
+  ```
+
+AoE uses a verified live control when available, otherwise a strict restart/resume:
+
+| Agent | Terminal sessions | Structured view |
+|-------|-------------------|-----------------|
+| OMP | Live with the approved [paired integration](../plugins.md#omp-paired-integration-prototype); restart/resume otherwise | Restart/load with native OMP 18.10.3 or newer |
+| Claude, Codex, Gemini | Restart/resume | Live, when both bypass and safe modes are advertised |
+| Qwen | Restart/resume | Unsupported |
+| Kimi | Unsupported | Live, when reversible modes are advertised |
+| Vibe | Unsupported because safe terminal profiles vary by version | Live, using the advertised `ask` or `default` safe profile |
+| Other agents | Explicit unsupported error | Explicit unsupported error |
+
+Terminal switching is host-only; sandboxed terminal sessions and conflicting custom launch commands or permission flags are rejected. OMP's packaged live integration requires both paired artifacts. New OMP YOLO launches use reversible `--approval-mode yolo`; an existing force-on `--auto-approve` or `--yolo` process must restart to turn off.
+
+A restart interrupts the current turn, requires a captured resumable conversation, and does not send a wake-up prompt or fall back to a fresh conversation. Adopted OMP workers without their original launch configuration, incompatible versions, and custom OMP ACP launchers are rejected before teardown. The result is persisted only after acknowledgement. If a connection times out, the operation can still complete; inspect the session before retrying.
+
+**Off** restores native approval policy, not a revocation of previously granted per-tool permissions. Existing tools are not rolled back. Live policy changes do not answer pending approval cards; restart/resume cancels the interrupted turn's approval and question cards. Codex applies mode changes on its next turn. OMP's Default/Plan mode is preserved independently of its approval policy.
+
 
 ## Approvals
 

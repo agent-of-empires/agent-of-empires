@@ -48,5 +48,6 @@ pub use manifest::{
 /// gained the `callout`, `bar`, and `columns` kinds, clickable/badged `row`s,
 /// header-summary and scrollable `section`s, `disabled`/`variant` actions, and
 /// the pane-level `footer`; 13 when provider-native session status and
-/// user-requested terminal replies gained `agent_integrations`.
-pub const API_VERSION: u32 = 13;
+/// user-requested terminal replies gained `agent_integrations`; 14 when native
+/// approval-policy observations, controls, and acknowledgements were added.
+pub const API_VERSION: u32 = 14;

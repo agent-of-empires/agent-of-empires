@@ -86,6 +86,8 @@ pub enum ActionId {
     /// is disabled (#3039). Terminal sessions rename locally; structured
     /// sessions go through the daemon.
     AutoName,
+    EnableAutoApprove,
+    DisableAutoApprove,
 }
 
 /// A single chord. `ctrl` requires the Control modifier; Shift is implicit in
@@ -986,6 +988,32 @@ pub static BINDINGS: &[Binding] = &[
             serve_only: false,
         }),
     },
+    Binding {
+        id: ActionId::EnableAutoApprove,
+        non_strict: &[],
+        strict: &[],
+        context: Context::Always,
+        help: None,
+        palette: Some(PaletteMeta {
+            title: "Enable auto-approve (may restart agent)",
+            keywords: &["approval", "permissions", "yolo", "allow", "on"],
+            group: PaletteGroup::Actions,
+            serve_only: false,
+        }),
+    },
+    Binding {
+        id: ActionId::DisableAutoApprove,
+        non_strict: &[],
+        strict: &[],
+        context: Context::Always,
+        help: None,
+        palette: Some(PaletteMeta {
+            title: "Disable auto-approve (may restart agent)",
+            keywords: &["approval", "permissions", "yolo", "ask", "off"],
+            group: PaletteGroup::Actions,
+            serve_only: false,
+        }),
+    },
 ];
 
 /// Stable palette/test id for an action (matches the legacy `builtin_commands`
@@ -1031,6 +1059,8 @@ pub fn palette_id(id: ActionId) -> &'static str {
         ActionId::Skills => "skills",
         ActionId::Fork => "fork",
         ActionId::AutoName => "auto-name",
+        ActionId::EnableAutoApprove => "enable-auto-approve",
+        ActionId::DisableAutoApprove => "disable-auto-approve",
     }
 }
 

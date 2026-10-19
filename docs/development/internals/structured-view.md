@@ -10,6 +10,11 @@ Workers run as detached `aoe __acp-runner` processes that outlive the daemon. `a
 
 Each runner registers at `<app_dir>/acp-workers/<session_id>.json` (PID, socket path, cached ACP session id, `build_version`); the same dir holds the per-session `.sock` and `.log` (runner stderr drain). `aoe ps --acp --dead` lists them.
 
+While the spawning daemon is alive, it waits asynchronously for each runner so
+exited children are reaped rather than mistaken for active workers during a
+restart. The runner caches the loaded session ID from the `session/load`
+request; unlike `session/new` and `session/fork`, its response has no `sessionId`.
+
 - **Process-group termination.** Runners are group leaders via `setsid`; every termination path signals the whole group so the node ACP wrapper and the SDK child die with the runner instead of reparenting to PID 1. A `SIGKILL`'d runner can still leak (it cannot run cleanup), so prefer the verbs over `kill -9`.
 - **Self-termination watchdog.** The reapers above need a live daemon, so each runner also polls its own registry record and self-destructs when abandoned: record vanished, superseded by a newer runner, or detached with no daemon for longer than a 48h retention window (reset on every reattach; a pending `aoe acp restart` is exempt). Backstop for a daemon that dies without killing its runners (#1921).
 - **Detach buffer.** Between `--stop` and the next `aoe serve`, the runner buffers up to 256 agent→daemon notification lines for replay on reattach. Permission requests issued while detached block the turn until reattach.
@@ -39,7 +44,10 @@ If context restoration fails (the agent's stored session is gone), the view fall
 
 ## Permission modes and model channels
 
-Modes come from `NewSessionResponse.modes`; the picker shows whatever the adapter reports. Gemini's `auto_edit`/`yolo` `ApprovalMode` names fold onto `acceptEdits`/`bypassPermissions`. YOLO (`[session] yolo_mode_default`) fires `session/set_mode("bypassPermissions")` after `session/new`, best-effort. claude-agent-acp gates `bypassPermissions` on the `ALLOW_BYPASS=1` daemon env var; without it `set_mode` returns "not available" and the session stays `default` (surfaced as a non-blocking amber notice).
+Modes come from `session/new` and `session/load`; the picker shows whatever the adapter reports. Startup YOLO (`[session] yolo_mode_default`) requests the profile's agent-specific bypass mode, best-effort. Claude's adapter gates `bypassPermissions` on `ALLOW_BYPASS=1`.
+
+Explicit `POST /api/sessions/{id}/auto-approve` operations are acknowledged, not fire-and-forget. A verified adapter must advertise both its bypass mode and a safe mode; config-option responses must confirm the requested current value. A durable per-session claim and the instance mutex serialize the mutation, and accepted safe-OFF modes are reapplied before queued prompts after new/load. Native OMP has no approval selector in its Default/Plan channel: it restarts with `--approval-mode=yolo` or `--approval-mode=always-ask`, requires strict same-ID `session/load`, then restores the independent planning mode. Strict approval resumes cannot send `session/new` after load failure; untouched sessions retain their existing context-reset fallback. See the [user controls and agent matrix](../../structured-view/controls.md#changing-auto-approve-during-a-session).
+
 
 Model and reasoning-effort selectors arrive over two wire mechanisms, normalized into one dropdown:
 

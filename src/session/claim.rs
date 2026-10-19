@@ -7,15 +7,13 @@
 //! `session` layer keeps the three surfaces from reaching into `cli` for
 //! shared logic. See #2534, #2541.
 //!
-//! Trash claim lifecycle: each trash site (TUI `trash_session_by_id` via the
-//! same-flock `apply_user_action_with` hook, the server trash handler's
-//! persist closure, CLI `remove`) sets the claim with `Instance::try_claim`
-//! in the SAME `storage.update` that writes the trash marker, so a peer can
+//! Trash claim lifecycle: each trash site (TUI `trash_session_by_id`, the
+//! server trash handler, and CLI `remove`) calls [`decide_trash_claim`] inside
+//! the SAME `storage.update` that writes the trash marker, so a peer can
 //! never read a trashed row without its in-flight claim. A refused claim
-//! (fresh peer purge/restore) still tears down, gated by the pre-move
-//! re-check and the locked relocation commit. Release happens on every
-//! terminal teardown path: [`commit_trash_relocation`] for relocation
-//! outcomes, [`release_trash_claim`] for the no-relocation ones.
+//! aborts trash before teardown. Release happens on every terminal teardown
+//! path: [`commit_trash_relocation`] for relocation outcomes,
+//! [`release_trash_claim`] for the no-relocation terminal paths.
 //!
 //! TTL asymmetries, all deliberate: the teardown's gates
 //! (`Instance::is_seized_by_fresh_peer_claim`) only yield to a FRESH peer
@@ -43,6 +41,39 @@ pub(crate) fn purge_restored_row_must_be_kept(targeted_trashed: bool, still_tras
     targeted_trashed && !still_trashed
 }
 
+/// Outcome of the locked Trash claim-and-marker transaction.
+#[derive(Debug, PartialEq)]
+pub(crate) enum TrashClaimDecision {
+    Claimed,
+    PurgeInProgress,
+    RestoreInProgress,
+    AutoApproveInProgress,
+    AlreadyGone,
+}
+
+/// Claim and mark a session trashed atomically under the storage flock. A
+/// refused claim leaves the row and its live session untouched.
+pub(crate) fn decide_trash_claim(
+    all: &mut [Instance],
+    id: &str,
+    now: DateTime<Utc>,
+) -> TrashClaimDecision {
+    match all.iter_mut().find(|i| i.id == id) {
+        None => TrashClaimDecision::AlreadyGone,
+        Some(stored) => match stored.try_claim(ClaimOp::Trash, Instance::OP_CLAIM_TTL, now) {
+            Ok(()) => {
+                stored.trash();
+                TrashClaimDecision::Claimed
+            }
+            Err(ClaimOp::Purge) => TrashClaimDecision::PurgeInProgress,
+            Err(ClaimOp::Restore) => TrashClaimDecision::RestoreInProgress,
+            Err(ClaimOp::AutoApprove) => TrashClaimDecision::AutoApproveInProgress,
+            Err(ClaimOp::Trash) => unreachable!("try_claim(Trash) cannot be refused by Trash"),
+        },
+    }
+}
+
+/// Decides whether a permanent purge must KEEP a row it had targeted, because
 /// Outcome of the purge claim decision, run under the storage flock before the
 /// unlocked teardown at every purge site (CLI, server, TUI). Shared so all
 /// three surfaces close the same race windows identically. See #2534, #2541.
@@ -57,6 +88,8 @@ pub(crate) enum PurgeClaimDecision {
     Restored,
     /// A peer holds a fresh Restore claim on the row.
     RestoreInProgress,
+    /// A policy change owns the row until its provider acknowledges.
+    AutoApproveInProgress,
     /// The row is gone from disk (a peer already removed it).
     AlreadyGone,
 }
@@ -80,8 +113,7 @@ pub(crate) fn decide_purge_claim(
         Some(stored) => match stored.try_claim(ClaimOp::Purge, Instance::OP_CLAIM_TTL, now) {
             Ok(()) => PurgeClaimDecision::Claimed,
             Err(ClaimOp::Restore) => PurgeClaimDecision::RestoreInProgress,
-            // `try_claim(Purge)` only ever refuses with the OTHER op, and a
-            // fresh Trash claim is seized rather than refused.
+            Err(ClaimOp::AutoApprove) => PurgeClaimDecision::AutoApproveInProgress,
             Err(ClaimOp::Purge) => unreachable!("try_claim(Purge) cannot be refused by Purge"),
             Err(ClaimOp::Trash) => unreachable!("try_claim seizes a fresh Trash claim"),
         },
@@ -131,6 +163,8 @@ pub(crate) enum RestoreClaimDecision {
     Claimed,
     /// A peer holds a fresh Purge claim, so the restore is refused.
     PurgeInProgress,
+    /// A policy change owns the row until its provider acknowledges.
+    AutoApproveInProgress,
     /// The trashed row is gone from disk.
     AlreadyGone,
 }
@@ -148,6 +182,7 @@ pub(crate) fn decide_restore_claim(
         Some(stored) => match stored.try_claim(ClaimOp::Restore, Instance::OP_CLAIM_TTL, now) {
             Ok(()) => RestoreClaimDecision::Claimed,
             Err(ClaimOp::Purge) => RestoreClaimDecision::PurgeInProgress,
+            Err(ClaimOp::AutoApprove) => RestoreClaimDecision::AutoApproveInProgress,
             Err(ClaimOp::Restore) => {
                 unreachable!("try_claim(Restore) cannot be refused by Restore")
             }
@@ -379,21 +414,20 @@ mod tests {
     }
 
     #[test]
-    fn trash_claim_never_overwrites_a_fresh_peer_claim() {
-        // The acquisition sites call `try_claim(Trash)` directly (in the same
-        // flock write as the trash marker); a fresh peer claim must refuse it
-        // and stay intact.
-        let mut row = trashed("b");
+    fn trash_claim_refuses_a_fresh_peer_claim_without_marking_the_row() {
+        let mut row = Instance::new("s", "/tmp/x");
+        row.id = "b".to_string();
         row.try_claim(ClaimOp::Purge, Instance::OP_CLAIM_TTL, Utc::now())
             .unwrap();
+        let mut all = vec![row];
         assert_eq!(
-            row.try_claim(ClaimOp::Trash, Instance::OP_CLAIM_TTL, Utc::now()),
-            Err(ClaimOp::Purge)
+            decide_trash_claim(&mut all, "b", Utc::now()),
+            TrashClaimDecision::PurgeInProgress
         );
+        assert!(!all[0].is_trashed());
         assert_eq!(
-            row.op_claim.as_ref().map(|c| c.op),
-            Some(ClaimOp::Purge),
-            "a peer-held claim is never overwritten by trash"
+            all[0].op_claim.as_ref().map(|claim| claim.op),
+            Some(ClaimOp::Purge)
         );
     }
 

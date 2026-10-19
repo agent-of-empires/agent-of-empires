@@ -79,6 +79,8 @@ pub enum Intent {
     /// Open the permission-mode picker (transcript `m`, when the agent
     /// advertised modes).
     OpenModePicker,
+    /// Explicit approval policy, independent of the agent's mode picker.
+    OpenAutoApprovePicker,
     /// Open the answer picker for the oldest pending elicitation
     /// (transcript `a`). The view layer decides whether the form is
     /// natively answerable or punts to the web.
@@ -167,6 +169,10 @@ pub fn dispatch(focus: Focus, key: &KeyEvent, ctx: InputContext) -> Intent {
     // composer. A no-op when the queue is empty.
     if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('x') {
         return Intent::ClearQueue;
+    }
+    // Keep an existing modal picker in charge until it is dismissed.
+    if !ctx.choice_picker_open && key.modifiers.is_empty() && key.code == KeyCode::F(4) {
+        return Intent::OpenAutoApprovePicker;
     }
     // An open choice picker (mode / answer) owns its navigation keys from
     // any focus: the user deliberately opened it, and it closes on
@@ -462,6 +468,38 @@ mod tests {
         InputContext {
             has_pending_approval: true,
             ..InputContext::default()
+        }
+    }
+
+    #[test]
+    fn auto_approve_shortcut_preserves_text_and_modal_focus() {
+        for focus in [
+            Focus::Composer,
+            Focus::Transcript,
+            Focus::Approval,
+            Focus::Pane,
+        ] {
+            assert_eq!(
+                dispatch(focus, &key(KeyCode::F(4)), ctx()),
+                Intent::OpenAutoApprovePicker
+            );
+            assert_eq!(
+                dispatch(
+                    focus,
+                    &key(KeyCode::F(4)),
+                    InputContext {
+                        choice_picker_open: true,
+                        ..ctx()
+                    }
+                ),
+                Intent::Ignore
+            );
+        }
+        for c in ['a', 'A', 'd', 'y'] {
+            assert_eq!(
+                dispatch(Focus::Composer, &key(KeyCode::Char(c)), ctx()),
+                Intent::Compose(key(KeyCode::Char(c)))
+            );
         }
     }
 

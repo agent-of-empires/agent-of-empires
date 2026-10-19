@@ -2934,8 +2934,30 @@ impl HomeView {
             ActionId::Tips => self.open_tips_dialog(),
             ActionId::Fork => self.open_fork_from_selection(),
             ActionId::AutoName => return self.auto_name_selected(),
+            ActionId::EnableAutoApprove => return self.set_auto_approve_selected(true),
+            ActionId::DisableAutoApprove => return self.set_auto_approve_selected(false),
         }
         None
+    }
+
+    fn set_auto_approve_selected(&mut self, enabled: bool) -> Option<Action> {
+        let Some(instance) = self
+            .selected_session
+            .as_deref()
+            .and_then(|id| self.get_instance(id))
+        else {
+            self.info_dialog = Some(InfoDialog::new(
+                "No Session Selected",
+                "Select a session to change auto-approve.",
+            ));
+            return None;
+        };
+        Some(Action::SetAutoApprove {
+            session_id: instance.id.clone(),
+            profile: instance.source_profile.clone(),
+            enabled,
+            structured: instance.is_structured(),
+        })
     }
 
     fn open_new_from_selection(&mut self) {

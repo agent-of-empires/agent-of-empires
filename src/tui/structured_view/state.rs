@@ -41,6 +41,11 @@ pub struct StructuredViewState {
     /// Toast banner that appears briefly above the composer, e.g.
     /// "prompt sent" or an HTTP error.
     pub toast: Option<ToastBanner>,
+    pub auto_approve_rx: Option<
+        tokio::sync::oneshot::Receiver<
+            Result<crate::session::auto_approve::AutoApproveResult, String>,
+        >,
+    >,
     /// Prompts the user queued while a turn was in flight, awaiting the
     /// next idle drain. Pure local state, like the web composer's queue.
     pub queue: PromptQueue,
@@ -141,6 +146,8 @@ pub struct ChoicePicker {
 pub enum ChoicePurpose {
     /// Accepting POSTs `session/set_mode` with the chosen mode id.
     Mode,
+    /// Explicit on/off policy, not inferred from Default/Plan modes.
+    AutoApprove,
     /// A numbered plugin-link picker: the option `value` is the URL to open in
     /// the browser. Shown when a plugin `open-ui-link` chord resolves to more
     /// than one link (a multi-repo workspace with several open PRs).
@@ -269,6 +276,7 @@ impl StructuredViewState {
             selected_approval: None,
             ws,
             toast: None,
+            auto_approve_rx: None,
             queue: PromptQueue::default(),
             in_flight: false,
             slash_selected: 0,

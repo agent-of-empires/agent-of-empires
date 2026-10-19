@@ -40,6 +40,7 @@ fn spawn_config(
         default_mode: None,
         socket_path: None,
         stored_acp_session_id,
+        strict_resume: false,
         fork_from: None,
         seed_history_replay: false,
         artifact_dir: None,
