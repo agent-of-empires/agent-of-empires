@@ -123,25 +123,28 @@ fn append_to_log(path: &std::path::Path) -> std::process::Stdio {
 
 /// A Worker started for a bare adapter name that resolved nowhere can only exit
 /// before its Hello, which loses the cause (#4576). Paths and `${placeholder}`
-/// commands resolve elsewhere, a sandbox resolves inside its container, and the
-/// runner searches the last configured `PATH` it applies to the adapter.
+/// commands resolve elsewhere, and a sandbox resolves inside its container.
+/// The adapter searches the last `PATH` in `agent_environment`, else the
+/// inherited one, from its cwd, so relative entries resolve against the project.
 fn refuse_unresolved_adapter(
     config: &SpawnConfig,
     sandboxed: bool,
     resolved: bool,
+    agent_environment: &[(String, String)],
+    inherited_path: Option<&std::ffi::OsStr>,
 ) -> Result<(), AcpError> {
     if sandboxed || resolved || !is_bare_command(&config.spec.command) {
         return Ok(());
     }
-    let configured_path = config
-        .host_environment
+    let path = agent_environment
         .iter()
-        .chain(&config.provider_routing)
         .rev()
-        .find(|(key, _)| key == "PATH");
-    if configured_path.is_some_and(|(_, path)| {
-        which::which_in(&config.spec.command, Some(path), &config.cwd).is_ok()
-    }) {
+        .find(|(key, _)| key == "PATH")
+        .map(|(_, path)| std::ffi::OsStr::new(path))
+        .or(inherited_path);
+    if path
+        .is_some_and(|path| which::which_in(&config.spec.command, Some(path), &config.cwd).is_ok())
+    {
         return Ok(());
     }
     Err(AcpError::missing_binary_spawn_error(
@@ -215,7 +218,35 @@ pub(super) async fn spawn_runner_detached(
         let app_dir = crate::session::get_app_dir().ok();
         resolve_agent_command(&config.spec.command, app_dir.as_deref())
     };
-    refuse_unresolved_adapter(config, sandbox_argv.is_some(), resolved.is_some())?;
+    // Trusted `Config.environment`, then the provider pick that outranks it, for
+    // the adapter only: they ride a carrier key the runner strips and applies to
+    // its child, because HOME, PATH or XDG_CONFIG_HOME set on the runner itself
+    // would move its worker registry (#1383) or change which binary it loads.
+    let host_environment: Vec<(String, String)> = config
+        .host_environment
+        .iter()
+        .chain(&config.provider_routing)
+        .filter(|(key, _)| match host_environment_denyreason(key) {
+            Some(reason) => {
+                warn!(
+                    target: "acp",
+                    key = %key,
+                    reason,
+                    "rejecting configured host environment key",
+                );
+                false
+            }
+            None => true,
+        })
+        .cloned()
+        .collect();
+    refuse_unresolved_adapter(
+        config,
+        sandbox_argv.is_some(),
+        resolved.is_some(),
+        &host_environment,
+        std::env::var_os("PATH").as_deref(),
+    )?;
     let (spawn_command, extra_path_dirs): (String, Vec<std::path::PathBuf>) =
         match (&sandbox_argv, &resolved) {
             (Some(s), _) => (s.docker_binary.clone(), Vec::new()),
@@ -288,30 +319,6 @@ pub(super) async fn spawn_runner_detached(
     if let Ok(interval) = std::env::var("AOE_ACP_WATCHDOG_POLL_MS") {
         cmd.env("AOE_ACP_WATCHDOG_POLL_MS", interval);
     }
-    // Trusted `Config.environment`, then the provider pick that outranks it,
-    // for the adapter only, riding one reserved
-    // carrier key (JSON `[[key, value], ...]`) that the runner strips and
-    // applies to its child. HOME / PATH / XDG_CONFIG_HOME are legal entries
-    // here, and setting those on the runner itself would move the
-    // worker-registry path it writes (#1383) or change which binary it loads.
-    let host_environment: Vec<(String, String)> = config
-        .host_environment
-        .iter()
-        .chain(&config.provider_routing)
-        .filter(|(key, _)| match host_environment_denyreason(key) {
-            Some(reason) => {
-                warn!(
-                    target: "acp",
-                    key = %key,
-                    reason,
-                    "rejecting configured host environment key",
-                );
-                false
-            }
-            None => true,
-        })
-        .cloned()
-        .collect();
     if !host_environment.is_empty() {
         let encoded = serde_json::to_string(&host_environment)
             .map_err(|e| AcpError::Spawn(format!("encode host environment: {e}")))?;
@@ -631,7 +638,9 @@ mod tests {
     fn refuse_unresolved_adapter_cases() {
         use std::os::unix::fs::PermissionsExt;
         let cwd = tempfile::tempdir().unwrap();
-        // A directory only the configured agent PATH reaches.
+        // Only a PATH entry for this directory finds the adapter. As the
+        // relative entry `agent-bin`, it resolves from the project cwd, not the
+        // test process's.
         let agent_bin = cwd.path().join("agent-bin");
         std::fs::create_dir(&agent_bin).unwrap();
         let adapter = agent_bin.join("codex-acp");
@@ -639,16 +648,16 @@ mod tests {
         std::fs::set_permissions(&adapter, std::fs::Permissions::from_mode(0o755)).unwrap();
         let empty_bin = cwd.path().join("empty-bin");
         std::fs::create_dir(&empty_bin).unwrap();
-        let (found, empty) = (Some(agent_bin.as_path()), Some(empty_bin.as_path()));
+        let (found, empty) = (agent_bin.to_str().unwrap(), empty_bin.to_str().unwrap());
         let hint = |cmd: &str| Some(crate::acp::install_hints::install_hint_for(cmd).unwrap());
-        let cases = [
-            // (command, sandboxed, resolved, environment PATH, provider routing PATH, expected error text)
-            ("codex-acp", false, false, None, None, hint("codex-acp")),
+        let cases: [(&str, bool, bool, &[&str], Option<&str>, Option<&str>); 13] = [
+            // (command, sandboxed, resolved, configured PATHs, inherited PATH, expected error text)
+            ("codex-acp", false, false, &[], None, hint("codex-acp")),
             (
                 "claude-agent-acp",
                 false,
                 false,
-                None,
+                &[],
                 None,
                 hint("claude-agent-acp"),
             ),
@@ -656,37 +665,67 @@ mod tests {
                 "aoe-test-unknown-adapter",
                 false,
                 false,
-                None,
+                &[],
                 None,
                 Some("binary `aoe-test-unknown-adapter` not found"),
             ),
-            ("codex-acp", true, false, None, None, None),
-            ("codex-acp", false, true, None, None, None),
-            ("/opt/agents/codex-acp", false, false, None, None, None),
-            ("${HOME}/bin/codex-acp", false, false, None, None, None),
-            // The runner applies the routing PATH after the environment one.
-            ("codex-acp", false, false, found, None, None),
-            ("codex-acp", false, false, empty, None, hint("codex-acp")),
-            ("codex-acp", false, false, None, found, None),
-            ("codex-acp", false, false, found, empty, hint("codex-acp")),
+            ("codex-acp", true, false, &[], None, None),
+            ("codex-acp", false, true, &[], None, None),
+            ("/opt/agents/codex-acp", false, false, &[], None, None),
+            ("${HOME}/bin/codex-acp", false, false, &[], None, None),
+            ("codex-acp", false, false, &[found], None, None),
+            ("codex-acp", false, false, &[empty], None, hint("codex-acp")),
+            // The last configured PATH wins, as the runner applies them in order.
+            (
+                "codex-acp",
+                false,
+                false,
+                &[found, empty],
+                None,
+                hint("codex-acp"),
+            ),
+            ("codex-acp", false, false, &[], Some("agent-bin"), None),
+            (
+                "codex-acp",
+                false,
+                false,
+                &[empty],
+                Some(found),
+                hint("codex-acp"),
+            ),
+            (
+                "codex-acp",
+                false,
+                false,
+                &[],
+                Some(empty),
+                hint("codex-acp"),
+            ),
         ];
-        for (command, sandboxed, resolved, env_path, routing_path, expected) in cases {
+        for (command, sandboxed, resolved, configured, inherited, expected) in cases {
             let label = format!(
                 "{command} sandboxed={sandboxed} resolved={resolved} \
-                 PATH={env_path:?} routing PATH={routing_path:?}"
+                 configured={configured:?} inherited={inherited:?}"
             );
             let mut config =
                 super::super::test_helpers::env_test_spawn_config(cwd.path().to_path_buf());
             config.spec.command = command.into();
-            let path_pair = |dir: &std::path::Path| ("PATH".to_string(), dir.display().to_string());
-            config.host_environment = env_path.map(path_pair).into_iter().collect();
-            config.provider_routing = routing_path.map(path_pair).into_iter().collect();
-            let got = refuse_unresolved_adapter(&config, sandboxed, resolved)
-                .err()
-                .map(|e| match e {
-                    AcpError::Spawn(msg) => msg,
-                    other => panic!("{label}: unexpected {other:?}"),
-                });
+            let environment: Vec<(String, String)> = configured
+                .iter()
+                .map(|path| ("PATH".to_string(), path.to_string()))
+                .collect();
+            let got = refuse_unresolved_adapter(
+                &config,
+                sandboxed,
+                resolved,
+                &environment,
+                inherited.map(std::ffi::OsStr::new),
+            )
+            .err()
+            .map(|e| match e {
+                AcpError::Spawn(msg) => msg,
+                other => panic!("{label}: unexpected {other:?}"),
+            });
             match (&got, expected) {
                 (Some(msg), Some(want)) => assert!(msg.contains(want), "{label}: {msg}"),
                 _ => assert_eq!(got.is_some(), expected.is_some(), "{label}: {got:?}"),
@@ -696,7 +735,10 @@ mod tests {
         let mut config =
             super::super::test_helpers::env_test_spawn_config(cwd.path().to_path_buf());
         config.spec.command = "codex-acp".into();
-        let msg = format!("{:?}", refuse_unresolved_adapter(&config, false, false));
+        let msg = format!(
+            "{:?}",
+            refuse_unresolved_adapter(&config, false, false, &[], None)
+        );
         assert!(!msg.contains(hint("claude-agent-acp").unwrap()), "{msg}");
     }
 
