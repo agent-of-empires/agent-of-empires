@@ -55,11 +55,11 @@ export async function fetchReplay(
     if (lastSeq.current === 0) await fetchTail(sid, lastSeq, true, dispatch, setHasMoreOlder, signal);
     else if (oldestSeq === 0) {
       // Cached control state is cursor-aware and must see each frame once, from its own cursor. Forward rows
-      // from that cursor would append older turns after the recovered tail, so rows resume at the tail's end.
+      // from that cursor would append older turns after the recovered tail, so rows resume exactly at the tail's end.
       const from = lastSeq.current;
       const tailEnd = await fetchTail(sid, lastSeq, false, dispatch, setHasMoreOlder, signal);
       await fetchForward(sid, from, dispatch, signal, "frames");
-      if (tailEnd !== null) await fetchForward(sid, tailEnd, dispatch, signal, "rows");
+      if (tailEnd !== null) await fetchForward(sid, tailEnd, dispatch, signal, "rows", 0);
     } else await fetchForward(sid, lastSeq.current, dispatch, signal);
   } catch {
     // Best effort.
@@ -132,8 +132,9 @@ async function fetchForward(
   dispatch: Dispatch,
   signal: AbortSignal,
   legs: ForwardLegs = "both",
+  overlap = REPLAY_OVERLAP,
 ): Promise<void> {
-  const firstSince = Math.max(0, lastSeq - REPLAY_OVERLAP);
+  const firstSince = Math.max(0, lastSeq - overlap);
   let cursor = firstSince;
   let target: number | null = null;
   for (;;) {

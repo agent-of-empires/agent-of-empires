@@ -69,7 +69,7 @@ describe("rows recovery for a cached cursor without history", () => {
   });
 
   it("keeps older forward rows out of the recovered transcript, but takes rows newer than the tail", async () => {
-    // The tail ends at seq 3000 (highest_seq); frames from the cached cursor 900 would replay older turns.
+    // The tail ends at seq 3000; rows from the cached cursor, or from inside the 50-seq overlap before the tail, would append older rows after it.
     const requests = mockReplay(
       {
         [TAIL]: {
@@ -81,7 +81,8 @@ describe("rows recovery for a cached cursor without history", () => {
       },
       {
         "850": [row("u1", "user_prompt"), row("t1", "tool_start")],
-        "2950": [row("t2", "tool_start"), row("new", "agent_message")],
+        "2950": [row("old-in-overlap", "agent_message"), row("t2", "tool_start")],
+        "3000": [row("new", "agent_message")],
       },
     );
     const actions: Parameters<typeof reducer>[1][] = [];
@@ -90,7 +91,8 @@ describe("rows recovery for a cached cursor without history", () => {
     const state = actions.reduce(reducer, { ...emptyAcpState(), lastSeq: 900 });
     expect(state.activity.map((r) => r.id)).toEqual(["u2", "t2", "new"]);
     expect(requests.some((u) => u.includes("since=850") && u.includes("view=rows"))).toBe(false);
-    expect(requests.some((u) => u.includes("since=2950") && u.includes("view=rows"))).toBe(true);
+    expect(requests.some((u) => u.includes("since=2950") && u.includes("view=rows"))).toBe(false);
+    expect(requests.some((u) => u.includes("since=3000") && u.includes("view=rows"))).toBe(true);
   });
 
   it("only folds forward when history is already loaded", async () => {
