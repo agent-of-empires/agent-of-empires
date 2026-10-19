@@ -21,7 +21,9 @@ export type SessionActionTargets = Record<SessionAction, SessionResponse[]>;
 
 /** The siblings each action may act on, in row order. */
 export function resolveActionTargets(sessions: SessionResponse[], optimistic: OptimisticTriage): SessionActionTargets {
-  const archivedOf = (s: SessionResponse) => effectiveArchivedOf(optimistic, !!s.archived_at);
+  // A pending archive applies to the one session it was issued for, not every sibling.
+  const archivedOf = (s: SessionResponse) =>
+    s.id === optimistic.archivedSessionId ? effectiveArchivedOf(optimistic, !!s.archived_at) : !!s.archived_at;
   const targets = (action: SessionAction) => sessions.filter((s) => ELIGIBLE[action](s, archivedOf(s)));
   return {
     stop: targets("stop"),

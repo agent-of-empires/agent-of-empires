@@ -64,6 +64,7 @@ it("withOverride merges a patch, applying explicit null and undefined", () => {
   expect(withOverride(override({ pinned: true }), { archived: true })).toEqual({
     pinned: true,
     archived: true,
+    archivedSessionId: null,
     snoozedUntil: undefined,
     unread: null,
   });
@@ -104,6 +105,26 @@ describe("reconcileOptimistic", () => {
   it("clears only the caught-up field, keeping the rest of the entry", () => {
     const map = new Map([["w", override({ pinned: true, archived: false })]]);
     const next = reconcileOptimistic(map, [ws("w", [{ pinned_at: null, archived_at: null }])]);
-    expect(next.get("w")).toEqual({ pinned: true, archived: null, snoozedUntil: undefined, unread: null });
+    expect(next.get("w")).toEqual({
+      pinned: true,
+      archived: null,
+      archivedSessionId: null,
+      snoozedUntil: undefined,
+      unread: null,
+    });
+  });
+
+  it("clears an archive override when its own session catches up, even if a sibling stays archived", () => {
+    const pending = new Map([["w", override({ archived: false, archivedSessionId: "a" })]]);
+    const stillArchived = ws("w", [
+      { id: "a", archived_at: "t" },
+      { id: "b", archived_at: "t" },
+    ]);
+    expect(reconcileOptimistic(pending, [stillArchived]).get("w")?.archived).toBe(false);
+    const unarchivedA = ws("w", [
+      { id: "a", archived_at: null },
+      { id: "b", archived_at: "t" },
+    ]);
+    expect(reconcileOptimistic(pending, [unarchivedA]).has("w")).toBe(false);
   });
 });
