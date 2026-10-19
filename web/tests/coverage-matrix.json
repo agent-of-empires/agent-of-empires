@@ -1603,6 +1603,18 @@
       "components": ["web/src/components/WorkspaceSidebar.tsx"]
     },
     {
+      "id": "sidebar.shared-worktree-actions",
+      "kind": "mocked-playwright",
+      "risk": "high",
+      "specs": ["src/components/__tests__/SessionRowSiblingTargets.test.tsx", "tests/sidebar-multi-session.spec.ts"],
+      "components": [
+        "web/src/components/sidebar/sessionActionTargets.ts",
+        "web/src/components/sidebar/SessionRowMenu.tsx",
+        "web/src/components/sidebar/SessionActions.tsx",
+        "web/src/components/sidebar/rowModel.ts"
+      ]
+    },
+    {
       "id": "sidebar.repo-appearance",
       "kind": "mocked-playwright",
       "risk": "low",
