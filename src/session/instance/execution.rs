@@ -641,10 +641,17 @@ impl NativeLaunchInputs {
     fn read_native_file(&self, path: &std::path::Path) -> Result<Option<Vec<u8>>> {
         let native = self.canonical_path(path)?;
         let location = self.physical_location(&native);
-        anyhow::ensure!(
-            location.filesystem == "host",
-            "native configuration requires a local filesystem projection"
-        );
+        if location.filesystem != "host" {
+            let container = self
+                .container
+                .as_ref()
+                .context("native configuration requires a local filesystem projection")?;
+            anyhow::ensure!(
+                !container.runtime.path_exists(&container.id, &native)?,
+                "native configuration exists inside the container and requires a local filesystem projection"
+            );
+            return Ok(None);
+        }
         match std::fs::symlink_metadata(&location.path) {
             Ok(_) => {}
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -3220,6 +3227,50 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(error.contains("local database projection"), "{error}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn container_native_file_is_absent_only_when_the_container_says_so() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let transport = root.join("transport");
+        std::fs::write(&transport, "#!/bin/sh\n[ \"$1\" = exec ] && [ \"$2\" = -w ] && [ \"$3\" = / ] && [ \"$4\" = fixture-id ] || exit 2\nshift 4\nexec \"$@\"\n").unwrap();
+        std::fs::set_permissions(&transport, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let present = root.join("present.toml");
+        std::fs::write(&present, "x").unwrap();
+        let inputs = NativeLaunchInputs {
+            launch_id: "review".into(),
+            environment: std::collections::HashMap::new(),
+            raw_environment: Vec::new(),
+            cwd: root.clone(),
+            profile: "default".into(),
+            container: Some(crate::containers::ContainerExecutionSnapshot {
+                runtime: crate::containers::RuntimeExecutionSnapshot {
+                    kind: crate::session::ContainerRuntimeName::Docker,
+                    program: transport,
+                    cwd: root.clone(),
+                    endpoint: String::new(),
+                    local_mounts: true,
+                    routing: Vec::new(),
+                    global_arguments: Vec::new(),
+                },
+                name: "fixture".into(),
+                id: "fixture-id".into(),
+                mounts: Vec::new(),
+                shadow_mounts: Vec::new(),
+            }),
+            docker_env: None,
+            pane_env: Vec::new(),
+            identity_extension: None,
+        };
+        assert!(inputs
+            .read_native_file(&root.join("absent.toml"))
+            .unwrap()
+            .is_none());
+        let error = inputs.read_native_file(&present).unwrap_err().to_string();
+        assert!(error.contains("exists inside the container"), "{error}");
     }
 
     #[test]
