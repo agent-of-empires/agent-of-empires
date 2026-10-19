@@ -149,4 +149,11 @@ describe("useKeyboardShortcuts", () => {
     unmount();
     input.remove();
   });
+
+  it("marks the document ready once the listener is attached", () => {
+    delete document.documentElement.dataset.shortcutsReady;
+    const { unmount } = mount();
+    expect(document.documentElement.dataset.shortcutsReady).toBe("true");
+    unmount();
+  });
 });
