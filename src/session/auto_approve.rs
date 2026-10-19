@@ -123,6 +123,7 @@ fn claim(storage: &Storage, id: &str, profile: &str) -> Result<Instance> {
 }
 /// Keep an approval override from taking precedence over the terminal policy.
 /// OMP's Default/Plan selector is independent of approvals and must remain pinned.
+#[cfg(feature = "serve")]
 fn reconcile_approval_mode(instance: &mut Instance, enabled: bool) {
     if instance.tool == "omp" {
         return;
@@ -147,6 +148,9 @@ fn reconcile_approval_mode(instance: &mut Instance, enabled: bool) {
         }
     };
 }
+
+#[cfg(not(feature = "serve"))]
+fn reconcile_approval_mode(_instance: &mut Instance, _enabled: bool) {}
 
 fn persist_policy(instance: &mut Instance, enabled: bool) {
     reconcile_approval_mode(instance, enabled);
@@ -419,6 +423,7 @@ mod tests {
         assert!(row.op_claim.is_none());
     }
 
+    #[cfg(feature = "serve")]
     #[test]
     fn terminal_policy_reconciles_native_approval_pins_without_changing_omp_mode() {
         let mut instance = Instance::new("approval", "/tmp");
