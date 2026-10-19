@@ -326,6 +326,14 @@ describe("SuggestionsView", () => {
     expect(await screen.findByRole("alert")).toBeTruthy();
     expect(screen.queryByText("No suggestions yet")).toBeNull();
   });
+  it("shows a successful empty snapshot without an error", async () => {
+    fetchSuggestions.mockResolvedValue({ ...snapshot, items: [] });
+    render(<SuggestionsView onPrepare={vi.fn()} onOpenSession={vi.fn()} />);
+
+    expect(await screen.findByText("No suggestions yet")).toBeTruthy();
+    expect(screen.queryByRole("alert")).toBeNull();
+  });
+
   it("clears the previous profile snapshot while the next profile is loading", async () => {
     const { promise: pendingProfile } = Promise.withResolvers<typeof snapshot>();
     fetchSuggestions.mockImplementation((profile: string) =>

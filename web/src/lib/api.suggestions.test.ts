@@ -77,4 +77,16 @@ describe("suggestion API", () => {
     vi.stubGlobal("fetch", vi.fn().mockResolvedValue(new Response("", { status: 503 })));
     expect(await refreshSuggestions()).toBe(false);
   });
+
+  it("returns server messages and status fallbacks for rejected requests", async () => {
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(new Response(JSON.stringify({ message: "Start denied" }), { status: 409 }))
+      .mockResolvedValueOnce(new Response("{}", { status: 503 }));
+    vi.stubGlobal("fetch", fetchMock);
+    const identity = { provider_id: "gh", id: "1", revision: 3 };
+
+    expect(await actOnSuggestion(identity, "start")).toEqual({ ok: false, error: "Start denied" });
+    expect(await prepareSuggestion(identity)).toEqual({ ok: false, error: "Request failed (503)" });
+  });
 });
