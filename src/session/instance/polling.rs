@@ -1433,7 +1433,10 @@ mod tests {
         .unwrap();
         let error = format!("{:#}", inst.resolve_native_execution(None).err().unwrap());
         assert!(
-            error.contains("ChatGPT login") && error.contains("OPENAI_API_KEY"),
+            error.contains("ChatGPT login")
+                && error.contains("cannot be attested")
+                && error.contains("cloud-managed requirements")
+                && error.contains("OPENAI_API_KEY"),
             "{error}"
         );
 
