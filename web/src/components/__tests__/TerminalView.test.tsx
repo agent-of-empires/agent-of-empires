@@ -25,6 +25,10 @@ vi.mock("../../lib/api", () => ({
   isStartRefusal: (code?: string) => code === "session_archived" || code === "session_trashed",
 }));
 
+vi.mock("../../hooks/useMobileTerminalFont", () => ({
+  useMobileTerminalFont: () => ({ fontSize: 14, update: vi.fn() }),
+}));
+
 // The full hook is exercised by useTerminal.lifecycle.test.ts and the Playwright suites.
 vi.mock("../../hooks/useTerminal", () => ({
   useTerminal: () => ({

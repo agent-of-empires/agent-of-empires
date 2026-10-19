@@ -167,6 +167,10 @@ pub(super) fn build_router(state: Arc<AppState>) -> Router {
             "/api/settings",
             get(api::get_settings).patch(api::update_settings),
         )
+        .route(
+            "/api/settings/mobile-terminal-font-size",
+            patch(api::update_mobile_terminal_font_size),
+        )
         .route("/api/settings/schema", get(api::get_settings_schema))
         .route("/api/settings/resolved", get(api::get_settings_resolved))
         // The CityHall config bundle an admin hands to CityHall.

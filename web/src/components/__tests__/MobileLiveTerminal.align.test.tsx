@@ -3,8 +3,11 @@
 import { describe, expect, it, vi } from "vitest";
 import { installResizeObserver, renderLiveTerminal } from "./liveTerminalHarness";
 
+vi.mock("../../hooks/useMobileTerminalFont", () => ({
+  useMobileTerminalFont: () => ({ fontSize: 14, update: vi.fn() }),
+}));
 vi.mock("../../hooks/useWebSettings", () => ({
-  useWebSettings: () => ({ settings: { mobileFontSize: 14, desktopFontSize: 14 }, update: vi.fn() }),
+  useWebSettings: () => ({ settings: { desktopFontSize: 14 }, update: vi.fn() }),
 }));
 installResizeObserver();
 

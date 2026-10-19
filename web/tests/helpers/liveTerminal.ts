@@ -25,7 +25,7 @@ export async function openLiveSession(
 ): Promise<MockHandle> {
   await page.goto("/");
   if (opts.settings !== null) {
-    await seedSettings(page, opts.settings ?? { mobileFontSize: 14 });
+    await seedSettings(page, opts.settings ?? { mobileTerminalFontSize: 14 });
     await page.reload();
   }
   if (opts.mobile) await openMobileSidebar(page);

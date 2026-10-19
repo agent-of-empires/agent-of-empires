@@ -820,6 +820,24 @@
       ]
     },
     {
+      "id": "settings.mobile-terminal-font-size",
+      "kind": "mocked-playwright",
+      "risk": "medium",
+      "specs": ["tests/pinch-zoom.spec.ts", "src/hooks/__tests__/useMobileTerminalFont.test.ts"],
+      "components": [
+        "web/src/hooks/useMobileTerminalFont.ts",
+        "web/src/components/MobileLiveTerminal.tsx",
+        "web/src/components/TerminalSettings.tsx"
+      ]
+    },
+    {
+      "id": "settings.mobile-terminal-font-persistence",
+      "kind": "live-playwright",
+      "risk": "medium",
+      "specs": ["tests/live/settings-persistence.spec.ts"],
+      "components": ["web/src/hooks/useMobileTerminalFont.ts", "web/src/components/TerminalSettings.tsx"]
+    },
+    {
       "id": "sidebar.attention-badges",
       "kind": "vitest",
       "risk": "medium",

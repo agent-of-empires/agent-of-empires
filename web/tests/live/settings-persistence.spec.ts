@@ -2,9 +2,9 @@
 
 import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import type { Locator, Page } from "@playwright/test";
+import { devices, type Locator, type Page } from "@playwright/test";
 import { test, expect, authHeaders, bootDashboard, type ServeHandle } from "../helpers/liveTest";
-import { appDirFor, loginWithPassphrase, resolveAoeBinary, spawnAoeServe } from "../helpers/aoeServe";
+import { appDirFor, loginWithPassphrase, resolveAoeBinary, spawnAoeServe, SYSTEMD_OFF } from "../helpers/aoeServe";
 
 // #1189: the theme resolver once deadlocked per request, which mocked specs cannot see.
 test.describe("theme API", () => {
@@ -361,4 +361,114 @@ test("systemd settings save machine-wide and refuse an invalid slice", async ({ 
   await page.reload();
   await expect(slice).toHaveValue("aoe-{profile}.slice");
   await expect(survive).not.toBeChecked();
+});
+
+test.describe("mobile terminal font configuration", () => {
+  test.use({
+    viewport: devices["iPhone 13"].viewport,
+    userAgent: devices["iPhone 13"].userAgent,
+    isMobile: true,
+    hasTouch: true,
+  });
+
+  test("migrates 14px and saves dashboard edits across browsers and restart despite stale UI state", async ({
+    spawnServe,
+    page,
+    browser,
+  }, testInfo) => {
+    let appDir = "";
+    const preferences = { mobileFontSize: 14, desktopFontSize: 17, structuredMobileFontSize: 20 };
+    const serve = await spawnServe({
+      seedFn: ({ home, xdg }) => {
+        appDir = appDirFor(home, xdg, resolveAoeBinary());
+        writeFileSync(join(appDir, ".schema_version"), "40");
+        writeFileSync(join(appDir, "config.toml"), SYSTEMD_OFF);
+        writeFileSync(
+          join(appDir, "state.toml"),
+          `has_seen_web_tour = true\n[web_ui_state]\n"aoe-web-settings" = '${JSON.stringify(preferences)}'\n`,
+        );
+      },
+    });
+    const machineUrl = `${serve.baseUrl}/api/settings?layer=machine`;
+    const stateUrl = `${serve.baseUrl}/api/app-state/web-ui-state`;
+    expect((await getJson(machineUrl)).web.mobile_terminal_font_size).toBe(14);
+    expect(JSON.parse((await getJson(stateUrl))["aoe-web-settings"])).toEqual({
+      desktopFontSize: 17,
+      structuredMobileFontSize: 20,
+    });
+    await page.goto(`${serve.baseUrl}/settings/terminal`);
+    const select = page.getByTestId("terminal-mobile-font-size-select");
+    await expect(select).toHaveValue("14");
+    const [saved] = await Promise.all([
+      page.waitForResponse(
+        (response) =>
+          response.url().endsWith("/api/settings/mobile-terminal-font-size") && response.request().method() === "PATCH",
+      ),
+      select.selectOption("18"),
+    ]);
+    expect(saved.ok()).toBe(true);
+    expect((await getJson(machineUrl)).web.mobile_terminal_font_size).toBe(18);
+    expect(readFileSync(join(appDir, "config.toml"), "utf8")).toContain("mobile_terminal_font_size = 18");
+
+    const stale = await page.request.patch(stateUrl, {
+      data: { "aoe-web-settings": JSON.stringify({ ...preferences, mobileFontSize: 8 }) },
+    });
+    expect(stale.ok()).toBe(true);
+    const otherBrowser = await browser.newContext({ ...devices["iPhone 13"] });
+    try {
+      const otherPage = await otherBrowser.newPage();
+      await otherPage.goto(`${serve.baseUrl}/settings/terminal`);
+      await expect(otherPage.getByTestId("terminal-mobile-font-size-select")).toHaveValue("18");
+      await expect(otherPage.getByTestId("terminal-desktop-font-size-select")).toHaveValue("17");
+    } finally {
+      await otherBrowser.close();
+    }
+    await serve.restart();
+    await page.reload();
+    await expect(select).toHaveValue("18");
+    expect((await getJson(machineUrl)).web.mobile_terminal_font_size).toBe(18);
+    await page.evaluate(() => document.fonts.ready.then(() => undefined));
+    await page.screenshot({ path: testInfo.outputPath("mobile-terminal-font.png"), fullPage: true });
+  });
+
+  test("font saves require authentication but not elevation, reject stale writes, and respect read-only mode", async ({
+    servePreauthed,
+    serveReadOnly,
+  }) => {
+    const url = `${servePreauthed.baseUrl}/api/settings/mobile-terminal-font-size`;
+    const headers = { "Content-Type": "application/json", "X-Forwarded-For": "203.0.113.10" };
+    const unsigned = await fetch(url, {
+      method: "PATCH",
+      headers,
+      body: JSON.stringify({ font_size: 18 }),
+    });
+    expect(unsigned.status).toBe(401);
+
+    for (const [size, stamp, status] of [
+      [18, "font-policy.2", 200],
+      [8, "font-policy.1", 409],
+    ] as const) {
+      const response = await fetch(url, {
+        method: "PATCH",
+        headers: { ...headers, ...authHeaders(servePreauthed), "X-Aoe-Write-Stamp": stamp },
+        body: JSON.stringify({ font_size: size }),
+      });
+      expect(response.status).toBe(status);
+    }
+    expect(
+      (await getJson(`${servePreauthed.baseUrl}/api/settings?layer=machine`, servePreauthed)).web
+        .mobile_terminal_font_size,
+    ).toBe(18);
+
+    const refused = await fetch(`${serveReadOnly.baseUrl}/api/settings/mobile-terminal-font-size`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ font_size: 18 }),
+    });
+    expect(refused.status).toBe(403);
+    expect((await refused.json()).error).toBe("read_only");
+    expect((await getJson(`${serveReadOnly.baseUrl}/api/settings?layer=machine`)).web.mobile_terminal_font_size).toBe(
+      14,
+    );
+  });
 });

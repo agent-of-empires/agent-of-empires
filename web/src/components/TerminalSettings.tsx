@@ -9,9 +9,11 @@ import {
 } from "../lib/persistentTerminals";
 import { FontSizeControl } from "./settings/FontSizeControl";
 import { MobileKeysSettings } from "./settings/MobileKeysSettings";
+import { useMobileTerminalFont } from "../hooks/useMobileTerminalFont";
 
 export function TerminalSettings() {
   const { settings, update } = useWebSettings();
+  const { fontSize: mobileFontSize, update: updateMobileFontSize } = useMobileTerminalFont();
   const maxPersistentTerminals = normalizePersistentTerminalLimit(settings.maxPersistentTerminals);
   // Probe once per mount; the set of installed fonts doesn't change while the
   // panel is open.
@@ -25,9 +27,9 @@ export function TerminalSettings() {
         <FontSizeControl
           label="Mobile font size"
           testIdPrefix="terminal-mobile-font-size"
-          value={settings.mobileFontSize}
-          onChange={(value) => update({ mobileFontSize: value })}
-          description="Font size for web terminal sessions on mobile devices, including tmux-backed sessions. Pinch the terminal with two fingers to zoom; the new size is saved here."
+          value={mobileFontSize}
+          onChange={updateMobileFontSize}
+          description="Font size for web terminal sessions on mobile devices, including tmux-backed sessions. Pinch the terminal with two fingers to zoom; this setting syncs across browsers."
         />
 
         <FontSizeControl

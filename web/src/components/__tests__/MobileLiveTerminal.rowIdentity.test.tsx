@@ -6,8 +6,11 @@ import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import { act, screen } from "@testing-library/react";
 import { CHAR_W, installResizeObserver, linesFrame, renderLiveTerminal, stubElementSize } from "./liveTerminalHarness";
 
+vi.mock("../../hooks/useMobileTerminalFont", () => ({
+  useMobileTerminalFont: () => ({ fontSize: 14, update: vi.fn() }),
+}));
 vi.mock("../../hooks/useWebSettings", () => ({
-  useWebSettings: () => ({ settings: { mobileFontSize: 14, desktopFontSize: 14 }, update: vi.fn() }),
+  useWebSettings: () => ({ settings: { desktopFontSize: 14 }, update: vi.fn() }),
 }));
 
 const WIDTH = 240;

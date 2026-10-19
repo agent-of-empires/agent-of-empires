@@ -255,7 +255,7 @@ async function setupLink(page: Page, mobile: boolean) {
     );
   const handle = await mockTerminalApis(page);
   await page.goto("/");
-  await seedSettings(page, { mobileFontSize: 14, desktopFontSize: 14 });
+  await seedSettings(page, { mobileTerminalFontSize: 14, desktopFontSize: 14 });
   await page.reload();
   if (mobile) await openMobileSidebar(page);
   await clickSidebarSession(page, "pinch-test");

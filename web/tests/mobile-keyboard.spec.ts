@@ -57,7 +57,7 @@ test.describe("Mobile keyboard detection and layout", () => {
     const handle = await mockTerminalApis(page);
     await page.route("**/api/sessions/*/ensure", (r) => r.fulfill({ json: { ok: true } }));
     // Disable auto-open-on-select so the keyboard starts closed; this suite covers detection, layout, and the FAB.
-    await openSession(page, handle, { mobileFontSize: 10, autoOpenKeyboard: false });
+    await openSession(page, handle, { mobileTerminalFontSize: 10, autoOpenKeyboard: false });
   }
 
   test("mobile shell is fixed and rejects document-level scroll", async ({ page }) => {
@@ -106,7 +106,7 @@ test.describe("Mobile keyboard detection and layout", () => {
     const handle = await mockTerminalApis(page);
     await page.route("**/api/sessions/*/ensure", (r) => r.fulfill({ json: { ok: true } }));
     // Claude's alternate-screen startup drops the first iOS input, so the selection stays a monitoring view until the keyboard opens.
-    await openSession(page, handle, { mobileFontSize: 10, autoOpenKeyboard: true });
+    await openSession(page, handle, { mobileTerminalFontSize: 10, autoOpenKeyboard: true });
     await expect(page.getByRole("button", { name: "Open keyboard" })).toBeVisible();
   });
 

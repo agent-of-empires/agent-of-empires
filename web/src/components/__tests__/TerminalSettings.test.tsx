@@ -2,6 +2,9 @@
 
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { fireEvent, render } from "@testing-library/react";
+vi.mock("../../hooks/useMobileTerminalFont", () => ({
+  useMobileTerminalFont: () => ({ fontSize: 14, update: vi.fn() }),
+}));
 import { TerminalSettings } from "../TerminalSettings";
 
 vi.mock("../../lib/fontDetect", () => ({
@@ -23,10 +26,8 @@ beforeEach(() => {
   window.localStorage.clear();
 });
 
-describe("TerminalSettings localStorage contract", () => {
+describe("TerminalSettings", () => {
   it.each([
-    ["mobile font slider", "input[type=range]", 0, "10", "mobileFontSize", 10],
-    ["mobile font select", "select", 0, "16", "mobileFontSize", 16],
     ["desktop font slider", "input[type=range]", 1, "18", "desktopFontSize", 18],
     ["desktop font select", "select", 1, "20", "desktopFontSize", 20],
     ["font family input", "#terminal-font-family", 0, "MesloLGS NF", "terminalFontFamily", "MesloLGS NF"],
@@ -65,9 +66,8 @@ describe("TerminalSettings localStorage contract", () => {
     expect(readStored().maxPersistentTerminals).toBe(50);
   });
 
-  it("preserves unrelated keys when persisting an update", () => {
+  it("preserves unrelated preferences when another setting changes", () => {
     const seeded = {
-      mobileFontSize: 8,
       desktopFontSize: 14,
       autoOpenKeyboard: true,
       persistentTerminals: false,
@@ -77,13 +77,12 @@ describe("TerminalSettings localStorage contract", () => {
     };
     seed(seeded);
     const { container } = render(<TerminalSettings />);
-    fireEvent.change(container.querySelectorAll("input[type=range]")[0]!, { target: { value: "12" } });
-    expect(readStored()).toMatchObject({ ...seeded, mobileFontSize: 12 });
+    fireEvent.change(container.querySelectorAll("input[type=range]")[1]!, { target: { value: "12" } });
+    expect(readStored()).toMatchObject({ ...seeded, desktopFontSize: 12 });
   });
 
-  it("reflects stored values on mount", () => {
+  it("reflects unrelated stored preferences on mount", () => {
     seed({
-      mobileFontSize: 22,
       desktopFontSize: 16,
       autoOpenKeyboard: false,
       persistentTerminals: true,
@@ -94,7 +93,6 @@ describe("TerminalSettings localStorage contract", () => {
     const { container } = render(<TerminalSettings />);
     const selects = container.querySelectorAll("select");
     const checkboxes = container.querySelectorAll("input[type=checkbox]");
-    expect((selects[0] as HTMLSelectElement).value).toBe("22");
     expect((selects[1] as HTMLSelectElement).value).toBe("16");
     expect((checkboxes[0] as HTMLInputElement).checked).toBe(false);
     expect((checkboxes[1] as HTMLInputElement).checked).toBe(true);

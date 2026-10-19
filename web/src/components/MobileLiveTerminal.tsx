@@ -5,6 +5,7 @@ import { LineParseCache, lineText, textWidth, wrapLine } from "../lib/liveTermLi
 import { cursorLineIndex, pointerPaneCell, unwrapPointer } from "../lib/liveMouse";
 import type { LiveFrame, LiveStats } from "../hooks/useLiveTerminal";
 import { useWebSettings } from "../hooks/useWebSettings";
+import { useMobileTerminalFont } from "../hooks/useMobileTerminalFont";
 import { useIsCoarsePointer } from "../hooks/useIsCoarsePointer";
 import { useTerminalGestureBoundary } from "../hooks/useTerminalGestureBoundary";
 import { useSelectionHold } from "../hooks/useSelectionHold";
@@ -135,9 +136,9 @@ export function MobileLiveTerminal({
   keyboardOpen,
 }: MobileLiveTerminalProps) {
   const { settings, update } = useWebSettings();
+  const { fontSize: mobileConfiguredFontSize, update: updateMobileFontSize } = useMobileTerminalFont();
   const coarse = useIsCoarsePointer();
-  const fontKey = coarse ? "mobileFontSize" : "desktopFontSize";
-  const configuredFontSize = settings[fontKey];
+  const configuredFontSize = coarse ? mobileConfiguredFontSize : settings.desktopFontSize;
   // Quotes are stripped so a stray `"` cannot produce an ignored font-family.
   const termFontFamily = (settings.terminalFontFamily ?? "").trim().replace(/"/g, "");
   const fontFamily = termFontFamily ? `"${termFontFamily}", var(--font-mono)` : undefined;
@@ -423,7 +424,10 @@ export function MobileLiveTerminal({
     if (!changed) return;
     setPinchGeneration((g) => g + 1);
     if (persistTimerRef.current) clearTimeout(persistTimerRef.current);
-    persistTimerRef.current = setTimeout(() => update({ [fontKey]: fontSize }), 400);
+    persistTimerRef.current = setTimeout(() => {
+      if (coarse) void updateMobileFontSize(fontSize);
+      else update({ desktopFontSize: fontSize });
+    }, 400);
   };
   // Records forward-mode finger travel as queued wheel notches; returns false for a zero move.
   const trackForwardDrag = (touch: { clientX: number; clientY: number }) => {

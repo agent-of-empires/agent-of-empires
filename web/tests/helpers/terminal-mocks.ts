@@ -18,6 +18,7 @@ export interface MockHandle {
     mouseSgr?: boolean;
   }) => Promise<void>;
   pushLiveClipboard: (text: string) => void;
+  machineSettingsWrites: unknown[];
 }
 
 /** `history` numbered scrollback lines, then a `rows`-tall screen with a prompt on its first line. */
@@ -52,7 +53,7 @@ export async function mockTerminalApis(
     delayLiveWindowShrinkMs?: number;
     tool?: string;
     extraSessions?: Array<{ id: string; title: string }>;
-    /** Extra SessionResponse fields merged over the primary session's defaults. */
+    mobileTerminalFontSize?: number;
     sessionFields?: Record<string, unknown>;
     pendingPaste?: boolean;
     onLiveMessage?: (url: string, message: Buffer) => void;
@@ -75,6 +76,7 @@ export async function mockTerminalApis(
     wsMessages: [],
     liveMessages: [],
     liveInput: [],
+    machineSettingsWrites: [],
     waitForLiveReady: async () => {
       await page.evaluate(() => document.fonts.ready.then(() => undefined));
       await expect(page.locator("[data-live-content]").first()).toContainText("$ ready");
@@ -106,6 +108,9 @@ export async function mockTerminalApis(
         }
       }
     },
+  };
+  const machineSettings: { web: Record<string, unknown> } = {
+    web: opts.mobileTerminalFontSize === undefined ? {} : { mobile_terminal_font_size: opts.mobileTerminalFontSize },
   };
   await page.route("**/api/login/status", (r) => r.fulfill({ json: { required: false, authenticated: true } }));
   await page.route("**/api/sessions", (r) => {
@@ -148,6 +153,31 @@ export async function mockTerminalApis(
   for (const path of ["settings", "themes", "agents", "profiles", "groups", "devices", "docker/status", "about"]) {
     await page.route(`**/api/${path}`, (r) => r.fulfill({ json: path === "docker/status" ? {} : [] }));
   }
+  await page.route("**/api/settings?layer=machine", async (r) => {
+    if (r.request().method() === "PATCH") {
+      const patch: unknown = r.request().postDataJSON();
+      handle.machineSettingsWrites.push(patch);
+      if (
+        patch &&
+        typeof patch === "object" &&
+        "web" in patch &&
+        patch.web &&
+        typeof patch.web === "object" &&
+        !Array.isArray(patch.web)
+      ) {
+        machineSettings.web = { ...machineSettings.web, ...patch.web };
+      }
+    }
+    await r.fulfill({ json: machineSettings });
+  });
+  await page.route("**/api/settings/mobile-terminal-font-size", async (r) => {
+    const body: unknown = r.request().postDataJSON();
+    handle.machineSettingsWrites.push(body);
+    if (body && typeof body === "object" && "font_size" in body && typeof body.font_size === "number") {
+      machineSettings.web.mobile_terminal_font_size = body.font_size;
+    }
+    await r.fulfill({ json: { ok: true } });
+  });
   await page.routeWebSocket(/\/sessions\/.*\/(ws|container-ws)$/, (ws) => {
     ws.onMessage((msg) => {
       if (Buffer.isBuffer(msg)) handle.wsMessages.push(msg);
@@ -241,19 +271,29 @@ export async function installTerminalSpies(page: Page) {
   });
 }
 
-export function readFontSize(page: Page, which: "mobile" | "desktop") {
-  return page.evaluate((which) => {
-    const raw = localStorage.getItem("aoe-web-settings");
-    if (!raw) return null;
-    const parsed = JSON.parse(raw);
-    return which === "mobile" ? parsed.mobileFontSize : parsed.desktopFontSize;
-  }, which);
+export function readFontSize(page: Page) {
+  return page
+    .locator("[data-live-content]")
+    .first()
+    .evaluate((el) => getComputedStyle(el.closest<HTMLElement>("[data-live-terminal] > div")!).fontSize)
+    .then((size) => Number.parseInt(size, 10));
+}
+
+export async function readMachineFontSize(page: Page): Promise<number | null> {
+  return page.evaluate(async () => {
+    const result: unknown = await (await fetch("/api/settings?layer=machine")).json();
+    if (!result || typeof result !== "object" || !("web" in result)) return null;
+    const web = result.web;
+    if (!web || typeof web !== "object" || !("mobile_terminal_font_size" in web)) return null;
+    const size = web.mobile_terminal_font_size;
+    return typeof size === "number" ? size : null;
+  });
 }
 
 export async function seedSettings(
   page: Page,
   settings: {
-    mobileFontSize?: number;
+    mobileTerminalFontSize?: number;
     desktopFontSize?: number;
     autoOpenKeyboard?: boolean;
     persistentTerminals?: boolean;
@@ -261,17 +301,27 @@ export async function seedSettings(
     showArrowJoystick?: boolean;
   },
 ) {
+  const { mobileTerminalFontSize, ...preferences } = settings;
+  if (mobileTerminalFontSize !== undefined) {
+    await page.evaluate(async (fontSize) => {
+      const response = await fetch("/api/settings/mobile-terminal-font-size", {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ font_size: fontSize }),
+      });
+      if (!response.ok) throw new Error(`Cannot seed mobile terminal font: HTTP ${response.status}`);
+    }, mobileTerminalFontSize);
+  }
   await page.evaluate((settings) => {
     localStorage.setItem(
       "aoe-web-settings",
       JSON.stringify({
-        mobileFontSize: 8,
         desktopFontSize: 14,
         autoOpenKeyboard: true,
         ...settings,
       }),
     );
-  }, settings);
+  }, preferences);
 }
 
 // page.touchscreen is single-finger, so build raw Touch objects for two-finger gestures.

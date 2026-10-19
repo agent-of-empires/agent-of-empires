@@ -841,6 +841,46 @@ pub async fn update_theme(
     }
 }
 
+/// Save the cosmetic, global mobile terminal font without the elevation gate
+/// used for arbitrary machine-wide configuration edits.
+pub async fn update_mobile_terminal_font_size(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    body: Result<Json<serde_json::Value>, axum::extract::rejection::JsonRejection>,
+) -> impl IntoResponse {
+    if let Some(response) = super::cityhall_block(&state) {
+        return response;
+    }
+    if state.read_only {
+        return read_only_response();
+    }
+    let Json(body) = match body {
+        Ok(body) => body,
+        Err(rejection) => return rejection.into_response(),
+    };
+    let Some(size) = body.get("font_size").and_then(serde_json::Value::as_u64) else {
+        return api_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_value",
+            "font_size must be an integer from 6 to 28",
+        );
+    };
+    let mut patch = serde_json::json!({"web": {"mobile_terminal_font_size": size}});
+    if let Err(rejection) = validate_patch(&patch, Scope::Global, true) {
+        return reject_response(rejection);
+    }
+    let stamp = WriteStamp::from_headers(&headers);
+    let mut applied = write_gate().await;
+    if drop_stale_leaves(&applied, stamp.as_ref(), "", &mut patch) {
+        return stale_write_response();
+    }
+    if let Err(response) = write_machine_patch(&state, patch.clone()).await {
+        return response;
+    }
+    record_applied(&mut applied, stamp.as_ref(), "", &patch);
+    (StatusCode::OK, Json(serde_json::json!({"ok": true}))).into_response()
+}
+
 /// Marks the web dashboard's first-run tour as seen.
 ///
 /// Single-purpose write so the cosmetic flag never widens the security-sensitive
@@ -2739,6 +2779,49 @@ mod tests {
             .into_response()
             .status(),
             StatusCode::OK
+        );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn mobile_terminal_font_save_is_cosmetic_global_and_range_checked() {
+        use serde_json::json;
+        let home = tempfile::TempDir::new().unwrap();
+        let _home = crate::session::test_support::isolate_home(home.path());
+        let state = crate::server::test_support::build_test_app_state(Vec::new());
+        let save = |body: serde_json::Value| {
+            let state = state.clone();
+            async move {
+                update_mobile_terminal_font_size(State(state), HeaderMap::new(), Ok(Json(body)))
+                    .await
+                    .into_response()
+                    .status()
+            }
+        };
+
+        for size in [6u8, 14, 28] {
+            assert_eq!(save(json!({"font_size": size})).await, StatusCode::OK);
+            assert_eq!(
+                crate::session::Config::load()
+                    .unwrap()
+                    .web
+                    .mobile_terminal_font_size,
+                size
+            );
+        }
+        for value in [
+            json!({"font_size": 5}),
+            json!({"font_size": 29}),
+            json!({"font_size": 14.5}),
+        ] {
+            assert_eq!(save(value).await, StatusCode::BAD_REQUEST);
+        }
+        assert_eq!(
+            crate::session::Config::load()
+                .unwrap()
+                .web
+                .mobile_terminal_font_size,
+            28
         );
     }
 }

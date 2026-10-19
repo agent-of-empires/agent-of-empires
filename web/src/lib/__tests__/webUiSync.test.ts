@@ -8,7 +8,7 @@ vi.mock("../api", () => ({
   patchWebUiState: (...args: unknown[]) => patchWebUiState(...args),
 }));
 
-import { hydrateWebUiStateFromServer, isSyncedKey } from "../webUiSync";
+import { hydrateWebUiStateFromServer, initWebUiSync, isSyncedKey } from "../webUiSync";
 import { configureStorageSync, safeRemoveItem, safeSetItem } from "../safeStorage";
 
 beforeEach(() => {
@@ -18,6 +18,7 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+  vi.useRealTimers();
   configureStorageSync(
     () => false,
     () => {},
@@ -96,6 +97,69 @@ describe("hydrateWebUiStateFromServer", () => {
 
     expect(localStorage.getItem("aoe-sidebar-axis")).toBe("group");
     expect(patchWebUiState).not.toHaveBeenCalled();
+  });
+
+  it("strips legacy mobile font size from hydrated settings while preserving other preferences", async () => {
+    const settings = { desktopFontSize: 18, structured: { enabled: true }, mobileFontSize: 8 };
+    localStorage.setItem("aoe-web-settings", "old");
+    getWebUiState.mockResolvedValue({ "aoe-web-settings": JSON.stringify(settings) });
+
+    await hydrateWebUiStateFromServer();
+
+    expect(localStorage.getItem("aoe-web-settings")).toBe(
+      JSON.stringify({ desktopFontSize: 18, structured: { enabled: true } }),
+    );
+    expect(patchWebUiState).not.toHaveBeenCalled();
+  });
+
+  it("preserves malformed settings from the server", async () => {
+    getWebUiState.mockResolvedValue({ "aoe-web-settings": "{broken" });
+
+    await hydrateWebUiStateFromServer();
+
+    expect(localStorage.getItem("aoe-web-settings")).toBe("{broken");
+  });
+
+  it("removes legacy mobile font size from local storage and payload when first-sync backfilling", async () => {
+    const legacy = JSON.stringify({
+      desktopFontSize: 18,
+      structured: { enabled: true },
+      mobileFontSize: 8,
+    });
+    localStorage.setItem("aoe-web-settings", legacy);
+    getWebUiState.mockResolvedValue({});
+
+    await hydrateWebUiStateFromServer();
+
+    const sanitized = JSON.stringify({ desktopFontSize: 18, structured: { enabled: true } });
+    expect(localStorage.getItem("aoe-web-settings")).toBe(sanitized);
+    expect(patchWebUiState).toHaveBeenCalledWith({ "aoe-web-settings": sanitized });
+  });
+
+  it("preserves malformed local settings during first-sync backfill", async () => {
+    localStorage.setItem("aoe-web-settings", "{broken");
+    getWebUiState.mockResolvedValue({});
+
+    await hydrateWebUiStateFromServer();
+
+    expect(localStorage.getItem("aoe-web-settings")).toBe("{broken");
+    expect(patchWebUiState).toHaveBeenCalledWith({ "aoe-web-settings": "{broken" });
+  });
+
+  it("strips the legacy field before sending scheduled settings updates", async () => {
+    vi.useFakeTimers();
+    initWebUiSync();
+    safeSetItem(
+      "aoe-web-settings",
+      JSON.stringify({ desktopFontSize: 18, structured: { enabled: true }, mobileFontSize: 8 }),
+    );
+
+    await vi.runAllTimersAsync();
+
+    expect(patchWebUiState).toHaveBeenCalledWith({
+      "aoe-web-settings": JSON.stringify({ desktopFontSize: 18, structured: { enabled: true } }),
+    });
+    vi.useRealTimers();
   });
 
   it("leaves the local cache untouched when the fetch fails", async () => {

@@ -47,6 +47,17 @@ On macOS nothing is moved for you: an existing `~/.agent-of-empires/` keeps bein
 | `AGENT_OF_EMPIRES_DEBUG` | Legacy alias for `AOE_LOG_LEVEL=debug` |
 | `AOE_DEFER_SANDBOX_MIGRATION` | Start without moving sandboxed sessions' agent stores; retried later or by `aoe migrate`. See [Per-session agent stores](sandbox.md#per-session-agent-stores) |
 
+## Web
+
+```toml
+[web]
+mobile_terminal_font_size = 14
+```
+
+`web.mobile_terminal_font_size` sets the web dashboard's mobile live-terminal font in pixels (6–28, default 14). It is global-only and shared across browsers. Pinching the terminal or changing **Settings > Terminal > Mobile font size** updates this value in `config.toml`. Migration v041 moves a valid legacy `mobileFontSize` (6–28) from the opaque `aoe-web-settings` state value only when `config.toml` does not already set `web.mobile_terminal_font_size`; an explicit config value wins. Invalid legacy sizes are discarded. All other web UI state remains untouched.
+
+Dashboard and pinch edits use an authenticated cosmetic save that does not require a step-up passphrase. Read-only and CityHall servers reject it. General configuration saves keep their existing elevation requirements.
+
 ## Theme
 
 ```toml

@@ -6,8 +6,11 @@ import { act, screen } from "@testing-library/react";
 import type { LiveFrame } from "../../hooks/useLiveTerminal";
 import { installResizeObserver, linesFrame, renderLiveTerminal, stubElementSize } from "./liveTerminalHarness";
 
+vi.mock("../../hooks/useMobileTerminalFont", () => ({
+  useMobileTerminalFont: () => ({ fontSize: 14, update: vi.fn() }),
+}));
 vi.mock("../../hooks/useWebSettings", () => ({
-  useWebSettings: () => ({ settings: { mobileFontSize: 14, desktopFontSize: 14 }, update: vi.fn() }),
+  useWebSettings: () => ({ settings: { desktopFontSize: 14 }, update: vi.fn() }),
 }));
 
 stubElementSize({ clientWidth: () => 240, clientHeight: () => 600 });

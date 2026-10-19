@@ -8,16 +8,19 @@ describe("buildSettingsSearchIndex", () => {
       descriptor({ section: "sandbox", field: "enabled_by_default", label: "Enabled by Default" }),
       descriptor({ section: "acp", field: "show_tool_durations", label: "Show tool-call durations" }),
       descriptor({ section: "web", field: "notify_on_idle", label: "Notify on idle" }),
+      descriptor({ section: "web", field: "mobile_terminal_font_size", label: "Mobile terminal font size" }),
     ]);
 
     expect(index.map((h) => `${h.section}.${h.field}`)).toEqual([
       "sandbox.enabled_by_default",
       "acp.show_tool_durations",
       "web.notify_on_idle",
+      "web.mobile_terminal_font_size",
     ]);
     expect(index.find((h) => h.section === "acp")?.tab).toBe("structured-view");
     expect(index.find((h) => h.section === "web")?.tab).toBe("notifications");
     expect(index.find((h) => h.section === "sandbox")?.tab).toBe("sandbox");
+    expect(index.find((h) => h.field === "mobile_terminal_font_size")?.tab).toBe("terminal");
   });
 
   it("skips local_only fields and sections with no web tab so every hit can jump", () => {

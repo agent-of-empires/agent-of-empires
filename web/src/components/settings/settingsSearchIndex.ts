@@ -33,7 +33,7 @@ export function buildSettingsSearchIndex(schema: SettingsFieldDescriptor[]): Set
   const hits: SettingsSearchHit[] = [];
   for (const d of schema) {
     if (d.web_write.policy === "local_only") continue;
-    const tab = SECTION_TO_TAB[d.section];
+    const tab = d.section === "web" && d.field === "mobile_terminal_font_size" ? "terminal" : SECTION_TO_TAB[d.section];
     if (!tab) continue;
     hits.push({
       section: d.section,

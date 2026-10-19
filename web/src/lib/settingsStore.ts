@@ -1,5 +1,5 @@
 import { useSyncExternalStore } from "react";
-import { fetchSettings, type SaveOutcome } from "./api";
+import { fetchMachineSettings, fetchSettings, type SaveOutcome } from "./api";
 
 type Settings = Record<string, unknown>;
 
@@ -66,10 +66,10 @@ interface Entry {
   loadSeq: number;
 }
 
-const entries = new Map<string, Entry>();
+const entries = new Map<string | undefined, Entry>();
 const listeners = new Set<() => void>();
 
-function entry(profile: string): Entry {
+function entry(profile: string | undefined): Entry {
   let e = entries.get(profile);
   if (!e) {
     e = {
@@ -94,7 +94,7 @@ function publish(e: Entry, patch: Partial<SettingsView>) {
   for (const l of listeners) l();
 }
 
-export function useProfileSettings(profile: string): SettingsView {
+export function useProfileSettings(profile: string | undefined): SettingsView {
   return useSyncExternalStore(
     (cb) => {
       listeners.add(cb);
@@ -131,17 +131,17 @@ function settle(e: Entry, fetched: Settings): { settings: Settings; resend: Unco
 }
 
 /**
- * Fetch the profile's settings. A response is dropped if a newer fetch started, and one that an
- * edit or settled save overtook is retried once the queue is idle, so the cache never stays on a
- * snapshot older than what it shows. Resolves once a fetch started after the call has landed, to
- * whether a response was applied.
+ * Fetch the profile's settings, or machine-wide settings for `undefined`. A response is dropped
+ * if a newer fetch started, and one that an edit or settled save overtook is retried once the
+ * queue is idle. Resolves once a fetch started after the call has landed, to whether a response
+ * was applied.
  */
-export function loadSettings(profile: string): Promise<boolean> {
-  if (!profile) return Promise.resolve(false);
+export function loadSettings(profile: string | undefined): Promise<boolean> {
+  if (profile === "") return Promise.resolve(false);
   const e = entry(profile);
   const { gen } = e;
   const seq = ++e.loadSeq;
-  const request = fetchSettings(profile)
+  const request = (profile === undefined ? fetchMachineSettings() : fetchSettings(profile))
     .then((s): boolean | Promise<boolean> => {
       if (seq !== e.loadSeq) return e.loading;
       if (gen !== e.gen || e.pending > 0) {
@@ -178,7 +178,7 @@ export function loadSettings(profile: string): Promise<boolean> {
  * edit on screen and is settled by a fetch once the queue drains.
  */
 export async function saveField(
-  profile: string,
+  profile: string | undefined,
   section: string,
   field: string,
   value: unknown,
@@ -196,7 +196,7 @@ export async function saveField(
   publish(e, {
     // Another edit does not answer a "could not confirm" still waiting on the server.
     error: e.unconfirmed.size > 0 ? e.view.error : null,
-    settings: base && writeField(base, section, field, value),
+    settings: writeField(base ?? {}, section, field, value),
   });
   const request = e.tail.then(send);
   e.tail = request.catch(() => undefined);

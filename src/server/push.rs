@@ -1493,6 +1493,7 @@ mod tests {
         use crate::session::Instance;
 
         let web = WebConfig {
+            mobile_terminal_font_size: 14,
             notifications_enabled: true,
             notify_on_waiting: true,
             notify_on_idle: false, // globally off

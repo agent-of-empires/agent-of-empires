@@ -2293,6 +2293,18 @@ fn default_context_lines() -> usize {
 #[derive(Debug, Clone, Serialize, Deserialize, SettingsSection)]
 #[setting_section(name = "web", category = "Web")]
 pub struct WebConfig {
+    /// Font size in pixels for the mobile live terminal.
+    #[serde(default = "default_mobile_terminal_font_size")]
+    #[setting(
+        label = "Mobile terminal font size",
+        widget = "number",
+        min = 6,
+        max = 28,
+        validate = "range:6:28",
+        global_only
+    )]
+    pub mobile_terminal_font_size: u8,
+
     /// Allow the web dashboard to deliver browser push notifications
     /// (server-wide kill switch). When false, `/api/push/*` returns 404 and
     /// the status-change consumer drops events without sending. Existing
@@ -2331,6 +2343,7 @@ pub struct WebConfig {
 impl Default for WebConfig {
     fn default() -> Self {
         Self {
+            mobile_terminal_font_size: default_mobile_terminal_font_size(),
             notifications_enabled: true,
             notify_on_waiting: true,
             notify_on_idle: false,
@@ -2338,6 +2351,10 @@ impl Default for WebConfig {
             notify_on_wake_fire: true,
         }
     }
+}
+
+fn default_mobile_terminal_font_size() -> u8 {
+    14
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, SettingsSection)]
@@ -3948,6 +3965,13 @@ mod model_value_quoting_tests {
 mod tests {
     use super::*;
 
+    #[test]
+    fn mobile_terminal_font_size_defaults_and_round_trips_explicit_config() {
+        assert_eq!(WebConfig::default().mobile_terminal_font_size, 14);
+
+        let config: Config = toml::from_str("[web]\nmobile_terminal_font_size = 22\n").unwrap();
+        assert_eq!(config.web.mobile_terminal_font_size, 22);
+    }
     #[test]
     fn notice_policy_hides_by_display_severity_and_age() {
         use std::time::Duration;

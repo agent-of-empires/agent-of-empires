@@ -7,7 +7,7 @@ import { mockTerminalApis, installTerminalSpies, fireTouches, type MockHandle } 
 test.use({ ...devices["iPhone 13"] });
 
 const openSession = (page: Page, handle: MockHandle) =>
-  openLiveSession(page, handle, { mobile: true, settings: { mobileFontSize: 14 } });
+  openLiveSession(page, handle, { mobile: true, settings: { mobileTerminalFontSize: 14 } });
 
 async function liveLineHeight(page: Page) {
   return scroller(page).evaluate((el) => {

@@ -127,7 +127,7 @@ test.describe("Mobile right panel picker (#1452)", () => {
   }
 
   test("picker promotes the paired terminal and it survives the keyboard", async ({ page }) => {
-    await openLiveTerminal(page, { mobile: true, settings: { mobileFontSize: 10 } });
+    await openLiveTerminal(page, { mobile: true, settings: { mobileTerminalFontSize: 10 } });
     await openPicker(page);
 
     await page.getByTestId("mobile-right-panel-pick-paired").click();

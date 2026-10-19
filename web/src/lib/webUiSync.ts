@@ -23,6 +23,25 @@ export function isSyncedKey(key: string): boolean {
   return EXACT_KEYS.has(key) || KEY_PREFIXES.some((p) => key.startsWith(p));
 }
 
+function stripLegacyMobileFontSize(key: string, value: string): string {
+  if (key !== "aoe-web-settings") return value;
+  try {
+    const settings: Record<string, unknown> | null = JSON.parse(value);
+    if (
+      settings !== null &&
+      typeof settings === "object" &&
+      !Array.isArray(settings) &&
+      Object.prototype.hasOwnProperty.call(settings, "mobileFontSize")
+    ) {
+      delete settings.mobileFontSize;
+      return JSON.stringify(settings);
+    }
+  } catch {
+    // Preserve malformed preferences rather than replacing them.
+  }
+  return value;
+}
+
 // Debounced so bursts collapse into one PATCH.
 let pending: Record<string, string | null> = {};
 let timer: ReturnType<typeof setTimeout> | null = null;
@@ -35,8 +54,8 @@ function flush(): void {
 }
 
 function scheduleWrite(key: string, value: string | null): void {
-  pending[key] = value;
-  if (timer) clearTimeout(timer);
+  pending[key] = value === null ? null : stripLegacyMobileFontSize(key, value);
+  clearTimeout(timer ?? undefined);
   timer = setTimeout(flush, 400);
 }
 
@@ -85,13 +104,17 @@ export async function hydrateWebUiStateFromServer(): Promise<void> {
     const backfill: Record<string, string | null> = {};
     for (const key of enumerateLocalSyncedKeys()) {
       const local = window.localStorage?.getItem(key);
-      if (local != null) backfill[key] = local;
+      if (local != null) {
+        const sanitized = stripLegacyMobileFontSize(key, local);
+        if (sanitized !== local) rawSet(key, sanitized);
+        backfill[key] = sanitized;
+      }
     }
     if (Object.keys(backfill).length > 0) void patchWebUiState(backfill);
     return;
   }
 
   for (const [key, value] of Object.entries(server)) {
-    rawSet(key, value);
+    rawSet(key, stripLegacyMobileFontSize(key, value));
   }
 }

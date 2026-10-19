@@ -94,6 +94,52 @@ mod tests {
     }
 
     #[test]
+    fn mobile_terminal_font_size_is_global_only_and_server_validated() {
+        use super::super::{validate_patch, PatchRejection, Scope, ValidationKind};
+        let d = descriptor("web", "mobile_terminal_font_size").unwrap();
+        assert_eq!(
+            d.widget,
+            WidgetKind::Number {
+                min: Some(6),
+                max: Some(28)
+            }
+        );
+        assert_eq!(
+            d.validation,
+            ValidationKind::RangeU64 {
+                min: 6,
+                max: Some(28)
+            }
+        );
+        assert!(!d.profile_overridable);
+        for value in [6, 14, 28] {
+            assert!(validate_patch(
+                &serde_json::json!({"web": {"mobile_terminal_font_size": value}}),
+                Scope::Global,
+                true
+            )
+            .is_ok());
+        }
+        for value in [5, 29] {
+            assert!(matches!(
+                validate_patch(
+                    &serde_json::json!({"web": {"mobile_terminal_font_size": value}}),
+                    Scope::Global,
+                    true
+                ),
+                Err(PatchRejection::Invalid { .. })
+            ));
+        }
+        assert!(matches!(
+            validate_patch(
+                &serde_json::json!({"web": {"mobile_terminal_font_size": 14}}),
+                Scope::Profile,
+                true
+            ),
+            Err(PatchRejection::GlobalOnly(_))
+        ));
+    }
+    #[test]
     fn schema_has_no_duplicate_paths() {
         let schema = schema();
         let mut seen = std::collections::HashSet::new();

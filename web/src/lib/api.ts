@@ -807,6 +807,13 @@ export function updateMachineSettings(updates: Record<string, unknown>): Promise
   return announceOutcome(sendSave("/api/settings?layer=machine", jsonInit("PATCH", updates)));
 }
 
+/** Save the cosmetic global mobile font size without machine-config elevation. */
+export function updateMobileTerminalFontSize(fontSize: number): Promise<SaveOutcome> {
+  return announceOutcome(
+    sendSave("/api/settings/mobile-terminal-font-size", jsonInit("PATCH", { font_size: fontSize })),
+  );
+}
+
 // Theme, tour, tips and acknowledgement flags use dedicated endpoints so these
 // cosmetic writes stay off the passphrase/elevation wall of PATCH /api/settings.
 

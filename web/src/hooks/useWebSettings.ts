@@ -8,7 +8,6 @@ import { DEFAULT_TOOLBAR_KEYS, normalizeToolbarKeys, type ToolbarKeyId } from ".
 const STORAGE_KEY = "aoe-web-settings";
 
 export interface WebSettings {
-  mobileFontSize: number;
   desktopFontSize: number;
   structuredMobileFontSize: number;
   structuredDesktopFontSize: number;
@@ -32,7 +31,6 @@ export interface WebSettings {
 
 function getDefaults(): WebSettings {
   return {
-    mobileFontSize: 8,
     desktopFontSize: 14,
     structuredMobileFontSize: DEFAULT_CONVERSATION_FONT_SIZE,
     structuredDesktopFontSize: DEFAULT_CONVERSATION_FONT_SIZE,
@@ -60,8 +58,9 @@ function normalizeBool(value: unknown, fallback: boolean): boolean {
 
 function normalizeSnapshot(settings: WebSettings): WebSettings {
   const defaults = getDefaults();
+  const { mobileFontSize: _legacyMobileFontSize, ...current } = settings as WebSettings & { mobileFontSize?: unknown };
   return {
-    ...settings,
+    ...current,
     persistentTerminals: normalizeBool(settings.persistentTerminals, defaults.persistentTerminals),
     maxPersistentTerminals: normalizePersistentTerminalLimit(settings.maxPersistentTerminals),
     structuredMobileFontSize: normalizeConversationFontSize(settings.structuredMobileFontSize),

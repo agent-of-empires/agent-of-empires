@@ -20,6 +20,7 @@ afterEach(cleanup);
 
 describe("StructuredViewDisplaySettings localStorage contract", () => {
   it("writes each axis independently and leaves the terminal sizes alone", () => {
+    localStorage.setItem(KEY, JSON.stringify({ desktopFontSize: 17, mobileFontSize: 8 }));
     const { getByTestId } = render(<StructuredViewDisplaySettings />);
 
     fireEvent.change(getByTestId("structured-mobile-font-size-slider"), { target: { value: "11" } });
@@ -30,9 +31,8 @@ describe("StructuredViewDisplaySettings localStorage contract", () => {
     expect(readStored().structuredMobileFontSize).toBe(11);
     expect(readStored().structuredDesktopFontSize).toBe(18);
 
-    // The terminal font sizes are a separate preference and must not move.
-    expect(readStored().mobileFontSize).toBe(8);
-    expect(readStored().desktopFontSize).toBe(14);
+    expect(readStored()).not.toHaveProperty("mobileFontSize");
+    expect(readStored().desktopFontSize).toBe(17);
   });
 
   it("survives a reread and reflects the stored values on remount", () => {

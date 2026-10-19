@@ -637,6 +637,7 @@ export function SettingsView({
                   <SchemaSection
                     section="web"
                     schema={schema}
+                    hideFields={["mobile_terminal_font_size"]}
                     focusRequest={focusRequest}
                     values={web}
                     onSaveField={sendSave}
