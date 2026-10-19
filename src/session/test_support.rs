@@ -1,32 +1,8 @@
-use std::cell::Cell;
+use crate::test_env_lock::{acquire_env_lock, release_env_lock};
 use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard, PoisonError};
 use tempfile::TempDir;
-
-static ENV_LOCK: Mutex<()> = Mutex::new(());
-
-thread_local! {
-    /// True while *this* thread already owns [`ENV_LOCK`] through an outer
-    /// guard. A nested guard on the same thread must not try to re-lock the
-    /// non-reentrant `Mutex` (that would deadlock the thread against
-    /// itself); it inherits the outer guard's exclusion instead and
-    /// acquires nothing. Same-thread nesting is race-free by construction,
-    /// so skipping the re-lock loses no safety.
-    static ENV_LOCK_HELD: Cell<bool> = const { Cell::new(false) };
-}
-
-// Acquire [`ENV_LOCK`] unless this thread already holds it.
-fn acquire_env_lock() -> Option<MutexGuard<'static, ()>> {
-    if ENV_LOCK_HELD.with(Cell::get) {
-        None
-    } else {
-        let guard = lock_reporting_contention(&ENV_LOCK, tests::report_env_lock_contention)
-            .unwrap_or_else(PoisonError::into_inner);
-        ENV_LOCK_HELD.with(|held| held.set(true));
-        Some(guard)
-    }
-}
 
 pub(crate) fn lock_reporting_contention<'a, T>(
     lock: &'a std::sync::Mutex<T>,
@@ -69,7 +45,7 @@ impl EnvGuard {
     pub(crate) fn set<V: AsRef<OsStr>>(pairs: &[(&'static str, V)]) -> Self {
         let mut guard = Self {
             prev: Vec::with_capacity(pairs.len()),
-            _lock: acquire_env_lock(),
+            _lock: acquire_env_lock(|| {}),
         };
         for (key, value) in pairs {
             guard.snapshot(key);
@@ -83,7 +59,7 @@ impl EnvGuard {
     pub(crate) fn unset(keys: &[&'static str]) -> Self {
         let mut guard = Self {
             prev: Vec::with_capacity(keys.len()),
-            _lock: acquire_env_lock(),
+            _lock: acquire_env_lock(|| {}),
         };
         for key in keys {
             guard.snapshot(key);
@@ -105,7 +81,7 @@ impl EnvGuard {
     pub(crate) fn read_lock() -> Self {
         Self {
             prev: Vec::new(),
-            _lock: acquire_env_lock(),
+            _lock: acquire_env_lock(|| {}),
         }
     }
 
@@ -119,9 +95,7 @@ impl Drop for EnvGuard {
         for (key, prev) in self.prev.drain(..).rev() {
             restore_or_remove(key, prev);
         }
-        if self._lock.is_some() {
-            ENV_LOCK_HELD.with(|held| held.set(false));
-        }
+        release_env_lock(self._lock.is_some());
     }
 }
 
@@ -189,7 +163,7 @@ pub(crate) struct TieWorkdirToNameGuard {
 
 impl TieWorkdirToNameGuard {
     pub(crate) fn set(enabled: bool) -> Self {
-        let lock = acquire_env_lock();
+        let lock = acquire_env_lock(|| {});
         let previous = super::config::load_config()
             .ok()
             .flatten()
@@ -218,9 +192,7 @@ impl Drop for TieWorkdirToNameGuard {
                 "failed to restore tie_workdir_to_name after test: {error}"
             );
         }
-        if self._lock.is_some() {
-            ENV_LOCK_HELD.with(|held| held.set(false));
-        }
+        release_env_lock(self._lock.is_some());
     }
 }
 
@@ -252,9 +224,11 @@ fn restore_or_remove(key: &str, prev: Option<OsString>) {
     // call as long as no other thread is concurrently reading or writing
     // the same env key. The invariant is enforced by:
     //   1. Every `EnvGuard` (and `AppDirGuard`, which delegates to it)
-    //      holds [`ENV_LOCK`] for its whole lifetime, so the whole call
-    //      sequence (snapshot -> set_var -> test body -> Drop ->
-    //      restore_or_remove) is linearized against every other guard in
+    //      holds `crate::test_env_lock::ENV_LOCK`, the single lock for the
+    //      whole process, shared with the server's `RuntimeEnvGuard`, for
+    //      its whole lifetime, so the whole call sequence (snapshot ->
+    //      set_var -> test body -> Drop -> restore_or_remove) is linearized
+    //      against every other guard in
     //      the process. This is structural, not annotation-dependent: it
     //      no longer matters whether a call site carries `#[serial]` or a
     //      matching `serial_test::serial(...)` group, because the mutex
@@ -416,18 +390,6 @@ mod tests {
         }
     }
 
-    thread_local! {
-        static LOCK_WAITING: std::cell::RefCell<Option<std::sync::mpsc::Sender<()>>> = const { std::cell::RefCell::new(None) };
-    }
-
-    pub(super) fn report_env_lock_contention() {
-        LOCK_WAITING.with_borrow_mut(|waiting| {
-            if let Some(waiting) = waiting.take() {
-                let _ = waiting.send(());
-            }
-        });
-    }
-
     #[test]
     fn env_lock_orders_readers_and_path_derivation() {
         use std::sync::mpsc;
@@ -464,7 +426,7 @@ mod tests {
             let (contended, observed, exclusive) = std::thread::scope(|scope| {
                 let shim = shim.path();
                 let reader = scope.spawn(move || {
-                    LOCK_WAITING.with_borrow_mut(|waiting| *waiting = Some(waiting_tx));
+                    crate::test_env_lock::observe_env_lock_contention(waiting_tx);
                     let _guard = if derive_path {
                         path_prepended(shim)
                     } else {
@@ -476,10 +438,7 @@ mod tests {
                 let contended = waiting_rx.recv_timeout(Duration::from_secs(30));
                 drop(writer);
                 let observed = observed_rx.recv_timeout(Duration::from_secs(30));
-                let exclusive = matches!(
-                    ENV_LOCK.try_lock(),
-                    Err(std::sync::TryLockError::WouldBlock)
-                );
+                let exclusive = crate::test_env_lock::env_lock_is_held_elsewhere();
                 drop(release_tx);
                 reader.join().unwrap();
                 (contended, observed, exclusive)

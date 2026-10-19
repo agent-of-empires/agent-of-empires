@@ -2520,7 +2520,16 @@ function AppContent({
           <ScratchOverridesModal profile={serverAbout?.profile ?? ""} onClose={() => setScratchSettingsOpen(false)} />
         )}
 
-        {welcome.showWelcome && <ThemeIntro onDone={welcome.dismissWelcome} />}
+        {welcome.showWelcome && (
+          <ThemeIntro
+            onDone={welcome.dismissWelcome}
+            tourFollows={!isCoarse}
+            onSkipTour={() => {
+              handleTourSeen();
+              welcome.dismissWelcome();
+            }}
+          />
+        )}
 
         {tour.tourElement}
 

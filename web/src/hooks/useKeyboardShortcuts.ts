@@ -25,6 +25,8 @@ export function useKeyboardShortcuts(getActions: () => ShortcutActions) {
 
     // Capture phase: xterm.js stops propagation of Cmd/Ctrl combos.
     document.addEventListener("keydown", handler, true);
+    // Lets browser tests wait for the listener instead of racing the effect flush.
+    document.documentElement.dataset.shortcutsReady = "true";
     return () => document.removeEventListener("keydown", handler, true);
   }, [getActions]);
 }

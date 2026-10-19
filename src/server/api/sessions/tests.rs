@@ -4716,6 +4716,100 @@ async fn post_create(
     (status, serde_json::from_slice(&bytes).unwrap())
 }
 
+#[tokio::test]
+async fn scratch_create_resolves_profile_before_publication_and_purge() {
+    use axum::response::IntoResponse;
+
+    let _home = crate::session::test_support::isolate_app_dir();
+    crate::session::config::update_config(|config| {
+        config.default_profile = "chosen-default".to_string();
+    })
+    .unwrap();
+
+    for profile in ["chosen-default", "explicit-other", "server-only"] {
+        crate::session::Storage::new_unwatched(profile).unwrap();
+    }
+
+    for (server_profile, requested_profile, expected_profile) in [
+        ("", None, Some("chosen-default")),
+        ("", Some(""), None),
+        ("", Some("explicit-other"), Some("explicit-other")),
+        ("server-only", None, Some("server-only")),
+    ] {
+        let mut state = crate::server::test_support::build_test_app_state(Vec::new());
+        std::sync::Arc::get_mut(&mut state).unwrap().profile = server_profile.to_string();
+        state.acp_supervisor.test_insert_worker("occupant").await;
+        let mut body = serde_json::json!({
+            "title": "profile-scratch", "path": "", "tool": "claude",
+            "scratch": true, "view": "structured",
+        });
+        if let Some(profile) = requested_profile {
+            body["profile"] = profile.into();
+        }
+        let (status, session) = post_create(&state, body).await;
+        let Some(expected_profile) = expected_profile else {
+            state.acp_supervisor.test_remove_worker("occupant").await;
+            assert_eq!(status, axum::http::StatusCode::BAD_REQUEST, "{session}");
+            assert_eq!(session["error"], "profile_not_found");
+            assert!(state.instances.read().await.is_empty());
+            continue;
+        };
+        assert_eq!(status, axum::http::StatusCode::CREATED, "{session}");
+        let id = session["id"].as_str().unwrap();
+        wait_for("capacity-rejected startup", || {
+            state
+                .acp_event_store
+                .replay_from(id, 0)
+                .iter()
+                .any(|(_, event)| matches!(event, crate::acp::Event::AgentStartupError { .. }))
+        })
+        .await;
+        state.acp_supervisor.test_remove_worker("occupant").await;
+
+        assert_eq!(session["profile"], expected_profile);
+        let path = std::path::PathBuf::from(session["project_path"].as_str().unwrap());
+        assert!(path.is_dir());
+        assert_eq!(
+            state
+                .instances
+                .read()
+                .await
+                .iter()
+                .find(|row| row.id == id)
+                .unwrap()
+                .source_profile,
+            expected_profile,
+        );
+
+        let response = delete_workspace(
+            State(state.clone()),
+            Some(Json(DeleteWorkspaceBody {
+                session_ids: vec![id.to_string()],
+                ..Default::default()
+            })),
+        )
+        .await
+        .into_response();
+        let status = response.status();
+        let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(status, axum::http::StatusCode::OK, "{body}");
+        assert!(
+            !path.exists(),
+            "scratch directory survived permanent deletion"
+        );
+        assert!(state.instances.read().await.iter().all(|row| row.id != id));
+        assert!(crate::session::Storage::open_unwatched(expected_profile)
+            .unwrap()
+            .load()
+            .unwrap()
+            .iter()
+            .all(|row| row.id != id));
+    }
+}
+
 async fn wait_for(what: &str, mut ready: impl FnMut() -> bool) {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
     while !ready() {

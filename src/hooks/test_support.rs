@@ -7,17 +7,22 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use tempfile::TempDir;
 
-/// Installs a hook-base override, cleared on drop.
-pub(crate) struct BaseGuard;
+/// A thread-local hook base guarded against concurrent process-environment changes.
+pub(crate) struct BaseGuard(Option<std::sync::MutexGuard<'static, ()>>);
 
 impl BaseGuard {
+    fn lock() -> Option<std::sync::MutexGuard<'static, ()>> {
+        crate::test_env_lock::acquire_env_lock(|| {
+            eprintln!("waiting for the environment lock: another test holds a process-wide state")
+        })
+    }
+
     /// Base under a fresh tempdir, not yet created on disk.
     pub(crate) fn fresh() -> (Self, PathBuf, TempDir) {
         let tmp = TempDir::new().unwrap();
         let base = tmp.path().join("aoe-hooks");
-        super::dir_guard::override_base_for_test(base.clone());
-        super::dir_guard::reset_for_test();
-        (Self, base, tmp)
+        Self::set_thread_base(base.clone());
+        (Self(Self::lock()), base, tmp)
     }
 
     /// As [`Self::fresh`], with the base created at 0o700.
@@ -29,9 +34,14 @@ impl BaseGuard {
 
     /// An explicit base; the caller creates any parents it needs.
     pub(crate) fn with_base(base: PathBuf) -> Self {
+        Self::set_thread_base(base);
+        Self(Self::lock())
+    }
+
+    /// The parent keeps the environment lock until its worker threads exit.
+    pub(crate) fn set_thread_base(base: PathBuf) {
         super::dir_guard::override_base_for_test(base);
         super::dir_guard::reset_for_test();
-        Self
     }
 }
 
@@ -39,6 +49,7 @@ impl Drop for BaseGuard {
     fn drop(&mut self) {
         super::dir_guard::clear_base_override_for_test();
         super::dir_guard::reset_for_test();
+        crate::test_env_lock::release_env_lock(self.0.is_some());
     }
 }
 

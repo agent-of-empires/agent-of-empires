@@ -1,11 +1,10 @@
-import { test, expect } from "./helpers/mockedTest";
+import { test, expect, pressShortcut } from "./helpers/mockedTest";
 
 test.describe("Command palette", () => {
   test("opens with Ctrl+K", async ({ page }) => {
     await page.setViewportSize({ width: 1280, height: 720 });
     await page.goto("/");
-    await page.locator("body").click();
-    await page.keyboard.press("ControlOrMeta+k");
+    await pressShortcut(page, "ControlOrMeta+k");
     const search = page.getByPlaceholder("Search actions, sessions, settings…");
     await expect(search).toBeVisible();
     // The search input must receive focus on open so the user can type
@@ -16,16 +15,14 @@ test.describe("Command palette", () => {
   test("opens with Meta+K", async ({ page }) => {
     await page.setViewportSize({ width: 1280, height: 720 });
     await page.goto("/");
-    await page.locator("body").click();
-    await page.keyboard.press("Meta+k");
+    await pressShortcut(page, "Meta+k");
     await expect(page.getByPlaceholder("Search actions, sessions, settings…")).toBeVisible();
   });
 
   test("closes on Escape", async ({ page }) => {
     await page.setViewportSize({ width: 1280, height: 720 });
     await page.goto("/");
-    await page.locator("body").click();
-    await page.keyboard.press("ControlOrMeta+k");
+    await pressShortcut(page, "ControlOrMeta+k");
     await expect(page.getByPlaceholder("Search actions, sessions, settings…")).toBeVisible();
     await page.keyboard.press("Escape");
     await expect(page.getByPlaceholder("Search actions, sessions, settings…")).not.toBeVisible();
@@ -34,8 +31,7 @@ test.describe("Command palette", () => {
   test("empty state on no matches", async ({ page }) => {
     await page.setViewportSize({ width: 1280, height: 720 });
     await page.goto("/");
-    await page.locator("body").click();
-    await page.keyboard.press("ControlOrMeta+k");
+    await pressShortcut(page, "ControlOrMeta+k");
     await page.getByPlaceholder("Search actions, sessions, settings…").fill("zzzxxqqq");
     await expect(page.getByText("No matches")).toBeVisible();
   });
@@ -43,8 +39,7 @@ test.describe("Command palette", () => {
   test("enter executes selected action", async ({ page }) => {
     await page.setViewportSize({ width: 1280, height: 720 });
     await page.goto("/");
-    await page.locator("body").click();
-    await page.keyboard.press("ControlOrMeta+k");
+    await pressShortcut(page, "ControlOrMeta+k");
     await page.getByPlaceholder("Search actions, sessions, settings…").fill("new session");
     await page.keyboard.press("ArrowDown");
     await page.keyboard.press("Enter");
@@ -78,8 +73,7 @@ test.describe("Command palette", () => {
   test("cheat code fires a toast and clears the input", async ({ page }) => {
     await page.setViewportSize({ width: 1280, height: 720 });
     await page.goto("/");
-    await page.locator("body").click();
-    await page.keyboard.press("ControlOrMeta+k");
+    await pressShortcut(page, "ControlOrMeta+k");
     const search = page.getByPlaceholder("Search actions, sessions, settings…");
     await search.fill("wololo");
     await expect(page.getByText(/converts to your cause/i)).toBeVisible();
@@ -89,8 +83,7 @@ test.describe("Command palette", () => {
   test("cheat visual overlay auto-cleans and never blocks the palette", async ({ page }) => {
     await page.setViewportSize({ width: 1280, height: 720 });
     await page.goto("/");
-    await page.locator("body").click();
-    await page.keyboard.press("ControlOrMeta+k");
+    await pressShortcut(page, "ControlOrMeta+k");
     const search = page.getByPlaceholder("Search actions, sessions, settings…");
     await search.fill("rock on");
     await expect(page.locator('[data-testid="cheat-overlay"]')).toBeVisible();

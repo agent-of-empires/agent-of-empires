@@ -64,6 +64,15 @@ export async function waitForResponseBody(page: Page, path: string) {
     .toBe(true);
 }
 
+/**
+ * Press a global shortcut once its listener is attached; an early key is silently lost.
+ * Does not click first: a click at the viewport centre can land on a pane button.
+ */
+export async function pressShortcut(page: Page, key: string) {
+  await expect(page.locator("html[data-shortcuts-ready]")).toBeAttached();
+  await page.keyboard.press(key);
+}
+
 export function publishedRequests(page: Page, path: string, method: string) {
   return page.evaluate(
     ({ path, method }) =>

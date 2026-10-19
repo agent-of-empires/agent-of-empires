@@ -9,6 +9,7 @@
     "format": "oxfmt .",
     "format:check": "oxfmt --check .",
     "lint": "eslint .",
+    "typecheck:tests": "tsc -p tsconfig.tests.json",
     "preview": "vite preview",
     "test": "playwright test",
     "test:ui": "playwright test --ui",

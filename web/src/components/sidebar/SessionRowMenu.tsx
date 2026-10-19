@@ -19,11 +19,13 @@ import {
   Sparkles,
   Trash2,
 } from "lucide-react";
+import type { SessionResponse } from "../../lib/types";
 import { triageMenuShape, triageStateOf } from "../../lib/sidebarSort";
 import type { BulkTriageBuckets } from "../../lib/sidebarBulk";
 import { MenuChoiceRow, MenuHeading, MenuItem, MenuSeparator, MenuSwatches } from "../ContextMenu";
 import { SNOOZE_PRESETS } from "./format";
 import { SESSION_COLOR_OPTIONS, type NotifyPreset, type RowModel } from "./rowModel";
+import type { SessionAction } from "./sessionActionTargets";
 import type { RowBulkApi } from "./types";
 
 const icon = (Icon: typeof Pin, className = "") => <Icon className={`h-3.5 w-3.5 shrink-0 ${className}`.trim()} />;
@@ -86,13 +88,13 @@ export interface SingleRowActions {
   editWorkdir: () => void;
   addProject: () => void;
   editGroup: () => void;
-  switchView: () => void;
-  switchAgent: () => void;
-  fork: () => void;
-  autoName: () => void;
-  summarize: () => void;
-  stop: () => void;
-  start: () => void;
+  switchView: (sessionId: string) => void;
+  switchAgent: (sessionId: string) => void;
+  fork: (sessionId: string) => void;
+  autoName: (sessionId: string) => void;
+  summarize: (sessionId: string) => void;
+  stop: (sessionId: string) => void;
+  start: (sessionId: string) => void;
   notify: (preset: NotifyPreset) => void;
   color: (color: string | null) => void;
   pin: () => void;
@@ -155,17 +157,21 @@ export function SingleRowMenuItems({
 }) {
   const [moreOpen, setMoreOpen] = useState(false);
   const moreId = useId();
-  const { firstSession: first, acpSession: acp } = model;
+  const [pickerOpen, setPickerOpen] = useState<SessionAction | null>(null);
+  const { actionTargets: t } = model;
   const write = !readOnly;
-  const canSwitchView = write && !!first && (first.view === "structured" || first.acp_capable);
-  const canFork = write && !!acp?.acp_session_id && acp.acp_can_fork;
+  const item = (action: SessionAction, props: Omit<TargetedItemProps, "targets" | "open" | "onToggle" | "onRun">) => (
+    <TargetedItem
+      {...props}
+      targets={t[action]}
+      open={pickerOpen === action}
+      onToggle={() => setPickerOpen((o) => (o === action ? null : action))}
+      onRun={a[action]}
+    />
+  );
   const more = write && {
-    switchAgent: !!acp,
-    autoName: !!acp,
-    summarize: !!acp,
     editWorkdir: model.canEditWorkdir,
     addProject: !!model.sessionId && model.canAddProject,
-    editGroup: true,
   };
   return (
     <>
@@ -176,26 +182,17 @@ export function SingleRowMenuItems({
           Rename
         </MenuItem>
       )}
-      {write && model.canStop && (
-        <MenuItem onClick={a.stop} testId="sidebar-context-menu-stop" icon={icon(CircleStop)}>
-          Stop
-        </MenuItem>
-      )}
-      {write && model.canStart && (
-        <MenuItem onClick={a.start} testId="sidebar-context-menu-start" icon={icon(Play)}>
-          Start
-        </MenuItem>
-      )}
-      {canSwitchView && (
-        <MenuItem onClick={a.switchView} testId="sidebar-context-menu-switch-view" icon={icon(SquareTerminal)}>
-          {first!.view === "structured" ? "Switch to terminal" : "Switch to structured view"}
-        </MenuItem>
-      )}
-      {canFork && (
-        <MenuItem onClick={a.fork} testId="sidebar-context-menu-fork" icon={icon(GitFork)}>
-          Fork session
-        </MenuItem>
-      )}
+      {write && item("stop", { label: "Stop", testId: "sidebar-context-menu-stop", glyph: icon(CircleStop) })}
+      {write && item("start", { label: "Start", testId: "sidebar-context-menu-start", glyph: icon(Play) })}
+      {write &&
+        item("switchView", {
+          label: "Switch view",
+          singleLabel: (s) => (s.view === "structured" ? "Switch to terminal" : "Switch to structured view"),
+          detail: (s) => `${s.status}, to ${s.view === "structured" ? "terminal" : "structured"}`,
+          testId: "sidebar-context-menu-switch-view",
+          glyph: icon(SquareTerminal),
+        })}
+      {write && item("fork", { label: "Fork session", testId: "sidebar-context-menu-fork", glyph: icon(GitFork) })}
       {write && a.newSession && (
         <MenuItem onClick={a.newSession} testId="sidebar-context-menu-new-session" icon={icon(Plus)}>
           New session in this project
@@ -213,26 +210,27 @@ export function SingleRowMenuItems({
             More
           </MenuItem>
           <div id={moreId} hidden={!moreOpen}>
-            {more.switchAgent && (
-              <MenuItem
-                onClick={a.switchAgent}
-                testId="sidebar-context-menu-switch-agent"
-                icon={icon(ArrowLeftRight)}
-                indent
-              >
-                Switch agent
-              </MenuItem>
-            )}
-            {more.autoName && (
-              <MenuItem onClick={a.autoName} testId="sidebar-context-menu-auto-name" icon={icon(Sparkles)} indent>
-                Auto-name now
-              </MenuItem>
-            )}
-            {more.summarize && (
-              <MenuItem onClick={a.summarize} testId="sidebar-context-menu-summarize" icon={icon(ScrollText)} indent>
-                Summarize conversation
-              </MenuItem>
-            )}
+            {write &&
+              item("switchAgent", {
+                label: "Switch agent",
+                testId: "sidebar-context-menu-switch-agent",
+                glyph: icon(ArrowLeftRight),
+                indent: true,
+              })}
+            {write &&
+              item("autoName", {
+                label: "Auto-name now",
+                testId: "sidebar-context-menu-auto-name",
+                glyph: icon(Sparkles),
+                indent: true,
+              })}
+            {write &&
+              item("summarize", {
+                label: "Summarize conversation",
+                testId: "sidebar-context-menu-summarize",
+                glyph: icon(ScrollText),
+                indent: true,
+              })}
             {more.editWorkdir && (
               <MenuItem
                 onClick={a.editWorkdir}
@@ -302,6 +300,80 @@ export function SingleRowMenuItems({
           </MenuItem>
         </>
       )}
+    </>
+  );
+}
+
+interface TargetedItemProps {
+  label: string;
+  /** Label when exactly one sibling is a target and no choice is needed. */
+  singleLabel?: (s: SessionResponse) => string;
+  detail?: (s: SessionResponse) => string;
+  testId: string;
+  glyph: React.ReactNode;
+  indent?: boolean;
+  targets: SessionResponse[];
+  open: boolean;
+  onToggle: () => void;
+  onRun: (sessionId: string) => void;
+}
+
+/** A session-scoped action: runs on its only target, or discloses a list of siblings to choose from. */
+function TargetedItem({
+  label,
+  singleLabel,
+  detail = (s) => s.status,
+  testId,
+  glyph,
+  indent,
+  targets,
+  open,
+  onToggle,
+  onRun,
+}: TargetedItemProps) {
+  const pickerId = useId();
+  const titleOf = (s: SessionResponse) => s.title.trim() || "Untitled session";
+  // Siblings can share a title (a worktree's default is its branch) and a status; an id tells them apart.
+  const clashes = (s: SessionResponse) =>
+    targets.some((t) => t !== s && titleOf(t) === titleOf(s) && detail(t) === detail(s));
+  if (targets.length === 0) return null;
+  if (targets.length === 1) {
+    const only = targets[0]!;
+    return (
+      <MenuItem onClick={() => onRun(only.id)} testId={testId} icon={glyph} indent={indent}>
+        {singleLabel?.(only) ?? label}
+      </MenuItem>
+    );
+  }
+  return (
+    <>
+      <MenuItem
+        onClick={onToggle}
+        testId={testId}
+        ariaExpanded={open}
+        ariaControls={pickerId}
+        icon={glyph}
+        indent={indent}
+      >
+        {label}…
+      </MenuItem>
+      <div id={pickerId} hidden={!open} className="pl-3">
+        {targets.map((s) => (
+          <MenuItem
+            key={s.id}
+            onClick={() => onRun(s.id)}
+            testId={`${testId}-target`}
+            indent
+            className="text-text-primary hover:bg-surface-700/50"
+          >
+            <span className="truncate">{titleOf(s)}</span>
+            <span className="ml-2 shrink-0 text-xs">
+              {detail(s)}
+              {clashes(s) && ` #${s.id.slice(0, 8)}`}
+            </span>
+          </MenuItem>
+        ))}
+      </div>
     </>
   );
 }

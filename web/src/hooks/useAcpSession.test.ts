@@ -217,6 +217,30 @@ describe("persisted state hydration", () => {
   });
 });
 
+describe("mid-turn cache recovery (#4530)", () => {
+  it("dials from the cursor the recovery caught up to, not the cached one", async () => {
+    const activity = [{ id: "t", kind: "tool_start", text: "t", at: "t" }];
+    const state = { ...emptyAcpState(), lastSeq: 900, oldestSeq: 40, activity };
+    localStorage.setItem(`${STORAGE_KEY_PREFIX}sess-mid`, JSON.stringify({ savedAt: Date.now(), state }));
+    const rows = [
+      { id: "u", kind: "user_prompt", at: "t", text: "u" },
+      { id: "t2", kind: "tool_start", at: "t", text: "t2" },
+    ];
+    installAcpFakes(({ url }) => {
+      if (!url.includes("/acp/replay")) return undefined;
+      const params = new URL(url, "http://x").searchParams;
+      const page = params.has("before")
+        ? { next_cursor: 2100, has_more: false, rows: params.get("view") === "rows" ? rows : null }
+        : { rows: params.get("view") === "rows" ? [] : null };
+      return json({ frames: [], lost: false, highest_seq: 3000, ...page });
+    });
+    render("sess-mid");
+    await flushAsync();
+    expect(sockets).toHaveLength(1);
+    expect(sockets[0]!.url).toContain("/acp/ws?since=3000");
+  });
+});
+
 describe("recent-first cold open + loadOlder (#2236)", () => {
   const prompt = (seq: number) => ({ session_id: "sess-rf", seq, event: { UserPromptSent: { text: `p${seq}` } } });
   const page = (seqs: number[], next: number | null, hasMore: boolean) => {

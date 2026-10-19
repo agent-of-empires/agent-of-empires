@@ -1,4 +1,5 @@
 import { expect, type Page } from "@playwright/test";
+import type { LiveClientMessage, LiveServerMessage } from "../../src/lib/generated/liveWire";
 import { sessionResponse } from "./sessions";
 
 export interface MockHandle {
@@ -8,17 +9,13 @@ export interface MockHandle {
   liveInput: Buffer[];
   waitForLiveReady: () => Promise<void>;
   /** Switch to explicit frames and await the real reducer's debug frame counter. */
-  pushLiveFrame: (frame: {
-    content: string;
-    rows: number;
-    history: number;
-    cursor?: { x: number; y: number } | null;
-    altScreen?: boolean;
-    mouse?: boolean;
-    mouseSgr?: boolean;
-  }) => Promise<void>;
+  pushLiveFrame: (frame: LiveFrameFields) => Promise<void>;
   pushLiveClipboard: (text: string) => void;
 }
+
+type LiveFrameMessage = Extract<LiveServerMessage, { type: "frame" }>;
+type LiveFrameDefaults = Pick<LiveFrameMessage, "cursor" | "altScreen" | "mouse" | "mouseSgr" | "pane0">;
+type LiveFrameFields = Omit<LiveFrameMessage, "type" | "seq" | keyof LiveFrameDefaults> & Partial<LiveFrameDefaults>;
 
 /** `history` numbered scrollback lines, then a `rows`-tall screen with a prompt on its first line. */
 export function makeLiveFrame(
@@ -43,6 +40,19 @@ export function makeLiveFrame(
   };
 }
 
+function liveFrameMessage(seq: number, frame: LiveFrameFields): LiveServerMessage {
+  return {
+    ...frame,
+    type: "frame",
+    seq,
+    cursor: frame.cursor ?? null,
+    altScreen: frame.altScreen ?? false,
+    mouse: frame.mouse ?? false,
+    mouseSgr: frame.mouseSgr ?? false,
+    pane0: frame.pane0 ?? null,
+  };
+}
+
 export async function mockTerminalApis(
   page: Page,
   opts: {
@@ -63,7 +73,7 @@ export async function mockTerminalApis(
     url.searchParams.set("livedebug", "1");
     history.replaceState(null, "", url);
   });
-  const liveSockets: Array<{ send: (data: string) => void; frames: number }> = [];
+  const liveSockets: Array<{ send: (message: LiveServerMessage) => void; frames: number }> = [];
   let customFrames = false;
   const consumedFrames = () =>
     page
@@ -83,10 +93,9 @@ export async function mockTerminalApis(
     },
     pushLiveFrame: async (frame) => {
       customFrames = true;
-      const payload = JSON.stringify({ type: "frame", cursor: null, ...frame });
       for (const ws of liveSockets) {
         try {
-          ws.send(payload);
+          ws.send(liveFrameMessage(ws.frames + 1, frame));
           ws.frames++;
         } catch {
           // closed socket at test teardown; ignore
@@ -97,10 +106,9 @@ export async function mockTerminalApis(
       await expect.poll(consumedFrames).toBe(expected);
     },
     pushLiveClipboard: (text) => {
-      const payload = JSON.stringify({ type: "clipboard", text });
       for (const ws of liveSockets) {
         try {
-          ws.send(payload);
+          ws.send({ type: "clipboard", text });
         } catch {
           // closed socket at test teardown; ignore
         }
@@ -163,7 +171,8 @@ export async function mockTerminalApis(
   });
   // Replies to resize and window messages with a sized frame, like src/server/live_ws.rs.
   await page.routeWebSocket(/\/sessions\/.*\/live-ws(\?.*)?$/, (ws) => {
-    const socket = { send: (data: string) => ws.send(data), frames: 0 };
+    const send = (message: LiveServerMessage) => ws.send(JSON.stringify(message));
+    const socket = { send, frames: 0 };
     liveSockets.push(socket);
     let rows = 24;
     let window = 24;
@@ -171,11 +180,11 @@ export async function mockTerminalApis(
     const reply = (responseRows = rows, responseWindow = window) => {
       if (customFrames) return;
       try {
-        ws.send(
-          JSON.stringify({
-            type: "frame",
-            ...makeLiveFrame({ rows: responseRows, history, window: responseWindow, line: opts.liveHistoryLine }),
-          }),
+        send(
+          liveFrameMessage(
+            socket.frames + 1,
+            makeLiveFrame({ rows: responseRows, history, window: responseWindow, line: opts.liveHistoryLine }),
+          ),
         );
         socket.frames++;
       } catch {
@@ -191,13 +200,13 @@ export async function mockTerminalApis(
         return;
       }
       try {
-        const control = JSON.parse(String(msg)) as { type?: string; rows?: number; lines?: number };
+        const control = JSON.parse(String(msg)) as LiveClientMessage;
         if (control.type === "claim_if_vacant") {
-          ws.send(JSON.stringify({ type: "size_owner", is_owner: true }));
+          send({ type: "size_owner", is_owner: true });
         } else if (control.type === "resize" && control.rows) {
           rows = control.rows;
           window = Math.max(window, rows);
-          ws.send(JSON.stringify({ type: "size_owner", is_owner: true }));
+          send({ type: "size_owner", is_owner: true });
           reply();
         } else if (control.type === "window" && control.lines) {
           const shrinking = control.lines < window;

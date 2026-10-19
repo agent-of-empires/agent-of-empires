@@ -292,3 +292,41 @@ test.describe("Sidebar multi-session (#956)", () => {
     expect(confirmText).toContain("Archive all 2 sessions");
   });
 });
+
+// Sessions sharing an explicit worktree branch stay in one row; its session actions must name a sibling (#3387).
+test.describe("Sidebar shared-worktree row actions (#3387)", () => {
+  const shared = { project_path: "/tmp/agent-of-empires", branch: "feature/shared" };
+
+  test("Stop and Start act on the chosen sibling, never the first session", async ({ page }) => {
+    await mockApis(page, [
+      { id: "sess-a", title: "Creator", status: "Stopped", ...shared },
+      { id: "sess-b", title: "Reviewer", status: "Running", ...shared },
+      { id: "sess-c", title: "Security", status: "Running", ...shared },
+    ]);
+    const lifecycle: string[] = [];
+    await page.route(/\/api\/sessions\/[^/]+\/(stop|start)$/, (r) => {
+      const [, id, verb] = new URL(r.request().url()).pathname.match(/sessions\/([^/]+)\/(\w+)$/)!;
+      lifecycle.push(`${verb} ${id}`);
+      return r.fulfill({ json: { id } });
+    });
+    await page.setViewportSize({ width: 1280, height: 720 });
+    await page.goto("/");
+
+    const row = page.getByTestId("sidebar-session-row");
+    await expect(row).toHaveCount(1, { timeout: 10_000 });
+    await row.click({ button: "right" });
+    await page.getByTestId("sidebar-context-menu-start").click();
+    await expect.poll(() => lifecycle, { timeout: 10_000 }).toEqual(["start sess-a"]);
+
+    await row.click({ button: "right" });
+    await page.getByTestId("sidebar-context-menu-stop").click();
+    const targets = page.getByTestId("sidebar-context-menu-stop-target");
+    await expect(targets).toHaveText([/Reviewer/, /Security/]);
+    await targets.nth(1).click();
+    await page
+      .getByTestId("stop-session-dialog")
+      .getByRole("button", { name: /^Stop$/ })
+      .click();
+    await expect.poll(() => lifecycle, { timeout: 10_000 }).toEqual(["start sess-a", "stop sess-c"]);
+  });
+});

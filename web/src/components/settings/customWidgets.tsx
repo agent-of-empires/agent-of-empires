@@ -108,6 +108,8 @@ const KNOWN_TARGETS: { value: string; group: string }[] = [
   { value: "acp.event_store", group: "Structured view" },
   { value: "acp.runner", group: "Structured view" },
   { value: "plugin.host", group: "Plugins" },
+  { value: "runtime.uds", group: "Runtime" },
+  { value: "runtime.ws", group: "Runtime" },
   { value: "terminal.ws", group: "Terminal" },
   { value: "terminal.ws.bytes", group: "Terminal" },
   { value: "auth.token", group: "Auth" },

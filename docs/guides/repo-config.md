@@ -15,7 +15,7 @@ on_destroy = ["docker-compose down"]
 
 - **`on_create`** runs once, when the session is first created. A failing command aborts creation, so use it for one-time setup.
 - **`on_launch`** runs on every start, including restarts. Failures are logged as warnings and do not prevent a user-initiated start, though during startup recovery a timed-out hook marks the recovered session as errored rather than launching with partial setup.
-- **`on_destroy`** runs when a session is deleted, before worktree and sandbox cleanup, so teardown commands can still reach running containers. Failures never prevent deletion.
+- **`on_destroy`** runs when a session is deleted, before worktree and sandbox cleanup, so teardown commands can still reach running containers. Failures never prevent deletion. For a host-side equivalent that always runs outside the container, see [`host_hooks.before_destroy`](configuration.md#host-hooks).
 
 Hooks run inside the container for a sandboxed session and in your host shell otherwise, so a path can resolve in one mode and not the other. An absolute host path fails in the container unless `sandbox.extra_volumes` mounts it, and a repo cannot set that key. Guard optional scripts on their presence only, so a real failure still aborts creation:
 

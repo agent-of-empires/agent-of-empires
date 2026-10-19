@@ -3,12 +3,12 @@
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashSet};
-use std::fs;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use thiserror::Error;
 use tracing::warn;
 
-use super::{get_app_dir, get_profile_dir_path};
+use super::{get_app_dir_path, get_profile_dir_path};
 
 /// Distinct failure modes for registry mutations.
 #[derive(Debug, Error)]
@@ -188,7 +188,7 @@ impl Project {
 }
 
 fn global_path() -> Result<PathBuf> {
-    Ok(get_app_dir()?.join("projects.json"))
+    Ok(get_app_dir_path()?.join("projects.json"))
 }
 
 fn profile_path(profile: &str) -> Result<PathBuf> {
@@ -213,10 +213,16 @@ fn parse_projects(content: &str, scope: ProjectScope) -> Result<Vec<Project>> {
 }
 
 fn read_file(path: &Path, scope: ProjectScope) -> Result<Vec<Project>> {
-    if !path.exists() {
-        return Ok(Vec::new());
+    let mut file = match crate::process::open_read_nonblocking(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error.into()),
+    };
+    if !file.metadata()?.is_file() {
+        anyhow::bail!("{} is not a regular file", path.display());
     }
-    let content = fs::read_to_string(path)?;
+    let mut content = String::new();
+    file.read_to_string(&mut content)?;
     if content.trim().is_empty() {
         return Ok(Vec::new());
     }
@@ -749,7 +755,100 @@ mod tests {
     use super::*;
     use crate::session::test_support::isolate_app_dir_at;
     use serial_test::serial;
+    use std::fs;
     use tempfile::tempdir;
+
+    #[test]
+    #[serial]
+    fn readonly_registries_do_not_create_paths_but_mutation_does() {
+        let home = tempdir().unwrap();
+        let _guard = isolate_app_dir_at(home.path());
+        let app = super::super::get_profile_dir_path("explicit")
+            .unwrap()
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .to_path_buf();
+        assert!(load_global().unwrap().is_empty());
+        assert!(load_profile("explicit").unwrap().is_empty());
+        assert!(!app.exists());
+        let repo = home.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        for scope in [ProjectScope::Global, ProjectScope::Profile] {
+            add(
+                "explicit",
+                scope,
+                Project::new(scope.as_str(), repo.to_string_lossy(), scope),
+                true,
+            )
+            .unwrap();
+        }
+        assert_eq!(load_global().unwrap()[0].name, "global");
+        assert_eq!(load_profile("explicit").unwrap()[0].name, "profile");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn nonregular_project_registries_are_refused_without_blocking() {
+        const CHILD: &str = "AOE_PROJECT_FIFO_TEST_CHILD";
+        const ENTERED: &str = "AOE_PROJECT_FIFO_TEST_ENTERED";
+        let thread = std::thread::current();
+        let test = thread.name().unwrap();
+        if std::env::var(CHILD).as_deref() != Ok(test) {
+            let home = tempdir().unwrap();
+            let entered = home.path().join("entered");
+            let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+            command
+                .env("TMPDIR", home.path())
+                .args(["--exact", test, "--nocapture", "--test-threads=1"])
+                .env(CHILD, test)
+                .env(ENTERED, &entered)
+                .stdin(std::process::Stdio::null());
+            let output = crate::process::run_with_timeout_process_group(
+                &mut command,
+                std::time::Duration::from_secs(10),
+            )
+            .unwrap()
+            .expect("project registry read blocked in the isolated child");
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert_eq!(fs::read_to_string(entered).unwrap(), test);
+            return;
+        }
+        fs::write(std::env::var_os(ENTERED).unwrap(), test).unwrap();
+        let home = tempdir().unwrap();
+        let fifo = home.path().join("fifo");
+        nix::unistd::mkfifo(
+            &fifo,
+            nix::sys::stat::Mode::S_IRUSR | nix::sys::stat::Mode::S_IWUSR,
+        )
+        .unwrap();
+        let alias = home.path().join("alias");
+        std::os::unix::fs::symlink(&fifo, &alias).unwrap();
+        for scope in [ProjectScope::Global, ProjectScope::Profile] {
+            assert!(read_file(&fifo, scope).is_err());
+            assert!(read_file(&alias, scope).is_err());
+        }
+        let _writer = nix::fcntl::open(
+            &fifo,
+            nix::fcntl::OFlag::O_RDWR | nix::fcntl::OFlag::O_NONBLOCK,
+            nix::sys::stat::Mode::empty(),
+        )
+        .unwrap();
+        assert!(read_file(&fifo, ProjectScope::Profile).is_err());
+        fs::remove_file(&alias).unwrap();
+        let regular = home.path().join("regular");
+        fs::write(&regular, br#"[{"name":"saved","path":"/repo"}]"#).unwrap();
+        std::os::unix::fs::symlink(&regular, &alias).unwrap();
+        let projects = read_file(&alias, ProjectScope::Profile).unwrap();
+        assert_eq!(projects[0].name, "saved");
+        assert_eq!(projects[0].path, "/repo");
+    }
 
     #[test]
     fn repo_label_uses_basename_with_root_fallbacks() {
@@ -757,6 +856,31 @@ mod tests {
         assert_eq!(repo_label("/home/me/myrepo/"), "myrepo");
         assert_eq!(repo_label("/"), "(root)");
         assert_eq!(repo_label(""), "(root)");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[serial]
+    fn unreadable_project_registries_are_not_successful_empty_results() {
+        let home = tempdir().unwrap();
+        let _guard = isolate_app_dir_at(home.path());
+        for scope in [ProjectScope::Global, ProjectScope::Profile] {
+            let path = registry_path("explicit", scope).unwrap();
+            assert!(read_file(&path, scope).unwrap().is_empty());
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(&path, "[]").unwrap();
+            assert!(read_file(&path, scope).unwrap().is_empty());
+            fs::remove_file(&path).unwrap();
+            std::os::unix::fs::symlink(path.file_name().unwrap(), &path).unwrap();
+            let error = read_file(&path, scope).unwrap_err();
+            assert_eq!(
+                error
+                    .downcast_ref::<std::io::Error>()
+                    .unwrap()
+                    .raw_os_error(),
+                Some(libc::ELOOP)
+            );
+        }
     }
 
     #[test]

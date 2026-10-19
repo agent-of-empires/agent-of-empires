@@ -1,6 +1,6 @@
 import { useState, type ReactNode, type RefObject } from "react";
 import { createPortal } from "react-dom";
-import type { Workspace } from "../../lib/types";
+import type { SessionResponse, Workspace } from "../../lib/types";
 import {
   attachSessionProject,
   createSession,
@@ -20,6 +20,7 @@ import { StatusGlyph } from "../StatusGlyph";
 import { AddProjectModal } from "./AddProjectModal";
 import type { RowModel } from "./rowModel";
 import { BulkTriageMenuItems, SingleRowMenuItems, type SingleRowActions } from "./SessionRowMenu";
+import type { SessionAction } from "./sessionActionTargets";
 import { SnoozeModal } from "./SnoozeModal";
 import type { RowBulkApi, RowContextScope } from "./types";
 import { WorkdirNameModal } from "./WorkdirNameModal";
@@ -157,10 +158,19 @@ function buildRowActions(
   closeMenu: () => void,
   setModal: (m: Modal) => void,
 ): Omit<SingleRowActions, "rename" | "notify" | "color"> {
-  const { firstSession: first, acpSession: acp } = model;
   const after = (fn: () => unknown) => () => {
     closeMenu();
     void fn();
+  };
+  // Re-checks the chosen session against the live row, since it can change while the menu is open.
+  const afterTarget = (action: SessionAction, fn: (s: SessionResponse) => unknown) => (sessionId: string) => {
+    closeMenu();
+    const session = workspace.sessions.find((s) => s.id === sessionId);
+    if (!session || !model.actionTargets[action].some((t) => t.id === sessionId)) {
+      reportError("That session changed. Please try again.");
+      return;
+    }
+    void fn(session);
   };
   return {
     newSession:
@@ -170,38 +180,34 @@ function buildRowActions(
     editWorkdir: after(() => setModal("workdir")),
     addProject: after(() => setModal("addProject")),
     editGroup: after(() => setModal("group")),
-    switchView: after(() => first && props.onSwitchView?.(first.id, first.view !== "structured")),
+    switchView: afterTarget("switchView", (s) => props.onSwitchView?.(s.id, s.view !== "structured")),
     // The dialog lives in the session's Composer, so navigate first; a pending latch opens it on mount.
-    switchAgent: after(() => {
-      if (!acp) return;
-      requestOpenSession(acp.id);
-      requestSwitchAgent(acp.id);
+    switchAgent: afterTarget("switchAgent", (s) => {
+      requestOpenSession(s.id);
+      requestSwitchAgent(s.id);
     }),
-    fork: after(async () => {
-      if (!acp?.acp_session_id || !acp.acp_can_fork) return;
+    fork: afterTarget("fork", async (s) => {
       const result = await createSession({
-        path: acp.project_path,
-        tool: acp.tool,
+        path: s.project_path,
+        tool: s.tool,
         view: "structured",
-        profile: acp.profile || undefined,
-        fork_from: acp.acp_session_id,
+        profile: s.profile || undefined,
+        fork_from: s.acp_session_id!,
       });
       if (result.ok && result.session) requestOpenSession(result.session.id);
       else reportError(result.error ?? "Could not fork this session. Please try again.");
     }),
-    autoName: after(async () => {
-      if (!acp) return;
-      const result = await smartRenameSession(acp.id);
+    autoName: afterTarget("autoName", async (s) => {
+      const result = await smartRenameSession(s.id);
       if (!result.ok) reportError(result.message ?? "Could not start auto-name. Please try again.");
     }),
-    summarize: after(async () => {
-      if (!acp) return;
-      const result = await summarizeSession(acp.id);
+    summarize: afterTarget("summarize", async (s) => {
+      const result = await summarizeSession(s.id);
       if (result.ok) reportInfo("Summarizing the conversation so far…");
       else reportError(result.message ?? "Could not start the summary. Please try again.");
     }),
-    stop: after(() => first && props.onStop?.(first.id)),
-    start: after(() => first && props.onStart?.(first.id)),
+    stop: afterTarget("stop", (s) => props.onStop?.(s.id)),
+    start: afterTarget("start", (s) => props.onStart?.(s.id)),
     pin: () => props.onPinToggle(workspace, !model.effectivePinned),
     archive: after(() => props.onArchiveToggle(workspace, !model.effectiveArchived)),
     openSnooze: after(() => setModal("snooze")),

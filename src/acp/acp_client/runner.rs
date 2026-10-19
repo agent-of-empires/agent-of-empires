@@ -3,7 +3,7 @@
 use tracing::{info, warn};
 
 use super::errors::AcpError;
-use super::resolve_command::resolve_agent_command;
+use super::resolve_command::{is_bare_command, resolve_agent_command};
 use super::session_sandbox::{build_sandbox_docker_argv, SessionSandbox};
 use super::spawn::{
     apply_claude_store_route, apply_env_filter, host_environment_denyreason, prepend_path_dirs,
@@ -121,6 +121,38 @@ fn append_to_log(path: &std::path::Path) -> std::process::Stdio {
     }
 }
 
+/// A Worker started for a bare adapter name that resolved nowhere can only exit
+/// before its Hello, which loses the cause (#4576). Paths and `${placeholder}`
+/// commands resolve elsewhere, and a sandbox resolves inside its container.
+/// The adapter searches the last `PATH` in `agent_environment`, else the
+/// inherited one, from its cwd, so relative entries resolve against the project.
+fn refuse_unresolved_adapter(
+    config: &SpawnConfig,
+    sandboxed: bool,
+    resolved: bool,
+    agent_environment: &[(String, String)],
+    inherited_path: Option<&std::ffi::OsStr>,
+) -> Result<(), AcpError> {
+    if sandboxed || resolved || !is_bare_command(&config.spec.command) {
+        return Ok(());
+    }
+    let path = agent_environment
+        .iter()
+        .rev()
+        .find(|(key, _)| key == "PATH")
+        .map(|(_, path)| std::ffi::OsStr::new(path))
+        .or(inherited_path);
+    if path
+        .is_some_and(|path| which::which_in(&config.spec.command, Some(path), &config.cwd).is_ok())
+    {
+        return Ok(());
+    }
+    Err(AcpError::missing_binary_spawn_error(
+        &std::io::Error::from(std::io::ErrorKind::NotFound),
+        &config.spec.command,
+    ))
+}
+
 /// The runner owns the agent subprocess and outlives the daemon, so no `Child`
 /// handle is kept: the daemon reaches it over the unix socket, and the OS keeps
 /// it alive across `aoe serve` restarts.
@@ -186,6 +218,35 @@ pub(super) async fn spawn_runner_detached(
         let app_dir = crate::session::get_app_dir().ok();
         resolve_agent_command(&config.spec.command, app_dir.as_deref())
     };
+    // Trusted `Config.environment`, then the provider pick that outranks it, for
+    // the adapter only: they ride a carrier key the runner strips and applies to
+    // its child, because HOME, PATH or XDG_CONFIG_HOME set on the runner itself
+    // would move its worker registry (#1383) or change which binary it loads.
+    let host_environment: Vec<(String, String)> = config
+        .host_environment
+        .iter()
+        .chain(&config.provider_routing)
+        .filter(|(key, _)| match host_environment_denyreason(key) {
+            Some(reason) => {
+                warn!(
+                    target: "acp",
+                    key = %key,
+                    reason,
+                    "rejecting configured host environment key",
+                );
+                false
+            }
+            None => true,
+        })
+        .cloned()
+        .collect();
+    refuse_unresolved_adapter(
+        config,
+        sandbox_argv.is_some(),
+        resolved.is_some(),
+        &host_environment,
+        std::env::var_os("PATH").as_deref(),
+    )?;
     let (spawn_command, extra_path_dirs): (String, Vec<std::path::PathBuf>) =
         match (&sandbox_argv, &resolved) {
             (Some(s), _) => (s.docker_binary.clone(), Vec::new()),
@@ -258,30 +319,6 @@ pub(super) async fn spawn_runner_detached(
     if let Ok(interval) = std::env::var("AOE_ACP_WATCHDOG_POLL_MS") {
         cmd.env("AOE_ACP_WATCHDOG_POLL_MS", interval);
     }
-    // Trusted `Config.environment`, then the provider pick that outranks it,
-    // for the adapter only, riding one reserved
-    // carrier key (JSON `[[key, value], ...]`) that the runner strips and
-    // applies to its child. HOME / PATH / XDG_CONFIG_HOME are legal entries
-    // here, and setting those on the runner itself would move the
-    // worker-registry path it writes (#1383) or change which binary it loads.
-    let host_environment: Vec<(String, String)> = config
-        .host_environment
-        .iter()
-        .chain(&config.provider_routing)
-        .filter(|(key, _)| match host_environment_denyreason(key) {
-            Some(reason) => {
-                warn!(
-                    target: "acp",
-                    key = %key,
-                    reason,
-                    "rejecting configured host environment key",
-                );
-                false
-            }
-            None => true,
-        })
-        .cloned()
-        .collect();
     if !host_environment.is_empty() {
         let encoded = serde_json::to_string(&host_environment)
             .map_err(|e| AcpError::Spawn(format!("encode host environment: {e}")))?;
@@ -592,6 +629,150 @@ mod tests {
             let mut want = vec!["A=1".to_string()];
             want.extend(own.map(|v| format!("INVOCATION_ID={v}")));
             assert_eq!(seen, want, "own INVOCATION_ID {own:?}");
+        }
+    }
+
+    /// #4576: an unresolved bare adapter name fails before a Worker starts,
+    /// naming that adapter's own install command.
+    #[test]
+    fn refuse_unresolved_adapter_cases() {
+        use std::os::unix::fs::PermissionsExt;
+        let cwd = tempfile::tempdir().unwrap();
+        // Only a PATH entry for this directory finds the adapter. As the
+        // relative entry `agent-bin`, it resolves from the project cwd, not the
+        // test process's.
+        let agent_bin = cwd.path().join("agent-bin");
+        std::fs::create_dir(&agent_bin).unwrap();
+        let adapter = agent_bin.join("codex-acp");
+        std::fs::write(&adapter, "#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&adapter, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let empty_bin = cwd.path().join("empty-bin");
+        std::fs::create_dir(&empty_bin).unwrap();
+        let (found, empty) = (agent_bin.to_str().unwrap(), empty_bin.to_str().unwrap());
+        let hint = |cmd: &str| Some(crate::acp::install_hints::install_hint_for(cmd).unwrap());
+        let cases: [(&str, bool, bool, &[&str], Option<&str>, Option<&str>); 13] = [
+            // (command, sandboxed, resolved, configured PATHs, inherited PATH, expected error text)
+            ("codex-acp", false, false, &[], None, hint("codex-acp")),
+            (
+                "claude-agent-acp",
+                false,
+                false,
+                &[],
+                None,
+                hint("claude-agent-acp"),
+            ),
+            (
+                "aoe-test-unknown-adapter",
+                false,
+                false,
+                &[],
+                None,
+                Some("binary `aoe-test-unknown-adapter` not found"),
+            ),
+            ("codex-acp", true, false, &[], None, None),
+            ("codex-acp", false, true, &[], None, None),
+            ("/opt/agents/codex-acp", false, false, &[], None, None),
+            ("${HOME}/bin/codex-acp", false, false, &[], None, None),
+            ("codex-acp", false, false, &[found], None, None),
+            ("codex-acp", false, false, &[empty], None, hint("codex-acp")),
+            // The last configured PATH wins, as the runner applies them in order.
+            (
+                "codex-acp",
+                false,
+                false,
+                &[found, empty],
+                None,
+                hint("codex-acp"),
+            ),
+            ("codex-acp", false, false, &[], Some("agent-bin"), None),
+            (
+                "codex-acp",
+                false,
+                false,
+                &[empty],
+                Some(found),
+                hint("codex-acp"),
+            ),
+            (
+                "codex-acp",
+                false,
+                false,
+                &[],
+                Some(empty),
+                hint("codex-acp"),
+            ),
+        ];
+        for (command, sandboxed, resolved, configured, inherited, expected) in cases {
+            let label = format!(
+                "{command} sandboxed={sandboxed} resolved={resolved} \
+                 configured={configured:?} inherited={inherited:?}"
+            );
+            let mut config =
+                super::super::test_helpers::env_test_spawn_config(cwd.path().to_path_buf());
+            config.spec.command = command.into();
+            let environment: Vec<(String, String)> = configured
+                .iter()
+                .map(|path| ("PATH".to_string(), path.to_string()))
+                .collect();
+            let got = refuse_unresolved_adapter(
+                &config,
+                sandboxed,
+                resolved,
+                &environment,
+                inherited.map(std::ffi::OsStr::new),
+            )
+            .err()
+            .map(|e| match e {
+                AcpError::Spawn(msg) => msg,
+                other => panic!("{label}: unexpected {other:?}"),
+            });
+            match (&got, expected) {
+                (Some(msg), Some(want)) => assert!(msg.contains(want), "{label}: {msg}"),
+                _ => assert_eq!(got.is_some(), expected.is_some(), "{label}: {got:?}"),
+            }
+        }
+        // Each adapter gets its own command, not another adapter's.
+        let mut config =
+            super::super::test_helpers::env_test_spawn_config(cwd.path().to_path_buf());
+        config.spec.command = "codex-acp".into();
+        let msg = format!(
+            "{:?}",
+            refuse_unresolved_adapter(&config, false, false, &[], None)
+        );
+        assert!(!msg.contains(hint("claude-agent-acp").unwrap()), "{msg}");
+    }
+
+    /// #4576: the refusal leaves no Worker record, socket or log behind.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn spawn_refuses_an_unresolved_adapter_before_starting_a_worker() {
+        let _guard = crate::session::test_support::isolate_app_dir();
+        let cwd = tempfile::tempdir().unwrap();
+        let session = format!("aoe-test-missing-adapter-{}", std::process::id());
+        let socket = crate::process::worker_registry::socket_path_for(&session).unwrap();
+        let mut config =
+            super::super::test_helpers::env_test_spawn_config(cwd.path().to_path_buf());
+        config.spec.command = format!("aoe-test-no-such-adapter-{}", std::process::id());
+        config.socket_path = Some(socket.clone());
+
+        let err = super::super::AcpClient::spawn(
+            config,
+            crate::acp::state::AcpSessionId(session.clone()),
+        )
+        .await
+        .err()
+        .expect("spawn must fail");
+        assert!(
+            matches!(&err, AcpError::Spawn(msg) if msg.contains("not found on the daemon's PATH")),
+            "{err:?}"
+        );
+        for path in [
+            socket.clone(),
+            crate::process::worker::control_socket_sibling(&socket),
+            crate::process::worker_registry::log_path_for(&session).unwrap(),
+            crate::process::worker_registry::record_path(&session).unwrap(),
+        ] {
+            assert!(!path.exists(), "left behind: {}", path.display());
         }
     }
 }

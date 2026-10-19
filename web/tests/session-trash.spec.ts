@@ -145,8 +145,10 @@ test.describe("Multi-session workspace trash", () => {
       .locator('[data-testid="stop-session-dialog"]')
       .getByRole("button", { name: /^Stop$/ })
       .click();
+    // Both gamma sessions are stopped, so Start asks which one; the second proves it is not the first.
     await menu(gamma, "start");
-    await expect.poll(() => lifecycle, { timeout: 10_000 }).toEqual(["stop sess-b", "start sess-c"]);
+    await page.locator('[data-testid="sidebar-context-menu-start-target"]').nth(1).click();
+    await expect.poll(() => lifecycle, { timeout: 10_000 }).toEqual(["stop sess-b", "start sess-d"]);
 
     const dialog = await openDeleteDialogFromRow(page, gamma);
     await expect(affected(dialog).list).not.toContainText("sess-a");

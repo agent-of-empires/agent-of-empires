@@ -89,10 +89,21 @@ interface RowOptions {
   rowTagMode?: SessionRowTagMode;
   colorsEnabled?: boolean;
   unread?: boolean;
+  onStop?: (sessionId: string) => void;
+  onStart?: (sessionId: string) => void;
+  onSwitchView?: (sessionId: string, toStructured: boolean) => void;
 }
 
 /** A single unselected SessionRow wired to the real triage hook, as the sidebar wires it. */
-function Row({ ws, readOnly, isActive = false, onCreateSession }: RowOptions & { ws: Workspace }) {
+function Row({
+  ws,
+  readOnly,
+  isActive = false,
+  onCreateSession,
+  onStop,
+  onStart,
+  onSwitchView,
+}: RowOptions & { ws: Workspace }) {
   const triage = useSidebarTriage(useMemo(() => [ws], [ws]));
   return (
     <SessionRow
@@ -101,6 +112,9 @@ function Row({ ws, readOnly, isActive = false, onCreateSession }: RowOptions & {
       isSelected={false}
       onActivate={() => {}}
       onCreateSession={onCreateSession}
+      onStop={onStop}
+      onStart={onStart}
+      onSwitchView={onSwitchView}
       readOnly={readOnly}
       optimistic={triage.optimisticFor(ws.id)}
       onPinToggle={triage.pinToggle}

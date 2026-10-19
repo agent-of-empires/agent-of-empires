@@ -299,24 +299,28 @@ test("shortcut bar toggle persists globally from Terminal UI settings", async ({
   await expect.poll(async () => (await getJson(machineUrl)).session.show_shortcut_bar).toBe(true);
 });
 
-test("clearing a logging target removes its global override", async ({ serve, page }) => {
+test("runtime logging overrides persist and clearing one preserves the other", async ({ serve, page }) => {
   await page.goto(`${serve.baseUrl}/settings/logging`);
-  const target = labelledSelect(page, /^acp\.protocol$/);
-  await expect(target).toBeVisible();
-  await target.selectOption("debug");
+  const uds = labelledSelect(page, /^runtime\.uds$/);
+  const ws = labelledSelect(page, /^runtime\.ws$/);
+  await expect(uds).toBeVisible();
+  await uds.selectOption("warn");
   const globalUrl = `${serve.baseUrl}/api/settings`;
-  await expect(async () => {
-    const saved = await fetch(globalUrl).then((r) => r.json());
-    expect(saved.logging.targets["acp.protocol"]).toBe("debug");
-  }).toPass({ timeout: 5_000 });
-
-  await target.selectOption("");
-  await expect(async () => {
-    const saved = await fetch(globalUrl).then((r) => r.json());
-    expect(saved.logging.targets).toEqual({});
-  }).toPass({ timeout: 5_000 });
+  await expect.poll(async () => (await getJson(globalUrl)).logging.targets["runtime.uds"]).toBe("warn");
+  await ws.selectOption("debug");
+  await expect
+    .poll(async () => (await getJson(globalUrl)).logging.targets)
+    .toEqual({ "runtime.uds": "warn", "runtime.ws": "debug" });
   await page.reload();
-  await expect(target).toHaveValue("");
+  await expect(uds).toHaveValue("warn");
+  await expect(ws).toHaveValue("debug");
+
+  await ws.selectOption("");
+  await expect.poll(async () => (await getJson(globalUrl)).logging.targets).toEqual({ "runtime.uds": "warn" });
+  await serve.restart();
+  await page.reload();
+  await expect(uds).toHaveValue("warn");
+  await expect(ws).toHaveValue("");
 });
 
 test("systemd settings save machine-wide and refuse an invalid slice", async ({ serve, page }) => {

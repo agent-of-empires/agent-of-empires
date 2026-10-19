@@ -77,13 +77,13 @@ function commitText(input: HTMLInputElement, value: string) {
   fireEvent.blur(input);
 }
 
-it("LoggingTargetsWidget sets an override and removes it on (default)", () => {
-  const { save, rerender } = mount(LoggingTargetsWidget, "Targets", {});
-  fireEvent.change(control("acp.protocol", "select"), { target: { value: "debug" } });
-  expect(save).toHaveBeenCalledWith({ "acp.protocol": "debug" });
-  rerender({ "acp.protocol": "debug" });
-  fireEvent.change(control("acp.protocol", "select"), { target: { value: "" } });
-  expect(save).toHaveBeenCalledWith({});
+it("LoggingTargetsWidget removes one runtime override without losing another", () => {
+  const { save, rerender } = mount(LoggingTargetsWidget, "Targets", { "runtime.uds": "warn" });
+  fireEvent.change(control("runtime.ws", "select"), { target: { value: "debug" } });
+  expect(save).toHaveBeenLastCalledWith({ "runtime.uds": "warn", "runtime.ws": "debug" });
+  rerender({ "runtime.uds": "warn", "runtime.ws": "debug" });
+  fireEvent.change(control("runtime.ws", "select"), { target: { value: "" } });
+  expect(save).toHaveBeenLastCalledWith({ "runtime.uds": "warn" });
 });
 
 describe("ThemeNameWidget", () => {
