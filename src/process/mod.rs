@@ -608,6 +608,13 @@ pub(super) struct PrimeProcessSample {
     pub marked: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct KernelProcessState {
+    pub start_id: u64,
+    pub group: u32,
+    pub writing: bool,
+}
+
 fn prime_selection_mask(
     samples: &[PrimeProcessSample],
     known: &[PrimeProcessIdentity],
@@ -714,7 +721,7 @@ pub(crate) fn prime_processes(
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
 pub struct ProcessBirthIdentity {
     pub boot_id: String,
     pub start_id: String,

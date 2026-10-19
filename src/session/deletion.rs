@@ -633,6 +633,7 @@ impl PurgeTransaction {
         let id = self.request.session_id.clone();
         let generation = self.generation;
         let was_trashed = self.was_trashed;
+        let status_before = self.status_before;
         let mut commit = None;
         if let Err(error) = self.storage.update(|instances, _groups| {
             let Some(index) = instances.iter().position(|instance| instance.id == id) else {
@@ -786,6 +787,7 @@ impl PurgeTransaction {
             return result;
         }
 
+        let id = self.request.session_id.clone();
         let kept_resources = kept_resources_from_messages(&self.request, &result.messages);
         if let Err(error) = self.update_journal(|entry| {
             entry
@@ -988,6 +990,7 @@ impl CommittedPurge {
                 .and_then(|instances| instances.into_iter().find(|instance| instance.id == id));
             return result;
         }
+        let id = self.request.session_id.clone();
         let kept_resources = kept_resources_from_messages(&self.request, &result.messages);
         if let Err(error) = self.update_terminal_checkpoint(&kept_resources) {
             result.success = false;
@@ -1003,7 +1006,6 @@ impl CommittedPurge {
                 .and_then(|rows| rows.into_iter().find(|instance| instance.id == id));
             return result;
         }
-        let id = self.request.session_id.clone();
         let generation = self.generation;
         let was_trashed = self.request.instance.is_trashed();
         let row_removed_checkpoint =
@@ -1068,7 +1070,7 @@ impl CommittedPurge {
                     }
                     Some((other, retained)) => {
                         let mut gated = DeletionResult::rejected(
-                            id,
+                            id.clone(),
                             match other {
                                 CompletionGate::KeptRestored => DeletionDisposition::KeptRestored,
                                 CompletionGate::Superseded => DeletionDisposition::Busy,
@@ -1102,24 +1104,6 @@ impl CommittedPurge {
             }
         }
         result
-    }
-
-    fn update_journal(&mut self, phase: LifecyclePhase) -> Result<()> {
-        let (Some(path), Some(_entry)) = (&self.journal_path, &self.journal_entry) else {
-            return Ok(());
-        };
-        let current = crate::session::lifecycle_journal::read_deletion(path)?
-            .ok_or_else(|| anyhow::anyhow!("purge lifecycle journal was replaced"))?;
-        anyhow::ensure!(
-            current.session_id == self.request.session_id
-                && current.source_profile == self.request.instance.source_profile
-                && current.generation == self.generation,
-            "purge lifecycle journal is no longer owned by this generation"
-        );
-        let updated = current.with_phase(phase);
-        crate::session::lifecycle_journal::update(path, &updated)?;
-        self.journal_entry = Some(Box::new(updated));
-        Ok(())
     }
 
     fn update_terminal_checkpoint(&mut self, kept_resources: &[String]) -> Result<()> {
@@ -4229,7 +4213,18 @@ mod tests {
             } else {
                 let transaction = reserve(profile, instance);
                 let observer = crate::session::observe_updates_for_test(move |observed| {
-                    if observed.profile() == profile {
+                    if observed.profile() == profile
+                        && crate::session::lifecycle_journal::scan([observed
+                            .sessions_path()
+                            .to_path_buf()])
+                        .entries
+                        .iter()
+                        .any(|(_, entry)| {
+                            entry
+                                .as_ref()
+                                .is_ok_and(|entry| entry.phase == LifecyclePhase::TeardownComplete)
+                        })
+                    {
                         crate::session::lifecycle_journal::fail_next_update_for_test();
                     }
                 });
@@ -4295,14 +4290,13 @@ mod tests {
                     panic!("purge was rejected: {result:?}")
                 }
             };
-            let committed = if transcript {
-                Some(
-                    transaction
-                        .begin_irreversible()
-                        .unwrap_or_else(|result| panic!("purge did not commit: {result:?}")),
-                )
+            let (transaction, committed) = if transcript {
+                let committed = transaction
+                    .begin_irreversible()
+                    .unwrap_or_else(|result| panic!("purge did not commit: {result:?}"));
+                (None, Some(committed))
             } else {
-                None
+                (Some(transaction), None)
             };
 
             let mut fail_write = storage.clone();
@@ -4327,7 +4321,9 @@ mod tests {
             });
             let result = match committed {
                 Some(committed) => committed.finish_with_transcript_cleanup(|_| Ok(())),
-                None => transaction.complete(),
+                None => transaction
+                    .expect("ordinary purge must retain its reversible transaction")
+                    .complete(),
             };
             drop(observer);
             assert!(
@@ -4459,12 +4455,19 @@ mod tests {
                 instance.project_path = workspace.to_string_lossy().into_owned();
                 instance.scratch = true;
                 instance.source_profile = profile.to_string();
+                let generation = instance
+                    .try_acquire_lifecycle_reservation(
+                        LifecycleOperation::Purge,
+                        Instance::LIFECYCLE_RESERVATION_TTL,
+                        Utc::now(),
+                    )
+                    .unwrap();
                 let older = crate::session::lifecycle_journal::LifecycleJournalEntry::deletion(
                     instance,
                     Status::Idle,
                     storage.sessions_path().to_path_buf(),
                     crate::session::lifecycle_journal::LifecycleDeletionOptions {
-                        generation: 1,
+                        generation,
                         delete_worktree: false,
                         delete_branch: false,
                         delete_sandbox: false,
@@ -4478,6 +4481,13 @@ mod tests {
                 let older_path = crate::session::lifecycle_journal::record(&older).unwrap();
                 let mut newer = older.with_generation(2);
                 newer.keep_scratch = true;
+                newer
+                    .instance
+                    .lifecycle_reservation
+                    .as_mut()
+                    .expect("purge snapshot reservation")
+                    .at =
+                    Utc::now() - Instance::LIFECYCLE_RESERVATION_TTL - chrono::Duration::seconds(1);
                 let current_path = if published_after_scan {
                     None
                 } else {
@@ -4524,7 +4534,7 @@ mod tests {
                         .iter()
                         .any(|(_, entry)| entry
                             .as_ref()
-                            .is_ok_and(|entry| entry.generation == 2
+                            .is_ok_and(|entry| entry.generation >= 2
                                 && entry.phase == LifecyclePhase::Kept)));
                 }
             }
@@ -5075,7 +5085,7 @@ mod tests {
 
     #[test]
     #[serial]
-    fn completed_purge_rollback_is_visible_to_cached_deleting_observers() {
+    fn pre_teardown_rollback_and_irreversible_failures_are_visible_to_cached_observers() {
         for path in ["drop", "complete", "finish"] {
             let _home = isolate_app_dir();
             let storage = Storage::new_unwatched("rollback-observer").unwrap();
@@ -5120,26 +5130,39 @@ mod tests {
                 }
                 _ => unreachable!(),
             }
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
-            let mut reloaded = loop {
-                let row = storage.load().unwrap().remove(0);
-                if row.lifecycle_reservation.is_none() {
-                    break row;
+            let reloaded = storage.load().unwrap().remove(0);
+            if path == "drop" {
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+                let mut reloaded = reloaded;
+                while reloaded.lifecycle_reservation.is_some() {
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "owned rollback did not complete"
+                    );
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                    reloaded = storage.load().unwrap().remove(0);
                 }
-                assert!(
-                    std::time::Instant::now() < deadline,
-                    "owned rollback did not complete"
+                assert_eq!(reloaded.status, Status::Idle);
+                reloaded.merge_runtime_from_reload(&observed);
+                assert_eq!(
+                    reloaded.status,
+                    Status::Idle,
+                    "cached Deleting overwrote the reversible rollback"
                 );
-                std::thread::sleep(std::time::Duration::from_millis(5));
-            };
-            assert_eq!(reloaded.status, Status::Idle);
-            assert!(reloaded.lifecycle_reservation.is_none());
-            reloaded.merge_runtime_from_reload(&observed);
-            assert_eq!(
-                reloaded.status,
-                Status::Idle,
-                "{path}: cached Deleting overwrote completed rollback"
-            );
+            } else {
+                assert_eq!(reloaded.status, Status::Deleting);
+                assert!(reloaded.lifecycle_reservation_is_owned(
+                    LifecycleOperation::Purge,
+                    observed.lifecycle_generation
+                ));
+                let mut merged = reloaded;
+                merged.merge_runtime_from_reload(&observed);
+                assert_eq!(
+                    merged.status,
+                    Status::Deleting,
+                    "{path}: cached state changed after the irreversible boundary"
+                );
+            }
         }
     }
 
@@ -5426,7 +5449,15 @@ mod tests {
         let hook_marker = temp.path().join("hook-done");
         let runner_marker = temp.path().join("runner-done");
         let executable = std::env::current_exe().unwrap();
-        let command = format!("AOE_TEST_CONTROL_RUNNER_SOCKET='{}' AOE_TEST_CONTROL_RUNNER_MARKER='{}' '{}' --exact process::worker_registry::tests::control_socket_runner_helper && printf done > '{}'", control.display(), runner_marker.display(), executable.display(), hook_marker.display());
+        let command = format!(
+            "AOE_TEST_CONTROL_RUNNER_NEW_SESSION=1 AOE_TEST_CONTROL_RUNNER_REPLACE_SOCKET_ON_TERM=1 AOE_TEST_CONTROL_RUNNER_SOCKET='{}' AOE_TEST_CONTROL_RUNNER_MARKER='{}' '{}' --exact process::worker_registry::tests::control_socket_runner_helper >/dev/null 2>&1 & runner=$!; attempt=0; while [ ! -S '{}' ] && [ \"$attempt\" -lt 300 ]; do attempt=$((attempt + 1)); sleep 0.01; done; [ -S '{}' ] || {{ kill \"$runner\"; wait \"$runner\"; exit 1; }}; printf done > '{}'",
+            control.display(),
+            runner_marker.display(),
+            executable.display(),
+            control.display(),
+            control.display(),
+            hook_marker.display()
+        );
         let config: ProfileConfig =
             serde_json::from_value(serde_json::json!({ "hooks": { "on_destroy": [command] } }))
                 .unwrap();
@@ -5551,7 +5582,10 @@ mod tests {
         assert!(branch_exists(&main_repo, "feature/moved-during-purge"));
         assert!(source.load().unwrap().is_empty());
         assert_eq!(destination.load().unwrap().len(), 1);
-        assert!(!journal_path.exists());
+        let retained = crate::session::lifecycle_journal::read_deletion(&journal_path)
+            .unwrap()
+            .expect("irreversible purge intent must remain available for recovery");
+        assert_eq!(retained.phase, LifecyclePhase::TeardownStarted);
     }
 
     #[test]

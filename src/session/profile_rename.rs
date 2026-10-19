@@ -31,9 +31,20 @@ fn checkpoint_path() -> Result<PathBuf> {
     Ok(super::get_app_dir()?.join(CHECKPOINT))
 }
 
+fn sha256_hex(bytes: &[u8]) -> String {
+    let digest = Sha256::digest(bytes);
+    let mut encoded = String::with_capacity(digest.len() * 2);
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    for byte in digest {
+        encoded.push(HEX[(byte >> 4) as usize] as char);
+        encoded.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    encoded
+}
+
 fn sidecar_checkpoint_path(old: &str, new: &str) -> Result<PathBuf> {
-    let identity = Sha256::digest(format!("{old}\0{new}").as_bytes());
-    Ok(super::get_app_dir()?.join(format!("{PENDING_CHECKPOINT_PREFIX}{identity:x}.json")))
+    let identity = sha256_hex(format!("{old}\0{new}").as_bytes());
+    Ok(super::get_app_dir()?.join(format!("{PENDING_CHECKPOINT_PREFIX}{identity}.json")))
 }
 
 fn checkpoint_paths() -> Result<Vec<PathBuf>> {
@@ -178,7 +189,7 @@ fn quarantine_checkpoint(path: &Path, bytes: &[u8]) -> Result<PathBuf> {
         metadata.file_type().is_file(),
         "profile rename checkpoint is not a regular file"
     );
-    let digest = format!("{:x}", Sha256::digest(bytes));
+    let digest = sha256_hex(bytes);
     let name = path
         .file_name()
         .context("profile rename checkpoint has no filename")?;
@@ -280,7 +291,7 @@ pub(crate) fn repair_rename_checkpoint(
             );
             let bytes = fs::read(&quarantine)?;
             anyhow::ensure!(
-                format!("{:x}", Sha256::digest(&bytes)) == expected_sha256,
+                sha256_hex(&bytes) == expected_sha256,
                 "preserved checkpoint does not match the supplied SHA-256"
             );
             let affected_profiles = match read_checkpoint_at(&quarantine)? {
@@ -308,7 +319,7 @@ pub(crate) fn repair_rename_checkpoint(
         CheckpointState::Missing => anyhow::bail!("active checkpoint is missing"),
     };
     anyhow::ensure!(
-        format!("{:x}", Sha256::digest(&bytes)) == expected_sha256,
+        sha256_hex(&bytes) == expected_sha256,
         "active checkpoint does not match the supplied SHA-256"
     );
     validate_checkpoint_repair_scope(affected_profiles, expected_profiles)?;
@@ -742,7 +753,7 @@ pub(crate) fn recover_once() -> Result<()> {
                     error,
                     affected_profiles: Some((old, new)),
                 } => {
-                    let sha256 = format!("{:x}", Sha256::digest(&bytes));
+                    let sha256 = sha256_hex(&bytes);
                     tracing::warn!(
                         target: "session.profile_rename",
                         checkpoint = %path.file_name().unwrap_or(path.as_os_str()).to_string_lossy(),
@@ -773,7 +784,7 @@ pub(crate) fn recover_once() -> Result<()> {
                         )
                         });
                     } else {
-                        let sha256 = format!("{:x}", Sha256::digest(&bytes));
+                        let sha256 = sha256_hex(&bytes);
                         tracing::error!(
                             target: "session.profile_rename",
                             checkpoint = %path.file_name().unwrap_or(path.as_os_str()).to_string_lossy(),
@@ -916,12 +927,12 @@ mod tests {
         fs::write(checkpoint_path().unwrap(), raw).unwrap();
         crate::session::deletion::recover_lifecycle_journals_once().unwrap();
 
-        let digest = format!("{:x}", Sha256::digest(raw));
+        let digest = sha256_hex(raw);
         let quarantine = checkpoint_path()
             .unwrap()
             .with_file_name(format!("{CHECKPOINT}.corrupt-{digest}"));
         assert_eq!(fs::read(checkpoint_path().unwrap()).unwrap(), raw);
-        assert_eq!(fs::read(quarantine).unwrap(), raw);
+        assert_eq!(fs::read(&quarantine).unwrap(), raw);
         assert!(workspace.exists(), "unknown authority allowed a purge");
         assert_eq!(healthy.load().unwrap().len(), 1);
         assert!(ensure_profile_available("healthy").is_err());
@@ -945,7 +956,7 @@ mod tests {
 
         let quarantine = checkpoint_path()
             .unwrap()
-            .with_file_name(format!("{CHECKPOINT}.corrupt-{:x}", Sha256::digest(raw)));
+            .with_file_name(format!("{CHECKPOINT}.corrupt-{}", sha256_hex(raw)));
         assert_eq!(fs::read(checkpoint_path().unwrap()).unwrap(), raw);
         assert_eq!(fs::read(quarantine).unwrap(), raw);
         assert_eq!(fs::read(&sidecar).unwrap(), bytes);
@@ -1052,6 +1063,8 @@ mod tests {
     fn attributable_invalid_checkpoint_blocks_only_conflicting_sidecar() {
         let temp = tempfile::tempdir().unwrap();
         let _home = crate::session::test_support::isolate_app_dir_at(temp.path());
+        Storage::new_unwatched("free-before").unwrap();
+        rename("free-before", "free-after").unwrap();
         Storage::new_unwatched("blocked-before").unwrap();
         Storage::new_unwatched("blocked-after").unwrap();
         let invalid = serde_json::json!({
@@ -1061,14 +1074,24 @@ mod tests {
         });
         let primary = checkpoint_path().unwrap();
         let invalid_bytes = serde_json::to_vec(&invalid).unwrap();
-        fs::write(&primary, &invalid_bytes).unwrap();
 
         let blocked_checkpoint = checkpoint_for("blocked-after", "blocked-final");
         let blocked_path = sidecar_checkpoint_path("blocked-after", "blocked-final").unwrap();
         let blocked_bytes = serde_json::to_vec(&blocked_checkpoint).unwrap();
         fs::write(&blocked_path, &blocked_bytes).unwrap();
 
-        let unrelated_checkpoint = checkpoint_for("free-before", "free-after");
+        let unrelated_checkpoint = RenameCheckpoint {
+            version: 1,
+            old: "free-before".to_owned(),
+            new: "free-after".to_owned(),
+            directory: crate::process::profile_directory_identity(
+                &super::super::get_profile_dir_path("free-after").unwrap(),
+            )
+            .unwrap()
+            .unwrap(),
+            session_ids: Vec::new(),
+            default_was_old: false,
+        };
         let unrelated_path = sidecar_checkpoint_path("free-before", "free-after").unwrap();
         fs::write(
             &unrelated_path,
@@ -1076,6 +1099,7 @@ mod tests {
         )
         .unwrap();
 
+        fs::write(&primary, &invalid_bytes).unwrap();
         recover_once().unwrap();
 
         assert_eq!(fs::read(&primary).unwrap(), invalid_bytes);
@@ -1107,7 +1131,7 @@ mod tests {
             "new": "broken-after"
         }))
         .unwrap();
-        let digest = format!("{:x}", Sha256::digest(&raw));
+        let digest = sha256_hex(&raw);
         let sidecar = checkpoint_path()
             .unwrap()
             .with_file_name(format!("{CHECKPOINT}.corrupt-{digest}"));
@@ -1139,7 +1163,7 @@ mod tests {
         let raw = b"{ malformed checkpoint";
         let active = checkpoint_path().unwrap();
         fs::write(&active, raw).unwrap();
-        let digest = format!("{:x}", Sha256::digest(raw));
+        let digest = sha256_hex(raw);
         let quarantine =
             active.with_file_name(format!("{CHECKPOINT}{CORRUPT_CHECKPOINT_MARKER}{digest}"));
 
@@ -1184,7 +1208,7 @@ mod tests {
         let active = checkpoint_path().unwrap();
         let raw = br#"{"version":1,"old":"before","new":"after","session_ids":"invalid"}"#;
         fs::write(&active, raw).unwrap();
-        let digest = format!("{:x}", Sha256::digest(raw));
+        let digest = sha256_hex(raw);
         let quarantine =
             active.with_file_name(format!("{CHECKPOINT}{CORRUPT_CHECKPOINT_MARKER}{digest}"));
 
@@ -1229,7 +1253,7 @@ mod tests {
         let raw = b"{ malformed checkpoint";
         let path = checkpoint_path().unwrap();
         fs::write(&path, raw).unwrap();
-        let digest = format!("{:x}", Sha256::digest(raw));
+        let digest = sha256_hex(raw);
         let quarantine = path.with_file_name(format!("{CHECKPOINT}.corrupt-{digest}"));
         fs::write(&quarantine, b"different checkpoint bytes").unwrap();
 
@@ -1774,15 +1798,17 @@ mod tests {
                     .all(|row| row.id != "move-witness"));
                 child.0.kill().unwrap();
                 child.0.wait().unwrap();
-                if !rowless {
-                    target
-                        .update(|rows, _| {
-                            rows[0].lifecycle_reservation.as_mut().unwrap().at =
-                                chrono::Utc::now() - chrono::Duration::days(1);
-                            Ok(())
-                        })
-                        .unwrap();
-                }
+                target
+                    .update(|rows, _| {
+                        let row = rows
+                            .iter_mut()
+                            .find(|row| row.id == "renamed")
+                            .expect("recovery must restore the row from its journal");
+                        row.lifecycle_reservation.as_mut().unwrap().at =
+                            chrono::Utc::now() - chrono::Duration::days(1);
+                        Ok(())
+                    })
+                    .unwrap();
                 crate::session::deletion::recover_lifecycle_journals_once().unwrap();
                 assert!(
                     !workspace.exists(),

@@ -230,7 +230,10 @@ mod tests {
         let active = app_dir.join(checkpoint);
         let raw = br#"{"version":1,"old":"before","new":"after","session_ids":"invalid"}"#;
         std::fs::write(&active, raw).unwrap();
-        let digest = format!("{:x}", Sha256::digest(raw));
+        let digest = Sha256::digest(raw)
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
 
         let common = [
             "profile",

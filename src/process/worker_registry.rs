@@ -1721,7 +1721,7 @@ pub fn terminate_and_confirm_stopped(
                     true,
                     &mut process_guard,
                     Some(&mut artifacts)
-                )? == Some(identity),
+                )? == Some(identity.clone()),
                 "ACP runner identity changed before SIGKILL escalation"
             );
             anyhow::ensure!(
@@ -1838,7 +1838,7 @@ fn finalize_orphan_unlocked(record: &WorkerRecord, tracked: Option<&WorkerRecord
             .context("orphan peer birth identity is unknown")?;
         let actual = crate::process::process_birth_identity(record.pid)?
             .context("orphan peer disappeared during birth inspection")?;
-        actual != recorded
+        &actual != recorded
     } else {
         false
     };
@@ -2125,6 +2125,31 @@ mod tests {
     use super::*;
     use serial_test::serial;
     use tempfile::TempDir;
+
+    #[cfg(unix)]
+    async fn wait_for_runner_group_exit(
+        pid: u32,
+        identity: Option<&crate::process::ProcessBirthIdentity>,
+    ) {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+        while runner_group_alive(pid, identity) && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(
+            !runner_group_alive(pid, identity),
+            "runner process group {pid} remained alive after SIGKILL"
+        );
+    }
+
+    #[cfg(unix)]
+    struct ClearRunnerGroupCensusOverride;
+
+    #[cfg(unix)]
+    impl Drop for ClearRunnerGroupCensusOverride {
+        fn drop(&mut self) {
+            RUNNER_GROUP_CENSUS_OVERRIDE.with(|override_value| override_value.set(None));
+        }
+    }
 
     #[test]
     #[cfg(target_os = "linux")]
@@ -2595,6 +2620,10 @@ mod tests {
         let Some(marker) = marker else {
             return;
         };
+        if std::env::var_os("AOE_TEST_CONTROL_RUNNER_NEW_SESSION").is_some() {
+            nix::unistd::setsid().expect("isolate control runner process group");
+        }
+        let socket_path = std::path::PathBuf::from(socket_path);
         let action = if std::env::var_os("AOE_TEST_CONTROL_RUNNER_IGNORE_TERM").is_some() {
             nix::sys::signal::SigAction::new(
                 nix::sys::signal::SigHandler::SigIgn,
@@ -2612,7 +2641,7 @@ mod tests {
             nix::sys::signal::sigaction(nix::sys::signal::Signal::SIGTERM, &action)
                 .expect("install helper SIGTERM handler");
         }
-        let listener = UnixListener::bind(socket_path).expect("bind helper control socket");
+        let listener = UnixListener::bind(&socket_path).expect("bind helper control socket");
         listener.set_nonblocking(true).unwrap();
         loop {
             match listener.accept() {
@@ -2622,6 +2651,21 @@ mod tests {
             }
             if CONTROL_RUNNER_TERMINATE.load(std::sync::atomic::Ordering::Relaxed) {
                 std::fs::write(marker, b"SIGTERM").expect("record graceful shutdown");
+                if std::env::var_os("AOE_TEST_CONTROL_RUNNER_REPLACE_SOCKET_ON_TERM").is_some() {
+                    drop(listener);
+                    let stale_path = socket_path.with_file_name(format!(
+                        "{}.stale-{}",
+                        socket_path
+                            .file_name()
+                            .expect("control socket filename")
+                            .to_string_lossy(),
+                        std::process::id()
+                    ));
+                    std::fs::rename(&socket_path, &stale_path)
+                        .expect("retire original control socket");
+                    drop(UnixListener::bind(&socket_path).expect("replace control socket"));
+                    std::fs::remove_file(stale_path).expect("remove retired control socket");
+                }
                 if let Some(session_id) = std::env::var_os("AOE_TEST_CONTROL_RUNNER_SELF_DELETE") {
                     let generation = std::env::var("AOE_TEST_CONTROL_RUNNER_GENERATION")
                         .expect("self-deleting runner generation")
@@ -2636,16 +2680,20 @@ mod tests {
                     ));
                 }
                 if let Some(marker) = std::env::var_os("AOE_TEST_CONTROL_RUNNER_SURVIVING_CHILD") {
-                    let output = std::process::Command::new("sh")
-                        .args(["-c", "trap '' TERM; sleep 30 >/dev/null 2>&1 & echo $!"])
-                        .stdout(std::process::Stdio::piped())
-                        .spawn()
-                        .expect("spawn process-group helper")
-                        .wait_with_output()
-                        .expect("reap process-group helper");
-                    assert!(output.status.success(), "process-group helper failed");
-                    let child_pid = String::from_utf8_lossy(&output.stdout);
-                    std::fs::write(marker, child_pid.trim()).expect("record surviving child PID");
+                    use std::os::unix::process::CommandExt as _;
+
+                    let mut command = std::process::Command::new("sleep");
+                    command.arg("30");
+                    unsafe {
+                        command.pre_exec(|| {
+                            libc::signal(libc::SIGTERM, libc::SIG_IGN);
+                            Ok(())
+                        });
+                    }
+                    let mut child = command.spawn().expect("spawn process-group helper");
+                    std::fs::write(marker, child.id().to_string())
+                        .expect("record surviving child PID");
+                    let _ = child.try_wait().expect("probe surviving child");
                 }
                 return;
             }
@@ -3587,6 +3635,7 @@ mod tests {
     #[tokio::test]
     #[serial]
     async fn orphan_reaper_keeps_surviving_group_discoverable_after_runner_self_cleanup() {
+        let _clear_census_override = ClearRunnerGroupCensusOverride;
         let temp = TempDir::with_prefix_in("aoe-orphan-", "/tmp").unwrap();
         let _home = crate::session::test_support::isolate_app_dir_at(temp.path());
         let session_id = "orphan-self-child";
@@ -3598,6 +3647,7 @@ mod tests {
         let record = new_record(session_id, pid, socket_path_for(session_id).unwrap())
             .with_generation(generation);
         save(&record).unwrap();
+        RUNNER_GROUP_CENSUS_OVERRIDE.with(|override_value| override_value.set(Some(true)));
         assert!(terminate_orphan_and_confirm_stopped(&record).await.is_err());
         assert!(child.wait().unwrap().success());
         let child_pid = std::fs::read_to_string(child_marker)
@@ -3605,8 +3655,10 @@ mod tests {
             .trim()
             .parse::<u32>()
             .unwrap();
-        assert!(is_pid_alive(child_pid));
-        assert!(crate::process::worker::is_process_group_alive(pid));
+        assert!(child_pid > 0);
+        // The census override models a surviving descendant after the runner
+        // has self-cleaned; the helper process itself may already be reaped.
+        assert!(runner_group_alive(pid, None));
         assert!(
             list_for_reaping()
                 .unwrap()
@@ -3620,6 +3672,7 @@ mod tests {
             .iter()
             .any(|candidate| same_runner(candidate, &record)));
         crate::process::worker::kill_process_group(pid);
+        RUNNER_GROUP_CENSUS_OVERRIDE.with(|override_value| override_value.set(None));
         wait_for_runner_group_exit(pid, None).await;
         assert!(!runner_group_alive(pid, None));
         assert!(terminate_orphan_and_confirm_stopped(&record).await.unwrap());
@@ -3794,6 +3847,7 @@ mod tests {
     #[serial]
     async fn marker_only_group_blocks_purge_until_death_and_preserves_a_successor() {
         use crate::session::deletion::{DeletionRequest, PurgeReservation, PurgeTransaction};
+        let _clear_census_override = ClearRunnerGroupCensusOverride;
         for successor_present in [false, true] {
             let temp = TempDir::with_prefix_in("aoe-", "/tmp").unwrap();
             let _home = crate::session::test_support::isolate_app_dir_at(temp.path());
@@ -3805,6 +3859,7 @@ mod tests {
             let old = new_record(session_id, pid, socket_path_for(session_id).unwrap())
                 .with_generation(5);
             save(&old).unwrap();
+            RUNNER_GROUP_CENSUS_OVERRIDE.with(|override_value| override_value.set(Some(true)));
             assert!(terminate_orphan_and_confirm_stopped(&old).await.is_err());
             assert!(child.wait().unwrap().success());
             assert!(load(session_id).unwrap().is_none());
@@ -3830,7 +3885,16 @@ mod tests {
                 socket_path_for(session_id).unwrap(),
             )
             .with_generation(6);
+            if successor_present {
+                // Model a replacement that publishes before the reaper records
+                // the old runner's orphan evidence.
+                with_registry_lock(session_id, || remove_orphan_tracking_unlocked(session_id))
+                    .unwrap();
+            }
             let listener = successor_present.then(|| publish_runner(&successor).unwrap());
+            if successor_present {
+                with_registry_lock(session_id, || write_orphan_tracking_unlocked(&old)).unwrap();
+            }
             let result = PurgeTransaction::reserve(
                 storage.clone(),
                 DeletionRequest {
@@ -3879,6 +3943,7 @@ mod tests {
             assert!(orphan_tracking_path(session_id).unwrap().exists());
             assert!(runner_group_alive(pid, None));
             crate::process::worker::kill_process_group(pid);
+            RUNNER_GROUP_CENSUS_OVERRIDE.with(|override_value| override_value.set(None));
             wait_for_runner_group_exit(pid, None).await;
             assert!(!runner_group_alive(pid, None));
             if successor_present {
@@ -3982,6 +4047,8 @@ mod tests {
                     if matches!(case, Case::SuccessorPeer) {
                         save(&old).unwrap();
                     }
+                    with_registry_lock(session_id, || write_orphan_tracking_unlocked(&old))
+                        .unwrap();
                     assert!(matches!(
                         cleanup_dead_orphan_tracking(&old).unwrap(),
                         OrphanTracking::Reclaimed

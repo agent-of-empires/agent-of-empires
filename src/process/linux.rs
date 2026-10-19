@@ -14,7 +14,9 @@ fn parse_kernel_process_stat(stat: &[u8]) -> anyhow::Result<super::KernelProcess
         .iter()
         .rposition(|byte| *byte == b')')
         .context("malformed kernel process stat")?;
-    let mut fields = stat[close_paren + 1..].split_ascii_whitespace();
+    let mut fields = stat[close_paren + 1..]
+        .split(u8::is_ascii_whitespace)
+        .filter(|field| !field.is_empty());
     let state = fields.next().context("kernel process state absent")?;
     anyhow::ensure!(
         state.len() == 1 && state[0].is_ascii_alphabetic(),
@@ -947,15 +949,7 @@ mod tests {
         use std::os::unix::fs::PermissionsExt as _;
         if std::env::var_os("AOE_PRIME_CENSUS_CHILD").is_some() {
             assert_eq!(
-                unsafe {
-                    libc::prctl(
-                        libc::PR_SET_NAME,
-                        b"\xffowned\0".as_ptr().cast::<libc::c_char>(),
-                        0,
-                        0,
-                        0,
-                    )
-                },
+                unsafe { libc::prctl(libc::PR_SET_NAME, c"\xffowned".as_ptr(), 0, 0, 0,) },
                 0
             );
             let signal = |message: &[u8]| {

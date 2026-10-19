@@ -160,7 +160,7 @@ fn has_recoverable_pre_teardown_purge(
             if row_reservation.op == journal_reservation.op
                 && row_reservation.generation == journal_reservation.generation =>
         {
-            row_reservation.at = journal_reservation.at.clone();
+            row_reservation.at = journal_reservation.at;
             matches!(
                 (
                     serde_json::to_value(&row_before_purge),
@@ -386,13 +386,7 @@ mod tests {
         let id = "recoverable-after-heartbeat";
         let (mut row, entry) =
             interrupted_purge(id, "profile", &sessions_path, LifecyclePhase::HooksStarted);
-        let journal_at = entry
-            .instance
-            .lifecycle_reservation
-            .as_ref()
-            .unwrap()
-            .at
-            .clone();
+        let journal_at = entry.instance.lifecycle_reservation.as_ref().unwrap().at;
         let now = Utc::now();
         let heartbeat_at = now - Instance::LIFECYCLE_RESERVATION_TTL - chrono::Duration::seconds(1);
         assert!(heartbeat_at > journal_at);
