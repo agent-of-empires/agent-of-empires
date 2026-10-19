@@ -117,6 +117,7 @@ impl SessionResponse {
                 q
             },
             acp_worker_state,
+            acp_worker_start: None,
             pending_approvals: Vec::new(),
             rate_limit: None,
             rate_limit_auto_resume: None,

@@ -11,10 +11,10 @@ use reqwest::{StatusCode, Url};
 use thiserror::Error;
 
 pub use wire::{
-    AcpWorkerState, CleanupDefaults, ContextResumeAvailability, ContextResumeIndeterminateReason,
-    ContextResumeUnavailableReason, ListSessionsQuery, PendingApproval, PlanSummary,
-    PromptAttachmentKind, PromptAttachmentRef, QueuedPromptEntry, SessionResponse,
-    SessionsEnvelope, WorkspaceRepoSummary,
+    AcpWorkerStart, AcpWorkerStartKind, AcpWorkerState, CleanupDefaults, ContextResumeAvailability,
+    ContextResumeIndeterminateReason, ContextResumeUnavailableReason, ListSessionsQuery,
+    PendingApproval, PlanSummary, PromptAttachmentKind, PromptAttachmentRef, QueuedPromptEntry,
+    SessionResponse, SessionsEnvelope, WorkspaceRepoSummary,
 };
 
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(15);

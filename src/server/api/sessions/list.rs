@@ -71,10 +71,10 @@ pub async fn list_sessions(
             } else {
                 None
             };
-            let acp_worker_state = worker_states
+            let (acp_worker_state, acp_worker_start) = worker_states
                 .get(&inst.id)
-                .copied()
-                .unwrap_or(crate::daemon::AcpWorkerState::Absent);
+                .cloned()
+                .unwrap_or((crate::daemon::AcpWorkerState::Absent, None));
             let mut session = SessionResponse::from_instance_with_plan(
                 inst,
                 claude_fullscreen,
@@ -84,6 +84,7 @@ pub async fn list_sessions(
                 next_wakeup_reason,
                 active_monitor,
             );
+            session.acp_worker_start = acp_worker_start;
             if structured_live && acp_worker_state == crate::daemon::AcpWorkerState::Running {
                 // Gate on a live worker: a pending nonce only exists on a
                 // running worker, and spawn/attach sweep orphaned nonces out of
@@ -609,6 +610,7 @@ mod workspace_ordering_tests {
             view: crate::session::View::Terminal,
             pending_approvals: Vec::new(),
             acp_worker_state: crate::daemon::AcpWorkerState::Absent,
+            acp_worker_start: None,
             context_resume: Some(ContextResumeAvailability::Unavailable {
                 reason: ContextResumeUnavailableReason::NoTarget,
             }),

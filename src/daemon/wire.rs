@@ -75,6 +75,21 @@ pub enum AcpWorkerState {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+pub enum AcpWorkerStartKind {
+    FirstStart,
+    Resume,
+}
+
+/// How the current worker start began; present only while the state is `resuming`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AcpWorkerStart {
+    pub kind: AcpWorkerStartKind,
+    /// RFC 3339, fixed for one admitted start.
+    pub started_at: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum ContextResumeUnavailableReason {
     AgentUnsupported,
     SandboxUnsupported,
@@ -205,6 +220,8 @@ pub struct SessionResponse {
     pub context_resume: Option<ContextResumeAvailability>,
     #[serde(default)]
     pub acp_worker_state: AcpWorkerState,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub acp_worker_start: Option<AcpWorkerStart>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub pending_approvals: Vec<PendingApproval>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -294,6 +311,10 @@ mod tests {
         assert_eq!(row.status, "");
         assert_eq!(row.view, crate::session::View::Terminal);
         assert_eq!(row.acp_worker_state, AcpWorkerState::Absent);
+        assert_eq!(row.acp_worker_start, None);
+        assert!(!serde_json::to_string(&row)
+            .unwrap()
+            .contains("acp_worker_start"));
         assert!(!row.cleanup_defaults.delete_to_trash);
         assert!(row.workspace_repos.is_empty());
         assert_eq!(row.context_resume, None);
