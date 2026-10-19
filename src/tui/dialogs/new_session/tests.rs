@@ -1166,6 +1166,53 @@ fn branch_picker_opens_for_reachable_repo_paths() {
 }
 
 #[test]
+#[serial_test::serial]
+fn branch_picker_in_attach_mode_lists_only_branches_with_a_worktree() {
+    let temp_home = tempfile::tempdir().expect("temp home");
+    let _home = crate::session::test_support::isolate_home(temp_home.path());
+    let repo = branch_picker_repo_in(temp_home.path());
+    let git = |args: &[&str]| {
+        let out = std::process::Command::new("git")
+            .args(args)
+            .current_dir(&repo)
+            .output()
+            .expect("git");
+        assert!(out.status.success(), "git {args:?}");
+    };
+    git(&["branch", "no-worktree"]);
+    let linked = temp_home.path().join("linked");
+    git(&[
+        "worktree",
+        "add",
+        "-b",
+        "has-worktree",
+        linked.to_str().unwrap(),
+    ]);
+
+    let picker_items = |create_new_branch: bool, field: usize| {
+        let mut dialog = worktree_config_dialog(repo.to_string_lossy().to_string());
+        dialog.create_new_branch = create_new_branch;
+        dialog.worktree_config_focused_field = field;
+        dialog.handle_key(ctrl_key(KeyCode::Char('p')));
+        assert!(dialog.branch_picker.is_active());
+        dialog
+            .branch_picker
+            .filtered_items()
+            .into_iter()
+            .cloned()
+            .collect::<Vec<_>>()
+    };
+
+    let attach = picker_items(false, 0);
+    assert!(attach.contains(&"has-worktree".to_string()), "{attach:?}");
+    assert!(!attach.contains(&"no-worktree".to_string()), "{attach:?}");
+    for (create, field) in [(true, 0), (false, WT_BASE_BRANCH_FIELD)] {
+        let all = picker_items(create, field);
+        assert!(all.contains(&"no-worktree".to_string()), "{all:?}");
+    }
+}
+
+#[test]
 fn branch_picker_surfaces_failures_and_clears_them() {
     // A path the picker cannot use has to say so, and the error has to be
     // drawn: the overlay used to render its hints unconditionally, leaving a

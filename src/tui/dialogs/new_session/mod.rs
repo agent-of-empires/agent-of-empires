@@ -1844,16 +1844,30 @@ impl NewSessionDialog {
             return;
         }
         let resolved = path_input::expand_tilde(&path_str);
-        match crate::git::diff::list_branches(std::path::Path::new(&resolved)) {
-            Ok(branches) if !branches.is_empty() => {
+        let resolved = std::path::Path::new(&resolved);
+        // Attaching targets a branch that already has a worktree, so Name lists
+        // only those; Base still lists every branch.
+        let attach_name =
+            !self.create_new_branch && self.worktree_config_focused_field != WT_BASE_BRANCH_FIELD;
+        let (what, listed) = if attach_name {
+            let worktrees = crate::git::GitWorktree::list_branch_worktrees_at(resolved)
+                .map(|wts| wts.into_iter().filter_map(|wt| wt.branch).collect())
+                .map_err(|e| e.to_string());
+            ("worktrees", worktrees)
+        } else {
+            let branches = crate::git::diff::list_branches(resolved).map_err(|e| e.to_string());
+            ("branches", branches)
+        };
+        match listed {
+            Ok(items) if !items.is_empty() => {
                 self.error_message = None;
-                self.branch_picker.activate(branches);
+                self.branch_picker.activate(items);
             }
             Ok(_) => {
-                self.error_message = Some(format!("No branches found in {}.", path_str));
+                self.error_message = Some(format!("No {what} found in {path_str}."));
             }
             Err(e) => {
-                self.error_message = Some(format!("Cannot list branches in {}: {}", path_str, e));
+                self.error_message = Some(format!("Cannot list {what} in {path_str}: {e}"));
             }
         }
     }
