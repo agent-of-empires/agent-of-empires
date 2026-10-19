@@ -336,6 +336,9 @@ pub(super) const CITYHALL_MUTATION_DENY: &[(&str, &str)] = &[
     ("PATCH", "/api/profiles/{name}/rename"),
     ("PATCH", "/api/default-profile"),
     // MCP mutations.
+    ("POST", "/api/mcp/servers"),
+    ("PUT", "/api/mcp/servers/{name}"),
+    ("DELETE", "/api/mcp/servers/{name}"),
     ("POST", "/api/mcp/servers/{name}/drop"),
     ("POST", "/api/mcp/servers/{name}/keep"),
     ("POST", "/api/mcp/servers/{name}/resolve"),

@@ -27,6 +27,8 @@ export interface SessionResponse {
   /** Per-session diff base override. */
   base_branch_override?: string | null;
   is_sandboxed: boolean;
+  /** The Working directory is not a Repository, so Diff does not auto-open. */
+  outside_repository?: boolean;
   /** True when the session was created in scratch mode (`aoe add
    *  --scratch` or the wizard toggle). The `project_path` points
    *  at an auto-provisioned directory under `<app_dir>/scratch/<id>/`,
@@ -206,7 +208,10 @@ export interface RichDiffFile {
 export interface RepoBase {
   /** Omitted for single-repo sessions. */
   repo_name?: string;
-  base_branch: string;
+  /** Absent when `outside_repository`. */
+  base_branch?: string;
+  /** The Working directory is not a Repository, so there is nothing to diff. */
+  outside_repository?: boolean;
   /** Worktree path this repo's diff was computed in. */
   repo_path: string;
   base_override?: string;

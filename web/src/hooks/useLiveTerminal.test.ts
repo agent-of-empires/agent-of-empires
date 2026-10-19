@@ -59,15 +59,15 @@ function mount(openSocket = true) {
   return { ...hook, ws };
 }
 
-const frame = (seq: number, content: string) => ({ type: "frame", seq, content, rows: 3, history: 5, cursor: null });
+const meta = { rows: 3, history: 5, cursor: null, altScreen: false, mouse: false, mouseSgr: false, pane0: null };
+const frame = (seq: number, content: string) => ({ type: "frame", seq, content, ...meta });
 const patch = (seq: number, base: number, lines: [number, string][], shift = 0) => ({
   type: "patch",
   seq,
   base,
   shift,
   lines,
-  rows: 3,
-  history: 5,
+  ...meta,
 });
 
 describe("row patches", () => {
@@ -180,6 +180,35 @@ describe("clipboard", () => {
     expect(FakeWS.sockets).toHaveLength(1);
     expect(first).toHaveBeenCalledTimes(1);
     expect(second).toHaveBeenCalledTimes(2);
+  });
+});
+
+describe("reconnect", () => {
+  it("replays the desired grid, window and cadence on the new socket", () => {
+    vi.useFakeTimers();
+    try {
+      const { result, ws } = mount();
+      act(() => {
+        result.current.sendResize(100, 30);
+        result.current.setWindow(500);
+        result.current.setCadence(false);
+      });
+      ws.readyState = FakeWS.CLOSED;
+      act(() => ws.onclose?.(new CloseEvent("close", { code: 1006 })));
+      act(() => vi.advanceTimersByTime(60_000));
+      const next = FakeWS.sockets[1]!;
+      next.open();
+      expect(next.json()).toEqual(
+        expect.arrayContaining([
+          { type: "resize", cols: 100, rows: 30 },
+          { type: "window", lines: 500 },
+          { type: "cadence", fast: false },
+        ]),
+      );
+    } finally {
+      vi.clearAllTimers();
+      vi.useRealTimers();
+    }
   });
 });
 

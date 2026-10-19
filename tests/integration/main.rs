@@ -83,6 +83,7 @@ mod serve_disk_reload_helper_equivalence;
 mod serve_dynamic_profile_rewire;
 #[cfg(debug_assertions)]
 mod serve_filewatch_propagation;
+mod serve_mcp_crud;
 #[cfg(debug_assertions)]
 mod serve_settings_layers;
 #[cfg(debug_assertions)]

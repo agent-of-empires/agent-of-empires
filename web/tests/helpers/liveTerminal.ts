@@ -49,6 +49,34 @@ export async function pushModeFrame(
   await handle.pushLiveFrame({ ...makeLiveFrame({ rows: 24, history: 120, window: 24 }), ...flags });
 }
 
+/** The scroller's side insets inside the pane frame, the frame's inset ring width, and the cell maths. */
+export async function gridGeometry(page: Page) {
+  return page.evaluate(() => {
+    const frame = document.querySelector<HTMLElement>("[data-pane-frame]")!;
+    const grid = document.querySelector<HTMLElement>("[data-live-terminal] > div")!;
+    const f = frame.getBoundingClientRect();
+    const g = grid.getBoundingClientRect();
+    const spreads = [...getComputedStyle(frame).boxShadow.matchAll(/0px 0px 0px ([\d.]+)px inset/g)];
+    return {
+      left: g.left - f.left,
+      right: f.right - g.right,
+      frameWidth: Math.max(0, ...spreads.map((m) => Number(m[1]))),
+      paneWidth: f.width,
+      gridWidth: grid.clientWidth,
+      cell: parseFloat(grid.style.getPropertyValue("--term-cell")),
+    };
+  });
+}
+
+/** The column count of the last resize sent to tmux. */
+export function lastResizeCols(h: MockHandle): number | undefined {
+  return liveTexts(h)
+    .filter((s) => s.startsWith("{"))
+    .map((s) => JSON.parse(s) as { type?: string; cols?: number })
+    .filter((m) => m.type === "resize")
+    .at(-1)?.cols;
+}
+
 /** Wait for the scroller to settle into forwarding (pinned) or reading mode. */
 export async function expectScrollMode(page: Page, mode: "forward" | "read") {
   await expect

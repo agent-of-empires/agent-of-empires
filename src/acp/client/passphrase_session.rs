@@ -438,3 +438,127 @@ mod tests {
         ));
     }
 }
+
+/// Loopback daemon requiring a passphrase session on `GET /api/sessions`:
+/// the cookie of the latest login plus the device binding it registered.
+#[cfg(test)]
+pub(crate) mod test_daemon {
+    use std::sync::{Arc, Mutex};
+
+    use axum::extract::State;
+    use axum::http::{HeaderMap, StatusCode};
+    use axum::response::IntoResponse;
+    use axum::routing::{get, post};
+    use axum::{Json, Router};
+
+    use crate::acp::client::discovery::{DaemonEndpoint, Source};
+
+    pub(crate) const PASSPHRASE: &str = "hunter2";
+
+    #[derive(Default)]
+    struct Inner {
+        logins: usize,
+        valid: Option<(String, String)>,
+        lists: Vec<(Option<String>, Option<String>)>,
+    }
+
+    pub(crate) struct TestDaemon {
+        inner: Arc<Mutex<Inner>>,
+        pub(crate) endpoint: DaemonEndpoint,
+        _dir: tempfile::TempDir,
+        server: tokio::task::JoinHandle<()>,
+    }
+
+    impl TestDaemon {
+        pub(crate) async fn start(passphrase: &str) -> Self {
+            let inner = Arc::new(Mutex::new(Inner::default()));
+            let router = Router::new()
+                .route("/api/login", post(login))
+                .route("/api/sessions", get(list))
+                .with_state(inner.clone());
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("serve.passphrase");
+            std::fs::write(&path, passphrase).unwrap();
+            let endpoint = DaemonEndpoint::new(
+                format!("http://127.0.0.1:{port}"),
+                None,
+                Source::LocalDaemon,
+            )
+            .with_local_passphrase_path(path);
+            Self {
+                inner,
+                endpoint,
+                _dir: dir,
+                server,
+            }
+        }
+
+        pub(crate) fn logins(&self) -> usize {
+            self.inner.lock().unwrap().logins
+        }
+
+        /// Cookie and binding headers of every `/api/sessions` request.
+        pub(crate) fn list_requests(&self) -> Vec<(Option<String>, Option<String>)> {
+            self.inner.lock().unwrap().lists.clone()
+        }
+
+        pub(crate) fn expire_session(&self) {
+            self.inner.lock().unwrap().valid = None;
+        }
+    }
+
+    impl Drop for TestDaemon {
+        fn drop(&mut self) {
+            self.server.abort();
+        }
+    }
+
+    async fn login(
+        State(inner): State<Arc<Mutex<Inner>>>,
+        Json(body): Json<serde_json::Value>,
+    ) -> impl IntoResponse {
+        let mut inner = inner.lock().unwrap();
+        inner.logins += 1;
+        if body["passphrase"] != PASSPHRASE {
+            return (StatusCode::UNAUTHORIZED, HeaderMap::new());
+        }
+        let cookie = format!("aoe_session=s{}", inner.logins);
+        let binding = body["device_binding_secret"].as_str().unwrap().to_string();
+        inner.valid = Some((cookie.clone(), binding));
+        let mut headers = HeaderMap::new();
+        headers.insert("set-cookie", format!("{cookie}; Path=/").parse().unwrap());
+        (StatusCode::NO_CONTENT, headers)
+    }
+
+    async fn list(State(inner): State<Arc<Mutex<Inner>>>, headers: HeaderMap) -> impl IntoResponse {
+        let header = |name: &str| {
+            headers
+                .get(name)
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_string)
+        };
+        let (cookie, binding) = (header("cookie"), header("x-aoe-device-binding"));
+        let mut inner = inner.lock().unwrap();
+        inner.lists.push((cookie.clone(), binding.clone()));
+        let authorized = match (&inner.valid, cookie, binding) {
+            (Some((c, b)), Some(cookie), Some(binding)) => *c == cookie && *b == binding,
+            _ => false,
+        };
+        if !authorized {
+            return (StatusCode::UNAUTHORIZED, Json(serde_json::json!({})));
+        }
+        (
+            StatusCode::OK,
+            Json(serde_json::json!({"sessions": [{
+                "id": "s-1",
+                "title": "one",
+                "project_path": "/tmp/one",
+                "status": "Stopped",
+                "view": "structured",
+            }]})),
+        )
+    }
+}

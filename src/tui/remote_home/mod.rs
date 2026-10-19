@@ -215,14 +215,12 @@ fn apply_session_result(state: &mut RemoteHomeState, result: Result<Vec<RemoteSe
 async fn refresh(state: &mut RemoteHomeState) {
     state.loading = true;
     state.last_error = None;
-    let sessions = match state.endpoint.daemon_client() {
-        Ok(client) => client
-            .list_sessions(None)
-            .await
-            .map(|envelope| sessions_from_snapshot(envelope.sessions))
-            .map_err(|error| error.to_string()),
-        Err(error) => Err(error.to_string()),
-    };
+    let sessions = state
+        .client
+        .list_sessions(None)
+        .await
+        .map(|envelope| sessions_from_snapshot(envelope.sessions))
+        .map_err(|error| error.to_string());
     apply_session_result(state, sessions);
 
     state.plugin_ui = match state.client.plugin_ui_state().await {
@@ -303,5 +301,24 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["first", "second"]
         );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn refresh_lists_sessions_through_a_passphrase_session() {
+        use crate::acp::client::passphrase_session::test_daemon::{TestDaemon, PASSPHRASE};
+        let _env = crate::session::test_support::EnvGuard::unset(&["AOE_DAEMON_PASSPHRASE"]);
+
+        let daemon = TestDaemon::start(PASSPHRASE).await;
+        let mut state = RemoteHomeState::new(daemon.endpoint.clone()).unwrap();
+        refresh(&mut state).await;
+        assert_eq!(state.last_error, None);
+        assert_eq!(state.sessions.len(), 1);
+
+        let wrong = TestDaemon::start("other").await;
+        let mut state = RemoteHomeState::new(wrong.endpoint.clone()).unwrap();
+        refresh(&mut state).await;
+        assert!(state.last_error.is_some());
+        assert!(state.sessions.is_empty());
     }
 }

@@ -556,15 +556,43 @@ impl HttpClient {
             .await
     }
 
-    /// Title, resolved agent, and path roots, from the shared session list.
-    pub async fn session_view_info(
+    /// The shared session list, authenticated like every other request: bearer
+    /// token, else passphrase-login session (one re-login if a cached session
+    /// is rejected), else none.
+    pub async fn list_sessions(
         &self,
-        session_id: &str,
-    ) -> Result<crate::acp::session_paths::SessionViewInfo, HttpError> {
-        let envelope = self
-            .endpoint
-            .daemon_client()?
-            .list_sessions(None)
+        state: Option<crate::session::SessionScope>,
+    ) -> Result<crate::daemon::SessionsEnvelope, HttpError> {
+        let had_cached_session = self.endpoint.resolved_token().is_none()
+            && self.passphrase_session.get(&self.endpoint).is_some();
+        match self.list_sessions_once(state).await {
+            Err(HttpError::Unauthorized) if had_cached_session => {
+                self.passphrase_session.invalidate(&self.endpoint);
+                self.list_sessions_once(state).await
+            }
+            result => result,
+        }
+    }
+
+    async fn list_sessions_once(
+        &self,
+        state: Option<crate::session::SessionScope>,
+    ) -> Result<crate::daemon::SessionsEnvelope, HttpError> {
+        let base_url = &self.endpoint.base_url;
+        let client = if let Some(token) = self.endpoint.resolved_token() {
+            crate::daemon::DaemonClient::new(base_url, Some(&token))
+        } else if self.endpoint.resolved_passphrase().is_some() {
+            let session = self.ensure_passphrase_session().await?;
+            crate::daemon::DaemonClient::with_session(
+                base_url,
+                &session.cookie,
+                &session.binding_secret,
+            )
+        } else {
+            crate::daemon::DaemonClient::new(base_url, None)
+        }?;
+        client
+            .list_sessions(state)
             .await
             .map_err(|error| match error {
                 crate::daemon::DaemonClientError::Status { status, .. }
@@ -573,7 +601,15 @@ impl HttpClient {
                     HttpError::Unauthorized
                 }
                 error => HttpError::Daemon(error),
-            })?;
+            })
+    }
+
+    /// Title, resolved agent, and path roots, from the shared session list.
+    pub async fn session_view_info(
+        &self,
+        session_id: &str,
+    ) -> Result<crate::acp::session_paths::SessionViewInfo, HttpError> {
+        let envelope = self.list_sessions(None).await?;
         envelope
             .sessions
             .into_iter()
@@ -948,5 +984,43 @@ mod tests {
         ));
         // Malformed body.
         assert!(!is_elevation_required(StatusCode::FORBIDDEN, "not json"));
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn session_list_logs_in_renews_once_and_fails_clearly() {
+        use super::passphrase_session::test_daemon::{TestDaemon, PASSPHRASE};
+        let _env = crate::session::test_support::EnvGuard::unset(&["AOE_DAEMON_PASSPHRASE"]);
+
+        let daemon = TestDaemon::start(PASSPHRASE).await;
+        let client = HttpClient::new(daemon.endpoint.clone()).unwrap();
+
+        let info = client.session_view_info("s-1").await.unwrap();
+        assert_eq!(info.title, "one");
+        assert_eq!(daemon.logins(), 1);
+        let requests = daemon.list_requests();
+        assert_eq!(requests.len(), 1);
+        assert!(requests[0]
+            .0
+            .as_deref()
+            .is_some_and(|c| c.starts_with("aoe_session=")));
+        assert!(requests[0].1.is_some());
+
+        // Cached session is reused without another login.
+        client.list_sessions(None).await.unwrap();
+        assert_eq!(daemon.logins(), 1);
+
+        // Expired session: one re-login, one retry.
+        daemon.expire_session();
+        client.list_sessions(None).await.unwrap();
+        assert_eq!(daemon.logins(), 2);
+
+        // Wrong passphrase: a single login attempt and a clear 401.
+        let wrong = TestDaemon::start("other").await;
+        let client = HttpClient::new(wrong.endpoint.clone()).unwrap();
+        let error = client.list_sessions(None).await.unwrap_err();
+        assert!(matches!(error, HttpError::Unauthorized), "{error}");
+        assert_eq!(wrong.logins(), 1);
+        assert!(!error.to_string().contains(PASSPHRASE));
     }
 }

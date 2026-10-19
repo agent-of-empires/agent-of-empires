@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 
+import { useLatestRef } from "../hooks/useLatestRef";
 import { getWebSettingsSnapshot, useWebSettings } from "../hooks/useWebSettings";
 import { safeGetItem, safeSetItem } from "./safeStorage";
 import { BUILTIN_PANES, isTerminalTabId, terminalTabId, type DockLocation } from "./panes";
@@ -399,10 +400,12 @@ export function seedLayout(template: DockLayout, prefs: AutoOpenPanePrefs): Dock
   return l;
 }
 
-export function usePaneLayout(sessionId: string | null): PaneLayoutApi {
+/** `outsideRepository` drops Diff from the seed only, so a Diff tab the user opened stays; `null` (not yet known) seeds no Diff. */
+export function usePaneLayout(sessionId: string | null, outsideRepository: boolean | null = false): PaneLayoutApi {
   const [store, setStore] = useState(loadStore);
   const { settings } = useWebSettings();
   const { autoOpenDiffPane, autoOpenTerminalPane } = settings;
+  const outsideRepositoryRef = useLatestRef(outsideRepository);
   useEffect(() => {
     safeSetItem(LAYOUT_KEY, JSON.stringify(store));
   }, [store]);
@@ -411,9 +414,12 @@ export function usePaneLayout(sessionId: string | null): PaneLayoutApi {
     () =>
       sessionId
         ? (store.sessions[sessionId] ??
-          seedLayout(store.template, { diff: autoOpenDiffPane, terminal: autoOpenTerminalPane }))
+          seedLayout(store.template, {
+            diff: autoOpenDiffPane && outsideRepository === false,
+            terminal: autoOpenTerminalPane,
+          }))
         : emptyDockLayout(),
-    [store, sessionId, autoOpenDiffPane, autoOpenTerminalPane],
+    [store, sessionId, autoOpenDiffPane, autoOpenTerminalPane, outsideRepository],
   );
 
   const mutate = useCallback(
@@ -424,13 +430,16 @@ export function usePaneLayout(sessionId: string | null): PaneLayoutApi {
         const prefs = getWebSettingsSnapshot();
         const current =
           s.sessions[sessionId] ??
-          seedLayout(s.template, { diff: prefs.autoOpenDiffPane, terminal: prefs.autoOpenTerminalPane });
+          seedLayout(s.template, {
+            diff: prefs.autoOpenDiffPane && outsideRepositoryRef.current === false,
+            terminal: prefs.autoOpenTerminalPane,
+          });
         const updated = fn(current);
         if (updated === current && sessionId in s.sessions) return s;
         return { ...s, sessions: { ...s.sessions, [sessionId]: updated } };
       });
     },
-    [sessionId],
+    [sessionId, outsideRepositoryRef],
   );
 
   const openTab = useCallback(

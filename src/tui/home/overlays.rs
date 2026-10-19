@@ -154,26 +154,32 @@ impl HomeView {
         self.flash_status(status);
     }
 
-    /// Report a system opener that exited unsuccessfully, which is how a scheme
+    /// Report system openers that exited unsuccessfully, which is how a scheme
     /// with no registered app fails; true when the flash changed.
     pub fn tick_opener(&mut self) -> bool {
-        let mut failed = None;
+        let failed = self.take_failed_openers();
+        let Some((copied, flash)) = opener_failure_feedback(&failed) else {
+            return false;
+        };
+        crate::tui::clipboard::copy_to_clipboard(&copied);
+        self.flash_status(flash);
+        true
+    }
+
+    /// Drop every finished opener and return the failures in launch order.
+    pub(super) fn take_failed_openers(&mut self) -> Vec<(String, std::process::ExitStatus)> {
+        let mut failed = Vec::new();
         self.opener_exits.retain(|(url, rx)| match rx.try_recv() {
             Ok(status) => {
                 if !status.success() {
-                    failed = Some((url.clone(), status));
+                    failed.push((url.clone(), status));
                 }
                 false
             }
             Err(std::sync::mpsc::TryRecvError::Empty) => true,
             Err(std::sync::mpsc::TryRecvError::Disconnected) => false,
         });
-        let Some((url, status)) = failed else {
-            return false;
-        };
-        crate::tui::clipboard::copy_to_clipboard(&url);
-        self.flash_status(format!("nothing opened it ({status}); copied {url}"));
-        true
+        failed
     }
 
     pub(in crate::tui) fn status_flash_text(&self) -> Option<&str> {
@@ -210,5 +216,29 @@ impl HomeView {
             || self.send_message_dialog.is_some()
             || self.new_dialog.is_some()
             || self.settings_view.is_some()
+    }
+}
+
+/// Clipboard text and flash for failed openers; several are grouped so no URL is lost.
+pub(super) fn opener_failure_feedback(
+    failed: &[(String, std::process::ExitStatus)],
+) -> Option<(String, String)> {
+    match failed {
+        [] => None,
+        [(url, status)] => Some((
+            url.clone(),
+            format!("nothing opened it ({status}); copied {url}"),
+        )),
+        _ => {
+            let urls: Vec<&str> = failed.iter().map(|(url, _)| url.as_str()).collect();
+            Some((
+                urls.join("\n"),
+                format!(
+                    "nothing opened {} links; copied {}",
+                    urls.len(),
+                    urls.join(" ")
+                ),
+            ))
+        }
     }
 }

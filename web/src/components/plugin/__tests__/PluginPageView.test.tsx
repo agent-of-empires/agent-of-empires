@@ -130,7 +130,7 @@ describe("PluginPageView", () => {
     expect(screen.queryByTestId("plugin-page-frame")).toBeNull();
     resolve(true);
     const frame = await screen.findByTestId("plugin-page-frame");
-    expect(frame.getAttribute("sandbox")).toBe("allow-scripts");
+    expect(frame.getAttribute("sandbox")).toBe("allow-scripts allow-downloads");
     expect(frame.getAttribute("src")).toMatch(new RegExp(`^${board.url}#[0-9a-f]{32}$`));
   });
 

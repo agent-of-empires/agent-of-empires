@@ -688,8 +688,9 @@ export function MobileLiveTerminal({
         onTouchMove={onTouchMove}
         onTouchEnd={onTouchEnd}
         onTouchCancel={onTouchCancel}
-        // A bottom inset, not padding: padding would inflate clientHeight and over-count rows sent to tmux.
-        className={`absolute inset-x-0 top-0 bottom-[8px] font-mono flex flex-col ${
+        // Insets, not padding: padding would inflate clientWidth/clientHeight and over-count the grid sent to tmux.
+        // The desktop side inset keeps column 0 clear of the parent's 1px pane frame; touch draws no frame.
+        className={`absolute ${coarse ? "inset-x-[2px]" : "inset-x-[6px]"} top-0 bottom-[8px] font-mono flex flex-col ${
           forwardMode ? "overflow-hidden" : "overflow-y-auto overflow-x-clip"
         }`}
         style={
