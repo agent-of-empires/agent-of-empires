@@ -15,7 +15,7 @@ use crate::acp::acp_client::between_prompt::BetweenPromptTracker;
 use crate::acp::acp_client::lifecycle::{
     forward_lifecycle_signals, LifecycleEnvelope, TerminalClaim,
 };
-use crate::acp::acp_client::rate_limit::rate_limit_rejection_from_meta;
+use crate::acp::acp_client::rate_limit::record_rate_limit_report;
 use crate::acp::acp_client::session_identity::SessionIngress;
 use crate::acp::acp_client::session_sandbox::SessionSandbox;
 use crate::acp::acp_client::tool_context::{
@@ -60,9 +60,9 @@ pub(super) struct Shared {
     pub(super) prompt_epoch: AtomicU64,
     lifecycle_tx: mpsc::Sender<LifecycleEnvelope>,
     pub(super) between_prompt: BetweenPromptTracker,
-    /// Reset epochs (unix seconds) per rejected quota window. Not cleared per
-    /// prompt: the adapter only reports a reset on turns with usage, and
-    /// stale entries are filtered at read time (#3028, #3152).
+    /// Reset epochs (unix seconds) per rejected quota window. Cleared at each
+    /// prompt and drained when a turn parks; a window that later reports a
+    /// non-rejected status is removed (#3028, #3152).
     pub(super) rate_limit_rejections: std::sync::Mutex<HashMap<String, i64>>,
     /// A stored-session rejection already emitted its context reset.
     pub(super) context_reset_emitted: AtomicBool,
@@ -300,19 +300,13 @@ impl Shared {
         let Some(raw) = u.meta.as_ref().and_then(|m| m.get("_claude/rateLimit")) else {
             return;
         };
-        let rejection = rate_limit_rejection_from_meta(&u.meta);
+        let retained = record_rate_limit_report(&self.rate_limit_rejections, &u.meta);
         debug!(
             target: "acp.protocol",
             session = %self.session_label,
             observed = %raw,
-            retained = rejection.is_some(),
+            retained,
             "observed adapter rate-limit meta"
         );
-        if let Some(r) = rejection {
-            self.rate_limit_rejections
-                .lock()
-                .expect("rate-limit capture mutex poisoned")
-                .insert(r.window, r.resets_at_secs);
-        }
     }
 }

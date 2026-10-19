@@ -24,7 +24,7 @@ use crate::acp::acp_client::lifecycle::{LifecycleSignal, OffProtocolWorkKind};
 use crate::acp::acp_client::opencode::recover_opencode_prompt_error;
 use crate::acp::acp_client::rate_limit::{
     captured_rate_limit_resets_at, classify_rate_limit_error, clear_captured_rejections,
-    is_unsupported_session_error,
+    is_unsupported_session_error, take_rate_limit_from_captured_rejection,
 };
 use crate::acp::acp_client::reset::ResetSessionOutcome;
 use crate::acp::acp_client::steer::{first_text_block, SteerOutcome, SteerRequest};
@@ -304,6 +304,9 @@ impl Session {
         let e = match res {
             Ok(resp) => {
                 turn.flags.prompt_cancelled = matches!(resp.stop_reason, StopReason::Cancelled);
+                if !turn.flags.prompt_cancelled {
+                    self.park_on_captured_rejection(turn).await;
+                }
                 return Ok(Flow::Break);
             }
             Err(e) => e,
@@ -344,6 +347,27 @@ impl Session {
                 .store(true, Ordering::Relaxed);
         }
         Err(e)
+    }
+
+    /// The adapter can end a limited turn normally, so a still-future rejected
+    /// window captured during it is the only evidence; park like the error path.
+    async fn park_on_captured_rejection(&self, turn: &mut Turn) {
+        let shared = &self.shared;
+        let Some(info) = take_rate_limit_from_captured_rejection(
+            &shared.rate_limit_rejections,
+            chrono::Utc::now(),
+        ) else {
+            return;
+        };
+        info!(
+            target: "acp.protocol",
+            session = %shared.session_label,
+            resets_at = ?info.resets_at,
+            "prompted turn ended on a rejected rate-limit window; parking session"
+        );
+        shared.emit(Event::RateLimit { info }).await;
+        turn.flags.rate_limited = true;
+        turn.flags.shutdown = true;
     }
 
     async fn reject_busy(&self, text: String) {

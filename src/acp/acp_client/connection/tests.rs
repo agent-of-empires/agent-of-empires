@@ -412,3 +412,148 @@ async fn rate_limit_on_an_agent_initiated_turn_ends_the_connection() {
     agent.abort();
     let _ = agent.await;
 }
+
+/// A prompted turn the adapter ends normally after a rejected window parks like
+/// the error path; a cancelled turn or an already-past reset does not.
+#[tokio::test]
+async fn prompted_turn_ending_on_a_rejected_window_parks() {
+    let now = chrono::Utc::now().timestamp();
+    for (stop_reason, resets_at, parks) in [
+        ("end_turn", now + 3600, true),
+        ("cancelled", now + 3600, false),
+        ("end_turn", now - 60, false),
+    ] {
+        let (daemon_write, agent_read) = tokio::io::duplex(64 * 1024);
+        let (agent_write, daemon_read) = tokio::io::duplex(64 * 1024);
+        let agent_write: SharedWrite = Arc::new(Mutex::new(agent_write));
+        let (event_tx, mut event_rx) = mpsc::channel(64);
+        let (cmd_tx, cmd_rx) = mpsc::channel::<ClientCmd>(1);
+        let (ready_tx, ready_rx) = oneshot::channel::<Result<(), AcpError>>();
+        let temp = tempfile::tempdir().unwrap();
+        let cwd = temp.path().to_path_buf();
+        let params = ConnectionParams {
+            event_tx,
+            cmd_rx,
+            child: None,
+            pending_responders: Arc::new(Mutex::new(HashMap::new())),
+            resources: SessionResources {
+                fs_policy: Arc::new(FsPolicy::new(vec![cwd.clone()])),
+                terminals: TerminalManager::new(),
+                cwd,
+                label: "s-prompted".to_string(),
+                sandbox: None,
+            },
+            mode: ConnectMode::Fresh {
+                stored_acp_session_id: None,
+                seed_history_replay: false,
+                fork_from: None,
+            },
+            ready_tx,
+            profile: &crate::acp::agent_profiles::GEMINI,
+            expected_agent: ExpectedAgent::Gemini,
+            source_profile: None,
+            default_effort: None,
+            default_mode: None,
+            default_model: None,
+            mcp_servers: Vec::new(),
+            runner: None,
+        };
+        let transport = ByteStreams::new(daemon_write.compat_write(), daemon_read.compat());
+        let connection = tokio::spawn(run_connection_task(transport, params));
+        let reply_write = agent_write.clone();
+        let agent = tokio::spawn(async move {
+            let mut lines = BufReader::new(agent_read).lines();
+            while let Ok(Some(line)) = lines.next_line().await {
+                let msg: serde_json::Value = serde_json::from_str(&line).unwrap();
+                let id = &msg["id"];
+                match msg["method"].as_str() {
+                    Some("initialize") => {
+                        write_line(
+                            &reply_write,
+                            &format!(
+                                r#"{{"jsonrpc":"2.0","id":{id},"result":{{"protocolVersion":1,"agentCapabilities":{{}}}}}}"#
+                            ),
+                        )
+                        .await;
+                    }
+                    Some("session/new") => {
+                        write_line(
+                            &reply_write,
+                            &format!(
+                                r#"{{"jsonrpc":"2.0","id":{id},"result":{{"sessionId":"s-prompted"}}}}"#
+                            ),
+                        )
+                        .await;
+                    }
+                    Some("session/prompt") => {
+                        write_line(
+                            &reply_write,
+                            &format!(
+                                r#"{{"jsonrpc":"2.0","method":"session/update","params":{{"sessionId":"s-prompted","update":{{"sessionUpdate":"usage_update","used":10,"size":100,"_meta":{{"_claude/rateLimit":{{"status":"rejected","rateLimitType":"five_hour","resetsAt":{resets_at}}}}}}}}}}}"#
+                            ),
+                        )
+                        .await;
+                        write_line(
+                            &reply_write,
+                            &format!(
+                                r#"{{"jsonrpc":"2.0","id":{id},"result":{{"stopReason":"{stop_reason}"}}}}"#
+                            ),
+                        )
+                        .await;
+                    }
+                    _ => {}
+                }
+            }
+        });
+
+        ready_rx
+            .await
+            .expect("handshake completes")
+            .expect("handshake ok");
+        cmd_tx
+            .send(ClientCmd::Prompt(vec![ContentBlock::Text(
+                TextContent::new("hi"),
+            )]))
+            .await
+            .unwrap();
+
+        let mut seen = Vec::new();
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while let Some(event) = event_rx.recv().await {
+                let stopped = matches!(event, Event::Stopped { .. });
+                seen.push(event);
+                if stopped {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("the turn must reach a terminal event");
+        let limit = seen.iter().position(|e| {
+            matches!(e, Event::RateLimit { info } if info.resets_at.map(|t| t.timestamp()) == Some(resets_at))
+        });
+        let stopped_reason = match seen.last() {
+            Some(Event::Stopped { reason }) => reason.as_str(),
+            other => panic!("expected a terminal Stopped: {other:?}"),
+        };
+        if parks {
+            assert!(
+                limit.is_some(),
+                "{stop_reason}: RateLimit expected: {seen:?}"
+            );
+            assert_eq!(stopped_reason, "rate_limited", "{seen:?}");
+            // The connection must end so the reaper can resume it.
+            tokio::time::timeout(Duration::from_secs(10), connection)
+                .await
+                .expect("connection task ends after parking")
+                .expect("connection task does not panic");
+        } else {
+            assert!(limit.is_none(), "{stop_reason}: must not park: {seen:?}");
+            assert_ne!(stopped_reason, "rate_limited", "{seen:?}");
+            connection.abort();
+            let _ = connection.await;
+        }
+        agent.abort();
+        let _ = agent.await;
+    }
+}
