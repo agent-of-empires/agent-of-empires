@@ -4921,6 +4921,7 @@ async fn a_failed_suggestion_start_can_retry_after_its_hook_recovers() {
 }
 
 #[tokio::test]
+#[serial_test::serial]
 async fn scratch_create_resolves_profile_before_publication_and_purge() {
     use axum::response::IntoResponse;
 
