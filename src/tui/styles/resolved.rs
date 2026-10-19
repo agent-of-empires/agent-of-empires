@@ -612,7 +612,8 @@ mod tests {
                     );
                 }
             }
-            // Dialog hints such as the onboarding footer sit on the modal surface.
+            // Dialog hints, such as the onboarding footer and the tour's Skip button, sit on the
+            // modal surface.
             let subtle_on_modal =
                 contrast_ratio(var("--color-text-subtle"), var("--color-surface-800"));
             assert!(

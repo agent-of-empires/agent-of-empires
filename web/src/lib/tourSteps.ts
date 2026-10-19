@@ -92,7 +92,7 @@ export const TOUR_STEPS: readonly TourStep[] = [
     anchor: TOUR_ANCHORS.sidebarSettings,
     scopes: ["dashboard", "session", "structured-view"],
     title: "Settings",
-    body: "Theme, notifications, worktrees, agent defaults, plugins and more. Each profile keeps its own sessions, projects and setting overrides.",
+    body: "Theme, notifications, worktrees, agent defaults, plugins and more. Each profile keeps its own sessions and setting overrides; projects can be global or per profile.",
     shortcutHints: [{ id: "settings", verb: "opens settings" }],
   },
   {

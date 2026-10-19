@@ -40,5 +40,6 @@ export const TOUR_RUNNER_STYLES: Partial<Styles> = {
     color: "var(--color-text-on-brand)",
   },
   buttonBack: { ...TOUR_BUTTON, color: "var(--color-text-secondary)" },
-  buttonSkip: { ...TOUR_BUTTON, color: "var(--color-text-secondary)" },
+  // text-subtle is lifted to AA on the tooltip's surface-800 for every builtin theme (resolved.rs).
+  buttonSkip: { ...TOUR_BUTTON, color: "var(--color-text-subtle)" },
 };
