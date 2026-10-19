@@ -24,6 +24,12 @@ The host keeps the five newest logs per plugin and removes older ones when a wor
 
 `aoe.web` is the only bundled plugin today: the web dashboard's management marker, present whenever the dashboard is compiled in, so every released binary ships it enabled. Disabling it hides `aoe serve` as an unrecognized subcommand (`--stop`, `--status`, and `--restart` still reach a running daemon); re-enable with `aoe plugin enable aoe.web`. A build without the dashboard has an empty registry, so `aoe plugin list` reporting nothing there is expected.
 
+## Featured plugins
+
+Featured plugins are first-party plugins whose release hashes are pinned in `plugins/featured.toml`, so `aoe plugin list` shows them as `featured`.
+
+- **Board** (`agent-of-empires.kanban`): a kanban board of your sessions in the web dashboard. Install with `aoe plugin install gh:agent-of-empires/plugin-kanban`; it needs Node 22 or newer on the daemon's `PATH`.
+
 ## Installing external plugins
 
 External plugins are community code you install at your own risk.
