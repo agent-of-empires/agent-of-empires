@@ -1840,6 +1840,12 @@ impl AcpConfig {
     }
 
     pub fn acp_defaults_for(&self, agent: &str) -> Option<&AcpAgentDefaults> {
+        // `claude-code` is the legacy alias stored by older session records.
+        let agent = if agent == "claude-code" {
+            "claude"
+        } else {
+            agent
+        };
         self.acp_defaults
             .get(agent)
             .filter(|defaults| !defaults.is_empty())
@@ -4486,6 +4492,18 @@ mod tests {
             Some("claude-x")
         );
         assert_eq!(config.pinned_model_for("gemini"), None);
+        assert_eq!(
+            config.pinned_model_for("claude-code").as_deref(),
+            Some("claude-x")
+        );
+        assert_eq!(
+            config
+                .acp_defaults_for("claude-code")
+                .unwrap()
+                .model
+                .as_deref(),
+            Some("claude-x")
+        );
     }
 
     /// Spawn resolution precedence: a pin replaces the request, an explicit
