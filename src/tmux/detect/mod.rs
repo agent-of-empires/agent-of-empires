@@ -2,33 +2,71 @@
 //! (`manifests/<agent>.toml`) name a state, a screen [`region`], a priority and
 //! a matcher; the highest matching priority wins. The hook file is a rule too.
 
+mod adapter;
 mod manifest;
 mod omp;
 mod region;
 
 use std::collections::HashMap;
-use std::sync::OnceLock;
+use std::sync::LazyLock;
 
 use crate::session::Status;
+use adapter::Adapter;
+pub use adapter::{CapturePolicy, CaptureScope};
 pub use manifest::HookObservation;
 use manifest::Manifest;
-pub use omp::OmpCueState;
-use region::Screen;
+use region::Rows;
 
-const MANIFEST_SOURCES: &[(&str, &str)] = &[
-    ("claude", include_str!("manifests/claude.toml")),
-    ("cursor", include_str!("manifests/cursor.toml")),
-    ("opencode", include_str!("manifests/opencode.toml")),
-    ("vibe", include_str!("manifests/vibe.toml")),
-    ("droid", include_str!("manifests/droid.toml")),
-    ("gemini", include_str!("manifests/gemini.toml")),
-    ("qwen", include_str!("manifests/qwen.toml")),
-    ("copilot", include_str!("manifests/copilot.toml")),
-    ("antigravity", include_str!("manifests/antigravity.toml")),
-    ("hermes", include_str!("manifests/hermes.toml")),
-    ("pi", include_str!("manifests/pi.toml")),
-    ("codex", include_str!("manifests/codex.toml")),
-    ("omp", include_str!("manifests/omp.toml")),
+const MANIFEST_SOURCES: &[(&str, &str, &Adapter)] = &[
+    (
+        "claude",
+        include_str!("manifests/claude.toml"),
+        &adapter::PLAIN,
+    ),
+    (
+        "cursor",
+        include_str!("manifests/cursor.toml"),
+        &adapter::PLAIN,
+    ),
+    (
+        "opencode",
+        include_str!("manifests/opencode.toml"),
+        &adapter::PLAIN,
+    ),
+    ("vibe", include_str!("manifests/vibe.toml"), &adapter::PLAIN),
+    (
+        "droid",
+        include_str!("manifests/droid.toml"),
+        &adapter::PLAIN,
+    ),
+    (
+        "gemini",
+        include_str!("manifests/gemini.toml"),
+        &adapter::PLAIN,
+    ),
+    ("qwen", include_str!("manifests/qwen.toml"), &adapter::PLAIN),
+    (
+        "copilot",
+        include_str!("manifests/copilot.toml"),
+        &adapter::PLAIN,
+    ),
+    (
+        "antigravity",
+        include_str!("manifests/antigravity.toml"),
+        &adapter::PLAIN,
+    ),
+    (
+        "hermes",
+        include_str!("manifests/hermes.toml"),
+        &adapter::PLAIN,
+    ),
+    ("pi", include_str!("manifests/pi.toml"), &adapter::PLAIN),
+    (
+        "codex",
+        include_str!("manifests/codex.toml"),
+        &adapter::PLAIN,
+    ),
+    ("omp", include_str!("manifests/omp.toml"), &omp::ADAPTER),
 ];
 
 /// What one capture says about a session.
@@ -51,74 +89,96 @@ impl Detection {
     }
 }
 
-/// Shared capture context. Losing ownership suppresses new live OMP cues, not configured rules.
+/// Raw facts accompanying a pane capture. Configured rules do not depend on them.
 pub struct Observation<'a> {
     title: &'a str,
     hook: Option<HookObservation>,
-    allow_live_cues: bool,
-    omp_cues: OnceLock<OmpCueState>,
+    live_owned: bool,
 }
 
 impl<'a> Observation<'a> {
-    pub fn new(title: &'a str, hook: Option<HookObservation>, allow_live_cues: bool) -> Self {
+    pub fn new(title: &'a str, hook: Option<HookObservation>, live_owned: bool) -> Self {
         Self {
             title,
             hook,
-            allow_live_cues,
-            omp_cues: OnceLock::new(),
+            live_owned,
         }
-    }
-
-    pub fn omp_cues(&self) -> OmpCueState {
-        *self.omp_cues.get_or_init(|| {
-            if !self.allow_live_cues {
-                OmpCueState::Unowned
-            } else if omp::title_is_working(self.title) {
-                OmpCueState::Working
-            } else {
-                OmpCueState::Unmarked
-            }
-        })
     }
 }
 
-fn manifests() -> &'static HashMap<&'static str, Manifest> {
-    static MANIFESTS: OnceLock<HashMap<&'static str, Manifest>> = OnceLock::new();
-    MANIFESTS.get_or_init(|| {
-        let mut map = HashMap::new();
-        for (agent, source) in MANIFEST_SOURCES {
-            match Manifest::parse(source) {
-                Ok(m) => {
-                    debug_assert_eq!(&m.id, agent, "manifest id must match its file name");
-                    map.insert(*agent, m);
-                }
-                // Unreachable in a tested build (`manifests_compile`).
-                Err(e) => tracing::error!(target: "tmux.status",
-                    "detection manifest for {agent} failed to compile, \
-                     falling back to hookless idle: {e}"),
-            }
+/// Adapter-defined semantic identity of non-screen evidence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ObservationKey {
+    detector: &'static str,
+    token: u64,
+}
+
+pub(super) struct Detector {
+    manifest: Manifest,
+    adapter: &'static Adapter,
+}
+
+impl Detector {
+    pub(super) fn capture_policy(&self) -> CapturePolicy {
+        self.adapter.capture
+    }
+
+    pub(super) fn observation_key(
+        &'static self,
+        observation: &Observation<'_>,
+    ) -> Option<ObservationKey> {
+        (self.adapter.observation_token)(observation).map(|token| ObservationKey {
+            detector: &self.manifest.id,
+            token,
+        })
+    }
+
+    pub(super) fn detect(&'static self, screen: &str, observation: &Observation<'_>) -> Detection {
+        let Some(rule) = (self.adapter.evaluate)(&self.manifest, Rows::new(screen), observation)
+        else {
+            return Detection::idle_by_default();
+        };
+        tracing::trace!(target: "tmux.status", "{} detection: rule {} matched", self.manifest.id, rule.id);
+        Detection {
+            status: (!rule.skip_state_update).then_some(rule.state).flatten(),
+            visible: rule.visible,
+            rule: rule.id.as_str(),
         }
-        map
-    })
+    }
+}
+
+static MANIFESTS: LazyLock<HashMap<&'static str, Detector>> = LazyLock::new(|| {
+    let mut map = HashMap::new();
+    for (agent, source, adapter) in MANIFEST_SOURCES {
+        match Manifest::parse(source, adapter.evidence_names) {
+            Ok(manifest) => {
+                debug_assert_eq!(&manifest.id, agent, "manifest id must match its file name");
+                map.insert(*agent, Detector { manifest, adapter });
+            }
+            // Unreachable in a tested build (`manifests_compile`).
+            Err(e) => tracing::error!(target: "tmux.status",
+                "detection manifest for {agent} failed to compile, \
+                 falling back to hookless idle: {e}"),
+        }
+    }
+    map
+});
+
+pub(super) fn detector(agent: &str) -> Option<&'static Detector> {
+    MANIFESTS.get(agent)
+}
+
+pub(super) fn plain_capture_policy() -> CapturePolicy {
+    adapter::PLAIN.capture
 }
 
 pub fn has_manifest(agent: &str) -> bool {
-    manifests().contains_key(agent)
+    detector(agent).is_some()
 }
 
 /// Evaluate an agent manifest over an ANSI-stripped capture.
 pub fn detect(agent: &str, screen: &str, observation: &Observation<'_>) -> Option<Detection> {
-    let manifest = manifests().get(agent)?;
-    let parsed = Screen::new(screen, observation, agent);
-    let Some(rule) = manifest.evaluate(&parsed, observation.hook) else {
-        return Some(Detection::idle_by_default());
-    };
-    tracing::trace!(target: "tmux.status", "{agent} detection: rule {} matched", rule.id);
-    Some(Detection {
-        status: (!rule.skip_state_update).then_some(rule.state).flatten(),
-        visible: rule.visible,
-        rule: rule.id.as_str(),
-    })
+    Some(detector(agent)?.detect(screen, observation))
 }
 
 /// Whether one named rule matches, so fixtures prove they carry their signal.
@@ -130,17 +190,16 @@ pub(crate) fn rule_matches(
     osc_title: &str,
     hook: Option<HookObservation>,
 ) -> bool {
-    let manifest = manifests().get(agent).expect("agent has a manifest");
+    let detector = detector(agent).expect("agent has a manifest");
     let observation = Observation::new(osc_title, hook, true);
-    let parsed = Screen::new(screen, &observation, agent);
-    manifest.rule_matches(rule_id, &parsed, hook)
+    (detector.adapter.rule_matches)(&detector.manifest, rule_id, Rows::new(screen), &observation)
 }
 
 #[cfg(test)]
 pub(crate) fn rule_max_age(agent: &str, rule_id: &str) -> Option<std::time::Duration> {
-    manifests()
-        .get(agent)
+    detector(agent)
         .expect("agent has a manifest")
+        .manifest
         .rule(rule_id)
         .expect("rule exists")
         .max_age
@@ -152,11 +211,11 @@ mod tests {
 
     #[test]
     fn manifests_compile() {
-        for (agent, source) in MANIFEST_SOURCES {
-            Manifest::parse(source)
+        for (agent, source, adapter) in MANIFEST_SOURCES {
+            Manifest::parse(source, adapter.evidence_names)
                 .unwrap_or_else(|e| panic!("manifest {agent} failed to compile: {e}"));
         }
-        assert_eq!(manifests().len(), MANIFEST_SOURCES.len());
+        assert_eq!(MANIFESTS.len(), MANIFEST_SOURCES.len());
     }
 
     #[test]

@@ -142,7 +142,7 @@ pub struct DetectionState {
     pub rule: Option<&'static str>,
     /// Status proposed off non-chrome evidence, published once a second poll agrees.
     pub pending: Option<Status>,
-    pub omp_cues: Option<tmux::OmpCueState>,
+    pub observation_key: Option<tmux::ObservationKey>,
 }
 
 /// A turn queued for delivery once the (resumed) worker is live. See

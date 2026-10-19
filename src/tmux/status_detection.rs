@@ -2,7 +2,9 @@
 
 use crate::session::Status;
 
-use super::detect::{Detection, HookObservation, Observation};
+use super::detect::{
+    CapturePolicy, Detection, Detector, HookObservation, Observation, ObservationKey,
+};
 use super::utils::strip_ansi;
 
 /// Configured rules for `(profile, tool)` outrank the built-in detector.
@@ -17,25 +19,50 @@ pub fn detect_status_from_content_in(profile: &str, content: &str, tool: &str) -
         .unwrap_or(Status::Idle)
 }
 
-/// Shared by the status poller and `aoe session capture` so they agree.
-/// `rules_tool` keys configured rules; `agent` is the manifest identity, which
-/// follows `agent_detect_as`. `clean` must be ANSI-stripped. `None` means no
-/// manifest and no configured rule matched.
-pub fn detect_with_rules(
-    profile: &str,
-    rules_tool: &str,
-    agent: &str,
-    clean: &str,
-    observation: &Observation<'_>,
-) -> Option<Detection> {
-    if let Some(status) = super::status_rules::detect(profile, rules_tool, clean) {
-        return Some(Detection {
-            status: Some(status),
-            visible: true,
-            rule: "configured_status_rule",
-        });
+/// One policy and detector selection shared by polling and CLI captures.
+pub struct DetectionPlan<'a> {
+    profile: &'a str,
+    rules_tool: &'a str,
+    detector: Option<&'static Detector>,
+}
+
+impl<'a> DetectionPlan<'a> {
+    /// `rules_tool` keys configured rules; `agent` follows the hook identity.
+    pub fn for_manifest(profile: &'a str, rules_tool: &'a str, agent: &str) -> Option<Self> {
+        let detector = super::detect::detector(agent)?;
+        Some(Self {
+            profile,
+            rules_tool,
+            detector: (!super::status_rules::has_rules(profile, rules_tool)).then_some(detector),
+        })
     }
-    super::detect::detect(agent, clean, observation)
+
+    pub fn capture_policy(&self) -> CapturePolicy {
+        self.detector.map_or_else(
+            super::detect::plain_capture_policy,
+            Detector::capture_policy,
+        )
+    }
+
+    pub fn observation_key(&self, observation: &Observation<'_>) -> Option<ObservationKey> {
+        self.detector
+            .and_then(|detector| detector.observation_key(observation))
+    }
+
+    /// `clean` is the original ANSI-stripped capture, before any surface masking.
+    pub fn detect(&self, clean: &str, observation: &Observation<'_>) -> Detection {
+        if let Some(status) = super::status_rules::detect(self.profile, self.rules_tool, clean) {
+            return Detection {
+                status: Some(status),
+                visible: true,
+                rule: "configured_status_rule",
+            };
+        }
+        self.detector
+            .map_or_else(Detection::idle_by_default, |detector| {
+                detector.detect(clean, observation)
+            })
+    }
 }
 
 /// Run an agent's manifest over one capture, Idle when no rule matches.
@@ -94,8 +121,8 @@ mod tests {
 
     #[test]
     #[serial_test::serial]
-    fn detect_with_rules_puts_configured_rules_and_the_title_in_reach() {
-        const PROFILE: &str = "detect-with-rules-test";
+    fn detection_plan_puts_configured_rules_and_the_title_in_reach() {
+        const PROFILE: &str = "detection-plan-test";
         let _registry = super::super::status_rules::ProfileRegistryGuard::take(PROFILE);
         let mut config = crate::session::Config::default();
         config
@@ -115,26 +142,17 @@ mod tests {
             Status::Running,
             "fixture invariant: the manifest alone reads this screen as Running"
         );
-        let detection = detect_with_rules(
-            PROFILE,
-            "claude",
-            "claude",
-            running,
-            &Observation::new("", None, true),
-        )
-        .expect("claude has a manifest");
+        let detection = DetectionPlan::for_manifest(PROFILE, "claude", "claude")
+            .expect("claude has a manifest")
+            .detect(running, &Observation::new("", None, true));
         assert_eq!(detection.status, Some(Status::Waiting));
         assert_eq!(detection.rule, "configured_status_rule");
 
         let idle_screen = "turn over\n";
-        let titled = detect_with_rules(
-            "no-rules-profile-for-title-test",
-            "claude",
-            "claude",
-            idle_screen,
-            &Observation::new("\u{2807}", None, true),
-        )
-        .expect("claude has a manifest");
+        let titled =
+            DetectionPlan::for_manifest("no-rules-profile-for-title-test", "claude", "claude")
+                .expect("claude has a manifest")
+                .detect(idle_screen, &Observation::new("\u{2807}", None, true));
         assert_eq!(titled.status, Some(Status::Running));
         assert_eq!(titled.rule, "osc_title_working");
         assert_eq!(
@@ -4015,14 +4033,9 @@ Final prose line.\n";
             ("different draft", Status::Idle),
         ] {
             let pane = format!("Output\n\n  Esc Busy\n ⠋ 1s > model\n╰─ {draft}\nPLUGIN");
-            let detection = detect_with_rules(
-                PROFILE,
-                "omp",
-                "omp",
-                &pane,
-                &Observation::new("π ⠋ Task", None, true),
-            )
-            .unwrap();
+            let detection = DetectionPlan::for_manifest(PROFILE, "omp", "omp")
+                .expect("omp has a manifest")
+                .detect(&pane, &Observation::new("π ⠋ Task", None, true));
             assert_eq!(detection.status, Some(expected));
         }
     }
