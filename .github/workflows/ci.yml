@@ -147,6 +147,9 @@ jobs:
       - name: Run ESLint
         working-directory: web
         run: npm run lint
+      - name: Typecheck test helpers
+        working-directory: web
+        run: npm run typecheck:tests
 
   deny:
     name: Supply Chain
