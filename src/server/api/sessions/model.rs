@@ -1,6 +1,8 @@
 //! The `SessionResponse` wire model and per-request config resolution.
 
 use super::*;
+use crate::session::projection::SessionProjection;
+use chrono::{DateTime, Utc};
 
 impl SessionResponse {
     /// Build a response from a session instance plus the user's Claude Code
@@ -35,31 +37,27 @@ impl SessionResponse {
             Some(description) => (true, description),
             None => (false, None),
         };
+        let row = SessionProjection::new(inst, &inst.source_profile);
+        let timestamp = |value: Option<DateTime<Utc>>| value.map(|t| t.to_rfc3339());
         Self {
-            id: inst.id.clone(),
-            title: inst.title.clone(),
-            project_path: inst.project_path.clone(),
+            id: row.id.to_string(),
+            title: row.title.to_string(),
+            project_path: row.project_path.to_string(),
             artifact_dir: crate::session::artifacts::artifact_dir_path(&inst.id)
                 .map(|p| p.to_string_lossy().to_string())
                 .unwrap_or_default(),
-            group_path: inst.group_path.clone(),
-            tool: inst.tool.clone(),
-            status: inst.status.wire_str().to_string(),
+            group_path: row.group_path.to_string(),
+            tool: row.tool.to_string(),
+            status: row.status.wire_str().to_string(),
             dormant: inst.is_shown_dormant(),
             yolo_mode: inst.yolo_mode,
-            created_at: inst.created_at.to_rfc3339(),
-            last_accessed_at: inst.last_accessed_at.map(|t| t.to_rfc3339()),
-            idle_entered_at: inst.idle_entered_at.map(|t| t.to_rfc3339()),
-            last_error: inst.last_error.clone(),
-            branch: inst.worktree_info.as_ref().map(|w| w.branch.clone()),
-            main_repo_path: inst
-                .worktree_info
-                .as_ref()
-                .map(|w| w.main_repo_path.clone()),
-            base_branch: inst
-                .worktree_info
-                .as_ref()
-                .and_then(|w| w.base_branch.clone()),
+            created_at: row.created_at.to_rfc3339(),
+            last_accessed_at: timestamp(row.last_accessed_at),
+            idle_entered_at: timestamp(row.idle_entered_at),
+            last_error: row.last_error.map(str::to_string),
+            branch: row.worktree.map(|w| w.branch.clone()),
+            main_repo_path: row.worktree.map(|w| w.main_repo_path.clone()),
+            base_branch: row.worktree.and_then(|w| w.base_branch.clone()),
             base_branch_override: inst.base_branch_override.clone(),
             is_sandboxed: inst.is_sandboxed(),
             // Worktree and workspace creation refuse a path that is not a Repository.
@@ -70,25 +68,14 @@ impl SessionResponse {
             favorited: inst.is_favorited(),
             color: inst.color.clone(),
             urgent: inst.is_urgent(),
-            pinned_at: inst.pinned_at.map(|t| t.to_rfc3339()),
-            archived_at: inst.archived_at.map(|t| t.to_rfc3339()),
-            // Surface `snoozed_until` only while the snooze is active:
-            // `is_snoozed()` goes false once it expires, even though the
-            // persisted field stays set until the next mutation, and the web
-            // must not show a "snoozed 0m" chip on a row that already woke.
-            snoozed_until: if inst.is_snoozed() {
-                inst.snoozed_until.map(|t| t.to_rfc3339())
-            } else {
-                None
-            },
-            trashed_at: inst.trashed_at.map(|t| t.to_rfc3339()),
+            pinned_at: timestamp(row.pinned_at),
+            archived_at: timestamp(row.archived_at),
+            snoozed_until: timestamp(row.active_snoozed_until),
+            trashed_at: timestamp(row.trashed_at),
             // Surface the marker; the web gates the visual on the
             // `session.unread_indicator` setting.
             unread: inst.unread,
-            has_managed_worktree: inst
-                .worktree_info
-                .as_ref()
-                .is_some_and(|w| w.managed_by_aoe),
+            has_managed_worktree: row.has_managed_worktree(),
             has_cleanable_worktree: inst.has_managed_worktree_or_workspace(),
             // Overlaid per-profile in list_sessions; see the field doc.
             tie_workdir_to_name: false,
@@ -97,7 +84,7 @@ impl SessionResponse {
             // Overlaid in list_sessions; single-session responses stay false.
             default_name: false,
             has_terminal: inst.terminal_info.is_some(),
-            profile: inst.source_profile.clone(),
+            profile: row.profile.to_string(),
             cleanup_defaults: CleanupDefaults {
                 delete_worktree: true,
                 delete_branch: false,
@@ -172,8 +159,8 @@ impl SessionResponse {
             claude_fullscreen: claude_fullscreen && inst.tool == "claude",
             // A session converted by `attach_project` (#3103) has a real
             // `workspace_info`, so both repos list here with no special case.
-            workspace_repos: inst
-                .all_repos()
+            workspace_repos: row
+                .workspace_repos
                 .iter()
                 .map(|r| WorkspaceRepoSummary {
                     name: r.name.clone(),

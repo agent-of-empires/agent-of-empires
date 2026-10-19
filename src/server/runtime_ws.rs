@@ -29,7 +29,7 @@ use tokio_tungstenite::tungstenite;
 
 use super::AppState;
 use crate::cli::runtime_read::dto::{
-    GroupRead, ProjectRead, ProjectScope, SessionRead, WorkspaceRepo, WorktreeRead,
+    wire_timestamp, GroupRead, ProjectRead, ProjectScope, SessionRead,
 };
 use crate::session::{GroupTree, Instance, Storage};
 
@@ -1050,72 +1050,6 @@ struct ProfileRead {
     groups: Vec<GroupRead>,
     projects: Vec<ProjectRead>,
     health: ProfileHealth,
-}
-
-impl SessionRead {
-    fn from_instance(inst: &Instance) -> Self {
-        // Preserve stored workspace order, as the CLI JSON projection does.
-        let workspace_repos: Vec<WorkspaceRepo> = inst
-            .workspace_info
-            .as_ref()
-            .map(|info| {
-                info.repos
-                    .iter()
-                    .map(|repo| WorkspaceRepo {
-                        name: repo.name.clone(),
-                        source_path: repo.source_path.clone(),
-                        branch: repo.branch.clone(),
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
-        Self {
-            id: inst.id.clone(),
-            title: inst.title.clone(),
-            project_path: inst.project_path.clone(),
-            group_path: inst.group_path.clone(),
-            tool: inst.tool.clone(),
-            command: inst.command.clone(),
-            profile: inst.source_profile.clone(),
-            status: inst.status.into(),
-            state: inst.effective_bucket().into(),
-            created_at: wire_timestamp(inst.created_at),
-            last_accessed_at: timestamp(inst.last_accessed_at),
-            idle_entered_at: timestamp(inst.idle_entered_at),
-            last_error: inst.last_error.clone(),
-            archived_at: timestamp(inst.archived_at),
-            trashed_at: timestamp(inst.trashed_at),
-            // Only while the snooze is active; a persisted past date is not one.
-            active_snoozed_until: if inst.is_snoozed() {
-                timestamp(inst.snoozed_until)
-            } else {
-                None
-            },
-            pinned_at: timestamp(inst.pinned_at),
-            agent_session_id: inst.agent_session_id.clone(),
-            parent_session_id: inst.parent_session_id.clone(),
-            has_worktree_info: inst.worktree_info.is_some(),
-            has_managed_worktree: inst
-                .worktree_info
-                .as_ref()
-                .is_some_and(|worktree| worktree.managed_by_aoe),
-            worktree: inst.worktree_info.as_ref().map(|worktree| WorktreeRead {
-                branch: worktree.branch.clone(),
-                main_repo_path: worktree.main_repo_path.clone(),
-                managed_by_aoe: worktree.managed_by_aoe,
-                base_branch: worktree.base_branch.clone(),
-            }),
-            workspace_repos,
-        }
-    }
-}
-
-fn wire_timestamp(value: DateTime<Utc>) -> String {
-    value.to_rfc3339_opts(chrono::SecondsFormat::AutoSi, true)
-}
-
-fn timestamp(value: Option<DateTime<Utc>>) -> Option<String> {
-    value.map(wire_timestamp)
 }
 
 #[cfg(test)]

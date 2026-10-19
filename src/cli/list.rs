@@ -4,6 +4,7 @@ use anyhow::Result;
 use clap::{Args, ValueEnum};
 use serde::Serialize;
 
+use crate::session::projection::SessionProjection;
 use crate::session::{Instance, SessionBucket, SessionScope, Storage};
 
 pub(crate) const TABLE_COL_TITLE: usize = 20;
@@ -57,22 +58,6 @@ pub struct ListArgs {
     pub(crate) state: StateFilter,
 }
 
-pub(super) fn state_tag(inst: &Instance) -> &'static str {
-    match inst.effective_bucket() {
-        SessionBucket::Trashed => "trashed",
-        SessionBucket::Archived => "archived",
-        SessionBucket::Active => "live",
-    }
-}
-
-pub(super) fn active_snoozed_until(inst: &Instance) -> Option<chrono::DateTime<chrono::Utc>> {
-    if inst.is_snoozed() {
-        inst.snoozed_until
-    } else {
-        None
-    }
-}
-
 /// `aoe list --json`, the shape the command has always emitted. The renderer
 /// fills this same struct from a snapshot rather than keeping a second copy,
 /// so the two transports cannot drift on a key, a spelling or a member order.
@@ -122,15 +107,6 @@ pub(crate) struct WorktreeJson {
     pub(crate) base_branch: Option<String>,
 }
 
-fn worktree_for(inst: &Instance) -> Option<WorktreeJson> {
-    inst.worktree_info.as_ref().map(|w| WorktreeJson {
-        branch: w.branch.clone(),
-        main_repo_path: w.main_repo_path.clone(),
-        managed_by_aoe: w.managed_by_aoe,
-        base_branch: w.base_branch.clone(),
-    })
-}
-
 /// Whether session scopes are expected, decided without calling systemd, so
 /// `aoe list` never waits on it.
 pub(crate) fn systemd_scopes_active() -> bool {
@@ -138,26 +114,40 @@ pub(crate) fn systemd_scopes_active() -> bool {
 }
 
 fn session_json(inst: &Instance, profile: &str, systemd_active: bool) -> SessionJson {
-    let live = matches!(inst.effective_bucket(), SessionBucket::Active);
+    let row = SessionProjection::new(inst, profile);
+    let live = matches!(row.bucket, SessionBucket::Active);
     SessionJson {
-        id: inst.id.clone(),
-        title: inst.title.clone(),
-        path: inst.project_path.clone(),
-        group: inst.group_path.clone(),
-        tool: inst.tool.clone(),
-        command: inst.command.clone(),
-        profile: profile.to_string(),
-        state: state_tag(inst),
-        created_at: inst.created_at,
-        trashed_at: inst.trashed_at,
-        archived_at: inst.archived_at,
-        snoozed_until: active_snoozed_until(inst),
-        pinned_at: inst.pinned_at,
-        workspace_repos: workspace_repos_for(inst),
-        worktree: worktree_for(inst),
-        parent_session_id: inst.parent_session_id.clone(),
+        id: row.id.to_string(),
+        title: row.title.to_string(),
+        path: row.project_path.to_string(),
+        group: row.group_path.to_string(),
+        tool: row.tool.to_string(),
+        command: row.command.to_string(),
+        profile: row.profile.to_string(),
+        state: row.bucket.as_str(),
+        created_at: row.created_at,
+        trashed_at: row.trashed_at,
+        archived_at: row.archived_at,
+        snoozed_until: row.active_snoozed_until,
+        pinned_at: row.pinned_at,
+        workspace_repos: row
+            .workspace_repos
+            .iter()
+            .map(|r| WorkspaceRepoJson {
+                name: r.name.clone(),
+                source_path: r.source_path.clone(),
+                branch: r.branch.clone(),
+            })
+            .collect(),
+        worktree: row.worktree.map(|w| WorktreeJson {
+            branch: w.branch.clone(),
+            main_repo_path: w.main_repo_path.clone(),
+            managed_by_aoe: w.managed_by_aoe,
+            base_branch: w.base_branch.clone(),
+        }),
+        parent_session_id: row.parent_session_id.map(str::to_string),
         systemd_unit: (systemd_active && live && crate::process::systemd::has_process(inst.status))
-            .then(|| crate::process::systemd::unit_glob(&inst.id)),
+            .then(|| crate::process::systemd::unit_glob(row.id)),
     }
 }
 
@@ -172,17 +162,6 @@ pub(crate) fn unreadable_profile_message(profile: &str) -> String {
         "Profile '{profile}' could not be read, so the answer would be incomplete.\n\
          Fix or remove that profile, then run the command again."
     )
-}
-
-fn workspace_repos_for(inst: &Instance) -> Vec<WorkspaceRepoJson> {
-    inst.all_repos()
-        .iter()
-        .map(|r| WorkspaceRepoJson {
-            name: r.name.clone(),
-            source_path: r.source_path.clone(),
-            branch: r.branch.clone(),
-        })
-        .collect()
 }
 
 /// The two header lines, the way this table has always printed them: the
@@ -336,7 +315,7 @@ fn print_table_row(inst: &Instance, depth: usize, show_state: bool) {
             &table_title(&inst.title, depth),
             &inst.group_path,
             &inst.project_path,
-            show_state.then(|| state_tag(inst)),
+            show_state.then(|| inst.effective_bucket().as_str()),
             &inst.id,
         )
     );
@@ -455,6 +434,111 @@ async fn run_all_profiles(json: bool, scope: SessionScope) -> Result<()> {
 mod tests {
     use super::*;
 
+    /// The CLI, runtime wire and REST rows share one derivation, so they agree
+    /// on the instant of every shared timestamp and on the worktree facts.
+    #[test]
+    fn projections_agree_on_shared_facts() {
+        use crate::cli::runtime_read::dto::SessionRead;
+        use crate::daemon::SessionResponse;
+        use crate::session::{WorkspaceInfo, WorkspaceRepo, WorktreeInfo};
+
+        let now = chrono::Utc::now();
+        let instant = |value: &str| chrono::DateTime::parse_from_rfc3339(value).unwrap();
+        let cases: [(&str, fn(&mut Instance)); 5] = [
+            ("live", |_| {}),
+            ("archived", |i| i.archived_at = Some(chrono::Utc::now())),
+            ("trashed", |i| i.trash()),
+            ("snoozed", |i| {
+                i.snoozed_until = Some(chrono::Utc::now() + chrono::Duration::minutes(5))
+            }),
+            ("expired snooze", |i| {
+                i.snoozed_until = Some(chrono::Utc::now() - chrono::Duration::minutes(5))
+            }),
+        ];
+        for (label, mutate) in cases {
+            let mut inst = Instance::new("t", "/repo");
+            inst.pinned_at = Some(now);
+            inst.worktree_info = Some(WorktreeInfo {
+                branch: "feat".into(),
+                main_repo_path: "/main".into(),
+                managed_by_aoe: true,
+                created_at: now,
+                base_branch: Some("base".into()),
+            });
+            inst.workspace_info = Some(WorkspaceInfo {
+                branch: "feat".into(),
+                workspace_dir: "/ws".into(),
+                created_at: now,
+                cleanup_on_delete: true,
+                repos: vec![WorkspaceRepo {
+                    name: "a".into(),
+                    source_path: "/a".into(),
+                    branch: "feat".into(),
+                    worktree_path: "/ws/a".into(),
+                    main_repo_path: "/a".into(),
+                    managed_by_aoe: true,
+                    branch_preexisting: false,
+                    base_branch: None,
+                    base_branch_override: None,
+                }],
+            });
+            mutate(&mut inst);
+
+            let cli =
+                serde_json::to_value(session_json(&inst, &inst.source_profile, false)).unwrap();
+            let wire = SessionRead::from_instance(&inst);
+            let rest = SessionResponse::from_instance(&inst, false);
+
+            assert_eq!(wire.state.as_str(), cli["state"], "{label}");
+            let cli_time = |key: &str| cli[key].as_str().map(instant);
+            let wire_time = |v: &Option<String>| v.as_deref().map(instant);
+            let rest_time = |v: &Option<String>| v.as_deref().map(instant);
+            assert_eq!(
+                cli_time("snoozed_until"),
+                wire_time(&wire.active_snoozed_until),
+                "{label}"
+            );
+            assert_eq!(
+                cli_time("snoozed_until"),
+                rest_time(&rest.snoozed_until),
+                "{label}"
+            );
+            assert_eq!(
+                cli_time("archived_at"),
+                wire_time(&wire.archived_at),
+                "{label}"
+            );
+            assert_eq!(
+                cli_time("archived_at"),
+                rest_time(&rest.archived_at),
+                "{label}"
+            );
+            assert_eq!(
+                cli_time("trashed_at"),
+                wire_time(&wire.trashed_at),
+                "{label}"
+            );
+            assert_eq!(
+                cli_time("trashed_at"),
+                rest_time(&rest.trashed_at),
+                "{label}"
+            );
+            assert_eq!(cli_time("pinned_at"), wire_time(&wire.pinned_at), "{label}");
+            assert_eq!(cli_time("pinned_at"), rest_time(&rest.pinned_at), "{label}");
+            assert_eq!(cli["worktree"]["branch"], "feat", "{label}");
+            assert_eq!(wire.worktree.as_ref().unwrap().branch, "feat", "{label}");
+            assert_eq!(rest.branch.as_deref(), Some("feat"), "{label}");
+            assert_eq!(rest.base_branch.as_deref(), Some("base"), "{label}");
+            assert!(
+                wire.has_managed_worktree && rest.has_managed_worktree,
+                "{label}"
+            );
+            assert_eq!(cli["workspace_repos"][0]["name"], "a", "{label}");
+            assert_eq!(wire.workspace_repos[0].name, "a", "{label}");
+            assert_eq!(rest.workspace_repos[0].name, "a", "{label}");
+        }
+    }
+
     /// An optional field the row has no value for is left out, as every other
     /// optional field in the struct is. A `null` here would make a consumer
     /// carry a branch that does not exist.
@@ -533,7 +617,6 @@ mod tests {
     #[test]
     fn session_json_reports_state_and_only_the_timestamps_that_apply() {
         let plain = Instance::new("z", "/repo");
-        assert_eq!(state_tag(&plain), "live");
         let json = session_json(&plain, "p", false);
         assert_eq!(json.state, "live");
         let serialized = serde_json::to_string(&json).unwrap();
@@ -543,7 +626,6 @@ mod tests {
 
         let mut archived = Instance::new("z", "/repo");
         archived.archive();
-        assert_eq!(state_tag(&archived), "archived");
         let json = session_json(&archived, "p", false);
         assert_eq!(json.state, "archived");
         assert!(json.archived_at.is_some());
@@ -551,7 +633,6 @@ mod tests {
 
         let mut trashed = Instance::new("z", "/repo");
         trashed.trash();
-        assert_eq!(state_tag(&trashed), "trashed");
         let json = session_json(&trashed, "p", false);
         assert_eq!(json.state, "trashed");
         assert!(json.trashed_at.is_some());

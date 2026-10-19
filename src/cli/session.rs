@@ -378,10 +378,10 @@ fn session_details(inst: &Instance, profile: &str) -> SessionDetails {
         tool: inst.tool.clone(),
         command: inst.command.clone(),
         status: format!("{:?}", inst.status).to_lowercase(),
-        state: super::list::state_tag(inst),
+        state: inst.effective_bucket().as_str(),
         trashed_at: inst.trashed_at,
         archived_at: inst.archived_at,
-        snoozed_until: super::list::active_snoozed_until(inst),
+        snoozed_until: inst.active_snoozed_until(),
         pinned_at: inst.pinned_at,
         agent_session_id: inst.agent_session_id.clone(),
         parent_session_id: inst.parent_session_id.clone(),
@@ -1503,7 +1503,7 @@ async fn show_session(profile: &str, args: ShowArgs) -> Result<()> {
         if let Some(at) = inst.trashed_at.or(inst.archived_at) {
             println!(
                 "  State:   {} ({})",
-                super::list::state_tag(&inst),
+                inst.effective_bucket().as_str(),
                 at.format("%+")
             );
         }
