@@ -69,7 +69,7 @@ export function useTranscriptScroll({
     vp.scrollTo({ top: vp.scrollHeight, behavior });
     lastScrollTopRef.current = vp.scrollTop;
   }, []);
-  const scrollToBottom = useCallback(() => pinToBottom("smooth"), [pinToBottom]);
+  const scrollToBottom = useCallback(() => pinToBottom("instant"), [pinToBottom]);
 
   // A new prompt re-engages stick-to-bottom, as the CLI does: on a fine pointer
   // the composer growing while typing can drop the pinned intent. See

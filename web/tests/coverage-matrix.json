@@ -3148,7 +3148,7 @@
       "id": "acp.mobile-jump-to-bottom",
       "kind": "mocked-playwright",
       "risk": "medium",
-      "specs": ["tests/acp-mobile-jump-to-bottom.spec.ts"],
+      "specs": ["tests/acp-mobile-jump-to-bottom.spec.ts", "src/components/acp/useTranscriptScroll.test.tsx"],
       "components": ["web/src/components/acp/StructuredView.tsx", "web/src/components/acp/useTranscriptScroll.ts"]
     },
     {

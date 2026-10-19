@@ -1,4 +1,4 @@
-import { test, expect } from "./helpers/mockedTest";
+import { test, expect, observeFor } from "./helpers/mockedTest";
 import { devices, type Locator } from "@playwright/test";
 import {
   agentMessageChunk,
@@ -50,6 +50,64 @@ test.describe("mobile jump-to-bottom", () => {
     await expect
       .poll(() => viewport.evaluate((el) => el.scrollTop + el.clientHeight >= el.scrollHeight - 16))
       .toBe(true);
+  });
+
+  test("follows output arriving on the jump's first scroll and still permits reader escape", async ({ page }) => {
+    const mock = await mockAcpSession(page, {
+      title: "story-jump-during-stream",
+      initialEvents: [
+        agentMessageChunk(Array.from({ length: 120 }, (_, i) => `History ${i}.`).join("\n\n")),
+        stopped(),
+      ],
+    });
+    await openStructuredSession(page, mock);
+    await waitForComposerConnected(page);
+
+    const viewport = page.getByTestId("acp-viewport");
+    const button = page.getByTestId("acp-jump-to-bottom");
+    const distanceToBottom = () => viewport.evaluate((el) => el.scrollHeight - el.clientHeight - el.scrollTop);
+    await userScroll(viewport, 0);
+    await expect(button).toBeVisible();
+    await observeFor(page, 300, async () => {
+      expect(await viewport.evaluate((el) => el.scrollTop)).toBe(0);
+    });
+
+    let jumpPosition: { top: number; max: number } | null = null;
+    await page.exposeFunction("streamAfterJumpScroll", (top: number, max: number) => {
+      jumpPosition = { top, max };
+      mock.pushEvents([agentMessageChunk("\n\nOutput arriving during the jump.")]);
+    });
+    await viewport.evaluate((el) => {
+      el.addEventListener(
+        "scroll",
+        () => {
+          void (
+            window as typeof window & {
+              streamAfterJumpScroll: (top: number, max: number) => Promise<void>;
+            }
+          ).streamAfterJumpScroll(el.scrollTop, el.scrollHeight - el.clientHeight);
+        },
+        { once: true },
+      );
+    });
+    await button.click();
+    await expect(viewport).toContainText("Output arriving during the jump.");
+    await test.info().attach("jump-scroll-position", {
+      body: JSON.stringify(jumpPosition),
+      contentType: "application/json",
+    });
+    await expect.poll(distanceToBottom).toBeLessThanOrEqual(1);
+    mock.pushEvents([agentMessageChunk("\n\nLater output follows the jump.")]);
+    await expect(viewport).toContainText("Later output follows the jump.");
+    await expect.poll(distanceToBottom).toBeLessThanOrEqual(1);
+
+    await userScroll(viewport, 0);
+    await expect(button).toBeVisible();
+    mock.pushEvents([agentMessageChunk("\n\nOutput after reader escape.")]);
+    await expect(viewport).toContainText("Output after reader escape.");
+    await observeFor(page, 300, async () => {
+      expect(await viewport.evaluate((el) => el.scrollTop)).toBe(0);
+    });
   });
 
   test("sticks to the bottom as content streams in, but never yanks a scrolled-up reader", async ({ page }) => {
