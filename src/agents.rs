@@ -1055,13 +1055,15 @@ impl AgentDef {
         // The first positional word selects the mode; later ones are its operands (a session id
         // or prompt) and may spell a subcommand name.
         let mut mode_known = false;
-        let mut words = options.iter();
+        let mut words = options.iter().peekable();
         while let Some(word) = words.next() {
             // A remote TUI has no local app server, and Codex rejects the combination.
             if word == "--remote" || word.starts_with("--remote=") {
                 return None;
             } else if CODEX_VALUE_OPTIONS.contains(&word.as_str()) {
                 words.next();
+            } else if CODEX_VARIADIC_OPTIONS.contains(&word.as_str()) {
+                while words.next_if(|next| !next.starts_with('-')).is_some() {}
             } else if !word.starts_with('-') && !mode_known {
                 mode_known = true;
                 if CODEX_NON_TUI_SUBCOMMANDS.contains(&word.as_str()) {
@@ -1203,8 +1205,6 @@ const CODEX_VALUE_OPTIONS: &[&str] = &[
     "--disable",
     "--remote",
     "--remote-auth-token-env",
-    "-i",
-    "--image",
     "-m",
     "--model",
     "--local-provider",
@@ -1218,6 +1218,9 @@ const CODEX_VALUE_OPTIONS: &[&str] = &[
     "-a",
     "--ask-for-approval",
 ];
+
+/// Codex options that take every following word up to the next flag.
+const CODEX_VARIADIC_OPTIONS: &[&str] = &["-i", "--image"];
 
 /// A flag the older generation's help lists and the current one's does not.
 const LEGACY_GENERATION_MARKER: &str = "--fork";
