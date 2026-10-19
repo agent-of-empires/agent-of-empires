@@ -10,6 +10,7 @@ use crate::acp::client::HttpClient;
 use crate::daemon::{ContextResumeAvailability, SessionResponse};
 use crate::plugin::ui_state::UiSnapshot;
 use crate::session::config::{resolve_theme_name, resolve_theme_palette_mode};
+use crate::tui::plugin_ui::{self, SortSpec};
 use crate::tui::styles::Theme;
 use anyhow::Result;
 use crossterm::event::{Event as CrosstermEvent, EventStream, KeyCode, KeyEventKind};
@@ -35,6 +36,9 @@ pub struct RemoteHomeState {
     pub last_error: Option<String>,
     pub loading: bool,
     pub plugin_ui: UiSnapshot,
+    /// `(plugin_id, entry_id)` of the chosen `sort-key`; `None` sorts by title.
+    /// Ephemeral, like the web sidebar's.
+    active_sort: Option<(String, String)>,
 }
 
 impl RemoteHomeState {
@@ -49,7 +53,49 @@ impl RemoteHomeState {
             last_error: None,
             loading: true,
             plugin_ui: UiSnapshot::default(),
+            active_sort: None,
         })
+    }
+
+    /// The chosen `sort-key`, if the current snapshot still publishes it.
+    pub fn active_sort_spec(&self) -> Option<SortSpec> {
+        let (plugin_id, entry_id) = self.active_sort.as_ref()?;
+        plugin_ui::sort_specs(&self.plugin_ui)
+            .into_iter()
+            .find(|s| &s.plugin_id == plugin_id && &s.entry_id == entry_id)
+    }
+
+    /// Advance title, then each published `sort-key`, then back to title.
+    pub fn cycle_sort(&mut self) {
+        let specs = plugin_ui::sort_specs(&self.plugin_ui);
+        let next = match self.active_sort_spec() {
+            None => 0,
+            Some(cur) => specs.iter().position(|s| *s == cur).map_or(0, |i| i + 1),
+        };
+        self.active_sort = specs
+            .get(next)
+            .map(|s| (s.plugin_id.clone(), s.entry_id.clone()));
+        let selected = self.sessions.get(self.cursor).map(|s| s.id.clone());
+        self.resort(selected);
+    }
+
+    /// Title order, then the active `sort-key` as a stable sort so ties keep
+    /// title order. The cursor follows `selected` to its new row.
+    fn resort(&mut self, selected: Option<String>) {
+        self.sessions.sort_by(|a, b| a.title.cmp(&b.title));
+        if let Some(spec) = self.active_sort_spec() {
+            let values = plugin_ui::sort_values(&self.plugin_ui, &spec);
+            self.sessions.sort_by(|a, b| {
+                plugin_ui::compare_sort_values(
+                    values.get(a.id.as_str()),
+                    values.get(b.id.as_str()),
+                    spec.descending,
+                )
+            });
+        }
+        if let Some(i) = selected.and_then(|id| self.sessions.iter().position(|s| s.id == id)) {
+            self.cursor = i;
+        }
     }
 
     pub fn move_cursor(&mut self, delta: i32) {
@@ -155,6 +201,7 @@ async fn run(
                 terminal.draw(|f| render::render(f, f.area(), theme, &state))?;
                 refresh(&mut state).await;
             }
+            KeyCode::Char('s') => state.cycle_sort(),
             KeyCode::Down | KeyCode::Char('j') => state.move_cursor(1),
             KeyCode::Up | KeyCode::Char('k') => state.move_cursor(-1),
             KeyCode::Enter => {
@@ -215,6 +262,7 @@ fn apply_session_result(state: &mut RemoteHomeState, result: Result<Vec<RemoteSe
 async fn refresh(state: &mut RemoteHomeState) {
     state.loading = true;
     state.last_error = None;
+    let selected = state.sessions.get(state.cursor).map(|s| s.id.clone());
     let sessions = state
         .client
         .list_sessions(None)
@@ -230,6 +278,7 @@ async fn refresh(state: &mut RemoteHomeState) {
             UiSnapshot::default()
         }
     };
+    state.resort(selected);
     state.loading = false;
 }
 #[cfg(test)]
@@ -266,6 +315,62 @@ mod tests {
             Source::Env,
         ))
         .unwrap()
+    }
+
+    fn with_sort_keys(state: &mut RemoteHomeState, ids: &[&str], values: &[(&str, f64)]) {
+        state.sessions = ids.iter().map(|id| session(id)).collect();
+        let mut entries = vec![serde_json::json!({
+            "plugin_id": "gh", "slot": "sort-key", "id": "k",
+            "payload": {"label": "Attention", "column": "att", "direction": "desc"}})];
+        entries.extend(values.iter().map(|(sid, v)| {
+            serde_json::json!({
+                "plugin_id": "gh", "slot": "row-column", "id": "att", "session_id": sid,
+                "payload": {"text": "t", "sort_value": v}})
+        }));
+        state.plugin_ui =
+            serde_json::from_value(serde_json::json!({"entries": entries, "notifications": []}))
+                .unwrap();
+    }
+
+    fn order(state: &RemoteHomeState) -> Vec<&str> {
+        state.sessions.iter().map(|s| s.id.as_str()).collect()
+    }
+
+    #[test]
+    fn cycle_sort_orders_by_plugin_value_and_keeps_the_cursor_row() {
+        let mut state = state();
+        with_sort_keys(&mut state, &["a", "b", "c", "d"], &[("c", 9.0), ("a", 1.0)]);
+        state.cursor = 3; // "d"
+
+        state.cycle_sort();
+        // Descending, unvalued rows last in title order.
+        assert_eq!(order(&state), ["c", "a", "b", "d"]);
+        assert_eq!(state.sessions[state.cursor].id, "d");
+
+        state.cycle_sort();
+        assert_eq!(order(&state), ["a", "b", "c", "d"]);
+        assert!(state.active_sort_spec().is_none());
+    }
+
+    #[test]
+    fn cycle_sort_without_sort_keys_keeps_title_order() {
+        let mut state = state();
+        state.sessions = vec![session("a"), session("b")];
+        state.cycle_sort();
+        assert_eq!(order(&state), ["a", "b"]);
+        assert!(state.active_sort_spec().is_none());
+    }
+
+    #[test]
+    fn vanished_sort_key_falls_back_to_title_on_resort() {
+        let mut state = state();
+        with_sort_keys(&mut state, &["a", "b"], &[("b", 1.0)]);
+        state.cycle_sort();
+        assert_eq!(order(&state), ["b", "a"]);
+
+        state.plugin_ui = UiSnapshot::default();
+        state.resort(None);
+        assert_eq!(order(&state), ["a", "b"]);
     }
 
     #[test]
