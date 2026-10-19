@@ -91,7 +91,7 @@ async fn fetch_sessions() -> SessionFeedResult {
             return SessionFeedResult::Unavailable(e.to_string());
         }
     };
-    let client = match endpoint.daemon_client() {
+    let client = match crate::acp::client::HttpClient::new(endpoint) {
         Ok(client) => client,
         Err(e) => {
             tracing::debug!(target: "tui.session_feed", "daemon client: {e}");

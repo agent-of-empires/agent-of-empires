@@ -1,11 +1,12 @@
 //! Reusable client and shared wire contract for the daemon REST API.
 
+pub mod live;
 mod wire;
 
 use std::fmt;
 use std::time::Duration;
 
-use reqwest::header::{HeaderValue, AUTHORIZATION};
+use reqwest::header::{HeaderName, HeaderValue, AUTHORIZATION, COOKIE};
 use reqwest::{StatusCode, Url};
 use thiserror::Error;
 
@@ -24,12 +25,12 @@ const MAX_SUCCESS_BODY_BYTES: usize = 16 * 1024 * 1024;
 pub struct DaemonClient {
     http: reqwest::Client,
     sessions_url: Url,
-    authorization: Option<HeaderValue>,
+    credentials: Vec<(HeaderName, HeaderValue)>,
 }
 
 impl fmt::Debug for DaemonClient {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let authenticated = self.authorization.is_some();
+        let authenticated = self.authenticated();
         let mut debug = f.debug_struct("DaemonClient");
         if authenticated {
             debug.field("sessions_url", &"<redacted>");
@@ -46,8 +47,10 @@ pub enum DaemonClientError {
     InvalidBaseUrl { reason: &'static str },
     #[error("invalid daemon bearer token")]
     InvalidBearerToken,
-    #[error("daemon bearer token requires HTTPS or a loopback HTTP URL")]
-    InsecureBearerTransport,
+    #[error("invalid daemon session credential")]
+    InvalidSessionCredential,
+    #[error("daemon credentials require HTTPS or a loopback HTTP URL")]
+    InsecureCredentialTransport,
     #[error("failed to build daemon HTTP client: {0}")]
     ClientBuild(#[source] reqwest::Error),
     #[error("daemon transport error: {0}")]
@@ -70,13 +73,41 @@ pub enum DaemonClientError {
 impl DaemonClient {
     /// Bearer authentication requires HTTPS except for loopback HTTP.
     pub fn new(base_url: &str, bearer_token: Option<&str>) -> Result<Self, DaemonClientError> {
+        let credentials = authorization_header(bearer_token)?
+            .map(|value| vec![(AUTHORIZATION, value)])
+            .unwrap_or_default();
+        Self::with_credentials(base_url, credentials)
+    }
+
+    /// Passphrase-login session: the `aoe_session` cookie pair plus the
+    /// device-binding secret. Same transport rules as a bearer token.
+    pub fn with_session(
+        base_url: &str,
+        cookie: &str,
+        binding_secret: &str,
+    ) -> Result<Self, DaemonClientError> {
+        Self::with_credentials(
+            base_url,
+            vec![
+                (COOKIE, sensitive_header(cookie)?),
+                (
+                    HeaderName::from_static("x-aoe-device-binding"),
+                    sensitive_header(binding_secret)?,
+                ),
+            ],
+        )
+    }
+
+    fn with_credentials(
+        base_url: &str,
+        credentials: Vec<(HeaderName, HeaderValue)>,
+    ) -> Result<Self, DaemonClientError> {
         let sessions_url = sessions_url(base_url)?;
-        let authorization = authorization_header(bearer_token)?;
-        if authorization.is_some()
+        if !credentials.is_empty()
             && sessions_url.scheme() == "http"
             && !is_loopback_url(&sessions_url)
         {
-            return Err(DaemonClientError::InsecureBearerTransport);
+            return Err(DaemonClientError::InsecureCredentialTransport);
         }
         let http = reqwest::Client::builder()
             .timeout(DEFAULT_TIMEOUT)
@@ -87,8 +118,12 @@ impl DaemonClient {
         Ok(Self {
             http,
             sessions_url,
-            authorization,
+            credentials,
         })
+    }
+
+    fn authenticated(&self) -> bool {
+        !self.credentials.is_empty()
     }
 
     pub async fn list_sessions(
@@ -101,8 +136,8 @@ impl DaemonClient {
             .get(self.sessions_url.clone())
             .query(&query)
             .timeout(DEFAULT_TIMEOUT);
-        if let Some(authorization) = &self.authorization {
-            request = request.header(AUTHORIZATION, authorization.clone());
+        for (name, value) in &self.credentials {
+            request = request.header(name.clone(), value.clone());
         }
         let request = request
             .build()
@@ -115,7 +150,7 @@ impl DaemonClient {
 
         let status = response.status();
         if !status.is_success() {
-            if self.authorization.is_some() {
+            if self.authenticated() {
                 return Err(DaemonClientError::Status {
                     status,
                     body: String::new(),
@@ -134,7 +169,7 @@ impl DaemonClient {
             .read_bounded_body(&mut response, MAX_SUCCESS_BODY_BYTES)
             .await?;
         serde_json::from_slice(&body).map_err(|error| {
-            if self.authorization.is_some() {
+            if self.authenticated() {
                 DaemonClientError::AuthenticatedDecode
             } else {
                 DaemonClientError::Decode(error)
@@ -172,7 +207,7 @@ impl DaemonClient {
 
     // An authenticated base path may itself contain credential material.
     fn transport_error(&self, error: reqwest::Error) -> DaemonClientError {
-        let error = if self.authorization.is_some() {
+        let error = if self.authenticated() {
             error.without_url()
         } else {
             error
@@ -277,6 +312,13 @@ fn authorization_header(
         .map_err(|_| DaemonClientError::InvalidBearerToken)?;
     value.set_sensitive(true);
     Ok(Some(value))
+}
+
+fn sensitive_header(value: &str) -> Result<HeaderValue, DaemonClientError> {
+    let mut value =
+        HeaderValue::from_str(value).map_err(|_| DaemonClientError::InvalidSessionCredential)?;
+    value.set_sensitive(true);
+    Ok(value)
 }
 
 fn truncate_utf8(value: &mut String, max_bytes: usize) {
