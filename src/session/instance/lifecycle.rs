@@ -104,6 +104,14 @@ impl Instance {
         )
     }
 
+    pub(crate) fn has_fresh_launch_reservation(&self, now: DateTime<Utc>) -> bool {
+        self.has_fresh_lifecycle_reservation(now)
+            && self
+                .lifecycle_reservation
+                .as_ref()
+                .is_some_and(|reservation| reservation.op == LifecycleOperation::Launch)
+    }
+
     /// Refresh an owned reservation while a bounded or user-defined hook runs. The generation
     /// remains the identity of the operation; only its liveness timestamp moves forward.
     pub(crate) fn renew_lifecycle_reservation_if_owned(
@@ -135,14 +143,6 @@ impl Instance {
         )
     }
 
-    pub(crate) fn has_fresh_launch_reservation(&self, now: DateTime<Utc>) -> bool {
-        self.has_fresh_lifecycle_reservation(now)
-            && self
-                .lifecycle_reservation
-                .as_ref()
-                .is_some_and(|reservation| reservation.op == LifecycleOperation::Launch)
-    }
-
     pub fn release_lifecycle_reservation_if_owned(
         &mut self,
         operation: LifecycleOperation,
@@ -154,26 +154,6 @@ impl Instance {
         } else {
             false
         }
-    }
-
-    /// Publish a retained purge result beyond peers' Deleting observation.
-    pub(crate) fn finish_owned_purge(
-        &mut self,
-        generation: u64,
-        status_before: Status,
-    ) -> Result<bool, LifecycleReservationError> {
-        if !self.lifecycle_reservation_is_owned(LifecycleOperation::Purge, generation) {
-            return Ok(false);
-        }
-        let completed = generation
-            .checked_add(1)
-            .ok_or(LifecycleReservationError::GenerationOverflow)?;
-        if self.status == Status::Deleting {
-            self.status = status_before;
-        }
-        self.lifecycle_reservation = None;
-        self.lifecycle_generation = completed;
-        Ok(true)
     }
 
     /// Clear a crashed owner's expired reservation. The generation is

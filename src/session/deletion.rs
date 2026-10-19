@@ -80,11 +80,10 @@ pub struct PurgeTransaction {
     was_trashed: bool,
     generation: u64,
     lifecycle_lock: Option<StorageFlock>,
-    owner_lock: Option<StorageFlock>,
     journal_path: Option<PathBuf>,
     journal_entry: Option<Box<crate::session::lifecycle_journal::LifecycleJournalEntry>>,
     status_before: Status,
-    pre_teardown_error: Option<String>,
+    hook_start_error: Option<String>,
     active: bool,
 }
 
@@ -95,13 +94,13 @@ pub struct CommittedPurge {
     storage: Storage,
     request: DeletionRequest,
     _lifecycle_lock: StorageFlock,
-    _owner_lock: StorageFlock,
     journal_path: Option<PathBuf>,
     journal_entry: Option<Box<crate::session::lifecycle_journal::LifecycleJournalEntry>>,
     generation: u64,
+    status_before: Status,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy)]
 enum CompletionGate {
     Proceed,
     AlreadyGone,
@@ -139,17 +138,7 @@ impl PurgeTransaction {
         let id = request.session_id.clone();
         let was_trashed = request.instance.is_trashed();
         let expected_trashed_at = request.instance.trashed_at;
-        crate::session::profile_rename::ensure_profile_available(storage.profile())?;
-        let Some(owner_lock) = storage.try_acquire_purge_owner_lock(&id)? else {
-            let retained = storage.load()?.into_iter().find(|row| row.id == id);
-            return Ok(PurgeReservation::Rejected(DeletionResult::rejected(
-                id,
-                DeletionDisposition::Busy,
-                "Session has a live purge owner",
-                retained,
-            )));
-        };
-        crate::session::profile_rename::ensure_profile_available(storage.profile())?;
+        let mut lifecycle_changed = false;
         let lifecycle_lock = storage
             .acquire_instance_lifecycle_lock(&id)
             .context("failed to acquire instance purge lock")?;
@@ -158,7 +147,7 @@ impl PurgeTransaction {
         let mut rejected = None;
         let mut journal_path = None;
         let mut journal_entry = None;
-        let reserve_result = storage.update(|instances, _groups| {
+        storage.update(|instances, _groups| {
             let decision =
                 crate::session::claim::decide_purge_claim(instances, &id, was_trashed, now)?;
             let generation = match decision {
@@ -194,11 +183,8 @@ impl PurgeTransaction {
                 .iter_mut()
                 .find(|instance| instance.id == id)
                 .expect("reserved purge row must still exist");
+            lifecycle_changed = was_trashed && stored.trashed_at != expected_trashed_at;
             let status_before = stored.status;
-            // Drop stale force permission before persisting the recovery intent.
-            if was_trashed && stored.trashed_at != expected_trashed_at {
-                request.force_delete = false;
-            }
             let mut snapshot = stored.clone();
             snapshot.source_profile = storage.profile().to_string();
             let entry = crate::session::lifecycle_journal::LifecycleJournalEntry::deletion(
@@ -223,20 +209,7 @@ impl PurgeTransaction {
             journal_path = Some(path);
             journal_entry = Some(entry);
             Ok(())
-        });
-        if let Err(error) = reserve_result {
-            if let Some(path) = journal_path.as_deref() {
-                if let Err(cleanup_error) = crate::session::lifecycle_journal::consume(path) {
-                    tracing::warn!(
-                        target: "session.delete",
-                        path = %path.display(),
-                        error = %cleanup_error,
-                        "failed reservation left a lifecycle journal that must be ignored"
-                    );
-                }
-            }
-            return Err(error);
-        }
+        })?;
 
         if let Some((disposition, message, retained_instance)) = rejected {
             return Ok(PurgeReservation::Rejected(DeletionResult::rejected(
@@ -249,30 +222,23 @@ impl PurgeTransaction {
         let (generation, snapshot, status_before) =
             reserved.ok_or_else(|| anyhow::anyhow!("purge reservation produced no outcome"))?;
         request.instance = snapshot;
-        let mut transaction = Self {
+        // A force chosen against an earlier trash lifecycle (a peer restored and re-trashed
+        // the row since) must not skip the dirty-worktree guard for the new one.
+        if lifecycle_changed {
+            request.force_delete = false;
+        }
+        Ok(PurgeReservation::Reserved(Self {
             storage,
             request,
             was_trashed,
             generation,
             lifecycle_lock: Some(lifecycle_lock),
-            owner_lock: Some(owner_lock),
             journal_path,
             journal_entry: journal_entry.map(Box::new),
             status_before,
-            pre_teardown_error: None,
+            hook_start_error: None,
             active: true,
-        };
-        if transaction.request.instance.is_structured() {
-            if let Err(error) = crate::process::worker_registry::fence_for_purge(
-                &transaction.request.session_id,
-                transaction.storage.profile(),
-                transaction.generation,
-            ) {
-                let _ = transaction.release_reservation();
-                return Err(error.context("failed to fence the ACP runner before purge"));
-            }
-        }
-        Ok(PurgeReservation::Reserved(transaction))
+        }))
     }
 
     /// Run best-effort hooks without a lifecycle or storage flock held.
@@ -300,195 +266,79 @@ impl PurgeTransaction {
         ) {
             Ok(heartbeat) => heartbeat,
             Err(error) => {
-                self.pre_teardown_error = Some(error.to_string());
+                self.hook_start_error = Some(error.to_string());
                 return self;
             }
         };
-        if let Err(error) = self.mark_journal_phase(LifecyclePhase::HooksStarted) {
-            heartbeat.stop();
-            self.pre_teardown_error = Some(format!("failed to record hook start: {error:#}"));
-            return self;
-        }
         self.lifecycle_lock = None;
+        self.mark_journal_phase(LifecyclePhase::HooksStarted);
         run_hooks(&self.request.instance, self.request.detach_hooks);
         heartbeat.stop();
-        if let Err(error) = self.mark_journal_phase(LifecyclePhase::HooksComplete) {
-            self.pre_teardown_error = Some(format!("failed to record hook completion: {error:#}"));
-        }
+        self.mark_journal_phase(LifecyclePhase::HooksComplete);
         self
     }
 
-    fn update_journal(
-        &mut self,
-        update: impl FnOnce(
-            &crate::session::lifecycle_journal::LifecycleJournalEntry,
-        ) -> crate::session::lifecycle_journal::LifecycleJournalEntry,
-    ) -> Result<()> {
-        let (Some(path), Some(_entry)) = (&self.journal_path, &self.journal_entry) else {
-            return Ok(());
-        };
-        let current = crate::session::lifecycle_journal::read_deletion(path)?
-            .ok_or_else(|| anyhow::anyhow!("purge lifecycle journal was replaced"))?;
-        anyhow::ensure!(
-            current.session_id == self.request.session_id
-                && current.source_profile == self.storage.profile()
-                && current.generation == self.generation,
-            "purge lifecycle journal is no longer owned by this generation"
-        );
-        let updated = update(&current);
-        crate::session::lifecycle_journal::update(path, &updated)?;
-        self.journal_entry = Some(Box::new(updated));
-        Ok(())
-    }
-
-    fn mark_journal_phase(&mut self, phase: LifecyclePhase) -> Result<()> {
-        self.update_journal(|entry| entry.with_phase(phase))
-    }
-
-    fn journal_confirms_pre_teardown(&self) -> bool {
-        let (Some(path), Some(_entry)) = (&self.journal_path, &self.journal_entry) else {
-            return false;
-        };
-        crate::session::lifecycle_journal::read_deletion(path)
-            .ok()
-            .flatten()
-            .is_some_and(|entry| {
-                entry.session_id == self.request.session_id
-                    && entry.source_profile == self.storage.profile()
-                    && entry.generation == self.generation
-                    && !entry.phase.teardown_started()
-            })
-    }
-
-    fn record_teardown_start(&mut self) -> Result<()> {
-        anyhow::ensure!(
-            self.journal_path.is_some() && self.journal_entry.is_some(),
-            "purge lifecycle journal is unavailable before irreversible teardown"
-        );
-        match self.mark_journal_phase(LifecyclePhase::TeardownStarted) {
-            Ok(()) => {
-                self.active = false;
-                Ok(())
-            }
-            Err(error) => {
-                if !self.journal_confirms_pre_teardown() {
-                    // The atomic journal replacement may have reached disk even
-                    // when its final durability check returned an error.
-                    self.active = false;
-                }
-                Err(error)
-            }
-        }
-    }
-
-    fn retained_instance(&self) -> Option<Instance> {
-        self.storage
-            .load()
-            .ok()?
-            .into_iter()
-            .find(|instance| instance.id == self.request.session_id)
-    }
-
-    fn failed_to_record_teardown_start(&mut self, error: &anyhow::Error) -> DeletionResult {
-        let can_release = self.journal_confirms_pre_teardown();
-        let retained_instance = if can_release {
-            self.release_reservation().ok().flatten()
-        } else {
-            self.active = false;
-            self.retained_instance()
-        };
-        let mut result = DeletionResult::rejected(
-            self.request.session_id.clone(),
-            DeletionDisposition::Failed,
-            format!("Failed to record session teardown start: {error:#}"),
-            retained_instance,
-        );
-        result.teardown_started = !can_release;
-        result
-    }
-
-    fn consume_journal(&mut self) {
-        let Some(path) = self.journal_path.as_deref() else {
+    fn mark_journal_phase(&mut self, phase: LifecyclePhase) {
+        let (Some(path), Some(entry)) = (&self.journal_path, &self.journal_entry) else {
             return;
         };
-        let current = match crate::session::lifecycle_journal::read_deletion(path) {
-            Ok(Some(current)) => current,
-            Ok(None) => {
-                self.journal_path = None;
-                self.journal_entry = None;
-                return;
-            }
-            Err(error) => {
-                tracing::warn!(
-                    target: "session.delete",
-                    path = %path.display(),
-                    error = %error,
-                    "purge journal could not be verified before cleanup"
-                );
-                return;
-            }
-        };
-        if current.session_id != self.request.session_id
-            || current.source_profile != self.storage.profile()
-            || current.generation != self.generation
-        {
-            self.journal_path = None;
-            self.journal_entry = None;
-            return;
-        }
-        if current.phase.teardown_started()
-            && !matches!(
-                current.phase,
-                LifecyclePhase::RowRemoved | LifecyclePhase::Kept
-            )
-        {
-            tracing::warn!(
-                target: "session.delete",
-                path = %path.display(),
-                "irreversible purge journal retained for recovery"
-            );
-            return;
-        }
-        if let Err(error) = self.clear_runner_fence() {
+        let updated = entry.with_phase(phase);
+        if let Err(error) = crate::session::lifecycle_journal::update(path, &updated) {
             tracing::warn!(
                 target: "session.delete",
                 path = %path.display(),
                 error = %error,
-                "purge journal retained so recovery can retry clearing its ACP runner fence"
+                "lifecycle journal phase update failed; the original intent remains recoverable"
             );
-            return;
+        } else {
+            self.journal_entry = Some(Box::new(updated));
         }
-        if let Err(error) = crate::session::lifecycle_journal::consume(path) {
+    }
+
+    fn consume_journal(&mut self) {
+        let Some(path) = self.journal_path.take() else {
+            return;
+        };
+        if let Err(error) = crate::session::lifecycle_journal::consume(&path) {
             tracing::warn!(
                 target: "session.delete",
                 path = %path.display(),
                 error = %error,
                 "completed purge could not consume its lifecycle journal; startup will retry it"
             );
-            return;
         }
-        self.journal_path = None;
         self.journal_entry = None;
     }
 
-    fn clear_runner_fence(&self) -> Result<()> {
-        if !self.request.instance.is_structured() {
-            return Ok(());
-        }
-        if let Err(error) = crate::process::worker_registry::clear_purge_fence_if_owned(
-            &self.request.session_id,
-            self.storage.profile(),
-            self.generation,
-        ) {
+    fn retain_kept_journal(&mut self, resources: &[String]) {
+        let (Some(path), Some(entry)) = (&self.journal_path, &self.journal_entry) else {
+            return;
+        };
+        let updated = entry
+            .with_kept_resources(resources.to_vec())
+            .with_phase(LifecyclePhase::Kept);
+        if let Err(error) = crate::session::lifecycle_journal::update(path, &updated) {
             tracing::warn!(
                 target: "session.delete",
-                session = %self.request.session_id,
+                path = %path.display(),
                 error = %error,
-                "ACP runner purge fence could not be cleared"
+                "kept sidecar lifecycle journal could not be updated"
             );
-            return Err(error);
+        } else {
+            self.journal_entry = Some(Box::new(updated));
         }
-        Ok(())
+    }
+
+    fn finalize_journal_for_result(&mut self, result: &DeletionResult) {
+        if !result.success {
+            return;
+        }
+        let kept_resources = kept_resources_from_messages(&self.request, &result.messages);
+        if !kept_resources.is_empty() {
+            self.retain_kept_journal(&kept_resources);
+        } else {
+            self.consume_journal();
+        }
     }
 
     fn ensure_lifecycle_lock(&mut self) -> Result<()> {
@@ -506,34 +356,17 @@ impl PurgeTransaction {
         let id = self.request.session_id.clone();
         let generation = self.generation;
         let status_before = self.status_before;
-        anyhow::ensure!(
-            self.journal_confirms_pre_teardown(),
-            "cannot release purge reservation after teardown may have started"
-        );
-        if let Err(error) = self.mark_journal_phase(LifecyclePhase::Abandoned) {
-            tracing::warn!(
-                target: "session.delete",
-                session = %id,
-                error = %error,
-                "failed to mark rolled-back purge intent abandoned"
-            );
-            anyhow::ensure!(
-                self.journal_confirms_pre_teardown(),
-                "could not verify that failed purge intent is still reversible"
-            );
-        }
         let mut retained = None;
         self.storage.update(|instances, _groups| {
             if let Some(stored) = instances.iter_mut().find(|instance| instance.id == id) {
-                if stored.lifecycle_reservation_is_owned(LifecycleOperation::Purge, generation) {
-                    stored.finish_owned_purge(generation, status_before)?;
-                }
+                stored.status = status_before;
+                stored
+                    .release_lifecycle_reservation_if_owned(LifecycleOperation::Purge, generation);
                 retained = Some(stored.clone());
             }
             Ok(())
         })?;
         self.active = false;
-        self.consume_journal();
         Ok(retained)
     }
 
@@ -555,13 +388,20 @@ impl PurgeTransaction {
             let owns = stored.lifecycle_reservation_is_owned(LifecycleOperation::Purge, generation);
             let gate = if restored {
                 CompletionGate::KeptRestored
-            } else if !owns || stored.status != Status::Deleting {
+            } else if !owns {
                 CompletionGate::Superseded
             } else {
                 CompletionGate::Proceed
             };
-            if !matches!(gate, CompletionGate::Proceed) && owns {
-                stored.finish_owned_purge(generation, status_before)?;
+            if !matches!(gate, CompletionGate::Proceed) {
+                if matches!(
+                    gate,
+                    CompletionGate::KeptRestored | CompletionGate::Superseded
+                ) {
+                    stored.status = status_before;
+                }
+                stored
+                    .release_lifecycle_reservation_if_owned(LifecycleOperation::Purge, generation);
             }
             outcome = Some((gate, Some(stored.clone())));
             Ok(())
@@ -609,7 +449,7 @@ impl PurgeTransaction {
     pub fn begin_irreversible(
         mut self,
     ) -> std::result::Result<CommittedPurge, Box<DeletionResult>> {
-        if let Some(error) = self.pre_teardown_error.take() {
+        if let Some(error) = self.hook_start_error.take() {
             let retained_instance = if self.ensure_lifecycle_lock().is_ok() {
                 self.release_reservation().ok().flatten()
             } else {
@@ -618,7 +458,7 @@ impl PurgeTransaction {
             return Err(Box::new(DeletionResult::rejected(
                 self.request.session_id.clone(),
                 DeletionDisposition::Failed,
-                format!("Failed to prepare session purge: {error}"),
+                format!("Failed to start purge hook reservation heartbeat: {error}"),
                 retained_instance,
             )));
         }
@@ -647,16 +487,14 @@ impl PurgeTransaction {
             let owns = instances[index]
                 .lifecycle_reservation_is_owned(LifecycleOperation::Purge, generation);
             if restored {
-                if owns {
-                    instances[index].finish_owned_purge(generation, status_before)?;
-                }
+                instances[index].status = status_before;
+                instances[index]
+                    .release_lifecycle_reservation_if_owned(LifecycleOperation::Purge, generation);
                 commit = Some((CompletionGate::KeptRestored, Some(instances[index].clone())));
-            } else if !owns || instances[index].status != Status::Deleting {
-                if owns {
-                    instances[index].finish_owned_purge(generation, status_before)?;
-                }
+            } else if !owns {
                 commit = Some((CompletionGate::Superseded, Some(instances[index].clone())));
             } else {
+                instances[index].status = Status::Deleting;
                 commit = Some((CompletionGate::Proceed, Some(instances[index].clone())));
             }
             Ok(())
@@ -677,16 +515,14 @@ impl PurgeTransaction {
                 None,
             )));
         };
+        self.active = false;
         if !matches!(gate, CompletionGate::Proceed) {
-            self.active = false;
             if !matches!(gate, CompletionGate::AlreadyGone) {
                 self.consume_journal();
             }
             return Err(Box::new(self.result_for_gate(gate, retained)));
         }
-        if let Err(error) = self.record_teardown_start() {
-            return Err(Box::new(self.failed_to_record_teardown_start(&error)));
-        }
+        self.mark_journal_phase(LifecyclePhase::TeardownStarted);
         Ok(CommittedPurge {
             storage: self.storage.clone(),
             request: DeletionRequest {
@@ -703,13 +539,10 @@ impl PurgeTransaction {
                 .lifecycle_lock
                 .take()
                 .expect("active purge transaction must own its lifecycle lock"),
-            _owner_lock: self
-                .owner_lock
-                .take()
-                .expect("active purge must own its owner lock"),
             journal_path: self.journal_path.take(),
             journal_entry: self.journal_entry.take(),
             generation,
+            status_before,
         })
     }
 
@@ -718,8 +551,9 @@ impl PurgeTransaction {
     fn complete_inner(
         mut self,
         after_teardown: impl FnOnce(&Instance) -> std::result::Result<(), String>,
+        commit_on_teardown_failure: bool,
     ) -> DeletionResult {
-        if let Some(error) = self.pre_teardown_error.take() {
+        if let Some(error) = self.hook_start_error.take() {
             let retained_instance = if self.ensure_lifecycle_lock().is_ok() {
                 self.release_reservation().ok().flatten()
             } else {
@@ -728,7 +562,7 @@ impl PurgeTransaction {
             return DeletionResult::rejected(
                 self.request.session_id.clone(),
                 DeletionDisposition::Failed,
-                format!("Failed to prepare session purge: {error}"),
+                format!("Failed to start purge hook reservation heartbeat: {error}"),
                 retained_instance,
             );
         }
@@ -755,65 +589,24 @@ impl PurgeTransaction {
         if !matches!(gate, CompletionGate::Proceed) {
             return self.result_for_gate(gate, retained);
         }
-        if let Err(error) = self.record_teardown_start() {
-            return self.failed_to_record_teardown_start(&error);
-        }
-        if let Err(error) = stop_acp_runner_for_purge(&self.request.instance, self.generation) {
-            let mut result = DeletionResult::rejected(
-                id,
-                DeletionDisposition::Failed,
-                format!(
-                    "ACP runner exit could not be confirmed; purge resources were retained: {error:#}"
-                ),
-                self.retained_instance(),
-            );
-            result.teardown_started = true;
-            return result;
-        }
+        self.mark_journal_phase(LifecyclePhase::TeardownStarted);
         let mut result = perform_deletion_teardown_lifecycle_locked(&self.request);
-        if !result.success {
-            result.retained_instance = self.retained_instance();
+        if !result.success && !commit_on_teardown_failure {
+            result.retained_instance = self.release_reservation().ok().flatten();
             result.disposition = DeletionDisposition::Failed;
-            result.teardown_started = true;
             return result;
         }
 
         if let Err(error) = after_teardown(&self.request.instance) {
             result.success = false;
             result.errors.push(error);
-            result.retained_instance = self.retained_instance();
+            result.retained_instance = self.release_reservation().ok().flatten();
             result.disposition = DeletionDisposition::Failed;
-            result.teardown_started = true;
-            return result;
-        }
-
-        let id = self.request.session_id.clone();
-        let kept_resources = kept_resources_from_messages(&self.request, &result.messages);
-        if let Err(error) = self.update_journal(|entry| {
-            entry
-                .with_kept_resources(kept_resources.clone())
-                .with_phase(LifecyclePhase::TeardownComplete)
-        }) {
-            result.success = false;
-            result.errors.push(format!(
-                "Session teardown completed, but its terminal journal checkpoint failed: {error:#}"
-            ));
-            result.retained_instance = self.retained_instance();
-            result.disposition = DeletionDisposition::Failed;
-            result.teardown_started = true;
             return result;
         }
 
         let generation = self.generation;
         let was_trashed = self.was_trashed;
-        let row_removed_checkpoint =
-            self.journal_path
-                .clone()
-                .zip(self.journal_entry.as_ref().map(|entry| {
-                    entry
-                        .with_kept_resources(kept_resources.clone())
-                        .with_phase(LifecyclePhase::RowRemoved)
-                }));
         let mut commit = None;
         let commit_result = self.storage.update(|instances, _groups| {
             let Some(index) = instances.iter().position(|instance| instance.id == id) else {
@@ -827,54 +620,38 @@ impl PurgeTransaction {
             let owns = instances[index]
                 .lifecycle_reservation_is_owned(LifecycleOperation::Purge, generation);
             if restored {
+                instances[index]
+                    .release_lifecycle_reservation_if_owned(LifecycleOperation::Purge, generation);
                 commit = Some((CompletionGate::KeptRestored, Some(instances[index].clone())));
-            } else if !owns || instances[index].status != Status::Deleting {
+            } else if !owns {
                 commit = Some((CompletionGate::Superseded, Some(instances[index].clone())));
             } else {
-                if let Some((path, checkpoint)) = &row_removed_checkpoint {
-                    crate::session::lifecycle_journal::update(path, checkpoint)?;
-                }
                 instances.remove(index);
                 commit = Some((CompletionGate::Proceed, None));
             }
             Ok(())
         });
+        self.lifecycle_lock = None;
         match commit_result {
             Err(error) => {
-                self.active = false;
                 result.success = false;
                 result.disposition = DeletionDisposition::Failed;
                 result.errors.push(format!(
                     "Session teardown completed, but sessions.json could not be updated: {error}"
                 ));
-                result.retained_instance = self.retained_instance();
-                result.teardown_started = true;
                 result
             }
             Ok(()) => {
                 self.active = false;
                 match commit {
                     Some((CompletionGate::Proceed, _)) => {
-                        if let Some((_, checkpoint)) = row_removed_checkpoint {
-                            self.journal_entry = Some(Box::new(checkpoint));
-                        }
                         result.disposition = DeletionDisposition::Removed;
-                        self.finalize_completed_journal(&kept_resources);
+                        self.finalize_journal_for_result(&result);
                         result
-                    }
-                    Some((CompletionGate::AlreadyGone, _)) => {
-                        self.finalize_completed_journal(&kept_resources);
-                        DeletionResult::rejected(
-                            id,
-                            DeletionDisposition::AlreadyGone,
-                            "Session was already removed by another process",
-                            None,
-                        )
                     }
                     Some((gate, retained)) => {
                         let mut gated = self.result_for_gate(gate, retained);
                         gated.teardown_started = true;
-                        gated.retained_instance = self.retained_instance();
                         gated.messages = result.messages;
                         gated.errors.extend(result.errors);
                         gated
@@ -889,54 +666,15 @@ impl PurgeTransaction {
             }
         }
     }
-
-    fn finalize_completed_journal(&mut self, kept_resources: &[String]) {
-        let (Some(path), Some(entry)) = (&self.journal_path, &self.journal_entry) else {
-            return;
-        };
-        if entry.phase != LifecyclePhase::RowRemoved {
-            tracing::warn!(
-                target: "session.delete",
-                path = %path.display(),
-                phase = ?entry.phase,
-                "purge row was removed without a durable terminal journal checkpoint"
-            );
-            return;
-        }
-        if kept_resources.is_empty() {
-            self.consume_journal();
-        } else {
-            let kept = entry
-                .with_kept_resources(kept_resources.to_vec())
-                .with_phase(LifecyclePhase::Kept);
-            if let Err(error) = crate::session::lifecycle_journal::update(path, &kept) {
-                tracing::warn!(
-                    target: "session.delete",
-                    path = %path.display(),
-                    error = %error,
-                    "kept sidecar lifecycle journal could not be finalized"
-                );
-            } else {
-                self.journal_entry = Some(Box::new(kept));
-                if let Err(error) = self.clear_runner_fence() {
-                    tracing::warn!(
-                        target: "session.delete",
-                        error = %error,
-                        "kept purge journal retained so recovery can retry clearing its ACP runner fence"
-                    );
-                }
-            }
-        }
-    }
     pub fn complete_with(
         self,
         after_teardown: impl FnOnce(&Instance) -> std::result::Result<(), String>,
     ) -> DeletionResult {
-        self.complete_inner(after_teardown)
+        self.complete_inner(after_teardown, false)
     }
 
     pub fn complete(self) -> DeletionResult {
-        self.complete_inner(|_| Ok(()))
+        self.complete_inner(|_| Ok(()), false)
     }
 }
 
@@ -950,21 +688,6 @@ impl CommittedPurge {
         mut self,
         purge_transcript: impl FnOnce(&Instance) -> Result<()>,
     ) -> DeletionResult {
-        if let Err(error) = stop_acp_runner_for_purge(&self.request.instance, self.generation) {
-            let mut result = DeletionResult::rejected(
-                self.request.session_id.clone(),
-                DeletionDisposition::Failed,
-                format!(
-                    "ACP runner exit could not be confirmed; purge resources were retained: {error:#}"
-                ),
-                self.storage.load().ok().and_then(|rows| {
-                    rows.into_iter()
-                        .find(|row| row.id == self.request.session_id)
-                }),
-            );
-            result.teardown_started = true;
-            return result;
-        }
         let mut result = perform_deletion_teardown_lifecycle_locked(&self.request);
         if result.success
             && self
@@ -981,8 +704,26 @@ impl CommittedPurge {
         }
         if !result.success {
             let id = self.request.session_id.clone();
+            let generation = self.generation;
+            let status_before = self.status_before;
+            if let Err(error) = self.storage.update(|instances, _groups| {
+                if let Some(stored) = instances.iter_mut().find(|instance| instance.id == id) {
+                    if stored.lifecycle_reservation_is_owned(LifecycleOperation::Purge, generation)
+                    {
+                        stored.status = status_before;
+                        stored.release_lifecycle_reservation_if_owned(
+                            LifecycleOperation::Purge,
+                            generation,
+                        );
+                    }
+                }
+                Ok(())
+            }) {
+                result.errors.push(format!(
+                    "Failed to release the retained session row after teardown failure: {error}"
+                ));
+            }
             result.disposition = DeletionDisposition::Failed;
-            result.teardown_started = true;
             result.retained_instance = self
                 .storage
                 .load()
@@ -991,259 +732,70 @@ impl CommittedPurge {
             return result;
         }
         let id = self.request.session_id.clone();
-        let kept_resources = kept_resources_from_messages(&self.request, &result.messages);
-        if let Err(error) = self.update_terminal_checkpoint(&kept_resources) {
-            result.success = false;
-            result.disposition = DeletionDisposition::Failed;
-            result.errors.push(format!(
-                "Session teardown completed, but its terminal journal checkpoint failed: {error:#}"
-            ));
-            result.teardown_started = true;
-            result.retained_instance = self
-                .storage
-                .load()
-                .ok()
-                .and_then(|rows| rows.into_iter().find(|instance| instance.id == id));
-            return result;
-        }
-        let generation = self.generation;
-        let was_trashed = self.request.instance.is_trashed();
-        let row_removed_checkpoint =
-            self.journal_path
-                .clone()
-                .zip(self.journal_entry.as_ref().map(|entry| {
-                    entry
-                        .with_kept_resources(kept_resources.clone())
-                        .with_phase(LifecyclePhase::RowRemoved)
-                }));
-        let mut gate = None;
-        let commit_result = self.storage.update(|instances, _groups| {
-            let Some(index) = instances.iter().position(|instance| instance.id == id) else {
-                gate = Some((CompletionGate::AlreadyGone, None));
-                return Ok(());
-            };
-            let restored = crate::session::claim::purge_restored_row_must_be_kept(
-                was_trashed,
-                instances[index].is_trashed(),
-            );
-            let owns = instances[index]
-                .lifecycle_reservation_is_owned(LifecycleOperation::Purge, generation);
-            if restored {
-                gate = Some((CompletionGate::KeptRestored, Some(instances[index].clone())));
-            } else if !owns || instances[index].status != Status::Deleting {
-                gate = Some((CompletionGate::Superseded, Some(instances[index].clone())));
-            } else {
-                if let Some((path, checkpoint)) = &row_removed_checkpoint {
-                    crate::session::lifecycle_journal::update(path, checkpoint)?;
-                }
-                instances.remove(index);
-                gate = Some((CompletionGate::Proceed, None));
-            }
+        match self.storage.update(|instances, _groups| {
+            instances.retain(|instance| instance.id != id);
             Ok(())
-        });
-        match commit_result {
+        }) {
+            Ok(()) => {
+                result.disposition = DeletionDisposition::Removed;
+                if let (Some(path), Some(entry)) = (&self.journal_path, &self.journal_entry) {
+                    let updated = entry.with_phase(LifecyclePhase::RowRemoved);
+                    if let Err(error) = crate::session::lifecycle_journal::update(path, &updated) {
+                        tracing::warn!(
+                            target: "session.delete",
+                            path = %path.display(),
+                            error = %error,
+                            "removed purge row but could not advance its lifecycle journal"
+                        );
+                    } else {
+                        self.journal_entry = Some(Box::new(updated));
+                    }
+                }
+                self.finalize_journal(&result);
+            }
             Err(error) => {
                 result.success = false;
                 result.disposition = DeletionDisposition::Failed;
                 result.errors.push(format!(
                     "Sidecar teardown completed, but sessions.json could not be updated: {error}"
                 ));
-                result.teardown_started = true;
-                result.retained_instance = self
-                    .storage
-                    .load()
-                    .ok()
-                    .and_then(|rows| rows.into_iter().find(|instance| instance.id == id));
-            }
-            Ok(()) => {
-                match gate {
-                    Some((CompletionGate::Proceed, _)) => {
-                        if let Some((_, checkpoint)) = row_removed_checkpoint {
-                            self.journal_entry = Some(Box::new(checkpoint));
-                        }
-                        result.disposition = DeletionDisposition::Removed;
-                        self.finalize_completed_journal(&kept_resources);
-                    }
-                    Some((CompletionGate::AlreadyGone, _)) => {
-                        result.disposition = DeletionDisposition::AlreadyGone;
-                        self.finalize_completed_journal(&kept_resources);
-                    }
-                    Some((other, retained)) => {
-                        let mut gated = DeletionResult::rejected(
-                            id.clone(),
-                            match other {
-                                CompletionGate::KeptRestored => DeletionDisposition::KeptRestored,
-                                CompletionGate::Superseded => DeletionDisposition::Busy,
-                                _ => unreachable!(),
-                            },
-                            "Session changed lifecycle state before purge bookkeeping completed",
-                            retained,
-                        );
-                        gated.teardown_started = true;
-                        gated.retained_instance =
-                            self.storage.load().ok().and_then(|rows| {
-                                rows.into_iter().find(|instance| instance.id == id)
-                            });
-                        gated.messages = result.messages;
-                        gated.errors.extend(result.errors);
-                        return gated;
-                    }
-                    None => {
-                        result.success = false;
-                        result.disposition = DeletionDisposition::Failed;
-                        result
-                            .errors
-                            .push("Purge commit produced no outcome".to_string());
-                        result.teardown_started = true;
-                        result.retained_instance =
-                            self.storage.load().ok().and_then(|rows| {
-                                rows.into_iter().find(|instance| instance.id == id)
-                            });
-                    }
-                }
             }
         }
         result
     }
+}
 
-    fn update_terminal_checkpoint(&mut self, kept_resources: &[String]) -> Result<()> {
-        let (Some(path), Some(_entry)) = (&self.journal_path, &self.journal_entry) else {
-            return Ok(());
-        };
-        let current = crate::session::lifecycle_journal::read_deletion(path)?
-            .ok_or_else(|| anyhow::anyhow!("purge lifecycle journal was replaced"))?;
-        anyhow::ensure!(
-            current.session_id == self.request.session_id
-                && current.source_profile == self.request.instance.source_profile
-                && current.generation == self.generation,
-            "purge lifecycle journal is no longer owned by this generation"
-        );
-        let updated = current
-            .with_kept_resources(kept_resources.to_vec())
-            .with_phase(LifecyclePhase::TeardownComplete);
-        crate::session::lifecycle_journal::update(path, &updated)?;
-        self.journal_entry = Some(Box::new(updated));
-        Ok(())
-    }
-
-    fn finalize_completed_journal(&mut self, kept_resources: &[String]) {
+impl CommittedPurge {
+    fn finalize_journal(&mut self, result: &DeletionResult) {
         let (Some(path), Some(entry)) = (&self.journal_path, &self.journal_entry) else {
             return;
         };
-        if entry.phase != LifecyclePhase::RowRemoved {
-            tracing::warn!(
-                target: "session.delete",
-                path = %path.display(),
-                phase = ?entry.phase,
-                "purge row was removed without a durable terminal journal checkpoint"
-            );
-            return;
-        }
-        if kept_resources.is_empty() {
-            self.consume_journal();
-        } else {
-            let kept = entry
-                .with_kept_resources(kept_resources.to_vec())
+        let kept_resources = kept_resources_from_messages(&self.request, &result.messages);
+        if !kept_resources.is_empty() {
+            let updated = entry
+                .with_kept_resources(kept_resources)
                 .with_phase(LifecyclePhase::Kept);
-            if let Err(error) = crate::session::lifecycle_journal::update(path, &kept) {
+            if let Err(error) = crate::session::lifecycle_journal::update(path, &updated) {
                 tracing::warn!(
                     target: "session.delete",
                     path = %path.display(),
                     error = %error,
-                    "kept sidecar lifecycle journal could not be finalized"
+                    "kept sidecar lifecycle journal could not be updated"
                 );
             } else {
-                self.journal_entry = Some(Box::new(kept));
-                if let Err(error) = self.clear_runner_fence() {
-                    tracing::warn!(
-                        target: "session.delete",
-                        error = %error,
-                        "kept purge journal retained so recovery can retry clearing its ACP runner fence"
-                    );
-                }
+                self.journal_entry = Some(Box::new(updated));
             }
-        }
-    }
-
-    fn consume_journal(&mut self) {
-        let Some(path) = self.journal_path.as_deref() else {
-            return;
-        };
-        let current = match crate::session::lifecycle_journal::read_deletion(path) {
-            Ok(Some(current)) => current,
-            Ok(None) => {
-                self.journal_path = None;
-                self.journal_entry = None;
-                return;
-            }
-            Err(error) => {
+        } else if result.success {
+            let path = self.journal_path.take().expect("journal path was checked");
+            if let Err(error) = crate::session::lifecycle_journal::consume(&path) {
                 tracing::warn!(
                     target: "session.delete",
                     path = %path.display(),
                     error = %error,
-                    "purge journal could not be verified before cleanup"
+                    "completed purge could not consume its lifecycle journal"
                 );
-                return;
             }
-        };
-        if current.session_id != self.request.session_id
-            || current.source_profile != self.request.instance.source_profile
-            || current.generation != self.generation
-        {
-            self.journal_path = None;
-            self.journal_entry = None;
-            return;
         }
-        if current.phase.teardown_started()
-            && !matches!(
-                current.phase,
-                LifecyclePhase::RowRemoved | LifecyclePhase::Kept
-            )
-        {
-            tracing::warn!(
-                target: "session.delete",
-                path = %path.display(),
-                "irreversible purge journal retained for recovery"
-            );
-            return;
-        }
-        if let Err(error) = self.clear_runner_fence() {
-            tracing::warn!(
-                target: "session.delete",
-                path = %path.display(),
-                error = %error,
-                "purge journal retained so recovery can retry clearing its ACP runner fence"
-            );
-            return;
-        }
-        if let Err(error) = crate::session::lifecycle_journal::consume(path) {
-            tracing::warn!(
-                target: "session.delete",
-                path = %path.display(),
-                error = %error,
-                "completed purge could not consume its lifecycle journal"
-            );
-        }
-    }
-
-    fn clear_runner_fence(&self) -> Result<()> {
-        if !self.request.instance.is_structured() {
-            return Ok(());
-        }
-        if let Err(error) = crate::process::worker_registry::clear_purge_fence_if_owned(
-            &self.request.session_id,
-            &self.request.instance.source_profile,
-            self.generation,
-        ) {
-            tracing::warn!(
-                target: "session.delete",
-                session = %self.request.session_id,
-                error = %error,
-                "ACP runner purge fence could not be cleared"
-            );
-            return Err(error);
-        }
-        Ok(())
     }
 }
 
@@ -1256,114 +808,27 @@ impl Drop for PurgeTransaction {
         let id = self.request.session_id.clone();
         let generation = self.generation;
         let status_before = self.status_before;
-        let structured = self.request.instance.is_structured();
-        let owner_lock = self.owner_lock.take();
-        let journal_path = self.journal_path.clone();
         let _ = std::thread::Builder::new()
             .name("aoe-purge-reservation-release".to_string())
             .spawn(move || {
-                let _owner_lock = owner_lock;
                 let Ok(storage) = Storage::open_unwatched(&profile) else {
                     return;
                 };
                 let Ok(_lifecycle_lock) = storage.acquire_instance_lifecycle_lock(&id) else {
                     return;
                 };
-                let Some(path) = journal_path.as_deref() else {
-                    return;
-                };
-                let matches_owner =
-                    |entry: &crate::session::lifecycle_journal::LifecycleJournalEntry| {
-                        entry.session_id == id
-                            && entry.source_profile == profile
-                            && entry.generation == generation
-                    };
-                let Ok(Some(entry)) = crate::session::lifecycle_journal::read_deletion(path) else {
-                    return;
-                };
-                if !matches_owner(&entry) || entry.phase.teardown_started() {
-                    return;
-                }
-                let _ = crate::session::lifecycle_journal::update(
-                    path,
-                    &entry.with_phase(LifecyclePhase::Abandoned),
-                );
-                let still_reversible = crate::session::lifecycle_journal::read_deletion(path)
-                    .ok()
-                    .flatten()
-                    .is_some_and(|current| {
-                        matches_owner(&current) && !current.phase.teardown_started()
-                    });
-                if !still_reversible {
-                    return;
-                }
-                let update = storage.update(|instances, _groups| {
+                let _ = storage.update(|instances, _groups| {
                     if let Some(stored) = instances.iter_mut().find(|instance| instance.id == id) {
-                        if stored
-                            .lifecycle_reservation_is_owned(LifecycleOperation::Purge, generation)
-                        {
-                            stored.finish_owned_purge(generation, status_before)?;
-                        }
+                        stored.status = status_before;
+                        stored.release_lifecycle_reservation_if_owned(
+                            LifecycleOperation::Purge,
+                            generation,
+                        );
                     }
                     Ok(())
                 });
-                if update.is_ok() {
-                    let still_reversible = crate::session::lifecycle_journal::read_deletion(path)
-                        .ok()
-                        .flatten()
-                        .is_some_and(|current| {
-                            matches_owner(&current) && !current.phase.teardown_started()
-                        });
-                    if !still_reversible {
-                        return;
-                    }
-                    if structured
-                        && crate::process::worker_registry::clear_purge_fence_if_owned(
-                            &id, &profile, generation,
-                        )
-                        .is_err()
-                    {
-                        return;
-                    }
-                    let _ = crate::session::lifecycle_journal::consume(path);
-                }
             });
     }
-}
-pub(crate) fn abandon_purge_intents_lifecycle_locked(storage: &Storage, id: &str) -> Result<()> {
-    let scan = crate::session::lifecycle_journal::scan([storage.sessions_path().to_path_buf()]);
-    anyhow::ensure!(
-        scan.unreadable_dirs.is_empty(),
-        "purge intents cannot be enumerated"
-    );
-    for (path, parsed) in scan.entries {
-        let key = crate::session::lifecycle_journal::filename_key(&path)?;
-        let entry = match parsed {
-            Ok(entry) => entry,
-            Err(_) if key.session_id() != id => continue,
-            Err(error) => anyhow::bail!("cannot abandon session purge intent: {error}"),
-        };
-        anyhow::ensure!(
-            key.session_id() == entry.session_id
-                && key.generation == entry.generation
-                && entry.session_id == entry.instance.id
-                && entry.source_profile == storage.profile()
-                && paths_refer_to_same_sessions_file(&entry.sessions_path, storage.sessions_path()),
-            "purge intent identity is ambiguous"
-        );
-        if entry.session_id == id
-            && !matches!(
-                entry.phase,
-                LifecyclePhase::Abandoned | LifecyclePhase::Kept
-            )
-        {
-            crate::session::lifecycle_journal::update(
-                &path,
-                &entry.with_phase(LifecyclePhase::Abandoned),
-            )?;
-        }
-    }
-    Ok(())
 }
 
 pub fn execute_deletion(request: DeletionRequest) -> DeletionResult {
@@ -1394,7 +859,6 @@ pub fn execute_deletion(request: DeletionRequest) -> DeletionResult {
 
 pub fn recover_lifecycle_journals_once() -> Result<()> {
     use crate::session::lifecycle_journal::LifecycleJournalEntry;
-    crate::session::profile_rename::recover_once()?;
 
     let profiles = crate::session::list_profiles()?;
     let mut storages = std::collections::HashMap::new();
@@ -1428,39 +892,20 @@ pub fn recover_lifecycle_journals_once() -> Result<()> {
         );
     }
 
-    let mut blocked_sessions: std::collections::HashMap<
-        PathBuf,
-        std::collections::HashSet<String>,
-    > = std::collections::HashMap::new();
     let mut entries: Vec<(PathBuf, LifecycleJournalEntry)> = Vec::new();
     for (path, parsed) in scan.entries {
-        let key = crate::session::lifecycle_journal::filename_key(&path);
         match parsed {
-            Ok(entry)
-                if key.as_ref().is_ok_and(|key| {
-                    key.session_id() == entry.session_id && key.generation == entry.generation
-                }) =>
-            {
-                entries.push((path, entry))
-            }
-            Ok(_) => {
+            Ok(entry) => entries.push((path, entry)),
+            Err(error) => {
                 if let Some(dir) = path.parent() {
                     blocked_dirs.insert(dir.to_path_buf());
                 }
-                tracing::error!(target: "session.delete_recovery", path = %path.display(), "journal filename and payload identity disagree");
-            }
-            Err(error) => {
-                if let Some(dir) = path.parent() {
-                    if let Ok(key) = key {
-                        blocked_sessions
-                            .entry(dir.to_path_buf())
-                            .or_default()
-                            .insert(key.session_id().to_owned());
-                    } else {
-                        blocked_dirs.insert(dir.to_path_buf());
-                    }
-                }
-                tracing::error!(target: "session.delete_recovery", path = %path.display(), %error, "unreadable lifecycle evidence retained");
+                tracing::error!(
+                    target: "session.delete_recovery",
+                    path = %path.display(),
+                    %error,
+                    "unreadable lifecycle journal blocks recovery for this profile"
+                );
             }
         }
     }
@@ -1472,54 +917,46 @@ pub fn recover_lifecycle_journals_once() -> Result<()> {
             .then_with(|| right.1.created_at_epoch_ms.cmp(&left.1.created_at_epoch_ms))
     });
 
-    #[cfg(test)]
-    BEFORE_LIFECYCLE_ENTRY_RECOVERY.with(|hook| {
-        if let Some(hook) = hook.borrow_mut().take() {
-            hook();
-        }
-    });
-    let mut handled_sessions = std::collections::HashSet::new();
+    let mut latest_sessions = std::collections::HashSet::new();
     for (path, entry) in entries {
         let Some(dir) = path.parent() else {
             continue;
         };
-        if blocked_dirs.contains(dir)
-            || blocked_sessions
-                .get(dir)
-                .is_some_and(|ids| ids.contains(entry.session_id.as_str()))
-        {
+        if blocked_dirs.contains(dir) {
             continue;
         }
         let key = (entry.source_profile.clone(), entry.session_id.clone());
-        if handled_sessions.contains(&key) {
+        if !latest_sessions.insert(key) {
+            if let Err(error) = crate::session::lifecycle_journal::consume(&path) {
+                tracing::warn!(
+                    target: "session.delete_recovery",
+                    path = %path.display(),
+                    %error,
+                    "superseded lifecycle journal could not be removed"
+                );
+            }
+            continue;
+        }
+        if entry.phase == LifecyclePhase::Kept {
             continue;
         }
         let Some(storage) = storages.get(&entry.source_profile) else {
             continue;
         };
         match recover_lifecycle_entry(&path, &entry, storage) {
-            Ok(RecoveryOutcome::Settled) => {
-                handled_sessions.insert(key);
-                tracing::info!(
-                    target: "session.delete_recovery",
-                    profile = %entry.source_profile,
-                    session_id = %entry.session_id,
-                    "replayed interrupted session purge"
-                );
-            }
-            Ok(RecoveryOutcome::Terminal) => {
-                handled_sessions.insert(key);
-            }
-            Ok(RecoveryOutcome::Unprocessed) => {}
-            Err(error) => {
-                handled_sessions.insert(key);
-                tracing::warn!(
-                    target: "session.delete_recovery",
-                    path = %path.display(),
-                    error = %error,
-                    "interrupted session purge remains journaled for retry"
-                );
-            }
+            Ok(true) => tracing::info!(
+                target: "session.delete_recovery",
+                profile = %entry.source_profile,
+                session_id = %entry.session_id,
+                "replayed interrupted session purge"
+            ),
+            Ok(false) => {}
+            Err(error) => tracing::warn!(
+                target: "session.delete_recovery",
+                path = %path.display(),
+                error = %error,
+                "interrupted session purge remains journaled for retry"
+            ),
         }
     }
     Ok(())
@@ -1551,386 +988,116 @@ pub fn start_lifecycle_recovery_worker() -> Result<()> {
     }
 }
 
-#[derive(Debug, PartialEq, Eq)]
-enum RecoveryOutcome {
-    Unprocessed,
-    Settled,
-    Terminal,
-}
-
-struct RecoverySiblings {
-    newer_terminal: bool,
-    same_session: bool,
-}
-
-fn inspect_recovery_siblings(
-    path: &Path,
-    current: &crate::session::lifecycle_journal::LifecycleJournalEntry,
-    storage: &Storage,
-) -> Result<RecoverySiblings> {
-    let mut result = RecoverySiblings {
-        newer_terminal: false,
-        same_session: false,
-    };
-    let dir = path.parent().context("journal has no parent directory")?;
-    for item in std::fs::read_dir(dir)? {
-        let sibling_path = item?.path();
-        if sibling_path == path
-            || sibling_path
-                .extension()
-                .is_none_or(|extension| extension != "json")
-        {
-            continue;
-        }
-        let key = crate::session::lifecycle_journal::filename_key(&sibling_path)?;
-        let sibling = match crate::session::lifecycle_journal::read_deletion(&sibling_path) {
-            Ok(Some(sibling)) => sibling,
-            Ok(None) => continue,
-            Err(_) if key.session_id() != current.session_id => continue,
-            Err(error) => return Err(error),
-        };
-        anyhow::ensure!(
-            key.session_id() == sibling.session_id && key.generation == sibling.generation,
-            "sibling journal filename and payload identity disagree"
-        );
-        anyhow::ensure!(
-            sibling.session_id == sibling.instance.id
-                && sibling.source_profile == storage.profile()
-                && paths_refer_to_same_sessions_file(
-                    &sibling.sessions_path,
-                    storage.sessions_path()
-                ),
-            "sibling journal identity does not match its source profile"
-        );
-        if sibling.session_id != current.session_id {
-            continue;
-        }
-        anyhow::ensure!(
-            sibling.generation != current.generation,
-            "duplicate lifecycle generation"
-        );
-        result.same_session = true;
-        result.newer_terminal |=
-            sibling.generation > current.generation && sibling.phase.teardown_complete();
-    }
-    Ok(result)
-}
-
-const AGENT_STORE_KEPT_PREFIX: &str = "Agent store kept (";
-const AGENT_STORE_PATHS_MARKER: &str = " [agent-store-paths:";
-
-fn expected_kept_agent_store_paths(instance: &Instance) -> Option<Vec<PathBuf>> {
-    if !instance.is_sandboxed()
-        || instance.sandbox_store_generation
-            < crate::session::config::container_config::CURRENT_SANDBOX_STORE_GENERATION
-    {
-        return None;
-    }
-    let home = dirs::home_dir()?;
-    let config =
-        crate::session::config::profile_config::resolve_config(&instance.effective_profile())
-            .ok()?;
-    let declared = config.session.agent_config_dir_for(&instance.tool, &home);
-    let capture_agent = instance.resolved_agent()?;
-    let capture_path = crate::session::config::container_config::sandbox_store_dir(
-        capture_agent.name,
-        &home,
-        declared.as_deref(),
-        &instance.id,
-    )
-    .ok()??;
-    let removal_agent = crate::session::config::container_config::resolve_active_agent(
-        &instance.tool,
-        Some(instance.get_tool_command()),
-        &config.session,
-    )?;
-    let paths = crate::session::config::container_config::sandbox_store_dirs(
-        removal_agent.name,
-        &home,
-        declared.as_deref(),
-        &instance.id,
-    )
-    .ok()?;
-    (!paths.is_empty() && paths.contains(&capture_path)).then_some(paths)
-}
-
-fn kept_agent_store_resource(message: &str, instance: &Instance) -> String {
-    let Some(paths) = expected_kept_agent_store_paths(instance) else {
-        return message.to_string();
-    };
-    let Some(paths) = paths
-        .iter()
-        .map(|path| path.to_str())
-        .collect::<Option<Vec<_>>>()
-    else {
-        return message.to_string();
-    };
-    let Ok(paths) = serde_json::to_string(&paths) else {
-        return message.to_string();
-    };
-    format!("{message}{AGENT_STORE_PATHS_MARKER}{paths}]")
-}
-
-fn recorded_kept_agent_store_paths(resource: &str, instance: &Instance) -> Option<Vec<PathBuf>> {
-    if !resource.starts_with(AGENT_STORE_KEPT_PREFIX) {
-        return None;
-    }
-    let encoded = resource
-        .rsplit_once(AGENT_STORE_PATHS_MARKER)?
-        .1
-        .strip_suffix(']')?;
-    let recorded: Vec<String> = serde_json::from_str(encoded).ok()?;
-    let recorded: Vec<PathBuf> = recorded.into_iter().map(PathBuf::from).collect();
-    (expected_kept_agent_store_paths(instance).as_ref() == Some(&recorded)).then_some(recorded)
-}
-
-fn kept_directory_is_reclaimed(path: &Path) -> bool {
-    if !path.is_absolute()
-        || path.components().any(|component| {
-            matches!(
-                component,
-                std::path::Component::ParentDir | std::path::Component::CurDir
-            )
-        })
-    {
-        return false;
-    }
-    if !std::fs::symlink_metadata(path)
-        .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
-    {
-        return false;
-    }
-    path.ancestors()
-        .skip(1)
-        .all(|ancestor| match std::fs::symlink_metadata(ancestor) {
-            Ok(metadata) => metadata.is_dir() && !metadata.file_type().is_symlink(),
-            Err(error) => error.kind() == std::io::ErrorKind::NotFound,
-        })
-}
-
-fn kept_resources_are_reclaimed(
-    entry: &crate::session::lifecycle_journal::LifecycleJournalEntry,
-) -> bool {
-    !entry.kept_resources.is_empty()
-        && entry.kept_resources.iter().all(|resource| {
-            if resource.starts_with(AGENT_STORE_KEPT_PREFIX) {
-                return recorded_kept_agent_store_paths(resource, &entry.instance).is_some_and(
-                    |paths| paths.iter().all(|path| kept_directory_is_reclaimed(path)),
-                );
-            }
-            let path = if let Some(scratch) = resource.strip_prefix("Scratch directory kept at: ") {
-                if !entry.instance.scratch || scratch != entry.instance.project_path {
-                    return false;
-                }
-                Path::new(scratch)
-            } else if resource.starts_with("Workspace directory kept:") {
-                let Some(workspace) = entry.instance.workspace_info.as_ref() else {
-                    return false;
-                };
-                let Some(suffix) = resource
-                    .strip_suffix(']')
-                    .and_then(|text| text.strip_suffix(workspace.workspace_dir.as_str()))
-                else {
-                    return false;
-                };
-                if !suffix.ends_with(" [") {
-                    return false;
-                }
-                Path::new(&workspace.workspace_dir)
-            } else {
-                return false;
-            };
-            kept_directory_is_reclaimed(path)
-        })
-}
 fn recover_lifecycle_entry(
     path: &Path,
-    scanned_entry: &crate::session::lifecycle_journal::LifecycleJournalEntry,
+    entry: &crate::session::lifecycle_journal::LifecycleJournalEntry,
     storage: &Storage,
-) -> Result<RecoveryOutcome> {
-    crate::session::profile_rename::ensure_profile_available(storage.profile())?;
-    let Some(_owner_lock) = storage.try_acquire_purge_owner_lock(&scanned_entry.session_id)? else {
-        return Ok(RecoveryOutcome::Unprocessed);
-    };
-    crate::session::profile_rename::ensure_profile_available(storage.profile())?;
-    let Some(lifecycle_lock) =
-        storage.try_acquire_instance_lifecycle_lock(&scanned_entry.session_id)?
-    else {
-        return Ok(RecoveryOutcome::Unprocessed);
-    };
-    let mut lifecycle_lock = Some(lifecycle_lock);
-
-    let Some(mut current_entry) = crate::session::lifecycle_journal::read_deletion(path)? else {
-        return Ok(RecoveryOutcome::Unprocessed);
-    };
+) -> Result<bool> {
     anyhow::ensure!(
-        current_entry.session_id == current_entry.instance.id,
+        entry.session_id == entry.instance.id,
         "journal session id does not match its instance snapshot"
     );
     anyhow::ensure!(
-        current_entry.source_profile == storage.profile(),
+        entry.source_profile == storage.profile(),
         "journal profile does not match the opened profile"
     );
-    if current_entry.session_id != scanned_entry.session_id
-        || current_entry.generation != scanned_entry.generation
-    {
-        return Ok(RecoveryOutcome::Unprocessed);
-    }
-    crate::session::validate_instance_id(&current_entry.session_id)
+    crate::session::validate_instance_id(&entry.session_id)
         .context("journal contains an invalid session id")?;
     anyhow::ensure!(
-        paths_refer_to_same_sessions_file(&current_entry.sessions_path, storage.sessions_path()),
+        paths_refer_to_same_sessions_file(&entry.sessions_path, storage.sessions_path()),
         "journal sessions path does not match its source profile"
     );
-    if current_entry.phase == LifecyclePhase::Kept {
-        clear_recovery_fence(&current_entry)?;
-        if kept_resources_are_reclaimed(&current_entry)
-            && !inspect_recovery_siblings(path, &current_entry, storage)?.same_session
+
+    let id = entry.session_id.as_str();
+    let Some(lifecycle_lock) = storage.try_acquire_instance_lifecycle_lock(id)? else {
+        return Ok(false);
+    };
+    let now = Utc::now();
+    if let Some(stored) = storage.load()?.into_iter().find(|row| row.id == id) {
+        if crate::session::claim::purge_restored_row_must_be_kept(
+            entry.instance.is_trashed(),
+            stored.is_trashed(),
+        ) || stored.lifecycle_generation > entry.generation
         {
-            consume_lifecycle_journal_if_owned(path, &current_entry)?;
+            crate::session::lifecycle_journal::consume(path)?;
+            return Ok(false);
         }
-        return Ok(RecoveryOutcome::Terminal);
-    }
-    if inspect_recovery_siblings(path, &current_entry, storage)?.newer_terminal {
-        return Ok(RecoveryOutcome::Terminal);
-    }
-    if current_entry.phase == LifecyclePhase::Abandoned {
-        abandon_recovery_entry(path, &current_entry, storage)?;
-        return Ok(RecoveryOutcome::Unprocessed);
-    }
-
-    let id = current_entry.session_id.clone();
-    let mut owners = session_owner_profiles(&id)?;
-    let foreign_owner = owners.iter().any(|profile| profile != storage.profile());
-    if foreign_owner
-        || owners
-            .iter()
-            .filter(|profile| *profile == storage.profile())
-            .count()
-            > 1
-    {
-        abandon_recovery_entry(path, &current_entry, storage)?;
-        return Ok(RecoveryOutcome::Unprocessed);
-    }
-
-    let mut row_present = owners.iter().any(|profile| profile == storage.profile());
-    if !row_present && !current_entry.phase.teardown_started() {
-        abandon_recovery_entry(path, &current_entry, storage)?;
-        return Ok(RecoveryOutcome::Unprocessed);
-    }
-    if !row_present
-        && matches!(
-            current_entry.phase,
-            LifecyclePhase::TeardownStarted | LifecyclePhase::TeardownComplete
-        )
-    {
-        restore_missing_deleting_row(&current_entry, storage)?;
-        row_present = true;
-        if current_entry.instance.is_structured() {
-            crate::process::worker_registry::fence_for_purge(
-                &id,
-                &current_entry.source_profile,
-                current_entry.generation,
-            )?;
+        if stored.has_fresh_lifecycle_reservation(now) {
+            if stored
+                .lifecycle_reservation
+                .as_ref()
+                .is_some_and(|reservation| reservation.generation > entry.generation)
+            {
+                crate::session::lifecycle_journal::consume(path)?;
+            }
+            return Ok(false);
         }
     }
 
+    let mut row_present = false;
+    let mut superseded = false;
+    let mut current_entry = entry.clone();
     let mut current_path = path.to_path_buf();
-    if row_present {
-        let stored = storage
-            .load()?
-            .into_iter()
-            .find(|row| row.id == id)
-            .ok_or_else(|| {
-                anyhow::anyhow!("profile owner disappeared while purge lock was held")
-            })?;
-        if stored.status != Status::Deleting
-            || crate::session::claim::purge_restored_row_must_be_kept(
-                current_entry.instance.is_trashed(),
-                stored.is_trashed(),
-            )
-            || !stored
-                .lifecycle_reservation_is_owned(LifecycleOperation::Purge, current_entry.generation)
+    storage.update(|instances, _groups| {
+        let Some(stored) = instances.iter_mut().find(|row| row.id == id) else {
+            return Ok(());
+        };
+        if crate::session::claim::purge_restored_row_must_be_kept(
+            entry.instance.is_trashed(),
+            stored.is_trashed(),
+        ) || stored.lifecycle_generation > entry.generation
         {
-            abandon_recovery_entry(path, &current_entry, storage)?;
-            return Ok(RecoveryOutcome::Unprocessed);
+            superseded = true;
+            return Ok(());
         }
         if stored.has_fresh_lifecycle_reservation(Utc::now()) {
-            return Ok(RecoveryOutcome::Unprocessed);
+            return Ok(());
         }
 
-        let old_entry = current_entry.clone();
-        let mut next_entry = current_entry.clone();
-        let mut next_path = current_path.clone();
-        let mut superseded = false;
-        storage.update(|instances, _groups| {
-            let Some(stored) = instances.iter_mut().find(|row| row.id == id) else {
-                superseded = true;
-                return Ok(());
-            };
-            if stored.status != Status::Deleting
-                || !stored
-                    .lifecycle_reservation_is_owned(LifecycleOperation::Purge, old_entry.generation)
-            {
-                superseded = true;
-                return Ok(());
-            }
-            let generation = stored.try_acquire_lifecycle_reservation(
-                LifecycleOperation::Purge,
-                Instance::LIFECYCLE_RESERVATION_TTL,
-                Utc::now(),
-            )?;
-            next_entry = old_entry.with_generation(generation);
-            next_entry.instance = stored.clone();
-            next_path = crate::session::lifecycle_journal::record(&next_entry)?;
-            Ok(())
-        })?;
-        if superseded {
-            abandon_recovery_entry(path, &old_entry, storage)?;
-            return Ok(RecoveryOutcome::Unprocessed);
-        }
-        current_entry = next_entry;
-        current_path = next_path;
-        if current_path != path {
-            if old_entry.phase.teardown_started() {
-                consume_superseded_lifecycle_journal_if_owned(
-                    path,
-                    &old_entry,
-                    &current_path,
-                    &current_entry,
-                )?;
-            } else {
-                consume_lifecycle_journal_if_owned(path, &old_entry)?;
-            }
-        }
-    }
-
-    if current_entry.instance.is_structured() {
-        crate::process::worker_registry::fence_for_purge(
-            &id,
-            &current_entry.source_profile,
-            current_entry.generation,
+        let generation = stored.try_acquire_lifecycle_reservation(
+            LifecycleOperation::Purge,
+            Instance::LIFECYCLE_RESERVATION_TTL,
+            Utc::now(),
         )?;
+        if generation != entry.generation {
+            current_entry = entry.with_generation(generation);
+            current_path = crate::session::lifecycle_journal::record(&current_entry)?;
+        }
+        stored.status = Status::Deleting;
+        row_present = true;
+        Ok(())
+    })?;
+    if superseded {
+        crate::session::lifecycle_journal::consume(path)?;
+        return Ok(false);
     }
+    if row_present && current_path != path {
+        if let Err(error) = crate::session::lifecycle_journal::consume(path) {
+            tracing::warn!(
+                target: "session.delete_recovery",
+                path = %path.display(),
+                %error,
+                "older lifecycle journal could not be removed after the newer intent was recorded"
+            );
+        }
+    }
+    let generation = current_entry.generation;
+    let mut lifecycle_lock = Some(lifecycle_lock);
 
-    stop_acp_runner_for_purge(&current_entry.instance, current_entry.generation)?;
-
-    let replayed_hooks = !current_entry.phase.hooks_are_complete();
-    if replayed_hooks {
+    if !current_entry.phase.hooks_are_complete() {
         current_entry = current_entry.with_phase(LifecyclePhase::HooksStarted);
         crate::session::lifecycle_journal::update(&current_path, &current_entry)?;
-        let generation = current_entry.generation;
         let heartbeat = if row_present {
             match ReservationHeartbeat::start(
                 storage,
-                &id,
+                id,
                 LifecycleOperation::Purge,
                 generation,
                 Duration::from_secs(60),
             ) {
                 Ok(heartbeat) => Some(heartbeat),
                 Err(error) => {
-                    abandon_recovery_entry(&current_path, &current_entry, storage)?;
+                    release_journal_reservation(storage, id, generation, entry.status_before)?;
                     return Err(error);
                 }
             }
@@ -1942,392 +1109,131 @@ fn recover_lifecycle_entry(
         }
         let mut instance = current_entry.instance.clone();
         instance.source_profile = current_entry.source_profile.clone();
-        run_on_destroy_hooks(&instance, true);
+        run_on_destroy_hooks(&instance, current_entry.detach_hooks);
         if let Some(heartbeat) = heartbeat {
             heartbeat.stop();
         }
         if row_present {
-            lifecycle_lock = storage.try_acquire_instance_lifecycle_lock(&id)?;
-            if lifecycle_lock.is_none() {
-                return Ok(RecoveryOutcome::Unprocessed);
+            lifecycle_lock = Some(storage.acquire_instance_lifecycle_lock(id)?);
+        }
+        if let Some(stored) = storage.load()?.into_iter().find(|row| row.id == id) {
+            if !stored.lifecycle_reservation_is_owned(LifecycleOperation::Purge, generation) {
+                if stored.lifecycle_generation > generation {
+                    crate::session::lifecycle_journal::consume(&current_path)?;
+                }
+                return Ok(false);
             }
-        }
-        let Some(latest) = crate::session::lifecycle_journal::read_deletion(&current_path)? else {
-            return Ok(RecoveryOutcome::Unprocessed);
-        };
-        if latest.session_id != current_entry.session_id
-            || latest.source_profile != current_entry.source_profile
-            || latest.generation != current_entry.generation
-        {
-            return Ok(RecoveryOutcome::Unprocessed);
-        }
-        current_entry = latest;
-        if current_entry.phase == LifecyclePhase::Kept
-            || inspect_recovery_siblings(&current_path, &current_entry, storage)?.newer_terminal
-        {
-            return Ok(RecoveryOutcome::Terminal);
-        }
-        owners = session_owner_profiles(&id)?;
-        if owners.iter().any(|profile| profile != storage.profile())
-            || owners
-                .iter()
-                .filter(|profile| *profile == storage.profile())
-                .count()
-                > 1
-        {
-            abandon_recovery_entry(&current_path, &current_entry, storage)?;
-            return Ok(RecoveryOutcome::Unprocessed);
-        }
-        row_present = owners.iter().any(|profile| profile == storage.profile());
-        if row_present {
-            let stored = storage
-                .load()?
-                .into_iter()
-                .find(|row| row.id == id)
-                .ok_or_else(|| anyhow::anyhow!("profile owner disappeared during hook replay"))?;
-            if stored.status != Status::Deleting
-                || crate::session::claim::purge_restored_row_must_be_kept(
-                    current_entry.instance.is_trashed(),
-                    stored.is_trashed(),
-                )
-                || !stored.lifecycle_reservation_is_owned(
-                    LifecycleOperation::Purge,
-                    current_entry.generation,
-                )
-            {
-                abandon_recovery_entry(&current_path, &current_entry, storage)?;
-                return Ok(RecoveryOutcome::Unprocessed);
-            }
+        } else {
+            row_present = false;
         }
         current_entry = current_entry.with_phase(LifecyclePhase::HooksComplete);
         crate::session::lifecycle_journal::update(&current_path, &current_entry)?;
     }
 
-    owners = session_owner_profiles(&id)?;
-    if owners.iter().any(|profile| profile != storage.profile())
-        || owners
-            .iter()
-            .filter(|profile| *profile == storage.profile())
-            .count()
-            > 1
-    {
-        abandon_recovery_entry(&current_path, &current_entry, storage)?;
-        return Ok(RecoveryOutcome::Unprocessed);
-    }
-    row_present = owners.iter().any(|profile| profile == storage.profile());
+    current_entry = current_entry.with_phase(LifecyclePhase::TeardownStarted);
+    crate::session::lifecycle_journal::update(&current_path, &current_entry)?;
     if row_present {
-        let stored = storage
-            .load()?
-            .into_iter()
-            .find(|row| row.id == id)
-            .ok_or_else(|| anyhow::anyhow!("profile owner disappeared before teardown"))?;
-        if stored.status != Status::Deleting
-            || crate::session::claim::purge_restored_row_must_be_kept(
+        let current = storage.load()?.into_iter().find(|row| row.id == id);
+        if let Some(stored) = current {
+            if crate::session::claim::purge_restored_row_must_be_kept(
                 current_entry.instance.is_trashed(),
                 stored.is_trashed(),
-            )
-            || !stored
-                .lifecycle_reservation_is_owned(LifecycleOperation::Purge, current_entry.generation)
-        {
-            abandon_recovery_entry(&current_path, &current_entry, storage)?;
-            return Ok(RecoveryOutcome::Unprocessed);
-        }
-    } else if !current_entry.phase.teardown_started() {
-        abandon_recovery_entry(&current_path, &current_entry, storage)?;
-        return Ok(RecoveryOutcome::Unprocessed);
-    }
-
-    if !current_entry.phase.teardown_complete() {
-        if replayed_hooks {
-            stop_acp_runner_for_purge(&current_entry.instance, current_entry.generation)?;
-        }
-        current_entry = current_entry.with_phase(LifecyclePhase::TeardownStarted);
-        crate::session::lifecycle_journal::update(&current_path, &current_entry)?;
-        let mut request_instance = current_entry.instance.clone();
-        request_instance.source_profile = current_entry.source_profile.clone();
-        let request = DeletionRequest {
-            session_id: id.clone(),
-            instance: request_instance.clone(),
-            delete_worktree: current_entry.delete_worktree,
-            delete_branch: current_entry.delete_branch,
-            delete_sandbox: current_entry.delete_sandbox,
-            force_delete: current_entry.force_delete,
-            detach_hooks: true,
-            keep_scratch: current_entry.keep_scratch,
-        };
-        let result = perform_deletion_teardown_lifecycle_locked(&request);
-        if !result.success {
-            let error = result.errors.join("; ");
-            abandon_recovery_entry(&current_path, &current_entry, storage)?;
-            anyhow::bail!("lifecycle teardown failed: {error}");
-        }
-        if current_entry.purge_acp_transcript {
-            if let Err(error) = purge_acp_transcript(&request_instance) {
-                abandon_recovery_entry(&current_path, &current_entry, storage)?;
-                anyhow::bail!("ACP transcript purge failed: {error:#}");
-            }
-        }
-        let kept_resources = kept_resources_from_messages(&request, &result.messages);
-        current_entry = current_entry
-            .with_kept_resources(kept_resources)
-            .with_phase(LifecyclePhase::TeardownComplete);
-        if let Err(error) = crate::session::lifecycle_journal::update(&current_path, &current_entry)
-        {
-            abandon_recovery_entry(&current_path, &current_entry, storage)?;
-            return Err(error);
-        }
-    }
-
-    let latest = crate::session::lifecycle_journal::read_deletion(&current_path)?
-        .ok_or_else(|| anyhow::anyhow!("purge lifecycle journal disappeared before row commit"))?;
-    if latest.session_id != current_entry.session_id
-        || latest.source_profile != current_entry.source_profile
-        || latest.generation != current_entry.generation
-        || !latest.phase.teardown_complete()
-    {
-        return Ok(RecoveryOutcome::Unprocessed);
-    }
-    current_entry = latest;
-    owners = session_owner_profiles(&id)?;
-    if owners.iter().any(|profile| profile != storage.profile())
-        || owners
-            .iter()
-            .filter(|profile| *profile == storage.profile())
-            .count()
-            > 1
-    {
-        abandon_recovery_entry(&current_path, &current_entry, storage)?;
-        return Ok(RecoveryOutcome::Unprocessed);
-    }
-    row_present = owners.iter().any(|profile| profile == storage.profile());
-    let removed = current_entry.with_phase(LifecyclePhase::RowRemoved);
-    let mut row_superseded = false;
-    if row_present {
-        storage.update(|instances, _groups| {
-            let Some(index) = instances.iter().position(|row| row.id == id) else {
-                row_superseded = true;
-                return Ok(());
-            };
-            if instances[index].status != Status::Deleting
-                || !instances[index].lifecycle_reservation_is_owned(
-                    LifecycleOperation::Purge,
-                    current_entry.generation,
-                )
-                || crate::session::claim::purge_restored_row_must_be_kept(
-                    current_entry.instance.is_trashed(),
-                    instances[index].is_trashed(),
-                )
+            ) || !stored.lifecycle_reservation_is_owned(LifecycleOperation::Purge, generation)
             {
-                row_superseded = true;
-                return Ok(());
+                if stored.lifecycle_generation > generation {
+                    crate::session::lifecycle_journal::consume(&current_path)?;
+                }
+                return Ok(false);
             }
-            crate::session::lifecycle_journal::update(&current_path, &removed)?;
-            instances.remove(index);
-            Ok(())
-        })?;
-    }
-    if row_superseded {
-        abandon_recovery_entry(&current_path, &current_entry, storage)?;
-        return Ok(RecoveryOutcome::Unprocessed);
+        } else {
+            row_present = false;
+        }
     }
 
-    if removed.kept_resources.is_empty() {
-        clear_recovery_fence(&removed)?;
-        consume_lifecycle_journal_if_owned(&current_path, &removed)?;
-    } else {
-        let kept = removed.with_phase(LifecyclePhase::Kept);
-        crate::session::lifecycle_journal::update(&current_path, &kept)?;
-        clear_recovery_fence(&kept)?;
+    let mut request_instance = current_entry.instance.clone();
+    request_instance.source_profile = current_entry.source_profile.clone();
+    let request = DeletionRequest {
+        session_id: id.to_string(),
+        instance: request_instance.clone(),
+        delete_worktree: current_entry.delete_worktree,
+        delete_branch: current_entry.delete_branch,
+        delete_sandbox: current_entry.delete_sandbox,
+        force_delete: current_entry.force_delete,
+        detach_hooks: current_entry.detach_hooks,
+        keep_scratch: current_entry.keep_scratch,
+    };
+    let mut result = perform_deletion_teardown_lifecycle_locked(&request);
+    if !result.success {
+        if row_present {
+            release_journal_reservation(storage, id, generation, current_entry.status_before)?;
+        }
+        let error = result.errors.join("; ");
+        anyhow::bail!("lifecycle teardown failed: {error}");
     }
-    drop(lifecycle_lock);
-    Ok(RecoveryOutcome::Settled)
-}
+    if current_entry.purge_acp_transcript {
+        if let Err(error) = purge_acp_transcript(&request_instance) {
+            if row_present {
+                release_journal_reservation(storage, id, generation, current_entry.status_before)?;
+            }
+            anyhow::bail!("ACP transcript purge failed: {error:#}");
+        }
+    }
 
-fn restore_missing_deleting_row(
-    entry: &crate::session::lifecycle_journal::LifecycleJournalEntry,
-    storage: &Storage,
-) -> Result<()> {
-    let mut restored = entry.instance.clone();
-    restored.status = Status::Deleting;
-    anyhow::ensure!(
-        restored.id == entry.session_id
-            && restored.source_profile == storage.profile()
-            && restored
-                .lifecycle_reservation_is_owned(LifecycleOperation::Purge, entry.generation,),
-        "purge journal snapshot cannot restore its deleting row"
-    );
+    let mut row_superseded = false;
     storage.update(|instances, _groups| {
-        if let Some(existing) = instances.iter().find(|row| row.id == entry.session_id) {
-            anyhow::ensure!(
-                existing.status == Status::Deleting
-                    && existing.lifecycle_reservation_is_owned(
-                        LifecycleOperation::Purge,
-                        entry.generation,
-                    ),
-                "session row changed while restoring an irreversible purge"
-            );
+        let Some(index) = instances.iter().position(|row| row.id == id) else {
+            return Ok(());
+        };
+        if !instances[index].lifecycle_reservation_is_owned(LifecycleOperation::Purge, generation)
+            || crate::session::claim::purge_restored_row_must_be_kept(
+                current_entry.instance.is_trashed(),
+                instances[index].is_trashed(),
+            )
+        {
+            row_superseded = true;
             return Ok(());
         }
-        instances.push(restored.clone());
+        instances.remove(index);
         Ok(())
     })?;
-    let persisted = storage
-        .load()?
-        .into_iter()
-        .find(|row| row.id == entry.session_id)
-        .ok_or_else(|| anyhow::anyhow!("deleting row was not restored from purge journal"))?;
-    anyhow::ensure!(
-        persisted.status == Status::Deleting
-            && persisted
-                .lifecycle_reservation_is_owned(LifecycleOperation::Purge, entry.generation,),
-        "restored deleting row does not match the purge journal generation"
-    );
-    Ok(())
-}
-
-fn session_owner_profiles(session_id: &str) -> Result<Vec<String>> {
-    let (profiles, storages) = all_profile_storages().map_err(|error| {
-        anyhow::anyhow!("could not verify cross-profile session ownership: {error}")
-    })?;
-    let mut owners = Vec::new();
-    for (profile, storage) in profiles.into_iter().zip(storages) {
-        let rows = storage.load().with_context(|| {
-            format!("failed to inspect profile '{profile}' for session ownership")
-        })?;
-        let matches = rows.iter().filter(|row| row.id == session_id).count();
-        owners.extend(std::iter::repeat_n(profile, matches));
-    }
-    Ok(owners)
-}
-
-fn consume_lifecycle_journal_if_owned(
-    path: &Path,
-    expected: &crate::session::lifecycle_journal::LifecycleJournalEntry,
-) -> Result<()> {
-    let Some(current) = crate::session::lifecycle_journal::read_deletion(path)? else {
-        return Ok(());
-    };
-    if current.session_id == expected.session_id
-        && current.source_profile == expected.source_profile
-        && current.generation == expected.generation
-    {
-        anyhow::ensure!(
-            !current.phase.teardown_started()
-                || matches!(
-                    current.phase,
-                    LifecyclePhase::RowRemoved | LifecyclePhase::Kept
-                ),
-            "cannot consume a nonterminal purge journal after teardown started"
-        );
-        crate::session::lifecycle_journal::consume(path)?;
-    }
-    Ok(())
-}
-
-fn consume_superseded_lifecycle_journal_if_owned(
-    path: &Path,
-    expected: &crate::session::lifecycle_journal::LifecycleJournalEntry,
-    successor_path: &Path,
-    successor: &crate::session::lifecycle_journal::LifecycleJournalEntry,
-) -> Result<()> {
-    let Some(current) = crate::session::lifecycle_journal::read_deletion(path)? else {
-        return Ok(());
-    };
-    if current.session_id != expected.session_id
-        || current.source_profile != expected.source_profile
-        || current.generation != expected.generation
-    {
-        return Ok(());
+    if row_superseded {
+        crate::session::lifecycle_journal::consume(&current_path)?;
+        return Ok(false);
     }
 
-    let persisted_successor = crate::session::lifecycle_journal::read_deletion(successor_path)?
-        .ok_or_else(|| anyhow::anyhow!("successor purge journal is missing"))?;
-    anyhow::ensure!(
-        expected.phase.teardown_started()
-            && persisted_successor.session_id == expected.session_id
-            && persisted_successor.source_profile == expected.source_profile
-            && persisted_successor.generation > expected.generation
-            && persisted_successor.phase == expected.phase
-            && persisted_successor.generation == successor.generation
-            && paths_refer_to_same_sessions_file(
-                &persisted_successor.sessions_path,
-                &expected.sessions_path,
-            ),
-        "successor purge journal does not preserve the irreversible intent"
-    );
-    crate::session::lifecycle_journal::consume(path)?;
-    Ok(())
-}
-
-fn clear_recovery_fence(
-    entry: &crate::session::lifecycle_journal::LifecycleJournalEntry,
-) -> Result<()> {
-    if entry.instance.is_structured() {
-        crate::process::worker_registry::clear_purge_fence_if_owned(
-            &entry.session_id,
-            &entry.source_profile,
-            entry.generation,
-        )?;
+    current_entry = current_entry.with_phase(LifecyclePhase::RowRemoved);
+    crate::session::lifecycle_journal::update(&current_path, &current_entry)?;
+    result.disposition = DeletionDisposition::Removed;
+    let kept_resources = kept_resources_from_messages(&request, &result.messages);
+    if kept_resources.is_empty() {
+        crate::session::lifecycle_journal::consume(&current_path)?;
+    } else {
+        current_entry = current_entry.with_kept_resources(kept_resources);
+        current_entry = current_entry.with_phase(LifecyclePhase::Kept);
+        crate::session::lifecycle_journal::update(&current_path, &current_entry)?;
     }
-    Ok(())
+    drop(lifecycle_lock);
+    Ok(true)
 }
 
-fn abandon_recovery_entry(
-    path: &Path,
-    entry: &crate::session::lifecycle_journal::LifecycleJournalEntry,
+fn release_journal_reservation(
     storage: &Storage,
+    session_id: &str,
+    generation: u64,
+    status_before: Status,
 ) -> Result<()> {
-    let Some(current) = crate::session::lifecycle_journal::read_deletion(path)? else {
-        return Ok(());
-    };
-    if current.session_id != entry.session_id
-        || current.source_profile != entry.source_profile
-        || current.generation != entry.generation
-    {
-        return Ok(());
-    }
-    if current.phase.teardown_started() {
-        tracing::warn!(
-            target: "session.delete_recovery",
-            path = %path.display(),
-            phase = ?current.phase,
-            "irreversible purge intent retained for recovery"
-        );
-        return Ok(());
-    }
-    let abandoned = current.with_phase(LifecyclePhase::Abandoned);
-    if let Err(update_error) = crate::session::lifecycle_journal::update(path, &abandoned) {
-        tracing::warn!(
-            target: "session.delete_recovery",
-            path = %path.display(),
-            error = %update_error,
-            "journal abandonment checkpoint failed; retaining the existing intent for recovery"
-        );
-    }
-    let confirmed = crate::session::lifecycle_journal::read_deletion(path)?
-        .ok_or_else(|| anyhow::anyhow!("purge journal disappeared during abandonment"))?;
-    anyhow::ensure!(
-        confirmed.session_id == entry.session_id
-            && confirmed.source_profile == entry.source_profile
-            && confirmed.generation == entry.generation
-            && !confirmed.phase.teardown_started(),
-        "purge journal could not be confirmed reversible after abandonment"
-    );
     storage.update(|instances, _groups| {
-        for stored in instances
-            .iter_mut()
-            .filter(|row| row.id == entry.session_id)
-        {
-            if stored.lifecycle_reservation_is_owned(LifecycleOperation::Purge, entry.generation) {
-                stored.finish_owned_purge(entry.generation, entry.status_before)?;
+        if let Some(stored) = instances.iter_mut().find(|row| row.id == session_id) {
+            if stored.lifecycle_reservation_is_owned(LifecycleOperation::Purge, generation) {
+                stored.status = status_before;
+                stored
+                    .release_lifecycle_reservation_if_owned(LifecycleOperation::Purge, generation);
             }
         }
         Ok(())
-    })?;
-    clear_recovery_fence(&confirmed)?;
-    consume_lifecycle_journal_if_owned(path, &confirmed)?;
-    Ok(())
+    })
 }
+
 fn paths_refer_to_same_sessions_file(left: &Path, right: &Path) -> bool {
     if left == right {
         return true;
@@ -2352,14 +1258,10 @@ fn kept_resources_from_messages(request: &DeletionRequest, messages: &[String]) 
     messages
         .iter()
         .filter(|message| {
-            message.starts_with("Workspace directory kept:")
-                || message.starts_with("Scratch directory kept at:")
-                || message.starts_with("Agent store kept (")
+            let lower = message.to_ascii_lowercase();
+            lower.contains(" kept") || lower.starts_with("kept") || lower.contains("preserved")
         })
         .map(|message| {
-            if message.starts_with(AGENT_STORE_KEPT_PREFIX) {
-                return kept_agent_store_resource(message, &request.instance);
-            }
             let workspace_path = request
                 .instance
                 .workspace_info
@@ -2379,26 +1281,6 @@ pub(crate) fn purge_acp_transcript(instance: &Instance) -> Result<()> {
         return Ok(());
     }
     purge_acp_transcript_rows(&db_path, &instance.id)
-}
-
-fn stop_acp_runner_for_purge(instance: &Instance, generation: u64) -> Result<()> {
-    if !instance.is_structured() && !instance.acp_handoff_pending {
-        return Ok(());
-    }
-    anyhow::ensure!(
-        !instance.source_profile.is_empty(),
-        "ACP owner session has no source profile"
-    );
-    crate::process::worker_registry::fence_for_purge(
-        &instance.id,
-        &instance.source_profile,
-        generation,
-    )?;
-    crate::process::worker_registry::terminate_and_confirm_stopped(
-        &instance.id,
-        &instance.source_profile,
-        generation,
-    )
 }
 
 pub(crate) fn purge_acp_transcript_rows(db_path: &Path, session_id: &str) -> Result<()> {
@@ -2540,8 +1422,6 @@ pub(crate) fn paths_in_use_except(except_ids: &[&str]) -> PathsInUse {
 thread_local! {
     static AFTER_PATHS_IN_USE_SCAN: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
         const { std::cell::RefCell::new(None) };
-    static BEFORE_LIFECYCLE_ENTRY_RECOVERY: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
-        const { std::cell::RefCell::new(None) };
 }
 
 /// Run `f` with the paths other sessions use while every profile's storage lock is held, so no
@@ -2663,6 +1543,7 @@ fn perform_deletion_core(
     } else {
         &[]
     };
+
     let removes_managed_worktree = request.delete_worktree
         && (request
             .instance
@@ -3284,7 +2165,7 @@ mod tests {
     use crate::containers::error::DockerError;
     use crate::containers::Teardown;
     use crate::session::test_support::{isolate_app_dir, isolate_app_dir_at};
-    use crate::session::{SandboxInfo, View, WorkspaceInfo, WorkspaceRepo, WorktreeInfo};
+    use crate::session::{SandboxInfo, WorkspaceInfo, WorkspaceRepo, WorktreeInfo};
     use serial_test::serial;
 
     fn request(instance: Instance) -> DeletionRequest {
@@ -3394,91 +2275,6 @@ mod tests {
         (tmp, main_repo, worktree_path, instance)
     }
 
-    #[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
-    #[test]
-    fn acp_writer_helper() {
-        use std::io::Write as _;
-        use std::os::unix::net::UnixListener;
-
-        let Some(socket_path) = std::env::var_os("AOE_TEST_ACP_WRITER_SOCKET") else {
-            return;
-        };
-        let output_path =
-            std::env::var_os("AOE_TEST_ACP_WRITER_OUTPUT").expect("writer output path");
-        let listener = UnixListener::bind(socket_path).expect("bind ACP control socket");
-        listener.set_nonblocking(true).unwrap();
-        loop {
-            match listener.accept() {
-                Ok((stream, _)) => drop(stream),
-                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
-                Err(error) => panic!("accept ACP control probe: {error}"),
-            }
-            std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(&output_path)
-                .and_then(|mut file| file.write_all(b"x"))
-                .expect("write ACP output");
-            std::thread::sleep(Duration::from_millis(10));
-        }
-    }
-
-    #[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
-    fn spawn_live_acp_writer(
-        socket_path: &Path,
-        output_path: &Path,
-    ) -> (u32, std::thread::JoinHandle<std::process::ExitStatus>) {
-        use std::os::unix::process::CommandExt as _;
-
-        let control_path = crate::process::worker::control_socket_sibling(socket_path);
-        let executable = std::env::current_exe().unwrap();
-        let mut child = std::process::Command::new(executable);
-        child
-            .args([
-                "--exact",
-                "session::deletion::tests::acp_writer_helper",
-                "--nocapture",
-            ])
-            .env("AOE_TEST_ACP_WRITER_SOCKET", &control_path)
-            .env("AOE_TEST_ACP_WRITER_OUTPUT", output_path)
-            .process_group(0);
-        let mut child = child.spawn().expect("spawn ACP writer stand-in");
-        let pid = child.id();
-        let waiter = std::thread::spawn(move || {
-            let deadline = std::time::Instant::now() + Duration::from_secs(10);
-            loop {
-                match child.try_wait() {
-                    Ok(Some(status)) => {
-                        return status;
-                    }
-                    Ok(None) => {}
-                    Err(error) => {
-                        crate::process::worker::kill_process_group(pid);
-                        let _ = child.kill();
-                        let _ = child.wait();
-                        panic!("wait for ACP writer: {error}");
-                    }
-                }
-                if std::time::Instant::now() >= deadline {
-                    crate::process::worker::kill_process_group(pid);
-                    let _ = child.kill();
-                    let status = child.wait().expect("reap timed-out ACP writer");
-                    return status;
-                }
-                std::thread::sleep(Duration::from_millis(10));
-            }
-        });
-
-        let deadline = std::time::Instant::now() + Duration::from_secs(3);
-        while std::time::Instant::now() < deadline {
-            if crate::process::worker::peer_pid_from_socket(&control_path) == Some(pid) {
-                return (pid, waiter);
-            }
-            std::thread::sleep(Duration::from_millis(10));
-        }
-        panic!("ACP control socket did not report its runner PID {pid}");
-    }
-
     fn reserve(profile: &str, instance: Instance) -> PurgeTransaction {
         let storage = Storage::open_unwatched(profile).unwrap();
         match PurgeTransaction::reserve(storage, request(instance)).unwrap() {
@@ -3497,26 +2293,6 @@ mod tests {
             })
             .unwrap();
         instance
-    }
-
-    fn expired_deleting_row(mut snapshot: Instance) -> (Instance, Instance, u64) {
-        let now = Utc::now();
-        let mut row = snapshot.clone();
-        let generation = row
-            .try_acquire_lifecycle_reservation(
-                LifecycleOperation::Purge,
-                Instance::LIFECYCLE_RESERVATION_TTL,
-                now,
-            )
-            .unwrap();
-        row.lifecycle_reservation
-            .as_mut()
-            .expect("purge reservation")
-            .at = now - Instance::LIFECYCLE_RESERVATION_TTL - chrono::Duration::seconds(1);
-        row.status = Status::Deleting;
-        snapshot.lifecycle_generation = row.lifecycle_generation;
-        snapshot.lifecycle_reservation = row.lifecycle_reservation.clone();
-        (snapshot, row, generation)
     }
 
     fn wait_for_reservation_renewal(
@@ -3564,27 +2340,6 @@ mod tests {
         }
     }
 
-    #[test]
-    #[serial]
-    fn terminal_with_pending_acp_handoff_is_fenced_for_purge() {
-        let _guard = isolate_app_dir();
-        let mut instance = Instance::new("pending-handoff", "/tmp/pending-handoff");
-        instance.source_profile = "terminal-pending-acp".to_string();
-        instance.view = View::Terminal;
-        instance.acp_handoff_pending = true;
-
-        let result = stop_acp_runner_for_purge(&instance, 1);
-
-        assert!(crate::process::worker_registry::is_purge_fenced(&instance.id).unwrap());
-        #[cfg(unix)]
-        result.unwrap();
-        #[cfg(not(unix))]
-        assert_eq!(
-            result.unwrap_err().to_string(),
-            "cannot prove ACP runner process exit on this platform"
-        );
-    }
-
     /// A force chosen against an earlier trash lifecycle is dropped at the claim, so a row
     /// a peer restored and re-trashed keeps its dirty-worktree guard.
     #[test]
@@ -3621,12 +2376,6 @@ mod tests {
                 transaction.request.force_delete, same_lifecycle,
                 "{profile}"
             );
-            let persisted = crate::session::lifecycle_journal::read_deletion(
-                transaction.journal_path.as_deref().unwrap(),
-            )
-            .unwrap()
-            .unwrap();
-            assert_eq!(persisted.force_delete, same_lifecycle, "{profile}");
         }
     }
 
@@ -3654,7 +2403,6 @@ mod tests {
         assert!(!result.teardown_started);
         let retained = storage.load().unwrap();
         assert_eq!(retained.len(), 1);
-        assert_eq!(retained[0].status, Status::Deleting);
         assert!(!retained[0].has_fresh_lifecycle_reservation(Utc::now()));
 
         let mut retry = retained.into_iter().next().unwrap();
@@ -3839,9 +2587,8 @@ mod tests {
         let profile = "kept-workspace-tombstone";
         let storage = Storage::new_unwatched(profile).unwrap();
         let temp = tempfile::tempdir().unwrap();
-        let root = temp.path().canonicalize().unwrap();
-        let main_repo = root.join("frontend");
-        let workspace = root.join("workspace");
+        let main_repo = temp.path().join("frontend");
+        let workspace = temp.path().join("workspace");
         let worktree = workspace.join("frontend");
         init_repo(&main_repo);
         std::fs::create_dir_all(&workspace).unwrap();
@@ -3920,630 +2667,11 @@ mod tests {
                 .len(),
             1
         );
-        std::fs::remove_dir_all(&workspace).unwrap();
-        recover_lifecycle_journals_once().unwrap();
-        assert!(
-            crate::session::lifecycle_journal::scan([storage.sessions_path().to_path_buf()])
-                .entries
-                .is_empty(),
-            "reclaimed workspace left a permanent Kept tombstone"
-        );
-    }
-
-    #[cfg(unix)]
-    #[test]
-    #[serial]
-    fn kept_reclamation_requires_every_resource_to_be_proven_absent() {
-        for case in [
-            "absent",
-            "present",
-            "unknown",
-            "mixed",
-            "leaf-symlink",
-            "ancestor-symlink",
-            "io-error",
-            "second-present",
-            "agent-present",
-        ] {
-            let temp = tempfile::tempdir().unwrap();
-            let _home = isolate_app_dir_at(temp.path());
-            let _user_profile =
-                crate::session::test_support::EnvGuard::set(&[("USERPROFILE", temp.path())]);
-            let root = temp.path().canonicalize().unwrap();
-            let mut scratch = root.join("scratch");
-            let workspace = root.join("workspace");
-            let agent_store_present = matches!(case, "mixed" | "agent-present");
-            match case {
-                "present" => std::fs::create_dir(&scratch).unwrap(),
-                "leaf-symlink" => {
-                    std::os::unix::fs::symlink(root.join("missing"), &scratch).unwrap()
-                }
-                "ancestor-symlink" => {
-                    let link = root.join("link");
-                    std::os::unix::fs::symlink(root.join("missing"), &link).unwrap();
-                    scratch = link.join("child");
-                }
-                "io-error" => {
-                    let file = root.join("file");
-                    std::fs::write(&file, b"not a directory").unwrap();
-                    scratch = file.join("child");
-                }
-                "second-present" | "mixed" => std::fs::create_dir(&workspace).unwrap(),
-                _ => {}
-            }
-            let mut instance = Instance::new("reclamation", scratch.to_str().unwrap());
-            instance.scratch = true;
-            instance.source_profile = "reclamation".into();
-            instance.workspace_info = Some(workspace_info(&workspace, vec![]));
-            instance.sandbox_info = Some(sandbox_info("reclamation"));
-            let agent_store = expected_kept_agent_store_paths(&instance)
-                .and_then(|paths| paths.into_iter().next())
-                .expect("sandbox agent store path should be known");
-            if agent_store_present {
-                std::fs::create_dir_all(&agent_store).unwrap();
-            }
-            let mut resources = vec![
-                format!("Scratch directory kept at: {}", scratch.display()),
-                format!(
-                    "Workspace directory kept: foreign contents [{}]",
-                    workspace.display()
-                ),
-            ];
-            let agent_message = "Agent store kept (container retained)".to_string();
-            if case == "unknown" {
-                resources.clear();
-                resources.push(agent_message);
-            } else {
-                resources.extend(kept_resources_from_messages(
-                    &request(instance.clone()),
-                    std::slice::from_ref(&agent_message),
-                ));
-            }
-            let entry = crate::session::lifecycle_journal::LifecycleJournalEntry::deletion(
-                instance,
-                Status::Idle,
-                root.join("sessions.json"),
-                crate::session::lifecycle_journal::LifecycleDeletionOptions {
-                    generation: 1,
-                    delete_worktree: false,
-                    delete_branch: false,
-                    delete_sandbox: false,
-                    force_delete: false,
-                    detach_hooks: true,
-                    keep_scratch: true,
-                    purge_acp_transcript: false,
-                },
-            )
-            .with_phase(LifecyclePhase::Kept)
-            .with_kept_resources(resources);
-            assert_eq!(
-                kept_resources_are_reclaimed(&entry),
-                case == "absent",
-                "{case}"
-            );
-        }
     }
 
     #[test]
     #[serial]
-    fn agent_store_kept_reclamation_requires_exact_known_path() {
-        let temp = tempfile::tempdir().unwrap();
-        let _home = isolate_app_dir_at(temp.path());
-        let _user_profile =
-            crate::session::test_support::EnvGuard::set(&[("USERPROFILE", temp.path())]);
-        for case in ["absent", "present", "unknown", "unsafe"] {
-            let mut instance = Instance::new("agent-store", "/unused");
-            instance.source_profile = "agent-store-reclamation".into();
-            instance.sandbox_info = Some(sandbox_info("agent-store-reclamation"));
-            let store = expected_kept_agent_store_paths(&instance)
-                .and_then(|paths| paths.into_iter().next())
-                .expect("sandbox agent store path should be known");
-            if case == "present" {
-                std::fs::create_dir_all(&store).unwrap();
-            }
-            let request = request(instance.clone());
-            let message = "Agent store kept (test retained store)".to_string();
-            let resources = match case {
-                "unknown" => vec![message],
-                "unsafe" => vec![format!(
-                    "{message}{AGENT_STORE_PATHS_MARKER}{}]",
-                    serde_json::to_string(&[temp.path().join("outside").to_string_lossy()])
-                        .unwrap()
-                )],
-                _ => kept_resources_from_messages(&request, std::slice::from_ref(&message)),
-            };
-            let entry = crate::session::lifecycle_journal::LifecycleJournalEntry::deletion(
-                instance,
-                Status::Idle,
-                temp.path().join("sessions.json"),
-                crate::session::lifecycle_journal::LifecycleDeletionOptions {
-                    generation: 1,
-                    delete_worktree: false,
-                    delete_branch: false,
-                    delete_sandbox: false,
-                    force_delete: false,
-                    detach_hooks: true,
-                    keep_scratch: false,
-                    purge_acp_transcript: false,
-                },
-            )
-            .with_phase(LifecyclePhase::Kept)
-            .with_kept_resources(resources);
-            assert_eq!(
-                kept_resources_are_reclaimed(&entry),
-                case == "absent",
-                "{case}"
-            );
-        }
-    }
-
-    #[test]
-    #[serial]
-    fn kept_agent_store_journal_is_consumed_after_store_disappears() {
-        let temp = tempfile::tempdir().unwrap();
-        let _home = isolate_app_dir_at(temp.path());
-        let _user_profile =
-            crate::session::test_support::EnvGuard::set(&[("USERPROFILE", temp.path())]);
-        let profile = "kept-agent-store-recovery";
-        let storage = Storage::new_unwatched(profile).unwrap();
-        let mut instance = Instance::new("agent-store", "/unused");
-        instance.source_profile = profile.to_string();
-        instance.sandbox_info = Some(sandbox_info(profile));
-        let agent_store = expected_kept_agent_store_paths(&instance)
-            .and_then(|paths| paths.into_iter().next())
-            .expect("sandbox agent store path should be known");
-        std::fs::create_dir_all(&agent_store).unwrap();
-        let resources = kept_resources_from_messages(
-            &request(instance.clone()),
-            &["Agent store kept (container retained)".to_string()],
-        );
-        assert_eq!(resources.len(), 1);
-        assert!(resources[0].contains(AGENT_STORE_PATHS_MARKER));
-        let entry = crate::session::lifecycle_journal::LifecycleJournalEntry::deletion(
-            instance,
-            Status::Idle,
-            storage.sessions_path().to_path_buf(),
-            crate::session::lifecycle_journal::LifecycleDeletionOptions {
-                generation: 1,
-                delete_worktree: false,
-                delete_branch: false,
-                delete_sandbox: false,
-                force_delete: false,
-                detach_hooks: true,
-                keep_scratch: false,
-                purge_acp_transcript: false,
-            },
-        )
-        .with_phase(LifecyclePhase::Kept)
-        .with_kept_resources(resources);
-        let path = crate::session::lifecycle_journal::record(&entry).unwrap();
-
-        recover_lifecycle_journals_once().unwrap();
-        assert!(
-            path.exists(),
-            "the live agent store must retain its journal"
-        );
-
-        std::fs::remove_dir_all(agent_store).unwrap();
-        recover_lifecycle_journals_once().unwrap();
-        assert!(
-            !path.exists(),
-            "reclaimed agent-store data must release its Kept journal"
-        );
-    }
-
-    #[test]
-    #[serial]
-    fn terminal_checkpoint_failure_keeps_the_deleting_row_and_recovery_intent() {
-        let _guard = isolate_app_dir();
-        let profile = "purge-terminal-checkpoint-failure";
-        let storage = Storage::new_unwatched(profile).unwrap();
-        let mut instance = Instance::new("terminal-failure", "/tmp/terminal-failure");
-        instance.source_profile = profile.to_string();
-        storage
-            .update(|instances, _groups| {
-                instances.push(instance.clone());
-                Ok(())
-            })
-            .unwrap();
-
-        let result = reserve(profile, instance).complete_with(|_| {
-            crate::session::lifecycle_journal::fail_next_update_for_test();
-            Ok(())
-        });
-
-        assert_eq!(result.disposition, DeletionDisposition::Failed);
-        assert!(result.teardown_started);
-        assert!(result
-            .errors
-            .iter()
-            .any(|error| error.contains("terminal journal checkpoint failed")));
-        let rows = storage.load().unwrap();
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].status, Status::Deleting);
-        let reservation = rows[0]
-            .lifecycle_reservation
-            .as_ref()
-            .expect("failed terminal checkpoint keeps purge reservation");
-        assert_eq!(reservation.op, LifecycleOperation::Purge);
-        assert_eq!(reservation.generation, rows[0].lifecycle_generation);
-
-        let journals =
-            crate::session::lifecycle_journal::scan([storage.sessions_path().to_path_buf()]);
-        assert_eq!(journals.entries.len(), 1);
-        assert_eq!(
-            journals.entries[0].1.as_ref().unwrap().phase,
-            LifecyclePhase::TeardownStarted
-        );
-    }
-
-    #[test]
-    #[serial]
-    fn row_removal_checkpoint_failure_keeps_rows_for_ordinary_and_transcript_purges() {
-        let _guard = isolate_app_dir();
-        for transcript in [false, true] {
-            let profile = if transcript {
-                "purge-row-checkpoint-transcript"
-            } else {
-                "purge-row-checkpoint-ordinary"
-            };
-            let storage = Storage::new_unwatched(profile).unwrap();
-            let instance = stored_instance(&storage, profile, "/tmp/row-checkpoint-failure");
-            let result = if transcript {
-                let transaction = match PurgeTransaction::reserve_with_acp_transcript(
-                    storage.clone(),
-                    request(instance),
-                )
-                .unwrap()
-                {
-                    PurgeReservation::Reserved(transaction) => transaction,
-                    PurgeReservation::Rejected(_) => panic!("purge reservation was refused"),
-                };
-                let committed = transaction
-                    .begin_irreversible()
-                    .unwrap_or_else(|_| panic!("purge did not cross its irreversible boundary"));
-                let observer = crate::session::observe_updates_for_test(move |observed| {
-                    if observed.profile() == profile {
-                        crate::session::lifecycle_journal::fail_next_update_for_test();
-                    }
-                });
-                let result = committed.finish_with_transcript_cleanup(|_| Ok(()));
-                drop(observer);
-                result
-            } else {
-                let transaction = reserve(profile, instance);
-                let observer = crate::session::observe_updates_for_test(move |observed| {
-                    if observed.profile() == profile
-                        && crate::session::lifecycle_journal::scan([observed
-                            .sessions_path()
-                            .to_path_buf()])
-                        .entries
-                        .iter()
-                        .any(|(_, entry)| {
-                            entry
-                                .as_ref()
-                                .is_ok_and(|entry| entry.phase == LifecyclePhase::TeardownComplete)
-                        })
-                    {
-                        crate::session::lifecycle_journal::fail_next_update_for_test();
-                    }
-                });
-                let result = transaction.complete();
-                drop(observer);
-                result
-            };
-
-            assert_eq!(result.disposition, DeletionDisposition::Failed);
-            assert!(result.teardown_started);
-            assert!(result
-                .errors
-                .iter()
-                .any(|error| { error.contains("injected lifecycle journal update failure") }));
-            let rows = storage.load().unwrap();
-            assert_eq!(rows.len(), 1);
-            assert_eq!(rows[0].status, Status::Deleting);
-            let reservation = rows[0]
-                .lifecycle_reservation
-                .as_ref()
-                .expect("failed terminal checkpoint keeps the purge reservation");
-            assert_eq!(reservation.op, LifecycleOperation::Purge);
-            assert_eq!(reservation.generation, rows[0].lifecycle_generation);
-
-            let journals =
-                crate::session::lifecycle_journal::scan([storage.sessions_path().to_path_buf()]);
-            assert_eq!(journals.entries.len(), 1);
-            let entry = journals.entries[0].1.as_ref().unwrap();
-            assert_eq!(entry.phase, LifecyclePhase::TeardownComplete);
-            assert_eq!(entry.generation, reservation.generation);
-        }
-    }
-
-    #[test]
-    #[serial]
-    fn sessions_write_failure_after_row_removed_checkpoint_recovers_both_purge_paths() {
-        let _guard = isolate_app_dir();
-        for transcript in [false, true] {
-            let profile = if transcript {
-                "purge-row-commit-failure-transcript"
-            } else {
-                "purge-row-commit-failure-ordinary"
-            };
-            let storage = Storage::new_unwatched(profile).unwrap();
-            let mut instance = stored_instance(&storage, profile, "/tmp/row-commit-failure");
-            instance.view = View::Structured;
-            storage
-                .update(|instances, _groups| {
-                    instances[0] = instance.clone();
-                    Ok(())
-                })
-                .unwrap();
-
-            let transaction = match PurgeTransaction::reserve_with_transcript_option(
-                storage.clone(),
-                request(instance.clone()),
-                transcript,
-            )
-            .unwrap()
-            {
-                PurgeReservation::Reserved(transaction) => transaction,
-                PurgeReservation::Rejected(result) => {
-                    panic!("purge was rejected: {result:?}")
-                }
-            };
-            let (transaction, committed) = if transcript {
-                let committed = transaction
-                    .begin_irreversible()
-                    .unwrap_or_else(|result| panic!("purge did not commit: {result:?}"));
-                (None, Some(committed))
-            } else {
-                (Some(transaction), None)
-            };
-
-            let mut fail_write = storage.clone();
-            let mut failure_switch = storage.clone();
-            let injected = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-            let observed_injection = std::sync::Arc::clone(&injected);
-            let observer = crate::session::observe_updates_for_test(move |observed| {
-                if observed.profile() != profile {
-                    return;
-                }
-                let scan = crate::session::lifecycle_journal::scan([observed
-                    .sessions_path()
-                    .to_path_buf()]);
-                if scan.entries.iter().any(|(_, entry)| {
-                    entry
-                        .as_ref()
-                        .is_ok_and(|entry| entry.phase == LifecyclePhase::TeardownComplete)
-                }) {
-                    fail_write.set_fail_writes_for_test(true);
-                    observed_injection.store(true, std::sync::atomic::Ordering::SeqCst);
-                }
-            });
-            let result = match committed {
-                Some(committed) => committed.finish_with_transcript_cleanup(|_| Ok(())),
-                None => transaction
-                    .expect("ordinary purge must retain its reversible transaction")
-                    .complete(),
-            };
-            drop(observer);
-            assert!(
-                injected.load(std::sync::atomic::Ordering::SeqCst),
-                "sessions write failure was not injected"
-            );
-            failure_switch.set_fail_writes_for_test(false);
-
-            assert_eq!(result.disposition, DeletionDisposition::Failed);
-            assert!(result.teardown_started);
-            assert!(result
-                .errors
-                .iter()
-                .any(|error| error.contains("sessions.json could not be updated")));
-            let rows = storage.load().unwrap();
-            assert_eq!(rows.len(), 1);
-            assert_eq!(rows[0].status, Status::Deleting);
-            let reservation = rows[0]
-                .lifecycle_reservation
-                .as_ref()
-                .expect("failed row commit keeps the purge reservation");
-            assert_eq!(reservation.op, LifecycleOperation::Purge);
-            let generation = reservation.generation;
-            assert_eq!(generation, rows[0].lifecycle_generation);
-
-            let scan =
-                crate::session::lifecycle_journal::scan([storage.sessions_path().to_path_buf()]);
-            assert_eq!(scan.entries.len(), 1);
-            let (path, entry) = &scan.entries[0];
-            let entry = entry.as_ref().unwrap();
-            assert_eq!(entry.phase, LifecyclePhase::RowRemoved);
-            assert_eq!(entry.generation, generation);
-            assert!(crate::process::worker_registry::is_purge_fenced(&instance.id).unwrap());
-
-            storage
-                .update(|instances, _groups| {
-                    let row = instances
-                        .iter_mut()
-                        .find(|row| row.id == instance.id)
-                        .expect("failed purge row remains stored");
-                    row.lifecycle_reservation
-                        .as_mut()
-                        .expect("purge reservation remains stored")
-                        .at = Utc::now()
-                        - Instance::LIFECYCLE_RESERVATION_TTL
-                        - chrono::Duration::seconds(1);
-                    Ok(())
-                })
-                .unwrap();
-            assert_eq!(
-                recover_lifecycle_entry(path, entry, &storage).unwrap(),
-                RecoveryOutcome::Settled
-            );
-            assert!(storage.load().unwrap().is_empty());
-            assert!(!crate::process::worker_registry::is_purge_fenced(&instance.id).unwrap());
-            assert!(crate::session::lifecycle_journal::scan([storage
-                .sessions_path()
-                .to_path_buf(),])
-            .entries
-            .is_empty());
-        }
-    }
-
-    #[test]
-    #[serial]
-    fn recovery_restores_missing_row_from_legacy_teardown_checkpoint() {
-        let _guard = isolate_app_dir();
-        let profile = "purge-recovery-missing-row";
-        let storage = Storage::new_unwatched(profile).unwrap();
-        let mut instance = Instance::new("missing-row", "/unused");
-        instance.source_profile = profile.to_string();
-        let generation = instance
-            .try_acquire_lifecycle_reservation(
-                LifecycleOperation::Purge,
-                Instance::LIFECYCLE_RESERVATION_TTL,
-                Utc::now(),
-            )
-            .unwrap();
-        let entry = crate::session::lifecycle_journal::LifecycleJournalEntry::deletion(
-            instance,
-            Status::Idle,
-            storage.sessions_path().to_path_buf(),
-            crate::session::lifecycle_journal::LifecycleDeletionOptions {
-                generation,
-                delete_worktree: false,
-                delete_branch: false,
-                delete_sandbox: false,
-                force_delete: false,
-                detach_hooks: true,
-                keep_scratch: false,
-                purge_acp_transcript: false,
-            },
-        )
-        .with_phase(LifecyclePhase::TeardownComplete);
-        let path = crate::session::lifecycle_journal::record(&entry).unwrap();
-
-        assert_eq!(
-            recover_lifecycle_entry(&path, &entry, &storage).unwrap(),
-            RecoveryOutcome::Unprocessed
-        );
-        let rows = storage.load().unwrap();
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].status, Status::Deleting);
-        assert!(rows[0].lifecycle_reservation_is_owned(LifecycleOperation::Purge, generation));
-        let persisted = crate::session::lifecycle_journal::read_deletion(&path)
-            .unwrap()
-            .unwrap();
-        assert_eq!(persisted.phase, LifecyclePhase::TeardownComplete);
-        assert_eq!(persisted.generation, generation);
-    }
-
-    #[test]
-    #[serial]
-    fn recovery_terminal_reread_blocks_older_destructive_intents() {
-        for terminal_phase in [
-            LifecyclePhase::TeardownComplete,
-            LifecyclePhase::RowRemoved,
-            LifecyclePhase::Kept,
-        ] {
-            for published_after_scan in [true, false] {
-                let _guard = isolate_app_dir();
-                let profile = "stale-terminal-authority";
-                let storage = Storage::new_unwatched(profile).unwrap();
-                let mut instance = Instance::new("terminal-reread", "/unused");
-                let workspace =
-                    crate::session::scratch::provision_scratch_dir(&instance.id).unwrap();
-                let sentinel = workspace.join("kept-data");
-                std::fs::write(&sentinel, b"retained").unwrap();
-                instance.project_path = workspace.to_string_lossy().into_owned();
-                instance.scratch = true;
-                instance.source_profile = profile.to_string();
-                let generation = instance
-                    .try_acquire_lifecycle_reservation(
-                        LifecycleOperation::Purge,
-                        Instance::LIFECYCLE_RESERVATION_TTL,
-                        Utc::now(),
-                    )
-                    .unwrap();
-                let older = crate::session::lifecycle_journal::LifecycleJournalEntry::deletion(
-                    instance,
-                    Status::Idle,
-                    storage.sessions_path().to_path_buf(),
-                    crate::session::lifecycle_journal::LifecycleDeletionOptions {
-                        generation,
-                        delete_worktree: false,
-                        delete_branch: false,
-                        delete_sandbox: false,
-                        force_delete: false,
-                        detach_hooks: true,
-                        keep_scratch: false,
-                        purge_acp_transcript: false,
-                    },
-                )
-                .with_phase(LifecyclePhase::TeardownStarted);
-                let older_path = crate::session::lifecycle_journal::record(&older).unwrap();
-                let mut newer = older.with_generation(2);
-                newer.keep_scratch = true;
-                newer
-                    .instance
-                    .lifecycle_reservation
-                    .as_mut()
-                    .expect("purge snapshot reservation")
-                    .at =
-                    Utc::now() - Instance::LIFECYCLE_RESERVATION_TTL - chrono::Duration::seconds(1);
-                let current_path = if published_after_scan {
-                    None
-                } else {
-                    Some(crate::session::lifecycle_journal::record(&newer).unwrap())
-                };
-                let terminal = newer
-                    .with_phase(terminal_phase)
-                    .with_kept_resources(vec![format!(
-                        "Scratch directory kept at: {}",
-                        workspace.display()
-                    )]);
-                let sessions_path = storage.sessions_path().to_path_buf();
-                BEFORE_LIFECYCLE_ENTRY_RECOVERY.with(|hook| {
-                    *hook.borrow_mut() = Some(Box::new(move || {
-                        let _lock = storage
-                            .acquire_instance_lifecycle_lock(&terminal.session_id)
-                            .unwrap();
-                        if let Some(path) = current_path {
-                            crate::session::lifecycle_journal::update(&path, &terminal).unwrap();
-                        } else {
-                            crate::session::lifecycle_journal::record(&terminal).unwrap();
-                        }
-                    }));
-                });
-                recover_lifecycle_journals_once().unwrap();
-                assert!(
-                    sentinel.exists(),
-                    "terminal checkpoint seen under lock did not stop an older teardown"
-                );
-                assert_eq!(std::fs::read(&sentinel).unwrap(), b"retained");
-                std::fs::remove_dir_all(&workspace).unwrap();
-                for _ in 0..2 {
-                    recover_lifecycle_journals_once().unwrap();
-                    assert_eq!(
-                        crate::session::lifecycle_journal::read_deletion(&older_path)
-                            .unwrap()
-                            .unwrap()
-                            .phase,
-                        LifecyclePhase::TeardownStarted
-                    );
-                    let scan = crate::session::lifecycle_journal::scan([sessions_path.clone()]);
-                    assert!(scan
-                        .entries
-                        .iter()
-                        .any(|(_, entry)| entry
-                            .as_ref()
-                            .is_ok_and(|entry| entry.generation >= 2
-                                && entry.phase == LifecyclePhase::Kept)));
-                }
-            }
-        }
-    }
-
-    #[test]
-    #[serial]
-    fn failed_teardown_keeps_the_irreversible_purge_intent_for_recovery() {
+    fn failed_teardown_keeps_a_replayable_lifecycle_journal() {
         let _guard = isolate_app_dir();
         let profile = "purge-failure-journal";
         let storage = Storage::new_unwatched(profile).unwrap();
@@ -4561,78 +2689,22 @@ mod tests {
         let result = reserve(profile, instance).run_hooks().complete();
         assert_eq!(result.disposition, DeletionDisposition::Failed);
         assert!(!result.success);
-        assert!(result.teardown_started);
         let rows = storage.load().unwrap();
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].status, Status::Deleting);
-        assert!(rows[0].lifecycle_reservation.is_some());
+        assert_eq!(rows[0].status, Status::Idle);
+        assert!(rows[0].lifecycle_reservation.is_none());
         let journals =
             crate::session::lifecycle_journal::scan([storage.sessions_path().to_path_buf()]);
         assert_eq!(journals.entries.len(), 1);
-        assert!(journals.entries[0]
-            .1
-            .as_ref()
-            .is_ok_and(|entry| entry.phase == LifecyclePhase::TeardownStarted));
-
-        recover_lifecycle_journals_once().unwrap();
-        let rows = storage.load().unwrap();
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].status, Status::Deleting);
-        assert!(rows[0].lifecycle_reservation.is_some());
-    }
-
-    #[test]
-    #[serial]
-    fn recovery_does_not_abandon_an_irreversible_purge_intent() {
-        let _guard = isolate_app_dir();
-        let profile = "purge-recovery-keeps-teardown-started";
-        let storage = Storage::new_unwatched(profile).unwrap();
-        let instance = stored_instance(&storage, profile, "/tmp/test-project");
-        let (snapshot, deleting_row, generation) = expired_deleting_row(instance);
-        storage
-            .update(|instances, _groups| {
-                instances.clear();
-                instances.push(deleting_row);
-                Ok(())
-            })
-            .unwrap();
-        let entry = crate::session::lifecycle_journal::LifecycleJournalEntry::deletion(
-            snapshot,
-            Status::Idle,
-            storage.sessions_path().to_path_buf(),
-            crate::session::lifecycle_journal::LifecycleDeletionOptions {
-                generation,
-                delete_worktree: false,
-                delete_branch: false,
-                delete_sandbox: false,
-                force_delete: false,
-                detach_hooks: true,
-                keep_scratch: false,
-                purge_acp_transcript: false,
-            },
-        )
-        .with_phase(LifecyclePhase::TeardownStarted);
-        let path = crate::session::lifecycle_journal::record(&entry).unwrap();
-
-        abandon_recovery_entry(&path, &entry, &storage).unwrap();
-
-        let retained = storage.load().unwrap().remove(0);
-        assert_eq!(retained.status, Status::Deleting);
-        assert!(retained.lifecycle_reservation_is_owned(LifecycleOperation::Purge, generation));
         assert_eq!(
-            crate::session::lifecycle_journal::read_deletion(&path)
-                .unwrap()
-                .unwrap()
-                .phase,
+            journals.entries[0].1.as_ref().unwrap().phase,
             LifecyclePhase::TeardownStarted
         );
-        assert!(consume_lifecycle_journal_if_owned(&path, &entry).is_err());
-        assert!(path.exists());
     }
 
     #[test]
     #[serial]
-    fn failed_acp_transcript_cleanup_is_replayed_by_recovery() {
+    fn startup_recovery_retries_the_acp_transcript_cleanup_before_removing_the_row() {
         let _guard = isolate_app_dir();
         let profile = "purge-transcript-recovery";
         let storage = Storage::new_unwatched(profile).unwrap();
@@ -4651,20 +2723,7 @@ mod tests {
             .run_hooks_with(|_, _| {})
             .complete_with(|_| Err("forced transcript store failure".to_string()));
         assert_eq!(result.disposition, DeletionDisposition::Failed);
-        assert!(result.teardown_started);
-        let rows = storage.load().unwrap();
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].status, Status::Deleting);
-        assert!(rows[0].lifecycle_reservation.is_some());
-        let journal =
-            crate::session::lifecycle_journal::scan([storage.sessions_path().to_path_buf()])
-                .entries
-                .into_iter()
-                .next()
-                .expect("failed cleanup must leave its journal")
-                .1
-                .unwrap();
-        assert_eq!(journal.phase, LifecyclePhase::TeardownStarted);
+        assert_eq!(storage.load().unwrap().len(), 1);
 
         let db_path = crate::session::get_app_dir().unwrap().join("acp_events.db");
         let conn = rusqlite::Connection::open(&db_path).unwrap();
@@ -4684,18 +2743,6 @@ mod tests {
         )
         .unwrap();
         drop(conn);
-
-        storage
-            .update(|instances, _groups| {
-                let reservation = instances[0]
-                    .lifecycle_reservation
-                    .as_mut()
-                    .expect("failed purge reservation");
-                reservation.at =
-                    Utc::now() - Instance::LIFECYCLE_RESERVATION_TTL - chrono::Duration::seconds(1);
-                Ok(())
-            })
-            .unwrap();
 
         recover_lifecycle_journals_once().unwrap();
         assert!(storage.load().unwrap().is_empty());
@@ -4853,7 +2900,7 @@ mod tests {
 
     #[test]
     #[serial]
-    fn committed_purge_keeps_its_journal_when_acp_cleanup_fails() {
+    fn committed_purge_keeps_row_and_journal_when_acp_cleanup_fails() {
         let _guard = isolate_app_dir();
         let profile = "committed-purge-acp-failure";
         let storage = Storage::new_unwatched(profile).unwrap();
@@ -4889,71 +2936,14 @@ mod tests {
             .contains("ACP transcript cleanup failed"));
         let rows = storage.load().unwrap();
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].status, Status::Deleting);
-        assert!(rows[0].lifecycle_reservation.is_some());
+        assert_eq!(rows[0].status, Status::Idle);
+        assert!(rows[0].lifecycle_reservation.is_none());
         let journals =
             crate::session::lifecycle_journal::scan([storage.sessions_path().to_path_buf()]);
         assert_eq!(journals.entries.len(), 1);
-        assert!(journals.entries[0]
-            .1
-            .as_ref()
-            .is_ok_and(|entry| entry.phase == LifecyclePhase::TeardownStarted));
-
-        recover_lifecycle_journals_once().unwrap();
-        let rows = storage.load().unwrap();
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].status, Status::Deleting);
-        assert!(rows[0].lifecycle_reservation.is_some());
-    }
-
-    #[test]
-    #[serial]
-    fn recovery_preserves_the_row_owned_generation_when_a_newer_journal_is_orphaned() {
-        let _guard = isolate_app_dir();
-        let profile = "purge-recovery-generation-crash";
-        let storage = Storage::new_unwatched(profile).unwrap();
-        let mut instance = Instance::new("generation-crash", "/tmp/generation-crash");
-        instance.source_profile = profile.to_string();
-        let (snapshot, deleting_row, generation) = expired_deleting_row(instance);
-        storage
-            .update(|instances, _groups| {
-                instances.push(deleting_row);
-                Ok(())
-            })
-            .unwrap();
-
-        let entry = crate::session::lifecycle_journal::LifecycleJournalEntry::deletion(
-            snapshot,
-            Status::Idle,
-            storage.sessions_path().to_path_buf(),
-            crate::session::lifecycle_journal::LifecycleDeletionOptions {
-                generation,
-                delete_worktree: false,
-                delete_branch: false,
-                delete_sandbox: false,
-                force_delete: false,
-                detach_hooks: true,
-                keep_scratch: false,
-                purge_acp_transcript: false,
-            },
-        );
-        let owned_path = crate::session::lifecycle_journal::record(&entry).unwrap();
-        let orphan_path =
-            crate::session::lifecycle_journal::record(&entry.with_generation(generation + 1))
-                .unwrap();
-        assert_ne!(owned_path, orphan_path);
-
-        recover_lifecycle_journals_once().unwrap();
-
-        assert!(
-            storage.load().unwrap().is_empty(),
-            "recovery should follow the generation still owned by the row"
-        );
-        assert!(
-            crate::session::lifecycle_journal::scan([storage.sessions_path().to_path_buf()])
-                .entries
-                .is_empty()
-        );
+        let entry = journals.entries[0].1.as_ref().unwrap();
+        assert_eq!(entry.phase, LifecyclePhase::TeardownStarted);
+        assert!(entry.purge_acp_transcript);
     }
 
     #[test]
@@ -4964,19 +2954,18 @@ mod tests {
         let storage = Storage::new_unwatched(profile).unwrap();
         let mut instance = Instance::new("replay", "/tmp/replay-project");
         instance.source_profile = profile.to_string();
-        let (snapshot, deleting_row, generation) = expired_deleting_row(instance.clone());
         storage
             .update(|instances, _groups| {
-                instances.push(deleting_row.clone());
+                instances.push(instance.clone());
                 Ok(())
             })
             .unwrap();
         let entry = crate::session::lifecycle_journal::LifecycleJournalEntry::deletion(
-            snapshot,
+            instance.clone(),
             Status::Idle,
             storage.sessions_path().to_path_buf(),
             crate::session::lifecycle_journal::LifecycleDeletionOptions {
-                generation,
+                generation: 0,
                 delete_worktree: false,
                 delete_branch: false,
                 delete_sandbox: false,
@@ -4987,32 +2976,6 @@ mod tests {
             },
         );
         crate::session::lifecycle_journal::record(&entry).unwrap();
-        recover_lifecycle_journals_once().unwrap();
-        assert!(storage.load().unwrap().is_empty());
-        assert!(
-            crate::session::lifecycle_journal::scan([storage.sessions_path().to_path_buf()])
-                .entries
-                .is_empty()
-        );
-
-        let mut abandoned_row = Instance::new("abandoned", "/tmp/abandoned-project");
-        abandoned_row.source_profile = profile.to_string();
-        let abandoned_entry = crate::session::lifecycle_journal::LifecycleJournalEntry::deletion(
-            abandoned_row,
-            Status::Idle,
-            storage.sessions_path().to_path_buf(),
-            crate::session::lifecycle_journal::LifecycleDeletionOptions {
-                generation: 1,
-                delete_worktree: false,
-                delete_branch: false,
-                delete_sandbox: false,
-                force_delete: false,
-                detach_hooks: true,
-                keep_scratch: false,
-                purge_acp_transcript: false,
-            },
-        );
-        crate::session::lifecycle_journal::record(&abandoned_entry).unwrap();
         recover_lifecycle_journals_once().unwrap();
         assert!(storage.load().unwrap().is_empty());
         assert!(
@@ -5055,883 +3018,6 @@ mod tests {
                 .entries
                 .is_empty()
         );
-    }
-    fn seed_expired_purge(storage: &Storage, instance: Instance, phase: LifecyclePhase) -> PathBuf {
-        let (snapshot, row, generation) = expired_deleting_row(instance);
-        storage
-            .update(|rows, _| {
-                rows.push(row.clone());
-                Ok(())
-            })
-            .unwrap();
-        let entry = crate::session::lifecycle_journal::LifecycleJournalEntry::deletion(
-            snapshot,
-            Status::Idle,
-            storage.sessions_path().to_path_buf(),
-            crate::session::lifecycle_journal::LifecycleDeletionOptions {
-                generation,
-                delete_worktree: false,
-                delete_branch: false,
-                delete_sandbox: false,
-                force_delete: false,
-                detach_hooks: true,
-                keep_scratch: false,
-                purge_acp_transcript: false,
-            },
-        )
-        .with_phase(phase);
-        crate::session::lifecycle_journal::record(&entry).unwrap()
-    }
-
-    #[test]
-    #[serial]
-    fn pre_teardown_rollback_and_irreversible_failures_are_visible_to_cached_observers() {
-        for path in ["drop", "complete", "finish"] {
-            let _home = isolate_app_dir();
-            let storage = Storage::new_unwatched("rollback-observer").unwrap();
-            let mut instance = stored_instance(&storage, "rollback-observer", "/unused");
-            instance.view = crate::session::View::Structured;
-            storage
-                .update(|rows, _| {
-                    rows[0] = instance.clone();
-                    Ok(())
-                })
-                .unwrap();
-            let transaction = match PurgeTransaction::reserve_with_acp_transcript(
-                storage.clone(),
-                request(instance),
-            )
-            .unwrap()
-            {
-                PurgeReservation::Reserved(transaction) => transaction,
-                PurgeReservation::Rejected(result) => panic!("unexpected rejection: {result:?}"),
-            };
-            let observed = storage.load().unwrap().remove(0);
-            assert_eq!(observed.status, Status::Deleting);
-            match path {
-                "drop" => drop(transaction),
-                "complete" => {
-                    assert!(
-                        !transaction
-                            .run_hooks_with(|_, _| {})
-                            .complete_with(|_| Err("store unavailable".into()))
-                            .success
-                    );
-                }
-                "finish" => {
-                    assert!(
-                        !transaction
-                            .run_hooks_with(|_, _| {})
-                            .begin_irreversible()
-                            .unwrap()
-                            .finish_with_transcript_cleanup(|_| anyhow::bail!("store unavailable"))
-                            .success
-                    );
-                }
-                _ => unreachable!(),
-            }
-            let reloaded = storage.load().unwrap().remove(0);
-            if path == "drop" {
-                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
-                let mut reloaded = reloaded;
-                while reloaded.lifecycle_reservation.is_some() {
-                    assert!(
-                        std::time::Instant::now() < deadline,
-                        "owned rollback did not complete"
-                    );
-                    std::thread::sleep(std::time::Duration::from_millis(5));
-                    reloaded = storage.load().unwrap().remove(0);
-                }
-                assert_eq!(reloaded.status, Status::Idle);
-                reloaded.merge_runtime_from_reload(&observed);
-                assert_eq!(
-                    reloaded.status,
-                    Status::Idle,
-                    "cached Deleting overwrote the reversible rollback"
-                );
-            } else {
-                assert_eq!(reloaded.status, Status::Deleting);
-                assert!(reloaded.lifecycle_reservation_is_owned(
-                    LifecycleOperation::Purge,
-                    observed.lifecycle_generation
-                ));
-                let mut merged = reloaded;
-                merged.merge_runtime_from_reload(&observed);
-                assert_eq!(
-                    merged.status,
-                    Status::Deleting,
-                    "{path}: cached state changed after the irreversible boundary"
-                );
-            }
-        }
-    }
-
-    #[test]
-    #[serial]
-    fn live_hook_owner_blocks_recovery_after_wall_clock_expiry() {
-        let _home = isolate_app_dir();
-        let storage = Storage::new_unwatched("live-owner").unwrap();
-        let workspace = crate::session::scratch::provision_scratch_dir("live-owner").unwrap();
-        std::fs::write(workspace.join("retained"), b"live hook owns workspace").unwrap();
-        let mut instance = stored_instance(&storage, "live-owner", workspace.to_str().unwrap());
-        instance.scratch = true;
-        storage
-            .update(|rows, _| {
-                rows[0] = instance.clone();
-                Ok(())
-            })
-            .unwrap();
-        let transaction = reserve("live-owner", instance);
-        let generation = transaction.generation;
-        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
-        let (release_tx, release_rx) = std::sync::mpsc::channel();
-        let owner = std::thread::spawn(move || {
-            transaction
-                .run_hooks_with(|_, _| {
-                    ready_tx.send(()).unwrap();
-                    release_rx.recv().unwrap();
-                })
-                .complete()
-        });
-        ready_rx
-            .recv_timeout(std::time::Duration::from_secs(3))
-            .unwrap();
-        storage
-            .update(|rows, _| {
-                rows[0].lifecycle_reservation.as_mut().unwrap().at =
-                    Utc::now() - chrono::Duration::days(1);
-                Ok(())
-            })
-            .unwrap();
-        let recovery = recover_lifecycle_journals_once();
-        let retained = workspace.join("retained").exists();
-        let still_owned =
-            storage.load().unwrap().iter().any(|row| {
-                row.lifecycle_reservation_is_owned(LifecycleOperation::Purge, generation)
-            });
-        release_tx.send(()).unwrap();
-        owner.join().unwrap();
-        recovery.unwrap();
-        assert!(retained, "recovery tore down beside a live hook owner");
-        assert!(
-            still_owned,
-            "recovery stole the live transaction generation"
-        );
-    }
-
-    #[test]
-    #[serial]
-    fn journal_errors_preserve_resources_and_scope_recovery() {
-        #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-        enum Case {
-            Malformed,
-            Future,
-            HigherMalformed,
-            Unidentified,
-            #[cfg(unix)]
-            PermissionDenied,
-        }
-        for case in [
-            Case::Malformed,
-            Case::Future,
-            Case::HigherMalformed,
-            Case::Unidentified,
-            #[cfg(unix)]
-            Case::PermissionDenied,
-        ] {
-            #[cfg(unix)]
-            if case == Case::PermissionDenied && unsafe { libc::geteuid() } == 0 {
-                eprintln!("PermissionDenied observation unavailable with root DAC override");
-                continue;
-            }
-
-            let _home = isolate_app_dir();
-            let storage = Storage::new_unwatched("isolated-errors").unwrap();
-            let bad_workspace = crate::session::scratch::provision_scratch_dir("bad").unwrap();
-            let good_workspace = crate::session::scratch::provision_scratch_dir("good").unwrap();
-            std::fs::write(bad_workspace.join("retained"), b"unknown intent retained").unwrap();
-            std::fs::write(good_workspace.join("retained"), b"healthy intent").unwrap();
-            let mut bad = Instance::new("bad", bad_workspace.to_str().unwrap());
-            bad.id = "bad".into();
-            bad.source_profile = "isolated-errors".into();
-            bad.scratch = true;
-            let bad_path = seed_expired_purge(&storage, bad, LifecyclePhase::HooksComplete);
-            let mut good = Instance::new("good", good_workspace.to_str().unwrap());
-            good.id = "good".into();
-            good.source_profile = "isolated-errors".into();
-            good.scratch = true;
-            seed_expired_purge(&storage, good, LifecyclePhase::HooksComplete);
-            let mut error_path = bad_path.clone();
-            match case {
-                Case::Malformed => std::fs::write(&error_path, b"malformed").unwrap(),
-                Case::Future => {
-                    let mut entry = crate::session::lifecycle_journal::read_deletion(&bad_path)
-                        .unwrap()
-                        .unwrap();
-                    entry.version += 1;
-                    crate::session::lifecycle_journal::update(&error_path, &entry).unwrap();
-                }
-                Case::HigherMalformed => {
-                    let entry = crate::session::lifecycle_journal::read_deletion(&bad_path)
-                        .unwrap()
-                        .unwrap();
-                    error_path = crate::session::lifecycle_journal::record(
-                        &entry.with_generation(entry.generation + 1),
-                    )
-                    .unwrap();
-                    std::fs::write(&error_path, b"malformed higher same SID").unwrap();
-                }
-                Case::Unidentified => {
-                    error_path = bad_path.parent().unwrap().join("unidentifiable.json");
-                    std::fs::write(&error_path, b"unattributable journal bytes").unwrap();
-                }
-                #[cfg(unix)]
-                Case::PermissionDenied => {
-                    use std::os::unix::fs::PermissionsExt as _;
-                    std::fs::set_permissions(&error_path, std::fs::Permissions::from_mode(0o000))
-                        .unwrap();
-                    assert_eq!(
-                        std::fs::read(&error_path).unwrap_err().kind(),
-                        std::io::ErrorKind::PermissionDenied
-                    );
-                    let error = crate::session::lifecycle_journal::deletion_exists(
-                        storage.sessions_path(),
-                        "bad",
-                        1,
-                    )
-                    .unwrap_err();
-                    assert_eq!(
-                        error.downcast_ref::<std::io::Error>().unwrap().kind(),
-                        std::io::ErrorKind::PermissionDenied
-                    );
-                }
-            }
-
-            recover_lifecycle_journals_once().unwrap();
-            #[cfg(unix)]
-            if case == Case::PermissionDenied {
-                use std::os::unix::fs::PermissionsExt as _;
-                std::fs::set_permissions(&error_path, std::fs::Permissions::from_mode(0o600))
-                    .unwrap();
-            }
-            assert_eq!(
-                std::fs::read(bad_workspace.join("retained")).unwrap(),
-                b"unknown intent retained",
-                "{case:?}"
-            );
-            assert!(bad_path.exists(), "{case:?}");
-            assert!(error_path.exists(), "{case:?}");
-            let profile_blocked = case == Case::Unidentified;
-            let rows = storage.load().unwrap();
-            assert!(
-                rows.iter()
-                    .any(|row| row.id == "bad" && row.status == Status::Deleting),
-                "{case:?}"
-            );
-            assert_eq!(
-                rows.iter().any(|row| row.id == "good"),
-                profile_blocked,
-                "{case:?}"
-            );
-            assert_eq!(good_workspace.exists(), profile_blocked, "{case:?}");
-            if profile_blocked {
-                assert_eq!(
-                    std::fs::read(&error_path).unwrap(),
-                    b"unattributable journal bytes"
-                );
-                assert_eq!(
-                    std::fs::read(good_workspace.join("retained")).unwrap(),
-                    b"healthy intent"
-                );
-            }
-            #[cfg(unix)]
-            if case == Case::PermissionDenied {
-                crate::session::lifecycle_journal::consume(&bad_path).unwrap();
-                assert!(!crate::session::lifecycle_journal::deletion_exists(
-                    storage.sessions_path(),
-                    "bad",
-                    1
-                )
-                .unwrap());
-            }
-        }
-    }
-
-    #[test]
-    #[serial]
-    fn profile_rename_preserves_interrupted_purge_recovery() {
-        let _home = isolate_app_dir();
-        let storage = Storage::new_unwatched("before").unwrap();
-        let workspace = crate::session::scratch::provision_scratch_dir("rename").unwrap();
-        let mut instance = Instance::new("rename", workspace.to_str().unwrap());
-        instance.id = "rename".into();
-        instance.source_profile = "before".into();
-        instance.scratch = true;
-        seed_expired_purge(&storage, instance, LifecyclePhase::HooksComplete);
-        crate::session::rename_profile("before", "after").unwrap();
-        let renamed = Storage::open_unwatched("after").unwrap();
-        recover_lifecycle_journals_once().unwrap();
-        assert!(!workspace.exists(), "renamed profile stranded its purge");
-        assert!(renamed.load().unwrap().is_empty());
-        assert!(
-            crate::session::lifecycle_journal::scan([renamed.sessions_path().to_path_buf()])
-                .entries
-                .is_empty()
-        );
-    }
-
-    #[test]
-    #[serial]
-    fn cached_storage_mutation_cannot_recreate_a_renamed_profile() {
-        let _home = isolate_app_dir();
-        let storage = Storage::new_unwatched("cached-before").unwrap();
-        let row = stored_instance(&storage, "cached", "/repo");
-        crate::session::rename_profile("cached-before", "cached-after").unwrap();
-        let mutation = storage.update(|rows, _| {
-            rows.clear();
-            Ok(())
-        });
-        assert!(
-            mutation.is_err(),
-            "cached write recreated the renamed source profile"
-        );
-        assert!(!crate::session::get_profile_dir_path("cached-before")
-            .unwrap()
-            .exists());
-        let renamed = Storage::open_unwatched("cached-after").unwrap();
-        assert_eq!(renamed.load().unwrap()[0].id, row.id);
-    }
-
-    #[test]
-    #[serial]
-    fn restored_owned_row_releases_abandoned_purge_reservation() {
-        let _home = isolate_app_dir();
-        let storage = Storage::new_unwatched("restored-owned").unwrap();
-        let mut instance = Instance::new("restored", "/unused");
-        instance.source_profile = "restored-owned".into();
-        instance.trashed_at = Some(Utc::now());
-        let path = seed_expired_purge(&storage, instance.clone(), LifecyclePhase::HooksComplete);
-        storage
-            .update(|rows, _| {
-                rows[0].trashed_at = None;
-                Ok(())
-            })
-            .unwrap();
-        recover_lifecycle_journals_once().unwrap();
-        let row = storage.load().unwrap().remove(0);
-        assert_eq!(
-            row.status,
-            Status::Idle,
-            "consumed journal stranded owned Deleting"
-        );
-        assert!(row.lifecycle_reservation.is_none());
-        assert!(!path.exists());
-    }
-    #[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
-    #[test]
-    #[serial]
-    fn recovery_rechecks_unknown_runner_artifacts_after_destroy_hooks() {
-        use crate::session::config::profile_config::{save_profile_config, ProfileConfig};
-        use std::os::unix::fs::FileTypeExt;
-        let temp = tempfile::TempDir::with_prefix_in("aoe-", "/tmp").unwrap();
-        let _home = isolate_app_dir_at(temp.path());
-        let profile = "hook-recovery";
-        let storage = Storage::new_unwatched(profile).unwrap();
-        let session_id = "hook-socket";
-        let workspace = crate::session::scratch::provision_scratch_dir(session_id).unwrap();
-        std::fs::write(
-            workspace.join("retained"),
-            b"hook cannot invalidate writer absence",
-        )
-        .unwrap();
-        let base = crate::process::worker_registry::socket_path_for(session_id).unwrap();
-        let control = crate::process::worker::control_socket_sibling(&base);
-        let hook_marker = temp.path().join("hook-done");
-        let runner_marker = temp.path().join("runner-done");
-        let executable = std::env::current_exe().unwrap();
-        let command = format!(
-            "AOE_TEST_CONTROL_RUNNER_NEW_SESSION=1 AOE_TEST_CONTROL_RUNNER_REPLACE_SOCKET_ON_TERM=1 AOE_TEST_CONTROL_RUNNER_SOCKET='{}' AOE_TEST_CONTROL_RUNNER_MARKER='{}' '{}' --exact process::worker_registry::tests::control_socket_runner_helper >/dev/null 2>&1 & runner=$!; attempt=0; while [ ! -S '{}' ] && [ \"$attempt\" -lt 300 ]; do attempt=$((attempt + 1)); sleep 0.01; done; [ -S '{}' ] || {{ kill \"$runner\"; wait \"$runner\"; exit 1; }}; printf done > '{}'",
-            control.display(),
-            runner_marker.display(),
-            executable.display(),
-            control.display(),
-            control.display(),
-            hook_marker.display()
-        );
-        let config: ProfileConfig =
-            serde_json::from_value(serde_json::json!({ "hooks": { "on_destroy": [command] } }))
-                .unwrap();
-        save_profile_config(profile, &config).unwrap();
-        let mut instance = Instance::new("hook", workspace.to_str().unwrap());
-        instance.id = session_id.into();
-        instance.source_profile = profile.into();
-        instance.view = crate::session::View::Structured;
-        instance.scratch = true;
-        let (snapshot, row, generation) = expired_deleting_row(instance);
-        storage
-            .update(|rows, _| {
-                rows.push(row.clone());
-                Ok(())
-            })
-            .unwrap();
-        let entry = crate::session::lifecycle_journal::LifecycleJournalEntry::deletion(
-            snapshot,
-            Status::Idle,
-            storage.sessions_path().to_path_buf(),
-            crate::session::lifecycle_journal::LifecycleDeletionOptions {
-                generation,
-                delete_worktree: false,
-                delete_branch: false,
-                delete_sandbox: false,
-                force_delete: false,
-                detach_hooks: true,
-                keep_scratch: false,
-                purge_acp_transcript: false,
-            },
-        );
-        crate::session::lifecycle_journal::record(&entry).unwrap();
-        recover_lifecycle_journals_once().unwrap();
-        assert_eq!(std::fs::read_to_string(&hook_marker).unwrap(), "done");
-        assert_eq!(std::fs::read_to_string(&runner_marker).unwrap(), "SIGTERM");
-        assert!(std::fs::symlink_metadata(&control)
-            .unwrap()
-            .file_type()
-            .is_socket());
-        assert_eq!(crate::process::worker::peer_pid_from_socket(&control), None);
-        assert!(crate::process::worker_registry::load(session_id)
-            .unwrap()
-            .is_none());
-        assert!(
-            workspace.join("retained").exists(),
-            "recovery removed scratch after hooks invalidated artifact absence"
-        );
-        let retained = storage.load().unwrap().remove(0);
-        assert_eq!(retained.status, Status::Deleting);
-        assert!(retained.lifecycle_reservation.is_some());
-        let scan = crate::session::lifecycle_journal::scan([storage.sessions_path().to_path_buf()]);
-        let journal = scan
-            .entries
-            .iter()
-            .find(|(_, entry)| entry.as_ref().unwrap().session_id == session_id)
-            .unwrap();
-        assert_eq!(
-            journal.1.as_ref().unwrap().phase,
-            LifecyclePhase::HooksComplete
-        );
-        std::fs::remove_file(&control).unwrap();
-        storage
-            .update(|rows, _| {
-                rows[0].lifecycle_reservation.as_mut().unwrap().at =
-                    Utc::now() - chrono::Duration::days(1);
-                Ok(())
-            })
-            .unwrap();
-        recover_lifecycle_journals_once().unwrap();
-        assert!(!workspace.exists());
-        assert!(storage.load().unwrap().is_empty());
-        assert!(
-            crate::session::lifecycle_journal::scan([storage.sessions_path().to_path_buf()])
-                .entries
-                .is_empty()
-        );
-    }
-
-    #[test]
-    #[serial]
-    fn recovery_does_not_replay_a_purge_after_the_session_moves_profiles() {
-        let _guard = isolate_app_dir();
-        let source_profile = "purge-moved-source";
-        let destination_profile = "purge-moved-destination";
-        let source = Storage::new_unwatched(source_profile).unwrap();
-        let destination = Storage::new_unwatched(destination_profile).unwrap();
-        let (_temp, main_repo, worktree_path, mut instance) =
-            worktree_fixture("feature/moved-during-purge");
-        instance.source_profile = source_profile.to_string();
-
-        let mut moved_instance = instance.clone();
-        moved_instance.source_profile = destination_profile.to_string();
-        destination
-            .update(|instances, _groups| {
-                instances.push(moved_instance.clone());
-                Ok(())
-            })
-            .unwrap();
-
-        let entry = crate::session::lifecycle_journal::LifecycleJournalEntry::deletion(
-            instance,
-            Status::Idle,
-            source.sessions_path().to_path_buf(),
-            crate::session::lifecycle_journal::LifecycleDeletionOptions {
-                generation: 1,
-                delete_worktree: true,
-                delete_branch: true,
-                delete_sandbox: false,
-                force_delete: true,
-                detach_hooks: true,
-                keep_scratch: false,
-                purge_acp_transcript: false,
-            },
-        )
-        .with_phase(LifecyclePhase::TeardownStarted);
-        let journal_path = crate::session::lifecycle_journal::record(&entry).unwrap();
-
-        recover_lifecycle_journals_once().unwrap();
-
-        assert!(worktree_path.exists(), "moved session worktree was removed");
-        assert!(main_repo.exists());
-        assert!(branch_exists(&main_repo, "feature/moved-during-purge"));
-        assert!(source.load().unwrap().is_empty());
-        assert_eq!(destination.load().unwrap().len(), 1);
-        let retained = crate::session::lifecycle_journal::read_deletion(&journal_path)
-            .unwrap()
-            .expect("irreversible purge intent must remain available for recovery");
-        assert_eq!(retained.phase, LifecyclePhase::TeardownStarted);
-    }
-
-    #[test]
-    #[serial]
-    fn recovery_rechecks_the_journal_after_acquiring_the_lifecycle_lock() {
-        let _guard = isolate_app_dir();
-        let profile = "purge-stale-scan";
-        let storage = Storage::new_unwatched(profile).unwrap();
-        let mut instance = Instance::new("stale-scan", "/tmp/stale-scan-project");
-        instance.source_profile = profile.to_string();
-        let (snapshot, deleting_row, generation) = expired_deleting_row(instance);
-        storage
-            .update(|instances, _groups| {
-                instances.push(deleting_row.clone());
-                Ok(())
-            })
-            .unwrap();
-        let scanned_entry = crate::session::lifecycle_journal::LifecycleJournalEntry::deletion(
-            snapshot,
-            Status::Idle,
-            storage.sessions_path().to_path_buf(),
-            crate::session::lifecycle_journal::LifecycleDeletionOptions {
-                generation,
-                delete_worktree: false,
-                delete_branch: false,
-                delete_sandbox: false,
-                force_delete: false,
-                detach_hooks: true,
-                keep_scratch: false,
-                purge_acp_transcript: false,
-            },
-        )
-        .with_phase(LifecyclePhase::TeardownStarted);
-        let path = crate::session::lifecycle_journal::record(&scanned_entry).unwrap();
-        crate::session::lifecycle_journal::update(
-            &path,
-            &scanned_entry.with_generation(generation + 1),
-        )
-        .unwrap();
-
-        assert_eq!(
-            recover_lifecycle_entry(&path, &scanned_entry, &storage).unwrap(),
-            RecoveryOutcome::Unprocessed
-        );
-        let row = storage.load().unwrap().remove(0);
-        assert_eq!(row.status, Status::Deleting);
-        assert!(row.lifecycle_reservation_is_owned(LifecycleOperation::Purge, generation));
-        assert_eq!(
-            crate::session::lifecycle_journal::read_deletion(&path)
-                .unwrap()
-                .unwrap()
-                .generation,
-            generation + 1
-        );
-    }
-
-    #[test]
-    #[serial]
-    fn stale_purge_paths_preserve_successor_statuses() {
-        let _guard = isolate_app_dir();
-        let profile = "purge-successor-status";
-        let storage = Storage::new_unwatched(profile).unwrap();
-
-        let release_instance = stored_instance(&storage, profile, "/tmp/release-project");
-        let mut release = reserve(profile, release_instance.clone());
-        storage
-            .update(|instances, _groups| {
-                instances
-                    .iter_mut()
-                    .find(|row| row.id == release_instance.id)
-                    .unwrap()
-                    .status = Status::Running;
-                Ok(())
-            })
-            .unwrap();
-        let released = release.release_reservation().unwrap().unwrap();
-        assert_eq!(released.status, Status::Running);
-        assert!(released.lifecycle_reservation.is_none());
-
-        let gate_instance = stored_instance(&storage, profile, "/tmp/gate-project");
-        let mut gate = reserve(profile, gate_instance.clone());
-        storage
-            .update(|instances, _groups| {
-                instances
-                    .iter_mut()
-                    .find(|row| row.id == gate_instance.id)
-                    .unwrap()
-                    .status = Status::Running;
-                Ok(())
-            })
-            .unwrap();
-        let (decision, gated) = gate.gate().unwrap();
-        assert_eq!(decision, CompletionGate::Superseded);
-        let gated = gated.unwrap();
-        assert_eq!(gated.status, Status::Running);
-        assert!(gated.lifecycle_reservation.is_none());
-
-        let drop_instance = stored_instance(&storage, profile, "/tmp/drop-project");
-        let dropped = reserve(profile, drop_instance.clone());
-        storage
-            .update(|instances, _groups| {
-                instances
-                    .iter_mut()
-                    .find(|row| row.id == drop_instance.id)
-                    .unwrap()
-                    .status = Status::Running;
-                Ok(())
-            })
-            .unwrap();
-        drop(dropped);
-        let deadline = std::time::Instant::now() + Duration::from_secs(3);
-        let dropped_row = loop {
-            let row = storage
-                .load()
-                .unwrap()
-                .into_iter()
-                .find(|row| row.id == drop_instance.id)
-                .unwrap();
-            if row.lifecycle_reservation.is_none() {
-                break row;
-            }
-            assert!(
-                std::time::Instant::now() < deadline,
-                "dropped purge reservation was not released"
-            );
-            std::thread::sleep(Duration::from_millis(5));
-        };
-        assert_eq!(dropped_row.status, Status::Running);
-
-        let begin_instance = stored_instance(&storage, profile, "/tmp/begin-project");
-        let begin = reserve(profile, begin_instance.clone()).run_hooks_with(|_, _| {});
-        let mut successor_generation = None;
-        storage
-            .update(|instances, _groups| {
-                let row = instances
-                    .iter_mut()
-                    .find(|row| row.id == begin_instance.id)
-                    .unwrap();
-                row.lifecycle_reservation
-                    .as_mut()
-                    .expect("old reservation")
-                    .at =
-                    Utc::now() - Instance::LIFECYCLE_RESERVATION_TTL - chrono::Duration::seconds(1);
-                let generation = row
-                    .try_acquire_lifecycle_reservation(
-                        LifecycleOperation::Purge,
-                        Instance::LIFECYCLE_RESERVATION_TTL,
-                        Utc::now(),
-                    )
-                    .unwrap();
-                row.status = Status::Deleting;
-                successor_generation = Some(generation);
-                Ok(())
-            })
-            .unwrap();
-        let Err(result) = begin.begin_irreversible() else {
-            panic!("stale purge crossed the irreversible boundary");
-        };
-        assert_eq!(result.disposition, DeletionDisposition::Busy);
-        let begun = storage
-            .load()
-            .unwrap()
-            .into_iter()
-            .find(|row| row.id == begin_instance.id)
-            .unwrap();
-        assert_eq!(begun.status, Status::Deleting);
-        assert!(begun.lifecycle_reservation_is_owned(
-            LifecycleOperation::Purge,
-            successor_generation.unwrap()
-        ));
-    }
-
-    #[test]
-    #[serial]
-    fn startup_recovery_finishes_a_terminal_checkpoint_without_repeating_teardown() {
-        let _guard = isolate_app_dir();
-        let profile = "purge-terminal-checkpoint";
-        let storage = Storage::new_unwatched(profile).unwrap();
-        let mut instance = Instance::new("terminal", "/tmp/terminal-project");
-        instance.source_profile = profile.to_string();
-        instance.view = View::Structured;
-        instance.scratch = true;
-        let (snapshot, deleting_row, generation) = expired_deleting_row(instance.clone());
-        storage
-            .update(|instances, _groups| {
-                instances.push(deleting_row.clone());
-                Ok(())
-            })
-            .unwrap();
-
-        let entry = crate::session::lifecycle_journal::LifecycleJournalEntry::deletion(
-            snapshot,
-            Status::Idle,
-            storage.sessions_path().to_path_buf(),
-            crate::session::lifecycle_journal::LifecycleDeletionOptions {
-                generation,
-                delete_worktree: false,
-                delete_branch: false,
-                delete_sandbox: false,
-                force_delete: false,
-                detach_hooks: false,
-                keep_scratch: false,
-                purge_acp_transcript: false,
-            },
-        )
-        .with_kept_resources(vec!["scratch workspace".to_string()])
-        .with_phase(LifecyclePhase::TeardownComplete);
-        crate::session::lifecycle_journal::record(&entry).unwrap();
-        crate::process::worker_registry::fence_for_purge(
-            &entry.session_id,
-            &entry.source_profile,
-            entry.generation,
-        )
-        .unwrap();
-
-        recover_lifecycle_journals_once().unwrap();
-
-        assert!(storage.load().unwrap().is_empty());
-        assert!(!crate::process::worker_registry::is_purge_fenced(&entry.session_id).unwrap());
-        let journals =
-            crate::session::lifecycle_journal::scan([storage.sessions_path().to_path_buf()]);
-        assert_eq!(journals.entries.len(), 1);
-        let retained = journals.entries[0].1.as_ref().unwrap();
-        assert_eq!(retained.phase, LifecyclePhase::Kept);
-        assert_eq!(
-            retained.kept_resources,
-            vec!["scratch workspace".to_string()]
-        );
-    }
-
-    #[test]
-    #[serial]
-    #[cfg(unix)]
-    fn recovery_stops_a_live_acp_writer_before_removing_its_workspace_and_transcript() {
-        let temp = tempfile::TempDir::with_prefix_in("aoe-purge-", "/tmp").unwrap();
-        let _guard = isolate_app_dir_at(temp.path());
-        let profile = "purge-live-acp-recovery";
-        let storage = Storage::new_unwatched(profile).unwrap();
-        let (_temp, main_repo, worktree_path, mut instance) =
-            worktree_fixture("feature/lifecycle-recovery");
-        instance.source_profile = profile.to_string();
-        instance.view = View::Structured;
-
-        let writer_path = worktree_path.join("live-writer-output");
-        let socket_path = crate::process::worker_registry::socket_path_for(&instance.id).unwrap();
-        let (writer_pid, waiter) = spawn_live_acp_writer(&socket_path, &writer_path);
-        let writer_deadline = std::time::Instant::now() + Duration::from_secs(3);
-        while !writer_path.exists() {
-            assert!(
-                std::time::Instant::now() < writer_deadline,
-                "ACP writer did not touch the worktree"
-            );
-            std::thread::sleep(Duration::from_millis(5));
-        }
-
-        let (snapshot, deleting_row, generation) = expired_deleting_row(instance.clone());
-        storage
-            .update(|instances, _groups| {
-                instances.push(deleting_row.clone());
-                Ok(())
-            })
-            .unwrap();
-        let entry = crate::session::lifecycle_journal::LifecycleJournalEntry::deletion(
-            snapshot,
-            Status::Idle,
-            storage.sessions_path().to_path_buf(),
-            crate::session::lifecycle_journal::LifecycleDeletionOptions {
-                generation,
-                delete_worktree: true,
-                delete_branch: true,
-                delete_sandbox: false,
-                force_delete: true,
-                detach_hooks: false,
-                keep_scratch: false,
-                purge_acp_transcript: true,
-            },
-        )
-        .with_phase(LifecyclePhase::TeardownStarted);
-        crate::session::lifecycle_journal::record(&entry).unwrap();
-
-        let record = crate::process::worker_registry::WorkerRecord::new(
-            instance.id.clone(),
-            writer_pid,
-            socket_path,
-            "codex-acp".to_string(),
-            "codex".to_string(),
-            worktree_path.clone(),
-            None,
-            Vec::new(),
-            Vec::new(),
-            None,
-            Some(profile.to_string()),
-        )
-        .with_generation(1);
-        crate::process::worker_registry::save(&record).unwrap();
-        assert!(crate::process::worker_registry::is_record_live(&record));
-
-        let db_path = crate::session::get_app_dir().unwrap().join("acp_events.db");
-        let _event_store = crate::acp::event_store::EventStore::open(&db_path, 100).unwrap();
-        let conn = rusqlite::Connection::open(&db_path).unwrap();
-        conn.execute(
-            "INSERT INTO acp_events (session_id, seq, event_json, created_at)
-             VALUES (?1, 0, '{}', 0), ('retained', 0, '{}', 0)",
-            rusqlite::params![instance.id],
-        )
-        .unwrap();
-        drop(conn);
-
-        AFTER_PATHS_IN_USE_SCAN.with(|hook| {
-            *hook.borrow_mut() = Some(Box::new(move || {
-                assert!(
-                    !crate::process::runner_group_executing(writer_pid)
-                        .expect("writer membership must be observable before cleanup"),
-                    "ACP writers must stop before managed worktree cleanup starts"
-                );
-            }));
-        });
-
-        recover_lifecycle_journals_once().unwrap();
-        let writer_status = waiter.join().expect("ACP writer waiter panicked");
-        assert!(!writer_status.success());
-        assert!(!worktree_path.exists());
-        assert!(storage.load().unwrap().is_empty());
-        assert!(!crate::process::worker_registry::record_path(&instance.id)
-            .unwrap()
-            .exists());
-        assert!(!crate::process::worker_registry::is_purge_fenced(&instance.id).unwrap());
-
-        let conn = rusqlite::Connection::open(db_path).unwrap();
-        let purged_events: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM acp_events WHERE session_id = ?1",
-                rusqlite::params![instance.id],
-                |row| row.get(0),
-            )
-            .unwrap();
-        let retained_events: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM acp_events WHERE session_id = 'retained'",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(purged_events, 0);
-        assert_eq!(retained_events, 1);
-        assert!(main_repo.exists());
     }
 
     #[test]
@@ -6124,6 +3210,7 @@ mod tests {
                 Teardown::Failed(DockerError::RemoveFailed("daemon busy".into()))
             });
             assert!(!result.success, "a teardown failure must fail the deletion");
+            assert!(result.errors.iter().any(|e| e.contains("Container")));
         }
 
         /// The agent store goes only when a current session's purge fully succeeds.
@@ -6627,7 +3714,8 @@ mod tests {
                 let _ = fs::remove_dir_all(&dir);
                 assert!(survived, "scratch={scratch}: {dir:?} must survive");
                 assert_eq!(
-                    result.success, !scratch,
+                    result.errors.iter().any(|e| e.contains("scratch guard")),
+                    scratch,
                     "scratch={scratch}: {:?}",
                     result.errors
                 );

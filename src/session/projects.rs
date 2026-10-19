@@ -877,7 +877,6 @@ mod tests {
     fn cross_scope_path_collision_needs_override_and_profile_shadows_global() -> Result<()> {
         let temp = tempdir()?;
         let _app_dir = isolate_app_dir_at(temp.path());
-        crate::session::create_profile("default")?;
         let repo = temp.path().join("repoZ");
         let _ = git2::Repository::init(&repo);
 
@@ -888,10 +887,13 @@ mod tests {
             false,
         )?;
         let second = || Project::new("second", repo.to_string_lossy(), ProjectScope::Profile);
-        assert!(matches!(
-            add("default", ProjectScope::Profile, second(), false),
-            Err(RegistryError::Conflict(_))
-        ));
+        let msg = add("default", ProjectScope::Profile, second(), false)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            msg.contains("--allow-override") && msg.contains("global"),
+            "error should mention --allow-override and the other scope, got: {msg}"
+        );
 
         add("default", ProjectScope::Profile, second(), true)?;
         let merged = load_merged("default")?;

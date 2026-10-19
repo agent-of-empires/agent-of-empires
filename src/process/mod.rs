@@ -29,44 +29,6 @@ use linux as platform;
 use macos as platform;
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
 mod platform {
-    use std::path::Path;
-
-    #[cfg(unix)]
-    #[derive(Debug, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
-    pub(crate) struct DirectoryIdentity {
-        device: u64,
-        inode: u64,
-    }
-
-    #[cfg(not(unix))]
-    #[derive(Debug, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
-    pub(crate) struct DirectoryIdentity {
-        created: std::time::SystemTime,
-    }
-
-    pub(crate) fn profile_directory_identity(
-        path: &Path,
-    ) -> anyhow::Result<Option<DirectoryIdentity>> {
-        let metadata = match std::fs::metadata(path) {
-            Ok(metadata) => metadata,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-            Err(error) => return Err(error.into()),
-        };
-        anyhow::ensure!(metadata.is_dir(), "profile is not a directory");
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::MetadataExt;
-            Ok(Some(DirectoryIdentity {
-                device: metadata.dev(),
-                inode: metadata.ino(),
-            }))
-        }
-        #[cfg(not(unix))]
-        Ok(Some(DirectoryIdentity {
-            created: metadata.created()?,
-        }))
-    }
-
     pub(super) fn configure_process_group(_: &mut std::process::Command) {}
 
     pub(super) fn kill_process_group(_: &std::process::Child) {}
@@ -92,12 +54,6 @@ mod platform {
             "process replacement requires Linux or macOS",
         )
     }
-}
-
-pub(crate) use platform::DirectoryIdentity;
-
-pub(crate) fn profile_directory_identity(path: &Path) -> anyhow::Result<Option<DirectoryIdentity>> {
-    platform::profile_directory_identity(path)
 }
 
 pub(crate) const LIVE_PANE_ENV_KEYS: [&str; 3] = ["TERM", "TMUX", "TMUX_PANE"];
@@ -343,38 +299,6 @@ pub(crate) fn rename_exclusive(
     }
 }
 
-/// Move a profile directory without replacing an existing destination.
-/// Platform-specific rename mechanics belong in this module.
-pub(crate) fn rename_profile_directory(source: &Path, destination: &Path) -> std::io::Result<()> {
-    #[cfg(unix)]
-    {
-        let source_parent = source
-            .parent()
-            .filter(|parent| !parent.as_os_str().is_empty())
-            .unwrap_or_else(|| Path::new("."));
-        let destination_parent = destination
-            .parent()
-            .filter(|parent| !parent.as_os_str().is_empty())
-            .unwrap_or_else(|| Path::new("."));
-        let source_name = source.file_name().ok_or_else(|| {
-            std::io::Error::new(std::io::ErrorKind::InvalidInput, "source has no file name")
-        })?;
-        let destination_name = destination.file_name().ok_or_else(|| {
-            std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "destination has no file name",
-            )
-        })?;
-        let source_dir: std::os::fd::OwnedFd = std::fs::File::open(source_parent)?.into();
-        let destination_dir: std::os::fd::OwnedFd = std::fs::File::open(destination_parent)?.into();
-        rename_exclusive(&source_dir, source_name, &destination_dir, destination_name)
-    }
-    #[cfg(not(unix))]
-    {
-        std::fs::rename(source, destination)
-    }
-}
-
 /// Only use this when output is not piped: a full pipe can wedge the child. Prefer
 /// [`run_with_timeout`].
 pub fn wait_with_timeout(
@@ -608,13 +532,6 @@ pub(super) struct PrimeProcessSample {
     pub marked: bool,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct KernelProcessState {
-    pub start_id: u64,
-    pub group: u32,
-    pub writing: bool,
-}
-
 fn prime_selection_mask(
     samples: &[PrimeProcessSample],
     known: &[PrimeProcessIdentity],
@@ -721,7 +638,7 @@ pub(crate) fn prime_processes(
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ProcessBirthIdentity {
     pub boot_id: String,
     pub start_id: String,
@@ -754,14 +671,6 @@ pub(crate) struct RunnerProcessGuard {
 }
 
 impl RunnerProcessGuard {
-    pub(crate) fn matches_identity(
-        &self,
-        pid: u32,
-        fingerprint: Option<ProcessBirthFingerprint>,
-    ) -> bool {
-        !self.obsolete && self.pid == pid && self.fingerprint == fingerprint
-    }
-
     pub(crate) fn capture(
         pid: u32,
         fingerprint: Option<ProcessBirthFingerprint>,
@@ -951,10 +860,6 @@ impl RunnerProcessGuard {
 
     pub(crate) fn settle(&self, grace: Duration) -> anyhow::Result<()> {
         self.signal(libc::SIGTERM)?;
-        self.settle_after_term(grace)
-    }
-
-    pub(crate) fn settle_after_term(&self, grace: Duration) -> anyhow::Result<()> {
         let term_deadline = Instant::now() + grace;
         let kill_deadline = term_deadline + Duration::from_secs(5);
         let mut killed = false;
@@ -1361,27 +1266,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn rename_profile_directory_preserves_an_existing_destination() {
-        let temp = tempfile::tempdir().unwrap();
-        let source = temp.path().join("source");
-        let destination = temp.path().join("destination");
-        std::fs::create_dir(&source).unwrap();
-        std::fs::create_dir(&destination).unwrap();
-        std::fs::write(source.join("value"), "source").unwrap();
-        std::fs::write(destination.join("value"), "destination").unwrap();
-
-        assert!(rename_profile_directory(&source, &destination).is_err());
-        assert_eq!(
-            std::fs::read_to_string(source.join("value")).unwrap(),
-            "source"
-        );
-        assert_eq!(
-            std::fs::read_to_string(destination.join("value")).unwrap(),
-            "destination"
-        );
-    }
-
-    #[test]
     fn prime_process_selection_preserves_scope_across_pid_reuse() {
         let sample = |pid, parent, start: &str, marked| PrimeProcessSample {
             identity: PrimeProcessIdentity {
@@ -1428,34 +1312,6 @@ mod tests {
                 .collect::<Vec<_>>(),
             [30, 31]
         );
-    }
-
-    #[test]
-    fn prime_process_selection_keeps_attested_child_when_parent_sample_is_missing() {
-        let child = PrimeProcessIdentity {
-            pid: 42,
-            start_id: "proc:420".into(),
-        };
-        let selected = select_prime_processes(
-            vec![
-                PrimeProcessSample {
-                    identity: child.clone(),
-                    parent: 99,
-                    marked: false,
-                },
-                PrimeProcessSample {
-                    identity: PrimeProcessIdentity {
-                        pid: 50,
-                        start_id: "proc:500".into(),
-                    },
-                    parent: 1,
-                    marked: false,
-                },
-            ],
-            std::slice::from_ref(&child),
-        );
-
-        assert_eq!(selected, [child]);
     }
 
     #[cfg(target_os = "macos")]

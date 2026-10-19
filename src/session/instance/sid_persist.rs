@@ -92,7 +92,7 @@ pub(crate) fn persist_session_to_storage(
     expected: &ConversationState,
     file_watch: &std::sync::Arc<crate::file_watch::FileWatchService>,
 ) -> SidWrite {
-    let storage = match crate::session::storage::Storage::open(profile, file_watch.clone()) {
+    let storage = match crate::session::storage::Storage::new(profile, file_watch.clone()) {
         Ok(storage) => storage,
         Err(error) => {
             tracing::warn!(target: "session.store", "Cannot open capture storage: {error}");
@@ -234,7 +234,7 @@ impl Instance {
         }
 
         let storage =
-            match crate::session::storage::Storage::open(profile, self.resolve_file_watch()) {
+            match crate::session::storage::Storage::new(profile, self.resolve_file_watch()) {
                 Ok(s) => s,
                 Err(e) => {
                     tracing::warn!(target: "session.store",
@@ -266,7 +266,7 @@ impl Instance {
             return SidPersistOutcome::Skip;
         }
         let storage =
-            match crate::session::storage::Storage::open(profile, self.resolve_file_watch()) {
+            match crate::session::storage::Storage::new(profile, self.resolve_file_watch()) {
                 Ok(storage) => storage,
                 Err(error) => {
                     tracing::warn!(target: "session.store", instance = %self.id, %error,
@@ -1215,7 +1215,6 @@ mod tests {
                 .join(profile)
                 .join("sessions.json"),
         );
-        std::fs::create_dir_all(storage.sessions_path().parent().unwrap()).unwrap();
         let mut inst = make_inst(profile, "title");
         let on_disk = inst.clone();
         storage

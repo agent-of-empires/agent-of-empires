@@ -984,13 +984,6 @@
       "components": ["web/src/components/settings/ProfileSelector.tsx"]
     },
     {
-      "id": "profiles.rename-kept-resources",
-      "kind": "live-playwright",
-      "risk": "high",
-      "specs": ["tests/live/settings-panels.spec.ts"],
-      "components": ["web/src/components/profiles/ProfilesSection.tsx"]
-    },
-    {
       "id": "profiles.page",
       "kind": "mocked-playwright",
       "risk": "high",

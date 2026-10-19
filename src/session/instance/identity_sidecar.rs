@@ -315,7 +315,7 @@ impl Instance {
         if !pi_transcript_names(path, &observation.sid) {
             return true;
         }
-        match crate::session::storage::Storage::open(
+        match crate::session::storage::Storage::new(
             &self.effective_profile(),
             self.resolve_file_watch(),
         ) {

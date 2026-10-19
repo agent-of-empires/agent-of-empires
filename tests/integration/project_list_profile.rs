@@ -35,7 +35,6 @@ async fn list_projects_resolves_overrides_for_the_requested_profile() {
     std::fs::create_dir_all(&repo).unwrap();
 
     for (profile, sandbox) in [("a", false), ("b", true)] {
-        agent_of_empires::session::create_profile(profile).unwrap();
         let project = Project::new("demo", repo.to_string_lossy(), ProjectScope::Profile)
             .with_overrides(ProjectOverrides {
                 sandbox_enabled: Some(sandbox),
@@ -67,9 +66,6 @@ async fn list_projects_fails_when_a_registry_is_unreadable() {
     let home = crate::common::setup_temp_home();
     let repo = home.path().join("demo");
     std::fs::create_dir_all(&repo).unwrap();
-    for profile in ["a", "b"] {
-        agent_of_empires::session::create_profile(profile).unwrap();
-    }
     let project = Project::new("demo", repo.to_string_lossy(), ProjectScope::Profile)
         .with_overrides(ProjectOverrides {
             sandbox_enabled: Some(true),

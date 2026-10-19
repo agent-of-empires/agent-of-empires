@@ -102,7 +102,7 @@ impl HomeView {
         let boot_size = self.live_send_boot_size();
         match &target {
             live_send::LiveSendTarget::Agent => {
-                // A shelved agent or pending handoff takes no input, even with a live pane.
+                // An archived or trashed agent takes no input, even with a live pane.
                 if let Some(blocked) = self.start_blocked(session_id) {
                     self.info_dialog =
                         Some(InfoDialog::new("Live send failed", &blocked.to_string()));

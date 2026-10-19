@@ -1,4 +1,4 @@
-//! Preserve legacy ownership as unknown instead of inferring it from current PID occupants.
+//! Preserve legacy ownership without inventing kernel birth or native epoch authority.
 
 use anyhow::Result;
 use serde_json::Value;
@@ -50,7 +50,27 @@ fn run_in(app: &Path) -> Result<()> {
             continue;
         };
         let changed = if is_record && !object.contains_key("runner_identity") {
-            object.insert("runner_identity".into(), Value::Null);
+            let identity = if let Ok(record) =
+                serde_json::from_slice::<crate::process::worker_registry::WorkerRecord>(&bytes)
+            {
+                let before = crate::process::process_birth_identity(record.pid)
+                    .ok()
+                    .flatten();
+                let peer = crate::process::worker::peer_pid_from_socket(
+                    &crate::process::worker::control_socket_sibling(&record.socket_path),
+                );
+                let after = crate::process::process_birth_identity(record.pid)
+                    .ok()
+                    .flatten();
+                if peer == Some(record.pid) && before == after {
+                    after
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+            object.insert("runner_identity".into(), serde_json::to_value(identity)?);
             true
         } else if is_proof {
             let mut changed = false;
@@ -79,7 +99,7 @@ mod tests {
 
     #[test]
     #[serial_test::serial]
-    fn migration_does_not_infer_legacy_runner_identity_from_live_control_owner() {
+    fn migration_attests_only_live_control_owners_and_preserves_unknown_evidence() {
         let root = tempfile::TempDir::with_prefix_in("aoe-migrate-", "/tmp").unwrap();
         let _home = crate::session::test_support::isolate_app_dir_at(root.path());
         let app = crate::session::get_app_dir().unwrap();
@@ -117,7 +137,13 @@ mod tests {
         run_in(&app).unwrap();
         let migrated_bytes = fs::read(&path).unwrap();
         let migrated: Value = serde_json::from_slice(&migrated_bytes).unwrap();
-        assert!(migrated["runner_identity"].is_null());
+        assert_eq!(
+            migrated["runner_identity"],
+            serde_json::to_value(
+                crate::process::process_birth_identity(std::process::id()).unwrap()
+            )
+            .unwrap()
+        );
         assert_eq!(migrated["extension"], old["extension"]);
         let receipt: Value = serde_json::from_slice(&fs::read(&proof).unwrap()).unwrap();
         assert!(receipt["epoch"].is_null() && receipt["launch_epoch"].is_null());

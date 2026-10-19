@@ -32,8 +32,7 @@ impl RunnerIdentity {
     }
 
     pub fn owns_record(&self, record: &crate::process::worker_registry::WorkerRecord) -> bool {
-        self.birth_fingerprint.is_some()
-            && self.matches_record(record.pid, record.generation)
+        self.matches_record(record.pid, record.generation)
             && self.birth_fingerprint
                 == record
                     .runner_identity
@@ -41,17 +40,16 @@ impl RunnerIdentity {
                     .map(|identity| identity.fingerprint())
     }
     pub fn disowns_record(&self, record: &crate::process::worker_registry::WorkerRecord) -> bool {
-        if !self.matches_record(record.pid, record.generation) {
-            return true;
-        }
-        self.birth_fingerprint
-            .zip(
-                record
-                    .runner_identity
-                    .as_ref()
-                    .map(|identity| identity.fingerprint()),
-            )
-            .is_some_and(|(expected, current)| expected != current)
+        !self.matches_record(record.pid, record.generation)
+            || self
+                .birth_fingerprint
+                .zip(
+                    record
+                        .runner_identity
+                        .as_ref()
+                        .map(|identity| identity.fingerprint()),
+                )
+                .is_some_and(|(expected, current)| expected != current)
     }
 
     /// Whether the PID and registry generation match, including legacy generations.
@@ -801,63 +799,6 @@ mod tests {
         for (id, pid, generation, expected) in cases {
             assert_eq!(id.matches_record(pid, generation), expected, "{id:?}");
         }
-    }
-
-    #[test]
-    fn record_ownership_requires_matching_attested_birth_identity() {
-        use crate::process::worker_registry::WorkerRecord;
-        use crate::process::ProcessBirthIdentity;
-        use std::path::PathBuf;
-
-        fn record(
-            pid: u32,
-            generation: u64,
-            runner_identity: Option<ProcessBirthIdentity>,
-        ) -> WorkerRecord {
-            let mut record = WorkerRecord::new(
-                ID.to_owned(),
-                pid,
-                PathBuf::from("socket"),
-                "agent".to_owned(),
-                "agent".to_owned(),
-                PathBuf::from("."),
-                None,
-                Vec::new(),
-                Vec::new(),
-                None,
-                None,
-            );
-            record.generation = generation;
-            record.runner_identity = runner_identity;
-            record
-        }
-
-        let birth = ProcessBirthIdentity {
-            boot_id: "boot-a".to_owned(),
-            start_id: "start-a".to_owned(),
-        };
-        let other_birth = ProcessBirthIdentity {
-            boot_id: "boot-a".to_owned(),
-            start_id: "start-b".to_owned(),
-        };
-        let unattested = RunnerIdentity::unattested(7, 5);
-        let unknown_record = record(7, 5, None);
-        let known_record = record(7, 5, Some(birth.clone()));
-        let known_owner = RunnerIdentity {
-            pid: 7,
-            generation: 5,
-            birth_fingerprint: Some(birth.fingerprint()),
-        };
-
-        assert!(!unattested.owns_record(&unknown_record));
-        assert!(!unattested.disowns_record(&unknown_record));
-        assert!(!unattested.owns_record(&known_record));
-        assert!(!unattested.disowns_record(&known_record));
-        assert!(!known_owner.owns_record(&unknown_record));
-        assert!(!known_owner.disowns_record(&unknown_record));
-        assert!(known_owner.owns_record(&known_record));
-        assert!(known_owner.disowns_record(&record(7, 5, Some(other_birth))));
-        assert!(unattested.disowns_record(&record(8, 5, None)));
     }
 
     #[test]

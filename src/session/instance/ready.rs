@@ -24,7 +24,7 @@ pub enum EnsureReadyError {
     Transient(Status),
     /// Instance is structured view-mode (no backing tmux pane); send is not supported.
     StructuredView,
-    /// The pane needed a start, but the session is archived, trashed, or in a pending handoff.
+    /// The pane needed a start, but the session is archived or trashed.
     Blocked(StartBlocked),
     /// Underlying tmux operation failed.
     Tmux(anyhow::Error),
@@ -122,7 +122,7 @@ impl Instance {
     /// hold the returned guard until the send lands. `ensure_pane_ready` takes the same lock, so
     /// call this after it.
     pub(crate) fn lock_for_input(&self) -> Result<crate::session::storage::StorageFlock> {
-        let storage = crate::session::storage::Storage::open(
+        let storage = crate::session::storage::Storage::new(
             &self.effective_profile(),
             self.resolve_file_watch(),
         )?;

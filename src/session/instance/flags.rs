@@ -20,15 +20,13 @@ pub enum SessionBucket {
     Trashed,
 }
 
-/// Why a session refuses to launch its agent or take input into a live pane.
+/// Why an archived or trashed session refuses to launch its agent or take input into a live pane.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum StartBlocked {
     #[error("session is archived; unarchive it first")]
     Archived,
     #[error("session is in trash; restore it first")]
     Trashed,
-    #[error("structured view handoff is still settling; retry the view switch")]
-    AcpHandoffPending,
 }
 
 impl StartBlocked {
@@ -37,19 +35,14 @@ impl StartBlocked {
         match self {
             StartBlocked::Archived => "session_archived",
             StartBlocked::Trashed => "session_trashed",
-            StartBlocked::AcpHandoffPending => "acp_handoff_pending",
         }
     }
 }
 
 impl Instance {
     /// Archived and trashed sessions must be unarchived or restored before any
-    /// path starts or resumes their agent. A structured-view handoff must also settle first.
-    /// Snooze is not a block: it expires on its own.
+    /// path starts or resumes their agent. Snooze is not a block: it expires on its own.
     pub fn ensure_startable(&self) -> Result<(), StartBlocked> {
-        if self.acp_handoff_pending {
-            return Err(StartBlocked::AcpHandoffPending);
-        }
         match self.effective_bucket() {
             SessionBucket::Active => Ok(()),
             SessionBucket::Archived => Err(StartBlocked::Archived),
@@ -321,23 +314,6 @@ mod tests {
 
     fn inst() -> Instance {
         Instance::new("test", "/tmp/test")
-    }
-
-    #[test]
-    fn pending_terminal_handoff_blocks_start_until_recovery_completes() {
-        let mut instance = inst();
-        instance.acp_handoff_pending = true;
-        assert_eq!(
-            instance.ensure_startable(),
-            Err(StartBlocked::AcpHandoffPending)
-        );
-
-        let stored = serde_json::to_vec(&instance).unwrap();
-        let restored: Instance = serde_json::from_slice(&stored).unwrap();
-        assert!(restored.acp_handoff_pending);
-
-        instance.acp_handoff_pending = false;
-        assert_eq!(instance.ensure_startable(), Ok(()));
     }
 
     #[test]

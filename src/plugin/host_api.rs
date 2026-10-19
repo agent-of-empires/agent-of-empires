@@ -62,7 +62,7 @@ impl HostApiState {
     }
 
     fn storage(&self) -> anyhow::Result<Storage> {
-        Storage::open_unwatched(&self.profile)
+        Storage::new_unwatched(&self.profile)
     }
 
     pub(crate) fn profile(&self) -> &str {

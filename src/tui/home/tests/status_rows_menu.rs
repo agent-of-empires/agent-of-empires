@@ -1177,17 +1177,6 @@ fn trash_then_immediate_restore_hands_off_cleanly() {
     );
     assert!(restored.lifecycle_generation > trashed.lifecycle_generation);
     assert_eq!(restored.lifecycle_reservation, None);
-    let restored_in_view = env.view.get_instance(&id).unwrap();
-    assert_eq!(
-        restored_in_view.lifecycle_generation, restored.lifecycle_generation,
-        "the live row must adopt the committed Restore generation"
-    );
-    assert_eq!(restored_in_view.lifecycle_reservation, None);
-    assert_eq!(restored_in_view.project_path, restored.project_path);
-    assert_eq!(
-        restored_in_view.pre_trash_project_path,
-        restored.pre_trash_project_path
-    );
 
     release_tx.send(()).unwrap();
     let deadline = Instant::now() + Duration::from_secs(2);
@@ -1372,6 +1361,10 @@ fn trash_header_d_and_palette_open_empty_trash_confirm() {
     }
 }
 
+/// A trashed row whose repo is gone fails every delete, so Empty Trash escalates it one
+/// opt-in step per attempt: plain delete, forced delete, then removal from aoe. A peer
+/// restore between the last confirm and its submit keeps the row, and a peer holding the
+/// lifecycle lock delays the removal without blocking input.
 #[test]
 #[serial]
 fn empty_trash_escalates_a_row_that_keeps_failing() {
@@ -1417,14 +1410,21 @@ fn empty_trash_escalates_a_row_that_keeps_failing() {
             "trash reservation released"
         );
 
-        for (round, forced) in [false, true, false].into_iter().enumerate() {
+        // (checkbox labels offered, forced delete expected in flight); each offered box is ticked.
+        let rounds: [(&[&str], bool); 3] = [
+            (&[], false),
+            (&["Force delete 1 that failed before"], true),
+            (&["Remove 1 from aoe that failed a forced delete"], false),
+        ];
+        for (round, (labels, forced)) in rounds.into_iter().enumerate() {
             env.view.prompt_empty_trash();
             let dialog = env
                 .view
                 .confirm_dialog
                 .as_mut()
                 .expect("empty-trash confirm");
-            if round > 0 {
+            assert_eq!(dialog.checkbox_labels_for_test(), labels, "round {round}");
+            if !labels.is_empty() {
                 dialog.handle_key(key(KeyCode::Down));
                 dialog.handle_key(key(KeyCode::Char(' ')));
             }
@@ -1445,14 +1445,16 @@ fn empty_trash_escalates_a_row_that_keeps_failing() {
             env.view.handle_key(key(KeyCode::Char('y')), None);
 
             if round == 2 {
+                // The submit returned with the lock still held; the row leaves only when
+                // the drop worker's result lands.
                 assert!(env.view.get_instance(&id).is_some(), "{peer:?}");
+                drop(peer_lock);
                 let deadline = Instant::now() + Duration::from_secs(10);
                 while !env.view.apply_drop_results() {
                     assert!(Instant::now() < deadline, "{peer:?}: no drop result");
                     std::thread::sleep(Duration::from_millis(20));
                 }
-                drop(peer_lock);
-                let kept = peer != Peer::Idle;
+                let kept = peer == Peer::Restores;
                 assert_eq!(durable(&storage).is_some(), kept, "{peer:?}");
                 assert_eq!(env.view.get_instance(&id).is_some(), kept, "{peer:?}");
                 break;
@@ -1727,27 +1729,6 @@ fn restart_on_trashed_row_surfaces_refusal() {
         env.view.info_dialog.is_some(),
         "restarting a trashed row must explain why nothing happened"
     );
-}
-
-#[test]
-#[serial]
-fn restart_on_handoff_pending_row_asks_user_to_wait() {
-    let mut env = create_test_env_with_sessions(2);
-    let id = env.view.instance_at(0).id.clone();
-    env.view
-        .mutate_instance(&id, |inst| inst.acp_handoff_pending = true);
-    env.view.select_session_by_id(&id);
-
-    env.view
-        .restart_selected_session(None, None, None, None)
-        .unwrap();
-    let dialog = env
-        .view
-        .info_dialog
-        .as_ref()
-        .expect("a pending handoff must explain why restart was refused");
-    assert_eq!(dialog.title(), "Session handoff pending");
-    assert!(dialog.message().contains("Wait for it to finish"));
 }
 
 /// While that delete is in flight, restart stays a silent drop: the "press z to restore it

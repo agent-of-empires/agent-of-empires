@@ -31,8 +31,11 @@ pub(super) fn load_all_instances(
     };
     let mut all = Vec::new();
     for profile in &profiles {
-        match load_profile_instances(profile, file_watch) {
-            Ok(instances) => {
+        match Storage::new(profile, file_watch.clone()).and_then(|s| s.load()) {
+            Ok(mut instances) => {
+                for inst in &mut instances {
+                    inst.source_profile = profile.clone();
+                }
                 all.extend(instances);
             }
             Err(e) => {
@@ -47,17 +50,6 @@ pub(super) fn load_all_instances(
         }
     }
     Ok(all)
-}
-
-fn load_profile_instances(
-    profile: &str,
-    file_watch: &Arc<FileWatchService>,
-) -> anyhow::Result<Vec<Instance>> {
-    let mut instances = Storage::open(profile, Arc::clone(file_watch))?.load()?;
-    for instance in &mut instances {
-        instance.source_profile = profile.to_string();
-    }
-    Ok(instances)
 }
 
 /// Carry over the in-memory-only fields from the prior `state.instances` entry into the
@@ -280,18 +272,15 @@ pub(crate) async fn reload_state_instances_from_disk(
     let mut merged: Vec<Instance> = Vec::with_capacity(fresh.len());
     for mut row in fresh {
         if let Some(prior) = prior_by_id.get(&row.id).cloned() {
+            let prior_status = prior.status;
             let prior_last_accessed = prior.last_accessed_at;
+            let prior_idle_entered = prior.idle_entered_at;
             let prior_tracking = PriorTickTracking::of(&prior);
-            row = match status_source {
-                StatusSource::DiskOnly => {
-                    row.merge_runtime_from_reload(&prior);
-                    row.plugin_revival_pending = prior.plugin_revival_pending;
-                    row
-                }
-                StatusSource::TmuxApplied => merge_runtime_fields(prior.clone(), row),
-            };
+            row = merge_runtime_fields(prior, row);
             match status_source {
                 StatusSource::DiskOnly => {
+                    row.status = prior_status;
+                    row.idle_entered_at = prior_idle_entered.or(row.idle_entered_at);
                     // `row` here is a raw disk load (no tmux scrape ran), so
                     // the `#[serde(skip)]` tracking fields are still at their
                     // zeroed defaults; restore the prior tick's.
@@ -343,11 +332,9 @@ pub(super) fn apply_acp_overlay_inplace(prior_by_id: &PriorById, merged: &mut [I
         let Some(prior) = prior_by_id.get(&inst.id) else {
             continue;
         };
-        if inst.lifecycle_generation <= prior.lifecycle_generation {
-            inst.status = prior.status;
-            inst.last_accessed_at = prior.last_accessed_at;
-            inst.idle_entered_at = prior.idle_entered_at;
-        }
+        inst.status = prior.status;
+        inst.last_accessed_at = prior.last_accessed_at;
+        inst.idle_entered_at = prior.idle_entered_at;
     }
 }
 
@@ -355,23 +342,6 @@ pub(super) fn apply_acp_overlay_inplace(prior_by_id: &PriorById, merged: &mut [I
 mod tests {
     use super::*;
     use chrono::Utc;
-
-    #[tokio::test]
-    #[serial_test::serial]
-    async fn reload_of_a_renamed_profile_does_not_recreate_its_old_directory() {
-        let _home = crate::session::test_support::isolate_app_dir();
-        let file_watch = FileWatchService::new().unwrap();
-        Storage::new_unwatched("reload-before").unwrap();
-        let old_path = crate::session::get_profile_dir_path("reload-before").unwrap();
-
-        crate::session::rename_profile("reload-before", "reload-after").unwrap();
-
-        assert!(load_profile_instances("reload-before", &file_watch).is_err());
-        assert!(!old_path.exists());
-        assert!(crate::session::get_profile_dir_path("reload-after")
-            .unwrap()
-            .is_dir());
-    }
 
     fn terminal_row(status: Status) -> Instance {
         let mut row = Instance::new("reload-publish", "/tmp/aoe-reload-publish");
@@ -425,53 +395,6 @@ mod tests {
             let got = rx.try_recv().ok().map(|c| (c.old, c.new));
             assert_eq!(got, want, "live={live:?} snapshot={snapshot:?} {source:?}");
         }
-    }
-
-    #[tokio::test]
-    async fn disk_only_reload_adopts_a_newer_durable_lifecycle() {
-        let mut prior = terminal_row(Status::Deleting);
-        prior.lifecycle_generation = 4;
-        let state = crate::server::test_support::build_test_app_state(vec![prior.clone()]);
-        let mut fresh = prior;
-        fresh.lifecycle_generation = 5;
-        fresh.status = Status::Stopped;
-        fresh.lifecycle_reservation = None;
-
-        reload_state_instances_from_disk(
-            &state,
-            vec![fresh],
-            Vec::new(),
-            StatusSource::DiskOnly,
-            0,
-        )
-        .await;
-
-        let instances = state.instances.read().await;
-        assert_eq!(instances[0].lifecycle_generation, 5);
-        assert_eq!(instances[0].status, Status::Stopped);
-        assert_eq!(instances[0].lifecycle_reservation, None);
-    }
-
-    #[test]
-    fn structured_overlay_keeps_a_newer_durable_lifecycle() {
-        let mut prior = terminal_row(Status::Deleting);
-        prior.view = crate::session::View::Structured;
-        prior.lifecycle_generation = 4;
-        prior.last_accessed_at = Some(Utc::now() - chrono::Duration::minutes(2));
-        let mut current = vec![prior.clone()];
-        let prior_by_id = PriorById::drain_from(&mut current);
-
-        let mut fresh = prior;
-        fresh.lifecycle_generation = 5;
-        fresh.status = Status::Stopped;
-        fresh.last_accessed_at = Some(Utc::now());
-        let expected_last_accessed = fresh.last_accessed_at;
-
-        apply_acp_overlay_inplace(&prior_by_id, std::slice::from_mut(&mut fresh));
-
-        assert_eq!(fresh.lifecycle_generation, 5);
-        assert_eq!(fresh.status, Status::Stopped);
-        assert_eq!(fresh.last_accessed_at, expected_last_accessed);
     }
 
     /// A snapshot that predates a lifecycle mutation is dropped whole, so it publishes nothing.

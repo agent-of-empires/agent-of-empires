@@ -32,7 +32,7 @@ impl Instance {
         }
         let profile = self.effective_profile();
         let Ok(storage) =
-            crate::session::storage::Storage::open(&profile, self.resolve_file_watch())
+            crate::session::storage::Storage::new(&profile, self.resolve_file_watch())
         else {
             return;
         };
@@ -170,7 +170,7 @@ impl Instance {
 
     pub(crate) fn kill_clean(&self) -> Result<()> {
         let profile = self.effective_profile();
-        let storage = crate::session::storage::Storage::open(&profile, self.resolve_file_watch())
+        let storage = crate::session::storage::Storage::new(&profile, self.resolve_file_watch())
             .context("failed to open lifecycle lock storage")?;
         let _lifecycle_lock = storage
             .acquire_instance_lifecycle_lock(&self.id)
@@ -210,7 +210,7 @@ impl Instance {
 
     pub fn kill(&self) -> Result<()> {
         let profile = self.effective_profile();
-        let storage = crate::session::storage::Storage::open(&profile, self.resolve_file_watch())
+        let storage = crate::session::storage::Storage::new(&profile, self.resolve_file_watch())
             .context("failed to open lifecycle lock storage")?;
         let _lifecycle_lock = storage
             .acquire_instance_lifecycle_lock(&self.id)
@@ -241,7 +241,7 @@ impl Instance {
     pub fn kill_all_tmux_sessions(&self) {
         let profile = self.effective_profile();
         let storage =
-            match crate::session::storage::Storage::open(&profile, self.resolve_file_watch()) {
+            match crate::session::storage::Storage::new(&profile, self.resolve_file_watch()) {
                 Ok(storage) => storage,
                 Err(error) => {
                     tracing::warn!(
@@ -339,7 +339,7 @@ impl Instance {
     pub fn kill_ancillary_tmux_sessions(&self) {
         let profile = self.effective_profile();
         let storage =
-            match crate::session::storage::Storage::open(&profile, self.resolve_file_watch()) {
+            match crate::session::storage::Storage::new(&profile, self.resolve_file_watch()) {
                 Ok(storage) => storage,
                 Err(error) => {
                     tracing::warn!(
@@ -392,7 +392,7 @@ impl Instance {
     /// lock used by launch/restart.
     pub fn stop(&self) -> Result<()> {
         let profile = self.effective_profile();
-        let storage = crate::session::storage::Storage::open(&profile, self.resolve_file_watch())
+        let storage = crate::session::storage::Storage::new(&profile, self.resolve_file_watch())
             .context("failed to open lifecycle lock storage")?;
         let _lifecycle_lock = storage
             .acquire_instance_lifecycle_lock(&self.id)
@@ -463,35 +463,6 @@ impl Instance {
 mod tests {
 
     use super::*;
-
-    #[test]
-    #[serial_test::serial]
-    fn stop_after_profile_rename_does_not_recreate_the_old_profile() {
-        let root = tempfile::tempdir().unwrap();
-        let _app = crate::session::test_support::isolate_app_dir_at(root.path());
-        let old = crate::session::storage::Storage::new_unwatched("before").unwrap();
-        let old_dir = crate::session::get_profile_dir_path("before").unwrap();
-        let new_dir = crate::session::get_profile_dir_path("after").unwrap();
-        let mut instance = Instance::new("renamed stop", root.path().to_str().unwrap());
-        instance.id = "renamed-stop".into();
-        instance.source_profile = "before".into();
-        old.update(|rows, _| {
-            rows.push(instance.clone());
-            Ok(())
-        })
-        .unwrap();
-
-        crate::session::rename_profile("before", "after").unwrap();
-        assert!(!old_dir.exists());
-        assert!(new_dir.exists());
-
-        assert!(instance.stop().is_err());
-        assert!(new_dir.exists());
-        assert!(
-            !old_dir.exists(),
-            "stop must not recreate the renamed profile"
-        );
-    }
 
     #[test]
     #[serial_test::serial]

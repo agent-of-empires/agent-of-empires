@@ -3,30 +3,7 @@
 pub(crate) const HAS_CODEX_MANAGED_PREFERENCES: bool = true;
 use anyhow::Context as _;
 use std::collections::HashMap;
-use std::fs;
-use std::path::Path;
 use std::process::Command;
-
-#[derive(Debug, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
-pub(crate) struct DirectoryIdentity {
-    device: u64,
-    inode: u64,
-}
-
-pub(crate) fn profile_directory_identity(path: &Path) -> anyhow::Result<Option<DirectoryIdentity>> {
-    use std::os::unix::fs::MetadataExt;
-
-    let metadata = match fs::metadata(path) {
-        Ok(metadata) => metadata,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(error.into()),
-    };
-    anyhow::ensure!(metadata.is_dir(), "profile is not a directory");
-    Ok(Some(DirectoryIdentity {
-        device: metadata.dev(),
-        inode: metadata.ino(),
-    }))
-}
 
 pub(super) use super::unix::{
     close_frozen_payload, configure_process_group, exec_command, kill_process_group,

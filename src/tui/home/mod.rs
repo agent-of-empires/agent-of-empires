@@ -132,8 +132,6 @@ pub(super) struct PassiveSynced {
 
 struct RecoveryUpdate {
     instance_id: String,
-    starting_source_profile: String,
-    starting_lifecycle_generation: u64,
     title: String,
     instance: Box<crate::session::Instance>,
     result: Result<crate::session::StartOutcome, String>,

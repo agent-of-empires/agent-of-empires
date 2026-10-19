@@ -367,61 +367,6 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    #[test]
-    #[serial_test::serial]
-    fn empty_profile_read_does_not_bootstrap_under_transition_lock() {
-        use std::sync::mpsc;
-        use std::time::{Duration, Instant};
-        let temp = tempfile::TempDir::new().unwrap();
-        let _home = crate::session::test_support::isolate_app_dir_at(temp.path());
-        let app = crate::session::get_app_dir().unwrap();
-        std::fs::write(
-            app.join("config.toml"),
-            "[session]\ndefault_tool = \"global-proof\"\n",
-        )
-        .unwrap();
-        let held = crate::session::acquire_storage_flock(
-            &app,
-            crate::migrations::v027_isolate_sandbox_stores::LOCK,
-        )
-        .unwrap();
-        let (blocked_tx, blocked) = mpsc::channel();
-        let (done_tx, done) = mpsc::channel();
-        let reader = std::thread::spawn(move || {
-            let _observer = crate::session::storage::observe_lock_contention_for_test(blocked_tx);
-            let result = resolve_config("");
-            done_tx.send(()).unwrap();
-            result
-        });
-        let deadline = Instant::now() + Duration::from_secs(5);
-        let completed_while_locked = loop {
-            if done.try_recv().is_ok() {
-                break true;
-            }
-            if blocked.try_recv().is_ok() {
-                break false;
-            }
-            if Instant::now() >= deadline {
-                break false;
-            }
-            std::thread::sleep(Duration::from_millis(5));
-        };
-        drop(held);
-        let result = reader.join().unwrap();
-        assert!(
-            completed_while_locked,
-            "pure profile read attempted bootstrap while transition was exclusive"
-        );
-        assert_eq!(
-            result.unwrap().session.default_tool.as_deref(),
-            Some("global-proof")
-        );
-        assert!(
-            !app.join("profiles").exists(),
-            "read-only lookup created a bootstrap profile"
-        );
-    }
-
     /// Build a `ProfileConfig` from a sparse override object (the on-disk shape).
     fn profile_from(overrides: serde_json::Value) -> ProfileConfig {
         serde_json::from_value(overrides).expect("profile override deserializes")

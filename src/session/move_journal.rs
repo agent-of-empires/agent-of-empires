@@ -1,12 +1,9 @@
-//! Durable journal for cross-profile session moves.
+//! Compatibility API for cross-profile move records stored in the lifecycle journal.
 
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use serde::{Deserialize, Serialize};
-use std::fs;
-
-use super::storage::{atomic_write_verified, sync_parent_directory};
 
 /// Bump when the entry shape changes. Entries written by an older version
 /// carry no arbitration authority (see [`MoveJournalEntry::is_current`]).
@@ -35,43 +32,38 @@ impl MoveJournalEntry {
     }
 }
 
-const JOURNAL_DIR_NAME: &str = ".move-journal";
-
-/// `.move-journal/` inside the directory holding `sessions_path`.
+/// `.lifecycle-journal/` inside the directory holding `sessions_path`.
+#[cfg(test)]
 fn journal_dir_for(sessions_path: &Path) -> PathBuf {
     sessions_path
         .parent()
         .unwrap_or(sessions_path)
-        .join(JOURNAL_DIR_NAME)
+        .join(".lifecycle-journal")
+}
+
+#[cfg(test)]
+fn legacy_journal_dir_for(sessions_path: &Path) -> PathBuf {
+    sessions_path
+        .parent()
+        .unwrap_or(sessions_path)
+        .join(".move-journal")
 }
 
 /// Persist one entry next to the source profile's `sessions.json` and return its path.
 pub(crate) fn record(entry: &MoveJournalEntry, source_sessions_path: &Path) -> Result<PathBuf> {
-    record_with_sync(entry, source_sessions_path, sync_parent_directory)
+    super::lifecycle_journal::record_move(entry, source_sessions_path)
 }
 
+#[cfg(test)]
 fn record_with_sync<S>(
     entry: &MoveJournalEntry,
     source_sessions_path: &Path,
-    mut sync: S,
+    sync: S,
 ) -> Result<PathBuf>
 where
     S: FnMut(&Path) -> Result<()>,
 {
-    let dir = journal_dir_for(source_sessions_path);
-    fs::create_dir_all(&dir).with_context(|| format!("failed to create {}", dir.display()))?;
-    sync(&dir)
-        .with_context(|| format!("journal directory {} was not made durable", dir.display()))?;
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|duration| duration.as_nanos())
-        .unwrap_or_default();
-    let path = dir.join(format!("move-{nanos}-{}.json", std::process::id()));
-    let bytes = serde_json::to_vec_pretty(entry)?;
-    atomic_write_verified(&path, &bytes)
-        .with_context(|| format!("failed to write move journal {}", path.display()))?;
-    sync(&path).with_context(|| format!("move journal {} was not made durable", path.display()))?;
-    Ok(path)
+    super::lifecycle_journal::record_move_with_sync(entry, source_sessions_path, sync)
 }
 
 /// Nanosecond creation order encoded in record's filename. Used only as a
@@ -87,15 +79,7 @@ pub(crate) fn file_created_at_nanos(path: &Path) -> Option<u128> {
 /// Delete one consumed entry and sync its parent directory so the removal
 /// itself is durable. Idempotent: a missing file is already consumed.
 pub(crate) fn consume(path: &Path) -> Result<()> {
-    match fs::remove_file(path) {
-        Ok(()) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(error) => {
-            return Err(error).with_context(|| format!("failed to remove {}", path.display()))
-        }
-    }
-    sync_parent_directory(path)
-        .with_context(|| format!("removal of {} was not made durable", path.display()))
+    super::lifecycle_journal::consume(path)
 }
 
 /// Result of scanning every loaded profile's journal directory.
@@ -106,123 +90,11 @@ pub(crate) struct ScanResult {
 
 /// Every journal file under each given profile directory paired with its parse outcome.
 pub(crate) fn scan(sessions_paths: impl IntoIterator<Item = PathBuf>) -> ScanResult {
-    let mut result = ScanResult {
-        entries: Vec::new(),
-        unreadable_dirs: Vec::new(),
-    };
-    let mut dirs: Vec<PathBuf> = sessions_paths
-        .into_iter()
-        .map(|sessions_path| journal_dir_for(&sessions_path))
-        .collect();
-    dirs.sort();
-    dirs.dedup();
-    for dir in dirs {
-        let read_dir = match fs::read_dir(&dir) {
-            Ok(read_dir) => read_dir,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(error) => {
-                result.unreadable_dirs.push((
-                    dir.clone(),
-                    format!("failed to list {}: {error}", dir.display()),
-                ));
-                continue;
-            }
-        };
-        let mut paths: Vec<PathBuf> = read_dir
-            .filter_map(|entry| entry.ok().map(|entry| entry.path()))
-            .filter(|path| {
-                path.extension()
-                    .is_some_and(|extension| extension == "json")
-            })
-            .collect();
-        paths.sort();
-        for path in paths {
-            let parsed = fs::read(&path)
-                .context("failed to read move journal entry")
-                .and_then(|bytes| {
-                    serde_json::from_slice::<MoveJournalEntry>(&bytes)
-                        .context("malformed move journal entry")
-                })
-                .map_err(|error| format!("{error:#}"))
-                .and_then(|entry| {
-                    if entry.is_current() {
-                        Ok(entry)
-                    } else {
-                        Err(format!(
-                            "move journal version {} is not supported (current: {MOVE_JOURNAL_VERSION})",
-                            entry.version
-                        ))
-                    }
-                });
-            result.entries.push((path, parsed));
-        }
+    let result = super::lifecycle_journal::scan_moves(sessions_paths);
+    ScanResult {
+        entries: result.entries,
+        unreadable_dirs: result.unreadable_dirs,
     }
-    result
-}
-
-pub(crate) fn retarget_profile_references(
-    sessions_paths: impl IntoIterator<Item = PathBuf>,
-    old_profile: &str,
-    new_profile: &str,
-    target_profile: &str,
-) -> Result<()> {
-    let old_sessions = super::get_profile_dir_path(old_profile)?.join("sessions.json");
-    let new_sessions = super::get_profile_dir_path(new_profile)?.join("sessions.json");
-    let target_sessions = if target_profile == old_profile {
-        &old_sessions
-    } else {
-        anyhow::ensure!(
-            target_profile == new_profile,
-            "invalid profile rename target"
-        );
-        &new_sessions
-    };
-    let scan = scan(sessions_paths);
-    anyhow::ensure!(
-        scan.unreadable_dirs.is_empty(),
-        "profile move journals cannot be enumerated"
-    );
-    for (path, parsed) in scan.entries {
-        let mut entry = parsed.map_err(anyhow::Error::msg)?;
-        let source_named =
-            entry.source_profile == old_profile || entry.source_profile == new_profile;
-        let source_path = entry.source_sessions_path == old_sessions
-            || entry.source_sessions_path == new_sessions;
-        let target_named =
-            entry.target_profile == old_profile || entry.target_profile == new_profile;
-        let target_path = entry.target_sessions_path == old_sessions
-            || entry.target_sessions_path == new_sessions;
-        anyhow::ensure!(
-            source_named == source_path,
-            "move journal source profile/path mismatch"
-        );
-        anyhow::ensure!(
-            target_named == target_path,
-            "move journal target profile/path mismatch"
-        );
-
-        let mut changed = false;
-        if source_named {
-            changed |= entry.source_profile != target_profile
-                || entry.source_sessions_path != *target_sessions;
-            entry.source_profile = target_profile.to_owned();
-            entry.source_sessions_path = target_sessions.clone();
-        }
-        if target_named {
-            changed |= entry.target_profile != target_profile
-                || entry.target_sessions_path != *target_sessions;
-            entry.target_profile = target_profile.to_owned();
-            entry.target_sessions_path = target_sessions.clone();
-        }
-        if changed {
-            let bytes = serde_json::to_vec_pretty(&entry)?;
-            atomic_write_verified(&path, &bytes)
-                .with_context(|| format!("failed to update move journal {}", path.display()))?;
-            sync_parent_directory(&path)
-                .with_context(|| format!("move journal {} was not made durable", path.display()))?;
-        }
-    }
-    Ok(())
 }
 
 #[cfg(test)]
@@ -279,7 +151,7 @@ mod tests {
         let temp = tempfile::tempdir()?;
         let sessions = temp.path().join("profile/sessions.json");
         fs::create_dir_all(sessions.parent().unwrap())?;
-        let journal_dir = journal_dir_for(&sessions);
+        let journal_dir = legacy_journal_dir_for(&sessions);
         fs::write(&journal_dir, b"not-a-directory")?;
 
         let result = scan([sessions]);
@@ -291,16 +163,16 @@ mod tests {
     }
 
     #[test]
-    fn record_and_scan_keep_the_existing_path_and_flat_schema() -> Result<()> {
+    fn scan_reads_legacy_move_records() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let source = temp.path().join("source/sessions.json");
         let target = temp.path().join("target/sessions.json");
         fs::create_dir_all(source.parent().unwrap())?;
         fs::create_dir_all(target.parent().unwrap())?;
-        let path = record(&entry(&source, &target), &source)?;
-        assert_eq!(path.parent(), Some(journal_dir_for(&source).as_path()));
-        let value: serde_json::Value = serde_json::from_slice(&fs::read(&path)?)?;
-        assert!(value.get("intent").is_none());
+        let legacy_dir = legacy_journal_dir_for(&source);
+        fs::create_dir_all(&legacy_dir)?;
+        let path = legacy_dir.join("move-1-1.json");
+        fs::write(&path, serde_json::to_vec(&entry(&source, &target))?)?;
 
         let result = scan([source]);
 
@@ -311,74 +183,15 @@ mod tests {
     }
 
     #[test]
-    fn scan_reads_a_flat_record_from_the_existing_move_journal_directory() -> Result<()> {
+    fn scan_rejects_unsupported_legacy_move_record_versions() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let source = temp.path().join("source/sessions.json");
         let target = temp.path().join("target/sessions.json");
         fs::create_dir_all(source.parent().unwrap())?;
         fs::create_dir_all(target.parent().unwrap())?;
-        let journal_dir = journal_dir_for(&source);
-        fs::create_dir_all(&journal_dir)?;
-        let path = journal_dir.join("move-1-1.json");
-        fs::write(&path, serde_json::to_vec(&entry(&source, &target))?)?;
-
-        let result = scan([source]);
-
-        assert_eq!(result.entries.len(), 1);
-        assert_eq!(result.entries[0].0, path);
-        assert_eq!(result.entries[0].1.as_ref().unwrap().ids, ["session-id"]);
-        Ok(())
-    }
-
-    #[test]
-    #[serial_test::serial]
-    fn profile_retarget_keeps_move_journal_path_and_record_shape() -> Result<()> {
-        let temp = tempfile::tempdir()?;
-        let _home = crate::session::test_support::isolate_app_dir_at(temp.path());
-        let source = super::super::get_profile_dir_path("source")?.join("sessions.json");
-        let old_target = super::super::get_profile_dir_path("before")?.join("sessions.json");
-        let new_target = super::super::get_profile_dir_path("after")?.join("sessions.json");
-        fs::create_dir_all(source.parent().unwrap())?;
-        fs::create_dir_all(old_target.parent().unwrap())?;
-        let mut entry = entry(&source, &old_target);
-        entry.target_profile = "before".to_string();
-        let journal_path = record(&entry, &source)?;
-        let before: serde_json::Value = serde_json::from_slice(&fs::read(&journal_path)?)?;
-
-        retarget_profile_references(
-            [source.clone(), old_target.clone()],
-            "before",
-            "after",
-            "after",
-        )?;
-
-        let after: serde_json::Value = serde_json::from_slice(&fs::read(&journal_path)?)?;
-        assert_eq!(after["source_profile"], "source");
-        assert_eq!(after["target_profile"], "after");
-        assert_eq!(
-            after["target_sessions_path"],
-            new_target.to_string_lossy().as_ref()
-        );
-        assert_eq!(after["version"], before["version"]);
-        assert_eq!(after["ids"], before["ids"]);
-        assert_eq!(
-            journal_path.parent(),
-            Some(journal_dir_for(&source).as_path())
-        );
-        assert!(!journal_dir_for(&new_target).exists());
-        Ok(())
-    }
-
-    #[test]
-    fn scan_rejects_unsupported_move_record_versions() -> Result<()> {
-        let temp = tempfile::tempdir()?;
-        let source = temp.path().join("source/sessions.json");
-        let target = temp.path().join("target/sessions.json");
-        fs::create_dir_all(source.parent().unwrap())?;
-        fs::create_dir_all(target.parent().unwrap())?;
-        let journal_dir = journal_dir_for(&source);
-        fs::create_dir_all(&journal_dir)?;
-        let path = journal_dir.join("move-unsupported.json");
+        let legacy_dir = legacy_journal_dir_for(&source);
+        fs::create_dir_all(&legacy_dir)?;
+        let path = legacy_dir.join("move-unsupported.json");
         let mut unsupported = entry(&source, &target);
         unsupported.version = MOVE_JOURNAL_VERSION + 1;
         fs::write(&path, serde_json::to_vec(&unsupported)?)?;

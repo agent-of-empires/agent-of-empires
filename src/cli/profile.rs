@@ -36,22 +36,6 @@ pub enum ProfileCommands {
         new_name: String,
     },
 
-    /// Preserve an invalid rename checkpoint after reviewing its digest
-    RepairRenameCheckpoint {
-        /// Active checkpoint filename printed by startup recovery
-        #[arg(long)]
-        checkpoint: String,
-        /// SHA-256 printed by startup recovery
-        #[arg(long)]
-        sha256: String,
-        /// Acknowledge the checkpoint's old profile when its endpoints are identifiable
-        #[arg(long, requires = "new_profile")]
-        old_profile: Option<String>,
-        /// Acknowledge the checkpoint's new profile when its endpoints are identifiable
-        #[arg(long, requires = "old_profile")]
-        new_profile: Option<String>,
-    },
-
     /// Show or set default profile
     Default {
         /// Profile name (optional, shows current if not provided)
@@ -78,21 +62,6 @@ pub async fn run(profile: &str, command: Option<ProfileCommands>) -> Result<()> 
         Some(ProfileCommands::Delete { name }) => delete_profile(&name).await,
         Some(ProfileCommands::Rename { old_name, new_name }) => {
             rename_profile(&old_name, &new_name).await
-        }
-        Some(ProfileCommands::RepairRenameCheckpoint {
-            checkpoint,
-            sha256,
-            old_profile,
-            new_profile,
-        }) => {
-            let expected_profiles = old_profile.as_deref().zip(new_profile.as_deref());
-            let preserved = session::profile_rename::repair_rename_checkpoint(
-                &checkpoint,
-                &sha256,
-                expected_profiles,
-            )?;
-            println!("Preserved checkpoint evidence at {}", preserved.display());
-            Ok(())
         }
         Some(ProfileCommands::Default { name }) => {
             if let Some(n) = name {
@@ -199,137 +168,4 @@ async fn show_profile_value(profile: &str, status_map: Option<&str>, json: bool)
         }
     }
     Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use clap::Parser;
-
-    fn parse_profile_cli(args: &[&str]) -> std::result::Result<crate::cli::Cli, clap::Error> {
-        crate::cli::Cli::try_parse_from(std::iter::once("aoe").chain(args.iter().copied()))
-    }
-
-    async fn run_profile_cli(args: &[&str]) -> Result<()> {
-        let cli = parse_profile_cli(args)?;
-        let profile = cli.profile.as_deref().unwrap_or("default");
-        let Some(crate::cli::Commands::Profile { command }) = cli.command else {
-            bail!("expected profile command");
-        };
-        run(profile, command).await
-    }
-
-    #[tokio::test]
-    #[serial_test::serial]
-    async fn repair_rename_checkpoint_cli_parses_pairs_and_preserves_verified_evidence() {
-        use sha2::{Digest, Sha256};
-
-        let _home = crate::session::test_support::isolate_app_dir();
-        let app_dir = crate::session::get_app_dir().unwrap();
-        let checkpoint = ".profile-rename.json";
-        let active = app_dir.join(checkpoint);
-        let raw = br#"{"version":1,"old":"before","new":"after","session_ids":"invalid"}"#;
-        std::fs::write(&active, raw).unwrap();
-        let digest = Sha256::digest(raw)
-            .iter()
-            .map(|byte| format!("{byte:02x}"))
-            .collect::<String>();
-
-        let common = [
-            "profile",
-            "repair-rename-checkpoint",
-            "--checkpoint",
-            checkpoint,
-            "--sha256",
-            digest.as_str(),
-        ];
-        let old_only = [
-            "profile",
-            "repair-rename-checkpoint",
-            "--checkpoint",
-            checkpoint,
-            "--sha256",
-            digest.as_str(),
-            "--old-profile",
-            "before",
-        ];
-        let new_only = [
-            "profile",
-            "repair-rename-checkpoint",
-            "--checkpoint",
-            checkpoint,
-            "--sha256",
-            digest.as_str(),
-            "--new-profile",
-            "after",
-        ];
-        assert!(parse_profile_cli(&old_only).is_err());
-        assert!(parse_profile_cli(&new_only).is_err());
-
-        let error = run_profile_cli(&common)
-            .await
-            .expect_err("identifiable endpoints require an explicit acknowledgement pair");
-        assert!(error
-            .to_string()
-            .contains("provide --old-profile and --new-profile"));
-        assert_eq!(std::fs::read(&active).unwrap(), raw);
-
-        let mismatch = [
-            "profile",
-            "repair-rename-checkpoint",
-            "--checkpoint",
-            checkpoint,
-            "--sha256",
-            digest.as_str(),
-            "--old-profile",
-            "wrong",
-            "--new-profile",
-            "after",
-        ];
-        let error = run_profile_cli(&mismatch)
-            .await
-            .expect_err("mismatched profile acknowledgement must be rejected");
-        assert!(error
-            .to_string()
-            .contains("checkpoint endpoints do not match"));
-        assert_eq!(std::fs::read(&active).unwrap(), raw);
-
-        let bad_digest = [
-            "profile",
-            "repair-rename-checkpoint",
-            "--checkpoint",
-            checkpoint,
-            "--sha256",
-            "not-a-sha256",
-            "--old-profile",
-            "before",
-            "--new-profile",
-            "after",
-        ];
-        let error = run_profile_cli(&bad_digest)
-            .await
-            .expect_err("invalid digest must be rejected");
-        assert!(error.to_string().contains("64 hexadecimal characters"));
-        assert_eq!(std::fs::read(&active).unwrap(), raw);
-
-        let acknowledged = [
-            "profile",
-            "repair-rename-checkpoint",
-            "--checkpoint",
-            checkpoint,
-            "--sha256",
-            digest.as_str(),
-            "--old-profile",
-            "before",
-            "--new-profile",
-            "after",
-        ];
-        run_profile_cli(&acknowledged)
-            .await
-            .expect("matching acknowledgement and digest should preserve the checkpoint");
-
-        let preserved = app_dir.join(format!("{checkpoint}.corrupt-{digest}"));
-        assert!(!active.exists());
-        assert_eq!(std::fs::read(preserved).unwrap(), raw);
-    }
 }

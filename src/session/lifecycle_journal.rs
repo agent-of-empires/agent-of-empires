@@ -6,12 +6,13 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
+use super::move_journal::MoveJournalEntry;
 use super::storage::{atomic_write_verified, sync_parent_directory};
 use super::{Instance, Status};
 
 /// Bump when the record shape changes. Unsupported records stay on disk so a newer
 /// binary cannot silently discard recovery evidence written by an older one.
-pub(crate) const LIFECYCLE_JOURNAL_VERSION: u32 = 3;
+pub(crate) const LIFECYCLE_JOURNAL_VERSION: u32 = 2;
 const EARLIEST_SUPPORTED_LIFECYCLE_JOURNAL_VERSION: u32 = 1;
 
 const JOURNAL_DIR_NAME: &str = ".lifecycle-journal";
@@ -23,33 +24,16 @@ pub(crate) enum LifecyclePhase {
     HooksStarted,
     HooksComplete,
     TeardownStarted,
-    TeardownComplete,
     RowRemoved,
     Kept,
-    Abandoned,
 }
 
 impl LifecyclePhase {
     pub(crate) fn hooks_are_complete(self) -> bool {
         matches!(
             self,
-            Self::HooksComplete
-                | Self::TeardownStarted
-                | Self::TeardownComplete
-                | Self::RowRemoved
-                | Self::Kept
+            Self::HooksComplete | Self::TeardownStarted | Self::RowRemoved | Self::Kept
         )
-    }
-
-    pub(crate) fn teardown_started(self) -> bool {
-        matches!(
-            self,
-            Self::TeardownStarted | Self::TeardownComplete | Self::RowRemoved | Self::Kept
-        )
-    }
-
-    pub(crate) fn teardown_complete(self) -> bool {
-        matches!(self, Self::TeardownComplete | Self::RowRemoved | Self::Kept)
     }
 }
 
@@ -57,6 +41,7 @@ impl LifecyclePhase {
 #[serde(tag = "intent", content = "payload", rename_all = "snake_case")]
 pub(crate) enum LifecycleJournalRecord {
     Deleting(Box<LifecycleJournalEntry>),
+    Moving(Box<MoveJournalEntry>),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -169,88 +154,49 @@ fn journal_dir_for(sessions_path: &Path) -> PathBuf {
         .join(JOURNAL_DIR_NAME)
 }
 
-pub(crate) struct JournalKey {
-    pub(crate) generation: u64,
-    id: [u8; 64],
-    len: usize,
-}
-
-impl JournalKey {
-    pub(crate) fn session_id(&self) -> &str {
-        std::str::from_utf8(&self.id[..self.len]).expect("validated ASCII session id")
-    }
-}
-
-/// Filename scopes unreadable evidence; only a validated payload authorizes replay.
-pub(crate) fn filename_key(path: &Path) -> Result<JournalKey> {
-    let name = path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .context("non-UTF8 journal filename")?;
-    let (generation, encoded) = name
-        .strip_prefix("delete-")
-        .and_then(|name| name.strip_suffix(".json"))
-        .and_then(|name| name.split_once('-'))
-        .context("noncanonical journal filename")?;
-    anyhow::ensure!(
-        !generation.is_empty()
-            && !(generation.len() > 1 && generation.starts_with('0'))
-            && generation.bytes().all(|byte| byte.is_ascii_digit()),
-        "noncanonical journal generation"
-    );
-    anyhow::ensure!(
-        !encoded.is_empty() && encoded.len() <= 128 && encoded.len().is_multiple_of(2),
-        "invalid encoded journal session"
-    );
-    let mut key = JournalKey {
-        generation: generation.parse()?,
-        id: [0; 64],
-        len: encoded.len() / 2,
-    };
-    let nibble = |byte| match byte {
-        b'0'..=b'9' => Ok(byte - b'0'),
-        b'a'..=b'f' => Ok(byte - b'a' + 10),
-        _ => anyhow::bail!("noncanonical journal session encoding"),
-    };
-    for (slot, bytes) in key.id.iter_mut().zip(encoded.as_bytes().as_chunks::<2>().0) {
-        *slot = (nibble(bytes[0])? << 4) | nibble(bytes[1])?;
-    }
-    super::validate_instance_id(std::str::from_utf8(&key.id[..key.len])?)?;
-    Ok(key)
-}
-
-pub(crate) fn path_for(sessions_path: &Path, session_id: &str, generation: u64) -> PathBuf {
-    use std::fmt::Write as _;
-    let mut name = String::with_capacity(33 + session_id.len() * 2);
-    write!(name, "delete-{generation}-").expect("writing to String");
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    for byte in session_id.bytes() {
-        name.push(HEX[usize::from(byte >> 4)] as char);
-        name.push(HEX[usize::from(byte & 15)] as char);
-    }
-    name.push_str(".json");
-    journal_dir_for(sessions_path).join(name)
-}
-pub(crate) fn deletion_exists(
-    sessions_path: &Path,
-    session_id: &str,
-    generation: u64,
-) -> Result<bool> {
-    let path = path_for(sessions_path, session_id, generation);
-    match read_deletion(&path)? {
-        Some(entry) => Ok(entry.session_id == session_id && entry.generation == generation),
-        None => Ok(false),
-    }
-}
-
 pub(crate) fn record(entry: &LifecycleJournalEntry) -> Result<PathBuf> {
     let dir = journal_dir_for(&entry.sessions_path);
-    let path = path_for(&entry.sessions_path, &entry.session_id, entry.generation);
+    let session_id_hex = entry
+        .session_id
+        .as_bytes()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    let path = dir.join(format!("delete-{}-{session_id_hex}.json", entry.generation));
     record_at_with_sync(
         &dir,
         &path,
         &LifecycleJournalRecord::Deleting(Box::new(entry.clone())),
         sync_parent_directory,
+    )
+}
+
+pub(crate) fn record_move(
+    entry: &MoveJournalEntry,
+    source_sessions_path: &Path,
+) -> Result<PathBuf> {
+    record_move_with_sync(entry, source_sessions_path, sync_parent_directory)
+}
+
+pub(crate) fn record_move_with_sync<S>(
+    entry: &MoveJournalEntry,
+    source_sessions_path: &Path,
+    sync: S,
+) -> Result<PathBuf>
+where
+    S: FnMut(&Path) -> Result<()>,
+{
+    let dir = journal_dir_for(source_sessions_path);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or_default();
+    let path = dir.join(format!("move-{nanos}-{}.json", std::process::id()));
+    record_at_with_sync(
+        &dir,
+        &path,
+        &LifecycleJournalRecord::Moving(Box::new(entry.clone())),
+        sync,
     )
 }
 
@@ -275,26 +221,12 @@ where
 }
 
 pub(crate) fn update(path: &Path, entry: &LifecycleJournalEntry) -> Result<()> {
-    #[cfg(test)]
-    if FAIL_NEXT_UPDATE.with(|fail| fail.replace(false)) {
-        anyhow::bail!("injected lifecycle journal update failure");
-    }
     let bytes =
         serde_json::to_vec_pretty(&LifecycleJournalRecord::Deleting(Box::new(entry.clone())))?;
     atomic_write_verified(path, &bytes)
         .with_context(|| format!("failed to update lifecycle journal {}", path.display()))?;
     sync_parent_directory(path)
         .with_context(|| format!("lifecycle journal {} was not made durable", path.display()))
-}
-
-#[cfg(test)]
-thread_local! {
-    static FAIL_NEXT_UPDATE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-}
-
-#[cfg(test)]
-pub(crate) fn fail_next_update_for_test() {
-    FAIL_NEXT_UPDATE.with(|fail| fail.set(true));
 }
 
 pub(crate) fn consume(path: &Path) -> Result<()> {
@@ -312,6 +244,11 @@ pub(crate) fn consume(path: &Path) -> Result<()> {
 
 pub(crate) struct ScanResult {
     pub(crate) entries: Vec<(PathBuf, std::result::Result<LifecycleJournalEntry, String>)>,
+    pub(crate) unreadable_dirs: Vec<(PathBuf, String)>,
+}
+
+pub(crate) struct MoveScanResult {
+    pub(crate) entries: Vec<(PathBuf, std::result::Result<MoveJournalEntry, String>)>,
     pub(crate) unreadable_dirs: Vec<(PathBuf, String)>,
 }
 
@@ -338,42 +275,24 @@ pub(crate) fn scan(sessions_paths: impl IntoIterator<Item = PathBuf>) -> ScanRes
                 continue;
             }
         };
-        let mut paths = Vec::new();
-        let mut unreadable = false;
-        for item in read_dir {
-            match item {
-                Ok(item) => {
-                    let path = item.path();
-                    if path
-                        .extension()
-                        .is_some_and(|extension| extension == "json")
-                    {
-                        paths.push(path);
-                    }
-                }
-                Err(error) => {
-                    result
-                        .unreadable_dirs
-                        .push((dir.clone(), error.to_string()));
-                    unreadable = true;
-                    break;
-                }
-            }
-        }
-        if unreadable {
-            continue;
-        }
+        let mut paths: Vec<PathBuf> = read_dir
+            .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+            .filter(|path| {
+                path.extension()
+                    .is_some_and(|extension| extension == "json")
+            })
+            .collect();
         paths.sort();
         for path in paths {
             let parsed = match read_record(&path) {
-                Ok(Some(LifecycleJournalRecord::Deleting(entry))) if entry.is_current() => {
+                Ok(LifecycleJournalRecord::Deleting(entry)) if entry.is_current() => {
                     Some(Ok(*entry))
                 }
-                Ok(Some(LifecycleJournalRecord::Deleting(entry))) => Some(Err(format!(
+                Ok(LifecycleJournalRecord::Deleting(entry)) => Some(Err(format!(
                         "lifecycle journal version {} is not supported (current: {LIFECYCLE_JOURNAL_VERSION})",
                         entry.version
                     ))),
-                Ok(None) => None,
+                Ok(LifecycleJournalRecord::Moving(_)) => None,
                 Err(error) => Some(Err(format!("{error:#}"))),
             };
             if let Some(parsed) = parsed {
@@ -384,39 +303,96 @@ pub(crate) fn scan(sessions_paths: impl IntoIterator<Item = PathBuf>) -> ScanRes
     result
 }
 
-fn read_record(path: &Path) -> Result<Option<LifecycleJournalRecord>> {
-    let bytes = match fs::read(path) {
-        Ok(bytes) => bytes,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(error.into()),
+pub(crate) fn scan_moves(sessions_paths: impl IntoIterator<Item = PathBuf>) -> MoveScanResult {
+    const LEGACY_MOVE_JOURNAL_DIR_NAME: &str = ".move-journal";
+
+    let mut result = MoveScanResult {
+        entries: Vec::new(),
+        unreadable_dirs: Vec::new(),
     };
+    let mut dirs: Vec<(PathBuf, bool)> = sessions_paths
+        .into_iter()
+        .flat_map(|path| {
+            let profile_dir = path.parent().unwrap_or(&path);
+            [
+                (journal_dir_for(&path), false),
+                (profile_dir.join(LEGACY_MOVE_JOURNAL_DIR_NAME), true),
+            ]
+        })
+        .collect();
+    dirs.sort();
+    dirs.dedup();
+    for (dir, legacy) in dirs {
+        let read_dir = match fs::read_dir(&dir) {
+            Ok(read_dir) => read_dir,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                result.unreadable_dirs.push((
+                    dir.clone(),
+                    format!("failed to list {}: {error}", dir.display()),
+                ));
+                continue;
+            }
+        };
+        let mut paths: Vec<PathBuf> = read_dir
+            .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+            .filter(|path| {
+                path.extension()
+                    .is_some_and(|extension| extension == "json")
+            })
+            .collect();
+        paths.sort();
+        for path in paths {
+            let parsed = if legacy {
+                fs::read(&path)
+                    .context("failed to read legacy move journal entry")
+                    .and_then(|bytes| {
+                        serde_json::from_slice::<MoveJournalEntry>(&bytes)
+                            .context("malformed legacy move journal entry")
+                    })
+                    .and_then(|entry| {
+                        if entry.is_current() {
+                            Ok(entry)
+                        } else {
+                            anyhow::bail!(
+                                "move journal version {} is not supported (current: {})",
+                                entry.version,
+                                super::move_journal::MOVE_JOURNAL_VERSION
+                            )
+                        }
+                    })
+                    .map_err(|error| format!("{error:#}"))
+            } else {
+                match read_record(&path) {
+                    Ok(LifecycleJournalRecord::Deleting(_)) => continue,
+                    Ok(LifecycleJournalRecord::Moving(entry)) if entry.is_current() => Ok(*entry),
+                    Ok(LifecycleJournalRecord::Moving(entry)) => Err(format!(
+                        "move journal version {} is not supported (current: {})",
+                        entry.version,
+                        super::move_journal::MOVE_JOURNAL_VERSION
+                    )),
+                    Err(error) => Err(format!("{error:#}")),
+                }
+            };
+            result.entries.push((path, parsed));
+        }
+    }
+    result
+}
+
+fn read_record(path: &Path) -> Result<LifecycleJournalRecord> {
+    let bytes = fs::read(path)?;
     serde_json::from_slice(&bytes)
         .or_else(|record_error| {
             serde_json::from_slice::<LifecycleJournalEntry>(&bytes)
                 .map(|entry| LifecycleJournalRecord::Deleting(Box::new(entry)))
+                .or_else(|_| {
+                    serde_json::from_slice::<MoveJournalEntry>(&bytes)
+                        .map(|entry| LifecycleJournalRecord::Moving(Box::new(entry)))
+                })
                 .map_err(|_| record_error)
         })
         .context("malformed lifecycle journal entry")
-        .map(Some)
-}
-
-pub(crate) fn read_deletion(path: &Path) -> Result<Option<LifecycleJournalEntry>> {
-    match read_record(path)? {
-        None => Ok(None),
-        Some(LifecycleJournalRecord::Deleting(entry)) if entry.is_current() => {
-            let mut entry = *entry;
-            entry
-                .instance
-                .source_profile
-                .clone_from(&entry.source_profile);
-            Ok(Some(entry))
-        }
-        Some(LifecycleJournalRecord::Deleting(entry)) => anyhow::bail!(
-            "lifecycle journal version {} is not supported (current: {})",
-            entry.version,
-            LIFECYCLE_JOURNAL_VERSION
-        ),
-    }
 }
 
 #[cfg(test)]
@@ -483,6 +459,54 @@ mod tests {
     }
 
     #[test]
+    fn moving_and_deleting_records_share_a_typed_journal() {
+        let temp = tempfile::tempdir().unwrap();
+        let sessions = temp.path().join("profile/sessions.json");
+        let target_sessions = temp.path().join("target/sessions.json");
+        std::fs::create_dir_all(sessions.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(target_sessions.parent().unwrap()).unwrap();
+
+        let mut instance = Instance::new("journal-session", "/tmp/worktree");
+        instance.id = "journal-session".to_string();
+        instance.source_profile = "profile".to_string();
+        let deletion = LifecycleJournalEntry::deletion(
+            instance,
+            Status::Idle,
+            sessions.clone(),
+            LifecycleDeletionOptions {
+                generation: 1,
+                delete_worktree: false,
+                delete_branch: false,
+                delete_sandbox: false,
+                force_delete: false,
+                detach_hooks: false,
+                keep_scratch: false,
+                purge_acp_transcript: false,
+            },
+        );
+        let deletion_path = record(&deletion).unwrap();
+        let moving = MoveJournalEntry {
+            version: super::super::move_journal::MOVE_JOURNAL_VERSION,
+            ids: vec!["moving-session".to_string()],
+            source_profile: "profile".to_string(),
+            target_profile: "target".to_string(),
+            source_sessions_path: sessions.clone(),
+            target_sessions_path: target_sessions,
+            group_move_source_path: "".to_string(),
+            group_move_target_path: "".to_string(),
+            group_move_subtree: false,
+            created_at_epoch_ms: 1,
+        };
+        let moving_path = record_move(&moving, &sessions).unwrap();
+
+        assert_eq!(deletion_path.parent(), moving_path.parent());
+        assert_eq!(scan([sessions.clone()]).entries.len(), 1);
+        let move_scan = scan_moves([sessions]);
+        assert_eq!(move_scan.entries.len(), 1);
+        assert_eq!(move_scan.entries[0].1.as_ref().unwrap().ids, moving.ids);
+    }
+
+    #[test]
     fn version_one_deletion_records_default_to_no_transcript_cleanup() {
         let mut instance = Instance::new("journal-session", "/tmp/worktree");
         instance.id = "journal-session".to_string();
@@ -511,40 +535,10 @@ mod tests {
             .remove("purge_acp_transcript");
 
         let parsed: LifecycleJournalRecord = serde_json::from_value(record).unwrap();
-        let LifecycleJournalRecord::Deleting(entry) = parsed;
+        let LifecycleJournalRecord::Deleting(entry) = parsed else {
+            panic!("expected deletion intent");
+        };
         assert!(entry.is_current());
         assert!(!entry.purge_acp_transcript);
-    }
-    #[test]
-    fn missing_journal_is_absence_not_an_error() {
-        let temp = tempfile::tempdir().unwrap();
-        let sessions = temp.path().join("profile/sessions.json");
-        std::fs::create_dir_all(sessions.parent().unwrap()).unwrap();
-        assert!(!deletion_exists(&sessions, "session", 7).unwrap());
-        let mut instance = Instance::new("session", "/unused");
-        instance.id = "session".into();
-        instance.source_profile = "profile".into();
-        let entry = LifecycleJournalEntry::deletion(
-            instance,
-            Status::Idle,
-            sessions.clone(),
-            LifecycleDeletionOptions {
-                generation: 7,
-                delete_worktree: false,
-                delete_branch: false,
-                delete_sandbox: false,
-                force_delete: false,
-                detach_hooks: true,
-                keep_scratch: false,
-                purge_acp_transcript: false,
-            },
-        );
-        let path = record(&entry).unwrap();
-        assert!(deletion_exists(&sessions, "session", 7).unwrap());
-        std::fs::write(&path, b"malformed").unwrap();
-        assert!(deletion_exists(&sessions, "session", 7).is_err());
-        consume(&path).unwrap();
-        assert!(!deletion_exists(&sessions, "session", 7).unwrap());
-        assert!(read_deletion(&path).unwrap().is_none());
     }
 }

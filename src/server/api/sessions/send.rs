@@ -162,7 +162,7 @@ pub(crate) async fn send_terminal_message(
             let id_for_save = id.to_string();
             let file_watch = service.file_watch.clone();
             tokio::task::spawn_blocking(move || {
-                if let Ok(storage) = Storage::open(&profile, file_watch) {
+                if let Ok(storage) = Storage::new(&profile, file_watch) {
                     if let Err(e) = storage.update(|all, _groups| {
                         if let Some(disk_inst) = all.iter_mut().find(|i| i.id == id_for_save) {
                             if revived {

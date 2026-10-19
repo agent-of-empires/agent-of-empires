@@ -26,7 +26,6 @@ mod lifecycle_reservation;
 pub mod mcp;
 mod move_journal;
 pub mod poller;
-pub(crate) mod profile_rename;
 pub mod projects;
 pub(crate) mod recovery;
 pub mod restart;
@@ -101,7 +100,6 @@ pub(crate) use move_journal::{
     record as record_move_journal, MoveJournalEntry, MOVE_JOURNAL_VERSION,
 };
 pub(crate) use storage::acquire_session_identity_lock;
-pub(crate) use storage::{atomic_write_verified, sync_parent_directory};
 #[cfg(test)]
 pub(crate) use storage::{observe_lock_contention_for_test, observe_updates_for_test};
 pub(crate) use storage::{reconcile_profile_duplicates, DuplicateIdReport};
@@ -341,6 +339,7 @@ pub fn format_debug_namespace_warning(release: &Path, dev: &Path) -> String {
 }
 
 pub fn get_profile_dir(profile: &str) -> Result<PathBuf> {
+    let base = get_app_dir()?;
     let resolved;
     let profile_name = if profile.is_empty() {
         resolved = config::resolve_default_profile();
@@ -348,13 +347,6 @@ pub fn get_profile_dir(profile: &str) -> Result<PathBuf> {
     } else {
         profile
     };
-    validate_profile_name(profile_name)?;
-    let base = get_app_dir()?;
-    let _transition = storage::acquire_storage_shared_flock(
-        &base,
-        crate::migrations::v027_isolate_sandbox_stores::LOCK,
-    )?;
-    profile_rename::ensure_profile_available(profile_name)?;
     let dir = base.join("profiles").join(profile_name);
     if !dir.exists() {
         // Only a name about to be created runs the strict grammar; an existing directory still
@@ -367,19 +359,18 @@ pub fn get_profile_dir(profile: &str) -> Result<PathBuf> {
 
 /// Resolve the on-disk profile directory path WITHOUT creating it.
 pub fn get_profile_dir_path(profile: &str) -> Result<PathBuf> {
+    let base = get_app_dir()?;
     let resolved;
     let profile_name = if profile.is_empty() {
-        resolved = config::default_profile_name();
+        resolved = config::resolve_default_profile();
         resolved.as_str()
     } else {
         profile
     };
-    validate_profile_name(profile_name)?;
-    let base = get_app_dir()?;
     Ok(base.join("profiles").join(profile_name))
 }
 
-/// Resolve an existing profile, allowing bootstrap only on a genuine empty first run.
+/// Resolve the effective profile name for a read/reference operation.
 pub fn resolve_existing_profile(profile: &str) -> Result<String> {
     let name = if profile.is_empty() {
         config::resolve_default_profile()
@@ -625,11 +616,6 @@ pub fn delete_profile(name: &str) -> Result<()> {
 
     let base = get_app_dir()?;
     let profile_dir = base.join("profiles").join(name);
-    let _transition = storage::acquire_storage_shared_flock(
-        &base,
-        crate::migrations::v027_isolate_sandbox_stores::LOCK,
-    )?;
-    profile_rename::ensure_profile_available(name)?;
 
     if !profile_dir.exists() {
         anyhow::bail!("Profile '{}' does not exist", name);
@@ -650,7 +636,28 @@ pub fn delete_profile(name: &str) -> Result<()> {
 pub fn rename_profile(old_name: &str, new_name: &str) -> Result<()> {
     validate_profile_name(old_name)?;
     validate_new_profile_name(new_name)?;
-    profile_rename::rename(old_name, new_name)
+
+    let base = get_app_dir()?;
+    let old_dir = base.join("profiles").join(old_name);
+    let new_dir = base.join("profiles").join(new_name);
+
+    if !old_dir.exists() {
+        anyhow::bail!("Profile '{}' does not exist", old_name);
+    }
+    if new_dir.exists() {
+        anyhow::bail!("Profile '{}' already exists", new_name);
+    }
+
+    fs::rename(&old_dir, &new_dir)?;
+
+    // Update default profile if the renamed profile was the default
+    if let Some(config) = load_config()? {
+        if config.default_profile == old_name {
+            set_default_profile(new_name)?;
+        }
+    }
+
+    Ok(())
 }
 
 pub fn set_default_profile(name: &str) -> Result<()> {
@@ -1173,15 +1180,7 @@ mod tests {
 
     #[test]
     fn validate_profile_name_accepts_existing_dirs_and_rejects_traversal() {
-        for name in [
-            "work",
-            "personal",
-            "client-a",
-            "stray with spaces",
-            ".hidden",
-            "1",
-            "main",
-        ] {
+        for name in ["work", "personal", "client-a", ".hidden", "1", "main"] {
             validate_profile_name(name)
                 .unwrap_or_else(|e| panic!("expected {name:?} to validate: {e}"));
         }
@@ -1189,17 +1188,6 @@ mod tests {
             validate_profile_name(bad)
                 .err()
                 .unwrap_or_else(|| panic!("expected {bad:?} to be rejected"));
-        }
-    }
-
-    #[test]
-    fn profile_dir_path_rejects_traversal_before_resolving_app_dir() {
-        for bad in ["../outside", r"..\outside", "/outside", "a/b"] {
-            for result in [get_profile_dir_path(bad), get_profile_dir(bad)] {
-                result
-                    .err()
-                    .unwrap_or_else(|| panic!("expected profile path {bad:?} to be rejected"));
-            }
         }
     }
 

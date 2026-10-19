@@ -20,163 +20,16 @@ pub struct DeleteSessionBody {
     pub keep_scratch: bool,
 }
 
-enum PurgeSessionOutcome {
-    Removed(Vec<String>),
-    Kept(Vec<String>),
-    Pending {
-        messages: Vec<String>,
-        message: String,
-    },
-}
-
-async fn consume_failed_deletion(
-    state: &AppState,
-    result: crate::session::deletion::DeletionResult,
-) -> Result<PurgeSessionOutcome, String> {
-    let message = if result.errors.is_empty() {
-        "Unknown error".to_string()
-    } else {
-        result.errors.join("; ")
-    };
-    if !result.teardown_started {
-        return Err(message);
-    }
-
-    sync_retained_instance(state, result.retained_instance).await;
-    tracing::warn!(
-        target: "http.api.sessions",
-        session = %result.session_id,
-        "session purge teardown started and remains pending recovery: {message}"
-    );
-    Ok(PurgeSessionOutcome::Pending {
-        messages: result.messages,
-        message,
-    })
-}
-
-/// Report a delete failure without masking a durable purge that recovery still owns.
+/// Flip a session out of `Status::Deleting` into `Status::Error` so a
+/// bookkeeping failure after teardown does not strand it greyed-out and
+/// unclickable, the state this detached-task delete exists to prevent.
 pub(super) async fn mark_delete_error(state: &AppState, id: &str, message: String) {
-    let profile = state
-        .instances
-        .read()
-        .await
-        .iter()
-        .find(|instance| instance.id == id)
-        .map(|instance| instance.source_profile.clone())
-        .unwrap_or_else(|| state.profile.clone());
-    let id_for_load = id.to_string();
-    let durable_row = tokio::task::spawn_blocking(move || {
-        Storage::open_unwatched(&profile)
-            .and_then(|storage| storage.load())
-            .map(|instances| {
-                instances
-                    .into_iter()
-                    .find(|instance| instance.id == id_for_load)
-            })
-    })
-    .await;
-    let durable_row = match durable_row {
-        Ok(Ok(durable_row)) => durable_row,
-        Ok(Err(error)) => {
-            tracing::warn!(target: "http.api.sessions", session = %id, error = %error,
-                "could not reload durable session row after delete failure");
-            None
-        }
-        Err(error) => {
-            tracing::warn!(target: "http.api.sessions", session = %id, error = %error,
-                "delete row reload task failed");
-            None
-        }
-    };
-    sync_delete_error_row(state, id, durable_row, message).await;
-}
-
-async fn sync_delete_error_row(
-    state: &AppState,
-    id: &str,
-    durable: Option<Instance>,
-    message: String,
-) {
     let mut instances = state.instances.write().await;
     if let Some(inst) = instances.iter_mut().find(|i| i.id == id) {
         let old_status = inst.status;
-        match durable {
-            Some(row) if row.lifecycle_generation >= inst.lifecycle_generation => {
-                let generation_advanced = row.lifecycle_generation > inst.lifecycle_generation;
-                sync_lifecycle_fields(inst, &row);
-                if !generation_advanced {
-                    inst.status = delete_failure_status(Some(row.status)).unwrap_or(inst.status);
-                    inst.last_error = Some(message);
-                } else if row.status == Status::Deleting {
-                    inst.last_error = Some(message);
-                }
-            }
-            Some(_) | None => inst.last_error = Some(message),
-        }
+        inst.status = Status::Error;
+        inst.last_error = Some(message);
         publish_status_change(&state.status_tx, inst, old_status);
-    }
-}
-
-pub(super) async fn sync_retained_instance(state: &AppState, retained: Option<Instance>) {
-    let Some(retained) = retained else {
-        return;
-    };
-    let mut instances = state.instances.write().await;
-    if let Some(inst) = instances.iter_mut().find(|i| i.id == retained.id) {
-        let old_status = inst.status;
-        if sync_lifecycle_fields(inst, &retained) {
-            publish_status_change(&state.status_tx, inst, old_status);
-        }
-    }
-}
-
-fn sync_lifecycle_fields(instance: &mut Instance, durable: &Instance) -> bool {
-    if durable.lifecycle_generation < instance.lifecycle_generation {
-        return false;
-    }
-    instance.status = durable.status;
-    instance.last_accessed_at = durable.last_accessed_at;
-    instance.idle_entered_at = durable.idle_entered_at;
-    instance.project_path.clone_from(&durable.project_path);
-    instance.pre_trash_project_path = durable.pre_trash_project_path.clone();
-    instance.trashed_at = durable.trashed_at;
-    instance.trash_lifecycle_id = durable.trash_lifecycle_id.clone();
-    instance.lifecycle_reservation = durable.lifecycle_reservation.clone();
-    instance.lifecycle_generation = durable.lifecycle_generation;
-    true
-}
-
-fn delete_failure_status(durable_status: Option<Status>) -> Option<Status> {
-    match durable_status {
-        Some(Status::Deleting) => Some(Status::Deleting),
-        Some(_) => Some(Status::Error),
-        None => None,
-    }
-}
-
-#[cfg(test)]
-mod deletion_status_tests {
-    use super::*;
-
-    #[test]
-    fn delete_failure_keeps_durable_deleting_status() {
-        assert_eq!(
-            delete_failure_status(Some(Status::Deleting)),
-            Some(Status::Deleting)
-        );
-    }
-
-    #[test]
-    fn delete_failure_marks_a_released_row_as_error() {
-        assert_eq!(
-            delete_failure_status(Some(Status::Idle)),
-            Some(Status::Error)
-        );
-    }
-
-    #[test]
-    fn delete_failure_keeps_current_status_when_durable_row_is_unavailable() {
-        assert_eq!(delete_failure_status(None), None);
     }
 }
 
@@ -187,16 +40,16 @@ mod deletion_status_tests {
 /// hook and completion phases are dispatched internally, so no caller-held
 /// lifecycle guard crosses an await.
 ///
-/// The result distinguishes removal, a retained row, and teardown that began
-/// but remains pending recovery. Callers must not report retained or pending
-/// rows as deleted.
+/// The success `bool` is `true` when the row was actually removed and `false`
+/// when a concurrent restore won the race and the row was kept. Callers must
+/// not report a kept row as deleted.
 async fn purge_session_artifacts(
     state: &Arc<AppState>,
     id: &str,
     instance: Instance,
     body: &DeleteSessionBody,
     recent_entry: Option<crate::session::RecentProjectEntry>,
-) -> Result<PurgeSessionOutcome, String> {
+) -> Result<(bool, Vec<String>), String> {
     let profile = instance.source_profile.clone();
     if profile.is_empty() {
         return Err(
@@ -218,7 +71,7 @@ async fn purge_session_artifacts(
     let file_watch = state.file_watch.clone();
     let reserve_profile = profile.clone();
     let reservation = tokio::task::spawn_blocking(move || {
-        let storage = Storage::open(&reserve_profile, file_watch)
+        let storage = Storage::new(&reserve_profile, file_watch)
             .map_err(|e| format!("Storage init failed before session teardown: {e}"))?;
         let reservation = if purge_acp_transcript {
             crate::session::deletion::PurgeTransaction::reserve_with_acp_transcript(
@@ -244,20 +97,19 @@ async fn purge_session_artifacts(
                     );
                     state.instance_locks.write().await.remove(id);
                     state.session_service.forget_prompt_lock(id).await;
-                    Ok(PurgeSessionOutcome::Removed(result.messages))
+                    Ok((true, result.messages))
                 }
                 crate::session::deletion::DeletionDisposition::KeptRestored => {
-                    sync_retained_instance(state, result.retained_instance).await;
-                    Ok(PurgeSessionOutcome::Kept(result.errors))
+                    Err("Session is being restored, so it was not purged".to_string())
                 }
                 crate::session::deletion::DeletionDisposition::Busy => {
-                    sync_retained_instance(state, result.retained_instance).await;
-                    Ok(PurgeSessionOutcome::Kept(result.errors))
+                    Err(result.errors.first().cloned().unwrap_or_else(|| {
+                        "Session is busy with another lifecycle operation, so it was not purged"
+                            .to_string()
+                    }))
                 }
-                crate::session::deletion::DeletionDisposition::Failed => {
-                    consume_failed_deletion(state, result).await
-                }
-                crate::session::deletion::DeletionDisposition::Removed => {
+                crate::session::deletion::DeletionDisposition::Failed
+                | crate::session::deletion::DeletionDisposition::Removed => {
                     Err(result.errors.join("; "))
                 }
             };
@@ -307,19 +159,24 @@ async fn purge_session_artifacts(
             .map_err(|e| format!("Deletion task failed: {e}"))?
     };
 
+    let messages = deletion_result.messages.clone();
     match deletion_result.disposition {
         crate::session::deletion::DeletionDisposition::KeptRestored
         | crate::session::deletion::DeletionDisposition::Busy => {
-            sync_retained_instance(state, deletion_result.retained_instance.clone()).await;
             tracing::warn!(
                 target: "http.api.sessions",
                 session = %id,
                 "session changed or was restored before purge completion; kept the durable row"
             );
-            return Ok(PurgeSessionOutcome::Kept(deletion_result.messages));
+            return Ok((false, messages));
         }
         crate::session::deletion::DeletionDisposition::Failed => {
-            return consume_failed_deletion(state, deletion_result).await;
+            let errs = if deletion_result.errors.is_empty() {
+                "Unknown error".to_string()
+            } else {
+                deletion_result.errors.join("; ")
+            };
+            return Err(errs);
         }
         crate::session::deletion::DeletionDisposition::Removed
         | crate::session::deletion::DeletionDisposition::AlreadyGone => {}
@@ -327,7 +184,11 @@ async fn purge_session_artifacts(
     if !deletion_result.success
         && deletion_result.disposition != crate::session::deletion::DeletionDisposition::AlreadyGone
     {
-        let errs = deletion_result.errors.join("; ");
+        let errs = if deletion_result.errors.is_empty() {
+            "Unknown error".to_string()
+        } else {
+            deletion_result.errors.join("; ")
+        };
         return Err(errs);
     }
 
@@ -349,7 +210,7 @@ async fn purge_session_artifacts(
                 "recording recent project after delete failed: {e}");
         }
     }
-    Ok(PurgeSessionOutcome::Removed(deletion_result.messages))
+    Ok((true, messages))
 }
 
 /// Heal managed worktree sessions whose recorded `project_path` no longer
@@ -553,20 +414,10 @@ pub(crate) async fn purge_expired_trash(state: &Arc<AppState>) {
             keep_scratch: false,
         };
         match purge_session_artifacts(state, &id, instance, &body, recent_entry).await {
-            Ok(PurgeSessionOutcome::Removed(_)) => tracing::info!(
+            Ok((_removed, _messages)) => tracing::info!(
                 target: "http.api.sessions",
                 session = %id,
                 "auto-purged expired trashed session"
-            ),
-            Ok(PurgeSessionOutcome::Kept(_)) => tracing::info!(
-                target: "http.api.sessions",
-                session = %id,
-                "expired trashed session was kept by a concurrent lifecycle operation"
-            ),
-            Ok(PurgeSessionOutcome::Pending { message, .. }) => tracing::warn!(
-                target: "http.api.sessions",
-                session = %id,
-                "auto-purge of expired trash remains pending recovery: {message}"
             ),
             Err(e) => tracing::warn!(
                 target: "http.api.sessions",
@@ -660,21 +511,13 @@ pub async fn delete_session(
         }
 
         match purge_session_artifacts(&state, &id, instance, &body, recent_entry).await {
-            Ok(PurgeSessionOutcome::Removed(messages)) => (
+            Ok((removed, messages)) => (
                 StatusCode::OK,
-                Json(serde_json::json!({"status": "deleted", "messages": messages})),
-            ),
-            Ok(PurgeSessionOutcome::Kept(messages)) => (
-                StatusCode::OK,
-                Json(serde_json::json!({"status": "kept", "messages": messages})),
-            ),
-            Ok(PurgeSessionOutcome::Pending { messages, message }) => (
-                StatusCode::ACCEPTED,
                 Json(serde_json::json!({
-                    "status": "pending",
-                    "session_status": "Deleting",
+                    // A concurrent restore can keep the row (removed=false); do
+                    // not claim it was deleted in that case.
+                    "status": if removed { "deleted" } else { "kept" },
                     "messages": messages,
-                    "message": message,
                 })),
             ),
             Err(msg) => {
@@ -732,13 +575,6 @@ pub struct DeleteWorkspaceBody {
 pub(super) struct WorkspaceDeleteFailure {
     pub(super) id: String,
     pub(super) error: String,
-}
-
-#[derive(Serialize)]
-pub(super) struct WorkspaceDeletePending {
-    pub(super) id: String,
-    pub(super) session_status: &'static str,
-    pub(super) message: String,
 }
 
 /// Drop duplicate session ids, preserving first-seen order. With
@@ -841,22 +677,16 @@ fn workspace_dirty_message_blocking(
 /// non-force stays all-or-nothing even if the worktree is dirtied after the
 /// handler preflight. This cannot deadlock: a session belongs to exactly one
 /// workspace, and sibling locks are taken one at a time. A session already gone
-/// is skipped, not failed; a row a concurrent restore kept is reported neither
-/// deleted nor failed.
+/// is skipped, not failed; a row a concurrent restore kept (`removed == false`)
+/// is reported neither deleted nor failed.
 pub(super) async fn purge_workspace_artifacts(
     state: &Arc<AppState>,
     owner_id: String,
     plan: Vec<(String, DeleteSessionBody)>,
     owner_needs_dirty_check: bool,
-) -> (
-    Vec<String>,
-    Vec<WorkspaceDeleteFailure>,
-    Vec<WorkspaceDeletePending>,
-    Vec<String>,
-) {
+) -> (Vec<String>, Vec<WorkspaceDeleteFailure>, Vec<String>) {
     let mut deleted = Vec::new();
     let mut failed = Vec::new();
-    let mut pending = Vec::new();
     let mut messages = Vec::new();
 
     // Hold the owner's locks across the entire teardown (see doc comment).
@@ -883,7 +713,7 @@ pub(super) async fn purge_workspace_artifacts(
                     id: owner_id,
                     error: format!("Workspace: {msg}"),
                 });
-                return (deleted, failed, pending, messages);
+                return (deleted, failed, messages);
             }
         }
     }
@@ -920,24 +750,14 @@ pub(super) async fn purge_workspace_artifacts(
 
         let recent_entry = crate::session::recent_project_entry_for(&instance);
         match purge_session_artifacts(state, &id, instance, &body, recent_entry).await {
-            Ok(PurgeSessionOutcome::Removed(mut msgs)) => {
+            Ok((removed, mut msgs)) => {
                 messages.append(&mut msgs);
-                deleted.push(id.clone());
-            }
-            Ok(PurgeSessionOutcome::Kept(mut msgs)) => {
-                messages.append(&mut msgs);
-            }
-            Ok(PurgeSessionOutcome::Pending {
-                messages: mut pending_messages,
-                message,
-            }) => {
-                messages.append(&mut pending_messages);
-                pending.push(WorkspaceDeletePending {
-                    id: id.clone(),
-                    session_status: "Deleting",
-                    message,
-                });
-                break;
+                // A concurrent restore can keep the row, so only actually
+                // removed rows are reported deleted; otherwise the client drops
+                // local state for a session that survived.
+                if removed {
+                    deleted.push(id.clone());
+                }
             }
             Err(msg) => {
                 mark_delete_error(state, &id, msg.clone()).await;
@@ -953,7 +773,7 @@ pub(super) async fn purge_workspace_artifacts(
         }
     }
 
-    (deleted, failed, pending, messages)
+    (deleted, failed, messages)
 }
 
 /// `DELETE /api/workspaces`: atomic multi-session workspace delete, replacing
@@ -1025,20 +845,7 @@ pub async fn delete_workspace(
     });
 
     match join.await {
-        Ok((deleted, failed, pending, messages)) => {
-            if !pending.is_empty() {
-                return (
-                    StatusCode::ACCEPTED,
-                    Json(serde_json::json!({
-                        "status": "pending",
-                        "deleted": deleted,
-                        "pending": pending,
-                        "failed": failed,
-                        "messages": messages,
-                    })),
-                )
-                    .into_response();
-            }
+        Ok((deleted, failed, messages)) => {
             if deleted.is_empty() && !failed.is_empty() {
                 let msg = failed
                     .iter()

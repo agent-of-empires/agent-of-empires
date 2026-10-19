@@ -26,53 +26,7 @@ Invariants worth knowing before touching this code:
 
 `session/delete` fires only on permanent removal (a purge, or disabling the structured view, which discards the conversation). Reversible teardown (`aoe acp stop`, snooze, archive, trash, idle auto-stop) deliberately does not fire it, so the transcript stays on disk and the next respawn resumes through `session/load`.
 
-Trash is the reversible middle state: a delete moves the session there by default (`session.delete_to_trash`), keeping its transcript, worktree, branch, and container until it is restored, purged, or auto-purged after `session.trash_retention_minutes`. Retention is enforced by the daemon (a startup sweep, then one every tenth of the shortest window, between a minute and an hour), so without one, expired trash waits for the next daemon start or a manual purge. When the daemon permanently deletes a structured session it sends a best-effort `session/delete` (2s timeout) so adapters that implement it can release their own state, then proceeds with cancel, SIGTERM, and on-disk cleanup. CLI purges stop any registered detached runner before deleting its local transcript.
-
-Purge intent is persisted in each profile's `.lifecycle-journal` before cleanup.
-A stable app-wide per-session flock keeps the purge owner exclusive across hooks,
-commit and rollback, even after its wall-clock lease expires. The separate lifecycle
-lock can be released for hooks. Retained completion advances the done generation so
-cached observers reload the restored status without overwriting a successor.
-
-Recovery rechecks ownership and terminal checkpoints under the lifecycle lock.
-Canonical journal filenames isolate unreadable or unsupported intents by session;
-unidentifiable files remain conservative profile-wide blockers. Force Remove and
-failed-trash row drops abandon matching destructive intents before removing the row,
-so later recovery cannot delete the worktree, branch or Scratch that was kept.
-
-A purge fence captures detached-runner identity before shutdown and preserves it across
-retries. Saved identity tracks unfinished groups; each TERM or KILL also requires a
-matching live socket peer and its recorded kernel boot/start identity. Legacy identities
-remain unknown instead of being minted from a potentially reused PID. Resource cleanup
-requires complete proof that no group member can write. Zombies alone do not block it;
-a zombie leader with remaining threads is still potentially writing. Live descendants
-and unreadable process membership retain resources.
-
-The orphan reaper records `.orphan-stop` evidence before signaling. Runner self-cleanup
-cannot erase that retry path. The marker does not authorize signals and blocks new runner
-publication until the orphan reaper releases it. Non-writing old groups can release their
-marker without touching a successor record or listener. An aborted purge keeps its fence
-and abandoned intent when clearing them would lose the last durable evidence of a writing
-group.
-
-Listener binding and registry publication share the registry lock. Purge cleanup checks
-invocation-local socket identity again before unlinking sockets and then the record.
-Unknown or replaced artifacts retain resources. Recovery repeats the runner gate after
-destroy hooks; a completed hook checkpoint does not make the pre-hook check current.
-
-Profile rename validates source and destination under the exclusive transition, then
-records directory identity before retargeting deletion snapshots and ACP profile references.
-Recovery rolls back before the directory commit or completes after
-it, preserving resource paths and conditionally updating the still-current default.
-Pending names refuse ordinary mutations and runner publication; publication retains its
-transition guard through agent spawn. The session-move journal format and path are unchanged.
-Path and effective-config reads select default names without creating profile directories,
-including empty selections. The explicit default-profile bootstrap boundary is unchanged.
-
-`Kept` checkpoints record intentionally retained resources. Recovery removes one only
-after every recognized scratch/workspace path is proven absent and no sibling intent
-could regain destructive authority. Unknown descriptors, symlink ancestry, I/O errors,
-and ambiguous sibling journals retain the checkpoint. There is no age-based expiry.
+Trash is the reversible middle state: a delete moves the session there by default (`session.delete_to_trash`), keeping its transcript, worktree, branch, and container until it is restored, purged, or auto-purged after `session.trash_retention_minutes`. Retention is enforced by the daemon (a startup sweep, then one every tenth of the shortest window, between a minute and an hour), so without one, expired trash waits for the next daemon start or a manual purge. When the daemon permanently deletes a structured session it sends a best-effort `session/delete` (2s timeout) so adapters that implement it can release their own state, then proceeds with cancel, SIGTERM, and on-disk cleanup. CLI purges have no running worker, so they delete the local transcript only.
 
 ## Who owns the state
 

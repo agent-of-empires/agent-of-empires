@@ -1004,7 +1004,6 @@ Manage profiles (separate workspaces)
 * `create` — Create a new profile
 * `delete` — Delete a profile
 * `rename` — Rename a profile
-* `repair-rename-checkpoint` — Preserve an invalid rename checkpoint after reviewing its digest
 * `default` — Show or set default profile
 * `show` — Show profile-derived values for scripts
 
@@ -1053,20 +1052,6 @@ Rename a profile
 * `<OLD_NAME>` — Current profile name
 * `<NEW_NAME>` — New profile name (same rules as `aoe profile create`)
 
-
-
-## `aoe profile repair-rename-checkpoint`
-
-Preserve an invalid rename checkpoint after reviewing its digest
-
-**Usage:** `aoe profile repair-rename-checkpoint --checkpoint <CHECKPOINT> --sha256 <SHA256> [--old-profile <OLD_PROFILE>] [--new-profile <NEW_PROFILE>]`
-
-###### **Options:**
-
-* `--checkpoint <CHECKPOINT>` — Active checkpoint filename printed by startup recovery
-* `--sha256 <SHA256>` — SHA-256 printed by startup recovery
-* `--old-profile <OLD_PROFILE>` — Acknowledge the checkpoint's old profile when its endpoints are identifiable
-* `--new-profile <NEW_PROFILE>` — Acknowledge the checkpoint's new profile when its endpoints are identifiable
 
 
 ## `aoe profile default`

@@ -227,7 +227,7 @@ impl Instance {
             profiles.push(current_profile.clone());
         }
         for profile in profiles {
-            let Ok(storage) = crate::session::storage::Storage::open_unwatched(&profile) else {
+            let Ok(storage) = crate::session::storage::Storage::new_unwatched(&profile) else {
                 return false;
             };
             let Ok(instances) = storage.load() else {
@@ -852,7 +852,7 @@ impl Instance {
     /// transition.
     pub(crate) fn stop_and_flush_poller(&mut self) {
         let profile = self.effective_profile();
-        let storage = match crate::session::storage::Storage::open(
+        let storage = match crate::session::storage::Storage::new(
             &profile,
             self.resolve_file_watch(),
         ) {
@@ -1634,44 +1634,6 @@ mod tests {
         inst.status = Status::Running;
         inst.sandbox_info = Some(test_sandbox(&format!("test-{}", inst.id), Some(workdir)));
         inst
-    }
-
-    #[test]
-    #[serial_test::serial]
-    fn managed_capture_profile_walk_does_not_recreate_missing_current_profile() {
-        let app = tempfile::tempdir().unwrap();
-        let _app_guard = crate::session::test_support::isolate_app_dir_at(app.path());
-        let profile = "capture-owner-missing";
-        let profile_dir = crate::session::get_profile_dir_path(profile).unwrap();
-        let store = app.path().join("managed-store");
-        std::fs::create_dir_all(&store).unwrap();
-        let mut current = sandboxed_gemini("current", "/repos/current", "/workspace/current");
-        current.source_profile = profile.to_string();
-        current.active_execution = Some(super::ActiveExecution {
-            launch_id: uuid::Uuid::new_v4().to_string(),
-            binding: crate::session::ExecutionBinding {
-                agent: "gemini".into(),
-                stores: vec![store.clone()],
-                configuration: Vec::new(),
-                exported_default_store: Some(false),
-                cwd: "/workspace/current".into(),
-                cwd_filesystem: "host".into(),
-                filesystem: "host".into(),
-            },
-            capture: Some(super::CaptureContext::Store {
-                root: store,
-                cwd: "/workspace/current".into(),
-            }),
-            container: None,
-        });
-
-        assert!(!profile_dir.exists());
-        assert!(!current
-            .managed_capture_store_is_exclusive(crate::agents::SessionCaptureBackend::Gemini));
-        assert!(
-            !profile_dir.exists(),
-            "profile enumeration must not recreate a missing profile"
-        );
     }
 
     /// The profile walk needs the peer's profile to be enumerated and its row to be
