@@ -976,73 +976,52 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn shutdown_and_wait_preserves_replacement_control_socket() {
-        use std::os::unix::process::CommandExt;
-
-        let (_home, tmp) = isolate_home();
-        let ready = tmp.path().join("old-runner-ready");
-        let mut old = std::process::Command::new("/bin/sh")
-            .args([
-                "-c",
-                r#"trap '' TERM; printf ready > "$1"; exec sleep 60"#,
-                "sh",
-            ])
-            .arg(&ready)
-            .process_group(0)
-            .spawn()
-            .expect("spawn old runner stand-in");
-        let old_pid = old.id();
-        std::thread::spawn(move || {
-            let _ = old.wait();
-        });
-        let ready_deadline = tokio::time::Instant::now() + Duration::from_secs(2);
-        while !ready.exists() {
-            assert!(
-                tokio::time::Instant::now() < ready_deadline,
-                "old runner stand-in did not become ready"
-            );
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-
+        let (_home, _tmp) = isolate_home();
         let session_id = "sw-replacement-socket";
+        let pid = std::process::id();
         let socket_path = worker_registry::socket_path_for(session_id).unwrap();
         let control_path = crate::process::worker::control_socket_sibling(&socket_path);
-        worker_registry::save(&worker_record(session_id, old_pid, socket_path.clone())).unwrap();
+        let old = worker_record(session_id, pid, socket_path.clone()).with_generation(1);
+        assert!(
+            old.runner_identity.is_some(),
+            "fixture runner birth must be attested"
+        );
+        worker_registry::save(&old).unwrap();
 
-        let sup = Supervisor::new(VecSink::new());
+        let control = Arc::new(FakeProcessControl::default());
+        let sup = Supervisor::new(VecSink::new()).with_process_control(control);
         sup.test_insert_worker(session_id).await;
-        let replacement_control = control_path.clone();
-        let replacement = tokio::spawn(async move {
-            let deadline = tokio::time::Instant::now()
-                + TEARDOWN_TERM_GRACE
-                + TEARDOWN_KILL_GRACE
-                + Duration::from_secs(1);
-            while worker_registry::load(session_id).unwrap().is_some() {
+        let shutdown = sup.shutdown_and_wait(session_id, Duration::from_millis(300));
+        tokio::pin!(shutdown);
+        // The tracked incarnation is gone, but a live raw PID keeps the final wait pending.
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
                 assert!(
-                    tokio::time::Instant::now() < deadline,
-                    "old registry record was not removed"
+                    futures_util::poll!(&mut shutdown).is_pending(),
+                    "shutdown must remain pending until the replacement is published"
                 );
-                tokio::time::sleep(Duration::from_millis(10)).await;
+                if worker_registry::load(session_id).unwrap().is_none() {
+                    break;
+                }
+                tokio::task::yield_now().await;
             }
-            let listener = tokio::net::UnixListener::bind(&replacement_control).unwrap();
-            worker_registry::save(&worker_record(session_id, std::process::id(), socket_path))
-                .unwrap();
-            listener
-        });
+        })
+        .await
+        .expect("shutdown must retire the old registry record");
 
-        sup.shutdown_and_wait(session_id, Duration::from_millis(300))
-            .await
-            .unwrap();
-        let listener = tokio::time::timeout(Duration::from_secs(1), replacement)
-            .await
-            .expect("replacement must publish during shutdown wait")
-            .unwrap();
+        let listener = tokio::net::UnixListener::bind(&control_path).unwrap();
+        let replacement = worker_record(session_id, pid, socket_path).with_generation(2);
+        worker_registry::save(&replacement).unwrap();
+        shutdown.await.unwrap();
         assert!(
             control_path.exists(),
             "old runner cleanup removed the replacement control socket"
         );
+        let current = worker_registry::load(session_id).unwrap().unwrap();
+        assert_eq!(current.pid, replacement.pid);
+        assert_eq!(current.generation, replacement.generation);
         drop(listener);
-        worker_registry::retire_if_owned(&worker_registry::load(session_id).unwrap().unwrap())
-            .unwrap();
+        worker_registry::retire_if_owned(&replacement).unwrap();
     }
 
     #[tokio::test]
