@@ -367,13 +367,10 @@ pub fn try_lock_serve() -> Result<Option<ServeLock>> {
 }
 
 /// Taken in `main` before startup migrations, so no migration write by a starting
-/// server can overlap `aoe migrate`. Commands that do not start a server take none.
-pub fn lock_for_startup(args: &ServeArgs) -> Result<Option<ServeLock>> {
-    if args.stop || args.status || args.restart {
-        return Ok(None);
-    }
+/// server can overlap `aoe migrate`.
+pub fn lock_for_startup() -> Result<ServeLock> {
     match try_lock_serve()? {
-        Some(lock) => Ok(Some(lock)),
+        Some(lock) => Ok(lock),
         None => match daemon_pid() {
             Some(pid) if pid != std::process::id() => Err(daemon_running_error(pid)),
             _ => bail!(
@@ -817,20 +814,23 @@ pub fn daemon_pid() -> Option<u32> {
     }
 }
 
+/// The daemon controls, dispatched by `main` before the startup lock and
+/// migrations: they must work while a pending migration fails or the old
+/// daemon still runs. `None` means `args` starts a server.
+pub async fn run_control(args: &ServeArgs) -> Option<Result<()>> {
+    if args.stop {
+        Some(stop_daemon().await)
+    } else if args.status {
+        Some(print_status().await)
+    } else if args.restart {
+        Some(restart_daemon().await)
+    } else {
+        None
+    }
+}
+
 #[tracing::instrument(target = "cli.serve", skip_all, fields(profile = %profile))]
 pub async fn run(profile: &str, mut args: ServeArgs, serve_lock: Option<ServeLock>) -> Result<()> {
-    if args.stop {
-        return stop_daemon().await;
-    }
-
-    if args.status {
-        return print_status().await;
-    }
-
-    if args.restart {
-        return restart_daemon().await;
-    }
-
     crate::session::require_known_profile(profile)?;
 
     args.cityhall = args.cityhall || std::env::var_os("AOE_CITYHALL_MODE").is_some();
@@ -1485,20 +1485,6 @@ mod tests {
         ];
         for (command, expected) in cases {
             assert_eq!(command_is_aoe_serve(command), *expected, "{command:?}");
-        }
-    }
-
-    #[test]
-    fn only_a_server_start_takes_the_startup_lock() {
-        use crate::cli::{Cli, Commands};
-        use clap::Parser;
-        for flag in ["--stop", "--status", "--restart"] {
-            let Some(Commands::Serve(args)) =
-                Cli::try_parse_from(["aoe", "serve", flag]).unwrap().command
-            else {
-                panic!("expected serve");
-            };
-            assert!(lock_for_startup(&args).unwrap().is_none(), "{flag}");
         }
     }
 

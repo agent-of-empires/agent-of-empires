@@ -653,3 +653,43 @@ fn cli_acp_tail_connects_to_behind_proxy_passphrase_daemon() {
         }
     }
 }
+
+/// Daemon controls reach their own handlers without running startup
+/// migrations or taking the lifetime lock (#4671). v040 would fail on the
+/// `acp-workers` file, so a migration run shows up as a different error.
+#[test]
+#[parallel]
+fn cli_serve_controls_skip_migrations_and_lock() {
+    use fs2::FileExt as _;
+
+    let h = TuiTestHarness::new("serve_controls_skip_migrations");
+    let app = app_dir_in(h.home_path());
+    std::fs::create_dir_all(&app).unwrap();
+    let version = app.join(".schema_version");
+    std::fs::write(&version, "39").unwrap();
+    let workers = app.join("acp-workers");
+    std::fs::write(&workers, "not a directory").unwrap();
+    let lock = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(app.join("serve.lock"))
+        .unwrap();
+    lock.lock_exclusive().unwrap();
+
+    let cases = [
+        ("--status", "Daemon: not running"),
+        ("--stop", "No running daemon found"),
+        ("--restart", "No running aoe serve daemon to restart"),
+    ];
+    for (flag, expected) in cases {
+        let stderr = h.run_cli_err(&["serve", flag]);
+        assert!(stderr.contains(expected), "{flag}: {stderr}");
+        assert_eq!(std::fs::read_to_string(&version).unwrap(), "39", "{flag}");
+        assert_eq!(
+            std::fs::read_to_string(&workers).unwrap(),
+            "not a directory",
+            "{flag}"
+        );
+    }
+}
