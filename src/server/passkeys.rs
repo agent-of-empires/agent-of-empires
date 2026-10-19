@@ -1074,6 +1074,49 @@ mod tests {
         assert!(mgr.load_failed, "a symlinked store is refused");
     }
 
+    fn state_with_login(passphrase: Option<&str>) -> Arc<AppState> {
+        let mut state = crate::server::test_support::build_test_app_state(Vec::new());
+        Arc::get_mut(&mut state).unwrap().login_manager =
+            Arc::new(crate::server::login::LoginManager::new(passphrase));
+        state
+    }
+
+    #[tokio::test]
+    async fn handlers_require_login_to_be_enabled_and_a_session_to_enrol() {
+        let addr = ConnectInfo("203.0.113.7:4000".parse::<std::net::SocketAddr>().unwrap());
+        let mut headers = HeaderMap::new();
+        headers.insert("origin", ORIGIN.parse().unwrap());
+        headers.insert("host", "aoe.example.com".parse().unwrap());
+
+        let off = state_with_login(None);
+        let res = login_start_handler(State(off.clone()), addr, headers.clone()).await;
+        assert_eq!(res.status(), StatusCode::NOT_FOUND);
+
+        let on = state_with_login(Some("pw"));
+        let res = register_start_handler(State(on.clone()), None, headers.clone(), None).await;
+        assert_eq!(
+            res.status(),
+            StatusCode::UNAUTHORIZED,
+            "no session, no enrolment"
+        );
+
+        // Login is on but no origin is allowlisted, so even a session cannot enrol.
+        let session = Some(Extension(AuthenticatedSession("s1".into())));
+        let res = register_start_handler(State(on.clone()), session, headers.clone(), None).await;
+        assert_eq!(res.status(), StatusCode::FORBIDDEN);
+
+        // Allowlisted origin, but nothing enrolled: login start has nothing to offer.
+        let mut with_origin = state_with_login(Some("pw"));
+        Arc::get_mut(&mut with_origin).unwrap().allowed_origins = allowed();
+        let res = login_start_handler(State(with_origin.clone()), addr, headers.clone()).await;
+        assert_eq!(res.status(), StatusCode::NOT_FOUND);
+
+        // Two Origin headers are ambiguous and refused.
+        headers.append("origin", ORIGIN.parse().unwrap());
+        let res = login_start_handler(State(with_origin), addr, headers).await;
+        assert_eq!(res.status(), StatusCode::FORBIDDEN);
+    }
+
     #[test]
     fn labels_are_trimmed_bounded_and_stripped_of_control_characters() {
         assert_eq!(sanitize_label("  "), "Passkey");

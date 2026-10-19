@@ -1578,11 +1578,13 @@ export interface LoginStatus {
   /** Inside the step-up window that sensitive routes require. */
   elevated: boolean;
   elevated_until_secs: number | null;
+  /** This origin has an enrolled passkey. */
+  passkey_available?: boolean;
 }
 
 export async function loginStatus(): Promise<LoginStatus> {
   return (
-    (await fetchJson<LoginStatus>("/api/login/status")) ?? {
+    (await fetchJson<LoginStatus>(`/api/login/status?origin=${encodeURIComponent(window.location.origin)}`)) ?? {
       required: false,
       authenticated: true,
       elevated: true,
@@ -1622,6 +1624,93 @@ export function login(passphrase: string): Promise<{ ok: boolean; error?: string
     );
     return ok ? { ok: true } : { ok: false, error: rawMessage(payload) ?? `Login failed (${status})` };
   });
+}
+
+/** The browser can parse and serialize WebAuthn JSON, which the passkey calls rely on. */
+export function passkeysSupported(): boolean {
+  return (
+    typeof PublicKeyCredential !== "undefined" &&
+    typeof PublicKeyCredential.parseRequestOptionsFromJSON === "function" &&
+    typeof PublicKeyCredential.parseCreationOptionsFromJSON === "function"
+  );
+}
+
+interface PasskeyCeremony<Options> {
+  transaction_id: string;
+  options: { publicKey: Options };
+}
+
+type PasskeyResult = { ok: boolean; error?: string; cancelled?: boolean };
+
+/** Start a ceremony, let the browser run it, and finish it. `finishExtra` adds fields to the finish request. */
+async function runPasskeyCeremony<Options>(
+  startUrl: string,
+  startBody: unknown,
+  finishUrl: string,
+  finishExtra: Record<string, unknown>,
+  prompt: (options: Options) => Promise<Credential | null>,
+  failure: string,
+): Promise<PasskeyResult> {
+  const start = await send(startUrl, jsonInit("POST", startBody));
+  if (!start.ok) return { ok: false, error: rawMessage(start.payload) ?? `${failure} (${start.status})` };
+  const ceremony = start.payload as unknown as PasskeyCeremony<Options>;
+  let credential: unknown;
+  try {
+    const result = await prompt(ceremony.options.publicKey);
+    if (!result) return { ok: false, cancelled: true };
+    credential = (result as PublicKeyCredential).toJSON();
+  } catch (err) {
+    if (err instanceof DOMException && err.name === "NotAllowedError") return { ok: false, cancelled: true };
+    return { ok: false, error: err instanceof Error ? err.message : failure };
+  }
+  const finish = await send(
+    finishUrl,
+    jsonInit("POST", { transaction_id: ceremony.transaction_id, credential, ...finishExtra }),
+  );
+  return finish.ok ? { ok: true } : { ok: false, error: rawMessage(finish.payload) ?? `${failure} (${finish.status})` };
+}
+
+/** Sign in with an enrolled passkey. `cancelled` means the user dismissed the browser prompt. */
+export function loginWithPasskey(): Promise<PasskeyResult> {
+  return withBindingSecret("Could not create device binding for this browser", (secret) =>
+    runPasskeyCeremony<PublicKeyCredentialRequestOptionsJSON>(
+      "/api/login/passkey/start",
+      undefined,
+      "/api/login/passkey/finish",
+      { device_binding_secret: secret },
+      (options) => navigator.credentials.get({ publicKey: PublicKeyCredential.parseRequestOptionsFromJSON(options) }),
+      "Passkey sign-in failed",
+    ).catch(() => ({ ok: false as const, error: "Network error" })),
+  );
+}
+
+/** Enrol a passkey for this origin. Elevation-gated; a 403 pops the passphrase prompt (fetch interceptor). */
+export function registerPasskey(label: string): Promise<PasskeyResult> {
+  return runPasskeyCeremony<PublicKeyCredentialCreationOptionsJSON>(
+    "/api/passkeys/register/start",
+    { label },
+    "/api/passkeys/register/finish",
+    {},
+    (options) => navigator.credentials.create({ publicKey: PublicKeyCredential.parseCreationOptionsFromJSON(options) }),
+    "Could not add passkey",
+  ).catch(() => ({ ok: false, error: "Network error" }));
+}
+
+export interface PasskeyInfo {
+  credential_id: string;
+  label: string;
+  origin: string;
+  created_at_ms: number;
+  last_used_at_ms: number | null;
+}
+
+export function fetchPasskeys(): Promise<PasskeyInfo[] | null> {
+  return fetchJson<PasskeyInfo[]>("/api/passkeys");
+}
+
+/** Elevation-gated; resolves false when the interceptor pops the passphrase prompt. */
+export function removePasskey(credentialId: string): Promise<boolean> {
+  return fetchOk(`/api/passkeys/${encodeURIComponent(credentialId)}`, { method: "DELETE" });
 }
 
 /** Re-verify the passphrase to open a fresh elevation window. Sends the binding header

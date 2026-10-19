@@ -2,6 +2,7 @@
 import { useCallback, useEffect, useMemo, useState, type ReactNode } from "react";
 import { useServerDown, OFFLINE_TITLE } from "../lib/connectionState";
 import { ConnectedDevices } from "./ConnectedDevices";
+import { PasskeySettings } from "./PasskeySettings";
 import { McpServers } from "./McpServers";
 import { SkillsManager } from "./SkillsManager";
 import { NotificationSettings } from "./NotificationSettings";
@@ -651,7 +652,12 @@ export function SettingsView({
       case "security":
         return <SecuritySettings />;
       case "devices":
-        return <ConnectedDevices />;
+        return (
+          <>
+            <ConnectedDevices />
+            <PasskeySettings />
+          </>
+        );
       case "mcp":
         return <McpServers readOnly={cityhall} />;
       case "skills":

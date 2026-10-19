@@ -461,6 +461,17 @@
       "components": ["web/src/components/LoginPage.tsx"]
     },
     {
+      "id": "auth.passkey",
+      "kind": "vitest",
+      "risk": "high",
+      "specs": [
+        "src/components/__tests__/LoginPage.test.tsx",
+        "src/components/__tests__/PasskeySettings.test.tsx",
+        "src/lib/api.test.ts"
+      ],
+      "components": ["web/src/components/PasskeySettings.tsx"]
+    },
+    {
       "id": "auth.token-entry",
       "kind": "live-playwright",
       "risk": "medium",
