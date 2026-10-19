@@ -156,3 +156,17 @@ test("provider errors stay visible alongside the last successful suggestions", a
   await expect(page.getByRole("heading", { name: suggestion.title })).toBeVisible();
   await expect(page.getByRole("heading", { name: "No suggestions yet" })).toHaveCount(0);
 });
+
+test("opens suggestions from the mobile sidebar without losing the active profile", async ({ page }) => {
+  await mockTerminalApis(page);
+  await page.route("**/api/sessions", (route) => route.fulfill({ json: { sessions: [], workspace_ordering: [] } }));
+  await page.route("**/api/suggestions**", (route) => route.fulfill({ json: snapshot }));
+  await page.setViewportSize({ width: 375, height: 812 });
+  await page.goto("/?profile=work");
+
+  await page.getByRole("button", { name: "Toggle sidebar" }).click();
+  await page.getByRole("button", { name: "Suggested sessions" }).click();
+
+  await expect(page).toHaveURL(/\/suggestions\?profile=work$/);
+  await expect(page.getByRole("heading", { name: suggestion.title })).toBeVisible();
+});

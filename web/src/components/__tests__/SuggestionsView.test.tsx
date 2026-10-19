@@ -106,6 +106,53 @@ describe("SuggestionsView", () => {
     expect(onOpenSession).not.toHaveBeenCalled();
   });
 
+  it("keeps the suggestion visible when preparation fails", async () => {
+    fetchSuggestions.mockResolvedValue(snapshot);
+    prepareSuggestion.mockResolvedValue({ ok: false, error: "Project mapping is missing" });
+    const onPrepare = vi.fn();
+    const onOpenSession = vi.fn();
+    render(<SuggestionsView onPrepare={onPrepare} onOpenSession={onOpenSession} />);
+
+    fireEvent.click(await screen.findByRole("button", { name: "Customize" }));
+
+    expect((await screen.findByRole("alert")).textContent).toContain("Project mapping is missing");
+    expect(screen.getByText(item.title)).toBeTruthy();
+    expect(onPrepare).not.toHaveBeenCalled();
+    expect(onOpenSession).not.toHaveBeenCalled();
+  });
+
+  it("starts an unlinked suggestion through the host and opens the created session", async () => {
+    fetchSuggestions.mockResolvedValue(snapshot);
+    actOnSuggestion.mockResolvedValue({ ok: true, data: { session_id: "new-session", created: true } });
+    const onOpenSession = vi.fn();
+    render(<SuggestionsView onPrepare={vi.fn()} onOpenSession={onOpenSession} />);
+
+    fireEvent.click(await screen.findByRole("button", { name: "Start" }));
+
+    await waitFor(() =>
+      expect(actOnSuggestion).toHaveBeenCalledWith(
+        { provider_id: "github", id: "issue-4562", revision: 7 },
+        "start",
+        undefined,
+        false,
+      ),
+    );
+    expect(onOpenSession).toHaveBeenCalledWith("new-session");
+  });
+
+  it("keeps the last snapshot visible when refresh and the follow-up read both fail", async () => {
+    fetchSuggestions.mockResolvedValueOnce(snapshot).mockResolvedValueOnce(null);
+    refreshSuggestions.mockResolvedValue(false);
+    render(<SuggestionsView onPrepare={vi.fn()} onOpenSession={vi.fn()} />);
+
+    expect(await screen.findByText(item.title)).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "Refresh" }));
+
+    expect((await screen.findByRole("alert")).textContent).toContain("Could not load suggestions");
+    expect(screen.getByText(item.title)).toBeTruthy();
+    expect(screen.queryByText("No suggestions yet")).toBeNull();
+  });
+
   it("keeps automation off until an explicit provider and criterion are reviewed", async () => {
     fetchSuggestions.mockResolvedValueOnce(snapshot).mockResolvedValue({
       ...snapshot,

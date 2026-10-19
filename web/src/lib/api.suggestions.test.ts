@@ -63,6 +63,16 @@ describe("suggestion API", () => {
     });
   });
 
+  it("returns the network error for start and preparation failures", async () => {
+    const fetchMock = vi.fn().mockRejectedValue(new Error("offline"));
+    vi.stubGlobal("fetch", fetchMock);
+    const identity = { provider_id: "gh", id: "1", revision: 3 };
+
+    expect(await actOnSuggestion(identity, "start")).toEqual({ ok: false, error: "offline" });
+    expect(await prepareSuggestion(identity)).toEqual({ ok: false, error: "offline" });
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
   it("returns refresh failures instead of claiming success", async () => {
     vi.stubGlobal("fetch", vi.fn().mockResolvedValue(new Response("", { status: 503 })));
     expect(await refreshSuggestions()).toBe(false);
