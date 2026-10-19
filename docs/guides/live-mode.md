@@ -36,7 +36,7 @@ While the leader is armed the status bar becomes a which-key menu. Only the lead
 
 `Shift+Enter` inserts a newline into the agent's input box on kitty-protocol-capable terminals (Ghostty, Kitty, WezTerm, foot, Konsole 24+, Alacritty 0.13+, recent xterm). Elsewhere it submits like bare `Enter`, so use `Alt+Enter` (`Option+Enter` on macOS), which sends `ESC+CR` natively on many terminals, or configure your terminal to send `ESC+CR` for `Shift+Enter`.
 
-When your terminal reports `Ctrl+Enter` distinctly, AoE forwards it as `CSI-u` to OMP agent panes in live mode; other live-send targets keep their normal key mapping. OMP's `Ctrl+Q` fallback collides with AoE's default live-mode exit. If your terminal cannot distinguish `Ctrl+Enter`, bind `live_send_exit_chord` to a different chord to free `Ctrl+Q` for OMP. `Esc` denies the OMP prompt.
+When your terminal reports `Ctrl+Enter` distinctly, AoE forwards it as `CSI-u` to OMP agent panes in live mode; other live-send targets receive ordinary Enter, including through older tmux transports. OMP's `Ctrl+Q` fallback collides with AoE's default live-mode exit. If your terminal cannot distinguish `Ctrl+Enter`, bind `live_send_exit_chord` to a different chord to free `Ctrl+Q` for OMP. `Esc` denies the OMP prompt.
 
 The web terminal also preserves `Ctrl+Enter` for OMP agent panes. Other agents and paired shells receive a normal carriage return; `Shift+Enter` and `Ctrl+Shift+Enter` remain soft newlines.
 

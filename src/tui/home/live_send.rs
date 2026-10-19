@@ -2533,13 +2533,13 @@ fn translate_inner(key: KeyEvent, use_omp_approval_chord: bool) -> LiveDispatch 
     let alt = key.modifiers.contains(KeyModifiers::ALT);
     let shift = key.modifiers.contains(KeyModifiers::SHIFT);
 
-    // OMP's native approval prompt accepts CSI-u Ctrl+Enter. Other panes retain
-    // tmux's C-Enter mapping, which resolves to the ordinary Enter byte.
-    if use_omp_approval_chord
-        && key.code == KeyCode::Enter
-        && key.modifiers == KeyModifiers::CONTROL
-    {
-        return LiveDispatch::Send(TmuxKey::HexBytes(crate::tmux::CSI_U_CTRL_ENTER.to_vec()));
+    // Older tmux versions can drop C-Enter; legacy panes need plain Enter.
+    if key.code == KeyCode::Enter && key.modifiers == KeyModifiers::CONTROL {
+        return LiveDispatch::Send(if use_omp_approval_chord {
+            TmuxKey::HexBytes(crate::tmux::CSI_U_CTRL_ENTER.to_vec())
+        } else {
+            TmuxKey::Named("Enter".to_owned())
+        });
     }
 
     // Shift+Enter alone becomes ESC+CR, the readline "meta-Enter inserts a newline"
@@ -2795,7 +2795,6 @@ mod tests {
             (KeyCode::BackTab, KeyModifiers::SHIFT, named("BTab")),
             (KeyCode::Esc, none, named("Escape")),
             (KeyCode::Enter, none, named("Enter")),
-            (KeyCode::Enter, ctrl, named("C-Enter")),
             (KeyCode::Tab, none, named("Tab")),
             (KeyCode::BackTab, none, named("BTab")),
             (KeyCode::Backspace, none, named("BSpace")),
@@ -2870,16 +2869,6 @@ mod tests {
         assert_named(
             translate(k_mod(KeyCode::Enter, KeyModifiers::ALT)),
             "M-Enter",
-        );
-    }
-
-    #[test]
-    fn ctrl_enter_uses_omp_chord_only_when_requested() {
-        let key = k_mod(KeyCode::Enter, KeyModifiers::CONTROL);
-        assert_named(translate(key), "C-Enter");
-        assert_hex(
-            translate_with_omp_approval_chord(key),
-            crate::tmux::CSI_U_CTRL_ENTER,
         );
     }
 

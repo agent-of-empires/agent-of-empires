@@ -132,7 +132,7 @@ fn test_live_send_paste_into_non_bracketed_pane_has_no_marker_debris() {
     );
 }
 
-/// Ctrl+Enter must remain distinct from Enter when live-send forwards keys.
+/// Native input capability must survive the tmux send-keys transport.
 #[test]
 #[parallel]
 fn test_live_send_forwards_ctrl_enter_as_csi_u() {
@@ -161,6 +161,9 @@ fn test_live_send_forwards_ctrl_enter_as_csi_u() {
     ] {
         let mut h = TuiTestHarness::new(&format!("live_send_ctrl_enter_{case}"));
         write_live_send_config(&h);
+        let config_path = app_dir_in(h.home_path()).join("config.toml");
+        let mut config = std::fs::read_to_string(&config_path).unwrap();
+        config.push_str("\n[tmux]\nvt_live = false\n");
         let bin = h.install_path_command(command);
         std::fs::write(
             bin.join(command),
@@ -178,8 +181,6 @@ sleep 60\n",
         )
         .expect("write key capture stub");
         if tool == "corp-omp" {
-            let config_path = app_dir_in(h.home_path()).join("config.toml");
-            let mut config = std::fs::read_to_string(&config_path).unwrap();
             config.push_str(&format!(
                 "\n[session.custom_agents]\ncorp-omp = \"{command}\"\n"
             ));
@@ -195,8 +196,8 @@ sleep 60\n",
             if detect_only {
                 config.push_str("\n[session.agent_detect_as]\ncorp-omp = \"omp\"\n");
             }
-            std::fs::write(config_path, config).unwrap();
         }
+        std::fs::write(config_path, config).unwrap();
         let project = h.project_path();
         let add = h.run_cli(&[
             "add",
