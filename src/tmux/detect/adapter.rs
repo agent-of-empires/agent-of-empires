@@ -1,7 +1,7 @@
 //! Static surface adapters for manifest evaluation.
 
 use super::manifest::{Manifest, Rule};
-use super::region::{Rows, Screen};
+use super::region::{Evidence, Region, Rows, Screen};
 use super::Observation;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -34,7 +34,27 @@ pub struct CapturePolicy {
     pub observe_ownership: bool,
 }
 
-type EvaluateSurface = for<'m, 'a> fn(&'m Manifest, Rows<'a>, &Observation<'a>) -> Option<&'m Rule>;
+pub(super) struct Evaluation<'m, 'a> {
+    pub rule: &'m Rule,
+    pub diagnostic: Option<&'a str>,
+}
+
+impl<'m, 'a> Evaluation<'m, 'a> {
+    pub fn new(rule: &'m Rule, evidence: &[Evidence<'a>]) -> Self {
+        let diagnostic = match rule.region {
+            Region::Evidence(index)
+                if rule.state == Some(crate::session::Status::Error) && !rule.skip_state_update =>
+            {
+                evidence.get(index).and_then(|evidence| evidence.diagnostic)
+            }
+            _ => None,
+        };
+        Self { rule, diagnostic }
+    }
+}
+
+type EvaluateSurface =
+    for<'m, 'a> fn(&'m Manifest, Rows<'a>, &Observation<'a>) -> Option<Evaluation<'m, 'a>>;
 
 pub(super) struct Adapter {
     pub capture: CapturePolicy,
@@ -55,7 +75,9 @@ pub(super) static PLAIN: Adapter = Adapter {
     observation_token: |_| None,
     evaluate: |manifest, rows, observation| {
         let screen = Screen::new(rows, observation.title, &[]);
-        manifest.evaluate(&screen, observation.hook)
+        manifest
+            .evaluate(&screen, observation.hook)
+            .map(|rule| Evaluation::new(rule, &[]))
     },
     #[cfg(test)]
     rule_matches: |manifest, rule, rows, observation| {

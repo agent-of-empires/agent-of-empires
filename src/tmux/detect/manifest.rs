@@ -620,10 +620,12 @@ not = [{ region = "evidence(secondary)", contains = ["cancel"] }]
             Evidence {
                 text: "ready",
                 bottom_offset: 0,
+                diagnostic: None,
             },
             Evidence {
                 text: "confirm",
                 bottom_offset: 0,
+                diagnostic: None,
             },
         ];
         let screen = Screen::new(Rows::new("unrelated"), "", &evidence);
@@ -634,6 +636,7 @@ not = [{ region = "evidence(secondary)", contains = ["cancel"] }]
             Evidence {
                 text: "confirm cancel",
                 bottom_offset: 0,
+                diagnostic: None,
             },
         ];
         let screen = Screen::new(Rows::new("unrelated"), "", &evidence);

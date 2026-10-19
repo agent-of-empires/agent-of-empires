@@ -50,12 +50,17 @@ impl<'a> DetectionPlan<'a> {
     }
 
     /// `clean` is the original ANSI-stripped capture, before any surface masking.
-    pub fn detect(&self, clean: &str, observation: &Observation<'_>) -> Detection {
+    pub fn detect<'capture>(
+        &self,
+        clean: &'capture str,
+        observation: &Observation<'capture>,
+    ) -> Detection<'capture> {
         if let Some(status) = super::status_rules::detect(self.profile, self.rules_tool, clean) {
             return Detection {
                 status: Some(status),
                 visible: true,
                 rule: "configured_status_rule",
+                diagnostic: None,
             };
         }
         self.detector
@@ -3634,6 +3639,83 @@ Final prose line.\n";
             observed_omp("Output\n\n  q Any activity label\n\n╰─\nCAVEMAN", "", false),
             Status::Idle
         );
+    }
+
+    #[test]
+    fn omp_error_diagnostics_keep_source_rows_and_respect_banner_boundaries() {
+        for (body, expected) in [
+            ("--------------------\n ✘ Provider denied request", Some("Provider denied request")),
+            ("continued provider failure", Some("continued provider failure")),
+            (
+                "--------------------\n [!!] Provider denied request\n  first detail\n\n  second detail\n  final detail",
+                Some("Provider denied request\n  first detail\n\n  second detail\n  final detail"),
+            ),
+            ("--------------------", None),
+            ("--------------------\n ✘", None),
+            (
+                "╭── pi > model ──╮\n│ unrelated draft │\n╰────────────────╯\n provider fragment",
+                None,
+            ),
+            ("unrelated transcript\n\nprovider fragment", None),
+            (
+                "old failure\n Dismissed when you send your next message.\n--------------------",
+                None,
+            ),
+        ] {
+            let pane = format!(
+                "{body}\n Dismissed when you\n send your next\n message.\n--------------------\n\n\
+                 pi > model\n╰─\n{}",
+                "PLUGIN\n".repeat(12)
+            );
+            let detection =
+                super::super::detect::detect("omp", &pane, &Observation::new("", None, true))
+                    .unwrap();
+            assert_eq!(detection.status, Some(Status::Error), "{body}");
+            assert_eq!(detection.diagnostic, expected, "{body}");
+        }
+    }
+
+    #[test]
+    fn omp_retained_banner_diagnostic_does_not_follow_another_winner() {
+        let banner = "--------------------\n Provider request denied\n\
+                      Dismissed when you send your next message.\n--------------------";
+        for (current, expected) in [
+            (" pi > model\n╰─", Status::Error),
+            (
+                " ⠋ Auto server compaction…\n pi > model\n╰─",
+                Status::Running,
+            ),
+            (OMP_LIVE_APPROVAL_PANEL, Status::Waiting),
+            (
+                " pi > model\n╰─\nError: Retry budget exhausted after 10 retries",
+                Status::Error,
+            ),
+        ] {
+            let pane = format!("{banner}\n\n{current}\nPLUGIN");
+            let detection =
+                super::super::detect::detect("omp", &pane, &Observation::new("", None, true))
+                    .unwrap();
+            assert_eq!(detection.status, Some(expected), "{current}");
+            assert_eq!(
+                detection.diagnostic,
+                (current == " pi > model\n╰─").then_some("Provider request denied"),
+                "{current}"
+            );
+        }
+        let pane = format!("{banner}\n\n pi > model\n╰─\n{}", "PLUGIN\n".repeat(12));
+        let unowned =
+            super::super::detect::detect("omp", &pane, &Observation::new("", None, false)).unwrap();
+        assert_eq!(unowned.status, Some(Status::Idle));
+        assert_eq!(unowned.diagnostic, None);
+
+        let legacy = super::super::detect::detect(
+            "omp",
+            "Unknown editor\nDismissed when you send your next message.",
+            &Observation::new("", None, false),
+        )
+        .unwrap();
+        assert_eq!(legacy.status, Some(Status::Error));
+        assert_eq!(legacy.diagnostic, None);
     }
 
     #[test]

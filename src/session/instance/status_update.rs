@@ -522,7 +522,12 @@ impl Instance {
             self.status = status;
             if status == Status::Error {
                 if self.last_error.is_none() {
-                    self.last_error = Some(summarize_error_from_pane(&pane_content));
+                    self.last_error = Some(
+                        detection
+                            .diagnostic
+                            .map(pane_status::summarize_error_diagnostic)
+                            .unwrap_or_else(|| summarize_error_from_pane(&pane_content)),
+                    );
                 }
             } else {
                 self.last_error = None;
@@ -1320,6 +1325,144 @@ Esc to cancel \u{b7} Tab to amend \u{b7} ctrl+e to explain\n\
             "one observation is all this caller gets, so its proposal decides (#3712)"
         );
         assert_eq!(once.detection.pending, None);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn omp_pinned_error_keeps_provider_diagnostic_above_plugin_rows() {
+        if !tmux_available() {
+            eprintln!("skipping: tmux not available");
+            return;
+        }
+
+        const PROVIDER_ERROR: &str = "Provider rejected this request: quota exceeded";
+        const WRAPPED_CAPTION: &str = " Dismissed when you\n send your next\n message.";
+        const MULTILINE_ERROR: &str =
+            "Provider rejected this request:\n  quota exceeded\n\n  retry after reset\n  account remains blocked";
+        for (message, caption, footer_rows) in [
+            (
+                PROVIDER_ERROR,
+                " Dismissed when you send your next message.",
+                12,
+            ),
+            (PROVIDER_ERROR, WRAPPED_CAPTION, 12),
+            (PROVIDER_ERROR, WRAPPED_CAPTION, 16),
+            (MULTILINE_ERROR, WRAPPED_CAPTION, 12),
+            (
+                PROVIDER_ERROR,
+                " Dismissed when you send your next message.",
+                0,
+            ),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let pane_file = dir.path().join("pane.txt");
+            let footer = if footer_rows == 0 {
+                String::new()
+            } else {
+                format!("{}PLUGIN_READY\n", "PLUGIN\n".repeat(footer_rows - 1))
+            };
+            let pane = format!(
+                "--------------------\n {message}\n{caption}\n--------------------\n\n\
+                 ╭── pi > model ──╮\n╰────────────────╯\n{footer}"
+            );
+            std::fs::write(&pane_file, pane).unwrap();
+
+            let mut inst = Instance::new("aoe_test_omp_error_diagnostic", "/tmp");
+            inst.tool = "omp".to_owned();
+            inst.source_profile = format!("omp-error-diagnostic-{}", inst.id);
+            inst.status = Status::Running;
+            let session_name = tmux::Session::generate_name(&inst.id, &inst.title);
+            let _guard = spawn_pane(
+                &session_name,
+                &format!("cat {}; exec sleep 300", shell_quote(&pane_file)),
+            );
+            let ready = if footer_rows == 0 {
+                "╰────────────────╯"
+            } else {
+                "PLUGIN_READY"
+            };
+            assert!(
+                wait_for_pane(&session_name, ready),
+                "error pane never painted: footer_rows={footer_rows}, caption={caption:?}"
+            );
+            let cache = crate::tmux::SessionCacheGuard::capture();
+            cache.force_present(&[session_name.as_str()]);
+            let mut metadata = agent_pane_metadata("omp", None);
+            metadata.pane_title = Some(String::new());
+
+            inst.update_status_with_metadata_inner(Some(&metadata), Some(&session_name));
+
+            assert_eq!(
+                inst.status,
+                Status::Error,
+                "footer_rows={footer_rows}, caption={caption:?}"
+            );
+            assert_eq!(
+                inst.last_error.as_deref(),
+                Some(message),
+                "footer_rows={footer_rows}, caption={caption:?}"
+            );
+            inst.last_error = Some("Earlier failure remains latched".to_owned());
+            inst.update_status_with_metadata_inner(Some(&metadata), Some(&session_name));
+            assert_eq!(
+                inst.last_error.as_deref(),
+                Some("Earlier failure remains latched"),
+                "an existing explanation survives another Error observation"
+            );
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn omp_newer_activity_and_dialog_clear_retained_error_diagnostics() {
+        if !tmux_available() {
+            eprintln!("skipping: tmux not available");
+            return;
+        }
+        for (current, expected) in [
+            (
+                " ⠋ Auto server compaction…\n pi > model\n╰─",
+                Status::Running,
+            ),
+            (
+                "╭─ Tool approval ─────╮\n│ ❯ Approve │\n│   Deny │\n\
+                 │ up/down navigate enter select esc cancel │\n╰─────────────────────╯",
+                Status::Waiting,
+            ),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let pane_file = dir.path().join("pane.txt");
+            std::fs::write(
+                &pane_file,
+                format!(
+                    "--------------------\n Provider request denied\n\
+                     Dismissed when you send your next message.\n--------------------\n\n\
+                     {current}\n{}PLUGIN_READY\n",
+                    "PLUGIN\n".repeat(11)
+                ),
+            )
+            .unwrap();
+            let mut inst = Instance::new("aoe_test_omp_error_cleared", "/tmp");
+            inst.tool = "omp".to_owned();
+            inst.source_profile = format!("omp-error-cleared-{}", inst.id);
+            inst.status = Status::Error;
+            inst.last_error = Some("Earlier provider request denied".to_owned());
+            let session_name = tmux::Session::generate_name(&inst.id, &inst.title);
+            let _guard = spawn_pane(
+                &session_name,
+                &format!("cat {}; exec sleep 300", shell_quote(&pane_file)),
+            );
+            assert!(wait_for_pane(&session_name, "PLUGIN_READY"));
+            let cache = crate::tmux::SessionCacheGuard::capture();
+            cache.force_present(&[session_name.as_str()]);
+            let mut metadata = agent_pane_metadata("omp", None);
+            metadata.pane_title = Some(String::new());
+
+            inst.update_status_with_metadata_inner(Some(&metadata), Some(&session_name));
+
+            assert_eq!(inst.status, expected, "{current}");
+            assert_eq!(inst.last_error, None, "{current}");
+        }
     }
 
     #[test]

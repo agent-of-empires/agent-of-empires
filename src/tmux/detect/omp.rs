@@ -5,7 +5,7 @@ use std::sync::LazyLock;
 use regex::Regex;
 use unicode_width::UnicodeWidthStr;
 
-use super::adapter::Adapter;
+use super::adapter::{Adapter, Evaluation};
 use super::region::{Evidence, Rows, Screen};
 use super::{CapturePolicy, CaptureScope, Observation};
 
@@ -26,13 +26,15 @@ pub(super) static ADAPTER: Adapter = Adapter {
         })
     },
     evaluate: |manifest, rows, observation| {
-        with_screen(rows, observation, |screen| {
-            manifest.evaluate(screen, observation.hook)
+        with_screen(rows, observation, |screen, evidence| {
+            manifest
+                .evaluate(screen, observation.hook)
+                .map(|rule| Evaluation::new(rule, evidence))
         })
     },
     #[cfg(test)]
     rule_matches: |manifest, rule, rows, observation| {
-        with_screen(rows, observation, |screen| {
+        with_screen(rows, observation, |screen, _| {
             manifest.rule_matches(rule, screen, observation.hook)
         })
     },
@@ -41,7 +43,7 @@ pub(super) static ADAPTER: Adapter = Adapter {
 fn with_screen<'a, T>(
     mut rows: Rows<'a>,
     observation: &Observation<'a>,
-    evaluate: impl FnOnce(&Screen<'_>) -> T,
+    evaluate: impl FnOnce(&Screen<'_>, &[Evidence<'a>]) -> T,
 ) -> T {
     let surface = Surface::new(rows.source, &mut rows.non_empty, &rows.blank_before);
     let live = |evidence| {
@@ -59,6 +61,7 @@ fn with_screen<'a, T>(
             Evidence {
                 text: observation.title,
                 bottom_offset: 0,
+                diagnostic: None,
             }
         } else {
             Evidence::default()
@@ -69,7 +72,7 @@ fn with_screen<'a, T>(
             surface.legacy_error
         },
     ];
-    evaluate(&Screen::new(rows, observation.title, &evidence))
+    evaluate(&Screen::new(rows, observation.title, &evidence), &evidence)
 }
 
 fn title_is_working(title: &str) -> bool {
@@ -89,6 +92,7 @@ fn line_evidence<'a>(lines: &[&'a str], index: usize) -> Evidence<'a> {
     Evidence {
         text: lines[index],
         bottom_offset: lines.len() - index - 1,
+        diagnostic: None,
     }
 }
 
@@ -528,6 +532,45 @@ fn source_span<'a>(source: &'a str, lines: &[&str], start: usize, end: usize) ->
     &source[first..last.as_ptr().addr() - base + last.len()]
 }
 
+fn error_diagnostic<'a>(
+    source: &'a str,
+    lines: &[&str],
+    blank_before: &[bool],
+    caption: usize,
+) -> Option<&'a str> {
+    let mut start = caption;
+    let mut bordered = false;
+    while let Some(index) = start.checked_sub(1) {
+        let line = lines[index].trim();
+        if horizontal(line) && line.chars().all(|c| matches!(c, '─' | '-' | ' ')) {
+            // Another banner's closing border cannot open this message.
+            if error_caption_start(lines, blank_before, index).is_some() {
+                return None;
+            }
+            bordered = true;
+            break;
+        }
+        if ui_boundary(line) || hard_status(line) || line.starts_with('❯') {
+            return None;
+        }
+        start = index;
+    }
+    if start == caption
+        || (!bordered && blank_before[start + 1..caption].iter().any(|blank| *blank))
+    {
+        return None;
+    }
+    let mut body = source_span(source, lines, start, caption).trim();
+    // Only this adapter knows the theme's error icon; common presentation keeps source text.
+    for glyph in ["✖", "✘", "✕", "[!!]", "\u{f00d}"] {
+        if let Some(rest) = body.strip_prefix(glyph) {
+            body = rest.trim_start();
+            break;
+        }
+    }
+    (!body.is_empty()).then_some(body)
+}
+
 fn spinner_led(text: &str) -> bool {
     let Some(frame) = text.split_whitespace().next() else {
         return false;
@@ -595,11 +638,15 @@ impl<'a> Surface<'a> {
         }
         let error = current
             .and_then(|composer| {
-                (0..composer.start)
-                    .rev()
-                    .find(|&i| error_caption_start(lines, blank_before, i).is_some())
+                (0..composer.start).rev().find_map(|close| {
+                    error_caption_start(lines, blank_before, close).map(|caption| (close, caption))
+                })
             })
-            .map_or_else(Evidence::default, |close| line_evidence(lines, close));
+            .map_or_else(Evidence::default, |(close, caption)| {
+                let mut evidence = line_evidence(lines, close);
+                evidence.diagnostic = error_diagnostic(source, lines, blank_before, caption);
+                evidence
+            });
         let mut activity = Evidence::default();
         let mut activity_start = None;
         let mut cards = None;

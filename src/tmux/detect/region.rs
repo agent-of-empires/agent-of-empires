@@ -35,6 +35,8 @@ impl<'a> Rows<'a> {
 pub(super) struct Evidence<'a> {
     pub text: &'a str,
     pub bottom_offset: usize,
+    /// Human-readable source text belonging to this evidence, before masking.
+    pub diagnostic: Option<&'a str>,
 }
 
 /// The pane, sliced lazily once per capture.

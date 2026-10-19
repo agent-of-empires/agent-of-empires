@@ -71,20 +71,23 @@ const MANIFEST_SOURCES: &[(&str, &str, &Adapter)] = &[
 
 /// What one capture says about a session.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Detection {
+pub struct Detection<'a> {
     /// `None` for an agent-owned viewer: the last known status stands.
     pub status: Option<Status>,
     /// Read off the agent's live chrome, so it can publish without a second poll.
     pub visible: bool,
     pub rule: &'static str,
+    /// Source text carried only by the selected Error rule's own evidence.
+    pub diagnostic: Option<&'a str>,
 }
 
-impl Detection {
+impl Detection<'_> {
     pub(crate) fn idle_by_default() -> Self {
         Self {
             status: Some(Status::Idle),
             visible: false,
             rule: "no_rule",
+            diagnostic: None,
         }
     }
 }
@@ -133,16 +136,23 @@ impl Detector {
         })
     }
 
-    pub(super) fn detect(&'static self, screen: &str, observation: &Observation<'_>) -> Detection {
-        let Some(rule) = (self.adapter.evaluate)(&self.manifest, Rows::new(screen), observation)
+    pub(super) fn detect<'a>(
+        &'static self,
+        screen: &'a str,
+        observation: &Observation<'a>,
+    ) -> Detection<'a> {
+        let Some(evaluation) =
+            (self.adapter.evaluate)(&self.manifest, Rows::new(screen), observation)
         else {
             return Detection::idle_by_default();
         };
+        let rule = evaluation.rule;
         tracing::trace!(target: "tmux.status", "{} detection: rule {} matched", self.manifest.id, rule.id);
         Detection {
             status: (!rule.skip_state_update).then_some(rule.state).flatten(),
             visible: rule.visible,
             rule: rule.id.as_str(),
+            diagnostic: evaluation.diagnostic,
         }
     }
 }
@@ -177,7 +187,11 @@ pub fn has_manifest(agent: &str) -> bool {
 }
 
 /// Evaluate an agent manifest over an ANSI-stripped capture.
-pub fn detect(agent: &str, screen: &str, observation: &Observation<'_>) -> Option<Detection> {
+pub fn detect<'a>(
+    agent: &str,
+    screen: &'a str,
+    observation: &Observation<'a>,
+) -> Option<Detection<'a>> {
     Some(detector(agent)?.detect(screen, observation))
 }
 
@@ -216,5 +230,105 @@ mod tests {
                 .unwrap_or_else(|e| panic!("manifest {agent} failed to compile: {e}"));
         }
         assert_eq!(MANIFESTS.len(), MANIFEST_SOURCES.len());
+    }
+
+    #[test]
+    fn diagnostic_belongs_to_the_winning_error_region() {
+        static ADAPTER: Adapter = Adapter {
+            capture: CapturePolicy {
+                scope: CaptureScope::Visible,
+                fetch_missing_title: false,
+                observe_ownership: false,
+            },
+            evidence_names: &["primary", "secondary"],
+            observation_token: |_| None,
+            evaluate: |manifest, rows, observation| {
+                let evidence = [
+                    region::Evidence {
+                        text: rows.non_empty.first().copied().unwrap_or(""),
+                        bottom_offset: 1,
+                        diagnostic: rows.non_empty.first().copied(),
+                    },
+                    region::Evidence {
+                        text: rows.non_empty.get(1).copied().unwrap_or(""),
+                        bottom_offset: 0,
+                        diagnostic: rows.non_empty.get(1).copied(),
+                    },
+                ];
+                let screen = region::Screen::new(rows, observation.title, &evidence);
+                manifest
+                    .evaluate(&screen, observation.hook)
+                    .map(|rule| adapter::Evaluation::new(rule, &evidence))
+            },
+            rule_matches: |_, _, _, _| unreachable!(),
+        };
+        static DETECTOR: LazyLock<Detector> = LazyLock::new(|| Detector {
+            adapter: &ADAPTER,
+            manifest: Manifest::parse(
+                r#"
+id = "diagnostics"
+[[rules]]
+id = "first_error"
+state = "error"
+priority = 700
+region = "evidence(primary)"
+contains = ["first error"]
+[[rules]]
+id = "second_error"
+state = "error"
+priority = 800
+region = "evidence(secondary)"
+contains = ["second error"]
+[[rules]]
+id = "active"
+state = "running"
+priority = 900
+region = "evidence(secondary)"
+contains = ["running"]
+[[rules]]
+id = "dialog"
+state = "waiting"
+priority = 900
+region = "evidence(secondary)"
+contains = ["waiting"]
+[[rules]]
+id = "other_error"
+state = "error"
+priority = 900
+region = "whole_recent"
+contains = ["other error"]
+all = [{ region = "evidence(primary)", contains = ["first error"] }]
+[[rules]]
+id = "viewer"
+state = "error"
+skip_state_update = true
+priority = 1000
+region = "evidence(secondary)"
+contains = ["viewer"]
+"#,
+                ADAPTER.evidence_names,
+            )
+            .unwrap(),
+        });
+        for (pane, status, diagnostic) in [
+            (
+                "first error\nquiet",
+                Some(Status::Error),
+                Some("first error"),
+            ),
+            (
+                "first error\nsecond error",
+                Some(Status::Error),
+                Some("second error"),
+            ),
+            ("first error\nrunning", Some(Status::Running), None),
+            ("first error\nwaiting", Some(Status::Waiting), None),
+            ("first error\nother error", Some(Status::Error), None),
+            ("first error\nviewer", None, None),
+        ] {
+            let detection = DETECTOR.detect(pane, &Observation::new("", None, true));
+            assert_eq!(detection.status, status, "{pane}");
+            assert_eq!(detection.diagnostic, diagnostic, "{pane}");
+        }
     }
 }
