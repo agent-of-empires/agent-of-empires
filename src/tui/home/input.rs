@@ -23,7 +23,7 @@ use crate::tui::dialogs::{
     HooksInstallDialog, InfoDialog, IntroOutcome, NewSessionData, NewSessionDialog, NoAgentsAction,
     PaletteAction, PaletteCommand, PaletteGroup, ProfilePickerAction, ProjectsDialog, RenameDialog,
     RenameMode, RepoTrustAction, RestartDialog, SendMessageDialog, TipsDialog, TipsOutcome,
-    UnifiedDeleteDialog, WorktreeNameDialog,
+    ToolPickerAction, UnifiedDeleteDialog, WorktreeNameDialog,
 };
 use crate::tui::diff::{DiffAction, DiffView};
 use crate::tui::responsive;
@@ -479,9 +479,39 @@ impl HomeView {
     }
 
     fn open_tool_picker(&mut self) {
-        self.tool_picker_dialog = Some(crate::tui::dialogs::ToolPickerDialog::new(
-            &self.tool_configs,
-        ));
+        #[cfg(feature = "serve")]
+        let mut picker = crate::tui::dialogs::ToolPickerDialog::new(&self.tool_configs);
+        #[cfg(not(feature = "serve"))]
+        let picker = crate::tui::dialogs::ToolPickerDialog::new(&self.tool_configs);
+        #[cfg(feature = "serve")]
+        if let Some(session_id) = self.selected_session.as_deref() {
+            for command in &self.plugin_ui.commands {
+                let Some(aoe_plugin_api::ClientAction::OpenUiLink { slot, id }) = &command.action
+                else {
+                    continue;
+                };
+                for (href, label) in
+                    self.plugin_ui
+                        .snapshot
+                        .links_for(&command.plugin_id, *slot, id, session_id)
+                {
+                    let title = if command.title.is_empty() {
+                        command.fqid.as_str()
+                    } else {
+                        command.title.as_str()
+                    };
+                    picker.add_plugin_link(
+                        format!("{title}: {label}"),
+                        command.fqid.clone(),
+                        session_id.to_owned(),
+                        href,
+                    );
+                }
+            }
+        }
+        if !picker.is_empty() {
+            self.tool_picker_dialog = Some(picker);
+        }
     }
 
     fn activate_tool(&mut self, tool_name: String, toggle_current: bool) -> Option<Action> {
@@ -532,6 +562,51 @@ impl HomeView {
         }
 
         Some(Action::RunBackgroundToolSession(session_id, tool_name))
+    }
+
+    fn activate_tool_picker_action(&mut self, action: ToolPickerAction) -> Option<Action> {
+        match action {
+            ToolPickerAction::Session(tool_name) => self.activate_tool(tool_name, false),
+            #[cfg(feature = "serve")]
+            ToolPickerAction::OpenPluginLink {
+                command_id,
+                session_id,
+                href,
+            } => {
+                if self.selected_session.as_deref() != Some(&session_id) {
+                    self.info_dialog = Some(InfoDialog::new(
+                        "Plugin link unavailable",
+                        "The selected session changed. Reopen the Tools menu to choose a current link.",
+                    ));
+                    return None;
+                }
+                let still_linked = self.plugin_ui.commands.iter().any(|command| {
+                    command.fqid == command_id
+                        && matches!(
+                            &command.action,
+                            Some(aoe_plugin_api::ClientAction::OpenUiLink { slot, id })
+                                if self.plugin_ui.snapshot.links_for(
+                                    &command.plugin_id, *slot, id, &session_id
+                                ).iter().any(|(current, _)| current == &href)
+                        )
+                });
+                if !still_linked {
+                    self.info_dialog = Some(InfoDialog::new(
+                        "Plugin link unavailable",
+                        "The linked resource is no longer available for this session.",
+                    ));
+                    return None;
+                }
+                match crate::tui::open_url::open_url(&href) {
+                    Ok(()) => None,
+                    Err(e) => {
+                        self.info_dialog =
+                            Some(InfoDialog::new("Could not open browser", &format!("{e}")));
+                        None
+                    }
+                }
+            }
+        }
     }
 
     /// Whether the key matches a configured tool session hotkey. On duplicates the
@@ -1512,9 +1587,9 @@ impl HomeView {
                 DialogResult::Cancel => {
                     self.tool_picker_dialog = None;
                 }
-                DialogResult::Submit(tool_name) => {
+                DialogResult::Submit(action) => {
                     self.tool_picker_dialog = None;
-                    self.pending_dialog_click_action = self.activate_tool(tool_name, false);
+                    self.pending_dialog_click_action = self.activate_tool_picker_action(action);
                 }
             }
             return true;
@@ -1999,9 +2074,17 @@ impl HomeView {
                     self.tool_picker_dialog = None;
                     return None;
                 }
-                DialogResult::Submit(tool_name) => {
+                DialogResult::Submit(action) => {
                     self.tool_picker_dialog = None;
-                    return self.activate_tool(tool_name, false);
+                    match action {
+                        ToolPickerAction::Session(tool_name) => {
+                            return self.activate_tool(tool_name, false);
+                        }
+                        #[cfg(feature = "serve")]
+                        action @ ToolPickerAction::OpenPluginLink { .. } => {
+                            return self.activate_tool_picker_action(action);
+                        }
+                    }
                 }
             }
         }
@@ -2764,7 +2847,7 @@ impl HomeView {
             ActionId::ToolPicker => {
                 if matches!(self.view_mode, ViewMode::Tool(_)) {
                     self.view_mode = ViewMode::Structured;
-                } else if !self.tool_configs.is_empty() {
+                } else {
                     self.open_tool_picker();
                 }
             }

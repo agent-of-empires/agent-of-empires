@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 
 use serial_test::parallel;
 
-use crate::harness::{require_node, require_tmux, TuiTestHarness};
+use crate::harness::{pick_free_port, require_node, require_tmux, wait_for_port, TuiTestHarness};
 
 /// Pushes an absolute- and a relative-href `detail-badge` per session, writes
 /// a marker on `plugin.command.invoke`, and fires a relative-href
@@ -120,6 +120,72 @@ command = ["node", "{worker_rel}"]
     )
 }
 
+const ROW_RESOURCES_WORKER_JS: &str = r#"
+const readline = require('readline');
+let nextId = 0;
+const send = (method, params) => {
+  process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: ++nextId, method, params }) + '\n');
+};
+const resources = {
+  github: { id: 'pr', text: 'Open', tone: 'success', href: 'https://example.com/pr/42' },
+  linear: { id: 'issue', text: 'WIP', tone: 'info', href: 'https://example.com/issues/42' },
+};
+const resource = resources[process.argv[2]];
+const rl = readline.createInterface({ input: process.stdin });
+rl.on('line', (line) => {
+  let message;
+  try { message = JSON.parse(line); } catch { return; }
+  if (message.result && Array.isArray(message.result.sessions)) {
+    for (const session of message.result.sessions) {
+      send('ui.state.set', {
+        slot: 'row-badge',
+        id: resource.id,
+        session_id: session.id,
+        payload: { text: resource.text, tone: resource.tone, href: resource.href },
+      });
+    }
+  }
+});
+setInterval(() => send('sessions.list', {}), 300);
+"#;
+
+fn row_resource_manifest(
+    worker_rel: &str,
+    plugin_id: &str,
+    name: &str,
+    resource_id: &str,
+    command_id: &str,
+    title: &str,
+    provider: &str,
+) -> String {
+    format!(
+        r#"
+id = "{plugin_id}"
+name = "{name}"
+version = "0.1.0"
+api_version = 8
+capabilities = ["runtime.worker", "session.read", "browser_open"]
+
+[[commands]]
+id = "{command_id}"
+title = "{title}"
+[commands.action]
+kind = "open-ui-link"
+slot = "row-badge"
+id = "{resource_id}"
+
+[[ui]]
+slot = "row-badge"
+id = "{resource_id}"
+
+[runtime]
+kind = "command"
+system = true
+command = ["node", "{worker_rel}", "{provider}"]
+"#
+    )
+}
+
 /// Resend `chord` until `file` contains `needle`; the plugin UI snapshot may
 /// not have reached the TUI on the first press.
 fn resend_until_file_contains(h: &TuiTestHarness, chord: &str, file: &Path, needle: &str) {
@@ -215,4 +281,171 @@ fn tui_executes_plugin_commands_with_live_daemon() {
         &format!("http://127.0.0.1:{port}/session/{session_id}?notify=1"),
         Duration::from_secs(20),
     );
+}
+#[test]
+#[parallel]
+fn home_shows_plugin_row_statuses_and_opens_each_link() {
+    require_tmux!();
+    require_node!();
+
+    let mut h = TuiTestHarness::new_in_tmp("plugin_row_resources");
+    for (provider, plugin_id, name, resource_id, command_id, title) in [
+        (
+            "github",
+            "test.github",
+            "GitHub Test",
+            "pr",
+            "open_pr",
+            "Open PR",
+        ),
+        (
+            "linear",
+            "test.linear",
+            "Linear Test",
+            "issue",
+            "open_issue",
+            "Open issue",
+        ),
+    ] {
+        let src = h.home_path().join(format!("src-{provider}"));
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(src.join("worker.js"), ROW_RESOURCES_WORKER_JS).unwrap();
+        std::fs::write(
+            src.join("aoe-plugin.toml"),
+            row_resource_manifest(
+                "worker.js",
+                plugin_id,
+                name,
+                resource_id,
+                command_id,
+                title,
+                provider,
+            ),
+        )
+        .unwrap();
+        let installed = h.run_cli(&["plugin", "install", src.to_str().unwrap(), "--yes"]);
+        assert!(
+            installed.status.success(),
+            "{provider} plugin install failed: {}",
+            String::from_utf8_lossy(&installed.stderr)
+        );
+    }
+
+    let script_path = h.home_path().join("idle-acp.json");
+    std::fs::write(&script_path, r#"{ "turns": [] }"#).expect("write fake ACP script");
+    h.install_acp_shim(&script_path);
+    let project = h.project_path();
+    for args in [
+        vec!["init", "-q"],
+        vec!["commit", "--allow-empty", "-q", "-m", "init"],
+    ] {
+        let output = std::process::Command::new("git")
+            .args(&args)
+            .current_dir(&project)
+            .env("GIT_AUTHOR_NAME", "t")
+            .env("GIT_AUTHOR_EMAIL", "t@t")
+            .env("GIT_COMMITTER_NAME", "t")
+            .env("GIT_COMMITTER_EMAIL", "t@t")
+            .output()
+            .expect("run git");
+        assert!(output.status.success(), "git {args:?} failed");
+    }
+    let opened = h.home_path().join("opened-urls.txt");
+    h.stop_daemon_on_drop();
+    let port = pick_free_port();
+    let port_s = port.to_string();
+    let start = h.run_cli(&["serve", "--daemon", "--port", &port_s, "--no-auth"]);
+    assert!(
+        start.status.success(),
+        "daemon start failed: {}",
+        String::from_utf8_lossy(&start.stderr)
+    );
+    assert!(wait_for_port(port, Duration::from_secs(10)));
+    h.tmux_new_detached("aoe_test_plugin_env", "sleep 60");
+    // Keep tmux's environment explicit because the server predates this TUI.
+    let env = std::process::Command::new("tmux")
+        .arg("-S")
+        .arg(h.home_path().join("tmux.sock"))
+        .args(["set-environment", "-g", "AOE_OPEN_URL_TO"])
+        .arg(&opened)
+        .output()
+        .expect("set browser URL capture in tmux environment");
+    assert!(
+        env.status.success(),
+        "tmux set-environment failed: {}",
+        String::from_utf8_lossy(&env.stderr)
+    );
+    h.spawn_tui();
+    h.wait_for_ready();
+    let tui_session = format!("aoe_e2e_plugin_row_resources_{}", std::process::id());
+    let resized = std::process::Command::new("tmux")
+        .arg("-S")
+        .arg(h.home_path().join("tmux.sock"))
+        .args(["resize-window", "-t"])
+        .arg(tui_session)
+        .args(["-x", "160", "-y", "40"])
+        .output()
+        .expect("resize TUI for both plugin statuses");
+    assert!(
+        resized.status.success(),
+        "tmux resize failed: {}",
+        String::from_utf8_lossy(&resized.stderr)
+    );
+    let add = h.run_cli(&[
+        "add",
+        project.to_str().unwrap(),
+        "-t",
+        "P",
+        "-c",
+        "claude",
+        "--structured-view",
+    ]);
+    assert!(
+        add.status.success(),
+        "session creation failed: {}",
+        String::from_utf8_lossy(&add.stderr)
+    );
+    h.wait_for("Open");
+    h.wait_for("WIP");
+
+    h.send_keys("\\;");
+    h.wait_for("Open PR");
+    h.wait_for("Open issue");
+    h.send_keys("Enter");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let contents = std::fs::read_to_string(&opened).unwrap_or_default();
+        if contents.contains("https://example.com/pr/42")
+            || contents.contains("https://example.com/issues/42")
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "no plugin link opened. Captured URLs: {contents:?}. Screen: {}",
+            h.capture_screen()
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+
+    h.send_keys("\\;");
+    h.wait_for("Open PR");
+    h.wait_for("Open issue");
+    h.send_keys("Down");
+    h.send_keys("Enter");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let contents = std::fs::read_to_string(&opened).unwrap_or_default();
+        if contents.contains("https://example.com/pr/42")
+            && contents.contains("https://example.com/issues/42")
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "both plugin links were not opened: {contents:?}. Screen: {}",
+            h.capture_screen()
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
 }

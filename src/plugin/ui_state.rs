@@ -252,7 +252,8 @@ pub struct Notification {
     pub href: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// One entry in the snapshot the web renders.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct UiEntry {
     pub plugin_id: String,
     pub slot: UiSlot,

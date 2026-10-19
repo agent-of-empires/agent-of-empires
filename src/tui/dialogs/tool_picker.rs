@@ -1,4 +1,4 @@
-//! Tool picker dialog: quick list of configured tool sessions.
+//! Picker for configured tool sessions and daemon-provided plugin links.
 
 use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::prelude::*;
@@ -8,6 +8,17 @@ use super::DialogResult;
 use crate::session::config::ToolSessionConfig;
 use crate::tui::components::hint_buttons::HintButtons;
 use crate::tui::styles::Theme;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ToolPickerAction {
+    Session(String),
+    #[cfg(feature = "serve")]
+    OpenPluginLink {
+        command_id: String,
+        session_id: String,
+        href: String,
+    },
+}
 
 pub struct ToolPickerDialog {
     items: Vec<ToolPickerEntry>,
@@ -22,6 +33,7 @@ struct ToolPickerEntry {
     command: String,
     hotkey: String,
     background: bool,
+    action: ToolPickerAction,
 }
 
 impl ToolPickerDialog {
@@ -33,6 +45,7 @@ impl ToolPickerDialog {
                 command: config.command.clone(),
                 hotkey: config.hotkey.clone().unwrap_or_default(),
                 background: config.background,
+                action: ToolPickerAction::Session(name.clone()),
             })
             .collect();
         items.sort_by(|a, b| a.name.cmp(&b.name));
@@ -45,7 +58,32 @@ impl ToolPickerDialog {
         }
     }
 
-    pub fn handle_click(&mut self, col: u16, row: u16) -> DialogResult<String> {
+    pub fn is_empty(&self) -> bool {
+        self.items.is_empty()
+    }
+
+    #[cfg(feature = "serve")]
+    pub fn add_plugin_link(
+        &mut self,
+        name: String,
+        command_id: String,
+        session_id: String,
+        href: String,
+    ) {
+        self.items.push(ToolPickerEntry {
+            name,
+            command: href.clone(),
+            hotkey: String::new(),
+            background: false,
+            action: ToolPickerAction::OpenPluginLink {
+                command_id,
+                session_id,
+                href,
+            },
+        });
+    }
+
+    pub fn handle_click(&mut self, col: u16, row: u16) -> DialogResult<ToolPickerAction> {
         if !super::contains(self.dialog_area, col, row) {
             return DialogResult::Cancel;
         }
@@ -56,7 +94,7 @@ impl ToolPickerDialog {
             return DialogResult::Continue;
         };
         self.cursor = idx;
-        DialogResult::Submit(self.items[idx].name.clone())
+        DialogResult::Submit(self.items[idx].action.clone())
     }
 
     pub fn handle_hover(&mut self, col: u16, row: u16) -> bool {
@@ -64,12 +102,12 @@ impl ToolPickerDialog {
         self.footer.handle_hover(col, row) | super::hover_select(&mut self.cursor, hovered)
     }
 
-    pub fn handle_key(&mut self, key: KeyEvent) -> DialogResult<String> {
+    pub fn handle_key(&mut self, key: KeyEvent) -> DialogResult<ToolPickerAction> {
         match key.code {
             KeyCode::Esc | KeyCode::Char(';') => DialogResult::Cancel,
             KeyCode::Enter => {
                 if let Some(entry) = self.items.get(self.cursor) {
-                    DialogResult::Submit(entry.name.clone())
+                    DialogResult::Submit(entry.action.clone())
                 } else {
                     DialogResult::Cancel
                 }
@@ -85,7 +123,7 @@ impl ToolPickerDialog {
         let width = 50u16.min(area.width.saturating_sub(4));
         let height = (self.items.len() as u16 + 3).min(area.height.saturating_sub(4));
         let block = Block::default()
-            .title(" Tool Sessions ")
+            .title(" Tools ")
             .title_style(Style::default().fg(theme.title))
             .borders(Borders::ALL)
             .border_style(Style::default().fg(theme.accent))
@@ -153,5 +191,33 @@ impl ToolPickerDialog {
             ],
             Alignment::Left,
         );
+    }
+}
+
+#[cfg(all(test, feature = "serve"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn enter_selects_plugin_browser_resource() {
+        let mut picker = ToolPickerDialog::new(&std::collections::HashMap::new());
+        picker.add_plugin_link(
+            "GitHub: #42".into(),
+            "plugin.github.open_pr".into(),
+            "session-1".into(),
+            "https://github.com/org/repo/pull/42".into(),
+        );
+
+        let DialogResult::Submit(ToolPickerAction::OpenPluginLink {
+            command_id,
+            session_id,
+            href,
+        }) = picker.handle_key(KeyEvent::from(KeyCode::Enter))
+        else {
+            panic!("Enter did not select the plugin browser resource");
+        };
+        assert_eq!(command_id, "plugin.github.open_pr");
+        assert_eq!(session_id, "session-1");
+        assert_eq!(href, "https://github.com/org/repo/pull/42");
     }
 }
