@@ -171,6 +171,7 @@ pub(super) fn build_router(state: Arc<AppState>) -> Router {
         )
         .route("/api/docker/status", get(api::docker_status))
         .route("/api/system/health", get(api::system_health))
+        .route("/api/system/logs", get(api::get_logs))
         // Settings + themes
         .route(
             "/api/settings",
