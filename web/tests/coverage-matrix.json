@@ -578,6 +578,16 @@
       ]
     },
     {
+      "id": "settings.logs-tab",
+      "kind": "vitest",
+      "risk": "medium",
+      "specs": [
+        "src/components/settings/__tests__/LogsSettings.test.tsx",
+        "src/components/__tests__/SettingsView.test.tsx"
+      ],
+      "components": ["web/src/components/settings/LogsSettings.tsx", "web/src/components/SettingsView.tsx"]
+    },
+    {
       "id": "settings.cityhall-export",
       "kind": "vitest",
       "risk": "medium",

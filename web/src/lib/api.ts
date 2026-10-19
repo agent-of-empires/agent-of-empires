@@ -360,6 +360,24 @@ export async function fetchCityHallBundle(): Promise<string> {
   return res.text();
 }
 
+export interface LogsSnapshot {
+  status: "available" | "missing" | "stdout";
+  /** Redacted server-side. */
+  content: string;
+  lineCount: number;
+  truncated: boolean;
+}
+
+/** Redacted tail of the active log file; throws with the server's message. */
+export async function fetchLogs(lines: number, signal?: AbortSignal): Promise<LogsSnapshot> {
+  const res = await fetch(`/api/system/logs?lines=${lines}`, { signal });
+  if (!res.ok) {
+    const detail = await res.json().catch(() => null);
+    throw new Error(detail?.message ?? `Could not load logs (HTTP ${res.status})`);
+  }
+  return (await res.json()) as LogsSnapshot;
+}
+
 // The schema is static per server run; only a successful fetch is cached.
 let schemaPromise: Promise<SettingsFieldDescriptor[] | null> | null = null;
 
