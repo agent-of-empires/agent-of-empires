@@ -654,7 +654,7 @@ fn render_active(
                     "Press G again for a new passphrase.",
                     "Every Device signs out.",
                 ),
-                PendingConfirm::Restart if effect.link == LinkChange::NewHost => {
+                PendingConfirm::Restart if effect.link == LinkChange::Replaced => {
                     ("Press R again to restart.", "Agents keep running.")
                 }
                 PendingConfirm::Restart => (
@@ -670,10 +670,10 @@ fn render_active(
             };
             let link = match effect.link {
                 LinkChange::Same => None,
-                LinkChange::NewHost if effect.passphrase => {
+                LinkChange::Replaced if effect.passphrase => {
                     Some("The link changes: re-scan and sign in again.")
                 }
-                LinkChange::NewHost | LinkChange::NewPort => Some("The link changes: re-scan it."),
+                LinkChange::Replaced | LinkChange::Moved => Some("The link changes: re-scan it."),
             };
             let rest = [effect_text]
                 .into_iter()
@@ -725,9 +725,9 @@ fn restart_help(effect: RestartEffect) -> String {
         Logins::Unknown => "Devices may have to sign in again",
     };
     let what = match effect.link {
-        LinkChange::NewHost if effect.passphrase => "new link, sign in again".to_string(),
-        LinkChange::NewHost => "new link".to_string(),
-        LinkChange::NewPort => format!("new link; {logins}"),
+        LinkChange::Replaced if effect.passphrase => "new link, sign in again".to_string(),
+        LinkChange::Replaced => "new link".to_string(),
+        LinkChange::Moved => format!("new link; {logins}"),
         LinkChange::Same => logins.to_string(),
     };
     format!("Restart the Daemon ({what}; agents keep running)")
@@ -1101,22 +1101,27 @@ mod tests {
         let on = Some(true);
         // What the next start does: (takes the Funnel path, port it reuses (None = random),
         // still has the link's LAN address, inherits AOE_SERVE_PASSPHRASE, persist_sessions).
-        let probe = |on_funnel, port, same_host: bool, local_passphrase, persists| RestartProbe {
-            on_funnel,
-            persists,
-            port,
-            local_hosts: vec![
-                if same_host {
-                    "192.168.1.42"
-                } else {
-                    "10.0.0.7"
-                }
-                .to_string(),
-                "localhost".to_string(),
-            ],
-            local_passphrase,
-        };
-        let tunnel = |on_funnel, persists| probe(on_funnel, None, true, false, persists);
+        // What the next start does: (takes the Funnel path, port it reuses (None = random),
+        // still has the link's LAN address, inherits AOE_SERVE_PASSPHRASE, persist_sessions,
+        // mints a new token).
+        let probe =
+            |on_funnel, port, same_host: bool, local_passphrase, persists, renews| RestartProbe {
+                on_funnel,
+                persists,
+                port,
+                local_hosts: vec![
+                    if same_host {
+                        "192.168.1.42"
+                    } else {
+                        "10.0.0.7"
+                    }
+                    .to_string(),
+                    "localhost".to_string(),
+                ],
+                local_passphrase,
+                local_token_renews: renews,
+            };
+        let tunnel = |on_funnel, persists| probe(on_funnel, None, true, false, persists, false);
         // (mode, url, next start, running daemon's persist_sessions (None = reattached), key
         //  pressed once, confirm after the first sentence, help R)
         let cases = [
@@ -1125,7 +1130,7 @@ mod tests {
             (
                 Local,
                 lan,
-                probe(false, Some(8080), true, false, false),
+                probe(false, Some(8080), true, false, false, false),
                 None,
                 R,
                 stays.clone(),
@@ -1134,7 +1139,7 @@ mod tests {
             (
                 Local,
                 lan,
-                probe(false, Some(51234), true, false, false),
+                probe(false, Some(51234), true, false, false, false),
                 None,
                 R,
                 local_moved.clone(),
@@ -1142,16 +1147,16 @@ mod tests {
             (
                 Local,
                 lan,
-                probe(false, None, true, false, true),
+                probe(false, None, true, false, true, false),
                 on,
                 R,
-                local_moved,
+                local_moved.clone(),
             ),
             // The interface lost its address: the old host's cookie is never sent again.
             (
                 Local,
                 lan,
-                probe(false, Some(8080), false, false, true),
+                probe(false, Some(8080), false, false, true, false),
                 on,
                 R,
                 (
@@ -1162,7 +1167,7 @@ mod tests {
             (
                 Local,
                 lan,
-                probe(false, Some(8080), false, true, true),
+                probe(false, Some(8080), false, true, true, false),
                 on,
                 R,
                 moved.clone(),
@@ -1172,7 +1177,7 @@ mod tests {
             (
                 Local,
                 lan,
-                probe(false, Some(8080), true, true, false),
+                probe(false, Some(8080), true, true, false, false),
                 on,
                 R,
                 signs_out.clone(),
@@ -1180,7 +1185,7 @@ mod tests {
             (
                 Local,
                 lan,
-                probe(false, Some(8080), true, true, true),
+                probe(false, Some(8080), true, true, true, false),
                 Some(false),
                 R,
                 signs_out.clone(),
@@ -1188,7 +1193,7 @@ mod tests {
             (
                 Local,
                 lan,
-                probe(false, Some(8080), true, true, true),
+                probe(false, Some(8080), true, true, true, false),
                 None,
                 R,
                 unknown.clone(),
@@ -1196,7 +1201,7 @@ mod tests {
             (
                 Local,
                 lan,
-                probe(false, Some(8080), true, true, true),
+                probe(false, Some(8080), true, true, true, false),
                 on,
                 R,
                 stays.clone(),
@@ -1205,13 +1210,35 @@ mod tests {
             (
                 Local,
                 lan,
-                probe(false, None, true, true, false),
+                probe(false, None, true, true, false, false),
                 on,
                 R,
                 (
                     format!("Every Device signs out; agents keep running. {rescan}"),
                     "new link; every Device signs out; agents keep running".to_string(),
                 ),
+            ),
+            // A Local daemon never refreshes serve.token, so a restart a day on mints a new
+            // one: a token-only Device's cookie stops matching, while a passphrase sign-in
+            // still lets it in.
+            (
+                Local,
+                lan,
+                probe(false, Some(8080), true, false, true, true),
+                on,
+                R,
+                (
+                    format!("Agents keep running. {rescan}"),
+                    "new link; agents keep running".to_string(),
+                ),
+            ),
+            (
+                Local,
+                lan,
+                probe(false, Some(8080), true, true, true, true),
+                on,
+                R,
+                local_moved,
             ),
             (Tunnel, funnel, tunnel(true, true), on, R, stays.clone()),
             // Tailscale went away (or Cloudflare was picked): the restart opens a quick tunnel.

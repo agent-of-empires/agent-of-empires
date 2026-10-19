@@ -332,6 +332,24 @@ fn saved_port_in(dir: &Path) -> Option<u16> {
         .filter(|port| *port >= 49152)
 }
 
+/// Whether the next start mints a new access token, which the Devices' `aoe_token` cookies
+/// don't match. `load_or_generate_token` reuses `serve.token` only while it is under 24 hours
+/// old, and only remote serving refreshes it while running. The hour's margin covers a help
+/// overlay left open.
+pub(super) fn token_renews() -> bool {
+    crate::session::get_app_dir()
+        .ok()
+        .is_none_or(|dir| token_renews_in(&dir))
+}
+
+fn token_renews_in(dir: &Path) -> bool {
+    const REUSED_UNDER: std::time::Duration = std::time::Duration::from_secs(23 * 60 * 60);
+    std::fs::metadata(dir.join("serve.token"))
+        .and_then(|meta| meta.modified())
+        .ok()
+        .is_none_or(|modified| modified.elapsed().unwrap_or_default() >= REUSED_UNDER)
+}
+
 fn random_port() -> u16 {
     rand::rng().random_range(49152..65535)
 }
@@ -492,6 +510,30 @@ mod tests {
         );
         set_cached_passphrase(None);
         assert_eq!(cached_passphrase(), None);
+    }
+
+    #[test]
+    fn token_renews_once_the_reuse_window_has_passed() {
+        let hours = |h: u64| std::time::Duration::from_secs(h * 60 * 60);
+        for (age, renews) in [
+            (None, true),
+            (Some(hours(1)), false),
+            (Some(hours(23)), true),
+            (Some(hours(25)), true),
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            if let Some(age) = age {
+                let path = tmp.path().join("serve.token");
+                std::fs::write(&path, "t").unwrap();
+                std::fs::File::options()
+                    .write(true)
+                    .open(&path)
+                    .unwrap()
+                    .set_modified(std::time::SystemTime::now() - age)
+                    .unwrap();
+            }
+            assert_eq!(token_renews_in(tmp.path()), renews, "{age:?}");
+        }
     }
 
     #[test]

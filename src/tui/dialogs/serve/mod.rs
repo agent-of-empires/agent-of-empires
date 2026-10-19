@@ -181,10 +181,12 @@ impl ServeMouse {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum LinkChange {
     Same,
-    /// Same host on another port: the host-only cookies still apply.
-    NewPort,
-    /// Another host, which the old host-only cookies are not sent to.
-    NewHost,
+    /// The link changes, but the Device's cookies still let it in: another port (cookies are
+    /// host-only, not per port), or a new token behind a passphrase sign-in.
+    Moved,
+    /// The Device's cookies no longer let it in: another host, which they are not sent to, or
+    /// a new token that the `aoe_token` cookie of a token-only Device doesn't match.
+    Replaced,
 }
 
 /// What a restart does to passphrase sign-ins on an unchanged host.
@@ -221,6 +223,8 @@ struct RestartProbe {
     local_hosts: Vec<String>,
     /// A Local restart inherits `AOE_SERVE_PASSPHRASE` from this process.
     local_passphrase: bool,
+    /// A Local restart mints a new access token (`token_renews`).
+    local_token_renews: bool,
 }
 
 impl RestartProbe {
@@ -237,6 +241,7 @@ impl RestartProbe {
                     .collect(),
                 local_passphrase: std::env::var("AOE_SERVE_PASSPHRASE")
                     .is_ok_and(|pp| !pp.is_empty()),
+                local_token_renews: token_renews(),
             },
             ServeMode::Tunnel => RestartProbe {
                 on_funnel: restart_on_funnel(transport),
@@ -251,8 +256,9 @@ impl RestartEffect {
     /// A Tunnel keeps its host only when it is on Funnel and the restart takes the Funnel path
     /// again: `spawn_daemon` never re-creates a named Cloudflare tunnel, and without Funnel the
     /// server opens a fresh quick tunnel. A Local daemon republishes this machine's addresses on
-    /// the reused or a random port. Behind the passphrase wall, sign-ins then survive only if
-    /// the running daemon wrote them to disk and the next start reads them back.
+    /// the reused or a random port, with a new token once the old one has aged out. Behind the
+    /// passphrase wall, sign-ins then survive only if the running daemon wrote them to disk and
+    /// the next start reads them back.
     fn of(
         mode: ServeMode,
         urls: &[ServeUrl],
@@ -268,10 +274,11 @@ impl RestartEffect {
                 let port_stays = probe
                     .port
                     .is_some_and(|port| urls.iter().all(|u| link_port(&u.url) == Some(port)));
-                let link = if !hosts_stay {
-                    LinkChange::NewHost
-                } else if !port_stays {
-                    LinkChange::NewPort
+                let renews = probe.local_token_renews;
+                let link = if !hosts_stay || (renews && !probe.local_passphrase) {
+                    LinkChange::Replaced
+                } else if !port_stays || renews {
+                    LinkChange::Moved
                 } else {
                     LinkChange::Same
                 };
@@ -283,7 +290,7 @@ impl RestartEffect {
                     if stays {
                         LinkChange::Same
                     } else {
-                        LinkChange::NewHost
+                        LinkChange::Replaced
                     },
                     true,
                 )
