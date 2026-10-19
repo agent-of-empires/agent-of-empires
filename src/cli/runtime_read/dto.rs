@@ -146,7 +146,7 @@ pub(crate) struct ProfileRead {
     pub health: ProfileHealth,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct GroupRead {
     pub name: String,
@@ -154,7 +154,7 @@ pub(crate) struct GroupRead {
     pub children: Vec<String>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct ProjectRead {
     pub name: String,
@@ -168,7 +168,7 @@ pub(crate) struct ProjectRead {
     pub registered: bool,
 }
 
-#[derive(Debug, Clone, Copy, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub(crate) enum ProjectScope {
     Global,
@@ -496,7 +496,7 @@ pub(crate) fn validate_hello(hello: &HelloData) -> Result<(), &'static str> {
     Ok(())
 }
 
-/// Bound ancestry walks on received session rows.
+/// Bound ancestry walks on session rows.
 const MAX_SESSION_DEPTH: usize = 64;
 pub(crate) fn validate_snapshot(snapshot: &SnapshotData) -> Result<(), &'static str> {
     if !valid_namespace(&snapshot.namespace)
@@ -809,7 +809,7 @@ fn validate_profile_component(health: ComponentHealth) -> Result<(), &'static st
 }
 
 /// Preserve registry order and validate group-tree references, not filesystem syntax.
-fn validate_groups(groups: &[GroupRead]) -> Result<(), &'static str> {
+pub(crate) fn validate_groups(groups: &[GroupRead]) -> Result<(), &'static str> {
     let mut unique: HashSet<&str> = HashSet::new();
     for group in groups {
         if !unique.insert(group.path.as_str()) {
@@ -834,10 +834,11 @@ fn validate_groups(groups: &[GroupRead]) -> Result<(), &'static str> {
     Ok(())
 }
 
-/// Projects in the producer's own registry order, and unique by identity:
-/// name, path and the registered flag together, so a synthesized row and the
-/// registry row it stands in for are two identities rather than one repeated.
-fn validate_projects(projects: &[ProjectRead], scope: ProjectScope) -> Result<(), &'static str> {
+/// Validate project scope, paths and exact registry identities.
+pub(crate) fn validate_projects(
+    projects: &[ProjectRead],
+    scope: ProjectScope,
+) -> Result<(), &'static str> {
     let mut identities = HashSet::new();
     for project in projects {
         if project.scope as u8 != scope as u8

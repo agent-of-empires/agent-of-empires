@@ -229,7 +229,7 @@ typescript = ["dep:ts-rs"]
 
 [dev-dependencies]
 serial_test = "4.0"
-jsonschema = { version = "0.58.6", default-features = false }
+jsonschema = { version = "0.59.0", default-features = false }
 # Test-only tokio clock control (`start_paused`), so the token-rotation
 # loop's grace deadline can be asserted without sleeping through it.
 # `cargo build` and released binaries never enable `test-util`.

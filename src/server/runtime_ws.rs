@@ -28,7 +28,9 @@ use serde::Serialize;
 use tokio_tungstenite::tungstenite;
 
 use super::AppState;
-use crate::cli::runtime_read::dto::{SessionRead, WorkspaceRepo, WorktreeRead};
+use crate::cli::runtime_read::dto::{
+    GroupRead, ProjectRead, ProjectScope, SessionRead, WorkspaceRepo, WorktreeRead,
+};
 use crate::session::{GroupTree, Instance, Storage};
 
 /// Wire version with physical profile aliases and listed membership.
@@ -603,9 +605,16 @@ fn build_snapshot(
             None
         }
     };
-    let global_metadata_healthy = global_projects.is_some();
+    let mut global_metadata_healthy = global_projects.is_some();
     let mut global_projects = global_projects.unwrap_or_default();
     drop_unusable_projects(&mut global_projects);
+    if crate::cli::runtime_read::dto::validate_projects(&global_projects, ProjectScope::Global)
+        .is_err()
+    {
+        tracing::warn!(target: "runtime.ws", "stored global projects violate the runtime read contract");
+        global_projects.clear();
+        global_metadata_healthy = false;
+    }
 
     let listed_names: HashSet<&str> = inventory
         .iter()
@@ -639,7 +648,7 @@ fn build_snapshot(
     let mut profile_health = BTreeMap::new();
     for (name, entry) in disk {
         let projects_healthy = entry.projects.is_ok();
-        let groups_healthy = entry.groups.is_ok();
+        let mut groups_healthy = entry.groups.is_ok();
         let scoped: Vec<&SessionRead> = sessions.iter().filter(|row| row.profile == name).collect();
         let mut projects = entry.projects.unwrap_or_default();
         drop_unusable_projects(&mut projects);
@@ -654,7 +663,15 @@ fn build_snapshot(
             scoped.iter().map(|row| row.group_path.as_str()),
             &stored_groups,
         );
-        let groups = group_reads(&tree);
+        let mut groups = group_reads(&tree);
+        if crate::cli::runtime_read::dto::validate_groups(&groups).is_err() {
+            tracing::warn!(target: "runtime.ws", ?name, "stored groups violate the runtime read contract");
+            groups = group_reads(&GroupTree::new_with_group_paths(
+                scoped.iter().map(|row| row.group_path.as_str()),
+                &[],
+            ));
+            groups_healthy = false;
+        }
         let health = ProfileHealth {
             profile_enumeration: component(groups_healthy, HealthCode::ProfileEnumeration),
             metadata: component(projects_healthy, HealthCode::Metadata),
@@ -964,6 +981,7 @@ impl Owner {
         }
     }
 
+    #[cfg(any(target_os = "linux", test, debug_assertions))]
     fn local(uid: u32) -> Self {
         Self {
             kind: "local_owner",
@@ -1032,32 +1050,6 @@ struct ProfileRead {
     groups: Vec<GroupRead>,
     projects: Vec<ProjectRead>,
     health: ProfileHealth,
-}
-
-#[derive(Serialize, Clone)]
-struct GroupRead {
-    name: String,
-    path: String,
-    children: Vec<String>,
-}
-
-#[derive(Serialize, Clone)]
-struct ProjectRead {
-    name: String,
-    path: String,
-    /// Daemon-resolved equality key; the client must not resolve remote paths locally.
-    merge_key: String,
-    scope: ProjectScope,
-    default_base_branch: Option<String>,
-    /// Registry rows are visible; session-path referential rows are not listings.
-    registered: bool,
-}
-
-#[derive(Debug, Serialize, Clone, Copy, PartialEq, Eq)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-enum ProjectScope {
-    Global,
-    Profile,
 }
 
 impl SessionRead {
@@ -1276,18 +1268,13 @@ mod tests {
 
     #[test]
     #[serial_test::serial]
-    fn stored_rows_outside_the_contract_degrade_only_their_profile() {
-        use crate::cli::runtime_read::dto::profile_component_healthy;
+    fn stored_rows_outside_the_contract_degrade_only_their_component() {
+        use crate::cli::runtime_read::dto::{component_healthy, profile_component_healthy};
 
         let home = TempHome::new();
         Storage::new_unwatched("healthy").unwrap();
         let storage = Storage::new_unwatched("broken").unwrap();
         let directory = home.app_dir().join("profiles/broken");
-        std::fs::write(
-            directory.join("groups.json"),
-            serde_json::to_vec(&[Group::new("kept", "kept")]).unwrap(),
-        )
-        .unwrap();
         std::fs::write(
             directory.join("projects.json"),
             br#"[{"name":"kept","path":"/srv/kept","scope":"profile"}]"#,
@@ -1308,9 +1295,50 @@ mod tests {
             "bidi-agent-id",
             "duplicate-id",
             "deep-parent-chain",
+            "group-duplicate",
+            "group-name",
+            "global-project-duplicate",
         ] {
+            let invalid_groups = matches!(case, "group-duplicate" | "group-name");
+            let invalid_global = case == "global-project-duplicate";
+            let invalid_sessions = !invalid_groups && !invalid_global;
+            let mut groups = vec![Group::new("kept", "kept")];
+            match case {
+                "group-duplicate" => groups.push(Group::new("kept", "kept")),
+                "group-name" => groups.push(Group::new("wrong", "session/child")),
+                _ => {}
+            }
+            let stored_groups = serde_json::to_vec(&groups).unwrap();
+            std::fs::write(directory.join("groups.json"), &stored_groups).unwrap();
+            let loaded_groups = storage.load_groups_readonly().unwrap();
+            assert_eq!(
+                loaded_groups
+                    .iter()
+                    .map(|group| (&group.name, &group.path))
+                    .collect::<Vec<_>>(),
+                groups
+                    .iter()
+                    .map(|group| (&group.name, &group.path))
+                    .collect::<Vec<_>>(),
+                "{case}: the store must accept the regression input"
+            );
+            let global_projects: &[u8] = if invalid_global {
+                br#"[{"name":"global","path":"/srv/global"},{"name":"global","path":"/srv/global"}]"#
+            } else {
+                br#"[{"name":"global","path":"/srv/global"}]"#
+            };
+            std::fs::write(home.app_dir().join("projects.json"), global_projects).unwrap();
+            assert_eq!(
+                crate::session::projects::load_global().unwrap().len(),
+                if invalid_global { 2 } else { 1 },
+                "{case}: the global store must accept the regression input"
+            );
             let mut bad = named("bad-row", "broken");
             let mut rows = vec![named("otherwise-valid", "broken")];
+            if !invalid_sessions {
+                bad.group_path = "session/child".into();
+                rows[0].group_path = "session/child".into();
+            }
             match case {
                 "workspace-trailing"
                 | "workspace-dot"
@@ -1359,6 +1387,8 @@ mod tests {
                         rows.push(row);
                     }
                 }
+                "group-duplicate" | "group-name" => {}
+                "global-project-duplicate" => bad.project_path = "/srv/global".into(),
                 _ => unreachable!(),
             }
             rows.push(bad);
@@ -1383,31 +1413,81 @@ mod tests {
             validate_hello(&hello).unwrap();
             validate_snapshot(&snapshot).unwrap();
             validate_cross_message(&hello, &snapshot, None).unwrap();
+            let expected_ids: &[&str] = if invalid_sessions {
+                &["healthy-row"]
+            } else {
+                &["healthy-row", "otherwise-valid", "bad-row"]
+            };
             assert_eq!(
                 snapshot
                     .sessions
                     .iter()
                     .map(|row| row.id.as_str())
                     .collect::<Vec<_>>(),
-                ["healthy-row"],
+                expected_ids,
                 "{case}"
             );
             assert!(cached_data_healthy(&snapshot, "healthy"), "{case}");
-            assert!(!cached_data_healthy(&snapshot, "broken"), "{case}");
+            assert_eq!(
+                cached_data_healthy(&snapshot, "broken"),
+                !invalid_sessions,
+                "{case}"
+            );
+            let healthy_profile = snapshot
+                .profiles
+                .iter()
+                .find(|row| row.name == "healthy")
+                .unwrap();
+            assert!(
+                profile_component_healthy(&healthy_profile.health.profile_enumeration)
+                    && profile_component_healthy(&healthy_profile.health.metadata),
+                "{case}"
+            );
+            assert!(
+                component_healthy(&snapshot.health.global_enumeration),
+                "{case}"
+            );
+            assert_eq!(
+                component_healthy(&snapshot.health.global_metadata),
+                !invalid_global,
+                "{case}"
+            );
             let broken = snapshot
                 .profiles
                 .iter()
                 .find(|row| row.name == "broken")
                 .unwrap();
             assert!(profile_component_healthy(&broken.health.metadata), "{case}");
-            assert!(
+            assert_eq!(
                 profile_component_healthy(&broken.health.profile_enumeration),
+                !invalid_groups,
                 "{case}"
             );
-            assert!(
+            assert_eq!(
                 broken.groups.iter().any(|group| group.path == "kept"),
+                !invalid_groups,
                 "{case}"
             );
+            if !invalid_sessions {
+                for path in ["session", "session/child"] {
+                    assert!(
+                        broken.groups.iter().any(|group| group.path == path),
+                        "{case}"
+                    );
+                }
+            }
+            if invalid_global {
+                assert!(snapshot.global_projects.is_empty(), "{case}");
+                assert!(
+                    broken
+                        .projects
+                        .iter()
+                        .any(|project| { project.path == "/srv/global" && !project.registered }),
+                    "{case}"
+                );
+            } else {
+                assert_eq!(snapshot.global_projects[0].path, "/srv/global", "{case}");
+            }
             assert!(
                 broken
                     .projects
@@ -1418,6 +1498,16 @@ mod tests {
             assert_eq!(
                 std::fs::read(directory.join("sessions.json")).unwrap(),
                 stored,
+                "{case}"
+            );
+            assert_eq!(
+                std::fs::read(directory.join("groups.json")).unwrap(),
+                stored_groups,
+                "{case}"
+            );
+            assert_eq!(
+                std::fs::read(home.app_dir().join("projects.json")).unwrap(),
+                global_projects,
                 "{case}"
             );
         }

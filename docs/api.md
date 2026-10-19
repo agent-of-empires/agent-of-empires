@@ -26,11 +26,11 @@ Wire protocol **version 4** sends a `Hello` followed by a `Snapshot`. Profiles c
 
 Runtime-read session identity and parent relationships are scoped to a profile. The same session ID may appear in different profiles without invalidating the snapshot. Stored absolute project paths retain their spelling, including legacy `.` / `..` components and repeated separators; reads do not normalize them or resolve them on the client.
 
-Profile stores and alias targets must remain responsive. Filesystem operations on a stalled mount can delay daemon status refresh and snapshot sampling. The exchange deadline does not cancel those filesystem operations.
+Profile stores and alias targets must remain responsive. A stalled filesystem operation can indefinitely block daemon status refresh and persisted session mutations waiting on the reload gate. A stalled snapshot worker holds `runtime.flight` and an admission permit; queued workers can exhaust read admission. Client exchange deadlines do not cancel these filesystem operations. Isolation of hung alias targets is tracked in [#4702](https://github.com/agent-of-empires/agent-of-empires/issues/4702).
 
-An explicitly selected unreadable profile fails rather than returning an empty successful result. All-profile listing skips unreadable profiles, matching local listing behavior. Stored sessions outside the wire contract make only their profile's session data unreadable; read sampling does not rewrite the store. Group and project registries have independent health, so an unrelated failure does not prevent a healthy read.
+Scoped session reads fail on unreadable profile data instead of returning an empty success. All-profile listing skips unreadable profiles. Contract-invalid stored sessions degrade only their profile's session data; invalid stored groups degrade only that profile's group enumeration. Invalid global projects degrade only global metadata. These components stay independent, and snapshot sampling never rewrites the stores.
 
-Newly listed profile stores are read on a cache miss without replacing existing live session rows or accepting a retargeted alias before the cache reload.
+Newly listed profile stores are read on a cache miss without replacing existing live session rows. A newly listed store reusing a cached profile name or alias is not admitted as a cache miss; the daemon must accept a reload first. This includes deleting and recreating a profile with the same name, preventing retained live rows from being mixed with replacement-store data.
 
 Wire members declared nullable must still be present. CLI JSON is a separate contract; for example, `session show --json` omits an unknown `agent_session_id`. A `systemd_unit` glob in local list JSON describes an expected scope name, not proof that the unit exists; remote snapshots omit it.
 
