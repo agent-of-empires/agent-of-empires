@@ -6,29 +6,22 @@ All contributions follow the [Code of Conduct](CODE_OF_CONDUCT.md).
 
 ## Contribution scope
 
-AoE favors a simple, focused core. Explain why a proposed feature belongs there
-and how its user benefit justifies added interface, configuration, and maintenance
-complexity. A smaller diff alone does not make a feature a better fit.
+AoE favors a simple, focused core. Explain how a feature fits existing workflows
+and justifies added interface, configuration, and maintenance complexity, not just
+a small diff. Maintainers decide fit; discussion can change that judgment, but
+these guidelines do not guarantee acceptance.
 
-Project fit involves maintainer taste and judgment, not just a checklist.
-Explain how the feature would work, how it fits existing workflows, and its
-tradeoffs so maintainers can evaluate the design. Discussion can change an
-initial view that a feature does not belong in core. These guidelines help that
-conversation; meeting them does not guarantee acceptance.
-
-- Explain the user problem and why the existing workflow does not solve it.
-  Check assignees and active PRs before starting overlapping work.
-- Discuss significant features or architecture changes before implementation.
-  Work toward a shared understanding of the design, acceptance criteria, and
-  non-goals. An issue is not necessarily an accepted design; follow the latest
-  agreed scope, or explain new reasoning when asking to revisit it.
-- Fix the responsible layer without overriding user configuration or changing
-  unrelated workflows. If approval calls for opt-in behavior, keep it opt-in.
-- Prefer existing sources of truth over parallel schemas, settings, or modes.
-  Explain any new dependencies and which build paths need them.
-- Keep the change focused on the accepted problem; propose unrelated refactors
-  or improvements separately. Provide reproducible evidence and show the changed
-  behavior working, following the testing guidance in [AGENTS.md](AGENTS.md).
+- Keep initial feature suggestions brief: explain the user problem, existing
+  workflow's limits, and proposed change. Read and edit your submission yourself,
+  including AI-generated text; respect maintainer reading time.
+- Check assignees and active PRs to avoid duplicate work. Agree on significant
+  designs, acceptance criteria, and non-goals before implementation; an issue
+  alone is not approval. Follow the latest agreed scope or ask to revisit it.
+- Fix the responsible layer, respect user configuration, and keep approved
+  opt-in behavior opt-in. Reuse existing sources of truth; justify new dependencies
+  and explain which build paths need them.
+- Keep unrelated improvements separate. Show the changed behavior working,
+  following the [testing guidance](AGENTS.md).
 
 ## Setup
 
@@ -70,12 +63,10 @@ Open the PR against `main` and complete the template. Include:
 - screenshots or recordings for UI changes;
 - related issues.
 
-AI-assisted contributions follow the same rules. Agents make recommendations and
-proposals, not project decisions: a human stays in the loop to approve scope and
-implementation, review proposed changes, and decide issue disposition or merge.
-Disclose tools and use in the [PR template](.github/pull_request_template.md);
-you remain responsible for the change. Answer reviewer questions yourself rather
-than pasting generated replies.
+AI agents propose; humans approve scope and implementation, review changes, and
+decide issue disposition or merge. You remain responsible for AI-assisted work:
+disclose tools and use in the [PR template](.github/pull_request_template.md)
+and answer reviewer questions yourself, not with generated replies.
 
 Before requesting review, run:
 
