@@ -437,6 +437,18 @@ impl HttpClient {
             .await
     }
 
+    /// A rejection echoes over the WS as `ConfigOptionSwitchFailed`.
+    pub async fn set_config_option(
+        &self,
+        session_id: &str,
+        config_id: &str,
+        value: &str,
+    ) -> Result<(), HttpError> {
+        let body = serde_json::json!({ "config_id": config_id, "value": value });
+        self.session_call(Method::POST, session_id, "/acp/config-option", Some(body))
+            .await
+    }
+
     /// Switch a terminal session to the structured view. Idempotent.
     pub async fn acp_enable(&self, session_id: &str) -> Result<(), HttpError> {
         self.session_call(Method::POST, session_id, "/acp/enable", None)
