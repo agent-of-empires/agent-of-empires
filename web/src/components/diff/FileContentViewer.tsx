@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import { getSessionFile } from "../../lib/api";
 import { useWebSettings } from "../../hooks/useWebSettings";
 import { extensionToLanguage } from "./comments/language";
+import { BinaryFileView } from "./BinaryFileView";
 import { FullFileViewer } from "./FullFileViewer";
 import { MarkdownFileView } from "./MarkdownFileView";
 import { BackButton, Centered, MarkdownToggle, TooLarge } from "./viewerChrome";
@@ -80,9 +81,7 @@ export function FileContentViewer({ sessionId, filePath, onBack }: Props) {
           <span className="text-sm">{error}</span>
         </Centered>
       ) : data?.is_binary ? (
-        <Centered>
-          <span className="text-sm">Binary file</span>
-        </Centered>
+        <BinaryFileView sessionId={sessionId} filePath={filePath} />
       ) : data?.truncated ? (
         <TooLarge what="File too large to display inline" hint="Open it in your editor instead." />
       ) : data && showRendered ? (

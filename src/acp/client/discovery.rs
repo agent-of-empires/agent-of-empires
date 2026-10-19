@@ -13,7 +13,6 @@ use std::sync::{Arc, RwLock};
 use thiserror::Error;
 
 use crate::cli::serve::{daemon_pid, read_serve_urls, ServeUrl};
-use crate::daemon::{DaemonClient, DaemonClientError};
 
 /// `base_url` carries no query string so it is safe to log; the token travels
 /// separately, as a bearer header in [`super::http`] and a `?token=` query in
@@ -59,12 +58,6 @@ impl DaemonEndpoint {
     /// Same base URL with a `ws://` / `wss://` scheme.
     pub fn ws_base_url(&self) -> String {
         http_to_ws(&self.base_url)
-    }
-
-    /// Session-list client carrying the credential as resolved now.
-    pub fn daemon_client(&self) -> Result<DaemonClient, DaemonClientError> {
-        let token = self.resolved_token();
-        DaemonClient::new(&self.base_url, token.as_deref())
     }
 
     /// The credential to send now, not the discovery-time snapshot. Only a

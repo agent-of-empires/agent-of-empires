@@ -50,6 +50,7 @@ aoe-plugin-api = { path = "aoe-plugin-api" }
 serde = { version = "1.0", features = ["derive"] }
 serde_ignored = "0.1"
 serde_json = { version = "1.0", features = ["preserve_order"] }
+ts-rs = { version = "12", optional = true }
 serde-saphyr = "1.3"
 granit-parser = { version = "1.3", features = ["std"] }
 toml = "1.1"
@@ -224,6 +225,9 @@ web = ["rust-embed", "qrcode"]
 # set, and a CI guard rejects any `cfg(feature = "serve")` so the alias
 # cannot diverge from `web`.
 serve = ["web"]
+# Derives `ts_rs::TS` on the live wire types so `cargo xtask gen-live-wire` can
+# emit the dashboard's copy. Not needed by any shipped binary.
+typescript = ["dep:ts-rs"]
 
 [dev-dependencies]
 serial_test = "4.0"

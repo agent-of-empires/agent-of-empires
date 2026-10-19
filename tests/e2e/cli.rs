@@ -924,6 +924,67 @@ fn cli_mcp_list_merges_layers_and_redacts_secrets() {
     assert_eq!(val["driftPaused"], false);
 }
 
+/// #3045: add, edit and remove an AoE-owned MCP server; native servers are refused.
+#[test]
+#[parallel]
+fn cli_mcp_add_edit_remove_flow() {
+    let h = TuiTestHarness::new("cli_mcp_add_edit_remove");
+    let home = h.home_path();
+    std::fs::write(
+        home.join(".claude.json"),
+        r#"{ "mcpServers": { "native-only": { "command": "n" } } }"#,
+    )
+    .expect("write .claude.json");
+    let mcp_json =
+        || std::fs::read_to_string(app_dir_in(home).join("mcp.json")).unwrap_or_default();
+
+    let out = h.run_cli_ok(&[
+        "mcp",
+        "add",
+        "fs",
+        "--command",
+        "mcp-fs",
+        "--arg",
+        "--root",
+        "--env",
+        "TOKEN=SUPER_SECRET",
+    ]);
+    assert!(!out.contains("SUPER_SECRET"), "secret leaked:\n{out}");
+
+    // Editing the command keeps the stored secret; --unset-env then removes it.
+    h.run_cli_ok(&["mcp", "edit", "fs", "--command", "mcp-fs2"]);
+    assert!(mcp_json().contains("SUPER_SECRET"));
+    let listed = json_out(&h, &["mcp", "list", "--agent", "claude", "--json"]);
+    let fs = listed["effective"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["name"] == "fs")
+        .expect("fs listed")
+        .clone();
+    assert_eq!(fs["command"], "mcp-fs2");
+    assert_eq!(fs["provenance"], "global");
+    assert_eq!(fs["envNames"], json!(["TOKEN"]));
+    h.run_cli_ok(&["mcp", "edit", "fs", "--unset-env", "TOKEN"]);
+    assert!(!mcp_json().contains("SUPER_SECRET"));
+    h.run_cli_ok(&["mcp", "edit", "fs", "--clear-args"]);
+    assert!(!mcp_json().contains("--root"));
+
+    let before = mcp_json();
+    for args in [
+        &["mcp", "edit", "native-only", "--command", "x"][..],
+        &["mcp", "remove", "native-only"][..],
+    ] {
+        let out = h.run_cli(args);
+        assert!(!out.status.success(), "{args:?} must fail");
+        assert!(String::from_utf8_lossy(&out.stderr).contains("not an AoE-owned server"));
+    }
+    assert_eq!(mcp_json(), before);
+
+    h.run_cli_ok(&["mcp", "remove", "fs"]);
+    assert!(!h.run_cli(&["mcp", "remove", "fs"]).status.success());
+}
+
 /// #3050: discover, adopt, edit, share, and remove a skill while the external
 /// source stays untouched unless it is explicitly taken over.
 #[test]

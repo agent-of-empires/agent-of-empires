@@ -3,6 +3,8 @@
 //! One WebSocket per viewer on `/sessions/{id}/live-ws`. There is no PTY and no
 //! `tmux attach`: the server publishes rendered windows and the client scrolls them.
 //!
+//! The JSON shapes are defined in `crate::daemon::live`.
+//!
 //! Server to client, JSON text frames, each carrying a monotonic `seq` plus the shared
 //! geometry block `rows`, `history`, `cursor` (`{"x","y"}` in window coordinates, or
 //! null), `altScreen`, `mouse`, `mouseSgr` and `pane0`
@@ -48,6 +50,9 @@ use super::pane::{
     CLOSE_CODE_TRY_AGAIN_LATER,
 };
 use super::AppState;
+use crate::daemon::live::{
+    LiveClientMessage, LiveCursor, LivePane0, LivePaneMeta, LiveServerMessage,
+};
 use crate::tmux::{SIZE_OWNER_HEARTBEAT, SIZE_OWNER_TTL};
 
 /// Capture cadence while the client is at the live edge.
@@ -127,42 +132,6 @@ impl ReassertGuard {
     fn reset(&mut self) {
         self.last = None;
     }
-}
-
-#[derive(Deserialize)]
-#[serde(tag = "type")]
-enum LiveControlMessage {
-    #[serde(rename = "resize")]
-    Resize { cols: u16, rows: u16 },
-    #[serde(rename = "window")]
-    Window { lines: usize },
-    #[serde(rename = "cadence")]
-    Cadence { fast: bool },
-    /// Request the lock when it is vacant, without resizing or displacing a live owner.
-    #[serde(rename = "claim_if_vacant")]
-    ClaimIfVacant,
-    /// Explicit "take over" from a non-owner client.
-    #[serde(rename = "claim")]
-    Claim,
-    /// Capability advertisement; see the module doc.
-    #[serde(rename = "caps")]
-    Caps {
-        #[serde(default)]
-        deflate: bool,
-        #[serde(default)]
-        patch: bool,
-    },
-    /// The client lost patch continuity and needs a full frame.
-    #[serde(rename = "resync")]
-    Resync,
-    /// Text for tmux's paste path, which has no size limit and adds bracketed-paste
-    /// markers only when the pane enabled them.
-    #[serde(rename = "paste")]
-    Paste {
-        text: String,
-        #[serde(default)]
-        submit: bool,
-    },
 }
 
 /// Bracketed-paste delimiters and remaining ESC bytes are removed before terminal input.
@@ -440,16 +409,16 @@ fn plan_patch<'a>(
 /// JSON control frame telling the client whether it currently owns the
 /// session's size (and may resize/type) or is a read-only viewer.
 fn size_owner_json(is_owner: bool) -> String {
-    serde_json::json!({ "type": "size_owner", "is_owner": is_owner }).to_string()
+    live_json(&LiveServerMessage::SizeOwner { is_owner })
 }
 
 fn clipboard_json(text: &str) -> String {
-    serde_json::json!({ "type": "clipboard", "text": text }).to_string()
+    live_json(&LiveServerMessage::Clipboard { text: text.into() })
 }
 
 /// Which transport is producing frames.
 fn transport_json(grid: bool) -> String {
-    serde_json::json!({ "type": "transport", "grid": grid }).to_string()
+    live_json(&LiveServerMessage::Transport { grid })
 }
 
 /// Whether this connection may push the pane's OSC 52 copies into the viewer's browser
@@ -1387,11 +1356,11 @@ async fn handle_live_ws_inner(
                         send_nudge.notify_one();
                     }
                     Some(Ok(Message::Text(text))) => {
-                        let Ok(control) = serde_json::from_str::<LiveControlMessage>(&text) else {
+                        let Ok(control) = serde_json::from_str::<LiveClientMessage>(&text) else {
                             continue;
                         };
                         match control {
-                            LiveControlMessage::Resize { cols, rows } => {
+                            LiveClientMessage::Resize { cols, rows } => {
                                 if cols == 0 || rows == 0 {
                                     continue;
                                 }
@@ -1434,20 +1403,20 @@ async fn handle_live_ws_inner(
                                     .await;
                                 nudge.notify_one();
                             }
-                            LiveControlMessage::Window { lines } => {
+                            LiveClientMessage::Window { lines } => {
                                 let floor = (settings.screen_rows.load(Ordering::Relaxed) as usize)
                                     .max(DEFAULT_WINDOW_LINES);
                                 let clamped = lines.clamp(floor, MAX_WINDOW_LINES);
                                 settings.window_lines.store(clamped, Ordering::Relaxed);
                                 nudge.notify_one();
                             }
-                            LiveControlMessage::Cadence { fast } => {
+                            LiveClientMessage::Cadence { fast } => {
                                 settings.fast.store(fast, Ordering::Relaxed);
                                 if fast {
                                     nudge.notify_one();
                                 }
                             }
-                            LiveControlMessage::ClaimIfVacant => {
+                            LiveClientMessage::ClaimIfVacant => {
                                 // A keyboard-open mobile pane intentionally postpones its
                                 // first resize so it never sends keyboard-shrunk rows to
                                 // tmux.
@@ -1465,7 +1434,7 @@ async fn handle_live_ws_inner(
                                     .await;
                                 nudge.notify_one();
                             }
-                            LiveControlMessage::Claim => {
+                            LiveClientMessage::Claim => {
                                 // Explicit take-over.
                                 let name = tmux_name.clone();
                                 let who = owner_id.clone();
@@ -1502,7 +1471,7 @@ async fn handle_live_ws_inner(
                                     .await;
                                 nudge.notify_one();
                             }
-                            LiveControlMessage::Caps { deflate, patch } => {
+                            LiveClientMessage::Caps { deflate, patch } => {
                                 // Set-once.
                                 if deflate {
                                     settings.deflate.store(true, Ordering::Relaxed);
@@ -1511,7 +1480,7 @@ async fn handle_live_ws_inner(
                                     settings.patch.store(true, Ordering::Relaxed);
                                 }
                             }
-                            LiveControlMessage::Paste { text, submit } => {
+                            LiveClientMessage::Paste { text, submit } => {
                                 if read_only || !settings.is_owner.load(Ordering::Relaxed) {
                                     continue;
                                 }
@@ -1527,7 +1496,7 @@ async fn handle_live_ws_inner(
                                 .await;
                                 nudge.notify_one();
                             }
-                            LiveControlMessage::Resync => {
+                            LiveClientMessage::Resync => {
                                 settings.force_full.store(true, Ordering::Relaxed);
                                 nudge.notify_one();
                             }
@@ -1654,56 +1623,34 @@ async fn wait_for_next(
     }
 }
 
+fn live_json(message: &LiveServerMessage) -> String {
+    serde_json::to_string(message).expect("live wire messages serialize")
+}
+
 /// The geometry, cursor and mode fields every frame and patch carries.
-fn frame_meta(
-    cursor: Option<&crate::tmux::PaneCursor>,
-) -> serde_json::Map<String, serde_json::Value> {
+fn frame_meta(cursor: Option<&crate::tmux::PaneCursor>) -> LivePaneMeta {
     // The cursor is pane relative while composited content uses the window grid.
     let pane0 = cursor.and_then(|c| c.composite_pane0);
     let (origin_x, origin_y) = pane0.map_or((0, 0), |p| (p.left, p.top));
-    let cursor_value = match cursor {
-        Some(c) if c.visible => serde_json::json!({
-            "x": c.x.saturating_add(origin_x),
-            "y": c.y.saturating_add(origin_y),
+    LivePaneMeta {
+        rows: cursor.map_or(0, |c| c.pane_height),
+        history: cursor.map_or(0, |c| c.history_size),
+        cursor: cursor.filter(|c| c.visible).map(|c| LiveCursor {
+            x: c.x.saturating_add(origin_x),
+            y: c.y.saturating_add(origin_y),
         }),
-        _ => serde_json::Value::Null,
-    };
-    let mut map = serde_json::Map::new();
-    map.insert(
-        "rows".into(),
-        cursor.map(|c| c.pane_height).unwrap_or(0).into(),
-    );
-    map.insert(
-        "history".into(),
-        cursor.map(|c| c.history_size).unwrap_or(0).into(),
-    );
-    map.insert("cursor".into(), cursor_value);
-    // Full-screen (alternate-screen) mouse apps have no capturable scrollback; the client
-    // forwards the wheel to the app instead of widening the capture window.
-    map.insert(
-        "altScreen".into(),
-        cursor.map(|c| c.alternate_on).unwrap_or(false).into(),
-    );
-    map.insert(
-        "mouse".into(),
-        cursor.map(|c| c.mouse_tracking).unwrap_or(false).into(),
-    );
-    map.insert(
-        "mouseSgr".into(),
-        cursor.map(|c| c.mouse_sgr).unwrap_or(false).into(),
-    );
-    map.insert(
-        "pane0".into(),
-        pane0.map_or(serde_json::Value::Null, |p| {
-            serde_json::json!({
-                "cols": p.width,
-                "rows": p.height,
-                "left": p.left,
-                "top": p.top,
-            })
+        // Full-screen (alternate-screen) mouse apps have no capturable scrollback; the client
+        // forwards the wheel to the app instead of widening the capture window.
+        alt_screen: cursor.is_some_and(|c| c.alternate_on),
+        mouse: cursor.is_some_and(|c| c.mouse_tracking),
+        mouse_sgr: cursor.is_some_and(|c| c.mouse_sgr),
+        pane0: pane0.map(|p| LivePane0 {
+            cols: p.width,
+            rows: p.height,
+            left: p.left,
+            top: p.top,
         }),
-    );
-    map
+    }
 }
 
 /// Serialize a row patch (see the module doc).
@@ -1713,28 +1660,21 @@ fn patch_json(
     seq: u64,
     cursor: Option<&crate::tmux::PaneCursor>,
 ) -> String {
-    let mut map = frame_meta(cursor);
-    map.insert("type".into(), "patch".into());
-    map.insert("seq".into(), seq.into());
-    map.insert("base".into(), (seq - 1).into());
-    map.insert("shift".into(), shift.into());
-    map.insert(
-        "lines".into(),
-        changed
-            .iter()
-            .map(|(i, row)| serde_json::json!([i, row]))
-            .collect::<Vec<_>>()
-            .into(),
-    );
-    serde_json::Value::Object(map).to_string()
+    live_json(&LiveServerMessage::Patch {
+        seq,
+        base: seq - 1,
+        shift,
+        lines: changed.iter().map(|(i, row)| (*i, (*row).into())).collect(),
+        meta: frame_meta(cursor),
+    })
 }
 
 fn frame_json(content: &str, cursor: Option<&crate::tmux::PaneCursor>, seq: u64) -> String {
-    let mut map = frame_meta(cursor);
-    map.insert("type".into(), "frame".into());
-    map.insert("seq".into(), seq.into());
-    map.insert("content".into(), content.into());
-    serde_json::Value::Object(map).to_string()
+    live_json(&LiveServerMessage::Frame {
+        seq,
+        content: content.into(),
+        meta: frame_meta(cursor),
+    })
 }
 
 #[cfg(test)]
@@ -1777,8 +1717,8 @@ mod tests {
             ),
         ];
         for (json, want_text, want_submit, want_payload) in cases {
-            let Ok(LiveControlMessage::Paste { text, submit }) =
-                serde_json::from_str::<LiveControlMessage>(json)
+            let Ok(LiveClientMessage::Paste { text, submit }) =
+                serde_json::from_str::<LiveClientMessage>(json)
             else {
                 panic!("{json} did not parse as paste");
             };
@@ -1786,7 +1726,7 @@ mod tests {
             assert_eq!(submit, *want_submit, "{json}");
             assert_eq!(paste_payload(text, submit), *want_payload, "{json}");
         }
-        assert!(serde_json::from_str::<LiveControlMessage>(r#"{"type":"paste"}"#).is_err());
+        assert!(serde_json::from_str::<LiveClientMessage>(r#"{"type":"paste"}"#).is_err());
     }
 
     #[cfg(unix)]

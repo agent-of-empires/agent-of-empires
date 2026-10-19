@@ -38,6 +38,50 @@ test.describe("MCP servers", () => {
   });
 });
 
+test("MCP panel adds, edits, and deletes an AoE-owned server and never shows secrets", async ({ page, spawnServe }) => {
+  // #3045
+  const serve = await spawnServe({
+    seedFn: ({ home }) =>
+      writeFileSync(join(home, ".claude.json"), JSON.stringify({ mcpServers: { native: { command: "n" } } })),
+  });
+  await page.goto(`${serve.baseUrl}/settings/mcp`);
+  const panel = page.getByTestId("mcp-panel");
+  await expect(panel.getByText("native", { exact: true })).toBeVisible();
+  // Agent-native rows are read-only.
+  await expect(panel.getByLabel("edit native")).toHaveCount(0);
+
+  await panel.getByRole("button", { name: "Add server" }).click();
+  const dialog = page.getByRole("dialog", { name: "Add MCP server" });
+  await dialog.getByLabel("Name").fill("fs");
+  await dialog.getByLabel("Command").fill("mcp-fs");
+  await dialog.getByRole("button", { name: "Add env" }).click();
+  await dialog.getByLabel("env name 1").fill("TOKEN");
+  await dialog.getByLabel("env value 1").fill("SUPER_SECRET_DO_NOT_LEAK");
+  await dialog.getByRole("button", { name: "Save" }).click();
+  await expect(dialog).toBeHidden();
+
+  // Persisted: a fresh load still lists it as AoE-owned, with the secret name only.
+  await page.reload();
+  const row = panel.getByText("fs", { exact: true });
+  await expect(row).toBeVisible();
+  await expect(panel).toContainText("TOKEN");
+  await expect(panel).not.toContainText("SUPER_SECRET_DO_NOT_LEAK");
+
+  // Edit the command, leaving the secret untouched.
+  await panel.getByLabel("edit fs").click();
+  const edit = page.getByRole("dialog", { name: "Edit MCP server fs" });
+  await edit.getByLabel("Command").fill("mcp-fs2");
+  await edit.getByRole("button", { name: "Save" }).click();
+  await expect(edit).toBeHidden();
+  await expect(panel).toContainText("mcp-fs2");
+  await expect(panel).toContainText("TOKEN");
+
+  page.once("dialog", (d) => d.accept());
+  await panel.getByLabel("delete fs").click();
+  await expect(panel.getByText("fs", { exact: true })).toHaveCount(0);
+  await expect(panel.getByText("native", { exact: true })).toBeVisible();
+});
+
 test("skills panel adopts, edits, creates, and deletes skills", async ({ page, spawnServe }) => {
   // #3050
   const original = "---\nname: Review\ndescription: Review code carefully\n---\n\nOriginal body\n";

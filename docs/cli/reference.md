@@ -96,6 +96,9 @@ This document contains the help content for the `aoe` command-line program.
 * [`aoe telemetry reset-id`↴](#aoe-telemetry-reset-id)
 * [`aoe mcp`↴](#aoe-mcp)
 * [`aoe mcp list`↴](#aoe-mcp-list)
+* [`aoe mcp add`↴](#aoe-mcp-add)
+* [`aoe mcp edit`↴](#aoe-mcp-edit)
+* [`aoe mcp remove`↴](#aoe-mcp-remove)
 * [`aoe skill`↴](#aoe-skill)
 * [`aoe skill list`↴](#aoe-skill-list)
 * [`aoe skill view`↴](#aoe-skill-view)
@@ -1452,6 +1455,9 @@ Inspect the effective MCP server set (provenance, conflicts, drift)
 ###### **Subcommands:**
 
 * `list` — List the merged effective MCP server set with provenance, plus any conflicts and servers kept after removal from a native config
+* `add` — Add an AoE-owned MCP server to the global mcp.json
+* `edit` — Edit an AoE-owned MCP server. Secrets you do not mention keep their stored value
+* `remove` — Remove an AoE-owned MCP server
 
 
 
@@ -1465,6 +1471,67 @@ List the merged effective MCP server set with provenance, plus any conflicts and
 
 * `--agent <AGENT>` — Agent whose effective set to resolve. Defaults to the configured default tool. MCP forwarding is per-agent because the agent-native layer differs
 * `--json` — Output machine-readable JSON instead of a table
+
+
+
+## `aoe mcp add`
+
+Add an AoE-owned MCP server to the global mcp.json
+
+**Usage:** `aoe mcp add [OPTIONS] <NAME>`
+
+###### **Arguments:**
+
+* `<NAME>` — Server name (letters, digits, '.', '_', '-')
+
+###### **Options:**
+
+* `--transport <TRANSPORT>`
+
+  Default value: `stdio`
+
+  Possible values: `stdio`, `http`, `sse`
+
+* `--command <COMMAND>` — Executable to run (stdio only)
+* `--arg <ARGS>` — Argument for the command; repeat for several (stdio only)
+* `--env <ENV>` — Environment variable as KEY=VALUE; repeatable (stdio only)
+* `--url <URL>` — Server URL (http and sse only)
+* `--header <HEADER>` — Request header as KEY=VALUE; repeatable (http and sse only)
+
+
+
+## `aoe mcp edit`
+
+Edit an AoE-owned MCP server. Secrets you do not mention keep their stored value
+
+**Usage:** `aoe mcp edit [OPTIONS] <NAME>`
+
+###### **Arguments:**
+
+* `<NAME>` — Name of the AoE-owned server to edit. Its transport cannot change; remove and add instead
+
+###### **Options:**
+
+* `--command <COMMAND>` — Replace the executable (stdio only)
+* `--arg <ARGS>` — Replace all arguments; repeat for several (stdio only)
+* `--clear-args` — Remove all arguments (stdio only)
+* `--env <ENV>` — Set an environment variable as KEY=VALUE; repeatable (stdio only)
+* `--unset-env <UNSET_ENV>` — Remove an environment variable by name; repeatable (stdio only)
+* `--url <URL>` — Replace the URL (http and sse only)
+* `--header <HEADER>` — Set a header as KEY=VALUE; repeatable (http and sse only)
+* `--unset-header <UNSET_HEADER>` — Remove a header by name; repeatable (http and sse only)
+
+
+
+## `aoe mcp remove`
+
+Remove an AoE-owned MCP server
+
+**Usage:** `aoe mcp remove <NAME>`
+
+###### **Arguments:**
+
+* `<NAME>` — Name of the AoE-owned server to remove
 
 
 

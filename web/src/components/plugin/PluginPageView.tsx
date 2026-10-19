@@ -318,7 +318,7 @@ export function PluginPageView({
             ref={attachFrame}
             title={page.title}
             src={`${page.url}#${ticket.nonce}`}
-            sandbox="allow-scripts"
+            sandbox="allow-scripts allow-downloads"
             onLoad={onFrameLoad}
             // The frame would swallow the divider's mousemove events mid-drag.
             className={`flex-1 min-h-0 w-full border-0 bg-surface-900 ${dragging ? "pointer-events-none" : ""}`}

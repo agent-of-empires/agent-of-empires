@@ -309,8 +309,9 @@ export function LiveTerminalView({ session, active = true, surface = "agent", te
          is obvious which box keystrokes go to. */}
       <div
         aria-hidden="true"
+        data-pane-frame
         className={`pointer-events-none absolute inset-0 z-10 ring-inset transition-shadow ${
-          coarse ? "" : inputFocused ? "ring-2 ring-terminal-active" : "ring-1 ring-surface-700/40"
+          coarse ? "" : `ring-1 ${inputFocused ? "ring-terminal-active" : "ring-surface-700/40"}`
         }`}
       />
 
