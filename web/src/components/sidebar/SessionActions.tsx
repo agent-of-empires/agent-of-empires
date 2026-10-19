@@ -20,7 +20,7 @@ import { StatusGlyph } from "../StatusGlyph";
 import { AddProjectModal } from "./AddProjectModal";
 import type { RowModel } from "./rowModel";
 import { BulkTriageMenuItems, SingleRowMenuItems, type SingleRowActions } from "./SessionRowMenu";
-import { canTarget, type SessionAction } from "./sessionActionTargets";
+import type { SessionAction } from "./sessionActionTargets";
 import { SnoozeModal } from "./SnoozeModal";
 import type { RowBulkApi, RowContextScope } from "./types";
 import { WorkdirNameModal } from "./WorkdirNameModal";
@@ -166,7 +166,7 @@ function buildRowActions(
   const afterTarget = (action: SessionAction, fn: (s: SessionResponse) => unknown) => (sessionId: string) => {
     closeMenu();
     const session = workspace.sessions.find((s) => s.id === sessionId);
-    if (!session || !canTarget(action, session)) {
+    if (!session || !model.actionTargets[action].some((t) => t.id === sessionId)) {
       reportError("That session changed. Please try again.");
       return;
     }

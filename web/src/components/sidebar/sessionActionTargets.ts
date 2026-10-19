@@ -19,14 +19,10 @@ const ELIGIBLE: Record<SessionAction, (s: SessionResponse, archived: boolean) =>
 
 export type SessionActionTargets = Record<SessionAction, SessionResponse[]>;
 
-export function canTarget(action: SessionAction, session: SessionResponse, archived = !!session.archived_at) {
-  return ELIGIBLE[action](session, archived);
-}
-
 /** The siblings each action may act on, in row order. */
 export function resolveActionTargets(sessions: SessionResponse[], optimistic: OptimisticTriage): SessionActionTargets {
   const archivedOf = (s: SessionResponse) => effectiveArchivedOf(optimistic, !!s.archived_at);
-  const targets = (action: SessionAction) => sessions.filter((s) => canTarget(action, s, archivedOf(s)));
+  const targets = (action: SessionAction) => sessions.filter((s) => ELIGIBLE[action](s, archivedOf(s)));
   return {
     stop: targets("stop"),
     start: targets("start"),

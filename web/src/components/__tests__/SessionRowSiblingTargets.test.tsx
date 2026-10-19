@@ -5,7 +5,7 @@ import { cleanup, fireEvent, screen } from "@testing-library/react";
 
 import type { SessionResponse } from "../../lib/types";
 import { EMPTY_OPTIMISTIC } from "../../lib/sidebarOptimistic";
-import { canTarget, resolveActionTargets } from "../sidebar/sessionActionTargets";
+import { resolveActionTargets } from "../sidebar/sessionActionTargets";
 import { makeSession, makeWorkspace, openRowMenu, stubFetch } from "./fixtures";
 
 const sibling = (id: string, over: Partial<SessionResponse> = {}) => makeSession({ id, title: `title ${id}`, ...over });
@@ -45,11 +45,6 @@ describe("resolveActionTargets", () => {
     const stopped = [sibling("a", { status: "Stopped" }), sibling("b", { status: "Stopped", archived_at: "x" })];
     expect(ids(resolveActionTargets(stopped, { ...EMPTY_OPTIMISTIC, archived: true }).start)).toEqual([]);
     expect(ids(resolveActionTargets(stopped, { ...EMPTY_OPTIMISTIC, archived: false }).start)).toEqual(["a", "b"]);
-  });
-
-  it("canTarget rejects a session that left the action's state", () => {
-    expect(canTarget("stop", sibling("a", { status: "Running" }))).toBe(true);
-    expect(canTarget("stop", sibling("a", { status: "Stopped" }))).toBe(false);
   });
 });
 
@@ -101,5 +96,17 @@ describe("shared-worktree row session actions (#3387)", () => {
     fireEvent.click(screen.getAllByTestId("sidebar-context-menu-summarize-target")[1]!);
     await vi.waitFor(() => expect(fetchSpy).toHaveBeenCalled());
     expect(fetchSpy.mock.calls[0]![0]).toContain("s2");
+  });
+
+  it("Start still runs right after Unarchive, before the server drops archived_at", () => {
+    const onStart = vi.fn();
+    openRowMenu(makeWorkspace("w", [sibling("s1", { status: "Stopped", archived_at: "2026-01-01T00:00:00Z" })]), {
+      onStart,
+    });
+    expect(screen.queryByTestId("sidebar-context-menu-start")).toBeNull();
+    click("sidebar-context-menu-archive");
+    fireEvent.contextMenu(screen.getByTestId("sidebar-session-row"));
+    click("sidebar-context-menu-start");
+    expect(onStart).toHaveBeenCalledWith("s1");
   });
 });
