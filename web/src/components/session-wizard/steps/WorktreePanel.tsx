@@ -11,6 +11,7 @@ interface Props {
 
 /** Branch name, attach mode and base branch, behind the wizard's Worktree row. */
 export function WorktreePanel({ data, onChange }: Props) {
+  const hasExtraRepos = data.extraRepoPaths.length > 0;
   return (
     <div>
       <label htmlFor="wizard-worktree-branch" className="block text-sm text-text-dim mb-1.5">
@@ -30,7 +31,12 @@ export function WorktreePanel({ data, onChange }: Props) {
       <ToggleRow
         className="mt-4 cursor-pointer"
         title="Attach to existing branch"
-        description="Re-use a branch and worktree that already exist. Off creates a new branch."
+        description={
+          hasExtraRepos
+            ? "Not available with extra repositories: each repository gets its own new worktree."
+            : "Re-use a branch and worktree that already exist. Off creates a new branch."
+        }
+        disabled={hasExtraRepos}
         checked={data.attachExisting}
         onChange={(v) => onChange("attachExisting", v)}
       />

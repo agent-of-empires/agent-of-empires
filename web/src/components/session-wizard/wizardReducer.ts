@@ -162,6 +162,8 @@ function setField(data: WizardData, field: string, value: unknown): WizardData {
     (field === "extraRepoPaths" && Array.isArray(value) && value.length > 0)
   ) {
     next.scratch = false;
+    // Extra repos each get a new worktree, so they cannot share an attached primary one.
+    if (field === "extraRepoPaths") next.attachExisting = false;
     // The import picker dispatches `importAcpSessionId` after `path`, so its own pick survives.
     next.importAcpSessionId = "";
   }

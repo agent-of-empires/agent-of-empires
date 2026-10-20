@@ -66,4 +66,12 @@ describe("WorktreePanel", () => {
     renderPanel({ attachExisting: true });
     await waitFor(() => expect(screen.getByText("Could not list worktrees.")).toBeTruthy());
   });
+
+  it("disables attach mode while extra repositories are selected", () => {
+    const { onChange } = renderPanel({ extraRepoPaths: ["/repo/beta"] });
+    const toggle = screen.getByRole("switch", { name: /attach to existing branch/i });
+    fireEvent.click(toggle);
+    expect(toggle.hasAttribute("disabled") || toggle.getAttribute("aria-disabled") === "true").toBe(true);
+    expect(onChange).not.toHaveBeenCalledWith("attachExisting", true);
+  });
 });
