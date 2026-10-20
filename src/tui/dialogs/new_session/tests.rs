@@ -1210,6 +1210,17 @@ fn branch_picker_in_attach_mode_lists_only_branches_with_a_worktree() {
         let all = picker_items(create, field);
         assert!(all.contains(&"no-worktree".to_string()), "{all:?}");
     }
+
+    // A multi-repo workspace builds a new worktree per repo, so attach mode
+    // keeps the full branch list there.
+    let mut dialog = worktree_config_dialog(repo.to_string_lossy().to_string());
+    dialog.create_new_branch = false;
+    dialog.workspace_repos = vec!["/tmp/other".to_string()];
+    dialog.handle_key(ctrl_key(KeyCode::Char('p')));
+    assert!(dialog
+        .branch_picker
+        .filtered_items()
+        .contains(&&"no-worktree".to_string()));
 }
 
 #[test]

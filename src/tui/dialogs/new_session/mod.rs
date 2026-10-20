@@ -1846,9 +1846,11 @@ impl NewSessionDialog {
         let resolved = path_input::expand_tilde(&path_str);
         let resolved = std::path::Path::new(&resolved);
         // Attaching targets a branch that already has a worktree, so Name lists
-        // only those; Base still lists every branch.
-        let attach_name =
-            !self.create_new_branch && self.worktree_config_focused_field != WT_BASE_BRANCH_FIELD;
+        // only those; Base still lists every branch. A multi-repo workspace
+        // creates a fresh worktree per repo, so it keeps the full list.
+        let attach_name = !self.create_new_branch
+            && self.workspace_repos.is_empty()
+            && self.worktree_config_focused_field != WT_BASE_BRANCH_FIELD;
         let (what, listed) = if attach_name {
             let worktrees = crate::git::GitWorktree::list_branch_worktrees_at(resolved)
                 .map(|wts| wts.into_iter().filter_map(|wt| wt.branch).collect())
