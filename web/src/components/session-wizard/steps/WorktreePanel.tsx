@@ -48,13 +48,13 @@ function ExistingWorktrees({
   data: WizardData;
   onChange: (field: string, value: unknown) => void;
 }) {
-  const [loaded, setLoaded] = useState<{ path: string; rows: WorktreeInfo[] } | null>(null);
+  const [loaded, setLoaded] = useState<{ path: string; rows: WorktreeInfo[] | null } | null>(null);
 
   useEffect(() => {
     if (!data.path) return;
     let cancelled = false;
     fetchWorktrees(data.path).then((rows) => {
-      if (!cancelled) setLoaded({ path: data.path, rows: rows ?? [] });
+      if (!cancelled) setLoaded({ path: data.path, rows });
     });
     return () => {
       cancelled = true;
@@ -62,6 +62,7 @@ function ExistingWorktrees({
   }, [data.path]);
 
   if (loaded?.path !== data.path) return <p className="text-xs text-text-dim mt-2">Loading worktrees...</p>;
+  if (!loaded.rows) return <p className="text-xs text-text-dim mt-2">Could not list worktrees.</p>;
   if (loaded.rows.length === 0) return <p className="text-xs text-text-dim mt-2">No existing worktrees found.</p>;
 
   return (

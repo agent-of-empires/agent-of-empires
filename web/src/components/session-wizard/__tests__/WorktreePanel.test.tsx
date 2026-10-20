@@ -58,8 +58,12 @@ describe("WorktreePanel", () => {
     renderPanel();
     expect(fetchWorktrees).not.toHaveBeenCalled();
     cleanup();
-    fetchWorktrees.mockResolvedValue(null);
+    fetchWorktrees.mockResolvedValue([]);
     renderPanel({ attachExisting: true });
     await waitFor(() => expect(screen.getByText("No existing worktrees found.")).toBeTruthy());
+    cleanup();
+    fetchWorktrees.mockResolvedValue(null);
+    renderPanel({ attachExisting: true });
+    await waitFor(() => expect(screen.getByText("Could not list worktrees.")).toBeTruthy());
   });
 });
