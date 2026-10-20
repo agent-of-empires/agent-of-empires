@@ -140,7 +140,7 @@ export async function mockAcpSession(page: Page, opts: AcpSessionMockOptions = {
     pushEvents,
   };
 
-  await page.route("**/api/login/status", (r) => r.fulfill({ json: { required: false, authenticated: true } }));
+  await page.route("**/api/login/status*", (r) => r.fulfill({ json: { required: false, authenticated: true } }));
   for (const path of [
     "settings",
     "themes",

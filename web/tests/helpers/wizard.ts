@@ -89,7 +89,7 @@ export interface WizardMockOptions {
 /** Mock every API the dashboard and wizard read. Returns the create-session POST bodies in order. */
 export async function mockWizardApis(page: Page, opts: WizardMockOptions = {}) {
   const created: Record<string, unknown>[] = [];
-  await page.route("**/api/login/status", (r) => r.fulfill({ json: { required: false, authenticated: true } }));
+  await page.route("**/api/login/status*", (r) => r.fulfill({ json: { required: false, authenticated: true } }));
   for (const path of ["themes", "groups", "devices"])
     await page.route(`**/api/${path}`, (r) => r.fulfill({ json: [] }));
   for (const path of ["about", "system/update-status"])
