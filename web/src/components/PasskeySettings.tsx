@@ -3,10 +3,16 @@ import { fetchPasskeys, passkeysSupported, registerPasskey, removePasskey, type 
 
 export function PasskeySettings() {
   const [passkeys, setPasskeys] = useState<PasskeyInfo[] | null>(null);
+  const [loadFailed, setLoadFailed] = useState(false);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [label, setLabel] = useState(() => navigator.platform || "This device");
 
-  const load = useCallback(async () => setPasskeys(await fetchPasskeys()), []);
+  const load = useCallback(async () => {
+    const list = await fetchPasskeys();
+    if (list) setPasskeys(list);
+    setLoadFailed(list === null);
+  }, []);
 
   useEffect(() => {
     // Deferred so the state update is not synchronous in the effect body.
@@ -14,12 +20,13 @@ export function PasskeySettings() {
     return () => clearTimeout(first);
   }, [load]);
 
-  if (!passkeysSupported() || passkeys === null) return null;
+  const canAdd = passkeysSupported();
+  if (!loadFailed && (passkeys === null || (passkeys.length === 0 && !canAdd))) return null;
 
   const onAdd = async () => {
     setBusy(true);
     setError(null);
-    const result = await registerPasskey(navigator.platform || "This device");
+    const result = await registerPasskey(label);
     setBusy(false);
     if (result.ok) await load();
     else if (!result.cancelled) setError(result.error ?? "Could not add passkey");
@@ -35,7 +42,19 @@ export function PasskeySettings() {
   return (
     <div className="mt-8">
       <h3 className="font-mono text-sm uppercase tracking-widest text-text-muted mb-4">Passkeys</h3>
-      {passkeys.map((p) => (
+      {loadFailed && (
+        <div className="flex items-center gap-3 mb-3">
+          <p className="font-body text-[13px] text-status-error">Could not load passkeys</p>
+          <button
+            type="button"
+            onClick={load}
+            className="font-mono text-[11px] uppercase tracking-wider text-text-secondary border border-surface-700 rounded px-2 py-1 hover:bg-surface-700/30"
+          >
+            Retry
+          </button>
+        </div>
+      )}
+      {passkeys?.map((p) => (
         <div key={p.credential_id} className="flex items-center justify-between gap-3 py-3 border-b border-surface-700">
           <div className="min-w-0">
             <p className="font-body text-[13px] font-medium text-text-primary">{p.label}</p>
@@ -55,14 +74,26 @@ export function PasskeySettings() {
         </div>
       ))}
       {error && <p className="font-body text-[13px] text-status-error mt-2">{error}</p>}
-      <button
-        type="button"
-        onClick={onAdd}
-        disabled={busy}
-        className="mt-4 font-mono text-[11px] uppercase tracking-wider text-text-secondary border border-surface-700 rounded px-3 py-1.5 hover:bg-surface-700/30 disabled:opacity-50"
-      >
-        {busy ? "Waiting..." : "Add a passkey for this device"}
-      </button>
+      {canAdd && (
+        <div className="mt-4 flex items-center gap-2">
+          <input
+            type="text"
+            value={label}
+            onChange={(e) => setLabel(e.target.value)}
+            maxLength={64}
+            aria-label="Passkey label"
+            className="min-w-0 flex-1 px-2 py-1.5 bg-surface-900 border border-surface-700/60 rounded text-text-primary text-[13px] focus:outline-none focus:ring-2 focus:ring-brand-600"
+          />
+          <button
+            type="button"
+            onClick={onAdd}
+            disabled={busy}
+            className="shrink-0 font-mono text-[11px] uppercase tracking-wider text-text-secondary border border-surface-700 rounded px-3 py-1.5 hover:bg-surface-700/30 disabled:opacity-50"
+          >
+            {busy ? "Waiting..." : "Add a passkey for this device"}
+          </button>
+        </div>
+      )}
     </div>
   );
 }

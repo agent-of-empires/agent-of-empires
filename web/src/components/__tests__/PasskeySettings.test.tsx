@@ -39,6 +39,34 @@ describe("PasskeySettings", () => {
     expect(container.textContent).toBe("");
   });
 
+  it("keeps list and remove without browser support but hides adding", async () => {
+    passkeysSupported.mockReturnValue(false);
+    fetchPasskeys.mockResolvedValue([phone]);
+    render(<PasskeySettings />);
+    expect(await screen.findByText("Phone")).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Remove" })).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "Add a passkey for this device" })).toBeNull();
+  });
+
+  it("offers Retry when the list fails to load", async () => {
+    fetchPasskeys.mockResolvedValueOnce(null).mockResolvedValueOnce([phone]);
+    render(<PasskeySettings />);
+    expect(await screen.findByText("Could not load passkeys")).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "Retry" }));
+    expect(await screen.findByText("Phone")).toBeTruthy();
+    expect(screen.queryByText("Could not load passkeys")).toBeNull();
+  });
+
+  it("enrols with the label the user typed", async () => {
+    fetchPasskeys.mockResolvedValue([]);
+    registerPasskey.mockResolvedValue({ ok: true });
+    render(<PasskeySettings />);
+    const input = (await screen.findByLabelText("Passkey label")) as HTMLInputElement;
+    fireEvent.change(input, { target: { value: "Work laptop" } });
+    fireEvent.click(screen.getByRole("button", { name: "Add a passkey for this device" }));
+    await waitFor(() => expect(registerPasskey).toHaveBeenCalledWith("Work laptop"));
+  });
+
   it("lists passkeys and reloads after adding one", async () => {
     fetchPasskeys
       .mockResolvedValueOnce([phone])
