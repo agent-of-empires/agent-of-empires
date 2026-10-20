@@ -1467,15 +1467,20 @@ mod tests {
             .await
             .unwrap();
             let mut chunks = Vec::new();
-            while chunks.len() < 204 {
+            let mut resets = 0;
+            let mut assigned = false;
+            while chunks.len() < 204 || !assigned {
                 match client.next_event().await.unwrap() {
                     Event::AgentMessageChunk { text, .. } => chunks.push(text),
+                    Event::SessionContextReset { .. } => resets += 1,
+                    Event::AcpSessionAssigned { .. } => assigned = true,
                     Event::AgentStartupError { message } => panic!("{message}"),
                     _ => {}
                 }
             }
             callbacks_ready.await.unwrap();
             client.shutdown().await.unwrap();
+            assert_eq!(resets, 1, "a different runner id announces one reset");
             assert_eq!(
                 chunks,
                 (0..204)
@@ -1491,6 +1496,80 @@ mod tests {
         .await
         .unwrap();
     }
+    #[tokio::test]
+    async fn same_id_reattach_announces_no_reset() {
+        use crate::acp::acp_client::AcpClient;
+        use crate::acp::state::AcpSessionId;
+        let temp = tempfile::tempdir().unwrap();
+        let socket = temp.path().join("same-id.sock");
+        let control = crate::process::worker::control_socket_sibling(&socket);
+        let listener = tokio::net::UnixListener::bind(control).unwrap();
+        let runner = async {
+            let (mut peer, _) = listener.accept().await.unwrap();
+            control_protocol::write_frame(
+                &mut peer,
+                &ControlBody::Hello {
+                    control_protocol_version: control_protocol::CONTROL_PROTOCOL_VERSION,
+                    session_id: "same-id".into(),
+                },
+            )
+            .await
+            .unwrap();
+            while let Some(frame) = control_protocol::read_frame(&mut peer).await.unwrap() {
+                match frame {
+                    ControlBody::Attach { .. } => {}
+                    ControlBody::Initialize { .. } => {
+                        control_protocol::write_frame(&mut peer, &ControlBody::Initialized {
+                            result: serde_json::json!({"protocolVersion":1,"agentCapabilities":{}}),
+                        }).await.unwrap();
+                    }
+                    ControlBody::ResumeSession => {
+                        control_protocol::write_frame(
+                            &mut peer,
+                            &ControlBody::SessionReady {
+                                acp_session_id: "actual".into(),
+                                result: serde_json::json!({}),
+                            },
+                        )
+                        .await
+                        .unwrap();
+                    }
+                    other => panic!("unexpected frame {other:?}"),
+                }
+            }
+        };
+        let daemon = async {
+            let mut client = AcpClient::attach(
+                socket,
+                temp.path().into(),
+                vec![],
+                "actual".into(),
+                true,
+                AcpSessionId("same-id".into()),
+                None,
+                "codex".into(),
+                None,
+            )
+            .await
+            .unwrap();
+            // The reset, when emitted, precedes the assignment.
+            loop {
+                match client.next_event().await.unwrap() {
+                    Event::SessionContextReset { .. } => panic!("same id must not reset"),
+                    Event::AcpSessionAssigned { .. } => break,
+                    Event::AgentStartupError { message } => panic!("{message}"),
+                    _ => {}
+                }
+            }
+            client.shutdown().await.unwrap();
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            tokio::join!(runner, daemon);
+        })
+        .await
+        .unwrap();
+    }
+
     #[tokio::test]
     async fn native_identity_reattach_preserves_a_full_wire_byte_backlog() {
         use crate::acp::acp_client::AcpClient;
