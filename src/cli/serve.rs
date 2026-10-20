@@ -953,7 +953,7 @@ pub async fn run(profile: &str, mut args: ServeArgs, serve_lock: Option<ServeLoc
     if args.daemon {
         // The child takes its own lock before its own startup migrations.
         drop(serve_lock);
-        return start_daemon(profile, &args);
+        return start_daemon(profile, &args).map(|_| ());
     }
     let _serve_lock = serve_lock;
 
@@ -1087,7 +1087,7 @@ async fn fetch_cityhall_bundle(url: &str, token: &str) -> Result<String> {
     Ok(response.text().await?)
 }
 
-fn start_daemon(profile: &str, args: &ServeArgs) -> Result<()> {
+fn start_daemon(profile: &str, args: &ServeArgs) -> Result<std::process::Child> {
     use std::process::{Command, Stdio};
 
     let _state_lock = lock_serve_state()?;
@@ -1221,7 +1221,7 @@ fn start_daemon(profile: &str, args: &ServeArgs) -> Result<()> {
 
     println!("aoe serve started as daemon (PID {})", pid);
     println!("Stop with: aoe serve --stop");
-    Ok(())
+    Ok(child)
 }
 
 #[tracing::instrument(target = "serve.lifecycle", skip_all)]
@@ -1280,7 +1280,33 @@ pub async fn restart_daemon() -> Result<()> {
 
     println!("Restarting aoe serve daemon (PID {pid})…");
     stop_daemon().await?;
-    start_daemon(&launch.profile, &args)
+    let child = start_daemon(&launch.profile, &args)?;
+    await_replacement_startup(child).await
+}
+
+const REPLACEMENT_STARTUP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// The replacement child runs its own startup migrations, so it can exit
+/// before serving. `serve.url` appears once it is bound; a child still
+/// starting at the deadline is left to finish.
+async fn await_replacement_startup(mut child: std::process::Child) -> Result<()> {
+    let ready = crate::session::get_app_dir()?.join("serve.url");
+    let deadline = std::time::Instant::now() + REPLACEMENT_STARTUP_TIMEOUT;
+    while std::time::Instant::now() < deadline {
+        if ready.exists() {
+            return Ok(());
+        }
+        if let Some(status) = child.try_wait()? {
+            let log = stdio_redirect_path()
+                .map(|p| format!(" See {}.", p.display()))
+                .unwrap_or_default();
+            bail!(
+                "The replacement daemon exited during startup ({status}); the old daemon is already stopped.{log}"
+            );
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    Ok(())
 }
 
 fn report_stale_cleanup(pid: i32) {
