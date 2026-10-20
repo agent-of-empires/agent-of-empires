@@ -432,6 +432,7 @@ export function SettingsView({
       activeTab !== "plugins" &&
       activeTab !== "telemetry" &&
       activeTab !== "cityhall" &&
+      activeTab !== "logs" &&
       activeTab !== "panels"
     ) {
       return <div className="text-sm text-text-dim">Loading settings...</div>;
