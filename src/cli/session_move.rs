@@ -56,7 +56,12 @@ pub async fn run(profile: &str, args: MoveArgs) -> Result<()> {
     }
 
     let authoritative = source.load()?;
-    crate::tmux::refresh_session_cache();
+    if matches!(
+        crate::tmux::refresh_session_cache(),
+        crate::tmux::SessionCacheRefresh::Unknown
+    ) {
+        bail!("Cannot determine whether tmux sessions are running; refusing to move");
+    }
     let mut batch = Vec::with_capacity(ids.len());
     for id in &ids {
         let mut live = authoritative
