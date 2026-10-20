@@ -134,7 +134,6 @@ pub struct App {
     // Actions that need the async loop, picked up after `execute_action`.
     pending_structured_view_open: Option<String>,
     pending_view_switch: Option<String>,
-    pending_daemon_start_open: Option<String>,
     pending_smart_rename: Option<String>,
     /// Outcome line of an in-flight "Auto-name now", which waits for the agent's one-shot.
     smart_rename_rx: Option<tokio::sync::oneshot::Receiver<Result<(), String>>>,
@@ -327,7 +326,6 @@ impl App {
             host_title: super::host_title::HostTitleTracker::default(),
             mosh_active,
             pending_structured_view_open: None,
-            pending_daemon_start_open: None,
             preview_mount_pending: None,
             pending_view_switch: None,
             pending_smart_rename: None,
@@ -1140,9 +1138,6 @@ impl App {
                                 self.execute_action(action, terminal)?;
                                 if let Some(session_id) = self.pending_view_switch.take() {
                                     self.perform_view_switch(&session_id, terminal).await;
-                                }
-                                if let Some(session_id) = self.pending_daemon_start_open.take() {
-                                    self.start_daemon_then_open(&session_id, terminal).await;
                                 }
                                 if let Some(session_id) = self.pending_smart_rename.take() {
                                     self.perform_smart_rename(&session_id).await;
@@ -2216,9 +2211,6 @@ impl App {
         if let Some(session_id) = self.pending_view_switch.take() {
             self.perform_view_switch(&session_id, terminal).await;
         }
-        if let Some(session_id) = self.pending_daemon_start_open.take() {
-            self.start_daemon_then_open(&session_id, terminal).await;
-        }
         if let Some(session_id) = self.pending_structured_view_open.take() {
             self.open_structured_view(&session_id).await?;
         }
@@ -2231,7 +2223,7 @@ impl App {
 
     /// On-demand "Auto-name now"; the new title arrives through the file watcher.
     async fn perform_smart_rename(&mut self, session_id: &str) {
-        use crate::acp::client::{require_daemon, HttpClient, ManagerError};
+        use crate::acp::client::{locate_daemon, HttpClient, ManagerError};
 
         // A second request would replace the receiver and lose the first one's result.
         if self.smart_rename_rx.is_some() {
@@ -2244,7 +2236,7 @@ impl App {
             .map(|i| i.title.clone())
             .unwrap_or_default();
 
-        let endpoint = match require_daemon().await {
+        let endpoint = match locate_daemon().await {
             Ok(e) => e,
             Err(ManagerError::NoDaemonRunning(_)) => {
                 self.set_status(
@@ -2299,10 +2291,9 @@ impl App {
         }
     }
 
-    /// POST the view switch, starting a local daemon first if needed: the user
-    /// just confirmed a dialog saying the agent restarts under `aoe serve`.
+    /// POST the view switch, starting a local daemon first if needed.
     async fn perform_view_switch(&mut self, session_id: &str, terminal: &mut Terminal<TuiBackend>) {
-        use crate::acp::client::{require_daemon, HttpClient, ManagerError};
+        use crate::acp::client::{ensure_daemon, HttpClient};
 
         let Some(inst) = self.home.get_instance(session_id) else {
             return;
@@ -2310,23 +2301,24 @@ impl App {
         let to_structured = !inst.is_structured();
         let title = inst.title.clone();
 
-        let endpoint = match require_daemon().await {
-            Ok(e) => e,
-            Err(ManagerError::NoDaemonRunning(_)) => {
-                self.set_status("Starting local daemon for the view switch…");
-                let _ = self.draw(terminal);
-                match crate::tui::dialogs::start_local_daemon_and_wait().await {
-                    Ok(e) => e,
-                    Err(e) => {
-                        // The log-tail hint is multi-line; a status is one row.
-                        let first = e.lines().next().unwrap_or("unknown error");
-                        self.set_status(format!("view switch failed: {first}"));
-                        return;
-                    }
+        self.set_status("Connecting to the daemon…");
+        let _ = self.draw(terminal);
+        let endpoint = match ensure_daemon().await {
+            Ok((endpoint, started)) => {
+                if let Some(pid) = started {
+                    tracing::info!(target: "tui.daemon", pid, "started aoe daemon");
                 }
+                endpoint
             }
             Err(e) => {
-                self.set_status(format!("daemon unreachable: {e}"));
+                // The failure hint is multi-line; a status is one row.
+                let first = e
+                    .to_string()
+                    .lines()
+                    .next()
+                    .unwrap_or("unknown error")
+                    .to_string();
+                self.set_status(format!("view switch failed: {first}"));
                 return;
             }
         };
@@ -2349,10 +2341,10 @@ impl App {
         });
     }
 
-    /// Enter the structured view, mounting it first if needed, or offer to
-    /// start a daemon when none runs.
+    /// Enter the structured view, mounting it first if needed and starting a
+    /// local daemon when none runs.
     async fn open_structured_view(&mut self, session_id: &str) -> Result<()> {
-        use crate::acp::client::{require_daemon, ManagerError};
+        use crate::acp::client::ensure_daemon;
 
         // Archived rows render a placeholder; an active view would capture keys invisibly.
         if self
@@ -2376,18 +2368,24 @@ impl App {
                 .await;
             return Ok(());
         }
-        match require_daemon().await {
-            Ok(endpoint) => {
+        match ensure_daemon().await {
+            Ok((endpoint, started)) => {
                 self.connect_embedded_structured(endpoint, session_id).await;
                 self.activate_embedded();
                 self.drain_pending_paste_for_structured_view(session_id)
                     .await;
-            }
-            Err(ManagerError::NoDaemonRunning(_)) => {
-                self.home.prompt_start_daemon_for_structured(session_id);
+                if let Some(pid) = started {
+                    self.set_status(format!("Started aoe daemon (pid {pid})"));
+                }
             }
             Err(e) => {
-                self.set_status(format!("structured view: {e}"));
+                let first = e
+                    .to_string()
+                    .lines()
+                    .next()
+                    .unwrap_or("unknown error")
+                    .to_string();
+                self.set_status(format!("structured view: {first}"));
             }
         }
         Ok(())
@@ -2442,28 +2440,6 @@ impl App {
     /// No `needs_redraw`: the diffed draw covers the pane, a full clear would flash.
     fn close_embedded_structured(&mut self) {
         self.home.structured_preview = None;
-    }
-
-    async fn start_daemon_then_open(
-        &mut self,
-        session_id: &str,
-        terminal: &mut Terminal<TuiBackend>,
-    ) {
-        self.update_status = Some(UpdateStatus::transient("Starting local daemon…".into()));
-        let _ = self.draw(terminal);
-        match crate::tui::dialogs::start_local_daemon_and_wait().await {
-            Ok(endpoint) => {
-                self.update_status = None;
-                self.connect_embedded_structured(endpoint, session_id).await;
-                self.activate_embedded();
-                self.drain_pending_paste_for_structured_view(session_id)
-                    .await;
-            }
-            Err(e) => {
-                let first = e.lines().next().unwrap_or("unknown error");
-                self.set_status(format!("daemon start failed: {first}"));
-            }
-        }
     }
 
     /// Keep a streaming preview mounted for the selected structured session,
@@ -2698,7 +2674,6 @@ impl App {
             // These need the async loop, which drains them after this returns.
             Action::OpenStructuredView(id) => self.pending_structured_view_open = Some(id),
             Action::SwitchSessionView(id) => self.pending_view_switch = Some(id),
-            Action::StartDaemonThenOpenStructured(id) => self.pending_daemon_start_open = Some(id),
             Action::SmartRenameNow(id) => self.pending_smart_rename = Some(id),
         }
         Ok(())
@@ -3227,7 +3202,6 @@ pub enum Action {
     // Stashed for the async loop.
     OpenStructuredView(String),
     SwitchSessionView(String),
-    StartDaemonThenOpenStructured(String),
     SmartRenameNow(String),
 }
 
