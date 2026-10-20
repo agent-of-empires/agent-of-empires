@@ -192,6 +192,46 @@ pub(crate) fn attest_observed_default_store(
     true
 }
 
+/// A Claude `--store` must be the config root holding the transcript. A
+/// `projects` directory, or `projects/<encoded cwd>`, is rejected even when a
+/// nested transcript exists, since exporting it as `CLAUDE_CONFIG_DIR` is what
+/// nests the tree.
+fn ensure_claude_store_root(
+    store: &std::path::Path,
+    cwd: &std::path::Path,
+    sid: &str,
+) -> Result<()> {
+    let encoded = crate::session::capture::encode_claude_project_path(
+        &crate::session::capture::canonicalize_or_raw(&cwd.to_string_lossy()).to_string_lossy(),
+    );
+    let named = |p: &std::path::Path, name: &str| p.file_name().is_some_and(|n| n == name);
+    let parent = store.parent();
+    let root = if named(store, "projects") {
+        parent
+    } else if named(store, &encoded) && parent.is_some_and(|p| named(p, "projects")) {
+        parent.and_then(|p| p.parent())
+    } else {
+        None
+    };
+    if let Some(root) = root {
+        anyhow::bail!(
+            "--store must be the Claude config root (the directory containing projects/), not a projects subdirectory; use {}",
+            root.display()
+        );
+    }
+    anyhow::ensure!(
+        !crate::session::capture::claude_host_transcript_confirmed_absent(
+            &cwd.to_string_lossy(),
+            sid,
+            &[],
+            Some(store),
+        ),
+        "no transcript for this conversation under {}/projects; --store must be the Claude config root (the directory containing projects/)",
+        store.display()
+    );
+    Ok(())
+}
+
 /// Whether a reserved (`Preallocated`) Claude id has its transcript in the
 /// binding's own store, which proves it names a resumable conversation.
 ///
@@ -199,37 +239,6 @@ pub(crate) fn attest_observed_default_store(
 /// resume nor a `/tmp` wipe, so without this a session can stay `Preallocated`
 /// for good and be refused as a fork parent despite holding a complete
 /// transcript. Existence uses the same probe as the `--resume` arm.
-fn ensure_claude_store_root(
-    store: &std::path::Path,
-    cwd: &std::path::Path,
-    sid: &str,
-) -> Result<()> {
-    if !crate::session::capture::claude_host_transcript_confirmed_absent(
-        &cwd.to_string_lossy(),
-        sid,
-        &[],
-        Some(store),
-    ) {
-        return Ok(());
-    }
-    let is_projects = |p: &std::path::Path| p.file_name().is_some_and(|n| n == "projects");
-    let root = [Some(store), store.parent()]
-        .into_iter()
-        .flatten()
-        .find(|p| is_projects(p))
-        .and_then(|p| p.parent());
-    match root {
-        Some(root) => anyhow::bail!(
-            "--store must be the Claude config root (the directory containing projects/), not a projects subdirectory; use {}",
-            root.display()
-        ),
-        None => anyhow::bail!(
-            "no transcript for this conversation under {}/projects; --store must be the Claude config root (the directory containing projects/)",
-            store.display()
-        ),
-    }
-}
-
 pub(super) fn transcript_confirms_reserved_claude_conversation(
     binding: &ConversationBinding,
 ) -> bool {
@@ -3037,6 +3046,11 @@ mod tests {
         std::fs::write(project_dir.join(format!("{sid}.jsonl")), "{}\n").unwrap();
         check(root.path()).unwrap();
 
+        // The tree the bug produced: a transcript nested under the wrong dir.
+        let nested = project_dir.join("projects").join(&encoded);
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::write(nested.join(format!("{sid}.jsonl")), "{}\n").unwrap();
+
         for wrong in [&projects, &project_dir] {
             let err = check(wrong).unwrap_err().to_string();
             assert!(
@@ -3044,6 +3058,13 @@ mod tests {
                 "{err}"
             );
         }
+
+        // A root merely living under a directory named `projects` is fine.
+        let under = root.path().join("projects").join("claude-home");
+        let dir = under.join("projects").join(&encoded);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(format!("{sid}.jsonl")), "{}\n").unwrap();
+        check(&under).unwrap();
     }
 
     #[cfg(unix)]
