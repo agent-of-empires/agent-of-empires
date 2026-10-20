@@ -1528,18 +1528,32 @@ fn wait_decision(
     }
 }
 
-/// Confirmed absence only; an unreachable tmux server leaves the status a plain `Error`.
-fn status_reports_termination(status: Status, last_error: Option<&str>) -> bool {
-    status == Status::Stopped
-        || (status == Status::Error && last_error == Some(crate::session::TMUX_SESSION_GONE_ERROR))
+/// Confirmed absence only. An unreachable tmux server leaves a plain `Error`, and a launch that
+/// holds the reservation has not created its pane yet.
+fn is_terminated(
+    status: Status,
+    last_error: Option<&str>,
+    launching: bool,
+    existence: crate::tmux::SessionExistence,
+) -> bool {
+    !launching
+        && (status == Status::Stopped
+            || (status == Status::Error
+                && last_error == Some(crate::session::TMUX_SESSION_GONE_ERROR))
+            // A capture that loses a vanishing pane reads as Idle, so recheck the pane itself.
+            || existence == crate::tmux::SessionExistence::Absent)
 }
 
-/// Also rechecks the pane, since a capture that loses a vanishing pane reads as `Idle`.
 fn confirmed_terminated(inst: &Instance) -> bool {
-    status_reports_termination(inst.status, inst.last_error.as_deref())
-        || inst.tmux_session().is_ok_and(|session| {
-            matches!(session.existence(), crate::tmux::SessionExistence::Absent)
-        })
+    let existence = inst
+        .tmux_session()
+        .map_or(crate::tmux::SessionExistence::Unknown, |s| s.existence());
+    is_terminated(
+        inst.status,
+        inst.last_error.as_deref(),
+        inst.has_fresh_launch_reservation(chrono::Utc::now()),
+        existence,
+    )
 }
 
 /// Take durable lifecycle fields from the stored row, keeping `live`'s detection state.
@@ -1578,6 +1592,7 @@ async fn wait_session(profile: &str, args: WaitArgs) -> Result<()> {
             live = adopt_stored(&live, stored, profile);
             live.update_status_with_metadata(None, None);
         }
+        tracing::debug!(target: "cli.session", "wait poll status={}", live.status.as_str());
         let elapsed = start.elapsed();
         // The poll may have lost a vanishing pane; reread liveness before deciding.
         crate::tmux::refresh_session_cache();
@@ -3864,7 +3879,7 @@ mod show_json_tests {
 
 #[cfg(test)]
 mod wait_decision_tests {
-    use super::{adopt_stored, status_reports_termination, wait_decision, WaitDecision};
+    use super::{adopt_stored, is_terminated, wait_decision, WaitDecision};
     use crate::session::{
         Instance, LifecycleOperation, Status, TMUX_SERVER_UNREACHABLE_ERROR,
         TMUX_SESSION_GONE_ERROR,
@@ -3923,18 +3938,42 @@ mod wait_decision_tests {
 
     #[test]
     fn only_confirmed_absence_is_termination() {
+        use crate::tmux::SessionExistence::{Absent, Present, Unknown};
         let cases = [
-            (Status::Stopped, None, true),
-            (Status::Error, Some(TMUX_SESSION_GONE_ERROR), true),
-            (Status::Error, Some(TMUX_SERVER_UNREACHABLE_ERROR), false),
-            (Status::Error, None, false),
-            (Status::Idle, Some(TMUX_SESSION_GONE_ERROR), false),
+            (Status::Stopped, None, false, Present, true),
+            (
+                Status::Error,
+                Some(TMUX_SESSION_GONE_ERROR),
+                false,
+                Present,
+                true,
+            ),
+            (
+                Status::Error,
+                Some(TMUX_SERVER_UNREACHABLE_ERROR),
+                false,
+                Unknown,
+                false,
+            ),
+            (Status::Error, None, false, Unknown, false),
+            (
+                Status::Idle,
+                Some(TMUX_SESSION_GONE_ERROR),
+                false,
+                Present,
+                false,
+            ),
+            // a capture that lost the pane reads Idle; the pane check still catches it
+            (Status::Idle, None, false, Absent, true),
+            // a launch holding its reservation has no pane yet
+            (Status::Starting, None, true, Absent, false),
+            (Status::Stopped, None, true, Absent, false),
         ];
-        for (status, last_error, want) in cases {
+        for (status, last_error, launching, existence, want) in cases {
             assert_eq!(
-                status_reports_termination(status, last_error),
+                is_terminated(status, last_error, launching, existence),
                 want,
-                "{status:?} {last_error:?}"
+                "{status:?} {last_error:?} launching={launching} {existence:?}"
             );
         }
     }
