@@ -137,10 +137,11 @@ fn read_tail(path: &Path, lines: usize) -> std::io::Result<(String, usize, bool)
 }
 
 /// Each pattern keeps capture group 1 (the key) and replaces the value.
-static REDACTORS: LazyLock<[Regex; 3]> = LazyLock::new(|| {
+static REDACTORS: LazyLock<[Regex; 4]> = LazyLock::new(|| {
     [
         r#"(?i)((?:set-)?cookie["']?\s*[:=]\s*)(?:"[^"]*"|'[^']*'|[^\r\n]+)"#,
-        r#"(?i)(authorization["']?\s*[:=]\s*["']?)[^\r\n"']+"#,
+        r#"(?i)(authorization["']?\s*[:=]\s*["'])[^\r\n"']+"#,
+        r#"(?i)(authorization["']?\s*[:=]\s*)[^\s"'][^\r\n]*"#,
         r#"(?i)((?:\w*token|passphrase|api[_-]?key|\w*password|\w*secret)["']?\s*[:=]\s*)(?:"[^"]*"|'[^']*'|[^\s&"',;]+)"#,
     ]
     .map(|p| Regex::new(p).expect("static redaction pattern"))
@@ -184,6 +185,10 @@ mod tests {
                 "Authorization: [REDACTED]",
             ),
             ("Authorization: abc123 next", "Authorization: [REDACTED]"),
+            (
+                r#"Authorization: Digest username="alice", response="xyz""#,
+                "Authorization: [REDACTED]",
+            ),
             (
                 r#"{"access_token":"s3cret","a":1}"#,
                 r#"{"access_token":[REDACTED],"a":1}"#,
