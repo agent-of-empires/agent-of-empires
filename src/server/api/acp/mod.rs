@@ -129,11 +129,13 @@ async fn persist_failure_response(
         session = %id,
         "failed to persist {what}: {err:#}"
     );
+    // `shutdown_and_wait` can return Ok at its deadline without a confirmed stop.
     let stopped = state
         .acp_supervisor
         .shutdown_and_wait(id, std::time::Duration::from_secs(5))
         .await
-        .is_ok();
+        .is_ok()
+        && state.acp_supervisor.worker_state(id).await == crate::daemon::AcpWorkerState::Absent;
     let outcome = if stopped {
         "the worker was stopped and the stored value is unchanged; retry"
     } else {
