@@ -281,6 +281,20 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
         );
     }
 
+    if let Some(effort) = args.effort.as_deref().map(str::trim) {
+        let agent = crate::acp::pick_acp_agent_name(
+            &crate::acp::agent_registry::AgentRegistry::with_defaults(),
+            &config.session,
+            &config.acp,
+            &resolved_tool,
+            args.agent.as_deref(),
+        );
+        let choices = crate::acp::option_catalog::thought_level_choices(&agent);
+        if let Some(warning) = check_effort_request(effort, wants_structured, &agent, &choices)? {
+            eprintln!("warning: {warning}");
+        }
+    }
+
     if args.fork_from.is_some() {
         if explicit_worktree_branch(&args).is_some() || args.create_branch {
             bail!(
@@ -689,38 +703,23 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
         .filter(|value| !value.is_empty())
         .map(str::to_string);
 
-    if let Some(effort) = explicit_effort.as_deref() {
-        let checked = if instance.is_structured() {
-            check_effort(
-                &agent_name,
-                effort,
-                &crate::acp::option_catalog::thought_level_choices(&agent_name),
-            )
-        } else {
-            Err(anyhow::anyhow!(
-                "--effort needs the structured view, but this session uses the terminal view.\n\
-                 Pass --agent or --structured-view with an installed ACP adapter."
-            ))
-        };
-        match checked {
-            Ok(Some(warning)) => eprintln!("warning: {warning}"),
-            Ok(None) => {}
-            Err(e) => {
-                cleanup_partial_session(
-                    &path,
-                    instance.worktree_info.as_ref(),
-                    instance.workspace_info.as_ref(),
-                    args.create_branch,
-                    if instance.scratch {
-                        Some(std::path::Path::new(&instance.project_path))
-                    } else {
-                        None
-                    },
-                    None,
-                );
-                return Err(e);
-            }
-        }
+    if explicit_effort.is_some() && !instance.is_structured() {
+        cleanup_partial_session(
+            &path,
+            instance.worktree_info.as_ref(),
+            instance.workspace_info.as_ref(),
+            args.create_branch,
+            if instance.scratch {
+                Some(std::path::Path::new(&instance.project_path))
+            } else {
+                None
+            },
+            None,
+        );
+        bail!(
+            "--effort needs the structured view, but the ACP adapter is not installed.\n\
+             Run `aoe acp doctor --fix`, then re-run."
+        );
     }
 
     if instance.is_structured() {
@@ -1248,6 +1247,20 @@ fn prompt_session_title(default_title: &str) -> Result<String> {
     })
 }
 
+/// Refuse `--effort` on a session that will not be structured, then check it
+/// against the agent's choices.
+fn check_effort_request(
+    effort: &str,
+    wants_structured: bool,
+    agent: &str,
+    choices: &[String],
+) -> Result<Option<String>> {
+    if !wants_structured {
+        bail!("--effort needs the structured view; pass --agent or --structured-view");
+    }
+    check_effort(agent, effort, choices)
+}
+
 /// Fail when the agent's thought-level choices are known and `effort` is not
 /// one of them; warn when they are not known yet.
 fn check_effort(agent: &str, effort: &str, choices: &[String]) -> Result<Option<String>> {
@@ -1513,8 +1526,8 @@ fn resolve_sandbox_image(
 #[cfg(test)]
 mod tests {
     use super::{
-        check_effort, hooks_when_trust_declined, override_launch_binary, parse_repo_base,
-        resolve_sandbox_image,
+        check_effort, check_effort_request, hooks_when_trust_declined, override_launch_binary,
+        parse_repo_base, resolve_sandbox_image,
     };
     use crate::session::config::repo_config::TrustSurface;
     use crate::session::config::SessionConfig;
@@ -2059,5 +2072,17 @@ mod tests {
         assert!(err.contains("low, high"), "{err}");
         let warning = check_effort("codex", "ultra", &[]).unwrap();
         assert!(warning.is_some_and(|w| w.contains("unchecked")));
+    }
+
+    #[test]
+    fn check_effort_request_refuses_unstructured_before_checking_choices() {
+        let known = ["high".to_string()];
+        let err = check_effort_request("high", false, "codex", &known).unwrap_err();
+        assert!(err.to_string().contains("structured view"), "{err}");
+        assert_eq!(
+            check_effort_request("high", true, "codex", &known).unwrap(),
+            None
+        );
+        assert!(check_effort_request("ultra", true, "codex", &known).is_err());
     }
 }
