@@ -137,7 +137,7 @@ fn read_tail(path: &Path, lines: usize) -> std::io::Result<(String, usize, bool)
 static REDACTORS: LazyLock<[Regex; 3]> = LazyLock::new(|| {
     [
         r#"(?i)((?:set-)?cookie["']?\s*[:=]\s*)(?:"[^"]*"|'[^']*'|[^\r\n]+)"#,
-        r#"(?i)(authorization["']?\s*[:=]\s*["']?(?:bearer|basic)\s+)[^\s"']+"#,
+        r#"(?i)(authorization["']?\s*[:=]\s*["']?)[^\r\n"']+"#,
         r#"(?i)((?:\w*token|passphrase|api[_-]?key)["']?\s*[:=]\s*)(?:"[^"]*"|'[^']*'|[^\s&"',;]+)"#,
     ]
     .map(|p| Regex::new(p).expect("static redaction pattern"))
@@ -169,12 +169,18 @@ mod tests {
             ),
             (
                 "Authorization: Bearer eyJ.abc.def",
-                "Authorization: Bearer [REDACTED]",
+                "Authorization: [REDACTED]",
             ),
             (
                 "authorization: basic dXNlcjpwdw==",
-                "authorization: basic [REDACTED]",
+                "authorization: [REDACTED]",
             ),
+            ("Authorization: Token abc", "Authorization: [REDACTED]"),
+            (
+                "Authorization: Digest a=1, b=2",
+                "Authorization: [REDACTED]",
+            ),
+            ("Authorization: abc123 next", "Authorization: [REDACTED]"),
             (
                 r#"{"access_token":"s3cret","a":1}"#,
                 r#"{"access_token":[REDACTED],"a":1}"#,
@@ -183,11 +189,11 @@ mod tests {
             ("Cookie: sid=1; t=2", "Cookie: [REDACTED]"),
             (
                 r#"{"authorization": "Bearer x", "cookie": "sid=1"}"#,
-                r#"{"authorization": "Bearer [REDACTED]", "cookie": [REDACTED]}"#,
+                r#"{"authorization": "[REDACTED]", "cookie": [REDACTED]}"#,
             ),
             (
                 r#"authorization="Bearer x" ok"#,
-                r#"authorization="Bearer [REDACTED]" ok"#,
+                r#"authorization="[REDACTED]" ok"#,
             ),
             (
                 "a token=1 and passphrase=2",
