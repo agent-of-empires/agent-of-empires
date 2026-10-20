@@ -1,5 +1,5 @@
 /* eslint-disable react-refresh/only-export-components */
-import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import { useCallback, useEffect, useMemo, useState, type ReactNode } from "react";
 import { useServerDown, OFFLINE_TITLE } from "../lib/connectionState";
 import { ConnectedDevices } from "./ConnectedDevices";
 import { PasskeySettings } from "./PasskeySettings";
@@ -18,7 +18,7 @@ import {
   type SaveOutcome,
   type SettingsResponse,
 } from "../lib/api";
-import { confirmThemeWrite } from "../lib/confirmThemeWrite";
+import { claimThemeWrite, confirmThemeWrite, isLatestThemeWrite } from "../lib/themeWrites";
 import { dispatchThemePickerChanged } from "../hooks/useResolvedTheme";
 import { loadSettings, saveField, useProfileSettings } from "../lib/settingsStore";
 import type { ProfileInfo, SettingsFieldDescriptor } from "../lib/types";
@@ -307,7 +307,6 @@ export function SettingsView({
   // renderer builds sandbox/worktree from this; empty until the one-shot fetch
   // resolves, at which point those tabs populate.
   const [schema, setSchema] = useState<SettingsFieldDescriptor[]>([]);
-  const latestThemePick = useRef(0);
   const [schemaLoading, setSchemaLoading] = useState(true);
   const [schemaError, setSchemaError] = useState<string | null>(null);
   // Search indexes the curated schema in CityHall mode, so it cannot offer a
@@ -416,26 +415,32 @@ export function SettingsView({
     (section: string, field: string, value: unknown): Promise<boolean> => {
       const overridable = schema.some((d) => d.section === section && d.field === field && d.profile_overridable);
       if (overridable) return sendSave(section, field, value);
-      // The picker repaints on true, so an unconfirmed write counts only once a fetch shows it.
-      // The store resends one that stays unconfirmed; a resend that commits repaints from here.
-      const pick = field === "name" ? ++latestThemePick.current : latestThemePick.current;
+      // The picker repaints on true, so an unconfirmed write counts only once a fetch shows it, and
+      // a pick that a newer one has superseded neither saves nor repaints. The store resends a
+      // write that stays unconfirmed; a resend that commits, or a later GET showing it saved,
+      // repaints from here instead.
+      const claim = claimThemeWrite(field);
       let outcome: SaveOutcome | undefined;
       let sends = 0;
       let repainted = false;
-      const send = async () => {
+      const repaint = () => {
+        if (field !== "name" || repainted || !isLatestThemeWrite(field, claim)) return;
+        repainted = true;
+        dispatchThemePickerChanged(typeof value === "string" && value ? value : undefined);
+      };
+      const send = async (): Promise<SaveOutcome> => {
+        if (!isLatestThemeWrite(field, claim)) return "committed";
         const resend = sends++ > 0;
         outcome = await updateTheme({ [field]: value });
-        if (resend && outcome === "committed" && field === "name" && !repainted && pick === latestThemePick.current) {
-          repainted = true;
-          dispatchThemePickerChanged(typeof value === "string" && value ? value : undefined);
-        }
+        if (resend && outcome === "committed") repaint();
         return outcome;
       };
-      return saveField(selectedProfile, section, field, value, send).then(async (ok) => {
+      return saveField(selectedProfile, section, field, value, send, 0, repaint).then(async (ok) => {
         const saved =
           ok && (outcome === "committed" || (outcome === "uncertain" && (await confirmThemeWrite(field, value))));
-        if (saved) repainted = true;
-        return saved;
+        if (!saved || repainted || !isLatestThemeWrite(field, claim)) return false;
+        repainted = true;
+        return true;
       });
     },
     [schema, selectedProfile, sendSave],

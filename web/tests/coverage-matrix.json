@@ -3882,7 +3882,7 @@
         "web/src/components/settings/SchemaSection.tsx",
         "web/src/components/SettingsView.tsx",
         "web/src/hooks/useResolvedTheme.ts",
-        "web/src/lib/confirmThemeWrite.ts"
+        "web/src/lib/themeWrites.ts"
       ]
     },
     {
@@ -4678,7 +4678,7 @@
       "components": [
         "web/src/components/onboarding/ThemeIntro.tsx",
         "web/src/hooks/useThemeMutation.ts",
-        "web/src/lib/confirmThemeWrite.ts"
+        "web/src/lib/themeWrites.ts"
       ]
     },
     {
