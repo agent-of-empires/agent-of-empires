@@ -106,6 +106,41 @@ fn supervisor_error_response(context: &str, err: &SupervisorError) -> Response {
     (status, body).into_response()
 }
 
+/// Whether a launch error is a failed storage write rather than one of the
+/// typed refusals `launch_error_response` maps.
+fn is_store_write_failure(error: &anyhow::Error) -> bool {
+    !(error.is::<crate::session::StartBlocked>()
+        || error.is::<crate::session::SessionGone>()
+        || error.is::<crate::session::LifecycleReservationError>()
+        || error.is::<crate::session::NativeStoreUnavailable>())
+}
+
+/// A durable write failed after the worker had taken the change. Stop the worker
+/// so its respawn reads the stored row; writing the old value back could
+/// overwrite a newer edit.
+async fn persist_failure_response(state: &AppState, id: &str, err: &anyhow::Error) -> Response {
+    tracing::error!(
+        target: "http.api.acp",
+        session = %id,
+        "failed to persist ACP change: {err:#}"
+    );
+    let stopped = state
+        .acp_supervisor
+        .shutdown_and_wait(id, std::time::Duration::from_secs(5))
+        .await
+        .is_ok();
+    let outcome = if stopped {
+        "the worker was stopped and the stored value is unchanged; retry"
+    } else {
+        "the worker may still be running the unsaved change"
+    };
+    super::api_error(
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "persist_failed",
+        format!("failed to save the change ({err:#}); {outcome}"),
+    )
+}
+
 /// A spawn request carrying the instance's persisted worker settings.
 pub(crate) fn spawn_request_for(
     instance: &crate::session::Instance,

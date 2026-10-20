@@ -373,6 +373,15 @@ pub fn seed_instances_on_disk_for_test(profile: &str, insts: Vec<Instance>) {
         .expect("seed sessions.json");
 }
 
+/// Make storage for `profile` fail on every write: a plain file where its directory belongs.
+pub fn block_profile_storage_for_test(profile: &str) {
+    let dir = crate::session::get_app_dir()
+        .expect("app dir")
+        .join("profiles");
+    std::fs::create_dir_all(&dir).expect("profiles dir");
+    std::fs::write(dir.join(profile), b"").expect("block profile");
+}
+
 pub fn load_instances_from_disk_for_test(profile: &str) -> Vec<Instance> {
     Storage::new_unwatched(profile)
         .expect("storage")

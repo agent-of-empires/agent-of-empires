@@ -527,6 +527,9 @@ pub async fn switch_acp_agent(
             .await
         {
             Ok(exclusion) => exclusion,
+            Err(error) if is_store_write_failure(&error) => {
+                return persist_failure_response(&state, &id, &error).await;
+            }
             Err(error) => return launch_error_response("agent switch completion", &error),
         };
     state
