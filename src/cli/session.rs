@@ -1502,27 +1502,50 @@ const WAIT_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1
 #[derive(Debug, PartialEq, Eq)]
 enum WaitDecision {
     Matched,
-    Stopped,
+    Terminated,
     TimedOut,
     Continue,
 }
 
-/// A match wins over everything, so an already-satisfied wait returns on its first poll.
+/// Termination wins over a match, so a vanished session never satisfies `--until error` or
+/// `--until idle`. Otherwise a match wins, so an already-satisfied wait returns on its first poll.
 fn wait_decision(
     current: Status,
     targets: &[Status],
+    terminated: bool,
     elapsed: std::time::Duration,
     timeout: std::time::Duration,
 ) -> WaitDecision {
-    if targets.contains(&current) {
+    if terminated {
+        WaitDecision::Terminated
+    } else if targets.contains(&current) {
         WaitDecision::Matched
-    } else if current == Status::Stopped {
-        WaitDecision::Stopped
     } else if elapsed >= timeout {
         WaitDecision::TimedOut
     } else {
         WaitDecision::Continue
     }
+}
+
+/// Confirmed absence only; an unreachable tmux server leaves the status a plain `Error`.
+fn status_reports_termination(status: Status, last_error: Option<&str>) -> bool {
+    status == Status::Stopped
+        || (status == Status::Error && last_error == Some(crate::session::TMUX_SESSION_GONE_ERROR))
+}
+
+/// Also rechecks the pane, since a capture that loses a vanishing pane reads as `Idle`.
+fn confirmed_terminated(inst: &Instance) -> bool {
+    status_reports_termination(inst.status, inst.last_error.as_deref())
+        || inst.tmux_session().is_ok_and(|session| {
+            matches!(session.existence(), crate::tmux::SessionExistence::Absent)
+        })
+}
+
+/// Take durable lifecycle fields from the stored row, keeping `live`'s detection state.
+fn adopt_stored(live: &Instance, mut stored: Instance, profile: &str) -> Instance {
+    stored.source_profile = profile.to_string();
+    stored.merge_runtime_from_reload(live);
+    stored
 }
 
 async fn wait_session(profile: &str, args: WaitArgs) -> Result<()> {
@@ -1540,21 +1563,33 @@ async fn wait_session(profile: &str, args: WaitArgs) -> Result<()> {
     let mut first = true;
     loop {
         crate::tmux::refresh_session_cache();
-        // The first poll must decide on its own; later polls share one instance so a
+        // The first poll must decide on its own; later polls share one detection state so a
         // Running to Idle transition can be confirmed by a second observation.
         if first {
             live.update_status_once(None, None);
             first = false;
         } else {
+            let stored = storage
+                .load()?
+                .into_iter()
+                .find(|i| i.id == live.id)
+                .with_context(|| format!("session '{}' was removed", live.title))?;
+            live = adopt_stored(&live, stored, profile);
             live.update_status_with_metadata(None, None);
         }
         let elapsed = start.elapsed();
-        match wait_decision(live.status, &targets, elapsed, timeout) {
+        match wait_decision(
+            live.status,
+            &targets,
+            confirmed_terminated(&live),
+            elapsed,
+            timeout,
+        ) {
             WaitDecision::Matched => {
                 println!("{}", live.status.as_str());
                 return Ok(());
             }
-            WaitDecision::Stopped => bail!("session '{}' is not running", live.title),
+            WaitDecision::Terminated => bail!("session '{}' is not running", live.title),
             WaitDecision::TimedOut => bail!(
                 "timed out after {}ms waiting for '{}' (last status: {})",
                 args.timeout,
@@ -3823,8 +3858,11 @@ mod show_json_tests {
 
 #[cfg(test)]
 mod wait_decision_tests {
-    use super::{wait_decision, WaitDecision};
-    use crate::session::Status;
+    use super::{adopt_stored, status_reports_termination, wait_decision, WaitDecision};
+    use crate::session::{
+        Instance, LifecycleOperation, Status, TMUX_SERVER_UNREACHABLE_ERROR,
+        TMUX_SESSION_GONE_ERROR,
+    };
     use std::time::Duration;
 
     const SECS: fn(u64) -> Duration = Duration::from_secs;
@@ -3834,34 +3872,88 @@ mod wait_decision_tests {
         use WaitDecision::*;
         let cases = [
             // already in the target state, even with no time left
-            (Status::Idle, vec![Status::Idle], 0, 0, Matched),
-            (Status::Idle, vec![Status::Idle], 99, 10, Matched),
+            (Status::Idle, vec![Status::Idle], false, 0, 0, Matched),
+            (Status::Idle, vec![Status::Idle], false, 99, 10, Matched),
             // any one of several targets satisfies the wait
             (
                 Status::Waiting,
                 vec![Status::Idle, Status::Waiting],
+                false,
                 1,
                 10,
                 Matched,
             ),
-            (Status::Error, vec![Status::Error], 1, 10, Matched),
+            (Status::Error, vec![Status::Error], false, 1, 10, Matched),
             (
                 Status::Running,
                 vec![Status::Idle, Status::Waiting],
+                false,
                 1,
                 10,
                 Continue,
             ),
-            (Status::Running, vec![Status::Idle], 10, 10, TimedOut),
-            (Status::Starting, vec![Status::Idle], 99, 10, TimedOut),
-            (Status::Stopped, vec![Status::Idle], 1, 10, Stopped),
+            (Status::Running, vec![Status::Idle], false, 10, 10, TimedOut),
+            (
+                Status::Starting,
+                vec![Status::Idle],
+                false,
+                99,
+                10,
+                TimedOut,
+            ),
+            // termination beats a match, including a gone pane that reads as Error or Idle
+            (Status::Stopped, vec![Status::Idle], true, 1, 10, Terminated),
+            (Status::Error, vec![Status::Error], true, 1, 10, Terminated),
+            (Status::Idle, vec![Status::Idle], true, 1, 10, Terminated),
         ];
-        for (current, targets, elapsed, timeout, want) in cases {
+        for (current, targets, terminated, elapsed, timeout, want) in cases {
             assert_eq!(
-                wait_decision(current, &targets, SECS(elapsed), SECS(timeout)),
+                wait_decision(current, &targets, terminated, SECS(elapsed), SECS(timeout)),
                 want,
-                "{current:?} {targets:?} elapsed={elapsed} timeout={timeout}"
+                "{current:?} {targets:?} terminated={terminated} elapsed={elapsed} timeout={timeout}"
             );
         }
+    }
+
+    #[test]
+    fn only_confirmed_absence_is_termination() {
+        let cases = [
+            (Status::Stopped, None, true),
+            (Status::Error, Some(TMUX_SESSION_GONE_ERROR), true),
+            (Status::Error, Some(TMUX_SERVER_UNREACHABLE_ERROR), false),
+            (Status::Error, None, false),
+            (Status::Idle, Some(TMUX_SESSION_GONE_ERROR), false),
+        ];
+        for (status, last_error, want) in cases {
+            assert_eq!(
+                status_reports_termination(status, last_error),
+                want,
+                "{status:?} {last_error:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn adopt_stored_sees_a_launch_commit_and_keeps_detection_state() {
+        let now = chrono::Utc::now();
+        let mut live = Instance::new("t", "/p");
+        live.try_acquire_lifecycle_reservation(
+            LifecycleOperation::Launch,
+            Instance::LIFECYCLE_RESERVATION_TTL,
+            now,
+        )
+        .unwrap();
+        live.status = Status::Starting;
+        live.detection.pending = Some(Status::Idle);
+        assert!(live.has_fresh_launch_reservation(now));
+
+        let mut stored = live.clone();
+        stored.lifecycle_generation += 1;
+        stored.lifecycle_reservation = None;
+        stored.detection.pending = None;
+
+        let adopted = adopt_stored(&live, stored, "default");
+        assert!(!adopted.has_fresh_launch_reservation(now));
+        assert_eq!(adopted.detection.pending, Some(Status::Idle));
     }
 }
