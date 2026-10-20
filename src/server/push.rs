@@ -462,7 +462,24 @@ pub enum NotificationEvent {
 }
 
 impl NotificationEvent {
-    fn dwell_ms(self) -> u64 {
+    pub(crate) fn for_status(status: Status) -> Option<Self> {
+        match status {
+            Status::Waiting => Some(Self::Waiting),
+            Status::Idle => Some(Self::Idle),
+            Status::Error => Some(Self::Error),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Waiting => "waiting",
+            Self::Idle => "idle",
+            Self::Error => "error",
+        }
+    }
+
+    pub(crate) fn dwell_ms(self) -> u64 {
         match self {
             Self::Waiting => DWELL_WAITING_MS,
             _ => DWELL_TERMINAL_MS,

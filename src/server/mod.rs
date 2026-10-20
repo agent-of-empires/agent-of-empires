@@ -38,6 +38,7 @@ pub(crate) mod session_identity;
 pub(crate) mod session_service;
 pub(crate) mod session_spawn;
 pub(crate) mod session_store;
+pub(crate) mod session_status_ws;
 pub(crate) mod sleep_inhibit;
 pub(crate) mod startup;
 pub(crate) mod startup_recovery;
