@@ -124,6 +124,7 @@ import { SwitchViewDialog } from "./components/SwitchViewDialog";
 import { TopBar } from "./components/TopBar";
 import { AppShellSkeleton, MainPaneSkeleton } from "./components/AppShellSkeleton";
 import { ContentSplit } from "./components/ContentSplit";
+import { StructuredSessionStack } from "./components/StructuredSessionStack";
 import { TerminalSessionStack } from "./components/TerminalSessionStack";
 // Lazy-load the acp surface so non-acp users never download
 // the @assistant-ui/react, shiki, and in-house StringDiff/DiffLine
@@ -1936,30 +1937,39 @@ function AppContent({
               <div className="flex-1 flex flex-col min-h-0 overflow-hidden relative">
                 <div className={selectedFilePath ? "hidden" : "flex-1 flex flex-col min-h-0 overflow-hidden"}>
                   {activeSession?.view === "structured" ? (
-                    <Suspense fallback={<AcpLoadingFallback />}>
-                      <StructuredView
-                        key={activeSessionId}
-                        sessionId={activeSessionId!}
-                        acpWorkerState={activeSession.acp_worker_state ?? "absent"}
-                        rateLimitAutoResume={activeSession.rate_limit_auto_resume}
-                        tool={activeSession.tool}
-                        acpAgent={activeSession.acp_agent ?? null}
-                        acpProvider={activeSession.acp_provider ?? null}
-                        clearAliases={activeSession.clear_aliases}
-                        archivedAt={activeSession.archived_at ?? null}
-                        snoozedUntil={activeSession.snoozed_until ?? null}
-                        trashedAt={activeSession.trashed_at ?? null}
-                        onRestore={
-                          activeSession.trashed_at
-                            ? () => handleRestoreSession(trashedWorkspaceRestoreIds(workspaces, activeSessionId!))
-                            : undefined
-                        }
-                        onOpenFileRef={handleOpenFileRef}
-                        fileRefSession={activeSession}
-                        onOpenAgentsPane={openAgentsPane}
-                        isSandboxed={activeSession.is_sandboxed}
-                      />
-                    </Suspense>
+                    <StructuredSessionStack
+                      active={!selectedFilePath}
+                      activeSessionId={activeSessionId!}
+                      sessions={sessions.filter((session) => session.view === "structured")}
+                      persistent={webSettings.persistentStructuredViews}
+                      maxPersistentViews={webSettings.maxPersistentStructuredViews}
+                      renderSession={(session, active) => (
+                        <Suspense fallback={<AcpLoadingFallback />}>
+                          <StructuredView
+                            active={active}
+                            sessionId={session.id}
+                            acpWorkerState={session.acp_worker_state ?? "absent"}
+                            rateLimitAutoResume={session.rate_limit_auto_resume}
+                            tool={session.tool}
+                            acpAgent={session.acp_agent ?? null}
+                            acpProvider={session.acp_provider ?? null}
+                            clearAliases={session.clear_aliases}
+                            archivedAt={session.archived_at ?? null}
+                            snoozedUntil={session.snoozed_until ?? null}
+                            trashedAt={session.trashed_at ?? null}
+                            onRestore={
+                              session.trashed_at
+                                ? () => handleRestoreSession(trashedWorkspaceRestoreIds(workspaces, session.id))
+                                : undefined
+                            }
+                            onOpenFileRef={handleOpenFileRef}
+                            fileRefSession={session}
+                            onOpenAgentsPane={openAgentsPane}
+                            isSandboxed={session.is_sandboxed}
+                          />
+                        </Suspense>
+                      )}
+                    />
                   ) : (
                     <TerminalSessionStack
                       activeSessionId={activeSessionId!}

@@ -1,5 +1,6 @@
 import { lazy, Suspense } from "react";
 
+import { StructuredSessionStack } from "./StructuredSessionStack";
 import { TerminalSessionStack } from "./TerminalSessionStack";
 import { PairedShellPane } from "./PairedTerminal";
 import { BackgroundAgentsPanel } from "./acp/BackgroundAgentsPanel";
@@ -13,6 +14,7 @@ import type { RightPanelView } from "../lib/rightPanelView";
 import { isPluginPaneId, type PluginPane } from "../lib/pluginPanes";
 import type { RepoBase, RichDiffFile, SessionResponse } from "../lib/types";
 import type { useDiffComments } from "../hooks/useDiffComments";
+import type { WebSettings } from "../hooks/useWebSettings";
 import type { FileRef } from "../lib/fileRef";
 
 const StructuredView = lazy(() => import("./acp/StructuredView").then((m) => ({ default: m.StructuredView })));
@@ -26,7 +28,10 @@ interface Props {
   activeSession: SessionResponse | null;
   activeSessionId: string | null;
   sessions: SessionResponse[];
-  webSettings: { persistentTerminals: boolean; maxPersistentTerminals: number };
+  webSettings: Pick<
+    WebSettings,
+    "persistentTerminals" | "maxPersistentTerminals" | "persistentStructuredViews" | "maxPersistentStructuredViews"
+  >;
   selectedFilePath: string | null;
   selectedRepoName: string | undefined;
   selectedFileLine: number | undefined;
@@ -118,25 +123,34 @@ export function MobileMainPane({
       <div className="relative flex-1 flex flex-col min-h-0 overflow-hidden">
         <div className={layerClass(view === "agent")} inert={view !== "agent"}>
           {activeSession?.view === "structured" ? (
-            <Suspense fallback={null}>
-              <StructuredView
-                key={activeSessionId}
-                sessionId={activeSessionId!}
-                acpWorkerState={activeSession.acp_worker_state ?? "absent"}
-                rateLimitAutoResume={activeSession.rate_limit_auto_resume}
-                tool={activeSession.tool}
-                acpAgent={activeSession.acp_agent ?? null}
-                acpProvider={activeSession.acp_provider ?? null}
-                clearAliases={activeSession.clear_aliases}
-                archivedAt={activeSession.archived_at ?? null}
-                snoozedUntil={activeSession.snoozed_until ?? null}
-                trashedAt={activeSession.trashed_at ?? null}
-                onOpenFileRef={onOpenFileRef}
-                fileRefSession={activeSession}
-                onOpenAgentsPane={onOpenAgentsPane}
-                isSandboxed={activeSession.is_sandboxed}
-              />
-            </Suspense>
+            <StructuredSessionStack
+              active={view === "agent"}
+              activeSessionId={activeSessionId!}
+              sessions={sessions.filter((session) => session.view === "structured")}
+              persistent={webSettings.persistentStructuredViews}
+              maxPersistentViews={webSettings.maxPersistentStructuredViews}
+              renderSession={(session, active) => (
+                <Suspense fallback={null}>
+                  <StructuredView
+                    active={active}
+                    sessionId={session.id}
+                    acpWorkerState={session.acp_worker_state ?? "absent"}
+                    rateLimitAutoResume={session.rate_limit_auto_resume}
+                    tool={session.tool}
+                    acpAgent={session.acp_agent ?? null}
+                    acpProvider={session.acp_provider ?? null}
+                    clearAliases={session.clear_aliases}
+                    archivedAt={session.archived_at ?? null}
+                    snoozedUntil={session.snoozed_until ?? null}
+                    trashedAt={session.trashed_at ?? null}
+                    onOpenFileRef={onOpenFileRef}
+                    fileRefSession={session}
+                    onOpenAgentsPane={onOpenAgentsPane}
+                    isSandboxed={session.is_sandboxed}
+                  />
+                </Suspense>
+              )}
+            />
           ) : (
             // Clear the home indicator without changing the keyboard-open lift.
             <div className="home-indicator-clearance flex-1 flex flex-col min-h-0 overflow-hidden">
