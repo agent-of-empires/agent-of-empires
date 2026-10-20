@@ -194,15 +194,15 @@ const CODEX_IMAGE: &str = "aoe-e2e-codex-shim:latest";
 const CAPTURE_DEADLINE: Duration = Duration::from_secs(60);
 
 /// Stands in for Codex inside the container. It publishes a rollout under the
-/// per-session store mounted at `$HOME/.codex`, which is what the poller reads,
+/// per-session store mounted at `$CODEX_HOME`, which is what the poller reads,
 /// and records the id it chose so the test can compare against the host path.
 const CODEX_SHIM_DOCKERFILE: &str = r#"FROM alpine:3
 RUN printf '%s\n' '#!/bin/sh' \
   'id=$(cat /proc/sys/kernel/random/uuid)' \
-  'dir="$HOME/.codex/sessions/2026/01/01"' \
+  'dir="${CODEX_HOME:?}/sessions/2026/01/01"' \
   'mkdir -p "$dir"' \
   'printf "{\"type\":\"session_meta\",\"payload\":{\"id\":\"%s\",\"cwd\":\"%s\"}}\n" "$id" "$PWD" > "$dir/rollout-2026-01-01T00-00-00-$id.jsonl"' \
-  'printf "%s" "$id" > "$HOME/.codex/published-id"' \
+  'printf "%s" "$id" > "$CODEX_HOME/published-id"' \
   'exec sleep 600' > /usr/local/bin/codex \
  && chmod +x /usr/local/bin/codex
 "#;
