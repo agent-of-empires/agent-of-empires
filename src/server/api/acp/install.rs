@@ -149,8 +149,7 @@ pub struct AgentInstallInfo {
     pub display_name: String,
     pub install_command: Option<&'static str>,
     pub npm_installable: bool,
-    /// Whether `install-agent` accepts requests: `acp.allow_agent_install` is on
-    /// and this server is neither read-only nor a CityHall client.
+    /// Whether `install-agent` accepts requests (`install_gate`).
     pub install_allowed: bool,
     pub sandboxed: bool,
 }
@@ -176,15 +175,30 @@ pub async fn agent_install_info(
             .as_deref()
             .and_then(crate::acp::install_hints::npm_package_for)
             .is_some(),
-        install_allowed: !state.read_only
-            && !state.cityhall_mode
-            && crate::session::Config::load_or_warn()
-                .acp
-                .allow_agent_install,
+        install_allowed: install_gate(&state).is_ok(),
         sandboxed: instance.is_sandboxed(),
         agent,
     })
     .into_response()
+}
+
+/// Whether `install-agent` accepts requests; `install-info` reports the same
+/// answer, so the banner never offers an install that is refused.
+fn install_gate(state: &AppState) -> Result<(), Response> {
+    if let Some(resp) = read_only_block(state).or_else(|| cityhall_block(state)) {
+        return Err(resp);
+    }
+    if !crate::session::Config::load_or_warn()
+        .acp
+        .allow_agent_install
+    {
+        return Err(api_error(
+            StatusCode::FORBIDDEN,
+            "install_disabled",
+            "Installing agents from the web is off. Enable acp.allow_agent_install (Settings, local only).",
+        ));
+    }
+    Ok(())
 }
 
 /// `POST /api/sessions/{id}/acp/install-agent`: install the session's adapter
@@ -195,21 +209,8 @@ pub async fn install_agent(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
-    if let Some(resp) = read_only_block(&state) {
+    if let Err(resp) = install_gate(&state) {
         return resp;
-    }
-    if let Some(resp) = cityhall_block(&state) {
-        return resp;
-    }
-    if !crate::session::Config::load_or_warn()
-        .acp
-        .allow_agent_install
-    {
-        return api_error(
-            StatusCode::FORBIDDEN,
-            "install_disabled",
-            "Installing agents from the web is off. Enable acp.allow_agent_install (Settings, local only).",
-        );
     }
     let Some(instance) = find_instance(&state, &id).await else {
         return session_not_found();
@@ -375,13 +376,31 @@ mod tests {
             );
         }
 
-        crate::session::config::update_config(|c| c.acp.allow_agent_install = true).unwrap();
-        assert_eq!(get("claude").await.1["install_allowed"], true);
         assert_eq!(get("missing").await.0, StatusCode::NOT_FOUND);
-        // `install-agent` refuses a CityHall client whatever the setting says.
+
+        // `install_allowed` is false exactly where `install-agent` refuses.
         let cityhall = crate::server::test_support::build_test_app_state_cityhall(vec![session(
             "claude", "claude", None, false,
         )]);
-        assert_eq!(fetch(cityhall, "claude").await.1["install_allowed"], false);
+        let mut read_only = crate::server::test_support::build_test_app_state(vec![session(
+            "claude", "claude", None, false,
+        )]);
+        Arc::get_mut(&mut read_only).unwrap().read_only = true;
+        for (label, setting, state, allowed) in [
+            ("setting off", false, state.clone(), false),
+            ("setting on", true, state.clone(), true),
+            ("CityHall", true, cityhall, false),
+            ("read-only", true, read_only, false),
+        ] {
+            crate::session::config::update_config(|c| c.acp.allow_agent_install = setting).unwrap();
+            let body = fetch(state.clone(), "claude").await.1;
+            assert_eq!(body["install_allowed"], allowed, "{label}");
+            if !allowed {
+                let refused = install_agent(State(state), Path("claude".to_string()))
+                    .await
+                    .into_response();
+                assert_eq!(refused.status(), StatusCode::FORBIDDEN, "{label}");
+            }
+        }
     }
 }
