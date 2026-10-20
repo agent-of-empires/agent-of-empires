@@ -2542,6 +2542,7 @@
       "risk": "low",
       "specs": [
         "src/components/__tests__/StructuredSessionStack.test.tsx",
+        "src/lib/__tests__/persistentStructuredViews.test.ts",
         "src/components/settings/__tests__/StructuredViewDisplaySettings.test.tsx",
         "src/components/acp/__tests__/StructuredViewRoot.test.tsx"
       ],
