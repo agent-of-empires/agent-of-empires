@@ -192,7 +192,6 @@ pub(super) async fn establish(
         cmd_rx: ctx.cmd_rx,
         lifecycle_rx: ctx.lifecycle_rx,
         pending_prompts: VecDeque::new(),
-        prior_turn_ended_uncancelled: false,
     };
     session.acp_session_id = match ctx.mode {
         ConnectMode::Resume { acp_session_id, .. } => session.resume(acp_session_id).await?,

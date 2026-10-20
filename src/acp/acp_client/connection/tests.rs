@@ -451,31 +451,21 @@ async fn rate_limit_on_an_agent_initiated_turn_ends_the_connection() {
 #[tokio::test]
 async fn prompted_turn_ending_on_a_rejected_window_parks() {
     let now = chrono::Utc::now().timestamp();
-    for (stop_reason, resets_at, late, parks) in [
-        ("end_turn", now + 3600, false, true),
-        // The rejection lands after the response; the next prompt must park.
-        ("end_turn", now + 3600, true, true),
-        ("cancelled", now + 3600, false, false),
-        ("end_turn", now - 60, false, false),
+    for (stop_reason, resets_at, parks) in [
+        ("end_turn", now + 3600, true),
+        ("cancelled", now + 3600, false),
+        ("end_turn", now - 60, false),
     ] {
         let update = format!(
             r#"{{"jsonrpc":"2.0","method":"session/update","params":{{"sessionId":"s-prompted","update":{{"sessionUpdate":"usage_update","used":10,"size":100,"_meta":{{"_claude/rateLimit":{{"status":"rejected","rateLimitType":"five_hour","resetsAt":{resets_at}}}}}}}}}}}"#
         );
-        let answered = AtomicBool::new(false);
-        let mut fake = spawn_fake_connection("s-prompted", {
-            let update = update.clone();
-            move |id| {
-                let response = format!(
+        let mut fake = spawn_fake_connection("s-prompted", move |id| {
+            vec![
+                update.clone(),
+                format!(
                     r#"{{"jsonrpc":"2.0","id":{id},"result":{{"stopReason":"{stop_reason}"}}}}"#
-                );
-                // A late case answers only the first prompt, and the test
-                // sends the update once that turn has stopped.
-                match (late, answered.swap(true, Ordering::SeqCst)) {
-                    (true, true) => Vec::new(),
-                    (true, false) => vec![response],
-                    (false, _) => vec![update.clone(), response],
-                }
-            }
+                ),
+            ]
         })
         .await;
         fake.cmd_tx
@@ -492,32 +482,6 @@ async fn prompted_turn_ending_on_a_rejected_window_parks() {
                 seen.push(event);
                 if stopped {
                     break;
-                }
-            }
-            if late {
-                assert!(
-                    matches!(seen.last(), Some(Event::Stopped { reason }) if reason == "prompt_complete"),
-                    "{seen:?}"
-                );
-                write_line(&fake.agent_write, &update).await;
-                // The capture happens before the update is forwarded, so
-                // seeing it means the window is recorded.
-                while !matches!(
-                    fake.event_rx.recv().await.expect("connection remains open"),
-                    Event::UsageUpdated { .. }
-                ) {}
-                fake.cmd_tx
-                    .send(ClientCmd::Prompt(vec![ContentBlock::Text(
-                        TextContent::new("again"),
-                    )]))
-                    .await
-                    .unwrap();
-                while let Some(event) = fake.event_rx.recv().await {
-                    let stopped = matches!(event, Event::Stopped { .. });
-                    seen.push(event);
-                    if stopped {
-                        break;
-                    }
                 }
             }
         })

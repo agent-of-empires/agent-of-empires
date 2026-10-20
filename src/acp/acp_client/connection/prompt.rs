@@ -140,19 +140,6 @@ impl Session {
     /// the connection should shut down.
     pub(super) async fn run_prompt(&mut self, blocks: Vec<ContentBlock>) -> AcpResult<bool> {
         let shared = self.shared.clone();
-        // The rejecting update can land after the prompt response, where the
-        // per-prompt clear below would drop it.
-        if std::mem::take(&mut self.prior_turn_ended_uncancelled) {
-            if let Some(info) = self.take_parking_rejection() {
-                shared.emit(Event::RateLimit { info }).await;
-                shared
-                    .emit(Event::Stopped {
-                        reason: "rate_limited".into(),
-                    })
-                    .await;
-                return Ok(true);
-            }
-        }
         if let Some(control) = self.control.as_ref() {
             control.supersede_adopted_turn();
         }
@@ -323,7 +310,6 @@ impl Session {
                         turn.flags.rate_limited = true;
                         turn.flags.shutdown = true;
                     }
-                    self.prior_turn_ended_uncancelled = true;
                 }
                 return Ok(Flow::Break);
             }
