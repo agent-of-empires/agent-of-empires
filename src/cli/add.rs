@@ -282,15 +282,14 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
     }
 
     if let Some(effort) = args.effort.as_deref().map(str::trim) {
-        let agent = crate::acp::pick_acp_agent_name(
-            &crate::acp::agent_registry::AgentRegistry::with_defaults(),
-            &config.session,
-            &config.acp,
-            &resolved_tool,
-            args.agent.as_deref(),
-        );
-        let choices = crate::acp::option_catalog::thought_level_choices(&agent);
-        if let Some(warning) = check_effort_request(effort, wants_structured, &agent, &choices)? {
+        // The daemon records the option catalog under this key.
+        let agent = args
+            .agent
+            .as_deref()
+            .filter(|name| !name.is_empty())
+            .unwrap_or(&resolved_tool);
+        let choices = crate::acp::option_catalog::thought_level_choices(agent);
+        if let Some(warning) = check_effort_request(effort, wants_structured, agent, &choices)? {
             eprintln!("warning: {warning}");
         }
     }
@@ -1315,6 +1314,9 @@ fn cleanup_partial_session(
                 {
                     let _ =
                         git_wt.remove_worktree(std::path::Path::new(&repo.worktree_path), false);
+                    if created_branch && !repo.branch_preexisting {
+                        let _ = git_wt.delete_branch(&repo.branch);
+                    }
                 }
             }
         }
@@ -1526,8 +1528,8 @@ fn resolve_sandbox_image(
 #[cfg(test)]
 mod tests {
     use super::{
-        check_effort, check_effort_request, hooks_when_trust_declined, override_launch_binary,
-        parse_repo_base, resolve_sandbox_image,
+        check_effort_request, hooks_when_trust_declined, override_launch_binary, parse_repo_base,
+        resolve_sandbox_image,
     };
     use crate::session::config::repo_config::TrustSurface;
     use crate::session::config::SessionConfig;
@@ -2063,26 +2065,28 @@ mod tests {
     }
 
     #[test]
-    fn check_effort_validates_only_against_known_choices() {
+    fn check_effort_request_gates_on_view_then_known_choices() {
         let known = ["low".to_string(), "high".to_string()];
-        assert_eq!(check_effort("codex", "high", &known).unwrap(), None);
-        let err = check_effort("codex", "ultra", &known)
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("low, high"), "{err}");
-        let warning = check_effort("codex", "ultra", &[]).unwrap();
-        assert!(warning.is_some_and(|w| w.contains("unchecked")));
-    }
-
-    #[test]
-    fn check_effort_request_refuses_unstructured_before_checking_choices() {
-        let known = ["high".to_string()];
-        let err = check_effort_request("high", false, "codex", &known).unwrap_err();
-        assert!(err.to_string().contains("structured view"), "{err}");
-        assert_eq!(
-            check_effort_request("high", true, "codex", &known).unwrap(),
-            None
-        );
-        assert!(check_effort_request("ultra", true, "codex", &known).is_err());
+        // (wants structured, choices, effort, error substring or warning substring)
+        let cases: [(bool, &[String], &str, Result<Option<&str>, &str>); 5] = [
+            (false, &known, "high", Err("structured view")),
+            (true, &known, "high", Ok(None)),
+            (true, &known, "ultra", Err("low, high")),
+            (true, &[], "ultra", Ok(Some("unchecked"))),
+            (true, &[], "high", Ok(Some("unchecked"))),
+        ];
+        for (structured, choices, effort, want) in cases {
+            let got = check_effort_request(effort, structured, "codex", choices);
+            match want {
+                Ok(None) => assert_eq!(got.unwrap(), None, "{effort}"),
+                Ok(Some(text)) => {
+                    assert!(got.unwrap().is_some_and(|w| w.contains(text)), "{effort}")
+                }
+                Err(text) => {
+                    let err = got.unwrap_err().to_string();
+                    assert!(err.contains(text), "{err}");
+                }
+            }
+        }
     }
 }
