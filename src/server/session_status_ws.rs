@@ -99,13 +99,19 @@ async fn send(socket: &mut WebSocket, message: Message) -> bool {
     )
 }
 
-/// The next frames to send, or `None` once the status channel closes. Queued moves win over an
-/// expired dwell, so a cue can never beat the move that cancels it.
+#[derive(Debug, PartialEq)]
+enum Next {
+    Frames(Vec<String>),
+    /// Moves were dropped; the caller reseeds and resyncs outside this cancellable future.
+    Lagged,
+}
+
+/// The next step, or `None` once the status channel closes. Queued moves win over an expired
+/// dwell, so a cue can never beat the move that cancels it.
 async fn next_frames(
-    state: &AppState,
     rx: &mut broadcast::Receiver<StatusChange>,
     dwells: &mut Dwells,
-) -> Option<Vec<String>> {
+) -> Option<Next> {
     let sleep = match dwells.next_due() {
         Some(due) => tokio::time::sleep_until(due),
         None => tokio::time::sleep(Duration::from_secs(3600)),
@@ -115,22 +121,21 @@ async fn next_frames(
         recv = rx.recv() => match recv {
             Ok(change) => {
                 dwells.on_change(&change, Instant::now());
-                Some(vec![status_frame(&change)])
+                Some(Next::Frames(vec![status_frame(&change)]))
             }
             Err(RecvError::Lagged(skipped)) => {
                 tracing::warn!(target: "http.middleware", skipped, "session status ws lagged");
-                *dwells = Dwells::seeded(state).await;
-                Some(vec![json!({ "kind": "resync" }).to_string()])
+                Some(Next::Lagged)
             }
             Err(RecvError::Closed) => None,
         },
-        _ = sleep => Some(
+        _ = sleep => Some(Next::Frames(
             dwells
                 .take_due(Instant::now())
                 .into_iter()
                 .map(|(id, event)| sound_due_frame(&id, event))
                 .collect(),
-        ),
+        )),
     }
 }
 
@@ -153,7 +158,7 @@ async fn serve(mut socket: WebSocket, state: Arc<AppState>) {
     let mut last_pong_at = Instant::now();
 
     loop {
-        let frame = tokio::select! {
+        let next = tokio::select! {
             _ = state.shutdown.cancelled() => break,
             incoming = socket.recv() => match incoming {
                 Some(Ok(Message::Close(_))) | None | Some(Err(_)) => break,
@@ -173,12 +178,19 @@ async fn serve(mut socket: WebSocket, state: Arc<AppState>) {
                 }
                 continue;
             }
-            frames = next_frames(&state, &mut rx, &mut dwells) => match frames {
-                Some(frames) => frames,
+            next = next_frames(&mut rx, &mut dwells) => match next {
+                Some(next) => next,
                 None => break,
             },
         };
-        for text in frame {
+        let frames = match next {
+            Next::Frames(frames) => frames,
+            Next::Lagged => {
+                dwells = Dwells::seeded(&state).await;
+                vec![json!({ "kind": "resync" }).to_string()]
+            }
+        };
+        for text in frames {
             if !send(&mut socket, Message::Text(text.into())).await {
                 return;
             }
@@ -234,13 +246,10 @@ mod tests {
         tx.send(running.clone()).unwrap();
         tokio::time::advance(Duration::from_secs(6)).await;
 
-        let frames = next_frames(&state, &mut rx, &mut dwells).await;
-        assert_eq!(frames, Some(vec![status_frame(&running)]));
-        let later = tokio::time::timeout(
-            Duration::from_secs(30),
-            next_frames(&state, &mut rx, &mut dwells),
-        )
-        .await;
+        let frames = next_frames(&mut rx, &mut dwells).await;
+        assert_eq!(frames, Some(Next::Frames(vec![status_frame(&running)])));
+        let later =
+            tokio::time::timeout(Duration::from_secs(30), next_frames(&mut rx, &mut dwells)).await;
         assert!(later.is_err(), "no cue for a session that moved on");
     }
 
@@ -255,14 +264,24 @@ mod tests {
         let mut rx = state.status_tx.subscribe();
         let mut dwells = Dwells::seeded(&state).await;
 
-        let frames = next_frames(&state, &mut rx, &mut dwells).await;
+        let frames = next_frames(&mut rx, &mut dwells).await;
         assert_eq!(
             frames,
-            Some(vec![sound_due_frame(
+            Some(Next::Frames(vec![sound_due_frame(
                 &waiting_id,
                 NotificationEvent::Waiting
-            )])
+            )]))
         );
+    }
+
+    #[tokio::test]
+    async fn a_lagged_receiver_reports_the_lag_for_the_caller_to_resync() {
+        let (tx, mut rx) = broadcast::channel(2);
+        for _ in 0..5 {
+            tx.send(change("a", Status::Waiting)).unwrap();
+        }
+        let mut dwells = Dwells::default();
+        assert_eq!(next_frames(&mut rx, &mut dwells).await, Some(Next::Lagged));
     }
 
     #[test]
