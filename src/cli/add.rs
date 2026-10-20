@@ -195,6 +195,10 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
 
     crate::session::require_known_profile(profile)?;
 
+    if args.effort.as_deref().is_some_and(|e| e.trim().is_empty()) {
+        bail!("--effort cannot be empty");
+    }
+
     if args.scratch && args.path.is_some() {
         bail!(
             "Cannot specify a project path with --scratch\nTip: drop the path argument, the session runs in a fresh scratch directory"
