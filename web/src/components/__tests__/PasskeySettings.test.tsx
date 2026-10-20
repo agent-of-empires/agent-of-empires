@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 
 import { PasskeySettings } from "../PasskeySettings";
 
@@ -31,11 +31,13 @@ beforeEach(() => {
 afterEach(cleanup);
 
 describe("PasskeySettings", () => {
-  it("renders nothing without browser support", async () => {
+  it("renders nothing without browser support once the list has loaded", async () => {
     passkeysSupported.mockReturnValue(false);
-    fetchPasskeys.mockResolvedValue([]);
+    let resolveList!: (list: unknown[]) => void;
+    fetchPasskeys.mockReturnValue(new Promise((resolve) => (resolveList = resolve)));
     const { container } = render(<PasskeySettings />);
     await waitFor(() => expect(fetchPasskeys).toHaveBeenCalled());
+    await act(async () => resolveList([]));
     expect(container.textContent).toBe("");
   });
 
@@ -95,6 +97,15 @@ describe("PasskeySettings", () => {
     registerPasskey.mockResolvedValueOnce({ ok: false, error: "nope" });
     fireEvent.click(add);
     expect(await screen.findByText("nope")).toBeTruthy();
+  });
+
+  it("shows an error when removal fails and keeps the passkey", async () => {
+    fetchPasskeys.mockResolvedValue([phone]);
+    removePasskey.mockResolvedValue(false);
+    render(<PasskeySettings />);
+    fireEvent.click(await screen.findByRole("button", { name: "Remove" }));
+    expect(await screen.findByText("Could not remove passkey")).toBeTruthy();
+    expect(screen.getByText("Phone")).toBeTruthy();
   });
 
   it("removes a passkey and reloads", async () => {
