@@ -112,6 +112,7 @@ The CLI is the optional path for scripting. Unlike the wizard, `aoe add` default
 aoe acp doctor                              # confirm prerequisites
 aoe add . --cmd claude --structured-view    # structured view for an ACP tool
 aoe add . --agent codex --model gpt-5       # pick an ACP agent + model (implies structured view)
+aoe add . --agent codex --effort high       # pick the reasoning effort
 ```
 
 `--agent` for an uninstalled adapter errors with an install hint; `--structured-view` without `--agent` falls back to the terminal view with a warning, so the command still succeeds.
@@ -176,6 +177,7 @@ Every structured-view operation has a matching verb against the same daemon:
 | `aoe acp prompt <id> <text>` | Send a prompt (`-` reads stdin) |
 | `aoe acp approve <id> <nonce> [--always\|--deny\|--option <id>]` | Resolve a pending approval |
 | `aoe acp cancel <id>` | Cancel the in-flight prompt |
+| `aoe acp set-option <id> <config_id> <value>` | Set a model, mode or effort option on a running session |
 | `aoe acp tail <id>` | Stream broadcast frames as JSON lines |
 | `aoe acp attach <id>` | Open the TUI structured view |
 | `aoe acp stop` / `kill` / `restart` / `logs` / `switch-agent` | Worker management |
