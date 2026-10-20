@@ -1840,15 +1840,13 @@ impl AcpConfig {
     }
 
     pub fn acp_defaults_for(&self, agent: &str) -> Option<&AcpAgentDefaults> {
-        // `claude-code` is the legacy alias stored by older session records.
-        let agent = if agent == "claude-code" {
-            "claude"
-        } else {
-            agent
-        };
-        self.acp_defaults
-            .get(agent)
-            .filter(|defaults| !defaults.is_empty())
+        let non_empty = |key: &str| self.acp_defaults.get(key).filter(|d| !d.is_empty());
+        non_empty(agent).or_else(|| {
+            // `claude-code` is the legacy alias stored by older session records.
+            (agent == "claude-code")
+                .then(|| non_empty("claude"))
+                .flatten()
+        })
     }
 
     /// The model `agent` is pinned to (`pin_model` with a non-empty `model`).
@@ -4492,18 +4490,47 @@ mod tests {
             Some("claude-x")
         );
         assert_eq!(config.pinned_model_for("gemini"), None);
-        assert_eq!(
-            config.pinned_model_for("claude-code").as_deref(),
-            Some("claude-x")
-        );
-        assert_eq!(
-            config
-                .acp_defaults_for("claude-code")
-                .unwrap()
-                .model
-                .as_deref(),
-            Some("claude-x")
-        );
+    }
+
+    /// The legacy `claude-code` key prefers its own non-empty entry and only
+    /// falls back to `claude` when it has none.
+    #[test]
+    fn acp_defaults_claude_code_alias_prefers_its_own_entry() {
+        let entry = |model: Option<&str>| AcpAgentDefaults {
+            model: model.map(str::to_string),
+            pin_model: model.is_some(),
+            ..Default::default()
+        };
+        let cases: [(&[(&str, Option<&str>)], Option<&str>); 4] = [
+            (&[("claude", Some("canon"))], Some("canon")),
+            (&[("claude-code", Some("alias"))], Some("alias")),
+            (
+                &[("claude", Some("canon")), ("claude-code", Some("alias"))],
+                Some("alias"),
+            ),
+            (
+                &[("claude", Some("canon")), ("claude-code", None)],
+                Some("canon"),
+            ),
+        ];
+        for (entries, want) in cases {
+            let mut config = AcpConfig::default();
+            for (key, model) in entries {
+                config.acp_defaults.insert(key.to_string(), entry(*model));
+            }
+            assert_eq!(
+                config
+                    .acp_defaults_for("claude-code")
+                    .and_then(|d| d.model.as_deref()),
+                want,
+                "{entries:?}"
+            );
+            assert_eq!(
+                config.pinned_model_for("claude-code").as_deref(),
+                want,
+                "{entries:?}"
+            );
+        }
     }
 
     /// Spawn resolution precedence: a pin replaces the request, an explicit
