@@ -417,6 +417,71 @@ mod tests {
         );
     }
 
+    /// The write fails on a valid stored row (not an unopenable profile): the
+    /// 500 leaves both stores on the old pick, and the retry after recovery
+    /// lands in both.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_pick_write_failing_on_a_valid_row_recovers_on_retry() {
+        use crate::server::test_support as support;
+        let _tmp = isolate_app_dir();
+        let mut inst = crate::session::Instance::new("t", "/tmp");
+        inst.source_profile = "default".to_string();
+        inst.agent_model = Some("old-model".to_string());
+        let id = inst.id.clone();
+        support::seed_instances_on_disk_for_test("default", vec![inst.clone()]);
+        let state = support::build_test_app_state(vec![inst]);
+        let pick = || async {
+            acp_set_config_option(
+                State(state.clone()),
+                Path(id.clone()),
+                Ok(Json(SetConfigOptionRequest {
+                    config_id: "model".to_string(),
+                    value: "new-model".to_string(),
+                })),
+            )
+            .await
+            .into_response()
+        };
+
+        state
+            .acp_supervisor
+            .test_insert_worker_cmd_recording(&id)
+            .await;
+        let lock = support::lock_profile_dir_for_test("default");
+        if !lock.blocks_writes() {
+            return;
+        }
+        assert_eq!(pick().await.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(
+            state.instances.read().await[0].agent_model.as_deref(),
+            Some("old-model")
+        );
+        assert_eq!(
+            support::load_instances_from_disk_for_test("default")[0]
+                .agent_model
+                .as_deref(),
+            Some("old-model")
+        );
+
+        drop(lock);
+        state
+            .acp_supervisor
+            .test_insert_worker_cmd_recording(&id)
+            .await;
+        assert_eq!(pick().await.status(), StatusCode::ACCEPTED);
+        assert_eq!(
+            state.instances.read().await[0].agent_model.as_deref(),
+            Some("new-model")
+        );
+        assert_eq!(
+            support::load_instances_from_disk_for_test("default")[0]
+                .agent_model
+                .as_deref(),
+            Some("new-model")
+        );
+    }
+
     /// An unknown effort is refused before the worker or storage see it. A
     /// known one, or any value with no cached choices, reaches the worker
     /// (absent here, hence 404).

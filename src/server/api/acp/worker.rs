@@ -1628,6 +1628,113 @@ mod tests {
         }
     }
 
+    /// The target spawns, then the stored write fails on a valid row: the
+    /// caller gets the 500, the new worker is stopped, nothing announces a
+    /// switch, and neither store moves. Once storage recovers the retry lands.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_failed_agent_switch_write_stops_the_target_and_a_retry_recovers() {
+        use crate::server::test_support as support;
+        let profile = "default";
+        let _tmp = crate::session::test_support::isolate_app_dir();
+        let project = tempfile::tempdir().unwrap();
+        let mut inst = crate::session::Instance::new("claude", project.path().to_str().unwrap());
+        inst.view = crate::session::View::Structured;
+        inst.status = crate::session::Status::Idle;
+        inst.agent_name = Some("claude".to_string());
+        inst.acp_effort = Some("high".to_string());
+        let id = inst.id.clone();
+        support::seed_instances_on_disk_for_test(profile, vec![inst.clone()]);
+        let state =
+            support::build_test_app_state_with_launcher(vec![inst], support::succeeding_launcher());
+        state.acp_supervisor.test_insert_worker(&id).await;
+        let switch = || async {
+            switch_acp_agent(
+                State(state.clone()),
+                Path(id.clone()),
+                Json(crate::acp::protocol::SwitchAgentRequest {
+                    target: "codex".to_string(),
+                    model: None,
+                    reason: None,
+                }),
+            )
+            .await
+            .into_response()
+        };
+        let switched = || {
+            state
+                .acp_event_store
+                .replay_from(&id, 0)
+                .iter()
+                .filter(|(_, event)| {
+                    matches!(event, crate::acp::state::Event::AgentSwitched { .. })
+                })
+                .count()
+        };
+
+        // Launch admission opens its lock file inside the directory; create it first.
+        drop(
+            crate::session::Storage::new_unwatched(profile)
+                .unwrap()
+                .acquire_instance_lifecycle_lock(&id)
+                .unwrap(),
+        );
+        let lock = support::lock_profile_dir_for_test(profile);
+        if !lock.blocks_writes() {
+            return;
+        }
+        let resp = switch().await;
+        let status = resp.status();
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body = String::from_utf8_lossy(&body);
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{body}");
+        assert!(
+            body.contains("persist_failed") && body.contains("agent switch"),
+            "{body}"
+        );
+        assert_eq!(
+            state.acp_supervisor.worker_state(&id).await,
+            crate::daemon::AcpWorkerState::Absent,
+            "the target worker is stopped"
+        );
+        assert_eq!(switched(), 0);
+        assert_eq!(
+            state
+                .telemetry_structured
+                .agent_switches
+                .load(std::sync::atomic::Ordering::Relaxed),
+            0
+        );
+        let memory = state.instances.read().await;
+        assert_eq!(memory[0].agent_name.as_deref(), Some("claude"));
+        assert_eq!(memory[0].acp_effort.as_deref(), Some("high"));
+        drop(memory);
+        let stored = support::load_instances_from_disk_for_test(profile);
+        assert_eq!(stored[0].agent_name.as_deref(), Some("claude"));
+        assert_eq!(stored[0].acp_effort.as_deref(), Some("high"));
+
+        drop(lock);
+        let resp = switch().await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(switched(), 1);
+        assert_eq!(
+            state
+                .telemetry_structured
+                .agent_switches
+                .load(std::sync::atomic::Ordering::Relaxed),
+            1
+        );
+        let stored = support::load_instances_from_disk_for_test(profile);
+        assert_eq!(stored[0].agent_name.as_deref(), Some("codex"));
+        assert_eq!(stored[0].acp_effort, None);
+        assert_eq!(
+            state.instances.read().await[0].agent_name.as_deref(),
+            Some("codex")
+        );
+    }
+
     /// The pick reaches both stores, and the model resets to the provider's
     /// default: ids are provider-specific, and a resumed transcript would
     /// otherwise keep its old one. Everything naming the conversation survives, because the

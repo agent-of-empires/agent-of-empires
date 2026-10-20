@@ -660,6 +660,51 @@ pub(crate) fn counting_failing_launcher() -> (
     (launcher, launches)
 }
 
+/// A launcher that hands back a fake worker for every launch, keeping the event
+/// senders alive so the drains never see a close.
+#[cfg(test)]
+pub(crate) fn succeeding_launcher() -> crate::acp::supervisor::Launcher {
+    let senders: Arc<std::sync::Mutex<Vec<tokio::sync::mpsc::Sender<crate::acp::state::Event>>>> =
+        Default::default();
+    Arc::new(move |_config, id| {
+        let senders = Arc::clone(&senders);
+        Box::pin(async move {
+            let (client, tx) = crate::acp::acp_client::AcpClient::fake_for_test(id);
+            senders.lock().unwrap().push(tx);
+            Ok(client)
+        })
+    })
+}
+
+/// Makes `profile`'s directory read-only, so storage opens and loads but cannot
+/// write; the mode comes back when the guard drops.
+#[cfg(test)]
+pub(crate) fn lock_profile_dir_for_test(profile: &str) -> ProfileDirLock {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = crate::session::get_profile_dir(profile).expect("profile dir");
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o555)).expect("lock");
+    ProfileDirLock(dir)
+}
+
+#[cfg(test)]
+pub(crate) struct ProfileDirLock(std::path::PathBuf);
+
+#[cfg(test)]
+impl ProfileDirLock {
+    /// Whether the lock actually denies writes (it does not for root).
+    pub(crate) fn blocks_writes(&self) -> bool {
+        std::fs::File::create(self.0.join(".probe")).is_err()
+    }
+}
+
+#[cfg(test)]
+impl Drop for ProfileDirLock {
+    fn drop(&mut self) {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(0o755));
+    }
+}
+
 /// Once the blocking hook signals `ready`, archive the stored rows matching `is_target` under
 /// their lifecycle lock, as `aoe session archive --no-kill` does, then release the hook.
 /// Returns whether the hook ran and a row was archived; the hook is released either way.
