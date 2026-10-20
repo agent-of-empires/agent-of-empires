@@ -109,7 +109,7 @@ test.describe("persisted login sessions", () => {
   test("settings -> devices renders the signed-in session as this device", async ({ servePreauthed, page }) => {
     await bootDashboard(page, servePreauthed, "/settings/devices");
     await expect(page.getByRole("heading", { name: /connected devices/i })).toBeVisible({ timeout: 10_000 });
-    await expect(page.getByText(/this device/i)).toBeVisible({ timeout: 10_000 });
+    await expect(page.getByText(/^this device$/i)).toBeVisible({ timeout: 10_000 });
     await expect(page.getByRole("button", { name: /sign out all devices/i })).toBeVisible();
   });
 });
