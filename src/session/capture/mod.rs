@@ -19,7 +19,6 @@ mod opencode;
 mod pi;
 mod prime;
 
-#[cfg(test)]
 pub(crate) use claude::encode_claude_project_path;
 pub(crate) use claude::exports_claude_store;
 pub(crate) use claude::{
