@@ -2223,7 +2223,7 @@ impl App {
 
     /// On-demand "Auto-name now"; the new title arrives through the file watcher.
     async fn perform_smart_rename(&mut self, session_id: &str) {
-        use crate::acp::client::{locate_daemon, HttpClient, ManagerError};
+        use crate::acp::client::{ensure_daemon, HttpClient};
 
         // A second request would replace the receiver and lose the first one's result.
         if self.smart_rename_rx.is_some() {
@@ -2236,16 +2236,21 @@ impl App {
             .map(|i| i.title.clone())
             .unwrap_or_default();
 
-        let endpoint = match locate_daemon().await {
-            Ok(e) => e,
-            Err(ManagerError::NoDaemonRunning(_)) => {
-                self.set_status(
-                    "Auto-name needs a running daemon; open the structured view first.",
-                );
-                return;
+        let endpoint = match ensure_daemon().await {
+            Ok((endpoint, started)) => {
+                if let Some(pid) = started {
+                    tracing::info!(target: "tui.daemon", pid, "started aoe daemon");
+                }
+                endpoint
             }
             Err(e) => {
-                self.set_status(format!("daemon unreachable: {e}"));
+                let first = e
+                    .to_string()
+                    .lines()
+                    .next()
+                    .unwrap_or("unknown error")
+                    .to_string();
+                self.set_status(format!("daemon unreachable: {first}"));
                 return;
             }
         };
