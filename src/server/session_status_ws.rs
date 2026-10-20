@@ -18,6 +18,7 @@ use super::AppState;
 
 const PING_INTERVAL: Duration = Duration::from_secs(25);
 const WRITE_TIMEOUT: Duration = Duration::from_secs(10);
+const PONG_IDLE_TIMEOUT: Duration = Duration::from_secs(90);
 
 pub async fn session_status_ws(
     ws: WebSocketUpgrade,
@@ -97,6 +98,7 @@ async fn serve(mut socket: WebSocket, state: Arc<AppState>) {
     let mut ping = tokio::time::interval(PING_INTERVAL);
     ping.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     ping.tick().await;
+    let mut last_pong_at = Instant::now();
 
     loop {
         let sleep = match dwells.next_due() {
@@ -107,9 +109,17 @@ async fn serve(mut socket: WebSocket, state: Arc<AppState>) {
             _ = state.shutdown.cancelled() => break,
             incoming = socket.recv() => match incoming {
                 Some(Ok(Message::Close(_))) | None | Some(Err(_)) => break,
+                Some(Ok(Message::Pong(_))) => {
+                    last_pong_at = Instant::now();
+                    continue;
+                }
                 Some(Ok(_)) => continue,
             },
             _ = ping.tick() => {
+                if last_pong_at.elapsed() > PONG_IDLE_TIMEOUT {
+                    tracing::debug!(target: "http.middleware", "session status ws idle reaper fired");
+                    break;
+                }
                 if !send(&mut socket, Message::Ping(Vec::new().into())).await {
                     break;
                 }
