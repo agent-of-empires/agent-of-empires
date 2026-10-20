@@ -388,13 +388,28 @@ static ACTIONABLE: tokio::sync::Mutex<Option<Actionable>> = tokio::sync::Mutex::
 /// [`install_method_supports_target`], cached per target for an hour. The Web dashboard asks on
 /// every poll and tab switch from every Device, and each probe shells out to `brew` twice.
 pub async fn update_actionable(target_version: &str) -> bool {
-    actionable_cached(
+    actionable_detached(
         &ACTIONABLE,
         target_version,
         std::time::Instant::now(),
         install_method_supports_target,
     )
     .await
+}
+
+/// Runs the lookup in its own task. A request dropped mid-probe (the client went away) would
+/// otherwise release the lock while the blocking probe keeps running, so the next request starts
+/// a second probe and the first answer is never cached.
+async fn actionable_detached(
+    cache: &'static tokio::sync::Mutex<Option<Actionable>>,
+    target: &str,
+    now: std::time::Instant,
+    probe: impl FnOnce(&str) -> bool + Send + 'static,
+) -> bool {
+    let target = target.to_string();
+    tokio::spawn(async move { actionable_cached(cache, &target, now, probe).await })
+        .await
+        .unwrap_or(true)
 }
 
 /// The lock is held across the probe, so requests that miss together share one probe.
@@ -643,6 +658,45 @@ mod tests {
             3,
             "an expired entry probes again"
         );
+    }
+
+    #[tokio::test]
+    async fn a_cancelled_request_still_caches_its_probe() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let cache: &'static _ = Box::leak(Box::new(tokio::sync::Mutex::new(None)));
+        let calls = std::sync::Arc::new(AtomicUsize::new(0));
+        let now = std::time::Instant::now();
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+
+        let first_calls = calls.clone();
+        let first = tokio::spawn(actionable_detached(cache, "1.1.0", now, move |_: &str| {
+            entered_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+            first_calls.fetch_add(1, Ordering::SeqCst);
+            false
+        }));
+        entered_rx.await.unwrap();
+        // The client goes away while `brew` is still running.
+        first.abort();
+        assert!(first.await.unwrap_err().is_cancelled());
+
+        let second_calls = calls.clone();
+        let second = tokio::spawn(actionable_detached(cache, "1.1.0", now, move |_: &str| {
+            second_calls.fetch_add(1, Ordering::SeqCst);
+            true
+        }));
+        release_tx.send(()).unwrap();
+        assert!(
+            !second.await.unwrap(),
+            "the second request reads the first probe's answer"
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "one probe ran");
+        assert!(cache
+            .lock()
+            .await
+            .as_ref()
+            .is_some_and(|e| e.target == "1.1.0" && !e.supported));
     }
 
     #[test]
