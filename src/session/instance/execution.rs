@@ -210,12 +210,17 @@ fn ensure_claude_store_root(
     ) {
         return Ok(());
     }
-    let is_projects = |p: &std::path::Path| p.file_name().is_some_and(|n| n == "projects");
-    let root = [Some(store), store.parent()]
-        .into_iter()
-        .flatten()
-        .find(|p| is_projects(p))
-        .and_then(|p| p.parent());
+    let named_projects = |p: Option<&std::path::Path>| {
+        p.and_then(std::path::Path::file_name)
+            .is_some_and(|n| n == "projects")
+    };
+    let root = if named_projects(Some(store)) {
+        store.parent()
+    } else if named_projects(store.parent()) {
+        store.parent().and_then(std::path::Path::parent)
+    } else {
+        None
+    };
     match root {
         Some(root) => anyhow::bail!(
             "--store must be the Claude config root (the directory containing projects/), not a projects subdirectory; use {}",
