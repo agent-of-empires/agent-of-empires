@@ -403,6 +403,37 @@ impl EventStore {
         .collect()
     }
 
+    /// True while the agent process holds work a replacement would lose: an
+    /// in-flight turn or background work, or a recent background finish the
+    /// agent has not yet answered with a turn.
+    pub fn holds_live_work(&self, session_id: &str) -> bool {
+        self.has_in_flight_turn(session_id) || self.has_unhandled_finish(session_id)
+    }
+
+    /// A background task or agent finished after the latest `Stopped`, so the
+    /// agent's follow-up turn is still pending. Old finishes expire so a turn
+    /// that never came cannot hold the runner forever.
+    fn has_unhandled_finish(&self, session_id: &str) -> bool {
+        let stale_cutoff = chrono::Utc::now().timestamp_millis() - BACKGROUND_AGENT_STALE_AFTER_MS;
+        logged(
+            self.conn().query_row(
+                "SELECT EXISTS (
+                     SELECT 1 FROM acp_events
+                     WHERE session_id = ?1
+                       AND discriminant IN ('BackgroundTaskFinished', 'BackgroundAgentCompleted')
+                       AND created_at >= ?2
+                       AND seq > COALESCE((SELECT MAX(seq) FROM acp_events
+                                           WHERE session_id = ?1
+                                             AND discriminant = 'Stopped'), 0))",
+                params![session_id, stale_cutoff],
+                |row| row.get::<_, bool>(0),
+            ),
+            "has_unhandled_finish query",
+            session_id,
+        )
+        .unwrap_or(false)
+    }
+
     fn latest_prompt_state(&self, session_id: &str) -> Option<bool> {
         let conn = self.conn();
         let prompt_seq = logged(
@@ -720,6 +751,69 @@ mod tests {
             !store.has_in_flight_turn("stale"),
             "a silent background agent is gone"
         );
+    }
+
+    #[test]
+    fn a_background_finish_holds_live_work_until_the_agent_answers() {
+        let (_tmp, store) = open_store(1000);
+        let started = Event::BackgroundTaskStarted {
+            task_id: "t".into(),
+            tool_call_id: None,
+            description: "sleep".into(),
+            workflow: None,
+        };
+        let finished = Event::BackgroundTaskFinished {
+            task_id: "t".into(),
+            ended_at: None,
+        };
+        // (events, holds live work)
+        let cases = [
+            (vec![user_prompt("go"), stopped("prompt_complete")], false),
+            (
+                vec![
+                    user_prompt("go"),
+                    started.clone(),
+                    stopped("prompt_complete"),
+                    finished.clone(),
+                ],
+                true,
+            ),
+            (
+                vec![
+                    user_prompt("go"),
+                    started,
+                    stopped("prompt_complete"),
+                    finished,
+                    agent_chunk("done"),
+                    stopped("prompt_complete"),
+                ],
+                false,
+            ),
+        ];
+        for (i, (events, holds)) in cases.into_iter().enumerate() {
+            let id = format!("s-{i}");
+            record_from(&store, &id, 1, events);
+            assert_eq!(store.holds_live_work(&id), holds, "case {i}");
+        }
+    }
+
+    /// An unhandled finish whose follow-up turn never came does not hold the
+    /// runner forever.
+    #[test]
+    fn an_old_unhandled_finish_no_longer_holds_live_work() {
+        let (_tmp, store) = open_store(1000);
+        let old =
+            chrono::Utc::now().timestamp_millis() - (BACKGROUND_AGENT_STALE_AFTER_MS + 60_000);
+        store.record_at("s", 1, &user_prompt("go"), old).unwrap();
+        store
+            .record_at("s", 2, &stopped("prompt_complete"), old)
+            .unwrap();
+        let finished = Event::BackgroundTaskFinished {
+            task_id: "t".into(),
+            ended_at: None,
+        };
+        store.record_at("s", 3, &finished, old).unwrap();
+        assert!(!store.holds_live_work("s"));
     }
 
     #[test]
