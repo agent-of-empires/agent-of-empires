@@ -662,7 +662,8 @@ fn cli_acp_tail_connects_to_behind_proxy_passphrase_daemon() {
 fn cli_serve_controls_skip_migrations_and_lock() {
     use fs2::FileExt as _;
 
-    let h = TuiTestHarness::new("serve_controls_skip_migrations");
+    let mut h = TuiTestHarness::new("serve_controls_skip_migrations");
+    h.remove_env("AOE_DAEMON_URL");
     let app = app_dir_in(h.home_path());
     std::fs::create_dir_all(&app).unwrap();
     let version = app.join(".schema_version");
