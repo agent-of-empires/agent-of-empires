@@ -354,6 +354,12 @@ pub async fn reconcile_acp_workers(
             })
             .await
             .unwrap_or(false);
+        target.holds_live_work = target.in_flight_turn
+            || query_store(&state.acp_event_store, &id, "live work", |s, id| {
+                s.holds_live_work(id)
+            })
+            .await
+            .unwrap_or(false);
         attempted.insert(id);
         tasks.push(target);
     }
