@@ -418,10 +418,12 @@ async fn rate_limit_on_an_agent_initiated_turn_ends_the_connection() {
 #[tokio::test]
 async fn prompted_turn_ending_on_a_rejected_window_parks() {
     let now = chrono::Utc::now().timestamp();
-    for (stop_reason, resets_at, parks) in [
-        ("end_turn", now + 3600, true),
-        ("cancelled", now + 3600, false),
-        ("end_turn", now - 60, false),
+    for (stop_reason, resets_at, late, parks) in [
+        ("end_turn", now + 3600, false, true),
+        // The rejection lands after the response; the next prompt must park.
+        ("end_turn", now + 3600, true, true),
+        ("cancelled", now + 3600, false, false),
+        ("end_turn", now - 60, false, false),
     ] {
         let (daemon_write, agent_read) = tokio::io::duplex(64 * 1024);
         let (agent_write, daemon_read) = tokio::io::duplex(64 * 1024);
@@ -461,6 +463,7 @@ async fn prompted_turn_ending_on_a_rejected_window_parks() {
         let transport = ByteStreams::new(daemon_write.compat_write(), daemon_read.compat());
         let connection = tokio::spawn(run_connection_task(transport, params));
         let reply_write = agent_write.clone();
+        let answered = Arc::new(AtomicBool::new(false));
         let agent = tokio::spawn(async move {
             let mut lines = BufReader::new(agent_read).lines();
             while let Ok(Some(line)) = lines.next_line().await {
@@ -486,6 +489,20 @@ async fn prompted_turn_ending_on_a_rejected_window_parks() {
                         .await;
                     }
                     Some("session/prompt") => {
+                        if late {
+                            // Only the first prompt is answered.
+                            if answered.swap(true, Ordering::SeqCst) {
+                                continue;
+                            }
+                            write_line(
+                                &reply_write,
+                                &format!(
+                                    r#"{{"jsonrpc":"2.0","id":{id},"result":{{"stopReason":"{stop_reason}"}}}}"#
+                                ),
+                            )
+                            .await;
+                            continue;
+                        }
                         write_line(
                             &reply_write,
                             &format!(
@@ -524,6 +541,38 @@ async fn prompted_turn_ending_on_a_rejected_window_parks() {
                 seen.push(event);
                 if stopped {
                     break;
+                }
+            }
+            if late {
+                assert!(
+                    matches!(seen.last(), Some(Event::Stopped { reason }) if reason == "prompt_complete"),
+                    "{seen:?}"
+                );
+                write_line(
+                    &agent_write,
+                    &format!(
+                        r#"{{"jsonrpc":"2.0","method":"session/update","params":{{"sessionId":"s-prompted","update":{{"sessionUpdate":"usage_update","used":10,"size":100,"_meta":{{"_claude/rateLimit":{{"status":"rejected","rateLimitType":"five_hour","resetsAt":{resets_at}}}}}}}}}}}"#
+                    ),
+                )
+                .await;
+                // The capture happens before the update is forwarded, so
+                // seeing it means the window is recorded.
+                while !matches!(
+                    event_rx.recv().await.expect("connection remains open"),
+                    Event::UsageUpdated { .. }
+                ) {}
+                cmd_tx
+                    .send(ClientCmd::Prompt(vec![ContentBlock::Text(
+                        TextContent::new("again"),
+                    )]))
+                    .await
+                    .unwrap();
+                while let Some(event) = event_rx.recv().await {
+                    let stopped = matches!(event, Event::Stopped { .. });
+                    seen.push(event);
+                    if stopped {
+                        break;
+                    }
                 }
             }
         })

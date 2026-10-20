@@ -3,7 +3,7 @@
 //! mid-turn steering.
 
 use crate::acp::control_protocol::PromptOutcome;
-use crate::acp::state::Event;
+use crate::acp::state::{Event, RateLimitInfo};
 use agent_client_protocol::schema::v1::{ContentBlock, PromptRequest, PromptResponse, StopReason};
 use std::collections::VecDeque;
 use std::future::Future;
@@ -140,6 +140,19 @@ impl Session {
     /// the connection should shut down.
     pub(super) async fn run_prompt(&mut self, blocks: Vec<ContentBlock>) -> AcpResult<bool> {
         let shared = self.shared.clone();
+        // The rejecting update can land after the prompt response, where the
+        // per-prompt clear below would drop it.
+        if std::mem::take(&mut self.prior_turn_ended_uncancelled) {
+            if let Some(info) = self.take_parking_rejection() {
+                shared.emit(Event::RateLimit { info }).await;
+                shared
+                    .emit(Event::Stopped {
+                        reason: "rate_limited".into(),
+                    })
+                    .await;
+                return Ok(true);
+            }
+        }
         if let Some(control) = self.control.as_ref() {
             control.supersede_adopted_turn();
         }
@@ -305,7 +318,12 @@ impl Session {
             Ok(resp) => {
                 turn.flags.prompt_cancelled = matches!(resp.stop_reason, StopReason::Cancelled);
                 if !turn.flags.prompt_cancelled {
-                    self.park_on_captured_rejection(turn).await;
+                    if let Some(info) = self.take_parking_rejection() {
+                        self.shared.emit(Event::RateLimit { info }).await;
+                        turn.flags.rate_limited = true;
+                        turn.flags.shutdown = true;
+                    }
+                    self.prior_turn_ended_uncancelled = true;
                 }
                 return Ok(Flow::Break);
             }
@@ -351,23 +369,19 @@ impl Session {
 
     /// The adapter can end a limited turn normally, so a still-future rejected
     /// window captured during it is the only evidence; park like the error path.
-    async fn park_on_captured_rejection(&self, turn: &mut Turn) {
+    fn take_parking_rejection(&self) -> Option<RateLimitInfo> {
         let shared = &self.shared;
-        let Some(info) = take_rate_limit_from_captured_rejection(
+        let info = take_rate_limit_from_captured_rejection(
             &shared.rate_limit_rejections,
             chrono::Utc::now(),
-        ) else {
-            return;
-        };
+        )?;
         info!(
             target: "acp.protocol",
             session = %shared.session_label,
             resets_at = ?info.resets_at,
             "prompted turn ended on a rejected rate-limit window; parking session"
         );
-        shared.emit(Event::RateLimit { info }).await;
-        turn.flags.rate_limited = true;
-        turn.flags.shutdown = true;
+        Some(info)
     }
 
     async fn reject_busy(&self, text: String) {

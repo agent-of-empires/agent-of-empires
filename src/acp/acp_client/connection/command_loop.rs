@@ -60,6 +60,9 @@ pub(super) struct Session {
     /// Steers the adapter handed back unconsumed, run as ordinary turns.
     /// Kept here rather than re-sent on the bounded channel this task drains.
     pub(super) pending_prompts: VecDeque<Vec<ContentBlock>>,
+    /// The last prompted turn ended without cancel, so a rejected window
+    /// captured since then belongs to it and must park before the next prompt.
+    pub(super) prior_turn_ended_uncancelled: bool,
 }
 
 impl Session {
