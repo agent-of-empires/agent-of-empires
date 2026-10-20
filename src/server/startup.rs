@@ -315,7 +315,7 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
         login::LoginManager::new(passphrase)
     });
     let passkey_manager = Arc::new(match crate::session::get_app_dir() {
-        Ok(app_dir) => super::passkeys::PasskeyManager::with_persistence(&app_dir),
+        Ok(app_dir) => super::passkeys::PasskeyManager::with_persistence(&app_dir, passphrase),
         Err(_) => super::passkeys::PasskeyManager::in_memory(),
     });
     let rate_limiter = Arc::new(RateLimiter::new());

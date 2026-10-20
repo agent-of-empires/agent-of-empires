@@ -24,7 +24,9 @@ use webauthn_rs::prelude::{
 
 use super::access::norm_host;
 use super::auth::{resolve_client_ip, AuthenticatedSession};
-use super::login::{decode_binding_secret, issue_session, session_id_from_headers};
+use super::login::{
+    argon2_verify, decode_binding_secret, hash_passphrase, issue_session, session_id_from_headers,
+};
 use super::secure_store::{check_path_security, write_private};
 use super::AppState;
 use crate::util::now_ms;
@@ -124,14 +126,18 @@ struct PersistedStore {
     schema_version: u32,
     /// Stable id for the single aoe owner, reused for every registration.
     user_handle: String,
+    /// argon2 hash of the passphrase the credentials were enrolled under; a different
+    /// passphrase drops them, as it drops login sessions.
+    passphrase_hash: Option<String>,
     credentials: Vec<StoredPasskey>,
 }
 
 impl PersistedStore {
-    fn new() -> Self {
+    fn new(passphrase_hash: Option<String>) -> Self {
         Self {
             schema_version: STORE_SCHEMA_VERSION,
             user_handle: Uuid::new_v4().to_string(),
+            passphrase_hash,
             credentials: Vec::new(),
         }
     }
@@ -194,8 +200,9 @@ pub enum PasskeyError {
 
 pub struct PasskeyManager {
     path: Option<PathBuf>,
-    /// Set when an existing store could not be loaded; the file is then never overwritten.
-    load_failed: bool,
+    /// Set when the store cannot be used (unreadable, or no passphrase to bind it to); the
+    /// file is then never overwritten.
+    disabled: bool,
     store: Mutex<PersistedStore>,
     registrations: StdMutex<HashMap<String, Ceremony<PasskeyRegistration>>>,
     authentications: StdMutex<HashMap<String, Ceremony<PasskeyAuthentication>>>,
@@ -212,30 +219,62 @@ fn purge_expired<S>(map: &mut HashMap<String, Ceremony<S>>) {
 
 impl PasskeyManager {
     pub fn in_memory() -> Self {
-        Self::build(None, false, PersistedStore::new())
+        Self::build(None, false, PersistedStore::new(None))
     }
 
-    /// Load `<app_dir>/passkeys.json`, creating the store on first use.
-    pub fn with_persistence(app_dir: &Path) -> Self {
+    /// Load `<app_dir>/passkeys.json`, creating the store on first use. Credentials enrolled
+    /// under a different passphrase are dropped; with no passphrase the store is left alone
+    /// and disabled.
+    pub fn with_persistence(app_dir: &Path, passphrase: Option<&str>) -> Self {
         let path = app_dir.join(STORE_FILE);
+        let Some(passphrase) = passphrase else {
+            return Self::build(Some(path), true, PersistedStore::new(None));
+        };
         match load_store(&path) {
-            Ok(Some(store)) => Self::build(Some(path), false, store),
-            Ok(None) => Self::build(Some(path), false, PersistedStore::new()),
+            Ok(Some(store))
+                if store
+                    .passphrase_hash
+                    .as_deref()
+                    .is_some_and(|hash| argon2_verify(passphrase, hash)) =>
+            {
+                Self::build(Some(path), false, store)
+            }
+            Ok(loaded) => {
+                let fresh = PersistedStore::new(Some(hash_passphrase(passphrase)));
+                if loaded.is_some() {
+                    tracing::warn!(
+                        target: "auth.passkey",
+                        "passphrase changed since passkeys were enrolled; dropping them"
+                    );
+                    match serde_json::to_vec_pretty(&fresh)
+                        .map_err(anyhow::Error::from)
+                        .and_then(|bytes| write_private(&path, &bytes))
+                    {
+                        Ok(()) => Self::build(Some(path), false, fresh),
+                        Err(e) => {
+                            tracing::warn!(target: "auth.passkey", error = %e, "could not clear passkey store");
+                            Self::build(Some(path), true, fresh)
+                        }
+                    }
+                } else {
+                    Self::build(Some(path), false, fresh)
+                }
+            }
             Err(e) => {
                 tracing::warn!(
                     target: "auth.passkey",
                     error = %e,
                     "could not load passkey store; passkeys disabled and the file left untouched"
                 );
-                Self::build(Some(path), true, PersistedStore::new())
+                Self::build(Some(path), true, PersistedStore::new(None))
             }
         }
     }
 
-    fn build(path: Option<PathBuf>, load_failed: bool, store: PersistedStore) -> Self {
+    fn build(path: Option<PathBuf>, disabled: bool, store: PersistedStore) -> Self {
         Self {
             path,
-            load_failed,
+            disabled,
             store: Mutex::new(store),
             registrations: StdMutex::new(HashMap::new()),
             authentications: StdMutex::new(HashMap::new()),
@@ -243,7 +282,7 @@ impl PasskeyManager {
     }
 
     pub async fn available_for(&self, profile: &Profile) -> bool {
-        !self.load_failed && !self.store.lock().await.passkeys_for(profile).is_empty()
+        !self.disabled && !self.store.lock().await.passkeys_for(profile).is_empty()
     }
 
     pub async fn list(&self) -> Vec<PasskeyInfo> {
@@ -252,7 +291,7 @@ impl PasskeyManager {
     }
 
     async fn persist(&self, next: &PersistedStore) -> Result<(), PasskeyError> {
-        if self.load_failed {
+        if self.disabled {
             return Err(PasskeyError::Storage("passkey store failed to load".into()));
         }
         let Some(path) = self.path.clone() else {
@@ -284,7 +323,7 @@ impl PasskeyManager {
         profile: &Profile,
         ip: IpAddr,
     ) -> Result<(String, serde_json::Value), PasskeyError> {
-        if self.load_failed {
+        if self.disabled {
             return Err(PasskeyError::Unavailable);
         }
         let creds = self.store.lock().await.passkeys_for(profile);
@@ -368,7 +407,7 @@ impl PasskeyManager {
         label: &str,
     ) -> Result<(String, serde_json::Value), PasskeyError> {
         let store = self.store.lock().await;
-        if self.load_failed || store.credentials.len() >= MAX_CREDENTIALS {
+        if self.disabled || store.credentials.len() >= MAX_CREDENTIALS {
             return Err(PasskeyError::LimitReached);
         }
         let exclude = store
@@ -882,7 +921,7 @@ mod tests {
     #[tokio::test]
     async fn enrol_and_sign_in_persists_owner_only_and_advances_counter() {
         let dir = tempfile::tempdir().unwrap();
-        let mgr = PasskeyManager::with_persistence(dir.path());
+        let mgr = PasskeyManager::with_persistence(dir.path(), Some("pw"));
         let mut auth = authenticator();
         let info = enrol(&mgr, &mut auth, ORIGIN, "s1").await;
         assert_eq!(info.label, "Phone");
@@ -899,12 +938,51 @@ mod tests {
             assert_eq!(mode & 0o777, 0o600);
         }
 
-        let reloaded = PasskeyManager::with_persistence(dir.path());
+        let reloaded = PasskeyManager::with_persistence(dir.path(), Some("pw"));
         assert!(reloaded.available_for(&profile(ORIGIN)).await);
         assert_eq!(
             stored_counter(&reloaded).await,
             1,
             "counter survives restart"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_passphrase_change_drops_passkeys_and_a_missing_one_only_disables_them() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(STORE_FILE);
+        let p = profile(ORIGIN);
+        let mut auth = authenticator();
+        enrol(
+            &PasskeyManager::with_persistence(dir.path(), Some("pw")),
+            &mut auth,
+            ORIGIN,
+            "s1",
+        )
+        .await;
+        let enrolled = std::fs::read(&path).unwrap();
+
+        // No passphrase: disabled, and the file is not touched.
+        let disabled = PasskeyManager::with_persistence(dir.path(), None);
+        assert!(!disabled.available_for(&p).await);
+        assert_eq!(std::fs::read(&path).unwrap(), enrolled);
+
+        // The original passphrase brings them back, so the disabled start lost nothing.
+        let same = PasskeyManager::with_persistence(dir.path(), Some("pw"));
+        assert!(same.available_for(&p).await);
+
+        // A different passphrase revokes them, in memory and on disk.
+        let rotated = PasskeyManager::with_persistence(dir.path(), Some("other"));
+        assert!(!rotated.available_for(&p).await);
+        let reloaded = PasskeyManager::with_persistence(dir.path(), Some("other"));
+        assert!(reloaded.list().await.is_empty());
+        let on_disk: PersistedStore =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert!(on_disk.credentials.is_empty());
+        assert!(
+            !PasskeyManager::with_persistence(dir.path(), Some("pw"))
+                .available_for(&p)
+                .await
         );
     }
 
@@ -1017,7 +1095,7 @@ mod tests {
     #[tokio::test]
     async fn overlapping_finishes_cannot_both_commit_against_a_stale_counter() {
         let dir = tempfile::tempdir().unwrap();
-        let mgr = PasskeyManager::with_persistence(dir.path());
+        let mgr = PasskeyManager::with_persistence(dir.path(), Some("pw"));
         let mut auth = authenticator();
         enrol(&mgr, &mut auth, ORIGIN, "s1").await;
         let p = profile(ORIGIN);
@@ -1109,7 +1187,7 @@ mod tests {
         for (content, mode) in [("{ not json", 0o600), ("{}", 0o644)] {
             std::fs::write(&path, content).unwrap();
             std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).unwrap();
-            let mgr = PasskeyManager::with_persistence(dir.path());
+            let mgr = PasskeyManager::with_persistence(dir.path(), Some("pw"));
             let p = profile(ORIGIN);
             assert!(!mgr.available_for(&p).await);
             assert!(matches!(
@@ -1121,8 +1199,8 @@ mod tests {
 
         std::fs::remove_file(&path).unwrap();
         std::os::unix::fs::symlink(dir.path().join("target"), &path).unwrap();
-        let mgr = PasskeyManager::with_persistence(dir.path());
-        assert!(mgr.load_failed, "a symlinked store is refused");
+        let mgr = PasskeyManager::with_persistence(dir.path(), Some("pw"));
+        assert!(mgr.disabled, "a symlinked store is refused");
     }
 
     fn state_with_login(passphrase: Option<&str>) -> Arc<AppState> {

@@ -95,7 +95,7 @@ pub struct LoginManager {
 }
 
 /// Argon2 hash of a passphrase with a fresh random salt.
-fn hash_passphrase(passphrase: &str) -> String {
+pub(super) fn hash_passphrase(passphrase: &str) -> String {
     use argon2::{Argon2, PasswordHasher};
 
     Argon2::default()
@@ -105,7 +105,7 @@ fn hash_passphrase(passphrase: &str) -> String {
 }
 
 /// Verify a passphrase against a stored argon2 PHC hash string.
-fn argon2_verify(passphrase: &str, hash: &str) -> bool {
+pub(super) fn argon2_verify(passphrase: &str, hash: &str) -> bool {
     use argon2::{Argon2, PasswordVerifier};
 
     Argon2::default()
