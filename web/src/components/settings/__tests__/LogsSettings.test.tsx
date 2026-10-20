@@ -16,7 +16,9 @@ import { LogsSettings } from "../LogsSettings";
 
 const CONTENT = "INFO started\nWARN token=[REDACTED]\n";
 
-beforeEach(() => fetchLogs.mockReset());
+beforeEach(() => {
+  fetchLogs.mockReset();
+});
 afterEach(() => vi.unstubAllGlobals());
 
 describe("LogsSettings", () => {
@@ -50,6 +52,30 @@ describe("LogsSettings", () => {
     const { findByText, getByTestId } = render(<LogsSettings />);
     await findByText(message);
     expect((getByTestId("logs-download") as HTMLButtonElement).disabled).toBe(true);
+  });
+
+  it("says so when the log file is empty", async () => {
+    fetchLogs.mockResolvedValue({ status: "available", content: "", lineCount: 0, truncated: false });
+    const { findByText } = render(<LogsSettings />);
+    await findByText("The log file is empty.");
+  });
+
+  it("falls back to a generic message for a non-Error rejection", async () => {
+    fetchLogs.mockRejectedValueOnce("boom");
+    const { findByText } = render(<LogsSettings />);
+    await findByText("Could not load logs");
+  });
+
+  it("aborts the in-flight request on unmount", async () => {
+    let signal: AbortSignal | undefined;
+    fetchLogs.mockImplementation((_lines, s) => {
+      signal = s;
+      return new Promise(() => {});
+    });
+    const { unmount } = render(<LogsSettings />);
+    await waitFor(() => expect(signal).toBeDefined());
+    unmount();
+    expect(signal!.aborted).toBe(true);
   });
 
   it("surfaces a failed fetch and recovers on Refresh", async () => {

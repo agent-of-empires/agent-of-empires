@@ -837,6 +837,25 @@ describe("fetchCityHallBundle", () => {
   });
 });
 
+describe("fetchLogs", () => {
+  it("requests the line count and returns the snapshot", async () => {
+    const snapshot = { status: "available", content: "a\n", lineCount: 1, truncated: false };
+    fetchSpy.mockResolvedValueOnce(json(snapshot));
+    const signal = new AbortController().signal;
+    await expect(api.fetchLogs(200, signal)).resolves.toEqual(snapshot);
+    expect(lastCall().url).toBe("/api/system/logs?lines=200");
+    expect(lastCall().init).toEqual({ signal });
+  });
+
+  it.each([
+    [json({ message: "Server is in read-only mode" }, 403), "Server is in read-only mode"],
+    [new Response("<html>502</html>", { status: 502 }), "Could not load logs (HTTP 502)"],
+  ])("throws the server message or status", async (response, message) => {
+    fetchSpy.mockResolvedValueOnce(response);
+    await expect(api.fetchLogs(500)).rejects.toThrow(message);
+  });
+});
+
 describe("installAcpAgent", () => {
   it("POSTs and returns the parsed body", async () => {
     const body = { session_id: "s-1", package: "p", success: true, exit_code: 0, stdout: "", stderr: "" };
