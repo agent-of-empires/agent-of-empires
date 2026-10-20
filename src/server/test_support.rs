@@ -676,33 +676,13 @@ pub(crate) fn succeeding_launcher() -> crate::acp::supervisor::Launcher {
     })
 }
 
-/// Makes `profile`'s directory read-only, so storage opens and loads but cannot
-/// write; the mode comes back when the guard drops.
+/// Fails every `sessions.json` write while the guard lives, leaving rows loadable.
+/// The failpoint is process-wide, so the test must be serial.
 #[cfg(test)]
-pub(crate) fn lock_profile_dir_for_test(profile: &str) -> ProfileDirLock {
-    use std::os::unix::fs::PermissionsExt;
-    let dir = crate::session::get_profile_dir(profile).expect("profile dir");
-    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o555)).expect("lock");
-    ProfileDirLock(dir)
-}
-
-#[cfg(test)]
-pub(crate) struct ProfileDirLock(std::path::PathBuf);
-
-#[cfg(test)]
-impl ProfileDirLock {
-    /// Whether the lock actually denies writes (it does not for root).
-    pub(crate) fn blocks_writes(&self) -> bool {
-        std::fs::File::create(self.0.join(".probe")).is_err()
-    }
-}
-
-#[cfg(test)]
-impl Drop for ProfileDirLock {
-    fn drop(&mut self) {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(0o755));
-    }
+pub(crate) fn fail_session_writes_for_test(profile: &str) -> crate::session::storage::WriteFailureGuard {
+    Storage::new_unwatched(profile)
+        .expect("storage")
+        .fail_writes_for_test()
 }
 
 /// Once the blocking hook signals `ready`, archive the stored rows matching `is_target` under

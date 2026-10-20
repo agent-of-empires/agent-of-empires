@@ -1672,17 +1672,7 @@ mod tests {
                 .count()
         };
 
-        // Launch admission opens its lock file inside the directory; create it first.
-        drop(
-            crate::session::Storage::new_unwatched(profile)
-                .unwrap()
-                .acquire_instance_lifecycle_lock(&id)
-                .unwrap(),
-        );
-        let lock = support::lock_profile_dir_for_test(profile);
-        if !lock.blocks_writes() {
-            return;
-        }
+        let failure = support::fail_session_writes_for_test(profile);
         let resp = switch().await;
         let status = resp.status();
         let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
@@ -1715,7 +1705,7 @@ mod tests {
         assert_eq!(stored[0].agent_name.as_deref(), Some("claude"));
         assert_eq!(stored[0].acp_effort.as_deref(), Some("high"));
 
-        drop(lock);
+        drop(failure);
         let resp = switch().await;
         assert_eq!(resp.status(), StatusCode::OK);
         assert_eq!(switched(), 1);
