@@ -308,6 +308,64 @@ describe("AssistantMessage tool output media", () => {
     getByText("first finding");
   });
 
+  it("keeps a write's structured diff so its card expands", () => {
+    const path = "/tmp/out.sh";
+    const messages = activityToThreadMessages(
+      [
+        { id: "u1", kind: "user_prompt", text: "go", at },
+        {
+          id: "start-w1",
+          kind: "tool_start",
+          text: `Write ${path}`,
+          at,
+          toolCallId: "w1",
+          tool: {
+            id: "w1",
+            name: `Write ${path}`,
+            kind: "edit",
+            args_preview: JSON.stringify({ file_path: path }),
+            started_at: at,
+            diffs: [{ path, old_text: null, new_text: "echo hi\n", created_at: at }],
+          },
+        },
+        { id: "done-w1", kind: "tool_complete", text: "", at, toolCallId: "w1" },
+      ],
+      false,
+    );
+    const { container } = render(<Harness messages={messages} />);
+    const header = container.querySelector("button");
+    expect(header).not.toBeNull();
+    fireEvent.click(header!);
+    expect(container.querySelector('[data-testid="string-diff"]')).not.toBeNull();
+  });
+
+  it("ignores malformed carried diffs instead of crashing the card", () => {
+    const messages = activityToThreadMessages(
+      [
+        { id: "u1", kind: "user_prompt", text: "go", at },
+        {
+          id: "start-w2",
+          kind: "tool_start",
+          text: "Write /tmp/x",
+          at,
+          toolCallId: "w2",
+          tool: {
+            id: "w2",
+            name: "Write /tmp/x",
+            kind: "edit",
+            args_preview: JSON.stringify({ file_path: "/tmp/x", _aoe_diffs: [null, { path: 1 }] }),
+            started_at: at,
+          },
+        },
+        { id: "done-w2", kind: "tool_complete", text: "", at, toolCallId: "w2" },
+      ],
+      false,
+    );
+    const { container } = render(<Harness messages={messages} />);
+    expect(container.textContent).toContain("/tmp/x");
+    expect(container.querySelector("button")).toBeNull();
+  });
+
   it.each([
     ["with child cards", true],
     ["without any", false],
