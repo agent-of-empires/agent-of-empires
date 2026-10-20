@@ -295,6 +295,50 @@ mod tests {
         assert_eq!(recovered.cache.alias_only_instances.len(), 1);
     }
 
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_blocked_alias_does_not_hold_up_a_reload_gated_mutation() {
+        let (_home, _external) = with_alias();
+        let row = Storage::new_unwatched("main")
+            .unwrap()
+            .load()
+            .unwrap()
+            .remove(0);
+        let id = row.id.clone();
+        let state = crate::server::test_support::build_test_app_state(vec![row]);
+        let service = &state.session_service;
+        load();
+
+        let hold = Hold::install("hung", "sessions");
+        let gate = service.disk_reload_guard().await;
+        let watch = state.file_watch.clone();
+        let gated_load = tokio::task::spawn_blocking(move || load_all_instances(&watch));
+        let gated = tokio::time::timeout(Duration::from_secs(10), gated_load)
+            .await
+            .expect("the gated load must not wait on the blocked alias")
+            .unwrap();
+        hold.wait_entered();
+        drop(gate);
+        assert!(gated.cache.health.unreadable_profiles.contains("hung"));
+
+        let _submission = service.prompt_submission(&id).await;
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            service.enqueue_prompt(&id, "A".into(), "first".into(), vec![], None, None),
+        )
+        .await
+        .expect("a persisted mutation must not wait on the blocked alias")
+        .unwrap();
+        assert_eq!(
+            in_flight_for_test("hung"),
+            1,
+            "the alias worker is still parked"
+        );
+
+        hold.release();
+        wait_idle_for_test("hung");
+    }
+
     #[test]
     #[serial_test::serial]
     fn repointing_an_alias_is_not_blocked_by_a_hung_worker_for_the_old_target() {
