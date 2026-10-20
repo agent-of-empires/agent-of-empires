@@ -66,6 +66,7 @@ function renderHeader(props: Partial<Parameters<typeof SidebarGroupHeader>[0]> =
       onNewSession={onNewSession}
       onUpdateAppearance={() => {}}
       offline={false}
+      rowsId="sidebar-rows-test"
       {...p}
     />
   );
@@ -150,6 +151,19 @@ describe("SidebarGroupHeader", () => {
       expect(folder(), String(key)).not.toBeNull();
       cleanup();
     }
+  });
+
+  it("is one disclosure button that controls its rows and names its menu shortcut", () => {
+    const { rerender } = renderHeader();
+    const header = screen.getByTestId("sidebar-group-header");
+    const button = header.querySelector("button[aria-expanded]")!;
+    expect(header.hasAttribute("tabindex")).toBe(false);
+    expect(header.getAttribute("aria-haspopup")).toBeNull();
+    expect(button.getAttribute("aria-expanded")).toBe("true");
+    expect(button.getAttribute("aria-controls")).toBe("sidebar-rows-test");
+    expect(button.getAttribute("aria-keyshortcuts")).toBe("Shift+F10");
+    rerender({ group: group({ collapsed: true }) });
+    expect(button.getAttribute("aria-expanded")).toBe("false");
   });
 
   it("marks the header draggable only with a drag handle", () => {

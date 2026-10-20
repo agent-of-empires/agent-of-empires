@@ -233,7 +233,7 @@ test.describe("Sidebar multi-session (#956)", () => {
     await expect(projectHeader).toBeVisible();
 
     // The appearance menu opens from the keyboard too.
-    await projectHeader.focus();
+    await projectHeader.locator("button[aria-expanded]").focus();
     await page.keyboard.press("Shift+F10");
     const menu = page.locator("[data-testid='sidebar-group-context-menu']");
     await expect(menu).toBeVisible();
