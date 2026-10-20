@@ -403,11 +403,36 @@ impl EventStore {
         .collect()
     }
 
+    /// Turn output after the latest `Stopped`: a turn the agent started itself
+    /// (a Monitor or background finish woke it), which opens with no
+    /// `UserPromptSent`. The between-prompt watchdog ends such a turn with a
+    /// `Stopped` once it goes quiet.
+    fn has_open_agent_turn(&self, session_id: &str) -> bool {
+        logged(
+            self.conn().query_row(
+                "SELECT EXISTS (
+                     SELECT 1 FROM acp_events
+                     WHERE session_id = ?1
+                       AND discriminant IN ('AgentMessageChunk', 'ToolCallStarted', 'ThinkingStarted')
+                       AND seq > COALESCE((SELECT MAX(seq) FROM acp_events
+                                           WHERE session_id = ?1
+                                             AND discriminant = 'Stopped'), 0))",
+                params![session_id],
+                |row| row.get::<_, bool>(0),
+            ),
+            "has_open_agent_turn query",
+            session_id,
+        )
+        .unwrap_or(false)
+    }
+
     /// True while the agent process holds work a replacement would lose: an
-    /// in-flight turn or background work, or a recent background finish the
-    /// agent has not yet answered with a turn.
+    /// in-flight or agent-initiated turn, background work, or a recent
+    /// background finish the agent has not yet answered with a turn.
     pub fn holds_live_work(&self, session_id: &str) -> bool {
-        self.has_in_flight_turn(session_id) || self.has_unhandled_finish(session_id)
+        self.has_in_flight_turn(session_id)
+            || self.has_open_agent_turn(session_id)
+            || self.has_unhandled_finish(session_id)
     }
 
     /// A background task or agent finished after the latest `Stopped`, so the
@@ -794,6 +819,53 @@ mod tests {
             let id = format!("s-{i}");
             record_from(&store, &id, 1, events);
             assert_eq!(store.holds_live_work(&id), holds, "case {i}");
+        }
+    }
+
+    /// An agent-initiated turn (a Monitor or background finish waking the
+    /// agent) opens with no `UserPromptSent`, so only its own events show it.
+    #[test]
+    fn an_agent_initiated_turn_without_a_stop_is_open_work() {
+        let (_tmp, store) = open_store(1000);
+        let tool_call = || Event::ToolCallStarted {
+            tool_call: crate::acp::state::ToolCall {
+                id: "t".into(),
+                name: "Bash".into(),
+                kind: "execute".into(),
+                args_preview: "{}".into(),
+                started_at: chrono::Utc::now(),
+                parent_tool_call_id: None,
+                memory_recall: None,
+                diffs: Vec::new(),
+            },
+        };
+        // (events, open work)
+        let cases = [
+            (vec![user_prompt("go"), stopped("prompt_complete")], false),
+            (
+                vec![
+                    user_prompt("go"),
+                    stopped("prompt_complete"),
+                    agent_chunk("woken"),
+                    tool_call(),
+                ],
+                true,
+            ),
+            (
+                vec![
+                    user_prompt("go"),
+                    stopped("prompt_complete"),
+                    agent_chunk("woken"),
+                    tool_call(),
+                    stopped("agent_idle"),
+                ],
+                false,
+            ),
+        ];
+        for (i, (events, open)) in cases.into_iter().enumerate() {
+            let id = format!("s-{i}");
+            record_from(&store, &id, 1, events);
+            assert_eq!(store.holds_live_work(&id), open, "case {i}");
         }
     }
 
