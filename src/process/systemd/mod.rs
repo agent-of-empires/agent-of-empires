@@ -478,6 +478,63 @@ pub(crate) fn scope_prefix_for(session_id: &str, profile: &str) -> Option<ScopeP
     })
 }
 
+/// The slice session scopes of `profile` live in, or `None` when scopes are
+/// unavailable. Blocking on the first call, like `scope_prefix_for`.
+pub(crate) fn slice_for(profile: &str) -> Option<String> {
+    let cap = capability()?;
+    Some(resolve_slice(&cap.cfg.slice_template, profile))
+}
+
+/// Whether session scopes are available. Blocking on the first call, like
+/// `scope_prefix_for`.
+pub(crate) fn scopes_available() -> bool {
+    capability().is_some()
+}
+
+fn container_scope_words(
+    systemd_run: &str,
+    env_bin: &str,
+    slice: &str,
+    container: &str,
+    start_ms: u64,
+) -> Vec<String> {
+    let mut words = vec![systemd_run.to_string()];
+    words.extend(
+        [
+            "--user",
+            "--scope",
+            "--quiet",
+            "--collect",
+            "--no-ask-password",
+            "--expand-environment=no",
+        ]
+        .map(String::from),
+    );
+    words.push(format!("--slice={slice}"));
+    words.push(format!(
+        "--unit=aoe-container-{}-{start_ms}.scope",
+        escape(container)
+    ));
+    words.push(format!("--description=aoe container {container}"));
+    words.extend(["--", env_bin, "-u", INJECTED_VAR].map(String::from));
+    words
+}
+
+/// The words to put in front of a container runtime command so that the
+/// helpers it forks (pasta) stay in `slice` instead of the caller's cgroup,
+/// or `None` when scopes are unavailable. Blocking on the first call, like
+/// `scope_prefix_for`.
+pub(crate) fn container_scope_prefix(slice: &str, container: &str) -> Option<Vec<String>> {
+    let cap = capability()?;
+    Some(container_scope_words(
+        &cap.systemd_run.to_string_lossy(),
+        &cap.env_bin.to_string_lossy(),
+        slice,
+        container,
+        now_ms(),
+    ))
+}
+
 /// Stops the session's scope(s) without waiting. Ignores `enabled`, which
 /// gates only new scopes: ones from before it was turned off still need
 /// stopping. Best effort; inert outside Linux.
@@ -694,6 +751,35 @@ mod tests {
         let flag = AtomicBool::new(false);
         let fired = (0..5).filter(|_| first_time(&flag)).count();
         assert_eq!(fired, 1);
+    }
+
+    #[test]
+    fn container_scope_words_shape() {
+        assert_eq!(
+            container_scope_words(
+                "/usr/bin/systemd-run",
+                "/usr/bin/env",
+                "background-aoe-main.slice",
+                "aoe-sandbox-ab12",
+                7
+            ),
+            [
+                "/usr/bin/systemd-run",
+                "--user",
+                "--scope",
+                "--quiet",
+                "--collect",
+                "--no-ask-password",
+                "--expand-environment=no",
+                "--slice=background-aoe-main.slice",
+                "--unit=aoe-container-aoe_2dsandbox_2dab12-7.scope",
+                "--description=aoe container aoe-sandbox-ab12",
+                "--",
+                "/usr/bin/env",
+                "-u",
+                "INVOCATION_ID",
+            ]
+        );
     }
 
     #[test]
