@@ -13,7 +13,7 @@ import {
   type SidebarWorkspaceView,
 } from "../../lib/sidebarGroups";
 import { workspaceIsPinned, workspaceIsSunk } from "../../lib/sidebarSort";
-import { dragEnded, dragStarted, typedClosestCenter, type DragClickGuard } from "./dnd";
+import { dragEnded, dragStarted, typedClosestCenter, useReleaseDragOnUnmount, type DragClickGuard } from "./dnd";
 import { SessionRow } from "./SessionRow";
 import { SidebarGroupHeader } from "./SidebarGroupHeader";
 import { SortableRepoGroup, SortableSessionRow } from "./Sortable";
@@ -101,6 +101,7 @@ export function FlatGroupList({
   onReorderWorkspaces: (newOrder: string[]) => void;
   dragClickGuard: React.MutableRefObject<DragClickGuard>;
 }) {
+  useReleaseDragOnUnmount(dragClickGuard);
   // Desktop activates on distance so a still click navigates; touch needs a hold so flicks scroll.
   const sensors = useSensors(
     useSensor(MouseSensor, { activationConstraint: { distance: 8 } }),

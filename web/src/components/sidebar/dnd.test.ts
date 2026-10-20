@@ -3,9 +3,9 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { renderHook } from "@testing-library/react";
 
-import { dragEnded, dragStarted, newDragClickGuard, useSuppressClickAfterDrag } from "./dnd";
+import { dragEnded, dragStarted, newDragClickGuard, useReleaseDragOnUnmount, useSuppressClickAfterDrag } from "./dnd";
 
-type Step = "start" | "end" | "press" | "click" | "key click" | "wait 1s";
+type Step = "start" | "end" | "press" | "click" | "key click" | "wait 1s" | "list unmounts";
 
 beforeEach(() => vi.useFakeTimers());
 afterEach(() => vi.useRealTimers());
@@ -30,10 +30,13 @@ describe("drag click guard", () => {
       [["start", "press", "click"], [false]],
       // Enter on a focused control, or `element.click()`, never presses.
       [["start", "end", "key click"], [true]],
+      // The drag's list goes away before any end or cancel.
+      [["start", "list unmounts", "click"], [true]],
     ];
     for (const [steps, want] of cases) {
       const ref = { current: newDragClickGuard() };
       const { unmount } = renderHook(() => useSuppressClickAfterDrag(ref));
+      const list = renderHook(() => useReleaseDragOnUnmount(ref));
       const button = document.body.appendChild(document.createElement("button"));
       const reached: boolean[] = [];
       for (const step of steps) {
@@ -41,6 +44,7 @@ describe("drag click guard", () => {
         else if (step === "end") dragEnded(ref.current);
         else if (step === "press") button.dispatchEvent(new PointerEvent("pointerdown", { bubbles: true }));
         else if (step === "wait 1s") vi.advanceTimersByTime(1000);
+        else if (step === "list unmounts") list.unmount();
         else {
           let got = false;
           button.addEventListener("click", () => (got = true), { once: true });

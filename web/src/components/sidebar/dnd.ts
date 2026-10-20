@@ -40,6 +40,19 @@ export function swallowsClick(guard: DragClickGuard, now = Date.now()): boolean 
   return true;
 }
 
+/**
+ * Nothing promises an end or cancel event once the DndContext unmounts mid-drag, and a guard left
+ * `dragging` would swallow every click until reload.
+ */
+export function useReleaseDragOnUnmount(ref: MutableRefObject<DragClickGuard>) {
+  useEffect(() => {
+    const guard = ref.current;
+    return () => {
+      guard.dragging = false;
+    };
+  }, [ref]);
+}
+
 export function useSuppressClickAfterDrag(ref: MutableRefObject<DragClickGuard>) {
   useEffect(() => {
     const onClick = (e: MouseEvent) => {
