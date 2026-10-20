@@ -190,7 +190,6 @@ fn sandbox_reclaim_reports_before_it_removes() {
     assert!(fresh.exists(), "a store being seeded right now was swept");
 }
 
-const CODEX_IMAGE: &str = "aoe-e2e-codex-shim:latest";
 const CAPTURE_DEADLINE: Duration = Duration::from_secs(60);
 
 /// Stands in for Codex inside the container. It publishes a rollout under the
@@ -207,9 +206,25 @@ RUN printf '%s\n' '#!/bin/sh' \
  && chmod +x /usr/local/bin/codex
 "#;
 
-/// Removes the sessions' containers and the throwaway image on every exit path.
+/// Removes the sessions' containers and this invocation's image on every exit
+/// path. Create it before building so a failed build is also torn down.
 struct SandboxCleanup {
+    image: String,
     ids: Vec<String>,
+}
+
+impl SandboxCleanup {
+    /// A tag no concurrent invocation or pre-existing image shares.
+    fn new() -> Self {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock before epoch")
+            .as_nanos();
+        Self {
+            image: format!("aoe-e2e-codex-shim-{}-{nanos}", std::process::id()),
+            ids: Vec::new(),
+        }
+    }
 }
 
 impl Drop for SandboxCleanup {
@@ -220,14 +235,14 @@ impl Drop for SandboxCleanup {
                 .output();
         }
         let _ = Command::new("docker")
-            .args(["rmi", "-f", CODEX_IMAGE])
+            .args(["rmi", "-f", &self.image])
             .output();
     }
 }
 
-fn build_codex_shim_image() {
+fn build_codex_shim_image(image: &str) {
     let mut build = Command::new("docker")
-        .args(["build", "-q", "-t", CODEX_IMAGE, "-"])
+        .args(["build", "-q", "-t", image, "-"])
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
@@ -259,8 +274,8 @@ fn two_sandboxed_codex_sessions_capture_their_own_ids() {
     require_tmux!();
 
     let mut h = TuiTestHarness::new_in_tmp("sandbox_codex_capture");
-    build_codex_shim_image();
-    let mut cleanup = SandboxCleanup { ids: Vec::new() };
+    let mut cleanup = SandboxCleanup::new();
+    build_codex_shim_image(&cleanup.image);
 
     let mut ids = Vec::new();
     for name in ["codex-A", "codex-B"] {
@@ -274,7 +289,7 @@ fn two_sandboxed_codex_sessions_capture_their_own_ids() {
             "codex",
             "--sandbox",
             "--sandbox-image",
-            CODEX_IMAGE,
+            &cleanup.image,
         ]);
         cleanup.ids.push(id.clone());
         ids.push(id);
