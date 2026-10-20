@@ -138,7 +138,7 @@ static REDACTORS: LazyLock<[Regex; 3]> = LazyLock::new(|| {
     [
         r#"(?i)((?:set-)?cookie["']?\s*[:=]\s*)(?:"[^"]*"|'[^']*'|[^\r\n]+)"#,
         r#"(?i)(authorization["']?\s*[:=]\s*["']?)[^\r\n"']+"#,
-        r#"(?i)((?:\w*token|passphrase|api[_-]?key)["']?\s*[:=]\s*)(?:"[^"]*"|'[^']*'|[^\s&"',;]+)"#,
+        r#"(?i)((?:\w*token|passphrase|api[_-]?key|\w*password|\w*secret)["']?\s*[:=]\s*)(?:"[^"]*"|'[^']*'|[^\s&"',;]+)"#,
     ]
     .map(|p| Regex::new(p).expect("static redaction pattern"))
 });
@@ -186,6 +186,10 @@ mod tests {
                 r#"{"access_token":[REDACTED],"a":1}"#,
             ),
             ("api_key='k 1'", "api_key=[REDACTED]"),
+            (
+                "password=hunter2 client_secret=abc",
+                "password=[REDACTED] client_secret=[REDACTED]",
+            ),
             ("Cookie: sid=1; t=2", "Cookie: [REDACTED]"),
             (
                 r#"{"authorization": "Bearer x", "cookie": "sid=1"}"#,
@@ -200,8 +204,8 @@ mod tests {
                 "a token=[REDACTED] and passphrase=[REDACTED]",
             ),
             (
-                "tokens=5 token_count=3 token=",
-                "tokens=5 token_count=3 token=",
+                "tokens=5 token_count=3 secrets=5 password_hash=x token=",
+                "tokens=5 token_count=3 secrets=5 password_hash=x token=",
             ),
         ];
         for (input, expected) in cases {
