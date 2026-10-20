@@ -2152,6 +2152,12 @@ mod tests {
         // arm `build_instance` owns, which pins the child conversation and the
         // parent the first launch must fork from. The parent sits on the store
         // the child launches on, so the fork has nothing to carry.
+        let stub = tempfile::tempdir().unwrap();
+        let _claude = crate::session::test_support::install_login_shell_path_command(
+            stub.path(),
+            "claude",
+            "#!/bin/sh\nexit 1\n",
+        );
         let store = dirs::home_dir().unwrap().join(".claude");
         std::fs::create_dir_all(&store).unwrap();
         let parent = crate::session::ConversationBinding {
