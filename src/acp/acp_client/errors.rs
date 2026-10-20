@@ -78,7 +78,7 @@ impl AcpError {
     }
 
     /// Why a bare adapter name could not launch. A bundled copy aoe refuses
-    /// needs a reinstall or a newer Node, not the adapter's install command (#4696).
+    /// needs a reinstall or a newer Node, not the adapter's install command.
     pub(super) fn unresolved_adapter_spawn_error(
         err: &std::io::Error,
         config: &super::SpawnConfig,
@@ -111,7 +111,7 @@ impl AcpError {
 
     /// Appends the exact install command for a known ACP adapter so the web
     /// banner shows a copyable line instead of a guess (#2109). A configured
-    /// PATH replaces the daemon's for the agent, so the advice names it (#4698).
+    /// PATH replaces the daemon's for the agent, so the advice names it.
     fn missing_binary_spawn_error(
         err: &std::io::Error,
         command: &str,
@@ -214,7 +214,7 @@ mod tests {
         spawn_message(AcpError::classify_spawn_error(denied, &cwd, "/bin/true"));
     }
 
-    /// #4698: a configured PATH replaces the daemon's for the agent, so the
+    /// A configured PATH replaces the daemon's for the agent, so the
     /// missing-adapter advice names what set it instead of the daemon's PATH.
     #[test]
     fn missing_adapter_advice_names_the_path_the_agent_searched() {

@@ -780,7 +780,7 @@ mod tests {
                 (Some(msg), Some(want)) => assert!(msg.contains(want), "{label}: {msg}"),
                 _ => assert_eq!(got.is_some(), expected.is_some(), "{label}: {got:?}"),
             }
-            // #4698: with a configured PATH, the advice is about that PATH.
+            // With a configured PATH, the advice is about that PATH.
             if let (Some(msg), Some(Unresolved::NotFound)) = (&got, &unresolved) {
                 if !configured.is_empty() {
                     assert!(

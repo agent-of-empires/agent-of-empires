@@ -18,7 +18,7 @@ pub enum Unresolved {
     /// A path or a `${placeholder}`, which resolves elsewhere.
     NotBare,
     NotFound,
-    /// The bundled copy predates this aoe build (#4696).
+    /// The bundled copy predates this aoe build.
     StaleBundle,
     /// Node cannot run the bundled copy's sources; holds the version found.
     NodeTooOld(String),
@@ -327,7 +327,7 @@ mod tests {
             assert_eq!(resolved.prepend_paths.first(), Some(&bin_dir));
         }
 
-        // #4696: a bundled copy aoe refuses says why, not just "not found".
+        // A bundled copy aoe refuses says why, not just "not found".
         {
             use crate::acp::adapters::test_fixtures::{touch_bin, write_digest};
             let name = crate::acp::install_hints::AOE_AGENT_BINARY;

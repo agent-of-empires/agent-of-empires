@@ -616,7 +616,7 @@ mod tests {
         let result = AcpClient::spawn(config, AcpSessionId("s-1".into())).await;
         assert!(matches!(result, Err(AcpError::Spawn(_))));
 
-        // #4698: a bare adapter missing from a configured PATH names that PATH.
+        // A bare adapter missing from a configured PATH names that PATH.
         let empty = tempfile::tempdir().unwrap();
         let mut config = env_test_spawn_config(std::env::temp_dir());
         config.spec.command = format!("aoe-test-no-such-adapter-{}", std::process::id());
