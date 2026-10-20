@@ -330,6 +330,9 @@ impl PasskeyManager {
         profile: &Profile,
         credential: &PublicKeyCredential,
     ) -> Result<(), PasskeyError> {
+        // Take the lock before consuming the ceremony so a finish that waits here finds the
+        // ceremonies cleared by the one ahead of it instead of verifying a stale counter.
+        let mut store = self.store.lock().await;
         let ceremony = lock(&self.authentications)
             .remove(tx)
             .filter(|c| c.expires_at > Instant::now() && c.profile == *profile)
@@ -342,7 +345,6 @@ impl PasskeyManager {
             .finish_passkey_authentication(credential, &ceremony.state)
             .map_err(|e| PasskeyError::Verification(e.to_string()))?;
 
-        let mut store = self.store.lock().await;
         let mut next = store.clone();
         let entry = next
             .credentials
@@ -1008,6 +1010,37 @@ mod tests {
         let (stale_tx, _) = mgr.begin_login(&p, ip()).await.unwrap();
         assert_at(&mgr, &mut auth, ORIGIN, ORIGIN).await.1.unwrap();
         assert!(!lock(&mgr.authentications).contains_key(&stale_tx));
+    }
+
+    /// Two finishes whose ceremonies were started before either committed must not both
+    /// succeed: the second would be verified against a counter snapshot older than the store.
+    #[tokio::test]
+    async fn overlapping_finishes_cannot_both_commit_against_a_stale_counter() {
+        let dir = tempfile::tempdir().unwrap();
+        let mgr = PasskeyManager::with_persistence(dir.path());
+        let mut auth = authenticator();
+        enrol(&mgr, &mut auth, ORIGIN, "s1").await;
+        let p = profile(ORIGIN);
+
+        let mut attempts = Vec::new();
+        for _ in 0..2 {
+            let (tx, options) = mgr.begin_login(&p, ip()).await.unwrap();
+            let options: RequestChallengeResponse = serde_json::from_value(options).unwrap();
+            attempts.push((tx, auth.do_authentication(url(ORIGIN), options).unwrap()));
+        }
+        let (a, b) = tokio::join!(
+            mgr.finish_login(&attempts[0].0, &p, &attempts[0].1),
+            mgr.finish_login(&attempts[1].0, &p, &attempts[1].1),
+        );
+        assert_eq!(
+            [a.is_ok(), b.is_ok()].iter().filter(|ok| **ok).count(),
+            1,
+            "exactly one overlapping finish commits"
+        );
+        assert!(matches!(
+            a.err().or(b.err()),
+            Some(PasskeyError::InvalidCeremony)
+        ));
     }
 
     #[tokio::test]
