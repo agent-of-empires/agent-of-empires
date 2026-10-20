@@ -7,7 +7,7 @@ use std::collections::HashSet;
 
 use crate::session::{
     acquire_session_identity_lock, duplicate_session_error, is_duplicate_session, GroupTree,
-    Instance, LifecycleOperation, ResumeIntent, StartOutcome, Storage,
+    Instance, LifecycleOperation, ResumeIntent, StartOutcome, Status, Storage,
 };
 
 #[derive(Subcommand)]
@@ -26,6 +26,11 @@ pub enum SessionCommands {
 
     /// Show session details
     Show(ShowArgs),
+
+    /// Block until a session's agent activity status matches one of the
+    /// `--until` values. Exits 0 on a match, non-zero on timeout or if the
+    /// session stops. Tmux sessions only.
+    Wait(WaitArgs),
 
     /// Rename a session
     Rename(RenameArgs),
@@ -164,6 +169,39 @@ pub struct ArchiveArgs {
     /// Skip tmux teardown on archive.
     #[arg(long = "no-kill")]
     pub no_kill: bool,
+}
+
+#[derive(Clone, Copy, clap::ValueEnum)]
+pub enum WaitStatus {
+    Running,
+    Waiting,
+    Idle,
+    Error,
+}
+
+impl From<WaitStatus> for Status {
+    fn from(s: WaitStatus) -> Self {
+        match s {
+            WaitStatus::Running => Status::Running,
+            WaitStatus::Waiting => Status::Waiting,
+            WaitStatus::Idle => Status::Idle,
+            WaitStatus::Error => Status::Error,
+        }
+    }
+}
+
+#[derive(Args)]
+pub struct WaitArgs {
+    /// Session ID or title
+    pub identifier: String,
+
+    /// Activity status to wait for; repeat to accept any of several
+    #[arg(long, required = true)]
+    pub until: Vec<WaitStatus>,
+
+    /// Give up after this many milliseconds
+    #[arg(long, default_value_t = 300_000)]
+    pub timeout: u64,
 }
 
 #[derive(Args)]
@@ -397,6 +435,7 @@ pub async fn run(profile: &str, command: SessionCommands) -> Result<()> {
         SessionCommands::Restart(args) => restart_session_dispatch(profile, args).await,
         SessionCommands::Attach(args) => attach_session(profile, args).await,
         SessionCommands::Show(args) => show_session(profile, args).await,
+        SessionCommands::Wait(args) => wait_session(profile, args).await,
         SessionCommands::Capture(args) => capture_session(profile, args).await,
         SessionCommands::Rename(args) => rename_session(profile, args).await,
         SessionCommands::SetWorktreeName(args) => set_worktree_name(profile, args).await,
@@ -1456,6 +1495,77 @@ async fn attach_session(profile: &str, args: SessionIdArgs) -> Result<()> {
     let mut working = inst.clone();
     working.source_profile = profile.to_string();
     supervise_attach_capture(&mut working, |_| tmux_session.attach())
+}
+
+const WAIT_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
+
+#[derive(Debug, PartialEq, Eq)]
+enum WaitDecision {
+    Matched,
+    Stopped,
+    TimedOut,
+    Continue,
+}
+
+/// A match wins over everything, so an already-satisfied wait returns on its first poll.
+fn wait_decision(
+    current: Status,
+    targets: &[Status],
+    elapsed: std::time::Duration,
+    timeout: std::time::Duration,
+) -> WaitDecision {
+    if targets.contains(&current) {
+        WaitDecision::Matched
+    } else if current == Status::Stopped {
+        WaitDecision::Stopped
+    } else if elapsed >= timeout {
+        WaitDecision::TimedOut
+    } else {
+        WaitDecision::Continue
+    }
+}
+
+async fn wait_session(profile: &str, args: WaitArgs) -> Result<()> {
+    let storage = Storage::open_unwatched(profile)?;
+    let (instances, _) = storage.load_with_groups()?;
+    let inst = super::resolve_session(&args.identifier, &instances)?;
+    bail_if_acp(inst, "wait")?;
+    let mut live = inst.clone();
+    live.source_profile = profile.to_string();
+    crate::session::config::profile_config::resolve_config_or_warn(profile);
+
+    let targets: Vec<Status> = args.until.iter().map(|s| (*s).into()).collect();
+    let timeout = std::time::Duration::from_millis(args.timeout);
+    let start = std::time::Instant::now();
+    let mut first = true;
+    loop {
+        crate::tmux::refresh_session_cache();
+        // The first poll must decide on its own; later polls share one instance so a
+        // Running to Idle transition can be confirmed by a second observation.
+        if first {
+            live.update_status_once(None, None);
+            first = false;
+        } else {
+            live.update_status_with_metadata(None, None);
+        }
+        let elapsed = start.elapsed();
+        match wait_decision(live.status, &targets, elapsed, timeout) {
+            WaitDecision::Matched => {
+                println!("{}", live.status.as_str());
+                return Ok(());
+            }
+            WaitDecision::Stopped => bail!("session '{}' is not running", live.title),
+            WaitDecision::TimedOut => bail!(
+                "timed out after {}ms waiting for '{}' (last status: {})",
+                args.timeout,
+                live.title,
+                live.status.as_str()
+            ),
+            WaitDecision::Continue => {
+                tokio::time::sleep(WAIT_POLL_INTERVAL.min(timeout - elapsed)).await;
+            }
+        }
+    }
 }
 
 async fn show_session(profile: &str, args: ShowArgs) -> Result<()> {
@@ -3708,5 +3818,50 @@ mod show_json_tests {
             active["snoozed_until"],
             serde_json::to_value(future).unwrap()
         );
+    }
+}
+
+#[cfg(test)]
+mod wait_decision_tests {
+    use super::{wait_decision, WaitDecision};
+    use crate::session::Status;
+    use std::time::Duration;
+
+    const SECS: fn(u64) -> Duration = Duration::from_secs;
+
+    #[test]
+    fn decides_match_stop_timeout_or_continue() {
+        use WaitDecision::*;
+        let cases = [
+            // already in the target state, even with no time left
+            (Status::Idle, vec![Status::Idle], 0, 0, Matched),
+            (Status::Idle, vec![Status::Idle], 99, 10, Matched),
+            // any one of several targets satisfies the wait
+            (
+                Status::Waiting,
+                vec![Status::Idle, Status::Waiting],
+                1,
+                10,
+                Matched,
+            ),
+            (Status::Error, vec![Status::Error], 1, 10, Matched),
+            (
+                Status::Running,
+                vec![Status::Idle, Status::Waiting],
+                1,
+                10,
+                Continue,
+            ),
+            (Status::Running, vec![Status::Idle], 10, 10, TimedOut),
+            (Status::Starting, vec![Status::Idle], 99, 10, TimedOut),
+            (Status::Stopped, vec![Status::Idle], 1, 10, Stopped),
+        ];
+        for (current, targets, elapsed, timeout, want) in cases {
+            assert_eq!(
+                wait_decision(current, &targets, SECS(elapsed), SECS(timeout)),
+                want,
+                "{current:?} {targets:?} elapsed={elapsed} timeout={timeout}"
+            );
+        }
     }
 }

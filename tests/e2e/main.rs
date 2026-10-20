@@ -61,6 +61,7 @@ mod sandbox;
 mod send_structured_e2e;
 mod serve;
 mod serve_lock;
+mod session_wait;
 mod settings;
 mod skills_tui;
 mod stop_confirm;

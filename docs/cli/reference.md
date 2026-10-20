@@ -22,6 +22,7 @@ This document contains the help content for the `aoe` command-line program.
 * [`aoe session restart`↴](#aoe-session-restart)
 * [`aoe session attach`↴](#aoe-session-attach)
 * [`aoe session show`↴](#aoe-session-show)
+* [`aoe session wait`↴](#aoe-session-wait)
 * [`aoe session rename`↴](#aoe-session-rename)
 * [`aoe session set-worktree-name`↴](#aoe-session-set-worktree-name)
 * [`aoe session capture`↴](#aoe-session-capture)
@@ -417,6 +418,7 @@ Manage session lifecycle (start, stop, attach, etc.)
 * `restart` — Restart session (or all sessions with `--all`)
 * `attach` — Attach to session interactively
 * `show` — Show session details
+* `wait` — Block until a session's agent activity status matches one of the `--until` values. Exits 0 on a match, non-zero on timeout or if the session stops. Tmux sessions only
 * `rename` — Rename a session
 * `set-worktree-name` — Edit a managed worktree session's workdir directory name (and, optionally, its git branch). Moves the worktree directory in place; the session must not be running. See #1723
 * `capture` — Capture tmux pane output
@@ -506,6 +508,28 @@ Show session details
 ###### **Options:**
 
 * `--json` — Output as JSON
+
+
+
+## `aoe session wait`
+
+Block until a session's agent activity status matches one of the `--until` values. Exits 0 on a match, non-zero on timeout or if the session stops. Tmux sessions only
+
+**Usage:** `aoe session wait [OPTIONS] --until <UNTIL> <IDENTIFIER>`
+
+###### **Arguments:**
+
+* `<IDENTIFIER>` — Session ID or title
+
+###### **Options:**
+
+* `--until <UNTIL>` — Activity status to wait for; repeat to accept any of several
+
+  Possible values: `running`, `waiting`, `idle`, `error`
+
+* `--timeout <TIMEOUT>` — Give up after this many milliseconds
+
+  Default value: `300000`
 
 
 
