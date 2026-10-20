@@ -3150,7 +3150,7 @@ mod tests {
         );
     }
 
-    /// #4617: `acp_installed` follows the structured create check, so a custom
+    /// `acp_installed` follows the structured create check, so a custom
     /// agent counts when its adapter is on the configured `environment` PATH.
     #[tokio::test]
     #[serial_test::serial]

@@ -1577,7 +1577,7 @@ pub(crate) fn branch_name_from_title(title: &str) -> String {
 mod tests {
     use super::*;
 
-    /// #4617: the pre-create refusal follows the runner's lookup, so it never
+    /// The pre-create refusal follows the runner's lookup, so it never
     /// refuses an adapter the spawn would find.
     #[test]
     fn validate_structured_choice_cases() {

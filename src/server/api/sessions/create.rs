@@ -903,7 +903,7 @@ pub async fn create_session(
     }
 
     // A structured session whose adapter resolves nowhere could only fail to
-    // start, so refuse it before anything is provisioned (#4617). An import is
+    // start, so refuse it before anything is provisioned. An import is
     // always structured, and its listing below would launch the adapter.
     let importing = body
         .import_acp_session_id

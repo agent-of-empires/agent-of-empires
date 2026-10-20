@@ -9359,7 +9359,7 @@ async fn workspace_trash_consent_follows_siblings_and_protects_the_shared_owner(
     Ok(())
 }
 
-/// #4617: a structured create whose adapter resolves nowhere is refused with a
+/// A structured create whose adapter resolves nowhere is refused with a
 /// stable code before anything is provisioned; the cases the check exempts
 /// never get that code.
 #[tokio::test]
