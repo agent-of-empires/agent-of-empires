@@ -341,30 +341,85 @@ fn brew_formula_lag_message(target_version: &str) -> String {
     )
 }
 
-/// `false` only while the Homebrew formula lags the release, so the TUI does not nag.
-/// Blocking; call from `spawn_blocking` on tokio.
+/// Whether `aoe update` can reach `target_version` from this install: `false` only for a
+/// Homebrew install whose formula is older, which `update_via_brew` refuses. An unknown
+/// formula version keeps the update on offer.
+fn supports_target(method: &InstallMethod, brew_version: Option<&str>, target: &str) -> bool {
+    match (method, brew_version) {
+        (InstallMethod::Homebrew, Some(v)) => !is_newer_version(target, v),
+        _ => true,
+    }
+}
+
+/// `false` only while the Homebrew formula lags the release, so the TUI and the Web dashboard
+/// do not offer an update `aoe update` would refuse. Blocking; call from `spawn_blocking` on
+/// tokio, or use [`update_actionable`].
 pub fn install_method_supports_target(target_version: &str) -> bool {
     let Ok(method) = detect_install_method() else {
         return true;
     };
-    if !matches!(method, InstallMethod::Homebrew) {
-        return true;
+    let brew_version = matches!(method, InstallMethod::Homebrew)
+        .then(brew_available_version)
+        .flatten();
+    let supported = supports_target(&method, brew_version.as_deref(), target_version);
+    if !supported {
+        tracing::info!(
+            target: "update.suppress",
+            brew_version = ?brew_version,
+            target_version = %target_version,
+            "suppressing update banner: Homebrew formula lags GitHub release"
+        );
     }
-    match brew_available_version() {
-        Some(v) => {
-            let supported = !is_newer_version(target_version, &v);
-            if !supported {
-                tracing::info!(
-                    target: "update.suppress",
-                    brew_version = %v,
-                    target_version = %target_version,
-                    "suppressing update banner: Homebrew formula lags GitHub release"
-                );
-            }
-            supported
-        }
-        None => true,
+    supported
+}
+
+/// The formula usually catches up within a few hours, so an hour bounds how long a stale
+/// answer hides or shows the banner.
+const ACTIONABLE_TTL: std::time::Duration = std::time::Duration::from_secs(60 * 60);
+
+struct Actionable {
+    target: String,
+    checked_at: std::time::Instant,
+    supported: bool,
+}
+
+static ACTIONABLE: tokio::sync::Mutex<Option<Actionable>> = tokio::sync::Mutex::const_new(None);
+
+/// [`install_method_supports_target`], cached per target for an hour. The Web dashboard asks on
+/// every poll and tab switch from every Device, and each probe shells out to `brew` twice.
+pub async fn update_actionable(target_version: &str) -> bool {
+    actionable_cached(
+        &ACTIONABLE,
+        target_version,
+        std::time::Instant::now(),
+        install_method_supports_target,
+    )
+    .await
+}
+
+/// The lock is held across the probe, so requests that miss together share one probe.
+async fn actionable_cached(
+    cache: &tokio::sync::Mutex<Option<Actionable>>,
+    target: &str,
+    now: std::time::Instant,
+    probe: impl FnOnce(&str) -> bool + Send + 'static,
+) -> bool {
+    let mut entry = cache.lock().await;
+    if let Some(hit) = entry.as_ref().filter(|e| {
+        e.target == target && now.saturating_duration_since(e.checked_at) < ACTIONABLE_TTL
+    }) {
+        return hit.supported;
     }
+    let owned = target.to_string();
+    let supported = tokio::task::spawn_blocking(move || probe(&owned))
+        .await
+        .unwrap_or(true);
+    *entry = Some(Actionable {
+        target: target.to_string(),
+        checked_at: now,
+        supported,
+    });
+    supported
 }
 
 fn update_via_brew(target_version: &str) -> Result<()> {
@@ -379,10 +434,13 @@ fn update_via_brew(target_version: &str) -> Result<()> {
     }
 
     // A lagging formula makes `brew upgrade aoe` exit 0 without upgrading.
-    if let Some(brew_version) = brew_available_version() {
-        if is_newer_version(target_version, &brew_version) {
-            anyhow::bail!(brew_formula_lag_message(target_version));
-        }
+    let brew_version = brew_available_version();
+    if !supports_target(
+        &InstallMethod::Homebrew,
+        brew_version.as_deref(),
+        target_version,
+    ) {
+        anyhow::bail!(brew_formula_lag_message(target_version));
     }
 
     let mut upgrade_cmd = Command::new("brew");
@@ -516,6 +574,75 @@ mod tests {
                 "{path:?}"
             );
         }
+    }
+
+    #[test]
+    fn only_a_lagging_homebrew_formula_hides_the_update() {
+        let tarball = InstallMethod::Tarball {
+            binary_path: home().join(".local/bin/aoe"),
+        };
+        let unknown = InstallMethod::Unknown {
+            binary_path: PathBuf::from("/opt/aoe"),
+        };
+        let cases = [
+            (InstallMethod::Homebrew, Some("1.0.0"), false),
+            (InstallMethod::Homebrew, Some("1.1.0"), true),
+            (InstallMethod::Homebrew, Some("1.2.0"), true),
+            // `brew info` failed: keep the update on offer.
+            (InstallMethod::Homebrew, None, true),
+            (tarball, Some("1.0.0"), true),
+            (InstallMethod::Cargo, Some("1.0.0"), true),
+            (InstallMethod::Nix, Some("1.0.0"), true),
+            (unknown, Some("1.0.0"), true),
+        ];
+        for (method, brew_version, supported) in cases {
+            assert_eq!(
+                supports_target(&method, brew_version, "1.1.0"),
+                supported,
+                "{method:?} {brew_version:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn actionable_probes_once_per_target_and_lifetime() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let calls = std::sync::Arc::new(AtomicUsize::new(0));
+        let probe = |answer: bool| {
+            let calls = calls.clone();
+            move |_: &str| {
+                calls.fetch_add(1, Ordering::SeqCst);
+                answer
+            }
+        };
+        let cache = tokio::sync::Mutex::new(None);
+        let now = std::time::Instant::now();
+
+        // Two requests that miss together share one probe.
+        let (a, b) = tokio::join!(
+            actionable_cached(&cache, "1.1.0", now, probe(false)),
+            actionable_cached(&cache, "1.1.0", now, probe(false)),
+        );
+        assert_eq!((a, b, calls.load(Ordering::SeqCst)), (false, false, 1));
+
+        let later = now + ACTIONABLE_TTL - std::time::Duration::from_secs(1);
+        assert!(!actionable_cached(&cache, "1.1.0", later, probe(true)).await);
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "hit within the lifetime");
+
+        assert!(actionable_cached(&cache, "1.2.0", later, probe(true)).await);
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            2,
+            "a new release probes again"
+        );
+
+        let expired = later + ACTIONABLE_TTL;
+        assert!(!actionable_cached(&cache, "1.2.0", expired, probe(false)).await);
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            3,
+            "an expired entry probes again"
+        );
     }
 
     #[test]
