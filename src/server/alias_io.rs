@@ -6,7 +6,7 @@
 //! callers get the last completed result without waiting.
 
 use std::any::Any;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::{mpsc, Arc, LazyLock, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
@@ -17,8 +17,8 @@ pub(crate) const WAIT: Duration = Duration::from_millis(250);
 
 struct Slot {
     target: Option<PathBuf>,
-    /// Target of the running worker, so a repoint is not blocked by a hung old one.
-    in_flight: Option<Option<PathBuf>>,
+    /// Targets with a worker still running; a hung one stays registered across repoints.
+    in_flight: HashSet<Option<PathBuf>>,
     last: Option<Arc<dyn Any + Send + Sync>>,
 }
 
@@ -43,9 +43,7 @@ struct Finish(Key, Option<PathBuf>);
 impl Drop for Finish {
     fn drop(&mut self) {
         if let Some(slot) = slots().get_mut(&self.0) {
-            if slot.in_flight.as_ref() == Some(&self.1) {
-                slot.in_flight = None;
-            }
+            slot.in_flight.remove(&self.1);
         }
     }
 }
@@ -72,31 +70,34 @@ where
         let mut guard = slots();
         let slot = guard.entry(key.clone()).or_insert(Slot {
             target: None,
-            in_flight: None,
+            in_flight: HashSet::new(),
             last: None,
         });
         if slot.target != target {
             slot.target.clone_from(&target);
             slot.last = None;
         }
-        if slot.in_flight.as_ref() == Some(&target) {
+        if slot.in_flight.contains(&target) {
             return Sample {
                 value: last(slot),
                 fresh: false,
             };
         }
-        slot.in_flight = Some(target.clone());
+        slot.in_flight.insert(target.clone());
+        #[cfg(test)]
+        held::count_start(&key);
+        let worker_target = target.clone();
         let (tx, rx) = mpsc::channel();
         let worker_key = key.clone();
         let spawned = std::thread::Builder::new()
             .name("aoe-alias-io".into())
             .spawn(move || {
-                let finish = Finish(worker_key.clone(), target.clone());
+                let finish = Finish(worker_key.clone(), worker_target.clone());
                 #[cfg(test)]
                 held::block(&worker_key);
                 let value = Arc::new(work());
                 if let Some(slot) = slots().get_mut(&worker_key) {
-                    if slot.target == target {
+                    if slot.target == worker_target {
                         slot.last = Some(value.clone());
                     }
                 }
@@ -105,7 +106,7 @@ where
                 let _ = tx.send(value);
             });
         if spawned.is_err() {
-            slot.in_flight = None;
+            slot.in_flight.remove(&target);
             return Sample {
                 value: last(slot),
                 fresh: false,
@@ -129,8 +130,9 @@ where
 pub(crate) fn in_flight_for_test(alias: &str) -> usize {
     slots()
         .iter()
-        .filter(|((name, _), slot)| name == alias && slot.in_flight.is_some())
-        .count()
+        .filter(|((name, _), _)| name == alias)
+        .map(|(_, slot)| slot.in_flight.len())
+        .sum()
 }
 
 /// Parks a worker at its entry, standing in for a hung mount.
@@ -146,6 +148,25 @@ pub(crate) mod held {
     type Held = (mpsc::Sender<()>, Gate, Arc<AtomicBool>);
 
     static HOLDS: LazyLock<Mutex<HashMap<Key, Held>>> = LazyLock::new(Mutex::default);
+    static STARTED: LazyLock<Mutex<HashMap<Key, usize>>> = LazyLock::new(Mutex::default);
+
+    pub(super) fn count_start(key: &Key) {
+        *STARTED
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .entry(key.clone())
+            .or_default() += 1;
+    }
+
+    /// Workers started for this alias and kind in this process.
+    pub(crate) fn started_for_test(alias: &str, kind: &'static str) -> usize {
+        STARTED
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(&(alias.to_owned(), kind))
+            .copied()
+            .unwrap_or(0)
+    }
 
     pub(super) fn block(key: &Key) {
         let held = HOLDS
@@ -223,7 +244,7 @@ pub(crate) fn wait_idle_for_test(alias: &str) {
 
 #[cfg(test)]
 mod tests {
-    use super::held::Hold;
+    use super::held::{started_for_test, Hold};
     use super::*;
     use crate::server::reload::{load_all_instances, selectable_profiles, LoadedInstances};
     use crate::session::{Instance, Storage};
@@ -365,6 +386,43 @@ mod tests {
 
         hold.release();
         wait_idle_for_test("hung");
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn returning_to_a_blocked_target_reuses_its_worker() {
+        let (_home, external) = with_alias();
+        load();
+        let link = crate::session::get_profile_dir_path("hung").unwrap();
+        let repoint = |to: &std::path::Path| {
+            std::fs::remove_file(&link).unwrap();
+            std::os::unix::fs::symlink(to, &link).unwrap();
+        };
+        let before = started_for_test("hung", "sessions");
+
+        let hold = Hold::install("hung", "sessions");
+        load();
+        hold.wait_entered();
+        let other = tempfile::tempdir().unwrap();
+        repoint(other.path());
+        let fresh = load();
+        assert!(fresh.cache.health.unreadable_profiles.is_empty());
+        assert_eq!(started_for_test("hung", "sessions") - before, 2);
+
+        repoint(external.path());
+        let returned = load();
+        assert!(returned.cache.health.unreadable_profiles.contains("hung"));
+        assert_eq!(
+            started_for_test("hung", "sessions") - before,
+            2,
+            "the blocked worker for the original target is reused"
+        );
+        assert_eq!(in_flight_for_test("hung"), 1);
+
+        hold.release();
+        wait_idle_for_test("hung");
+        assert!(load().cache.health.unreadable_profiles.is_empty());
+        assert_eq!(started_for_test("hung", "sessions") - before, 3);
     }
 
     #[test]
