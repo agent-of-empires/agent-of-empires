@@ -173,6 +173,11 @@ impl<S: BroadcastSink> Drain<S> {
         let mut end = StreamEnd::default();
         let mut established = false;
         while let Some(event) = inbound.recv().await {
+            // A runner stopped on purpose closes its connection with an error that is no
+            // failure: not published, and not a startup failure before the session is assigned.
+            if matches!(event, Event::AgentStartupError { .. }) && self.restart_intended() {
+                continue;
+            }
             match &event {
                 Event::Stopped { reason } => match reason.as_str() {
                     "agent_unresponsive" | "prompt_orphaned" | "user_forced" => {
@@ -289,6 +294,19 @@ impl<S: BroadcastSink> Drain<S> {
             });
         }
         end
+    }
+
+    /// Whether a restart is pending for the runner on record. A marker naming another
+    /// generation belongs to a different runner, so a replacement's genuine error passes.
+    fn restart_intended(&self) -> bool {
+        let Some(marker) = worker_registry::peek_restart_marker(&self.session_id) else {
+            return false;
+        };
+        let generation = worker_registry::load(&self.session_id)
+            .ok()
+            .flatten()
+            .map_or(0, |record| record.generation);
+        marker == generation
     }
 
     fn clear_pending_context_reset(&self) -> bool {
@@ -1310,6 +1328,68 @@ mod tests {
                 usize::from(!expect_rearm),
                 "{id}: a registry-gone attached crash is a user stop"
             );
+        }
+    }
+
+    /// A runner stopped on purpose closes its connection with an error that is
+    /// not a startup failure, before or after the session is assigned. A marker
+    /// naming another generation belongs to a different runner, so its error passes.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_deliberate_restart_publishes_no_startup_error() {
+        // (name, session assigned first, marker generation, error is a deliberate close)
+        let cases = [
+            ("after assignment", true, 4, true),
+            ("before assignment", false, 4, true),
+            ("marker for another runner", false, 3, false),
+        ];
+        for (name, assigned, marker, deliberate) in cases {
+            let (_home, tmp) = isolate_home();
+            let id = "s-deliberate";
+            let sink = VecSink::new();
+            let sup = Supervisor::new(sink.clone());
+            worker_registry::save(
+                &worker_record(id, std::process::id(), tmp.path().join("attach.sock"))
+                    .with_generation(4),
+            )
+            .unwrap();
+            worker_registry::mark_restart_pending(id, marker);
+            let (client, _client_tx) = crate::acp::acp_client::AcpClient::fake_for_test(
+                crate::acp::state::AcpSessionId(id.into()),
+            );
+            let lease = sup
+                .test_install_handle(id, client, WorkerKind::Attached, None)
+                .await;
+            let (inbound_tx, inbound_rx) = mpsc::channel::<Event>(16);
+            let drain = sup.start_drain_task(id.into(), lease, inbound_rx, None);
+            if assigned {
+                inbound_tx
+                    .send(Event::AcpSessionAssigned {
+                        acp_session_id: "acp-1".into(),
+                    })
+                    .await
+                    .unwrap();
+            }
+            inbound_tx
+                .send(Event::AgentStartupError {
+                    message: "ACP connection failed: agent transport closed".into(),
+                })
+                .await
+                .unwrap();
+            drop(inbound_tx);
+            tokio::time::timeout(Duration::from_secs(2), drain)
+                .await
+                .expect("drain task should exit within 2s of inbound close")
+                .unwrap();
+
+            let published = sink
+                .frames
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(_, _, ev)| matches!(ev, Event::AgentStartupError { .. }))
+                .count();
+            assert_eq!(published, usize::from(!deliberate), "{name}: published");
         }
     }
 
