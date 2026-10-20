@@ -139,8 +139,8 @@ fn read_tail(path: &Path, lines: usize) -> std::io::Result<(String, usize, bool)
 /// Each pattern keeps capture group 1 (the key) and replaces the value.
 static REDACTORS: LazyLock<[Regex; 3]> = LazyLock::new(|| {
     [
-        r"(?i)((?:set-)?cookie\s*[:=]\s*)[^\r\n]+",
-        r#"(?i)(authorization\s*[:=]\s*(?:bearer|basic)\s+)[^\s"']+"#,
+        r#"(?i)((?:set-)?cookie["']?\s*[:=]\s*)(?:"[^"]*"|'[^']*'|[^\r\n]+)"#,
+        r#"(?i)(authorization["']?\s*[:=]\s*["']?(?:bearer|basic)\s+)[^\s"']+"#,
         r#"(?i)((?:\w*token|passphrase|api[_-]?key)["']?\s*[:=]\s*)(?:"[^"]*"|'[^']*'|[^\s&"',;]+)"#,
     ]
     .map(|p| Regex::new(p).expect("static redaction pattern"))
@@ -184,6 +184,14 @@ mod tests {
             ),
             ("api_key='k 1'", "api_key=[REDACTED]"),
             ("Cookie: sid=1; t=2", "Cookie: [REDACTED]"),
+            (
+                r#"{"authorization": "Bearer x", "cookie": "sid=1"}"#,
+                r#"{"authorization": "Bearer [REDACTED]", "cookie": [REDACTED]}"#,
+            ),
+            (
+                r#"authorization="Bearer x" ok"#,
+                r#"authorization="Bearer [REDACTED]" ok"#,
+            ),
             (
                 "a token=1 and passphrase=2",
                 "a token=[REDACTED] and passphrase=[REDACTED]",
