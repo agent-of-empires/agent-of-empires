@@ -1403,6 +1403,49 @@ fn cli_scratch_session_provisions_and_purges_its_dir() {
     }
 }
 
+/// `aoe add --effort` stores the explicit effort on a structured session, and
+/// each refusal happens before the scratch dir is provisioned.
+#[test]
+#[parallel]
+fn cli_add_effort_is_stored_and_refusals_provision_nothing() {
+    let mut h = TuiTestHarness::new("cli_add_effort");
+    h.install_path_command("claude");
+    h.install_path_command("claude-agent-acp");
+
+    h.run_cli_ok(&[
+        "add",
+        "--scratch",
+        "-t",
+        "Effort",
+        "-c",
+        "claude",
+        "--structured-view",
+        "--effort",
+        " high ",
+    ]);
+    let sessions = h.read_sessions();
+    let session = crate::harness::session_by_title(&sessions, "Effort");
+    assert_eq!(session["acp_effort"].as_str(), Some("high"));
+
+    let scratch_root = app_dir_in(h.home_path()).join("scratch");
+    let provisioned = || std::fs::read_dir(&scratch_root).map_or(0, Iterator::count);
+    let before = provisioned();
+    for (extra, expect) in [
+        (
+            &["--structured-view", "--effort", "  "][..],
+            "cannot be empty",
+        ),
+        (&["--effort", "high"][..], "needs the structured view"),
+    ] {
+        let mut args = vec!["add", "--scratch", "-t", "Refused", "-c", "claude"];
+        args.extend_from_slice(extra);
+        let out = h.run_cli(&args);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(!out.status.success() && stderr.contains(expect), "{stderr}");
+        assert_eq!(provisioned(), before, "a refused add must not provision");
+    }
+}
+
 /// #1051: `aoe ps --json` is fail-soft on an empty profile with no tmux
 /// server: an empty array and exit 0, never a failed substrate probe.
 #[test]
