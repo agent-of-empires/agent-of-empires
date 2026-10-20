@@ -288,9 +288,21 @@ fn home_shows_plugin_row_statuses_and_opens_each_link() {
     require_tmux!();
     require_node!();
 
-    let mut h = TuiTestHarness::new_in_tmp("plugin_row_resources");
-    for (provider, plugin_id, name, resource_id, command_id, title) in [
+    for (scenario, include_github, include_linear) in [
+        ("both", true, true),
+        ("github", true, false),
+        ("linear", false, true),
+    ] {
+        run_plugin_row_resource_scenario(scenario, include_github, include_linear);
+    }
+}
+
+fn run_plugin_row_resource_scenario(scenario: &str, include_github: bool, include_linear: bool) {
+    let test_name = format!("plugin_row_resources_{scenario}");
+    let mut h = TuiTestHarness::new_in_tmp(&test_name);
+    for (enabled, provider, plugin_id, name, resource_id, command_id, title) in [
         (
+            include_github,
             "github",
             "test.github",
             "GitHub Test",
@@ -299,6 +311,7 @@ fn home_shows_plugin_row_statuses_and_opens_each_link() {
             "Open PR",
         ),
         (
+            include_linear,
             "linear",
             "test.linear",
             "Linear Test",
@@ -307,6 +320,9 @@ fn home_shows_plugin_row_statuses_and_opens_each_link() {
             "Open issue",
         ),
     ] {
+        if !enabled {
+            continue;
+        }
         let src = h.home_path().join(format!("src-{provider}"));
         std::fs::create_dir_all(&src).unwrap();
         std::fs::write(src.join("worker.js"), ROW_RESOURCES_WORKER_JS).unwrap();
@@ -375,27 +391,14 @@ fn home_shows_plugin_row_statuses_and_opens_each_link() {
         "tmux set-environment failed: {}",
         String::from_utf8_lossy(&env.stderr)
     );
-    h.spawn_tui();
+    h.spawn_tui_sized(160, 40);
     h.wait_for_ready();
-    let tui_session = format!("aoe_e2e_plugin_row_resources_{}", std::process::id());
-    let resized = std::process::Command::new("tmux")
-        .arg("-S")
-        .arg(h.home_path().join("tmux.sock"))
-        .args(["resize-window", "-t"])
-        .arg(tui_session)
-        .args(["-x", "160", "-y", "40"])
-        .output()
-        .expect("resize TUI for both plugin statuses");
-    assert!(
-        resized.status.success(),
-        "tmux resize failed: {}",
-        String::from_utf8_lossy(&resized.stderr)
-    );
+    h.send_keys(">>>>>>");
     let add = h.run_cli(&[
         "add",
         project.to_str().unwrap(),
         "-t",
-        "P",
+        "Plugin Resources",
         "-c",
         "claude",
         "--structured-view",
@@ -405,47 +408,85 @@ fn home_shows_plugin_row_statuses_and_opens_each_link() {
         "session creation failed: {}",
         String::from_utf8_lossy(&add.stderr)
     );
-    h.wait_for("Open");
-    h.wait_for("WIP");
+    if include_github {
+        h.wait_for("Open");
+    }
+    if include_linear {
+        h.wait_for("WIP");
+    }
+    let home_screen = h.capture_screen();
+    let status_row = home_screen
+        .lines()
+        .find(|line| line.contains("Plugin Resources"))
+        .unwrap_or_else(|| panic!("session row missing from screen: {home_screen}"));
+    assert_eq!(
+        status_row.contains("Open"),
+        include_github,
+        "GitHub row badge presence mismatch for {scenario}: {status_row}"
+    );
+    assert_eq!(
+        status_row.contains("WIP"),
+        include_linear,
+        "Linear row badge presence mismatch for {scenario}: {status_row}"
+    );
 
+    let links = [
+        (include_github, "Open PR", "https://example.com/pr/42"),
+        (
+            include_linear,
+            "Open issue",
+            "https://example.com/issues/42",
+        ),
+    ];
     h.send_keys("\\;");
-    h.wait_for("Open PR");
-    h.wait_for("Open issue");
-    h.send_keys("Enter");
-    let deadline = Instant::now() + Duration::from_secs(10);
-    loop {
-        let contents = std::fs::read_to_string(&opened).unwrap_or_default();
-        if contents.contains("https://example.com/pr/42")
-            || contents.contains("https://example.com/issues/42")
-        {
-            break;
+    for (enabled, command, _) in links {
+        if enabled {
+            h.wait_for(command);
         }
-        assert!(
-            Instant::now() < deadline,
-            "no plugin link opened. Captured URLs: {contents:?}. Screen: {}",
-            h.capture_screen()
+    }
+    let picker_screen = h.capture_screen();
+    for (enabled, command, _) in links {
+        assert_eq!(
+            picker_screen.contains(command),
+            enabled,
+            "plugin command presence mismatch for {scenario}: {command}. Screen: {picker_screen}"
         );
-        std::thread::sleep(Duration::from_millis(100));
     }
 
-    h.send_keys("\\;");
-    h.wait_for("Open PR");
-    h.wait_for("Open issue");
-    h.send_keys("Down");
-    h.send_keys("Enter");
-    let deadline = Instant::now() + Duration::from_secs(10);
-    loop {
-        let contents = std::fs::read_to_string(&opened).unwrap_or_default();
-        if contents.contains("https://example.com/pr/42")
-            && contents.contains("https://example.com/issues/42")
-        {
-            break;
+    let mut opened_count = 0;
+    for (enabled, command, url) in links {
+        if !enabled {
+            continue;
         }
-        assert!(
-            Instant::now() < deadline,
-            "both plugin links were not opened: {contents:?}. Screen: {}",
-            h.capture_screen()
-        );
-        std::thread::sleep(Duration::from_millis(100));
+        if opened_count > 0 {
+            h.send_keys("\\;");
+            for (enabled, command, _) in links {
+                if enabled {
+                    h.wait_for(command);
+                }
+            }
+            for _ in 0..opened_count {
+                h.send_keys("Down");
+            }
+        }
+        h.send_keys("Enter");
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let contents = std::fs::read_to_string(&opened).unwrap_or_default();
+            if contents.contains(url) {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "{command} link was not opened for {scenario}: {contents:?}. Screen: {}",
+                h.capture_screen()
+            );
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        opened_count += 1;
     }
+    assert_eq!(
+        opened_count,
+        usize::from(include_github) + usize::from(include_linear)
+    );
 }
