@@ -15,14 +15,14 @@ function setup(initial: { id: string; persistent: boolean; limit: number; stackA
   const mounts: Record<string, number> = {};
   const live = new Set<string>();
   let maxLive = 0;
-  const Probe = ({ id, active }: { id: string; active: boolean }) => {
+  const Probe = ({ id, active, selected }: { id: string; active: boolean; selected: boolean }) => {
     useEffect(() => {
       mounts[id] = (mounts[id] ?? 0) + 1;
       live.add(id);
       maxLive = Math.max(maxLive, live.size);
       return () => void live.delete(id);
     }, [id]);
-    return <div data-testid={`view-${id}`} data-active={String(active)} />;
+    return <div data-testid={`view-${id}`} data-active={String(active)} data-selected={String(selected)} />;
   };
   const ui = (p: typeof initial) => (
     <StructuredSessionStack
@@ -31,7 +31,7 @@ function setup(initial: { id: string; persistent: boolean; limit: number; stackA
       sessions={sessions}
       persistent={p.persistent}
       maxPersistentViews={p.limit}
-      renderSession={(session, active) => <Probe id={session.id} active={active} />}
+      renderSession={(session, active, selected) => <Probe id={session.id} active={active} selected={selected} />}
     />
   );
   const { rerender } = render(ui(initial));
@@ -82,10 +82,14 @@ describe("StructuredSessionStack", () => {
     expect(maxLive()).toBe(2);
   });
 
-  it("marks every view inactive while the stack is covered", async () => {
+  it("marks every view inactive while the stack is covered, but the selected one stays selected", async () => {
     const { show } = setup({ id: "s1", persistent: true, limit: 3 });
-    await show({ id: "s1", persistent: true, limit: 3, stackActive: false });
+    await show({ id: "s2", persistent: true, limit: 3 });
+    await waitFor(() => expect(screen.getByTestId("view-s1")).toBeDefined());
+    await show({ id: "s2", persistent: true, limit: 3, stackActive: false });
 
-    expect(screen.getByTestId("view-s1").dataset.active).toBe("false");
+    expect(screen.getByTestId("view-s2").dataset.active).toBe("false");
+    expect(screen.getByTestId("view-s2").dataset.selected).toBe("true");
+    expect(screen.getByTestId("view-s1").dataset.selected).toBe("false");
   });
 });

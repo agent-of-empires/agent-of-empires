@@ -40,8 +40,10 @@ type WorkerState = "absent" | "resuming" | "running" | "stopping";
 
 interface Props {
   sessionId: string;
-  /** False for a retained view that is hidden: no keyboard reservation, no chime. */
+  /** False for a retained view that is hidden or covered: no keyboard reservation. */
   active?: boolean;
+  /** False for a non-selected retained view: no chime. Stays true while the stack is covered. */
+  selected?: boolean;
   /** `SessionResponse.acp_worker_state`, polled. */
   acpWorkerState: WorkerState;
   /** Whether rate-limit auto-resume is on for this session's profile. */
@@ -201,7 +203,7 @@ function AcpChrome({
   }
   return (
     <StructuredViewRoot active={view.active}>
-      {view.active !== false && (
+      {view.selected !== false && (
         <AttentionChime
           sessionId={sessionId}
           approvals={state.pendingApprovals.length}

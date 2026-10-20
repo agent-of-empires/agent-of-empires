@@ -1943,10 +1943,11 @@ function AppContent({
                       sessions={sessions.filter((session) => session.view === "structured")}
                       persistent={webSettings.persistentStructuredViews}
                       maxPersistentViews={webSettings.maxPersistentStructuredViews}
-                      renderSession={(session, active) => (
+                      renderSession={(session, active, selected) => (
                         <Suspense fallback={<AcpLoadingFallback />}>
                           <StructuredView
                             active={active}
+                            selected={selected}
                             sessionId={session.id}
                             acpWorkerState={session.acp_worker_state ?? "absent"}
                             rateLimitAutoResume={session.rate_limit_auto_resume}

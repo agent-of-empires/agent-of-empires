@@ -13,7 +13,7 @@ interface Props {
   sessions: SessionResponse[];
   persistent: boolean;
   maxPersistentViews?: number;
-  renderSession: (session: SessionResponse, active: boolean) => ReactNode;
+  renderSession: (session: SessionResponse, active: boolean, selected: boolean) => ReactNode;
 }
 
 export function StructuredSessionStack({
@@ -47,7 +47,7 @@ export function StructuredSessionStack({
                 : "absolute inset-0 flex flex-col min-h-0 invisible pointer-events-none"
             }
           >
-            {renderSession(session, active && selected)}
+            {renderSession(session, active && selected, selected)}
           </div>
         );
       })}
