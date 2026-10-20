@@ -205,16 +205,17 @@ pub(super) async fn reap_idle_workers(state: &Arc<AppState>) {
         if !should_auto_stop(now_ms, last_ms, idle_secs, false) {
             continue;
         }
-        // Re-check mid-turn: a turn may have started since the snapshot.
-        let in_flight = query_store(
+        // Re-check mid-turn: work may have started since the snapshot. A failed probe counts
+        // as busy so live work is never stopped.
+        let holds_live_work = query_store(
             &state.acp_event_store,
             &id,
-            "idle-reap in-flight",
-            |s, id| s.has_in_flight_turn(id),
+            "idle-reap live work",
+            |s, id| s.holds_live_work(id),
         )
         .await
-        .unwrap_or(false);
-        if !should_auto_stop(now_ms, last_ms, idle_secs, in_flight)
+        .unwrap_or(true);
+        if !should_auto_stop(now_ms, last_ms, idle_secs, holds_live_work)
             || !set_dormant_in_memory(state, &id, true).await
         {
             continue;
