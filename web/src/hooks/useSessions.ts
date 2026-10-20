@@ -31,6 +31,10 @@ export function useSessions() {
   // GET admission is global; only installed rows attest individual mutation receipts.
   const floorGet = useRef<RuntimeCursor | null>(null);
   const abandonedEpochs = useRef(new Set<string>());
+  // Reads begun so far, and the pushed statuses by id with the reads begun at push time; a read at or below
+  // that count predates the push.
+  const startedReadsRef = useRef(0);
+  const pushedRef = useRef(new Map<string, { status: SessionResponse["status"]; read: number }>());
 
   const injectSession = useCallback((session: SessionResponse) => {
     setState((prev) =>
@@ -42,7 +46,7 @@ export function useSessions() {
     lastLocalOrderingAtRef.current = Date.now();
   }, []);
 
-  const applyResult = useCallback((data: SessionsEnvelope | null) => {
+  const applyResult = useCallback((data: SessionsEnvelope | null, read: number) => {
     setLoaded(true);
     if (data !== null) {
       setError(false);
@@ -53,8 +57,18 @@ export function useSessions() {
       if (floor?.epoch === cursor.epoch && cursor.revision < floor.revision) return;
       if (floor && floor.epoch !== cursor.epoch) abandonedEpochs.current.add(floor.epoch);
       floorGet.current = cursor;
+      const pushed = pushedRef.current;
+      const sessions = data.sessions.map((s) => {
+        const p = pushed.get(s.id);
+        if (!p) return s;
+        if (read > p.read) {
+          pushed.delete(s.id);
+          return s;
+        }
+        return { ...s, status: p.status };
+      });
       setState({
-        sessions: data.sessions,
+        sessions,
         observedById: Object.fromEntries(data.sessions.map((session) => [session.id, cursor])),
         epoch: cursor.epoch,
       });
@@ -80,13 +94,14 @@ export function useSessions() {
     };
     const tick = async () => {
       const mine = ++generation;
+      const read = ++startedReadsRef.current;
       const request = new AbortController();
       controller = request;
       const requestDeadline = setTimeout(() => {
         if (cancelled || mine !== generation) return;
         generation++;
         request.abort();
-        applyResult(null);
+        applyResult(null, read);
         scheduleNext();
       }, POLL_DEADLINE_MS);
       deadline = requestDeadline;
@@ -94,7 +109,7 @@ export function useSessions() {
       clearTimeout(requestDeadline);
       if (cancelled || mine !== generation) return;
       controller = undefined;
-      applyResult(data);
+      applyResult(data, read);
       scheduleNext();
     };
     void tick();
@@ -106,6 +121,16 @@ export function useSessions() {
       controller?.abort();
     };
   }, [applyResult]);
+
+  const refresh = useCallback(() => {
+    const read = ++startedReadsRef.current;
+    void fetchSessions().then((data) => applyResult(data, read));
+  }, [applyResult]);
+
+  const applyPushedStatus = useCallback((id: string, status: SessionResponse["status"]) => {
+    pushedRef.current.set(id, { status, read: startedReadsRef.current });
+    setState((prev) => ({ ...prev, sessions: prev.sessions.map((s) => (s.id === id ? { ...s, status } : s)) }));
+  }, []);
 
   const setSessionStatus = useCallback((id: string, status: SessionResponse["status"]) => {
     setState((prev) => ({ ...prev, sessions: prev.sessions.map((s) => (s.id === id ? { ...s, status } : s)) }));
@@ -177,5 +202,7 @@ export function useSessions() {
     clearDeletingStatus,
     applySession,
     applySessionMutation,
+    refresh,
+    applyPushedStatus,
   };
 }

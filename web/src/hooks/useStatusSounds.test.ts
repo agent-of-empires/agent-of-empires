@@ -29,7 +29,7 @@ const ENABLED = {
 };
 
 let played: string[] = [];
-let view: RenderHookResult<void, { s: SessionResponse[] }>;
+let view: RenderHookResult<ReturnType<typeof useStatusSounds>, { s: SessionResponse[] }>;
 
 class FakeAudio {
   volume = 1;
@@ -93,6 +93,17 @@ describe("useStatusSounds", () => {
     vi.useRealTimers();
     vi.unstubAllGlobals();
     vi.restoreAllMocks();
+  });
+
+  it("plays a server cue without waiting for a refresh, and the next refresh does not repeat it", async () => {
+    mount([at("a", "Running")]);
+    await step([at("a", "Waiting")]);
+    act(() => view.result.current("a", "waiting"));
+    await vi.waitFor(() => expect(played).toEqual(["blob:0"]));
+    await step([at("a", "Waiting")]);
+    await step([at("a", "Waiting")]);
+    await vi.waitFor(() => expect(fetchSoundBlob).toHaveBeenCalledTimes(1));
+    expect(played).toHaveLength(1);
   });
 
   it("plays the idle sound once a session settles into Idle", async () => {

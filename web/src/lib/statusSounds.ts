@@ -72,3 +72,18 @@ export function nextStatusSoundState(
   }
   return { state, due };
 }
+
+/** Folds a server `sound_due` cue: sounds once if the session is still in that status and not already sounded. */
+export function soundDueFor(
+  prev: StatusSoundState | null,
+  session: SessionResponse | undefined,
+  event: StatusSoundEvent,
+  now: number,
+): { state: StatusSoundState | null; play: boolean } {
+  if (!session || eventFor(session) !== event) return { state: prev, play: false };
+  const before = prev?.get(session.id);
+  if (before?.status === session.status && before.sounded) return { state: prev, play: false };
+  const state = new Map(prev ?? []);
+  state.set(session.id, { status: session.status, since: before?.since ?? now, sounded: true });
+  return { state, play: true };
+}
