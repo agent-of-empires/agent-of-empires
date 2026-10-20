@@ -1088,6 +1088,14 @@
       ]
     },
     {
+      "id": "wizard.attach-existing-worktree",
+      "kind": "vitest",
+      "risk": "low",
+      "specs": ["src/components/session-wizard/__tests__/WorktreePanel.test.tsx", "src/lib/api.test.ts"],
+      "components": ["web/src/components/session-wizard/steps/WorktreePanel.tsx"],
+      "notes": "Attach mode lists the repo's existing worktrees via GET /api/git/worktrees; picking one fills the branch name. Empty and failed listings show distinct messages, and create mode does not fetch."
+    },
+    {
       "id": "wizard.rows-and-panels",
       "kind": "vitest",
       "risk": "medium",
