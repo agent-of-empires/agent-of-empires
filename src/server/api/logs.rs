@@ -139,13 +139,15 @@ fn read_tail(path: &Path, lines: usize) -> std::io::Result<(String, usize, bool)
     Ok((out, kept.len(), truncated))
 }
 
-/// Each pattern keeps capture group 1 (the key) and replaces the value.
-static REDACTORS: LazyLock<[Regex; 4]> = LazyLock::new(|| {
+/// Each pattern keeps capture group 1 (the key) and replaces the value. Quoted values run
+/// through backslash escapes to their closing quote.
+static REDACTORS: LazyLock<[Regex; 5]> = LazyLock::new(|| {
     [
-        r#"(?i)((?:set-)?cookie["']?\s*[:=]\s*)(?:"[^"]*"|'[^']*'|[^\r\n]+)"#,
-        r#"(?i)(authorization["']?\s*[:=]\s*["'])[^\r\n"']+"#,
+        r#"(?i)((?:set-)?cookie["']?\s*[:=]\s*)(?:"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|[^\r\n]+)"#,
+        r#"(?i)(authorization["']?\s*[:=]\s*")(?:\\.|[^"\\\r\n])+"#,
+        r#"(?i)(authorization["']?\s*[:=]\s*')(?:\\.|[^'\\\r\n])+"#,
         r#"(?i)(authorization["']?\s*[:=]\s*)[^\s"'][^\r\n]*"#,
-        r#"(?i)((?:\w*token|passphrase|api[_-]?key|\w*password|\w*secret)["']?\s*[:=]\s*)(?:"[^"]*"|'[^']*'|[^\s&"',;]+)"#,
+        r#"(?i)((?:\w*token|passphrase|api[_-]?key|\w*password|\w*secret)["']?\s*[:=]\s*)(?:"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|[^\s&"',;]+)"#,
     ]
     .map(|p| Regex::new(p).expect("static redaction pattern"))
 });
@@ -188,6 +190,23 @@ mod tests {
                 "Authorization: [REDACTED]",
             ),
             ("Authorization: abc123 next", "Authorization: [REDACTED]"),
+            (
+                r#"{"authorization": "Digest username=\"alice\", response=\"xyz\""}"#,
+                r#"{"authorization": "[REDACTED]"}"#,
+            ),
+            (
+                r"authorization='Digest a=\'b\' c' ok",
+                r"authorization='[REDACTED]' ok",
+            ),
+            (
+                r#"{"cookie": "a=\"b\"; c=d", "x": 1}"#,
+                r#"{"cookie": [REDACTED], "x": 1}"#,
+            ),
+            (
+                r#"{"token": "a\"b", "x": 1}"#,
+                r#"{"token": [REDACTED], "x": 1}"#,
+            ),
+            (r"client_secret='it\'s' ok", r"client_secret=[REDACTED] ok"),
             (
                 r#"Authorization: Digest username="alice", response="xyz""#,
                 "Authorization: [REDACTED]",
