@@ -461,6 +461,17 @@
       "components": ["web/src/components/LoginPage.tsx"]
     },
     {
+      "id": "auth.passkey",
+      "kind": "vitest",
+      "risk": "high",
+      "specs": [
+        "src/components/__tests__/LoginPage.test.tsx",
+        "src/components/__tests__/PasskeySettings.test.tsx",
+        "src/lib/api.test.ts"
+      ],
+      "components": ["web/src/components/PasskeySettings.tsx"]
+    },
+    {
       "id": "auth.token-entry",
       "kind": "live-playwright",
       "risk": "medium",
@@ -533,6 +544,17 @@
       ]
     },
     {
+      "id": "settings.mcp-server-toggle",
+      "kind": "vitest",
+      "risk": "medium",
+      "specs": ["src/components/__tests__/SettingsView.mcpToggle.test.tsx"],
+      "components": [
+        "web/src/components/SettingsView.tsx",
+        "web/src/components/settings/SchemaSection.tsx",
+        "src/server/mcp.rs"
+      ]
+    },
+    {
       "id": "settings.list-field",
       "kind": "mocked-playwright",
       "risk": "medium",
@@ -576,6 +598,23 @@
         "web/src/components/settings/TelemetrySettings.tsx",
         "web/src/components/TelemetryConsentModal.tsx"
       ]
+    },
+    {
+      "id": "settings.logs-tab",
+      "kind": "vitest",
+      "risk": "medium",
+      "specs": [
+        "src/components/settings/__tests__/LogsSettings.test.tsx",
+        "src/components/__tests__/SettingsView.test.tsx"
+      ],
+      "components": ["web/src/components/settings/LogsSettings.tsx", "web/src/components/SettingsView.tsx"]
+    },
+    {
+      "id": "settings.logs-endpoint-access",
+      "kind": "live-playwright",
+      "risk": "high",
+      "specs": ["tests/live/logs-endpoint.spec.ts"],
+      "components": ["src/server/api/logs.rs"]
     },
     {
       "id": "settings.cityhall-export",
@@ -818,6 +857,13 @@
       "risk": "medium",
       "specs": ["src/components/__tests__/PushHealthBanner.test.tsx"],
       "components": ["web/src/components/PushHealthBanner.tsx"]
+    },
+    {
+      "id": "notifications.status-sounds",
+      "kind": "vitest",
+      "risk": "medium",
+      "specs": ["src/lib/statusSounds.test.ts", "src/hooks/useStatusSounds.test.ts"],
+      "components": ["web/src/lib/statusSounds.ts", "web/src/hooks/useStatusSounds.ts", "web/src/lib/soundPlayer.ts"]
     },
     {
       "id": "settings.security-readonly",
@@ -1086,6 +1132,14 @@
         "web/src/lib/api.ts",
         "web/src/lib/pendingCreates.ts"
       ]
+    },
+    {
+      "id": "wizard.attach-existing-worktree",
+      "kind": "vitest",
+      "risk": "low",
+      "specs": ["src/components/session-wizard/__tests__/WorktreePanel.test.tsx", "src/lib/api.test.ts"],
+      "components": ["web/src/components/session-wizard/steps/WorktreePanel.tsx"],
+      "notes": "Attach mode lists the repo's existing worktrees via GET /api/git/worktrees; picking one fills the branch name. Empty and failed listings show distinct messages, and create mode does not fetch."
     },
     {
       "id": "wizard.rows-and-panels",
@@ -1646,8 +1700,8 @@
       "id": "sidebar.project-row-header",
       "kind": "vitest",
       "risk": "medium",
-      "specs": ["src/components/__tests__/SidebarGroupHeader.test.tsx"],
-      "components": ["web/src/components/WorkspaceSidebar.tsx"]
+      "specs": ["src/components/__tests__/SidebarGroupHeader.test.tsx", "src/lib/__tests__/githubAvatar.test.ts"],
+      "components": ["web/src/components/WorkspaceSidebar.tsx", "web/src/components/OwnerAvatar.tsx"]
     },
     {
       "id": "sidebar.empty-state",
@@ -2501,6 +2555,24 @@
       "components": ["web/src/components/ConnectedDevices.tsx"]
     },
     {
+      "id": "connectivity.banner-stack",
+      "kind": "vitest",
+      "risk": "medium",
+      "specs": [
+        "src/components/__tests__/BannerStack.test.tsx",
+        "src/components/__tests__/DisconnectBanner.test.tsx",
+        "src/components/__tests__/UpdateBanner.test.tsx",
+        "src/components/__tests__/DashboardUpdateBanner.test.tsx"
+      ],
+      "components": [
+        "web/src/components/BannerStack.tsx",
+        "web/src/components/DisconnectBanner.tsx",
+        "web/src/components/UpdateBanner.tsx",
+        "web/src/components/DashboardUpdateBanner.tsx",
+        "web/src/components/PushHealthBanner.tsx"
+      ]
+    },
+    {
       "id": "connectivity.disconnect-banner",
       "kind": "live-playwright",
       "risk": "medium",
@@ -2634,8 +2706,12 @@
       "id": "acp.attention-chime",
       "kind": "vitest",
       "risk": "medium",
-      "specs": ["src/components/acp/__tests__/AttentionChime.test.tsx"],
-      "components": ["web/src/components/acp/AttentionChime.tsx", "web/src/components/acp/StructuredView.tsx"]
+      "specs": ["src/components/acp/__tests__/AttentionChime.test.tsx", "src/hooks/useApprovalSound.test.ts"],
+      "components": [
+        "web/src/components/acp/AttentionChime.tsx",
+        "web/src/components/acp/StructuredView.tsx",
+        "web/src/hooks/useApprovalSound.ts"
+      ]
     },
     {
       "id": "acp.elicitation-card",

@@ -46,6 +46,18 @@ impl ResumeTarget {
             command: inst.command.clone(),
         }
     }
+
+    fn spawn_kind(&self) -> ResumeKind {
+        spawn_kind(self.stored_acp_session_id.is_some())
+    }
+}
+
+fn spawn_kind(has_stored_id: bool) -> ResumeKind {
+    if has_stored_id {
+        ResumeKind::Spawn
+    } else {
+        ResumeKind::SpawnFirst
+    }
 }
 
 /// What to do with the registry record of a session with no in-memory worker.
@@ -157,7 +169,7 @@ pub(super) async fn resume_one(state: Arc<AppState>, target: ResumeTarget) -> Re
     });
     let kind = match decision {
         AdoptDecision::Attach | AdoptDecision::AdoptStaleForDrain => ResumeKind::Attach,
-        _ => ResumeKind::Spawn,
+        _ => target.spawn_kind(),
     };
     let mut reservation = match admit(&state, &id, kind).await {
         Ok(r) => r,
@@ -241,7 +253,7 @@ pub(super) async fn resume_one(state: Arc<AppState>, target: ResumeTarget) -> Re
                     }
                 }
                 // The failed attach released its lease; the spawn needs one that counts toward capacity.
-                reservation = match admit(&state, &id, ResumeKind::Spawn).await {
+                reservation = match admit(&state, &id, target.spawn_kind()).await {
                     Ok(r) => r,
                     Err(outcome) => return outcome,
                 };
@@ -363,6 +375,7 @@ async fn build_spawn_request(
         agent_model,
         agent_provider,
         claude_store_pin,
+        prior_conversation,
     ) = {
         let _guard = inst_lock.lock().await;
         let instances = service.instances.read().await;
@@ -378,6 +391,9 @@ async fn build_spawn_request(
             inst.agent_model.clone(),
             inst.agent_provider.clone(),
             inst.selected_claude_store_pin(),
+            // A restart before the first worker assigned an ACP id leaves only
+            // the terminal conversation id to announce replacing.
+            target.stored_acp_session_id.is_none() && inst.agent_session_id.is_some(),
         )
     };
     let agent = supervisor
@@ -427,6 +443,7 @@ async fn build_spawn_request(
         acp_mode_id,
         agent_command_override: command_override_for_spawn(&target.tool, &target.command),
         seed_history_replay,
+        prior_conversation,
         claude_store_pin,
     })
 }
@@ -468,9 +485,15 @@ pub(crate) async fn trigger_resume_background(
     id: &str,
     authority: crate::process::worker_registry::ResumeAuthority,
 ) -> Result<ResumeTrigger, SupervisorError> {
+    let has_stored_id = service
+        .instances
+        .read()
+        .await
+        .iter()
+        .any(|i| i.id == id && i.acp_session_id.is_some());
     let reservation = match service
         .acp_supervisor
-        .begin_resume(id, ResumeKind::Spawn, authority)
+        .begin_resume(id, spawn_kind(has_stored_id), authority)
         .await?
     {
         ResumeReservationOutcome::Reserved(r) => r,
@@ -606,6 +629,31 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(req.model.as_deref(), Some("claude-opus-5"));
+    }
+
+    #[tokio::test]
+    async fn build_spawn_request_flags_a_terminal_conversation_without_an_acp_id() {
+        // (agent_session_id, acp_session_id, expected)
+        let cases = [
+            (Some("terminal-id"), None, true),
+            (None, None, false),
+            (Some("terminal-id"), Some("acp-id"), false),
+        ];
+        for (agent_id, acp_id, expected) in cases {
+            let mut instance = Instance::new("restart", "/tmp/aoe-4553-restart");
+            instance.id = "sess-restart".to_string();
+            instance.view = crate::session::View::Structured;
+            instance.agent_session_id = agent_id.map(String::from);
+            instance.acp_session_id = acp_id.map(String::from);
+            let state = crate::server::test_support::build_test_app_state(vec![instance.clone()]);
+            let req = build_spawn_request(
+                &state.session_service,
+                &ResumeTarget::from_instance(&instance),
+            )
+            .await
+            .unwrap();
+            assert_eq!(req.prior_conversation, expected, "{agent_id:?} {acp_id:?}");
+        }
     }
 
     /// #4127: a request is not an observation. Building one derives the route

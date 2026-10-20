@@ -124,8 +124,6 @@ use ratatui::prelude::*;
 use std::io::{self, IsTerminal};
 
 use crate::migrations;
-use crate::session::get_update_settings;
-use crate::update::check_for_update;
 
 /// Mouse capture needs both the `session.mouse_capture` setting and no
 /// `AOE_MOUSE_CAPTURE=0|false` opt-out.
@@ -271,20 +269,7 @@ pub async fn run(profile: &str, startup_warning: Option<String>) -> Result<()> {
         std::process::exit(1);
     }
 
-    let available_tools = crate::tmux::AvailableTools::detect();
-
-    // Refresh the update cache so the changelog dialog has release notes.
-    if check_version_change()?.is_some() && get_update_settings().update_check_mode.is_enabled() {
-        // Don't let a network issue block startup.
-        let _ = tokio::time::timeout(
-            std::time::Duration::from_secs(5),
-            check_for_update(env!("CARGO_PKG_VERSION"), true),
-        )
-        .await;
-    }
-
-    // Clean-only plugin auto-update, non-blocking; asks a running daemon to reload.
-    crate::plugin::auto_update::spawn_if_enabled(&crate::session::Config::load_or_warn(), None);
+    let available_tools = crate::tmux::AvailableTools::detect_on_path();
 
     // Without a tty the event loop would busy-loop after the parent terminal dies.
     if !io::stdin().is_terminal() {

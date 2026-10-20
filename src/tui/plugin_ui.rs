@@ -2,18 +2,22 @@
 //! native TUI (#2402), mirroring `web/src/lib/pluginUi.ts` narrowed to what a
 //! terminal can render: `StatusBar` / `DetailBadge` text, `Notification` toasts,
 //! `Pane` / `HomePane` blocks in a toggleable overlay (#2467), and `RowColumn`
-//! text on remote-home rows (#2948). Icons, tooltips, hrefs and the
-//! `Card`/`RowBadge`/`SortKey`/`FilterFacet` slots have no TUI surface.
+//! text on remote-home rows (#2948), and `SortKey` orderings of that picker.
+//! Icons, tooltips, hrefs and the `Card`/`RowBadge`/`FilterFacet` slots have no
+//! TUI surface.
 //!
 //! Side-effect-free, so the render layer can borrow the snapshot and the
 //! filtering / tone-mapping is unit-testable without a daemon.
+
+use std::cmp::Ordering;
+use std::collections::HashMap;
 
 use aoe_plugin_api::UiSlot;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use serde_json::Value;
 
-use crate::plugin::ui_state::{Notification, Tone, UiEntry, UiSnapshot};
+use crate::plugin::ui_state::{Notification, SortValue, Tone, UiEntry, UiSnapshot};
 use crate::tui::styles::Theme;
 
 /// Global entries for `slot`: those a plugin pushed without a `session_id`.
@@ -84,6 +88,82 @@ pub fn row_column_cells(snapshot: &UiSnapshot, session_id: &str) -> Vec<(String,
     session_entries(snapshot, UiSlot::RowColumn, session_id)
         .filter_map(|e| entry_text(e).map(|t| (t.to_string(), entry_tone(e))))
         .collect()
+}
+
+/// A plugin's `sort-key`: which `row-column` to order by, and which way.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SortSpec {
+    pub plugin_id: String,
+    pub entry_id: String,
+    pub label: String,
+    column: String,
+    pub descending: bool,
+}
+
+/// Global `SortKey` entries in snapshot order. Entries missing a label or
+/// column are skipped; direction defaults to ascending.
+pub fn sort_specs(snapshot: &UiSnapshot) -> Vec<SortSpec> {
+    let text = |e: &UiEntry, key: &str| {
+        e.payload
+            .get(key)
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+    };
+    global_entries(snapshot, UiSlot::SortKey)
+        .filter_map(|e| {
+            Some(SortSpec {
+                plugin_id: e.plugin_id.clone(),
+                entry_id: e.id.clone(),
+                label: text(e, "label")?,
+                column: text(e, "column")?,
+                descending: e.payload.get("direction").and_then(Value::as_str) == Some("desc"),
+            })
+        })
+        .collect()
+}
+
+/// `session_id` to the referenced `row-column`'s `sort_value`. Sessions without
+/// a finite number or string are absent, and sink in [`compare_sort_values`].
+pub fn sort_values<'a>(snapshot: &'a UiSnapshot, spec: &SortSpec) -> HashMap<&'a str, SortValue> {
+    snapshot
+        .entries
+        .iter()
+        .filter(|e| {
+            e.slot == UiSlot::RowColumn && e.plugin_id == spec.plugin_id && e.id == spec.column
+        })
+        .filter_map(|e| {
+            let value = match e.payload.get("sort_value")? {
+                Value::Number(n) => SortValue::Number(n.as_f64().filter(|f| f.is_finite())?),
+                Value::String(s) => SortValue::String(s.clone()),
+                _ => return None,
+            };
+            Some((e.session_id.as_deref()?, value))
+        })
+        .collect()
+}
+
+/// Missing values sink in both directions; numbers sort before strings when
+/// mixed.
+pub fn compare_sort_values(
+    a: Option<&SortValue>,
+    b: Option<&SortValue>,
+    descending: bool,
+) -> Ordering {
+    let ord = match (a, b) {
+        (None, None) => return Ordering::Equal,
+        (None, Some(_)) => return Ordering::Greater,
+        (Some(_), None) => return Ordering::Less,
+        (Some(SortValue::Number(x)), Some(SortValue::Number(y))) => x.total_cmp(y),
+        (Some(SortValue::String(x)), Some(SortValue::String(y))) => x.cmp(y),
+        (Some(SortValue::Number(_)), Some(SortValue::String(_))) => Ordering::Less,
+        (Some(SortValue::String(_)), Some(SortValue::Number(_))) => Ordering::Greater,
+    };
+    if descending {
+        ord.reverse()
+    } else {
+        ord
+    }
 }
 
 /// Map a tone to a foreground style against the active theme. `None` renders
@@ -937,6 +1017,74 @@ mod tests {
 
     /// Flatten rendered lines to their plain text, one string per line, so a
     /// test can assert on content without spelling out styles.
+    #[test]
+    fn sort_specs_skip_malformed_and_default_ascending() {
+        let snap = pane_snapshot(json!([
+            {"plugin_id": "gh", "slot": "sort-key", "id": "a",
+             "payload": {"label": "Attention", "column": "att", "direction": "desc"}},
+            {"plugin_id": "gh", "slot": "sort-key", "id": "b",
+             "payload": {"label": "Age", "column": "age"}},
+            {"plugin_id": "gh", "slot": "sort-key", "id": "c", "payload": {"label": "x"}},
+            {"plugin_id": "gh", "slot": "sort-key", "id": "d",
+             "payload": {"label": "", "column": "age"}},
+            {"plugin_id": "gh", "slot": "sort-key", "id": "e", "session_id": "s1",
+             "payload": {"label": "scoped", "column": "age"}}
+        ]));
+        let specs = sort_specs(&snap);
+        let got: Vec<_> = specs
+            .iter()
+            .map(|s| (s.entry_id.as_str(), s.label.as_str(), s.descending))
+            .collect();
+        assert_eq!(got, [("a", "Attention", true), ("b", "Age", false)]);
+        assert!(sort_specs(&pane_snapshot(json!([]))).is_empty());
+    }
+
+    #[test]
+    fn sort_values_read_only_the_referenced_finite_scalars() {
+        let rc = |plugin: &str, id: &str, sid: &str, v: serde_json::Value| {
+            json!({"plugin_id": plugin, "slot": "row-column", "id": id,
+                   "session_id": sid, "payload": {"text": "t", "sort_value": v}})
+        };
+        let snap = pane_snapshot(json!([
+            {"plugin_id": "gh", "slot": "sort-key", "id": "k",
+             "payload": {"label": "L", "column": "att"}},
+            rc("gh", "att", "s1", json!(2.5)),
+            rc("gh", "att", "s2", json!("b")),
+            rc("gh", "att", "s3", json!(null)),
+            rc("gh", "att", "s4", json!(true)),
+            rc("gh", "other", "s5", json!(1)),
+            rc("other", "att", "s6", json!(1)),
+        ]));
+        let spec = &sort_specs(&snap)[0];
+        let values = sort_values(&snap, spec);
+        let mut ids: Vec<_> = values.keys().copied().collect();
+        ids.sort_unstable();
+        assert_eq!(ids, ["s1", "s2"]);
+        assert!(matches!(values["s1"], SortValue::Number(n) if n == 2.5));
+    }
+
+    #[test]
+    fn compare_sort_values_cases() {
+        use SortValue::{Number as N, String as S};
+        let (one, two) = (N(1.0), N(2.0));
+        let (a, b) = (S("a".into()), S("b".into()));
+        let cases = [
+            (Some(&one), Some(&two), false, Ordering::Less),
+            (Some(&one), Some(&two), true, Ordering::Greater),
+            (Some(&a), Some(&b), false, Ordering::Less),
+            (Some(&a), Some(&b), true, Ordering::Greater),
+            (Some(&two), Some(&a), false, Ordering::Less),
+            (Some(&two), Some(&a), true, Ordering::Greater),
+            (None, Some(&one), false, Ordering::Greater),
+            (None, Some(&one), true, Ordering::Greater),
+            (Some(&one), None, true, Ordering::Less),
+            (None, None, true, Ordering::Equal),
+        ];
+        for (x, y, desc, want) in cases {
+            assert_eq!(compare_sort_values(x, y, desc), want, "{x:?} {y:?} {desc}");
+        }
+    }
+
     fn texts(lines: &[Line<'static>]) -> Vec<String> {
         lines
             .iter()

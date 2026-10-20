@@ -8,7 +8,7 @@ use super::access::{access_policy, cityhall_gate, security_headers};
 #[cfg(feature = "web")]
 use super::assets::{serve_asset, serve_index, serve_public_file};
 use super::state::AppState;
-use crate::server::{acp_ws, api, auth, live_ws, login, push, runtime_ws};
+use crate::server::{acp_ws, api, auth, live_ws, login, passkeys, push, runtime_ws};
 
 pub(super) fn build_router(state: Arc<AppState>) -> Router {
     use axum::routing::{delete, get, patch, post, put};
@@ -158,6 +158,7 @@ pub(super) fn build_router(state: Arc<AppState>) -> Router {
         .route("/api/filesystem/browse", get(api::browse_filesystem))
         .route("/api/filesystem/home", get(api::filesystem_home))
         .route("/api/git/branches", get(api::list_branches))
+        .route("/api/git/worktrees", get(api::list_worktrees))
         .route("/api/git/is-repo", get(api::is_git_repo))
         .route("/api/git/clone", post(api::clone_repo))
         .route("/api/groups", get(api::list_groups))
@@ -171,6 +172,7 @@ pub(super) fn build_router(state: Arc<AppState>) -> Router {
         )
         .route("/api/docker/status", get(api::docker_status))
         .route("/api/system/health", get(api::system_health))
+        .route("/api/system/logs", get(api::get_logs))
         // Settings + themes
         .route(
             "/api/settings",
@@ -281,6 +283,25 @@ pub(super) fn build_router(state: Arc<AppState>) -> Router {
             "/api/login/sessions/{id}",
             delete(login::revoke_session_handler),
         )
+        // Passkey (WebAuthn) sign-in. Register and delete are elevation-gated.
+        .route(
+            "/api/login/passkey/start",
+            post(passkeys::login_start_handler),
+        )
+        .route(
+            "/api/login/passkey/finish",
+            post(passkeys::login_finish_handler),
+        )
+        .route(
+            "/api/passkeys/register/start",
+            post(passkeys::register_start_handler),
+        )
+        .route(
+            "/api/passkeys/register/finish",
+            post(passkeys::register_finish_handler),
+        )
+        .route("/api/passkeys", get(passkeys::list_handler))
+        .route("/api/passkeys/{id}", delete(passkeys::delete_handler))
         // Devices.
         .route("/api/devices", get(login::devices_handler))
         // About (version, auth status, read-only state)
@@ -319,6 +340,10 @@ pub(super) fn build_router(state: Arc<AppState>) -> Router {
         .route(
             "/api/sessions/{id}/acp/install-agent",
             post(api::install_agent),
+        )
+        .route(
+            "/api/sessions/{id}/acp/install-info",
+            get(api::agent_install_info),
         )
         .route("/api/sessions/{id}/acp", delete(api::shutdown_acp))
         .route(
@@ -389,6 +414,12 @@ pub(super) fn build_router(state: Arc<AppState>) -> Router {
             "/api/importable-sessions",
             get(api::list_importable_sessions),
         );
+
+    let app = if state.web_config.mcp_enabled {
+        app.route_service("/mcp", super::mcp::service(state.clone()))
+    } else {
+        app
+    };
 
     // Dashboard bundle (Vite build output) plus the SPA fallback.
     #[cfg(feature = "web")]

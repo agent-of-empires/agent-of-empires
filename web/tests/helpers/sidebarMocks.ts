@@ -73,7 +73,7 @@ export async function installSidebarMocks(page: Page, opts: SidebarMockOptions):
 
   let ordering = opts.ordering ?? filled.map((s) => workspaceId(s));
 
-  await page.route("**/api/login/status", (r) => r.fulfill({ json: { required: false, authenticated: true } }));
+  await page.route("**/api/login/status*", (r) => r.fulfill({ json: { required: false, authenticated: true } }));
   await page.route("**/api/sessions", (r) => {
     if (r.request().method() !== "GET") return r.fulfill({ status: 400 });
     return r.fulfill({

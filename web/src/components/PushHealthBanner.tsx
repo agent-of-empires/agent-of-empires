@@ -10,8 +10,11 @@ function writeDismissed(health: PushHealth | null): void {
   else safeRemoveItem(DISMISSED_KEY);
 }
 
-/** Alerts a device that asked for push notifications and has stopped receiving them. */
-export function PushHealthBanner() {
+/**
+ * Alerts a device that asked for push notifications and has stopped receiving them. `hidden` removes it without
+ * unmounting the subscription state behind it.
+ */
+export function PushHealthBanner({ hidden = false }: { hidden?: boolean }) {
   const { state, health, enable } = usePushSubscription();
   // Dismissal is per health state, so a different failure shows again.
   const [dismissed, setDismissed] = useState(() => safeGetItem(DISMISSED_KEY));
@@ -22,7 +25,7 @@ export function PushHealthBanner() {
   }, [health]);
   if (health === "healthy" && dismissed !== null) setDismissed(null);
 
-  if (!needsAttention(health) || dismissed === health) return null;
+  if (hidden || !needsAttention(health) || dismissed === health) return null;
   const busy = state.kind === "asking" || state.kind === "subscribing";
 
   return (

@@ -26,9 +26,10 @@ use super::agent_registry::AgentRegistry;
 pub use super::runner_lifecycle::ResumeKind;
 use super::runner_lifecycle::{
     Lease, LifecycleTable, ProcessControl, RunnerIdentity, SystemProcessControl, WorkerPhase,
+    WorkerStart,
 };
 use super::state::AcpSessionId;
-use crate::daemon::AcpWorkerState;
+use crate::daemon::{AcpWorkerStart, AcpWorkerStartKind, AcpWorkerState};
 use crate::session::SandboxInfo;
 
 pub(crate) use agents::apply_agent_command_override;
@@ -125,6 +126,19 @@ struct WorkerHandle {
     kind: WorkerKind,
     lease: Lease,
     native_session_id: Option<String>,
+}
+
+impl From<WorkerStart> for AcpWorkerStart {
+    fn from(start: WorkerStart) -> Self {
+        Self {
+            kind: if start.first_start {
+                AcpWorkerStartKind::FirstStart
+            } else {
+                AcpWorkerStartKind::Resume
+            },
+            started_at: start.started_at.to_rfc3339(),
+        }
+    }
 }
 
 impl From<WorkerPhase> for AcpWorkerState {
@@ -246,6 +260,8 @@ pub struct SpawnRequest {
     pub agent_command_override: Option<AgentCommandOverride>,
     /// Let a `session/load` replay history into the (empty) event store for an import.
     pub seed_history_replay: bool,
+    /// A conversation existed before this launch, so replacing it must be announced.
+    pub prior_conversation: bool,
     /// Claude store selected by the conversation binding for a host Claude worker.
     pub claude_store_pin: Option<crate::session::capture::ClaudeStorePin>,
 }
@@ -341,11 +357,13 @@ impl<S: BroadcastSink> Supervisor<S> {
         out
     }
 
-    pub async fn worker_states_snapshot(&self) -> HashMap<String, AcpWorkerState> {
+    pub async fn worker_states_snapshot(
+        &self,
+    ) -> HashMap<String, (AcpWorkerState, Option<AcpWorkerStart>)> {
         lock_recover(&self.lifecycle)
             .snapshot()
             .into_iter()
-            .map(|(id, phase)| (id, phase.into()))
+            .map(|(id, (phase, start))| (id, (phase.into(), start.map(Into::into))))
             .collect()
     }
 

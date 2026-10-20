@@ -156,6 +156,7 @@ const requestCases: RequestCase[] = [
   ["POST /api/app-state/web-tour-seen", () => api.markWebTourSeen(), { result: true }],
   ["GET /api/git/branches?path=%2Frepo", () => api.fetchBranches("/repo")],
   ["GET /api/git/branches?path=%2Frepo&include_remote=true", () => api.fetchBranches("/repo", true)],
+  ["GET /api/git/worktrees?path=%2Frepo", () => api.fetchWorktrees("/repo")],
   [
     "GET /api/git/is-repo?path=%2Fr",
     () => api.fetchIsGitRepo("/r"),
@@ -236,7 +237,17 @@ const requestCases: RequestCase[] = [
   ["GET /api/devices", () => api.fetchDevices()],
   ["DELETE /api/login/sessions/sess%2F1", () => api.revokeDevice("sess/1"), { result: true }],
   ["POST /api/login/logout-all", () => api.signOutAllDevices(), { result: true }],
-  ["GET /api/login/status", () => api.loginStatus(), { respond: json({ required: true }), result: { required: true } }],
+  [
+    `GET /api/login/status?origin=${encodeURIComponent(window.location.origin)}`,
+    () => api.loginStatus(),
+    { respond: json({ required: true }), result: { required: true } },
+  ],
+  [
+    "GET /api/passkeys",
+    () => api.fetchPasskeys(),
+    { respond: json([{ credential_id: "c1" }]), result: [{ credential_id: "c1" }] },
+  ],
+  ["DELETE /api/passkeys/a%2Fb", () => api.removePasskey("a/b"), { result: true }],
   ["GET /api/login/status", () => api.verifyToken(), { result: true }],
   ["GET /api/agents", () => api.fetchAgents(), { respond: json([{ id: "claude" }]), result: [{ id: "claude" }] }],
   ["GET /api/profiles", () => api.fetchProfiles()],
@@ -837,6 +848,25 @@ describe("fetchCityHallBundle", () => {
   });
 });
 
+describe("fetchLogs", () => {
+  it("requests the line count and returns the snapshot", async () => {
+    const snapshot = { status: "available", content: "a\n", lineCount: 1, truncated: false };
+    fetchSpy.mockResolvedValueOnce(json(snapshot));
+    const signal = new AbortController().signal;
+    await expect(api.fetchLogs(200, signal)).resolves.toEqual(snapshot);
+    expect(lastCall().url).toBe("/api/system/logs?lines=200");
+    expect(lastCall().init).toEqual({ signal });
+  });
+
+  it.each([
+    [json({ message: "Server is in read-only mode" }, 403), "Server is in read-only mode"],
+    [new Response("<html>502</html>", { status: 502 }), "Could not load logs (HTTP 502)"],
+  ])("throws the server message or status", async (response, message) => {
+    fetchSpy.mockResolvedValueOnce(response);
+    await expect(api.fetchLogs(500)).rejects.toThrow(message);
+  });
+});
+
 describe("installAcpAgent", () => {
   it("POSTs and returns the parsed body", async () => {
     const body = { session_id: "s-1", package: "p", success: true, exit_code: 0, stdout: "", stderr: "" };
@@ -946,6 +976,80 @@ it("cloneRepo maps server and network errors", async () => {
   expect(await api.cloneRepo("u")).toEqual({ ok: false, error: "Clone failed (500)" });
   offline();
   expect(await api.cloneRepo("u")).toEqual({ ok: false, error: "Network error: offline" });
+});
+
+describe("passkey ceremonies", () => {
+  const getOptions = { publicKey: { challenge: "c" } };
+  let get: ReturnType<typeof vi.fn>;
+  let create: ReturnType<typeof vi.fn>;
+
+  beforeEach(() => {
+    get = vi.fn();
+    create = vi.fn();
+    const parse = vi.fn((o: unknown) => ({ parsed: o }));
+    vi.stubGlobal("PublicKeyCredential", {
+      parseRequestOptionsFromJSON: parse,
+      parseCreationOptionsFromJSON: parse,
+    });
+    vi.stubGlobal("navigator", { credentials: { get, create } });
+  });
+  afterEach(() => vi.unstubAllGlobals());
+
+  it("passkeysSupported needs both JSON parsers", () => {
+    expect(api.passkeysSupported()).toBe(true);
+    vi.stubGlobal("PublicKeyCredential", { parseRequestOptionsFromJSON: () => {} });
+    expect(api.passkeysSupported()).toBe(false);
+    vi.stubGlobal("PublicKeyCredential", undefined);
+    expect(api.passkeysSupported()).toBe(false);
+  });
+
+  it("loginWithPasskey runs start, the browser prompt, then finish with the binding secret", async () => {
+    fetchSpy.mockResolvedValueOnce(json({ transaction_id: "t1", options: getOptions }));
+    get.mockResolvedValueOnce({ toJSON: () => ({ id: "cred" }) });
+    fetchSpy.mockResolvedValueOnce(empty());
+
+    expect(await api.loginWithPasskey()).toEqual({ ok: true });
+    expect(get).toHaveBeenCalledWith({ publicKey: { parsed: { challenge: "c" } } });
+    const calls = fetchSpy.mock.calls;
+    expect(calls[0][0]).toBe("/api/login/passkey/start");
+    expect(calls[1][0]).toBe("/api/login/passkey/finish");
+    const sent = bodyOf(calls[1][1]);
+    expect(sent.transaction_id).toBe("t1");
+    expect(sent.credential).toEqual({ id: "cred" });
+    expect(sent.device_binding_secret).toMatch(/.+/);
+  });
+
+  it("a dismissed prompt is cancelled and never reaches finish", async () => {
+    fetchSpy.mockResolvedValueOnce(json({ transaction_id: "t1", options: getOptions }));
+    get.mockRejectedValueOnce(new DOMException("denied", "NotAllowedError"));
+    expect(await api.loginWithPasskey()).toEqual({ ok: false, cancelled: true });
+    expect(fetchSpy).toHaveBeenCalledTimes(1);
+  });
+
+  it("maps start, finish and network failures", async () => {
+    fetchSpy.mockResolvedValueOnce(json({ message: "no passkey" }, 404));
+    expect(await api.loginWithPasskey()).toEqual({ ok: false, error: "no passkey" });
+
+    fetchSpy.mockResolvedValueOnce(json({ transaction_id: "t1", options: getOptions }));
+    get.mockResolvedValueOnce({ toJSON: () => ({}) });
+    fetchSpy.mockResolvedValueOnce(empty(401));
+    expect(await api.loginWithPasskey()).toEqual({ ok: false, error: "Passkey sign-in failed (401)" });
+
+    offline();
+    expect(await api.loginWithPasskey()).toEqual({ ok: false, error: "Network error" });
+  });
+
+  it("registerPasskey sends the label and the created credential", async () => {
+    fetchSpy.mockResolvedValueOnce(json({ transaction_id: "t2", options: { publicKey: { challenge: "c" } } }));
+    create.mockResolvedValueOnce({ toJSON: () => ({ id: "new" }) });
+    fetchSpy.mockResolvedValueOnce(json({ ok: true }));
+
+    expect(await api.registerPasskey("Phone")).toEqual({ ok: true });
+    expect(fetchSpy.mock.calls[0][0]).toBe("/api/passkeys/register/start");
+    expect(bodyOf(fetchSpy.mock.calls[0][1])).toEqual({ label: "Phone" });
+    expect(fetchSpy.mock.calls[1][0]).toBe("/api/passkeys/register/finish");
+    expect(bodyOf(fetchSpy.mock.calls[1][1])).toEqual({ transaction_id: "t2", credential: { id: "new" } });
+  });
 });
 
 describe("login", () => {

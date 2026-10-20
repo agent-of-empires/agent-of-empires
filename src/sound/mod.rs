@@ -30,7 +30,7 @@ fn resolve_sound_name(override_name: Option<&str>) -> Option<String> {
 }
 
 pub fn play_for_transition(old: Status, new: Status, config: &SoundConfig) {
-    if !config.enabled || old == new {
+    if !config.enabled || !config.server_enabled || old == new {
         return;
     }
 

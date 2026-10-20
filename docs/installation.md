@@ -29,7 +29,7 @@ For system libraries, install `pkg-config` and compatible libgit2, OpenSSL and S
 LIBGIT2_NO_VENDOR=1 cargo build --release --no-default-features --features default-plugins
 ```
 
-`--no-default-features` disables all defaults; explicitly selecting `default-plugins` retains that default feature selection independently of `vendored`. Add `web` to the feature list for the dashboard. `LIBGIT2_NO_VENDOR=1` fails the build if compatible system libgit2 is unavailable, instead of falling back to a source build. Other native dependencies are unaffected, and system libgit2 may still link OpenSSL transitively.
+`--no-default-features` disables all defaults; explicitly selecting `default-plugins` retains that default feature selection independently of `vendored`. Add `web` to the feature list for the dashboard. `LIBGIT2_NO_VENDOR=1` fails the build if compatible system libgit2 is unavailable, instead of falling back to a source build. Other native dependencies are unaffected, and system libgit2 may still link OpenSSL transitively. The passkey sign-in dependency also links OpenSSL, which then comes from the system.
 
 A source build leaves the binary at `target/release/aoe`. Verify any install with `aoe --version`.
 

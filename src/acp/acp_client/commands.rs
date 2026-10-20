@@ -79,6 +79,8 @@ pub(super) enum ConnectMode {
         /// advertises the fork capability, the handshake sends
         /// `session/fork` instead of `session/new` / `session/load`.
         fork_from: Option<String>,
+        /// A conversation existed before this launch, even without a stored id.
+        prior_conversation: bool,
     },
     Resume {
         acp_session_id: String,

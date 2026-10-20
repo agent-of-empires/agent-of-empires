@@ -7,7 +7,7 @@ const STATIC_PATHS = ["settings", "themes", "agents", "profiles", "groups", "dev
 /** `login/status` plus the config GETs the shell fetches on mount. Later
  *  `page.route` registrations win, so a spec can override any of these after. */
 export async function mockStaticApis(page: Page, overrides: Record<string, unknown> = {}) {
-  await page.route("**/api/login/status", (r) => r.fulfill({ json: { required: false, authenticated: true } }));
+  await page.route("**/api/login/status*", (r) => r.fulfill({ json: { required: false, authenticated: true } }));
   for (const path of STATIC_PATHS) {
     const json = path in overrides ? overrides[path] : path === "docker/status" ? {} : [];
     await page.route(`**/api/${path}`, (r) => r.fulfill({ json }));

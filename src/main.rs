@@ -372,6 +372,12 @@ async fn run(
         Some(Commands::Migrate) => return exit_zero(cli::migrate::run()),
 
         Some(Commands::Stop { .. }) => return exit_zero(cli::killall::stop_trap()),
+        // Before the startup lock and migrations: see `cli::serve::run_control`.
+        Some(Commands::Serve(ref args)) => {
+            if let Some(result) = cli::serve::run_control(args).await {
+                return exit_zero(result);
+            }
+        }
         _ => {}
     }
 
@@ -379,7 +385,7 @@ async fn run(
     let profile = cli.profile.unwrap_or_default();
 
     let serve_lock = match &cli.command {
-        Some(Commands::Serve(args)) => cli::serve::lock_for_startup(args)?,
+        Some(Commands::Serve(_)) => Some(cli::serve::lock_for_startup()?),
         _ => None,
     };
 

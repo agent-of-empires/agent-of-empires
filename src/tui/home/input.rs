@@ -1496,12 +1496,7 @@ impl HomeView {
             if let Some(DialogResult::Submit(action)) = dialog.handle_click(col, row) {
                 match action {
                     NoAgentsAction::Recheck => {
-                        crate::tmux::invalidate_agent_availability();
-                        let tools = crate::tmux::AvailableTools::detect();
-                        if tools.any_available() {
-                            self.set_available_tools(tools);
-                            self.no_agents_dialog = None;
-                        }
+                        self.pending_dialog_click_action = Some(Action::RecheckAgents);
                     }
                     NoAgentsAction::Quit => {
                         self.no_agents_dialog = None;
@@ -1888,13 +1883,7 @@ impl HomeView {
                     return Some(Action::Quit);
                 }
                 DialogResult::Submit(NoAgentsAction::Recheck) => {
-                    crate::tmux::invalidate_agent_availability();
-                    let tools = crate::tmux::AvailableTools::detect();
-                    if tools.any_available() {
-                        self.set_available_tools(tools);
-                        self.no_agents_dialog = None;
-                    }
-                    // If still no agents, keep dialog open (user can try again)
+                    return Some(Action::RecheckAgents);
                 }
             }
             return None;

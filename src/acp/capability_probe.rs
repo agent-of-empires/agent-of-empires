@@ -59,6 +59,7 @@ pub async fn probe_agent(agent: &str) -> anyhow::Result<bool> {
         source_profile: None,
         mcp_servers: Vec::new(),
         seed_history_replay: false,
+        prior_conversation: false,
         generation: 0,
         artifact_dir: None,
         claude_store_pin: None,

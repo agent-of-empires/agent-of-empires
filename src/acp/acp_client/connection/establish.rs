@@ -4,6 +4,7 @@
 use crate::acp::agent_compat::{self, ExpectedAgent};
 use crate::acp::mcp_config;
 use crate::acp::state::{Event, StartupErrorDetail};
+use crate::acp::transcript::LOAD_FAILED_PREFIX;
 use agent_client_protocol::schema::v1::{
     ForkSessionRequest, ForkSessionResponse, InitializeResponse, LoadSessionRequest,
     LoadSessionResponse, McpServer, NewSessionRequest, NewSessionResponse, SessionConfigId,
@@ -34,6 +35,35 @@ use crate::acp::acp_client::session_identity::ordered_session_request;
 
 /// Fully silent grace after reattaching to an in-flight turn.
 const RESUME_IDLE_GRACE_DEFAULT: Duration = Duration::from_secs(30);
+
+/// Announced when `session/new` replaces a conversation the user expects to
+/// continue. `stored` is absent after a view switch that lost the id.
+fn initial_reset_reason(
+    stored: bool,
+    load_session_capable: bool,
+    fork_requested: bool,
+    prior_conversation: bool,
+) -> Option<String> {
+    if fork_requested {
+        return None;
+    }
+    if stored && !load_session_capable {
+        return Some("session/load unavailable; started a new session with empty context".into());
+    }
+    (!stored && prior_conversation).then(|| {
+        "Conversation context reset; the previous conversation could not be resumed.".into()
+    })
+}
+
+/// A prior conversation drops the prefix the transcript suppresses, since the
+/// view switch cleared the history that suppression looks for.
+fn load_failed_reason(prior_conversation: bool, error: &impl std::fmt::Display) -> String {
+    if prior_conversation {
+        format!("Conversation context reset; {LOAD_FAILED_PREFIX}: {error}")
+    } else {
+        format!("{LOAD_FAILED_PREFIX}: {error}")
+    }
+}
 
 /// Debug builds honor `AOE_RESUME_IDLE_GRACE_MS`, clamped to at least 100ms.
 fn resume_idle_grace() -> Duration {
@@ -199,6 +229,7 @@ pub(super) async fn establish(
             stored_acp_session_id,
             seed_history_replay,
             fork_from,
+            prior_conversation,
         } => {
             let fork_capable = init.agent_capabilities.session_capabilities.fork.is_some();
             session
@@ -209,6 +240,7 @@ pub(super) async fn establish(
                     fork_capable,
                     load_session_capable,
                     mcp_servers,
+                    prior_conversation,
                 )
                 .await?
         }
@@ -296,18 +328,29 @@ impl Session {
     /// daemon's reset may commit after our registry snapshot, so a runner's
     /// cached identity wins.
     async fn resume(&self, stored: String) -> Result<SessionId, agent_client_protocol::Error> {
-        let stored = match self.control.as_ref() {
+        let runner = match self.control.as_ref() {
             Some(control) => control.resume_session().await?,
-            None => stored,
+            None => stored.clone(),
         };
         info!(
             target: "acp.protocol",
             session = %self.shared.session_label,
             stored_id = %stored,
+            runner_id = %runner,
             "resume mode: reusing runner session without agent load/new"
         );
+        if runner != stored {
+            // Ahead of the assignment, so the reset's id clear is overwritten by the new id.
+            self.shared
+                .emit(Event::SessionContextReset {
+                    reason:
+                        "Conversation context reset; the agent resumed a different conversation."
+                            .to_string(),
+                })
+                .await;
+        }
         // Clears a sticky startup error in the UI; same-id is a no-op server-side.
-        let id = SessionId::from(stored);
+        let id = SessionId::from(runner);
         self.shared.commit_session(id.clone()).await?;
         Ok(id)
     }
@@ -329,6 +372,7 @@ impl Session {
         result
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn fresh(
         &mut self,
         stored: Option<String>,
@@ -337,14 +381,17 @@ impl Session {
         fork_capable: bool,
         load_session_capable: bool,
         mcp_servers: Vec<McpServer>,
+        prior_conversation: bool,
     ) -> Result<SessionId, agent_client_protocol::Error> {
         let label = self.shared.session_label.clone();
         let fork_requested = fork_from.as_deref().is_some_and(|s| !s.is_empty());
         // Lost resume context is announced only once a replacement succeeds.
-        let mut context_reset_reason =
-            (stored.is_some() && !load_session_capable && !fork_requested).then(|| {
-                "session/load unavailable; started a new session with empty context".to_string()
-            });
+        let mut context_reset_reason = initial_reset_reason(
+            stored.is_some(),
+            load_session_capable,
+            fork_requested,
+            prior_conversation,
+        );
 
         if should_fork(fork_from.as_deref(), fork_capable) {
             // Never falls through to session/new, which would hand the user
@@ -476,7 +523,7 @@ impl Session {
                         .suppress_history_replay
                         .store(false, Ordering::Relaxed);
                     if !fork_requested {
-                        context_reset_reason = Some(format!("session/load failed: {e}"));
+                        context_reset_reason = Some(load_failed_reason(prior_conversation, &e));
                     }
                 }
             }
@@ -623,5 +670,30 @@ impl Session {
                 "structured view effort skipped; no thought_level option"
             ),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reset_reasons_follow_prior_conversation() {
+        // (stored, load_capable, fork, prior) -> announced
+        for (stored, load, fork, prior, announced) in [
+            (false, true, false, true, true),
+            (false, true, false, false, false),
+            (false, true, true, true, false),
+            (true, false, false, false, true),
+            (true, true, false, true, false),
+        ] {
+            assert_eq!(
+                initial_reset_reason(stored, load, fork, prior).is_some(),
+                announced,
+                "stored={stored} load={load} fork={fork} prior={prior}"
+            );
+        }
+        assert!(load_failed_reason(false, &"boom").starts_with(LOAD_FAILED_PREFIX));
+        assert!(!load_failed_reason(true, &"boom").starts_with(LOAD_FAILED_PREFIX));
     }
 }

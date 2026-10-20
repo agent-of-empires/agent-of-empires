@@ -1,5 +1,5 @@
 import { useState, useRef, useEffect } from "react";
-import { login } from "../lib/api";
+import { login, loginStatus, loginWithPasskey, passkeysSupported } from "../lib/api";
 import { StrokeIcon } from "./icons";
 
 interface Props {
@@ -11,11 +11,34 @@ export function LoginPage({ onSuccess }: Props) {
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
   const [showPassphrase, setShowPassphrase] = useState(false);
+  const [passkeyAvailable, setPasskeyAvailable] = useState(false);
   const inputRef = useRef<HTMLInputElement>(null);
 
   useEffect(() => {
     inputRef.current?.focus();
   }, []);
+
+  useEffect(() => {
+    if (!passkeysSupported()) return;
+    let live = true;
+    void loginStatus().then((s) => live && setPasskeyAvailable(s.passkey_available === true));
+    return () => {
+      live = false;
+    };
+  }, []);
+
+  const handlePasskey = async () => {
+    if (loading) return;
+    setLoading(true);
+    setError(null);
+    const result = await loginWithPasskey();
+    if (result.ok) {
+      onSuccess();
+      return;
+    }
+    setLoading(false);
+    if (!result.cancelled) setError(result.error ?? "Passkey sign-in failed");
+  };
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -111,6 +134,17 @@ export function LoginPage({ onSuccess }: Props) {
               "Sign in"
             )}
           </button>
+
+          {passkeyAvailable && (
+            <button
+              type="button"
+              onClick={handlePasskey}
+              disabled={loading}
+              className="mt-3 w-full py-2.5 border border-surface-700/60 hover:bg-surface-700/30 text-text-primary text-sm font-medium rounded-lg transition-colors disabled:opacity-50 disabled:cursor-not-allowed cursor-pointer"
+            >
+              Sign in with passkey
+            </button>
+          )}
         </form>
       </div>
     </div>

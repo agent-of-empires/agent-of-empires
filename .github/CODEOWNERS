@@ -3,8 +3,11 @@
 # member's approval satisfies code owner review. Members are listed in
 # MAINTAINERS.md. Docs: https://docs.github.com/en/repositories/managing-your-repositorys-settings-and-features/customizing-your-repository/about-code-owners
 
+# Fallback for paths no area rule below claims. Keep it first so they win.
+*                                       @agent-of-empires/maintainers
+
 # Web dashboard, plugin pages and the plugin API
-/web/                                   @agent-of-empires/web
+/web/                                  @agent-of-empires/web
 /aoe-plugin-api/                        @agent-of-empires/web
 /plugins/                               @agent-of-empires/web
 /src/plugin/                            @agent-of-empires/web

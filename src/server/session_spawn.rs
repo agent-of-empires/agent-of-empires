@@ -516,6 +516,7 @@ pub(crate) async fn spawn_structured_session(
                                 agent_command_override: command_override,
                                 seed_history_replay,
                                 claude_store_pin: None,
+                                prior_conversation: false,
                             },
                             crate::process::worker_registry::ResumeAuthority::Explicit,
                         )

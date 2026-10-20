@@ -12,20 +12,31 @@ pub struct ResolvedAgentCommand {
     pub prepend_paths: Vec<std::path::PathBuf>,
 }
 
+/// Why an agent command did not resolve to a binary.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Unresolved {
+    /// A path or a `${placeholder}`, which resolves elsewhere.
+    NotBare,
+    NotFound,
+    /// The bundled copy predates this aoe build (#4696).
+    StaleBundle,
+    /// Node cannot run the bundled copy's sources; holds the version found.
+    NodeTooOld(String),
+}
+
 /// PATH first, so a user's explicit install wins, unless it is below the
 /// startup gate's version floor and a pinned bundled copy exists; then the
 /// on-demand bundled adapter (#1017), then the node-version-manager scan.
 /// Uncached, so an `nvm use` after daemon start takes effect immediately.
-/// `None` for a path, a `${placeholder}`, or a binary found nowhere.
 ///
 /// `app_dir` is optional so a `get_app_dir` failure degrades to PATH plus the
 /// node-manager scan rather than resolving nothing (#1048).
 pub fn resolve_agent_command(
     command: &str,
     app_dir: Option<&std::path::Path>,
-) -> Option<ResolvedAgentCommand> {
+) -> Result<ResolvedAgentCommand, Unresolved> {
     if !is_bare_command(command) {
-        return None;
+        return Err(Unresolved::NotBare);
     }
 
     if let Some(path) = find_in_path_env(command) {
@@ -39,14 +50,14 @@ pub fn resolve_agent_command(
                     path = %path.display(),
                     "PATH copy is below the supported version floor; using the bundled pinned copy"
                 );
-                return Some(bundled_resolution(bundled_path, app_dir, command));
+                return Ok(bundled_resolution(bundled_path, app_dir, command));
             }
             _ => {
                 let dir = path
                     .parent()
                     .map(|p| p.to_path_buf())
                     .unwrap_or_else(std::path::PathBuf::new);
-                return Some(ResolvedAgentCommand {
+                return Ok(ResolvedAgentCommand {
                     path,
                     prepend_paths: vec![dir],
                 });
@@ -62,7 +73,7 @@ pub fn resolve_agent_command(
                 adapter = command,
                 "installed copy predates this aoe build; refusing it until it is reinstalled"
             );
-            return None;
+            return Err(Unresolved::StaleBundle);
         }
         if let Some(found) =
             app_dir.and_then(|d| crate::acp::adapters::runtime_too_old_for(d, command))
@@ -75,21 +86,21 @@ pub fn resolve_agent_command(
                 crate::acp::node::MIN_NODE_MAJOR,
                 crate::acp::node::MIN_NODE_MINOR
             );
-            return None;
+            return Err(Unresolved::NodeTooOld(found));
         }
-        return Some(bundled_resolution(path, app_dir, command));
+        return Ok(bundled_resolution(path, app_dir, command));
     }
 
     for dir in node_search_dirs() {
         let candidate = dir.join(command);
         if candidate.is_file() {
-            return Some(ResolvedAgentCommand {
+            return Ok(ResolvedAgentCommand {
                 path: candidate,
                 prepend_paths: vec![dir],
             });
         }
     }
-    None
+    Err(Unresolved::NotFound)
 }
 
 /// A plain name to look up, as opposed to a path or a `${placeholder}`.
@@ -276,7 +287,10 @@ mod tests {
             .expect("binary should resolve from PATH");
         assert_eq!(resolved.path, bin);
         assert_eq!(resolved.prepend_paths, vec![dir.path().to_path_buf()]);
-        assert!(resolve_agent_command("aoe-definitely-not-installed", None).is_none());
+        assert_eq!(
+            resolve_agent_command("aoe-definitely-not-installed", None).err(),
+            Some(Unresolved::NotFound)
+        );
 
         // A path or a `${placeholder}` is already resolved, so it is left alone.
         let app = std::path::Path::new("/nonexistent-app-dir");
@@ -285,8 +299,9 @@ mod tests {
             "./relative/path",
             "${aoe_data_dir}/acp-worker/dist/aoe-agent",
         ] {
-            assert!(
-                resolve_agent_command(command, Some(app)).is_none(),
+            assert_eq!(
+                resolve_agent_command(command, Some(app)).err(),
+                Some(Unresolved::NotBare),
                 "{command}"
             );
         }
@@ -310,6 +325,39 @@ mod tests {
                 .expect("should resolve from the bundled adapter dir");
             assert_eq!(resolved.path, bin);
             assert_eq!(resolved.prepend_paths.first(), Some(&bin_dir));
+        }
+
+        // #4696: a bundled copy aoe refuses says why, not just "not found".
+        {
+            use crate::acp::adapters::test_fixtures::{touch_bin, write_digest};
+            let name = crate::acp::install_hints::AOE_AGENT_BINARY;
+            let node_dir = tempfile::TempDir::new().unwrap();
+            let node = |version: &str| {
+                let path = node_dir.path().join(format!("node-{version}"));
+                std::fs::write(&path, format!("#!/bin/sh\necho {version}\n")).unwrap();
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+                path
+            };
+            let (old, new) = (node("v22.1.0"), node("v22.6.0"));
+            let empty = tempfile::TempDir::new().unwrap();
+            for (current, node, expected) in [
+                (false, &new, Err(Unresolved::StaleBundle)),
+                (true, &old, Err(Unresolved::NodeTooOld("v22.1.0".into()))),
+                (true, &new, Ok(())),
+            ] {
+                let app = tempfile::TempDir::new().unwrap();
+                touch_bin(app.path(), name);
+                if current {
+                    write_digest(app.path(), name);
+                }
+                let _env = crate::session::test_support::EnvGuard::set(&[
+                    ("PATH", empty.path()),
+                    ("AOE_ACP_NODE", node.as_path()),
+                ]);
+                let got = resolve_agent_command(name, Some(app.path())).map(|_| ());
+                assert_eq!(got, expected, "current={current} node={}", node.display());
+            }
         }
     }
 }

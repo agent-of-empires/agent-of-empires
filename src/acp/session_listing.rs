@@ -72,6 +72,7 @@ async fn list_with_spec(
         source_profile: Some(profile.to_string()),
         mcp_servers: Vec::new(),
         seed_history_replay: false,
+        prior_conversation: false,
         generation: 0,
         artifact_dir: None,
         claude_store_pin: None,

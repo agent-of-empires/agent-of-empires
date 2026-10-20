@@ -161,6 +161,12 @@ fn normalize_path(path: &str) -> &str {
     path.strip_suffix('/').unwrap_or(path)
 }
 
+/// Whether a path is served to programs, which get a JSON `401` rather than a redirect to the
+/// login page when unauthenticated.
+fn is_machine_endpoint(path: &str) -> bool {
+    path.starts_with("/api/") || path.contains("/ws") || path == "/mcp" || path.starts_with("/mcp/")
+}
+
 /// Whether a request path is exempt from the passphrase session + device-binding check.
 fn is_login_session_exempt(path: &str) -> bool {
     path == "/"
@@ -169,6 +175,8 @@ fn is_login_session_exempt(path: &str) -> bool {
         || path.starts_with("/plugins/")
         || path == "/api/login"
         || path == "/api/login/status"
+        || path == "/api/login/passkey/start"
+        || path == "/api/login/passkey/finish"
         || path == "/api/logout"
         || path == "/theme-bootstrap.js"
         || path.starts_with("/assets/")
@@ -281,6 +289,16 @@ fn requires_elevation(method: &axum::http::Method, path: &str) -> bool {
         {
             return false;
         }
+        return true;
+    }
+
+    // Adding or removing a passkey changes who can sign in.
+    if method == Method::POST
+        && (path == "/api/passkeys/register/start" || path == "/api/passkeys/register/finish")
+    {
+        return true;
+    }
+    if method == Method::DELETE && path.starts_with("/api/passkeys/") {
         return true;
     }
 
@@ -461,7 +479,7 @@ async fn run_passphrase_wall(
     };
 
     if !has_valid_session {
-        if path.starts_with("/api/") || path.contains("/ws") {
+        if is_machine_endpoint(&path) {
             tracing::warn!(
                 target: "auth",
                 ip = %client_ip,
@@ -664,8 +682,7 @@ pub async fn auth_middleware(
     let Some(source) = matched_source else {
         // No valid token and no valid session.
         let path = request.uri().path();
-        let is_api_or_ws = path.starts_with("/api/") || path.contains("/ws");
-        if !is_api_or_ws {
+        if !is_machine_endpoint(path) {
             return next.run(request).await;
         }
         let locked = state.rate_limiter.record_failure(client_ip).await;
@@ -728,7 +745,7 @@ pub async fn auth_middleware(
                 had_device_binding = presented_binding.is_some(),
                 "valid token but no session on non-login-exempt path; returning login_required"
             );
-            if path.starts_with("/api/") || path.contains("/ws") {
+            if is_machine_endpoint(&path) {
                 return (
                     StatusCode::UNAUTHORIZED,
                     axum::Json(serde_json::json!({
@@ -1147,6 +1164,8 @@ mod tests {
             "/plugins/github/prs",
             "/api/login",
             "/api/login/status",
+            "/api/login/passkey/start",
+            "/api/login/passkey/finish",
             "/api/logout",
             // Static assets: pre-load the SPA shell before any auth.
             "/theme-bootstrap.js",
@@ -1179,6 +1198,9 @@ mod tests {
             "/sessions/abc/ws",
             "/api/sessions/abc/ws",
             "/api/login/foo",
+            "/api/login/passkey",
+            "/api/passkeys",
+            "/api/passkeys/register/start",
             "/logins",
         ];
         for path in gated {
@@ -1230,6 +1252,9 @@ mod tests {
             (Method::DELETE, "/api/profiles/work"),
             (Method::POST, "/api/login/logout-all"),
             (Method::DELETE, "/api/login/sessions/abc123"),
+            (Method::POST, "/api/passkeys/register/start"),
+            (Method::POST, "/api/passkeys/register/finish"),
+            (Method::DELETE, "/api/passkeys/abc123"),
         ];
         for (method, path) in gated {
             assert!(requires_elevation(&method, path), "{method} {path}");
@@ -1275,6 +1300,9 @@ mod tests {
             (Method::GET, "/api/about"),
             (Method::POST, "/api/login"),
             (Method::POST, "/api/login/elevate"),
+            (Method::POST, "/api/login/passkey/start"),
+            (Method::POST, "/api/login/passkey/finish"),
+            (Method::GET, "/api/passkeys"),
             (Method::POST, "/api/logout"),
         ];
         for (method, path) in ungated {

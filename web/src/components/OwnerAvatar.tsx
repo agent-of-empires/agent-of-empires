@@ -1,20 +1,30 @@
-import { useState } from "react";
+import { useState, type ReactNode } from "react";
+import { githubAvatar } from "../lib/githubAvatar";
 
-/** Renders the GitHub avatar for a repo owner. Hides itself on load error. */
-export function OwnerAvatar({ owner, size = 16 }: { owner: string | null; size?: number }) {
-  const [erroredOwner, setErroredOwner] = useState<string | null>(null);
-  const hidden = owner === erroredOwner;
+/** A GitHub remote owner's avatar; `fallback` takes its place off GitHub or when the image fails to load. */
+export function OwnerAvatar({
+  ownerKey,
+  fallback,
+  size = 16,
+}: {
+  ownerKey: string | null;
+  fallback: ReactNode;
+  size?: number;
+}) {
+  const avatar = githubAvatar(ownerKey, size);
+  const [failedUrl, setFailedUrl] = useState<string | null>(null);
 
-  if (!owner || hidden) return null;
+  if (!avatar || avatar.url === failedUrl) return <>{fallback}</>;
+  const { url, owner } = avatar;
 
   return (
     <img
-      src={`https://github.com/${owner}.png?size=${size * 2}`}
+      src={url}
       alt={owner}
       width={size}
       height={size}
       className="rounded-sm shrink-0"
-      onError={() => setErroredOwner(owner)}
+      onError={() => setFailedUrl(url)}
     />
   );
 }

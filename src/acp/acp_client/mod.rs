@@ -44,7 +44,7 @@ pub use delete::DeleteSessionOutcome;
 pub use errors::{AcpError, IncompatibleAgentError};
 pub use list::{list_native_sessions, ListSessionsError};
 pub use reset::ResetSessionOutcome;
-pub use resolve_command::{resolve_agent_command, ResolvedAgentCommand};
+pub use resolve_command::{resolve_agent_command, ResolvedAgentCommand, Unresolved};
 pub(crate) use runner::wrap_in_scope;
 pub use session_sandbox::SessionSandbox;
 pub(crate) use spawn::host_environment_denyreason;
@@ -401,6 +401,7 @@ impl AcpClient {
                 stored_acp_session_id: config.stored_acp_session_id.clone(),
                 seed_history_replay: config.seed_history_replay,
                 fork_from: config.fork_from.clone(),
+                prior_conversation: config.prior_conversation,
             },
             session_id: session_id.clone(),
             cwd: config.cwd.clone(),

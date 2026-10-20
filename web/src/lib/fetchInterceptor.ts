@@ -28,7 +28,12 @@ export async function classifyAuthError(res: Response): Promise<"login_required"
 
 /** A 401 from a login attempt means a wrong passphrase, not a stale token, so it must not fire `TOKEN_EXPIRED_EVENT`. */
 export function isLoginAttemptPath(path: string): boolean {
-  return path === "/api/login" || path === "/api/login/elevate";
+  return (
+    path === "/api/login" ||
+    path === "/api/login/elevate" ||
+    path === "/api/login/passkey/start" ||
+    path === "/api/login/passkey/finish"
+  );
 }
 
 const ACP_PROMPT_PATH = /^\/api\/sessions\/[^/]+\/acp\/prompt$/;

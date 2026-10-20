@@ -29,7 +29,7 @@ use tokio_tungstenite::tungstenite;
 
 use super::AppState;
 use crate::cli::runtime_read::dto::{
-    GroupRead, ProjectRead, ProjectScope, SessionRead, WorkspaceRepo, WorktreeRead,
+    wire_timestamp, GroupRead, ProjectRead, ProjectScope, SessionRead,
 };
 use crate::session::{GroupTree, Instance, Storage};
 
@@ -556,29 +556,20 @@ fn build_snapshot(
                         .iter()
                         .any(|prior| prior.identity == profile.identity)
             });
-            let projects = if accepted {
-                crate::session::projects::load_profile(name)
-                    .map(|projects| {
-                        projects
-                            .into_iter()
-                            .map(|project| ProjectRead {
-                                merge_key: crate::session::projects::canonical_key(&project.path),
-                                name: project.name,
-                                path: project.path,
-                                scope: ProjectScope::Profile,
-                                default_base_branch: project.default_base_branch,
-                                registered: true,
-                            })
-                            .collect()
-                    })
-                    .map_err(|_| ())
+            let external = profile.as_ref().is_some_and(|profile| !profile.listed);
+            let projects = if accepted && external {
+                let owned = name.clone();
+                alias_sample(name, "projects", move || load_profile_projects(&owned))
+            } else if accepted {
+                load_profile_projects(name)
             } else {
                 Err(())
             };
-            let groups = if accepted {
-                Storage::open_unwatched(name)
-                    .and_then(|storage| storage.load_groups_readonly())
-                    .map_err(|_| ())
+            let groups = if accepted && external {
+                let owned = name.clone();
+                alias_sample(name, "groups", move || load_profile_groups(&owned))
+            } else if accepted {
+                load_profile_groups(name)
             } else {
                 Err(())
             };
@@ -771,6 +762,46 @@ fn build_snapshot(
 }
 
 /// Omit stored paths that cannot represent an absolute native directory.
+fn load_profile_projects(name: &str) -> Result<Vec<ProjectRead>, ()> {
+    crate::session::projects::load_profile(name)
+        .map(|projects| {
+            projects
+                .into_iter()
+                .map(|project| ProjectRead {
+                    merge_key: crate::session::projects::canonical_key(&project.path),
+                    name: project.name,
+                    path: project.path,
+                    scope: ProjectScope::Profile,
+                    default_base_branch: project.default_base_branch,
+                    registered: true,
+                })
+                .collect()
+        })
+        .map_err(|_| ())
+}
+
+fn load_profile_groups(name: &str) -> Result<Vec<crate::session::Group>, ()> {
+    Storage::open_unwatched(name)
+        .and_then(|storage| storage.load_groups_readonly())
+        .map_err(|_| ())
+}
+
+/// A stale alias read is unavailable, never mixed into a fresh snapshot.
+fn alias_sample<T>(
+    name: &str,
+    kind: &'static str,
+    work: impl FnOnce() -> Result<T, ()> + Send + 'static,
+) -> Result<T, ()>
+where
+    T: Clone + Send + Sync + 'static,
+{
+    let sampled = super::alias_io::sample(name, kind, work);
+    match sampled.value {
+        Some(value) if sampled.fresh => (*value).clone(),
+        _ => Err(()),
+    }
+}
+
 fn drop_unusable_projects(projects: &mut Vec<ProjectRead>) {
     projects
         .retain(|project| crate::cli::runtime_read::dto::valid_stored_project_path(&project.path));
@@ -1050,72 +1081,6 @@ struct ProfileRead {
     groups: Vec<GroupRead>,
     projects: Vec<ProjectRead>,
     health: ProfileHealth,
-}
-
-impl SessionRead {
-    fn from_instance(inst: &Instance) -> Self {
-        // Preserve stored workspace order, as the CLI JSON projection does.
-        let workspace_repos: Vec<WorkspaceRepo> = inst
-            .workspace_info
-            .as_ref()
-            .map(|info| {
-                info.repos
-                    .iter()
-                    .map(|repo| WorkspaceRepo {
-                        name: repo.name.clone(),
-                        source_path: repo.source_path.clone(),
-                        branch: repo.branch.clone(),
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
-        Self {
-            id: inst.id.clone(),
-            title: inst.title.clone(),
-            project_path: inst.project_path.clone(),
-            group_path: inst.group_path.clone(),
-            tool: inst.tool.clone(),
-            command: inst.command.clone(),
-            profile: inst.source_profile.clone(),
-            status: inst.status.into(),
-            state: inst.effective_bucket().into(),
-            created_at: wire_timestamp(inst.created_at),
-            last_accessed_at: timestamp(inst.last_accessed_at),
-            idle_entered_at: timestamp(inst.idle_entered_at),
-            last_error: inst.last_error.clone(),
-            archived_at: timestamp(inst.archived_at),
-            trashed_at: timestamp(inst.trashed_at),
-            // Only while the snooze is active; a persisted past date is not one.
-            active_snoozed_until: if inst.is_snoozed() {
-                timestamp(inst.snoozed_until)
-            } else {
-                None
-            },
-            pinned_at: timestamp(inst.pinned_at),
-            agent_session_id: inst.agent_session_id.clone(),
-            parent_session_id: inst.parent_session_id.clone(),
-            has_worktree_info: inst.worktree_info.is_some(),
-            has_managed_worktree: inst
-                .worktree_info
-                .as_ref()
-                .is_some_and(|worktree| worktree.managed_by_aoe),
-            worktree: inst.worktree_info.as_ref().map(|worktree| WorktreeRead {
-                branch: worktree.branch.clone(),
-                main_repo_path: worktree.main_repo_path.clone(),
-                managed_by_aoe: worktree.managed_by_aoe,
-                base_branch: worktree.base_branch.clone(),
-            }),
-            workspace_repos,
-        }
-    }
-}
-
-fn wire_timestamp(value: DateTime<Utc>) -> String {
-    value.to_rfc3339_opts(chrono::SecondsFormat::AutoSi, true)
-}
-
-fn timestamp(value: Option<DateTime<Utc>>) -> Option<String> {
-    value.map(wire_timestamp)
 }
 
 #[cfg(test)]
@@ -1610,6 +1575,43 @@ mod tests {
 
     #[tokio::test]
     #[serial_test::serial]
+    async fn a_blocked_alias_degrades_only_its_own_metadata_in_the_snapshot() {
+        use crate::cli::runtime_read::dto::profile_component_healthy;
+        use crate::server::alias_io::{held::Hold, in_flight_for_test, wait_idle_for_test};
+        let home = TempHome::new();
+        Storage::new_unwatched("main").unwrap();
+        let external = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink(external.path(), home.app_dir().join("profiles/ext")).unwrap();
+        Storage::open_unwatched("ext").unwrap();
+        let state = super::super::test_support::build_test_app_state(Vec::new());
+        super::super::test_support::accept_runtime_read_cache_for_test(&state).await;
+        let metadata_healthy = |snapshot: &crate::cli::runtime_read::dto::SnapshotData, name| {
+            let profile = snapshot
+                .profiles
+                .iter()
+                .find(|row| row.name == name)
+                .unwrap();
+            profile_component_healthy(&profile.health.metadata)
+        };
+        let healthy = cached_snapshot(&state).await;
+        assert!(metadata_healthy(&healthy, "ext"));
+
+        let hold = Hold::install("ext", "projects");
+        for _ in 0..2 {
+            let blocked = cached_snapshot(&state).await;
+            assert!(metadata_healthy(&blocked, "main"));
+            assert!(!metadata_healthy(&blocked, "ext"));
+        }
+        hold.wait_entered();
+        assert_eq!(in_flight_for_test("ext"), 1, "no second worker starts");
+
+        hold.release();
+        wait_idle_for_test("ext");
+        assert!(metadata_healthy(&cached_snapshot(&state).await, "ext"));
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
     async fn session_load_failures_recover_only_with_an_accepted_reload() {
         use crate::server::{
             reload::{load_all_instances, reload_state_instances_from_disk},
@@ -1714,7 +1716,6 @@ mod tests {
         std::fs::write(&profiles, "not a directory").unwrap();
         let state = test_support::build_test_app_state(Vec::new());
         let failed = load_all_instances(&state.file_watch);
-        let failed_health = failed.cache.health.clone();
         reload_state_instances_from_disk(&state, failed, vec![], StatusSource::DiskOnly, 0).await;
         let snapshot = cached_snapshot(&state).await;
         assert!(!crate::cli::runtime_read::dto::component_healthy(
@@ -1742,21 +1743,73 @@ mod tests {
         )
         .await;
         assert!(cached_data_healthy(&cached_snapshot(&state).await, "main"));
-        std::fs::remove_dir_all(profiles.join("main")).unwrap();
-        let failed = crate::server::reload::LoadedInstances {
-            instances: vec![],
-            cache: super::super::reload::RuntimeReadCache {
-                health: failed_health,
-                ..Default::default()
-            },
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn failed_enumeration_keeps_rows_until_a_successful_empty_inventory() {
+        use crate::server::{
+            reload::{load_all_instances, reload_state_instances_from_disk},
+            state::StatusSource,
+            test_support,
         };
-        reload_state_instances_from_disk(&state, failed, vec![], StatusSource::DiskOnly, 0).await;
+        let home = TempHome::new();
+        Storage::new_unwatched("main")
+            .unwrap()
+            .update(|rows, _| {
+                *rows = vec![named("kept", "main")];
+                Ok(())
+            })
+            .unwrap();
+        let state = test_support::build_test_app_state(Vec::new());
+        let reload = |loaded| {
+            reload_state_instances_from_disk(&state, loaded, vec![], StatusSource::DiskOnly, 0)
+        };
+        reload(load_all_instances(&state.file_watch)).await;
+        state.instances.write().await[0].last_error = Some("daemon-only".into());
+
+        let profiles = home.app_dir().join("profiles");
+        let stash = home.app_dir().join("profiles-stash");
+        std::fs::rename(&profiles, &stash).unwrap();
+        std::fs::write(&profiles, "not a directory").unwrap();
+        let failed = load_all_instances(&state.file_watch);
+        assert!(failed.cache.health.enumeration_failed);
+        reload(failed).await;
+        assert!(
+            state
+                .runtime_read_cache
+                .read()
+                .unwrap()
+                .health
+                .enumeration_failed
+        );
         let snapshot = cached_snapshot(&state).await;
-        assert!(crate::cli::runtime_read::dto::component_healthy(
+        assert!(!crate::cli::runtime_read::dto::component_healthy(
             &snapshot.health.global_enumeration
         ));
-        assert!(snapshot.profiles.is_empty());
-        assert!(snapshot.sessions.is_empty());
+        assert!(snapshot.sessions.iter().any(|row| row.id == "kept"));
+        assert_eq!(
+            state.instances.read().await[0].last_error.as_deref(),
+            Some("daemon-only")
+        );
+
+        std::fs::remove_file(&profiles).unwrap();
+        std::fs::rename(&stash, &profiles).unwrap();
+        reload(load_all_instances(&state.file_watch)).await;
+        assert!(
+            !state
+                .runtime_read_cache
+                .read()
+                .unwrap()
+                .health
+                .enumeration_failed
+        );
+        assert_eq!(state.instances.read().await.len(), 1);
+
+        std::fs::remove_dir_all(&profiles).unwrap();
+        reload(load_all_instances(&state.file_watch)).await;
+        assert!(state.instances.read().await.is_empty());
+        assert!(cached_snapshot(&state).await.sessions.is_empty());
     }
 
     /// Project and group registry errors degrade only their own components.

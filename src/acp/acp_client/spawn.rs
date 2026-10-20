@@ -53,6 +53,8 @@ pub struct SpawnConfig {
     /// Seed an empty event store from the load replay instead of suppressing
     /// it (first spawn of an imported session, #2276).
     pub seed_history_replay: bool,
+    /// A conversation existed before this launch, so replacing it must be announced.
+    pub prior_conversation: bool,
     /// Exported as `AOE_ARTIFACT_DIR` to host agents (#2587).
     pub artifact_dir: Option<PathBuf>,
     /// `(wrapper, base)` when an `agent_detect_as` wrapper runs its base
@@ -456,11 +458,11 @@ pub(super) fn spawn_subprocess(
     let app_dir = crate::session::get_app_dir().ok();
     let resolved = resolve_agent_command(&config.spec.command, app_dir.as_deref());
     let (spawn_command, extra_path_dirs) = match &resolved {
-        Some(r) => (
+        Ok(r) => (
             r.path.to_string_lossy().into_owned(),
             r.prepend_paths.clone(),
         ),
-        None => (config.spec.command.clone(), Vec::new()),
+        Err(_) => (config.spec.command.clone(), Vec::new()),
     };
 
     let mut cmd = tokio::process::Command::new(&spawn_command);
@@ -524,10 +526,11 @@ pub(super) fn spawn_subprocess(
         );
         // ENOENT is ambiguous: a missing cwd must classify as
         // ProjectPathMissing (#1089) before the unresolved-binary hint (#1048).
-        if e.kind() == std::io::ErrorKind::NotFound && config.cwd.exists() && resolved.is_none() {
-            AcpError::missing_binary_spawn_error(&e, &config.spec.command)
-        } else {
-            AcpError::classify_spawn_error(e, &config.cwd, &spawn_command)
+        match &resolved {
+            Err(reason) if e.kind() == std::io::ErrorKind::NotFound && config.cwd.exists() => {
+                AcpError::unresolved_adapter_spawn_error(&e, &config.spec.command, reason)
+            }
+            _ => AcpError::classify_spawn_error(e, &config.cwd, &spawn_command),
         }
     })?;
 

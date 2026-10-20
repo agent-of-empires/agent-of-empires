@@ -163,11 +163,11 @@ export const SidebarGroupHeader = memo(function SidebarGroupHeader(props: Props)
               data-testid="sidebar-group-icon"
               className="absolute inset-0 flex items-center justify-center transition-opacity duration-75 group-hover:opacity-0 group-focus-within:opacity-0"
             >
-              {group.remoteOwner ? (
-                <OwnerAvatar owner={group.remoteOwner} size={16} />
-              ) : (
-                <Folder className="h-3.5 w-3.5 text-text-dim" />
-              )}
+              <OwnerAvatar
+                ownerKey={group.remoteOwnerKey}
+                size={16}
+                fallback={<Folder className="h-3.5 w-3.5 text-text-dim" />}
+              />
             </span>
             <span
               data-testid="sidebar-group-fold-chevron"

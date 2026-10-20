@@ -154,6 +154,9 @@ mime_guess = "2.0"
 qrcode = { version = "0.14", optional = true }
 argon2 = "0.6"
 subtle = "2"
+# Passkey (WebAuthn) sign-in for the web dashboard. Links OpenSSL: vendored by the default
+# `vendored` feature, from the system otherwise.
+webauthn-rs = "0.5"
 
 # TUI OSC 52 clipboard writes and Web Push payload encoding.
 base64 = "0.23"
@@ -185,6 +188,8 @@ tokio-tungstenite = { version = "0.30", default-features = false, features = ["r
 # beneath a Dir so a component swapped after the containment check cannot
 # escape the intended root.
 cap-std = "4.0.2"
+rmcp = { version = "3.5.1", features = ["transport-streamable-http-server"] }
+schemars = { version = "1", features = ["chrono04"] }
 
 # Unix-only: O_NOFOLLOW for capability-safe filesystem operations.
 [target.'cfg(unix)'.dependencies]
@@ -240,6 +245,8 @@ cargo-husky = { version = "1", default-features = false, features = ["precommit-
 # Test-only tower dep for `ServiceExt::oneshot`, so the DNS-rebinding gate
 # (#2735) can be driven through the real router without binding a socket.
 tower = { version = "0.5", features = ["util"] }
+# Software authenticator that drives the passkey ceremonies in tests.
+webauthn-authenticator-rs = { version = "0.5", default-features = false, features = ["softpasskey"] }
 
 [profile.dev]
 # Full DWARF is cargo's `dev` default and it dominates `target/`: this table and

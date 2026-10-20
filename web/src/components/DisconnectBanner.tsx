@@ -1,27 +1,9 @@
-import { useEffect, useState } from "react";
-import { onServerDownChange, isServerDown } from "../lib/connectionState";
+import type { ConnectionBannerState } from "../hooks/useConnectionBanner";
 import { StrokeIcon } from "./icons";
 
 /** Full-width banner shown when the backend server is unreachable. */
-export function DisconnectBanner() {
-  const [down, setDown] = useState(isServerDown);
-  const [reconnected, setReconnected] = useState(false);
-
-  useEffect(() => {
-    return onServerDownChange((isDown) => {
-      if (!isDown && down) {
-        // Server came back. Flash a "reconnected" message briefly.
-        setReconnected(true);
-        setDown(false);
-        const t = setTimeout(() => setReconnected(false), 3000);
-        return () => clearTimeout(t);
-      }
-      setDown(isDown);
-      if (isDown) setReconnected(false);
-    });
-  }, [down]);
-
-  if (reconnected) {
+export function DisconnectBanner({ state }: { state: ConnectionBannerState }) {
+  if (state === "reconnected") {
     return (
       <div
         role="status"
@@ -34,8 +16,6 @@ export function DisconnectBanner() {
       </div>
     );
   }
-
-  if (!down) return null;
 
   return (
     <div

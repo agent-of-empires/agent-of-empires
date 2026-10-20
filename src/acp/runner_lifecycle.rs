@@ -1,5 +1,6 @@
 //! Per-session ownership of a structured-view runner.
 
+use chrono::{DateTime, Utc};
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
@@ -63,7 +64,17 @@ impl RunnerIdentity {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ResumeKind {
     Attach,
+    /// A spawn for a session with a stored ACP session id.
     Spawn,
+    /// A spawn for a session that has no stored ACP session id yet.
+    SpawnFirst,
+}
+
+/// When the current start was admitted, and whether it is a session's first.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WorkerStart {
+    pub first_start: bool,
+    pub started_at: DateTime<Utc>,
 }
 
 /// Authority token for one epoch of one session.
@@ -96,12 +107,16 @@ pub enum WorkerPhase {
 enum Phase {
     Starting {
         kind: ResumeKind,
+        /// Wall clock, so it survives a client reload. A daemon restart that
+        /// re-adopts a starting worker admits again and resets it.
+        started_at: DateTime<Utc>,
         cancel: Option<String>,
     },
     Running {
         identity: Option<RunnerIdentity>,
     },
     Respawning {
+        started_at: DateTime<Utc>,
         cancel: Option<String>,
     },
     Stopping {
@@ -330,12 +345,16 @@ impl LifecycleTable {
         if let Some(reason) = self.stale_cancels.remove(session_id) {
             return Err(AdmitError::Cancelled(reason));
         }
-        let epoch = self.mint(session_id, kind == ResumeKind::Spawn);
+        let epoch = self.mint(session_id, kind != ResumeKind::Attach);
         self.entries.insert(
             session_id.to_string(),
             Entry {
                 epoch,
-                phase: Phase::Starting { kind, cancel: None },
+                phase: Phase::Starting {
+                    kind,
+                    started_at: Utc::now(),
+                    cancel: None,
+                },
                 sweep_owed: false,
             },
         );
@@ -352,7 +371,7 @@ impl LifecycleTable {
             return Err(InstallError::Stale);
         };
         let cancel = match &mut entry.phase {
-            Phase::Starting { cancel, .. } | Phase::Respawning { cancel } => cancel.take(),
+            Phase::Starting { cancel, .. } | Phase::Respawning { cancel, .. } => cancel.take(),
             _ => return Err(InstallError::Stale),
         };
         if let Some(reason) = cancel {
@@ -376,7 +395,7 @@ impl LifecycleTable {
             return false;
         };
         let cancel = match &entry.phase {
-            Phase::Starting { cancel, .. } | Phase::Respawning { cancel } => cancel.clone(),
+            Phase::Starting { cancel, .. } | Phase::Respawning { cancel, .. } => cancel.clone(),
             _ => return false,
         };
         self.entries.remove(&lease.session_id);
@@ -406,7 +425,7 @@ impl LifecycleTable {
         };
         let epoch = entry.epoch;
         match &mut entry.phase {
-            Phase::Starting { cancel, .. } | Phase::Respawning { cancel } => {
+            Phase::Starting { cancel, .. } | Phase::Respawning { cancel, .. } => {
                 cancel.get_or_insert_with(|| reason.to_string());
                 StopDecision::CancelRequested
             }
@@ -509,7 +528,10 @@ impl LifecycleTable {
             .get_mut(&session_id)
             .expect("entry checked above");
         entry.epoch = epoch;
-        entry.phase = Phase::Respawning { cancel: None };
+        entry.phase = Phase::Respawning {
+            started_at: Utc::now(),
+            cancel: None,
+        };
         Ok((self.lease(&session_id, epoch), identity))
     }
 
@@ -532,7 +554,10 @@ impl LifecycleTable {
             Phase::Starting {
                 cancel: Some(_),
                 ..
-            } | Phase::Respawning { cancel: Some(_) }
+            } | Phase::Respawning {
+                cancel: Some(_),
+                ..
+            }
         );
         entry.phase = Phase::Stopping {
             attempts: 0,
@@ -548,7 +573,7 @@ impl LifecycleTable {
             return None;
         }
         match &entry.phase {
-            Phase::Starting { cancel, .. } | Phase::Respawning { cancel } => cancel.clone(),
+            Phase::Starting { cancel, .. } | Phase::Respawning { cancel, .. } => cancel.clone(),
             _ => None,
         }
     }
@@ -624,10 +649,27 @@ impl LifecycleTable {
         }
     }
 
-    pub fn snapshot(&self) -> HashMap<String, WorkerPhase> {
+    /// The start of a worker that is coming up, `None` in every other phase.
+    pub fn start(&self, session_id: &str) -> Option<WorkerStart> {
+        match self.entries.get(session_id).map(|e| &e.phase) {
+            Some(Phase::Starting {
+                kind, started_at, ..
+            }) => Some(WorkerStart {
+                first_start: *kind == ResumeKind::SpawnFirst,
+                started_at: *started_at,
+            }),
+            Some(Phase::Respawning { started_at, .. }) => Some(WorkerStart {
+                first_start: false,
+                started_at: *started_at,
+            }),
+            _ => None,
+        }
+    }
+
+    pub fn snapshot(&self) -> HashMap<String, (WorkerPhase, Option<WorkerStart>)> {
         self.entries
             .keys()
-            .map(|id| (id.clone(), self.phase(id)))
+            .map(|id| (id.clone(), (self.phase(id), self.start(id))))
             .collect()
     }
 
@@ -799,6 +841,40 @@ mod tests {
         for (id, pid, generation, expected) in cases {
             assert_eq!(id.matches_record(pid, generation), expected, "{id:?}");
         }
+    }
+
+    #[test]
+    fn start_reports_kind_and_a_stable_time_only_while_coming_up() {
+        for (kind, first_start) in [
+            (ResumeKind::SpawnFirst, true),
+            (ResumeKind::Spawn, false),
+            (ResumeKind::Attach, false),
+        ] {
+            let mut table = LifecycleTable::new(100);
+            let lease = table.admit(ID, kind).unwrap();
+            let start = table.start(ID).expect("starting reports a start");
+            assert_eq!(start.first_start, first_start, "{kind:?}");
+            assert_eq!(table.start(ID), Some(start), "stable across reads");
+            assert_eq!(
+                table.snapshot().get(ID),
+                Some(&(WorkerPhase::Resuming, Some(start)))
+            );
+
+            table.install(&lease, None).unwrap();
+            assert_eq!(table.start(ID), None, "cleared on install");
+
+            let (respawn, _) = table.begin_respawn(&lease).unwrap();
+            let start = table.start(ID).expect("respawning reports a start");
+            assert!(!start.first_start, "a respawn is a resume");
+            table.abandon(&respawn);
+            assert_eq!(table.start(ID), None, "cleared on abandon");
+        }
+
+        let mut table = LifecycleTable::new(100);
+        let lease = table.admit(ID, ResumeKind::SpawnFirst).unwrap();
+        table.install(&lease, None).unwrap();
+        table.begin_stop(ID, "user");
+        assert_eq!(table.start(ID), None, "cleared on stop");
     }
 
     #[test]
@@ -994,8 +1070,8 @@ mod tests {
         assert_eq!(table.occupied_slots(), 2);
 
         let snap = table.snapshot();
-        assert_eq!(snap.get("b"), Some(&WorkerPhase::Running));
-        assert_eq!(snap.get("c"), Some(&WorkerPhase::Running));
+        assert_eq!(snap.get("b"), Some(&(WorkerPhase::Running, None)));
+        assert_eq!(snap.get("c"), Some(&(WorkerPhase::Running, None)));
         assert_eq!(snap.len(), 2);
     }
 

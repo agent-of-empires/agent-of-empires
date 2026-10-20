@@ -148,6 +148,24 @@ pub fn inherited_acp_base(tool: &str, agent_detect_as: &HashMap<String, String>)
         .map(|_| base.clone())
 }
 
+/// The name users know a registry agent by, for headlines such as
+/// "Codex couldn't start".
+pub fn display_name_for(agent: &str) -> Option<&'static str> {
+    Some(match agent {
+        "claude" | "claude-code" => "Claude",
+        "opencode" => "OpenCode",
+        "gemini" => "Gemini",
+        "codex" => "Codex",
+        "vibe" => "Mistral Vibe",
+        "pi" => "Pi",
+        "omp" => "Oh My Pi",
+        "kimi" => "Kimi Code",
+        "prime-agent" => "Prime Agent",
+        "aoe-agent" => "aoe-agent",
+        _ => return None,
+    })
+}
+
 /// The agent a structured-view session of `tool` spawns as: an explicit
 /// override, the tool's own registry entry or custom command, an inherited
 /// base, then (except for `claude`) the configured default agent.
@@ -314,6 +332,13 @@ mod tests {
         );
         for bad in ["", "   ", "ocp run \"unterminated"] {
             assert!(AgentSpec::from_acp_cmd("x", bad).is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn every_default_agent_has_a_display_name() {
+        for (name, _) in AgentRegistry::with_defaults().list() {
+            assert!(display_name_for(name).is_some(), "{name}");
         }
     }
 

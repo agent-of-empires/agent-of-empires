@@ -520,7 +520,13 @@ pub(crate) mod test_daemon {
         logins: usize,
         valid: Option<(String, String)>,
         lists: Vec<(Option<String>, Option<String>)>,
+        config_options: Vec<ConfigOptionRequest>,
     }
+
+    /// One `POST /api/sessions/{id}/acp/config-option`: session id, cookie,
+    /// binding header and JSON body.
+    pub(crate) type ConfigOptionRequest =
+        (String, Option<String>, Option<String>, serde_json::Value);
 
     pub(crate) struct TestDaemon {
         inner: Arc<Mutex<Inner>>,
@@ -535,6 +541,7 @@ pub(crate) mod test_daemon {
             let router = Router::new()
                 .route("/api/login", post(login))
                 .route("/api/sessions", get(list))
+                .route("/api/sessions/{id}/acp/config-option", post(config_option))
                 .with_state(inner.clone());
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let port = listener.local_addr().unwrap().port();
@@ -565,6 +572,10 @@ pub(crate) mod test_daemon {
             self.inner.lock().unwrap().lists.clone()
         }
 
+        pub(crate) fn config_option_requests(&self) -> Vec<ConfigOptionRequest> {
+            self.inner.lock().unwrap().config_options.clone()
+        }
+
         pub(crate) fn expire_session(&self) {
             self.inner.lock().unwrap().valid = None;
         }
@@ -591,6 +602,31 @@ pub(crate) mod test_daemon {
         let mut headers = HeaderMap::new();
         headers.insert("set-cookie", format!("{cookie}; Path=/").parse().unwrap());
         (StatusCode::NO_CONTENT, headers)
+    }
+
+    async fn config_option(
+        State(inner): State<Arc<Mutex<Inner>>>,
+        axum::extract::Path(id): axum::extract::Path<String>,
+        headers: HeaderMap,
+        Json(body): Json<serde_json::Value>,
+    ) -> StatusCode {
+        let header = |name: &str| {
+            headers
+                .get(name)
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_string)
+        };
+        let (cookie, binding) = (header("cookie"), header("x-aoe-device-binding"));
+        let mut inner = inner.lock().unwrap();
+        let authorized = match (&inner.valid, &cookie, &binding) {
+            (Some((c, b)), Some(cookie), Some(binding)) => c == cookie && b == binding,
+            _ => false,
+        };
+        if !authorized {
+            return StatusCode::UNAUTHORIZED;
+        }
+        inner.config_options.push((id, cookie, binding, body));
+        StatusCode::ACCEPTED
     }
 
     async fn list(State(inner): State<Arc<Mutex<Inner>>>, headers: HeaderMap) -> impl IntoResponse {

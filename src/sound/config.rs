@@ -6,7 +6,9 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Serialize, Deserialize, SettingsSection)]
 #[setting_section(name = "sound", category = "Sound")]
 pub struct SoundConfig {
-    /// Play sounds on agent state transitions.
+    /// Play sounds on agent state transitions. Needs .wav or .ogg files in the
+    /// sounds folder on the machine running aoe; run "aoe sounds install" there
+    /// for a starter pack.
     #[serde(default)]
     #[setting(label = "Enabled", widget = "toggle")]
     pub enabled: bool,
@@ -37,13 +39,22 @@ pub struct SoundConfig {
     pub on_error: Option<String>,
 
     /// Acp only. Played in the browser when a session needs permission.
-    /// Specify file name with extension. Surfaced by the acp's approval
-    /// hook (host-side playback intentionally has no approval transition; the
-    /// host audio device is the wrong side of the wire when the user is
-    /// running the dashboard on a separate machine). See #1038.
+    /// Specify file name with extension. Host playback has no approval
+    /// transition.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[setting(label = "On Approval", widget = "optional_text")]
     pub on_approval: Option<String>,
+
+    /// Play status sounds on the machine running aoe.
+    #[serde(default = "default_true")]
+    #[setting(label = "Play on server", widget = "toggle")]
+    pub server_enabled: bool,
+
+    /// Play status sounds in the web dashboard for every session. Needs an
+    /// open dashboard tab.
+    #[serde(default = "default_true")]
+    #[setting(label = "Play in browser", widget = "toggle")]
+    pub browser_enabled: bool,
 
     /// Playback volume (0.1 = min, 1.0 = normal, 1.5 = max), step 0.1. Ignored
     /// when aplay is the Linux backend.
@@ -62,9 +73,15 @@ impl Default for SoundConfig {
             on_idle: None,
             on_error: None,
             on_approval: None,
+            server_enabled: true,
+            browser_enabled: true,
             volume: default_volume(),
         }
     }
+}
+
+fn default_true() -> bool {
+    true
 }
 
 pub(super) fn default_volume() -> f64 {
@@ -115,6 +132,24 @@ mod tests {
             assert_eq!(config.on_approval.as_deref(), on_approval, "{toml}");
             // A 0.0 default would mute playback on a fresh install.
             assert!((config.volume - 1.0).abs() < 1e-9, "{toml}");
+        }
+    }
+
+    #[test]
+    fn target_toggles_default_on_and_parse_independently() {
+        for (toml, server, browser) in [
+            ("", true, true),
+            ("server_enabled = false", false, true),
+            ("browser_enabled = false", true, false),
+            (
+                "server_enabled = false\nbrowser_enabled = false",
+                false,
+                false,
+            ),
+        ] {
+            let config: SoundConfig = toml::from_str(toml).expect(toml);
+            assert_eq!(config.server_enabled, server, "{toml}");
+            assert_eq!(config.browser_enabled, browser, "{toml}");
         }
     }
 

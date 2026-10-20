@@ -1,6 +1,10 @@
+use std::io::Write;
+use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
+
 use serial_test::parallel;
 
-use crate::harness::TuiTestHarness;
+use crate::harness::{agent_session_id_of, require_tmux, TuiTestHarness};
 
 /// Exercises `aoe add --sandbox` which builds the full container config.
 /// This would have caught the duplicate mount points bug (commit 92d2e53).
@@ -184,4 +188,162 @@ fn sandbox_reclaim_reports_before_it_removes() {
     assert!(orphan.exists(), "an unproven store must survive `--delete`");
     assert!(owned.exists(), "a claimed store must survive the pass");
     assert!(fresh.exists(), "a store being seeded right now was swept");
+}
+
+const CAPTURE_DEADLINE: Duration = Duration::from_secs(60);
+
+/// Stands in for Codex inside the container. It publishes a rollout under the
+/// per-session store mounted at `$CODEX_HOME`, which is what the poller reads,
+/// and records the id it chose, via rename so the host never reads a partial value.
+const CODEX_SHIM_DOCKERFILE: &str = r#"FROM alpine:3
+RUN printf '%s\n' '#!/bin/sh' \
+  'id=$(cat /proc/sys/kernel/random/uuid)' \
+  'dir="${CODEX_HOME:?}/sessions/2026/01/01"' \
+  'mkdir -p "$dir"' \
+  'printf "{\"type\":\"session_meta\",\"payload\":{\"id\":\"%s\",\"cwd\":\"%s\"}}\n" "$id" "$PWD" > "$dir/rollout-2026-01-01T00-00-00-$id.jsonl"' \
+  'printf "%s" "$id" > "$CODEX_HOME/published-id.tmp"' \
+  'mv "$CODEX_HOME/published-id.tmp" "$CODEX_HOME/published-id"' \
+  'exec sleep 600' > /usr/local/bin/codex \
+ && chmod +x /usr/local/bin/codex
+"#;
+
+/// Removes the sessions' containers and this invocation's image on every exit
+/// path. Create it before building so a failed build is also torn down.
+struct SandboxCleanup {
+    image: String,
+    ids: Vec<String>,
+}
+
+impl SandboxCleanup {
+    /// A tag no concurrent invocation or pre-existing image shares.
+    fn new() -> Self {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock before epoch")
+            .as_nanos();
+        Self {
+            image: format!("aoe-e2e-codex-shim-{}-{nanos}", std::process::id()),
+            ids: Vec::new(),
+        }
+    }
+}
+
+impl Drop for SandboxCleanup {
+    fn drop(&mut self) {
+        for id in &self.ids {
+            let _ = Command::new("docker")
+                .args(["rm", "-f", &format!("aoe-sandbox-{}", &id[..8])])
+                .output();
+        }
+        let _ = Command::new("docker")
+            .args(["rmi", "-f", &self.image])
+            .output();
+    }
+}
+
+fn build_codex_shim_image(image: &str) {
+    let mut build = Command::new("docker")
+        .args(["build", "-q", "-t", image, "-"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn docker build");
+    build
+        .stdin
+        .take()
+        .expect("docker build stdin")
+        .write_all(CODEX_SHIM_DOCKERFILE.as_bytes())
+        .expect("write Dockerfile");
+    let out = build.wait_with_output().expect("docker build");
+    assert!(
+        out.status.success(),
+        "docker build failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// Two sandboxed Codex sessions in one profile each capture the id their own
+/// container published (#4157). A log-only check would miss the original bug:
+/// the ambiguous-store deferral is a warn and the session still starts.
+///
+/// Requires a running Docker daemon; marked `#[ignore]` for CI.
+#[test]
+#[parallel]
+#[ignore = "requires Docker daemon"]
+fn two_sandboxed_codex_sessions_capture_their_own_ids() {
+    require_tmux!();
+
+    let mut h = TuiTestHarness::new_in_tmp("sandbox_codex_capture");
+    let mut cleanup = SandboxCleanup::new();
+    build_codex_shim_image(&cleanup.image);
+
+    let mut ids = Vec::new();
+    for name in ["codex-A", "codex-B"] {
+        let project = h.home_path().join(name);
+        std::fs::create_dir_all(&project).expect("mkdir project");
+        let id = h.add_session(&[
+            project.to_str().unwrap(),
+            "-t",
+            name,
+            "-c",
+            "codex",
+            "--sandbox",
+            "--sandbox-image",
+            &cleanup.image,
+        ]);
+        cleanup.ids.push(id.clone());
+        ids.push(id);
+    }
+    for id in &ids {
+        h.run_cli_ok(&["session", "start", id]);
+    }
+
+    let published = |id: &str| {
+        h.home_path()
+            .join(".codex/sandbox-v2")
+            .join(id)
+            .join("published-id")
+    };
+    let deadline = Instant::now() + CAPTURE_DEADLINE;
+    let expected: Vec<String> = ids
+        .iter()
+        .map(|id| loop {
+            if let Ok(published_id) = std::fs::read_to_string(published(id)) {
+                break published_id;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the shim in {id} never published an id"
+            );
+            std::thread::sleep(Duration::from_millis(100));
+        })
+        .collect();
+    assert_ne!(
+        expected[0], expected[1],
+        "the shims must publish distinct ids"
+    );
+
+    // A bare CLI launch exits with its poller, so the TUI hosts it.
+    h.spawn_tui();
+    h.wait_for_ready();
+
+    loop {
+        let sessions = h.try_read_sessions();
+        let captured: Vec<Option<String>> = ids
+            .iter()
+            .map(|id| agent_session_id_of(&sessions, id))
+            .collect();
+        if captured.iter().all(Option::is_some) {
+            for ((id, want), got) in ids.iter().zip(&expected).zip(&captured) {
+                assert_eq!(got.as_deref(), Some(want.as_str()), "session {id}");
+            }
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "sessions never captured their ids: {captured:?}"
+        );
+        std::thread::sleep(Duration::from_millis(200));
+    }
 }

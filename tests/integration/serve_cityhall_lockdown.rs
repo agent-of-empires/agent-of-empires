@@ -86,7 +86,7 @@ async fn assert_cityhall_blocked(method: Method, uri: &str, body: Body) {
 #[serial_test::parallel]
 async fn sensitive_routes_are_blocked() {
     let cases: &[(Method, &str, &str)] = &[
-        // Git clone plus the two path probes: write $HOME, fetch the network,
+        // Git clone plus the path probes: write $HOME, fetch the network,
         // probe the filesystem.
         (
             Method::POST,
@@ -94,6 +94,7 @@ async fn sensitive_routes_are_blocked() {
             r#"{"url":"https://example.com/x.git"}"#,
         ),
         (Method::GET, "/api/git/branches?path=/tmp", ""),
+        (Method::GET, "/api/git/worktrees?path=/tmp", ""),
         (Method::GET, "/api/git/is-repo?path=/tmp", ""),
         // Terminal pane content, and the Files pane reads (#3088): enumerating
         // the workspace tree and reading file contents are the same
