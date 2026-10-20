@@ -810,6 +810,7 @@ pub fn build_instance(
                     from: parent.session_id.clone(),
                 };
                 instance.resume_binding = Some(*parent);
+                instance.source_profile = profile.to_string();
                 crate::session::conversation_carry::carry_fork_parent(&mut instance)?;
             }
             crate::session::ForkSeed::Structured {
@@ -2252,6 +2253,83 @@ mod tests {
                 "{label}: fork-seed build must restore the prior alias and compiled rule"
             );
         }
+    }
+
+    /// The carry resolves the child's store under the profile the child is
+    /// built for, so a profile-scoped `agent_config_dir` receives the
+    /// transcript rather than the default profile's store.
+    #[test]
+    #[serial_test::serial]
+    fn terminal_fork_carries_into_the_build_profiles_store() {
+        let root = tempfile::tempdir().unwrap();
+        let _app = crate::session::test_support::isolate_app_dir_at(root.path());
+        let stub = tempfile::tempdir().unwrap();
+        let _claude = crate::session::test_support::install_login_shell_path_command(
+            stub.path(),
+            "claude",
+            "#!/bin/sh\nexit 1\n",
+        );
+        let _registry = crate::tmux::status_rules::ProfileRegistryGuard::take("work");
+        crate::session::create_profile("work").unwrap();
+        crate::session::create_profile("other").unwrap();
+        std::fs::write(
+            crate::session::get_app_dir().unwrap().join("config.toml"),
+            "default_profile = \"other\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            crate::session::get_profile_dir("work")
+                .unwrap()
+                .join("config.toml"),
+            "[session.custom_agents]\nclaude-b = \"claude\"\n\
+             [session.agent_detect_as]\nclaude-b = \"claude\"\n\
+             [session.agent_config_dir]\nclaude-b = \"~/destination\"\n",
+        )
+        .unwrap();
+        let home = dirs::home_dir().unwrap();
+        let project = root.path().join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        let source = home.join("source");
+        let sid = "11111111-2222-3333-4444-555555555555";
+        let transcript = std::path::Path::new("projects")
+            .join(crate::session::capture::encode_claude_project_path(
+                &project.to_string_lossy(),
+            ))
+            .join(format!("{sid}.jsonl"));
+        std::fs::create_dir_all(source.join(transcript.parent().unwrap())).unwrap();
+        std::fs::write(source.join(&transcript), "parent conversation\n").unwrap();
+        let parent = crate::session::ConversationBinding {
+            session_id: sid.into(),
+            execution: Some(crate::session::ExecutionBinding {
+                agent: "claude".into(),
+                stores: vec![source.clone()],
+                configuration: Vec::new(),
+                cwd: project.clone(),
+                cwd_filesystem: "host".into(),
+                filesystem: "host".into(),
+                exported_default_store: None,
+            }),
+            provenance: crate::session::ConversationProvenance::Observed,
+            transcript_path: None,
+        };
+        let mut params = custom_agent_params(&project, "claude-b");
+        params.fork_seed = Some(crate::session::ForkSeed::Terminal {
+            parent: Box::new(parent),
+            child_session_id: "child-conversation".into(),
+            unattributed_parent_agent: None,
+        });
+
+        let child = build_instance(params, &[], &[], "work").unwrap().instance;
+
+        let destination = home.join("destination");
+        assert_eq!(
+            std::fs::read_to_string(destination.join(&transcript)).unwrap(),
+            "parent conversation\n"
+        );
+        assert_eq!(
+            child.resume_binding.unwrap().execution.unwrap().stores,
+            vec![destination.canonicalize().unwrap()]
+        );
     }
 
     /// The parent's capability is checked against the parent row's own agent,
