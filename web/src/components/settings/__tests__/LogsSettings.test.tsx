@@ -47,6 +47,7 @@ describe("LogsSettings", () => {
   it.each([
     ["stdout", /stdout/],
     ["missing", /No log file yet/],
+    ["unavailable", /no active log file/],
   ] as const)("explains an empty %s snapshot and disables Download", async (status, message) => {
     fetchLogs.mockResolvedValue({ status, content: "", lineCount: 0, truncated: false });
     const { findByText, getByTestId } = render(<LogsSettings />);

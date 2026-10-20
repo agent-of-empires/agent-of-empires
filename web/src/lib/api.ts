@@ -361,7 +361,7 @@ export async function fetchCityHallBundle(): Promise<string> {
 }
 
 export interface LogsSnapshot {
-  status: "available" | "missing" | "stdout";
+  status: "available" | "missing" | "stdout" | "unavailable";
   /** Redacted server-side. */
   content: string;
   lineCount: number;

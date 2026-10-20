@@ -188,9 +188,6 @@ async fn run_cli(mut cli: Cli, read_source: cli::runtime_read::ReadRequestSource
                     SubscriberTarget::File(p, _) => Some(p.clone()),
                     SubscriberTarget::Stdout => None,
                 };
-                if let Some(p) = &path_for_msg {
-                    logging::set_active_log_path(p.clone());
-                }
                 let session_tee = if matches!(
                     ctx,
                     ProcessContext::ServeForeground | ProcessContext::ServeDaemonChild

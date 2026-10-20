@@ -47,11 +47,13 @@ export function LogsSettings() {
   const empty =
     snapshot?.status === "stdout"
       ? "Logging is set to stdout, so there is no file to show."
-      : snapshot?.status === "missing"
-        ? "No log file yet."
-        : snapshot && !snapshot.content
-          ? "The log file is empty."
-          : null;
+      : snapshot?.status === "unavailable"
+        ? "This server has no active log file."
+        : snapshot?.status === "missing"
+          ? "No log file yet."
+          : snapshot && !snapshot.content
+            ? "The log file is empty."
+            : null;
 
   return (
     <div className="space-y-4">

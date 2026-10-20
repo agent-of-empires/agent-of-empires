@@ -455,6 +455,10 @@ pub fn init_subscriber_with_options(
         }
     };
     let (reload_layer, handle) = reload::Layer::new(parsed);
+    let sink = match &target {
+        SubscriberTarget::File(path, _) => ActiveSink::File(path.clone()),
+        SubscriberTarget::Stdout => ActiveSink::Stdout,
+    };
 
     // Only the JSON formatter can drop spans, so a custom FormatEvent does it here.
     let install_result = match target {
@@ -515,6 +519,7 @@ pub fn init_subscriber_with_options(
 
     match install_result {
         Ok(()) => {
+            let _ = ACTIVE_SINK.set(sink);
             let controller = Arc::new(FilterController {
                 inner: handle,
                 current: Mutex::new(filter),
@@ -753,15 +758,18 @@ fn file_inode(_meta: &std::fs::Metadata) -> u64 {
 
 static CONTROLLER: Mutex<Option<Arc<FilterController>>> = Mutex::new(None);
 
-static ACTIVE_LOG_PATH: OnceLock<PathBuf> = OnceLock::new();
-
-/// Records the file this process logs to. Never called for a stdout sink.
-pub fn set_active_log_path(path: PathBuf) {
-    let _ = ACTIVE_LOG_PATH.set(path);
+/// The sink a successful `init_subscriber_with_options` installed in this process.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ActiveSink {
+    File(PathBuf),
+    Stdout,
 }
 
-pub fn active_log_path() -> Option<PathBuf> {
-    ACTIVE_LOG_PATH.get().cloned()
+static ACTIVE_SINK: OnceLock<ActiveSink> = OnceLock::new();
+
+/// `None` when no subscriber was installed, including after a failed initialization.
+pub fn active_sink() -> Option<ActiveSink> {
+    ACTIVE_SINK.get().cloned()
 }
 
 pub fn install_controller(c: Arc<FilterController>) {
@@ -1094,6 +1102,18 @@ mod tests {
 
     /// Only a foreground serve may log to stdout; the TUI owns the terminal,
     /// so it is coerced to the file with a warning.
+    #[test]
+    fn failed_init_leaves_the_active_sink_unset() {
+        let init = init_subscriber_with_options(
+            SubscriberTarget::Stdout,
+            "aoe=notalevel".into(),
+            false,
+            None,
+        );
+        assert!(init.controller.is_none());
+        assert_eq!(active_sink(), None);
+    }
+
     #[test]
     fn resolve_sink_honors_stdout_only_outside_the_tui() {
         let mut cfg = make_cfg(RotationKind::Size, 50, 5);

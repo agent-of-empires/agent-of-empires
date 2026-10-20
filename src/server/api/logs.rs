@@ -13,7 +13,7 @@ use axum::Json;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 
-use crate::logging;
+use crate::logging::{self, ActiveSink};
 
 use super::{api_error, cityhall_block, read_only_response, AppState};
 
@@ -34,6 +34,7 @@ enum LogsStatus {
     Available,
     Missing,
     Stdout,
+    Unavailable,
 }
 
 #[derive(Serialize)]
@@ -90,8 +91,10 @@ pub async fn get_logs(
 }
 
 fn snapshot(lines: usize) -> std::io::Result<LogsResponse> {
-    let Some(path) = logging::active_log_path() else {
-        return Ok(LogsResponse::empty(LogsStatus::Stdout));
+    let path = match logging::active_sink() {
+        Some(ActiveSink::File(path)) => path,
+        Some(ActiveSink::Stdout) => return Ok(LogsResponse::empty(LogsStatus::Stdout)),
+        None => return Ok(LogsResponse::empty(LogsStatus::Unavailable)),
     };
     let (tail, line_count, truncated) = match read_tail(&path, lines) {
         Ok(tail) => tail,
