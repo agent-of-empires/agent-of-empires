@@ -449,6 +449,16 @@ describe("structured output media", () => {
     expect(text()).toContain(visible);
   });
 
+  it("keeps a failed Read's output under the attempted action, not outside the card", () => {
+    const { container, getByText } = renderCard(
+      fixtures.read,
+      makeError({ output: [{ kind: "text", text: "partial output" }] }),
+    );
+    const details = container.querySelector("details");
+    expect(details).not.toBeNull();
+    expect(getByText("partial output").closest("details")).toBe(details);
+  });
+
   // Agent-controlled uris never reach a sink; unusable blocks degrade to a placeholder.
   it.each<[string, ToolOutputBlock, string, string]>([
     ["image without data", { kind: "image", mime_type: "image/png" }, "img", "image (image/png)"],

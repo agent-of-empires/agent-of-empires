@@ -279,15 +279,15 @@ describe("AssistantMessage tool output media", () => {
   const at = "2026-05-12T00:00:00Z";
   // The file-level URL stub has no constructor, which link-scheme checks need.
   beforeEach(() => vi.unstubAllGlobals());
-  const rows = (output: NonNullable<ActivityRow["output"]>): ActivityRow[] => [
+  const rows = (output: NonNullable<ActivityRow["output"]>, kind = "other"): ActivityRow[] => [
     { id: "u1", kind: "user_prompt", text: "go", at },
     {
       id: "start-t1",
       kind: "tool_start",
-      text: "Read",
+      text: "Capture",
       at,
       toolCallId: "t1",
-      tool: { id: "t1", name: "Read", kind: "read", args_preview: '{"path":"a.rs"}', started_at: at },
+      tool: { id: "t1", name: "Capture", kind, args_preview: '{"path":"a.rs"}', started_at: at },
     },
     { id: "done-t1", kind: "tool_complete", text: "Captured", at, toolCallId: "t1", output },
   ];
@@ -350,6 +350,20 @@ describe("AssistantMessage tool output media", () => {
       />,
     );
     expect(getByAltText("tool output image (image/png)").getAttribute("src")).toBe("data:image/png;base64,AAAA");
+  });
+
+  it("keeps a Read's image result inside its card, collapsed until opened", () => {
+    const { queryByAltText, getByAltText, getByRole } = render(
+      <Harness
+        messages={activityToThreadMessages(
+          rows([{ kind: "image", mime_type: "image/png", data: "AAAA" }], "read"),
+          false,
+        )}
+      />,
+    );
+    expect(queryByAltText("tool output image (image/png)")).toBeNull();
+    fireEvent.click(getByRole("button", { name: /read/i }));
+    expect(getByAltText("tool output image (image/png)").closest("[data-tool-id]")).not.toBeNull();
   });
 
   it("expands an inline image result in the lightbox", () => {
