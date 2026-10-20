@@ -34,9 +34,11 @@ export function PasskeySettings() {
 
   const onRemove = async (id: string) => {
     setBusy(true);
+    setError(null);
     const ok = await removePasskey(id);
     setBusy(false);
     if (ok) await load();
+    else setError("Could not remove passkey");
   };
 
   return (
