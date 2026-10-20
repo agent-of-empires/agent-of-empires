@@ -418,7 +418,7 @@ Manage session lifecycle (start, stop, attach, etc.)
 * `restart` — Restart session (or all sessions with `--all`)
 * `attach` — Attach to session interactively
 * `show` — Show session details
-* `wait` — Block until a session's agent activity status matches one of the `--until` values. Exits 0 on a match, non-zero on timeout or if the session stops. Tmux sessions only
+* `wait` — Block until a session's agent activity status matches one of the `--until` values. Exits 0 on a match, 124 on timeout (like `timeout(1)`), and 1 if the session stops. Tmux sessions only
 * `rename` — Rename a session
 * `set-worktree-name` — Edit a managed worktree session's workdir directory name (and, optionally, its git branch). Moves the worktree directory in place; the session must not be running. See #1723
 * `capture` — Capture tmux pane output
@@ -513,7 +513,7 @@ Show session details
 
 ## `aoe session wait`
 
-Block until a session's agent activity status matches one of the `--until` values. Exits 0 on a match, non-zero on timeout or if the session stops. Tmux sessions only
+Block until a session's agent activity status matches one of the `--until` values. Exits 0 on a match, 124 on timeout (like `timeout(1)`), and 1 if the session stops. Tmux sessions only
 
 **Usage:** `aoe session wait [OPTIONS] --until <UNTIL> <IDENTIFIER>`
 

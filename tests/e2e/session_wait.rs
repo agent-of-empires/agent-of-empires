@@ -18,7 +18,7 @@ fn test_wait_times_out_then_reports_stopped_session() {
     h.add_session(&[project.to_str().unwrap(), "-t", "waiter"]);
     h.run_cli_ok(&["session", "start", "waiter"]);
 
-    let err = h.run_cli_err(&[
+    let out = h.run_cli(&[
         "session",
         "wait",
         "waiter",
@@ -27,6 +27,8 @@ fn test_wait_times_out_then_reports_stopped_session() {
         "--timeout",
         "1500",
     ]);
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(124), "stderr: {err}");
     assert!(err.contains("timed out after 1500ms"), "stderr: {err}");
 
     h.run_cli_ok(&["session", "stop", "waiter"]);

@@ -28,8 +28,8 @@ pub enum SessionCommands {
     Show(ShowArgs),
 
     /// Block until a session's agent activity status matches one of the
-    /// `--until` values. Exits 0 on a match, non-zero on timeout or if the
-    /// session stops. Tmux sessions only.
+    /// `--until` values. Exits 0 on a match, 124 on timeout (like
+    /// `timeout(1)`), and 1 if the session stops. Tmux sessions only.
     Wait(WaitArgs),
 
     /// Rename a session
@@ -1498,6 +1498,7 @@ async fn attach_session(profile: &str, args: SessionIdArgs) -> Result<()> {
 }
 
 const WAIT_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
+const WAIT_TIMEOUT_EXIT_CODE: i32 = 124;
 
 #[derive(Debug, PartialEq, Eq)]
 enum WaitDecision {
@@ -1592,12 +1593,15 @@ async fn wait_session(profile: &str, args: WaitArgs) -> Result<()> {
                 return Ok(());
             }
             WaitDecision::Terminated => bail!("session '{}' is not running", live.title),
-            WaitDecision::TimedOut => bail!(
-                "timed out after {}ms waiting for '{}' (last status: {})",
-                args.timeout,
-                live.title,
-                live.status.as_str()
-            ),
+            WaitDecision::TimedOut => {
+                eprintln!(
+                    "Error: timed out after {}ms waiting for '{}' (last status: {})",
+                    args.timeout,
+                    live.title,
+                    live.status.as_str()
+                );
+                std::process::exit(WAIT_TIMEOUT_EXIT_CODE);
+            }
             WaitDecision::Continue => {
                 tokio::time::sleep(WAIT_POLL_INTERVAL.min(timeout - elapsed)).await;
             }
