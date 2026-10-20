@@ -69,6 +69,14 @@ enum PersistedSelector {
 }
 
 impl PersistedSelector {
+    fn field(self) -> &'static str {
+        match self {
+            Self::Model => "agent_model",
+            Self::Mode => "acp_mode_id",
+            Self::ThoughtLevel => "acp_effort",
+        }
+    }
+
     fn apply(self, inst: &mut crate::session::Instance, value: String) {
         match self {
             Self::Model => inst.agent_model = Some(value),
@@ -202,7 +210,13 @@ pub async fn acp_set_config_option(
     }
     if let Some(selector) = selector {
         if let Err(e) = persist_selector(&state, &id, selector, &req.value).await {
-            return persist_failure_response(&state, &id, &e).await;
+            return persist_failure_response(
+                &state,
+                &id,
+                &format!("config-option pick for {}", selector.field()),
+                &e,
+            )
+            .await;
         }
         if selector == PersistedSelector::Model {
             state

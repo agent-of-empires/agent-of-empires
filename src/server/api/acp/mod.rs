@@ -118,11 +118,16 @@ fn is_store_write_failure(error: &anyhow::Error) -> bool {
 /// A durable write failed after the worker had taken the change. Stop the worker
 /// so its respawn reads the stored row; writing the old value back could
 /// overwrite a newer edit.
-async fn persist_failure_response(state: &AppState, id: &str, err: &anyhow::Error) -> Response {
+async fn persist_failure_response(
+    state: &AppState,
+    id: &str,
+    what: &str,
+    err: &anyhow::Error,
+) -> Response {
     tracing::error!(
         target: "http.api.acp",
         session = %id,
-        "failed to persist ACP change: {err:#}"
+        "failed to persist {what}: {err:#}"
     );
     let stopped = state
         .acp_supervisor
@@ -137,7 +142,7 @@ async fn persist_failure_response(state: &AppState, id: &str, err: &anyhow::Erro
     super::api_error(
         StatusCode::INTERNAL_SERVER_ERROR,
         "persist_failed",
-        format!("failed to save the change ({err:#}); {outcome}"),
+        format!("failed to save the {what} ({err:#}); {outcome}"),
     )
 }
 
