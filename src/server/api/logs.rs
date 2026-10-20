@@ -114,14 +114,17 @@ fn read_tail(path: &Path, lines: usize) -> std::io::Result<(String, usize, bool)
     let mut file = std::fs::File::open(path)?;
     let len = file.metadata()?.len();
     let start = len.saturating_sub(MAX_TAIL_BYTES);
-    file.seek(SeekFrom::Start(start))?;
+    // Read one byte early so a cut that lands just after a newline keeps its first line.
+    let seek = start.saturating_sub(1);
+    file.seek(SeekFrom::Start(seek))?;
     let mut buf = Vec::new();
-    file.take(len - start).read_to_end(&mut buf)?;
-    let text = String::from_utf8_lossy(&buf);
+    file.take(len - seek).read_to_end(&mut buf)?;
+    let at_line_start = start == 0 || buf[0] == b'\n';
+    let body = if start == 0 { &buf[..] } else { &buf[1..] };
+    let text = String::from_utf8_lossy(body);
 
     let mut all: Vec<&str> = text.lines().collect();
-    // A mid-file start lands inside a line; drop the fragment.
-    if start > 0 && !all.is_empty() {
+    if !at_line_start && !all.is_empty() {
         all.remove(0);
     }
     let truncated = start > 0 || all.len() > lines;
@@ -233,6 +236,15 @@ mod tests {
         assert!(truncated);
         assert_eq!(count, MAX_LINES);
         assert!(text.lines().all(|l| l.len() == 99));
+
+        // A cut exactly on a line boundary keeps every line in the window.
+        let line = format!("{}\n", "y".repeat(63));
+        assert_eq!(MAX_TAIL_BYTES as usize % line.len(), 0);
+        let n = MAX_TAIL_BYTES as usize / line.len() + 10;
+        std::fs::write(&path, line.repeat(n)).unwrap();
+        let (_, count, truncated) = read_tail(&path, usize::MAX).unwrap();
+        assert!(truncated);
+        assert_eq!(count, MAX_TAIL_BYTES as usize / line.len());
 
         assert_eq!(
             read_tail(&dir.path().join("missing.log"), 1)
