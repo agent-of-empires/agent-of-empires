@@ -1714,7 +1714,6 @@ mod tests {
         std::fs::write(&profiles, "not a directory").unwrap();
         let state = test_support::build_test_app_state(Vec::new());
         let failed = load_all_instances(&state.file_watch);
-        let failed_health = failed.cache.health.clone();
         reload_state_instances_from_disk(&state, failed, vec![], StatusSource::DiskOnly, 0).await;
         let snapshot = cached_snapshot(&state).await;
         assert!(!crate::cli::runtime_read::dto::component_healthy(
@@ -1742,21 +1741,73 @@ mod tests {
         )
         .await;
         assert!(cached_data_healthy(&cached_snapshot(&state).await, "main"));
-        std::fs::remove_dir_all(profiles.join("main")).unwrap();
-        let failed = crate::server::reload::LoadedInstances {
-            instances: vec![],
-            cache: super::super::reload::RuntimeReadCache {
-                health: failed_health,
-                ..Default::default()
-            },
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn failed_enumeration_keeps_rows_until_a_successful_empty_inventory() {
+        use crate::server::{
+            reload::{load_all_instances, reload_state_instances_from_disk},
+            state::StatusSource,
+            test_support,
         };
-        reload_state_instances_from_disk(&state, failed, vec![], StatusSource::DiskOnly, 0).await;
+        let home = TempHome::new();
+        Storage::new_unwatched("main")
+            .unwrap()
+            .update(|rows, _| {
+                *rows = vec![named("kept", "main")];
+                Ok(())
+            })
+            .unwrap();
+        let state = test_support::build_test_app_state(Vec::new());
+        let reload = |loaded| {
+            reload_state_instances_from_disk(&state, loaded, vec![], StatusSource::DiskOnly, 0)
+        };
+        reload(load_all_instances(&state.file_watch)).await;
+        state.instances.write().await[0].last_error = Some("daemon-only".into());
+
+        let profiles = home.app_dir().join("profiles");
+        let stash = home.app_dir().join("profiles-stash");
+        std::fs::rename(&profiles, &stash).unwrap();
+        std::fs::write(&profiles, "not a directory").unwrap();
+        let failed = load_all_instances(&state.file_watch);
+        assert!(failed.cache.health.enumeration_failed);
+        reload(failed).await;
+        assert!(
+            state
+                .runtime_read_cache
+                .read()
+                .unwrap()
+                .health
+                .enumeration_failed
+        );
         let snapshot = cached_snapshot(&state).await;
-        assert!(crate::cli::runtime_read::dto::component_healthy(
+        assert!(!crate::cli::runtime_read::dto::component_healthy(
             &snapshot.health.global_enumeration
         ));
-        assert!(snapshot.profiles.is_empty());
-        assert!(snapshot.sessions.is_empty());
+        assert!(snapshot.sessions.iter().any(|row| row.id == "kept"));
+        assert_eq!(
+            state.instances.read().await[0].last_error.as_deref(),
+            Some("daemon-only")
+        );
+
+        std::fs::remove_file(&profiles).unwrap();
+        std::fs::rename(&stash, &profiles).unwrap();
+        reload(load_all_instances(&state.file_watch)).await;
+        assert!(
+            !state
+                .runtime_read_cache
+                .read()
+                .unwrap()
+                .health
+                .enumeration_failed
+        );
+        assert_eq!(state.instances.read().await.len(), 1);
+
+        std::fs::remove_dir_all(&profiles).unwrap();
+        reload(load_all_instances(&state.file_watch)).await;
+        assert!(state.instances.read().await.is_empty());
+        assert!(cached_snapshot(&state).await.sessions.is_empty());
     }
 
     /// Project and group registry errors degrade only their own components.
