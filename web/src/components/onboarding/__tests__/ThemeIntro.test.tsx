@@ -3,7 +3,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 
-const updateTheme = vi.fn(() => Promise.resolve(true));
+const updateTheme = vi.fn(() => Promise.resolve("committed" as "committed" | "rejected" | "uncertain"));
 vi.mock("../../../lib/api", () => ({
   fetchThemes: vi.fn(() => Promise.resolve(["default", "modus-vivendi", "empire"])),
   updateTheme: (patch: { name?: string }) => updateTheme(patch),
@@ -20,7 +20,7 @@ afterEach(() => {
   cleanup();
   dispatchSpy.mockClear();
   updateTheme.mockClear();
-  updateTheme.mockImplementation(() => Promise.resolve(true));
+  updateTheme.mockImplementation(() => Promise.resolve("committed"));
 });
 
 async function mount(tourFollows = true) {
@@ -47,7 +47,7 @@ describe("ThemeIntro", () => {
   });
 
   it("shows an error, does not repaint, and reverts the highlight when the save fails", async () => {
-    updateTheme.mockImplementation(() => Promise.resolve(false));
+    updateTheme.mockImplementation(() => Promise.resolve("rejected"));
     await mount();
     fireEvent.click(option("empire"));
     await waitFor(() => expect(screen.getByRole("alert")).toBeTruthy());

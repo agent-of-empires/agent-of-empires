@@ -16,8 +16,7 @@ export function useThemeMutation(): {
   const select = useCallback(async (name: string): Promise<ThemeSelectResult> => {
     setPending(true);
     try {
-      const ok = await updateTheme({ name });
-      if (!ok) return { ok: false, error: SAVE_ERROR };
+      if ((await updateTheme({ name })) !== "committed") return { ok: false, error: SAVE_ERROR };
       dispatchThemePickerChanged(name);
       return { ok: true };
     } catch {

@@ -412,9 +412,7 @@ export function SettingsView({
     (section: string, field: string, value: unknown): Promise<boolean> => {
       const overridable = schema.some((d) => d.section === section && d.field === field && d.profile_overridable);
       if (overridable) return sendSave(section, field, value);
-      return saveField(selectedProfile, section, field, value, async () =>
-        (await updateTheme({ [field]: value })) ? "committed" : "rejected",
-      );
+      return saveField(selectedProfile, section, field, value, () => updateTheme({ [field]: value }));
     },
     [schema, selectedProfile, sendSave],
   );

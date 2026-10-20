@@ -113,7 +113,7 @@ const requestCases: RequestCase[] = [
     () => api.updateMachineSettings({ a: 1 }),
     { body: { a: 1 }, result: "committed" },
   ],
-  ["PATCH /api/theme", () => api.updateTheme({ name: "dracula" }), { body: { name: "dracula" }, result: true }],
+  ["PATCH /api/theme", () => api.updateTheme({ name: "dracula" }), { body: { name: "dracula" }, result: "committed" }],
   ["GET /api/app-state/web-ui-state", () => api.getWebUiState(), { respond: json({ k: "v" }), result: { k: "v" } }],
   [
     "PATCH /api/app-state/web-ui-state",

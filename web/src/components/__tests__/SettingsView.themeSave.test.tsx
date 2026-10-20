@@ -51,7 +51,9 @@ const THEME_SCHEMA = [
   },
 ];
 
-const updateTheme = vi.fn(() => Promise.resolve(true));
+const updateTheme = vi.fn((_patch: Record<string, unknown>) =>
+  Promise.resolve("committed" as "committed" | "rejected" | "uncertain"),
+);
 const updateSettings = vi.fn(() => Promise.resolve("committed" as const));
 
 vi.mock("../../lib/api", () => ({
@@ -147,5 +149,17 @@ describe("SettingsView theme tab save routing", () => {
     fireEvent.blur(idle);
     await waitFor(() => expect(updateSettings).toHaveBeenCalledWith({ theme: { idle_decay_minutes: 5 } }, "main"));
     expect(updateTheme).not.toHaveBeenCalled();
+  });
+
+  it("keeps a theme pick whose response was lost on screen and resends it, never reporting a rejection", async () => {
+    updateTheme.mockImplementationOnce(() => Promise.resolve("uncertain"));
+    renderThemeTab();
+    await waitFor(() => selectWithOption("dracula"));
+    fireEvent.change(selectWithOption("dracula"), { target: { value: "dracula" } });
+
+    // The store resends the unconfirmed intent after a refresh that does not show it.
+    await waitFor(() => expect(updateTheme).toHaveBeenCalledTimes(2));
+    expect(updateTheme).toHaveBeenLastCalledWith({ name: "dracula" });
+    expect(screen.queryByText("Failed to save, please try again")).toBeNull();
   });
 });
