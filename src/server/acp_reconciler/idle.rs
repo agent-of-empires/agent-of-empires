@@ -151,6 +151,36 @@ async fn persist_dormant(state: &AppState, profile: &str, id: &str, dormant: boo
     .is_ok_and(|r| r.is_ok())
 }
 
+/// Whether a reap decided on `snapshot_last_ms` still holds. A prompt that woke
+/// the session meanwhile has a fresh worker that a stop would kill mid-turn.
+async fn reap_still_applies(
+    state: &Arc<AppState>,
+    id: &str,
+    idle_secs: u32,
+    snapshot_last_ms: Option<i64>,
+) -> bool {
+    let Some((latest, in_flight)) =
+        query_store(&state.acp_event_store, id, "idle-reap recheck", |s, id| {
+            (
+                s.last_event_at_for_sessions(&[id.to_string()])
+                    .get(id)
+                    .copied(),
+                s.has_in_flight_turn(id),
+            )
+        })
+        .await
+    else {
+        return false;
+    };
+    latest == snapshot_last_ms
+        && should_auto_stop(
+            chrono::Utc::now().timestamp_millis(),
+            latest,
+            idle_secs,
+            in_flight,
+        )
+}
+
 /// Shuts down idle workers and marks them dormant so the resume pass skips
 /// them. Dormancy is persisted before shutdown so a persist failure leaves the
 /// worker alive rather than orphaned.
@@ -220,6 +250,13 @@ pub(super) async fn reap_idle_workers(state: &Arc<AppState>) {
         if !persist_dormant(state, &profile, &id, true).await {
             set_dormant_in_memory(state, &id, false).await;
             tracing::warn!(target: "acp.supervisor", session = %id, "idle-reap persist failed; leaving worker alive");
+            continue;
+        }
+        // Persisting is slow under load: a prompt can wake the session meanwhile.
+        if !reap_still_applies(state, &id, idle_secs, last_ms).await {
+            set_dormant_in_memory(state, &id, false).await;
+            persist_dormant(state, &profile, &id, false).await;
+            tracing::info!(target: "acp.supervisor", session = %id, "session woke during idle-reap; leaving worker alive");
             continue;
         }
         match state.acp_supervisor.shutdown_idle(&id, Some(&lease)).await {
@@ -377,6 +414,43 @@ mod tests {
             Err(crate::acp::supervisor::SupervisorError::Superseded(_))
         ));
         assert_eq!(sup.worker_state(id).await, Running);
+    }
+
+    /// A prompt that woke the session after the reap snapshot must veto the
+    /// stop: killing the fresh worker would drop the prompt it is serving.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_prompt_after_the_reap_snapshot_vetoes_the_stop() {
+        let id = "acp-reap-recheck";
+        let project = tempfile::TempDir::new().unwrap();
+        let inst = structured_instance(id, &project.path().to_string_lossy());
+        let state = crate::server::test_support::build_test_app_state(vec![inst]);
+        let long_ago = Utc::now().timestamp_millis() - 25 * 3_600_000;
+        let stopped = Event::Stopped {
+            reason: "prompt_complete".into(),
+        };
+        state
+            .acp_event_store
+            .record_at(id, 1, &stopped, long_ago)
+            .unwrap();
+
+        assert!(
+            reap_still_applies(&state, id, 3600, Some(long_ago)).await,
+            "nothing happened since the snapshot"
+        );
+
+        let prompt = Event::UserPromptSent {
+            prompt_id: None,
+            text: "wake".into(),
+            attachments: Vec::new(),
+            synthesized: true,
+            origin_plugin: None,
+        };
+        state.acp_event_store.record(id, 2, &prompt).unwrap();
+        assert!(
+            !reap_still_applies(&state, id, 3600, Some(long_ago)).await,
+            "a prompt landed after the snapshot"
+        );
     }
 
     /// Case 0 replays the real occurrence: an agent-initiated turn after the
