@@ -36,7 +36,6 @@ use crate::acp::acp_client::session_identity::ordered_session_request;
 /// Fully silent grace after reattaching to an in-flight turn.
 const RESUME_IDLE_GRACE_DEFAULT: Duration = Duration::from_secs(30);
 
-/// Debug builds honor `AOE_RESUME_IDLE_GRACE_MS`, clamped to at least 100ms.
 /// Announced when `session/new` replaces a conversation the user expects to
 /// continue. `stored` is absent after a view switch that lost the id.
 fn initial_reset_reason(
@@ -66,6 +65,7 @@ fn load_failed_reason(prior_conversation: bool, error: &impl std::fmt::Display) 
     }
 }
 
+/// Debug builds honor `AOE_RESUME_IDLE_GRACE_MS`, clamped to at least 100ms.
 fn resume_idle_grace() -> Duration {
     #[cfg(debug_assertions)]
     if let Some(ms) = std::env::var("AOE_RESUME_IDLE_GRACE_MS")
