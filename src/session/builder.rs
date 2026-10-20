@@ -1231,6 +1231,20 @@ pub mod structured {
         )))
     }
 
+    /// Whether `agent` is ACP-capable and its adapter passes the create check, for the agent
+    /// list. With no project to search from, relative PATH entries resolve from the daemon's cwd.
+    pub fn adapter_installed(agent: &str, config: &crate::session::Config) -> bool {
+        let cwd = std::env::current_dir().unwrap_or_default();
+        let choice = StructuredChoice {
+            tool: agent,
+            agent_name: None,
+            command_override: "",
+            sandboxed: false,
+            project_path: &cwd,
+        };
+        validate_structured_choice(&choice, config).is_ok()
+    }
+
     /// Whether the adapter can launch, judged as the runner does: the daemon's lookup, or the
     /// configured PATH searched from the project. `before_session` hooks may set PATH at
     /// spawn, so with any configured the adapter is given the benefit of the doubt.

@@ -73,11 +73,8 @@ pub struct AgentInfo {
     /// valid `agent_acp_cmd`. The web wizard reads this to decide
     /// whether a session created for the agent runs in acp or tmux.
     pub acp_capable: bool,
-    /// True when the agent's ACP adapter binary (`acp_command`) is actually
-    /// resolvable on this host, not just registered. Distinct from
-    /// `installed` (the agent's own CLI binary) and `acp_capable` (registry
-    /// knows an adapter exists). The wizard's "Import from Claude" tab gates
-    /// on this so it never shows when claude-agent-acp is missing. See #2276.
+    /// Whether the agent's ACP adapter passes the structured create check on this
+    /// host, so the wizard offers Structured view only where a create would succeed.
     pub acp_installed: bool,
     /// True when `[acp] allowed_agents` permits this agent in the structured
     /// view. Deliberately separate from `acp_capable`, which states an intrinsic
@@ -161,8 +158,7 @@ fn build_custom_agent_infos(
                 .is_some_and(|cmd| crate::acp::AgentSpec::from_acp_cmd(name, cmd).is_ok())
                 || crate::acp::inherited_acp_base(name, agent_detect_as).is_some(),
             acp_allowed: policy.allows(name),
-            // A custom agent's acp_command is never serialized (it can hold
-            // hostnames or secrets), so its install state is not probed.
+            // Set by `list_agents`, which holds the config the probe needs.
             acp_installed: false,
             // Custom agents' command values are deliberately never
             // serialized here; they can hold hostnames or secrets.
@@ -179,9 +175,6 @@ pub async fn list_agents(State(state): State<Arc<AppState>>) -> Json<Vec<AgentIn
     let profile = state.served_profile().to_string();
     let result = tokio::task::spawn_blocking(move || {
         let config = crate::session::config::profile_config::resolve_config_or_warn(&profile);
-        let custom_agents = config.session.custom_agents;
-        let agent_acp_cmd = config.session.agent_acp_cmd;
-        let agent_detect_as = config.session.agent_detect_as;
         let tools = crate::tmux::AvailableTools::detect();
         let available = tools.available_list();
         let acp_registry = crate::acp::AgentRegistry::with_defaults();
@@ -204,9 +197,7 @@ pub async fn list_agents(State(state): State<Arc<AppState>>) -> Json<Vec<AgentIn
                     oneshot_capable: a.oneshot_flag.is_some(),
                     lifecycle: a.lifecycle,
                     acp_capable: acp_registry.get(a.name).is_some(),
-                    acp_installed: acp_command
-                        .as_deref()
-                        .is_some_and(crate::cli::acp::command_present),
+                    acp_installed: false,
                     acp_allowed: policy.allows(a.name),
                     acp_command,
                     acp_args,
@@ -214,11 +205,15 @@ pub async fn list_agents(State(state): State<Arc<AppState>>) -> Json<Vec<AgentIn
             })
             .collect::<Vec<_>>();
         agents.extend(build_custom_agent_infos(
-            &custom_agents,
-            &agent_acp_cmd,
-            &agent_detect_as,
+            &config.session.custom_agents,
+            &config.session.agent_acp_cmd,
+            &config.session.agent_detect_as,
             &policy,
         ));
+        for agent in agents.iter_mut().filter(|a| a.acp_capable) {
+            agent.acp_installed =
+                crate::session::builder::structured::adapter_installed(&agent.name, &config);
+        }
         agents
     })
     .await
@@ -3153,6 +3148,46 @@ mod tests {
             !cursor.acp_capable,
             "wrapper inheriting a terminal-only base stays tmux-only"
         );
+    }
+
+    /// #4617: `acp_installed` follows the structured create check, so a custom
+    /// agent counts when its adapter is on the configured `environment` PATH.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn acp_installed_matches_the_structured_create_check() {
+        use std::os::unix::fs::PermissionsExt;
+        let _home = crate::session::test_support::isolate_app_dir();
+        let bin = tempfile::tempdir().unwrap();
+        let adapter = format!("aoe-test-adapter-{}", std::process::id());
+        std::fs::write(bin.path().join(&adapter), "#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(
+            bin.path().join(&adapter),
+            std::fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
+        crate::session::config::update_config(|config| {
+            for (name, acp) in [
+                ("on-path", Some(format!("{adapter} acp"))),
+                ("missing", Some(format!("{adapter}-missing acp"))),
+                ("terminal", None),
+            ] {
+                config
+                    .session
+                    .custom_agents
+                    .insert(name.into(), "true".into());
+                if let Some(acp) = acp {
+                    config.session.agent_acp_cmd.insert(name.into(), acp);
+                }
+            }
+            config.environment = vec![format!("PATH={}", bin.path().display())];
+        })
+        .unwrap();
+        let state = crate::server::test_support::build_test_app_state(Vec::new());
+        let Json(agents) = list_agents(State(state)).await;
+        for (name, installed) in [("on-path", true), ("missing", false), ("terminal", false)] {
+            let agent = agents.iter().find(|a| a.name == name).unwrap();
+            assert_eq!(agent.acp_installed, installed, "{name}");
+        }
     }
 
     #[test]
