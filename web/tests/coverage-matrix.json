@@ -588,6 +588,13 @@
       "components": ["web/src/components/settings/LogsSettings.tsx", "web/src/components/SettingsView.tsx"]
     },
     {
+      "id": "settings.logs-endpoint-access",
+      "kind": "live-playwright",
+      "risk": "high",
+      "specs": ["tests/live/logs-endpoint.spec.ts"],
+      "components": ["src/server/api/logs.rs"]
+    },
+    {
       "id": "settings.cityhall-export",
       "kind": "vitest",
       "risk": "medium",
