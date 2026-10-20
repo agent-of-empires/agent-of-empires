@@ -113,6 +113,9 @@ pub enum SupervisorError {
     SessionGone(String),
     #[error("native session authority unavailable")]
     NativeStoreUnavailable,
+    /// The event log could not say whether a turn is open; the caller retries.
+    #[error("session {0:?} event log is unavailable")]
+    EventStoreUnavailable(String),
 }
 
 /// What the caller does with prompt text after it was published.
