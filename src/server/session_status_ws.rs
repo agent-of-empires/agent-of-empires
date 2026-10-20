@@ -10,7 +10,7 @@ use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::State;
 use axum::response::{IntoResponse, Response};
 use serde_json::json;
-use tokio::sync::broadcast::error::RecvError;
+use tokio::sync::broadcast::{self, error::RecvError};
 use tokio::time::Instant;
 
 use super::push::{NotificationEvent, StatusChange};
@@ -82,6 +82,40 @@ async fn send(socket: &mut WebSocket, message: Message) -> bool {
     )
 }
 
+/// The next frames to send, or `None` once the status channel closes. Queued moves win over an
+/// expired dwell, so a cue can never beat the move that cancels it.
+async fn next_frames(
+    rx: &mut broadcast::Receiver<StatusChange>,
+    dwells: &mut Dwells,
+) -> Option<Vec<String>> {
+    let sleep = match dwells.next_due() {
+        Some(due) => tokio::time::sleep_until(due),
+        None => tokio::time::sleep(Duration::from_secs(3600)),
+    };
+    tokio::select! {
+        biased;
+        recv = rx.recv() => match recv {
+            Ok(change) => {
+                dwells.on_change(&change, Instant::now());
+                Some(vec![status_frame(&change)])
+            }
+            Err(RecvError::Lagged(skipped)) => {
+                tracing::warn!(target: "http.middleware", skipped, "session status ws lagged");
+                *dwells = Dwells::default();
+                Some(vec![json!({ "kind": "resync" }).to_string()])
+            }
+            Err(RecvError::Closed) => None,
+        },
+        _ = sleep => Some(
+            dwells
+                .take_due(Instant::now())
+                .into_iter()
+                .map(|(id, event)| sound_due_frame(&id, event))
+                .collect(),
+        ),
+    }
+}
+
 async fn serve(mut socket: WebSocket, state: Arc<AppState>) {
     // Subscribe before `ready` so the client's resync fetch cannot miss a move.
     let mut rx = state.status_tx.subscribe();
@@ -101,10 +135,6 @@ async fn serve(mut socket: WebSocket, state: Arc<AppState>) {
     let mut last_pong_at = Instant::now();
 
     loop {
-        let sleep = match dwells.next_due() {
-            Some(due) => tokio::time::sleep_until(due),
-            None => tokio::time::sleep(Duration::from_secs(3600)),
-        };
         let frame = tokio::select! {
             _ = state.shutdown.cancelled() => break,
             incoming = socket.recv() => match incoming {
@@ -125,24 +155,9 @@ async fn serve(mut socket: WebSocket, state: Arc<AppState>) {
                 }
                 continue;
             }
-            _ = sleep => {
-                let mut frames = Vec::new();
-                for (id, event) in dwells.take_due(Instant::now()) {
-                    frames.push(sound_due_frame(&id, event));
-                }
-                frames
-            }
-            recv = rx.recv() => match recv {
-                Ok(change) => {
-                    dwells.on_change(&change, Instant::now());
-                    vec![status_frame(&change)]
-                }
-                Err(RecvError::Lagged(skipped)) => {
-                    tracing::warn!(target: "http.middleware", skipped, "session status ws lagged");
-                    dwells = Dwells::default();
-                    vec![json!({ "kind": "resync" }).to_string()]
-                }
-                Err(RecvError::Closed) => break,
+            frames = next_frames(&mut rx, &mut dwells) => match frames {
+                Some(frames) => frames,
+                None => break,
             },
         };
         for text in frame {
@@ -189,6 +204,22 @@ mod tests {
         );
         assert!(dwells.take_due(t0 + Duration::from_secs(60)).is_empty());
         assert_eq!(dwells.next_due(), None);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_queued_move_cancels_the_dwell_before_its_expired_cue() {
+        let (tx, mut rx) = broadcast::channel(8);
+        let mut dwells = Dwells::default();
+        dwells.on_change(&change("a", Status::Waiting), Instant::now());
+        let running = change("a", Status::Running);
+        tx.send(running.clone()).unwrap();
+        tokio::time::advance(Duration::from_secs(6)).await;
+
+        let frames = next_frames(&mut rx, &mut dwells).await;
+        assert_eq!(frames, Some(vec![status_frame(&running)]));
+        let later =
+            tokio::time::timeout(Duration::from_secs(30), next_frames(&mut rx, &mut dwells)).await;
+        assert!(later.is_err(), "no cue for a session that moved on");
     }
 
     #[test]
