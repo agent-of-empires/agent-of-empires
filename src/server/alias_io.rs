@@ -17,7 +17,8 @@ pub(crate) const WAIT: Duration = Duration::from_millis(250);
 
 struct Slot {
     target: Option<PathBuf>,
-    in_flight: bool,
+    /// Target of the running worker, so a repoint is not blocked by a hung old one.
+    in_flight: Option<Option<PathBuf>>,
     last: Option<Arc<dyn Any + Send + Sync>>,
 }
 
@@ -37,12 +38,14 @@ pub(crate) struct Sample<T> {
 }
 
 /// Clears the in-flight mark when the worker finishes or panics.
-struct Finish(Key);
+struct Finish(Key, Option<PathBuf>);
 
 impl Drop for Finish {
     fn drop(&mut self) {
         if let Some(slot) = slots().get_mut(&self.0) {
-            slot.in_flight = false;
+            if slot.in_flight.as_ref() == Some(&self.1) {
+                slot.in_flight = None;
+            }
         }
     }
 }
@@ -69,26 +72,26 @@ where
         let mut guard = slots();
         let slot = guard.entry(key.clone()).or_insert(Slot {
             target: None,
-            in_flight: false,
+            in_flight: None,
             last: None,
         });
         if slot.target != target {
             slot.target.clone_from(&target);
             slot.last = None;
         }
-        if slot.in_flight {
+        if slot.in_flight.as_ref() == Some(&target) {
             return Sample {
                 value: last(slot),
                 fresh: false,
             };
         }
-        slot.in_flight = true;
+        slot.in_flight = Some(target.clone());
         let (tx, rx) = mpsc::channel();
         let worker_key = key.clone();
         let spawned = std::thread::Builder::new()
             .name("aoe-alias-io".into())
             .spawn(move || {
-                let _finish = Finish(worker_key.clone());
+                let _finish = Finish(worker_key.clone(), target.clone());
                 #[cfg(test)]
                 held::block(&worker_key);
                 let value = Arc::new(work());
@@ -100,7 +103,7 @@ where
                 let _ = tx.send(value);
             });
         if spawned.is_err() {
-            slot.in_flight = false;
+            slot.in_flight = None;
             return Sample {
                 value: last(slot),
                 fresh: false,
@@ -124,7 +127,7 @@ where
 pub(crate) fn in_flight_for_test(alias: &str) -> usize {
     slots()
         .iter()
-        .filter(|((name, _), slot)| name == alias && slot.in_flight)
+        .filter(|((name, _), slot)| name == alias && slot.in_flight.is_some())
         .count()
 }
 
@@ -132,11 +135,12 @@ pub(crate) fn in_flight_for_test(alias: &str) -> usize {
 #[cfg(test)]
 pub(crate) mod held {
     use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Condvar;
 
     type Gate = Arc<(Mutex<bool>, Condvar)>;
 
-    static HOLDS: LazyLock<Mutex<HashMap<Key, (mpsc::Sender<()>, Gate)>>> =
+    static HOLDS: LazyLock<Mutex<HashMap<Key, (mpsc::Sender<()>, Gate, Arc<AtomicBool>)>>> =
         LazyLock::new(Mutex::default);
 
     pub(super) fn block(key: &Key) {
@@ -145,7 +149,9 @@ pub(crate) mod held {
             .unwrap_or_else(PoisonError::into_inner)
             .get(key)
             .cloned();
-        if let Some((entered, gate)) = held {
+        if let Some((entered, gate, taken)) =
+            held.filter(|(_, _, taken)| !taken.swap(true, Ordering::SeqCst))
+        {
             let _ = entered.send(());
             let (open, signal) = &*gate;
             let mut open = open.lock().unwrap_or_else(PoisonError::into_inner);
@@ -169,7 +175,7 @@ pub(crate) mod held {
             HOLDS
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
-                .insert(key.clone(), (tx, gate.clone()));
+                .insert(key.clone(), (tx, gate.clone(), Arc::default()));
             Self { key, entered, gate }
         }
 
@@ -281,6 +287,34 @@ mod tests {
         let recovered = load();
         assert!(recovered.cache.health.unreadable_profiles.is_empty());
         assert_eq!(recovered.cache.alias_only_instances.len(), 1);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn repointing_an_alias_is_not_blocked_by_a_hung_worker_for_the_old_target() {
+        let (_home, _external) = with_alias();
+        let hold = Hold::install("hung", "sessions");
+        load();
+        hold.wait_entered();
+
+        let healthy = tempfile::tempdir().unwrap();
+        let link = crate::session::get_profile_dir_path("hung").unwrap();
+        std::fs::remove_file(&link).unwrap();
+        std::os::unix::fs::symlink(healthy.path(), &link).unwrap();
+        Storage::open_unwatched("hung")
+            .unwrap()
+            .update(|rows, _| {
+                rows.push(Instance::new("repointed", "/tmp/repointed"));
+                Ok(())
+            })
+            .unwrap();
+        let repointed = load();
+        assert!(repointed.cache.health.unreadable_profiles.is_empty());
+        assert_eq!(repointed.cache.alias_only_instances.len(), 1);
+        assert_eq!(repointed.cache.alias_only_instances[0].title, "repointed");
+
+        hold.release();
+        wait_idle_for_test("hung");
     }
 
     #[test]
