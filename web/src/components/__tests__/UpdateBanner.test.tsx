@@ -104,6 +104,25 @@ describe("UpdateBanner", () => {
     }
   });
 
+  it("a slower older poll can't restore an offer a newer poll withdrew", async () => {
+    fetchUpdateStatus.mockResolvedValue(makeStatus());
+    render(<Banner />);
+    await screen.findByRole("status");
+
+    const replies: ((s: UpdateStatus) => void)[] = [];
+    fetchUpdateStatus.mockImplementation(() => new Promise((resolve) => replies.push(resolve)));
+    act(() => {
+      document.dispatchEvent(new Event("visibilitychange"));
+      setServerDown(true);
+      setServerDown(false);
+    });
+    expect(replies).toHaveLength(2);
+    await act(async () => replies[1]!(makeStatus({ update_available: false })));
+    await act(async () => replies[0]!(makeStatus()));
+    expect(screen.queryByRole("status")).toBeNull();
+    setServerDown(false);
+  });
+
   it("dismiss hides the banner optimistically and persists via dismissUpdate", async () => {
     fetchUpdateStatus.mockResolvedValue(makeStatus());
     const { container } = render(<Banner />);

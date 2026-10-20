@@ -16,12 +16,15 @@ export function useUpdateBanner(): { status: UpdateStatus; dismiss: () => void }
   useEffect(() => {
     let cancelled = false;
     let timer: ReturnType<typeof setTimeout> | null = null;
+    let latest = 0;
 
+    // Visibility and reconnect can start a poll while one is in flight. Only the newest applies
+    // its answer and schedules the next one, so a slow older reply can't restore a stale offer.
     const poll = async () => {
+      const seq = ++latest;
       const s = await fetchUpdateStatus();
-      if (cancelled) return;
+      if (cancelled || seq !== latest) return;
       if (s) setStatus(s);
-      // Visibility and reconnect can start a poll while one is in flight; keep a single hourly timer.
       if (timer) clearTimeout(timer);
       timer = setTimeout(poll, POLL_MINUTES * 60_000);
     };
