@@ -248,6 +248,34 @@ async fn pick_agent(
 mod tests {
     use super::*;
 
+    /// Shared by the agent switch and the selector picks: names the operation,
+    /// stops the worker, and answers 500.
+    #[tokio::test]
+    async fn persist_failure_names_the_operation_and_stops_the_worker() {
+        let state = crate::server::test_support::build_test_app_state(vec![]);
+        state.acp_supervisor.test_insert_worker("sess").await;
+
+        let resp = persist_failure_response(
+            &state,
+            "sess",
+            "agent switch",
+            &anyhow::anyhow!("disk full"),
+        )
+        .await;
+
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body = String::from_utf8_lossy(&body);
+        assert!(body.contains("persist_failed") && body.contains("agent switch"));
+        assert!(body.contains("disk full") && body.contains("worker was stopped"));
+        assert_eq!(
+            state.acp_supervisor.worker_state("sess").await,
+            crate::daemon::AcpWorkerState::Absent
+        );
+    }
+
     #[tokio::test]
     async fn agent_exited_maps_to_the_retryable_status_not_a_fault() {
         let cases = [

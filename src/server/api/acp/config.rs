@@ -362,6 +362,61 @@ mod tests {
         }
     }
 
+    /// The worker takes the pick, the stored write fails: the caller gets the
+    /// 500, the worker is stopped, and neither the plan-mode tally nor memory
+    /// records the pick.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_failed_pick_write_stops_the_worker_and_reports_it() {
+        let _tmp = isolate_app_dir();
+        let mut inst = crate::session::Instance::new("t", "/tmp");
+        inst.source_profile = "blocked".to_string();
+        inst.agent_model = Some("old-model".to_string());
+        let id = inst.id.clone();
+        crate::server::test_support::block_profile_storage_for_test("blocked");
+        let state = crate::server::test_support::build_test_app_state(vec![inst]);
+        let cmds = state
+            .acp_supervisor
+            .test_insert_worker_cmd_recording(&id)
+            .await;
+
+        let resp = acp_set_config_option(
+            State(state.clone()),
+            Path(id.clone()),
+            Ok(Json(SetConfigOptionRequest {
+                config_id: "model".to_string(),
+                value: "plan".to_string(),
+            })),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert!(String::from_utf8_lossy(&body).contains("persist_failed"));
+        assert!(
+            !cmds.lock().unwrap().is_empty(),
+            "the worker took the pick before the write failed"
+        );
+        assert_eq!(
+            state.acp_supervisor.worker_state(&id).await,
+            crate::daemon::AcpWorkerState::Absent
+        );
+        assert_eq!(
+            state
+                .telemetry_structured
+                .plan_mode_seen
+                .load(std::sync::atomic::Ordering::Relaxed),
+            0
+        );
+        assert_eq!(
+            state.instances.read().await[0].agent_model.as_deref(),
+            Some("old-model")
+        );
+    }
+
     /// An unknown effort is refused before the worker or storage see it. A
     /// known one, or any value with no cached choices, reaches the worker
     /// (absent here, hence 404).
