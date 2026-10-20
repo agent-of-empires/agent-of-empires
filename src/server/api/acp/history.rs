@@ -222,8 +222,40 @@ pub async fn acp_context_primer(
     .into_response()
 }
 
-/// Events read below a `view=rows` page to find the agent message it continues.
-const ROWS_PRIOR_LOOKBACK: usize = 64;
+/// Events read per batch when looking below a `view=rows` page.
+const ROWS_PRIOR_BATCH: usize = 256;
+
+/// The latest event below `before` that says which agent message a page
+/// continues: a chunk with a message id, or a user turn, which resets it.
+/// Walks retained history backward in batches until one is found.
+fn prior_message_marker(
+    store: &crate::acp::event_store::EventStore,
+    session_id: &str,
+    before: u64,
+    batch: usize,
+) -> Option<crate::acp::state::Event> {
+    let mut cursor = before;
+    loop {
+        let page = store.replay_page_before(session_id, cursor, Some(batch));
+        let marker = page.events.iter().rev().find(|(_, event)| {
+            matches!(
+                event,
+                crate::acp::state::Event::AgentMessageChunk {
+                    message_id: Some(_),
+                    ..
+                } | crate::acp::state::Event::UserPromptSent { .. }
+                    | crate::acp::state::Event::UserDiffCommentsPrompt { .. }
+            )
+        });
+        if let Some((_, event)) = marker {
+            return Some(event.clone());
+        }
+        match page.last_scanned_seq {
+            Some(next) if page.has_more && next < cursor => cursor = next,
+            _ => return None,
+        }
+    }
+}
 
 /// Paged transcript replay from the durable event store. `before` pages
 /// backward; `view=rows` returns the page folded into transcript rows with
@@ -257,16 +289,12 @@ pub async fn acp_replay(
     );
     let (frames, rows) = if q.view.as_deref() == Some("rows") {
         let mut model = crate::acp::transcript::TranscriptModel::new();
-        // A page can open mid-turn; the events just below it say which agent
-        // message its first chunk follows.
-        if let Some(lowest) = page.events.first().map(|(seq, _)| *seq) {
-            let prior =
-                state
-                    .acp_event_store
-                    .replay_page_before(&id, lowest, Some(ROWS_PRIOR_LOOKBACK));
-            for (_, event) in &prior.events {
-                model.observe_prior(event);
-            }
+        // A page can open mid-turn, so its first chunk may continue a message
+        // that started below it.
+        if let Some(prior) = page.events.first().and_then(|(lowest, _)| {
+            prior_message_marker(&state.acp_event_store, &id, *lowest, ROWS_PRIOR_BATCH)
+        }) {
+            model.observe_prior(&prior);
         }
         for (seq, event) in &page.events {
             model.apply_event(*seq, event);
@@ -638,49 +666,119 @@ done
     /// events just below the page.
     #[tokio::test]
     async fn acp_replay_view_rows_marks_a_message_that_continues_the_previous_page() {
-        let inst = crate::session::Instance::new("t", "/tmp");
-        let id = inst.id.clone();
-        let state = crate::server::test_support::build_test_app_state(vec![inst]);
         let chunk = |text: &str, message_id: &str| Event::AgentMessageChunk {
             text: text.into(),
             message_id: Some(message_id.into()),
         };
-        let events = [
-            Event::UserPromptSent {
-                text: "status".into(),
-                attachments: Vec::new(),
-                prompt_id: None,
-                synthesized: false,
-                origin_plugin: None,
-            },
-            chunk("for #4656.", "m-a"),
-            chunk("", "m-b"),
-            chunk("The waiter has the lock.", "m-b"),
-        ];
-        for (i, ev) in events.iter().enumerate() {
-            state
-                .acp_event_store
-                .record(&id, i as u64 + 1, ev)
-                .expect("record");
-        }
-        let q = ReplayQuery {
-            since: 2,
-            limit: None,
-            before: None,
-            view: Some("rows".into()),
+        let prompt = || Event::UserPromptSent {
+            text: "status".into(),
+            attachments: Vec::new(),
+            prompt_id: None,
+            synthesized: false,
+            origin_plugin: None,
         };
-        let resp = acp_replay(State(state), Path(id), axum::extract::Query(q))
-            .await
-            .into_response();
-        let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20)
-            .await
-            .unwrap();
-        let rows = serde_json::from_slice::<ReplayResponse>(&bytes)
-            .unwrap()
-            .rows
-            .expect("rows present");
-        let starts: Vec<bool> = rows.iter().map(|r| r.message_start).collect();
-        assert_eq!(starts, [true, false]);
+        // More invisible events between the messages than a fixed lookback
+        // would have read, within the test store's retention.
+        let thoughts = || std::iter::repeat_n(Event::ThinkingStarted, 70);
+        // (events before the page, page events, message_start per page row)
+        let cases: [(Vec<Event>, Vec<Event>, Vec<bool>); 4] = [
+            (
+                vec![prompt(), chunk("for #4656.", "m-a")],
+                vec![chunk("", "m-b"), chunk("The waiter has the lock.", "m-b")],
+                vec![true, false],
+            ),
+            (
+                std::iter::once(prompt())
+                    .chain([chunk("for #4656.", "m-a")])
+                    .chain(thoughts())
+                    .collect(),
+                vec![chunk("", "m-b"), chunk("The waiter has the lock.", "m-b")],
+                vec![true, false],
+            ),
+            (
+                std::iter::once(prompt())
+                    .chain([chunk("Still ", "m-a")])
+                    .chain(thoughts())
+                    .collect(),
+                vec![chunk("going.", "m-a")],
+                vec![false],
+            ),
+            (
+                vec![chunk("earlier turn", "m-a"), prompt()],
+                vec![chunk("", "m-b"), chunk("New turn.", "m-b")],
+                vec![false, false],
+            ),
+        ];
+        for (before, page, expected) in cases {
+            let inst = crate::session::Instance::new("t", "/tmp");
+            let id = inst.id.clone();
+            let state = crate::server::test_support::build_test_app_state(vec![inst]);
+            let since = before.len() as u64;
+            for (i, ev) in before.iter().chain(&page).enumerate() {
+                state
+                    .acp_event_store
+                    .record(&id, i as u64 + 1, ev)
+                    .expect("record");
+            }
+            let q = ReplayQuery {
+                since,
+                limit: None,
+                before: None,
+                view: Some("rows".into()),
+            };
+            let resp = acp_replay(State(state), Path(id), axum::extract::Query(q))
+                .await
+                .into_response();
+            let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20)
+                .await
+                .unwrap();
+            let rows = serde_json::from_slice::<ReplayResponse>(&bytes)
+                .unwrap()
+                .rows
+                .expect("rows present");
+            let starts: Vec<bool> = rows
+                .iter()
+                .filter(|r| r.kind == crate::acp::transcript::TranscriptRowKind::Message)
+                .map(|r| r.message_start)
+                .collect();
+            assert_eq!(starts, expected, "{} events before the page", before.len());
+        }
+    }
+
+    /// The marker search walks back batch by batch past invisible events, and
+    /// stops at a user turn.
+    #[test]
+    fn prior_message_marker_walks_back_through_batches() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = crate::acp::event_store::EventStore::open(&dir.path().join("e.db"), 1000)
+            .expect("event store");
+        let chunk = Event::AgentMessageChunk {
+            text: "A".into(),
+            message_id: Some("m-a".into()),
+        };
+        let prompt = Event::UserPromptSent {
+            text: "go".into(),
+            attachments: Vec::new(),
+            prompt_id: None,
+            synthesized: false,
+            origin_plugin: None,
+        };
+        for (session, head) in [("s-chunk", &chunk), ("s-prompt", &prompt)] {
+            let events =
+                std::iter::once(head).chain(std::iter::repeat_n(&Event::ThinkingStarted, 70));
+            for (i, event) in events.enumerate() {
+                store.record(session, i as u64 + 1, event).expect("record");
+            }
+        }
+        assert!(matches!(
+            prior_message_marker(&store, "s-chunk", 72, 8),
+            Some(Event::AgentMessageChunk { message_id: Some(id), .. }) if id == "m-a"
+        ));
+        assert!(matches!(
+            prior_message_marker(&store, "s-prompt", 72, 8),
+            Some(Event::UserPromptSent { .. })
+        ));
+        assert!(prior_message_marker(&store, "s-none", 72, 8).is_none());
     }
 
     #[tokio::test]
