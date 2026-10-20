@@ -326,7 +326,10 @@ impl PasskeyManager {
         if self.disabled {
             return Err(PasskeyError::Unavailable);
         }
-        let creds = self.store.lock().await.passkeys_for(profile);
+        // Hold the store until the ceremony is inserted, so a finish_login cannot commit and
+        // clear the ceremonies between this counter snapshot and the insert.
+        let store = self.store.lock().await;
+        let creds = store.passkeys_for(profile);
         if creds.is_empty() {
             return Err(PasskeyError::Unavailable);
         }
@@ -356,6 +359,7 @@ impl PasskeyManager {
                 },
             );
         }
+        drop(store);
         let options = serde_json::to_value(challenge)
             .map_err(|e| PasskeyError::Verification(e.to_string()))?;
         Ok((tx, options))
