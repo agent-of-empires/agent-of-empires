@@ -145,6 +145,21 @@ impl TranscriptModel {
         self.last_seq
     }
 
+    /// Note an event that precedes this fold without rendering it, so a chunk
+    /// that opens the fold still knows which message it follows.
+    pub fn observe_prior(&mut self, event: &Event) {
+        match event {
+            Event::AgentMessageChunk {
+                message_id: Some(id),
+                ..
+            } => self.last_message_id = Some(id.clone()),
+            Event::UserPromptSent { .. } | Event::UserDiffCommentsPrompt { .. } => {
+                self.last_message_id = None;
+            }
+            _ => {}
+        }
+    }
+
     /// Apply one event at `seq`, returning the row changes it produced.
     pub fn apply_event(&mut self, seq: u64, event: &Event) -> Vec<TranscriptDelta> {
         if seq <= self.last_seq {
@@ -1402,6 +1417,30 @@ mod tests {
             assert_eq!(got, starts, "{label}");
             let groups: HashSet<_> = messages.iter().map(|r| &r.group_id).collect();
             assert_eq!(groups.len() == 1, one_group, "{label}");
+        }
+    }
+
+    /// A fold that starts after earlier events (a reconnect, a rows page)
+    /// still marks the first chunk of a new message.
+    #[test]
+    fn observed_prior_chunks_carry_the_message_id_into_a_partial_fold() {
+        let chunk = |text: &str, id: &str| Event::AgentMessageChunk {
+            text: text.into(),
+            message_id: Some(id.into()),
+        };
+        for (prior, expected) in [
+            (vec![chunk("x", "m-a")], true),
+            (vec![chunk("x", "m-b")], false),
+            (vec![chunk("x", "m-a"), prompt("next")], false),
+            (vec![], false),
+        ] {
+            let mut m = TranscriptModel::new();
+            for event in &prior {
+                m.observe_prior(event);
+            }
+            m.apply_event(10, &chunk("", "m-b"));
+            assert!(m.rows().len() == 1, "{prior:?}");
+            assert_eq!(m.rows()[0].message_start, expected, "{prior:?}");
         }
     }
 

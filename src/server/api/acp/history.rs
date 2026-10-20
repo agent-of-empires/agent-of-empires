@@ -222,6 +222,9 @@ pub async fn acp_context_primer(
     .into_response()
 }
 
+/// Events read below a `view=rows` page to find the agent message it continues.
+const ROWS_PRIOR_LOOKBACK: usize = 64;
+
 /// Paged transcript replay from the durable event store. `before` pages
 /// backward; `view=rows` returns the page folded into transcript rows with
 /// identical paging metadata.
@@ -254,6 +257,17 @@ pub async fn acp_replay(
     );
     let (frames, rows) = if q.view.as_deref() == Some("rows") {
         let mut model = crate::acp::transcript::TranscriptModel::new();
+        // A page can open mid-turn; the events just below it say which agent
+        // message its first chunk follows.
+        if let Some(lowest) = page.events.first().map(|(seq, _)| *seq) {
+            let prior =
+                state
+                    .acp_event_store
+                    .replay_page_before(&id, lowest, Some(ROWS_PRIOR_LOOKBACK));
+            for (_, event) in &prior.events {
+                model.observe_prior(event);
+            }
+        }
         for (seq, event) in &page.events {
             model.apply_event(*seq, event);
         }
@@ -618,6 +632,55 @@ done
         assert_eq!(status, StatusCode::FORBIDDEN);
         assert_eq!(body["error"], "agent_not_allowed");
         assert!(!ran.exists(), "a denied adapter must not be spawned");
+    }
+
+    /// A rows page that opens on a new agent message marks it, from the
+    /// events just below the page.
+    #[tokio::test]
+    async fn acp_replay_view_rows_marks_a_message_that_continues_the_previous_page() {
+        let inst = crate::session::Instance::new("t", "/tmp");
+        let id = inst.id.clone();
+        let state = crate::server::test_support::build_test_app_state(vec![inst]);
+        let chunk = |text: &str, message_id: &str| Event::AgentMessageChunk {
+            text: text.into(),
+            message_id: Some(message_id.into()),
+        };
+        let events = [
+            Event::UserPromptSent {
+                text: "status".into(),
+                attachments: Vec::new(),
+                prompt_id: None,
+                synthesized: false,
+                origin_plugin: None,
+            },
+            chunk("for #4656.", "m-a"),
+            chunk("", "m-b"),
+            chunk("The waiter has the lock.", "m-b"),
+        ];
+        for (i, ev) in events.iter().enumerate() {
+            state
+                .acp_event_store
+                .record(&id, i as u64 + 1, ev)
+                .expect("record");
+        }
+        let q = ReplayQuery {
+            since: 2,
+            limit: None,
+            before: None,
+            view: Some("rows".into()),
+        };
+        let resp = acp_replay(State(state), Path(id), axum::extract::Query(q))
+            .await
+            .into_response();
+        let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        let rows = serde_json::from_slice::<ReplayResponse>(&bytes)
+            .unwrap()
+            .rows
+            .expect("rows present");
+        let starts: Vec<bool> = rows.iter().map(|r| r.message_start).collect();
+        assert_eq!(starts, [true, false]);
     }
 
     #[tokio::test]

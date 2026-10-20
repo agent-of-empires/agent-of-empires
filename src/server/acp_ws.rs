@@ -398,6 +398,7 @@ fn fold_connect_history(
         let _ = folds.reduced.apply_event(seq, event.clone());
         folds.last_applied_seq = seq;
         if seq <= since {
+            folds.transcript.observe_prior(&event);
             continue;
         }
         folds.transcript.apply_event(seq, &event);
@@ -837,6 +838,7 @@ mod tests {
                     seq,
                     &Event::AgentMessageChunk {
                         text: "output".into(),
+                        message_id: None,
                     },
                 )
                 .unwrap();
@@ -870,6 +872,32 @@ mod tests {
         fold_connect_history(retained, 5, &mut folds);
         assert_eq!(folds.reduced.session_notices[0].id, "notice-5");
     }
+
+    /// A reconnect between two agent messages still marks the new one, since
+    /// the skipped history says which message the client already holds.
+    #[test]
+    fn reconnect_fold_marks_a_message_that_follows_the_cursor() {
+        let chunk = |text: &str, id: &str| Event::AgentMessageChunk {
+            text: text.into(),
+            message_id: Some(id.into()),
+        };
+        let history = vec![(1, chunk("for #4656.", "m-a")), (2, chunk("", "m-b"))];
+        let mut reduced =
+            AcpState::new(AcpSessionId("s-1".into()), AgentName("claude".into()), None);
+        let mut transcript = TranscriptModel::new();
+        let mut cold = ColdFieldCache::default();
+        let mut folds = ConnectionFolds {
+            reduced: &mut reduced,
+            transcript: &mut transcript,
+            cold: &mut cold,
+            last_applied_seq: 0,
+        };
+        fold_connect_history(history, 1, &mut folds);
+        let rows = folds.transcript.rows();
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].message_start);
+    }
+
     /// Prompt dispatch (Tier 3) reads the daemon's own control state through
     /// `fold_control_state`, so the whole decision is only as good as this fold.
     #[tokio::test]
