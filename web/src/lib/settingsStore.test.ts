@@ -22,6 +22,14 @@ const pluginSettings = (list: string[]) => ({ plugins: { x: { settings: { list }
 const pluginList = (hook: { result: { current: SettingsView } }) =>
   (hook.result.current.settings?.plugins as { x: { settings: { list: string[] } } } | undefined)?.x.settings.list;
 
+async function seedPluginProfile(profile: string, list: string[]) {
+  vi.mocked(fetchSettings).mockResolvedValueOnce(pluginSettings(list));
+  loadSettings(profile);
+  const hook = renderHook(() => useProfileSettings(profile));
+  await waitFor(() => expect(pluginList(hook)).toEqual(list));
+  return hook;
+}
+
 beforeEach(() => {
   resetSettingsStore();
   // Unscripted fetches (a retry after the test is over) hang instead of resolving to undefined.
@@ -378,6 +386,44 @@ describe("settings store", () => {
     expect(pluginList(b)).toEqual(["c"]);
     await act(async () => heldA.resolve("committed"));
     await waitFor(() => expect(pluginList(b)).toEqual(["c"]));
+  });
+
+  it("settles overlapping rejected global edits back to the server value, one mirror at a time", async () => {
+    const b = await seedPluginProfile("B", ["a", "b", "c"]);
+    await seedPluginProfile("A", ["a", "b", "c"]);
+    vi.mocked(fetchSettings).mockResolvedValue(pluginSettings(["a", "b", "c"]));
+    const first = deferred<SaveOutcome>();
+    const second = deferred<SaveOutcome>();
+    await act(async () => {
+      void saveField("A", "plugin:x", "list", ["b", "c"], () => first.promise);
+      void saveField("A", "plugin:x", "list", ["c"], () => second.promise);
+    });
+    expect(pluginList(b)).toEqual(["c"]);
+
+    // The first rejection does not own B's mirror any more, so the second edit still shows.
+    await act(async () => first.resolve("rejected"));
+    await waitFor(() => expect(fetchSettings).toHaveBeenCalledTimes(3));
+    expect(pluginList(b)).toEqual(["c"]);
+
+    await act(async () => second.resolve("rejected"));
+    await waitFor(() => expect(pluginList(b)).toEqual(["a", "b", "c"]));
+  });
+
+  it("keeps a newer origin's same-value mirror when an older origin's edit is rejected", async () => {
+    const b = await seedPluginProfile("B", ["a", "b"]);
+    await seedPluginProfile("A", ["a", "b"]);
+    await seedPluginProfile("C", ["a", "b"]);
+    vi.mocked(fetchSettings).mockResolvedValue(pluginSettings(["a", "b"]));
+    const older = deferred<SaveOutcome>();
+    const newer = deferred<SaveOutcome>();
+    await act(async () => {
+      void saveField("A", "plugin:x", "list", ["b"], () => older.promise);
+      void saveField("C", "plugin:x", "list", ["b"], () => newer.promise);
+    });
+
+    await act(async () => older.resolve("rejected"));
+    await waitFor(() => expect(fetchSettings.mock.calls.length).toBeGreaterThan(3));
+    expect(pluginList(b)).toEqual(["b"]);
   });
 
   it("drops a GET already in flight for a profile when another profile's global edit is mirrored", async () => {

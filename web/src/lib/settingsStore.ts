@@ -19,6 +19,8 @@ interface Unconfirmed {
   value: unknown;
   send: () => Promise<SaveOutcome>;
   attempts: number;
+  /** Called once a fetch shows the edit saved, for a caller whose own confirmation came up empty. */
+  onConfirmed?: () => void;
 }
 
 /** Resends of an unconfirmed edit before it is left unresolved, still on screen, for the user to settle. */
@@ -118,48 +120,31 @@ export function useProfileSettings(profile: string): SettingsView {
  * Plugin values are global, so an edit made under one profile is written into the other cached
  * profiles too. Bumping their `gen` makes a GET already in flight, even a first one with no
  * snapshot to mirror into, retry instead of landing a value that predates the edit, and the
- * edit is laid over any GET that still lands while the save is out. `settle` refetches them
- * once the save has an outcome, so none keeps an edit the server may not have kept; `undo`
- * reverts a mirror the target has not edited since.
+ * edit is laid over any GET that still lands while the save is out. The returned function runs
+ * once the save has an outcome: it releases only this edit's mirror and refetches, so a profile
+ * returns to the server's value plus whatever other mirrors are still pending.
  */
-function mirrorPluginField(origin: Entry, section: string, field: string, value: unknown) {
+function mirrorPluginField(origin: Entry, section: string, field: string, value: unknown): () => void {
   const key = `${section}\0${field}`;
   const global = section.startsWith(PLUGIN_PREFIX);
-  const mirrored = new Map<Entry, { prior: unknown; fieldGen?: number }>();
   const token = {};
-  const release = (other: Entry) => {
-    if (other.mirrors.get(key)?.token === token) other.mirrors.delete(key);
-  };
   if (global) {
     for (const other of entries.values()) {
       if (other === origin) continue;
       other.gen++;
       other.mirrors.set(key, { section, field, value, token });
-      const current = other.view.settings;
-      if (!current) continue;
-      mirrored.set(other, { prior: readField(current, section, field), fieldGen: other.fieldGen.get(key) });
-      publish(other, { settings: writeField(current, section, field, value) });
+      if (other.view.settings) publish(other, { settings: writeField(other.view.settings, section, field, value) });
     }
   }
-  return {
-    settle: () => {
-      if (!global) return;
-      for (const [profile, other] of entries) {
-        if (other === origin) continue;
-        release(other);
-        other.gen++;
-        if (other.loadSeq > 0 && other.pending === 0) void loadSettings(profile);
-      }
-    },
-    undo: () => {
-      for (const other of entries.values()) release(other);
-      for (const [other, { prior, fieldGen }] of mirrored) {
-        const current = other.view.settings;
-        if (current && other.fieldGen.get(key) === fieldGen && same(readField(current, section, field), value)) {
-          publish(other, { settings: writeField(current, section, field, prior) });
-        }
-      }
-    },
+  return () => {
+    if (!global) return;
+    for (const [profile, other] of entries) {
+      if (other === origin) continue;
+      if (other.mirrors.get(key)?.token === token) other.mirrors.delete(key);
+      other.gen++;
+      other.needsReconcile = true;
+      if (other.loadSeq > 0 && other.pending === 0) void loadSettings(profile);
+    }
   };
 }
 
@@ -179,6 +164,7 @@ function settle(e: Entry, fetched: Settings): { settings: Settings; resend: Unco
   for (const [key, u] of e.unconfirmed) {
     if (same(readField(fetched, u.section, u.field), u.value)) {
       e.unconfirmed.delete(key);
+      u.onConfirmed?.();
       continue;
     }
     settings = writeField(settings, u.section, u.field, u.value);
@@ -223,7 +209,7 @@ export function loadSettings(profile: string): Promise<boolean> {
             ? null
             : e.view.error;
       publish(e, { settings, error });
-      for (const u of resend) void saveField(profile, u.section, u.field, u.value, u.send, u.attempts);
+      for (const u of resend) void saveField(profile, u.section, u.field, u.value, u.send, u.attempts, u.onConfirmed);
       return true;
     })
     .catch(() => {
@@ -246,6 +232,7 @@ export async function saveField(
   value: unknown,
   send: () => Promise<SaveOutcome>,
   attempts = 0,
+  onConfirmed?: () => void,
 ): Promise<boolean> {
   const e = entry(profile);
   const base = e.view.settings;
@@ -261,18 +248,17 @@ export async function saveField(
     error: e.unconfirmed.size > 0 ? e.view.error : null,
     settings: base && writeField(base, section, field, value),
   });
-  const mirror = mirrorPluginField(e, section, field, value);
+  const settleMirror = mirrorPluginField(e, section, field, value);
   const request = e.tail.then(send);
   e.tail = request.catch(() => undefined);
   const outcome = await request.catch((): SaveOutcome => "uncertain");
   e.gen++;
   e.pending--;
   if (outcome !== "committed") e.needsReconcile = true;
-  if (outcome === "rejected") mirror.undo();
-  else mirror.settle();
+  settleMirror();
   // A newer edit of the same field supersedes this one, so only the latest keeps its intent.
   if (outcome === "uncertain" && e.fieldGen.get(key) === fieldGen) {
-    e.unconfirmed.set(key, { section, field, value, send, attempts: attempts + 1 });
+    e.unconfirmed.set(key, { section, field, value, send, attempts: attempts + 1, onConfirmed });
   }
   const error =
     outcome === "rejected"
