@@ -787,32 +787,14 @@ pub fn build_instance(
                 parent,
                 child_session_id,
                 unattributed_parent_agent,
-            } => {
-                // Only an unattributed parent needs this: the launch
-                // identity-checks a qualified one itself. The parent's
-                // capability came from its own row's agent, so the child must
-                // actually launch that same agent.
-                if let Some(parent_agent) = unattributed_parent_agent.as_deref() {
-                    let launched = Instance::execution_agent_for(
-                        &instance.tool,
-                        instance.get_tool_command(),
-                        &config.session,
-                    )
-                    .map_err(anyhow::Error::msg)?;
-                    crate::session::fork::ensure_child_matches_parent_agent(
-                        Some(parent_agent),
-                        launched.name,
-                    )
-                    .map_err(anyhow::Error::msg)?;
-                }
-                instance.agent_session_id = Some(child_session_id);
-                instance.resume_intent = crate::session::ResumeIntent::Fork {
-                    from: parent.session_id.clone(),
-                };
-                instance.resume_binding = Some(*parent);
-                instance.source_profile = profile.to_string();
-                crate::session::conversation_carry::carry_fork_parent(&mut instance)?;
-            }
+            } => crate::session::fork::apply_terminal_fork_seed(
+                &mut instance,
+                &config.session,
+                profile,
+                *parent,
+                child_session_id,
+                unattributed_parent_agent.as_deref(),
+            )?,
             crate::session::ForkSeed::Structured {
                 parent_acp_session_id,
             } => {

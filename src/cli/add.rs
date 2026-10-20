@@ -738,29 +738,14 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
                 parent,
                 child_session_id,
                 unattributed_parent_agent,
-            } => {
-                // Only an unattributed parent needs this: the launch
-                // identity-checks a qualified one itself, and this path builds
-                // the child itself, so nothing else would hold it.
-                if let Some(parent_agent) = unattributed_parent_agent.as_deref() {
-                    let launched = crate::session::Instance::execution_agent_for(
-                        &instance.tool,
-                        instance.get_tool_command(),
-                        &config.session,
-                    )
-                    .map_err(anyhow::Error::msg)?;
-                    crate::session::fork::ensure_child_matches_parent_agent(
-                        Some(parent_agent),
-                        launched.name,
-                    )
-                    .map_err(anyhow::Error::msg)?;
-                }
-                instance.agent_session_id = Some(child_session_id);
-                instance.resume_intent = crate::session::ResumeIntent::Fork {
-                    from: parent.session_id.clone(),
-                };
-                instance.resume_binding = Some(*parent);
-            }
+            } => crate::session::fork::apply_terminal_fork_seed(
+                &mut instance,
+                &config.session,
+                profile,
+                *parent,
+                child_session_id,
+                unattributed_parent_agent.as_deref(),
+            )?,
             crate::session::ForkSeed::Structured { .. } => {}
         }
     }
@@ -2012,6 +1997,100 @@ mod tests {
             assert!(
                 msg.contains("codex") && msg.contains("claude"),
                 "the refusal must name both agents, got: {msg}"
+            );
+        }
+
+        /// `aoe add --fork-from --tool <account>` is the #4347 workflow: the
+        /// child's own store must receive the parent's transcript and be the
+        /// one its binding records.
+        #[tokio::test]
+        #[serial]
+        async fn add_fork_carries_the_parent_onto_the_childs_store() {
+            let root = tempfile::tempdir().unwrap();
+            let _guard = crate::session::test_support::isolate_app_dir_at(root.path());
+            let _claude = crate::session::test_support::install_login_shell_path_command(
+                root.path(),
+                "claude",
+                "#!/bin/sh\nexit 1\n",
+            );
+            let home = dirs::home_dir().unwrap();
+            let project = tempfile::tempdir().unwrap();
+            let source = home.join("source");
+            let sid = "11111111-2222-3333-4444-555555555555";
+            let transcript = std::path::Path::new("projects")
+                .join(crate::session::capture::encode_claude_project_path(
+                    &project.path().to_string_lossy(),
+                ))
+                .join(format!("{sid}.jsonl"));
+            std::fs::create_dir_all(source.join(transcript.parent().unwrap())).unwrap();
+            std::fs::write(source.join(&transcript), "parent conversation\n").unwrap();
+            let storage = crate::session::Storage::new_unwatched("real").unwrap();
+            std::fs::write(
+                crate::session::get_profile_dir("real")
+                    .unwrap()
+                    .join("config.toml"),
+                "[session.custom_agents]\nclaude-b = \"claude\"\n\
+                 [session.agent_detect_as]\nclaude-b = \"claude\"\n\
+                 [session.agent_config_dir]\nclaude-b = \"~/destination\"\n",
+            )
+            .unwrap();
+            let parent_id = "parent-session-uuid";
+            storage
+                .update(|rows, _| {
+                    let mut parent =
+                        crate::session::Instance::new("parent", project.path().to_str().unwrap());
+                    parent.id = parent_id.to_string();
+                    parent.tool = "claude".into();
+                    parent.command = "claude".into();
+                    parent.agent_session_id = Some(sid.into());
+                    parent.agent_session_binding = Some(crate::session::ConversationBinding {
+                        session_id: sid.into(),
+                        provenance: crate::session::ConversationProvenance::Observed,
+                        transcript_path: None,
+                        execution: Some(crate::session::ExecutionBinding {
+                            agent: "claude".into(),
+                            stores: vec![source.clone()],
+                            configuration: Vec::new(),
+                            cwd: project.path().to_path_buf(),
+                            cwd_filesystem: "host".into(),
+                            filesystem: "host".into(),
+                            exported_default_store: None,
+                        }),
+                    });
+                    *rows = vec![parent];
+                    Ok(())
+                })
+                .unwrap();
+
+            let (profile, args) = dispatch_argv(&[
+                "aoe",
+                "add",
+                project.path().to_str().unwrap(),
+                "--fork-from",
+                parent_id,
+                "--tool",
+                "claude-b",
+                "-p",
+                "real",
+            ]);
+            super::super::run(&profile, args).await.unwrap();
+
+            let destination = home.join("destination");
+            assert_eq!(
+                std::fs::read_to_string(destination.join(&transcript)).unwrap(),
+                "parent conversation\n"
+            );
+            let rows = storage.load().unwrap();
+            let child = rows.iter().find(|row| row.tool == "claude-b").unwrap();
+            assert_eq!(
+                child
+                    .resume_binding
+                    .clone()
+                    .unwrap()
+                    .execution
+                    .unwrap()
+                    .stores,
+                vec![destination.canonicalize().unwrap()]
             );
         }
 

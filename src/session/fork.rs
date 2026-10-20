@@ -237,6 +237,38 @@ pub fn ensure_child_matches_parent_agent(
     ))
 }
 
+/// Apply a terminal fork seed to the freshly built child row, for every entry
+/// point that builds one. `profile` is the one the child is built for: the
+/// carry resolves the child's store under it.
+pub(crate) fn apply_terminal_fork_seed(
+    instance: &mut crate::session::Instance,
+    session: &crate::session::config::SessionConfig,
+    profile: &str,
+    parent: crate::session::ConversationBinding,
+    child_session_id: String,
+    unattributed_parent_agent: Option<&str>,
+) -> anyhow::Result<()> {
+    // Only an unattributed parent needs this: the launch identity-checks a
+    // qualified one itself. The parent's capability came from its own row's
+    // agent, so the child must actually launch that same agent.
+    if let Some(parent_agent) = unattributed_parent_agent {
+        let launched = crate::session::Instance::execution_agent_for(
+            &instance.tool,
+            instance.get_tool_command(),
+            session,
+        )?;
+        ensure_child_matches_parent_agent(Some(parent_agent), launched.name)
+            .map_err(anyhow::Error::msg)?;
+    }
+    instance.agent_session_id = Some(child_session_id);
+    instance.resume_intent = crate::session::ResumeIntent::Fork {
+        from: parent.session_id.clone(),
+    };
+    instance.resume_binding = Some(parent);
+    instance.source_profile = profile.to_string();
+    crate::session::conversation_carry::carry_fork_parent(instance)
+}
+
 /// Decide whether a terminal session can be forked, and produce its one-shot seed.
 /// `sandboxed` is whether the parent row runs in a sandbox.
 pub fn terminal_fork_seed(
