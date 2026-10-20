@@ -3881,7 +3881,8 @@
       "components": [
         "web/src/components/settings/SchemaSection.tsx",
         "web/src/components/SettingsView.tsx",
-        "web/src/hooks/useResolvedTheme.ts"
+        "web/src/hooks/useResolvedTheme.ts",
+        "web/src/lib/confirmThemeWrite.ts"
       ]
     },
     {
@@ -4674,7 +4675,11 @@
       "kind": "vitest",
       "risk": "low",
       "specs": ["src/components/onboarding/__tests__/ThemeIntro.test.tsx", "src/lib/__tests__/onboarding.test.ts"],
-      "components": ["web/src/components/onboarding/ThemeIntro.tsx", "web/src/hooks/useThemeMutation.ts"]
+      "components": [
+        "web/src/components/onboarding/ThemeIntro.tsx",
+        "web/src/hooks/useThemeMutation.ts",
+        "web/src/lib/confirmThemeWrite.ts"
+      ]
     },
     {
       "id": "shortcuts.single-source",
