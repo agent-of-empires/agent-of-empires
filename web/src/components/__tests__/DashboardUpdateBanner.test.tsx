@@ -4,6 +4,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { act, render, screen } from "@testing-library/react";
 
 import { DashboardUpdateBanner } from "../DashboardUpdateBanner";
+import { useDashboardUpdate } from "../../hooks/useDashboardUpdate";
 import * as api from "../../lib/api";
 import type { ServerAbout } from "../../lib/api";
 
@@ -45,17 +46,21 @@ afterEach(() => {
   vi.restoreAllMocks();
 });
 
+function Banner() {
+  return useDashboardUpdate() ? <DashboardUpdateBanner /> : null;
+}
+
 describe("DashboardUpdateBanner", () => {
   it("shows the reload prompt when the server's bundle differs", async () => {
     vi.spyOn(api, "fetchAbout").mockResolvedValue(aboutWith("index-NewerBuild.js"));
-    render(<DashboardUpdateBanner />);
+    render(<Banner />);
     expect(await screen.findByRole("status", { name: "Dashboard update available" })).toBeDefined();
     expect(screen.getByRole("button", { name: "Reload now" })).toBeDefined();
   });
 
   it("renders nothing when the server does not report a build id (older binary)", async () => {
     vi.spyOn(api, "fetchAbout").mockResolvedValue(aboutWith(null));
-    const { container } = render(<DashboardUpdateBanner />);
+    const { container } = render(<Banner />);
     await act(async () => {});
     expect(container.firstChild).toBeNull();
   });
@@ -65,7 +70,7 @@ describe("DashboardUpdateBanner", () => {
       .spyOn(api, "fetchAbout")
       .mockResolvedValueOnce(aboutWith("index-PageBuild.js"))
       .mockResolvedValue(aboutWith("index-NewerBuild.js"));
-    render(<DashboardUpdateBanner />);
+    render(<Banner />);
     await act(async () => {});
     expect(screen.queryByRole("status")).toBeNull();
 

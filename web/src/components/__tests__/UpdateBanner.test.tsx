@@ -1,10 +1,12 @@
 // @vitest-environment jsdom
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 
 import { UpdateBanner } from "../UpdateBanner";
+import { useUpdateBanner } from "../../hooks/useUpdateBanner";
 import type { UpdateStatus } from "../../lib/api";
+import { setServerDown } from "../../lib/connectionState";
 
 const fetchUpdateStatus = vi.fn();
 const dismissUpdate = vi.fn();
@@ -37,10 +39,15 @@ afterEach(() => {
   cleanup();
 });
 
+function Banner() {
+  const update = useUpdateBanner();
+  return update && <UpdateBanner status={update.status} onDismiss={update.dismiss} />;
+}
+
 describe("UpdateBanner", () => {
   it("renders the banner with both versions and the release link only when a URL is set", async () => {
     fetchUpdateStatus.mockResolvedValue(makeStatus());
-    render(<UpdateBanner />);
+    render(<Banner />);
 
     const banner = await screen.findByRole("status");
     expect(banner.getAttribute("aria-label")).toBe("Update available: v1.1.0");
@@ -51,14 +58,14 @@ describe("UpdateBanner", () => {
     cleanup();
 
     fetchUpdateStatus.mockResolvedValue(makeStatus({ release_url: null }));
-    render(<UpdateBanner />);
+    render(<Banner />);
     await screen.findByRole("status");
     expect(screen.queryByText("Release notes")).toBeNull();
   });
 
   it("renders nothing before the first poll resolves", () => {
     fetchUpdateStatus.mockReturnValue(new Promise(() => {}));
-    const { container } = render(<UpdateBanner />);
+    const { container } = render(<Banner />);
     expect(container.firstChild).toBeNull();
   });
 
@@ -70,14 +77,36 @@ describe("UpdateBanner", () => {
     ["the version was already dismissed server-side", { dismissed_version: "1.1.0" }],
   ] as [string, Partial<UpdateStatus>][])("renders nothing when %s", async (_name, overrides) => {
     fetchUpdateStatus.mockResolvedValue(makeStatus(overrides));
-    const { container } = render(<UpdateBanner />);
+    const { container } = render(<Banner />);
     await waitFor(() => expect(fetchUpdateStatus).toHaveBeenCalled());
     expect(container.querySelector('[role="status"]')).toBeNull();
   });
 
+  it("overlapping polls leave a single hourly re-poll", async () => {
+    vi.useFakeTimers();
+    try {
+      fetchUpdateStatus.mockResolvedValue(makeStatus());
+      render(<Banner />);
+      await act(() => vi.advanceTimersByTimeAsync(0));
+      // A reconnect and a visibility flip both start a poll before either resolves.
+      act(() => {
+        setServerDown(true);
+        setServerDown(false);
+        document.dispatchEvent(new Event("visibilitychange"));
+      });
+      await act(() => vi.advanceTimersByTimeAsync(0));
+      const before = fetchUpdateStatus.mock.calls.length;
+      await act(() => vi.advanceTimersByTimeAsync(60 * 60_000));
+      expect(fetchUpdateStatus.mock.calls.length - before).toBe(1);
+    } finally {
+      vi.useRealTimers();
+      setServerDown(false);
+    }
+  });
+
   it("dismiss hides the banner optimistically and persists via dismissUpdate", async () => {
     fetchUpdateStatus.mockResolvedValue(makeStatus());
-    const { container } = render(<UpdateBanner />);
+    const { container } = render(<Banner />);
 
     await screen.findByRole("status");
     fireEvent.click(screen.getByLabelText("Dismiss update notice"));

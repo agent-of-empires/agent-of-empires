@@ -171,11 +171,8 @@ import { TipsModal } from "./components/TipsModal";
 import { useTips, shouldAutoPopTips } from "./hooks/useTips";
 import { CommandPalette } from "./components/command-palette/CommandPalette";
 import { useConversationSearch } from "./hooks/useConversationSearch";
-import { DisconnectBanner } from "./components/DisconnectBanner";
+import { BannerStack } from "./components/BannerStack";
 import { ElevationPrompt } from "./components/ElevationPrompt";
-import { UpdateBanner } from "./components/UpdateBanner";
-import { DashboardUpdateBanner } from "./components/DashboardUpdateBanner";
-import { PushHealthBanner } from "./components/PushHealthBanner";
 
 // Pre-#1832 per-browser tour-seen flag. Read once on load to migrate users who
 // already dismissed the tour to the backend; no longer written.
@@ -2413,10 +2410,7 @@ function AppContent({
           />
         </CollapsibleRegion>
 
-        <DisconnectBanner />
-        <UpdateBanner />
-        <DashboardUpdateBanner />
-        <PushHealthBanner />
+        <BannerStack />
 
         {/* Below the banners, not directly under the bar: the handle is
             absolutely positioned at the top-right, and hanging it off the bar
