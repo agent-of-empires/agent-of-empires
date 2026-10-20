@@ -27,11 +27,13 @@ impl Drop for KillSession<'_> {
 #[test]
 #[serial]
 fn send_keys_keeps_a_trailing_semicolon() {
+    let mut _env = agent_of_empires::server::test_support::RuntimeEnvGuard::read_lock();
     if Command::new("tmux").arg("-V").output().is_err() {
         eprintln!("skipping: tmux not on PATH");
         return;
     }
-    let home = crate::common::setup_temp_home();
+    let home = tempfile::tempdir().expect("owned home");
+    _env.bind(home.path());
     let socket = tmux_socket();
     let name = format!("{}send_keys_semicolon", tmux::SESSION_PREFIX);
     let _cleanup = KillSession {
@@ -43,7 +45,7 @@ fn send_keys_keeps_a_trailing_semicolon() {
         .create(
             home.path().to_str().expect("temporary HOME is UTF-8"),
             Some("cat -v"),
-            "default",
+            "main",
         )
         .expect("create managed cat session");
     let target = format!("{name}:^.0");

@@ -1300,8 +1300,12 @@ mod tests {
             crate::session::sync::drain_and_persist_session_ids(instances, &file_watch).touched()
         };
         let forkable = |row: &Instance| {
-            crate::session::fork::terminal_fork_seed(row.fork_parent_ref().unwrap(), "child".into())
-                .is_ok()
+            crate::session::fork::terminal_fork_seed(
+                row.fork_parent_ref().unwrap(),
+                "child".into(),
+                row.is_sandboxed(),
+            )
+            .is_ok()
         };
 
         assert!(
@@ -1399,6 +1403,49 @@ mod tests {
             matches!(capture.unwrap(), Some(super::CaptureContext::Hooks(_))),
             "a host Codex launch must capture through its pane hook"
         );
+    }
+
+    /// A ChatGPT login is refused for managed execution, and the refusal names why.
+    #[test]
+    #[serial_test::serial]
+    fn codex_host_execution_refuses_chatgpt_login_with_its_reason() {
+        if crate::process::HAS_CODEX_MANAGED_PREFERENCES {
+            return;
+        }
+        let (_guard, _base, _tmp) = crate::hooks::test_support::BaseGuard::ready();
+        let temp = tempfile::tempdir().unwrap();
+        let _app = crate::session::test_support::isolate_app_dir_at(temp.path());
+        let codex_home = temp.path().join("codex-home");
+        std::fs::create_dir_all(&codex_home).unwrap();
+        let _codex = crate::session::test_support::install_login_shell_path_command(
+            temp.path(),
+            "codex",
+            "#!/bin/sh\nexit 0\n",
+        )
+        .and_set("CODEX_HOME", &codex_home);
+        let mut inst = Instance::new("codex-chatgpt", "/tmp");
+        inst.tool = "codex".to_string();
+
+        std::fs::write(
+            codex_home.join("auth.json"),
+            r#"{"auth_mode":"chatgpt","tokens":{"access_token":"t"}}"#,
+        )
+        .unwrap();
+        let error = format!("{:#}", inst.resolve_native_execution(None).err().unwrap());
+        assert!(
+            error.contains("ChatGPT login")
+                && error.contains("cannot be attested")
+                && error.contains("cloud-managed requirements")
+                && error.contains("OPENAI_API_KEY"),
+            "{error}"
+        );
+
+        std::fs::write(
+            codex_home.join("auth.json"),
+            r#"{"OPENAI_API_KEY":"sk-test"}"#,
+        )
+        .unwrap();
+        assert!(inst.resolve_native_execution(None).is_ok());
     }
 
     /// The restart that follows a `cx bind` relaunches the pane with whatever id the launch

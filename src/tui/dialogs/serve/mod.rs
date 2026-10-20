@@ -107,7 +107,12 @@ enum ServeViewState {
         opened_at: Instant,
         log_offset: u64,
     },
-    Error(String),
+    /// What failed, kept so a Tunnel failure can offer the other provider.
+    Error {
+        message: String,
+        mode: ServeMode,
+        transport: Option<TunnelTransport>,
+    },
 }
 
 impl ServeViewState {
@@ -125,6 +130,30 @@ impl ServeViewState {
             selected,
             tunnel_available,
             local_available,
+            flash: None,
+        }
+    }
+
+    /// The provider screen after a Tunnel failure: the provider that did not just fail is
+    /// preselected when it is ready.
+    fn provider_retry(
+        failed: Option<TunnelTransport>,
+        tailscale: TransportStatus,
+        cloudflare: TransportStatus,
+    ) -> Self {
+        let other = match failed {
+            Some(TunnelTransport::Tailscale) => Some((TunnelTransport::Cloudflare, cloudflare)),
+            Some(TunnelTransport::Cloudflare) => Some((TunnelTransport::Tailscale, tailscale)),
+            None => None,
+        };
+        let selected = match other {
+            Some((transport, TransportStatus::Ready)) => transport,
+            _ => default_transport(tailscale, cloudflare),
+        };
+        ServeViewState::Confirm {
+            selected,
+            tailscale,
+            cloudflare,
             flash: None,
         }
     }
@@ -353,6 +382,24 @@ fn is_funnel_link(url: &str) -> bool {
     link_host(url).is_some_and(|host| host.ends_with(".ts.net"))
 }
 
+fn stop_failed(e: &str) -> String {
+    format!("Stop failed: {e}. Daemon may still be running; retry or use `aoe serve --stop` from a shell.")
+}
+
+/// `tailscale funnel reset` only helps a Tunnel that went through Funnel; a reattached
+/// daemon's transport is unknown, so its message decides.
+fn funnel_reset_applies(
+    message: &str,
+    mode: ServeMode,
+    transport: Option<TunnelTransport>,
+) -> bool {
+    mode == ServeMode::Tunnel
+        && transport.map_or_else(
+            || error_mentions_tailscale(message),
+            |t| t == TunnelTransport::Tailscale,
+        )
+}
+
 /// A destructive action awaiting a second press of its key.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PendingConfirm {
@@ -449,7 +496,7 @@ impl ServeView {
                 _ => ServeAction::Continue,
             },
             ServeViewState::Active { .. } => self.active_key(key.code),
-            ServeViewState::Error(_) => self.error_key(key.code),
+            ServeViewState::Error { .. } => self.error_key(key.code),
         }
     }
 
@@ -610,7 +657,11 @@ impl ServeView {
                     log_offset,
                 }
             }
-            Err(e) => ServeViewState::Error(e),
+            Err(message) => ServeViewState::Error {
+                message,
+                mode,
+                transport,
+            },
         };
     }
 
@@ -641,9 +692,11 @@ impl ServeView {
             KeyCode::Char('s' | 'S') => match stop_daemon() {
                 Ok(()) => self.state = ServeViewState::mode_picker(),
                 Err(e) => {
-                    self.state = ServeViewState::Error(format!(
-                        "Stop failed: {e}. Daemon may still be running; retry or use `aoe serve --stop` from a shell."
-                    ))
+                    self.state = ServeViewState::Error {
+                        message: stop_failed(&e),
+                        mode,
+                        transport,
+                    }
                 }
             },
             KeyCode::Char('g' | 'G') if mode == ServeMode::Tunnel => {
@@ -683,27 +736,54 @@ impl ServeView {
     }
 
     fn error_key(&mut self, code: KeyCode) -> ServeAction {
-        let ServeViewState::Error(msg) = &self.state else {
+        let ServeViewState::Error {
+            message,
+            mode,
+            transport,
+        } = &self.state
+        else {
             return ServeAction::Continue;
         };
+        let (mode, transport) = (*mode, *transport);
         match code {
             // Best effort: no daemon left running is the goal either way.
             KeyCode::Char('s' | 'S') => {
                 let _ = stop_daemon();
                 ServeAction::Close
             }
+            KeyCode::Char('p' | 'P') if mode == ServeMode::Tunnel => {
+                // Like S: a daemon left running must not outlive the retry.
+                if crate::cli::serve::daemon_pid().is_some() {
+                    if let Err(e) = stop_daemon() {
+                        self.state = ServeViewState::Error {
+                            message: stop_failed(&e),
+                            mode,
+                            transport,
+                        };
+                        return ServeAction::Continue;
+                    }
+                }
+                let (tailscale, cloudflare) = assess_transports();
+                self.state = ServeViewState::provider_retry(transport, tailscale, cloudflare);
+                ServeAction::Continue
+            }
             // Clears a stale funnel config blocking port 443; safe when none exists.
-            KeyCode::Char('r' | 'R') if error_mentions_tailscale(msg) => {
-                self.state = ServeViewState::Error(match run_tailscale_funnel_reset() {
+            KeyCode::Char('r' | 'R') if funnel_reset_applies(message, mode, transport) => {
+                let message = match run_tailscale_funnel_reset() {
                     Ok(()) => "Ran `tailscale funnel reset`. The existing funnel \
                          config (if any) has been cleared.\n\n\
-                         Close this dialog and press R to retry."
+                         Press P to pick a provider and start again."
                         .to_string(),
                     Err(e) => format!(
                         "`tailscale funnel reset` failed: {e}\n\n\
-                         Try running it manually from a shell, then retry."
+                         Try running it manually from a shell, then press P to start again."
                     ),
-                });
+                };
+                self.state = ServeViewState::Error {
+                    message,
+                    mode,
+                    transport,
+                };
                 ServeAction::Continue
             }
             KeyCode::Esc | KeyCode::Enter | KeyCode::Char(' ' | 'q') => ServeAction::Close,
@@ -729,7 +809,11 @@ impl ServeView {
                 std::thread::sleep(Duration::from_millis(200));
                 ServeViewState::running(mode, transport, passphrase, log_offset)
             }
-            Err(e) => ServeViewState::Error(format!("Restart failed: {}", e)),
+            Err(e) => ServeViewState::Error {
+                message: format!("Restart failed: {}", e),
+                mode,
+                transport,
+            },
         };
     }
 
@@ -776,8 +860,11 @@ impl ServeView {
                         }
                     };
                     let hint = diagnose_daemon_exit(&tail.join("\n"), mode);
-                    self.state =
-                        ServeViewState::Error(format!("{prefix}{hint}{}", last_log_lines(&tail)));
+                    self.state = ServeViewState::Error {
+                        message: format!("{prefix}{hint}{}", last_log_lines(&tail)),
+                        mode,
+                        transport: *transport,
+                    };
                     return true;
                 }
                 if mode == ServeMode::Tunnel
@@ -792,7 +879,7 @@ impl ServeView {
                             e
                         ),
                     };
-                    self.state = ServeViewState::Error(format!(
+                    let message = format!(
                         "HTTPS tunnel did not announce a URL within {}s. \
                          {}\n\n\
                          Most likely cause: Tailscale Funnel needs HTTPS certs \
@@ -802,7 +889,12 @@ impl ServeView {
                         TUNNEL_STARTUP_TIMEOUT_SECS,
                         stop_note,
                         last_log_lines(&initial_log_tail())
-                    ));
+                    );
+                    self.state = ServeViewState::Error {
+                        message,
+                        mode,
+                        transport: *transport,
+                    };
                     return true;
                 }
                 log_grew
@@ -818,7 +910,7 @@ impl ServeView {
                 }
                 log_grew
             }
-            ServeViewState::Confirm { .. } | ServeViewState::Error(_) => false,
+            ServeViewState::Confirm { .. } | ServeViewState::Error { .. } => false,
         }
     }
 
@@ -884,6 +976,66 @@ mod tests {
             view.show_help = false;
             view.handle_key(KeyEvent::from(KeyCode::Char(key)));
             assert!(view.restart_probe.persists, "{key}");
+        }
+    }
+
+    #[test]
+    fn a_tunnel_retry_preselects_the_provider_that_did_not_fail() {
+        use TransportStatus::{FunnelNotEnabled, NotInstalled, Ready};
+        use TunnelTransport::{Cloudflare, Tailscale};
+        // (failed provider, tailscale, cloudflare, preselected)
+        let cases = [
+            (Some(Tailscale), Ready, Ready, Cloudflare),
+            // The other provider isn't ready, so the usual default applies.
+            (Some(Tailscale), Ready, NotInstalled, Tailscale),
+            (Some(Cloudflare), Ready, Ready, Tailscale),
+            (Some(Cloudflare), FunnelNotEnabled, Ready, Cloudflare),
+            // A reattached daemon's transport is unknown.
+            (None, Ready, Ready, Tailscale),
+            (None, NotInstalled, Ready, Cloudflare),
+        ];
+        for (failed, ts, cf, want) in cases {
+            let ServeViewState::Confirm {
+                selected,
+                tailscale,
+                cloudflare,
+                flash,
+            } = ServeViewState::provider_retry(failed, ts, cf)
+            else {
+                panic!("{failed:?} {ts:?} {cf:?}: not the provider screen");
+            };
+            assert_eq!(
+                (selected, tailscale, cloudflare, flash.is_none()),
+                (want, ts, cf, true),
+                "{failed:?} {ts:?} {cf:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_local_error_offers_no_provider_retry_or_funnel_reset() {
+        let message = "`aoe serve --daemon` exited: tailscale status failed".to_string();
+        let mut view = ServeView {
+            state: ServeViewState::Error {
+                message: message.clone(),
+                mode: ServeMode::Local,
+                transport: None,
+            },
+            pending_passphrase: String::new(),
+            pending_confirm: None,
+            show_help: false,
+            mouse: RefCell::default(),
+            copied: None,
+            running_persists: None,
+            restart_probe: RestartProbe::default(),
+        };
+        for key in ['p', 'P', 'r', 'R'] {
+            let action = view.handle_key(KeyEvent::from(KeyCode::Char(key)));
+            assert!(matches!(action, ServeAction::Continue), "{key}");
+            assert!(
+                matches!(&view.state, ServeViewState::Error { message: m, mode: ServeMode::Local, .. } if *m == message),
+                "{key}"
+            );
         }
     }
 }

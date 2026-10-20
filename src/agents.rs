@@ -123,6 +123,14 @@ pub enum SessionCaptureContext {
     ManagedExclusiveStore,
 }
 
+impl SessionCaptureContext {
+    /// Whether an id the agent mints after launch is captured authoritatively.
+    /// `Preassigned` names an id fixed before launch, so it proves nothing here.
+    const fn captures_minted_child(self) -> bool {
+        matches!(self, Self::PaneScoped | Self::ManagedExclusiveStore)
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SessionCaptureSpec {
     pub backend: SessionCaptureBackend,
@@ -161,6 +169,9 @@ pub enum ForkStrategy {
     CodexFork,
     PiFork,
     Flag(&'static str),
+    /// A root flag whose value is the parent id, with no resume flag; the agent
+    /// mints the child, so AoE can fork only where it can capture that id.
+    ValueFlag(&'static str),
     /// The agent's store mints the child over its own API before the launch, so
     /// the session that follows is still the interactive one.
     ServeFork,
@@ -179,7 +190,7 @@ impl ForkStrategy {
     /// pre-pinned for the fork a placeholder to drop. A root fork flag never
     /// carries that id, so the agent mints one of its own.
     pub(crate) const fn mints_child(self) -> bool {
-        matches!(self, Self::CodexFork | Self::Flag(_))
+        matches!(self, Self::CodexFork | Self::Flag(_) | Self::ValueFlag(_))
     }
 
     /// The mechanism the installed build understands. A strategy that spans two
@@ -961,8 +972,7 @@ pub const AGENTS: &[AgentDef] = &[
             SessionCaptureContext::Unsupported,
             SessionCaptureContext::ManagedExclusiveStore,
         ),
-        // Prime exposes no fork surface, so the parent id has nothing to carry.
-        fork_strategy: ForkStrategy::Unsupported,
+        fork_strategy: ForkStrategy::ValueFlag("--fork"),
         ..agent(
             "prime-agent",
             "prime-agent",
@@ -972,6 +982,24 @@ pub const AGENTS: &[AgentDef] = &[
 ];
 
 impl AgentDef {
+    /// Whether a fork can run in this context. A `ValueFlag` fork leaves the
+    /// child id to the agent, so it needs a capture context that can read it.
+    pub fn can_fork_in(&self, sandboxed: bool) -> bool {
+        if !matches!(self.fork_strategy, ForkStrategy::ValueFlag(_)) {
+            return true;
+        }
+        self.session_support
+            .and_then(|support| support.capture)
+            .is_some_and(|capture| {
+                if sandboxed {
+                    capture.sandbox
+                } else {
+                    capture.host
+                }
+                .captures_minted_child()
+            })
+    }
+
     pub fn lifecycle_label(&self) -> Option<&'static str> {
         match self.lifecycle {
             AgentLifecycle::Active => None,
@@ -1036,6 +1064,43 @@ impl AgentDef {
     ) -> Option<&'static str> {
         let flag = self.session_name_flag()?;
         with_agent_help(command, false, |help| help_advertises_flag(help, flag)).then_some(flag)
+    }
+
+    /// Flag keeping the agent's app server inside the launched process. A shared daemon runs
+    /// hooks under the env of the pane that spawned it, so every session's status lands on that
+    /// pane's `AOE_INSTANCE_ID`. `command` is the launch's own executable and environment: older
+    /// installs reject the flag. `options` are the arguments before any `--`; the flag is
+    /// withheld when they name a subcommand that does not define it.
+    pub(crate) fn supported_no_daemon_flag(
+        &self,
+        command: &std::process::Command,
+        options: &[String],
+    ) -> Option<&'static str> {
+        let flag = match self.name {
+            "codex" => "--no-daemon",
+            _ => return None,
+        };
+        // After an explicit `resume` or `fork`, later positionals are operands (a session id or
+        // prompt) that may spell a subcommand name. A root prompt does not shield a later
+        // subcommand: Codex still dispatches it.
+        let mut mode_known = false;
+        let mut words = options.iter().peekable();
+        while let Some(word) = words.next() {
+            // A remote TUI has no local app server, and Codex rejects the combination.
+            if word == "--remote" || word.starts_with("--remote=") {
+                return None;
+            } else if CODEX_VALUE_OPTIONS.contains(&word.as_str()) {
+                words.next();
+            } else if CODEX_VARIADIC_OPTIONS.contains(&word.as_str()) {
+                while words.next_if(|next| !next.starts_with('-')).is_some() {}
+            } else if !word.starts_with('-') && !mode_known {
+                if CODEX_NON_TUI_SUBCOMMANDS.contains(&word.as_str()) {
+                    return None;
+                }
+                mode_known = matches!(word.as_str(), "resume" | "fork");
+            }
+        }
+        agent_help_advertises(command, flag).then_some(flag)
     }
 
     pub fn launch_base_command(&self) -> String {
@@ -1122,6 +1187,69 @@ fn with_agent_help<R>(
         inspect,
     )
 }
+
+/// Codex subcommands, and their aliases, outside the interactive TUI. `--no-daemon` is defined on
+/// the TUI, `resume` and `fork` only; the others reject it.
+const CODEX_NON_TUI_SUBCOMMANDS: &[&str] = &[
+    "agents",
+    "exec",
+    "e",
+    "review",
+    "login",
+    "logout",
+    "mcp",
+    "mcp-server",
+    "plugin",
+    "app-server",
+    "remote-control",
+    "app",
+    "completion",
+    "update",
+    "doctor",
+    "sandbox",
+    "debug",
+    "apply",
+    "a",
+    "queue",
+    "archive",
+    "delete",
+    "migrate-rollouts",
+    "unarchive",
+    "cloud",
+    "cloud-tasks",
+    "execpolicy",
+    "responses-api-proxy",
+    "stdio-to-uds",
+    "tcp-tunnel",
+    "exec-server",
+    "features",
+    "help",
+];
+
+/// Codex options that take their value as the next word, which is not a subcommand.
+const CODEX_VALUE_OPTIONS: &[&str] = &[
+    "-c",
+    "--config",
+    "--enable",
+    "--disable",
+    "--remote",
+    "--remote-auth-token-env",
+    "-m",
+    "--model",
+    "--local-provider",
+    "-p",
+    "--profile",
+    "-s",
+    "--sandbox",
+    "-C",
+    "--cd",
+    "--add-dir",
+    "-a",
+    "--ask-for-approval",
+];
+
+/// Codex options that take every following word up to the next flag.
+const CODEX_VARIADIC_OPTIONS: &[&str] = &["-i", "--image"];
 
 /// A flag the older generation's help lists and the current one's does not.
 const LEGACY_GENERATION_MARKER: &str = "--fork";
@@ -1341,6 +1469,21 @@ fn pi_help_advertises(flag: &str) -> bool {
     get_agent("pi")
         .and_then(|agent| which::which(agent.binary).ok())
         .is_some_and(|program| agent_help_advertises(&ambient_help_command(&program), flag))
+}
+
+/// Whether the opencode at `program` has `--standalone` (2.x), which runs one command on a
+/// private server instead of the shared background service. Asked from `cwd`, the launch
+/// directory, because a version-manager shim picks its install by directory.
+pub(crate) fn opencode_supports_standalone(
+    program: &std::path::Path,
+    cwd: &std::path::Path,
+) -> bool {
+    let mut command = ambient_help_command(program);
+    command.current_dir(cwd);
+    // Uncached on success, like the generation probe: a shim can change what it runs.
+    with_agent_help(&command, false, |help| {
+        help_advertises_flag(help, "--standalone")
+    })
 }
 
 pub(crate) fn pi_supports_extension_flag() -> bool {
@@ -1804,6 +1947,34 @@ mod tests {
             !agent_help_advertises(&ambient_help_command(&older), "--name"),
             "an answer cached for one install was reused for another"
         );
+        forget_agent_help_for_test();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[serial_test::serial]
+    fn standalone_support_is_probed_in_the_launch_cwd() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let temp = tempfile::tempdir().unwrap();
+        // A version-manager shim: which opencode answers depends on the directory.
+        let shim = temp.path().join("opencode");
+        std::fs::write(
+            &shim,
+            "#!/bin/sh\nif [ -e .v2 ]; then echo '  --standalone  private server'; else echo '  --fork'; fi\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let (v2, v1) = (temp.path().join("v2"), temp.path().join("v1"));
+        for dir in [&v2, &v1] {
+            std::fs::create_dir(dir).unwrap();
+        }
+        std::fs::write(v2.join(".v2"), "").unwrap();
+        forget_agent_help_for_test();
+        assert!(opencode_supports_standalone(&shim, &v2));
+        assert!(!opencode_supports_standalone(&shim, &v1));
+        // The shim now dispatches to 2.x here: a cached answer must not outlive that.
+        std::fs::write(v1.join(".v2"), "").unwrap();
+        assert!(opencode_supports_standalone(&shim, &v1));
         forget_agent_help_for_test();
     }
 

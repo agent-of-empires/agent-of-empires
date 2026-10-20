@@ -8,7 +8,7 @@ use super::access::{access_policy, cityhall_gate, security_headers};
 #[cfg(feature = "web")]
 use super::assets::{serve_asset, serve_index, serve_public_file};
 use super::state::AppState;
-use crate::server::{acp_ws, api, auth, live_ws, login, push};
+use crate::server::{acp_ws, api, auth, live_ws, login, push, runtime_ws};
 
 pub(super) fn build_router(state: Arc<AppState>) -> Router {
     use axum::routing::{delete, get, patch, post, put};
@@ -36,7 +36,14 @@ pub(super) fn build_router(state: Arc<AppState>) -> Router {
         // Atomic multi-session workspace delete.
         .route("/api/workspaces", delete(api::delete_workspace))
         // Unified MCP management surface (#1996)
-        .route("/api/mcp/servers", get(api::get_mcp_servers))
+        .route(
+            "/api/mcp/servers",
+            get(api::get_mcp_servers).post(api::create_mcp_server),
+        )
+        .route(
+            "/api/mcp/servers/{name}",
+            put(api::edit_mcp_server).delete(api::delete_mcp_server),
+        )
         .route(
             "/api/mcp/servers/{name}/resolve",
             post(api::resolve_mcp_conflict),
@@ -73,6 +80,8 @@ pub(super) fn build_router(state: Arc<AppState>) -> Router {
         )
         .route("/api/sessions/{id}/file", get(api::session_file))
         .route("/api/sessions/{id}/file/raw", get(api::session_file_raw))
+        // Read-only runtime read: one Hello, one Snapshot, one clean close.
+        .route("/api/runtime/read/ws", get(runtime_ws::runtime_ws))
         .route(
             "/api/sessions/{id}/artifacts/{*path}",
             get(api::serve_session_artifact),
@@ -380,6 +389,12 @@ pub(super) fn build_router(state: Arc<AppState>) -> Router {
             "/api/importable-sessions",
             get(api::list_importable_sessions),
         );
+
+    let app = if state.web_config.mcp_enabled {
+        app.route_service("/mcp", super::mcp::service(state.clone()))
+    } else {
+        app
+    };
 
     // Dashboard bundle (Vite build output) plus the SPA fallback.
     #[cfg(feature = "web")]

@@ -1653,8 +1653,8 @@ export async function logout(): Promise<void> {
     }
     // Don't leak the previous user's cached approval sound to the next user of this tab.
     try {
-      const { clearApprovalSoundCache } = await import("../hooks/useApprovalSound");
-      clearApprovalSoundCache();
+      const { clearSoundCache } = await import("./soundPlayer");
+      clearSoundCache();
     } catch {
       // ignore
     }
@@ -1926,6 +1926,38 @@ export function keepMcpServer(name: string, agent: string): Promise<boolean> {
 
 export function dropMcpServer(name: string, agent: string): Promise<boolean> {
   return fetchOk(mcpPath(name, "drop"), jsonInit("POST", { agent }));
+}
+
+/** `value` omitted keeps the stored secret on edit. */
+export interface McpSecretEntry {
+  name: string;
+  value?: string;
+}
+
+export type McpServerInput =
+  | { transport: "stdio"; command: string; args: string[]; env: McpSecretEntry[] }
+  | { transport: "http" | "sse"; url: string; headers: McpSecretEntry[] };
+
+export interface McpMutationResult {
+  ok: boolean;
+  error?: string;
+  status?: number;
+}
+
+function mcpMutation(url: string, method: string, body?: unknown): Promise<McpMutationResult> {
+  return skillRequest<McpMutationResult>(url, body === undefined ? { method } : jsonInit(method, body), () => ({}));
+}
+
+export function createMcpServer(name: string, input: McpServerInput): Promise<McpMutationResult> {
+  return mcpMutation("/api/mcp/servers", "POST", { name, ...input });
+}
+
+export function updateMcpServer(name: string, input: McpServerInput): Promise<McpMutationResult> {
+  return mcpMutation(`/api/mcp/servers/${encodeURIComponent(name)}`, "PUT", input);
+}
+
+export function deleteMcpServer(name: string): Promise<McpMutationResult> {
+  return mcpMutation(`/api/mcp/servers/${encodeURIComponent(name)}`, "DELETE");
 }
 
 // --- Skills ---

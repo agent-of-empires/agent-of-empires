@@ -1,9 +1,10 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-import type { ActivityRow, TranscriptRow } from "../../lib/acpTypes";
+import { emptyAcpState, type ActivityRow, type TranscriptRow } from "../../lib/acpTypes";
+import { reducer } from "./reducer";
 import { fetchReplay } from "./replay";
 
-type Page = { rows: TranscriptRow[]; next_cursor: number | null; has_more: boolean };
+type Page = { rows: TranscriptRow[]; next_cursor: number | null; has_more: boolean; highest_seq?: number };
 
 const row = (id: string, kind: TranscriptRow["kind"]): TranscriptRow => ({
   id,
@@ -14,13 +15,18 @@ const row = (id: string, kind: TranscriptRow["kind"]): TranscriptRow => ({
 });
 
 // `pages` are keyed by the `before` cursor they answer; the tail answers `before=MAX_SAFE_INTEGER`.
-function mockReplay(pages: Record<string, Page>) {
+// `since` pages answer `since=N` by cursor; the rows view carries `rows`, the frames view none.
+function mockReplay(pages: Record<string, Page>, since: Record<string, TranscriptRow[]> = {}) {
   const requests: string[] = [];
   vi.stubGlobal(
     "fetch",
     vi.fn(async (url: string) => {
       requests.push(url);
       const params = new URLSearchParams(url.split("?")[1]);
+      if (params.has("since")) {
+        const rows = params.get("view") === "rows" ? (since[params.get("since")!] ?? []) : null;
+        return new Response(JSON.stringify({ frames: [], rows, lost: false, highest_seq: 3000 }));
+      }
       const page = pages[params.get("before") ?? ""] ?? { rows: [], next_cursor: null, has_more: false };
       const body = params.has("before")
         ? { frames: [], rows: params.get("view") === "rows" ? page.rows : null, lost: false, highest_seq: 100, ...page }
@@ -31,17 +37,116 @@ function mockReplay(pages: Record<string, Page>) {
   return requests;
 }
 
-async function coldOpen(signal = new AbortController().signal) {
-  const actions: { kind: string; rows?: ActivityRow[]; oldestSeq?: number }[] = [];
+async function reopen(signal = new AbortController().signal, lastSeq = 0, oldestSeq = 0) {
+  const actions: { kind: string; frames?: unknown[]; rows?: ActivityRow[]; oldestSeq?: number }[] = [];
   const handshakes = () => actions.filter((a) => a.kind === "handshake");
   const setHasMore = vi.fn();
-  await fetchReplay("sid", { current: 0 }, (a) => actions.push(a as (typeof actions)[number]), setHasMore, signal);
-  return { frames: actions.filter((a) => a.kind === "frames"), setHasMore, handshakes };
+  const cursor = { current: lastSeq };
+  await fetchReplay("sid", cursor, oldestSeq, (a) => actions.push(a as (typeof actions)[number]), setHasMore, signal);
+  return { frames: actions.filter((a) => a.kind === "frames"), setHasMore, handshakes, cursor };
 }
+const coldOpen = (signal?: AbortSignal) => reopen(signal);
 
 const TAIL = String(Number.MAX_SAFE_INTEGER);
 
 afterEach(() => vi.unstubAllGlobals());
+
+describe("rows recovery for a cached cursor without history", () => {
+  it("loads the transcript from the tail, then folds frames forward from the cached cursor", async () => {
+    const requests = mockReplay({
+      [TAIL]: { rows: [row("t1", "tool_start")], next_cursor: 80, has_more: true },
+      "80": { rows: [row("u", "user_prompt")], next_cursor: 40, has_more: true },
+    });
+    const { frames, cursor, handshakes } = await reopen(undefined, 900);
+    expect(frames[0]).toMatchObject({ frames: [], oldestSeq: 40 });
+    expect(frames[0]!.rows!.map((r) => r.id)).toEqual(["u", "t1"]);
+    expect(cursor.current).toBe(3000);
+    expect(handshakes()).toEqual([]);
+    expect(requests.some((u) => u.includes("since=850&"))).toBe(true);
+    expect(requests.findIndex((u) => u.includes("before="))).toBeLessThan(
+      requests.findIndex((u) => u.includes("since=")),
+    );
+  });
+
+  it("keeps older forward rows out of the recovered transcript, but takes rows newer than the tail", async () => {
+    // The tail ends at seq 3000; rows from the cached cursor, or from inside the 50-seq overlap before the tail, would append older rows after it.
+    const requests = mockReplay(
+      {
+        [TAIL]: {
+          rows: [row("u2", "user_prompt"), row("t2", "tool_start")],
+          next_cursor: 2100,
+          has_more: true,
+          highest_seq: 3000,
+        },
+      },
+      {
+        "850": [row("u1", "user_prompt"), row("t1", "tool_start")],
+        "2950": [row("old-in-overlap", "agent_message"), row("t2", "tool_start")],
+        "3000": [row("new", "agent_message")],
+      },
+    );
+    const actions: Parameters<typeof reducer>[1][] = [];
+    const cursor = { current: 900 };
+    await fetchReplay("sid", cursor, 0, (a) => actions.push(a), vi.fn(), new AbortController().signal);
+    const state = actions.reduce(reducer, { ...emptyAcpState(), lastSeq: 900 });
+    expect(state.activity.map((r) => r.id)).toEqual(["u2", "t2", "new"]);
+    // The dial reads this ref before React commits, so it must already be at what the controls reached.
+    expect(cursor.current).toBe(3000);
+    expect(requests.some((u) => u.includes("since=850") && u.includes("view=rows"))).toBe(false);
+    expect(requests.some((u) => u.includes("since=2950") && u.includes("view=rows"))).toBe(false);
+    expect(requests.some((u) => u.includes("since=3000") && u.includes("view=rows"))).toBe(true);
+  });
+
+  describe("interrupted catch-up", () => {
+    const tailPage = {
+      [TAIL]: {
+        rows: [row("u2", "user_prompt"), row("t2", "tool_start")],
+        next_cursor: 2100,
+        has_more: true,
+        highest_seq: 3000,
+      },
+    };
+    const interrupt = (onFrames: (url: string) => Response | void) => {
+      mockReplay(tailPage, { "3000": [row("new", "agent_message")] });
+      const fetchMock = globalThis.fetch as unknown as ReturnType<typeof vi.fn>;
+      const impl = fetchMock.getMockImplementation()!;
+      fetchMock.mockImplementation(async (url: string) =>
+        url.includes("since=850") && !url.includes("view=rows") ? (onFrames(url) ?? impl(url)) : impl(url),
+      );
+    };
+    const cursor = { current: 900 };
+    const run = async (signal?: AbortSignal) => {
+      const actions: Parameters<typeof reducer>[1][] = [];
+      await fetchReplay("sid", cursor, 0, (a) => actions.push(a), vi.fn(), signal ?? new AbortController().signal);
+      return actions;
+    };
+    // What the socket sends when it dials with since=900: the whole transcript, oldest first.
+    const snapshot = {
+      kind: "transcript_snapshot" as const,
+      rows: [row("u1", "user_prompt"), row("u2", "user_prompt")],
+    };
+
+    it.each([
+      ["a failed frames request", () => new Response("", { status: 500 })],
+      ["an abort", undefined],
+    ])("publishes no recovered tail after %s, so the socket snapshot stays chronological", async (_name, respond) => {
+      const abort = new AbortController();
+      interrupt(respond ?? (() => abort.abort()));
+      const actions = await run(abort.signal);
+      expect(actions.filter((a) => a.kind === "frames")).toEqual([]);
+      expect(cursor.current).toBe(900);
+      const state = [...actions, snapshot].reduce(reducer, { ...emptyAcpState(), lastSeq: 900 });
+      expect(state.activity.map((r) => r.id)).toEqual(["u1", "u2"]);
+    });
+  });
+
+  it("only folds forward when history is already loaded", async () => {
+    const requests = mockReplay({});
+    await reopen(undefined, 900, 40);
+    expect(requests.some((u) => u.includes("before="))).toBe(false);
+    expect(requests.some((u) => u.includes("since=850&"))).toBe(true);
+  });
+});
 
 describe("fetchTail", () => {
   it("keeps paging older until the page holds a user prompt, then dispatches once", async () => {

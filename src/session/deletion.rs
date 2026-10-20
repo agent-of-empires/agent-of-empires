@@ -190,7 +190,7 @@ impl PurgeTransaction {
 
     /// Run best-effort hooks without a lifecycle or storage flock held.
     pub fn run_hooks(self) -> Self {
-        self.run_hooks_with(run_on_destroy_hooks)
+        self.run_hooks_with(run_destroy_hooks)
     }
 
     fn run_hooks_with<F>(mut self, run_hooks: F) -> Self
@@ -692,7 +692,7 @@ fn with_paths_in_use_locked<R>(except_id: &str, f: impl FnOnce(&PathsInUse) -> R
 
 #[cfg(test)]
 pub fn perform_deletion(request: &DeletionRequest) -> DeletionResult {
-    run_on_destroy_hooks(&request.instance, request.detach_hooks);
+    run_destroy_hooks(&request.instance, request.detach_hooks);
     perform_deletion_with(request, |session_id| {
         DockerContainer::from_session_id(session_id).teardown(session_id)
     })
@@ -1323,6 +1323,37 @@ fn deletion_messages_for(
     }
 }
 
+/// Run `host_hooks.before_destroy`, then `on_destroy`, for an instance.
+fn run_destroy_hooks(instance: &Instance, detach: bool) {
+    run_before_destroy_hooks(instance, detach);
+    run_on_destroy_hooks(instance, detach);
+}
+
+const BEFORE_DESTROY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// Host-side on every session kind, so it never targets the container.
+fn run_before_destroy_hooks(instance: &Instance, detach: bool) {
+    let commands = repo_config::resolve_before_destroy_hooks(&instance.source_profile);
+    if commands.is_empty() {
+        return;
+    }
+    tracing::info!(target: "session.delete", "Running before_destroy host hooks for session {}", instance.id);
+    let failures = repo_config::execute_host_hooks_best_effort(
+        &commands,
+        Path::new(&instance.project_path),
+        detach,
+        &repo_config::lifecycle_env_vars(instance),
+        BEFORE_DESTROY_TIMEOUT,
+    );
+    if failures > 0 {
+        tracing::warn!(target: "session.delete",
+            "before_destroy hooks had {} failure(s) for session {}",
+            failures,
+            instance.id
+        );
+    }
+}
+
 /// Run on_destroy hooks for an instance.
 fn run_on_destroy_hooks(instance: &Instance, detach: bool) {
     let profile = crate::session::config::effective_profile(&instance.source_profile);
@@ -1664,6 +1695,29 @@ mod tests {
         assert!(acquired, "on_destroy hook held the lifecycle flock");
         assert_eq!(result.disposition, DeletionDisposition::Removed);
         assert!(storage.load().unwrap().is_empty());
+    }
+
+    #[test]
+    #[serial]
+    fn before_destroy_runs_on_host_for_sandboxed_session_and_survives_failures() {
+        let temp = tempfile::tempdir().unwrap();
+        let _home = isolate_app_dir_at(temp.path());
+        let marker = temp.path().join("marker");
+        let marker = crate::session::environment::shell_escape(&marker.to_string_lossy());
+        crate::session::config::update_config(|global| {
+            global.host_hooks.before_destroy = vec![
+                "exit 1".to_string(),
+                format!("printf %s \"$AOE_SESSION_ID\" > {marker}"),
+            ];
+        })
+        .unwrap();
+        let mut instance = Instance::new("purge", temp.path().to_str().unwrap());
+        instance.sandbox_info = Some(sandbox_info("aoe-sandbox-hook"));
+
+        run_destroy_hooks(&instance, true);
+
+        let written = std::fs::read_to_string(temp.path().join("marker")).unwrap();
+        assert_eq!(written, instance.id);
     }
 
     /// #4107: a purge keeps a shared worktree when another profile cannot be read, and a session

@@ -14,6 +14,14 @@
 //! Modules behind `#[cfg(debug_assertions)]` use test hooks and helpers that
 //! only debug builds compile, so release test builds (the Nix checks) skip them.
 
+#[cfg(all(target_os = "linux", debug_assertions))]
+mod cli_read_parity;
+#[cfg(debug_assertions)]
+mod cli_read_record;
+#[cfg(debug_assertions)]
+mod cli_read_server;
+#[cfg(all(target_os = "linux", debug_assertions))]
+mod cli_read_uds;
 mod common;
 #[cfg(unix)]
 mod frozen_environment;
@@ -26,6 +34,7 @@ mod hooks_cli;
 mod hooks_config;
 mod migration_pipeline;
 mod profile_management;
+mod profile_selection_scope;
 mod recovery_hook_timeout;
 mod repo_config;
 mod session_id_acquisition;
@@ -34,6 +43,7 @@ mod status_detection;
 mod storage_concurrency;
 mod terminal_smart_rename;
 mod tmux_reachability;
+#[cfg(debug_assertions)]
 mod tmux_send_keys;
 mod tui_attach_detach;
 mod update_command;
@@ -83,6 +93,7 @@ mod serve_disk_reload_helper_equivalence;
 mod serve_dynamic_profile_rewire;
 #[cfg(debug_assertions)]
 mod serve_filewatch_propagation;
+mod serve_mcp_crud;
 #[cfg(debug_assertions)]
 mod serve_settings_layers;
 #[cfg(debug_assertions)]

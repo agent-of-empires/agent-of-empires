@@ -20,6 +20,17 @@ pub enum SessionBucket {
     Trashed,
 }
 
+impl SessionBucket {
+    /// Lowercase state name shared by the CLI and the runtime wire.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Active => "live",
+            Self::Archived => "archived",
+            Self::Trashed => "trashed",
+        }
+    }
+}
+
 /// Why an archived or trashed session refuses to launch its agent or take input into a live pane.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum StartBlocked {
@@ -254,6 +265,11 @@ impl Instance {
     /// naturally rejoins the main sort on the next render.
     pub fn is_snoozed(&self) -> bool {
         self.snoozed_until.map(|t| t > Utc::now()).unwrap_or(false)
+    }
+
+    /// `snoozed_until` only while the snooze is active; a persisted past date is not one.
+    pub fn active_snoozed_until(&self) -> Option<DateTime<Utc>> {
+        self.snoozed_until.filter(|t| *t > Utc::now())
     }
 
     /// Combined "don't bother me" sink-state check: trashed, snoozed, or archived.

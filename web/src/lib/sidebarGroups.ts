@@ -36,7 +36,8 @@ export interface SidebarGroup {
   defaultDisplayName: string;
   alias: string | null;
   color: RepoColor | null;
-  remoteOwner: string | null;
+  /** `owner@host` of the Repository's remote; repo and org groups only. */
+  remoteOwnerKey: string | null;
   workspaces: SidebarWorkspaceView[];
   status: WorkspaceStatus;
   collapsed: boolean;
@@ -67,7 +68,7 @@ export function repoGroupToSidebarGroup(group: RepoGroup): SidebarGroup {
     defaultDisplayName: group.defaultDisplayName,
     alias: group.alias,
     color: group.color,
-    remoteOwner: group.remoteOwner,
+    remoteOwnerKey: group.remoteOwnerKey,
     workspaces: group.workspaces.map((workspace) => ({
       key: workspace.id,
       workspace,
@@ -160,7 +161,7 @@ export function buildSessionGroups(
       defaultDisplayName: groupDisplayName(gp),
       alias: null,
       color: null,
-      remoteOwner: null,
+      remoteOwnerKey: null,
       workspaces: views,
       status: hasActive ? "active" : "idle",
       collapsed: opts.isCollapsed(id, gp),
@@ -293,7 +294,7 @@ export function buildOrgGroups(
       defaultDisplayName: displayName,
       alias: null,
       color: null,
-      remoteOwner: orgId === NO_ORG_GROUP_ID ? null : displayName,
+      remoteOwnerKey: orgId === NO_ORG_GROUP_ID ? null : orgId,
       workspaces,
       status: hasActive ? "active" : "idle",
       collapsed: opts.isOrgCollapsed(orgId),

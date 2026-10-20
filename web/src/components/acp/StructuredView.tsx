@@ -199,7 +199,11 @@ function AcpChrome({
   }
   return (
     <StructuredViewRoot>
-      <AttentionChime approvals={state.pendingApprovals.length} elicitations={state.pendingElicitations.length} />
+      <AttentionChime
+        sessionId={sessionId}
+        approvals={state.pendingApprovals.length}
+        elicitations={state.pendingElicitations.length}
+      />
       <PlanStrip plan={state.plan} />
 
       <RateLimitRecoverySection
@@ -251,6 +255,7 @@ function AcpChrome({
             autoScroll={false}
             ref={viewportRef}
             data-testid="acp-viewport"
+            tabIndex={0}
             className="flex-1 overflow-x-hidden overflow-y-auto [overflow-anchor:none]"
           >
             <div ref={messagesContentRef} className="mx-auto max-w-3xl xl:max-w-4xl 2xl:max-w-5xl px-4 py-6">

@@ -668,7 +668,7 @@ async fn write_machine_patch(
             // Notify each touched plugin's worker after the durable write (#2897).
             if !plugin_changes.is_empty() {
                 if let Some(host) = &state.plugin_host {
-                    host.emit_settings_changed(&plugin_changes).await;
+                    host.emit_settings_changed(&plugin_changes, None).await;
                 }
             }
             Ok(())

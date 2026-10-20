@@ -270,19 +270,14 @@ fn test_delete_selected_group_updates_groups_field() {
         .group_exists("work"));
 
     // Verify self.groups is updated (this is the bug fix)
-    let all_groups = env.view.all_groups();
-    let group_paths: Vec<_> = all_groups.iter().map(|g| g.path.as_str()).collect();
+    let all_groups = env.view.all_group_paths();
+    let group_paths: Vec<_> = all_groups.iter().map(String::as_str).collect();
     assert!(!group_paths.contains(&"work"));
     assert!(!group_paths.contains(&"work/projects"));
 
     // A reload from storage agrees with the in-memory tree.
     env.view.reload().unwrap();
-    let reloaded_groups: Vec<_> = env
-        .view
-        .all_groups()
-        .iter()
-        .map(|g| g.path.clone())
-        .collect();
+    let reloaded_groups = env.view.all_group_paths();
     let tree_groups: Vec<_> = env
         .view
         .group_trees
@@ -3120,5 +3115,72 @@ fn test_a_hidden_destination_falls_back_to_the_header_in_its_own_profile() {
         view.selected_group_profile.as_deref(),
         Some("beta"),
         "the header the selection lands on is in the moving row's own profile"
+    );
+}
+
+#[test]
+#[serial]
+fn same_named_groups_across_profiles_are_tagged_and_listed_once() {
+    use crate::session::{GroupTree, Item};
+
+    let temp = TempDir::new().unwrap();
+    let _guard = setup_test_home(&temp);
+
+    for (profile, groups) in [("alpha", &["work", "solo"][..]), ("beta", &["work"][..])] {
+        let insts: Vec<Instance> = groups
+            .iter()
+            .map(|g| {
+                let mut i = Instance::new(&format!("{profile}-{g}"), "/tmp/x");
+                i.group_path = g.to_string();
+                i
+            })
+            .collect();
+        let tree = GroupTree::new_with_groups(&insts, &[]);
+        Storage::new_unwatched(profile)
+            .unwrap()
+            .update(|i, g| {
+                *i = insts.clone();
+                *g = tree.get_all_groups();
+                Ok(())
+            })
+            .unwrap();
+    }
+
+    let tools = AvailableTools::with_tools(&["claude"]);
+    let mut view =
+        HomeView::new_for_test(None, tools, crate::file_watch::FileWatchService::noop()).unwrap();
+    view.group_by = crate::session::config::GroupByMode::Manual;
+    view.flat_items = view.build_flat_items();
+
+    assert_eq!(view.all_group_paths(), vec!["solo", "work"]);
+
+    view.open_new_session_dialog();
+    let dialog = view.new_dialog.as_mut().expect("new session dialog");
+    dialog.focus_group();
+    dialog.handle_key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL));
+    assert_eq!(dialog.group_picker_items(), vec!["solo", "work"]);
+    view.new_dialog = None;
+
+    let theme = crate::tui::styles::Theme::default();
+    let labels: Vec<String> = view
+        .flat_items
+        .iter()
+        .filter(|item| matches!(item, Item::Group { .. }))
+        .map(|item| {
+            view.render_item_line(item, false, false, &theme, 200, false)
+                .spans
+                .iter()
+                .map(|s| s.content.as_ref())
+                .collect::<String>()
+        })
+        .collect();
+    let tagged = |tag: &str| labels.iter().filter(|l| l.contains(tag)).count();
+    assert_eq!(tagged("[alpha] work (1)"), 1, "{labels:?}");
+    assert_eq!(tagged("[beta] work (1)"), 1, "{labels:?}");
+    assert!(
+        labels
+            .iter()
+            .any(|l| l.contains("solo (1)") && !l.contains('[')),
+        "{labels:?}"
     );
 }

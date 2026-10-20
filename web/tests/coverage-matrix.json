@@ -3,6 +3,21 @@
   "description": "Surface/flow coverage matrix for the agent-of-empires web dashboard. Every component file under web/src/components/** must appear in at least one entry's `components` list (covered, deferred, or out-of-scope), or in coverage-matrix.exempt.json. CI validates this on every PR via tests/validate-coverage-matrix.mjs.",
   "surfaces": [
     {
+      "id": "settings.dialog-escape",
+      "kind": "mocked-playwright",
+      "risk": "high",
+      "specs": ["tests/settings-dialog-escape.spec.ts"],
+      "components": [
+        "web/src/App.tsx",
+        "web/src/components/settings/PluginsSettings.tsx",
+        "web/src/components/settings/PluginDetailModal.tsx",
+        "web/src/components/AboutModal.tsx",
+        "web/src/components/command-palette/CommandPalette.tsx",
+        "web/src/components/settings/PluginJobProgressModal.tsx"
+      ],
+      "notes": "Real Escape keys dismiss uninstall, plugin details and its nested lightbox, and Web dashboard disable confirmation without leaving Settings or issuing a mutation; Escape in the command palette preserves the underlying uninstall confirmation; Escape without a dialog still closes Settings. Running plugin jobs retain their dialog; successful, failed and missing jobs dismiss through the existing close callback and reload plugins without leaving Settings. The command palette retains Escape priority over a completed job."
+    },
+    {
       "id": "terminal.paired-shell",
       "kind": "vitest",
       "risk": "medium",
@@ -43,14 +58,14 @@
       "kind": "live-playwright",
       "risk": "high",
       "specs": ["tests/live/settings-panels.spec.ts"],
-      "components": ["web/src/components/McpServers.tsx"]
+      "components": ["web/src/components/McpServers.tsx", "web/src/components/McpServerForm.tsx"]
     },
     {
       "id": "settings.mcp-servers.handlers",
       "kind": "vitest",
       "risk": "high",
       "specs": ["src/components/__tests__/McpServers.test.tsx", "src/lib/api.test.ts"],
-      "components": ["web/src/components/McpServers.tsx"]
+      "components": ["web/src/components/McpServers.tsx", "web/src/components/McpServerForm.tsx"]
     },
     {
       "id": "settings.skills-management",
@@ -518,6 +533,17 @@
       ]
     },
     {
+      "id": "settings.mcp-server-toggle",
+      "kind": "vitest",
+      "risk": "medium",
+      "specs": ["src/components/__tests__/SettingsView.mcpToggle.test.tsx"],
+      "components": [
+        "web/src/components/SettingsView.tsx",
+        "web/src/components/settings/SchemaSection.tsx",
+        "src/server/mcp.rs"
+      ]
+    },
+    {
       "id": "settings.list-field",
       "kind": "mocked-playwright",
       "risk": "medium",
@@ -656,7 +682,11 @@
       "kind": "live-playwright",
       "risk": "medium",
       "specs": ["tests/live/settings-persistence.spec.ts"],
-      "components": ["web/src/components/SettingsView.tsx", "web/src/components/settings/SchemaSection.tsx"]
+      "components": [
+        "web/src/components/SettingsView.tsx",
+        "web/src/components/settings/SchemaSection.tsx",
+        "web/src/components/settings/customWidgets.tsx"
+      ]
     },
     {
       "id": "settings.tui-shortcut-bar",
@@ -790,7 +820,8 @@
       "kind": "vitest",
       "risk": "high",
       "specs": ["src/hooks/usePushSubscription.test.ts", "src/lib/pushHealth.test.ts"],
-      "components": ["web/src/hooks/usePushSubscription.ts", "web/src/lib/pushHealth.ts"]
+      "components": ["web/src/hooks/usePushSubscription.ts", "web/src/lib/pushHealth.ts"],
+      "notes": "Deferred-operation tests cover an enable that settles after every consumer unmounted and remounted, and refresh registration POSTs (one or two overlapping) that must not land after disable."
     },
     {
       "id": "notifications.push-health-banner",
@@ -798,6 +829,13 @@
       "risk": "medium",
       "specs": ["src/components/__tests__/PushHealthBanner.test.tsx"],
       "components": ["web/src/components/PushHealthBanner.tsx"]
+    },
+    {
+      "id": "notifications.status-sounds",
+      "kind": "vitest",
+      "risk": "medium",
+      "specs": ["src/lib/statusSounds.test.ts", "src/hooks/useStatusSounds.test.ts"],
+      "components": ["web/src/lib/statusSounds.ts", "web/src/hooks/useStatusSounds.ts", "web/src/lib/soundPlayer.ts"]
     },
     {
       "id": "settings.security-readonly",
@@ -1374,6 +1412,13 @@
       "components": ["web/src/components/session-wizard/SessionWizard.tsx"]
     },
     {
+      "id": "wizard.scratch-resolves-configured-default-profile",
+      "kind": "live-playwright",
+      "risk": "high",
+      "specs": ["tests/live/session-create.spec.ts"],
+      "components": ["web/src/components/session-wizard/SessionWizard.tsx"]
+    },
+    {
       "id": "wizard.recent-hides-workspaces",
       "kind": "vitest",
       "risk": "medium",
@@ -1576,6 +1621,18 @@
       "components": ["web/src/components/WorkspaceSidebar.tsx"]
     },
     {
+      "id": "sidebar.shared-worktree-actions",
+      "kind": "mocked-playwright",
+      "risk": "high",
+      "specs": ["src/components/__tests__/SessionRowSiblingTargets.test.tsx", "tests/sidebar-multi-session.spec.ts"],
+      "components": [
+        "web/src/components/sidebar/sessionActionTargets.ts",
+        "web/src/components/sidebar/SessionRowMenu.tsx",
+        "web/src/components/sidebar/SessionActions.tsx",
+        "web/src/components/sidebar/rowModel.ts"
+      ]
+    },
+    {
       "id": "sidebar.repo-appearance",
       "kind": "mocked-playwright",
       "risk": "low",
@@ -1607,8 +1664,8 @@
       "id": "sidebar.project-row-header",
       "kind": "vitest",
       "risk": "medium",
-      "specs": ["src/components/__tests__/SidebarGroupHeader.test.tsx"],
-      "components": ["web/src/components/WorkspaceSidebar.tsx"]
+      "specs": ["src/components/__tests__/SidebarGroupHeader.test.tsx", "src/lib/__tests__/githubAvatar.test.ts"],
+      "components": ["web/src/components/WorkspaceSidebar.tsx", "web/src/components/OwnerAvatar.tsx"]
     },
     {
       "id": "sidebar.empty-state",
@@ -1880,13 +1937,15 @@
       "risk": "high",
       "specs": ["tests/plugin-pages.spec.ts"],
       "components": [
-        "web/src/components/plugin/PluginPagesMenu.tsx",
+        "web/src/components/plugin/PluginPageButtons.tsx",
         "web/src/components/plugin/PluginPageView.tsx",
+        "web/src/components/plugin/PluginSessionMenu.tsx",
+        "web/src/components/sidebar/SessionActions.tsx",
         "web/src/lib/pluginBridge.ts",
         "web/src/components/TopBar.tsx",
         "web/src/App.tsx"
       ],
-      "notes": "Pages menu and palette entries appear only with a declared page; the route hides the sidebar, mints a page ticket before framing, and Back pops history. A fixture page served under the daemon's page CSP proves the sandboxed frame cannot read storage, cookies or call the API. A bridge fixture page round-trips ready, sessions.list, plugins.uiState, its own action, session.archive, session.trash and openSession, a page without session.write is refused both lifecycle calls, and it receives a theme change without reloading; a page that navigates to another plugin's page before ready never hands that page the bridge. Mint ordering, empty states, the nonce-checked ready-only channel handoff, theme pushes, teardown on a second load and remount resets are unit-tested in PluginPageView.test.tsx; envelope validation and gating in pluginBridge.test.ts; the ticket's server side in src/server/api/plugins.rs."
+      "notes": "TopBar page buttons and palette entries appear only with a declared page, the button marking the open page; the route hides the sidebar, mints a page ticket before framing, and Back pops history. A fixture page served under the daemon's page CSP proves the sandboxed frame cannot read storage, cookies or call the API. A bridge fixture page round-trips ready, sessions.list, plugins.uiState, its own action, session.archive, session.trash and openSession, a page without session.write is refused both lifecycle calls, and it receives a theme change without reloading; with split view on, openSession shows the session below the page with its docks, in `?session=` rather than navigating, pushes the selection, maximizes over the page without reloading it, and Open full navigates; session.contextMenu opens the sidebar's session menu at the frame-relative point, resolves with a picked page item or null, opens the snooze picker and a rename dialog that PATCHes the title, and a click over the frame dismisses it; a page that navigates to another plugin's page before ready never hands that page the bridge. Mint ordering, empty states, the nonce-checked ready-only channel handoff, theme pushes, teardown on a second load and remount resets are unit-tested in PluginPageView.test.tsx; envelope validation and gating in pluginBridge.test.ts; the ticket's server side in src/server/api/plugins.rs."
     },
     {
       "id": "sidebar.plugin-row-slots",
@@ -2176,7 +2235,8 @@
         "web/src/components/diff/comments/CommentMarkdown.tsx",
         "web/src/components/diff/comments/CommentsBanner.tsx",
         "web/src/components/diff/comments/DiffCommentsUserCard.tsx",
-        "web/src/components/diff/comments/SendCommentsDialog.tsx"
+        "web/src/components/diff/comments/SendCommentsDialog.tsx",
+        "web/src/lib/paneLayout.ts"
       ]
     },
     {
@@ -2195,12 +2255,14 @@
       "risk": "medium",
       "specs": [
         "src/components/diff/__tests__/FileContentViewer.test.tsx",
+        "src/components/diff/__tests__/BinaryFileView.test.tsx",
         "src/components/diff/__tests__/FullFileViewer.test.tsx",
         "src/components/__tests__/FilesPane.test.tsx"
       ],
       "components": [
         "web/src/components/FilesPane.tsx",
         "web/src/components/diff/FileContentViewer.tsx",
+        "web/src/components/diff/BinaryFileView.tsx",
         "web/src/components/diff/FullFileViewer.tsx"
       ]
     },
@@ -2220,6 +2282,7 @@
       "components": [
         "web/src/components/FilesPane.tsx",
         "web/src/components/diff/FileContentViewer.tsx",
+        "web/src/components/diff/BinaryFileView.tsx",
         "web/src/components/diff/MarkdownFileView.tsx",
         "web/src/components/diff/FullFileViewer.tsx",
         "web/src/App.tsx"
@@ -2296,11 +2359,13 @@
         "src/hooks/__tests__/useHistoryWindow.test.tsx",
         "src/lib/historyScroll.test.ts",
         "src/hooks/useAcpSession.test.ts",
-        "src/hooks/acpSession/replay.test.ts"
+        "src/hooks/acpSession/replay.test.ts",
+        "src/hooks/acpSession/stateCache.test.ts"
       ],
       "components": [
         "web/src/lib/acpHistoryWindow.ts",
         "web/src/hooks/acpSession/replay.ts",
+        "web/src/hooks/acpSession/stateCache.ts",
         "web/src/lib/historyScroll.ts",
         "web/src/hooks/useHistoryWindow.ts",
         "web/src/hooks/useAcpSession.ts",
@@ -2544,6 +2609,7 @@
       "risk": "high",
       "specs": [
         "tests/live/acp-transcript.spec.ts",
+        "tests/acp-user-attachments.spec.ts",
         "src/components/acp/Composer.test.tsx",
         "src/components/acp/ThreadMessages.test.tsx"
       ],
@@ -2586,8 +2652,12 @@
       "id": "acp.attention-chime",
       "kind": "vitest",
       "risk": "medium",
-      "specs": ["src/components/acp/__tests__/AttentionChime.test.tsx"],
-      "components": ["web/src/components/acp/AttentionChime.tsx", "web/src/components/acp/StructuredView.tsx"]
+      "specs": ["src/components/acp/__tests__/AttentionChime.test.tsx", "src/hooks/useApprovalSound.test.ts"],
+      "components": [
+        "web/src/components/acp/AttentionChime.tsx",
+        "web/src/components/acp/StructuredView.tsx",
+        "web/src/hooks/useApprovalSound.ts"
+      ]
     },
     {
       "id": "acp.elicitation-card",
@@ -2797,13 +2867,18 @@
       "id": "acp.tool-output-media",
       "kind": "vitest",
       "risk": "medium",
-      "specs": ["src/lib/acpTypes.test.ts", "src/components/acp/ToolCards.render.test.tsx"],
+      "specs": [
+        "src/lib/acpTypes.test.ts",
+        "src/components/acp/ToolCards.render.test.tsx",
+        "src/components/acp/ReadFileResult.test.tsx"
+      ],
       "components": [
         "web/src/components/acp/ToolCards.tsx",
         "web/src/lib/acpTypes.ts",
         "web/src/components/acp/CoreToolCards.tsx",
         "web/src/components/acp/GroupToolCards.tsx",
         "web/src/components/acp/NamedToolCards.tsx",
+        "web/src/components/acp/ReadFileResult.tsx",
         "web/src/components/acp/TodoCards.tsx",
         "web/src/components/acp/ToolCardChrome.tsx",
         "web/src/components/acp/ToolOutputMedia.tsx"
@@ -3068,11 +3143,14 @@
         "tests/acp-structured-view.spec.ts",
         "src/components/acp/ToolExpansion.test.tsx",
         "src/components/acp/activityMessages.test.ts",
-        "src/lib/toolAnchor.test.ts"
+        "src/lib/toolAnchor.test.ts",
+        "src/components/acp/useTranscriptScroll.test.tsx"
       ],
       "components": [
+        "web/src/components/acp/StructuredView.tsx",
         "web/src/components/acp/ToolExpansion.tsx",
         "web/src/components/acp/GroupToolCards.tsx",
+        "web/src/components/acp/useTranscriptScroll.ts",
         "web/src/lib/toolAnchor.ts"
       ]
     },
@@ -3152,8 +3230,8 @@
       "id": "acp.mobile-jump-to-bottom",
       "kind": "mocked-playwright",
       "risk": "medium",
-      "specs": ["tests/acp-mobile-jump-to-bottom.spec.ts"],
-      "components": ["web/src/components/acp/StructuredView.tsx"]
+      "specs": ["tests/acp-mobile-jump-to-bottom.spec.ts", "src/components/acp/useTranscriptScroll.test.tsx"],
+      "components": ["web/src/components/acp/StructuredView.tsx", "web/src/components/acp/useTranscriptScroll.ts"]
     },
     {
       "id": "acp.tool-stopped-sweep",
@@ -3305,7 +3383,7 @@
       "kind": "vitest",
       "risk": "low",
       "specs": ["src/components/__tests__/ProjectFormModal.test.tsx"],
-      "components": ["web/src/components/ProjectFormModal.tsx"]
+      "components": ["web/src/components/ProjectFormModal.tsx", "web/src/components/ProjectPluginSettings.tsx"]
     },
     {
       "id": "scratch-overrides-modal",
@@ -3963,6 +4041,18 @@
         "web/src/components/acp/ToolCardChrome.tsx",
         "web/src/components/acp/ToolOutputMedia.tsx"
       ]
+    },
+    {
+      "id": "acp.tool-output-media",
+      "kind": "mocked-playwright",
+      "risk": "medium",
+      "specs": [
+        "src/components/acp/activityMessages.test.ts",
+        "src/components/acp/ThreadMessages.test.tsx",
+        "tests/acp-tool-output-media.spec.ts"
+      ],
+      "components": ["web/src/components/acp/ThreadMessages.tsx", "web/src/components/acp/ToolOutputMedia.tsx"],
+      "notes": "A tool result's image, audio, link and resource blocks reach the card through the thread's tool part, so they render under it."
     },
     {
       "id": "acp.story.edit-card-diff-scroll",

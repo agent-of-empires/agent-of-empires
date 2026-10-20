@@ -46,6 +46,18 @@ impl ResumeTarget {
             command: inst.command.clone(),
         }
     }
+
+    fn spawn_kind(&self) -> ResumeKind {
+        spawn_kind(self.stored_acp_session_id.is_some())
+    }
+}
+
+fn spawn_kind(has_stored_id: bool) -> ResumeKind {
+    if has_stored_id {
+        ResumeKind::Spawn
+    } else {
+        ResumeKind::SpawnFirst
+    }
 }
 
 /// What to do with the registry record of a session with no in-memory worker.
@@ -157,7 +169,7 @@ pub(super) async fn resume_one(state: Arc<AppState>, target: ResumeTarget) -> Re
     });
     let kind = match decision {
         AdoptDecision::Attach | AdoptDecision::AdoptStaleForDrain => ResumeKind::Attach,
-        _ => ResumeKind::Spawn,
+        _ => target.spawn_kind(),
     };
     let mut reservation = match admit(&state, &id, kind).await {
         Ok(r) => r,
@@ -241,7 +253,7 @@ pub(super) async fn resume_one(state: Arc<AppState>, target: ResumeTarget) -> Re
                     }
                 }
                 // The failed attach released its lease; the spawn needs one that counts toward capacity.
-                reservation = match admit(&state, &id, ResumeKind::Spawn).await {
+                reservation = match admit(&state, &id, target.spawn_kind()).await {
                     Ok(r) => r,
                     Err(outcome) => return outcome,
                 };
@@ -468,9 +480,15 @@ pub(crate) async fn trigger_resume_background(
     id: &str,
     authority: crate::process::worker_registry::ResumeAuthority,
 ) -> Result<ResumeTrigger, SupervisorError> {
+    let has_stored_id = service
+        .instances
+        .read()
+        .await
+        .iter()
+        .any(|i| i.id == id && i.acp_session_id.is_some());
     let reservation = match service
         .acp_supervisor
-        .begin_resume(id, ResumeKind::Spawn, authority)
+        .begin_resume(id, spawn_kind(has_stored_id), authority)
         .await?
     {
         ResumeReservationOutcome::Reserved(r) => r,

@@ -5,9 +5,7 @@ use std::sync::Arc;
 
 use super::state::AppState;
 
-/// What the walk inspected before it ran, so a verdict can be dropped if the row moved. The last
-/// field is the agent: a tool swap changes it without moving the lifecycle counter, so the guard
-/// has to read it separately.
+/// Conversation and lifecycle state observed before the blocking maintenance walk.
 pub(super) type SessionIdentityBaseline = (
     crate::session::ConversationState,
     Option<String>,
@@ -16,7 +14,6 @@ pub(super) type SessionIdentityBaseline = (
     Option<std::time::SystemTime>,
     u64,
     crate::session::Status,
-    String,
 );
 
 /// Preserve concurrent changes to any part of the native conversation.
@@ -25,7 +22,7 @@ pub(super) fn apply_drained_identity_if_unchanged(
     drained: &Instance,
     baseline: &SessionIdentityBaseline,
 ) {
-    let (baseline_conversation, baseline_marker, baseline_generation, _, _, _, _, _) = baseline;
+    let (baseline_conversation, baseline_marker, baseline_generation, _, _, _, _) = baseline;
     if baseline_conversation.matches(live) && live.omp_capture_generation == *baseline_generation {
         live.adopt_conversation_state(drained.conversation_state());
         live.omp_capture_generation = drained.omp_capture_generation.clone();
@@ -46,7 +43,7 @@ fn apply_poller_repair_if_lifecycle_unchanged(
     if live.lifecycle_generation == baseline.5
         && live.active_execution == baseline.0.active
         && live.omp_capture_generation == baseline.2
-        && live.tool == baseline.7
+        && live.tool == baseline.0.tool
     {
         live.poller_repair = backoff.clone();
     }
@@ -104,23 +101,38 @@ pub(super) async fn drain_session_id_updates_in_state(state: &Arc<AppState>) {
                         inst.capture_started_at,
                         inst.lifecycle_generation,
                         inst.status,
-                        inst.tool.clone(),
                     ),
                 )
             })
             .collect();
         let mut snapshot = snapshot;
         // Preserve a final queued observation before replacing a stopped worker.
-        let outcome =
+        let mut outcome =
             crate::session::sync::drain_and_persist_session_ids(&mut snapshot, &file_watch);
         // One observation for the whole repair walk, as on the TUI side.
         let live = crate::tmux::LiveSessionSnapshot::new();
         let backoff_before = repair_backoffs(&snapshot);
+        let repair_now = std::time::Instant::now();
+        let contended = if snapshot
+            .iter()
+            .any(|inst| inst.finished_execution_identity_is_due(&live, repair_now))
+        {
+            Instance::contended_capture_cwds(&snapshot)
+        } else {
+            std::collections::HashSet::new()
+        };
         let runtime_changed: std::collections::HashSet<String> = snapshot
             .iter_mut()
             .filter_map(|inst| {
                 let retry_before = inst.session_id_poller_retry_after;
                 let started = inst.repair_session_id_poller_if_needed(&live);
+                let generation_before = inst.lifecycle_generation;
+                if inst.repair_finished_execution_identity(&live, &contended, repair_now) {
+                    outcome.applied.push(inst.id.clone());
+                }
+                if inst.lifecycle_generation != generation_before {
+                    outcome.lifecycle_advanced.push(inst.id.clone());
+                }
                 (started || inst.session_id_poller_retry_after != retry_before)
                     .then(|| inst.id.clone())
             })
@@ -217,7 +229,6 @@ mod tests {
             None,
             0,
             crate::session::Status::Idle,
-            "claude".to_string(),
         );
         let mut drained = Instance::new("session", "/tmp/project");
         drained.agent_session_id = Some("captured-sid".to_string());
@@ -258,6 +269,27 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
+    fn legacy_capture_reapply_does_not_cross_a_tool_swap() {
+        let mut live = Instance::new("legacy", "/tmp/project");
+        live.tool = "claude".into();
+        let baseline = (
+            live.conversation_state(),
+            None,
+            None,
+            None,
+            None,
+            0,
+            crate::session::Status::Stopped,
+        );
+        let mut drained = live.clone();
+        drained.agent_session_id = Some("11111111-2222-4333-8444-555555555555".into());
+        live.tool = "codex".into();
+        apply_drained_identity_if_unchanged(&mut live, &drained, &baseline);
+        assert!(live.agent_session_id.is_none());
+    }
+
+    #[test]
     fn a_relaunch_during_the_walk_keeps_its_schedule_clear() {
         let mut live = Instance::new("session", "/tmp/project");
         live.lifecycle_generation = 7;
@@ -269,7 +301,6 @@ mod tests {
             None,
             7,
             crate::session::Status::Idle,
-            "claude".to_string(),
         );
         let mut walked = live.clone();
         let now = std::time::Instant::now();
@@ -309,7 +340,6 @@ mod tests {
             None,
             0,
             crate::session::Status::Idle,
-            "claude".to_string(),
         );
         let mut live = Instance::new("session", "/tmp/project");
         let mut repaired = live.clone();
@@ -354,7 +384,6 @@ mod tests {
             None,
             0,
             crate::session::Status::Idle,
-            "claude".to_string(),
         );
         let mut drained = Instance::new("session", "/tmp/project");
         drained.lifecycle_generation = 7;
@@ -416,7 +445,6 @@ mod tests {
             None,
             7,
             crate::session::Status::Idle,
-            "claude".to_string(),
         );
         let mut walked = live.clone();
         walked.poller_repair.reprobe(std::time::Instant::now());
@@ -455,7 +483,6 @@ mod tests {
             None,
             7,
             crate::session::Status::Idle,
-            "claude".to_string(),
         );
         let mut walked = live.clone();
         walked.poller_repair.reprobe(std::time::Instant::now());

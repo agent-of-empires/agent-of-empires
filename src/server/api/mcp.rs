@@ -2,7 +2,8 @@
 //!
 //! `GET /api/mcp/servers` resolves the effective MCP set for an agent and
 //! returns the redaction-safe view the dashboard renders. The mutating routes
-//! resolve a conflict and keep or drop a server removed from a native config.
+//! resolve a conflict and keep or drop a server removed from a native config,
+//! and create, edit or delete AoE-owned global servers.
 //! All values are redacted; AoE never writes an agent-native config.
 
 use std::sync::Arc;
@@ -15,11 +16,14 @@ use axum::{
 };
 use serde::Deserialize;
 
+use super::mutation_guard::ElevatedMutationGuard;
 use super::read_only_response;
-use super::AppState;
+use super::{api_error, AppState};
 use crate::session::config::profile_config;
-use crate::session::mcp::mcp_model;
+use crate::session::mcp::mcp_model::{self, McpProvenance, ResolvedMcpServer};
+use crate::session::mcp::mcp_overrides::{self, McpServerInput, McpWriteError};
 use crate::session::mcp::mcp_state::{self, ConflictWinner};
+use crate::session::mcp::project_mcp::ProjectMcpServer;
 
 #[derive(Debug, Deserialize)]
 pub struct AgentQuery {
@@ -217,6 +221,123 @@ pub async fn drop_mcp_server(
     match result {
         Ok(Ok(())) => Json(serde_json::json!({"status": "dropped"})).into_response(),
         _ => internal_error(),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+pub struct CreateMcpServerBody {
+    name: String,
+    #[serde(flatten)]
+    input: McpServerInput,
+}
+
+type JsonBody<T> = Result<Json<T>, axum::extract::rejection::JsonRejection>;
+
+fn write_error(error: McpWriteError) -> axum::response::Response {
+    match error {
+        McpWriteError::Invalid(m) => api_error(StatusCode::BAD_REQUEST, "invalid_mcp_server", m),
+        McpWriteError::Exists(name) => api_error(
+            StatusCode::CONFLICT,
+            "mcp_server_exists",
+            format!("an AoE-owned server named \"{name}\" already exists"),
+        ),
+        McpWriteError::NotFound(m) => api_error(StatusCode::NOT_FOUND, "mcp_server_not_found", m),
+        McpWriteError::ReadOnly(m) => api_error(StatusCode::FORBIDDEN, "mcp_read_only", m),
+        McpWriteError::Io(e) => {
+            tracing::warn!(target: "acp.mcp", error = %e, "global mcp.json write failed");
+            api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "internal",
+                "could not write the global mcp.json",
+            )
+        }
+    }
+}
+
+fn redacted_global(server: ProjectMcpServer) -> serde_json::Value {
+    let resolved = ResolvedMcpServer {
+        def: server,
+        provenance: McpProvenance::Global,
+        shadowed: Vec::new(),
+    };
+    serde_json::json!(resolved.redacted())
+}
+
+/// Runs a blocking global write, mapping a miss to read-only when another layer owns the name.
+async fn run_write<R: Send + 'static>(
+    state: &AppState,
+    write: impl FnOnce() -> Result<R, McpWriteError> + Send + 'static,
+) -> Result<R, McpWriteError> {
+    let agent = resolve_agent(state, None);
+    let profile = state.profile.clone();
+    tokio::task::spawn_blocking(move || {
+        write().map_err(|e| {
+            let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+            let profile_opt = (!profile.is_empty()).then_some(profile.as_str());
+            mcp_overrides::classify_missing(e, &agent, profile_opt, &cwd)
+        })
+    })
+    .await
+    .unwrap_or_else(|e| Err(McpWriteError::Io(e.into())))
+}
+
+fn bad_json() -> axum::response::Response {
+    api_error(
+        StatusCode::BAD_REQUEST,
+        "invalid_body",
+        "request body is not a valid MCP server definition",
+    )
+}
+
+/// `POST /api/mcp/servers`: add an AoE-owned global server.
+pub async fn create_mcp_server(
+    State(state): State<Arc<AppState>>,
+    _guard: ElevatedMutationGuard,
+    body: JsonBody<CreateMcpServerBody>,
+) -> impl IntoResponse {
+    let Ok(Json(body)) = body else {
+        return bad_json();
+    };
+    match run_write(&state, move || {
+        mcp_overrides::create_global_server(&body.name, &body.input)
+    })
+    .await
+    {
+        Ok(server) => (StatusCode::CREATED, Json(redacted_global(server))).into_response(),
+        Err(e) => write_error(e),
+    }
+}
+
+/// `PUT /api/mcp/servers/{name}`: replace an AoE-owned global server. Secret entries without a
+/// value keep their stored value.
+pub async fn edit_mcp_server(
+    State(state): State<Arc<AppState>>,
+    _guard: ElevatedMutationGuard,
+    Path(name): Path<String>,
+    body: JsonBody<McpServerInput>,
+) -> impl IntoResponse {
+    let Ok(Json(input)) = body else {
+        return bad_json();
+    };
+    match run_write(&state, move || {
+        mcp_overrides::update_global_server(&name, &input)
+    })
+    .await
+    {
+        Ok(server) => Json(redacted_global(server)).into_response(),
+        Err(e) => write_error(e),
+    }
+}
+
+/// `DELETE /api/mcp/servers/{name}`: remove an AoE-owned global server.
+pub async fn delete_mcp_server(
+    State(state): State<Arc<AppState>>,
+    _guard: ElevatedMutationGuard,
+    Path(name): Path<String>,
+) -> impl IntoResponse {
+    match run_write(&state, move || mcp_overrides::delete_global_server(&name)).await {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(e) => write_error(e),
     }
 }
 

@@ -150,12 +150,15 @@ function isPromptAttachmentInput(v: unknown): v is PromptAttachmentInput {
 }
 
 /** Records a clear as a tombstone; when even that does not fit the quota, frees the stale bytes
- *  instead, so a draft that was cleared or failed to save cannot linger until its session goes. */
+ *  and retries it, so a draft that was cleared or failed to save cannot linger until its session
+ *  goes. The tombstone is what rejects an older save, so if the retry fails or the tab dies after
+ *  the delete, no stale bytes remain but the fence is missing. */
 async function recordClear(sessionId: string, rev: Revision): Promise<void> {
   try {
     await clearAttachments(sessionId, rev);
   } catch {
     await deleteAttachmentsUpTo(sessionId, rev);
+    await clearAttachments(sessionId, rev).catch(() => {});
   }
 }
 

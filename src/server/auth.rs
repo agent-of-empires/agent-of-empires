@@ -161,6 +161,12 @@ fn normalize_path(path: &str) -> &str {
     path.strip_suffix('/').unwrap_or(path)
 }
 
+/// Whether a path is served to programs, which get a JSON `401` rather than a redirect to the
+/// login page when unauthenticated.
+fn is_machine_endpoint(path: &str) -> bool {
+    path.starts_with("/api/") || path.contains("/ws") || path == "/mcp" || path.starts_with("/mcp/")
+}
+
 /// Whether a request path is exempt from the passphrase session + device-binding check.
 fn is_login_session_exempt(path: &str) -> bool {
     path == "/"
@@ -461,7 +467,7 @@ async fn run_passphrase_wall(
     };
 
     if !has_valid_session {
-        if path.starts_with("/api/") || path.contains("/ws") {
+        if is_machine_endpoint(&path) {
             tracing::warn!(
                 target: "auth",
                 ip = %client_ip,
@@ -664,8 +670,7 @@ pub async fn auth_middleware(
     let Some(source) = matched_source else {
         // No valid token and no valid session.
         let path = request.uri().path();
-        let is_api_or_ws = path.starts_with("/api/") || path.contains("/ws");
-        if !is_api_or_ws {
+        if !is_machine_endpoint(path) {
             return next.run(request).await;
         }
         let locked = state.rate_limiter.record_failure(client_ip).await;
@@ -728,7 +733,7 @@ pub async fn auth_middleware(
                 had_device_binding = presented_binding.is_some(),
                 "valid token but no session on non-login-exempt path; returning login_required"
             );
-            if path.starts_with("/api/") || path.contains("/ws") {
+            if is_machine_endpoint(&path) {
                 return (
                     StatusCode::UNAUTHORIZED,
                     axum::Json(serde_json::json!({

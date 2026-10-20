@@ -96,6 +96,9 @@ This document contains the help content for the `aoe` command-line program.
 * [`aoe telemetry reset-id`↴](#aoe-telemetry-reset-id)
 * [`aoe mcp`↴](#aoe-mcp)
 * [`aoe mcp list`↴](#aoe-mcp-list)
+* [`aoe mcp add`↴](#aoe-mcp-add)
+* [`aoe mcp edit`↴](#aoe-mcp-edit)
+* [`aoe mcp remove`↴](#aoe-mcp-remove)
 * [`aoe skill`↴](#aoe-skill)
 * [`aoe skill list`↴](#aoe-skill-list)
 * [`aoe skill view`↴](#aoe-skill-view)
@@ -173,13 +176,15 @@ Run without arguments to launch the TUI dashboard.
 * `acp` — Manage the ACP structured-view workers (doctor, ps, logs, prompt, approve, ...)
 * `uninstall` — Uninstall Agent of Empires
 * `update` — Update aoe to the latest release
-* `migrate` — Run pending data migrations now, showing progress. A sandboxed session moves its own agent store when it starts; use this to move every eligible store at once instead. Trashed and archived sessions are skipped; each moves when it is started, or restore or unarchive it and run this again
+* `migrate` — Run pending data migrations now, showing progress. A sandboxed session moves its own agent store when it starts; use this to move every eligible store at once instead. Trashed and archived sessions are skipped; each moves when it is started, or restore or unarchive it and run this again. Refuses while the aoe serve daemon runs; stop it with `aoe serve --stop` first
 * `completion` — Generate shell completions
 
 ###### **Options:**
 
-* `-p`, `--profile <PROFILE>` — Profile to use (separate workspace with its own sessions). Commands that consume or create profile state require an existing profile: an unknown name is refused, not created (make one with `aoe profile create`). Profile-independent commands such as `list --all` and `serve --stop` ignore it
-* `--daemon-url <DAEMON_URL>` — Attach to a remote agent daemon instead of using the local session list. Equivalent to setting `AOE_DAEMON_URL`; pair with `AOE_DAEMON_TOKEN` for the bearer token. The session list goes through a bearer-only client, so `AOE_DAEMON_PASSPHRASE` does not work here yet; it works for `aoe acp <verb>` against the same `AOE_DAEMON_URL`. Only meaningful at the no-subcommand `aoe` invocation (the TUI dashboard); ignored otherwise
+* `-p`, `--profile <PROFILE>` — Profile to use (separate workspace with its own sessions). Commands that consume or create profile state require an existing profile: an unknown name is refused, not created (make one with `aoe profile create`). Profile-independent commands such as `list --all` and `serve --stop` ignore it. `AGENT_OF_EMPIRES_PROFILE` names one too, and an explicit `-p` wins over it
+* `--daemon-url <DAEMON_URL>` — Select a daemon endpoint for read-only CLI commands or the TUI
+
+   Explicit CLI endpoints never fall back. `AOE_DAEMON_URL` discovery may fall back to local storage before reaching a TCP peer, with a notice. Authenticate CLI reads with `AOE_DAEMON_TOKEN` or `AOE_DAEMON_PASSPHRASE`; TUI session lists support bearer tokens only. An unauthenticated daemon needs neither. See the HTTP API reference for transport and fallback rules.
 
 
 
@@ -275,7 +280,11 @@ List all sessions
 
 Show a substrate-agnostic runtime view of in-flight sessions (tmux agent panes and ACP structured-view workers), one row each
 
-**Usage:** `aoe ps [OPTIONS]`
+**Usage:** `aoe ps [OPTIONS] [SESSION]`
+
+###### **Arguments:**
+
+* `<SESSION>` — Show one session in detail, including dead runtimes (id, id prefix, title, or path)
 
 ###### **Options:**
 
@@ -283,6 +292,10 @@ Show a substrate-agnostic runtime view of in-flight sessions (tmux agent panes a
 * `--tmux` — Show only tmux-backed sessions
 * `--acp` — Show only ACP (structured-view) workers, with their ACP-specific columns (BUILD, MODEL, CWD, SOCKET); `--json` adds `substrate`, `state`, `age_secs`, and `model` to the keys the removed `aoe acp ps` emitted, but sorts by substrate, then title, then id rather than by `started_at`. Dead and orphaned workers are hidden unless `--dead` is also passed; the worker registry is global, so with an explicit `-p` the workers of other profiles surface as orphans (also hidden without `--dead`)
 * `--dead` — Include dead sessions and orphaned substrate entries (hidden by default)
+* `--watch` — Redraw continuously until Ctrl-C; with `--json`, print one compact JSON array per line instead of clearing the screen
+* `--interval <INTERVAL>` — Seconds between `--watch` redraws
+
+  Default value: `2`
 
 
 
@@ -361,6 +374,8 @@ Send a message to a running agent session
 ## `aoe status`
 
 Show session status summary
+
+JSON takes precedence over quiet, which takes precedence over verbose.
 
 **Usage:** `aoe status [OPTIONS]`
 
@@ -1444,6 +1459,9 @@ Inspect the effective MCP server set (provenance, conflicts, drift)
 ###### **Subcommands:**
 
 * `list` — List the merged effective MCP server set with provenance, plus any conflicts and servers kept after removal from a native config
+* `add` — Add an AoE-owned MCP server to the global mcp.json
+* `edit` — Edit an AoE-owned MCP server. Secrets you do not mention keep their stored value
+* `remove` — Remove an AoE-owned MCP server
 
 
 
@@ -1457,6 +1475,67 @@ List the merged effective MCP server set with provenance, plus any conflicts and
 
 * `--agent <AGENT>` — Agent whose effective set to resolve. Defaults to the configured default tool. MCP forwarding is per-agent because the agent-native layer differs
 * `--json` — Output machine-readable JSON instead of a table
+
+
+
+## `aoe mcp add`
+
+Add an AoE-owned MCP server to the global mcp.json
+
+**Usage:** `aoe mcp add [OPTIONS] <NAME>`
+
+###### **Arguments:**
+
+* `<NAME>` — Server name (letters, digits, '.', '_', '-')
+
+###### **Options:**
+
+* `--transport <TRANSPORT>`
+
+  Default value: `stdio`
+
+  Possible values: `stdio`, `http`, `sse`
+
+* `--command <COMMAND>` — Executable to run (stdio only)
+* `--arg <ARGS>` — Argument for the command; repeat for several (stdio only)
+* `--env <ENV>` — Environment variable as KEY=VALUE; repeatable (stdio only)
+* `--url <URL>` — Server URL (http and sse only)
+* `--header <HEADER>` — Request header as KEY=VALUE; repeatable (http and sse only)
+
+
+
+## `aoe mcp edit`
+
+Edit an AoE-owned MCP server. Secrets you do not mention keep their stored value
+
+**Usage:** `aoe mcp edit [OPTIONS] <NAME>`
+
+###### **Arguments:**
+
+* `<NAME>` — Name of the AoE-owned server to edit. Its transport cannot change; remove and add instead
+
+###### **Options:**
+
+* `--command <COMMAND>` — Replace the executable (stdio only)
+* `--arg <ARGS>` — Replace all arguments; repeat for several (stdio only)
+* `--clear-args` — Remove all arguments (stdio only)
+* `--env <ENV>` — Set an environment variable as KEY=VALUE; repeatable (stdio only)
+* `--unset-env <UNSET_ENV>` — Remove an environment variable by name; repeatable (stdio only)
+* `--url <URL>` — Replace the URL (http and sse only)
+* `--header <HEADER>` — Set a header as KEY=VALUE; repeatable (http and sse only)
+* `--unset-header <UNSET_HEADER>` — Remove a header by name; repeatable (http and sse only)
+
+
+
+## `aoe mcp remove`
+
+Remove an AoE-owned MCP server
+
+**Usage:** `aoe mcp remove <NAME>`
+
+###### **Arguments:**
+
+* `<NAME>` — Name of the AoE-owned server to remove
 
 
 
@@ -1963,7 +2042,7 @@ Update aoe to the latest release
 
 ## `aoe migrate`
 
-Run pending data migrations now, showing progress. A sandboxed session moves its own agent store when it starts; use this to move every eligible store at once instead. Trashed and archived sessions are skipped; each moves when it is started, or restore or unarchive it and run this again
+Run pending data migrations now, showing progress. A sandboxed session moves its own agent store when it starts; use this to move every eligible store at once instead. Trashed and archived sessions are skipped; each moves when it is started, or restore or unarchive it and run this again. Refuses while the aoe serve daemon runs; stop it with `aoe serve --stop` first
 
 **Usage:** `aoe migrate`
 

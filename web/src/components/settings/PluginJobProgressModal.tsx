@@ -16,6 +16,7 @@ export function PluginJobProgressModal({ jobId, title, onClose }: PluginJobProgr
   // A 404 (e.g. daemon restart) is terminal, so Close is not stuck disabled.
   const [gone, setGone] = useState(false);
   const logRef = useRef<HTMLPreElement>(null);
+  const dialogRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
     let cancelled = false;
@@ -53,8 +54,23 @@ export function PluginJobProgressModal({ jobId, title, onClose }: PluginJobProgr
   const done = state === "succeeded" || state === "failed" || gone;
   const failedError = job?.job.status.state === "failed" ? job.job.status.error : null;
 
+  useEffect(() => {
+    if (!done) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key !== "Escape") return;
+      const dialog = e
+        .composedPath()
+        .find((node) => node instanceof HTMLElement && node.getAttribute("aria-modal") === "true");
+      if (dialog && dialog !== dialogRef.current) return;
+      onClose();
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [done, onClose]);
+
   return (
     <div
+      ref={dialogRef}
       className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 p-4"
       role="dialog"
       aria-modal="true"

@@ -501,6 +501,61 @@ impl Instance {
         native_alive.then_some(Status::Unknown)
     }
 
+    /// A sandboxed Prime fork child has its own private store, so the parent's
+    /// transcript is copied into it and the fork target is rebound to the
+    /// child's context before the launch identity check runs. Returns the state
+    /// to restore once the command is built; the rebound one is adopted after
+    /// the launch, as for any resolved target.
+    pub(super) fn hand_off_prime_fork_parent(
+        &mut self,
+        execution: &super::execution::NativeExecution,
+    ) -> anyhow::Result<Option<ConversationState>> {
+        let ResumeIntent::Fork { from } = &self.resume_intent else {
+            return Ok(None);
+        };
+        let Some(CaptureContext::Prime { plan, .. }) = &execution.capture else {
+            return Ok(None);
+        };
+        let from = from.clone();
+        let parent = self
+            .resume_binding
+            .clone()
+            .filter(|binding| binding.session_id == from)
+            .context("Prime fork has no parent conversation binding")?;
+        let parent_execution = parent
+            .execution
+            .as_ref()
+            .filter(|bound| bound.agent == execution.binding.agent)
+            .context("Prime fork needs a qualified parent conversation")?;
+        if Self::execution_identity_matches(parent_execution, &execution.binding) {
+            return Ok(None);
+        }
+        anyhow::ensure!(
+            parent_execution.filesystem == execution.binding.filesystem,
+            "the parent's Prime store is not on this launch's filesystem"
+        );
+        // A Prime binding records its sessions directory as its one store.
+        let [parent_sessions] = parent_execution.stores.as_slice() else {
+            anyhow::bail!("the parent records no single Prime sessions directory");
+        };
+        crate::session::capture::hand_off_prime_root_transcript(
+            parent_sessions,
+            &plan.store,
+            &plan.session_dir,
+            &from,
+            &plan.container_cwd,
+        )
+        .context("cannot hand the parent's Prime conversation to the fork")?;
+        let prior = self.conversation_state();
+        let rebound = ConversationBinding {
+            execution: Some(execution.binding.clone()),
+            ..parent
+        };
+        self.retroactive_capture_excludes.insert(rebound.clone());
+        self.resume_binding = Some(rebound);
+        Ok(Some(prior))
+    }
+
     pub(super) fn prime_runtime(&self) -> Option<&crate::process::prime::PrimeRuntime> {
         match self.active_execution.as_ref()?.capture.as_ref()? {
             CaptureContext::Prime { runtime, .. } => runtime.as_ref(),
@@ -914,6 +969,135 @@ mod tests {
             Some(peer)
         );
         assert_eq!(inst.agent_session_id.as_deref(), Some(peer));
+    }
+
+    /// A fork child's private store holds nothing of the parent's, so its launch
+    /// would be refused at the identity check. The handoff puts the parent's
+    /// transcript in the child's store and rebinds the target there, and the
+    /// captured child then resumes from its own store.
+    #[test]
+    #[serial_test::serial]
+    fn a_sandboxed_prime_fork_child_launches_from_its_own_store_and_resumes_there() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _app = crate::session::test_support::isolate_app_dir_at(&tmp.path().join("app"));
+        let project = tmp.path().join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        let (parent_id, child_id) = (
+            "018f47a6-7b80-7cc3-98a2-37b5f486b2a1",
+            "018f47a6-7b80-7cc3-98a2-37b5f486b2a9",
+        );
+        let sandboxed = |name: &str| {
+            let mut inst = tool_instance("prime-agent", project.to_str().unwrap());
+            inst.source_profile = "prime-fork-handoff".into();
+            inst.extra_args = "--session-dir /root/.prime/agent/sessions".into();
+            inst.sandbox_info = Some(test_sandbox(name, Some("/workspace/project")));
+            admit_sandbox_fixture(&inst);
+            inst
+        };
+        let plan_of = |inst: &Instance| {
+            inst.prime_agent_capture_plan(inst.prime_agent_capture_options().unwrap())
+                .unwrap()
+        };
+        let write_transcript = |plan: &PrimeAgentCapturePlan, id: &str| {
+            let dir = plan.store.join(&plan.session_dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            let path = dir.join(format!("{id}.jsonl"));
+            std::fs::write(
+                &path,
+                format!(
+                    "{{\"type\":\"session\",\"id\":\"{id}\",\"cwd\":\"{}\",\"rlmDepth\":0}}\n{{\"type\":\"message\"}}\n",
+                    plan.container_cwd
+                ),
+            )
+            .unwrap();
+            path
+        };
+
+        let parent = sandboxed("prime-fork-parent");
+        let parent_plan = plan_of(&parent);
+        let parent_transcript = write_transcript(&parent_plan, parent_id);
+        let parent_bytes = std::fs::read(&parent_transcript).unwrap();
+        let parent_binding = {
+            let config = parent.build_container_config().unwrap();
+            let _transport = install_container_transport(
+                &tmp.path().join("parent-transport"),
+                "prime-fork-parent",
+                &config.volumes,
+            );
+            parent.resolve_native_execution(None).unwrap().binding
+        };
+
+        let mut child = sandboxed("prime-fork-child");
+        let child_plan = plan_of(&child);
+        assert_ne!(child_plan.store, parent_plan.store);
+        child.resume_intent = ResumeIntent::Fork {
+            from: parent_id.into(),
+        };
+        child.resume_binding = Some(ConversationBinding {
+            session_id: parent_id.into(),
+            execution: Some(parent_binding.clone()),
+            provenance: ConversationProvenance::Observed,
+            transcript_path: None,
+        });
+        child.agent_session_id = Some(child_id.into());
+        let config = child.build_container_config().unwrap();
+        let _transport = install_container_transport(
+            &tmp.path().join("child-transport"),
+            "prime-fork-child",
+            &config.volumes,
+        );
+
+        let prepared = child
+            .prepare_launch_command(child.conversation_state())
+            .unwrap();
+        let command = prepared.command.as_deref().unwrap();
+        assert!(
+            command.contains(&format!("--fork {parent_id}")),
+            "{command}"
+        );
+        assert!(!command.contains("--resume"), "{command}");
+        assert!(prepared.fork_mints_child);
+        assert_eq!(
+            std::fs::read(
+                child_plan
+                    .store
+                    .join(&child_plan.session_dir)
+                    .join(format!("{parent_id}.jsonl"))
+            )
+            .unwrap(),
+            parent_bytes
+        );
+        assert_eq!(std::fs::read(&parent_transcript).unwrap(), parent_bytes);
+        let rebound = prepared
+            .canonical_conversation
+            .as_ref()
+            .and_then(|state| state.resume_binding.as_ref())
+            .and_then(|binding| binding.execution.as_ref())
+            .expect("the fork target is rebound to the child's context");
+        assert_ne!(rebound.stores, parent_binding.stores);
+        assert_eq!(
+            child
+                .resume_binding
+                .as_ref()
+                .and_then(|b| b.execution.as_ref()),
+            Some(&parent_binding),
+            "a prepared launch leaves the row untouched until it is adopted"
+        );
+
+        write_transcript(&child_plan, child_id);
+        child.adopt_conversation_state(prepared.canonical_conversation.unwrap());
+        child.resume_intent = ResumeIntent::Default;
+        child.resume_binding = None;
+        child.set_agent_conversation(Some(child_id.into()), None, None);
+        let restarted = child
+            .prepare_launch_command(child.conversation_state())
+            .unwrap();
+        let command = restarted.command.as_deref().unwrap();
+        assert!(
+            command.contains(&format!("--resume {child_id}")),
+            "{command}"
+        );
+        assert!(!command.contains(parent_id), "{command}");
     }
 
     #[test]

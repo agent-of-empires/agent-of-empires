@@ -4,6 +4,25 @@ Search existing [issues](../../issues) and [pull requests](../../pulls) before
 starting. Discuss significant features or architecture changes in an issue.
 All contributions follow the [Code of Conduct](CODE_OF_CONDUCT.md).
 
+## Contribution scope
+
+AoE favors a simple, focused core. Explain how a feature fits existing workflows
+and justifies added interface, configuration, and maintenance complexity, not just
+a small diff. Maintainers decide fit; discussion can change that judgment, but
+these guidelines do not guarantee acceptance.
+
+- Keep initial feature suggestions brief: explain the user problem, existing
+  workflow's limits, and proposed change. Read and edit your submission yourself,
+  including AI-generated text; respect maintainer reading time.
+- Check assignees and active PRs to avoid duplicate work. Agree on significant
+  designs, acceptance criteria, and non-goals before implementation; an issue
+  alone is not approval. Follow the latest agreed scope or ask to revisit it.
+- Fix the responsible layer, respect user configuration, and keep approved
+  opt-in behavior opt-in. Reuse existing sources of truth; justify new dependencies
+  and explain which build paths need them.
+- Keep unrelated improvements separate. Provide reproducible evidence and show
+  changed behavior working, following the [testing guidance](AGENTS.md).
+
 ## Setup
 
 Install Rust, Git, and tmux. Node.js and npm are needed only for the web
@@ -43,6 +62,11 @@ Open the PR against `main` and complete the template. Include:
 - how it was tested;
 - screenshots or recordings for UI changes;
 - related issues.
+
+AI agents propose; humans approve scope and implementation, review changes, and
+decide issue disposition or merge. You remain responsible for AI-assisted work:
+disclose tools and use in the [PR template](.github/pull_request_template.md)
+and answer reviewer questions yourself, not with generated replies.
 
 Before requesting review, run:
 

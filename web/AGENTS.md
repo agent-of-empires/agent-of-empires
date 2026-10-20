@@ -11,6 +11,7 @@ cd web
 npm run format:check
 npm run lint
 npx tsc -b
+npm run typecheck:tests
 ```
 
 `cargo xtask dev` runs the debug server on 8081 and Vite on 5173. A build

@@ -15,6 +15,7 @@ import { IDLE_DECAY_WINDOW_MS } from "./lib/session";
 import { diffSelectionStale } from "./lib/diffSelection";
 import { useSessions } from "./hooks/useSessions";
 import { useAttentionCounts } from "./hooks/useAttentionCounts";
+import { useStatusSounds } from "./hooks/useStatusSounds";
 import { useDashboardPresence } from "./hooks/useDashboardPresence";
 import { clearAcpCache } from "./hooks/useAcpSession";
 import { clearDraft, sweepOrphanDrafts } from "./lib/acpDrafts";
@@ -57,6 +58,7 @@ import { usePaneLayout, dockTabs, dockGroups, dockOf, isActiveTab, isDockCollaps
 import { isPluginPaneId, resolvePaneIcon, usePluginPanes, type PluginPane } from "./lib/pluginPanes";
 import { PluginPaneBody } from "./components/plugin/PluginPane";
 import { PluginPageView } from "./components/plugin/PluginPageView";
+import { PluginSessionMenu } from "./components/plugin/PluginSessionMenu";
 import { TOUR_ANCHORS, tourAnchor } from "./lib/tourSteps";
 import {
   deleteWorkspaceSessions,
@@ -356,9 +358,29 @@ function AppContent({
   const settingsRootMatch = useMatch("/settings");
   const settingsTabMatch = useMatch("/settings/:tab");
   const profilesMatch = useMatch("/profiles");
-  const activeSessionId = sessionMatch?.params.sessionId ?? null;
-  const showSettings = settingsRootMatch !== null || settingsTabMatch !== null;
   const pluginPageMatch = useMatch("/plugins/:pluginId/:pageId");
+  // A plugin page's split pane shows `?session=` as the routed session, docks and all.
+  const activeSessionId = sessionMatch?.params.sessionId ?? (pluginPageMatch ? searchParams.get("session") : null);
+  const selectPluginPageSession = useCallback(
+    (id: string | null) =>
+      setSearchParams(
+        (prev) => {
+          const next = new URLSearchParams(prev);
+          if (id) next.set("session", id);
+          else next.delete("session");
+          return next;
+        },
+        { replace: true },
+      ),
+    [setSearchParams],
+  );
+  // Off a removed session: back to the dashboard, or on a plugin page just out of its split pane.
+  const onPluginPage = pluginPageMatch !== null;
+  const leaveActiveSession = useCallback(
+    () => (onPluginPage ? selectPluginPageSession(null) : navigate("/")),
+    [onPluginPage, selectPluginPageSession, navigate],
+  );
+  const showSettings = settingsRootMatch !== null || settingsTabMatch !== null;
   // Settings and plugin pages take the full width, sidebar and session panels hidden.
   const fullPageView = showSettings || pluginPageMatch !== null;
   const settingsTab = settingsTabMatch?.params.tab ?? null;
@@ -399,6 +421,7 @@ function AppContent({
   const trashedWorkspaces = useMemo(() => workspaces.filter(workspaceIsTrashed), [workspaces]);
 
   const { unreadCount, waitingCount } = useAttentionCounts(sessions, activeSessionId);
+  useStatusSounds(sessions);
   const attentionBadgeColors = useMemo(() => getAttentionBadgeColors(resolvedTheme), [resolvedTheme]);
 
   // Remember the active session and restore it on a PWA relaunch (#2103).
@@ -560,6 +583,9 @@ function AppContent({
   // of tabs (diff, one-or-more terminals, plugin panes) with one active body.
   // The tab membership + active tab + terminal count are persisted per session;
   // dock sizes stay global (Dock/BottomDock own those localStorage keys).
+  // Null until the active Session's row loads, so nothing is seeded from a guess.
+  const activeRow = sessions.find((s) => s.id === activeSessionId);
+  const activeOutsideRepository = activeRow ? Boolean(activeRow.outside_repository) : null;
   const {
     layout: paneLayout,
     openTab,
@@ -572,7 +598,7 @@ function AppContent({
     togglePlugin,
     syncPlugins,
     setDockCollapsed,
-  } = usePaneLayout(activeSessionId);
+  } = usePaneLayout(activeSessionId, activeOutsideRepository);
   const pluginPanes = usePluginPanes(activeSessionId);
   const pluginPaneById = useMemo(() => {
     const m = new Map<string, PluginPane>();
@@ -581,16 +607,15 @@ function AppContent({
   }, [pluginPanes]);
 
   // Auto-add newly available plugin panes as tabs in their default dock; the
-  // layout suppresses any the user explicitly closed. When the user disabled
-  // plugin auto-open (#3035) pass an empty list rather than skipping the
-  // effect: syncPlugins still materializes the session's seeded layout on
-  // mount (pinning the diff/terminal defaults), it just adds no plugin panes.
-  // Manual activity-bar opens and already-open panes are unaffected.
+  // layout suppresses any the user explicitly closed. With plugin auto-open
+  // off (#3035) an empty list still pins the seeded diff/terminal defaults,
+  // which waits for the Session row so a non-git seed never keeps Diff (#4574).
   useEffect(() => {
+    if (activeOutsideRepository === null) return;
     syncPlugins(
       webSettings.autoOpenPluginPanes ? pluginPanes.map((p) => ({ id: p.id, defaultDock: p.defaultDock })) : [],
     );
-  }, [pluginPanes, syncPlugins, webSettings.autoOpenPluginPanes]);
+  }, [pluginPanes, syncPlugins, webSettings.autoOpenPluginPanes, activeOutsideRepository]);
 
   // One-shot lookup from plugin id to its manifest identity (icon name +
   // icon_asset URL), so a pane gets a real identity glyph, up to the plugin's
@@ -1192,7 +1217,7 @@ function AppContent({
         clearDraft(id);
         clearStoredComments(id);
       },
-      navigateHome: () => navigate("/"),
+      navigateHome: leaveActiveSession,
       notify: toastBus.handler,
     });
   };
@@ -1239,7 +1264,7 @@ function AppContent({
               clearDraft(id);
               clearStoredComments(id);
             },
-            navigateHome: () => navigate("/"),
+            navigateHome: leaveActiveSession,
             notify,
           },
         );
@@ -1250,7 +1275,7 @@ function AppContent({
     toastBus.handler?.[anyFailed ? "error" : "info"](
       anyFailed ? "Some trashed sessions could not be deleted" : "Emptied trash",
     );
-  }, [trashedWorkspaces, activeSessionId, setSessionStatus, navigate]);
+  }, [trashedWorkspaces, activeSessionId, setSessionStatus, leaveActiveSession]);
 
   // Move-to-trash path (#2489): the safe default. Unlike permanent delete it
   // deliberately KEEPS the per-session acp cache, draft, and stored comments
@@ -1264,7 +1289,7 @@ function AppContent({
     setDeletingSessionIds(null);
     for (const id of ids) setSessionStatus(id, "Stopped");
     if (wasActive) {
-      navigate("/");
+      leaveActiveSession();
     }
 
     // The returned snapshot re-buckets each row into Trash immediately
@@ -1752,7 +1777,8 @@ function AppContent({
           }
           setShowSessionWizard(false);
           setShowHelp(false);
-          if (showSettings) handleCloseSettings();
+          // Settings dialogs handle Escape after this capture-phase shortcut.
+          if (showSettings && !document.querySelector('[aria-modal="true"]')) handleCloseSettings();
           setShowAbout(false);
           setSelectedFile(null);
         },
@@ -1856,124 +1882,8 @@ function AppContent({
     [conversationHits, sessions, activeSessionId, handleSelectSession],
   );
 
-  const renderContent = () => {
-    if (pluginPageMatch) {
-      return (
-        <PluginPageView
-          key={pluginPageMatch.pathname}
-          pluginId={pluginPageMatch.params.pluginId ?? ""}
-          pageId={pluginPageMatch.params.pageId ?? ""}
-          onBack={handleClosePluginPage}
-          readOnly={serverAbout?.read_only ?? false}
-          cityhall={caps.cityhall}
-          theme={resolvedTheme}
-        />
-      );
-    }
-    if (showSettings) {
-      return (
-        <SettingsView
-          tab={settingsTab}
-          onClose={handleCloseSettings}
-          onSelectTab={(t) => {
-            const p = searchParams.get("profile");
-            // Marks a tab opened from the mobile section list, so its Back pops to it.
-            navigate(`/settings/${t}${p ? `?profile=${encodeURIComponent(p)}` : ""}`, {
-              state: { fromSettingsList: settingsTab === null },
-            });
-          }}
-          onShowList={() => {
-            if ((location.state as { fromSettingsList?: boolean } | null)?.fromSettingsList) {
-              navigate(-1);
-              return;
-            }
-            const p = searchParams.get("profile");
-            navigate(`/settings${p ? `?profile=${encodeURIComponent(p)}` : ""}`, { replace: true });
-          }}
-          onServerAboutRefresh={refreshServerAbout}
-          profile={searchParams.get("profile")}
-          onSelectProfile={(p) => {
-            const next = new URLSearchParams(searchParams);
-            next.set("profile", p);
-            setSearchParams(next, { replace: true });
-          }}
-          readOnly={serverAbout?.read_only}
-          cityhall={caps.cityhall}
-        />
-      );
-    }
-
-    // Refresh on `/session/<id>` paints once with `sessions === []` before
-    // the first poll resolves. Without this guard the lookup misses, the
-    // dashboard fallback renders, and the acp/terminal view only
-    // reappears once the fetch lands. Hold the minimal pre-auth shell
-    // until the first fetch settles, then let the real fallback decide.
-    // See #1351.
-    if (activeSessionId && !sessionsLoaded) {
-      // The shell (TopBar + sidebar) already renders around this; fill the main
-      // pane with a skeleton rather than blanking it until the first fetch lands.
-      return <MainPaneSkeleton />;
-    }
-
-    if (!activeWorkspace || !activeSession) {
-      return (
-        <Dashboard
-          sessions={sessions}
-          onSelectSession={handleSelectSession}
-          onNewSession={handleNewSession}
-          onCloneFromUrl={handleCloneFromUrl}
-          onToggleSidebar={handleToggleSidebar}
-          readOnly={serverAbout?.read_only}
-          canManageProjects={caps.canManageProjects}
-        />
-      );
-    }
-
-    // Below the md breakpoint there is no room for the side-by-side split.
-    // Render one full-viewport pane and let the picker choose which view
-    // occupies it (#1452). The agent terminal (and the paired shell, once
-    // first opened) stay mounted but hidden so their PTY, scrollback, and
-    // focus survive view switches; the diff view has no xterm so it mounts
-    // on demand. Inactive layers use visibility, never display:none, which
-    // would collapse xterm's measured geometry to zero. The desktop branch
-    // below is left exactly as it was; only this mobile branch is new.
-    if (singlePane) {
-      return (
-        <MobileMainPane
-          view={rightPanelView}
-          pluginPanes={pluginPanes}
-          onBackToAgent={() => handlePickView("agent")}
-          onOpenAgentsPane={() => handlePickView("agents")}
-          pairedMounted={pairedMounted}
-          activeSession={activeSession ?? null}
-          activeSessionId={activeSessionId}
-          sessions={sessions}
-          webSettings={webSettings}
-          selectedFilePath={selectedFilePath}
-          selectedRepoName={selectedRepoName}
-          selectedFileLine={selectedFileLine}
-          revision={revision}
-          diffFiles={diffFiles}
-          perRepoBases={perRepoBases}
-          warning={warning}
-          diffFilesLoading={diffFilesLoading}
-          onSelectFile={handleSelectFile}
-          onOpenFileRef={handleOpenFileRef}
-          onCloseFile={handleCloseFile}
-          onDiffRefresh={refreshDiffFiles}
-          commentsEnabled={commentsEnabled}
-          commentSendEnabled={commentSendEnabled}
-          commentSendDisabledReason={commentSendDisabledReason}
-          diffComments={diffComments}
-          commentsIsMultiRepo={commentsIsMultiRepo}
-          sendDialogOpen={sendDialogOpen}
-          onOpenSendDialog={() => setSendDialogOpen(true)}
-          onCloseSendDialog={() => setSendDialogOpen(false)}
-          onClearSelectedFile={() => setSelectedFile(null)}
-        />
-      );
-    }
-
+  /** The routed session with its docks: the session route, or a plugin page's split pane. */
+  const renderSessionLayout = () => {
     // Render a pane body by id. Passed to the docks as a callback (rather than
     // building an array of {icon, body} objects here) so the per-session JSX is
     // constructed inside the dock, not threaded through a prop object.
@@ -2143,6 +2053,147 @@ function AppContent({
         )}
       </div>
     );
+  };
+
+  const renderContent = () => {
+    if (pluginPageMatch) {
+      return (
+        <PluginPageView
+          key={pluginPageMatch.pathname}
+          pluginId={pluginPageMatch.params.pluginId ?? ""}
+          pageId={pluginPageMatch.params.pageId ?? ""}
+          onBack={handleClosePluginPage}
+          readOnly={serverAbout?.read_only ?? false}
+          cityhall={caps.cityhall}
+          theme={resolvedTheme}
+          selectedSessionId={activeSessionId}
+          onSelectSession={selectPluginPageSession}
+          renderSession={() => {
+            if (!sessionsLoaded) return { title: "", view: <MainPaneSkeleton /> };
+            return activeSession ? { title: activeSession.title, view: renderSessionLayout() } : null;
+          }}
+          renderSessionMenu={(request) => (
+            <PluginSessionMenu
+              request={request}
+              workspaces={workspaces}
+              readOnly={serverAbout?.read_only ?? false}
+              handlers={{
+                onDelete: handleDeleteSession,
+                onStop: handleStopSession,
+                onStart: handleStartSession,
+                onSwitchView: handleSwitchView,
+                onCreateSession: handleCreateSession,
+              }}
+            />
+          )}
+        />
+      );
+    }
+    if (showSettings) {
+      return (
+        <SettingsView
+          tab={settingsTab}
+          onClose={handleCloseSettings}
+          onSelectTab={(t) => {
+            const p = searchParams.get("profile");
+            // Marks a tab opened from the mobile section list, so its Back pops to it.
+            navigate(`/settings/${t}${p ? `?profile=${encodeURIComponent(p)}` : ""}`, {
+              state: { fromSettingsList: settingsTab === null },
+            });
+          }}
+          onShowList={() => {
+            if ((location.state as { fromSettingsList?: boolean } | null)?.fromSettingsList) {
+              navigate(-1);
+              return;
+            }
+            const p = searchParams.get("profile");
+            navigate(`/settings${p ? `?profile=${encodeURIComponent(p)}` : ""}`, { replace: true });
+          }}
+          onServerAboutRefresh={refreshServerAbout}
+          profile={searchParams.get("profile")}
+          onSelectProfile={(p) => {
+            const next = new URLSearchParams(searchParams);
+            next.set("profile", p);
+            setSearchParams(next, { replace: true });
+          }}
+          readOnly={serverAbout?.read_only}
+          cityhall={caps.cityhall}
+        />
+      );
+    }
+
+    // Refresh on `/session/<id>` paints once with `sessions === []` before
+    // the first poll resolves. Without this guard the lookup misses, the
+    // dashboard fallback renders, and the acp/terminal view only
+    // reappears once the fetch lands. Hold the minimal pre-auth shell
+    // until the first fetch settles, then let the real fallback decide.
+    // See #1351.
+    if (activeSessionId && !sessionsLoaded) {
+      // The shell (TopBar + sidebar) already renders around this; fill the main
+      // pane with a skeleton rather than blanking it until the first fetch lands.
+      return <MainPaneSkeleton />;
+    }
+
+    if (!activeWorkspace || !activeSession) {
+      return (
+        <Dashboard
+          sessions={sessions}
+          onSelectSession={handleSelectSession}
+          onNewSession={handleNewSession}
+          onCloneFromUrl={handleCloneFromUrl}
+          onToggleSidebar={handleToggleSidebar}
+          readOnly={serverAbout?.read_only}
+          canManageProjects={caps.canManageProjects}
+        />
+      );
+    }
+
+    // Below the md breakpoint there is no room for the side-by-side split.
+    // Render one full-viewport pane and let the picker choose which view
+    // occupies it (#1452). The agent terminal (and the paired shell, once
+    // first opened) stay mounted but hidden so their PTY, scrollback, and
+    // focus survive view switches; the diff view has no xterm so it mounts
+    // on demand. Inactive layers use visibility, never display:none, which
+    // would collapse xterm's measured geometry to zero. The desktop branch
+    // below is left exactly as it was; only this mobile branch is new.
+    if (singlePane) {
+      return (
+        <MobileMainPane
+          view={rightPanelView}
+          pluginPanes={pluginPanes}
+          onBackToAgent={() => handlePickView("agent")}
+          onOpenAgentsPane={() => handlePickView("agents")}
+          pairedMounted={pairedMounted}
+          activeSession={activeSession ?? null}
+          activeSessionId={activeSessionId}
+          sessions={sessions}
+          webSettings={webSettings}
+          selectedFilePath={selectedFilePath}
+          selectedRepoName={selectedRepoName}
+          selectedFileLine={selectedFileLine}
+          revision={revision}
+          diffFiles={diffFiles}
+          perRepoBases={perRepoBases}
+          warning={warning}
+          diffFilesLoading={diffFilesLoading}
+          onSelectFile={handleSelectFile}
+          onOpenFileRef={handleOpenFileRef}
+          onCloseFile={handleCloseFile}
+          onDiffRefresh={refreshDiffFiles}
+          commentsEnabled={commentsEnabled}
+          commentSendEnabled={commentSendEnabled}
+          commentSendDisabledReason={commentSendDisabledReason}
+          diffComments={diffComments}
+          commentsIsMultiRepo={commentsIsMultiRepo}
+          sendDialogOpen={sendDialogOpen}
+          onOpenSendDialog={() => setSendDialogOpen(true)}
+          onCloseSendDialog={() => setSendDialogOpen(false)}
+          onClearSelectedFile={() => setSelectedFile(null)}
+        />
+      );
+    }
+
+    return renderSessionLayout();
   };
 
   // No root-height pin remains: every mobile terminal surface (agent,
@@ -2471,7 +2522,16 @@ function AppContent({
           <ScratchOverridesModal profile={serverAbout?.profile ?? ""} onClose={() => setScratchSettingsOpen(false)} />
         )}
 
-        {welcome.showWelcome && <ThemeIntro onDone={welcome.dismissWelcome} />}
+        {welcome.showWelcome && (
+          <ThemeIntro
+            onDone={welcome.dismissWelcome}
+            tourFollows={!isCoarse}
+            onSkipTour={() => {
+              handleTourSeen();
+              welcome.dismissWelcome();
+            }}
+          />
+        )}
 
         {tour.tourElement}
 

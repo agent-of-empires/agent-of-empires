@@ -66,7 +66,12 @@ export function useSidebarTriage(workspaces: readonly Workspace[]) {
 
   const archive = useCallback(
     (ws: Workspace, archived: boolean) =>
-      triage(ws, { archived }, { archived: null }, (id) => setSessionArchive(id, archived)),
+      triage(
+        ws,
+        { archived, archivedSessionId: ws.sessions[0]?.id ?? null },
+        { archived: null, archivedSessionId: null },
+        (id) => setSessionArchive(id, archived),
+      ),
     [triage],
   );
 

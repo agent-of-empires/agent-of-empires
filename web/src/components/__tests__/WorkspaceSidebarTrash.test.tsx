@@ -246,8 +246,11 @@ describe("WorkspaceSidebar row actions on a group slice (#4019)", () => {
       click(`sidebar-context-menu-${item}`);
     };
 
+    // Two running siblings share the row, so Stop asks which one.
     act("beta", "stop");
-    expect(onStopSession).toHaveBeenCalledWith("b1");
+    expect(onStopSession).not.toHaveBeenCalled();
+    fireEvent.click(screen.getAllByTestId("sidebar-context-menu-stop-target")[1]!);
+    expect(onStopSession).toHaveBeenCalledWith("b2");
     act("alpha", "start");
     expect(onStartSession).toHaveBeenCalledWith("a1");
     act("beta", "delete");

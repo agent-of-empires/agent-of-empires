@@ -36,7 +36,7 @@ function group(over: Partial<SidebarGroup> = {}): SidebarGroup {
     defaultDisplayName: "my-project",
     alias: null,
     color: null,
-    remoteOwner: null,
+    remoteOwnerKey: null,
     workspaces: views(workspace("w1", idle(3))),
     status: "idle",
     collapsed: false,
@@ -130,13 +130,27 @@ describe("SidebarGroupHeader", () => {
     }
   });
 
-  it("renders the owner avatar when there is a remote owner, else the folder icon", () => {
-    renderHeader({ group: group({ remoteOwner: "octocat" }) });
-    expect(screen.getByRole("img").getAttribute("alt")).toBe("octocat");
-    cleanup();
-    renderHeader();
-    expect(screen.queryByRole("img")).toBeNull();
-    expect(screen.getByTestId("sidebar-group-icon")).not.toBeNull();
+  it("shows the owner avatar only for GitHub remotes, and the folder otherwise or once the image fails", () => {
+    const folder = () => screen.getByTestId("sidebar-group-icon").querySelector("svg.lucide-folder");
+    // (remoteOwnerKey, avatar src); no src means no image, so no request.
+    const cases: Array<[string | null, string | null]> = [
+      ["octocat@github.com", "https://github.com/octocat.png?size=32"],
+      ["acme@gitlab.com", null],
+      [null, null],
+    ];
+    for (const [key, src] of cases) {
+      renderHeader({ group: group({ remoteOwnerKey: key }) });
+      const img = screen.queryByRole("img");
+      expect(img?.getAttribute("src") ?? null, String(key)).toBe(src);
+      if (img) {
+        expect(img.getAttribute("alt")).toBe("octocat");
+        expect(folder()).toBeNull();
+        fireEvent.error(img);
+        expect(screen.queryByRole("img")).toBeNull();
+      }
+      expect(folder(), String(key)).not.toBeNull();
+      cleanup();
+    }
   });
 
   it("marks the header draggable only with a drag handle", () => {

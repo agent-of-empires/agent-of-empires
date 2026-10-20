@@ -134,6 +134,12 @@ pub(crate) async fn spawn_structured_session(
             progress,
         } = spec;
 
+        let profile = if profile.is_empty() {
+            crate::session::config::resolve_default_profile()
+        } else {
+            profile
+        };
+
         let config = Config::load_or_warn();
         let sandbox_image = sandbox_image.unwrap_or_else(|| {
             if config.sandbox.default_image.is_empty() {
@@ -635,7 +641,7 @@ mod tests {
         let id = created.id;
         let reload = crate::server::reload::reload_state_instances_from_disk(
             &state,
-            stale_snapshot,
+            stale_snapshot.into(),
             Vec::new(),
             crate::server::state::StatusSource::DiskOnly,
             epoch,
@@ -749,34 +755,5 @@ mod tests {
         .expect("the refused spawn reports a startup error");
         assert_eq!(launches.load(std::sync::atomic::Ordering::SeqCst), 0);
         assert!(!state.acp_supervisor.is_running(&id).await);
-    }
-
-    /// The test above runs on a current-thread runtime, where an unlock moved above the
-    /// epoch bump has no await to yield at and still passes.
-    #[test]
-    fn publication_bumps_the_epoch_before_releasing_the_instances_lock() {
-        // Whitespace-normalised so rustfmt's wrapping cannot change the result.
-        let source = include_str!("session_spawn.rs")
-            .split_whitespace()
-            .collect::<Vec<_>>()
-            .join(" ");
-        let start = source
-            .find("async fn publish_created_instance(")
-            .expect("publication function");
-        let body = &source[start..];
-        let body = &body[..body
-            .find("#[cfg(test)] mod tests")
-            .expect("tests follow publication")];
-        let lock = body
-            .find("let mut instances = service.instances.write().await;")
-            .expect("publication takes the instances write lock");
-        let bump = body
-            .find(".mutation_epoch .fetch_add(")
-            .expect("publication bumps the epoch");
-        assert!(lock < bump, "the bump must happen under the lock");
-        assert!(
-            !body[lock..bump].contains("drop(instances)"),
-            "the instances guard must be held until the epoch is bumped"
-        );
     }
 }

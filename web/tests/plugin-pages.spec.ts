@@ -1,6 +1,7 @@
 // #4460: plugin pages open full width from the TopBar or palette, framed with
-// `sandbox="allow-scripts"` so plugin script never runs on the dashboard origin.
+// `sandbox="allow-scripts allow-downloads"` so plugin script never runs on the dashboard origin.
 
+import { readFileSync } from "node:fs";
 import { test, expect } from "./helpers/mockedTest";
 import { mockStaticApis, mockSessionShellApis } from "./helpers/apiMocks";
 import { sessionResponse } from "./helpers/sessions";
@@ -19,11 +20,17 @@ const WRITE_PAGE = { ...PAGE, capabilities: ["session.read", "session.write"] };
 
 // The daemon's page policy (src/server/api/plugins.rs `PLUGIN_PAGE_CSP`).
 const PAGE_CSP =
-  "sandbox allow-scripts; default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; " +
+  "sandbox allow-scripts allow-downloads; default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; " +
   "img-src data: blob:; connect-src 'none'; form-action 'none'; base-uri 'none'; frame-ancestors 'self'";
 
 // Reports what the page could reach back to the dashboard.
-const FIXTURE = `<!doctype html><p>board fixture</p><script>
+const FIXTURE = `<!doctype html><p>board fixture</p><button id="export">Export</button><script>
+document.getElementById("export").onclick = () => {
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(new Blob(['{"ok":true}'], { type: "application/json" }));
+  a.download = "board.json";
+  a.click();
+};
 const probe = (f) => { try { return String(f()); } catch (e) { return "blocked:" + e.name; } };
 const report = { storage: probe(() => localStorage.getItem("aoe_auth_token")), cookie: probe(() => document.cookie), href: location.href };
 fetch("/api/sessions").then(() => "reached", (e) => "blocked:" + e.name).then((api) => parent.postMessage({ ...report, api }, "*"));
@@ -144,12 +151,12 @@ test.describe("Plugin pages (#4460)", () => {
     });
   });
 
-  test("no Pages menu or palette group without a declared page", async ({ page }) => {
+  test("no page button or palette group without a declared page", async ({ page }) => {
     await mockApis(page, []);
     await searchPalette(page, "board");
     await expect(page.getByRole("option", { name: /Board/ })).toHaveCount(0);
     await page.keyboard.press("Escape");
-    await expect(page.getByRole("button", { name: "Pages" })).toHaveCount(0);
+    await expect(page.getByRole("banner").getByRole("button", { name: "Board", exact: true })).toHaveCount(0);
   });
 
   test("opens from the TopBar full width, sandboxed, and Back returns to the session", async ({ page }) => {
@@ -165,15 +172,23 @@ test.describe("Plugin pages (#4460)", () => {
     });
 
     await page.goto("/session/sess-a");
-    await page.getByRole("button", { name: "Pages" }).click();
-    await page.getByRole("menuitem", { name: "Board" }).click();
+    await page.getByRole("banner").getByRole("button", { name: "Board", exact: true }).click();
 
     await expect(page).toHaveURL("/plugins/acme.kit/board");
+    await expect(page.getByRole("banner").getByRole("button", { name: "Board", exact: true })).toHaveAttribute(
+      "aria-current",
+      "page",
+    );
     await expect(page.getByRole("navigation", { name: "Sessions sidebar" })).toHaveCount(0);
     const frame = page.getByTestId("plugin-page-frame");
-    await expect(frame).toHaveAttribute("sandbox", "allow-scripts");
+    await expect(frame).toHaveAttribute("sandbox", "allow-scripts allow-downloads");
     await expect(frame).toHaveAttribute("src", new RegExp(`^${PAGE.url}#[0-9a-f]{32}$`));
     await expect(page.frameLocator("[data-testid=plugin-page-frame]").getByText("board fixture")).toBeVisible();
+    const download = page.waitForEvent("download");
+    await page.frameLocator("[data-testid=plugin-page-frame]").getByRole("button", { name: "Export" }).click();
+    const saved = await download;
+    expect(saved.suggestedFilename()).toBe("board.json");
+    expect(readFileSync((await saved.path())!, "utf8")).toBe('{"ok":true}');
     expect(order.slice(0, 2)).toEqual([`POST ${PAGE.url}/ticket`, `GET ${PAGE.url}`]);
 
     const report = await page.waitForFunction(
@@ -268,6 +283,101 @@ test.describe("Plugin pages (#4460)", () => {
       (window as typeof window & { call: (m: string, p: unknown) => unknown }).call("openSession", { id: "sess-a" }),
     );
     await expect(page).toHaveURL("/session/sess-a");
+  });
+
+  test("split view shows the opened session below the page and tells the page", async ({ page }) => {
+    await mockApis(page, [PAGE]);
+    await page.route(`**${PAGE.url}`, (r) =>
+      r.fulfill({ contentType: "text/html", headers: { "content-security-policy": PAGE_CSP }, body: BRIDGE_FIXTURE }),
+    );
+    await page.route("**/api/plugins/*/action", (r) => r.fulfill({ status: 202, json: { ok: true } }));
+
+    await page.goto("/plugins/acme.kit/board");
+    await expect.poll(() => latestReport(page, "results")).toBeTruthy();
+    const frame = page.frames().find((f) => new URL(f.url()).pathname === PAGE.url)!;
+    const selections = () => frame.evaluate("pushes.filter((m) => m.event === 'selection').map((m) => m.data)");
+    await expect.poll(selections).toEqual([{ sessionId: null }]);
+
+    await page.getByRole("button", { name: "Split view" }).click();
+    await expect(page.getByRole("button", { name: "Split view" })).toHaveAttribute("aria-pressed", "true");
+    await expect(page.getByTestId("plugin-page-split-session")).toContainText("No session selected");
+
+    await frame.evaluate("call('openSession', { id: 'sess-a' })");
+    const pane = page.getByTestId("plugin-page-split-session");
+    await expect(pane.getByTestId("plugin-page-split-title")).toHaveText("Ethiopians");
+    // The pane is the session's full view, docks included.
+    await expect(pane.getByTestId("pane-tab-diff")).toBeVisible();
+    await expect(page).toHaveURL("/plugins/acme.kit/board?session=sess-a");
+    await expect.poll(selections).toEqual([{ sessionId: null }, { sessionId: "sess-a" }]);
+
+    // Maximized, the page hides without reloading.
+    await page.getByRole("button", { name: "Maximize session" }).click();
+    await expect(page.getByTestId("plugin-page-frame")).toBeHidden();
+    await page.getByRole("button", { name: "Restore split" }).click();
+    await expect(page.getByTestId("plugin-page-frame")).toBeVisible();
+    expect(await frame.evaluate("pushes.filter((m) => m.event === 'selection').length")).toBe(2);
+
+    await page.getByRole("button", { name: "Open full" }).click();
+    await expect(page).toHaveURL("/session/sess-a");
+  });
+
+  test("session.contextMenu opens the sidebar's session menu over the page", async ({ page }) => {
+    await mockApis(page, [PAGE]);
+    await page.route(`**${PAGE.url}`, (r) =>
+      r.fulfill({ contentType: "text/html", headers: { "content-security-policy": PAGE_CSP }, body: BRIDGE_FIXTURE }),
+    );
+    await page.route("**/api/plugins/*/action", (r) => r.fulfill({ status: 202, json: { ok: true } }));
+    await page.route("**/api/plugins/acme.kit/sessions", (r) => r.fulfill({ json: { sessions: [{ id: "sess-a" }] } }));
+    const renames: unknown[] = [];
+    await page.route("**/api/sessions/sess-a", (r) => {
+      if (r.request().method() !== "PATCH") return r.fallback();
+      renames.push(r.request().postDataJSON());
+      return r.fulfill({ json: sessionResponse({ id: "sess-a", title: "Renamed" }) });
+    });
+
+    await page.goto("/plugins/acme.kit/board");
+    await expect.poll(() => latestReport(page, "results")).toBeTruthy();
+    const frame = page.frames().find((f) => new URL(f.url()).pathname === PAGE.url)!;
+    const open = (items: unknown[] = []) =>
+      frame.evaluate((items) => {
+        // Not returned: evaluate would await the reply, which comes only once the menu closes.
+        const w = window as typeof window & { menu: unknown; call: (m: string, p: unknown) => Promise<unknown> };
+        w.menu = undefined;
+        void w.call("session.contextMenu", { id: "sess-a", x: 40, y: 50, items }).then((reply) => (w.menu = reply));
+      }, items);
+    const menuReply = () => frame.evaluate(() => (window as typeof window & { menu: unknown }).menu);
+    const menu = page.getByTestId("sidebar-context-menu");
+
+    await open([{ id: "move:done", label: "Move to Done" }]);
+    await expect(menu).toBeVisible();
+    const frameBox = (await page.getByTestId("plugin-page-frame").boundingBox())!;
+    const menuBox = (await menu.boundingBox())!;
+    expect(menuBox.x).toBeCloseTo(frameBox.x + 40, 0);
+    expect(menuBox.y).toBeCloseTo(frameBox.y + 50, 0);
+    await menu.getByRole("button", { name: "Move to Done" }).click();
+    await expect(menu).toHaveCount(0);
+    await expect.poll(menuReply).toMatchObject({ result: "move:done" });
+
+    await open();
+    await page.getByTestId("sidebar-context-menu-snooze").click();
+    await expect(page.getByTestId("snooze-modal")).toBeVisible();
+    await expect.poll(menuReply).toMatchObject({ result: null });
+    await page.keyboard.press("Escape");
+
+    await open();
+    await page.getByTestId("sidebar-context-menu-rename").click();
+    await page.getByTestId("rename-modal-input").fill("Renamed");
+    await page.getByRole("button", { name: "Rename", exact: true }).click();
+    await expect(page.getByTestId("rename-modal")).toHaveCount(0);
+    expect(renames).toEqual([{ title: "Renamed" }]);
+
+    // A click back on the page dismisses the menu.
+    await open();
+    await expect(menu).toBeVisible();
+    // A raw click does not retry, so wait out the shield that swallows clicks just after opening.
+    await expect(page.getByTestId("plugin-session-menu-backdrop")).toHaveAttribute("data-armed", "true");
+    await page.mouse.click(frameBox.x + frameBox.width - 20, frameBox.y + frameBox.height - 20);
+    await expect(menu).toHaveCount(0);
   });
 
   test("a page without session.write cannot archive or trash", async ({ page }) => {

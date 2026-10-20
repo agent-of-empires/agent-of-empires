@@ -269,6 +269,16 @@ fn render_footer(frame: &mut Frame, area: Rect, theme: &Theme, state: &RemoteHom
         " j/k=navigate · Enter=open · r=refresh · q=quit ",
         Style::default().fg(theme.hint),
     ));
+    if !plugin_ui::sort_specs(&state.plugin_ui).is_empty() {
+        let mode = match state.active_sort_spec() {
+            Some(s) => format!("{} {}", s.label, if s.descending { "↓" } else { "↑" }),
+            None => "title".to_string(),
+        };
+        spans.push(Span::styled(
+            format!("· s=sort ({mode}) "),
+            Style::default().fg(theme.hint),
+        ));
+    }
     if let Some(session) = selected {
         spans.push(Span::styled(
             format!(
@@ -491,6 +501,28 @@ mod tests {
             );
             assert_eq!(column_of(&painted, "/tmp/s1"), 54, "{painted:?}");
         }
+    }
+
+    #[test]
+    fn footer_offers_sort_only_when_a_sort_key_is_published() {
+        let sort_key = json!({"plugin_id": "gh", "slot": "sort-key", "id": "k",
+            "payload": {"label": "Attention", "column": "att", "direction": "desc"}});
+        let mut state = state_with(&["s1"], json!([sort_key]));
+        let painted = rows(&state);
+        assert!(
+            painted.iter().any(|l| l.contains("s=sort (title)")),
+            "{painted:?}"
+        );
+
+        state.cycle_sort();
+        let painted = rows(&state);
+        assert!(
+            painted.iter().any(|l| l.contains("s=sort (Attention ↓)")),
+            "{painted:?}"
+        );
+
+        let painted = rows(&state_with(&["s1"], json!([])));
+        assert!(!painted.iter().any(|l| l.contains("s=sort")), "{painted:?}");
     }
 
     #[test]

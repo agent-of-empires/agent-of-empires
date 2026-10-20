@@ -622,6 +622,7 @@ impl Instance {
             .context(unresolved)?
             .ok_or_else(|| anyhow::anyhow!(unresolved))?;
         self.adopt_conversation_state(ConversationState {
+            tool: self.tool.clone(),
             session_id: Some(sid.clone()),
             binding: Some(binding.clone()),
             intent: ResumeIntent::Use(sid),

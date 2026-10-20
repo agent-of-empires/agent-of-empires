@@ -1,10 +1,11 @@
 //! Shared wire types for the daemon REST API.
 
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::session::SessionScope;
 /// Which ACP `ContentBlock` an attachment maps to; the lowercase form is the wire contract.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum PromptAttachmentKind {
     Image,
@@ -33,7 +34,7 @@ impl PromptAttachmentKind {
 
 /// Metadata only: the blob is fetched lazily from `GET /acp/attachments/{id}` so the event
 /// log stays small.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct PromptAttachmentRef {
     pub id: String,
     pub kind: PromptAttachmentKind,
@@ -44,7 +45,7 @@ pub struct PromptAttachmentRef {
 }
 
 /// One queued follow-up prompt, owned by the daemon so it drains with no tab open.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct QueuedPromptEntry {
     /// Client-minted, stable across edits; also the optimistic-echo reconcile key.
     pub id: String,
@@ -63,7 +64,7 @@ pub struct QueuedPromptEntry {
 }
 
 /// Ephemeral worker lifecycle; never persisted to the event log.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum AcpWorkerState {
     #[default]
@@ -73,7 +74,22 @@ pub enum AcpWorkerState {
     Stopping,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum AcpWorkerStartKind {
+    FirstStart,
+    Resume,
+}
+
+/// How the current worker start began; present only while the state is `resuming`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct AcpWorkerStart {
+    pub kind: AcpWorkerStartKind,
+    /// RFC 3339, fixed for one admitted start.
+    pub started_at: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum ContextResumeUnavailableReason {
     AgentUnsupported,
@@ -86,7 +102,7 @@ pub enum ContextResumeUnavailableReason {
     NoTarget,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum ContextResumeIndeterminateReason {
     RuntimeCheckRequired,
@@ -94,7 +110,7 @@ pub enum ContextResumeIndeterminateReason {
 }
 
 /// Whether context survives a future lifecycle transition, not current start eligibility.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "state", rename_all = "snake_case")]
 pub enum ContextResumeAvailability {
     Available,
@@ -106,7 +122,7 @@ pub enum ContextResumeAvailability {
     },
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema)]
 pub struct PendingApproval {
     pub nonce: String,
     pub tool_name: String,
@@ -118,7 +134,7 @@ pub struct PendingApproval {
 }
 
 /// Decoding requires only `id`; every other field defaults so an older daemon cannot break the list.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct SessionResponse {
     pub id: String,
     #[serde(default)]
@@ -205,6 +221,8 @@ pub struct SessionResponse {
     pub context_resume: Option<ContextResumeAvailability>,
     #[serde(default)]
     pub acp_worker_state: AcpWorkerState,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub acp_worker_start: Option<AcpWorkerStart>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub pending_approvals: Vec<PendingApproval>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -248,21 +266,21 @@ pub struct SessionResponse {
     pub monitor_description: Option<String>,
 }
 
-#[derive(Serialize, Deserialize, Clone, Debug)]
+#[derive(Serialize, Deserialize, Clone, Debug, JsonSchema)]
 pub struct PlanSummary {
     pub current_step_title: Option<String>,
     pub completed: u32,
     pub total: u32,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct WorkspaceRepoSummary {
     pub name: String,
     pub source_path: String,
     pub branch: String,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
 pub struct CleanupDefaults {
     pub delete_worktree: bool,
     pub delete_branch: bool,
@@ -270,7 +288,7 @@ pub struct CleanupDefaults {
     pub delete_to_trash: bool,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct SessionsEnvelope {
     pub sessions: Vec<SessionResponse>,
     #[serde(default)]
@@ -294,6 +312,10 @@ mod tests {
         assert_eq!(row.status, "");
         assert_eq!(row.view, crate::session::View::Terminal);
         assert_eq!(row.acp_worker_state, AcpWorkerState::Absent);
+        assert_eq!(row.acp_worker_start, None);
+        assert!(!serde_json::to_string(&row)
+            .unwrap()
+            .contains("acp_worker_start"));
         assert!(!row.cleanup_defaults.delete_to_trash);
         assert!(row.workspace_repos.is_empty());
         assert_eq!(row.context_resume, None);

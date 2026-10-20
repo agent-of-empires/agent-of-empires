@@ -551,8 +551,9 @@ mod tests {
 
     const VALID_SID: &str = "019342ab-1234-7def-8901-abcdef012345";
 
-    fn expected_state(sid: Option<&str>, intent: ResumeIntent) -> ConversationState {
+    fn expected_state(tool: &str, sid: Option<&str>, intent: ResumeIntent) -> ConversationState {
         ConversationState {
+            tool: tool.to_owned(),
             session_id: sid.map(str::to_owned),
             binding: None,
             intent,
@@ -696,6 +697,29 @@ mod tests {
 
     #[test]
     #[serial]
+    fn legacy_capture_does_not_cross_a_tool_swap() {
+        let profile = "capture-tool-swap";
+        let mut snapshot = make_inst(profile, "legacy");
+        snapshot.tool = "claude".into();
+        let expected = snapshot.conversation_state();
+        let (_temp, _home, storage) = seeded(profile, &[&snapshot]);
+        storage
+            .update(|rows, _| {
+                rows[0].tool = "codex".into();
+                Ok(())
+            })
+            .unwrap();
+        let observed =
+            crate::session::poller::SessionIdObservation::instance_sidecar(VALID_SID.into(), None);
+        assert_eq!(
+            persist_session_with_storage(&storage, &snapshot.id, &observed, &expected),
+            SidWrite::Skipped
+        );
+        assert!(storage.load().unwrap()[0].agent_session_id.is_none());
+    }
+
+    #[test]
+    #[serial]
     fn persist_session_to_storage_is_cas_guarded() {
         for (prior, expected, disk) in [
             (Some("old"), SidWrite::Applied, "new"),
@@ -709,7 +733,7 @@ mod tests {
                 profile,
                 &inst.id,
                 &observation("new"),
-                &expected_state(prior, ResumeIntent::Default),
+                &expected_state(&inst.tool, prior, ResumeIntent::Default),
                 &FileWatchService::noop(),
             );
             assert_eq!(write, expected);
@@ -1189,7 +1213,7 @@ mod tests {
             profile,
             &inst.id,
             &observation("new-sid"),
-            &expected_state(Some("old"), ResumeIntent::Default),
+            &expected_state(&inst.tool, Some("old"), ResumeIntent::Default),
             &svc,
         );
         assert_eq!(write, SidWrite::Applied);
@@ -1228,7 +1252,7 @@ mod tests {
 
         let outcome = inst.persist_session_id_with_storage(
             &storage,
-            &expected_state(None, ResumeIntent::Default),
+            &expected_state(&inst.tool, None, ResumeIntent::Default),
         );
         assert_eq!(outcome, SidPersistOutcome::Published);
         let loaded = storage.load().unwrap();
@@ -1328,7 +1352,7 @@ mod tests {
         inst.resume_intent = ResumeIntent::Use(VALID_SID.into());
         let (_temp, _home, storage) = seeded(profile, &[&inst]);
 
-        let expected = expected_state(Some(VALID_SID), inst.resume_intent.clone());
+        let expected = expected_state(&inst.tool, Some(VALID_SID), inst.resume_intent.clone());
         let _ = inst.persist_session_id(profile, &expected);
         assert_eq!(
             inst.resume_intent,
@@ -1336,7 +1360,7 @@ mod tests {
             "configured capture support is not enough without a launch publisher"
         );
         inst.identity_publisher_launched = true;
-        let expected = expected_state(Some(VALID_SID), inst.resume_intent.clone());
+        let expected = expected_state(&inst.tool, Some(VALID_SID), inst.resume_intent.clone());
         let _ = inst.persist_session_id(profile, &expected);
         assert_eq!(inst.resume_intent, ResumeIntent::Default);
         assert_eq!(
@@ -1809,7 +1833,7 @@ mod tests {
                 inst.finalize_launch(
                     tmux.name(),
                     profile,
-                    &expected_state(prior, prior_intent),
+                    &expected_state(&inst.tool, prior, prior_intent),
                     None,
                     false,
                 )

@@ -17,7 +17,9 @@ pub struct TerminalInfo {
 }
 
 /// How a session is rendered: ACP-native `Structured` or raw tmux `Terminal`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, schemars::JsonSchema,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum View {
     #[default]

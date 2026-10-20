@@ -4,11 +4,16 @@ import {
   resolveMcpConflict,
   keepMcpServer,
   dropMcpServer,
+  createMcpServer,
+  updateMcpServer,
+  deleteMcpServer,
+  type McpServerInput,
   type McpServersResponse,
   type McpServerView,
   type McpConflictView,
 } from "../lib/api";
 import { ProvenanceBadge } from "./ProvenanceBadge";
+import { McpServerForm } from "./McpServerForm";
 
 /** One-line redacted connection detail: command/args or url, plus secret NAMES. */
 function detail(s: McpServerView): string {
@@ -20,13 +25,45 @@ function detail(s: McpServerView): string {
   return base;
 }
 
-function ServerRow({ s }: { s: McpServerView }) {
+function ServerRow({
+  s,
+  busy,
+  onEdit,
+  onDelete,
+}: {
+  s: McpServerView;
+  busy: boolean;
+  onEdit?: () => void;
+  onDelete?: () => void;
+}) {
   return (
     <div className="py-2 border-b border-surface-700">
       <div className="flex items-center gap-2">
         <span className="font-body text-[13px] font-medium text-text-primary">{s.name}</span>
         <span className="font-mono text-[11px] text-text-muted">({s.transport})</span>
         <ProvenanceBadge label={s.provenance} />
+        {onEdit && onDelete && (
+          <span className="ml-auto flex gap-2">
+            <button
+              type="button"
+              disabled={busy}
+              onClick={onEdit}
+              aria-label={`edit ${s.name}`}
+              className="px-2.5 py-1 text-[12px] rounded border border-surface-700 text-text-secondary hover:bg-surface-700 disabled:opacity-50"
+            >
+              Edit
+            </button>
+            <button
+              type="button"
+              disabled={busy}
+              onClick={onDelete}
+              aria-label={`delete ${s.name}`}
+              className="px-2.5 py-1 text-[12px] rounded border border-status-error/50 text-status-error hover:bg-status-error/10 disabled:opacity-50"
+            >
+              Delete
+            </button>
+          </span>
+        )}
       </div>
       <p className="font-mono text-[11px] text-text-secondary ml-1">{detail(s)}</p>
       {s.shadowed && s.shadowed.length > 0 && (
@@ -107,6 +144,8 @@ export function McpServers({ readOnly = false }: { readOnly?: boolean } = {}) {
   const [active, setActive] = useState<McpConflictView | null>(null);
   const [busy, setBusy] = useState(false);
   const [notice, setNotice] = useState<string | null>(null);
+  const [form, setForm] = useState<{ server?: McpServerView } | null>(null);
+  const [formError, setFormError] = useState<string | null>(null);
 
   const load = useCallback(async () => {
     const result = await fetchMcpServers();
@@ -162,6 +201,29 @@ export function McpServers({ readOnly = false }: { readOnly?: boolean } = {}) {
       return;
     }
     setNotice(null);
+    await load();
+  };
+
+  const onSave = async (name: string, input: McpServerInput) => {
+    setBusy(true);
+    const result = form?.server ? await updateMcpServer(name, input) : await createMcpServer(name, input);
+    setBusy(false);
+    if (!result.ok) {
+      setFormError(result.error ?? "Could not save the server.");
+      return;
+    }
+    setForm(null);
+    setFormError(null);
+    setNotice(null);
+    await load();
+  };
+
+  const onDelete = async (name: string) => {
+    if (!window.confirm(`Delete MCP server "${name}"?`)) return;
+    setBusy(true);
+    const result = await deleteMcpServer(name);
+    setBusy(false);
+    setNotice(result.ok ? null : (result.error ?? `Could not delete "${name}".`));
     await load();
   };
 
@@ -228,10 +290,39 @@ export function McpServers({ readOnly = false }: { readOnly?: boolean } = {}) {
         <p className="font-body text-[13px] text-text-muted">No servers forwarded.</p>
       ) : (
         <div className="mb-5">
-          {data.effective.map((s) => (
-            <ServerRow key={s.name} s={s} />
-          ))}
+          {data.effective.map((s) => {
+            const owned = !readOnly && s.provenance === "global";
+            return (
+              <ServerRow
+                key={s.name}
+                s={s}
+                busy={busy}
+                onEdit={
+                  owned
+                    ? () => {
+                        setFormError(null);
+                        setForm({ server: s });
+                      }
+                    : undefined
+                }
+                onDelete={owned ? () => onDelete(s.name) : undefined}
+              />
+            );
+          })}
         </div>
+      )}
+
+      {!readOnly && (
+        <button
+          type="button"
+          onClick={() => {
+            setFormError(null);
+            setForm({});
+          }}
+          className="mb-5 px-3 py-1.5 text-[13px] rounded bg-brand-600 text-white hover:bg-brand-500"
+        >
+          Add server
+        </button>
       )}
 
       {data.keptOnRemoval.length > 0 && (
@@ -274,6 +365,16 @@ export function McpServers({ readOnly = false }: { readOnly?: boolean } = {}) {
             </div>
           ))}
         </div>
+      )}
+
+      {form && (
+        <McpServerForm
+          initial={form.server}
+          busy={busy}
+          error={formError}
+          onSubmit={onSave}
+          onClose={() => setForm(null)}
+        />
       )}
 
       {active && <ConflictModal conflict={active} busy={busy} onResolve={onResolve} onClose={() => setActive(null)} />}

@@ -10,6 +10,40 @@ max_depth = 12
 
 # OMP stacks live markers, so positional rules compete by screen position.
 
+[[rules]]
+id = "current_hidden_ask"
+state = "waiting"
+priority = 980
+region = "evidence(hidden_ask)"
+visible = true
+regex = ['\S']
+
+[[rules]]
+id = "current_activity"
+state = "running"
+priority = 970
+positional = true
+region = "evidence(activity)"
+visible = true
+regex = ['\S']
+
+[[rules]]
+id = "current_dialog"
+state = "waiting"
+priority = 970
+positional = true
+region = "evidence(dialog)"
+visible = true
+regex = ['\S']
+
+[[rules]]
+id = "osc_title_working"
+state = "running"
+priority = 969
+region = "evidence(working_title)"
+visible = true
+regex = ['\S']
+
 # The spinner-free Processing footer also carries a live interrupt token.
 [[rules]]
 id = "active_interrupt_hint"
@@ -202,9 +236,9 @@ id = "banner_dismissal"
 state = "error"
 priority = 970
 positional = true
-region = "bottom_non_empty_lines(6)"
+region = "evidence(error)"
 visible = true
-contains = ["dismissed when you send your next message"]
+regex = ['\S']
 
 [[rules]]
 id = "retry_exhausted"
@@ -269,4 +303,3 @@ any = [
   { line_regex = ['(?i)attempt \d+/\d+ \x{b7}'] },
 ]
 
-# A terminal failure banner: omp has stopped and is waiting to be dismissed.

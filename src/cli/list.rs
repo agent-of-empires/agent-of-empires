@@ -4,13 +4,14 @@ use anyhow::Result;
 use clap::{Args, ValueEnum};
 use serde::Serialize;
 
+use crate::session::projection::SessionProjection;
 use crate::session::{Instance, SessionBucket, SessionScope, Storage};
 
-const TABLE_COL_TITLE: usize = 20;
-const TABLE_COL_GROUP: usize = 15;
-const TABLE_COL_PATH: usize = 40;
-const TABLE_COL_ID_DISPLAY: usize = 12;
-const TABLE_COL_STATE: usize = 9;
+pub(crate) const TABLE_COL_TITLE: usize = 20;
+pub(crate) const TABLE_COL_GROUP: usize = 15;
+pub(crate) const TABLE_COL_PATH: usize = 40;
+pub(crate) const TABLE_COL_ID_DISPLAY: usize = 12;
+pub(crate) const TABLE_COL_STATE: usize = 9;
 
 /// The `aoe list --state=` vocabulary. Mirrors the REST API's
 /// `SessionScope` (`GET /api/sessions?state=`) so the two vocabularies
@@ -20,7 +21,7 @@ const TABLE_COL_STATE: usize = 9;
 /// own `PossibleValue` list for `--help` and `--state=?` errors.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 #[value(rename_all = "lowercase")]
-enum StateFilter {
+pub(crate) enum StateFilter {
     /// Only sessions that are neither archived nor trashed.
     Live,
     /// Only sessions currently in the trash.
@@ -43,135 +44,132 @@ impl From<StateFilter> for SessionScope {
 pub struct ListArgs {
     /// Output as JSON
     #[arg(long)]
-    json: bool,
+    pub(crate) json: bool,
 
     /// List sessions from all profiles
     #[arg(long)]
-    all: bool,
+    pub(crate) all: bool,
 
     /// Filter by session state. Defaults to `all`, every persisted session,
     /// which is what `aoe list` has always shown. Pass `--state=live` to skip
     /// trashed and archived rows; the vocabulary matches the REST API's
     /// `GET /api/sessions?state=`.
-    #[arg(long, value_enum, default_value_t = StateFilter::All)]
-    state: StateFilter,
+    #[arg(long, value_enum, default_value = "all")]
+    pub(crate) state: StateFilter,
 }
 
-pub(super) fn state_tag(inst: &Instance) -> &'static str {
-    match inst.effective_bucket() {
-        SessionBucket::Trashed => "trashed",
-        SessionBucket::Archived => "archived",
-        SessionBucket::Active => "live",
-    }
-}
-
-pub(super) fn active_snoozed_until(inst: &Instance) -> Option<chrono::DateTime<chrono::Utc>> {
-    if inst.is_snoozed() {
-        inst.snoozed_until
-    } else {
-        None
-    }
-}
-
+/// `aoe list --json`, the shape the command has always emitted. The renderer
+/// fills this same struct from a snapshot rather than keeping a second copy,
+/// so the two transports cannot drift on a key, a spelling or a member order.
 #[derive(Serialize)]
-struct SessionJson {
-    id: String,
-    title: String,
-    path: String,
-    group: String,
-    tool: String,
+pub(crate) struct SessionJson {
+    pub(crate) id: String,
+    pub(crate) title: String,
+    pub(crate) path: String,
+    pub(crate) group: String,
+    pub(crate) tool: String,
     #[serde(skip_serializing_if = "String::is_empty")]
-    command: String,
-    profile: String,
-    state: &'static str,
-    created_at: chrono::DateTime<chrono::Utc>,
+    pub(crate) command: String,
+    pub(crate) profile: String,
+    pub(crate) state: &'static str,
+    pub(crate) created_at: chrono::DateTime<chrono::Utc>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    trashed_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub(crate) trashed_at: Option<chrono::DateTime<chrono::Utc>>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    archived_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub(crate) archived_at: Option<chrono::DateTime<chrono::Utc>>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    snoozed_until: Option<chrono::DateTime<chrono::Utc>>,
+    pub(crate) snoozed_until: Option<chrono::DateTime<chrono::Utc>>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pinned_at: Option<chrono::DateTime<chrono::Utc>>,
-    workspace_repos: Vec<WorkspaceRepoJson>,
+    pub(crate) pinned_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub(crate) workspace_repos: Vec<WorkspaceRepoJson>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    worktree: Option<WorktreeJson>,
+    pub(crate) worktree: Option<WorktreeJson>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    parent_session_id: Option<String>,
+    pub(crate) parent_session_id: Option<String>,
     /// Expected scope unit glob (`aoe-session-<id>-*.scope`) for live sessions with a process; not proof a unit exists.
     #[serde(skip_serializing_if = "Option::is_none")]
-    systemd_unit: Option<String>,
+    pub(crate) systemd_unit: Option<String>,
 }
 
 #[derive(Serialize)]
-struct WorkspaceRepoJson {
-    name: String,
-    source_path: String,
-    branch: String,
+pub(crate) struct WorkspaceRepoJson {
+    pub(crate) name: String,
+    pub(crate) source_path: String,
+    pub(crate) branch: String,
 }
 
 #[derive(Serialize)]
-struct WorktreeJson {
-    branch: String,
-    main_repo_path: String,
-    managed_by_aoe: bool,
+pub(crate) struct WorktreeJson {
+    pub(crate) branch: String,
+    pub(crate) main_repo_path: String,
+    pub(crate) managed_by_aoe: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
-    base_branch: Option<String>,
-}
-
-fn worktree_for(inst: &Instance) -> Option<WorktreeJson> {
-    inst.worktree_info.as_ref().map(|w| WorktreeJson {
-        branch: w.branch.clone(),
-        main_repo_path: w.main_repo_path.clone(),
-        managed_by_aoe: w.managed_by_aoe,
-        base_branch: w.base_branch.clone(),
-    })
+    pub(crate) base_branch: Option<String>,
 }
 
 /// Whether session scopes are expected, decided without calling systemd, so
 /// `aoe list` never waits on it.
-fn systemd_scopes_active() -> bool {
+pub(crate) fn systemd_scopes_active() -> bool {
     crate::process::systemd::scopes_expected(crate::session::Config::load_or_warn().systemd.enabled)
 }
 
 fn session_json(inst: &Instance, profile: &str, systemd_active: bool) -> SessionJson {
-    let live = matches!(inst.effective_bucket(), SessionBucket::Active);
+    let row = SessionProjection::new(inst, profile);
+    let live = matches!(row.bucket, SessionBucket::Active);
     SessionJson {
-        id: inst.id.clone(),
-        title: inst.title.clone(),
-        path: inst.project_path.clone(),
-        group: inst.group_path.clone(),
-        tool: inst.tool.clone(),
-        command: inst.command.clone(),
-        profile: profile.to_string(),
-        state: state_tag(inst),
-        created_at: inst.created_at,
-        trashed_at: inst.trashed_at,
-        archived_at: inst.archived_at,
-        snoozed_until: active_snoozed_until(inst),
-        pinned_at: inst.pinned_at,
-        workspace_repos: workspace_repos_for(inst),
-        worktree: worktree_for(inst),
-        parent_session_id: inst.parent_session_id.clone(),
+        id: row.id.to_string(),
+        title: row.title.to_string(),
+        path: row.project_path.to_string(),
+        group: row.group_path.to_string(),
+        tool: row.tool.to_string(),
+        command: row.command.to_string(),
+        profile: row.profile.to_string(),
+        state: row.bucket.as_str(),
+        created_at: row.created_at,
+        trashed_at: row.trashed_at,
+        archived_at: row.archived_at,
+        snoozed_until: row.active_snoozed_until,
+        pinned_at: row.pinned_at,
+        workspace_repos: row
+            .workspace_repos
+            .iter()
+            .map(|r| WorkspaceRepoJson {
+                name: r.name.clone(),
+                source_path: r.source_path.clone(),
+                branch: r.branch.clone(),
+            })
+            .collect(),
+        worktree: row.worktree.map(|w| WorktreeJson {
+            branch: w.branch.clone(),
+            main_repo_path: w.main_repo_path.clone(),
+            managed_by_aoe: w.managed_by_aoe,
+            base_branch: w.base_branch.clone(),
+        }),
+        parent_session_id: row.parent_session_id.map(str::to_string),
         systemd_unit: (systemd_active && live && crate::process::systemd::has_process(inst.status))
-            .then(|| crate::process::systemd::unit_glob(&inst.id)),
+            .then(|| crate::process::systemd::unit_glob(row.id)),
     }
 }
 
-fn workspace_repos_for(inst: &Instance) -> Vec<WorkspaceRepoJson> {
-    inst.all_repos()
-        .iter()
-        .map(|r| WorkspaceRepoJson {
-            name: r.name.clone(),
-            source_path: r.source_path.clone(),
-            branch: r.branch.clone(),
-        })
-        .collect()
+/// The refusal an all-profiles listing gives, on either transport, when one
+/// profile's data cannot be read. The local command owns the wording, and the
+/// served renderer builds the identical string from here, so an operator reads
+/// one sentence whichever transport answered. Carried back as an `anyhow`
+/// error, which is how `main` prints it: it adds the `Error: ` prefix and the
+/// newline, and exits 1.
+pub(crate) fn unreadable_profile_message(profile: &str) -> String {
+    format!(
+        "Profile '{profile}' could not be read, so the answer would be incomplete.\n\
+         Fix or remove that profile, then run the command again."
+    )
 }
 
-fn print_table_header(show_state: bool) {
-    if show_state {
-        println!(
+/// The two header lines, the way this table has always printed them: the
+/// heading row, then a separator as wide as the columns plus their gaps. The
+/// renderer emits these exact bytes, so a served listing is the listing.
+pub(crate) fn table_header(show_state: bool) -> String {
+    let heading = if show_state {
+        format!(
             "{:<width_title$} {:<width_group$} {:<width_path$} {:<width_state$} ID",
             "TITLE",
             "GROUP",
@@ -181,20 +179,9 @@ fn print_table_header(show_state: bool) {
             width_group = TABLE_COL_GROUP,
             width_path = TABLE_COL_PATH,
             width_state = TABLE_COL_STATE,
-        );
-        println!(
-            "{}",
-            "-".repeat(
-                TABLE_COL_TITLE
-                    + TABLE_COL_GROUP
-                    + TABLE_COL_PATH
-                    + TABLE_COL_STATE
-                    + TABLE_COL_ID_DISPLAY
-                    + 6
-            )
-        );
+        )
     } else {
-        println!(
+        format!(
             "{:<width_title$} {:<width_group$} {:<width_path$} ID",
             "TITLE",
             "GROUP",
@@ -202,82 +189,58 @@ fn print_table_header(show_state: bool) {
             width_title = TABLE_COL_TITLE,
             width_group = TABLE_COL_GROUP,
             width_path = TABLE_COL_PATH
-        );
-        println!(
-            "{}",
-            "-".repeat(
-                TABLE_COL_TITLE + TABLE_COL_GROUP + TABLE_COL_PATH + TABLE_COL_ID_DISPLAY + 5
-            )
-        );
-    }
+        )
+    };
+    let separator = if show_state {
+        TABLE_COL_TITLE
+            + TABLE_COL_GROUP
+            + TABLE_COL_PATH
+            + TABLE_COL_STATE
+            + TABLE_COL_ID_DISPLAY
+            + 6
+    } else {
+        TABLE_COL_TITLE + TABLE_COL_GROUP + TABLE_COL_PATH + TABLE_COL_ID_DISPLAY + 5
+    };
+    format!("{heading}\n{}\n", "-".repeat(separator))
 }
 
-fn nest_children<'a>(instances: &[&'a Instance]) -> Vec<(&'a Instance, usize)> {
-    fn place<'a>(
-        inst: &'a Instance,
-        depth: usize,
-        instances: &[&'a Instance],
-        placed: &mut std::collections::HashSet<&'a str>,
-        ordered: &mut Vec<(&'a Instance, usize)>,
-    ) {
-        if !placed.insert(inst.id.as_str()) {
-            return;
-        }
-        ordered.push((inst, depth));
-        for child in instances
-            .iter()
-            .filter(|c| c.parent_session_id.as_deref() == Some(inst.id.as_str()))
-        {
-            place(child, depth + 1, instances, placed, ordered);
-        }
-    }
-
-    let listed: std::collections::HashSet<&str> = instances.iter().map(|i| i.id.as_str()).collect();
-    let mut placed = std::collections::HashSet::new();
-    let mut ordered = Vec::with_capacity(instances.len());
-    for inst in instances {
-        let under_listed_parent = inst
-            .parent_session_id
-            .as_deref()
-            .is_some_and(|p| p != inst.id && listed.contains(p));
-        if !under_listed_parent {
-            place(inst, 0, instances, &mut placed, &mut ordered);
-        }
-    }
-    for inst in instances {
-        place(inst, 0, instances, &mut placed, &mut ordered);
-    }
-    ordered
-}
-
-fn table_title(inst: &Instance, depth: usize) -> String {
+/// The title cell, indented by its depth in the parent/child nesting.
+pub(crate) fn table_title(title: &str, depth: usize) -> String {
     match depth {
-        0 => inst.title.clone(),
-        _ => format!("{}└ {}", "  ".repeat(depth - 1), inst.title),
+        0 => title.to_string(),
+        _ => format!("{}└ {}", "  ".repeat(depth - 1), title),
     }
 }
 
-fn print_table_row(inst: &Instance, depth: usize, show_state: bool) {
-    let title = super::truncate(&table_title(inst, depth), TABLE_COL_TITLE);
-    let group = super::truncate(&inst.group_path, TABLE_COL_GROUP);
-    let path = super::truncate(&inst.project_path, TABLE_COL_PATH);
-    let id_display = super::truncate_id(&inst.id, TABLE_COL_ID_DISPLAY);
-    if show_state {
-        println!(
-            "{:<width_title$} {:<width_group$} {:<width_path$} {:<width_state$} {}",
+/// One table row. The id column is truncated to the display width with no
+/// ellipsis, and the other three to theirs with one; the widths are the
+/// constants above, so the row and the separator cannot disagree.
+pub(crate) fn table_row(
+    title: &str,
+    group: &str,
+    path: &str,
+    state: Option<&str>,
+    id: &str,
+) -> String {
+    let title = super::truncate(title, TABLE_COL_TITLE);
+    let group = super::truncate(group, TABLE_COL_GROUP);
+    let path = super::truncate(path, TABLE_COL_PATH);
+    let id_display = super::truncate_id(id, TABLE_COL_ID_DISPLAY);
+    match state {
+        Some(state) => format!(
+            "{:<width_title$} {:<width_group$} {:<width_path$} {:<width_state$} {}\n",
             title,
             group,
             path,
-            state_tag(inst),
+            state,
             id_display,
             width_title = TABLE_COL_TITLE,
             width_group = TABLE_COL_GROUP,
             width_path = TABLE_COL_PATH,
             width_state = TABLE_COL_STATE,
-        );
-    } else {
-        println!(
-            "{:<width_title$} {:<width_group$} {:<width_path$} {}",
+        ),
+        None => format!(
+            "{:<width_title$} {:<width_group$} {:<width_path$} {}\n",
             title,
             group,
             path,
@@ -285,8 +248,77 @@ fn print_table_row(inst: &Instance, depth: usize, show_state: bool) {
             width_title = TABLE_COL_TITLE,
             width_group = TABLE_COL_GROUP,
             width_path = TABLE_COL_PATH
-        );
+        ),
     }
+}
+
+/// The listing order: every row whose listed parent is absent or itself, then
+/// their children beneath them, then anything the walk did not reach. The
+/// renderer runs the same walk over the snapshot, so a served listing is
+/// ordered exactly as the local one is.
+pub(crate) fn nest_order<'a, T>(
+    rows: &'a [T],
+    id: impl Fn(&'a T) -> &'a str,
+    parent: impl Fn(&'a T) -> Option<&'a str>,
+) -> Vec<(usize, usize)> {
+    fn place<'a, T>(
+        index: usize,
+        depth: usize,
+        rows: &'a [T],
+        id: &impl Fn(&'a T) -> &'a str,
+        parent: &impl Fn(&'a T) -> Option<&'a str>,
+        placed: &mut std::collections::HashSet<usize>,
+        ordered: &mut Vec<(usize, usize)>,
+    ) {
+        if !placed.insert(index) {
+            return;
+        }
+        ordered.push((index, depth));
+        let name = id(&rows[index]);
+        for (candidate, row) in rows.iter().enumerate() {
+            if parent(row) == Some(name) {
+                place(candidate, depth + 1, rows, id, parent, placed, ordered);
+            }
+        }
+    }
+
+    let listed: std::collections::HashSet<&str> = rows.iter().map(&id).collect();
+    let mut placed = std::collections::HashSet::new();
+    let mut ordered = Vec::with_capacity(rows.len());
+    for (index, row) in rows.iter().enumerate() {
+        let under_listed_parent = parent(row).is_some_and(|p| p != id(row) && listed.contains(p));
+        if !under_listed_parent {
+            place(index, 0, rows, &id, &parent, &mut placed, &mut ordered);
+        }
+    }
+    for index in 0..rows.len() {
+        place(index, 0, rows, &id, &parent, &mut placed, &mut ordered);
+    }
+    ordered
+}
+
+fn nest_children<'a>(instances: &[&'a Instance]) -> Vec<(&'a Instance, usize)> {
+    nest_order(
+        instances,
+        |inst| inst.id.as_str(),
+        |inst| inst.parent_session_id.as_deref(),
+    )
+    .into_iter()
+    .map(|(index, depth)| (instances[index], depth))
+    .collect()
+}
+
+fn print_table_row(inst: &Instance, depth: usize, show_state: bool) {
+    print!(
+        "{}",
+        table_row(
+            &table_title(&inst.title, depth),
+            &inst.group_path,
+            &inst.project_path,
+            show_state.then(|| inst.effective_bucket().as_str()),
+            &inst.id,
+        )
+    );
 }
 
 fn table_shows_state(scope: SessionScope) -> bool {
@@ -324,7 +356,7 @@ pub async fn run(profile: &str, args: ListArgs) -> Result<()> {
 
     let show_state = table_shows_state(scope);
     println!("Profile: {}\n", storage.profile());
-    print_table_header(show_state);
+    print!("{}", table_header(show_state));
     let listed: Vec<&Instance> = instances.iter().collect();
     for (inst, depth) in nest_children(&listed) {
         print_table_row(inst, depth, show_state);
@@ -344,19 +376,24 @@ async fn run_all_profiles(json: bool, scope: SessionScope) -> Result<()> {
         return Ok(());
     }
 
+    let mut loaded: Vec<(&str, Vec<Instance>)> = Vec::with_capacity(profiles.len());
+    for profile in &profiles {
+        if let Ok((instances, _)) =
+            Storage::open_unwatched(profile).and_then(|storage| storage.load_with_groups())
+        {
+            loaded.push((profile.as_str(), instances));
+        }
+    }
+
     if json {
         let systemd_active = systemd_scopes_active();
         let mut all_sessions: Vec<SessionJson> = Vec::new();
-        for profile_name in &profiles {
-            if let Ok(storage) = Storage::open_unwatched(profile_name) {
-                if let Ok((instances, _)) = storage.load_with_groups() {
-                    for inst in &instances {
-                        if !SessionScope::matches(Some(scope), inst) {
-                            continue;
-                        }
-                        all_sessions.push(session_json(inst, profile_name, systemd_active));
-                    }
+        for (profile, instances) in &loaded {
+            for inst in instances {
+                if !SessionScope::matches(Some(scope), inst) {
+                    continue;
                 }
+                all_sessions.push(session_json(inst, profile, systemd_active));
             }
         }
         super::output::print_json(&all_sessions)?;
@@ -365,26 +402,22 @@ async fn run_all_profiles(json: bool, scope: SessionScope) -> Result<()> {
 
     let show_state = table_shows_state(scope);
     let mut total_sessions = 0;
-    for profile_name in &profiles {
-        if let Ok(storage) = Storage::open_unwatched(profile_name) {
-            if let Ok((all_instances, _)) = storage.load_with_groups() {
-                let instances: Vec<&Instance> = all_instances
-                    .iter()
-                    .filter(|inst| SessionScope::matches(Some(scope), inst))
-                    .collect();
-                if instances.is_empty() {
-                    continue;
-                }
-
-                println!("\n═══ Profile: {} ═══\n", profile_name);
-                print_table_header(show_state);
-                for (inst, depth) in nest_children(&instances) {
-                    print_table_row(inst, depth, show_state);
-                }
-                println!("({} sessions)", instances.len());
-                total_sessions += instances.len();
-            }
+    for (profile, instances) in &loaded {
+        let listed: Vec<&Instance> = instances
+            .iter()
+            .filter(|inst| SessionScope::matches(Some(scope), inst))
+            .collect();
+        if listed.is_empty() {
+            continue;
         }
+
+        println!("\n═══ Profile: {} ═══\n", profile);
+        print!("{}", table_header(show_state));
+        for (inst, depth) in nest_children(&listed) {
+            print_table_row(inst, depth, show_state);
+        }
+        println!("({} sessions)", listed.len());
+        total_sessions += listed.len();
     }
 
     println!("\n═══════════════════════════════════════");
@@ -400,6 +433,136 @@ async fn run_all_profiles(json: bool, scope: SessionScope) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The CLI, runtime wire and REST rows share one derivation, so they agree
+    /// on the instant of every shared timestamp and on the worktree facts.
+    #[test]
+    fn projections_agree_on_shared_facts() {
+        use crate::cli::runtime_read::dto::SessionRead;
+        use crate::daemon::SessionResponse;
+        use crate::session::{WorkspaceInfo, WorkspaceRepo, WorktreeInfo};
+
+        let now = chrono::Utc::now();
+        let instant = |value: &str| chrono::DateTime::parse_from_rfc3339(value).unwrap();
+        let cases: [(&str, fn(&mut Instance)); 5] = [
+            ("live", |_| {}),
+            ("archived", |i| i.archived_at = Some(chrono::Utc::now())),
+            ("trashed", |i| i.trash()),
+            ("snoozed", |i| {
+                i.snoozed_until = Some(chrono::Utc::now() + chrono::Duration::minutes(5))
+            }),
+            ("expired snooze", |i| {
+                i.snoozed_until = Some(chrono::Utc::now() - chrono::Duration::minutes(5))
+            }),
+        ];
+        for (label, mutate) in cases {
+            let mut inst = Instance::new("t", "/repo");
+            inst.pinned_at = Some(now);
+            inst.worktree_info = Some(WorktreeInfo {
+                branch: "feat".into(),
+                main_repo_path: "/main".into(),
+                managed_by_aoe: true,
+                created_at: now,
+                base_branch: Some("base".into()),
+            });
+            inst.workspace_info = Some(WorkspaceInfo {
+                branch: "feat".into(),
+                workspace_dir: "/ws".into(),
+                created_at: now,
+                cleanup_on_delete: true,
+                repos: vec![WorkspaceRepo {
+                    name: "a".into(),
+                    source_path: "/a".into(),
+                    branch: "feat".into(),
+                    worktree_path: "/ws/a".into(),
+                    main_repo_path: "/a".into(),
+                    managed_by_aoe: true,
+                    branch_preexisting: false,
+                    base_branch: None,
+                    base_branch_override: None,
+                }],
+            });
+            mutate(&mut inst);
+
+            let cli =
+                serde_json::to_value(session_json(&inst, &inst.source_profile, false)).unwrap();
+            let wire = SessionRead::from_instance(&inst);
+            let rest = SessionResponse::from_instance(&inst, false);
+
+            assert_eq!(wire.state.as_str(), cli["state"], "{label}");
+            let cli_time = |key: &str| cli[key].as_str().map(instant);
+            let wire_time = |v: &Option<String>| v.as_deref().map(instant);
+            let rest_time = |v: &Option<String>| v.as_deref().map(instant);
+            assert_eq!(
+                cli_time("snoozed_until"),
+                wire_time(&wire.active_snoozed_until),
+                "{label}"
+            );
+            assert_eq!(
+                cli_time("snoozed_until"),
+                rest_time(&rest.snoozed_until),
+                "{label}"
+            );
+            assert_eq!(
+                cli_time("archived_at"),
+                wire_time(&wire.archived_at),
+                "{label}"
+            );
+            assert_eq!(
+                cli_time("archived_at"),
+                rest_time(&rest.archived_at),
+                "{label}"
+            );
+            assert_eq!(
+                cli_time("trashed_at"),
+                wire_time(&wire.trashed_at),
+                "{label}"
+            );
+            assert_eq!(
+                cli_time("trashed_at"),
+                rest_time(&rest.trashed_at),
+                "{label}"
+            );
+            assert_eq!(cli_time("pinned_at"), wire_time(&wire.pinned_at), "{label}");
+            assert_eq!(cli_time("pinned_at"), rest_time(&rest.pinned_at), "{label}");
+            assert_eq!(cli["worktree"]["branch"], "feat", "{label}");
+            assert_eq!(wire.worktree.as_ref().unwrap().branch, "feat", "{label}");
+            assert_eq!(rest.branch.as_deref(), Some("feat"), "{label}");
+            assert_eq!(rest.base_branch.as_deref(), Some("base"), "{label}");
+            assert!(
+                wire.has_managed_worktree && rest.has_managed_worktree,
+                "{label}"
+            );
+            assert_eq!(cli["workspace_repos"][0]["name"], "a", "{label}");
+            assert_eq!(wire.workspace_repos[0].name, "a", "{label}");
+            assert_eq!(rest.workspace_repos[0].name, "a", "{label}");
+        }
+    }
+
+    /// An optional field the row has no value for is left out, as every other
+    /// optional field in the struct is. A `null` here would make a consumer
+    /// carry a branch that does not exist.
+    #[test]
+    fn a_worktree_without_a_base_branch_emits_no_key() {
+        let row = |base_branch| WorktreeJson {
+            branch: "feature".into(),
+            main_repo_path: "/repo".into(),
+            managed_by_aoe: true,
+            base_branch,
+        };
+        let keys = |value: Option<String>| {
+            let text = serde_json::to_string(&row(value)).expect("encodes");
+            serde_json::from_str::<serde_json::Value>(&text).expect("is JSON")
+        };
+        assert!(
+            keys(None).get("base_branch").is_none(),
+            "an absent base branch is omitted, not null"
+        );
+        assert_eq!(
+            keys(Some("main".into()))["base_branch"],
+            serde_json::json!("main")
+        );
+    }
 
     #[test]
     fn nest_children_lists_each_child_under_its_listed_parent() {
@@ -428,7 +591,7 @@ mod tests {
         ];
         let titles: Vec<String> = nest_children(&listed)
             .into_iter()
-            .map(|(inst, depth)| table_title(inst, depth))
+            .map(|(inst, depth)| table_title(&inst.title, depth))
             .collect();
         assert_eq!(
             titles,
@@ -454,7 +617,6 @@ mod tests {
     #[test]
     fn session_json_reports_state_and_only_the_timestamps_that_apply() {
         let plain = Instance::new("z", "/repo");
-        assert_eq!(state_tag(&plain), "live");
         let json = session_json(&plain, "p", false);
         assert_eq!(json.state, "live");
         let serialized = serde_json::to_string(&json).unwrap();
@@ -464,7 +626,6 @@ mod tests {
 
         let mut archived = Instance::new("z", "/repo");
         archived.archive();
-        assert_eq!(state_tag(&archived), "archived");
         let json = session_json(&archived, "p", false);
         assert_eq!(json.state, "archived");
         assert!(json.archived_at.is_some());
@@ -472,7 +633,6 @@ mod tests {
 
         let mut trashed = Instance::new("z", "/repo");
         trashed.trash();
-        assert_eq!(state_tag(&trashed), "trashed");
         let json = session_json(&trashed, "p", false);
         assert_eq!(json.state, "trashed");
         assert!(json.trashed_at.is_some());

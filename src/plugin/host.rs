@@ -152,16 +152,23 @@ impl PluginHost {
         }
     }
 
-    pub async fn emit_settings_changed(&self, changes: &[(String, Vec<String>)]) {
+    pub async fn emit_settings_changed(
+        &self,
+        changes: &[(String, Vec<String>)],
+        project_path: Option<&str>,
+    ) {
         if changes.is_empty() {
             return;
         }
         let revision = self.api.bump_settings_revision();
         for (plugin_id, changed_keys) in changes {
-            let params = serde_json::json!({
+            let mut params = serde_json::json!({
                 "revision": revision,
                 "changed_keys": changed_keys,
             });
+            if let Some(path) = project_path {
+                params["project_path"] = serde_json::json!(path);
+            }
             let delivered = self
                 .notify_worker(plugin_id, "plugin.settings.changed", params)
                 .await;
@@ -1038,7 +1045,9 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::parallel]
     async fn worker_subprocess_round_trip_and_capability_gate() {
+        let _env = crate::session::test_support::EnvGuard::read_lock();
         if which::which("node").is_err() {
             eprintln!("skipping: node not found on PATH");
             return;
@@ -1079,7 +1088,9 @@ process.stdout.write(JSON.stringify({jsonrpc:"2.0",id:1,method:"session.meta.set
     }
 
     #[tokio::test]
+    #[serial_test::parallel]
     async fn host_initiated_notification_reaches_worker() {
+        let _env = crate::session::test_support::EnvGuard::read_lock();
         if which::which("node").is_err() {
             eprintln!("skipping: node not found on PATH");
             return;

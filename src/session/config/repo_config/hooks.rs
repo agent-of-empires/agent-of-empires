@@ -54,9 +54,10 @@ impl HooksConfig {
     }
 }
 
-/// Host-side hooks, profile/global only (never from a repo). Each prints
-/// `KEY=VALUE` lines that are injected into the launch; stdout is never logged,
-/// and a non-zero exit aborts the launch.
+/// Host-side hooks, profile/global only (never from a repo). The launch hooks
+/// print `KEY=VALUE` lines that are injected into the launch; stdout is never
+/// logged, and a non-zero exit aborts the launch. `before_destroy` is
+/// best-effort and its output is ignored.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct HostHooksConfig {
     /// Runs before a sandbox container comes up; pairs reach the container as
@@ -75,11 +76,22 @@ pub struct HostHooksConfig {
         deserialize_with = "crate::session::serde_helpers::string_or_vec"
     )]
     pub before_session: Vec<String>,
+    /// Runs on the host when a session is purged, before container and
+    /// worktree cleanup; not when it is moved to trash. Failures and timeouts
+    /// are logged without their output.
+    #[serde(
+        default,
+        skip_serializing_if = "Vec::is_empty",
+        deserialize_with = "crate::session::serde_helpers::string_or_vec"
+    )]
+    pub before_destroy: Vec<String>,
 }
 
 impl HostHooksConfig {
     pub fn is_empty(&self) -> bool {
-        self.before_start.is_empty() && self.before_session.is_empty()
+        self.before_start.is_empty()
+            && self.before_session.is_empty()
+            && self.before_destroy.is_empty()
     }
 }
 
@@ -596,6 +608,14 @@ pub fn resolve_before_session_hooks(profile: &str) -> Vec<String> {
         .before_session
 }
 
+/// Global+profile only, so a repo can never contribute host commands.
+pub fn resolve_before_destroy_hooks(profile: &str) -> Vec<String> {
+    let resolved = super::super::effective_profile(profile);
+    profile_config::resolve_config_or_warn(&resolved)
+        .host_hooks
+        .before_destroy
+}
+
 /// `KEY=VALUE` lines, later keys winning; values are kept verbatim.
 fn parse_env_kv_lines(stdout: &str) -> Vec<(String, String)> {
     let mut out: Vec<(String, String)> = Vec::new();
@@ -742,6 +762,47 @@ fn run_hooks_best_effort(
         errors.push(err);
     }
     errors
+}
+
+/// Runs every host command, each bounded by `timeout` (the process tree is killed on expiry),
+/// and returns the failure count. Output may carry secrets, so failures log only the command
+/// and exit status, never captured stdout or stderr.
+pub fn execute_host_hooks_best_effort(
+    commands: &[String],
+    project_path: &Path,
+    detach_tty: bool,
+    extra_env: &[(&'static str, String)],
+    timeout: std::time::Duration,
+) -> usize {
+    let target = HookTarget::Local { project_path };
+    let opts = HookSpawnOpts {
+        merge_stderr: false,
+        detach_tty,
+    };
+    let mut failures = 0;
+    for cmd in commands {
+        tracing::info!(target: "session.store", "Running host hook (output not logged): {}", cmd);
+        let mut command = build_hook_command(cmd, &target, opts, extra_env);
+        command
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        match run_hook_with_timeout(&mut command, timeout, cmd) {
+            Ok(output) if output.status.success() => {}
+            Ok(output) => {
+                failures += 1;
+                tracing::warn!(target: "session.store",
+                    "Host hook failed with exit code {}: {}",
+                    output.status.code().unwrap_or(-1),
+                    cmd
+                );
+            }
+            Err(error) => {
+                failures += 1;
+                tracing::warn!(target: "session.store", "Host hook failed: {:#}", error);
+            }
+        }
+    }
+    failures
 }
 
 /// `detach_tty`: true from TUI/web contexts, false from the CLI so prompts stay answerable.
@@ -1108,6 +1169,32 @@ mod tests {
     }
 
     /// CLI paths keep the terminal attached; TUI/web best-effort paths detach.
+    #[test]
+    fn host_hooks_best_effort_kill_hung_commands_and_continue() {
+        let _shell = pin_host_shell();
+        let tmp = tempfile::tempdir().unwrap();
+        let marker = tmp.path().join("marker");
+        let commands = vec![
+            "echo leaked-secret; exit 1".to_string(),
+            "sleep 60".to_string(),
+            format!("touch '{}'", marker.display()),
+        ];
+        let started = std::time::Instant::now();
+        let failures = execute_host_hooks_best_effort(
+            &commands,
+            tmp.path(),
+            true,
+            &[],
+            std::time::Duration::from_millis(500),
+        );
+        assert_eq!(failures, 2);
+        assert!(
+            marker.exists(),
+            "hook after a failure and a timeout must run"
+        );
+        assert!(started.elapsed() < std::time::Duration::from_secs(30));
+    }
+
     #[test]
     #[serial_test::serial]
     fn captured_and_best_effort_hooks_detach_only_when_requested() {

@@ -114,6 +114,18 @@ pub struct GroupTree {
 
 impl GroupTree {
     pub fn new_with_groups(instances: &[Instance], existing_groups: &[Group]) -> Self {
+        Self::new_with_group_paths(
+            instances
+                .iter()
+                .map(|instance| instance.group_path.as_str()),
+            existing_groups,
+        )
+    }
+
+    pub(crate) fn new_with_group_paths<'a>(
+        paths: impl IntoIterator<Item = &'a str>,
+        existing_groups: &[Group],
+    ) -> Self {
         let mut tree = Self {
             roots: Vec::new(),
             groups_by_path: HashMap::new(),
@@ -127,10 +139,9 @@ impl GroupTree {
             tree.insertion_order.push(group.path.clone());
         }
 
-        // Ensure all instance groups exist
-        for inst in instances {
-            if !inst.group_path.is_empty() {
-                tree.ensure_group_exists(&inst.group_path);
+        for path in paths {
+            if !path.is_empty() {
+                tree.ensure_group_exists(path);
             }
         }
 

@@ -8,6 +8,7 @@ import {
   effectiveUnreadOf,
   type OptimisticTriage,
 } from "../../lib/sidebarOptimistic";
+import { resolveActionTargets } from "./sessionActionTargets";
 
 /** Mirrors the Rust `SESSION_COLORS` list. */
 export const SESSION_COLOR_OPTIONS: { key: string; label: string; dotClass: string }[] = [
@@ -92,7 +93,7 @@ export function deriveRowModel(
     firstSession,
     runningSession,
     navigationSession: runningSession ?? firstSession,
-    acpSession: sessions.find((s) => s.view === "structured"),
+    actionTargets: resolveActionTargets(sessions, optimistic),
     sessionId: firstSession?.id,
     sessionTitle,
     branchLabel,
@@ -140,9 +141,6 @@ export function deriveRowModel(
       !firstSession?.trashed_at &&
       firstSession?.status !== "Creating" &&
       firstSession?.status !== "Deleting",
-    canStop: !["Stopped", "Deleting", "Creating"].includes(status),
-    // Archived and trashed sessions must be unarchived or restored before they start (#4116).
-    canStart: status === "Stopped" && !effectiveArchived && !firstSession?.trashed_at,
   };
 }
 

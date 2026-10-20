@@ -183,7 +183,7 @@ fn parse_status(raw: &str) -> Option<Status> {
 }
 
 impl Matcher {
-    fn compile(raw: &RawMatcher, rule_id: &str) -> anyhow::Result<Self> {
+    fn compile(raw: &RawMatcher, rule_id: &str, evidence_names: &[&str]) -> anyhow::Result<Self> {
         let compile_all = |patterns: &[String]| -> anyhow::Result<Vec<regex::Regex>> {
             patterns
                 .iter()
@@ -195,7 +195,7 @@ impl Matcher {
         };
         Ok(Self {
             region: match &raw.region {
-                Some(r) => Some(Region::parse(r).ok_or_else(|| {
+                Some(r) => Some(Region::parse(r, evidence_names).ok_or_else(|| {
                     anyhow::anyhow!("rule {rule_id}: unknown clause region {r:?}")
                 })?),
                 None => None,
@@ -214,17 +214,17 @@ impl Matcher {
             any: raw
                 .any
                 .iter()
-                .map(|m| Matcher::compile(m, rule_id))
+                .map(|m| Matcher::compile(m, rule_id, evidence_names))
                 .collect::<anyhow::Result<_>>()?,
             all: raw
                 .all
                 .iter()
-                .map(|m| Matcher::compile(m, rule_id))
+                .map(|m| Matcher::compile(m, rule_id, evidence_names))
                 .collect::<anyhow::Result<_>>()?,
             not: raw
                 .not
                 .iter()
-                .map(|m| Matcher::compile(m, rule_id))
+                .map(|m| Matcher::compile(m, rule_id, evidence_names))
                 .collect::<anyhow::Result<_>>()?,
             hook_status: match &raw.hook_status {
                 Some(s) => {
@@ -272,7 +272,7 @@ impl Matcher {
 }
 
 impl Rule {
-    fn compile(raw: RawRule) -> anyhow::Result<Self> {
+    fn compile(raw: RawRule, evidence_names: &[&str]) -> anyhow::Result<Self> {
         let region_name = raw.region.clone().ok_or_else(|| {
             anyhow::anyhow!("rule {}: no region, and no template gave one", raw.id)
         })?;
@@ -280,7 +280,7 @@ impl Rule {
         let region = if is_hook {
             Region::WholeRecent
         } else {
-            Region::parse(&region_name).ok_or_else(|| {
+            Region::parse(&region_name, evidence_names).ok_or_else(|| {
                 anyhow::anyhow!("rule {}: unknown region {:?}", raw.id, region_name)
             })?
         };
@@ -294,7 +294,7 @@ impl Rule {
         if state.is_none() && !raw.skip_state_update {
             anyhow::bail!("rule {}: needs a state or skip_state_update", raw.id);
         }
-        let matcher = Matcher::compile(&raw.matcher, &raw.id)?;
+        let matcher = Matcher::compile(&raw.matcher, &raw.id, evidence_names)?;
         Ok(Self {
             id: raw.id,
             positional: raw.positional,
@@ -469,7 +469,7 @@ impl Rule {
             // Newline-joined so `line_regex` still sees individual lines.
             let window = lines[start..=idx].join("\n");
             let lower = window.to_lowercase();
-            let position = lines.len() - idx;
+            let position = lines.len() - idx + screen.region_bottom_offset(self.region);
             (self.max_position.is_none_or(|max| position <= max)
                 && self.matcher.matches(&window, &lower, &ctx))
             .then_some(position)
@@ -478,7 +478,7 @@ impl Rule {
 }
 
 impl Manifest {
-    pub(super) fn parse(source: &str) -> anyhow::Result<Self> {
+    pub(super) fn parse(source: &str, evidence_names: &[&str]) -> anyhow::Result<Self> {
         let mut raw: RawManifest = toml::from_str(source)?;
         let templates: RawTemplates = toml::from_str(SHARED_TEMPLATES)?;
         for rule in &mut raw.rules {
@@ -502,7 +502,7 @@ impl Manifest {
             .rules
             .into_iter()
             .chain(inherited)
-            .map(Rule::compile)
+            .map(|rule| Rule::compile(rule, evidence_names))
             .collect::<anyhow::Result<Vec<_>>>()?;
         rules.sort_by_key(|rule| std::cmp::Reverse(rule.priority));
         let prompt_marker = raw
@@ -594,5 +594,56 @@ impl Manifest {
             i = group_end;
         }
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::region::{Evidence, Rows};
+    use super::*;
+
+    #[test]
+    fn evidence_regions_resolve_nested_overrides_and_reject_undeclared_names() {
+        let source = r#"
+id = "test"
+[[rules]]
+id = "nested"
+state = "waiting"
+priority = 1000
+region = "evidence(primary)"
+contains = ["ready"]
+all = [{ any = [{ region = "evidence(secondary)", contains = ["confirm"] }] }]
+not = [{ region = "evidence(secondary)", contains = ["cancel"] }]
+"#;
+        let manifest = Manifest::parse(source, &["primary", "secondary"]).unwrap();
+        let evidence = [
+            Evidence {
+                text: "ready",
+                bottom_offset: 0,
+                diagnostic: None,
+            },
+            Evidence {
+                text: "confirm",
+                bottom_offset: 0,
+                diagnostic: None,
+            },
+        ];
+        let screen = Screen::new(Rows::new("unrelated"), "", &evidence);
+        assert_eq!(manifest.evaluate(&screen, None).unwrap().id, "nested");
+
+        let evidence = [
+            evidence[0],
+            Evidence {
+                text: "confirm cancel",
+                bottom_offset: 0,
+                diagnostic: None,
+            },
+        ];
+        let screen = Screen::new(Rows::new("unrelated"), "", &evidence);
+        assert!(manifest.evaluate(&screen, None).is_none());
+
+        for names in [&[][..], &["primary"][..], &["secondary"][..]] {
+            assert!(Manifest::parse(source, names).is_err(), "{names:?}");
+        }
     }
 }

@@ -97,6 +97,92 @@ fn select_prime_agent_session(
     Ok(candidate.id)
 }
 
+/// Caps one handed-over transcript on disk; the copy itself streams.
+const PRIME_AGENT_HANDOFF_MAX_BYTES: usize = 512 * 1024 * 1024;
+
+/// Open `relative` as a root session transcript of `id` recorded in `cwd`,
+/// leaving the reader just past its header line so the whole file can be
+/// copied from the one open that was checked.
+fn open_root_transcript(
+    root: &crate::session::AnchoredDir,
+    relative: &Path,
+    id: &str,
+    cwd: &str,
+) -> Option<(std::io::BufReader<std::fs::File>, Vec<u8>)> {
+    let file = root
+        .open_regular(relative, PRIME_AGENT_HANDOFF_MAX_BYTES)
+        .ok()??;
+    let mut reader = std::io::BufReader::new(file);
+    let mut header = Vec::with_capacity(4096);
+    (&mut reader)
+        .take(PRIME_AGENT_HEADER_SCAN_BYTES.saturating_add(1))
+        .read_until(b'\n', &mut header)
+        .ok()?;
+    let (header_id, header_cwd) = root_session_header(&header)?;
+    (header_id == id && canonicalize_or_raw(&header_cwd) == canonicalize_or_raw(cwd))
+        .then_some((reader, header))
+}
+
+/// Copy the root transcript of `parent_id` from the parent's sessions directory
+/// into `session_dir` of the child's private store, so `prime-agent --fork
+/// <parent_id>` finds it there. Exactly one
+/// transcript must carry that id and `cwd`; a copy already in place for the same
+/// conversation is kept, any other entry at its name is refused, and the
+/// parent's store is only read, never shared.
+pub(crate) fn hand_off_root_transcript(
+    parent_sessions: &Path,
+    child_store: &Path,
+    session_dir: &Path,
+    parent_id: &str,
+    cwd: &str,
+) -> Result<()> {
+    use anyhow::Context as _;
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let parent = crate::session::AnchoredDir::open(parent_sessions)
+        .context("opening the parent's Prime sessions")?;
+    let names = parent
+        .read_dir(
+            Path::new(""),
+            PRIME_AGENT_MAX_SESSION_FILES.saturating_add(1),
+        )
+        .context("listing the parent's Prime sessions")?;
+    anyhow::ensure!(
+        names.len() <= PRIME_AGENT_MAX_SESSION_FILES,
+        "the parent's Prime store holds too many sessions to search"
+    );
+    let mut matches = names
+        .into_iter()
+        .filter(|name| Path::new(name).extension().and_then(|e| e.to_str()) == Some("jsonl"))
+        .filter(|name| open_root_transcript(&parent, Path::new(name), parent_id, cwd).is_some());
+    let name = matches
+        .next()
+        .context("the parent's Prime transcript was not found in its store")?;
+    anyhow::ensure!(
+        matches.next().is_none(),
+        "more than one Prime transcript names the parent conversation"
+    );
+    let (mut reader, header) = open_root_transcript(&parent, Path::new(&name), parent_id, cwd)
+        .context("the parent's Prime transcript changed during the handoff")?;
+    let child = crate::session::AnchoredDir::open(child_store)
+        .context("opening the child's Prime store")?
+        .create_child(session_dir)?;
+    let leaf = Path::new(&name);
+    let published = child.publish_file(
+        leaf,
+        &mut header.as_slice().chain(&mut reader),
+        std::fs::Permissions::from_mode(0o600),
+        false,
+        None,
+    )?;
+    anyhow::ensure!(
+        published || open_root_transcript(&child, leaf, parent_id, cwd).is_some(),
+        "another Prime session already occupies {} in the child's store",
+        leaf.display()
+    );
+    Ok(())
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum PrimeRootPublication {
     Ready(String),
@@ -139,6 +225,7 @@ pub(crate) fn prime_agent_poll_fn_sandboxed(
 mod tests {
     use super::super::test_support::set_mtime_ms;
     use super::*;
+    use std::io::Write as _;
     use std::path::PathBuf;
 
     fn write_prime_session(dir: &Path, name: &str, id: &str, cwd: &str) -> PathBuf {
@@ -213,6 +300,122 @@ mod tests {
         symlink(outside.path(), store.path().join("sessions")).unwrap();
         assert!(scanned_ids(store.path()).is_empty());
     }
+    /// Two private stores, each with a `sessions` directory.
+    fn stores() -> (tempfile::TempDir, std::path::PathBuf, std::path::PathBuf) {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (parent, child) = (tmp.path().join("parent"), tmp.path().join("child"));
+        std::fs::create_dir_all(parent.join("sessions")).unwrap();
+        std::fs::create_dir_all(&child).unwrap();
+        (tmp, parent, child)
+    }
+
+    fn hand_off(parent: &Path, child: &Path, id: &str, cwd: &str) -> Result<()> {
+        hand_off_root_transcript(
+            &parent.join("sessions"),
+            child,
+            Path::new("sessions"),
+            id,
+            cwd,
+        )
+    }
+
+    #[test]
+    fn a_handoff_copies_only_the_parents_transcript_and_is_repeatable() {
+        let (_tmp, parent, child) = stores();
+        let sessions = parent.join("sessions");
+        let source = write_prime_session(&sessions, "root.jsonl", "parent-id", "/workspace");
+        write_prime_session(&sessions, "peer.jsonl", "peer-id", "/workspace");
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&source)
+            .unwrap()
+            .write_all(b"{\"type\":\"message\"}\n")
+            .unwrap();
+        let before = std::fs::read(&source).unwrap();
+
+        hand_off(&parent, &child, "parent-id", "/workspace").unwrap();
+        let copied = child.join("sessions/root.jsonl");
+        assert_eq!(std::fs::read(&copied).unwrap(), before);
+        assert!(!child.join("sessions/peer.jsonl").exists());
+        assert_eq!(
+            std::fs::read(&source).unwrap(),
+            before,
+            "the parent is only read"
+        );
+
+        hand_off(&parent, &child, "parent-id", "/workspace").unwrap();
+        assert_eq!(
+            std::fs::read(&copied).unwrap(),
+            before,
+            "a retry keeps the copy"
+        );
+    }
+
+    #[test]
+    fn a_handoff_refuses_a_transcript_it_cannot_attribute_to_the_parent() {
+        let (_tmp, parent, child) = stores();
+        let sessions = parent.join("sessions");
+        assert!(
+            hand_off(&parent, &child, "parent-id", "/workspace").is_err(),
+            "no transcript"
+        );
+
+        write_prime_session(&sessions, "one.jsonl", "parent-id", "/workspace");
+        assert!(
+            hand_off(&parent, &child, "parent-id", "/elsewhere").is_err(),
+            "other cwd"
+        );
+        assert!(
+            hand_off(&parent, &child, "other-id", "/workspace").is_err(),
+            "other id"
+        );
+
+        write_prime_session(&sessions, "two.jsonl", "parent-id", "/workspace");
+        assert!(
+            hand_off(&parent, &child, "parent-id", "/workspace").is_err(),
+            "ambiguous"
+        );
+        assert!(
+            !child.join("sessions").exists()
+                || std::fs::read_dir(child.join("sessions"))
+                    .unwrap()
+                    .next()
+                    .is_none()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_handoff_refuses_a_symlinked_source_and_a_foreign_occupant() {
+        use std::os::unix::fs::symlink;
+
+        let (tmp, parent, child) = stores();
+        let outside = write_prime_session(tmp.path(), "outside.jsonl", "parent-id", "/workspace");
+        symlink(&outside, parent.join("sessions/link.jsonl")).unwrap();
+        assert!(
+            hand_off(&parent, &child, "parent-id", "/workspace").is_err(),
+            "symlink"
+        );
+
+        write_prime_session(
+            &parent.join("sessions"),
+            "root.jsonl",
+            "parent-id",
+            "/workspace",
+        );
+        std::fs::create_dir_all(child.join("sessions")).unwrap();
+        write_prime_session(
+            &child.join("sessions"),
+            "root.jsonl",
+            "peer-id",
+            "/workspace",
+        );
+        assert!(
+            hand_off(&parent, &child, "parent-id", "/workspace").is_err(),
+            "foreign occupant"
+        );
+    }
+
     #[test]
     fn print_capture_rejects_ambiguity_instead_of_resuming_the_newest_peer() {
         let temp = tempfile::tempdir().unwrap();

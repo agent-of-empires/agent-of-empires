@@ -52,18 +52,21 @@ pub struct Cli {
     /// consume or create profile state require an existing profile: an unknown
     /// name is refused, not created (make one with `aoe profile create`).
     /// Profile-independent commands such as `list --all` and `serve --stop`
-    /// ignore it
-    #[arg(short = 'p', long, global = true, env = "AGENT_OF_EMPIRES_PROFILE")]
+    /// ignore it. `AGENT_OF_EMPIRES_PROFILE` names one too, and an explicit
+    /// `-p` wins over it.
+    // No env attribute: explicit and environment profiles are tracked separately.
+    #[arg(short = 'p', long, global = true)]
     pub profile: Option<String>,
 
-    /// Attach to a remote agent daemon instead of using the local
-    /// session list. Equivalent to setting `AOE_DAEMON_URL`; pair with
-    /// `AOE_DAEMON_TOKEN` for the bearer token. The session list goes
-    /// through a bearer-only client, so `AOE_DAEMON_PASSPHRASE` does not
-    /// work here yet; it works for `aoe acp <verb>` against the same
-    /// `AOE_DAEMON_URL`. Only meaningful at the no-subcommand `aoe`
-    /// invocation (the TUI dashboard); ignored otherwise.
-    #[arg(long, global = true, env = "AOE_DAEMON_URL")]
+    /// Select a daemon endpoint for read-only CLI commands or the TUI
+    ///
+    /// Explicit CLI endpoints never fall back. `AOE_DAEMON_URL` discovery may
+    /// fall back to local storage before reaching a TCP peer, with a notice.
+    /// Authenticate CLI reads with `AOE_DAEMON_TOKEN` or `AOE_DAEMON_PASSPHRASE`;
+    /// TUI session lists support bearer tokens only. An unauthenticated daemon
+    /// needs neither. See the HTTP API reference for transport and fallback rules.
+    // Keep the explicit flag separate from the optional environment endpoint.
+    #[arg(long, global = true)]
     pub daemon_url: Option<String>,
 
     #[command(subcommand)]
@@ -106,6 +109,8 @@ pub enum Commands {
     Send(SendArgs),
 
     /// Show session status summary
+    ///
+    /// JSON takes precedence over quiet, which takes precedence over verbose.
     Status(StatusArgs),
 
     /// Force-stop everything aoe is running: the serve daemon, all agent
@@ -259,7 +264,8 @@ pub enum Commands {
     /// moves its own agent store when it starts; use this to move every
     /// eligible store at once instead. Trashed and archived sessions are
     /// skipped; each moves when it is started, or restore or unarchive it
-    /// and run this again.
+    /// and run this again. Refuses while the aoe serve daemon runs; stop it
+    /// with `aoe serve --stop` first.
     Migrate,
 
     /// Generate shell completions

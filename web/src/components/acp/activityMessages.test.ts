@@ -1,7 +1,14 @@
 import { describe, expect, it } from "vitest";
 
 import { reducer, transcriptDeltaAction } from "../../hooks/useAcpSession";
-import { emptyAcpState, type AcpState, type ActivityRow, type ToolCall, type TranscriptRow } from "../../lib/acpTypes";
+import {
+  emptyAcpState,
+  type AcpState,
+  type ActivityRow,
+  type ToolCall,
+  type ToolOutputBlock,
+  type TranscriptRow,
+} from "../../lib/acpTypes";
 import { resolveAgentProfile } from "../../lib/agentProfiles";
 import {
   activityToThreadMessages,
@@ -429,5 +436,37 @@ describe("user and callout rows", () => {
     expect(assistantParts(state.activity)[0]!.text).toBe(
       "> ℹ️ **Notice**; warning: Model fallback: Switched to Sonnet.",
     );
+  });
+});
+
+describe("tool output media", () => {
+  const resultOf = (content: string, output: ToolOutputBlock[]) => {
+    const [msg] = activityToThreadMessages(
+      [user(), toolStart("t1"), row("done-t1", "tool_complete", content, { toolCallId: "t1", output })],
+      false,
+    ).filter((m) => m.role === "assistant");
+    const part = (msg!.content as { type: string; result?: Record<string, unknown> }[]).find(
+      (p) => p.type === "tool-call",
+    );
+    return part?.result;
+  };
+
+  it("carries a completion's media blocks onto the tool part's result, minus text that content repeats", () => {
+    const media: ToolOutputBlock[] = [
+      { kind: "image", mime_type: "image/png", data: "AAAA" },
+      { kind: "resource_link", uri: "https://example.com/r", name: "Report" },
+      // An embedded terminal has no text in `content`, so its placeholder is the only trace of it.
+      { kind: "text", text: "[terminal t-1]" },
+    ];
+    const result = resultOf("Captured", [{ kind: "text", text: "Captured" }, ...media]);
+    expect(result?.output).toEqual(media);
+    expect(result?.content).toBe("Captured");
+  });
+
+  it.each<[string, ToolOutputBlock[]]>([
+    ["no media", []],
+    ["only text that content repeats", [{ kind: "text", text: "Captured" }]],
+  ])("leaves the result without an output key for %s", (_name, output) => {
+    expect(resultOf("Captured", output)).not.toHaveProperty("output");
   });
 });

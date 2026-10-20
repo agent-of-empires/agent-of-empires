@@ -4,7 +4,37 @@
 
 ## Authentication
 
-Every endpoint requires the token `aoe serve` printed (also visible in the TUI's Serve panel), unless the server runs with `--no-auth`. Send it as `Authorization: Bearer <token>`, as a `?token=` query parameter, or as the `aoe_token` cookie. Read-only mode (`--read-only`) answers every write endpoint with `403 read_only`.
+Protected routes follow the configured authentication mode. Token authentication accepts `Authorization: Bearer <token>`, a `?token=` query parameter, or the `aoe_token` cookie. Passphrase authentication uses `/api/login` and a device-bound `aoe_session` cookie. A daemon running `--auth none` needs no credential. Read-only mode (`--read-only`) answers write endpoints with `403 read_only`.
+
+## Runtime CLI reads
+
+Read-only CLI commands use `/api/runtime/read/ws` when `--daemon-url` or `AOE_DAEMON_URL` selects an HTTP endpoint. `/api/runtime/ws` is reserved for the TUI stream and does not serve this one-shot protocol.
+
+An explicit endpoint requires a served answer and never falls back. Environment discovery falls back to local storage, with a notice on stderr, if its configuration is unusable or no TCP peer is reached within one second. Authentication, upgrade and protocol failures after reaching a peer never fall back. Each served exchange has a 15-second deadline.
+
+After upgrading the CLI, a `protocol_mismatch` means the target daemon uses a different protocol version. On that daemon's host, run `aoe serve --restart` for a detached daemon; otherwise restart the foreground daemon or its service through the service manager. Update that host's installation if needed. A missing runtime-read route can also indicate an older daemon, but first check the selected URL and proxy routing.
+
+Without an HTTP endpoint, Linux reads use a verified, same-user local daemon socket when published; otherwise they use local storage. Invalid or unverifiable publication artifacts refuse fallback. Other platforms use local storage.
+
+The route follows the daemon's authentication mode. CLI clients use `AOE_DAEMON_TOKEN` or `AOE_DAEMON_PASSPHRASE`; passphrase login shares the ACP client's device-bound session cache. Environment URLs discard query parameters, including query tokens. Explicit endpoints reject queries. HTTP on a non-loopback host is accepted only without credentials; remote authentication requires HTTPS. Localhost connections bypass proxies and pin both loopback address families.
+
+Loopback HTTP does not verify the listener's OS user. If another local user binds the selected port, that process can receive the CLI's bearer token or passphrase. Use it only with trusted local users and port ownership; unset the HTTP endpoint to use verified same-user UDS discovery on Linux.
+
+Runtime snapshots include stored launch commands on both transports to preserve CLI output. Commands may contain inline secrets; treat clients allowed to read snapshots as trusted, and do not expose `--auth none` to untrusted peers. Human output from served reads strips C0/C1 control characters from daemon-provided fields; JSON retains the original values.
+
+Wire protocol **version 4** sends a `Hello` followed by a `Snapshot`. Profiles carry `name`, `listed` and `aliases`; aliases select the same physical store while preserving the requested spelling. Alias-only external stores are available through scoped reads but excluded from ordinary profile inventories and all-profile lists.
+
+Runtime-read session identity and parent relationships are scoped to a profile. The same session ID may appear in different profiles without invalidating the snapshot. Stored absolute project paths retain their spelling, including legacy `.` / `..` components and repeated separators; reads do not normalize them or resolve them on the client.
+
+Profile stores and alias targets must remain responsive. A stalled filesystem operation can indefinitely block daemon status refresh and persisted session mutations waiting on the reload gate. A stalled snapshot worker holds `runtime.flight` and an admission permit; queued workers can exhaust read admission. Client exchange deadlines do not cancel these filesystem operations. Isolation of hung alias targets is tracked in [#4702](https://github.com/agent-of-empires/agent-of-empires/issues/4702).
+
+Scoped session reads fail on unreadable profile data instead of returning an empty success. All-profile listing skips unreadable profiles. Contract-invalid stored sessions degrade only their profile's session data; invalid stored groups degrade only that profile's group enumeration. Invalid global projects degrade only global metadata. These components stay independent, and snapshot sampling never rewrites the stores.
+
+Newly listed profile stores are read on a cache miss without replacing existing live session rows. A newly listed store reusing a cached profile name or alias is not admitted as a cache miss; the daemon must accept a reload first. This includes deleting and recreating a profile with the same name, preventing retained live rows from being mixed with replacement-store data.
+
+Wire members declared nullable must still be present. CLI JSON is a separate contract; for example, `session show --json` omits an unknown `agent_session_id`. A `systemd_unit` glob in local list JSON describes an expected scope name, not proof that the unit exists; remote snapshots omit it.
+
+Background daemon maintenance can recover missing native session IDs from validated publications after the agent pane exits. Read requests do not perform these writes.
 
 ## GET /api/sessions
 
@@ -44,6 +74,8 @@ A daemon older than this field omits it, so treat an absent `context_resume` as 
 ## POST /api/sessions
 
 Creates a session. Pass `?wait=ready` to block until the new session's status leaves `Starting` (bounded at 10s); the response `status` reports whatever it actually reached, including `Error`, so a timeout does not mean success.
+
+When `profile` is omitted, creation uses the server's selected profile or the configured default. An explicitly empty `profile` is rejected.
 
 ```json
 {
@@ -102,6 +134,17 @@ Responses are `200` with `{"id", "lines", "format", "content"}`, `400 format_inv
 3. Read `output` once and capture its trailing region as the reply.
 
 Status transitions also reach `callback_url` and push subscribers.
+
+## MCP server
+
+With `[web] mcp_enabled = true` in `config.toml` (read at daemon startup), the daemon serves a [Model Context Protocol](https://modelcontextprotocol.io) server over Streamable HTTP at `POST /mcp`. With the setting off the route does not exist. It takes the same token as the rest of the API and reports `401` without one.
+
+| Tool | Arguments | Returns |
+| --- | --- | --- |
+| `list_sessions` | `state` (`live`, the default, or `all`), `group` (a group path, including everything beneath it), `children_of` (a session id) | The `GET /api/sessions` body, PascalCase `status` included. |
+| `whoami` | none | `null` until sessions get their own credential. |
+
+Both tools declare an `outputSchema` and return the result as `structuredContent`.
 
 ## Skills
 

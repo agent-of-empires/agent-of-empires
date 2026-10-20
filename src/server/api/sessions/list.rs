@@ -26,6 +26,52 @@ pub async fn list_sessions(
     State(state): State<Arc<AppState>>,
     axum::extract::Query(query): axum::extract::Query<ListSessionsQuery>,
 ) -> Json<SessionsEnvelope> {
+    Json(
+        list_sessions_envelope(
+            &state,
+            &SessionFilter {
+                scope: query.state,
+                ..SessionFilter::default()
+            },
+            true,
+        )
+        .await,
+    )
+}
+
+/// Row filter shared by the HTTP list route and the MCP `list_sessions` tool.
+#[derive(Default)]
+pub(crate) struct SessionFilter {
+    pub scope: Option<crate::session::SessionScope>,
+    /// Group path; matches the group itself and everything beneath it.
+    pub group: Option<String>,
+    pub children_of: Option<String>,
+}
+
+impl SessionFilter {
+    fn matches(&self, inst: &Instance) -> bool {
+        crate::session::SessionScope::matches(self.scope, inst)
+            && self.group.as_deref().is_none_or(|group| {
+                inst.group_path == group
+                    || inst
+                        .group_path
+                        .strip_prefix(group)
+                        .is_some_and(|rest| rest.starts_with('/'))
+            })
+            && self
+                .children_of
+                .as_deref()
+                .is_none_or(|parent| inst.parent_session_id.as_deref() == Some(parent))
+    }
+}
+
+/// `persist_ordering` lets the dashboard's list poll record newly seen workspaces; other callers
+/// pass false and only read the stored order.
+pub(crate) async fn list_sessions_envelope(
+    state: &Arc<AppState>,
+    filter: &SessionFilter,
+    persist_ordering: bool,
+) -> SessionsEnvelope {
     let instances = state.instances.read().await;
     let claude_fullscreen = crate::claude_settings::read_tui_fullscreen();
     // Snapshot the supervisor's worker lifecycle map once per request
@@ -39,7 +85,7 @@ pub async fn list_sessions(
         // the TUI or another client must not be visible or actionable to a
         // locked-down client. The lifecycle routes apply the matching gate (#7).
         .filter(|inst| !state.cityhall_mode || inst.is_structured())
-        .filter(|inst| crate::session::SessionScope::matches(query.state, inst))
+        .filter(|inst| filter.matches(inst))
         .collect();
     let mut sessions: Vec<SessionResponse> = scoped_instances
         .iter()
@@ -71,10 +117,10 @@ pub async fn list_sessions(
             } else {
                 None
             };
-            let acp_worker_state = worker_states
+            let (acp_worker_state, acp_worker_start) = worker_states
                 .get(&inst.id)
-                .copied()
-                .unwrap_or(crate::daemon::AcpWorkerState::Absent);
+                .cloned()
+                .unwrap_or((crate::daemon::AcpWorkerState::Absent, None));
             let mut session = SessionResponse::from_instance_with_plan(
                 inst,
                 claude_fullscreen,
@@ -84,6 +130,7 @@ pub async fn list_sessions(
                 next_wakeup_reason,
                 active_monitor,
             );
+            session.acp_worker_start = acp_worker_start;
             if structured_live && acp_worker_state == crate::daemon::AcpWorkerState::Running {
                 // Gate on a live worker: a pending nonce only exists on a
                 // running worker, and spawn/attach sweep orphaned nonces out of
@@ -359,16 +406,19 @@ pub async fn list_sessions(
         }
     }
 
-    let workspace_ordering =
-        merge_workspace_ordering(&sessions, state.read_only).unwrap_or_else(|e| {
-            tracing::error!(target: "http.api.sessions", "Failed to merge workspace ordering: {e}");
-            Vec::new()
-        });
+    let workspace_ordering = merge_workspace_ordering(
+        &sessions,
+        state.read_only || !persist_ordering,
+    )
+    .unwrap_or_else(|e| {
+        tracing::error!(target: "http.api.sessions", "Failed to merge workspace ordering: {e}");
+        Vec::new()
+    });
 
-    Json(SessionsEnvelope {
+    SessionsEnvelope {
         sessions,
         workspace_ordering,
-    })
+    }
 }
 // Workspace id derivation, mirroring `useWorkspaces.ts`: a session with a
 // branch collapses to `${repoPath}::${branch}`, a branchless one gets
@@ -609,6 +659,7 @@ mod workspace_ordering_tests {
             view: crate::session::View::Terminal,
             pending_approvals: Vec::new(),
             acp_worker_state: crate::daemon::AcpWorkerState::Absent,
+            acp_worker_start: None,
             context_resume: Some(ContextResumeAvailability::Unavailable {
                 reason: ContextResumeUnavailableReason::NoTarget,
             }),

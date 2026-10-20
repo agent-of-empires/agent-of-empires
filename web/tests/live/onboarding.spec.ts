@@ -31,7 +31,8 @@ async function openTopBarMenuItem(page: Page, name: string) {
 
 test("first-run tutorial: auto-launch, skip, persist, re-trigger", async ({ page, serve }) => {
   // #1513; the seen flag is server-side since #1832.
-  const firstStep = "Command bar";
+  const tourStep = (title: string) => page.getByRole("alertdialog", { name: title, exact: true });
+  const firstStep = tourStep("Search and commands");
   await presentAsRealBrowser(page);
   // Tips would also auto-pop after reload; keep the tour the only modal here.
   const disableTipsRes = await page.request.post(`${serve.baseUrl}/api/tips/show`, { data: { enabled: false } });
@@ -39,11 +40,11 @@ test("first-run tutorial: auto-launch, skip, persist, re-trigger", async ({ page
 
   await page.goto(serve.baseUrl);
   // #1834: the theme welcome shows first.
-  await expect(page.getByText("Choose your theme")).toBeVisible({ timeout: 10_000 });
+  await expect(page.getByRole("heading", { name: "Welcome to Agent of Empires" })).toBeVisible({ timeout: 10_000 });
   await page.getByRole("button", { name: "Continue" }).click();
 
-  await expect(page.getByText(firstStep)).toBeVisible({ timeout: 10_000 });
-  const skip = page.getByRole("button", { name: "Skip" });
+  await expect(firstStep).toBeVisible({ timeout: 10_000 });
+  const skip = page.getByRole("button", { name: "Skip tour", exact: true });
   await expect(skip).toBeVisible();
   const postSeen = page.waitForResponse(
     (r) => r.url().includes("/api/app-state/web-tour-seen") && r.request().method() === "POST",
@@ -51,25 +52,25 @@ test("first-run tutorial: auto-launch, skip, persist, re-trigger", async ({ page
   );
   await skip.click();
   expect((await postSeen).status()).toBe(200);
-  await expect(page.getByText(firstStep)).toBeHidden();
+  await expect(firstStep).toBeHidden();
   // #2819: a stranded scrim blocks the whole page.
   await expect(page.locator(".react-joyride__overlay")).toHaveCount(0);
   await expect.poll(() => tourSeen(page), { timeout: 20_000 }).toBe(true);
 
   await page.reload();
   await expect(page.getByRole("button", { name: "Go to dashboard" })).toBeVisible();
-  await expect(page.getByText(firstStep)).toBeHidden();
-  await expect(page.getByText("Choose your theme")).toBeHidden();
+  await expect(firstStep).toBeHidden();
+  await expect(page.getByRole("heading", { name: "Welcome to Agent of Empires" })).toBeHidden();
 
   await openTopBarMenuItem(page, "Show tutorial");
-  await expect(page.getByText(firstStep)).toBeVisible({ timeout: 10_000 });
+  await expect(firstStep).toBeVisible({ timeout: 10_000 });
 
   // #2633: the tour opens settings tabs mid-walk. Each crossing is async, so wait for every step.
   const next = page.getByRole("button", { name: /^Next/ });
   const steps: [string, string?][] = [
-    ["Workspaces and sessions"],
+    ["Your sessions"],
     ["Start a session"],
-    ["Settings and profiles"],
+    ["Settings"],
     ["Worktrees keep sessions isolated", "/settings/worktree"],
     ["Extend AoE with plugins", "/settings/plugins"],
     // #2631
@@ -78,11 +79,11 @@ test("first-run tutorial: auto-launch, skip, persist, re-trigger", async ({ page
   ];
   for (const [heading, path] of steps) {
     await next.click();
-    await expect(page.getByText(heading)).toBeVisible({ timeout: 10_000 });
+    await expect(tourStep(heading)).toBeVisible({ timeout: 10_000 });
     if (path) await expect.poll(() => new URL(page.url()).pathname).toBe(path);
   }
   await page.getByRole("button", { name: /^Done/ }).click();
-  await expect(page.getByText("Replay this tour any time")).toBeHidden();
+  await expect(tourStep("Replay this tour any time")).toBeHidden();
   // #2819: each settings crossing remounts Joyride, so the last step must end the tour itself.
   await expect(page.locator(".react-joyride__overlay")).toHaveCount(0);
   expect(await tourSeen(page)).toBe(true);

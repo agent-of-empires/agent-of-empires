@@ -43,6 +43,23 @@ test.describe("Live terminal mobile controls", () => {
     expect(handle.liveInput.length).toBe(typedBefore);
   });
 
+  for (const chord of ["Control+Enter", "Meta+Enter"]) {
+    test(`${chord} pastes once and hands focus to the terminal`, async ({ page }) => {
+      const handle = await openLiveTerminal(page, { mobile: true });
+      const typedBefore = handle.liveInput.length;
+
+      await page.getByRole("button", { name: "Compose" }).tap();
+      await expect(page.getByRole("textbox", { name: "Message" })).toBeFocused();
+      await page.keyboard.type("go");
+      await page.keyboard.press(chord);
+
+      await expect(page.getByRole("dialog", { name: "Compose" })).toHaveCount(0);
+      await expect(page.getByLabel("Live terminal input")).toBeFocused();
+      await expect.poll(() => pastes(handle)).toEqual([{ type: "paste", text: "go", submit: true }]);
+      expect(handle.liveInput.length).toBe(typedBefore);
+    });
+  }
+
   test("the default key row fits one line, and an eight-key row still does not scroll", async ({ page }) => {
     const handle = await openLiveTerminal(page, { mobile: true });
     const row = ["Escape", "Tab", "Ctrl", "Paste from clipboard", "Compose"];

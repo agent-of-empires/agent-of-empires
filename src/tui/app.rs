@@ -1325,11 +1325,11 @@ impl App {
                 self.emit_telemetry_snapshot();
             }
 
-            if last_serve_probe.elapsed() >= SERVE_PROBE_INTERVAL {
+            let serve_probe_due = last_serve_probe.elapsed() >= SERVE_PROBE_INTERVAL;
+            if serve_probe_due {
                 last_serve_probe = std::time::Instant::now();
-                self.home.request_serve_probe();
             }
-            refresh_needed |= self.home.apply_serve_probe();
+            refresh_needed |= self.home.tick_serve_probe(serve_probe_due);
 
             if last_presence_refresh.elapsed() >= PRESENCE_REFRESH_INTERVAL {
                 last_presence_refresh = std::time::Instant::now();

@@ -15,6 +15,9 @@ export const TOUR_RUNNER_OPTIONS: Partial<Options> = {
   scrollOffset: 96,
 };
 
+// Joyride's own defaults center the text and size buttons at 16px.
+const TOUR_BUTTON = { fontSize: 13, padding: "8px 12px" };
+
 export const TOUR_RUNNER_STYLES: Partial<Styles> = {
   tooltip: {
     backgroundColor: "var(--color-surface-800)",
@@ -23,6 +26,7 @@ export const TOUR_RUNNER_STYLES: Partial<Styles> = {
     color: "var(--color-text-primary)",
     fontSize: 13,
   },
+  tooltipContainer: { textAlign: "left" },
   tooltipTitle: {
     color: "var(--color-brand-500)",
     fontSize: 14,
@@ -30,10 +34,12 @@ export const TOUR_RUNNER_STYLES: Partial<Styles> = {
   },
   tooltipContent: { padding: "10px 4px" },
   buttonPrimary: {
+    ...TOUR_BUTTON,
     backgroundColor: "var(--color-brand-600)",
     borderRadius: 6,
     color: "var(--color-text-on-brand)",
   },
-  buttonBack: { color: "var(--color-text-secondary)" },
-  buttonSkip: { color: "var(--color-text-dim)" },
+  buttonBack: { ...TOUR_BUTTON, color: "var(--color-text-secondary)" },
+  // text-subtle is lifted to AA on the tooltip's surface-800 for every builtin theme (resolved.rs).
+  buttonSkip: { ...TOUR_BUTTON, color: "var(--color-text-subtle)" },
 };
