@@ -129,6 +129,11 @@ impl RateLimiter {
         false
     }
 
+    #[cfg(test)]
+    pub(crate) async fn failure_count(&self, ip: IpAddr) -> u32 {
+        self.failures.read().await.get(&ip).map_or(0, |r| r.count)
+    }
+
     /// Clear failure count for an IP after successful auth.
     pub async fn record_success(&self, ip: IpAddr) {
         let mut failures = self.failures.write().await;

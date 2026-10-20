@@ -344,8 +344,19 @@ impl PasskeyManager {
         {
             let mut map = lock(&self.authentications);
             purge_expired(&mut map);
-            let per_ip = map.values().filter(|c| c.owner == owner).count();
-            if map.len() >= MAX_AUTHENTICATIONS || per_ip >= MAX_AUTHENTICATIONS_PER_IP {
+            // A dismissed browser prompt leaves its ceremony behind, so at the per-IP cap
+            // replace that IP's oldest instead of locking it out until they expire.
+            let mine: Vec<(String, Instant)> = map
+                .iter()
+                .filter(|(_, c)| c.owner == owner)
+                .map(|(id, c)| (id.clone(), c.expires_at))
+                .collect();
+            if mine.len() >= MAX_AUTHENTICATIONS_PER_IP {
+                if let Some((oldest, _)) = mine.into_iter().min_by_key(|(_, at)| *at) {
+                    map.remove(&oldest);
+                }
+            }
+            if map.len() >= MAX_AUTHENTICATIONS {
                 return Err(PasskeyError::TooManyCeremonies);
             }
             map.insert(
@@ -666,7 +677,13 @@ pub async fn login_finish_handler(
             issue_session(&state, &binding, ip, &headers).await
         }
         Err(e) => {
-            let locked = state.rate_limiter.record_failure(ip).await;
+            // A missing or expired ceremony guesses nothing (ids are 256-bit random) and
+            // also happens to a legitimate finish whose ceremony another login cleared.
+            let locked = if matches!(e, PasskeyError::InvalidCeremony) {
+                false
+            } else {
+                state.rate_limiter.record_failure(ip).await
+            };
             tracing::warn!(
                 target: "auth.passkey",
                 ip = %ip,
@@ -1151,24 +1168,37 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn login_ceremonies_are_capped_per_ip_without_evicting_registrations() {
+    async fn login_ceremonies_are_capped_per_ip_by_replacing_the_oldest() {
         let mgr = PasskeyManager::in_memory();
         let mut auth = authenticator();
         enrol(&mgr, &mut auth, ORIGIN, "s1").await;
         let p = profile(ORIGIN);
         mgr.begin_register(&p, "s2", "").await.unwrap();
 
-        for _ in 0..MAX_AUTHENTICATIONS_PER_IP {
-            mgr.begin_login(&p, ip()).await.unwrap();
+        let mut txs = Vec::new();
+        for _ in 0..=MAX_AUTHENTICATIONS_PER_IP {
+            txs.push(mgr.begin_login(&p, ip()).await.unwrap().0);
         }
-        assert!(matches!(
-            mgr.begin_login(&p, ip()).await,
-            Err(PasskeyError::TooManyCeremonies)
-        ));
+        let mine = |mgr: &PasskeyManager| {
+            lock(&mgr.authentications)
+                .values()
+                .filter(|c| c.owner == ip().to_string())
+                .count()
+        };
+        assert_eq!(mine(&mgr), MAX_AUTHENTICATIONS_PER_IP);
+        {
+            let map = lock(&mgr.authentications);
+            assert!(
+                !map.contains_key(&txs[0]),
+                "the oldest ceremony was replaced"
+            );
+            assert!(map.contains_key(&txs[MAX_AUTHENTICATIONS_PER_IP]));
+        }
         let other: IpAddr = "203.0.113.8".parse().unwrap();
         mgr.begin_login(&p, other)
             .await
             .expect("other IP unaffected");
+        assert_eq!(mine(&mgr), MAX_AUTHENTICATIONS_PER_IP);
         assert_eq!(lock(&mgr.registrations).len(), 1);
     }
 
@@ -1311,6 +1341,131 @@ mod tests {
                 "{cookie:?} bound={bound}"
             );
         }
+    }
+
+    /// Drives login over HTTP with a software authenticator: the session a passkey login
+    /// issues is not elevated, and only credential failures count toward the lockout.
+    #[tokio::test]
+    async fn passkey_login_over_http_issues_a_non_elevated_session_and_counts_only_credential_failures(
+    ) {
+        use tower::ServiceExt;
+
+        let mut state = crate::server::test_support::build_test_app_state_with_policy(
+            Vec::new(),
+            vec!["aoe.example.com".to_string()],
+            vec![ORIGIN.to_string()],
+            None,
+        );
+        Arc::get_mut(&mut state).unwrap().login_manager =
+            Arc::new(crate::server::login::LoginManager::new(Some("pw")));
+        let mut auth = authenticator();
+        enrol(&state.passkey_manager, &mut auth, ORIGIN, "enrolling").await;
+        let limiter = Arc::clone(&state.rate_limiter);
+        let app = crate::server::test_support::build_router_for_test(state);
+        let binding = URL_SAFE_NO_PAD.encode([5u8; 32]);
+
+        let send = |path: &str, cookie: Option<&str>, body: serde_json::Value| {
+            let mut req = axum::http::Request::builder()
+                .method("POST")
+                .uri(path)
+                .header("host", "aoe.example.com")
+                .header("origin", ORIGIN)
+                .header("content-type", "application/json")
+                .header("x-aoe-device-binding", &binding);
+            if let Some(cookie) = cookie {
+                req = req.header("cookie", cookie);
+            }
+            let mut req = req.body(axum::body::Body::from(body.to_string())).unwrap();
+            req.extensions_mut()
+                .insert(ConnectInfo(std::net::SocketAddr::from((
+                    [203, 0, 113, 7],
+                    5555,
+                ))));
+            app.clone().oneshot(req)
+        };
+        let json_of = |res: Response| async move {
+            let bytes = axum::body::to_bytes(res.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            serde_json::from_slice::<serde_json::Value>(&bytes).unwrap()
+        };
+        let start = || async {
+            let res = send("/api/login/passkey/start", None, serde_json::json!({}))
+                .await
+                .unwrap();
+            let status = res.status();
+            (status, json_of(res).await)
+        };
+        let finish_body = |tx: &str, cred: &PublicKeyCredential| {
+            serde_json::json!({
+                "transaction_id": tx,
+                "credential": cred,
+                "device_binding_secret": binding,
+            })
+        };
+
+        let (status, started) = start().await;
+        assert_eq!(status, StatusCode::OK);
+        let options: RequestChallengeResponse =
+            serde_json::from_value(started["options"].clone()).unwrap();
+        let cred = auth.do_authentication(url(ORIGIN), options).unwrap();
+        let res = send(
+            "/api/login/passkey/finish",
+            None,
+            finish_body(started["transaction_id"].as_str().unwrap(), &cred),
+        )
+        .await
+        .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let cookie = res
+            .headers()
+            .get_all("set-cookie")
+            .iter()
+            .filter_map(|v| v.to_str().ok())
+            .find_map(|c| {
+                c.split(';')
+                    .next()
+                    .filter(|c| c.starts_with("aoe_session="))
+            })
+            .expect("session cookie")
+            .to_string();
+
+        // The new session is bound but not elevated, so enrolling still needs the passphrase.
+        let res = send(
+            "/api/passkeys/register/start",
+            Some(&cookie),
+            serde_json::json!({ "label": "x" }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(res.status(), StatusCode::FORBIDDEN);
+        assert_eq!(json_of(res).await["error"], "elevation_required");
+
+        // Finishing a ceremony that no longer exists never counts toward the lockout.
+        let client = ip();
+        for _ in 0..6 {
+            let res = send(
+                "/api/login/passkey/finish",
+                None,
+                finish_body("gone", &cred),
+            )
+            .await
+            .unwrap();
+            assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+        }
+        assert_eq!(limiter.failure_count(client).await, 0);
+
+        // A credential that fails verification does.
+        let (_, started) = start().await;
+        let res = send(
+            "/api/login/passkey/finish",
+            None,
+            finish_body(started["transaction_id"].as_str().unwrap(), &cred),
+        )
+        .await
+        .unwrap();
+        assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(limiter.failure_count(client).await, 1);
     }
 
     #[test]
