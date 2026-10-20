@@ -18,6 +18,7 @@ import {
   type SaveOutcome,
   type SettingsResponse,
 } from "../lib/api";
+import { confirmThemeWrite } from "../lib/confirmThemeWrite";
 import { loadSettings, saveField, useProfileSettings } from "../lib/settingsStore";
 import type { ProfileInfo, SettingsFieldDescriptor } from "../lib/types";
 import { SchemaSection } from "./settings/SchemaSection";
@@ -413,10 +414,13 @@ export function SettingsView({
     (section: string, field: string, value: unknown): Promise<boolean> => {
       const overridable = schema.some((d) => d.section === section && d.field === field && d.profile_overridable);
       if (overridable) return sendSave(section, field, value);
-      // The picker repaints on true, so an unconfirmed write must not count.
+      // The picker repaints on true, so an unconfirmed write counts only once a fetch shows it.
       let outcome: SaveOutcome | undefined;
       const send = async () => (outcome = await updateTheme({ [field]: value }));
-      return saveField(selectedProfile, section, field, value, send).then((ok) => ok && outcome === "committed");
+      return saveField(selectedProfile, section, field, value, send).then(
+        async (ok) =>
+          ok && (outcome === "committed" || (outcome === "uncertain" && (await confirmThemeWrite(field, value)))),
+      );
     },
     [schema, selectedProfile, sendSave],
   );

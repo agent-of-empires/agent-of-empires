@@ -1,5 +1,6 @@
 import { useCallback, useState } from "react";
-import { fetchSettings, updateTheme } from "../lib/api";
+import { updateTheme } from "../lib/api";
+import { confirmThemeWrite } from "../lib/confirmThemeWrite";
 import { dispatchThemePickerChanged } from "./useResolvedTheme";
 
 export type ThemeSelectResult = { ok: true } | { ok: false; error: string };
@@ -17,9 +18,7 @@ export function useThemeMutation(): {
     setPending(true);
     try {
       const outcome = await updateTheme({ name });
-      // A lost response may still have persisted the pick; only a fetch showing it counts as saved.
-      const saved =
-        outcome === "committed" || (outcome === "uncertain" && (await fetchSettings())?.theme?.name === name);
+      const saved = outcome === "committed" || (outcome === "uncertain" && (await confirmThemeWrite("name", name)));
       if (!saved) return { ok: false, error: SAVE_ERROR };
       dispatchThemePickerChanged(name);
       return { ok: true };

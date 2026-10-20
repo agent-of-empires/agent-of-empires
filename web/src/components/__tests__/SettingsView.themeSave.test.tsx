@@ -2,6 +2,7 @@
 
 import { afterEach, describe, expect, it, vi, beforeEach } from "vitest";
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { fetchSettings } from "../../lib/api";
 import { SettingsView } from "../SettingsView";
 
 const PROFILES = [{ name: "main", is_default: true }];
@@ -161,6 +162,28 @@ describe("SettingsView theme tab save routing", () => {
     await waitFor(() => expect(updateTheme).toHaveBeenCalledTimes(2));
     expect(updateTheme).toHaveBeenLastCalledWith({ name: "dracula" });
     expect(screen.queryByText("Failed to save, please try again")).toBeNull();
+    expect(dispatchThemePickerChanged).not.toHaveBeenCalled();
+  });
+
+  it("repaints an uncertain theme pick once a fetch shows it saved", async () => {
+    updateTheme.mockImplementationOnce(() => Promise.resolve("uncertain"));
+    renderThemeTab();
+    await waitFor(() => selectWithOption("dracula"));
+    const saved = { theme: { name: "dracula", idle_decay_minutes: 0 } };
+    vi.mocked(fetchSettings).mockResolvedValueOnce(saved).mockResolvedValueOnce(saved);
+    fireEvent.change(selectWithOption("dracula"), { target: { value: "dracula" } });
+
+    await waitFor(() => expect(dispatchThemePickerChanged).toHaveBeenCalledWith("dracula"));
+    expect(updateTheme).toHaveBeenCalledTimes(1);
+  });
+
+  it("reports a rejected theme pick and never repaints", async () => {
+    updateTheme.mockImplementationOnce(() => Promise.resolve("rejected"));
+    renderThemeTab();
+    await waitFor(() => selectWithOption("dracula"));
+    fireEvent.change(selectWithOption("dracula"), { target: { value: "dracula" } });
+
+    await screen.findByText("Failed to save, please try again");
     expect(dispatchThemePickerChanged).not.toHaveBeenCalled();
   });
 });
