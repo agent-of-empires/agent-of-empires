@@ -91,7 +91,7 @@ where
         let spawned = std::thread::Builder::new()
             .name("aoe-alias-io".into())
             .spawn(move || {
-                let _finish = Finish(worker_key.clone(), target.clone());
+                let finish = Finish(worker_key.clone(), target.clone());
                 #[cfg(test)]
                 held::block(&worker_key);
                 let value = Arc::new(work());
@@ -100,6 +100,8 @@ where
                         slot.last = Some(value.clone());
                     }
                 }
+                // Idle before any caller can observe the result.
+                drop(finish);
                 let _ = tx.send(value);
             });
         if spawned.is_err() {
@@ -140,8 +142,10 @@ pub(crate) mod held {
 
     type Gate = Arc<(Mutex<bool>, Condvar)>;
 
-    static HOLDS: LazyLock<Mutex<HashMap<Key, (mpsc::Sender<()>, Gate, Arc<AtomicBool>)>>> =
-        LazyLock::new(Mutex::default);
+    /// Entry signal, release gate, and whether a worker already took the hold.
+    type Held = (mpsc::Sender<()>, Gate, Arc<AtomicBool>);
+
+    static HOLDS: LazyLock<Mutex<HashMap<Key, Held>>> = LazyLock::new(Mutex::default);
 
     pub(super) fn block(key: &Key) {
         let held = HOLDS
@@ -149,15 +153,17 @@ pub(crate) mod held {
             .unwrap_or_else(PoisonError::into_inner)
             .get(key)
             .cloned();
-        if let Some((entered, gate, taken)) =
-            held.filter(|(_, _, taken)| !taken.swap(true, Ordering::SeqCst))
-        {
-            let _ = entered.send(());
-            let (open, signal) = &*gate;
-            let mut open = open.lock().unwrap_or_else(PoisonError::into_inner);
-            while !*open {
-                open = signal.wait(open).unwrap_or_else(PoisonError::into_inner);
-            }
+        let Some((entered, gate, taken)) = held else {
+            return;
+        };
+        if taken.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let _ = entered.send(());
+        let (open, signal) = &*gate;
+        let mut open = open.lock().unwrap_or_else(PoisonError::into_inner);
+        while !*open {
+            open = signal.wait(open).unwrap_or_else(PoisonError::into_inner);
         }
     }
 
