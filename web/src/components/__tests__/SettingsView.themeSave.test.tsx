@@ -161,5 +161,6 @@ describe("SettingsView theme tab save routing", () => {
     await waitFor(() => expect(updateTheme).toHaveBeenCalledTimes(2));
     expect(updateTheme).toHaveBeenLastCalledWith({ name: "dracula" });
     expect(screen.queryByText("Failed to save, please try again")).toBeNull();
+    expect(dispatchThemePickerChanged).not.toHaveBeenCalled();
   });
 });

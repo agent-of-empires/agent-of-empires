@@ -89,7 +89,8 @@ test("PATCH 500 does not silently change dataset.theme or dispatch picker event"
   const surfaceBefore = await surface900(page);
 
   await select.selectOption(await optionOtherThanCurrent(select));
-  await expect(page.getByText("Failed to save, please try again")).toBeVisible();
+  // A 5xx leaves the write uncertain, which the picker reports as unconfirmed rather than rejected.
+  await expect(page.getByText(/Could not confirm the save/)).toBeVisible();
   expect(await page.evaluate(() => (window as unknown as { __pickerFired?: number }).__pickerFired ?? 0)).toBe(0);
   expect(await datasetTheme(page)).toBe(datasetBefore);
   expect(await surface900(page)).toBe(surfaceBefore);

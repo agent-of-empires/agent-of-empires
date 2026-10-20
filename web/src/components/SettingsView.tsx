@@ -15,6 +15,7 @@ import {
   updateProfileSettings,
   updateSettings,
   updateTheme,
+  type SaveOutcome,
   type SettingsResponse,
 } from "../lib/api";
 import { loadSettings, saveField, useProfileSettings } from "../lib/settingsStore";
@@ -412,7 +413,10 @@ export function SettingsView({
     (section: string, field: string, value: unknown): Promise<boolean> => {
       const overridable = schema.some((d) => d.section === section && d.field === field && d.profile_overridable);
       if (overridable) return sendSave(section, field, value);
-      return saveField(selectedProfile, section, field, value, () => updateTheme({ [field]: value }));
+      // The picker repaints on true, so an unconfirmed write must not count.
+      let outcome: SaveOutcome | undefined;
+      const send = async () => (outcome = await updateTheme({ [field]: value }));
+      return saveField(selectedProfile, section, field, value, send).then((ok) => ok && outcome === "committed");
     },
     [schema, selectedProfile, sendSave],
   );
