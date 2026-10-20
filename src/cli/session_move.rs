@@ -75,7 +75,17 @@ pub async fn run(profile: &str, args: MoveArgs) -> Result<()> {
         refuse_if_live(&live)?;
         batch.push(live);
     }
-    ensure_no_duplicates(&target.load()?, &batch)?;
+    let target_rows = target.load()?;
+    if let Some(clash) = batch
+        .iter()
+        .find(|inst| target_rows.iter().any(|row| row.id == inst.id))
+    {
+        bail!(
+            "Session {} already exists in profile '{target_name}'",
+            clash.id
+        );
+    }
+    ensure_no_duplicates(&target_rows, &batch)?;
 
     // One transaction per group path: GroupMovePlan carries a single path.
     let mut by_group: BTreeMap<&str, Vec<&Instance>> = BTreeMap::new();
@@ -280,6 +290,26 @@ mod tests {
             assert!(error.to_string().contains(expect), "{ids:?}: {error}");
             assert_eq!(source.load().unwrap().len(), 3, "{ids:?}");
         }
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn target_id_clash_in_a_later_group_moves_nothing() {
+        let _guard = crate::session::test_support::isolate_app_dir();
+        let first = grouped("grp-a", "/tmp/a", "a");
+        let second = grouped("grp-b", "/tmp/b", "b");
+        let mut stale = second.clone();
+        stale.title = "stale-copy".into();
+        stale.project_path = "/tmp/stale".into();
+        let source = seed("clash-src", vec![first, second]);
+        let target = seed("clash-dst", vec![stale]);
+
+        let error = run("clash-src", args(&["grp-a", "grp-b"], "clash-dst"))
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("already exists"), "{error}");
+        assert_eq!(source.load().unwrap().len(), 2);
+        assert_eq!(target.load().unwrap().len(), 1);
     }
 
     #[test]
