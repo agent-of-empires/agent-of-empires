@@ -186,6 +186,9 @@ Run without arguments to launch the TUI dashboard.
 * `--daemon-url <DAEMON_URL>` — Select a daemon endpoint for read-only CLI commands or the TUI
 
    Explicit CLI endpoints never fall back. `AOE_DAEMON_URL` discovery may fall back to local storage before reaching a TCP peer, with a notice. Authenticate CLI reads with `AOE_DAEMON_TOKEN` or `AOE_DAEMON_PASSPHRASE`; TUI session lists support bearer tokens only. An unauthenticated daemon needs neither. See the HTTP API reference for transport and fallback rules.
+* `--no-autostart` — Fail instead of starting a local daemon when none is running
+
+   Also read from `AOE_NO_AUTOSTART=1`. Has no effect with `--daemon-url` or `AOE_DAEMON_URL`, which never start a daemon.
 
 
 

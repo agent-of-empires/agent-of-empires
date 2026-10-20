@@ -73,7 +73,12 @@ pub struct Cli {
     ///
     /// Also read from `AOE_NO_AUTOSTART=1`. Has no effect with `--daemon-url`
     /// or `AOE_DAEMON_URL`, which never start a daemon.
-    #[arg(long, global = true, env = "AOE_NO_AUTOSTART")]
+    #[arg(
+        long,
+        global = true,
+        env = "AOE_NO_AUTOSTART",
+        value_parser = clap::builder::BoolishValueParser::new()
+    )]
     pub no_autostart: bool,
 
     #[command(subcommand)]
