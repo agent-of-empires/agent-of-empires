@@ -8,6 +8,7 @@ on:
   # PR concurrency replaces in-flight runs; completed work still reruns.
   pull_request:
     types: [opened, synchronize, reopened, labeled]
+  merge_group:
 
 concurrency:
   group: tests-${{ github.event.pull_request.number || github.sha }}

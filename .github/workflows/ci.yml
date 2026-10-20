@@ -7,6 +7,7 @@ on:
   # and a base filter would leave every PR but the bottom of the stack with no
   # checks at all.
   pull_request:
+  merge_group:
 
 env:
   CARGO_TERM_COLOR: always
