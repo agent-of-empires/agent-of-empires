@@ -7,6 +7,7 @@ on:
   # and a base filter would leave every PR but the bottom of the stack with no
   # checks at all.
   pull_request:
+  merge_group:
 
 env:
   CARGO_TERM_COLOR: always
@@ -357,11 +358,14 @@ jobs:
         env:
           EVENT_NAME: ${{ github.event_name }}
           BASE_REF: ${{ github.base_ref }}
+          QUEUE_BASE_SHA: ${{ github.event.merge_group.base_sha }}
           EVENT_BEFORE: ${{ github.event.before }}
         run: |
           set -euo pipefail
           if [ "$EVENT_NAME" = "pull_request" ]; then
             BASE="origin/$BASE_REF"
+          elif [ "$EVENT_NAME" = "merge_group" ]; then
+            BASE="$QUEUE_BASE_SHA"
           else
             # `before` is the pre-push SHA (covers multi-commit pushes); fall
             # back to the empty tree on the initial push where it is all-zero.
@@ -409,11 +413,14 @@ jobs:
         env:
           EVENT_NAME: ${{ github.event_name }}
           BASE_REF: ${{ github.base_ref }}
+          QUEUE_BASE_SHA: ${{ github.event.merge_group.base_sha }}
           EVENT_BEFORE: ${{ github.event.before }}
         run: |
           set -euo pipefail
           if [ "$EVENT_NAME" = "pull_request" ]; then
             BASE="origin/$BASE_REF"
+          elif [ "$EVENT_NAME" = "merge_group" ]; then
+            BASE="$QUEUE_BASE_SHA"
           else
             # `github.event.before` is the SHA before the push, which
             # covers multi-commit pushes correctly. Falls back to the
