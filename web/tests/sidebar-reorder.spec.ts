@@ -21,6 +21,17 @@ async function openDesktop(page: Page, sessions: MockSessionInput[] = threeSessi
   return handle;
 }
 
+/**
+ * A click right after a drop, held for a person's press (about 100ms). dnd-kit itself drops clicks for
+ * 50ms after a drag ends; the old 250ms window would still swallow this one.
+ */
+async function humanClick(page: Page, x: number, y: number) {
+  await page.mouse.move(x, y);
+  await page.mouse.down();
+  await page.waitForTimeout(100);
+  await page.mouse.up();
+}
+
 async function expectNoOrderingPut(page: Page, handle: SidebarMockHandle, ms: number) {
   await observeFor(page, ms, async () => {
     expect(await publishedRequests(page, "/api/workspace-ordering", "PUT")).toEqual([]);
@@ -91,6 +102,17 @@ test.describe("desktop rows", () => {
     // The reloaded order comes from the served ordering, not a client sort.
     await page.reload();
     await expect.poll(() => readVisibleSessionTitles(page), { timeout: 8_000 }).toEqual(["gamma", "alpha", "beta"]);
+  });
+
+  test("a click right after a drop goes through: the row that didn't move navigates", async ({ page }) => {
+    await openDesktop(page);
+    const wrappers = page.locator(WRAPPERS);
+    await expect(wrappers).toHaveCount(3);
+    // alpha keeps its place when gamma drops onto beta, so its box is valid straight after the drop.
+    const alpha = (await wrappers.nth(0).boundingBox())!;
+    await dragRow(page, wrappers.nth(2), wrappers.nth(1));
+    await humanClick(page, alpha.x + alpha.width - 4, alpha.y + alpha.height / 2);
+    await expect(page).toHaveURL(/\/session\/s-a$/, { timeout: 5_000 });
   });
 
   test("a 4px movement does not start a drag; a stationary click navigates without reordering", async ({ page }) => {
@@ -221,6 +243,27 @@ test.describe("group headers", () => {
         .filter(Boolean),
     );
   const draggable = (page: Page) => page.locator("[data-testid='sidebar-group-header'][data-draggable='true']");
+
+  test("a click right after a header drop toggles the header just dropped", async ({ page }) => {
+    await openDesktop(page, twoRepos);
+    await expect(draggable(page)).toHaveCount(2);
+    const before = await groupNames(page);
+    const source = (await draggable(page).nth(1).boundingBox())!;
+    const target = (await page.locator("[data-testid='sidebar-group-header']").nth(0).boundingBox())!;
+    await page.mouse.move(source.x + 40, source.y + source.height / 2);
+    await page.mouse.down();
+    await page.mouse.move(target.x + 40, target.y + target.height / 3, { steps: 12 });
+    await page.mouse.up();
+    // The dropped header now sits where the target was.
+    const dropped = page
+      .locator("[data-testid='sidebar-group-header']")
+      .filter({ hasText: before[1]! })
+      .locator("button[aria-expanded]");
+    await expect(dropped).toHaveAttribute("aria-expanded", "true");
+    const box = (await dropped.boundingBox())!;
+    await humanClick(page, box.x + box.width / 2, box.y + box.height / 2);
+    await expect(dropped).toHaveAttribute("aria-expanded", "false");
+  });
 
   test("drag a group header to reorder, order persists across reload", async ({ page }) => {
     await openDesktop(page, twoRepos);

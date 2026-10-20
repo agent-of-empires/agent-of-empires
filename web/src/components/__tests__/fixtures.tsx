@@ -1,5 +1,5 @@
 /* eslint-disable react-refresh/only-export-components */
-import { useMemo, useRef, type ReactNode } from "react";
+import { useMemo, type ReactNode } from "react";
 import { fireEvent, render, screen } from "@testing-library/react";
 import { vi } from "vitest";
 import { useSidebarTriage } from "../../hooks/useSidebarTriage";
@@ -8,7 +8,6 @@ import { SidebarCompactContext } from "../../lib/sidebarCompact";
 import { SessionColorsContext } from "../../lib/sessionColors";
 import { SessionRowTagContext, type SessionRowTagMode } from "../../lib/sessionRowTag";
 import { UnreadIndicatorContext } from "../../lib/unreadIndicator";
-import { DragSuppressContext } from "../sidebar/dnd";
 import { SessionRow } from "../sidebar/SessionRow";
 import type { RowBulkApi } from "../sidebar/types";
 
@@ -133,7 +132,6 @@ function Providers({
   compact = false,
   unread,
 }: RowOptions & { children: ReactNode }) {
-  const ref = useRef(0);
   const inner = (
     <SidebarCompactContext.Provider value={compact}>
       <SessionRowTagContext.Provider value={rowTagMode}>
@@ -141,14 +139,10 @@ function Providers({
       </SessionRowTagContext.Provider>
     </SidebarCompactContext.Provider>
   );
-  return (
-    <DragSuppressContext.Provider value={ref}>
-      {unread === undefined ? (
-        inner
-      ) : (
-        <UnreadIndicatorContext.Provider value={unread}>{inner}</UnreadIndicatorContext.Provider>
-      )}
-    </DragSuppressContext.Provider>
+  return unread === undefined ? (
+    inner
+  ) : (
+    <UnreadIndicatorContext.Provider value={unread}>{inner}</UnreadIndicatorContext.Provider>
   );
 }
 

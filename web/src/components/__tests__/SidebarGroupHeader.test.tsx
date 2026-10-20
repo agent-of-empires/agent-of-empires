@@ -49,11 +49,10 @@ function group(over: Partial<SidebarGroup> = {}): SidebarGroup {
   };
 }
 
-const dragHandle = (isDragging: boolean) => ({
+const dragHandle = () => ({
   setActivatorNodeRef: () => {},
   attributes: {},
   listeners: {},
-  isDragging,
 });
 
 function renderHeader(props: Partial<Parameters<typeof SidebarGroupHeader>[0]> = {}) {
@@ -154,29 +153,10 @@ describe("SidebarGroupHeader", () => {
   });
 
   it("marks the header draggable only with a drag handle", () => {
-    const { rerender } = renderHeader({ dragHandle: dragHandle(false) });
+    const { rerender } = renderHeader({ dragHandle: dragHandle() });
     expect(screen.getByTestId("sidebar-group-header").getAttribute("data-draggable")).toBe("true");
     rerender({});
     expect(screen.getByTestId("sidebar-group-header").getAttribute("data-draggable")).toBeNull();
-  });
-
-  it("swallows clicks on every control during a drag and briefly after, then toggles again", () => {
-    vi.useFakeTimers();
-    try {
-      const { onClick, onNewSession, rerender } = renderHeader({ dragHandle: dragHandle(true) });
-      fireEvent.click(screen.getByText("my-project"));
-      fireEvent.click(screen.getByLabelText("New session in my-project"));
-      rerender({ dragHandle: dragHandle(false) });
-      fireEvent.click(screen.getByText("my-project"));
-      expect(onClick).not.toHaveBeenCalled();
-      expect(onNewSession).not.toHaveBeenCalled();
-
-      vi.advanceTimersByTime(300);
-      fireEvent.click(screen.getByText("my-project"));
-      expect(onClick).toHaveBeenCalledTimes(1);
-    } finally {
-      vi.useRealTimers();
-    }
   });
 
   it("offers 'Edit settings' for the synthetic Scratch group despite capabilities.create being 'generic'", () => {
