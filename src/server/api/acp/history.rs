@@ -635,9 +635,13 @@ done
                 synthesized: false,
                 origin_plugin: None,
             },
-            Event::AgentMessageChunk { text: "hi".into() },
+            Event::AgentMessageChunk {
+                text: "hi".into(),
+                message_id: None,
+            },
             Event::AgentMessageChunk {
                 text: " there".into(),
+                message_id: None,
             },
             Event::Stopped {
                 reason: "prompt_complete".into(),

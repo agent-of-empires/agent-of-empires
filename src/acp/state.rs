@@ -701,6 +701,9 @@ pub enum Event {
     },
     AgentMessageChunk {
         text: String,
+        /// The ACP message this chunk belongs to; a change starts a new message.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        message_id: Option<String>,
     },
     /// aoe sent `session/cancel` and armed the escalation watchdog.
     CancelRequested {
@@ -1209,7 +1212,10 @@ pub(crate) mod test_support {
     }
 
     pub(crate) fn chunk(text: &str) -> Event {
-        Event::AgentMessageChunk { text: text.into() }
+        Event::AgentMessageChunk {
+            text: text.into(),
+            message_id: None,
+        }
     }
 
     pub(crate) fn stopped(reason: &str) -> Event {

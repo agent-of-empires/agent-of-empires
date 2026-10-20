@@ -757,6 +757,7 @@ mod tests {
                 4,
                 Event::AgentMessageChunk {
                     text: "hello".into(),
+                    message_id: None,
                 },
             ),
         ];

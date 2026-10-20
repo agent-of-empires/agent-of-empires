@@ -802,7 +802,10 @@ mod tests {
 
     #[test]
     fn interrupted_agent_turn_needs_agent_work_and_no_prompt() {
-        let chunk = || Event::AgentMessageChunk { text: "x".into() };
+        let chunk = || Event::AgentMessageChunk {
+            text: "x".into(),
+            message_id: None,
+        };
         let diff_comments = || Event::UserDiffCommentsPrompt {
             intro: String::new(),
             outro: String::new(),
