@@ -152,14 +152,13 @@ describe("SettingsView theme tab save routing", () => {
     expect(updateTheme).not.toHaveBeenCalled();
   });
 
-  it("keeps a theme pick whose response was lost on screen and resends it, never reporting a rejection", async () => {
-    updateTheme.mockImplementationOnce(() => Promise.resolve("uncertain"));
+  it("keeps a theme pick that stays unconfirmed on screen after its resends, without repainting or reporting a rejection", async () => {
+    for (let i = 0; i < 3; i++) updateTheme.mockImplementationOnce(() => Promise.resolve("uncertain"));
     renderThemeTab();
     await waitFor(() => selectWithOption("dracula"));
     fireEvent.change(selectWithOption("dracula"), { target: { value: "dracula" } });
 
-    // The store resends the unconfirmed intent after a refresh that does not show it.
-    await waitFor(() => expect(updateTheme).toHaveBeenCalledTimes(2));
+    await waitFor(() => expect(updateTheme).toHaveBeenCalledTimes(3));
     expect(updateTheme).toHaveBeenLastCalledWith({ name: "dracula" });
     expect(screen.queryByText("Failed to save, please try again")).toBeNull();
     expect(dispatchThemePickerChanged).not.toHaveBeenCalled();
@@ -185,5 +184,18 @@ describe("SettingsView theme tab save routing", () => {
 
     await screen.findByText("Failed to save, please try again");
     expect(dispatchThemePickerChanged).not.toHaveBeenCalled();
+  });
+
+  it("repaints once, from the retry, when an old first fetch leaves an uncertain pick unconfirmed", async () => {
+    renderThemeTab();
+    await waitFor(() => selectWithOption("dracula"));
+    updateTheme.mockImplementationOnce(() => Promise.resolve("uncertain"));
+    // The retry commits after the first confirmation GET already showed the old theme.
+    updateTheme.mockImplementationOnce(() => Promise.resolve("committed"));
+    fireEvent.change(selectWithOption("dracula"), { target: { value: "dracula" } });
+
+    await waitFor(() => expect(dispatchThemePickerChanged).toHaveBeenCalledWith("dracula"));
+    expect(updateTheme).toHaveBeenCalledTimes(2);
+    expect(dispatchThemePickerChanged).toHaveBeenCalledTimes(1);
   });
 });

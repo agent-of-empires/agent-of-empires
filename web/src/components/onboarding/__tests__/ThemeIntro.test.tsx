@@ -72,6 +72,24 @@ describe("ThemeIntro", () => {
     expect(dispatchSpy).toHaveBeenCalledTimes(1);
   });
 
+  it("resends an uncertain save past an old fetch, and reports failure only once retries stay unconfirmed", async () => {
+    await mount();
+    updateTheme.mockImplementation(() => Promise.resolve("uncertain"));
+    updateTheme
+      .mockImplementationOnce(() => Promise.resolve("uncertain"))
+      .mockImplementationOnce(() => Promise.resolve("committed"));
+    fetchSettings.mockResolvedValueOnce({ theme: { name: "default" } });
+    fireEvent.click(option("modus-vivendi"));
+    await waitFor(() => expect(dispatchSpy).toHaveBeenCalledWith("modus-vivendi"));
+    expect(updateTheme).toHaveBeenCalledTimes(2);
+
+    updateTheme.mockClear();
+    fireEvent.click(option("empire"));
+    await waitFor(() => expect(screen.getByRole("alert")).toBeTruthy());
+    expect(updateTheme).toHaveBeenCalledTimes(3);
+    expect(dispatchSpy).toHaveBeenCalledTimes(1);
+  });
+
   it("Continue hands off to the tour; Escape skips it", async () => {
     const cases: Array<[string, () => void, "onDone" | "onSkipTour"]> = [
       ["Continue", () => fireEvent.click(screen.getByRole("button", { name: "Continue" })), "onDone"],

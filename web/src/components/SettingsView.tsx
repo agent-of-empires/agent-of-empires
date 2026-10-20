@@ -1,5 +1,5 @@
 /* eslint-disable react-refresh/only-export-components */
-import { useCallback, useEffect, useMemo, useState, type ReactNode } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { useServerDown, OFFLINE_TITLE } from "../lib/connectionState";
 import { ConnectedDevices } from "./ConnectedDevices";
 import { PasskeySettings } from "./PasskeySettings";
@@ -19,6 +19,7 @@ import {
   type SettingsResponse,
 } from "../lib/api";
 import { confirmThemeWrite } from "../lib/confirmThemeWrite";
+import { dispatchThemePickerChanged } from "../hooks/useResolvedTheme";
 import { loadSettings, saveField, useProfileSettings } from "../lib/settingsStore";
 import type { ProfileInfo, SettingsFieldDescriptor } from "../lib/types";
 import { SchemaSection } from "./settings/SchemaSection";
@@ -306,6 +307,7 @@ export function SettingsView({
   // renderer builds sandbox/worktree from this; empty until the one-shot fetch
   // resolves, at which point those tabs populate.
   const [schema, setSchema] = useState<SettingsFieldDescriptor[]>([]);
+  const latestThemePick = useRef(0);
   const [schemaLoading, setSchemaLoading] = useState(true);
   const [schemaError, setSchemaError] = useState<string | null>(null);
   // Search indexes the curated schema in CityHall mode, so it cannot offer a
@@ -415,12 +417,26 @@ export function SettingsView({
       const overridable = schema.some((d) => d.section === section && d.field === field && d.profile_overridable);
       if (overridable) return sendSave(section, field, value);
       // The picker repaints on true, so an unconfirmed write counts only once a fetch shows it.
+      // The store resends one that stays unconfirmed; a resend that commits repaints from here.
+      const pick = field === "name" ? ++latestThemePick.current : latestThemePick.current;
       let outcome: SaveOutcome | undefined;
-      const send = async () => (outcome = await updateTheme({ [field]: value }));
-      return saveField(selectedProfile, section, field, value, send).then(
-        async (ok) =>
-          ok && (outcome === "committed" || (outcome === "uncertain" && (await confirmThemeWrite(field, value)))),
-      );
+      let sends = 0;
+      let repainted = false;
+      const send = async () => {
+        const resend = sends++ > 0;
+        outcome = await updateTheme({ [field]: value });
+        if (resend && outcome === "committed" && field === "name" && !repainted && pick === latestThemePick.current) {
+          repainted = true;
+          dispatchThemePickerChanged(typeof value === "string" && value ? value : undefined);
+        }
+        return outcome;
+      };
+      return saveField(selectedProfile, section, field, value, send).then(async (ok) => {
+        const saved =
+          ok && (outcome === "committed" || (outcome === "uncertain" && (await confirmThemeWrite(field, value))));
+        if (saved) repainted = true;
+        return saved;
+      });
     },
     [schema, selectedProfile, sendSave],
   );
