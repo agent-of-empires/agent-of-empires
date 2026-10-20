@@ -107,8 +107,8 @@ export function useProfileSettings(profile: string): SettingsView {
 /**
  * Plugin values are global, so an edit made under one profile is written into the other cached
  * profiles too; bumping `gen` makes a GET already in flight for them retry instead of landing
- * a snapshot that predates the edit. `settle` does the same once the save has an outcome, for
- * a GET that started in between; `undo` reverts a mirror the target has not edited since.
+ * a snapshot that predates the edit. `settle` does the same for every other profile once the
+ * save has an outcome, including one whose first GET is still out; `undo` reverts a mirror the target has not edited since.
  */
 function mirrorPluginField(origin: Entry, section: string, field: string, value: unknown) {
   const key = `${section}\0${field}`;
@@ -124,7 +124,8 @@ function mirrorPluginField(origin: Entry, section: string, field: string, value:
   }
   return {
     settle: () => {
-      for (const other of mirrored.keys()) other.gen++;
+      if (!section.startsWith(PLUGIN_PREFIX)) return;
+      for (const other of entries.values()) if (other !== origin) other.gen++;
     },
     undo: () => {
       for (const [other, { prior, fieldGen }] of mirrored) {

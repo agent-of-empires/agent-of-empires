@@ -344,6 +344,26 @@ describe("settings store", () => {
     await waitFor(() => expect(pluginList(b)).toEqual(["b", "c"]));
   });
 
+  it("drops the first GET of a profile with no snapshot yet once a global edit settles", async () => {
+    vi.mocked(fetchSettings).mockResolvedValueOnce(pluginSettings(["a", "b", "c"]));
+    loadSettings("A");
+    const a = renderHook(() => useProfileSettings("A"));
+    await waitFor(() => expect(pluginList(a)).toEqual(["a", "b", "c"]));
+
+    // B has no snapshot to mirror into, and its first GET reads the value from before the commit.
+    const stale = deferred<Record<string, unknown>>();
+    vi.mocked(fetchSettings)
+      .mockReturnValueOnce(stale.promise)
+      .mockResolvedValue(pluginSettings(["b", "c"]));
+    loadSettings("B");
+    const b = renderHook(() => useProfileSettings("B"));
+    await act(async () => {
+      await saveField("A", "plugin:x", "list", ["b", "c"], async () => "committed");
+    });
+    await act(async () => stale.resolve(pluginSettings(["a", "b", "c"])));
+    await waitFor(() => expect(pluginList(b)).toEqual(["b", "c"]));
+  });
+
   it("keeps another profile's own save of the same value when the mirrored edit is rejected", async () => {
     vi.mocked(fetchSettings).mockResolvedValueOnce(pluginSettings(["a", "b"]));
     loadSettings("B");
