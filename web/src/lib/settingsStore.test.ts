@@ -344,6 +344,49 @@ describe("settings store", () => {
     await waitFor(() => expect(pluginList(b)).toEqual(["b", "c"]));
   });
 
+  it("drops a GET already in flight for a profile when another profile's global edit is mirrored", async () => {
+    vi.mocked(fetchSettings).mockResolvedValueOnce(pluginSettings(["a", "b", "c"]));
+    loadSettings("B");
+    const b = renderHook(() => useProfileSettings("B"));
+    await waitFor(() => expect(pluginList(b)).toEqual(["a", "b", "c"]));
+    vi.mocked(fetchSettings).mockResolvedValueOnce(pluginSettings(["a", "b", "c"]));
+    loadSettings("A");
+    const a = renderHook(() => useProfileSettings("A"));
+    await waitFor(() => expect(pluginList(a)).toEqual(["a", "b", "c"]));
+
+    // B's GET is out, and B itself never saves, before A's edit is mirrored into it.
+    const stale = deferred<Record<string, unknown>>();
+    vi.mocked(fetchSettings)
+      .mockReturnValueOnce(stale.promise)
+      .mockResolvedValue(pluginSettings(["b", "c"]));
+    loadSettings("B");
+    const held = deferred<SaveOutcome>();
+    void saveField("A", "plugin:x", "list", ["b", "c"], () => held.promise);
+    const before = vi.mocked(fetchSettings).mock.calls.length;
+    await act(async () => stale.resolve(pluginSettings(["a", "b", "c"])));
+
+    await waitFor(() => expect(pluginList(b)).toEqual(["b", "c"]));
+    expect(vi.mocked(fetchSettings).mock.calls.length).toBeGreaterThan(before);
+  });
+
+  it("refetches the other profiles once an uncertain global edit settles", async () => {
+    vi.mocked(fetchSettings).mockResolvedValueOnce(pluginSettings(["a", "b"]));
+    loadSettings("B");
+    const b = renderHook(() => useProfileSettings("B"));
+    await waitFor(() => expect(pluginList(b)).toEqual(["a", "b"]));
+    vi.mocked(fetchSettings).mockResolvedValueOnce(pluginSettings(["a", "b"]));
+    loadSettings("A");
+    const a = renderHook(() => useProfileSettings("A"));
+    await waitFor(() => expect(pluginList(a)).toEqual(["a", "b"]));
+
+    // The server never persisted the edit, so B must not keep building on the mirrored value.
+    vi.mocked(fetchSettings).mockResolvedValue(pluginSettings(["a", "b"]));
+    await act(async () => {
+      await saveField("A", "plugin:x", "list", ["b"], async () => "uncertain");
+    });
+    await waitFor(() => expect(pluginList(b)).toEqual(["a", "b"]));
+  });
+
   it("drops the first GET of a profile with no snapshot yet once a global edit settles", async () => {
     vi.mocked(fetchSettings).mockResolvedValueOnce(pluginSettings(["a", "b", "c"]));
     loadSettings("A");

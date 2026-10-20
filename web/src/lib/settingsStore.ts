@@ -106,26 +106,33 @@ export function useProfileSettings(profile: string): SettingsView {
 
 /**
  * Plugin values are global, so an edit made under one profile is written into the other cached
- * profiles too; bumping `gen` makes a GET already in flight for them retry instead of landing
- * a snapshot that predates the edit. `settle` does the same for every other profile once the
- * save has an outcome, including one whose first GET is still out; `undo` reverts a mirror the target has not edited since.
+ * profiles too. Bumping their `gen` makes a GET already in flight, even a first one with no
+ * snapshot to mirror into, retry instead of landing a value that predates the edit. `settle`
+ * refetches them once the save has an outcome, so none keeps an edit the server may not have
+ * kept; `undo` reverts a mirror the target has not edited since.
  */
 function mirrorPluginField(origin: Entry, section: string, field: string, value: unknown) {
   const key = `${section}\0${field}`;
+  const global = section.startsWith(PLUGIN_PREFIX);
   const mirrored = new Map<Entry, { prior: unknown; fieldGen?: number }>();
-  if (section.startsWith(PLUGIN_PREFIX)) {
+  if (global) {
     for (const other of entries.values()) {
-      const current = other.view.settings;
-      if (other === origin || !current) continue;
-      mirrored.set(other, { prior: readField(current, section, field), fieldGen: other.fieldGen.get(key) });
+      if (other === origin) continue;
       other.gen++;
+      const current = other.view.settings;
+      if (!current) continue;
+      mirrored.set(other, { prior: readField(current, section, field), fieldGen: other.fieldGen.get(key) });
       publish(other, { settings: writeField(current, section, field, value) });
     }
   }
   return {
     settle: () => {
-      if (!section.startsWith(PLUGIN_PREFIX)) return;
-      for (const other of entries.values()) if (other !== origin) other.gen++;
+      if (!global) return;
+      for (const [profile, other] of entries) {
+        if (other === origin) continue;
+        other.gen++;
+        if (other.loadSeq > 0 && other.pending === 0) void loadSettings(profile);
+      }
     },
     undo: () => {
       for (const [other, { prior, fieldGen }] of mirrored) {
