@@ -608,7 +608,7 @@ Set the resume target for a session; an agent whose exact native resume AoE cann
 
 ###### **Options:**
 
-* `--store <STORE>` — Assert the native store: a Claude store directory, or a Pi/OMP transcript file
+* `--store <STORE>` — Assert the native store: the Claude config root (the directory containing `projects/`), or a Pi/OMP transcript file
 
 
 

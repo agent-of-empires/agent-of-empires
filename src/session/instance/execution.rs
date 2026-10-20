@@ -199,6 +199,37 @@ pub(crate) fn attest_observed_default_store(
 /// resume nor a `/tmp` wipe, so without this a session can stay `Preallocated`
 /// for good and be refused as a fork parent despite holding a complete
 /// transcript. Existence uses the same probe as the `--resume` arm.
+fn ensure_claude_store_root(
+    store: &std::path::Path,
+    cwd: &std::path::Path,
+    sid: &str,
+) -> Result<()> {
+    if !crate::session::capture::claude_host_transcript_confirmed_absent(
+        &cwd.to_string_lossy(),
+        sid,
+        &[],
+        Some(store),
+    ) {
+        return Ok(());
+    }
+    let is_projects = |p: &std::path::Path| p.file_name().is_some_and(|n| n == "projects");
+    let root = [Some(store), store.parent()]
+        .into_iter()
+        .flatten()
+        .find(|p| is_projects(p))
+        .and_then(|p| p.parent());
+    match root {
+        Some(root) => anyhow::bail!(
+            "--store must be the Claude config root (the directory containing projects/), not a projects subdirectory; use {}",
+            root.display()
+        ),
+        None => anyhow::bail!(
+            "no transcript for this conversation under {}/projects; --store must be the Claude config root (the directory containing projects/)",
+            store.display()
+        ),
+    }
+}
+
 pub(super) fn transcript_confirms_reserved_claude_conversation(
     binding: &ConversationBinding,
 ) -> bool {
@@ -2925,6 +2956,7 @@ impl Instance {
                 store.is_absolute(),
                 "--store must be an absolute native store path"
             );
+            ensure_claude_store_root(store, &execution.cwd, sid)?;
             *primary = crate::session::capture::canonicalize_or_raw(
                 store.to_str().context("store path must be UTF-8")?,
             );
@@ -2984,6 +3016,35 @@ impl Instance {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn claude_store_must_be_the_config_root_holding_the_transcript() {
+        let root = tempfile::tempdir().unwrap();
+        let cwd = tempfile::tempdir().unwrap();
+        let sid = "11111111-2222-3333-4444-555555555555";
+        let encoded = crate::session::capture::encode_claude_project_path(
+            &crate::session::capture::canonicalize_or_raw(&cwd.path().to_string_lossy())
+                .to_string_lossy(),
+        );
+        let projects = root.path().join("projects");
+        let project_dir = projects.join(&encoded);
+        let check = |store: &std::path::Path| ensure_claude_store_root(store, cwd.path(), sid);
+
+        let missing = check(root.path()).unwrap_err().to_string();
+        assert!(missing.contains("no transcript"), "{missing}");
+
+        std::fs::create_dir_all(&project_dir).unwrap();
+        std::fs::write(project_dir.join(format!("{sid}.jsonl")), "{}\n").unwrap();
+        check(root.path()).unwrap();
+
+        for wrong in [&projects, &project_dir] {
+            let err = check(wrong).unwrap_err().to_string();
+            assert!(
+                err.contains(&format!("use {}", root.path().display())),
+                "{err}"
+            );
+        }
+    }
 
     #[cfg(unix)]
     #[test]

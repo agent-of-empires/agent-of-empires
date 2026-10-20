@@ -2478,6 +2478,13 @@ mod tests {
         };
 
         let literal = temp.path().join(".claude");
+        let transcripts =
+            work.join("projects")
+                .join(crate::session::capture::encode_claude_project_path(
+                    &crate::session::capture::canonicalize_or_raw("/tmp").to_string_lossy(),
+                ));
+        std::fs::create_dir_all(&transcripts).unwrap();
+        std::fs::write(transcripts.join(format!("{sid}.jsonl")), "{}\n").unwrap();
         for (profile, store, expected) in [
             ("undeclared", None, None),
             ("literal", None, None),
