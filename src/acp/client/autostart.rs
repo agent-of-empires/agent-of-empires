@@ -61,6 +61,8 @@ pub(crate) async fn start_local() -> Result<(DaemonEndpoint, Option<u32>), Strin
             return Ok((endpoint, daemon_pid().filter(|_| spawned)));
         }
         if Instant::now() >= deadline {
+            // The detached child binds after the wrapper exits 0, so a port clash lands here.
+            forget_port_if_in_use();
             return Err(format!(
                 "the daemon was started but never became reachable.{}",
                 log_hint()
@@ -87,17 +89,21 @@ fn lock_autostart() -> Result<std::fs::File, String> {
 }
 
 fn spawn_failure(code: Option<i32>, port: u16) -> String {
-    let tail = initial_log_tail().join("\n");
-    if tail.contains("EADDRINUSE") || tail.contains("Address already in use") {
-        // Forget an occupied port so the next attempt picks a fresh one.
-        if let Ok(dir) = crate::session::get_app_dir() {
-            let _ = std::fs::remove_file(dir.join("serve.last_port"));
-        }
-    }
+    forget_port_if_in_use();
     format!(
         "`aoe serve --daemon` exited with {code:?}. Most likely port {port} is in use.{}",
         log_hint()
     )
+}
+
+/// Forget an occupied port so the next attempt picks a fresh one.
+fn forget_port_if_in_use() {
+    let tail = initial_log_tail().join("\n");
+    if tail.contains("EADDRINUSE") || tail.contains("Address already in use") {
+        if let Ok(dir) = crate::session::get_app_dir() {
+            let _ = std::fs::remove_file(dir.join("serve.last_port"));
+        }
+    }
 }
 
 fn log_hint() -> String {
