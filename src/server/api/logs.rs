@@ -13,7 +13,7 @@ use axum::Json;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 
-use crate::logging::{self, ProcessContext, SubscriberTarget};
+use crate::logging;
 
 use super::{api_error, cityhall_block, read_only_response, AppState};
 
@@ -90,11 +90,8 @@ pub async fn get_logs(
 }
 
 fn snapshot(lines: usize) -> std::io::Result<LogsResponse> {
-    let app_dir = crate::session::get_app_dir().map_err(std::io::Error::other)?;
-    let cfg = crate::session::Config::load_or_warn().logging;
-    let path = match logging::resolve_sink(&cfg, &app_dir, ProcessContext::ServeForeground).target {
-        SubscriberTarget::File(path, _) => path,
-        SubscriberTarget::Stdout => return Ok(LogsResponse::empty(LogsStatus::Stdout)),
+    let Some(path) = logging::active_log_path() else {
+        return Ok(LogsResponse::empty(LogsStatus::Stdout));
     };
     let (tail, line_count, truncated) = match read_tail(&path, lines) {
         Ok(tail) => tail,

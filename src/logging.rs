@@ -2,7 +2,7 @@
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use fs2::FileExt;
 use tracing_subscriber::filter::EnvFilter;
@@ -752,6 +752,17 @@ fn file_inode(_meta: &std::fs::Metadata) -> u64 {
 }
 
 static CONTROLLER: Mutex<Option<Arc<FilterController>>> = Mutex::new(None);
+
+static ACTIVE_LOG_PATH: OnceLock<PathBuf> = OnceLock::new();
+
+/// Records the file this process logs to. Never called for a stdout sink.
+pub fn set_active_log_path(path: PathBuf) {
+    let _ = ACTIVE_LOG_PATH.set(path);
+}
+
+pub fn active_log_path() -> Option<PathBuf> {
+    ACTIVE_LOG_PATH.get().cloned()
+}
 
 pub fn install_controller(c: Arc<FilterController>) {
     *CONTROLLER.lock().unwrap() = Some(c);
