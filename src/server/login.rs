@@ -1174,8 +1174,12 @@ pub async fn login_status_handler(
 
 /// Extract the `aoe_session` cookie value from a request.
 pub fn extract_login_session(request: &axum::extract::Request) -> Option<String> {
-    let cookie_header = request.headers().get(header::COOKIE)?;
-    let cookie_str = cookie_header.to_str().ok()?;
+    session_id_from_headers(request.headers())
+}
+
+/// The `aoe_session` cookie value in `headers`.
+pub(super) fn session_id_from_headers(headers: &axum::http::HeaderMap) -> Option<String> {
+    let cookie_str = headers.get(header::COOKIE)?.to_str().ok()?;
     for cookie in cookie_str.split(';') {
         let cookie = cookie.trim();
         if let Some(value) = cookie.strip_prefix("aoe_session=") {

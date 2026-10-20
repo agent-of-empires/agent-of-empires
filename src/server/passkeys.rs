@@ -24,7 +24,7 @@ use webauthn_rs::prelude::{
 
 use super::access::norm_host;
 use super::auth::{resolve_client_ip, AuthenticatedSession};
-use super::login::{decode_binding_secret, issue_session};
+use super::login::{decode_binding_secret, issue_session, session_id_from_headers};
 use super::secure_store::{check_path_security, write_private};
 use super::AppState;
 use crate::util::now_ms;
@@ -640,8 +640,26 @@ pub struct RegisterStartRequest {
     label: String,
 }
 
-fn session_id(session: Option<Extension<AuthenticatedSession>>) -> Option<String> {
-    session.map(|Extension(AuthenticatedSession(id))| id)
+/// The session enrolling a passkey. The auth middleware sets it, except on the loopback
+/// bypass, where the cookie and device binding are validated here instead.
+async fn enrolling_session(
+    state: &AppState,
+    session: Option<Extension<AuthenticatedSession>>,
+    headers: &HeaderMap,
+) -> Option<String> {
+    if let Some(Extension(AuthenticatedSession(id))) = session {
+        return Some(id);
+    }
+    let id = session_id_from_headers(headers)?;
+    let binding = decode_binding_secret(header_str(
+        headers,
+        axum::http::HeaderName::from_static("x-aoe-device-binding"),
+    )?)?;
+    state
+        .login_manager
+        .validate_session(&id, &binding)
+        .await
+        .then_some(id)
 }
 
 /// POST /api/passkeys/register/start (elevation-gated in the auth middleware)
@@ -654,7 +672,7 @@ pub async fn register_start_handler(
     if !state.login_manager.is_enabled() {
         return login_disabled();
     }
-    let Some(session_id) = session_id(session) else {
+    let Some(session_id) = enrolling_session(&state, session, &headers).await else {
         return json_error(StatusCode::UNAUTHORIZED, "login_required", "Sign in first");
     };
     let Some(profile) = Profile::from_headers(&headers, &state.allowed_origins) else {
@@ -689,7 +707,7 @@ pub async fn register_finish_handler(
     if !state.login_manager.is_enabled() {
         return login_disabled();
     }
-    let Some(session_id) = session_id(session) else {
+    let Some(session_id) = enrolling_session(&state, session, &headers).await else {
         return json_error(StatusCode::UNAUTHORIZED, "login_required", "Sign in first");
     };
     let Ok(Json(req)) = body else {
@@ -1115,6 +1133,69 @@ mod tests {
         headers.append("origin", ORIGIN.parse().unwrap());
         let res = login_start_handler(State(with_origin), addr, headers).await;
         assert_eq!(res.status(), StatusCode::FORBIDDEN);
+    }
+
+    /// On a direct loopback bind the auth wall is bypassed and sets no session extension,
+    /// so enrolment must validate the cookie and binding itself.
+    #[tokio::test]
+    async fn loopback_enrolment_validates_the_bound_session_through_the_router() {
+        use tower::ServiceExt;
+
+        let mut state = crate::server::test_support::build_test_app_state_with_policy(
+            Vec::new(),
+            vec!["localhost".to_string()],
+            vec!["http://localhost".to_string()],
+            None,
+        );
+        Arc::get_mut(&mut state).unwrap().login_manager =
+            Arc::new(crate::server::login::LoginManager::new(Some("pw")));
+        let binding = [9u8; 32];
+        let session = state
+            .login_manager
+            .create_session(&binding, "127.0.0.1", "t")
+            .await;
+        let binding = URL_SAFE_NO_PAD.encode(binding);
+        let app = crate::server::test_support::build_router_for_test(state);
+
+        let send = |cookie: Option<&str>, bound: bool| {
+            let mut req = axum::http::Request::builder()
+                .method("POST")
+                .uri("/api/passkeys/register/start")
+                .header("host", "localhost")
+                .header("origin", "http://localhost")
+                .header("content-type", "application/json");
+            if let Some(cookie) = cookie {
+                req = req.header("cookie", cookie);
+            }
+            if bound {
+                req = req.header("x-aoe-device-binding", &binding);
+            }
+            let mut req = req
+                .body(axum::body::Body::from(r#"{"label":"Laptop"}"#))
+                .unwrap();
+            req.extensions_mut()
+                .insert(ConnectInfo(std::net::SocketAddr::from((
+                    [127, 0, 0, 1],
+                    5555,
+                ))));
+            app.clone().oneshot(req)
+        };
+        let cookie = format!("aoe_session={session}");
+
+        let ok = send(Some(&cookie), true).await.unwrap();
+        assert_eq!(ok.status(), StatusCode::OK);
+        for (cookie, bound) in [
+            (Some(cookie.as_str()), false),
+            (None, true),
+            (Some("aoe_session=forged"), true),
+        ] {
+            let res = send(cookie, bound).await.unwrap();
+            assert_eq!(
+                res.status(),
+                StatusCode::UNAUTHORIZED,
+                "{cookie:?} bound={bound}"
+            );
+        }
     }
 
     #[test]
