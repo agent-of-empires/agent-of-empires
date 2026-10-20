@@ -426,6 +426,31 @@ describe("settings store", () => {
     expect(pluginList(b)).toEqual(["b"]);
   });
 
+  it("does not resend another profile's older unconfirmed edit over a newer global one", async () => {
+    const b = await seedPluginProfile("B", ["a", "b", "c"]);
+    await seedPluginProfile("A", ["a", "b", "c"]);
+    const reconcile = deferred<Record<string, unknown>>();
+    // Only B's first fetch is held; A refetches too once B's edit settles.
+    let heldB = false;
+    vi.mocked(fetchSettings).mockImplementation((profile?: string) => {
+      if (profile !== "B" || heldB) return Promise.resolve(pluginSettings(["c"]));
+      heldB = true;
+      return reconcile.promise;
+    });
+    const sendB = vi.fn(async (): Promise<SaveOutcome> => "uncertain");
+    await act(async () => {
+      await saveField("B", "plugin:x", "list", ["a", "b"], sendB);
+    });
+
+    // A's newer edit commits while B's reconcile GET is still out.
+    await act(async () => {
+      await saveField("A", "plugin:x", "list", ["c"], async () => "committed");
+    });
+    await act(async () => reconcile.resolve(pluginSettings(["a", "b", "c"])));
+    await waitFor(() => expect(pluginList(b)).toEqual(["c"]));
+    expect(sendB).toHaveBeenCalledTimes(1);
+  });
+
   it("drops a GET already in flight for a profile when another profile's global edit is mirrored", async () => {
     vi.mocked(fetchSettings).mockResolvedValueOnce(pluginSettings(["a", "b", "c"]));
     loadSettings("B");

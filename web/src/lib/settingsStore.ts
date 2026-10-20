@@ -132,6 +132,9 @@ function mirrorPluginField(origin: Entry, section: string, field: string, value:
     for (const other of entries.values()) {
       if (other === origin) continue;
       other.gen++;
+      // A newer global edit supersedes this profile's older intent for the field, even one still in flight.
+      other.unconfirmed.delete(key);
+      other.fieldGen.set(key, (other.fieldGen.get(key) ?? 0) + 1);
       other.mirrors.set(key, { section, field, value, token });
       if (other.view.settings) publish(other, { settings: writeField(other.view.settings, section, field, value) });
     }
