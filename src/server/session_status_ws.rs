@@ -13,6 +13,8 @@ use serde_json::json;
 use tokio::sync::broadcast::{self, error::RecvError};
 use tokio::time::Instant;
 
+use crate::session::Status;
+
 use super::push::{NotificationEvent, StatusChange};
 use super::AppState;
 
@@ -37,16 +39,31 @@ pub async fn session_status_ws(
 struct Dwells(HashMap<String, (Instant, NotificationEvent)>);
 
 impl Dwells {
-    fn on_change(&mut self, change: &StatusChange, now: Instant) {
-        match NotificationEvent::for_status(change.new) {
+    fn track(&mut self, id: &str, status: Status, now: Instant) {
+        match NotificationEvent::for_status(status) {
             Some(event) => {
                 let due = now + Duration::from_millis(event.dwell_ms());
-                self.0.insert(change.instance_id.clone(), (due, event));
+                self.0.insert(id.to_string(), (due, event));
             }
             None => {
-                self.0.remove(&change.instance_id);
+                self.0.remove(id);
             }
         }
+    }
+
+    fn on_change(&mut self, change: &StatusChange, now: Instant) {
+        self.track(&change.instance_id, change.new, now);
+    }
+
+    /// A dwell for every session already in a cueing status, so a new connection still cues a
+    /// status that started before it; the client drops a cue it already sounded.
+    async fn seeded(state: &AppState) -> Self {
+        let now = Instant::now();
+        let mut dwells = Self::default();
+        for inst in state.instances.read().await.iter() {
+            dwells.track(&inst.id, inst.status, now);
+        }
+        dwells
     }
 
     fn next_due(&self) -> Option<Instant> {
@@ -85,6 +102,7 @@ async fn send(socket: &mut WebSocket, message: Message) -> bool {
 /// The next frames to send, or `None` once the status channel closes. Queued moves win over an
 /// expired dwell, so a cue can never beat the move that cancels it.
 async fn next_frames(
+    state: &AppState,
     rx: &mut broadcast::Receiver<StatusChange>,
     dwells: &mut Dwells,
 ) -> Option<Vec<String>> {
@@ -101,7 +119,7 @@ async fn next_frames(
             }
             Err(RecvError::Lagged(skipped)) => {
                 tracing::warn!(target: "http.middleware", skipped, "session status ws lagged");
-                *dwells = Dwells::default();
+                *dwells = Dwells::seeded(state).await;
                 Some(vec![json!({ "kind": "resync" }).to_string()])
             }
             Err(RecvError::Closed) => None,
@@ -128,7 +146,7 @@ async fn serve(mut socket: WebSocket, state: Arc<AppState>) {
         return;
     }
 
-    let mut dwells = Dwells::default();
+    let mut dwells = Dwells::seeded(&state).await;
     let mut ping = tokio::time::interval(PING_INTERVAL);
     ping.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     ping.tick().await;
@@ -155,7 +173,7 @@ async fn serve(mut socket: WebSocket, state: Arc<AppState>) {
                 }
                 continue;
             }
-            frames = next_frames(&mut rx, &mut dwells) => match frames {
+            frames = next_frames(&state, &mut rx, &mut dwells) => match frames {
                 Some(frames) => frames,
                 None => break,
             },
@@ -171,7 +189,6 @@ async fn serve(mut socket: WebSocket, state: Arc<AppState>) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::session::Status;
     use chrono::Utc;
 
     fn change(id: &str, new: Status) -> StatusChange {
@@ -208,18 +225,44 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn a_queued_move_cancels_the_dwell_before_its_expired_cue() {
-        let (tx, mut rx) = broadcast::channel(8);
+        let state = crate::server::test_support::build_test_app_state(Vec::new());
+        let tx = state.status_tx.clone();
+        let mut rx = tx.subscribe();
         let mut dwells = Dwells::default();
         dwells.on_change(&change("a", Status::Waiting), Instant::now());
         let running = change("a", Status::Running);
         tx.send(running.clone()).unwrap();
         tokio::time::advance(Duration::from_secs(6)).await;
 
-        let frames = next_frames(&mut rx, &mut dwells).await;
+        let frames = next_frames(&state, &mut rx, &mut dwells).await;
         assert_eq!(frames, Some(vec![status_frame(&running)]));
-        let later =
-            tokio::time::timeout(Duration::from_secs(30), next_frames(&mut rx, &mut dwells)).await;
+        let later = tokio::time::timeout(
+            Duration::from_secs(30),
+            next_frames(&state, &mut rx, &mut dwells),
+        )
+        .await;
         assert!(later.is_err(), "no cue for a session that moved on");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_new_connection_cues_a_status_that_started_before_it() {
+        let mut waiting = crate::session::Instance::new("w", "/tmp/aoe-ws-w");
+        waiting.status = Status::Waiting;
+        let mut running = crate::session::Instance::new("r", "/tmp/aoe-ws-r");
+        running.status = Status::Running;
+        let waiting_id = waiting.id.clone();
+        let state = crate::server::test_support::build_test_app_state(vec![waiting, running]);
+        let mut rx = state.status_tx.subscribe();
+        let mut dwells = Dwells::seeded(&state).await;
+
+        let frames = next_frames(&state, &mut rx, &mut dwells).await;
+        assert_eq!(
+            frames,
+            Some(vec![sound_due_frame(
+                &waiting_id,
+                NotificationEvent::Waiting
+            )])
+        );
     }
 
     #[test]

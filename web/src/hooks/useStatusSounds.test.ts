@@ -106,6 +106,20 @@ describe("useStatusSounds", () => {
     expect(played).toHaveLength(1);
   });
 
+  it("cues a reconnect mid-dwell once, and stays silent for a status that was there at load", async () => {
+    mount([at("old", "Waiting"), at("a", "Running")]);
+    await step([at("old", "Waiting"), at("a", "Waiting")]);
+    // A new socket's seeded cues: one for the observed transition, one for the baseline status.
+    act(() => {
+      view.result.current("a", "waiting");
+      view.result.current("old", "waiting");
+      view.result.current("a", "waiting");
+    });
+    await vi.waitFor(() => expect(played).toHaveLength(1));
+    await step([at("old", "Waiting"), at("a", "Waiting")]);
+    expect(played).toHaveLength(1);
+  });
+
   it("plays the idle sound once a session settles into Idle", async () => {
     mount([at("a", "Running")]);
     await step([at("a", "Idle")]);

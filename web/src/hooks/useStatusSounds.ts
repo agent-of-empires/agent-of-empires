@@ -24,7 +24,7 @@ export function useStatusSounds(sessions: readonly SessionResponse[]): (id: stri
     (id: string, event: StatusSoundEvent) => {
       const now = Date.now();
       const session = sessionsRef.current.find((x) => x.id === id);
-      const { state, play } = soundDueFor(stateRef.current, session, event, now);
+      const { state, play } = soundDueFor(stateRef.current, session, event);
       stateRef.current = state;
       if (play && !(event === "waiting" && approvalChimedRecently(id, now))) void playSoundFor(event);
     },

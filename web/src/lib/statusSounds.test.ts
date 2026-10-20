@@ -131,7 +131,14 @@ describe("soundDueFor", () => {
 
   it.each([
     ["sounds an unsounded status", at("a", "Waiting"), "waiting", tracked(false), true],
-    ["sounds a status the tracker has not seen", at("a", "Waiting"), "waiting", null, true],
+    ["is silent before the tracker has a baseline", at("a", "Waiting"), "waiting", null, false],
+    [
+      "is silent for a status that was already there when first seen",
+      at("a", "Waiting"),
+      "waiting",
+      tracked(true),
+      false,
+    ],
     ["is silent once already sounded", at("a", "Waiting"), "waiting", tracked(true), false],
     ["is silent when the status moved on", at("a", "Running"), "waiting", tracked(false), false],
     [
@@ -143,13 +150,13 @@ describe("soundDueFor", () => {
     ],
     ["is silent for an unknown session", undefined, "waiting", tracked(false), false],
   ] as const)("%s", (_label, session, event, prev, play) => {
-    const result = soundDueFor(prev, session, event, 100);
+    const result = soundDueFor(prev, session, event);
     expect(result.play).toBe(play);
     if (play) expect(result.state?.get("a")?.sounded).toBe(true);
   });
 
   it("keeps the later poll from sounding the same status again", () => {
-    const cue = soundDueFor(null, at("a", "Waiting"), "waiting", 1000);
+    const cue = soundDueFor(tracked(false), at("a", "Waiting"), "waiting");
     const next = nextStatusSoundState(cue.state, [at("a", "Waiting")], 20_000);
     expect(next.due).toEqual([]);
   });
