@@ -660,8 +660,8 @@ pub(crate) fn counting_failing_launcher() -> (
     (launcher, launches)
 }
 
-/// A launcher that hands back a fake worker for every launch, keeping the event
-/// senders alive so the drains never see a close.
+/// A launcher that hands back a fake worker that accepts commands, keeping the
+/// event senders alive so the drains never see a close.
 #[cfg(test)]
 pub(crate) fn succeeding_launcher() -> crate::acp::supervisor::Launcher {
     let senders: Arc<std::sync::Mutex<Vec<tokio::sync::mpsc::Sender<crate::acp::state::Event>>>> =
@@ -669,7 +669,8 @@ pub(crate) fn succeeding_launcher() -> crate::acp::supervisor::Launcher {
     Arc::new(move |_config, id| {
         let senders = Arc::clone(&senders);
         Box::pin(async move {
-            let (client, tx) = crate::acp::acp_client::AcpClient::fake_for_test(id);
+            let (client, tx, _cmds) =
+                crate::acp::acp_client::AcpClient::fake_for_test_cmd_recording(id);
             senders.lock().unwrap().push(tx);
             Ok(client)
         })

@@ -116,7 +116,7 @@ fn is_store_write_failure(error: &anyhow::Error) -> bool {
 }
 
 /// A durable write failed after the worker had taken the change. Stop the worker
-/// so its respawn reads the stored row; writing the old value back could
+/// and have it respawn from the stored row; writing the old value back could
 /// overwrite a newer edit.
 async fn persist_failure_response(
     state: &AppState,
@@ -137,6 +137,8 @@ async fn persist_failure_response(
         .is_ok()
         && state.acp_supervisor.worker_state(id).await == crate::daemon::AcpWorkerState::Absent;
     let outcome = if stopped {
+        // The reconciler skips a session it already attempted unless asked.
+        state.acp_supervisor.request_respawn(id);
         "the worker was stopped and the stored value is unchanged; retry"
     } else {
         "the worker may still be running the unsaved change"

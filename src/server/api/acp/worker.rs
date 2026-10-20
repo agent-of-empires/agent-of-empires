@@ -735,7 +735,12 @@ pub async fn switch_acp_provider(
     let exclusion =
         match persist_provider_switch(native.clone(), &instance, &provider, exclusion).await {
             Ok(exclusion) => exclusion,
-            Err(error) => return launch_error_response("persisting the provider switch", &error),
+            Err(error) => {
+                if is_store_write_failure(&error) {
+                    state.acp_supervisor.request_respawn(&id);
+                }
+                return launch_error_response("persisting the provider switch", &error);
+            }
         };
     drop(native);
 

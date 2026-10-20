@@ -235,6 +235,35 @@ mod tests {
     use crate::acp::state::{ConfigOptionChoice, ConfigOptionDescriptor};
     use crate::session::test_support::isolate_app_dir;
 
+    /// The reconciler's per-process state across ticks.
+    #[derive(Default)]
+    struct ReconcilerTick {
+        attempted: std::collections::HashSet<String>,
+        respawn_history: std::collections::HashMap<String, Vec<std::time::Instant>>,
+        parked: std::collections::HashSet<String>,
+        capacity_deferred: std::collections::HashSet<String>,
+    }
+
+    impl ReconcilerTick {
+        async fn run(&mut self, state: &Arc<AppState>) {
+            let now = Some(std::time::Instant::now());
+            let mut cadence = crate::server::acp_reconciler::ReapCadence {
+                idle: now,
+                rate_limit: now,
+                terminal_repair: now,
+            };
+            crate::server::acp_reconciler::reconcile_acp_workers(
+                state,
+                &mut self.attempted,
+                &mut cadence,
+                &mut self.respawn_history,
+                &mut self.parked,
+                &mut self.capacity_deferred,
+            )
+            .await;
+        }
+    }
+
     #[tokio::test]
     #[serial_test::serial]
     async fn persist_selector_updates_memory_and_storage() {
@@ -418,19 +447,23 @@ mod tests {
     }
 
     /// The write fails on a valid stored row (not an unopenable profile): the
-    /// 500 leaves both stores on the old pick, and the retry after recovery
-    /// lands in both.
+    /// 500 leaves both stores on the old pick and stops the worker, which the
+    /// reconciler then brings back, so the retry after recovery lands in both.
     #[tokio::test]
     #[serial_test::serial]
     async fn a_pick_write_failing_on_a_valid_row_recovers_on_retry() {
         use crate::server::test_support as support;
         let _tmp = isolate_app_dir();
-        let mut inst = crate::session::Instance::new("t", "/tmp");
-        inst.source_profile = "default".to_string();
+        let project = tempfile::tempdir().unwrap();
+        let mut inst = crate::session::Instance::new("t", project.path().to_str().unwrap());
+        inst.view = crate::session::View::Structured;
+        inst.status = crate::session::Status::Idle;
+        inst.agent_name = Some("claude".to_string());
         inst.agent_model = Some("old-model".to_string());
         let id = inst.id.clone();
         support::seed_instances_on_disk_for_test("default", vec![inst.clone()]);
-        let state = support::build_test_app_state(vec![inst]);
+        let state =
+            support::build_test_app_state_with_launcher(vec![inst], support::succeeding_launcher());
         let pick = || async {
             acp_set_config_option(
                 State(state.clone()),
@@ -443,13 +476,16 @@ mod tests {
             .await
             .into_response()
         };
+        let mut tick = ReconcilerTick::default();
+        let running = || async {
+            state.acp_supervisor.worker_state(&id).await == crate::daemon::AcpWorkerState::Running
+        };
 
-        state
-            .acp_supervisor
-            .test_insert_worker_cmd_recording(&id)
-            .await;
+        tick.run(&state).await;
+        assert!(running().await, "the reconciler starts the worker");
         let failure = support::fail_session_writes_for_test("default");
         assert_eq!(pick().await.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(!running().await);
         assert_eq!(
             state.instances.read().await[0].agent_model.as_deref(),
             Some("old-model")
@@ -462,10 +498,8 @@ mod tests {
         );
 
         drop(failure);
-        state
-            .acp_supervisor
-            .test_insert_worker_cmd_recording(&id)
-            .await;
+        tick.run(&state).await;
+        assert!(running().await, "the stopped worker is respawned");
         assert_eq!(pick().await.status(), StatusCode::ACCEPTED);
         assert_eq!(
             state.instances.read().await[0].agent_model.as_deref(),
