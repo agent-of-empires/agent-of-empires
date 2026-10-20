@@ -672,7 +672,17 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
                 &mut spec,
             )?;
         }
-        if !crate::cli::acp::command_present(&spec.command) {
+        // A sandboxed adapter runs inside the container, which bundles it.
+        let sandboxed =
+            (args.sandbox || args.sandbox_image.is_some() || config.sandbox.enabled_by_default)
+                && containers::get_container_runtime().is_available();
+        if !sandboxed
+            && !crate::session::builder::structured::adapter_reachable(
+                &spec.command,
+                std::path::Path::new(&instance.project_path),
+                &config,
+            )
+        {
             let hint = crate::acp::install_hints::install_hint_for(&spec.command)
                 .unwrap_or("install via your package manager and re-run");
             if user_picked_agent {

@@ -902,6 +902,45 @@ pub async fn create_session(
         }
     }
 
+    // A structured session whose adapter resolves nowhere could only fail to
+    // start, so refuse it before anything is provisioned (#4617). An import is
+    // always structured, and its listing below would launch the adapter.
+    let importing = body
+        .import_acp_session_id
+        .as_deref()
+        .is_some_and(|id| !id.trim().is_empty());
+    if body.view == crate::session::View::Structured || importing {
+        let profile = validation_profile.to_string();
+        let project_path = std::path::PathBuf::from(&body.path);
+        let (tool, agent_name) = (body.tool.clone(), body.agent_name.clone());
+        let (command_override, sandboxed) = (body.command_override.clone(), body.sandbox);
+        let missing = tokio::task::spawn_blocking(move || {
+            use crate::session::builder::structured::{
+                validate_structured_choice, StructuredChoice, StructuredChoiceError,
+            };
+            let config = crate::session::config::repo_config::resolve_config_with_repo_or_warn(
+                &profile,
+                &project_path,
+            );
+            let choice = StructuredChoice {
+                tool: &tool,
+                agent_name: agent_name.as_deref(),
+                command_override: &command_override,
+                sandboxed,
+                project_path: &project_path,
+            };
+            match validate_structured_choice(&choice, &config) {
+                Err(StructuredChoiceError::AdapterMissing(msg)) => Some(msg),
+                _ => None,
+            }
+        })
+        .await
+        .unwrap_or(None);
+        if let Some(msg) = missing {
+            return api_error(StatusCode::BAD_REQUEST, "acp_adapter_missing", msg);
+        }
+    }
+
     // A new session has exactly one conversation source.
     if create_body_has_conflicting_sources(&body) {
         return api_error(

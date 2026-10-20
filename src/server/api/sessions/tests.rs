@@ -9358,3 +9358,72 @@ async fn workspace_trash_consent_follows_siblings_and_protects_the_shared_owner(
     }
     Ok(())
 }
+
+/// #4617: a structured create whose adapter resolves nowhere is refused with a
+/// stable code before anything is provisioned; the cases the check exempts
+/// never get that code.
+#[tokio::test]
+#[serial_test::serial]
+async fn create_refuses_a_structured_session_without_its_adapter() {
+    let _home = crate::session::test_support::isolate_app_dir();
+    let adapter = format!("aoe-test-adapter-{}", std::process::id());
+    crate::session::config::update_config(|config| {
+        config
+            .session
+            .custom_agents
+            .insert("fake".into(), "true".into());
+        config
+            .session
+            .agent_acp_cmd
+            .insert("fake".into(), adapter.clone());
+    })
+    .unwrap();
+    let project = tempfile::tempdir().unwrap();
+    let path = project.path().display().to_string();
+    let state = crate::server::test_support::build_test_app_state(Vec::new());
+    // Holds the only worker slot, so an exempt create that gets through never launches an agent.
+    state.acp_supervisor.test_insert_worker("occupant").await;
+    let base = |extra: serde_json::Value| {
+        let mut body = serde_json::json!({ "title": "no-adapter", "path": path, "tool": "fake" });
+        body.as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        body
+    };
+    let refused = [
+        serde_json::json!({ "view": "structured" }),
+        serde_json::json!({ "view": "structured", "scratch": true, "path": "" }),
+        // An import is structured whatever `view` says.
+        serde_json::json!({ "import_acp_session_id": "native-1" }),
+        serde_json::json!({ "view": "structured", "fork_from": "parent-1" }),
+        serde_json::json!({ "view": "structured", "tool": "claude", "agent_name": "fake" }),
+    ];
+    for extra in refused {
+        let (status, body) = post_create(&state, base(extra.clone())).await;
+        assert_eq!(
+            status,
+            axum::http::StatusCode::BAD_REQUEST,
+            "{extra}: {body}"
+        );
+        assert_eq!(body["error"], "acp_adapter_missing", "{extra}: {body}");
+        let message = body["message"].as_str().unwrap();
+        assert!(
+            message.contains(&format!("ACP adapter `{adapter}` is not installed")),
+            "{extra}: {message}"
+        );
+        assert!(state.instances.read().await.is_empty(), "{extra}");
+        assert!(
+            crate::server::test_support::load_instances_from_disk_for_test("default").is_empty(),
+            "{extra}"
+        );
+    }
+    let exempt = [
+        serde_json::json!({ "view": "structured", "sandbox": true }),
+        serde_json::json!({ "view": "structured", "command_override": "true acp" }),
+        serde_json::json!({ "view": "terminal" }),
+    ];
+    for extra in exempt {
+        let (_, body) = post_create(&state, base(extra.clone())).await;
+        assert_ne!(body["error"], "acp_adapter_missing", "{extra}: {body}");
+    }
+}
