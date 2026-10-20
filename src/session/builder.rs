@@ -810,6 +810,7 @@ pub fn build_instance(
                     from: parent.session_id.clone(),
                 };
                 instance.resume_binding = Some(*parent);
+                crate::session::conversation_carry::carry_fork_parent(&mut instance)?;
             }
             crate::session::ForkSeed::Structured {
                 parent_acp_session_id,
@@ -2149,12 +2150,15 @@ mod tests {
         let _registry = crate::tmux::status_rules::ProfileRegistryGuard::take("default");
         // The CLI e2e covers the separate application in `add.rs`; this is the
         // arm `build_instance` owns, which pins the child conversation and the
-        // parent the first launch must fork from.
+        // parent the first launch must fork from. The parent sits on the store
+        // the child launches on, so the fork has nothing to carry.
+        let store = dirs::home_dir().unwrap().join(".claude");
+        std::fs::create_dir_all(&store).unwrap();
         let parent = crate::session::ConversationBinding {
             session_id: "parent-conversation".into(),
             execution: Some(crate::session::ExecutionBinding {
                 agent: "claude".into(),
-                stores: vec![std::path::PathBuf::from("/tmp/store")],
+                stores: vec![store.canonicalize().unwrap()],
                 configuration: Vec::new(),
                 cwd: "/tmp".into(),
                 cwd_filesystem: "host".into(),
