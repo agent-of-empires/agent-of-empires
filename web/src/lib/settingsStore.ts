@@ -47,6 +47,13 @@ function writeField(settings: Settings, section: string, field: string, value: u
   };
 }
 
+interface Mirror {
+  section: string;
+  field: string;
+  value: unknown;
+  token: object;
+}
+
 interface Entry {
   view: SettingsView;
   /** Bumped by every edit and every settled save; a GET started before a bump is stale. */
@@ -60,6 +67,8 @@ interface Entry {
    * value that differs from the intent never replaces it; only a matching one settles it.
    */
   unconfirmed: Map<string, Unconfirmed>;
+  /** Global edits made under another profile that its save has not settled; laid over every GET. */
+  mirrors: Map<string, Mirror>;
   fieldGen: Map<string, number>;
   loading: Promise<boolean>;
   afterDrain: (() => void)[];
@@ -79,6 +88,7 @@ function entry(profile: string): Entry {
       tail: Promise.resolve(),
       needsReconcile: false,
       unconfirmed: new Map(),
+      mirrors: new Map(),
       fieldGen: new Map(),
       loading: Promise.resolve(false),
       afterDrain: [],
@@ -107,18 +117,24 @@ export function useProfileSettings(profile: string): SettingsView {
 /**
  * Plugin values are global, so an edit made under one profile is written into the other cached
  * profiles too. Bumping their `gen` makes a GET already in flight, even a first one with no
- * snapshot to mirror into, retry instead of landing a value that predates the edit. `settle`
- * refetches them once the save has an outcome, so none keeps an edit the server may not have
- * kept; `undo` reverts a mirror the target has not edited since.
+ * snapshot to mirror into, retry instead of landing a value that predates the edit, and the
+ * edit is laid over any GET that still lands while the save is out. `settle` refetches them
+ * once the save has an outcome, so none keeps an edit the server may not have kept; `undo`
+ * reverts a mirror the target has not edited since.
  */
 function mirrorPluginField(origin: Entry, section: string, field: string, value: unknown) {
   const key = `${section}\0${field}`;
   const global = section.startsWith(PLUGIN_PREFIX);
   const mirrored = new Map<Entry, { prior: unknown; fieldGen?: number }>();
+  const token = {};
+  const release = (other: Entry) => {
+    if (other.mirrors.get(key)?.token === token) other.mirrors.delete(key);
+  };
   if (global) {
     for (const other of entries.values()) {
       if (other === origin) continue;
       other.gen++;
+      other.mirrors.set(key, { section, field, value, token });
       const current = other.view.settings;
       if (!current) continue;
       mirrored.set(other, { prior: readField(current, section, field), fieldGen: other.fieldGen.get(key) });
@@ -130,11 +146,13 @@ function mirrorPluginField(origin: Entry, section: string, field: string, value:
       if (!global) return;
       for (const [profile, other] of entries) {
         if (other === origin) continue;
+        release(other);
         other.gen++;
         if (other.loadSeq > 0 && other.pending === 0) void loadSettings(profile);
       }
     },
     undo: () => {
+      for (const other of entries.values()) release(other);
       for (const [other, { prior, fieldGen }] of mirrored) {
         const current = other.view.settings;
         if (current && other.fieldGen.get(key) === fieldGen && same(readField(current, section, field), value)) {
@@ -194,7 +212,10 @@ export function loadSettings(profile: string): Promise<boolean> {
         publish(e, { error: REFRESH_ERROR });
         return false;
       }
-      const { settings, resend, unresolved } = settle(e, s);
+      const settled = settle(e, s);
+      const { resend, unresolved } = settled;
+      let settings = settled.settings;
+      for (const m of e.mirrors.values()) settings = writeField(settings, m.section, m.field, m.value);
       const error =
         unresolved.length > 0
           ? `${CONFIRM_ERROR} ${unresolved.join(", ")}; showing your value. Reload to discard it`
@@ -232,6 +253,7 @@ export async function saveField(
   const fieldGen = (e.fieldGen.get(key) ?? 0) + 1;
   e.fieldGen.set(key, fieldGen);
   e.unconfirmed.delete(key);
+  e.mirrors.delete(key);
   e.gen++;
   e.pending++;
   publish(e, {

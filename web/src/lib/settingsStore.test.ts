@@ -344,6 +344,42 @@ describe("settings store", () => {
     await waitFor(() => expect(pluginList(b)).toEqual(["b", "c"]));
   });
 
+  it("keeps a mirrored global edit over a GET that lands before the origin save settles", async () => {
+    const seedPlugin = async (profile: string) => {
+      vi.mocked(fetchSettings).mockResolvedValueOnce(pluginSettings(["a", "b", "c"]));
+      loadSettings(profile);
+      const hook = renderHook(() => useProfileSettings(profile));
+      await waitFor(() => expect(pluginList(hook)).toEqual(["a", "b", "c"]));
+      return hook;
+    };
+    const b = await seedPlugin("B");
+    await seedPlugin("A");
+    const heldA = deferred<SaveOutcome>();
+    void saveField("A", "plugin:x", "list", ["b", "c"], () => heldA.promise);
+
+    // B's GET starts after the mirror and reads the old list before A's PATCH commits.
+    vi.mocked(fetchSettings).mockResolvedValueOnce(pluginSettings(["a", "b", "c"]));
+    await act(async () => {
+      await loadSettings("B");
+    });
+    expect(pluginList(b)).toEqual(["b", "c"]);
+
+    const sendB = vi.fn(async (): Promise<SaveOutcome> => "committed");
+    vi.mocked(fetchSettings).mockResolvedValue(pluginSettings(["c"]));
+    await act(async () => {
+      await saveField(
+        "B",
+        "plugin:x",
+        "list",
+        (pluginList(b) ?? []).filter((x) => x !== "b"),
+        sendB,
+      );
+    });
+    expect(pluginList(b)).toEqual(["c"]);
+    await act(async () => heldA.resolve("committed"));
+    await waitFor(() => expect(pluginList(b)).toEqual(["c"]));
+  });
+
   it("drops a GET already in flight for a profile when another profile's global edit is mirrored", async () => {
     vi.mocked(fetchSettings).mockResolvedValueOnce(pluginSettings(["a", "b", "c"]));
     loadSettings("B");
