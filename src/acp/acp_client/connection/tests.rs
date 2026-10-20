@@ -305,17 +305,27 @@ async fn auth_events(mode: ConnectMode, reports: bool) -> Vec<bool> {
     seen
 }
 
-/// A limit that ends an agent-initiated turn must end the connection, or the
-/// drain loop never drops the worker and the reaper skips it as still running
-/// (#4373).
-#[tokio::test]
-async fn rate_limit_on_an_agent_initiated_turn_ends_the_connection() {
+/// A connection driven against a fake agent that answers the handshake and, on
+/// each `session/prompt`, writes the lines `on_prompt` returns for its request id.
+struct FakeConnection {
+    event_rx: mpsc::Receiver<Event>,
+    cmd_tx: mpsc::Sender<ClientCmd>,
+    agent_write: SharedWrite,
+    connection: tokio::task::JoinHandle<()>,
+    agent: tokio::task::JoinHandle<()>,
+    _cwd: tempfile::TempDir,
+}
+
+async fn spawn_fake_connection(
+    session_id: &'static str,
+    on_prompt: impl Fn(&serde_json::Value) -> Vec<String> + Send + 'static,
+) -> FakeConnection {
     let (daemon_write, agent_read) = tokio::io::duplex(64 * 1024);
     let (agent_write, daemon_read) = tokio::io::duplex(64 * 1024);
     let agent_write: SharedWrite = Arc::new(Mutex::new(agent_write));
-    let (event_tx, mut event_rx) = mpsc::channel(64);
-    let (_cmd_tx, cmd_rx) = mpsc::channel::<ClientCmd>(1);
-    let (ready_tx, _ready_rx) = oneshot::channel();
+    let (event_tx, event_rx) = mpsc::channel(64);
+    let (cmd_tx, cmd_rx) = mpsc::channel::<ClientCmd>(1);
+    let (ready_tx, ready_rx) = oneshot::channel::<Result<(), AcpError>>();
     let temp = tempfile::tempdir().unwrap();
     let cwd = temp.path().to_path_buf();
     let params = ConnectionParams {
@@ -327,7 +337,7 @@ async fn rate_limit_on_an_agent_initiated_turn_ends_the_connection() {
             fs_policy: Arc::new(FsPolicy::new(vec![cwd.clone()])),
             terminals: TerminalManager::new(),
             cwd,
-            label: "s-limit".to_string(),
+            label: session_id.to_string(),
             sandbox: None,
         },
         mode: ConnectMode::Fresh {
@@ -347,28 +357,51 @@ async fn rate_limit_on_an_agent_initiated_turn_ends_the_connection() {
     };
     let transport = ByteStreams::new(daemon_write.compat_write(), daemon_read.compat());
     let connection = tokio::spawn(run_connection_task(transport, params));
-    let handshake_write = agent_write.clone();
+    let reply_write = agent_write.clone();
     let agent = tokio::spawn(async move {
         let mut lines = BufReader::new(agent_read).lines();
         while let Ok(Some(line)) = lines.next_line().await {
             let msg: serde_json::Value = serde_json::from_str(&line).unwrap();
             let id = &msg["id"];
-            let reply = match msg["method"].as_str() {
-                Some("initialize") => format!(
+            let replies = match msg["method"].as_str() {
+                Some("initialize") => vec![format!(
                     r#"{{"jsonrpc":"2.0","id":{id},"result":{{"protocolVersion":1,"agentCapabilities":{{}}}}}}"#
-                ),
-                Some("session/new") => {
-                    format!(r#"{{"jsonrpc":"2.0","id":{id},"result":{{"sessionId":"s-limit"}}}}"#)
-                }
+                )],
+                Some("session/new") => vec![format!(
+                    r#"{{"jsonrpc":"2.0","id":{id},"result":{{"sessionId":"{session_id}"}}}}"#
+                )],
+                Some("session/prompt") => on_prompt(id),
                 _ => continue,
             };
-            write_line(&handshake_write, &reply).await;
+            for reply in replies {
+                write_line(&reply_write, &reply).await;
+            }
         }
     });
+    ready_rx
+        .await
+        .expect("handshake completes")
+        .expect("handshake ok");
+    FakeConnection {
+        event_rx,
+        cmd_tx,
+        agent_write,
+        connection,
+        agent,
+        _cwd: temp,
+    }
+}
+
+/// A limit that ends an agent-initiated turn must end the connection, or the
+/// drain loop never drops the worker and the reaper skips it as still running
+/// (#4373).
+#[tokio::test]
+async fn rate_limit_on_an_agent_initiated_turn_ends_the_connection() {
+    let mut fake = spawn_fake_connection("s-limit", |_| Vec::new()).await;
 
     tokio::time::timeout(Duration::from_secs(10), async {
         while !matches!(
-            event_rx.recv().await.expect("connection remains open"),
+            fake.event_rx.recv().await.expect("connection remains open"),
             Event::AcpSessionAssigned { .. }
         ) {}
     })
@@ -378,7 +411,7 @@ async fn rate_limit_on_an_agent_initiated_turn_ends_the_connection() {
     // Accounting for a turn nobody prompted, carrying a rejected window.
     let resets_at = chrono::Utc::now().timestamp() + 3600;
     write_line(
-        &agent_write,
+        &fake.agent_write,
         &format!(
             r#"{{"jsonrpc":"2.0","method":"session/update","params":{{"sessionId":"s-limit","update":{{"sessionUpdate":"usage_update","used":10,"size":100,"cost":{{"amount":0.1,"currency":"USD"}},"_meta":{{"_claude/rateLimit":{{"status":"rejected","rateLimitType":"five_hour","resetsAt":{resets_at}}}}}}}}}}}"#
         ),
@@ -388,13 +421,13 @@ async fn rate_limit_on_an_agent_initiated_turn_ends_the_connection() {
     // The idle grace is wall-clock, so the deadline covers it with margin.
     let mut seen = Vec::new();
     tokio::time::timeout(Duration::from_secs(30), async {
-        while let Some(event) = event_rx.recv().await {
+        while let Some(event) = fake.event_rx.recv().await {
             seen.push(event);
         }
     })
     .await
     .expect("the connection must end after parking, closing the event channel");
-    tokio::time::timeout(Duration::from_secs(10), connection)
+    tokio::time::timeout(Duration::from_secs(10), fake.connection)
         .await
         .expect("connection task ends")
         .expect("connection task does not panic");
@@ -409,8 +442,8 @@ async fn rate_limit_on_an_agent_initiated_turn_ends_the_connection() {
         limit.is_some() && limit < stopped,
         "RateLimit then Stopped(rate_limited) expected: {seen:?}"
     );
-    agent.abort();
-    let _ = agent.await;
+    fake.agent.abort();
+    let _ = fake.agent.await;
 }
 
 /// A prompted turn the adapter ends normally after a rejected window parks like
@@ -425,109 +458,27 @@ async fn prompted_turn_ending_on_a_rejected_window_parks() {
         ("cancelled", now + 3600, false, false),
         ("end_turn", now - 60, false, false),
     ] {
-        let (daemon_write, agent_read) = tokio::io::duplex(64 * 1024);
-        let (agent_write, daemon_read) = tokio::io::duplex(64 * 1024);
-        let agent_write: SharedWrite = Arc::new(Mutex::new(agent_write));
-        let (event_tx, mut event_rx) = mpsc::channel(64);
-        let (cmd_tx, cmd_rx) = mpsc::channel::<ClientCmd>(1);
-        let (ready_tx, ready_rx) = oneshot::channel::<Result<(), AcpError>>();
-        let temp = tempfile::tempdir().unwrap();
-        let cwd = temp.path().to_path_buf();
-        let params = ConnectionParams {
-            event_tx,
-            cmd_rx,
-            child: None,
-            pending_responders: Arc::new(Mutex::new(HashMap::new())),
-            resources: SessionResources {
-                fs_policy: Arc::new(FsPolicy::new(vec![cwd.clone()])),
-                terminals: TerminalManager::new(),
-                cwd,
-                label: "s-prompted".to_string(),
-                sandbox: None,
-            },
-            mode: ConnectMode::Fresh {
-                stored_acp_session_id: None,
-                seed_history_replay: false,
-                fork_from: None,
-            },
-            ready_tx,
-            profile: &crate::acp::agent_profiles::GEMINI,
-            expected_agent: ExpectedAgent::Gemini,
-            source_profile: None,
-            default_effort: None,
-            default_mode: None,
-            default_model: None,
-            mcp_servers: Vec::new(),
-            runner: None,
-        };
-        let transport = ByteStreams::new(daemon_write.compat_write(), daemon_read.compat());
-        let connection = tokio::spawn(run_connection_task(transport, params));
-        let reply_write = agent_write.clone();
-        let answered = Arc::new(AtomicBool::new(false));
-        let agent = tokio::spawn(async move {
-            let mut lines = BufReader::new(agent_read).lines();
-            while let Ok(Some(line)) = lines.next_line().await {
-                let msg: serde_json::Value = serde_json::from_str(&line).unwrap();
-                let id = &msg["id"];
-                match msg["method"].as_str() {
-                    Some("initialize") => {
-                        write_line(
-                            &reply_write,
-                            &format!(
-                                r#"{{"jsonrpc":"2.0","id":{id},"result":{{"protocolVersion":1,"agentCapabilities":{{}}}}}}"#
-                            ),
-                        )
-                        .await;
-                    }
-                    Some("session/new") => {
-                        write_line(
-                            &reply_write,
-                            &format!(
-                                r#"{{"jsonrpc":"2.0","id":{id},"result":{{"sessionId":"s-prompted"}}}}"#
-                            ),
-                        )
-                        .await;
-                    }
-                    Some("session/prompt") => {
-                        if late {
-                            // Only the first prompt is answered.
-                            if answered.swap(true, Ordering::SeqCst) {
-                                continue;
-                            }
-                            write_line(
-                                &reply_write,
-                                &format!(
-                                    r#"{{"jsonrpc":"2.0","id":{id},"result":{{"stopReason":"{stop_reason}"}}}}"#
-                                ),
-                            )
-                            .await;
-                            continue;
-                        }
-                        write_line(
-                            &reply_write,
-                            &format!(
-                                r#"{{"jsonrpc":"2.0","method":"session/update","params":{{"sessionId":"s-prompted","update":{{"sessionUpdate":"usage_update","used":10,"size":100,"_meta":{{"_claude/rateLimit":{{"status":"rejected","rateLimitType":"five_hour","resetsAt":{resets_at}}}}}}}}}}}"#
-                            ),
-                        )
-                        .await;
-                        write_line(
-                            &reply_write,
-                            &format!(
-                                r#"{{"jsonrpc":"2.0","id":{id},"result":{{"stopReason":"{stop_reason}"}}}}"#
-                            ),
-                        )
-                        .await;
-                    }
-                    _ => {}
+        let update = format!(
+            r#"{{"jsonrpc":"2.0","method":"session/update","params":{{"sessionId":"s-prompted","update":{{"sessionUpdate":"usage_update","used":10,"size":100,"_meta":{{"_claude/rateLimit":{{"status":"rejected","rateLimitType":"five_hour","resetsAt":{resets_at}}}}}}}}}}}"#
+        );
+        let answered = AtomicBool::new(false);
+        let mut fake = spawn_fake_connection("s-prompted", {
+            let update = update.clone();
+            move |id| {
+                let response = format!(
+                    r#"{{"jsonrpc":"2.0","id":{id},"result":{{"stopReason":"{stop_reason}"}}}}"#
+                );
+                // A late case answers only the first prompt, and the test
+                // sends the update once that turn has stopped.
+                match (late, answered.swap(true, Ordering::SeqCst)) {
+                    (true, true) => Vec::new(),
+                    (true, false) => vec![response],
+                    (false, _) => vec![update.clone(), response],
                 }
             }
-        });
-
-        ready_rx
-            .await
-            .expect("handshake completes")
-            .expect("handshake ok");
-        cmd_tx
+        })
+        .await;
+        fake.cmd_tx
             .send(ClientCmd::Prompt(vec![ContentBlock::Text(
                 TextContent::new("hi"),
             )]))
@@ -536,7 +487,7 @@ async fn prompted_turn_ending_on_a_rejected_window_parks() {
 
         let mut seen = Vec::new();
         tokio::time::timeout(Duration::from_secs(10), async {
-            while let Some(event) = event_rx.recv().await {
+            while let Some(event) = fake.event_rx.recv().await {
                 let stopped = matches!(event, Event::Stopped { .. });
                 seen.push(event);
                 if stopped {
@@ -548,26 +499,20 @@ async fn prompted_turn_ending_on_a_rejected_window_parks() {
                     matches!(seen.last(), Some(Event::Stopped { reason }) if reason == "prompt_complete"),
                     "{seen:?}"
                 );
-                write_line(
-                    &agent_write,
-                    &format!(
-                        r#"{{"jsonrpc":"2.0","method":"session/update","params":{{"sessionId":"s-prompted","update":{{"sessionUpdate":"usage_update","used":10,"size":100,"_meta":{{"_claude/rateLimit":{{"status":"rejected","rateLimitType":"five_hour","resetsAt":{resets_at}}}}}}}}}}}"#
-                    ),
-                )
-                .await;
+                write_line(&fake.agent_write, &update).await;
                 // The capture happens before the update is forwarded, so
                 // seeing it means the window is recorded.
                 while !matches!(
-                    event_rx.recv().await.expect("connection remains open"),
+                    fake.event_rx.recv().await.expect("connection remains open"),
                     Event::UsageUpdated { .. }
                 ) {}
-                cmd_tx
+                fake.cmd_tx
                     .send(ClientCmd::Prompt(vec![ContentBlock::Text(
                         TextContent::new("again"),
                     )]))
                     .await
                     .unwrap();
-                while let Some(event) = event_rx.recv().await {
+                while let Some(event) = fake.event_rx.recv().await {
                     let stopped = matches!(event, Event::Stopped { .. });
                     seen.push(event);
                     if stopped {
@@ -592,17 +537,17 @@ async fn prompted_turn_ending_on_a_rejected_window_parks() {
             );
             assert_eq!(stopped_reason, "rate_limited", "{seen:?}");
             // The connection must end so the reaper can resume it.
-            tokio::time::timeout(Duration::from_secs(10), connection)
+            tokio::time::timeout(Duration::from_secs(10), fake.connection)
                 .await
                 .expect("connection task ends after parking")
                 .expect("connection task does not panic");
         } else {
             assert!(limit.is_none(), "{stop_reason}: must not park: {seen:?}");
             assert_ne!(stopped_reason, "rate_limited", "{seen:?}");
-            connection.abort();
-            let _ = connection.await;
+            fake.connection.abort();
+            let _ = fake.connection.await;
         }
-        agent.abort();
-        let _ = agent.await;
+        fake.agent.abort();
+        let _ = fake.agent.await;
     }
 }
