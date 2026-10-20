@@ -18,6 +18,10 @@ const plugins = (list: string[]) => ({ web: { list } });
 const listOf = (hook: { result: { current: SettingsView } }) =>
   (hook.result.current.settings?.web as { list: string[] } | undefined)?.list;
 
+const pluginSettings = (list: string[]) => ({ plugins: { x: { settings: { list } } } });
+const pluginList = (hook: { result: { current: SettingsView } }) =>
+  (hook.result.current.settings?.plugins as { x: { settings: { list: string[] } } } | undefined)?.x.settings.list;
+
 beforeEach(() => {
   resetSettingsStore();
   // Unscripted fetches (a retry after the test is over) hang instead of resolving to undefined.
@@ -263,5 +267,70 @@ describe("settings store", () => {
     await act(async () => slow.resolve(plugins(["w"])));
     expect(listOf(workHook)).toEqual(["w"]);
     expect(listOf(mainHook)).toEqual(["m"]);
+  });
+
+  it("shows an accepted global plugin edit to another profile before its GET lands", async () => {
+    vi.mocked(fetchSettings).mockResolvedValueOnce(pluginSettings(["a", "b", "c"]));
+    loadSettings("B");
+    const b = renderHook(() => useProfileSettings("B"));
+    await waitFor(() => expect(pluginList(b)).toEqual(["a", "b", "c"]));
+    vi.mocked(fetchSettings).mockResolvedValueOnce(pluginSettings(["a", "b", "c"]));
+    loadSettings("A");
+    const a = renderHook(() => useProfileSettings("A"));
+    await waitFor(() => expect(pluginList(a)).toEqual(["a", "b", "c"]));
+
+    await act(async () => {
+      await saveField("A", "plugin:x", "list", ["b", "c"], async () => "committed");
+    });
+
+    // Back on B with its GET held, removing `b` must not restore the removal of `a`.
+    const held = deferred<Record<string, unknown>>();
+    vi.mocked(fetchSettings)
+      .mockReturnValueOnce(held.promise)
+      .mockResolvedValue(pluginSettings(["c"]));
+    loadSettings("B");
+    expect(pluginList(b)).toEqual(["b", "c"]);
+    const sendB = vi.fn(async (): Promise<SaveOutcome> => "committed");
+    await act(async () => {
+      await saveField(
+        "B",
+        "plugin:x",
+        "list",
+        (pluginList(b) ?? []).filter((x) => x !== "b"),
+        sendB,
+      );
+    });
+    expect(pluginList(b)).toEqual(["c"]);
+    await act(async () => held.resolve(pluginSettings(["a", "b", "c"])));
+    expect(pluginList(b)).toEqual(["c"]);
+  });
+
+  it("restores another profile's plugin value when the edit is rejected", async () => {
+    vi.mocked(fetchSettings).mockResolvedValueOnce(pluginSettings(["a", "b"]));
+    loadSettings("B");
+    const b = renderHook(() => useProfileSettings("B"));
+    await waitFor(() => expect(pluginList(b)).toEqual(["a", "b"]));
+    await seed("A", ["a", "b"]);
+    vi.mocked(fetchSettings).mockResolvedValue(pluginSettings(["a", "b"]));
+    const held = deferred<SaveOutcome>();
+
+    await act(async () => void saveField("A", "plugin:x", "list", ["b"], () => held.promise));
+    expect(pluginList(b)).toEqual(["b"]);
+    await act(async () => held.resolve("rejected"));
+    expect(pluginList(b)).toEqual(["a", "b"]);
+  });
+
+  it("clears the refresh warning once a refetch succeeds", async () => {
+    const hook = await seed("main", ["a", "b"]);
+    vi.mocked(fetchSettings).mockResolvedValueOnce(null as never);
+    await act(async () => {
+      await loadSettings("main");
+    });
+    expect(hook.result.current.error).toBe("Could not refresh settings, please reload");
+    vi.mocked(fetchSettings).mockResolvedValueOnce(plugins(["a", "b"]));
+    await act(async () => {
+      await loadSettings("main");
+    });
+    expect(hook.result.current.error).toBeNull();
   });
 });

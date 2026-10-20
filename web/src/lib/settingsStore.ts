@@ -104,6 +104,32 @@ export function useProfileSettings(profile: string): SettingsView {
   );
 }
 
+/**
+ * Plugin values are global, so an edit made under one profile is written into the other cached
+ * profiles too; bumping `gen` makes a GET already in flight for them retry instead of landing
+ * a snapshot that predates the edit. Returns a function that undoes it where still unchanged.
+ */
+function mirrorPluginField(origin: Entry, section: string, field: string, value: unknown): () => void {
+  const priors = new Map<Entry, unknown>();
+  if (section.startsWith(PLUGIN_PREFIX)) {
+    for (const other of entries.values()) {
+      const current = other.view.settings;
+      if (other === origin || !current) continue;
+      priors.set(other, readField(current, section, field));
+      other.gen++;
+      publish(other, { settings: writeField(current, section, field, value) });
+    }
+  }
+  return () => {
+    for (const [other, prior] of priors) {
+      const current = other.view.settings;
+      if (current && same(readField(current, section, field), value)) {
+        publish(other, { settings: writeField(current, section, field, prior) });
+      }
+    }
+  };
+}
+
 const REFRESH_ERROR = "Could not refresh settings, please reload";
 
 const same = (a: unknown, b: unknown) => JSON.stringify(a) === JSON.stringify(b);
@@ -157,7 +183,7 @@ export function loadSettings(profile: string): Promise<boolean> {
       const error =
         unresolved.length > 0
           ? `${CONFIRM_ERROR} ${unresolved.join(", ")}; showing your value. Reload to discard it`
-          : e.unconfirmed.size === 0 && e.view.error?.startsWith(CONFIRM_ERROR)
+          : e.view.error === REFRESH_ERROR || (e.unconfirmed.size === 0 && e.view.error?.startsWith(CONFIRM_ERROR))
             ? null
             : e.view.error;
       publish(e, { settings, error });
@@ -198,12 +224,14 @@ export async function saveField(
     error: e.unconfirmed.size > 0 ? e.view.error : null,
     settings: base && writeField(base, section, field, value),
   });
+  const unmirror = mirrorPluginField(e, section, field, value);
   const request = e.tail.then(send);
   e.tail = request.catch(() => undefined);
   const outcome = await request.catch((): SaveOutcome => "uncertain");
   e.gen++;
   e.pending--;
   if (outcome !== "committed") e.needsReconcile = true;
+  if (outcome === "rejected") unmirror();
   // A newer edit of the same field supersedes this one, so only the latest keeps its intent.
   if (outcome === "uncertain" && e.fieldGen.get(key) === fieldGen) {
     e.unconfirmed.set(key, { section, field, value, send, attempts: attempts + 1 });
