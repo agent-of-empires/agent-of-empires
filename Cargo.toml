@@ -154,7 +154,8 @@ mime_guess = "2.0"
 qrcode = { version = "0.14", optional = true }
 argon2 = "0.6"
 subtle = "2"
-# Passkey (WebAuthn) sign-in for the web dashboard. Pulls in OpenSSL, already vendored for git2.
+# Passkey (WebAuthn) sign-in for the web dashboard. Links OpenSSL: vendored by the default
+# `vendored` feature, from the system otherwise.
 webauthn-rs = "0.5"
 
 # TUI OSC 52 clipboard writes and Web Push payload encoding.
