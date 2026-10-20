@@ -24,6 +24,7 @@ This document contains the help content for the `aoe` command-line program.
 * [`aoe session show`↴](#aoe-session-show)
 * [`aoe session wait`↴](#aoe-session-wait)
 * [`aoe session rename`↴](#aoe-session-rename)
+* [`aoe session move`↴](#aoe-session-move)
 * [`aoe session set-worktree-name`↴](#aoe-session-set-worktree-name)
 * [`aoe session capture`↴](#aoe-session-capture)
 * [`aoe session current`↴](#aoe-session-current)
@@ -423,6 +424,7 @@ Manage session lifecycle (start, stop, attach, etc.)
 * `show` — Show session details
 * `wait` — Block until a session's agent activity status matches one of the `--until` values. Exits 0 on a match, 124 on timeout (like `timeout(1)`), and 1 if the session stops. Tmux sessions only
 * `rename` — Rename a session
+* `move` — Move stopped sessions to another profile. The session keeps its title, group and worktree; the target profile's config applies from the next start
 * `set-worktree-name` — Edit a managed worktree session's workdir directory name (and, optionally, its git branch). Moves the worktree directory in place; the session must not be running. See #1723
 * `capture` — Capture tmux pane output
 * `current` — Auto-detect current session
@@ -552,6 +554,22 @@ Rename a session
 * `-g`, `--group <GROUP>` — New group for the session (empty string to ungroup)
 * `--rename-branch` — When the session is tied (session.tie_workdir_to_name) and an aoe-managed worktree, also rename the underlying git branch to match. Off by default; ignored for untied / non-worktree sessions
 * `--branch <BRANCH>` — Rename the Git branch without moving the worktree directory
+
+
+
+## `aoe session move`
+
+Move stopped sessions to another profile. The session keeps its title, group and worktree; the target profile's config applies from the next start
+
+**Usage:** `aoe session move --to-profile <TO_PROFILE> <IDENTIFIERS>...`
+
+###### **Arguments:**
+
+* `<IDENTIFIERS>` — Session IDs or titles to move
+
+###### **Options:**
+
+* `--to-profile <TO_PROFILE>` — Destination profile; it must already exist
 
 
 
