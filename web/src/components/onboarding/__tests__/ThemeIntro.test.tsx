@@ -4,7 +4,9 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 
 const updateTheme = vi.fn(() => Promise.resolve("committed" as "committed" | "rejected" | "uncertain"));
+const fetchSettings = vi.fn(() => Promise.resolve(null as { theme: { name: string } } | null));
 vi.mock("../../../lib/api", () => ({
+  fetchSettings: () => fetchSettings(),
   fetchThemes: vi.fn(() => Promise.resolve(["default", "modus-vivendi", "empire"])),
   updateTheme: (patch: { name?: string }) => updateTheme(patch),
 }));
@@ -20,6 +22,7 @@ afterEach(() => {
   cleanup();
   dispatchSpy.mockClear();
   updateTheme.mockClear();
+  fetchSettings.mockClear();
   updateTheme.mockImplementation(() => Promise.resolve("committed"));
 });
 
@@ -53,6 +56,20 @@ describe("ThemeIntro", () => {
     await waitFor(() => expect(screen.getByRole("alert")).toBeTruthy());
     expect(dispatchSpy).not.toHaveBeenCalled();
     expect(option("empire").getAttribute("aria-selected")).toBe("false");
+  });
+
+  it("treats an uncertain save as done only when a fetch shows the pick", async () => {
+    updateTheme.mockImplementation(() => Promise.resolve("uncertain"));
+    await mount();
+
+    fetchSettings.mockResolvedValueOnce({ theme: { name: "modus-vivendi" } });
+    fireEvent.click(option("modus-vivendi"));
+    await waitFor(() => expect(dispatchSpy).toHaveBeenCalledWith("modus-vivendi"));
+
+    fetchSettings.mockResolvedValueOnce({ theme: { name: "modus-vivendi" } });
+    fireEvent.click(option("empire"));
+    await waitFor(() => expect(screen.getByRole("alert")).toBeTruthy());
+    expect(dispatchSpy).toHaveBeenCalledTimes(1);
   });
 
   it("Continue hands off to the tour; Escape skips it", async () => {
