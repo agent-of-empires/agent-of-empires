@@ -732,24 +732,6 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
         instance.acp_effort = explicit_effort;
     }
 
-    if let Some(seed) = fork_seed {
-        match seed {
-            crate::session::ForkSeed::Terminal {
-                parent,
-                child_session_id,
-                unattributed_parent_agent,
-            } => crate::session::fork::apply_terminal_fork_seed(
-                &mut instance,
-                &config.session,
-                profile,
-                *parent,
-                child_session_id,
-                unattributed_parent_agent.as_deref(),
-            )?,
-            crate::session::ForkSeed::Structured { .. } => {}
-        }
-    }
-
     let use_sandbox = args.sandbox || args.sandbox_image.is_some();
 
     let runtime = containers::get_container_runtime();
@@ -784,6 +766,24 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
                 provider: None,
                 container_workdir: None,
             });
+        }
+    }
+
+    if let Some(seed) = fork_seed {
+        match seed {
+            crate::session::ForkSeed::Terminal {
+                parent,
+                child_session_id,
+                unattributed_parent_agent,
+            } => crate::session::fork::apply_terminal_fork_seed(
+                &mut instance,
+                &config.session,
+                profile,
+                *parent,
+                child_session_id,
+                unattributed_parent_agent.as_deref(),
+            )?,
+            crate::session::ForkSeed::Structured { .. } => {}
         }
     }
 
