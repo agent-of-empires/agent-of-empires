@@ -451,6 +451,7 @@ function ComposerDock({
 
       <CollapsibleRegion id={`conversation-composer-${sessionId}`} collapsed={collapsible && collapsed}>
         <Composer
+          active={view.active !== false}
           sessionId={sessionId}
           currentAgent={state.agent ?? acpAgent}
           currentProvider={acpProvider}

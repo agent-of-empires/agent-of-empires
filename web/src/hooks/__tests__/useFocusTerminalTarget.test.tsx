@@ -19,12 +19,15 @@ function mountTextarea(): HTMLElement {
   return el;
 }
 
-function renderWithElement(target: "composer" | "agent", el: HTMLElement | null) {
-  return renderHook(() => {
-    const ref = useRef<HTMLElement | null>(el);
-    useFocusTerminalTarget(target, ref);
-    return ref;
-  });
+function renderWithElement(target: "composer" | "agent", el: HTMLElement | null, active = true) {
+  return renderHook(
+    ({ active }) => {
+      const ref = useRef<HTMLElement | null>(el);
+      useFocusTerminalTarget(target, ref, active);
+      return ref;
+    },
+    { initialProps: { active } },
+  );
 }
 
 describe("useFocusTerminalTarget", () => {
@@ -68,5 +71,33 @@ describe("useFocusTerminalTarget", () => {
     el.blur();
     dispatchFocusTerminal("composer");
     expect(document.activeElement).not.toBe(el);
+  });
+
+  it("hands a sidebar focus request to the retained composer that activates, not the one it replaces", () => {
+    const a = mountTextarea();
+    const b = mountTextarea();
+    const viewA = renderWithElement("composer", a, false);
+    const viewB = renderWithElement("composer", b, true);
+
+    // The sidebar click: latch, then event, before the selection commits.
+    setPendingTerminalFocus("composer");
+    dispatchFocusTerminal("composer");
+    expect(document.activeElement).not.toBe(a);
+
+    // The selection commits: B goes inert and A activates.
+    b.blur();
+    viewB.rerender({ active: false });
+    viewA.rerender({ active: true });
+    expect(document.activeElement).toBe(a);
+    expect(consumePendingTerminalFocus("composer")).toBe(false);
+  });
+
+  it("leaves the latch alone and ignores events while inactive", () => {
+    const el = mountTextarea();
+    renderWithElement("composer", el, false);
+    setPendingTerminalFocus("composer");
+    dispatchFocusTerminal("composer");
+    expect(document.activeElement).not.toBe(el);
+    expect(consumePendingTerminalFocus("composer")).toBe(true);
   });
 });
