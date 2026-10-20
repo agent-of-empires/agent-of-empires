@@ -1578,6 +1578,8 @@ async fn wait_session(profile: &str, args: WaitArgs) -> Result<()> {
             live.update_status_with_metadata(None, None);
         }
         let elapsed = start.elapsed();
+        // The poll may have lost a vanishing pane; reread liveness before deciding.
+        crate::tmux::refresh_session_cache();
         match wait_decision(
             live.status,
             &targets,

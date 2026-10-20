@@ -45,7 +45,7 @@ fn test_wait_times_out_then_reports_stopped_session() {
 /// A pane that disappears mid-wait reads as `Error`; that must not satisfy `--until error`.
 #[test]
 #[parallel]
-fn test_wait_until_error_fails_when_session_is_stopped_mid_wait() {
+fn test_wait_until_error_fails_when_session_is_killed_mid_wait() {
     require_tmux!();
     let mut h = TuiTestHarness::new("session_wait_stop");
     let bin = h.install_path_command("claude");
@@ -63,7 +63,24 @@ fn test_wait_until_error_fails_when_session_is_stopped_mid_wait() {
         "--timeout",
         "30000",
     ]);
-    h.run_cli_ok(&["session", "stop", "stopper"]);
+    // Kill the pane without `aoe session stop`, which would store `Stopped` and hide the gone-pane
+    // path whichever side of the waiter's first poll it lands on.
+    let names = h
+        .tmux()
+        .args(["list-sessions", "-F", "#{session_name}"])
+        .output()
+        .expect("list tmux sessions");
+    let names = String::from_utf8_lossy(&names.stdout);
+    let pane = names
+        .lines()
+        .find(|n| n.contains("stopper"))
+        .expect("agent tmux session");
+    // Killing the last session exits the server, which reads as unreachable rather than gone.
+    h.tmux()
+        .args(["set-option", "-s", "exit-empty", "off"])
+        .output()
+        .expect("keep tmux server");
+    h.tmux_kill_session(pane);
 
     let out = waiter.wait_with_output().expect("wait for `session wait`");
     let stderr = String::from_utf8_lossy(&out.stderr);
