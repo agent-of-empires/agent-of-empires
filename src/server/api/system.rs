@@ -3382,6 +3382,7 @@ mod tests {
             StatusCode::OK
         );
     }
+
     #[tokio::test]
     #[serial_test::serial]
     async fn theme_save_drops_a_late_older_write_of_the_same_leaf() {
@@ -3389,7 +3390,7 @@ mod tests {
         let home = tempfile::TempDir::new().unwrap();
         let _home = crate::session::test_support::isolate_home(home.path());
         let state = crate::server::test_support::build_test_app_state(Vec::new());
-        let save = |tab_seq: &'static str, mode: ColorMode| {
+        let save = |tab_seq: &'static str, name: Option<String>, mode: Option<ColorMode>| {
             let state = state.clone();
             async move {
                 let mut headers = HeaderMap::new();
@@ -3398,8 +3399,8 @@ mod tests {
                     State(state),
                     headers,
                     Ok(Json(ThemePatch {
-                        name: None,
-                        color_mode: Some(mode),
+                        name,
+                        color_mode: mode,
                     })),
                 )
                 .await
@@ -3408,14 +3409,27 @@ mod tests {
             }
         };
 
-        assert_eq!(save("tab1.2", ColorMode::Palette).await, StatusCode::OK);
         assert_eq!(
-            save("tab1.1", ColorMode::Truecolor).await,
+            save("tab1.2", None, Some(ColorMode::Palette)).await,
+            StatusCode::OK
+        );
+        assert_eq!(
+            save("tab1.1", None, Some(ColorMode::Truecolor)).await,
             StatusCode::CONFLICT
         );
         assert_eq!(
             crate::session::Config::load().unwrap().theme.color_mode,
             ColorMode::Palette
         );
+
+        // A fresh name still lands when its stale color mode is dropped from the same patch.
+        let name = crate::tui::styles::available_themes().remove(0);
+        assert_eq!(
+            save("tab1.1", Some(name.clone()), Some(ColorMode::Truecolor)).await,
+            StatusCode::OK
+        );
+        let theme = crate::session::Config::load().unwrap().theme;
+        assert_eq!(theme.name, name);
+        assert_eq!(theme.color_mode, ColorMode::Palette);
     }
 }
