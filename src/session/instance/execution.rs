@@ -200,6 +200,8 @@ fn ensure_claude_store_root(
     cwd: &std::path::Path,
     sid: &str,
 ) -> Result<()> {
+    let store = crate::session::capture::canonicalize_or_raw(&store.to_string_lossy());
+    let store = store.as_path();
     if !crate::session::capture::claude_host_transcript_confirmed_absent(
         &cwd.to_string_lossy(),
         sid,
@@ -3029,6 +3031,8 @@ mod tests {
             &crate::session::capture::canonicalize_or_raw(&cwd.path().to_string_lossy())
                 .to_string_lossy(),
         );
+        let canonical =
+            crate::session::capture::canonicalize_or_raw(&root.path().to_string_lossy());
         let projects = root.path().join("projects");
         let project_dir = projects.join(&encoded);
         let check = |store: &std::path::Path| ensure_claude_store_root(store, cwd.path(), sid);
@@ -3043,7 +3047,19 @@ mod tests {
         for wrong in [&projects, &project_dir] {
             let err = check(wrong).unwrap_err().to_string();
             assert!(
-                err.contains(&format!("use {}", root.path().display())),
+                err.contains(&format!("use {}", canonical.display())),
+                "{err}"
+            );
+        }
+
+        // A symlink to the projects dir is judged by where it resolves.
+        #[cfg(unix)]
+        {
+            let link = root.path().join("link");
+            std::os::unix::fs::symlink(&projects, &link).unwrap();
+            let err = check(&link).unwrap_err().to_string();
+            assert!(
+                err.contains(&format!("use {}", canonical.display())),
                 "{err}"
             );
         }
