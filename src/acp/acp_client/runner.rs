@@ -149,7 +149,7 @@ fn refuse_unresolved_adapter(
     }
     Err(AcpError::unresolved_adapter_spawn_error(
         &std::io::Error::from(std::io::ErrorKind::NotFound),
-        &config.spec.command,
+        config,
         reason,
     ))
 }
@@ -762,6 +762,9 @@ mod tests {
                 .iter()
                 .map(|path| ("PATH".to_string(), path.to_string()))
                 .collect();
+            // The runner hands the adapter this list; the error reads the same config.
+            config.base_host_environment = environment.clone();
+            config.host_environment = environment.clone();
             let got = refuse_unresolved_adapter(
                 &config,
                 unresolved.as_ref(),
@@ -776,6 +779,16 @@ mod tests {
             match (&got, expected) {
                 (Some(msg), Some(want)) => assert!(msg.contains(want), "{label}: {msg}"),
                 _ => assert_eq!(got.is_some(), expected.is_some(), "{label}: {got:?}"),
+            }
+            // #4698: with a configured PATH, the advice is about that PATH.
+            if let (Some(msg), Some(Unresolved::NotFound)) = (&got, &unresolved) {
+                if !configured.is_empty() {
+                    assert!(
+                        msg.contains("`environment` sets for the agent"),
+                        "{label}: {msg}"
+                    );
+                    assert!(!msg.contains("restart `aoe serve`"), "{label}: {msg}");
+                }
             }
             if matches!(
                 unresolved,
