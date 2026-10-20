@@ -132,9 +132,15 @@ describe("SET_FIELD mutual exclusion", () => {
   });
 
   it("adding extra repos turns attach-existing off, removing them leaves it alone", () => {
-    const attached = makeState({ attachExisting: true });
-    expect(reducer(attached, set("extraRepoPaths", ["/lib"])).data.attachExisting).toBe(false);
+    const attached = makeState({ attachExisting: true, worktreeBranch: "feat/x", worktreeBranchDirty: true });
+    expect(reducer(attached, set("extraRepoPaths", ["/lib"])).data).toMatchObject({
+      attachExisting: false,
+      worktreeBranch: "",
+      worktreeBranchDirty: false,
+    });
     expect(reducer(attached, set("extraRepoPaths", [])).data.attachExisting).toBe(true);
+    const creating = makeState({ worktreeBranch: "mine", worktreeBranchDirty: true });
+    expect(reducer(creating, set("extraRepoPaths", ["/lib"])).data.worktreeBranch).toBe("mine");
   });
 
   it.each([
