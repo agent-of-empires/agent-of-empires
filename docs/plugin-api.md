@@ -33,32 +33,46 @@ capabilities = ["runtime.worker"]
 | `api_version` | integer | yes | Manifest schema version, `1` to `19`. |
 | `description` | string | no | Shown in plugin listings. Defaults to empty. |
 | `aoe_version` | string | no | Host-app semver requirement. Requires `api_version >= 4`. |
-| `capabilities` | array of string | no | Runtime grants the worker needs (see [Capabilities](#capabilities)). Static contributions need none. |
+| `capabilities` | array of string | no | Runtime grants the worker needs (see [Capabilities](#capabilities)). Static contributions need none; provider-native agent status and replies require `session.integration`. |
 | `screenshots` | array | no | Up to 8. Requires `api_version >= 5`. See [Screenshots](#screenshots). |
 | `setting_defaults` | table | no | Overrides for core host settings, keyed by canonical path (e.g. `"theme.idle_decay_minutes"`). Resolution is user value, then plugin override, then core default. |
-| `agent_integrations` | array of tables | no | Optional agent launch metadata. Requires `api_version >= 19`. |
-
+| `agent_integrations` | array of tables | no | Agent tools may declare provider-native communication or optional launch metadata. Requires `api_version >= 19`; provider-native status and replies require `session.integration`. |
 
 ## Agent integrations
 
+An agent integration connects a plugin to provider-native status and prompt replies for a terminal agent. Optional launch metadata makes that tool discoverable and launchable from AoE; the host still owns session creation, approvals, and lifecycle. It is separate from ACP and worker RPCs. The user still chooses each response; declaring an integration does not approve tools automatically.
 
-An agent integration declares an optional launch command for an agent tool. Active plugins with a command contribute that tool to AoE's agent picker and CLI when the name is unique across plugin declarations and does not collide with a built-in or configured custom agent.
-
-Available plugin agents can be selected with `session.default_tool`. Discovery checks the executable after leading `NAME=value` assignments, using the process PATH and then the user's login shell without running the agent command or its arguments.
-
+Active plugins with a command contribute that tool to AoE's agent picker and CLI when the name is unique across plugin declarations and does not collide with a built-in or configured custom agent. Available plugin agents can be selected with `session.default_tool`. Discovery checks the executable after leading `NAME=value` assignments, using the process PATH and then the user's login shell without running the agent command or its arguments.
 
 ```toml
+capabilities = ["session.integration"]
+
 [[agent_integrations]]
 tool = "session-agent"
+provider_versions = ["^1.2"]
 command = "session-agent"
+replies = true
 ```
-
 
 | Key | Type | Required | Notes |
 |---|---|---|---|
 | `tool` | string | yes | Lowercase agent id; each tool may appear only once per plugin. |
-| `command` | string | no | Default launch command for this agent. |
+| `provider_versions` | array of strings | conditional | Required when declaring `session.integration`; nonempty alternative semver requirements for the agent runtime. A report's `provider_version` must match at least one. Omit for launch-only agent declarations. |
+| `command` | string | no | Default launch command for this agent. Active plugins with a command contribute the agent to AoE's agent picker and CLI only when the tool name is unique across plugins and does not collide with a built-in or configured custom agent. |
+| `replies` | boolean | no | Explicitly enable provider-native prompt replies; defaults to false. Requires `session.integration`. Status-only integrations do not take over quick-response actions. |
 
+The host matches status integrations to terminal sessions and rejects missing, malformed, or unsupported runtime versions before consuming reports or sending replies. The runtime extension must also enforce supported versions before activation. These requirements are independent of the plugin's `version`, AoE host `api_version` / `aoe_version`, and report/reply `schema_version`. Launch-only agent declarations do not enable provider-native status or replies.
+For reply-enabled integrations, the provider report's `reply_keys` must contain only function-key names from `F1` through `F12`. AoE sends those keys only after the user submits a response. A status-only report may omit `reply_keys` or send an empty array. Prompts are ignored unless the integration enables replies and the report supplies wake keys. Missing or invalid reports for reply-enabled integrations never fall back to terminal approval keystrokes.
+
+### Report and reply files
+
+The provider writes `integration-<plugin id>.json` in the session's private hook directory, `/tmp/aoe-hooks-<effective uid>/<instance id>/`. AoE reads that report and writes `integration-<plugin id>.reply.json` in the same directory after the user responds. Both files must be regular files owned by the host's effective uid with exact mode `0600`; reports are limited to 64 KiB and rejected when their modification time is more than 15 seconds old or in the future. Providers should refresh reports at least every 15 seconds. `writer_pid` must identify a live process while the report is consumed.
+
+AoE owns report validation and reply creation. The provider owns reading and removing its reply file after processing it; AoE replaces it on the next response and removes the per-instance directory during hook-status cleanup. This is a same-user trust boundary: file ownership and a live `writer_pid` do not authenticate a provider against another process running as the same uid. When `replies = false`, AoE drops any prompt from the report and does not offer provider-native replies.
+
+The snapshot's `revision` changes only when the prompt changes, not when runtime status changes. Single-choice questions require exactly one selected option or a nonblank custom answer. Enter selects the highlighted option for an unanswered single-choice question before advancing or submitting; custom answers and multi-choice selections are preserved. The response dialog stays open for incomplete answers.
+
+Shell-hook sidecars and native-plugin reports remain distinct transports. Native reports retain their heartbeat and live-writer checks; shell hooks keep their existing freshness and publisher rules. Both reuse hardened host I/O and the established guarded session-identity persistence path where applicable. Declaring launch or reply metadata does not install hooks or companion extensions.
 
 ## Plugin id
 
@@ -91,6 +105,7 @@ Capabilities gate plugin resource access and host interactions. They are prompte
 | `session.prompt` | Delivering a turn to a session the plugin created via `sessions.turn.send`, and the initial turn on `sessions.create` (`api_version >= 9`). |
 | `session.unattended` | Creating a session in a host-classified *unattended* approval mode. A distinct, high-severity grant, never implied by `session.create` or `session.prompt` (`api_version >= 9`). See [Session-driving RPCs](#session-driving-rpcs). |
 | `session.message` | Pushing a text message into **any** session, including ones the plugin did not create, via `sessions.message.send`. A structured session shows the message as sent by the plugin, and the call reaches sessions the plugin did not create, so it is a separate grant, never implied by `session.prompt` (`api_version >= 15`). |
+| `session.integration` | Provider-native status and user-requested replies for an agent (`api_version >= 19`). Launch-only agent metadata does not require this capability. |
 
 A capability this host version does not recognize is rejected, not granted.
 

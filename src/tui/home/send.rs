@@ -7,7 +7,7 @@ use super::*;
 pub(super) fn permission_response_tokens(
     response: &crate::agents::PermissionResponse,
     choice: crate::tui::dialogs::PermissionResponseChoice,
-) -> Option<&'static [crate::agents::KeyToken]> {
+) -> Option<&'static [crate::agents::KeyToken<'static>]> {
     use crate::tui::dialogs::PermissionResponseChoice::*;
     match choice {
         Allow => Some(response.allow),

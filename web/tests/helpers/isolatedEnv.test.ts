@@ -43,6 +43,7 @@ const NON_SUFFIX_HOST_STATE: Record<string, string> = {
   AOE_E2E_STORAGE_LOCK_CONTENDED: `${HOST}/lock-contended`,
   AOE_PROJECT_FIFO_TEST_CHILD: "host-test-child",
   AOE_PROJECT_FIFO_TEST_ENTERED: `${HOST}/fifo-test-entered`,
+  AOE_HOOK_ATOMIC_UMASK_CHILD_BASE: `${HOST}/hook-umask-fixture`,
   AOE_PRIME_CENSUS_CHILD: "1",
   AOE_RUNNER_EXPIRY_CHILD: "host-test-child",
   AOE_TUI_TEST_CHILD: "host-test-child",

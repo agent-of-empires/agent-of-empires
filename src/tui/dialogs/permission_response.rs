@@ -45,10 +45,13 @@ pub enum PermissionResponseChoice {
     Deny,
 }
 
-struct StructuredApprovalDetail {
-    tool_name: String,
-    target: String,
-    destructive: bool,
+enum ApprovalDetail {
+    Integration(String),
+    Structured {
+        tool_name: String,
+        target: String,
+        destructive: bool,
+    },
 }
 
 pub struct PermissionResponseDialog {
@@ -57,10 +60,7 @@ pub struct PermissionResponseDialog {
     focused: usize,
     /// Whether `choices` includes `AllowAlways`, computed once in `new`.
     supports_allow_always: bool,
-    /// `Some` for a structured ACP approval: the dialog shows what is being
-    /// approved and drops the terminal-only "raw keystrokes" guidance, which
-    /// does not hold on the ACP path.
-    detail: Option<StructuredApprovalDetail>,
+    detail: Option<ApprovalDetail>,
     /// Click rects parallel to `choices`.
     choice_rects: Vec<Rect>,
     /// The hovered choice. Visual only; never moves `focused`.
@@ -76,9 +76,17 @@ const ALL_CHOICES: [(&str, PermissionResponseChoice); 3] = [
 impl PermissionResponseDialog {
     pub fn new(
         session_title: &str,
-        allow_always: Option<&'static [crate::agents::KeyToken]>,
+        allow_always: Option<&'static [crate::agents::KeyToken<'static>]>,
     ) -> Self {
         Self::build(session_title, allow_always.is_some(), None)
+    }
+
+    pub fn integration(session_title: &str, prompt_title: &str, allow_always: bool) -> Self {
+        Self::build(
+            session_title,
+            allow_always,
+            Some(ApprovalDetail::Integration(prompt_title.to_owned())),
+        )
     }
 
     /// Show the ACP tool, target and destructive flag before resolving its request.
@@ -91,7 +99,7 @@ impl PermissionResponseDialog {
         Self::build(
             session_title,
             true,
-            Some(StructuredApprovalDetail {
+            Some(ApprovalDetail::Structured {
                 tool_name: tool_name.to_owned(),
                 target: target.to_owned(),
                 destructive,
@@ -102,7 +110,7 @@ impl PermissionResponseDialog {
     fn build(
         session_title: &str,
         supports_allow_always: bool,
-        detail: Option<StructuredApprovalDetail>,
+        detail: Option<ApprovalDetail>,
     ) -> Self {
         let choices = ALL_CHOICES
             .into_iter()
@@ -186,21 +194,27 @@ impl PermissionResponseDialog {
             Style::default().fg(theme.title).bold(),
         )));
         match &self.detail {
-            Some(detail) => {
-                let warning = if detail.destructive {
-                    "destructive: "
-                } else {
-                    ""
-                };
+            Some(ApprovalDetail::Integration(title)) => {
+                header_lines.push(Line::from(Span::styled(
+                    truncate_to_width(title, width),
+                    Style::default().fg(theme.text),
+                )));
+            }
+            Some(ApprovalDetail::Structured {
+                tool_name,
+                target,
+                destructive,
+            }) => {
+                let warning = if *destructive { "destructive: " } else { "" };
                 header_lines.push(Line::from(vec![
                     Span::styled(warning, Style::default().fg(theme.error).bold()),
                     Span::styled(
-                        truncate_to_width(&detail.tool_name, width.saturating_sub(warning.len())),
+                        truncate_to_width(tool_name, width.saturating_sub(warning.len())),
                         Style::default().fg(theme.text),
                     ),
                 ]));
                 header_lines.push(Line::from(Span::styled(
-                    truncate_to_width(&detail.target, width),
+                    truncate_to_width(target, width),
                     Style::default().fg(theme.text),
                 )));
             }
@@ -272,7 +286,7 @@ mod tests {
     /// Stand-in for a real agent's `allow_always` mapping. `Some(&[])` would
     /// also satisfy `.is_some()` but reads as "supported with zero
     /// keystrokes", a footgun if copy-pasted into a real `AgentDef`.
-    const ALLOW_ALWAYS: Option<&[crate::agents::KeyToken]> =
+    const ALLOW_ALWAYS: Option<&[crate::agents::KeyToken<'static>]> =
         Some(&[crate::agents::KeyToken::Literal("2")]);
 
     fn dialog() -> PermissionResponseDialog {
@@ -402,5 +416,32 @@ mod tests {
                 assert!(out.contains(context), "missing {context:?}:\n{out}");
             }
         }
+    }
+
+    #[test]
+    fn provider_approval_renders_the_provider_prompt_title() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let theme = crate::tui::styles::load_theme_with_mode("empire", false);
+        let mut dialog = PermissionResponseDialog::integration(
+            "session-one",
+            "Delete the production database?",
+            false,
+        );
+        let mut terminal = Terminal::new(TestBackend::new(80, 12)).unwrap();
+        terminal
+            .draw(|frame| dialog.render(frame, frame.area(), &theme))
+            .unwrap();
+        let output: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+
+        assert!(output.contains("session-one"));
+        assert!(output.contains("Delete the production database?"));
     }
 }
