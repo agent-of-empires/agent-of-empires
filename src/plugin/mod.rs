@@ -20,6 +20,7 @@ pub(crate) mod automation_policy;
 pub mod host;
 pub mod host_api;
 pub mod mcp_rewrite;
+pub mod mcp_serve;
 pub mod protocol;
 pub mod sandbox;
 pub mod session_api;

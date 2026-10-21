@@ -904,6 +904,10 @@ mod tests {
         fn report_failure(&self, _plugin_id: &str, _message: &str) {
             unreachable!("plugin MCP forwarding reports no host failures")
         }
+
+        fn report_serve_failure(&self, _plugin_id: &str, _message: &str) {
+            unreachable!("plugin MCP forwarding reports no host failures")
+        }
     }
 
     struct Fake {

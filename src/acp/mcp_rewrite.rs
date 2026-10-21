@@ -195,18 +195,24 @@ impl WireServer {
     }
 }
 
-pub fn request_params(ctx: &McpRewriteContext, servers: &[ProjectMcpServer]) -> Value {
+/// The session description every plugin callback carries.
+pub fn context_params(ctx: &McpRewriteContext) -> Value {
     let mut params = json!({
         "session_id": ctx.session_id,
         "agent": ctx.agent,
         "sandboxed": ctx.sandboxed(),
         "profile": ctx.profile,
         "cwd": ctx.cwd,
-        "servers": servers.iter().map(WireServer::from).collect::<Vec<_>>(),
     });
     if let Some(sandbox) = &ctx.sandbox {
         params["sandbox"] = json!(sandbox);
     }
+    params
+}
+
+pub fn request_params(ctx: &McpRewriteContext, servers: &[ProjectMcpServer]) -> Value {
+    let mut params = context_params(ctx);
+    params["servers"] = json!(servers.iter().map(WireServer::from).collect::<Vec<_>>());
     params
 }
 
