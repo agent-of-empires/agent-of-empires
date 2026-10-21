@@ -329,6 +329,21 @@ describe("read-only policy", () => {
   });
 });
 
+describe("transport reason", () => {
+  it("keeps the reason only while on the snapshot fallback", () => {
+    const { result, ws } = mount();
+    ws.deliver({ type: "transport", grid: false, reason: "pipe_owned" });
+    expect(result.current.state).toMatchObject({ transport: "snapshot", transportReason: "pipe_owned" });
+
+    ws.deliver({ type: "transport", grid: false });
+    expect(result.current.state).toMatchObject({ transport: "snapshot", transportReason: null });
+
+    ws.deliver({ type: "transport", grid: false, reason: "pipe_owned" });
+    ws.deliver({ type: "transport", grid: true });
+    expect(result.current.state).toMatchObject({ transport: "grid", transportReason: null });
+  });
+});
+
 describe("size owner", () => {
   it("claims a vacant lock on open and waits for the owner verdict", () => {
     const { result, ws } = mount();
