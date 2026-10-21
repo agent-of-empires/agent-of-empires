@@ -130,15 +130,24 @@ async fn persist_failure_response(
         "failed to persist {what}: {err:#}"
     );
     // `shutdown_and_wait` can return Ok at its deadline without a confirmed stop.
-    let stopped = state
+    let shutdown_ok = state
         .acp_supervisor
         .shutdown_and_wait(id, std::time::Duration::from_secs(5))
         .await
-        .is_ok()
-        && state.acp_supervisor.worker_state(id).await == crate::daemon::AcpWorkerState::Absent;
-    let outcome = if stopped {
-        // The reconciler skips a session it already attempted unless asked.
+        .is_ok();
+    let worker_state = state.acp_supervisor.worker_state(id).await;
+    let stopped = shutdown_ok && worker_state == crate::daemon::AcpWorkerState::Absent;
+    // The reconciler skips a session it already attempted unless asked, and a
+    // teardown still in flight settles after this returns.
+    if stopped
+        || matches!(
+            worker_state,
+            crate::daemon::AcpWorkerState::Resuming | crate::daemon::AcpWorkerState::Stopping
+        )
+    {
         state.acp_supervisor.request_respawn(id);
+    }
+    let outcome = if stopped {
         "the worker was stopped and the stored value is unchanged; retry"
     } else {
         "the worker may still be running the unsaved change"
