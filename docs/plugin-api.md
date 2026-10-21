@@ -8,7 +8,7 @@ A manifest carries two independent version axes.
 
 | Key | Meaning |
 |---|---|
-| `api_version` | The manifest *schema* version. The current schema is `18`. The host rejects a manifest whose `api_version` is newer than it supports. |
+| `api_version` | The manifest *schema* version. The current schema is `19`. The host rejects a manifest whose `api_version` is newer than it supports. |
 | `aoe_version` | A semver requirement on the *host app* version, e.g. `">=1.11.0, <2.0.0"`. The host refuses to install, and skips loading, a plugin whose requirement excludes the running version. Optional; requires `api_version >= 4`. |
 
 Each key below notes the `api_version` it needs. Target the newest schema your plugin uses, and set `aoe_version` to the host range you have tested.
@@ -30,12 +30,35 @@ capabilities = ["runtime.worker"]
 | `id` | string | yes | Plugin id (see [Plugin id](#plugin-id)). Namespaces config, events, and action names. |
 | `name` | string | yes | Human-readable display name. |
 | `version` | string | yes | Semantic version of the plugin. |
-| `api_version` | integer | yes | Manifest schema version, `1` to `18`. |
+| `api_version` | integer | yes | Manifest schema version, `1` to `19`. |
 | `description` | string | no | Shown in plugin listings. Defaults to empty. |
 | `aoe_version` | string | no | Host-app semver requirement. Requires `api_version >= 4`. |
 | `capabilities` | array of string | no | Runtime grants the worker needs (see [Capabilities](#capabilities)). Static contributions need none. |
 | `screenshots` | array | no | Up to 8. Requires `api_version >= 5`. See [Screenshots](#screenshots). |
 | `setting_defaults` | table | no | Overrides for core host settings, keyed by canonical path (e.g. `"theme.idle_decay_minutes"`). Resolution is user value, then plugin override, then core default. |
+| `agent_integrations` | array of tables | no | Optional agent launch metadata. Requires `api_version >= 19`. |
+
+
+## Agent integrations
+
+
+An agent integration declares an optional launch command for an agent tool. Active plugins with a command contribute that tool to AoE's agent picker and CLI when the name is unique across plugin declarations and does not collide with a built-in or configured custom agent.
+
+Available plugin agents can be selected with `session.default_tool`. Discovery checks the executable after leading `NAME=value` assignments, using the process PATH and then the user's login shell without running the agent command or its arguments.
+
+
+```toml
+[[agent_integrations]]
+tool = "session-agent"
+command = "session-agent"
+```
+
+
+| Key | Type | Required | Notes |
+|---|---|---|---|
+| `tool` | string | yes | Lowercase agent id; each tool may appear only once per plugin. |
+| `command` | string | no | Default launch command for this agent. |
+
 
 ## Plugin id
 
@@ -43,7 +66,7 @@ A dotted, lowercase ASCII identifier such as `dev.example.review-helper`. Each d
 
 ## Capabilities
 
-Capabilities gate runtime resource access. They are prompted once at install and pinned to the manifest hash, so an update that widens them must be re-approved. Declare only what the worker uses; static contributions (commands, keybinds, themes, ui, status) need none.
+Capabilities gate plugin resource access and host interactions. They are prompted once at install and pinned to the manifest hash, so an update that widens them must be re-approved. Declare only the capabilities the plugin uses; static contributions (commands, keybinds, themes, ui, status) need none.
 
 | Capability | Grants |
 |---|---|

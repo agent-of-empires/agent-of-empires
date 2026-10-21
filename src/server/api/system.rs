@@ -184,6 +184,29 @@ pub async fn list_agents(State(state): State<Arc<AppState>>) -> Json<Vec<AgentIn
                 }
             })
             .collect::<Vec<_>>();
+        let registry = crate::plugin::registry();
+        let plugin_agents = crate::plugin::agent_integration::catalog(
+            &registry,
+            crate::agents::AGENTS.iter().map(|agent| agent.name),
+            custom_agents.keys().map(String::as_str),
+        );
+        for integration in plugin_agents {
+            agents.push(AgentInfo {
+                kind: "plugin".to_string(),
+                name: integration.tool.to_string(),
+                binary: integration.tool.to_string(),
+                host_only: false,
+                installed: available.iter().any(|name| name == integration.tool),
+                install_hint: "Provided by an enabled AoE plugin".to_string(),
+                oneshot_capable: false,
+                acp_capable: false,
+                acp_installed: false,
+                acp_allowed: policy.allows(integration.tool),
+                acp_command: None,
+                acp_args: Vec::new(),
+                lifecycle: crate::agents::AgentLifecycle::Active,
+            });
+        }
         agents.extend(build_custom_agent_infos(
             &custom_agents,
             &agent_acp_cmd,

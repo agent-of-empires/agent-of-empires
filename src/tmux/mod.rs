@@ -2254,6 +2254,59 @@ fn agent_probe_output(
     }
 }
 
+fn plugin_command_available(
+    command: &str,
+    login_shell: bool,
+    cancel: Option<&tokio_util::sync::CancellationToken>,
+) -> bool {
+    if cancel.is_some_and(tokio_util::sync::CancellationToken::is_cancelled) {
+        return false;
+    }
+    let Ok(words) = shell_words::split(command) else {
+        return false;
+    };
+    let assignments = words
+        .iter()
+        .take_while(|word| {
+            word.split_once('=')
+                .is_some_and(|(key, _)| crate::session::environment::is_valid_env_key(key))
+        })
+        .count();
+    let Some(binary) = words.get(assignments) else {
+        return false;
+    };
+    let path_override = words[..assignments]
+        .iter()
+        .rev()
+        .find_map(|word| word.strip_prefix("PATH="));
+    let on_path = match path_override {
+        Some(path) => std::env::current_dir()
+            .ok()
+            .is_some_and(|cwd| which::which_in(binary, Some(path), cwd).is_ok()),
+        None => which::which(binary).is_ok(),
+    };
+    if on_path || !login_shell {
+        return on_path;
+    }
+
+    let mut probe = String::new();
+    for assignment in &words[..assignments] {
+        let (key, value) = assignment.split_once('=').unwrap();
+        probe.push_str(key);
+        probe.push('=');
+        probe.push_str(&shell_words::quote(value));
+        probe.push(' ');
+    }
+    probe.push_str("command -v ");
+    probe.push_str(&shell_words::quote(binary));
+    agent_probe_output(
+        Command::new(crate::session::user_shell()).args(["-lc", &probe]),
+        LOGIN_SHELL_PROBE_TIMEOUT,
+        cancel,
+    )
+    .is_some_and(|output| output.status.success())
+}
+
 fn agent_available_direct(
     agent: &crate::agents::AgentDef,
     cancel: Option<&tokio_util::sync::CancellationToken>,
@@ -2531,7 +2584,7 @@ impl AvailableTools {
     /// Startup's local snapshot. Login shells and executable probes run later.
     pub(crate) fn detect_on_path() -> Self {
         let refs: Vec<_> = crate::agents::AGENTS.iter().collect();
-        Self::from_detected(agent_availability_snapshot(&refs))
+        Self::from_detected(agent_availability_snapshot(&refs), false, None)
     }
 
     pub fn detect() -> Self {
@@ -2539,7 +2592,7 @@ impl AvailableTools {
         let agents = crate::agents::AGENTS;
         let refs: Vec<&crate::agents::AgentDef> = agents.iter().collect();
         let found = probe_agents_available(&refs);
-        Self::from_detected(found)
+        Self::from_detected(found, true, None)
     }
 
     pub(crate) fn detect_cancellable(
@@ -2547,10 +2600,18 @@ impl AvailableTools {
         force: bool,
     ) -> Self {
         let refs: Vec<_> = crate::agents::AGENTS.iter().collect();
-        Self::from_detected(probe_agents_available_inner(&refs, Some(cancel), force))
+        Self::from_detected(
+            probe_agents_available_inner(&refs, Some(cancel), force),
+            true,
+            Some(cancel),
+        )
     }
 
-    fn from_detected(found: HashSet<String>) -> Self {
+    fn from_detected(
+        found: HashSet<String>,
+        login_shell: bool,
+        cancel: Option<&tokio_util::sync::CancellationToken>,
+    ) -> Self {
         let agents = crate::agents::AGENTS;
         let mut available: Vec<String> = agents
             .iter()
@@ -2570,6 +2631,18 @@ impl AvailableTools {
                 .collect();
             custom.sort();
             available.extend(custom);
+        }
+        let registry = crate::plugin::registry();
+        let plugin_agents = crate::plugin::agent_integration::catalog(
+            &registry,
+            agents.iter().map(|agent| agent.name),
+            available.iter().map(String::as_str),
+        );
+        for agent in plugin_agents {
+            let installed = plugin_command_available(agent.command, login_shell, cancel);
+            if installed {
+                available.push(agent.tool.to_string());
+            }
         }
 
         Self { available }
@@ -2791,6 +2864,59 @@ mod tests {
             !memo.is_populated(),
             "full detection still needs a fresh probe"
         );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    #[serial_test::serial]
+    fn plugin_command_availability_handles_shell_launches() {
+        if run_probe_test_in_subprocess() {
+            return;
+        }
+        use std::os::unix::fs::PermissionsExt;
+        let home = tempfile::tempdir().unwrap();
+        let _env = probe_environment(home.path());
+        let login_bin = home.path().join("login-bin");
+        std::fs::create_dir(&login_bin).unwrap();
+        let executed = home.path().join("executed");
+        for path in [
+            home.path().join("bin/direct-agent"),
+            login_bin.join("login-agent"),
+        ] {
+            std::fs::write(
+                &path,
+                format!("#!/bin/sh\n/bin/touch {}\n", executed.display()),
+            )
+            .unwrap();
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        std::fs::write(
+            home.path().join("bin/login-shell"),
+            format!(
+                "#!/bin/sh\nexport PATH={}:$PATH\nexec /bin/sh -c \"$2\"\n",
+                login_bin.display()
+            ),
+        )
+        .unwrap();
+        let injected = format!("login-agent \"$(/bin/touch {})\"", executed.display());
+        let cases = [
+            ("direct-agent", true),
+            ("TOKEN=local direct-agent", true),
+            ("login-agent", true),
+            ("TOKEN=local login-agent", true),
+            (injected.as_str(), true),
+            ("PATH=/missing direct-agent", false),
+            ("TOKEN=local", false),
+            ("9INVALID=local direct-agent", false),
+        ];
+        let failures: Vec<_> = cases
+            .into_iter()
+            .filter(|(command, expected)| {
+                plugin_command_available(command, true, None) != *expected
+            })
+            .collect();
+        assert!(!executed.exists(), "discovery must not execute the agent");
+        assert!(failures.is_empty(), "{failures:?}");
     }
 
     #[test]

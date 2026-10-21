@@ -1366,20 +1366,7 @@ fn resolve_tool_for_add(args: &AddArgs, config: &crate::session::Config) -> Resu
     } else {
         let available_tools = crate::tmux::AvailableTools::detect();
         let tools_list = available_tools.available_list();
-        config
-            .session
-            .default_tool
-            .as_deref()
-            .and_then(|name| {
-                if config.session.custom_agents.contains_key(name) {
-                    Some(name)
-                } else {
-                    crate::agents::resolve_tool_name(name)
-                }
-            })
-            .or_else(|| tools_list.first().map(|s| s.as_str()))
-            .unwrap_or("claude")
-            .to_string()
+        default_tool_for_add(&config.session, tools_list).to_string()
     };
 
     if let Some(notice) =
@@ -1388,6 +1375,25 @@ fn resolve_tool_for_add(args: &AddArgs, config: &crate::session::Config) -> Resu
         eprintln!("Warning: {tool_name} is {notice}");
     }
     Ok(tool_name)
+}
+
+fn default_tool_for_add<'a>(
+    config: &'a crate::session::config::SessionConfig,
+    available: &'a [String],
+) -> &'a str {
+    config
+        .default_tool
+        .as_deref()
+        .and_then(|name| {
+            if config.custom_agents.contains_key(name) || available.iter().any(|tool| tool == name)
+            {
+                Some(name)
+            } else {
+                crate::agents::resolve_tool_name(name)
+            }
+        })
+        .or_else(|| available.first().map(String::as_str))
+        .unwrap_or("claude")
 }
 
 fn detect_tool(cmd: &str) -> Result<String> {
@@ -1473,6 +1479,9 @@ fn resolve_named_tool(tool: &str, config: &crate::session::Config) -> Result<Nam
         return Ok(NamedToolSelection::Custom(name.to_string()));
     }
 
+    if crate::plugin::agent_integration::agent_command(name).is_some() {
+        return Ok(NamedToolSelection::Custom(name.to_string()));
+    }
     if let Some(tool_name) = crate::agents::resolve_tool_name(name) {
         if let Some(agent_def) = crate::agents::get_agent(tool_name) {
             if !crate::tmux::is_agent_available(agent_def) {
@@ -1534,6 +1543,25 @@ mod tests {
     use crate::session::config::repo_config::TrustSurface;
     use crate::session::config::SessionConfig;
     use crate::session::HooksConfig;
+
+    #[test]
+    fn plugin_default_tool_precedes_availability_fallback() {
+        let available = vec!["claude".to_string(), "plugin-agent".to_string()];
+        let mut config = SessionConfig::default();
+        config
+            .custom_agents
+            .insert("custom-agent".into(), "custom-command".into());
+        for (configured, expected) in [
+            (Some("plugin-agent"), "plugin-agent"),
+            (Some("custom-agent"), "custom-agent"),
+            (Some("codex"), "codex"),
+            (Some("unregistered-harness"), "claude"),
+            (None, "claude"),
+        ] {
+            config.default_tool = configured.map(str::to_owned);
+            assert_eq!(super::default_tool_for_add(&config, &available), expected);
+        }
+    }
 
     #[test]
     fn declined_trust_keeps_personal_on_create_hooks_only() {

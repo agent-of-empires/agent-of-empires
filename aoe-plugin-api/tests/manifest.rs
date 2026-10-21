@@ -35,6 +35,55 @@ fn minimal_manifest_parses_and_round_trips() {
 }
 
 #[test]
+fn agent_integrations_require_api19_and_validate_unique_launch_tools() {
+    let valid = r#"
+id = "acme.session-agent"
+name = "Session Agent"
+version = "0.1.0"
+api_version = 19
+[[agent_integrations]]
+tool = "session-agent"
+command = "session-agent --"
+"#;
+    let parsed = PluginManifest::from_toml_str(valid).expect("valid launch declaration parses");
+    assert_eq!(parsed.agent_integrations[0].tool, "session-agent");
+    assert_eq!(
+        parsed.agent_integrations[0].command.as_deref(),
+        Some("session-agent --")
+    );
+
+    let cases = [
+        (
+            valid.replace("api_version = 19", "api_version = 18"),
+            "agent_integrations require api_version >= 19",
+        ),
+        (
+            valid.replace("tool = \"session-agent\"", "tool = \"Session-Agent\""),
+            "lowercase agent id",
+        ),
+        (
+            valid.replace("tool = \"session-agent\"", "tool = \"\""),
+            "nonempty lowercase agent id",
+        ),
+        (
+            format!("{valid}\n[[agent_integrations]]\ntool = \"session-agent\"\n"),
+            "must not repeat tool",
+        ),
+        (
+            valid.replace("command = \"session-agent --\"", "command = \"\""),
+            "command must not be blank",
+        ),
+    ];
+    for (toml, expected_error) in cases {
+        let error = PluginManifest::from_toml_str(&toml).unwrap_err();
+        assert!(
+            matches!(&error, ManifestError::Invalid(errors) if errors.iter().any(|item| item.contains(expected_error))),
+            "expected {expected_error:?}, got {error:?}"
+        );
+    }
+}
+
+#[test]
 fn contribution_sections_parse() {
     let m = parse(
         4,
