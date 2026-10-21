@@ -912,6 +912,10 @@ pub async fn create_session(
     if body.view == crate::session::View::Structured || importing {
         let profile = validation_profile.to_string();
         let project_path = std::path::PathBuf::from(&body.path);
+        // These launch in a directory provisioned later, not `body.path`.
+        let launch_dir_known = !(body.scratch
+            || create_body_uses_worktree(&body)
+            || !body.extra_repo_paths.is_empty());
         let (tool, agent_name) = (body.tool.clone(), body.agent_name.clone());
         let (command_override, sandboxed) = (body.command_override.clone(), body.sandbox);
         let missing = tokio::task::spawn_blocking(move || {
@@ -927,7 +931,7 @@ pub async fn create_session(
                 agent_name: agent_name.as_deref(),
                 command_override: &command_override,
                 sandboxed,
-                project_path: &project_path,
+                project_path: launch_dir_known.then_some(project_path.as_path()),
             };
             match validate_structured_choice(&choice, &config) {
                 Err(StructuredChoiceError::AdapterMissing(msg)) => Some(msg),

@@ -1166,7 +1166,9 @@ pub mod structured {
         pub agent_name: Option<&'a str>,
         pub command_override: &'a str,
         pub sandboxed: bool,
-        pub project_path: &'a std::path::Path,
+        /// Where the session launches, or `None` while that directory doesn't exist yet
+        /// (a worktree, scratch or multi-repo session checked before provisioning).
+        pub project_path: Option<&'a std::path::Path>,
     }
 
     /// Pre-create validation for an explicit structured-view choice, run BEFORE any worktree,
@@ -1176,12 +1178,20 @@ pub mod structured {
         choice: &StructuredChoice<'_>,
         config: &crate::session::Config,
     ) -> Result<(), StructuredChoiceError> {
-        validate_structured_choice_with(choice, config, std::env::var_os("PATH").as_deref())
+        validate_structured_choice_with(
+            choice,
+            config,
+            &crate::session::environment::resolve_host_environment_pairs(&config.environment),
+            std::env::var_os("PATH").as_deref(),
+        )
     }
 
+    /// `host_environment` is `config.environment` resolved, passed in so a caller checking
+    /// several agents resolves it once.
     pub(super) fn validate_structured_choice_with(
         choice: &StructuredChoice<'_>,
         config: &crate::session::Config,
+        host_environment: &[(String, String)],
         inherited_path: Option<&std::ffi::OsStr>,
     ) -> Result<(), StructuredChoiceError> {
         let agent = choice
@@ -1219,7 +1229,13 @@ pub mod structured {
                 }
             },
         };
-        if adapter_reachable_with(&spec.command, choice.project_path, config, inherited_path) {
+        if adapter_reachable_with(
+            &spec.command,
+            choice.project_path,
+            config,
+            host_environment,
+            inherited_path,
+        ) {
             return Ok(());
         }
         let hint = crate::acp::install_hints::install_hint_for(&spec.command)
@@ -1232,39 +1248,51 @@ pub mod structured {
     }
 
     /// Whether `agent` is ACP-capable and its adapter passes the create check, for the agent
-    /// list. With no project to search from, relative PATH entries resolve from the daemon's cwd.
-    pub fn adapter_installed(agent: &str, config: &crate::session::Config) -> bool {
-        let cwd = std::env::current_dir().unwrap_or_default();
+    /// list. There is no project to search from, so relative PATH entries pass.
+    pub fn adapter_installed(
+        agent: &str,
+        config: &crate::session::Config,
+        host_environment: &[(String, String)],
+    ) -> bool {
         let choice = StructuredChoice {
             tool: agent,
             agent_name: None,
             command_override: "",
             sandboxed: false,
-            project_path: &cwd,
+            project_path: None,
         };
-        validate_structured_choice(&choice, config).is_ok()
+        validate_structured_choice_with(
+            &choice,
+            config,
+            host_environment,
+            std::env::var_os("PATH").as_deref(),
+        )
+        .is_ok()
     }
 
     /// Whether the adapter can launch, judged as the runner does: the daemon's lookup, or the
-    /// configured PATH searched from the project. `before_session` hooks may set PATH at
-    /// spawn, so with any configured the adapter is given the benefit of the doubt.
+    /// configured PATH searched from the session's directory. Given the benefit of the doubt
+    /// when that can't be known yet: any `before_session` hook may set PATH at spawn, and a
+    /// relative PATH entry resolves in a directory that `on_create` hooks may still fill.
     pub fn adapter_reachable(
         command: &str,
-        project_path: &std::path::Path,
+        project_path: Option<&std::path::Path>,
         config: &crate::session::Config,
     ) -> bool {
         adapter_reachable_with(
             command,
             project_path,
             config,
+            &crate::session::environment::resolve_host_environment_pairs(&config.environment),
             std::env::var_os("PATH").as_deref(),
         )
     }
 
     fn adapter_reachable_with(
         command: &str,
-        project_path: &std::path::Path,
+        project_path: Option<&std::path::Path>,
         config: &crate::session::Config,
+        host_environment: &[(String, String)],
         inherited_path: Option<&std::ffi::OsStr>,
     ) -> bool {
         use crate::acp::acp_client::{is_bare_command, on_agent_path, resolve_agent_command};
@@ -1274,14 +1302,30 @@ pub mod structured {
             return !checkable || crate::cli::acp::command_present(command);
         }
         let app_dir = crate::session::get_app_dir().ok();
-        resolve_agent_command(command, app_dir.as_deref()).is_ok()
+        if resolve_agent_command(command, app_dir.as_deref()).is_ok()
             || !config.host_hooks.before_session.is_empty()
-            || on_agent_path(
-                command,
-                project_path,
-                &crate::session::environment::resolve_host_environment_pairs(&config.environment),
-                inherited_path,
-            )
+        {
+            return true;
+        }
+        match project_path {
+            Some(cwd) => on_agent_path(command, cwd, host_environment, inherited_path),
+            None => {
+                let agent_path = host_environment
+                    .iter()
+                    .rev()
+                    .find(|(key, _)| key == "PATH")
+                    .map(|(_, path)| std::ffi::OsString::from(path))
+                    .or_else(|| inherited_path.map(std::ffi::OsStr::to_os_string));
+                agent_path
+                    .is_some_and(|path| std::env::split_paths(&path).any(|dir| dir.is_relative()))
+                    || on_agent_path(
+                        command,
+                        std::path::Path::new("/"),
+                        host_environment,
+                        inherited_path,
+                    )
+            }
+        }
     }
 
     /// Apply a validated structured-view choice to a freshly-built instance:
@@ -1611,187 +1655,142 @@ mod tests {
             }
             config
         };
-        let configured = [format!("PATH={}", bin.display())];
+        let configured = vec![format!("PATH={}", bin.display())];
         let missing_text = "is not installed or not on $PATH";
         let missing = Some(missing_text);
         let not_capable = Some("is not ACP-capable");
-        // (tool, agent_name, override, sandboxed, project, environment, hooks, inherited PATH, expected)
-        type Case<'a> = (
-            &'a str,
-            Option<&'a str>,
-            &'a str,
-            bool,
-            &'a std::path::Path,
-            &'a [String],
-            bool,
-            Option<&'a str>,
-            Option<&'a str>,
-        );
-        let cases: [Case; 12] = [
-            (
-                "fake",
-                None,
-                "",
-                false,
-                project.path(),
-                &[],
-                false,
-                None,
-                missing,
-            ),
-            (
-                "fake",
-                None,
-                "",
-                false,
-                project.path(),
-                &configured,
-                false,
-                None,
-                None,
-            ),
-            (
-                "fake",
-                None,
-                "",
-                false,
-                project.path(),
-                &[],
-                false,
-                Some("agent-bin"),
-                None,
-            ),
-            (
-                "fake",
-                None,
-                "",
-                false,
-                elsewhere.path(),
-                &[],
-                false,
-                Some("agent-bin"),
-                missing,
-            ),
-            (
-                "fake",
-                None,
-                "my-wrapper acp",
-                false,
-                project.path(),
-                &[],
-                false,
-                None,
-                None,
-            ),
-            (
-                "fake",
-                None,
-                "",
-                true,
-                project.path(),
-                &[],
-                false,
-                None,
-                None,
-            ),
-            (
-                "fake",
-                None,
-                "",
-                false,
-                project.path(),
-                &[],
-                true,
-                None,
-                None,
-            ),
-            (
-                "claude",
-                Some("fake"),
-                "",
-                false,
-                project.path(),
-                &[],
-                false,
-                None,
-                missing,
-            ),
-            (
-                "aoe-test-not-acp",
-                None,
-                "",
-                false,
-                project.path(),
-                &[],
-                false,
-                None,
-                not_capable,
-            ),
-            (
-                "fake-path",
-                None,
-                "",
-                false,
-                project.path(),
-                &[],
-                false,
-                None,
-                missing,
-            ),
-            (
-                "fake-present-path",
-                None,
-                "",
-                false,
-                project.path(),
-                &[],
-                false,
-                None,
-                None,
-            ),
-            // A configured PATH replaces the inherited one, as at spawn.
-            (
-                "fake",
-                None,
-                "",
-                false,
-                project.path(),
-                &[format!("PATH={}", elsewhere.path().display())],
-                false,
-                Some("agent-bin"),
-                missing,
-            ),
+        struct Case<'a> {
+            label: &'a str,
+            tool: &'a str,
+            agent_name: Option<&'a str>,
+            command_override: &'a str,
+            sandboxed: bool,
+            /// `None`: a worktree, scratch or multi-repo session checked before it exists.
+            project: Option<&'a std::path::Path>,
+            environment: Vec<String>,
+            before_session_hook: bool,
+            inherited_path: Option<&'a str>,
+            /// `None` passes; otherwise a substring of the refusal.
+            expected: Option<&'a str>,
+        }
+        let base = || Case {
+            label: "",
+            tool: "fake",
+            agent_name: None,
+            command_override: "",
+            sandboxed: false,
+            project: Some(project.path()),
+            environment: Vec::new(),
+            before_session_hook: false,
+            inherited_path: None,
+            expected: None,
+        };
+        let cases = [
+            Case {
+                label: "found nowhere",
+                expected: missing,
+                ..base()
+            },
+            Case {
+                label: "on the configured PATH",
+                environment: configured.clone(),
+                ..base()
+            },
+            Case {
+                label: "relative inherited entry, from the project",
+                inherited_path: Some("agent-bin"),
+                ..base()
+            },
+            Case {
+                label: "relative inherited entry, from another directory",
+                project: Some(elsewhere.path()),
+                inherited_path: Some("agent-bin"),
+                expected: missing,
+                ..base()
+            },
+            Case {
+                label: "command override skips the check",
+                command_override: "my-wrapper acp",
+                ..base()
+            },
+            Case {
+                label: "sandboxed skips the check",
+                sandboxed: true,
+                ..base()
+            },
+            Case {
+                label: "a before_session hook may set PATH",
+                before_session_hook: true,
+                ..base()
+            },
+            Case {
+                label: "agent_name overrides the tool",
+                tool: "claude",
+                agent_name: Some("fake"),
+                expected: missing,
+                ..base()
+            },
+            Case {
+                label: "not ACP-capable",
+                tool: "aoe-test-not-acp",
+                expected: not_capable,
+                ..base()
+            },
+            Case {
+                label: "absolute command, missing",
+                tool: "fake-path",
+                expected: missing,
+                ..base()
+            },
+            Case {
+                label: "absolute command, present",
+                tool: "fake-present-path",
+                ..base()
+            },
+            Case {
+                label: "a configured PATH replaces the inherited one, as at spawn",
+                environment: vec![format!("PATH={}", elsewhere.path().display())],
+                inherited_path: Some("agent-bin"),
+                expected: missing,
+                ..base()
+            },
+            Case {
+                label: "launch dir not created yet: a relative entry may resolve there",
+                project: None,
+                inherited_path: Some("agent-bin"),
+                ..base()
+            },
+            Case {
+                label: "launch dir not created yet: absolute entries are still searched",
+                project: None,
+                environment: configured.clone(),
+                ..base()
+            },
+            Case {
+                label: "launch dir not created yet: absolute entries without the adapter",
+                project: None,
+                environment: vec![format!("PATH={}", elsewhere.path().display())],
+                expected: missing,
+                ..base()
+            },
         ];
-        for (
-            tool,
-            agent_name,
-            command_override,
-            sandboxed,
-            project_path,
-            environment,
-            hooks,
-            inherited,
-            expected,
-        ) in cases
-        {
-            let label = format!(
-                "{tool} agent={agent_name:?} override={command_override:?} sandboxed={sandboxed} \
-                 project={} environment={environment:?} hooks={hooks} inherited={inherited:?}",
-                project_path.display()
-            );
+        for case in cases {
+            let label = case.label;
+            let config = config(&case.environment, case.before_session_hook);
             let choice = StructuredChoice {
-                tool,
-                agent_name,
-                command_override,
-                sandboxed,
-                project_path,
+                tool: case.tool,
+                agent_name: case.agent_name,
+                command_override: case.command_override,
+                sandboxed: case.sandboxed,
+                project_path: case.project,
             };
             let got = structured::validate_structured_choice_with(
                 &choice,
-                &config(environment, hooks),
-                inherited.map(std::ffi::OsStr::new),
+                &config,
+                &crate::session::environment::resolve_host_environment_pairs(&config.environment),
+                case.inherited_path.map(std::ffi::OsStr::new),
             );
-            match (got, expected) {
+            match (got, case.expected) {
                 (Ok(()), None) => {}
                 (Err(StructuredChoiceError::AdapterMissing(msg)), Some(want))
                     if want == missing_text =>
@@ -1801,7 +1800,7 @@ mod tests {
                 (Err(StructuredChoiceError::NotCapable(msg)), Some(want)) => {
                     assert!(msg.contains(want), "{label}: {msg}");
                 }
-                (got, _) => panic!("{label}: got {got:?}, expected {expected:?}"),
+                (got, expected) => panic!("{label}: got {got:?}, expected {expected:?}"),
             }
         }
     }

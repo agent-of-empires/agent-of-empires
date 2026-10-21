@@ -2142,7 +2142,9 @@ impl NewSessionDialog {
             agent_name: None,
             command_override: self.command_override.value(),
             sandboxed: self.sandbox_enabled,
-            project_path: std::path::Path::new(if self.scratch { "" } else { &path }),
+            // A worktree or scratch session launches in a directory created later.
+            project_path: (!self.scratch && !self.worktree_enabled)
+                .then(|| std::path::Path::new(&path)),
         };
         if let Err(e) =
             crate::session::builder::structured::validate_structured_choice(&choice, &config)

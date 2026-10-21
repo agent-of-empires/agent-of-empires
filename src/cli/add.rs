@@ -672,17 +672,13 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
                 &mut spec,
             )?;
         }
-        // A sandboxed adapter runs inside the container, which bundles it.
-        let sandboxed =
-            (args.sandbox || args.sandbox_image.is_some() || config.sandbox.enabled_by_default)
-                && containers::get_container_runtime().is_available();
-        if !sandboxed
-            && !crate::session::builder::structured::adapter_reachable(
-                &spec.command,
-                std::path::Path::new(&instance.project_path),
-                &config,
-            )
-        {
+        if structured_adapter_missing(
+            &args,
+            &config,
+            &spec.command,
+            std::path::Path::new(&instance.project_path),
+            || containers::get_container_runtime().is_available(),
+        ) {
             let hint = crate::acp::install_hints::install_hint_for(&spec.command)
                 .unwrap_or("install via your package manager and re-run");
             if user_picked_agent {
@@ -1324,6 +1320,27 @@ fn cleanup_partial_session(
     }
 }
 
+/// Whether a structured `aoe add` must refuse, or fall back, for its adapter. A sandboxed
+/// adapter runs inside the container, which bundles it, so a sandbox the runtime can start
+/// skips the host check.
+fn structured_adapter_missing(
+    args: &AddArgs,
+    config: &crate::session::Config,
+    command: &str,
+    project_path: &std::path::Path,
+    runtime_available: impl FnOnce() -> bool,
+) -> bool {
+    let sandboxed =
+        (args.sandbox || args.sandbox_image.is_some() || config.sandbox.enabled_by_default)
+            && runtime_available();
+    !sandboxed
+        && !crate::session::builder::structured::adapter_reachable(
+            command,
+            Some(project_path),
+            config,
+        )
+}
+
 fn resolve_tool_for_add(args: &AddArgs, config: &crate::session::Config) -> Result<String> {
     let tool_name = if let Some(tool) = &args.tool {
         let selection = resolve_named_tool(tool, config)?;
@@ -1899,6 +1916,85 @@ mod tests {
             match cli.command {
                 Some(Commands::Add(args)) => (profile, *args),
                 _ => panic!("expected an add invocation"),
+            }
+        }
+
+        /// `aoe add` skips the host adapter check only for a sandbox the runtime can start,
+        /// whichever way it was asked for, and otherwise judges the adapter as the create
+        /// check does.
+        #[test]
+        fn structured_adapter_check_follows_the_sandbox_and_the_agent_path() {
+            let project = tempfile::tempdir().unwrap();
+            let bin = tempfile::tempdir().unwrap();
+            let adapter = format!("aoe-test-add-adapter-{}", std::process::id());
+            crate::session::test_support::write_stub_adapter(bin.path(), &adapter);
+            let config = |tweak: &dyn Fn(&mut crate::session::Config)| {
+                let mut config = crate::session::Config::default();
+                tweak(&mut config);
+                config
+            };
+            let plain = config(&|_| {});
+            let on_path =
+                config(&|c| c.environment = vec![format!("PATH={}", bin.path().display())]);
+            let hooked = config(&|c| c.host_hooks.before_session = vec!["true".into()]);
+            let sandbox_default = config(&|c| c.sandbox.enabled_by_default = true);
+            let dir = project.path().to_str().unwrap();
+            // (label, extra argv, config, runtime available, refused)
+            let cases: [(&str, &[&str], &crate::session::Config, bool, bool); 8] = [
+                ("found nowhere", &[], &plain, true, true),
+                ("on the configured PATH", &[], &on_path, true, false),
+                (
+                    "a before_session hook may set PATH",
+                    &[],
+                    &hooked,
+                    true,
+                    false,
+                ),
+                ("--sandbox", &["--sandbox"], &plain, true, false),
+                (
+                    "--sandbox-image",
+                    &["--sandbox-image", "img:1"],
+                    &plain,
+                    true,
+                    false,
+                ),
+                ("sandbox on by default", &[], &sandbox_default, true, false),
+                (
+                    "--sandbox without a runtime",
+                    &["--sandbox"],
+                    &plain,
+                    false,
+                    true,
+                ),
+                (
+                    "sandbox default without a runtime",
+                    &[],
+                    &sandbox_default,
+                    false,
+                    true,
+                ),
+            ];
+            for (label, extra, config, runtime, refused) in cases {
+                let argv: Vec<&str> = ["aoe", "add", dir].iter().chain(extra).copied().collect();
+                let (_, args) = dispatch_argv(&argv);
+                let checked_runtime = std::cell::Cell::new(false);
+                let got = super::super::structured_adapter_missing(
+                    &args,
+                    config,
+                    &adapter,
+                    project.path(),
+                    || {
+                        checked_runtime.set(true);
+                        runtime
+                    },
+                );
+                assert_eq!(got, refused, "{label}");
+                let asked_for_sandbox = !extra.is_empty() || config.sandbox.enabled_by_default;
+                assert_eq!(
+                    checked_runtime.get(),
+                    asked_for_sandbox,
+                    "{label}: runtime probe"
+                );
             }
         }
 

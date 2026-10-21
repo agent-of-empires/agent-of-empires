@@ -130,6 +130,37 @@ pub(crate) fn path_prepended(dir: &Path) -> EnvGuard {
     guard.and_set("PATH", path)
 }
 
+/// Writes an executable stub named `name` into `dir`, for a structured create to find
+/// on hosts without the real ACP adapter (CI runners). It speaks no ACP.
+pub(crate) fn write_stub_adapter(dir: &Path, name: &str) {
+    use std::os::unix::fs::PermissionsExt as _;
+    let stub = dir.join(name);
+    std::fs::write(&stub, "#!/bin/sh\n").expect("write stub adapter");
+    std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755))
+        .expect("make stub adapter executable");
+}
+
+/// Puts a stub `claude-agent-acp` on the configured `environment` PATH, ahead of the
+/// inherited one, so a structured `claude` create passes the adapter check without the
+/// real adapter. Call after isolating the app dir; keep the directory alive.
+pub(crate) fn stub_claude_adapter_on_agent_path() -> tempfile::TempDir {
+    let bin = tempfile::tempdir().expect("stub adapter dir");
+    write_stub_adapter(bin.path(), "claude-agent-acp");
+    let path = std::env::join_paths(
+        std::iter::once(bin.path().to_path_buf()).chain(
+            std::env::var_os("PATH")
+                .iter()
+                .flat_map(std::env::split_paths),
+        ),
+    )
+    .expect("join PATH");
+    crate::session::config::update_config(|config| {
+        config.environment = vec![format!("PATH={}", path.to_string_lossy())];
+    })
+    .expect("configure the stub adapter's PATH");
+    bin
+}
+
 pub(crate) fn install_login_shell_path_command(root: &Path, name: &str, script: &str) -> EnvGuard {
     let bin = root.join("bin");
     std::fs::create_dir_all(&bin).expect("create test bin directory");

@@ -8734,6 +8734,7 @@ done
         <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o755),
     )
     .unwrap();
+    crate::session::test_support::write_stub_adapter(&bin, "claude-agent-acp");
     let path = std::env::join_paths(
         std::iter::once(bin).chain(std::env::split_paths(&std::env::var_os("PATH").unwrap())),
     )

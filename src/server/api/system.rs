@@ -74,7 +74,7 @@ pub struct AgentInfo {
     /// whether a session created for the agent runs in acp or tmux.
     pub acp_capable: bool,
     /// Whether a non-sandboxed structured create would find this agent's ACP adapter
-    /// (the create check, with no project to search relative PATH entries from).
+    /// (the create check, with no project to search relative PATH entries from, so they count).
     pub acp_installed: bool,
     /// True when `[acp] allowed_agents` permits this agent in the structured
     /// view. Deliberately separate from `acp_capable`, which states an intrinsic
@@ -210,9 +210,14 @@ pub async fn list_agents(State(state): State<Arc<AppState>>) -> Json<Vec<AgentIn
             &config.session.agent_detect_as,
             &policy,
         ));
+        let host_environment =
+            crate::session::environment::resolve_host_environment_pairs(&config.environment);
         for agent in agents.iter_mut().filter(|a| a.acp_capable) {
-            agent.acp_installed =
-                crate::session::builder::structured::adapter_installed(&agent.name, &config);
+            agent.acp_installed = crate::session::builder::structured::adapter_installed(
+                &agent.name,
+                &config,
+                &host_environment,
+            );
         }
         agents
     })
