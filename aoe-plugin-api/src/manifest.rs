@@ -654,7 +654,7 @@ pub struct HooksSpec {
     pub mcp_rewrite: Option<McpRewriteHook>,
 }
 
-/// Rewrites the MCP servers AoE forwards to a session's agent (`api_version >= 14`).
+/// Rewrites the MCP servers AoE forwards to a session's agent (`api_version >= 21`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct McpRewriteHook {
@@ -1505,8 +1505,8 @@ impl PluginManifest {
         }
         if let Some(hook) = self.hooks.as_ref().and_then(|h| h.mcp_rewrite.as_ref()) {
             check(
-                self.api_version >= 14,
-                "hooks.mcp_rewrite requires api_version >= 14".into(),
+                self.api_version >= 21,
+                "hooks.mcp_rewrite requires api_version >= 21".into(),
             );
             check(
                 self.capabilities
@@ -1649,11 +1649,11 @@ mod tests {
     #[test]
     fn mcp_rewrite_hook_parses_with_defaults() {
         let m = PluginManifest::from_toml_str(&mcp_rewrite_toml(
-            14,
+            21,
             "\"runtime.worker\", \"mcp.rewrite\"",
             "",
         ))
-        .expect("v14 hook parses");
+        .expect("v21 hook parses");
         let hook = m.hooks.unwrap().mcp_rewrite.unwrap();
         assert_eq!(hook.applies_to, McpRewriteScope::Sandbox);
         assert_eq!(hook.timeout_ms, MCP_REWRITE_DEFAULT_TIMEOUT_MS);
@@ -1663,7 +1663,7 @@ mod tests {
     #[test]
     fn mcp_rewrite_hook_parses_explicit_values() {
         let m = PluginManifest::from_toml_str(&mcp_rewrite_toml(
-            14,
+            21,
             "\"runtime.worker\", \"mcp.rewrite\"",
             "applies_to = \"all\"\ntimeout_ms = 1200\norder = -5\n",
         ))
@@ -1678,39 +1678,39 @@ mod tests {
     fn mcp_rewrite_hook_is_validated() {
         let ok_caps = "\"runtime.worker\", \"mcp.rewrite\"";
         let no_runtime =
-            "id = \"acme.gate\"\nname = \"Gate\"\nversion = \"1.0.0\"\napi_version = 14\n\
+            "id = \"acme.gate\"\nname = \"Gate\"\nversion = \"1.0.0\"\napi_version = 21\n\
              capabilities = [\"mcp.rewrite\"]\n\n[hooks.mcp_rewrite]\n"
                 .to_string();
         rejects(&[
             (
-                "below v14",
-                mcp_rewrite_toml(13, ok_caps, ""),
-                "api_version >= 14",
+                "below v21",
+                mcp_rewrite_toml(20, ok_caps, ""),
+                "api_version >= 21",
             ),
             (
                 "missing capability",
-                mcp_rewrite_toml(14, "\"runtime.worker\"", ""),
+                mcp_rewrite_toml(21, "\"runtime.worker\"", ""),
                 "mcp.rewrite capability",
             ),
             ("missing runtime", no_runtime, "runtime worker"),
             (
                 "zero timeout",
-                mcp_rewrite_toml(14, ok_caps, "timeout_ms = 0\n"),
+                mcp_rewrite_toml(21, ok_caps, "timeout_ms = 0\n"),
                 "timeout_ms",
             ),
             (
                 "huge timeout",
-                mcp_rewrite_toml(14, ok_caps, "timeout_ms = 30001\n"),
+                mcp_rewrite_toml(21, ok_caps, "timeout_ms = 30001\n"),
                 "timeout_ms",
             ),
             (
                 "bad scope",
-                mcp_rewrite_toml(14, ok_caps, "applies_to = \"never\"\n"),
+                mcp_rewrite_toml(21, ok_caps, "applies_to = \"never\"\n"),
                 "applies_to",
             ),
             (
                 "unknown hook key",
-                mcp_rewrite_toml(14, ok_caps, "bogus = 1\n"),
+                mcp_rewrite_toml(21, ok_caps, "bogus = 1\n"),
                 "bogus",
             ),
         ]);

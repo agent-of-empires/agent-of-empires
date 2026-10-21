@@ -18,4 +18,4 @@ pub use manifest::{
     MCP_REWRITE_MAX_TIMEOUT_MS,
 };
 
-pub const API_VERSION: u32 = 20;
+pub const API_VERSION: u32 = 21;
