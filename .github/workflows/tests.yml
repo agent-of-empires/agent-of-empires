@@ -8,9 +8,10 @@ on:
   merge_group:
 
 # The event keeps a queue run and the push of its fast-forwarded commit apart.
+# Queue refs are unique per entry; newer PR and main pushes cancel older runs.
 concurrency:
-  group: tests-${{ github.event_name }}-${{ github.event.pull_request.number || github.sha }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+  group: tests-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
 
 env:
   CARGO_TERM_COLOR: always
