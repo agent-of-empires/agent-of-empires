@@ -143,7 +143,8 @@ fn shortcut_bar_tip_after_cli_creation_waits_for_home_and_is_seen_once() {
     use std::{fs, time::Duration};
 
     require_tmux!();
-    let mut h = TuiTestHarness::new("shortcut_bar_tip");
+    let mut h = TuiTestHarness::new_in_tmp("shortcut_bar_tip");
+    h.stop_daemon_on_drop();
     let app = app_dir_in(h.home_path());
     let config_path = app.join("config.toml");
     let mut config = fs::read_to_string(&config_path).unwrap();

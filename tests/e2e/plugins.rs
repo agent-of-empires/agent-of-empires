@@ -29,7 +29,8 @@ fn web_row(h: &TuiTestHarness) -> String {
 #[test]
 #[parallel]
 fn test_plugin_cli_lists_describes_and_toggles_builtins() {
-    let h = TuiTestHarness::new("plugin_cli");
+    let mut h = TuiTestHarness::new_in_tmp("plugin_cli");
+    h.stop_daemon_on_drop();
     let list = h.run_cli_ok(&["plugin", "list"]);
     assert!(
         list.contains("ID") && list.contains("VERSION") && list.contains("STATE"),
@@ -69,7 +70,8 @@ fn test_plugin_cli_lists_describes_and_toggles_builtins() {
 #[test]
 #[parallel]
 fn test_serve_refuses_when_web_plugin_disabled() {
-    let h = TuiTestHarness::new("plugin_serve_gate");
+    let mut h = TuiTestHarness::new_in_tmp("plugin_serve_gate");
+    h.stop_daemon_on_drop();
     let free_port = std::net::TcpListener::bind("127.0.0.1:0")
         .unwrap()
         .local_addr()
@@ -93,6 +95,8 @@ fn test_serve_refuses_when_web_plugin_disabled() {
 
     let enable = h.run_cli(&["plugin", "enable", "aoe.web"]);
     assert!(enable.status.success(), "enable aoe.web failed");
+    // The disable auto-started a Daemon; stop it so the explicit start below binds its own port.
+    assert!(h.run_cli(&["serve", "--stop"]).status.success());
 
     let started = h.run_cli(&["serve", "--daemon", "--port", &free_port, "--no-auth"]);
     assert!(

@@ -11,7 +11,8 @@ use crate::harness::{init_git_repo, TuiTestHarness};
 #[test]
 #[parallel]
 fn test_project_registry_add_list_override_and_remove() {
-    let h = TuiTestHarness::new("project_registry");
+    let mut h = TuiTestHarness::new_in_tmp("project_registry");
+    h.stop_daemon_on_drop();
     let repo = h.home_path().join("repoA");
     init_git_repo(&repo);
     let repo = repo.to_str().unwrap();
@@ -46,11 +47,8 @@ fn test_project_registry_add_list_override_and_remove() {
             vec!["project", "add", missing.to_str().unwrap()],
             "does not exist or is not a directory",
         ),
-        (vec!["project", "add", repo], "already registered"),
-        (
-            vec!["project", "add", repo, "--scope", "profile"],
-            "--allow-override",
-        ),
+        (vec!["project", "add", repo], "409"),
+        (vec!["project", "add", repo, "--scope", "profile"], "409"),
     ] {
         let stderr = h.run_cli_err(&args);
         assert!(stderr.contains(expected), "{args:?}: {stderr}");
@@ -80,7 +78,8 @@ fn test_project_registry_add_list_override_and_remove() {
 #[test]
 #[parallel]
 fn test_aoe_add_project_flag_rejects_invalid_requests() {
-    let h = TuiTestHarness::new("project_add_flag");
+    let mut h = TuiTestHarness::new_in_tmp("project_add_flag");
+    h.stop_daemon_on_drop();
     let primary = h.home_path().join("primary");
     let extra = h.home_path().join("extra");
     init_git_repo(&primary);

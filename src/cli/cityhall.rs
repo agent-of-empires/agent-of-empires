@@ -2,6 +2,7 @@
 
 use anyhow::{bail, Context, Result};
 use clap::{Args, Subcommand, ValueHint};
+use reqwest::Method;
 use std::path::PathBuf;
 
 use crate::session::cityhall_bundle::{self, CityHallBundle};
@@ -30,10 +31,10 @@ pub struct ApplyArgs {
     file: String,
 }
 
-pub fn run(command: CityHallCommands) -> Result<()> {
+pub async fn run(command: CityHallCommands) -> Result<()> {
     match command {
         CityHallCommands::Export(args) => run_export(args),
-        CityHallCommands::Apply(args) => run_apply(args),
+        CityHallCommands::Apply(args) => run_apply(args).await,
     }
 }
 
@@ -49,14 +50,28 @@ fn run_export(args: ExportArgs) -> Result<()> {
     Ok(())
 }
 
-fn run_apply(args: ApplyArgs) -> Result<()> {
+/// Applying clones repositories, which outlasts the client's default timeout.
+const APPLY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(600);
+
+async fn run_apply(args: ApplyArgs) -> Result<()> {
     let raw = if args.file == "-" {
         std::io::read_to_string(std::io::stdin()).context("reading the bundle from stdin")?
     } else {
         std::fs::read_to_string(&args.file).with_context(|| format!("reading {}", args.file))?
     };
 
-    let report = cityhall_bundle::apply(&CityHallBundle::from_toml(&raw)?)?;
+    // Fail on a malformed bundle before starting a Daemon for it.
+    CityHallBundle::from_toml(&raw)?;
+    let value = super::daemon_client()
+        .await?
+        .mutate_with(Method::POST, "/api/cityhall/apply", |request| {
+            request
+                .header(reqwest::header::CONTENT_TYPE, "application/toml")
+                .body(raw.clone())
+                .timeout(APPLY_TIMEOUT)
+        })
+        .await?;
+    let report: cityhall_bundle::ApplyReport = serde_json::from_value(value)?;
 
     println!("Applied {} settings.", report.settings_applied);
     if !report.cloned.is_empty() {

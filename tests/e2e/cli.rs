@@ -990,7 +990,8 @@ fn cli_mcp_add_edit_remove_flow() {
 #[test]
 #[parallel]
 fn cli_skill_management_flow() {
-    let h = TuiTestHarness::new("cli_skill_management");
+    let mut h = TuiTestHarness::new_in_tmp("cli_skill_management");
+    h.stop_daemon_on_drop();
     let source = h.home_path().join(".claude/skills/review");
     std::fs::create_dir_all(&source).unwrap();
     let original = "---\nname: review\ndescription: Review code\n---\n\nOriginal body\n";

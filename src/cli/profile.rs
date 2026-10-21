@@ -103,40 +103,22 @@ async fn list_profiles() -> Result<()> {
 }
 
 async fn create_profile(name: &str) -> Result<()> {
-    session::create_profile(name)?;
+    super::mutate_profile(crate::daemon::ProfileMutation::Create(
+        crate::daemon::CreateProfileBody { name: name.into() },
+    ))
+    .await?;
     println!("✓ Created profile: {}", name);
     println!("  Use with: aoe -p {}", name);
     Ok(())
 }
-async fn mutate_running_profile(mutation: crate::daemon::ProfileMutation) -> Result<bool> {
-    use crate::acp::client::discovery::{discover, DiscoveryError};
-    let endpoint = match discover() {
-        Ok(endpoint) => endpoint,
-        Err(DiscoveryError::NoLocalDaemon) => return Ok(false),
-        Err(error) => return Err(error.into()),
-    };
-    let client = endpoint.daemon_client()?;
-    let info = client.runtime_info().await?;
-    anyhow::ensure!(
-        info.protocol_version == crate::daemon::RUNTIME_PROTOCOL_VERSION
-            && info.health == crate::daemon::RuntimeHealth::Healthy,
-        "Daemon runtime is not ready"
-    );
-    client.mutate_profile(&mutation, &info.epoch).await?;
-    Ok(true)
-}
-
 async fn rename_profile(old_name: &str, new_name: &str) -> Result<()> {
-    if !mutate_running_profile(crate::daemon::ProfileMutation::Rename {
+    super::mutate_profile(crate::daemon::ProfileMutation::Rename {
         name: old_name.into(),
         body: crate::daemon::RenameProfileBody {
             new_name: new_name.into(),
         },
     })
-    .await?
-    {
-        session::rename_profile(old_name, new_name)?;
-    }
+    .await?;
     println!("✓ Renamed profile: {} -> {}", old_name, new_name);
     Ok(())
 }
@@ -156,14 +138,11 @@ async fn delete_profile(name: &str) -> Result<()> {
         return Ok(());
     }
 
-    if !mutate_running_profile(crate::daemon::ProfileMutation::Delete {
+    super::mutate_profile(crate::daemon::ProfileMutation::Delete {
         name: name.into(),
         query: crate::daemon::DeleteProfileQuery::default(),
     })
-    .await?
-    {
-        session::delete_profile(name)?;
-    }
+    .await?;
     println!("✓ Deleted profile: {}", name);
     Ok(())
 }
@@ -177,7 +156,13 @@ async fn show_default_profile() -> Result<()> {
 }
 
 async fn set_default_profile(name: &str) -> Result<()> {
-    session::set_default_profile(name)?;
+    if !session::list_profiles()?.iter().any(|p| p == name) {
+        bail!("Profile '{name}' does not exist");
+    }
+    super::mutate_profile(crate::daemon::ProfileMutation::SetDefault(
+        crate::daemon::DefaultProfileBody { name: name.into() },
+    ))
+    .await?;
     println!("✓ Default profile set to: {}", name);
     Ok(())
 }

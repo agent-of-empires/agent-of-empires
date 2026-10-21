@@ -101,7 +101,7 @@ pub async fn set_telemetry_consent(
 /// `DO_NOT_TRACK`, where no id exists; the response says which.
 pub async fn reset_telemetry_id(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     if state.read_only {
-        return read_only_response();
+        return super::read_only_response();
     }
     let status = current_status();
     if status.enabled && !status.do_not_track {

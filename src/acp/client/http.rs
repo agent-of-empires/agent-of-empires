@@ -374,6 +374,40 @@ impl HttpClient {
         Ok(())
     }
 
+    /// A config mutation on a daemon-wide endpoint, retried after a passphrase
+    /// step-up. Returns the JSON body, `Null` when empty.
+    pub async fn mutate(
+        &self,
+        method: reqwest::Method,
+        path: &str,
+        body: Option<serde_json::Value>,
+    ) -> Result<serde_json::Value, HttpError> {
+        self.mutate_with(method, path, |request| match &body {
+            Some(body) => request.json(body),
+            None => request,
+        })
+        .await
+    }
+
+    /// Like [`mutate`](Self::mutate), with the caller shaping the request
+    /// (a non-JSON body or a longer timeout).
+    pub async fn mutate_with(
+        &self,
+        method: reqwest::Method,
+        path: &str,
+        shape: impl Fn(reqwest::RequestBuilder) -> reqwest::RequestBuilder,
+    ) -> Result<serde_json::Value, HttpError> {
+        let url = format!("{}{path}", self.endpoint.base_url);
+        let res = self
+            .execute_elevated(|| shape(self.http.request(method.clone(), &url)))
+            .await?;
+        if !res.status().is_success() {
+            return Err(brief_server_error(status_error(&res, None, false), res).await);
+        }
+        let text = res.text().await?;
+        Ok(serde_json::from_str(&text).unwrap_or(serde_json::Value::Null))
+    }
+
     /// `POST /api/sessions/{id}/acp/cancel`.
     pub async fn cancel(&self, session_id: &str) -> Result<(), HttpError> {
         let url = format!(
@@ -893,6 +927,28 @@ fn check_status(res: reqwest::Response, session_id: &str) -> Result<reqwest::Res
     } else {
         Err(status_error(&res, Some(session_id), false))
     }
+}
+
+/// The daemon's own message reads best for config commands; the typed error
+/// carries only a code. An empty 404 is an absent route: the daemon predates
+/// the endpoint.
+async fn brief_server_error(error: HttpError, res: reqwest::Response) -> HttpError {
+    let HttpError::Server { status, body } = error else {
+        return error;
+    };
+    let text = res.text().await.unwrap_or_default();
+    let body = match serde_json::from_str::<serde_json::Value>(&text)
+        .ok()
+        .and_then(|v| v.get("message")?.as_str().map(str::to_string))
+    {
+        Some(message) => message,
+        None if status == StatusCode::NOT_FOUND && text.trim().is_empty() => {
+            "the running daemon does not support this command; restart it with `aoe serve --restart`"
+                .to_string()
+        }
+        None => body,
+    };
+    HttpError::Server { status, body }
 }
 
 fn check_global_status(res: reqwest::Response) -> Result<reqwest::Response, HttpError> {

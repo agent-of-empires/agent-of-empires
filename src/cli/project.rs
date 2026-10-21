@@ -1,6 +1,6 @@
 //! `aoe project` subcommands: manage the project registry used by the
 
-use anyhow::{bail, Result};
+use anyhow::Result;
 use clap::{Args, Subcommand, ValueEnum, ValueHint};
 use serde::Serialize;
 use std::path::PathBuf;
@@ -173,56 +173,57 @@ async fn list(profile: &str, args: ProjectListArgs) -> Result<()> {
     Ok(())
 }
 
-async fn add(profile: &str, profile_explicit: bool, args: ProjectAddArgs) -> Result<()> {
-    let scope = match args.scope {
+fn scope_or_default(arg: Option<ScopeArg>, profile_explicit: bool) -> ProjectScope {
+    match arg {
         Some(ScopeArg::Global) => ProjectScope::Global,
         Some(ScopeArg::Profile) => ProjectScope::Profile,
         None => resolve_default_scope(profile_explicit),
-    };
-    let resolved_profile = match scope {
-        ProjectScope::Global => None,
-        ProjectScope::Profile => Some(resolve_existing_profile(profile)?),
-    };
-    let profile = resolved_profile.as_deref().unwrap_or(profile);
-
-    let canonical = args
-        .path
-        .canonicalize()
-        .unwrap_or_else(|_| args.path.clone());
-
-    if !canonical.is_dir() {
-        bail!(
-            "Path does not exist or is not a directory: {}",
-            canonical.display()
-        );
     }
+}
 
-    let name = match args.name {
-        Some(n) => n,
-        None => {
-            let base = canonical
-                .file_name()
-                .map(|n| n.to_string_lossy().to_string())
-                .unwrap_or_else(|| "project".to_string());
-            projects::unique_name(profile, scope, &base)
-        }
-    };
-
-    let project =
-        Project::new(name, canonical.to_string_lossy(), scope).with_base_branch(args.base_branch);
-    let is_git = project.is_git();
-    let committed = projects::add(profile, scope, project, args.allow_override)?;
-    let saved = &committed.projects[committed.result];
+async fn add(profile: &str, profile_explicit: bool, args: ProjectAddArgs) -> Result<()> {
+    let scope = scope_or_default(args.scope, profile_explicit);
+    let profile = resolve_existing_profile(profile)?;
+    // The Daemon resolves the path in its own working directory, so a relative
+    // one is anchored here, where the user typed it.
+    let absolute = std::path::absolute(&args.path)?;
+    let canonical = absolute.canonicalize().unwrap_or(absolute);
+    let name = args.name.unwrap_or_else(|| {
+        let base = canonical
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| "project".to_string());
+        projects::unique_name(&profile, scope, &base)
+    });
+    anyhow::ensure!(
+        canonical.is_dir(),
+        "Path does not exist or is not a directory: {}",
+        canonical.display()
+    );
+    let path = canonical.to_string_lossy().to_string();
+    super::mutate_project(crate::daemon::ProjectMutation::Create(
+        crate::daemon::CreateProjectBody {
+            profile,
+            scope,
+            path: path.clone(),
+            name: Some(name.clone()),
+            allow_override: args.allow_override,
+            default_base_branch: args.base_branch.clone(),
+            pinned: false,
+            overrides: Default::default(),
+        },
+    ))
+    .await?;
     println!(
         "✓ Registered project '{}' [{}] at {}",
-        saved.name,
+        name,
         scope.as_str(),
-        saved.path
+        path
     );
-    if let Some(base) = &saved.default_base_branch {
+    if let Some(base) = args.base_branch.as_deref().filter(|b| !b.trim().is_empty()) {
         println!("  Default base branch: {base}");
     }
-    if !is_git {
+    if !Project::new(name, &path, scope).is_git() {
         println!(
             "  Note: not a git repository; sessions open directly in this folder \
              (no worktree per session, branches, or diff view)."
@@ -232,22 +233,22 @@ async fn add(profile: &str, profile_explicit: bool, args: ProjectAddArgs) -> Res
 }
 
 async fn remove(profile: &str, profile_explicit: bool, args: ProjectRemoveArgs) -> Result<()> {
-    let scope = match args.scope {
-        Some(ScopeArg::Global) => ProjectScope::Global,
-        Some(ScopeArg::Profile) => ProjectScope::Profile,
-        None => resolve_default_scope(profile_explicit),
+    let scope = scope_or_default(args.scope, profile_explicit);
+    let target = match scope {
+        ProjectScope::Global => crate::daemon::ProjectTarget::Global,
+        ProjectScope::Profile => crate::daemon::ProjectTarget::Profile {
+            profile: resolve_existing_profile(profile)?,
+        },
     };
-    let resolved_profile = match scope {
-        ProjectScope::Global => None,
-        ProjectScope::Profile => Some(resolve_existing_profile(profile)?),
-    };
-    let profile = resolved_profile.as_deref().unwrap_or(profile);
-    let removed = projects::remove(profile, scope, &args.name_or_path)?.result;
+    super::mutate_project(crate::daemon::ProjectMutation::Remove {
+        target,
+        name_or_path: args.name_or_path.clone(),
+    })
+    .await?;
     println!(
-        "✓ Removed project '{}' [{}] (was at {})",
-        removed.name,
-        scope.as_str(),
-        removed.path
+        "✓ Removed project '{}' [{}]",
+        args.name_or_path,
+        scope.as_str()
     );
     Ok(())
 }

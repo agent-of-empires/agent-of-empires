@@ -58,6 +58,38 @@ pub(crate) fn lifecycle_notice_line(indent: &str, notice: &str) -> String {
 use crate::session::Instance;
 use anyhow::{bail, Result};
 
+/// A client for the Daemon, auto-started when none runs (ADR 0004).
+pub(crate) async fn daemon_client() -> Result<crate::acp::client::HttpClient> {
+    let endpoint = crate::acp::client::require_daemon().await?;
+    Ok(crate::acp::client::HttpClient::new(endpoint)?)
+}
+
+/// A ready Daemon runtime and its epoch, auto-started when none runs.
+async fn runtime_client() -> Result<(crate::daemon::DaemonClient, String)> {
+    let client = crate::acp::client::require_daemon()
+        .await?
+        .daemon_client()?;
+    let info = client.runtime_info().await?;
+    anyhow::ensure!(
+        info.protocol_version == crate::daemon::RUNTIME_PROTOCOL_VERSION
+            && info.health == crate::daemon::RuntimeHealth::Healthy,
+        "Daemon runtime is not ready"
+    );
+    Ok((client, info.epoch))
+}
+
+pub(crate) async fn mutate_profile(mutation: crate::daemon::ProfileMutation) -> Result<()> {
+    let (client, epoch) = runtime_client().await?;
+    client.mutate_profile(&mutation, &epoch).await?;
+    Ok(())
+}
+
+pub(crate) async fn mutate_project(mutation: crate::daemon::ProjectMutation) -> Result<()> {
+    let (client, epoch) = runtime_client().await?;
+    client.mutate_project(&mutation, &epoch).await?;
+    Ok(())
+}
+
 pub fn resolve_session<'a>(identifier: &str, instances: &'a [Instance]) -> Result<&'a Instance> {
     if let Some(inst) = instances.iter().find(|i| i.id == identifier) {
         return Ok(inst);
