@@ -835,6 +835,37 @@ fn internal_error() -> axum::response::Response {
     )
 }
 
+/// `POST /api/cityhall/apply` applies a TOML bundle to this install and returns
+/// the `ApplyReport`. Applying writes settings, the git identity and the
+/// project registry, and clones repositories on this host.
+pub async fn apply_cityhall_bundle(
+    _guard: super::mutation_guard::ElevatedMutationGuard,
+    body: String,
+) -> axum::response::Response {
+    let applied = tokio::task::spawn_blocking(move || {
+        let bundle = crate::session::cityhall_bundle::CityHallBundle::from_toml(&body)
+            .map_err(|e| (StatusCode::BAD_REQUEST, "bad_bundle", e))?;
+        crate::session::cityhall_bundle::apply(&bundle)
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, "apply_failed", e))
+    })
+    .await;
+    match applied {
+        Ok(Ok(report)) => Json(report).into_response(),
+        Ok(Err((status, code, e))) => {
+            tracing::warn!(target: "http.api.system", "CityHall bundle apply failed: {e:#}");
+            api_error(status, code, format!("{e:#}"))
+        }
+        Err(e) => {
+            tracing::error!(target: "http.api.system", "CityHall bundle apply panicked: {e}");
+            api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "internal",
+                "Internal server error",
+            )
+        }
+    }
+}
+
 /// `GET /api/cityhall/bundle` returns this install's CityHall config bundle as
 /// TOML, for an admin to paste into CityHall. See
 /// `crate::session::cityhall_bundle`.

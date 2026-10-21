@@ -76,18 +76,18 @@ pub use skills::{
 };
 
 pub use system::{
-    browse_filesystem, create_profile, default_profile, delete_profile, dismiss_update,
-    docker_status, filesystem_home, get_about, get_cityhall_bundle, get_current_theme,
-    get_profile_settings, get_resolved_theme, get_settings, get_settings_resolved,
-    get_settings_schema, get_tips, get_update_status, get_web_ui_state, list_agents, list_groups,
-    list_profiles, list_sounds, list_themes, mark_tip_seen, mark_volume_ignores_globs_acknowledged,
-    mark_web_tour_seen, patch_web_ui_state, post_dashboard_presence, rename_profile,
-    serve_sound_file, set_show_tips, system_health, update_profile_settings, update_settings,
-    update_theme,
+    apply_cityhall_bundle, browse_filesystem, create_profile, default_profile, delete_profile,
+    dismiss_update, docker_status, filesystem_home, get_about, get_cityhall_bundle,
+    get_current_theme, get_profile_settings, get_resolved_theme, get_settings,
+    get_settings_resolved, get_settings_schema, get_tips, get_update_status, get_web_ui_state,
+    list_agents, list_groups, list_profiles, list_sounds, list_themes, mark_tip_seen,
+    mark_volume_ignores_globs_acknowledged, mark_web_tour_seen, patch_web_ui_state,
+    post_dashboard_presence, rename_profile, serve_sound_file, set_show_tips, system_health,
+    update_profile_settings, update_settings, update_theme,
 };
 pub use telemetry::{
     get_telemetry_status, post_telemetry_seen, post_telemetry_structured_interaction,
-    set_telemetry_consent,
+    reset_telemetry_id, set_telemetry_consent, TelemetryMutation,
 };
 
 /// A clone of the live instance with this id.

@@ -14,15 +14,15 @@ use serde::{Deserialize, Serialize};
 use super::api_error;
 use super::AppState;
 
-#[derive(Serialize)]
+#[derive(Serialize, Deserialize)]
 pub struct TelemetryStatus {
     /// `config.telemetry.enabled`.
-    enabled: bool,
-    /// Whether the user has answered the opt-in prompt (drives whether the
-    /// web consent modal should show).
-    responded: bool,
+    pub enabled: bool,
+    /// Whether the user has answered the opt-in prompt, which drives the web
+    /// consent modal.
+    pub responded: bool,
     /// `DO_NOT_TRACK` is set; the toggle is forced off and nothing is sent.
-    do_not_track: bool,
+    pub do_not_track: bool,
 }
 
 fn current_status() -> TelemetryStatus {
@@ -31,6 +31,22 @@ fn current_status() -> TelemetryStatus {
         enabled: config.telemetry.enabled,
         responded: config.app_state.has_responded_to_telemetry,
         do_not_track: crate::telemetry::do_not_track(),
+    }
+}
+
+/// Status plus the install id, returned only to the clients that change consent
+/// (the CLI prints it); the dashboard-facing status never carries the id.
+#[derive(Serialize, Deserialize)]
+pub struct TelemetryMutation {
+    #[serde(flatten)]
+    pub status: TelemetryStatus,
+    pub install_id: Option<String>,
+}
+
+fn current_mutation() -> TelemetryMutation {
+    TelemetryMutation {
+        status: current_status(),
+        install_id: crate::telemetry::install_id(),
     }
 }
 
@@ -78,7 +94,20 @@ pub async fn set_telemetry_consent(
     // Reconcile the install id (no-op under DO_NOT_TRACK). The daemon, not the
     // browser, owns the id.
     crate::telemetry::apply_opt_in_change(req.enabled);
-    (StatusCode::OK, Json(current_status())).into_response()
+    (StatusCode::OK, Json(current_mutation())).into_response()
+}
+
+/// Replace the install id with a fresh one. A no-op while opted out or under
+/// `DO_NOT_TRACK`, where no id exists; the response says which.
+pub async fn reset_telemetry_id(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    if state.read_only {
+        return read_only_response();
+    }
+    let status = current_status();
+    if status.enabled && !status.do_not_track {
+        crate::telemetry::reset_install_id();
+    }
+    (StatusCode::OK, Json(current_mutation())).into_response()
 }
 
 #[derive(Deserialize)]

@@ -422,6 +422,7 @@ pub(super) const CITYHALL_MUTATION_ALLOW: &[(&str, &str)] = &[
     ("POST", "/api/plugins/{id}/pages/{page_id}/ticket"),
     // Telemetry consent (its own surface, still prompted).
     ("POST", "/api/telemetry/consent"),
+    ("POST", "/api/telemetry/reset-id"),
     ("POST", "/api/telemetry/seen"),
     ("POST", "/api/telemetry/structured-interaction"),
     // Ephemeral foreground-presence heartbeat. Does not mutate user data.
