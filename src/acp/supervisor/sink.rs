@@ -36,6 +36,11 @@ pub trait BroadcastSink: Send + Sync + 'static {
     fn unresolved_background_agent_ids(&self, _session_id: &str) -> Vec<String> {
         Vec::new()
     }
+    /// Task ids of `BackgroundTaskStarted` events on disk with no matching
+    /// `BackgroundTaskFinished`: tasks a dead worker will never report on.
+    fn unresolved_background_task_ids(&self, _session_id: &str) -> Vec<String> {
+        Vec::new()
+    }
     /// The same rows, carrying `output_file` so `Supervisor::attach` can
     /// resume tailing a sub-agent that survived a daemon restart.
     fn unresolved_background_agent_launches(
@@ -88,6 +93,10 @@ impl BroadcastSink for ChannelSink {
 
     fn unresolved_background_agent_ids(&self, session_id: &str) -> Vec<String> {
         self.event_store.unresolved_background_agent_ids(session_id)
+    }
+
+    fn unresolved_background_task_ids(&self, session_id: &str) -> Vec<String> {
+        self.event_store.unresolved_background_task_ids(session_id)
     }
 
     fn unresolved_background_agent_launches(

@@ -7,7 +7,7 @@ use std::collections::HashSet;
 
 use crate::session::{
     acquire_session_identity_lock, duplicate_session_error, is_duplicate_session, GroupTree,
-    Instance, LifecycleOperation, ResumeIntent, StartOutcome, Storage,
+    Instance, LifecycleOperation, ResumeIntent, StartOutcome, Status, Storage,
 };
 
 #[derive(Subcommand)]
@@ -26,6 +26,11 @@ pub enum SessionCommands {
 
     /// Show session details
     Show(ShowArgs),
+
+    /// Block until a session's agent activity status matches one of the
+    /// `--until` values. Exits 0 on a match, 124 on timeout (like
+    /// `timeout(1)`), and 1 if the session stops. Tmux sessions only.
+    Wait(WaitArgs),
 
     /// Rename a session
     Rename(RenameArgs),
@@ -166,6 +171,39 @@ pub struct ArchiveArgs {
     pub no_kill: bool,
 }
 
+#[derive(Clone, Copy, clap::ValueEnum)]
+pub enum WaitStatus {
+    Running,
+    Waiting,
+    Idle,
+    Error,
+}
+
+impl From<WaitStatus> for Status {
+    fn from(s: WaitStatus) -> Self {
+        match s {
+            WaitStatus::Running => Status::Running,
+            WaitStatus::Waiting => Status::Waiting,
+            WaitStatus::Idle => Status::Idle,
+            WaitStatus::Error => Status::Error,
+        }
+    }
+}
+
+#[derive(Args)]
+pub struct WaitArgs {
+    /// Session ID or title
+    pub identifier: String,
+
+    /// Activity status to wait for; repeat to accept any of several
+    #[arg(long, required = true)]
+    pub until: Vec<WaitStatus>,
+
+    /// Give up after this many milliseconds
+    #[arg(long, default_value_t = 300_000)]
+    pub timeout: u64,
+}
+
 #[derive(Args)]
 pub struct SessionIdArgs {
     /// Session ID or title
@@ -294,7 +332,8 @@ pub struct SetSessionIdArgs {
     /// keeps its ACP conversation and needs the native ID plus an explicit
     /// `--store` and a bound Claude conversation.
     session_id: String,
-    /// Assert the native store: a Claude store directory, or a Pi/OMP transcript file.
+    /// Assert the native store: the Claude config root (the directory
+    /// containing `projects/`), or a Pi/OMP transcript file.
     #[arg(long)]
     store: Option<std::path::PathBuf>,
 }
@@ -397,6 +436,7 @@ pub async fn run(profile: &str, command: SessionCommands) -> Result<()> {
         SessionCommands::Restart(args) => restart_session_dispatch(profile, args).await,
         SessionCommands::Attach(args) => attach_session(profile, args).await,
         SessionCommands::Show(args) => show_session(profile, args).await,
+        SessionCommands::Wait(args) => wait_session(profile, args).await,
         SessionCommands::Capture(args) => capture_session(profile, args).await,
         SessionCommands::Rename(args) => rename_session(profile, args).await,
         SessionCommands::SetWorktreeName(args) => set_worktree_name(profile, args).await,
@@ -1456,6 +1496,133 @@ async fn attach_session(profile: &str, args: SessionIdArgs) -> Result<()> {
     let mut working = inst.clone();
     working.source_profile = profile.to_string();
     supervise_attach_capture(&mut working, |_| tmux_session.attach())
+}
+
+const WAIT_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
+const WAIT_TIMEOUT_EXIT_CODE: i32 = 124;
+
+#[derive(Debug, PartialEq, Eq)]
+enum WaitDecision {
+    Matched,
+    Terminated,
+    TimedOut,
+    Continue,
+}
+
+/// Termination wins over a match, so a vanished session never satisfies `--until error` or
+/// `--until idle`. Otherwise a match wins, so an already-satisfied wait returns on its first poll.
+fn wait_decision(
+    current: Status,
+    targets: &[Status],
+    terminated: bool,
+    elapsed: std::time::Duration,
+    timeout: std::time::Duration,
+) -> WaitDecision {
+    if terminated {
+        WaitDecision::Terminated
+    } else if targets.contains(&current) {
+        WaitDecision::Matched
+    } else if elapsed >= timeout {
+        WaitDecision::TimedOut
+    } else {
+        WaitDecision::Continue
+    }
+}
+
+/// Confirmed absence only. An unreachable tmux server leaves a plain `Error`, and a launch that
+/// holds the reservation has not created its pane yet.
+fn is_terminated(
+    status: Status,
+    last_error: Option<&str>,
+    launching: bool,
+    existence: crate::tmux::SessionExistence,
+) -> bool {
+    !launching
+        && (status == Status::Stopped
+            || (status == Status::Error
+                && last_error == Some(crate::session::TMUX_SESSION_GONE_ERROR))
+            // A capture that loses a vanishing pane reads as Idle, so recheck the pane itself.
+            || existence == crate::tmux::SessionExistence::Absent)
+}
+
+fn confirmed_terminated(inst: &Instance) -> bool {
+    let existence = inst
+        .tmux_session()
+        .map_or(crate::tmux::SessionExistence::Unknown, |s| s.existence());
+    is_terminated(
+        inst.status,
+        inst.last_error.as_deref(),
+        inst.has_fresh_launch_reservation(chrono::Utc::now()),
+        existence,
+    )
+}
+
+/// Take durable lifecycle fields from the stored row, keeping `live`'s detection state.
+fn adopt_stored(live: &Instance, mut stored: Instance, profile: &str) -> Instance {
+    stored.source_profile = profile.to_string();
+    stored.merge_runtime_from_reload(live);
+    stored
+}
+
+async fn wait_session(profile: &str, args: WaitArgs) -> Result<()> {
+    let storage = Storage::open_unwatched(profile)?;
+    let (instances, _) = storage.load_with_groups()?;
+    let inst = super::resolve_session(&args.identifier, &instances)?;
+    bail_if_acp(inst, "wait")?;
+    let mut live = inst.clone();
+    live.source_profile = profile.to_string();
+    crate::session::config::profile_config::resolve_config_or_warn(profile);
+
+    let targets: Vec<Status> = args.until.iter().map(|s| (*s).into()).collect();
+    let timeout = std::time::Duration::from_millis(args.timeout);
+    let start = std::time::Instant::now();
+    let mut first = true;
+    loop {
+        crate::tmux::refresh_session_cache();
+        // The first poll must decide on its own; later polls share one detection state so a
+        // Running to Idle transition can be confirmed by a second observation.
+        if first {
+            live.update_status_once(None, None);
+            first = false;
+        } else {
+            let stored = storage
+                .load()?
+                .into_iter()
+                .find(|i| i.id == live.id)
+                .with_context(|| format!("session '{}' was removed", live.title))?;
+            live = adopt_stored(&live, stored, profile);
+            live.update_status_with_metadata(None, None);
+        }
+        tracing::debug!(target: "cli.session", "wait poll status={}", live.status.as_str());
+        let elapsed = start.elapsed();
+        // The poll may have lost a vanishing pane; reread liveness before deciding.
+        crate::tmux::refresh_session_cache();
+        match wait_decision(
+            live.status,
+            &targets,
+            confirmed_terminated(&live),
+            elapsed,
+            timeout,
+        ) {
+            WaitDecision::Matched => {
+                println!("{}", live.status.as_str());
+                return Ok(());
+            }
+            WaitDecision::Terminated => bail!("session '{}' is not running", live.title),
+            WaitDecision::TimedOut => {
+                eprintln!(
+                    "Error: timed out after {}ms waiting for '{}' (last status: {})",
+                    args.timeout,
+                    live.title,
+                    live.status.as_str()
+                );
+                std::process::exit(WAIT_TIMEOUT_EXIT_CODE);
+            }
+            WaitDecision::Continue => {
+                tokio::time::sleep(WAIT_POLL_INTERVAL.min(timeout - elapsed)).await;
+            }
+        }
+    }
 }
 
 async fn show_session(profile: &str, args: ShowArgs) -> Result<()> {
@@ -3708,5 +3875,131 @@ mod show_json_tests {
             active["snoozed_until"],
             serde_json::to_value(future).unwrap()
         );
+    }
+}
+
+#[cfg(test)]
+mod wait_decision_tests {
+    use super::{adopt_stored, is_terminated, wait_decision, WaitDecision};
+    use crate::session::{
+        Instance, LifecycleOperation, Status, TMUX_SERVER_UNREACHABLE_ERROR,
+        TMUX_SESSION_GONE_ERROR,
+    };
+    use std::time::Duration;
+
+    const SECS: fn(u64) -> Duration = Duration::from_secs;
+
+    #[test]
+    fn decides_match_stop_timeout_or_continue() {
+        use WaitDecision::*;
+        let cases = [
+            // already in the target state, even with no time left
+            (Status::Idle, vec![Status::Idle], false, 0, 0, Matched),
+            (Status::Idle, vec![Status::Idle], false, 99, 10, Matched),
+            // any one of several targets satisfies the wait
+            (
+                Status::Waiting,
+                vec![Status::Idle, Status::Waiting],
+                false,
+                1,
+                10,
+                Matched,
+            ),
+            (Status::Error, vec![Status::Error], false, 1, 10, Matched),
+            (
+                Status::Running,
+                vec![Status::Idle, Status::Waiting],
+                false,
+                1,
+                10,
+                Continue,
+            ),
+            (Status::Running, vec![Status::Idle], false, 10, 10, TimedOut),
+            (
+                Status::Starting,
+                vec![Status::Idle],
+                false,
+                99,
+                10,
+                TimedOut,
+            ),
+            // termination beats a match, including a gone pane that reads as Error or Idle
+            (Status::Stopped, vec![Status::Idle], true, 1, 10, Terminated),
+            (Status::Error, vec![Status::Error], true, 1, 10, Terminated),
+            (Status::Idle, vec![Status::Idle], true, 1, 10, Terminated),
+        ];
+        for (current, targets, terminated, elapsed, timeout, want) in cases {
+            assert_eq!(
+                wait_decision(current, &targets, terminated, SECS(elapsed), SECS(timeout)),
+                want,
+                "{current:?} {targets:?} terminated={terminated} elapsed={elapsed} timeout={timeout}"
+            );
+        }
+    }
+
+    #[test]
+    fn only_confirmed_absence_is_termination() {
+        use crate::tmux::SessionExistence::{Absent, Present, Unknown};
+        let cases = [
+            (Status::Stopped, None, false, Present, true),
+            (
+                Status::Error,
+                Some(TMUX_SESSION_GONE_ERROR),
+                false,
+                Present,
+                true,
+            ),
+            (
+                Status::Error,
+                Some(TMUX_SERVER_UNREACHABLE_ERROR),
+                false,
+                Unknown,
+                false,
+            ),
+            (Status::Error, None, false, Unknown, false),
+            (
+                Status::Idle,
+                Some(TMUX_SESSION_GONE_ERROR),
+                false,
+                Present,
+                false,
+            ),
+            // a capture that lost the pane reads Idle; the pane check still catches it
+            (Status::Idle, None, false, Absent, true),
+            // a launch holding its reservation has no pane yet
+            (Status::Starting, None, true, Absent, false),
+            (Status::Stopped, None, true, Absent, false),
+        ];
+        for (status, last_error, launching, existence, want) in cases {
+            assert_eq!(
+                is_terminated(status, last_error, launching, existence),
+                want,
+                "{status:?} {last_error:?} launching={launching} {existence:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn adopt_stored_sees_a_launch_commit_and_keeps_detection_state() {
+        let now = chrono::Utc::now();
+        let mut live = Instance::new("t", "/p");
+        live.try_acquire_lifecycle_reservation(
+            LifecycleOperation::Launch,
+            Instance::LIFECYCLE_RESERVATION_TTL,
+            now,
+        )
+        .unwrap();
+        live.status = Status::Starting;
+        live.detection.pending = Some(Status::Idle);
+        assert!(live.has_fresh_launch_reservation(now));
+
+        let mut stored = live.clone();
+        stored.lifecycle_generation += 1;
+        stored.lifecycle_reservation = None;
+        stored.detection.pending = None;
+
+        let adopted = adopt_stored(&live, stored, "default");
+        assert!(!adopted.has_fresh_launch_reservation(now));
+        assert_eq!(adopted.detection.pending, Some(Status::Idle));
     }
 }

@@ -230,6 +230,31 @@ impl EventStore {
         )
     }
 
+    /// Task ids of `BackgroundTaskStarted` events with no later
+    /// `BackgroundTaskFinished`, for the same dead-worker detach as
+    /// [`Self::unresolved_background_agent_ids`].
+    pub fn unresolved_background_task_ids(&self, session_id: &str) -> Vec<String> {
+        query_strings(
+            &self.conn(),
+            "SELECT json_extract(started.event_json, '$.BackgroundTaskStarted.task_id') AS task_id
+             FROM acp_events AS started
+             WHERE started.session_id = ?1
+               AND started.discriminant = 'BackgroundTaskStarted'
+               AND json_extract(started.event_json, '$.BackgroundTaskStarted.task_id') IS NOT NULL
+               AND NOT EXISTS (
+                   SELECT 1 FROM acp_events AS finished
+                   WHERE finished.session_id = ?1
+                     AND finished.discriminant = 'BackgroundTaskFinished'
+                     AND finished.seq > started.seq
+                     AND json_extract(finished.event_json, '$.BackgroundTaskFinished.task_id') =
+                         json_extract(started.event_json, '$.BackgroundTaskStarted.task_id')
+               )
+             ORDER BY started.seq ASC",
+            "unresolved_background_task_ids",
+            session_id,
+        )
+    }
+
     /// The same rows as [`Self::unresolved_background_agent_ids`], carrying
     /// the transcript path a resumed tailer needs. `Supervisor::attach` uses
     /// it to resume tracking a sub-agent that survived the restart instead of
@@ -851,6 +876,133 @@ mod tests {
             ["bg-real-orphan".to_string()],
             "an unextractable Completed row must not blank the whole scan"
         );
+    }
+
+    /// Retention must not erase the start of a long-running task (the open
+    /// work could never be finished at teardown, and a cold fold would lose
+    /// it) nor keep a start whose finish was pruned (it would read open).
+    #[test]
+    fn background_task_lifecycle_survives_the_retention_prune() {
+        use crate::acp::state::{AcpSessionId, AcpState, AgentName};
+
+        let (_tmp, store) = open_store(3);
+        let task = |id: &str| Event::BackgroundTaskStarted {
+            task_id: id.into(),
+            tool_call_id: None,
+            description: "sleep".into(),
+        };
+        let chunk = || Event::AgentMessageChunk { text: "x".into() };
+        let mut seq = 0;
+        let mut record = |event: Event| {
+            seq += 1;
+            store.record("s-1", seq, &event).unwrap();
+        };
+        record(task("open"));
+        record(task("done"));
+        record(Event::BackgroundTaskFinished {
+            task_id: "done".into(),
+        });
+        // An id reused after its finish: the second start is open and must
+        // outlive the sweep that drops the completed first pair.
+        record(task("reused"));
+        record(Event::BackgroundTaskFinished {
+            task_id: "reused".into(),
+        });
+        record(task("reused"));
+        record(bg_launched("agent-open", ""));
+        record(bg_launched("agent-done", ""));
+        record(Event::BackgroundAgentCompleted {
+            agent_id: "agent-done".into(),
+            status: BackgroundAgentStatus::Completed,
+            tools: Vec::new(),
+            result: None,
+            warning: None,
+            ended_at: chrono::Utc::now(),
+        });
+        // Enough events for the periodic sweep of completed work to run.
+        for _ in 0..150 {
+            record(chunk());
+        }
+
+        assert_eq!(
+            store.unresolved_background_task_ids("s-1"),
+            ["open".to_string(), "reused".to_string()]
+        );
+        assert_eq!(
+            store.unresolved_background_agent_ids("s-1"),
+            ["agent-open".to_string()]
+        );
+        let lifecycle_rows: i64 = store
+            .conn()
+            .query_row(
+                "SELECT count(*) FROM acp_events WHERE session_id = 's-1' AND discriminant IN
+                 ('BackgroundTaskStarted', 'BackgroundTaskFinished',
+                  'BackgroundAgentLaunched', 'BackgroundAgentCompleted')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            lifecycle_rows, 3,
+            "completed pairs age out; only the open starts stay"
+        );
+        let mut state = AcpState::new(AcpSessionId("s-1".into()), AgentName("claude".into()), None);
+        for (_, event) in store.replay_from("s-1", 0) {
+            state.apply_event(event).unwrap();
+        }
+        assert_eq!(
+            state.background_tasks,
+            ["open".to_string(), "reused".to_string()]
+        );
+    }
+
+    /// Nothing guarantees an adapter task id stays unique for a session, so a
+    /// finish only closes the starts before it.
+    #[test]
+    fn a_reused_task_id_is_open_after_its_earlier_finish() {
+        let (_tmp, store) = open_store(1000);
+        let started = || Event::BackgroundTaskStarted {
+            task_id: "t".into(),
+            tool_call_id: None,
+            description: "sleep".into(),
+        };
+        let finished = || Event::BackgroundTaskFinished {
+            task_id: "t".into(),
+        };
+        store.record("s-1", 1, &started()).unwrap();
+        store.record("s-1", 2, &finished()).unwrap();
+        assert!(store.unresolved_background_task_ids("s-1").is_empty());
+        store.record("s-1", 3, &started()).unwrap();
+        assert_eq!(
+            store.unresolved_background_task_ids("s-1"),
+            ["t".to_string()]
+        );
+    }
+
+    #[test]
+    fn unresolved_background_task_ids_skip_finished_tasks() {
+        let (_tmp, store) = open_store(1000);
+        let started = |id: &str| Event::BackgroundTaskStarted {
+            task_id: id.into(),
+            tool_call_id: None,
+            description: "sleep".into(),
+        };
+        store.record("s-1", 1, &started("t-1")).unwrap();
+        store.record("s-1", 2, &started("t-2")).unwrap();
+        store
+            .record(
+                "s-1",
+                3,
+                &Event::BackgroundTaskFinished {
+                    task_id: "t-1".into(),
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            store.unresolved_background_task_ids("s-1"),
+            ["t-2".to_string()]
+        );
+        assert!(store.unresolved_background_task_ids("s-2").is_empty());
     }
 
     fn bg_launched(agent_id: &str, output_file: &str) -> Event {

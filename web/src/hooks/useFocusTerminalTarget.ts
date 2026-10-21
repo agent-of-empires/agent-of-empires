@@ -8,8 +8,14 @@ import {
 } from "../lib/terminalFocus";
 import { listen } from "./domEvents";
 
-export function useFocusTerminalTarget(target: TerminalFocusTarget, ref: React.RefObject<HTMLElement | null>): void {
+/** `active` false (a hidden retained view) ignores focus events and keeps the latch for its own activation. */
+export function useFocusTerminalTarget(
+  target: TerminalFocusTarget,
+  ref: React.RefObject<HTMLElement | null>,
+  active = true,
+): void {
   useEffect(() => {
+    if (!active) return;
     const onFocusEvent = (e: Event) => {
       const detail = (e as CustomEvent<FocusTerminalDetail>).detail;
       if (detail?.target !== target) return;
@@ -18,9 +24,11 @@ export function useFocusTerminalTarget(target: TerminalFocusTarget, ref: React.R
       else setPendingTerminalFocus(target);
     };
     return listen(onFocusEvent, [window, FOCUS_TERMINAL_EVENT]);
-  }, [target, ref]);
+  }, [target, ref, active]);
 
+  // Spends the latch on activation, which no event handler sees.
   useEffect(() => {
-    if (consumePendingTerminalFocus(target)) ref.current?.focus();
-  }, [target, ref]);
+    // eslint-disable-next-line react-you-might-not-need-an-effect/no-event-handler
+    if (active && consumePendingTerminalFocus(target)) ref.current?.focus();
+  }, [target, ref, active]);
 }

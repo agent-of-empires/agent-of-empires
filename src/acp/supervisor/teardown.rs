@@ -107,7 +107,7 @@ impl<S: BroadcastSink> Supervisor<S> {
                 let handle = workers.remove(session_id);
                 drop(workers);
                 worker_registry::clear_restart_marker(session_id);
-                let Some(handle) = handle else {
+                let Some(mut handle) = handle else {
                     let settlement =
                         tear_down_runner(&*self.process_control, session_id, identity).await;
                     self.settle(&lease, settlement);
@@ -125,9 +125,19 @@ impl<S: BroadcastSink> Supervisor<S> {
                     warn!(target: "acp.supervisor", session = %session_id, ?close, "session close failed; continuing owned runtime cleanup");
                 }
                 let _ = handle.client.shutdown().await;
-                handle.drain_task.abort();
+                quiesce_drain(&mut handle.drain_task).await;
                 let settlement =
                     tear_down_runner(&*self.process_control, session_id, identity).await;
+                // The worker's tailer died with it, so a sub-agent still
+                // running on disk will never get its own terminal event and
+                // `has_active_background_agent` would stay true forever
+                // (#4001). Ahead of the `Stopped`, so a reader folding the log
+                // in order sees it cleared no later than the turn-end event,
+                // and ahead of the settle, which admits a replacement whose
+                // own work this sweep would otherwise finish.
+                if !is_test_worker(&handle) {
+                    self.finish_open_background_work(session_id);
+                }
                 // An in-process test worker has no scope.
                 if is_test_worker(&handle) {
                     self.settle(&lease, settlement);
@@ -136,25 +146,6 @@ impl<S: BroadcastSink> Supervisor<S> {
                 }
                 // Publish now so the UI clears its thinking state before the next reap tick.
                 if !is_test_worker(&handle) {
-                    // The worker's tailer died with it, so a sub-agent still
-                    // running on disk will never get its own terminal event
-                    // and `has_active_background_agent` would stay true
-                    // forever (#4001). Ahead of the `Stopped`, so a reader
-                    // folding the log in order sees it cleared no later than
-                    // the turn-end event.
-                    for agent_id in self.sink.unresolved_background_agent_ids(session_id) {
-                        self.publish_next(
-                            session_id,
-                            &Event::BackgroundAgentCompleted {
-                                agent_id,
-                                status: BackgroundAgentStatus::Detached,
-                                tools: Vec::new(),
-                                result: None,
-                                warning: None,
-                                ended_at: chrono::Utc::now(),
-                            },
-                        );
-                    }
                     self.publish_next(
                         session_id,
                         &Event::Stopped {
@@ -191,11 +182,39 @@ impl<S: BroadcastSink> Supervisor<S> {
                 let identity = RunnerIdentity::from_record(&record);
                 let settlement =
                     tear_down_runner(&*self.process_control, session_id, Some(identity)).await;
+                // Only the lease holder may sweep: without one another epoch
+                // owns the session, and its work is not ours to finish. The
+                // sweep runs before the settle admits a replacement, and even
+                // when the settlement is unproven: the stop is final, and
+                // gating on proof would pin the session busy until a retry
+                // succeeds.
                 if let Some(lease) = lease {
+                    self.finish_open_background_work(session_id);
                     self.settle_sweeping_if_owed(&lease, settlement).await;
                 }
                 Ok(())
             }
+        }
+    }
+
+    /// The stopped runner's tailer and task tracking died with it, so work
+    /// still open in the log will never report its end.
+    fn finish_open_background_work(&self, session_id: &str) {
+        for task_id in self.sink.unresolved_background_task_ids(session_id) {
+            self.publish_next(session_id, &Event::BackgroundTaskFinished { task_id });
+        }
+        for agent_id in self.sink.unresolved_background_agent_ids(session_id) {
+            self.publish_next(
+                session_id,
+                &Event::BackgroundAgentCompleted {
+                    agent_id,
+                    status: BackgroundAgentStatus::Detached,
+                    tools: Vec::new(),
+                    result: None,
+                    warning: None,
+                    ended_at: chrono::Utc::now(),
+                },
+            );
         }
     }
 
@@ -373,12 +392,26 @@ impl<S: BroadcastSink> Supervisor<S> {
             lease,
             identity,
         } = candidate;
-        let handle = {
+        // Take the teardown as `Stopping`, not leave the entry `Running`: a
+        // concurrent stop then sees a teardown in progress instead of settling
+        // it, and no replacement is admitted until the sweep below is done.
+        let mut handle = {
             let mut workers = self.workers.lock().await;
-            if !lock_recover(&self.lifecycle).release_running(&lease) {
+            let mut lifecycle = lock_recover(&self.lifecycle);
+            if !lifecycle
+                .running(&id)
+                .is_some_and(|(running, _)| running == lease)
+            {
                 return None;
             }
-            workers.remove(&id)?
+            let _ = lifecycle.begin_stop(&id, "registry_disowned");
+            match workers.remove(&id) {
+                Some(handle) => handle,
+                None => {
+                    lifecycle.settle(&lease, Settlement::Proven);
+                    return None;
+                }
+            }
         };
         // A marker authorizes a restart only of the generation that was stopped.
         let generation = identity.map_or(0, |i| i.generation);
@@ -394,6 +427,12 @@ impl<S: BroadcastSink> Supervisor<S> {
             reason,
             "registry entry gone while worker handle live; tearing down"
         );
+        // The drain would detach what the runner left open only on seeing a
+        // dropped worker, which it will not here, so sweep ourselves. Wait for
+        // it to be gone first: a start it is publishing would otherwise land
+        // after the sweep and keep the stopped session busy.
+        quiesce_drain(&mut handle.drain_task).await;
+        self.finish_open_background_work(&id);
         self.publish_next(
             &id,
             &Event::Stopped {
@@ -401,9 +440,18 @@ impl<S: BroadcastSink> Supervisor<S> {
             },
         );
         let _ = handle.client.shutdown().await;
-        handle.drain_task.abort();
+        // The runner is gone (its record was), so the teardown is proven.
+        self.settle(&lease, Settlement::Proven);
         Some(is_restart)
     }
+}
+
+/// Aborts a worker's drain and waits until it is gone. `abort` alone only
+/// flags the task: one already inside a publish finishes it first, so nothing
+/// may be swept for open work until this returns.
+async fn quiesce_drain(drain: &mut tokio::task::JoinHandle<()>) {
+    drain.abort();
+    let _ = drain.await;
 }
 
 /// Stops every scope of the session. Call only while the caller's lease
@@ -820,6 +868,61 @@ mod tests {
         );
     }
 
+    /// A runner left on disk by a previous daemon is stopped through the
+    /// `NotOwned` arm, which has no worker handle: its persisted open
+    /// background work must still be finished, or the session reads busy
+    /// forever after the stop.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn shutdown_of_an_unowned_runner_finishes_its_open_background_work() {
+        let (_home, _tmp) = isolate_home();
+        let (sink, store, _rx, _store_tmp) = channel_sink();
+        let session = "s-unowned-teardown";
+        store
+            .record(
+                session,
+                1,
+                &Event::BackgroundTaskStarted {
+                    task_id: "task-1".into(),
+                    tool_call_id: None,
+                    description: "sleep".into(),
+                },
+            )
+            .unwrap();
+        store
+            .record(
+                session,
+                2,
+                &Event::BackgroundAgentLaunched {
+                    agent_id: "bg-1".into(),
+                    tool_call_id: "tc-1".into(),
+                    description: "map backend".into(),
+                    prompt: "do it".into(),
+                    model: "claude-opus-4-8".into(),
+                    output_file: String::new(),
+                    started_at: chrono::Utc::now(),
+                },
+            )
+            .unwrap();
+        let dead_pid = {
+            let mut child = std::process::Command::new("/bin/sh")
+                .args(["-c", "exit 0"])
+                .spawn()
+                .expect("spawn helper");
+            let id = child.id();
+            let _ = child.wait();
+            id
+        };
+        save_record(session, dead_pid, 1);
+        let sup = Supervisor::new(sink);
+        sup.hydrate_seqs(store.all_session_seqs());
+
+        sup.shutdown(session).await.expect("unowned shutdown");
+
+        assert!(store.unresolved_background_task_ids(session).is_empty());
+        assert!(store.unresolved_background_agent_ids(session).is_empty());
+    }
+
     #[tokio::test]
     #[serial_test::serial]
     async fn reaper_honors_only_a_restart_marker_for_the_stopped_generation() {
@@ -857,6 +960,455 @@ mod tests {
                 "{id}: the marker is consumed"
             );
         }
+    }
+
+    /// The reaper tears a worker down once its registry record is gone, ahead
+    /// of the drain's own detach (it releases the lease first), so it must
+    /// finish the open background work itself.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn reaping_a_disowned_worker_finishes_its_open_background_work() {
+        let _home = isolate_home();
+        let (sink, store, _rx, _store_tmp) = channel_sink();
+        let id = "s-reap-open-task";
+        store
+            .record(
+                id,
+                1,
+                &Event::BackgroundTaskStarted {
+                    task_id: "task-1".into(),
+                    tool_call_id: None,
+                    description: "sleep".into(),
+                },
+            )
+            .unwrap();
+        let sup = Supervisor::new(sink);
+        sup.hydrate_seqs(store.all_session_seqs());
+        let socket = worker_registry::socket_path_for(id).unwrap();
+        sup.test_install_runner(id, runner_config(socket), None)
+            .await;
+
+        sup.reap_user_stopped().await;
+
+        assert!(store.unresolved_background_task_ids(id).is_empty());
+    }
+
+    /// Publishes like the production sink, except that an event matching
+    /// `park_on` parks inside `publish` until released, then acknowledges once
+    /// the publish has returned. The publisher is then mid-publish on its own
+    /// thread while a teardown runs.
+    struct GatedSink {
+        inner: Arc<super::super::ChannelSink>,
+        park_on: fn(&Event) -> bool,
+        entered: tokio::sync::mpsc::UnboundedSender<()>,
+        release: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
+        done: tokio::sync::mpsc::UnboundedSender<()>,
+        /// Signalled once a teardown has queried the open work to finish.
+        swept: tokio::sync::mpsc::UnboundedSender<()>,
+    }
+
+    impl GatedSink {
+        fn park(&self, event: &Event) -> bool {
+            let parks = (self.park_on)(event);
+            if parks {
+                let _ = self.entered.send(());
+                let _ = self.release.lock().unwrap().recv();
+            }
+            parks
+        }
+    }
+
+    impl BroadcastSink for GatedSink {
+        fn publish(&self, session_id: &str, seq: u64, event: &Event) {
+            let parked = self.park(event);
+            self.inner.publish(session_id, seq, event);
+            if parked {
+                let _ = self.done.send(());
+            }
+        }
+        fn publish_persisted(&self, session_id: &str, seq: u64, event: &Event) -> bool {
+            self.inner.publish_persisted(session_id, seq, event)
+        }
+        fn publish_from_worker(&self, session_id: &str, seq: u64, event: &Event, generation: u64) {
+            let parked = self.park(event);
+            self.inner
+                .publish_from_worker(session_id, seq, event, generation);
+            if parked {
+                let _ = self.done.send(());
+            }
+        }
+        fn unresolved_background_task_ids(&self, session_id: &str) -> Vec<String> {
+            let ids = self.inner.unresolved_background_task_ids(session_id);
+            let _ = self.swept.send(());
+            ids
+        }
+        fn unresolved_background_agent_ids(&self, session_id: &str) -> Vec<String> {
+            self.inner.unresolved_background_agent_ids(session_id)
+        }
+    }
+
+    /// A supervisor over a [`GatedSink`] plus the handles to drive its gate.
+    struct Parked {
+        sup: Arc<Supervisor<GatedSink>>,
+        store: Arc<crate::acp::event_store::EventStore>,
+        entered: tokio::sync::mpsc::UnboundedReceiver<()>,
+        done: tokio::sync::mpsc::UnboundedReceiver<()>,
+        swept: tokio::sync::mpsc::UnboundedReceiver<()>,
+        release: std::sync::mpsc::Sender<()>,
+        _keep: (
+            tokio::sync::broadcast::Receiver<crate::server::AcpBroadcastFrame>,
+            tempfile::TempDir,
+        ),
+    }
+
+    fn parked(park_on: fn(&Event) -> bool) -> Parked {
+        let (inner, store, rx, store_tmp) = channel_sink();
+        let (entered_tx, entered) = tokio::sync::mpsc::unbounded_channel();
+        let (done_tx, done) = tokio::sync::mpsc::unbounded_channel();
+        let (swept_tx, swept) = tokio::sync::mpsc::unbounded_channel();
+        let (release, release_rx) = std::sync::mpsc::channel();
+        let sup = Arc::new(Supervisor::new(Arc::new(GatedSink {
+            inner,
+            park_on,
+            entered: entered_tx,
+            release: std::sync::Mutex::new(release_rx),
+            done: done_tx,
+            swept: swept_tx,
+        })));
+        Parked {
+            sup,
+            store,
+            entered,
+            done,
+            swept,
+            release,
+            _keep: (rx, store_tmp),
+        }
+    }
+
+    impl Parked {
+        /// Waits until a publish is parked in the gate. The deadline only
+        /// bounds a failure.
+        async fn entered(&mut self) {
+            tokio::time::timeout(Duration::from_secs(5), self.entered.recv())
+                .await
+                .expect("a publish parked in the gate")
+                .expect("sink alive");
+        }
+
+        /// Opens the gate and waits for the parked publish to return, so the
+        /// event is persisted before anything asserts on the store.
+        async fn release_and_wait(&mut self) {
+            self.release.send(()).unwrap();
+            tokio::time::timeout(Duration::from_secs(5), self.done.recv())
+                .await
+                .expect("the parked publish returned")
+                .expect("sink alive");
+        }
+    }
+
+    /// A start the drain is publishing when the reaper runs must not land
+    /// after the final sweep, or the stopped session stays busy for good.
+    /// Checkpoints before the gate opens: the drain is parked mid-publish, and
+    /// the reaper took the teardown (handle removed, entry `Stopping`) and is
+    /// still running. A reaper that does not wait for the drain then sweeps
+    /// while the drain is parked, which the sink reports. The reaper is waiting
+    /// on the drain when no sweep shows within the observation window. The
+    /// assertion follows the acknowledgment that the parked publish returned.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[serial_test::serial]
+    async fn a_start_in_flight_in_the_drain_cannot_outlive_the_reap_sweep() {
+        let _home = isolate_home();
+        let mut p = parked(|event| matches!(event, Event::BackgroundTaskStarted { .. }));
+        let id = "s-reap-inflight-start";
+        let (client, _client_tx) =
+            crate::acp::acp_client::AcpClient::fake_for_test(AcpSessionId(id.into()));
+        let lease = p
+            .sup
+            .test_install_handle(id, client, WorkerKind::Attached, None)
+            .await;
+        let (inbound_tx, inbound_rx) = tokio::sync::mpsc::channel::<Event>(16);
+        let drain = p.sup.start_drain_task(id.into(), lease, inbound_rx, None);
+        {
+            let mut workers = p.sup.workers.lock().await;
+            let handle = workers.get_mut(id).expect("installed worker");
+            handle.drain_task.abort();
+            handle.drain_task = drain;
+        }
+        inbound_tx
+            .send(Event::BackgroundTaskStarted {
+                task_id: "inflight".into(),
+                tool_call_id: None,
+                description: "sleep".into(),
+            })
+            .await
+            .unwrap();
+        p.entered().await;
+
+        let reaper = {
+            let sup = Arc::clone(&p.sup);
+            tokio::spawn(async move { sup.reap_user_stopped().await })
+        };
+        // Checkpoint: the reaper owns the teardown. The deadline only bounds a
+        // failure.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while lock_recover(&p.sup.lifecycle).phase(id) != WorkerPhase::Stopping {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the reaper never took the teardown"
+            );
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            !p.sup.workers.lock().await.contains_key(id),
+            "the reaper removed the worker handle"
+        );
+        // Observation window: a reaper that skips the drain wait sweeps now.
+        let swept_while_parked = tokio::time::timeout(Duration::from_millis(300), p.swept.recv())
+            .await
+            .is_ok();
+        p.release_and_wait().await;
+        reaper.await.unwrap();
+
+        assert!(
+            p.store.unresolved_background_task_ids(id).is_empty(),
+            "a start published after the sweep stays open for good \
+             (swept while the drain was parked: {swept_while_parked})"
+        );
+        assert!(
+            p.store
+                .replay_from(id, 0)
+                .iter()
+                .any(|(_, event)| matches!(event, Event::Stopped { .. })),
+            "the teardown reached its terminal publication"
+        );
+    }
+
+    /// While a teardown publishes the finishes of the stopped worker's open
+    /// work, a replacement must not be admitted: its own task start could
+    /// otherwise be finished by that same sweep.
+    async fn assert_replacement_fenced_through_sweep(
+        p: &mut Parked,
+        id: &str,
+        teardown: tokio::task::JoinHandle<()>,
+    ) {
+        // The sweep is now parked publishing the synthetic finish.
+        p.entered().await;
+        assert!(
+            lock_recover(&p.sup.lifecycle)
+                .admit(id, ResumeKind::Spawn)
+                .is_err(),
+            "a replacement was admitted while the sweep was still publishing"
+        );
+        p.release_and_wait().await;
+        teardown.await.unwrap();
+        assert!(
+            p.store.unresolved_background_task_ids(id).is_empty(),
+            "the sweep finished the open task"
+        );
+        assert!(
+            lock_recover(&p.sup.lifecycle)
+                .admit(id, ResumeKind::Spawn)
+                .is_ok(),
+            "once the teardown settled, a replacement is admitted again"
+        );
+    }
+
+    fn open_task(store: &crate::acp::event_store::EventStore, id: &str) {
+        store
+            .record(
+                id,
+                1,
+                &Event::BackgroundTaskStarted {
+                    task_id: "open".into(),
+                    tool_call_id: None,
+                    description: "sleep".into(),
+                },
+            )
+            .unwrap();
+    }
+
+    fn parks_on_finish(event: &Event) -> bool {
+        matches!(event, Event::BackgroundTaskFinished { .. })
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[serial_test::serial]
+    async fn the_reaper_fences_replacement_admission_through_its_sweep() {
+        let _home = isolate_home();
+        let mut p = parked(parks_on_finish);
+        let id = "s-fence-reaper";
+        open_task(&p.store, id);
+        p.sup.hydrate_seqs(p.store.all_session_seqs());
+        let socket = worker_registry::socket_path_for(id).unwrap();
+        p.sup
+            .test_install_runner(id, runner_config(socket), None)
+            .await;
+        let teardown = {
+            let sup = Arc::clone(&p.sup);
+            tokio::spawn(async move {
+                sup.reap_user_stopped().await;
+            })
+        };
+        assert_replacement_fenced_through_sweep(&mut p, id, teardown).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[serial_test::serial]
+    async fn an_owned_shutdown_fences_replacement_admission_through_its_sweep() {
+        let _home = isolate_home();
+        let mut p = parked(parks_on_finish);
+        let id = "s-fence-owned";
+        open_task(&p.store, id);
+        p.sup.hydrate_seqs(p.store.all_session_seqs());
+        let socket = worker_registry::socket_path_for(id).unwrap();
+        p.sup
+            .test_install_runner(id, runner_config(socket), None)
+            .await;
+        let teardown = {
+            let sup = Arc::clone(&p.sup);
+            tokio::spawn(async move { sup.shutdown(id).await.expect("shutdown") })
+        };
+        assert_replacement_fenced_through_sweep(&mut p, id, teardown).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[serial_test::serial]
+    async fn an_unowned_shutdown_fences_replacement_admission_through_its_sweep() {
+        let _home = isolate_home();
+        let mut p = parked(parks_on_finish);
+        let id = "s-fence-unowned";
+        open_task(&p.store, id);
+        p.sup.hydrate_seqs(p.store.all_session_seqs());
+        let dead_pid = {
+            let mut child = std::process::Command::new("/bin/sh")
+                .args(["-c", "exit 0"])
+                .spawn()
+                .expect("spawn helper");
+            let pid = child.id();
+            let _ = child.wait();
+            pid
+        };
+        save_record(id, dead_pid, 1);
+        let teardown = {
+            let sup = Arc::clone(&p.sup);
+            tokio::spawn(async move { sup.shutdown(id).await.expect("unowned shutdown") })
+        };
+        assert_replacement_fenced_through_sweep(&mut p, id, teardown).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[serial_test::serial]
+    async fn a_closed_worker_fences_replacement_admission_through_its_detach_sweep() {
+        let _home = isolate_home();
+        let mut p = parked(parks_on_finish);
+        let id = "s-fence-eof";
+        open_task(&p.store, id);
+        p.sup.hydrate_seqs(p.store.all_session_seqs());
+        let (client, _client_tx) =
+            crate::acp::acp_client::AcpClient::fake_for_test(AcpSessionId(id.into()));
+        let lease = p
+            .sup
+            .test_install_handle(id, client, WorkerKind::Attached, None)
+            .await;
+        let (inbound_tx, inbound_rx) = tokio::sync::mpsc::channel::<Event>(16);
+        // No registry record, so the closed worker is dropped without a respawn.
+        let drain = p.sup.start_drain_task(id.into(), lease, inbound_rx, None);
+        drop(inbound_tx);
+        let teardown = tokio::spawn(async move { drain.await.unwrap() });
+        assert_replacement_fenced_through_sweep(&mut p, id, teardown).await;
+    }
+
+    /// A tailer waiting on a task that never reports must not keep the
+    /// worker's channel open: with a registry record that still matches the
+    /// worker, neither the reaper nor a reconcile steps in, so the drain's own
+    /// EOF handling is the only way recovery starts.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[serial_test::serial]
+    async fn an_abrupt_worker_loss_is_not_held_open_by_a_pending_task_tailer() {
+        use crate::acp::background_agent::TailerStart;
+        use crate::acp::task_transcript::TaskTailer;
+
+        let _home = isolate_home();
+        let (sink, _store, _rx, _store_tmp) = channel_sink();
+        let sup = Supervisor::new(sink);
+        let id = "s-abrupt-loss";
+        save_record(id, std::process::id(), 0);
+
+        // A transcript that holds no notification for the task.
+        let claude_home = tempfile::tempdir().unwrap();
+        let projects = claude_home.path().join("projects/-enc");
+        std::fs::create_dir_all(&projects).unwrap();
+        std::fs::write(projects.join("sess.jsonl"), "{\"type\":\"user\"}\n").unwrap();
+
+        let (client, _client_tx) =
+            crate::acp::acp_client::AcpClient::fake_for_test(AcpSessionId(id.into()));
+        let lease = sup
+            .test_install_handle(id, client, WorkerKind::Attached, None)
+            .await;
+        let (inbound_tx, inbound_rx) = tokio::sync::mpsc::channel::<Event>(16);
+        let drain = sup.start_drain_task(id.into(), lease, inbound_rx, None);
+        let (idle_tx, mut idle_rx) = tokio::sync::mpsc::unbounded_channel();
+        TaskTailer {
+            claude_home: Some(claude_home.path().to_path_buf()),
+            watch: crate::file_watch::FileWatchService::noop(),
+            task_id: "task-1".into(),
+            session_id: "sess".into(),
+            active: Arc::default(),
+            event_tx: inbound_tx.downgrade(),
+            start: TailerStart::Live,
+            idle: Arc::new(move || {
+                let _ = idle_tx.send(());
+            }),
+        }
+        .spawn();
+        // The tailer is pending: it scanned the transcript and found no end.
+        tokio::time::timeout(Duration::from_secs(10), idle_rx.recv())
+            .await
+            .expect("the tailer reached its wait")
+            .expect("hook alive");
+
+        // The connection dies abruptly.
+        drop(inbound_tx);
+        tokio::time::timeout(Duration::from_secs(5), drain)
+            .await
+            .expect("the drain reaches EOF handling without a notification or an external stop")
+            .unwrap();
+    }
+
+    /// A concurrent stop must not settle a teardown the reaper owns, or a
+    /// replacement is admitted before the reaper's sweep has run.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[serial_test::serial]
+    async fn a_concurrent_shutdown_cannot_settle_a_reaper_owned_teardown() {
+        let _home = isolate_home();
+        let mut p = parked(parks_on_finish);
+        let id = "s-fence-reaper-shutdown";
+        open_task(&p.store, id);
+        p.sup.hydrate_seqs(p.store.all_session_seqs());
+        let socket = worker_registry::socket_path_for(id).unwrap();
+        p.sup
+            .test_install_runner(id, runner_config(socket), None)
+            .await;
+        let reaper = {
+            let sup = Arc::clone(&p.sup);
+            tokio::spawn(async move {
+                sup.reap_user_stopped().await;
+            })
+        };
+        // The reaper's sweep is parked publishing the synthetic finish.
+        p.entered().await;
+
+        p.sup.shutdown(id).await.expect("concurrent shutdown");
+        assert!(
+            lock_recover(&p.sup.lifecycle)
+                .admit(id, ResumeKind::Spawn)
+                .is_err(),
+            "the concurrent shutdown settled the reaper's teardown"
+        );
+        p.release_and_wait().await;
+        reaper.await.unwrap();
+        assert!(p.store.unresolved_background_task_ids(id).is_empty());
     }
 
     #[tokio::test]
@@ -962,11 +1514,18 @@ mod tests {
             sup.test_insert_worker(session_id).await;
             let shutdown = sup.shutdown_and_wait(session_id, Duration::from_secs(2));
             tokio::pin!(shutdown);
+            // Waiting for the aborted drain takes a few scheduler turns; a
+            // poll wait would sleep on a timer far longer than these yields.
+            let mut outcome = None;
+            for _ in 0..16 {
+                if let std::task::Poll::Ready(result) = futures_util::poll!(&mut shutdown) {
+                    outcome = Some(result);
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
             assert!(
-                matches!(
-                    futures_util::poll!(&mut shutdown),
-                    std::task::Poll::Ready(Ok(()))
-                ),
+                matches!(outcome, Some(Ok(()))),
                 "{session_id}: without a PID source shutdown must not enter a poll wait"
             );
         }

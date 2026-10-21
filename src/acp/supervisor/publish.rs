@@ -231,6 +231,13 @@ pub(super) fn detach_orphaned_background_agents_on<S: BroadcastSink>(
     session_id: &str,
     warning: &str,
 ) {
+    for task_id in sink.unresolved_background_task_ids(session_id) {
+        sink.publish(
+            session_id,
+            next_seq(next_seqs, session_id),
+            &Event::BackgroundTaskFinished { task_id },
+        );
+    }
     let stale_ids = sink.unresolved_background_agent_ids(session_id);
     if stale_ids.is_empty() {
         return;

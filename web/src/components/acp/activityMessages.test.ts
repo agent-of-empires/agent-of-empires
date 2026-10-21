@@ -324,6 +324,11 @@ describe("subagents", () => {
       { memory_recall: { mode: "synthesize" as const, synthesized_text: "remembered" } },
       { mode: "synthesize", synthesized_text: "remembered" },
     ],
+    [
+      "_aoe_diffs",
+      { diffs: [{ path: "/a.md", old_text: null, new_text: "x", created_at: AT }] },
+      [{ path: "/a.md", old_text: null, new_text: "x", created_at: AT }],
+    ],
   ])("smuggles %s through argsText", (key, over, expected) => {
     const [part] = toolParts([toolStart("x", over)]);
     expect(payload(part!)[key]).toEqual(expected);

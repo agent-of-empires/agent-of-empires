@@ -104,6 +104,7 @@ fn main() -> Result<()> {
             std::env::set_var("AOE_DAEMON_URL", url);
         }
     }
+    agent_of_empires::acp::client::daemon_manager::set_autostart_disabled(cli.no_autostart);
     seed_cityhall_env(&cli);
     tokio::runtime::Runtime::new()?.block_on(run_cli(cli, read_source))
 }

@@ -9,6 +9,12 @@ on:
   pull_request:
   merge_group:
 
+# The event keeps a queue run and the push of its fast-forwarded commit apart.
+# Queue refs are unique per entry; newer PR and main pushes cancel older runs.
+concurrency:
+  group: ci-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
 env:
   CARGO_TERM_COLOR: always
 
@@ -44,7 +50,7 @@ jobs:
       - uses: ./.github/actions/rust-toolchain
         with:
           components: clippy
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           cache-bin: "false"
           save-if: ${{ github.ref == 'refs/heads/main' }}
@@ -94,10 +100,10 @@ jobs:
         id: msrv
         run: |
           python3 -c 'import tomllib; print("version=" + tomllib.load(open("Cargo.toml", "rb"))["package"]["rust-version"])' >> "$GITHUB_OUTPUT"
-      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
           toolchain: ${{ steps.msrv.outputs.version }}
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           cache-bin: "false"
           save-if: ${{ github.ref == 'refs/heads/main' }}
@@ -115,36 +121,24 @@ jobs:
           printf '<!doctype html><title>aoe msrv placeholder</title>\n' > target/ci-web-dist/index.html
           AOE_WEB_DIST="$PWD/target/ci-web-dist" cargo +"$MSRV" check --locked --workspace --features web
 
-  web-fmt:
-    name: Format (web)
+  web-lint:
+    name: Lint (web)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: '22'
+          cache: npm
+          cache-dependency-path: web/package-lock.json
       - name: Install dependencies
         working-directory: web
         run: npm ci
       - name: Check formatting
         working-directory: web
         run: npm run format:check
-
-  eslint:
-    name: ESLint (web)
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
-        with:
-          node-version: '22'
-      - name: Install dependencies
-        working-directory: web
-        run: npm ci
       - name: Run ESLint
         working-directory: web
         run: npm run lint
@@ -165,15 +159,22 @@ jobs:
       - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
 
   docs:
+    # Also the skill check: both build xtask.
     name: Docs
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: ./.github/actions/rust-toolchain
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           cache-bin: "false"
           save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Check skill file references valid CLI commands
+        run: cargo xtask check-skill
+      # The workspace declares no `default-members`, so every other `cargo
+      # test` in these workflows is scoped to the root package (#3479).
+      - name: Cargo test (non-default workspace members)
+        run: cargo test -p xtask -p aoe-plugin-api
       - name: Check CLI docs are up-to-date
         run: |
           cargo xtask gen-docs
@@ -197,72 +198,20 @@ jobs:
           printf '<!doctype html><title>aoe docs placeholder</title>\n' > target/ci-web-dist/index.html
           AOE_WEB_DIST="$PWD/target/ci-web-dist" cargo doc --no-deps --features web
 
-  skill:
-    name: Skill Check
+  script-selftests:
+    # Toolchain-free self-tests for the scripts other workflows rely on:
+    # verify-shared-target.sh (kache verify), select-internal-pr.py
+    # (nix-npm-hash.yml), check-dependabot-pr.py (dependabot-auto-merge.yml)
+    # and classify-cachix-failure.py (cachix-push.yml).
+    name: Script Self-Tests
     runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: ./.github/actions/rust-toolchain
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-        with:
-          cache-bin: "false"
-          save-if: ${{ github.ref == 'refs/heads/main' }}
-      - name: Check skill file references valid CLI commands
-        run: cargo xtask check-skill
-      # The workspace declares no `default-members`, so every other `cargo
-      # test` in these workflows is scoped to the root package and these two
-      # members' tests ran nowhere (#3479). This job already builds xtask.
-      - name: Cargo test (non-default workspace members)
-        run: cargo test -p xtask -p aoe-plugin-api
-
-  build-cache-selftest:
-    name: Build Cache Self-Test
-    runs-on: ubuntu-latest
-    # Guards the zero-copy threshold checker that the kache verify script
-    # relies on (scripts/verify-shared-target.sh). No cargo, no kache, no
-    # toolchain: feeds a known reflinked report and a known all-copies report
-    # through the checker and asserts it accepts the first and rejects the
-    # second. Runs in seconds.
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       - run: scripts/verify-shared-target.sh --self-test
-
-  pr-lookup-selftest:
-    name: PR Lookup Self-Test
-    runs-on: ubuntu-latest
-    # Guards the selector nix-npm-hash.yml uses to decide which PR it edits,
-    # labels `automated` and queues for auto-merge. No toolchain: feeds
-    # candidate lists (an internal PR, a fork PR on the same branch name,
-    # both, duplicates) through the selector and asserts it picks the
-    # base-repo PR or fails closed. Runs in seconds.
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
       - run: python3 .github/scripts/select-internal-pr.py --self-test
-
-  dependabot-check-selftest:
-    name: Dependabot Check Self-Test
-    runs-on: ubuntu-latest
-    # Guards the supply-chain checker dependabot-auto-merge.yml runs before
-    # queueing a merge. No toolchain; runs in seconds.
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
       - run: python3 .github/scripts/check-dependabot-pr.py --self-test
-
-  cachix-alert-selftest:
-    name: Cachix Alert Self-Test
-    runs-on: ubuntu-latest
-    # Guards the classifier cachix-push.yml uses to decide whether a failed
-    # build on main opens an issue. No toolchain; runs in seconds.
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
       - run: python3 .github/scripts/classify-cachix-failure.py --self-test
 
   nix:
@@ -458,9 +407,11 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: '22'
+          cache: npm
+          cache-dependency-path: website/package-lock.json
       - name: Install and build
         working-directory: website
         run: npm install && npm run build

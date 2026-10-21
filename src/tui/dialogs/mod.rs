@@ -66,7 +66,6 @@ pub use rename::{RenameData, RenameDialog, RenameMode};
 pub use repo_trust::{RepoTrustAction, RepoTrustDialog};
 pub use restart::{RestartData, RestartDialog};
 pub use send_message::SendMessageDialog;
-pub(crate) use serve::start_local_daemon_and_wait;
 pub use serve::{ServeAction, ServeView};
 pub use skills_manager::SkillsManagerDialog;
 pub use snooze_duration::SnoozeDurationDialog;

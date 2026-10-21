@@ -78,11 +78,11 @@ cargo test
 
 Web changes have additional checks in [web/AGENTS.md](web/AGENTS.md).
 
-Add `ci-macos` when a PR needs macOS coverage; a skipped check is not coverage.
-The [labeler](.github/workflows/labeler.yml) requests it conservatively for
-sensitive changes or potentially incomplete file data. When adding macOS-specific
-code or tests outside its covered paths, extend its sensitive-file list. It runs
-from the base branch, so new or changed detection rules may need a manual label.
+A skipped macOS check is not coverage. The `macOS gate` job in
+[tests.yml](.github/workflows/tests.yml) runs macOS for sensitive changes or
+potentially incomplete file data; when adding macOS-specific code or tests
+outside its covered paths, extend its sensitive-file list. To force a run, add
+`ci-macos` and re-run the `macOS gate` job.
 
 Releases are staged weekly. Maintainer instructions live in
 [docs/development/releases.md](docs/development/releases.md).
