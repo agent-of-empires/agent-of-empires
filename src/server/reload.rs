@@ -560,6 +560,17 @@ pub(crate) async fn reload_state_instances_from_disk(
         return;
     }
 
+    // A failed enumeration is unknown, not empty: keep the accepted rows and overlay state.
+    if cache.health.enumeration_failed {
+        state
+            .runtime_read_cache
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .health
+            .enumeration_failed = true;
+        return;
+    }
+
     let prior_by_id = PriorById::drain_from(&mut current);
     let mut previous_cache = state
         .runtime_read_cache

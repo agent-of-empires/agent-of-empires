@@ -16,19 +16,17 @@
 //! 1. `AOE_DAEMON_URL` (+ optional `AOE_DAEMON_TOKEN`).
 //! 2. Local `<app_dir>/serve.url` paired with a live `serve.pid`.
 //!
-//! [`daemon_manager::require_daemon`] returns
-//! [`daemon_manager::ManagerError::NoDaemonRunning`] when neither
-//! resolves; callers render the contained hint and bail rather than
-//! starting a daemon by side-effect, so the user keeps the choice
-//! between localhost, Tailscale, and Cloudflare explicit.
+//! [`daemon_manager::require_daemon`] starts a local daemon when neither
+//! resolves, unless `AOE_DAEMON_URL` is set or autostart is disabled.
 
+pub(crate) mod autostart;
 pub mod daemon_manager;
 pub mod discovery;
 pub mod http;
 pub(crate) mod passphrase_session;
 pub mod ws;
 
-pub use daemon_manager::{require_daemon, ManagerError};
+pub use daemon_manager::{ensure_daemon, locate_daemon, require_daemon, ManagerError};
 pub use discovery::{discover, DaemonEndpoint, DiscoveryError, Source};
 pub use http::{HttpClient, HttpError, PluginCommandView, REPLAY_PAGE_SIZE};
 pub use ws::{

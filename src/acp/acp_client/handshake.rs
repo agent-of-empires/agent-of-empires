@@ -137,6 +137,19 @@ mod tests {
         }
     }
 
+    /// Any `_meta.jetbrains.air` makes claude-agent-acp treat aoe as the AIR
+    /// client, which strips the text and `rawOutput` of a Read that names a
+    /// path (the Read card would show only "completed").
+    #[test]
+    fn initialize_does_not_declare_the_air_extension() {
+        let wire = serde_json::to_value(build_initialize_request()).expect("serialize");
+        assert_eq!(
+            wire.pointer("/clientCapabilities/_meta/jetbrains"),
+            None,
+            "AIR client mode changes tool output: {wire}"
+        );
+    }
+
     /// The adapter silently falls back to untyped text unless these exact keys
     /// are advertised (#4242 for notices). Every other test builds its own
     /// update, so a drift here would kill the feature with the suite green.

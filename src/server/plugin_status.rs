@@ -1,4 +1,5 @@
-//! Forwards daemon status transitions to plugin workers as `session.status.changed`.
+//! Forwards daemon status transitions and session lifecycle changes to plugin workers as
+//! `session.status.changed` and `session.lifecycle.changed`.
 
 use std::sync::Arc;
 
@@ -8,11 +9,14 @@ use tokio_util::sync::CancellationToken;
 use super::push::StatusChange;
 use super::AppState;
 use crate::plugin::host::PluginHost;
+use crate::session::lifecycle::LifecycleChange;
 
-/// Spawn the forwarder. The caller guarantees the plugin host exists.
+/// Spawn the status and lifecycle forwarders. The caller guarantees the plugin host exists.
 pub fn spawn_forwarder(state: Arc<AppState>, host: Arc<PluginHost>) {
     let rx = state.status_tx.subscribe();
-    tokio::spawn(run_forwarder(rx, host, state.shutdown.clone()));
+    tokio::spawn(run_forwarder(rx, host.clone(), state.shutdown.clone()));
+    let rx = state.lifecycle.subscribe();
+    tokio::spawn(run_lifecycle_forwarder(rx, host, state.shutdown.clone()));
 }
 
 pub(crate) async fn run_forwarder(
@@ -36,9 +40,29 @@ pub(crate) async fn run_forwarder(
     }
 }
 
+pub(crate) async fn run_lifecycle_forwarder(
+    mut rx: broadcast::Receiver<LifecycleChange>,
+    host: Arc<PluginHost>,
+    shutdown: CancellationToken,
+) {
+    loop {
+        tokio::select! {
+            recv = rx.recv() => match recv {
+                Ok(change) => host.emit_session_lifecycle_changed(&change).await,
+                Err(RecvError::Lagged(n)) => {
+                    tracing::warn!(target: "plugin.host", lagged = n, "plugin lifecycle forwarder lagged, skipped events");
+                }
+                Err(RecvError::Closed) => return,
+            },
+            _ = shutdown.cancelled() => return,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::session::lifecycle::LifecycleKind;
     use crate::session::Status;
     use std::time::Duration;
     use tokio::sync::broadcast;
@@ -144,6 +168,36 @@ mod tests {
         assert_eq!(next_session_id(&mut rx).await, "sess-5");
         tx.send(change(6)).unwrap();
         assert_eq!(next_session_id(&mut rx).await, "sess-6");
+
+        shutdown.cancel();
+        task.await.unwrap();
+    }
+
+    fn lifecycle_change(session: &str, profile: &str) -> LifecycleChange {
+        LifecycleChange {
+            session_id: session.to_string(),
+            effective_profile: profile.to_string(),
+            kind: LifecycleKind::Created,
+            at: chrono::Utc::now(),
+            summary: Some(serde_json::json!({ "id": session })),
+        }
+    }
+
+    #[tokio::test]
+    async fn lifecycle_forwarder_delivers_to_lifecycle_workers_of_the_host_profile() {
+        let (host, _status_rx, _tmp) = host_with_worker().await;
+        let mut rx = host
+            .register_lifecycle_test_worker("acme.lifecycle", 16)
+            .await;
+        let (tx, brx) = broadcast::channel(16);
+        let shutdown = CancellationToken::new();
+        let task = tokio::spawn(run_lifecycle_forwarder(brx, host, shutdown.clone()));
+
+        // Events are handled in order, so seeing sess-2 means sess-1 was already dropped.
+        tx.send(lifecycle_change("sess-1", "other")).unwrap();
+        tx.send(lifecycle_change("sess-2", "default")).unwrap();
+        assert_eq!(next_session_id(&mut rx).await, "sess-2");
+        assert!(rx.try_recv().is_err(), "nothing else was forwarded");
 
         shutdown.cancel();
         task.await.unwrap();

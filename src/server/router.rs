@@ -172,6 +172,7 @@ pub(super) fn build_router(state: Arc<AppState>) -> Router {
         )
         .route("/api/docker/status", get(api::docker_status))
         .route("/api/system/health", get(api::system_health))
+        .route("/api/system/logs", get(api::get_logs))
         // Settings + themes
         .route(
             "/api/settings",
@@ -339,6 +340,10 @@ pub(super) fn build_router(state: Arc<AppState>) -> Router {
         .route(
             "/api/sessions/{id}/acp/install-agent",
             post(api::install_agent),
+        )
+        .route(
+            "/api/sessions/{id}/acp/install-info",
+            get(api::agent_install_info),
         )
         .route("/api/sessions/{id}/acp", delete(api::shutdown_acp))
         .route(

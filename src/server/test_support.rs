@@ -197,6 +197,7 @@ fn build_test_app_state_impl(
         changed_files_cache: std::sync::RwLock::new(std::collections::HashMap::new()),
         remote_owner_cache: RwLock::new(HashMap::new()),
         status_tx: broadcast::channel(STATUS_CHANNEL_CAPACITY).0,
+        lifecycle: crate::server::lifecycle_feed::LifecycleFeed::new(),
         acp_events_tx,
         acp_event_store: event_store,
         acp_control_cache,

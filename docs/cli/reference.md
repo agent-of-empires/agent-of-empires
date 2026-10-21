@@ -22,6 +22,7 @@ This document contains the help content for the `aoe` command-line program.
 * [`aoe session restart`↴](#aoe-session-restart)
 * [`aoe session attach`↴](#aoe-session-attach)
 * [`aoe session show`↴](#aoe-session-show)
+* [`aoe session wait`↴](#aoe-session-wait)
 * [`aoe session rename`↴](#aoe-session-rename)
 * [`aoe session set-worktree-name`↴](#aoe-session-set-worktree-name)
 * [`aoe session capture`↴](#aoe-session-capture)
@@ -186,6 +187,9 @@ Run without arguments to launch the TUI dashboard.
 * `--daemon-url <DAEMON_URL>` — Select a daemon endpoint for read-only CLI commands or the TUI
 
    Explicit CLI endpoints never fall back. `AOE_DAEMON_URL` discovery may fall back to local storage before reaching a TCP peer, with a notice. Authenticate CLI reads with `AOE_DAEMON_TOKEN` or `AOE_DAEMON_PASSPHRASE`; TUI session lists support bearer tokens only. An unauthenticated daemon needs neither. See the HTTP API reference for transport and fallback rules.
+* `--no-autostart` — Fail instead of starting a local daemon when none is running
+
+   Also read from `AOE_NO_AUTOSTART=1`. Has no effect with `--daemon-url` or `AOE_DAEMON_URL`, which never start a daemon.
 
 
 
@@ -417,6 +421,7 @@ Manage session lifecycle (start, stop, attach, etc.)
 * `restart` — Restart session (or all sessions with `--all`)
 * `attach` — Attach to session interactively
 * `show` — Show session details
+* `wait` — Block until a session's agent activity status matches one of the `--until` values. Exits 0 on a match, 124 on timeout (like `timeout(1)`), and 1 if the session stops. Tmux sessions only
 * `rename` — Rename a session
 * `set-worktree-name` — Edit a managed worktree session's workdir directory name (and, optionally, its git branch). Moves the worktree directory in place; the session must not be running. See #1723
 * `capture` — Capture tmux pane output
@@ -506,6 +511,28 @@ Show session details
 ###### **Options:**
 
 * `--json` — Output as JSON
+
+
+
+## `aoe session wait`
+
+Block until a session's agent activity status matches one of the `--until` values. Exits 0 on a match, 124 on timeout (like `timeout(1)`), and 1 if the session stops. Tmux sessions only
+
+**Usage:** `aoe session wait [OPTIONS] --until <UNTIL> <IDENTIFIER>`
+
+###### **Arguments:**
+
+* `<IDENTIFIER>` — Session ID or title
+
+###### **Options:**
+
+* `--until <UNTIL>` — Activity status to wait for; repeat to accept any of several
+
+  Possible values: `running`, `waiting`, `idle`, `error`
+
+* `--timeout <TIMEOUT>` — Give up after this many milliseconds
+
+  Default value: `300000`
 
 
 
@@ -608,7 +635,7 @@ Set the resume target for a session; an agent whose exact native resume AoE cann
 
 ###### **Options:**
 
-* `--store <STORE>` — Assert the native store: a Claude store directory, or a Pi/OMP transcript file
+* `--store <STORE>` — Assert the native store: the Claude config root (the directory containing `projects/`), or a Pi/OMP transcript file
 
 
 

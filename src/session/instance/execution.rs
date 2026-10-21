@@ -192,6 +192,47 @@ pub(crate) fn attest_observed_default_store(
     true
 }
 
+/// A Claude `--store` must be the config root holding the transcript. When it
+/// does not, a `projects` directory (or `projects/<encoded cwd>`) is the likely
+/// mistake, so the error names the root to use instead.
+fn ensure_claude_store_root(
+    store: &std::path::Path,
+    cwd: &std::path::Path,
+    sid: &str,
+) -> Result<()> {
+    let store = crate::session::capture::canonicalize_or_raw(&store.to_string_lossy());
+    let store = store.as_path();
+    if !crate::session::capture::claude_host_transcript_confirmed_absent(
+        &cwd.to_string_lossy(),
+        sid,
+        &[],
+        Some(store),
+    ) {
+        return Ok(());
+    }
+    let named_projects = |p: Option<&std::path::Path>| {
+        p.and_then(std::path::Path::file_name)
+            .is_some_and(|n| n == "projects")
+    };
+    let root = if named_projects(Some(store)) {
+        store.parent()
+    } else if named_projects(store.parent()) {
+        store.parent().and_then(std::path::Path::parent)
+    } else {
+        None
+    };
+    match root {
+        Some(root) => anyhow::bail!(
+            "--store must be the Claude config root (the directory containing projects/), not a projects subdirectory; use {}",
+            root.display()
+        ),
+        None => anyhow::bail!(
+            "no transcript for this conversation under {}/projects; --store must be the Claude config root (the directory containing projects/)",
+            store.display()
+        ),
+    }
+}
+
 /// Whether a reserved (`Preallocated`) Claude id has its transcript in the
 /// binding's own store, which proves it names a resumable conversation.
 ///
@@ -2925,6 +2966,7 @@ impl Instance {
                 store.is_absolute(),
                 "--store must be an absolute native store path"
             );
+            ensure_claude_store_root(store, &execution.cwd, sid)?;
             *primary = crate::session::capture::canonicalize_or_raw(
                 store.to_str().context("store path must be UTF-8")?,
             );
@@ -2984,6 +3026,55 @@ impl Instance {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn claude_store_must_be_the_config_root_holding_the_transcript() {
+        let root = tempfile::tempdir().unwrap();
+        let cwd = tempfile::tempdir().unwrap();
+        let sid = "11111111-2222-3333-4444-555555555555";
+        let encoded = crate::session::capture::encode_claude_project_path(
+            &crate::session::capture::canonicalize_or_raw(&cwd.path().to_string_lossy())
+                .to_string_lossy(),
+        );
+        let canonical =
+            crate::session::capture::canonicalize_or_raw(&root.path().to_string_lossy());
+        let projects = root.path().join("projects");
+        let project_dir = projects.join(&encoded);
+        let check = |store: &std::path::Path| ensure_claude_store_root(store, cwd.path(), sid);
+
+        let missing = check(root.path()).unwrap_err().to_string();
+        assert!(missing.contains("no transcript"), "{missing}");
+
+        std::fs::create_dir_all(&project_dir).unwrap();
+        std::fs::write(project_dir.join(format!("{sid}.jsonl")), "{}\n").unwrap();
+        check(root.path()).unwrap();
+
+        for wrong in [&projects, &project_dir] {
+            let err = check(wrong).unwrap_err().to_string();
+            assert!(
+                err.contains(&format!("use {}", canonical.display())),
+                "{err}"
+            );
+        }
+
+        // A symlink to the projects dir is judged by where it resolves.
+        #[cfg(unix)]
+        {
+            let link = root.path().join("link");
+            std::os::unix::fs::symlink(&projects, &link).unwrap();
+            let err = check(&link).unwrap_err().to_string();
+            assert!(
+                err.contains(&format!("use {}", canonical.display())),
+                "{err}"
+            );
+        }
+
+        // A projects dir that really holds the transcript is a working root.
+        let nested = project_dir.join("projects").join(&encoded);
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::write(nested.join(format!("{sid}.jsonl")), "{}\n").unwrap();
+        check(&project_dir).unwrap();
+    }
 
     #[cfg(unix)]
     #[test]

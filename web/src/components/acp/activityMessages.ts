@@ -225,6 +225,7 @@ class AssistantBuilder {
     // The wire name survives later retitles, so subagent launches stay recognisable.
     if (tool.raw_name) argsObj._aoe_raw_tool_name = tool.raw_name;
     if (tool.memory_recall) argsObj._aoe_memory_recall = tool.memory_recall;
+    if (tool.diffs?.length) argsObj._aoe_diffs = tool.diffs;
     const part: ToolPart = {
       type: "tool-call",
       toolCallId: tool.id,

@@ -7,12 +7,10 @@
 //!    point of the env override is to attach to a *specific* daemon.
 //! 2. If a live local daemon exists (`serve.pid` + reachable
 //!    `serve.url`), use it.
-//! 3. Otherwise return [`ManagerError::NoDaemonRunning`] with an
-//!    actionable hint. Auto-spawn is intentionally not provided:
-//!    starting a loopback daemon by side-effect hides the choice
-//!    between localhost, Tailscale, and Cloudflare from the user and
-//!    leaves an `aoe serve` process behind that they did not ask for.
-//!    The caller is expected to render the hint and bail.
+//! 3. Otherwise start a detached loopback daemon, unless autostart is
+//!    disabled (`--no-autostart`, `AOE_NO_AUTOSTART=1`), in which case
+//!    return [`ManagerError::NoDaemonRunning`] with an actionable hint.
+//!    [`locate_daemon`] never spawns.
 //!
 //! Build-namespace discipline (debug vs release) is enforced by
 //! `crate::session::get_app_dir`: discovery reads `serve.pid` /
@@ -20,8 +18,11 @@
 //! would have written, so a debug client never picks up a release
 //! daemon (or vice versa).
 
+use std::sync::atomic::{AtomicBool, Ordering};
+
 use thiserror::Error;
 
+use super::autostart;
 use super::discovery::{discover, discover_env, DaemonEndpoint, DiscoveryError};
 use super::http::HttpError;
 
@@ -43,14 +44,21 @@ pub enum ManagerError {
         "no structured view daemon is running.\n\nStart one with one of:\n  aoe serve --daemon                 (localhost only, recommended for solo dev)\n  aoe serve --daemon --remote        (Tailscale Funnel or Cloudflare quick tunnel)\n  aoe serve --daemon --tunnel-name … (named Cloudflare Tunnel)\n\nOr attach to an existing remote daemon with:\n  AOE_DAEMON_URL=<url> AOE_DAEMON_TOKEN=<token> aoe …"
     )]
     NoDaemonRunning(#[from] DiscoveryError),
+    #[error(
+        "could not start a local aoe daemon: {0}\n\nStart one by hand with `aoe serve --daemon`, or attach to an existing remote daemon with:\n  AOE_DAEMON_URL=<url> AOE_DAEMON_TOKEN=<token> aoe …"
+    )]
+    AutostartFailed(String),
 }
 
-/// Locate the daemon the caller should talk to. Does *not* spawn one;
-/// returns [`ManagerError::NoDaemonRunning`] if neither the env
-/// override nor a live local daemon resolves, so the caller can
-/// surface the message and let the user decide how to start the
-/// server.
-pub async fn require_daemon() -> Result<DaemonEndpoint, ManagerError> {
+static AUTOSTART_DISABLED: AtomicBool = AtomicBool::new(false);
+
+/// Set once at startup from `--no-autostart` / `AOE_NO_AUTOSTART`.
+pub fn set_autostart_disabled(disabled: bool) {
+    AUTOSTART_DISABLED.store(disabled, Ordering::Relaxed);
+}
+
+/// Locate the daemon the caller should talk to. Never spawns one.
+pub async fn locate_daemon() -> Result<DaemonEndpoint, ManagerError> {
     if discover_env().is_some() {
         // Resolve through `discover()` so the parsing/redaction
         // applied to local endpoints is also applied here, then
@@ -66,4 +74,28 @@ pub async fn require_daemon() -> Result<DaemonEndpoint, ManagerError> {
         };
     }
     discover().map_err(ManagerError::NoDaemonRunning)
+}
+
+/// Like [`locate_daemon`], but starts a local daemon when none answers. The pid
+/// is `Some` only for the caller that spawned it, so each start is announced
+/// once. A TUI caller shows it in the status line; stderr would corrupt the screen.
+pub async fn ensure_daemon() -> Result<(DaemonEndpoint, Option<u32>), ManagerError> {
+    if discover_env().is_some() || AUTOSTART_DISABLED.load(Ordering::Relaxed) {
+        return locate_daemon().await.map(|endpoint| (endpoint, None));
+    }
+    if let Some(endpoint) = autostart::healthy_local().await {
+        return Ok((endpoint, None));
+    }
+    autostart::start_local()
+        .await
+        .map_err(ManagerError::AutostartFailed)
+}
+
+/// [`ensure_daemon`] for the CLI: announces a start on stderr, also under `--json`.
+pub async fn require_daemon() -> Result<DaemonEndpoint, ManagerError> {
+    let (endpoint, started) = ensure_daemon().await?;
+    if let Some(pid) = started {
+        eprintln!("Started aoe daemon (pid {pid})");
+    }
+    Ok(endpoint)
 }

@@ -830,7 +830,9 @@ pub(crate) enum StatusIntent {
 pub(super) fn reads_activity_flags(event: &crate::acp::Event) -> bool {
     matches!(
         event,
-        crate::acp::Event::Stopped { .. } | crate::acp::Event::BackgroundAgentCompleted { .. }
+        crate::acp::Event::Stopped { .. }
+            | crate::acp::Event::BackgroundAgentCompleted { .. }
+            | crate::acp::Event::BackgroundTaskFinished { .. }
     )
 }
 
@@ -863,7 +865,9 @@ pub(crate) fn derive_acp_status(
         // dot lit even while the main turn is between its own events. Must
         // not override a pending approval/elicitation's Waiting dot, which
         // speaks to the main turn, not the sub-agent (#4001).
-        Event::BackgroundAgentLaunched { .. } => Some(StatusIntent::SetUnlessHeld(Status::Running)),
+        Event::BackgroundAgentLaunched { .. } | Event::BackgroundTaskStarted { .. } => {
+            Some(StatusIntent::SetUnlessHeld(Status::Running))
+        }
         Event::BackgroundAgentProgress {
             status: crate::acp::state::BackgroundAgentStatus::Running,
             ..
@@ -894,13 +898,13 @@ pub(crate) fn derive_acp_status(
         // consults the same flags). `SetUnlessHeld`
         // because a sibling agent finishing must not clobber a pending
         // approval/elicitation on the main turn (#4001).
-        Event::BackgroundAgentCompleted { .. } => Some(StatusIntent::SetUnlessHeld(
-            if turn_active_after || background_agent_active_after {
+        Event::BackgroundAgentCompleted { .. } | Event::BackgroundTaskFinished { .. } => Some(
+            StatusIntent::SetUnlessHeld(if turn_active_after || background_agent_active_after {
                 Status::Running
             } else {
                 Status::Idle
-            },
-        )),
+            }),
+        ),
         Event::AgentStartupError { .. } => Some(StatusIntent::Set(Status::Error)),
         // A successful session/new or session/load means the agent is alive.
         Event::AcpSessionAssigned { .. } => Some(StatusIntent::HealError),
@@ -1964,6 +1968,14 @@ mod tests {
                 held(Status::Running),
             ),
             (
+                Event::BackgroundTaskStarted {
+                    task_id: "t-1".into(),
+                    tool_call_id: None,
+                    description: "desc".into(),
+                },
+                held(Status::Running),
+            ),
+            (
                 Event::AgentStartupError {
                     message: "boom".into(),
                 },
@@ -2007,6 +2019,9 @@ mod tests {
             warning: None,
             ended_at: chrono::Utc::now(),
         };
+        let task_finished = || Event::BackgroundTaskFinished {
+            task_id: "t-1".into(),
+        };
         // Every Stopped reason surfaces as Idle, the rate-limit park included.
         let parked = || Event::Stopped {
             reason: "rate_limited".into(),
@@ -2019,6 +2034,9 @@ mod tests {
             (completed(), false, false, held(Status::Idle)),
             (completed(), false, true, held(Status::Running)),
             (completed(), true, false, held(Status::Running)),
+            (task_finished(), false, false, held(Status::Idle)),
+            (task_finished(), false, true, held(Status::Running)),
+            (task_finished(), true, false, held(Status::Running)),
         ];
         for (event, turn_active, background_active, want) in flag_reading {
             assert!(reads_activity_flags(&event), "{event:?}");

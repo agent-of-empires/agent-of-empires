@@ -185,4 +185,4 @@ Every structured-view operation has a matching verb against the same daemon:
 | `aoe acp recover <id> --confirm-worker-stopped` | Retire malformed or unattested legacy ownership after external shutdown confirmation |
 | `aoe ps --acp` | List workers with their ACP columns; `--dead` includes dead and orphaned ones |
 
-Daemon-backed verbs need a running `aoe serve` and exit with a hint if none is found. The CLI never spawns a daemon on your behalf. Recovery operates on the local worker registry, so run it on the original worker host, using SSH for a remote host.
+Daemon-backed verbs start a detached local daemon (loopback only) when none answers and print `Started aoe daemon (pid N)` on stderr. They never start one with `AOE_DAEMON_URL`/`--daemon-url` set, or with `--no-autostart` / `AOE_NO_AUTOSTART=1`; then they exit with a hint. Recovery operates on the local worker registry, so run it on the original worker host, using SSH for a remote host.

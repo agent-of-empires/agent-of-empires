@@ -36,6 +36,9 @@ export const HOST_STATE_VARS = new Set([
   // A host passphrase would let discovery log in against a host daemon's
   // session store instead of the private one the harness spawned.
   "AOE_DAEMON_PASSPHRASE",
+  // A host opt-out would make the harness's CLI calls fail instead of starting
+  // the private daemon.
+  "AOE_NO_AUTOSTART",
   // Private fixture files and subprocess controls cannot come from the host.
   "AOE_E2E_INPUT_BARRIER",
   "AOE_E2E_PARTIAL_FRAME_FILE",

@@ -646,7 +646,9 @@ fn command_is_aoe_serve(command: &[u8]) -> bool {
                     return false;
                 }
             }
+            b"--no-autostart" => index += 1,
             arg if arg.starts_with(b"--profile=")
+                || arg.starts_with(b"--no-autostart=")
                 || arg.starts_with(b"--daemon-url=")
                 || (arg.starts_with(b"-p") && arg.len() > 2) =>
             {
@@ -1503,6 +1505,7 @@ mod tests {
             (b"agent-of-empires serve --daemon", true),
             (b"aoe --profile work serve --daemon", true),
             (b"aoe --profile=work serve --daemon", true),
+            (b"aoe --no-autostart serve --daemon", true),
             (b"aoe update", false),
             (b"aoe --profile serve update", false),
             (b"aoe --some-option serve update", false),
@@ -1691,6 +1694,7 @@ mod tests {
             globals,
             vec![
                 ("daemon-url".to_string(), None),
+                ("no-autostart".to_string(), None),
                 ("profile".to_string(), Some('p')),
             ],
             "a top-level global changed; teach command_is_aoe_serve about it before \

@@ -44,7 +44,7 @@ pub use delete::DeleteSessionOutcome;
 pub use errors::{AcpError, IncompatibleAgentError};
 pub use list::{list_native_sessions, ListSessionsError};
 pub use reset::ResetSessionOutcome;
-pub use resolve_command::{resolve_agent_command, ResolvedAgentCommand};
+pub use resolve_command::{resolve_agent_command, ResolvedAgentCommand, Unresolved};
 pub(crate) use runner::wrap_in_scope;
 pub use session_sandbox::SessionSandbox;
 pub(crate) use spawn::host_environment_denyreason;
@@ -327,6 +327,7 @@ impl AcpClient {
                 ClientCmd::SetMode(_) => "set_mode",
                 ClientCmd::SetConfigOption { .. } => "set_config_option",
                 ClientCmd::ResumeBackgroundTailing(_) => "resume_background_tailing",
+                ClientCmd::ResumeTaskTailing(_) => "resume_task_tailing",
                 ClientCmd::DeleteSession { respond_to, .. } => {
                     let _ = respond_to.send(DeleteSessionOutcome::UnsupportedMethod);
                     "delete_session"
@@ -651,6 +652,16 @@ impl AcpClient {
                     .map(|l| (l.agent_id, l.output_file))
                     .collect(),
             ))
+            .await
+            .map_err(|_| AcpError::AgentExited)
+    }
+
+    /// Spawn transcript tailers for background tasks that survived a daemon
+    /// restart. Errors like [`Self::resume_background_tailing`].
+    pub async fn resume_task_tailing(&self, task_ids: Vec<String>) -> Result<(), AcpError> {
+        let cmd_tx = self.cmd_tx.as_ref().ok_or(AcpError::NotRunning)?;
+        cmd_tx
+            .send(ClientCmd::ResumeTaskTailing(task_ids))
             .await
             .map_err(|_| AcpError::AgentExited)
     }

@@ -30,7 +30,7 @@ use self::state::{
     ToastBanner, ToastKind,
 };
 use crate::acp::client::{
-    require_daemon, ws_connect_with, DaemonEndpoint, HttpClient, HttpError, ManagerError,
+    ensure_daemon, ws_connect_with, DaemonEndpoint, HttpClient, HttpError, ManagerError,
     PluginCommandView, WsError, WsMessage, REPLAY_PAGE_SIZE,
 };
 use crate::acp::elicitations::ElicitationResolution;
@@ -115,8 +115,8 @@ pub async fn run(
     theme: &Theme,
     session_id: &str,
 ) -> Result<()> {
-    let endpoint = match require_daemon().await {
-        Ok(e) => e,
+    let endpoint = match ensure_daemon().await {
+        Ok((e, _)) => e,
         Err(ManagerError::EnvOverrideUnreachable) => {
             render_error_screen(
                 terminal,
@@ -135,69 +135,17 @@ pub async fn run(
             wait_for_dismiss(event_stream).await?;
             return Ok(());
         }
-        Err(ManagerError::NoDaemonRunning(_)) => {
-            // A structured session cannot function without the daemon, so
-            // offer to start a localhost one here (Enter). Remote modes keep
-            // their manual commands: auto-picking a tunnel would hide the choice.
-            match offer_daemon_start(terminal, event_stream, theme).await? {
-                Some(endpoint) => endpoint,
-                None => return Ok(()),
-            }
-        }
-    };
-    run_for_endpoint(terminal, event_stream, theme, endpoint, session_id).await
-}
-
-/// Render the "no daemon running" screen. Enter spawns a localhost daemon and
-/// waits for it to become healthy, returning its endpoint; any other key, or a
-/// spawn or health-check failure, returns `None`.
-async fn offer_daemon_start(
-    terminal: &mut Terminal<CrosstermBackend<Stdout>>,
-    event_stream: &mut EventStream,
-    theme: &Theme,
-) -> Result<Option<DaemonEndpoint>> {
-    render_error_screen(
-        terminal,
-        theme,
-        "No structured view daemon is running.\n\n\
-         The structured view is driven by the `aoe serve` daemon.\n\n  \
-         Enter  start a local daemon now\n  \
-         Esc    back to the session list\n\n\
-         For remote access, start one by hand instead:\n  \
-         aoe serve --daemon --remote        (Tailscale Funnel or Cloudflare quick tunnel)\n  \
-         aoe serve --daemon --tunnel-name … (named Cloudflare Tunnel)\n\n\
-         Or attach to an existing remote daemon with:\n  \
-         AOE_DAEMON_URL=<url> AOE_DAEMON_TOKEN=<token> aoe …",
-    )?;
-    loop {
-        let Some(evt) = event_stream.next().await else {
-            return Ok(None);
-        };
-        match evt.context("read terminal event")? {
-            CrosstermEvent::Key(key) if key.kind != KeyEventKind::Release => {
-                if key.code == crossterm::event::KeyCode::Enter {
-                    break;
-                }
-                return Ok(None);
-            }
-            _ => {}
-        }
-    }
-    render_error_screen(terminal, theme, "Starting local daemon…")?;
-    match crate::tui::dialogs::start_local_daemon_and_wait().await {
-        Ok(endpoint) => Ok(Some(endpoint)),
-        Err(e) => {
+        Err(e @ (ManagerError::NoDaemonRunning(_) | ManagerError::AutostartFailed(_))) => {
             render_error_screen(
                 terminal,
                 theme,
-                &format!(
-                    "Failed to start the daemon: {e}\n\nPress any key to return to the session list."
-                ),
+                &format!("{e}\n\nPress any key to return to the session list."),
             )?;
             wait_for_dismiss(event_stream).await?;
-            Ok(None)
+            return Ok(());
         }
-    }
+    };
+    run_for_endpoint(terminal, event_stream, theme, endpoint, session_id).await
 }
 
 /// Same as [`run`] but for a caller that already located the daemon endpoint,

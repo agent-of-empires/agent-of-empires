@@ -22,9 +22,11 @@ import { useSkillIndex } from "../../hooks/useSkillIndex";
 import { parseJsonObject, pickStr } from "../../lib/acpArgs";
 import type { ToolCall } from "../../lib/acpTypes";
 import type { AgentProfile } from "../../lib/agentProfiles";
+import { diffPair } from "../../lib/diffPair";
 import { humanizeServer, humanizeVerb } from "../../lib/mcpClassify";
 import { cleanRecalledMemory, parseMemoryFrontmatter, type MemoryHit } from "../../lib/memoryClassify";
 import { badgeLabel, badgeTone, resolveSkillSource } from "../../lib/skillProvenance";
+import { StringDiff } from "../diff/StringDiff";
 import { ProvenanceBadge } from "../ProvenanceBadge";
 import { GenericToolCard } from "./CoreToolCards";
 import {
@@ -155,15 +157,24 @@ export function MemoryCard({ tool, result, hit }: ToolCardProps & { hit: MemoryH
   const status = statusFor(result);
   const [open, setOpen] = useToolCardExpansion(status);
   const args = useToolArgs(tool);
+  // claude-agent-acp sends the written text only as a structured diff, not in the args.
+  const diff = hit.verb === "recalled" ? undefined : tool.diffs?.find((d) => d.path === hit.path);
+  const oldText = diff?.old_text ?? "";
+  const newText = diff?.new_text ?? "";
+  const showDiff = diff?.old_text != null;
   const content = useMemo<string>(
     () =>
       hit.verb === "recalled"
         ? (result?.text ?? "")
-        : (pickStr(args, "new_string", "newString", "new_str", "content") ?? ""),
-    [hit.verb, args, result?.text],
+        : (pickStr(args, "new_string", "newString", "new_str", "content") ?? newText),
+    [hit.verb, args, result?.text, newText],
   );
   const parsed = useMemo(() => (content ? parseMemoryFrontmatter(content) : null), [content]);
-  const hasBody = Boolean(content);
+  const hasBody = showDiff || Boolean(content);
+  const { adds, dels } = useMemo(
+    () => (showDiff ? diffPair(oldText, newText) : { adds: 0, dels: 0 }),
+    [showDiff, oldText, newText],
+  );
 
   return (
     <CardChrome
@@ -178,12 +189,24 @@ export function MemoryCard({ tool, result, hit }: ToolCardProps & { hit: MemoryH
           <span className="ml-2 text-text-dim">· {hit.basename}</span>
         </>
       }
-      meta={parsed?.type && <span className="hidden md:inline text-[11px] text-text-dim">{parsed.type}</span>}
+      meta={
+        showDiff && status !== "err" ? (
+          <span className="hidden md:inline text-[11px]">
+            <span className="text-emerald-400">+{adds}</span> <span className="text-rose-400">−{dels}</span>
+          </span>
+        ) : (
+          parsed?.type && <span className="hidden md:inline text-[11px] text-text-dim">{parsed.type}</span>
+        )
+      }
       expanded={open}
       onToggle={status === "err" || hasBody ? () => setOpen((v) => !v) : undefined}
       body={
         <ToolErrorBody status={status} errorText={result?.text}>
-          {hasBody && parsed && status !== "err" ? (
+          {showDiff && status !== "err" ? (
+            <div className="border-t border-surface-800 bg-surface-950">
+              <StringDiff oldText={oldText} newText={newText} filePath={hit.path} />
+            </div>
+          ) : hasBody && parsed && status !== "err" ? (
             <div className="border-t border-surface-800 bg-surface-950">
               {(parsed.name || parsed.description || parsed.type) && (
                 <dl className="grid grid-cols-[auto_1fr] gap-x-3 gap-y-0.5 px-3 py-2 text-[11px]">

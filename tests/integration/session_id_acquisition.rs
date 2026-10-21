@@ -362,6 +362,7 @@ sleep 60
         "-t",
         "parent",
     ]);
+    std::fs::create_dir_all(temp.path().join(".claude")).unwrap();
     cli(&["session", "set-session-id", "parent", VALID_CLAUDE_UUID]);
     cli(&["add", "--fork-from", "parent", "-t", "child"]);
     let storage = Storage::open_unwatched("default").unwrap();

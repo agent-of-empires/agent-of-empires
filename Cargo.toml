@@ -3,7 +3,7 @@ members = [".", "xtask", "aoe-settings-derive", "aoe-plugin-api"]
 
 [package]
 name = "agent-of-empires"
-version = "1.20.0"
+version = "1.21.0"
 edition = "2021"
 rust-version = "1.89"
 authors = ["Agent of Empires Contributors"]
@@ -182,7 +182,7 @@ flate2 = "1"
 xz2 = "0.1"
 
 # WebSockets for daemon clients and the daemon's local UDS transport.
-tokio-tungstenite = { version = "0.30", default-features = false, features = ["rustls-tls-webpki-roots", "connect"] }
+tokio-tungstenite = { version = "0.30", default-features = false, features = ["rustls-tls-native-roots", "connect"] }
 
 # Capability-safe file opens for the session file-read endpoint (#3088): open
 # beneath a Dir so a component swapped after the containment check cannot

@@ -75,7 +75,12 @@ function setup(overrides: Partial<Parameters<typeof MobileMainPane>[0]> = {}) {
     activeSessionId: "s1",
     sessions: [session()],
     serverAbout: null,
-    webSettings: { persistentTerminals: false, maxPersistentTerminals: 3 },
+    webSettings: {
+      persistentTerminals: false,
+      maxPersistentTerminals: 3,
+      persistentStructuredViews: false,
+      maxPersistentStructuredViews: 3,
+    },
     selectedFilePath: null,
     selectedRepoName: undefined,
     revision: 0,
@@ -103,7 +108,8 @@ function setup(overrides: Partial<Parameters<typeof MobileMainPane>[0]> = {}) {
 
 describe("MobileMainPane", () => {
   it("renders the structured view for structured view sessions", async () => {
-    setup({ view: "agent", activeSession: session({ view: "structured" }) });
+    const structured = session({ view: "structured" });
+    setup({ view: "agent", activeSession: structured, sessions: [structured] });
     // StructuredView is lazy-loaded behind Suspense, so await its resolution.
     expect(await screen.findByTestId("acp-view")).toBeDefined();
   });

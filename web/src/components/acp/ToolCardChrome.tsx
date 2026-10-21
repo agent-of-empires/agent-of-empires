@@ -43,7 +43,8 @@ export function isAcpBookkeepingKey(key: string): boolean {
     key === "_aoe_title" ||
     key === "_aoe_started_at" ||
     key === "_aoe_parent_tool_call_id" ||
-    key === "_aoe_raw_tool_name"
+    key === "_aoe_raw_tool_name" ||
+    key === "_aoe_diffs"
   );
 }
 

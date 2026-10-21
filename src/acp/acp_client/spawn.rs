@@ -458,11 +458,11 @@ pub(super) fn spawn_subprocess(
     let app_dir = crate::session::get_app_dir().ok();
     let resolved = resolve_agent_command(&config.spec.command, app_dir.as_deref());
     let (spawn_command, extra_path_dirs) = match &resolved {
-        Some(r) => (
+        Ok(r) => (
             r.path.to_string_lossy().into_owned(),
             r.prepend_paths.clone(),
         ),
-        None => (config.spec.command.clone(), Vec::new()),
+        Err(_) => (config.spec.command.clone(), Vec::new()),
     };
 
     let mut cmd = tokio::process::Command::new(&spawn_command);
@@ -526,10 +526,11 @@ pub(super) fn spawn_subprocess(
         );
         // ENOENT is ambiguous: a missing cwd must classify as
         // ProjectPathMissing (#1089) before the unresolved-binary hint (#1048).
-        if e.kind() == std::io::ErrorKind::NotFound && config.cwd.exists() && resolved.is_none() {
-            AcpError::missing_binary_spawn_error(&e, &config.spec.command)
-        } else {
-            AcpError::classify_spawn_error(e, &config.cwd, &spawn_command)
+        match &resolved {
+            Err(reason) if e.kind() == std::io::ErrorKind::NotFound && config.cwd.exists() => {
+                AcpError::unresolved_adapter_spawn_error(&e, config, reason)
+            }
+            _ => AcpError::classify_spawn_error(e, &config.cwd, &spawn_command),
         }
     })?;
 
@@ -614,6 +615,24 @@ mod tests {
         config.spec.command = "/nonexistent/agent/binary/aoe-test".into();
         let result = AcpClient::spawn(config, AcpSessionId("s-1".into())).await;
         assert!(matches!(result, Err(AcpError::Spawn(_))));
+
+        // A bare adapter missing from a configured PATH names that PATH.
+        let empty = tempfile::tempdir().unwrap();
+        let mut config = env_test_spawn_config(std::env::temp_dir());
+        config.spec.command = format!("aoe-test-no-such-adapter-{}", std::process::id());
+        config.base_host_environment = vec![("PATH".into(), empty.path().display().to_string())];
+        config.host_environment = config.base_host_environment.clone();
+        match AcpClient::spawn(config, AcpSessionId("s-1".into())).await {
+            Err(AcpError::Spawn(msg)) => {
+                assert!(
+                    msg.contains("the PATH `environment` sets for the agent"),
+                    "{msg}"
+                );
+                assert!(!msg.contains("restart `aoe serve`"), "{msg}");
+            }
+            Err(other) => panic!("expected a missing-adapter error, got {other:?}"),
+            Ok(_) => panic!("expected a missing-adapter error, got Ok"),
+        }
 
         // #1089: a renamed project path is typed, not a bare ENOENT.
         let missing =
