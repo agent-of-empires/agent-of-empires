@@ -259,8 +259,29 @@ impl PluginHost {
         params: Value,
         timeout: Duration,
     ) -> Result<Value, WorkerRequestError> {
+        let id = self.pending.next_id();
+        self.request_worker_as(&id, worker, method, params, timeout, timeout)
+            .await
+    }
+
+    pub fn next_request_id(&self) -> String {
+        self.pending.next_id()
+    }
+
+    /// [`Self::request_worker`] with the envelope id `id` (from [`Self::next_request_id`]),
+    /// waiting at most `start_wait` for a worker that is still starting.
+    pub async fn request_worker_as(
+        &self,
+        id: &str,
+        worker: WorkerRef<'_>,
+        method: &str,
+        params: Value,
+        start_wait: Duration,
+        timeout: Duration,
+    ) -> Result<Value, WorkerRequestError> {
         let plugin_id = worker.plugin_id;
         let deadline = Instant::now() + timeout;
+        let start_deadline = Instant::now() + start_wait.min(timeout);
         let (generation, inbound) = loop {
             let found = {
                 let table = self.state.lock().await;
@@ -270,7 +291,7 @@ impl PluginHost {
                         .map(|tx| (w.manifest_hash == worker.manifest_hash, w.supervisor_id, tx))
                 })
             };
-            let remaining = deadline.saturating_duration_since(Instant::now());
+            let remaining = start_deadline.saturating_duration_since(Instant::now());
             match found {
                 Some((false, ..)) => return Err(WorkerRequestError::Superseded),
                 Some((true, generation, inbound)) => break (generation, inbound),
@@ -278,9 +299,9 @@ impl PluginHost {
                 None => tokio::time::sleep(remaining.min(Duration::from_millis(50))).await,
             }
         };
-        let (id, rx) = self.pending.register(plugin_id, generation);
+        let rx = self.pending.register_as(id, plugin_id, generation);
         // A dropped caller must not leave its entry behind.
-        let _forget = self.pending.forget_on_drop(&id);
+        let _forget = self.pending.forget_on_drop(id);
         let line =
             serde_json::json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params })
                 .to_string()
@@ -2392,6 +2413,32 @@ rl.on('line', (line) => {
         );
     }
 
+    #[tokio::test]
+    async fn start_wait_bounds_the_wait_for_a_missing_worker_not_the_reply_deadline() {
+        let tmp = tempfile::tempdir().unwrap();
+        let host = PluginHost::new(
+            tmp.path(),
+            "default",
+            None,
+            Arc::new(crate::server::runtime::RuntimeWork::default()),
+        )
+        .unwrap();
+        let id = host.next_request_id();
+        let request = host.request_worker_as(
+            &id,
+            worker_ref("acme.absent", "sha256:none"),
+            "mcp.tools.list",
+            json!({}),
+            Duration::from_millis(300),
+            Duration::from_secs(600),
+        );
+        let err = tokio::time::timeout(Duration::from_secs(10), request)
+            .await
+            .expect("the start wait, not the 600 s deadline, bounds a missing worker")
+            .unwrap_err();
+        assert!(matches!(err, WorkerRequestError::NoWorker), "{err}");
+    }
+
     async fn worker_pid(host: &PluginHost, plugin_id: &str) -> Option<u32> {
         let table = host.state.lock().await;
         table
@@ -2419,41 +2466,7 @@ rl.on('line', (line) => {
     }
 
     fn install_worker(plugin_id: &str, command: &str) {
-        use crate::session::{update_config, CapabilityGrant, PluginConfig};
-
-        let manifest = format!(
-            r#"
-id = "{plugin_id}"
-name = "Sleeper"
-version = "1.0.0"
-api_version = 8
-capabilities = ["runtime.worker"]
-
-[runtime]
-kind = "command"
-system = true
-command = {command}
-"#
-        );
-        let dir = crate::plugin::plugins_dir().unwrap().join(plugin_id);
-        std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join("aoe-plugin.toml"), &manifest).unwrap();
-        update_config(|config| {
-            config.plugins.insert(
-                plugin_id.to_string(),
-                PluginConfig {
-                    grant: Some(CapabilityGrant {
-                        manifest_hash: aoe_plugin_api::PluginManifest::hash_bytes(
-                            manifest.as_bytes(),
-                        ),
-                        capabilities: vec!["runtime.worker".to_string()],
-                        granted_at: chrono::Utc::now(),
-                    }),
-                    ..PluginConfig::default()
-                },
-            );
-        })
-        .unwrap();
+        crate::plugin::install_test_plugin(plugin_id, 8, &["runtime.worker"], command);
     }
 
     #[cfg(unix)]
