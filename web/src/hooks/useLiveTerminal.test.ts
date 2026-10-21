@@ -342,6 +342,15 @@ describe("transport reason", () => {
     ws.deliver({ type: "transport", grid: true });
     expect(result.current.state).toMatchObject({ transport: "grid", transportReason: null });
   });
+
+  it("drops the previous connection's transport and reason when a socket opens", () => {
+    const { result, ws } = mount();
+    ws.deliver({ type: "transport", grid: false, reason: "pipe_owned" });
+    expect(result.current.state.transportReason).toBe("pipe_owned");
+
+    ws.open();
+    expect(result.current.state).toMatchObject({ transport: null, transportReason: null });
+  });
 });
 
 describe("size owner", () => {

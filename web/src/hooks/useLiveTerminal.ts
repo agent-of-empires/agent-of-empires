@@ -184,6 +184,8 @@ export function useLiveTerminal(
           connected: true,
           reconnecting: false,
           paneDead: false,
+          transport: null,
+          transportReason: null,
         }));
         const desired = desiredRef.current;
         if (!readOnlyRef.current) {
