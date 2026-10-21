@@ -1071,6 +1071,21 @@ describe("SessionWizard View row", () => {
     expect(selected()).toBe(expected);
   });
 
+  it.each([
+    ["clicking Terminal view", () => fireEvent.click(radio("Terminal view"))],
+    ["an arrow key", () => fireEvent.keyDown(radio("Terminal view"), { key: "ArrowLeft" })],
+  ])("re-picking the forced Terminal view by %s keeps Structured view for later", async (_label, repick) => {
+    vi.mocked(fetchAgents).mockResolvedValue(AGENTS);
+    renderWizard();
+    await waitFor(() => expect(selected()).toBe("structured"));
+    pickAgent("aider");
+    await waitFor(() => expect(radio("Structured view").disabled).toBe(true));
+    repick();
+    pickAgent("claude");
+    await waitFor(() => expect(radio("Structured view").disabled).toBe(false));
+    expect(selected()).toBe("structured");
+  });
+
   it("arrow keys move the selection and skip a disabled option", async () => {
     vi.mocked(fetchAgents).mockResolvedValue(AGENTS);
     renderWizard();
