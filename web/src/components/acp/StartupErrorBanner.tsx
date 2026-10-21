@@ -32,6 +32,7 @@ function specificRemediation(message: string): React.ReactNode {
     );
   }
   // The Daemon refuses a stale bundled copy or one its Node can't run; npm can't fix either.
+  // Both match the Display of `unresolved_adapter_spawn_error` (src/acp/acp_client/errors.rs).
   const stale = /bundled ACP adapter `([^`]+)` predates this aoe build/.exec(message);
   if (stale) {
     return (
