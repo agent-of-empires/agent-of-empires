@@ -14,6 +14,7 @@ use super::secure_store::{check_path_security, write_private};
 type HmacSha256 = Hmac<Sha256>;
 
 const SECRET_LEN: usize = 32;
+const PLUGIN_SERVER_DOMAIN: &[u8] = b"aoe-plugin-mcp-v1";
 
 pub struct McpSessionSecret([u8; SECRET_LEN]);
 
@@ -41,9 +42,43 @@ impl McpSessionSecret {
 
     /// The bearer credential for `session_id`.
     pub fn credential_for(&self, session_id: &str) -> String {
+        self.hex_hmac(session_id.as_bytes())
+    }
+
+    /// The bearer credential for one plugin MCP server in one session. The length-prefixed,
+    /// domain-tagged input cannot collide with `credential_for` or across part boundaries.
+    pub fn plugin_server_credential_for(
+        &self,
+        plugin_id: &str,
+        server: &str,
+        session_id: &str,
+    ) -> String {
+        let mut input = PLUGIN_SERVER_DOMAIN.to_vec();
+        for part in [plugin_id, server, session_id] {
+            input.extend_from_slice(&(part.len() as u32).to_be_bytes());
+            input.extend_from_slice(part.as_bytes());
+        }
+        self.hex_hmac(&input)
+    }
+
+    /// Whether `presented` is the plugin-server credential for the tuple, compared in constant time.
+    pub fn verify_plugin_server(
+        &self,
+        plugin_id: &str,
+        server: &str,
+        session_id: &str,
+        presented: &str,
+    ) -> bool {
+        super::auth::constant_time_eq(
+            &self.plugin_server_credential_for(plugin_id, server, session_id),
+            presented,
+        )
+    }
+
+    fn hex_hmac(&self, input: &[u8]) -> String {
         let mut mac =
             HmacSha256::new_from_slice(&self.0).expect("HMAC-SHA256 accepts a 32-byte key");
-        mac.update(session_id.as_bytes());
+        mac.update(input);
         mac.finalize()
             .into_bytes()
             .iter()
@@ -76,6 +111,58 @@ mod tests {
         assert!(secret.verify("session-a", &cred));
         assert!(!secret.verify("session-b", &cred), "wrong session id");
         assert!(!secret.verify("session-a", "garbage"), "wrong credential");
+    }
+
+    #[test]
+    fn plugin_server_credential_is_deterministic_and_tuple_scoped() {
+        let secret = McpSessionSecret([0x42; SECRET_LEN]);
+        let base = secret.plugin_server_credential_for("plug", "srv", "sess");
+        assert_eq!(
+            base,
+            secret.plugin_server_credential_for("plug", "srv", "sess")
+        );
+        assert_ne!(
+            base,
+            secret.plugin_server_credential_for("other", "srv", "sess")
+        );
+        assert_ne!(
+            base,
+            secret.plugin_server_credential_for("plug", "other", "sess")
+        );
+        assert_ne!(
+            base,
+            secret.plugin_server_credential_for("plug", "srv", "other")
+        );
+        assert_ne!(base, secret.credential_for("sess"));
+    }
+
+    #[test]
+    fn plugin_server_credential_resists_boundary_shifts() {
+        let secret = McpSessionSecret([0x42; SECRET_LEN]);
+        let creds = [
+            secret.plugin_server_credential_for("a:b", "c", ""),
+            secret.plugin_server_credential_for("a", "b:c", ""),
+            secret.plugin_server_credential_for("a", "b", "c"),
+            secret.plugin_server_credential_for("ab", "c", ""),
+            secret.plugin_server_credential_for("a", "bc", ""),
+        ];
+        for (i, a) in creds.iter().enumerate() {
+            for b in &creds[i + 1..] {
+                assert_ne!(a, b);
+            }
+        }
+    }
+
+    #[test]
+    fn verify_plugin_server_accepts_only_the_matching_tuple() {
+        let secret = McpSessionSecret([0x7; SECRET_LEN]);
+        let cred = secret.plugin_server_credential_for("plug", "srv", "sess");
+        assert!(secret.verify_plugin_server("plug", "srv", "sess", &cred));
+        assert!(!secret.verify_plugin_server("plug", "srv", "sess", "garbage"));
+        assert!(!secret.verify_plugin_server("other", "srv", "sess", &cred));
+        assert!(!secret.verify_plugin_server("plug", "other", "sess", &cred));
+        assert!(!secret.verify_plugin_server("plug", "srv", "other", &cred));
+        assert!(!secret.verify("sess", &cred), "must not work on /mcp");
     }
 
     #[test]
