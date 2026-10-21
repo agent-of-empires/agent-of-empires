@@ -12,7 +12,7 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 
-use crate::server::auth::{handler_elevated, AuthenticatedSession, LoopbackTrusted};
+use crate::server::auth::{handler_elevated, AuthenticatedBrowserSession, LoopbackTrusted};
 use crate::session::config::settings_schema::validate_project_plugin_setting;
 use crate::session::projects::{self, RegistryError};
 use crate::session::{Project, ProjectOverrides, ProjectScope};
@@ -148,7 +148,7 @@ pub struct CreateProjectBody {
 )]
 pub async fn create_project(
     State(state): State<Arc<AppState>>,
-    session: Option<axum::Extension<AuthenticatedSession>>,
+    session: Option<axum::Extension<AuthenticatedBrowserSession>>,
     loopback: Option<axum::Extension<LoopbackTrusted>>,
     body: Result<Json<CreateProjectBody>, axum::extract::rejection::JsonRejection>,
 ) -> impl IntoResponse {
@@ -293,7 +293,7 @@ pub async fn delete_project(
     State(state): State<Arc<AppState>>,
     Path(name): Path<String>,
     Query(q): Query<DeleteQuery>,
-    session: Option<axum::Extension<AuthenticatedSession>>,
+    session: Option<axum::Extension<AuthenticatedBrowserSession>>,
     loopback: Option<axum::Extension<LoopbackTrusted>>,
 ) -> impl IntoResponse {
     if let Some(resp) = super::cityhall_block(&state) {
@@ -544,7 +544,7 @@ pub async fn update_project(
     State(state): State<Arc<AppState>>,
     Path(name): Path<String>,
     Query(q): Query<DeleteQuery>,
-    session: Option<axum::Extension<AuthenticatedSession>>,
+    session: Option<axum::Extension<AuthenticatedBrowserSession>>,
     loopback: Option<axum::Extension<LoopbackTrusted>>,
     body: Result<Json<serde_json::Value>, axum::extract::rejection::JsonRejection>,
 ) -> impl IntoResponse {
@@ -716,7 +716,7 @@ mod tests {
                     State(state),
                     Path("demo".to_string()),
                     Query(DeleteQuery { scope: None }),
-                    Some(axum::Extension(AuthenticatedSession(session))),
+                    Some(axum::Extension(AuthenticatedBrowserSession(session))),
                     None,
                     Ok(Json(body)),
                 )
@@ -783,7 +783,11 @@ mod tests {
             .login_manager
             .create_session(b"bind", "127.0.0.1", "t")
             .await;
-        let ext = || Some(axum::Extension(AuthenticatedSession(session.clone())));
+        let ext = || {
+            Some(axum::Extension(AuthenticatedBrowserSession(
+                session.clone(),
+            )))
+        };
         let delete = |name: &str| {
             delete_project(
                 State(state.clone()),
@@ -873,7 +877,9 @@ mod tests {
                 Query(DeleteQuery {
                     scope: Some("profile".into()),
                 }),
-                Some(axum::Extension(AuthenticatedSession(session.clone()))),
+                Some(axum::Extension(AuthenticatedBrowserSession(
+                    session.clone(),
+                ))),
                 None,
             )
         };
@@ -914,7 +920,7 @@ mod tests {
 
         let resp = create_project(
             State(state),
-            Some(axum::Extension(AuthenticatedSession(session))),
+            Some(axum::Extension(AuthenticatedBrowserSession(session))),
             None,
             Ok(Json(body)),
         )

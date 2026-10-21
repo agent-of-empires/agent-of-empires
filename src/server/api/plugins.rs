@@ -16,7 +16,7 @@ use serde_json::json;
 use super::{api_error, AppState};
 use crate::plugin;
 use crate::plugin::install::OperationLog;
-use crate::server::auth::{handler_elevated, AuthenticatedSession, LoopbackTrusted};
+use crate::server::auth::{handler_elevated, AuthenticatedBrowserSession, LoopbackTrusted};
 
 const CAP_COMPOSER_READ: &str = "composer.read";
 const CAP_SESSION_READ: &str = "session.read";
@@ -24,11 +24,11 @@ const CAP_SESSION_READ: &str = "session.read";
 /// Resolve the read-only and elevation gates shared by every mutation.
 /// Elevation goes through `handler_elevated`, so a loopback-trusted caller
 /// passes without a session: the bypass paths never insert
-/// `AuthenticatedSession`, and treating that as not-elevated made these
+/// `AuthenticatedBrowserSession`, and treating that as not-elevated made these
 /// mutations unreachable from localhost (#2610).
 async fn mutation_gate(
     state: &AppState,
-    session: Option<&AuthenticatedSession>,
+    session: Option<&AuthenticatedBrowserSession>,
     loopback_trusted: bool,
 ) -> Result<(), Response> {
     if state.read_only {
@@ -215,7 +215,7 @@ pub async fn serve_plugin_page(
 pub async fn mint_plugin_page_ticket(
     State(state): State<std::sync::Arc<AppState>>,
     Path((id, page_id)): Path<(String, String)>,
-    session: Option<axum::Extension<AuthenticatedSession>>,
+    session: Option<axum::Extension<AuthenticatedBrowserSession>>,
 ) -> Response {
     let declared = plugin::registry()
         .active()
@@ -228,7 +228,7 @@ pub async fn mint_plugin_page_ticket(
         [(axum::http::header::CACHE_CONTROL, "no-store")],
     )
         .into_response();
-    if let Some(axum::Extension(AuthenticatedSession(session_id))) = session {
+    if let Some(axum::Extension(AuthenticatedBrowserSession(session_id))) = session {
         let ticket = state
             .login_manager
             .mint_page_ticket(&session_id, &id, &page_id)
@@ -619,7 +619,7 @@ pub struct ApplyUpdateBody {
 /// job, which the UI recovers from by re-previewing.
 pub async fn apply_plugin_update(
     State(state): State<std::sync::Arc<AppState>>,
-    session: Option<axum::Extension<AuthenticatedSession>>,
+    session: Option<axum::Extension<AuthenticatedBrowserSession>>,
     loopback: Option<axum::Extension<LoopbackTrusted>>,
     Path(id): Path<String>,
     Json(body): Json<ApplyUpdateBody>,
@@ -650,7 +650,7 @@ pub struct DismissUpdateBody {
 /// suppresses a security signal, so it is gated like apply.
 pub async fn dismiss_plugin_update(
     State(state): State<std::sync::Arc<AppState>>,
-    session: Option<axum::Extension<AuthenticatedSession>>,
+    session: Option<axum::Extension<AuthenticatedBrowserSession>>,
     loopback: Option<axum::Extension<LoopbackTrusted>>,
     Path(id): Path<String>,
     Json(body): Json<DismissUpdateBody>,
@@ -677,7 +677,7 @@ pub struct SetEnabledBody {
 /// `POST /api/plugins/{id}/enabled`
 pub async fn set_plugin_enabled(
     State(state): State<std::sync::Arc<AppState>>,
-    session: Option<axum::Extension<AuthenticatedSession>>,
+    session: Option<axum::Extension<AuthenticatedBrowserSession>>,
     loopback: Option<axum::Extension<LoopbackTrusted>>,
     Path(id): Path<String>,
     Json(body): Json<SetEnabledBody>,
@@ -708,7 +708,7 @@ pub async fn set_plugin_enabled(
 /// TUI) runs the new build without a daemon restart.
 pub async fn restart_plugin_worker(
     State(state): State<std::sync::Arc<AppState>>,
-    session: Option<axum::Extension<AuthenticatedSession>>,
+    session: Option<axum::Extension<AuthenticatedBrowserSession>>,
     loopback: Option<axum::Extension<LoopbackTrusted>>,
     Path(id): Path<String>,
 ) -> Response {
@@ -934,7 +934,7 @@ pub struct StartInstallBody {
 /// `job_id` to poll; `409` if another lifecycle job is running.
 pub async fn start_plugin_install(
     State(state): State<std::sync::Arc<AppState>>,
-    session: Option<axum::Extension<AuthenticatedSession>>,
+    session: Option<axum::Extension<AuthenticatedBrowserSession>>,
     loopback: Option<axum::Extension<LoopbackTrusted>>,
     Json(body): Json<StartInstallBody>,
 ) -> Response {
@@ -960,7 +960,7 @@ pub async fn start_plugin_install(
 /// elevation; returns a `job_id` to poll, or `409` if one is running.
 pub async fn start_plugin_uninstall(
     State(state): State<std::sync::Arc<AppState>>,
-    session: Option<axum::Extension<AuthenticatedSession>>,
+    session: Option<axum::Extension<AuthenticatedBrowserSession>>,
     loopback: Option<axum::Extension<LoopbackTrusted>>,
     Path(id): Path<String>,
 ) -> Response {

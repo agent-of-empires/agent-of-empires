@@ -82,6 +82,10 @@ pub struct AppState {
     pub session_service: Arc<session_service::SessionService>,
     pub token_manager: Arc<TokenManager>,
     pub login_manager: Arc<login::LoginManager>,
+    /// Signs session-scoped `/mcp` credentials (`X-AoE-Session` + HMAC bearer). `None` when
+    /// `mcp_enabled` is off or the secret failed to load, in which case only the daemon-wide
+    /// bearer token authenticates `/mcp`.
+    pub mcp_session_secret: Option<Arc<super::session_credential::McpSessionSecret>>,
     pub passkey_manager: Arc<super::passkeys::PasskeyManager>,
     pub rate_limiter: Arc<RateLimiter>,
     pub behind_tunnel: bool,

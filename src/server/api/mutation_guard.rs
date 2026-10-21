@@ -5,11 +5,11 @@ use axum::http::{request::Parts, StatusCode};
 use axum::response::Response;
 
 use super::{api_error, AppState};
-use crate::server::auth::{handler_elevated, AuthenticatedSession, LoopbackTrusted};
+use crate::server::auth::{handler_elevated, AuthenticatedBrowserSession, LoopbackTrusted};
 
 async fn mutation_gate(
     state: &AppState,
-    session: Option<&AuthenticatedSession>,
+    session: Option<&AuthenticatedBrowserSession>,
     loopback_trusted: bool,
 ) -> Result<(), Response> {
     if state.read_only {
@@ -39,7 +39,7 @@ impl FromRequestParts<std::sync::Arc<AppState>> for ElevatedMutationGuard {
         parts: &mut Parts,
         state: &std::sync::Arc<AppState>,
     ) -> Result<Self, Self::Rejection> {
-        let session = parts.extensions.get::<AuthenticatedSession>();
+        let session = parts.extensions.get::<AuthenticatedBrowserSession>();
         let loopback_trusted = parts.extensions.get::<LoopbackTrusted>().is_some();
         mutation_gate(state, session, loopback_trusted).await?;
         Ok(Self)

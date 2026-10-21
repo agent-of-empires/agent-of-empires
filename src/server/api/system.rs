@@ -16,7 +16,7 @@ use super::validate_profile_name;
 use super::AppState;
 use super::{api_error, read_only_response};
 use crate::server::auth::AuthenticatedTokenHash;
-use crate::server::auth::{handler_elevated, AuthenticatedSession, LoopbackTrusted};
+use crate::server::auth::{handler_elevated, AuthenticatedBrowserSession, LoopbackTrusted};
 use crate::session::config::settings_schema::{
     clear_path, rewrite_plugin_sections, runtime_schema, strip_local_only, validate_patch,
     validate_patch_with, PatchRejection, Scope,
@@ -376,7 +376,7 @@ pub async fn update_settings(
     State(state): State<Arc<AppState>>,
     axum::extract::Query(query): axum::extract::Query<SettingsQuery>,
     headers: HeaderMap,
-    session: Option<axum::Extension<AuthenticatedSession>>,
+    session: Option<axum::Extension<AuthenticatedBrowserSession>>,
     loopback: Option<axum::Extension<LoopbackTrusted>>,
     body: Result<Json<serde_json::Value>, axum::extract::rejection::JsonRejection>,
 ) -> impl IntoResponse {
@@ -2059,7 +2059,7 @@ pub async fn update_profile_settings(
     State(state): State<Arc<AppState>>,
     axum::extract::Path(name): axum::extract::Path<String>,
     headers: HeaderMap,
-    session: Option<axum::Extension<AuthenticatedSession>>,
+    session: Option<axum::Extension<AuthenticatedBrowserSession>>,
     loopback: Option<axum::Extension<LoopbackTrusted>>,
     body: Result<Json<serde_json::Value>, axum::extract::rejection::JsonRejection>,
 ) -> impl IntoResponse {
@@ -2298,7 +2298,7 @@ mod tests {
                         layer: None,
                     }),
                     HeaderMap::new(),
-                    Some(axum::Extension(AuthenticatedSession(session))),
+                    Some(axum::Extension(AuthenticatedBrowserSession(session))),
                     None,
                     Ok(Json(body)),
                 )
