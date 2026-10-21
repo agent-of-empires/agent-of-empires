@@ -195,7 +195,11 @@ export function StartupErrorScreen({ detail, sessionId, isSandboxed = false }: P
           <RecoveryActionRow
             primary={primary}
             secondary={secondary}
-            install={{ error: containerDown ? null : install.error, output: install.output }}
+            install={{
+              // Its own message replaces this, and stays gone once the container is running.
+              error: install.errorCode === "container_not_running" ? null : install.error,
+              output: install.output,
+            }}
           />
         )}
 

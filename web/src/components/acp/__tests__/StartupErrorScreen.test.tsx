@@ -387,6 +387,7 @@ describe("StartupErrorScreen", () => {
     await waitFor(() => expect(buttons(screen)).toEqual(["Update in Sandbox & restart", "Check again"]));
     expect(queryByTestId("startup-error-container-down")).toBeNull();
     expect(queryByTestId("startup-error-fails-again")).toBeNull();
+    expect(queryByTestId("adapter-install-error")).toBeNull();
   });
 
   it("fails again: a version failure after the install says it changed nothing", async () => {
