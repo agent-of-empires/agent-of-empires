@@ -1582,7 +1582,12 @@ impl LiveCaptureWorker {
                                 name.clone(),
                                 generation_now,
                                 nudge_thread.clone(),
-                                crate::tmux::vt::VtChannel::acquire_with_deadline,
+                                |name, deadline| {
+                                    crate::tmux::vt::VtChannel::acquire_with_deadline(
+                                        name, deadline,
+                                    )
+                                    .ok()
+                                },
                             ));
                         }
                         // A channel whose forwarder disconnected stops updating its grid,
