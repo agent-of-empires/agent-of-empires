@@ -301,6 +301,18 @@ impl HttpClient {
         Ok(crate::daemon::decode_json::<PromptDispatchWire>(res).await?)
     }
 
+    /// Types `message` into a terminal session's pane. `no_revive` fails loud on a dead pane.
+    pub async fn send_message(
+        &self,
+        session_id: &str,
+        message: &str,
+        no_revive: bool,
+    ) -> Result<(), HttpError> {
+        let body = serde_json::json!({ "message": message, "revive": !no_revive });
+        self.session_call(Method::POST, session_id, "/send", Some(body))
+            .await
+    }
+
     /// `GET /api/plugins/ui-state`. The daemon-wide plugin UI snapshot
     /// (host-rendered slots + notifications) the web dashboard polls; the
     /// native structured view renders the TUI-applicable subset (#2402).
