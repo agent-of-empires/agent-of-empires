@@ -17,6 +17,7 @@ const live = vi.hoisted(() => ({
     isOwner: false,
     ownerKnown: false,
     transport: null,
+    transportReason: null as string | null,
     paneDead: true,
     stats: { frames: 0, patches: 0, wireBytes: 0, resyncs: 0 },
   },
@@ -52,6 +53,7 @@ vi.mock("../MobileLiveTerminal", () => ({
 beforeEach(() => {
   live.state.paneDead = true;
   live.state.connected = false;
+  live.state.transportReason = null;
   live.ensureSession.mockClear();
 });
 afterEach(cleanup);
@@ -62,6 +64,27 @@ const mountDead = async (status: "Running" | "Stopped" = "Running") => {
   await waitFor(() => expect(live.ensureSession).toHaveBeenCalledTimes(1));
   return utils;
 };
+
+describe("LiveTerminalView pipe contention notice", () => {
+  const pipeNotice = () => document.querySelector("[data-live-pipe-notice]");
+
+  it("shows only while connected on the pipe_owned fallback", async () => {
+    live.state.paneDead = false;
+    live.state.connected = true;
+    const session = makeSession({ id: "piped", status: "Running" });
+    const { rerender } = render(<LiveTerminalView session={session} />);
+    await waitFor(() => expect(live.ensureSession).toHaveBeenCalledTimes(1));
+    expect(pipeNotice()).toBeNull();
+
+    live.state.transportReason = "pipe_owned";
+    rerender(<LiveTerminalView session={session} />);
+    expect(pipeNotice()?.textContent).toContain("Another client was already rendering this pane");
+
+    live.state.connected = false;
+    rerender(<LiveTerminalView session={session} />);
+    expect(pipeNotice()).toBeNull();
+  });
+});
 
 describe("LiveTerminalView after the agent exits", () => {
   it("Restart re-runs ensure so the pane is revived and redialed", async () => {

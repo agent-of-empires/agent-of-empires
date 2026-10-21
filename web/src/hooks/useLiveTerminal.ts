@@ -43,6 +43,8 @@ export interface LiveTerminalState {
   isOwner: boolean;
   ownerKnown: boolean;
   transport: "grid" | "snapshot" | null;
+  /** Why the server is on the snapshot fallback, when it said. */
+  transportReason: "pipe_owned" | null;
   /** The agent exited and left a dead pane; redialing cannot help until it is restarted. */
   paneDead: boolean;
   stats: LiveStats;
@@ -58,6 +60,7 @@ const INITIAL_STATE: LiveTerminalState = {
   isOwner: false,
   ownerKnown: false,
   transport: null,
+  transportReason: null,
   paneDead: false,
   stats: { frames: 0, patches: 0, wireBytes: 0, resyncs: 0 },
 };
@@ -216,7 +219,12 @@ export function useLiveTerminal(
         }
         if (msg.type === "transport") {
           const transport = msg.grid ? "grid" : "snapshot";
-          setState((prev) => (prev.transport === transport ? prev : { ...prev, transport }));
+          const transportReason = msg.grid ? null : (msg.reason ?? null);
+          setState((prev) =>
+            prev.transport === transport && prev.transportReason === transportReason
+              ? prev
+              : { ...prev, transport, transportReason },
+          );
           return;
         }
         if (msg.type === "clipboard") {
