@@ -6,7 +6,7 @@
 //! profile with one key inherits the other from the global file.
 
 use super::config_file;
-use anyhow::Result;
+use anyhow::{Context, Result};
 use std::path::Path;
 use tracing::info;
 
@@ -30,25 +30,32 @@ pub fn run() -> Result<()> {
 /// interrupted run still finds its keys on the next start.
 fn run_in(app_dir: &Path) -> Result<()> {
     let global_path = app_dir.join("config.toml");
-    let global = legacy_in(&global_path);
+    let global = legacy_in(&global_path)?;
     for path in config_file::profile_configs(app_dir)? {
         migrate_config_file(&path, &global)?;
     }
     migrate_config_file(&global_path, &Legacy::default())
 }
 
-fn legacy_in(path: &Path) -> Legacy {
-    let doc = std::fs::read_to_string(path)
-        .ok()
-        .and_then(|text| text.parse::<toml::Table>().ok());
+/// A missing file holds no keys; one that cannot be read or parsed aborts the
+/// migration before any profile is rewritten against a wrong inherited value.
+fn legacy_in(path: &Path) -> Result<Legacy> {
+    let doc = match std::fs::read_to_string(path) {
+        Ok(text) => Some(
+            text.parse::<toml::Table>()
+                .with_context(|| format!("parse {}", path.display()))?,
+        ),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(error).with_context(|| format!("read {}", path.display())),
+    };
     let acp = doc
         .as_ref()
         .and_then(|doc| doc.get("acp"))
         .and_then(toml::Value::as_table);
-    Legacy {
+    Ok(Legacy {
         offer: acp.and_then(|acp| acp.get(OFFER)).cloned(),
         view: acp.and_then(|acp| acp.get(VIEW)).cloned(),
-    }
+    })
 }
 
 fn migrate_config_file(path: &Path, inherited: &Legacy) -> Result<()> {
@@ -203,5 +210,19 @@ mod tests {
             assert_eq!(read(dir.path().join("config.toml")), expect(want_global));
             assert_eq!(read(profile_dir.join("config.toml")), expect(want_profile));
         }
+    }
+
+    #[test]
+    fn a_malformed_global_config_aborts_before_any_profile_is_rewritten() {
+        let dir = tempfile::tempdir().unwrap();
+        let profile_dir = dir.path().join("profiles").join("work");
+        std::fs::create_dir_all(&profile_dir).unwrap();
+        let profile = profile_dir.join("config.toml");
+        let legacy = "[acp]\ndefault_new_session_view = \"terminal\"\n";
+        std::fs::write(dir.path().join("config.toml"), "[acp\n").unwrap();
+        std::fs::write(&profile, legacy).unwrap();
+
+        assert!(run_in(dir.path()).is_err());
+        assert_eq!(std::fs::read_to_string(&profile).unwrap(), legacy);
     }
 }
