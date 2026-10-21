@@ -62,6 +62,8 @@ import { useDictationBurstGuard } from "./useDictationBurstGuard";
 import { useProviderSwitch } from "./useProviderSwitch";
 
 interface Props {
+  /** False for a hidden or covered retained view: it takes no focus requests. */
+  active?: boolean;
   sessionId: string;
   currentAgent: AcpState["agent"];
   /** Pinned LLM backend, or null when the host environment decides. */
@@ -136,7 +138,7 @@ export function Composer(props: Props) {
   useDraftPersistence(sessionId, client, composerText, draftTextRef, taRef);
   useInitialFocus(isMobile, taRef);
   // Sidebar session selection focuses the composer even when already mounted.
-  useFocusTerminalTarget("composer", taRef);
+  useFocusTerminalTarget("composer", taRef, props.active);
 
   // Opened from the sidebar row's "Switch agent" item.
   const pendingSwitchAgentSessionId = useSyncExternalStore(

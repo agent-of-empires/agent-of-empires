@@ -461,13 +461,30 @@ describe("turnActive: daemon truth plus an optimistic overlay (#3417)", () => {
     });
     const active = [bg(null)];
 
-    expect(hasActiveBackgroundAgent({ backgroundAgents: [] })).toBe(false);
-    expect(hasActiveBackgroundAgent({ backgroundAgents: active })).toBe(true);
-    expect(hasActiveBackgroundAgent({ backgroundAgents: [bg("2026-06-27T00:00:10Z")] })).toBe(false);
+    expect(hasActiveBackgroundAgent({ backgroundAgents: [], backgroundTasks: [] })).toBe(false);
+    expect(hasActiveBackgroundAgent({ backgroundAgents: active, backgroundTasks: [] })).toBe(true);
+    expect(hasActiveBackgroundAgent({ backgroundAgents: [bg("2026-06-27T00:00:10Z")], backgroundTasks: [] })).toBe(
+      false,
+    );
 
-    expect(isVisiblyBusy({ turnActive: false, backgroundAgents: [] })).toBe(false);
-    expect(isVisiblyBusy({ turnActive: true, backgroundAgents: [] })).toBe(true);
-    expect(isVisiblyBusy({ turnActive: false, backgroundAgents: active })).toBe(true);
+    expect(isVisiblyBusy({ turnActive: false, backgroundAgents: [], backgroundTasks: [] })).toBe(false);
+    expect(isVisiblyBusy({ turnActive: true, backgroundAgents: [], backgroundTasks: [] })).toBe(true);
+    expect(isVisiblyBusy({ turnActive: false, backgroundAgents: active, backgroundTasks: [] })).toBe(true);
+  });
+
+  it("a background task keeps the session visibly busy until it finishes", () => {
+    const started = (task_id: string): AcpEvent => ({
+      BackgroundTaskStarted: { task_id, description: "sleep 15" },
+    });
+    const finished = (task_id: string): AcpEvent => ({ BackgroundTaskFinished: { task_id } });
+
+    const running = fold(emptyAcpState(), started("t1"), started("t2"), started("t1"));
+    expect(running.backgroundTasks).toEqual(["t1", "t2"]);
+    expect(isVisiblyBusy(running)).toBe(true);
+
+    const oneLeft = fold(running, finished("t1"));
+    expect(isVisiblyBusy(oneLeft)).toBe(true);
+    expect(isVisiblyBusy(fold(oneLeft, finished("t2")))).toBe(false);
   });
 
   it("a stalled background agent still reads as active, since Progress never sets endedAt (#4001)", () => {

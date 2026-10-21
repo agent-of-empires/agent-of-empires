@@ -78,16 +78,17 @@ impl AcpError {
     }
 
     /// Why a bare adapter name could not launch. A bundled copy aoe refuses
-    /// needs a reinstall or a newer Node, not the adapter's install command (#4696).
+    /// needs a reinstall or a newer Node, not the adapter's install command.
     pub(super) fn unresolved_adapter_spawn_error(
         err: &std::io::Error,
-        command: &str,
+        config: &super::SpawnConfig,
         reason: &super::resolve_command::Unresolved,
     ) -> Self {
         use super::resolve_command::Unresolved;
+        let command = config.spec.command.as_str();
         match reason {
             Unresolved::NotBare | Unresolved::NotFound => {
-                Self::missing_binary_spawn_error(err, command)
+                Self::missing_binary_spawn_error(err, command, configured_path_source(config))
             }
             Unresolved::StaleBundle => AcpError::Spawn(format!(
                 "aoe's bundled ACP adapter `{command}` predates this aoe build, so it is \
@@ -109,18 +110,57 @@ impl AcpError {
     }
 
     /// Appends the exact install command for a known ACP adapter so the web
-    /// banner shows a copyable line instead of a guess (#2109).
-    fn missing_binary_spawn_error(err: &std::io::Error, command: &str) -> Self {
+    /// banner shows a copyable line instead of a guess (#2109). A configured
+    /// PATH replaces the daemon's for the agent, so the advice names it.
+    fn missing_binary_spawn_error(
+        err: &std::io::Error,
+        command: &str,
+        configured_path: Option<&str>,
+    ) -> Self {
         let hint = crate::acp::install_hints::install_hint_for(command)
             .map(|cmd| format!(". Install with: {cmd}"))
             .unwrap_or_default();
+        let place = match configured_path {
+            Some(source) => format!(
+                "on the PATH {source} sets for the agent, which replaces the daemon's; \
+                 add the directory that holds it to that PATH, or install it there"
+            ),
+            None => format!(
+                "on the daemon's PATH or in any known node-manager bin dir; install it \
+                 where the daemon can see it, or restart `aoe serve` from a shell where \
+                 `which {command}` resolves"
+            ),
+        };
         AcpError::Spawn(format!(
-            "{err} (binary `{command}` not found on the daemon's PATH or in \
-             any known node-manager bin dir; install it where the daemon can \
-             see it, or restart `aoe serve` from a shell where `which \
-             {command}` resolves){hint}"
+            "{err} (binary `{command}` not found {place}){hint}"
         ))
     }
+}
+
+/// What set the PATH the agent is launched with, when it isn't the daemon's:
+/// the configured `environment`, or a `before_session` hook overlaying it.
+fn configured_path_source(config: &super::SpawnConfig) -> Option<&'static str> {
+    fn last_path<'a>(
+        pairs: impl DoubleEndedIterator<Item = &'a (String, String)>,
+    ) -> Option<&'a String> {
+        pairs
+            .rev()
+            .find(|(key, _)| key == "PATH")
+            .map(|(_, value)| value)
+    }
+    let effective = last_path(
+        config
+            .host_environment
+            .iter()
+            .chain(&config.provider_routing),
+    )?;
+    Some(
+        if last_path(config.base_host_environment.iter()) == Some(effective) {
+            "`environment`"
+        } else {
+            "a `before_session` hook"
+        },
+    )
 }
 
 /// Build a crate error for a control v3 handshake failure.
@@ -172,5 +212,71 @@ mod tests {
         assert!(msg.contains("/nonexistent/bin/foo"), "{msg}");
         let denied = std::io::Error::from(std::io::ErrorKind::PermissionDenied);
         spawn_message(AcpError::classify_spawn_error(denied, &cwd, "/bin/true"));
+    }
+
+    /// A configured PATH replaces the daemon's for the agent, so the
+    /// missing-adapter advice names what set it instead of the daemon's PATH.
+    #[test]
+    fn missing_adapter_advice_names_the_path_the_agent_searched() {
+        use super::super::resolve_command::Unresolved;
+        let path = |dir: &str| vec![("PATH".to_string(), dir.to_string())];
+        let daemon = "restart `aoe serve`";
+        let environment = "on the PATH `environment` sets for the agent";
+        let hook = "on the PATH a `before_session` hook sets for the agent";
+        // (configured `environment`, after the hook overlay, provider routing, expected, unexpected)
+        let cases = [
+            (vec![], vec![], vec![], daemon, "sets for the agent"),
+            (
+                path("/opt/acp"),
+                path("/opt/acp"),
+                vec![],
+                environment,
+                daemon,
+            ),
+            (vec![], path("/hook/bin"), vec![], hook, daemon),
+            // A hook overlaying the configured PATH is what the agent searches.
+            (
+                path("/opt/acp"),
+                path("/hook/bin"),
+                vec![],
+                hook,
+                environment,
+            ),
+            // Routing carries no PATH, so it never hides the configured one.
+            (
+                path("/opt/acp"),
+                path("/opt/acp"),
+                vec![("CLAUDE_CODE_USE_BEDROCK".to_string(), "1".to_string())],
+                environment,
+                daemon,
+            ),
+        ];
+        for (base, host, routing, expected, unexpected) in cases {
+            let mut config =
+                super::super::test_helpers::env_test_spawn_config(std::env::temp_dir());
+            config.spec.command = "codex-acp".into();
+            config.base_host_environment = base;
+            config.host_environment = host;
+            config.provider_routing = routing;
+            let msg = spawn_message(AcpError::unresolved_adapter_spawn_error(
+                &std::io::Error::from(std::io::ErrorKind::NotFound),
+                &config,
+                &Unresolved::NotFound,
+            ));
+            let label = format!(
+                "base={:?} host={:?} routing={:?}",
+                config.base_host_environment, config.host_environment, config.provider_routing
+            );
+            assert!(msg.contains(expected), "{label}: {msg}");
+            assert!(!msg.contains(unexpected), "{label}: {msg}");
+            assert!(
+                msg.contains("binary `codex-acp` not found"),
+                "{label}: {msg}"
+            );
+            assert!(
+                msg.contains("Install with: npm install -g @agentclientprotocol/codex-acp@latest"),
+                "{label}: {msg}"
+            );
+        }
     }
 }

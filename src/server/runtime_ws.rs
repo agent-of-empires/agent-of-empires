@@ -31,7 +31,9 @@ use super::AppState;
 use crate::cli::runtime_read::dto::{
     wire_timestamp, GroupRead, ProjectRead, ProjectScope, SessionRead,
 };
-use crate::session::{GroupTree, Instance, Storage};
+#[cfg(any(test, debug_assertions))]
+use crate::session::Instance;
+use crate::session::{GroupTree, Storage};
 
 /// Wire version with physical profile aliases and listed membership.
 pub(crate) const PROTOCOL_VERSION: u16 = 4;

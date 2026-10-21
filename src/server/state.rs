@@ -150,6 +150,8 @@ pub struct AppState {
     /// Broadcasts session status transitions to consumers (currently the push-notification
     /// module).
     pub status_tx: broadcast::Sender<StatusChange>,
+    /// Publishes session lifecycle changes (created, archived, trashed, renamed, deleted ...).
+    pub lifecycle: Arc<super::lifecycle_feed::LifecycleFeed>,
     /// Web Push state.
     pub push: Option<Arc<PushState>>,
     /// Cached value of `web.notifications_enabled` at startup.

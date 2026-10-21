@@ -80,11 +80,12 @@ fn parse_ts(raw: Option<&str>) -> Option<chrono::DateTime<chrono::Utc>> {
 }
 
 async fn fetch_sessions() -> SessionFeedResult {
-    // `require_daemon` is the resolver `open_structured_view` uses, so the feed
-    // and the view can never disagree about which daemon they talk to, and
-    // neither spawns one. Its `AOE_DAEMON_URL` branch is unreachable here:
-    // `tui::run` swaps to `remote_home::run_standalone` when that is set.
-    let endpoint = match crate::acp::client::require_daemon().await {
+    // `locate_daemon` is the resolver `open_structured_view` uses, so the feed
+    // and the view can never disagree about which daemon they talk to. It never
+    // spawns: a background tick must not restart a daemon the user stopped.
+    // Its `AOE_DAEMON_URL` branch is unreachable here: `tui::run` swaps to
+    // `remote_home::run_standalone` when that is set.
+    let endpoint = match crate::acp::client::locate_daemon().await {
         Ok(endpoint) => endpoint,
         Err(e) => {
             tracing::trace!(target: "tui.session_feed", "no daemon: {e}");

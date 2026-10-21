@@ -18,7 +18,10 @@ test.describe("mobile conversation chrome collapse", () => {
     const composerToggle = page.getByTestId("composer-collapse-toggle");
 
     // Measure heights: a clipped child still reports visible, but the row must release its height.
-    const heightOf = async (testId: string) => (await page.getByTestId(testId).boundingBox())!.height;
+    const heightOf = async (testId: string) =>
+      (await (
+        testId === "conversation-composer" ? page.locator(`[data-testid^="${testId}-"]`) : page.getByTestId(testId)
+      ).boundingBox())!.height;
     const viewportHeight = () => heightOf("acp-viewport");
 
     await expect(page.getByTestId("composer-footer")).toBeVisible();
@@ -138,7 +141,10 @@ test.describe("mobile conversation chrome collapse", () => {
 
     const headerToggle = page.getByTestId("header-collapse-toggle");
     const composerToggle = page.getByTestId("composer-collapse-toggle");
-    const heightOf = async (testId: string) => (await page.getByTestId(testId).boundingBox())!.height;
+    const heightOf = async (testId: string) =>
+      (await (
+        testId === "conversation-composer" ? page.locator(`[data-testid^="${testId}-"]`) : page.getByTestId(testId)
+      ).boundingBox())!.height;
 
     await page.getByRole("textbox").first().fill("typed on the phone");
     const draftValue = () => page.evaluate(() => document.querySelector("textarea")?.value ?? null);

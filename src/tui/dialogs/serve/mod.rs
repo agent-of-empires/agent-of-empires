@@ -10,11 +10,11 @@ use std::time::{Duration, Instant};
 use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::prelude::*;
 
+use crate::acp::client::autostart::initial_log_tail;
 use crate::cli::serve::{read_serve_urls, ServeUrl};
 use crate::tui::components::hover::HoverState;
 use crate::tui::dialogs::{contains, hit, target_rects};
 use crate::tui::styles::Theme;
-pub(crate) use daemon::start_local_daemon_and_wait;
 use daemon::*;
 
 const TUNNEL_STARTUP_TIMEOUT_SECS: u64 = 60;

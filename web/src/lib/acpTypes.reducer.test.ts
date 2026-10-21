@@ -6,6 +6,7 @@ import {
   applyReducedState,
   webRendersServerRow,
   emptyAcpState,
+  isVisiblyBusy,
   mergeServerRows,
   patchServerRow,
   summarizeAnswers,
@@ -124,6 +125,19 @@ describe("applyReducedState (Tier 1.2)", () => {
 
     const cleared = applyReducedState(seeded, reducedState());
     expect(cleared.availableCommands).toHaveLength(0);
+  });
+
+  it("adopts the daemon's open background tasks, so one older than the replay window still reads busy", () => {
+    // The replay window folds only the latest events, so the start of a
+    // long-running task may never reach the reducer.
+    const cold = applyReducedState(emptyAcpState(), reducedState({ background_tasks: ["t-1"] }));
+    expect(cold.backgroundTasks).toEqual(["t-1"]);
+    expect(isVisiblyBusy(cold)).toBe(true);
+
+    // The daemon omits the field when nothing is open, which must clear it.
+    const cleared = applyReducedState(cold, reducedState());
+    expect(cleared.backgroundTasks).toEqual([]);
+    expect(isVisiblyBusy(cleared)).toBe(false);
   });
 
   it("leaves lastSeq alone so the raw-frame dedupe still governs replay", () => {

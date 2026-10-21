@@ -1049,7 +1049,11 @@ last_seen_version = "{}"
         let mut cmd = self.isolated(
             &self.binary_path,
             &[],
-            &["AGENT_OF_EMPIRES_DEBUG", "AOE_LOG_LEVEL"],
+            &[
+                "AGENT_OF_EMPIRES_DEBUG",
+                "AOE_LOG_LEVEL",
+                "AOE_NO_AUTOSTART",
+            ],
         );
         cmd.args(args);
         cmd

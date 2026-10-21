@@ -255,7 +255,6 @@ pub struct HomeView {
     /// Checkbox keys the last submitted confirm dialog had checked.
     pub(super) confirm_checked: Vec<&'static str>,
     pub(super) pending_switch_view_session: Option<String>,
-    pub(super) pending_daemon_start_session: Option<String>,
     pub(in crate::tui) structured_preview:
         Option<crate::tui::structured_view::embedded::EmbeddedView>,
     pub(in crate::tui) structured_preview_pending: bool,

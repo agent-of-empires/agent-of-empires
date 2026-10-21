@@ -2537,6 +2537,24 @@
       ]
     },
     {
+      "id": "settings.persistent-structured-views",
+      "kind": "vitest",
+      "risk": "low",
+      "specs": [
+        "src/components/__tests__/StructuredSessionStack.test.tsx",
+        "src/lib/__tests__/persistentStructuredViews.test.ts",
+        "src/components/settings/__tests__/StructuredViewDisplaySettings.test.tsx",
+        "src/components/acp/__tests__/StructuredViewRoot.test.tsx"
+      ],
+      "components": [
+        "web/src/components/StructuredSessionStack.tsx",
+        "web/src/components/TerminalSessionStack.tsx",
+        "web/src/hooks/usePersistentSessionIds.ts",
+        "web/src/lib/persistentStructuredViews.ts",
+        "web/src/components/MobileMainPane.tsx"
+      ]
+    },
+    {
       "id": "settings.panels-section",
       "kind": "vitest",
       "risk": "low",
@@ -2632,6 +2650,13 @@
         "web/src/components/acp/ToolCardChrome.tsx",
         "web/src/components/acp/ToolOutputMedia.tsx"
       ]
+    },
+    {
+      "id": "acp.background-tasks",
+      "kind": "vitest",
+      "risk": "medium",
+      "specs": ["src/lib/acpTypes.test.ts", "src/lib/acpTypes.reducer.test.ts"],
+      "components": ["web/src/lib/acpTypes.ts", "web/src/components/acp/AcpRuntime.tsx"]
     },
     {
       "id": "acp.background-agent-composer",
@@ -4122,9 +4147,17 @@
       "specs": [
         "src/lib/diffPair.test.ts",
         "src/components/diff/__tests__/StringDiff.test.tsx",
-        "src/components/acp/ToolCards.render.test.tsx"
+        "src/components/acp/ToolCards.render.test.tsx",
+        "src/components/acp/activityMessages.test.ts",
+        "src/components/acp/ThreadMessages.test.tsx"
       ],
-      "components": ["web/src/components/acp/ToolCards.tsx", "web/src/components/diff/StringDiff.tsx"]
+      "components": [
+        "web/src/components/acp/ToolCards.tsx",
+        "web/src/components/acp/NamedToolCards.tsx",
+        "web/src/components/acp/activityMessages.ts",
+        "web/src/components/acp/ThreadMessages.tsx",
+        "web/src/components/diff/StringDiff.tsx"
+      ]
     },
     {
       "id": "acp.story.queue-follow-up-with-nav",

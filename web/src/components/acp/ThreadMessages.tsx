@@ -2,7 +2,13 @@ import { createContext, useContext, useMemo } from "react";
 
 import { MessagePrimitive, useAuiState } from "@assistant-ui/react";
 
-import { isElicitationAnswersPayload, type ActivityRow, type ToolCall, type ToolOutputBlock } from "../../lib/acpTypes";
+import {
+  isElicitationAnswersPayload,
+  type ActivityRow,
+  type DiffPreview,
+  type ToolCall,
+  type ToolOutputBlock,
+} from "../../lib/acpTypes";
 import { parseJsonObject } from "../../lib/acpArgs";
 import { pickMemoryRecall } from "../../lib/memoryRecall";
 import { openInNewTab } from "../../lib/openInNewTab";
@@ -171,6 +177,22 @@ function pickStartedAt(args: Record<string, unknown> | undefined, argsText: stri
   return null;
 }
 
+const isTextOrNull = (v: unknown) => v === undefined || v === null || typeof v === "string";
+
+function isDiffPreview(v: unknown): v is DiffPreview {
+  if (!v || typeof v !== "object") return false;
+  const d = v as Record<string, unknown>;
+  return typeof d.path === "string" && isTextOrNull(d.old_text) && isTextOrNull(d.new_text);
+}
+
+function pickDiffs(args: Record<string, unknown> | undefined, argsText: string | undefined): DiffPreview[] | undefined {
+  for (const o of [args, argsText ? parseJsonObject(argsText) : null]) {
+    const diffs = o?._aoe_diffs;
+    if (Array.isArray(diffs) && diffs.length > 0 && diffs.every(isDiffPreview)) return diffs;
+  }
+  return undefined;
+}
+
 function prettifyToolName(kind: string, args?: Record<string, unknown>): string {
   for (const key of ["_aoe_title", "path", "file_path", "filePath", "command", "cmd", "query", "url"]) {
     const v = args?.[key];
@@ -202,6 +224,7 @@ function toToolItem(part: ToolPart): { tool: ToolCall; result?: ActivityRow; kin
     args_preview: part.argsText ?? safeStringify(part.args ?? null),
     started_at: pickStartedAt(part.args, part.argsText) ?? fallbackAt,
     memory_recall: pickMemoryRecall(part.args, part.argsText),
+    diffs: pickDiffs(part.args, part.argsText),
   };
   const result =
     part.result !== undefined
