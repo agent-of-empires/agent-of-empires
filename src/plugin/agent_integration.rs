@@ -403,8 +403,8 @@ fn same_prompt(a: &AgentIntegrationSnapshot, b: &AgentIntegrationSnapshot) -> bo
         && a.provider_session_id == b.provider_session_id
         && a.writer_pid == b.writer_pid
         && a.revision == b.revision
-        && a.prompt.as_ref().map(AgentIntegrationPrompt::id)
-            == b.prompt.as_ref().map(AgentIntegrationPrompt::id)
+        && a.prompt == b.prompt
+        && a.reply_keys == b.reply_keys
 }
 
 fn validate_response(
@@ -548,6 +548,229 @@ mod tests {
                 "built-in alias should reserve {tool}"
             );
         }
+    }
+
+    #[test]
+    fn same_prompt_rejects_changed_prompt_content_and_reply_keys() {
+        let expected = snapshot();
+
+        let mut changed = expected.clone();
+        if let Some(AgentIntegrationPrompt::Approval { title, .. }) = &mut changed.prompt {
+            *title = "Different action".into();
+        }
+        assert!(!same_prompt(&expected, &changed));
+
+        let mut changed = expected.clone();
+        changed.reply_keys = vec!["F1".into()];
+        assert!(!same_prompt(&expected, &changed));
+
+        let mut expected_question = expected.clone();
+        expected_question.prompt = Some(AgentIntegrationPrompt::Question {
+            id: "ask".into(),
+            title: "Pick a database".into(),
+            questions: vec![AgentIntegrationQuestion {
+                id: "db".into(),
+                question: "Which database?".into(),
+                options: vec![AgentIntegrationOption {
+                    label: "SQLite".into(),
+                    description: Some("Embedded".into()),
+                }],
+                multi: false,
+                recommended: None,
+            }],
+        });
+        let mut changed = expected_question.clone();
+        let Some(AgentIntegrationPrompt::Question { questions, .. }) = &mut changed.prompt else {
+            unreachable!();
+        };
+        questions[0].question = "Which database version?".into();
+        assert!(!same_prompt(&expected_question, &changed));
+    }
+
+    #[test]
+    fn check_file_rejects_insecure_mode_and_oversized_reports() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("report.json");
+
+        std::fs::write(&path, b"{}").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(check_file(&std::fs::metadata(&path).unwrap())
+            .unwrap_err()
+            .to_string()
+            .contains("mode 0600"));
+
+        std::fs::write(&path, vec![b'x'; MAX_REPORT_BYTES + 1]).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(check_file(&std::fs::metadata(&path).unwrap())
+            .unwrap_err()
+            .to_string()
+            .contains("size limit"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn check_file_rejects_a_report_owned_by_another_user_when_root() {
+        use crate::hooks::test_support::{make_alien_owned, privdrop_test_enabled};
+        use nix::unistd::chown;
+        use std::os::unix::fs::PermissionsExt;
+
+        if !privdrop_test_enabled() {
+            return;
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("report.json");
+        std::fs::write(&path, b"{}").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        make_alien_owned(&path);
+
+        let rejected = check_file(&std::fs::metadata(&path).unwrap());
+        chown(
+            &path,
+            Some(nix::unistd::geteuid()),
+            Some(nix::unistd::getegid()),
+        )
+        .unwrap();
+        assert!(rejected.unwrap_err().to_string().contains("another owner"));
+    }
+
+    fn install_test_integration(plugin_id: &str, tool: &str) {
+        use crate::session::{CapabilityGrant, PluginConfig};
+
+        let manifest = format!(
+            r#"
+id = "{plugin_id}"
+name = "Integration test"
+version = "1.0.0"
+api_version = 19
+capabilities = ["session.integration"]
+
+[[agent_integrations]]
+tool = "{tool}"
+provider_versions = ["^18"]
+replies = true
+"#
+        );
+        let dir = super::super::plugins_dir().unwrap().join(plugin_id);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("aoe-plugin.toml"), &manifest).unwrap();
+        crate::session::update_config(|config| {
+            config.plugins.insert(
+                plugin_id.to_string(),
+                PluginConfig {
+                    grant: Some(CapabilityGrant {
+                        manifest_hash: aoe_plugin_api::PluginManifest::hash_bytes(
+                            manifest.as_bytes(),
+                        ),
+                        capabilities: vec!["session.integration".into()],
+                        granted_at: chrono::Utc::now(),
+                    }),
+                    ..PluginConfig::default()
+                },
+            );
+        })
+        .unwrap();
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn provider_rejects_duplicate_active_claims() {
+        let temp = tempfile::tempdir().unwrap();
+        let _env = crate::session::test_support::EnvGuard::set(&[
+            ("HOME", temp.path()),
+            ("XDG_CONFIG_HOME", temp.path()),
+            ("USERPROFILE", temp.path()),
+        ]);
+        let _featured = crate::session::test_support::EnvGuard::unset(&["AOE_FEATURED_INDEX_PATH"]);
+        install_test_integration("acme.integration-one", "shared-agent");
+        install_test_integration("acme.integration-two", "shared-agent");
+
+        let registry = super::super::PluginRegistry::load(&crate::session::Config::load_or_warn());
+        let error = match provider(&registry, "shared-agent") {
+            Err(error) => error,
+            Ok(_) => panic!("duplicate integration claims must be rejected"),
+        };
+        assert!(error.to_string().contains("multiple approved integrations"));
+    }
+
+    #[test]
+    #[serial_test::serial(hook_base)]
+    fn respond_writes_private_reply_and_delivers_declared_wake_key() {
+        if !crate::tmux::test_helpers::tmux_available() {
+            eprintln!("Skipping test: tmux not available");
+            return;
+        }
+        let (_base, _base_path, _hook_tmp) = crate::hooks::test_support::BaseGuard::ready();
+        let temp = tempfile::tempdir().unwrap();
+        let _reload = super::super::ReloadRegistryOnDrop;
+        let _env = crate::session::test_support::EnvGuard::set(&[
+            ("HOME", temp.path()),
+            ("XDG_CONFIG_HOME", temp.path()),
+            ("USERPROFILE", temp.path()),
+        ]);
+        let _featured = crate::session::test_support::EnvGuard::unset(&["AOE_FEATURED_INDEX_PATH"]);
+        install_test_integration("acme.integration-reply", "reply-agent");
+        let registry = super::super::reload_registry();
+
+        let mut instance = Instance::new("integration-reply-test", "/tmp");
+        instance.tool = "reply-agent".into();
+        instance.status = crate::session::Status::Running;
+        let tmux = crate::tmux::Session::new(&instance.id, &instance.title).unwrap();
+        tmux.create("/tmp", Some("od -An -tx1"), "default").unwrap();
+        struct KillSession(crate::tmux::Session);
+        impl Drop for KillSession {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+            }
+        }
+        let _kill = KillSession(crate::tmux::Session::from_name(tmux.name()));
+
+        let mut current = snapshot();
+        current.instance_id = instance.id.clone();
+        current.provider_version = "18.11.1".into();
+        current.reply_keys = vec!["F12".into()];
+        let dir = dir_guard::open_instance_dir(&instance.id).unwrap();
+        let report_name = "integration-acme.integration-reply.json";
+        dir_guard::write_atomic(
+            dir.as_fd(),
+            report_name,
+            &serde_json::to_vec(&current).unwrap(),
+        )
+        .unwrap();
+
+        let response = AgentIntegrationResponse::Approval {
+            choice: IntegrationApprovalChoice::Allow,
+        };
+        respond(&instance, &current, response).unwrap();
+
+        let reply_path = _hook_tmp
+            .path()
+            .join("aoe-hooks")
+            .join(&instance.id)
+            .join("integration-acme.integration-reply.reply.json");
+        let reply_meta = std::fs::metadata(&reply_path).unwrap();
+        assert_eq!(reply_meta.mode() & 0o7777, 0o600);
+        let reply: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(reply_path).unwrap()).unwrap();
+        assert_eq!(reply["prompt_id"], "approval");
+        assert_eq!(reply["instance_id"], instance.id);
+        assert_eq!(reply["response"]["choice"], "allow");
+
+        let mut pane = String::new();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while std::time::Instant::now() < deadline {
+            pane = tmux.capture_pane(20).unwrap();
+            if pane.contains("^[[24~") {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(
+            pane.contains("^[[24~"),
+            "provider-declared F12 must be delivered to the pane, got {pane:?}"
+        );
+        drop(registry);
     }
 
     use aoe_plugin_api::agent_integration::{

@@ -6744,6 +6744,7 @@ impl HomeView {
             if let Some(prompt) = snapshot.prompt.clone() {
                 match prompt {
                     aoe_plugin_api::agent_integration::AgentIntegrationPrompt::Approval {
+                        title: prompt_title,
                         allow_always,
                         ..
                     } => {
@@ -6753,8 +6754,9 @@ impl HomeView {
                                 snapshot,
                             });
                         self.permission_response_dialog = Some(
-                            crate::tui::dialogs::PermissionResponseDialog::new_with_allow_always(
+                            crate::tui::dialogs::PermissionResponseDialog::integration(
                                 &title,
+                                &prompt_title,
                                 allow_always,
                             ),
                         );

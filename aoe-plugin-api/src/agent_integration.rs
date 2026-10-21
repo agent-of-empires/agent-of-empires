@@ -64,7 +64,7 @@ pub struct AgentIntegrationSnapshot {
     pub prompt: Option<AgentIntegrationPrompt>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "lowercase", deny_unknown_fields)]
 pub enum AgentIntegrationPrompt {
     Approval {
@@ -87,7 +87,7 @@ impl AgentIntegrationPrompt {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AgentIntegrationQuestion {
     pub id: String,
@@ -98,7 +98,7 @@ pub struct AgentIntegrationQuestion {
     pub recommended: Option<usize>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AgentIntegrationOption {
     pub label: String,
