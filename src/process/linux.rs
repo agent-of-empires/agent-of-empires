@@ -190,6 +190,14 @@ pub(super) fn processes_matching(
     found
 }
 
+/// A process mid-exit reports pgrp `-1`; it belongs to no group.
+fn parse_process_group(field: &str) -> anyhow::Result<Option<u32>> {
+    let pgrp = field
+        .parse::<i32>()
+        .with_context(|| format!("invalid process group {field:?}"))?;
+    Ok(u32::try_from(pgrp).ok())
+}
+
 fn process_disappeared(error: &std::io::Error) -> bool {
     error.kind() == std::io::ErrorKind::NotFound || error.raw_os_error() == Some(libc::ESRCH)
 }
@@ -227,11 +235,8 @@ pub(super) fn runner_group_executing(group: u32) -> anyhow::Result<bool> {
             .context("invalid process stat")?;
         let mut fields = std::str::from_utf8(&bytes[offset + 2..size])?.split_ascii_whitespace();
         let state = fields.next().context("missing process state")?;
-        let process_group = fields
-            .nth(1)
-            .context("missing process group")?
-            .parse::<u32>()?;
-        if process_group == group && state != "Z" {
+        let process_group = parse_process_group(fields.nth(1).context("missing process group")?)?;
+        if process_group == Some(group) && state != "Z" {
             return Ok(true);
         }
     }
@@ -267,12 +272,11 @@ pub(super) fn process_group_id(pid: u32) -> anyhow::Result<Option<u32>> {
         .rposition(|pair| pair == b") ")
         .context("invalid process stat")?;
     let tail = std::str::from_utf8(&stat[offset + 2..])?;
-    Ok(Some(
+    parse_process_group(
         tail.split_ascii_whitespace()
             .nth(2)
-            .context("missing process group")?
-            .parse()?,
-    ))
+            .context("missing process group")?,
+    )
 }
 impl ProcessHandle {
     pub(super) fn capture(identity: &super::PrimeProcessIdentity) -> anyhow::Result<Option<Self>> {
@@ -402,11 +406,8 @@ pub(super) fn runner_group_identities(
         let (_, tail) = stat.rsplit_once(") ").context("invalid process stat")?;
         let mut fields = tail.split_ascii_whitespace();
         let state = fields.next().context("missing process state")?;
-        let pgrp = fields
-            .nth(1)
-            .context("missing process group")?
-            .parse::<u32>()?;
-        if state != "Z" && pgrp == group {
+        let pgrp = parse_process_group(fields.nth(1).context("missing process group")?)?;
+        if state != "Z" && pgrp == Some(group) {
             let start = fields.nth(16).context("missing process birth identity")?;
             result.push(super::PrimeProcessIdentity {
                 pid,
@@ -807,6 +808,14 @@ impl super::SleepInhibit for SystemdInhibitor {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn process_group_field_tolerates_a_process_mid_exit() {
+        assert_eq!(parse_process_group("-1").unwrap(), None);
+        assert_eq!(parse_process_group("42").unwrap(), Some(42));
+        let error = parse_process_group("S").unwrap_err();
+        assert!(format!("{error:#}").contains("\"S\""));
+    }
 
     #[test]
     fn launch_executable_recovers_only_deleted_paths_with_a_live_replacement() {

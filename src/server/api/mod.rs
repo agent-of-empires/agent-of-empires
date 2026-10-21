@@ -8,6 +8,7 @@ mod client_log;
 mod file_provenance;
 mod git;
 mod log_level;
+mod logs;
 mod mcp;
 mod mutation_guard;
 pub(crate) mod plugin_settings;
@@ -33,6 +34,7 @@ pub use queue::{queue_clear, queue_edit, queue_enqueue, queue_list, queue_remove
 pub use client_log::post_client_log;
 pub use git::{clone_repo, is_git_repo, list_branches, list_worktrees};
 pub use log_level::{get_log_level, patch_log_level};
+pub use logs::get_logs;
 pub use mcp::{
     create_mcp_server, delete_mcp_server, drop_mcp_server, edit_mcp_server, get_mcp_servers,
     keep_mcp_server, resolve_mcp_conflict,

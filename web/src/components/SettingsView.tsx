@@ -28,6 +28,7 @@ import { CityHallSettings } from "./settings/CityHallSettings";
 import { PluginsSettings } from "./settings/PluginsSettings";
 import { TOUR_ANCHORS, tourAnchor } from "../lib/tourSteps";
 import { PluginSettingsSections } from "./settings/PluginSettingsSections";
+import { LogsSettings } from "./settings/LogsSettings";
 import { SettingsHeader } from "./settings/SettingsHeader";
 import { StructuredViewDisplaySettings } from "./settings/StructuredViewDisplaySettings";
 import { ProfilesSection } from "./profiles/ProfilesSection";
@@ -56,6 +57,7 @@ export type TabId =
   | "mcp"
   | "skills"
   | "logging"
+  | "logs"
   | "plugins"
   | "cityhall";
 
@@ -86,7 +88,7 @@ const PROFILES_ICON = (
 // Dashboard settings lead, since the web is where they apply; tabs that only
 // tune the daemon, TUI, or host follow. Exported to test the order without the
 // duplicated list and sidebar in the DOM.
-export function buildSidebar(): SidebarItem[] {
+export function buildSidebar(readOnly = false): SidebarItem[] {
   const items: SidebarItem[] = [
     { kind: "divider", label: "Dashboard" },
     { kind: "tab", id: "theme", label: "Theme" },
@@ -112,6 +114,7 @@ export function buildSidebar(): SidebarItem[] {
     { kind: "tab", id: "updates", label: "Updates" },
     { kind: "tab", id: "telemetry", label: "Telemetry" },
     { kind: "tab", id: "logging", label: "Logging" },
+    ...(readOnly ? [] : [{ kind: "tab" as const, id: "logs" as const, label: "Logs" }]),
     { kind: "tab", id: "plugins", label: "Plugins" },
     { kind: "tab", id: "cityhall", label: "CityHall" },
   ];
@@ -197,6 +200,7 @@ const ALL_TAB_IDS = new Set<TabId>([
   "mcp",
   "skills",
   "logging",
+  "logs",
   "plugins",
   "cityhall",
 ]);
@@ -280,9 +284,10 @@ export function SettingsView({
     },
     [onSelectProfile],
   );
-  const sidebar: SidebarItem[] = cityhall ? CITYHALL_SIDEBAR : buildSidebar();
+  const sidebar: SidebarItem[] = cityhall ? CITYHALL_SIDEBAR : buildSidebar(readOnly);
   const tabs = sidebar.filter((s): s is { kind: "tab"; id: TabId; label: string } => s.kind === "tab");
-  const allowedTab = (t: unknown): t is TabId => isTabId(t) && (!cityhall || CITYHALL_TAB_IDS.has(t));
+  const allowedTab = (t: unknown): t is TabId =>
+    isTabId(t) && (cityhall ? CITYHALL_TAB_IDS.has(t) : sidebar.some((s) => s.kind === "tab" && s.id === t));
   // No tab in the URL: mobile shows the section list, desktop reopens the last visited tab.
   const lastTab = safeGetItem(LAST_TAB_KEY);
   const activeTab: TabId = allowedTab(tab) ? tab : allowedTab(lastTab) ? lastTab : "theme";
@@ -428,6 +433,7 @@ export function SettingsView({
       activeTab !== "plugins" &&
       activeTab !== "telemetry" &&
       activeTab !== "cityhall" &&
+      activeTab !== "logs" &&
       activeTab !== "panels"
     ) {
       return <div className="text-sm text-text-dim">Loading settings...</div>;
@@ -613,6 +619,8 @@ export function SettingsView({
             advancedSubtitle="Sink and rotation; some fields require restarting aoe to take effect."
           />
         );
+      case "logs":
+        return <LogsSettings />;
 
       case "plugins":
         return (

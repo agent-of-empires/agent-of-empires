@@ -600,6 +600,23 @@
       ]
     },
     {
+      "id": "settings.logs-tab",
+      "kind": "vitest",
+      "risk": "medium",
+      "specs": [
+        "src/components/settings/__tests__/LogsSettings.test.tsx",
+        "src/components/__tests__/SettingsView.test.tsx"
+      ],
+      "components": ["web/src/components/settings/LogsSettings.tsx", "web/src/components/SettingsView.tsx"]
+    },
+    {
+      "id": "settings.logs-endpoint-access",
+      "kind": "live-playwright",
+      "risk": "high",
+      "specs": ["tests/live/logs-endpoint.spec.ts"],
+      "components": ["src/server/api/logs.rs"]
+    },
+    {
       "id": "settings.cityhall-export",
       "kind": "vitest",
       "risk": "medium",
@@ -2536,6 +2553,24 @@
       "risk": "medium",
       "specs": ["tests/live/auth.spec.ts"],
       "components": ["web/src/components/ConnectedDevices.tsx"]
+    },
+    {
+      "id": "connectivity.banner-stack",
+      "kind": "vitest",
+      "risk": "medium",
+      "specs": [
+        "src/components/__tests__/BannerStack.test.tsx",
+        "src/components/__tests__/DisconnectBanner.test.tsx",
+        "src/components/__tests__/UpdateBanner.test.tsx",
+        "src/components/__tests__/DashboardUpdateBanner.test.tsx"
+      ],
+      "components": [
+        "web/src/components/BannerStack.tsx",
+        "web/src/components/DisconnectBanner.tsx",
+        "web/src/components/UpdateBanner.tsx",
+        "web/src/components/DashboardUpdateBanner.tsx",
+        "web/src/components/PushHealthBanner.tsx"
+      ]
     },
     {
       "id": "connectivity.disconnect-banner",

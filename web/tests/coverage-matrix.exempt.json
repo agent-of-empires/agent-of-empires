@@ -34,10 +34,6 @@
       "reason": "Trigger covered by command-palette.spec.ts"
     },
     {
-      "path": "web/src/components/UpdateBanner.tsx",
-      "reason": "Update banner covered by update-banner.spec.ts (mocked)"
-    },
-    {
       "path": "web/src/components/command-palette/CommandPalette.tsx",
       "reason": "Command palette covered by command-palette.spec.ts (mocked)"
     },
