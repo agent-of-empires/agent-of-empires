@@ -437,9 +437,7 @@ impl<S: BroadcastSink> Supervisor<S> {
             guard.remove(session_id);
         }
         lock_recover(&self.lifecycle).forget(session_id);
-        if let Some((_, token)) = lock_recover(&self.resume_cancellations).remove(session_id) {
-            token.cancel();
-        }
+        // Let an in-flight launch reach stale-install cleanup so it can reap its runner.
         lock_recover(&self.startup_failures).remove(session_id);
         lock_recover(&self.respawned_in_place).remove(session_id);
     }
