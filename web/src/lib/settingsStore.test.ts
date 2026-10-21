@@ -451,6 +451,25 @@ describe("settings store", () => {
     expect(sendB).toHaveBeenCalledTimes(1);
   });
 
+  it("does not send a queued global edit once another profile's newer one was mirrored in", async () => {
+    const b = await seedPluginProfile("B", ["a", "b", "c"]);
+    await seedPluginProfile("A", ["a", "b", "c"]);
+    vi.mocked(fetchSettings).mockResolvedValue(pluginSettings(["c"]));
+    const unrelated = deferred<SaveOutcome>();
+    const sendX = vi.fn(async (): Promise<SaveOutcome> => "committed");
+    await act(async () => {
+      void saveField("B", "web", "other", 1, () => unrelated.promise);
+      void saveField("B", "plugin:x", "list", ["a", "b"], sendX);
+    });
+
+    await act(async () => {
+      await saveField("A", "plugin:x", "list", ["c"], async () => "committed");
+    });
+    await act(async () => unrelated.resolve("committed"));
+    await waitFor(() => expect(pluginList(b)).toEqual(["c"]));
+    expect(sendX).not.toHaveBeenCalled();
+  });
+
   it("drops a GET already in flight for a profile when another profile's global edit is mirrored", async () => {
     vi.mocked(fetchSettings).mockResolvedValueOnce(pluginSettings(["a", "b", "c"]));
     loadSettings("B");

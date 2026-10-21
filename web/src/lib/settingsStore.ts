@@ -72,6 +72,8 @@ interface Entry {
   /** Global edits made under another profile that its save has not settled; laid over every GET. */
   mirrors: Map<string, Mirror>;
   fieldGen: Map<string, number>;
+  /** Bumped when another profile's global edit of the field is mirrored in; a send queued before it is stale. */
+  mirrorGen: Map<string, number>;
   loading: Promise<boolean>;
   afterDrain: (() => void)[];
   loadSeq: number;
@@ -92,6 +94,7 @@ function entry(profile: string): Entry {
       unconfirmed: new Map(),
       mirrors: new Map(),
       fieldGen: new Map(),
+      mirrorGen: new Map(),
       loading: Promise.resolve(false),
       afterDrain: [],
       loadSeq: 0,
@@ -135,6 +138,7 @@ function mirrorPluginField(origin: Entry, section: string, field: string, value:
       // A newer global edit supersedes this profile's older intent for the field, even one still in flight.
       other.unconfirmed.delete(key);
       other.fieldGen.set(key, (other.fieldGen.get(key) ?? 0) + 1);
+      other.mirrorGen.set(key, (other.mirrorGen.get(key) ?? 0) + 1);
       other.mirrors.set(key, { section, field, value, token });
       if (other.view.settings) publish(other, { settings: writeField(other.view.settings, section, field, value) });
     }
@@ -252,7 +256,11 @@ export async function saveField(
     settings: base && writeField(base, section, field, value),
   });
   const settleMirror = mirrorPluginField(e, section, field, value);
-  const request = e.tail.then(send);
+  const mirrorGen = e.mirrorGen.get(key);
+  // A newer global edit mirrored in while this send waited its turn owns the field now.
+  const request = e.tail.then((): Promise<SaveOutcome> | SaveOutcome =>
+    e.mirrorGen.get(key) === mirrorGen ? send() : "committed",
+  );
   e.tail = request.catch(() => undefined);
   const outcome = await request.catch((): SaveOutcome => "uncertain");
   e.gen++;
