@@ -1150,8 +1150,6 @@ mod tests {
         let local_moved = (format!("{kept}. {rescan}"), format!("new link; {kept}"));
         let on = Some(true);
         // What the next start does: (takes the Funnel path, port it reuses (None = random),
-        // still has the link's LAN address, inherits AOE_SERVE_PASSPHRASE, persist_sessions).
-        // What the next start does: (takes the Funnel path, port it reuses (None = random),
         // still has the link's LAN address, inherits AOE_SERVE_PASSPHRASE, persist_sessions,
         // mints a new token).
         let probe =
