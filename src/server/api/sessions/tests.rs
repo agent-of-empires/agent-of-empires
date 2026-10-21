@@ -9398,6 +9398,8 @@ async fn create_refuses_a_structured_session_without_its_adapter() {
         serde_json::json!({ "import_acp_session_id": "native-1" }),
         serde_json::json!({ "view": "structured", "fork_from": "parent-1" }),
         serde_json::json!({ "view": "structured", "tool": "claude", "agent_name": "fake" }),
+        // The session's command can't stand in for a custom agent's ACP command.
+        serde_json::json!({ "view": "structured", "command_override": "true acp" }),
     ];
     for extra in refused {
         let (status, body) = post_create(&state, base(extra.clone())).await;
@@ -9420,7 +9422,8 @@ async fn create_refuses_a_structured_session_without_its_adapter() {
     }
     let exempt = [
         serde_json::json!({ "view": "structured", "sandbox": true }),
-        serde_json::json!({ "view": "structured", "command_override": "true acp" }),
+        // It replaces an adapter that is the agent's own CLI, so that's what is checked.
+        serde_json::json!({ "view": "structured", "tool": "gemini", "command_override": "/bin/sh" }),
         serde_json::json!({ "view": "terminal" }),
     ];
     for extra in exempt {

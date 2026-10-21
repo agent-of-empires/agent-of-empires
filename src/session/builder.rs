@@ -1164,6 +1164,8 @@ pub mod structured {
         pub tool: &'a str,
         /// An explicit ACP agent overriding `tool`, as the web create's `agent_name`.
         pub agent_name: Option<&'a str>,
+        /// The session's own command, as the web create's `command_override`;
+        /// empty uses the configured one.
         pub command_override: &'a str,
         pub sandboxed: bool,
         /// Where the session launches, or `None` while that directory doesn't exist yet
@@ -1205,30 +1207,52 @@ pub mod structured {
                  agents, or turn Structured off for a terminal session."
             )));
         }
-        if !choice.command_override.trim().is_empty() || choice.sandboxed {
+        if choice.sandboxed {
             return Ok(());
         }
         let registry = crate::acp::agent_registry::AgentRegistry::with_defaults();
-        let spec = match registry.get(agent) {
-            Some(spec) => spec.clone(),
+        let (mut spec, spec_from_registry) = match registry.get(agent) {
+            Some(spec) => (spec.clone(), true),
             None => match config.session.agent_acp_cmd.get(agent) {
-                Some(cmd) => crate::acp::AgentSpec::from_acp_cmd(agent, cmd).map_err(|e| {
-                    StructuredChoiceError::NotCapable(format!(
-                        "invalid [session.agent_acp_cmd] for `{agent}`: {e}"
-                    ))
-                })?,
+                Some(cmd) => (
+                    crate::acp::AgentSpec::from_acp_cmd(agent, cmd).map_err(|e| {
+                        StructuredChoiceError::NotCapable(format!(
+                            "invalid [session.agent_acp_cmd] for `{agent}`: {e}"
+                        ))
+                    })?,
+                    false,
+                ),
                 // A custom agent that inherits a registry-backed base runs the
                 // base agent's adapter, so the check targets that.
                 None => {
                     match crate::acp::inherited_acp_base(agent, &config.session.agent_detect_as)
                         .and_then(|base| registry.get(&base).cloned())
                     {
-                        Some(spec) => spec,
+                        Some(spec) => (spec, true),
                         None => unreachable!("tool_acp_capable implies a resolvable spec"),
                     }
                 }
             },
         };
+        // The spawn runs the session's command in place of an adapter that is the
+        // agent's own CLI, so check what it will launch.
+        let command = match choice.command_override.trim() {
+            "" => config.session.resolve_tool_command(choice.tool),
+            command => command.to_string(),
+        };
+        if let Some(ovr) =
+            crate::server::acp_reconciler::command_override_for_spawn(choice.tool, &command)
+        {
+            crate::acp::supervisor::apply_agent_command_override(
+                agent,
+                spec_from_registry,
+                &ovr,
+                &mut spec,
+            )
+            .map_err(|e| {
+                StructuredChoiceError::NotCapable(format!("invalid command for `{agent}`: {e}"))
+            })?;
+        }
         if adapter_reachable_with(
             &spec.command,
             choice.project_path,
@@ -1624,9 +1648,11 @@ mod tests {
     /// The pre-create refusal follows the runner's lookup, so it never
     /// refuses an adapter the spawn would find.
     #[test]
+    #[serial_test::serial]
     fn validate_structured_choice_cases() {
         use std::os::unix::fs::PermissionsExt;
         use structured::{StructuredChoice, StructuredChoiceError};
+        let _home = crate::session::test_support::isolate_app_dir();
         let adapter = format!("aoe-test-adapter-{}", std::process::id());
         let project = tempfile::tempdir().unwrap();
         let elsewhere = tempfile::tempdir().unwrap();
@@ -1637,7 +1663,7 @@ mod tests {
         std::fs::write(bin.join(&adapter), "#!/bin/sh\n").unwrap();
         std::fs::set_permissions(bin.join(&adapter), std::fs::Permissions::from_mode(0o755))
             .unwrap();
-        let config = |environment: &[String], hooks: bool| {
+        let config = |environment: &[String], hooks: bool, configured_command: Option<&str>| {
             let mut config = crate::session::Config::default();
             for (name, cmd) in [
                 ("fake", adapter.clone()),
@@ -1650,12 +1676,19 @@ mod tests {
                 config.session.agent_acp_cmd.insert(name.into(), cmd);
             }
             config.environment = environment.to_vec();
+            if let Some(command) = configured_command {
+                config
+                    .session
+                    .agent_command_override
+                    .insert("gemini".into(), command.into());
+            }
             if hooks {
                 config.host_hooks.before_session = vec!["true".into()];
             }
             config
         };
         let configured = vec![format!("PATH={}", bin.display())];
+        let present_wrapper = bin.join(&adapter).display().to_string();
         let missing_text = "is not installed or not on $PATH";
         let missing = Some(missing_text);
         let not_capable = Some("is not ACP-capable");
@@ -1668,6 +1701,8 @@ mod tests {
             /// `None`: a worktree, scratch or multi-repo session checked before it exists.
             project: Option<&'a std::path::Path>,
             environment: Vec<String>,
+            /// `agent_command_override` for gemini.
+            configured_command: Option<&'a str>,
             before_session_hook: bool,
             inherited_path: Option<&'a str>,
             /// `None` passes; otherwise a substring of the refusal.
@@ -1681,6 +1716,7 @@ mod tests {
             sandboxed: false,
             project: Some(project.path()),
             environment: Vec::new(),
+            configured_command: None,
             before_session_hook: false,
             inherited_path: None,
             expected: None,
@@ -1709,8 +1745,28 @@ mod tests {
                 ..base()
             },
             Case {
-                label: "command override skips the check",
+                label: "a session command doesn't replace a custom agent's ACP command",
                 command_override: "my-wrapper acp",
+                expected: missing,
+                ..base()
+            },
+            Case {
+                label: "a session command replaces an adapter that is the agent's own CLI",
+                tool: "gemini",
+                command_override: &present_wrapper,
+                ..base()
+            },
+            Case {
+                label: "the replacing session command is checked too",
+                tool: "gemini",
+                command_override: "/nonexistent/aoe-test-gemini-wrapper",
+                expected: missing,
+                ..base()
+            },
+            Case {
+                label: "a configured command override replaces it the same way",
+                tool: "gemini",
+                configured_command: Some(&present_wrapper),
                 ..base()
             },
             Case {
@@ -1776,7 +1832,11 @@ mod tests {
         ];
         for case in cases {
             let label = case.label;
-            let config = config(&case.environment, case.before_session_hook);
+            let config = config(
+                &case.environment,
+                case.before_session_hook,
+                case.configured_command,
+            );
             let choice = StructuredChoice {
                 tool: case.tool,
                 agent_name: case.agent_name,

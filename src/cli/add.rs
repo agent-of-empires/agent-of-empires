@@ -1923,7 +1923,9 @@ mod tests {
         /// whichever way it was asked for, and otherwise judges the adapter as the create
         /// check does.
         #[test]
+        #[serial]
         fn structured_adapter_check_follows_the_sandbox_and_the_agent_path() {
+            let _home = crate::session::test_support::isolate_app_dir();
             let project = tempfile::tempdir().unwrap();
             let bin = tempfile::tempdir().unwrap();
             let adapter = format!("aoe-test-add-adapter-{}", std::process::id());
