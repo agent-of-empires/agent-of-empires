@@ -37,6 +37,7 @@ const NON_SUFFIX_HOST_STATE: Record<string, string> = {
   AOE_DAEMON_PASSPHRASE: "host-passphrase",
   AOE_DAEMON_TOKEN: "host-token",
   AOE_DAEMON_URL: "http://a-real-daemon.internal:8080",
+  AOE_NO_AUTOSTART: "1",
   AOE_E2E_INPUT_BARRIER: `${HOST}/input-barrier`,
   AOE_E2E_PARTIAL_FRAME_FILE: `${HOST}/partial-frame`,
   AOE_E2E_PROMPT_COMPLETED_FILE: `${HOST}/prompt-completed`,
@@ -107,6 +108,7 @@ const INHERITED_BY_CONTRACT = new Set([
   "AOE_AGENT_PROBE_TEST_CHILD",
   "AOE_FROZEN_NATIVE_TEST_CHILD",
   "AOE_LOOPBACK_PROXY_TEST_CHILD",
+  "AOE_RECHECK_TEST_CHILD",
   // A marker `aoe` echoes into a pane to probe a login shell, not a variable
   // the daemon resolves anything from.
   "AOE_AGENT_OK",

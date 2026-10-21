@@ -1069,10 +1069,6 @@ impl HomeView {
                 .pending_switch_view_session
                 .take()
                 .map(Action::SwitchSessionView),
-            "start_daemon_structured" => self
-                .pending_daemon_start_session
-                .take()
-                .map(Action::StartDaemonThenOpenStructured),
             "quit_during_creation" => Some(Action::Quit),
             "quit" => Some(Action::Quit),
             _ => None,
@@ -1496,12 +1492,7 @@ impl HomeView {
             if let Some(DialogResult::Submit(action)) = dialog.handle_click(col, row) {
                 match action {
                     NoAgentsAction::Recheck => {
-                        crate::tmux::invalidate_agent_availability();
-                        let tools = crate::tmux::AvailableTools::detect();
-                        if tools.any_available() {
-                            self.set_available_tools(tools);
-                            self.no_agents_dialog = None;
-                        }
+                        self.pending_dialog_click_action = Some(Action::RecheckAgents);
                     }
                     NoAgentsAction::Quit => {
                         self.no_agents_dialog = None;
@@ -1888,13 +1879,7 @@ impl HomeView {
                     return Some(Action::Quit);
                 }
                 DialogResult::Submit(NoAgentsAction::Recheck) => {
-                    crate::tmux::invalidate_agent_availability();
-                    let tools = crate::tmux::AvailableTools::detect();
-                    if tools.any_available() {
-                        self.set_available_tools(tools);
-                        self.no_agents_dialog = None;
-                    }
-                    // If still no agents, keep dialog open (user can try again)
+                    return Some(Action::RecheckAgents);
                 }
             }
             return None;
@@ -3103,24 +3088,6 @@ impl HomeView {
         };
         self.pending_switch_view_session = Some(id);
         self.confirm_dialog = Some(ConfirmDialog::new(title, body, "switch_view"));
-    }
-
-    /// Offer to start a localhost daemon when opening a structured view found none.
-    /// Neutral tone: nothing is destroyed, the user is just about to run a background
-    /// process. Remote setups keep their manual commands.
-    pub(in crate::tui) fn prompt_start_daemon_for_structured(&mut self, session_id: &str) {
-        self.pending_daemon_start_session = Some(session_id.to_string());
-        self.confirm_dialog = Some(
-            ConfirmDialog::new(
-                "Start structured view daemon",
-                "No `aoe serve` daemon is running, and structured sessions are \
-                 driven by it. Start a local (localhost-only) daemon now? For \
-                 remote access instead, cancel and run `aoe serve --daemon \
-                 --remote` yourself.",
-                "start_daemon_structured",
-            )
-            .neutral(),
-        );
     }
 
     /// The selected session's id when it is a previewable structured row: not mid

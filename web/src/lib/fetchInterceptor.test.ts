@@ -49,6 +49,9 @@ describe("classifyAuthError", () => {
 it.each([
   ["/api/login", true],
   ["/api/login/elevate", true],
+  ["/api/login/passkey/start", true],
+  ["/api/login/passkey/finish", true],
+  ["/api/passkeys/register/finish", false],
   ["/api/login/status", false],
   ["/api/logout", false],
   ["/api/sessions", false],

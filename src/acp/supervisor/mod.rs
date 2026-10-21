@@ -260,6 +260,8 @@ pub struct SpawnRequest {
     pub agent_command_override: Option<AgentCommandOverride>,
     /// Let a `session/load` replay history into the (empty) event store for an import.
     pub seed_history_replay: bool,
+    /// A conversation existed before this launch, so replacing it must be announced.
+    pub prior_conversation: bool,
     /// Claude store selected by the conversation binding for a host Claude worker.
     pub claude_store_pin: Option<crate::session::capture::ClaudeStorePin>,
 }

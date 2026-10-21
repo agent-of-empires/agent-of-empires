@@ -375,6 +375,7 @@ async fn build_spawn_request(
         agent_model,
         agent_provider,
         claude_store_pin,
+        prior_conversation,
     ) = {
         let _guard = inst_lock.lock().await;
         let instances = service.instances.read().await;
@@ -390,6 +391,9 @@ async fn build_spawn_request(
             inst.agent_model.clone(),
             inst.agent_provider.clone(),
             inst.selected_claude_store_pin(),
+            // A restart before the first worker assigned an ACP id leaves only
+            // the terminal conversation id to announce replacing.
+            target.stored_acp_session_id.is_none() && inst.agent_session_id.is_some(),
         )
     };
     let agent = supervisor
@@ -439,6 +443,7 @@ async fn build_spawn_request(
         acp_mode_id,
         agent_command_override: command_override_for_spawn(&target.tool, &target.command),
         seed_history_replay,
+        prior_conversation,
         claude_store_pin,
     })
 }
@@ -624,6 +629,31 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(req.model.as_deref(), Some("claude-opus-5"));
+    }
+
+    #[tokio::test]
+    async fn build_spawn_request_flags_a_terminal_conversation_without_an_acp_id() {
+        // (agent_session_id, acp_session_id, expected)
+        let cases = [
+            (Some("terminal-id"), None, true),
+            (None, None, false),
+            (Some("terminal-id"), Some("acp-id"), false),
+        ];
+        for (agent_id, acp_id, expected) in cases {
+            let mut instance = Instance::new("restart", "/tmp/aoe-4553-restart");
+            instance.id = "sess-restart".to_string();
+            instance.view = crate::session::View::Structured;
+            instance.agent_session_id = agent_id.map(String::from);
+            instance.acp_session_id = acp_id.map(String::from);
+            let state = crate::server::test_support::build_test_app_state(vec![instance.clone()]);
+            let req = build_spawn_request(
+                &state.session_service,
+                &ResumeTarget::from_instance(&instance),
+            )
+            .await
+            .unwrap();
+            assert_eq!(req.prior_conversation, expected, "{agent_id:?} {acp_id:?}");
+        }
     }
 
     /// #4127: a request is not an observation. Building one derives the route

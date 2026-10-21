@@ -126,6 +126,81 @@ async fn install_in_container(
     .await
 }
 
+/// The agent a session's Structured view spawns as, and its adapter binary.
+async fn session_adapter(
+    state: &AppState,
+    instance: &crate::session::Instance,
+) -> (String, Result<String, SupervisorError>) {
+    let agent = pick_agent(state, instance, instance.agent_name.as_deref()).await;
+    let binary = state
+        .acp_supervisor
+        .resolve_agent(&agent)
+        .await
+        .map(|spec| spec.command);
+    (agent, binary)
+}
+
+/// How to install a session's adapter, for the startup error banner. Describes
+/// the adapter `install-agent` installs, which for a custom `agent_acp_cmd`
+/// agent is none.
+#[derive(Serialize)]
+pub struct AgentInstallInfo {
+    pub agent: String,
+    pub display_name: String,
+    pub install_command: Option<&'static str>,
+    pub npm_installable: bool,
+    /// Whether `install-agent` accepts requests (`install_gate`).
+    pub install_allowed: bool,
+    pub sandboxed: bool,
+}
+
+/// `GET /api/sessions/{id}/acp/install-info`
+pub async fn agent_install_info(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    let Some(instance) = find_instance(&state, &id).await else {
+        return session_not_found();
+    };
+    let (agent, binary) = session_adapter(&state, &instance).await;
+    let binary = binary.ok();
+    Json(AgentInstallInfo {
+        display_name: crate::acp::display_name_for(&agent)
+            .unwrap_or(&agent)
+            .to_string(),
+        install_command: binary
+            .as_deref()
+            .and_then(crate::acp::install_hints::install_hint_for),
+        npm_installable: binary
+            .as_deref()
+            .and_then(crate::acp::install_hints::npm_package_for)
+            .is_some(),
+        install_allowed: install_gate(&state).is_ok(),
+        sandboxed: instance.is_sandboxed(),
+        agent,
+    })
+    .into_response()
+}
+
+/// Whether `install-agent` accepts requests; `install-info` reports the same
+/// answer, so the banner never offers an install that is refused.
+fn install_gate(state: &AppState) -> Result<(), Response> {
+    if let Some(resp) = read_only_block(state).or_else(|| cityhall_block(state)) {
+        return Err(resp);
+    }
+    if !crate::session::Config::load_or_warn()
+        .acp
+        .allow_agent_install
+    {
+        return Err(api_error(
+            StatusCode::FORBIDDEN,
+            "install_disabled",
+            "Installing agents from the web is off. Enable acp.allow_agent_install (Settings, local only).",
+        ));
+    }
+    Ok(())
+}
+
 /// `POST /api/sessions/{id}/acp/install-agent`: install the session's adapter
 /// where it runs (host, or inside a sandboxed session's container). Opt-in via
 /// `acp.allow_agent_install`; the package comes from a static server-side
@@ -134,29 +209,16 @@ pub async fn install_agent(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
-    if let Some(resp) = read_only_block(&state) {
+    if let Err(resp) = install_gate(&state) {
         return resp;
-    }
-    if let Some(resp) = cityhall_block(&state) {
-        return resp;
-    }
-    if !crate::session::Config::load_or_warn()
-        .acp
-        .allow_agent_install
-    {
-        return api_error(
-            StatusCode::FORBIDDEN,
-            "install_disabled",
-            "Installing agents from the web is off. Enable acp.allow_agent_install (Settings, local only).",
-        );
     }
     let Some(instance) = find_instance(&state, &id).await else {
         return session_not_found();
     };
 
-    let agent = pick_agent(&state, &instance, instance.agent_name.as_deref()).await;
-    let binary = match state.acp_supervisor.resolve_agent(&agent).await {
-        Ok(spec) => spec.command,
+    let (agent, binary) = session_adapter(&state, &instance).await;
+    let binary = match binary {
+        Ok(binary) => binary,
         Err(e) => {
             return api_error(
                 StatusCode::BAD_REQUEST,
@@ -220,4 +282,125 @@ pub async fn install_agent(
         recovered_sessions,
     })
     .into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The banner's install command and Agent name come from the session's
+    /// resolved adapter, not the session's tool or a hardcoded Claude package.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn install_info_describes_the_sessions_adapter() {
+        let _guard = crate::session::test_support::isolate_app_dir();
+        let session = |id: &str, tool: &str, agent: Option<&str>, sandboxed: bool| {
+            let mut inst = crate::session::Instance::new(id, "/tmp/aoe-install-info");
+            inst.id = id.to_string();
+            inst.tool = tool.to_string();
+            inst.agent_name = agent.map(str::to_string);
+            inst.sandbox_info = sandboxed.then(|| crate::session::SandboxInfo {
+                provider: None,
+                enabled: true,
+                container_id: None,
+                image: "ubuntu:latest".to_string(),
+                container_name: format!("aoe-{id}"),
+                extra_env: None,
+                custom_instruction: None,
+                before_start_env: Vec::new(),
+                container_workdir: None,
+            });
+            inst
+        };
+        let state = crate::server::test_support::build_test_app_state(vec![
+            session("claude", "claude", None, false),
+            session("opencode", "opencode", None, false),
+            session("override", "claude", Some("codex"), false),
+            session("custom", "claude", Some("my-wrapper"), false),
+            session("sandboxed", "claude", None, true),
+        ]);
+        let fetch = |state: Arc<AppState>, id: &'static str| async move {
+            let resp = agent_install_info(State(state), Path(id.to_string()))
+                .await
+                .into_response();
+            let status = resp.status();
+            let bytes = axum::body::to_bytes(resp.into_body(), 1 << 16)
+                .await
+                .unwrap();
+            let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap_or_default();
+            (status, body)
+        };
+        let get = |id: &'static str| fetch(state.clone(), id);
+        let claude_npm = "npm install -g @agentclientprotocol/claude-agent-acp@latest";
+        for (id, agent, name, command, npm, sandboxed) in [
+            ("claude", "claude", "Claude", Some(claude_npm), true, false),
+            (
+                "opencode",
+                "opencode",
+                "OpenCode",
+                crate::acp::install_hints::install_hint_for("opencode"),
+                false,
+                false,
+            ),
+            (
+                "override",
+                "codex",
+                "Codex",
+                Some("npm install -g @agentclientprotocol/codex-acp@latest"),
+                true,
+                false,
+            ),
+            ("custom", "my-wrapper", "my-wrapper", None, false, false),
+            (
+                "sandboxed",
+                "claude",
+                "Claude",
+                Some(claude_npm),
+                true,
+                true,
+            ),
+        ] {
+            let (status, body) = get(id).await;
+            assert_eq!(status, StatusCode::OK, "{id}: {body}");
+            assert_eq!(
+                body,
+                serde_json::json!({
+                    "agent": agent,
+                    "display_name": name,
+                    "install_command": command,
+                    "npm_installable": npm,
+                    "install_allowed": false,
+                    "sandboxed": sandboxed,
+                }),
+                "{id}"
+            );
+        }
+
+        assert_eq!(get("missing").await.0, StatusCode::NOT_FOUND);
+
+        // `install_allowed` is false exactly where `install-agent` refuses.
+        let cityhall = crate::server::test_support::build_test_app_state_cityhall(vec![session(
+            "claude", "claude", None, false,
+        )]);
+        let mut read_only = crate::server::test_support::build_test_app_state(vec![session(
+            "claude", "claude", None, false,
+        )]);
+        Arc::get_mut(&mut read_only).unwrap().read_only = true;
+        for (label, setting, state, allowed) in [
+            ("setting off", false, state.clone(), false),
+            ("setting on", true, state.clone(), true),
+            ("CityHall", true, cityhall, false),
+            ("read-only", true, read_only, false),
+        ] {
+            crate::session::config::update_config(|c| c.acp.allow_agent_install = setting).unwrap();
+            let body = fetch(state.clone(), "claude").await.1;
+            assert_eq!(body["install_allowed"], allowed, "{label}");
+            if !allowed {
+                let refused = install_agent(State(state), Path("claude".to_string()))
+                    .await
+                    .into_response();
+                assert_eq!(refused.status(), StatusCode::FORBIDDEN, "{label}");
+            }
+        }
+    }
 }

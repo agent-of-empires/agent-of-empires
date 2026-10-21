@@ -437,6 +437,18 @@ impl HttpClient {
             .await
     }
 
+    /// A rejection echoes over the WS as `ConfigOptionSwitchFailed`.
+    pub async fn set_config_option(
+        &self,
+        session_id: &str,
+        config_id: &str,
+        value: &str,
+    ) -> Result<(), HttpError> {
+        let body = serde_json::json!({ "config_id": config_id, "value": value });
+        self.session_call(Method::POST, session_id, "/acp/config-option", Some(body))
+            .await
+    }
+
     /// Switch a terminal session to the structured view. Idempotent.
     pub async fn acp_enable(&self, session_id: &str) -> Result<(), HttpError> {
         self.session_call(Method::POST, session_id, "/acp/enable", None)
@@ -1001,5 +1013,32 @@ mod tests {
         assert!(matches!(error, HttpError::Unauthorized), "{error}");
         assert_eq!(wrong.logins(), 1);
         assert!(!error.to_string().contains(PASSPHRASE));
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn set_config_option_posts_the_pick_with_passphrase_credentials() {
+        use super::passphrase_session::test_daemon::{TestDaemon, PASSPHRASE};
+        let _env = crate::session::test_support::EnvGuard::unset(&["AOE_DAEMON_PASSPHRASE"]);
+
+        let daemon = TestDaemon::start(PASSPHRASE).await;
+        let client = HttpClient::new(daemon.endpoint.clone()).unwrap();
+        client
+            .set_config_option("s-1", "reasoning_effort", "high")
+            .await
+            .unwrap();
+
+        let requests = daemon.config_option_requests();
+        assert_eq!(requests.len(), 1);
+        let (id, cookie, binding, body) = &requests[0];
+        assert_eq!(id, "s-1");
+        assert!(cookie
+            .as_deref()
+            .is_some_and(|c| c.starts_with("aoe_session=")));
+        assert!(binding.is_some());
+        assert_eq!(
+            body,
+            &serde_json::json!({"config_id": "reasoning_effort", "value": "high"})
+        );
     }
 }

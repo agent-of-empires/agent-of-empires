@@ -162,6 +162,12 @@ pub struct AddArgs {
     #[arg(long = "model")]
     model: Option<String>,
 
+    /// Reasoning effort for the ACP agent (e.g., low, medium, high). Checked
+    /// against the agent's known thought-level choices when cached. Structured
+    /// view only.
+    #[arg(long = "effort")]
+    effort: Option<String>,
+
     /// Create the session in a fresh scratch directory under
     /// `<app_dir>/scratch/<id>/` instead of a project path. The directory is
     /// removed when the session is deleted (unless `aoe rm` is given
@@ -188,6 +194,10 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
     }
 
     crate::session::require_known_profile(profile)?;
+
+    if args.effort.as_deref().is_some_and(|e| e.trim().is_empty()) {
+        bail!("--effort cannot be empty");
+    }
 
     if args.scratch && args.path.is_some() {
         bail!(
@@ -269,6 +279,19 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
             "`--fork-from` performs a terminal fork and cannot be combined with \
              --structured-view or --agent; structured fork is available from the web dashboard."
         );
+    }
+
+    if let Some(effort) = args.effort.as_deref().map(str::trim) {
+        // The daemon records the option catalog under this key.
+        let agent = args
+            .agent
+            .as_deref()
+            .filter(|name| !name.is_empty())
+            .unwrap_or(&resolved_tool);
+        let choices = crate::acp::option_catalog::thought_level_choices(agent);
+        if let Some(warning) = check_effort_request(effort, wants_structured, agent, &choices)? {
+            eprintln!("warning: {warning}");
+        }
     }
 
     if args.fork_from.is_some() {
@@ -672,14 +695,41 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
         }
     }
 
+    let explicit_effort = args
+        .effort
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+
+    if explicit_effort.is_some() && !instance.is_structured() {
+        cleanup_partial_session(
+            &path,
+            instance.worktree_info.as_ref(),
+            instance.workspace_info.as_ref(),
+            args.create_branch,
+            if instance.scratch {
+                Some(std::path::Path::new(&instance.project_path))
+            } else {
+                None
+            },
+            None,
+        );
+        bail!(
+            "--effort needs the structured view, but the ACP adapter is not installed.\n\
+             Run `aoe acp doctor --fix`, then re-run."
+        );
+    }
+
     if instance.is_structured() {
         let defaults = config.acp.acp_defaults_for(&agent_name);
         instance.agent_model = crate::session::config::resolve_spawn_model_effort(
             defaults,
             instance.agent_model.take(),
-            None,
+            explicit_effort.clone(),
         )
         .0;
+        instance.acp_effort = explicit_effort;
     }
 
     if let Some(seed) = fork_seed {
@@ -1196,6 +1246,37 @@ fn prompt_session_title(default_title: &str) -> Result<String> {
     })
 }
 
+/// Refuse `--effort` on a session that will not be structured, then check it
+/// against the agent's choices.
+fn check_effort_request(
+    effort: &str,
+    wants_structured: bool,
+    agent: &str,
+    choices: &[String],
+) -> Result<Option<String>> {
+    if !wants_structured {
+        bail!("--effort needs the structured view; pass --agent or --structured-view");
+    }
+    check_effort(agent, effort, choices)
+}
+
+/// Fail when the agent's thought-level choices are known and `effort` is not
+/// one of them; warn when they are not known yet.
+fn check_effort(agent: &str, effort: &str, choices: &[String]) -> Result<Option<String>> {
+    if choices.is_empty() {
+        return Ok(Some(format!(
+            "no known effort choices for ACP agent `{agent}`; passing `{effort}` through unchecked"
+        )));
+    }
+    if choices.iter().any(|choice| choice == effort) {
+        return Ok(None);
+    }
+    bail!(
+        "effort `{effort}` is not offered by ACP agent `{agent}`. Valid values: {}",
+        choices.join(", ")
+    );
+}
+
 fn cleanup_partial_session(
     path: &std::path::Path,
     worktree_info: Option<&crate::session::WorktreeInfo>,
@@ -1233,6 +1314,9 @@ fn cleanup_partial_session(
                 {
                     let _ =
                         git_wt.remove_worktree(std::path::Path::new(&repo.worktree_path), false);
+                    if created_branch && !repo.branch_preexisting {
+                        let _ = git_wt.delete_branch(&repo.branch);
+                    }
                 }
             }
         }
@@ -1444,7 +1528,8 @@ fn resolve_sandbox_image(
 #[cfg(test)]
 mod tests {
     use super::{
-        hooks_when_trust_declined, override_launch_binary, parse_repo_base, resolve_sandbox_image,
+        check_effort_request, hooks_when_trust_declined, override_launch_binary, parse_repo_base,
+        resolve_sandbox_image,
     };
     use crate::session::config::repo_config::TrustSurface;
     use crate::session::config::SessionConfig;
@@ -1976,6 +2061,32 @@ mod tests {
                 msg.contains("Path does not exist"),
                 "a known profile must reach path validation, got: {msg}"
             );
+        }
+    }
+
+    #[test]
+    fn check_effort_request_gates_on_view_then_known_choices() {
+        let known = ["low".to_string(), "high".to_string()];
+        // (wants structured, choices, effort, error substring or warning substring)
+        let cases: [(bool, &[String], &str, Result<Option<&str>, &str>); 5] = [
+            (false, &known, "high", Err("structured view")),
+            (true, &known, "high", Ok(None)),
+            (true, &known, "ultra", Err("low, high")),
+            (true, &[], "ultra", Ok(Some("unchecked"))),
+            (true, &[], "high", Ok(Some("unchecked"))),
+        ];
+        for (structured, choices, effort, want) in cases {
+            let got = check_effort_request(effort, structured, "codex", choices);
+            match want {
+                Ok(None) => assert_eq!(got.unwrap(), None, "{effort}"),
+                Ok(Some(text)) => {
+                    assert!(got.unwrap().is_some_and(|w| w.contains(text)), "{effort}")
+                }
+                Err(text) => {
+                    let err = got.unwrap_err().to_string();
+                    assert!(err.contains(text), "{err}");
+                }
+            }
         }
     }
 }

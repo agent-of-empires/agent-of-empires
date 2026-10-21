@@ -59,7 +59,7 @@ interface SetupOpts {
 async function setup(page: Page, opts: SetupOpts = {}) {
   const structuredView = opts.structuredView ?? true;
   const acpWorkerState = opts.acpWorkerState ?? "running";
-  await page.route("**/api/login/status", (r) => r.fulfill({ json: { required: false, authenticated: true } }));
+  await page.route("**/api/login/status*", (r) => r.fulfill({ json: { required: false, authenticated: true } }));
   for (const path of [
     "settings",
     "themes",

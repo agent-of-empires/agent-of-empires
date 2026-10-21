@@ -6,7 +6,7 @@
 import { test, expect } from "./helpers/mockedTest";
 
 test("topbar overflow menu signs the user out and returns to LoginPage", async ({ page }) => {
-  await page.route("**/api/login/status", (r) =>
+  await page.route("**/api/login/status*", (r) =>
     r.fulfill({
       json: { required: true, authenticated: true, elevated: true, elevated_until_secs: 600 },
     }),

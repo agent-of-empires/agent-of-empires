@@ -1,4 +1,4 @@
-//! Git endpoints: repository cloning and branch listing.
+//! Git endpoints: repository cloning, branch and worktree listing.
 
 use std::sync::Arc;
 
@@ -284,6 +284,47 @@ pub async fn list_branches(
             Json(serde_json::to_value(branches).unwrap()),
         )
             .into_response(),
+        Ok(Err(msg)) => api_error(StatusCode::BAD_REQUEST, "not_a_repo", msg),
+        Err(e) => api_error(StatusCode::INTERNAL_SERVER_ERROR, "internal", e.to_string()),
+    }
+}
+
+#[derive(Serialize)]
+pub struct WorktreeInfo {
+    pub branch: String,
+    pub path: String,
+}
+
+/// Existing worktrees with a branch checked out, so the wizard can offer them
+/// when attaching instead of asking for a typed branch name.
+pub async fn list_worktrees(
+    State(state): State<Arc<AppState>>,
+    axum::extract::Query(query): axum::extract::Query<IsRepoQuery>,
+) -> impl IntoResponse {
+    // Probes an arbitrary filesystem path, and is not reachable from the
+    // CityHall name-only wizard.
+    if let Some(resp) = super::cityhall_block(&state) {
+        return resp;
+    }
+    let result = tokio::task::spawn_blocking(move || {
+        crate::git::GitWorktree::list_branch_worktrees_at(std::path::Path::new(&query.path))
+            .map_err(|e| e.to_string())
+    })
+    .await;
+
+    match result {
+        Ok(Ok(entries)) => {
+            let worktrees: Vec<WorktreeInfo> = entries
+                .into_iter()
+                .filter_map(|wt| {
+                    Some(WorktreeInfo {
+                        branch: wt.branch?,
+                        path: wt.path.display().to_string(),
+                    })
+                })
+                .collect();
+            (StatusCode::OK, Json(worktrees)).into_response()
+        }
         Ok(Err(msg)) => api_error(StatusCode::BAD_REQUEST, "not_a_repo", msg),
         Err(e) => api_error(StatusCode::INTERNAL_SERVER_ERROR, "internal", e.to_string()),
     }

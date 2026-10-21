@@ -3,7 +3,7 @@ members = [".", "xtask", "aoe-settings-derive", "aoe-plugin-api"]
 
 [package]
 name = "agent-of-empires"
-version = "1.20.0"
+version = "1.21.0"
 edition = "2021"
 rust-version = "1.89"
 authors = ["Agent of Empires Contributors"]
@@ -154,6 +154,9 @@ mime_guess = "2.0"
 qrcode = { version = "0.14", optional = true }
 argon2 = "0.6"
 subtle = "2"
+# Passkey (WebAuthn) sign-in for the web dashboard. Links OpenSSL: vendored by the default
+# `vendored` feature, from the system otherwise.
+webauthn-rs = "0.5"
 
 # TUI OSC 52 clipboard writes and Web Push payload encoding.
 base64 = "0.23"
@@ -179,7 +182,7 @@ flate2 = "1"
 xz2 = "0.1"
 
 # WebSockets for daemon clients and the daemon's local UDS transport.
-tokio-tungstenite = { version = "0.30", default-features = false, features = ["rustls-tls-webpki-roots", "connect"] }
+tokio-tungstenite = { version = "0.30", default-features = false, features = ["rustls-tls-native-roots", "connect"] }
 
 # Capability-safe file opens for the session file-read endpoint (#3088): open
 # beneath a Dir so a component swapped after the containment check cannot
@@ -242,6 +245,8 @@ cargo-husky = { version = "1", default-features = false, features = ["precommit-
 # Test-only tower dep for `ServiceExt::oneshot`, so the DNS-rebinding gate
 # (#2735) can be driven through the real router without binding a socket.
 tower = { version = "0.5", features = ["util"] }
+# Software authenticator that drives the passkey ceremonies in tests.
+webauthn-authenticator-rs = { version = "0.5", default-features = false, features = ["softpasskey"] }
 
 [profile.dev]
 # Full DWARF is cargo's `dev` default and it dominates `target/`: this table and

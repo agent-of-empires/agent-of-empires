@@ -82,6 +82,7 @@ pub struct AppState {
     pub session_service: Arc<session_service::SessionService>,
     pub token_manager: Arc<TokenManager>,
     pub login_manager: Arc<login::LoginManager>,
+    pub passkey_manager: Arc<super::passkeys::PasskeyManager>,
     pub rate_limiter: Arc<RateLimiter>,
     pub behind_tunnel: bool,
     /// Coarse auth mode resolved once at launch (`"token"` / `"passphrase"` / `"none"`).
@@ -149,6 +150,8 @@ pub struct AppState {
     /// Broadcasts session status transitions to consumers (currently the push-notification
     /// module).
     pub status_tx: broadcast::Sender<StatusChange>,
+    /// Publishes session lifecycle changes (created, archived, trashed, renamed, deleted ...).
+    pub lifecycle: Arc<super::lifecycle_feed::LifecycleFeed>,
     /// Web Push state.
     pub push: Option<Arc<PushState>>,
     /// Cached value of `web.notifications_enabled` at startup.

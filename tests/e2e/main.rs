@@ -21,6 +21,7 @@ mod acp_live_e2e;
 mod add_project_cli;
 mod archive_restore;
 mod archive_structured;
+mod autostart;
 mod claude_shared_project_correlation_e2e;
 mod cli;
 mod cli_session_id_capture;

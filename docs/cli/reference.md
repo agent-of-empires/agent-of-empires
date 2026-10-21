@@ -123,6 +123,7 @@ This document contains the help content for the `aoe` command-line program.
 * [`aoe acp history`↴](#aoe-acp-history)
 * [`aoe acp status`↴](#aoe-acp-status)
 * [`aoe acp prompt`↴](#aoe-acp-prompt)
+* [`aoe acp set-option`↴](#aoe-acp-set-option)
 * [`aoe acp approve`↴](#aoe-acp-approve)
 * [`aoe acp cancel`↴](#aoe-acp-cancel)
 * [`aoe acp tail`↴](#aoe-acp-tail)
@@ -185,6 +186,9 @@ Run without arguments to launch the TUI dashboard.
 * `--daemon-url <DAEMON_URL>` — Select a daemon endpoint for read-only CLI commands or the TUI
 
    Explicit CLI endpoints never fall back. `AOE_DAEMON_URL` discovery may fall back to local storage before reaching a TCP peer, with a notice. Authenticate CLI reads with `AOE_DAEMON_TOKEN` or `AOE_DAEMON_PASSPHRASE`; TUI session lists support bearer tokens only. An unauthenticated daemon needs neither. See the HTTP API reference for transport and fallback rules.
+* `--no-autostart` — Fail instead of starting a local daemon when none is running
+
+   Also read from `AOE_NO_AUTOSTART=1`. Has no effect with `--daemon-url` or `AOE_DAEMON_URL`, which never start a daemon.
 
 
 
@@ -225,6 +229,7 @@ Add a new session
 * `--structured-view` — Render this session in the structured view (ACP-based native rendering) instead of the default terminal view. `aoe add` defaults to the terminal (raw tmux/PTY) so the CLI matches the TUI; pass this (or `--agent`) to opt into the structured rendering. Ignored for tools with no ACP adapter
 * `--agent <AGENT>` — Pick a specific ACP agent for the structured view (e.g., claude-code, codex)
 * `--model <MODEL>` — Override the model used by the ACP agent (e.g., claude-opus-4-7, gpt-5, gemini-2.5-pro). Forwarded to the agent at session start
+* `--effort <EFFORT>` — Reasoning effort for the ACP agent (e.g., low, medium, high). Checked against the agent's known thought-level choices when cached. Structured view only
 * `--scratch` — Create the session in a fresh scratch directory under `<app_dir>/scratch/<id>/` instead of a project path. The directory is removed when the session is deleted (unless `aoe rm` is given `--keep-scratch`). Mutually exclusive with worktree-related flags
 
 
@@ -1761,6 +1766,7 @@ Manage the ACP structured-view workers (doctor, ps, logs, prompt, approve, ...)
 * `history` — Print the persisted transcript for an agent session
 * `status` — Print live status for an agent session: highest/lowest seq, and whether the on-disk retention window has truncated history
 * `prompt` — Send a prompt to an agent session's agent
+* `set-option` — Set a config option (model, mode, effort, ...) on a running agent session. The agent's own option id is the config id, e.g. `reasoning_effort`. A rejection by the agent is reported in the session's event stream, not here
 * `approve` — Resolve a pending approval (default: allow). Use --always for a session-scoped allow-list entry, --deny to refuse the request, and --option to answer a request that lists choices
 * `cancel` — Cancel the in-flight prompt for an agent session
 * `tail` — Stream the agent broadcast for a session to stdout as JSON lines (one frame per line). Press Ctrl-C to stop
@@ -1914,6 +1920,20 @@ Send a prompt to an agent session's agent
 
 * `<SESSION>` — Acp session id
 * `<TEXT>` — Prompt text. Pass `-` to read from stdin
+
+
+
+## `aoe acp set-option`
+
+Set a config option (model, mode, effort, ...) on a running agent session. The agent's own option id is the config id, e.g. `reasoning_effort`. A rejection by the agent is reported in the session's event stream, not here
+
+**Usage:** `aoe acp set-option <SESSION> <CONFIG_ID> <VALUE>`
+
+###### **Arguments:**
+
+* `<SESSION>` — Acp session id
+* `<CONFIG_ID>` — Config option id as advertised by the agent
+* `<VALUE>` — Value to select
 
 
 

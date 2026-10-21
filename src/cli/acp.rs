@@ -126,6 +126,18 @@ pub enum AcpCommands {
         /// Prompt text. Pass `-` to read from stdin.
         text: String,
     },
+    /// Set a config option (model, mode, effort, ...) on a running agent
+    /// session. The agent's own option id is the config id, e.g.
+    /// `reasoning_effort`. A rejection by the agent is reported in the
+    /// session's event stream, not here.
+    SetOption {
+        /// Acp session id.
+        session: String,
+        /// Config option id as advertised by the agent.
+        config_id: String,
+        /// Value to select.
+        value: String,
+    },
     /// Resolve a pending approval (default: allow). Use --always for a
     /// session-scoped allow-list entry, --deny to refuse the request, and
     /// --option to answer a request that lists choices.
@@ -230,6 +242,11 @@ pub async fn run(command: AcpCommands) -> Result<()> {
         } => history(&session, since, json).await,
         AcpCommands::Status { session, json } => status(&session, json).await,
         AcpCommands::Prompt { session, text } => prompt(&session, &text).await,
+        AcpCommands::SetOption {
+            session,
+            config_id,
+            value,
+        } => set_option(&session, &config_id, &value).await,
         AcpCommands::Approve {
             session,
             nonce,
@@ -1031,6 +1048,17 @@ async fn prompt(session: &str, text: &str) -> Result<()> {
         .await
         .map_err(map_http)?;
     println!("prompt accepted ({} bytes)", body.len());
+    Ok(())
+}
+
+async fn set_option(session: &str, config_id: &str, value: &str) -> Result<()> {
+    let endpoint = require_daemon().await?;
+    let client = HttpClient::new(endpoint)?;
+    client
+        .set_config_option(session, config_id, value)
+        .await
+        .map_err(map_http)?;
+    println!("set {config_id}={value} requested");
     Ok(())
 }
 

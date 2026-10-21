@@ -88,6 +88,31 @@ pub(super) fn rate_limit_rejection_from_meta(
     })
 }
 
+/// Records a rejected window and drops one a later report shows has recovered,
+/// so a stale rejection cannot park a turn. Returns whether a rejection was kept.
+pub(super) fn record_rate_limit_report(
+    captures: &std::sync::Mutex<HashMap<String, i64>>,
+    meta: &Option<agent_client_protocol::schema::v1::Meta>,
+) -> bool {
+    let Some(info) = meta.as_ref().and_then(|m| m.get("_claude/rateLimit")) else {
+        return false;
+    };
+    let mut captures = captures.lock().expect("rate-limit capture mutex poisoned");
+    if let Some(r) = rate_limit_rejection_from_meta(meta) {
+        captures.insert(r.window, r.resets_at_secs);
+        return true;
+    }
+    if info
+        .get("status")
+        .and_then(|s| s.as_str())
+        .is_some_and(|s| s != "rejected")
+    {
+        let window = info.get("rateLimitType").and_then(|v| v.as_str());
+        captures.remove(window.unwrap_or_default());
+    }
+    false
+}
+
 /// The latest future reset, since every rejected window must clear.
 pub(super) fn captured_rate_limit_resets_at(
     captures: &std::sync::Mutex<HashMap<String, i64>>,
@@ -225,6 +250,31 @@ mod tests {
         ];
         for (meta, want) in cases {
             assert_eq!(rate_limit_rejection_from_meta(&meta), want, "{meta:?}");
+        }
+
+        // A window that recovers after rejecting is dropped; others stay.
+        let report = |status: &str, window: &str| {
+            meta(json!({ "status": status, "rateLimitType": window, "resetsAt": secs }))
+        };
+        let captures = std::sync::Mutex::new(HashMap::new());
+        for (status, window, kept, want) in [
+            ("rejected", "five_hour", true, vec!["five_hour"]),
+            (
+                "rejected",
+                "seven_day",
+                true,
+                vec!["five_hour", "seven_day"],
+            ),
+            ("allowed", "five_hour", false, vec!["seven_day"]),
+            ("allowed_warning", "other", false, vec!["seven_day"]),
+        ] {
+            assert_eq!(
+                record_rate_limit_report(&captures, &report(status, window)),
+                kept
+            );
+            let mut have: Vec<_> = captures.lock().unwrap().keys().cloned().collect();
+            have.sort();
+            assert_eq!(have, want, "{status} {window}");
         }
 
         {

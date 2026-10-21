@@ -314,6 +314,10 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
     } else {
         login::LoginManager::new(passphrase)
     });
+    let passkey_manager = Arc::new(match crate::session::get_app_dir() {
+        Ok(app_dir) => super::passkeys::PasskeyManager::with_persistence(&app_dir, passphrase),
+        Err(_) => super::passkeys::PasskeyManager::in_memory(),
+    });
     let rate_limiter = Arc::new(RateLimiter::new());
 
     // Fail closed before anything binds.
@@ -668,6 +672,7 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
         session_service,
         token_manager: Arc::clone(&token_manager),
         login_manager: Arc::clone(&login_manager),
+        passkey_manager,
         rate_limiter: Arc::clone(&rate_limiter),
         behind_tunnel: remote || behind_proxy,
         auth_mode,
@@ -703,6 +708,7 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
         remote_owner_cache: RwLock::new(std::collections::HashMap::new()),
         changed_files_cache: std::sync::RwLock::new(std::collections::HashMap::new()),
         status_tx,
+        lifecycle: crate::server::lifecycle_feed::LifecycleFeed::new(),
         acp_events_tx: acp_events_tx.clone(),
         acp_event_store: acp_event_store.clone(),
         acp_control_cache: acp_control_cache.clone(),
@@ -893,8 +899,27 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
     // Per-session dispatcher callback consumer.
     callback::spawn_consumer(state.clone());
 
+    // Report this process's own session commits exactly; the disk consumer covers the rest.
+    // Held for the server's lifetime, and only worth running when a plugin host consumes it.
+    let _lifecycle_observer = state
+        .plugin_host
+        .as_ref()
+        .map(|_| state.lifecycle.install_commit_observer());
+
     // Launch plugin workers for every active plugin that declares a runtime.
     if let Some(host) = state.plugin_host.clone() {
+        // Record the sessions on disk before a worker can list them, so a change made after
+        // its list is reported against that baseline instead of being absorbed into it.
+        let (feed, file_watch) = (state.lifecycle.clone(), state.file_watch.clone());
+        let baseline = feed
+            .establish_baseline(move || load_all_instances(&file_watch))
+            .await;
+        if !baseline {
+            tracing::warn!(
+                target: "server.lifecycle",
+                "no lifecycle baseline could be read; workers start anyway and session.lifecycle.changed may miss changes made before the next disk reload"
+            );
+        }
         // Subscribe before any worker can register, or a transition published meanwhile has no
         // forwarder to carry it.
         plugin_status::spawn_forwarder(state.clone(), host.clone());

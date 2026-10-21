@@ -319,7 +319,7 @@ impl Instance {
             .context("fork working directory is not UTF-8")?;
 
         let child = crate::session::capture::fork_opencode_session_id(cwd, command, parent_id)
-            .context("the store returned no child for this fork")?;
+            .context("could not fork the conversation in the OpenCode store")?;
         anyhow::ensure!(
             child != parent_id,
             "OpenCode fork returned its parent instead of a child"

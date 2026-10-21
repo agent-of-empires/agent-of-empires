@@ -395,6 +395,20 @@ pub fn run_with_timeout_process_group(
     )
 }
 
+pub(crate) fn run_until_cancelled_process_group(
+    cmd: &mut Command,
+    timeout: Duration,
+    cancel: &CancellationToken,
+) -> std::io::Result<Option<Output>> {
+    platform::configure_process_group(cmd);
+    run_with_timeout_inner(
+        cmd,
+        timeout,
+        cfg!(any(target_os = "linux", target_os = "macos")),
+        Some(cancel),
+    )
+}
+
 fn run_with_timeout_inner(
     cmd: &mut Command,
     timeout: Duration,

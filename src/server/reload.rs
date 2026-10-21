@@ -46,14 +46,26 @@ pub(crate) fn selectable_profiles() -> anyhow::Result<Vec<SelectableProfile>> {
         if kind.is_symlink() && !crate::session::valid_profile_name(&name) {
             continue;
         }
-        let metadata = match std::fs::metadata(entry.path()) {
-            Ok(metadata) if metadata.is_dir() => metadata,
-            Ok(_) => continue,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(_) if kind.is_symlink() => continue,
-            Err(error) => return Err(error.into()),
+        let (device, inode) = if kind.is_symlink() {
+            let path = entry.path();
+            let sampled = super::alias_io::sample(&name, "identity", move || {
+                std::fs::metadata(path)
+                    .ok()
+                    .filter(std::fs::Metadata::is_dir)
+                    .map(|metadata| crate::process::metadata_identity(&metadata))
+            });
+            match sampled.value.and_then(|identity| *identity) {
+                Some(identity) => identity,
+                None => continue,
+            }
+        } else {
+            match std::fs::metadata(entry.path()) {
+                Ok(metadata) if metadata.is_dir() => crate::process::metadata_identity(&metadata),
+                Ok(_) => continue,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(error.into()),
+            }
         };
-        let (device, inode) = crate::process::metadata_identity(&metadata);
         let identity = ProfileIdentity { device, inode };
         if kind.is_dir() {
             directories.push(SelectableProfile {
@@ -153,11 +165,23 @@ pub(super) fn load_all_instances(file_watch: &Arc<FileWatchService>) -> LoadedIn
         }
     };
     for profile in &loaded.cache.inventory {
-        let rows = if profile.listed {
-            Storage::new(&profile.name, file_watch.clone()).and_then(|storage| storage.load())
+        let (rows, stale) = if profile.listed {
+            let rows = Storage::new(&profile.name, file_watch.clone())
+                .and_then(|storage| storage.load())
+                .map_err(|error| error.to_string());
+            (rows, false)
         } else {
-            Storage::open_unwatched(&profile.name)
-                .and_then(|storage| storage.load_instances_readonly())
+            let name = profile.name.clone();
+            let sampled = super::alias_io::sample(&profile.name, "sessions", move || {
+                Storage::open_unwatched(&name)
+                    .and_then(|storage| storage.load_instances_readonly())
+                    .map_err(|error| error.to_string())
+            });
+            let rows = sampled.value.map_or_else(
+                || Err("alias read pending".to_owned()),
+                |rows| (*rows).clone(),
+            );
+            (rows, !sampled.fresh)
         };
         match rows {
             Ok(mut instances) => {
@@ -168,6 +192,13 @@ pub(super) fn load_all_instances(file_watch: &Arc<FileWatchService>) -> LoadedIn
                     loaded.instances.extend(instances);
                 } else {
                     loaded.cache.alias_only_instances.extend(instances);
+                }
+                if stale {
+                    loaded
+                        .cache
+                        .health
+                        .unreadable_profiles
+                        .insert(profile.name.clone());
                 }
             }
             Err(error) => {
@@ -526,6 +557,17 @@ pub(crate) async fn reload_state_instances_from_disk(
             current_epoch,
             "dropping a disk reload whose snapshot predates a session lifecycle mutation"
         );
+        return;
+    }
+
+    // A failed enumeration is unknown, not empty: keep the accepted rows and overlay state.
+    if cache.health.enumeration_failed {
+        state
+            .runtime_read_cache
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .health
+            .enumeration_failed = true;
         return;
     }
 

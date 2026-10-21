@@ -37,7 +37,8 @@ pub mod transcript;
 pub mod version_probe;
 
 pub use agent_registry::{
-    inherited_acp_base, pick_acp_agent_name, pinned_model_for_tool, AgentRegistry, AgentSpec,
+    display_name_for, inherited_acp_base, pick_acp_agent_name, pinned_model_for_tool,
+    AgentRegistry, AgentSpec,
 };
 pub use approvals::{Approval, ApprovalDecision, Nonce};
 pub use state::{AcpState, Event};

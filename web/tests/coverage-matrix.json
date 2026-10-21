@@ -461,6 +461,17 @@
       "components": ["web/src/components/LoginPage.tsx"]
     },
     {
+      "id": "auth.passkey",
+      "kind": "vitest",
+      "risk": "high",
+      "specs": [
+        "src/components/__tests__/LoginPage.test.tsx",
+        "src/components/__tests__/PasskeySettings.test.tsx",
+        "src/lib/api.test.ts"
+      ],
+      "components": ["web/src/components/PasskeySettings.tsx"]
+    },
+    {
       "id": "auth.token-entry",
       "kind": "live-playwright",
       "risk": "medium",
@@ -587,6 +598,23 @@
         "web/src/components/settings/TelemetrySettings.tsx",
         "web/src/components/TelemetryConsentModal.tsx"
       ]
+    },
+    {
+      "id": "settings.logs-tab",
+      "kind": "vitest",
+      "risk": "medium",
+      "specs": [
+        "src/components/settings/__tests__/LogsSettings.test.tsx",
+        "src/components/__tests__/SettingsView.test.tsx"
+      ],
+      "components": ["web/src/components/settings/LogsSettings.tsx", "web/src/components/SettingsView.tsx"]
+    },
+    {
+      "id": "settings.logs-endpoint-access",
+      "kind": "live-playwright",
+      "risk": "high",
+      "specs": ["tests/live/logs-endpoint.spec.ts"],
+      "components": ["src/server/api/logs.rs"]
     },
     {
       "id": "settings.cityhall-export",
@@ -1104,6 +1132,14 @@
         "web/src/lib/api.ts",
         "web/src/lib/pendingCreates.ts"
       ]
+    },
+    {
+      "id": "wizard.attach-existing-worktree",
+      "kind": "vitest",
+      "risk": "low",
+      "specs": ["src/components/session-wizard/__tests__/WorktreePanel.test.tsx", "src/lib/api.test.ts"],
+      "components": ["web/src/components/session-wizard/steps/WorktreePanel.tsx"],
+      "notes": "Attach mode lists the repo's existing worktrees via GET /api/git/worktrees; picking one fills the branch name. Empty and failed listings show distinct messages, and create mode does not fetch."
     },
     {
       "id": "wizard.rows-and-panels",
@@ -2501,6 +2537,24 @@
       ]
     },
     {
+      "id": "settings.persistent-structured-views",
+      "kind": "vitest",
+      "risk": "low",
+      "specs": [
+        "src/components/__tests__/StructuredSessionStack.test.tsx",
+        "src/lib/__tests__/persistentStructuredViews.test.ts",
+        "src/components/settings/__tests__/StructuredViewDisplaySettings.test.tsx",
+        "src/components/acp/__tests__/StructuredViewRoot.test.tsx"
+      ],
+      "components": [
+        "web/src/components/StructuredSessionStack.tsx",
+        "web/src/components/TerminalSessionStack.tsx",
+        "web/src/hooks/usePersistentSessionIds.ts",
+        "web/src/lib/persistentStructuredViews.ts",
+        "web/src/components/MobileMainPane.tsx"
+      ]
+    },
+    {
       "id": "settings.panels-section",
       "kind": "vitest",
       "risk": "low",
@@ -2517,6 +2571,24 @@
       "risk": "medium",
       "specs": ["tests/live/auth.spec.ts"],
       "components": ["web/src/components/ConnectedDevices.tsx"]
+    },
+    {
+      "id": "connectivity.banner-stack",
+      "kind": "vitest",
+      "risk": "medium",
+      "specs": [
+        "src/components/__tests__/BannerStack.test.tsx",
+        "src/components/__tests__/DisconnectBanner.test.tsx",
+        "src/components/__tests__/UpdateBanner.test.tsx",
+        "src/components/__tests__/DashboardUpdateBanner.test.tsx"
+      ],
+      "components": [
+        "web/src/components/BannerStack.tsx",
+        "web/src/components/DisconnectBanner.tsx",
+        "web/src/components/UpdateBanner.tsx",
+        "web/src/components/DashboardUpdateBanner.tsx",
+        "web/src/components/PushHealthBanner.tsx"
+      ]
     },
     {
       "id": "connectivity.disconnect-banner",
@@ -4068,9 +4140,17 @@
       "specs": [
         "src/lib/diffPair.test.ts",
         "src/components/diff/__tests__/StringDiff.test.tsx",
-        "src/components/acp/ToolCards.render.test.tsx"
+        "src/components/acp/ToolCards.render.test.tsx",
+        "src/components/acp/activityMessages.test.ts",
+        "src/components/acp/ThreadMessages.test.tsx"
       ],
-      "components": ["web/src/components/acp/ToolCards.tsx", "web/src/components/diff/StringDiff.tsx"]
+      "components": [
+        "web/src/components/acp/ToolCards.tsx",
+        "web/src/components/acp/NamedToolCards.tsx",
+        "web/src/components/acp/activityMessages.ts",
+        "web/src/components/acp/ThreadMessages.tsx",
+        "web/src/components/diff/StringDiff.tsx"
+      ]
     },
     {
       "id": "acp.story.queue-follow-up-with-nav",

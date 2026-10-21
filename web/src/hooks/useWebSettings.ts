@@ -1,6 +1,10 @@
 import { useCallback, useSyncExternalStore } from "react";
 
 import { DEFAULT_CONVERSATION_FONT_SIZE, normalizeConversationFontSize } from "../lib/conversationFontSize";
+import {
+  DEFAULT_PERSISTENT_STRUCTURED_VIEWS,
+  normalizePersistentStructuredViewLimit,
+} from "../lib/persistentStructuredViews";
 import { DEFAULT_PERSISTENT_TERMINALS, normalizePersistentTerminalLimit } from "../lib/persistentTerminals";
 import { safeGetItem, safeSetItem } from "../lib/safeStorage";
 import { DEFAULT_TOOLBAR_KEYS, normalizeToolbarKeys, type ToolbarKeyId } from "../lib/terminalToolbarKeys";
@@ -16,6 +20,8 @@ export interface WebSettings {
   autoOpenKeyboard: boolean;
   persistentTerminals: boolean;
   maxPersistentTerminals: number;
+  persistentStructuredViews: boolean;
+  maxPersistentStructuredViews: number;
   diffViewMode: "flat" | "tree";
   diffViewLayout: "unified" | "split";
   markdownPreview: "rendered" | "raw";
@@ -40,6 +46,8 @@ function getDefaults(): WebSettings {
     autoOpenKeyboard: true,
     persistentTerminals: false,
     maxPersistentTerminals: DEFAULT_PERSISTENT_TERMINALS,
+    persistentStructuredViews: false,
+    maxPersistentStructuredViews: DEFAULT_PERSISTENT_STRUCTURED_VIEWS,
     diffViewMode: window.innerWidth < 768 ? "flat" : "tree",
     diffViewLayout: "unified",
     markdownPreview: "rendered",
@@ -64,6 +72,8 @@ function normalizeSnapshot(settings: WebSettings): WebSettings {
     ...settings,
     persistentTerminals: normalizeBool(settings.persistentTerminals, defaults.persistentTerminals),
     maxPersistentTerminals: normalizePersistentTerminalLimit(settings.maxPersistentTerminals),
+    persistentStructuredViews: normalizeBool(settings.persistentStructuredViews, defaults.persistentStructuredViews),
+    maxPersistentStructuredViews: normalizePersistentStructuredViewLimit(settings.maxPersistentStructuredViews),
     structuredMobileFontSize: normalizeConversationFontSize(settings.structuredMobileFontSize),
     structuredDesktopFontSize: normalizeConversationFontSize(settings.structuredDesktopFontSize),
     sidebarCompact: normalizeBool(settings.sidebarCompact, defaults.sidebarCompact),
