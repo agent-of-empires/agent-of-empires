@@ -1766,10 +1766,8 @@ impl Session {
             return OwnerClaim::Claimed;
         }
 
-        if matches!(
-            self.owner_at_result_with_deadline(opt, hb_opt, deadline),
-            Ok(Some((id, _))) if id == owner_id
-        ) {
+        let after = self.owner_at_result_with_deadline(opt, hb_opt, deadline);
+        if matches!(&after, Ok(Some((id, _))) if id == owner_id) {
             return OwnerClaim::Claimed;
         }
         if replaced.is_err() {
@@ -1778,7 +1776,12 @@ impl Session {
             );
             return OwnerClaim::Error;
         }
-        OwnerClaim::Held
+        match after {
+            Ok(Some((_, hb))) if now_ms().saturating_sub(hb) <= ttl.as_millis() as u64 => {
+                OwnerClaim::Held
+            }
+            _ => OwnerClaim::Error,
+        }
     }
 
     fn refresh_owner_at(&self, opt: &str, hb_opt: &str, owner_id: &str) -> bool {
