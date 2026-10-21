@@ -19,6 +19,9 @@ use crate::acp::protocol::{
 };
 use crate::plugin::ui_state::UiSnapshot;
 
+/// The daemon revives, waits for readiness and delivers before it answers a terminal send.
+const SEND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+
 /// One active plugin command as the daemon reports it (`GET
 /// /api/plugins/commands`), the source of truth the structured view resolves
 /// keybinds against: for a session on a remote daemon the plugin may not be
@@ -297,9 +300,17 @@ impl HttpClient {
         message: &str,
         no_revive: bool,
     ) -> Result<(), HttpError> {
+        let url = format!(
+            "{}/api/sessions/{}/send",
+            self.endpoint.base_url,
+            path_segment(session_id)?
+        );
         let body = serde_json::json!({ "message": message, "revive": !no_revive });
-        self.session_call(Method::POST, session_id, "/send", Some(body))
-            .await
+        let res = self
+            .execute(self.http.post(&url).json(&body).timeout(SEND_TIMEOUT))
+            .await?;
+        check_status(res, session_id)?;
+        Ok(())
     }
 
     /// `GET /api/plugins/ui-state`. The daemon-wide plugin UI snapshot
