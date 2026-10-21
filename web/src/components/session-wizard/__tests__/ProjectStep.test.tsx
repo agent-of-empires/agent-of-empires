@@ -120,7 +120,7 @@ describe("recent and saved projects", () => {
     savedProjects("/repo/alpha", "/repo/dup");
     sessions(mockSession({ id: "b", project_path: "/repo/beta" }), mockSession({ id: "d", project_path: "/repo/dup" }));
     renderStep();
-    expect(await screen.findByText("Saved projects", { selector: "p" })).toBeTruthy();
+    expect(await screen.findByText("Projects", { selector: "p" })).toBeTruthy();
     expect(header("Recent")).toBeTruthy();
     expect(screen.getByText("/repo/alpha")).toBeTruthy();
     expect(screen.getByText("/repo/beta")).toBeTruthy();

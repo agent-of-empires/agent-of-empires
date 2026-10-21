@@ -4,6 +4,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
 
 import { ProjectsSection } from "../ProjectsSection";
+import { SidebarCompactContext } from "../../lib/sidebarCompact";
 import type { ProjectInfo, RepoGroup } from "../../lib/types";
 
 afterEach(cleanup);
@@ -110,13 +111,41 @@ describe("ProjectsSection", () => {
     expect(menu.className).toContain("overflow-y-auto");
   });
 
+  it("names what it lists, with a count that matches the rows, and stays short in the rail", () => {
+    for (const paths of [[], ["/work/alpha"], ["/work/alpha", "/work/beta"]]) {
+      renderSection({ projects: paths.map((p) => emptyProject(p)) });
+      const toggle = screen.getByTestId("sidebar-projects-toggle");
+      expect(Array.from(toggle.querySelectorAll("span"), (span) => span.textContent)).toEqual([
+        "Projects, no sessions",
+        `(${paths.length})`,
+      ]);
+      expect(screen.queryAllByTestId("sidebar-project-row")).toHaveLength(paths.length);
+      cleanup();
+    }
+    render(
+      <SidebarCompactContext.Provider value={true}>
+        <ProjectsSection
+          projects={[emptyProject("/work/alpha")]}
+          query=""
+          offline={false}
+          onCreateSession={vi.fn()}
+          onAddProject={vi.fn()}
+          onEditProject={vi.fn()}
+          onRemoveProject={vi.fn()}
+        />
+      </SidebarCompactContext.Provider>,
+    );
+    const label = screen.getByTestId("sidebar-projects-toggle").querySelector("span[title]")!;
+    expect([label.textContent, label.getAttribute("title")]).toEqual(["Projects", "Projects, no sessions"]);
+  });
+
   it("shows the no-match and empty hints, and nothing when there is no way to add", () => {
     renderSection({ query: "zzz" });
     expect(screen.queryByTestId("sidebar-project-row")).toBeNull();
     expect(screen.getByText("No matching projects.")).toBeTruthy();
     cleanup();
     renderSection({ projects: [] });
-    expect(screen.getByText(/No saved projects/)).toBeTruthy();
+    expect(screen.getByText(/No registered projects/)).toBeTruthy();
     cleanup();
     renderSection({ projects: [], readOnly: true });
     expect(screen.queryByTestId("sidebar-projects-section")).toBeNull();

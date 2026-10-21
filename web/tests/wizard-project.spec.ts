@@ -93,7 +93,7 @@ test.describe("extra repos", () => {
 
   test("saved projects render without the primary and toggle as chips", async ({ page }) => {
     const { picker, chip } = await openPicker(page);
-    await expect(picker.getByText("Saved projects")).toBeVisible();
+    await expect(picker.getByText("Projects", { exact: true })).toBeVisible();
     await expect(chip("primary")).toHaveCount(0);
     await expect(chip("docs")).toBeVisible();
     await chip("shared-lib").first().click();

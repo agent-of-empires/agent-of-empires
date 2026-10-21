@@ -50,13 +50,16 @@ export function ProjectsSection({
           data-testid="sidebar-projects-toggle"
           aria-expanded={expanded}
           className={`flex-1 min-w-0 flex items-center gap-2 py-1.5 text-[11px] font-mono uppercase text-text-muted hover:text-text-secondary hover:bg-surface-800/40 cursor-pointer transition-colors ${
-            compact ? "px-2" : "px-3 tracking-widest"
+            compact ? "px-2" : "px-3 tracking-wider"
           }`}
         >
           <FoldChevron className={`shrink-0 transition-transform duration-75 ${expanded ? "" : "-rotate-90"}`} />
-          {/* The count and the wide tracking do not fit the rail, and a clipped
-              "(0)" is exactly what looks broken; truncate the label. See #2288. */}
-          <span className="truncate">Projects{compact ? "" : ` (${visible.length})`}</span>
+          {/* A clipped count is exactly what looks broken, so the label truncates and the count never
+              does; the rail has room for neither (#2288). */}
+          <span className="truncate" title="Projects, no sessions">
+            {compact ? "Projects" : "Projects, no sessions"}
+          </span>
+          {!compact && <span className="shrink-0">({visible.length})</span>}
         </button>
         {canAdd && !compact && (
           <button
@@ -84,7 +87,7 @@ export function ProjectsSection({
         ))}
       {expanded && visible.length === 0 && !compact && (
         <p className="px-3 py-2 text-[12px] text-text-dim">
-          {query ? "No matching projects." : "No saved projects. Add one to keep a repo handy without a session."}
+          {query ? "No matching projects." : "No registered projects. Add one to keep a repo handy without a session."}
         </p>
       )}
     </div>
@@ -147,8 +150,8 @@ const ProjectRow = memo(function ProjectRow({
         className="group flex items-center gap-2 px-3 py-1.5 text-text-secondary hover:bg-surface-800/50 transition-colors focus:outline-none focus:ring-2 focus:ring-brand-600 select-none [-webkit-touch-callout:none]"
         style={repoColorStyle(project.color)}
       >
-        <span className="shrink-0 text-[10px] leading-none text-text-dim" title="Saved project" aria-hidden>
-          ◆
+        <span className="shrink-0 text-[10px] leading-none text-text-dim" title="Project" aria-hidden>
+          ◇
         </span>
         <button
           onClick={() => canModify && onCreateSession(project.repoPath)}
