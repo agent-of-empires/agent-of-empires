@@ -514,6 +514,10 @@ pub(super) fn build_router(state: Arc<AppState>) -> Router {
 
     let app = if state.web_config.mcp_enabled {
         app.route_service("/mcp", super::mcp::service(state.clone()))
+            .route_service(
+                "/mcp/plugins/{plugin}/{server}",
+                super::mcp_plugins::service(state.clone()),
+            )
     } else {
         app
     };

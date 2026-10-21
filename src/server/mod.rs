@@ -20,6 +20,7 @@ pub mod lifecycle_feed;
 pub mod live_ws;
 pub mod login;
 mod mcp;
+mod mcp_plugins;
 mod pane;
 pub mod passkeys;
 pub(crate) mod peer;
