@@ -2649,6 +2649,13 @@
       "components": ["web/src/components/ConnectedDevices.tsx"]
     },
     {
+      "id": "connectivity.update-banner-how-to-update",
+      "kind": "mocked-playwright",
+      "risk": "medium",
+      "specs": ["tests/update-banner.spec.ts", "src/components/__tests__/UpdateBanner.test.tsx"],
+      "components": ["web/src/components/UpdateBanner.tsx"]
+    },
+    {
       "id": "connectivity.banner-stack",
       "kind": "vitest",
       "risk": "medium",

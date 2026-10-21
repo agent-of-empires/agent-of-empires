@@ -4,12 +4,18 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 
 import { UpdateBanner } from "../UpdateBanner";
+import type { InstallMethod } from "../../lib/api";
 import { useUpdateBanner } from "../../hooks/useUpdateBanner";
 import type { UpdateStatus } from "../../lib/api";
 import { setServerDown } from "../../lib/connectionState";
 
 const fetchUpdateStatus = vi.fn();
 const dismissUpdate = vi.fn();
+
+const writeClipboard = vi.fn();
+vi.mock("../../lib/clipboard", () => ({
+  writeClipboard: (...args: unknown[]) => writeClipboard(...args),
+}));
 
 vi.mock("../../lib/api", () => ({
   fetchUpdateStatus: (...args: unknown[]) => fetchUpdateStatus(...args),
@@ -49,7 +55,7 @@ describe("UpdateBanner", () => {
     fetchUpdateStatus.mockResolvedValue(makeStatus());
     render(<Banner />);
 
-    const banner = await screen.findByRole("status");
+    const banner = await screen.findByRole("status", { name: /^Update available/ });
     expect(banner.getAttribute("aria-label")).toBe("Update available: v1.1.0");
     expect(banner.textContent).toContain("v1.0.0");
     expect(banner.textContent).toContain("v1.1.0");
@@ -59,8 +65,77 @@ describe("UpdateBanner", () => {
 
     fetchUpdateStatus.mockResolvedValue(makeStatus({ release_url: null }));
     render(<Banner />);
-    await screen.findByRole("status");
+    await screen.findByRole("status", { name: /^Update available/ });
     expect(screen.queryByText("Release notes")).toBeNull();
+  });
+
+  it("says how to update for each install method, with a copy target per command", () => {
+    const restart = "aoe serve --restart";
+    const cargo = "cargo install --git https://github.com/agent-of-empires/agent-of-empires aoe";
+    const nix = "nix run github:agent-of-empires/agent-of-empires";
+    // (install_method, update_command, text that must show, second line, commands with a copy button)
+    const cases: [InstallMethod | undefined, string | undefined, string, string | null, string[]][] = [
+      [
+        "homebrew",
+        "aoe update",
+        "",
+        "then run aoe serve --restart or restart it through your service manager",
+        ["aoe update", restart],
+      ],
+      ["release", "aoe update", "", "It offers to restart the Daemon for you when it's done.", ["aoe update"]],
+      ["cargo", cargo, "", "then run aoe serve --restart or restart it through your service manager", [cargo, restart]],
+      [
+        "nix",
+        nix,
+        "or rebuild your flake input",
+        "then run aoe serve --restart or restart it through your service manager",
+        [nix, restart],
+      ],
+      ["unknown", "aoe update", "to see how to update this install.", null, ["aoe update"]],
+      // A Daemon older than the field.
+      [undefined, undefined, "to see how to update this install.", null, ["aoe update"]],
+    ];
+    for (const [install_method, update_command, extra, second, commands] of cases) {
+      const { container, unmount } = render(
+        <UpdateBanner status={makeStatus({ install_method, update_command })} onDismiss={() => {}} />,
+      );
+      // Each line's pieces are flex items, so join them the way they read.
+      const lines = Array.from(container.querySelectorAll("[aria-label^='Update available'] > div > div")).map((line) =>
+        Array.from(line.children, (piece) => piece.textContent).join(" "),
+      );
+      const label = String(install_method);
+      expect(lines[0], label).toContain("Update available: v1.0.0 → v1.1.0 On the machine running AoE, run");
+      expect(lines[0], label).toContain(`run ${commands[0]}${extra ? ` ${extra}` : ""}`);
+      expect(lines[1] ?? null, label).toBe(second);
+      const copies = Array.from(container.querySelectorAll("button[aria-label^='Copy ']")).map((b) =>
+        b.getAttribute("aria-label"),
+      );
+      expect(copies, label).toEqual(commands.map((c) => `Copy ${c}`));
+      unmount();
+    }
+  });
+
+  it("confirms a copy for two seconds, and selects the command when copying fails", async () => {
+    vi.useFakeTimers();
+    try {
+      render(<UpdateBanner status={makeStatus({ install_method: "homebrew" })} onDismiss={() => {}} />);
+      const button = screen.getByRole("button", { name: "Copy aoe update" });
+
+      writeClipboard.mockResolvedValueOnce(true);
+      await act(async () => fireEvent.click(button));
+      expect(writeClipboard).toHaveBeenLastCalledWith("aoe update");
+      const feedback = button.parentElement!.querySelector("[role='status']")!;
+      expect(feedback.textContent).toBe("Copied");
+      await act(async () => vi.advanceTimersByTime(2000));
+      expect(screen.queryByText("Copied")).toBeNull();
+
+      writeClipboard.mockResolvedValueOnce(false);
+      await act(async () => fireEvent.click(button));
+      expect(feedback.textContent).toBe("Couldn't copy. Select and copy it.");
+      expect(window.getSelection()?.toString()).toBe("aoe update");
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("renders nothing before the first poll resolves", () => {
@@ -79,7 +154,7 @@ describe("UpdateBanner", () => {
     fetchUpdateStatus.mockResolvedValue(makeStatus(overrides));
     const { container } = render(<Banner />);
     await waitFor(() => expect(fetchUpdateStatus).toHaveBeenCalled());
-    expect(container.querySelector('[role="status"]')).toBeNull();
+    expect(container.querySelector('[aria-label^="Update available"]')).toBeNull();
   });
 
   it("overlapping polls leave a single hourly re-poll", async () => {
@@ -107,7 +182,7 @@ describe("UpdateBanner", () => {
   it("a slower older poll can't restore an offer a newer poll withdrew", async () => {
     fetchUpdateStatus.mockResolvedValue(makeStatus());
     render(<Banner />);
-    await screen.findByRole("status");
+    await screen.findByRole("status", { name: /^Update available/ });
 
     const replies: ((s: UpdateStatus) => void)[] = [];
     fetchUpdateStatus.mockImplementation(() => new Promise((resolve) => replies.push(resolve)));
@@ -119,7 +194,7 @@ describe("UpdateBanner", () => {
     expect(replies).toHaveLength(2);
     await act(async () => replies[1]!(makeStatus({ update_available: false })));
     await act(async () => replies[0]!(makeStatus()));
-    expect(screen.queryByRole("status")).toBeNull();
+    expect(screen.queryByRole("status", { name: /^Update available/ })).toBeNull();
     setServerDown(false);
   });
 
@@ -127,11 +202,11 @@ describe("UpdateBanner", () => {
     fetchUpdateStatus.mockResolvedValue(makeStatus());
     const { container } = render(<Banner />);
 
-    await screen.findByRole("status");
+    await screen.findByRole("status", { name: /^Update available/ });
     fireEvent.click(screen.getByLabelText("Dismiss update notice"));
 
     expect(dismissUpdate).toHaveBeenCalledTimes(1);
     expect(dismissUpdate).toHaveBeenCalledWith("1.1.0");
-    expect(container.querySelector('[role="status"]')).toBeNull();
+    expect(container.querySelector('[aria-label^="Update available"]')).toBeNull();
   });
 });
