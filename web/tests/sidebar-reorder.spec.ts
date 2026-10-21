@@ -115,6 +115,23 @@ test.describe("desktop rows", () => {
     await expect(page).toHaveURL(/\/session\/s-a$/, { timeout: 5_000 });
   });
 
+  test("Escape cancels a drag without reordering, and the next click goes through", async ({ page }) => {
+    const handle = await openDesktop(page);
+    const wrappers = page.locator(WRAPPERS);
+    await expect(wrappers).toHaveCount(3);
+    const alpha = (await wrappers.nth(0).boundingBox())!;
+    await dragRow(page, wrappers.nth(2), wrappers.nth(1), { release: false });
+    // The drag must really be live, or the "nothing happened" checks below prove nothing.
+    await expect(wrappers.nth(2)).toHaveClass(/ring-2/);
+    // dnd-kit's pointer sensor cancels on Escape, which must release the click guard too.
+    await page.keyboard.press("Escape");
+    await page.mouse.up();
+    await expectNoOrderingPut(page, handle, 200);
+    expect(await readVisibleSessionTitles(page)).toEqual(["alpha", "beta", "gamma"]);
+    await humanClick(page, alpha.x + alpha.width - 4, alpha.y + alpha.height / 2);
+    await expect(page).toHaveURL(/\/session\/s-a$/, { timeout: 5_000 });
+  });
+
   test("a 4px movement does not start a drag; a stationary click navigates without reordering", async ({ page }) => {
     const handle = await openDesktop(page);
     const wrappers = page.locator(WRAPPERS);
