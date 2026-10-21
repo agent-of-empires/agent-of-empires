@@ -672,4 +672,56 @@ mod tests {
             );
         }
     }
+
+    /// A degraded move must reach the caller as `warning` while the new path
+    /// is still reported.
+    #[test]
+    #[cfg(unix)]
+    #[serial_test::serial]
+    fn edit_workdir_surfaces_a_degraded_move_warning() {
+        use crate::git::test_support::repo_with_nested_submodules;
+        use std::os::unix::fs::PermissionsExt;
+
+        if unsafe { libc::geteuid() } == 0 {
+            eprintln!("skipping: root ignores directory permissions");
+            return;
+        }
+        let home_dir = tempfile::TempDir::new().unwrap();
+        let _home = crate::session::test_support::isolate_home(home_dir.path());
+
+        let dirs = repo_with_nested_submodules("feature", Path::new(".claude"));
+        let repo_path = dirs[0].path().to_path_buf();
+        let git = GitWorktree::new(repo_path.clone())
+            .unwrap()
+            .allow_submodule_file_transport();
+        let parent = tempfile::TempDir::new().unwrap();
+        let from = parent.path().join("source");
+        git.create_worktree("feature", &from, false, None).unwrap();
+
+        let gitdir = std::fs::read_to_string(from.join(".claude/.git")).unwrap();
+        let gitdir = from
+            .join(".claude")
+            .join(gitdir.trim().strip_prefix("gitdir: ").unwrap())
+            .canonicalize()
+            .unwrap();
+        std::fs::set_permissions(&gitdir, std::fs::Permissions::from_mode(0o555)).unwrap();
+
+        let info = wt_info("feature", repo_path.to_str().unwrap(), true);
+        let result = edit_worktree_workdir(WorktreeEditRequest {
+            worktree_info: &info,
+            current_path: &from,
+            new_name: "renamed",
+            rename_branch: false,
+        });
+        std::fs::set_permissions(&gitdir, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let outcome = result.unwrap();
+        assert_eq!(outcome.new_path, parent.path().join("renamed"));
+        assert!(outcome.new_path.is_dir());
+        let warning = outcome.warning.expect("degraded move must carry a warning");
+        assert!(
+            warning.contains("git submodule update --init --recursive"),
+            "{warning}"
+        );
+    }
 }
