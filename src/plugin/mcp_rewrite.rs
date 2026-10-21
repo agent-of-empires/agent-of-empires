@@ -293,6 +293,10 @@ mod tests {
                 .unwrap()
                 .push((plugin_id.to_string(), message.to_string()));
         }
+
+        fn report_serve_failure(&self, _plugin_id: &str, _message: &str) {
+            unreachable!("the rewrite chain reports no serve failures")
+        }
     }
 
     fn hook(id: &str) -> RewriteHook {
