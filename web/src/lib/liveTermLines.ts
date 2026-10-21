@@ -67,7 +67,6 @@ export function lineText(line: AnsiSegment[]): string {
   return line.map((s) => s.text).join("");
 }
 
-// Per-line matching only: a URL wrapped across rows links just its first part.
 const URL_RE = /https?:\/\/\S+/g;
 
 /** Pane output is agent-controlled, so only http(s) targets become hrefs. */
@@ -107,6 +106,53 @@ export function splitUrls(text: string): UrlPart[] {
   if (parts.length === 0) return [{ text, url: null }];
   if (last < text.length) parts.push({ text: text.slice(last), url: null });
   return parts;
+}
+
+/** Annotate `url` on the pieces of each URL in a logical line, before wrapLine, so a color change or a wrap mid-URL keeps the full href. OSC 8 segments are opaque and break the scan. */
+export function linkifyLine(line: AnsiSegment[]): AnsiSegment[] {
+  const out: AnsiSegment[] = [];
+  let changed = false;
+  let group: AnsiSegment[] = [];
+  const flush = () => {
+    const ranges: Array<[number, number, string]> = [];
+    let at = 0;
+    for (const part of splitUrls(group.map((s) => s.text).join(""))) {
+      if (part.url) ranges.push([at, at + part.text.length, part.url]);
+      at += part.text.length;
+    }
+    if (ranges.length === 0) {
+      out.push(...group);
+    } else {
+      changed = true;
+      let segStart = 0;
+      for (const seg of group) {
+        const segEnd = segStart + seg.text.length;
+        let from = segStart;
+        const emit = (to: number, url?: string) => {
+          if (to > from) out.push({ text: seg.text.slice(from - segStart, to - segStart), style: seg.style, url });
+          from = to;
+        };
+        for (const [s, e, url] of ranges) {
+          if (e <= from || s >= segEnd) continue;
+          emit(s, undefined);
+          emit(Math.min(e, segEnd), url);
+        }
+        emit(segEnd, undefined);
+        segStart = segEnd;
+      }
+    }
+    group = [];
+  };
+  for (const seg of line) {
+    if (seg.url && isHttpUrl(seg.url)) {
+      flush();
+      out.push(seg);
+    } else {
+      group.push(seg);
+    }
+  }
+  flush();
+  return changed ? out : line;
 }
 
 // Cell widths per grapheme cluster, aligned with tmux 3.6a: marks, ZWJ and variation selectors take no column; VS16 emoji, flags and ZWJ chains take two.
