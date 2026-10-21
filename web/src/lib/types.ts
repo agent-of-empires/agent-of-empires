@@ -92,6 +92,8 @@ export interface SessionResponse {
   acp_can_fork?: boolean;
   /** The agent binary was replaced after launch and a restart is safe to offer now. */
   update_restart?: boolean;
+  /** `acp.structured_view = off` for this session: a terminal session cannot switch to structured. */
+  structured_view_off?: boolean;
   /** Claude's fullscreen renderer is on, so mobile skips copy-mode scrollback workarounds. */
   claude_fullscreen: boolean;
   workspace_repos: WorkspaceRepoSummary[];

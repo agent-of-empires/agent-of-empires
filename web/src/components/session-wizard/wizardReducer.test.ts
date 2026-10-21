@@ -115,8 +115,24 @@ describe("APPLY_PROFILE_DEFAULTS", () => {
       true,
     ],
     ["import", { importAcpSessionId: "abc" }, [], defaults({ useStructuredView: false }), true],
+    [
+      "off outranks a hand-set view",
+      {},
+      [set("useStructuredView", true)],
+      defaults({ useStructuredView: false, structuredViewOffered: false }),
+      false,
+    ],
   ] as const)("seeds the configured view: %s", (_, data, edits, seed, view) => {
     expect(run(makeState(data), ...edits, seed).data.useStructuredView).toBe(view);
+  });
+});
+
+describe("structuredViewOffered", () => {
+  it("follows the latest profile defaults, and an omitted flag keeps the last one", () => {
+    const off = reducer(makeState(), defaults({ structuredViewOffered: false }));
+    expect(off.data.structuredViewOffered).toBe(false);
+    expect(reducer(off, defaults()).data.structuredViewOffered).toBe(false);
+    expect(reducer(off, defaults({ structuredViewOffered: true })).data.structuredViewOffered).toBe(true);
   });
 });
 

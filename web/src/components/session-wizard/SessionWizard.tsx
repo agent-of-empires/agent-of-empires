@@ -818,24 +818,26 @@ export function SessionWizard({
       </RowGroup>
 
       <RowGroup>
-        <SwitchRow
-          label="Structured"
-          switchLabel="Use structured view"
-          checked={acpCapable && d.useStructuredView}
-          onChange={(v) => handleChange("useStructuredView", v)}
-          disabled={!acpCapable}
-          summary={
-            !acpCapable
-              ? selectedAgent?.acp_allowed === false
-                ? "not on the allowed agents list"
-                : selectedAgent?.kind === "custom"
-                  ? "needs agent_acp_cmd"
-                  : "no ACP adapter, terminal only"
-              : d.useStructuredView
-                ? "plan, tool calls and diffs"
-                : "raw terminal"
-          }
-        />
+        {d.structuredViewOffered && (
+          <SwitchRow
+            label="Structured"
+            switchLabel="Use structured view"
+            checked={acpCapable && d.useStructuredView}
+            onChange={(v) => handleChange("useStructuredView", v)}
+            disabled={!acpCapable}
+            summary={
+              !acpCapable
+                ? selectedAgent?.acp_allowed === false
+                  ? "not on the allowed agents list"
+                  : selectedAgent?.kind === "custom"
+                    ? "needs agent_acp_cmd"
+                    : "no ACP adapter, terminal only"
+                : d.useStructuredView
+                  ? "plan, tool calls and diffs"
+                  : "raw terminal"
+            }
+          />
+        )}
         <SwitchRow
           label="Auto-approve"
           switchLabel="Auto-approve actions"
