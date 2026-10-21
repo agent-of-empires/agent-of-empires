@@ -22,8 +22,8 @@ async function openDesktop(page: Page, sessions: MockSessionInput[] = threeSessi
 }
 
 /**
- * A click right after a drop, held for a person's press (about 100ms). dnd-kit itself drops clicks for
- * 50ms after a drag ends; the old 250ms window would still swallow this one.
+ * A click right after a drop, held for a person's press (about 100ms), since dnd-kit itself drops clicks
+ * for 50ms after a drag ends.
  */
 async function humanClick(page: Page, x: number, y: number) {
   await page.mouse.move(x, y);
