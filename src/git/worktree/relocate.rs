@@ -11,6 +11,25 @@ use super::{
 use crate::git::command::run_git_with_timeout;
 use crate::git::error::{GitError, Result};
 
+/// Where a move left the worktree. `Err` from a move means the checkout is
+/// still at the source.
+#[derive(Debug, PartialEq, Eq)]
+pub enum MoveOutcome {
+    Moved,
+    /// The checkout is at the destination but git is broken there; the
+    /// message says how to repair it.
+    MovedDegraded(String),
+}
+
+impl MoveOutcome {
+    pub fn into_warning(self) -> Option<String> {
+        match self {
+            Self::Moved => None,
+            Self::MovedDegraded(message) => Some(message),
+        }
+    }
+}
+
 /// What a mutation that timed out actually did, judged by observing both sides.
 #[derive(Debug, PartialEq, Eq)]
 pub(super) enum TimedMutationOutcome {
@@ -195,7 +214,7 @@ impl GitWorktree {
     /// Move a worktree with `git worktree move` so git's bookkeeping follows,
     /// unlocking before and re-locking after. Worktrees with submodules take
     /// `relocate_worktree_with_submodules`.
-    pub fn move_worktree(&self, from: &Path, to: &Path) -> Result<()> {
+    pub fn move_worktree(&self, from: &Path, to: &Path) -> Result<MoveOutcome> {
         if !from.exists() {
             return Err(GitError::WorktreeNotFound(from.to_path_buf()));
         }
@@ -249,7 +268,7 @@ impl GitWorktree {
                 TimedMutationOutcome::Applied => {
                     self.relock(to);
                     tracing::warn!(target: "git.worktree", to = %to.display(), "timed-out worktree move completed before termination");
-                    return Ok(());
+                    return Ok(MoveOutcome::Moved);
                 }
                 TimedMutationOutcome::Unchanged
                     if matches!(from.try_exists(), Ok(true))
@@ -283,17 +302,16 @@ impl GitWorktree {
             return Err(error);
         }
         self.relock(to);
-        Ok(())
+        Ok(MoveOutcome::Moved)
     }
 
     /// Rename a worktree with submodules and repair git's pointers, keeping
     /// uncommitted and untracked submodule work (`submodule deinit` would
     /// refuse or discard it).
     ///
-    /// An `Err` leaves the checkout at `from`: `session::attach_project` only
-    /// records the move once this returns `Ok`. Past the repair, the worktree
-    /// is registered at `to` and remaining failures are logged, not returned.
-    fn relocate_worktree_with_submodules(&self, from: &Path, to: &Path) -> Result<()> {
+    /// An `Err` leaves the checkout at `from`. Once the checkout is at `to`
+    /// the result is `Ok`, `MovedDegraded` when a pointer could not be fixed.
+    fn relocate_worktree_with_submodules(&self, from: &Path, to: &Path) -> Result<MoveOutcome> {
         tracing::info!(target: "git.worktree",
             from = %from.display(),
             to = %to.display(),
@@ -315,44 +333,49 @@ impl GitWorktree {
             return Err(e.into());
         }
         if let Err(e) = self.repair_worktree(to) {
-            if std::fs::rename(to, from).is_err() {
+            if let Err(rollback) = std::fs::rename(to, from) {
                 tracing::error!(target: "git.worktree",
                     to = %to.display(),
                     error = %e,
                     "move_worktree: could not repair or move back; the checkout is stranded at the new path"
                 );
-                return Err(e);
+                return Ok(MoveOutcome::MovedDegraded(format!(
+                    "`git worktree repair` failed ({e}) and moving back failed ({rollback}); \
+                     run `git worktree repair {}` from the main repository",
+                    to.display()
+                )));
             }
             let _ = self.repair_worktree(from);
             let _ = self.lock_worktree(from);
             return Err(e);
         }
 
+        let mut problems = Vec::new();
         if let Err(e) = Self::convert_git_file_to_relative(to) {
-            tracing::warn!(target: "git.worktree",
-                to = %to.display(),
-                error = %e,
-                "move_worktree: could not restore the relative .git pointer"
-            );
+            problems.push(format!("could not restore the relative .git pointer: {e}"));
         }
-        let unrepaired: Vec<String> = checkouts
-            .iter()
-            .filter_map(|checkout| {
-                Self::repoint_submodule(to, checkout)
-                    .err()
-                    .map(|e| format!("{}: {e}", checkout.relative.display()))
-            })
-            .collect();
-        if !unrepaired.is_empty() {
-            tracing::error!(target: "git.worktree",
-                to = %to.display(),
-                submodules = ?unrepaired,
-                "move_worktree: relocated the worktree but left submodule pointers stale; \
-                 `git submodule update --init --recursive` in the new path restores them"
-            );
+        for checkout in &checkouts {
+            if let Err(e) = Self::repoint_submodule(to, checkout) {
+                problems.push(format!(
+                    "submodule {} is not repointed: {e}",
+                    checkout.relative.display()
+                ));
+            }
         }
         self.relock(to);
-        Ok(())
+        if problems.is_empty() {
+            return Ok(MoveOutcome::Moved);
+        }
+        tracing::error!(target: "git.worktree",
+            to = %to.display(),
+            problems = ?problems,
+            "move_worktree: relocated the worktree but left it degraded"
+        );
+        Ok(MoveOutcome::MovedDegraded(format!(
+            "{}; run `git submodule update --init --recursive` in {} to repair",
+            problems.join("; "),
+            to.display()
+        )))
     }
 
     /// `git worktree repair`, which fixes both the checkout's `.git` pointer and
@@ -886,6 +909,54 @@ mod tests {
         assert!(result.is_err());
         assert!(from.is_dir());
         assert!(!to.exists());
+    }
+
+    /// A submodule gitdir that cannot be rewritten must surface as a degraded
+    /// move at the destination, never as a plain success.
+    #[test]
+    #[cfg(unix)]
+    #[serial_test::serial]
+    fn move_worktree_reports_degraded_when_submodule_repoint_fails() {
+        use std::os::unix::fs::PermissionsExt;
+
+        if unsafe { libc::geteuid() } == 0 {
+            eprintln!("skipping: root ignores directory permissions");
+            return;
+        }
+        let home_dir = TempDir::new().unwrap();
+        let _home = crate::session::test_support::isolate_home(home_dir.path());
+
+        let dirs = repo_with_nested_submodules("test-degraded-move", Path::new(".claude"));
+        let git_wt = GitWorktree::new(dirs[0].path().to_path_buf())
+            .unwrap()
+            .allow_submodule_file_transport();
+        let parent = TempDir::new().unwrap();
+        let from = parent.path().join("source");
+        git_wt
+            .create_worktree("test-degraded-move", &from, false, None)
+            .unwrap();
+
+        // Git cannot take `config.lock` in a read-only gitdir.
+        let gitdir = submodule_gitdir(&from.join(".claude")).unwrap();
+        std::fs::set_permissions(&gitdir, std::fs::Permissions::from_mode(0o555)).unwrap();
+
+        let to = parent.path().join("nested-dest/moved");
+        std::fs::create_dir_all(to.parent().unwrap()).unwrap();
+        let result = git_wt.move_worktree(&from, &to);
+        std::fs::set_permissions(&gitdir, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let Ok(MoveOutcome::MovedDegraded(message)) = result else {
+            panic!("expected a degraded move, got {result:?}");
+        };
+        assert!(message.contains(".claude"), "{message}");
+        assert!(
+            message.contains("git submodule update --init --recursive"),
+            "{message}"
+        );
+        assert!(!from.exists());
+        assert!(to.is_dir());
+        let listed = run_git(&git_wt.repo_path, &["worktree", "list", "--porcelain"]);
+        assert!(listed.contains("moved"), "{listed}");
     }
 
     /// The backstop reaches the relocation after `move_worktree` has already

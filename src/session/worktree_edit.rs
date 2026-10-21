@@ -292,6 +292,8 @@ pub struct WorktreeEditOutcome {
     /// `Some(new_branch)` when the branch was renamed; assign to
     /// `worktree_info.branch`. `None` means the branch was left untouched.
     pub new_branch: Option<String>,
+    /// Set when the directory moved but git is degraded there; says how to repair it.
+    pub warning: Option<String>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -378,31 +380,42 @@ pub fn edit_worktree_workdir(
         renamed_branch = true;
     }
 
+    let mut warning = None;
     if path_changes {
-        if let Err(e) = git.move_worktree(req.current_path, &new_path) {
-            if renamed_branch {
-                if let Err(rollback) = git.rename_branch(&new_branch, &req.worktree_info.branch) {
-                    tracing::error!(
-                        target: "git.worktree",
-                        new = %new_branch,
-                        old = %req.worktree_info.branch,
-                        "worktree edit: branch-rename rollback failed after move error: {rollback}"
-                    );
-                    // The repo is now on `new_branch` with the directory still at its old path.
-                    return Err(WorktreeEditError::RollbackFailed {
-                        move_err: e.to_string(),
-                        rollback_err: rollback.to_string(),
-                        branch: new_branch.clone(),
-                    });
+        match git.move_worktree(req.current_path, &new_path) {
+            Ok(moved) => {
+                warning = moved.into_warning();
+                if let Some(warning) = &warning {
+                    tracing::warn!(target: "git.worktree", to = %new_path.display(), "worktree edit left git degraded: {warning}");
                 }
             }
-            return Err(e.into());
+            Err(e) => {
+                if renamed_branch {
+                    if let Err(rollback) = git.rename_branch(&new_branch, &req.worktree_info.branch)
+                    {
+                        tracing::error!(
+                            target: "git.worktree",
+                            new = %new_branch,
+                            old = %req.worktree_info.branch,
+                            "worktree edit: branch-rename rollback failed after move error: {rollback}"
+                        );
+                        // The repo is now on `new_branch` with the directory still at its old path.
+                        return Err(WorktreeEditError::RollbackFailed {
+                            move_err: e.to_string(),
+                            rollback_err: rollback.to_string(),
+                            branch: new_branch.clone(),
+                        });
+                    }
+                }
+                return Err(e.into());
+            }
         }
     }
 
     Ok(WorktreeEditOutcome {
         new_path,
         new_branch: renamed_branch.then_some(new_branch),
+        warning,
     })
 }
 
