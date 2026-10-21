@@ -1102,6 +1102,7 @@ mod tests {
                     State(state),
                     Query(crate::server::api::sessions::CreateSessionQuery { wait: None }),
                     None,
+                    None,
                     Ok(Json(body)),
                 )
                 .await
@@ -1186,6 +1187,7 @@ mod tests {
         let response = crate::server::api::sessions::create_session(
             State(Arc::clone(&state)),
             Query(crate::server::api::sessions::CreateSessionQuery { wait: None }),
+            None,
             None,
             Ok(Json(body)),
         )

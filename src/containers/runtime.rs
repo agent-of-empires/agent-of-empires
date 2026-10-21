@@ -59,6 +59,11 @@ impl Default for ContainerRuntime {
 }
 
 impl ContainerRuntime {
+    /// "Docker", "Podman" or "Apple Container".
+    pub fn display_name(&self) -> &'static str {
+        self.base.name
+    }
+
     pub fn is_available(&self) -> bool {
         self.base.is_available()
     }

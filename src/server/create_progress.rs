@@ -17,7 +17,7 @@ const FAILURE_TTL: Duration = Duration::from_secs(24 * 60 * 60);
 /// Live failures remembered at once. A live one is never evicted, since a client may still
 /// retry its key; at the cap, new keyed creates are refused until entries expire.
 const MAX_FAILURES: usize = 4096;
-const MAX_FAILURE_MESSAGE_CHARS: usize = 1024;
+pub(crate) const MAX_FAILURE_MESSAGE_CHARS: usize = 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -54,6 +54,14 @@ struct State {
     output: VecDeque<String>,
 }
 
+/// Unregistered, for a create without an idempotency key: nothing polls it,
+/// but its failure still reports the stage.
+impl Default for CreateProgress {
+    fn default() -> Self {
+        Self::new(CreateProgressVisibility::UnixOwnerOnly)
+    }
+}
+
 impl CreateProgress {
     fn new(visibility: CreateProgressVisibility) -> Self {
         Self {
@@ -88,6 +96,11 @@ impl CreateProgress {
         }
     }
 
+    /// The stage alone, which a failure may report whoever made the request.
+    pub fn stage(&self) -> CreateStage {
+        self.state.lock().expect("create progress poisoned").stage
+    }
+
     fn snapshot(&self) -> CreateProgressSnapshot {
         let state = self.state.lock().expect("create progress poisoned");
         CreateProgressSnapshot {
@@ -99,12 +112,31 @@ impl CreateProgress {
 }
 
 /// A failed create's response. A retry whose first response was lost gets it
-/// back instead of running the create, and its hooks, again.
+/// back, with the original `stage` and `reference`, instead of running the
+/// create, and its hooks, again.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CreateFailure {
     pub status: axum::http::StatusCode,
     pub code: &'static str,
     pub message: String,
+    pub stage: CreateStage,
+    /// The `X-Request-Id` of the attempt that failed, as logged with it.
+    pub reference: String,
+}
+
+impl axum::response::IntoResponse for CreateFailure {
+    fn into_response(self) -> axum::response::Response {
+        (
+            self.status,
+            axum::Json(serde_json::json!({
+                "error": self.code,
+                "message": self.message,
+                "stage": self.stage,
+                "reference": self.reference,
+            })),
+        )
+            .into_response()
+    }
 }
 
 pub struct CreateProgressRegistry {
@@ -228,6 +260,8 @@ mod tests {
             status: axum::http::StatusCode::BAD_REQUEST,
             code: "create_failed",
             message: format!("failure {n}"),
+            stage: CreateStage::Preparing,
+            reference: format!("ref-{n}"),
         };
         for n in 0..MAX_FAILURES {
             assert!(registry.has_failure_capacity());

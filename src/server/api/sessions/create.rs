@@ -2,16 +2,25 @@
 
 use super::*;
 
+/// A failed on_create hook in the words the TUI and local owners have always seen. It keeps
+/// its cause, so the Web dashboard can still name the hook; no `source`, so `{:#}` doesn't
+/// repeat the cause the text already includes.
 #[derive(Debug, thiserror::Error)]
-#[error("{0}")]
-pub(crate) struct CreateHookFailed(String);
+#[error("{text}")]
+pub(crate) struct CreateHookFailed {
+    text: String,
+    pub(crate) cause: anyhow::Error,
+}
 
 impl CreateHookFailed {
     pub(crate) fn new(error: anyhow::Error, origin_hint: Option<&str>) -> Self {
         let hint = origin_hint
             .map(|hint| format!("\n{hint}"))
             .unwrap_or_default();
-        Self(format!("on_create hook failed: {error:#}{hint}"))
+        Self {
+            text: format!("on_create hook failed: {error:#}{hint}"),
+            cause: error,
+        }
     }
 }
 
@@ -660,12 +669,15 @@ pub async fn create_session(
     State(state): State<Arc<AppState>>,
     axum::extract::Query(query): axum::extract::Query<CreateSessionQuery>,
     local: Option<axum::Extension<crate::server::auth::LocalAuthorization>>,
+    request_id: Option<axum::Extension<crate::server::router::RequestId>>,
     body: Result<Json<CreateSessionBody>, axum::extract::rejection::JsonRejection>,
 ) -> impl IntoResponse {
     let local_owner = matches!(
         local.as_deref(),
         Some(crate::server::auth::LocalAuthorization::UnixOwner(_))
     );
+    // The router always sets it; a direct call (tests) still gets a loggable one.
+    let reference = request_id.map_or_else(|| uuid::Uuid::new_v4().to_string(), |id| id.0 .0);
     if state.read_only {
         return crate::server::api::read_only_response();
     }
@@ -709,7 +721,7 @@ pub async fn create_session(
             return created_session_response(&state, &id, Vec::new(), StatusCode::OK).await;
         }
         if let Some(failure) = state.create_progress.recent_failure(key) {
-            return api_error(failure.status, failure.code, failure.message);
+            return failure.into_response();
         }
         if body
             .retry_origin
@@ -1125,7 +1137,7 @@ pub async fn create_session(
     // at `validation_profile` checked against, so the two cannot disagree.
     // Registered after the idempotency lock, so a retry waiting on it cannot
     // replace the entry the in-flight create is writing to.
-    let progress = body.idempotency_key.as_deref().map(|key| {
+    let registration = body.idempotency_key.as_deref().map(|key| {
         state.create_progress.register(
             key,
             if local_owner {
@@ -1135,6 +1147,9 @@ pub async fn create_session(
             },
         )
     });
+    let progress = registration
+        .as_ref()
+        .map_or_else(Default::default, |r| Arc::clone(&r.progress));
 
     let spec = crate::server::session_spawn::StructuredSessionSpec {
         title: body.title,
@@ -1179,7 +1194,7 @@ pub async fn create_session(
         import_acp_session_id: body.import_acp_session_id,
         import_binding,
         fork_seed,
-        progress: progress.as_ref().map(|p| Arc::clone(&p.progress)),
+        progress: Some(Arc::clone(&progress)),
     };
 
     // Detached so a client that drops the connection mid-create (a backgrounded
@@ -1188,16 +1203,19 @@ pub async fn create_session(
     // this create and then finds its session.
     let task_state = Arc::clone(&state);
     let key = body.idempotency_key;
+    let task_progress = Arc::clone(&progress);
+    let task_reference = reference.clone();
     let created = tokio::spawn(async move {
         let _idempotency_guard = _idempotency_guard;
-        let _progress = progress;
+        let _registration = registration;
         let _creation_profile = _creation_profile;
         let result = task_state
             .session_service
             .create_structured_session(spec, None, None, None)
             .await;
         if let (Err(e), Some(key)) = (&result, &key) {
-            if let Some(failure) = create_failure(e) {
+            let stage = task_progress.stage();
+            if let Some(failure) = create_failure(e, stage, &task_reference) {
                 task_state.create_progress.record_failure(key, failure);
             }
         }
@@ -1260,25 +1278,31 @@ pub async fn create_session(
                 )
                     .into_response();
             }
+            let stage = progress.stage();
             if let Some(panicked) =
                 e.downcast_ref::<crate::server::session_spawn::SessionBuildPanicked>()
             {
-                tracing::error!(target: "http.api.sessions", "Session creation panicked: {}", panicked.0);
+                tracing::error!(target: "http.api.sessions", %reference, ?stage, "Session creation panicked: {}", panicked.0);
             } else {
-                tracing::warn!(target: "http.api.sessions", "Session creation failed: {}", e);
+                tracing::warn!(target: "http.api.sessions", %reference, ?stage, "Session creation failed: {}", e);
             }
             if let Some(response) = local_create_hook_error_response(&e, local_owner) {
                 return response;
             }
-            let failure = create_failure(&e).expect("hooks_need_trust returned above");
-            api_error(failure.status, failure.code, failure.message)
+            create_failure(&e, stage, &reference)
+                .expect("hooks_need_trust returned above")
+                .into_response()
         }
     }
 }
 
 /// The response for a failed create; `None` for a trust refusal, which the
 /// caller resubmits with the same key.
-fn create_failure(e: &anyhow::Error) -> Option<crate::server::create_progress::CreateFailure> {
+fn create_failure(
+    e: &anyhow::Error,
+    stage: crate::server::create_progress::CreateStage,
+    reference: &str,
+) -> Option<crate::server::create_progress::CreateFailure> {
     use crate::server::create_progress::CreateFailure;
     // A refusal the caller corrects and resends under the same idempotency key must not
     // be frozen into the replay map: recording it would make every later attempt on that
@@ -1294,23 +1318,29 @@ fn create_failure(e: &anyhow::Error) -> Option<crate::server::create_progress::C
         return None;
     }
     // A build-task panic keeps its 500; a plain build failure is a 400.
-    Some(
-        if e.downcast_ref::<crate::server::session_spawn::SessionBuildPanicked>()
-            .is_some()
-        {
-            CreateFailure {
-                status: StatusCode::INTERNAL_SERVER_ERROR,
-                code: "internal",
-                message: "Internal server error".to_string(),
-            }
-        } else {
-            CreateFailure {
-                status: StatusCode::BAD_REQUEST,
-                code: "create_failed",
-                message: public_create_session_error(e),
-            }
-        },
-    )
+    let (status, code, message) = if e
+        .downcast_ref::<crate::server::session_spawn::SessionBuildPanicked>()
+        .is_some()
+    {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "internal",
+            "Internal server error".to_string(),
+        )
+    } else {
+        let (code, message) = public_create_session_error(e);
+        (StatusCode::BAD_REQUEST, code, message)
+    };
+    Some(CreateFailure {
+        status,
+        code,
+        message: message
+            .chars()
+            .take(crate::server::create_progress::MAX_FAILURE_MESSAGE_CHARS)
+            .collect(),
+        stage,
+        reference: reference.to_string(),
+    })
 }
 
 /// `GET /api/sessions/create-progress/{key}`: stage and hook output of an
@@ -1371,22 +1401,71 @@ async fn created_session_response(
     crate::server::runtime::mutation_response(&snapshot.value.cursor, (status, Json(response)))
 }
 
-/// Pick the client-facing message for a failed session creation.
+/// Pick the client-facing code and message for a failed session creation.
 ///
-/// The full error is always logged server-side; this only governs what
-/// reaches the browser. We whitelist the well-typed `GitError` variants
-/// that carry a clear, actionable, credential-free message (a branch name
-/// or a worktree path the user chose) and let everything else fall back to
-/// the generic string. This keeps raw git stderr, libgit2 internals, IO
-/// paths, and arbitrary `bail!` strings off the wire even though the
-/// duplicate-worktree case now surfaces its real message.
-pub(super) fn public_create_session_error(e: &anyhow::Error) -> String {
+/// The full error is always logged server-side. The Web dashboard can be reached
+/// remotely, so only fixed templates go back: typed errors found anywhere in the
+/// chain fill them with a runtime name, an image reference, a Repo hook command
+/// or an exit code, never stderr, paths or git output. The well-typed `GitError`
+/// variants with a credential-free message pass through as before; anything
+/// else is the generic string.
+pub(super) fn public_create_session_error(e: &anyhow::Error) -> (&'static str, String) {
+    use crate::containers::error::DockerError;
+    use crate::session::builder::BuildRefusal;
+    use crate::session::config::repo_config::HookFailed;
+
+    // A failed on_create hook keeps its cause, so its typed parts can still be found.
+    let e = e
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<CreateHookFailed>())
+        .map_or(e, |hook| &hook.cause);
+    let runtime = || crate::containers::get_container_runtime().display_name();
+    let unavailable = |why: String| ("sandbox_unavailable", why);
+    for cause in e.chain() {
+        if let Some(hook) = cause.downcast_ref::<HookFailed>() {
+            let ended = match hook.exit_code {
+                Some(code) => format!("exited with code {code}"),
+                None => "was stopped before it exited".to_string(),
+            };
+            return (
+                "hook_failed",
+                format!("The Repo hook `{}` {ended}.", hook.command),
+            );
+        }
+        if let Some(refusal) = cause.downcast_ref::<BuildRefusal>() {
+            return match refusal {
+                BuildRefusal::RuntimeNotInstalled => unavailable(not_installed(runtime())),
+                BuildRefusal::RuntimeNotRunning => unavailable(not_running(runtime())),
+                BuildRefusal::WorkingDirMissing(_) => (
+                    "working_dir_missing",
+                    "The Working directory doesn't exist where the Daemon runs.".to_string(),
+                ),
+            };
+        }
+        match cause.downcast_ref::<DockerError>() {
+            Some(DockerError::NotInstalled) => return unavailable(not_installed(runtime())),
+            Some(DockerError::DaemonNotRunning) => return unavailable(not_running(runtime())),
+            Some(DockerError::PermissionDenied) => {
+                return unavailable(format!(
+                    "The Daemon's user isn't allowed to use {}, so the Sandbox can't start.",
+                    runtime()
+                ))
+            }
+            Some(DockerError::ImagePullFailed { image, .. }) => {
+                return (
+                    "sandbox_image_pull_failed",
+                    format!("Couldn't pull the Sandbox image {image}."),
+                )
+            }
+            _ => {}
+        }
+    }
     if let Some(git_err) = e.chain().find_map(|c| c.downcast_ref::<GitError>()) {
         match git_err {
             GitError::WorktreeAlreadyExists(_)
             | GitError::BranchAlreadyCheckedOut(_)
             | GitError::BranchNotFound(_)
-            | GitError::NotAGitRepo => return git_err.to_string(),
+            | GitError::NotAGitRepo => return ("create_failed", git_err.to_string()),
             // Raw command output / libgit2 / IO: not safe to expose.
             GitError::WorktreeCommandFailed(_)
             | GitError::CloneFailed(_)
@@ -1395,5 +1474,13 @@ pub(super) fn public_create_session_error(e: &anyhow::Error) -> String {
             | GitError::IoError(_) => {}
         }
     }
-    "Failed to create session".to_string()
+    ("create_failed", "Failed to create session".to_string())
+}
+
+fn not_installed(runtime: &str) -> String {
+    format!("{runtime} isn't installed where the Daemon runs, so the Sandbox can't start.")
+}
+
+fn not_running(runtime: &str) -> String {
+    format!("{runtime} isn't running, so the Sandbox can't start. Start {runtime}, then try again.")
 }

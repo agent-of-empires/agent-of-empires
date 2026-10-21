@@ -1830,6 +1830,7 @@ pub async fn system_health(State(state): State<Arc<AppState>>) -> axum::response
 #[derive(Serialize)]
 pub struct DockerStatus {
     pub available: bool,
+    /// The configured runtime, also when it is down, so the client can name it.
     pub runtime: Option<String>,
 }
 
@@ -1837,20 +1838,15 @@ pub async fn docker_status() -> Json<DockerStatus> {
     let result = tokio::task::spawn_blocking(|| {
         let runtime = crate::containers::get_container_runtime();
         let available = runtime.is_available() && runtime.is_daemon_running();
-        let runtime_name = if available {
-            let config = crate::session::Config::load_or_warn();
-            Some(
+        let config = crate::session::Config::load_or_warn();
+        DockerStatus {
+            available,
+            runtime: Some(
                 serde_json::to_value(config.sandbox.container_runtime)
                     .ok()
                     .and_then(|v| v.as_str().map(String::from))
                     .unwrap_or_else(|| "docker".to_string()),
-            )
-        } else {
-            None
-        };
-        DockerStatus {
-            available,
-            runtime: runtime_name,
+            ),
         }
     })
     .await

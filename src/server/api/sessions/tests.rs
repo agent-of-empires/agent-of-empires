@@ -824,6 +824,7 @@ async fn create_receipts_include_published_rows_and_idempotent_retries() -> anyh
             State(state.clone()),
             axum::extract::Query(create::CreateSessionQuery { wait: None }),
             None,
+            None,
             Ok(Json(body)),
         )
         .await
@@ -887,6 +888,7 @@ async fn canonical_fork_refusals_do_not_create_sessions() -> anyhow::Result<()> 
         create_session(
             State(state),
             axum::extract::Query(create::CreateSessionQuery { wait: None }),
+            None,
             None,
             Ok(Json(create_body_from_json(body))),
         )
@@ -4093,50 +4095,182 @@ async fn create_hook_failure_details_are_local_owner_only() {
 }
 
 #[test]
-fn public_create_session_error_forwards_whitelisted_git_errors_only() {
-    let dup: anyhow::Error =
-        GitError::WorktreeAlreadyExists(std::path::PathBuf::from("/tmp/repo-worktrees/foo")).into();
-    assert_eq!(
-        public_create_session_error(&dup),
-        "Worktree already exists at /tmp/repo-worktrees/foo"
-    );
-
-    let in_use: anyhow::Error = GitError::BranchAlreadyCheckedOut("feature/foo".to_string()).into();
-    assert_eq!(
-        public_create_session_error(&in_use),
-        "Branch 'feature/foo' is already in use by another worktree"
-    );
-
-    // Whitelisted variants survive an anyhow::Context wrapper too.
-    let wrapped = anyhow::Error::from(GitError::BranchNotFound("nope".to_string()))
-        .context("while creating worktree");
-    assert_eq!(
-        public_create_session_error(&wrapped),
-        "Branch 'nope' not found"
-    );
-
-    // Raw git stderr (even already-sanitized) must not reach the client.
-    let cmd: anyhow::Error = GitError::WorktreeCommandFailed(
-        "fatal: unable to access 'https://<redacted>@host/repo.git'".to_string(),
+#[serial_test::serial]
+fn public_create_session_error_forwards_typed_causes_as_fixed_templates() {
+    use crate::containers::error::DockerError;
+    use crate::session::builder::BuildRefusal;
+    const SECRET: &str = "ghp_sekrit";
+    let _home = crate::session::test_support::isolate_app_dir();
+    crate::session::config::update_config(|c| {
+        c.sandbox.container_runtime = crate::session::config::ContainerRuntimeName::Podman
+    })
+    .unwrap();
+    // A real hook failure whose output carries a secret and a path.
+    let project = tempfile::tempdir().unwrap();
+    std::fs::write(
+        project.path().join("out.txt"),
+        format!("token {SECRET} in /home/alice/.ssh"),
     )
-    .into();
-    assert_eq!(
-        public_create_session_error(&cmd),
-        "Failed to create session"
-    );
-
-    let clone: anyhow::Error =
-        GitError::CloneFailed("https://alice:supersecret@host/repo.git".to_string()).into();
-    let msg = public_create_session_error(&clone);
-    assert_eq!(msg, "Failed to create session");
-    assert!(!msg.contains("supersecret"));
-
-    // A non-GitError anyhow also stays generic.
-    let other = anyhow::anyhow!("something internal at /home/user/.config/secret");
-    assert_eq!(
-        public_create_session_error(&other),
-        "Failed to create session"
-    );
+    .unwrap();
+    let hook = |cmd: &str| {
+        crate::session::config::repo_config::execute_hooks(&[cmd.to_string()], project.path(), &[])
+            .unwrap_err()
+    };
+    let generic = ("create_failed", "Failed to create session".to_string());
+    let rows: Vec<(&str, anyhow::Error, (&str, String))> = vec![
+        (
+            "hook exit code",
+            hook("cat out.txt; cat out.txt >&2; exit 3"),
+            (
+                "hook_failed",
+                "The Repo hook `cat out.txt; cat out.txt >&2; exit 3` exited with code 3.".into(),
+            ),
+        ),
+        (
+            "hook under context",
+            hook("exit 7").context("on_create hooks failed"),
+            (
+                "hook_failed",
+                "The Repo hook `exit 7` exited with code 7.".into(),
+            ),
+        ),
+        (
+            "hook wrapped by the create path",
+            anyhow::Error::new(CreateHookFailed::new(
+                hook("exit 5"),
+                Some("Defined in .agent-of-empires.yml"),
+            )),
+            (
+                "hook_failed",
+                "The Repo hook `exit 5` exited with code 5.".into(),
+            ),
+        ),
+        (
+            "runtime not installed",
+            BuildRefusal::RuntimeNotInstalled.into(),
+            (
+                "sandbox_unavailable",
+                "Podman isn't installed where the Daemon runs, so the Sandbox can't start.".into(),
+            ),
+        ),
+        (
+            "runtime down at the pre-check",
+            BuildRefusal::RuntimeNotRunning.into(),
+            (
+                "sandbox_unavailable",
+                "Podman isn't running, so the Sandbox can't start. Start Podman, then try again."
+                    .into(),
+            ),
+        ),
+        (
+            "runtime down while starting the container",
+            anyhow::Error::from(DockerError::DaemonNotRunning).context("ensure container"),
+            (
+                "sandbox_unavailable",
+                "Podman isn't running, so the Sandbox can't start. Start Podman, then try again."
+                    .into(),
+            ),
+        ),
+        (
+            "runtime missing while starting the container",
+            DockerError::NotInstalled.into(),
+            (
+                "sandbox_unavailable",
+                "Podman isn't installed where the Daemon runs, so the Sandbox can't start.".into(),
+            ),
+        ),
+        (
+            "runtime permission",
+            DockerError::PermissionDenied.into(),
+            (
+                "sandbox_unavailable",
+                "The Daemon's user isn't allowed to use Podman, so the Sandbox can't start.".into(),
+            ),
+        ),
+        (
+            "image pull",
+            anyhow::Error::from(DockerError::ImagePullFailed {
+                runtime: "Podman",
+                image: "ghcr.io/acme/sandbox:1".into(),
+                detail: format!("denied: token {SECRET} at /root/.docker/config.json"),
+            })
+            .context("ensure image"),
+            (
+                "sandbox_image_pull_failed",
+                "Couldn't pull the Sandbox image ghcr.io/acme/sandbox:1.".into(),
+            ),
+        ),
+        (
+            "working dir missing",
+            BuildRefusal::WorkingDirMissing("/home/alice/secret-project".into()).into(),
+            (
+                "working_dir_missing",
+                "The Working directory doesn't exist where the Daemon runs.".into(),
+            ),
+        ),
+        // The git whitelist is unchanged.
+        (
+            "git: worktree exists",
+            GitError::WorktreeAlreadyExists(std::path::PathBuf::from("/tmp/repo-worktrees/foo"))
+                .into(),
+            (
+                "create_failed",
+                "Worktree already exists at /tmp/repo-worktrees/foo".into(),
+            ),
+        ),
+        (
+            "git: branch in use",
+            GitError::BranchAlreadyCheckedOut("feature/foo".into()).into(),
+            (
+                "create_failed",
+                "Branch 'feature/foo' is already in use by another worktree".into(),
+            ),
+        ),
+        (
+            "git: under context",
+            anyhow::Error::from(GitError::BranchNotFound("nope".into()))
+                .context("while creating worktree"),
+            ("create_failed", "Branch 'nope' not found".into()),
+        ),
+        // Raw git stderr (even already-sanitized) must not reach the client.
+        (
+            "git: command output",
+            GitError::WorktreeCommandFailed(format!(
+                "fatal: unable to access 'https://{SECRET}@host'"
+            ))
+            .into(),
+            generic.clone(),
+        ),
+        (
+            "git: clone credentials",
+            GitError::CloneFailed(format!("https://alice:{SECRET}@host/repo.git")).into(),
+            generic.clone(),
+        ),
+        (
+            "untyped",
+            anyhow::anyhow!("something internal at /home/user/.config/{SECRET}"),
+            generic.clone(),
+        ),
+        // An image inspect miss is not a pull failure.
+        (
+            "image not found",
+            DockerError::ImageNotFound(format!("img {SECRET}")).into(),
+            generic.clone(),
+        ),
+    ];
+    for (label, error, expected) in rows {
+        let got = public_create_session_error(&error);
+        assert!(!got.1.contains(SECRET), "{label}: leaked into {got:?}");
+        assert!(
+            !got.1.contains("/home/alice"),
+            "{label}: leaked a path into {got:?}"
+        );
+        assert!(
+            !got.1.contains("Docker"),
+            "{label}: named Docker, not Podman: {got:?}"
+        );
+        assert_eq!(got, expected, "{label}");
+    }
 }
 
 #[test]
@@ -8146,6 +8280,7 @@ async fn post_create_bytes(
         axum::extract::State(state.clone()),
         axum::extract::Query(CreateSessionQuery { wait: None }),
         None,
+        None,
         Ok(axum::Json(serde_json::from_value(body).unwrap())),
     )
     .await
@@ -8168,6 +8303,7 @@ async fn post_create_raw(
     let response = create_session(
         axum::extract::State(state.clone()),
         axum::extract::Query(CreateSessionQuery { wait: None }),
+        None,
         None,
         Ok(axum::Json(serde_json::from_value(body).unwrap())),
     )
@@ -8358,6 +8494,7 @@ async fn a_dropped_create_finishes_and_its_retry_returns_the_same_session() {
                             nix::unistd::geteuid().as_raw(),
                         ),
                     )),
+                    None,
                     Ok(Json(serde_json::from_value(body).unwrap())),
                 )
                 .await
@@ -8468,9 +8605,21 @@ async fn a_failed_create_is_replayed_to_a_same_key_retry() {
         })
     };
 
+    let (_logs, log) = crate::server::test_helpers::capture_logs();
     let (status, failed) = post_create(&state, body("k1")).await;
     assert_eq!(status, axum::http::StatusCode::BAD_REQUEST, "{failed}");
-    // A re-run would now succeed, so a matching 400 proves the replay.
+    assert_eq!(failed["error"], "working_dir_missing", "{failed}");
+    assert_eq!(failed["stage"], "preparing", "{failed}");
+    // The reference shown in the browser finds the failure's log line.
+    let reference = failed["reference"].as_str().unwrap();
+    let log = String::from_utf8(log.lock().unwrap().clone()).unwrap();
+    assert!(
+        log.lines().any(|l| l.contains("Session creation failed")
+            && l.contains(&format!("reference={reference}"))),
+        "{log}"
+    );
+    // A re-run would now succeed, so a matching 400, stage and reference included,
+    // proves the replay.
     std::fs::create_dir_all(&path).unwrap();
     assert_eq!(post_create(&state, body("k1")).await, (status, failed));
     let (fresh, session) = post_create(&state, body("k2")).await;
@@ -8521,6 +8670,8 @@ async fn a_full_failure_map_replays_its_oldest_key_and_refuses_new_ones() {
 
     let (status, failed) = post_create(&state, body("oldest")).await;
     assert_eq!(status, axum::http::StatusCode::BAD_REQUEST, "{failed}");
+    assert_eq!(failed["error"], "hook_failed", "{failed}");
+    assert_eq!(failed["stage"], "running_hooks", "{failed}");
     assert_eq!(hook_runs(), 1);
 
     // More live failures than the map holds.
@@ -8531,6 +8682,8 @@ async fn a_full_failure_map_replays_its_oldest_key_and_refuses_new_ones() {
                 status: axum::http::StatusCode::BAD_REQUEST,
                 code: "create_failed",
                 message: "filler".to_string(),
+                stage: crate::server::create_progress::CreateStage::Preparing,
+                reference: format!("filler-{n}"),
             },
         );
     }
