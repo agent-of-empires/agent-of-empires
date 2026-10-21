@@ -120,7 +120,7 @@ impl Instance {
                 sandbox.container_id = Some(container.id()?);
             }
         }
-        self.backfill_container_workdir(container);
+        self.reconcile_container_workdir(container);
         container_config::ensure_folder_trust_config_for_active_agent(
             &self.tool,
             Some(command),
@@ -439,26 +439,20 @@ impl Instance {
         }
     }
 
-    /// Backfill [`SandboxInfo::container_workdir`] from a live container for a
-    /// session created before that field existed (or one whose value was
-    /// cleared). Authoritative: the value is the container's own
-    /// `Config.WorkingDir`, so a later host-side git-linkage break can't make
-    /// [`Self::container_workdir`] drift from the path the container was built
-    /// with (#2414). No-op once the value is set, when the session is not
-    /// sandboxed, or when the runtime can't report it (the live fallback
-    /// stands). Not persisted here; the next start re-backfills if needed.
-    fn backfill_container_workdir(&mut self, container: &containers::DockerContainer) {
-        let needs_backfill = self
-            .sandbox_info
-            .as_ref()
-            .is_some_and(|s| s.container_workdir.is_none());
-        if !needs_backfill {
-            return;
-        }
-        if let Some(workdir) = container.working_dir() {
-            if let Some(sandbox) = self.sandbox_info.as_mut() {
-                sandbox.container_workdir = Some(workdir);
-            }
+    /// Pin [`SandboxInfo::container_workdir`] to a live container's own
+    /// `Config.WorkingDir`, which is what its mounts were built for. Covers a
+    /// session that predates the field and one whose pin names a path the
+    /// container never mounted (#4806), and keeps a later host-side
+    /// git-linkage break from drifting [`Self::container_workdir`] (#2414).
+    /// A runtime that can't report it leaves the pin. Not persisted here;
+    /// the next start reconciles again.
+    fn reconcile_container_workdir(&mut self, container: &containers::DockerContainer) {
+        self.adopt_container_workdir(container.working_dir());
+    }
+
+    fn adopt_container_workdir(&mut self, live: Option<String>) {
+        if let (Some(workdir), Some(sandbox)) = (live, self.sandbox_info.as_mut()) {
+            sandbox.container_workdir = Some(workdir);
         }
     }
 
@@ -756,6 +750,33 @@ mod tests {
         let pinned = "/workspace/myrepo-worktrees/contexec".to_string();
         inst.sandbox_info.as_mut().unwrap().container_workdir = Some(pinned.clone());
         assert_eq!(inst.container_workdir(), pinned);
+    }
+
+    /// Regression for #4806: a pin naming a path the pre-1.20 container never
+    /// mounted must yield to the container's own working directory.
+    #[test]
+    fn container_workdir_pin_yields_to_live_container() {
+        let mut inst = Instance::new("groceries", "/nowhere/groceries");
+        inst.sandbox_info = Some(SandboxInfo {
+            provider: None,
+            enabled: true,
+            container_id: None,
+            image: "img".to_string(),
+            container_name: "aoe-sandbox-test".to_string(),
+            extra_env: None,
+            custom_instruction: None,
+            before_start_env: Vec::new(),
+            container_workdir: Some("/workspace/Thymeline-worktrees/groceries".to_string()),
+        });
+
+        inst.adopt_container_workdir(None);
+        assert_eq!(
+            inst.container_workdir(),
+            "/workspace/Thymeline-worktrees/groceries"
+        );
+
+        inst.adopt_container_workdir(Some("/workspace/groceries".to_string()));
+        assert_eq!(inst.container_workdir(), "/workspace/groceries");
     }
 
     #[test]
