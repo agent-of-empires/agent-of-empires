@@ -176,6 +176,7 @@ Capabilities gate plugin resource access and host interactions. They are prompte
 | `session.message` | Pushing a text message into **any** session, including ones the plugin did not create, via `sessions.message.send`. A structured session shows the message as sent by the plugin, and the call reaches sessions the plugin did not create, so it is a separate grant, never implied by `session.prompt` (`api_version >= 15`). |
 | `session.integration` | Provider-native status and user-requested replies for an agent (`api_version >= 19`). Launch-only agent metadata does not require this capability. |
 | `mcp.rewrite` | Serving the `mcp.rewrite` hook. The worker receives each session's resolved MCP server definitions **including secret env and header values**, and returns the set AoE forwards to the agent (`api_version >= 23`). A distinct, high-severity grant, never implied by another. See [Hooks](#hooks). |
+| `mcp.serve` | Serving MCP servers from the plugin's worker (`api_version >= 23`, requires a `[runtime]` worker). Gives the plugin an authenticated per-session MCP endpoint, so it can answer tool calls an agent makes in that session; the worker never sees the credentials. A distinct, high-severity grant, never implied by another. |
 
 A capability this host version does not recognize is rejected, not granted.
 
