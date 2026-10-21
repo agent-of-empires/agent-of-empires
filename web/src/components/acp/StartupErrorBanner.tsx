@@ -130,7 +130,13 @@ export function StartupErrorBanner({
   const [infoRequest, setInfoRequest] = useState(0);
   const [detailsOpen, setDetailsOpen] = useState(false);
   const { state: retryState, detail: retryDetail, respawn } = useRespawnSession(sessionId);
-  const install = useAdapterInstall(sessionId, respawn);
+  // A failed respawn opens Details, where its failure line is, whichever button started it.
+  const respawnOrShow = async () => {
+    const ok = await respawn();
+    if (!ok) setDetailsOpen(true);
+    return ok;
+  };
+  const install = useAdapterInstall(sessionId, respawnOrShow);
 
   useEffect(() => {
     let alive = true;
@@ -150,7 +156,7 @@ export function StartupErrorBanner({
   const retry = async () => {
     // A setting changed in the TUI shows up on the next attempt.
     setInfoRequest((n) => n + 1);
-    if (!(await respawn())) setDetailsOpen(true);
+    await respawnOrShow();
   };
   const retryAction: RecoveryAction = {
     label: retryState === "retrying" ? "Retrying…" : "Retry",

@@ -255,6 +255,18 @@ describe("StartupErrorBanner install", () => {
     await findByText("npm ERR! EACCES");
   });
 
+  it("opens Details when the respawn after a successful install fails", async () => {
+    stubApi({
+      info: json(claude({ install_allowed: true })),
+      install: json({ success: true, exit_code: 0, stdout: "", stderr: "", recovered_sessions: 0 }),
+      spawn: json("spawn failed: capacity full", 500),
+    });
+    const { findByTestId } = renderBanner();
+    fireEvent.click(await findByTestId("startup-error-banner-install"));
+    const details = await findByTestId("startup-error-banner-details-body");
+    await waitFor(() => expect(details.textContent).toContain("Retry failed: capacity full"));
+  });
+
   it("respawns once the install succeeds", async () => {
     const spy = stubApi({
       info: json(claude({ install_allowed: true })),
