@@ -176,7 +176,7 @@ describe("SessionWizard structured view payload", () => {
     [true, "terminal"],
   ])("opting out=%s sends view %s", async (optOut, view) => {
     renderWizard();
-    if (optOut) fireEvent.click(screen.getByRole("switch", { name: "Use structured view" }));
+    if (optOut) fireEvent.click(screen.getByRole("radio", { name: "Terminal view" }));
     await launch();
     await waitFor(() => expect(createSession).toHaveBeenCalled());
     expect(payload()).toMatchObject({ tool: "claude", view });
@@ -378,10 +378,10 @@ describe("SessionWizard rows", () => {
     await screen.findByText(message + ". Turn it off to launch.");
     expect(createSession).not.toHaveBeenCalled();
   });
-  const viewSwitch = () => screen.getByRole("switch", { name: "Use structured view" }) as HTMLButtonElement;
+  const viewSwitch = () => screen.getByRole("radio", { name: "Structured view" }) as HTMLButtonElement;
 
   it.each([
-    ["claude", undefined, false, /plan, tool calls and diffs/],
+    ["claude", undefined, false, /plan, tool calls and diffs as cards/],
     ["aider", [agent("aider", { acp_capable: false })], true, /no ACP adapter/],
     ["helper", [agent("helper", { kind: "custom", acp_capable: false })], true, /needs agent_acp_cmd/],
     ["claude", [agent("claude", { acp_allowed: false })], true, /not on the allowed agents list/],
@@ -389,7 +389,12 @@ describe("SessionWizard rows", () => {
     if (agents) vi.mocked(fetchAgents).mockResolvedValueOnce(agents);
     renderWizard({ path: "/tmp/proj", tool });
     await waitFor(() => expect(viewSwitch().disabled).toBe(disabled));
-    expect(viewSwitch().closest("div")!.textContent).toMatch(summary);
+    expect(screen.getByTestId("wizard-view-row").textContent).toMatch(summary);
+    // A reason cut off at md stays readable on hover.
+    expect(screen.getByTestId("wizard-view-row").querySelector("[title]")?.getAttribute("title")).toMatch(summary);
+    // Terminal view is what an agent without Structured view gets.
+    const terminal = screen.getByRole("radio", { name: "Terminal view" });
+    expect(terminal.getAttribute("aria-checked")).toBe(String(disabled));
   });
 
   it.each([
@@ -452,8 +457,8 @@ describe("SessionWizard rows", () => {
         .mockResolvedValueOnce(terminal)
         .mockReturnValueOnce(new Promise((r) => (release = r)));
       renderWizard();
-      const view = () => screen.getByRole("switch", { name: "Use structured view" });
-      await screen.findByRole("switch", { name: "Use structured view" });
+      const view = () => screen.getByRole("radio", { name: "Structured view" });
+      await screen.findByRole("radio", { name: "Structured view" });
       await waitFor(() => expect(view().getAttribute("aria-checked")).toBe("false"));
       fireEvent.click(screen.getByText("Profile"));
       fireEvent.click(screen.getByRole("radio", { name: /work/ }));
@@ -475,7 +480,7 @@ describe("SessionWizard rows", () => {
           .mockResolvedValueOnce({} as never)
           .mockResolvedValueOnce({ acp: { default_new_session_view: "terminal" } } as never);
         renderWizard();
-        fireEvent.click(await screen.findByRole("switch", { name: "Use structured view" }));
+        fireEvent.click(await screen.findByRole("radio", { name: "Terminal view" }));
         fireEvent.click(screen.getByText("Profile"));
         fireEvent.click(screen.getByRole("radio", { name: /work/ }));
         await launch();
@@ -910,15 +915,15 @@ describe("SessionWizard served-profile authority", () => {
           );
         }
         render(<Harness />);
-        const view = () => screen.getByRole("switch", { name: "Use structured view" });
-        await waitFor(() => expect(view().getAttribute("aria-checked")).toBe("false"));
-        fireEvent.click(view());
+        const structured = () => screen.getByRole("radio", { name: "Structured view" });
+        await waitFor(() => expect(structured().getAttribute("aria-checked")).toBe("false"));
+        fireEvent.click(structured());
         open("Profile");
         fireEvent.click(screen.getByRole("radio", { name: /Server default/ }));
         await waitFor(() => expect(fetchSettings).toHaveBeenCalledWith("Alpha"));
         if (editWhilePending) {
-          fireEvent.click(view());
-          fireEvent.click(view());
+          fireEvent.click(screen.getByRole("radio", { name: "Terminal view" }));
+          fireEvent.click(structured());
         }
         await act(async () => pending.resolve(settings("Alpha")));
         await launch();
@@ -1037,5 +1042,51 @@ describe("SessionWizard Group field", () => {
     await launch();
     await waitFor(() => expect(createSession).toHaveBeenCalledTimes(1));
     expect(payload()).toMatchObject({ group: "client/new" });
+  });
+});
+
+describe("SessionWizard View row", () => {
+  const radio = (name: string) => screen.getByRole("radio", { name }) as HTMLButtonElement;
+  const selected = () => (radio("Structured view").getAttribute("aria-checked") === "true" ? "structured" : "terminal");
+  const pickAgent = (name: string) => {
+    fireEvent.click(screen.getByTestId("wizard-agent-row"));
+    fireEvent.click(screen.getByRole("button", { name: new RegExp(`^${name}`) }));
+    fireEvent.click(screen.getByRole("button", { name: "Done" }));
+  };
+  const AGENTS = [agent("claude"), agent("aider", { acp_capable: false })];
+
+  it.each([
+    ["Structured view", "structured"],
+    ["Terminal view", "terminal"],
+  ])("gives %s back after an agent that can't run Structured view", async (choice, expected) => {
+    vi.mocked(fetchAgents).mockResolvedValue(AGENTS);
+    renderWizard();
+    await waitFor(() => expect(radio("Structured view").disabled).toBe(false));
+    fireEvent.click(radio(choice));
+    pickAgent("aider");
+    await waitFor(() => expect(radio("Structured view").disabled).toBe(true));
+    expect(selected()).toBe("terminal");
+    pickAgent("claude");
+    await waitFor(() => expect(radio("Structured view").disabled).toBe(false));
+    expect(selected()).toBe(expected);
+  });
+
+  it("arrow keys move the selection and skip a disabled option", async () => {
+    vi.mocked(fetchAgents).mockResolvedValue(AGENTS);
+    renderWizard();
+    await waitFor(() => expect(selected()).toBe("structured"));
+    expect(radio("Structured view").tabIndex).toBe(0);
+    expect(radio("Terminal view").tabIndex).toBe(-1);
+    radio("Structured view").focus();
+    fireEvent.keyDown(radio("Structured view"), { key: "ArrowRight" });
+    expect(selected()).toBe("terminal");
+    expect(document.activeElement).toBe(radio("Terminal view"));
+    fireEvent.keyDown(radio("Terminal view"), { key: "ArrowLeft" });
+    expect(selected()).toBe("structured");
+
+    pickAgent("aider");
+    await waitFor(() => expect(radio("Structured view").disabled).toBe(true));
+    fireEvent.keyDown(radio("Terminal view"), { key: "ArrowLeft" });
+    expect(selected()).toBe("terminal");
   });
 });
