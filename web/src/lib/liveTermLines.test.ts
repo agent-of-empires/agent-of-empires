@@ -225,6 +225,12 @@ describe("linkifyLine", () => {
     ]);
   });
 
+  it("does not overwrite a non-http OSC 8 target with a URL in its label", () => {
+    const mail = { text: "see https://label.example", style: {}, url: "mailto:a@b.example" };
+    const line = [seg("x"), mail, seg("y")];
+    expect(linkifyLine(line)).toEqual(line);
+  });
+
   it("returns the line unchanged when it has no URL", () => {
     const line = [seg("plain", "red"), seg(" text")];
     expect(linkifyLine(line)).toBe(line);

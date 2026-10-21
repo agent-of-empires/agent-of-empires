@@ -108,7 +108,7 @@ export function splitUrls(text: string): UrlPart[] {
   return parts;
 }
 
-/** Annotate `url` on the pieces of each URL in a logical line, before wrapLine, so a color change or a wrap mid-URL keeps the full href. OSC 8 segments are opaque and break the scan. */
+/** Annotate `url` on the pieces of each URL in a logical line, before wrapLine, so a color change or a wrap mid-URL keeps the full href. Any segment with a `url` (OSC 8) is opaque and breaks the scan. */
 export function linkifyLine(line: AnsiSegment[]): AnsiSegment[] {
   const out: AnsiSegment[] = [];
   let changed = false;
@@ -145,7 +145,7 @@ export function linkifyLine(line: AnsiSegment[]): AnsiSegment[] {
     group = [];
   };
   for (const seg of line) {
-    if (seg.url && isHttpUrl(seg.url)) {
+    if (seg.url) {
       flush();
       out.push(seg);
     } else {
