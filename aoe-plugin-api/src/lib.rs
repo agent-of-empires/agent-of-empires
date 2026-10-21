@@ -5,6 +5,7 @@ pub mod agent_integration;
 mod capability;
 mod id;
 mod manifest;
+mod mcp;
 pub mod session;
 pub mod suggestions;
 
@@ -21,6 +22,11 @@ pub use manifest::{
 pub use suggestions::{
     CheckStatus, SetChecks, SetSuggestions, SetupCheck, Suggestion, SuggestionDraft, SuggestionFix,
     SuggestionSource, SuggestionsError, SuggestionsSpec,
+};
+
+pub use mcp::{
+    is_valid_mcp_server_name, mcp_prefix, MCP_SERVE_CAPABILITY, MCP_SERVE_DEFAULT_TIMEOUT_MS,
+    MCP_SERVE_MAX_PER_PLUGIN, MCP_SERVE_MAX_TIMEOUT_MS,
 };
 
 pub const API_VERSION: u32 = 25;
