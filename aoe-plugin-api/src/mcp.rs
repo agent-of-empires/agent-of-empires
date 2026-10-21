@@ -1,8 +1,6 @@
 //! MCP server naming rules and limits for plugin-served servers.
 
 pub const MCP_SERVE_CAPABILITY: &str = "mcp.serve";
-pub const MCP_SERVE_DEFAULT_TIMEOUT_MS: u64 = 30_000;
-pub const MCP_SERVE_MAX_TIMEOUT_MS: u64 = 600_000;
 pub const MCP_SERVE_MAX_PER_PLUGIN: usize = 64;
 
 const MAX_NAME_LEN: usize = 128;

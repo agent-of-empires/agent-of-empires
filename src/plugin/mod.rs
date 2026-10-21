@@ -24,6 +24,7 @@ pub mod protocol;
 pub mod sandbox;
 pub mod session_api;
 pub mod ui_state;
+pub mod worker_call;
 pub(crate) mod worker_requests;
 
 pub mod launch;
@@ -193,6 +194,55 @@ pub(crate) fn write_fake_node(dir: &std::path::Path, name: &str) -> std::path::P
     .unwrap();
     std::fs::set_permissions(&node, std::fs::Permissions::from_mode(0o755)).unwrap();
     node
+}
+
+/// Installs a granted, enabled command-worker plugin into the current app dir. `command` is a
+/// TOML array literal.
+#[cfg(test)]
+pub(crate) fn install_test_plugin(
+    plugin_id: &str,
+    api_version: u32,
+    capabilities: &[&str],
+    command: &str,
+) {
+    use crate::session::{update_config, CapabilityGrant, PluginConfig};
+
+    let caps = capabilities
+        .iter()
+        .map(|c| format!("{c:?}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let manifest = format!(
+        r#"
+id = "{plugin_id}"
+name = "Test"
+version = "1.0.0"
+api_version = {api_version}
+capabilities = [{caps}]
+
+[runtime]
+kind = "command"
+system = true
+command = {command}
+"#
+    );
+    let dir = plugins_dir().unwrap().join(plugin_id);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("aoe-plugin.toml"), &manifest).unwrap();
+    update_config(|config| {
+        config.plugins.insert(
+            plugin_id.to_string(),
+            PluginConfig {
+                grant: Some(CapabilityGrant {
+                    manifest_hash: aoe_plugin_api::PluginManifest::hash_bytes(manifest.as_bytes()),
+                    capabilities: capabilities.iter().map(|c| c.to_string()).collect(),
+                    granted_at: chrono::Utc::now(),
+                }),
+                ..PluginConfig::default()
+            },
+        );
+    })
+    .unwrap();
 }
 
 #[cfg(test)]
