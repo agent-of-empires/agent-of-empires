@@ -75,4 +75,12 @@ describe("useSessionStatusStream", () => {
     expect(FakeSocket.all).toHaveLength(2);
     expect(FakeSocket.all[1]!.close).toHaveBeenCalled();
   });
+
+  it("drops a message that was already queued when it unmounted", () => {
+    const { handlers, unmount } = mount();
+    const ws = FakeSocket.all[0]!;
+    unmount();
+    act(() => ws.push({ kind: "status", id: "a", status: "Waiting" }));
+    expect(handlers.onStatus).not.toHaveBeenCalled();
+  });
 });

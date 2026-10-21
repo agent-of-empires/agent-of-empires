@@ -28,6 +28,7 @@ export function useSessionStatusStream(handlers: SessionStatusStreamHandlers): v
       const protocol = window.location.protocol === "https:" ? "wss" : "ws";
       ws = new WebSocket(`${protocol}://${window.location.host}/api/sessions/status/ws`, acpSocketProtocols());
       ws.onmessage = (e) => {
+        if (stopped) return;
         let frame: { kind?: string; id?: string; status?: string; event?: string };
         try {
           frame = JSON.parse(String(e.data));
