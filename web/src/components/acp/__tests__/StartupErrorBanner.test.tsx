@@ -14,6 +14,7 @@ const NATIVE_BINARY_MSG =
   'agent spawn failed: ACP connection failed: Internal error: { "details": "Claude Code native binary at /usr/lib/node_modules/.../claude exists but failed to launch." }';
 const SPAWN_MSG =
   'Failed to start structured view agent "claude": acp client error: agent spawn failed: runner closed before Hello';
+const SPAWN_PREFIX = 'Failed to start structured view agent "claude": acp client error: agent spawn failed: ';
 const CLAUDE_NPM = "npm install -g @agentclientprotocol/claude-agent-acp@latest";
 
 const claude = (over: Partial<AgentInstallInfo> = {}): AgentInstallInfo => ({
@@ -161,6 +162,26 @@ describe("StartupErrorBanner layout", () => {
       command: null,
       texts: ["Architecture mismatch", "dynamic loader", "bind-mounted into a container"],
       absent: ["aoe acp doctor --fix", "connects AoE to"],
+      actions: ["Retry", "Use Terminal view"],
+    },
+    {
+      label: "a stale bundled copy names the doctor fix, not npm",
+      info: claude({ install_allowed: true }),
+      message: `${SPAWN_PREFIX}aoe's bundled ACP adapter \`claude-agent-acp\` predates this aoe build, so it is refused until it is reinstalled. Reinstall it with: aoe acp doctor --fix --adapter claude-agent-acp`,
+      headline: "Claude couldn't start in Structured view",
+      command: null,
+      texts: ["older than this aoe build", "aoe acp doctor --fix --adapter claude-agent-acp"],
+      absent: ["connects AoE to", "isn't installed"],
+      actions: ["Retry", "Use Terminal view"],
+    },
+    {
+      label: "a Node too old for the adapter says to upgrade Node",
+      info: claude({ install_allowed: true }),
+      message: `${SPAWN_PREFIX}\`claude-agent-acp\` needs Node 22.6 or newer to run its sources; found v22.1.0. Upgrade Node, or point AOE_ACP_NODE at a newer one, then retry`,
+      headline: "Claude couldn't start in Structured view",
+      command: null,
+      texts: ["needs Node 22.6 or newer, and the Daemon found v22.1.0", "AOE_ACP_NODE", "won't help"],
+      absent: ["connects AoE to", "isn't installed"],
       actions: ["Retry", "Use Terminal view"],
     },
     {

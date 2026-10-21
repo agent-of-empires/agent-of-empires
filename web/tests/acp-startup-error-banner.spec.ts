@@ -1,4 +1,4 @@
-// #4577: the Structured view startup error banner's actions, keyboard order and phone layout.
+// The Structured view startup error banner's actions, keyboard order and phone layout.
 
 import type { Page } from "@playwright/test";
 

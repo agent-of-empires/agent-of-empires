@@ -31,6 +31,26 @@ function specificRemediation(message: string): React.ReactNode {
       </>
     );
   }
+  // The Daemon refuses a stale bundled copy or one its Node can't run; npm can't fix either.
+  const stale = /bundled ACP adapter `([^`]+)` predates this aoe build/.exec(message);
+  if (stale) {
+    return (
+      <>
+        aoe's bundled copy of the ACP adapter is older than this aoe build, so the Daemon won't run it. Run{" "}
+        <Code>aoe acp doctor --fix --adapter {stale[1]}</Code> where the Daemon runs, then click <strong>Retry</strong>.
+      </>
+    );
+  }
+  const oldNode = /needs Node (\S+) or newer to run its sources; found (.+?)\. Upgrade/.exec(message);
+  if (oldNode) {
+    return (
+      <>
+        The ACP adapter needs Node {oldNode[1]} or newer, and the Daemon found <Code>{oldNode[2]}</Code>. Upgrade Node,
+        or point <Code>AOE_ACP_NODE</Code> at a newer one, then click <strong>Retry</strong>. Reinstalling the adapter
+        won't help.
+      </>
+    );
+  }
   // Matches the Display of `AcpError::ProjectPathMissing`.
   const missing = /project path no longer exists:\s*(\S.*)$/im.exec(message);
   if (missing) {
@@ -92,7 +112,7 @@ function specificRemediation(message: string): React.ReactNode {
 
 /** The Agent named in a spawn failure ("Failed to start structured view agent \"x\""). */
 const AGENT_IN_MESSAGE = /structured view agent "([^"]+)"/;
-/** The Daemon's missing-adapter error (#4654), which names its cause. */
+/** The Daemon's missing-adapter error, which names its cause. */
 const ADAPTER_NOT_FOUND = /binary `[^`]+` not found/;
 
 export function StartupErrorBanner({
