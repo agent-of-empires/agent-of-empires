@@ -724,6 +724,8 @@ fn the_profile_row_cycles_and_rides_along_on_submit() {
 
     let mut dialog = with_profiles(&["default", "work"]);
     dialog.handle_key(key(KeyCode::Right));
+    // Structured is preselected by default, and its adapter check is not under test.
+    dialog.structured_enabled = false;
     assert_eq!(
         submitted(dialog.handle_key(key(KeyCode::Enter))).profile,
         "work"
@@ -1585,6 +1587,8 @@ fn test_unreadable_registry_keeps_a_held_resolution_for_the_same_path() {
     assert!(dialog.sandbox_enabled, "the project's override resolved");
 
     fs::write(&registry, "{ not json").expect("break registry");
+    // Structured is preselected by default, and its adapter check is not under test.
+    dialog.structured_enabled = false;
     let data = submitted(dialog.handle_key(key(KeyCode::Enter)));
     assert!(
         data.sandbox,
@@ -1622,6 +1626,8 @@ fn test_scratch_round_trip_does_not_count_an_unreadable_registry_as_resolved() {
     );
 
     fs::write(&registry, valid).expect("repair registry");
+    // Structured is preselected by default, and its adapter check is not under test.
+    dialog.structured_enabled = false;
     let data = submitted(dialog.handle_key(key(KeyCode::Enter)));
     assert!(
         data.sandbox,
@@ -1653,6 +1659,8 @@ fn test_unreadable_registry_blocks_submission_until_the_path_resolves() {
 
     // A missing registry file is genuinely empty, and a repaired one resolves the override.
     fs::write(&registry, valid).expect("repair registry");
+    // Structured is preselected by default, and its adapter check is not under test.
+    dialog.structured_enabled = false;
     let data = submitted(dialog.handle_key(key(KeyCode::Enter)));
     assert!(
         data.sandbox,
