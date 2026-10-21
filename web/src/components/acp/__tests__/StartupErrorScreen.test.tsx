@@ -77,6 +77,20 @@ const buttons = (root: HTMLElement) =>
     .map((b) => b.textContent)
     .filter((t) => t !== "Details" && t !== "Copy");
 
+const stepTitles = (getByTestId: (id: string) => HTMLElement) =>
+  [1, 2].map((n) => getByTestId(`startup-error-step-${n}`).querySelector("div > div")?.textContent ?? "");
+
+/** A step names only buttons that render. */
+function expectStepsNameRenderedButtons(screen: HTMLElement, titles: string[]) {
+  for (const title of titles) {
+    const named = /^Click (.+)$/.exec(title)?.[1];
+    if (named) expect(buttons(screen), title).toContain(named);
+  }
+  for (const m of (screen.textContent ?? "").matchAll(/then (Check again|Update[^.:]*)/g)) {
+    expect(buttons(screen), m[0]).toContain(m[1]);
+  }
+}
+
 beforeEach(() => {
   fetchAgentInstallInfo.mockReset();
   installAcpAgent.mockReset();
@@ -169,6 +183,7 @@ describe("StartupErrorScreen", () => {
     /** The primary button is disabled and described by step 1. */
     locked?: boolean;
     command: string | null;
+    text?: string;
   }>([
     {
       label: "host, installs off",
@@ -238,6 +253,7 @@ describe("StartupErrorScreen", () => {
       steps: ["Run this where the Daemon runs", "Restart the agent from the TUI"],
       buttons: [],
       command: CLAUDE_NPM,
+      text: "This dashboard is read-only",
     },
     {
       label: "CityHall, Sandbox",
@@ -247,6 +263,7 @@ describe("StartupErrorScreen", () => {
       steps: ["Run this where the Daemon runs", "Restart the agent from the TUI"],
       buttons: [],
       command: IN_CONTAINER,
+      text: "A CityHall dashboard can't restart the agent.",
     },
     {
       label: "unsupported protocol",
@@ -261,13 +278,9 @@ describe("StartupErrorScreen", () => {
     const { getByTestId, queryByTestId, getByText } = await renderScreen(c.detail, c.answer);
     const screen = getByTestId("startup-error-screen");
     getByText(c.eyebrow);
-    const titles = [1, 2].map((n) => getByTestId(`startup-error-step-${n}`).querySelector("div > div")?.textContent);
+    const titles = stepTitles(getByTestId);
     expect(titles).toEqual(c.steps);
-    // A step names only buttons that render.
-    for (const title of titles) {
-      const named = /^Click (.+)$/.exec(title ?? "")?.[1];
-      if (named) expect(buttons(screen), title!).toContain(named);
-    }
+    expectStepsNameRenderedButtons(screen, titles);
     expect(buttons(screen)).toEqual(c.buttons);
     if (c.stepOneDone !== undefined) {
       expect(getByTestId("startup-error-step-1").hasAttribute("data-done")).toBe(c.stepOneDone);
@@ -286,6 +299,7 @@ describe("StartupErrorScreen", () => {
         'Turn on TUI › Settings › Global › Acp › Advanced › "Allow agent install from web". The install runs npm install as the Daemon\'s user.',
       );
     }
+    if (c.text) expect(screen.textContent).toContain(c.text);
     for (const banned of ["Docker", "terminal app", "helper", "paused", "from the browser"]) {
       expect(screen.textContent).not.toContain(banned);
     }
@@ -352,20 +366,27 @@ describe("StartupErrorScreen", () => {
     expect(fetch).not.toHaveBeenCalled();
   });
 
-  it("container not running: says so and offers to start it", async () => {
+  it("container not running: its own steps, then Update returns once the container runs", async () => {
     installAcpAgent.mockRejectedValue(new InstallAgentError("container is not running", "container_not_running"));
-    const { getByTestId, findByTestId, queryByTestId } = await renderScreen(
-      incompatible(),
-      info({ ...sandbox, ...allowed }),
-    );
+    const view = await renderScreen(incompatible(), info({ ...sandbox, ...allowed }));
+    const { getByTestId, findByTestId, queryByTestId } = view;
     fireEvent.click(getByTestId("startup-error-update-restart"));
     expect((await findByTestId("startup-error-container-down")).textContent).toContain(
       "This Session's container isn't running",
     );
-    expect(buttons(getByTestId("startup-error-screen"))).toEqual(["Start the container"]);
+    const screen = getByTestId("startup-error-screen");
+    expect(buttons(screen)).toEqual(["Start the container"]);
+    expect(stepTitles(getByTestId)).toEqual(["Click Start the container", "Then update the adapter"]);
+    expectStepsNameRenderedButtons(screen, stepTitles(getByTestId));
     expect(queryByTestId("adapter-install-error")).toBeNull();
+
     fireEvent.click(getByTestId("startup-error-start-container"));
     spawnCall();
+    // The started container runs the adapter, which fails the version check again.
+    view.rerender(<StartupErrorScreen detail={incompatible()} sessionId="s1" />);
+    await waitFor(() => expect(buttons(screen)).toEqual(["Update in Sandbox & restart", "Check again"]));
+    expect(queryByTestId("startup-error-container-down")).toBeNull();
+    expect(queryByTestId("startup-error-fails-again")).toBeNull();
   });
 
   it("fails again: a version failure after the install says it changed nothing", async () => {

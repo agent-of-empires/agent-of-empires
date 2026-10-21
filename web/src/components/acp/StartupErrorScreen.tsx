@@ -62,6 +62,8 @@ export function StartupErrorScreen({ detail, sessionId, isSandboxed = false }: P
     return respawn();
   });
   const failsAgain = installedFor !== null && installedFor !== detail;
+  // Cleared by the next detail, which arrives once the started container runs the adapter again.
+  const [containerDownFor, setContainerDownFor] = useState<IncompatibleAgentDetail | null>(null);
 
   const hostCommand = "install_command" in detail ? detail.install_command : null;
   const manualCommand = sandboxed ? (info?.container_install_command ?? null) : hostCommand;
@@ -71,7 +73,7 @@ export function StartupErrorScreen({ detail, sessionId, isSandboxed = false }: P
   const observer = info?.install_blocked === "read_only" || info?.install_blocked === "cityhall";
   const webInstall = !observer && "auto_install" in detail && detail.auto_install;
   const allowed = info?.install_allowed === true;
-  const containerDown = install.errorCode === "container_not_running";
+  const containerDown = containerDownFor === detail && install.errorCode === "container_not_running";
   const busy = respawnState === "retrying" || install.state === "installing";
 
   const updateLabel = sandboxed ? "Update in Sandbox & restart" : "Update & restart";
@@ -83,7 +85,10 @@ export function StartupErrorScreen({ detail, sessionId, isSandboxed = false }: P
   };
   const update: RecoveryAction = {
     label: install.state === "installing" ? "Updating…" : updateLabel,
-    onClick: () => void install.install(),
+    onClick: () =>
+      void install.install().then((code) => {
+        if (code === "container_not_running") setContainerDownFor(detail);
+      }),
     testId: "startup-error-update-restart",
     disabled: busy || !allowed,
     describedBy: allowed ? undefined : stepOneId,
@@ -135,6 +140,13 @@ export function StartupErrorScreen({ detail, sessionId, isSandboxed = false }: P
               </Step>
               {!observer && <Step n={2} title="Click Check again" />}
             </>
+          ) : containerDown ? (
+            <>
+              <Step n={1} title="Click Start the container" />
+              <Step n={2} title="Then update the adapter">
+                The update comes back here once the container is running.
+              </Step>
+            </>
           ) : webInstall ? (
             <>
               <Step n={1} id={stepOneId} done={allowed} title="Allow installs from the Web dashboard">
@@ -170,7 +182,10 @@ export function StartupErrorScreen({ detail, sessionId, isSandboxed = false }: P
                 )}
               </Step>
               <Step n={2} title={observer ? "Restart the agent from the TUI" : "Click Check again"}>
-                {observer && "This dashboard is read-only, so it can't restart the agent."}
+                {observer &&
+                  (info?.install_blocked === "cityhall"
+                    ? "A CityHall dashboard can't restart the agent."
+                    : "This dashboard is read-only, so it can't restart the agent.")}
               </Step>
             </>
           )}
