@@ -767,9 +767,17 @@ impl<S: BroadcastSink> Drain<S> {
     /// Route an archived or trashed row through the stop path, so the cancellation retires the
     /// replacement and the runner it replaces.
     async fn refuse_if_dismissed(&self, config: &SpawnConfig) {
-        let admitted = admit_stored_row(config.source_profile.as_deref(), &self.session_id).await;
-        if let Err(SupervisorError::Blocked(blocked)) = admitted {
-            lock_recover(&self.lifecycle).begin_stop(&self.session_id, blocked.code());
+        match admit_stored_row(config.source_profile.as_deref(), &self.session_id).await {
+            Ok(()) => {}
+            Err(SupervisorError::Blocked(blocked)) => {
+                lock_recover(&self.lifecycle).begin_stop(&self.session_id, blocked.code());
+            }
+            Err(error) => warn!(
+                target: "acp.supervisor",
+                session = %self.session_id,
+                error = %error,
+                "durable admission check failed on respawn; continuing without it"
+            ),
         }
     }
 
