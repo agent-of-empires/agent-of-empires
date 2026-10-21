@@ -21,7 +21,7 @@ use crate::agents::{AgentDef, SessionCaptureBackend};
 use crate::session::capture::is_valid_session_id;
 use crate::session::config::container_config;
 use crate::session::config::profile_config::resolve_config_or_warn;
-use crate::session::{AnchoredDir, ConversationBinding, Instance};
+use crate::session::{AnchoredDir, ConversationBinding, ExecutionBinding, Instance};
 
 /// Claude refuses to open a transcript it cannot fit in memory long before
 /// this, so the cap only exists to keep [`AnchoredDir::open_regular`] bounded.
@@ -338,6 +338,16 @@ fn fork_parent_carry_relocates_a_cross_store_parent() {
     carry_fork_parent(&mut other_agent).unwrap();
     assert_eq!(stores(&other_agent), vec![source.clone()]);
 
+    let mut other_child = fork("claude");
+    other_child.command = "codex".into();
+    carry_fork_parent(&mut other_child)
+        .expect("a child the launch will refuse is left to the launch, not refused here");
+    assert_eq!(stores(&other_child), vec![source.clone()]);
+    assert!(
+        !home.join("destination").exists(),
+        "nothing is written for a child that cannot be attested"
+    );
+
     carry_fork_parent(&mut child).unwrap();
     let destination = home.join("destination");
     assert_eq!(
@@ -646,11 +656,12 @@ impl ConversationCarry {
     }
 
     pub(crate) fn run_for(&self, instance: &mut Instance) -> Result<bool> {
+        let destination = instance.attested_carry_destination()?;
         let mut bindings = [
             instance.agent_session_binding.clone(),
             instance.resume_binding.clone(),
         ];
-        let relocated = relocate_known_bindings(instance, &mut bindings)?;
+        let relocated = relocate_known_bindings(&destination, &mut bindings)?;
         if relocated {
             let [agent, resume] = bindings;
             instance.agent_session_binding = agent;
@@ -677,17 +688,15 @@ impl ConversationCarry {
     }
 }
 
-/// Copy each known binding's transcript into the store `instance` launches on
-/// and repoint the binding at it. Attests the destination's native identity
-/// and store before any filesystem write: a Claude-labeled alias resolving to
-/// a codex or opaque wrapper must not receive a Claude transcript. Resolving
-/// without the source binding keeps the recorded store from masking the
-/// configured destination.
+/// Copy each known binding's transcript into `destination`'s store and repoint
+/// the binding at it. The caller attests `destination` first, so a Claude-labeled
+/// alias resolving to a codex or opaque wrapper never receives a Claude
+/// transcript. Resolving it without the source binding keeps the recorded store
+/// from masking the configured destination.
 fn relocate_known_bindings(
-    instance: &Instance,
+    destination: &ExecutionBinding,
     bindings: &mut [Option<ConversationBinding>],
 ) -> Result<bool> {
-    let destination = instance.attested_carry_destination()?;
     for binding in bindings.iter().flatten() {
         if !binding.is_known() {
             continue;
@@ -700,7 +709,7 @@ fn relocate_known_bindings(
             "conversation carry requires one host-accessible Claude store"
         );
         anyhow::ensure!(
-            Instance::execution_matches_destination(execution, &destination),
+            Instance::execution_matches_destination(execution, destination),
             "incoming execution context differs from the attested destination"
         );
     }
@@ -753,9 +762,9 @@ fn relocate_known_bindings(
 /// Put a terminal fork's parent conversation on the store the child launches
 /// on. The fork resumes the parent's id there, and the child's binding is
 /// recorded from that launch, so a parent bound to another account's store
-/// would leave the child recorded on a store it never wrote to. A parent
-/// whose binding cannot name a Claude store is left to the launch's own
-/// identity checks.
+/// would leave the child recorded on a store it never wrote to. A child whose
+/// launch cannot be attested as a host Claude one carries nothing: the launch
+/// resolves the same execution and refuses it with its own message.
 pub(crate) fn carry_fork_parent(instance: &mut Instance) -> Result<()> {
     let mut binding = [instance.resume_binding.clone()];
     let is_claude_parent = binding[0].as_ref().is_some_and(|binding| {
@@ -765,7 +774,17 @@ pub(crate) fn carry_fork_parent(instance: &mut Instance) -> Result<()> {
                 .as_ref()
                 .is_some_and(|execution| execution.agent == "claude")
     });
-    if is_claude_parent && relocate_known_bindings(instance, &mut binding)? {
+    if !is_claude_parent {
+        return Ok(());
+    }
+    let destination = match instance.attested_carry_destination() {
+        Ok(destination) => destination,
+        Err(error) => {
+            tracing::debug!(target: "session.store", error = %error, "fork child has no attestable Claude destination; leaving the conversation to the launch checks");
+            return Ok(());
+        }
+    };
+    if relocate_known_bindings(&destination, &mut binding)? {
         let [resume] = binding;
         instance.resume_binding = resume;
     }
