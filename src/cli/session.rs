@@ -591,12 +591,14 @@ async fn restore_session(profile: &str, args: SessionIdArgs) -> Result<()> {
     let mut inst = fresh.context("restored session disappeared after claim")?;
     inst.source_profile = storage.profile().to_owned();
 
-    if let crate::session::trash::RestoreOutcome::Failed { reason } =
-        crate::session::trash::restore_worktree_location(&mut inst)
-    {
-        release_restore_reservation(&storage, &restore_id, restore_generation);
-        anyhow::bail!("Cannot restore worktree: {reason}");
-    }
+    let warning = match crate::session::trash::restore_worktree_location(&mut inst) {
+        crate::session::trash::RestoreOutcome::Failed { reason } => {
+            release_restore_reservation(&storage, &restore_id, restore_generation);
+            anyhow::bail!("Cannot restore worktree: {reason}");
+        }
+        crate::session::trash::RestoreOutcome::Restored { warning, .. } => warning,
+        crate::session::trash::RestoreOutcome::NoChange => None,
+    };
     let restored_path = inst.project_path.clone();
     let restored_pre = inst.pre_trash_project_path.clone();
 
@@ -620,6 +622,9 @@ async fn restore_session(profile: &str, args: SessionIdArgs) -> Result<()> {
         }
     }
     println!("Restored: {}", inst.title);
+    if let Some(warning) = warning {
+        eprintln!("Warning: {warning}");
+    }
     Ok(())
 }
 
