@@ -4271,6 +4271,25 @@ fn public_create_session_error_forwards_typed_causes_as_fixed_templates() {
         );
         assert_eq!(got, expected, "{label}");
     }
+
+    // A direct response is capped like a stored one; a long image reference would exceed it.
+    let long = DockerError::ImagePullFailed {
+        runtime: "Docker",
+        image: "x".repeat(2000),
+        detail: String::new(),
+    }
+    .into();
+    let failure = create_failure(
+        &long,
+        crate::server::create_progress::CreateStage::StartingContainer,
+        "ref",
+    )
+    .unwrap();
+    assert_eq!(failure.code, "sandbox_image_pull_failed");
+    assert_eq!(
+        failure.message.chars().count(),
+        crate::server::create_progress::MAX_FAILURE_MESSAGE_CHARS
+    );
 }
 
 #[test]

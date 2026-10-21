@@ -1298,7 +1298,7 @@ pub async fn create_session(
 
 /// The response for a failed create; `None` for a trust refusal, which the
 /// caller resubmits with the same key.
-fn create_failure(
+pub(super) fn create_failure(
     e: &anyhow::Error,
     stage: crate::server::create_progress::CreateStage,
     reference: &str,
