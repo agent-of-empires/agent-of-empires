@@ -64,6 +64,9 @@ impl ToolPickerDialog {
         }
     }
 
+    pub fn is_empty(&self) -> bool {
+        self.items.is_empty()
+    }
     pub fn handle_click(&mut self, col: u16, row: u16) -> DialogResult<String> {
         if !super::contains(self.dialog_area, col, row) {
             return DialogResult::Cancel;

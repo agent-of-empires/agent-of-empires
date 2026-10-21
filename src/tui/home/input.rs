@@ -493,10 +493,10 @@ impl HomeView {
                 crate::session::AuxiliaryTarget::Tool { tool_name } => Some(tool_name.as_str()),
                 _ => None,
             });
-        self.tool_picker_dialog = Some(crate::tui::dialogs::ToolPickerDialog::new(
-            &self.tool_configs,
-            observed,
-        ));
+        let picker = crate::tui::dialogs::ToolPickerDialog::new(&self.tool_configs, observed);
+        if !picker.is_empty() {
+            self.tool_picker_dialog = Some(picker);
+        }
     }
 
     fn activate_tool(&mut self, tool_name: String, toggle_current: bool) -> Option<Action> {

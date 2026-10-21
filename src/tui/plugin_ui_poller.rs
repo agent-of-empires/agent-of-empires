@@ -1,9 +1,9 @@
-//! Background fetch for the daemon-owned plugin UI snapshot and link commands.
+//! Background fetch for the daemon-owned plugin UI snapshot.
 
 use std::sync::mpsc::TryRecvError;
 use std::time::{Duration, Instant};
 
-use crate::acp::client::{HttpClient, PluginCommandView};
+use crate::acp::client::HttpClient;
 use crate::plugin::ui_state::UiSnapshot;
 use crate::tui::worker::Worker;
 
@@ -12,7 +12,6 @@ const REFRESH_INTERVAL: Duration = Duration::from_secs(3);
 #[derive(Default)]
 struct PluginUiUpdate {
     snapshot: UiSnapshot,
-    commands: Vec<PluginCommandView>,
 }
 
 async fn fetch_plugin_ui() -> PluginUiUpdate {
@@ -30,16 +29,12 @@ async fn fetch_plugin_ui() -> PluginUiUpdate {
             return PluginUiUpdate::default();
         }
     };
-    let (snapshot, commands) = tokio::join!(client.plugin_ui_state(), client.plugin_commands());
+    let snapshot = client.plugin_ui_state().await;
     if let Err(error) = &snapshot {
         tracing::debug!(target: "tui.plugin_ui", "plugin UI fetch: {error}");
     }
-    if let Err(error) = &commands {
-        tracing::debug!(target: "tui.plugin_ui", "plugin commands fetch: {error}");
-    }
     PluginUiUpdate {
         snapshot: snapshot.unwrap_or_default(),
-        commands: commands.unwrap_or_default(),
     }
 }
 
@@ -72,7 +67,6 @@ impl PluginUiPoller {
 /// a daemon disconnect produces an empty snapshot rather than stale row badges.
 pub(crate) struct PluginUiState {
     pub(crate) snapshot: UiSnapshot,
-    pub(crate) commands: Vec<PluginCommandView>,
     poller: PluginUiPoller,
     pending: bool,
     last_refresh: Instant,
@@ -92,7 +86,6 @@ impl PluginUiState {
         match self.poller.worker.try_recv() {
             Ok(update) => {
                 self.snapshot = update.snapshot;
-                self.commands = update.commands;
                 self.pending = false;
                 true
             }
@@ -100,7 +93,6 @@ impl PluginUiState {
             Err(TryRecvError::Disconnected) => {
                 tracing::error!(target: "tui.plugin_ui", "plugin UI worker gone; respawning");
                 self.snapshot = UiSnapshot::default();
-                self.commands.clear();
                 self.poller = PluginUiPoller::new();
                 self.pending = false;
                 true
@@ -113,7 +105,6 @@ impl Default for PluginUiState {
     fn default() -> Self {
         Self {
             snapshot: UiSnapshot::default(),
-            commands: Vec::new(),
             poller: PluginUiPoller::new(),
             pending: false,
             last_refresh: Instant::now() - REFRESH_INTERVAL,

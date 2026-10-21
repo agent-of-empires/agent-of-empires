@@ -127,8 +127,8 @@ const send = (method, params) => {
   process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: ++nextId, method, params }) + '\n');
 };
 const resources = {
-  github: { id: 'pr', text: 'Open', tone: 'success', href: 'https://example.com/pr/42' },
-  linear: { id: 'issue', text: 'WIP', tone: 'info', href: 'https://example.com/issues/42' },
+  github: { id: 'pr', text: 'Open', tone: 'success' },
+  linear: { id: 'issue', text: 'WIP', tone: 'info' },
 };
 const resource = resources[process.argv[2]];
 const rl = readline.createInterface({ input: process.stdin });
@@ -141,7 +141,7 @@ rl.on('line', (line) => {
         slot: 'row-badge',
         id: resource.id,
         session_id: session.id,
-        payload: { text: resource.text, tone: resource.tone, href: resource.href },
+        payload: { text: resource.text, tone: resource.tone },
       });
     }
   }
@@ -149,13 +149,11 @@ rl.on('line', (line) => {
 setInterval(() => send('sessions.list', {}), 300);
 "#;
 
-fn row_resource_manifest(
+fn row_status_manifest(
     worker_rel: &str,
     plugin_id: &str,
     name: &str,
     resource_id: &str,
-    command_id: &str,
-    title: &str,
     provider: &str,
 ) -> String {
     format!(
@@ -164,15 +162,7 @@ id = "{plugin_id}"
 name = "{name}"
 version = "0.1.0"
 api_version = 8
-capabilities = ["runtime.worker", "session.read", "browser_open"]
-
-[[commands]]
-id = "{command_id}"
-title = "{title}"
-[commands.action]
-kind = "open-ui-link"
-slot = "row-badge"
-id = "{resource_id}"
+capabilities = ["runtime.worker", "session.read"]
 
 [[ui]]
 slot = "row-badge"
@@ -284,7 +274,7 @@ fn tui_executes_plugin_commands_with_live_daemon() {
 }
 #[test]
 #[parallel]
-fn home_shows_plugin_row_statuses_and_opens_each_link() {
+fn home_shows_plugin_row_statuses_from_enabled_plugins() {
     require_tmux!();
     require_node!();
 
@@ -293,31 +283,21 @@ fn home_shows_plugin_row_statuses_and_opens_each_link() {
         ("github", true, false),
         ("linear", false, true),
     ] {
-        run_plugin_row_resource_scenario(scenario, include_github, include_linear);
+        run_plugin_row_status_scenario(scenario, include_github, include_linear);
     }
 }
 
-fn run_plugin_row_resource_scenario(scenario: &str, include_github: bool, include_linear: bool) {
-    let test_name = format!("plugin_row_resources_{scenario}");
+fn run_plugin_row_status_scenario(scenario: &str, include_github: bool, include_linear: bool) {
+    let test_name = format!("plugin_row_statuses_{scenario}");
     let mut h = TuiTestHarness::new_in_tmp(&test_name);
-    for (enabled, provider, plugin_id, name, resource_id, command_id, title) in [
-        (
-            include_github,
-            "github",
-            "test.github",
-            "GitHub Test",
-            "pr",
-            "open_pr",
-            "Open PR",
-        ),
+    for (enabled, provider, plugin_id, name, resource_id) in [
+        (include_github, "github", "test.github", "GitHub Test", "pr"),
         (
             include_linear,
             "linear",
             "test.linear",
             "Linear Test",
             "issue",
-            "open_issue",
-            "Open issue",
         ),
     ] {
         if !enabled {
@@ -328,15 +308,7 @@ fn run_plugin_row_resource_scenario(scenario: &str, include_github: bool, includ
         std::fs::write(src.join("worker.js"), ROW_RESOURCES_WORKER_JS).unwrap();
         std::fs::write(
             src.join("aoe-plugin.toml"),
-            row_resource_manifest(
-                "worker.js",
-                plugin_id,
-                name,
-                resource_id,
-                command_id,
-                title,
-                provider,
-            ),
+            row_status_manifest("worker.js", plugin_id, name, resource_id, provider),
         )
         .unwrap();
         let installed = h.run_cli(&["plugin", "install", src.to_str().unwrap(), "--yes"]);
@@ -366,7 +338,6 @@ fn run_plugin_row_resource_scenario(scenario: &str, include_github: bool, includ
             .expect("run git");
         assert!(output.status.success(), "git {args:?} failed");
     }
-    let opened = h.home_path().join("opened-urls.txt");
     h.stop_daemon_on_drop();
     let port = pick_free_port();
     let port_s = port.to_string();
@@ -378,19 +349,6 @@ fn run_plugin_row_resource_scenario(scenario: &str, include_github: bool, includ
     );
     assert!(wait_for_port(port, Duration::from_secs(10)));
     h.tmux_new_detached("aoe_test_plugin_env", "sleep 60");
-    // Keep tmux's environment explicit because the server predates this TUI.
-    let env = std::process::Command::new("tmux")
-        .arg("-S")
-        .arg(h.home_path().join("tmux.sock"))
-        .args(["set-environment", "-g", "AOE_OPEN_URL_TO"])
-        .arg(&opened)
-        .output()
-        .expect("set browser URL capture in tmux environment");
-    assert!(
-        env.status.success(),
-        "tmux set-environment failed: {}",
-        String::from_utf8_lossy(&env.stderr)
-    );
     h.spawn_tui_sized(160, 40);
     h.wait_for_ready();
     h.send_keys(">>>>>>");
@@ -428,65 +386,5 @@ fn run_plugin_row_resource_scenario(scenario: &str, include_github: bool, includ
         status_row.contains("WIP"),
         include_linear,
         "Linear row badge presence mismatch for {scenario}: {status_row}"
-    );
-
-    let links = [
-        (include_github, "Open PR", "https://example.com/pr/42"),
-        (
-            include_linear,
-            "Open issue",
-            "https://example.com/issues/42",
-        ),
-    ];
-    h.send_keys("\\;");
-    for (enabled, command, _) in links {
-        if enabled {
-            h.wait_for(command);
-        }
-    }
-    let picker_screen = h.capture_screen();
-    for (enabled, command, _) in links {
-        assert_eq!(
-            picker_screen.contains(command),
-            enabled,
-            "plugin command presence mismatch for {scenario}: {command}. Screen: {picker_screen}"
-        );
-    }
-
-    let mut opened_count = 0;
-    for (enabled, command, url) in links {
-        if !enabled {
-            continue;
-        }
-        if opened_count > 0 {
-            h.send_keys("\\;");
-            for (enabled, command, _) in links {
-                if enabled {
-                    h.wait_for(command);
-                }
-            }
-            for _ in 0..opened_count {
-                h.send_keys("Down");
-            }
-        }
-        h.send_keys("Enter");
-        let deadline = Instant::now() + Duration::from_secs(10);
-        loop {
-            let contents = std::fs::read_to_string(&opened).unwrap_or_default();
-            if contents.contains(url) {
-                break;
-            }
-            assert!(
-                Instant::now() < deadline,
-                "{command} link was not opened for {scenario}: {contents:?}. Screen: {}",
-                h.capture_screen()
-            );
-            std::thread::sleep(Duration::from_millis(100));
-        }
-        opened_count += 1;
-    }
-    assert_eq!(
-        opened_count,
-        usize::from(include_github) + usize::from(include_linear)
     );
 }
