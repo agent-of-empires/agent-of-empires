@@ -44,9 +44,11 @@ export interface WizardData {
   scratch: boolean;
   /** Optimistically true until the wizard's probe says otherwise; false forces `useWorktree` off. */
   pathIsGitRepo: boolean;
-  /** Per-session structured view choice, seeded from `acp.default_new_session_view`; deliberately
+  /** Per-session structured view choice, seeded from `acp.structured_view`; deliberately
    *  not persisted or tracked in `profileDirty`. */
   useStructuredView: boolean;
+  /** False when the profile's `acp.structured_view` is `off`: the toggle is hidden and the view stays off. */
+  structuredViewOffered: boolean;
   /** Set by a direct `useStructuredView` edit so mount-time seeding keeps it. */
   structuredViewDirty: boolean;
   agentModel: string;
@@ -88,6 +90,7 @@ export type Action =
       agentModel?: string;
       agentEffort?: string;
       useStructuredView?: boolean;
+      structuredViewOffered?: boolean;
       /** Mount-time seeding sets this so a late settings response cannot clobber user edits. */
       skipIfDirty?: boolean;
     }
@@ -127,6 +130,7 @@ export const initialData: WizardData = {
   scratch: false,
   pathIsGitRepo: true,
   useStructuredView: true,
+  structuredViewOffered: true,
   structuredViewDirty: false,
   agentModel: "",
   agentEffort: "",
@@ -196,9 +200,11 @@ function setField(data: WizardData, field: string, value: unknown): WizardData {
   return next;
 }
 
-/** An import (structured on disk) and a hand-set view outrank the seeded view. */
-function seededStructuredView(data: WizardData, action: { useStructuredView?: boolean }): boolean {
-  if (data.importAcpSessionId || data.structuredViewDirty) return data.useStructuredView;
+/** An import (structured on disk) outranks everything; `off` outranks a hand-set view. */
+function seededStructuredView(data: WizardData, action: { useStructuredView?: boolean }, offered: boolean): boolean {
+  if (data.importAcpSessionId) return data.useStructuredView;
+  if (!offered) return false;
+  if (data.structuredViewDirty) return data.useStructuredView;
   return action.useStructuredView ?? data.useStructuredView;
 }
 
@@ -256,7 +262,8 @@ export function reducer(state: WizardState, action: Action): WizardState {
         state.data.importAcpSessionId || state.data.scratch || state.data.pathIsGitRepo === false
           ? false
           : (state.data.projectWorktreeOverride ?? action.worktreeEnabled);
-      const useStructuredView = seededStructuredView(state.data, action);
+      const structuredViewOffered = action.structuredViewOffered ?? state.data.structuredViewOffered;
+      const useStructuredView = seededStructuredView(state.data, action, structuredViewOffered);
       const resolvedSandbox = state.data.importAcpSessionId
         ? false
         : (state.data.projectSandboxOverride ?? action.sandboxEnabled);
@@ -268,6 +275,7 @@ export function reducer(state: WizardState, action: Action): WizardState {
           data: {
             ...state.data,
             useStructuredView,
+            structuredViewOffered,
             profileWorktreeDefault: action.worktreeEnabled,
             profileSandboxDefault: action.sandboxEnabled,
             useWorktree: state.data.worktreeDirty ? state.data.useWorktree : resolvedUseWorktree(),
@@ -289,6 +297,7 @@ export function reducer(state: WizardState, action: Action): WizardState {
           agentModel: action.agentModel ?? "",
           agentEffort: action.agentEffort ?? "",
           useStructuredView,
+          structuredViewOffered,
           profileDirty: false,
           worktreeDirty: false,
           sandboxDirty: false,

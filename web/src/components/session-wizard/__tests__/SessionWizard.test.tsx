@@ -183,14 +183,21 @@ describe("SessionWizard structured view payload", () => {
 
   it.each([
     ["terminal", "terminal"],
-    ["auto", "structured"],
     ["structured", "structured"],
+    ["off", "terminal"],
   ])("opens on and sends the configured default view %s (#3517)", async (setting, view) => {
-    vi.mocked(fetchSettings).mockResolvedValueOnce({ acp: { default_new_session_view: setting } } as never);
+    vi.mocked(fetchSettings).mockResolvedValueOnce({ acp: { structured_view: setting } } as never);
     renderWizard();
     await launch();
     await waitFor(() => expect(createSession).toHaveBeenCalled());
     expect(payload()).toMatchObject({ tool: "claude", view });
+  });
+
+  it("hides the structured toggle when structured_view is off", async () => {
+    vi.mocked(fetchSettings).mockResolvedValueOnce({ acp: { structured_view: "off" } } as never);
+    renderWizard();
+    await screen.findByRole("switch", { name: "Auto-approve actions" });
+    await waitFor(() => expect(screen.queryByRole("switch", { name: "Use structured view" })).toBeNull());
   });
 
   it("sends profile-resolved agent model and effort defaults", async () => {
@@ -443,7 +450,7 @@ describe("SessionWizard rows", () => {
     // #4086: a view toggled while the settings response is pending is newer than the response.
     it("keeps a view toggled while the profile response is pending", async () => {
       vi.mocked(fetchProfiles).mockResolvedValue(PROFILES);
-      const terminal = { acp: { default_new_session_view: "terminal" } } as never;
+      const terminal = { acp: { structured_view: "terminal" } } as never;
       let release!: (v: never) => void;
       vi.mocked(fetchSettings)
         .mockResolvedValueOnce(terminal)
@@ -470,7 +477,7 @@ describe("SessionWizard rows", () => {
       try {
         vi.mocked(fetchSettings)
           .mockResolvedValueOnce({} as never)
-          .mockResolvedValueOnce({ acp: { default_new_session_view: "terminal" } } as never);
+          .mockResolvedValueOnce({ acp: { structured_view: "terminal" } } as never);
         renderWizard();
         fireEvent.click(await screen.findByRole("switch", { name: "Use structured view" }));
         fireEvent.click(screen.getByText("Profile"));
