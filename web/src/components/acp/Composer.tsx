@@ -80,6 +80,8 @@ interface Props {
   availableCommands: AcpState["availableCommands"];
   /** WS open and worker healthy. Sends still work when false; they queue until resume. */
   connected: boolean;
+  /** For a Session that has never started: the Agent it waits for. */
+  waitingFor?: string | null;
   /** Mid-turn the textarea stays editable and sends go through the queue. */
   turnActive: boolean;
   /** Queue path used by the custom send buttons and mid-turn Enter, which the primitive blocks. */
@@ -370,7 +372,12 @@ export function Composer(props: Props) {
                     />
                   </>
                 ) : (
-                  <SendButton connected={connected} disabled={!canSend} onSend={submitComposer} />
+                  <SendButton
+                    connected={connected}
+                    waitingFor={props.waitingFor}
+                    disabled={!canSend}
+                    onSend={submitComposer}
+                  />
                 )}
               </div>
             </div>

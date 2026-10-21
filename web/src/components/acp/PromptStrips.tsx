@@ -252,6 +252,8 @@ interface QueuedPromptsStripProps {
   sendNowInterrupts: boolean;
   /** The drain cannot fire yet (disconnected, stopped, restarting, cold-starting). */
   pendingResume: boolean;
+  /** For a Session that has never started: the Agent it waits for. */
+  waitingFor?: string | null;
 }
 
 export function QueuedPromptsStrip({
@@ -263,6 +265,7 @@ export function QueuedPromptsStrip({
   canSendNow,
   sendNowInterrupts,
   pendingResume,
+  waitingFor = null,
 }: QueuedPromptsStripProps) {
   const isMobile = useIsCoarsePointer();
   const [expanded, setExpanded] = useState(false);
@@ -278,7 +281,11 @@ export function QueuedPromptsStrip({
           title="Queued in this browser. Sends when the agent is free, even from another chat, as long as a dashboard tab stays open. Three closed chats deliver in the background at a time; the rest wait for a slot or for you to open them. Your other devices do not see it."
         >
           <Clock className="h-3 w-3" />
-          {pendingResume ? `Pending until session resumes (${queued.length})` : `Queued (${queued.length})`}
+          {pendingResume
+            ? waitingFor
+              ? `Pending until ${waitingFor} is ready (${queued.length})`
+              : `Pending until session resumes (${queued.length})`
+            : `Queued (${queued.length})`}
         </span>
         {queued.length > 1 && (
           <button type="button" onClick={onClear} className="text-text-dim hover:text-text-secondary transition-colors">

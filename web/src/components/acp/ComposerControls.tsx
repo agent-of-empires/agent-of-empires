@@ -363,21 +363,27 @@ function sendButtonClass(disabled: boolean, extra = "") {
 export function SendButton({
   connected = true,
   disabled = false,
+  waitingFor = null,
   onSend,
 }: {
   connected?: boolean;
   disabled?: boolean;
+  /** For a Session that has never started: the Agent it waits for. */
+  waitingFor?: string | null;
   onSend: () => void;
 }) {
+  const queueLabel = waitingFor ? `Queue message until ${waitingFor} is ready` : "Queue message until session resumes";
   const title = disabled
     ? "Type a message to send"
     : connected
       ? "Send, Enter"
-      : "Session not active, will send on resume";
+      : waitingFor
+        ? `Queued until ${waitingFor} is ready`
+        : "Session not active, will send on resume";
   return (
     <button
       type="button"
-      aria-label={connected ? "Send message" : "Queue message until session resumes"}
+      aria-label={connected ? "Send message" : queueLabel}
       title={title}
       onClick={onSend}
       disabled={disabled}

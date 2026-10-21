@@ -21,6 +21,8 @@ export interface AcpSessionMockOptions {
   trashedAt?: string;
   /** Report the session archived with a stopped worker (#4116). */
   archivedAt?: string;
+  /** Report the worker as still starting. */
+  workerStarting?: boolean;
 }
 
 export interface AcpSessionMock {
@@ -194,7 +196,9 @@ export async function mockAcpSession(page: Page, opts: AcpSessionMockOptions = {
             archived_at: opts.archivedAt ?? null,
             workspace_repos: [],
             view: "structured",
-            acp_worker_state: opts.trashedAt || opts.archivedAt ? "stopped" : "running",
+            acp_worker_state:
+              opts.trashedAt || opts.archivedAt ? "stopped" : opts.workerStarting ? "resuming" : "running",
+            ...(opts.workerStarting ? { acp_agent: "claude" } : {}),
             claude_fullscreen: false,
           },
         ],
