@@ -49,24 +49,41 @@ impl PendingRequests {
         self.entries.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    /// `generation` is the supervisor id, which an in-place respawn keeps, so an exit fails
-    /// every request of that supervisor.
+    #[cfg(test)]
     pub fn register(
         &self,
         plugin_id: &str,
         generation: u64,
     ) -> (String, oneshot::Receiver<Result<Value, String>>) {
-        let id = format!("h-{}", self.next.fetch_add(1, Ordering::Relaxed) + 1);
+        let id = self.next_id();
+        let rx = self.register_as(&id, plugin_id, generation);
+        (id, rx)
+    }
+
+    /// A fresh request id, unique for this host.
+    pub fn next_id(&self) -> String {
+        format!("h-{}", self.next.fetch_add(1, Ordering::Relaxed) + 1)
+    }
+
+    /// Registers under `id`, which must come from [`Self::next_id`]. `generation` is the
+    /// supervisor id, which an in-place respawn keeps, so an exit fails every request of that
+    /// supervisor.
+    pub fn register_as(
+        &self,
+        id: &str,
+        plugin_id: &str,
+        generation: u64,
+    ) -> oneshot::Receiver<Result<Value, String>> {
         let (tx, rx) = oneshot::channel();
         self.entries().insert(
-            id.clone(),
+            id.to_string(),
             Entry {
                 plugin_id: plugin_id.to_string(),
                 generation,
                 tx,
             },
         );
-        (id, rx)
+        rx
     }
 
     /// Only the plugin that owns the request can answer it.

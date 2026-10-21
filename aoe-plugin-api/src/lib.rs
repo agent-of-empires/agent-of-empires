@@ -20,8 +20,7 @@ pub use manifest::{
 };
 
 pub use mcp::{
-    is_valid_mcp_server_name, mcp_prefix, MCP_SERVE_CAPABILITY, MCP_SERVE_DEFAULT_TIMEOUT_MS,
-    MCP_SERVE_MAX_PER_PLUGIN, MCP_SERVE_MAX_TIMEOUT_MS,
+    is_valid_mcp_server_name, mcp_prefix, MCP_SERVE_CAPABILITY, MCP_SERVE_MAX_PER_PLUGIN,
 };
 
 pub const API_VERSION: u32 = 22;

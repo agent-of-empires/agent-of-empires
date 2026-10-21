@@ -4,28 +4,14 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use aoe_plugin_api::{McpRewriteScope, PluginManifest};
-use futures_util::future::BoxFuture;
-use serde_json::Value;
 
 use crate::acp::mcp_rewrite::{
     apply_edit, parse_edit, request_params, McpRewriteContext, McpRewriter, RewriteError,
     RewriteFuture, METHOD,
 };
 use crate::plugin::host::PluginHost;
-use crate::plugin::worker_requests::WorkerRequestError;
+use crate::plugin::worker_call::WorkerCall;
 use crate::session::mcp::project_mcp::ProjectMcpServer;
-
-pub trait WorkerCall: Send + Sync {
-    fn call<'a>(
-        &'a self,
-        plugin_id: &'a str,
-        method: &'a str,
-        params: Value,
-        timeout: Duration,
-    ) -> BoxFuture<'a, Result<Value, WorkerRequestError>>;
-
-    fn report_failure(&self, plugin_id: &str, message: &str);
-}
 
 pub struct RewriteHook {
     pub plugin_id: String,
@@ -80,27 +66,6 @@ pub async fn run_chain(
     Ok(servers)
 }
 
-impl WorkerCall for PluginHost {
-    fn call<'a>(
-        &'a self,
-        plugin_id: &'a str,
-        method: &'a str,
-        params: Value,
-        timeout: Duration,
-    ) -> BoxFuture<'a, Result<Value, WorkerRequestError>> {
-        Box::pin(self.request_worker(plugin_id, method, params, timeout))
-    }
-
-    fn report_failure(&self, plugin_id: &str, message: &str) {
-        self.notify_host(
-            plugin_id,
-            crate::plugin::ui_state::Tone::Danger,
-            "MCP rewrite hook failed".to_string(),
-            Some(message.to_string()),
-        );
-    }
-}
-
 /// A missing worker caller fails closed, but only when a hook applies.
 async fn run_hooks(
     caller: Option<&dyn WorkerCall>,
@@ -148,8 +113,10 @@ impl McpRewriter for PluginMcpRewriter {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::plugin::worker_requests::WorkerRequestError;
     use crate::session::mcp::project_mcp::ProjectMcpTransport;
-    use serde_json::json;
+    use futures_util::future::BoxFuture;
+    use serde_json::{json, Value};
     use std::sync::Mutex;
 
     fn manifest(id: &str, scope: &str, with_cap: bool, with_hook: bool) -> PluginManifest {
@@ -247,6 +214,31 @@ mod tests {
             self.seen_params.lock().unwrap().push(params);
             let reply = self.replies.lock().unwrap().remove(0);
             Box::pin(async move { reply })
+        }
+
+        fn request_id(&self) -> String {
+            unreachable!("the rewrite chain never names its requests")
+        }
+
+        fn call_as<'a>(
+            &'a self,
+            _id: &'a str,
+            _plugin_id: &'a str,
+            _method: &'a str,
+            _params: Value,
+            _start_wait: Duration,
+            _timeout: Duration,
+        ) -> BoxFuture<'a, Result<Value, WorkerRequestError>> {
+            unreachable!("the rewrite chain never names its requests")
+        }
+
+        fn notify<'a>(
+            &'a self,
+            _plugin_id: &'a str,
+            _method: &'a str,
+            _params: Value,
+        ) -> BoxFuture<'a, bool> {
+            unreachable!("the rewrite chain sends no notifications")
         }
 
         fn report_failure(&self, plugin_id: &str, message: &str) {
