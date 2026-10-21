@@ -47,6 +47,12 @@ Each override is logged.
 
 A plugin holding the `mcp.rewrite` capability can drop and replace servers per session, usually to route host credentials through a gateway instead of handing them to a sandbox. The hook is documented in [Plugin API](../plugin-api.md#hooks). AoE does not copy host MCP definitions into a Claude sandbox's agent store (`.mcp.json` files inside the copied Claude `plugins/` directory are copied as they are), but other agents' MCP-bearing config files are still copied into their sandbox stores verbatim, so the hook alone does not keep host MCP secrets out of those sandboxes.
 
+## Plugin-served servers
+
+A plugin holding the `mcp.serve` capability can offer MCP servers to your sessions. They appear in the agent as `<plugin id with . as _>__<server>`, for example `acme_tools__docs`, or under the bare server name if the plugin chooses, and their provenance is `plugin:<plugin id>`. A plugin entry replaces any entry of the same key from your own files; AoE notifies you when an offered entry does, but not when a rewrite hook replaces one. AoE forwards the agent's calls to the plugin and gives the agent a credential that opens only that server for that session.
+
+They are not shown by `aoe mcp list` or the dashboard, and terminal-view sessions get none. Sandboxed sessions get them only when you opt in by binding non-loopback and allowing `host.containers.internal`. Limits and the protocol are in the [Plugin API](../plugin-api.md#serving-mcp-servers-api_version--21). Any plugin holding `mcp.rewrite` sees every serving plugin's entries, credentials included.
+
 ## Project-local servers need repo trust
 
 A project stdio server would launch its `command` the moment a session starts, so opening a cloned, untrusted repo would be a zero-click way to run its code. It therefore sits behind the same trust gate as repository hooks.
