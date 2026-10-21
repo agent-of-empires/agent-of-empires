@@ -420,30 +420,21 @@ fn default_show_spans() -> bool {
 #[derive(Debug, Clone, Serialize, Deserialize, SettingsSection)]
 #[setting_section(name = "acp", category = "Acp")]
 pub struct AcpConfig {
-    /// Show the "Structured view" toggle in the TUI's new-session dialog, and
-    /// offer switching an existing terminal session into the structured view
-    /// there. Hidden by default while the view matures; the web dashboard
-    /// always offers it. Opening already-structured sessions, and switching a
-    /// structured session back to a terminal, are unaffected.
+    /// Whether the structured view is offered, and which view new sessions
+    /// open in. `off` hides the structured option everywhere: the new-session
+    /// dialog and wizard, and switching a terminal session into it.
+    /// `terminal` and `structured` offer it on every surface and preselect that
+    /// view; the toggle still wins per session. Opening structured sessions and
+    /// switching one back to a terminal are never gated. A structured session
+    /// runs the ACP adapter, so it never registers with Claude's Remote Control
+    /// app (#3517).
     #[serde(default)]
     #[setting(
-        label = "Offer structured view in the TUI",
-        widget = "toggle",
-        tui_only
-    )]
-    pub offer_structured_in_new_session: bool,
-    /// Which view the new-session dialog starts on when the chosen agent can
-    /// back a structured session. Auto keeps each surface's own default: the
-    /// web dashboard starts on the structured view, the TUI on a terminal. The
-    /// TUI still offers the structured view only when the toggle above is on,
-    /// and the dialog's own toggle wins for that one session.
-    #[serde(default)]
-    #[setting(
-        label = "Default view for new sessions",
+        label = "Structured view",
         widget = "select",
-        options = "auto:Auto,structured:Structured view,terminal:Terminal view"
+        options = "off:Off,terminal:Terminal view,structured:Structured view"
     )]
-    pub default_new_session_view: NewSessionView,
+    pub structured_view: StructuredView,
     /// Acp agent used when --agent is not specified (e.g. claude-code,
     /// codex). Must name an agent that can start: `aoe-agent` is not
     /// packaged yet (#3553).
@@ -682,8 +673,7 @@ fn default_silent_orphan_grace_secs() -> u32 {
 impl Default for AcpConfig {
     fn default() -> Self {
         Self {
-            offer_structured_in_new_session: false,
-            default_new_session_view: NewSessionView::Auto,
+            structured_view: StructuredView::default(),
             default_agent: default_agent(),
             restrict_agents: false,
             allowed_agents: Vec::new(),
@@ -1902,14 +1892,26 @@ pub enum NewSessionMode {
     LiveSend,
 }
 
-/// See `AcpConfig::default_new_session_view`.
+/// See `AcpConfig::structured_view`.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum NewSessionView {
-    #[default]
-    Auto,
-    Structured,
+pub enum StructuredView {
+    Off,
     Terminal,
+    #[default]
+    Structured,
+}
+
+impl StructuredView {
+    /// Whether the structured option is shown at all.
+    pub fn is_offered(self) -> bool {
+        self != Self::Off
+    }
+
+    /// Whether a new session opens in the structured view.
+    pub fn starts_structured(self) -> bool {
+        self == Self::Structured
+    }
 }
 
 /// See `AcpConfig::notice_display`.

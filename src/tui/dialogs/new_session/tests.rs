@@ -846,6 +846,24 @@ fn editing_the_env_list_does_submit_a_session_override() {
 }
 
 #[test]
+fn structured_view_setting_gates_the_offer_and_sets_the_default() {
+    use crate::session::config::StructuredView;
+    for (view, offered, starts_structured) in [
+        (StructuredView::Off, false, false),
+        (StructuredView::Terminal, true, false),
+        (StructuredView::Structured, true, true),
+    ] {
+        let mut config = Config::default();
+        config.acp.structured_view = view;
+        assert_eq!(compute_structured_capable("claude", &config), offered);
+        assert_eq!(
+            config.acp.structured_view.starts_structured(),
+            starts_structured
+        );
+    }
+}
+
+#[test]
 fn the_structured_row_appears_only_for_an_acp_capable_tool() {
     // Without the row, index 2 is YOLO.
     let mut dialog = single_tool_dialog();
@@ -1794,7 +1812,7 @@ fn a_selected_session_carries_its_view() {
     fs::create_dir_all(app_dir.join("profiles").join("default")).expect("default profile");
     fs::write(
         app_dir.join("config.toml"),
-        "[acp]\noffer_structured_in_new_session = true\n",
+        "[acp]\nstructured_view = \"structured\"\n",
     )
     .expect("global config");
 
@@ -1830,7 +1848,7 @@ fn a_carried_agent_is_judged_by_the_repo_config() {
     fs::create_dir_all(app_dir.join("profiles").join("default")).expect("default profile");
     fs::write(
         app_dir.join("config.toml"),
-        "[acp]\noffer_structured_in_new_session = true\n",
+        "[acp]\nstructured_view = \"structured\"\n",
     )
     .expect("global config");
     let repo = tempfile::tempdir().expect("repo");

@@ -194,7 +194,7 @@ pub struct NewSessionDialog {
     pub(super) yolo_mode: bool,
     pub(super) yolo_mode_default: bool,
     pub(super) structured_enabled: bool,
-    /// Configured opening state (`acp.default_new_session_view`), re-applied
+    /// Configured opening state (`acp.structured_view`), re-applied
     /// when a tool change makes the structured view available again.
     pub(super) structured_default: bool,
     /// The user's own toggle choice, restored instead of the configured
@@ -388,8 +388,8 @@ const OVERRIDES_UNRESOLVED_ERROR: &str = "Could not load this project's settings
 /// Whether `tool` can back a structured-view (ACP) session, judged against
 /// the resolved config.
 fn compute_structured_capable(tool: &str, config: &crate::session::Config) -> bool {
-    // Opt-in setting, shared with `session_switch_view_target`.
-    config.acp.offer_structured_in_new_session
+    // Shared with `session_switch_view_target`.
+    config.acp.structured_view.is_offered()
         && crate::session::builder::structured::tool_acp_capable(tool, config)
 }
 
@@ -509,8 +509,7 @@ impl NewSessionDialog {
             .unwrap_or_default();
         let command_override_value = config.session.resolve_tool_command(selected_tool);
         let structured_capable = compute_structured_capable(selected_tool, &config);
-        let structured_default = config.acp.default_new_session_view
-            == crate::session::config::NewSessionView::Structured;
+        let structured_default = config.acp.structured_view.starts_structured();
 
         let (extra_env, inherited_settings) = if sandbox_enabled {
             let inherited = build_inherited_settings(&config.sandbox);
@@ -977,8 +976,7 @@ impl NewSessionDialog {
 
         self.yolo_mode_default = config.session.yolo_mode_default;
         self.yolo_mode = self.yolo_mode_default;
-        self.structured_default = config.acp.default_new_session_view
-            == crate::session::config::NewSessionView::Structured;
+        self.structured_default = config.acp.structured_view.starts_structured();
         // Each profile has its own registry, so an earlier resolution says nothing about this one. A
         // scratch session belongs to no project, so a retained path's overrides do not apply.
         self.overrides_resolved_for = None;
