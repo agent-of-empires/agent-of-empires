@@ -3,7 +3,7 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::{CapabilityId, PluginId, API_VERSION};
+use crate::{CapabilityId, PluginId, API_VERSION, MCP_SERVE_CAPABILITY};
 
 /// Parsed and validated `aoe-plugin.toml`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1523,6 +1523,20 @@ impl PluginManifest {
                 format!("hooks.mcp_rewrite.timeout_ms must be 1..={MCP_REWRITE_MAX_TIMEOUT_MS}"),
             );
         }
+        if self
+            .capabilities
+            .iter()
+            .any(|c| c.as_str() == MCP_SERVE_CAPABILITY)
+        {
+            check(
+                self.api_version >= 22,
+                "the mcp.serve capability requires api_version >= 22".into(),
+            );
+            check(
+                self.runtime.is_some(),
+                "the mcp.serve capability requires a runtime worker".into(),
+            );
+        }
         for key in self.setting_defaults.keys() {
             check(
                 key.contains('.') && !key.starts_with('.') && !key.ends_with('.'),
@@ -1806,6 +1820,33 @@ mod tests {
         };
         rejects(&[("session.message below v15", toml(14), "api_version >= 15")]);
         PluginManifest::from_toml_str(&toml(15)).expect("v15 parses");
+    }
+
+    #[test]
+    fn mcp_serve_capability_is_validated() {
+        let toml = |v: u32, runtime: bool| {
+            let rt = if runtime {
+                "\n[runtime]\nkind = \"command\"\ncommand = [\"bin/worker\"]\n"
+            } else {
+                ""
+            };
+            format!(
+                "id = \"acme.gate\"\nname = \"Gate\"\nversion = \"1.0.0\"\napi_version = {v}\ncapabilities = [\"runtime.worker\", \"mcp.serve\"]\n{rt}"
+            )
+        };
+        rejects(&[
+            (
+                "mcp.serve below v22",
+                toml(21, true),
+                "mcp.serve capability requires api_version >= 22",
+            ),
+            (
+                "mcp.serve without runtime",
+                toml(22, false),
+                "mcp.serve capability requires a runtime worker",
+            ),
+        ]);
+        PluginManifest::from_toml_str(&toml(22, true)).expect("v22 mcp.serve parses");
     }
 
     #[test]
