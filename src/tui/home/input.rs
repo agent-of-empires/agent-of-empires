@@ -3220,7 +3220,7 @@ impl HomeView {
     /// Whether the session's persisted view can be switched, and which it renders now:
     /// `Some(is_structured)` when the context menu should offer a switch. A structured
     /// session can always go back to a terminal; a terminal one can go structured only
-    /// when its tool is ACP-capable and `offer_structured_in_new_session` is on, the same
+    /// when its tool is ACP-capable and `acp.structured_view` is not `off`, the same
     /// gate as the new-session toggle. Archived, trashed and mid-lifecycle rows are
     /// excluded: their agent is deliberately stopped and the swap would boot a worker
     /// behind the parked state.
@@ -3239,10 +3239,8 @@ impl HomeView {
             &inst.source_profile,
             std::path::Path::new(&inst.project_path),
         );
-        // Switching a terminal session into structured view is gated on the same opt-in
-        // as the new-session toggle; the reverse direction stays available regardless, so
-        // a session can always get out.
-        (config.acp.offer_structured_in_new_session
+        // The reverse direction stays available regardless, so a session can always get out.
+        (config.acp.structured_view.is_offered()
             && crate::session::builder::structured::tool_acp_capable(&inst.tool, &config))
         .then_some(false)
     }
