@@ -2,35 +2,69 @@
 //! `acp.default_new_session_view` into `acp.structured_view` in the global
 //! config and every profile config. An explicit `offer = false` becomes `off`;
 //! otherwise a `terminal` view stays `terminal`, and anything else (including
-//! `auto`) becomes `structured`. A file with neither key is left alone.
+//! `auto`) becomes `structured`. A file with neither key is left alone, and a
+//! profile with one key inherits the other from the global file.
 
 use super::config_file;
 use anyhow::Result;
 use std::path::Path;
 use tracing::info;
 
+const OFFER: &str = "offer_structured_in_new_session";
+const VIEW: &str = "default_new_session_view";
+
+/// The two legacy keys as found in one config file.
+#[derive(Default)]
+struct Legacy {
+    offer: Option<toml::Value>,
+    view: Option<toml::Value>,
+}
+
 pub fn run() -> Result<()> {
     let app_dir = crate::session::get_app_dir()?;
     run_in(&app_dir)
 }
 
+/// Profiles go first and inherit the global file's legacy values for a key
+/// they leave out, as they did at runtime. The global file goes last, so an
+/// interrupted run still finds its keys on the next start.
 fn run_in(app_dir: &Path) -> Result<()> {
-    for path in config_file::all_configs(app_dir)? {
-        migrate_config_file(&path)?;
+    let global_path = app_dir.join("config.toml");
+    let global = legacy_in(&global_path);
+    for path in config_file::profile_configs(app_dir)? {
+        migrate_config_file(&path, &global)?;
     }
-    Ok(())
+    migrate_config_file(&global_path, &Legacy::default())
 }
 
-fn migrate_config_file(path: &Path) -> Result<()> {
+fn legacy_in(path: &Path) -> Legacy {
+    let doc = std::fs::read_to_string(path)
+        .ok()
+        .and_then(|text| text.parse::<toml::Table>().ok());
+    let acp = doc
+        .as_ref()
+        .and_then(|doc| doc.get("acp"))
+        .and_then(toml::Value::as_table);
+    Legacy {
+        offer: acp.and_then(|acp| acp.get(OFFER)).cloned(),
+        view: acp.and_then(|acp| acp.get(VIEW)).cloned(),
+    }
+}
+
+fn migrate_config_file(path: &Path, inherited: &Legacy) -> Result<()> {
     config_file::rewrite_strict(path, "v049", |doc| {
         let Some(acp) = doc.get_mut("acp").and_then(toml::Value::as_table_mut) else {
             return false;
         };
-        let offer = acp.remove("offer_structured_in_new_session");
-        let view = acp.remove("default_new_session_view");
-        if offer.is_none() && view.is_none() {
+        let own = Legacy {
+            offer: acp.remove(OFFER),
+            view: acp.remove(VIEW),
+        };
+        if own.offer.is_none() && own.view.is_none() {
             return false;
         }
+        let offer = own.offer.or_else(|| inherited.offer.clone());
+        let view = own.view.or_else(|| inherited.view.clone());
         let migrated = if matches!(offer, Some(toml::Value::Boolean(false))) {
             "off"
         } else if view.as_ref().and_then(toml::Value::as_str) == Some("terminal") {
@@ -95,7 +129,11 @@ mod tests {
             .iter()
             .map(|(a, b)| (a.as_deref(), b.as_deref()))
             .collect();
-        assert_rewrites("config.toml", migrate_config_file, &rows);
+        assert_rewrites(
+            "config.toml",
+            |path| migrate_config_file(path, &Legacy::default()),
+            &rows,
+        );
     }
 
     #[test]
@@ -104,7 +142,7 @@ mod tests {
         let migrated = "[acp]\nstructured_view = \"off\"\n";
         assert_rewrites(
             "config.toml",
-            migrate_config_file,
+            |path| migrate_config_file(path, &Legacy::default()),
             &[
                 (Some(untouched), Some(untouched)),
                 (
@@ -114,5 +152,56 @@ mod tests {
                 (Some(migrated), Some(migrated)),
             ],
         );
+    }
+
+    #[test]
+    fn a_profile_inherits_the_legacy_key_it_leaves_out() {
+        // (global, profile, migrated global, migrated profile)
+        let cases: &[(&str, &str, &str, &str)] = &[
+            // The profile's terminal view must not turn on what the global hid.
+            (
+                "offer_structured_in_new_session = false\n",
+                "default_new_session_view = \"terminal\"\n",
+                "off",
+                "off",
+            ),
+            // The profile's opt-in must not override the global terminal view.
+            (
+                "default_new_session_view = \"terminal\"\n",
+                "offer_structured_in_new_session = true\n",
+                "terminal",
+                "terminal",
+            ),
+            // A profile that sets both keys ignores the global ones.
+            (
+                "offer_structured_in_new_session = false\n",
+                "offer_structured_in_new_session = true\ndefault_new_session_view = \"structured\"\n",
+                "off",
+                "structured",
+            ),
+        ];
+        for (global, profile, want_global, want_profile) in cases {
+            let dir = tempfile::tempdir().unwrap();
+            let profile_dir = dir.path().join("profiles").join("work");
+            std::fs::create_dir_all(&profile_dir).unwrap();
+            std::fs::write(dir.path().join("config.toml"), format!("[acp]\n{global}")).unwrap();
+            std::fs::write(profile_dir.join("config.toml"), format!("[acp]\n{profile}")).unwrap();
+
+            run_in(dir.path()).unwrap();
+
+            let read = |path: std::path::PathBuf| {
+                std::fs::read_to_string(path)
+                    .unwrap()
+                    .parse::<toml::Table>()
+                    .unwrap()
+            };
+            let expect = |want: &str| {
+                format!("[acp]\nstructured_view = \"{want}\"\n")
+                    .parse::<toml::Table>()
+                    .unwrap()
+            };
+            assert_eq!(read(dir.path().join("config.toml")), expect(want_global));
+            assert_eq!(read(profile_dir.join("config.toml")), expect(want_profile));
+        }
     }
 }
