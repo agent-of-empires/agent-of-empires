@@ -197,6 +197,15 @@ describe("linkifyLine", () => {
     ]);
   });
 
+  it("keeps the text of a URL that continues from a shorter earlier segment", () => {
+    const line = linkifyLine([seg("https://", "red"), seg("example.com/path", "blue")]);
+    expect(line.map((s) => [s.text, s.url, s.style.fg])).toEqual([
+      ["https://", "https://example.com/path", "red"],
+      ["example.com/path", "https://example.com/path", "blue"],
+    ]);
+    expect(lineText(line)).toBe("https://example.com/path");
+  });
+
   it("keeps the full href on every row after a client-side wrap", () => {
     const rows = wrapLine(linkifyLine([seg(`(${URL}). Per the spec`)]), 40);
     expect(rows.length).toBeGreaterThan(1);

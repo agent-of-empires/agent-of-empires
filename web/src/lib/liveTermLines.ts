@@ -129,7 +129,8 @@ export function linkifyLine(line: AnsiSegment[]): AnsiSegment[] {
         const segEnd = segStart + seg.text.length;
         let from = segStart;
         const emit = (to: number, url?: string) => {
-          if (to > from) out.push({ text: seg.text.slice(from - segStart, to - segStart), style: seg.style, url });
+          if (to <= from) return;
+          out.push({ text: seg.text.slice(from - segStart, to - segStart), style: seg.style, url });
           from = to;
         };
         for (const [s, e, url] of ranges) {
