@@ -118,6 +118,21 @@ describe("useStatusSounds", () => {
     expect(played).toHaveLength(1);
   });
 
+  it("keeps a cue across a stale snapshot, and drops it once the session moves to another status", async () => {
+    mount([at("a", "Running"), at("b", "Running")]);
+    act(() => {
+      view.result.current("a", "idle");
+      view.result.current("b", "idle");
+    });
+    await step([at("a", "Running"), at("b", "Running")]);
+    await step([at("a", "Idle"), at("b", "Error")]);
+    await vi.waitFor(() => expect(played).toHaveLength(1));
+    expect(fetchSoundBlob.mock.calls.map(([name]) => name)).toEqual(["done"]);
+    // b's cue is gone: going Idle later waits for its own dwell instead of sounding at once.
+    await step([at("a", "Idle"), at("b", "Idle")]);
+    expect(played).toHaveLength(1);
+  });
+
   it("stays silent for a late cue about a session first seen by the refreshed list", async () => {
     mount([at("a", "Running")]);
     act(() => view.result.current("new", "waiting"));
