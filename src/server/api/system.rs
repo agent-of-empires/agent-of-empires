@@ -1671,29 +1671,79 @@ pub async fn browse_filesystem(
     }
 }
 
-#[derive(Serialize)]
+#[derive(Debug, PartialEq, Serialize)]
 pub struct GroupInfo {
     pub path: String,
+    /// Sessions directly in this group, not in its children.
     pub session_count: usize,
+    pub archived: bool,
 }
 
-pub async fn list_groups(State(state): State<Arc<AppState>>) -> impl IntoResponse {
-    let instances = state.instances.read().await;
-    let mut group_counts: std::collections::HashMap<String, usize> =
-        std::collections::HashMap::new();
-    for inst in instances.iter() {
-        if !inst.group_path.is_empty() {
-            *group_counts.entry(inst.group_path.clone()).or_default() += 1;
-        }
-    }
-    let groups: Vec<GroupInfo> = group_counts
+#[derive(Deserialize)]
+pub struct GroupsQuery {
+    profile: Option<String>,
+}
+
+/// `GET /api/groups[?profile=]`: the profile's groups for the wizard's Group field.
+pub async fn list_groups(
+    State(state): State<Arc<AppState>>,
+    axum::extract::Query(query): axum::extract::Query<GroupsQuery>,
+) -> impl IntoResponse {
+    let served = state.served_profile().to_string();
+    let requested = query.profile.filter(|p| !p.is_empty());
+    let profile = tokio::task::spawn_blocking(move || match requested {
+        // Never create a profile by naming it here.
+        Some(name) => crate::session::list_profiles()
+            .unwrap_or_default()
+            .contains(&name)
+            .then_some(name),
+        None if served.is_empty() => Some(crate::session::config::resolve_default_profile()),
+        None => Some(served),
+    })
+    .await
+    .ok()
+    .flatten();
+    let Some(profile) = profile else {
+        return Json(Vec::<GroupInfo>::new());
+    };
+    let session_groups: Vec<String> = state
+        .instances
+        .read()
+        .await
+        .iter()
+        .filter(|inst| inst.source_profile == profile && inst.trashed_at.is_none())
+        .map(|inst| inst.group_path.clone())
+        .collect();
+    let stored = tokio::task::spawn_blocking(move || {
+        crate::session::Storage::new_unwatched(&profile).and_then(|s| s.load_groups_readonly())
+    })
+    .await
+    .ok()
+    .and_then(Result::ok)
+    .unwrap_or_default();
+    Json(group_infos(&session_groups, &stored))
+}
+
+/// Every group in the profile's tree (stored groups, the groups sessions are in,
+/// and each parent of a nested path), with its direct session count, sorted by
+/// path. The synthetic Archived, Trash and Scratch sections are left out.
+fn group_infos(session_groups: &[String], stored: &[crate::session::Group]) -> Vec<GroupInfo> {
+    let tree = crate::session::GroupTree::new_with_group_paths(
+        session_groups.iter().map(String::as_str),
+        stored,
+    );
+    let mut groups: Vec<GroupInfo> = tree
+        .get_all_groups()
         .into_iter()
-        .map(|(path, session_count)| GroupInfo {
-            path,
-            session_count,
+        .filter(|g| !g.path.is_empty() && !crate::session::is_synthetic_project_header(&g.path))
+        .map(|g| GroupInfo {
+            session_count: session_groups.iter().filter(|p| **p == g.path).count(),
+            archived: g.is_archived(),
+            path: g.path,
         })
         .collect();
-    Json(groups)
+    groups.sort_by(|a, b| a.path.cmp(&b.path));
+    groups
 }
 
 /// One agent row on the health readout. Every figure is optional for the same
@@ -2581,6 +2631,45 @@ pub async fn serve_sound_file(
 
 #[cfg(test)]
 mod tests {
+    /// The wizard's Group list holds every group the sidebar can show: stored
+    /// empty groups and the parents of nested paths, but not the synthetic shelves.
+    #[test]
+    fn group_infos_merge_the_tree_with_session_counts() {
+        use crate::session::{
+            Group, ARCHIVED_SECTION_PATH, SCRATCH_GROUP_PATH, TRASH_SECTION_PATH,
+        };
+        let mut archived = Group::new("old", "old");
+        archived.archived_at = Some(chrono::Utc::now());
+        let stored = [Group::new("empty", "empty"), archived];
+        let sessions: Vec<String> = [
+            "client/api",
+            "client/api",
+            "zeta",
+            "",
+            SCRATCH_GROUP_PATH,
+            &format!("{ARCHIVED_SECTION_PATH}/repo"),
+            TRASH_SECTION_PATH,
+        ]
+        .iter()
+        .map(|p| p.to_string())
+        .collect();
+        let got: Vec<(String, usize, bool)> = group_infos(&sessions, &stored)
+            .into_iter()
+            .map(|g| (g.path, g.session_count, g.archived))
+            .collect();
+        assert_eq!(
+            got,
+            [
+                ("client".to_string(), 0, false),
+                ("client/api".to_string(), 2, false),
+                ("empty".to_string(), 0, false),
+                ("old".to_string(), 0, true),
+                ("zeta".to_string(), 1, false),
+            ]
+        );
+        assert!(group_infos(&[], &[]).is_empty());
+    }
+
     use super::*;
     use axum::body::to_bytes;
     use std::collections::HashMap;

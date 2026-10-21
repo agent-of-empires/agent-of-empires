@@ -43,6 +43,7 @@ import { AgentPanel } from "./steps/AgentPanel";
 import { WorktreePanel } from "./steps/WorktreePanel";
 import { SandboxPanel } from "./steps/SandboxPanel";
 import { ProfilePresetPicker } from "./steps/ProfilePresetPicker";
+import { GroupCombobox } from "./steps/GroupCombobox";
 import { CreateProgressView } from "./CreateProgressView";
 import { FieldRow, NavRow, PanelHeader, ROW_INPUT, RowGroup, SwitchRow } from "./WizardRows";
 import { LaunchFooter } from "./LaunchFooter";
@@ -258,11 +259,21 @@ export function SessionWizard({
     };
   }, [servedProfile, prefill?.profile, onRetryServedProfile]);
 
+  // Groups are per profile, so the list follows the selected one.
+  useEffect(() => {
+    let alive = true;
+    void fetchGroups(state.data.profile || undefined).then((groups) => {
+      if (alive) dispatch({ type: "SET_GROUPS", groups });
+    });
+    return () => {
+      alive = false;
+    };
+  }, [state.data.profile]);
+
   useEffect(() => {
     const generations = defaultsGeneration;
     const switches = profileSwitchRef;
     fetchAgents().then((a) => dispatch({ type: "SET_AGENTS", agents: a }));
-    fetchGroups().then((g) => dispatch({ type: "SET_GROUPS", groups: g }));
     fetchDockerStatus().then((d) => dispatch({ type: "SET_DOCKER", available: d.available }));
     fetchProfiles()
       .then((profiles) => dispatch({ type: "SET_PROFILES", profiles }))
@@ -843,20 +854,12 @@ export function SessionWizard({
           onConfigure={!sandboxBlocked && d.sandboxEnabled ? openPanel("sandbox") : undefined}
         />
         <FieldRow label="Group" htmlFor="wizard-group">
-          <input
+          <GroupCombobox
             id="wizard-group"
-            type="text"
             value={d.group}
-            onChange={(e) => handleChange("group", e.target.value)}
-            placeholder="Optional"
-            list="wizard-groups"
-            className={ROW_INPUT}
+            onChange={(v) => handleChange("group", v)}
+            groups={state.groups}
           />
-          <datalist id="wizard-groups">
-            {state.groups.map((g) => (
-              <option key={g.path} value={g.path} />
-            ))}
-          </datalist>
         </FieldRow>
       </RowGroup>
     </div>
@@ -886,7 +889,7 @@ export function SessionWizard({
             &times;
           </button>
         </div>
-        <div className="flex-1 overflow-y-auto px-4 md:px-5 py-4">
+        <div data-wizard-scroll className="flex-1 overflow-y-auto px-4 md:px-5 py-4">
           {!nameOnly && !state.data.profile && !servedProfile && (
             <div
               role="alert"

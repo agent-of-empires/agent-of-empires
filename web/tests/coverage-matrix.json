@@ -4349,9 +4349,10 @@
     {
       "id": "story.wizard-group-field",
       "kind": "mocked-playwright",
-      "risk": "low",
-      "specs": ["tests/wizard.spec.ts"],
-      "components": ["web/src/components/session-wizard/steps/WorktreePanel.tsx"]
+      "risk": "medium",
+      "specs": ["tests/wizard.spec.ts", "src/components/session-wizard/__tests__/GroupCombobox.test.tsx"],
+      "components": ["web/src/components/session-wizard/steps/GroupCombobox.tsx"],
+      "notes": "The Group field lists the selected profile's groups from /api/groups with counts, offers a create row for a new name, keeps typed text on Enter, Esc and blur, and opens upward inside the sheet when there's no room below."
     },
     {
       "id": "story.wizard-extra-repos",

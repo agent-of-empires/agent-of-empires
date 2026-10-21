@@ -9,6 +9,7 @@ import {
   fetchAgents,
   fetchCreateProgress,
   fetchDockerStatus,
+  fetchGroups,
   fetchIsGitRepo,
   fetchProfiles,
   fetchProjects,
@@ -435,6 +436,8 @@ describe("SessionWizard rows", () => {
       fireEvent.click(await screen.findByText("Profile"));
       fireEvent.click(screen.getByRole("radio", { name: /work/ }));
       await waitFor(() => expect(fetchSettings).toHaveBeenCalledWith("work"));
+      // Groups are per profile.
+      await waitFor(() => expect(fetchGroups).toHaveBeenLastCalledWith("work"));
       await launch();
       await waitFor(() => expect(createSession).toHaveBeenCalled());
       expect(payload()).toMatchObject({ profile: "work" });
@@ -978,5 +981,19 @@ describe("SessionWizard Docker readiness", () => {
 
     answer(true);
     await waitFor(() => expect(launchButton().disabled).toBe(false));
+  });
+});
+
+describe("SessionWizard Group field", () => {
+  it("launches with the typed group while its list is open", async () => {
+    vi.mocked(fetchGroups).mockResolvedValue([{ path: "client/api", session_count: 2 }]);
+    renderWizard();
+    const field = await screen.findByRole("combobox", { name: "Group" });
+    fireEvent.focus(field);
+    fireEvent.change(field, { target: { value: "client/new" } });
+    expect(field.getAttribute("aria-expanded")).toBe("true");
+    await launch();
+    await waitFor(() => expect(createSession).toHaveBeenCalledTimes(1));
+    expect(payload()).toMatchObject({ group: "client/new" });
   });
 });
