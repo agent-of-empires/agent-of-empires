@@ -1851,7 +1851,11 @@ export interface AgentInstallInfo {
   npm_installable: boolean;
   /** Whether `install-agent` would accept a request now. */
   install_allowed: boolean;
+  /** Why it wouldn't: read-only and CityHall dashboards also can't respawn. */
+  install_blocked: "read_only" | "cityhall" | "setting_off" | null;
   sandboxed: boolean;
+  /** `<runtime> exec <container> npm install -g <pkg>` for a sandboxed npm adapter. */
+  container_install_command: string | null;
 }
 
 export function fetchAgentInstallInfo(sessionId: string): Promise<AgentInstallInfo | null> {

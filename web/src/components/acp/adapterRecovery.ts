@@ -22,12 +22,14 @@ function installFailureMessage(e: unknown): string {
 export function useAdapterInstall(sessionId: string, respawn: () => Promise<boolean>) {
   const [state, setState] = useState<"idle" | "installing" | "failed">("idle");
   const [error, setError] = useState<string | null>(null);
+  const [errorCode, setErrorCode] = useState<string | null>(null);
   const [output, setOutput] = useState<string | null>(null);
   const [recovered, setRecovered] = useState(0);
 
   const install = async () => {
     setState("installing");
     setError(null);
+    setErrorCode(null);
     setOutput(null);
     try {
       const res = await installAcpAgent(sessionId);
@@ -43,10 +45,11 @@ export function useAdapterInstall(sessionId: string, respawn: () => Promise<bool
     } catch (e) {
       setState("failed");
       setError(installFailureMessage(e));
+      setErrorCode(e instanceof InstallAgentError ? (e.code ?? null) : null);
     }
   };
 
-  return { state, error, output, recovered, install };
+  return { state, error, errorCode, output, recovered, install };
 }
 
 // The event names the agent ("Failed to start structured view agent \"x\": ...");
