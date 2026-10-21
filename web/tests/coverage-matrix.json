@@ -2275,7 +2275,7 @@
       "id": "acp.agent-message-boundaries",
       "kind": "vitest",
       "risk": "medium",
-      "specs": ["src/components/acp/activityMessages.test.ts"],
+      "specs": ["src/components/acp/activityMessages.test.ts", "tests/live/acp-transcript.spec.ts"],
       "components": ["web/src/components/acp/activityMessages.ts", "web/src/lib/acpTypes.ts"],
       "notes": "Back-to-back agent messages render as separate paragraphs: the server marks the row that opens a new ACP message (message_start), and only that mark breaks the text, so one streamed message never splits mid-word."
     },

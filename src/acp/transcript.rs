@@ -1353,8 +1353,6 @@ mod tests {
         assert_eq!(tool_of(&m, "start-dup").name, "Edit a.rs");
     }
 
-    /// ACP compaction updates are upserts by id: a late, cleared or restored
-    /// summary stays beside its divider, past any later turn.
     /// A new ACP message id opens a new message; one streamed message,
     /// or chunks without an id, keep joining the open one.
     #[test]
@@ -1444,6 +1442,8 @@ mod tests {
         }
     }
 
+    /// ACP compaction updates are upserts by id: a late, cleared or restored
+    /// summary stays beside its divider, past any later turn.
     #[test]
     fn compaction_summary_row_is_keyed_by_compaction() {
         let summary = |id: &str, text: &str| Event::ConversationCompactionSummary {
