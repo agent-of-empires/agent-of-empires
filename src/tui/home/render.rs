@@ -880,10 +880,10 @@ fn title_width_for_column(
     (title_width.min(budget), false)
 }
 
-#[cfg(feature = "serve")]
+#[cfg(feature = "web")]
 const MAX_PLUGIN_STATUS_WIDTH: usize = 32;
 
-#[cfg(feature = "serve")]
+#[cfg(feature = "web")]
 fn plugin_status_width<'a>(
     statuses: impl Iterator<Item = (&'a str, Option<crate::plugin::ui_state::Tone>)>,
     budget: usize,
@@ -2015,16 +2015,16 @@ impl HomeView {
 
         let tag_width = tag_span.as_ref().map_or(0, |span| span.width());
         let fixed_trailing = slot_width + badge_width + LAST_ACTIVITY_RIGHT_MARGIN;
-        #[cfg(feature = "serve")]
+        #[cfg(feature = "web")]
         let status_budget = room
             .saturating_sub(tag_width + fixed_trailing + text_width.min(MIN_TITLE_CELLS))
             .min(MAX_PLUGIN_STATUS_WIDTH);
-        #[cfg(feature = "serve")]
+        #[cfg(feature = "web")]
         let plugin_status_width = plugin_status_width(
             crate::tui::plugin_ui::session_row_statuses(&self.plugin_ui.snapshot, id),
             status_budget,
         );
-        #[cfg(not(feature = "serve"))]
+        #[cfg(not(feature = "web"))]
         let plugin_status_width = 0;
 
         let (title_width, keep_tag) = if plugin_status_width > 0 {
@@ -2042,7 +2042,7 @@ impl HomeView {
         ));
         line_spans.extend(tag_span.filter(|_| keep_tag));
 
-        #[cfg(feature = "serve")]
+        #[cfg(feature = "web")]
         if plugin_status_width > 0 {
             let mut remaining = plugin_status_width;
             for (status, tone) in

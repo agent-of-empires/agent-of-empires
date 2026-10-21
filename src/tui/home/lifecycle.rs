@@ -349,7 +349,7 @@ impl HomeView {
             available_tools,
             status_poller: StatusPoller::new(),
             pending_status_refresh: false,
-            #[cfg(feature = "serve")]
+            #[cfg(feature = "web")]
             plugin_ui: crate::tui::plugin_ui_poller::PluginUiState::default(),
             show_diagnostics: resolved.session.show_diagnostics_pane,
             show_shortcut_bar: resolved.session.show_shortcut_bar,

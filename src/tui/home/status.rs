@@ -43,7 +43,7 @@ impl HomeView {
                 .request_refresh(self.pollable_instances());
             self.pending_status_refresh = true;
         }
-        #[cfg(feature = "serve")]
+        #[cfg(feature = "web")]
         self.plugin_ui.request_refresh(!self.instances.is_empty());
     }
 
@@ -52,9 +52,9 @@ impl HomeView {
     pub fn apply_status_updates(&mut self) -> bool {
         use std::sync::mpsc::TryRecvError;
 
-        #[cfg(feature = "serve")]
+        #[cfg(feature = "web")]
         let plugin_updated = self.plugin_ui.apply_pending();
-        #[cfg(not(feature = "serve"))]
+        #[cfg(not(feature = "web"))]
         let plugin_updated = false;
 
         match self.status_poller.try_recv_updates() {

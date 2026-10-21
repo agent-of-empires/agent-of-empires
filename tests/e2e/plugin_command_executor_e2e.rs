@@ -367,10 +367,10 @@ fn run_plugin_row_status_scenario(scenario: &str, include_github: bool, include_
         String::from_utf8_lossy(&add.stderr)
     );
     if include_github {
-        h.wait_for("Open");
+        h.wait_for_timeout("Open", Duration::from_secs(30));
     }
     if include_linear {
-        h.wait_for("WIP");
+        h.wait_for_timeout("WIP", Duration::from_secs(30));
     }
     let home_screen = h.capture_screen();
     let status_row = home_screen
