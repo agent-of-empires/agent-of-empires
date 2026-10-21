@@ -497,18 +497,12 @@ impl<S: BroadcastSink> Supervisor<S> {
     /// Keeping this beside the lifecycle lease makes every in-flight start
     /// observable to `shutdown`, including drain-task respawns.
     pub(crate) fn reservation_for_lease(&self, lease: Lease) -> ResumeReservation {
-        let cancellation = CancellationToken::new();
-        lock_recover(&self.resume_cancellations).insert(
-            lease.session_id().to_string(),
-            (lease.epoch(), cancellation.clone()),
-        );
-        ResumeReservation {
+        new_reservation(
             lease,
-            lifecycle: Arc::clone(&self.lifecycle),
-            notify: Arc::clone(&self.worker_notify),
-            cancellation,
-            cancellations: Arc::clone(&self.resume_cancellations),
-        }
+            Arc::clone(&self.lifecycle),
+            Arc::clone(&self.worker_notify),
+            Arc::clone(&self.resume_cancellations),
+        )
     }
 
     /// Cancel an admitted launch after the lifecycle table records the stop.
@@ -543,6 +537,26 @@ impl<S: BroadcastSink> Supervisor<S> {
         if let Some((_, cancellation)) = lock_recover(&self.restart_requests).get(session_id) {
             cancellation.cancel();
         }
+    }
+}
+
+pub(super) fn new_reservation(
+    lease: Lease,
+    lifecycle: Arc<std::sync::Mutex<LifecycleTable>>,
+    notify: Arc<tokio::sync::Notify>,
+    cancellations: ResumeCancellations,
+) -> ResumeReservation {
+    let cancellation = CancellationToken::new();
+    lock_recover(&cancellations).insert(
+        lease.session_id().to_string(),
+        (lease.epoch(), cancellation.clone()),
+    );
+    ResumeReservation {
+        lease,
+        lifecycle,
+        notify,
+        cancellation,
+        cancellations,
     }
 }
 

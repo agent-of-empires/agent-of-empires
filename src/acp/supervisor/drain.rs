@@ -7,7 +7,6 @@ use std::time::{Duration, Instant};
 
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
-use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
 use super::agents::log_wrapper_substitution;
@@ -19,9 +18,9 @@ use super::teardown::{
     settle_sweeping_if_owed, tear_down_replacement, tear_down_runner, wait_for_exit,
 };
 use super::{
-    lock_recover, next_seq, BroadcastSink, Launcher, PendingContextReset, ResumeCancellations,
-    ResumeReservation, SeqMap, SharedSet, Supervisor, WorkerKind, Workers, MAX_RESPAWNS_IN_WINDOW,
-    RESPAWN_BACKOFF, RESTART_WINDOW,
+    lock_recover, new_reservation, next_seq, BroadcastSink, Launcher, PendingContextReset,
+    ResumeCancellations, SeqMap, SharedSet, Supervisor, WorkerKind, Workers,
+    MAX_RESPAWNS_IN_WINDOW, RESPAWN_BACKOFF, RESTART_WINDOW,
 };
 use crate::acp::acp_client::{AcpError, SpawnConfig};
 use crate::acp::runner_lifecycle::{
@@ -80,19 +79,13 @@ struct Drain<S> {
 }
 
 impl<S> Drain<S> {
-    fn reservation_for_lease(&self, lease: Lease) -> ResumeReservation {
-        let cancellation = CancellationToken::new();
-        lock_recover(&self.resume_cancellations).insert(
-            lease.session_id().to_string(),
-            (lease.epoch(), cancellation.clone()),
-        );
-        ResumeReservation {
+    fn reservation_for_lease(&self, lease: Lease) -> super::ResumeReservation {
+        new_reservation(
             lease,
-            lifecycle: Arc::clone(&self.lifecycle),
-            notify: Arc::clone(&self.notify),
-            cancellation,
-            cancellations: Arc::clone(&self.resume_cancellations),
-        }
+            Arc::clone(&self.lifecycle),
+            Arc::clone(&self.notify),
+            Arc::clone(&self.resume_cancellations),
+        )
     }
 }
 
