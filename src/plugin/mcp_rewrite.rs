@@ -164,7 +164,7 @@ mod tests {
             String::new()
         };
         PluginManifest::from_toml_str(&format!(
-            "id = \"{id}\"\nname = \"N\"\nversion = \"1.0.0\"\napi_version = 14\ncapabilities = [{caps}]\n\n[runtime]\nkind = \"command\"\ncommand = [\"bin/w\"]\n{hook}"
+            "id = \"{id}\"\nname = \"N\"\nversion = \"1.0.0\"\napi_version = 19\ncapabilities = [{caps}]\n\n[runtime]\nkind = \"command\"\ncommand = [\"bin/w\"]\n{hook}"
         ))
         .unwrap()
     }
@@ -177,7 +177,7 @@ mod tests {
     fn hooks_for_sorts_by_order_then_plugin_id() {
         let with_order = |id: &str, order: i32| {
             PluginManifest::from_toml_str(&format!(
-                "id = \"{id}\"\nname = \"N\"\nversion = \"1.0.0\"\napi_version = 14\ncapabilities = [\"runtime.worker\", \"mcp.rewrite\"]\n\n[runtime]\nkind = \"command\"\ncommand = [\"bin/w\"]\n\n[hooks.mcp_rewrite]\norder = {order}\n"
+                "id = \"{id}\"\nname = \"N\"\nversion = \"1.0.0\"\napi_version = 19\ncapabilities = [\"runtime.worker\", \"mcp.rewrite\"]\n\n[runtime]\nkind = \"command\"\ncommand = [\"bin/w\"]\n\n[hooks.mcp_rewrite]\norder = {order}\n"
             ))
             .unwrap()
         };

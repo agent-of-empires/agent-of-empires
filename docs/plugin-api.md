@@ -8,7 +8,7 @@ A manifest carries two independent version axes.
 
 | Key | Meaning |
 |---|---|
-| `api_version` | The manifest *schema* version. The current schema is `18`. The host rejects a manifest whose `api_version` is newer than it supports. |
+| `api_version` | The manifest *schema* version. The current schema is `19`. The host rejects a manifest whose `api_version` is newer than it supports. |
 | `aoe_version` | A semver requirement on the *host app* version, e.g. `">=1.11.0, <2.0.0"`. The host refuses to install, and skips loading, a plugin whose requirement excludes the running version. Optional; requires `api_version >= 4`. |
 
 Each key below notes the `api_version` it needs. Target the newest schema your plugin uses, and set `aoe_version` to the host range you have tested.
@@ -30,7 +30,7 @@ capabilities = ["runtime.worker"]
 | `id` | string | yes | Plugin id (see [Plugin id](#plugin-id)). Namespaces config, events, and action names. |
 | `name` | string | yes | Human-readable display name. |
 | `version` | string | yes | Semantic version of the plugin. |
-| `api_version` | integer | yes | Manifest schema version, `1` to `18`. |
+| `api_version` | integer | yes | Manifest schema version, `1` to `19`. |
 | `description` | string | no | Shown in plugin listings. Defaults to empty. |
 | `aoe_version` | string | no | Host-app semver requirement. Requires `api_version >= 4`. |
 | `capabilities` | array of string | no | Runtime grants the worker needs (see [Capabilities](#capabilities)). Static contributions need none. |
@@ -68,7 +68,7 @@ Capabilities gate runtime resource access. They are prompted once at install and
 | `session.prompt` | Delivering a turn to a session the plugin created via `sessions.turn.send`, and the initial turn on `sessions.create` (`api_version >= 9`). |
 | `session.unattended` | Creating a session in a host-classified *unattended* approval mode. A distinct, high-severity grant, never implied by `session.create` or `session.prompt` (`api_version >= 9`). See [Session-driving RPCs](#session-driving-rpcs). |
 | `session.message` | Pushing a text message into **any** session, including ones the plugin did not create, via `sessions.message.send`. A structured session shows the message as sent by the plugin, and the call reaches sessions the plugin did not create, so it is a separate grant, never implied by `session.prompt` (`api_version >= 15`). |
-| `mcp.rewrite` | Serving the `mcp.rewrite` hook. The worker receives each session's resolved MCP server definitions **including secret env and header values**, and returns the set AoE forwards to the agent (`api_version >= 14`). A distinct, high-severity grant, never implied by another. See [Hooks](#hooks). |
+| `mcp.rewrite` | Serving the `mcp.rewrite` hook. The worker receives each session's resolved MCP server definitions **including secret env and header values**, and returns the set AoE forwards to the agent (`api_version >= 19`). A distinct, high-severity grant, never implied by another. See [Hooks](#hooks). |
 
 A capability this host version does not recognize is rejected, not granted.
 
@@ -289,7 +289,7 @@ With `api_version >= 9` a worker can discover ACP capabilities and create host-o
 
 ## Hooks
 
-### `[hooks.mcp_rewrite]` (`api_version >= 14`)
+### `[hooks.mcp_rewrite]` (`api_version >= 19`)
 
 Lets a worker rewrite the MCP servers AoE forwards to a session's agent. Requires the `mcp.rewrite` capability and a `[runtime]` worker. The hook runs only while the plugin is active: enabled, loaded, and with a grant covering the current manifest hash. While it is inactive (disabled, failed to load, or awaiting re-approval after an update changed its manifest) no hook runs and sandboxes get the full resolved set.
 
