@@ -841,6 +841,11 @@ pub struct AppStateConfig {
     #[serde(default)]
     pub has_seen_web_tour: bool,
 
+    /// Settings tab intros the user folded with "Got it", by id. Shared across Devices like
+    /// `has_seen_web_tour`; "Show tutorial" clears it so every intro shows once more.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub settings_intros_folded: Vec<String>,
+
     #[serde(default)]
     pub last_seen_version: Option<String>,
 

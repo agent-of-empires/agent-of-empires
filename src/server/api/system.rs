@@ -940,6 +940,87 @@ pub async fn get_tips(State(_state): State<Arc<AppState>>) -> impl IntoResponse 
     }
 }
 
+/// The Settings tabs that carry a first-visit intro. An id outside this list is rejected, so
+/// junk cannot accumulate in `app_state`.
+pub const SETTINGS_INTRO_IDS: &[&str] = &["worktree", "plugins", "structured-view"];
+
+#[derive(Deserialize)]
+pub struct FoldSettingsIntroBody {
+    pub id: String,
+}
+
+/// Folds one Settings tab intro ("Got it") in the shared `app_state`, so it stays folded on
+/// every Device. Exempt from elevation like [`mark_web_tour_seen`]; `read_only` still blocks it.
+pub async fn fold_settings_intro(
+    State(state): State<Arc<AppState>>,
+    body: Result<Json<FoldSettingsIntroBody>, axum::extract::rejection::JsonRejection>,
+) -> impl IntoResponse {
+    if state.read_only {
+        return read_only_response();
+    }
+    let Json(FoldSettingsIntroBody { id }) = match body {
+        Ok(b) => b,
+        Err(rej) => return rej.into_response(),
+    };
+    if !SETTINGS_INTRO_IDS.contains(&id.as_str()) {
+        return api_error(
+            StatusCode::BAD_REQUEST,
+            "unknown_intro",
+            format!("Unknown Settings intro '{id}'"),
+        );
+    }
+    write_settings_intros(move |folded| {
+        if !folded.contains(&id) {
+            folded.push(id);
+        }
+    })
+    .await
+}
+
+/// Unfolds every Settings tab intro, for "Show tutorial". Same exemptions as
+/// [`fold_settings_intro`].
+pub async fn reset_settings_intros(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    if state.read_only {
+        return read_only_response();
+    }
+    write_settings_intros(Vec::clear).await
+}
+
+async fn write_settings_intros(
+    change: impl FnOnce(&mut Vec<String>) + Send + 'static,
+) -> axum::response::Response {
+    let result = tokio::task::spawn_blocking(move || {
+        crate::session::update_app_state(|state| {
+            change(&mut state.settings_intros_folded);
+            state.settings_intros_folded.clone()
+        })
+    })
+    .await;
+    match result {
+        Ok(Ok(folded)) => (
+            StatusCode::OK,
+            Json(serde_json::json!({"settings_intros_folded": folded})),
+        )
+            .into_response(),
+        Ok(Err(e)) => {
+            tracing::warn!(target: "http.api.system", "Saving Settings intros failed: {}", e);
+            api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "save_failed",
+                "Failed to persist Settings intro state",
+            )
+        }
+        Err(e) => {
+            tracing::error!(target: "http.api.system", "Saving Settings intros panicked: {}", e);
+            api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "internal",
+                "Internal server error",
+            )
+        }
+    }
+}
+
 #[derive(Deserialize)]
 pub struct MarkTipSeenBody {
     pub id: String,
@@ -2743,5 +2824,49 @@ mod tests {
             .status(),
             StatusCode::OK
         );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn settings_intros_fold_once_reject_unknown_ids_and_reset() {
+        let _dir = crate::session::test_support::isolate_app_dir();
+        let state = crate::server::test_support::build_test_app_state(Vec::new());
+        let folded = || {
+            crate::session::Config::load()
+                .unwrap()
+                .app_state
+                .settings_intros_folded
+        };
+        let fold = |id: &str| {
+            let state = state.clone();
+            let id = id.to_string();
+            async move {
+                fold_settings_intro(State(state), Ok(Json(FoldSettingsIntroBody { id })))
+                    .await
+                    .into_response()
+                    .status()
+            }
+        };
+
+        assert_eq!(fold("worktree").await, StatusCode::OK);
+        assert_eq!(fold("plugins").await, StatusCode::OK);
+        assert_eq!(
+            fold("worktree").await,
+            StatusCode::OK,
+            "folding twice is a no-op"
+        );
+        assert_eq!(folded(), ["worktree", "plugins"]);
+        assert_eq!(fold("not-an-intro").await, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            folded(),
+            ["worktree", "plugins"],
+            "an unknown id is not stored"
+        );
+
+        let reset = reset_settings_intros(State(state.clone()))
+            .await
+            .into_response();
+        assert_eq!(reset.status(), StatusCode::OK);
+        assert!(folded().is_empty());
     }
 }

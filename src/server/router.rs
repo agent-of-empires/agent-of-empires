@@ -242,6 +242,10 @@ pub(super) fn build_router(state: Arc<AppState>) -> Router {
             "/api/app-state/web-tour-seen",
             post(api::mark_web_tour_seen),
         )
+        .route(
+            "/api/app-state/settings-intros",
+            post(api::fold_settings_intro).delete(api::reset_settings_intros),
+        )
         .route("/api/app-state/dismiss-update", post(api::dismiss_update))
         .route(
             "/api/app-state/web-ui-state",
