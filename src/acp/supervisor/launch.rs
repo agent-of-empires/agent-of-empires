@@ -1,5 +1,6 @@
 //! Bringing a worker up: admission, spawn, attach, and the launch environment.
 
+use std::future::Future;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -12,8 +13,9 @@ use super::agents::{
 use super::publish::collect_resumable_background_agent_launches;
 use super::teardown::{release_scope, tear_down_runner};
 use super::{
-    lock_recover, BroadcastSink, PendingContextReset, ResumeKind, ResumeReservation,
-    ResumeReservationOutcome, SpawnRequest, Supervisor, SupervisorError, WorkerHandle, WorkerKind,
+    lock_recover, BroadcastSink, PendingContextReset, RestartRequestGuard, ResumeKind,
+    ResumeReservation, ResumeReservationOutcome, SpawnRequest, Supervisor, SupervisorError,
+    WorkerHandle, WorkerKind,
 };
 use crate::acp::acp_client::{AcpClient, AcpError, SpawnConfig};
 use crate::acp::agent_policy::AgentPolicy;
@@ -22,6 +24,7 @@ use crate::acp::state::{AcpSessionId, Event};
 use crate::process::worker_registry;
 use crate::session::config::repo_config::resolve_config_with_repo_or_warn;
 use crate::session::SandboxInfo;
+use tokio_util::sync::CancellationToken;
 
 impl<S: BroadcastSink> Supervisor<S> {
     /// Spawn a structured view worker for the given session.
@@ -30,12 +33,36 @@ impl<S: BroadcastSink> Supervisor<S> {
         req: SpawnRequest,
         authority: crate::process::worker_registry::ResumeAuthority,
     ) -> Result<(), SupervisorError> {
+        self.spawn_with_restart_claim(req, authority, None).await
+    }
+
+    /// Start the replacement worker under the restart claim that excludes
+    /// concurrent ordinary starts for this session.
+    pub(crate) async fn spawn_for_restart(
+        &self,
+        req: SpawnRequest,
+        authority: crate::process::worker_registry::ResumeAuthority,
+        restart: &RestartRequestGuard,
+    ) -> Result<(), SupervisorError> {
+        self.spawn_with_restart_claim(req, authority, Some(restart))
+            .await
+    }
+
+    async fn spawn_with_restart_claim(
+        &self,
+        req: SpawnRequest,
+        authority: crate::process::worker_registry::ResumeAuthority,
+        restart: Option<&RestartRequestGuard>,
+    ) -> Result<(), SupervisorError> {
         let kind = if req.stored_acp_session_id.is_some() {
             ResumeKind::Spawn
         } else {
             ResumeKind::SpawnFirst
         };
-        match self.begin_resume(&req.session_id, kind, authority).await? {
+        match self
+            .begin_resume_with_restart_claim(&req.session_id, kind, authority, restart)
+            .await?
+        {
             ResumeReservationOutcome::Reserved(r) => self.spawn_inner(req, r).await,
             ResumeReservationOutcome::AlreadyPresent => {
                 Err(SupervisorError::AlreadyRunning(req.session_id))
@@ -51,10 +78,44 @@ impl<S: BroadcastSink> Supervisor<S> {
         kind: ResumeKind,
         authority: crate::process::worker_registry::ResumeAuthority,
     ) -> Result<ResumeReservationOutcome, SupervisorError> {
+        self.begin_resume_with_restart_claim(session_id, kind, authority, None)
+            .await
+    }
+
+    async fn begin_resume_with_restart_claim(
+        &self,
+        session_id: &str,
+        kind: ResumeKind,
+        authority: crate::process::worker_registry::ResumeAuthority,
+        restart: Option<&RestartRequestGuard>,
+    ) -> Result<ResumeReservationOutcome, SupervisorError> {
         let observed_stop = worker_registry::stop_intent(session_id)
             .map_err(|error| SupervisorError::Acp(AcpError::Spawn(error.to_string())))?;
         // Hold the worker gate while claiming the matching durable stop token.
         let _workers = self.workers.lock().await;
+        let restart_requests = lock_recover(&self.restart_requests);
+        let active_restart = restart_requests.get(session_id);
+        let restart_in_progress = active_restart.is_some();
+        let restart_authorized = restart.is_some_and(|claim| {
+            claim.session_id == session_id
+                && Arc::ptr_eq(&claim.requests, &self.restart_requests)
+                && active_restart.is_some_and(|(request_id, token)| {
+                    *request_id == claim.request_id && !token.is_cancelled()
+                })
+        });
+        if restart_in_progress && !restart_authorized {
+            if restart.is_some_and(|claim| claim.session_id == session_id && claim.is_cancelled()) {
+                return Err(SupervisorError::SpawnCancelled(session_id.to_string()));
+            }
+            return Err(SupervisorError::RestartInProgress(session_id.to_string()));
+        }
+        if restart.is_some() && !restart_authorized {
+            if restart.is_some_and(|claim| claim.session_id == session_id && claim.is_cancelled()) {
+                return Err(SupervisorError::SpawnCancelled(session_id.to_string()));
+            }
+            return Err(SupervisorError::RestartInProgress(session_id.to_string()));
+        }
+        drop(restart_requests);
         worker_registry::admit_resume(session_id, authority, &observed_stop)
             .map_err(|error| SupervisorError::Acp(AcpError::Spawn(error.to_string())))?;
         let mut table = lock_recover(&self.lifecycle);
@@ -94,11 +155,9 @@ impl<S: BroadcastSink> Supervisor<S> {
                 });
             }
         }
-        Ok(ResumeReservationOutcome::Reserved(ResumeReservation {
-            lease,
-            lifecycle: Arc::clone(&self.lifecycle),
-            notify: Arc::clone(&self.worker_notify),
-        }))
+        Ok(ResumeReservationOutcome::Reserved(
+            self.reservation_for_lease(lease),
+        ))
     }
 
     /// Spawn body, run under the reservation from `begin_resume`.
@@ -109,8 +168,24 @@ impl<S: BroadcastSink> Supervisor<S> {
     ) -> Result<(), SupervisorError> {
         let lease = reservation.lease().clone();
         let session_id = req.session_id.as_str();
-        let warmup_guard = self.warmup_guard(&req.agent).await;
-        let (config, context_reset) = self.spawn_config(&req, lease.epoch()).await?;
+        let warmup_guard =
+            match await_resume(reservation.cancellation(), self.warmup_guard(&req.agent)).await {
+                Ok(guard) => guard,
+                Err(()) => return Err(self.cancelled_spawn(&lease).await),
+            };
+        let (config, context_reset) = match await_resume(
+            reservation.cancellation(),
+            self.spawn_config(&req, lease.epoch()),
+        )
+        .await
+        {
+            Ok(Ok(config)) => config,
+            Ok(Err(error)) => return Err(error),
+            Err(()) => {
+                drop(warmup_guard);
+                return Err(self.cancelled_spawn(&lease).await);
+            }
+        };
         debug!(
             target: "acp.supervisor",
             session = %session_id,
@@ -118,13 +193,34 @@ impl<S: BroadcastSink> Supervisor<S> {
             "spawning structured view worker"
         );
         // The hooks above may re-enter aoe, so the lifecycle lock is taken only for each check.
-        admit_durable_launch(&req).await?;
+        match await_resume(reservation.cancellation(), admit_durable_launch(&req)).await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => return Err(error),
+            Err(()) => {
+                drop(warmup_guard);
+                return Err(self.cancelled_spawn(&lease).await);
+            }
+        }
         // Clear a partial replay from a failed import before session/load re-emits it.
         if config.seed_history_replay {
             self.sink.clear_session_events(session_id);
         }
 
-        let launched = (self.launcher)(config.clone(), AcpSessionId(session_id.to_string())).await;
+        // `session/new` and `session/load` can wait on an adapter indefinitely.
+        // A shutdown must be able to cancel that future instead of waiting for
+        // the adapter to eventually notice the stop.
+        let launched = match await_resume(
+            reservation.cancellation(),
+            (self.launcher)(config.clone(), AcpSessionId(session_id.to_string())),
+        )
+        .await
+        {
+            Ok(launched) => launched,
+            Err(()) => {
+                drop(warmup_guard);
+                return Err(self.cancelled_spawn(&lease).await);
+            }
+        };
         let mut client = match launched {
             Ok(c) => c,
             Err(err) => {
@@ -133,8 +229,8 @@ impl<S: BroadcastSink> Supervisor<S> {
                     .cancel_requested(&lease)
                     .is_some();
                 if cancelled {
-                    self.reap_failed_launch(&lease).await;
-                    return Err(SupervisorError::SpawnCancelled(req.session_id));
+                    drop(warmup_guard);
+                    return Err(self.cancelled_spawn(&lease).await);
                 }
                 if matches!(err, AcpError::IncompatibleAgent(_)) {
                     self.mark_incompatible_binary(session_id, &config.spec.command);
@@ -148,10 +244,18 @@ impl<S: BroadcastSink> Supervisor<S> {
         };
 
         // A peer that archived or trashed the row during the handshake wins: retire the runner.
-        if let Err(refused) = admit_durable_launch(&req).await {
-            drop(client);
-            self.reap_failed_launch(&lease).await;
-            return Err(refused);
+        match await_resume(reservation.cancellation(), admit_durable_launch(&req)).await {
+            Ok(Ok(())) => {}
+            Ok(Err(refused)) => {
+                drop(client);
+                self.reap_failed_launch(&lease).await;
+                return Err(refused);
+            }
+            Err(()) => {
+                drop(client);
+                drop(warmup_guard);
+                return Err(self.cancelled_spawn(&lease).await);
+            }
         }
 
         if warmup_guard.is_some() {
@@ -198,6 +302,16 @@ impl<S: BroadcastSink> Supervisor<S> {
             apply_mode(&client, session_id, mode_id, "spawn").await;
         }
         Ok(())
+    }
+
+    async fn cancelled_spawn(&self, lease: &Lease) -> SupervisorError {
+        let session_id = lease.session_id();
+        let reason = lock_recover(&self.lifecycle)
+            .cancel_requested(lease)
+            .unwrap_or_else(|| "user_stopped".into());
+        self.reap_failed_launch(lease).await;
+        self.publish_next(session_id, &Event::Stopped { reason });
+        SupervisorError::SpawnCancelled(session_id.to_string())
     }
 
     /// Serializes an agent's spawns until its first one finishes.
@@ -782,6 +896,17 @@ pub(super) fn publish_rejection(err: &AcpError, mut publish: impl FnMut(Event)) 
     true
 }
 
+async fn await_resume<T>(
+    cancellation: &CancellationToken,
+    future: impl Future<Output = T>,
+) -> Result<T, ()> {
+    tokio::select! {
+        biased;
+        _ = cancellation.cancelled() => Err(()),
+        result = future => Ok(result),
+    }
+}
+
 /// Recheck the stored row under its lifecycle lock: the caller's check ran before
 /// `spawn_config` awaited the `before_session` hook. Refuses an archived or trashed row, or one
 /// purged since. A request without a source profile has no stored row to check.
@@ -998,6 +1123,55 @@ mod tests {
     use crate::acp::approvals::{ApprovalDecision, Nonce};
     use crate::acp::runner_lifecycle::test_support::FakeProcessControl;
     use crate::daemon::AcpWorkerState;
+
+    #[tokio::test]
+    async fn ordinary_spawn_is_rejected_while_restart_claim_is_held() {
+        let supervisor = Supervisor::new(VecSink::new());
+        let _restart = supervisor
+            .try_begin_restart("s-restart")
+            .await
+            .expect("restart claims the session");
+
+        let result = supervisor
+            .spawn(
+                spawn_request("s-restart"),
+                crate::process::worker_registry::ResumeAuthority::Explicit,
+            )
+            .await;
+
+        assert!(matches!(
+            result,
+            Err(SupervisorError::RestartInProgress(id)) if id == "s-restart"
+        ));
+        assert_eq!(
+            supervisor.worker_state("s-restart").await,
+            AcpWorkerState::Absent
+        );
+    }
+
+    #[tokio::test]
+    async fn cancelled_restart_claim_does_not_admit_a_replacement() {
+        let supervisor = Supervisor::new(VecSink::new());
+        let restart = supervisor
+            .try_begin_restart("s-restart")
+            .await
+            .expect("restart claims the session");
+
+        supervisor.cancel_restart_request("s-restart").await;
+        let result = supervisor
+            .spawn_for_restart(
+                spawn_request("s-restart"),
+                crate::process::worker_registry::ResumeAuthority::Explicit,
+                &restart,
+            )
+            .await;
+
+        assert!(matches!(result, Err(SupervisorError::SpawnCancelled(id)) if id == "s-restart"));
+        assert_eq!(
+            supervisor.worker_state("s-restart").await,
+            AcpWorkerState::Absent
+        );
+    }
 
     fn mcp_names(servers: &[agent_client_protocol::schema::v1::McpServer]) -> Vec<&str> {
         use agent_client_protocol::schema::v1::McpServer;

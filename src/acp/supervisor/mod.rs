@@ -13,12 +13,14 @@ mod test_support;
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use thiserror::Error;
 use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
+use tokio_util::sync::CancellationToken;
 use tracing::warn;
 
 use super::acp_client::{AcpClient, AcpError, SpawnConfig};
@@ -59,6 +61,8 @@ type Workers = Arc<Mutex<HashMap<String, WorkerHandle>>>;
 /// Per-session seq counter; outlives workers so every publisher shares one sequence.
 type SeqMap = std::sync::Mutex<HashMap<String, u64>>;
 type SharedSet = Arc<std::sync::Mutex<HashSet<String>>>;
+type ResumeCancellations = Arc<std::sync::Mutex<HashMap<String, (u64, CancellationToken)>>>;
+type RestartRequests = Arc<std::sync::Mutex<HashMap<String, (u64, CancellationToken)>>>;
 
 #[derive(Debug, Error)]
 pub enum SupervisorError {
@@ -77,6 +81,8 @@ pub enum SupervisorError {
     InvalidAgentCommand(String),
     #[error("session {0:?} already has a running structured view worker")]
     AlreadyRunning(String),
+    #[error("session {0:?} has a restart in progress")]
+    RestartInProgress(String),
     #[error("structured view worker capacity full ({current}/{limit}); raise [acp] max_concurrent_workers or delete an existing structured view session")]
     CapacityFull { current: usize, limit: u32 },
     /// A concurrent shutdown cancelled the resume; callers treat it as a soft success.
@@ -165,6 +171,12 @@ pub struct Supervisor<S: BroadcastSink> {
     next_seqs: Arc<SeqMap>,
     /// Owner of every runner epoch. Lock order: `workers` before `lifecycle`.
     lifecycle: Arc<std::sync::Mutex<LifecycleTable>>,
+    /// Cancellation signals for launch futures admitted in the lifecycle table.
+    /// The epoch guards against an old reservation removing a newer token.
+    resume_cancellations: ResumeCancellations,
+    /// Explicit restart requests currently operating on each session.
+    restart_requests: RestartRequests,
+    next_restart_request_id: AtomicU64,
     process_control: Arc<dyn ProcessControl>,
     launcher: Launcher,
     /// Agents whose first spawn finished; until then spawns serialize on a
@@ -196,17 +208,62 @@ pub(crate) struct ResumeReservation {
     lease: Lease,
     lifecycle: Arc<std::sync::Mutex<LifecycleTable>>,
     notify: Arc<tokio::sync::Notify>,
+    cancellation: CancellationToken,
+    cancellations: ResumeCancellations,
+}
+
+/// Keeps concurrent explicit restart requests from restarting the same worker twice.
+pub(crate) struct RestartRequestGuard {
+    session_id: String,
+    request_id: u64,
+    cancellation: CancellationToken,
+    requests: RestartRequests,
+}
+
+impl Drop for RestartRequestGuard {
+    fn drop(&mut self) {
+        let mut requests = lock_recover(&self.requests);
+        if requests
+            .get(&self.session_id)
+            .is_some_and(|(request_id, _)| *request_id == self.request_id)
+        {
+            requests.remove(&self.session_id);
+        }
+    }
+}
+
+impl RestartRequestGuard {
+    pub(crate) fn is_cancelled(&self) -> bool {
+        self.cancellation.is_cancelled()
+    }
+
+    pub(crate) fn session_id(&self) -> &str {
+        &self.session_id
+    }
 }
 
 impl ResumeReservation {
     pub(crate) fn lease(&self) -> &Lease {
         &self.lease
     }
+
+    pub(crate) fn cancellation(&self) -> &CancellationToken {
+        &self.cancellation
+    }
 }
 
 impl Drop for ResumeReservation {
     fn drop(&mut self) {
-        if lock_recover(&self.lifecycle).abandon(&self.lease) {
+        let abandoned = lock_recover(&self.lifecycle).abandon(&self.lease);
+        let mut cancellations = lock_recover(&self.cancellations);
+        if cancellations
+            .get(self.lease.session_id())
+            .is_some_and(|(epoch, _)| *epoch == self.lease.epoch())
+        {
+            cancellations.remove(self.lease.session_id());
+        }
+        drop(cancellations);
+        if abandoned {
             self.notify.notify_waiters();
         }
     }
@@ -281,6 +338,9 @@ impl<S: BroadcastSink> Supervisor<S> {
             lifecycle: Arc::new(std::sync::Mutex::new(LifecycleTable::new(
                 chrono::Utc::now().timestamp_millis().max(1) as u64,
             ))),
+            resume_cancellations: Arc::default(),
+            restart_requests: Arc::default(),
+            next_restart_request_id: AtomicU64::new(1),
             process_control: Arc::new(SystemProcessControl::default()),
             launcher: Arc::new(|config, session_id| Box::pin(AcpClient::spawn(config, session_id))),
             warmed_up_agents: Arc::default(),
@@ -377,6 +437,9 @@ impl<S: BroadcastSink> Supervisor<S> {
             guard.remove(session_id);
         }
         lock_recover(&self.lifecycle).forget(session_id);
+        if let Some((_, token)) = lock_recover(&self.resume_cancellations).remove(session_id) {
+            token.cancel();
+        }
         lock_recover(&self.startup_failures).remove(session_id);
         lock_recover(&self.respawned_in_place).remove(session_id);
     }
@@ -431,6 +494,58 @@ impl<S: BroadcastSink> Supervisor<S> {
     pub async fn count(&self) -> usize {
         self.workers.lock().await.len()
     }
+
+    /// Create the cancellation-aware reservation used by a launch or respawn.
+    /// Keeping this beside the lifecycle lease makes every in-flight start
+    /// observable to `shutdown`, including drain-task respawns.
+    pub(crate) fn reservation_for_lease(&self, lease: Lease) -> ResumeReservation {
+        let cancellation = CancellationToken::new();
+        lock_recover(&self.resume_cancellations).insert(
+            lease.session_id().to_string(),
+            (lease.epoch(), cancellation.clone()),
+        );
+        ResumeReservation {
+            lease,
+            lifecycle: Arc::clone(&self.lifecycle),
+            notify: Arc::clone(&self.worker_notify),
+            cancellation,
+            cancellations: Arc::clone(&self.resume_cancellations),
+        }
+    }
+
+    /// Cancel an admitted launch after the lifecycle table records the stop.
+    pub(crate) fn cancel_resume(&self, session_id: &str) {
+        if let Some((_, token)) = lock_recover(&self.resume_cancellations).get(session_id) {
+            token.cancel();
+        }
+    }
+
+    /// Claim the session's restart lane while holding the same gate used by
+    /// `begin_resume`, so an explicit launch cannot slip past the claim.
+    pub(crate) async fn try_begin_restart(&self, session_id: &str) -> Option<RestartRequestGuard> {
+        let _workers = self.workers.lock().await;
+        let mut requests = lock_recover(&self.restart_requests);
+        if requests.contains_key(session_id) {
+            return None;
+        }
+        let request_id = self.next_restart_request_id.fetch_add(1, Ordering::Relaxed);
+        let cancellation = CancellationToken::new();
+        requests.insert(session_id.to_string(), (request_id, cancellation.clone()));
+        Some(RestartRequestGuard {
+            session_id: session_id.to_string(),
+            request_id,
+            cancellation,
+            requests: Arc::clone(&self.restart_requests),
+        })
+    }
+
+    /// Serialize with resume admission, then cancel any restart that has not settled yet.
+    pub(crate) async fn cancel_restart_request(&self, session_id: &str) {
+        let _workers = self.workers.lock().await;
+        if let Some((_, cancellation)) = lock_recover(&self.restart_requests).get(session_id) {
+            cancellation.cancel();
+        }
+    }
 }
 
 fn next_seq(next_seqs: &SeqMap, session_id: &str) -> u64 {
@@ -454,6 +569,21 @@ fn lock_recover<T>(m: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 mod tests {
     use super::test_support::*;
     use super::*;
+
+    #[tokio::test]
+    async fn explicit_restart_guard_serializes_same_session_and_releases_on_drop() {
+        let sup = Supervisor::new(VecSink::new());
+        let first = sup
+            .try_begin_restart("s-restart")
+            .await
+            .expect("first restart claims the session");
+
+        assert!(sup.try_begin_restart("s-restart").await.is_none());
+        assert!(sup.try_begin_restart("s-other").await.is_some());
+
+        drop(first);
+        assert!(sup.try_begin_restart("s-restart").await.is_some());
+    }
 
     #[tokio::test]
     async fn respawned_worker_rejects_the_prior_generation() {

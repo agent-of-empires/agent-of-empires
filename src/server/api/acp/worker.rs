@@ -199,6 +199,176 @@ pub async fn spawn_acp(
     .into_response()
 }
 
+/// Stop and start the structured-view worker as one operation. Unlike a plain
+/// spawn, this endpoint also cancels a launch that is stuck in
+/// `session/new`/`session/load` and proves the old worker is gone before it
+/// admits the replacement.
+pub async fn restart_acp(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    req: Result<Json<SpawnAcpRequest>, axum::extract::rejection::JsonRejection>,
+) -> impl IntoResponse {
+    if let Some(resp) = read_only_block(&state) {
+        return resp;
+    }
+    if let Some(resp) = cityhall_block(&state) {
+        return resp;
+    }
+    let Json(req) = match req {
+        Ok(j) => j,
+        Err(rej) => return rej.into_response(),
+    };
+    let Some(restart) = state.acp_supervisor.try_begin_restart(&id).await else {
+        return (
+            StatusCode::CONFLICT,
+            "restart_in_progress: a restart is already in progress for this session",
+        )
+            .into_response();
+    };
+    let Some(preflight_instance) = find_instance(&state, &id).await else {
+        return session_not_found();
+    };
+    if !preflight_instance.is_structured() {
+        return not_structured_response();
+    }
+    if let Err(blocked) = preflight_instance.ensure_startable() {
+        return crate::server::api::start_blocked_response(blocked);
+    }
+    if let Some(resp) = refuse_if_stored_row_shelved(&state, &preflight_instance).await {
+        return resp;
+    }
+
+    // Cancel before waiting for the submission and instance guards: an in-flight
+    // spawn request holds both guards until its launcher returns.
+    if let Err(e) = state
+        .acp_supervisor
+        .shutdown_and_wait_for_restart(&id, std::time::Duration::from_secs(5), &restart)
+        .await
+    {
+        return supervisor_error_response("restart shutdown failed", &e);
+    }
+    if restart.is_cancelled() {
+        return supervisor_error_response(
+            "restart cancelled by a stop request",
+            &crate::acp::supervisor::SupervisorError::SpawnCancelled(id.clone()),
+        );
+    }
+    if state.acp_supervisor.worker_state(&id).await != crate::daemon::AcpWorkerState::Absent {
+        return (
+            StatusCode::CONFLICT,
+            "worker_not_stopped: the previous worker has not finished stopping; retry the restart shortly",
+        )
+            .into_response();
+    }
+
+    let Some(_submission) = state
+        .session_service
+        .prompt_submission_for_session(&id)
+        .await
+    else {
+        return session_not_found();
+    };
+    if restart.is_cancelled() {
+        return supervisor_error_response(
+            "restart cancelled by a stop request",
+            &crate::acp::supervisor::SupervisorError::SpawnCancelled(id.clone()),
+        );
+    }
+
+    let inst_lock = state.instance_lock(&id).await;
+    let _guard = inst_lock.lock().await;
+    let Some(instance) = find_instance(&state, &id).await else {
+        return session_not_found();
+    };
+    if !instance.is_structured() {
+        return not_structured_response();
+    }
+    if let Err(blocked) = instance.ensure_startable() {
+        return crate::server::api::start_blocked_response(blocked);
+    }
+    let explicit = req.agent.clone().or_else(|| instance.agent_name.clone());
+    let agent = pick_agent(&state, &instance, explicit.as_deref()).await;
+
+    if let Some(resp) = refuse_if_stored_row_shelved(&state, &instance).await {
+        return resp;
+    }
+    if restart.is_cancelled() {
+        return supervisor_error_response(
+            "restart cancelled by a stop request",
+            &crate::acp::supervisor::SupervisorError::SpawnCancelled(id.clone()),
+        );
+    }
+    // A second explicit start may have won the lock while this request waited
+    // for its guards. Stop it under those guards before admitting the restart.
+    if state.acp_supervisor.worker_state(&id).await != crate::daemon::AcpWorkerState::Absent {
+        if let Err(e) = state
+            .acp_supervisor
+            .shutdown_and_wait_for_restart(&id, std::time::Duration::from_secs(5), &restart)
+            .await
+        {
+            return supervisor_error_response("restart shutdown failed", &e);
+        }
+        if state.acp_supervisor.worker_state(&id).await != crate::daemon::AcpWorkerState::Absent {
+            return (
+                StatusCode::CONFLICT,
+                "worker_not_stopped: the previous worker has not finished stopping; retry the restart shortly",
+            )
+                .into_response();
+        }
+    }
+
+    let sandbox_info = match crate::acp::sandbox::ensure_container_for_session_locked(
+        &state.instances,
+        &state.mutation_epoch,
+        &id,
+        false,
+    )
+    .await
+    {
+        Ok(info) => info,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("sandbox container ensure failed: {e}"),
+            )
+                .into_response();
+        }
+    };
+    if restart.is_cancelled() {
+        return supervisor_error_response(
+            "restart cancelled by a stop request",
+            &crate::acp::supervisor::SupervisorError::SpawnCancelled(id.clone()),
+        );
+    }
+    let request = SpawnRequest {
+        additional_dirs: req.additional_dirs,
+        provider_env: req
+            .provider_env
+            .into_iter()
+            .map(|p| (p.key, p.value))
+            .collect(),
+        model: req.model.or_else(|| instance.agent_model.clone()),
+        ..spawn_request_for(&instance, agent.clone(), sandbox_info)
+    };
+    match state
+        .acp_supervisor
+        .spawn_for_restart(
+            request,
+            crate::process::worker_registry::ResumeAuthority::Explicit,
+            &restart,
+        )
+        .await
+    {
+        Ok(()) => Json(SpawnAcpResponse {
+            session_id: id,
+            agent,
+            status: "running",
+        })
+        .into_response(),
+        Err(e) => supervisor_error_response("restart spawn failed", &e),
+    }
+}
+
 pub async fn shutdown_acp(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
@@ -208,6 +378,12 @@ pub async fn shutdown_acp(
     }
     if let Some(resp) = cityhall_block(&state) {
         return resp;
+    }
+    state.acp_supervisor.cancel_restart_request(&id).await;
+    if state.acp_supervisor.worker_state(&id).await == crate::daemon::AcpWorkerState::Resuming {
+        if let Err(e) = state.acp_supervisor.shutdown(&id).await {
+            return supervisor_error_response("shutdown failed", &e);
+        }
     }
     // Worker-stopping barrier (#3650): wait out any in-flight submission.
     let Some(_submission) = state
@@ -709,6 +885,243 @@ mod tests {
     use super::*;
     use crate::acp::agent_policy::AgentPolicy;
     use crate::acp::state::RateLimitInfo;
+
+    #[tokio::test]
+    async fn a_concurrent_restart_request_returns_conflict() {
+        let state = crate::server::test_support::build_test_app_state(Vec::new());
+        let id = "restart-in-flight".to_string();
+        let first = state
+            .acp_supervisor
+            .try_begin_restart(&id)
+            .await
+            .expect("the first restart claims the session");
+
+        let response = restart_acp(
+            State(Arc::clone(&state)),
+            Path(id.clone()),
+            Ok(Json(SpawnAcpRequest {
+                agent: None,
+                model: None,
+                additional_dirs: Vec::new(),
+                provider_env: Vec::new(),
+            })),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert!(String::from_utf8_lossy(&body).starts_with("restart_in_progress:"));
+
+        drop(first);
+        assert!(state.acp_supervisor.try_begin_restart(&id).await.is_some());
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn restart_cancels_a_spawn_while_it_holds_submission_and_instance_locks() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let _home = crate::session::test_support::isolate_app_dir();
+        let mut instance = crate::session::Instance::new("restart", "/tmp/aoe-restart-api");
+        instance.view = crate::session::View::Structured;
+        instance.source_profile = "default".into();
+        let id = instance.id.clone();
+        crate::server::test_support::seed_instances_on_disk_for_test(
+            "default",
+            vec![instance.clone()],
+        );
+
+        let (started_tx, mut started_rx) = tokio::sync::mpsc::unbounded_channel();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let launcher: crate::acp::supervisor::Launcher = {
+            let calls = Arc::clone(&calls);
+            Arc::new(move |_config, _session_id| {
+                let call = calls.fetch_add(1, Ordering::SeqCst);
+                let started = started_tx.clone();
+                Box::pin(async move {
+                    started.send(call).expect("test receiver remains open");
+                    std::future::pending::<
+                        Result<crate::acp::acp_client::AcpClient, crate::acp::acp_client::AcpError>,
+                    >()
+                    .await
+                })
+            })
+        };
+        let state = crate::server::test_support::build_test_app_state_with_launcher(
+            vec![instance],
+            launcher,
+        );
+        let first = {
+            let state = Arc::clone(&state);
+            let id = id.clone();
+            tokio::spawn(async move {
+                spawn_acp(
+                    State(state),
+                    Path(id),
+                    Ok(Json(SpawnAcpRequest {
+                        agent: None,
+                        model: None,
+                        additional_dirs: Vec::new(),
+                        provider_env: Vec::new(),
+                    })),
+                )
+                .await
+                .into_response()
+            })
+        };
+        assert_eq!(
+            tokio::time::timeout(std::time::Duration::from_secs(3), started_rx.recv())
+                .await
+                .expect("initial spawn reaches its blocked launcher"),
+            Some(0)
+        );
+
+        let restarting = {
+            let state = Arc::clone(&state);
+            let id = id.clone();
+            tokio::spawn(async move {
+                restart_acp(
+                    State(state),
+                    Path(id),
+                    Ok(Json(SpawnAcpRequest {
+                        agent: None,
+                        model: None,
+                        additional_dirs: Vec::new(),
+                        provider_env: Vec::new(),
+                    })),
+                )
+                .await
+                .into_response()
+            })
+        };
+        assert_eq!(
+            tokio::time::timeout(std::time::Duration::from_secs(3), started_rx.recv())
+                .await
+                .expect("restart cancels the first launch and starts its replacement"),
+            Some(1)
+        );
+        tokio::time::timeout(std::time::Duration::from_secs(1), first)
+            .await
+            .expect("the cancelled spawn request releases its guards")
+            .expect("initial spawn handler panicked");
+
+        let duplicate = restart_acp(
+            State(Arc::clone(&state)),
+            Path(id.clone()),
+            Ok(Json(SpawnAcpRequest {
+                agent: None,
+                model: None,
+                additional_dirs: Vec::new(),
+                provider_env: Vec::new(),
+            })),
+        )
+        .await
+        .into_response();
+        assert_eq!(duplicate.status(), StatusCode::CONFLICT);
+        let body = axum::body::to_bytes(duplicate.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert!(String::from_utf8_lossy(&body).starts_with("restart_in_progress:"));
+
+        let stopped = shutdown_acp(State(Arc::clone(&state)), Path(id.clone()))
+            .await
+            .into_response();
+        assert!([StatusCode::NO_CONTENT, StatusCode::NOT_FOUND].contains(&stopped.status()));
+        let restart_response = tokio::time::timeout(std::time::Duration::from_secs(1), restarting)
+            .await
+            .expect("replacement launch observes shutdown")
+            .expect("restart handler panicked");
+        assert_eq!(restart_response.status(), StatusCode::CONFLICT);
+        let body = axum::body::to_bytes(restart_response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert!(String::from_utf8_lossy(&body).starts_with("spawn_cancelled:"));
+        assert_eq!(
+            state.acp_supervisor.worker_state(&id).await,
+            crate::daemon::AcpWorkerState::Absent
+        );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn delete_cancels_a_start_before_waiting_for_its_submission_guard() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let _home = crate::session::test_support::isolate_app_dir();
+        let mut instance = crate::session::Instance::new("stop-start", "/tmp/aoe-stop-start-api");
+        instance.view = crate::session::View::Structured;
+        instance.source_profile = "default".into();
+        let id = instance.id.clone();
+        crate::server::test_support::seed_instances_on_disk_for_test(
+            "default",
+            vec![instance.clone()],
+        );
+
+        let (started_tx, mut started_rx) = tokio::sync::mpsc::unbounded_channel();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let launcher: crate::acp::supervisor::Launcher = {
+            let calls = Arc::clone(&calls);
+            Arc::new(move |_config, _session_id| {
+                let call = calls.fetch_add(1, Ordering::SeqCst);
+                let started = started_tx.clone();
+                Box::pin(async move {
+                    started.send(call).expect("test receiver remains open");
+                    std::future::pending::<
+                        Result<crate::acp::acp_client::AcpClient, crate::acp::acp_client::AcpError>,
+                    >()
+                    .await
+                })
+            })
+        };
+        let state = crate::server::test_support::build_test_app_state_with_launcher(
+            vec![instance],
+            launcher,
+        );
+        let spawning = {
+            let state = Arc::clone(&state);
+            let id = id.clone();
+            tokio::spawn(async move {
+                spawn_acp(
+                    State(state),
+                    Path(id),
+                    Ok(Json(SpawnAcpRequest {
+                        agent: None,
+                        model: None,
+                        additional_dirs: Vec::new(),
+                        provider_env: Vec::new(),
+                    })),
+                )
+                .await
+                .into_response()
+            })
+        };
+        assert_eq!(
+            tokio::time::timeout(std::time::Duration::from_secs(3), started_rx.recv())
+                .await
+                .expect("initial spawn reaches its blocked launcher"),
+            Some(0)
+        );
+
+        let stopped = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            shutdown_acp(State(Arc::clone(&state)), Path(id.clone())),
+        )
+        .await
+        .expect("DELETE cancels launch before waiting on the submission guard")
+        .into_response();
+        assert!([StatusCode::NO_CONTENT, StatusCode::NOT_FOUND].contains(&stopped.status()));
+        tokio::time::timeout(std::time::Duration::from_secs(1), spawning)
+            .await
+            .expect("cancelled start releases the submission guard")
+            .expect("spawn handler panicked");
+        assert_eq!(
+            state.acp_supervisor.worker_state(&id).await,
+            crate::daemon::AcpWorkerState::Absent
+        );
+    }
 
     #[tokio::test]
     #[serial_test::serial]

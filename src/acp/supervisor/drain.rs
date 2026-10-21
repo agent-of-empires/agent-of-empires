@@ -7,6 +7,7 @@ use std::time::{Duration, Instant};
 
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
 use super::agents::log_wrapper_substitution;
@@ -18,9 +19,9 @@ use super::teardown::{
     settle_sweeping_if_owed, tear_down_replacement, tear_down_runner, wait_for_exit,
 };
 use super::{
-    lock_recover, next_seq, BroadcastSink, Launcher, PendingContextReset, ResumeReservation,
-    SeqMap, SharedSet, Supervisor, WorkerKind, Workers, MAX_RESPAWNS_IN_WINDOW, RESPAWN_BACKOFF,
-    RESTART_WINDOW,
+    lock_recover, next_seq, BroadcastSink, Launcher, PendingContextReset, ResumeCancellations,
+    ResumeReservation, SeqMap, SharedSet, Supervisor, WorkerKind, Workers, MAX_RESPAWNS_IN_WINDOW,
+    RESPAWN_BACKOFF, RESTART_WINDOW,
 };
 use crate::acp::acp_client::{AcpError, SpawnConfig};
 use crate::acp::runner_lifecycle::{
@@ -47,6 +48,7 @@ impl<S: BroadcastSink> Supervisor<S> {
             process_control: Arc::clone(&self.process_control),
             launcher: Arc::clone(&self.launcher),
             notify: Arc::clone(&self.worker_notify),
+            resume_cancellations: Arc::clone(&self.resume_cancellations),
             startup_failures: Arc::clone(&self.startup_failures),
             pending_context_resets: Arc::clone(&self.pending_context_resets),
             context_reset,
@@ -70,10 +72,28 @@ struct Drain<S> {
     process_control: Arc<dyn ProcessControl>,
     launcher: Launcher,
     notify: Arc<tokio::sync::Notify>,
+    resume_cancellations: ResumeCancellations,
     startup_failures: SharedSet,
     pending_context_resets: SharedSet,
     context_reset: Option<PendingContextReset>,
     respawned_in_place: SharedSet,
+}
+
+impl<S> Drain<S> {
+    fn reservation_for_lease(&self, lease: Lease) -> ResumeReservation {
+        let cancellation = CancellationToken::new();
+        lock_recover(&self.resume_cancellations).insert(
+            lease.session_id().to_string(),
+            (lease.epoch(), cancellation.clone()),
+        );
+        ResumeReservation {
+            lease,
+            lifecycle: Arc::clone(&self.lifecycle),
+            notify: Arc::clone(&self.notify),
+            cancellation,
+            cancellations: Arc::clone(&self.resume_cancellations),
+        }
+    }
 }
 
 /// What a worker's event stream said before it closed.
@@ -419,14 +439,21 @@ impl<S: BroadcastSink> Drain<S> {
             );
             return None;
         };
-        let reservation = ResumeReservation {
-            lease: respawn_lease.clone(),
-            lifecycle: Arc::clone(&self.lifecycle),
-            notify: Arc::clone(&self.notify),
-        };
+        let reservation = self.reservation_for_lease(respawn_lease.clone());
         config.generation = respawn_lease.epoch();
 
-        tokio::time::sleep(RESPAWN_BACKOFF).await;
+        tokio::select! {
+            _ = tokio::time::sleep(RESPAWN_BACKOFF) => {}
+            _ = reservation.cancellation().cancelled() => {
+                let reason = lock_recover(&self.lifecycle)
+                    .cancel_requested(&respawn_lease)
+                    .unwrap_or_else(|| "user_stopped".into());
+                if lock_recover(&self.lifecycle).convert_to_stopping(&respawn_lease) {
+                    self.finish_cancelled(&respawn_lease, previous, reason, None).await;
+                }
+                return None;
+            }
+        }
         if worker_registry::stop_requested(session_id) {
             lock_recover(&self.lifecycle).begin_stop(session_id, "user_stopped");
         }
@@ -462,11 +489,41 @@ impl<S: BroadcastSink> Drain<S> {
             }
             previous = None;
         }
-        Self::refresh_launch_env(&self.session_id, &mut config).await;
+        let refreshed = tokio::select! {
+            biased;
+            _ = reservation.cancellation().cancelled() => false,
+            _ = Self::refresh_launch_env(&self.session_id, &mut config) => true,
+        };
+        if !refreshed {
+            let reason = lock_recover(&self.lifecycle)
+                .cancel_requested(&respawn_lease)
+                .unwrap_or_else(|| "user_stopped".into());
+            if lock_recover(&self.lifecycle).convert_to_stopping(&respawn_lease) {
+                self.finish_cancelled(&respawn_lease, previous, reason, None)
+                    .await;
+            }
+            return None;
+        }
         if let Some((wrapper, base)) = &config.wrapper_substitution {
             log_wrapper_substitution(session_id, &config.tool, wrapper, base);
         }
-        let launched = (self.launcher)(config.clone(), AcpSessionId(session_id.clone())).await;
+        let launched = tokio::select! {
+            launched = (self.launcher)(config.clone(), AcpSessionId(session_id.clone())) => launched,
+            _ = reservation.cancellation().cancelled() => {
+                let launched = worker_registry::load(session_id)
+                    .ok()
+                    .flatten()
+                    .filter(|record| record.generation == respawn_lease.epoch())
+                    .map(|record| RunnerIdentity::from_record(&record));
+                let reason = lock_recover(&self.lifecycle)
+                    .cancel_requested(&respawn_lease)
+                    .unwrap_or_else(|| "user_stopped".into());
+                if lock_recover(&self.lifecycle).convert_to_stopping(&respawn_lease) {
+                    self.finish_cancelled(&respawn_lease, previous, reason, launched).await;
+                }
+                return None;
+            }
+        };
         let mut client = match launched {
             Ok(client) => client,
             Err(e) => {

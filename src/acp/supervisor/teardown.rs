@@ -5,7 +5,10 @@ use std::time::{Duration, Instant};
 
 use tracing::{debug, info, warn};
 
-use super::{lock_recover, BroadcastSink, Supervisor, SupervisorError, WorkerHandle, WorkerKind};
+use super::{
+    lock_recover, BroadcastSink, RestartRequestGuard, Supervisor, SupervisorError, WorkerHandle,
+    WorkerKind,
+};
 use crate::acp::acp_client::{AcpClient, DeleteSessionOutcome};
 use crate::acp::runner_lifecycle::{
     Lease, LifecycleTable, ProcessControl, RunnerIdentity, Settlement, StopDecision,
@@ -26,12 +29,14 @@ const TEARDOWN_ORPHAN_GRACE: Duration = Duration::from_secs(15);
 impl<S: BroadcastSink> Supervisor<S> {
     /// Stop a worker, keeping its agent-side transcript resumable.
     pub async fn shutdown(&self, session_id: &str) -> Result<(), SupervisorError> {
+        self.cancel_restart_request(session_id).await;
         self.shutdown_with_reason(session_id, "user_stopped", false)
             .await
     }
 
     /// Stop a worker reclaimed for inactivity.
     pub async fn shutdown_idle(&self, session_id: &str) -> Result<(), SupervisorError> {
+        self.cancel_restart_request(session_id).await;
         self.shutdown_with_reason(session_id, "idle_auto_stop", false)
             .await
     }
@@ -39,6 +44,7 @@ impl<S: BroadcastSink> Supervisor<S> {
     /// Stop a worker being permanently discarded, releasing agent-side state
     /// via `session/delete`. Reversible stops must not use this.
     pub async fn shutdown_and_delete(&self, session_id: &str) -> Result<(), SupervisorError> {
+        self.cancel_restart_request(session_id).await;
         self.shutdown_with_reason(session_id, "user_stopped", true)
             .await
     }
@@ -50,9 +56,37 @@ impl<S: BroadcastSink> Supervisor<S> {
         session_id: &str,
         deadline: Duration,
     ) -> Result<(), SupervisorError> {
+        self.cancel_restart_request(session_id).await;
+        self.shutdown_and_wait_inner(session_id, deadline).await
+    }
+
+    /// Internal restart teardown preserves the claim that protects the stop/start sequence.
+    pub(crate) async fn shutdown_and_wait_for_restart(
+        &self,
+        session_id: &str,
+        deadline: Duration,
+        restart: &RestartRequestGuard,
+    ) -> Result<(), SupervisorError> {
+        if restart.session_id() != session_id {
+            return Err(SupervisorError::RestartInProgress(session_id.to_string()));
+        }
+        if restart.is_cancelled() {
+            return Err(SupervisorError::SpawnCancelled(session_id.to_string()));
+        }
+        self.shutdown_and_wait_inner(session_id, deadline).await
+    }
+
+    async fn shutdown_and_wait_inner(
+        &self,
+        session_id: &str,
+        deadline: Duration,
+    ) -> Result<(), SupervisorError> {
         let pid_before = worker_registry::pid_source_for(session_id);
         let start = Instant::now();
-        match self.shutdown(session_id).await {
+        match self
+            .shutdown_with_reason(session_id, "user_stopped", false)
+            .await
+        {
             Ok(()) => {}
             Err(SupervisorError::UnknownSession(_)) => return Ok(()),
             Err(e) => return Err(e),
@@ -156,6 +190,10 @@ impl<S: BroadcastSink> Supervisor<S> {
                 Ok(())
             }
             StopDecision::CancelRequested => {
+                // Wake the launcher immediately. The lifecycle table remains
+                // the authority for the final outcome; this only interrupts
+                // an adapter future that may be blocked in session/new/load.
+                self.cancel_resume(session_id);
                 drop(workers);
                 worker_registry::clear_restart_marker(session_id);
                 debug!(
@@ -1754,6 +1792,98 @@ mod tests {
             ),
             "once settled the session admits a fresh resume"
         );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn shutdown_cancels_a_launcher_that_never_returns() {
+        let _home = isolate_home();
+        let gate = Gate::default();
+        let sup =
+            Arc::new(Supervisor::new(VecSink::new()).with_launcher(gated_launcher(&gate, 4545)));
+        let spawner = {
+            let sup = Arc::clone(&sup);
+            tokio::spawn(async move {
+                sup.spawn(
+                    spawn_request("s-cancel-blocked"),
+                    crate::process::worker_registry::ResumeAuthority::Explicit,
+                )
+                .await
+            })
+        };
+        gate.entered.notified().await;
+        sup.shutdown("s-cancel-blocked")
+            .await
+            .expect("shutdown is a soft success while launch is in flight");
+        let result = tokio::time::timeout(std::time::Duration::from_secs(1), spawner)
+            .await
+            .expect("cancellation must not wait for the adapter")
+            .expect("spawn task panicked");
+        assert!(matches!(result, Err(SupervisorError::SpawnCancelled(_))));
+        assert_eq!(
+            sup.worker_state("s-cancel-blocked").await,
+            AcpWorkerState::Absent
+        );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn shutdown_cancels_a_second_spawn_waiting_for_agent_warmup() {
+        let _home = isolate_home();
+        let control = Arc::new(FakeProcessControl::default());
+        control.alive(4546);
+        let gate = Gate::default();
+        let sup = Arc::new(
+            Supervisor::new(VecSink::new())
+                .with_process_control(control)
+                .with_launcher(gated_launcher(&gate, 4546)),
+        );
+        let first = {
+            let sup = Arc::clone(&sup);
+            tokio::spawn(async move {
+                sup.spawn(
+                    spawn_request("s-warmup-first"),
+                    crate::process::worker_registry::ResumeAuthority::Explicit,
+                )
+                .await
+            })
+        };
+        gate.entered.notified().await;
+
+        let second = {
+            let sup = Arc::clone(&sup);
+            tokio::spawn(async move {
+                sup.spawn(
+                    spawn_request("s-warmup-second"),
+                    crate::process::worker_registry::ResumeAuthority::Explicit,
+                )
+                .await
+            })
+        };
+        tokio::task::yield_now().await;
+        assert_eq!(
+            sup.worker_state("s-warmup-second").await,
+            AcpWorkerState::Resuming
+        );
+
+        sup.shutdown("s-warmup-second")
+            .await
+            .expect("shutdown cancels the pending start");
+        let result = tokio::time::timeout(std::time::Duration::from_secs(1), second)
+            .await
+            .expect("shutdown must not wait for the first spawn's warmup lock")
+            .expect("second spawn task panicked");
+        assert!(matches!(result, Err(SupervisorError::SpawnCancelled(_))));
+        assert_eq!(
+            sup.worker_state("s-warmup-second").await,
+            AcpWorkerState::Absent
+        );
+
+        gate.open.notify_one();
+        first.await.expect("first spawn task panicked").unwrap();
+        sup.shutdown("s-warmup-first")
+            .await
+            .expect("first worker is cleaned up");
     }
 
     /// A stop that lands while the launch then fails still releases the scope

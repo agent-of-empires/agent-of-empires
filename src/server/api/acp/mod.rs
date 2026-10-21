@@ -36,7 +36,7 @@ pub use prompt::{
 };
 pub use view::{acp_disable, acp_enable};
 pub use worker::{
-    get_option_catalog, list_acp_agents, shutdown_acp, spawn_acp, switch_acp_agent,
+    get_option_catalog, list_acp_agents, restart_acp, shutdown_acp, spawn_acp, switch_acp_agent,
     switch_acp_provider,
 };
 
@@ -71,6 +71,9 @@ fn supervisor_error_response(context: &str, err: &SupervisorError) -> Response {
             StatusCode::CONFLICT,
             "structured view worker already running for session".to_string(),
         ),
+        SupervisorError::RestartInProgress(_) => {
+            (StatusCode::CONFLICT, format!("restart_in_progress: {err}"))
+        }
         SupervisorError::CapacityFull { .. } | SupervisorError::TeardownPending(_) => {
             (StatusCode::SERVICE_UNAVAILABLE, err.to_string())
         }

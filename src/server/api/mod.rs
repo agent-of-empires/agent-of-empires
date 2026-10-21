@@ -25,8 +25,8 @@ pub use acp::{
     acp_attachment, acp_cancel, acp_context_primer, acp_disable, acp_enable, acp_files,
     acp_force_end_turn, acp_prompt, acp_prompt_diff_comments, acp_replay, acp_set_config_option,
     acp_set_mode, acp_worker_log, agent_install_info, get_option_catalog, install_agent,
-    list_acp_agents, list_importable_sessions, resolve_approval, resolve_elicitation, shutdown_acp,
-    spawn_acp, switch_acp_agent, switch_acp_provider,
+    list_acp_agents, list_importable_sessions, resolve_approval, resolve_elicitation, restart_acp,
+    shutdown_acp, spawn_acp, switch_acp_agent, switch_acp_provider,
 };
 
 pub use queue::{queue_clear, queue_edit, queue_enqueue, queue_list, queue_remove};
@@ -400,7 +400,7 @@ mod tests {
         (
             "acp/worker.rs",
             include_str!("acp/worker.rs"),
-            &["spawn_acp", "shutdown_acp"],
+            &["spawn_acp", "restart_acp", "shutdown_acp"],
         ),
         (
             "acp/prompt.rs",
