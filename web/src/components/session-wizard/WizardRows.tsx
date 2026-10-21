@@ -137,7 +137,7 @@ export function SegmentedRow<T extends string>({
     const at = enabled.findIndex((o) => o.value === value);
     const next = enabled[(at + step + enabled.length) % enabled.length];
     if (!next) return;
-    onChange(next.value);
+    if (next.value !== value) onChange(next.value);
     refs.current[options.indexOf(next)]?.focus();
   };
   return (
@@ -180,7 +180,8 @@ export function SegmentedRow<T extends string>({
               aria-label={option.name}
               disabled={option.disabled}
               tabIndex={selected ? 0 : -1}
-              onClick={() => onChange(option.value)}
+              // Re-picking the selected option must not overwrite a choice the row is overriding.
+              onClick={() => option.value !== value && onChange(option.value)}
               className={`min-h-8 rounded px-2 text-xs font-medium transition-colors disabled:cursor-not-allowed disabled:opacity-40 ${
                 selected ? "bg-surface-700 text-text-primary" : "text-text-secondary hover:text-text-primary"
               }`}
