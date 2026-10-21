@@ -196,6 +196,7 @@ export function SessionWizard({
     groupsFor: null,
     profiles: [],
     dockerAvailable: false,
+    dockerRuntimeName: null,
     dockerChecked: false,
   });
 
@@ -285,7 +286,9 @@ export function SessionWizard({
     const generations = defaultsGeneration;
     const switches = profileSwitchRef;
     fetchAgents().then((a) => dispatch({ type: "SET_AGENTS", agents: a }));
-    fetchDockerStatus().then((d) => dispatch({ type: "SET_DOCKER", available: d.available }));
+    fetchDockerStatus().then((d) =>
+      dispatch({ type: "SET_DOCKER", available: d.available, runtimeName: d.runtime_name ?? null }),
+    );
     fetchProfiles()
       .then((profiles) => dispatch({ type: "SET_PROFILES", profiles }))
       .catch(() => {});
@@ -609,6 +612,7 @@ export function SessionWizard({
           d.tool,
           state.agents.find((a) => a.name === d.tool),
         ),
+        state.agents.find((a) => a.name === d.tool)?.always_yolo === true,
       ),
       idempotency_key: newIdempotencyKey(),
     };
@@ -690,7 +694,13 @@ export function SessionWizard({
       : isHostOnly
         ? hostOnlyReason
         : null;
-  const sandboxBlocked = isHostOnly ? hostOnlyReason : !state.dockerAvailable ? "Docker is not running" : null;
+  const sandboxBlocked = isHostOnly
+    ? hostOnlyReason
+    : !state.dockerAvailable
+      ? `${state.dockerRuntimeName ?? "Container runtime"} is not running`
+      : null;
+  // Locked on without touching the stored value, so another agent gets it back.
+  const alwaysYolo = selectedAgent?.always_yolo === true;
   const agentCustomized = !!(d.extraArgs || d.commandOverride || d.customInstruction);
   const openPanel = (next: Panel) => () => setPanel(next);
   const effectiveProfile = d.profile || servedProfile;
@@ -837,11 +847,19 @@ export function SessionWizard({
           }
         />
         <SwitchRow
-          label="Auto-approve"
-          switchLabel="Auto-approve actions"
-          checked={d.yoloMode}
+          label="Yolo mode"
+          switchLabel="Yolo mode"
+          testId="wizard-yolo-row"
+          checked={alwaysYolo || d.yoloMode}
           onChange={(v) => handleChange("yoloMode", v)}
-          summary="skip permission prompts"
+          disabled={alwaysYolo}
+          summary={
+            alwaysYolo
+              ? `always on for ${d.tool}`
+              : d.yoloMode
+                ? "skips permission prompts"
+                : "asks before running commands"
+          }
         />
         <SwitchRow
           label="Worktree"

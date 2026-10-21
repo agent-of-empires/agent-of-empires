@@ -135,7 +135,7 @@ export async function mockWizardApis(page: Page, opts: WizardMockOptions = {}) {
   await page.route("**/api/recent-projects", (r) => r.fulfill({ json: { projects: [] } }));
   await page.route("**/api/projects**", (r) => r.fulfill({ json: projects }));
   await page.route("**/api/docker/status", (r) =>
-    r.fulfill({ json: { available: !!opts.docker, runtime: opts.docker ? "docker" : null } }),
+    r.fulfill({ json: { available: !!opts.docker, runtime: "docker", runtime_name: "Docker" } }),
   );
   await page.route("**/api/groups**", (r) => r.fulfill({ json: opts.groups ?? [] }));
   await page.route("**/api/agents", (r) => r.fulfill({ json: opts.agents ?? [CLAUDE_AGENT] }));

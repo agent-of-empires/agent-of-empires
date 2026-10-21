@@ -75,6 +75,26 @@ impl YoloMode {
             mode => Some(mode),
         }
     }
+
+    /// Whether the agent runs in Yolo mode with no way to turn it off, whichever
+    /// generation is installed.
+    pub fn always_on(&self) -> bool {
+        match self {
+            YoloMode::AlwaysYolo => true,
+            YoloMode::EitherGeneration { legacy, current } => {
+                legacy.always_on() && current.always_on()
+            }
+            YoloMode::CliFlag(_) | YoloMode::EnvVar(..) => false,
+        }
+    }
+}
+
+/// Whether the built-in agent `name` always runs in Yolo mode. False for
+/// unknown and custom agents.
+pub fn is_always_yolo(name: &str) -> bool {
+    get_agent(name)
+        .and_then(|agent| agent.yolo.as_ref())
+        .is_some_and(YoloMode::always_on)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1800,6 +1820,29 @@ mod tests {
         assert!(!acp_transcript_cli_resumable("claude", "codex"));
         assert!(!acp_transcript_cli_resumable("claude", "aoe-agent"));
         assert!(!acp_transcript_cli_resumable("codex", "codex"));
+    }
+
+    #[test]
+    fn always_yolo_follows_each_agents_declaration() {
+        for agent in AGENTS {
+            let declared = matches!(agent.yolo, Some(YoloMode::AlwaysYolo));
+            assert_eq!(is_always_yolo(agent.name), declared, "{}", agent.name);
+        }
+        for name in ["pi", "settl", "prime-agent"] {
+            assert!(is_always_yolo(name), "{name}");
+        }
+        assert!(!is_always_yolo("not-an-agent"));
+        // A mode spanning two generations is always on only when both are.
+        static ON: YoloMode = YoloMode::AlwaysYolo;
+        static FLAG: YoloMode = YoloMode::CliFlag("--yolo");
+        for (legacy, current, expected) in
+            [(&ON, &ON, true), (&ON, &FLAG, false), (&FLAG, &ON, false)]
+        {
+            assert_eq!(
+                YoloMode::EitherGeneration { legacy, current }.always_on(),
+                expected
+            );
+        }
     }
 
     #[test]

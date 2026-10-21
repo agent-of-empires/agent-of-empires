@@ -29,7 +29,7 @@ test.describe("essentials", () => {
     await expect(w.getByPlaceholder("Auto-generated if empty")).toHaveValue("");
     await expect(w.getByTestId("wizard-agent-row")).toContainText("claude");
     await expect(switchNamed(page, "Use structured view")).toHaveAttribute("aria-checked", "true");
-    await expect(switchNamed(page, "Auto-approve actions")).toHaveAttribute("aria-checked", "false");
+    await expect(switchNamed(page, "Yolo mode")).toHaveAttribute("aria-checked", "false");
     await expect(switchNamed(page, "Create a worktree")).toHaveAttribute("aria-checked", "true");
     await expect(w.getByTestId("wizard-worktree-row")).toContainText("auto, new branch");
     await expect(w.getByRole("button", { name: /Launch session/ })).toBeVisible();
@@ -307,7 +307,7 @@ test.describe("agents and presets", () => {
 
     await w.getByRole("radio", { name: /yolo-sandbox/ }).click();
     // A pick returns to the form.
-    for (const label of ["Run in a safe container", "Auto-approve actions"]) {
+    for (const label of ["Run in a safe container", "Yolo mode"]) {
       await expect(switchNamed(page, label)).toHaveAttribute("aria-checked", "true");
     }
     expect(settingsProfiles).toContain("yolo-sandbox");

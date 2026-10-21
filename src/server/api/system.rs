@@ -61,6 +61,8 @@ pub struct AgentInfo {
     pub name: String,
     pub binary: String,
     pub host_only: bool,
+    /// The agent always runs in Yolo mode, so the wizard locks the switch on.
+    pub always_yolo: bool,
     pub installed: bool,
     pub install_hint: String,
     /// True when this agent has a one-shot mode (a `oneshot_flag`), so it can
@@ -150,6 +152,7 @@ fn build_custom_agent_infos(
             name: name.clone(),
             binary: name.clone(),
             host_only: false,
+            always_yolo: false,
             installed: true,
             install_hint: "Configured custom agent".to_string(),
             oneshot_capable: false,
@@ -192,6 +195,7 @@ pub async fn list_agents(State(state): State<Arc<AppState>>) -> Json<Vec<AgentIn
                     name: a.name.to_string(),
                     binary: a.binary.to_string(),
                     host_only: a.host_only,
+                    always_yolo: crate::agents::is_always_yolo(a.name),
                     installed: available.iter().any(|s| s == a.name),
                     install_hint: a.install_hint.to_string(),
                     oneshot_capable: a.oneshot_flag.is_some(),
@@ -1830,8 +1834,11 @@ pub async fn system_health(State(state): State<Arc<AppState>>) -> axum::response
 #[derive(Serialize)]
 pub struct DockerStatus {
     pub available: bool,
-    /// The configured runtime, also when it is down, so the client can name it.
+    /// The configured runtime's config value (`docker`, `podman`,
+    /// `apple_container`), also when it is down.
     pub runtime: Option<String>,
+    /// Its display name ("Apple Container"), for messages that name it.
+    pub runtime_name: Option<&'static str>,
 }
 
 pub async fn docker_status() -> Json<DockerStatus> {
@@ -1841,6 +1848,7 @@ pub async fn docker_status() -> Json<DockerStatus> {
         let config = crate::session::Config::load_or_warn();
         DockerStatus {
             available,
+            runtime_name: Some(runtime.display_name()),
             runtime: Some(
                 serde_json::to_value(config.sandbox.container_runtime)
                     .ok()
@@ -1853,6 +1861,7 @@ pub async fn docker_status() -> Json<DockerStatus> {
     .unwrap_or(DockerStatus {
         available: false,
         runtime: None,
+        runtime_name: None,
     });
     Json(result)
 }
@@ -3350,6 +3359,30 @@ mod tests {
 
     /// `acp_installed` follows the structured create check, so a custom
     /// agent counts when its adapter is on the configured `environment` PATH.
+    /// The wizard names the runtime that isn't running, so it's reported
+    /// whether or not it's available.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn docker_status_names_the_configured_runtime() {
+        use crate::session::config::ContainerRuntimeName;
+        let _home = crate::session::test_support::isolate_app_dir();
+        for (runtime, value, display) in [
+            (ContainerRuntimeName::Docker, "docker", "Docker"),
+            (ContainerRuntimeName::Podman, "podman", "Podman"),
+            (
+                ContainerRuntimeName::AppleContainer,
+                "apple_container",
+                "Apple Container",
+            ),
+        ] {
+            crate::session::config::update_config(|c| c.sandbox.container_runtime = runtime)
+                .unwrap();
+            let Json(status) = docker_status().await;
+            assert_eq!(status.runtime.as_deref(), Some(value), "{display}");
+            assert_eq!(status.runtime_name, Some(display));
+        }
+    }
+
     #[tokio::test]
     #[serial_test::serial]
     async fn acp_installed_matches_the_structured_create_check() {

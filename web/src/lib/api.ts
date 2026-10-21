@@ -2089,7 +2089,13 @@ export async function updateProject(
 }
 
 export async function fetchDockerStatus(): Promise<DockerStatusResponse> {
-  return (await fetchJson<DockerStatusResponse>("/api/docker/status")) ?? { available: false, runtime: null };
+  return (
+    (await fetchJson<DockerStatusResponse>("/api/docker/status")) ?? {
+      available: false,
+      runtime: null,
+      runtime_name: null,
+    }
+  );
 }
 
 /** The repo's hooks need approval before this session can be created
