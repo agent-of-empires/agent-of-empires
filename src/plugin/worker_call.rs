@@ -41,6 +41,9 @@ pub trait WorkerCall: Send + Sync {
     ) -> BoxFuture<'a, bool>;
 
     fn report_failure(&self, plugin_id: &str, message: &str);
+
+    /// Tells the user a plugin's MCP server selection was ignored.
+    fn report_serve_failure(&self, plugin_id: &str, message: &str);
 }
 
 impl WorkerCall for PluginHost {
@@ -84,6 +87,15 @@ impl WorkerCall for PluginHost {
             plugin_id,
             crate::plugin::ui_state::Tone::Danger,
             "MCP rewrite hook failed".to_string(),
+            Some(message.to_string()),
+        );
+    }
+
+    fn report_serve_failure(&self, plugin_id: &str, message: &str) {
+        self.notify_host(
+            plugin_id,
+            crate::plugin::ui_state::Tone::Danger,
+            "MCP server selection failed".to_string(),
             Some(message.to_string()),
         );
     }
