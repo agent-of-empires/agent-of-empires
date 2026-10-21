@@ -395,7 +395,7 @@ export function LiveTerminalView({ session, readOnly, active = true, surface = "
       {live.state.connected && live.state.transportReason === "pipe_owned" && (
         <div
           data-live-pipe-notice
-          className="absolute left-0 right-0 top-14 z-20 flex justify-center px-3 pointer-events-none"
+          className={`absolute left-0 right-0 ${ensureWarning ? "top-24" : "top-14"} z-20 flex justify-center px-3 pointer-events-none`}
         >
           <span className="text-xs text-text-muted bg-surface-900/90 border border-surface-700/60 rounded-full px-4 py-2 max-w-md break-words text-center">
             Another client was already rendering this pane, so updates use slower snapshots. Reconnect to retry.
