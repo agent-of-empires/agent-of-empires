@@ -31,6 +31,7 @@ pub async fn run(profile: &str, args: SendArgs) -> Result<()> {
     let endpoint = require_daemon().await?;
     let client = HttpClient::new(endpoint)?;
     let mut sessions = client.list_sessions(None).await?.sessions;
+    let profile = crate::session::config::effective_profile(profile);
     sessions.retain(|s| s.profile == profile);
     let session = super::resolve_session(&args.identifier, &sessions)?;
 
