@@ -743,6 +743,7 @@ mod tests {
             extra_env: None,
             custom_instruction: None,
             before_start_env: Vec::new(),
+            before_start_hook_env: Vec::new(),
             container_workdir: None,
         });
 
@@ -837,6 +838,7 @@ claude-personal = "~/.claude-global"
             extra_env: None,
             custom_instruction: None,
             before_start_env: Vec::new(),
+            before_start_hook_env: Vec::new(),
             container_workdir: None,
         });
         for (case, declared_agent, entries, expected) in cases {
@@ -1018,6 +1020,7 @@ claude-personal = "~/.claude-global"
                 extra_env: None,
                 custom_instruction: None,
                 before_start_env: Vec::new(),
+                before_start_hook_env: Vec::new(),
                 container_workdir: None,
             });
             instance.sandbox_store_generation =
@@ -1103,6 +1106,7 @@ claude-personal = "~/.claude-global"
                 extra_env: None,
                 custom_instruction: None,
                 before_start_env: Vec::new(),
+                before_start_hook_env: Vec::new(),
                 container_workdir: None,
             });
             assert_eq!(
@@ -1208,6 +1212,7 @@ claude-personal = "~/.claude-global"
                 extra_env: None,
                 custom_instruction: None,
                 before_start_env: Vec::new(),
+                before_start_hook_env: Vec::new(),
                 container_workdir: None,
             });
             let id = instance.id.clone();

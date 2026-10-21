@@ -1385,6 +1385,7 @@ mod tests {
             extra_env: None,
             custom_instruction: None,
             before_start_env: Vec::new(),
+            before_start_hook_env: Vec::new(),
             container_workdir: None,
         });
         sandboxed.agent_session_binding = Some(legacy());

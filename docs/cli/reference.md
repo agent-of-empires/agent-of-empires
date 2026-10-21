@@ -223,6 +223,7 @@ Add a new session
 * `--no-submodules` — Skip `git submodule update --init --recursive` after creating the worktree, overriding the `worktree.init_submodules` config (default true). Useful for repos with large or deeply nested submodule trees that you don't need inside the agent session
 * `-s`, `--sandbox` — Run session in a container sandbox
 * `--sandbox-image <SANDBOX_IMAGE>` — Custom container image for sandbox (implies --sandbox)
+* `--hook-env <KEY[=VALUE]>` — Env var for the host `before_start` hook only, never the container (`KEY=VALUE` or `KEY`; repeatable; requires --sandbox)
 * `-y`, `--yolo` — Enable YOLO mode (skip permission prompts)
 * `--trust-hooks` — Automatically trust this repository's hooks and project-local MCP servers without prompting
 * `--extra-args <EXTRA_ARGS>` — Extra arguments to append after the agent binary
