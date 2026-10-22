@@ -14,6 +14,8 @@ pub enum WorkerRequestError {
     NoWorker,
     Timeout,
     WorkerGone,
+    /// The worker answered JSON-RPC "method not found".
+    MethodNotFound,
     Rejected,
 }
 
@@ -23,6 +25,7 @@ impl std::fmt::Display for WorkerRequestError {
             Self::NoWorker => f.write_str("no running worker"),
             Self::Timeout => f.write_str("timed out"),
             Self::WorkerGone => f.write_str("worker exited"),
+            Self::MethodNotFound => f.write_str("worker does not implement the method"),
             Self::Rejected => f.write_str("worker rejected the request"),
         }
     }
@@ -31,7 +34,7 @@ impl std::fmt::Display for WorkerRequestError {
 struct Entry {
     plugin_id: String,
     generation: u64,
-    tx: oneshot::Sender<Result<Value, String>>,
+    tx: oneshot::Sender<Result<Value, WorkerRequestError>>,
 }
 
 #[derive(Default)]
@@ -54,7 +57,7 @@ impl PendingRequests {
         &self,
         plugin_id: &str,
         generation: u64,
-    ) -> (String, oneshot::Receiver<Result<Value, String>>) {
+    ) -> (String, oneshot::Receiver<Result<Value, WorkerRequestError>>) {
         let id = self.next_id();
         let rx = self.register_as(&id, plugin_id, generation);
         (id, rx)
@@ -73,7 +76,7 @@ impl PendingRequests {
         id: &str,
         plugin_id: &str,
         generation: u64,
-    ) -> oneshot::Receiver<Result<Value, String>> {
+    ) -> oneshot::Receiver<Result<Value, WorkerRequestError>> {
         let (tx, rx) = oneshot::channel();
         self.entries().insert(
             id.to_string(),

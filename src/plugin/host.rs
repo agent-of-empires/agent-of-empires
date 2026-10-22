@@ -279,7 +279,7 @@ impl PluginHost {
         }
         match tokio::time::timeout(deadline.saturating_duration_since(Instant::now()), rx).await {
             Ok(Ok(Ok(result))) => Ok(result),
-            Ok(Ok(Err(_))) => Err(WorkerRequestError::Rejected),
+            Ok(Ok(Err(e))) => Err(e),
             Ok(Err(_)) => Err(WorkerRequestError::WorkerGone),
             Err(_) => Err(WorkerRequestError::Timeout),
         }
