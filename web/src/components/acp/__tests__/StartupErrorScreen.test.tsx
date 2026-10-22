@@ -211,7 +211,8 @@ describe("StartupErrorScreen", () => {
       expect(queryByTestId("startup-error-install-command")).toBeNull();
       const note = getByTestId("startup-error-sandbox-note").textContent ?? "";
       expect(note).toContain("inside the container");
-      expect(note).toContain("sandbox image update available");
+      // The dashboard now offers the pull itself, so the note no longer sends users to the TUI.
+      expect(note).toContain('the dashboard shows a "Sandbox image update available" banner');
       // A literal `docker pull` would be wrong for Podman / Apple Container or a custom image.
       expect(note).not.toContain("docker pull");
     });
