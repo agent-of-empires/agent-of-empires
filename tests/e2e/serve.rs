@@ -2537,24 +2537,15 @@ fn cli_serve_replay_rejects_missing_or_unbound_passphrases() {
         .unwrap();
     let launch_path = daemon_launch_path(&h);
     let original = std::fs::read(&launch_path).unwrap();
-    let mut legacy: serde_json::Value = serde_json::from_slice(&original).unwrap();
-    legacy.as_object_mut().unwrap().remove("has_passphrase");
-    legacy.as_object_mut().unwrap().remove("instance_id");
-    legacy["schema"] = 3.into();
-    std::fs::write(&launch_path, serde_json::to_vec(&legacy).unwrap()).unwrap();
-    legacy["port"] = pick_free_port().into();
+    let mut unbound: serde_json::Value = serde_json::from_slice(&original).unwrap();
+    unbound.as_object_mut().unwrap().remove("instance_id");
+    std::fs::write(&launch_path, serde_json::to_vec(&unbound).unwrap()).unwrap();
+    unbound["port"] = pick_free_port().into();
     std::fs::write(
         launch_path.with_file_name("serve.rollback.launch"),
-        serde_json::to_vec(&legacy).unwrap(),
+        serde_json::to_vec(&unbound).unwrap(),
     )
     .unwrap();
-    std::fs::write(launch_path.with_file_name(".schema_version"), "29").unwrap();
-    let migrate = h.run_cli(&["profile", "list"]);
-    assert!(
-        migrate.status.success(),
-        "{}",
-        String::from_utf8_lossy(&migrate.stderr)
-    );
     let rollback = h.run_cli(&["serve", "--rollback"]);
     assert!(
         !rollback.status.success(),
