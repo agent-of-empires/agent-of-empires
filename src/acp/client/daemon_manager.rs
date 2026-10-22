@@ -63,7 +63,7 @@ pub async fn ensure_daemon() -> Result<(DaemonEndpoint, Option<u32>), ManagerErr
     if discover_env().is_some() || autostart_disabled() {
         return locate_daemon().await.map(|endpoint| (endpoint, None));
     }
-    crate::cli::serve::ensure_local_daemon("", true)
+    crate::cli::serve::ensure_local_daemon(Some(""), true)
         .await
         .map_err(|error| ManagerError::AutostartFailed(error.to_string()))
 }
@@ -77,23 +77,9 @@ pub async fn require_daemon() -> Result<DaemonEndpoint, ManagerError> {
 
 /// Read scope is resolved from the snapshot, not the Daemon's startup profile.
 pub(crate) async fn require_local_read_daemon() -> Result<DaemonEndpoint, ManagerError> {
-    let allow_start = !autostart_disabled();
-    let (endpoint, started) = async {
-        let profile = if allow_start {
-            let default = crate::session::config::resolve_default_profile();
-            let profiles = crate::session::list_profiles()?;
-            if profiles.iter().any(|profile| profile == &default) {
-                default
-            } else {
-                profiles.into_iter().next().unwrap_or(default)
-            }
-        } else {
-            String::new()
-        };
-        crate::cli::serve::ensure_local_daemon(&profile, allow_start).await
-    }
-    .await
-    .map_err(|error| ManagerError::AutostartFailed(error.to_string()))?;
+    let (endpoint, started) = crate::cli::serve::ensure_local_daemon(None, !autostart_disabled())
+        .await
+        .map_err(|error| ManagerError::AutostartFailed(error.to_string()))?;
     announce_start(started);
     Ok(endpoint)
 }
@@ -109,7 +95,7 @@ pub async fn ensure_native_daemon(profile: &str) -> anyhow::Result<DaemonEndpoin
     if discover_env().is_some() {
         return locate_daemon().await.map_err(Into::into);
     }
-    crate::cli::serve::ensure_local_daemon(profile, !autostart_disabled())
+    crate::cli::serve::ensure_local_daemon(Some(profile), !autostart_disabled())
         .await
         .map(|(endpoint, _)| endpoint)
 }

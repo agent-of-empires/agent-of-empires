@@ -1458,8 +1458,9 @@ async fn fetch_cityhall_bundle(url: &str, token: &str) -> Result<String> {
     Ok(daemon::decode_text(response).await?)
 }
 
+/// `None` selects read acquisition; `Some` preserves native profile admission.
 pub(crate) async fn ensure_local_daemon(
-    profile: &str,
+    native_profile: Option<&str>,
     allow_start: bool,
 ) -> Result<(crate::acp::client::DaemonEndpoint, Option<u32>)> {
     use clap::Parser;
@@ -1483,7 +1484,17 @@ pub(crate) async fn ensure_local_daemon(
             allow_start,
             "Local daemon autostart is disabled; start one with `aoe serve --core-only --daemon`"
         );
-        let resolved_profile = crate::session::config::effective_profile(profile);
+        let resolved_profile = if let Some(profile) = native_profile {
+            crate::session::config::effective_profile(profile)
+        } else {
+            let default = crate::session::config::resolve_default_profile();
+            let profiles = crate::session::list_profiles()?;
+            if profiles.iter().any(|profile| profile == &default) {
+                default
+            } else {
+                profiles.into_iter().next().unwrap_or(default)
+            }
+        };
         let profile = resolved_profile.as_str();
         crate::session::require_known_profile(profile)?;
         let cli = crate::cli::Cli::try_parse_from(["aoe", "serve", "--core-only", "--daemon"])?;
@@ -1498,10 +1509,20 @@ pub(crate) async fn ensure_local_daemon(
     let endpoint = crate::acp::client::DaemonEndpoint::local_unix(
         crate::daemon::transport::local_socket_path()?,
     );
-    endpoint
-        .daemon_client()?
-        .local_runtime_ready((!profile.is_empty()).then_some(profile))
-        .await?;
+    let client = endpoint.daemon_client()?;
+    if let Some(profile) = native_profile {
+        client
+            .local_runtime_ready((!profile.is_empty()).then_some(profile))
+            .await?;
+    } else {
+        let pid = existing
+            .or(started)
+            .context("Local daemon has no verified owner after startup")?;
+        anyhow::ensure!(
+            client.local_daemon_ready(pid).await?,
+            "Local daemon runtime identity or protocol is incompatible"
+        );
+    }
     Ok((endpoint, started))
 }
 pub(crate) async fn start_dashboard_for_tui(

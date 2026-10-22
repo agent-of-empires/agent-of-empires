@@ -527,3 +527,68 @@ fn configured_alias_does_not_choose_an_unlisted_startup_profile() {
         );
     }
 }
+
+#[tokio::test]
+#[parallel]
+#[cfg_attr(
+    not(target_os = "macos"),
+    ignore = "macOS local reads exercise shared acquisition during reuse"
+)]
+async fn read_reuse_does_not_require_an_unadopted_startup_profile() {
+    use agent_of_empires::daemon::{DaemonClient, RuntimeHealth};
+    use fs2::FileExt;
+
+    let fixture = Fixture::new();
+    std::fs::write(
+        fixture.app.join("config.toml"),
+        "[updates]\nupdate_check_mode = \"off\"\n[systemd]\nenabled = false\n",
+    )
+    .unwrap();
+    let started = fixture.run(&["list", "--json"]);
+    assert!(started.status.success(), "{started:?}");
+    let client = DaemonClient::new_unix(fixture.app.join("daemon/api.sock")).unwrap();
+    let before = client.runtime_info().await.unwrap();
+    assert_eq!(before.health, RuntimeHealth::Healthy);
+    assert_eq!(before.profiles, ["main"]);
+    let pid = std::fs::read(fixture.app.join("serve.pid")).unwrap();
+    let launch = std::fs::read(fixture.app.join("serve.launch")).unwrap();
+    let lock = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(fixture.app.join("profiles/main/.storage.lock"))
+        .unwrap();
+    lock.lock_exclusive().unwrap();
+    std::fs::create_dir(fixture.app.join("profiles/aaa")).unwrap();
+    let held = client.runtime_info().await.unwrap();
+    assert_eq!(held.health, RuntimeHealth::Healthy);
+    assert_eq!(held.profiles, ["main"]);
+    for args in [
+        &["-p", "main", "list", "--json"][..],
+        &["profile", "list"],
+        &["project", "list", "--scope", "global", "--json"],
+    ] {
+        let output = fixture.run(args);
+        assert!(output.status.success(), "{args:?}: {output:?}");
+        assert!(!String::from_utf8_lossy(&output.stderr).contains("Started aoe daemon"));
+        if args.contains(&"profile") {
+            let profiles = String::from_utf8_lossy(&output.stdout);
+            assert!(profiles.contains("main"), "{profiles}");
+            assert!(profiles.contains("aaa"), "{profiles}");
+        } else {
+            let rows: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+            if args.contains(&"project") {
+                assert_eq!(rows, serde_json::json!([]));
+            } else {
+                assert_eq!(rows[0]["id"], "daemon-only-row");
+            }
+        }
+    }
+    assert_eq!(std::fs::read(fixture.app.join("serve.pid")).unwrap(), pid);
+    assert_eq!(
+        std::fs::read(fixture.app.join("serve.launch")).unwrap(),
+        launch
+    );
+    let held = client.runtime_info().await.unwrap();
+    assert_eq!(held.health, RuntimeHealth::Healthy);
+    assert_eq!(held.profiles, ["main"]);
+}

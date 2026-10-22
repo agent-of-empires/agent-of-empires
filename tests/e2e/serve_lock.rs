@@ -117,6 +117,42 @@ fn direct_serve_upgrades_legacy_policy_under_its_existing_transaction() {
 
 #[test]
 #[parallel]
+fn explicit_profile_serve_recovers_invalid_config() {
+    for (core_only, empty) in [(false, false), (false, true), (true, false), (true, true)] {
+        let mut h = TuiTestHarness::new_in_tmp("serve_invalid_config");
+        h.stop_daemon_on_drop();
+        h.run_cli_ok(&["migrate"]);
+        let app = app_dir_in(h.home_path());
+        let profiles = app.join("profiles");
+        std::fs::remove_dir_all(&profiles).unwrap();
+        std::fs::create_dir(&profiles).unwrap();
+        if !empty {
+            std::fs::create_dir(profiles.join("main")).unwrap();
+        }
+        std::fs::write(app.join("config.toml"), "default_profile = [\n").unwrap();
+        if core_only {
+            h.run_cli_ok(&["-p", "main", "serve", "--daemon", "--core-only"]);
+        } else {
+            let port = crate::harness::pick_free_port().to_string();
+            h.run_cli_ok(&[
+                "-p",
+                "main",
+                "serve",
+                "--daemon",
+                "--port",
+                &port,
+                "--no-auth",
+            ]);
+        }
+        assert!(profiles.join("main").is_dir());
+        let status = h.run_cli_ok(&["serve", "--status"]);
+        assert!(status.contains("Daemon: running (PID "), "{status}");
+        h.run_cli_ok(&["serve", "--stop"]);
+    }
+}
+
+#[test]
+#[parallel]
 fn managed_controls_migrate_historical_launch_before_replay() {
     for (rollback, protected) in [(false, false), (true, false), (false, true), (true, true)] {
         let mut h = TuiTestHarness::new(&format!("legacy_control_{rollback}_{protected}"));
