@@ -346,6 +346,12 @@ describe("StartupErrorBanner Details", () => {
       "Retry failed: same error",
     ],
     ["a new error", SPAWN_MSG, "spawn failed: capacity full", "Retry failed: capacity full"],
+    [
+      "a JSON refusal",
+      SPAWN_MSG,
+      JSON.stringify({ error: "session_archived", message: "session is archived; unarchive it first" }),
+      "Retry failed: session is archived; unarchive it first",
+    ],
   ])("a retry failing with %s opens Details without the HTTP status", async (_label, message, body, line) => {
     stubApi({ info: json(claude()), spawn: json(body, 500) });
     const { getByTestId, findByTestId } = renderBanner({ message });

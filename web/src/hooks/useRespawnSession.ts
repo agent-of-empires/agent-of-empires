@@ -2,6 +2,17 @@ import { useState } from "react";
 
 export type RespawnState = "idle" | "retrying" | "ok" | "failed";
 
+/** A refusal's JSON `{ "error", "message" }` body by its message; any other body as sent. */
+function failureText(body: string): string {
+  try {
+    const message: unknown = JSON.parse(body)?.message;
+    if (typeof message === "string" && message) return message;
+  } catch {
+    // Plain text.
+  }
+  return body;
+}
+
 interface RespawnSnapshot {
   resetKey: string | null;
   incident: number;
@@ -48,7 +59,7 @@ export function useRespawnSession(sessionId: string, resetKey: string | null = n
         settle("ok", null);
         return true;
       }
-      const body = await res.text().catch(() => "");
+      const body = failureText(await res.text().catch(() => ""));
       settle("failed", `Server returned ${res.status}. ${body.slice(0, 200)}`.trim(), body);
       return false;
     } catch (e) {
