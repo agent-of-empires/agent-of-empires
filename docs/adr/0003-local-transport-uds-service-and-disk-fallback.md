@@ -24,6 +24,6 @@ Issue #3839 settled the same REST+WS routes over a local Unix socket and remote 
 
 ## Consequences
 
-- Until #4400's CLI auto-start lands, read-only CLI commands may read storage directly on the three paths above. The TUI and mutations never do.
+- CLI auto-start landed in #4778 for #4465. #4470 removes all three transitional disk read paths together. Covered CLI reads now use the Daemon or hard fail with reconnect guidance, following ADR 0004's local-only startup policy.
 - Tracking: router and `LocalPeer` convergence is #3897, the macOS UDS listener is #4431, projection convergence is #4432.
 - Nothing here precludes a later multi-user layer (ADR 0002).

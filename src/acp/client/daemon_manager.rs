@@ -71,10 +71,39 @@ pub async fn ensure_daemon() -> Result<(DaemonEndpoint, Option<u32>), ManagerErr
 /// Announce CLI autostart on stderr, also under `--json`.
 pub async fn require_daemon() -> Result<DaemonEndpoint, ManagerError> {
     let (endpoint, started) = ensure_daemon().await?;
+    announce_start(started);
+    Ok(endpoint)
+}
+
+/// Read scope is resolved from the snapshot, not the Daemon's startup profile.
+pub(crate) async fn require_local_read_daemon() -> Result<DaemonEndpoint, ManagerError> {
+    let allow_start = !autostart_disabled();
+    let (endpoint, started) = async {
+        let profile = if allow_start {
+            let default = crate::session::config::resolve_default_profile();
+            if crate::session::get_profile_dir_path(&default)?.try_exists()? {
+                default
+            } else {
+                crate::session::list_profiles()?
+                    .into_iter()
+                    .next()
+                    .unwrap_or(default)
+            }
+        } else {
+            String::new()
+        };
+        crate::cli::serve::ensure_local_daemon(&profile, allow_start).await
+    }
+    .await
+    .map_err(|error| ManagerError::AutostartFailed(error.to_string()))?;
+    announce_start(started);
+    Ok(endpoint)
+}
+
+fn announce_start(started: Option<u32>) {
     if let Some(pid) = started {
         eprintln!("Started aoe daemon (pid {pid})");
     }
-    Ok(endpoint)
 }
 
 /// Initial native bootstrap and explicit reconnect may start the local Daemon.

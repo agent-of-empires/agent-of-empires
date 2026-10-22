@@ -173,7 +173,7 @@ pub(crate) struct Admission {
 }
 
 /// Retry publication identity races within the establishment budget.
-/// Untrusted artifacts refuse; absent or provably dead publication permits disk fallback.
+/// Untrusted artifacts refuse; only absent or provably dead publication permits acquisition.
 pub(crate) fn connect(
     establishment_deadline: Instant,
 ) -> impl std::future::Future<Output = Result<UdsConnection, ReadFailure>> {
@@ -665,10 +665,10 @@ fn runtime_entry_present(dir: RawFd) -> bool {
         .any(|name| fstatat(dir, name).is_ok())
 }
 
-/// Unsupported schemas are absent; invalid identities or namespaces remain refusals.
+/// Unknown schemas cannot establish publication absence.
 fn validate_prebind(marker: &PrebindMarker, namespace: &str) -> Result<(), ReadFailure> {
     if marker.schema != SCHEMA {
-        return Err(ReadFailure::local_absence());
+        return Err(ReadFailure::pre("marker_invalid"));
     }
     if !valid_uuid(&marker.prebind_instance_id) || !valid_namespace(&marker.namespace) {
         return Err(ReadFailure::pre("marker_invalid"));
@@ -683,7 +683,7 @@ fn validate_prebind(marker: &PrebindMarker, namespace: &str) -> Result<(), ReadF
 
 fn validate_postbind(marker: &PostbindMarker, namespace: &str) -> Result<(), ReadFailure> {
     if marker.schema != SCHEMA {
-        return Err(ReadFailure::local_absence());
+        return Err(ReadFailure::pre("marker_invalid"));
     }
     if !valid_uuid(&marker.prebind_instance_id)
         || !valid_uuid(&marker.runtime_instance_id)
@@ -1708,9 +1708,8 @@ mod tests {
         drop(client);
     }
 
-    /// Unsupported schemas and malformed bodies have distinct refusal codes.
     #[test]
-    fn a_marker_schema_and_a_marker_body_are_two_different_refusals() {
+    fn unknown_marker_schemas_and_malformed_bodies_refuse_admission() {
         let namespace = crate::server::runtime_ws::NAMESPACE;
         let good_uuid = "11111111-2222-3333-4444-555555555555";
         let identity = "linux:v1:aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee:1";
@@ -1737,7 +1736,7 @@ mod tests {
         };
         let bad_uuid = "not-a-uuid";
         let cases: [(u8, &str, &str); 2] = [
-            (SCHEMA + 1, good_uuid, "marker_missing"),
+            (SCHEMA + 1, good_uuid, "marker_invalid"),
             (SCHEMA, bad_uuid, "marker_invalid"),
         ];
         for (schema, instance, code) in cases {

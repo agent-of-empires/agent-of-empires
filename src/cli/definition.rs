@@ -60,11 +60,10 @@ pub struct Cli {
 
     /// Select a daemon endpoint for read-only CLI commands or the TUI.
     ///
-    /// Explicit CLI endpoints never fall back. `AOE_DAEMON_URL` discovery may
-    /// fall back to local storage before reaching a TCP peer, with a notice.
-    /// Authenticate with `AOE_DAEMON_TOKEN` or `AOE_DAEMON_PASSPHRASE`.
-    /// An unauthenticated daemon needs neither. See the HTTP API reference
-    /// for transport and fallback rules.
+    /// Explicit endpoints and `AOE_DAEMON_URL` never fall back to local storage
+    /// or start a local daemon. Authenticate with `AOE_DAEMON_TOKEN` or
+    /// `AOE_DAEMON_PASSPHRASE`. An unauthenticated daemon needs neither.
+    /// See the HTTP API reference for transport and authentication rules.
     // Keep the explicit flag separate from the optional environment endpoint.
     #[arg(long, global = true)]
     pub daemon_url: Option<String>,

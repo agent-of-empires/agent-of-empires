@@ -383,51 +383,6 @@ pub struct SetColorArgs {
     pub color: String,
 }
 
-#[derive(Serialize)]
-struct SessionDetails {
-    id: String,
-    title: String,
-    path: String,
-    group: String,
-    tool: String,
-    command: String,
-    status: String,
-    state: &'static str,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    trashed_at: Option<chrono::DateTime<chrono::Utc>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    archived_at: Option<chrono::DateTime<chrono::Utc>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    snoozed_until: Option<chrono::DateTime<chrono::Utc>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pinned_at: Option<chrono::DateTime<chrono::Utc>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    agent_session_id: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    parent_session_id: Option<String>,
-    profile: String,
-}
-
-fn session_details(inst: &Instance, profile: &str) -> SessionDetails {
-    SessionDetails {
-        id: inst.id.clone(),
-        title: inst.title.clone(),
-        path: inst.project_path.clone(),
-        group: inst.group_path.clone(),
-        tool: inst.tool.clone(),
-        command: inst.command.clone(),
-        status: format!("{:?}", inst.status).to_lowercase(),
-        state: inst.effective_bucket().as_str(),
-        trashed_at: inst.trashed_at,
-        archived_at: inst.archived_at,
-        snoozed_until: inst.active_snoozed_until(),
-        pinned_at: inst.pinned_at,
-        agent_session_id: inst.agent_session_id.clone(),
-        parent_session_id: inst.parent_session_id.clone(),
-        profile: profile.to_string(),
-    }
-}
-
 #[tracing::instrument(target = "cli.session", skip_all, fields(profile = %profile))]
 pub async fn run(profile: &str, command: SessionCommands) -> Result<()> {
     match command {
@@ -435,7 +390,7 @@ pub async fn run(profile: &str, command: SessionCommands) -> Result<()> {
         SessionCommands::Stop(args) => stop_session(profile, args).await,
         SessionCommands::Restart(args) => restart_session_dispatch(profile, args).await,
         SessionCommands::Attach(args) => attach_session(profile, args).await,
-        SessionCommands::Show(args) => show_session(profile, args).await,
+        SessionCommands::Show(_) => unreachable!("runtime reads are handled before local dispatch"),
         SessionCommands::Wait(args) => wait_session(profile, args).await,
         SessionCommands::Capture(args) => capture_session(profile, args).await,
         SessionCommands::Rename(args) => rename_session(profile, args).await,
@@ -459,7 +414,9 @@ pub async fn run(profile: &str, command: SessionCommands) -> Result<()> {
         }
         SessionCommands::Restore(args) => restore_session(profile, args).await,
         SessionCommands::Import(args) => import_sessions(profile, args).await,
-        SessionCommands::ListTrash => list_trash(profile).await,
+        SessionCommands::ListTrash => {
+            unreachable!("runtime reads are handled before local dispatch")
+        }
         SessionCommands::EmptyTrash => empty_trash(profile).await,
     }
 }
@@ -633,25 +590,6 @@ fn release_restore_reservation(storage: &Storage, restore_id: &str, generation: 
         }
         Ok(())
     });
-}
-
-async fn list_trash(profile: &str) -> Result<()> {
-    let storage = Storage::open_unwatched(profile)?;
-    let (instances, _groups) = storage.load_with_groups()?;
-    let trashed: Vec<_> = instances.iter().filter(|i| i.is_trashed()).collect();
-    if trashed.is_empty() {
-        println!("Trash is empty.");
-        return Ok(());
-    }
-    println!("Trashed sessions in profile '{}':", storage.profile());
-    for inst in trashed {
-        let when = inst
-            .trashed_at
-            .map(|value| value.to_rfc3339())
-            .unwrap_or_else(|| "?".to_string());
-        println!("  {}  {}  (trashed {})", inst.id, inst.title, when);
-    }
-    Ok(())
 }
 
 async fn empty_trash(profile: &str) -> Result<()> {
@@ -1640,86 +1578,6 @@ async fn wait_session(profile: &str, args: WaitArgs) -> Result<()> {
             }
         }
     }
-}
-
-async fn show_session(profile: &str, args: ShowArgs) -> Result<()> {
-    let storage = Storage::open_reference(profile)?;
-    let (instances, _) = storage.load_with_groups()?;
-
-    let mut inst = if let Some(id) = &args.identifier {
-        super::resolve_session(id, &instances)?.clone()
-    } else {
-        let current_session = std::env::var("TMUX_PANE")
-            .ok()
-            .and_then(|_| crate::tmux::get_current_session_name());
-
-        if let Some(session_name) = current_session {
-            instances
-                .iter()
-                .find(|i| crate::tmux::agent_session_belongs_to(&session_name, &i.id))
-                .ok_or_else(|| {
-                    anyhow::anyhow!("Current tmux session is not an Agent of Empires session")
-                })?
-                .clone()
-        } else {
-            bail!("Not in a tmux session. Specify a session ID or run inside tmux.");
-        }
-    };
-    inst.source_profile = storage.profile().to_string();
-
-    crate::session::config::profile_config::resolve_config_or_warn(profile);
-
-    crate::tmux::refresh_session_cache();
-    inst.update_status_once(None, None);
-    let contended = crate::session::Instance::contended_capture_cwds(&instances);
-    inst.self_heal_session_id(profile, &contended);
-
-    if args.json {
-        super::output::print_json(&session_details(&inst, storage.profile()))?;
-    } else {
-        println!("Session: {}", inst.title);
-        println!("  ID:      {}", inst.id);
-        println!("  Path:    {}", inst.project_path);
-        println!("  Group:   {}", inst.group_path);
-        println!("  Tool:    {}", inst.tool);
-        println!("  Command: {}", inst.command);
-        println!("  Status:  {:?}", inst.status);
-        if let Some(at) = inst.trashed_at.or(inst.archived_at) {
-            println!(
-                "  State:   {} ({})",
-                inst.effective_bucket().as_str(),
-                at.format("%+")
-            );
-        }
-        println!("  Profile: {}", storage.profile());
-        for line in relationship_lines(&inst, &instances) {
-            println!("{line}");
-        }
-    }
-
-    Ok(())
-}
-
-fn relationship_lines(
-    inst: &crate::session::Instance,
-    instances: &[crate::session::Instance],
-) -> Vec<String> {
-    let mut lines = Vec::new();
-    if let Some(parent_id) = &inst.parent_session_id {
-        lines.push(match instances.iter().find(|i| &i.id == parent_id) {
-            Some(parent) => format!("  Parent:  {} ({parent_id})", parent.title),
-            None => format!("  Parent:  {parent_id}"),
-        });
-    }
-    let mut children = instances
-        .iter()
-        .filter(|i| i.parent_session_id.as_deref() == Some(inst.id.as_str()))
-        .peekable();
-    if children.peek().is_some() {
-        lines.push("  Children:".to_string());
-        lines.extend(children.map(|child| format!("    {} ({})", child.title, child.id)));
-    }
-    lines
 }
 
 async fn capture_session(profile: &str, args: CaptureArgs) -> Result<()> {
@@ -3791,167 +3649,6 @@ mod import_tests {
         ] {
             assert_eq!(already_imported(&instances, id), claimed, "{id}");
         }
-    }
-}
-
-#[cfg(test)]
-mod show_json_tests {
-    use super::*;
-
-    #[test]
-    fn relationship_lines_name_parent_and_children() {
-        let parent = Instance::new("orchestrator", "/repo");
-        let mut child = Instance::new("worker", "/repo");
-        child.parent_session_id = Some(parent.id.clone());
-        let mut orphan = Instance::new("stray", "/repo");
-        orphan.parent_session_id = Some("gone".to_string());
-        let instances = vec![parent.clone(), child.clone(), orphan.clone()];
-
-        for (inst, expected) in [
-            (
-                &parent,
-                vec![
-                    "  Children:".to_string(),
-                    format!("    worker ({})", child.id),
-                ],
-            ),
-            (
-                &child,
-                vec![format!("  Parent:  orchestrator ({})", parent.id)],
-            ),
-            (&orphan, vec!["  Parent:  gone".to_string()]),
-        ] {
-            assert_eq!(
-                relationship_lines(inst, &instances),
-                expected,
-                "{}",
-                inst.title
-            );
-        }
-    }
-
-    #[test]
-    fn show_json_reports_state_and_only_the_timestamps_that_apply() {
-        let plain = Instance::new("z", "/repo");
-        let serialized = serde_json::to_string(&session_details(&plain, "p")).unwrap();
-        assert!(!serialized.contains("trashed_at"), "{serialized}");
-        assert!(!serialized.contains("archived_at"), "{serialized}");
-        assert!(serialized.contains("\"state\":\"live\""), "{serialized}");
-
-        let mut archived = Instance::new("z", "/repo");
-        archived.archive();
-        let details = session_details(&archived, "p");
-        assert_eq!(details.state, "archived");
-        assert!(details.archived_at.is_some());
-        assert!(details.trashed_at.is_none());
-
-        let mut trashed = archived;
-        trashed.trash();
-        let details = session_details(&trashed, "p");
-        assert_eq!(
-            details.state, "trashed",
-            "trash outranks an earlier archive"
-        );
-        assert!(details.trashed_at.is_some());
-        assert!(details.archived_at.is_some());
-    }
-
-    #[test]
-    fn show_json_mirrors_the_api_snooze_and_pin_keys() {
-        let now = chrono::Utc::now();
-        let future = now + chrono::Duration::minutes(15);
-        let past = now - chrono::Duration::minutes(15);
-        let row = |f: &dyn Fn(&mut Instance)| {
-            let mut inst = Instance::new("z", "/repo");
-            f(&mut inst);
-            inst
-        };
-        let check = |label: &str, f: &dyn Fn(&mut Instance), snooze: bool, pin: bool, state| {
-            let value = serde_json::to_value(session_details(&row(f), "p")).unwrap();
-            let seen = (
-                value.get("snoozed_until").is_some(),
-                value.get("pinned_at").is_some(),
-                value["state"].as_str(),
-            );
-            assert_eq!(seen, (snooze, pin, Some(state)), "{label}: {value}");
-        };
-
-        check("plain row", &|_| {}, false, false, "live");
-        check(
-            "active snooze",
-            &|i| i.snoozed_until = Some(future),
-            true,
-            false,
-            "live",
-        );
-        check(
-            "expired snooze",
-            &|i| i.snoozed_until = Some(past),
-            false,
-            false,
-            "live",
-        );
-        check("pinned", &|i| i.pinned_at = Some(now), false, true, "live");
-        check(
-            "snoozed and archived",
-            &|i| {
-                i.archived_at = Some(now);
-                i.snoozed_until = Some(future);
-            },
-            true,
-            false,
-            "archived",
-        );
-        check(
-            "pinned and snoozed",
-            &|i| {
-                i.pinned_at = Some(now);
-                i.snoozed_until = Some(future);
-            },
-            true,
-            true,
-            "live",
-        );
-        check(
-            "trashed and snoozed",
-            &|i| {
-                i.snooze(30);
-                i.trash();
-            },
-            true,
-            false,
-            "trashed",
-        );
-        check(
-            "trashed and pinned",
-            &|i| {
-                i.pin();
-                i.trash();
-            },
-            false,
-            true,
-            "trashed",
-        );
-        check(
-            "pinned and archived",
-            &|i| {
-                i.archived_at = Some(now);
-                i.pinned_at = Some(now);
-            },
-            false,
-            true,
-            "archived",
-        );
-
-        let active = serde_json::to_value(session_details(
-            &row(&|i| i.snoozed_until = Some(future)),
-            "p",
-        ))
-        .unwrap();
-        assert_eq!(
-            active["snoozed_until"],
-            serde_json::to_value(future).unwrap()
-        );
     }
 }
 

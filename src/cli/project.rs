@@ -2,7 +2,6 @@
 
 use anyhow::{bail, Result};
 use clap::{Args, Subcommand, ValueEnum, ValueHint};
-use serde::Serialize;
 use std::path::PathBuf;
 
 use crate::session::projects;
@@ -99,19 +98,10 @@ pub struct ProjectRemoveArgs {
     scope: Option<ScopeArg>,
 }
 
-#[derive(Serialize)]
-struct ProjectInfo {
-    name: String,
-    path: String,
-    scope: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    default_base_branch: Option<String>,
-}
-
 #[tracing::instrument(target = "cli.project", skip_all, fields(profile = %profile, profile_explicit))]
 pub async fn run(profile: &str, profile_explicit: bool, command: ProjectCommands) -> Result<()> {
     match command {
-        ProjectCommands::List(args) => list(profile, args).await,
+        ProjectCommands::List(_) => unreachable!("runtime reads are handled before local dispatch"),
         ProjectCommands::Add(args) => add(profile, profile_explicit, args).await,
         ProjectCommands::Remove(args) => remove(profile, profile_explicit, args).await,
     }
@@ -123,54 +113,6 @@ fn resolve_default_scope(profile_explicit: bool) -> ProjectScope {
     } else {
         ProjectScope::Global
     }
-}
-
-async fn list(profile: &str, args: ProjectListArgs) -> Result<()> {
-    let resolved_profile = match args.scope {
-        ScopeFilter::Global => None,
-        ScopeFilter::All | ScopeFilter::Profile => Some(resolve_existing_profile(profile)?),
-    };
-    let profile = resolved_profile.as_deref().unwrap_or(profile);
-    let entries: Vec<Project> = match args.scope {
-        ScopeFilter::All => projects::load_merged(profile)?,
-        ScopeFilter::Global => projects::load_global()?,
-        ScopeFilter::Profile => projects::load_profile(profile)?,
-    };
-
-    if args.json {
-        let info: Vec<ProjectInfo> = entries
-            .iter()
-            .map(|p| ProjectInfo {
-                name: p.name.clone(),
-                path: p.path.clone(),
-                scope: p.scope.as_str().to_string(),
-                default_base_branch: p.default_base_branch.clone(),
-            })
-            .collect();
-        super::output::print_json(&info)?;
-        return Ok(());
-    }
-
-    if entries.is_empty() {
-        println!("No projects registered.");
-        println!("Add one with: aoe project add <path>");
-        return Ok(());
-    }
-
-    println!("Projects:\n");
-    for p in &entries {
-        println!("  • {} [{}]  {}", p.name, p.scope.as_str(), p.path);
-        if let Some(base) = &p.default_base_branch {
-            println!("      base branch: {base}");
-        }
-    }
-    let n = entries.len();
-    println!(
-        "\nTotal: {} {}",
-        n,
-        if n == 1 { "project" } else { "projects" }
-    );
-    Ok(())
 }
 
 async fn add(profile: &str, profile_explicit: bool, args: ProjectAddArgs) -> Result<()> {

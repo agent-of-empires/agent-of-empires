@@ -203,13 +203,17 @@ rejects symlinks, special files, packages over 64 MiB, individual files over
 
 ## Runtime CLI reads
 
-Read-only CLI commands use `/api/runtime/read/ws` when `--daemon-url` or `AOE_DAEMON_URL` selects an HTTP endpoint. `/api/runtime/ws` is reserved for the TUI stream and does not serve this one-shot protocol.
+The covered CLI reads (`list`, `status`, `session show`, `session list-trash`, `group list`, `profile list` or bare `profile`, and `project list`) require a Daemon answer. They use `/api/runtime/read/ws` when `--daemon-url` or `AOE_DAEMON_URL` selects an HTTP endpoint. `/api/runtime/ws` remains the separate TUI stream.
 
-An explicit endpoint requires a served answer and never falls back. Environment discovery falls back to local storage, with a notice on stderr, if its configuration is unusable or no TCP peer is reached within one second. Authentication, upgrade and protocol failures after reaching a peer never fall back. Each served exchange has a 15-second deadline.
+Explicit and environment-selected endpoints never fall back to local storage or start a local Daemon. Invalid configuration, connection failures, authentication errors, and protocol errors are final refusals against the selected target. Unreachable targets leave stdout empty and report reconnect guidance on stderr. Environment URLs retain a one-second TCP establishment budget; each served exchange has a 15-second deadline.
 
 After upgrading the CLI, a `protocol_mismatch` means the target daemon uses a different protocol version. On that daemon's host, run `aoe serve --restart` for a detached daemon; otherwise restart the foreground daemon or its service through the service manager. Update that host's installation if needed. A missing runtime-read route can also indicate an older daemon, but first check the selected URL and proxy routing.
 
-Without an HTTP endpoint, Linux reads use a verified, same-user local daemon socket when published; otherwise they use local storage. Invalid or unverifiable publication artifacts refuse fallback. Other platforms use local storage.
+Without an HTTP endpoint, Linux first reads through its verified, same-user runtime socket. Only proven publication absence permits the [shared local auto-start policy](adr/0004-cli-writes-through-the-daemon.md), followed by one read through that same transport. Invalid or unverifiable publication artifacts, including unknown marker schemas, refuse without starting or changing targets. macOS acquires the local Daemon through the same policy and reads through its returned API Unix socket, with peer-UID verification. The API route retains its existing wire shape; it does not claim Linux marker identity. A Client without a local backend requires a remote URL.
+
+`--no-autostart` or `AOE_NO_AUTOSTART=1` disables local startup, not reuse of an existing Daemon. Startup failure or an absent Daemon with startup disabled is an error with guidance, never a disk answer. The spawning Client announces `Started aoe daemon (pid N)` only on stderr, including under `--json`. Local administrative commands and reads outside this covered set retain their existing behavior.
+
+The startup profile does not determine read scope. A missing configured default does not block an explicitly scoped read or a profile-independent read; an unscoped read still reports that missing default from the Daemon snapshot.
 
 The route follows the daemon's authentication mode. CLI clients use `AOE_DAEMON_TOKEN` or `AOE_DAEMON_PASSPHRASE`; passphrase login shares the ACP client's device-bound session cache. Environment URLs discard query parameters, including query tokens. Explicit endpoints reject queries. HTTP on a non-loopback host is accepted only without credentials; remote authentication requires HTTPS. Localhost connections bypass proxies and pin both loopback address families.
 

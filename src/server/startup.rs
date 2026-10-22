@@ -1426,7 +1426,7 @@ mod tests {
     #[serial_test::serial]
     async fn a_successor_waits_for_a_retained_reader_then_serves_the_cached_row() {
         use crate::cli::definition::Cli;
-        use crate::cli::runtime_read::{attempt, classify, ReadRequestSource, ScopedRead};
+        use crate::cli::runtime_read::{attempt, classify, ReadRequestSource};
         use crate::server::runtime_uds::{LOCK_FILE, POSTBIND_FILE, PREBIND_FILE, SOCKET_FILE};
         use clap::Parser;
         use std::fs::OpenOptions;
@@ -1494,7 +1494,8 @@ mod tests {
         )
         .await
         .expect("a retained reader must not stall local discovery");
-        assert!(matches!(local, ScopedRead::NoLocalPublication(None)));
+        assert_eq!(local.exit, 2);
+        assert_eq!(local.stdout, None);
         drop(owner_probe);
         drop(reader);
         tokio::time::timeout(Duration::from_secs(5), async {
@@ -1505,12 +1506,7 @@ mod tests {
         .await
         .expect("the successor publishes after the retained reader leaves");
 
-        let outcome = match attempt(classify(cli.command.as_ref()).unwrap(), &source).await {
-            ScopedRead::Answered(outcome) => outcome,
-            ScopedRead::NoLocalPublication(_) => {
-                panic!("the waiting successor must serve, not fall back")
-            }
-        };
+        let outcome = attempt(classify(cli.command.as_ref()).unwrap(), &source).await;
         assert_eq!(outcome.exit, 0, "{:?}", outcome.stderr);
         let value: serde_json::Value = serde_json::from_str(&outcome.stdout.unwrap()).unwrap();
         assert_eq!(value["id"], "successor-read");
