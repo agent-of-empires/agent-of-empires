@@ -332,6 +332,7 @@ impl GitWorktree {
             let _ = self.lock_worktree(from);
             return Err(e.into());
         }
+        let mut problems = Vec::new();
         if let Err(e) = self.repair_worktree(to) {
             if let Err(rollback) = std::fs::rename(to, from) {
                 tracing::error!(target: "git.worktree",
@@ -339,18 +340,18 @@ impl GitWorktree {
                     error = %e,
                     "move_worktree: could not repair or move back; the checkout is stranded at the new path"
                 );
-                return Ok(MoveOutcome::MovedDegraded(format!(
+                problems.push(format!(
                     "`git worktree repair` failed ({e}) and moving back failed ({rollback}); \
                      run `git worktree repair {}` from the main repository",
                     to.display()
-                )));
+                ));
+            } else {
+                let _ = self.repair_worktree(from);
+                let _ = self.lock_worktree(from);
+                return Err(e);
             }
-            let _ = self.repair_worktree(from);
-            let _ = self.lock_worktree(from);
-            return Err(e);
         }
 
-        let mut problems = Vec::new();
         if let Err(e) = Self::convert_git_file_to_relative(to) {
             problems.push(format!("could not restore the relative .git pointer: {e}"));
         }
