@@ -103,6 +103,7 @@ import { IdleDecayWindowContext, parseIdleDecayWindowMs } from "./lib/idleDecay"
 import { parseUnreadIndicatorEnabled, UnreadIndicatorContext, useUnreadIndicatorEnabled } from "./lib/unreadIndicator";
 import { parseSessionRowTagMode, SessionRowTagContext, type SessionRowTagMode } from "./lib/sessionRowTag";
 import { parseSessionColorsEnabled, SessionColorsContext } from "./lib/sessionColors";
+import { settleSettingsIntrosReadOnly } from "./lib/settingsIntros";
 import { onSettingsChanged } from "./lib/settingsEvents";
 import { parseSystemHealthEnabled, SystemHealthEnabledContext } from "./lib/systemHealth";
 import { toastBus, reportError } from "./lib/toastBus";
@@ -1113,7 +1114,10 @@ function AppContent({
   const refreshServerAbout = useCallback(async () => {
     try {
       const about = await fetchAbout();
-      if (about) setServerAbout(about);
+      if (about) {
+        setServerAbout(about);
+        settleSettingsIntrosReadOnly(about.read_only);
+      }
     } finally {
       setServerAboutLoaded(true);
     }
@@ -1127,7 +1131,11 @@ function AppContent({
     void fetchAbout()
       .then((about) => {
         if (!active) return;
-        if (about) setServerAbout(about);
+        if (about) {
+          setServerAbout(about);
+          // Settings intro choices made before this answer was in wait to learn where they go.
+          settleSettingsIntrosReadOnly(about.read_only);
+        }
         // Read-only servers can't persist an opt-in choice, so skip the ping.
         if (about && !about.read_only) reportTelemetrySeen("web");
       })

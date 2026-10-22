@@ -124,6 +124,24 @@ test("first-run tutorial: auto-launch, skip, persist, re-trigger, and the Settin
   expect(await page.evaluate(() => document.documentElement.scrollWidth)).toBeLessThanOrEqual(375);
 });
 
+test("a read-only dashboard keeps a Settings intro fold on the device across a reload", async ({
+  serveReadOnly,
+  page,
+}) => {
+  const intro = page.getByRole("region", { name: "About this tab" });
+  const about = page.getByRole("button", { name: "About this tab" });
+  await page.goto(`${serveReadOnly.baseUrl}/settings/worktree`);
+  await expect(intro).toBeVisible({ timeout: 10_000 });
+  await intro.getByRole("button", { name: "Got it" }).click();
+  await expect(about).toBeVisible();
+  // The Daemon refuses the write, so the fold lives only in this browser's device key.
+  expect(await storedIntros(page)).toEqual({});
+  expect(await page.evaluate(() => localStorage.getItem("aoe-local-settings-intro-worktree"))).toBe("folded");
+  await page.reload();
+  await expect(about).toBeVisible({ timeout: 10_000 });
+  await expect(intro).toBeHidden();
+});
+
 // #2292: tip of the day, shared seen state with the TUI.
 test.describe("tips", () => {
   const PWA_TIP = "Install the dashboard as an app";

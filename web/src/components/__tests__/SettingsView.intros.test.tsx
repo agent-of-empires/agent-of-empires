@@ -217,7 +217,7 @@ describe("Settings tab intros", () => {
     await waitFor(() => expect(intro()).not.toBeNull());
     fireEvent.click(screen.getByRole("button", { name: "Got it" }));
     expect(localStorage.getItem("aoe-local-settings-intro-worktree")).toBeNull();
-    // What `useServerAbout` does once /api/about answers.
+    // What App does once /api/about answers.
     settleSettingsIntrosReadOnly(true);
     rerender(view(true));
     expect(localStorage.getItem("aoe-local-settings-intro-worktree")).toBe("folded");
