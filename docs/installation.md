@@ -47,11 +47,13 @@ A daemon from an older build may not expose the local Unix runtime transport, ev
 
 If you installed shell completions as a static file, regenerate it afterwards so it picks up new commands and flags; see [Shell completions](guides/shell-completions.md) for the always-fresh setup that avoids this.
 
-Local Unix transport requires a private `daemon/` directory and trusted
-ancestors. AoE creates missing application ancestors without group-write bits,
-including under umask `002`; it does not change existing `~/.config` permissions.
-If an existing shared-group directory is refused as unsafe, remove group write
-permission only from the directory named in the error, then retry.
+Local Unix transport requires a current-user-owned `daemon/` directory with mode
+`0700` and trusted ancestors. AoE creates missing application ancestors without
+group-write bits, including under umask `002`; it does not change existing
+`~/.config` permissions. Follow the recovery command naming the refused directory:
+set `daemon/` to mode `0700`, or remove both group and other write permissions from
+another refused ancestor, then retry. A directory owned by another user also
+requires ownership recovery; changing its mode alone is not sufficient.
 
 ## Downgrading
 

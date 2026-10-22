@@ -58,6 +58,13 @@ pub(crate) fn prepare_runtime_directory(parent: &Path) -> anyhow::Result<()> {
             && meta.mode() & 0o022 != 0
             && !trusted_ancestor(meta.uid(), meta.gid(), meta.mode(), owner, private_gid)
         {
+            if ancestor == parent {
+                anyhow::bail!(
+                    "Unsafe daemon socket directory: {}. Set this directory to mode 0700 with `chmod 0700 -- {}`, then retry.",
+                    ancestor.display(),
+                    crate::session::environment::shell_escape(&ancestor.to_string_lossy())
+                );
+            }
             anyhow::bail!(
                 "Unsafe daemon socket directory: {}. Remove group/other write permission from this directory with `chmod go-w -- {}`, then retry.",
                 ancestor.display(),
@@ -74,8 +81,15 @@ pub(crate) fn prepare_runtime_directory(parent: &Path) -> anyhow::Result<()> {
     }
     let directory = std::fs::symlink_metadata(parent)?;
     anyhow::ensure!(
-        directory.uid() == owner && directory.mode() & 0o777 == 0o700,
-        "Daemon socket directory must be owned by this user with mode0700"
+        directory.uid() == owner,
+        "Daemon socket directory must be owned by this user: {}",
+        parent.display()
+    );
+    anyhow::ensure!(
+        directory.mode() & 0o777 == 0o700,
+        "Daemon socket directory {} must have mode 0700. Set it with `chmod 0700 -- {}`, then retry.",
+        parent.display(),
+        crate::session::environment::shell_escape(&parent.to_string_lossy())
     );
     Ok(())
 }
@@ -416,6 +430,86 @@ mod tests {
         prepare_runtime_directory(&app.join("daemon")).unwrap();
 
         assert_eq!(std::fs::metadata(&app).unwrap().mode() & 0o777, 0o755);
+    }
+
+    fn run_directory_recovery(error: &anyhow::Error) {
+        let diagnostic = error.to_string();
+        let command = diagnostic
+            .split('`')
+            .nth(1)
+            .unwrap_or_else(|| panic!("missing recovery command: {diagnostic}"));
+        let status = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(command)
+            .status()
+            .unwrap();
+        assert!(status.success(), "recovery command failed: {diagnostic}");
+    }
+
+    #[test]
+    fn socket_directory_recovery_command_repairs_every_nonprivate_mode() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        for mode in [0o755, 0o775, 0o777] {
+            let root = tempfile::tempdir().unwrap();
+            std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+            let app = root
+                .path()
+                .canonicalize()
+                .unwrap()
+                .join("owner's app directory");
+            std::fs::create_dir(&app).unwrap();
+            std::fs::set_permissions(&app, std::fs::Permissions::from_mode(0o700)).unwrap();
+            let parent = app.join("owner's daemon directory");
+            std::fs::create_dir(&parent).unwrap();
+            std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(mode)).unwrap();
+
+            let error = prepare_runtime_directory(&parent).unwrap_err();
+            assert!(
+                error.to_string().contains(parent.to_str().unwrap()),
+                "{error}"
+            );
+            assert_eq!(std::fs::metadata(&parent).unwrap().mode() & 0o777, mode);
+            run_directory_recovery(&error);
+            assert_eq!(std::fs::metadata(&parent).unwrap().mode() & 0o777, 0o700);
+            prepare_runtime_directory(&parent).unwrap();
+        }
+    }
+
+    #[test]
+    fn higher_ancestor_recovery_command_removes_group_and_other_write() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        let root = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let ancestor = root
+            .path()
+            .canonicalize()
+            .unwrap()
+            .join("owner's unsafe ancestor");
+        let app = ancestor.join("app");
+        let parent = app.join("daemon");
+        std::fs::create_dir(&ancestor).unwrap();
+        std::fs::create_dir(&app).unwrap();
+        std::fs::create_dir(&parent).unwrap();
+        for directory in [&app, &parent] {
+            std::fs::set_permissions(directory, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        std::fs::set_permissions(&ancestor, std::fs::Permissions::from_mode(0o777)).unwrap();
+
+        let error = prepare_runtime_directory(&parent).unwrap_err();
+        assert!(
+            error.to_string().contains(ancestor.to_str().unwrap()),
+            "{error}"
+        );
+        assert_eq!(std::fs::metadata(&ancestor).unwrap().mode() & 0o777, 0o777);
+        // Removing only group write still leaves an unsafe world-writable ancestor.
+        std::fs::set_permissions(&ancestor, std::fs::Permissions::from_mode(0o757)).unwrap();
+        let error = prepare_runtime_directory(&parent).unwrap_err();
+        assert_eq!(std::fs::metadata(&ancestor).unwrap().mode() & 0o777, 0o757);
+        run_directory_recovery(&error);
+        assert_eq!(std::fs::metadata(&ancestor).unwrap().mode() & 0o777, 0o755);
+        prepare_runtime_directory(&parent).unwrap();
     }
 
     async fn serve_deadline_body<S>(
