@@ -2372,8 +2372,21 @@ mod tests {
             bin.display(),
             std::env::var("PATH").unwrap_or_default()
         );
-        let _path = crate::session::test_support::EnvGuard::set(&[("PATH", path.as_str())]);
-        for legacy_unknown in [false, true] {
+        let runtime = tempfile::tempdir().unwrap();
+        std::fs::create_dir(runtime.path().join("systemd")).unwrap();
+        std::fs::write(runtime.path().join("systemd/private"), "").unwrap();
+        let _path = crate::session::test_support::EnvGuard::unset(&["DBUS_SESSION_BUS_ADDRESS"])
+            .and_set("PATH", path.as_str());
+        // A legacy row is resolvable only without a user manager that could own its scopes.
+        for (legacy_unknown, manager) in [(false, true), (true, true), (true, false)] {
+            let _manager = crate::session::test_support::EnvGuard::set(&[(
+                "XDG_RUNTIME_DIR",
+                if manager {
+                    runtime.path().to_str().unwrap()
+                } else {
+                    home.path().to_str().unwrap()
+                },
+            )]);
             let profile = "terminal-scope-refusal";
             let storage = Storage::new_unwatched(profile).unwrap();
             let mut row = Instance::new("owned terminal", home.path().to_str().unwrap());
@@ -2406,6 +2419,16 @@ mod tests {
                 panic!("the selected row must reserve before runtime scope proof");
             };
             let result = transaction.run_hooks().unwrap().complete();
+            if !manager {
+                assert!(result.success, "{:?}", result.errors);
+                assert!(!scratch.exists());
+                assert!(storage
+                    .load()
+                    .unwrap()
+                    .iter()
+                    .all(|candidate| candidate.id != row.id));
+                continue;
+            }
             assert!(
                 !result.success,
                 "a denied or unknown scope cannot release checkout resources"

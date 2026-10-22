@@ -350,6 +350,14 @@ mod tests {
     fn recovered_terminal_scope_debt_unlocks_stop_and_purge_without_new_custody() -> Result<()> {
         let home = tempfile::tempdir()?;
         let _home = crate::session::test_support::isolate_app_dir_at(home.path());
+        // A reachable user manager could own the legacy scope, so teardown cannot resolve it alone.
+        let runtime = tempfile::tempdir()?;
+        std::fs::create_dir(runtime.path().join("systemd"))?;
+        std::fs::write(runtime.path().join("systemd/private"), "")?;
+        let _manager = crate::session::test_support::EnvGuard::set(&[(
+            "XDG_RUNTIME_DIR",
+            runtime.path().as_os_str(),
+        )]);
         let mut row = crate::session::Instance::new("legacy", "/tmp/repo");
         row.view = crate::session::View::Terminal;
         row.terminal_scopes = None;

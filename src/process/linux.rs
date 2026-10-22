@@ -117,6 +117,46 @@ impl LegacyUserManager {
         Ok(manager)
     }
 
+    /// Loaded scopes named `<prefix>*.scope`, with their active state.
+    fn list_scope_units(&self, prefix: &str) -> anyhow::Result<Vec<(String, String)>> {
+        use std::collections::HashSet;
+        use std::time::Duration;
+        let mut command = self.command()?;
+        command.args([
+            "--user",
+            "list-units",
+            "--all",
+            "--plain",
+            "--no-legend",
+            "--no-pager",
+            "--full",
+            &format!("{prefix}*.scope"),
+        ]);
+        command.env("LC_ALL", "C").env("SYSTEMD_COLORS", "0");
+        let output = super::run_with_timeout(&mut command, Duration::from_secs(3))?
+            .context("Legacy scope inventory timed out")?;
+        anyhow::ensure!(
+            output.status.success(),
+            "Legacy scope inventory rejected: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let mut listed = HashSet::new();
+        let mut units = Vec::new();
+        for line in std::str::from_utf8(&output.stdout)?.lines() {
+            let mut fields = line.split_whitespace();
+            let unit = fields.next().context("Missing legacy scope unit")?;
+            fields.next().context("Missing legacy scope load state")?;
+            let active = fields.next().context("Missing legacy scope active state")?;
+            fields.next().context("Missing legacy scope substate")?;
+            anyhow::ensure!(
+                unit.starts_with(prefix) && unit.ends_with(".scope") && listed.insert(unit),
+                "Invalid or duplicate legacy scope inventory unit"
+            );
+            units.push((unit.to_owned(), active.to_owned()));
+        }
+        Ok(units)
+    }
+
     fn inventory_root(&self) -> std::path::PathBuf {
         std::path::PathBuf::from("/sys/fs/cgroup").join(self.root.trim_start_matches('/'))
     }
@@ -279,6 +319,14 @@ mod legacy_inventory_boundary_tests {
     }
 }
 
+/// Loaded user-manager scope names starting with `prefix`.
+pub(super) fn legacy_scope_unit_names(prefix: &str) -> anyhow::Result<Vec<String>> {
+    let manager = LegacyUserManager::capture()?;
+    let units = manager.list_scope_units(prefix)?;
+    manager.check_current()?;
+    Ok(units.into_iter().map(|(unit, _)| unit).collect())
+}
+
 pub(super) fn legacy_scope_inventory_clear(
     prefix: &str,
     known: &[crate::process::worker_registry::ScopeOwnership],
@@ -294,36 +342,8 @@ pub(super) fn legacy_scope_inventory_clear(
         })
         .collect();
     let manager = LegacyUserManager::capture()?;
-    let mut command = manager.command()?;
-    command.args([
-        "--user",
-        "list-units",
-        "--all",
-        "--plain",
-        "--no-legend",
-        "--no-pager",
-        "--full",
-        &format!("{prefix}*.scope"),
-    ]);
-    command.env("LC_ALL", "C").env("SYSTEMD_COLORS", "0");
-    let output = super::run_with_timeout(&mut command, Duration::from_secs(3))?
-        .context("Legacy scope inventory timed out")?;
-    anyhow::ensure!(
-        output.status.success(),
-        "Legacy scope inventory rejected: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let mut listed = HashSet::new();
-    for line in std::str::from_utf8(&output.stdout)?.lines() {
-        let mut fields = line.split_whitespace();
-        let unit = fields.next().context("Missing legacy scope unit")?;
-        fields.next().context("Missing legacy scope load state")?;
-        let active = fields.next().context("Missing legacy scope active state")?;
-        fields.next().context("Missing legacy scope substate")?;
-        anyhow::ensure!(
-            unit.starts_with(prefix) && unit.ends_with(".scope") && listed.insert(unit),
-            "Invalid or duplicate legacy scope inventory unit"
-        );
+    for (unit, active) in manager.list_scope_units(prefix)? {
+        let (unit, active) = (unit.as_str(), active.as_str());
         if !retained.contains(unit) {
             // Inventory can prove absence, not transfer kill authority.
             if !matches!(active, "inactive" | "failed") {

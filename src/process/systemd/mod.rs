@@ -588,6 +588,9 @@ pub(crate) fn legacy_unknown_scope_absent(
     );
     #[cfg(target_os = "linux")]
     {
+        if !user_manager_runtime_present() {
+            return Ok(true);
+        }
         super::linux::legacy_scope_inventory_clear(&format!("{}-", escaped_id(session_id)), known)
     }
     #[cfg(target_os = "macos")]
@@ -599,6 +602,91 @@ pub(crate) fn legacy_unknown_scope_absent(
         let _ = known;
         anyhow::bail!("Legacy scope authority recovery is unsupported on this platform")
     }
+}
+
+/// Without a user manager's runtime sockets, `systemd-run --user` never
+/// created a scope, so earlier releases left none to retire.
+#[cfg(target_os = "linux")]
+fn user_manager_runtime_present() -> bool {
+    let runtime_dir = std::env::var_os("XDG_RUNTIME_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(format!("/run/user/{}", nix::unistd::geteuid().as_raw())));
+    user_manager_reachable(Some(&runtime_dir), None)
+}
+
+/// Units named as releases before scope custody named this session's scopes.
+fn legacy_scope_units(session_id: &str) -> anyhow::Result<Vec<String>> {
+    #[cfg(target_os = "linux")]
+    {
+        if !user_manager_runtime_present() {
+            return Ok(Vec::new());
+        }
+        let prefix = format!("{}-", escaped_id(session_id));
+        Ok(super::linux::legacy_scope_unit_names(&prefix)?
+            .into_iter()
+            .filter(|unit| is_legacy_unit_name(&prefix, unit))
+            .collect())
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = session_id;
+        Ok(Vec::new())
+    }
+}
+
+/// `<prefix><start_ms>.scope`, without the namespace and nonce current units carry.
+#[cfg(any(target_os = "linux", test))]
+fn is_legacy_unit_name(prefix: &str, unit: &str) -> bool {
+    unit.strip_prefix(prefix)
+        .and_then(|rest| rest.strip_suffix(".scope"))
+        .is_some_and(|start| !start.is_empty() && start.bytes().all(|byte| byte.is_ascii_digit()))
+}
+
+/// Teardown scopes for a terminal row. Rows from before scope custody adopt the
+/// units earlier releases named for them, which those releases stopped by the
+/// same glob; any other unknown unit must be proven absent.
+pub(crate) fn resolve_unknown_scopes(
+    session_id: &str,
+    recorded: Option<&[crate::process::worker_registry::ScopeOwnership]>,
+) -> anyhow::Result<Vec<crate::process::worker_registry::ScopeOwnership>> {
+    resolve_unknown_scopes_with(
+        session_id,
+        recorded,
+        legacy_scope_units,
+        legacy_unknown_scope_absent,
+    )
+}
+
+fn resolve_unknown_scopes_with(
+    session_id: &str,
+    recorded: Option<&[crate::process::worker_registry::ScopeOwnership]>,
+    legacy_units: impl FnOnce(&str) -> anyhow::Result<Vec<String>>,
+    unknown_absent: impl FnOnce(
+        &str,
+        &[crate::process::worker_registry::ScopeOwnership],
+    ) -> anyhow::Result<bool>,
+) -> anyhow::Result<Vec<crate::process::worker_registry::ScopeOwnership>> {
+    use crate::process::worker_registry::ScopeOwnership;
+    let mut known: Vec<ScopeOwnership> = recorded
+        .unwrap_or_default()
+        .iter()
+        .filter(|scope| **scope != ScopeOwnership::Unresolved)
+        .cloned()
+        .collect();
+    if recorded.is_some_and(|scopes| scopes.len() == known.len()) {
+        return Ok(known);
+    }
+    for unit in legacy_units(session_id)? {
+        let owned = ScopeOwnership::Owned { unit };
+        if !known.contains(&owned) {
+            known.push(owned);
+        }
+    }
+    anyhow::ensure!(
+        unknown_absent(session_id, &known)?,
+        "Terminal scope ownership is unresolved and an unknown scope is live; resources retained"
+    );
+    Ok(known)
 }
 
 /// Blocking exact-unit retirement; only completed, empty scope exit is success.
@@ -698,6 +786,68 @@ mod tests {
                 want,
                 "dir={dir:?} addr={addr:?}"
             );
+        }
+    }
+
+    #[test]
+    fn unknown_scopes_resolve_by_adopting_legacy_units_and_proving_the_rest_absent() {
+        use crate::process::worker_registry::ScopeOwnership::{self, Owned, Unresolved, Unscoped};
+        let id = "0123abcd-0000-4000-8000-000000000000";
+        let prefix = format!("{}-", escaped_id(id));
+        let current = Owned {
+            unit: format!("{prefix}{}-1700000000000-uuid.scope", "a".repeat(64)),
+        };
+        let legacy = format!("{prefix}1700000000000.scope");
+        assert!(is_legacy_unit_name(&prefix, &legacy));
+        for unit in [
+            format!("{prefix}.scope"),
+            format!("{prefix}17x.scope"),
+            format!("{prefix}{}-1700000000000-uuid.scope", "a".repeat(64)),
+            format!("{prefix}1700000000000.service"),
+        ] {
+            assert!(!is_legacy_unit_name(&prefix, &unit), "{unit}");
+        }
+        let adopted = Owned {
+            unit: legacy.clone(),
+        };
+        let cases: Vec<(
+            Option<Vec<ScopeOwnership>>,
+            bool,
+            Result<Vec<ScopeOwnership>, ()>,
+        )> = vec![
+            (
+                Some(vec![Unscoped, current.clone()]),
+                false,
+                Ok(vec![Unscoped, current.clone()]),
+            ),
+            (None, true, Ok(vec![adopted.clone()])),
+            (
+                Some(vec![Unresolved, current.clone()]),
+                true,
+                Ok(vec![current.clone(), adopted.clone()]),
+            ),
+            (None, false, Err(())),
+        ];
+        for (recorded, absent, want) in cases {
+            let consulted = std::cell::Cell::new(false);
+            let got = resolve_unknown_scopes_with(
+                id,
+                recorded.as_deref(),
+                |_| Ok(vec![legacy.clone()]),
+                |_, known| {
+                    consulted.set(true);
+                    assert!(known.iter().all(|scope| *scope != Unresolved));
+                    Ok(absent)
+                },
+            );
+            match want {
+                Ok(want) => assert_eq!(got.unwrap(), want, "{recorded:?}"),
+                Err(()) => assert!(got.is_err(), "{recorded:?}"),
+            }
+            let complete = recorded
+                .as_ref()
+                .is_some_and(|scopes| !scopes.contains(&Unresolved));
+            assert_eq!(consulted.get(), !complete, "{recorded:?}");
         }
     }
 

@@ -438,11 +438,11 @@ impl Instance {
         if self.is_structured() {
             return Ok(());
         }
-        let scopes = self
-            .terminal_scopes
-            .as_deref()
-            .context("Terminal scope ownership is unresolved; resources retained")?;
-        crate::process::systemd::retire_scopes(&self.id, scopes)
+        let scopes = crate::process::systemd::resolve_unknown_scopes(
+            &self.id,
+            self.terminal_scopes.as_deref(),
+        )?;
+        crate::process::systemd::retire_scopes(&self.id, &scopes)
     }
 
     /// Stop the session and its sandbox container under the same lifecycle

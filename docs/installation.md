@@ -73,15 +73,15 @@ Run only the matching restore command. Restore modes are mutually exclusive and 
 
 ### Resolve legacy unknown scopes
 
-Ordinary startup migrates metadata; it does not perform explicit positive scope recovery. After repairing unreadable components and restoring required journals, run `aoe migrate`. Recovery requires complete, consistent session, worker and journal evidence plus manager and kernel proof before changing scope authority. A current schema marker is not that proof. Live unknown units remain retained, not adopted or stopped automatically.
+Stop, remove, purge and start resolve a pre-upgrade terminal session's scopes themselves. Units in the naming format earlier releases used, `aoe-session-<id>-<start_ms>.scope`, are adopted and stopped as those releases did. Any other live unknown unit is retained, not adopted or stopped. For worker and journal-held debt, repair unreadable components, restore required journals and run `aoe migrate`; a current schema marker is not proof.
 
 On Linux with a local systemd user manager, scope recovery authenticates that manager through its kernel-identified private socket. It binds the manager's reported cgroup root to its reader-relative procfs path and verifies the same physical manager in that directory's kernel membership. Recovery scans the complete manager subtree on a root-mounted cgroup2 filesystem without descendant overmounts. It does not require access to root's or the manager's protected namespace links. Unreadable or partial evidence, a changing manager, and live unknown units still refuse recovery. The runtime namespace comes from the effective user, not a caller-selected recovery identity.
 
-Disabling systemd scopes today, failing the launch capability probe, or finding no user manager does not prove that historical scopes are absent. Legacy terminal rows do not record the original backend, host or boot needed for an alternative proof. On managerless Linux, this recovery remains refused rather than inventing absence; return to the original accessible manager environment or retain the unresolved evidence. A scope created earlier can outlive its manager or leader.
+Without a user manager's runtime sockets, `systemd-run --user` never created a scope, so a managerless Linux host resolves legacy rows to no scopes. Disabling systemd scopes or failing the launch capability probe is not that proof while a manager is reachable.
 
 On macOS, recovery verifies the native Darwin kernel, which cannot host Linux systemd cgroups. This resolves only missing Linux-scope evidence. Explicit captured Linux unit receipts remain refused on macOS; recover those original resources on their Linux host. Worker PID, birth, generation, native runtime, producer and tmux authority are not adopted or replaced. Their own stop and cleanup guards still apply.
 
-Explicit recovery preserves original worker records and opaque fields, changing only an unresolved scope to proven unscoped status. Ordinary startup still leaves missing historical scope evidence unresolved. A missing ownership journal must be restored from complete original authority, never recreated empty.
+Explicit recovery preserves original worker records and opaque fields, changing only an unresolved scope to proven unscoped status. A missing ownership journal must be restored from complete original authority, never recreated empty.
 
 If a live unknown unit blocks recovery:
 
