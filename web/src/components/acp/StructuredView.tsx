@@ -54,6 +54,8 @@ interface Props {
   tool: string | null | undefined;
   /** Resolved ACP agent key; the switch-agent modal's fallback before any `AgentSwitched`. */
   acpAgent: string | null;
+  /** `SessionResponse.acp_session_id`: present once the Agent's session exists. */
+  acpSessionId?: string | null;
   acpProvider: string | null;
   /** Server-owned conversation-reset slash aliases (`/clear`, `/new`). */
   clearAliases?: readonly string[];
@@ -165,7 +167,7 @@ function AcpChrome({
 }: ChromeProps) {
   const { sessionId, acpWorkerState, acpAgent } = view;
   const { state, status } = ctx;
-  const startingAgent = isNewSessionStarting(state, ctx, acpWorkerState)
+  const startingAgent = isNewSessionStarting(state, ctx, acpWorkerState, view.acpSessionId ?? null)
     ? agentDisplayName(state.agent ?? acpAgent)
     : null;
   // Neither can start until restored or unarchived, so nothing here may send (#4116).

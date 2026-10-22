@@ -17,8 +17,11 @@ export function isNewSessionStarting(
   state: AcpState,
   connection: ConnectionRetryState & Pick<AcpContext, "hasEverOpened">,
   acpWorkerState: "absent" | "resuming" | "running" | "stopping",
+  /** Set once the Agent's session exists, so an older Session is known before its events load. */
+  acpSessionId: string | null,
 ): boolean {
   if (
+    acpSessionId ||
     state.startupError ||
     state.workerStopped ||
     state.workerRestarting ||

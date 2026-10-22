@@ -144,6 +144,7 @@ export function MobileMainPane({
                     rateLimitAutoResume={session.rate_limit_auto_resume}
                     tool={session.tool}
                     acpAgent={session.acp_agent ?? null}
+                    acpSessionId={session.acp_session_id ?? null}
                     acpProvider={session.acp_provider ?? null}
                     clearAliases={session.clear_aliases}
                     archivedAt={session.archived_at ?? null}

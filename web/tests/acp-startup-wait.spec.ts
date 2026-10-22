@@ -1,7 +1,7 @@
 // A new Structured view Session that is still starting: one line names the Agent and counts up.
 
 import { test, expect } from "./helpers/mockedTest";
-import { mockAcpSession, openStructuredSession } from "./helpers/acpMock";
+import { agentMessageChunk, mockAcpSession, openStructuredSession, stopped } from "./helpers/acpMock";
 
 async function openStarting(page: import("@playwright/test").Page) {
   const mock = await mockAcpSession(page, { title: "story-starting", workerStarting: true });
@@ -33,6 +33,26 @@ test("a never-started Session that isn't starting waits to resume, not for its A
   await expect(page.getByText("Pending until session resumes (2)")).toBeVisible();
   await expect(page.getByText(/Pending until .* is ready/)).toHaveCount(0);
   await expect(page.getByTestId("startup-wait-line")).toHaveCount(0);
+});
+
+test("an older Session resuming never shows the startup line, even before its events load", async ({ page }) => {
+  // Counts every DOM change that leaves the line in the page, so a one-frame flash shows up.
+  await page.addInitScript(() => {
+    const w = window as unknown as { __startupLineSeen: number };
+    w.__startupLineSeen = 0;
+    new MutationObserver(() => {
+      if (document.querySelector('[data-testid="startup-wait-line"]')) w.__startupLineSeen++;
+    }).observe(document, { subtree: true, childList: true });
+  });
+  const mock = await mockAcpSession(page, {
+    title: "story-resuming-old",
+    workerState: "resuming",
+    acpSessionId: "acp-session-1",
+    initialEvents: [{ UserPromptSent: { text: "hi", prompt_id: "p1" } }, agentMessageChunk("hello"), stopped()],
+  });
+  await openStructuredSession(page, mock);
+  await expect(page.getByText("hello")).toBeVisible();
+  expect(await page.evaluate(() => (window as unknown as { __startupLineSeen: number }).__startupLineSeen)).toBe(0);
 });
 
 test.describe("at 375px", () => {
