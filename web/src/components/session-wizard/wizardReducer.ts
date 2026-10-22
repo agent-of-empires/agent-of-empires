@@ -197,6 +197,10 @@ function setField(data: WizardData, field: string, value: unknown): WizardData {
   if (field === "useWorktree") next.worktreeDirty = true;
   if (field === "sandboxEnabled") next.sandboxDirty = true;
   if (field === "useStructuredView") next.structuredViewDirty = true;
+  // An import is the one thing that outranks `off`, so the choice it forced ends with it.
+  if (data.importAcpSessionId && !next.importAcpSessionId && !next.structuredViewOffered) {
+    next.useStructuredView = false;
+  }
   return next;
 }
 
