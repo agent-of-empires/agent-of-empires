@@ -200,7 +200,6 @@ fn save_file(
         StatusCode::CONFLICT,
         "File changed on disk. Copy your edits or reload",
     );
-    let _save = SAVES.lock();
     if request.content.len() > MAX_CONTENTS_BYTES || request.content.contains('\0') {
         return Err((
             StatusCode::BAD_REQUEST,
@@ -209,13 +208,19 @@ fn save_file(
     }
     let path = FsPath::new(&request.path);
     let confined = project_file(roots, path)?;
+    // Once, outside the lock: a runtime probe can take a minute, and mounts
+    // change only with the container ID that `sandbox_reason` verifies.
+    if let Some(reason) = sandbox_reason(instance, &confined.canonical) {
+        return Err((StatusCode::FORBIDDEN, reason));
+    }
+    let _save = SAVES.lock();
     // Runs again immediately before publication: optimistic, not a lock on external writers.
     let check = || -> Result<std::fs::Permissions, FileError> {
         let current = project_file(roots, path)?;
         if current.canonical != confined.canonical {
             return Err(CHANGED);
         }
-        let current = snapshot(roots, &current, Some(instance), false).map_err(|_| CHANGED)?;
+        let current = snapshot(roots, &current, None, false).map_err(|_| CHANGED)?;
         if current.version.as_deref() != Some(request.version.as_str()) {
             return Err(CHANGED);
         }
