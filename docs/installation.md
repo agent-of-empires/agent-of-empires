@@ -69,9 +69,9 @@ Run only the matching restore command. Restore modes are mutually exclusive and 
 
 ### Resolve legacy unknown scopes
 
-Ordinary startup migrates metadata; it does not perform explicit positive scope recovery. After repairing unreadable components and restoring required journals, run `aoe migrate`. Recovery requires complete, consistent session, worker and journal evidence plus manager and kernel proof before changing scope authority. A current schema marker is not that proof. Live unknown units remain retained, not adopted or stopped automatically.
+Stop, remove, purge and start resolve a pre-upgrade session's scopes themselves. Units in the naming format earlier releases used, `aoe-session-<id>-<start_ms>.scope`, are adopted and stopped as those releases did; without a Linux user manager there are no scopes. Any other live unknown unit is retained, not adopted or stopped. For journal-held debt, repair unreadable components, restore required journals and run `aoe migrate`; a current schema marker is not proof.
 
-On Linux, scope recovery must read `/proc/self/ns/cgroup` and `/proc/1/ns/cgroup`, verify the same cgroup namespace and inspect the unified cgroup hierarchy. Permission denial or an incomplete namespace retains unresolved ownership, even after candidate units exit. Restore access to that proof before retrying; do not clear the fence or assume an empty inventory.
+On Linux, the proof compares `/proc/self/ns/cgroup` with the cgroup namespace of PID 1, or of the user manager when PID 1 is not readable, and inspects the unified cgroup hierarchy. An incomplete namespace retains unresolved ownership, even after candidate units exit; do not clear the fence or assume an empty inventory.
 
 If a live unknown unit blocks recovery:
 
