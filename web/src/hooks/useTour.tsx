@@ -1,7 +1,7 @@
 /* eslint-disable react-refresh/only-export-components */
 import { lazy, Suspense, useCallback, useEffect, useRef, useState, type ReactNode } from "react";
 import { resolveTourSteps, type TourScope, type TourStep } from "../lib/tourSteps";
-import type { TourSettingsTab } from "../components/tour/TourRunner";
+import { resetSettingsIntros } from "../lib/settingsIntros";
 import { isAutomatedSession } from "../lib/onboarding";
 import { useLatestRef } from "./useLatestRef";
 
@@ -10,13 +10,11 @@ const TourRunner = lazy(() => import("../components/tour/TourRunner"));
 export interface UseTourOptions {
   scope: TourScope;
   readOnly: boolean;
-  cityhall: boolean;
   isDesktop: boolean;
   autoLaunchReady: boolean;
   seen: boolean;
   seenKnown: boolean;
   onSeen: () => void;
-  onNavigate: (tab: TourSettingsTab | null) => void;
 }
 
 export function shouldAutoLaunch(args: {
@@ -46,13 +44,11 @@ export interface UseTourResult {
 export function useTour({
   scope,
   readOnly,
-  cityhall,
   isDesktop,
   autoLaunchReady,
   seen,
   seenKnown,
   onSeen,
-  onNavigate,
 }: UseTourOptions): UseTourResult {
   const [run, setRun] = useState(false);
   const [steps, setSteps] = useState<TourStep[]>([]);
@@ -76,17 +72,19 @@ export function useTour({
     (onStarted?: () => void): number => {
       return requestAnimationFrame(() => {
         if (!mountedRef.current) return;
-        const resolved = resolveTourSteps({ scope, readOnly, cityhall, isDesktop });
+        const resolved = resolveTourSteps({ scope, readOnly, isDesktop });
         if (resolved.length === 0) return;
         onStarted?.();
         setSteps(resolved);
         setRun(true);
       });
     },
-    [scope, readOnly, cityhall, isDesktop],
+    [scope, readOnly, isDesktop],
   );
 
+  // Replaying the tutorial also shows every Settings tab intro once more.
   const startTour = useCallback(() => {
+    resetSettingsIntros();
     begin();
   }, [begin]);
 
@@ -111,7 +109,7 @@ export function useTour({
 
   const tourElement = run ? (
     <Suspense fallback={null}>
-      <TourRunner run={run} steps={steps} onFinish={handleFinish} onNavigate={onNavigate} />
+      <TourRunner run={run} steps={steps} onFinish={handleFinish} />
     </Suspense>
   ) : null;
 

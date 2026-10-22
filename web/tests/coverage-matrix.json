@@ -4534,7 +4534,25 @@
         "web/src/components/WorkspaceSidebar.tsx",
         "web/src/components/Dock.tsx",
         "web/src/components/acp/Composer.tsx",
-        "web/src/components/SettingsView.tsx"
+        "web/src/components/SettingsView.tsx",
+        "web/src/components/settings/SettingsIntro.tsx"
+      ]
+    },
+    {
+      "id": "onboarding.settings-tab-intros",
+      "kind": "vitest",
+      "risk": "low",
+      "specs": [
+        "src/components/__tests__/SettingsView.intros.test.tsx",
+        "src/hooks/useTour.test.tsx",
+        "src/lib/__tests__/webUiSync.test.ts"
+      ],
+      "components": [
+        "web/src/components/settings/SettingsIntro.tsx",
+        "web/src/components/SettingsView.tsx",
+        "web/src/lib/settingsIntros.ts",
+        "web/src/lib/webUiSync.ts",
+        "web/src/hooks/useTour.tsx"
       ]
     },
     {

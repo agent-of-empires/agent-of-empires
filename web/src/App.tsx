@@ -2303,13 +2303,11 @@ function AppContent({
   const tour = useTour({
     scope: tourScope,
     readOnly: !!serverAbout?.read_only,
-    cityhall: caps.cityhall,
     isDesktop: !isCoarse,
     autoLaunchReady: tourAutoLaunchReady && welcome.resolved,
     seen: tourSeen,
     seenKnown: tourSeenKnown,
     onSeen: handleTourSeen,
-    onNavigate: (tab) => (tab ? navigate(`/settings/${tab}`) : handleCloseSettings()),
   });
 
   // Auto-pop the tip-of-the-day once per load, after onboarding settles, like

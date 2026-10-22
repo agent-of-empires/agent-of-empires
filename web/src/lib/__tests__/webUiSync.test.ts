@@ -40,6 +40,7 @@ describe("isSyncedKey", () => {
       "aoe-repo-collapsed-/home/me/repo",
       "aoe-group-collapsed-feature",
       "aoe-nested-group-collapsed-x",
+      "aoe-settings-intro-worktree", // folded Settings tab intro
     ]) {
       expect(isSyncedKey(k), k).toBe(true);
     }

@@ -2,6 +2,7 @@
 
 import { getWebUiState, patchWebUiState } from "./api";
 import { configureStorageSync } from "./safeStorage";
+import { SETTINGS_INTRO_KEY_PREFIX } from "./settingsIntros";
 
 const EXACT_KEYS = new Set<string>([
   "aoe-welcome-seen", // theme welcome modal seen (mirrors the server-side tour flag)
@@ -16,8 +17,13 @@ const EXACT_KEYS = new Set<string>([
   "aoe-web-settings", // dashboard prefs (persistent terminals, auto-open keyboard, fonts)
 ]);
 
-// Group-collapse keys are per repo/group, so match by prefix.
-const KEY_PREFIXES = ["aoe-repo-collapsed-", "aoe-nested-group-collapsed-", "aoe-group-collapsed-"];
+// Group-collapse keys are per repo/group and Settings intro folds per tab, so match by prefix.
+const KEY_PREFIXES = [
+  "aoe-repo-collapsed-",
+  "aoe-nested-group-collapsed-",
+  "aoe-group-collapsed-",
+  SETTINGS_INTRO_KEY_PREFIX,
+];
 
 export function isSyncedKey(key: string): boolean {
   return EXACT_KEYS.has(key) || KEY_PREFIXES.some((p) => key.startsWith(p));
@@ -94,4 +100,13 @@ export async function hydrateWebUiStateFromServer(): Promise<void> {
   for (const [key, value] of Object.entries(server)) {
     rawSet(key, value);
   }
+  window.dispatchEvent(new Event(HYDRATED_EVENT));
+}
+
+const HYDRATED_EVENT = "aoe:web-ui-state-hydrated";
+
+/** Hydration isn't awaited before render, so a view that read its keys on mount re-reads here. */
+export function onWebUiStateHydrated(listener: () => void): () => void {
+  window.addEventListener(HYDRATED_EVENT, listener);
+  return () => window.removeEventListener(HYDRATED_EVENT, listener);
 }

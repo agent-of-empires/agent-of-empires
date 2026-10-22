@@ -3,12 +3,14 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { act, render, renderHook, waitFor } from "@testing-library/react";
 
+import { resetSettingsIntros } from "../lib/settingsIntros";
 import { resolveTourSteps, type TourStep } from "../lib/tourSteps";
 import { isAutomatedSession } from "../lib/onboarding";
 import { shouldAutoLaunch, useTour, type UseTourOptions } from "./useTour";
 
 vi.mock("../lib/tourSteps", () => ({ resolveTourSteps: vi.fn() }));
 vi.mock("../lib/onboarding", () => ({ isAutomatedSession: vi.fn(() => false) }));
+vi.mock("../lib/settingsIntros", () => ({ resetSettingsIntros: vi.fn() }));
 
 let lastOnFinish: ((markSeen: boolean) => void) | null = null;
 vi.mock("../components/tour/TourRunner", () => ({
@@ -33,13 +35,11 @@ const drainRaf = () =>
 const opts = (over: Partial<UseTourOptions> = {}): UseTourOptions => ({
   scope: "dashboard",
   readOnly: false,
-  cityhall: false,
   isDesktop: true,
   autoLaunchReady: true,
   seen: false,
   seenKnown: true,
   onSeen: vi.fn(),
-  onNavigate: vi.fn(),
   ...over,
 });
 
@@ -84,18 +84,18 @@ describe("shouldAutoLaunch", () => {
 });
 
 describe("useTour", () => {
-  it("starts inactive; startTour activates on the next frame with the scope's steps", () => {
+  it("starts inactive; startTour unfolds the Settings intros and activates on the next frame", () => {
     const { result } = renderHook(() => useTour(opts({ autoLaunchReady: false })));
     expect(result.current).toMatchObject({ isTourActive: false, tourElement: null });
 
     act(() => result.current.startTour());
+    expect(resetSettingsIntros).toHaveBeenCalledTimes(1);
     expect(result.current.isTourActive).toBe(false);
     drainRaf();
     expect(result.current.isTourActive).toBe(true);
     expect(resolveTourStepsMock).toHaveBeenCalledWith({
       scope: "dashboard",
       readOnly: false,
-      cityhall: false,
       isDesktop: true,
     });
   });
@@ -125,6 +125,8 @@ describe("useTour", () => {
     rerender(opts());
     drainRaf();
     expect(resolveTourStepsMock).toHaveBeenCalledTimes(1);
+    // Only an explicit replay unfolds the intros, never the first-run launch.
+    expect(resetSettingsIntros).not.toHaveBeenCalled();
   });
 
   it("cancels an active tour when the scope changes", () => {

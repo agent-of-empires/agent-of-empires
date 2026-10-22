@@ -26,7 +26,16 @@ import { PanelsSettings } from "./settings/PanelsSettings";
 import { TelemetrySettings } from "./settings/TelemetrySettings";
 import { CityHallSettings } from "./settings/CityHallSettings";
 import { PluginsSettings } from "./settings/PluginsSettings";
-import { TOUR_ANCHORS, tourAnchor } from "../lib/tourSteps";
+import { SettingsIntro, SettingsIntroReopen } from "./settings/SettingsIntro";
+import { onWebUiStateHydrated } from "../lib/webUiSync";
+import {
+  SETTINGS_INTRO_IDS,
+  foldSettingsIntro,
+  isSettingsIntroFolded,
+  isSettingsIntroId,
+  onSettingsIntrosReset,
+  type SettingsIntroId,
+} from "../lib/settingsIntros";
 import { PluginSettingsSections } from "./settings/PluginSettingsSections";
 import { LogsSettings } from "./settings/LogsSettings";
 import { SettingsHeader } from "./settings/SettingsHeader";
@@ -240,6 +249,8 @@ export function resolveSelectedProfile(current: string, profiles: ProfileInfo[])
   return profiles.find((p) => p.is_default)?.name ?? "default";
 }
 
+const storedIntroFolds = () => new Set(SETTINGS_INTRO_IDS.filter(isSettingsIntroFolded));
+
 export function SettingsView({
   onClose,
   tab,
@@ -372,6 +383,18 @@ export function SettingsView({
   }
 
   const defaultProfile = profiles.find((p) => p.is_default)?.name ?? "default";
+
+  // Reopening with "About" is local to this visit; "Got it" folds it again.
+  const [foldedIntros, setFoldedIntros] = useState<ReadonlySet<SettingsIntroId>>(storedIntroFolds);
+  const foldIntro = (id: SettingsIntroId) => {
+    foldSettingsIntro(id);
+    setFoldedIntros((prev) => new Set(prev).add(id));
+  };
+  const reopenIntro = (id: SettingsIntroId) => setFoldedIntros((prev) => new Set([...prev].filter((f) => f !== id)));
+  // "Show tutorial" can run with Settings open.
+  useEffect(() => onSettingsIntrosReset(() => setFoldedIntros(new Set())), []);
+  // A Device landing straight on Settings can mount before the Daemon's folds arrive.
+  useEffect(() => onWebUiStateHydrated(() => setFoldedIntros(storedIntroFolds())), []);
 
   const handleSetDefault = async (name: string) => {
     const ok = await setDefaultProfile(name);
@@ -544,7 +567,6 @@ export function SettingsView({
             values={worktree}
             onSaveField={sendSave}
             advancedSubtitle="Bare-repo and workspace path templates, branch cleanup, and submodules."
-            fieldAnchor={{ field: "path_template", anchor: TOUR_ANCHORS.settingsWorktree }}
           />
         );
 
@@ -624,7 +646,7 @@ export function SettingsView({
 
       case "plugins":
         return (
-          <div className="space-y-6" {...tourAnchor(TOUR_ANCHORS.settingsPlugins)}>
+          <div className="space-y-6">
             <PluginsSettings readOnly={cityhall} />
             {!cityhall &&
               (schemaGuard() ?? <PluginSettingsSections schema={schema} settings={settings} onSaveField={sendSave} />)}
@@ -677,12 +699,7 @@ export function SettingsView({
         const acp = settings.acp ?? {};
         return (
           <div className="space-y-4">
-            {/* Tour anchor for the per-agent defaults step (#2631). Anchored on
-                this top-of-tab intro, not the defaults widget itself, so
-                react-joyride never has to scroll a far-down, async-growing
-                target into view (which made it loop and never advance). Keep it
-                first in the tab for the same reason. */}
-            <p className="text-xs text-text-dim" {...tourAnchor(TOUR_ANCHORS.settingsAgentDefaults)}>
+            <p className="text-xs text-text-dim">
               Defaults for structured-view (ACP) sessions: which agent starts, how many workers run at once, how much
               history is replayed on reconnect, and the per-agent model, mode, and thinking defaults below. These apply
               when a session renders in the structured view instead of a raw terminal.
@@ -707,6 +724,8 @@ export function SettingsView({
   };
 
   const currentTabLabel = tabs.find((t) => t.id === activeTab)?.label ?? "";
+  const introId = isSettingsIntroId(activeTab) ? activeTab : null;
+  const introFolded = introId !== null && foldedIntros.has(introId);
   const showProfilePicker = !cityhall && profileScopedTabs.has(activeTab);
 
   return (
@@ -798,7 +817,10 @@ export function SettingsView({
               label-to-control gaps don't stretch across an ultrawide monitor. */}
           <div className={activeTab === "skills" ? "p-4 md:p-6 space-y-5" : "p-4 md:p-6 max-w-5xl mx-auto space-y-5"}>
             <div className="flex flex-wrap items-center justify-between gap-x-4 gap-y-2">
-              <h2 className="text-lg font-semibold text-text-bright">{currentTabLabel}</h2>
+              <div className="flex items-center gap-3">
+                <h2 className="text-lg font-semibold text-text-bright">{currentTabLabel}</h2>
+                {introId && introFolded && <SettingsIntroReopen onReopen={() => reopenIntro(introId)} />}
+              </div>
               {showProfilePicker && (
                 <div data-testid="settings-profile-picker">
                   <ProfileSelector selectedProfile={selectedProfile} onSelect={handleSelectProfile} />
@@ -806,6 +828,7 @@ export function SettingsView({
               )}
             </div>
 
+            {introId && !introFolded && <SettingsIntro key={introId} id={introId} onFold={() => foldIntro(introId)} />}
             {offline && (
               <div className="text-sm text-status-error bg-status-error/10 rounded-lg p-3">
                 {OFFLINE_TITLE}: toggles will not save while disconnected.
