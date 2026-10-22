@@ -692,6 +692,37 @@ async fn write_machine_patch(
     }
 }
 
+/// `POST /api/cityhall/apply` applies a TOML bundle to this install and returns
+/// the `ApplyReport`. Applying writes settings, the git identity and the
+/// project registry, and clones repositories on this host.
+pub async fn apply_cityhall_bundle(
+    _guard: super::mutation_guard::ElevatedMutationGuard,
+    body: String,
+) -> axum::response::Response {
+    let applied = tokio::task::spawn_blocking(move || {
+        let bundle = crate::session::cityhall_bundle::CityHallBundle::from_toml(&body)
+            .map_err(|e| (StatusCode::BAD_REQUEST, "bad_bundle", e))?;
+        crate::session::cityhall_bundle::apply(&bundle)
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, "apply_failed", e))
+    })
+    .await;
+    match applied {
+        Ok(Ok(report)) => Json(report).into_response(),
+        Ok(Err((status, code, e))) => {
+            tracing::warn!(target: "http.api.system", "CityHall bundle apply failed: {e:#}");
+            api_error(status, code, format!("{e:#}"))
+        }
+        Err(e) => {
+            tracing::error!(target: "http.api.system", "CityHall bundle apply panicked: {e}");
+            api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "internal",
+                "Internal server error",
+            )
+        }
+    }
+}
+
 /// `GET /api/cityhall/bundle` returns this install's CityHall config bundle as
 /// TOML. Refused in CityHall client mode: `cityhall_gate` only guards
 /// mutations, so this read needs its own block.
@@ -1974,7 +2005,14 @@ pub async fn default_profile(
         return api_error(StatusCode::BAD_REQUEST, "validation_failed", e);
     }
     let name = body.name;
-    match tokio::task::spawn_blocking(move || crate::session::set_default_profile(&name)).await {
+    let result = tokio::task::spawn_blocking(move || {
+        if !crate::session::list_profiles()?.contains(&name) {
+            anyhow::bail!("Profile '{name}' does not exist");
+        }
+        crate::session::set_default_profile(&name)
+    })
+    .await;
+    match result {
         Ok(Ok(())) => (StatusCode::OK, Json(serde_json::json!({"ok": true}))).into_response(),
         Ok(Err(e)) => api_error(StatusCode::BAD_REQUEST, "update_failed", e.to_string()),
         Err(e) => api_error(StatusCode::INTERNAL_SERVER_ERROR, "internal", e.to_string()),

@@ -287,6 +287,7 @@ pub(super) const CITYHALL_MUTATION_ALLOW: &[(&str, &str)] = &[
     ("POST", "/api/plugins/{id}/pages/{page_id}/ticket"),
     // Telemetry consent (its own surface, still prompted).
     ("POST", "/api/telemetry/consent"),
+    ("POST", "/api/telemetry/reset-id"),
     ("POST", "/api/telemetry/seen"),
     ("POST", "/api/telemetry/structured-interaction"),
     // Ephemeral foreground-presence heartbeat. Does not mutate user data.
@@ -327,6 +328,8 @@ pub(super) const CITYHALL_MUTATION_DENY: &[(&str, &str)] = &[
     // Git / project / profile management.
     ("POST", "/api/git/clone"),
     ("POST", "/api/projects"),
+    // Applying a bundle is what puts an install under CityHall, not something a managed one does.
+    ("POST", "/api/cityhall/apply"),
     // Attaching a repo to a session takes an arbitrary host path, so it is denied for the
     // same reason `git/clone` and `POST /api/projects` are.
     ("POST", "/api/sessions/{id}/projects"),

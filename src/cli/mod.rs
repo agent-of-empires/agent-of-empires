@@ -57,6 +57,12 @@ pub(crate) fn lifecycle_notice_line(indent: &str, notice: &str) -> String {
 use crate::session::Instance;
 use anyhow::{bail, Result};
 
+/// A client for the Daemon, auto-started when none runs (ADR 0004).
+pub(crate) async fn daemon_client() -> Result<crate::acp::client::HttpClient> {
+    let endpoint = crate::acp::client::require_daemon().await?;
+    Ok(crate::acp::client::HttpClient::new(endpoint)?)
+}
+
 pub fn resolve_session<'a>(identifier: &str, instances: &'a [Instance]) -> Result<&'a Instance> {
     if let Some(inst) = instances.iter().find(|i| i.id == identifier) {
         return Ok(inst);

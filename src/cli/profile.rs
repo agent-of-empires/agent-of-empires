@@ -2,8 +2,10 @@
 
 use anyhow::{bail, Result};
 use clap::Subcommand;
+use reqwest::Method;
 use std::io::{self, Write};
 
+use crate::acp::client::path_segment;
 use crate::session;
 
 #[derive(Subcommand)]
@@ -101,14 +103,23 @@ async fn list_profiles() -> Result<()> {
 }
 
 async fn create_profile(name: &str) -> Result<()> {
-    session::create_profile(name)?;
+    let body = serde_json::json!({ "name": name });
+    super::daemon_client()
+        .await?
+        .mutate(Method::POST, "/api/profiles", Some(body))
+        .await?;
     println!("✓ Created profile: {}", name);
     println!("  Use with: aoe -p {}", name);
     Ok(())
 }
 
 async fn rename_profile(old_name: &str, new_name: &str) -> Result<()> {
-    session::rename_profile(old_name, new_name)?;
+    let path = format!("/api/profiles/{}/rename", path_segment(old_name));
+    let body = serde_json::json!({ "new_name": new_name });
+    super::daemon_client()
+        .await?
+        .mutate(Method::PATCH, &path, Some(body))
+        .await?;
     println!("✓ Renamed profile: {} -> {}", old_name, new_name);
     Ok(())
 }
@@ -128,7 +139,11 @@ async fn delete_profile(name: &str) -> Result<()> {
         return Ok(());
     }
 
-    session::delete_profile(name)?;
+    let path = format!("/api/profiles/{}", path_segment(name));
+    super::daemon_client()
+        .await?
+        .mutate(Method::DELETE, &path, None)
+        .await?;
     println!("✓ Deleted profile: {}", name);
     Ok(())
 }
@@ -142,12 +157,11 @@ async fn show_default_profile() -> Result<()> {
 }
 
 async fn set_default_profile(name: &str) -> Result<()> {
-    let profiles = session::list_profiles()?;
-    if !profiles.contains(&name.to_string()) {
-        bail!("Profile '{}' does not exist", name);
-    }
-
-    session::set_default_profile(name)?;
+    let body = serde_json::json!({ "name": name });
+    super::daemon_client()
+        .await?
+        .mutate(Method::PATCH, "/api/default-profile", Some(body))
+        .await?;
     println!("✓ Default profile set to: {}", name);
     Ok(())
 }

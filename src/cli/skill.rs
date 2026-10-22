@@ -6,6 +6,9 @@ use std::process::Command;
 
 use anyhow::{bail, Context, Result};
 use clap::{Args, Subcommand};
+use reqwest::Method;
+
+use crate::acp::client::path_segment;
 
 use crate::session::skills_model::{self, SkillError, SkillProvenance};
 
@@ -99,15 +102,15 @@ pub struct SkillSyncArgs {
     json: bool,
 }
 
-pub fn run(command: SkillCommands) -> Result<()> {
+pub async fn run(command: SkillCommands) -> Result<()> {
     match command {
         SkillCommands::List(args) => list(args),
         SkillCommands::View(args) => view(args),
-        SkillCommands::Add(args) => add(args),
-        SkillCommands::Edit(args) => edit(args),
-        SkillCommands::Adopt(args) => adopt(args),
-        SkillCommands::Remove(args) => remove(args),
-        SkillCommands::Sync(args) => sync(args),
+        SkillCommands::Add(args) => add(args).await,
+        SkillCommands::Edit(args) => edit(args).await,
+        SkillCommands::Adopt(args) => adopt(args).await,
+        SkillCommands::Remove(args) => remove(args).await,
+        SkillCommands::Sync(args) => sync(args).await,
     }
 }
 
@@ -152,37 +155,50 @@ fn view(args: SkillViewArgs) -> Result<()> {
     Ok(())
 }
 
-fn add(args: SkillAddArgs) -> Result<()> {
-    let (_, app_dir) = skills_dirs()?;
-    skills_model::create_skill(&app_dir, &args.directory, args.description.as_deref())
-        .map_err(skill_error)?;
+async fn add(args: SkillAddArgs) -> Result<()> {
+    let body = serde_json::json!({
+        "directory": args.directory,
+        "description": args.description,
+    });
+    super::daemon_client()
+        .await?
+        .mutate(Method::POST, "/api/skills", Some(body))
+        .await?;
     println!("Created managed skill {}.", args.directory);
     Ok(())
 }
 
-fn edit(args: SkillEditArgs) -> Result<()> {
-    let (home, app_dir) = skills_dirs()?;
+async fn edit(args: SkillEditArgs) -> Result<()> {
+    let client = super::daemon_client().await?;
+    let segment = path_segment(&args.directory);
     let content = match args.file {
         Some(path) if path.as_os_str() == "-" => read_stdin_capped()?,
         Some(path) => skills_model::read_file_capped(&path, skills_model::MAX_SKILL_MD_BYTES)
             .with_context(|| format!("failed to read {}", path.display()))?,
-        None => edit_with_editor(&home, &app_dir, &args.directory)?,
+        None => {
+            let skill = client
+                .mutate(
+                    Method::GET,
+                    &format!("/api/skills/aoe-managed/{segment}"),
+                    None,
+                )
+                .await?;
+            let current = skill["content"].as_str().unwrap_or_default();
+            edit_with_editor(current)?
+        }
     };
-    skills_model::edit_skill(&home, &app_dir, &args.directory, &content).map_err(skill_error)?;
+    let body = serde_json::json!({ "content": content });
+    client
+        .mutate(Method::PUT, &format!("/api/skills/{segment}"), Some(body))
+        .await?;
     println!("Updated managed skill {}.", args.directory);
     Ok(())
 }
 
-fn edit_with_editor(
-    home: &std::path::Path,
-    app_dir: &std::path::Path,
-    directory: &str,
-) -> Result<String> {
-    let skill = skills_model::read_skill(home, app_dir, &SkillProvenance::AoeManaged, directory)
-        .map_err(skill_error)?;
+fn edit_with_editor(current: &str) -> Result<String> {
     let temp = tempfile::tempdir()?;
     let path = temp.path().join("SKILL.md");
-    std::fs::write(&path, skill.content)?;
+    std::fs::write(&path, current)?;
     let editor = std::env::var("VISUAL")
         .or_else(|_| std::env::var("EDITOR"))
         .unwrap_or_else(|_| "vi".to_string());
@@ -217,17 +233,22 @@ fn read_stdin_capped() -> Result<String> {
     String::from_utf8(buf).context("stdin is not valid UTF-8")
 }
 
-fn adopt(args: SkillAdoptArgs) -> Result<()> {
-    let (home, app_dir) = skills_dirs()?;
+async fn adopt(args: SkillAdoptArgs) -> Result<()> {
     let provenance = parse_external_source(&args.source)?;
-    let destination = skills_model::adopt_skill(
-        &home,
-        &app_dir,
-        &provenance,
-        &args.directory,
-        args.destination.as_deref(),
-    )
-    .map_err(skill_error)?;
+    let SkillProvenance::External { root } = provenance else {
+        unreachable!("parse_external_source returns External");
+    };
+    let path = format!(
+        "/api/skills/{}/{}/adopt",
+        path_segment(&root),
+        path_segment(&args.directory)
+    );
+    let body = serde_json::json!({ "destination": args.destination });
+    let reply = super::daemon_client()
+        .await?
+        .mutate(Method::POST, &path, Some(body))
+        .await?;
+    let destination = reply["directory"].as_str().unwrap_or(&args.directory);
     println!(
         "Adopted {} as managed skill {}.",
         args.directory, destination
@@ -235,30 +256,28 @@ fn adopt(args: SkillAdoptArgs) -> Result<()> {
     Ok(())
 }
 
-fn remove(args: SkillRemoveArgs) -> Result<()> {
-    let (home, app_dir) = skills_dirs()?;
-    skills_model::delete_skill(&home, &app_dir, &args.directory).map_err(skill_error)?;
+async fn remove(args: SkillRemoveArgs) -> Result<()> {
+    let path = format!("/api/skills/{}", path_segment(&args.directory));
+    super::daemon_client()
+        .await?
+        .mutate(Method::DELETE, &path, None)
+        .await?;
     println!("Removed managed skill {}.", args.directory);
     Ok(())
 }
 
-fn sync(args: SkillSyncArgs) -> Result<()> {
-    let (home, app_dir) = skills_dirs()?;
-    let options = skills_model::SyncOptions {
-        replace: args.replace.into_iter().collect(),
-        only: args.only.into_iter().collect(),
-    };
-    let outcomes = if args.roots.is_empty() {
-        skills_model::sync_all_roots(&home, &app_dir, &options)
-    } else {
-        let mut out = Vec::new();
-        for root in &args.roots {
-            out.extend(
-                skills_model::sync_root(&home, &app_dir, root, &options).map_err(skill_error)?,
-            );
-        }
-        out
-    };
+async fn sync(args: SkillSyncArgs) -> Result<()> {
+    let body = serde_json::json!({
+        "roots": args.roots,
+        "replace": args.replace,
+        "directories": args.only,
+    });
+    let reply = super::daemon_client()
+        .await?
+        .mutate(Method::POST, "/api/skills/sync", Some(body))
+        .await?;
+    let outcomes: Vec<skills_model::SyncOutcome> =
+        serde_json::from_value(reply["outcomes"].clone())?;
 
     if args.json {
         println!("{}", serde_json::to_string_pretty(&outcomes)?);

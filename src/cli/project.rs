@@ -1,10 +1,12 @@
 //! `aoe project` subcommands: manage the project registry used by the
 
-use anyhow::{bail, Result};
+use anyhow::Result;
 use clap::{Args, Subcommand, ValueEnum, ValueHint};
+use reqwest::Method;
 use serde::Serialize;
 use std::path::PathBuf;
 
+use crate::acp::client::path_segment;
 use crate::session::projects;
 use crate::session::{resolve_existing_profile, Project, ProjectScope};
 
@@ -176,45 +178,40 @@ async fn list(profile: &str, args: ProjectListArgs) -> Result<()> {
     Ok(())
 }
 
-async fn add(profile: &str, profile_explicit: bool, args: ProjectAddArgs) -> Result<()> {
-    let scope = match args.scope {
+/// A project as the Daemon reports it after a write.
+#[derive(serde::Deserialize)]
+struct SavedProject {
+    name: String,
+    path: String,
+    default_base_branch: Option<String>,
+}
+
+fn scope_or_default(arg: Option<ScopeArg>, profile_explicit: bool) -> ProjectScope {
+    match arg {
         Some(ScopeArg::Global) => ProjectScope::Global,
         Some(ScopeArg::Profile) => ProjectScope::Profile,
         None => resolve_default_scope(profile_explicit),
-    };
-    let resolved_profile = match scope {
-        ProjectScope::Global => None,
-        ProjectScope::Profile => Some(resolve_existing_profile(profile)?),
-    };
-    let profile = resolved_profile.as_deref().unwrap_or(profile);
-
-    let canonical = args
-        .path
-        .canonicalize()
-        .unwrap_or_else(|_| args.path.clone());
-
-    if !canonical.is_dir() {
-        bail!(
-            "Path does not exist or is not a directory: {}",
-            canonical.display()
-        );
     }
+}
 
-    let name = match args.name {
-        Some(n) => n,
-        None => {
-            let base = canonical
-                .file_name()
-                .map(|n| n.to_string_lossy().to_string())
-                .unwrap_or_else(|| "project".to_string());
-            projects::unique_name(profile, scope, &base)
-        }
-    };
-
-    let project = Project::new(name.clone(), canonical.to_string_lossy(), scope)
-        .with_base_branch(args.base_branch);
-    let is_git = project.is_git();
-    let saved = projects::add(profile, scope, project, args.allow_override)?;
+async fn add(profile: &str, profile_explicit: bool, args: ProjectAddArgs) -> Result<()> {
+    let scope = scope_or_default(args.scope, profile_explicit);
+    // The Daemon resolves the path in its own working directory, so a relative
+    // one is anchored here, where the user typed it.
+    let path = std::path::absolute(&args.path)?;
+    let body = serde_json::json!({
+        "path": path.to_string_lossy(),
+        "name": args.name,
+        "scope": scope.as_str(),
+        "profile": (scope == ProjectScope::Profile).then_some(profile),
+        "allow_override": args.allow_override,
+        "default_base_branch": args.base_branch,
+    });
+    let value = super::daemon_client()
+        .await?
+        .mutate(Method::POST, "/api/projects", Some(body))
+        .await?;
+    let saved: SavedProject = serde_json::from_value(value)?;
     println!(
         "✓ Registered project '{}' [{}] at {}",
         saved.name,
@@ -224,7 +221,7 @@ async fn add(profile: &str, profile_explicit: bool, args: ProjectAddArgs) -> Res
     if let Some(base) = &saved.default_base_branch {
         println!("  Default base branch: {base}");
     }
-    if !is_git {
+    if !Project::new(saved.name, &saved.path, scope).is_git() {
         println!(
             "  Note: not a git repository; sessions open directly in this folder \
              (no worktree per session, branches, or diff view)."
@@ -234,17 +231,20 @@ async fn add(profile: &str, profile_explicit: bool, args: ProjectAddArgs) -> Res
 }
 
 async fn remove(profile: &str, profile_explicit: bool, args: ProjectRemoveArgs) -> Result<()> {
-    let scope = match args.scope {
-        Some(ScopeArg::Global) => ProjectScope::Global,
-        Some(ScopeArg::Profile) => ProjectScope::Profile,
-        None => resolve_default_scope(profile_explicit),
-    };
-    let resolved_profile = match scope {
-        ProjectScope::Global => None,
-        ProjectScope::Profile => Some(resolve_existing_profile(profile)?),
-    };
-    let profile = resolved_profile.as_deref().unwrap_or(profile);
-    let removed = projects::remove(profile, scope, &args.name_or_path)?;
+    let scope = scope_or_default(args.scope, profile_explicit);
+    let mut path = format!(
+        "/api/projects/{}?scope={}",
+        path_segment(&args.name_or_path),
+        scope.as_str()
+    );
+    if scope == ProjectScope::Profile {
+        path.push_str(&format!("&profile={}", path_segment(profile)));
+    }
+    let value = super::daemon_client()
+        .await?
+        .mutate(Method::DELETE, &path, None)
+        .await?;
+    let removed: SavedProject = serde_json::from_value(value)?;
     println!(
         "✓ Removed project '{}' [{}] (was at {})",
         removed.name,

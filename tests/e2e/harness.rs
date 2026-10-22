@@ -1034,7 +1034,7 @@ last_seen_version = "{}"
         );
     }
 
-    fn cli_command(&self, args: &[&str]) -> Command {
+    pub fn cli_command(&self, args: &[&str]) -> Command {
         let mut cmd = self.isolated(
             &self.binary_path,
             &[],

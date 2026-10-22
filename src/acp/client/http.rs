@@ -358,6 +358,37 @@ impl HttpClient {
         Ok(())
     }
 
+    /// A config mutation on a daemon-wide endpoint, retried after a passphrase
+    /// step-up. Returns the JSON body, `Null` when empty.
+    pub async fn mutate(
+        &self,
+        method: Method,
+        path: &str,
+        body: Option<serde_json::Value>,
+    ) -> Result<serde_json::Value, HttpError> {
+        self.mutate_with(method, path, |request| match &body {
+            Some(body) => request.json(body),
+            None => request,
+        })
+        .await
+    }
+
+    /// Like [`mutate`](Self::mutate), with the caller shaping the request
+    /// (a non-JSON body or a longer timeout).
+    pub async fn mutate_with(
+        &self,
+        method: Method,
+        path: &str,
+        shape: impl Fn(reqwest::RequestBuilder) -> reqwest::RequestBuilder,
+    ) -> Result<serde_json::Value, HttpError> {
+        let res = self
+            .send_elevated(|| shape(self.request(method.clone(), path)), Scope::Global)
+            .await
+            .map_err(brief_server_error)?;
+        let text = res.text().await?;
+        Ok(serde_json::from_str(&text).unwrap_or(serde_json::Value::Null))
+    }
+
     /// Toggled through the daemon so its plugin host reconciles workers live.
     pub async fn set_plugin_enabled(
         &self,
@@ -366,11 +397,7 @@ impl HttpClient {
     ) -> Result<(), HttpError> {
         let path = format!("/api/plugins/{plugin_id}/enabled");
         let body = serde_json::json!({ "enabled": enabled });
-        self.send_elevated(
-            || self.request(Method::POST, &path).json(&body),
-            Scope::Global,
-        )
-        .await?;
+        self.mutate(Method::POST, &path, Some(body)).await?;
         Ok(())
     }
 
@@ -754,6 +781,31 @@ fn classify_error(status: StatusCode, body: &str, scope: Scope<'_>) -> HttpError
             body: body.to_string(),
         },
     }
+}
+
+/// Server errors for config commands read best as the daemon's own message. An
+/// empty 404 is an absent route: the daemon predates the endpoint.
+fn brief_server_error(error: HttpError) -> HttpError {
+    let HttpError::Server { status, body } = error else {
+        return error;
+    };
+    let body = match serde_json::from_str::<serde_json::Value>(&body)
+        .ok()
+        .and_then(|v| v.get("message")?.as_str().map(str::to_string))
+    {
+        Some(message) => message,
+        None if status == StatusCode::NOT_FOUND && body.trim().is_empty() => {
+            "the running daemon does not support this command; restart it with `aoe serve --restart`"
+                .to_string()
+        }
+        None => body,
+    };
+    HttpError::Server { status, body }
+}
+
+/// Escapes one URL path segment.
+pub fn path_segment(raw: &str) -> String {
+    utf8_percent_encode(raw, PATH_SEGMENT).to_string()
 }
 
 /// Only the resolve endpoints mint `ApprovalGone`, and only for a 404 naming

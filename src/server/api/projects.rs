@@ -111,9 +111,25 @@ pub async fn list_projects(
     }
 }
 
+/// The registry profile a write targets: the request's explicit one, which must
+/// exist, else the served profile.
+fn target_profile(
+    state: &AppState,
+    requested: Option<&str>,
+) -> Result<String, axum::response::Response> {
+    match requested {
+        None => Ok(state.profile.clone()),
+        Some(name) => crate::session::resolve_existing_profile(name)
+            .map_err(|e| api_error(StatusCode::BAD_REQUEST, "bad_profile", e.to_string())),
+    }
+}
+
 #[derive(Deserialize)]
 pub struct CreateProjectBody {
     pub path: String,
+    /// Profile for a "profile"-scoped entry; defaults to the served profile.
+    #[serde(default)]
+    pub profile: Option<String>,
     #[serde(default)]
     pub name: Option<String>,
     /// "global" (default) or "profile".
@@ -187,6 +203,11 @@ pub async fn create_project(
         }
     };
 
+    let profile = match target_profile(&state, body.profile.as_deref()) {
+        Ok(profile) => profile,
+        Err(resp) => return resp,
+    };
+
     let path_buf = std::path::PathBuf::from(&body.path);
     let canonical = path_buf.canonicalize().unwrap_or_else(|_| path_buf.clone());
 
@@ -197,7 +218,7 @@ pub async fn create_project(
                 .file_name()
                 .map(|n| n.to_string_lossy().to_string())
                 .unwrap_or_else(|| "project".to_string());
-            projects::unique_name(&state.profile, scope, &base)
+            projects::unique_name(&profile, scope, &base)
         }
     };
 
@@ -242,19 +263,13 @@ pub async fn create_project(
         .with_overrides(body.overrides);
     // A new entry can hide the values of one it shadows. That is decided under the registry locks,
     // together with the write, so no concurrent writer can slip in between.
-    let added = projects::add_guarded(
-        &state.profile,
-        scope,
-        project,
-        body.allow_override,
-        |effect| {
-            if elevated || effect.is_noop() {
-                Ok(())
-            } else {
-                Err(RegistryError::Forbidden(PLUGIN_SETTINGS_ELEVATION.into()))
-            }
-        },
-    );
+    let added = projects::add_guarded(&profile, scope, project, body.allow_override, |effect| {
+        if elevated || effect.is_noop() {
+            Ok(())
+        } else {
+            Err(RegistryError::Forbidden(PLUGIN_SETTINGS_ELEVATION.into()))
+        }
+    });
     match added {
         Ok((saved, effect)) => {
             tracing::info!(target: "http.api.projects", name = %saved.name, path = %saved.path, scope = saved.scope.as_str(), "created project");
@@ -286,6 +301,9 @@ pub struct DeleteQuery {
     /// "global" (default) or "profile".
     #[serde(default)]
     pub scope: Option<String>,
+    /// Profile for a "profile"-scoped entry; defaults to the served profile.
+    #[serde(default)]
+    pub profile: Option<String>,
 }
 
 #[tracing::instrument(target = "http.api.projects", skip_all, fields(name = %name, scope = q.scope.as_deref().unwrap_or("global")))]
@@ -318,11 +336,16 @@ pub async fn delete_project(
         }
     };
 
+    let profile = match target_profile(&state, q.profile.as_deref()) {
+        Ok(profile) => profile,
+        Err(resp) => return resp,
+    };
+
     // Removing an entry drops its own values and can reveal those of an entry it shadows. That is
     // decided under the registry locks, together with the write, so no concurrent writer can slip
     // in between.
     let elevated = handler_elevated(&state, session.as_deref(), loopback.is_some()).await;
-    let removed = projects::remove_guarded(&state.profile, scope, &name, |entry, effect| {
+    let removed = projects::remove_guarded(&profile, scope, &name, |entry, effect| {
         if elevated || (entry.overrides.plugin_settings.is_empty() && effect.is_noop()) {
             Ok(())
         } else {
@@ -715,7 +738,10 @@ mod tests {
                 let resp = update_project(
                     State(state),
                     Path("demo".to_string()),
-                    Query(DeleteQuery { scope: None }),
+                    Query(DeleteQuery {
+                        scope: None,
+                        profile: None,
+                    }),
                     Some(axum::Extension(AuthenticatedSession(session))),
                     None,
                     Ok(Json(body)),
@@ -788,7 +814,10 @@ mod tests {
             delete_project(
                 State(state.clone()),
                 Path(name.to_string()),
-                Query(DeleteQuery { scope: None }),
+                Query(DeleteQuery {
+                    scope: None,
+                    profile: None,
+                }),
                 ext(),
                 None,
             )
@@ -800,6 +829,7 @@ mod tests {
                 None,
                 Ok(Json(CreateProjectBody {
                     path: path.to_string_lossy().to_string(),
+                    profile: None,
                     name: Some("shadow".into()),
                     scope: Some("profile".into()),
                     allow_override: true,
@@ -872,6 +902,7 @@ mod tests {
                 Path("shadow".to_string()),
                 Query(DeleteQuery {
                     scope: Some("profile".into()),
+                    profile: None,
                 }),
                 Some(axum::Extension(AuthenticatedSession(session.clone()))),
                 None,
@@ -975,6 +1006,7 @@ mod tests {
             Path("p".to_string()),
             Query(DeleteQuery {
                 scope: Some("profile".into()),
+                profile: None,
             }),
             None,
             None,
@@ -988,6 +1020,7 @@ mod tests {
             None,
             Ok(Json(CreateProjectBody {
                 path: other.to_string_lossy().to_string(),
+                profile: None,
                 name: None,
                 scope: Some("profile".into()),
                 allow_override: false,
