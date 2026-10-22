@@ -503,6 +503,12 @@ structured sessions). The receipt cursor is carried in `aoe-runtime-epoch` and
 attach only after applying a snapshot at or beyond that receipt in the same
 epoch, with matching lifecycle generation, profile, and live terminal identity.
 
+## GET and PUT /api/sessions/{id}/file
+
+GET accepts `?path=<relative-or-absolute-path>` and returns `content`, `is_binary`, `truncated`, `version`, and `edit_disabled_reason`. Add `editing=true` to request a version and edit-eligibility checks. `version_only=true` requests those checks without the content payload. Reads may include out-of-project files proven by the Session's transcript; that provenance never grants writes.
+
+PUT accepts `{ "path", "version", "content" }` for an existing project UTF-8 text file up to 5 MB. Send the opened GET version. A successful atomic replacement returns 204; a changed version returns 409 and preserves the disk file. Read-only and CityHall modes return 403. Escaping paths, binary files, and unverified or separate Sandbox volumes cannot be edited. The browser's opt-in setting and workflow are described in [Editing project files](guides/web/dashboard.md#editing-project-files).
+
 ## POST /api/sessions/{id}/send
 
 Type a message into the agent and press Enter, the same way the TUI's

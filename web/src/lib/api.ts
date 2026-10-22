@@ -395,6 +395,13 @@ export interface SessionFileResponse {
   content: string;
   is_binary: boolean;
   truncated: boolean;
+  version?: string | null;
+  edit_disabled_reason?: string | null;
+}
+
+export async function saveSessionFile(id: string, path: string, version: string, content: string) {
+  const response = await send(`/api/sessions/${id}/file`, jsonInit("PUT", { path, version, content }));
+  return { ok: response.ok, status: response.status, error: stringField(response.payload, "message") };
 }
 
 /**
@@ -402,8 +409,14 @@ export interface SessionFileResponse {
  * or an absolute path the agent touched this session; the server enforces
  * provenance confinement. See `GET /api/sessions/{id}/file`.
  */
-export function getSessionFile(id: string, filePath: string): Promise<SessionFileResponse | null> {
+export function getSessionFile(
+  id: string,
+  filePath: string,
+  options: { editing?: boolean; versionOnly?: boolean } = {},
+): Promise<SessionFileResponse | null> {
   const params = new URLSearchParams({ path: filePath });
+  if (options.editing) params.set("editing", "true");
+  if (options.versionOnly) params.set("version_only", "true");
   return fetchJson<SessionFileResponse>(`/api/sessions/${id}/file?${params.toString()}`);
 }
 

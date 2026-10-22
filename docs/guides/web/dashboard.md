@@ -15,6 +15,15 @@ The dashboard is the home screen of the web app: a workspace sidebar on the left
 
 Each sidebar row carries an animated braille glyph encoding the session's state: a spinner of dots while **Running**, an orbiting dot while **Waiting** or **Creating**, a slow breathe while **Starting** or freshly idle. Errors render in the error color. The frame is offset by each session's creation time so rows don't pulse in lockstep.
 
+## Editing project files
+
+Editing is off by default. Enable **Settings > Panels > Edit project text files** in the browser, then open an existing file in **Files** and select **Edit**.
+
+- Save or Cancel in the viewer. Ctrl/Cmd+S and Esc apply only while the text area has focus. Confirm before leaving unsaved changes.
+- Existing UTF-8 text files up to 5 MB only. Read-only dashboards, out-of-project transcript files, and Sandbox folders backed by separate volumes and individual file bind mounts stay read-only with a reason. Files are unavailable in CityHall mode.
+- Saves preserve line endings, the trailing newline and file mode. A changed disk version refuses the save; copy your edits or reload. The editor checks for external changes while open.
+- After saving, optionally draft a note in Structured view without submitting it. Terminal view shows a reminder to tell the agent.
+
 ## Creating a session
 
 The **New session** wizard is one screen of one-line rows, like the TUI dialog; a row with a chevron opens its details in a panel:

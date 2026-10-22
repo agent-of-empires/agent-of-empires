@@ -97,7 +97,12 @@ pub(super) fn build_router(state: Arc<AppState>) -> Router {
             "/api/sessions/{id}/diff/file/raw",
             get(api::session_diff_file_raw),
         )
-        .route("/api/sessions/{id}/file", get(api::session_file))
+        .route(
+            "/api/sessions/{id}/file",
+            get(api::session_file)
+                .put(api::save_session_file)
+                .layer(axum::extract::DefaultBodyLimit::max(32 * 1024 * 1024)),
+        )
         .route("/api/sessions/{id}/file/raw", get(api::session_file_raw))
         // Read-only runtime read: one Hello, one Snapshot, one clean close.
         .route("/api/runtime/read/ws", get(runtime_ws::runtime_ws))
