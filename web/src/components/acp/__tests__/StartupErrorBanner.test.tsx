@@ -165,6 +165,16 @@ describe("StartupErrorBanner layout", () => {
       actions: ["Retry", "Use Terminal view"],
     },
     {
+      label: "the short native-binary form gets the same remediation",
+      info: claude({ install_allowed: true }),
+      message: "ACP connection failed: native binary failed to launch",
+      headline: "Claude couldn't start in Structured view",
+      command: null,
+      texts: ["Architecture mismatch"],
+      absent: ["aoe acp doctor --fix", "connects AoE to"],
+      actions: ["Retry", "Use Terminal view"],
+    },
+    {
       label: "a stale bundled copy names the doctor fix, not npm",
       info: claude({ install_allowed: true }),
       message: `${SPAWN_PREFIX}aoe's bundled ACP adapter \`claude-agent-acp\` predates this aoe build, so it is refused until it is reinstalled. Reinstall it with: aoe acp doctor --fix --adapter claude-agent-acp`,

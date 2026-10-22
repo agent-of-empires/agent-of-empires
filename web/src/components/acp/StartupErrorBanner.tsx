@@ -79,7 +79,7 @@ function specificRemediation(message: string): React.ReactNode {
       </>
     );
   }
-  if (/native binary at .* exists but failed to launch/i.test(message)) {
+  if (/native binary (?:at .* exists but )?failed to launch/i.test(message)) {
     return (
       <>
         The adapter is installed but its bundled Claude Code native sub-binary couldn't launch. The binary exists on
