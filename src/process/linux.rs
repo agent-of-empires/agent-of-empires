@@ -84,10 +84,6 @@ impl LegacyUserManager {
         let birth = super::process_birth_identity(peer.pid)?
             .context("User manager process birth is unavailable")?;
         let namespace = fs::read_link("/proc/self/ns/cgroup")?;
-        anyhow::ensure!(
-            fs::read_link(format!("/proc/{}/ns/cgroup", peer.pid))? == namespace,
-            "Caller and user manager have different cgroup namespaces"
-        );
         let mountinfo = fs::read_to_string("/proc/self/mountinfo")?;
         validate_legacy_cgroup_mount(&mountinfo)?;
         let process_cgroup = fs::read_to_string(format!("/proc/{}/cgroup", peer.pid))?;
@@ -136,11 +132,16 @@ impl LegacyUserManager {
         );
         anyhow::ensure!(
             fs::read_link("/proc/self/ns/cgroup")? == self.namespace
-                && fs::read_link(format!("/proc/{}/ns/cgroup", self.pid))? == self.namespace
                 && fs::read_to_string(format!("/proc/{}/cgroup", self.pid))? == self.process_cgroup
                 && fs::read_to_string("/proc/self/mountinfo")? == self.mountinfo
                 && self.manager_root()? == self.root,
             "User manager inventory boundary changed during scope proof"
+        );
+        let members = fs::read_to_string(self.inventory_root().join("init.scope/cgroup.procs"))?;
+        validate_legacy_manager_pid(&members, self.pid)?;
+        anyhow::ensure!(
+            super::process_birth_identity(self.pid)?.as_ref() == Some(&self.birth),
+            "User manager incarnation changed during kernel membership proof"
         );
         Ok(())
     }
@@ -161,6 +162,7 @@ fn validate_legacy_manager_root(root: &str) -> anyhow::Result<()> {
 }
 
 fn validate_legacy_manager_membership(contents: &str, root: &str) -> anyhow::Result<()> {
+    // Procfs uses the reader's root; systemd reports its manager's root.
     let mut unified = contents.lines().filter_map(|line| line.strip_prefix("0::"));
     anyhow::ensure!(
         unified
@@ -174,21 +176,42 @@ fn validate_legacy_manager_membership(contents: &str, root: &str) -> anyhow::Res
 }
 
 fn validate_legacy_cgroup_mount(contents: &str) -> anyhow::Result<()> {
-    let mut matches = contents.lines().filter_map(|line| {
-        let (mount, filesystem) = line.split_once(" - ")?;
+    let mut found = false;
+    for line in contents.lines() {
+        let (mount, filesystem) = line
+            .split_once(" - ")
+            .context("Malformed mount inventory")?;
         let mut fields = mount.split_whitespace();
-        let root = fields.nth(3)?;
-        let point = fields.next()?;
-        (point == "/sys/fs/cgroup").then_some((root, filesystem))
-    });
-    let (root, filesystem) = matches
-        .next()
-        .context("Unified cgroup mount is unavailable")?;
+        let root = fields.nth(3).context("Missing mount root")?;
+        let point = fields.next().context("Missing mount point")?;
+        anyhow::ensure!(
+            !point.starts_with("/sys/fs/cgroup/"),
+            "A descendant mount hides part of the cgroup inventory"
+        );
+        if point == "/sys/fs/cgroup" {
+            anyhow::ensure!(
+                !found && root == "/" && filesystem.split_whitespace().next() == Some("cgroup2"),
+                "A complete unified cgroup hierarchy is unavailable"
+            );
+            found = true;
+        }
+    }
+    anyhow::ensure!(found, "Unified cgroup mount is unavailable");
+    Ok(())
+}
+
+fn validate_legacy_manager_pid(contents: &str, expected: u32) -> anyhow::Result<()> {
+    let mut found = false;
+    for line in contents.lines() {
+        let pid: u32 = line
+            .parse()
+            .context("Malformed manager cgroup membership")?;
+        anyhow::ensure!(pid != 0, "Invalid manager cgroup PID");
+        found |= pid == expected;
+    }
     anyhow::ensure!(
-        matches.next().is_none()
-            && root == "/"
-            && filesystem.split_whitespace().next() == Some("cgroup2"),
-        "A complete unified cgroup hierarchy is unavailable"
+        found,
+        "Authenticated manager is absent from the visible cgroup"
     );
     Ok(())
 }
@@ -211,6 +234,20 @@ mod legacy_inventory_boundary_tests {
             validate_legacy_cgroup_mount("31 20 0:27 / /sys/fs/cgroup rw - tmpfs tmpfs rw\n")
                 .is_err()
         );
+        assert!(validate_legacy_cgroup_mount(
+            "31 20 0:27 / /sys/fs/cgroup rw - cgroup2 cgroup rw\n\
+             32 31 0:31 / /sys/fs/cgroup/user.slice rw - tmpfs tmpfs rw\n"
+        )
+        .is_err());
+        for (members, valid) in [
+            ("3703\n3749\n", true),
+            ("3749\n", false),
+            ("", false),
+            ("3703\nbad\n", false),
+            ("3703\n0\n", false),
+        ] {
+            assert_eq!(validate_legacy_manager_pid(members, 3703).is_ok(), valid);
+        }
         for bad in [
             "",
             "/",
