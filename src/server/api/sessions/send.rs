@@ -178,6 +178,10 @@ async fn send_terminal_message_inner(
             TerminalNotRunning
         );
         let session = instance.tmux_session()?;
+        session.wait_until_ready(
+            std::time::Duration::from_secs(5),
+            crate::agents::ready_marker(&instance.tool),
+        );
         session.send_keys_with_delay(
             &message,
             crate::agents::send_keys_enter_delay(&instance.tool),
