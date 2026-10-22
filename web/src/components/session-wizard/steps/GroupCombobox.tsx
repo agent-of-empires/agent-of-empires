@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useId, useLayoutEffect, useRef, useState } from "react";
+import { useCallback, useId, useLayoutEffect, useRef, useState } from "react";
 
 import type { GroupInfo } from "../../../lib/types";
 import { ROW_INPUT } from "../WizardRows";
@@ -44,7 +44,8 @@ export function GroupCombobox({
     setPlacement({ up, maxHeight: Math.max(0, Math.min(LIST_MAX, up ? above : below)) });
   }, []);
 
-  useEffect(() => {
+  // Before paint, so the list never shows a frame at its default size.
+  useLayoutEffect(() => {
     if (!open) return;
     place();
     const scroller = inputRef.current?.closest<HTMLElement>("[data-wizard-scroll]");
@@ -130,7 +131,8 @@ export function GroupCombobox({
             placement.up ? "bottom-full mb-1" : "top-full mt-1"
           }`}
         >
-          <ul id={listId} role="listbox" aria-label="Groups" className="min-h-0 flex-1 overflow-y-auto">
+          {/* In a cramped popup the help yields first, so at least one row stays usable. */}
+          <ul id={listId} role="listbox" aria-label="Groups" className="min-h-11 flex-1 overflow-y-auto">
             {options.map((option, i) => (
               <li
                 key={keyOf(option)}
@@ -164,7 +166,7 @@ export function GroupCombobox({
               </li>
             ))}
           </ul>
-          <p className="shrink-0 border-t border-surface-700/60 px-3 py-2 text-xs text-text-dim">
+          <p className="min-h-0 shrink overflow-y-auto border-t border-surface-700/60 px-3 py-2 text-xs text-text-dim">
             {noGroups && !value.trim() ? (
               "No groups yet. Type a name to create one."
             ) : (

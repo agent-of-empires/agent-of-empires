@@ -521,6 +521,15 @@ test.describe("Group field", () => {
       const areaBox = (await w.locator("[data-wizard-scroll]").boundingBox())!;
       expect(popupBox.y).toBeGreaterThanOrEqual(areaBox.y - 1);
       expect(popupBox.y + popupBox.height).toBeLessThanOrEqual(Math.min(areaBox.y + areaBox.height, 260) + 1);
+      // The capped popup still shows a whole option, and it can be picked.
+      const option = w.getByRole("option").first();
+      const optionBox = (await option.boundingBox())!;
+      const listBox = (await w.getByRole("listbox", { name: "Groups" }).boundingBox())!;
+      expect(optionBox.height).toBeGreaterThanOrEqual(43);
+      expect(optionBox.y).toBeGreaterThanOrEqual(listBox.y - 1);
+      expect(optionBox.y + optionBox.height).toBeLessThanOrEqual(listBox.y + listBox.height + 1);
+      await option.click();
+      await expect(field).toHaveValue("client");
     });
 
     test("the list opens upward inside the sheet, with 44px rows", async ({ page }) => {
