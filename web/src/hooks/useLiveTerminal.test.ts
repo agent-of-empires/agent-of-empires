@@ -343,13 +343,22 @@ describe("transport reason", () => {
     expect(result.current.state).toMatchObject({ transport: "grid", transportReason: null });
   });
 
-  it("drops the previous connection's transport and reason when a socket opens", () => {
-    const { result, ws } = mount();
-    ws.deliver({ type: "transport", grid: false, reason: "pipe_owned" });
-    expect(result.current.state.transportReason).toBe("pipe_owned");
+  it("drops the previous connection's transport and reason when a replacement socket opens", () => {
+    vi.useFakeTimers();
+    try {
+      const { result, ws } = mount();
+      ws.deliver({ type: "transport", grid: false, reason: "pipe_owned" });
+      ws.readyState = FakeWS.CLOSED;
+      act(() => ws.onclose?.(new CloseEvent("close")));
+      expect(result.current.state.transportReason).toBe("pipe_owned");
 
-    ws.open();
-    expect(result.current.state).toMatchObject({ transport: null, transportReason: null });
+      act(() => result.current.manualReconnect());
+      FakeWS.sockets[1]!.open();
+      expect(result.current.state).toMatchObject({ transport: null, transportReason: null });
+    } finally {
+      vi.clearAllTimers();
+      vi.useRealTimers();
+    }
   });
 });
 
