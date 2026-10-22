@@ -350,20 +350,37 @@ mod tests {
     fn recovered_terminal_scope_debt_unlocks_stop_and_purge_without_new_custody() -> Result<()> {
         let home = tempfile::tempdir()?;
         let _home = crate::session::test_support::isolate_app_dir_at(home.path());
-        // A reachable user manager could own the legacy scope, so teardown cannot resolve it alone.
+        // A reachable manager whose inventory fails leaves the legacy scope unresolved.
+        use std::os::unix::fs::PermissionsExt;
         let runtime = tempfile::tempdir()?;
         std::fs::create_dir(runtime.path().join("systemd"))?;
         std::fs::write(runtime.path().join("systemd/private"), "")?;
-        let _manager = crate::session::test_support::EnvGuard::set(&[(
-            "XDG_RUNTIME_DIR",
-            runtime.path().as_os_str(),
-        )]);
+        let bin = runtime.path().join("bin");
+        std::fs::create_dir(&bin)?;
+        std::fs::write(bin.join("systemctl"), "#!/bin/sh\nexit 1\n")?;
+        std::fs::set_permissions(
+            bin.join("systemctl"),
+            std::fs::Permissions::from_mode(0o700),
+        )?;
+        let path = format!(
+            "{}:{}",
+            bin.display(),
+            std::env::var("PATH").unwrap_or_default()
+        );
+        let _manager = crate::session::test_support::EnvGuard::set(&[
+            ("XDG_RUNTIME_DIR", runtime.path().as_os_str()),
+            ("PATH", std::ffi::OsStr::new(&path)),
+        ]);
         let mut row = crate::session::Instance::new("legacy", "/tmp/repo");
         row.view = crate::session::View::Terminal;
         row.terminal_scopes = None;
-        assert!(row.release_scope().is_err());
+        // macOS has no Linux scope backend, so teardown resolves the row on its own there.
+        assert_eq!(row.release_scope().is_err(), cfg!(target_os = "linux"));
         let before = crate::session::purge_owners::PurgeCapture::new(&row)?;
-        assert!(before.ensure_captured_runner_stopped().is_err());
+        assert_eq!(
+            before.ensure_captured_runner_stopped().is_err(),
+            cfg!(target_os = "linux")
+        );
         let mut rows = vec![serde_json::to_value(&row)?];
         let original = rows.clone();
         assert!(resolve_rows_with(&mut rows, |_, _| Ok(false)).is_err());

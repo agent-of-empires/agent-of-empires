@@ -2419,7 +2419,8 @@ mod tests {
                 panic!("the selected row must reserve before runtime scope proof");
             };
             let result = transaction.run_hooks().unwrap().complete();
-            if !manager {
+            // Without a Linux scope backend a legacy row has nothing left to prove.
+            if legacy_unknown && (!manager || !cfg!(target_os = "linux")) {
                 assert!(result.success, "{:?}", result.errors);
                 assert!(!scratch.exists());
                 assert!(storage
