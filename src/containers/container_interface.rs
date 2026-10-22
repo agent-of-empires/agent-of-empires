@@ -223,7 +223,12 @@ impl ContainerConfig {
         use sha2::{Digest, Sha256};
 
         let mut digest = Sha256::new();
-        for volume in &self.volumes {
+        // The plugin MCP mount holds no identity path and is checked on its own at launch.
+        let fingerprinted = self
+            .volumes
+            .iter()
+            .filter(|v| v.container_path != crate::server::plugin_mcp_socket::CONTAINER_DIR);
+        for volume in fingerprinted {
             for value in [&volume.host_path, &volume.container_path] {
                 digest.update((value.len() as u64).to_le_bytes());
                 digest.update(value.as_bytes());
@@ -307,6 +312,27 @@ mod tests {
         assert!(!alternate.uses_default_container_home());
         assert_ne!(root.mount_fingerprint(), alternate.mount_fingerprint());
         assert_ne!(missing.mount_fingerprint(), root.mount_fingerprint());
+    }
+
+    /// The plugin MCP mount carries no identity path and is tracked on its own, so adding it
+    /// (or failing to) never invalidates an existing container's fingerprint.
+    #[test]
+    fn the_plugin_mcp_mount_is_not_fingerprinted() {
+        let repo = VolumeMount {
+            host_path: "/repo".into(),
+            container_path: "/workspace/repo".into(),
+            read_only: false,
+        };
+        let mut without = ContainerConfig::default();
+        without.volumes.push(repo.clone());
+        let mut with = ContainerConfig::default();
+        with.volumes.push(repo);
+        with.volumes.push(VolumeMount {
+            host_path: "/app/plugin-mcp".into(),
+            container_path: crate::server::plugin_mcp_socket::CONTAINER_DIR.into(),
+            read_only: true,
+        });
+        assert_eq!(with.mount_fingerprint(), without.mount_fingerprint());
     }
 
     #[test]

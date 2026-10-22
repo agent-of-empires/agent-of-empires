@@ -25,6 +25,7 @@ mod mcp_plugins;
 mod pane;
 pub mod passkeys;
 pub(crate) mod peer;
+pub(crate) mod plugin_mcp_socket;
 pub mod plugin_status;
 pub mod principal;
 pub mod push;

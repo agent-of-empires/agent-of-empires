@@ -14,7 +14,7 @@ use crate::acp::mcp_rewrite::{
 use crate::plugin::host::PluginHost;
 use crate::plugin::mcp_serve::{plugin_entries, servers_for_session, ServedServer};
 use crate::plugin::worker_call::WorkerCall;
-use crate::server::daemon_endpoint::DaemonEndpoint;
+use crate::server::daemon_endpoint::{plugin_route, DaemonEndpoint};
 use crate::session::mcp::project_mcp::ProjectMcpServer;
 
 pub struct RewriteHook {
@@ -81,40 +81,41 @@ pub async fn run_chain(
     Ok(entries)
 }
 
-/// Turns the chain's serve entries into credentialed plugin entries. Without a daemon URL
-/// the session reaches they are omitted together with any same-key entry, so nothing falls
-/// back to a server they replaced, and each serving plugin is reported once.
+/// Turns the chain's serve entries into credentialed plugin entries. Without a route to the
+/// daemon they are omitted together with any same-key entry, so nothing falls back to a server
+/// they replaced, and each serving plugin not already told at launch is told once.
 fn resolve_served(
     caller: &dyn WorkerCall,
     entries: Vec<McpEntry>,
     endpoint: Option<&DaemonEndpoint>,
     ctx: &McpRewriteContext,
 ) -> Rewritten {
-    let target = endpoint.and_then(|e| Some((&*e.secret, e.base_url(ctx.sandboxed())?)));
+    let target = plugin_route(endpoint, ctx.sandbox_socket());
     let mut out = Rewritten::default();
     let mut unreachable: BTreeSet<String> = BTreeSet::new();
     let mut omitted: BTreeSet<String> = BTreeSet::new();
     for entry in entries {
         match (entry, target) {
             (McpEntry::Server(server), _) => out.servers.push(server),
-            (McpEntry::Serve { served }, Some((secret, base_url))) => {
-                for p in plugin_entries(secret, base_url, &ctx.session_id, &[served]) {
+            (McpEntry::Serve { served }, Ok((secret, route))) => {
+                for p in plugin_entries(secret, route, &ctx.session_id, &[served]) {
                     out.served_by.insert(p.server.name.clone(), p.plugin_id);
                     out.servers.push(p.server);
                 }
             }
-            (McpEntry::Serve { served }, None) => {
+            (McpEntry::Serve { served }, Err(_)) => {
                 omitted.insert(served.entry_key);
                 unreachable.insert(served.plugin_id);
             }
         }
     }
     out.servers.retain(|s| !omitted.contains(&s.name));
-    for plugin_id in unreachable {
-        caller.report_serve_failure(
-            &plugin_id,
-            "This session cannot reach the daemon's MCP endpoint, so the servers the plugin's rewrite hook serves are skipped for it.",
-        );
+    if let Err(cause) = target {
+        for plugin_id in unreachable {
+            if !ctx.unreachable_notified.contains(&plugin_id) {
+                caller.report_serve_failure(&plugin_id, cause.notice());
+            }
+        }
     }
     out
 }
@@ -179,6 +180,12 @@ impl McpRewriter for PluginMcpRewriter {
     fn report_serve_notice(&self, plugin_id: &str, message: &str) {
         if let Some(host) = &self.host {
             WorkerCall::report_serve_notice(host.as_ref(), plugin_id, message);
+        }
+    }
+
+    fn report_serve_failure(&self, plugin_id: &str, message: &str) {
+        if let Some(host) = &self.host {
+            WorkerCall::report_serve_failure(host.as_ref(), plugin_id, message);
         }
     }
 }
@@ -280,7 +287,7 @@ mod tests {
         replies: Mutex<Vec<Result<Value, WorkerRequestError>>>,
         seen_params: Mutex<Vec<Value>>,
         failures: Mutex<Vec<(String, String)>>,
-        serve_failures: Mutex<Vec<String>>,
+        serve_failures: Mutex<Vec<(String, String)>>,
     }
 
     impl FakeCaller {
@@ -340,11 +347,11 @@ mod tests {
                 .push((plugin_id.to_string(), message.to_string()));
         }
 
-        fn report_serve_failure(&self, plugin_id: &str, _message: &str) {
+        fn report_serve_failure(&self, plugin_id: &str, message: &str) {
             self.serve_failures
                 .lock()
                 .unwrap()
-                .push(plugin_id.to_string());
+                .push((plugin_id.to_string(), message.to_string()));
         }
 
         fn report_serve_notice(&self, _plugin_id: &str, _message: &str) {
@@ -375,10 +382,12 @@ mod tests {
             sandbox: Some(crate::acp::mcp_rewrite::McpSandbox {
                 container_workdir: None,
                 mounts: Vec::new(),
+                plugin_socket: crate::server::daemon_endpoint::SandboxSocket::Reachable,
             }),
             profile: None,
             cwd: "/w".into(),
             plugin_served: Vec::new(),
+            unreachable_notified: Vec::new(),
         }
     }
 
@@ -485,6 +494,7 @@ mod tests {
         DaemonEndpoint {
             host_url: "http://127.0.0.1:4321".into(),
             sandbox_url: sandbox_url.map(str::to_string),
+            sandbox_socket: None,
             secret: Arc::new(McpSessionSecret::load_or_generate(&dir.join("secret")).unwrap()),
         }
     }
@@ -620,24 +630,94 @@ mod tests {
         }
     }
 
+    /// Hook-served entries take the session's route: http for the host, the socket forwarder
+    /// for a sandbox whose container mounts it, else none with a notice naming the cause.
     #[tokio::test]
-    async fn serve_entries_need_a_daemon_url_the_session_reaches() {
+    async fn serve_entries_take_the_route_the_session_reaches() {
+        use crate::server::daemon_endpoint::{NoRoute, PluginRoute};
+
         let dir = tempfile::tempdir().unwrap();
         let sandbox_url = "http://host.containers.internal:4321";
-        // (case, sandboxed, endpoint: None | Some(sandbox url), served base)
-        let cases: [(&str, bool, Option<Option<&str>>, Option<&str>); 5] = [
-            ("host, no endpoint", false, None, None),
-            ("sandbox, no endpoint", true, None, None),
-            ("sandbox without sandbox url", true, Some(None), None),
-            ("host", false, Some(None), Some("http://127.0.0.1:4321")),
-            ("sandbox", true, Some(Some(sandbox_url)), Some(sandbox_url)),
+        enum Want {
+            Http(&'static str),
+            Stdio,
+            Skipped(NoRoute),
+        }
+        // (case, sandboxed, container mounts the socket, endpoint: None | (url, socket), want)
+        type Case<'a> = (&'a str, bool, bool, Option<(Option<&'a str>, bool)>, Want);
+        let cases: Vec<Case> = vec![
+            (
+                "host, no endpoint",
+                false,
+                false,
+                None,
+                Want::Skipped(NoRoute::Endpoint),
+            ),
+            (
+                "sandbox, no endpoint",
+                true,
+                true,
+                None,
+                Want::Skipped(NoRoute::Endpoint),
+            ),
+            (
+                "sandbox, no route",
+                true,
+                true,
+                Some((None, false)),
+                Want::Skipped(if cfg!(target_os = "linux") {
+                    NoRoute::Socket
+                } else {
+                    NoRoute::Platform
+                }),
+            ),
+            (
+                "sandbox, unmounted",
+                true,
+                false,
+                Some((None, true)),
+                Want::Skipped(NoRoute::Mount),
+            ),
+            (
+                "host",
+                false,
+                false,
+                Some((None, true)),
+                Want::Http("http://127.0.0.1:4321"),
+            ),
+            (
+                "sandbox, socket",
+                true,
+                true,
+                Some((Some(sandbox_url), true)),
+                Want::Stdio,
+            ),
+            (
+                "sandbox, url fallback",
+                true,
+                false,
+                Some((Some(sandbox_url), true)),
+                Want::Http(sandbox_url),
+            ),
         ];
-        for (label, sandboxed, ep, served_base) in cases {
-            let ep = ep.map(|url| endpoint(dir.path(), url));
+        for (label, sandboxed, mounted, ep, want) in cases {
+            use crate::server::daemon_endpoint::SandboxSocket;
+            let ep = ep.map(|(url, socket)| DaemonEndpoint {
+                sandbox_socket: socket
+                    .then_some((|_: &str| SandboxSocket::Reachable) as fn(&str) -> SandboxSocket),
+                ..endpoint(dir.path(), url)
+            });
             let caller = FakeCaller::new(vec![Ok(
                 json!({"add":[{"name":"fs","serve":{"prefix":false}}]}),
             )]);
-            let c = if sandboxed { ctx() } else { host_ctx() };
+            let mut c = if sandboxed { ctx() } else { host_ctx() };
+            if let Some(sandbox) = c.sandbox.as_mut() {
+                sandbox.plugin_socket = if mounted {
+                    SandboxSocket::Reachable
+                } else {
+                    SandboxSocket::Unmounted
+                };
+            }
             let out = run_hooks(
                 Some(&caller),
                 &[serving_hook("acme.a")],
@@ -648,29 +728,52 @@ mod tests {
             .await
             .unwrap();
             let failures = caller.serve_failures.lock().unwrap().clone();
-            match served_base {
-                Some(base) => {
-                    let secret = &ep.as_ref().unwrap().secret;
-                    assert_eq!(
-                        out.servers,
-                        [
-                            stdio("keep"),
-                            plugin_http(secret, base, "acme.a", "fs", "fs")
-                        ],
-                        "{label}"
-                    );
-                    assert!(failures.is_empty(), "{label}");
-                }
-                None => {
+            let route = match want {
+                Want::Http(base) => PluginRoute::Http(base),
+                Want::Stdio => PluginRoute::Socket,
+                Want::Skipped(cause) => {
                     assert_eq!(
                         out,
                         Rewritten::from(vec![stdio("keep")]),
                         "{label}: omitted, and the replaced original stays dropped"
                     );
-                    assert_eq!(failures, ["acme.a"], "{label}: one notification");
+                    assert_eq!(
+                        failures,
+                        [("acme.a".to_string(), cause.notice().to_string())],
+                        "{label}: one notification naming the cause"
+                    );
+                    continue;
                 }
-            }
+            };
+            let secret = &ep.as_ref().unwrap().secret;
+            let served = ServedServer::new("acme.a", "fs".into(), false);
+            let entry = plugin_entries(secret, route, "s", &[served])
+                .remove(0)
+                .server;
+            assert_eq!(out.servers, [stdio("keep"), entry], "{label}");
+            assert_eq!(out.served_by, served_by(&[("fs", "acme.a")]), "{label}");
+            assert!(failures.is_empty(), "{label}");
         }
+    }
+
+    /// A plugin already told at launch is not told again by the hook path.
+    #[test]
+    fn unreachable_plugins_are_notified_once_per_launch() {
+        let mut c = ctx();
+        c.unreachable_notified = vec!["acme.a".into()];
+        let caller = FakeCaller::new(vec![]);
+        let serve = |plugin: &str| McpEntry::Serve {
+            served: ServedServer::new(plugin, "fs".into(), true),
+        };
+        resolve_served(&caller, vec![serve("acme.a"), serve("acme.b")], None, &c);
+        let notified: Vec<String> = caller
+            .serve_failures
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(plugin, _)| plugin.clone())
+            .collect();
+        assert_eq!(notified, ["acme.b"]);
     }
 
     fn http(name: &str, url: &str) -> ProjectMcpServer {
@@ -834,11 +937,14 @@ mod tests {
                 &c,
             );
             assert_eq!(out, Rewritten::from(vec![stdio("keep")]), "{label}");
-            assert_eq!(
-                *caller.serve_failures.lock().unwrap(),
-                ["acme.a"],
-                "{label}"
-            );
+            let notified: Vec<String> = caller
+                .serve_failures
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|(plugin, _)| plugin.clone())
+                .collect();
+            assert_eq!(notified, ["acme.a"], "{label}");
         }
     }
 

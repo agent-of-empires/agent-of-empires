@@ -58,6 +58,11 @@ export const HOST_STATE_VARS = new Set([
   "AOE_UDS_UMASK_TEST_CHILD",
   "AOE_UDS_UMASK_TEST_ENTERED",
   "AOE_GITHUB_CLONE_BASE", // redirects plugin clones at a host path or tree
+  // Set by aoe for the sandbox MCP forwarder it spawns (a credential
+  // reference plus the session it belongs to); a host value could only
+  // smuggle a credential or session into a spec.
+  "AOE_PLUGIN_MCP_SESSION",
+  "AOE_PLUGIN_MCP_TOKEN",
   "AOE_OPEN_URL_TO", // appends every URL the TUI opens to a host file
   "AOE_SERVE_INSTANCE_ID", // identifies a host daemon process as this one
   "AOE_SERVE_PASSPHRASE", // host credential for the daemon's own auth

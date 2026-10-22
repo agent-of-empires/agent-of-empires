@@ -1314,6 +1314,324 @@ mod tests {
         }
     }
 
+    /// The sandbox forwarder, run by the host's `node`; `None` (skip) without one.
+    #[cfg(target_os = "linux")]
+    mod forwarder {
+        use super::*;
+        use crate::server::plugin_mcp_socket::{FORWARDER, SESSION_ENV, SOCKET_HOST, TOKEN_ENV};
+        use std::path::{Path, PathBuf};
+        use tokio::io::AsyncWriteExt;
+
+        const CREDENTIAL: &str = "forwarder-test-credential";
+
+        fn node() -> bool {
+            let found = std::process::Command::new("node")
+                .arg("--version")
+                .output()
+                .is_ok_and(|o| o.status.success());
+            if !found {
+                eprintln!("skipping: node is not installed");
+            }
+            found
+        }
+
+        /// Serves `app` on `dir/mcp.sock` until the returned handle is dropped.
+        fn serve_unix(dir: &Path, app: axum::Router) -> (PathBuf, tokio::task::JoinHandle<()>) {
+            let path = dir.join("mcp.sock");
+            let listener = tokio::net::UnixListener::bind(&path).unwrap();
+            let task = tokio::spawn(async move {
+                axum::serve(listener, app.into_make_service())
+                    .await
+                    .unwrap();
+            });
+            (path, task)
+        }
+
+        /// Runs the forwarder for `acme.plug`/`srv`, feeds it `lines`, closes stdin, and
+        /// returns the stdout lines once it exits.
+        async fn run(dir: &Path, socket: &Path, lines: &[String]) -> Vec<String> {
+            let script = dir.join("forward.mjs");
+            std::fs::write(&script, FORWARDER).unwrap();
+            let mut child = tokio::process::Command::new("node")
+                .arg(&script)
+                .arg(socket)
+                .args(["acme.plug", "srv"])
+                .env(TOKEN_ENV, CREDENTIAL)
+                .env(SESSION_ENV, "sess-1")
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .kill_on_drop(true)
+                .spawn()
+                .unwrap();
+            let mut stdin = child.stdin.take().unwrap();
+            for line in lines {
+                stdin
+                    .write_all(format!("{line}\n").as_bytes())
+                    .await
+                    .unwrap();
+            }
+            drop(stdin);
+            let out = tokio::time::timeout(DEADLINE, child.wait_with_output())
+                .await
+                .expect("the forwarder exits after stdin closes")
+                .unwrap();
+            assert!(out.status.success(), "{out:?}");
+            let stdout = String::from_utf8(out.stdout).unwrap();
+            let stderr = String::from_utf8(out.stderr).unwrap();
+            assert!(!stdout.contains(CREDENTIAL) && !stderr.contains(CREDENTIAL));
+            stdout.lines().map(str::to_string).collect()
+        }
+
+        fn by_id(lines: &[String]) -> std::collections::BTreeMap<String, Value> {
+            lines
+                .iter()
+                .map(|l| serde_json::from_str::<Value>(l).expect("stdout is JSON lines"))
+                .map(|v| (v["id"].to_string(), v))
+                .collect()
+        }
+
+        type Seen = Arc<std::sync::Mutex<Vec<axum::http::HeaderMap>>>;
+
+        fn recording(app: axum::Router) -> (axum::Router, Seen) {
+            let seen: Seen = Default::default();
+            let record = seen.clone();
+            let app = app.layer(axum::middleware::from_fn(
+                move |req: axum::extract::Request, next: axum::middleware::Next| {
+                    record.lock().unwrap().push(req.headers().clone());
+                    next.run(req)
+                },
+            ));
+            (app, seen)
+        }
+
+        #[tokio::test]
+        async fn forwarder_bridges_stdio_to_the_endpoint_over_the_socket() {
+            if !node() {
+                return;
+            }
+            let temp = tempfile::tempdir().unwrap();
+            let fake = fake(Some("sess-1"), || {
+                Some(Ok(
+                    json!({"content": [{"type": "text", "text": "hi"}], "tools": []}),
+                ))
+            });
+            let (app, seen) = recording(fake.app);
+            let (socket, _server) = serve_unix(temp.path(), app);
+            let modern_meta = json!({
+                "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+                "io.modelcontextprotocol/clientCapabilities": {},
+                "io.modelcontextprotocol/clientInfo": {"name": "t", "version": "1"},
+            });
+            // Like an MCP client: each request waits for its reply, so the headers arrive in order.
+            let script = temp.path().join("forward.mjs");
+            std::fs::write(&script, FORWARDER).unwrap();
+            let mut child = tokio::process::Command::new("node")
+                .arg(&script)
+                .arg(&socket)
+                .args(["acme.plug", "srv"])
+                .env(TOKEN_ENV, CREDENTIAL)
+                .env(SESSION_ENV, "sess-1")
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .kill_on_drop(true)
+                .spawn()
+                .unwrap();
+            let mut stdin = child.stdin.take().unwrap();
+            let mut stdout = tokio::io::AsyncBufReadExt::lines(tokio::io::BufReader::new(
+                child.stdout.take().unwrap(),
+            ));
+            let exchanges = [
+                (
+                    json!({"jsonrpc": "2.0", "id": 0, "method": "initialize", "params": {
+                    "protocolVersion": "2025-06-18", "capabilities": {},
+                    "clientInfo": {"name": "t", "version": "1"}}})
+                    .to_string(),
+                    true,
+                ),
+                (
+                    json!({"jsonrpc": "2.0", "method": "notifications/initialized"}).to_string(),
+                    false,
+                ),
+                (list_request().to_string(), true),
+                (
+                    json!({"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {
+                    "name": "echo", "arguments": {}, "_meta": modern_meta}})
+                    .to_string(),
+                    true,
+                ),
+                ("not json".to_string(), true),
+            ];
+            let mut replies = Vec::new();
+            for (line, answered) in exchanges {
+                stdin
+                    .write_all(format!("{line}\n").as_bytes())
+                    .await
+                    .unwrap();
+                if answered {
+                    let reply = tokio::time::timeout(DEADLINE, stdout.next_line())
+                        .await
+                        .expect("the forwarder answers")
+                        .unwrap()
+                        .expect("a reply line");
+                    assert!(!reply.contains(CREDENTIAL));
+                    replies.push(serde_json::from_str::<Value>(&reply).unwrap());
+                }
+            }
+            drop(stdin);
+            let status = tokio::time::timeout(DEADLINE, child.wait())
+                .await
+                .expect("the forwarder exits after stdin closes")
+                .unwrap();
+            assert!(status.success());
+            assert_eq!(
+                replies[0]["result"]["protocolVersion"], "2025-06-18",
+                "{}",
+                replies[0]
+            );
+            assert!(replies[1]["result"]["tools"].is_array(), "{}", replies[1]);
+            assert!(replies[1]["result"].get("resultType").is_none());
+            assert_eq!(
+                replies[2]["result"]["content"][0]["text"], "hi",
+                "{}",
+                replies[2]
+            );
+            assert_eq!(
+                replies[2]["result"]["resultType"], "complete",
+                "{}",
+                replies[2]
+            );
+            assert_eq!(
+                replies[3],
+                json!({"jsonrpc": "2.0", "id": null, "error": {"code": -32700, "message": "Parse error"}})
+            );
+
+            let seen = seen.lock().unwrap();
+            assert_eq!(seen.len(), 4, "the parse error never reaches the socket");
+            for headers in seen.iter() {
+                assert_eq!(headers[header::HOST], SOCKET_HOST);
+                assert_eq!(
+                    headers[header::AUTHORIZATION],
+                    format!("Bearer {CREDENTIAL}")
+                );
+                assert_eq!(headers["x-aoe-session"], "sess-1");
+            }
+            assert!(
+                seen[0].get("mcp-protocol-version").is_none(),
+                "initialize negotiates the version"
+            );
+            let (modern, legacy): (Vec<_>, Vec<_>) = seen[1..]
+                .iter()
+                .partition(|h| h.get("mcp-method").is_some());
+            assert_eq!(legacy.len(), 2, "the notification and tools/list");
+            for headers in legacy {
+                assert_eq!(
+                    headers["mcp-protocol-version"], "2025-06-18",
+                    "later messages carry it"
+                );
+                assert!(headers.get("mcp-name").is_none());
+            }
+            let [modern] = modern.as_slice() else {
+                panic!("one 2026-07-28 request expected");
+            };
+            assert_eq!(modern["mcp-protocol-version"], "2026-07-28");
+            assert_eq!(modern["mcp-method"], "tools/call");
+            assert_eq!(modern["mcp-name"], "echo");
+        }
+
+        /// A line that is valid JSON but no message is refused without taking the
+        /// forwarder down.
+        #[tokio::test]
+        async fn forwarder_refuses_non_object_messages() {
+            if !node() {
+                return;
+            }
+            let temp = tempfile::tempdir().unwrap();
+            let fake = fake(Some("sess-1"), || Some(Ok(json!({"tools": []}))));
+            let (socket, _server) = serve_unix(temp.path(), fake.app);
+            // MCP has no batching since 2025-06-18, so arrays are refused too.
+            let lines = [
+                "null",
+                "42",
+                "\"x\"",
+                "[]",
+                r#"[{"jsonrpc":"2.0","id":9,"method":"tools/list"}]"#,
+            ]
+            .map(str::to_string)
+            .into_iter()
+            .chain([list_request().to_string()])
+            .collect::<Vec<_>>();
+            let out = run(temp.path(), &socket, &lines).await;
+            let replies: Vec<Value> = out
+                .iter()
+                .map(|l| serde_json::from_str(l).unwrap())
+                .collect();
+            let refused = replies
+                .iter()
+                .filter(|r| r["id"].is_null() && r["error"]["code"] == -32600)
+                .count();
+            assert_eq!(refused, 5, "{replies:?}");
+            assert!(
+                replies.iter().all(|r| r["id"] != 9),
+                "a batch never reaches the endpoint"
+            );
+            assert!(
+                replies
+                    .iter()
+                    .any(|r| r["id"] == 1 && r["result"]["tools"].is_array()),
+                "the forwarder keeps serving: {replies:?}"
+            );
+        }
+
+        #[tokio::test]
+        async fn forwarder_turns_failures_into_jsonrpc_errors() {
+            if !node() {
+                return;
+            }
+            let temp = tempfile::tempdir().unwrap();
+            let sse = "event: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{}}\n\n";
+            let app = axum::Router::new().route(
+                "/mcp/plugins/{plugin}/{server}",
+                any(move |body: String| async move {
+                    let id = serde_json::from_str::<Value>(&body).unwrap()["id"].clone();
+                    match id.as_i64() {
+                        Some(1) => {
+                            ([(header::CONTENT_TYPE, "text/event-stream")], sse).into_response()
+                        }
+                        Some(2) => (StatusCode::UNAUTHORIZED, axum::Json(json!({"error": "x"})))
+                            .into_response(),
+                        _ => StatusCode::ACCEPTED.into_response(),
+                    }
+                }),
+            );
+            let (socket, _server) = serve_unix(temp.path(), app);
+            let request =
+                |id: i64| json!({"jsonrpc": "2.0", "id": id, "method": "tools/list"}).to_string();
+            let notification =
+                json!({"jsonrpc": "2.0", "method": "notifications/initialized"}).to_string();
+
+            let out = by_id(
+                &run(
+                    temp.path(),
+                    &socket,
+                    &[request(1), request(2), request(3), notification.clone()],
+                )
+                .await,
+            );
+            assert_eq!(out.len(), 3, "{out:?}");
+            assert_eq!(out["1"]["result"], json!({}), "SSE is unwrapped");
+            for id in ["2", "3"] {
+                assert_eq!(out[id]["error"]["code"], -32603, "{id}: {}", out[id]);
+            }
+
+            let missing = temp.path().join("missing.sock");
+            let out = by_id(&run(temp.path(), &missing, &[request(7), notification]).await);
+            assert_eq!(out.len(), 1, "a notification gets no reply: {out:?}");
+            let message = out["7"]["error"]["message"].as_str().unwrap();
+            assert!(message.contains("unreachable"), "{message}");
+        }
+    }
+
     #[tokio::test]
     async fn dropping_a_request_mid_call_sends_one_cancel() {
         let Fake {

@@ -389,6 +389,16 @@ async fn live_plugin_caller(
         })
 }
 
+/// The caller on the sandbox plugin socket, which accepts nothing but a live derived credential.
+/// `&mut` keeps the future `Send`, as in [`attach_caller_session`].
+pub(super) async fn socket_plugin_caller(
+    state: &AppState,
+    request: &mut Request,
+) -> Option<AuthenticatedPluginCaller> {
+    let claim = plugin_credential_claim(state, request);
+    live_plugin_caller(state, claim).await
+}
+
 /// The caller for a plugin endpoint request that authenticated by any means other than the
 /// derived credential (daemon-wide bearer, login session, or an open gate): no session.
 fn daemon_plugin_caller(path: &str) -> Option<AuthenticatedPluginCaller> {
