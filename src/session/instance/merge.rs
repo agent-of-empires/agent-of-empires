@@ -34,6 +34,12 @@ impl Instance {
         self.file_watch = self.file_watch.take().or(prior.file_watch);
         if let (Some(fresh), Some(previous)) = (self.sandbox_info.as_mut(), prior.sandbox_info) {
             fresh.before_start_env = previous.before_start_env;
+            // The live container's workdir outranks a stale persisted pin (#4806).
+            if fresh.container_name == previous.container_name
+                && previous.container_workdir.is_some()
+            {
+                fresh.container_workdir = previous.container_workdir;
+            }
         }
     }
 

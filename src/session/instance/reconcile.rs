@@ -221,6 +221,28 @@ mod tests {
         assert_eq!(inst.unknown_since, Some(unknown_since));
     }
 
+    /// A workdir adopted from the live container must survive the post-hook reload over a stale
+    /// persisted pin, but not carry onto a different container (#4806).
+    #[test]
+    #[serial]
+    fn reconcile_from_disk_keeps_adopted_workdir_for_same_container() {
+        let temp = tempdir().unwrap();
+        let _home_guard = crate::session::test_support::isolate_home(temp.path());
+        let profile = "reconcile-workdir";
+        let mut inst = Instance::new("workdir pin", "/tmp/x");
+        inst.source_profile = profile.to_string();
+        inst.sandbox_info = Some(test_sandbox("ctr", Some("/workspace/stale/wt")));
+        seeded(profile, &inst);
+
+        inst.adopt_container_workdir(Some("/workspace/live".to_string()));
+        inst.reconcile_from_disk();
+        assert_eq!(inst.container_workdir(), "/workspace/live");
+
+        inst.sandbox_info.as_mut().unwrap().container_name = "recreated".to_string();
+        inst.reconcile_from_disk();
+        assert_eq!(inst.container_workdir(), "/workspace/stale/wt");
+    }
+
     #[test]
     #[serial]
     fn reconcile_sidecar_adopts_only_an_unclaimed_fresh_conversation() {

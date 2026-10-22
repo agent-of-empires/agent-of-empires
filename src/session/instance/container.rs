@@ -450,7 +450,7 @@ impl Instance {
         self.adopt_container_workdir(container.working_dir());
     }
 
-    fn adopt_container_workdir(&mut self, live: Option<String>) {
+    pub(super) fn adopt_container_workdir(&mut self, live: Option<String>) {
         if let (Some(workdir), Some(sandbox)) = (live, self.sandbox_info.as_mut()) {
             sandbox.container_workdir = Some(workdir);
         }
