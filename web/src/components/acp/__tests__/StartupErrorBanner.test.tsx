@@ -226,6 +226,18 @@ describe("StartupErrorBanner layout", () => {
   });
 });
 
+describe("StartupErrorBanner primary action", () => {
+  // resolved.rs checks this label/fill pair per built-in theme; hover must not swap either colour.
+  it("uses the theme's readable pair at rest and on hover", async () => {
+    stubApi({ info: json(claude()) });
+    const { findByTestId } = renderBanner();
+    const classes = (await findByTestId("startup-error-banner-retry")).className.split(/\s+/);
+    expect(classes).toEqual(expect.arrayContaining(["bg-status-error", "text-text-on-status-error"]));
+    expect(classes.filter((c) => /^hover:(bg|text)-/.test(c))).toEqual([]);
+    expect(classes).not.toContain("text-white");
+  });
+});
+
 describe("StartupErrorBanner install", () => {
   it.each([
     ["npm_missing", "npm isn't on the Daemon's PATH"],

@@ -9,6 +9,10 @@ export interface RecoveryAction {
 const BUTTON =
   "min-h-8 rounded-md px-3 py-1.5 text-xs font-medium transition-colors disabled:cursor-not-allowed disabled:opacity-60";
 
+/** Label and fill are a theme-projected readable pair; hover adds a ring instead of
+ *  changing either, so the pair holds in every state. */
+const PRIMARY = `${BUTTON} bg-status-error text-text-on-status-error hover:ring-2 hover:ring-status-error/50`;
+
 /** The recovery buttons both startup error surfaces show, primary first, and the
  *  install's failure and npm output under them. */
 export function RecoveryActionRow({
@@ -33,7 +37,7 @@ export function RecoveryActionRow({
             title={action.title}
             className={
               action === primary
-                ? `${BUTTON} w-full bg-status-error/90 text-white hover:bg-status-error sm:w-auto`
+                ? `${PRIMARY} w-full sm:w-auto`
                 : `${BUTTON} border border-surface-700 bg-surface-800 text-text-primary hover:bg-surface-700`
             }
           >

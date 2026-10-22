@@ -280,6 +280,10 @@ fn web_projection(theme: &Theme, appearance: ThemeAppearance) -> CssVarProjectio
     css.insert("--color-status-idle".into(), hex(theme.idle));
     css.insert("--color-status-unread".into(), hex(theme.unread));
     css.insert("--color-status-error".into(), hex(theme.error));
+    css.insert(
+        "--color-text-on-status-error".into(),
+        hex(readable_on(theme.error)),
+    );
     // Some theme reds are a hue, not readable text, on the surfaces below.
     css.insert(
         "--color-status-error-text".into(),
@@ -596,6 +600,15 @@ mod tests {
             assert!(
                 contrast_ratio(var("--color-text-on-brand"), var("--color-brand-600")) >= 4.5,
                 "{name}: color-text-on-brand must remain readable on brand-600"
+            );
+            // The startup error surfaces' primary button: label on a solid error fill,
+            // the same at rest and on hover.
+            assert!(
+                contrast_ratio(
+                    var("--color-text-on-status-error"),
+                    var("--color-status-error")
+                ) >= TEXT_CONTRAST_RATIO,
+                "{name}: color-text-on-status-error must remain readable on status-error"
             );
             // Status error text, and the session notices strip's body text, sit on
             // these solid surfaces.
