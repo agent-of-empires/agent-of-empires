@@ -763,8 +763,8 @@ fn inspect_temporary_markers(dir: RawFd) -> Result<(), ReadFailure> {
                     )
                 }
                 Ok(_) => return Err(ReadFailure::pre("marker_invalid")),
-                // An incomplete abandoned write establishes no publisher.
-                Err(_) => continue,
+                Err(error) if error.is_eof() => continue,
+                Err(_) => return Err(ReadFailure::pre("marker_invalid")),
             },
             TempKind::Postbind => match serde_json::from_slice::<PostbindMarker>(&bytes) {
                 Ok(value)
@@ -779,7 +779,8 @@ fn inspect_temporary_markers(dir: RawFd) -> Result<(), ReadFailure> {
                     )
                 }
                 Ok(_) => return Err(ReadFailure::pre("marker_invalid")),
-                Err(_) => continue,
+                Err(error) if error.is_eof() => continue,
+                Err(_) => return Err(ReadFailure::pre("marker_invalid")),
             },
         };
         if content_uuid != suffix {
@@ -1398,7 +1399,7 @@ mod tests {
 
     #[tokio::test]
     #[serial_test::parallel]
-    async fn abandoned_temporaries_do_not_establish_a_publication() {
+    async fn temporary_admission_distinguishes_abandoned_and_invalid_writes() {
         let _env = crate::session::test_support::EnvGuard::read_lock();
         use std::os::unix::fs::PermissionsExt;
         let instance = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
@@ -1422,12 +1423,41 @@ mod tests {
         ] {
             postbind[key] = value;
         }
+        let prebind = serde_json::to_vec(&prebind).unwrap();
+        let postbind = serde_json::to_vec(&postbind).unwrap();
         for with_lock in [false, true] {
-            for (name, bytes) in [
-                (PREBIND_FILE, None),
-                (PREBIND_FILE, Some(Vec::new())),
-                (PREBIND_FILE, Some(serde_json::to_vec(&prebind).unwrap())),
-                (POSTBIND_FILE, Some(serde_json::to_vec(&postbind).unwrap())),
+            for (name, bytes, expected) in [
+                (PREBIND_FILE, None, "marker_missing"),
+                (PREBIND_FILE, Some(Vec::new()), "marker_missing"),
+                (
+                    PREBIND_FILE,
+                    Some(prebind[..prebind.len() / 2].to_vec()),
+                    "marker_missing",
+                ),
+                (
+                    POSTBIND_FILE,
+                    Some(postbind[..postbind.len() - 1].to_vec()),
+                    "marker_missing",
+                ),
+                (PREBIND_FILE, Some(prebind.clone()), "marker_missing"),
+                (POSTBIND_FILE, Some(postbind.clone()), "marker_missing"),
+                (
+                    PREBIND_FILE,
+                    Some(br#"{"future_field":true,"schema":1}"#.to_vec()),
+                    "marker_invalid",
+                ),
+                (
+                    POSTBIND_FILE,
+                    Some(br#"{"schema":256}"#.to_vec()),
+                    "marker_invalid",
+                ),
+                (
+                    PREBIND_FILE,
+                    Some(br#"{"schema":"1"}"#.to_vec()),
+                    "marker_invalid",
+                ),
+                (POSTBIND_FILE, Some(b"{}".to_vec()), "marker_invalid"),
+                (PREBIND_FILE, Some(b"{]".to_vec()), "marker_invalid"),
             ] {
                 let dir = tempfile::tempdir().unwrap();
                 if with_lock {
@@ -1454,7 +1484,7 @@ mod tests {
                 else {
                     panic!("no publication can be admitted");
                 };
-                assert_eq!(error.code(), "marker_missing", "{name}, lock={with_lock}");
+                assert_eq!(error.code(), expected, "{name}, lock={with_lock}");
             }
         }
     }

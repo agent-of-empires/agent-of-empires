@@ -235,7 +235,14 @@ fn failed_local_acquisition_never_uses_the_store() {
 fn unknown_publication_schema_never_authorizes_bootstrap() {
     use std::os::unix::fs::PermissionsExt;
 
-    for postbind in [false, true] {
+    let mut prior_boot = agent_of_empires::process::boot_id().unwrap();
+    let first = if prior_boot.starts_with('0') {
+        "1"
+    } else {
+        "0"
+    };
+    prior_boot.replace_range(..1, first);
+    for (postbind, temporary) in [(false, false), (true, false), (false, true), (true, true)] {
         let fixture = Fixture::new();
         std::fs::set_permissions(&fixture.app, std::fs::Permissions::from_mode(0o700)).unwrap();
         let lock = fixture.app.join("lifetime.lock");
@@ -244,7 +251,7 @@ fn unknown_publication_schema_never_authorizes_bootstrap() {
         let mut marker = serde_json::json!({
             "schema": 255,
             "pid": std::process::id(),
-            "process_start_identity": "unknown",
+            "process_start_identity": format!("linux:v1:{prior_boot}:1"),
             "prebind_instance_id": "11111111-2222-3333-4444-555555555555",
             "namespace": "debug:agent-of-empires-dev",
         });
@@ -261,12 +268,19 @@ fn unknown_publication_schema_never_authorizes_bootstrap() {
         } else {
             "runtime.prebind.json"
         };
+        let name = if temporary {
+            marker["future_field"] = serde_json::json!(true);
+            format!("{name}.tmp.11111111-2222-3333-4444-555555555555")
+        } else {
+            name.to_owned()
+        };
         let path = fixture.app.join(name);
         let bytes = serde_json::to_vec(&marker).unwrap();
         std::fs::write(&path, &bytes).unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
         let output = fixture.run(&["list", "--json"]);
         assert_refused(&output, "daemon read: marker_invalid");
+        assert_eq!(output.status.code(), Some(2));
         fixture.assert_not_started();
         assert_eq!(std::fs::read(path).unwrap(), bytes);
     }
