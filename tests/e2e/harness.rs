@@ -674,7 +674,7 @@ last_seen_version = "{}"
         serde_json::from_str(&content).unwrap_or(Value::Null)
     }
 
-    fn build_tmux_command(&mut self, args: &[&str]) -> String {
+    fn build_tmux_command(&mut self, args: &[&str], cols: &str, rows: &str) -> String {
         let mut aoe_cmd = self.binary_path.display().to_string();
         if self.input_barrier {
             let path = self.home_dir.path().join("input-barrier");
@@ -693,7 +693,7 @@ last_seen_version = "{}"
         }
         let cast_path = recordings_dir().join(format!("{}.cast", self.test_name));
         let cmd = format!(
-            "asciinema rec --overwrite --cols 100 --rows 30 -c {} {}",
+            "asciinema rec --overwrite --cols {cols} --rows {rows} -c {} {}",
             shell_words::quote(&aoe_cmd),
             shell_words::quote(cast_path.to_str().expect("recording path"))
         );
@@ -705,10 +705,21 @@ last_seen_version = "{}"
         self.spawn(&[]);
     }
 
+    /// Spawn `aoe` in a detached tmux session at the requested dimensions.
+    pub fn spawn_tui_sized(&mut self, cols: u16, rows: u16) {
+        self.spawn_sized(&[], cols, rows);
+    }
+
     /// Spawn `aoe <args>` in a detached 100x30 tmux session.
     pub fn spawn(&mut self, args: &[&str]) {
+        self.spawn_sized(args, 100, 30);
+    }
+
+    fn spawn_sized(&mut self, args: &[&str], cols: u16, rows: u16) {
         self.input_barrier = args.first() != Some(&"add");
-        let cmd_str = self.build_tmux_command(args);
+        let cols = cols.to_string();
+        let rows = rows.to_string();
+        let cmd_str = self.build_tmux_command(args, &cols, &rows);
         let start_gate = self.home_dir.path().join("tui-start");
         let cmd_str = if self.input_barrier {
             if start_gate.exists() {
@@ -724,7 +735,7 @@ last_seen_version = "{}"
         } else {
             cmd_str
         };
-        self.new_tmux_session(&self.session_name, "100", "30", &cmd_str);
+        self.new_tmux_session(&self.session_name, &cols, &rows, &cmd_str);
         self.spawned = true;
 
         if self.input_barrier {

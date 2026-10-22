@@ -1,4 +1,4 @@
-//! Tool picker dialog: quick list of configured tool sessions.
+//! Picker for configured tool sessions.
 
 use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::prelude::*;
@@ -45,6 +45,10 @@ impl ToolPickerDialog {
         }
     }
 
+    pub fn is_empty(&self) -> bool {
+        self.items.is_empty()
+    }
+
     pub fn handle_click(&mut self, col: u16, row: u16) -> DialogResult<String> {
         if !super::contains(self.dialog_area, col, row) {
             return DialogResult::Cancel;
@@ -85,7 +89,7 @@ impl ToolPickerDialog {
         let width = 50u16.min(area.width.saturating_sub(4));
         let height = (self.items.len() as u16 + 3).min(area.height.saturating_sub(4));
         let block = Block::default()
-            .title(" Tool Sessions ")
+            .title(" Tools ")
             .title_style(Style::default().fg(theme.title))
             .borders(Borders::ALL)
             .border_style(Style::default().fg(theme.accent))

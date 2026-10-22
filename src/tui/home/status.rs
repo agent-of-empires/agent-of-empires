@@ -43,12 +43,19 @@ impl HomeView {
                 .request_refresh(self.pollable_instances());
             self.pending_status_refresh = true;
         }
+        #[cfg(feature = "web")]
+        self.plugin_ui.request_refresh(!self.instances.is_empty());
     }
 
     /// Apply any pending status updates from the background poller.
     /// Returns true if updates were applied.
     pub fn apply_status_updates(&mut self) -> bool {
         use std::sync::mpsc::TryRecvError;
+
+        #[cfg(feature = "web")]
+        let plugin_updated = self.plugin_ui.apply_pending();
+        #[cfg(not(feature = "web"))]
+        let plugin_updated = false;
 
         match self.status_poller.try_recv_updates() {
             Ok(updates) => {
@@ -58,7 +65,7 @@ impl HomeView {
                 self.pending_status_refresh = false;
                 true
             }
-            Err(TryRecvError::Empty) => false,
+            Err(TryRecvError::Empty) => plugin_updated,
             Err(TryRecvError::Disconnected) => {
                 // The worker thread is gone (a panic in poll_statuses_once). Without a
                 // respawn, pending_status_refresh stays set and request_status_refresh

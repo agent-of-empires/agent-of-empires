@@ -479,9 +479,10 @@ impl HomeView {
     }
 
     fn open_tool_picker(&mut self) {
-        self.tool_picker_dialog = Some(crate::tui::dialogs::ToolPickerDialog::new(
-            &self.tool_configs,
-        ));
+        let picker = crate::tui::dialogs::ToolPickerDialog::new(&self.tool_configs);
+        if !picker.is_empty() {
+            self.tool_picker_dialog = Some(picker);
+        }
     }
 
     fn activate_tool(&mut self, tool_name: String, toggle_current: bool) -> Option<Action> {
@@ -1508,9 +1509,9 @@ impl HomeView {
                 DialogResult::Cancel => {
                     self.tool_picker_dialog = None;
                 }
-                DialogResult::Submit(tool_name) => {
+                DialogResult::Submit(action) => {
                     self.tool_picker_dialog = None;
-                    self.pending_dialog_click_action = self.activate_tool(tool_name, false);
+                    self.pending_dialog_click_action = self.activate_tool(action, false);
                 }
             }
             return true;
@@ -1995,9 +1996,9 @@ impl HomeView {
                     self.tool_picker_dialog = None;
                     return None;
                 }
-                DialogResult::Submit(tool_name) => {
+                DialogResult::Submit(action) => {
                     self.tool_picker_dialog = None;
-                    return self.activate_tool(tool_name, false);
+                    return self.activate_tool(action, false);
                 }
             }
         }
@@ -2760,7 +2761,7 @@ impl HomeView {
             ActionId::ToolPicker => {
                 if matches!(self.view_mode, ViewMode::Tool(_)) {
                     self.view_mode = ViewMode::Structured;
-                } else if !self.tool_configs.is_empty() {
+                } else {
                     self.open_tool_picker();
                 }
             }

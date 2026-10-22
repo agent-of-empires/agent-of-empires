@@ -1,10 +1,11 @@
 //! Pure selectors for rendering the daemon's plugin UI-state snapshot in the
-//! native TUI (#2402), mirroring `web/src/lib/pluginUi.ts` narrowed to what a
-//! terminal can render: `StatusBar` / `DetailBadge` text, `Notification` toasts,
-//! `Pane` / `HomePane` blocks in a toggleable overlay (#2467), and `RowColumn`
-//! text on remote-home rows (#2948), and `SortKey` orderings of that picker.
-//! Icons, tooltips, hrefs and the `Card`/`RowBadge`/`FilterFacet` slots have no
-//! TUI surface.
+//! native TUI (#2402), mirroring `web/src/lib/pluginUi.ts` but narrowed to what
+//! a terminal can render: structured-view `StatusBar` / `DetailBadge` text,
+//! `Notification` toasts, and `Pane` / `HomePane` blocks in a toggleable
+//! overlay (#2467); session-scoped `RowColumn` text and `RowBadge` labels,
+//! including itemized badges, in both home session lists; and `SortKey`
+//! ordering in the remote-home picker. Icon glyphs are omitted; tooltips are
+//! fallback labels for icon-only badges. Other slots have no native TUI surface.
 //!
 //! Side-effect-free, so the render layer can borrow the snapshot and the
 //! filtering / tone-mapping is unit-testable without a daemon.
@@ -168,6 +169,57 @@ pub fn compare_sort_values(
 
 /// Map a tone to a foreground style against the active theme. `None` renders
 /// neutral. Reuses the theme's status colors rather than inventing fields.
+#[cfg(any(feature = "web", test))]
+/// Session-scoped `RowColumn` text and `RowBadge` labels, including itemized
+/// badges. Icon-only badges use their tooltip; unlabeled icons stay omitted.
+pub fn session_row_statuses<'a>(
+    snapshot: &'a UiSnapshot,
+    session_id: &'a str,
+) -> impl Iterator<Item = (&'a str, Option<Tone>)> {
+    snapshot
+        .entries
+        .iter()
+        .filter(move |entry| {
+            entry.session_id.as_deref() == Some(session_id)
+                && matches!(entry.slot, UiSlot::RowBadge | UiSlot::RowColumn)
+        })
+        .flat_map(|entry| {
+            let items = entry.payload.get("items").and_then(Value::as_array);
+            let item_statuses =
+                items
+                    .into_iter()
+                    .flat_map(|items| items.iter())
+                    .filter_map(|item| {
+                        let text = item
+                            .get("text")
+                            .or_else(|| item.get("tooltip"))
+                            .and_then(Value::as_str)
+                            .map(str::trim)
+                            .filter(|text| !text.is_empty())?;
+                        let tone = item
+                            .get("tone")
+                            .and_then(|value| serde_json::from_value(value.clone()).ok());
+                        Some((text, tone))
+                    });
+            let fallback = std::iter::once(entry)
+                .filter(move |_| items.is_none())
+                .filter_map(|entry| {
+                    let text = entry_text(entry).or_else(|| {
+                        (entry.slot == UiSlot::RowBadge)
+                            .then(|| entry.payload.get("tooltip").and_then(Value::as_str))
+                            .flatten()
+                            .map(str::trim)
+                            .filter(|text| !text.is_empty())
+                    })?;
+                    Some((text, entry_tone(entry)))
+                });
+            item_statuses.chain(fallback)
+        })
+}
+
+/// Map a tone to a foreground style against the active theme. `None` (no tone)
+/// renders neutral. Reuses existing theme status colors rather than inventing
+/// new fields, matching how the home view tones session rows.
 pub fn tone_style(tone: Option<Tone>, theme: &Theme) -> Style {
     let color = tone_color(tone, theme);
     Style::default().fg(color)
@@ -850,6 +902,59 @@ mod tests {
     fn entry_filters_and_payload_fields() {
         // session_id / body omitted on the wire (skip_serializing_if) must
         // still decode, not error.
+        let snap = snapshot(
+            json!([{
+                "plugin_id": "p",
+                "slot": "status-bar",
+                "id": "x",
+                "payload": {"text": "ok", "tone": "success"}
+            }]),
+            json!([{"seq": 1, "plugin_id": "p", "tone": "info", "title": "hi"}]),
+        );
+        assert_eq!(snap.entries.len(), 1);
+        assert!(snap.entries[0].session_id.is_none());
+        assert!(snap.notifications[0].body.is_none());
+    }
+
+    #[test]
+    fn global_entries_exclude_per_session() {
+        let snap = snapshot(
+            json!([
+                {"plugin_id": "p", "slot": "status-bar", "id": "g", "payload": {"text": "global"}},
+                {"plugin_id": "p", "slot": "status-bar", "id": "s", "session_id": "sess-1", "payload": {"text": "scoped"}}
+            ]),
+            json!([]),
+        );
+        let got: Vec<&str> = global_entries(&snap, UiSlot::StatusBar)
+            .filter_map(entry_text)
+            .collect();
+        assert_eq!(got, vec!["global"]);
+    }
+
+    #[test]
+    fn session_row_statuses_selects_badges_and_columns_for_exact_session() {
+        let snap = snapshot(
+            json!([
+                {"plugin_id":"gh","slot":"row-badge","id":"pr","session_id":"s1","payload":{"items":[{"text":"#42","tone":"success"},{"icon":"check","tooltip":"CI failed","tone":"danger"},{"icon":"check"}]}},
+                {"plugin_id":"linear","slot":"row-column","id":"issue","session_id":"s1","payload":{"text":"In Progress","tone":"info"}},
+                {"plugin_id":"gh","slot":"row-badge","id":"pr","session_id":"s2","payload":{"text":"other"}},
+                {"plugin_id":"gh","slot":"row-badge","id":"global","payload":{"text":"global"}}
+            ]),
+            json!([]),
+        );
+        let got: Vec<_> = session_row_statuses(&snap, "s1").collect();
+        assert_eq!(
+            got,
+            vec![
+                ("#42", Some(Tone::Success)),
+                ("CI failed", Some(Tone::Danger)),
+                ("In Progress", Some(Tone::Info)),
+            ]
+        );
+    }
+
+    #[test]
+    fn session_entries_require_exact_match() {
         let snap = snapshot(
             json!([
                 {"plugin_id": "p", "slot": "status-bar", "id": "g", "payload": {"text": "global", "tone": "danger"}},
