@@ -46,9 +46,16 @@ test.describe("ensure_session restart flow", () => {
     const [session] = await listSessions(serve.baseUrl);
     const sessionId = session!.id;
     const tmuxName = `${serve.tmuxPrefix}${title}_${sessionId.slice(0, 8)}`;
-    const ensure = async () =>
-      (await fetch(`${serve.baseUrl}/api/sessions/${sessionId}/ensure`, { method: "POST" }).then((r) => r.json()))
-        .status;
+    const ensure = async () => {
+      const response = await fetch(`${serve.baseUrl}/api/sessions/${sessionId}/ensure`, { method: "POST" });
+      const body = await response.text();
+      expect(response.status, `POST /ensure returned ${response.status}: ${body}`).toBe(200);
+      const result: unknown = JSON.parse(body);
+      if (typeof result !== "object" || result === null || !("status" in result) || typeof result.status !== "string") {
+        throw new Error(`POST /ensure returned an invalid status: ${body}`);
+      }
+      return result.status;
+    };
 
     // The status poller flips the seeded session to Error once it sees no tmux session.
     await expect.poll(async () => (await listSessions(serve.baseUrl))[0]?.status, { timeout: 10_000 }).toBe("Error");
@@ -152,26 +159,54 @@ test("peer rename surfaces within the watcher budget", async ({ page, spawnServe
   await expect(page.getByText("peer-target")).toBeVisible({ timeout: 10_000 });
 });
 
-test("enabling structured view reaps agent, terminal, and tool tmux sessions", async ({ spawnServe }) => {
-  // #1869: history is destroyed in the swap, so a surviving pane would orphan an unreachable shell.
+test("enabling structured view reaps owned panes and preserves an unverified tool", async ({ spawnServe }) => {
+  // #1869: owned panes must not leave unreachable shells after the view switch.
   const title = "modeswitch";
   const serve = await spawnServe({ acp: true, seedFn: seedSessionViaAoeAdd({ title, tool: "claude" }) });
   const [session] = await listSessions(serve.baseUrl);
   const sessionId = session!.id;
   expect(session!.view === "structured").toBeFalsy();
 
-  // Reapers scan list-sessions by these naming conventions.
   const id8 = sessionId.slice(0, 8);
   const names = [
     `${serve.tmuxPrefix}${title}_${id8}`,
     `${serve.tmuxPrefix}term_${title}_${id8}`,
     `${serve.tmuxPrefix}tool_lazygit_${title}_${id8}`,
   ];
+  const unverifiedTool = `${serve.tmuxPrefix}tool_unverified_${title}_${id8}`;
+  const allNames = [...names, unverifiedTool];
   try {
-    for (const name of names) {
-      expect(
-        tmux(serve.tmuxSocket, "new-session", "-d", "-s", name, "-x", "80", "-y", "24", "sleep", "600").status,
-      ).toBe(0);
+    for (const [index, name] of allNames.entries()) {
+      // Production stamps kind at creation; tool cleanup also requires the full owner identity.
+      const args = [
+        "new-session",
+        "-d",
+        "-s",
+        name,
+        "-x",
+        "80",
+        "-y",
+        "24",
+        "sleep",
+        "600",
+        ";",
+        "set-option",
+        "-t",
+        `=${name}:`,
+        "pane-base-index",
+        "0",
+        ";",
+        "set-option",
+        "-t",
+        `=${name}:`,
+        "@aoe_kind",
+        ["agent", "term", "tool", "tool"][index]!,
+      ];
+      if (name === names[2]) {
+        args.push(";", "set-option", "-t", `=${name}:`, "@aoe_tool_owner", JSON.stringify([sessionId, "lazygit"]));
+      }
+      const created = tmux(serve.tmuxSocket, ...args);
+      expect(created.status, created.stderr.toString()).toBe(0);
       expect(tmuxHasSession(serve.tmuxSocket, name)).toBe(true);
     }
 
@@ -187,6 +222,8 @@ test("enabling structured view reaps agent, terminal, and tool tmux sessions", a
         .poll(() => tmuxHasSession(serve.tmuxSocket, name), { timeout: 10_000, intervals: [100, 200, 400] })
         .toBe(false);
     }
+    // A matching name and kind are not proof of tool ownership.
+    expect(tmuxHasSession(serve.tmuxSocket, unverifiedTool)).toBe(true);
     await waitForView(serve.baseUrl, sessionId, "structured");
     // Killing tmux removes the poller that would settle a stale terminal status, so enable resets it.
     await expect
@@ -196,6 +233,6 @@ test("enabling structured view reaps agent, terminal, and tool tmux sessions", a
       })
       .toBe("Idle");
   } finally {
-    for (const name of names) tmux(serve.tmuxSocket, "kill-session", "-t", name);
+    for (const name of allNames) tmux(serve.tmuxSocket, "kill-session", "-t", name);
   }
 });

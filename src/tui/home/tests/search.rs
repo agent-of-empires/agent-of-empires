@@ -242,7 +242,10 @@ fn test_search_matching_and_cursor() {
 
     env.view.search_query = Input::new("session2".to_string());
     env.view.update_search();
-    let best = session_id_at(&env.view, env.view.search_matches[0]).expect("session row");
+    let best = match &env.view.flat_items[env.view.search_matches[0]] {
+        Item::Session { id, .. } => id.clone(),
+        _ => panic!("best match should be a session row"),
+    };
     assert!(env
         .view
         .get_instance(&best)
@@ -401,8 +404,7 @@ fn persist_tips_outcome_merges_seen_sets_disabled_and_updates_badge() {
     assert_eq!(env.view.tips_unseen, 0);
 }
 
-/// The footer tips badge shows the unseen count, outranks low-priority hints on a thin
-/// footer, hides at zero, and highlights on hover and opens the overlay on click.
+/// Full and compact Tips badges keep hover and click targets separate from shortcuts.
 #[test]
 #[serial]
 fn footer_tips_badge_renders_hovers_and_opens_overlay() {
@@ -438,16 +440,46 @@ fn footer_tips_badge_renders_hovers_and_opens_overlay() {
     );
     env.view.tips_dialog = None;
 
-    // Thin: the badge still shows (it takes priority); the hints yield.
+    // Compact Tips use their painted icon width beside the critical Enter action.
     let thin = render_home_to_string(&mut env.view, 30, 40);
-    assert!(
-        thin.contains(&badge),
-        "badge survives on a thin footer\n{thin}"
+    assert!(thin.contains('\u{1f4a1}'), "compact badge survives\n{thin}");
+    let compact = env.view.tips_badge_rect.expect("compact badge hit area");
+    assert_eq!(
+        compact.width,
+        unicode_width::UnicodeWidthStr::width("\u{1f4a1}") as u16
     );
+    let enter = env
+        .view
+        .footer_buttons
+        .iter()
+        .find(|(key, _)| key.code == KeyCode::Enter)
+        .expect("critical Enter remains available")
+        .1;
+    assert_eq!(enter.right(), compact.x);
+    assert!(env
+        .view
+        .footer_button_at(compact.x - 1, compact.y)
+        .is_some());
+    assert_eq!(env.view.footer_button_at(compact.x, compact.y), None);
+    assert!(!env.view.handle_tips_badge_click(compact.x - 1, compact.y));
+    assert!(!env.view.handle_tips_badge_click(compact.right(), compact.y));
+    assert!(!env.view.handle_tips_badge_click(rect.x, rect.y));
+    assert!(env.view.handle_hover(compact.right() - 1, compact.y));
+    assert!(env.view.tips_badge_hovered);
+    assert!(env.view.handle_hover(compact.right(), compact.y));
+    assert!(!env.view.tips_badge_hovered);
+    assert!(env
+        .view
+        .handle_tips_badge_click(compact.right() - 1, compact.y));
+    assert!(env.view.tips_dialog.is_some());
+    env.view.tips_dialog = None;
     assert!(
         !thin.contains("Diff"),
         "low-priority hints drop to make room for the badge\n{thin}"
     );
+    render_home_to_string(&mut env.view, 30 - compact.width, 40);
+    assert!(env.view.tips_badge_rect.is_none());
+    assert!(!env.view.handle_tips_badge_click(compact.x, compact.y));
 
     env.view.tips_unseen = 0;
     let hidden = render_home_to_string(&mut env.view, 200, 40);
@@ -455,6 +487,8 @@ fn footer_tips_badge_renders_hovers_and_opens_overlay() {
         !hidden.contains("tips"),
         "no badge when nothing is unseen\n{hidden}"
     );
+    assert!(env.view.tips_badge_rect.is_none());
+    assert!(!env.view.handle_tips_badge_click(compact.x, compact.y));
 }
 
 #[test]
@@ -618,8 +652,14 @@ fn test_select_session_by_id() {
 #[serial]
 fn test_select_top_attention() {
     let mut env = create_test_env_with_sessions(3);
-    let first_id = session_id_at(&env.view, 0).expect("first row is a session");
-    let second_id = session_id_at(&env.view, 1).expect("second row is a session");
+    let first_id = match &env.view.flat_items[0] {
+        Item::Session { id, .. } => id.clone(),
+        _ => panic!("first row is a session"),
+    };
+    let second_id = match &env.view.flat_items[1] {
+        Item::Session { id, .. } => id.clone(),
+        _ => panic!("second row is a session"),
+    };
     env.view.cursor = 2;
     env.view.update_selected();
 
@@ -638,7 +678,10 @@ fn test_select_top_attention() {
     );
 
     let mut env = create_test_env_with_sessions(1);
-    let only_id = session_id_at(&env.view, 0).expect("only row is a session");
+    let only_id = match &env.view.flat_items[0] {
+        Item::Session { id, .. } => id.clone(),
+        _ => panic!("only row is a session"),
+    };
     env.view.select_top_attention(Some(&only_id));
     assert_eq!(env.view.cursor, 0);
     assert_eq!(env.view.selected_session.as_deref(), Some(only_id.as_str()));

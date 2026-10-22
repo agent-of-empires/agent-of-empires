@@ -78,7 +78,7 @@ describe("MobileLiveTerminal paste", () => {
     const { input, sendPaste } = renderTerm(upload);
     const file = png();
     fireEvent.paste(input, clipboard(text, [imageItem(file)]));
-    expect(upload).toHaveBeenCalledWith(file);
+    expect(upload).toHaveBeenCalledWith(file, expect.any(Function));
     await vi.waitFor(() => expect(sendPaste).toHaveBeenCalledWith(pasted, false));
   });
 

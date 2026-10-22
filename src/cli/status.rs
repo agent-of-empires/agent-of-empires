@@ -116,7 +116,7 @@ pub(crate) fn count_statuses(statuses: impl Iterator<Item = Status>) -> StatusCo
 
 #[tracing::instrument(target = "cli.session", skip_all, fields(profile = %profile))]
 pub async fn run(profile: &str, args: StatusArgs) -> Result<()> {
-    let storage = Storage::open_unwatched(profile)?;
+    let storage = Storage::open_reference(profile)?;
     let (mut instances, _) = storage.load_with_groups()?;
     for inst in &mut instances {
         inst.source_profile = storage.profile().to_string();

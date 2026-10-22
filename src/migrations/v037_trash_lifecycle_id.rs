@@ -34,7 +34,7 @@ fn run_in(app_dir: &Path) -> Result<()> {
             }
         })?;
         if changed > 0 {
-            info!("v037: assigned trash lifecycle identities to {changed} session(s)");
+            info!(target: "migrations.v037", changed, "assigned trash lifecycle identities");
         }
     }
     Ok(())

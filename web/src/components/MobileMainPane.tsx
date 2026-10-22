@@ -20,6 +20,7 @@ import type { FileRef } from "../lib/fileRef";
 const StructuredView = lazy(() => import("./acp/StructuredView").then((m) => ({ default: m.StructuredView })));
 
 interface Props {
+  readOnly: boolean;
   view: RightPanelView;
   pluginPanes: PluginPane[];
   onBackToAgent: () => void;
@@ -63,6 +64,7 @@ function layerClass(active: boolean): string {
 /** Keep terminal geometry and scrollback across switches; only the visible
  *  surface owns keyboard input. */
 export function MobileMainPane({
+  readOnly,
   view,
   pluginPanes,
   onBackToAgent,
@@ -156,6 +158,7 @@ export function MobileMainPane({
             // Clear the home indicator without changing the keyboard-open lift.
             <div className="home-indicator-clearance flex-1 flex flex-col min-h-0 overflow-hidden">
               <TerminalSessionStack
+                readOnly={readOnly}
                 active={view === "agent"}
                 activeSessionId={activeSessionId!}
                 sessions={sessions.filter((session) => session.view !== "structured")}
@@ -173,7 +176,12 @@ export function MobileMainPane({
             inert={view !== "paired"}
             data-testid="mobile-paired-layer"
           >
-            <PairedShellPane session={activeSession} sessionId={activeSessionId} active={view === "paired"} />
+            <PairedShellPane
+              session={activeSession}
+              sessionId={activeSessionId}
+              readOnly={readOnly}
+              active={view === "paired"}
+            />
           </div>
         )}
 

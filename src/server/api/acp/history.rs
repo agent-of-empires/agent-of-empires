@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 use crate::acp::protocol::{
     ContextPrimerQuery, ContextPrimerResponse, FilesResponse, ReplayQuery, ReplayResponse,
 };
+use crate::server::api::sessions::cityhall_block_non_structured;
 use crate::server::api::{find_instance, instance_exists};
 
 use super::*;
@@ -199,6 +200,9 @@ pub async fn acp_context_primer(
     Path(id): Path<String>,
     axum::extract::Query(q): axum::extract::Query<ContextPrimerQuery>,
 ) -> impl IntoResponse {
+    if let Some(resp) = cityhall_block_non_structured(&state, &id).await {
+        return resp;
+    }
     let events = state.acp_event_store.replay_before(&id, q.before_seq);
     let primer = crate::acp::context_primer::build_context_primer(
         &events,
@@ -226,6 +230,9 @@ pub async fn acp_replay(
     Path(id): Path<String>,
     axum::extract::Query(q): axum::extract::Query<ReplayQuery>,
 ) -> impl IntoResponse {
+    if let Some(resp) = cityhall_block_non_structured(&state, &id).await {
+        return resp;
+    }
     let limit = q
         .limit
         .map(|l| l as usize)
@@ -340,14 +347,23 @@ pub async fn list_importable_sessions(
     State(state): State<Arc<AppState>>,
     axum::extract::Query(q): axum::extract::Query<ImportableSessionsQuery>,
 ) -> impl IntoResponse {
+    // Native session discovery exposes titles and paths outside this mode's scope.
+    if let Some(resp) = cityhall_block(&state) {
+        return resp;
+    }
     if let Some(resp) = read_only_block(&state) {
         return resp;
     }
-    let profile = q.profile.as_deref().filter(|p| !p.is_empty());
-    if let Some(resp) = profile.and_then(crate::server::api::unknown_profile_response) {
+    let _namespace = state.profile_namespace.read().await;
+    let profile = q.profile.filter(|p| !p.is_empty());
+    if let Some(resp) = profile
+        .as_deref()
+        .and_then(crate::server::api::unknown_profile_response)
+    {
         return resp;
     }
-    match importable_sessions(&state, &q.agent, profile.unwrap_or(&state.profile)).await {
+    let profile = profile.unwrap_or_else(|| state.served_profile().clone());
+    match importable_sessions(&state, &q.agent, &profile).await {
         Ok(list) => Json(list).into_response(),
         Err(e) => list_error_response(e),
     }
@@ -472,6 +488,43 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn import_discovery_refuses_cityhall_and_read_only_before_listing() {
+        for cityhall in [false, true] {
+            for agent in ["claude", "codex"] {
+                let state = crate::server::test_support::build_test_app_state_configured(
+                    Vec::new(),
+                    |state| {
+                        state.cityhall_mode = cityhall;
+                        state.read_only = !cityhall;
+                    },
+                );
+                let response = list_importable_sessions(
+                    State(state),
+                    axum::extract::Query(ImportableSessionsQuery {
+                        agent: agent.into(),
+                        profile: Some("missing-profile".into()),
+                    }),
+                )
+                .await
+                .into_response();
+                assert_eq!(response.status(), StatusCode::FORBIDDEN);
+                let bytes = axum::body::to_bytes(response.into_body(), 1 << 16)
+                    .await
+                    .unwrap();
+                let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+                assert_eq!(
+                    body["error"],
+                    if cityhall {
+                        "cityhall_mode"
+                    } else {
+                        "read_only"
+                    },
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
     #[serial_test::serial]
     async fn importable_sessions_lists_the_selected_profile_and_never_launches_a_denied_agent() {
         let tmp = tempfile::tempdir().unwrap();
@@ -517,10 +570,10 @@ done
         }
 
         let state = crate::server::test_support::build_test_app_state(Vec::new());
-        let get = |profile: &str| {
+        let get = |profile: Option<&str>| {
             let q = ImportableSessionsQuery {
                 agent: "pi".into(),
-                profile: Some(profile.into()),
+                profile: profile.map(str::to_owned),
             };
             let state = state.clone();
             async move {
@@ -536,11 +589,22 @@ done
             }
         };
         for name in ["a", "b"] {
-            let (status, body) = get(name).await;
+            let (status, body) = get(Some(name)).await;
             assert_eq!(status, StatusCode::OK, "{body}");
             assert_eq!(body["sessions"][0]["cwd"], format!("/stores/{name}"));
         }
-        let (status, body) = get("missing").await;
+        let served_profile = state.served_profile().to_string();
+        state.rename_served_profile(&served_profile, "b");
+        for profile in [None, Some("")] {
+            let (status, body) = get(profile).await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            assert_eq!(body["sessions"][0]["cwd"], "/stores/b");
+        }
+        state.rename_served_profile("b", "a");
+        let (status, body) = get(None).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["sessions"][0]["cwd"], "/stores/a");
+        let (status, body) = get(Some("missing")).await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert_eq!(body["error"], "profile_not_found");
 
@@ -550,7 +614,7 @@ done
         })
         .unwrap();
         std::fs::remove_file(&ran).unwrap();
-        let (status, body) = get("a").await;
+        let (status, body) = get(Some("a")).await;
         assert_eq!(status, StatusCode::FORBIDDEN);
         assert_eq!(body["error"], "agent_not_allowed");
         assert!(!ran.exists(), "a denied adapter must not be spawned");

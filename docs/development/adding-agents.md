@@ -42,6 +42,10 @@ Add a `session_name_flag` arm only from documented argv: it names the agent's ow
 
 Register the manifest with a static surface adapter in `src/tmux/detect/mod.rs`. Most agents use the plain adapter: unmodified rows and 50 lines of scrollback. An agent that needs surface preprocessing keeps its parsing, masking, capture policy, and semantic observation token in its private adapter module. For manifest-based detection, the poller and CLI use the same `DetectionPlan` without branching on agent names.
 
+Session-ID pollers retain the configured thread-count budget and use standard
+Rust thread stacks. Agent capture can deserialize complete peer instances,
+including nested execution metadata.
+
 Adapters supply borrowed `Evidence` slices with original bottom offsets. A manifest uses `region = "evidence(name)"`; names must be declared by its adapter and compile to indices, including nested clause overrides. Extract source spans before masking, preserve row positions, and preprocess before truncating common recent regions. Configured status rules bypass adapter preprocessing and use the plain capture policy; a configured no-match remains authoritative Idle.
 
 Evidence may also borrow a diagnostic from the original capture. Extract only the message owned by that surface, preserving captured line breaks and rejecting ambiguous boundaries. Keep its matching text and bottom offset unchanged. Only a selected Error rule's own evidence region can supply `Detection::diagnostic`; skipped updates, nested clauses, and other winners cannot inherit it. The poller uses this text when first recording an error, with the existing display-length limit, and otherwise keeps the pane-summary fallback.

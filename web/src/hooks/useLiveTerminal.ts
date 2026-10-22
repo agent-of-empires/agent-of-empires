@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useEffectEvent, useRef } from "react";
+import { useCallback, useEffect, useEffectEvent, useLayoutEffect, useRef } from "react";
 import { useSnapshotStore } from "./useSnapshotStore";
 import { listen } from "./domEvents";
 import { getOrCreateDeviceBindingSecret } from "../lib/deviceBinding";
@@ -64,6 +64,7 @@ const INITIAL_STATE: LiveTerminalState = {
 
 export function useLiveTerminal(
   sessionId: string | null,
+  readOnly: boolean,
   wsPath: string = "live-ws",
   onClipboard?: (text: string) => void,
 ) {
@@ -84,6 +85,14 @@ export function useLiveTerminal(
   const pendingInputRef = useRef<(Uint8Array<ArrayBuffer> | string)[]>([]);
   // Hold input until the server confirms this connection owns the pane.
   const ownerKnownRef = useRef(false);
+  const readOnlyRef = useRef(readOnly);
+  useLayoutEffect(() => {
+    readOnlyRef.current = readOnly;
+    if (readOnly) {
+      pendingInputRef.current = [];
+      desiredRef.current.resize = null;
+    }
+  }, [readOnly]);
 
   const { state, read, setState } = useSnapshotStore(() => INITIAL_STATE);
 
@@ -91,6 +100,13 @@ export function useLiveTerminal(
     const ws = wsRef.current;
     if (ws?.readyState === WebSocket.OPEN) ws.send(data);
   }, []);
+
+  const sendMutationIfOpen = useCallback(
+    (data: string | ArrayBufferView<ArrayBuffer>) => {
+      if (!readOnlyRef.current) sendIfOpen(data);
+    },
+    [sendIfOpen],
+  );
 
   const setWindowInternal = useCallback(
     (lines: number) => {
@@ -147,7 +163,8 @@ export function useLiveTerminal(
       wsRef.current = ws;
 
       const flushPendingInput = () => {
-        if (wsRef.current !== ws || !ownerKnownRef.current || ws.readyState !== WebSocket.OPEN) return;
+        if (readOnlyRef.current || wsRef.current !== ws || !ownerKnownRef.current || ws.readyState !== WebSocket.OPEN)
+          return;
         const pending = pendingInputRef.current;
         pendingInputRef.current = [];
         for (const data of pending) ws.send(data);
@@ -155,7 +172,7 @@ export function useLiveTerminal(
 
       ws.onopen = () => {
         if (wsRef.current !== ws) return;
-        if (!telemetrySeenRef.current) {
+        if (!readOnlyRef.current && !telemetrySeenRef.current) {
           telemetrySeenRef.current = true;
           reportTelemetrySeen("web_terminal");
         }
@@ -165,10 +182,10 @@ export function useLiveTerminal(
           reconnecting: false,
           paneDead: false,
         }));
-        ws.send(encodeControl({ type: "claim_if_vacant" }));
         const desired = desiredRef.current;
-        if (desired.resize) {
-          ws.send(encodeControl({ type: "resize", ...desired.resize }));
+        if (!readOnlyRef.current) {
+          ws.send(encodeControl({ type: "claim_if_vacant" }));
+          if (desired.resize) ws.send(encodeControl({ type: "resize", ...desired.resize }));
         }
         if (desired.window != null) {
           ws.send(encodeControl({ type: "window", lines: desired.window }));
@@ -352,6 +369,7 @@ export function useLiveTerminal(
   /** Whether `message` was sent or queued for the owner confirmation. */
   const sendInput = useCallback(
     (message: Uint8Array<ArrayBuffer> | string): boolean => {
+      if (readOnlyRef.current) return false;
       const ws = wsRef.current;
       const isOwner = read().isOwner;
       if (ownerKnownRef.current && isOwner && ws?.readyState === WebSocket.OPEN) {
@@ -379,21 +397,22 @@ export function useLiveTerminal(
     [sendInput],
   );
 
-  const claim = useCallback(() => sendIfOpen(encodeControl({ type: "claim" })), [sendIfOpen]);
+  const claim = useCallback(() => sendMutationIfOpen(encodeControl({ type: "claim" })), [sendMutationIfOpen]);
 
   const forwardWheel = useCallback(
-    (up: boolean, sgr: boolean, col: number, row: number) => sendIfOpen(wheelMouseBytes(up, sgr, col, row)),
-    [sendIfOpen],
+    (up: boolean, sgr: boolean, col: number, row: number) => sendMutationIfOpen(wheelMouseBytes(up, sgr, col, row)),
+    [sendMutationIfOpen],
   );
 
   const forwardButton = useCallback(
     (baseButton: number, release: boolean, motion: boolean, sgr: boolean, col: number, row: number) =>
-      sendIfOpen(buttonMouseBytes(baseButton, release, motion, sgr, col, row)),
-    [sendIfOpen],
+      sendMutationIfOpen(buttonMouseBytes(baseButton, release, motion, sgr, col, row)),
+    [sendMutationIfOpen],
   );
 
   const sendResize = useCallback(
     (cols: number, rows: number) => {
+      if (readOnlyRef.current) return;
       const prev = desiredRef.current.resize;
       if (prev && prev.cols === cols && prev.rows === rows) return;
       desiredRef.current.resize = { cols, rows };

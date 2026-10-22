@@ -57,6 +57,8 @@ const RETENTION_PINNED_EVENT_DISCRIMINANTS: &[&str] = &[
     "ModesAvailable",
     "CurrentModeChanged",
     "AcpSessionAssigned",
+    "SessionContextReset",
+    "SessionCleared",
     "PromptCapabilities",
     "AuthStatusUpdated",
     "BackgroundAgentLaunched",
@@ -204,6 +206,72 @@ impl EventStore {
         collected
     }
 
+    pub(crate) fn highest_seq_checked(&self, session_id: &str) -> Result<u64> {
+        let seq: i64 = self.conn().query_row(
+            &format!(
+                "SELECT COALESCE(MAX(seq), 0) FROM {} WHERE session_id = ?1",
+                self.schema.events_table()
+            ),
+            rusqlite::params![session_id],
+            |row| row.get(0),
+        )?;
+        Ok(u64::try_from(seq)?)
+    }
+
+    pub(crate) fn handoff_context_event(
+        &self,
+        session_id: &str,
+        after: u64,
+        through: u64,
+    ) -> Result<Option<(u64, Event)>> {
+        let found: Option<(i64, String)> = self.conn().query_row(
+        &format!("SELECT seq, event_json FROM {} WHERE session_id = ?1 AND seq > ?2 AND seq <= ?3 AND discriminant IN ('AcpSessionAssigned', 'SessionContextReset', 'SessionCleared') ORDER BY seq DESC LIMIT 1", self.schema.events_table()),
+        rusqlite::params![session_id, i64::try_from(after)?, i64::try_from(through)?],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    ).optional()?;
+        found
+            .map(|(seq, json)| -> Result<_> {
+                Ok((u64::try_from(seq)?, serde_json::from_str(&json)?))
+            })
+            .transpose()
+    }
+    pub(crate) fn delete_session_checked(&self, session_id: &str) -> Result<()> {
+        let mut conn = self.conn();
+        let tx = conn.transaction()?;
+        for table in [
+            self.schema.events_table(),
+            self.schema.attachments_table(),
+            self.schema.pending_attachments_table(),
+            self.schema.rate_limit_budgets_table(),
+        ] {
+            tx.execute(
+                &format!("DELETE FROM {table} WHERE session_id = ?1"),
+                rusqlite::params![session_id],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub(crate) fn handoff_stopped_after(&self, session_id: &str, after: u64) -> Result<bool> {
+        let conn = self.conn();
+        let mut statement = conn.prepare(&format!(
+        "SELECT event_json FROM {} WHERE session_id = ?1 AND seq > ?2 AND discriminant = 'Stopped' ORDER BY seq DESC",
+        self.schema.events_table(),
+    ))?;
+        let rows = statement.query_map(
+            rusqlite::params![session_id, i64::try_from(after)?],
+            |row| row.get::<_, String>(0),
+        )?;
+        for json in rows {
+            match serde_json::from_str::<Event>(&json?)? {
+                Event::Stopped { reason } if reason == "user_stopped" => return Ok(true),
+                Event::Stopped { .. } => {}
+                _ => anyhow::bail!("persisted Stopped discriminant has a different event payload"),
+            }
+        }
+        Ok(false)
+    }
     /// Drop every event for a session, cascading to its attachment blobs.
     pub fn delete_session(&self, session_id: &str) {
         let deleted = events::delete_topic(&self.conn(), &self.schema, session_id);

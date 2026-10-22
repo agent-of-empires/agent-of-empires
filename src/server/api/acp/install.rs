@@ -382,10 +382,10 @@ mod tests {
         let cityhall = crate::server::test_support::build_test_app_state_cityhall(vec![session(
             "claude", "claude", None, false,
         )]);
-        let mut read_only = crate::server::test_support::build_test_app_state(vec![session(
-            "claude", "claude", None, false,
-        )]);
-        Arc::get_mut(&mut read_only).unwrap().read_only = true;
+        let read_only = crate::server::test_support::build_test_app_state_configured(
+            vec![session("claude", "claude", None, false)],
+            |state| state.read_only = true,
+        );
         for (label, setting, state, allowed) in [
             ("setting off", false, state.clone(), false),
             ("setting on", true, state.clone(), true),

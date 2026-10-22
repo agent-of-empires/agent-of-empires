@@ -62,6 +62,8 @@ pub struct SpawnConfig {
     pub wrapper_substitution: Option<(String, String)>,
     /// Lifecycle epoch stamped on the runner's registry record.
     pub generation: u64,
+    /// Producer cancellation and pre-publication runner identity for the admitted epoch.
+    pub launch_lease: Option<crate::acp::runner_lifecycle::Lease>,
     pub claude_store_pin: Option<crate::session::capture::ClaudeStorePin>,
     /// Trusted environment before the current hook overlay or Claude routing.
     pub base_host_environment: Vec<(String, String)>,

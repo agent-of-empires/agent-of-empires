@@ -6,11 +6,13 @@ type ShellMode = "host" | "container";
 
 /** Host/container shell shared by desktop docks and the mobile paired view. */
 export function PairedShellPane({
+  readOnly,
   session,
   sessionId,
   active = true,
   terminalIndex = 0,
 }: {
+  readOnly: boolean;
   session: SessionResponse | null;
   sessionId: string | null;
   active?: boolean;
@@ -52,6 +54,7 @@ export function PairedShellPane({
         <LiveTerminalView
           key={`${sessionId}-${effectiveMode}-${terminalIndex}`}
           session={session}
+          readOnly={readOnly}
           active={active}
           surface={effectiveMode === "container" ? "paired-container" : "paired-host"}
           terminalIndex={terminalIndex}

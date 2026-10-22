@@ -67,9 +67,11 @@ theme.
 ## TUI
 
 - Preserve dashboard density and the status glyph system.
+- Keep runtime status separate from shortcuts; Tips yield to critical hints and compact to their icon when space is tight.
 - Use rounded block borders.
 - Keep one character of horizontal padding in the list and preview panels.
 - Adjacent list and preview panels share one separator, never a double border.
+- Passive split panes only observe: use a reliable captured cursor to choose the viewport without resizing shared panes or discarding captured history.
 - Dialogs remain boxed and manage their own internal spacing.
 - Prefer geometric text symbols over emoji where column width must be stable.
 
