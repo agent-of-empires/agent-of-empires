@@ -5,7 +5,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { SettingsView } from "../SettingsView";
-import { resetSettingsIntros, settleSettingsIntrosReadOnly } from "../../lib/settingsIntros";
+import { resetSettingsIntros } from "../../lib/settingsIntros";
 import { hydrateWebUiStateFromServer } from "../../lib/webUiSync";
 import * as api from "../../lib/api";
 
@@ -48,8 +48,6 @@ const intro = () => screen.queryByRole("region", { name: "About this tab" });
 const about = () => screen.queryByRole("button", { name: "About this tab" });
 
 beforeEach(async () => {
-  // Drop choices an earlier test left waiting for read-only to resolve.
-  settleSettingsIntrosReadOnly(false);
   localStorage.clear();
   // Intros wait for this page load's hydration to settle; null is an unreachable Daemon.
   vi.mocked(api.getWebUiState).mockResolvedValue(null);
@@ -180,10 +178,35 @@ describe("Settings tab intros", () => {
     expect(about()).toBeNull();
   });
 
-  it("folds only the synced key while read-only is unknown, so a replay elsewhere still reaches it", async () => {
+  it("gives a replay held for hydration the read-only answer that arrived meanwhile", async () => {
+    vi.resetModules();
+    const sync = await import("../../lib/webUiSync");
+    const intros = await import("../../lib/settingsIntros");
+    let respond: (state: Record<string, string>) => void = () => {};
+    vi.mocked(api.getWebUiState).mockReturnValue(new Promise((resolve) => (respond = resolve)));
+    const hydrating = sync.hydrateWebUiStateFromServer();
+    // "Show tutorial" before /api/about answered, then about says read-only before hydration settles.
+    intros.resetSettingsIntros(undefined);
+    intros.settleSettingsIntrosReadOnly(true);
+    await act(async () => {
+      respond({ [KEY("worktree")]: "folded" });
+      await hydrating;
+    });
+    expect(localStorage.getItem("aoe-local-settings-intro-worktree")).toBe("unfolded");
+    expect(intros.isSettingsIntroFolded("worktree")).toBe(false);
+  });
+
+  /** Fresh modules, so nothing earlier in the file has told the intros whether the Daemon is read-only. */
+  async function freshIntros() {
+    vi.resetModules();
+    const sync = await import("../../lib/webUiSync");
+    const intros = await import("../../lib/settingsIntros");
+    const { SettingsView: FreshView } = await import("../SettingsView");
+    vi.mocked(api.getWebUiState).mockResolvedValue(null);
+    await sync.hydrateWebUiStateFromServer();
     // App passes `serverAbout?.read_only`, which is undefined until /api/about loads.
     const view = (readOnly?: boolean) => (
-      <SettingsView
+      <FreshView
         onClose={() => {}}
         tab="worktree"
         onSelectTab={() => {}}
@@ -191,12 +214,17 @@ describe("Settings tab intros", () => {
         readOnly={readOnly}
       />
     );
+    return { sync, intros, view };
+  }
+
+  it("folds only the synced key while read-only is unknown, so a replay elsewhere still reaches it", async () => {
+    const { sync, view } = await freshIntros();
     const { unmount } = render(view());
     await waitFor(() => expect(intro()).not.toBeNull());
     fireEvent.click(screen.getByRole("button", { name: "Got it" }));
     unmount();
     vi.mocked(api.getWebUiState).mockResolvedValue({ [KEY("worktree")]: "unfolded" });
-    await act(() => hydrateWebUiStateFromServer());
+    await act(() => sync.hydrateWebUiStateFromServer());
     render(view(false));
     await waitFor(() => expect(intro()).not.toBeNull());
     expect(about()).toBeNull();
@@ -204,26 +232,18 @@ describe("Settings tab intros", () => {
   });
 
   it("moves a fold made before read-only was known onto the device once it resolves to read-only", async () => {
-    const view = (readOnly?: boolean) => (
-      <SettingsView
-        onClose={() => {}}
-        tab="worktree"
-        onSelectTab={() => {}}
-        onServerAboutRefresh={() => {}}
-        readOnly={readOnly}
-      />
-    );
+    const { sync, intros, view } = await freshIntros();
     const { rerender } = render(view());
     await waitFor(() => expect(intro()).not.toBeNull());
     fireEvent.click(screen.getByRole("button", { name: "Got it" }));
     expect(localStorage.getItem("aoe-local-settings-intro-worktree")).toBeNull();
     // What App does once /api/about answers.
-    settleSettingsIntrosReadOnly(true);
+    intros.settleSettingsIntrosReadOnly(true);
     rerender(view(true));
     expect(localStorage.getItem("aoe-local-settings-intro-worktree")).toBe("folded");
     // The Daemon refused the synced write, so hydration brings its own value back.
     vi.mocked(api.getWebUiState).mockResolvedValue({ [KEY("worktree")]: "unfolded" });
-    await act(() => hydrateWebUiStateFromServer());
+    await act(() => sync.hydrateWebUiStateFromServer());
     expect(about()).not.toBeNull();
   });
 

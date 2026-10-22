@@ -30,9 +30,12 @@ export function isSettingsIntroFolded(id: SettingsIntroId): boolean {
 
 // Choices made before the Daemon's about says whether it is read-only, kept until it does.
 const unsettled = new Map<SettingsIntroId, string>();
+// Once settled, a caller that captured `undefined` earlier (a replay waiting for hydration) uses it.
+let knownReadOnly: boolean | undefined;
 
 /** `readOnly` is undefined until the Daemon's about loads. */
-function setIntro(id: SettingsIntroId, value: string, readOnly: boolean | undefined): void {
+function setIntro(id: SettingsIntroId, value: string, callerReadOnly: boolean | undefined): void {
+  const readOnly = callerReadOnly ?? knownReadOnly;
   if (readOnly === true) {
     safeSetItem(deviceKey(id), value);
     return;
@@ -50,6 +53,7 @@ function setIntro(id: SettingsIntroId, value: string, readOnly: boolean | undefi
 
 /** Once the Daemon's about loads: a read-only one keeps the earlier choices on the device. */
 export function settleSettingsIntrosReadOnly(readOnly: boolean): void {
+  knownReadOnly = readOnly;
   for (const [id, value] of unsettled) setIntro(id, value, readOnly);
   unsettled.clear();
 }
