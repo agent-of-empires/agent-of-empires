@@ -2131,10 +2131,23 @@ impl SessionConfig {
     pub fn resolve_tool_command(&self, tool: &str) -> String {
         self.agent_command_override
             .get(tool)
-            .filter(|s| !s.is_empty())
-            .or_else(|| self.custom_agents.get(tool))
+            .filter(|command| !command.trim().is_empty())
             .cloned()
-            .or_else(|| crate::plugin::agent_integration::agent_command(tool))
+            .or_else(|| {
+                self.custom_agents
+                    .get(tool)
+                    .filter(|command| !command.trim().is_empty())
+                    .cloned()
+            })
+            .or_else(|| {
+                crate::plugin::agent_integration::agent_command(
+                    tool,
+                    self.custom_agents
+                        .iter()
+                        .filter(|(_, command)| !command.trim().is_empty())
+                        .map(|(name, _)| name.as_str()),
+                )
+            })
             .unwrap_or_default()
     }
 

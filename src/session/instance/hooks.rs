@@ -33,7 +33,7 @@ pub(super) fn host_launch_env_prefix(
             shell_escape(agent_bin)
         )
     } else {
-        format!("AOE_INSTANCE_ID={} ", shell_escape(instance_id))
+        String::new()
     }
 }
 
@@ -1853,7 +1853,7 @@ mod tests {
     }
 
     #[test]
-    fn host_launch_env_prefix_keeps_identity_independent_of_hooks() {
+    fn host_launch_env_prefix_adds_identity_only_for_hooks() {
         for agent in ["codex", "hermes", "settl", "claude", "kiro", "kimi"] {
             let binary = crate::agents::get_agent(agent).unwrap().binary;
             for program in [None, Some(binary)] {
@@ -1870,7 +1870,7 @@ mod tests {
         }
         assert_eq!(
             host_launch_env_prefix("work", "abc123", crate::agents::get_agent("opencode"), None),
-            format!("AOE_INSTANCE_ID={} ", shell_escape("abc123"))
+            ""
         );
     }
 

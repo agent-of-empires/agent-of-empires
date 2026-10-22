@@ -56,10 +56,9 @@ export function PluginUpdateConsentModal({
 
       {needsConsent && (
         <p className="mb-3 text-xs text-text-dim">
-          This update expands what the plugin can do. Review the new access before approving.
+          This update changes plugin access or launch commands. Review the changes before approving.
         </p>
       )}
-
       {consent && consent.added_capabilities.length > 0 && (
         <ModalSection label="New capabilities" warn testId="plugin-update-added-caps">
           {consent.added_capabilities.join(", ")}
@@ -83,6 +82,17 @@ export function PluginUpdateConsentModal({
       )}
 
       {consent && <BuildSteps steps={consent.build_steps} testId="plugin-update-build-steps" />}
+      {consent && consent.agent_integrations.length > 0 && (
+        <ModalSection label="Agent launch commands" warn testId="plugin-update-agent-integrations">
+          <ul className="space-y-0.5">
+            {consent.agent_integrations.map((agent) => (
+              <li key={agent.tool} className="font-mono text-[11px] text-text-dim">
+                {agent.tool}: {agent.command ?? "No launch command declared"}
+              </li>
+            ))}
+          </ul>
+        </ModalSection>
+      )}
 
       {consent && consent.ui.length > 0 && (
         <ModalSection label="Dashboard UI slots">{uniqueSlots(consent.ui)}</ModalSection>
@@ -90,8 +100,8 @@ export function PluginUpdateConsentModal({
 
       {needsConsent && (
         <p className="mb-3 text-[11px] text-text-dim">
-          Approving trusts this plugin. The host enforces capabilities at its API boundary, but a plugin worker (and any
-          build step) runs without OS-level sandboxing, so a malicious plugin is not contained. Only approve updates
+          Approving trusts this plugin. Its declared agent commands run as your user when launched; a plugin worker (and
+          any build step) runs without OS-level sandboxing, so a malicious plugin is not contained. Only approve updates
           from sources you trust.
         </p>
       )}

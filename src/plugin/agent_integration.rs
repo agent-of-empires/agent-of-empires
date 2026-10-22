@@ -66,6 +66,17 @@ fn unique_candidates<'a, 'b, 'c>(
     for name in custom_names {
         candidate_counts.remove(name);
     }
+    for (plugin, tool, _) in &candidates {
+        if let Some(builtin) = crate::agents::resolve_tool_name(tool) {
+            tracing::warn!(
+                plugin = %plugin,
+                tool = %tool,
+                builtin = %builtin,
+                "plugin agent tool name contains a built-in name or alias; preserving built-in precedence"
+            );
+            candidate_counts.remove(tool);
+        }
+    }
     candidates
         .into_iter()
         .filter_map(|(plugin, tool, command)| {
@@ -99,12 +110,15 @@ pub fn catalog<'a, 'b, 'c>(
 }
 
 /// Resolve a unique plugin-provided agent launch command.
-pub fn agent_command(tool: &str) -> Option<String> {
+pub fn agent_command<'a>(
+    tool: &str,
+    custom_names: impl IntoIterator<Item = &'a str>,
+) -> Option<String> {
     let registry = super::registry();
     catalog(
         &registry,
         crate::agents::AGENTS.iter().map(|agent| agent.name),
-        std::iter::empty(),
+        custom_names,
     )
     .into_iter()
     .find(|agent| agent.tool == tool)
@@ -465,7 +479,7 @@ mod tests {
                 ("plugin-b", "duplicate", "b"),
                 ("plugin-c", "builtin-agent", "c"),
                 ("plugin-d", "custom-agent", "d"),
-                ("plugin-e", "unique-agent", "e"),
+                ("plugin-e", "unique-helper", "e"),
             ],
             ["builtin-agent"],
             ["custom-agent"],
@@ -474,7 +488,7 @@ mod tests {
             entries,
             [PluginAgent {
                 plugin: "plugin-e",
-                tool: "unique-agent",
+                tool: "unique-helper",
                 command: "e",
             }]
         );
@@ -938,5 +952,15 @@ replies = true
         let mut changed = snapshot();
         changed.provider_version = "1.3.0".into();
         assert!(!same_prompt(&snapshot(), &changed));
+    }
+
+    #[test]
+    fn builtin_substring_aliases_are_reserved_from_plugins() {
+        for tool in ["claude-yolo", "session-agent"] {
+            assert!(
+                unique_candidates([("plugin", tool, "agent")], [], []).is_empty(),
+                "built-in alias should reserve {tool}"
+            );
+        }
     }
 }

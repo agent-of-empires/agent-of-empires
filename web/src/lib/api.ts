@@ -543,6 +543,11 @@ export interface PluginUpdateChangelog {
   more_url: string | null;
 }
 
+export interface PluginAgentIntegration {
+  tool: string;
+  command?: string;
+}
+
 /** Mirrors Rust `UpdateConsent`. */
 export interface PluginUpdateConsent {
   id: string;
@@ -553,6 +558,7 @@ export interface PluginUpdateConsent {
   added_capabilities: string[];
   removed_capabilities: string[];
   ui: PluginUpdateUiView[];
+  agent_integrations: PluginAgentIntegration[];
   build_steps: string[];
   runtime_change: string | null;
   trust_downgrade: boolean;
@@ -611,6 +617,7 @@ export interface PluginInstallConsent {
   validation: string;
   capabilities: string[];
   ui: PluginUpdateUiView[];
+  agent_integrations: PluginAgentIntegration[];
   build_steps: string[];
   fingerprint: string;
 }

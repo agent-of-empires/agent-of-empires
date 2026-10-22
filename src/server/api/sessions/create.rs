@@ -258,12 +258,19 @@ pub(super) fn validate_session_tool_identity(
 
     match crate::session::config::repo_config::resolve_config_with_repo(profile, project_path) {
         Ok(config) => {
+            let custom_agents = config
+                .session
+                .custom_agents
+                .iter()
+                .filter(|(_, command)| !command.trim().is_empty())
+                .map(|(name, _)| name.as_str())
+                .collect::<Vec<_>>();
             config
                 .session
                 .custom_agents
                 .get(tool)
                 .is_some_and(|command| !command.trim().is_empty())
-                || crate::plugin::agent_integration::agent_command(tool).is_some()
+                || crate::plugin::agent_integration::agent_command(tool, custom_agents).is_some()
         }
         Err(e) => {
             tracing::warn!(

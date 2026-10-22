@@ -42,15 +42,15 @@ capabilities = ["runtime.worker"]
 
 An agent integration connects a plugin to provider-native status and prompt replies for a terminal agent. Optional launch metadata makes that tool discoverable and launchable from AoE; the host still owns session creation, approvals, and lifecycle. It is separate from ACP and worker RPCs. The user still chooses each response; declaring an integration does not approve tools automatically.
 
-Active plugins with a command contribute that tool to AoE's agent picker and CLI when the name is unique across plugin declarations and does not collide with a built-in or configured custom agent. Available plugin agents can be selected with `session.default_tool`. Discovery checks the executable after leading `NAME=value` assignments, using the process PATH and then the user's login shell without running the agent command or its arguments.
+An agent integration connects a plugin to provider-native status and prompt replies for a terminal agent, and may declare an optional launch command. Active plugins with a command contribute that tool to AoE's agent picker and CLI when its name is unique across plugin declarations and does not match a configured custom agent. Built-in names and aliases retain precedence under AoE's case-insensitive substring resolver, so a plugin tool containing any such token is omitted from the catalog and a warning names the plugin ID and tool. Available plugin agents can be selected with `session.default_tool`. Discovery checks the executable after leading `NAME=value` assignments, using the process PATH and then the user's login shell without running the agent command or its arguments. Installing a plugin with agent integrations requires explicit approval. The install preview and CLI/TUI prompts show each tool and its exact command. Updates require approval when they add an agent integration or change a launch command; removals alone do not. AoE runs the declared command as the user only when that agent is launched.
 
 ```toml
 capabilities = ["session.integration"]
 
 [[agent_integrations]]
-tool = "session-agent"
+tool = "session-helper"
 provider_versions = ["^1.2"]
-command = "session-agent"
+command = "session-helper"
 replies = true
 ```
 

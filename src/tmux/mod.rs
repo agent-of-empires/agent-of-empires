@@ -2254,17 +2254,8 @@ fn agent_probe_output(
     }
 }
 
-fn plugin_command_available(
-    command: &str,
-    login_shell: bool,
-    cancel: Option<&tokio_util::sync::CancellationToken>,
-) -> bool {
-    if cancel.is_some_and(tokio_util::sync::CancellationToken::is_cancelled) {
-        return false;
-    }
-    let Ok(words) = shell_words::split(command) else {
-        return false;
-    };
+fn plugin_command_parts(command: &str) -> Option<(Vec<String>, usize)> {
+    let words = shell_words::split(command).ok()?;
     let assignments = words
         .iter()
         .take_while(|word| {
@@ -2272,39 +2263,204 @@ fn plugin_command_available(
                 .is_some_and(|(key, _)| crate::session::environment::is_valid_env_key(key))
         })
         .count();
-    let Some(binary) = words.get(assignments) else {
+    (words.get(assignments).is_some()).then_some((words, assignments))
+}
+
+fn plugin_command_on_path(command: &str) -> bool {
+    let Some((words, assignments)) = plugin_command_parts(command) else {
         return false;
     };
+    let binary = &words[assignments];
     let path_override = words[..assignments]
         .iter()
         .rev()
         .find_map(|word| word.strip_prefix("PATH="));
-    let on_path = match path_override {
+    match path_override {
         Some(path) => std::env::current_dir()
             .ok()
             .is_some_and(|cwd| which::which_in(binary, Some(path), cwd).is_ok()),
         None => which::which(binary).is_ok(),
-    };
-    if on_path || !login_shell {
-        return on_path;
+    }
+}
+
+fn plugin_cache_key(agent: crate::plugin::agent_integration::PluginAgent<'_>) -> String {
+    format!(
+        "plugin\0{}\0{}\0{}",
+        agent.plugin, agent.tool, agent.command
+    )
+}
+
+fn plugin_agents_available(
+    agents: &[crate::plugin::agent_integration::PluginAgent<'_>],
+    login_shell: bool,
+    cancel: Option<&tokio_util::sync::CancellationToken>,
+    force: bool,
+) -> HashSet<String> {
+    let mut found = HashSet::new();
+    let mut uncached = Vec::new();
+    if !force {
+        if let Ok(cache) = AGENT_AVAILABILITY.read() {
+            for agent in agents {
+                match cache
+                    .as_ref()
+                    .and_then(|cache| cache.get(&plugin_cache_key(*agent)))
+                {
+                    Some((true, at)) if at.elapsed() < AGENT_AVAILABILITY_TTL => {
+                        found.insert(agent.tool.to_string());
+                    }
+                    Some((false, at)) if at.elapsed() < AGENT_AVAILABILITY_TTL => {}
+                    _ => uncached.push(*agent),
+                }
+            }
+        } else {
+            uncached.extend_from_slice(agents);
+        }
+    } else {
+        uncached.extend_from_slice(agents);
+    }
+    if uncached.is_empty() {
+        return found;
     }
 
-    let mut probe = String::new();
-    for assignment in &words[..assignments] {
-        let (key, value) = assignment.split_once('=').unwrap();
-        probe.push_str(key);
-        probe.push('=');
-        probe.push_str(&shell_words::quote(value));
-        probe.push(' ');
+    let _probe_guard = if let Some(cancel) = cancel {
+        loop {
+            if cancel.is_cancelled() {
+                return found;
+            }
+            match AGENT_PROBE_LOCK.try_lock() {
+                Ok(guard) => break guard,
+                Err(std::sync::TryLockError::Poisoned(error)) => break error.into_inner(),
+                Err(std::sync::TryLockError::WouldBlock) => {
+                    std::thread::sleep(Duration::from_millis(1))
+                }
+            }
+        }
+    } else {
+        AGENT_PROBE_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+    };
+    if force {
+        if let Ok(mut cache) = AGENT_AVAILABILITY.write() {
+            if let Some(cache) = cache.as_mut() {
+                for agent in agents {
+                    cache.remove(&plugin_cache_key(*agent));
+                }
+            }
+        }
+    } else if let Ok(cache) = AGENT_AVAILABILITY.read() {
+        let cached = cache.as_ref();
+        uncached.retain(|agent| {
+            match cached.and_then(|cache| cache.get(&plugin_cache_key(*agent))) {
+                Some((true, at)) if at.elapsed() < AGENT_AVAILABILITY_TTL => {
+                    found.insert(agent.tool.to_string());
+                    false
+                }
+                Some((false, at)) if at.elapsed() < AGENT_AVAILABILITY_TTL => false,
+                _ => true,
+            }
+        });
     }
-    probe.push_str("command -v ");
-    probe.push_str(&shell_words::quote(binary));
-    agent_probe_output(
-        Command::new(crate::session::user_shell()).args(["-lc", &probe]),
-        LOGIN_SHELL_PROBE_TIMEOUT,
-        cancel,
-    )
-    .is_some_and(|output| output.status.success())
+    if uncached.is_empty() {
+        return found;
+    }
+
+    let mut results = Vec::new();
+    let mut needs_shell = Vec::new();
+    for agent in uncached {
+        if cancel.is_some_and(tokio_util::sync::CancellationToken::is_cancelled) {
+            return found;
+        }
+        let Some((words, assignments)) = plugin_command_parts(agent.command) else {
+            results.push((agent, false));
+            continue;
+        };
+        let on_path = plugin_command_on_path(agent.command);
+        if on_path {
+            results.push((agent, true));
+        } else if login_shell {
+            needs_shell.push((agent, words, assignments));
+        } else {
+            results.push((agent, false));
+        }
+    }
+
+    if !needs_shell.is_empty() {
+        let mut script = String::new();
+        for (index, (_, words, assignments)) in needs_shell.iter().enumerate() {
+            script.push_str("( ");
+            for assignment in &words[..*assignments] {
+                let (key, value) = assignment.split_once('=').unwrap();
+                script.push_str(key);
+                script.push('=');
+                script.push_str(&shell_words::quote(value));
+                script.push(' ');
+            }
+            script.push_str("command -v ");
+            script.push_str(&shell_words::quote(&words[*assignments]));
+            script.push_str(" >/dev/null 2>&1 ) && printf '\\nAOE_PLUGIN_OK ");
+            script.push_str(&index.to_string());
+            script.push_str("\\n'; ");
+        }
+        let output = agent_probe_output(
+            Command::new(crate::session::user_shell()).args(["-lc", &script]),
+            LOGIN_SHELL_PROBE_TIMEOUT,
+            cancel,
+        );
+        if cancel.is_some_and(tokio_util::sync::CancellationToken::is_cancelled) {
+            return found;
+        }
+        let shell_found: HashSet<usize> = output
+            .map(|output| {
+                String::from_utf8_lossy(&output.stdout)
+                    .lines()
+                    .filter_map(|line| line.strip_prefix("AOE_PLUGIN_OK "))
+                    .filter_map(|index| index.parse().ok())
+                    .collect()
+            })
+            .unwrap_or_default();
+        for (index, (agent, _, _)) in needs_shell.into_iter().enumerate() {
+            results.push((agent, shell_found.contains(&index)));
+        }
+    }
+
+    if cancel.is_some_and(tokio_util::sync::CancellationToken::is_cancelled) {
+        return found;
+    }
+    if let Ok(mut cache) = AGENT_AVAILABILITY.write() {
+        let map = cache.get_or_insert_with(HashMap::new);
+        let now = std::time::Instant::now();
+        for (agent, available) in &results {
+            map.insert(plugin_cache_key(*agent), (*available, now));
+        }
+    }
+    found.extend(
+        results
+            .into_iter()
+            .filter(|(_, available)| *available)
+            .map(|(agent, _)| agent.tool.to_string()),
+    );
+    found
+}
+
+#[cfg(test)]
+fn plugin_command_available(
+    command: &str,
+    login_shell: bool,
+    cancel: Option<&tokio_util::sync::CancellationToken>,
+) -> bool {
+    let Some((words, assignments)) = plugin_command_parts(command) else {
+        return false;
+    };
+    let Some(binary) = words.get(assignments) else {
+        return false;
+    };
+    let agent = crate::plugin::agent_integration::PluginAgent {
+        plugin: "availability-test",
+        tool: binary,
+        command,
+    };
+    plugin_agents_available(&[agent], login_shell, cancel, false).contains(binary)
 }
 
 fn agent_available_direct(
@@ -2584,15 +2740,32 @@ impl AvailableTools {
     /// Startup's local snapshot. Login shells and executable probes run later.
     pub(crate) fn detect_on_path() -> Self {
         let refs: Vec<_> = crate::agents::AGENTS.iter().collect();
-        Self::from_detected(agent_availability_snapshot(&refs), false, None)
+        let config = crate::session::config::Config::load().ok();
+        let custom_agents = config.as_ref().map(|config| &config.session.custom_agents);
+        Self::from_detected(
+            agent_availability_snapshot(&refs),
+            false,
+            None,
+            false,
+            custom_agents,
+        )
     }
 
     pub fn detect() -> Self {
-        // One batched probe warms the memo for later per-agent callers.
         let agents = crate::agents::AGENTS;
         let refs: Vec<&crate::agents::AgentDef> = agents.iter().collect();
         let found = probe_agents_available(&refs);
-        Self::from_detected(found, true, None)
+        let config = crate::session::config::Config::load().ok();
+        let custom_agents = config.as_ref().map(|config| &config.session.custom_agents);
+        Self::from_detected(found, true, None, false, custom_agents)
+    }
+
+    pub(crate) fn detect_with_custom_agents(
+        custom_agents: &std::collections::HashMap<String, String>,
+    ) -> Self {
+        let refs: Vec<_> = crate::agents::AGENTS.iter().collect();
+        let found = probe_agents_available(&refs);
+        Self::from_detected(found, true, None, false, Some(custom_agents))
     }
 
     pub(crate) fn detect_cancellable(
@@ -2600,51 +2773,77 @@ impl AvailableTools {
         force: bool,
     ) -> Self {
         let refs: Vec<_> = crate::agents::AGENTS.iter().collect();
-        Self::from_detected(
-            probe_agents_available_inner(&refs, Some(cancel), force),
-            true,
-            Some(cancel),
-        )
+        let found = probe_agents_available_inner(&refs, Some(cancel), force);
+        let config = crate::session::config::Config::load().ok();
+        let custom_agents = config.as_ref().map(|config| &config.session.custom_agents);
+        Self::from_detected(found, true, Some(cancel), force, custom_agents)
     }
 
     fn from_detected(
         found: HashSet<String>,
         login_shell: bool,
         cancel: Option<&tokio_util::sync::CancellationToken>,
+        force: bool,
+        custom_agents: Option<&std::collections::HashMap<String, String>>,
     ) -> Self {
         let agents = crate::agents::AGENTS;
         let mut available: Vec<String> = agents
             .iter()
-            .filter(|a| found.contains(a.name))
-            .map(|a| a.name.to_string())
+            .filter(|agent| found.contains(agent.name))
+            .map(|agent| agent.name.to_string())
             .collect();
-
-        // Custom agents always count as available (they may target a wrapper).
-        if let Ok(config) = crate::session::config::Config::load() {
+        let loaded_config = if custom_agents.is_none() {
+            crate::session::config::Config::load().ok()
+        } else {
+            None
+        };
+        if let Some(config) = &loaded_config {
             config.session.warn_custom_agent_issues();
-            let mut custom: Vec<_> = config
-                .session
-                .custom_agents
-                .keys()
-                .filter(|name| !name.is_empty() && !available.iter().any(|n| n == *name))
-                .cloned()
-                .collect();
-            custom.sort();
-            available.extend(custom);
         }
+        let empty_custom_agents = std::collections::HashMap::new();
+        let custom_agents = custom_agents
+            .or_else(|| {
+                loaded_config
+                    .as_ref()
+                    .map(|config| &config.session.custom_agents)
+            })
+            .unwrap_or(&empty_custom_agents);
+        let mut custom: Vec<_> = custom_agents
+            .iter()
+            .filter(|(name, command)| {
+                !name.is_empty()
+                    && !command.trim().is_empty()
+                    && !available.iter().any(|available| available == *name)
+            })
+            .map(|(name, _)| name.clone())
+            .collect();
+        custom.sort();
+        available.extend(custom);
+
         let registry = crate::plugin::registry();
         let plugin_agents = crate::plugin::agent_integration::catalog(
             &registry,
             agents.iter().map(|agent| agent.name),
-            available.iter().map(String::as_str),
+            custom_agents
+                .iter()
+                .filter(|(_, command)| !command.trim().is_empty())
+                .map(|(name, _)| name.as_str()),
         );
-        for agent in plugin_agents {
-            let installed = plugin_command_available(agent.command, login_shell, cancel);
-            if installed {
-                available.push(agent.tool.to_string());
-            }
-        }
-
+        let found_plugins = if login_shell {
+            plugin_agents_available(&plugin_agents, true, cancel, force)
+        } else {
+            plugin_agents
+                .iter()
+                .filter(|agent| plugin_command_on_path(agent.command))
+                .map(|agent| agent.tool.to_string())
+                .collect()
+        };
+        available.extend(
+            plugin_agents
+                .iter()
+                .filter(|agent| found_plugins.contains(agent.tool))
+                .map(|agent| agent.tool.to_string()),
+        );
         Self { available }
     }
 
@@ -2890,10 +3089,13 @@ mod tests {
             .unwrap();
             std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
         }
+        let probe_path = home.path().join("probes");
+        let probes = shell_words::quote(probe_path.to_str().unwrap());
         std::fs::write(
             home.path().join("bin/login-shell"),
             format!(
-                "#!/bin/sh\nexport PATH={}:$PATH\nexec /bin/sh -c \"$2\"\n",
+                "#!/bin/sh\nprintf 'login\\n' >> {}\nexport PATH={}:$PATH\nexec /bin/sh -c \"$2\"\n",
+                probes,
                 login_bin.display()
             ),
         )
@@ -2915,8 +3117,98 @@ mod tests {
                 plugin_command_available(command, true, None) != *expected
             })
             .collect();
+        let batch = [
+            crate::plugin::agent_integration::PluginAgent {
+                plugin: "plugin-a",
+                tool: "session-agent",
+                command: "TOKEN=local login-agent",
+            },
+            crate::plugin::agent_integration::PluginAgent {
+                plugin: "plugin-b",
+                tool: "worker-agent",
+                command: "TOKEN=other login-agent --ignored",
+            },
+        ];
+        std::fs::remove_file(home.path().join("probes")).ok();
+        assert_eq!(
+            plugin_agents_available(&batch, true, None, false),
+            HashSet::from(["session-agent".to_owned(), "worker-agent".to_owned()])
+        );
+        assert_eq!(
+            std::fs::read_to_string(home.path().join("probes"))
+                .unwrap()
+                .lines()
+                .filter(|line| *line == "login")
+                .count(),
+            1,
+            "uncached plugin agents share a single login shell"
+        );
+        assert_eq!(
+            plugin_agents_available(&batch, true, None, false),
+            HashSet::from(["session-agent".to_owned(), "worker-agent".to_owned()])
+        );
+        assert_eq!(
+            std::fs::read_to_string(home.path().join("probes"))
+                .unwrap()
+                .lines()
+                .filter(|line| *line == "login")
+                .count(),
+            1,
+            "cached plugin results avoid another login shell"
+        );
         assert!(!executed.exists(), "discovery must not execute the agent");
         assert!(failures.is_empty(), "{failures:?}");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    #[serial_test::serial]
+    fn plugin_probe_spawn_failure_preserves_path_hits_and_caches_results() {
+        if run_probe_test_in_subprocess() {
+            return;
+        }
+        use std::os::unix::fs::PermissionsExt;
+        let home = tempfile::tempdir().unwrap();
+        let _env = probe_environment(home.path());
+        let memo = AgentAvailabilityGuard::capture();
+        memo.clear();
+        let direct_binary = home.path().join("bin/direct-agent");
+        std::fs::write(&direct_binary, "#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(&direct_binary, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let shell = home.path().join("missing-login-shell");
+        let _shell = crate::session::test_support::EnvGuard::set(&[("SHELL", shell)]);
+        let batch = [
+            crate::plugin::agent_integration::PluginAgent {
+                plugin: "plugin",
+                tool: "direct-agent",
+                command: "direct-agent",
+            },
+            crate::plugin::agent_integration::PluginAgent {
+                plugin: "plugin",
+                tool: "login-agent",
+                command: "login-agent",
+            },
+        ];
+        let expected = HashSet::from(["direct-agent".to_owned()]);
+        assert_eq!(plugin_agents_available(&batch, true, None, false), expected);
+        let direct_key = plugin_cache_key(batch[0]);
+        let shell_key = plugin_cache_key(batch[1]);
+        let cached = || {
+            AGENT_AVAILABILITY
+                .read()
+                .ok()
+                .and_then(|cache| {
+                    let cache = cache.as_ref()?;
+                    Some((*cache.get(&direct_key)?, *cache.get(&shell_key)?))
+                })
+                .expect("probe results cached")
+        };
+        let first_cache = cached();
+        let (direct, shell) = first_cache;
+        assert!(direct.0, "PATH-discovered agent remains available");
+        assert!(!shell.0, "failed shell probe is cached as unavailable");
+        assert_eq!(plugin_agents_available(&batch, true, None, false), expected);
+        assert_eq!(cached(), first_cache, "failed shell probe is not repeated");
     }
 
     #[test]

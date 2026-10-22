@@ -4,7 +4,9 @@ use anyhow::Result;
 
 #[tracing::instrument(target = "cli.agents", skip_all)]
 pub fn run() -> Result<()> {
-    let available = crate::tmux::AvailableTools::detect();
+    let config = crate::session::Config::load_or_warn();
+    let available =
+        crate::tmux::AvailableTools::detect_with_custom_agents(&config.session.custom_agents);
     let available_list = available.available_list();
     let colorize = crate::cli::color_enabled();
     let installed_mark = if colorize {
@@ -34,12 +36,16 @@ pub fn run() -> Result<()> {
             println!("{}", crate::cli::lifecycle_notice_line("      ", &notice));
         }
     }
-    let config = crate::session::Config::load_or_warn();
     let registry = crate::plugin::registry();
     let plugin_agents = crate::plugin::agent_integration::catalog(
         &registry,
         crate::agents::AGENTS.iter().map(|agent| agent.name),
-        config.session.custom_agents.keys().map(String::as_str),
+        config
+            .session
+            .custom_agents
+            .iter()
+            .filter(|(_, command)| !command.trim().is_empty())
+            .map(|(name, _)| name.as_str()),
     );
     for agent in &plugin_agents {
         if available_list

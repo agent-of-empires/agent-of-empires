@@ -1385,7 +1385,11 @@ fn default_tool_for_add<'a>(
         .default_tool
         .as_deref()
         .and_then(|name| {
-            if config.custom_agents.contains_key(name) || available.iter().any(|tool| tool == name)
+            if config
+                .custom_agents
+                .get(name)
+                .is_some_and(|command| !command.trim().is_empty())
+                || available.iter().any(|tool| tool == name)
             {
                 Some(name)
             } else {
@@ -1458,10 +1462,12 @@ fn resolve_named_tool(tool: &str, config: &crate::session::Config) -> Result<Nam
         bail!("--tool requires a non-empty agent name");
     }
 
-    if let Some(command) = config.session.custom_agents.get(name) {
-        if command.trim().is_empty() {
-            bail!("custom agent '{name}' has an empty configured command");
-        }
+    if config
+        .session
+        .custom_agents
+        .get(name)
+        .is_some_and(|command| !command.trim().is_empty())
+    {
         if let Some(detect_as) = config
             .session
             .agent_detect_as
@@ -1478,10 +1484,6 @@ fn resolve_named_tool(tool: &str, config: &crate::session::Config) -> Result<Nam
         }
         return Ok(NamedToolSelection::Custom(name.to_string()));
     }
-
-    if crate::plugin::agent_integration::agent_command(name).is_some() {
-        return Ok(NamedToolSelection::Custom(name.to_string()));
-    }
     if let Some(tool_name) = crate::agents::resolve_tool_name(name) {
         if let Some(agent_def) = crate::agents::get_agent(tool_name) {
             if !crate::tmux::is_agent_available(agent_def) {
@@ -1495,6 +1497,20 @@ fn resolve_named_tool(tool: &str, config: &crate::session::Config) -> Result<Nam
             }
         }
         return Ok(NamedToolSelection::BuiltIn(tool_name.to_string()));
+    }
+
+    if crate::plugin::agent_integration::agent_command(
+        name,
+        config
+            .session
+            .custom_agents
+            .iter()
+            .filter(|(_, command)| !command.trim().is_empty())
+            .map(|(name, _)| name.as_str()),
+    )
+    .is_some()
+    {
+        return Ok(NamedToolSelection::Custom(name.to_string()));
     }
 
     let mut safe_names: Vec<String> = crate::agents::agent_names()
@@ -1551,10 +1567,14 @@ mod tests {
         config
             .custom_agents
             .insert("custom-agent".into(), "custom-command".into());
+        config
+            .custom_agents
+            .insert("blankcustom".into(), "   ".into());
         for (configured, expected) in [
             (Some("plugin-agent"), "plugin-agent"),
             (Some("custom-agent"), "custom-agent"),
             (Some("codex"), "codex"),
+            (Some("blankcustom"), "claude"),
             (Some("unregistered-harness"), "claude"),
             (None, "claude"),
         ] {
@@ -2003,6 +2023,8 @@ mod tests {
                 "codex",
                 "#!/bin/sh\nexit 1\n",
             );
+            let availability = crate::tmux::AgentAvailabilityGuard::capture();
+            availability.clear();
             let project = tempfile::tempdir().unwrap();
             let parent_id = "parent-session-uuid";
             crate::session::Storage::new_unwatched("real")
