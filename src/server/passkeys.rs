@@ -23,7 +23,7 @@ use webauthn_rs::prelude::{
 };
 
 use super::access::norm_host;
-use super::auth::{resolve_client_ip, AuthenticatedSession};
+use super::auth::{resolve_client_ip, AuthenticatedBrowserSession};
 use super::login::{
     argon2_verify, decode_binding_secret, hash_passphrase, issue_session, session_id_from_headers,
 };
@@ -706,10 +706,10 @@ pub struct RegisterStartRequest {
 /// bypass, where the cookie and device binding are validated here instead.
 async fn enrolling_session(
     state: &AppState,
-    session: Option<Extension<AuthenticatedSession>>,
+    session: Option<Extension<AuthenticatedBrowserSession>>,
     headers: &HeaderMap,
 ) -> Option<String> {
-    if let Some(Extension(AuthenticatedSession(id))) = session {
+    if let Some(Extension(AuthenticatedBrowserSession(id))) = session {
         return Some(id);
     }
     let id = session_id_from_headers(headers)?;
@@ -727,7 +727,7 @@ async fn enrolling_session(
 /// POST /api/passkeys/register/start (elevation-gated in the auth middleware)
 pub async fn register_start_handler(
     State(state): State<Arc<AppState>>,
-    session: Option<Extension<AuthenticatedSession>>,
+    session: Option<Extension<AuthenticatedBrowserSession>>,
     headers: HeaderMap,
     body: Option<Json<RegisterStartRequest>>,
 ) -> Response {
@@ -762,7 +762,7 @@ pub struct RegisterFinishRequest {
 /// POST /api/passkeys/register/finish (elevation-gated in the auth middleware)
 pub async fn register_finish_handler(
     State(state): State<Arc<AppState>>,
-    session: Option<Extension<AuthenticatedSession>>,
+    session: Option<Extension<AuthenticatedBrowserSession>>,
     headers: HeaderMap,
     body: Result<Json<RegisterFinishRequest>, axum::extract::rejection::JsonRejection>,
 ) -> Response {
@@ -1264,7 +1264,7 @@ mod tests {
         );
 
         // Login is on but no origin is allowlisted, so even a session cannot enrol.
-        let session = Some(Extension(AuthenticatedSession("s1".into())));
+        let session = Some(Extension(AuthenticatedBrowserSession("s1".into())));
         let res = register_start_handler(State(on.clone()), session, headers.clone(), None).await;
         assert_eq!(res.status(), StatusCode::FORBIDDEN);
 

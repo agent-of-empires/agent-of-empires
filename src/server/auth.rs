@@ -164,7 +164,12 @@ fn normalize_path(path: &str) -> &str {
 /// Whether a path is served to programs, which get a JSON `401` rather than a redirect to the
 /// login page when unauthenticated.
 fn is_machine_endpoint(path: &str) -> bool {
-    path.starts_with("/api/") || path.contains("/ws") || path == "/mcp" || path.starts_with("/mcp/")
+    path.starts_with("/api/") || path.contains("/ws") || is_mcp_path(path)
+}
+
+/// Whether `path` is the daemon's `/mcp` server (vs. the unrelated REST API).
+fn is_mcp_path(path: &str) -> bool {
+    path == "/mcp" || path.starts_with("/mcp/")
 }
 
 /// Whether a request path is exempt from the passphrase session + device-binding check.
@@ -347,6 +352,9 @@ enum TokenSource {
     QueryParam,
     WebSocketProtocol,
     Bearer,
+    /// `X-AoE-Session` plus its matching `HMAC(secret, session_id)` bearer (see
+    /// `session_credential_claim` and `session_is_live`).
+    SessionCredential,
 }
 
 /// Request extension carrying the SHA-256 hash of the bearer token that authenticated this
@@ -357,7 +365,74 @@ pub struct AuthenticatedTokenHash(pub [u8; 32]);
 /// Request extension carrying the login session id used to authenticate the current
 /// request.
 #[derive(Clone, Debug)]
-pub struct AuthenticatedSession(pub String);
+pub struct AuthenticatedBrowserSession(pub String);
+
+/// Request extension carrying the AoE session id that authenticated the current request via
+/// its own `X-AoE-Session` credential. Distinct from [`AuthenticatedBrowserSession`], which
+/// carries a browser's passphrase login session.
+#[derive(Clone, Debug)]
+pub struct AuthenticatedCallerSession(pub String);
+
+/// The `X-AoE-Session` header name carrying the id a session credential claims to be.
+const SESSION_HEADER: &str = "x-aoe-session";
+
+/// The session id `request` claims via `X-AoE-Session`, if its bearer token equals
+/// `HMAC(secret, that session's id)`. Does not check that the session is live; callers must
+/// also check [`session_is_live`].
+///
+/// Kept synchronous and called directly rather than wrapped in an async fn: `Request`'s body is
+/// `Send` but not `Sync`, so an async fn taking `&Request` that also awaits breaks the caller's
+/// future's `Send` bound, which `axum::middleware::from_fn` requires.
+fn session_credential_claim(state: &AppState, request: &Request) -> Option<String> {
+    let secret = state.mcp_session_secret.as_ref()?;
+    let session_id = request
+        .headers()
+        .get(SESSION_HEADER)?
+        .to_str()
+        .ok()?
+        .to_string();
+    let presented = extract_tokens(request)
+        .into_iter()
+        .find(|(_, source)| *source == TokenSource::Bearer)
+        .map(|(value, _)| value)?;
+    secret.verify(&session_id, presented).then_some(session_id)
+}
+
+/// Whether `session_id` names a session that still exists and is neither archived nor trashed.
+async fn session_is_live(state: &AppState, session_id: &str) -> bool {
+    state
+        .instances
+        .read()
+        .await
+        .iter()
+        .any(|inst| inst.id == session_id && !inst.is_archived() && !inst.is_trashed())
+}
+
+/// [`session_credential_claim`], but only for `/mcp`: this credential authenticates that
+/// surface alone, never the REST API or WebSocket routes.
+fn session_credential_claim_for_mcp(state: &AppState, request: &Request) -> Option<String> {
+    if !is_mcp_path(request.uri().path()) {
+        return None;
+    }
+    session_credential_claim(state, request)
+}
+
+/// Attach [`AuthenticatedCallerSession`] to `request` when it carries a live session
+/// credential, regardless of which gate (token, no-auth, or the passphrase wall) already
+/// decided to let the request through. A no-op otherwise.
+///
+/// Takes `&mut Request`, not `&Request`: unlike a shared reference, `&mut Request` is `Send`
+/// without requiring `Request` to be `Sync`, so this can safely await internally.
+async fn attach_caller_session(state: &AppState, request: &mut Request) {
+    let Some(claimed) = session_credential_claim_for_mcp(state, request) else {
+        return;
+    };
+    if session_is_live(state, &claimed).await {
+        request
+            .extensions_mut()
+            .insert(AuthenticatedCallerSession(claimed));
+    }
+}
 
 /// Request extension marking a request whose resolved client IP is loopback (see
 /// `is_local_trusted`).
@@ -380,11 +455,11 @@ fn elevation_verdict(
 /// Shared resolver for handler-side (body-shape) elevation gates.
 pub(crate) async fn handler_elevated(
     state: &AppState,
-    session: Option<&AuthenticatedSession>,
+    session: Option<&AuthenticatedBrowserSession>,
     loopback_trusted: bool,
 ) -> bool {
     let session_elevated = match session {
-        Some(AuthenticatedSession(id)) => Some(state.login_manager.is_elevated(id).await),
+        Some(AuthenticatedBrowserSession(id)) => Some(state.login_manager.is_elevated(id).await),
         None => None,
     };
     elevation_verdict(
@@ -451,7 +526,7 @@ async fn session_valid(
 /// Passphrase login wall used when the token gate is disabled (`--auth=passphrase`).
 async fn run_passphrase_wall(
     state: &AppState,
-    request: Request,
+    mut request: Request,
     client_ip: IpAddr,
     next: Next,
 ) -> Response {
@@ -459,9 +534,13 @@ async fn run_passphrase_wall(
     let method = request.method().clone();
 
     match passphrase_wall_entry_action(&path, client_ip, state.behind_tunnel) {
-        PassphraseWallEntryAction::BypassExempt => return next.run(request).await,
+        PassphraseWallEntryAction::BypassExempt => {
+            attach_caller_session(state, &mut request).await;
+            return next.run(request).await;
+        }
         PassphraseWallEntryAction::BypassLoopback => {
             log_loopback_bypass_passphrase(client_ip, &path);
+            attach_caller_session(state, &mut request).await;
             return next.run(request).await;
         }
         PassphraseWallEntryAction::Continue => {}
@@ -519,10 +598,10 @@ async fn run_passphrase_wall(
             .into_response();
     }
 
-    let mut request = request;
     request
         .extensions_mut()
-        .insert(AuthenticatedSession(session_id.clone()));
+        .insert(AuthenticatedBrowserSession(session_id.clone()));
+    attach_caller_session(state, &mut request).await;
 
     let mut response = next.run(request).await;
 
@@ -564,6 +643,7 @@ pub async fn auth_middleware(
                 TokenSource::QueryParam => "query",
                 TokenSource::Bearer => "bearer",
                 TokenSource::WebSocketProtocol => "ws-proto",
+                TokenSource::SessionCredential => "session-credential",
             })
             .collect();
         let ws_protocols = extract_ws_protocols(&request);
@@ -600,6 +680,7 @@ pub async fn auth_middleware(
         request
             .extensions_mut()
             .insert(AuthenticatedTokenHash([0u8; 32]));
+        attach_caller_session(&state, &mut request).await;
         return next.run(request).await;
     }
 
@@ -654,14 +735,28 @@ pub async fn auth_middleware(
     let mut matched_source = None;
     let mut needs_upgrade = false;
     let mut matched_token_hash: Option<[u8; 32]> = None;
+    let mut caller_session: Option<String> = None;
 
-    for (token_value, source) in extract_tokens(&request) {
-        let (valid, upgrade) = state.token_manager.validate(token_value).await;
-        if valid {
-            matched_source = Some(source);
-            needs_upgrade = upgrade;
-            matched_token_hash = Some(super::push::sha256_token(token_value));
-            break;
+    if let Some(claimed_session_id) = session_credential_claim_for_mcp(&state, &request) {
+        if session_is_live(&state, &claimed_session_id).await {
+            matched_source = Some(TokenSource::SessionCredential);
+            matched_token_hash = extract_tokens(&request)
+                .into_iter()
+                .find(|(_, source)| *source == TokenSource::Bearer)
+                .map(|(value, _)| super::push::sha256_token(value));
+            caller_session = Some(claimed_session_id);
+        }
+    }
+
+    if matched_source.is_none() {
+        for (token_value, source) in extract_tokens(&request) {
+            let (valid, upgrade) = state.token_manager.validate(token_value).await;
+            if valid {
+                matched_source = Some(source);
+                needs_upgrade = upgrade;
+                matched_token_hash = Some(super::push::sha256_token(token_value));
+                break;
+            }
         }
     }
 
@@ -723,6 +818,11 @@ pub async fn auth_middleware(
         request
             .extensions_mut()
             .insert(AuthenticatedTokenHash(hash));
+    }
+    if let Some(session_id) = caller_session {
+        request
+            .extensions_mut()
+            .insert(AuthenticatedCallerSession(session_id));
     }
     let path = request.uri().path().to_string();
     let should_attach_token =
@@ -823,7 +923,8 @@ async fn handle_session_authenticated(
 
     request
         .extensions_mut()
-        .insert(AuthenticatedSession(session_id.clone()));
+        .insert(AuthenticatedBrowserSession(session_id.clone()));
+    attach_caller_session(state, &mut request).await;
 
     let mut response = next.run(request).await;
 
@@ -1360,5 +1461,49 @@ mod tests {
                 assert_eq!(get(api).await, StatusCode::UNAUTHORIZED, "{token:?} {api}");
             }
         }
+    }
+
+    /// A session's own `/mcp` credential is scoped to `/mcp`; it must not also authenticate
+    /// unrelated REST API routes, which are a much larger surface than the MCP tool set.
+    #[tokio::test]
+    async fn session_credential_does_not_authenticate_non_mcp_routes() {
+        use crate::server::session_credential::McpSessionSecret;
+        use crate::session::Instance;
+        use tower::ServiceExt;
+
+        let inst = Instance::new("caller", "/repo");
+        let id = inst.id.clone();
+        let mut state = crate::server::test_support::build_test_app_state_with_policy(
+            vec![inst],
+            vec!["localhost".to_string()],
+            Vec::new(),
+            Some("daemon-token".to_string()),
+        );
+        let dir = tempfile::tempdir().expect("tempdir");
+        let secret = McpSessionSecret::load_or_generate(&dir.path().join("mcp_session_secret"))
+            .expect("load_or_generate");
+        let bearer = secret.credential_for(&id);
+        Arc::get_mut(&mut state)
+            .expect("unique test state")
+            .mcp_session_secret = Some(Arc::new(secret));
+        let app = crate::server::test_support::build_router_for_test(state);
+
+        let mut req = Request::builder()
+            .uri("/api/sessions")
+            .header("host", "localhost")
+            .header("authorization", format!("Bearer {bearer}"))
+            .header("x-aoe-session", &id)
+            .body(axum::body::Body::empty())
+            .unwrap();
+        req.extensions_mut().insert(ConnectInfo(
+            "203.0.113.7:5555".parse::<SocketAddr>().unwrap(),
+        ));
+        let status = app.oneshot(req).await.unwrap().status();
+
+        assert_eq!(
+            status,
+            StatusCode::UNAUTHORIZED,
+            "a valid /mcp session credential must not authenticate /api/sessions"
+        );
     }
 }
