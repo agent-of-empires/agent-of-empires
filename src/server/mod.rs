@@ -30,6 +30,7 @@ pub(crate) mod router;
 #[cfg(target_os = "linux")]
 pub(crate) mod runtime_uds;
 pub(crate) mod runtime_ws;
+pub(crate) mod sandbox_login;
 mod secure_store;
 pub(crate) mod serve_snapshot;
 pub(crate) mod session_identity;

@@ -328,6 +328,7 @@ impl PurgeTransaction {
             } else if !owns {
                 commit = Some((CompletionGate::Superseded, Some(instances[index].clone())));
             } else {
+                crate::session::forget_before_start_resolution(&instances[index].id);
                 instances.remove(index);
                 commit = Some((CompletionGate::Proceed, None));
             }
@@ -437,6 +438,7 @@ impl PurgeTransaction {
             } else if !owns {
                 commit = Some((CompletionGate::Superseded, Some(instances[index].clone())));
             } else {
+                crate::session::forget_before_start_resolution(&instances[index].id);
                 instances.remove(index);
                 commit = Some((CompletionGate::Proceed, None));
             }

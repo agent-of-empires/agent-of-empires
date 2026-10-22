@@ -1305,6 +1305,12 @@ pub async fn start_session(
             if let Some(blocked) = blocked {
                 return crate::server::api::start_blocked_response(blocked);
             }
+            if let Some(login) = e.downcast_ref::<crate::session::SandboxLoginRequired>() {
+                return crate::server::api::sandbox_login_required_response(login);
+            }
+            if let Some(unsupported) = e.downcast_ref::<crate::session::SandboxLoginUnsupported>() {
+                return crate::server::api::sandbox_login_unsupported_response(unsupported);
+            }
             api_error(StatusCode::INTERNAL_SERVER_ERROR, "restart_failed", msg)
         }
         Err(e) => {

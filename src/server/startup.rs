@@ -112,6 +112,16 @@ async fn run_shutdown_sequence<R, F>(
     }
 }
 
+/// The daemon's profile and every session, whose shared credential files may have login
+/// helpers.
+async fn login_helper_scopes(state: &AppState) -> Vec<super::sandbox_login::LoginScope> {
+    use super::sandbox_login::LoginScope;
+    let instances = state.instances.read().await;
+    std::iter::once(LoginScope::profile(state.profile.clone()))
+        .chain(instances.iter().flat_map(LoginScope::of_session))
+        .collect()
+}
+
 /// Raise the soft `RLIMIT_NOFILE` so the server can sustain many WS terminals at once.
 #[cfg(unix)]
 pub(super) fn raise_fd_limit() {
@@ -895,6 +905,15 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
 
     // Push-notification consumer.
     push::spawn_consumer(state.clone());
+    push::spawn_login_required_consumer(state.clone());
+    tokio::spawn({
+        let profile = state.profile.clone();
+        let scopes = login_helper_scopes(&state).await;
+        async move {
+            super::sandbox_login::log_login_status(profile).await;
+            super::sandbox_login::sweep_stale_login_helpers(scopes).await;
+        }
+    });
 
     // Per-session dispatcher callback consumer.
     callback::spawn_consumer(state.clone());

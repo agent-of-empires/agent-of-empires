@@ -20,22 +20,14 @@ use super::acp::validate_attachments;
 use super::read_only_block;
 use crate::acp::protocol::PromptAttachmentUpload;
 use crate::daemon::PromptAttachmentRef;
-use crate::server::session_service::EditQueuedOutcome;
+use crate::server::session_service::{
+    EditQueuedOutcome, QueueRoom, MAX_QUEUED_PROMPTS_PER_SESSION, MAX_QUEUED_TEXT_BYTES,
+};
 use crate::server::AppState;
 
 /// Cap on total queued-attachment bytes buffered per session: enough for
 /// several image follow-ups while bounding what an undrained queue holds.
 const MAX_QUEUED_ATTACHMENT_BYTES_PER_SESSION: u64 = 64 * 1024 * 1024;
-
-/// Cap on queue depth per session. The queue lives on the `Instance` and every
-/// mutation rewrites the whole profile session file, so depth costs disk I/O on
-/// each enqueue rather than just memory.
-const MAX_QUEUED_PROMPTS_PER_SESSION: usize = 100;
-
-/// Cap on a single queued prompt's text. Unlike `/acp/prompt`, which streams
-/// straight to the agent, this text is persisted and rewritten on every
-/// subsequent queue mutation, so 256 KiB bounds that rewrite.
-const MAX_QUEUED_TEXT_BYTES: usize = 256 * 1024;
 
 #[derive(Debug, Deserialize)]
 pub struct EnqueueRequest {
@@ -82,16 +74,6 @@ pub async fn queue_enqueue(
     if req.text.trim().is_empty() && req.attachments.is_empty() {
         return (StatusCode::BAD_REQUEST, "empty prompt").into_response();
     }
-    if req.text.len() > MAX_QUEUED_TEXT_BYTES {
-        return (
-            StatusCode::PAYLOAD_TOO_LARGE,
-            format!(
-                "queued prompt text exceeds the {} KiB limit",
-                MAX_QUEUED_TEXT_BYTES / 1024
-            ),
-        )
-            .into_response();
-    }
     // Re-enqueuing an existing id rewrites that row's text and replaces its
     // blobs, so it is the same kind of mutation `edit_queued_prompt` and
     // `remove_queued_prompt` serialize against: landing inside a drain's
@@ -100,17 +82,13 @@ pub async fn queue_enqueue(
     // `buffer_and_enqueue`, which the prompt endpoint reaches already holding
     // the guard and which is not reentrant.
     let _submission = state.session_service.prompt_submission(&id).await;
-    // Depth cap. Re-enqueuing an existing id replaces that row, so it must not
-    // count against a full queue.
-    {
-        let queue = state.session_service.queued_prompts_snapshot(&id).await;
-        if queue.len() >= MAX_QUEUED_PROMPTS_PER_SESSION && !queue.iter().any(|q| q.id == req.id) {
-            return (
-                StatusCode::TOO_MANY_REQUESTS,
-                format!("queue is full ({MAX_QUEUED_PROMPTS_PER_SESSION} prompts)"),
-            )
-                .into_response();
-        }
+    if let Some((status, msg)) = queue_refusal(
+        state
+            .session_service
+            .check_queue_room(&id, &req.id, &req.text)
+            .await,
+    ) {
+        return (status, msg).into_response();
     }
 
     // Decode, validate and capability-gate the attachments exactly as the live
@@ -135,6 +113,25 @@ pub async fn queue_enqueue(
     }
 }
 
+/// The refusal for a queue that cannot take a prompt, `None` when it can. The one mapping
+/// every enqueue path answers with.
+pub(crate) fn queue_refusal(room: QueueRoom) -> Option<(StatusCode, String)> {
+    match room {
+        QueueRoom::Available => None,
+        QueueRoom::TextTooLarge => Some((
+            StatusCode::PAYLOAD_TOO_LARGE,
+            format!(
+                "queued prompt text exceeds the {} KiB limit",
+                MAX_QUEUED_TEXT_BYTES / 1024
+            ),
+        )),
+        QueueRoom::Full => Some((
+            StatusCode::TOO_MANY_REQUESTS,
+            format!("queue is full ({MAX_QUEUED_PROMPTS_PER_SESSION} prompts)"),
+        )),
+    }
+}
+
 /// Buffer already-validated attachment blobs under `prompt_id` and append the
 /// prompt to the session's server-owned queue.
 ///
@@ -150,6 +147,16 @@ pub(super) async fn buffer_and_enqueue(
     origin_device: Option<String>,
     origin_plugin: Option<String>,
 ) -> Result<crate::daemon::QueuedPromptEntry, (StatusCode, String)> {
+    // Before any blob is buffered. The caller holds the session's prompt-submission guard, so
+    // the room found here is still there at the enqueue below.
+    if let Some(refusal) = queue_refusal(
+        state
+            .session_service
+            .check_queue_room(id, prompt_id, &text)
+            .await,
+    ) {
+        return Err(refusal);
+    }
     // Per-session buffer cap, so an undrained queue cannot grow without bound.
     // Re-enqueuing the same id replaces its blobs, so subtract what this prompt
     // already holds before checking headroom.

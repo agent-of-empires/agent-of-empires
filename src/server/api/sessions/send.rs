@@ -29,6 +29,8 @@ pub(crate) enum SendKeysError {
     Transient(Status),
     StructuredView,
     Blocked(crate::session::StartBlocked),
+    /// The revive needs the sandbox login first; nothing queues the message.
+    LoginRequired(crate::session::SandboxLoginRequired),
     Gone,
     Tmux(anyhow::Error),
     Internal,
@@ -87,14 +89,20 @@ pub(crate) async fn send_terminal_message(
                         EnsureReadyError::Transient(s) => SendKeysError::Transient(s),
                         EnsureReadyError::StructuredView => SendKeysError::StructuredView,
                         EnsureReadyError::Blocked(b) => SendKeysError::Blocked(b),
-                        EnsureReadyError::Tmux(e) => SendKeysError::Tmux(e),
+                        EnsureReadyError::Tmux(e) => {
+                            match e.downcast::<crate::session::SandboxLoginRequired>() {
+                                Ok(blocked) => SendKeysError::LoginRequired(blocked),
+                                Err(e) => SendKeysError::Tmux(e),
+                            }
+                        }
                     };
                     // Tagged AlreadyAlive because ensure_pane_ready did not
                     // mutate user-visible state here, keeping the outer
                     // `did_work` flag false. `EnsureReadyError::Tmux` covers
                     // both an unmutated pre-cascade failure and a committed
-                    // post-resume-path one, so its outer arm syncs
-                    // unconditionally; the others bail before any mutation.
+                    // post-resume-path one, so its outer arm (and the login
+                    // refusal's, a refused launch) syncs unconditionally; the
+                    // others bail before any mutation.
                     return Err(Box::new((
                         inst_owned,
                         EnsureReadyOutcome::AlreadyAlive,
@@ -210,10 +218,16 @@ pub(crate) async fn send_terminal_message(
                 // `Status::Starting` on a broken session. Tmux Err is the
                 // catch-all for both an unmutated pre-cascade failure and a
                 // post-resume-path one whose durable state must be copied
-                // back from the clone.
-                SendKeysError::Tmux(e) => {
-                    tracing::error!(target: "http.api.sessions", "send_message: tmux error for {id}: {e}");
-                    let msg = e.to_string();
+                // back from the clone. A login refusal is a failed launch too.
+                SendKeysError::Tmux(_) | SendKeysError::LoginRequired(_) => {
+                    let msg = match &send_err {
+                        SendKeysError::Tmux(e) => {
+                            tracing::error!(target: "http.api.sessions", "send_message: tmux error for {id}: {e}");
+                            e.to_string()
+                        }
+                        SendKeysError::LoginRequired(blocked) => blocked.to_string(),
+                        _ => unreachable!("matched above"),
+                    };
                     let mut instances = service.instances.write().await;
                     if let Some(i) = instances.iter_mut().find(|i| i.id == id) {
                         if sync_live_after_restart(status_tx, i, &sync_base, &started) {
@@ -307,6 +321,9 @@ pub async fn send_message(
         )
             .into_response(),
         Err(SendKeysError::Blocked(blocked)) => crate::server::api::start_blocked_response(blocked),
+        Err(SendKeysError::LoginRequired(blocked)) => {
+            crate::server::api::sandbox_login_required_response(&blocked)
+        }
         Err(SendKeysError::Tmux(_)) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({"error": "tmux_error"})),

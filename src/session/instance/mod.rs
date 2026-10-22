@@ -30,6 +30,7 @@ use crate::session::capture::{
 };
 mod accessors;
 mod container;
+pub(crate) use container::{forget_before_start_resolution, BeforeStartHookError};
 mod execution;
 pub(crate) use execution::{ActiveExecution, CaptureContext, ConversationKey, ConversationState};
 pub use execution::{
@@ -66,7 +67,10 @@ pub(crate) const SESSION_IDENTITY_EXTENSION: &str =
     include_str!("../../../assets/session/aoe-session-id.js");
 
 pub(crate) use accessors::resolved_agent_for;
-pub use flags::{is_valid_session_color, SessionBucket, StartBlocked, SESSION_COLORS};
+pub use flags::{
+    is_valid_session_color, SandboxLoginRequired, SandboxLoginUnsupported, SessionBucket,
+    StartBlocked, SESSION_COLORS,
+};
 #[cfg(test)]
 pub(crate) use identity_sidecar::FAIL_PI_PATH_WRITES;
 pub(crate) use lifecycle::NEWER_GENERATION_BUSY_REASON;
@@ -367,6 +371,15 @@ pub struct Instance {
     /// Values minted by `host_hooks.before_session`; may be secrets, so never persisted.
     #[serde(skip)]
     pending_host_env: Vec<(String, String)>,
+    /// What the sandbox login admission of the launch in progress ran with (the target agent
+    /// and the request's environment), so the come-up gates on the same launch. May hold a
+    /// secret; never persisted, never printed.
+    #[serde(skip)]
+    launch_admission: Option<container::LaunchAdmission>,
+    /// The come-up's `before_start` environment was already resolved, ahead of the
+    /// destructive steps of this launch: the come-up itself does not mint again.
+    #[serde(skip)]
+    before_start_minted_for_launch: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) capture_started_at: Option<std::time::SystemTime>,
     #[serde(skip)]

@@ -136,6 +136,13 @@ impl Instance {
         if self.is_structured() {
             return Ok(StartOutcome::Fresh);
         }
+        if restart && self.is_sandboxed() {
+            // A `before_start` hook the sandbox login admission needs runs here, before the
+            // title lock and lifecycle flock are taken (hooks may call `aoe` on this session)
+            // and before anything is stopped or discarded: the checks below then decide on
+            // its real environment, and a hook failure is its own error with nothing touched.
+            self.resolve_before_start_for_restart()?;
+        }
         let profile = self.effective_profile();
         let storage = crate::session::storage::Storage::new(&profile, self.resolve_file_watch())
             .context("failed to open lifecycle lock storage")?;
@@ -164,6 +171,20 @@ impl Instance {
             Some(Status::Starting),
         )?;
         if restart {
+            // Refused before the poller stops or the old container is discarded, so a launch
+            // that cannot start leaves the running agent and its container alone. The
+            // pre-launch hooks never run for it; the gate in them still covers fresh starts.
+            // No host hook runs here, under the title lock and lifecycle flock. The hook the
+            // admission needs was resolved before the locks were taken (see the top of this
+            // function), and this re-checks on what the session holds right now, strictly: a
+            // resolution a concurrent come-up consumed, or that expired while this restart
+            // waited for the locks, refuses the restart here, with nothing stopped or
+            // discarded, instead of deferring to an admission that runs after the old agent is
+            // gone.
+            if let Err(error) = self.ensure_sandbox_launchable_strict() {
+                self.fail_reserved_launch(&storage, &error, false);
+                return Err(error);
+            }
             self.stop_and_flush_poller_lifecycle_locked();
             self.capture_omp_before_restart(&profile);
         }

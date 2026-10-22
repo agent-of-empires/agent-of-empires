@@ -50,6 +50,78 @@ impl StartBlocked {
     }
 }
 
+/// A sandbox launch refused in `separate_login` mode while the shared credential its agent
+/// needs holds none. `tool` is the session's tool, which `aoe sandbox login --tool` takes;
+/// `credential` is the shared file the launch waits for. `profile` is the session's profile
+/// and `command` its own command for the tool: each is set only when the recovery needs it,
+/// `profile` when it is not the default one (the CLI runs under the default profile unless
+/// `-p` says otherwise) and `command` when `--tool` alone would log in another file than the
+/// one the launch waits for and `--command` with it reaches that file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SandboxLoginRequired {
+    pub tool: String,
+    pub credential: std::path::PathBuf,
+    pub profile: Option<String>,
+    pub command: Option<String>,
+}
+
+impl SandboxLoginRequired {
+    /// Stable machine-readable code for API error bodies.
+    pub const CODE: &'static str = "sandbox_login_required";
+
+    /// The `aoe sandbox login` invocation that logs the launch's file in, quoted for a shell.
+    /// A value starting with `-` is joined to its flag (`--tool=-x`), which clap would
+    /// otherwise read as a flag of its own.
+    pub fn login_command(&self) -> String {
+        fn flag(line: &mut String, short: Option<&str>, long: &str, value: &str) {
+            let quoted = shell_words::quote(value);
+            match short {
+                Some(short) if !value.starts_with('-') => {
+                    line.push_str(&format!(" {short} {quoted}"));
+                }
+                _ if value.starts_with('-') => line.push_str(&format!(" {long}={quoted}")),
+                _ => line.push_str(&format!(" {long} {quoted}")),
+            }
+        }
+        let mut line = String::from("aoe sandbox login");
+        if let Some(profile) = &self.profile {
+            flag(&mut line, Some("-p"), "--profile", profile);
+        }
+        flag(&mut line, None, "--tool", &self.tool);
+        if let Some(command) = &self.command {
+            flag(&mut line, None, "--command", command);
+        }
+        line
+    }
+}
+
+impl std::fmt::Display for SandboxLoginRequired {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "sandbox login required for {}: run `{}`",
+            self.tool,
+            self.login_command()
+        )
+    }
+}
+
+impl std::error::Error for SandboxLoginRequired {}
+
+/// A sandbox launch refused in `separate_login` mode because the active container runtime
+/// cannot run the sandbox login helper, while the launch needs the login. Nothing can
+/// satisfy the login there, so the launch fails at once instead of waiting for it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, thiserror::Error)]
+#[error(
+    "sandbox.shared_credential is separate_login, which is not supported with Apple Container; use host_seed or Docker/Podman"
+)]
+pub struct SandboxLoginUnsupported;
+
+impl SandboxLoginUnsupported {
+    /// Stable machine-readable code for API error bodies.
+    pub const CODE: &'static str = "sandbox_login_unsupported";
+}
+
 impl Instance {
     /// Archived and trashed sessions must be unarchived or restored before any
     /// path starts or resumes their agent. Snooze is not a block: it expires on its own.
@@ -100,6 +172,7 @@ impl Instance {
     /// Mark the session archived. Archived sessions sink to the bottom of the Attention sort and
     /// render in italic+dim style, but remain visible.
     pub fn archive(&mut self) {
+        super::forget_before_start_resolution(&self.id);
         self.archived_at = Some(Utc::now());
         self.favorited_at = None;
         self.snoozed_until = None;
@@ -129,6 +202,7 @@ impl Instance {
     /// Soft-delete the session into the trash bucket. Stops the live session (handled by the
     /// caller.
     pub fn trash(&mut self) {
+        super::forget_before_start_resolution(&self.id);
         if self.trashed_at.is_none() {
             self.trashed_at = Some(Utc::now());
             self.trash_lifecycle_id = Some(Uuid::new_v4().to_string());

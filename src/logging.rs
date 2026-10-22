@@ -113,6 +113,7 @@ pub const DEFAULT_TARGET_ROOTS: &[&str] = &[
     "sound",
     "telemetry",
     "smart_rename",
+    "push",
 ];
 
 pub const KNOWN_SUB_TARGETS: &[&str] = &[
