@@ -6,6 +6,10 @@ import { groupOptions, optionLabel, type GroupOption } from "./groupOptions";
 
 const LIST_MAX = 288;
 
+const keyOf = (option: GroupOption) => (option.kind === "group" ? `group:${option.group.path}` : "create");
+// Stable, so React calls it once each time a row becomes the highlighted one.
+const reveal = (row: HTMLLIElement | null) => row?.scrollIntoView?.({ block: "nearest" });
+
 /** The wizard's Group field: free text with a themed list of the profile's groups. */
 export function GroupCombobox({
   id,
@@ -21,9 +25,10 @@ export function GroupCombobox({
   const listId = useId();
   const inputRef = useRef<HTMLInputElement>(null);
   const [open, setOpen] = useState(false);
-  const [highlight, setHighlight] = useState(-1);
+  // By option identity, so groups arriving after typing don't move it onto another row.
+  const [highlight, setHighlight] = useState<string | null>(null);
   const [placement, setPlacement] = useState<{ up: boolean; maxHeight: number }>({ up: true, maxHeight: LIST_MAX });
-  const { options } = groupOptions(groups, value);
+  const { options, highlight: defaultHighlight } = groupOptions(groups, value);
 
   // Opens upward unless there is room below inside the wizard's scroll area, and never
   // taller than the room it opens into, so the sheet can't clip it.
@@ -38,7 +43,7 @@ export function GroupCombobox({
     const below = bottom - field.bottom - 8;
     const above = field.top - area.top - 8;
     const up = below < Math.min(LIST_MAX, above);
-    setPlacement({ up, maxHeight: Math.max(96, Math.min(LIST_MAX, up ? above : below)) });
+    setPlacement({ up, maxHeight: Math.max(0, Math.min(LIST_MAX, up ? above : below)) });
   }, []);
 
   useEffect(() => {
@@ -55,13 +60,15 @@ export function GroupCombobox({
 
   const show = (next: string) => {
     setOpen(true);
-    setHighlight(groupOptions(groups, next).highlight);
+    const { options: nextOptions, highlight: i } = groupOptions(groups, next);
+    setHighlight(i >= 0 ? keyOf(nextOptions[i]!) : null);
   };
   const pick = (option: GroupOption) => {
     if (option.kind === "group") onChange(option.group.path);
     setOpen(false);
   };
-  const active = open && highlight >= 0 && highlight < options.length ? highlight : -1;
+  const kept = highlight === null ? -1 : options.findIndex((o) => keyOf(o) === highlight);
+  const active = !open ? -1 : highlight === null ? -1 : kept >= 0 ? kept : defaultHighlight;
   const optionId = (i: number) => `${listId}-option-${i}`;
   const noGroups = groups.length === 0;
 
@@ -90,10 +97,13 @@ export function GroupCombobox({
           if (e.key === "ArrowDown" || e.key === "ArrowUp") {
             e.preventDefault();
             if (!open) return show(value);
+            if (options.length === 0) return;
             const step = e.key === "ArrowDown" ? 1 : -1;
-            setHighlight((i) =>
-              Math.min(Math.max((i < 0 && step < 0 ? options.length : i) + step, 0), options.length - 1),
+            const next = Math.min(
+              Math.max((active < 0 && step < 0 ? options.length : active) + step, 0),
+              options.length - 1,
             );
+            setHighlight(keyOf(options[next]!));
           } else if (e.key === "Enter" && open) {
             e.preventDefault();
             if (active >= 0) pick(options[active]!);
@@ -117,12 +127,13 @@ export function GroupCombobox({
           <ul id={listId} role="listbox" aria-label="Groups" className="min-h-0 flex-1 overflow-y-auto">
             {options.map((option, i) => (
               <li
-                key={option.kind === "group" ? option.group.path : "create"}
+                key={keyOf(option)}
+                ref={i === active ? reveal : undefined}
                 id={optionId(i)}
                 role="option"
                 aria-label={optionLabel(option)}
                 aria-selected={i === active}
-                onMouseEnter={() => setHighlight(i)}
+                onMouseEnter={() => setHighlight(keyOf(option))}
                 // Picking on mousedown keeps focus, so blur can't close the list first.
                 onMouseDown={(e) => {
                   e.preventDefault();

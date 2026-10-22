@@ -444,8 +444,48 @@ test.describe("Group field", () => {
     await expect(w).toBeVisible();
   });
 
+  test("in a list taller than the popup, the highlighted row stays in view", async ({ page }) => {
+    const many = Array.from({ length: 20 }, (_, i) => ({
+      path: `team/g${String(i + 1).padStart(2, "0")}`,
+      session_count: 1,
+    }));
+    await startWizard(page, { groups: many });
+    const w = wizard(page);
+    const field = w.getByRole("combobox", { name: "Group" });
+    await field.click();
+    await field.fill("team/");
+    const list = w.getByRole("listbox", { name: "Groups" });
+    const inView = async (name: string) => {
+      const row = (await w.getByRole("option", { name }).boundingBox())!;
+      const box = (await list.boundingBox())!;
+      return row.y >= box.y - 1 && row.y + row.height <= box.y + box.height + 1;
+    };
+    // The default create row is last, past the popup's height.
+    await expect(w.getByRole("option", { name: 'Create group "team/"' })).toHaveAttribute("aria-selected", "true");
+    await expect.poll(() => inView('Create group "team/"')).toBe(true);
+    for (let i = 0; i < 20; i++) await page.keyboard.press("ArrowUp");
+    await expect(w.getByRole("option", { name: "team/g01 · 1 session" })).toHaveAttribute("aria-selected", "true");
+    await expect.poll(() => inView("team/g01 · 1 session")).toBe(true);
+  });
+
   test.describe("at 375px", () => {
     test.use({ viewport: { width: 375, height: 812 } });
+
+    test("with the keyboard up, the list fits the room left", async ({ page }) => {
+      await startWizard(page, { groups: GROUPS });
+      const w = wizard(page);
+      const field = w.getByRole("combobox", { name: "Group" });
+      // A short viewport stands in for the on-screen keyboard, leaving under 96px on either side.
+      await page.setViewportSize({ width: 375, height: 260 });
+      await field.evaluate((el) => el.scrollIntoView({ block: "start" }));
+      await field.click();
+      const popup = w.getByTestId("group-combobox-popup");
+      await expect(popup).toBeVisible();
+      const popupBox = (await popup.boundingBox())!;
+      const areaBox = (await w.locator("[data-wizard-scroll]").boundingBox())!;
+      expect(popupBox.y).toBeGreaterThanOrEqual(areaBox.y - 1);
+      expect(popupBox.y + popupBox.height).toBeLessThanOrEqual(Math.min(areaBox.y + areaBox.height, 260) + 1);
+    });
 
     test("the list opens upward inside the sheet, with 44px rows", async ({ page }) => {
       await startWizard(page, { groups: GROUPS });

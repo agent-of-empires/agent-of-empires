@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 
 import { useState } from "react";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 
 import type { GroupInfo } from "../../../lib/types";
@@ -110,6 +110,36 @@ describe("GroupCombobox", () => {
     expect(activeOption()).toBe("client/api · 2 sessions");
     key("Enter");
     expect(value()).toBe("client/api");
+  });
+
+  // The wizard renders before `/api/groups` answers, so groups can arrive after typing.
+  it.each([
+    ["a new name", "Stu", 'Create group "Stu"', "Stu"],
+    ["a name that turns out to exist", "studio", "studio · 2 sessions", "studio"],
+  ])("groups arriving after typing %s keep Enter on the right row", (_label, typed, highlighted, picked) => {
+    const { rerender } = render(<Harness groups={[]} />);
+    fireEvent.focus(input());
+    type(typed);
+    rerender(<Harness groups={GROUPS} />);
+    expect(activeOption()).toBe(highlighted);
+    key("Enter");
+    expect(value()).toBe(picked);
+  });
+
+  it("scrolls the highlighted row into view", () => {
+    const scrolled: (string | null)[] = [];
+    const spy = vi.spyOn(Element.prototype, "scrollIntoView").mockImplementation(function (this: Element) {
+      scrolled.push(this.getAttribute("aria-label"));
+    });
+    try {
+      render(<Harness />);
+      fireEvent.focus(input());
+      type("client/");
+      key("ArrowUp");
+      expect(scrolled.at(-1)).toBe("client/web · 1 session");
+    } finally {
+      spy.mockRestore();
+    }
   });
 
   it("a click picks a group", () => {
