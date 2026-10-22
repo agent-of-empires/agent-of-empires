@@ -257,14 +257,21 @@ fn web_projection(theme: &Theme, appearance: ThemeAppearance) -> CssVarProjectio
     css.insert("--color-text-secondary".into(), hex(theme.hint));
     css.insert("--color-text-muted".into(), hex(theme.hint));
     css.insert("--color-text-dim".into(), hex(theme.dimmed));
-    // Dimmed lifted to body-text AA on surface-900, -850 and the modal surface-800,
-    // for small text that cannot use the raw slot.
+    // Dimmed lifted to body-text AA on surface-900, -850, the modal surface-800, the
+    // code-block surface-950 and the startup error banner's tint, for small text that
+    // cannot use the raw slot.
     css.insert(
         "--color-text-subtle".into(),
         hex(lift_until(
             theme.dimmed,
             bg,
-            &[bg, elevated_1, elevated_2],
+            &[
+                bg,
+                elevated_1,
+                elevated_2,
+                deeper,
+                composite(theme.error, bg, 0.1),
+            ],
             TEXT_CONTRAST_RATIO,
         )),
     );
@@ -626,13 +633,29 @@ mod tests {
                     );
                 }
             }
-            // Install errors sit on the startup error banner's tint.
+            // The startup error banner's text, on its tint and on its code and log blocks.
             let tint = composite(var("--color-status-error"), var("--color-surface-900"), 0.1);
-            let ratio = contrast_ratio(var("--color-status-error-text"), tint);
-            assert!(
-                ratio >= TEXT_CONTRAST_RATIO,
-                "{name}: --color-status-error-text on bg-status-error/10 is {ratio:.2}, below body-text AA"
-            );
+            for (fg, surface, label) in [
+                ("--color-text-primary", tint, "bg-status-error/10"),
+                ("--color-text-subtle", tint, "bg-status-error/10"),
+                ("--color-status-error-text", tint, "bg-status-error/10"),
+                (
+                    "--color-text-primary",
+                    var("--color-surface-950"),
+                    "surface-950",
+                ),
+                (
+                    "--color-text-subtle",
+                    var("--color-surface-950"),
+                    "surface-950",
+                ),
+            ] {
+                let ratio = contrast_ratio(var(fg), surface);
+                assert!(
+                    ratio >= TEXT_CONTRAST_RATIO,
+                    "{name}: {fg} on {label} is {ratio:.2}, below body-text AA"
+                );
+            }
             // Dialog hints, such as the onboarding footer and the tour's Skip button, sit on the
             // modal surface.
             let subtle_on_modal =

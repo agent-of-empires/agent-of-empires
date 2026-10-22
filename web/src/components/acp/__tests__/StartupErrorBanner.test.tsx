@@ -246,6 +246,47 @@ describe("StartupErrorBanner primary action", () => {
     expect(classes.filter((c) => /^hover:(bg|text)-/.test(c))).toEqual([]);
     expect(classes).not.toContain("text-white");
   });
+
+  // resolved.rs checks text-primary, text-subtle and status-error-text on the tint and on
+  // surface-950; the raw secondary, dim and running colours fail there in light themes.
+  it.each([
+    [
+      "a failed install with Details and a truncated log open",
+      () =>
+        stubApi({
+          info: json(claude({ install_allowed: true })),
+          install: json({
+            success: false,
+            exit_code: 243,
+            stdout: "",
+            stderr: "npm ERR! EACCES",
+            recovered_sessions: 0,
+          }),
+          log: json({ exists: true, tail: "tail content", truncated: true }),
+        }),
+      async (view: ReturnType<typeof renderBanner>) => {
+        fireEvent.click(await view.findByTestId("startup-error-banner-install"));
+        await view.findByText("npm ERR! EACCES");
+        fireEvent.click(view.getByTestId("startup-error-banner-details"));
+        fireEvent.click(view.getByTestId("acp-agent-log-toggle"));
+        await view.findByText("Log is large; showing the tail.");
+      },
+    ],
+    [
+      "a sandboxed Session's steps",
+      () => stubApi({ info: json(claude({ sandboxed: true })) }),
+      async (view: ReturnType<typeof renderBanner>) => {
+        await view.findByTestId("startup-error-banner-sandbox-note");
+      },
+    ],
+  ])("keeps every line on a validated text colour: %s", async (_label, stub, open) => {
+    stub();
+    const view = renderBanner();
+    await open(view);
+    const banner = view.getByTestId("startup-error-banner");
+    expect(banner.querySelectorAll(".text-text-secondary, .text-text-dim, .text-status-running")).toHaveLength(0);
+    expect(banner.querySelectorAll(".text-text-subtle").length).toBeGreaterThan(0);
+  });
 });
 
 describe("StartupErrorBanner install", () => {

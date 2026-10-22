@@ -194,7 +194,7 @@ export function StartupErrorBanner({
     >
       <div role="alert">
         <h2 className="text-sm font-semibold">{name} couldn't start in Structured view</h2>
-        <div className="mt-1 text-xs text-text-secondary">
+        <div className="mt-1 text-xs text-text-subtle">
           {specific ??
             (ADAPTER_NOT_FOUND.test(message) ? (
               <>{name}'s ACP adapter isn't installed where the Daemon runs.</>
@@ -213,7 +213,7 @@ export function StartupErrorBanner({
         install={install}
       />
       {retryState === "ok" && (
-        <div className="mt-2 text-xs text-status-running">Retrying. Events will appear when {name} starts.</div>
+        <div className="mt-2 text-xs text-text-subtle">Retrying. Events will appear when {name} starts.</div>
       )}
       <div className="mt-3 border-t border-status-error/30 pt-2">
         <button
@@ -227,8 +227,8 @@ export function StartupErrorBanner({
         </button>
         {detailsOpen && (
           <div className="mt-2" data-testid="startup-error-banner-details-body">
-            <pre className="whitespace-pre-wrap break-all font-mono text-xs text-text-secondary">{message}</pre>
-            {retryFailure && <div className="mt-1 font-mono text-xs text-text-secondary">{retryFailure}</div>}
+            <pre className="whitespace-pre-wrap break-all font-mono text-xs text-text-subtle">{message}</pre>
+            {retryFailure && <div className="mt-1 font-mono text-xs text-text-subtle">{retryFailure}</div>}
             <AgentLogDisclosure sessionId={sessionId} />
           </div>
         )}
@@ -241,7 +241,7 @@ export function StartupErrorBanner({
 function InstallSteps({ info }: { info: AgentInstallInfo | null }) {
   if (!info?.install_command) {
     return (
-      <p className="mt-2 text-xs text-text-secondary">
+      <p className="mt-2 text-xs text-text-subtle">
         Run <Code>aoe acp doctor --fix</Code> where the Daemon runs, then Retry.
       </p>
     );
@@ -249,11 +249,11 @@ function InstallSteps({ info }: { info: AgentInstallInfo | null }) {
   const hint = splitInstallHint(info.install_command);
   if (info.sandboxed) {
     return (
-      <div className="mt-2 text-xs text-text-secondary" data-testid="startup-error-banner-sandbox-note">
+      <div className="mt-2 text-xs text-text-subtle" data-testid="startup-error-banner-sandbox-note">
         <p>The ACP adapter lives inside the sandbox container, so installing it on the host won't reach it.</p>
         <p className="mt-2">Run this inside the container, then Retry:</p>
         <CommandBlock {...hint} />
-        <p className="mt-2 text-text-dim">
+        <p className="mt-2 text-text-subtle">
           This updates the running container only. To keep new Sessions from hitting this, refresh the sandbox image:
           the aoe TUI shows a "sandbox image update available" banner that pulls the right image with your configured
           container runtime.
@@ -262,7 +262,7 @@ function InstallSteps({ info }: { info: AgentInstallInfo | null }) {
     );
   }
   return (
-    <div className="mt-2 text-xs text-text-secondary">
+    <div className="mt-2 text-xs text-text-subtle">
       <CommandBlock {...hint} />
       <p className="mt-2">Run this where the Daemon runs, then Retry.</p>
     </div>
@@ -283,12 +283,12 @@ function CommandBlock({ command, note }: { command: string; note: string | null 
         <button
           type="button"
           onClick={() => void writeClipboard(command).then(setCopied)}
-          className="shrink-0 rounded-md px-2 text-[11px] text-text-secondary hover:text-text-primary"
+          className="shrink-0 rounded-md px-2 text-[11px] text-text-subtle hover:text-text-primary"
         >
           {copied ? "Copied" : "Copy"}
         </button>
       </div>
-      {note && <p className="mt-1 text-text-dim">{note}</p>}
+      {note && <p className="mt-1 text-text-subtle">{note}</p>}
     </>
   );
 }
@@ -356,24 +356,26 @@ function AgentLogDisclosure({ sessionId }: { sessionId: string }) {
       </div>
       {open && (
         <div className="mt-2" data-testid="acp-agent-log-body">
-          {log.kind === "loading" && <div className="text-xs text-text-secondary">Loading log…</div>}
+          {log.kind === "loading" && <div className="text-xs text-text-subtle">Loading log…</div>}
           {log.kind === "failed" && log.error && (
-            <div className="text-xs text-text-secondary">Could not load log: {log.error}</div>
+            <div className="text-xs text-text-subtle">Could not load log: {log.error}</div>
           )}
           {log.kind === "ok" && !log.exists && (
-            <div className="text-xs text-text-secondary">
+            <div className="text-xs text-text-subtle">
               No log output yet. The worker may not have written anything before exiting.
             </div>
           )}
           {log.kind === "ok" && log.exists && log.tail.length === 0 && (
-            <div className="text-xs text-text-secondary">Log file exists but is empty.</div>
+            <div className="text-xs text-text-subtle">Log file exists but is empty.</div>
           )}
           {log.kind === "ok" && log.exists && log.tail.length > 0 && (
             <>
-              {log.truncated && <div className="mb-1 text-[10px] text-text-dim">Log is large; showing the tail.</div>}
+              {log.truncated && (
+                <div className="mb-1 text-[10px] text-text-subtle">Log is large; showing the tail.</div>
+              )}
               <pre
                 data-testid="acp-agent-log-pre"
-                className="max-h-64 overflow-auto whitespace-pre-wrap break-all rounded bg-surface-950 p-2 font-mono text-[11px] text-text-secondary"
+                className="max-h-64 overflow-auto whitespace-pre-wrap break-all rounded bg-surface-950 p-2 font-mono text-[11px] text-text-subtle"
               >
                 {log.tail}
               </pre>

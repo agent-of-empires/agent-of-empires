@@ -51,7 +51,7 @@ export function RecoveryActionRow({
         </div>
       )}
       {install.output && (
-        <pre className="mt-2 max-h-40 overflow-auto rounded-md border border-surface-700 bg-surface-950 p-2 font-mono text-[11px] text-text-secondary">
+        <pre className="mt-2 max-h-40 overflow-auto rounded-md border border-surface-700 bg-surface-950 p-2 font-mono text-[11px] text-text-subtle">
           {install.output}
         </pre>
       )}
