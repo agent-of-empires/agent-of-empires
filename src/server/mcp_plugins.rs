@@ -145,6 +145,7 @@ impl Failure {
             Self::Worker(WorkerRequestError::NoWorker) => "no_worker",
             Self::Worker(WorkerRequestError::Timeout) => "timeout",
             Self::Worker(WorkerRequestError::WorkerGone) => "worker_gone",
+            Self::Worker(WorkerRequestError::MethodNotFound) => "method_not_found",
             Self::Worker(WorkerRequestError::Rejected) => "rejected",
             Self::Worker(WorkerRequestError::Superseded) => "superseded",
             Self::TooLarge => "too_large",

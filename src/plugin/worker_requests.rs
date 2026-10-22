@@ -17,6 +17,8 @@ pub enum WorkerRequestError {
     /// The running worker was launched from another manifest than the one the request was
     /// chosen from, so it is not delivered.
     Superseded,
+    /// The worker answered JSON-RPC "method not found".
+    MethodNotFound,
     Rejected,
 }
 
@@ -35,6 +37,7 @@ impl std::fmt::Display for WorkerRequestError {
             Self::Timeout => f.write_str("timed out"),
             Self::WorkerGone => f.write_str("worker exited"),
             Self::Superseded => f.write_str("worker was launched from a different manifest"),
+            Self::MethodNotFound => f.write_str("worker does not implement the method"),
             Self::Rejected => f.write_str("worker rejected the request"),
         }
     }
@@ -43,7 +46,7 @@ impl std::fmt::Display for WorkerRequestError {
 struct Entry {
     plugin_id: String,
     generation: u64,
-    tx: oneshot::Sender<Result<Value, String>>,
+    tx: oneshot::Sender<Result<Value, WorkerRequestError>>,
 }
 
 #[derive(Default)]
@@ -75,7 +78,7 @@ impl PendingRequests {
         &self,
         plugin_id: &str,
         generation: u64,
-    ) -> (String, oneshot::Receiver<Result<Value, String>>) {
+    ) -> (String, oneshot::Receiver<Result<Value, WorkerRequestError>>) {
         let id = self.next_id();
         let rx = self.register_as(&id, plugin_id, generation);
         (id, rx)
@@ -94,7 +97,7 @@ impl PendingRequests {
         id: &str,
         plugin_id: &str,
         generation: u64,
-    ) -> oneshot::Receiver<Result<Value, String>> {
+    ) -> oneshot::Receiver<Result<Value, WorkerRequestError>> {
         let (tx, rx) = oneshot::channel();
         let mut state = self.state();
         if state.closed.get(plugin_id) == Some(&generation) {
@@ -199,7 +202,7 @@ mod tests {
     }
 
     /// Still waiting: `try_recv` also errors on a closed channel, which is not the same.
-    fn is_open(rx: &mut oneshot::Receiver<Result<Value, String>>) -> bool {
+    fn is_open<T>(rx: &mut oneshot::Receiver<T>) -> bool {
         matches!(rx.try_recv(), Err(oneshot::error::TryRecvError::Empty))
     }
 
