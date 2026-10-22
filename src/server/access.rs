@@ -359,6 +359,9 @@ pub(super) const CITYHALL_MUTATION_DENY: &[(&str, &str)] = &[
     ("POST", "/api/plugins/{id}/update/apply"),
     ("POST", "/api/plugins/{id}/update/dismiss"),
     ("POST", "/api/plugins/commands/{fqid}/invoke"),
+    // Sandbox image pulls run the Container runtime as the daemon user.
+    ("POST", "/api/sandbox/image-pull"),
+    ("POST", "/api/sandbox/image-dismiss"),
     // ACP agent / worker lifecycle + config.
     ("DELETE", "/api/sessions/{id}/acp"),
     ("POST", "/api/sessions/{id}/acp/config-option"),

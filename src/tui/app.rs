@@ -117,7 +117,9 @@ pub struct App {
     /// Snoozed via Ctrl+x until a newer release ships.
     dismissed_update_version: Option<String>,
     image_update: Option<ImageUpdate>,
-    image_update_rx: Option<tokio::sync::oneshot::Receiver<anyhow::Result<Option<ImageUpdate>>>>,
+    image_update_rx: Option<
+        tokio::sync::oneshot::Receiver<anyhow::Result<crate::containers::image_update::ImageCheck>>,
+    >,
     image_pull_rx: Option<tokio::sync::oneshot::Receiver<anyhow::Result<()>>>,
     /// Snoozed via Ctrl+x while the registry still resolves to this digest.
     dismissed_image_digest: Option<String>,
@@ -1674,7 +1676,7 @@ impl App {
         let (tx, rx) = tokio::sync::oneshot::channel();
         self.image_update_rx = Some(rx);
         tokio::spawn(async move {
-            let result = crate::containers::image_update::check_for_image_update(&image).await;
+            let result = crate::containers::image_update::check_image(&image).await;
             let _ = tx.send(result);
         });
     }
@@ -1684,14 +1686,15 @@ impl App {
             return false;
         };
         match rx.try_recv() {
-            Ok(Ok(Some(update))) => {
+            Ok(Ok(crate::containers::image_update::ImageCheck::Available(update))) => {
                 if self.dismissed_image_digest.as_deref() == Some(update.remote_digest.as_str()) {
                     return false;
                 }
                 self.image_update = Some(update);
                 true
             }
-            Ok(Ok(None)) => false,
+            // The TUI banner only offers an update; it has no row for "can't tell".
+            Ok(Ok(_)) => false,
             Ok(Err(e)) => {
                 tracing::debug!(target: "containers.image_update", error = %e, "image update check failed");
                 false

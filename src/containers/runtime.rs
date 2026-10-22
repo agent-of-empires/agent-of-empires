@@ -8,6 +8,7 @@ use super::container_interface::{
     ContainerConfig, InspectedContainer, InspectedMount, VolumeMount,
 };
 use super::error::{DockerError, Result};
+use super::image_update::LocalDigest;
 use super::runtime_base::RuntimeBase;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -71,7 +72,7 @@ impl ContainerRuntime {
         self.base.image_exists_locally(image)
     }
 
-    pub fn local_image_digest(&self, image: &str) -> Option<String> {
+    pub fn local_image_digest(&self, image: &str) -> LocalDigest {
         match self.kind {
             RuntimeKind::Docker | RuntimeKind::Podman => {
                 let mut cmd = self.base.command();
@@ -82,20 +83,37 @@ impl ContainerRuntime {
                     "{{range .RepoDigests}}{{println .}}{{end}}",
                     image,
                 ]);
-                let output = self.base.probe_output(&mut cmd).ok()?;
-                if !output.status.success() {
-                    return None;
+                match self.base.probe_output(&mut cmd) {
+                    Ok(output) if output.status.success() => {
+                        let stdout = String::from_utf8_lossy(&output.stdout);
+                        super::image_update::pick_repo_digest(image, &stdout)
+                            .map_or(LocalDigest::NoDigest, LocalDigest::Digest)
+                    }
+                    _ => LocalDigest::Missing,
                 }
-                let stdout = String::from_utf8_lossy(&output.stdout);
-                super::image_update::pick_repo_digest(image, &stdout)
             }
             // Apple's `image inspect` exposes no repo digest.
-            RuntimeKind::AppleContainer => None,
+            RuntimeKind::AppleContainer if self.image_exists_locally(image) => {
+                LocalDigest::NoDigest
+            }
+            RuntimeKind::AppleContainer => LocalDigest::Missing,
         }
     }
 
     pub fn pull_image(&self, image: &str) -> Result<()> {
         self.base.pull_image(image)
+    }
+
+    /// The command [`Self::pull_image`] runs, for a user to copy when the dashboard can't pull.
+    pub fn pull_command(&self, image: &str) -> String {
+        let mut parts = vec![self.base.binary];
+        parts.extend(self.base.pull_prefix);
+        parts.push(image);
+        parts.join(" ")
+    }
+
+    pub fn display_name(&self) -> &'static str {
+        self.base.name
     }
 
     pub fn ensure_image(
