@@ -349,11 +349,35 @@ pub struct ImagePullBody {
     image: Option<String>,
 }
 
+/// No body pulls the default image; any other body must be a JSON `{image}`. A `Json` extractor
+/// can't tell an empty body from one sent without a JSON content type.
+fn requested_image(
+    headers: &axum::http::HeaderMap,
+    body: &[u8],
+) -> Result<Option<String>, Response> {
+    if body.is_empty() {
+        return Ok(None);
+    }
+    let is_json = headers
+        .get(axum::http::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| v.starts_with("application/json"));
+    match serde_json::from_slice::<ImagePullBody>(body) {
+        Ok(parsed) if is_json => Ok(parsed.image),
+        _ => Err(api_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_body",
+            "Expected no body, or a JSON body like {\"image\": \"<configured image>\"}",
+        )),
+    }
+}
+
 /// `POST /api/sandbox/image-pull`: starts at most one pull per image and returns at once;
 /// `image-status` reports its progress. The pull keeps its 600 s runtime timeout.
 pub async fn sandbox_image_pull(
     State(state): State<Arc<AppState>>,
-    body: Result<Json<ImagePullBody>, JsonRejection>,
+    headers: axum::http::HeaderMap,
+    body: axum::body::Bytes,
 ) -> Response {
     if let Some(resp) = read_only_block(&state).or_else(|| cityhall_block(&state)) {
         return resp;
@@ -369,17 +393,9 @@ pub async fn sandbox_image_pull(
             "Pulling sandbox images from the web is off. Enable sandbox.allow_image_pull (Settings, local only).",
         );
     }
-    // No body pulls the default image; a body that isn't valid JSON is an error.
-    let requested = match body {
-        Ok(Json(body)) => body.image,
-        Err(JsonRejection::MissingJsonContentType(_)) => None,
-        Err(rejection) => {
-            return api_error(
-                StatusCode::BAD_REQUEST,
-                "invalid_body",
-                rejection.body_text(),
-            )
-        }
+    let requested = match requested_image(&headers, &body) {
+        Ok(requested) => requested,
+        Err(resp) => return resp,
     };
     let image = match resolve_image(&configured, requested.as_deref()) {
         Ok(image) => image,
@@ -686,6 +702,40 @@ mod tests {
     }
 
     #[test]
+    fn a_pull_body_is_empty_or_json_never_silently_the_default() {
+        let json_type = || {
+            let mut headers = axum::http::HeaderMap::new();
+            headers.insert(
+                axum::http::header::CONTENT_TYPE,
+                "application/json".parse().unwrap(),
+            );
+            headers
+        };
+        let none = axum::http::HeaderMap::new;
+        let image = br#"{"image":"ghcr.io/x/y:1"}"#;
+        // (headers, body, requested image, or None for invalid_body)
+        let cases: [(axum::http::HeaderMap, &[u8], Option<Option<&str>>); 5] = [
+            (none(), b"", Some(None)),
+            (json_type(), b"", Some(None)),
+            (json_type(), image, Some(Some("ghcr.io/x/y:1"))),
+            // A configured image sent without a JSON content type must not pull the default.
+            (none(), image, None),
+            (json_type(), b"{not json", None),
+        ];
+        for (headers, body, want) in cases {
+            let got = requested_image(&headers, body);
+            match want {
+                Some(image) => assert_eq!(got.ok().flatten().as_deref(), image, "{body:?}"),
+                None => assert_eq!(
+                    got.err().map(|r| r.status()),
+                    Some(StatusCode::BAD_REQUEST),
+                    "{body:?}"
+                ),
+            }
+        }
+    }
+
+    #[test]
     fn only_one_pull_per_image_and_runtime_runs_at_a_time() {
         let mut pulls = HashMap::new();
         let docker = key("Docker", "img");
@@ -724,7 +774,8 @@ mod tests {
             std::fs::write(&path, "not = [valid").unwrap();
             let pull = sandbox_image_pull(
                 State(state.clone()),
-                Ok(Json(ImagePullBody { image: None })),
+                axum::http::HeaderMap::new(),
+                axum::body::Bytes::new(),
             )
             .await;
             let (code, body) = json(pull).await;
@@ -800,7 +851,11 @@ mod tests {
         assert_eq!(code, StatusCode::BAD_REQUEST, "only configured images");
 
         let pull = |state: Arc<AppState>| {
-            sandbox_image_pull(State(state), Ok(Json(ImagePullBody { image: None })))
+            sandbox_image_pull(
+                State(state),
+                axum::http::HeaderMap::new(),
+                axum::body::Bytes::new(),
+            )
         };
         let (code, body) = json(pull(state.clone()).await).await;
         assert_eq!(
