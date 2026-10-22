@@ -93,7 +93,7 @@ mod hook_fixtures {
         fs::write(path, serde_json::to_string_pretty(value).unwrap()).unwrap();
     }
 }
-use anyhow::Result;
+use anyhow::{Context, Result};
 use std::fs;
 use tracing::{debug, info};
 
@@ -374,11 +374,45 @@ fn run_migrations_inner(
 ) -> Result<()> {
     let _installed = progress::install(reporter);
     let _announced = progress::install_announced(announce);
-    let current = get_current_version();
-    debug!("Current schema version: {}", current);
-    if current > CURRENT_VERSION {
-        anyhow::bail!("data schema version {current} is newer than this build supports ({CURRENT_VERSION}); refusing to downgrade");
+    let current = ensure_schema_supported()?;
+    // Older daemons know serve.lock but not the lifecycle transaction. Hold
+    // both before the first schema write; standalone callers include the TUI.
+    let owned_transaction;
+    let transaction = if (current < CURRENT_VERSION || announce) && transaction.is_none() {
+        owned_transaction = crate::daemon::lifecycle::Transaction::acquire_blocking_for(
+            std::time::Duration::from_secs(10),
+        )?;
+        Some(&owned_transaction)
+    } else {
+        transaction
+    };
+    // Another migrator may have completed while we acquired its transaction.
+    let current = ensure_schema_supported()?;
+    let owned_serve;
+    let serve = if (current < CURRENT_VERSION || announce) && serve.is_none() {
+        owned_serve = crate::cli::serve::try_lock_serve()?.context(
+            "A daemon or migration is starting or running; schema migration refused. \
+             Run `aoe serve --restart` with the new binary, or stop the daemon through its manager",
+        )?;
+        Some(&owned_serve)
+    } else {
+        serve
+    };
+    if current < CURRENT_VERSION || announce {
+        let transaction = transaction.context("Missing migration lifecycle transaction")?;
+        // Drop this probe before v044 and explicit recovery take nested lifetime
+        // and state exclusions. The held transaction and serve lock exclude starts.
+        let _lifetime = transaction.try_lifetime()?.context(
+            "A daemon still owns its lifetime; schema migration refused. \
+             Run `aoe serve --restart` with the new binary, or stop the daemon through its manager",
+        )?;
+        anyhow::ensure!(
+            crate::cli::serve::daemon_status() == crate::cli::serve::DaemonStatus::Absent,
+            "Existing daemon identity is live or ambiguous; schema migration refused. \
+             Run `aoe serve --restart` with the new binary, or stop the daemon through its manager"
+        );
     }
+    debug!("Current schema version: {}", current);
     if current == CURRENT_VERSION {
         v027_isolate_sandbox_stores::reconcile_pending(announce)?;
         v033_isolate_sandbox_content::reconcile_pending(announce)?;
@@ -469,6 +503,43 @@ fn set_version(version: u32) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[serial_test::serial]
+    fn pending_schema_migration_preserves_marker_under_active_daemon_exclusion() -> Result<()> {
+        for borrowed in [false, true] {
+            let home = tempfile::tempdir()?;
+            let _home = crate::session::test_support::isolate_app_dir_at(home.path());
+            let app = crate::session::get_app_dir()?;
+            std::fs::create_dir_all(&app)?;
+            set_version(CURRENT_VERSION - 1)?;
+            let marker = std::fs::read(app.join(VERSION_FILE))?;
+            let transaction = borrowed
+                .then(|| {
+                    crate::daemon::lifecycle::Transaction::acquire_blocking_for(
+                        std::time::Duration::from_secs(1),
+                    )
+                })
+                .transpose()?;
+            let serve = crate::cli::serve::try_lock_serve()?.unwrap();
+            let _lifetime = transaction
+                .as_ref()
+                .map(crate::daemon::lifecycle::Transaction::lifetime)
+                .transpose()?;
+            let result = match &transaction {
+                Some(transaction) => {
+                    run_migrations_under_exclusion(None, false, transaction, &serve)
+                }
+                None => run_migrations(),
+            };
+            assert!(
+                result.is_err(),
+                "active daemon exclusion must block migration"
+            );
+            assert_eq!(std::fs::read(app.join(VERSION_FILE))?, marker);
+        }
+        Ok(())
+    }
 
     #[test]
     fn test_migrations_are_sequential() {

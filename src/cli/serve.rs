@@ -1464,7 +1464,21 @@ pub(crate) async fn ensure_local_daemon(
 ) -> Result<(crate::acp::client::DaemonEndpoint, Option<u32>)> {
     use clap::Parser;
     let transaction = crate::daemon::lifecycle::Transaction::acquire().await?;
-    let started = if daemon_pid().is_none() {
+    let existing = match daemon_status() {
+        DaemonStatus::Verified(pid) => {
+            anyhow::ensure!(
+                transaction.try_lifetime()?.is_none(),
+                "Running daemon (PID {pid}) predates this build's local runtime transport. \
+                 Run `aoe serve --restart` with the new binary, or stop it through its manager"
+            );
+            Some(pid)
+        }
+        DaemonStatus::Unverified => {
+            bail!("Cannot verify the existing daemon; refusing local runtime startup")
+        }
+        DaemonStatus::Absent => None,
+    };
+    let started = if existing.is_none() {
         anyhow::ensure!(
             allow_start,
             "Local daemon autostart is disabled; start one with `aoe serve --core-only --daemon`"
@@ -1864,8 +1878,6 @@ async fn stop_daemon_locked(transaction: &crate::daemon::lifecycle::Transaction)
     let pid_str = tokio::fs::read_to_string(&path).await?;
     let pid = parse_positive_pid(&pid_str)
         .ok_or_else(|| anyhow::anyhow!("Invalid PID in {}: {}", path.display(), pid_str.trim()))?;
-    tracing::info!(target: "serve.shutdown", pid, "sending SIGTERM to daemon");
-
     if matches!(
         classify_daemon_probe(nix::sys::signal::kill(
             nix::unistd::Pid::from_raw(pid),
@@ -1877,6 +1889,12 @@ async fn stop_daemon_locked(transaction: &crate::daemon::lifecycle::Transaction)
         return Ok(());
     }
 
+    // Capture before inspecting custody, so process exit or PID reuse during
+    // inspection can never redirect a later signal to another incarnation.
+    let birth = crate::process::process_birth_identity(pid as u32)?
+        .context("Daemon exited before its physical identity could be captured; retry stop")?;
+    let process = crate::process::CapturedProcess::capture(pid as u32, &birth)?
+        .context("Daemon incarnation changed before shutdown; preserving serve state")?;
     match inspect_daemon_process(pid) {
         DaemonProcessIdentity::Verified => {
             if serve_launch_contradicts(pid as u32) {
@@ -1903,55 +1921,41 @@ async fn stop_daemon_locked(transaction: &crate::daemon::lifecycle::Transaction)
             );
         }
     }
+    anyhow::ensure!(
+        crate::process::process_birth_identity(pid as u32)?.as_ref() == Some(&birth)
+            && !process.exited()?,
+        "Daemon incarnation changed during authorization; preserving serve state"
+    );
     let lifetime_owned = transaction.try_lifetime()?.is_none();
-
-    // Send SIGTERM
-    match nix::sys::signal::kill(
-        nix::unistd::Pid::from_raw(pid),
-        nix::sys::signal::Signal::SIGTERM,
-    ) {
-        Ok(()) => {
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(7);
-            loop {
-                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-                if lifetime_owned && transaction.try_lifetime()?.is_some() {
-                    break;
-                }
-                match nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None) {
-                    Err(nix::errno::Errno::ESRCH) => break,
-                    _ if std::time::Instant::now() >= deadline => {
-                        anyhow::ensure!(
-                            matches!(inspect_daemon_process(pid), DaemonProcessIdentity::Verified)
-                                && !serve_launch_contradicts(pid as u32),
-                            "Daemon identity changed during shutdown; refusing escalation"
-                        );
-                        nix::sys::signal::kill(
-                            nix::unistd::Pid::from_raw(pid),
-                            nix::sys::signal::Signal::SIGKILL,
-                        )?;
-                        let reap_deadline =
-                            std::time::Instant::now() + std::time::Duration::from_secs(2);
-                        while lifetime_owned && transaction.try_lifetime()?.is_none() {
-                            anyhow::ensure!(
-                                std::time::Instant::now() < reap_deadline,
-                                "Daemon retained lifetime ownership after shutdown"
-                            );
-                            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
-                        }
-                        break;
-                    }
-                    _ => {}
-                }
+    tracing::info!(target: "serve.shutdown", pid, "sending SIGTERM to daemon");
+    process.signal(nix::libc::SIGTERM)?;
+    let term_deadline = std::time::Instant::now() + std::time::Duration::from_secs(7);
+    let mut kill_deadline = None;
+    while !process.exited()? {
+        let now = std::time::Instant::now();
+        match kill_deadline {
+            Some(deadline) => anyhow::ensure!(
+                now < deadline,
+                "Daemon physical exit remains unproven after shutdown; preserving serve state"
+            ),
+            None if now >= term_deadline => {
+                // Authority stays with the handle captured before SIGTERM.
+                // A zombie has exited even while kill(pid, 0) still succeeds.
+                process.signal(nix::libc::SIGKILL)?;
+                kill_deadline = Some(now + std::time::Duration::from_secs(2));
             }
-            clear_serve_state(pid);
-            println!("Stopped aoe serve daemon (PID {})", pid);
+            None => {}
         }
-        Err(nix::errno::Errno::ESRCH) => {
-            report_stale_cleanup(pid);
-        }
-        Err(e) => bail!("Failed to stop daemon (PID {}): {}", pid, e),
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
     }
-
+    if lifetime_owned {
+        anyhow::ensure!(
+            transaction.try_lifetime()?.is_some(),
+            "Daemon retained lifetime ownership after physical exit; preserving serve state"
+        );
+    }
+    clear_serve_state(pid);
+    println!("Stopped aoe serve daemon (PID {})", pid);
     Ok(())
 }
 

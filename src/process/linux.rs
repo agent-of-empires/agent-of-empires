@@ -11,6 +11,237 @@ pub(super) use super::unix::{
     close_frozen_payload, configure_process_group, exec_command, kill_process_group,
     restore_environment_value, terminate_process_group, try_wait_status_hook,
 };
+struct LegacyUserManager {
+    stream: std::os::unix::net::UnixStream,
+    pid: u32,
+    uid: u32,
+    birth: super::ProcessBirthIdentity,
+    namespace: std::path::PathBuf,
+    process_cgroup: String,
+    root: String,
+    runtime: std::path::PathBuf,
+    mountinfo: String,
+}
+
+impl LegacyUserManager {
+    fn command(&self) -> anyhow::Result<Command> {
+        let mut command = Command::new(which::which("systemctl")?);
+        command
+            .env("XDG_RUNTIME_DIR", &self.runtime)
+            .env(
+                "DBUS_SESSION_BUS_ADDRESS",
+                format!("unix:path={}/bus", self.runtime.display()),
+            )
+            .env_remove("SYSTEMD_BUS_ADDRESS")
+            .env("LC_ALL", "C")
+            .env("SYSTEMD_COLORS", "0");
+        Ok(command)
+    }
+
+    fn manager_root(&self) -> anyhow::Result<String> {
+        let mut command = self.command()?;
+        command.args(["--user", "show", "--property=ControlGroup"]);
+        let output = super::run_with_timeout(&mut command, std::time::Duration::from_secs(3))?
+            .context("User manager cgroup query timed out")?;
+        anyhow::ensure!(
+            output.status.success(),
+            "User manager cgroup query rejected"
+        );
+        let text = std::str::from_utf8(&output.stdout)?;
+        let mut lines = text.lines();
+        let root = lines
+            .next()
+            .and_then(|line| line.strip_prefix("ControlGroup="))
+            .context("User manager cgroup root is unavailable")?;
+        anyhow::ensure!(lines.next().is_none(), "Malformed user manager cgroup root");
+        validate_legacy_manager_root(root)?;
+        Ok(root.to_owned())
+    }
+
+    fn capture() -> anyhow::Result<Self> {
+        use std::os::fd::AsRawFd as _;
+        use std::os::unix::fs::{FileTypeExt as _, MetadataExt as _};
+        let uid = nix::unistd::geteuid().as_raw();
+        let runtime = std::path::PathBuf::from(format!("/run/user/{uid}"));
+        let metadata = fs::symlink_metadata(&runtime)?;
+        anyhow::ensure!(
+            metadata.is_dir() && metadata.uid() == uid && metadata.mode() & 0o022 == 0,
+            "User manager runtime directory is unsafe"
+        );
+        let private = runtime.join("systemd/private");
+        let metadata = fs::symlink_metadata(&private)?;
+        anyhow::ensure!(
+            metadata.file_type().is_socket() && metadata.uid() == uid,
+            "User manager private socket is unsafe"
+        );
+        let stream = super::worker::connect_with_timeout(&private)
+            .context("Authenticated user manager is unavailable")?;
+        let peer = runtime_io::peer_credentials(stream.as_raw_fd())?;
+        anyhow::ensure!(
+            peer.uid == uid && peer.pid != 0,
+            "User manager peer does not match the effective user"
+        );
+        let birth = super::process_birth_identity(peer.pid)?
+            .context("User manager process birth is unavailable")?;
+        let namespace = fs::read_link("/proc/self/ns/cgroup")?;
+        anyhow::ensure!(
+            fs::read_link(format!("/proc/{}/ns/cgroup", peer.pid))? == namespace,
+            "Caller and user manager have different cgroup namespaces"
+        );
+        let mountinfo = fs::read_to_string("/proc/self/mountinfo")?;
+        validate_legacy_cgroup_mount(&mountinfo)?;
+        let process_cgroup = fs::read_to_string(format!("/proc/{}/cgroup", peer.pid))?;
+        let mut manager = Self {
+            stream,
+            pid: peer.pid,
+            uid,
+            birth,
+            namespace,
+            process_cgroup,
+            root: String::new(),
+            runtime,
+            mountinfo,
+        };
+        manager.root = manager.manager_root()?;
+        validate_legacy_manager_membership(&manager.process_cgroup, &manager.root)?;
+        let directory = fs::File::open(manager.inventory_root())?;
+        let mut stat = std::mem::MaybeUninit::<libc::statfs>::uninit();
+        // SAFETY: directory is live and stat points to writable storage.
+        anyhow::ensure!(
+            unsafe { libc::fstatfs(directory.as_raw_fd(), stat.as_mut_ptr()) } == 0,
+            "Cannot inspect the user manager cgroup filesystem: {}",
+            std::io::Error::last_os_error()
+        );
+        // SAFETY: fstatfs succeeded and initialized stat.
+        anyhow::ensure!(
+            unsafe { stat.assume_init() }.f_type == libc::CGROUP2_SUPER_MAGIC,
+            "User manager inventory is not a cgroup2 filesystem"
+        );
+        manager.check_current()?;
+        Ok(manager)
+    }
+
+    fn inventory_root(&self) -> std::path::PathBuf {
+        std::path::PathBuf::from("/sys/fs/cgroup").join(self.root.trim_start_matches('/'))
+    }
+
+    fn check_current(&self) -> anyhow::Result<()> {
+        use std::os::fd::AsRawFd as _;
+        let peer = runtime_io::peer_credentials(self.stream.as_raw_fd())?;
+        anyhow::ensure!(
+            peer.uid == self.uid
+                && peer.pid == self.pid
+                && super::process_birth_identity(self.pid)?.as_ref() == Some(&self.birth),
+            "User manager incarnation changed during scope proof"
+        );
+        anyhow::ensure!(
+            fs::read_link("/proc/self/ns/cgroup")? == self.namespace
+                && fs::read_link(format!("/proc/{}/ns/cgroup", self.pid))? == self.namespace
+                && fs::read_to_string(format!("/proc/{}/cgroup", self.pid))? == self.process_cgroup
+                && fs::read_to_string("/proc/self/mountinfo")? == self.mountinfo
+                && self.manager_root()? == self.root,
+            "User manager inventory boundary changed during scope proof"
+        );
+        Ok(())
+    }
+}
+
+fn validate_legacy_manager_root(root: &str) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        root.starts_with('/')
+            && root != "/"
+            && !root.ends_with('/')
+            && root
+                .split('/')
+                .skip(1)
+                .all(|part| !part.is_empty() && !matches!(part, "." | "..")),
+        "User manager cgroup root is not a complete non-root absolute path"
+    );
+    Ok(())
+}
+
+fn validate_legacy_manager_membership(contents: &str, root: &str) -> anyhow::Result<()> {
+    let mut unified = contents.lines().filter_map(|line| line.strip_prefix("0::"));
+    anyhow::ensure!(
+        unified
+            .next()
+            .and_then(|path| path.strip_suffix("/init.scope"))
+            == Some(root)
+            && unified.next().is_none(),
+        "User manager cgroup does not match the authenticated peer"
+    );
+    Ok(())
+}
+
+fn validate_legacy_cgroup_mount(contents: &str) -> anyhow::Result<()> {
+    let mut matches = contents.lines().filter_map(|line| {
+        let (mount, filesystem) = line.split_once(" - ")?;
+        let mut fields = mount.split_whitespace();
+        let root = fields.nth(3)?;
+        let point = fields.next()?;
+        (point == "/sys/fs/cgroup").then_some((root, filesystem))
+    });
+    let (root, filesystem) = matches
+        .next()
+        .context("Unified cgroup mount is unavailable")?;
+    anyhow::ensure!(
+        matches.next().is_none()
+            && root == "/"
+            && filesystem.split_whitespace().next() == Some("cgroup2"),
+        "A complete unified cgroup hierarchy is unavailable"
+    );
+    Ok(())
+}
+
+#[cfg(test)]
+mod legacy_inventory_boundary_tests {
+    use super::*;
+
+    #[test]
+    fn manager_root_requires_the_whole_mount_and_the_physical_peer() {
+        assert!(validate_legacy_cgroup_mount(
+            "31 20 0:27 / /sys/fs/cgroup rw - cgroup2 cgroup rw\n"
+        )
+        .is_ok());
+        assert!(validate_legacy_cgroup_mount(
+            "31 20 0:27 /user.slice/hidden /sys/fs/cgroup rw - cgroup2 cgroup rw\n"
+        )
+        .is_err());
+        assert!(
+            validate_legacy_cgroup_mount("31 20 0:27 / /sys/fs/cgroup rw - tmpfs tmpfs rw\n")
+                .is_err()
+        );
+        for bad in [
+            "",
+            "/",
+            "relative",
+            "/user.slice/../other",
+            "/user.slice//other",
+            "/user.slice/",
+        ] {
+            assert!(validate_legacy_manager_root(bad).is_err(), "{bad}");
+        }
+        let root = "/user.slice/user-1000.slice/user@1000.service";
+        assert!(validate_legacy_manager_root(root).is_ok());
+        assert!(
+            validate_legacy_manager_membership(&format!("0::{root}/init.scope\n"), root).is_ok()
+        );
+        assert!(validate_legacy_manager_membership(
+            "0::/user.slice/user-2000.slice/user@2000.service/init.scope\n",
+            root
+        )
+        .is_err());
+        assert!(
+            validate_legacy_manager_membership(&format!("0::{root}/other.scope\n"), root).is_err()
+        );
+        assert!(validate_legacy_manager_membership(
+            &format!("0::{root}/init.scope\n0::{root}/init.scope\n"),
+            root
+        )
+        .is_err());
+    }
+}
+
 pub(super) fn legacy_scope_inventory_clear(
     prefix: &str,
     known: &[crate::process::worker_registry::ScopeOwnership],
@@ -25,26 +256,8 @@ pub(super) fn legacy_scope_inventory_clear(
             _ => None,
         })
         .collect();
-    let current_namespace = fs::read_link("/proc/self/ns/cgroup")
-        .context("Reading /proc/self/ns/cgroup for complete scope inventory")?;
-    let init_namespace = fs::read_link("/proc/1/ns/cgroup")
-        .context("Reading /proc/1/ns/cgroup for complete scope inventory")?;
-    anyhow::ensure!(
-        current_namespace == init_namespace,
-        "Cannot prove full cgroup inventory in a nested cgroup namespace"
-    );
-    let mountinfo = fs::read_to_string("/proc/self/mountinfo")?;
-    anyhow::ensure!(
-        mountinfo.lines().any(|line| {
-            let Some((mount, filesystem)) = line.split_once(" - ") else {
-                return false;
-            };
-            mount.split_whitespace().nth(4) == Some("/sys/fs/cgroup")
-                && filesystem.split_whitespace().next() == Some("cgroup2")
-        }),
-        "A complete unified cgroup hierarchy is unavailable"
-    );
-    let mut command = Command::new(which::which("systemctl")?);
+    let manager = LegacyUserManager::capture()?;
+    let mut command = manager.command()?;
     command.args([
         "--user",
         "list-units",
@@ -79,7 +292,7 @@ pub(super) fn legacy_scope_inventory_clear(
             if !matches!(active, "inactive" | "failed") {
                 return Ok(false);
             }
-            let mut show = Command::new(which::which("systemctl")?);
+            let mut show = manager.command()?;
             show.args([
                 "--user",
                 "show",
@@ -114,7 +327,7 @@ pub(super) fn legacy_scope_inventory_clear(
             }
         }
     }
-    let mut pending = vec![std::path::PathBuf::from("/sys/fs/cgroup")];
+    let mut pending = vec![manager.inventory_root()];
     while let Some(path) = pending.pop() {
         for entry in fs::read_dir(&path)? {
             let entry = entry?;
@@ -151,6 +364,7 @@ pub(super) fn legacy_scope_inventory_clear(
             pending.push(child);
         }
     }
+    manager.check_current()?;
     Ok(true)
 }
 pub(super) fn open_read_nonblocking(path: &std::path::Path) -> std::io::Result<std::fs::File> {

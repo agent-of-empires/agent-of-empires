@@ -9,6 +9,49 @@ pub(super) use super::unix::{
     close_frozen_payload, configure_process_group, exec_command, kill_process_group,
     restore_environment_value, terminate_process_group, try_wait_status_hook,
 };
+/// Prove only the absence of the Linux scope backend on this kernel.
+/// Native process, worker and tmux custody must still pass their own guards.
+pub(super) fn legacy_scope_inventory_clear(
+    known: &[crate::process::worker_registry::ScopeOwnership],
+) -> anyhow::Result<bool> {
+    use crate::process::worker_registry::ScopeOwnership;
+    anyhow::ensure!(
+        !known
+            .iter()
+            .any(|scope| matches!(scope, ScopeOwnership::Owned { .. })),
+        "Captured Linux scope authority cannot be recovered on this platform"
+    );
+    let mut name = std::mem::MaybeUninit::<libc::utsname>::uninit();
+    // SAFETY: uname receives writable storage of the required size.
+    if unsafe { libc::uname(name.as_mut_ptr()) } != 0 {
+        return Err(std::io::Error::last_os_error()).context("Reading the native kernel identity");
+    }
+    // SAFETY: uname succeeded and initializes NUL-terminated sysname.
+    let name = unsafe { name.assume_init() };
+    let kernel = unsafe { std::ffi::CStr::from_ptr(name.sysname.as_ptr()) };
+    anyhow::ensure!(
+        kernel.to_bytes() == b"Darwin",
+        "Cannot prove the Linux scope backend absent on this kernel"
+    );
+    Ok(true)
+}
+
+#[cfg(test)]
+mod legacy_scope_recovery_tests {
+    use super::*;
+    use crate::process::worker_registry::ScopeOwnership;
+
+    #[test]
+    fn native_darwin_proof_does_not_discard_a_captured_linux_unit() {
+        assert!(legacy_scope_inventory_clear(&[]).unwrap());
+        assert!(legacy_scope_inventory_clear(&[ScopeOwnership::Unscoped]).unwrap());
+        assert!(legacy_scope_inventory_clear(&[ScopeOwnership::Owned {
+            unit: "aoe-session-old-original.scope".into(),
+        }])
+        .is_err());
+    }
+}
+
 pub(super) fn open_read_nonblocking(path: &std::path::Path) -> std::io::Result<std::fs::File> {
     use std::os::unix::fs::OpenOptionsExt;
 

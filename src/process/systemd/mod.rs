@@ -590,10 +590,14 @@ pub(crate) fn legacy_unknown_scope_absent(
     {
         super::linux::legacy_scope_inventory_clear(&format!("{}-", escaped_id(session_id)), known)
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(target_os = "macos")]
+    {
+        super::macos::legacy_scope_inventory_clear(known)
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
         let _ = known;
-        anyhow::bail!("Legacy Linux scope authority requires a complete Linux inventory")
+        anyhow::bail!("Legacy scope authority recovery is unsupported on this platform")
     }
 }
 

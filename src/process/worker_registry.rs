@@ -374,10 +374,7 @@ fn save_unlocked(record: &WorkerRecord) -> Result<()> {
         .context("publishing worker record")
 }
 
-pub(crate) fn with_registry_lock<T>(
-    session_id: &str,
-    operation: impl FnOnce() -> Result<T>,
-) -> Result<T> {
+pub(crate) fn acquire_registry_lock(session_id: &str) -> Result<std::fs::File> {
     validate_session_id(session_id)?;
     let lock_path = workers_dir()?.join(format!("{session_id}.lock"));
     let lock_file = std::fs::OpenOptions::new()
@@ -395,6 +392,14 @@ pub(crate) fn with_registry_lock<T>(
     lock_file
         .lock_exclusive()
         .with_context(|| format!("locking worker registry entry {session_id}"))?;
+    Ok(lock_file)
+}
+
+pub(crate) fn with_registry_lock<T>(
+    session_id: &str,
+    operation: impl FnOnce() -> Result<T>,
+) -> Result<T> {
+    let lock_file = acquire_registry_lock(session_id)?;
     let result = operation();
     let unlock = fs2::FileExt::unlock(&lock_file)
         .with_context(|| format!("unlocking worker registry entry {session_id}"));

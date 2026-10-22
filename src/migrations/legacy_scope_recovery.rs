@@ -22,6 +22,14 @@ struct SessionPlan {
     primary: bool,
 }
 
+struct WorkerPlan {
+    path: PathBuf,
+    file: ResolvedDataFile,
+    original: String,
+    document: Value,
+    encoded: Option<Vec<u8>>,
+}
+
 pub(super) fn session_paths(app: &Path) -> Result<Vec<PathBuf>> {
     let mut paths = vec![app.join("sessions.json")];
     let profiles_path = app.join("profiles");
@@ -137,16 +145,18 @@ fn recover_components() -> Result<()> {
             plan.path.display()
         );
     }
-    // Read every current worker component strictly. Recovery does not rewrite or
-    // borrow any worker's birth, native runtime or scope authority.
+    // Pin original workers while planning field-only scope recovery.
     let mut workers = Vec::new();
+    let mut worker_locks = Vec::new();
     let workers_path = app.join("acp-workers");
     match std::fs::symlink_metadata(&workers_path) {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(error) => return Err(error).context("Inspecting worker namespace"),
         Ok(_) => {
             let directory = AnchoredDir::open(&workers_path)?;
-            for name in directory.read_dir(Path::new(""), usize::MAX)? {
+            let mut names = directory.read_dir(Path::new(""), usize::MAX)?;
+            names.sort();
+            for name in names {
                 let path = Path::new(&name);
                 if path.extension().is_none_or(|extension| extension != "json") {
                     continue;
@@ -156,16 +166,25 @@ fn recover_components() -> Result<()> {
                     .and_then(|stem| stem.to_str())
                     .context("Invalid worker component name")?;
                 crate::process::worker_registry::validate_session_id(id)?;
+                let lock = crate::process::worker_registry::acquire_registry_lock(id)?;
                 let file = directory.bind_file(&name)?;
                 let raw = file.read()?.context("Worker component disappeared")?;
-                let record: crate::process::worker_registry::WorkerRecord =
-                    serde_json::from_str(&raw)
-                        .with_context(|| format!("Invalid worker component {}", path.display()))?;
+                let document: Value = serde_json::from_str(&raw)
+                    .with_context(|| format!("Invalid worker component {}", path.display()))?;
+                let record = crate::process::worker_registry::WorkerRecord::deserialize(&document)
+                    .with_context(|| format!("Invalid worker component {}", path.display()))?;
                 anyhow::ensure!(
                     record.session_id == id,
                     "Worker component identity does not match its file name"
                 );
-                workers.push((file, raw));
+                workers.push(WorkerPlan {
+                    path: workers_path.join(&name),
+                    file,
+                    original: raw,
+                    document,
+                    encoded: None,
+                });
+                worker_locks.push(lock);
             }
         }
     }
@@ -175,12 +194,20 @@ fn recover_components() -> Result<()> {
             plan.encoded = Some(serde_json::to_vec(&plan.rows)?);
         }
     }
+    for plan in &mut workers {
+        if resolve_worker_with(&mut plan.document, inventory_clear)? {
+            plan.encoded = Some(serde_json::to_vec(&plan.document)?);
+        }
+    }
     let journal = crate::session::purge_owners::plan_scope_recovery(journal_inventory)?;
-    for (file, raw) in &workers {
+    for plan in &workers {
         anyhow::ensure!(
-            file.read()?.as_deref() == Some(raw.as_str()),
+            plan.file.read()?.as_deref() == Some(plan.original.as_str()),
             "Worker component changed before scope recovery"
         );
+        if plan.encoded.is_some() {
+            plan.file.require_writable_existing()?;
+        }
     }
     for plan in &sessions {
         anyhow::ensure!(
@@ -201,13 +228,26 @@ fn recover_components() -> Result<()> {
         }
     }
     journal.backup()?;
+    for plan in &workers {
+        if plan.encoded.is_some() {
+            crate::session::backup_before_migration(&plan.path)?;
+            AnchoredDir::open(plan.path.parent().context("Worker path has no parent")?)?.sync()?;
+        }
+    }
     for plan in &sessions {
         if let Some(encoded) = &plan.encoded {
             plan.file.replace(encoded)?;
             plan.file.sync_parent()?;
         }
     }
+    for plan in &workers {
+        if let Some(encoded) = &plan.encoded {
+            plan.file.replace(encoded)?;
+            plan.file.sync_parent()?;
+        }
+    }
     journal.commit()?;
+    drop(worker_locks);
     tracing::info!(target: "migrations.scope_recovery", "Completed explicit legacy scope authority recovery");
     Ok(())
 }
@@ -251,6 +291,20 @@ pub(super) mod test_support {
     }
 }
 
+fn resolve_worker_with(
+    document: &mut Value,
+    inventory_clear: impl Fn(&str, &[ScopeOwnership]) -> Result<bool>,
+) -> Result<bool> {
+    let record = crate::process::worker_registry::WorkerRecord::deserialize(&*document)?;
+    if record.scope != ScopeOwnership::Unresolved {
+        return Ok(false);
+    }
+    anyhow::ensure!(inventory_clear(&record.session_id, &[])?,
+        "Worker {} still has a live unknown legacy scope; independently establish and retire the exact original unit before retrying aoe migrate", record.session_id);
+    document["scope"] = serde_json::to_value(ScopeOwnership::Unscoped)?;
+    Ok(true)
+}
+
 fn resolve_rows_with(
     rows: &mut [Value],
     inventory_clear: impl Fn(&str, &[ScopeOwnership]) -> Result<bool>,
@@ -290,6 +344,69 @@ fn resolve_rows_with(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[serial_test::serial]
+    fn recovered_terminal_scope_debt_unlocks_stop_and_purge_without_new_custody() -> Result<()> {
+        let home = tempfile::tempdir()?;
+        let _home = crate::session::test_support::isolate_app_dir_at(home.path());
+        let mut row = crate::session::Instance::new("legacy", "/tmp/repo");
+        row.view = crate::session::View::Terminal;
+        row.terminal_scopes = None;
+        assert!(row.release_scope().is_err());
+        let before = crate::session::purge_owners::PurgeCapture::new(&row)?;
+        assert!(before.ensure_captured_runner_stopped().is_err());
+        let mut rows = vec![serde_json::to_value(&row)?];
+        let original = rows.clone();
+        assert!(resolve_rows_with(&mut rows, |_, _| Ok(false)).is_err());
+        assert_eq!(rows, original);
+        assert!(resolve_rows_with(&mut rows, |_, _| Ok(true))?);
+        let recovered: crate::session::Instance = serde_json::from_value(rows.remove(0))?;
+        assert_eq!(recovered.id, row.id);
+        assert_eq!(recovered.lifecycle_generation, row.lifecycle_generation);
+        recovered.release_scope()?;
+        crate::session::purge_owners::PurgeCapture::new(&recovered)?
+            .ensure_captured_runner_stopped()?;
+        Ok(())
+    }
+
+    #[test]
+    fn worker_scope_recovery_preserves_physical_and_opaque_authority() -> Result<()> {
+        let mut record = crate::process::worker_registry::WorkerRecord::new(
+            "old-worker".into(),
+            std::process::id(),
+            "/tmp/old-worker.sock".into(),
+            "agent".into(),
+            "agent".into(),
+            "/tmp/repo".into(),
+            None,
+            vec![],
+            vec![],
+            None,
+            Some("default".into()),
+        )
+        .with_generation(71);
+        record.scope = ScopeOwnership::Unresolved;
+        let mut document = serde_json::to_value(&record)?;
+        document["opaque_original_authority"] = serde_json::json!({"keep": 19});
+        let before = document.clone();
+        assert!(resolve_worker_with(&mut document, |_, _| Ok(false)).is_err());
+        assert_eq!(document, before);
+        assert!(resolve_worker_with(&mut document, |_, _| anyhow::bail!("denied")).is_err());
+        assert_eq!(document, before);
+        assert!(resolve_worker_with(&mut document, |id, retained| {
+            assert_eq!(id, "old-worker");
+            assert!(retained.is_empty());
+            Ok(true)
+        })?);
+        let mut expected = before;
+        expected["scope"] = serde_json::to_value(ScopeOwnership::Unscoped)?;
+        assert_eq!(document, expected);
+        assert!(!resolve_worker_with(&mut document, |_, _| panic!(
+            "settled proof must not be reacquired"
+        ))?);
+        Ok(())
+    }
 
     #[test]
     fn scope_proof_is_strict_and_retains_every_original_owned_unit() -> Result<()> {

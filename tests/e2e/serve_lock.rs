@@ -371,3 +371,38 @@ fn tui_restart_failure_retains_predecessor_credential_for_rotation_and_removal()
         );
     }
 }
+
+#[test]
+#[parallel]
+fn pending_schema_startup_gates_cli_tui_and_explicit_migrate_before_daemon_writes() {
+    let mut h = TuiTestHarness::new("pending_schema_active_writer");
+    h.stop_daemon_on_drop();
+    h.run_cli_ok(&["serve", "--core-only", "--daemon"]);
+    let app = app_dir_in(h.home_path());
+    let marker = app.join(VERSION_FILE);
+    std::fs::write(
+        &marker,
+        (agent_of_empires::migrations::current_schema_version() - 1).to_string(),
+    )
+    .unwrap();
+    let original_marker = std::fs::read(&marker).unwrap();
+    let original_launch = std::fs::read(app.join("serve.launch")).unwrap();
+    for args in [&["list"][..], &[][..], &["migrate"][..]] {
+        let result = h.run_cli(args);
+        assert!(
+            !result.status.success(),
+            "startup must gate pending migrations"
+        );
+        assert_eq!(std::fs::read(&marker).unwrap(), original_marker);
+        assert_eq!(
+            std::fs::read(app.join("serve.launch")).unwrap(),
+            original_launch
+        );
+    }
+    h.run_cli_ok(&["serve", "--restart"]);
+    assert_eq!(
+        std::fs::read_to_string(&marker).unwrap(),
+        agent_of_empires::migrations::current_schema_version().to_string()
+    );
+    h.run_cli_ok(&["serve", "--stop"]);
+}

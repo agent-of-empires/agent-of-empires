@@ -41,6 +41,10 @@ aoe update
 
 `aoe update` detects how aoe was installed (Homebrew, the install script, Nix, or Cargo) and dispatches to the right mechanism. For Nix and Cargo it prints the manual command instead, since those need external tooling. In the TUI, press `u` while the update bar is visible to run the same flow, or `Ctrl+x` to dismiss the bar.
 
+A schema upgrade refuses to run while a daemon is still writing the old data layout. The TUI and ordinary commands stop before migration and tell you how to continue. With the new binary installed, run `aoe serve --restart` to retain the managed daemon's launch settings and authentication, stop its original process, migrate under exclusion, and start its replacement. Alternatively, run `aoe serve --stop`, then reopen the TUI. Stop a service-supervised daemon through its service manager before migrating and restart it there afterwards. Do not remove PID files or schema markers to bypass this gate.
+
+A daemon from an older build may not expose the local Unix runtime transport, even when a previous attempt already advanced the schema marker. The TUI asks you to restart that daemon rather than trying to use an incompatible transport. Stop and restart capture the original process incarnation before signaling; an exited but unreaped daemon does not require unsafe PID-based escalation.
+
 If you installed shell completions as a static file, regenerate it afterwards so it picks up new commands and flags; see [Shell completions](guides/shell-completions.md) for the always-fresh setup that avoids this.
 
 ## Downgrading
@@ -71,7 +75,13 @@ Run only the matching restore command. Restore modes are mutually exclusive and 
 
 Ordinary startup migrates metadata; it does not perform explicit positive scope recovery. After repairing unreadable components and restoring required journals, run `aoe migrate`. Recovery requires complete, consistent session, worker and journal evidence plus manager and kernel proof before changing scope authority. A current schema marker is not that proof. Live unknown units remain retained, not adopted or stopped automatically.
 
-On Linux, scope recovery must read `/proc/self/ns/cgroup` and `/proc/1/ns/cgroup`, verify the same cgroup namespace and inspect the unified cgroup hierarchy. Permission denial or an incomplete namespace retains unresolved ownership, even after candidate units exit. Restore access to that proof before retrying; do not clear the fence or assume an empty inventory.
+On Linux with a local systemd user manager, scope recovery authenticates that manager through its kernel-identified private socket. It binds that exact manager process and birth to its cgroup root, verifies matching caller and manager cgroup namespaces, and scans the complete manager subtree on a root-mounted cgroup2 filesystem. It does not require access to root's `/proc/1/ns/cgroup` or other users' cgroups. Unreadable or partial evidence, a changing manager, and live unknown units still refuse recovery. The runtime namespace comes from the effective user, not a caller-selected recovery identity.
+
+Disabling systemd scopes today, failing the launch capability probe, or finding no user manager does not prove that historical scopes are absent. Legacy terminal rows do not record the original backend, host or boot needed for an alternative proof. On managerless Linux, this recovery remains refused rather than inventing absence; return to the original accessible manager environment or retain the unresolved evidence. A scope created earlier can outlive its manager or leader.
+
+On macOS, recovery verifies the native Darwin kernel, which cannot host Linux systemd cgroups. This resolves only missing Linux-scope evidence. Explicit captured Linux unit receipts remain refused on macOS; recover those original resources on their Linux host. Worker PID, birth, generation, native runtime, producer and tmux authority are not adopted or replaced. Their own stop and cleanup guards still apply.
+
+Explicit recovery preserves original worker records and opaque fields, changing only an unresolved scope to proven unscoped status. Ordinary startup still leaves missing historical scope evidence unresolved. A missing ownership journal must be restored from complete original authority, never recreated empty.
 
 If a live unknown unit blocks recovery:
 

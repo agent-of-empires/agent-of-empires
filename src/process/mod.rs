@@ -822,6 +822,124 @@ impl ProcessBirthIdentity {
     }
 }
 
+/// A handle to one physical process incarnation, never its process group.
+/// Callers must establish their own custody before sending any signal.
+pub(crate) struct CapturedProcess {
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    handle: platform::ProcessHandle,
+}
+
+impl CapturedProcess {
+    pub(crate) fn capture(
+        pid: u32,
+        expected: &ProcessBirthIdentity,
+    ) -> anyhow::Result<Option<Self>> {
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        {
+            if process_birth_identity(pid)?.as_ref() != Some(expected) {
+                return Ok(None);
+            }
+            let identity = PrimeProcessIdentity {
+                pid,
+                start_id: expected.start_id.clone(),
+            };
+            let Some(handle) = platform::ProcessHandle::capture(&identity)? else {
+                return Ok(None);
+            };
+            if process_birth_identity(pid)?.as_ref() != Some(expected) || handle.exited()? {
+                return Ok(None);
+            }
+            Ok(Some(Self { handle }))
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        {
+            let _ = (pid, expected);
+            anyhow::bail!("incarnation-bound process control unsupported on this platform")
+        }
+    }
+
+    pub(crate) fn exited(&self) -> anyhow::Result<bool> {
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        {
+            self.handle.exited()
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        anyhow::bail!("incarnation-bound process control unsupported on this platform")
+    }
+
+    pub(crate) fn signal(&self, signal: i32) -> anyhow::Result<()> {
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        {
+            self.handle.signal(signal)
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        {
+            let _ = signal;
+            anyhow::bail!("incarnation-bound process control unsupported on this platform")
+        }
+    }
+}
+
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+mod captured_process_tests {
+    use super::*;
+
+    struct ChildGuard(Child);
+
+    impl Drop for ChildGuard {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    #[test]
+    fn single_process_capture_refuses_another_birth() {
+        let child = Command::new("sh")
+            .args(["-c", "read -r line"])
+            .stdin(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let child = ChildGuard(child);
+        let pid = child.0.id();
+        let birth = process_birth_identity(pid).unwrap().unwrap();
+        assert!(CapturedProcess::capture(pid, &birth).unwrap().is_some());
+        let mut wrong = birth.clone();
+        wrong.start_id.push_str("-not-this-incarnation");
+        assert!(CapturedProcess::capture(pid, &wrong).unwrap().is_none());
+        let mut wrong = birth;
+        wrong.boot_id.push_str("-not-this-boot");
+        assert!(CapturedProcess::capture(pid, &wrong).unwrap().is_none());
+    }
+
+    #[test]
+    fn single_process_handle_observes_exit_before_parent_reaps() {
+        let child = Command::new("sh")
+            .args(["-c", "read -r line"])
+            .stdin(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut child = ChildGuard(child);
+        let pid = child.0.id();
+        let birth = process_birth_identity(pid).unwrap().unwrap();
+        let process = CapturedProcess::capture(pid, &birth).unwrap().unwrap();
+        drop(child.0.stdin.take());
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !process.exited().unwrap() {
+            assert!(
+                Instant::now() < deadline,
+                "child physical exit was not observed"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        // Linux zombies still satisfy kill(pid, 0), but cannot own a writer.
+        #[cfg(target_os = "linux")]
+        assert!(nix::sys::signal::kill(Pid::from_raw(pid as i32), None).is_ok());
+        child.0.wait().unwrap();
+        assert!(process.exited().unwrap());
+    }
+}
+
 pub(crate) struct RunnerProcessGuard {
     pid: u32,
     fingerprint: Option<ProcessBirthFingerprint>,
