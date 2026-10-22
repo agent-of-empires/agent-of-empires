@@ -358,12 +358,15 @@ fn requested_image(
     if body.is_empty() {
         return Ok(None);
     }
+    // Media types are case-insensitive, and parameters such as `charset` follow a `;`.
     let is_json = headers
         .get(axum::http::header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
-        .is_some_and(|v| v.starts_with("application/json"));
+        .and_then(|v| v.split(';').next())
+        .is_some_and(|media| media.trim().eq_ignore_ascii_case("application/json"));
+    // A body that names no image is malformed, not a request for the default.
     match serde_json::from_slice::<ImagePullBody>(body) {
-        Ok(parsed) if is_json => Ok(parsed.image),
+        Ok(ImagePullBody { image: Some(image) }) if is_json => Ok(Some(image)),
         _ => Err(api_error(
             StatusCode::BAD_REQUEST,
             "invalid_body",
@@ -712,15 +715,30 @@ mod tests {
             headers
         };
         let none = axum::http::HeaderMap::new;
+        let typed = |value: &str| {
+            let mut headers = axum::http::HeaderMap::new();
+            headers.insert(axum::http::header::CONTENT_TYPE, value.parse().unwrap());
+            headers
+        };
         let image = br#"{"image":"ghcr.io/x/y:1"}"#;
         // (headers, body, requested image, or None for invalid_body)
-        let cases: [(axum::http::HeaderMap, &[u8], Option<Option<&str>>); 5] = [
+        let cases: [(axum::http::HeaderMap, &[u8], Option<Option<&str>>); 10] = [
             (none(), b"", Some(None)),
             (json_type(), b"", Some(None)),
             (json_type(), image, Some(Some("ghcr.io/x/y:1"))),
+            (
+                typed("Application/JSON; charset=utf-8"),
+                image,
+                Some(Some("ghcr.io/x/y:1")),
+            ),
             // A configured image sent without a JSON content type must not pull the default.
             (none(), image, None),
+            (typed("application/json-extra"), image, None),
             (json_type(), b"{not json", None),
+            // A body naming no image is malformed, not a request for the default.
+            (json_type(), b"{}", None),
+            (json_type(), br#"{"image":null}"#, None),
+            (typed("text/plain"), image, None),
         ];
         for (headers, body, want) in cases {
             let got = requested_image(&headers, body);
