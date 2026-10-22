@@ -61,7 +61,7 @@ describe("FilesPane", () => {
     await waitFor(() => {
       expect(container.querySelector("h1")?.textContent).toBe("Plan");
     });
-    expect(api.getSessionFile).toHaveBeenCalledWith("s1", "docs/plan.md");
+    expect(api.getSessionFile).toHaveBeenCalledWith("s1", "docs/plan.md", { editing: false });
 
     fireEvent.click(screen.getByRole("button", { name: "Back to files" }));
     // The row the user opened regains focus, not the top of the pane.

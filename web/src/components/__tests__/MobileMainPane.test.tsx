@@ -16,6 +16,9 @@ vi.mock("../PairedTerminal", () => ({
 vi.mock("../diff/DiffFileList", () => ({
   DiffFileList: () => <div data-testid="diff-list" />,
 }));
+vi.mock("../diff/FileContentViewer", () => ({
+  FileContentViewer: ({ filePath }: { filePath: string }) => <div data-testid="session-file-viewer">{filePath}</div>,
+}));
 vi.mock("../diff/DiffFileViewer", () => ({
   DiffFileViewer: () => <div data-testid="diff-viewer" />,
 }));
@@ -141,6 +144,13 @@ describe("MobileMainPane", () => {
       expect(screen.getByTestId("mobile-back-to-agent")).toBeDefined();
       cleanup();
     }
+  });
+
+  it("uses the provenance-confined viewer for transcript files outside a repository", () => {
+    setup({ view: "diff", selectedFilePath: "/tmp/plan.md", selectedFileExternal: true });
+    expect(screen.getByTestId("session-file-viewer").textContent).toBe("/tmp/plan.md");
+    expect(screen.queryByTestId("diff-viewer")).toBeNull();
+    cleanup();
   });
 
   it("shows the diff list, or the viewer when a file is selected", () => {
