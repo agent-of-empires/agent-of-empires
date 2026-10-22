@@ -22,6 +22,11 @@ export function useSandboxImageBanner(): SandboxImageBannerView | null {
   // page saw running; otherwise every reload would repeat an old result.
   const [watchedPull, setWatchedPull] = useState(false);
   const [noticeDismissed, setNoticeDismissed] = useState(false);
+  // Why the Daemon refused the last "Update now"; nothing was pulled.
+  const [refusal, setRefusal] = useState<string | null>(null);
+  // Set from "Update now" until a status answer confirms the pull, so polling stays fast even when
+  // the status request itself fails.
+  const expectingPull = useRef(false);
   // The Daemon refuses checks and pulls while it can't read its configuration.
   const [configUnreadable, setConfigUnreadable] = useState(false);
   const [configNoticeDismissed, setConfigNoticeDismissed] = useState(false);
@@ -45,8 +50,9 @@ export function useSandboxImageBanner(): SandboxImageBannerView | null {
         setStatus(answer);
         if (answer.pull.state === "running") setWatchedPull(true);
       }
+      if (answer) expectingPull.current = false;
       if (timer) clearTimeout(timer);
-      const pulling = answer?.pull.state === "running";
+      const pulling = answer ? answer.pull.state === "running" : expectingPull.current;
       timer = setTimeout(poll, pulling ? PULL_POLL_MS : POLL_MINUTES * 60_000);
     };
     pollNow.current = () => {
@@ -75,8 +81,18 @@ export function useSandboxImageBanner(): SandboxImageBannerView | null {
   const update = useCallback(() => {
     setWatchedPull(true);
     setNoticeDismissed(false);
+    setRefusal(null);
+    expectingPull.current = true;
     setStatus((s) => s && { ...s, pull: { state: "running" } });
-    void pullSandboxImage().then(() => pollNow.current());
+    void pullSandboxImage().then((reply) => {
+      if (!reply.ok) {
+        // Nothing was pulled, and the Daemon may still hold an older pull's outcome.
+        expectingPull.current = false;
+        setWatchedPull(false);
+        setRefusal(reply.message ?? "The Daemon refused the pull.");
+      }
+      pollNow.current();
+    });
   }, []);
 
   if (configUnreadable) {
@@ -86,6 +102,9 @@ export function useSandboxImageBanner(): SandboxImageBannerView | null {
   }
   if (!status || !status.checks_enabled || !status.sandbox_in_use) return null;
 
+  if (refusal !== null && !noticeDismissed) {
+    return { kind: "failed", error: refusal, onRetry: update, onDismiss: () => setNoticeDismissed(true) };
+  }
   const { pull } = status;
   if (pull.state === "running") return { kind: "updating" };
   if (watchedPull && !noticeDismissed) {

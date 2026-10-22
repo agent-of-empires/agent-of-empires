@@ -5,10 +5,13 @@ import { writeClipboard } from "../lib/clipboard";
 const WHY =
   "Sandboxed sessions run in a container image that AoE doesn't update automatically. Newer AoE versions can need a newer image; without it, Structured view sessions stop with an adapter error.";
 
+// Text stays at text contrast on every tint in every built-in theme (text-primary at least 5.99:1,
+// text-subtle 4.84:1). A status hue on its own tint falls short (status-running is 2.68:1 and
+// status-error-text 4.07:1 in Catppuccin Latte), so the state's colour is on the dot and border.
 const TONES = {
-  brand: { bar: "bg-brand-600/10 border-brand-600/30 text-brand-300", dot: "bg-brand-400" },
-  done: { bar: "bg-status-running/10 border-status-running/30 text-status-running", dot: "bg-status-running" },
-  failed: { bar: "bg-status-error/10 border-status-error/30 text-status-error", dot: "bg-status-error" },
+  brand: { bar: "bg-brand-600/10 border-brand-600/30 text-text-primary", dot: "bg-brand-400" },
+  done: { bar: "bg-status-running/10 border-status-running/30 text-text-primary", dot: "bg-status-running" },
+  failed: { bar: "bg-status-error/10 border-status-error/30 text-text-primary", dot: "bg-status-error" },
 };
 
 const linkButton = "min-h-8 underline cursor-pointer hover:opacity-80";
@@ -53,10 +56,10 @@ export function SandboxImageBanner({ view }: { view: SandboxImageBannerView }) {
       );
     case "config_unreadable":
       return (
-        <Bar tone="failed" label="Couldn't check the sandbox image" onDismiss={view.onDismiss}>
+        <Bar tone="failed" label="AoE can't read its configuration" onDismiss={view.onDismiss}>
           <span>
-            Couldn&apos;t check the sandbox image: the Daemon can&apos;t read its configuration (config.toml or
-            state.toml). Fix the file, then reload.
+            AoE can&apos;t read its configuration (config.toml or state.toml), so sandbox image updates aren&apos;t
+            checked. Fix the file, then reload.
           </span>
         </Bar>
       );
@@ -101,7 +104,7 @@ function Bar({
           type="button"
           onClick={onDismiss}
           aria-label="Dismiss sandbox image notice"
-          className="absolute right-2 top-1 sm:static sm:ml-2 min-h-8 text-text-muted hover:text-text-secondary cursor-pointer text-base leading-none px-1"
+          className="absolute right-2 top-1 sm:static sm:ml-2 min-h-8 text-text-subtle hover:text-text-primary cursor-pointer text-base leading-none px-1"
         >
           &times;
         </button>
@@ -164,7 +167,8 @@ function CopyCommand({ command }: { command: string }) {
       <button type="button" onClick={() => void copy()} className={linkButton} aria-label={`Copy ${command}`}>
         Copy
       </button>
-      <span role="status">
+      {/* Inside the banner's live region, so it is announced without a nested one. */}
+      <span>
         {feedback === "copied" ? "Copied" : feedback === "failed" ? "Couldn't copy. Select and copy it." : ""}
       </span>
     </span>

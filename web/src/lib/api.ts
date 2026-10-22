@@ -1561,8 +1561,9 @@ export async function fetchSandboxImageStatus(): Promise<SandboxImageStatus | { 
   return { error: stringField(reply.payload, "error") ?? `http_${reply.status}` };
 }
 
-export function pullSandboxImage(): Promise<boolean> {
-  return fetchOk("/api/sandbox/image-pull", { method: "POST" });
+/** `message` explains a refusal: the gate is off, read-only, or the configuration is unreadable. */
+export function pullSandboxImage(): Promise<{ ok: boolean; message?: string }> {
+  return okWithMessage("/api/sandbox/image-pull", { method: "POST" });
 }
 
 export function dismissSandboxImage(digest: string): Promise<boolean> {
