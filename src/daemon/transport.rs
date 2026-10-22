@@ -53,6 +53,17 @@ pub(crate) fn prepare_runtime_directory(parent: &Path) -> anyhow::Result<()> {
     let private_gid = user_private_gid(owner);
     for ancestor in parent.ancestors() {
         let meta = std::fs::symlink_metadata(ancestor)?;
+        if meta.is_dir()
+            && meta.uid() == owner
+            && meta.mode() & 0o022 != 0
+            && !trusted_ancestor(meta.uid(), meta.gid(), meta.mode(), owner, private_gid)
+        {
+            anyhow::bail!(
+                "Unsafe daemon socket directory: {}. Remove group/other write permission from this directory with `chmod go-w -- {}`, then retry.",
+                ancestor.display(),
+                crate::session::environment::shell_escape(&ancestor.to_string_lossy())
+            );
+        }
         anyhow::ensure!(
             meta.is_dir()
                 && !meta.file_type().is_symlink()

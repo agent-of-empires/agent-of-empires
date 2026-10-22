@@ -47,6 +47,12 @@ A daemon from an older build may not expose the local Unix runtime transport, ev
 
 If you installed shell completions as a static file, regenerate it afterwards so it picks up new commands and flags; see [Shell completions](guides/shell-completions.md) for the always-fresh setup that avoids this.
 
+Local Unix transport requires a private `daemon/` directory and trusted
+ancestors. AoE creates missing application ancestors without group-write bits,
+including under umask `002`; it does not change existing `~/.config` permissions.
+If an existing shared-group directory is refused as unsafe, remove group write
+permission only from the directory named in the error, then retry.
+
 ## Downgrading
 
 Downgrades are unsupported. An older build refuses a newer `.schema_version`; preserve that refusal. Never lower or delete the marker to force startup. Older commands and clients are not safe readability probes against current application data.
