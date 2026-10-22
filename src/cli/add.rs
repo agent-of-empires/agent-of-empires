@@ -664,10 +664,9 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
                 },
             },
         };
-        if let Some(ovr) = crate::server::acp_reconciler::command_override_for_spawn(
-            &instance.tool,
-            &instance.command,
-        ) {
+        if let Some(ovr) =
+            crate::acp::supervisor::command_override_for_spawn(&instance.tool, &instance.command)
+        {
             crate::acp::supervisor::apply_agent_command_override(
                 &agent_name,
                 spec_from_registry,

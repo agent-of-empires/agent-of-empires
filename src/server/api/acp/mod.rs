@@ -134,7 +134,7 @@ pub(crate) fn spawn_request_for(
         source_profile: Some(instance.source_profile.clone()),
         yolo_mode: instance.yolo_mode,
         acp_mode_id: instance.acp_mode_id.clone(),
-        agent_command_override: crate::server::acp_reconciler::command_override_for_spawn(
+        agent_command_override: crate::acp::supervisor::command_override_for_spawn(
             &instance.tool,
             &instance.command,
         ),

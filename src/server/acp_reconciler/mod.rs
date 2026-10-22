@@ -21,7 +21,7 @@ use crate::session::Instance;
 pub(crate) use rate_limit::install_rate_limit_continuation;
 #[cfg(test)]
 pub(crate) use rate_limit::ContinuationOutcome;
-pub(crate) use resume::{command_override_for_spawn, trigger_resume_background, ResumeTrigger};
+pub(crate) use resume::{trigger_resume_background, ResumeTrigger};
 
 use resume::{resume_one, ResumeTarget};
 

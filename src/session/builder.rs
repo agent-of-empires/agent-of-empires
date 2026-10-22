@@ -1285,8 +1285,7 @@ pub mod structured {
             "" => config.session.resolve_tool_command(choice.tool),
             command => command.to_string(),
         };
-        if let Some(ovr) =
-            crate::server::acp_reconciler::command_override_for_spawn(choice.tool, &command)
+        if let Some(ovr) = crate::acp::supervisor::command_override_for_spawn(choice.tool, &command)
         {
             crate::acp::supervisor::apply_agent_command_override(
                 agent,

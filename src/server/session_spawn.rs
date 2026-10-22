@@ -727,7 +727,7 @@ pub(crate) async fn spawn_structured_session(
                     )
                     .await;
                 let command_override =
-                    crate::server::acp_reconciler::command_override_for_spawn(&tool, &command);
+                    crate::acp::supervisor::command_override_for_spawn(&tool, &command);
                 let cwd = std::path::PathBuf::from(project_path);
                 let supervisor = service.acp_supervisor.clone();
                 let service_for_check = service.clone();
