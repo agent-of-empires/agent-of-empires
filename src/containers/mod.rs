@@ -33,14 +33,17 @@ pub fn runtime_binary() -> &'static str {
 pub const SANDBOX_NAME_PREFIX: &str = "aoe-sandbox-";
 
 pub fn get_container_runtime() -> ContainerRuntime {
-    if let Ok(cfg) = Config::load() {
-        match cfg.sandbox.container_runtime {
-            ContainerRuntimeName::AppleContainer => ContainerRuntime::apple_container(),
-            ContainerRuntimeName::Docker => ContainerRuntime::docker(),
-            ContainerRuntimeName::Podman => ContainerRuntime::podman(),
-        }
-    } else {
-        ContainerRuntime::default()
+    match Config::load() {
+        Ok(cfg) => container_runtime_for(cfg.sandbox.container_runtime),
+        Err(_) => ContainerRuntime::default(),
+    }
+}
+
+pub fn container_runtime_for(name: ContainerRuntimeName) -> ContainerRuntime {
+    match name {
+        ContainerRuntimeName::AppleContainer => ContainerRuntime::apple_container(),
+        ContainerRuntimeName::Docker => ContainerRuntime::docker(),
+        ContainerRuntimeName::Podman => ContainerRuntime::podman(),
     }
 }
 

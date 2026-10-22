@@ -1672,11 +1672,13 @@ impl App {
         if self.image_update_rx.is_some() {
             return;
         }
-        let image = Config::load_or_warn().sandbox.default_image.clone();
+        let sandbox = Config::load_or_warn().sandbox;
+        let image = sandbox.default_image;
+        let runtime = crate::containers::container_runtime_for(sandbox.container_runtime);
         let (tx, rx) = tokio::sync::oneshot::channel();
         self.image_update_rx = Some(rx);
         tokio::spawn(async move {
-            let result = crate::containers::image_update::check_image(&image).await;
+            let result = crate::containers::image_update::check_image(runtime, &image).await;
             let _ = tx.send(result);
         });
     }

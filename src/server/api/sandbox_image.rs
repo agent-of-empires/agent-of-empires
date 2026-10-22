@@ -4,7 +4,7 @@
 
 use std::collections::HashMap;
 use std::sync::{Arc, LazyLock, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use axum::extract::rejection::JsonRejection;
 use axum::extract::{Query, State};
@@ -12,10 +12,14 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use serde::{Deserialize, Serialize};
+// Tokio's, so tests can drive overlapping checks on a paused clock.
+use tokio::time::Instant;
 
 use super::{api_error, cityhall_block, read_only_block};
+use crate::containers::container_runtime_for;
 use crate::containers::image_update::{self, ImageCheck};
 use crate::server::AppState;
+use crate::session::ContainerRuntimeName;
 
 /// Long enough that the banner and the wizard share a registry request, short enough that a
 /// newly published image shows up within the hour.
@@ -53,61 +57,92 @@ fn is_dismissed(state: &ImageState, dismissed_digest: Option<&str>) -> bool {
         if dismissed_digest == Some(remote_digest.as_str()))
 }
 
+/// One image as one Container runtime sees it, so switching runtimes can't reuse another's answer.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct ImageKey {
+    runtime: &'static str,
+    image: String,
+}
+
 #[derive(Default)]
 struct StatusCache {
-    entries: HashMap<String, (Instant, ImageState)>,
+    entries: HashMap<ImageKey, (Instant, ImageState)>,
+    /// Bumped by a pull, so a check that began before it can't store its older answer.
+    generations: HashMap<ImageKey, u64>,
 }
 
 impl StatusCache {
-    /// A result checked after `not_before` (a fresh request) or within the TTL.
-    fn get(&self, image: &str, now: Instant, not_before: Option<Instant>) -> Option<ImageState> {
-        let (at, state) = self.entries.get(image)?;
+    /// A result whose check started after `not_before` (a fresh request), or one within the TTL.
+    fn get(&self, key: &ImageKey, now: Instant, not_before: Option<Instant>) -> Option<ImageState> {
+        let (started, state) = self.entries.get(key)?;
         let usable = match not_before {
-            Some(not_before) => *at >= not_before,
-            None => now.duration_since(*at) < STATUS_TTL,
+            Some(not_before) => *started >= not_before,
+            None => now.duration_since(*started) < STATUS_TTL,
         };
         usable.then(|| state.clone())
     }
 
-    fn store(&mut self, image: &str, at: Instant, state: ImageState) {
-        self.entries.insert(image.to_string(), (at, state));
+    fn generation(&self, key: &ImageKey) -> u64 {
+        self.generations.get(key).copied().unwrap_or(0)
     }
 
-    fn invalidate(&mut self, image: &str) {
-        self.entries.remove(image);
+    /// Keeps a check that started at `started` in `generation`, unless a pull has run since.
+    fn store(&mut self, key: &ImageKey, started: Instant, generation: u64, state: ImageState) {
+        if self.generation(key) == generation {
+            self.entries.insert(key.clone(), (started, state));
+        }
+    }
+
+    fn invalidate(&mut self, key: &ImageKey) {
+        self.entries.remove(key);
+        *self.generations.entry(key.clone()).or_default() += 1;
     }
 }
 
 static STATUS: LazyLock<Mutex<StatusCache>> = LazyLock::new(Mutex::default);
-/// One registry check per image at a time, so callers arriving together share it.
-static CHECK_TURNS: LazyLock<Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>> =
+/// One registry check per image and runtime at a time, so callers arriving together share it.
+static CHECK_TURNS: LazyLock<Mutex<HashMap<ImageKey, Arc<tokio::sync::Mutex<()>>>>> =
     LazyLock::new(Mutex::default);
 
-async fn image_state(image: &str, fresh: bool) -> ImageState {
+async fn image_state(runtime: ContainerRuntimeName, key: ImageKey, fresh: bool) -> ImageState {
+    image_state_with(key, fresh, move |image| async move {
+        image_update::check_image(container_runtime_for(runtime), &image).await
+    })
+    .await
+}
+
+async fn image_state_with<F, Fut>(key: ImageKey, fresh: bool, check: F) -> ImageState
+where
+    F: FnOnce(String) -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = anyhow::Result<ImageCheck>> + Send,
+{
     let requested_at = Instant::now();
     let turn = CHECK_TURNS
         .lock()
         .unwrap_or_else(|e| e.into_inner())
-        .entry(image.to_string())
+        .entry(key.clone())
         .or_default()
         .clone();
-    let image = image.to_string();
     // Detached so a closed page still caches the answer for the next caller.
     tokio::spawn(async move {
         let _turn = turn.lock().await;
-        let not_before = fresh.then_some(requested_at);
-        let cached = STATUS.lock().unwrap_or_else(|e| e.into_inner()).get(
-            &image,
-            Instant::now(),
-            not_before,
-        );
+        let (cached, generation) = {
+            let cache = STATUS.lock().unwrap_or_else(|e| e.into_inner());
+            let not_before = fresh.then_some(requested_at);
+            (
+                cache.get(&key, Instant::now(), not_before),
+                cache.generation(&key),
+            )
+        };
         if let Some(state) = cached {
             return state;
         }
-        let state = ImageState::from_check(image_update::check_image(&image).await);
+        let started = Instant::now();
+        let state = ImageState::from_check(check(key.image.clone()).await);
         STATUS.lock().unwrap_or_else(|e| e.into_inner()).store(
-            &image,
-            Instant::now(),
+            &key,
+            started,
+            generation,
             state.clone(),
         );
         state
@@ -130,22 +165,22 @@ pub enum PullState {
     },
 }
 
-static PULLS: LazyLock<Mutex<HashMap<String, PullState>>> = LazyLock::new(Mutex::default);
+static PULLS: LazyLock<Mutex<HashMap<ImageKey, PullState>>> = LazyLock::new(Mutex::default);
 
-/// Marks `image` running unless it already is; true when the caller should start the pull.
-fn claim_pull(pulls: &mut HashMap<String, PullState>, image: &str) -> bool {
-    if pulls.get(image) == Some(&PullState::Running) {
+/// Marks the image running unless it already is; true when the caller should start the pull.
+fn claim_pull(pulls: &mut HashMap<ImageKey, PullState>, key: &ImageKey) -> bool {
+    if pulls.get(key) == Some(&PullState::Running) {
         return false;
     }
-    pulls.insert(image.to_string(), PullState::Running);
+    pulls.insert(key.clone(), PullState::Running);
     true
 }
 
-fn pull_state(image: &str) -> PullState {
+fn pull_state(key: &ImageKey) -> PullState {
     PULLS
         .lock()
         .unwrap_or_else(|e| e.into_inner())
-        .get(image)
+        .get(key)
         .cloned()
         .unwrap_or(PullState::Idle)
 }
@@ -155,45 +190,63 @@ fn pull_state(image: &str) -> PullState {
 struct Configured {
     default_image: String,
     images: Vec<String>,
+    runtime: ContainerRuntimeName,
     checks_enabled: bool,
     enabled_by_default: bool,
     allow_image_pull: bool,
     dismissed_digest: Option<String>,
 }
 
-fn load_configured() -> Configured {
-    let config = crate::session::Config::load_or_warn();
-    let default_image = config.sandbox.default_image.clone();
-    let mut images = vec![default_image.clone()];
-    for profile in crate::session::list_profiles().unwrap_or_default() {
-        let image = crate::session::resolve_config_or_warn(&profile)
-            .sandbox
-            .default_image;
-        if !images.contains(&image) {
-            images.push(image);
+impl Configured {
+    fn key(&self, image: String) -> ImageKey {
+        ImageKey {
+            runtime: container_runtime_for(self.runtime).display_name(),
+            image,
         }
     }
-    Configured {
+}
+
+/// Strict, so an unreadable config refuses the request rather than falling back to defaults,
+/// whose pull gate is open.
+fn load_configured() -> anyhow::Result<Configured> {
+    let config = crate::session::Config::load()?;
+    let default_image = config.sandbox.default_image.clone();
+    let mut images = vec![default_image.clone()];
+    for profile in crate::session::list_profiles()? {
+        match crate::session::resolve_config(&profile) {
+            Ok(resolved) if !images.contains(&resolved.sandbox.default_image) => {
+                images.push(resolved.sandbox.default_image);
+            }
+            Ok(_) => {}
+            // An unreadable profile only drops its image from what may be checked or pulled.
+            Err(e) => {
+                tracing::warn!(target: "http.api.sandbox_image", %profile, "skipping profile: {e:#}")
+            }
+        }
+    }
+    Ok(Configured {
         default_image,
         images,
+        runtime: config.sandbox.container_runtime,
         checks_enabled: config.updates.update_check_mode.is_enabled(),
         enabled_by_default: config.sandbox.enabled_by_default,
         allow_image_pull: config.sandbox.allow_image_pull,
         dismissed_digest: config.app_state.dismissed_image_digest,
-    }
+    })
 }
 
 async fn configured() -> Result<Configured, Response> {
-    tokio::task::spawn_blocking(load_configured)
+    let loaded = tokio::task::spawn_blocking(load_configured)
         .await
-        .map_err(|e| {
-            tracing::error!(target: "http.api.sandbox_image", "loading config panicked: {e}");
-            api_error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "internal",
-                "Internal server error",
-            )
-        })
+        .unwrap_or_else(|e| Err(anyhow::anyhow!("loading config panicked: {e}")));
+    loaded.map_err(|e| {
+        tracing::error!(target: "http.api.sandbox_image", "reading the configuration failed: {e:#}");
+        api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "config_unreadable",
+            "Couldn't read the AoE configuration, so no sandbox image is checked or pulled",
+        )
+    })
 }
 
 fn resolve_image(configured: &Configured, requested: Option<&str>) -> Result<String, Response> {
@@ -260,8 +313,10 @@ pub async fn sandbox_image_status(
         Ok(image) => image,
         Err(resp) => return resp,
     };
+    let runtime = container_runtime_for(configured.runtime);
+    let key = configured.key(image.clone());
     let image_state = if configured.checks_enabled {
-        image_state(&image, query.fresh).await
+        image_state(configured.runtime, key.clone(), query.fresh).await
     } else {
         ImageState::Unknown {
             reason: "checks_off",
@@ -275,9 +330,8 @@ pub async fn sandbox_image_status(
             .await
             .iter()
             .any(|i| i.is_sandboxed());
-    let runtime = crate::containers::get_container_runtime();
     Json(ImageStatusResponse {
-        pull: pull_state(&image),
+        pull: pull_state(&key),
         pull_blocked: pull_blocked(&state, &configured),
         pull_command: runtime.pull_command(&image),
         runtime: runtime.display_name(),
@@ -331,13 +385,14 @@ pub async fn sandbox_image_pull(
         Ok(image) => image,
         Err(resp) => return resp,
     };
-    let started = claim_pull(&mut PULLS.lock().unwrap_or_else(|e| e.into_inner()), &image);
+    let key = configured.key(image.clone());
+    let started = claim_pull(&mut PULLS.lock().unwrap_or_else(|e| e.into_inner()), &key);
     if started {
-        let job_image = image.clone();
+        let runtime = configured.runtime;
         tokio::spawn(async move {
-            let pulled = job_image.clone();
+            let pulled = key.image.clone();
             let result = tokio::task::spawn_blocking(move || {
-                crate::containers::get_container_runtime().pull_image(&pulled)
+                container_runtime_for(runtime).pull_image(&pulled)
             })
             .await;
             let outcome = match result {
@@ -352,11 +407,11 @@ pub async fn sandbox_image_pull(
             STATUS
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
-                .invalidate(&job_image);
+                .invalidate(&key);
             PULLS
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
-                .insert(job_image, outcome);
+                .insert(key, outcome);
         });
     }
     (
@@ -478,50 +533,228 @@ mod tests {
         assert!(!is_dismissed(&ImageState::Current, Some("sha256:b")));
     }
 
-    #[test]
-    fn the_cache_serves_within_its_ttl_honours_fresh_and_drops_a_pulled_image() {
-        let mut cache = StatusCache::default();
-        let checked = Instant::now();
-        cache.store("img", checked, ImageState::Current);
-
-        let within = checked + STATUS_TTL - Duration::from_secs(1);
-        assert_eq!(cache.get("img", within, None), Some(ImageState::Current));
-        assert_eq!(
-            cache.get("img", checked + STATUS_TTL, None),
-            None,
-            "expired"
-        );
-        // A fresh request only takes a result checked after it arrived.
-        assert_eq!(
-            cache.get("img", within, Some(checked + Duration::from_secs(1))),
-            None
-        );
-        assert_eq!(
-            cache.get("img", within, Some(checked)),
-            Some(ImageState::Current)
-        );
-
-        cache.invalidate("img");
-        assert_eq!(cache.get("img", checked, None), None, "a pull invalidates");
+    fn key(runtime: &'static str, image: &str) -> ImageKey {
+        ImageKey {
+            runtime,
+            image: image.into(),
+        }
     }
 
     #[test]
-    fn only_one_pull_per_image_runs_at_a_time() {
+    fn the_cache_is_dated_by_check_start_and_discards_a_check_a_pull_overtook() {
+        let docker = key("Docker", "img");
+        let mut cache = StatusCache::default();
+        let started = Instant::now();
+        cache.store(
+            &docker,
+            started,
+            cache.generation(&docker),
+            ImageState::Current,
+        );
+
+        let within = started + STATUS_TTL - Duration::from_secs(1);
+        assert_eq!(cache.get(&docker, within, None), Some(ImageState::Current));
+        assert_eq!(
+            cache.get(&docker, started + STATUS_TTL, None),
+            None,
+            "expired"
+        );
+
+        // A check that started before a fresh request doesn't satisfy it, however late it ended.
+        assert_eq!(
+            cache.get(&docker, within, Some(started + Duration::from_secs(1))),
+            None
+        );
+        assert_eq!(
+            cache.get(&docker, within, Some(started)),
+            Some(ImageState::Current)
+        );
+
+        // A check in flight when a pull finishes can't store its pre-pull answer.
+        let generation = cache.generation(&docker);
+        cache.invalidate(&docker);
+        assert_eq!(
+            cache.get(&docker, started, None),
+            None,
+            "a pull invalidates"
+        );
+        let available = ImageState::Available {
+            remote_digest: "sha256:old".into(),
+        };
+        cache.store(&docker, Instant::now(), generation, available);
+        assert_eq!(
+            cache.get(&docker, Instant::now(), None),
+            None,
+            "stale check discarded"
+        );
+        let current = cache.generation(&docker);
+        cache.store(&docker, Instant::now(), current, ImageState::Current);
+        assert_eq!(
+            cache.get(&docker, Instant::now(), None),
+            Some(ImageState::Current)
+        );
+    }
+
+    fn available(digest: &str) -> ImageState {
+        ImageState::Available {
+            remote_digest: digest.into(),
+        }
+    }
+
+    /// A 10 s check that answers with how many checks have run, so each answer is traceable.
+    fn slow_check(
+        checks: Arc<std::sync::atomic::AtomicUsize>,
+    ) -> impl FnOnce(
+        String,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = anyhow::Result<ImageCheck>> + Send>,
+    > {
+        move |image| {
+            Box::pin(async move {
+                let n = checks.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+                tokio::time::sleep(Duration::from_secs(10)).await;
+                Ok(ImageCheck::Available(ImageUpdate {
+                    image,
+                    remote_digest: format!("sha256:{n}"),
+                }))
+            })
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn overlapping_requests_and_a_pull_mid_check_never_get_an_older_answer() {
+        let key = key("Docker", "overlap-test-image");
+        let checks = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+        // A starts a check; B asks for a fresh answer while it runs.
+        let a = tokio::spawn(image_state_with(
+            key.clone(),
+            false,
+            slow_check(checks.clone()),
+        ));
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        let b = tokio::spawn(image_state_with(
+            key.clone(),
+            true,
+            slow_check(checks.clone()),
+        ));
+        assert_eq!(a.await.unwrap(), available("sha256:1"));
+        // A's check started before B arrived, so it can't count as fresh however late it ended.
+        assert_eq!(b.await.unwrap(), available("sha256:2"));
+        // A cached request shares the newest answer.
+        let cached = image_state_with(key.clone(), false, slow_check(checks.clone())).await;
+        assert_eq!(cached, available("sha256:2"));
+
+        // A pull finishing mid-check: that check still answers its caller, but isn't cached.
+        let c = tokio::spawn(image_state_with(
+            key.clone(),
+            true,
+            slow_check(checks.clone()),
+        ));
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        STATUS.lock().unwrap().invalidate(&key);
+        assert_eq!(c.await.unwrap(), available("sha256:3"));
+        let after = image_state_with(key.clone(), false, slow_check(checks.clone())).await;
+        assert_eq!(
+            after,
+            available("sha256:4"),
+            "the pre-pull answer was not served"
+        );
+    }
+
+    #[test]
+    fn a_runtime_switch_keys_status_and_pulls_apart() {
+        let configured = |runtime| Configured {
+            default_image: "img".into(),
+            images: Vec::new(),
+            runtime,
+            checks_enabled: true,
+            enabled_by_default: false,
+            allow_image_pull: true,
+            dismissed_digest: None,
+        };
+        let docker = configured(ContainerRuntimeName::Docker).key("img".into());
+        let podman = configured(ContainerRuntimeName::Podman).key("img".into());
+        assert_ne!(docker, podman);
+        let mut cache = StatusCache::default();
+        cache.store(&docker, Instant::now(), 0, ImageState::Current);
+        assert_eq!(
+            cache.get(&podman, Instant::now(), None),
+            None,
+            "Docker's answer isn't Podman's"
+        );
+    }
+
+    #[test]
+    fn only_one_pull_per_image_and_runtime_runs_at_a_time() {
         let mut pulls = HashMap::new();
-        assert!(claim_pull(&mut pulls, "img"));
-        assert!(!claim_pull(&mut pulls, "img"), "already running");
-        assert!(claim_pull(&mut pulls, "other"), "per image");
+        let docker = key("Docker", "img");
+        assert!(claim_pull(&mut pulls, &docker));
+        assert!(!claim_pull(&mut pulls, &docker), "already running");
+        assert!(claim_pull(&mut pulls, &key("Docker", "other")), "per image");
+        assert!(claim_pull(&mut pulls, &key("Podman", "img")), "per runtime");
         for finished in [
             PullState::Done,
             PullState::Failed {
                 error: "denied".into(),
             },
         ] {
-            pulls.insert("img".into(), finished);
+            pulls.insert(docker.clone(), finished);
             assert!(
-                claim_pull(&mut pulls, "img"),
+                claim_pull(&mut pulls, &docker),
                 "a finished pull can be retried"
             );
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn an_unreadable_configuration_refuses_status_and_pull() {
+        let _app = crate::session::test_support::isolate_app_dir();
+        crate::session::update_config(|c| c.sandbox.allow_image_pull = false).unwrap();
+        let dir = crate::session::get_app_dir().unwrap();
+        let state = crate::server::test_support::build_test_app_state(Vec::new());
+        // (file made unreadable, what it breaks)
+        for (file, label) in [
+            ("state.toml", "malformed state.toml under a disabled gate"),
+            ("config.toml", "malformed config.toml"),
+        ] {
+            let path = dir.join(file);
+            let original = std::fs::read_to_string(&path).unwrap_or_default();
+            std::fs::write(&path, "not = [valid").unwrap();
+            let pull = sandbox_image_pull(
+                State(state.clone()),
+                Ok(Json(ImagePullBody { image: None })),
+            )
+            .await;
+            let (code, body) = json(pull).await;
+            assert_eq!(
+                (code, body["error"].as_str()),
+                (StatusCode::INTERNAL_SERVER_ERROR, Some("config_unreadable")),
+                "{label}"
+            );
+            let status = sandbox_image_status(
+                State(state.clone()),
+                Query(ImageStatusQuery {
+                    image: None,
+                    fresh: false,
+                }),
+            )
+            .await;
+            assert_eq!(
+                status.status(),
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "{label}"
+            );
+            assert!(
+                PULLS
+                    .lock()
+                    .unwrap()
+                    .values()
+                    .all(|p| *p != PullState::Running),
+                "{label}: no pull started"
+            );
+            std::fs::write(&path, original).unwrap();
         }
     }
 

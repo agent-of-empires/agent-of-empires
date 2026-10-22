@@ -297,12 +297,13 @@ fn compare(image: &str, local: &str, remote: String) -> ImageCheck {
 
 /// `Err` means the registry couldn't be asked (network, auth, timeout), not that the image is
 /// current.
-pub async fn check_image(image: &str) -> Result<ImageCheck> {
+pub async fn check_image(
+    runtime: crate::containers::ContainerRuntime,
+    image: &str,
+) -> Result<ImageCheck> {
     let image_owned = image.to_string();
     let pre = tokio::task::spawn_blocking(move || {
-        pre_check(&image_owned, || {
-            crate::containers::get_container_runtime().local_image_digest(&image_owned)
-        })
+        pre_check(&image_owned, || runtime.local_image_digest(&image_owned))
     })
     .await
     .map_err(|e| anyhow!("local image check panicked: {e}"))?;
