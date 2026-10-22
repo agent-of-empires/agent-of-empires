@@ -383,6 +383,14 @@ fn run_migrations_inner(
         v027_isolate_sandbox_stores::reconcile_pending(announce)?;
         v033_isolate_sandbox_content::reconcile_pending(announce)?;
     } else {
+        // A live daemon at this schema predates this build and would keep
+        // writing the old shape underneath the migrated data.
+        if let crate::cli::serve::DaemonStatus::Verified(pid) = crate::cli::serve::daemon_status() {
+            anyhow::bail!(
+                "An older aoe daemon (PID {pid}) is running on schema {current}; stop it with \
+                 `aoe serve --stop`, then retry"
+            );
+        }
         let pending: Vec<&Migration> = MIGRATIONS
             .iter()
             .filter(|(version, ..)| *version > current)

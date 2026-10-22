@@ -1481,13 +1481,24 @@ pub(crate) async fn ensure_local_daemon(
     } else {
         None
     };
-    let endpoint = crate::acp::client::DaemonEndpoint::local_unix(
-        crate::daemon::transport::local_socket_path()?,
-    );
-    endpoint
+    let socket = crate::daemon::transport::local_socket_path()?;
+    let endpoint = crate::acp::client::DaemonEndpoint::local_unix(socket.clone());
+    let ready = endpoint
         .daemon_client()?
         .local_runtime_ready((!profile.is_empty()).then_some(profile))
-        .await?;
+        .await;
+    if let Err(error) = ready {
+        if started.is_none() && !socket.exists() {
+            if let Some(pid) = daemon_pid() {
+                bail!(
+                    "The running aoe daemon (PID {pid}) does not serve {}; it is likely from an \
+                     older aoe. Stop it with `aoe serve --stop`, then retry",
+                    socket.display()
+                );
+            }
+        }
+        return Err(error.into());
+    }
     Ok((endpoint, started))
 }
 pub(crate) async fn start_dashboard_for_tui(

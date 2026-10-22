@@ -27,10 +27,8 @@ pub(super) fn legacy_scope_inventory_clear(
         .collect();
     let current_namespace = fs::read_link("/proc/self/ns/cgroup")
         .context("Reading /proc/self/ns/cgroup for complete scope inventory")?;
-    let init_namespace = fs::read_link("/proc/1/ns/cgroup")
-        .context("Reading /proc/1/ns/cgroup for complete scope inventory")?;
     anyhow::ensure!(
-        current_namespace == init_namespace,
+        current_namespace == scope_manager_cgroup_namespace()?,
         "Cannot prove full cgroup inventory in a nested cgroup namespace"
     );
     let mountinfo = fs::read_to_string("/proc/self/mountinfo")?;
@@ -44,39 +42,11 @@ pub(super) fn legacy_scope_inventory_clear(
         }),
         "A complete unified cgroup hierarchy is unavailable"
     );
-    let mut command = Command::new(which::which("systemctl")?);
-    command.args([
-        "--user",
-        "list-units",
-        "--all",
-        "--plain",
-        "--no-legend",
-        "--no-pager",
-        "--full",
-        &format!("{prefix}*.scope"),
-    ]);
-    command.env("LC_ALL", "C").env("SYSTEMD_COLORS", "0");
-    let output = super::run_with_timeout(&mut command, Duration::from_secs(3))?
-        .context("Legacy scope inventory timed out")?;
-    anyhow::ensure!(
-        output.status.success(),
-        "Legacy scope inventory rejected: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let mut listed = HashSet::new();
-    for line in std::str::from_utf8(&output.stdout)?.lines() {
-        let mut fields = line.split_whitespace();
-        let unit = fields.next().context("Missing legacy scope unit")?;
-        fields.next().context("Missing legacy scope load state")?;
-        let active = fields.next().context("Missing legacy scope active state")?;
-        fields.next().context("Missing legacy scope substate")?;
-        anyhow::ensure!(
-            unit.starts_with(prefix) && unit.ends_with(".scope") && listed.insert(unit),
-            "Invalid or duplicate legacy scope inventory unit"
-        );
+    for (unit, active) in list_scope_units(prefix)? {
+        let unit = unit.as_str();
         if !retained.contains(unit) {
             // Inventory can prove absence, not transfer kill authority.
-            if !matches!(active, "inactive" | "failed") {
+            if !matches!(active.as_str(), "inactive" | "failed") {
                 return Ok(false);
             }
             let mut show = Command::new(which::which("systemctl")?);
@@ -152,6 +122,69 @@ pub(super) fn legacy_scope_inventory_clear(
         }
     }
     Ok(true)
+}
+/// The init namespace, or the user manager's own when PID 1 is not inspectable
+/// by this user; scopes are the user manager's units either way.
+fn scope_manager_cgroup_namespace() -> anyhow::Result<std::path::PathBuf> {
+    match fs::read_link("/proc/1/ns/cgroup") {
+        Ok(namespace) => return Ok(namespace),
+        Err(error) if error.kind() != std::io::ErrorKind::PermissionDenied => {
+            return Err(error).context("Reading /proc/1/ns/cgroup for complete scope inventory");
+        }
+        Err(_) => {}
+    }
+    let uid = nix::unistd::geteuid().as_raw();
+    let procs = fs::read_to_string(format!(
+        "/sys/fs/cgroup/user.slice/user-{uid}.slice/user@{uid}.service/init.scope/cgroup.procs"
+    ))
+    .context("Locating the user manager for complete scope inventory")?;
+    let pid: u32 = procs
+        .lines()
+        .next()
+        .and_then(|line| line.trim().parse().ok())
+        .context("User manager process is unavailable")?;
+    fs::read_link(format!("/proc/{pid}/ns/cgroup"))
+        .context("Reading the user manager cgroup namespace for complete scope inventory")
+}
+
+/// Every loaded user-manager scope whose name starts with `prefix`, with its active state.
+pub(super) fn list_scope_units(prefix: &str) -> anyhow::Result<Vec<(String, String)>> {
+    use std::collections::HashSet;
+    use std::time::Duration;
+    let mut command = Command::new(which::which("systemctl")?);
+    command.args([
+        "--user",
+        "list-units",
+        "--all",
+        "--plain",
+        "--no-legend",
+        "--no-pager",
+        "--full",
+        &format!("{prefix}*.scope"),
+    ]);
+    command.env("LC_ALL", "C").env("SYSTEMD_COLORS", "0");
+    let output = super::run_with_timeout(&mut command, Duration::from_secs(3))?
+        .context("Legacy scope inventory timed out")?;
+    anyhow::ensure!(
+        output.status.success(),
+        "Legacy scope inventory rejected: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let mut listed = HashSet::new();
+    let mut units = Vec::new();
+    for line in std::str::from_utf8(&output.stdout)?.lines() {
+        let mut fields = line.split_whitespace();
+        let unit = fields.next().context("Missing legacy scope unit")?;
+        fields.next().context("Missing legacy scope load state")?;
+        let active = fields.next().context("Missing legacy scope active state")?;
+        fields.next().context("Missing legacy scope substate")?;
+        anyhow::ensure!(
+            unit.starts_with(prefix) && unit.ends_with(".scope") && listed.insert(unit.to_owned()),
+            "Invalid or duplicate legacy scope inventory unit"
+        );
+        units.push((unit.to_owned(), active.to_owned()));
+    }
+    Ok(units)
 }
 pub(super) fn open_read_nonblocking(path: &std::path::Path) -> std::io::Result<std::fs::File> {
     use std::os::unix::fs::OpenOptionsExt;

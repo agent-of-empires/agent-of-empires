@@ -829,6 +829,16 @@ impl Instance {
             None
         };
         let scope = crate::process::systemd::scope_prefix_for(&self.id, profile);
+        let recorded_scopes = self.terminal_scopes.clone();
+        let resolved_scopes = match recorded_scopes.as_deref() {
+            Some(scopes)
+                if !scopes
+                    .contains(&crate::process::worker_registry::ScopeOwnership::Unresolved) =>
+            {
+                None
+            }
+            recorded => crate::process::systemd::resolve_unknown_scopes(&self.id, recorded).ok(),
+        };
         let generation = self.lifecycle_generation;
         self.terminal_scopes = Some(storage.update(|rows, _| {
             let row = rows
@@ -845,6 +855,11 @@ impl Instance {
                     .as_mut()
                     .expect("validated handoff")
                     .launch = handoff_launch;
+            }
+            if let Some(resolved) = resolved_scopes.as_ref() {
+                if row.terminal_scopes == recorded_scopes {
+                    row.terminal_scopes = Some(resolved.clone());
+                }
             }
             let scopes = row.terminal_scopes.get_or_insert_with(|| {
                 vec![crate::process::worker_registry::ScopeOwnership::Unresolved]

@@ -939,6 +939,13 @@ pub(crate) fn plan_scope_recovery(inventory: ScopeRecoveryInventory) -> Result<S
 impl PurgeCapture {
     pub(crate) fn new(row: &Instance) -> Result<Self> {
         let mut runner = capture_runner(&row.id);
+        let terminal_scopes = if row.is_structured() {
+            row.terminal_scopes.clone()
+        } else {
+            crate::process::systemd::resolve_unknown_scopes(&row.id, row.terminal_scopes.as_deref())
+                .ok()
+                .or_else(|| row.terminal_scopes.clone())
+        };
         if !row.is_structured() {
             let scopes = match &mut runner {
                 RunnerCapture::Captured { scopes, .. }
@@ -947,8 +954,7 @@ impl PurgeCapture {
                 RunnerCapture::Unresolved { .. } => None,
             };
             if let Some(scopes) = scopes {
-                for scope in row
-                    .terminal_scopes
+                for scope in terminal_scopes
                     .as_deref()
                     .unwrap_or(&[crate::process::worker_registry::ScopeOwnership::Unresolved])
                 {
@@ -963,7 +969,7 @@ impl PurgeCapture {
         Ok(Self {
             protection,
             runner,
-            terminal_scopes: row.terminal_scopes.clone(),
+            terminal_scopes,
             session_id: row.id.clone(),
         })
     }
