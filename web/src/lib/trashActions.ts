@@ -54,6 +54,7 @@ export async function trashSessions(
     const res = await trashSession(id);
     if (res) {
       deps.applySession(res);
+      res.warnings?.forEach((warning) => deps.notify?.info?.(warning));
     } else {
       anyFailed = true;
       deps.onError(id);
@@ -148,6 +149,7 @@ export async function restoreSessions(ids: string[], deps: TrashDeps): Promise<b
     const res = await restoreSession(id);
     if (res) {
       deps.applySession(res);
+      res.warnings?.forEach((warning) => deps.notify?.info?.(warning));
     } else {
       anyFailed = true;
     }

@@ -60,6 +60,16 @@ describe("trash and restore loops (#2489)", () => {
     expect(notify.error).toHaveBeenCalledWith("Failed to restore session");
   });
 
+  it("surfaces the warnings of a landed trash or restore", async () => {
+    const warned = { ...snap("a"), warnings: ["submodule x is not repointed"] } as SessionResponse;
+    trashMock.mockResolvedValue(warned);
+    restoreMock.mockResolvedValue(warned);
+    const notify = notifier();
+    await trashSessions(["a"], { applySession: vi.fn(), onError: vi.fn(), notify });
+    await restoreSessions(["a"], { applySession: vi.fn(), notify });
+    expect(notify.info.mock.calls.filter(([m]) => m === "submodule x is not repointed")).toHaveLength(2);
+  });
+
   it("tolerates a null notifier", async () => {
     trashMock.mockResolvedValue(snap("a"));
     restoreMock.mockResolvedValue(snap("a"));
