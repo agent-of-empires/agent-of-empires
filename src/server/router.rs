@@ -403,7 +403,7 @@ pub(super) fn build_router(state: Arc<AppState>) -> Router {
         .route("/api/sessions/{id}/acp", delete(api::shutdown_acp))
         .route(
             "/api/sessions/{id}/acp/switch-agent",
-            post(api::switch_acp_agent),
+            post(api::switch_acp_agent).layer(read_only.clone()),
         )
         .route(
             "/api/sessions/{id}/acp/switch-provider",

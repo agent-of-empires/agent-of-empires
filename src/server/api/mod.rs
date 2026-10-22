@@ -394,6 +394,318 @@ pub(super) fn validate_profile_name(name: &str) -> Result<(), String> {
 mod tests {
     use super::*;
 
+    // Write handlers and their existing rejection/extractor boundaries.
+    const MUTATING_HANDLERS: &[(&str, &str, &[&str])] = &[
+        (
+            "sessions/create.rs",
+            include_str!("sessions/create.rs"),
+            &["cancel_creation", "create_session", "review_creation_trust"],
+        ),
+        (
+            "sessions/delete.rs",
+            include_str!("sessions/delete.rs"),
+            &["abandon_purge", "delete_session", "delete_workspace"],
+        ),
+        (
+            "sessions/rename.rs",
+            include_str!("sessions/rename.rs"),
+            &[
+                "attach_session_project",
+                "rename_session",
+                "set_worktree_name",
+            ],
+        ),
+        (
+            "sessions/send.rs",
+            include_str!("sessions/send.rs"),
+            &["paste_image", "send_message"],
+        ),
+        (
+            "sessions/ensure.rs",
+            include_str!("sessions/ensure.rs"),
+            &[
+                "ensure_container_terminal",
+                "ensure_session",
+                "ensure_terminal",
+                "ensure_tool",
+                "kill_terminal",
+                "stop_auxiliary",
+            ],
+        ),
+        (
+            "sessions/update.rs",
+            include_str!("sessions/update.rs"),
+            &[
+                "update_session_diff_base",
+                "update_session_group",
+                "update_session_notifications",
+            ],
+        ),
+        (
+            "sessions/lifecycle.rs",
+            include_str!("sessions/lifecycle.rs"),
+            &[
+                "force_smart_rename",
+                "prepare_agent_session",
+                "prepare_agent_session_inner",
+                "restart_session",
+                "restore_session",
+                "start_session",
+                "stop_session",
+                "summarize_session",
+                "touch_session_access",
+                "trash_session",
+                "update_session_archive",
+                "update_session_color",
+                "update_session_favorite",
+                "update_session_pin",
+                "update_session_snooze",
+                "update_session_unread",
+            ],
+        ),
+        (
+            "sessions/list.rs",
+            include_str!("sessions/list.rs"),
+            &["update_workspace_ordering"],
+        ),
+        ("git.rs", include_str!("git.rs"), &["clone_repo"]),
+        (
+            "mcp.rs",
+            include_str!("mcp.rs"),
+            &[
+                "create_mcp_server",
+                "delete_mcp_server",
+                "drop_mcp_server",
+                "edit_mcp_server",
+                "keep_mcp_server",
+                "resolve_mcp_conflict",
+            ],
+        ),
+        (
+            "log_level.rs",
+            include_str!("log_level.rs"),
+            &["patch_log_level"],
+        ),
+        (
+            "projects.rs",
+            include_str!("projects.rs"),
+            &["create_project", "delete_project", "update_project"],
+        ),
+        (
+            "system.rs",
+            include_str!("system.rs"),
+            &[
+                "create_profile",
+                "default_profile",
+                "delete_profile",
+                "dismiss_update",
+                "mark_tip_seen",
+                "mark_volume_ignores_globs_acknowledged",
+                "mark_web_tour_seen",
+                "patch_web_ui_state",
+                "rename_profile",
+                "set_show_tips",
+                "update_profile_settings",
+                "update_settings",
+            ],
+        ),
+        (
+            "acp/worker.rs",
+            include_str!("acp/worker.rs"),
+            &[
+                "shutdown_acp",
+                "spawn_acp",
+                "switch_acp_agent",
+                "switch_acp_provider",
+            ],
+        ),
+        (
+            "acp/prompt.rs",
+            include_str!("acp/prompt.rs"),
+            &[
+                "acp_cancel",
+                "acp_force_end_turn",
+                "acp_prompt",
+                "acp_prompt_diff_comments",
+                "resolve_approval",
+                "resolve_elicitation",
+            ],
+        ),
+        (
+            "acp/view.rs",
+            include_str!("acp/view.rs"),
+            &["acp_disable", "acp_enable"],
+        ),
+        (
+            "acp/config.rs",
+            include_str!("acp/config.rs"),
+            &["acp_set_config_option", "acp_set_mode"],
+        ),
+        (
+            "push.rs",
+            include_str!("../push.rs"),
+            &["subscribe", "test", "unsubscribe"],
+        ),
+        (
+            "telemetry.rs",
+            include_str!("telemetry.rs"),
+            &[
+                "post_telemetry_seen",
+                "post_telemetry_structured_interaction",
+                "set_telemetry_consent",
+            ],
+        ),
+        (
+            "plugins.rs",
+            include_str!("plugins.rs"),
+            &["invoke_plugin_action"],
+        ),
+        (
+            "skills.rs",
+            include_str!("skills.rs"),
+            &[
+                "adopt_skill",
+                "create_skill",
+                "delete_skill",
+                "edit_skill",
+                "sync_skills",
+            ],
+        ),
+        (
+            "groups.rs",
+            include_str!("groups.rs"),
+            &[
+                "collapse_group",
+                "create_group",
+                "delete_group",
+                "move_group",
+                "reorder",
+            ],
+        ),
+        (
+            "queue.rs",
+            include_str!("queue.rs"),
+            &["queue_clear", "queue_edit", "queue_enqueue", "queue_remove"],
+        ),
+        (
+            "acp/install.rs",
+            include_str!("acp/install.rs"),
+            &["install_agent"],
+        ),
+    ];
+
+    fn handler_source<'a>(source: &'a str, name: &str) -> Option<(&'a str, &'a str)> {
+        let needle = format!("fn {name}(");
+        let rest = &source[source.find(&needle)? + needle.len()..];
+        let mut depth = 1usize;
+        let sig_end = rest.char_indices().find_map(|(i, c)| {
+            match c {
+                '(' => depth += 1,
+                ')' => depth -= 1,
+                _ => {}
+            }
+            (depth == 0).then_some(i)
+        })?;
+        let body_end = ["\npub async fn ", "\npub fn ", "\nasync fn ", "\nfn "]
+            .iter()
+            .filter_map(|t| rest.find(t))
+            .min()
+            .unwrap_or(rest.len());
+        Some((&rest[..sig_end], &rest[..body_end]))
+    }
+
+    #[test]
+    fn mutating_handlers_guard_read_only_before_body_extraction() {
+        let routes = crate::server::access::router_mutating_handlers();
+        let mut failures = Vec::new();
+        for route in &routes {
+            if route.path.starts_with("/api/sessions")
+                || route.path.starts_with("/api/groups")
+                || matches!(
+                    route.path,
+                    "/api/reorder" | "/api/workspaces" | "/api/workspace-ordering"
+                )
+            {
+                let name = route
+                    .handler
+                    .strip_prefix("api::")
+                    .expect("API mutation handler");
+                if !MUTATING_HANDLERS
+                    .iter()
+                    .any(|(_, _, names)| names.contains(&name))
+                {
+                    failures.push(format!(
+                        "{} {}: handler `{name}` is not audited",
+                        route.method, route.path
+                    ));
+                }
+            }
+        }
+        for (file, source, handlers) in MUTATING_HANDLERS {
+            for name in *handlers {
+                let Some((signature, body)) = handler_source(source, name) else {
+                    failures.push(format!("{file}: handler `{name}` not found"));
+                    continue;
+                };
+                let body = body
+                    .lines()
+                    .filter(|line| !line.trim_start().starts_with("//"))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                let mut handler_routes = routes
+                    .iter()
+                    .filter(|route| route.handler.strip_prefix("api::") == Some(name))
+                    .peekable();
+                let route_layer = handler_routes.peek().is_some()
+                    && handler_routes.all(|route| route.read_only_layer);
+                let parts_guard = signature.find("ElevatedMutationGuard");
+                let eager = signature.split(',').any(|arg| {
+                    let arg = arg.trim_start();
+                    arg.starts_with("Json(") || arg.contains(": Json<")
+                });
+                let local_guard = ["state.read_only", "self.read_only", "read_only_block("]
+                    .iter()
+                    .any(|marker| body.contains(marker));
+                let delegated = match *name {
+                    "ensure_session" | "start_session" => body.contains("prepare_agent_session("),
+                    "prepare_agent_session" => body.contains("prepare_agent_session_inner("),
+                    _ => false,
+                };
+                if !route_layer && parts_guard.is_none() && !local_guard && !delegated {
+                    failures.push(format!("{file}: `{name}` lacks a read-only guard"));
+                }
+                if eager && !route_layer {
+                    let consumer = signature
+                        .find("Json(")
+                        .or_else(|| signature.find(": Json<"));
+                    if !parts_guard
+                        .zip(consumer)
+                        .is_some_and(|(guard, body)| guard < body)
+                    {
+                        failures.push(format!(
+                            "{file}: `{name}` rejects JSON before its read-only guard"
+                        ));
+                    }
+                }
+            }
+        }
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
+        let (_, preparation) = handler_source(
+            include_str!("sessions/lifecycle.rs"),
+            "prepare_agent_session_inner",
+        )
+        .expect("shared preparation guard");
+        assert!(preparation.contains("state.read_only"));
+        let (_, body) = handler_source(include_str!("plugins.rs"), "invoke_plugin_action")
+            .expect("invoke_plugin_action");
+        for marker in ["mutation_gate", "is_elevated", "elevation_required"] {
+            assert!(
+                !body.contains(marker),
+                "invoke_plugin_action: found `{marker}"
+            );
+        }
+    }
+
     #[tokio::test]
     #[serial_test::serial]
     async fn native_mutations_reject_read_only_before_body_extraction() {
@@ -419,6 +731,7 @@ mod tests {
             (Method::POST, "/api/sessions/missing/restart"),
             (Method::POST, "/api/sessions/missing/tools/ensure"),
             (Method::POST, "/api/sessions/missing/auxiliary/stop"),
+            (Method::POST, "/api/sessions/missing/acp/switch-agent"),
             (Method::POST, "/api/groups"),
             (Method::PATCH, "/api/groups"),
             (Method::DELETE, "/api/groups"),

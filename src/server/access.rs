@@ -450,6 +450,167 @@ pub(super) const CITYHALL_MUTATION_ALLOW: &[(&str, &str)] = &[
     ("DELETE", "/api/login/sessions/{id}"),
 ];
 
+/// Mutating routes deliberately unavailable in CityHall.
+#[cfg(test)]
+pub(super) const CITYHALL_MUTATION_DENY: &[(&str, &str)] = &[
+    ("POST", "/api/sessions/creation-trust"),
+    ("POST", "/api/sessions/{id}/restart"),
+    ("POST", "/api/sessions/{id}/tools/ensure"),
+    ("POST", "/api/sessions/{id}/auxiliary/stop"),
+    // Terminal surface.
+    ("POST", "/api/sessions/{id}/ensure"),
+    ("POST", "/api/sessions/{id}/send"),
+    ("POST", "/api/sessions/{id}/terminal"),
+    ("DELETE", "/api/sessions/{id}/terminal"),
+    ("POST", "/api/sessions/{id}/container-terminal"),
+    // Git / project / profile management.
+    ("POST", "/api/git/clone"),
+    ("POST", "/api/projects"),
+    // Attaching a repo to a session takes an arbitrary host path, so it is denied for the
+    // same reason `git/clone` and `POST /api/projects` are.
+    ("POST", "/api/sessions/{id}/projects"),
+    ("PATCH", "/api/projects/{name}"),
+    ("DELETE", "/api/projects/{name}"),
+    ("POST", "/api/profiles"),
+    ("DELETE", "/api/profiles/{name}"),
+    ("PATCH", "/api/profiles/{name}/rename"),
+    ("PATCH", "/api/default-profile"),
+    // MCP mutations.
+    ("POST", "/mcp"),
+    ("PUT", "/mcp"),
+    ("PATCH", "/mcp"),
+    ("DELETE", "/mcp"),
+    ("POST", "/api/mcp/servers"),
+    ("PUT", "/api/mcp/servers/{name}"),
+    ("DELETE", "/api/mcp/servers/{name}"),
+    ("POST", "/api/mcp/servers/{name}/drop"),
+    ("POST", "/api/mcp/servers/{name}/keep"),
+    ("POST", "/api/mcp/servers/{name}/resolve"),
+    // Skills mutations.
+    ("POST", "/api/skills"),
+    ("POST", "/api/skills/sync"),
+    ("PUT", "/api/skills/{directory}"),
+    ("DELETE", "/api/skills/{directory}"),
+    ("POST", "/api/skills/{source}/{directory}/adopt"),
+    // Plugin lifecycle.
+    ("POST", "/api/plugins/install"),
+    ("POST", "/api/plugins/install/preview"),
+    ("POST", "/api/plugins/{id}/action"),
+    ("POST", "/api/plugins/{id}/enabled"),
+    ("POST", "/api/plugins/{id}/worker/restart"),
+    ("POST", "/api/plugins/{id}/uninstall"),
+    ("POST", "/api/plugins/{id}/update/apply"),
+    ("POST", "/api/plugins/{id}/update/dismiss"),
+    ("POST", "/api/plugins/commands/{fqid}/invoke"),
+    // ACP agent / worker lifecycle + config.
+    ("DELETE", "/api/sessions/{id}/acp"),
+    ("POST", "/api/sessions/{id}/acp/config-option"),
+    ("POST", "/api/sessions/{id}/acp/disable"),
+    ("POST", "/api/sessions/{id}/acp/enable"),
+    ("POST", "/api/sessions/{id}/acp/install-agent"),
+    ("POST", "/api/sessions/{id}/acp/mode"),
+    ("POST", "/api/sessions/{id}/acp/spawn"),
+    ("POST", "/api/sessions/{id}/acp/switch-agent"),
+    ("POST", "/api/sessions/{id}/acp/switch-provider"),
+    // Global settings / ops / shared workspace ordering.
+    ("PATCH", "/api/settings"),
+    ("PATCH", "/api/log-level"),
+    ("PUT", "/api/workspace-ordering"),
+];
+
+#[cfg(test)]
+#[derive(Debug)]
+pub(super) struct MutatingRoute<'a> {
+    pub method: &'static str,
+    pub path: &'a str,
+    pub handler: &'a str,
+    pub read_only_layer: bool,
+}
+
+#[cfg(test)]
+pub(super) fn router_mutating_handlers() -> Vec<MutatingRoute<'static>> {
+    let source = include_str!("router.rs");
+    let start = source
+        .find("fn build_router(")
+        .expect("build_router present");
+    let end = start + source[start..].find("\n}").expect("build_router end");
+    mutating_routes(&source[start..end])
+}
+
+#[cfg(test)]
+fn mutating_routes(source: &str) -> Vec<MutatingRoute<'_>> {
+    let mut routes = Vec::new();
+    let mut remaining = source;
+    while let Some((start, marker)) = [".route(", ".route_service("]
+        .into_iter()
+        .filter_map(|marker| remaining.find(marker).map(|start| (start, marker)))
+        .min_by_key(|(start, _)| *start)
+    {
+        remaining = &remaining[start + marker.len()..];
+        let path_start = remaining.find('"').expect("literal route path") + 1;
+        let path_end = path_start + remaining[path_start..].find('"').expect("route path end");
+        let path = &remaining[path_start..path_end];
+        let mut depth = 1;
+        let end = remaining[path_end + 1..]
+            .char_indices()
+            .find_map(|(index, ch)| {
+                match ch {
+                    '(' => depth += 1,
+                    ')' => depth -= 1,
+                    _ => {}
+                }
+                (depth == 0).then_some(path_end + 1 + index)
+            })
+            .expect("balanced route expression");
+        let expression = &remaining[path_end + 1..end];
+        if marker == ".route_service(" {
+            for method in ["POST", "PUT", "PATCH", "DELETE"] {
+                routes.push(MutatingRoute {
+                    method,
+                    path,
+                    handler: expression.trim_start_matches(',').trim(),
+                    read_only_layer: false,
+                });
+            }
+            remaining = &remaining[end + 1..];
+            continue;
+        }
+        let last_mutation = ["post(", "put(", "patch(", "delete("]
+            .into_iter()
+            .filter_map(|method| expression.rfind(method))
+            .max();
+        let read_only_layer = expression
+            .rfind(".layer(read_only.clone())")
+            .zip(last_mutation)
+            .is_some_and(|(layer, mutation)| layer > mutation);
+        for (combinator, method) in [
+            ("post(", "POST"),
+            ("put(", "PUT"),
+            ("patch(", "PATCH"),
+            ("delete(", "DELETE"),
+        ] {
+            if let Some(position) = expression.find(combinator) {
+                let handler = &expression[position + combinator.len()..];
+                let handler = handler[..handler.find(')').expect("handler end")].trim();
+                assert!(
+                    handler
+                        .chars()
+                        .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | ':')),
+                    "unsupported mutation handler: {handler}"
+                );
+                routes.push(MutatingRoute {
+                    method,
+                    path,
+                    handler,
+                    read_only_layer,
+                });
+            }
+        }
+        remaining = &remaining[end + 1..];
+    }
+    routes
+}
+
 /// Refuse unlisted mutations in CityHall mode with the canonical 403.
 /// Unmatched routes and omitted prefixes fail closed.
 pub(super) async fn cityhall_gate(
@@ -549,6 +710,123 @@ mod tests {
 
     use crate::server::test_helpers::vecs;
     use crate::server::test_support;
+    fn router_mutating_routes() -> std::collections::BTreeSet<(String, String)> {
+        router_mutating_handlers()
+            .into_iter()
+            .map(|route| (route.method.to_owned(), route.path.to_owned()))
+            .collect()
+    }
+
+    #[test]
+    fn mutation_scan_keeps_chained_methods_and_nested_layers() {
+        let routes = mutating_routes(
+            r#"
+            .route("/first", get(api::read).post(api::write).layer(read_only.clone()))
+            .route(
+                "/second",
+                patch(api::change).delete(api::remove).layer(limit(2)),
+            )
+            .route("/third", post(api::early).layer(read_only.clone()).patch(api::late))
+            .route_service("/service", super::mcp::service(state.clone()))
+        "#,
+        );
+        let observed: Vec<_> = routes
+            .iter()
+            .map(|route| {
+                (
+                    route.method,
+                    route.path,
+                    route.handler,
+                    route.read_only_layer,
+                )
+            })
+            .collect();
+        assert_eq!(
+            observed,
+            vec![
+                ("POST", "/first", "api::write", true),
+                ("PATCH", "/second", "api::change", false),
+                ("DELETE", "/second", "api::remove", false),
+                ("POST", "/third", "api::early", false),
+                ("PATCH", "/third", "api::late", false),
+                (
+                    "POST",
+                    "/service",
+                    "super::mcp::service(state.clone())",
+                    false
+                ),
+                (
+                    "PUT",
+                    "/service",
+                    "super::mcp::service(state.clone())",
+                    false
+                ),
+                (
+                    "PATCH",
+                    "/service",
+                    "super::mcp::service(state.clone())",
+                    false
+                ),
+                (
+                    "DELETE",
+                    "/service",
+                    "super::mcp::service(state.clone())",
+                    false
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn every_mutating_route_is_cityhall_classified() {
+        let routed = router_mutating_routes();
+        assert!(
+            routed.len() > 60,
+            "router scan found only {} mutating routes; parser likely broke",
+            routed.len()
+        );
+        let classified: std::collections::BTreeSet<(String, String)> = CITYHALL_MUTATION_ALLOW
+            .iter()
+            .chain(CITYHALL_MUTATION_DENY.iter())
+            .map(|(m, p)| ((*m).to_string(), (*p).to_string()))
+            .collect();
+
+        assert_eq!(
+            classified.len(),
+            CITYHALL_MUTATION_ALLOW.len() + CITYHALL_MUTATION_DENY.len(),
+            "duplicate CityHall classification"
+        );
+        let mut failures = Vec::new();
+        for route in routed.difference(&classified) {
+            failures.push(format!(
+                "{} {} is a mutating route but is in neither CITYHALL_MUTATION_ALLOW nor \
+                 CITYHALL_MUTATION_DENY. Add it to the allow table if the CityHall client must \
+                 reach it, else to the deny table.",
+                route.0, route.1
+            ));
+        }
+        for entry in classified.difference(&routed) {
+            failures.push(format!(
+                "{} {} is listed in a CityHall table but no router route matches it; remove the \
+                 stale entry (path template or method changed?).",
+                entry.0, entry.1
+            ));
+        }
+        for a in CITYHALL_MUTATION_ALLOW {
+            assert!(
+                !CITYHALL_MUTATION_DENY.contains(a),
+                "{} {} is in both CityHall allow and deny tables",
+                a.0,
+                a.1
+            );
+        }
+        assert!(
+            failures.is_empty(),
+            "CityHall route classification is not exhaustive:\n{}",
+            failures.join("\n")
+        );
+    }
+
     #[tokio::test]
     #[serial_test::serial]
     async fn cityhall_reorder_preserves_native_rows_and_allows_structured_ordering() {
