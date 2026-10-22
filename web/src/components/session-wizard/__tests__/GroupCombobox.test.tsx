@@ -2,7 +2,7 @@
 
 import { useState } from "react";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
 
 import type { GroupInfo } from "../../../lib/types";
 import { GroupCombobox } from "../steps/GroupCombobox";
@@ -176,6 +176,37 @@ describe("GroupCombobox", () => {
       expect(popup.className).toContain("top-full");
     } finally {
       spy.mockRestore();
+    }
+  });
+
+  it("counts only the visible part of the sheet above the field", () => {
+    const rect = (top: number, bottom: number) => ({ top, bottom }) as DOMRect;
+    const spy = vi.spyOn(Element.prototype, "getBoundingClientRect").mockImplementation(function (this: Element) {
+      if (this.hasAttribute("data-wizard-scroll")) return rect(0, 800);
+      if (this.getAttribute("role") === "combobox") return rect(700, 740);
+      return rect(0, 0);
+    });
+    // The keyboard is up and the visual viewport has scrolled 520px into the page.
+    const viewport = Object.assign(new EventTarget(), { offsetTop: 520, height: 280 });
+    vi.stubGlobal("visualViewport", viewport);
+    try {
+      render(
+        <div data-wizard-scroll="">
+          <Harness />
+        </div>,
+      );
+      fireEvent.focus(input());
+      // 700 - 520 - 8 above the field is visible, not 700 - 0 - 8.
+      expect(screen.getByTestId("group-combobox-popup").style.maxHeight).toBe("172px");
+      // Scrolling the visual viewport alone, with no resize, re-measures.
+      viewport.offsetTop = 600;
+      act(() => {
+        viewport.dispatchEvent(new Event("scroll"));
+      });
+      expect(screen.getByTestId("group-combobox-popup").style.maxHeight).toBe("92px");
+    } finally {
+      spy.mockRestore();
+      vi.unstubAllGlobals();
     }
   });
 

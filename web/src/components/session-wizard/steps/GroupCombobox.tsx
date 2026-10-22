@@ -37,9 +37,11 @@ export function GroupCombobox({
     const field = input.getBoundingClientRect();
     const area = scroller?.getBoundingClientRect() ?? { top: 0, bottom: window.innerHeight };
     const viewport = window.visualViewport;
+    // The visual viewport can sit inside the layout viewport (keyboard up), on either side.
+    const top = viewport ? Math.max(area.top, viewport.offsetTop) : area.top;
     const bottom = viewport ? Math.min(area.bottom, viewport.offsetTop + viewport.height) : area.bottom;
     const below = bottom - field.bottom - 8;
-    const above = field.top - area.top - 8;
+    const above = field.top - top - 8;
     const up = below < Math.min(LIST_MAX, above);
     setPlacement({ up, maxHeight: Math.max(0, Math.min(LIST_MAX, up ? above : below)) });
   }, []);
@@ -52,10 +54,13 @@ export function GroupCombobox({
     const viewport = window.visualViewport;
     scroller?.addEventListener("scroll", place, { passive: true });
     viewport?.addEventListener("resize", place);
+    // The visual viewport's offset can change without a resize.
+    viewport?.addEventListener("scroll", place);
     window.addEventListener("resize", place);
     return () => {
       scroller?.removeEventListener("scroll", place);
       viewport?.removeEventListener("resize", place);
+      viewport?.removeEventListener("scroll", place);
       window.removeEventListener("resize", place);
     };
   }, [open, place]);
