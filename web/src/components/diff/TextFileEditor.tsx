@@ -16,7 +16,7 @@ interface Props {
 }
 
 const button =
-  "min-h-8 px-2 py-1 text-xs rounded border border-surface-700/50 text-text-secondary hover:bg-surface-800 disabled:opacity-40 cursor-pointer";
+  "min-h-8 px-2 py-1 text-xs rounded-md border border-surface-700/50 text-text-secondary hover:bg-surface-800 disabled:opacity-40 cursor-pointer";
 
 export function TextFileEditor({ sessionId, filePath, original, onBack, onCancel, onSaved }: Props) {
   const normalized = original.content.replace(/\r\n|\r/g, "\n");
@@ -129,7 +129,7 @@ export function TextFileEditor({ sessionId, filePath, original, onBack, onCancel
           Cancel
         </button>
         <button
-          className={`${button} bg-brand-600 text-white hover:bg-brand-500 disabled:hover:bg-brand-600`}
+          className={`${button} bg-brand-600 text-text-on-brand hover:bg-brand-500 disabled:hover:bg-brand-600`}
           disabled={!dirty || saving || changed}
           onClick={() => void save()}
           title="Save (Ctrl/Cmd+S)"

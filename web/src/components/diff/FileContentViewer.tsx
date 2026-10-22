@@ -90,7 +90,7 @@ function SessionFileViewer({ sessionId, filePath, onBack, structured }: Props) {
               type="button"
               disabled={!data.version || !!data.edit_disabled_reason}
               title={data.edit_disabled_reason ?? undefined}
-              className="flex items-center gap-1 min-h-8 px-2 py-1 text-xs rounded border border-surface-700/50 text-text-secondary disabled:opacity-40 cursor-pointer"
+              className="flex items-center gap-1 min-h-8 px-2 py-1 text-xs rounded-md border border-surface-700/50 text-text-secondary disabled:opacity-40 cursor-pointer"
               onClick={() => {
                 setEditing(data);
                 setSaved(false);
