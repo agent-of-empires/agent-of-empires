@@ -331,7 +331,9 @@ mod tests {
                 .map(std::fs::read)
                 .collect::<std::io::Result<Vec<_>>>()?;
             crate::migrations::recovery::reconcile_repaired_components()?;
-            if journal_before.is_some() {
+            let _inventory_denied =
+                crate::migrations::legacy_scope_recovery::test_support::deny_inventory();
+            if journal_before.is_some() && private {
                 crate::migrations::run_migrations_announced(None)?;
             } else {
                 assert!(crate::migrations::run_migrations_announced(None).is_err());
