@@ -101,6 +101,7 @@ function setup(overrides: Partial<Parameters<typeof MobileMainPane>[0]> = {}) {
     onOpenSendDialog: vi.fn(),
     onCloseSendDialog: vi.fn(),
     onClearSelectedFile: vi.fn(),
+    settingsReadOnly: false,
     ...overrides,
   };
   render(<MobileMainPane {...props} />);

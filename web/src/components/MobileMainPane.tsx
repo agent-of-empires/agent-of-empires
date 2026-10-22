@@ -57,6 +57,8 @@ interface Props {
   onOpenSendDialog: () => void;
   onCloseSendDialog: () => void;
   onClearSelectedFile: () => void;
+  /** The server refuses settings edits, so nothing links to Settings. */
+  settingsReadOnly: boolean;
 }
 
 function layerClass(active: boolean): string {
@@ -99,6 +101,7 @@ export function MobileMainPane({
   onOpenSendDialog,
   onCloseSendDialog,
   onClearSelectedFile,
+  settingsReadOnly,
 }: Props) {
   const activePluginPane = isPluginPaneId(view) ? (pluginPanes.find((p) => p.id === view) ?? null) : null;
   const viewLabel =
@@ -143,6 +146,11 @@ export function MobileMainPane({
                     sessionId={session.id}
                     acpWorkerState={session.acp_worker_state ?? "absent"}
                     rateLimitAutoResume={session.rate_limit_auto_resume}
+                    settingsHref={
+                      settingsReadOnly
+                        ? null
+                        : `/settings/structured-view?profile=${encodeURIComponent(session.profile)}`
+                    }
                     tool={session.tool}
                     acpAgent={session.acp_agent ?? null}
                     startedBefore={hasStartedBefore(session)}
