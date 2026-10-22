@@ -273,7 +273,10 @@ describe("StartupErrorBanner install", () => {
     });
     const { findByTestId, findByText } = renderBanner();
     fireEvent.click(await findByTestId("startup-error-banner-install"));
-    expect((await findByTestId("adapter-install-error")).textContent).toContain("Install exited with code 243");
+    const error = await findByTestId("adapter-install-error");
+    expect(error.textContent).toContain("Install exited with code 243");
+    // The token resolved.rs lifts to AA on the banner's tint, not the raw error hue.
+    expect(error.classList).toContain("text-status-error-text");
     await findByText("npm ERR! EACCES");
   });
 

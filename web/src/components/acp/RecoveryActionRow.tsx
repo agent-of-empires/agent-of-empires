@@ -46,7 +46,7 @@ export function RecoveryActionRow({
         ))}
       </div>
       {install.error && (
-        <div className="mt-2 text-xs text-status-error" data-testid="adapter-install-error">
+        <div className="mt-2 text-xs text-status-error-text" data-testid="adapter-install-error">
           {install.error}
         </div>
       )}

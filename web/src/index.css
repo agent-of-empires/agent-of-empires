@@ -115,7 +115,7 @@
   /* Text on a solid status-error fill: black or white, whichever reads (see resolved.rs). */
   --color-text-on-status-error: #000000;
   /* Error as body text: projected as the theme error lifted until it clears
-     4.5:1 on surface-900 and -850 (see resolved.rs). This default is zinc's. */
+     4.5:1 on surface-900, -850 and the error banner's tint (see resolved.rs). This default is zinc's. */
   --color-status-error-text: #f26969;
   --color-status-starting: #f59e0b;
   --color-status-stopped: #52525b;

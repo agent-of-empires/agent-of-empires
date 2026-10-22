@@ -284,13 +284,14 @@ fn web_projection(theme: &Theme, appearance: ThemeAppearance) -> CssVarProjectio
         "--color-text-on-status-error".into(),
         hex(readable_on(theme.error)),
     );
-    // Some theme reds are a hue, not readable text, on the surfaces below.
+    // Some theme reds are a hue, not readable text, on the surfaces below. The
+    // last is the startup error banner's `bg-status-error/10` tint.
     css.insert(
         "--color-status-error-text".into(),
         hex(lift_until(
             theme.error,
             bg,
-            &[bg, elevated_1],
+            &[bg, elevated_1, composite(theme.error, bg, 0.1)],
             TEXT_CONTRAST_RATIO,
         )),
     );
@@ -625,6 +626,13 @@ mod tests {
                     );
                 }
             }
+            // Install errors sit on the startup error banner's tint.
+            let tint = composite(var("--color-status-error"), var("--color-surface-900"), 0.1);
+            let ratio = contrast_ratio(var("--color-status-error-text"), tint);
+            assert!(
+                ratio >= TEXT_CONTRAST_RATIO,
+                "{name}: --color-status-error-text on bg-status-error/10 is {ratio:.2}, below body-text AA"
+            );
             // Dialog hints, such as the onboarding footer and the tour's Skip button, sit on the
             // modal surface.
             let subtle_on_modal =
