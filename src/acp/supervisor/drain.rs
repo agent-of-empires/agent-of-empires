@@ -2386,6 +2386,7 @@ mod tests {
         let _endpoint = EndpointGuard::install(DaemonEndpoint {
             host_url: "http://127.0.0.1:4321".into(),
             sandbox_url: None,
+            sandbox_socket: None,
             secret: secret.clone(),
         });
 

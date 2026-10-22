@@ -14,6 +14,7 @@ use tracing::warn;
 
 use crate::acp::acp_client::{known_container_workdir, AcpError, SandboxLayout};
 use crate::plugin::mcp_serve::ServedServer;
+use crate::server::daemon_endpoint::SandboxSocket;
 use crate::session::mcp::project_mcp::{ProjectMcpServer, ProjectMcpTransport};
 use crate::session::{SandboxInfo, WorkspaceInfo};
 
@@ -28,6 +29,8 @@ pub struct McpRewriteContext {
     pub cwd: PathBuf,
     /// The plugin-served entries injected into this session's set.
     pub plugin_served: Vec<PluginServed>,
+    /// Plugins already told at launch that this session cannot reach their servers.
+    pub unreachable_notified: Vec<String>,
 }
 
 /// A session entry for a server a plugin serves through the daemon.
@@ -41,6 +44,11 @@ impl McpRewriteContext {
     pub fn sandboxed(&self) -> bool {
         self.sandbox.is_some()
     }
+
+    /// `None` for a host session, else how its container reaches the plugin socket.
+    pub fn sandbox_socket(&self) -> Option<SandboxSocket> {
+        self.sandbox.as_ref().map(|s| s.plugin_socket)
+    }
 }
 
 /// The workspace volumes a sandboxed session's container mounts, so a plugin can map
@@ -49,6 +57,9 @@ impl McpRewriteContext {
 pub struct McpSandbox {
     pub container_workdir: Option<String>,
     pub mounts: Vec<McpSandboxMount>,
+    /// How the container reaches the daemon's plugin socket. Not sent to plugins.
+    #[serde(skip)]
+    pub plugin_socket: SandboxSocket,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -59,18 +70,23 @@ pub struct McpSandboxMount {
 }
 
 impl McpSandbox {
-    /// Blocking: without a pinned workdir it asks the container runtime.
+    /// Blocking: without a pinned workdir, or while the daemon serves the plugin socket, it
+    /// asks the container runtime.
     pub fn resolve(
         info: &SandboxInfo,
         cwd: &Path,
         workspace: Option<&WorkspaceInfo>,
         session_id: &str,
     ) -> Self {
-        Self::from_layout(
+        let mut sandbox = Self::from_layout(
             SandboxLayout::resolve(info, cwd, workspace),
             || known_container_workdir(info),
             session_id,
-        )
+        );
+        sandbox.plugin_socket = crate::server::daemon_endpoint::daemon_endpoint()
+            .and_then(|endpoint| endpoint.sandbox_socket)
+            .map_or(SandboxSocket::Unmounted, |reach| reach(session_id));
+        sandbox
     }
 
     /// A layout that cannot be computed still marks the session as sandboxed, with no
@@ -92,6 +108,7 @@ impl McpSandbox {
                         read_only: v.read_only,
                     })
                     .collect(),
+                plugin_socket: SandboxSocket::Unmounted,
             },
             Err(e) => {
                 warn!(
@@ -102,6 +119,7 @@ impl McpSandbox {
                 Self {
                     container_workdir: fallback_workdir(),
                     mounts: Vec::new(),
+                    plugin_socket: SandboxSocket::Unmounted,
                 }
             }
         }
@@ -496,6 +514,9 @@ pub trait McpRewriter: Send + Sync {
 
     /// Tells the user a plugin's MCP server replaced one of their configured servers.
     fn report_serve_notice(&self, _plugin_id: &str, _message: &str) {}
+
+    /// Tells the user a plugin's MCP servers were skipped for a session.
+    fn report_serve_failure(&self, _plugin_id: &str, _message: &str) {}
 }
 
 static REWRITER: Mutex<Option<Arc<dyn McpRewriter>>> = Mutex::new(None);
@@ -511,6 +532,12 @@ pub fn set_rewriter(rewriter: Option<Arc<dyn McpRewriter>>) {
 pub fn report_serve_notice(plugin_id: &str, message: &str) {
     if let Some(rewriter) = current_rewriter() {
         rewriter.report_serve_notice(plugin_id, message);
+    }
+}
+
+pub fn report_serve_failure(plugin_id: &str, message: &str) {
+    if let Some(rewriter) = current_rewriter() {
+        rewriter.report_serve_failure(plugin_id, message);
     }
 }
 
@@ -703,10 +730,12 @@ mod tests {
                     container: "/workspace/foo".into(),
                     read_only: false,
                 }],
+                plugin_socket: SandboxSocket::Unmounted,
             }),
             profile: Some("work".into()),
             cwd: "/w".into(),
             plugin_served: Vec::new(),
+            unreachable_notified: Vec::new(),
         }
     }
 
@@ -1046,6 +1075,7 @@ mod tests {
                         read_only: false,
                     },
                 ],
+                plugin_socket: SandboxSocket::Unmounted,
             }
         );
     }
@@ -1090,6 +1120,7 @@ mod tests {
             McpSandbox {
                 container_workdir: Some("/workspace/ws/feat".into()),
                 mounts: expected,
+                plugin_socket: SandboxSocket::Unmounted,
             }
         );
         let created: Vec<_> = created
@@ -1128,6 +1159,7 @@ mod tests {
             McpSandbox {
                 container_workdir: Some("/workspace/pinned".into()),
                 mounts: Vec::new(),
+                plugin_socket: SandboxSocket::Unmounted,
             }
         );
     }

@@ -1473,8 +1473,10 @@ pub(super) async fn resolve_mcp_servers(
         profile,
         cwd,
         plugin_served: Vec::new(),
+        unreachable_notified: Vec::new(),
     };
-    ctx.plugin_served = crate::plugin::mcp_serve::session_plugin_entries(&ctx).await;
+    (ctx.plugin_served, ctx.unreachable_notified) =
+        crate::plugin::mcp_serve::session_plugin_entries(&ctx).await;
     let mut provenance: std::collections::HashMap<String, McpProvenance> = resolved
         .iter()
         .map(|s| (s.def.name.clone(), s.provenance.clone()))
@@ -2826,6 +2828,7 @@ time.sleep(60)
         let endpoint = crate::server::daemon_endpoint::DaemonEndpoint {
             host_url: "http://127.0.0.1:4321".into(),
             sandbox_url: None,
+            sandbox_socket: None,
             secret: secret.clone(),
         };
         (secret, endpoint)
@@ -3105,6 +3108,9 @@ time.sleep(60)
                 .iter()
                 .map(|s| match s {
                     McpServer::Http(s) => format!("{}={}", s.name, s.url),
+                    McpServer::Stdio(s) if s.command.as_os_str() == "node" => {
+                        format!("{}=node {}", s.name, s.args.join(" "))
+                    }
                     McpServer::Stdio(s) => s.name.clone(),
                     _ => panic!("unexpected transport"),
                 })
@@ -3112,69 +3118,147 @@ time.sleep(60)
             n.sort();
             n
         };
-
-        // (case, endpoint: none | host | sandbox, sandboxed, fail hook, expected, worker asked)
-        let cases: [(&str, &str, bool, bool, &[&str], bool); 6] = [
-            ("no endpoint", "none", false, false, &["native"], false),
+        use crate::server::daemon_endpoint::NoRoute;
+        let host_entry = "acme_a__docs=http://127.0.0.1:4321/mcp/plugins/acme.a/docs";
+        let url_entry = "acme_a__docs=http://host.containers.internal:4321/mcp/plugins/acme.a/docs";
+        let socket_entry =
+            "acme_a__docs=node /aoe/plugin-mcp/forward.mjs /aoe/plugin-mcp/mcp.sock acme.a docs";
+        // Endpoint kinds: none; host (no sandbox route); socket (container reaches it);
+        // unmounted (socket, container lacks the mount); vm (container on another kernel);
+        // url+unmounted; all routes.
+        // (case, endpoint, sandboxed, fail hook, expected, skipped notice)
+        type Case<'a> = (&'a str, &'a str, bool, bool, Vec<&'a str>, Option<NoRoute>);
+        let cases: Vec<Case> = vec![
+            (
+                "no endpoint",
+                "none",
+                false,
+                false,
+                vec!["native"],
+                Some(NoRoute::Endpoint),
+            ),
+            (
+                "sandbox, no endpoint",
+                "none",
+                true,
+                false,
+                vec!["native"],
+                Some(NoRoute::Endpoint),
+            ),
             (
                 "host",
                 "host",
                 false,
                 false,
-                &[
-                    "acme_a__docs=http://127.0.0.1:4321/mcp/plugins/acme.a/docs",
-                    "native",
-                ],
-                true,
+                vec![host_entry, "native"],
+                None,
             ),
             (
-                "sandbox without a sandbox url",
+                "sandbox, no route",
                 "host",
                 true,
                 false,
-                &["native"],
-                false,
+                vec!["native"],
+                Some(if cfg!(target_os = "linux") {
+                    NoRoute::Socket
+                } else {
+                    NoRoute::Platform
+                }),
             ),
             (
-                "sandbox with a sandbox url",
-                "sandbox",
+                "sandbox, socket",
+                "socket",
                 true,
                 false,
-                &[
-                    "acme_a__docs=http://host.containers.internal:4321/mcp/plugins/acme.a/docs",
-                    "native",
-                ],
-                true,
+                vec![socket_entry, "native"],
+                None,
             ),
             (
-                "host ignores the sandbox url",
-                "sandbox",
-                false,
-                false,
-                &[
-                    "acme_a__docs=http://127.0.0.1:4321/mcp/plugins/acme.a/docs",
-                    "native",
-                ],
+                "sandbox, unmounted",
+                "unmounted",
                 true,
+                false,
+                vec!["native"],
+                Some(NoRoute::Mount),
             ),
-            ("sandbox hook failure", "sandbox", true, true, &[], true),
+            (
+                "sandbox, VM-backed runtime",
+                "vm",
+                true,
+                false,
+                vec!["native"],
+                Some(NoRoute::Kernel),
+            ),
+            (
+                "sandbox, container not checkable",
+                "unchecked",
+                true,
+                false,
+                vec!["native"],
+                Some(NoRoute::Probe),
+            ),
+            (
+                "sandbox, url fallback",
+                "url+unmounted",
+                true,
+                false,
+                vec![url_entry, "native"],
+                None,
+            ),
+            (
+                "host ignores sandbox routes",
+                "all",
+                false,
+                false,
+                vec![host_entry, "native"],
+                None,
+            ),
+            ("sandbox hook failure", "all", true, true, vec![], None),
         ];
-        for (case, endpoint_kind, sandboxed, fail_hook, expected, asked) in cases {
+        for (case, endpoint_kind, sandboxed, fail_hook, expected, skipped) in cases {
             let rewriter = ServingRewriter::new(vec![("acme.a", names(&["docs"]))], fail_hook);
             let _slot = SlotGuard::install(rewriter.clone());
             let _endpoint = match endpoint_kind {
                 "none" => EndpointGuard::clear_on_drop(),
                 kind => {
                     let mut endpoint = test_endpoint(tmp.path()).1;
-                    if kind == "sandbox" {
+                    if kind.contains("url") || kind == "all" {
                         endpoint.sandbox_url = Some("http://host.containers.internal:4321".into());
                     }
+                    use crate::server::daemon_endpoint::SandboxSocket;
+                    fn reachable(_: &str) -> SandboxSocket {
+                        SandboxSocket::Reachable
+                    }
+                    fn unmounted(_: &str) -> SandboxSocket {
+                        SandboxSocket::Unmounted
+                    }
+                    fn other_kernel(_: &str) -> SandboxSocket {
+                        SandboxSocket::OtherKernel
+                    }
+                    fn unchecked(_: &str) -> SandboxSocket {
+                        SandboxSocket::Unchecked
+                    }
+                    endpoint.sandbox_socket = match kind {
+                        "socket" | "all" => Some(reachable as fn(&str) -> SandboxSocket),
+                        "unmounted" | "url+unmounted" => Some(unmounted),
+                        "vm" => Some(other_kernel),
+                        "unchecked" => Some(unchecked),
+                        _ => None,
+                    };
                     EndpointGuard::install(endpoint)
                 }
             };
             let out = resolve(sandboxed).await;
             assert_eq!(names_of(&out), expected, "{case}");
-            assert_eq!(rewriter.worker_calls() > 0, asked, "{case}");
+            assert!(
+                rewriter.worker_calls() > 0,
+                "{case}: the worker is always asked"
+            );
+            let want: Vec<(String, String)> = skipped
+                .map(|cause| ("acme.a".to_string(), cause.notice().to_string()))
+                .into_iter()
+                .collect();
+            assert_eq!(rewriter.skipped(), want, "{case}");
         }
     }
 

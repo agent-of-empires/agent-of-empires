@@ -14,6 +14,8 @@ use serde_json::Value;
 use crate::acp::mcp_rewrite::{context_params, McpRewriteContext, PluginServed};
 use crate::plugin::worker_call::WorkerCall;
 use crate::plugin::worker_requests::WorkerRequestError;
+use crate::server::daemon_endpoint::{plugin_route, PluginRoute};
+use crate::server::plugin_mcp_socket as socket;
 use crate::server::session_credential::McpSessionSecret;
 use crate::session::mcp::project_mcp::{ProjectMcpServer, ProjectMcpTransport};
 
@@ -167,22 +169,31 @@ async fn servers_with_timeout<'a>(
     served
 }
 
-/// The plugin entries for a session, or none when the daemon has no endpoint the session reaches.
-pub async fn session_plugin_entries(ctx: &McpRewriteContext) -> Vec<PluginServed> {
-    let Some(endpoint) = crate::server::daemon_endpoint::daemon_endpoint() else {
-        return Vec::new();
-    };
-    let Some(base_url) = endpoint.base_url(ctx.sandboxed()) else {
-        return Vec::new();
-    };
+/// The plugin entries for a session, and the plugins told it cannot reach them.
+/// Workers are asked even without a route, so only plugins that offered servers are told.
+pub async fn session_plugin_entries(ctx: &McpRewriteContext) -> (Vec<PluginServed>, Vec<String>) {
     let served = crate::acp::mcp_rewrite::served_servers(ctx).await;
-    plugin_entries(&endpoint.secret, base_url, &ctx.session_id, &served)
+    let endpoint = crate::server::daemon_endpoint::daemon_endpoint();
+    match plugin_route(endpoint.as_deref(), ctx.sandbox_socket()) {
+        Ok((secret, route)) => (
+            plugin_entries(secret, route, &ctx.session_id, &served),
+            Vec::new(),
+        ),
+        Err(cause) => {
+            let mut plugins: Vec<String> = served.into_iter().map(|s| s.plugin_id).collect();
+            plugins.dedup();
+            for plugin_id in &plugins {
+                crate::acp::mcp_rewrite::report_serve_failure(plugin_id, cause.notice());
+            }
+            (Vec::new(), plugins)
+        }
+    }
 }
 
-/// One `http` entry per served server, authenticated with the credential for exactly that server.
+/// One entry per served server, authenticated with the credential for exactly that server.
 pub fn plugin_entries(
     secret: &McpSessionSecret,
-    base_url: &str,
+    route: PluginRoute<'_>,
     session_id: &str,
     served: &[ServedServer],
 ) -> Vec<PluginServed> {
@@ -191,19 +202,35 @@ pub fn plugin_entries(
         .iter()
         .map(|s| {
             let credential = secret.plugin_server_credential_for(&s.plugin_id, &s.name, session_id);
-            let headers = [
-                ("Authorization".to_string(), format!("Bearer {credential}")),
-                ("X-AoE-Session".to_string(), session_id.to_string()),
-            ]
-            .into();
+            let transport = match route {
+                PluginRoute::Http(base_url) => ProjectMcpTransport::Http {
+                    url: format!("{base_url}/mcp/plugins/{}/{}", s.plugin_id, s.name),
+                    headers: [
+                        ("Authorization".to_string(), format!("Bearer {credential}")),
+                        ("X-AoE-Session".to_string(), session_id.to_string()),
+                    ]
+                    .into(),
+                },
+                PluginRoute::Socket => ProjectMcpTransport::Stdio {
+                    command: "node".to_string(),
+                    args: vec![
+                        socket::container_forwarder(),
+                        socket::container_socket(),
+                        s.plugin_id.clone(),
+                        s.name.clone(),
+                    ],
+                    env: [
+                        (socket::TOKEN_ENV.to_string(), credential),
+                        (socket::SESSION_ENV.to_string(), session_id.to_string()),
+                    ]
+                    .into(),
+                },
+            };
             PluginServed {
                 plugin_id: s.plugin_id.clone(),
                 server: ProjectMcpServer {
                     name: s.entry_key.clone(),
-                    transport: ProjectMcpTransport::Http {
-                        url: format!("{base_url}/mcp/plugins/{}/{}", s.plugin_id, s.name),
-                        headers,
-                    },
+                    transport,
                 },
             }
         })
@@ -354,6 +381,7 @@ pub(crate) mod test_support {
         manifests: Vec<PluginManifest>,
         fail_hook: bool,
         pub(crate) requests: Mutex<Vec<Value>>,
+        skipped: Mutex<Vec<(String, String)>>,
     }
 
     impl ServingRewriter {
@@ -364,6 +392,7 @@ pub(crate) mod test_support {
                 manifests,
                 fail_hook,
                 requests: Mutex::new(Vec::new()),
+                skipped: Mutex::new(Vec::new()),
             })
         }
 
@@ -373,6 +402,11 @@ pub(crate) mod test_support {
 
         pub(crate) fn notices(&self) -> Vec<(String, String)> {
             self.caller.notices.lock().unwrap().clone()
+        }
+
+        /// The `report_serve_failure` calls, `(plugin, message)`.
+        pub(crate) fn skipped(&self) -> Vec<(String, String)> {
+            self.skipped.lock().unwrap().clone()
         }
     }
 
@@ -417,6 +451,13 @@ pub(crate) mod test_support {
         fn report_serve_notice(&self, plugin_id: &str, message: &str) {
             self.caller.report_serve_notice(plugin_id, message);
         }
+
+        fn report_serve_failure(&self, plugin_id: &str, message: &str) {
+            self.skipped
+                .lock()
+                .unwrap()
+                .push((plugin_id.into(), message.into()));
+        }
     }
 }
 
@@ -434,10 +475,12 @@ mod tests {
             sandbox: sandboxed.then(|| McpSandbox {
                 container_workdir: Some("/work".into()),
                 mounts: Vec::new(),
+                plugin_socket: crate::server::daemon_endpoint::SandboxSocket::Reachable,
             }),
             profile: Some("p".into()),
             cwd: "/w".into(),
             plugin_served: Vec::new(),
+            unreachable_notified: Vec::new(),
         }
     }
 
@@ -750,7 +793,7 @@ mod tests {
         let secret = McpSessionSecret::load_or_generate(&dir.path().join("secret")).unwrap();
         let out = plugin_entries(
             &secret,
-            "http://127.0.0.1:4321",
+            PluginRoute::Http("http://127.0.0.1:4321"),
             "sess-1",
             &[served("acme.a", "docs"), served("acme.b", "git.v2")],
         );
@@ -775,6 +818,42 @@ mod tests {
             },
         };
         assert_eq!(out, [entry("acme.a", "docs"), entry("acme.b", "git.v2")]);
+    }
+
+    /// Sandboxes reach the socket through the mounted forwarder; the credential travels in
+    /// env, never in argv.
+    #[test]
+    fn socket_entries_run_the_forwarder_with_the_server_credential() {
+        use crate::server::plugin_mcp_socket::{SESSION_ENV, TOKEN_ENV};
+
+        let dir = tempfile::tempdir().unwrap();
+        let secret = McpSessionSecret::load_or_generate(&dir.path().join("secret")).unwrap();
+        let docs = ServedServer::new("acme.a", "docs".into(), false);
+        let out = plugin_entries(&secret, PluginRoute::Socket, "sess-1", &[docs]);
+        let credential = secret.plugin_server_credential_for("acme.a", "docs", "sess-1");
+        assert_eq!(
+            out,
+            [PluginServed {
+                plugin_id: "acme.a".into(),
+                server: ProjectMcpServer {
+                    name: "docs".into(),
+                    transport: ProjectMcpTransport::Stdio {
+                        command: "node".into(),
+                        args: vec![
+                            "/aoe/plugin-mcp/forward.mjs".into(),
+                            "/aoe/plugin-mcp/mcp.sock".into(),
+                            "acme.a".into(),
+                            "docs".into(),
+                        ],
+                        env: [
+                            (TOKEN_ENV.to_string(), credential),
+                            (SESSION_ENV.to_string(), "sess-1".to_string()),
+                        ]
+                        .into(),
+                    },
+                },
+            }]
+        );
     }
 
     #[tokio::test]
