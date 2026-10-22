@@ -366,6 +366,7 @@ pub(super) const CITYHALL_MUTATION_DENY: &[(&str, &str)] = &[
     ("POST", "/api/sessions/{id}/acp/enable"),
     ("POST", "/api/sessions/{id}/acp/install-agent"),
     ("POST", "/api/sessions/{id}/acp/mode"),
+    ("POST", "/api/sessions/{id}/acp/restart"),
     ("POST", "/api/sessions/{id}/acp/spawn"),
     ("POST", "/api/sessions/{id}/acp/switch-agent"),
     ("POST", "/api/sessions/{id}/acp/switch-provider"),
