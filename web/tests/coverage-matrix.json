@@ -3413,6 +3413,7 @@
       "specs": [
         "src/components/acp/__tests__/SessionBanners.test.tsx",
         "src/components/acp/startupWait.test.ts",
+        "src/lib/agentDisplayName.test.ts",
         "src/components/acp/SystemNotices.test.tsx",
         "src/components/acp/QueuedPromptsStrip.test.tsx",
         "src/components/acp/SendButton.test.tsx",

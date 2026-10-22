@@ -275,12 +275,12 @@ export function QueuedPromptsStrip({
   const visible = queued.slice(0, layout.visibleCount);
   return (
     <Strip tone="border-surface-800 bg-surface-900/60">
-      <div className="flex items-center justify-between pb-1.5 text-[11px] uppercase tracking-wider text-text-dim">
+      <div className="flex items-center justify-between gap-2 pb-1.5 text-[11px] uppercase tracking-wider text-text-dim">
         <span
-          className="inline-flex items-center gap-1"
+          className="flex min-w-0 items-center gap-1 wrap-anywhere"
           title="Queued in this browser. Sends when the agent is free, even from another chat, as long as a dashboard tab stays open. Three closed chats deliver in the background at a time; the rest wait for a slot or for you to open them. Your other devices do not see it."
         >
-          <Clock className="h-3 w-3" />
+          <Clock className="h-3 w-3 shrink-0" />
           {pendingResume
             ? waitingFor
               ? `Pending until ${waitingFor} is ready (${queued.length})`
@@ -288,7 +288,11 @@ export function QueuedPromptsStrip({
             : `Queued (${queued.length})`}
         </span>
         {queued.length > 1 && (
-          <button type="button" onClick={onClear} className="text-text-dim hover:text-text-secondary transition-colors">
+          <button
+            type="button"
+            onClick={onClear}
+            className="shrink-0 text-text-dim hover:text-text-secondary transition-colors"
+          >
             Clear all
           </button>
         )}

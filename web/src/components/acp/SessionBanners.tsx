@@ -109,7 +109,7 @@ export function StartupWaitLine({ agent }: { agent: string }) {
       <span aria-hidden className="w-3 shrink-0 font-mono text-text-secondary">
         {glyph}
       </span>
-      <span className="min-w-0">
+      <span className="min-w-0 flex-1 wrap-anywhere">
         {seconds < STILL_STARTING_AFTER_S ? `Starting ${agent}… You can type now.` : `Still starting ${agent}…`}
       </span>
       <span data-testid="startup-wait-elapsed" className="ml-auto shrink-0 font-mono tabular-nums">

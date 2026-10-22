@@ -45,6 +45,17 @@ describe("SystemNotices", () => {
     ["first connect while starting", { status: "connecting", hasEverOpened: false, newSessionStarting: true }, null],
     ["first connect error while starting", { status: "error", hasEverOpened: false, newSessionStarting: true }, null],
     [
+      "a first-connection retry while starting",
+      { status: "error", reconnecting: true, retryCount: 1, hasEverOpened: false, newSessionStarting: true },
+      null,
+    ],
+    ["a closed socket while starting", { status: "closed", hasEverOpened: false, newSessionStarting: true }, null],
+    [
+      "a retry once the Session has connected",
+      { status: "error", reconnecting: true, retryCount: 1, hasEverOpened: true, newSessionStarting: true },
+      /Structured view disconnected\. Reconnecting \(1\/7\)/,
+    ],
+    [
       "a reconnect",
       { status: "connecting", hasEverOpened: true, newSessionStarting: true },
       /Reconnecting to structured view/,
