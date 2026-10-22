@@ -10,6 +10,13 @@ import {
   type ReactNode,
 } from "react";
 import { Puzzle } from "lucide-react";
+import {
+  confirmFileEditNavigation,
+  hasUnsavedFileEdits,
+  isFileEditorOpen,
+  rememberFileEditLocation,
+} from "./lib/fileEditGuard";
+import type { NavigateOptions, To } from "react-router-dom";
 import { useLocation, useMatch, useNavigate, useSearchParams } from "react-router-dom";
 import { IDLE_DECAY_WINDOW_MS } from "./lib/session";
 import { diffSelectionStale } from "./lib/diffSelection";
@@ -369,7 +376,29 @@ function AppContent({
   }, []);
 
   const location = useLocation();
-  const navigate = useNavigate();
+  const rawNavigate = useNavigate();
+  const navigate = useCallback(
+    (to: To | number, options?: NavigateOptions) => {
+      if (!confirmFileEditNavigation()) return;
+      return typeof to === "number" ? rawNavigate(to) : rawNavigate(to, options);
+    },
+    [rawNavigate],
+  );
+  useEffect(() => {
+    const guardLink = (event: MouseEvent) => {
+      const link = event.target instanceof Element ? event.target.closest("a[href]") : null;
+      if (!link || !hasUnsavedFileEdits() || event.metaKey || event.ctrlKey || event.shiftKey || event.button !== 0)
+        return;
+      if (link.getAttribute("target") === "_blank" || (link as HTMLAnchorElement).href === window.location.href) return;
+      if (!confirmFileEditNavigation()) {
+        event.preventDefault();
+        event.stopPropagation();
+      }
+    };
+    rememberFileEditLocation();
+    document.addEventListener("click", guardLink, true);
+    return () => document.removeEventListener("click", guardLink, true);
+  }, [location]);
   const [searchParams, setSearchParams] = useSearchParams();
   const { settings: webSettings } = useWebSettings();
   const sessionMatch = useMatch("/session/:sessionId");
@@ -384,7 +413,8 @@ function AppContent({
   // A plugin page's split pane shows `?session=` as the routed session, docks and all.
   const activeSessionId = sessionMatch?.params.sessionId ?? (pluginPageMatch ? searchParams.get("session") : null);
   const selectPluginPageSession = useCallback(
-    (id: string | null) =>
+    (id: string | null) => {
+      if (!confirmFileEditNavigation()) return;
       setSearchParams(
         (prev) => {
           const next = new URLSearchParams(prev);
@@ -393,7 +423,8 @@ function AppContent({
           return next;
         },
         { replace: true },
-      ),
+      );
+    },
     [setSearchParams],
   );
   // Off a removed session: back to the dashboard, or on a plugin page just out of its split pane. A focus window
@@ -1647,6 +1678,7 @@ function AppContent({
 
   const handlePickView = useCallback(
     (view: RightPanelView) => {
+      if (!confirmFileEditNavigation()) return;
       transitionKeyboardProxy(activeSessionId, view);
       setRightPanelView(view);
       setPickerOpen(false);
@@ -1655,6 +1687,7 @@ function AppContent({
   );
 
   const handleSelectFile = useCallback((path: string, repoName?: string, line?: number) => {
+    if (!confirmFileEditNavigation()) return;
     setSelectedFile({ path, repoName, line });
   }, []);
 
@@ -1674,6 +1707,7 @@ function AppContent({
       // provenance-confined /file viewer, as does any out-of-repo absolute path
       // the agent touched this session (a plan in /tmp, ~/.claude, etc.). #3088.
       if (resolved && !activeSession.scratch) {
+        if (!confirmFileEditNavigation()) return;
         setSelectedFile({
           path: resolved.relativePath,
           repoName: resolved.repoName,
@@ -1683,6 +1717,7 @@ function AppContent({
         return;
       }
       if (resolved || isAbsolutePath(ref.path)) {
+        if (!confirmFileEditNavigation()) return;
         setSelectedFile({
           path: resolved?.relativePath ?? ref.path,
           line: ref.line,
@@ -1697,12 +1732,12 @@ function AppContent({
   );
 
   const handleCloseFile = useCallback(() => {
+    if (!confirmFileEditNavigation()) return;
     setSelectedFile(null);
   }, []);
 
   const handleGoDashboard = useCallback(() => {
     navigate("/");
-    setSelectedFile(null);
   }, [navigate]);
 
   const handleOpenSettings = useCallback(() => {
@@ -1835,6 +1870,7 @@ function AppContent({
       return;
     }
     if (singlePane) {
+      if (!confirmFileEditNavigation()) return;
       setRightPanelView("agent");
       requestAnimationFrame(() => dispatchFocusTerminal("agent"));
       return;
@@ -1843,6 +1879,7 @@ function AppContent({
       // Agent terminal is hidden under the diff viewer; close the diff first
       // so the wrapper un-hides, then dispatch on the next frame because
       // focus() on a display:none element is a no-op.
+      if (!confirmFileEditNavigation()) return;
       setSelectedFile(null);
       requestAnimationFrame(() => dispatchFocusTerminal("agent"));
       return;
@@ -1904,7 +1941,7 @@ function AppContent({
           // Settings dialogs handle Escape after this capture-phase shortcut.
           if (showSettings && !document.querySelector('[aria-modal="true"]')) handleCloseSettings();
           setShowAbout(false);
-          setSelectedFile(null);
+          if (!isFileEditorOpen()) setSelectedFile(null);
         },
         onHelp: () => setShowHelp((h) => !h),
         onSettings: () => (showSettings ? handleCloseSettings() : handleOpenSettings()),
@@ -2043,7 +2080,13 @@ function AppContent({
         // Remount on session switch so the selected file (and any in-flight
         // read) resets instead of requesting the old path from the new
         // session. See #3088 review.
-        return <FilesPane key={activeSessionId ?? "none"} sessionId={activeSessionId} />;
+        return (
+          <FilesPane
+            key={activeSessionId ?? "none"}
+            sessionId={activeSessionId}
+            structured={activeSession?.view === "structured"}
+          />
+        );
       }
       if (id === "diff") {
         return (
@@ -2150,6 +2193,7 @@ function AppContent({
                   activeSessionId &&
                   (selectedFileExternal ? (
                     <FileContentViewer
+                      structured={activeSession?.view === "structured"}
                       sessionId={activeSessionId}
                       filePath={selectedFilePath}
                       onBack={handleCloseFile}
@@ -2377,6 +2421,7 @@ function AppContent({
           sessions={sessions}
           webSettings={webSettings}
           selectedFilePath={selectedFilePath}
+          selectedFileExternal={selectedFileExternal}
           selectedRepoName={selectedRepoName}
           selectedFileLine={selectedFileLine}
           revision={revision}
@@ -2396,7 +2441,7 @@ function AppContent({
           sendDialogOpen={sendDialogOpen}
           onOpenSendDialog={() => setSendDialogOpen(true)}
           onCloseSendDialog={() => setSendDialogOpen(false)}
-          onClearSelectedFile={() => setSelectedFile(null)}
+          onClearSelectedFile={handleCloseFile}
           serverAbout={serverAbout}
         />
       );

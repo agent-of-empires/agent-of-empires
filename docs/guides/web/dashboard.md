@@ -17,6 +17,15 @@ Each sidebar row carries an animated braille glyph encoding the session's state:
 
 The **?** in the sidebar header opens a legend of every glyph and mark: the status glyphs, Unread, Pinned Session, Favorite, Project, Pinned project and the Group dot. It's a popover on desktop and a sheet on a phone. Hovering a glyph or mark with a mouse shows what it means, and a row that needs attention for another reason adds that on a second line. With a row focused from the keyboard, its glyph's meaning shows too, along with **Press Enter to open**. Animated glyphs in the legend hold still when your system asks for reduced motion.
 
+## Editing project files
+
+Editing is off by default. Enable **Settings > Panels > Edit project text files** in the browser, then open an existing file in **Files** and select **Edit**.
+
+- Save or Cancel in the viewer. Ctrl/Cmd+S and Esc apply only while the text area has focus. Confirm before leaving unsaved changes.
+- Existing UTF-8 text files up to 5 MB only. Read-only dashboards, out-of-project transcript files, and Sandbox folders backed by separate volumes and individual file bind mounts stay read-only with a reason. Files are unavailable in CityHall mode.
+- Saves preserve line endings, the trailing newline and file mode. A changed disk version refuses the save; copy your edits or reload. The editor checks for external changes while open.
+- After saving, optionally draft a note in Structured view without submitting it. Terminal view shows a reminder to tell the agent.
+
 ## Creating a session
 
 The **New session** wizard is one screen of one-line rows, like the TUI dialog; a row with a chevron opens its details in a panel:
