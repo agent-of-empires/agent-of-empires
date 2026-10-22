@@ -36,7 +36,7 @@ impl Instance {
             fresh.before_start_env = previous.before_start_env;
             // The live container's workdir outranks a stale persisted pin (#4806).
             if fresh.container_name == previous.container_name
-                && fresh.container_id == previous.container_id
+                && (fresh.container_id.is_none() || fresh.container_id == previous.container_id)
                 && previous.container_workdir.is_some()
             {
                 fresh.container_workdir = previous.container_workdir;
