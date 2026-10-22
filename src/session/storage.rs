@@ -2014,6 +2014,7 @@ impl Storage {
             ReadPolicy::ReadOnly,
             "group",
             self.files.as_deref().map(|files| &files.groups),
+            |_| Ok(()),
         )
     }
 
@@ -2030,6 +2031,14 @@ impl Storage {
             policy,
             "session",
             self.profile_files(policy).map(|files| &files.sessions),
+            |instance: &Instance| {
+                if let Some(intent) = &instance.terminal_handoff {
+                    intent.validate_relationships().with_context(|| {
+                        format!("invalid terminal handoff for session {}", instance.id)
+                    })?;
+                }
+                Ok(())
+            },
         )?;
         for instance in &mut instances {
             // `source_profile` is never persisted, so a loaded row
@@ -2047,6 +2056,7 @@ impl Storage {
         policy: ReadPolicy<'_>,
         kind: &str,
         source: Option<&super::anchored_fs::ResolvedDataFile>,
+        validate: impl Fn(&T) -> Result<()>,
     ) -> Result<Vec<T>> {
         let result = (|| {
             let content = match source {
@@ -2057,7 +2067,11 @@ impl Storage {
                 return Ok(Vec::new());
             };
             if matches!(policy, ReadPolicy::Complete(_)) {
-                return Ok(serde_json::from_str(&content)?);
+                let rows: Vec<T> = serde_json::from_str(&content)?;
+                for row in &rows {
+                    validate(row)?;
+                }
+                return Ok(rows);
             }
             if content.trim().is_empty() {
                 return Ok(Vec::new());
@@ -2067,8 +2081,21 @@ impl Storage {
             let mut corrupt = Vec::new();
             for (index, row) in rows.into_iter().enumerate() {
                 match T::deserialize(&row) {
-                    Ok(row) => valid.push(row),
+                    Ok(row) => {
+                        validate(&row)?;
+                        valid.push(row);
+                    }
                     Err(error) => {
+                        if kind == "session"
+                            && row
+                                .get("terminal_handoff")
+                                .is_some_and(|intent| !intent.is_null())
+                        {
+                            return Err(anyhow::Error::from(error).context(format!(
+                                "invalid retained terminal handoff at session row {index} in {}",
+                                path.display()
+                            )));
+                        }
                         tracing::warn!(target: "session.store", profile = %self.profile, row = index, %error, %kind, path = %path.display(), "skipping corrupt stored row");
                         corrupt.push(row);
                     }
@@ -2215,6 +2242,7 @@ impl Storage {
             ReadPolicy::Complete(files),
             "group",
             Some(&files.groups),
+            |_| Ok(()),
         )?;
         self.verify_bound_profile()?;
         Ok((rows, groups))
@@ -2243,6 +2271,7 @@ impl Storage {
             policy,
             "group",
             self.profile_files(policy).map(|files| &files.groups),
+            |_| Ok(()),
         )?;
         Ok((instances, groups))
     }

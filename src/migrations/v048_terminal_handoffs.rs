@@ -6,7 +6,7 @@ pub fn run() -> Result<()> {
     for path in super::sessions_file::session_files(&crate::session::get_app_dir()?)? {
         migrate_file(&path)?;
     }
-    tracing::info!(target: "migrations.v048", "Initialized explicit terminal handoff state");
+    tracing::info!(target: "migrations.v048", "Validated retained terminal handoff authority");
     Ok(())
 }
 
@@ -25,21 +25,20 @@ fn migrate_file(path: &Path) -> Result<()> {
     let _lock =
         crate::session::acquire_storage_flock(parent, crate::session::STORAGE_LOCK_FILENAME)?;
     let bytes = std::fs::read(path)?;
-    let mut value: Value = match serde_json::from_slice(&bytes) {
+    let value: Value = match serde_json::from_slice(&bytes) {
         Ok(value) => value,
         Err(error) => {
             tracing::warn!(target: "migrations.v048", path = %path.display(), %error, "Preserved unreadable session component; repair it and run aoe migrate");
             return Ok(());
         }
     };
-    let Some(rows) = value.as_array_mut() else {
+    let Some(rows) = value.as_array() else {
         tracing::warn!(target: "migrations.v048", path = %path.display(), "Preserved invalid session component; repair it and run aoe migrate");
         return Ok(());
     };
-    let mut changed = false;
     let mut invalid_rows = false;
     for row in rows {
-        let Some(object) = row.as_object_mut() else {
+        let Some(object) = row.as_object() else {
             invalid_rows = true;
             continue;
         };
@@ -48,34 +47,14 @@ fn migrate_file(path: &Path) -> Result<()> {
             .filter(|value| !value.is_null())
         {
             let intent: crate::session::TerminalHandoffIntent =
-                serde_json::from_value(intent.clone())
+                serde::Deserialize::deserialize(intent)
                     .context("existing terminal handoff authority is malformed")?;
-            anyhow::ensure!(
-                intent.target_generation <= intent.generation,
-                "terminal handoff target generation exceeds ownership generation"
-            );
-            anyhow::ensure!(
-                intent
-                    .launch
-                    .as_ref()
-                    .is_none_or(|launch| launch.generation <= intent.generation),
-                "terminal handoff attempt generation exceeds ownership generation"
-            );
-            if intent.unborn_fence.is_some() {
-                intent.validate_unborn_fence()?;
-            }
-        } else if !object.contains_key("terminal_handoff") {
-            object.insert("terminal_handoff".into(), Value::Null);
-            changed = true;
+            intent.validate_relationships()?;
         }
     }
     if invalid_rows {
         tracing::warn!(target: "migrations.v048", path = %path.display(), "Preserved invalid session rows; repair them and run aoe migrate");
         return Ok(());
-    }
-    if changed {
-        crate::session::backup_before_migration(path)?;
-        crate::session::atomic_write(path, &serde_json::to_vec_pretty(&value)?)?;
     }
     Ok(())
 }
@@ -102,6 +81,9 @@ mod tests {
             let mut row = serde_json::to_value(crate::session::Instance::new("old", "/tmp/repo"))?;
             row["terminal_scopes"] = Value::Null;
             row["opaque"] = json!({"keep":17});
+            if invalid == b"{}" {
+                row["terminal_handoff"] = Value::Null;
+            }
             let original = serde_json::to_vec(&json!([row]))?;
             std::fs::write(healthy.sessions_path(), &original)?;
             std::fs::write(damaged.sessions_path(), invalid)?;
@@ -115,17 +97,8 @@ mod tests {
             );
             assert_eq!(std::fs::read(damaged.sessions_path())?, invalid);
             assert!(crate::session::migration_backups(damaged.sessions_path())?.is_empty());
-            let migrated: Value = serde_json::from_slice(&std::fs::read(healthy.sessions_path())?)?;
-            assert_eq!(migrated[0]["terminal_scopes"], Value::Null);
-            assert_eq!(migrated[0]["terminal_handoff"], Value::Null);
-            assert!(migrated[0]
-                .as_object()
-                .unwrap()
-                .contains_key("terminal_handoff"));
-            assert_eq!(migrated[0]["opaque"], json!({"keep":17}));
-            assert!(crate::session::migration_backups(healthy.sessions_path())?
-                .iter()
-                .any(|(_, backup)| std::fs::read(backup).is_ok_and(|bytes| bytes == original)));
+            assert_eq!(std::fs::read(healthy.sessions_path())?, original);
+            assert!(crate::session::migration_backups(healthy.sessions_path())?.is_empty());
             let committed = std::fs::read(healthy.sessions_path())?;
             run()?;
             assert_eq!(std::fs::read(healthy.sessions_path())?, committed);
@@ -171,11 +144,8 @@ mod tests {
         std::fs::write(&path, &original)?;
         migrate_file(&path)?;
         let committed = std::fs::read(&path)?;
-        let migrated: Value = serde_json::from_slice(&committed)?;
-        assert_eq!(migrated[1], pending);
-        assert!(crate::session::migration_backups(&path)?
-            .iter()
-            .any(|(_, backup)| std::fs::read(backup).is_ok_and(|bytes| bytes == original)));
+        assert_eq!(committed, original);
+        assert!(crate::session::migration_backups(&path)?.is_empty());
         migrate_file(&path)?;
         assert_eq!(std::fs::read(&path)?, committed);
 
@@ -206,6 +176,30 @@ mod tests {
             assert_eq!(crate::migrations::get_current_version(), 47);
             assert_eq!(std::fs::read(&path)?, bytes);
             assert_eq!(crate::session::migration_backups(&path)?.len(), backups);
+
+            std::fs::write(app.join(".schema_version"), "48")?;
+            let bytes = serde_json::to_vec(&json!([earlier, invalid]))?;
+            std::fs::write(&path, &bytes)?;
+            let storage = crate::session::Storage::new_for_test_path("default", path.clone());
+            assert!(storage.load().is_err(), "corruption {corruption}");
+            assert!(
+                storage.load_instances_readonly().is_err(),
+                "corruption {corruption}"
+            );
+            assert!(
+                storage.load_complete_with_groups().is_err(),
+                "corruption {corruption}"
+            );
+            let entered = std::cell::Cell::new(false);
+            assert!(storage
+                .update(|_, _| {
+                    entered.set(true);
+                    Ok(())
+                })
+                .is_err());
+            assert!(!entered.get());
+            assert_eq!(std::fs::read(&path)?, bytes);
+            assert!(!app.join("sessions.corrupt.jsonl").exists());
         }
         Ok(())
     }
