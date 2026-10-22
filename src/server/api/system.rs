@@ -2828,7 +2828,7 @@ mod tests {
 
     #[tokio::test]
     #[serial_test::serial]
-    async fn settings_intros_fold_once_reject_unknown_ids_and_reset() {
+    async fn settings_intros_fold_once_reject_unknown_ids_refuse_read_only_and_reset() {
         let _dir = crate::session::test_support::isolate_app_dir();
         let state = crate::server::test_support::build_test_app_state(Vec::new());
         let folded = || {
@@ -2861,6 +2861,28 @@ mod tests {
             folded(),
             ["worktree", "plugins"],
             "an unknown id is not stored"
+        );
+
+        // Read-only profiles can read the list but neither fold nor reset it.
+        let mut read_only = crate::server::test_support::build_test_app_state(Vec::new());
+        Arc::get_mut(&mut read_only).expect("fresh state").read_only = true;
+        let refused_fold = fold_settings_intro(
+            State(read_only.clone()),
+            Ok(Json(FoldSettingsIntroBody {
+                id: "structured-view".into(),
+            })),
+        )
+        .await
+        .into_response();
+        assert_eq!(refused_fold.status(), StatusCode::FORBIDDEN);
+        let refused_reset = reset_settings_intros(State(read_only))
+            .await
+            .into_response();
+        assert_eq!(refused_reset.status(), StatusCode::FORBIDDEN);
+        assert_eq!(
+            folded(),
+            ["worktree", "plugins"],
+            "a read-only fold or reset changes nothing"
         );
 
         let reset = reset_settings_intros(State(state.clone()))
