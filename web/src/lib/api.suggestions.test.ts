@@ -5,6 +5,7 @@ import {
   prepareSuggestion,
   refreshSuggestions,
   updateSuggestionPolicy,
+  updateSuggestionSource,
 } from "./api";
 
 afterEach(() => vi.unstubAllGlobals());
@@ -88,5 +89,15 @@ describe("suggestion API", () => {
 
     expect(await actOnSuggestion(identity, "start")).toEqual({ ok: false, error: "Start denied" });
     expect(await prepareSuggestion(identity)).toEqual({ ok: false, error: "Request failed (503)" });
+  });
+
+  it("switches one provider source for the selected profile", async () => {
+    const fetchMock = vi.fn().mockResolvedValueOnce(new Response(JSON.stringify({ enabled: false })));
+    vi.stubGlobal("fetch", fetchMock);
+    expect(await updateSuggestionSource("gh", "ci_failed", false, "profile one")).toBe(true);
+    const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(url).toBe("/api/suggestions/sources?profile=profile%20one");
+    expect(init.method).toBe("PATCH");
+    expect(JSON.parse(String(init.body))).toEqual({ provider_id: "gh", criterion: "ci_failed", enabled: false });
   });
 });

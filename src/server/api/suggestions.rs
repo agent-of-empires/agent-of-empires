@@ -452,7 +452,9 @@ pub async fn update_suggestion_policy(
         let valid_provider = crate::plugin::registry()
             .get(&rule.provider_id)
             .is_some_and(|plugin| {
-                plugin.active() && plugin.manifest.runtime.is_some() && plugin.manifest.suggestions
+                plugin.active()
+                    && plugin.manifest.runtime.is_some()
+                    && plugin.manifest.suggestions.is_some()
             });
         if !valid_provider || rule.criterion.trim().is_empty() || rule.criterion.len() > 256 {
             return (
@@ -483,6 +485,78 @@ pub async fn update_suggestion_policy(
         )
             .into_response(),
     }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SourceBody {
+    provider_id: String,
+    criterion: String,
+    enabled: bool,
+}
+
+/// Switch one declared criterion of a provider on or off, then ask that worker
+/// to republish so the snapshot reflects the change without the next poll.
+pub async fn update_suggestion_source(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<ProfileQuery>,
+    Json(body): Json<SourceBody>,
+) -> impl IntoResponse {
+    if state.read_only || state.cityhall_mode {
+        return (
+            axum::http::StatusCode::FORBIDDEN,
+            Json(serde_json::json!({"error":"suggestions_disabled","message":"Suggestion source updates are unavailable in read-only or CityHall mode"})),
+        )
+            .into_response();
+    }
+    if let Err(response) = resolve_profile(query, &state) {
+        return response;
+    }
+    let declared = crate::plugin::registry()
+        .get(&body.provider_id)
+        .filter(|plugin| plugin.active() && plugin.manifest.runtime.is_some())
+        .and_then(|plugin| plugin.manifest.suggestions.as_ref())
+        .is_some_and(|spec| {
+            spec.sources
+                .iter()
+                .any(|source| source.criterion == body.criterion)
+        });
+    if !declared {
+        return (
+            axum::http::StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error":"validation_failed",
+                "message":"The provider must be an active suggestion provider that declares this criterion"
+            })),
+        )
+            .into_response();
+    }
+    let Some(host) = state.plugin_host.as_ref() else {
+        return (
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({"error":"unavailable","message":"Plugin host is unavailable"})),
+        )
+            .into_response();
+    };
+    if let Err(e) = host.set_suggestion_source(&body.provider_id, &body.criterion, body.enabled) {
+        return (
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error":"internal","message":e.to_string()})),
+        )
+            .into_response();
+    }
+    host.notify_worker(
+        &body.provider_id,
+        "suggestions.refresh",
+        serde_json::json!({}),
+    )
+    .await;
+    Json(serde_json::json!({
+        "provider_id": body.provider_id,
+        "criterion": body.criterion,
+        "enabled": body.enabled
+    }))
+    .into_response()
 }
 
 pub(crate) fn spawn_auto_create(state: Arc<AppState>) {
@@ -649,6 +723,41 @@ mod tests {
 
     #[tokio::test]
     #[serial_test::serial]
+    async fn source_switches_need_a_writable_host_and_a_declared_criterion() {
+        let _home = crate::session::test_support::isolate_app_dir();
+        crate::server::test_support::seed_instances_on_disk_for_test("test", Vec::new());
+        let body = || SourceBody {
+            provider_id: "nobody.provider".into(),
+            criterion: "assigned".into(),
+            enabled: false,
+        };
+        let read_only =
+            crate::server::test_support::build_test_app_state_configured(Vec::new(), |state| {
+                state.read_only = true
+            });
+        let response = update_suggestion_source(
+            State(read_only),
+            Query(ProfileQuery { profile: None }),
+            Json(body()),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), axum::http::StatusCode::FORBIDDEN);
+
+        let state =
+            crate::server::test_support::build_test_app_state_configured(Vec::new(), |_| {});
+        let response = update_suggestion_source(
+            State(state),
+            Query(ProfileQuery { profile: None }),
+            Json(body()),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), axum::http::StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
     async fn suggestions_automation_requires_opt_in_exact_rules_and_healthy_items() {
         use crate::plugin::{host::PluginHost, host_api::HostApiState};
         let _home = crate::session::test_support::isolate_app_dir();
@@ -672,6 +781,7 @@ mod tests {
             preview: "source text".into(),
             project: None,
             criterion: "assigned".into(),
+            variables: Default::default(),
             draft: aoe_plugin_api::SuggestionDraft {
                 title: "Review".into(),
                 prompt: "Review work".into(),

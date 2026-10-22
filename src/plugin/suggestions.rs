@@ -44,10 +44,45 @@ pub fn initialize(db: &rusqlite::Connection) -> anyhow::Result<()> {
             PRIMARY KEY(profile,provider_id));
          CREATE TABLE IF NOT EXISTS suggestion_policy (
             profile TEXT PRIMARY KEY, enabled INTEGER NOT NULL DEFAULT 0,
-            rules_json TEXT NOT NULL DEFAULT '[]', last_error TEXT);",
+            rules_json TEXT NOT NULL DEFAULT '[]', last_error TEXT);
+         CREATE TABLE IF NOT EXISTS suggestion_sources (
+            profile TEXT NOT NULL, provider_id TEXT NOT NULL, criterion TEXT NOT NULL,
+            enabled INTEGER NOT NULL, PRIMARY KEY(profile,provider_id,criterion));",
     )?;
     Ok(())
 }
+fn source_overrides(
+    db: &rusqlite::Connection,
+    profile: &str,
+    provider_id: &str,
+) -> anyhow::Result<std::collections::HashMap<String, bool>> {
+    let mut query = db.prepare(
+        "SELECT criterion,enabled FROM suggestion_sources WHERE profile=?1 AND provider_id=?2",
+    )?;
+    let rows = query
+        .query_map(params![profile, provider_id], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, bool>(1)?))
+        })?
+        .collect::<Result<_, _>>()?;
+    Ok(rows)
+}
+
+fn effective_sources(
+    declared: Vec<aoe_plugin_api::SuggestionSource>,
+    overrides: &std::collections::HashMap<String, bool>,
+) -> Vec<(aoe_plugin_api::SuggestionSource, bool)> {
+    declared
+        .into_iter()
+        .map(|source| {
+            let enabled = overrides
+                .get(&source.criterion)
+                .copied()
+                .unwrap_or(source.default_enabled);
+            (source, enabled)
+        })
+        .collect()
+}
+
 impl HostApiState {
     pub fn with_suggestions_db<T>(
         &self,
@@ -56,12 +91,48 @@ impl HostApiState {
         let db = self.events.lock().unwrap_or_else(|p| p.into_inner());
         f(&db)
     }
+    /// Declared sources with their effective switch; a stored override wins
+    /// over the manifest default. Undeclared providers have no sources.
+    pub fn suggestion_sources(
+        &self,
+        provider_id: &str,
+    ) -> anyhow::Result<Vec<(aoe_plugin_api::SuggestionSource, bool)>> {
+        let declared = crate::plugin::registry()
+            .get(provider_id)
+            .and_then(|plugin| plugin.manifest.suggestions.clone())
+            .map(|spec| spec.sources)
+            .unwrap_or_default();
+        let profile = self.suggestion_profile();
+        self.with_suggestions_db(|db| {
+            let overrides = source_overrides(db, profile, provider_id)?;
+            Ok(effective_sources(declared, &overrides))
+        })
+    }
+
+    pub fn set_suggestion_source(
+        &self,
+        provider_id: &str,
+        criterion: &str,
+        enabled: bool,
+    ) -> anyhow::Result<()> {
+        let profile = self.suggestion_profile();
+        self.with_suggestions_db(|db| {
+            db.execute(
+                "INSERT INTO suggestion_sources(profile,provider_id,criterion,enabled) VALUES(?1,?2,?3,?4)
+                 ON CONFLICT(profile,provider_id,criterion) DO UPDATE SET enabled=excluded.enabled",
+                params![profile, provider_id, criterion, enabled as i64],
+            )?;
+            Ok(())
+        })
+    }
+
     pub fn snapshot(&self, profile: &str) -> anyhow::Result<Value> {
         self.with_suggestions_db(|db| {
             let mut provider_query = db.prepare(
                 "SELECT provider_id,provider_name,status,error,updated_at
                  FROM suggestion_providers WHERE profile=?1 ORDER BY provider_name",
             )?;
+            let registry = crate::plugin::registry();
             let providers: Vec<Value> = provider_query
                 .query_map([profile], |row| {
                     let updated_at: i64 = row.get(4)?;
@@ -74,7 +145,33 @@ impl HostApiState {
                             .map(|timestamp| timestamp.to_rfc3339())
                     }))
                 })?
-                .collect::<Result<_, _>>()?;
+                .collect::<Result<Vec<_>, _>>()?
+                .into_iter()
+                .map(|mut provider| {
+                    let id = provider["provider_id"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .to_string();
+                    let declared = registry
+                        .get(&id)
+                        .and_then(|plugin| plugin.manifest.suggestions.clone())
+                        .map(|spec| spec.sources)
+                        .unwrap_or_default();
+                    let overrides = source_overrides(db, profile, &id)?;
+                    provider["sources"] = effective_sources(declared, &overrides)
+                        .into_iter()
+                        .map(|(source, enabled)| {
+                            json!({
+                                "criterion": source.criterion,
+                                "label": source.label,
+                                "description": source.description,
+                                "enabled": enabled
+                            })
+                        })
+                        .collect();
+                    Ok(provider)
+                })
+                .collect::<anyhow::Result<_>>()?;
 
             let mut item_query = db.prepare(
                 "SELECT i.item_json,i.provider_id,p.provider_name,i.revision,
@@ -349,11 +446,79 @@ mod tests {
             preview: "Untrusted PR body".into(),
             project: Some("repo".into()),
             criterion: "review_requested".into(),
+            variables: Default::default(),
             draft: aoe_plugin_api::SuggestionDraft {
                 title: "Review PR".into(),
                 prompt: "Review the pull request.".into(),
             },
         }
+    }
+
+    fn source(criterion: &str, default_enabled: bool) -> aoe_plugin_api::SuggestionSource {
+        aoe_plugin_api::SuggestionSource {
+            criterion: criterion.into(),
+            label: criterion.into(),
+            description: String::new(),
+            variables: Vec::new(),
+            default_enabled,
+        }
+    }
+
+    #[test]
+    fn source_switch_overrides_persist_and_fall_back_to_manifest_defaults() {
+        let dir = tempfile::tempdir().unwrap();
+        let host = host(dir.path());
+        let declared = || {
+            vec![
+                source("on_by_default", true),
+                source("off_by_default", false),
+            ]
+        };
+        let read = |host: &HostApiState| {
+            host.with_suggestions_db(|db| source_overrides(db, "default", "example.provider"))
+                .unwrap()
+        };
+        assert_eq!(
+            effective_sources(declared(), &read(&host))
+                .into_iter()
+                .map(|(s, on)| (s.criterion, on))
+                .collect::<Vec<_>>(),
+            vec![
+                ("on_by_default".to_string(), true),
+                ("off_by_default".to_string(), false)
+            ]
+        );
+
+        host.set_suggestion_source("example.provider", "on_by_default", false)
+            .unwrap();
+        host.set_suggestion_source("example.provider", "off_by_default", true)
+            .unwrap();
+        host.set_suggestion_source("example.provider", "off_by_default", true)
+            .unwrap();
+        let overrides = read(&host);
+        assert_eq!(
+            effective_sources(declared(), &overrides)
+                .into_iter()
+                .map(|(s, on)| (s.criterion, on))
+                .collect::<Vec<_>>(),
+            vec![
+                ("on_by_default".to_string(), false),
+                ("off_by_default".to_string(), true)
+            ]
+        );
+        // An override for a criterion the manifest no longer declares is ignored.
+        host.set_suggestion_source("example.provider", "retired", true)
+            .unwrap();
+        assert_eq!(effective_sources(declared(), &read(&host)).len(), 2);
+
+        // Unregistered providers expose no sources but still snapshot cleanly.
+        host.lock_suggestion_generations()
+            .begin("example.provider", 1);
+        assert!(host
+            .publish_suggestions("example.provider", 1, "Example", &[suggestion()])
+            .unwrap());
+        let snapshot = host.snapshot("default").unwrap();
+        assert_eq!(snapshot["providers"][0]["sources"], json!([]));
     }
 
     fn host(dir: &std::path::Path) -> HostApiState {

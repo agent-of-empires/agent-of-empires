@@ -25,6 +25,9 @@ Dismissal and linked-session state survive restart within the selected
 profile. Repeated starts open the linked session unless you explicitly choose
 to create another. Disabling or uninstalling a provider hides its suggestions.
 Provider discovery errors retain its last successful snapshot.
+Each provider lists its sources (the kinds of suggestion it publishes) in the
+suggestions controls; switching one off hides that kind for the profile and
+spares the provider that query.
 
 Automatic creation is off by default. Enable it only after reviewing explicit
 provider-and-criterion rules in the suggestions controls. Normal repository

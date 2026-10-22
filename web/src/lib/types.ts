@@ -381,7 +381,16 @@ export interface SuggestedSession {
   preview: string;
   project?: string;
   criterion: string;
+  /** Placeholder values declared by the provider's source; untrusted text. */
+  variables?: Record<string, string>;
   draft: { title: string; prompt: string };
+}
+
+export interface SuggestionSource {
+  criterion: string;
+  label: string;
+  description: string;
+  enabled: boolean;
 }
 
 export interface SuggestionItem extends SuggestedSession {
@@ -403,6 +412,7 @@ export interface SuggestionsSnapshot {
     status: string;
     error: string | null;
     updated_at: string | null;
+    sources: SuggestionSource[];
   }[];
   auto_create: {
     enabled: boolean;

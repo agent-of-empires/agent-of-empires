@@ -62,6 +62,10 @@ pub(super) fn build_router(state: Arc<AppState>) -> Router {
             "/api/suggestions/policy",
             patch(api::update_suggestion_policy),
         )
+        .route(
+            "/api/suggestions/sources",
+            patch(api::update_suggestion_source),
+        )
         // Unified MCP management surface (#1996)
         .route(
             "/api/mcp/servers",

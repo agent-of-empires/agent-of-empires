@@ -6,6 +6,7 @@ import {
   prepareSuggestion,
   refreshSuggestions,
   updateSuggestionPolicy,
+  updateSuggestionSource,
 } from "../lib/api";
 import type { SuggestionItem, SuggestionsSnapshot } from "../lib/types";
 import { OFFLINE_TITLE, useServerDown } from "../lib/connectionState";
@@ -168,6 +169,21 @@ function SuggestionsViewForProfile({ profile, readOnly = false, onPrepare, onOpe
     }
   };
 
+  const changeSource = async (providerId: string, criterion: string, enabled: boolean) => {
+    if (!snapshot || readOnly || offline || policyBusyRef.current) return;
+    policyBusyRef.current = true;
+    setPolicyBusy(true);
+    try {
+      const ok = await updateSuggestionSource(providerId, criterion, enabled, profile);
+      if (!current.current) return;
+      if (!ok) setActionError("Source update failed; the previous switches remain in effect.");
+      else await load();
+    } finally {
+      policyBusyRef.current = false;
+      if (current.current) setPolicyBusy(false);
+    }
+  };
+
   const policyRules = snapshot?.auto_create.rules ?? [];
   const criteria = [
     ...new Map([
@@ -221,7 +237,7 @@ function SuggestionsViewForProfile({ profile, readOnly = false, onPrepare, onOpe
         {snapshot?.providers.length ? (
           <section aria-label="Provider status" className="mt-4 space-y-2">
             {snapshot.providers.map((provider) => (
-              <p
+              <div
                 key={provider.provider_id}
                 className={`rounded-md border p-3 text-sm text-text-secondary ${
                   provider.error || provider.status === "error" || provider.status === "stale"
@@ -229,13 +245,38 @@ function SuggestionsViewForProfile({ profile, readOnly = false, onPrepare, onOpe
                     : "border-surface-700/50"
                 }`}
               >
-                <strong>{provider.provider_name}:</strong> {provider.status}
-                {provider.error ? ` · ${provider.error}` : null}
-                {provider.updated_at ? ` · Updated ${provider.updated_at}` : null}
-                {provider.error || provider.status === "error" || provider.status === "stale"
-                  ? " · Previously collected items remain available."
-                  : null}
-              </p>
+                <p>
+                  <strong>{provider.provider_name}:</strong> {provider.status}
+                  {provider.error ? ` · ${provider.error}` : null}
+                  {provider.updated_at ? ` · Updated ${provider.updated_at}` : null}
+                  {provider.error || provider.status === "error" || provider.status === "stale"
+                    ? " · Previously collected items remain available."
+                    : null}
+                </p>
+                {provider.sources?.length ? (
+                  <fieldset className="mt-2 grid gap-1 sm:grid-cols-2">
+                    <legend className="sr-only">{provider.provider_name} sources</legend>
+                    {provider.sources.map((source) => (
+                      <label
+                        key={`${provider.provider_id}:${source.criterion}`}
+                        className="flex items-start gap-2 text-xs"
+                        title={source.description || undefined}
+                      >
+                        <input
+                          type="checkbox"
+                          checked={source.enabled}
+                          disabled={readOnly || offline || policyBusy}
+                          aria-label={`${provider.provider_name}: ${source.label}`}
+                          onChange={(event) =>
+                            void changeSource(provider.provider_id, source.criterion, event.target.checked)
+                          }
+                        />
+                        <span>{source.label}</span>
+                      </label>
+                    ))}
+                  </fieldset>
+                ) : null}
+              </div>
             ))}
           </section>
         ) : null}

@@ -58,10 +58,11 @@ The host maps a command id to a fully namespaced method, `plugin.<id>.<command-i
 
 The host also pushes notifications that carry no `id`, such as `session.status.changed` (`api_version >= 14`) and `session.lifecycle.changed` (`api_version >= 19`) for plugins that hold `session.read`. Ignore methods you do not handle and never reply. See [Session status events](../plugin-api.md#session-driving-rpcs) in the Plugin API reference.
 
-For a read-only suggested-session provider, use schema 19 and top-level
-`suggestions = true`, publish `suggestions.set { items }` after discovery,
-report failures through `suggestions.error { message }`, and handle the
-`suggestions.refresh` notification. Keep upstream item IDs and exact source
+For a read-only suggested-session provider, use schema 19, declare each
+criterion in a `[suggestions]` block, ask `suggestions.sources` which ones are
+switched on and skip the rest, publish `suggestions.set { items }` after
+discovery, report failures through `suggestions.error { message }`, and handle
+the `suggestions.refresh` notification. Keep upstream item IDs and exact source
 references stable. The host owns provider identity, user decisions and session
 creation; no session-driving grant is needed. See
 [Suggested sessions](../plugin-api.md#suggested-sessions) for the wire contract.

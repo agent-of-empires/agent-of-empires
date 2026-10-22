@@ -210,6 +210,15 @@ export function updateSuggestionPolicy(
   return fetchOk(suggestionsUrl("/policy", profile), jsonInit("PATCH", { enabled, rules }));
 }
 
+export function updateSuggestionSource(
+  provider_id: string,
+  criterion: string,
+  enabled: boolean,
+  profile?: string,
+): Promise<boolean> {
+  return fetchOk(suggestionsUrl("/sources", profile), jsonInit("PATCH", { provider_id, criterion, enabled }));
+}
+
 // --- Sessions ---
 
 export interface RuntimeCursor {

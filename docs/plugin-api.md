@@ -36,27 +36,53 @@ capabilities = ["runtime.worker"]
 | `capabilities` | array of string | no | Runtime grants the worker needs (see [Capabilities](#capabilities)). Static contributions need none. |
 | `screenshots` | array | no | Up to 8. Requires `api_version >= 5`. See [Screenshots](#screenshots). |
 | `setting_defaults` | table | no | Overrides for core host settings, keyed by canonical path (e.g. `"theme.idle_decay_minutes"`). Resolution is user value, then plugin override, then core default. |
-| `suggestions` | boolean | no | Read-only suggested-session provider; defaults to false. Requires `api_version >= 19`, a worker, and `runtime.worker`. See [Suggested sessions](#suggested-sessions). |
+| `suggestions` | table | no | Read-only suggested-session provider and its `sources`. Requires `api_version >= 19`, a worker, and `runtime.worker`. See [Suggested sessions](#suggested-sessions). |
 
 ## Suggested sessions
 
-A worker declaring top-level `suggestions = true` can call `suggestions.set`
-with `{ "items": [...] }` to replace its profile-scoped snapshot. A successful
-empty list retracts the live snapshot. `suggestions.error { "message": "..." }`
-records a discovery failure without dropping the last successful items. On
-`suggestions.refresh`, discover again and publish a replacement or an error.
+A worker declares the criteria it publishes in a `[suggestions]` block:
+
+```toml
+[suggestions]
+[[suggestions.sources]]
+criterion = "review_requested"          # stable key, matches each item's `criterion`
+label = "Review requests"               # plural, shown as the on/off switch
+description = "Open PRs where your review is requested."
+variables = ["pr_number", "repo", "org", "url"]   # `[a-z0-9_]+`, promised in every item
+[[suggestions.sources]]
+criterion = "ci_failed"
+label = "Failing checks on your PRs"
+default_enabled = false
+```
+
+At least one source is required; criteria are unique, non-empty and at most
+256 bytes. The host keeps a per-profile switch for every source (manifest
+`default_enabled` until the user changes it). Before discovering, call
+`suggestions.sources` (`{}` -> `{ "sources": [{ "criterion", "enabled" }] }`)
+and skip the query for every criterion that is off; the host also drops items
+of a switched-off criterion on publish, and rejects an undeclared criterion.
+Switching a source changes nothing on the upstream service.
+
+Then call `suggestions.set` with `{ "items": [...] }` to replace the
+profile-scoped snapshot. A successful empty list retracts the live snapshot.
+`suggestions.error { "message": "..." }` records a discovery failure without
+dropping the last successful items. On `suggestions.refresh`, discover again
+and publish a replacement or an error.
 
 Each item has `id`, `title`, `reason`, `source_url`, `source_ref`, `preview`,
-`criterion`, an optional `project`, and `draft: { title, prompt }`. IDs are
-stable and provider-local. `source_ref` identifies the exact upstream work
-item, not a project or search result. `project` must match a registered
-project name or canonical registered local path before a session can start.
-Treat previews and drafts as untrusted source content.
+`criterion`, an optional `project`, an optional `variables` map of string
+values for the placeholders its source declared, and `draft: { title, prompt }`.
+IDs are stable and provider-local. `source_ref` identifies the exact upstream
+work item, not a project or search result. `project` must match a registered
+project name or canonical registered local path before a session can start;
+`projects.list` (`session.read`) returns `{ "projects": [{ "name", "path" }] }`
+so a provider can map its own source keys to them. Treat previews, variables
+and drafts as untrusted source content.
 
 The host stamps provider identity and revisions, persists dismissals and
 session links, and rejects stale worker generations and stale user actions.
 Providers cannot publish host-owned fields or create sessions through this
-contribution. `runtime.worker` plus `suggestions = true` does not grant
+contribution. `runtime.worker` plus a `[suggestions]` block does not grant
 `session.create`, `session.prompt`, or `session.unattended`.
 
 User clients read `GET /api/suggestions`, request refresh with
@@ -72,6 +98,12 @@ configured default). An unresolved project is null, never a scratch fallback.
 The ordinary sessions POST accepts `suggestion`, `prompt`, `source_refs`,
 and explicit `create_another`; source identity is re-read from host storage.
 Concurrent starts deduplicate by exact source within the selected profile.
+
+`GET /api/suggestions` lists each provider's `sources`
+(`{ criterion, label, description, enabled }`);
+`PATCH /api/suggestions/sources?profile=...` with
+`{ provider_id, criterion, enabled }` flips one switch and asks that worker to
+republish.
 
 Automation is off by default. `PATCH /api/suggestions/policy?profile=...`
 accepts `{ enabled, rules: [{ provider_id, criterion }] }`; its optional
@@ -287,6 +319,8 @@ With `api_version >= 9` a worker can discover ACP capabilities and create host-o
 | `sessions.turn.send` | `session.prompt` | Deliver a turn to a session **this plugin created**. |
 | `sessions.message.send` | `session.message` | Deliver a short text message to **any** session, like `aoe send`. See [Messaging any session](#messaging-any-session). `api_version >= 15`. |
 | `plugin.storage.get` / `set` / `cas` / `remove` | `runtime.worker` | Plugin-private durable key/value storage (see [Plugin storage](#plugin-storage)). |
+| `suggestions.sources` | `runtime.worker` | Which declared suggestion criteria are switched on (see [Suggested sessions](#suggested-sessions)). |
+| `projects.list` | `session.read` | Registered projects of the host profile as `{ name, path }`. |
 
 **Project selection (`api_version >= 11`).** `sessions.create` takes an optional `project_path` (the trust-checked primary repo) and `extra_project_paths` (the other repos of a multi-repo session). Omitting `project_path` creates a **scratch** session: a throwaway directory with no repository, so extras alongside it are refused. Every path is canonicalized and existence-checked host-side, fail-closed and capped per call.
 

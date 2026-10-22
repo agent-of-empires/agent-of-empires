@@ -5,15 +5,21 @@ import { SuggestionsView } from "../SuggestionsView";
 import { setServerDown } from "../../lib/connectionState";
 import type { SuggestionPrepareResponse } from "../../lib/types";
 
-const { fetchSuggestions, prepareSuggestion, actOnSuggestion, refreshSuggestions, updateSuggestionPolicy } = vi.hoisted(
-  () => ({
-    fetchSuggestions: vi.fn(),
-    prepareSuggestion: vi.fn(),
-    actOnSuggestion: vi.fn(),
-    refreshSuggestions: vi.fn(),
-    updateSuggestionPolicy: vi.fn(),
-  }),
-);
+const {
+  fetchSuggestions,
+  prepareSuggestion,
+  actOnSuggestion,
+  refreshSuggestions,
+  updateSuggestionPolicy,
+  updateSuggestionSource,
+} = vi.hoisted(() => ({
+  fetchSuggestions: vi.fn(),
+  prepareSuggestion: vi.fn(),
+  actOnSuggestion: vi.fn(),
+  refreshSuggestions: vi.fn(),
+  updateSuggestionPolicy: vi.fn(),
+  updateSuggestionSource: vi.fn(),
+}));
 
 vi.mock("../../lib/api", () => ({
   fetchSuggestions,
@@ -21,6 +27,7 @@ vi.mock("../../lib/api", () => ({
   actOnSuggestion,
   refreshSuggestions,
   updateSuggestionPolicy,
+  updateSuggestionSource,
 }));
 
 const item = {
@@ -45,7 +52,22 @@ const item = {
 const snapshot = {
   items: [item],
   providers: [
-    { provider_id: "github", provider_name: "GitHub", status: "ok", error: null, updated_at: "2026-10-18T12:00:00Z" },
+    {
+      provider_id: "github",
+      provider_name: "GitHub",
+      status: "ok",
+      error: null,
+      updated_at: "2026-10-18T12:00:00Z",
+      sources: [
+        {
+          criterion: "assigned-to-me",
+          label: "Assigned issues",
+          description: "Open issues assigned to you.",
+          enabled: true,
+        },
+        { criterion: "ci-failed", label: "Failing checks", description: "", enabled: false },
+      ],
+    },
   ],
   auto_create: { enabled: false, rules: [], last_error: null },
 };
@@ -373,6 +395,26 @@ describe("SuggestionsView", () => {
     );
   });
 
+  it("switches a provider source off and reloads, and keeps the switches when the update fails", async () => {
+    fetchSuggestions.mockResolvedValue(snapshot);
+    updateSuggestionSource.mockResolvedValueOnce(true).mockResolvedValueOnce(false);
+    render(<SuggestionsView profile="work" onPrepare={vi.fn()} onOpenSession={vi.fn()} />);
+    const assigned = (await screen.findByRole("checkbox", { name: "GitHub: Assigned issues" })) as HTMLInputElement;
+    const failing = screen.getByRole("checkbox", { name: "GitHub: Failing checks" }) as HTMLInputElement;
+    expect(assigned.checked).toBe(true);
+    expect(failing.checked).toBe(false);
+
+    fireEvent.click(assigned);
+    await waitFor(() => expect(updateSuggestionSource).toHaveBeenCalledWith("github", "assigned-to-me", false, "work"));
+    await waitFor(() => expect(fetchSuggestions).toHaveBeenCalledTimes(2));
+    await waitFor(() => expect(failing.disabled).toBe(false));
+
+    fireEvent.click(failing);
+    await waitFor(() => expect(updateSuggestionSource).toHaveBeenCalledWith("github", "ci-failed", true, "work"));
+    expect((await screen.findByRole("alert")).textContent).toContain("Source update failed");
+    expect(fetchSuggestions).toHaveBeenCalledTimes(2);
+  });
+
   it.each(["read-only", "offline"])("disables mutations while %s without hiding the draft", async (mode) => {
     fetchSuggestions.mockResolvedValue(snapshot);
     if (mode === "offline") setServerDown(true);
@@ -384,9 +426,13 @@ describe("SuggestionsView", () => {
       fireEvent.click(button);
     }
     expect((screen.getByRole("checkbox", { name: "Enable eligible rules" }) as HTMLInputElement).disabled).toBe(true);
+    const source = screen.getByRole("checkbox", { name: "GitHub: Assigned issues" }) as HTMLInputElement;
+    expect(source.disabled).toBe(true);
+    fireEvent.click(source);
     expect(actOnSuggestion).not.toHaveBeenCalled();
     expect(prepareSuggestion).not.toHaveBeenCalled();
     expect(updateSuggestionPolicy).not.toHaveBeenCalled();
+    expect(updateSuggestionSource).not.toHaveBeenCalled();
   });
 
   it("does not open a wizard for a prepare response from a previous profile", async () => {

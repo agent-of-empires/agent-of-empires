@@ -171,7 +171,7 @@ impl PluginHost {
         }
         let ids: Vec<String> = crate::plugin::registry()
             .active()
-            .filter(|p| p.manifest.suggestions && p.manifest.runtime.is_some())
+            .filter(|p| p.manifest.suggestions.is_some() && p.manifest.runtime.is_some())
             .map(|p| p.id().to_string())
             .collect();
         let mut sent = 0;
@@ -230,6 +230,16 @@ impl PluginHost {
         rules: &serde_json::Value,
     ) -> anyhow::Result<()> {
         self.api.update_policy(profile, enabled, rules)
+    }
+
+    pub fn set_suggestion_source(
+        &self,
+        provider_id: &str,
+        criterion: &str,
+        enabled: bool,
+    ) -> anyhow::Result<()> {
+        self.api
+            .set_suggestion_source(provider_id, criterion, enabled)
     }
 
     pub fn set_suggestion_policy_error(
@@ -499,7 +509,9 @@ impl PluginHost {
         self.teardown_workers(to_teardown).await;
         let providers = registry
             .active()
-            .filter(|plugin| plugin.manifest.runtime.is_some() && plugin.manifest.suggestions)
+            .filter(|plugin| {
+                plugin.manifest.runtime.is_some() && plugin.manifest.suggestions.is_some()
+            })
             .map(|plugin| plugin.id().to_string())
             .collect();
         if let Err(error) = self.api.reconcile_suggestion_providers(&providers) {

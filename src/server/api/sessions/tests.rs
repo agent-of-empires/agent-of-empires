@@ -8143,6 +8143,7 @@ async fn suggestion_creation_keeps_normal_trust_and_deduplicates_concurrent_star
                 preview: "Source text".into(),
                 project: Some("registered".into()),
                 criterion: "assigned".into(),
+                variables: Default::default(),
                 draft: aoe_plugin_api::SuggestionDraft {
                     title: "Fix issue".into(),
                     prompt: "Investigate the assigned issue.".into(),
@@ -8287,6 +8288,7 @@ async fn a_failed_suggestion_start_can_retry_after_its_hook_recovers() {
                 preview: "Source text".into(),
                 project: Some("registered".into()),
                 criterion: "assigned".into(),
+                variables: Default::default(),
                 draft: aoe_plugin_api::SuggestionDraft {
                     title: "Fix issue".into(),
                     prompt: "Investigate the assigned issue.".into(),

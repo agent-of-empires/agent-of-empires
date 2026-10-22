@@ -15,6 +15,9 @@ pub use manifest::{
     ObjectFieldType, OptionSource, PluginManifest, RuntimeSpec, Screenshot, SettingContribution,
     SettingType, StatusContribution, ThemeContribution, UiContribution, UiSlot, MAX_SCREENSHOTS,
 };
-pub use suggestions::{SetSuggestions, Suggestion, SuggestionDraft, SuggestionsError};
+pub use suggestions::{
+    SetSuggestions, Suggestion, SuggestionDraft, SuggestionSource, SuggestionsError,
+    SuggestionsSpec,
+};
 
 pub const API_VERSION: u32 = 19;
