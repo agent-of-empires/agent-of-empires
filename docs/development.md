@@ -18,6 +18,8 @@ When adding a mutating REST route, classify it in the CityHall allow or deny
 table in `src/server/access.rs` and extend the handler audit in
 `src/server/api/mod.rs`. Keep read-only refusal ahead of JSON rejection using
 the route layer, parts-only guard, or existing deferred-rejection convention.
+Use direct Axum method builders. Opaque builders and unsupported router
+compositions fail the audit until their method coverage is implemented.
 
 Debug builds carry line tables only, and dependencies carry no debug info, to keep `target/` small across worktrees. Panics still name the file and line in this crate, but a debugger has no local values; rebuild with `RUSTFLAGS="-Cdebuginfo=2"` for a full debugging session.
 
