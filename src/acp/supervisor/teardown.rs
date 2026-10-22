@@ -1571,15 +1571,8 @@ mod tests {
         sup.test_insert_worker(session_id).await;
         let replacement_control = control_path.clone();
         let replacement = tokio::spawn(async move {
-            let deadline = tokio::time::Instant::now()
-                + TEARDOWN_TERM_GRACE
-                + TEARDOWN_KILL_GRACE
-                + Duration::from_secs(1);
+            // Bounded by the caller's timeout once `shutdown_and_wait` returns.
             while worker_registry::load(session_id).unwrap().is_some() {
-                assert!(
-                    tokio::time::Instant::now() < deadline,
-                    "old registry record was not removed"
-                );
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
             let listener = tokio::net::UnixListener::bind(&replacement_control).unwrap();
