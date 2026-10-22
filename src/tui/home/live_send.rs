@@ -6,9 +6,10 @@
 //!
 //! While a VT channel carries input (`[tmux] vt_live`, tmux 3.8+, unix) the action is
 //! encoded to raw terminal bytes and written into the pane socket, bypassing tmux's key
-//! translation, so the encoder honors the pane's DECCKM itself. That is the default, and
-//! a live input channel is a single-writer signal: two writers would interleave on one
-//! pty input stream, so nothing goes through `send-keys` while it exists.
+//! translation, so the encoder honors the pane's DECCKM itself. That is the default:
+//! ordinary batches use the live input channel as their single writer. A batch containing
+//! `Paste` sets `force_tmux` for the entire batch, including other keys, to preserve ordering
+//! through tmux instead of mixing socket writes with `send-keys` on one pty input stream.
 //!
 //! Otherwise each action forks `tmux send-keys`: plain characters literally, every other
 //! key by tmux key name with `C-` / `M-` prefixes. That covers tmux older than 3.8 (where
@@ -2059,9 +2060,10 @@ fn dispatch_via_fork(
 ) -> anyhow::Result<()> {
     use std::process::Stdio;
 
-    // Fast path (`[tmux] vt_live`): while a live input channel is armed for this pane, all
-    // pane input goes through the socket and none through `send-keys`. Mixing the two would
-    // interleave writers on one pty input stream and can corrupt multi-byte sequences, as
+    // Fast path (`[tmux] vt_live`): while a live input channel is armed for this pane,
+    // ordinary batches send pane input through the socket, not `send-keys`. A batch
+    // containing `Paste` sets `force_tmux` and sends the whole batch through tmux instead.
+    // Mixing writers on one pty input stream can corrupt multi-byte sequences, since
     // `pipe-pane -I` arbitrates nothing. `input_mode` returns `Some` only while the
     // forwarder is connected, so a dead or not-yet-connected channel falls through to the
     // fork below instead of vanishing. Keys are encoded here against the pane's DECCKM from
