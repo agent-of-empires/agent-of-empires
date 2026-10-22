@@ -89,7 +89,7 @@ describe("useTour", () => {
     expect(result.current).toMatchObject({ isTourActive: false, tourElement: null });
 
     act(() => result.current.startTour());
-    expect(resetSettingsIntros).toHaveBeenCalledTimes(1);
+    expect(resetSettingsIntros).toHaveBeenCalledExactlyOnceWith(false);
     expect(result.current.isTourActive).toBe(false);
     drainRaf();
     expect(result.current.isTourActive).toBe(true);

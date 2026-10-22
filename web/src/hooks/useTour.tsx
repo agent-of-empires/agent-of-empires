@@ -84,9 +84,9 @@ export function useTour({
 
   // Replaying the tutorial also shows every Settings tab intro once more.
   const startTour = useCallback(() => {
-    resetSettingsIntros();
+    resetSettingsIntros(readOnly);
     begin();
-  }, [begin]);
+  }, [begin, readOnly]);
 
   const beginRef = useLatestRef(begin);
   useEffect(() => {

@@ -83,7 +83,7 @@ describe("Settings tab intros", () => {
     localStorage.setItem(KEY("worktree"), "folded");
     renderTab("worktree");
     await waitFor(() => expect(about()).not.toBeNull());
-    act(() => resetSettingsIntros());
+    act(() => resetSettingsIntros(false));
     expect(intro()).not.toBeNull();
     expect(about()).toBeNull();
     // Written, not removed, so the reset reaches Devices that hydrate from the Daemon.
@@ -114,8 +114,21 @@ describe("Settings tab intros", () => {
     await act(() => hydrateWebUiStateFromServer());
     expect(about()).not.toBeNull();
 
-    act(() => resetSettingsIntros());
+    // A replay is refused too, so it stays on the device and outlasts the Daemon's "folded".
+    act(() => resetSettingsIntros(true));
     expect(intro()).not.toBeNull();
+    expect(localStorage.getItem("aoe-local-settings-intro-worktree")).toBe("unfolded");
+    vi.mocked(api.getWebUiState).mockResolvedValue({ [KEY("worktree")]: "folded" });
+    await act(() => hydrateWebUiStateFromServer());
+    expect(intro()).not.toBeNull();
+  });
+
+  it("drops a read-only device override once a writable dashboard folds", async () => {
+    localStorage.setItem("aoe-local-settings-intro-worktree", "unfolded");
+    renderTab("worktree");
+    await waitFor(() => expect(intro()).not.toBeNull());
+    fireEvent.click(screen.getByRole("button", { name: "Got it" }));
+    expect(localStorage.getItem(KEY("worktree"))).toBe("folded");
     expect(localStorage.getItem("aoe-local-settings-intro-worktree")).toBeNull();
   });
 

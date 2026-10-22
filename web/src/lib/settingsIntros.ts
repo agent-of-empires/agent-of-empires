@@ -19,25 +19,33 @@ const UNFOLDED = "unfolded";
 
 const introKey = (id: SettingsIntroId) => `${SETTINGS_INTRO_KEY_PREFIX}${id}`;
 // A read-only dashboard can't write synced state, and hydration would put the Daemon's value
-// back over a local fold. Its folds go to this unsynced key, which hydration never touches.
+// back over its choice. It keeps its folds and replays in this unsynced key, which hydration
+// never touches and which overrides the synced one.
 const deviceKey = (id: SettingsIntroId) => `aoe-local-settings-intro-${id}`;
 
 export function isSettingsIntroFolded(id: SettingsIntroId): boolean {
-  return safeGetItem(deviceKey(id)) === FOLDED || safeGetItem(introKey(id)) === FOLDED;
+  return (safeGetItem(deviceKey(id)) ?? safeGetItem(introKey(id))) === FOLDED;
+}
+
+function setIntro(id: SettingsIntroId, value: string, readOnly: boolean): void {
+  if (readOnly) {
+    safeSetItem(deviceKey(id), value);
+    return;
+  }
+  safeSetItem(introKey(id), value);
+  // A choice made while read-only must not outlive one the Daemon now stores.
+  safeRemoveItem(deviceKey(id));
 }
 
 export function foldSettingsIntro(id: SettingsIntroId, readOnly: boolean): void {
-  safeSetItem(readOnly ? deviceKey(id) : introKey(id), FOLDED);
+  setIntro(id, FOLDED, readOnly);
 }
 
 const INTROS_RESET_EVENT = "aoe:settings-intros-reset";
 
 /** "Show tutorial" unfolds every intro once, here and on other Devices. */
-export function resetSettingsIntros(): void {
-  for (const id of SETTINGS_INTRO_IDS) {
-    safeSetItem(introKey(id), UNFOLDED);
-    safeRemoveItem(deviceKey(id));
-  }
+export function resetSettingsIntros(readOnly: boolean): void {
+  for (const id of SETTINGS_INTRO_IDS) setIntro(id, UNFOLDED, readOnly);
   // An open Settings view holds its folds in state, so it hears about the reset.
   window.dispatchEvent(new Event(INTROS_RESET_EVENT));
 }
