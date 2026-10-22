@@ -1228,7 +1228,7 @@ mod tests {
         use std::os::unix::fs::{MetadataExt, PermissionsExt};
         const CHILD: &str = "AOE_TEST_APP_DIR_UMASK_CHILD";
         if let Ok(mask) = std::env::var(CHILD) {
-            let mask = u32::from_str_radix(&mask, 8).unwrap();
+            let mask = libc::mode_t::from_str_radix(&mask, 8).unwrap();
             // This branch runs alone in a subprocess.
             unsafe { libc::umask(mask) };
             get_app_dir().unwrap();
