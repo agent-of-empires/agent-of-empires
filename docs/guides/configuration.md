@@ -443,7 +443,7 @@ See [Tool Sessions](tool-sessions.md) for the full reference.
 ```toml
 [worktree]
 enabled = false                                       # auto-enable for new sessions
-path_template = "../{repo-name}-worktrees/{branch}"   # {repo-name}, {branch}, {session-id}
+path_template = "../{repo-name}-worktrees/{branch}"   # {repo-name}, {branch}, {session-id}; ~ and $VAR expand
 auto_cleanup = true
 
 [sandbox]

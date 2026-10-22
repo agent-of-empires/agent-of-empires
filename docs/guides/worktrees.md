@@ -65,6 +65,10 @@ init_submodules = true
 
 Template variables are `{repo-name}` (repository folder name), `{branch}` (slashes become hyphens), and `{session-id}` (the first 8 characters of the session UUID), so `../wt/{branch}-{session-id}` or `./worktrees/{branch}` both work. Use `[session] row_tag = "branch"` to show branch tags in the TUI list.
 
+`path_template`, `bare_repo_path_template` and `workspace_path_template` also expand a leading `~` and `$VAR` / `${VAR}` before anything else, so `$XDG_CACHE_HOME/aoe-worktrees/{repo-name}/{branch}` is an absolute path. An unset or empty variable fails session creation with an error naming it, except `$XDG_CACHE_HOME`, `$XDG_CONFIG_HOME`, `$XDG_DATA_HOME` and `$XDG_STATE_HOME`, which fall back to their XDG defaults under your home directory when unset, empty or relative. Write `$$` for a literal `$`. Only these three settings expand variables, and repo-level config cannot set them.
+
+Variables are read from the process that creates the worktree. For sessions created in the web dashboard that is the `aoe serve` daemon, whose environment under systemd or launchd often differs from your shell, so a template can work from the TUI and fail on the web.
+
 ### Bare repos
 
 Bare repos are auto-detected and use `bare_repo_path_template` instead, so worktrees land as siblings inside the project directory. A sandboxed session needs this layout to reach the repo's git directory from the container.

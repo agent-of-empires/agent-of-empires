@@ -2565,7 +2565,8 @@ pub struct WorktreeConfig {
     )]
     pub enabled: bool,
 
-    /// Template for worktree paths ({repo-name}, {branch}).
+    /// Template for worktree paths ({repo-name}, {branch}). A leading `~` and
+    /// `$VAR` / `${VAR}` are expanded; see `docs/guides/worktrees.md`.
     #[serde(default = "default_worktree_template")]
     #[setting(
         label = "Path Template",
