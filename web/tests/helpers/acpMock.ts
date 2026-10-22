@@ -25,6 +25,8 @@ export interface AcpSessionMockOptions {
   workerStarting?: boolean;
   /** The starting Session's `acp_agent`; defaults to claude. */
   startingAgent?: string;
+  /** Overrides the reported `acp_worker_state`. */
+  workerState?: "absent" | "resuming" | "running" | "stopping";
 }
 
 export interface AcpSessionMock {
@@ -199,7 +201,8 @@ export async function mockAcpSession(page: Page, opts: AcpSessionMockOptions = {
             workspace_repos: [],
             view: "structured",
             acp_worker_state:
-              opts.trashedAt || opts.archivedAt ? "stopped" : opts.workerStarting ? "resuming" : "running",
+              opts.workerState ??
+              (opts.trashedAt || opts.archivedAt ? "stopped" : opts.workerStarting ? "resuming" : "running"),
             ...(opts.workerStarting ? { acp_agent: opts.startingAgent ?? "claude" } : {}),
             claude_fullscreen: false,
           },

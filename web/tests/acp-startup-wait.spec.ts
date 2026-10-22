@@ -18,6 +18,23 @@ test("one startup line names the Agent and counts", async ({ page }) => {
   await expect(line.getByTestId("startup-wait-elapsed")).toHaveText(/^0:0[0-9]$/);
 });
 
+test("a never-started Session that isn't starting waits to resume, not for its Agent", async ({ page }) => {
+  const mock = await mockAcpSession(page, { title: "story-absent", workerState: "absent" });
+  const at = new Date().toISOString();
+  await page.route("**/api/sessions/*/queue", (r) =>
+    r.fulfill({
+      json: [
+        { id: "q1", seq: 1, text: "first", created_at: at },
+        { id: "q2", seq: 2, text: "second", created_at: at },
+      ],
+    }),
+  );
+  await openStructuredSession(page, mock);
+  await expect(page.getByText("Pending until session resumes (2)")).toBeVisible();
+  await expect(page.getByText(/Pending until .* is ready/)).toHaveCount(0);
+  await expect(page.getByTestId("startup-wait-line")).toHaveCount(0);
+});
+
 test.describe("at 375px", () => {
   test.use({ viewport: { width: 375, height: 812 } });
 

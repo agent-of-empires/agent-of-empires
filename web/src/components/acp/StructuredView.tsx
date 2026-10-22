@@ -368,6 +368,7 @@ function AcpChrome({
               collapsible={composerCollapsible}
               collapsed={composerCollapsed}
               onToggleCollapsed={() => setComposerCollapsed((v) => !v)}
+              startingAgent={startingAgent}
             />
           )}
         </div>
@@ -386,6 +387,7 @@ function ComposerDock({
   collapsible,
   collapsed,
   onToggleCollapsed,
+  startingAgent,
 }: {
   view: Props;
   ctx: AcpContext;
@@ -394,11 +396,11 @@ function ComposerDock({
   collapsible: boolean;
   collapsed: boolean;
   onToggleCollapsed: () => void;
+  /** Set while a new Session starts, as for the startup line. */
+  startingAgent: string | null;
 }) {
   const { sessionId, acpWorkerState, acpAgent, acpProvider } = view;
   const { state, status } = ctx;
-  // A Session with no events yet has never started, so it has nothing to resume.
-  const waitingFor = state.lastSeq === 0 ? agentDisplayName(state.agent ?? acpAgent) : null;
   return (
     <>
       <QueuedPromptsStrip
@@ -412,7 +414,7 @@ function ComposerDock({
         pendingResume={
           status !== "open" || acpWorkerState !== "running" || state.workerStopped || state.workerRestarting
         }
-        waitingFor={waitingFor}
+        waitingFor={startingAgent}
       />
 
       <RejectedPromptsStrip
@@ -465,7 +467,7 @@ function ComposerDock({
           sessionId={sessionId}
           currentAgent={state.agent ?? acpAgent}
           currentProvider={acpProvider}
-          waitingFor={waitingFor}
+          waitingFor={startingAgent}
           availableModes={state.availableModes}
           currentModeId={state.currentModeId}
           legacyMode={state.mode}
