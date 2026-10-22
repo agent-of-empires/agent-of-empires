@@ -8,34 +8,32 @@ Settings resolve in layers, each overriding the one before it, field by field:
 
 Unset fields inherit from the layer above. List fields replace rather than extend. Everything below is also editable from the TUI settings screen (`s`) and, unless noted, from the web dashboard.
 
-
 Over the web API, `GET /api/settings` returns the settings as they apply to the profile the server serves (or `?profile=<name>`): the profile's overrides over the global config. `PATCH /api/settings` saves each field to the layer it belongs in, that profile for fields it can override and the global config for the rest, so a save always lands where the read looks. Add `?layer=machine` to either to read or write the global config alone.
 
 Global-only settings use the global config. On upgrade, values from the default profile move there and copies in other profiles are removed. The profile settings API rejects global-only fields; use `PATCH /api/settings` instead.
 
 A project registry entry can override `worktree.enabled`, `session.smart_rename` and `sandbox.enabled_by_default` for that project from the web Projects view or the TUI add-project form. Project overrides win over all three configuration layers. They live in the user's `projects.json`, not the repository, so they do not weaken these fields' `repo = "deny"` policy.
 
-## File Locations
+## File locations
 
-| Platform | Global Config |
+| Platform | Global config |
 |----------|--------------|
-| Linux | `$XDG_CONFIG_HOME/agent-of-empires/config.toml` (defaults to `~/.config/agent-of-empires/`) |
-| macOS | `~/.agent-of-empires/config.toml` by default, or `$XDG_CONFIG_HOME/agent-of-empires/config.toml` when you opt into the XDG layout (see below) |
+| Linux | `$XDG_CONFIG_HOME/agent-of-empires/config.toml` (default `~/.config/agent-of-empires/`) |
+| macOS | `~/.agent-of-empires/config.toml`, or the XDG path when `XDG_CONFIG_HOME` is set or that directory already exists |
 
 On macOS, AoE uses `$XDG_CONFIG_HOME/agent-of-empires/` when `XDG_CONFIG_HOME` is set or that directory already exists. Nothing moves automatically: an existing `~/.agent-of-empires/` remains in use until you relocate it.
 
 ```
 ~/.agent-of-empires/
   config.toml              # Global configuration
-  state.toml               # Runtime/UI bookkeeping (auto-managed, see below)
+  state.toml               # Runtime/UI bookkeeping (auto-managed)
   trusted_repos.toml       # Hook trust decisions (auto-managed)
   .schema_version          # Migration tracking (auto-managed)
-  profiles/
-    default/
-      sessions.json        # Session data
-      groups.json          # Group hierarchy
-      config.toml          # Profile-specific overrides
-  logs/                    # Session execution logs
+  profiles/default/
+    sessions.json          # Session data
+    groups.json            # Group hierarchy
+    config.toml            # Profile overrides
+  logs/
 ```
 
 ### `state.toml`
@@ -50,17 +48,17 @@ Updates use a locked read-modify-write operation, preserving concurrent changes.
 
 | Variable | Description |
 |----------|-------------|
-| `AGENT_OF_EMPIRES_PROFILE` | Default profile to use |
-| `AGENT_OF_EMPIRES_DEBUG` | Enable debug logging to `debug.log` in app data dir (`1` to enable). Legacy alias for `AOE_LOG_LEVEL=debug`. |
-| `AOE_LOG_LEVEL` | File log level: `trace`, `debug`, `info`, `warn`, `error`. |
-| `AOE_DEFER_SANDBOX_MIGRATION` | Start without moving sandboxed sessions' agent stores; the move is retried on a later start or with `aoe migrate`. See [Per-session agent stores](sandbox.md#per-session-agent-stores). |
+| `AGENT_OF_EMPIRES_PROFILE` | Default profile |
+| `AOE_LOG_LEVEL` | File log level: `trace`, `debug`, `info`, `warn`, `error` |
+| `AGENT_OF_EMPIRES_DEBUG` | Legacy alias for `AOE_LOG_LEVEL=debug` |
+| `AOE_DEFER_SANDBOX_MIGRATION` | Start without moving sandboxed sessions' agent stores; retried later or by `aoe migrate`. See [Per-session agent stores](sandbox.md#per-session-agent-stores) |
 
 ## Theme
 
 ```toml
 [theme]
-name = "default"   # default, empire, phosphor, tokyo-night-storm, catppuccin-latte, dracula, rose-pine, deep-ocean
-color_mode = "truecolor"   # truecolor | palette (TUI only)
+name = "default"          # see the picker or `aoe theme list`
+color_mode = "truecolor"  # truecolor | palette (TUI only)
 ```
 
 | Option | Default | Description |
@@ -68,15 +66,12 @@ color_mode = "truecolor"   # truecolor | palette (TUI only)
 | `name` | `"default"` | Theme for the TUI and web dashboard. Builtins: `default`, `empire`, `phosphor`, `tokyo-night-storm`, `catppuccin-latte`, `dracula`, `rose-pine`, `deep-ocean`. Custom TOML themes appear in the picker. Empty means `default`. |
 | `color_mode` | `"truecolor"` | TUI only. `palette` downsamples to xterm-256 for transports that mangle 24-bit RGB (e.g. some `mosh` setups). The web dashboard always renders truecolor. |
 
-### Custom themes
-
-Drop a TOML file in `~/.agent-of-empires/themes/<name>.toml` (or `$XDG_CONFIG_HOME/agent-of-empires/themes/` on Linux). The file appears in the theme picker under its filename stem. Export a builtin as a starting point:
+Custom themes are TOML files in `~/.agent-of-empires/themes/`, listed in the picker under their filename:
 
 ```bash
-aoe theme export empire             # writes ~/.agent-of-empires/themes/custom-empire.toml
-aoe theme export dracula -o my.toml # writes to my.toml
-aoe theme list                      # show all available themes
-aoe theme dir                       # print the custom themes directory
+aoe theme export empire   # writes ~/.agent-of-empires/themes/custom-empire.toml
+aoe theme list
+aoe theme dir
 ```
 
 Every field is optional. Missing colors fall back to the Empire baseline, except `unread` and `favorite`, which inherit the theme's own `accent`. An omitted `appearance` or `[syntax].shiki_theme` is derived from the theme's background luminance. `appearance = "dark" | "light"` and `[syntax].shiki_theme` (any id [Shiki bundles](https://shiki.style/themes)) drive the dashboard's surface ramp and code highlighting. An unknown `shiki_theme` falls back to `github-dark` or `github-light` by appearance.
@@ -85,36 +80,14 @@ Every field is optional. Missing colors fall back to the Empire baseline, except
 
 ```toml
 [session]
-default_tool = "claude"   # any supported agent name
+default_tool = "claude"
 yolo_mode_default = false
-pre_trust_agent_folders = false
-opencode_preassign_session_id = false  # pre-create OpenCode's exact native session id
 agent_status_hooks = true
 smart_rename = true
-smart_rename_agent = ""    # "" = use the session's own agent; e.g. "codex"
-# smart_rename_model: per-agent title model, e.g. { claude = "haiku" } (see table below)
 name_agent_session = false
 auto_stop_idle_secs = 0   # 0 disables; e.g. 7200 = stop after 2h idle
-row_tag = "branch"       # none | auto | profile | sandbox | branch
+row_tag = "branch"        # none | auto | profile | sandbox | branch
 sidebar_position = "left" # left | right; TUI session list
-prevent_sleep_when_active = false      # daemon only; keep the OS awake while sessions are active
-prevent_sleep_idle_grace_minutes = 15  # release once every session has been idle this long (0-240)
-
-# Per-agent structured-view defaults live under [acp], not [session].
-[acp.acp_defaults.opencode]
-model = "openai/gpt-5.5"
-# pin_model = true        # make `model` a pin: creation refuses any other model
-# Empty or whitespace-only model values are unset, including with pin_model.
-effort = "high"           # default thinking level
-mode = "plan"             # default mode, applied when the agent advertises one
-
-[acp.acp_defaults.opencode.effort_by_model]
-"openai/gpt-5.5" = "high"  # overrides `effort` when this model is resolved
-
-# Trusted global/profile hook event to AoE status overrides.
-[agents.claude.status_map]
-Stop = "idle"
-Notification = "waiting"
 ```
 
 After your 31st session creation, a one-time tip explains how to hide the shortcut bar.
@@ -143,7 +116,7 @@ You can browse tips from **Ctrl+K > Show tips** even with the bar hidden.
 | `smart_rename_model` | `{}` | Per-agent rename model, e.g. `{ claude = "haiku" }`. Missing uses the agent's built-in default; empty forces its CLI default; another value passes its model flag. Invalid IDs leave the generated name. Applies only to one-shot agents with a model flag, not conversation summaries. The web dashboard sets default or pinned models; use the TUI or file for an empty value. |
 | `name_agent_session` | `false` | For a session whose title was typed in the TUI's New Session dialog, give its title at the first launch (including a rename in AoE before then) to the agent as its own session name, so it shows in the agent's own apps (Claude's `--name`). For a structured session that is its first terminal launch. Skipped for a generated or suggested title, a title starting with `-`, a launch that resumes a conversation, sandboxed sessions, a launch whose command, arguments or `PATH` AoE cannot attest (including your own `-n`/`--name`), and when the agent's `--help` does not list the flag. |
 | `inherit_host_environment` | `false` | Forward AoE's whole environment to host sessions. See [Host environment](#host-environment). |
-| `agent_extra_args` | `{}` | Per-agent extra arguments appended after the binary (e.g., `{ opencode = "--port 8080" }`). |
+| `agent_extra_args` | `{}` | Per-agent arguments appended after the binary, e.g. `{ opencode = "--port 8080" }`. Ignored for structured view sessions. |
 | `agent_command_override` | `{}` | Per-agent command replacing the binary. Managed resume and fork validate the actual native command and store; opaque wrappers require an explicit execution contract. See [execution identity and wrappers](session-resume.md#execution-identity-and-wrappers). |
 | `custom_agents` | `{}` | User-defined agents (name to command). See [Custom agents](#custom-agents). |
 | `agent_detect_as` | `{}` | Built-in status detection and ACP adapter inheritance for a custom agent. This does not prove native execution or authorize terminal resume or fork. |
@@ -156,10 +129,10 @@ Per-agent structured view defaults live under `[acp]`, not `[session]`:
 |--------|---------|-------------|
 | `acp.offer_structured_in_new_session` | `false` | Offer the structured view in the TUI: the Structured toggle in the new-session dialog, and switching a terminal session into it. Off, every TUI-created session is a terminal. The web dashboard always offers it. |
 | `acp.default_new_session_view` | `auto` | View the new-session dialog starts on when the agent supports the structured view: `auto`, `structured`, or `terminal`. `auto` keeps each surface's default, structured on the web dashboard and terminal in the TUI. The dialog's toggle still wins per session. |
-| `acp.rate_limit_auto_resume` | `false` | Respawn a structured view worker parked on a provider rate limit once the adapter-reported reset time (plus a fixed grace) has passed, redelivering the interrupted prompt and publishing a `RateLimitAutoResumed` breadcrumb. Off leaves the park to a manual resume or an agent handoff. Bounded per streak; see the [troubleshooting guide](../structured-view/troubleshooting.md). |
-| `acp.restrict_agents` | `false` | Restrict structured view sessions to `acp.allowed_agents`. Off leaves every registered agent available. Read from the global config only: a profile override cannot widen it, so a shared or locked-down deployment cannot be loosened by its own users. Changing the web value requires the passphrase step-up. |
-| `acp.allowed_agents` | `[]` | ACP registry keys a structured view session may run while `acp.restrict_agents` is on, e.g. `["claude", "codex"]`. These are registry keys, not binary names, and each alias counts separately (allowing `claude` does not allow `claude-code`). With the restriction on, an empty list denies every agent. Governs the structured view only; a terminal session runs in a pane where any binary can be launched, so it is not constrained here. A policy change applies to new sessions immediately and to an already-running worker when it next respawns or when the daemon restarts, at which point a worker on a now-disallowed agent is terminated rather than reattached. |
-| `acp.acp_defaults` | `{}` | Per-agent defaults for structured view startup (under the `[acp]` section, not `[session]`). `model` is forwarded when the worker starts; `effort` (thinking) and `mode` are applied through the agent's ACP config options (`thought_level`, `mode`) when advertised, and skipped with a warning otherwise. `effort_by_model` (a `{model = effort}` map) overrides `effort` for the resolved model. A `model` is a default: a model chosen at creation (CLI flag, web/plugin `model_id`) wins over it. Set `pin_model = true` alongside `model` to make it a pin instead: every structured view session of that agent under the profile launches on the pinned model, `sessions.create` refuses a request naming another model (error `kind = "model_pinned"`), and the model picker in the web dashboard collapses to the pin. The entry is keyed by the agent the session spawns as: a custom agent mapped to a base agent through `session.agent_detect_as` reads the base agent's entry. The pin governs creation and respawn; effort still follows the request or `effort_by_model`. Editable per agent from the web dashboard (Structured view tab, Structured View Defaults). Example: `[acp.acp_defaults.opencode] model = "openai/gpt-5.5" effort = "high" mode = "plan"`. |
+| `acp.acp_defaults.<agent>` | `{}` | `model`, `effort` (thinking level), `mode`, and an `effort_by_model` map applied when a worker starts. `effort` and `mode` go through the agent's ACP config options when advertised and are skipped with a warning otherwise. A model chosen at creation wins over `model`, unless `pin_model = true` makes it a pin: creation then refuses any other model (`kind = "model_pinned"`) and the dashboard's picker collapses to it. The entry is keyed by the agent the session spawns as, so a custom agent reads its `agent_detect_as` base's entry. |
+| `acp.restrict_agents` | `false` | Restrict structured view sessions to `acp.allowed_agents`. Read from the global config only, so a profile cannot widen it; changing it from the web needs the passphrase step-up. |
+| `acp.allowed_agents` | `[]` | Registry keys allowed while the restriction is on, e.g. `["claude", "codex"]`. Each alias counts separately, and an empty list denies every agent. A worker on a now-disallowed agent is terminated at its next respawn. |
+| `acp.rate_limit_auto_resume` | `false` | Respawn a worker parked on a provider rate limit once the reported reset passes. See [Rate-limit recovery](../structured-view/troubleshooting.md#rate-limits-and-agent-hand-off). |
 
 Agent status overrides use `[agents.<name>]`:
 
@@ -168,7 +141,9 @@ Agent status overrides use `[agents.<name>]`:
 | `agents.<name>.status_map` | `{}` | Trusted global/profile-only hook event to AoE status mappings. Valid statuses are `running`, `waiting`, `idle`, and `error`. Entries apply by event name to built-in hook defaults, so duplicate event names with different matchers all receive the same status; new event names are added to the installed hooks when the agent format supports event keys. Existing hook files update on the next hook install, usually a new or restarted session. Agent processes with installed status hooks receive `AOE_PROFILE`, so hook scripts can query the resolved map with `aoe -p "$AOE_PROFILE" profile show --status-map <agent> --json`. |
 | `agents.<name>.status_rules` | `[]` | Trusted global/profile-only declarative pane status rules (`[[agents.<name>.status_rules]]` array of tables). Each rule has `status` (`running`, `waiting`, `idle`, or `error`) and exactly one of `contains` (case-insensitive substring) or `regex` (Rust regex, matched as written; use `(?i)` for case-insensitive). Rules are evaluated in order against the ANSI-stripped pane snapshot; first match wins, no match reports `idle`. Rules take precedence over `agent_detect_as`, over a built-in detector of the same name, and over a status hook the agent writes. Invalid rules are skipped with a warning in the debug log. Takes effect on the next config resolve (TUI or daemon start). |
 
-## Status Hooks
+AoE writes per-session status into `/tmp/aoe-hooks-<euid>/`. When that directory cannot be initialized (another user squatted the path, a permissive umask or ACL widened it, a symlink was planted, or `/tmp` was reaped mid-run), AoE logs the resolved path with a recovery hint and falls back to reading the pane, which costs latency but no functionality. Check it with `ls -ldn /tmp/aoe-hooks-$(id -u)`, which should be `drwx------` and owned by you. Removing the directory (`rm -rf /tmp/aoe-hooks-$(id -u)`) and starting a session recreates it, a wrong ACL clears with `setfacl -b`, and a path owned by another user has to be removed by them or by root, since `/tmp` is sticky. `aoe uninstall` removes the hooks from every agent settings file and tears the directory down, leaving status detection on pane content alone.
+
+## Status hooks
 
 Status hooks run local shell commands when the Daemon publishes a session status change, including while no TUI is open or a TUI is attached to tmux. They are disabled by default and are intended for personal machine behavior such as desktop notifications. The initial snapshot does not replay existing statuses.
 
@@ -176,7 +151,6 @@ Status hooks run local shell commands when the Daemon publishes a session status
 [status_hooks]
 enabled = true
 on_waiting = "notify-send -a aoe 'AoE: Waiting' \"$AOE_SESSION_TITLE is waiting for input\""
-on_idle = "notify-send -a aoe 'AoE: Idle' \"$AOE_SESSION_TITLE is idle\""
 on_error = "notify-send -u critical -a aoe 'AoE: Error' \"$AOE_SESSION_TITLE errored\""
 ```
 
@@ -213,7 +187,6 @@ The approval is per installation and is not bound to a profile, so every profile
 
 Turning `agent_status_hooks` off stops AoE installing status hooks, but it does not end the gate: identity hooks, which native resume depends on, stay installed. How many agents remain gated then depends on which ones declare an identity event, so check `aoe hooks status` for the list under a given profile. A session launched with its own command resolves the file that command names, which the TUI creation dialog describes exactly. `aoe hooks status` has neither a session nor a project directory: it resolves each tool from the profile config, so for a repository that sets `session.agent_detect_as` it can name a different agent than the same session launched inside that repository.
 
-
 ### Custom Agents
 
 Custom agents name commands AoE cannot detect as built-in binaries: SSH wrappers, local scripts, or a CLI using another account. Configure them once, then select the name in the TUI, `aoe add --tool <name>`, or the web wizard.
@@ -235,7 +208,7 @@ agent_detect_as = { "lenovo-claude" = "claude" }
 
 Custom agents remain selectable even for remote or unmanaged commands. Maps are editable in config files or the TUI. Profile maps replace global maps; `agent_detect_as` also permits repo overrides. `agent_execution_as` and `agent_config_dir` are trusted global/profile declarations, never repo overrides. The web wizard can select a custom agent but never edits these command strings.
 
-#### One CLI, two accounts
+### One CLI, two accounts
 
 A wrapper selecting another login may export a config-dir variable after AoE has chosen its hook files. Name that directory in `agent_config_dir` so folder trust and [native MCP discovery](mcp-servers.md) use the agent's actual config, until the conversation records its own store.
 ```toml
@@ -267,7 +240,7 @@ Host sessions still need `pre_trust_agent_folders`. Sandboxed sessions seed
 folder trust and install status and identity hooks in their own staged config
 tree, including Pi's pane-scoped identity extension.
 
-#### Status rules for custom agents
+### Status rules for custom agents
 
 `agent_detect_as` fits wrappers whose output matches a built-in. For a different harness, declare pane status rules instead:
 
@@ -284,7 +257,7 @@ status = "running"
 regex = "esc to interrupt|thinking"
 ```
 
-Rules are checked in order against the last screenful of ANSI-stripped pane text every status poll; the first match wins and no match reports `idle`. Put the more specific states (`waiting`, `error`) before the broad `running` matchers. When an agent has rules, they take precedence over its `agent_detect_as` alias, over a built-in detector of the same name, and over a status hook the agent writes.
+Each rule sets `status` (`running`, `waiting`, `idle`, `error`) and exactly one of `contains` (case-insensitive substring) or `regex` (Rust regex; use `(?i)` for case-insensitive). Rules are matched in order against the ANSI-stripped pane; first match wins and no match reports `idle`, so put the specific states before broad ones. Rules outrank `agent_detect_as`, a built-in detector of the same name, and a status hook the agent writes. Invalid rules are skipped with a warning and take effect on the next config resolve.
 
 #### OMP terminal status
 
@@ -307,9 +280,9 @@ turn timer or working title, passive text that exactly reproduces a loader row
 remains indistinguishable from that control. Use the explicit status rules above
 for such interfaces; they remain authoritative, including their no-match behavior.
 
-#### Running a custom agent in the structured view
+### Running a custom agent in the structured view
 
-Give an agent an ACP launch command in `agent_acp_cmd` to run it in the structured view UI instead of tmux. The agent must speak the [Agent Client Protocol](https://agentclientprotocol.com); the command is what AoE execs to start the ACP server.
+Give the agent an ACP launch command; it must speak the [Agent Client Protocol](https://agentclientprotocol.com).
 
 ```toml
 [session.custom_agents]
@@ -319,23 +292,30 @@ Give an agent an ACP launch command in `agent_acp_cmd` to run it in the structur
 "oc-superpowers" = "ocp run sp acp"
 ```
 
-The `agent_acp_cmd` value is split into argv and executed directly with no shell, so for shell features wrap explicitly, e.g. `"sh -lc 'source ~/.profile && ocp run sp acp'"`. The name must match a `custom_agents` entry and cannot shadow a built-in. A custom agent with no `agent_acp_cmd` runs in the terminal view.
+The value is split into argv and executed with no shell, so wrap explicitly for shell features (`sh -lc '...'`). The name must match a `custom_agents` entry and cannot shadow a built-in.
 
-**Inheriting a supported agent.** If your custom agent only wraps a supported one (for example separate tools that each run Claude Code against a different profile / oauth location), you do not need to spell out `agent_acp_cmd` at all. Map the wrapper to its base with `agent_detect_as`, and it inherits the base's ACP adapter automatically:
+A wrapper around a supported agent needs no `agent_acp_cmd` at all: map it with `agent_detect_as` and it inherits the base agent's ACP adapter, which also lights up **Switch to structured view** on an existing terminal session. **The wrapper binary is never executed** in that case, so anything it does outside the CLI (selecting an account, gateway, or profile by setting env) does not apply. Inheritance works only for bases with a built-in adapter (`claude`, `codex`, `opencode`, `gemini`, `vibe`, `pi`, `omp`, `kimi`, `prime-agent`).
+
+To pass those overrides to a host structured session anyway, use the session's `extra_env` or [`environment`](#host-environment). A Docker-sandboxed session reads only `sandbox.environment` and pins its own config dir at a container path, so set the container-side value there, or give the wrapper a real `agent_acp_cmd`. An explicit `agent_acp_cmd` wins if you set both.
+
+## Agent command overrides
+
+An override replaces the command AoE launches for an agent, which is how you run it with fixed options, through a script, or under a sandbox such as [nono](https://github.com/always-further/nono/).
 
 ```toml
-[session.custom_agents]
-"work-claude" = "CLAUDE_CONFIG_DIR=/Users/me/.claude-work claude"
-
-[session.agent_detect_as]
-"work-claude" = "claude"
+[session.agent_command_override]
+opencode = "nono run --profile opencode-dev --allow-cwd -- opencode"
 ```
 
-`work-claude` is now structured view-capable through `claude-agent-acp`, and the existing terminal session's **Switch to structured view** action becomes available. **The wrapper binary itself is never executed**: structured view runs the base agent's adapter instead (inheriting its version gate and env allowlist), so it renders exactly like the base agent. Anything the wrapper does outside that CLI, such as selecting an account, gateway, or profile by setting env, does not apply. AoE logs a warning to the daemon log at spawn whenever a structured view session launches this way. Inheritance only works when the base has a built-in ACP adapter (`claude`, `codex`, `opencode`, `gemini`, `vibe`, `pi`, `omp`, `kimi`, `prime-agent`); a wrapper mapped to a terminal-only base (e.g. `cursor`) stays tmux-only.
+Set the same thing in the TUI under **Agents**, using `<agent>=<cmd>`, or per session with `aoe add --cmd-override <CMD>`. Overrides are evaluated per-session first, then profile, then global (a repo config cannot set one).
 
-To pass overrides to a host (non-sandboxed) structured session anyway, use the session's `extra_env` / [Host Environment](#host-environment) (for example `environment = ["CLAUDE_CONFIG_DIR=/Users/me/.claude-work"]`) or `session.inherit_host_environment`, the same as any other agent. Those are host paths and host env: they do not reach a Docker-sandboxed session, which reads only `sandbox.environment` and pins its own config dir at a container path (`AGENT_CONFIG_MOUNTS` bind-mounts it and path-valued vars like `CLAUDE_CONFIG_DIR` are stripped at the container boundary). For a sandboxed wrapper, set the container-side value in `sandbox.environment`, or give the wrapper a real ACP command with `agent_acp_cmd`. An explicit `agent_acp_cmd` still wins if you set both.
+A configured override also applies to plain `aoe add --cmd <agent>`, and the on-PATH check validates the resolved override binary, so a session works when only the wrapper is installed. Native conversation resume survives an override only when the command starts with the built-in's exact binary token, or is a single bare token, and contains no shell control syntax; see [session resume](session-resume.md).
 
-## Host Environment
+The web wizard previews the resolved command in its **Agent** panel, including the ACP registry args a structured view session adds (`opencode acp`). Extra args are ignored for structured view sessions, so change the command override instead.
+
+An override runs through your `$SHELL`, falling back to `bash` when `$SHELL` is unset or non-POSIX (`fish`, `nu`, `pwsh`). If your wrapper is a function or abbreviation in a non-POSIX shell, write it as a bash script or spell the command out here.
+
+## Host environment
 
 ```toml
 environment = [
@@ -358,8 +338,7 @@ Wrappers, sandboxed launches and unattested executables are not probed for this 
 
 Independent of that list, AoE forwards `DISPLAY`, `WAYLAND_DISPLAY`, `XAUTHORITY`, `DBUS_SESSION_BUS_ADDRESS`, `SSH_AUTH_SOCK`, and every `XDG_*` variable into host sessions, so a browser the agent launches (an OIDC login) can reach your desktop. Worth knowing what that grants: `DISPLAY` plus `XAUTHORITY` is X11 access to your whole session, which includes screen capture and input injection. A sandboxed session never receives them.
 
-
-To forward everything else too, rather than naming each var in `environment`:
+To forward everything else too:
 
 ```toml
 [session]
@@ -367,7 +346,6 @@ inherit_host_environment = true
 ```
 
 Every variable AoE holds then reaches host sessions, except `AOE_*` and `AGENT_OF_EMPIRES_*` (its own wiring) and `TERM` (owned by tmux). Off by default, since it widens what every agent can read, including tokens exported in your shell. In the terminal view the pairs ride `tmux new-session -e`, so a secret is briefly visible in `ps` while that command runs.
-
 
 Managed OpenCode selects this policy before probing or launching the native agent. It also retains process essentials and OpenCode database, configuration and workspace selector inputs for validation when wholesale inheritance is off. Unsupported selectors remain unsupported. Explicit profile `environment` entries and before-session overrides take precedence; login-only exports are not imported. See [managed OpenCode contexts](session-resume.md#supported-managed-contexts).
 
@@ -388,9 +366,7 @@ systemctl --user import-environment DISPLAY XAUTHORITY XDG_RUNTIME_DIR DBUS_SESS
 systemctl --user restart agent-of-empires
 ```
 
-
-To check what a running daemon can actually forward, read its environment
-directly. On Linux:
+To inspect what the running Daemon inherited on Linux:
 
 ```bash
 tr '\0' '\n' < /proc/$(cat ~/.config/agent-of-empires/serve.pid)/environ
@@ -435,7 +411,7 @@ See [Container Sandbox](sandbox.md) for options, environment grammar, credential
 ```toml
 [host_hooks]
 before_start   = ['echo "GH_TOKEN=$(my-mint-tool "$AOE_REPO_SLUG")"']  # sandboxed sessions
-before_session = ['my-account-switcher env']                            # host sessions
+before_session = ['my-account-switcher env --profile "$AOE_PROFILE"']  # host sessions
 before_destroy = ['sync-transcripts "$AOE_SESSION_ID"']                 # any session, at purge
 ```
 
@@ -529,77 +505,63 @@ The daemon reports `STATUS=<n> running, <n> waiting, <n> idle` to systemd, visib
 
 ```toml
 [diff]
-default_branch = "main"
+default_branch = "main"   # auto-detected when unset
 context_lines = 3
 ```
-
-| Option | Default | Description |
-|--------|---------|-------------|
-| `default_branch` | (auto-detect) | Base branch for diffs |
-| `context_lines` | `3` | Lines of context around changes |
 
 ## Updates
 
 ```toml
 [updates]
-update_check_mode = "notify"
+update_check_mode = "notify"   # auto | notify | off
 ```
 
-| Option | Default | Description |
-|--------|---------|-------------|
-| `update_check_mode` | `"notify"` | One of `auto`, `notify`, `off`. See below. |
+- `auto`: install a new release silently in the background through the same tarball path as `aoe update`, picked up on the next launch. Only when the install location is writable; Homebrew installs fall through to `brew upgrade`.
+- `notify` (default): show the TUI banner and the CLI nag. `Ctrl+x` snoozes the banner until a newer release ships.
+- `off`: no check, banner, or dashboard poll. Use it on offline networks.
 
-Checks hit GitHub at most once a day (a built-in server-side cache TTL); the web dashboard re-polls the cached status hourly while open.
-
-### `update_check_mode`
-
-- `auto`: when a new release is detected, install it silently in the background using the same tarball install path as `aoe update`. The new binary is picked up on the next launch (no mid-session restart). Only fires when the install location is writable; Homebrew installs fall through to manual `brew upgrade`.
-- `notify` (default): show the TUI banner and the CLI eprintln nag. Press `Ctrl+x` on the banner to snooze for the current latest version; the banner returns automatically when a newer release ships.
-- `off`: skip every check, banner, fetch, and dashboard poll. Use this on offline / restricted networks.
-
-The TUI banner snooze is persisted to `app_state.dismissed_update_version` (in `state.toml`, see [above](#statetoml)), so dismissing on v1.5.3 keeps the banner hidden across `aoe` restarts until v1.5.4 (or later) ships. See #1140.
-
-Configs written for older `aoe` versions used a `check_enabled` boolean and an orphaned `auto_update` field. Migration `v009` runs once on startup and rewrites `check_enabled = false` to `update_check_mode = "off"`, `check_enabled = true` (or missing) to `"notify"`, and drops `auto_update` entirely. The former `check_interval_hours`, `notify_in_cli`, and `web_poll_interval_minutes` knobs are now fixed built-ins; migration `v022` drops them from saved configs.
+Checks hit GitHub at most once a day; the dashboard re-polls the cached status hourly while open.
 
 ## Tools
 
-The `[tools.*]` block configures dev tools tied to each agent session's working directory. Each entry has a required `command`, an optional `hotkey` in `Alt+<single-char>` format, and optional `background = true` for fire-and-forget commands that should not create a tmux tool session.
+`[tools.*]` defines dev tools tied to each session's working directory. Each entry takes a `command`, an optional `hotkey` (`Alt+<char>`), and optional `background = true` for fire-and-forget commands.
 
 ```toml
 [tools.lazygit]
 command = "lazygit"
 hotkey = "Alt+g"
-
-[tools.yazi]
-command = "yazi"
-hotkey = "Alt+f"
-
-[tools.github]
-command = "gh repo view --web"
-hotkey = "Alt+o"
-background = true
 ```
 
-See [Tool Sessions](tool-sessions.md) for the full reference, hotkey rules, and lifecycle.
+See [Tool Sessions](tool-sessions.md) for the full reference.
+
+## Worktree and sandbox
+
+```toml
+[worktree]
+enabled = false                                       # auto-enable for new sessions
+path_template = "../{repo-name}-worktrees/{branch}"   # {repo-name}, {branch}, {session-id}
+auto_cleanup = true
+
+[sandbox]
+enabled_by_default = false
+default_image = "ghcr.io/agent-of-empires/aoe-sandbox:latest"
+environment = ["GH_TOKEN=$AOE_GH_TOKEN"]
+```
+
+[Git Worktrees](worktrees.md) and [Container Sandbox](sandbox.md) document the remaining keys in each section.
 
 ## Profiles
 
 Profiles have separate sessions, groups, and overrides of profile-overridable settings. Press `P` in the TUI to choose from the last applied Daemon profile list. Reopen it to see later changes. A removed profile stays selected until you choose another filter; choose `all` to see remaining profiles.
 
 ```bash
-aoe                 # Uses "default" profile
-aoe -p work         # Uses "work" profile
+aoe                        # "default" profile
+aoe -p work                # the "work" profile
 aoe profile create client-xyz
 aoe profile list
-aoe profile default work   # Set "work" as default
+aoe profile default work
 ```
 
-Profile overrides go in `~/.agent-of-empires/profiles/<name>/config.toml` and use the same format as the global config.
+## Repo config
 
-## Repo Config
-
-Per-repo settings go in `.agent-of-empires/config.toml` at your project root. Run `aoe init` to generate a template.
-
-Repo config supports: `[hooks]`, `[session]`, `[sandbox]`, and `[worktree]` sections. It does not support `[tmux]`, `[sound]`, `[updates]`, `[claude]`, or `[diff]` (those are personal settings).
-
-See [Repo Config & Hooks](repo-config.md) for details.
+Per-repo settings live in `.agent-of-empires/config.toml`; `aoe init` writes a template. A repo may set `[hooks]`, parts of `[session]`, `[sandbox]`, and `[worktree]`, and nothing else. See [Repo Config & Hooks](repo-config.md) for which keys are accepted and why the rest are not.
