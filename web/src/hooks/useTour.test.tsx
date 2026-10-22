@@ -100,6 +100,12 @@ describe("useTour", () => {
     });
   });
 
+  it("hands the intro reset an unknown read-only state as unknown, not writable", () => {
+    const { result } = renderHook(() => useTour(opts({ autoLaunchReady: false, readOnly: undefined })));
+    act(() => result.current.startTour());
+    expect(resetSettingsIntros).toHaveBeenCalledExactlyOnceWith(undefined);
+  });
+
   it("startTour is a no-op when no steps resolve", () => {
     resolveTourStepsMock.mockReturnValue([]);
     const { result } = renderHook(() => useTour(opts({ autoLaunchReady: false })));

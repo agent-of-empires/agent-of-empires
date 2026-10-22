@@ -3,6 +3,7 @@
 import { getWebUiState, patchWebUiState } from "./api";
 import { configureStorageSync } from "./safeStorage";
 import { SETTINGS_INTRO_KEY_PREFIX } from "./settingsIntros";
+import { markWebUiStateHydrated } from "./webUiHydration";
 
 const EXACT_KEYS = new Set<string>([
   "aoe-welcome-seen", // theme welcome modal seen (mirrors the server-side tour flag)
@@ -87,8 +88,7 @@ export async function hydrateWebUiStateFromServer(): Promise<void> {
     await applyServerState();
   } finally {
     // Settled even when the Daemon is unreachable, so nothing waits on it forever.
-    hydrated = true;
-    window.dispatchEvent(new Event(HYDRATED_EVENT));
+    markWebUiStateHydrated();
   }
 }
 
@@ -110,18 +110,4 @@ async function applyServerState(): Promise<void> {
   for (const [key, value] of Object.entries(server)) {
     rawSet(key, value);
   }
-}
-
-const HYDRATED_EVENT = "aoe:web-ui-state-hydrated";
-let hydrated = false;
-
-/** Whether this page load's hydration has settled, successfully or not. */
-export function isWebUiStateHydrated(): boolean {
-  return hydrated;
-}
-
-/** Hydration isn't awaited before render, so a view that read its keys on mount re-reads here. */
-export function onWebUiStateHydrated(listener: () => void): () => void {
-  window.addEventListener(HYDRATED_EVENT, listener);
-  return () => window.removeEventListener(HYDRATED_EVENT, listener);
 }

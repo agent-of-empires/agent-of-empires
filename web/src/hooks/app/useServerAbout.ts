@@ -8,6 +8,7 @@ import {
   setTelemetryConsent,
   type ServerAbout,
 } from "../../lib/api";
+import { settleSettingsIntrosReadOnly } from "../../lib/settingsIntros";
 
 export function useServerAbout() {
   const [serverAbout, setServerAbout] = useState<ServerAbout | null>(null);
@@ -20,6 +21,8 @@ export function useServerAbout() {
       const about = await fetchAbout();
       if (!about) return;
       setServerAbout(about);
+      // Settings intros folded before this answer was in wait to learn where they belong.
+      settleSettingsIntrosReadOnly(about.read_only);
       if (reportSeen && !about.read_only) reportTelemetrySeen("web");
     } finally {
       setServerAboutLoaded(true);

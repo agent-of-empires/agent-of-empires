@@ -1,6 +1,7 @@
 // Folded Settings tab intros, kept in synced web UI state so they follow the user to every Device.
 
 import { safeGetItem, safeRemoveItem, safeSetItem } from "./safeStorage";
+import { isWebUiStateHydrated, onWebUiStateHydrated } from "./webUiHydration";
 
 /** The Settings tabs that open with an intro. */
 export const SETTINGS_INTRO_IDS = ["worktree", "plugins", "structured-view"] as const;
@@ -27,13 +28,30 @@ export function isSettingsIntroFolded(id: SettingsIntroId): boolean {
   return (safeGetItem(deviceKey(id)) ?? safeGetItem(introKey(id))) === FOLDED;
 }
 
-/** `readOnly` is undefined until the Daemon's about loads, so the choice goes to both keys. */
+// Choices made before the Daemon's about says whether it is read-only, kept until it does.
+const unsettled = new Map<SettingsIntroId, string>();
+
+/** `readOnly` is undefined until the Daemon's about loads. */
 function setIntro(id: SettingsIntroId, value: string, readOnly: boolean | undefined): void {
-  if (readOnly !== false) safeSetItem(deviceKey(id), value);
-  if (readOnly === true) return;
+  if (readOnly === true) {
+    safeSetItem(deviceKey(id), value);
+    return;
+  }
   safeSetItem(introKey(id), value);
+  // A device key overrides the synced one, so an unknown dashboard can't write it yet: on a
+  // writable one it would block a replay from another Device.
+  if (readOnly === undefined) {
+    unsettled.set(id, value);
+    return;
+  }
   // On a writable dashboard, a choice made while read-only must not outlive one the Daemon stores.
-  if (readOnly === false) safeRemoveItem(deviceKey(id));
+  safeRemoveItem(deviceKey(id));
+}
+
+/** Once the Daemon's about loads: a read-only one keeps the earlier choices on the device. */
+export function settleSettingsIntrosReadOnly(readOnly: boolean): void {
+  for (const [id, value] of unsettled) setIntro(id, value, readOnly);
+  unsettled.clear();
 }
 
 export function foldSettingsIntro(id: SettingsIntroId, readOnly: boolean | undefined): void {
@@ -43,10 +61,21 @@ export function foldSettingsIntro(id: SettingsIntroId, readOnly: boolean | undef
 const INTROS_RESET_EVENT = "aoe:settings-intros-reset";
 
 /** "Show tutorial" unfolds every intro once, here and on other Devices. */
-export function resetSettingsIntros(readOnly: boolean): void {
-  for (const id of SETTINGS_INTRO_IDS) setIntro(id, UNFOLDED, readOnly);
-  // An open Settings view holds its folds in state, so it hears about the reset.
-  window.dispatchEvent(new Event(INTROS_RESET_EVENT));
+export function resetSettingsIntros(readOnly: boolean | undefined): void {
+  const apply = () => {
+    for (const id of SETTINGS_INTRO_IDS) setIntro(id, UNFOLDED, readOnly);
+    // An open Settings view holds its folds in state, so it hears about the reset.
+    window.dispatchEvent(new Event(INTROS_RESET_EVENT));
+  };
+  if (isWebUiStateHydrated()) {
+    apply();
+    return;
+  }
+  // The page's first hydration would copy the Daemon's older folds over the replay.
+  const off = onWebUiStateHydrated(() => {
+    off();
+    apply();
+  });
 }
 
 export function onSettingsIntrosReset(listener: () => void): () => void {

@@ -9,7 +9,8 @@ const TourRunner = lazy(() => import("../components/tour/TourRunner"));
 
 export interface UseTourOptions {
   scope: TourScope;
-  readOnly: boolean;
+  /** Undefined until the Daemon's about loads. */
+  readOnly: boolean | undefined;
   isDesktop: boolean;
   autoLaunchReady: boolean;
   seen: boolean;
@@ -72,7 +73,7 @@ export function useTour({
     (onStarted?: () => void): number => {
       return requestAnimationFrame(() => {
         if (!mountedRef.current) return;
-        const resolved = resolveTourSteps({ scope, readOnly, isDesktop });
+        const resolved = resolveTourSteps({ scope, readOnly: !!readOnly, isDesktop });
         if (resolved.length === 0) return;
         onStarted?.();
         setSteps(resolved);

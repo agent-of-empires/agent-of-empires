@@ -2302,7 +2302,7 @@ function AppContent({
   });
   const tour = useTour({
     scope: tourScope,
-    readOnly: !!serverAbout?.read_only,
+    readOnly: serverAbout?.read_only,
     isDesktop: !isCoarse,
     autoLaunchReady: tourAutoLaunchReady && welcome.resolved,
     seen: tourSeen,

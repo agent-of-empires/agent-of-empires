@@ -27,7 +27,7 @@ import { TelemetrySettings } from "./settings/TelemetrySettings";
 import { CityHallSettings } from "./settings/CityHallSettings";
 import { PluginsSettings } from "./settings/PluginsSettings";
 import { SettingsIntro, SettingsIntroReopen } from "./settings/SettingsIntro";
-import { isWebUiStateHydrated, onWebUiStateHydrated } from "../lib/webUiSync";
+import { isWebUiStateHydrated, onWebUiStateHydrated } from "../lib/webUiHydration";
 import {
   SETTINGS_INTRO_IDS,
   foldSettingsIntro,
