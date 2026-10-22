@@ -2970,9 +2970,10 @@
       "specs": [
         "src/lib/acpTypes.test.ts",
         "src/hooks/useRespawnSession.test.tsx",
-        "src/components/acp/SystemNotices.test.tsx",
+        "src/components/acp/UsageLimitBanner.test.tsx",
         "src/components/acp/SwitchAgentModal.test.tsx",
-        "src/hooks/useAcpSession.test.ts"
+        "src/hooks/useAcpSession.test.ts",
+        "tests/acp-usage-limit.spec.ts"
       ],
       "components": [
         "src/server/api/acp.rs",
@@ -2981,7 +2982,7 @@
         "web/src/hooks/useAcpSession.ts",
         "web/src/hooks/useRespawnSession.ts",
         "web/src/lib/acpTypes.ts",
-        "web/src/components/acp/SystemNotices.tsx"
+        "web/src/components/acp/UsageLimitBanner.tsx"
       ]
     },
     {
@@ -3405,6 +3406,27 @@
       "risk": "medium",
       "specs": ["src/components/acp/ToolErrorBody.test.tsx"],
       "components": ["web/src/components/acp/ToolErrorBody.tsx"]
+    },
+    {
+      "id": "acp.startup-wait-line",
+      "kind": "vitest",
+      "risk": "medium",
+      "specs": [
+        "src/components/acp/__tests__/SessionBanners.test.tsx",
+        "src/components/acp/startupWait.test.ts",
+        "src/lib/agentDisplayName.test.ts",
+        "src/components/acp/SystemNotices.test.tsx",
+        "src/components/acp/QueuedPromptsStrip.test.tsx",
+        "src/components/acp/SendButton.test.tsx",
+        "tests/acp-startup-wait.spec.ts"
+      ],
+      "components": [
+        "web/src/components/acp/SessionBanners.tsx",
+        "web/src/components/acp/SystemNotices.tsx",
+        "web/src/components/acp/PromptStrips.tsx",
+        "web/src/components/acp/ComposerControls.tsx"
+      ],
+      "notes": "A new Session shows one startup line naming the Agent with an elapsed count, switching to a neutral line at 15s with no duration or delivery promise; the queued strip and Send button say what they wait for. Reduced motion holds one breathe frame."
     },
     {
       "id": "acp.startup-error-screen",

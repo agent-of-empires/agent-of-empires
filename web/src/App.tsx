@@ -1951,6 +1951,11 @@ function AppContent({
                             sessionId={session.id}
                             acpWorkerState={session.acp_worker_state ?? "absent"}
                             rateLimitAutoResume={session.rate_limit_auto_resume}
+                            settingsHref={
+                              serverAbout?.read_only
+                                ? null
+                                : `/settings/structured-view?profile=${encodeURIComponent(session.profile)}`
+                            }
                             tool={session.tool}
                             acpAgent={session.acp_agent ?? null}
                             acpProvider={session.acp_provider ?? null}
@@ -2197,6 +2202,7 @@ function AppContent({
           onOpenSendDialog={() => setSendDialogOpen(true)}
           onCloseSendDialog={() => setSendDialogOpen(false)}
           onClearSelectedFile={() => setSelectedFile(null)}
+          settingsReadOnly={!!serverAbout?.read_only}
         />
       );
     }
