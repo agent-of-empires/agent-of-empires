@@ -85,7 +85,9 @@ pub(super) fn build_router(state: Arc<AppState>) -> Router {
         )
         .route(
             "/api/sessions/{id}",
-            patch(api::rename_session).delete(api::delete_session),
+            patch(api::rename_session)
+                .delete(api::delete_session)
+                .layer(read_only.clone()),
         )
         .route("/api/sessions/{id}/group", patch(api::update_session_group))
         .route(
@@ -147,7 +149,10 @@ pub(super) fn build_router(state: Arc<AppState>) -> Router {
             "/api/sessions/{id}/snooze",
             patch(api::update_session_snooze),
         )
-        .route("/api/sessions/{id}/trash", post(api::trash_session))
+        .route(
+            "/api/sessions/{id}/trash",
+            post(api::trash_session).layer(read_only.clone()),
+        )
         .route("/api/sessions/{id}/restore", post(api::restore_session))
         .route(
             "/api/sessions/{id}/purge/abandon",
@@ -254,7 +259,7 @@ pub(super) fn build_router(state: Arc<AppState>) -> Router {
         .route("/api/plugins/commands", get(api::plugin_commands))
         .route(
             "/api/plugins/commands/{fqid}/invoke",
-            post(api::invoke_plugin_command),
+            post(api::invoke_plugin_command).layer(read_only.clone()),
         )
         .route("/api/plugins/ui-state", get(api::plugin_ui_state))
         .route("/api/plugins/updates", get(api::plugin_updates))

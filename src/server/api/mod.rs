@@ -558,7 +558,7 @@ mod tests {
         (
             "plugins.rs",
             include_str!("plugins.rs"),
-            &["invoke_plugin_action"],
+            &["invoke_plugin_action", "invoke_plugin_command"],
         ),
         (
             "skills.rs",
@@ -590,28 +590,116 @@ mod tests {
         (
             "acp/install.rs",
             include_str!("acp/install.rs"),
-            &["install_agent"],
+            &["install_agent", "install_gate"],
         ),
     ];
 
     fn handler_source<'a>(source: &'a str, name: &str) -> Option<(&'a str, &'a str)> {
-        let needle = format!("fn {name}(");
-        let rest = &source[source.find(&needle)? + needle.len()..];
-        let mut depth = 1usize;
-        let sig_end = rest.char_indices().find_map(|(i, c)| {
-            match c {
-                '(' => depth += 1,
-                ')' => depth -= 1,
-                _ => {}
+        use syn::spanned::Spanned;
+
+        let file = syn::parse_file(source)
+            .unwrap_or_else(|error| panic!("invalid Rust source while auditing `{name}`: {error}"));
+        file.items.into_iter().find_map(|item| {
+            let syn::Item::Fn(function) = item else {
+                return None;
+            };
+            if function.sig.ident != name {
+                return None;
             }
-            (depth == 0).then_some(i)
-        })?;
-        let body_end = ["\npub async fn ", "\npub fn ", "\nasync fn ", "\nfn "]
+            let signature = function.sig.span().byte_range();
+            let opening = function.block.brace_token.span.open().byte_range();
+            let closing = function.block.brace_token.span.close().byte_range();
+            Some((
+                source.get(signature)?,
+                source.get(opening.start..closing.end)?,
+            ))
+        })
+    }
+
+    fn eager_json_consumer(signature: &str) -> Option<usize> {
+        use syn::spanned::Spanned;
+
+        fn eager(ty: &syn::Type) -> bool {
+            let syn::Type::Path(path) = ty else {
+                return false;
+            };
+            let Some(segment) = path.path.segments.last() else {
+                return false;
+            };
+            if segment.ident == "Json" {
+                return true;
+            }
+            if segment.ident != "Option" {
+                return false;
+            }
+            let syn::PathArguments::AngleBracketed(arguments) = &segment.arguments else {
+                return false;
+            };
+            arguments
+                .args
+                .iter()
+                .any(|argument| matches!(argument, syn::GenericArgument::Type(ty) if eager(ty)))
+        }
+
+        syn::parse_str::<syn::Signature>(signature)
+            .expect("audited function signature")
+            .inputs
             .iter()
-            .filter_map(|t| rest.find(t))
-            .min()
-            .unwrap_or(rest.len());
-        Some((&rest[..sig_end], &rest[..body_end]))
+            .find_map(|argument| match argument {
+                syn::FnArg::Typed(argument) if eager(&argument.ty) => {
+                    Some(argument.ty.span().byte_range().start)
+                }
+                _ => None,
+            })
+    }
+
+    #[test]
+    fn handler_source_stays_inside_the_selected_top_level_function() {
+        let source = r###"
+            pub async fn selected(body: Option<Json<Body>>) {
+                let text = "}";
+                let raw = r#"{ fn fake() {} }"#;
+                let character = '}';
+                /* outer { /* nested } */ } */
+                if true { consume(text, raw, character); }
+            }
+            pub(crate) fn neighbor() { if state.read_only {} }
+            #[cfg(test)]
+            mod tests {
+                fn selected() { if state.read_only {} }
+                fn only_in_tests() {}
+            }
+        "###;
+        let (signature, body) = handler_source(source, "selected").unwrap();
+        assert!(signature.contains("Option<Json<Body>>"));
+        assert!(body.contains("consume(text, raw, character)"));
+        assert!(!body.contains("state.read_only"));
+        assert!(!body.contains("neighbor"));
+        assert!(handler_source(source, "only_in_tests").is_none());
+        let (_, install) = handler_source(include_str!("acp/install.rs"), "install_agent").unwrap();
+        assert!(!install.contains("state.read_only"));
+        assert!(install.contains("install_gate(&state)"));
+    }
+
+    #[test]
+    fn eager_json_detection_distinguishes_deferred_rejection() {
+        for (signature, expected) in [
+            ("fn write(body: Json<Body>)", true),
+            ("fn write(body: Option<Json<Body>>)", true),
+            ("fn write(body: Option<axum::Json<Body>>)", true),
+            ("fn write(body: Result<Json<Body>, JsonRejection>)", false),
+            (
+                "fn write(body: Result<Option<Json<Body>>, JsonRejection>)",
+                false,
+            ),
+            ("fn write(body: Bytes)", false),
+        ] {
+            assert_eq!(
+                eager_json_consumer(signature).is_some(),
+                expected,
+                "{signature}"
+            );
+        }
     }
 
     #[test]
@@ -620,6 +708,7 @@ mod tests {
         let mut failures = Vec::new();
         for route in &routes {
             if route.path.starts_with("/api/sessions")
+                || route.path.starts_with("/api/plugins/commands/")
                 || route.path.starts_with("/api/groups")
                 || matches!(
                     route.path,
@@ -659,33 +748,28 @@ mod tests {
                 let route_layer = handler_routes.peek().is_some()
                     && handler_routes.all(|route| route.read_only_layer);
                 let parts_guard = signature.find("ElevatedMutationGuard");
-                let eager = signature.split(',').any(|arg| {
-                    let arg = arg.trim_start();
-                    arg.starts_with("Json(") || arg.contains(": Json<")
-                });
+                let consumer = eager_json_consumer(signature);
                 let local_guard = ["state.read_only", "self.read_only", "read_only_block("]
                     .iter()
                     .any(|marker| body.contains(marker));
                 let delegated = match *name {
                     "ensure_session" | "start_session" => body.contains("prepare_agent_session("),
                     "prepare_agent_session" => body.contains("prepare_agent_session_inner("),
+                    "install_agent" => body.contains("install_gate(&state)"),
                     _ => false,
                 };
                 if !route_layer && parts_guard.is_none() && !local_guard && !delegated {
                     failures.push(format!("{file}: `{name}` lacks a read-only guard"));
                 }
-                if eager && !route_layer {
-                    let consumer = signature
-                        .find("Json(")
-                        .or_else(|| signature.find(": Json<"));
-                    if !parts_guard
+                if consumer.is_some()
+                    && !route_layer
+                    && !parts_guard
                         .zip(consumer)
                         .is_some_and(|(guard, body)| guard < body)
-                    {
-                        failures.push(format!(
-                            "{file}: `{name}` rejects JSON before its read-only guard"
-                        ));
-                    }
+                {
+                    failures.push(format!(
+                        "{file}: `{name}` rejects JSON before its read-only guard"
+                    ));
                 }
             }
         }
@@ -732,6 +816,9 @@ mod tests {
             (Method::POST, "/api/sessions/missing/tools/ensure"),
             (Method::POST, "/api/sessions/missing/auxiliary/stop"),
             (Method::POST, "/api/sessions/missing/acp/switch-agent"),
+            (Method::DELETE, "/api/sessions/missing"),
+            (Method::POST, "/api/sessions/missing/trash"),
+            (Method::POST, "/api/plugins/commands/missing/invoke"),
             (Method::POST, "/api/groups"),
             (Method::PATCH, "/api/groups"),
             (Method::DELETE, "/api/groups"),
