@@ -136,6 +136,28 @@ describe("structuredViewOffered", () => {
   });
 });
 
+describe("leaving an import under structured_view off", () => {
+  // An import deliberately holds structured while the toggle is hidden; ending it must not leak that.
+  it.each([
+    ["another project", set("path", "/other")],
+    ["Scratch", set("scratch", true)],
+  ])("clears the structured choice when moving to %s", (_, edit) => {
+    const importing = makeState({
+      importAcpSessionId: "abc",
+      useStructuredView: true,
+      structuredViewOffered: false,
+    });
+    const next = reducer(importing, edit);
+    expect(next.data.importAcpSessionId).toBe("");
+    expect(next.data.useStructuredView).toBe(false);
+  });
+
+  it("keeps the choice when structured is offered", () => {
+    const importing = makeState({ importAcpSessionId: "abc", useStructuredView: true });
+    expect(reducer(importing, set("path", "/other")).data.useStructuredView).toBe(true);
+  });
+});
+
 describe("SET_FIELD mutual exclusion", () => {
   it("enabling scratch clears path sources, worktree, import id and a stale non-repo probe", () => {
     const seeded = makeState({
