@@ -1,5 +1,5 @@
 /* eslint-disable react-refresh/only-export-components */
-import { useCallback, useEffect, useMemo, useState, type ReactNode } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { useServerDown, OFFLINE_TITLE } from "../lib/connectionState";
 import { ConnectedDevices } from "./ConnectedDevices";
 import { PasskeySettings } from "./PasskeySettings";
@@ -27,7 +27,7 @@ import { TelemetrySettings } from "./settings/TelemetrySettings";
 import { CityHallSettings } from "./settings/CityHallSettings";
 import { PluginsSettings } from "./settings/PluginsSettings";
 import { SettingsIntro, SettingsIntroReopen } from "./settings/SettingsIntro";
-import { onWebUiStateHydrated } from "../lib/webUiSync";
+import { isWebUiStateHydrated, onWebUiStateHydrated } from "../lib/webUiSync";
 import {
   SETTINGS_INTRO_IDS,
   foldSettingsIntro,
@@ -386,15 +386,44 @@ export function SettingsView({
 
   // Reopening with "About" is local to this visit; "Got it" folds it again.
   const [foldedIntros, setFoldedIntros] = useState<ReadonlySet<SettingsIntroId>>(storedIntroFolds);
+  // Until hydration settles, a new Device would show an intro the Daemon has folded.
+  const [introsKnown, setIntrosKnown] = useState(isWebUiStateHydrated);
+  // Intros the user acted on this visit; the Daemon's folds arriving late must not undo that.
+  const touchedIntros = useRef(new Set<SettingsIntroId>());
   const foldIntro = (id: SettingsIntroId) => {
-    foldSettingsIntro(id, !!readOnly);
+    touchedIntros.current.add(id);
+    foldSettingsIntro(id, readOnly);
     setFoldedIntros((prev) => new Set(prev).add(id));
   };
-  const reopenIntro = (id: SettingsIntroId) => setFoldedIntros((prev) => new Set([...prev].filter((f) => f !== id)));
+  const reopenIntro = (id: SettingsIntroId) => {
+    touchedIntros.current.add(id);
+    setFoldedIntros((prev) => new Set([...prev].filter((f) => f !== id)));
+  };
   // "Show tutorial" can run with Settings open.
-  useEffect(() => onSettingsIntrosReset(() => setFoldedIntros(new Set())), []);
+  useEffect(
+    () =>
+      onSettingsIntrosReset(() => {
+        SETTINGS_INTRO_IDS.forEach((id) => touchedIntros.current.add(id));
+        setFoldedIntros(new Set());
+      }),
+    [],
+  );
   // A Device landing straight on Settings can mount before the Daemon's folds arrive.
-  useEffect(() => onWebUiStateHydrated(() => setFoldedIntros(storedIntroFolds())), []);
+  useEffect(
+    () =>
+      onWebUiStateHydrated(() => {
+        setIntrosKnown(true);
+        setFoldedIntros((current) => {
+          const next = storedIntroFolds();
+          for (const id of touchedIntros.current) {
+            if (current.has(id)) next.add(id);
+            else next.delete(id);
+          }
+          return next;
+        });
+      }),
+    [],
+  );
 
   const handleSetDefault = async (name: string) => {
     const ok = await setDefaultProfile(name);
@@ -724,7 +753,7 @@ export function SettingsView({
   };
 
   const currentTabLabel = tabs.find((t) => t.id === activeTab)?.label ?? "";
-  const introId = isSettingsIntroId(activeTab) ? activeTab : null;
+  const introId = introsKnown && isSettingsIntroId(activeTab) ? activeTab : null;
   const introFolded = introId !== null && foldedIntros.has(introId);
   const showProfilePicker = !cityhall && profileScopedTabs.has(activeTab);
 

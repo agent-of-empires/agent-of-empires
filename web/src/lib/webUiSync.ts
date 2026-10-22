@@ -83,6 +83,16 @@ function enumerateLocalSyncedKeys(): string[] {
 
 /** Pull server values into localStorage before first paint (server wins). Raw writes avoid echoing back through the sync chokepoint. */
 export async function hydrateWebUiStateFromServer(): Promise<void> {
+  try {
+    await applyServerState();
+  } finally {
+    // Settled even when the Daemon is unreachable, so nothing waits on it forever.
+    hydrated = true;
+    window.dispatchEvent(new Event(HYDRATED_EVENT));
+  }
+}
+
+async function applyServerState(): Promise<void> {
   const server = await getWebUiState();
   if (!server) return;
 
@@ -100,10 +110,15 @@ export async function hydrateWebUiStateFromServer(): Promise<void> {
   for (const [key, value] of Object.entries(server)) {
     rawSet(key, value);
   }
-  window.dispatchEvent(new Event(HYDRATED_EVENT));
 }
 
 const HYDRATED_EVENT = "aoe:web-ui-state-hydrated";
+let hydrated = false;
+
+/** Whether this page load's hydration has settled, successfully or not. */
+export function isWebUiStateHydrated(): boolean {
+  return hydrated;
+}
 
 /** Hydration isn't awaited before render, so a view that read its keys on mount re-reads here. */
 export function onWebUiStateHydrated(listener: () => void): () => void {

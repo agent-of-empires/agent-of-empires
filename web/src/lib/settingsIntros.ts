@@ -27,17 +27,16 @@ export function isSettingsIntroFolded(id: SettingsIntroId): boolean {
   return (safeGetItem(deviceKey(id)) ?? safeGetItem(introKey(id))) === FOLDED;
 }
 
-function setIntro(id: SettingsIntroId, value: string, readOnly: boolean): void {
-  if (readOnly) {
-    safeSetItem(deviceKey(id), value);
-    return;
-  }
+/** `readOnly` is undefined until the Daemon's about loads, so the choice goes to both keys. */
+function setIntro(id: SettingsIntroId, value: string, readOnly: boolean | undefined): void {
+  if (readOnly !== false) safeSetItem(deviceKey(id), value);
+  if (readOnly === true) return;
   safeSetItem(introKey(id), value);
-  // A choice made while read-only must not outlive one the Daemon now stores.
-  safeRemoveItem(deviceKey(id));
+  // On a writable dashboard, a choice made while read-only must not outlive one the Daemon stores.
+  if (readOnly === false) safeRemoveItem(deviceKey(id));
 }
 
-export function foldSettingsIntro(id: SettingsIntroId, readOnly: boolean): void {
+export function foldSettingsIntro(id: SettingsIntroId, readOnly: boolean | undefined): void {
   setIntro(id, FOLDED, readOnly);
 }
 

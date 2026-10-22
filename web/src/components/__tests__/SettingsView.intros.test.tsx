@@ -47,7 +47,12 @@ const renderTab = (tab: string, readOnly = false) =>
 const intro = () => screen.queryByRole("region", { name: "About this tab" });
 const about = () => screen.queryByRole("button", { name: "About this tab" });
 
-beforeEach(() => localStorage.clear());
+beforeEach(async () => {
+  localStorage.clear();
+  // Intros wait for this page load's hydration to settle; null is an unreachable Daemon.
+  vi.mocked(api.getWebUiState).mockResolvedValue(null);
+  await hydrateWebUiStateFromServer();
+});
 
 afterEach(() => {
   cleanup();
@@ -90,6 +95,10 @@ describe("Settings tab intros", () => {
     for (const id of ["worktree", "plugins", "structured-view"]) {
       expect(localStorage.getItem(KEY(id)), id).toBe("unfolded");
     }
+    // A hydration answered before the reset's write reached the Daemon must not fold it again.
+    vi.mocked(api.getWebUiState).mockResolvedValue({ [KEY("worktree")]: "folded" });
+    await act(() => hydrateWebUiStateFromServer());
+    expect(intro()).not.toBeNull();
   });
 
   it("re-reads the folds when the Daemon's web UI state arrives after the view mounted", async () => {
@@ -99,6 +108,53 @@ describe("Settings tab intros", () => {
     await act(() => hydrateWebUiStateFromServer());
     expect(intro()).toBeNull();
     expect(about()).not.toBeNull();
+  });
+
+  it("keeps an intro the user reopened open when the Daemon's same fold arrives later", async () => {
+    localStorage.setItem(KEY("worktree"), "folded");
+    renderTab("worktree");
+    await waitFor(() => expect(about()).not.toBeNull());
+    let respond: (state: Record<string, string>) => void = () => {};
+    vi.mocked(api.getWebUiState).mockReturnValue(new Promise((resolve) => (respond = resolve)));
+    const hydrating = hydrateWebUiStateFromServer();
+
+    fireEvent.click(about() as HTMLElement);
+    expect(intro()).not.toBeNull();
+    await act(async () => {
+      respond({ [KEY("worktree")]: "folded", [KEY("plugins")]: "folded" });
+      await hydrating;
+    });
+    expect(intro()).not.toBeNull();
+    expect(about()).toBeNull();
+  });
+
+  it("shows neither the intro nor About until this page load's hydration settles", async () => {
+    vi.resetModules();
+    const { SettingsView: FreshView } = await import("../SettingsView");
+    const sync = await import("../../lib/webUiSync");
+    localStorage.setItem(KEY("worktree"), "folded");
+    let respond: (state: Record<string, string> | null) => void = () => {};
+    vi.mocked(api.getWebUiState).mockReturnValue(new Promise((resolve) => (respond = resolve)));
+    const hydrating = sync.hydrateWebUiStateFromServer();
+    render(<FreshView onClose={() => {}} tab="worktree" onSelectTab={() => {}} onServerAboutRefresh={() => {}} />);
+    await waitFor(() => expect(screen.queryByText(/Loading settings/)).toBeNull());
+    expect(intro()).toBeNull();
+    expect(about()).toBeNull();
+    // An unreachable Daemon still settles it, so the stored fold shows.
+    await act(async () => {
+      respond(null);
+      await hydrating;
+    });
+    expect(about()).not.toBeNull();
+  });
+
+  it("writes a fold to both keys while the Daemon's read-only state is unknown", async () => {
+    // App passes `serverAbout?.read_only`, which is undefined until /api/about loads.
+    render(<SettingsView onClose={() => {}} tab="worktree" onSelectTab={() => {}} onServerAboutRefresh={() => {}} />);
+    await waitFor(() => expect(intro()).not.toBeNull());
+    fireEvent.click(screen.getByRole("button", { name: "Got it" }));
+    expect(localStorage.getItem(KEY("worktree"))).toBe("folded");
+    expect(localStorage.getItem("aoe-local-settings-intro-worktree")).toBe("folded");
   });
 
   it("keeps a read-only dashboard's fold on the device, where hydration can't undo it", async () => {
