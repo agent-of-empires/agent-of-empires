@@ -185,13 +185,15 @@ code_generation:
   docstrings:
     language: en-US
 
-# Issue enrichment intentionally disabled for now. Revisit once we have a
-# clearer sense of CodeRabbit's baseline behavior on real PRs.
+# Trial for duplicate and related-work detection (#4704). Suggestions only:
+# planning runs on a manual `@coderabbitai plan`, labels are never applied.
 issue_enrichment:
   auto_enrich:
-    enabled: false
+    enabled: true
   planning:
-    enabled: false
+    enabled: true
     auto_planning:
       enabled: false
       labels: []
+  labeling:
+    auto_apply_labels: false

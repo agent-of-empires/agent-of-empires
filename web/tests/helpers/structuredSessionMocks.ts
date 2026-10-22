@@ -22,13 +22,14 @@ const OBJECT_PATHS = new Set(["settings", "docker/status", "about", "system/upda
  *  but silent, so the session reads as connected; a spec that needs frames
  *  re-routes them afterwards (later registrations win). */
 export async function mockStructuredSessionApis(page: Page, opts: { id: string; title: string; projectPath?: string }) {
-  await page.route("**/api/login/status", (r) => r.fulfill({ json: { required: false, authenticated: true } }));
+  await page.route("**/api/login/status*", (r) => r.fulfill({ json: { required: false, authenticated: true } }));
   for (const path of BOOT_PATHS) {
     await page.route(`**/api/${path}`, (r) => r.fulfill({ json: OBJECT_PATHS.has(path) ? {} : [] }));
   }
   await page.route("**/api/sessions", (r) => {
     if (r.request().method() === "POST") return r.fulfill({ status: 400 });
     return r.fulfill({
+      headers: { "aoe-runtime-epoch": "mock-runtime", "aoe-runtime-revision": "1" },
       json: {
         sessions: [
           sessionResponse({

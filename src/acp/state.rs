@@ -125,7 +125,7 @@ pub struct ThinkingSignal {
     pub started_at: DateTime<Utc>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct RateLimitInfo {
     pub status: String,
     /// When the quota window clears, if the agent reported it.
@@ -361,6 +361,12 @@ impl BackgroundAgentStatus {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BackgroundTaskLaunch {
+    pub task_id: String,
+    pub tool_call_id: Option<String>,
+}
+
 /// One tool call a background sub-agent made, parsed from its transcript.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BackgroundAgentTool {
@@ -448,6 +454,9 @@ pub struct AcpState {
     pub session_notices: Vec<SessionNotice>,
     #[serde(default)]
     pub background_agents: Vec<BackgroundAgentRecord>,
+    /// Ids of running background tasks that are not sub-agents.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub background_tasks: Vec<String>,
 
     /// Whether the main turn is in flight. Dispatch (`acp::dispatch::decide`)
     /// and the queue drain gate on this directly, so it tracks only the main
@@ -673,6 +682,19 @@ pub enum Event {
         warning: Option<String>,
         ended_at: DateTime<Utc>,
     },
+    /// A background task that is not a sub-agent (Bash `run_in_background`)
+    /// started, from the tool result's `toolResponse.backgroundTaskId`. Its
+    /// end is read from the session transcript (`acp::task_transcript`).
+    BackgroundTaskStarted {
+        task_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tool_call_id: Option<String>,
+        description: String,
+    },
+    /// A background task reached a terminal state.
+    BackgroundTaskFinished {
+        task_id: String,
+    },
     /// The adapter runtime failed a prompt before emitting any transcript.
     PromptRuntimeError {
         message: String,
@@ -799,16 +821,17 @@ impl AcpState {
         }
     }
 
-    /// Whether any background sub-agent is still in flight. Keyed on
-    /// `ended_at`, not `status`: a terminal `BackgroundAgentCompleted` can
-    /// carry `status: Stalled` (the tailer's abort timeout gives up without a
-    /// clean `end_turn`), and that record is done like any other (#4001).
+    /// Whether any background sub-agent or task is still in flight. Agents
+    /// are keyed on `ended_at`, not `status`: a terminal
+    /// `BackgroundAgentCompleted` can carry `status: Stalled` (the tailer's
+    /// abort timeout gives up without a clean `end_turn`), and that record is
+    /// done like any other (#4001).
     pub fn has_active_background_agent(&self) -> bool {
-        self.background_agents.iter().any(|a| a.ended_at.is_none())
+        !self.background_tasks.is_empty()
+            || self.background_agents.iter().any(|a| a.ended_at.is_none())
     }
 
-    /// Apply a single event; returns the new `last_seq`.
-    pub fn apply_event(&mut self, event: Event) -> Result<u64, StateError> {
+    pub fn apply_event(&mut self, seq: u64, event: Event) -> Result<u64, StateError> {
         match event {
             Event::PlanUpdated { plan } => self.current_plan = Some(plan),
             Event::TodoListUpdated { todos } => self.todos = todos,
@@ -899,7 +922,7 @@ impl AcpState {
                 key,
             } => {
                 let notice = SessionNotice {
-                    id: notice_id(key.as_deref(), self.last_seq.saturating_add(1)),
+                    id: notice_id(key.as_deref(), seq),
                     severity,
                     title,
                     description,
@@ -1053,6 +1076,14 @@ impl AcpState {
                     }
                 }
             }
+            Event::BackgroundTaskStarted { task_id, .. } => {
+                if !self.background_tasks.contains(&task_id) {
+                    self.background_tasks.push(task_id);
+                }
+            }
+            Event::BackgroundTaskFinished { task_id } => {
+                self.background_tasks.retain(|id| *id != task_id);
+            }
             // Titles live on `Instance`; wakeups and monitors are read from the log.
             Event::SessionTitleSuggested { .. }
             | Event::ToolCallContent { .. }
@@ -1065,7 +1096,7 @@ impl AcpState {
             | Event::WakeupScheduled { .. }
             | Event::MonitorArmed { .. } => {}
         }
-        self.last_seq = self.last_seq.saturating_add(1);
+        self.last_seq = seq;
         self.updated_at = Utc::now();
         Ok(self.last_seq)
     }
@@ -1204,7 +1235,7 @@ mod tests {
     fn applied(events: impl IntoIterator<Item = Event>) -> AcpState {
         let mut s = fresh_state();
         for event in events {
-            s.apply_event(event).unwrap();
+            s.apply_event(s.last_seq.saturating_add(1), event).unwrap();
         }
         s
     }
@@ -1443,10 +1474,13 @@ mod tests {
     fn turn_flags_and_rate_limit_park_follow_their_edges() {
         let mut s = fresh_state();
         assert!(!s.turn_active);
-        s.apply_event(prompt("hi")).unwrap();
-        s.apply_event(Event::ThinkingStarted).unwrap();
+        s.apply_event(s.last_seq.saturating_add(1), prompt("hi"))
+            .unwrap();
+        s.apply_event(s.last_seq.saturating_add(1), Event::ThinkingStarted)
+            .unwrap();
         assert!(s.turn_active && s.thinking.is_some());
-        s.apply_event(stopped("end_turn")).unwrap();
+        s.apply_event(s.last_seq.saturating_add(1), stopped("end_turn"))
+            .unwrap();
         assert!(!s.turn_active && s.thinking.is_none());
 
         for terminal in [
@@ -1542,10 +1576,13 @@ mod tests {
         let mut s = fresh_state();
         let before = s.updated_at;
         let seq = s
-            .apply_event(Event::ModeSwitchFailed {
-                mode_id: "bypassPermissions".into(),
-                reason: "Mode bypassPermissions is not available.".into(),
-            })
+            .apply_event(
+                s.last_seq.saturating_add(1),
+                Event::ModeSwitchFailed {
+                    mode_id: "bypassPermissions".into(),
+                    reason: "Mode bypassPermissions is not available.".into(),
+                },
+            )
             .unwrap();
         assert_eq!(seq, 1);
         assert_eq!(
@@ -1554,10 +1591,13 @@ mod tests {
             "a failed switch changes nothing"
         );
         assert!(s.updated_at >= before);
-        let result = s.apply_event(Event::ApprovalResolved {
-            nonce: Nonce::new(),
-            decision: ApprovalDecision::Allow,
-        });
+        let result = s.apply_event(
+            s.last_seq.saturating_add(1),
+            Event::ApprovalResolved {
+                nonce: Nonce::new(),
+                decision: ApprovalDecision::Allow,
+            },
+        );
         assert!(matches!(result, Err(StateError::UnknownApprovalNonce(_))));
 
         // A rate-limit park ends on a live prompt, session, or organic stop.
@@ -1637,8 +1677,11 @@ mod tests {
 
         let mut richer = tool_call("tc-1");
         richer.name = "Write src/foo.rs".into();
-        s.apply_event(Event::ToolCallStarted { tool_call: richer })
-            .unwrap();
+        s.apply_event(
+            s.last_seq.saturating_add(1),
+            Event::ToolCallStarted { tool_call: richer },
+        )
+        .unwrap();
         let tool = s.in_flight_tool.as_ref().unwrap();
         assert_eq!(tool.name, "Write src/foo.rs", "richer fields still apply");
         assert_eq!(
@@ -1714,16 +1757,20 @@ mod tests {
         assert_eq!(agent.tools[0].name, "Read");
         assert_eq!(agent.last_tool.as_deref(), Some("Read"));
 
-        s.apply_event(Event::BackgroundAgentCompleted {
-            agent_id: "a1".into(),
-            status: BackgroundAgentStatus::Completed,
-            tools: vec![],
-            result: Some("done".into()),
-            warning: None,
-            ended_at: Utc::now(),
-        })
+        s.apply_event(
+            s.last_seq.saturating_add(1),
+            Event::BackgroundAgentCompleted {
+                agent_id: "a1".into(),
+                status: BackgroundAgentStatus::Completed,
+                tools: vec![],
+                result: Some("done".into()),
+                warning: None,
+                ended_at: Utc::now(),
+            },
+        )
         .unwrap();
-        s.apply_event(progress(9, vec![])).unwrap();
+        s.apply_event(s.last_seq.saturating_add(1), progress(9, vec![]))
+            .unwrap();
         let agent = &s.background_agents[0];
         assert_eq!(
             agent.status,
@@ -1803,14 +1850,40 @@ mod tests {
             let mut s = applied([launched()]);
             assert!(s.has_active_background_agent(), "{status:?}");
 
-            s.apply_event(bg_completed(status)).unwrap();
-            s.apply_event(bg_progress(BackgroundAgentStatus::Running, 9))
+            s.apply_event(s.last_seq.saturating_add(1), bg_completed(status))
                 .unwrap();
+            s.apply_event(
+                s.last_seq.saturating_add(1),
+                bg_progress(BackgroundAgentStatus::Running, 9),
+            )
+            .unwrap();
             let agent = &s.background_agents[0];
             assert_eq!(agent.status, status, "{status:?} must not reopen");
             assert!(agent.ended_at.is_some(), "{status:?}");
             assert!(!s.has_active_background_agent(), "{status:?}");
         }
+    }
+
+    /// A backgrounded command keeps the session busy after the turn that
+    /// started it ends, until its own finish event.
+    #[test]
+    fn a_background_task_holds_the_busy_signal_until_it_finishes() {
+        let started = |id: &str| Event::BackgroundTaskStarted {
+            task_id: id.into(),
+            tool_call_id: None,
+            description: "sleep".into(),
+        };
+        let finished = |id: &str| Event::BackgroundTaskFinished { task_id: id.into() };
+        let mut s = applied([prompt("go"), started("t-1"), started("t-2"), stopped("end")]);
+        assert!(!s.turn_active);
+        assert!(s.has_active_background_agent());
+
+        s.apply_event(s.last_seq.saturating_add(1), finished("t-1"))
+            .unwrap();
+        assert!(s.has_active_background_agent(), "t-2 still runs");
+        s.apply_event(s.last_seq.saturating_add(1), finished("t-2"))
+            .unwrap();
+        assert!(!s.has_active_background_agent());
     }
 
     /// #4001: `turn_active` gates prompt dispatch and the queue drain, not
@@ -1821,8 +1894,11 @@ mod tests {
         let mut s = applied([prompt("go"), launched()]);
         assert!(s.turn_active && s.has_active_background_agent());
 
-        s.apply_event(bg_completed(BackgroundAgentStatus::Completed))
-            .unwrap();
+        s.apply_event(
+            s.last_seq.saturating_add(1),
+            bg_completed(BackgroundAgentStatus::Completed),
+        )
+        .unwrap();
         assert!(
             s.turn_active,
             "the main turn's own Stopped never fired, so it is still live"
@@ -1839,8 +1915,11 @@ mod tests {
             "the display signal stays busy"
         );
 
-        s.apply_event(bg_completed(BackgroundAgentStatus::Completed))
-            .unwrap();
+        s.apply_event(
+            s.last_seq.saturating_add(1),
+            bg_completed(BackgroundAgentStatus::Completed),
+        )
+        .unwrap();
         assert!(!s.turn_active && !s.has_active_background_agent());
     }
 
@@ -1953,20 +2032,25 @@ mod tests {
         );
 
         let mut s = applied(adapter_events());
-        s.apply_event(Event::SessionCleared).unwrap();
+        s.apply_event(s.last_seq.saturating_add(1), Event::SessionCleared)
+            .unwrap();
         assert_eq!(s.config_options.len(), 2);
         assert!(s.available_commands[0].accepts_input);
         assert_eq!(s.available_modes.len(), 1);
         assert_eq!(s.current_mode_id.as_deref(), Some("plan"));
         assert!(s.usage.is_none() && s.current_plan.is_none());
 
-        s.apply_event(Event::ConfigOptionSwitchFailed {
-            config_id: "effort".into(),
-            value: "high".into(),
-            reason: "unsupported".into(),
-        })
+        s.apply_event(
+            s.last_seq.saturating_add(1),
+            Event::ConfigOptionSwitchFailed {
+                config_id: "effort".into(),
+                value: "high".into(),
+                reason: "unsupported".into(),
+            },
+        )
         .unwrap();
-        s.apply_event(switch_agent()).unwrap();
+        s.apply_event(s.last_seq.saturating_add(1), switch_agent())
+            .unwrap();
         assert!(s.config_options.is_empty() && s.config_option_switch_failed.is_none());
         assert!(s.available_commands.is_empty() && s.available_modes.is_empty());
         assert_eq!(s.current_mode_id, None);

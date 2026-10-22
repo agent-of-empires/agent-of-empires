@@ -23,6 +23,7 @@ use crate::common::{shim_path, shim_ready};
 
 fn spawn_config_with_shim_env(shim: PathBuf, env: Vec<(String, String)>) -> SpawnConfig {
     SpawnConfig {
+        launch_lease: None,
         provider_routing: Vec::new(),
         wrapper_substitution: None,
         agent_key: "claude".into(),
@@ -48,6 +49,7 @@ fn spawn_config_with_shim_env(shim: PathBuf, env: Vec<(String, String)>) -> Spaw
         stored_acp_session_id: None,
         fork_from: None,
         seed_history_replay: false,
+        prior_conversation: false,
         generation: 0,
         artifact_dir: None,
         sandbox_info: None,

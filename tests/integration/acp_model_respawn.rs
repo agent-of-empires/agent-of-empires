@@ -29,6 +29,7 @@ fn spawn_config(
     default_effort: Option<String>,
 ) -> SpawnConfig {
     SpawnConfig {
+        launch_lease: None,
         provider_routing: Vec::new(),
         wrapper_substitution: None,
         agent_key: "claude".into(),
@@ -54,6 +55,7 @@ fn spawn_config(
         stored_acp_session_id,
         fork_from: None,
         seed_history_replay: false,
+        prior_conversation: false,
         generation: 0,
         artifact_dir: None,
         sandbox_info: None,

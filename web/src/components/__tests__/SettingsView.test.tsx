@@ -32,9 +32,18 @@ describe("buildSidebar", () => {
       "updates",
       "telemetry",
       "logging",
+      "logs",
       "plugins",
       "cityhall",
     ]);
+  });
+});
+
+describe("buildSidebar read-only", () => {
+  it("omits the Logs tab", () => {
+    const ids = (readOnly: boolean) => buildSidebar(readOnly).flatMap((i) => (i.kind === "tab" ? [i.id] : []));
+    expect(ids(false)).toContain("logs");
+    expect(ids(true)).not.toContain("logs");
   });
 });
 

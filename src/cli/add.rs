@@ -162,6 +162,12 @@ pub struct AddArgs {
     #[arg(long = "model")]
     model: Option<String>,
 
+    /// Reasoning effort for the ACP agent (e.g., low, medium, high). Checked
+    /// against the agent's known thought-level choices when cached. Structured
+    /// view only.
+    #[arg(long = "effort")]
+    effort: Option<String>,
+
     /// Create the session in a fresh scratch directory under
     /// `<app_dir>/scratch/<id>/` instead of a project path. The directory is
     /// removed when the session is deleted (unless `aoe rm` is given
@@ -188,6 +194,10 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
     }
 
     crate::session::require_known_profile(profile)?;
+
+    if args.effort.as_deref().is_some_and(|e| e.trim().is_empty()) {
+        bail!("--effort cannot be empty");
+    }
 
     if args.scratch && args.path.is_some() {
         bail!(
@@ -271,6 +281,19 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
         );
     }
 
+    if let Some(effort) = args.effort.as_deref().map(str::trim) {
+        // The daemon records the option catalog under this key.
+        let agent = args
+            .agent
+            .as_deref()
+            .filter(|name| !name.is_empty())
+            .unwrap_or(&resolved_tool);
+        let choices = crate::acp::option_catalog::thought_level_choices(agent);
+        if let Some(warning) = check_effort_request(effort, wants_structured, agent, &choices)? {
+            eprintln!("warning: {warning}");
+        }
+    }
+
     if args.fork_from.is_some() {
         if explicit_worktree_branch(&args).is_some() || args.create_branch {
             bail!(
@@ -338,7 +361,7 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
             let resolve_extra = |path: &std::path::Path| {
                 let project = project_bases
                     .get(&crate::session::projects::canonical_key(
-                        &path.to_string_lossy(),
+                        path.to_string_lossy(),
                     ))
                     .map(String::as_str);
                 builder::resolve_base_branch(session_base, project, global_default)
@@ -672,47 +695,41 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
         }
     }
 
+    let explicit_effort = args
+        .effort
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+
+    if explicit_effort.is_some() && !instance.is_structured() {
+        cleanup_partial_session(
+            &path,
+            instance.worktree_info.as_ref(),
+            instance.workspace_info.as_ref(),
+            args.create_branch,
+            if instance.scratch {
+                Some(std::path::Path::new(&instance.project_path))
+            } else {
+                None
+            },
+            None,
+        );
+        bail!(
+            "--effort needs the structured view, but the ACP adapter is not installed.\n\
+             Run `aoe acp doctor --fix`, then re-run."
+        );
+    }
+
     if instance.is_structured() {
         let defaults = config.acp.acp_defaults_for(&agent_name);
         instance.agent_model = crate::session::config::resolve_spawn_model_effort(
             defaults,
             instance.agent_model.take(),
-            None,
+            explicit_effort.clone(),
         )
         .0;
-    }
-
-    if let Some(seed) = fork_seed {
-        match seed {
-            crate::session::ForkSeed::Terminal {
-                parent,
-                child_session_id,
-                unattributed_parent_agent,
-            } => {
-                // Only an unattributed parent needs this: the launch
-                // identity-checks a qualified one itself, and this path builds
-                // the child itself, so nothing else would hold it.
-                if let Some(parent_agent) = unattributed_parent_agent.as_deref() {
-                    let launched = crate::session::Instance::execution_agent_for(
-                        &instance.tool,
-                        instance.get_tool_command(),
-                        &config.session,
-                    )
-                    .map_err(anyhow::Error::msg)?;
-                    crate::session::fork::ensure_child_matches_parent_agent(
-                        Some(parent_agent),
-                        launched.name,
-                    )
-                    .map_err(anyhow::Error::msg)?;
-                }
-                instance.agent_session_id = Some(child_session_id);
-                instance.resume_intent = crate::session::ResumeIntent::Fork {
-                    from: parent.session_id.clone(),
-                };
-                instance.resume_binding = Some(*parent);
-            }
-            crate::session::ForkSeed::Structured { .. } => {}
-        }
+        instance.acp_effort = explicit_effort;
     }
 
     let use_sandbox = args.sandbox || args.sandbox_image.is_some();
@@ -749,6 +766,24 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
                 provider: None,
                 container_workdir: None,
             });
+        }
+    }
+
+    if let Some(seed) = fork_seed {
+        match seed {
+            crate::session::ForkSeed::Terminal {
+                parent,
+                child_session_id,
+                unattributed_parent_agent,
+            } => crate::session::fork::apply_terminal_fork_seed(
+                &mut instance,
+                &config.session,
+                profile,
+                *parent,
+                child_session_id,
+                unattributed_parent_agent.as_deref(),
+            )?,
+            crate::session::ForkSeed::Structured { .. } => {}
         }
     }
 
@@ -1196,6 +1231,37 @@ fn prompt_session_title(default_title: &str) -> Result<String> {
     })
 }
 
+/// Refuse `--effort` on a session that will not be structured, then check it
+/// against the agent's choices.
+fn check_effort_request(
+    effort: &str,
+    wants_structured: bool,
+    agent: &str,
+    choices: &[String],
+) -> Result<Option<String>> {
+    if !wants_structured {
+        bail!("--effort needs the structured view; pass --agent or --structured-view");
+    }
+    check_effort(agent, effort, choices)
+}
+
+/// Fail when the agent's thought-level choices are known and `effort` is not
+/// one of them; warn when they are not known yet.
+fn check_effort(agent: &str, effort: &str, choices: &[String]) -> Result<Option<String>> {
+    if choices.is_empty() {
+        return Ok(Some(format!(
+            "no known effort choices for ACP agent `{agent}`; passing `{effort}` through unchecked"
+        )));
+    }
+    if choices.iter().any(|choice| choice == effort) {
+        return Ok(None);
+    }
+    bail!(
+        "effort `{effort}` is not offered by ACP agent `{agent}`. Valid values: {}",
+        choices.join(", ")
+    );
+}
+
 fn cleanup_partial_session(
     path: &std::path::Path,
     worktree_info: Option<&crate::session::WorktreeInfo>,
@@ -1233,6 +1299,9 @@ fn cleanup_partial_session(
                 {
                     let _ =
                         git_wt.remove_worktree(std::path::Path::new(&repo.worktree_path), false);
+                    if created_branch && !repo.branch_preexisting {
+                        let _ = git_wt.delete_branch(&repo.branch);
+                    }
                 }
             }
         }
@@ -1444,7 +1513,8 @@ fn resolve_sandbox_image(
 #[cfg(test)]
 mod tests {
     use super::{
-        hooks_when_trust_declined, override_launch_binary, parse_repo_base, resolve_sandbox_image,
+        check_effort_request, hooks_when_trust_declined, override_launch_binary, parse_repo_base,
+        resolve_sandbox_image,
     };
     use crate::session::config::repo_config::TrustSurface;
     use crate::session::config::SessionConfig;
@@ -1930,6 +2000,100 @@ mod tests {
             );
         }
 
+        /// `aoe add --fork-from --tool <account>` is the #4347 workflow: the
+        /// child's own store must receive the parent's transcript and be the
+        /// one its binding records.
+        #[tokio::test]
+        #[serial]
+        async fn add_fork_carries_the_parent_onto_the_childs_store() {
+            let root = tempfile::tempdir().unwrap();
+            let _guard = crate::session::test_support::isolate_app_dir_at(root.path());
+            let _claude = crate::session::test_support::install_login_shell_path_command(
+                root.path(),
+                "claude",
+                "#!/bin/sh\nexit 1\n",
+            );
+            let home = dirs::home_dir().unwrap();
+            let project = tempfile::tempdir().unwrap();
+            let source = home.join("source");
+            let sid = "11111111-2222-3333-4444-555555555555";
+            let transcript = std::path::Path::new("projects")
+                .join(crate::session::capture::encode_claude_project_path(
+                    &project.path().to_string_lossy(),
+                ))
+                .join(format!("{sid}.jsonl"));
+            std::fs::create_dir_all(source.join(transcript.parent().unwrap())).unwrap();
+            std::fs::write(source.join(&transcript), "parent conversation\n").unwrap();
+            let storage = crate::session::Storage::new_unwatched("real").unwrap();
+            std::fs::write(
+                crate::session::get_profile_dir("real")
+                    .unwrap()
+                    .join("config.toml"),
+                "[session.custom_agents]\nclaude-b = \"claude\"\n\
+                 [session.agent_detect_as]\nclaude-b = \"claude\"\n\
+                 [session.agent_config_dir]\nclaude-b = \"~/destination\"\n",
+            )
+            .unwrap();
+            let parent_id = "parent-session-uuid";
+            storage
+                .update(|rows, _| {
+                    let mut parent =
+                        crate::session::Instance::new("parent", project.path().to_str().unwrap());
+                    parent.id = parent_id.to_string();
+                    parent.tool = "claude".into();
+                    parent.command = "claude".into();
+                    parent.agent_session_id = Some(sid.into());
+                    parent.agent_session_binding = Some(crate::session::ConversationBinding {
+                        session_id: sid.into(),
+                        provenance: crate::session::ConversationProvenance::Observed,
+                        transcript_path: None,
+                        execution: Some(crate::session::ExecutionBinding {
+                            agent: "claude".into(),
+                            stores: vec![source.clone()],
+                            configuration: Vec::new(),
+                            cwd: project.path().to_path_buf(),
+                            cwd_filesystem: "host".into(),
+                            filesystem: "host".into(),
+                            exported_default_store: None,
+                        }),
+                    });
+                    *rows = vec![parent];
+                    Ok(())
+                })
+                .unwrap();
+
+            let (profile, args) = dispatch_argv(&[
+                "aoe",
+                "add",
+                project.path().to_str().unwrap(),
+                "--fork-from",
+                parent_id,
+                "--tool",
+                "claude-b",
+                "-p",
+                "real",
+            ]);
+            super::super::run(&profile, args).await.unwrap();
+
+            let destination = home.join("destination");
+            assert_eq!(
+                std::fs::read_to_string(destination.join(&transcript)).unwrap(),
+                "parent conversation\n"
+            );
+            let rows = storage.load().unwrap();
+            let child = rows.iter().find(|row| row.tool == "claude-b").unwrap();
+            assert_eq!(
+                child
+                    .resume_binding
+                    .clone()
+                    .unwrap()
+                    .execution
+                    .unwrap()
+                    .stores,
+                vec![destination.canonicalize().unwrap()]
+            );
+        }
+
         #[tokio::test]
         #[serial]
         async fn add_refuses_unknown_profile_before_vivifying_it() {
@@ -1976,6 +2140,32 @@ mod tests {
                 msg.contains("Path does not exist"),
                 "a known profile must reach path validation, got: {msg}"
             );
+        }
+    }
+
+    #[test]
+    fn check_effort_request_gates_on_view_then_known_choices() {
+        let known = ["low".to_string(), "high".to_string()];
+        // (wants structured, choices, effort, error substring or warning substring)
+        let cases: [(bool, &[String], &str, Result<Option<&str>, &str>); 5] = [
+            (false, &known, "high", Err("structured view")),
+            (true, &known, "high", Ok(None)),
+            (true, &known, "ultra", Err("low, high")),
+            (true, &[], "ultra", Ok(Some("unchecked"))),
+            (true, &[], "high", Ok(Some("unchecked"))),
+        ];
+        for (structured, choices, effort, want) in cases {
+            let got = check_effort_request(effort, structured, "codex", choices);
+            match want {
+                Ok(None) => assert_eq!(got.unwrap(), None, "{effort}"),
+                Ok(Some(text)) => {
+                    assert!(got.unwrap().is_some_and(|w| w.contains(text)), "{effort}")
+                }
+                Err(text) => {
+                    let err = got.unwrap_err().to_string();
+                    assert!(err.contains(text), "{err}");
+                }
+            }
         }
     }
 }

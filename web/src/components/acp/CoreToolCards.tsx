@@ -22,6 +22,7 @@ import {
 } from "./ToolCardChrome";
 import { ReadFileResult } from "./ReadFileResult";
 import { ToolErrorBody } from "./ToolErrorBody";
+import { ToolOutputMedia } from "./ToolOutputMedia";
 
 const ICON = "h-3.5 w-3.5";
 
@@ -109,6 +110,7 @@ export function ReadToolCard({ tool, result }: ToolCardProps) {
   const ext = argPath?.match(/\.([a-z0-9]+)$/i)?.[1]?.toLowerCase();
   const text = result?.text ?? "";
   const content = text === COMPLETED_PLACEHOLDER ? "" : text;
+  const media = result?.output?.length ? result.output : undefined;
   const { fileRefSession } = useAcpFileRef();
   // An adapter that sends a Read no text leaves the card empty; the session still has the file.
   const fetchFrom =
@@ -130,10 +132,11 @@ export function ReadToolCard({ tool, result }: ToolCardProps) {
         </>
       }
       expanded={open}
-      onToggle={status === "err" || content || fetchFrom ? () => setOpen((v) => !v) : undefined}
+      onToggle={status === "err" || content || fetchFrom || media ? () => setOpen((v) => !v) : undefined}
       body={
         <ToolErrorBody status={status} errorText={result?.text}>
           {content && status !== "err" && <HighlightedBlock text={content} language={ext} maxLines={16} />}
+          {media && <ToolOutputMedia blocks={media} bare />}
           {fetchFrom && (
             <ReadFileResult
               sessionId={fetchFrom}

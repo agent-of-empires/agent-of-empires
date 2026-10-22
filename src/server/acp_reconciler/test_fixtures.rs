@@ -13,6 +13,7 @@ use crate::session::{Instance, View};
 pub(super) fn structured_instance(id: &str, project_path: &str) -> Instance {
     let mut inst = Instance::new(id, project_path);
     inst.id = id.to_string();
+    inst.source_profile = "default".into();
     inst.view = View::Structured;
     inst.agent_name = Some("aoe-no-such-agent-1027".to_string());
     inst
@@ -24,6 +25,10 @@ pub(super) fn test_state(id: &str) -> (AppDirGuard, Arc<AppState>, tempfile::Tem
     let home = crate::session::test_support::isolate_app_dir();
     let project = tempfile::TempDir::new().unwrap();
     let inst = structured_instance(id, &project.path().to_string_lossy());
+    crate::server::test_support::seed_instances_on_disk_for_test(
+        &inst.source_profile,
+        vec![inst.clone()],
+    );
     let state = crate::server::test_support::build_test_app_state(vec![inst]);
     (home, state, project)
 }

@@ -58,6 +58,8 @@ pub(super) enum ClientCmd {
     /// `Supervisor::attach` once, right after the connection is up, so
     /// tracking resumes instead of the panel showing them as detached.
     ResumeBackgroundTailing(Vec<(String, String)>),
+    /// Re-tail the exact background task launches a previous daemon left open.
+    ResumeTaskTailing(Vec<crate::acp::state::BackgroundTaskLaunch>),
     #[cfg(test)]
     FlushForTest(oneshot::Sender<()>),
     CloseSession(oneshot::Sender<super::close::CloseSessionOutcome>),
@@ -79,6 +81,8 @@ pub(super) enum ConnectMode {
         /// advertises the fork capability, the handshake sends
         /// `session/fork` instead of `session/new` / `session/load`.
         fork_from: Option<String>,
+        /// A conversation existed before this launch, even without a stored id.
+        prior_conversation: bool,
     },
     Resume {
         acp_session_id: String,

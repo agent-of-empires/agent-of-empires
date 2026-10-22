@@ -247,16 +247,14 @@ pub(crate) fn preassign_opencode_session_id(
 }
 
 /// Forks `parent_id` in the store the launch selects and returns the child the
-/// store minted. `None` leaves the fork refused rather than started unforked.
+/// store minted. An error leaves the fork refused rather than started unforked.
 pub(crate) fn fork_opencode_session_id(
     project_path: &str,
     command: std::process::Command,
     parent_id: &str,
-) -> Option<String> {
-    let Some(parent_id) = super::validated_session_id(parent_id.to_owned()) else {
-        tracing::warn!(target: "session.capture", %parent_id, "refusing to fork an invalid OpenCode session id");
-        return None;
-    };
+) -> Result<String> {
+    let parent_id = super::validated_session_id(parent_id.to_owned())
+        .context("refusing to fork an invalid OpenCode session id")?;
     let project_path = project_path.to_owned();
     with_serve(
         &project_path,
@@ -267,11 +265,10 @@ pub(crate) fn fork_opencode_session_id(
             Box::pin(async move { client.fork_session(&parent_id).await })
         },
     )
-    .map_err(|e| {
-        tracing::warn!(target: "session.capture", error = %e, "opencode session fork failed");
+    .and_then(|id| {
+        super::validated_session_id(id)
+            .context("OpenCode fork returned an invalid child session id")
     })
-    .ok()
-    .and_then(super::validated_session_id)
 }
 
 #[cfg(test)]

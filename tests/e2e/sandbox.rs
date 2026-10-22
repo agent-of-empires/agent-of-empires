@@ -1,6 +1,10 @@
+use std::io::Write;
+use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
+
 use serial_test::parallel;
 
-use crate::harness::TuiTestHarness;
+use crate::harness::{agent_session_id_of, require_tmux, TuiTestHarness};
 
 /// Exercises `aoe add --sandbox` which builds the full container config.
 /// This would have caught the duplicate mount points bug (commit 92d2e53).
@@ -184,4 +188,371 @@ fn sandbox_reclaim_reports_before_it_removes() {
     assert!(orphan.exists(), "an unproven store must survive `--delete`");
     assert!(owned.exists(), "a claimed store must survive the pass");
     assert!(fresh.exists(), "a store being seeded right now was swept");
+}
+
+const CAPTURE_DEADLINE: Duration = Duration::from_secs(60);
+
+/// Stands in for Codex inside the container. It publishes a rollout under the
+/// per-session store mounted at `$CODEX_HOME`, which is what the poller reads,
+/// and records the id it chose, via rename so the host never reads a partial value.
+const CODEX_SHIM_DOCKERFILE: &str = r#"FROM alpine:3
+RUN printf '%s\n' '#!/bin/sh' \
+  'id=$(cat /proc/sys/kernel/random/uuid)' \
+  'dir="${CODEX_HOME:?}/sessions/2026/01/01"' \
+  'mkdir -p "$dir"' \
+  'printf "{\"type\":\"session_meta\",\"payload\":{\"id\":\"%s\",\"cwd\":\"%s\"}}\n" "$id" "$PWD" > "$dir/rollout-2026-01-01T00-00-00-$id.jsonl"' \
+  'printf "%s" "$id" > "$CODEX_HOME/published-id.tmp"' \
+  'mv "$CODEX_HOME/published-id.tmp" "$CODEX_HOME/published-id"' \
+  'exec sleep 600' > /usr/local/bin/codex \
+ && chmod +x /usr/local/bin/codex
+"#;
+
+/// Removes the sessions' containers and this invocation's image on every exit
+/// path. Create it before building so a failed build is also torn down.
+struct SandboxCleanup {
+    image: String,
+    ids: Vec<String>,
+}
+
+impl SandboxCleanup {
+    /// A tag no concurrent invocation or pre-existing image shares.
+    fn new() -> Self {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock before epoch")
+            .as_nanos();
+        Self {
+            image: format!("aoe-e2e-codex-shim-{}-{nanos}", std::process::id()),
+            ids: Vec::new(),
+        }
+    }
+}
+
+impl Drop for SandboxCleanup {
+    fn drop(&mut self) {
+        for id in &self.ids {
+            let _ = Command::new("docker")
+                .args(["rm", "-f", &format!("aoe-sandbox-{}", &id[..8])])
+                .output();
+        }
+        let _ = Command::new("docker")
+            .args(["rmi", "-f", &self.image])
+            .output();
+    }
+}
+
+fn build_codex_shim_image(image: &str) {
+    let mut build = Command::new("docker")
+        .args(["build", "-q", "-t", image, "-"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn docker build");
+    build
+        .stdin
+        .take()
+        .expect("docker build stdin")
+        .write_all(CODEX_SHIM_DOCKERFILE.as_bytes())
+        .expect("write Dockerfile");
+    let out = build.wait_with_output().expect("docker build");
+    assert!(
+        out.status.success(),
+        "docker build failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// Two sandboxed Codex sessions in one profile each capture the id their own
+/// container published (#4157). A log-only check would miss the original bug:
+/// the ambiguous-store deferral is a warn and the session still starts.
+///
+/// Requires a running Docker daemon; marked `#[ignore]` for CI.
+#[test]
+#[parallel]
+#[ignore = "requires Docker daemon"]
+fn two_sandboxed_codex_sessions_capture_their_own_ids() {
+    require_tmux!();
+
+    let mut h = TuiTestHarness::new_in_tmp("sandbox_codex_capture");
+    let mut cleanup = SandboxCleanup::new();
+    build_codex_shim_image(&cleanup.image);
+
+    let mut ids = Vec::new();
+    for name in ["codex-A", "codex-B"] {
+        let project = h.home_path().join(name);
+        std::fs::create_dir_all(&project).expect("mkdir project");
+        let id = h.add_session(&[
+            project.to_str().unwrap(),
+            "-t",
+            name,
+            "-c",
+            "codex",
+            "--sandbox",
+            "--sandbox-image",
+            &cleanup.image,
+        ]);
+        cleanup.ids.push(id.clone());
+        ids.push(id);
+    }
+    for id in &ids {
+        h.run_cli_ok(&["session", "start", id]);
+    }
+
+    let published = |id: &str| {
+        h.home_path()
+            .join(".codex/sandbox-v2")
+            .join(id)
+            .join("published-id")
+    };
+    let deadline = Instant::now() + CAPTURE_DEADLINE;
+    let expected: Vec<String> = ids
+        .iter()
+        .map(|id| loop {
+            if let Ok(published_id) = std::fs::read_to_string(published(id)) {
+                break published_id;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the shim in {id} never published an id"
+            );
+            std::thread::sleep(Duration::from_millis(100));
+        })
+        .collect();
+    assert_ne!(
+        expected[0], expected[1],
+        "the shims must publish distinct ids"
+    );
+
+    // A bare CLI launch exits with its poller, so the TUI hosts it.
+    h.spawn_tui();
+    h.wait_for_ready();
+
+    loop {
+        let sessions = h.try_read_sessions();
+        let captured: Vec<Option<String>> = ids
+            .iter()
+            .map(|id| agent_session_id_of(&sessions, id))
+            .collect();
+        if captured.iter().all(Option::is_some) {
+            for ((id, want), got) in ids.iter().zip(&expected).zip(&captured) {
+                assert_eq!(got.as_deref(), Some(want.as_str()), "session {id}");
+            }
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "sessions never captured their ids: {captured:?}"
+        );
+        std::thread::sleep(Duration::from_millis(200));
+    }
+}
+
+#[tokio::test]
+#[parallel]
+async fn native_purge_never_starts_the_managed_container() {
+    use agent_of_empires::{daemon::DaemonClient, session::Instance};
+    use std::{fs, path::PathBuf, process::Command, time::Duration};
+    crate::harness::require_tmux!();
+    const IMAGE: &str = "ghcr.io/agent-of-empires/aoe-sandbox:latest";
+    const HOST: &str = "unix:///var/run/docker.sock";
+    fn docker(args: &[&str]) -> std::io::Result<Option<std::process::Output>> {
+        let mut command = Command::new("docker");
+        command
+            .args(args)
+            .env("DOCKER_HOST", HOST)
+            .env_remove("DOCKER_CONTEXT")
+            .env_remove("DOCKER_TLS")
+            .env_remove("DOCKER_TLS_VERIFY");
+        agent_of_empires::process::run_with_timeout(&mut command, Duration::from_secs(30))
+    }
+    if !docker(&["image", "inspect", IMAGE])
+        .ok()
+        .flatten()
+        .is_some_and(|out| out.status.success())
+    {
+        eprintln!(
+            "Skipping container purge: local Docker or the cached sandbox image is unavailable"
+        );
+        return;
+    }
+    let mut h = TuiTestHarness::new_in_tmp("native_purge_entrypoint");
+    for (key, value) in [
+        ("DOCKER_HOST", HOST),
+        ("DOCKER_CONTEXT", ""),
+        ("DOCKER_TLS", ""),
+        ("DOCKER_TLS_VERIFY", ""),
+        ("AGENT_OF_EMPIRES_PROFILE", "default"),
+    ] {
+        h.set_env(key, value);
+    }
+    h.stop_daemon_on_drop();
+    let app = crate::harness::app_dir_in(h.home_path());
+    let config_path = app.join("config.toml");
+    let mut config = fs::read_to_string(&config_path).unwrap();
+    config.push_str("\n[sandbox]\ncontainer_runtime = \"docker\"\n");
+    fs::write(config_path, config).unwrap();
+    let project = h.project_path();
+    {
+        let repository = git2::Repository::init(&project).unwrap();
+        let signature = git2::Signature::now("Test", "test@example.invalid").unwrap();
+        let tree_id = repository.index().unwrap().write_tree().unwrap();
+        let tree = repository.find_tree(tree_id).unwrap();
+        repository
+            .commit(Some("HEAD"), &signature, &signature, "initial", &tree, &[])
+            .unwrap();
+    }
+    let added = h.run_cli(&[
+        "add",
+        project.to_str().unwrap(),
+        "--worktree",
+        "purge-entrypoint",
+        "--new-branch",
+        "--tool",
+        "claude",
+        "--sandbox-image",
+        IMAGE,
+    ]);
+    assert!(
+        added.status.success(),
+        "{}",
+        String::from_utf8_lossy(&added.stderr)
+    );
+    let rows_path = app.join("profiles/default/sessions.json");
+    let mut rows: Vec<Instance> = serde_json::from_slice(&fs::read(&rows_path).unwrap()).unwrap();
+    let row = &mut rows[0];
+    assert!(row.worktree_info.as_ref().unwrap().managed_by_aoe);
+    let worktree = PathBuf::from(&row.project_path);
+    let control = h.home_path().join("container-control");
+    fs::create_dir(&control).unwrap();
+    fs::write(worktree.join("owned-data"), "keep until runtime teardown").unwrap();
+    struct OwnedContainer {
+        name: String,
+        worktree: PathBuf,
+        control: PathBuf,
+    }
+    impl Drop for OwnedContainer {
+        fn drop(&mut self) {
+            let Some(output) = docker(&["container", "inspect", &self.name])
+                .ok()
+                .flatten()
+                .filter(|output| output.status.success())
+            else {
+                return;
+            };
+            let Ok(values) = serde_json::from_slice::<Vec<serde_json::Value>>(&output.stdout)
+            else {
+                return;
+            };
+            let Some(value) = values.first() else {
+                return;
+            };
+            let Some(mounts) = value["Mounts"].as_array() else {
+                return;
+            };
+            if [&self.worktree, &self.control].iter().all(|path| {
+                mounts
+                    .iter()
+                    .any(|mount| mount["Source"].as_str() == path.to_str())
+            }) {
+                if let Some(id) = value["Id"].as_str() {
+                    let _ = docker(&["rm", "-fv", id]);
+                }
+            }
+        }
+    }
+    let sandbox = row.sandbox_info.as_mut().unwrap();
+    let owned = OwnedContainer {
+        name: sandbox.container_name.clone(),
+        worktree: worktree.clone(),
+        control: control.clone(),
+    };
+    let work_mount = format!("type=bind,source={},target=/work", worktree.display());
+    let control_mount = format!("type=bind,source={},target=/control", control.display());
+    let created = docker(&[
+        "create",
+        "--name",
+        &owned.name,
+        "--entrypoint",
+        "/bin/sh",
+        "--mount",
+        &work_mount,
+        "--mount",
+        &control_mount,
+        "--workdir",
+        "/work",
+        IMAGE,
+        "-c",
+        "printf 'started\\n' >> /control/starts; exec sleep infinity",
+    ])
+    .unwrap()
+    .unwrap();
+    assert!(
+        created.status.success(),
+        "{}",
+        String::from_utf8_lossy(&created.stderr)
+    );
+    let id = String::from_utf8(created.stdout).unwrap().trim().to_owned();
+    sandbox.container_id = Some(id.clone());
+    sandbox.container_workdir = Some("/work".into());
+    let session_id = row.id.clone();
+    fs::write(&rows_path, serde_json::to_vec(&rows).unwrap()).unwrap();
+    let started = h.run_cli(&["serve", "--core-only", "--daemon"]);
+    assert!(
+        started.status.success(),
+        "{}",
+        String::from_utf8_lossy(&started.stderr)
+    );
+    let sdk = DaemonClient::new_unix(app.join("daemon/api.sock")).unwrap();
+    let epoch = sdk.runtime_info().await.unwrap().epoch;
+    let http = reqwest::Client::builder()
+        .unix_socket(app.join("daemon/api.sock"))
+        .no_proxy()
+        .timeout(Duration::from_secs(30))
+        .build()
+        .unwrap();
+    let response = http
+        .delete(format!("http://localhost/api/sessions/{session_id}"))
+        .header(agent_of_empires::daemon::RUNTIME_EPOCH_HEADER, epoch)
+        .json(
+            &serde_json::json!({"delete_worktree":true,"delete_branch":true,
+                                 "delete_sandbox":true,"force_delete":true}),
+        )
+        .send()
+        .await
+        .unwrap();
+    let status = response.status();
+    let outcome: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(status, reqwest::StatusCode::OK, "{outcome}");
+    assert_eq!(
+        outcome["cleanup_errors"],
+        serde_json::json!([]),
+        "{outcome}"
+    );
+    assert!(
+        !control.join("starts").exists(),
+        "purge executed the managed container entrypoint"
+    );
+    assert!(!worktree.exists(), "purge left the managed worktree behind");
+    let filter = format!("id={id}");
+    let remaining = docker(&[
+        "container",
+        "ls",
+        "--all",
+        "--quiet",
+        "--no-trunc",
+        "--filter",
+        &filter,
+    ])
+    .unwrap()
+    .unwrap();
+    assert!(
+        remaining.status.success(),
+        "{}",
+        String::from_utf8_lossy(&remaining.stderr)
+    );
+    assert!(
+        remaining.stdout.is_empty(),
+        "purge retained its managed container"
+    );
 }

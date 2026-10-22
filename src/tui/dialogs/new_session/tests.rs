@@ -428,25 +428,31 @@ fn yolo_toggles_on_its_own_row_independently_of_the_sandbox() {
 }
 
 #[test]
+#[serial_test::serial]
 fn the_sandbox_image_always_submits_whatever_the_field_holds() {
-    let default_image = crate::containers::get_container_runtime().effective_default_image();
-    // (sandbox on?, image field, submitted image)
-    let cases: &[(bool, Option<&str>, &str)] = &[
-        (true, Some("custom/image:tag"), "custom/image:tag"),
-        (true, None, &default_image),
-        (true, Some(""), ""),
-        (false, Some("custom/image:tag"), "custom/image:tag"),
-    ];
-    for (sandbox, image, want) in cases {
-        let mut dialog = sandboxed_dialog();
-        dialog.sandbox_enabled = *sandbox;
+    let temp_home = tempfile::tempdir().expect("temp home");
+    let _home = crate::session::test_support::isolate_home(temp_home.path());
+    let project = temp_home.path().join("project");
+    fs::create_dir(&project).expect("project directory");
+    for (sandbox, image, want) in [
+        (true, "custom/image:tag", "custom/image:tag"),
+        (true, "  custom/image:tag  ", "custom/image:tag"),
+        (true, "", ""),
+        (false, "custom/image:tag", "custom/image:tag"),
+    ] {
+        let mut dialog = NewSessionDialog::new_with_config(
+            vec!["claude"],
+            project.display().to_string(),
+            Config::default(),
+        );
+        dialog.docker_available = true;
+        dialog.sandbox_enabled = sandbox;
         dialog.sandbox_dirty = true;
-        if let Some(image) = image {
-            dialog.sandbox_image = Input::new(image.to_string());
-        }
+        dialog.sandbox_image = Input::new(image.to_string());
         let data = submitted(dialog.handle_key(key(KeyCode::Enter)));
-        assert_eq!(data.sandbox, *sandbox);
-        assert_eq!(data.sandbox_image, *want);
+        assert_eq!(data.path, project.display().to_string());
+        assert_eq!(data.sandbox, sandbox);
+        assert_eq!(data.sandbox_image, want);
     }
 }
 
@@ -1163,6 +1169,64 @@ fn branch_picker_opens_for_reachable_repo_paths() {
         );
         assert!(dialog.error_message.is_none());
     }
+}
+
+#[test]
+#[serial_test::serial]
+fn branch_picker_in_attach_mode_lists_only_branches_with_a_worktree() {
+    let temp_home = tempfile::tempdir().expect("temp home");
+    let _home = crate::session::test_support::isolate_home(temp_home.path());
+    let repo = branch_picker_repo_in(temp_home.path());
+    let git = |args: &[&str]| {
+        let out = std::process::Command::new("git")
+            .args(args)
+            .current_dir(&repo)
+            .output()
+            .expect("git");
+        assert!(out.status.success(), "git {args:?}");
+    };
+    git(&["branch", "no-worktree"]);
+    let linked = temp_home.path().join("linked");
+    git(&[
+        "worktree",
+        "add",
+        "-b",
+        "has-worktree",
+        linked.to_str().unwrap(),
+    ]);
+
+    let picker_items = |create_new_branch: bool, field: usize| {
+        let mut dialog = worktree_config_dialog(repo.to_string_lossy().to_string());
+        dialog.create_new_branch = create_new_branch;
+        dialog.worktree_config_focused_field = field;
+        dialog.handle_key(ctrl_key(KeyCode::Char('p')));
+        assert!(dialog.branch_picker.is_active());
+        dialog
+            .branch_picker
+            .filtered_items()
+            .into_iter()
+            .cloned()
+            .collect::<Vec<_>>()
+    };
+
+    let attach = picker_items(false, 0);
+    assert!(attach.contains(&"has-worktree".to_string()), "{attach:?}");
+    assert!(!attach.contains(&"no-worktree".to_string()), "{attach:?}");
+    for (create, field) in [(true, 0), (false, WT_BASE_BRANCH_FIELD)] {
+        let all = picker_items(create, field);
+        assert!(all.contains(&"no-worktree".to_string()), "{all:?}");
+    }
+
+    // A multi-repo workspace builds a new worktree per repo, so attach mode
+    // keeps the full branch list there.
+    let mut dialog = worktree_config_dialog(repo.to_string_lossy().to_string());
+    dialog.create_new_branch = false;
+    dialog.workspace_repos = vec!["/tmp/other".to_string()];
+    dialog.handle_key(ctrl_key(KeyCode::Char('p')));
+    assert!(dialog
+        .branch_picker
+        .filtered_items()
+        .contains(&&"no-worktree".to_string()));
 }
 
 #[test]

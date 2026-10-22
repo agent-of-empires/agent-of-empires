@@ -1,7 +1,7 @@
 import { memo, useRef, useState } from "react";
 import { Pin } from "lucide-react";
 import type { Workspace } from "../../lib/types";
-import { renameSession } from "../../lib/api";
+import { renameSession, type RuntimeCursor, type SessionMutation } from "../../lib/api";
 import { isSessionActive } from "../../lib/session";
 import { useIdleDecayWindowMs } from "../../lib/idleDecay";
 import { sessionRowChromeClass } from "../../lib/sessionRowChrome";
@@ -19,6 +19,9 @@ import { useLongPress } from "./useLongPress";
 
 export interface SessionRowProps extends SessionActionHandlers {
   workspace: Workspace;
+  observedById: Record<string, RuntimeCursor>;
+  runtimeEpoch: string | null;
+  onSessionMutation: (mutation: SessionMutation) => void;
   isActive: boolean;
   isSelected: boolean;
   onActivate: RowActivate;
@@ -33,7 +36,7 @@ export const SessionRow = memo(function SessionRow(props: SessionRowProps) {
   const idleDecayWindowMs = useIdleDecayWindowMs();
   const sessionColorsEnabled = useSessionColorsEnabled();
   const compact = useSidebarCompact();
-  const { model, setNotify, setColor } = useSessionRowModel(workspace, props.optimistic, isActive);
+  const { model, setNotify, setColor } = useSessionRowModel(workspace, props.optimistic, isActive, props);
   const { label, sessionId, isDeleting, navigationSession } = model;
 
   const [renaming, setRenaming] = useState(false);
@@ -56,6 +59,7 @@ export const SessionRow = memo(function SessionRow(props: SessionRowProps) {
     if (!trimmed || trimmed === model.sessionTitle || !sessionId) return;
     const result = await renameSession(sessionId, trimmed);
     if (result.ok) {
+      props.onSessionMutation(result);
       // The title persisted; a tmux rekey warning is informational.
       result.warnings?.forEach((warning) => reportInfo(warning));
     } else {

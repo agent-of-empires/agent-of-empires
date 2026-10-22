@@ -5,6 +5,7 @@ import type { KeyboardEvent as ReactKeyboardEvent } from "react";
 const drafts = new Map<string, string>();
 
 interface Props {
+  readOnly: boolean;
   draftKey: string;
   /** Soft keyboard height above the home-indicator inset, which the sheet adds since its parent drops it. */
   bottomInset: number;
@@ -17,7 +18,7 @@ interface Props {
  * A native textarea for writing a prompt with autocorrect, dictation, and long-press paste, delivered as one paste.
  * It is uncontrolled so a React re-render never rewrites text iOS dictation is still inserting.
  */
-export function TerminalComposeSheet({ draftKey, bottomInset, onSubmit, onClose }: Props) {
+export function TerminalComposeSheet({ draftKey, bottomInset, readOnly, onSubmit, onClose }: Props) {
   const textRef = useRef<HTMLTextAreaElement>(null);
   const dialogRef = useRef<HTMLDivElement>(null);
   const [empty, setEmpty] = useState(() => !drafts.get(draftKey)?.trim());
@@ -40,7 +41,7 @@ export function TerminalComposeSheet({ draftKey, bottomInset, onSubmit, onClose 
 
   const deliver = (submit: boolean, keepTyping = !submit) => {
     const text = textRef.current?.value ?? "";
-    if (!text.trim() || !onSubmit(text, submit)) return;
+    if (readOnly || !text.trim() || !onSubmit(text, submit)) return;
     drafts.delete(draftKey);
     // A tapped Send drops the keyboard; Insert and the hardware chord keep typing in the terminal.
     if (!keepTyping) textRef.current?.blur();
@@ -107,7 +108,7 @@ export function TerminalComposeSheet({ draftKey, bottomInset, onSubmit, onClose 
           <span className="flex-1" />
           <button
             type="button"
-            disabled={empty}
+            disabled={readOnly || empty}
             className={`${action} border border-surface-700 text-text-primary active:bg-surface-800`}
             onClick={() => deliver(false)}
           >
@@ -115,7 +116,7 @@ export function TerminalComposeSheet({ draftKey, bottomInset, onSubmit, onClose 
           </button>
           <button
             type="button"
-            disabled={empty}
+            disabled={readOnly || empty}
             className={`${action} px-4 font-semibold bg-brand-600 text-white active:bg-brand-700`}
             onClick={() => deliver(true)}
           >

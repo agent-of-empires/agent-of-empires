@@ -4,6 +4,9 @@ Explicit resume and fork against a qualified conversation require the native age
 
 Runtime conversation changes such as `/clear`, `/new`, fork, continue, or a fresh pane generation rotate the recorded identity when the native agent publishes the change. The old identity and any artifact predating the launch boundary cannot be recaptured after an AoE process restart.
 
+Physical launch and pane adoption decisions probe the exact tmux name live.
+A cached tmux session snapshot cannot suppress recreation of a missing pane.
+
 ## Automatic capture matrix
 
 | Agent | Host terminal | Sandboxed terminal | Authoritative source |
@@ -123,9 +126,12 @@ A fork starts a new, independent session from an existing session's conversation
 - **Web**: **Fork session** on the sidebar context menu of a forkable session.
 - **CLI**: `aoe add --fork-from <session-id-or-title>`.
 
-The fork inherits the parent tool, group, working directory, and conversation binding. A qualified binding has already established the native agent and store through a qualified publication, import, or explicit recovery assertion. A raw or preallocated ID is insufficient; status detection and matching tool labels grant no authority. A raw ID that migration left unqualified is not a reason to refuse: a fork of it launches against the store current configuration resolves, under the same agent the parent row resolves to, because nothing recorded the store or the tool its parent used. A child asked for under another agent is refused before dispatch, whatever it is asked for by name. A conflicting native command or user-supplied resume/fork selector is refused before dispatch whatever the binding, and for a qualified binding so is a different tool, without clearing the pending fork. `--fork-from` cannot be combined with `--worktree` / `--new-branch` or `--sandbox` / `--sandbox-image`.
+The fork inherits the parent tool, group, working directory, and conversation binding. A qualified binding has already established the native agent and store through a qualified publication, import, or explicit recovery assertion. A raw or preallocated ID is insufficient; status detection and matching tool labels grant no authority. A raw ID that migration left unqualified is not a reason to refuse: a fork of it launches against the store current configuration resolves, under the same agent the parent row resolves to, because nothing recorded the store or the tool its parent used. A child asked for under another agent is refused before dispatch, whatever it is asked for by name. A Claude child whose tool resolves to a different store than the parent's (for example a custom agent with its own `agent_config_dir`) gets the parent's transcript copied into that store, and its binding records that store; the fork is refused if the transcript cannot be copied. A conflicting native command or user-supplied resume/fork selector is refused before dispatch whatever the binding, and for a qualified binding so is a different tool, without clearing the pending fork. `--fork-from` cannot be combined with `--worktree` / `--new-branch` or `--sandbox` / `--sandbox-image`.
 
 The child gets its own AoE ID and native conversation. The parent row and transcript remain unchanged.
+
+After a Claude terminal fork copies a transcript to a different physical store, the child's prepared launch determines credential routing. The parent's default-store export provenance does not carry over.
+
 Current-generation OpenCode store forks validate the returned child in the prepared active store after the short-lived server is stopped, before adoption. Local control requests bypass ambient proxies; provider traffic keeps the selected environment. Shutdown preserves the process group's grace period even if a shim exits first, then escalates and bounds direct-child reaping.
 Launch success requires confirmation that the adopted child is durably published. A failed confirmation refuses the launch. If adoption was already saved, retry opens that child instead of forking again.
 A returned parent, missing child, or unsupported route preserves the pending fork.
@@ -133,7 +139,7 @@ Automatic recovery still depends on the agent's capture capability and supported
 
 Forking needs an agent that can branch a conversation: claude, codex, opencode, pi, and prime-agent in the supported managed contexts, and the Claude adapter for structured sessions. Resume-only agents (gemini, vibe, copilot) and agents without resume in AoE (cursor, droid, kiro, qwen) hide or refuse the action.
 
-Pi terminal forks require the same working directory and an attested host `pi` on `PATH` that supports both `--fork` and `--session-id`. AoE assigns the child id before launch. A sandboxed Pi, an unattestable wrapper, or a Pi without either flag refuses the fork rather than creating an untracked conversation. The child copies the parent's saved transcript, starting from the last persisted message. Forking into a new worktree is not supported for Pi.
+Pi terminal forks require the same working directory and an attested host `pi` on `PATH` that supports both `--fork` and `--session-id`. AoE assigns the child id before launch. A sandboxed Pi, an unattestable wrapper, or a Pi without either flag refuses the fork rather than creating an untracked conversation. The child copies the parent's saved transcript, starting from the last persisted message. Stopping the child saves its launch-scoped transcript before clearing publication evidence; later starts resume that exact child rather than forking the parent again. Forking into a new worktree is not supported for Pi.
 
 ## Swapping the engine on a restart
 
@@ -165,7 +171,7 @@ The list hides conversations not worth importing: ones AoE already owns, scratch
 
 ### Claude
 
-Claude conversations come from the Claude Code store on disk (under `$CLAUDE_CONFIG_DIR` or `~/.claude/projects`). The tab reads `CLAUDE_CONFIG_DIR` from AoE's own process environment and consults neither `agent_config_dir` nor a recorded store, so a conversation held in the store the entry points at is not listed.
+Claude conversations come from the Claude Code store on disk (under `$CLAUDE_CONFIG_DIR` or `~/.claude/projects`). The tab reads `CLAUDE_CONFIG_DIR` from AoE's own process environment and consults neither `agent_config_dir` nor a recorded store, so a conversation held in the store the entry points at is not listed. Imports bind the selected store for both terminal and structured resumes; later profile routing and hook output do not replace it.
 
 ### Other agents
 

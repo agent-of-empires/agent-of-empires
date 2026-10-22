@@ -43,4 +43,34 @@ describe("useSessions.applySession (#2489)", () => {
     expect(result.current.sessions).toHaveLength(1);
     expect(result.current.sessions[0].id).toBe("s1");
   });
+
+  it("clears retained deletion progress without overwriting a newer row or trash lifecycle", async () => {
+    const original = base({
+      profile: "default",
+      created_at: "2026-01-01T00:00:00Z",
+      status: "Stopped",
+      lifecycle_generation: 4,
+      trashed_at: "2026-01-02T00:00:00Z",
+      trash_lifecycle_id: "00000000-0000-4000-8000-000000000004",
+    });
+    const { result } = renderHook(() => useSessions());
+    await act(async () => result.current.injectSession(original));
+    act(() => result.current.setSessionStatus(original.id, "Deleting"));
+    act(() => result.current.clearDeletingStatus([original]));
+    expect(result.current.sessions).toEqual([original]);
+
+    for (const changed of [
+      { lifecycle_generation: 5 },
+      { trashed_at: "2026-01-04T00:00:00Z" },
+      { trash_lifecycle_id: "00000000-0000-4000-8000-000000000005" },
+      { created_at: "2026-01-03T00:00:00Z" },
+      { profile: "another" },
+      { status: "Running" as const },
+    ]) {
+      const newer = { ...original, status: "Deleting" as const, ...changed };
+      act(() => result.current.applySession(newer));
+      act(() => result.current.clearDeletingStatus([original]));
+      expect(result.current.sessions).toEqual([newer]);
+    }
+  });
 });

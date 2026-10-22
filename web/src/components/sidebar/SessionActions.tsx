@@ -1,13 +1,13 @@
 import { useState, type ReactNode, type RefObject } from "react";
 import { createPortal } from "react-dom";
-import type { Workspace } from "../../lib/types";
+import type { SessionResponse, Workspace } from "../../lib/types";
 import {
-  attachSessionProject,
   createSession,
   setWorktreeName,
   smartRenameSession,
   summarizeSession,
   updateSessionGroup,
+  type SessionMutation,
 } from "../../lib/api";
 import { useUnreadIndicatorEnabled } from "../../lib/unreadIndicator";
 import { useSessionColorsEnabled } from "../../lib/sessionColors";
@@ -17,17 +17,19 @@ import { reportError, reportInfo } from "../../lib/toastBus";
 import { ContextMenu } from "../ContextMenu";
 import { SessionGroupModal } from "../SessionGroupModal";
 import { StatusGlyph } from "../StatusGlyph";
-import { AddProjectModal } from "./AddProjectModal";
 import type { RowModel } from "./rowModel";
 import { BulkTriageMenuItems, SingleRowMenuItems, type SingleRowActions } from "./SessionRowMenu";
+import type { SessionAction } from "./sessionActionTargets";
 import { SnoozeModal } from "./SnoozeModal";
 import type { RowBulkApi, RowContextScope } from "./types";
 import { WorkdirNameModal } from "./WorkdirNameModal";
+import { useSessionActions } from "./usePendingSetting";
 
-type Modal = "snooze" | "workdir" | "addProject" | "group" | null;
+type Modal = "snooze" | "workdir" | "group" | null;
 
 /** What a session's actions call back into; the sidebar and a plugin page's host menu both supply them. */
 export interface SessionActionHandlers {
+  onSessionMutation: (mutation: SessionMutation) => void;
   /** Receives the row's sessions, which a group slice narrows to a subset of the workspace. */
   onDelete?: (sessionIds: string[]) => void;
   onStop?: (sessionId: string) => void;
@@ -75,11 +77,14 @@ export function SessionActionsMenu({
   extraItems?: ReactNode;
 }) {
   const [modal, setModal] = useState<Modal>(null);
+  const owner = useSessionActions();
   const colorsEnabled = useSessionColorsEnabled();
   const unreadEnabled = useUnreadIndicatorEnabled();
   const { label } = model;
   const actions = {
-    ...buildRowActions(workspace, handlers, model, closeMenu, setModal),
+    ...buildRowActions(workspace, handlers, model, closeMenu, setModal, () => {
+      if (model.firstSession) owner.openAttach(model.firstSession);
+    }),
     rename: onRename,
     notify: setNotify,
     color: setColor,
@@ -138,6 +143,7 @@ export function SessionActionsMenu({
         modal={modal}
         setModal={setModal}
         model={model}
+        onSessionMutation={handlers.onSessionMutation}
         onSnooze={(minutes) => {
           closeMenu();
           setModal(null);
@@ -156,11 +162,21 @@ function buildRowActions(
   model: RowModel,
   closeMenu: () => void,
   setModal: (m: Modal) => void,
+  openAttach: () => void,
 ): Omit<SingleRowActions, "rename" | "notify" | "color"> {
-  const { firstSession: first, acpSession: acp } = model;
   const after = (fn: () => unknown) => () => {
     closeMenu();
     void fn();
+  };
+  // Re-checks the chosen session against the live row, since it can change while the menu is open.
+  const afterTarget = (action: SessionAction, fn: (s: SessionResponse) => unknown) => (sessionId: string) => {
+    closeMenu();
+    const session = workspace.sessions.find((s) => s.id === sessionId);
+    if (!session || !model.actionTargets[action].some((t) => t.id === sessionId)) {
+      reportError("That session changed. Please try again.");
+      return;
+    }
+    void fn(session);
   };
   return {
     newSession:
@@ -168,40 +184,36 @@ function buildRowActions(
         ? after(() => props.onCreateSession!(model.newSessionRepoPath!))
         : undefined,
     editWorkdir: after(() => setModal("workdir")),
-    addProject: after(() => setModal("addProject")),
+    addProject: after(openAttach),
     editGroup: after(() => setModal("group")),
-    switchView: after(() => first && props.onSwitchView?.(first.id, first.view !== "structured")),
+    switchView: afterTarget("switchView", (s) => props.onSwitchView?.(s.id, s.view !== "structured")),
     // The dialog lives in the session's Composer, so navigate first; a pending latch opens it on mount.
-    switchAgent: after(() => {
-      if (!acp) return;
-      requestOpenSession(acp.id);
-      requestSwitchAgent(acp.id);
+    switchAgent: afterTarget("switchAgent", (s) => {
+      requestOpenSession(s.id);
+      requestSwitchAgent(s.id);
     }),
-    fork: after(async () => {
-      if (!acp?.acp_session_id || !acp.acp_can_fork) return;
+    fork: afterTarget("fork", async (s) => {
       const result = await createSession({
-        path: acp.project_path,
-        tool: acp.tool,
+        path: s.project_path,
+        tool: s.tool,
         view: "structured",
-        profile: acp.profile || undefined,
-        fork_from: acp.acp_session_id,
+        profile: s.profile || undefined,
+        fork_from: s.acp_session_id!,
       });
       if (result.ok && result.session) requestOpenSession(result.session.id);
       else reportError(result.error ?? "Could not fork this session. Please try again.");
     }),
-    autoName: after(async () => {
-      if (!acp) return;
-      const result = await smartRenameSession(acp.id);
+    autoName: afterTarget("autoName", async (s) => {
+      const result = await smartRenameSession(s.id);
       if (!result.ok) reportError(result.message ?? "Could not start auto-name. Please try again.");
     }),
-    summarize: after(async () => {
-      if (!acp) return;
-      const result = await summarizeSession(acp.id);
+    summarize: afterTarget("summarize", async (s) => {
+      const result = await summarizeSession(s.id);
       if (result.ok) reportInfo("Summarizing the conversation so far…");
       else reportError(result.message ?? "Could not start the summary. Please try again.");
     }),
-    stop: after(() => first && props.onStop?.(first.id)),
-    start: after(() => first && props.onStart?.(first.id)),
+    stop: afterTarget("stop", (s) => props.onStop?.(s.id)),
+    start: afterTarget("start", (s) => props.onStart?.(s.id)),
     pin: () => props.onPinToggle(workspace, !model.effectivePinned),
     archive: after(() => props.onArchiveToggle(workspace, !model.effectiveArchived)),
     openSnooze: after(() => setModal("snooze")),
@@ -219,11 +231,13 @@ function RowModals({
   setModal,
   model,
   onSnooze,
+  onSessionMutation,
 }: {
   modal: Modal;
   setModal: (m: Modal) => void;
   model: RowModel;
   onSnooze: (minutes: number) => void;
+  onSessionMutation: SessionActionHandlers["onSessionMutation"];
 }) {
   const { label, sessionId } = model;
   const close = () => setModal(null);
@@ -235,7 +249,13 @@ function RowModals({
       <SessionGroupModal
         sessionTitle={model.sessionTitle || label}
         currentGroup={model.firstSession?.group_path ?? ""}
-        onSave={async (group) => (sessionId ? updateSessionGroup(sessionId, group) : false)}
+        onSave={async (group) => {
+          if (!sessionId) return false;
+          const mutation = await updateSessionGroup(sessionId, group);
+          if (!mutation) return false;
+          onSessionMutation(mutation);
+          return true;
+        }}
         onClose={close}
       />,
       document.body,
@@ -250,20 +270,13 @@ function RowModals({
         onCancel={close}
         onSubmit={async (name, renameBranch) => {
           const res = await setWorktreeName(sessionId, name, renameBranch);
-          if (res.ok) close();
+          if (res.ok) {
+            onSessionMutation(res);
+            res.warnings?.forEach((warning) => reportInfo(warning));
+            close();
+          }
           return res;
         }}
-      />,
-      document.body,
-    );
-  }
-  if (modal === "addProject") {
-    return createPortal(
-      <AddProjectModal
-        title={label}
-        onCancel={close}
-        onDone={close}
-        onSubmit={(project, attachExistingBranch) => attachSessionProject(sessionId, project, { attachExistingBranch })}
       />,
       document.body,
     );

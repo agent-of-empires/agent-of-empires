@@ -2,7 +2,7 @@
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use fs2::FileExt;
 use tracing_subscriber::filter::EnvFilter;
@@ -108,6 +108,7 @@ pub const DEFAULT_TARGET_ROOTS: &[&str] = &[
     "tmux",
     "http",
     "serve",
+    "server",
     "runtime",
     "hooks",
     "sound",
@@ -129,6 +130,7 @@ pub const KNOWN_SUB_TARGETS: &[&str] = &[
     "auth.middleware",
     "auth.rate_limit",
     "auth.passphrase",
+    "auth.passkey",
     "auth.device",
     "auth.ip",
     "process.signal",
@@ -145,6 +147,28 @@ pub const KNOWN_SUB_TARGETS: &[&str] = &[
     "git.command",
     "web.client",
     "log.runtime",
+    "migrations.v036",
+    "migrations.v037",
+    "migrations.v038",
+    "migrations.v039",
+    "migrations.v040",
+    "migrations.v041",
+    "migrations.v043",
+    "migrations.v044",
+    "migrations.v045",
+    "migrations.v046",
+    "migrations.v047",
+    "migrations.v048",
+    "server.file_watch",
+    "server.lifecycle",
+    "server.idle_reap",
+    "server.runtime",
+    "server.session_service",
+    "server.session_store",
+    "server.sleep_inhibit",
+    "server.maintenance",
+    "server.status",
+    "server.sessions",
     "runtime.uds",
     "runtime.ws",
 ];
@@ -455,6 +479,10 @@ pub fn init_subscriber_with_options(
         }
     };
     let (reload_layer, handle) = reload::Layer::new(parsed);
+    let sink = match &target {
+        SubscriberTarget::File(path, _) => ActiveSink::File(path.clone()),
+        SubscriberTarget::Stdout => ActiveSink::Stdout,
+    };
 
     // Only the JSON formatter can drop spans, so a custom FormatEvent does it here.
     let install_result = match target {
@@ -515,6 +543,7 @@ pub fn init_subscriber_with_options(
 
     match install_result {
         Ok(()) => {
+            let _ = ACTIVE_SINK.set(sink);
             let controller = Arc::new(FilterController {
                 inner: handle,
                 current: Mutex::new(filter),
@@ -753,6 +782,20 @@ fn file_inode(_meta: &std::fs::Metadata) -> u64 {
 
 static CONTROLLER: Mutex<Option<Arc<FilterController>>> = Mutex::new(None);
 
+/// The sink a successful `init_subscriber_with_options` installed in this process.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ActiveSink {
+    File(PathBuf),
+    Stdout,
+}
+
+static ACTIVE_SINK: OnceLock<ActiveSink> = OnceLock::new();
+
+/// `None` when no subscriber was installed, including after a failed initialization.
+pub fn active_sink() -> Option<ActiveSink> {
+    ACTIVE_SINK.get().cloned()
+}
+
 pub fn install_controller(c: Arc<FilterController>) {
     *CONTROLLER.lock().unwrap() = Some(c);
 }
@@ -853,14 +896,14 @@ fn apply_filter_file(path: &std::path::Path) {
             previous = %swap.previous,
             current = %swap.current,
             source = "file-watch",
-            "runner filter swapped"
+            "filter swapped"
         ),
         Ok(_) => {}
         Err(e) => tracing::warn!(
             target: "log.runtime",
             error = %e,
             directive = %directive,
-            "runner filter swap failed"
+            "filter swap failed"
         ),
     }
     #[cfg(debug_assertions)]
@@ -1083,6 +1126,18 @@ mod tests {
 
     /// Only a foreground serve may log to stdout; the TUI owns the terminal,
     /// so it is coerced to the file with a warning.
+    #[test]
+    fn failed_init_leaves_the_active_sink_unset() {
+        let init = init_subscriber_with_options(
+            SubscriberTarget::Stdout,
+            "aoe=notalevel".into(),
+            false,
+            None,
+        );
+        assert!(init.controller.is_none());
+        assert_eq!(active_sink(), None);
+    }
+
     #[test]
     fn resolve_sink_honors_stdout_only_outside_the_tui() {
         let mut cfg = make_cfg(RotationKind::Size, 50, 5);

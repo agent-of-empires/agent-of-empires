@@ -21,13 +21,13 @@ vi.mock("../../../lib/api", () => ({
 }));
 
 import { AttentionChime } from "../AttentionChime";
-import { clearApprovalSoundCache } from "../../../hooks/useApprovalSound";
+import { clearSoundCache } from "../../../lib/soundPlayer";
 
 let audioCount = 0;
 
 beforeEach(() => {
   audioCount = 0;
-  clearApprovalSoundCache();
+  clearSoundCache();
   vi.useFakeTimers();
   // jsdom has no Audio / object-URL plumbing; stub the minimum the hook
   // touches so a successful play() path is observable by counting builds.
@@ -58,17 +58,17 @@ afterEach(() => {
 
 describe("AttentionChime", () => {
   it("chimes once when a question arrives (0 -> >=1 combined edge)", async () => {
-    const { rerender } = render(<AttentionChime approvals={0} elicitations={0} />);
+    const { rerender } = render(<AttentionChime sessionId="s1" approvals={0} elicitations={0} />);
     await vi.advanceTimersByTimeAsync(1500);
-    rerender(<AttentionChime approvals={0} elicitations={1} />);
+    rerender(<AttentionChime sessionId="s1" approvals={0} elicitations={1} />);
     await vi.runAllTimersAsync();
     expect(audioCount).toBe(1);
   });
 
   it("does not re-chime when a second item arrives (>=1 -> >=2)", async () => {
-    const { rerender } = render(<AttentionChime approvals={1} elicitations={0} />);
+    const { rerender } = render(<AttentionChime sessionId="s1" approvals={1} elicitations={0} />);
     await vi.advanceTimersByTimeAsync(1500);
-    rerender(<AttentionChime approvals={1} elicitations={1} />);
+    rerender(<AttentionChime sessionId="s1" approvals={1} elicitations={1} />);
     await vi.runAllTimersAsync();
     expect(audioCount).toBe(0);
   });

@@ -41,6 +41,12 @@ The host keeps the five newest logs per plugin and removes older ones when a wor
 
 `aoe.web` is the only bundled plugin today: the web dashboard's management marker, present whenever the dashboard is compiled in, so every released binary ships it enabled. Disabling it hides `aoe serve` as an unrecognized subcommand (`--stop`, `--status`, and `--restart` still reach a running daemon); re-enable with `aoe plugin enable aoe.web`. A build without the dashboard has an empty registry, so `aoe plugin list` reporting nothing there is expected.
 
+## Featured plugins
+
+Featured plugins are first-party plugins whose release hashes are pinned in `plugins/featured.toml`, so `aoe plugin list` shows them as `featured`.
+
+- **Board** (`agent-of-empires.kanban`): a kanban board of your sessions in the web dashboard. Install with `aoe plugin install gh:agent-of-empires/plugin-kanban`; it needs Node 22 or newer on the daemon's `PATH`.
+
 ## Installing external plugins
 
 External plugins are community code you install at your own risk.
@@ -61,7 +67,7 @@ The web dashboard's Plugins settings does the same things, with a marketplace se
 
 ## Trust and capabilities
 
-Bundled plugins are `builtin` and fully trusted. Installed plugins are `community` and untrusted: the manifest declares the capabilities they need (network, filesystem, spawning processes, and so on) and install prompts once to grant that exact set. `--yes` grants without prompting, and a capability this version does not recognize is rejected rather than granted. An external plugin cannot claim the reserved `aoe.*` or `agent-of-empires.*` id namespace.
+Bundled plugins are `builtin` and fully trusted. Installed plugins are `community` and untrusted: the manifest declares the capabilities they need (network, filesystem, spawning processes, and so on) and install prompts once to grant that exact set. `--yes` grants without prompting, and a capability this version does not recognize is rejected rather than granted. An external plugin cannot claim the reserved `aoe.*` or `agent-of-empires.*` id namespace unless its release hash is pinned in the featured index.
 
 A grant is pinned to the installed manifest, so an update that widens what the plugin can do (new capabilities, changed build steps or UI slots, a runtime or trust change) must be approved before it becomes active. Approve with `aoe plugin update <id>` (`--yes` skips the prompt), or in-app: the web and TUI plugin managers show an Update action with a popup describing what changed. Declining keeps the current version and stops the prompt until the next version. Approval is pinned to the exact fetched content, so an update that changed since you reviewed it is refused rather than applied.
 

@@ -40,6 +40,10 @@ type WorkerState = "absent" | "resuming" | "running" | "stopping";
 
 interface Props {
   sessionId: string;
+  /** False for a retained view that is hidden or covered: no keyboard reservation. */
+  active?: boolean;
+  /** False for a non-selected retained view: no chime. Stays true while the stack is covered. */
+  selected?: boolean;
   /** `SessionResponse.acp_worker_state`, polled. */
   acpWorkerState: WorkerState;
   /** Whether rate-limit auto-resume is on for this session's profile. */
@@ -116,7 +120,7 @@ function structuredViewRootStyle(keyboardHeight: number): React.CSSProperties | 
 
 /** Flex root publishing the keyboard reservation and both conversation font
  *  sizes (as rem); `index.css` picks the active size. */
-export function StructuredViewRoot({ children }: { children: React.ReactNode }) {
+export function StructuredViewRoot({ active = true, children }: { active?: boolean; children: React.ReactNode }) {
   const { keyboardHeight } = useMobileKeyboard();
   const { settings } = useWebSettings();
   return (
@@ -125,7 +129,7 @@ export function StructuredViewRoot({ children }: { children: React.ReactNode }) 
       className="acp-conversation-scope flex h-full flex-col bg-surface-900 text-text-primary"
       style={
         {
-          ...structuredViewRootStyle(keyboardHeight),
+          ...structuredViewRootStyle(active ? keyboardHeight : 0),
           "--acp-conversation-font-size-mobile": conversationFontSizeRem(settings.structuredMobileFontSize),
           "--acp-conversation-font-size-desktop": conversationFontSizeRem(settings.structuredDesktopFontSize),
         } as React.CSSProperties
@@ -198,8 +202,14 @@ function AcpChrome({
     );
   }
   return (
-    <StructuredViewRoot>
-      <AttentionChime approvals={state.pendingApprovals.length} elicitations={state.pendingElicitations.length} />
+    <StructuredViewRoot active={view.active}>
+      {view.selected !== false && (
+        <AttentionChime
+          sessionId={sessionId}
+          approvals={state.pendingApprovals.length}
+          elicitations={state.pendingElicitations.length}
+        />
+      )}
       <PlanStrip plan={state.plan} />
 
       <RateLimitRecoverySection
@@ -434,13 +444,14 @@ function ComposerDock({
           onToggle={onToggleCollapsed}
           collapseLabel="Collapse message composer"
           expandLabel="Expand message composer"
-          controlsId="conversation-composer"
+          controlsId={`conversation-composer-${sessionId}`}
           testId="composer-collapse-toggle"
         />
       )}
 
-      <CollapsibleRegion id="conversation-composer" collapsed={collapsible && collapsed}>
+      <CollapsibleRegion id={`conversation-composer-${sessionId}`} collapsed={collapsible && collapsed}>
         <Composer
+          active={view.active !== false}
           sessionId={sessionId}
           currentAgent={state.agent ?? acpAgent}
           currentProvider={acpProvider}

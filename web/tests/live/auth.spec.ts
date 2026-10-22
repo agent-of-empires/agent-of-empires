@@ -2,7 +2,15 @@
 
 import { readFile } from "node:fs/promises";
 import { setTimeout as delay } from "node:timers/promises";
-import { test, expect, authHeaders, bootDashboard, type ServeHandle } from "../helpers/liveTest";
+import {
+  test,
+  expect,
+  authHeaders,
+  bootDashboard,
+  confirmPassphraseElevation,
+  type ServeHandle,
+} from "../helpers/liveTest";
+import { loginWithPassphrase } from "../helpers/aoeServe";
 
 test("--no-auth skips LoginPage and lands on dashboard", async ({ serve, page }) => {
   await page.goto(serve.baseUrl);
@@ -76,40 +84,67 @@ test.describe("persisted login sessions", () => {
     }).toPass({ timeout: 10_000 });
   });
 
-  // Loopback callers bypass the elevation wall (#1525); the 403 policy is unit-tested in src/server/auth.rs.
-  test("revoke removes one device and sign-out-all clears every session", async ({ servePreauthed }) => {
-    const otherBinding = Buffer.from(new Uint8Array(32).fill(0x5a)).toString("base64url");
-    const loginRes = await fetch(`${servePreauthed.baseUrl}/api/login`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ passphrase: servePreauthed.passphrase, device_binding_secret: otherBinding }),
-    });
-    expect(loginRes.ok).toBe(true);
-
+  test("device management requires browser elevation, then revokes and signs out every device", async ({
+    servePreauthed,
+    page,
+  }) => {
+    // An authenticated TCP browser is not the kernel-authenticated Unix owner, even on loopback.
+    const loginOtherDevice = async (): Promise<ServeHandle> => {
+      const deviceBindingSecret = Buffer.from(new Uint8Array(32).fill(0x5a)).toString("base64url");
+      const { cookie } = await loginWithPassphrase(
+        servePreauthed.baseUrl,
+        servePreauthed.passphrase!,
+        deviceBindingSecret,
+      );
+      return { ...servePreauthed, sessionCookie: cookie, deviceBindingSecret };
+    };
+    let otherDevice = await loginOtherDevice();
     const before = await devices(servePreauthed);
-    expect(before.length).toBe(2);
+    expect(before).toHaveLength(2);
     const other = before.find((d) => !d.current);
     expect(other).toBeTruthy();
+    expect(await loginStatus(servePreauthed)).toMatchObject({ authenticated: true, elevated: false });
 
-    const revoke = await fetch(`${servePreauthed.baseUrl}/api/login/sessions/${other!.session_id}`, {
-      method: "DELETE",
-      headers: authHeaders(servePreauthed),
-    });
-    expect(revoke.ok).toBe(true);
-    expect((await devices(servePreauthed)).some((d) => d.session_id === other!.session_id)).toBe(false);
+    await bootDashboard(page, servePreauthed, "/settings/devices");
+    const prompt = page.getByRole("dialog").filter({ hasText: "Confirm passphrase" });
+    const signOutAll = page.getByRole("button", { name: /sign out all devices/i });
+    page.once("dialog", (dialog) => dialog.accept());
+    await signOutAll.click();
+    await expect(prompt).toBeVisible({ timeout: 5_000 });
+    expect(await devices(servePreauthed)).toHaveLength(2);
+    expect((await loginStatus(otherDevice)).authenticated).toBe(true);
+    await prompt.getByRole("button", { name: "Cancel", exact: true }).click();
+    await expect(prompt).toHaveCount(0);
 
-    const all = await fetch(`${servePreauthed.baseUrl}/api/login/logout-all`, {
-      method: "POST",
-      headers: authHeaders(servePreauthed),
-    });
-    expect(all.ok).toBe(true);
-    expect((await loginStatus(servePreauthed)).authenticated).toBe(false);
+    const revoke = page.getByRole("button", { name: "Revoke", exact: true });
+    await revoke.click();
+    await expect(prompt).toBeVisible({ timeout: 5_000 });
+    expect((await devices(servePreauthed)).some((d) => d.session_id === other!.session_id)).toBe(true);
+    await confirmPassphraseElevation(page, servePreauthed);
+    // Confirming elevates this session; it must not replay the denied destructive action.
+    expect((await devices(servePreauthed)).some((d) => d.session_id === other!.session_id)).toBe(true);
+    await revoke.click();
+    await expect
+      .poll(async () => (await devices(servePreauthed)).some((d) => d.session_id === other!.session_id))
+      .toBe(false);
+    await expect(revoke).toHaveCount(0);
+    await expect(page.getByText(/^this device$/i)).toBeVisible();
+    expect((await loginStatus(otherDevice)).authenticated).toBe(false);
+
+    // Keep another live session so sign-out-all proves more than signing out only this browser.
+    otherDevice = await loginOtherDevice();
+    expect(await devices(servePreauthed)).toHaveLength(2);
+    page.once("dialog", (dialog) => dialog.accept());
+    await signOutAll.click();
+    await expect.poll(async () => (await loginStatus(servePreauthed)).authenticated).toBe(false);
+    expect((await loginStatus(otherDevice)).authenticated).toBe(false);
+    await expect(page.locator("input#passphrase")).toBeVisible({ timeout: 10_000 });
   });
 
   test("settings -> devices renders the signed-in session as this device", async ({ servePreauthed, page }) => {
     await bootDashboard(page, servePreauthed, "/settings/devices");
     await expect(page.getByRole("heading", { name: /connected devices/i })).toBeVisible({ timeout: 10_000 });
-    await expect(page.getByText(/this device/i)).toBeVisible({ timeout: 10_000 });
+    await expect(page.getByText(/^this device$/i)).toBeVisible({ timeout: 10_000 });
     await expect(page.getByRole("button", { name: /sign out all devices/i })).toBeVisible();
   });
 });

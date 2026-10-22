@@ -7,8 +7,51 @@ use std::process::Command;
 
 pub(super) use super::unix::{
     close_frozen_payload, configure_process_group, exec_command, kill_process_group,
-    restore_environment_value, terminate_process_group,
+    restore_environment_value, terminate_process_group, try_wait_status_hook,
 };
+/// Prove only the absence of the Linux scope backend on this kernel.
+/// Native process, worker and tmux custody must still pass their own guards.
+pub(super) fn legacy_scope_inventory_clear(
+    known: &[crate::process::worker_registry::ScopeOwnership],
+) -> anyhow::Result<bool> {
+    use crate::process::worker_registry::ScopeOwnership;
+    anyhow::ensure!(
+        !known
+            .iter()
+            .any(|scope| matches!(scope, ScopeOwnership::Owned { .. })),
+        "Captured Linux scope authority cannot be recovered on this platform"
+    );
+    let mut name = std::mem::MaybeUninit::<libc::utsname>::uninit();
+    // SAFETY: uname receives writable storage of the required size.
+    if unsafe { libc::uname(name.as_mut_ptr()) } != 0 {
+        return Err(std::io::Error::last_os_error()).context("Reading the native kernel identity");
+    }
+    // SAFETY: uname succeeded and initializes NUL-terminated sysname.
+    let name = unsafe { name.assume_init() };
+    let kernel = unsafe { std::ffi::CStr::from_ptr(name.sysname.as_ptr()) };
+    anyhow::ensure!(
+        kernel.to_bytes() == b"Darwin",
+        "Cannot prove the Linux scope backend absent on this kernel"
+    );
+    Ok(true)
+}
+
+#[cfg(test)]
+mod legacy_scope_recovery_tests {
+    use super::*;
+    use crate::process::worker_registry::ScopeOwnership;
+
+    #[test]
+    fn native_darwin_proof_does_not_discard_a_captured_linux_unit() {
+        assert!(legacy_scope_inventory_clear(&[]).unwrap());
+        assert!(legacy_scope_inventory_clear(&[ScopeOwnership::Unscoped]).unwrap());
+        assert!(legacy_scope_inventory_clear(&[ScopeOwnership::Owned {
+            unit: "aoe-session-old-original.scope".into(),
+        }])
+        .is_err());
+    }
+}
+
 pub(super) fn open_read_nonblocking(path: &std::path::Path) -> std::io::Result<std::fs::File> {
     use std::os::unix::fs::OpenOptionsExt;
 
@@ -50,6 +93,9 @@ pub(super) fn rename_exclusive(
     result.map_err(std::io::Error::from)
 }
 
+pub(crate) fn unix_peer_uid(stream: &tokio::net::UnixStream) -> std::io::Result<u32> {
+    Ok(stream.peer_cred()?.uid())
+}
 /// Run the child at background priority so a mass file delete does not saturate
 /// `fseventsd` and stall the rest of the machine.
 pub(super) fn throttle_child(cmd: &mut Command) {
@@ -94,7 +140,16 @@ pub(super) fn build_children_map() -> HashMap<u32, Vec<u32>> {
     children_map
 }
 
-/// `-E` appends each owned process's environment; if `ps` rejects it, every candidate is `false`.
+/// One `ps -A -ww -E -o command=` fork deciding, for each candidate `i`,
+/// whether a live process belongs to it: a whitespace-delimited token exactly
+/// equals `env_needles[i]` (anchored, matching the `KEY=VAL` env tokens `-E`
+/// appends), and the line contains `cmdline_needles[i]` when both are supplied.
+/// An executable needle matches an exact argv-token basename. A candidate with
+/// one signal uses that one; otherwise every supplied signal must match.
+/// `-ww` disables column
+/// truncation; `-E` appends each owner-owned process's environment. If a `ps`
+/// build rejects `-E`, the call fails closed to all `false` and recovery falls
+/// back to the ledger. Best-effort: a failed `ps` yields all `false`.
 pub(super) fn processes_matching(
     env_needles: &[String],
     cmdline_needles: &[Option<String>],
@@ -404,6 +459,67 @@ pub(super) fn foreign_runner_group_absent(pid: u32) -> anyhow::Result<bool> {
     let ruid = unsafe { libc::getuid() };
     Ok((info.pbsi_uid != uid || info.pbsi_ruid != ruid) && !runner_group_executing(pid)?)
 }
+pub(super) fn process_tree_samples(
+    root: &super::PrimeProcessIdentity,
+) -> anyhow::Result<Vec<super::PrimeProcessSample>> {
+    let mut command = Command::new("ps");
+    command.args(["-A", "-o", "pid=,ppid=,stat="]);
+    let output = crate::session::capture::run_with_timeout_limit(
+        command,
+        std::time::Duration::from_secs(2),
+        "tool process census",
+        1024 * 1024,
+    )?;
+    let mut candidates = Vec::new();
+    for line in std::str::from_utf8(&output)?.lines() {
+        let mut fields = line.split_ascii_whitespace();
+        let pid = fields.next().context("missing process PID")?.parse()?;
+        let parent = fields.next().context("missing process parent")?.parse()?;
+        if !fields
+            .next()
+            .context("missing process state")?
+            .starts_with('Z')
+        {
+            candidates.push(super::PrimeProcessSample {
+                identity: super::PrimeProcessIdentity {
+                    pid,
+                    start_id: if pid == root.pid {
+                        root.start_id.clone()
+                    } else {
+                        String::new()
+                    },
+                },
+                parent,
+                marked: false,
+            });
+        }
+    }
+    let selected = super::prime_selection_mask(&candidates, std::slice::from_ref(root));
+    let mut samples = Vec::new();
+    for (mut sample, selected) in candidates.into_iter().zip(selected) {
+        if !selected {
+            continue;
+        }
+        let pid = sample.identity.pid;
+        let Some(token) = audit_token(pid)? else {
+            continue;
+        };
+        let membership = process_membership(pid)?.context("tool process membership unavailable")?;
+        anyhow::ensure!(
+            audit_token(pid)? == Some(token),
+            "tool process incarnation changed during census"
+        );
+        sample.identity.start_id = audit_start_id(&token);
+        sample.parent = membership.pbi_ppid;
+        samples.push(sample);
+    }
+    anyhow::ensure!(
+        samples.iter().any(|sample| sample.identity == *root),
+        "tool root omitted from census"
+    );
+    Ok(samples)
+}
+
 pub(super) fn prime_processes(
     marker: &str,
     socket: &std::path::Path,
@@ -603,6 +719,9 @@ fn prime_launch_marker(
             .any(|entry| entry == marker.as_bytes()))
 }
 
+/// Sample system memory via `sysctl` and `vm_stat`, matching this module's
+/// existing shell-out convention. Populates total/available RAM and the native
+/// memory-pressure level; PSI has no macOS analogue and stays `None`.
 pub(super) fn sample_memory() -> super::metrics::MemorySample {
     // A vm_stat failure alone would otherwise read as a false 100% used.
     let (total_bytes, available_bytes) = match (
@@ -969,6 +1088,8 @@ fn find_process_in_group(pgrp: u32) -> Option<u32> {
     None
 }
 
+/// Prevents user-idle system sleep by holding a `caffeinate` child. `-i`
+/// inhibits system idle sleep only, so the display still sleeps normally.
 pub(super) struct CaffeinateInhibitor {
     child: Option<std::process::Child>,
 }

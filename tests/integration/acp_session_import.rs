@@ -13,6 +13,7 @@ use crate::common::{shim_node, shim_path, shim_ready};
 
 fn spawn_config(env: Vec<(String, String)>) -> SpawnConfig {
     SpawnConfig {
+        launch_lease: None,
         wrapper_substitution: None,
         agent_key: "pi".into(),
         tool: "pi".into(),
@@ -38,6 +39,7 @@ fn spawn_config(env: Vec<(String, String)>) -> SpawnConfig {
         stored_acp_session_id: None,
         fork_from: None,
         seed_history_replay: false,
+        prior_conversation: false,
         generation: 0,
         artifact_dir: None,
         sandbox_info: None,

@@ -128,25 +128,18 @@ pub fn render(frame: &mut Frame, area: Rect, theme: &Theme, state: &RemoteHomeSt
             Constraint::Length(2),
         ])
         .split(area);
-    render_header(frame, chunks[0], theme, state);
+    render_header(frame, chunks[0], theme);
     render_list(frame, chunks[1], theme, state);
     render_footer(frame, chunks[2], theme, state);
 }
 
-fn render_header(frame: &mut Frame, area: Rect, theme: &Theme, state: &RemoteHomeState) {
-    let spans = vec![
-        Span::styled(
-            " Remote sessions · ",
-            Style::default()
-                .fg(theme.title)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(
-            state.endpoint.base_url.clone(),
-            Style::default().fg(theme.text),
-        ),
-        Span::raw(" "),
-    ];
+fn render_header(frame: &mut Frame, area: Rect, theme: &Theme) {
+    let spans = vec![Span::styled(
+        " Remote sessions ",
+        Style::default()
+            .fg(theme.title)
+            .add_modifier(Modifier::BOLD),
+    )];
     let block = Block::default().borders(Borders::BOTTOM);
     let para = Paragraph::new(Line::from(spans)).block(block);
     frame.render_widget(para, area);
@@ -155,8 +148,8 @@ fn render_header(frame: &mut Frame, area: Rect, theme: &Theme, state: &RemoteHom
 fn render_list(frame: &mut Frame, area: Rect, theme: &Theme, state: &RemoteHomeState) {
     if let Some(err) = &state.last_error {
         let para = Paragraph::new(format!(
-            "Could not reach daemon at {}:\n\n{}\n\nPress r to retry, q to quit.",
-            state.endpoint.base_url, err
+            "Could not reach daemon:\n\n{}\n\nPress r to retry, q to quit.",
+            err
         ))
         .style(Style::default().fg(theme.error));
         frame.render_widget(para, area);
@@ -269,6 +262,16 @@ fn render_footer(frame: &mut Frame, area: Rect, theme: &Theme, state: &RemoteHom
         " j/k=navigate · Enter=open · r=refresh · q=quit ",
         Style::default().fg(theme.hint),
     ));
+    if !plugin_ui::sort_specs(&state.plugin_ui).is_empty() {
+        let mode = match state.active_sort_spec() {
+            Some(s) => format!("{} {}", s.label, if s.descending { "↓" } else { "↑" }),
+            None => "title".to_string(),
+        };
+        spans.push(Span::styled(
+            format!("· s=sort ({mode}) "),
+            Style::default().fg(theme.hint),
+        ));
+    }
     if let Some(session) = selected {
         spans.push(Span::styled(
             format!(
@@ -491,6 +494,28 @@ mod tests {
             );
             assert_eq!(column_of(&painted, "/tmp/s1"), 54, "{painted:?}");
         }
+    }
+
+    #[test]
+    fn footer_offers_sort_only_when_a_sort_key_is_published() {
+        let sort_key = json!({"plugin_id": "gh", "slot": "sort-key", "id": "k",
+            "payload": {"label": "Attention", "column": "att", "direction": "desc"}});
+        let mut state = state_with(&["s1"], json!([sort_key]));
+        let painted = rows(&state);
+        assert!(
+            painted.iter().any(|l| l.contains("s=sort (title)")),
+            "{painted:?}"
+        );
+
+        state.cycle_sort();
+        let painted = rows(&state);
+        assert!(
+            painted.iter().any(|l| l.contains("s=sort (Attention ↓)")),
+            "{painted:?}"
+        );
+
+        let painted = rows(&state_with(&["s1"], json!([])));
+        assert!(!painted.iter().any(|l| l.contains("s=sort")), "{painted:?}");
     }
 
     #[test]

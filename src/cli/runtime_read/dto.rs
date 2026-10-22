@@ -1,10 +1,13 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt;
 
+use chrono::{DateTime, Utc};
 use serde::de::{self, MapAccess, Visitor};
 use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::server::runtime_ws::PROTOCOL_VERSION;
+use crate::session::projection::SessionProjection;
+use crate::session::Instance;
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -213,6 +216,58 @@ pub(crate) struct SessionRead {
     #[serde(deserialize_with = "deserialize_required_nullable")]
     pub worktree: Option<WorktreeRead>,
     pub workspace_repos: Vec<WorkspaceRepo>,
+}
+
+impl SessionRead {
+    pub(crate) fn from_instance(inst: &Instance) -> Self {
+        Self::from_projection(&SessionProjection::new(inst, &inst.source_profile))
+    }
+
+    fn from_projection(row: &SessionProjection<'_>) -> Self {
+        let timestamp = |value: Option<DateTime<Utc>>| value.map(wire_timestamp);
+        Self {
+            id: row.id.to_string(),
+            title: row.title.to_string(),
+            project_path: row.project_path.to_string(),
+            group_path: row.group_path.to_string(),
+            tool: row.tool.to_string(),
+            command: row.command.to_string(),
+            profile: row.profile.to_string(),
+            status: row.status.into(),
+            state: row.bucket.into(),
+            created_at: wire_timestamp(row.created_at),
+            last_accessed_at: timestamp(row.last_accessed_at),
+            idle_entered_at: timestamp(row.idle_entered_at),
+            last_error: row.last_error.map(str::to_string),
+            archived_at: timestamp(row.archived_at),
+            trashed_at: timestamp(row.trashed_at),
+            active_snoozed_until: timestamp(row.active_snoozed_until),
+            pinned_at: timestamp(row.pinned_at),
+            agent_session_id: row.agent_session_id.map(str::to_string),
+            parent_session_id: row.parent_session_id.map(str::to_string),
+            has_worktree_info: row.worktree.is_some(),
+            has_managed_worktree: row.has_managed_worktree(),
+            worktree: row.worktree.map(|worktree| WorktreeRead {
+                branch: worktree.branch.clone(),
+                main_repo_path: worktree.main_repo_path.clone(),
+                managed_by_aoe: worktree.managed_by_aoe,
+                base_branch: worktree.base_branch.clone(),
+            }),
+            workspace_repos: row
+                .workspace_repos
+                .iter()
+                .map(|repo| WorkspaceRepo {
+                    name: repo.name.clone(),
+                    source_path: repo.source_path.clone(),
+                    branch: repo.branch.clone(),
+                })
+                .collect(),
+        }
+    }
+}
+
+pub(crate) fn wire_timestamp(value: DateTime<Utc>) -> String {
+    value.to_rfc3339_opts(chrono::SecondsFormat::AutoSi, true)
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]

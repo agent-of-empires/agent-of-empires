@@ -137,8 +137,12 @@ mod tests {
                     Some("[sandbox]\nenvironment = [\"TERM\"]\n"),
                 ),
                 (
-                    Some("[sandbox]\nenabled_by_default = false\n\n[sandbox.environment_values]\nTOKEN = \"secret\"\n"),
-                    Some("[sandbox]\nenabled_by_default = false\nenvironment = [\"TOKEN=secret\"]\n"),
+                    Some(
+                        "[sandbox]\nenabled_by_default = false\n\n[sandbox.environment_values]\nTOKEN = \"secret\"\n",
+                    ),
+                    Some(
+                        "[sandbox]\nenabled_by_default = false\nenvironment = [\"TOKEN=secret\"]\n",
+                    ),
                 ),
                 (Some(term_only), Some(term_only)),
                 (Some(no_sandbox), Some(no_sandbox)),

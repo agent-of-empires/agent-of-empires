@@ -19,6 +19,15 @@ afterEach(() => {
 
 const json = (body: unknown, status = 200) =>
   new Response(JSON.stringify(body), { status, headers: { "content-type": "application/json" } });
+const cursor = { epoch: "boot", revision: 9007199254740993n };
+const runtimeJson = (body: unknown) =>
+  new Response(JSON.stringify(body), {
+    headers: {
+      "content-type": "application/json",
+      "aoe-runtime-epoch": cursor.epoch,
+      "aoe-runtime-revision": cursor.revision.toString(),
+    },
+  });
 const empty = (status = 200) => new Response("", { status });
 const offline = () => fetchSpy.mockRejectedValueOnce(new Error("offline"));
 
@@ -33,6 +42,7 @@ const bodyOf = (init: RequestInit | undefined) => JSON.parse(init!.body as strin
 type RequestCase = [string, () => Promise<unknown>, { body?: unknown; respond?: Response; result?: unknown }?];
 
 const session = { id: "s1" };
+const sessions = { sessions: [session], workspace_ordering: ["/repo::main"] };
 const plugins = { plugins: [], load_errors: [] };
 const hit = { session_id: "s1", seq: 3, kind: "agent", snippet: "hit", match_count: 2 };
 const switched = { session_id: "s-1", agent: "codex", before_seq: 41, switch_seq: 42, status: "ok" };
@@ -45,8 +55,24 @@ const skill = {
 };
 const preview = { kind: "consent_required", dismissed: false, consent: { id: "p" } };
 
+describe("project container override serialization", () => {
+  it.each([true, false, undefined])("serializes %s without turning inherit into false", async (override) => {
+    fetchSpy.mockResolvedValueOnce(json({}));
+    await api.createProject({
+      path: "/repo",
+      scope: "profile",
+      profile: "served",
+      overrides: { sandbox_enabled: override },
+    });
+    const { init } = lastCall();
+    const body = bodyOf(init);
+    expect(body).toMatchObject({ path: "/repo", scope: "profile", profile: "served" });
+    expect(body.overrides).toEqual(override === undefined ? {} : { sandbox_enabled: override });
+  });
+});
+
 const requestCases: RequestCase[] = [
-  ["GET /api/sessions", () => api.fetchSessions(), { respond: json(session), result: session }],
+  ["GET /api/sessions", () => api.fetchSessions(), { respond: runtimeJson(sessions), result: { ...sessions, cursor } }],
   [
     "GET /api/sessions/search?q=foo%20bar",
     () => api.searchConversations("foo bar"),
@@ -156,6 +182,7 @@ const requestCases: RequestCase[] = [
   ["POST /api/app-state/web-tour-seen", () => api.markWebTourSeen(), { result: true }],
   ["GET /api/git/branches?path=%2Frepo", () => api.fetchBranches("/repo")],
   ["GET /api/git/branches?path=%2Frepo&include_remote=true", () => api.fetchBranches("/repo", true)],
+  ["GET /api/git/worktrees?path=%2Frepo", () => api.fetchWorktrees("/repo")],
   [
     "GET /api/git/is-repo?path=%2Fr",
     () => api.fetchIsGitRepo("/r"),
@@ -236,7 +263,17 @@ const requestCases: RequestCase[] = [
   ["GET /api/devices", () => api.fetchDevices()],
   ["DELETE /api/login/sessions/sess%2F1", () => api.revokeDevice("sess/1"), { result: true }],
   ["POST /api/login/logout-all", () => api.signOutAllDevices(), { result: true }],
-  ["GET /api/login/status", () => api.loginStatus(), { respond: json({ required: true }), result: { required: true } }],
+  [
+    `GET /api/login/status?origin=${encodeURIComponent(window.location.origin)}`,
+    () => api.loginStatus(),
+    { respond: json({ required: true }), result: { required: true } },
+  ],
+  [
+    "GET /api/passkeys",
+    () => api.fetchPasskeys(),
+    { respond: json([{ credential_id: "c1" }]), result: [{ credential_id: "c1" }] },
+  ],
+  ["DELETE /api/passkeys/a%2Fb", () => api.removePasskey("a/b"), { result: true }],
   ["GET /api/login/status", () => api.verifyToken(), { result: true }],
   ["GET /api/agents", () => api.fetchAgents(), { respond: json([{ id: "claude" }]), result: [{ id: "claude" }] }],
   ["GET /api/profiles", () => api.fetchProfiles()],
@@ -251,10 +288,9 @@ const requestCases: RequestCase[] = [
     () => api.browseFilesystem("/repo", 50, "src", true),
   ],
   ["GET /api/groups", () => api.fetchGroups()],
-  ["GET /api/projects", () => api.fetchProjects()],
-  ["GET /api/projects?scope=profile", () => api.fetchProjects("profile")],
-  ["GET /api/projects?profile=work", () => api.fetchProjects(undefined, "work")],
-  ["GET /api/projects?scope=global&profile=work", () => api.fetchProjects("global", "work")],
+  ["GET /api/projects?profile=default", () => api.fetchProjects({ profile: "default" })],
+  ["GET /api/projects?scope=global", () => api.fetchProjects({ scope: "global" })],
+  ["GET /api/projects?scope=profile&profile=served", () => api.fetchProjects({ scope: "profile", profile: "served" })],
   [
     "GET /api/importable-sessions?agent=pi&profile=work",
     () => api.listImportableSessions("pi", "work"),
@@ -270,21 +306,21 @@ const requestCases: RequestCase[] = [
   ],
   [
     "POST /api/projects",
-    () => api.createProject({ path: "/p", name: "p", scope: "global" }),
+    () => api.createProject({ path: "/p", name: "p", scope: "global", profile: "default" }),
     {
-      body: { path: "/p", name: "p", scope: "global" },
+      body: { path: "/p", name: "p", scope: "global", profile: "default" },
       respond: json({ name: "p" }),
       result: { ok: true, project: { name: "p" } },
     },
   ],
   [
-    "DELETE /api/projects/my%20proj?scope=profile",
-    () => api.deleteProject("my proj", "profile"),
+    "DELETE /api/projects/my%20proj?scope=profile&profile=default",
+    () => api.deleteProject("my proj", { scope: "profile", profile: "default" }),
     { result: { ok: true } },
   ],
   [
     "PATCH /api/projects/p?scope=global",
-    () => api.updateProject("p", "global", "develop"),
+    () => api.updateProject("p", { scope: "global" }, { default_base_branch: "develop" }),
     {
       body: { default_base_branch: "develop" },
       respond: json({ name: "p" }),
@@ -293,27 +329,79 @@ const requestCases: RequestCase[] = [
   ],
   [
     "PATCH /api/projects/p?scope=global",
-    () => api.updateProject("p", "global", "develop", { worktree_enabled: true, smart_rename: null }),
+    () => api.updateProject("p", { scope: "global" }, { default_base_branch: null }),
+    { body: { default_base_branch: null }, respond: json({}) },
+  ],
+  [
+    "PATCH /api/projects/p?scope=global",
+    () =>
+      api.updateProject(
+        "p",
+        { scope: "global" },
+        {
+          default_base_branch: "develop",
+          overrides: { worktree_enabled: true, smart_rename: null, sandbox_enabled: false },
+        },
+      ),
     {
-      body: { default_base_branch: "develop", overrides: { worktree_enabled: true, smart_rename: null } },
+      body: {
+        default_base_branch: "develop",
+        overrides: { worktree_enabled: true, smart_rename: null, sandbox_enabled: false },
+      },
       respond: json({}),
     },
   ],
   [
-    "PATCH /api/projects/a%20b?scope=profile",
-    () => api.setProjectPinned("a b", "profile", true),
-    { body: { pinned: true }, respond: json({ pinned: true }), result: { ok: true, project: { pinned: true } } },
+    "POST /api/projects",
+    () => api.createProject({ path: "/p", scope: "global", profile: "default", overrides: { worktree_enabled: true } }),
+    {
+      body: { path: "/p", scope: "global", profile: "default", overrides: { worktree_enabled: true } },
+      respond: json({}),
+    },
+  ],
+  [
+    "PATCH /api/projects/a%20b?scope=profile&profile=served",
+    () =>
+      api.updateProject(
+        "a b",
+        { scope: "profile", profile: "served" },
+        { pinned: true, overrides: { sandbox_enabled: null } },
+      ),
+    {
+      body: { pinned: true, overrides: { sandbox_enabled: null } },
+      respond: json({ pinned: true }),
+      result: { ok: true, project: { pinned: true } },
+    },
   ],
   [
     "POST /api/sessions",
-    () => api.createSession({ path: "/repo", tool: "claude", trust_hooks: true } as CreateSessionRequest),
+    () =>
+      api.createSession({
+        path: "/repo",
+        tool: "claude",
+        trust_hooks: true,
+        trust_review: { project_path: "/repo", base_hooks_hash: "base", hooks_hash: "repo", mcp_hash: null },
+      } as CreateSessionRequest),
     {
-      body: { path: "/repo", tool: "claude", trust_hooks: true },
+      body: {
+        path: "/repo",
+        tool: "claude",
+        trust_hooks: true,
+        trust_review: { project_path: "/repo", base_hooks_hash: "base", hooks_hash: "repo", mcp_hash: null },
+      },
       respond: json(session, 201),
       result: { ok: true, session },
     },
   ],
-  ["PATCH /api/sessions/s1", () => api.renameSession("s1", "T"), { body: { title: "T" }, result: { ok: true } }],
+  [
+    "PATCH /api/sessions/s1",
+    () => api.renameSession("s1", "T"),
+    {
+      body: { title: "T" },
+      respond: runtimeJson({ ...session, outcome: { warnings: [] } }),
+      result: { ok: true, session, cursor },
+    },
+  ],
   [
     "POST /api/sessions/s1/smart-rename",
     () => api.smartRenameSession("s1"),
@@ -323,20 +411,17 @@ const requestCases: RequestCase[] = [
   [
     "PATCH /api/sessions/s1/worktree-name",
     () => api.setWorktreeName("s1", "feature", true),
-    { body: { name: "feature", rename_branch: true }, result: { ok: true } },
+    {
+      body: { name: "feature", rename_branch: true },
+      respond: runtimeJson({ ...session, outcome: { warnings: [] } }),
+      result: { ok: true, session, cursor },
+    },
   ],
-  ["PATCH /api/sessions/a%2Fb/group", () => api.updateSessionGroup("a/b", ""), { body: { group: "" }, result: true }],
-  ...(
-    [
-      ["off", false],
-      ["all", true],
-      ["default", null],
-    ] as const
-  ).map(([preset, value]): RequestCase => [
-    "PATCH /api/sessions/s1/notifications",
-    () => api.setSessionNotifications("s1", preset),
-    { body: { notify_on_waiting: value, notify_on_idle: value, notify_on_error: value }, result: true },
-  ]),
+  [
+    "PATCH /api/sessions/a%2Fb/group",
+    () => api.updateSessionGroup("a/b", ""),
+    { body: { group: "" }, respond: runtimeJson(session), result: { session, cursor } },
+  ],
   [
     "PATCH /api/sessions/s1/diff-base",
     () => api.setSessionDiffBase("s1", "develop"),
@@ -352,7 +437,6 @@ const requestCases: RequestCase[] = [
     () => api.setSessionPin("s1", false),
     { body: { pinned: false }, respond: json(session), result: session },
   ],
-  ["PATCH /api/sessions/s1/color", () => api.setSessionColor("s1", null), { body: { color: null } }],
   [
     "PATCH /api/sessions/s1/archive",
     () => api.setSessionArchive("s1", true),
@@ -379,27 +463,22 @@ const requestCases: RequestCase[] = [
   ["PATCH /api/sessions/s1/snooze", () => api.setSessionSnooze("s1", 60), { body: { minutes: 60 } }],
   ["PATCH /api/sessions/s1/unread", () => api.setSessionUnread("s1", true), { body: { unread: true } }],
   [
-    "DELETE /api/workspaces",
-    () => api.deleteWorkspace(["a", "b"], { delete_worktree: true }),
-    {
-      body: { session_ids: ["a", "b"], delete_worktree: true },
-      respond: json({ deleted: ["a"], failed: [{ id: "b", error: "boom" }], messages: ["m"] }),
-      result: { ok: true, messages: ["m"], deleted: ["a"], failed: [{ id: "b", error: "boom" }] },
-    },
-  ],
-  [
     "POST /api/sessions/s1/projects",
-    () => api.attachSessionProject("s1", "/r"),
+    () => api.attachSessionProject("s1", "/r", { epoch: "boot" }),
     {
       body: { project: "/r", attach_existing_branch: false },
-      respond: json({
-        worker: "restart_failed",
-        worker_message: "boom",
-        attached: { name: "r", branch: "b", branch_created: false, moved_to: "/w" },
-        warnings: ["w"],
+      respond: runtimeJson({
+        ...session,
+        outcome: {
+          worker: { status: "restart_failed", message: "boom" },
+          attached: { name: "r", worktree_path: "/w/r", branch: "b", branch_created: false, moved_to: "/w" },
+          warnings: ["w"],
+        },
       }),
       result: {
         ok: true,
+        session,
+        cursor,
         worker: "restart_failed",
         message: "boom",
         name: "r",
@@ -663,8 +742,7 @@ describe("settings saves", () => {
 
 const failureCases: [string, () => Promise<unknown>, unknown][] = [
   ["fetchSessions", () => api.fetchSessions(), null],
-  ["fetchProjects", () => api.fetchProjects(), []],
-  ["fetchProjectRegistry", () => api.fetchProjectRegistry(undefined, "work"), null],
+  ["fetchProjects", () => api.fetchProjects({ profile: "work" }), null],
   ["searchConversations", () => api.searchConversations("q"), []],
   ["updateWorkspaceOrdering", () => api.updateWorkspaceOrdering([]), false],
   ["getSessionFileContents", () => api.getSessionFileContents("s1", "a"), null],
@@ -685,7 +763,7 @@ const failureCases: [string, () => Promise<unknown>, unknown][] = [
   ["listServerQueue", () => api.listServerQueue("s1"), []],
   ["renameSession", () => api.renameSession("s1", "x"), { ok: false }],
   ["smartRenameSession", () => api.smartRenameSession("s1"), { ok: false }],
-  ["attachSessionProject", () => api.attachSessionProject("s1", "p"), { ok: false }],
+  ["attachSessionProject", () => api.attachSessionProject("s1", "p", { epoch: "boot" }), { ok: false }],
   ["resolveMcpConflict", () => api.resolveMcpConflict("n", "a", "aoe", "fp"), "error"],
   ["invokePluginAction", () => api.invokePluginAction("p", "m"), null],
   ["resolvePluginOptions", () => api.resolvePluginOptions("p", "s", []), []],
@@ -808,11 +886,71 @@ it("forwards abort signals", async () => {
 it("pasteImage uploads raw base64 and returns the host path", async () => {
   fetchSpy.mockResolvedValueOnce(json({ path: "/wt/img.png" }));
   const file = new File(["hi"], "img.png", { type: "image/png" });
-  expect(await api.pasteImage("s1", file)).toBe("/wt/img.png");
+  expect(await api.pasteImage("s1", file, () => true)).toBe("/wt/img.png");
   expect(lastCall().url).toBe("/api/sessions/s1/paste-image");
   expect(bodyOf(lastCall().init)).toEqual({ mime_type: "image/png", data: btoa("hi") });
   fetchSpy.mockResolvedValueOnce(json({}));
-  expect(await api.pasteImage("s1", file)).toBeNull();
+  expect(await api.pasteImage("s1", file, () => true)).toBeNull();
+});
+
+it("drops an image upload revoked during file decoding without replaying it", async () => {
+  let finish!: () => void;
+  vi.stubGlobal(
+    "FileReader",
+    class {
+      result = "data:image/png;base64,aGk=";
+      onload: (() => void) | null = null;
+      readAsDataURL() {
+        finish = () => this.onload?.();
+      }
+    },
+  );
+  let readOnly = false;
+  const file = new File(["hi"], "img.png", { type: "image/png" });
+  const pending = api.pasteImage("s1", file, () => !readOnly);
+  readOnly = true;
+  finish();
+  expect(await pending).toBeNull();
+  expect(fetchSpy).not.toHaveBeenCalled();
+  readOnly = false;
+  expect(fetchSpy).not.toHaveBeenCalled();
+  fetchSpy.mockResolvedValueOnce(json({ path: "/wt/new.png" }));
+  const fresh = api.pasteImage("s1", file, () => !readOnly);
+  finish();
+  expect(await fresh).toBe("/wt/new.png");
+  expect(fetchSpy).toHaveBeenCalledTimes(1);
+});
+
+it("keeps a dispatched image upload result after write policy is revoked", async () => {
+  vi.stubGlobal(
+    "FileReader",
+    class {
+      result = "data:image/png;base64,aGk=";
+      onload: (() => void) | null = null;
+      readAsDataURL() {
+        this.onload?.();
+      }
+    },
+  );
+  let readOnly = false;
+  let finish!: (response: Response) => void;
+  let started!: () => void;
+  const dispatched = new Promise<void>((resolve) => {
+    started = resolve;
+  });
+  fetchSpy.mockImplementationOnce(() => {
+    started();
+    return new Promise<Response>((resolve) => {
+      finish = resolve;
+    });
+  });
+  const file = new File(["hi"], "img.png", { type: "image/png" });
+  const pending = api.pasteImage("s1", file, () => !readOnly);
+  await dispatched;
+  readOnly = true;
+  finish(json({ path: "/wt/accepted.png" }));
+  expect(await pending).toBe("/wt/accepted.png");
+  expect(fetchSpy).toHaveBeenCalledTimes(1);
 });
 
 it("fetchSoundBlob returns the file as a Blob", async () => {
@@ -837,6 +975,25 @@ describe("fetchCityHallBundle", () => {
   });
 });
 
+describe("fetchLogs", () => {
+  it("requests the line count and returns the snapshot", async () => {
+    const snapshot = { status: "available", content: "a\n", lineCount: 1, truncated: false };
+    fetchSpy.mockResolvedValueOnce(json(snapshot));
+    const signal = new AbortController().signal;
+    await expect(api.fetchLogs(200, signal)).resolves.toEqual(snapshot);
+    expect(lastCall().url).toBe("/api/system/logs?lines=200");
+    expect(lastCall().init).toEqual({ signal });
+  });
+
+  it.each([
+    [json({ message: "Server is in read-only mode" }, 403), "Server is in read-only mode"],
+    [new Response("<html>502</html>", { status: 502 }), "Could not load logs (HTTP 502)"],
+  ])("throws the server message or status", async (response, message) => {
+    fetchSpy.mockResolvedValueOnce(response);
+    await expect(api.fetchLogs(500)).rejects.toThrow(message);
+  });
+});
+
 describe("installAcpAgent", () => {
   it("POSTs and returns the parsed body", async () => {
     const body = { session_id: "s-1", package: "p", success: true, exit_code: 0, stdout: "", stderr: "" };
@@ -858,7 +1015,9 @@ describe("installAcpAgent", () => {
 
 describe("project mutations", () => {
   const calls: [string, () => Promise<{ ok: boolean; error?: string }>][] = [
-    ["createProject", () => api.createProject({ path: "/p" })],
+    ["createProject", () => api.createProject({ path: "/p", scope: "global", profile: "default" })],
+    ["deleteProject", () => api.deleteProject("p", { scope: "global" })],
+    ["updateProject", () => api.updateProject("p", { scope: "global" }, { default_base_branch: "x" })],
   ];
 
   it.each(calls)("%s maps JSON, text, and network errors", async (_name, call) => {
@@ -897,6 +1056,57 @@ describe("createSession errors", () => {
   ])("surfaces %s", async (_name, payload, hooksNeedTrust) => {
     fetchSpy.mockResolvedValueOnce(new Response(JSON.stringify(payload), { status: 403 }));
     expect(await api.createSession(body)).toEqual({ ok: false, error: "trust me", hooksNeedTrust });
+  });
+
+  it("classifies an empty creation_trust_changed 409 before parsing its body", async () => {
+    fetchSpy.mockResolvedValueOnce(
+      new Response(null, {
+        status: 409,
+        headers: { "aoe-error-code": "creation_trust_changed" },
+      }),
+    );
+    expect(await api.createSession(body)).toEqual({
+      ok: false,
+      error: "Repository hook configuration changed; review it again",
+      trustChanged: true,
+    });
+  });
+
+  it("reviews the exact creation trust fingerprint", async () => {
+    const review = {
+      fingerprint: { project_path: "/repo", base_hooks_hash: "base", hooks_hash: "repo", mcp_hash: null },
+      merged_hooks: { on_create: ["setup"] },
+      repo_hooks: { on_create: ["setup"] },
+      mcp_summaries: [],
+      hooks_need_trust: true,
+      mcp_need_trust: false,
+    };
+    fetchSpy.mockResolvedValueOnce(json(review));
+    expect(await api.reviewCreationTrust({ path: "/repo", profile: "default", scratch: false })).toEqual({
+      ok: true,
+      review,
+    });
+    const { url, init } = lastCall();
+    expect(url).toBe("/api/sessions/creation-trust");
+    expect(init?.method).toBe("POST");
+    expect(JSON.parse(String(init?.body))).toEqual({ path: "/repo", profile: "default", scratch: false });
+  });
+
+  it("rejects malformed MCP summaries without exposing their payload", async () => {
+    const secret = "server-secret-mcp-command";
+    fetchSpy.mockResolvedValueOnce(
+      json({
+        fingerprint: { project_path: "/repo", base_hooks_hash: "base", hooks_hash: "repo", mcp_hash: null },
+        merged_hooks: {},
+        repo_hooks: {},
+        mcp_summaries: secret,
+        hooks_need_trust: false,
+        mcp_need_trust: true,
+      }),
+    );
+    const result = await api.reviewCreationTrust({ path: "/repo" });
+    expect(result).toEqual({ ok: false, error: "Invalid creation trust review" });
+    expect(JSON.stringify(result)).not.toContain(secret);
   });
 
   it("maps plain JSON, text, and network errors", async () => {
@@ -946,6 +1156,80 @@ it("cloneRepo maps server and network errors", async () => {
   expect(await api.cloneRepo("u")).toEqual({ ok: false, error: "Clone failed (500)" });
   offline();
   expect(await api.cloneRepo("u")).toEqual({ ok: false, error: "Network error: offline" });
+});
+
+describe("passkey ceremonies", () => {
+  const getOptions = { publicKey: { challenge: "c" } };
+  let get: ReturnType<typeof vi.fn>;
+  let create: ReturnType<typeof vi.fn>;
+
+  beforeEach(() => {
+    get = vi.fn();
+    create = vi.fn();
+    const parse = vi.fn((o: unknown) => ({ parsed: o }));
+    vi.stubGlobal("PublicKeyCredential", {
+      parseRequestOptionsFromJSON: parse,
+      parseCreationOptionsFromJSON: parse,
+    });
+    vi.stubGlobal("navigator", { credentials: { get, create } });
+  });
+  afterEach(() => vi.unstubAllGlobals());
+
+  it("passkeysSupported needs both JSON parsers", () => {
+    expect(api.passkeysSupported()).toBe(true);
+    vi.stubGlobal("PublicKeyCredential", { parseRequestOptionsFromJSON: () => {} });
+    expect(api.passkeysSupported()).toBe(false);
+    vi.stubGlobal("PublicKeyCredential", undefined);
+    expect(api.passkeysSupported()).toBe(false);
+  });
+
+  it("loginWithPasskey runs start, the browser prompt, then finish with the binding secret", async () => {
+    fetchSpy.mockResolvedValueOnce(json({ transaction_id: "t1", options: getOptions }));
+    get.mockResolvedValueOnce({ toJSON: () => ({ id: "cred" }) });
+    fetchSpy.mockResolvedValueOnce(empty());
+
+    expect(await api.loginWithPasskey()).toEqual({ ok: true });
+    expect(get).toHaveBeenCalledWith({ publicKey: { parsed: { challenge: "c" } } });
+    const calls = fetchSpy.mock.calls;
+    expect(calls[0][0]).toBe("/api/login/passkey/start");
+    expect(calls[1][0]).toBe("/api/login/passkey/finish");
+    const sent = bodyOf(calls[1][1]);
+    expect(sent.transaction_id).toBe("t1");
+    expect(sent.credential).toEqual({ id: "cred" });
+    expect(sent.device_binding_secret).toMatch(/.+/);
+  });
+
+  it("a dismissed prompt is cancelled and never reaches finish", async () => {
+    fetchSpy.mockResolvedValueOnce(json({ transaction_id: "t1", options: getOptions }));
+    get.mockRejectedValueOnce(new DOMException("denied", "NotAllowedError"));
+    expect(await api.loginWithPasskey()).toEqual({ ok: false, cancelled: true });
+    expect(fetchSpy).toHaveBeenCalledTimes(1);
+  });
+
+  it("maps start, finish and network failures", async () => {
+    fetchSpy.mockResolvedValueOnce(json({ message: "no passkey" }, 404));
+    expect(await api.loginWithPasskey()).toEqual({ ok: false, error: "no passkey" });
+
+    fetchSpy.mockResolvedValueOnce(json({ transaction_id: "t1", options: getOptions }));
+    get.mockResolvedValueOnce({ toJSON: () => ({}) });
+    fetchSpy.mockResolvedValueOnce(empty(401));
+    expect(await api.loginWithPasskey()).toEqual({ ok: false, error: "Passkey sign-in failed (401)" });
+
+    offline();
+    expect(await api.loginWithPasskey()).toEqual({ ok: false, error: "Network error" });
+  });
+
+  it("registerPasskey sends the label and the created credential", async () => {
+    fetchSpy.mockResolvedValueOnce(json({ transaction_id: "t2", options: { publicKey: { challenge: "c" } } }));
+    create.mockResolvedValueOnce({ toJSON: () => ({ id: "new" }) });
+    fetchSpy.mockResolvedValueOnce(json({ ok: true }));
+
+    expect(await api.registerPasskey("Phone")).toEqual({ ok: true });
+    expect(fetchSpy.mock.calls[0][0]).toBe("/api/passkeys/register/start");
+    expect(bodyOf(fetchSpy.mock.calls[0][1])).toEqual({ label: "Phone" });
+    expect(fetchSpy.mock.calls[1][0]).toBe("/api/passkeys/register/finish");
+    expect(bodyOf(fetchSpy.mock.calls[1][1])).toEqual({ transaction_id: "t2", credential: { id: "new" } });
+  });
 });
 
 describe("login", () => {
@@ -1008,14 +1292,14 @@ describe("login", () => {
 
 describe("session mutation messages", () => {
   it("renameSession keeps only string warnings", async () => {
-    fetchSpy.mockResolvedValueOnce(json({ warnings: ["kept", 3, null] }));
-    expect(await api.renameSession("s1", "T")).toEqual({ ok: true, warnings: ["kept"] });
+    fetchSpy.mockResolvedValueOnce(runtimeJson({ ...session, outcome: { warnings: ["kept", 3, null] } }));
+    expect(await api.renameSession("s1", "T")).toEqual({ ok: true, session, cursor, warnings: ["kept"] });
   });
 
   it.each([
     ["renameSession", () => api.renameSession("s1", "x")],
     ["smartRenameSession", () => api.smartRenameSession("s1")],
-    ["attachSessionProject", () => api.attachSessionProject("s1", "p")],
+    ["attachSessionProject", () => api.attachSessionProject("s1", "p", { epoch: "boot" })],
   ])("%s surfaces the server message", async (_name, call) => {
     fetchSpy.mockResolvedValueOnce(json({ message: "running" }, 409));
     expect(await call()).toEqual({ ok: false, message: "running" });
@@ -1213,5 +1497,122 @@ describe("profile settings write guard", () => {
     expect(await api.updateProfileSettings("work", { hooks: {} })).toBe("committed");
     expect(fetchSpy).toHaveBeenCalledTimes(2);
     expect(lastCall().url).toBe("/api/profiles/work/settings");
+  });
+});
+
+describe("runtime snapshots and cancellation", () => {
+  it.each([
+    ["missing epoch", { "aoe-runtime-revision": "1" }],
+    ["missing revision", { "aoe-runtime-epoch": "boot" }],
+    ["malformed revision", { "aoe-runtime-epoch": "boot", "aoe-runtime-revision": "1.5" }],
+  ])("rejects unattested session snapshots and mutation ACKs (%s)", async (_name, headers) => {
+    for (const call of [() => api.fetchSessions(), () => api.updateSessionGroup("s1", "")]) {
+      fetchSpy.mockResolvedValueOnce(
+        new Response(JSON.stringify(session), { headers: headers as Record<string, string> }),
+      );
+      expect(await call()).toBeNull();
+    }
+  });
+
+  it.each([
+    ["missing epoch", { "aoe-runtime-revision": "1" }],
+    ["missing revision", { "aoe-runtime-epoch": "boot" }],
+    ["malformed revision", { "aoe-runtime-epoch": "boot", "aoe-runtime-revision": "1.5" }],
+    ["zero revision", { "aoe-runtime-epoch": "boot", "aoe-runtime-revision": "0" }],
+    ["another epoch", { "aoe-runtime-epoch": "successor", "aoe-runtime-revision": "1" }],
+  ])("does not claim a setting committed without its original runtime receipt (%s)", async (_name, headers) => {
+    for (const call of [
+      () => api.setSessionColor("s1", null, "boot"),
+      () => api.setSessionNotifications("s1", "default", "boot"),
+    ]) {
+      fetchSpy.mockResolvedValueOnce(
+        new Response(JSON.stringify(session), { headers: headers as Record<string, string> }),
+      );
+      expect(await call()).toEqual({ outcome: "uncertain" });
+    }
+  });
+
+  it.each([400, 401, 403, 409, 500, 503])(
+    "distinguishes setting rejection from unconfirmed writes (%s)",
+    async (status) => {
+      for (const call of [
+        () => api.setSessionColor("s1", null, "boot"),
+        () => api.setSessionNotifications("s1", "all", "boot"),
+      ]) {
+        fetchSpy.mockResolvedValueOnce(empty(status));
+        expect(await call()).toEqual({ outcome: status >= 500 ? "uncertain" : "rejected" });
+      }
+    },
+  );
+
+  it("does not attest another session or a missing canonical row", async () => {
+    for (const body of [null, {}, { ...session, id: "replacement" }]) {
+      fetchSpy.mockResolvedValueOnce(runtimeJson(body));
+      expect(await api.setSessionColor("s1", null, "boot")).toEqual({ outcome: "uncertain" });
+    }
+  });
+
+  it("preserves u64 revision precision and the canonical returned fields, including optional outcome", async () => {
+    const canonical = { ...session, color: "green", outcome: { acknowledged: true } };
+    fetchSpy.mockResolvedValueOnce(runtimeJson(canonical));
+    expect(await api.setSessionColor("s1", null, "boot")).toEqual({
+      outcome: "committed",
+      mutation: { session: canonical, cursor },
+    });
+    fetchSpy.mockResolvedValueOnce(runtimeJson(sessions));
+    expect((await api.fetchSessions())!.cursor.revision).toBe(9007199254740993n);
+  });
+
+  it.each(["sessions", "about", "projects"])(
+    "passes the caller's AbortSignal to %s and settles abort as null",
+    async (endpoint) => {
+      const controller = new AbortController();
+      fetchSpy.mockImplementationOnce(
+        (_url, init) =>
+          new Promise((_resolve, reject) => {
+            expect(init?.signal).toBe(controller.signal);
+            init!.signal!.addEventListener("abort", () => reject(new DOMException("aborted", "AbortError")), {
+              once: true,
+            });
+          }),
+      );
+      const request =
+        endpoint === "sessions"
+          ? api.fetchSessions(controller.signal)
+          : endpoint === "about"
+            ? api.fetchAbout(controller.signal)
+            : api.fetchProjects({ profile: "alpha" }, controller.signal);
+      controller.abort();
+      expect(await request).toBeNull();
+    },
+  );
+});
+
+describe("header-complete operations", () => {
+  it.each([
+    ["login", () => api.login("fixture"), { ok: true }],
+    ["terminal", () => api.ensureTerminal("s1"), { ok: true }],
+    ["summary", () => api.summarizeSession("s1"), { ok: true }],
+    ["smart rename", () => api.smartRenameSession("s1"), { ok: true }],
+    ["dismiss plugin update", () => api.dismissPluginUpdate("p", "fingerprint"), { kind: "ok" }],
+    ["refused plugin action", () => api.invokePluginAction("p.action", "s1"), null, 403],
+  ] as const)("settles %s without waiting for an open response body", async (_name, call, expected, status = 200) => {
+    let controller!: ReadableStreamDefaultController<Uint8Array>;
+    const stream = new ReadableStream<Uint8Array>({
+      start(value) {
+        controller = value;
+      },
+    });
+    fetchSpy.mockResolvedValueOnce(new Response(stream, { status }));
+    let timer!: ReturnType<typeof setTimeout>;
+    const deadline = new Promise<never>((_resolve, reject) => {
+      timer = setTimeout(() => reject(new Error("Operation waited for an irrelevant body")), 1000);
+    });
+    try {
+      expect(await Promise.race([call(), deadline])).toEqual(expected);
+    } finally {
+      clearTimeout(timer);
+      controller.close();
+    }
   });
 });

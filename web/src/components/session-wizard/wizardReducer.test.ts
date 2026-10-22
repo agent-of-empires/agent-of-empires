@@ -106,6 +106,13 @@ describe("APPLY_PROFILE_DEFAULTS", () => {
       defaults({ useStructuredView: false, skipIfDirty: undefined }),
       false,
     ],
+    [
+      "view edited after confirmed profile selection",
+      {},
+      [set("useStructuredView", false), { type: "RESET_STRUCTURED_VIEW_DIRTY" }, set("useStructuredView", true)],
+      defaults({ useStructuredView: false, skipIfDirty: undefined }),
+      true,
+    ],
     ["import", { importAcpSessionId: "abc" }, [], defaults({ useStructuredView: false }), true],
   ] as const)("seeds the configured view: %s", (_, data, edits, seed, view) => {
     expect(run(makeState(data), ...edits, seed).data.useStructuredView).toBe(view);
@@ -129,6 +136,18 @@ describe("SET_FIELD mutual exclusion", () => {
       importAcpSessionId: "",
       pathIsGitRepo: true,
     });
+  });
+
+  it("adding extra repos turns attach-existing off, removing them leaves it alone", () => {
+    const attached = makeState({ attachExisting: true, worktreeBranch: "feat/x", worktreeBranchDirty: true });
+    expect(reducer(attached, set("extraRepoPaths", ["/lib"])).data).toMatchObject({
+      attachExisting: false,
+      worktreeBranch: "",
+      worktreeBranchDirty: false,
+    });
+    expect(reducer(attached, set("extraRepoPaths", [])).data.attachExisting).toBe(true);
+    const creating = makeState({ worktreeBranch: "mine", worktreeBranchDirty: true });
+    expect(reducer(creating, set("extraRepoPaths", ["/lib"])).data.worktreeBranch).toBe("mine");
   });
 
   it.each([
@@ -217,6 +236,50 @@ describe("SEED_PROJECT_OVERRIDES", () => {
     expect(withB.data).toMatchObject({ useWorktree: false, projectWorktreeOverride: false });
     const switched = reducer(withB, defaults({ worktreeEnabled: true, skipIfDirty: false }));
     expect(switched.data).toMatchObject({ useWorktree: false, worktreeDirty: false });
+  });
+});
+
+describe("native import defaults", () => {
+  it.each([true, false])("clears host-incompatible state and ignores late defaults (skipIfDirty %s)", (skipIfDirty) => {
+    const imported = run(
+      makeState({
+        path: "/repo",
+        scratch: true,
+        useWorktree: true,
+        sandboxEnabled: true,
+        attachExisting: true,
+        extraRepoPaths: ["/other"],
+        repoBases: { "/other": "main" },
+        worktreeBranch: "feature",
+        baseBranch: "main",
+        projectWorktreeOverride: true,
+        projectSandboxOverride: true,
+      }),
+      set("importAcpSessionId", "native"),
+    );
+    const late = run(
+      imported,
+      {
+        type: "SEED_PROJECT_OVERRIDES",
+        path: "/repo",
+        overrides: { worktree_enabled: true, sandbox_enabled: true },
+      },
+      defaults({ sandboxEnabled: true, worktreeEnabled: true, skipIfDirty }),
+      set("title", "Imported title"),
+    );
+    expect(late.data).toMatchObject({
+      importAcpSessionId: "native",
+      scratch: false,
+      useWorktree: false,
+      sandboxEnabled: false,
+      attachExisting: false,
+      extraRepoPaths: [],
+      repoBases: {},
+      worktreeBranch: "",
+      baseBranch: "",
+      projectWorktreeOverride: undefined,
+      projectSandboxOverride: undefined,
+    });
   });
 });
 

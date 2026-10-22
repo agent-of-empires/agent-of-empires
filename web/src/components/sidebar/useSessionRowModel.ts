@@ -1,15 +1,25 @@
 import type { Workspace } from "../../lib/types";
-import { setSessionColor, setSessionNotifications } from "../../lib/api";
+import type { RuntimeCursor, SessionMutation } from "../../lib/api";
 import { useIdleDecayWindowMs } from "../../lib/idleDecay";
 import { useUnreadIndicatorEnabled } from "../../lib/unreadIndicator";
 import { usePluginAttention } from "../../lib/pluginUiContext";
 import type { OptimisticTriage } from "../../lib/sidebarOptimistic";
-import { reportError } from "../../lib/toastBus";
 import { deriveRowModel, SESSION_COLOR_OPTIONS, type RowModel } from "./rowModel";
-import { usePendingSetting } from "./usePendingSetting";
+import { sessionActionTarget, usePendingSetting } from "./usePendingSetting";
+
+export interface RowObservation {
+  observedById: Record<string, RuntimeCursor>;
+  runtimeEpoch: string | null;
+  onSessionMutation: (mutation: SessionMutation) => void;
+}
 
 /** The row model with its notify and color picks applied optimistically. */
-export function useSessionRowModel(workspace: Workspace, optimistic: OptimisticTriage, isActive: boolean) {
+export function useSessionRowModel(
+  workspace: Workspace,
+  optimistic: OptimisticTriage,
+  isActive: boolean,
+  observation: RowObservation,
+) {
   const idleDecayWindowMs = useIdleDecayWindowMs();
   const unreadIndicatorEnabled = useUnreadIndicatorEnabled();
   const pluginAttention = usePluginAttention();
@@ -19,19 +29,9 @@ export function useSessionRowModel(workspace: Workspace, optimistic: OptimisticT
     unreadIndicatorEnabled,
     pluginAttention,
   });
-  const { sessionId } = derived;
-  const [notifyPreset, setNotify] = usePendingSetting(
-    derived.notifyPreset,
-    (preset) => (sessionId ? setSessionNotifications(sessionId, preset) : Promise.resolve(false)),
-    () => reportError("Could not change notifications. Please try again."),
-  );
-  const [sessionColor, setColor] = usePendingSetting(
-    derived.sessionColor,
-    // The row shows any session's color, so every session must change for the pick to stick.
-    async (color) =>
-      (await Promise.all(workspace.sessions.map((s) => setSessionColor(s.id, color)))).every((r) => r != null),
-    () => reportError("Could not change the session color. Please try again."),
-  );
+  const targets = workspace.sessions.map((session) => sessionActionTarget(session, observation.runtimeEpoch));
+  const [notifyPreset, setNotify] = usePendingSetting("notifications", targets.slice(0, 1), derived.notifyPreset);
+  const [sessionColor, setColor] = usePendingSetting("color", targets, derived.sessionColor);
   const model: RowModel = {
     ...derived,
     notifyPreset,

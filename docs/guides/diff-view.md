@@ -26,11 +26,45 @@ Each entry carries a status letter: `A` added, `M` modified, `D` deleted, `R` re
 
 The diff refreshes automatically after you save and exit the editor.
 
+Base changes save through the Daemon for the original session and profile. The TUI shows pending or rejected saves instead of writing local session storage. A stale selection, unavailable runtime, or read-only policy refuses the save. Reconnect and select the base again to retry; changes are not replayed automatically.
+
 ## In the web dashboard
 
 The changed-files list has two layouts, toggled in its header: **flat** lists every path, **tree** nests them under collapsible directories with per-directory file counts and `+`/`-` stats. Arrow keys move the selection, left and right expand or collapse a directory, and Enter or Space opens a file. Per-repo collapse state persists to your web settings. Right-click a file or folder for **Copy relative path**. On a file, **Open file** opens its current working-tree copy in a new browser tab. It is disabled for deleted files.
 
 The **Files** pane (folder icon in the activity bar) browses the session's whole working directory, not just its git changes, so it lists files even in a non-git scratch session. Right-click a file there for the same **Open file** and **Copy relative path** actions. Markdown renders as HTML with a **Rendered** / **Raw** toggle, in this pane and from the diff list. Files an agent cites that live outside the session's repo open only when that agent actually read or wrote them during this session: the dashboard cannot open an arbitrary host path.
+
+### "Open file" and the raw route
+
+**Open file** does not navigate the tab to the file. It fetches the raw bytes
+through the authenticated client and hands them to the new tab as a blob URL,
+because a bare navigation carries no auth token. The diff list reads
+`GET /api/sessions/<id>/diff/file/raw?path=<repo-relative-path>`; the **Files**
+pane reads `GET /api/sessions/<id>/file/raw`. Both responses:
+
+- are capped at **50 MiB**; a larger file is answered `413 Payload Too Large`
+  rather than being read into memory. The cap is enforced on the read itself,
+  so a file that grows mid-request cannot slip past it;
+- are confined, but not identically. The diff route is confined to the
+  selected repo's worktree with no provenance fallback: an absolute path or a
+  `..` segment is a `400`, and a file deleted from the worktree is a `404`. The
+  **Files** pane is confined like the file viewer, so the session root, any
+  workspace member and any file the agent read or wrote during this session
+  open, and a path outside them is a `403`; an absolute path or a touched path
+  outside the repo opens from the pane while the diff route refuses it;
+- always carry `X-Content-Type-Options: nosniff`;
+- are sent as `Content-Disposition: attachment` for every type a browser would
+  not render in a tab, and additionally for every *scriptable* type (HTML, SVG,
+  XML, and the JavaScript/ECMAScript family), which is also re-typed as
+  `application/octet-stream`. Blob URLs drop `Content-Disposition`, so the
+  dashboard saves the attachment itself under the file's own name. A scriptable
+  artifact can therefore never become a document the dashboard's own origin
+  renders.
+
+Session artifacts written by an agent into the session's artifact directory
+(`GET /api/sessions/<id>/artifacts/<path>`) are served under the same rules:
+the same 50 MiB cap, the same `nosniff`, the same attachment-forcing, and
+confinement to that session's artifact directory.
 
 ### Split view
 

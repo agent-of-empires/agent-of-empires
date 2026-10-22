@@ -393,11 +393,12 @@ fn prepend_dir_to_path(cmd: &mut std::process::Command, dir: Option<&Path>) {
     }
 }
 
+/// Fixtures for an install under a test app dir.
 #[cfg(test)]
-mod tests {
+pub(crate) mod test_fixtures {
     use super::*;
 
-    fn touch_bin(app_dir: &Path, binary: &str) {
+    pub(crate) fn touch_bin(app_dir: &Path, binary: &str) {
         let bin = bin_dir(app_dir, binary);
         std::fs::create_dir_all(&bin).unwrap();
         let name = if cfg!(windows) {
@@ -408,7 +409,8 @@ mod tests {
         std::fs::write(bin.join(name), b"#!/usr/bin/env node\n").unwrap();
     }
 
-    fn write_digest(app_dir: &Path, binary: &str) {
+    /// Marks the install current, as a finished `install` does.
+    pub(crate) fn write_digest(app_dir: &Path, binary: &str) {
         let adapter = lookup(binary).unwrap();
         std::fs::write(
             adapter_dir(app_dir, binary).join(DIGEST_FILE),
@@ -416,6 +418,12 @@ mod tests {
         )
         .unwrap();
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::test_fixtures::{touch_bin, write_digest};
+    use super::*;
 
     #[test]
     fn installation_is_current_requires_matching_digest_and_binary() {

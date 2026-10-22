@@ -15,7 +15,6 @@ use tui_input::Input;
 use super::DialogResult;
 use crate::containers;
 use crate::session::config::profile_config::resolve_config_or_warn;
-use crate::session::config::repo_config::HookProgress;
 use crate::session::config::{load_config, update_app_state, DefaultTerminalMode, SandboxConfig};
 #[cfg(test)]
 use crate::session::Config;
@@ -242,11 +241,10 @@ pub struct NewSessionDialog {
     pub(super) available_projects: Vec<crate::session::Project>,
     pub(super) dir_picker: DirPicker,
     pub(super) error_message: Option<String>,
-    pub(super) show_help: bool,
+    /// A suggested-session create is in flight on this dialog's data; keys
+    /// are held so the request cannot be abandoned and resubmitted.
     pub(super) loading: bool,
-    pub(super) has_hooks: bool,
-    pub(super) current_hook: Option<String>,
-    pub(super) hook_output: Vec<String>,
+    pub(super) show_help: bool,
     pub(super) path_invalid_flash_until: Option<Instant>,
     /// Ghost text completion for the path field (fish-shell style).
     path_ghost: Option<PathGhostCompletion>,
@@ -378,7 +376,7 @@ fn project_overrides(
 
 /// Key identifying a typed path the way the registry lookup does.
 fn path_key(path: &str) -> String {
-    crate::session::projects::canonical_key(&path_input::expand_tilde(path.trim()))
+    crate::session::projects::canonical_key(path_input::expand_tilde(path.trim()))
 }
 
 /// What the registry says about the form's project.
@@ -597,11 +595,8 @@ impl NewSessionDialog {
             extra_args: Input::new(extra_args_value),
             command_override: Input::new(command_override_value),
             error_message: None,
-            show_help: false,
             loading: false,
-            has_hooks: false,
-            current_hook: None,
-            hook_output: Vec::new(),
+            show_help: false,
             path_invalid_flash_until: None,
             path_ghost: None,
             group_ghost: None,
@@ -785,17 +780,6 @@ impl NewSessionDialog {
             .unwrap_or("")
     }
 
-    pub fn push_hook_progress(&mut self, progress: HookProgress) {
-        match progress {
-            HookProgress::Started(cmd) => {
-                self.current_hook = Some(cmd);
-            }
-            HookProgress::Output(line) => {
-                self.hook_output.push(line);
-            }
-        }
-    }
-
     pub fn set_loading(&mut self, loading: bool) {
         self.loading = loading;
         if loading {
@@ -807,16 +791,15 @@ impl NewSessionDialog {
         self.loading
     }
 
+    pub fn set_error(&mut self, error: String) {
+        self.error_message = Some(error);
+    }
+
     /// Advance dialog timers (spinner and transient highlights).
     /// Returns true when visual state changed and the UI should redraw.
     pub fn tick(&mut self) -> bool {
-        let mut changed = false;
-
-        if self.loading {
-            // rattles computes the frame from elapsed time; just redraw.
-            changed = true;
-        }
-
+        // rattles computes the spinner frame from elapsed time; just redraw.
+        let mut changed = self.loading;
         if let Some(until) = self.path_invalid_flash_until {
             if Instant::now() >= until {
                 self.path_invalid_flash_until = None;
@@ -1142,11 +1125,8 @@ impl NewSessionDialog {
             extra_args: Input::default(),
             command_override: Input::default(),
             error_message: None,
-            show_help: false,
             loading: false,
-            has_hooks: false,
-            current_hook: None,
-            hook_output: Vec::new(),
+            show_help: false,
             path_invalid_flash_until: None,
             path_ghost: None,
             group_ghost: None,
@@ -1226,11 +1206,8 @@ impl NewSessionDialog {
             extra_args: Input::default(),
             command_override: Input::default(),
             error_message: None,
-            show_help: false,
             loading: false,
-            has_hooks: false,
-            current_hook: None,
-            hook_output: Vec::new(),
+            show_help: false,
             path_invalid_flash_until: None,
             path_ghost: None,
             group_ghost: None,
@@ -1247,10 +1224,6 @@ impl NewSessionDialog {
             hover_rects: Vec::new(),
             hover: HoverState::default(),
         }
-    }
-
-    pub fn set_error(&mut self, error: String) {
-        self.error_message = Some(error);
     }
 }
 
@@ -1431,10 +1404,6 @@ impl NewSessionDialog {
 
     pub fn handle_key(&mut self, key: KeyEvent) -> DialogResult<NewSessionData> {
         if self.loading {
-            if matches!(key.code, KeyCode::Esc) {
-                self.loading = false;
-                return DialogResult::Cancel;
-            }
             return DialogResult::Continue;
         }
 
@@ -1844,16 +1813,32 @@ impl NewSessionDialog {
             return;
         }
         let resolved = path_input::expand_tilde(&path_str);
-        match crate::git::diff::list_branches(std::path::Path::new(&resolved)) {
-            Ok(branches) if !branches.is_empty() => {
+        let resolved = std::path::Path::new(&resolved);
+        // Attaching targets a branch that already has a worktree, so Name lists
+        // only those; Base still lists every branch. A multi-repo workspace
+        // creates a fresh worktree per repo, so it keeps the full list.
+        let attach_name = !self.create_new_branch
+            && self.workspace_repos.is_empty()
+            && self.worktree_config_focused_field != WT_BASE_BRANCH_FIELD;
+        let (what, listed) = if attach_name {
+            let worktrees = crate::git::GitWorktree::list_branch_worktrees_at(resolved)
+                .map(|wts| wts.into_iter().filter_map(|wt| wt.branch).collect())
+                .map_err(|e| e.to_string());
+            ("worktrees", worktrees)
+        } else {
+            let branches = crate::git::diff::list_branches(resolved).map_err(|e| e.to_string());
+            ("branches", branches)
+        };
+        match listed {
+            Ok(items) if !items.is_empty() => {
                 self.error_message = None;
-                self.branch_picker.activate(branches);
+                self.branch_picker.activate(items);
             }
             Ok(_) => {
-                self.error_message = Some(format!("No branches found in {}.", path_str));
+                self.error_message = Some(format!("No {what} found in {path_str}."));
             }
             Err(e) => {
-                self.error_message = Some(format!("Cannot list branches in {}: {}", path_str, e));
+                self.error_message = Some(format!("Cannot list {what} in {path_str}: {e}"));
             }
         }
     }

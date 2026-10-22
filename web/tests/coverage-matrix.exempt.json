@@ -26,20 +26,12 @@
       "reason": "Toast presentation primitive; flows exercise it implicitly"
     },
     {
-      "path": "web/src/components/OwnerAvatar.tsx",
-      "reason": "Pure presentational avatar"
-    },
-    {
       "path": "web/src/components/OverflowMenu.tsx",
       "reason": "Presentational primitive; covered indirectly by sidebar specs"
     },
     {
       "path": "web/src/components/PaletteTriggerPill.tsx",
       "reason": "Trigger covered by command-palette.spec.ts"
-    },
-    {
-      "path": "web/src/components/UpdateBanner.tsx",
-      "reason": "Update banner covered by update-banner.spec.ts (mocked)"
     },
     {
       "path": "web/src/components/command-palette/CommandPalette.tsx",

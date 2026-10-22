@@ -37,6 +37,7 @@ pub async fn probe_agent(agent: &str) -> anyhow::Result<bool> {
     let tmp = tempfile::tempdir()?;
 
     let config = SpawnConfig {
+        launch_lease: None,
         wrapper_substitution: None,
         agent_key: agent.to_string(),
         tool: agent.to_string(),
@@ -59,6 +60,7 @@ pub async fn probe_agent(agent: &str) -> anyhow::Result<bool> {
         source_profile: None,
         mcp_servers: Vec::new(),
         seed_history_replay: false,
+        prior_conversation: false,
         generation: 0,
         artifact_dir: None,
         claude_store_pin: None,

@@ -59,7 +59,7 @@ interface SetupOpts {
 async function setup(page: Page, opts: SetupOpts = {}) {
   const structuredView = opts.structuredView ?? true;
   const acpWorkerState = opts.acpWorkerState ?? "running";
-  await page.route("**/api/login/status", (r) => r.fulfill({ json: { required: false, authenticated: true } }));
+  await page.route("**/api/login/status*", (r) => r.fulfill({ json: { required: false, authenticated: true } }));
   for (const path of [
     "settings",
     "themes",
@@ -83,6 +83,7 @@ async function setup(page: Page, opts: SetupOpts = {}) {
   await page.route("**/api/sessions", (r) => {
     if (r.request().method() === "POST") return r.fulfill({ status: 400 });
     return r.fulfill({
+      headers: { "aoe-runtime-epoch": "mock-runtime", "aoe-runtime-revision": "1" },
       json: {
         sessions: [
           sessionResponse({

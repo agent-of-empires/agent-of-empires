@@ -79,12 +79,12 @@ describe("TerminalView early-return states", () => {
   it("shows a placeholder while pending and the error, or generic copy, when ensure fails", async () => {
     // Never-resolving promise keeps ensureState at "pending".
     ensureSession.mockReturnValue(new Promise(() => {}));
-    render(<TerminalView session={makeSession()} />);
+    render(<TerminalView readOnly={false} session={makeSession()} />);
     expect(screen.getByText(/Starting session/i)).toBeDefined();
     cleanup();
 
     ensureSession.mockResolvedValueOnce({ ok: false });
-    render(<TerminalView session={makeSession()} />);
+    render(<TerminalView readOnly={false} session={makeSession()} />);
     await waitFor(() => expect(screen.getByText(/Could not start session/i)).toBeDefined());
   });
 
@@ -98,7 +98,7 @@ describe("TerminalView early-return states", () => {
       error: "session_archived",
       message: "session is archived; unarchive it first",
     });
-    render(<LiveTerminalView session={makeSession()} surface={surface} />);
+    render(<LiveTerminalView readOnly={false} session={makeSession()} surface={surface} />);
     await waitFor(() => {
       expect(screen.getByText("session is archived; unarchive it first")).toBeDefined();
     });
@@ -111,11 +111,13 @@ describe("TerminalView early-return states", () => {
       error: "session_archived",
       message: "session is archived; unarchive it first",
     });
-    const { rerender } = render(<TerminalView session={makeSession({ archived_at: "2026-01-01T00:00:00Z" })} />);
+    const { rerender } = render(
+      <TerminalView readOnly={false} session={makeSession({ archived_at: "2026-01-01T00:00:00Z" })} />,
+    );
     await waitFor(() => {
       expect(screen.getByText("session is archived; unarchive it first")).toBeDefined();
     });
-    rerender(<TerminalView session={makeSession({ archived_at: null })} />);
+    rerender(<TerminalView readOnly={false} session={makeSession({ archived_at: null })} />);
     await waitFor(() => {
       expect(screen.queryByText("session is archived; unarchive it first")).toBeNull();
     });
@@ -124,7 +126,7 @@ describe("TerminalView early-return states", () => {
 
   it("re-runs ensureSession when Retry is clicked", async () => {
     ensureSession.mockResolvedValueOnce({ ok: false, message: "first fail" });
-    const { container } = render(<TerminalView session={makeSession()} />);
+    const { container } = render(<TerminalView readOnly={false} session={makeSession()} />);
     await waitFor(() => {
       expect(screen.getByText("first fail")).toBeDefined();
     });

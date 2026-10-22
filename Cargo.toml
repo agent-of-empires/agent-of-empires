@@ -3,7 +3,7 @@ members = [".", "xtask", "aoe-settings-derive", "aoe-plugin-api"]
 
 [package]
 name = "agent-of-empires"
-version = "1.20.0"
+version = "1.21.0"
 edition = "2021"
 rust-version = "1.89"
 authors = ["Agent of Empires Contributors"]
@@ -47,7 +47,7 @@ aoe-settings-derive = { path = "aoe-settings-derive" }
 aoe-plugin-api = { path = "aoe-plugin-api" }
 
 # Serialization
-serde = { version = "1.0", features = ["derive"] }
+serde = { version = "1.0", features = ["derive", "rc"] }
 serde_ignored = "0.1"
 serde_json = { version = "1.0", features = ["preserve_order"] }
 ts-rs = { version = "12", optional = true }
@@ -77,7 +77,7 @@ anyhow = "1.0"
 chrono = { version = "0.4", features = ["serde"] }
 
 # UUID generation
-uuid = { version = "1.23", features = ["v4"] }
+uuid = { version = "1.23", features = ["v4", "serde"] }
 zstd = "0.14"
 
 # Random
@@ -100,7 +100,7 @@ reqwest = { version = "0.13", features = ["json", "query", "rustls", "stream"], 
 percent-encoding = "2"
 
 # Unix sockets + futures-compat for ACP byte streams
-tokio-util = { version = "0.7", features = ["codec", "compat"] }
+tokio-util = { version = "0.7", features = ["codec", "compat", "io-util"] }
 
 # Unicode width + normalization (NFKD used to fold accents in title-derived branch names)
 unicode-normalization = "0.1"
@@ -138,9 +138,10 @@ which = "8.0"
 # SQLite
 rusqlite = "0.40"
 
-# Daemon HTTP/WS server. Core: the daemon is the product, the dashboard is one
-# surface on it (see the `web` feature).
 axum = { version = "0.8", features = ["ws"] }
+# hyper/TokioIo reuse the UID/PID-verified UnixStream, including builds without `web`.
+hyper = { version = "1", features = ["client", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
 # Cross-platform browser launcher: `aoe serve --open`, the plugin host's
 # `ui.open_url`, and structured-view link activation.
 webbrowser = "1"
@@ -154,6 +155,9 @@ mime_guess = "2.0"
 qrcode = { version = "0.14", optional = true }
 argon2 = "0.6"
 subtle = "2"
+# Passkey (WebAuthn) sign-in for the web dashboard. Links OpenSSL: vendored by the default
+# `vendored` feature, from the system otherwise.
+webauthn-rs = "0.5"
 
 # TUI OSC 52 clipboard writes and Web Push payload encoding.
 base64 = "0.23"
@@ -179,12 +183,14 @@ flate2 = "1"
 xz2 = "0.1"
 
 # WebSockets for daemon clients and the daemon's local UDS transport.
-tokio-tungstenite = { version = "0.30", default-features = false, features = ["rustls-tls-webpki-roots", "connect"] }
+tokio-tungstenite = { version = "0.30", default-features = false, features = ["rustls-tls-native-roots", "connect"] }
 
 # Capability-safe file opens for the session file-read endpoint (#3088): open
 # beneath a Dir so a component swapped after the containment check cannot
 # escape the intended root.
 cap-std = "4.0.2"
+rmcp = { version = "3.5.1", features = ["transport-streamable-http-server"] }
+schemars = { version = "1", features = ["chrono04"] }
 
 # Unix-only: O_NOFOLLOW for capability-safe filesystem operations.
 [target.'cfg(unix)'.dependencies]
@@ -240,6 +246,8 @@ cargo-husky = { version = "1", default-features = false, features = ["precommit-
 # Test-only tower dep for `ServiceExt::oneshot`, so the DNS-rebinding gate
 # (#2735) can be driven through the real router without binding a socket.
 tower = { version = "0.5", features = ["util"] }
+# Software authenticator that drives the passkey ceremonies in tests.
+webauthn-authenticator-rs = { version = "0.5", default-features = false, features = ["softpasskey"] }
 
 [profile.dev]
 # Full DWARF is cargo's `dev` default and it dominates `target/`: this table and

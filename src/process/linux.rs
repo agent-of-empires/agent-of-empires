@@ -9,8 +9,421 @@ use std::process::{Child, ChildStdin, Command, Stdio};
 
 pub(super) use super::unix::{
     close_frozen_payload, configure_process_group, exec_command, kill_process_group,
-    restore_environment_value, terminate_process_group,
+    restore_environment_value, terminate_process_group, try_wait_status_hook,
 };
+struct LegacyUserManager {
+    stream: std::os::unix::net::UnixStream,
+    pid: u32,
+    uid: u32,
+    birth: super::ProcessBirthIdentity,
+    namespace: std::path::PathBuf,
+    process_cgroup: String,
+    root: String,
+    runtime: std::path::PathBuf,
+    mountinfo: String,
+}
+
+impl LegacyUserManager {
+    fn command(&self) -> anyhow::Result<Command> {
+        let mut command = Command::new(which::which("systemctl")?);
+        command
+            .env("XDG_RUNTIME_DIR", &self.runtime)
+            .env(
+                "DBUS_SESSION_BUS_ADDRESS",
+                format!("unix:path={}/bus", self.runtime.display()),
+            )
+            .env_remove("SYSTEMD_BUS_ADDRESS")
+            .env("LC_ALL", "C")
+            .env("SYSTEMD_COLORS", "0");
+        Ok(command)
+    }
+
+    fn manager_root(&self) -> anyhow::Result<String> {
+        let mut command = self.command()?;
+        command.args(["--user", "show", "--property=ControlGroup"]);
+        let output = super::run_with_timeout(&mut command, std::time::Duration::from_secs(3))?
+            .context("User manager cgroup query timed out")?;
+        anyhow::ensure!(
+            output.status.success(),
+            "User manager cgroup query rejected"
+        );
+        let text = std::str::from_utf8(&output.stdout)?;
+        let mut lines = text.lines();
+        let root = lines
+            .next()
+            .and_then(|line| line.strip_prefix("ControlGroup="))
+            .context("User manager cgroup root is unavailable")?;
+        anyhow::ensure!(lines.next().is_none(), "Malformed user manager cgroup root");
+        validate_legacy_manager_root(root)?;
+        Ok(root.to_owned())
+    }
+
+    fn capture() -> anyhow::Result<Self> {
+        use std::os::fd::AsRawFd as _;
+        use std::os::unix::fs::{FileTypeExt as _, MetadataExt as _};
+        let uid = nix::unistd::geteuid().as_raw();
+        let runtime = std::path::PathBuf::from(format!("/run/user/{uid}"));
+        let metadata = fs::symlink_metadata(&runtime)?;
+        anyhow::ensure!(
+            metadata.is_dir() && metadata.uid() == uid && metadata.mode() & 0o022 == 0,
+            "User manager runtime directory is unsafe"
+        );
+        let private = runtime.join("systemd/private");
+        let metadata = fs::symlink_metadata(&private)?;
+        anyhow::ensure!(
+            metadata.file_type().is_socket() && metadata.uid() == uid,
+            "User manager private socket is unsafe"
+        );
+        let stream = super::worker::connect_with_timeout(&private)
+            .context("Authenticated user manager is unavailable")?;
+        let peer = runtime_io::peer_credentials(stream.as_raw_fd())?;
+        anyhow::ensure!(
+            peer.uid == uid && peer.pid != 0,
+            "User manager peer does not match the effective user"
+        );
+        let birth = super::process_birth_identity(peer.pid)?
+            .context("User manager process birth is unavailable")?;
+        let namespace = fs::read_link("/proc/self/ns/cgroup")?;
+        let mountinfo = fs::read_to_string("/proc/self/mountinfo")?;
+        validate_legacy_cgroup_mount(&mountinfo)?;
+        let process_cgroup = fs::read_to_string(format!("/proc/{}/cgroup", peer.pid))?;
+        let mut manager = Self {
+            stream,
+            pid: peer.pid,
+            uid,
+            birth,
+            namespace,
+            process_cgroup,
+            root: String::new(),
+            runtime,
+            mountinfo,
+        };
+        manager.root = manager.manager_root()?;
+        validate_legacy_manager_membership(&manager.process_cgroup, &manager.root)?;
+        let directory = fs::File::open(manager.inventory_root())?;
+        let mut stat = std::mem::MaybeUninit::<libc::statfs>::uninit();
+        // SAFETY: directory is live and stat points to writable storage.
+        anyhow::ensure!(
+            unsafe { libc::fstatfs(directory.as_raw_fd(), stat.as_mut_ptr()) } == 0,
+            "Cannot inspect the user manager cgroup filesystem: {}",
+            std::io::Error::last_os_error()
+        );
+        // SAFETY: fstatfs succeeded and initialized stat.
+        anyhow::ensure!(
+            unsafe { stat.assume_init() }.f_type == libc::CGROUP2_SUPER_MAGIC,
+            "User manager inventory is not a cgroup2 filesystem"
+        );
+        manager.check_current()?;
+        Ok(manager)
+    }
+
+    /// Loaded scopes named `<prefix>*.scope`, with their active state.
+    fn list_scope_units(&self, prefix: &str) -> anyhow::Result<Vec<(String, String)>> {
+        use std::collections::HashSet;
+        use std::time::Duration;
+        let mut command = self.command()?;
+        command.args([
+            "--user",
+            "list-units",
+            "--all",
+            "--plain",
+            "--no-legend",
+            "--no-pager",
+            "--full",
+            &format!("{prefix}*.scope"),
+        ]);
+        command.env("LC_ALL", "C").env("SYSTEMD_COLORS", "0");
+        let output = super::run_with_timeout(&mut command, Duration::from_secs(3))?
+            .context("Legacy scope inventory timed out")?;
+        anyhow::ensure!(
+            output.status.success(),
+            "Legacy scope inventory rejected: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let mut listed = HashSet::new();
+        let mut units = Vec::new();
+        for line in std::str::from_utf8(&output.stdout)?.lines() {
+            let mut fields = line.split_whitespace();
+            let unit = fields.next().context("Missing legacy scope unit")?;
+            fields.next().context("Missing legacy scope load state")?;
+            let active = fields.next().context("Missing legacy scope active state")?;
+            fields.next().context("Missing legacy scope substate")?;
+            anyhow::ensure!(
+                unit.starts_with(prefix) && unit.ends_with(".scope") && listed.insert(unit),
+                "Invalid or duplicate legacy scope inventory unit"
+            );
+            units.push((unit.to_owned(), active.to_owned()));
+        }
+        Ok(units)
+    }
+
+    fn inventory_root(&self) -> std::path::PathBuf {
+        std::path::PathBuf::from("/sys/fs/cgroup").join(self.root.trim_start_matches('/'))
+    }
+
+    fn check_current(&self) -> anyhow::Result<()> {
+        use std::os::fd::AsRawFd as _;
+        let peer = runtime_io::peer_credentials(self.stream.as_raw_fd())?;
+        anyhow::ensure!(
+            peer.uid == self.uid
+                && peer.pid == self.pid
+                && super::process_birth_identity(self.pid)?.as_ref() == Some(&self.birth),
+            "User manager incarnation changed during scope proof"
+        );
+        anyhow::ensure!(
+            fs::read_link("/proc/self/ns/cgroup")? == self.namespace
+                && fs::read_to_string(format!("/proc/{}/cgroup", self.pid))? == self.process_cgroup
+                && fs::read_to_string("/proc/self/mountinfo")? == self.mountinfo
+                && self.manager_root()? == self.root,
+            "User manager inventory boundary changed during scope proof"
+        );
+        let members = fs::read_to_string(self.inventory_root().join("init.scope/cgroup.procs"))?;
+        validate_legacy_manager_pid(&members, self.pid)?;
+        anyhow::ensure!(
+            super::process_birth_identity(self.pid)?.as_ref() == Some(&self.birth),
+            "User manager incarnation changed during kernel membership proof"
+        );
+        Ok(())
+    }
+}
+
+fn validate_legacy_manager_root(root: &str) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        root.starts_with('/')
+            && root != "/"
+            && !root.ends_with('/')
+            && root
+                .split('/')
+                .skip(1)
+                .all(|part| !part.is_empty() && !matches!(part, "." | "..")),
+        "User manager cgroup root is not a complete non-root absolute path"
+    );
+    Ok(())
+}
+
+fn validate_legacy_manager_membership(contents: &str, root: &str) -> anyhow::Result<()> {
+    // Procfs uses the reader's root; systemd reports its manager's root.
+    let mut unified = contents.lines().filter_map(|line| line.strip_prefix("0::"));
+    anyhow::ensure!(
+        unified
+            .next()
+            .and_then(|path| path.strip_suffix("/init.scope"))
+            == Some(root)
+            && unified.next().is_none(),
+        "User manager cgroup does not match the authenticated peer"
+    );
+    Ok(())
+}
+
+fn validate_legacy_cgroup_mount(contents: &str) -> anyhow::Result<()> {
+    let mut found = false;
+    for line in contents.lines() {
+        let (mount, filesystem) = line
+            .split_once(" - ")
+            .context("Malformed mount inventory")?;
+        let mut fields = mount.split_whitespace();
+        let root = fields.nth(3).context("Missing mount root")?;
+        let point = fields.next().context("Missing mount point")?;
+        anyhow::ensure!(
+            !point.starts_with("/sys/fs/cgroup/"),
+            "A descendant mount hides part of the cgroup inventory"
+        );
+        if point == "/sys/fs/cgroup" {
+            anyhow::ensure!(
+                !found && root == "/" && filesystem.split_whitespace().next() == Some("cgroup2"),
+                "A complete unified cgroup hierarchy is unavailable"
+            );
+            found = true;
+        }
+    }
+    anyhow::ensure!(found, "Unified cgroup mount is unavailable");
+    Ok(())
+}
+
+fn validate_legacy_manager_pid(contents: &str, expected: u32) -> anyhow::Result<()> {
+    let mut found = false;
+    for line in contents.lines() {
+        let pid: u32 = line
+            .parse()
+            .context("Malformed manager cgroup membership")?;
+        anyhow::ensure!(pid != 0, "Invalid manager cgroup PID");
+        found |= pid == expected;
+    }
+    anyhow::ensure!(
+        found,
+        "Authenticated manager is absent from the visible cgroup"
+    );
+    Ok(())
+}
+
+#[cfg(test)]
+mod legacy_inventory_boundary_tests {
+    use super::*;
+
+    #[test]
+    fn manager_root_requires_the_whole_mount_and_the_physical_peer() {
+        assert!(validate_legacy_cgroup_mount(
+            "31 20 0:27 / /sys/fs/cgroup rw - cgroup2 cgroup rw\n"
+        )
+        .is_ok());
+        assert!(validate_legacy_cgroup_mount(
+            "31 20 0:27 /user.slice/hidden /sys/fs/cgroup rw - cgroup2 cgroup rw\n"
+        )
+        .is_err());
+        assert!(
+            validate_legacy_cgroup_mount("31 20 0:27 / /sys/fs/cgroup rw - tmpfs tmpfs rw\n")
+                .is_err()
+        );
+        assert!(validate_legacy_cgroup_mount(
+            "31 20 0:27 / /sys/fs/cgroup rw - cgroup2 cgroup rw\n\
+             32 31 0:31 / /sys/fs/cgroup/user.slice rw - tmpfs tmpfs rw\n"
+        )
+        .is_err());
+        for (members, valid) in [
+            ("3703\n3749\n", true),
+            ("3749\n", false),
+            ("", false),
+            ("3703\nbad\n", false),
+            ("3703\n0\n", false),
+        ] {
+            assert_eq!(validate_legacy_manager_pid(members, 3703).is_ok(), valid);
+        }
+        for bad in [
+            "",
+            "/",
+            "relative",
+            "/user.slice/../other",
+            "/user.slice//other",
+            "/user.slice/",
+        ] {
+            assert!(validate_legacy_manager_root(bad).is_err(), "{bad}");
+        }
+        let root = "/user.slice/user-1000.slice/user@1000.service";
+        assert!(validate_legacy_manager_root(root).is_ok());
+        assert!(
+            validate_legacy_manager_membership(&format!("0::{root}/init.scope\n"), root).is_ok()
+        );
+        assert!(validate_legacy_manager_membership(
+            "0::/user.slice/user-2000.slice/user@2000.service/init.scope\n",
+            root
+        )
+        .is_err());
+        assert!(
+            validate_legacy_manager_membership(&format!("0::{root}/other.scope\n"), root).is_err()
+        );
+        assert!(validate_legacy_manager_membership(
+            &format!("0::{root}/init.scope\n0::{root}/init.scope\n"),
+            root
+        )
+        .is_err());
+    }
+}
+
+/// Loaded user-manager scope names starting with `prefix`.
+pub(super) fn legacy_scope_unit_names(prefix: &str) -> anyhow::Result<Vec<String>> {
+    let manager = LegacyUserManager::capture()?;
+    let units = manager.list_scope_units(prefix)?;
+    manager.check_current()?;
+    Ok(units.into_iter().map(|(unit, _)| unit).collect())
+}
+
+pub(super) fn legacy_scope_inventory_clear(
+    prefix: &str,
+    known: &[crate::process::worker_registry::ScopeOwnership],
+) -> anyhow::Result<bool> {
+    use crate::process::worker_registry::ScopeOwnership;
+    use std::collections::HashSet;
+    use std::time::Duration;
+    let retained: HashSet<&str> = known
+        .iter()
+        .filter_map(|scope| match scope {
+            ScopeOwnership::Owned { unit } => Some(unit.as_str()),
+            _ => None,
+        })
+        .collect();
+    let manager = LegacyUserManager::capture()?;
+    for (unit, active) in manager.list_scope_units(prefix)? {
+        let (unit, active) = (unit.as_str(), active.as_str());
+        if !retained.contains(unit) {
+            // Inventory can prove absence, not transfer kill authority.
+            if !matches!(active, "inactive" | "failed") {
+                return Ok(false);
+            }
+            let mut show = manager.command()?;
+            show.args([
+                "--user",
+                "show",
+                "--property=LoadState",
+                "--property=ActiveState",
+                "--property=ControlGroup",
+                unit,
+            ]);
+            let show = super::run_with_timeout(&mut show, Duration::from_secs(3))?
+                .context("Legacy scope status timed out")?;
+            anyhow::ensure!(show.status.success(), "Legacy scope status rejected");
+            let mut properties = std::collections::HashMap::new();
+            for line in std::str::from_utf8(&show.stdout)?.lines() {
+                let (key, value) = line
+                    .split_once('=')
+                    .context("Malformed legacy scope property")?;
+                anyhow::ensure!(
+                    properties.insert(key, value).is_none(),
+                    "Duplicate legacy scope property"
+                );
+            }
+            anyhow::ensure!(
+                properties.contains_key("LoadState"),
+                "Missing legacy scope load state"
+            );
+            if !properties
+                .get("ActiveState")
+                .is_some_and(|state| matches!(*state, "inactive" | "failed"))
+                || properties.get("ControlGroup") != Some(&"")
+            {
+                return Ok(false);
+            }
+        }
+    }
+    let mut pending = vec![manager.inventory_root()];
+    while let Some(path) = pending.pop() {
+        for entry in fs::read_dir(&path)? {
+            let entry = entry?;
+            let kind = entry.file_type()?;
+            anyhow::ensure!(!kind.is_symlink(), "Cgroup inventory contains a link");
+            if !kind.is_dir() {
+                continue;
+            }
+            let child = entry.path();
+            let name = entry.file_name();
+            let name = name.to_str().context("Non-UTF8 cgroup name")?;
+            if name.starts_with(prefix) && name.ends_with(".scope") && !retained.contains(name) {
+                let events = fs::read_to_string(child.join("cgroup.events"))?;
+                let mut populated = None;
+                for line in events.lines() {
+                    let mut fields = line.split_whitespace();
+                    if fields.next() == Some("populated") {
+                        let value = fields.next().context("Missing cgroup population")?;
+                        anyhow::ensure!(
+                            populated.is_none()
+                                && fields.next().is_none()
+                                && matches!(value, "0" | "1"),
+                            "Invalid cgroup population"
+                        );
+                        populated = Some(value == "1");
+                    }
+                }
+                match populated {
+                    Some(false) => {}
+                    Some(true) => return Ok(false),
+                    None => anyhow::bail!("Cgroup population unavailable"),
+                }
+            }
+            pending.push(child);
+        }
+    }
+    manager.check_current()?;
+    Ok(true)
+}
 pub(super) fn open_read_nonblocking(path: &std::path::Path) -> std::io::Result<std::fs::File> {
     use std::os::unix::fs::OpenOptionsExt;
 
@@ -81,6 +494,10 @@ pub(super) fn connect_systemd_socket(
     }
 }
 
+pub(crate) fn unix_peer_uid(stream: &tokio::net::UnixStream) -> std::io::Result<u32> {
+    Ok(stream.peer_cred()?.uid())
+}
+
 pub(super) fn collect_pid_tree(pid: u32) -> Vec<u32> {
     let children_map = build_children_map();
     let mut pids = vec![pid];
@@ -116,8 +533,17 @@ pub(super) fn build_children_map() -> HashMap<u32, Vec<u32>> {
     children_map
 }
 
-/// Environment entries are compared NUL-delimited, so there is no prefix collision.
-/// `environ` is owner-only, so only same-uid processes can match on it.
+/// One `/proc` walk deciding, for each candidate `i`, whether a live process
+/// belongs to it: an `/proc/<pid>/environ` *entry* exactly equals
+/// `env_needles[i]` (NUL-delimited, so no prefix-collision), and
+/// `/proc/<pid>/cmdline` contains `cmdline_needles[i]` when both are supplied.
+/// An executable needle matches an exact argv-token basename. A candidate with
+/// one signal uses that one; otherwise every supplied signal must match.
+/// `environ` is owner-only,
+/// so only same-uid processes (our agent children among them) contribute an
+/// environment match. Skips entries that vanish or are unreadable mid-scan;
+/// stops early once every candidate is matched. Best-effort: an unreadable
+/// `/proc` yields all `false`.
 pub(super) fn processes_matching(
     env_needles: &[String],
     cmdline_needles: &[Option<String>],
@@ -190,6 +616,14 @@ pub(super) fn processes_matching(
     found
 }
 
+/// A process mid-exit reports pgrp `-1`; it belongs to no group.
+fn parse_process_group(field: &str) -> anyhow::Result<Option<u32>> {
+    let pgrp = field
+        .parse::<i32>()
+        .with_context(|| format!("invalid process group {field:?}"))?;
+    Ok(u32::try_from(pgrp).ok())
+}
+
 fn process_disappeared(error: &std::io::Error) -> bool {
     error.kind() == std::io::ErrorKind::NotFound || error.raw_os_error() == Some(libc::ESRCH)
 }
@@ -227,11 +661,8 @@ pub(super) fn runner_group_executing(group: u32) -> anyhow::Result<bool> {
             .context("invalid process stat")?;
         let mut fields = std::str::from_utf8(&bytes[offset + 2..size])?.split_ascii_whitespace();
         let state = fields.next().context("missing process state")?;
-        let process_group = fields
-            .nth(1)
-            .context("missing process group")?
-            .parse::<u32>()?;
-        if process_group == group && state != "Z" {
+        let process_group = parse_process_group(fields.nth(1).context("missing process group")?)?;
+        if process_group == Some(group) && state != "Z" {
             return Ok(true);
         }
     }
@@ -267,12 +698,11 @@ pub(super) fn process_group_id(pid: u32) -> anyhow::Result<Option<u32>> {
         .rposition(|pair| pair == b") ")
         .context("invalid process stat")?;
     let tail = std::str::from_utf8(&stat[offset + 2..])?;
-    Ok(Some(
+    parse_process_group(
         tail.split_ascii_whitespace()
             .nth(2)
-            .context("missing process group")?
-            .parse()?,
-    ))
+            .context("missing process group")?,
+    )
 }
 impl ProcessHandle {
     pub(super) fn capture(identity: &super::PrimeProcessIdentity) -> anyhow::Result<Option<Self>> {
@@ -402,11 +832,8 @@ pub(super) fn runner_group_identities(
         let (_, tail) = stat.rsplit_once(") ").context("invalid process stat")?;
         let mut fields = tail.split_ascii_whitespace();
         let state = fields.next().context("missing process state")?;
-        let pgrp = fields
-            .nth(1)
-            .context("missing process group")?
-            .parse::<u32>()?;
-        if state != "Z" && pgrp == group {
+        let pgrp = parse_process_group(fields.nth(1).context("missing process group")?)?;
+        if state != "Z" && pgrp == Some(group) {
             let start = fields.nth(16).context("missing process birth identity")?;
             result.push(super::PrimeProcessIdentity {
                 pid,
@@ -415,6 +842,44 @@ pub(super) fn runner_group_identities(
         }
     }
     Ok(result)
+}
+
+pub(super) fn process_tree_samples(
+    root: &super::PrimeProcessIdentity,
+) -> anyhow::Result<Vec<super::PrimeProcessSample>> {
+    let mut samples = Vec::new();
+    for entry in fs::read_dir("/proc")? {
+        let entry = entry?;
+        let Ok(pid) = entry.file_name().to_string_lossy().parse::<u32>() else {
+            continue;
+        };
+        let stat = match fs::read_to_string(entry.path().join("stat")) {
+            Ok(stat) => stat,
+            Err(error) if process_disappeared(&error) => continue,
+            Err(error) if pid == root.pid => return Err(error.into()),
+            Err(_) => continue,
+        };
+        let (_, tail) = stat.rsplit_once(") ").context("invalid process stat")?;
+        let mut fields = tail.split_ascii_whitespace();
+        let state = fields.next().context("missing process state")?;
+        let parent = fields.next().context("missing process parent")?.parse()?;
+        let start = fields.nth(17).context("missing process start identity")?;
+        if state != "Z" {
+            samples.push(super::PrimeProcessSample {
+                identity: super::PrimeProcessIdentity {
+                    pid,
+                    start_id: format!("proc:{start}"),
+                },
+                parent,
+                marked: false,
+            });
+        }
+    }
+    anyhow::ensure!(
+        samples.iter().any(|sample| sample.identity == *root),
+        "tool root omitted from census"
+    );
+    Ok(samples)
 }
 
 pub(super) fn prime_processes(
@@ -508,6 +973,11 @@ pub(super) fn prime_processes(
     super::select_stable_prime_processes(samples, known)
 }
 
+/// Sample system memory from `/proc` and `/sys`: a handful of small pseudo-file
+/// reads, cheap enough for the background sampler. Any file that is missing or
+/// unparseable leaves its field at the default (0 for the always-present RAM
+/// figures, `None` for the optional ones) so a transient read never fabricates
+/// a reading.
 pub(super) fn sample_memory() -> super::metrics::MemorySample {
     let meminfo = fs::read_to_string("/proc/meminfo").unwrap_or_default();
     let total = parse_meminfo_field(&meminfo, "MemTotal").map(kib_to_bytes);
@@ -627,6 +1097,8 @@ fn parse_psi_some_avg10(psi: &str) -> Option<f32> {
     None
 }
 
+/// Per-boot identity from `/proc/sys/kernel/random/boot_id`: constant for the
+/// boot's lifetime and immune to clock changes (the property the ledger needs).
 pub(super) fn boot_id() -> Option<String> {
     std::fs::read_to_string("/proc/sys/kernel/random/boot_id")
         .ok()
@@ -638,6 +1110,8 @@ pub fn get_foreground_pid(shell_pid: u32) -> Option<u32> {
     let stat_path = format!("/proc/{}/stat", shell_pid);
     let stat_content = fs::read_to_string(&stat_path).ok()?;
 
+    // Parse stat: pid (comm) state ppid pgrp session tty_nr tpgid ...
+    // tpgid (field 8, 0-indexed 7) is the foreground process group ID
     let tpgid = parse_stat_field(&stat_content, 7)?;
 
     if tpgid <= 0 {
@@ -667,6 +1141,7 @@ fn find_process_in_group(pgrp: u32) -> Option<u32> {
             continue;
         };
 
+        // Field 5 (0-indexed 4) is the process group ID
         if let Some(proc_pgrp) = parse_stat_field(&content, 4) {
             if proc_pgrp as u32 == pgrp {
                 return Some(pid);
@@ -734,11 +1209,15 @@ fn parse_stat_field(content: &str, field_idx: usize) -> Option<i64> {
     let close_paren = content.rfind(')')?;
     let after_comm = &content[close_paren + 2..]; // Skip ") "
 
+    // Fields after comm start at index 2 (state is index 2)
+    // So field_idx 4 means we want the 3rd field after comm (index 2 in after_comm split)
     let adjusted_idx = field_idx.checked_sub(2)?;
     let fields: Vec<&str> = after_comm.split_whitespace().collect();
     fields.get(adjusted_idx)?.parse().ok()
 }
 
+/// Prevents user-idle system sleep by holding a `systemd-inhibit` block lock.
+/// `--what=idle:sleep` blocks idle sleep only (the display still sleeps).
 pub(super) struct SystemdInhibitor {
     child: Option<Child>,
     stdin: Option<ChildStdin>,
@@ -807,6 +1286,14 @@ impl super::SleepInhibit for SystemdInhibitor {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn process_group_field_tolerates_a_process_mid_exit() {
+        assert_eq!(parse_process_group("-1").unwrap(), None);
+        assert_eq!(parse_process_group("42").unwrap(), Some(42));
+        let error = parse_process_group("S").unwrap_err();
+        assert!(format!("{error:#}").contains("\"S\""));
+    }
 
     #[test]
     fn launch_executable_recovers_only_deleted_paths_with_a_live_replacement() {
@@ -1005,6 +1492,7 @@ mod tests {
     #[test]
     fn test_parse_stat_field() {
         let stat = "1234 (bash) S 1233 1234 1234 34816 1234 4194304 1234 0 0 0";
+        // Fields: pid(0) comm(1) state(2) ppid(3) pgrp(4) session(5) tty(6) tpgid(7) ...
 
         assert_eq!(parse_stat_field(stat, 3), Some(1233)); // ppid
         assert_eq!(parse_stat_field(stat, 4), Some(1234)); // pgrp
@@ -1064,6 +1552,7 @@ pub(crate) mod runtime_io {
     pub(crate) const DIRECTORY: u32 = libc::S_IFDIR;
     pub(crate) const SOCKET: u32 = libc::S_IFSOCK;
     pub(crate) const KIND_MASK: u32 = libc::S_IFMT;
+    #[cfg(test)]
     pub(crate) const STICKY: u32 = libc::S_ISVTX;
     pub(crate) enum DirectoryOpenFailure {
         Symlink,
@@ -1087,6 +1576,7 @@ pub(crate) mod runtime_io {
     pub(crate) struct Stat {
         pub st_mode: u32,
         pub st_uid: u32,
+        pub st_gid: u32,
         pub st_dev: u64,
         pub st_ino: u64,
         pub st_nlink: libc::nlink_t,
@@ -1095,6 +1585,7 @@ pub(crate) mod runtime_io {
         Stat {
             st_mode: stat.st_mode,
             st_uid: stat.st_uid,
+            st_gid: stat.st_gid,
             st_dev: stat.st_dev,
             st_ino: stat.st_ino,
             st_nlink: stat.st_nlink,
@@ -1618,6 +2109,13 @@ mod runtime_identity_tests {
         );
         let pid = child.0.id();
         let identity = process_start_identity(pid).unwrap();
+        let birth = crate::process::process_birth_identity(pid)
+            .unwrap()
+            .unwrap();
+        assert!(crate::process::process_birth_is_live(pid, &birth).unwrap());
+        let mut stale = birth.clone();
+        stale.start_id.push_str("-reused");
+        assert!(!crate::process::process_birth_is_live(pid, &stale).unwrap());
         assert_eq!(
             process_identity_state(pid, &identity),
             ProcessIdentityState::Live
@@ -1628,6 +2126,7 @@ mod runtime_identity_tests {
             process_identity_state(pid, &identity),
             ProcessIdentityState::Live
         );
+        assert!(crate::process::process_birth_is_live(pid, &birth).unwrap());
 
         drop(child.0.stdin.take());
         assert_eq!(unsafe { libc::kill(pid as libc::pid_t, libc::SIGCONT) }, 0);
@@ -1636,6 +2135,11 @@ mod runtime_identity_tests {
             process_identity_state(pid, &identity),
             ProcessIdentityState::Dead
         );
+        assert_eq!(
+            crate::process::process_birth_identity(pid).unwrap(),
+            Some(birth.clone())
+        );
+        assert!(!crate::process::process_birth_is_live(pid, &birth).unwrap());
         child.0.wait().unwrap();
     }
 }

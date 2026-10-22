@@ -8,6 +8,7 @@ import {
   effectiveUnreadOf,
   type OptimisticTriage,
 } from "../../lib/sidebarOptimistic";
+import { resolveActionTargets } from "./sessionActionTargets";
 
 /** Mirrors the Rust `SESSION_COLORS` list. */
 export const SESSION_COLOR_OPTIONS: { key: string; label: string; dotClass: string }[] = [
@@ -19,7 +20,7 @@ export const SESSION_COLOR_OPTIONS: { key: string; label: string; dotClass: stri
 export type NotifyPreset = "off" | "default" | "all";
 
 /** Mixed per-event overrides read as "default", which resets them cleanly when picked. */
-function detectNotifyPreset(values: (boolean | null | undefined)[]): NotifyPreset {
+export function detectNotifyPreset(values: (boolean | null | undefined)[]): NotifyPreset {
   if (values.every((v) => v === false)) return "off";
   if (values.every((v) => v === true)) return "all";
   return "default";
@@ -92,7 +93,7 @@ export function deriveRowModel(
     firstSession,
     runningSession,
     navigationSession: runningSession ?? firstSession,
-    acpSession: sessions.find((s) => s.view === "structured"),
+    actionTargets: resolveActionTargets(sessions, optimistic),
     sessionId: firstSession?.id,
     sessionTitle,
     branchLabel,
@@ -135,14 +136,12 @@ export function deriveRowModel(
       !!firstSession?.id,
     // Mirrors the refusals in `attach_project::plan`; Running/Waiting are decided server-side.
     canAddProject:
-      !firstSession?.scratch &&
+      !!firstSession?.profile &&
+      !firstSession.scratch &&
       !firstSession?.archived_at &&
       !firstSession?.trashed_at &&
       firstSession?.status !== "Creating" &&
       firstSession?.status !== "Deleting",
-    canStop: !["Stopped", "Deleting", "Creating"].includes(status),
-    // Archived and trashed sessions must be unarchived or restored before they start (#4116).
-    canStart: status === "Stopped" && !effectiveArchived && !firstSession?.trashed_at,
   };
 }
 

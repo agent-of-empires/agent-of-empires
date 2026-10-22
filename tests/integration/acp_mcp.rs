@@ -23,6 +23,7 @@ use crate::common::{shim_path, shim_ready};
 fn base_config(cwd: std::path::PathBuf, record_path: &std::path::Path) -> SpawnConfig {
     let shim = shim_path();
     SpawnConfig {
+        launch_lease: None,
         provider_routing: Vec::new(),
         wrapper_substitution: None,
         agent_key: "claude".into(),
@@ -51,6 +52,7 @@ fn base_config(cwd: std::path::PathBuf, record_path: &std::path::Path) -> SpawnC
         stored_acp_session_id: None,
         fork_from: None,
         seed_history_replay: false,
+        prior_conversation: false,
         generation: 0,
         artifact_dir: None,
         sandbox_info: None,

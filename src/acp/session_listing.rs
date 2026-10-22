@@ -52,6 +52,7 @@ async fn list_with_spec(
     .await
     .map_err(|e| ListSessionsError::Failed(e.to_string()))?;
     let config = SpawnConfig {
+        launch_lease: None,
         wrapper_substitution: None,
         agent_key: agent.to_string(),
         tool: agent.to_string(),
@@ -72,6 +73,7 @@ async fn list_with_spec(
         source_profile: Some(profile.to_string()),
         mcp_servers: Vec::new(),
         seed_history_replay: false,
+        prior_conversation: false,
         generation: 0,
         artifact_dir: None,
         claude_store_pin: None,

@@ -1,4 +1,13 @@
 //! Async worker RPC handlers for the session-driving plugin API (#2897):
+//! `acp.capabilities.get`, `sessions.create`, `sessions.turn.send`.
+//!
+//! These run on the async runtime (unlike the synchronous
+//! [`crate::plugin::host_api::dispatch`]) because they call into the shared
+//! `SessionService`. Authorization layers, in order: capability grants
+//! (connection context, never payload), host-side approval classification
+//! (`session.unattended` for unattended modes), automation policy limits,
+//! and the service's own invariants (repo trust fail-closed, plugin
+//! ownership on turn delivery, idempotency).
 
 use std::sync::Arc;
 
@@ -22,11 +31,13 @@ use crate::plugin::host_api::{DispatchError, PluginRpcContext};
 use crate::plugin::protocol::codes;
 use crate::server::api::sessions::{send_terminal_message, SendKeysError};
 use crate::server::session_service::{
-    CreateIdempotencyProbe, IdempotencyConflict, SendTurnError, SendTurnRequest, SessionCaller,
-    SessionService,
+    CreateIdempotencyProbe, IdempotencyConflict, PromptTouch, SendTurnError, SendTurnRequest,
+    SessionCaller, SessionService,
 };
 use crate::server::session_spawn::StructuredSessionSpec;
 
+/// Upper bound on `extra_project_paths` per create, so one plugin call cannot
+/// trigger an unbounded chain of blocking `canonicalize` calls.
 const MAX_EXTRA_PROJECT_PATHS: usize = 16;
 
 const CAP_ACP_CAPABILITIES_READ: &str = "acp.capabilities.read";
@@ -42,14 +53,15 @@ const MAX_MESSAGE_BYTES: usize = 64 * 1024;
 const MESSAGE_DEADLINE: std::time::Duration =
     crate::acp::supervisor::WORKER_READY_TIMEOUT.saturating_add(std::time::Duration::from_secs(15));
 
+/// Everything the session RPCs need, injected into the plugin host at
+/// construction (before any worker launches).
 pub struct SessionRpcDeps {
     pub session_service: Arc<SessionService>,
     pub policy: Arc<AutomationPolicy>,
+    /// The serving profile new sessions are created under.
     pub profile: String,
     /// Terminal keystroke injection is closed in CityHall mode, so plugins may not reach it either.
     pub cityhall_mode: bool,
-    /// Publishes the status move a terminal revive makes, as the HTTP send handler does.
-    pub status_tx: tokio::sync::broadcast::Sender<crate::server::push::StatusChange>,
 }
 
 async fn clear_revival_pending(session_service: &SessionService, id: &str) {
@@ -59,6 +71,7 @@ async fn clear_revival_pending(session_service: &SessionService, id: &str) {
     }
 }
 
+/// Whether `method` belongs to this module's async dispatch.
 pub(crate) fn handles(method: &str) -> bool {
     matches!(
         method,
@@ -70,6 +83,9 @@ pub(crate) fn handles(method: &str) -> bool {
     )
 }
 
+/// The base capability a session method requires. Exposed so the host can
+/// authorize before consulting the session dependencies, keeping the authz
+/// result identical whether or not the service happens to be wired up.
 pub(crate) fn required_capability(method: &str) -> Option<&'static str> {
     match method {
         "acp.capabilities.get" => Some(CAP_ACP_CAPABILITIES_READ),
@@ -114,6 +130,8 @@ pub(crate) async fn dispatch(
     }
 }
 
+/// Merge the static agent registry with the last advertised option catalog
+/// into the stable public DTO. Pure reads; never launches an agent.
 async fn capabilities_get() -> Result<Value, DispatchError> {
     let catalog = load_catalog().await;
     let mut ids: Vec<String> = crate::acp::AgentRegistry::with_defaults()
@@ -155,6 +173,8 @@ async fn capabilities_get() -> Result<Value, DispatchError> {
                             display_name: choice.name.clone(),
                             approval_class: match classify_mode(&id, Some(&choice.value), entry) {
                                 ModeDecision::Class(class) => class,
+                                // Advertised modes always classify; fail
+                                // closed if that invariant ever breaks.
                                 _ => ApprovalClass::Unattended,
                             },
                         })
@@ -174,6 +194,8 @@ async fn capabilities_get() -> Result<Value, DispatchError> {
                 .unwrap_or_default();
             thinking.sort_by(|a, b| a.id.cmp(&b.id));
             AcpAgentCapability {
+                // The registry has no display metadata; the id doubles as
+                // the display name until it grows one.
                 display_name: id.clone(),
                 id,
                 catalog_status,
@@ -189,6 +211,12 @@ async fn capabilities_get() -> Result<Value, DispatchError> {
         .map_err(|e| DispatchError::internal(format!("serialize capabilities: {e}")))
 }
 
+/// `acp.capabilities.probe`: populate the option catalog for one agent (or every
+/// currently-undiscovered registry agent when no `agent_id` is given) via a
+/// handshake-only ACP probe, then return the same shape as
+/// `acp.capabilities.get`. Each probe degrades to a no-op on failure, so a
+/// missing adapter or an agent that needs credentials the daemon lacks simply
+/// stays `Undiscovered` instead of erroring the whole call.
 async fn capabilities_probe(params: &Value) -> Result<Value, DispatchError> {
     #[derive(serde::Deserialize)]
     #[serde(deny_unknown_fields)]
@@ -287,6 +315,7 @@ async fn admit_and_create(
     let catalog = load_catalog().await;
     let entry = catalog.agents.get(&req.agent_id);
 
+    // Agent must be a registry agent or one the catalog has observed.
     let known_agent = crate::acp::AgentRegistry::with_defaults()
         .get(&req.agent_id)
         .is_some()
@@ -299,6 +328,7 @@ async fn admit_and_create(
         ));
     }
 
+    // Host-side approval classification; the plugin cannot self-label.
     let class = match classify_mode(&req.agent_id, req.mode_id.as_deref(), entry) {
         ModeDecision::Class(class) => class,
         ModeDecision::UnknownMode => {
@@ -340,6 +370,11 @@ async fn admit_and_create(
         });
     }
 
+    // Refuse a model off the profile pin at the creation boundary instead of
+    // recording it as the session's choice and silently launching the pin at
+    // spawn. The pin is keyed by the agent the session spawns as, see
+    // `pinned_model_for_tool`. Config resolution reads files; keep it off the
+    // runtime thread like the canonicalization below.
     let requested_model = req
         .model_id
         .as_deref()
@@ -374,6 +409,8 @@ async fn admit_and_create(
         }
     }
 
+    // Model must be advertised when the catalog is discovered; with an
+    // undiscovered catalog it passes through and the adapter arbitrates.
     if let (Some(model), Some(entry)) = (req.model_id.as_deref(), entry) {
         let advertised = entry.options.iter().any(|opt| {
             opt.category == ConfigOptionCategory::Model
@@ -392,6 +429,12 @@ async fn admit_and_create(
         ctx.require(CAP_SESSION_PROMPT)?;
     }
 
+    // Resolve the project selection into (path, extra_repo_paths, scratch).
+    // No project -> a scratch session (no repo, hence no trust anchor). One or
+    // more projects -> the first is the trust-checked primary repo and the rest
+    // are extra repos. Canonicalize immediately before the trust-checked spawn;
+    // a dangling path is the caller's error. Repo trust itself is enforced
+    // inside the service, fail-closed for plugin callers.
     let primary = req
         .project_path
         .as_deref()
@@ -399,6 +442,8 @@ async fn admit_and_create(
         .filter(|p| !p.is_empty());
     let (project_path, extra_repo_paths, scratch) = match primary {
         None => {
+            // A scratch session has no repo, so extra repos are meaningless and
+            // the builder refuses the combination; reject early and clearly.
             if req.extra_project_paths.iter().any(|p| !p.trim().is_empty()) {
                 return Err(DispatchError::invalid_params(
                     "extra_project_paths requires a project_path; a scratch session takes no extra repos",
@@ -407,6 +452,8 @@ async fn admit_and_create(
             (String::new(), Vec::new(), true)
         }
         Some(primary) => {
+            // Cap the extras before any blocking work so one call cannot tie up
+            // a runtime worker with a long canonicalization chain.
             let extras_in: Vec<String> = req
                 .extra_project_paths
                 .iter()
@@ -420,6 +467,8 @@ async fn admit_and_create(
                 )));
             }
             let primary = primary.to_string();
+            // Filesystem canonicalization is blocking; run it off the async
+            // runtime rather than stalling a worker thread.
             tokio::task::spawn_blocking(move || {
                 let canon = |p: &str| -> Result<String, DispatchError> {
                     std::fs::canonicalize(p)
@@ -444,6 +493,8 @@ async fn admit_and_create(
 
     let spec = StructuredSessionSpec {
         title: req.title,
+        title_typed: false,
+        size: None,
         path: project_path,
         group: req.group.unwrap_or_default(),
         tool: req.agent_id.clone(),
@@ -451,6 +502,9 @@ async fn admit_and_create(
         worktree_branch: None,
         create_new_branch: false,
         base_branch: None,
+        // The plugin opts into sandboxing; the host resolves the image from its
+        // own config (a plugin cannot pick an image). Sandboxing only contains
+        // the agent, so it rides on session.create.
         sandbox: req.sandbox,
         sandbox_image: None,
         yolo_mode: false,
@@ -458,16 +512,25 @@ async fn admit_and_create(
         extra_args: String::new(),
         command_override: String::new(),
         extra_repo_paths,
+        // A plugin cannot request a worktree, so there is no branch to fork and
+        // no per-repo base to honor.
         repo_base_branches: Vec::new(),
         scratch,
-        trust_hooks: Some(false),
+        trust_hooks: None,
+        trust_review: None,
         custom_instruction: None,
+        // Plugin-created sessions have no request-level dispatcher callback
+        // or idempotency key; that surface is REST-only (#3156). Plugin
+        // create-idempotency uses the separate `plugin_create_idempotency`
+        // record below.
         callback_url: None,
         idempotency_key: None,
         source_refs: Vec::new(),
         profile: deps.profile.clone(),
         created_by_plugin: None,
         plugin_create_idempotency: None,
+        // Set here (not just inside the service) so the idempotency probe below
+        // hashes the same payload the create will.
         pending_initial_turn: req.initial_turn.as_ref().map(|t| t.text.clone()),
         acp_mode_id: req.mode_id.clone(),
         view: crate::session::View::Structured,
@@ -475,10 +538,15 @@ async fn admit_and_create(
         agent_model: req.model_id.clone(),
         agent_effort: None,
         import_acp_session_id: None,
+        import_binding: None,
         fork_seed: None,
         progress: None,
     };
 
+    // Resolve an idempotent replay/conflict BEFORE charging admission, so a
+    // retry after a lost response returns the prior result without consuming
+    // rate or concurrency capacity (#2897). A brand-new key falls through to
+    // the reservation and create below.
     if let Some(key) = req.idempotency_key.as_deref() {
         match deps
             .session_service
@@ -492,7 +560,7 @@ async fn admit_and_create(
                 });
             }
             Ok(CreateIdempotencyProbe::New) => {}
-            Err(conflict) => return Err(map_create_error(anyhow::Error::new(conflict))),
+            Err(error) => return Err(map_create_error(error)),
         }
     }
 
@@ -510,6 +578,8 @@ async fn admit_and_create(
             })
             .count()
     };
+    // Held until the create resolves so concurrent different-key creates
+    // cannot overshoot the cap.
     let _reservation = deps.policy.admit_create(plugin_id, active_sessions)?;
 
     let initial_turn_text = req.initial_turn.as_ref().map(|t| t.text.as_str());
@@ -538,6 +608,13 @@ fn map_create_error(e: anyhow::Error) -> DispatchError {
             conflict.to_string(),
         );
     }
+    if e.is::<crate::server::session_service::CreationUnfinalized>() {
+        return DispatchError::with_kind(
+            codes::FAILED_PRECONDITION,
+            "create_outcome_unknown",
+            e.to_string(),
+        );
+    }
     if e.downcast_ref::<crate::server::api::sessions::HooksNeedTrust>()
         .is_some()
     {
@@ -564,6 +641,21 @@ async fn sessions_turn_send(
         let caller = SessionCaller::Plugin {
             plugin_id: plugin_id.clone(),
         };
+        // Same per-session submission authority the HTTP surfaces and the
+        // queue drain take, and the same disposition decided under it, so a
+        // plugin turn cannot land between the drain's idle check and its send
+        // (#3621, #3649). Existence and ownership are settled here rather
+        // than by `send_turn`: a plugin probing distinct nonexistent ids
+        // cannot grow the lock registry within its turn quota (#3651), and a
+        // foreign session is refused before its disposition is computed, so
+        // it cannot answer `agent_busy` for a session the caller may not see
+        // (#3685).
+        // Ownership is checked before the wake so a foreign session is never
+        // touched, and the guard is claimed before it too, as the user prompt
+        // handlers do, so a Stop cannot overtake a turn the host just started
+        // (see `acp_cancel`). The wake clears an idle-dormant (or manually
+        // stopped) park the same way a user prompt does: a turn is intent to
+        // continue, so the host resumes rather than refusing (#3686).
         let _submission = deps
             .session_service
             .admit_prompt_submission(&caller, &req.session_id)
@@ -617,10 +709,15 @@ async fn sessions_turn_send(
             .session_service
             .touch_and_wake_on_prompt(&req.session_id, false)
             .await
-            .idle_dormant()
         {
-            Ok(woke) => woke,
-            Err(blocked) => {
+            PromptTouch::Touched { idle_dormant } => idle_dormant,
+            PromptTouch::WorkerNotReady | PromptTouch::RevivalRefused => {
+                if marked_pending {
+                    clear_revival_pending(&deps.session_service, &req.session_id).await;
+                }
+                return Err(DispatchError::with_kind(codes::FAILED_PRECONDITION, "worker_not_ready", "The structured session launch is not finalized"));
+            }
+            PromptTouch::Blocked(blocked) => {
                 if marked_pending {
                     clear_revival_pending(&deps.session_service, &req.session_id).await;
                 }
@@ -635,6 +732,11 @@ async fn sessions_turn_send(
             .session_service
             .prompt_dispatch_under_submission(&req.session_id, &req.text, woke_idle_dormant, false)
             .await;
+        // A cold worker is not a refusal on this path: `send_turn` resumes it
+        // and waits, which is how a scheduler wakes a session it created. The
+        // turn gates are, because a second prompt at a busy non-steerable
+        // agent is refused asynchronously and the plugin would have been told
+        // its turn landed.
         if let crate::acp::dispatch::PromptDispatch::Queued { reason } = dispatch {
             if !matches!(reason, crate::acp::dispatch::QueueReason::WorkerDown) {
                 if marked_pending {
@@ -647,6 +749,9 @@ async fn sessions_turn_send(
                 ));
             }
         }
+        // Unlike the user path, the pending initial turn is left alone: for
+        // a plugin session it may be the `sessions.create { initial_turn }`
+        // the worker has not delivered yet.
         let sent = deps
             .session_service
             .send_turn(
@@ -790,13 +895,12 @@ async fn deliver_message(
     }
     let revived = send_terminal_message(
         &deps.session_service,
-        &deps.status_tx,
         &req.session_id,
         req.message.clone(),
         true,
     )
     .await
-    .map_err(map_terminal_error)?;
+    .map_err(|error| map_terminal_error(error.error))?;
     Ok(MessageSendResponse {
         disposition: MessageDisposition::Sent,
         revived,
@@ -819,11 +923,12 @@ async fn deliver_structured(
         .admit_prompt_submission(&caller, id)
         .await
         .map_err(|e| map_send_error(e.into()))?;
-    let woke_idle_dormant = service
-        .touch_and_wake_on_prompt(id, false)
-        .await
-        .idle_dormant()
-        .map_err(blocked_error)?;
+    let woke_idle_dormant = match service.touch_and_wake_on_prompt(id, false).await {
+        PromptTouch::Touched { idle_dormant } => idle_dormant,
+        PromptTouch::RevivalRefused => return Err(map_send_error(SendTurnError::RevivalRefused)),
+        PromptTouch::WorkerNotReady => return Err(map_send_error(SendTurnError::WorkerNotReady)),
+        PromptTouch::Blocked(blocked) => return Err(blocked_error(blocked)),
+    };
     let was_running = service.acp_supervisor.is_running(id).await;
     let dispatch = service
         .prompt_dispatch_under_submission(id, &req.message, woke_idle_dormant, false)
@@ -885,14 +990,24 @@ fn map_terminal_error(e: SendKeysError) -> DispatchError {
             "session_not_running",
             "the session's terminal is not running",
         ),
-        SendKeysError::ResumeFailed(sid) => DispatchError {
-            code: codes::FAILED_PRECONDITION,
-            message: format!("resume failed for sid {sid}; preserved for explicit retry"),
-            data: Some(serde_json::json!({
-                "kind": "resume_failed",
-                "resume_session_id": sid,
-            })),
-        },
+        SendKeysError::Preparation { response, detail } => {
+            let code = if response.status() == axum::http::StatusCode::FORBIDDEN {
+                codes::FORBIDDEN
+            } else if response.status().is_server_error() {
+                codes::SERVICE_UNAVAILABLE
+            } else {
+                codes::FAILED_PRECONDITION
+            };
+            let kind = detail
+                .get("error")
+                .and_then(Value::as_str)
+                .unwrap_or("start_failed");
+            let mut error = DispatchError::with_kind(code, kind, "Terminal preparation failed");
+            if let Some(sid) = detail.get("resume_session_id").and_then(Value::as_str) {
+                error.data.as_mut().expect("typed error data")["resume_session_id"] = sid.into();
+            }
+            error
+        }
         SendKeysError::Transient(status) => DispatchError::with_kind(
             codes::FAILED_PRECONDITION,
             "session_transient",
@@ -901,7 +1016,10 @@ fn map_terminal_error(e: SendKeysError) -> DispatchError {
         SendKeysError::StructuredView => {
             DispatchError::internal("terminal send reached a structured session")
         }
-        SendKeysError::Tmux(e) => DispatchError::internal(format!("terminal send failed: {e:#}")),
+        SendKeysError::Tmux(error) => {
+            tracing::warn!(target: "plugin.host", %error, "plugin terminal send failed");
+            DispatchError::internal("terminal send failed")
+        }
         SendKeysError::Internal => DispatchError::internal("terminal send failed"),
     }
 }
@@ -958,12 +1076,7 @@ mod tests {
         }
     }
 
-    fn test_deps(prior: Vec<Instance>) -> (Arc<SessionRpcDeps>, tempfile::TempDir) {
-        let (deps, _state, dir) = test_deps_with_state(prior);
-        (deps, dir)
-    }
-
-    fn test_deps_with_state(
+    fn test_deps(
         prior: Vec<Instance>,
     ) -> (
         Arc<SessionRpcDeps>,
@@ -980,18 +1093,29 @@ mod tests {
                 policy,
                 profile: "test".to_string(),
                 cityhall_mode: false,
-                status_tx: state.status_tx.clone(),
             }),
             state,
             dir,
         )
     }
 
-    fn write_app_config(body: &str) {
-        let path = crate::session::get_app_dir()
-            .expect("isolated app dir")
-            .join("config.toml");
-        std::fs::write(&path, body).expect("write config");
+    async fn seed_native_rows(state: &Arc<crate::server::AppState>) {
+        crate::session::purge_owners::initialize(&crate::session::get_app_dir().unwrap()).unwrap();
+        let mut profiles = std::collections::BTreeMap::<String, Vec<Instance>>::new();
+        {
+            let mut rows = state.instances.write().await;
+            for row in rows.iter_mut() {
+                row.source_profile = crate::session::config::effective_profile(&row.source_profile);
+                profiles
+                    .entry(row.source_profile.clone())
+                    .or_default()
+                    .push(row.clone());
+            }
+        }
+        for (profile, rows) in profiles {
+            crate::server::test_support::seed_instances_on_disk_for_test(&profile, rows);
+        }
+        crate::server::test_support::refresh_canonical_metadata_for_test(state).await;
     }
 
     fn kind(e: &DispatchError) -> String {
@@ -1003,9 +1127,11 @@ mod tests {
             .to_string()
     }
 
+    /// Every method refuses a caller missing its gating capability, before
+    /// touching any state.
     #[tokio::test]
     async fn authz_matrix_capability_gates() {
-        let (deps, _dir) = test_deps(Vec::new());
+        let (deps, _state, _dir) = test_deps(Vec::new());
         let none = ctx_with(&[]);
         for method in [
             "acp.capabilities.get",
@@ -1020,12 +1146,20 @@ mod tests {
             assert_eq!(err.code, codes::FORBIDDEN, "{method}");
             assert_eq!(kind(&err), "capability_missing", "{method}");
         }
+        // The wrong capability does not substitute for the right one.
         let wrong = ctx_with(&["session.prompt"]);
         let err = dispatch(&deps, &wrong, "sessions.create", &serde_json::json!({}))
             .await
             .expect_err("session.prompt must not grant sessions.create");
         assert_eq!(err.code, codes::FORBIDDEN);
+    }
 
+    /// An unattended-classified mode needs the distinct session.unattended
+    /// grant; session.create alone is refused with the stable policy kind.
+    /// Uses a trusted-table bypass id so the decision is catalog-independent.
+    #[tokio::test]
+    async fn unattended_mode_requires_the_distinct_grant() {
+        let (deps, _state, _dir) = test_deps(Vec::new());
         let unattended = serde_json::json!({
             "agent_id": "claude",
             "project_path": "/tmp",
@@ -1043,53 +1177,85 @@ mod tests {
         assert_eq!(kind(&err), "unattended_grant_required");
     }
 
+    /// A payload smuggling an unknown field (a would-be bypass flag) is
+    /// rejected at decode, before any capability-gated work.
     #[tokio::test]
-    async fn invalid_params_are_rejected() {
-        let (deps, _dir) = test_deps(Vec::new());
-        let cases = [
-            (
-                "unknown create field",
-                "session.create",
-                "sessions.create",
-                serde_json::json!({
-                    "agent_id": "claude",
-                    "project_path": "/tmp",
-                    "allow_untrusted": true,
-                }),
-            ),
-            (
-                "scratch session with extra repos",
-                "session.create",
-                "sessions.create",
-                serde_json::json!({ "agent_id": "claude", "extra_project_paths": ["/tmp"] }),
-            ),
-            (
-                "unknown probe param",
-                "acp.capabilities.probe",
-                "acp.capabilities.probe",
-                serde_json::json!({ "bogus": 1 }),
-            ),
-        ];
-        for (label, capability, method, params) in cases {
-            let err = dispatch(&deps, &ctx_with(&[capability]), method, &params)
-                .await
-                .expect_err(label);
-            assert_eq!(err.code, codes::INVALID_PARAMS, "{label}");
-        }
+    async fn create_rejects_unknown_payload_fields() {
+        let (deps, _state, _dir) = test_deps(Vec::new());
+        let ctx = ctx_with(&["session.create"]);
+        let err = dispatch(
+            &deps,
+            &ctx,
+            "sessions.create",
+            &serde_json::json!({
+                "agent_id": "claude",
+                "project_path": "/tmp",
+                "allow_untrusted": true,
+            }),
+        )
+        .await
+        .expect_err("unknown fields must be rejected");
+        assert_eq!(err.code, codes::INVALID_PARAMS);
     }
 
+    /// The probe RPC decodes params strictly: an unknown field is a client
+    /// error, refused before any spawn work.
+    #[tokio::test]
+    async fn probe_rejects_unknown_params() {
+        let (deps, _state, _dir) = test_deps(Vec::new());
+        let ctx = ctx_with(&["acp.capabilities.probe"]);
+        let err = dispatch(
+            &deps,
+            &ctx,
+            "acp.capabilities.probe",
+            &serde_json::json!({ "bogus": 1 }),
+        )
+        .await
+        .expect_err("unknown probe param must be rejected");
+        assert_eq!(err.code, codes::INVALID_PARAMS);
+    }
+
+    /// A scratch create (no project_path) may not carry extra repos: the
+    /// session builder refuses that combination, so the RPC rejects it up front
+    /// with a clear invalid-params error, before any spawn.
+    #[tokio::test]
+    async fn scratch_with_extra_repos_is_rejected() {
+        let (deps, _state, _dir) = test_deps(Vec::new());
+        let ctx = ctx_with(&["session.create"]);
+        let err = dispatch(
+            &deps,
+            &ctx,
+            "sessions.create",
+            &serde_json::json!({
+                "agent_id": "claude",
+                "extra_project_paths": ["/tmp"],
+            }),
+        )
+        .await
+        .expect_err("scratch + extra repos must be refused");
+        assert_eq!(err.code, codes::INVALID_PARAMS);
+    }
+
+    /// A profile pin (`acp.acp_defaults.<agent>.pin_model`) is authoritative
+    /// at the creation boundary: a `model_id` naming any other model is refused
+    /// with a typed error carrying the pin, instead of being forwarded as the
+    /// explicit session model and silently replaced at spawn. The pinned model
+    /// itself, and an omitted model, pass the gate.
     #[tokio::test]
     #[serial_test::serial]
-    async fn create_refuses_a_model_off_the_profile_pin_including_through_a_wrapper() {
-        let _tmp = crate::session::test_support::isolate_app_dir();
-        write_app_config(
-            "[session.agent_detect_as]\nmy-claude = \"claude\"\n\n\
-             [acp.acp_defaults.claude]\nmodel = \"claude-pinned\"\npin_model = true\n",
-        );
-        crate::acp::option_catalog::record("my-claude", &[], "2026-01-01T00:00:00Z".into())
-            .expect("seed catalog");
-        let (deps, _dir) = test_deps(Vec::new());
-        let ctx = ctx_with(&["session.create", "session.unattended"]);
+    async fn create_refuses_a_model_off_the_profile_pin() {
+        use crate::session::test_support::isolate_app_dir;
+        let _tmp = isolate_app_dir();
+        let config_path = crate::session::get_app_dir()
+            .expect("isolated app dir")
+            .join("config.toml");
+        std::fs::write(
+            &config_path,
+            "[acp.acp_defaults.claude]\nmodel = \"claude-pinned\"\npin_model = true\n",
+        )
+        .expect("write pinned config");
+        let (deps, _state, _dir) = test_deps(Vec::new());
+        let ctx = ctx_with(&["session.create"]);
 
         let err = dispatch(
             &deps,
@@ -1110,6 +1276,10 @@ mod tests {
         assert_eq!(data["model_id"], "claude-other");
         assert_eq!(data["pinned_model"], "claude-pinned");
 
+        // The pin itself and an omitted model get past the gate: the request
+        // then reaches project-path canonicalization, which fails on a path
+        // that does not exist, so nothing is spawned and the error names the
+        // path rather than the pin.
         for params in [
             serde_json::json!({
                 "agent_id": "claude",
@@ -1128,8 +1298,34 @@ mod tests {
             assert_ne!(kind(&err), "model_pinned", "{params}");
             assert!(err.message.contains("project_path"), "{}", err.message);
         }
+    }
 
-        // A wrapper agent is held to the pin of the agent it spawns.
+    /// The pin is keyed by the agent a session spawns as. A wrapper that
+    /// `agent_detect_as` maps to a base agent runs the base adapter, so its
+    /// creation reads the base agent's pin, the same entry the spawn resolver
+    /// applies.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn create_reads_the_pin_of_the_agent_a_wrapper_spawns() {
+        use crate::session::test_support::isolate_app_dir;
+        let _tmp = isolate_app_dir();
+        let config_path = crate::session::get_app_dir()
+            .expect("isolated app dir")
+            .join("config.toml");
+        std::fs::write(
+            &config_path,
+            "[session.agent_detect_as]\nmy-claude = \"claude\"\n\n\
+             [acp.acp_defaults.claude]\nmodel = \"claude-pinned\"\npin_model = true\n",
+        )
+        .expect("write pinned config");
+        // The wrapper is admitted like any agent that has run once: through
+        // the option catalog. Its default mode is unreviewed, so the request
+        // also needs the unattended grant to reach the pin gate.
+        crate::acp::option_catalog::record("my-claude", &[], "2026-01-01T00:00:00Z".into())
+            .expect("seed catalog");
+        let (deps, _state, _dir) = test_deps(Vec::new());
+        let ctx = ctx_with(&["session.create", "session.unattended"]);
+
         let err = dispatch(
             &deps,
             &ctx,
@@ -1148,6 +1344,11 @@ mod tests {
         assert_eq!(data["pinned_model"], "claude-pinned");
     }
 
+    /// A brand-new create at the active-session limit is denied with the stable
+    /// concurrency kind. The idempotency probe runs before admission (see
+    /// `admit_and_create`), so an idempotent retry replays instead of hitting
+    /// this path; the replay/conflict/new resolution itself is unit-tested in
+    /// `server::session_service::tests::probe_resolves_replay_conflict_and_new`.
     #[tokio::test]
     async fn create_at_concurrency_limit_denies_a_new_key() {
         use crate::plugin::automation_policy::MAX_ACTIVE_PLUGIN_SESSIONS;
@@ -1160,8 +1361,10 @@ mod tests {
                 i
             })
             .collect();
-        let (deps, _dir) = test_deps(prior);
+        let (deps, _state, _dir) = test_deps(prior);
         let ctx = ctx_with(&["session.create"]);
+        // "claude" with no mode classifies Interactive (reviewed adapter), so no
+        // unattended grant is needed and the request reaches the limit check.
         let err = dispatch(
             &deps,
             &ctx,
@@ -1174,6 +1377,8 @@ mod tests {
         assert_eq!(kind(&err), "concurrency_limited");
     }
 
+    /// turn.send maps the service's ownership and existence denials to the
+    /// stable error kinds.
     #[tokio::test]
     async fn create_ignores_finished_runs_left_unarchived() {
         use crate::plugin::automation_policy::MAX_ACTIVE_PLUGIN_SESSIONS;
@@ -1181,6 +1386,10 @@ mod tests {
         // needs its own app dir: HOME is process-global, and running the full suite races this
         // against every other test that installs or restores it.
         let _home = crate::session::test_support::isolate_app_dir();
+        // The daemon resolves the profile through its canonical metadata before
+        // it spawns, so the profile this dispatch targets has to exist on disk
+        // and in the metadata the state was built with.
+        crate::session::create_profile("test").expect("profile");
         // Past runs default to `Status::Idle` and are kept around, unarchived, for the user
         // to review; they must not count against the concurrency limit like `sess-1` does.
         let mut prior: Vec<Instance> = (0..MAX_ACTIVE_PLUGIN_SESSIONS)
@@ -1196,7 +1405,15 @@ mod tests {
         running.created_by_plugin = Some("cron".to_string());
         running.status = Status::Running;
         prior.push(running);
-        let (deps, _dir) = test_deps(prior);
+        let (deps, state, _dir) = test_deps(prior);
+        crate::server::test_support::refresh_canonical_metadata_for_test(&state).await;
+        // The host-agent launch is gated on an explicit hook-path consent,
+        // which a real user gives in the TUI; this test drives the cap check
+        // that happens after that gate.
+        crate::session::config::update_app_state(|app_state| {
+            app_state.has_acknowledged_agent_hooks = true;
+        })
+        .expect("acknowledge agent hooks");
         let ctx = ctx_with(&["session.create"]);
         dispatch(
             &deps,
@@ -1225,7 +1442,8 @@ mod tests {
         foreign.id = id.to_string();
         foreign.view = crate::session::View::Structured;
         foreign.agent_name = Some("claude".to_string());
-        let (deps, state, dir) = test_deps_with_state(vec![foreign]);
+        let (deps, state, dir) = test_deps(vec![foreign]);
+        seed_native_rows(&state).await;
         let cmds = deps
             .session_service
             .acp_supervisor
@@ -1236,7 +1454,7 @@ mod tests {
 
     #[tokio::test]
     async fn message_send_needs_its_own_capability() {
-        let (deps, _dir) = test_deps(Vec::new());
+        let (deps, _state, _dir) = test_deps(Vec::new());
         let err = dispatch(
             &deps,
             &ctx_with(&["session.prompt", "session.create"]),
@@ -1260,7 +1478,7 @@ mod tests {
 
     #[tokio::test]
     async fn message_send_validates_the_message_before_admitting_it() {
-        let (deps, _dir) = test_deps(Vec::new());
+        let (deps, _state, _dir) = test_deps(Vec::new());
         let ctx = ctx_with(&["session.message"]);
         let oversize = "x".repeat(MAX_MESSAGE_BYTES + 1);
         let at_limit = "x".repeat(MAX_MESSAGE_BYTES);
@@ -1303,7 +1521,7 @@ mod tests {
         use crate::plugin::automation_policy::{
             MAX_PLUGIN_MESSAGES_PER_HOUR, MAX_PLUGIN_TURNS_PER_HOUR,
         };
-        let (deps, _dir) = test_deps(Vec::new());
+        let (deps, _state, _dir) = test_deps(Vec::new());
         for _ in 0..MAX_PLUGIN_MESSAGES_PER_HOUR {
             deps.policy.admit_message("cron").expect("under the rate");
         }
@@ -1344,7 +1562,7 @@ mod tests {
                 prior.push(inst);
             }
         }
-        let (deps, state, _dir) = test_deps_with_state(prior.clone());
+        let (deps, state, _dir) = test_deps(prior.clone());
         let ctx = ctx_with(&["session.message"]);
         for inst in &prior {
             let want = if inst.is_archived() {
@@ -1490,7 +1708,8 @@ mod tests {
             parked.view = crate::session::View::Structured;
             parked.agent_name = Some("aoe-no-such-agent-msg".to_string());
             park(&mut parked);
-            let (deps, state, _dir) = test_deps_with_state(vec![parked]);
+            let (deps, state, _dir) = test_deps(vec![parked]);
+            seed_native_rows(&state).await;
             let result = dispatch(
                 &deps,
                 &ctx_with(&["session.message"]),
@@ -1525,13 +1744,12 @@ mod tests {
         let _home = crate::session::test_support::isolate_app_dir();
         let mut terminal = Instance::new("terminal", "/tmp/aoe-msg-project");
         terminal.id = "sess-msg-terminal".to_string();
-        let (deps, _dir) = test_deps(vec![terminal]);
+        let (deps, _state, _dir) = test_deps(vec![terminal]);
         let cityhall = Arc::new(SessionRpcDeps {
             session_service: deps.session_service.clone(),
             policy: deps.policy.clone(),
             profile: deps.profile.clone(),
             cityhall_mode: true,
-            status_tx: deps.status_tx.clone(),
         });
         let err = dispatch(
             &cityhall,
@@ -1568,6 +1786,7 @@ mod tests {
 
     #[test]
     fn terminal_send_errors_map_to_documented_kinds() {
+        use axum::response::IntoResponse;
         let cases: Vec<(SendKeysError, &str)> = vec![
             (SendKeysError::NotFound, "session_not_found"),
             (SendKeysError::Gone, "session_not_found"),
@@ -1584,13 +1803,32 @@ mod tests {
                 SendKeysError::Transient(Status::Starting),
                 "session_transient",
             ),
-            (SendKeysError::ResumeFailed("sid-1".into()), "resume_failed"),
+            (
+                SendKeysError::Preparation {
+                    response: Box::new(axum::http::StatusCode::CONFLICT.into_response()),
+                    detail: serde_json::json!({"error": "resume_failed", "resume_session_id": "sid-1"}),
+                },
+                "resume_failed",
+            ),
         ];
         for (err, want) in cases {
             assert_eq!(kind(&map_terminal_error(err)), want);
         }
-        let resume = map_terminal_error(SendKeysError::ResumeFailed("sid-1".into()));
+        let resume = map_terminal_error(SendKeysError::Preparation {
+            response: Box::new(axum::http::StatusCode::CONFLICT.into_response()),
+            detail: serde_json::json!({"error": "resume_failed", "resume_session_id": "sid-1"}),
+        });
         assert_eq!(resume.data.unwrap()["resume_session_id"], "sid-1");
+        let forbidden = map_terminal_error(SendKeysError::Preparation {
+            response: Box::new(axum::http::StatusCode::FORBIDDEN.into_response()),
+            detail: serde_json::json!({"error": "read_only"}),
+        });
+        assert_eq!(forbidden.code, codes::FORBIDDEN);
+        assert_eq!(kind(&forbidden), "read_only");
+        let secret = map_terminal_error(SendKeysError::Tmux(anyhow::anyhow!(
+            "credential=private-value"
+        )));
+        assert!(!secret.message.contains("private-value"));
     }
 
     #[tokio::test]
@@ -1600,7 +1838,7 @@ mod tests {
         let mut other_session = Instance::new("other-owned", "/tmp/aoe-2897-project");
         other_session.id = "sess-other".to_string();
         other_session.created_by_plugin = Some("other-plugin".to_string());
-        let (deps, _dir) = test_deps(vec![user_session, other_session]);
+        let (deps, _state, _dir) = test_deps(vec![user_session, other_session]);
         let ctx = ctx_with(&["session.prompt"]);
 
         for (session, expected_kind, expected_code) in [
@@ -1626,6 +1864,12 @@ mod tests {
         );
     }
 
+    /// #3649: a plugin turn is a turn-starting surface, so it must settle a
+    /// disposition under the submission guard instead of forwarding
+    /// unconditionally once the guard is its own. `send_prompt` acknowledges
+    /// the channel enqueue, so the pre-fix path answered `{}` for a prompt the
+    /// agent then refused as `agent_busy`, and the plugin's audit trail
+    /// recorded a turn that never ran.
     #[tokio::test]
     async fn turn_send_refuses_a_turn_another_submission_already_started() {
         use std::time::Duration;
@@ -1636,7 +1880,8 @@ mod tests {
         inst.view = crate::session::View::Structured;
         inst.status = crate::session::Status::Idle;
         inst.created_by_plugin = Some("cron".to_string());
-        let (deps, _dir) = test_deps(vec![inst]);
+        let (deps, state, _dir) = test_deps(vec![inst]);
+        seed_native_rows(&state).await;
         let cmds = deps
             .session_service
             .acp_supervisor
@@ -1655,6 +1900,8 @@ mod tests {
         );
         assert_eq!(claims.try_recv().unwrap(), "sess-3649");
 
+        // What the winner does before releasing: publishing is the choke point
+        // that flips the control fold to `turn_active`.
         deps.session_service
             .acp_supervisor
             .publish_user_prompt_with_attachments(
@@ -1681,6 +1928,11 @@ mod tests {
         );
     }
 
+    /// #3685: ownership is immutable and decided before any live state is
+    /// folded, so a session another plugin owns answers `not_owner` whatever
+    /// it is doing. Settling the disposition first leaked coarse live state
+    /// for a foreign session, and answered a retryable `agent_busy` for a
+    /// permanently unauthorized call.
     #[tokio::test]
     async fn turn_send_refuses_a_foreign_session_in_every_control_state() {
         use crate::acp::state::Event;
@@ -1691,7 +1943,10 @@ mod tests {
         foreign.view = crate::session::View::Structured;
         foreign.agent_name = Some("claude".to_string());
         foreign.created_by_plugin = Some("other-plugin".to_string());
-        let (deps, state, _dir) = test_deps_with_state(vec![foreign]);
+        let (deps, state, _dir) = test_deps(vec![foreign]);
+        // A live worker: without one every dispatch parks on `WorkerDown`,
+        // which this path forwards rather than refusing, so the leak the test
+        // is about would never be reachable.
         deps.session_service
             .acp_supervisor
             .test_insert_worker("sess-3685")
@@ -1718,6 +1973,7 @@ mod tests {
             synthesized: false,
             origin_plugin: None,
         };
+        // Each state named by the disposition it would have leaked.
         for (label, events, expected) in [
             ("idle", vec![], crate::acp::dispatch::PromptDispatch::Sent),
             (
@@ -1778,6 +2034,9 @@ mod tests {
         }
     }
 
+    /// #3686: a parked plugin session is woken by a turn, not refused as
+    /// missing. The resume itself fails here (no real agent), which is a
+    /// worker error, never `session_not_found`.
     #[tokio::test]
     async fn turn_send_wakes_a_parked_session() {
         let _home = crate::session::test_support::isolate_app_dir();
@@ -1796,7 +2055,8 @@ mod tests {
             parked.agent_name = Some("aoe-no-such-agent-3686".to_string());
             parked.created_by_plugin = Some("cron".to_string());
             park(&mut parked);
-            let (deps, state, _dir) = test_deps_with_state(vec![parked]);
+            let (deps, state, _dir) = test_deps(vec![parked]);
+            seed_native_rows(&state).await;
             let ctx = ctx_with(&["session.prompt"]);
 
             let result = dispatch(
@@ -1859,7 +2119,7 @@ mod tests {
             park(&mut resting);
             prior.push(resting);
 
-            let (deps, state, _dir) = test_deps_with_state(prior);
+            let (deps, state, _dir) = test_deps(prior);
             let ctx = ctx_with(&["session.prompt"]);
 
             let err = match dispatch(
@@ -1922,7 +2182,8 @@ mod tests {
             shelve(&mut shelved);
             prior.push(shelved.clone());
 
-            let (deps, state, _dir) = test_deps_with_state(prior);
+            let (deps, state, _dir) = test_deps(prior);
+            seed_native_rows(&state).await;
             let err = dispatch(
                 &deps,
                 &ctx_with(&["session.prompt"]),
@@ -1962,7 +2223,9 @@ mod tests {
                 Ok(())
             })
             .unwrap();
-        let (deps, state, _dir) = test_deps_with_state(vec![resting]);
+        let (deps, state, _dir) = test_deps(vec![resting]);
+        crate::session::purge_owners::initialize(&crate::session::get_app_dir().unwrap()).unwrap();
+        crate::server::test_support::refresh_canonical_metadata_for_test(&state).await;
 
         let err = dispatch(
             &deps,
@@ -1999,6 +2262,7 @@ mod tests {
         let mut already_pending = Instance::new("already-reviving", "/tmp/aoe-4120-plugin");
         already_pending.id = "sess-already-pending".to_string();
         already_pending.created_by_plugin = Some("cron".to_string());
+        already_pending.view = crate::session::View::Structured;
         already_pending.status = Status::Idle;
         already_pending.plugin_revival_pending = true;
         prior.push(already_pending);
@@ -2011,7 +2275,15 @@ mod tests {
         resting.status = Status::Idle;
         prior.push(resting);
 
-        let (deps, state, _dir) = test_deps_with_state(prior);
+        let (deps, state, _dir) = test_deps(prior);
+        seed_native_rows(&state).await;
+        assert!(matches!(
+            state
+                .session_service
+                .touch_and_wake_on_prompt("sess-already-pending", false)
+                .await,
+            crate::server::session_service::PromptTouch::Touched { .. }
+        ));
         let ctx = ctx_with(&["session.prompt"]);
 
         let err = match dispatch(
@@ -2048,7 +2320,8 @@ mod tests {
         resting.agent_name = Some("aoe-no-such-agent-4120".to_string());
         resting.created_by_plugin = Some("cron".to_string());
         resting.status = Status::Idle;
-        let (deps, state, _dir) = test_deps_with_state(vec![resting]);
+        let (deps, state, _dir) = test_deps(vec![resting]);
+        seed_native_rows(&state).await;
         let ctx = ctx_with(&["session.prompt"]);
 
         let result = dispatch(

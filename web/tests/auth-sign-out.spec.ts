@@ -6,13 +6,18 @@
 import { test, expect } from "./helpers/mockedTest";
 
 test("topbar overflow menu signs the user out and returns to LoginPage", async ({ page }) => {
-  await page.route("**/api/login/status", (r) =>
+  await page.route("**/api/login/status*", (r) =>
     r.fulfill({
       json: { required: true, authenticated: true, elevated: true, elevated_until_secs: 600 },
     }),
   );
   await page.route("**/api/logout", (r) => r.fulfill({ json: { ok: true } }));
-  await page.route("**/api/sessions", (r) => r.fulfill({ json: { sessions: [], workspace_ordering: [] } }));
+  await page.route("**/api/sessions", (r) =>
+    r.fulfill({
+      headers: { "aoe-runtime-epoch": "mock-runtime", "aoe-runtime-revision": "1" },
+      json: { sessions: [], workspace_ordering: [] },
+    }),
+  );
 
   await page.setViewportSize({ width: 1280, height: 720 });
   await page.goto("/");

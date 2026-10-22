@@ -460,16 +460,13 @@ fn json_to_list(current: &Value) -> Vec<String> {
     }
 }
 
-/// Built-in agents with a `oneshot_flag` that are installed here, so the
-/// smart-rename picker cannot offer one the one-shot would fail on. Probed in
-/// one memoized batch: field rebuilds are frequent and a per-agent probe paid
-/// a login shell each time. Avoids `AvailableTools::detect()`'s `Config::load`.
+/// Render from the last availability snapshot without waiting for background probes.
 fn installed_oneshot_agents() -> Vec<String> {
     let defs: Vec<&crate::agents::AgentDef> = crate::agents::oneshot_capable_names()
         .into_iter()
         .filter_map(crate::agents::get_agent)
         .collect();
-    let available = crate::tmux::probe_agents_available(&defs);
+    let available = crate::tmux::agent_availability_snapshot(&defs);
     defs.iter()
         .filter(|d| available.contains(d.name))
         .map(|d| d.name.to_string())
@@ -492,10 +489,13 @@ fn custom_value_from_json(id: &str, current: &Value) -> FieldValue {
             FieldValue::Select { selected, options }
         }
         "smart-rename-agent" => {
-            let names = installed_oneshot_agents();
+            let mut names = installed_oneshot_agents();
+            let current = current.as_str().unwrap_or("").trim();
+            if !current.is_empty() && !names.iter().any(|name| name == current) {
+                names.push(current.to_string());
+            }
             let mut options = vec!["Same as session".to_string()];
             options.extend(names.iter().cloned());
-            let current = current.as_str().unwrap_or("").trim();
             let selected = if current.is_empty() {
                 0
             } else {
@@ -1132,6 +1132,19 @@ fn clear_override_path(profile: &mut ProfileConfig, section: &str, field: &str) 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[serial_test::serial]
+    fn smart_rename_picker_retains_a_configured_agent_until_discovery_finishes() {
+        let _home = crate::session::test_support::isolate_app_dir();
+        let memo = crate::tmux::AgentAvailabilityGuard::capture();
+        memo.seed("claude", false);
+        let value = custom_value_from_json("smart-rename-agent", &json!("claude"));
+        assert_eq!(
+            custom_value_to_json("smart-rename-agent", &value),
+            json!("claude")
+        );
+    }
 
     /// Find a built field by its stable identity (`section.field`).
     fn field<'a>(fields: &'a [SettingField], ident: &str) -> &'a SettingField {

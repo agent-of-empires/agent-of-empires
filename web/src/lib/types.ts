@@ -5,15 +5,19 @@ import type { SchemaSettings } from "./generated/settingsKeys";
 
 export interface SessionResponse {
   id: string;
+  idempotency_key?: string | null;
+  parent_session_id?: string | null;
   title: string;
   project_path: string;
   /** Host path of the session's managed artifact directory. */
   artifact_dir: string;
   group_path: string;
+  sort_index?: number | null;
   tool: string;
   status: SessionStatus;
   /** Worker auto-stopped for inactivity (resumable), unlike a deliberate Stop. */
   dormant: boolean;
+  lifecycle_generation: number;
   yolo_mode: boolean;
   created_at: string;
   last_accessed_at: string | null;
@@ -45,6 +49,7 @@ export interface SessionResponse {
   /** Null once the snooze expires, so any non-null value is an active snooze. */
   snoozed_until?: string | null;
   trashed_at?: string | null;
+  trash_lifecycle_id?: string | null;
   /** Needs attention (unreviewed finished turn or manual flag). */
   unread?: boolean;
   has_managed_worktree: boolean;
@@ -419,6 +424,13 @@ export interface SuggestionActionResponse {
   created?: boolean;
 }
 
+export interface CreationTrustFingerprint {
+  project_path: string;
+  base_hooks_hash: string;
+  hooks_hash: string | null;
+  mcp_hash: string | null;
+}
+
 /** Request body for POST /api/sessions. */
 export interface CreateSessionRequest {
   prompt?: string;
@@ -454,6 +466,8 @@ export interface CreateSessionRequest {
   scratch?: boolean;
   /** Approve repo lifecycle hooks, like CLI `--trust-hooks`. */
   trust_hooks?: boolean;
+  /** Fingerprint of the exact hook/MCP configuration reviewed before approval. */
+  trust_review?: CreationTrustFingerprint;
   /** Claude Code session id to import; `path` must be its original cwd. */
   import_acp_session_id?: string;
   /** Agent or ACP session id to fork from. */

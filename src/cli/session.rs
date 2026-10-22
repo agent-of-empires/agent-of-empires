@@ -7,7 +7,7 @@ use std::collections::HashSet;
 
 use crate::session::{
     acquire_session_identity_lock, duplicate_session_error, is_duplicate_session, GroupTree,
-    Instance, LifecycleOperation, ResumeIntent, StartOutcome, Storage,
+    Instance, LifecycleOperation, ResumeIntent, StartOutcome, Status, Storage,
 };
 
 #[derive(Subcommand)]
@@ -26,6 +26,11 @@ pub enum SessionCommands {
 
     /// Show session details
     Show(ShowArgs),
+
+    /// Block until a session's agent activity status matches one of the
+    /// `--until` values. Exits 0 on a match, 124 on timeout (like
+    /// `timeout(1)`), and 1 if the session stops. Tmux sessions only.
+    Wait(WaitArgs),
 
     /// Rename a session
     Rename(RenameArgs),
@@ -166,6 +171,39 @@ pub struct ArchiveArgs {
     pub no_kill: bool,
 }
 
+#[derive(Clone, Copy, clap::ValueEnum)]
+pub enum WaitStatus {
+    Running,
+    Waiting,
+    Idle,
+    Error,
+}
+
+impl From<WaitStatus> for Status {
+    fn from(s: WaitStatus) -> Self {
+        match s {
+            WaitStatus::Running => Status::Running,
+            WaitStatus::Waiting => Status::Waiting,
+            WaitStatus::Idle => Status::Idle,
+            WaitStatus::Error => Status::Error,
+        }
+    }
+}
+
+#[derive(Args)]
+pub struct WaitArgs {
+    /// Session ID or title
+    pub identifier: String,
+
+    /// Activity status to wait for; repeat to accept any of several
+    #[arg(long, required = true)]
+    pub until: Vec<WaitStatus>,
+
+    /// Give up after this many milliseconds
+    #[arg(long, default_value_t = 300_000)]
+    pub timeout: u64,
+}
+
 #[derive(Args)]
 pub struct SessionIdArgs {
     /// Session ID or title
@@ -294,7 +332,8 @@ pub struct SetSessionIdArgs {
     /// keeps its ACP conversation and needs the native ID plus an explicit
     /// `--store` and a bound Claude conversation.
     session_id: String,
-    /// Assert the native store: a Claude store directory, or a Pi/OMP transcript file.
+    /// Assert the native store: the Claude config root (the directory
+    /// containing `projects/`), or a Pi/OMP transcript file.
     #[arg(long)]
     store: Option<std::path::PathBuf>,
 }
@@ -378,10 +417,10 @@ fn session_details(inst: &Instance, profile: &str) -> SessionDetails {
         tool: inst.tool.clone(),
         command: inst.command.clone(),
         status: format!("{:?}", inst.status).to_lowercase(),
-        state: super::list::state_tag(inst),
+        state: inst.effective_bucket().as_str(),
         trashed_at: inst.trashed_at,
         archived_at: inst.archived_at,
-        snoozed_until: super::list::active_snoozed_until(inst),
+        snoozed_until: inst.active_snoozed_until(),
         pinned_at: inst.pinned_at,
         agent_session_id: inst.agent_session_id.clone(),
         parent_session_id: inst.parent_session_id.clone(),
@@ -397,6 +436,7 @@ pub async fn run(profile: &str, command: SessionCommands) -> Result<()> {
         SessionCommands::Restart(args) => restart_session_dispatch(profile, args).await,
         SessionCommands::Attach(args) => attach_session(profile, args).await,
         SessionCommands::Show(args) => show_session(profile, args).await,
+        SessionCommands::Wait(args) => wait_session(profile, args).await,
         SessionCommands::Capture(args) => capture_session(profile, args).await,
         SessionCommands::Rename(args) => rename_session(profile, args).await,
         SessionCommands::SetWorktreeName(args) => set_worktree_name(profile, args).await,
@@ -472,17 +512,17 @@ async fn archive_session(profile: &str, args: ArchiveArgs) -> Result<()> {
     let inst = super::resolve_session(&args.identifier, &instances)?;
     let id = inst.id.clone();
     let title = inst.title.clone();
-    let inst = inst.clone();
 
     let _lifecycle_lock = storage
         .acquire_instance_lifecycle_lock(&id)
         .context("failed to acquire instance archive lock")?;
     if !args.no_kill {
-        if let Err(e) = inst.kill_locked() {
-            eprintln!("Warning: failed to kill agent tmux session: {}", e);
-        }
-        inst.kill_ancillary_tmux_sessions_locked();
-        inst.release_scope();
+        let inst = storage
+            .load()?
+            .into_iter()
+            .find(|row| row.id == id)
+            .context("session disappeared before archive")?;
+        inst.kill_all_tmux_sessions_locked()?;
     }
 
     let landed = storage.update(|instances, _groups| {
@@ -509,22 +549,33 @@ async fn restore_session(profile: &str, args: SessionIdArgs) -> Result<()> {
     let storage = Storage::open_unwatched(profile)?;
 
     let (instances, _groups) = storage.load_with_groups()?;
-    let trashed: Vec<_> = instances
-        .iter()
-        .filter(|i| i.is_trashed())
-        .cloned()
-        .collect();
-    let mut inst = super::resolve_session(&args.identifier, &trashed)
-        .map_err(|_| anyhow::anyhow!("No trashed session matching '{}'", args.identifier))?
-        .clone();
+    let trashed: Vec<_> = instances.into_iter().filter(Instance::is_trashed).collect();
+    let inst = super::resolve_session(&args.identifier, &trashed)
+        .map_err(|_| anyhow::anyhow!("No trashed session matching '{}'", args.identifier))?;
     let restore_id = inst.id.clone();
 
+    let _identity = crate::session::acquire_session_identity_lock()?;
     let _lifecycle_lock = storage
         .acquire_instance_lifecycle_lock(&restore_id)
         .context("failed to acquire instance restore lock")?;
-    let decision = storage.update(|instances, _groups| {
-        crate::session::claim::decide_restore_claim(instances, &restore_id, chrono::Utc::now())
-            .map_err(anyhow::Error::new)
+    let (decision, fresh) = storage.update(|instances, _groups| {
+        let decision = crate::session::claim::decide_restore_claim(
+            instances,
+            &restore_id,
+            chrono::Utc::now(),
+        )?;
+        let fresh = if matches!(
+            decision,
+            crate::session::claim::RestoreClaimDecision::Claimed(_)
+        ) {
+            instances
+                .iter()
+                .find(|instance| instance.id == restore_id)
+                .cloned()
+        } else {
+            None
+        };
+        Ok((decision, fresh))
     })?;
     let restore_generation = match decision {
         crate::session::claim::RestoreClaimDecision::AlreadyGone => {
@@ -537,6 +588,8 @@ async fn restore_session(profile: &str, args: SessionIdArgs) -> Result<()> {
         ),
         crate::session::claim::RestoreClaimDecision::Claimed(generation) => generation,
     };
+    let mut inst = fresh.context("restored session disappeared after claim")?;
+    inst.source_profile = storage.profile().to_owned();
 
     if let crate::session::trash::RestoreOutcome::Failed { reason } =
         crate::session::trash::restore_worktree_location(&mut inst)
@@ -647,10 +700,11 @@ async fn empty_trash(profile: &str) -> Result<()> {
                 detach_hooks: false,
                 keep_scratch: false,
             },
+            None,
         )?;
         let transaction = match reservation {
-            crate::session::deletion::PurgeReservation::Reserved(transaction) => transaction,
-            crate::session::deletion::PurgeReservation::Rejected(result) => {
+            Ok(transaction) => transaction,
+            Err(result) => {
                 match result.disposition {
                     crate::session::deletion::DeletionDisposition::KeptRestored => {
                         being_restored_elsewhere += 1;
@@ -663,7 +717,7 @@ async fn empty_trash(profile: &str) -> Result<()> {
                 continue;
             }
         };
-        let result = transaction.run_hooks().complete_with(|instance| {
+        let result = transaction.run_hooks()?.complete_with(|instance| {
             super::purge_acp_transcript(instance).map_err(|error| {
                 format!("transcript not purged, keeping session in trash: {error}")
             })
@@ -875,26 +929,29 @@ fn apply_import_mode(
     s: &crate::session::claude_import::ClaudeSessionSummary,
     structured: bool,
 ) {
+    let binding = crate::session::ConversationBinding {
+        session_id: s.session_id.clone(),
+        execution: Some(crate::session::ExecutionBinding {
+            agent: "claude".into(),
+            stores: vec![s.config_dir.clone()],
+            configuration: Vec::new(),
+            cwd: crate::session::capture::canonicalize_or_raw(&s.cwd),
+            filesystem: "host".into(),
+            cwd_filesystem: "host".into(),
+            exported_default_store: Some(true),
+        }),
+        provenance: crate::session::ConversationProvenance::Imported,
+        transcript_path: None,
+    };
     if structured {
         inst.view = crate::session::View::Structured;
         inst.acp_session_id = Some(s.session_id.clone());
+        inst.agent_session_id = Some(s.session_id.clone());
+        inst.agent_session_binding = Some(binding);
         inst.import_pending = Some(true);
     } else {
         inst.resume_intent = ResumeIntent::Use(s.session_id.clone());
-        inst.resume_binding = Some(crate::session::ConversationBinding {
-            session_id: s.session_id.clone(),
-            execution: Some(crate::session::ExecutionBinding {
-                agent: "claude".into(),
-                stores: vec![s.config_dir.clone()],
-                configuration: Vec::new(),
-                cwd: crate::session::capture::canonicalize_or_raw(&s.cwd),
-                filesystem: "host".into(),
-                cwd_filesystem: "host".into(),
-                exported_default_store: None,
-            }),
-            provenance: crate::session::ConversationProvenance::Imported,
-            transcript_path: None,
-        });
+        inst.resume_binding = Some(binding);
     }
 }
 
@@ -1458,8 +1515,135 @@ async fn attach_session(profile: &str, args: SessionIdArgs) -> Result<()> {
     supervise_attach_capture(&mut working, |_| tmux_session.attach())
 }
 
-async fn show_session(profile: &str, args: ShowArgs) -> Result<()> {
+const WAIT_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
+const WAIT_TIMEOUT_EXIT_CODE: i32 = 124;
+
+#[derive(Debug, PartialEq, Eq)]
+enum WaitDecision {
+    Matched,
+    Terminated,
+    TimedOut,
+    Continue,
+}
+
+/// Termination wins over a match, so a vanished session never satisfies `--until error` or
+/// `--until idle`. Otherwise a match wins, so an already-satisfied wait returns on its first poll.
+fn wait_decision(
+    current: Status,
+    targets: &[Status],
+    terminated: bool,
+    elapsed: std::time::Duration,
+    timeout: std::time::Duration,
+) -> WaitDecision {
+    if terminated {
+        WaitDecision::Terminated
+    } else if targets.contains(&current) {
+        WaitDecision::Matched
+    } else if elapsed >= timeout {
+        WaitDecision::TimedOut
+    } else {
+        WaitDecision::Continue
+    }
+}
+
+/// Confirmed absence only. An unreachable tmux server leaves a plain `Error`, and a launch that
+/// holds the reservation has not created its pane yet.
+fn is_terminated(
+    status: Status,
+    last_error: Option<&str>,
+    launching: bool,
+    existence: crate::tmux::SessionExistence,
+) -> bool {
+    !launching
+        && (status == Status::Stopped
+            || (status == Status::Error
+                && last_error == Some(crate::session::TMUX_SESSION_GONE_ERROR))
+            // A capture that loses a vanishing pane reads as Idle, so recheck the pane itself.
+            || existence == crate::tmux::SessionExistence::Absent)
+}
+
+fn confirmed_terminated(inst: &Instance) -> bool {
+    let existence = inst
+        .tmux_session()
+        .map_or(crate::tmux::SessionExistence::Unknown, |s| s.existence());
+    is_terminated(
+        inst.status,
+        inst.last_error.as_deref(),
+        inst.has_fresh_launch_reservation(chrono::Utc::now()),
+        existence,
+    )
+}
+
+/// Take durable lifecycle fields from the stored row, keeping `live`'s detection state.
+fn adopt_stored(live: &Instance, mut stored: Instance) -> Result<Instance> {
+    bail_if_acp(&stored, "wait")?;
+    stored.merge_runtime_from_reload(live);
+    Ok(stored)
+}
+
+async fn wait_session(profile: &str, args: WaitArgs) -> Result<()> {
     let storage = Storage::open_unwatched(profile)?;
+    let profile = storage.profile();
+    let (instances, _) = storage.load_with_groups()?;
+    let inst = super::resolve_session(&args.identifier, &instances)?;
+    bail_if_acp(inst, "wait")?;
+    let mut live = inst.clone();
+    crate::session::config::profile_config::resolve_config_or_warn(profile);
+
+    let targets: Vec<Status> = args.until.iter().map(|s| (*s).into()).collect();
+    let timeout = std::time::Duration::from_millis(args.timeout);
+    let start = std::time::Instant::now();
+    let mut first = true;
+    loop {
+        crate::tmux::refresh_session_cache();
+        // The first poll must decide on its own; later polls share one detection state so a
+        // Running to Idle transition can be confirmed by a second observation.
+        if first {
+            live.update_status_once(None, None);
+            first = false;
+        } else {
+            let stored = storage
+                .load()?
+                .into_iter()
+                .find(|i| i.id == live.id)
+                .with_context(|| format!("session '{}' was removed", live.title))?;
+            live = adopt_stored(&live, stored)?;
+            live.update_status_with_metadata(None, None);
+        }
+        tracing::debug!(target: "cli.session", "wait poll status={}", live.status.as_str());
+        let elapsed = start.elapsed();
+        // The poll may have lost a vanishing pane; reread liveness before deciding.
+        crate::tmux::refresh_session_cache();
+        match wait_decision(
+            live.status,
+            &targets,
+            confirmed_terminated(&live),
+            elapsed,
+            timeout,
+        ) {
+            WaitDecision::Matched => {
+                println!("{}", live.status.as_str());
+                return Ok(());
+            }
+            WaitDecision::Terminated => bail!("session '{}' is not running", live.title),
+            WaitDecision::TimedOut => {
+                eprintln!(
+                    "Error: timed out after {}ms waiting for '{}' (last status: {})",
+                    args.timeout,
+                    live.title,
+                    live.status.as_str()
+                );
+                std::process::exit(WAIT_TIMEOUT_EXIT_CODE);
+            }
+            WaitDecision::Continue => {
+                tokio::time::sleep(WAIT_POLL_INTERVAL.min(timeout - elapsed)).await;
+            }
+        }
+    }
+}
+
+async fn show_session(profile: &str, args: ShowArgs) -> Result<()> {
+    let storage = Storage::open_reference(profile)?;
     let (instances, _) = storage.load_with_groups()?;
 
     let mut inst = if let Some(id) = &args.identifier {
@@ -1503,7 +1687,7 @@ async fn show_session(profile: &str, args: ShowArgs) -> Result<()> {
         if let Some(at) = inst.trashed_at.or(inst.archived_at) {
             println!(
                 "  State:   {} ({})",
-                super::list::state_tag(&inst),
+                inst.effective_bucket().as_str(),
                 at.format("%+")
             );
         }
@@ -1709,7 +1893,7 @@ async fn rename_session(profile: &str, args: RenameArgs) -> Result<()> {
         .find(|instance| instance.id == id)
         .ok_or_else(|| anyhow::anyhow!("Session not found: {}", id))?;
     let mut inst = inst.clone();
-    if let Err(error) = crate::session::worktree_reconcile::reconcile_and_persist(
+    if let Err(error) = crate::session::worktree_reconcile::reconcile_and_persist_locked(
         &storage,
         &mut inst,
         &mut Default::default(),
@@ -2487,7 +2671,7 @@ async fn set_worktree_name(profile: &str, args: SetWorktreeNameArgs) -> Result<(
         .find(|instance| instance.id == id)
         .ok_or_else(|| anyhow::anyhow!("Session not found: {}", id))?;
     let mut inst = inst.clone();
-    if let Err(error) = crate::session::worktree_reconcile::reconcile_and_persist(
+    if let Err(error) = crate::session::worktree_reconcile::reconcile_and_persist_locked(
         &storage,
         &mut inst,
         &mut Default::default(),
@@ -2651,13 +2835,39 @@ async fn set_session_id(profile: &str, args: SetSessionIdArgs) -> Result<()> {
             .id
             .clone()
     };
+    let _handoff_driver = crate::session::try_acquire_terminal_handoff_driver(&target_id)?
+        .context("terminal handoff driver is active; retry after it finishes")?;
     let lifecycle_lock = storage
         .acquire_instance_lifecycle_lock(&target_id)
         .context("failed to acquire instance resume-target lock")?;
     let title = storage.update(|instances, _groups| {
         super::patch_instance(instances, &target_id, |inst| {
+            let pending_recovery = inst.terminal_handoff.as_ref().map(|intent| (intent.id, intent.stage));
+            if let Some((_, stage)) = pending_recovery {
+                anyhow::ensure!(matches!(stage,
+                    crate::session::TerminalHandoffStage::TerminalCommitOwed
+                        | crate::session::TerminalHandoffStage::TerminalLaunchOwed),
+                    "terminal handoff must finish original retirement before its native target can change");
+                let pending = inst.terminal_handoff.as_ref().expect("pending recovery");
+                anyhow::ensure!(pending.final_event_seq.is_some(),
+                    "original retirement completion has not been durably captured");
+                anyhow::ensure!(pending.profile == storage.profile()
+                    && pending.profile_identity == storage.bound_profile_identity()?
+                    && pending.generation == inst.lifecycle_generation,
+                    crate::session::LifecycleReservationError::Superseded);
+                pending.ensure_original_stopped(&inst.id)?;
+                let pane = inst.tmux_session()?;
+                if pane.exists_live() {
+                    anyhow::ensure!(pane.is_pane_dead(),
+                        "terminal handoff pane is live; retry disable to complete adoption before changing its target");
+                    let launch = pending.launch.as_ref().ok_or_else(|| anyhow::anyhow!(
+                        "existing dead pane has no handoff receipt; pane retained"))?;
+                    crate::session::Instance::ensure_terminal_handoff_pane_matches(pane.name(),
+                        crate::session::TerminalHandoffKey { id: pending.id, generation: pending.generation }, launch)?;
+                }
+            }
             inst.source_profile = storage.profile().to_string();
-            if inst.is_structured() {
+            if inst.is_structured() && pending_recovery.is_none() {
                 anyhow::ensure!(args.store.is_some() && matches!((&new_intent, inst.acp_session_id.as_deref()), (crate::session::ResumeIntent::Use(sid), Some(acp_sid)) if sid == acp_sid),
                     "ACP manages its own conversation; a native handoff assertion requires its current ID and an explicit --store");
             }
@@ -2665,11 +2875,39 @@ async fn set_session_id(profile: &str, args: SetSessionIdArgs) -> Result<()> {
                 crate::session::ResumeIntent::Use(sid) => Some(inst.asserted_resume_binding(sid, args.store.as_deref())?),
                 _ => None,
             };
-            anyhow::ensure!(!inst.is_structured() || binding.as_ref().and_then(|binding| binding.execution.as_ref()).is_some_and(|execution| execution.agent == "claude"),
+            anyhow::ensure!(pending_recovery.is_some() || !inst.is_structured() || binding.as_ref().and_then(|binding| binding.execution.as_ref()).is_some_and(|execution| execution.agent == "claude"),
                 "ACP terminal handoff is supported only for an explicitly bound Claude conversation");
             inst.resume_binding = binding;
             inst.resume_intent = new_intent.clone();
             inst.resume_probe_failed_sid = None;
+            if let Some((intent_id, _)) = pending_recovery {
+                let context = match &new_intent {
+                    crate::session::ResumeIntent::Use(_) => {
+                        let native_store = inst.resume_binding.as_ref().and_then(|binding| binding.execution.clone())
+                            .context("pending handoff recovery requires a proven native store")?;
+                        crate::session::TerminalHandoffContext::Keep { native_store }
+                    }
+                    crate::session::ResumeIntent::Cleared => crate::session::TerminalHandoffContext::Discard,
+                    _ => unreachable!(),
+                };
+                let generation = inst.lifecycle_generation.checked_add(1)
+                    .ok_or(crate::session::LifecycleReservationError::GenerationOverflow)?;
+                let target = inst.conversation_state();
+                let source_acp_session_id = inst.acp_session_id.clone();
+                inst.lifecycle_generation = generation;
+                inst.lifecycle_reservation = None;
+                let pending = inst.terminal_handoff.as_mut().expect("validated handoff");
+                anyhow::ensure!(pending.id == intent_id,
+                    crate::session::LifecycleReservationError::Superseded);
+                pending.generation = generation;
+                pending.target_generation = generation;
+                pending.context = context;
+                pending.source_conversation = target.clone();
+                pending.source_acp_session_id = source_acp_session_id;
+                pending.terminal = Some(target);
+                pending.launch_started = false;
+                // Retain the original checkpoint solely as the owned dead-pane receipt.
+            }
             Ok(inst.title.clone())
         })
     })?;
@@ -2735,7 +2973,13 @@ async fn add_project(profile: &str, args: AddProjectArgs) -> Result<()> {
         crate::session::attach_project::Quiesced::default()
     };
 
-    let outcome = match crate::session::attach_project::attach_planned(&storage, &id, inst, plan) {
+    let outcome = match crate::session::attach_project::attach_planned(
+        &storage,
+        &id,
+        inst,
+        plan,
+        quiesced.lifecycle_generation,
+    ) {
         Ok(outcome) => outcome,
         Err(e) => {
             crate::session::attach_project::resume_after_conversion(&storage, &id, quiesced);
@@ -3708,5 +3952,135 @@ mod show_json_tests {
             active["snoozed_until"],
             serde_json::to_value(future).unwrap()
         );
+    }
+}
+
+#[cfg(test)]
+mod wait_decision_tests {
+    use super::{adopt_stored, is_terminated, wait_decision, WaitDecision};
+    use crate::session::{
+        Instance, LifecycleOperation, Status, TMUX_SERVER_UNREACHABLE_ERROR,
+        TMUX_SESSION_GONE_ERROR,
+    };
+    use std::time::Duration;
+
+    const SECS: fn(u64) -> Duration = Duration::from_secs;
+
+    #[test]
+    fn decides_match_stop_timeout_or_continue() {
+        use WaitDecision::*;
+        let cases = [
+            // already in the target state, even with no time left
+            (Status::Idle, vec![Status::Idle], false, 0, 0, Matched),
+            (Status::Idle, vec![Status::Idle], false, 99, 10, Matched),
+            // any one of several targets satisfies the wait
+            (
+                Status::Waiting,
+                vec![Status::Idle, Status::Waiting],
+                false,
+                1,
+                10,
+                Matched,
+            ),
+            (Status::Error, vec![Status::Error], false, 1, 10, Matched),
+            (
+                Status::Running,
+                vec![Status::Idle, Status::Waiting],
+                false,
+                1,
+                10,
+                Continue,
+            ),
+            (Status::Running, vec![Status::Idle], false, 10, 10, TimedOut),
+            (
+                Status::Starting,
+                vec![Status::Idle],
+                false,
+                99,
+                10,
+                TimedOut,
+            ),
+            // termination beats a match, including a gone pane that reads as Error or Idle
+            (Status::Stopped, vec![Status::Idle], true, 1, 10, Terminated),
+            (Status::Error, vec![Status::Error], true, 1, 10, Terminated),
+            (Status::Idle, vec![Status::Idle], true, 1, 10, Terminated),
+        ];
+        for (current, targets, terminated, elapsed, timeout, want) in cases {
+            assert_eq!(
+                wait_decision(current, &targets, terminated, SECS(elapsed), SECS(timeout)),
+                want,
+                "{current:?} {targets:?} terminated={terminated} elapsed={elapsed} timeout={timeout}"
+            );
+        }
+    }
+
+    #[test]
+    fn only_confirmed_absence_is_termination() {
+        use crate::tmux::SessionExistence::{Absent, Present, Unknown};
+        let cases = [
+            (Status::Stopped, None, false, Present, true),
+            (
+                Status::Error,
+                Some(TMUX_SESSION_GONE_ERROR),
+                false,
+                Present,
+                true,
+            ),
+            (
+                Status::Error,
+                Some(TMUX_SERVER_UNREACHABLE_ERROR),
+                false,
+                Unknown,
+                false,
+            ),
+            (Status::Error, None, false, Unknown, false),
+            (
+                Status::Idle,
+                Some(TMUX_SESSION_GONE_ERROR),
+                false,
+                Present,
+                false,
+            ),
+            // a capture that lost the pane reads Idle; the pane check still catches it
+            (Status::Idle, None, false, Absent, true),
+            // a launch holding its reservation has no pane yet
+            (Status::Starting, None, true, Absent, false),
+            (Status::Stopped, None, true, Absent, false),
+        ];
+        for (status, last_error, launching, existence, want) in cases {
+            assert_eq!(
+                is_terminated(status, last_error, launching, existence),
+                want,
+                "{status:?} {last_error:?} launching={launching} {existence:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn adopt_stored_sees_a_launch_commit_and_keeps_detection_state() {
+        let now = chrono::Utc::now();
+        let mut live = Instance::new("t", "/p");
+        live.try_acquire_lifecycle_reservation(
+            LifecycleOperation::Launch,
+            Instance::LIFECYCLE_RESERVATION_TTL,
+            now,
+        )
+        .unwrap();
+        live.status = Status::Starting;
+        live.detection.pending = Some(Status::Idle);
+        assert!(live.has_fresh_launch_reservation(now));
+
+        let mut stored = live.clone();
+        stored.lifecycle_generation += 1;
+        stored.lifecycle_reservation = None;
+        stored.detection.pending = None;
+        stored.source_profile = "original".into();
+
+        let adopted = adopt_stored(&live, stored).unwrap();
+        assert!(!adopted.has_fresh_launch_reservation(now));
+        assert_eq!(adopted.detection.pending, Some(Status::Idle));
+        let mut converted = adopted;
+        converted.view = crate::session::View::Structured;
+        assert!(adopt_stored(&live, converted).is_err());
     }
 }

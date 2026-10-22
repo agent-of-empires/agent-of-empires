@@ -90,7 +90,7 @@ pub(super) async fn normalize_suggestion(
     let profile = body
         .profile
         .clone()
-        .unwrap_or_else(|| crate::session::config::effective_profile(&state.profile));
+        .unwrap_or_else(|| crate::session::config::effective_profile(&state.served_profile()));
     if let Some(response) = crate::server::api::unknown_profile_response(&profile) {
         return Err(response);
     }

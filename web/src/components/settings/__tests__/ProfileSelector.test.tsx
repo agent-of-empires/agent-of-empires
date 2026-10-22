@@ -29,7 +29,7 @@ afterEach(cleanup);
 
 async function openPanel(button: "+ New" | "Rename", selected = "work") {
   const onSelect = vi.fn();
-  const { container } = render(<ProfileSelector selectedProfile={selected} onSelect={onSelect} />);
+  const { container } = render(<ProfileSelector selectedProfile={selected} onSelect={onSelect} onRenamed={() => {}} />);
   await waitFor(() => expect(fetchProfiles).toHaveBeenCalled());
   fireEvent.click(screen.getByText(button));
   const input = (await screen.findByPlaceholderText(
@@ -99,7 +99,7 @@ describe("ProfileSelector rename", () => {
 
 it("deletes only after confirm() returns true", async () => {
   const confirmSpy = vi.spyOn(window, "confirm").mockReturnValueOnce(false).mockReturnValueOnce(true);
-  render(<ProfileSelector selectedProfile="work" onSelect={vi.fn()} />);
+  render(<ProfileSelector selectedProfile="work" onSelect={vi.fn()} onRenamed={() => {}} />);
   const deleteBtn = await screen.findByText("Delete");
   fireEvent.click(deleteBtn);
   expect(deleteProfile).not.toHaveBeenCalled();

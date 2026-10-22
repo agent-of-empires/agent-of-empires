@@ -1085,21 +1085,6 @@ pub struct SessionConfig {
     )]
     pub sidebar_position: SidebarPosition,
 
-    /// Read the session state the `aoe serve` daemon owns (structured session
-    /// status) from the running daemon, the way the web dashboard does, instead
-    /// of from the local session store. With no daemon running the sidebar uses
-    /// the local store alone and daemon-owned state keeps its last value. Off
-    /// keeps the sidebar on the local store only.
-    #[serde(default = "default_true")]
-    #[setting(
-        label = "Daemon-sourced sidebar",
-        widget = "toggle",
-        global_only,
-        advanced,
-        tui_only
-    )]
-    pub daemon_sidebar: bool,
-
     /// Forward AoE's whole environment to host sessions instead of just the
     /// desktop vars (DISPLAY, XDG_*, DBUS). Lets vars like GOPATH reach an
     /// agent without naming each one in the Host Environment list. AoE's own
@@ -1840,9 +1825,13 @@ impl AcpConfig {
     }
 
     pub fn acp_defaults_for(&self, agent: &str) -> Option<&AcpAgentDefaults> {
-        self.acp_defaults
-            .get(agent)
-            .filter(|defaults| !defaults.is_empty())
+        let non_empty = |key: &str| self.acp_defaults.get(key).filter(|d| !d.is_empty());
+        non_empty(agent).or_else(|| {
+            // `claude-code` is the legacy alias stored by older session records.
+            (agent == "claude-code")
+                .then(|| non_empty("claude"))
+                .flatten()
+        })
     }
 
     /// The model `agent` is pinned to (`pin_model` with a non-empty `model`).
@@ -2006,7 +1995,6 @@ impl Default for SessionConfig {
             pre_trust_agent_folders: false,
             show_diagnostics_pane: false,
             sidebar_position: SidebarPosition::default(),
-            daemon_sidebar: true,
             inherit_host_environment: false,
             agent_extra_args: HashMap::new(),
             agent_command_override: HashMap::new(),
@@ -2326,6 +2314,13 @@ pub struct WebConfig {
     #[serde(default = "default_true")]
     #[setting(label = "Notify on scheduled wake", widget = "toggle", global_only)]
     pub notify_on_wake_fire: bool,
+
+    /// Serve a Model Context Protocol server at `/mcp` on the daemon so MCP
+    /// clients holding the daemon token can list and drive sessions. When
+    /// false the route does not exist. Read at daemon startup.
+    #[serde(default)]
+    #[setting(label = "MCP server", widget = "toggle", global_only)]
+    pub mcp_enabled: bool,
 }
 
 impl Default for WebConfig {
@@ -2336,6 +2331,7 @@ impl Default for WebConfig {
             notify_on_idle: false,
             notify_on_error: true,
             notify_on_wake_fire: true,
+            mcp_enabled: false,
         }
     }
 }
@@ -3594,29 +3590,46 @@ fn config_save_lock() -> &'static Mutex<()> {
     LOCK.get_or_init(|| Mutex::new(()))
 }
 
+pub(super) fn read_optional_config(path: &std::path::Path) -> Result<Option<String>> {
+    match fs::read_to_string(path) {
+        Ok(content) => Ok(Some(content)),
+        // A missing file is optional; a broken link or an unreadable path is not.
+        Err(error)
+            if error.kind() == std::io::ErrorKind::NotFound
+                && fs::symlink_metadata(path)
+                    .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound) =>
+        {
+            Ok(None)
+        }
+        Err(error) => Err(error.into()),
+    }
+}
+
 impl Config {
-    /// Read and parse `config.toml` into a raw `toml::Table`, with the
-    /// stale `app_state` section stripped. Shared prelude for [`Config::load`]
-    /// and [`Config::config_ignored_keys`]; keeping the read + strip in one
-    /// place stops the ignored-key probe from ever flagging a section `load`
-    /// silently drops.
+    /// Read config.toml without the obsolete inline app_state table.
     fn load_raw_table() -> Result<toml::Table> {
         let path = config_path()?;
-        let mut table: toml::Table = if path.exists() {
-            toml::from_str(&fs::read_to_string(&path)?)?
-        } else {
-            toml::Table::new()
-        };
-        // `app_state` now lives in state.toml; strip any stale key left over
-        // from before the split (or written by an out-of-date peer) so it
-        // never shadows the authoritative source below.
-        table.remove("app_state");
-        Ok(table)
+        let result = (|| {
+            let mut table: toml::Table = match read_optional_config(&path)? {
+                Some(content) => toml::from_str(&content)?,
+                None => toml::Table::new(),
+            };
+            // state.toml is authoritative even if an older peer writes inline state.
+            table.remove("app_state");
+            Ok(table)
+        })();
+        result.map_err(|error: anyhow::Error| error.context(crate::session::LoadSource(path)))
     }
 
     pub fn load() -> Result<Self> {
         let table = Self::load_raw_table()?;
-        let mut config: Config = table.try_into()?;
+        let mut config: Config = table.try_into().map_err(|error: toml::de::Error| {
+            let error = anyhow::Error::new(error);
+            match config_path() {
+                Ok(path) => error.context(crate::session::LoadSource(path)),
+                Err(_) => error,
+            }
+        })?;
         config.app_state = AppStateConfig::load()?;
         Ok(config)
     }
@@ -3728,12 +3741,14 @@ impl AppStateConfig {
     /// `[app_state]` table). A missing file deserializes to defaults.
     pub fn load() -> Result<Self> {
         let path = state_path()?;
-        let table: toml::Table = if path.exists() {
-            toml::from_str(&fs::read_to_string(&path)?)?
-        } else {
-            toml::Table::new()
-        };
-        Ok(table.try_into()?)
+        let result = (|| {
+            let table: toml::Table = match read_optional_config(&path)? {
+                Some(content) => toml::from_str(&content)?,
+                None => toml::Table::new(),
+            };
+            Ok(table.try_into()?)
+        })();
+        result.map_err(|error: anyhow::Error| error.context(crate::session::LoadSource(path)))
     }
 }
 
@@ -3747,16 +3762,15 @@ impl AppStateConfig {
 /// concurrent writer's unrelated edits survive, and the TUI and an `aoe serve`
 /// daemon (or any two `aoe` processes) can call this concurrently without
 /// losing an update. Symlinked `state.toml` files are resolved and written
-/// through, the same as every other `locked_update` file.
+/// through the resolved target protected by `LockedDataFile`.
 pub fn update_app_state<R>(f: impl FnOnce(&mut AppStateConfig) -> R) -> Result<R> {
-    let outcome = super::storage::locked_update(
-        &state_path()?,
+    let outcome = super::storage::LockedDataFile::open(&state_path()?)?.update(
         |content| Ok(content.parse::<toml::Table>()?.try_into()?),
         |state| Ok(toml::to_string_pretty(&toml::Table::try_from(state)?)?),
         |state| -> std::result::Result<R, std::convert::Infallible> { Ok(f(state)) },
     )?;
     match outcome {
-        Ok(result) => Ok(result),
+        Ok((result, _)) => Ok(result),
         Err(never) => match never {},
     }
 }
@@ -4488,6 +4502,47 @@ mod tests {
         assert_eq!(config.pinned_model_for("gemini"), None);
     }
 
+    /// The legacy `claude-code` key prefers its own non-empty entry and only
+    /// falls back to `claude` when it has none.
+    #[test]
+    fn acp_defaults_claude_code_alias_prefers_its_own_entry() {
+        let entry = |model: Option<&str>| AcpAgentDefaults {
+            model: model.map(str::to_string),
+            pin_model: model.is_some(),
+            ..Default::default()
+        };
+        let cases: [(&[(&str, Option<&str>)], Option<&str>); 4] = [
+            (&[("claude", Some("canon"))], Some("canon")),
+            (&[("claude-code", Some("alias"))], Some("alias")),
+            (
+                &[("claude", Some("canon")), ("claude-code", Some("alias"))],
+                Some("alias"),
+            ),
+            (
+                &[("claude", Some("canon")), ("claude-code", None)],
+                Some("canon"),
+            ),
+        ];
+        for (entries, want) in cases {
+            let mut config = AcpConfig::default();
+            for (key, model) in entries {
+                config.acp_defaults.insert(key.to_string(), entry(*model));
+            }
+            assert_eq!(
+                config
+                    .acp_defaults_for("claude-code")
+                    .and_then(|d| d.model.as_deref()),
+                want,
+                "{entries:?}"
+            );
+            assert_eq!(
+                config.pinned_model_for("claude-code").as_deref(),
+                want,
+                "{entries:?}"
+            );
+        }
+    }
+
     /// Spawn resolution precedence: a pin replaces the request, an explicit
     /// request otherwise beats the configured default, blank values on either
     /// side are unset, and the per-model effort is keyed on the model that
@@ -4538,6 +4593,7 @@ mod tests {
             (Some(&flat), Some("  "), Some(""), Some("def"), Some("lo")),
             (Some(&keyed), None, None, Some("def"), Some("hi")),
             (Some(&keyed), Some("req"), None, Some("req"), Some("lo")),
+            (Some(&keyed), None, Some("med"), Some("def"), Some("med")),
             (
                 Some(&bare),
                 Some(" def "),

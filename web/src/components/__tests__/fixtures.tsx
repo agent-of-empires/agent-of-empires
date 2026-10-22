@@ -1,8 +1,9 @@
 /* eslint-disable react-refresh/only-export-components */
-import { useMemo, useRef, type ReactNode } from "react";
+import { useMemo, useRef, useState, type ReactNode } from "react";
 import { fireEvent, render, screen } from "@testing-library/react";
 import { vi } from "vitest";
 import { useSidebarTriage } from "../../hooks/useSidebarTriage";
+import type { RuntimeCursor, SessionMutation } from "../../lib/api";
 import type { SessionResponse, Workspace } from "../../lib/types";
 import { SidebarCompactContext } from "../../lib/sidebarCompact";
 import { SessionColorsContext } from "../../lib/sessionColors";
@@ -11,6 +12,7 @@ import { UnreadIndicatorContext } from "../../lib/unreadIndicator";
 import { DragSuppressContext } from "../sidebar/dnd";
 import { SessionRow } from "../sidebar/SessionRow";
 import type { RowBulkApi } from "../sidebar/types";
+import { SessionActionProvider } from "../sidebar/SessionActionProvider";
 
 export function makeSession(over: Partial<SessionResponse> = {}): SessionResponse {
   return {
@@ -21,6 +23,7 @@ export function makeSession(over: Partial<SessionResponse> = {}): SessionRespons
     tool: "claude",
     status: "Idle",
     yolo_mode: false,
+    lifecycle_generation: 0,
     created_at: "2025-01-01T00:00:00Z",
     last_accessed_at: null,
     idle_entered_at: null,
@@ -58,12 +61,19 @@ export function makeWorkspace(id: string, sessions: SessionResponse[], over: Par
 }
 
 export function jsonResponse(body: unknown, status = 200) {
-  return new Response(JSON.stringify(body), { status, headers: { "content-type": "application/json" } });
+  return new Response(JSON.stringify(body), {
+    status,
+    headers: { "content-type": "application/json", "aoe-runtime-epoch": "boot", "aoe-runtime-revision": "1" },
+  });
 }
 
 /** Stubs `fetch` with a spy answering `{ id: "s1" }`; call from `beforeEach` and unstub globals after. */
 export function stubFetch() {
-  const spy = vi.fn<typeof fetch>(async () => jsonResponse({ id: "s1" }));
+  const spy = vi.fn<typeof fetch>(async (url, init) => {
+    const session = makeSession(init?.body ? JSON.parse(init.body as string) : {});
+    const typedEdit = /\/api\/sessions\/[^/]+(?:\/worktree-name)?$/.test(String(url));
+    return jsonResponse(typedEdit ? { ...session, outcome: { warnings: [] } } : session);
+  });
   vi.stubGlobal("fetch", spy);
   return spy;
 }
@@ -89,26 +99,66 @@ interface RowOptions {
   rowTagMode?: SessionRowTagMode;
   colorsEnabled?: boolean;
   unread?: boolean;
+  onStop?: (sessionId: string) => void;
+  onStart?: (sessionId: string) => void;
+  onSwitchView?: (sessionId: string, toStructured: boolean) => void;
 }
 
 /** A single unselected SessionRow wired to the real triage hook, as the sidebar wires it. */
-function Row({ ws, readOnly, isActive = false, onCreateSession }: RowOptions & { ws: Workspace }) {
+function Row({
+  ws,
+  readOnly,
+  isActive = false,
+  onCreateSession,
+  onStop,
+  onStart,
+  onSwitchView,
+}: RowOptions & { ws: Workspace }) {
   const triage = useSidebarTriage(useMemo(() => [ws], [ws]));
+  const [canonical, setCanonical] = useState({
+    source: ws,
+    workspace: ws,
+    observedById: {} as Record<string, RuntimeCursor>,
+  });
+  if (canonical.source !== ws) setCanonical({ source: ws, workspace: ws, observedById: {} });
+  const onSessionMutation = ({ session, cursor }: SessionMutation) =>
+    setCanonical((current) => ({
+      ...current,
+      workspace: {
+        ...current.workspace,
+        sessions: current.workspace.sessions.map((row) => (row.id === session.id ? session : row)),
+      },
+      observedById: { ...current.observedById, [session.id]: cursor },
+    }));
   return (
-    <SessionRow
-      workspace={ws}
-      isActive={isActive}
-      isSelected={false}
-      onActivate={() => {}}
-      onCreateSession={onCreateSession}
+    <SessionActionProvider
+      sessions={canonical.workspace.sessions}
+      runtimeEpoch="boot"
+      observedById={canonical.observedById}
+      onSessionMutation={onSessionMutation}
       readOnly={readOnly}
-      optimistic={triage.optimisticFor(ws.id)}
-      onPinToggle={triage.pinToggle}
-      onArchiveToggle={triage.archiveToggle}
-      onSnooze={triage.snooze}
-      onUnreadToggle={triage.unreadToggle}
-      bulkApi={SINGLE_BULK_API}
-    />
+    >
+      <SessionRow
+        workspace={canonical.workspace}
+        observedById={canonical.observedById}
+        runtimeEpoch="boot"
+        onSessionMutation={onSessionMutation}
+        isActive={isActive}
+        isSelected={false}
+        onActivate={() => {}}
+        onCreateSession={onCreateSession}
+        onStop={onStop}
+        onStart={onStart}
+        onSwitchView={onSwitchView}
+        readOnly={readOnly}
+        optimistic={triage.optimisticFor(ws.id)}
+        onPinToggle={triage.pinToggle}
+        onArchiveToggle={triage.archiveToggle}
+        onSnooze={triage.snooze}
+        onUnreadToggle={triage.unreadToggle}
+        bulkApi={SINGLE_BULK_API}
+      />
+    </SessionActionProvider>
   );
 }
 

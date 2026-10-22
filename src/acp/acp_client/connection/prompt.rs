@@ -3,7 +3,7 @@
 //! mid-turn steering.
 
 use crate::acp::control_protocol::PromptOutcome;
-use crate::acp::state::Event;
+use crate::acp::state::{Event, RateLimitInfo};
 use agent_client_protocol::schema::v1::{ContentBlock, PromptRequest, PromptResponse, StopReason};
 use std::collections::VecDeque;
 use std::future::Future;
@@ -24,7 +24,7 @@ use crate::acp::acp_client::lifecycle::{LifecycleSignal, OffProtocolWorkKind};
 use crate::acp::acp_client::opencode::recover_opencode_prompt_error;
 use crate::acp::acp_client::rate_limit::{
     captured_rate_limit_resets_at, classify_rate_limit_error, clear_captured_rejections,
-    is_unsupported_session_error,
+    is_unsupported_session_error, take_rate_limit_from_captured_rejection,
 };
 use crate::acp::acp_client::reset::ResetSessionOutcome;
 use crate::acp::acp_client::steer::{first_text_block, SteerOutcome, SteerRequest};
@@ -304,6 +304,13 @@ impl Session {
         let e = match res {
             Ok(resp) => {
                 turn.flags.prompt_cancelled = matches!(resp.stop_reason, StopReason::Cancelled);
+                if !turn.flags.prompt_cancelled {
+                    if let Some(info) = self.take_parking_rejection() {
+                        self.shared.emit(Event::RateLimit { info }).await;
+                        turn.flags.rate_limited = true;
+                        turn.flags.shutdown = true;
+                    }
+                }
                 return Ok(Flow::Break);
             }
             Err(e) => e,
@@ -344,6 +351,23 @@ impl Session {
                 .store(true, Ordering::Relaxed);
         }
         Err(e)
+    }
+
+    /// The adapter can end a limited turn normally, so a still-future rejected
+    /// window captured during it is the only evidence; park like the error path.
+    fn take_parking_rejection(&self) -> Option<RateLimitInfo> {
+        let shared = &self.shared;
+        let info = take_rate_limit_from_captured_rejection(
+            &shared.rate_limit_rejections,
+            chrono::Utc::now(),
+        )?;
+        info!(
+            target: "acp.protocol",
+            session = %shared.session_label,
+            resets_at = ?info.resets_at,
+            "prompted turn ended on a rejected rate-limit window; parking session"
+        );
+        Some(info)
     }
 
     async fn reject_busy(&self, text: String) {
@@ -391,6 +415,11 @@ impl Session {
             }) => handle_delete_session_cmd(&self.connection, acp_session_id, respond_to),
             Some(ClientCmd::ResumeBackgroundTailing(launches)) => {
                 self.shared.resume_background_tailing(launches)
+            }
+            Some(ClientCmd::ResumeTaskTailing(task_ids)) => {
+                self.shared
+                    .resume_task_tailing(&self.acp_session_id.0, task_ids)
+                    .await
             }
             Some(ClientCmd::Prompt(blocks)) => return Ok(self.on_follow_up(turn, blocks).await),
             Some(ClientCmd::ResetSession {

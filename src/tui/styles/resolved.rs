@@ -620,6 +620,12 @@ mod tests {
                 subtle_on_modal >= TEXT_CONTRAST_RATIO,
                 "{name}: --color-text-subtle on --color-surface-800 is {subtle_on_modal:.2}, below body-text AA"
             );
+            // The sidebar context menu's session picker is body text on surface-800.
+            let picker = contrast_ratio(var("--color-text-primary"), var("--color-surface-800"));
+            assert!(
+                picker >= TEXT_CONTRAST_RATIO,
+                "{name}: text-primary on surface-800 is {picker:.2}, below body-text AA"
+            );
             let frame = var("--color-session-active");
             let fill = var("--color-surface-800");
             // The third surface is the fill an open row takes while it is also

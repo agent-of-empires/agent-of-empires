@@ -24,6 +24,7 @@ use crate::tui::styles::Theme;
 use crate::update::{get_cached_releases, ReleaseInfo};
 
 pub struct ChangelogDialog {
+    from_version: Option<String>,
     scroll_offset: usize,
     display_lines: Vec<DisplayLine>,
     dialog_area: Rect,
@@ -93,12 +94,21 @@ impl ChangelogDialog {
         let releases = get_cached_releases(from_version.as_deref());
         let display_lines = build_display_lines(&releases);
         Self {
+            from_version,
             scroll_offset: 0,
             display_lines,
             dialog_area: Rect::default(),
             got_it_button_area: Rect::default(),
             hover: HoverState::default(),
         }
+    }
+
+    pub fn refresh(&mut self) {
+        self.display_lines =
+            build_display_lines(&get_cached_releases(self.from_version.as_deref()));
+        self.scroll_offset = self
+            .scroll_offset
+            .min(self.display_lines.len().saturating_sub(1));
     }
 
     /// A click anywhere inside dismisses, as any of Enter/Esc/q/Space does.
@@ -518,8 +528,41 @@ mod tests {
     use super::*;
     use crate::tui::dialogs::test_keys::key;
 
+    #[test]
+    #[serial_test::serial]
+    fn refresh_picks_up_background_release_notes_and_bounds_scroll() {
+        let _guard = crate::session::test_support::isolate_app_dir();
+        let mut dialog = ChangelogDialog::new(Some("1.18.0".into()));
+        assert!(matches!(
+            dialog.display_lines.as_slice(),
+            [DisplayLine::NoReleases]
+        ));
+        let cache = serde_json::json!({
+            "checked_at": chrono::Utc::now(),
+            "latest_version": "1.19.0",
+            "releases": [{"version": "1.19.0", "body": "### Performance\n- Faster startup", "published_at": null}]
+        });
+        std::fs::write(
+            crate::session::get_app_dir()
+                .unwrap()
+                .join("update_cache.json"),
+            cache.to_string(),
+        )
+        .unwrap();
+        dialog.scroll_offset = usize::MAX;
+        dialog.refresh();
+        assert!(dialog.display_lines.iter().any(
+            |line| matches!(line, DisplayLine::VersionHeader { version, .. } if version == "1.19.0")
+        ));
+        assert!(dialog.display_lines.iter().any(
+            |line| matches!(line, DisplayLine::Item(item) if item.message == "Faster startup")
+        ));
+        assert!(dialog.scroll_offset < dialog.display_lines.len());
+    }
+
     fn dialog_with(lines: Vec<DisplayLine>) -> ChangelogDialog {
         ChangelogDialog {
+            from_version: None,
             scroll_offset: 0,
             display_lines: lines,
             dialog_area: Rect::default(),

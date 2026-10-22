@@ -1403,6 +1403,49 @@ fn cli_scratch_session_provisions_and_purges_its_dir() {
     }
 }
 
+/// `aoe add --effort` stores the explicit effort on a structured session, and
+/// each refusal happens before the scratch dir is provisioned.
+#[test]
+#[parallel]
+fn cli_add_effort_is_stored_and_refusals_provision_nothing() {
+    let mut h = TuiTestHarness::new("cli_add_effort");
+    h.install_path_command("claude");
+    h.install_path_command("claude-agent-acp");
+
+    h.run_cli_ok(&[
+        "add",
+        "--scratch",
+        "-t",
+        "Effort",
+        "-c",
+        "claude",
+        "--structured-view",
+        "--effort",
+        " high ",
+    ]);
+    let sessions = h.read_sessions();
+    let session = crate::harness::session_by_title(&sessions, "Effort");
+    assert_eq!(session["acp_effort"].as_str(), Some("high"));
+
+    let scratch_root = app_dir_in(h.home_path()).join("scratch");
+    let provisioned = || std::fs::read_dir(&scratch_root).map_or(0, Iterator::count);
+    let before = provisioned();
+    for (extra, expect) in [
+        (
+            &["--structured-view", "--effort", "  "][..],
+            "cannot be empty",
+        ),
+        (&["--effort", "high"][..], "needs the structured view"),
+    ] {
+        let mut args = vec!["add", "--scratch", "-t", "Refused", "-c", "claude"];
+        args.extend_from_slice(extra);
+        let out = h.run_cli(&args);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(!out.status.success() && stderr.contains(expect), "{stderr}");
+        assert_eq!(provisioned(), before, "a refused add must not provision");
+    }
+}
+
 /// #1051: `aoe ps --json` is fail-soft on an empty profile with no tmux
 /// server: an empty array and exit 0, never a failed substrate probe.
 #[test]
@@ -1580,6 +1623,97 @@ fn cli_acp_doctor_flags_adapters_below_the_version_floor() {
                 stdout.contains("npm install -g @agentclientprotocol/claude-agent-acp@latest"),
                 "{stdout}"
             );
+        }
+    }
+}
+
+#[test]
+#[parallel]
+fn cli_migration_34_37_43_persists_policy_and_second_run_bytes() {
+    let completed_checkpoint = agent_of_empires::migrations::current_schema_version();
+    for version in [34, 37, 43] {
+        let h = TuiTestHarness::new("cli_policy_upgrade");
+        let app = app_dir_in(h.home_path());
+        std::fs::write(app.join(".schema_version"), version.to_string()).unwrap();
+        let retained = agent_of_empires::session::config::AppStateConfig {
+            sort_order: Some(agent_of_empires::session::config::SortOrder::Custom),
+            sessions_created: 19,
+            sessions_created_seeded: true,
+            tips_seen: vec!["retained-tip".into()],
+            ..Default::default()
+        };
+        let state = toml::to_string_pretty(&toml::Table::try_from(&retained).unwrap()).unwrap();
+        std::fs::write(app.join("state.toml"), &state).unwrap();
+        let identity = "01234567-89ab-4cde-8fab-0123456789ab";
+        let row = json!({
+            "id":"retained",
+            "title":"Retained legacy session",
+            "project_path":h.project_path().to_str().unwrap(),
+            "created_at":"2026-10-10T00:00:00Z",
+            "tool":"claude",
+            "trashed_at":"2026-10-11T00:00:00Z",
+            "trash_lifecycle_id":identity,
+            "lifecycle_generation":7,
+            "failed_purge":{"trashed_at":"2026-10-11T00:00:00Z","trash_lifecycle_id":identity,"lifecycle_generation":7,"forced":true}
+        });
+        let sessions = app.join("profiles/default/sessions.json");
+        std::fs::write(&sessions, json!([row]).to_string()).unwrap();
+        let launch = json!({"schema":2,"pid":42,"instance_id":"retained-instance","auth_mode":"token","remote":false});
+        for name in ["serve.launch", "serve.rollback.launch"] {
+            std::fs::write(app.join(name), launch.to_string()).unwrap();
+        }
+        std::fs::write(app.join("serve.passphrase"), "secondary login").unwrap();
+        let journal = "{\"version\":2,\"owners\":[]}\n";
+        std::fs::write(app.join("pending-purge-owners.json"), journal).unwrap();
+        let first = h.run_cli(&["settings", "explain", "acp.default_agent"]);
+        assert!(
+            first.status.success(),
+            "schema={version}: {}",
+            String::from_utf8_lossy(&first.stderr)
+        );
+        assert_eq!(
+            std::fs::read_to_string(app.join(".schema_version"))
+                .unwrap()
+                .parse::<u32>()
+                .unwrap(),
+            completed_checkpoint
+        );
+        for name in ["serve.launch", "serve.rollback.launch"] {
+            let converted: Value =
+                serde_json::from_slice(&std::fs::read(app.join(name)).unwrap()).unwrap();
+            assert_eq!(converted["pid"], 42);
+            assert_eq!(converted["instance_id"], "retained-instance");
+            assert_eq!(converted["auth_mode"], "token");
+            assert_eq!(converted["has_passphrase"], true);
+        }
+        let converted: Value = serde_json::from_slice(&std::fs::read(&sessions).unwrap()).unwrap();
+        assert_eq!(converted[0]["trash_lifecycle_id"], identity);
+        assert_eq!(converted[0]["failed_purge"]["forced"], true);
+        assert_eq!(converted[0].get("terminal_scopes"), Some(&Value::Null), "the real legacy upgrade must publish unresolved authority, not invent an empty known-unscoped list");
+        assert_eq!(
+            std::fs::read_to_string(app.join("state.toml")).unwrap(),
+            state
+        );
+        let paths = [
+            app.join("state.toml"),
+            sessions,
+            app.join("serve.launch"),
+            app.join("serve.rollback.launch"),
+            app.join("serve.rollback.passphrase"),
+            app.join("pending-purge-owners.json"),
+        ];
+        let bytes: Vec<_> = paths
+            .iter()
+            .map(|path| std::fs::read(path).unwrap())
+            .collect();
+        let second = h.run_cli(&["settings", "explain", "acp.default_agent"]);
+        assert!(
+            second.status.success(),
+            "{}",
+            String::from_utf8_lossy(&second.stderr)
+        );
+        for (path, before) in paths.iter().zip(bytes) {
+            assert_eq!(std::fs::read(path).unwrap(), before);
         }
     }
 }

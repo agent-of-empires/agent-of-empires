@@ -18,7 +18,7 @@ fn resolve_profile(
 ) -> Result<String, axum::response::Response> {
     let profile = query
         .profile
-        .unwrap_or_else(|| crate::session::config::effective_profile(&state.profile));
+        .unwrap_or_else(|| crate::session::config::effective_profile(&state.served_profile()));
     if let Some(response) = super::unknown_profile_response(&profile) {
         return Err(response);
     }
@@ -353,7 +353,6 @@ pub async fn suggestion_action(
                 "sandbox": config.sandbox.enabled_by_default,
                 "sandbox_image": config.sandbox.default_image,
                 "scratch": false,
-                "trust_hooks": false,
                 "worktree_enabled": config.worktree.enabled,
                 "extra_args": session.agent_extra_args.get(&tool).cloned().unwrap_or_default(),
                 "extra_env": if config.sandbox.enabled_by_default { &config.sandbox.environment } else { &config.environment },
@@ -361,7 +360,7 @@ pub async fn suggestion_action(
                 "command_override": session.agent_command_override.get(&tool).cloned().unwrap_or_default(),
                 "view": if structured { "structured" } else { "terminal" }
             });
-            let create_body: crate::server::api::sessions::CreateSessionBody =
+            let create_body: crate::daemon::CreateSessionBody =
                 match serde_json::from_value(body_value) {
                     Ok(body) => body,
                     Err(error) => {
@@ -375,6 +374,7 @@ pub async fn suggestion_action(
             let response = super::sessions::create_session(
                 State(state),
                 Query(super::sessions::CreateSessionQuery { wait: None }),
+                None,
                 Ok(Json(create_body)),
             )
             .await
@@ -504,7 +504,7 @@ async fn run_auto_create(state: Arc<AppState>) {
     let Some(host) = state.plugin_host.as_ref() else {
         return;
     };
-    let profile = crate::session::config::effective_profile(&state.profile);
+    let profile = crate::session::config::effective_profile(&state.served_profile());
     let snapshot = match host.suggestions_snapshot(&profile) {
         Ok(snapshot) => snapshot,
         Err(error) => {
@@ -630,8 +630,10 @@ mod tests {
     async fn suggestions_without_explicit_profile_use_the_default_profile() {
         let _home = crate::session::test_support::isolate_app_dir();
         crate::server::test_support::seed_instances_on_disk_for_test("test", Vec::new());
-        let mut state = crate::server::test_support::build_test_app_state(Vec::new());
-        Arc::get_mut(&mut state).unwrap().profile.clear();
+        let state =
+            crate::server::test_support::build_test_app_state_configured(Vec::new(), |state| {
+                state.profile = std::sync::RwLock::new(String::new())
+            });
 
         let response = get_suggestions(State(state), Query(ProfileQuery { profile: None }))
             .await
@@ -652,7 +654,13 @@ mod tests {
         let _home = crate::session::test_support::isolate_app_dir();
         crate::server::test_support::seed_instances_on_disk_for_test("test", Vec::new());
         let app = crate::session::get_app_dir().unwrap();
-        let host = PluginHost::new(&app, "test", None).unwrap();
+        let host = PluginHost::new(
+            &app,
+            "test",
+            None,
+            Arc::new(crate::server::runtime::RuntimeWork::default()),
+        )
+        .unwrap();
         let publisher = HostApiState::open(&app.join("plugin_events.db"), "test", 100).unwrap();
         let generation = publisher.begin_ui_generation("example.provider");
         let item = aoe_plugin_api::Suggestion {
@@ -677,8 +685,10 @@ mod tests {
                 std::slice::from_ref(&item),
             )
             .unwrap();
-        let mut state = crate::server::test_support::build_test_app_state(Vec::new());
-        Arc::get_mut(&mut state).unwrap().plugin_host = Some(host.clone());
+        let state =
+            crate::server::test_support::build_test_app_state_configured(Vec::new(), |state| {
+                state.plugin_host = Some(host.clone())
+            });
         run_auto_create(state.clone()).await;
         assert_eq!(
             host.suggestions_snapshot("test").unwrap()["auto_create"]["enabled"],

@@ -104,6 +104,7 @@ fn main() -> Result<()> {
             std::env::set_var("AOE_DAEMON_URL", url);
         }
     }
+    agent_of_empires::acp::client::daemon_manager::set_autostart_disabled(cli.no_autostart);
     seed_cityhall_env(&cli);
     tokio::runtime::Runtime::new()?.block_on(run_cli(cli, read_source))
 }
@@ -305,7 +306,7 @@ fn emit_read_outcome(outcome: cli::runtime_read::ReadOutcome) -> i32 {
 /// command that exits from its own handler and the served read's own code when
 /// a daemon already answered.
 async fn run(
-    cli: Cli,
+    mut cli: Cli,
     is_daemon_child: bool,
     should_init: bool,
     debug_namespace_drift: Option<(std::path::PathBuf, std::path::PathBuf)>,
@@ -321,9 +322,18 @@ async fn run(
         }
     }
 
+    // Settings and MCP commands must resolve migrated configuration.
+    let command_name = cli.command.as_ref().and_then(cli::command_name);
+    if matches!(
+        cli.command,
+        Some(Commands::Settings { .. }) | Some(Commands::Mcp { .. })
+    ) {
+        run_startup_migrations(command_name, is_daemon_child, None)?;
+    }
+
     // Skipped for the detached daemon child so `aoe serve --daemon` counts once.
     if !is_daemon_child {
-        if let Some(name) = cli.command.as_ref().and_then(cli::command_name) {
+        if let Some(name) = command_name {
             agent_of_empires::telemetry::track_cli_command(name).await;
         }
     }
@@ -369,28 +379,28 @@ async fn run(
         Some(Commands::Skill { command }) => return exit_zero(cli::skill::run(command)),
         Some(Commands::Uninstall(args)) => return exit_zero(cli::uninstall::run(args).await),
         Some(Commands::Update(args)) => return exit_zero(cli::update::run(args).await),
-        Some(Commands::Migrate) => return exit_zero(cli::migrate::run()),
+        Some(Commands::Migrate(args)) => return exit_zero(cli::migrate::run(&args).await),
 
         Some(Commands::Stop { .. }) => return exit_zero(cli::killall::stop_trap()),
+        // Before the startup lock and migrations: see `cli::serve::run_control`.
+        Some(Commands::Serve(ref args)) => {
+            if let Some(result) = cli::serve::run_control(args).await {
+                return exit_zero(result);
+            }
+        }
         _ => {}
     }
 
     let profile_explicit = cli.profile.is_some();
     let profile = cli.profile.unwrap_or_default();
 
-    let serve_lock = match &cli.command {
-        Some(Commands::Serve(args)) => cli::serve::lock_for_startup(args)?,
+    let serve_lock = match &mut cli.command {
+        Some(Commands::Serve(args)) => cli::serve::lock_for_startup(&profile, args).await?,
         _ => None,
     };
 
     if cli.command.is_some() {
-        let reporter = cli
-            .command
-            .as_ref()
-            .and_then(cli::command_name)
-            .is_some()
-            .then(cli::migrate::stderr_reporter);
-        migrations::run_migrations_with(reporter)?;
+        run_startup_migrations(command_name, is_daemon_child, serve_lock.as_ref())?;
         agent_of_empires::session::poller::configure_session_id_poller_max_threads(
             agent_of_empires::session::poller::configured_session_id_poller_max_threads(&profile),
         );
@@ -398,7 +408,7 @@ async fn run(
 
     // Unknown keys are only reported here; parse failures only when no subscriber is up.
     // Hidden machine-spawned subcommands never print into a worker's redirected stderr.
-    if cli.command.as_ref().and_then(cli::command_name).is_some() {
+    if command_name.is_some() {
         let warning = if should_init {
             agent_of_empires::session::collect_startup_ignored_key_warnings(&profile)
         } else {
@@ -461,6 +471,28 @@ async fn run(
     exit_zero(result)
 }
 
+/// Advance the schema, or verify it where migrating is the parent's job.
+///
+/// `is_daemon_child` is the detached `aoe serve --daemon` child: the parent
+/// already ran the migrations and is holding the daemon lifecycle transaction
+/// that this child is about to receive. A migration running here would race
+/// the parent on `.schema_version` and, for the one that writes the launch
+/// record, wait on the very lock the parent holds. Verify the schema instead
+/// of migrating, and fail closed.
+fn run_startup_migrations(
+    command_name: Option<&str>,
+    is_daemon_child: bool,
+    startup: Option<&cli::serve::ServeStartup>,
+) -> Result<()> {
+    if is_daemon_child {
+        return migrations::assert_schema_current();
+    }
+    let reporter = command_name.is_some().then(cli::migrate::stderr_reporter);
+    match startup {
+        Some(startup) => startup.run_migrations(reporter),
+        None => migrations::run_migrations_with(reporter),
+    }
+}
 /// Every command above exits from inside its own handler, so completing one
 /// leaves the process with the ordinary success code.
 fn exit_zero(result: Result<()>) -> Result<i32> {

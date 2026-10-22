@@ -16,6 +16,7 @@ use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
 
 use super::auth::resolve_client_ip;
+use super::secure_store::{check_path_security, write_private};
 use super::AppState;
 use crate::util::{now_ms, system_time_to_ms};
 
@@ -94,7 +95,7 @@ pub struct LoginManager {
 }
 
 /// Argon2 hash of a passphrase with a fresh random salt.
-fn hash_passphrase(passphrase: &str) -> String {
+pub(super) fn hash_passphrase(passphrase: &str) -> String {
     use argon2::{Argon2, PasswordHasher};
 
     Argon2::default()
@@ -104,7 +105,7 @@ fn hash_passphrase(passphrase: &str) -> String {
 }
 
 /// Verify a passphrase against a stored argon2 PHC hash string.
-fn argon2_verify(passphrase: &str, hash: &str) -> bool {
+pub(super) fn argon2_verify(passphrase: &str, hash: &str) -> bool {
     use argon2::{Argon2, PasswordVerifier};
 
     Argon2::default()
@@ -620,15 +621,6 @@ fn build_persisted(
 
 /// Atomically write the session store, owner-only (0600).
 fn write_sessions(path: &Path, file: &PersistedFile) -> bool {
-    // The no-symlink, owner-only invariant belongs on the write path too, not just at load.
-    if let Err(e) = check_path_security(path) {
-        tracing::warn!(
-            target: "auth.passphrase",
-            error = %e,
-            "refusing to write persisted login sessions to an insecure path"
-        );
-        return false;
-    }
     let toml = match toml::to_string(file) {
         Ok(s) => s,
         Err(e) => {
@@ -636,56 +628,11 @@ fn write_sessions(path: &Path, file: &PersistedFile) -> bool {
             return false;
         }
     };
-    if let Err(e) = crate::session::atomic_write(path, toml.as_bytes()) {
+    if let Err(e) = write_private(path, toml.as_bytes()) {
         tracing::warn!(target: "auth.passphrase", error = %e, "write login sessions");
         return false;
     }
-    // `atomic_write` lands the file via a `NamedTempFile`, which is 0600
-    // on first create; re-assert it defensively so the secret can never
-    // widen even if an earlier file had looser perms.
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
-    }
     true
-}
-
-/// Fail-closed check that the sessions store is safe to read from or write to.
-fn check_path_security(path: &Path) -> anyhow::Result<()> {
-    use anyhow::{bail, Context};
-
-    if let Some(parent) = path.parent() {
-        let pmeta = std::fs::symlink_metadata(parent).context("stat login sessions parent dir")?;
-        if pmeta.file_type().is_symlink() {
-            bail!("login sessions parent dir is a symlink; refusing");
-        }
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            if pmeta.permissions().mode() & 0o022 != 0 {
-                bail!("login sessions parent dir is group/world writable; refusing");
-            }
-        }
-    }
-
-    match std::fs::symlink_metadata(path) {
-        Ok(meta) => {
-            if meta.file_type().is_symlink() {
-                bail!("login sessions path is a symlink; refusing");
-            }
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                if meta.permissions().mode() & 0o077 != 0 {
-                    bail!("login sessions file is group/world accessible; refusing");
-                }
-            }
-            Ok(())
-        }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(e) => Err(e).context("stat login sessions file"),
-    }
 }
 
 /// Load and rehydrate persisted sessions.
@@ -832,14 +779,56 @@ pub struct LoginRequest {
     device_binding_secret: String,
 }
 
+/// Create a device-bound login session and build the success response (cookie and
+/// new-login push). Shared by passphrase and passkey login.
+pub(super) async fn issue_session(
+    state: &Arc<AppState>,
+    binding_bytes: &[u8],
+    client_ip: std::net::IpAddr,
+    headers: &axum::http::HeaderMap,
+) -> axum::response::Response {
+    // Display-only, for the connected-devices label and the new-login push.
+    let user_agent = headers
+        .get(axum::http::header::USER_AGENT)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("unknown")
+        .to_string();
+
+    let session_id = state
+        .login_manager
+        .create_session(binding_bytes, &client_ip.to_string(), &user_agent)
+        .await;
+
+    // Fire-and-forget push to every existing subscriber.
+    let state_for_push = state.clone();
+    tokio::spawn(async move {
+        trigger_new_login_push(&state_for_push, &user_agent).await;
+    });
+
+    let cookie = build_login_cookie(&session_id, state.behind_tunnel);
+    let mut response = Json(serde_json::json!({ "ok": true })).into_response();
+    response.headers_mut().insert(
+        header::SET_COOKIE,
+        cookie.parse().expect("cookie format must be valid"),
+    );
+    response
+}
+
 /// POST /api/login
 pub async fn login_handler(
     State(state): State<Arc<AppState>>,
-    axum::extract::ConnectInfo(addr): axum::extract::ConnectInfo<std::net::SocketAddr>,
+    peer: super::peer::ConnectionPeer,
     headers: axum::http::HeaderMap,
     login_body: Result<Json<LoginRequest>, axum::extract::rejection::JsonRejection>,
 ) -> axum::response::Response {
-    let client_ip = resolve_client_ip(addr, &headers);
+    let super::peer::ConnectionPeer::Tcp(addr) = peer else {
+        return (
+            StatusCode::CONFLICT,
+            "Local owner authentication does not use browser login",
+        )
+            .into_response();
+    };
+    let client_ip = resolve_client_ip(addr, &headers, state.behind_tunnel);
 
     if !state.login_manager.is_enabled() {
         return (
@@ -853,7 +842,11 @@ pub async fn login_handler(
     }
 
     // Rate limit check
-    if let Some(remaining) = state.rate_limiter.check_locked(client_ip).await {
+    if let Some(remaining) = state
+        .rate_limiter
+        .check_locked(client_ip, super::rate_limit::AuthBudget::Passphrase)
+        .await
+    {
         return (
             StatusCode::TOO_MANY_REQUESTS,
             [("Retry-After", remaining.to_string())],
@@ -902,43 +895,17 @@ pub async fn login_handler(
     );
 
     if state.login_manager.verify_passphrase(&login_req.passphrase) {
-        state.rate_limiter.record_success(client_ip).await;
-
-        // Captured for the persisted session's connected-devices label
-        // and reused for the new-login push below. Display-only.
-        let user_agent = headers
-            .get(axum::http::header::USER_AGENT)
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("unknown")
-            .to_string();
-
-        let session_id = state
-            .login_manager
-            .create_session(&binding_bytes, &client_ip.to_string(), &user_agent)
+        state
+            .rate_limiter
+            .record_success(client_ip, super::rate_limit::AuthBudget::Passphrase)
             .await;
-
         tracing::info!(target: "auth.passphrase", ip = %client_ip, "passphrase login successful");
-
-        // Fire-and-forget push to every existing subscriber.
-        let state_for_push = state.clone();
-        tokio::spawn(async move {
-            trigger_new_login_push(&state_for_push, &user_agent).await;
-        });
-
-        let cookie = build_login_cookie(&session_id, state.behind_tunnel);
-        let mut response = Json(serde_json::json!({
-            "ok": true
-        }))
-        .into_response();
-
-        response.headers_mut().insert(
-            header::SET_COOKIE,
-            cookie.parse().expect("cookie format must be valid"),
-        );
-
-        response
+        issue_session(&state, &binding_bytes, client_ip, &headers).await
     } else {
-        let locked = state.rate_limiter.record_failure(client_ip).await;
+        let locked = state
+            .rate_limiter
+            .record_failure(client_ip, super::rate_limit::AuthBudget::Passphrase)
+            .await;
         tracing::warn!(
             target: "auth.passphrase",
             ip = %client_ip,
@@ -966,10 +933,17 @@ pub struct ElevateRequest {
 /// POST /api/login/elevate
 pub async fn elevate_handler(
     State(state): State<Arc<AppState>>,
-    axum::extract::ConnectInfo(addr): axum::extract::ConnectInfo<std::net::SocketAddr>,
+    peer: super::peer::ConnectionPeer,
     request: axum::extract::Request,
 ) -> axum::response::Response {
-    let client_ip = resolve_client_ip(addr, request.headers());
+    let super::peer::ConnectionPeer::Tcp(addr) = peer else {
+        return (
+            StatusCode::CONFLICT,
+            "Local owner authentication does not use browser elevation",
+        )
+            .into_response();
+    };
+    let client_ip = resolve_client_ip(addr, request.headers(), state.behind_tunnel);
 
     if !state.login_manager.is_enabled() {
         return (
@@ -1010,7 +984,11 @@ pub async fn elevate_handler(
             .into_response();
     }
 
-    if let Some(remaining) = state.rate_limiter.check_locked(client_ip).await {
+    if let Some(remaining) = state
+        .rate_limiter
+        .check_locked(client_ip, super::rate_limit::AuthBudget::Passphrase)
+        .await
+    {
         return (
             StatusCode::TOO_MANY_REQUESTS,
             [("Retry-After", remaining.to_string())],
@@ -1041,7 +1019,10 @@ pub async fn elevate_handler(
         .login_manager
         .verify_passphrase(&elevate_req.passphrase)
     {
-        let ip_locked = state.rate_limiter.record_failure(client_ip).await;
+        let ip_locked = state
+            .rate_limiter
+            .record_failure(client_ip, super::rate_limit::AuthBudget::Passphrase)
+            .await;
         let session_locked = state
             .login_manager
             .record_elevation_failure(&session_id)
@@ -1064,7 +1045,10 @@ pub async fn elevate_handler(
             .into_response();
     }
 
-    state.rate_limiter.record_success(client_ip).await;
+    state
+        .rate_limiter
+        .record_success(client_ip, super::rate_limit::AuthBudget::Passphrase)
+        .await;
     let elevated = state.login_manager.elevate_session(&session_id).await;
     if !elevated {
         return (
@@ -1171,11 +1155,29 @@ pub async fn revoke_session_handler(
     response
 }
 
+#[derive(Deserialize)]
+pub struct LoginStatusQuery {
+    /// The browser's `window.location.origin`; same-origin GETs carry no `Origin` header.
+    origin: Option<String>,
+}
+
 /// GET /api/login/status
 pub async fn login_status_handler(
     State(state): State<Arc<AppState>>,
+    axum::extract::Query(query): axum::extract::Query<LoginStatusQuery>,
     request: axum::extract::Request,
 ) -> Json<serde_json::Value> {
+    if matches!(
+        request
+            .extensions()
+            .get::<super::auth::LocalAuthorization>(),
+        Some(super::auth::LocalAuthorization::UnixOwner(_))
+    ) {
+        return Json(serde_json::json!({
+            "required": false, "authenticated": true, "elevated": true,
+            "elevated_until_secs": null, "principal": "local_owner"
+        }));
+    }
     let required = state.login_manager.is_enabled();
 
     if !required {
@@ -1203,18 +1205,26 @@ pub async fn login_status_handler(
         None => (false, None),
     };
 
+    let passkey_available =
+        super::passkeys::availability(&state, request.headers(), query.origin.as_deref()).await;
+
     Json(serde_json::json!({
         "required": required,
         "authenticated": authenticated,
         "elevated": elevated,
         "elevated_until_secs": elevated_secs,
+        "passkey_available": passkey_available,
     }))
 }
 
 /// Extract the `aoe_session` cookie value from a request.
 pub fn extract_login_session(request: &axum::extract::Request) -> Option<String> {
-    let cookie_header = request.headers().get(header::COOKIE)?;
-    let cookie_str = cookie_header.to_str().ok()?;
+    session_id_from_headers(request.headers())
+}
+
+/// The `aoe_session` cookie value in `headers`.
+pub(super) fn session_id_from_headers(headers: &axum::http::HeaderMap) -> Option<String> {
+    let cookie_str = headers.get(header::COOKIE)?.to_str().ok()?;
     for cookie in cookie_str.split(';') {
         let cookie = cookie.trim();
         if let Some(value) = cookie.strip_prefix("aoe_session=") {

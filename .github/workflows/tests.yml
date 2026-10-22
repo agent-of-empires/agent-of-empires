@@ -4,14 +4,14 @@ on:
   push:
     branches: [main]
   # No branch filter: stacked PRs also need checks.
-  # `labeled` starts coverage after automatic ci-macos labeling.
-  # PR concurrency replaces in-flight runs; completed work still reruns.
   pull_request:
-    types: [opened, synchronize, reopened, labeled]
+  merge_group:
 
+# The event keeps a queue run and the push of its fast-forwarded commit apart.
+# Queue refs are unique per entry; newer PR and main pushes cancel older runs.
 concurrency:
-  group: tests-${{ github.event.pull_request.number || github.sha }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+  group: tests-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
 
 env:
   CARGO_TERM_COLOR: always
@@ -21,12 +21,9 @@ permissions:
 
 jobs:
   cargo-linux:
-    # Sharded Linux test matrix. Each leg runs on its own runner with its own
-    # rust-cache slot, so the feature-set switch that used to force a recompile
-    # between the sequential legs is gone and the legs run in parallel. The
-    # required-check context is the fan-in `cargo-linux-ok` job below (named
-    # "Cargo Test (linux)"), NOT these shard jobs; keep that in sync with the
-    # branch ruleset if the leg set changes.
+    # Each leg builds its own feature set on its own runner and cache key. The
+    # branch ruleset requires every leg's context by name; keep it in sync if
+    # the leg set changes.
     name: Cargo Test (linux, ${{ matrix.leg }})
     runs-on: ubuntu-latest
     strategy:
@@ -42,25 +39,25 @@ jobs:
           # release.yml.
           persist-credentials: false
       - uses: ./.github/actions/rust-toolchain
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
-          # Cache compiled binaries too. Same-PR pushes that don't
-          # touch Rust deps get a warm `target/` and skip the cold
-          # cargo build entirely; the first push still pays cold cost.
-          cache-bin: "true"
-          # Save on PRs too. Swatinem keys the cache on Cargo.lock +
-          # toolchain hash, so successive pushes to the same PR reuse
-          # the slot rather than thrashing the 10GB repo cache budget.
-          save-if: true
-      - uses: taiki-e/install-action@9983c65e42da123ff25d1f78505eb6de315aa172 # v2.87.20
+          key: ${{ matrix.leg }}
+          # Only main saves: PR and queue entries would evict main's within
+          # the 10 GB repository budget.
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
         if: matrix.leg != 'web-e2e'
         with:
           tool: cargo-nextest
       - name: Install tmux
         run: sudo apt-get update && sudo apt-get install -y tmux
-      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: '22'
+          cache: npm
+          cache-dependency-path: |
+            web/package-lock.json
+            acp-worker/test-shim/package-lock.json
       # tests/integration/acp_smoke.rs spawns the Node ACP shim under
       # acp-worker/test-shim/. The shim depends on @agentclientprotocol/sdk,
       # so its deps must be installed before the integration crate runs. Only
@@ -203,47 +200,79 @@ jobs:
           sudo env AOE_PRIVDROP_TESTS=1 \
             "$test_binary" privdrop_ --test-threads=1 --nocapture
 
-  cargo-linux-ok:
-    # Fan-in for the branch ruleset: "Cargo Test (linux)" is a required status
-    # check, and matrix jobs report per-leg contexts the ruleset doesn't know
-    # about. This job carries the stable context name and fails unless every
-    # leg succeeded.
-    name: Cargo Test (linux)
-    needs: [cargo-linux]
-    if: ${{ always() }}
+  macos-gate:
+    # Decides on Linux whether macOS runs, so a skip holds no macOS runner.
+    # It runs for macOS-sensitive changes or the ci-macos label. After adding
+    # the label, re-run this job; GitHub re-runs its dependents with it.
+    name: macOS gate
+    if: github.event_name != 'push'
     runs-on: ubuntu-latest
-    steps:
-      - name: Check leg results
-        run: |
-          if [ "${{ needs.cargo-linux.result }}" != "success" ]; then
-            echo "linux legs result: ${{ needs.cargo-linux.result }}"
-            exit 1
-          fi
-
-  cargo-macos:
-    # Keep the required context on all PRs; unlabeled PRs emit a skip notice.
-    # Queued event payloads can predate ci-macos, so read current labels.
-    # Both Cargo steps share e2e-tests; no frontend build is needed on macOS.
-    name: Cargo Test (macos)
-    runs-on: macos-latest
-    # Bound a hung test without consuming GitHub's six-hour job limit.
-    timeout-minutes: 45
     permissions:
       contents: read
       pull-requests: read
+    outputs:
+      run: ${{ steps.decide.outputs.run }}
     steps:
-      - name: Read current macOS coverage
-        id: macos
-        if: github.event_name == 'pull_request'
+      - id: decide
         uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        env:
+          QUEUE_REF: ${{ github.event.merge_group.head_ref }}
         with:
           script: |
-            const { data: pr } = await github.rest.pulls.get({
-              ...context.repo, pull_number: context.payload.pull_request.number,
+            const run = reason => { core.notice(`macOS runs: ${reason}`); core.setOutput('run', 'true'); };
+            const pr = context.payload.pull_request;
+            const queue = context.payload.merge_group;
+            // refs/heads/gh-readonly-queue/<base>/pr-<number>-<base sha>
+            const number = pr?.number ?? Number(/\/pr-(\d+)-[0-9a-f]+$/.exec(process.env.QUEUE_REF)?.[1]);
+            if (!number) return run(`no PR number in ${process.env.QUEUE_REF}`);
+            const { data: current } = await github.rest.pulls.get({ ...context.repo, pull_number: number });
+            if (current.labels.some(l => l.name === 'ci-macos')) return run('ci-macos label');
+
+            const prefixes = [
+              'src/process/', 'src/git/', 'src/migrations/', 'src/containers/',
+              'src/session/config/container_config/',
+              '.github/actions/rust-toolchain/',
+            ];
+            // Existing macOS-only bodies can change without touching their cfg.
+            const exact = [
+              'src/hooks/dir_guard.rs', 'src/server/api/system.rs',
+              'src/session/mod.rs', 'src/sound/playback.rs',
+              'src/tui/clipboard.rs', 'src/tui/open_url.rs',
+              'src/session/config/container_config.rs',
+              'src/session/instance/container.rs',
+              'src/session/sandbox_store_reclaim.rs',
+              'build.rs', 'Cargo.lock', 'rust-toolchain.toml',
+            ];
+            const cfg = /target_os\s*=\s*"macos"/;
+            const sensitive = path => !!path &&
+              (exact.includes(path) || prefixes.some(p => path.startsWith(p)));
+            // A queue entry is diffed whole, so every PR in the group counts.
+            const base = pr ? pr.base.sha : queue.base_sha;
+            const head = pr ? pr.head.sha : queue.head_sha;
+            const { data: diff } = await github.rest.repos.compareCommitsWithBasehead({
+              ...context.repo, basehead: `${base}...${head}`,
             });
-            core.setOutput('run', pr.labels.some(label => label.name === 'ci-macos'));
+            // The compare API lists at most 300 files.
+            if (diff.files.length >= 300) return run('diff too large to inspect');
+            const hit = diff.files.find(f =>
+              sensitive(f.filename) || sensitive(f.previous_filename) ||
+              !f.patch || f.patch.split('\n').some(line =>
+                /^[+-](?![+-]{2} )/.test(line) && cfg.test(line)));
+            if (hit) return run(`${hit.filename} is macOS-sensitive`);
+            core.notice('macOS skipped: runs post-merge on main. Add ci-macos and re-run this job to run it here.');
+            core.setOutput('run', 'false');
+
+  cargo-macos:
+    # Push always runs; a failed gate also runs it rather than pass unchecked.
+    # Both Cargo steps share e2e-tests; no frontend build is needed on macOS.
+    name: Cargo Test (macos)
+    needs: macos-gate
+    if: ${{ !cancelled() && (needs.macos-gate.result != 'success' || needs.macos-gate.outputs.run == 'true') }}
+    runs-on: macos-latest
+    # Allow cold compilation and both test stages within a bounded job.
+    timeout-minutes: 90
+    steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        if: github.event_name != 'pull_request' || steps.macos.outputs.run == 'true'
         with:
           # These jobs run repository-controlled build/test code after checkout
           # and never push, so the job token must not linger in .git/config
@@ -251,32 +280,21 @@ jobs:
           # release.yml.
           persist-credentials: false
       - uses: ./.github/actions/rust-toolchain
-        if: github.event_name != 'pull_request' || steps.macos.outputs.run == 'true'
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-        if: github.event_name != 'pull_request' || steps.macos.outputs.run == 'true'
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
-          cache-bin: "true"
-          save-if: true
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Install tmux
-        if: github.event_name != 'pull_request' || steps.macos.outputs.run == 'true'
         run: brew install tmux
-      - uses: taiki-e/install-action@9983c65e42da123ff25d1f78505eb6de315aa172 # v2.87.20
-        if: github.event_name != 'pull_request' || steps.macos.outputs.run == 'true'
+      - uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
         with:
           tool: cargo-nextest
-      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
-        if: github.event_name != 'pull_request' || steps.macos.outputs.run == 'true'
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: '22'
       - name: Cargo test (macOS, lib + bins)
-        if: github.event_name != 'pull_request' || steps.macos.outputs.run == 'true'
         run: cargo nextest run --features e2e-tests --lib --bins --no-fail-fast
       - name: Cargo test (macOS, acp live-daemon e2e)
-        if: github.event_name != 'pull_request' || steps.macos.outputs.run == 'true'
         run: cargo test --features e2e-tests --test e2e -- acp_ --test-threads=1 --nocapture
-      - name: Skipped on pull requests
-        if: github.event_name == 'pull_request' && steps.macos.outputs.run != 'true'
-        run: echo "macOS runs post-merge on main. Add the 'ci-macos' label to run it here."
 
   vitest:
     name: Vitest
@@ -289,9 +307,11 @@ jobs:
           # (zizmor artipacked). Matches the hardened convention in ci.yml and
           # release.yml.
           persist-credentials: false
-      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: '22'
+          cache: npm
+          cache-dependency-path: web/package-lock.json
       - name: Install dependencies
         working-directory: web
         run: npm ci
@@ -344,7 +364,7 @@ jobs:
           disable_search: true
           files: web/test-report.junit.xml
           flags: vitest
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: ${{ !cancelled() }}
         with:
           name: vitest-coverage
@@ -362,9 +382,11 @@ jobs:
           # (zizmor artipacked). Matches the hardened convention in ci.yml and
           # release.yml.
           persist-credentials: false
-      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: '22'
+          cache: npm
+          cache-dependency-path: web/package-lock.json
       - name: Install dependencies
         working-directory: web
         run: npm ci
@@ -391,9 +413,11 @@ jobs:
           # (zizmor artipacked). Matches the hardened convention in ci.yml and
           # release.yml.
           persist-credentials: false
-      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: '22'
+          cache: npm
+          cache-dependency-path: web/package-lock.json
       - name: Install dependencies
         working-directory: web
         run: npm ci
@@ -454,13 +478,13 @@ jobs:
           disable_search: true
           files: web/test-report.junit.xml
           flags: playwright-mocked
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: ${{ !cancelled() }}
         with:
           name: playwright-report
           path: web/playwright-report/
           retention-days: 14
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: ${{ !cancelled() }}
         with:
           name: playwright-mocked-coverage
@@ -468,18 +492,10 @@ jobs:
           retention-days: 14
 
   playwright-live:
-    # Sharded 2-way: each shard is a free 4-core runner running half the
-    # suite at the same 3-worker density, so wall-clock roughly halves
-    # without changing per-runner contention. The required-check context
-    # is the fan-in `playwright-live-ok` job below (named "Playwright
-    # (live)"), NOT these shard jobs; keep that in sync with the branch
-    # ruleset if the shard count changes.
-    name: Playwright (live, shard ${{ matrix.shard }}/2)
+    # Unsharded: shards each repeat the ~2 min cargo build and hold a runner
+    # from the shared concurrency pool, which costs more wall than it saves.
+    name: Playwright (live)
     runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        shard: [1, 2]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -488,20 +504,15 @@ jobs:
           # (zizmor artipacked). Matches the hardened convention in ci.yml and
           # release.yml.
           persist-credentials: false
-      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: '22'
+          cache: npm
+          cache-dependency-path: web/package-lock.json
       - uses: ./.github/actions/rust-toolchain
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
-          # Cache compiled binaries too. Same-PR pushes that don't
-          # touch Rust deps get a warm `target/` and skip the 4-minute
-          # cargo build entirely; the first push still pays cold cost.
-          cache-bin: "true"
-          # Save on PRs too. Swatinem keys the cache on Cargo.lock +
-          # toolchain hash, so successive pushes to the same PR reuse
-          # the slot rather than thrashing the 10GB repo cache budget.
-          save-if: true
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Install tmux
         run: sudo apt-get update && sudo apt-get install -y tmux
       # Debug build instead of --release: --release with LTO and
@@ -542,7 +553,7 @@ jobs:
         env:
           AOE_COVERAGE: '1'
           AOE_E2E_BINARY: ${{ github.workspace }}/target/debug/aoe
-        run: npx playwright test --config=playwright.live.config.ts --shard=${{ matrix.shard }}/2
+        run: npx playwright test --config=playwright.live.config.ts
       - name: Build LCOV from collected Playwright coverage
         working-directory: web
         if: ${{ !cancelled() }}
@@ -555,12 +566,11 @@ jobs:
           # See the matching comment in the vitest upload step: without
           # disable_search the action also picks up the coverage-matrix
           # JSON files under web/tests/ and ships them as if they were
-          # coverage reports. Codecov merges the two shard uploads that
-          # share the playwright-live flag on the same commit.
+          # coverage reports.
           disable_search: true
           files: web/coverage/merged/lcov.info
           flags: playwright-live
-          name: playwright-live-shard-${{ matrix.shard }}
+          name: playwright-live
           fail_ci_if_error: false
       - name: Upload test results to Codecov (playwright-live)
         if: ${{ !cancelled() }}
@@ -572,32 +582,15 @@ jobs:
           disable_search: true
           files: web/test-report.junit.xml
           flags: playwright-live
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: ${{ !cancelled() }}
         with:
-          name: playwright-live-report-shard-${{ matrix.shard }}
+          name: playwright-live-report
           path: web/playwright-live-report/
           retention-days: 14
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: ${{ !cancelled() }}
         with:
-          name: playwright-live-coverage-shard-${{ matrix.shard }}
+          name: playwright-live-coverage
           path: web/coverage/merged/
           retention-days: 14
-
-  playwright-live-ok:
-    # Fan-in for the branch ruleset: "Playwright (live)" is a required
-    # status check, and matrix jobs report per-shard contexts that the
-    # ruleset doesn't know about. This job carries the stable context
-    # name and fails unless every shard succeeded.
-    name: Playwright (live)
-    needs: playwright-live
-    if: ${{ always() }}
-    runs-on: ubuntu-latest
-    steps:
-      - name: Check shard results
-        run: |
-          if [ "${{ needs.playwright-live.result }}" != "success" ]; then
-            echo "live shards result: ${{ needs.playwright-live.result }}"
-            exit 1
-          fi

@@ -2,6 +2,7 @@ import { useCallback, useMemo, useRef, useState } from "react";
 import { usePluginUiEntries } from "../lib/pluginUiContext";
 import { pluginSortSpecs } from "../lib/pluginUi";
 import type { ProjectInfo, RepoGroup, Workspace } from "../lib/types";
+import type { RuntimeCursor, SessionMutation } from "../lib/api";
 import { SidebarSystemHealth } from "./SystemHealthStrip";
 import type { SidebarAxis } from "../lib/sidebarAxis";
 import {
@@ -40,6 +41,9 @@ import { useSidebarSelection } from "./sidebar/useSidebarSelection";
 import { useSidebarWidth } from "./sidebar/useSidebarWidth";
 
 interface Props {
+  observedById: Record<string, RuntimeCursor>;
+  runtimeEpoch: string | null;
+  onSessionMutation: (mutation: SessionMutation) => void;
   groups: SidebarGroup[];
   /** Used only when `axis === "repo+group"`. */
   nestedGroups: NestedSidebarGroup[];
@@ -74,7 +78,7 @@ interface Props {
   onDeleteSession?: (sessionIds: string[]) => void;
   /** Receives every session id of the trashed workspace. */
   onRestoreSession?: (sessionIds: string[]) => void;
-  onEmptyTrash?: () => void;
+  onEmptyTrash?: (workspaces: Workspace[]) => void;
   onStopSession?: (sessionId: string) => void;
   onStartSession?: (sessionId: string) => void;
   onSwitchView?: (sessionId: string, toStructured: boolean) => void;
@@ -176,6 +180,9 @@ export function WorkspaceSidebar(props: Props) {
     onArchiveGroup,
     rowProps: (v: SidebarWorkspaceView) => ({
       workspace: v.workspace,
+      observedById: props.observedById,
+      runtimeEpoch: props.runtimeEpoch,
+      onSessionMutation: props.onSessionMutation,
       isActive: v.workspace.id === selection.displayedActiveId,
       isSelected: selection.isSelected(v.workspace.id),
       onActivate: selection.handleRowActivate,
@@ -377,7 +384,7 @@ export function WorkspaceSidebar(props: Props) {
               onOpen={selection.handleRowActivate}
               onRestore={(ids) => props.onRestoreSession?.(ids)}
               onDelete={(ids) => props.onDeleteSession?.(ids)}
-              onEmptyTrash={() => props.onEmptyTrash?.()}
+              onEmptyTrash={(workspaces) => props.onEmptyTrash?.(workspaces)}
             />
           )}
           {props.onSuggestions && (
