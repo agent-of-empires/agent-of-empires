@@ -45,6 +45,7 @@ describe("isSyncedKey", () => {
       expect(isSyncedKey(k), k).toBe(true);
     }
     for (const k of [
+      "aoe-local-settings-intro-worktree", // a read-only dashboard's fold stays on the device
       "aoe-sidebar-width",
       "aoe-split-ratio",
       "aoe-right-vsplit",

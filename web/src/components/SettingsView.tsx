@@ -387,7 +387,7 @@ export function SettingsView({
   // Reopening with "About" is local to this visit; "Got it" folds it again.
   const [foldedIntros, setFoldedIntros] = useState<ReadonlySet<SettingsIntroId>>(storedIntroFolds);
   const foldIntro = (id: SettingsIntroId) => {
-    foldSettingsIntro(id);
+    foldSettingsIntro(id, !!readOnly);
     setFoldedIntros((prev) => new Set(prev).add(id));
   };
   const reopenIntro = (id: SettingsIntroId) => setFoldedIntros((prev) => new Set([...prev].filter((f) => f !== id)));

@@ -33,8 +33,16 @@ vi.mock("../../lib/api", () => ({
 
 const KEY = (id: string) => `aoe-settings-intro-${id}`;
 
-const renderTab = (tab: string) =>
-  render(<SettingsView onClose={() => {}} tab={tab} onSelectTab={() => {}} onServerAboutRefresh={() => {}} />);
+const renderTab = (tab: string, readOnly = false) =>
+  render(
+    <SettingsView
+      onClose={() => {}}
+      tab={tab}
+      onSelectTab={() => {}}
+      onServerAboutRefresh={() => {}}
+      readOnly={readOnly}
+    />,
+  );
 
 const intro = () => screen.queryByRole("region", { name: "About this tab" });
 const about = () => screen.queryByRole("button", { name: "About this tab" });
@@ -91,6 +99,24 @@ describe("Settings tab intros", () => {
     await act(() => hydrateWebUiStateFromServer());
     expect(intro()).toBeNull();
     expect(about()).not.toBeNull();
+  });
+
+  it("keeps a read-only dashboard's fold on the device, where hydration can't undo it", async () => {
+    localStorage.setItem(KEY("worktree"), "unfolded");
+    renderTab("worktree", true);
+    await waitFor(() => expect(intro()).not.toBeNull());
+    fireEvent.click(screen.getByRole("button", { name: "Got it" }));
+    // The Daemon refuses read-only writes, so the synced key keeps its value.
+    expect(localStorage.getItem(KEY("worktree"))).toBe("unfolded");
+    expect(localStorage.getItem("aoe-local-settings-intro-worktree")).toBe("folded");
+
+    vi.mocked(api.getWebUiState).mockResolvedValue({ [KEY("worktree")]: "unfolded" });
+    await act(() => hydrateWebUiStateFromServer());
+    expect(about()).not.toBeNull();
+
+    act(() => resetSettingsIntros());
+    expect(intro()).not.toBeNull();
+    expect(localStorage.getItem("aoe-local-settings-intro-worktree")).toBeNull();
   });
 
   it.each<[string, string, Record<string, string>, "intro" | "about" | "neither"]>([
