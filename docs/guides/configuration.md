@@ -66,10 +66,10 @@ color_mode = "truecolor"  # truecolor | palette (TUI only)
 | `name` | `"default"` | Theme for the TUI and web dashboard. Builtins: `default`, `empire`, `phosphor`, `tokyo-night-storm`, `catppuccin-latte`, `dracula`, `rose-pine`, `deep-ocean`. Custom TOML themes appear in the picker. Empty means `default`. |
 | `color_mode` | `"truecolor"` | TUI only. `palette` downsamples to xterm-256 for transports that mangle 24-bit RGB (e.g. some `mosh` setups). The web dashboard always renders truecolor. |
 
-Custom themes are TOML files in `~/.agent-of-empires/themes/`, listed in the picker under their filename:
+Custom themes are TOML files in `<app_dir>/themes/`, listed in the picker under their filename stem. Run `aoe theme dir` for the active directory; see [File Locations](#file-locations) for Linux and macOS resolution.
 
 ```bash
-aoe theme export empire   # writes ~/.agent-of-empires/themes/custom-empire.toml
+aoe theme export empire   # writes custom-empire.toml in the active themes directory
 aoe theme list
 aoe theme dir
 ```
@@ -313,7 +313,9 @@ A configured override also applies to plain `aoe add --cmd <agent>`, and the on-
 
 The web wizard previews the resolved command in its **Agent** panel, including the ACP registry args a structured view session adds (`opencode acp`). Extra args are ignored for structured view sessions, so change the command override instead.
 
-An override runs through your `$SHELL`, falling back to `bash` when `$SHELL` is unset or non-POSIX (`fish`, `nu`, `pwsh`). If your wrapper is a function or abbreviation in a non-POSIX shell, write it as a bash script or spell the command out here.
+Host launches in Terminal view run overrides through your `$SHELL`, falling back to `bash` when `$SHELL` is unset or non-POSIX (`fish`, `nu`, `pwsh`). If your wrapper is a function or abbreviation in a non-POSIX shell, write it as a script or spell the command out here.
+
+When an override applies to an ACP adapter, AoE splits it into a program and arguments and launches the program directly, without a shell. Shell expansions, assignments and operators are not evaluated. Use [environment settings](#host-environment), a wrapper script or an explicitly invoked shell when needed. Overrides do not replace every adapter: they apply only when the adapter command matches the agent's native binary.
 
 ## Host environment
 

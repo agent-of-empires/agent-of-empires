@@ -172,8 +172,6 @@ impl Drop for ToolDetection {
     }
 }
 
-/// Ignores SIGINT/SIGQUIT while alive. With raw mode off for a child process,
-/// Ctrl+C would otherwise kill aoe and every session it manages.
 fn theme_apply_needed(current: (&str, bool), next: (&str, bool)) -> bool {
     current != next
 }
@@ -2065,7 +2063,6 @@ fn plan_disk_refresh(
     }
 }
 
-/// Log and record reload errors; the loop keeps the previous in-memory state.
 fn should_show_image_banner(
     has_image_update: bool,
     has_app_update: bool,
