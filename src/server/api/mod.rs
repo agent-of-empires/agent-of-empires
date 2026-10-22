@@ -507,6 +507,7 @@ mod tests {
                 "set_show_tips",
                 "update_profile_settings",
                 "update_settings",
+                "update_theme",
             ],
         ),
         (
@@ -544,7 +545,7 @@ mod tests {
         (
             "push.rs",
             include_str!("../push.rs"),
-            &["subscribe", "test", "unsubscribe"],
+            &["push::subscribe", "push::test", "push::unsubscribe"],
         ),
         (
             "telemetry.rs",
@@ -558,7 +559,17 @@ mod tests {
         (
             "plugins.rs",
             include_str!("plugins.rs"),
-            &["invoke_plugin_action", "invoke_plugin_command"],
+            &[
+                "apply_plugin_update",
+                "dismiss_plugin_update",
+                "invoke_plugin_action",
+                "invoke_plugin_command",
+                "preview_plugin_install",
+                "restart_plugin_worker",
+                "set_plugin_enabled",
+                "start_plugin_install",
+                "start_plugin_uninstall",
+            ],
         ),
         (
             "skills.rs",
@@ -593,6 +604,306 @@ mod tests {
             &["install_agent", "install_gate"],
         ),
     ];
+
+    // Exact exceptions to the read-only handler audit. Authentication and
+    // transport-only requests retain their own policy instead of a write guard.
+    const MUTATION_AUDIT_EXEMPTIONS: &[(&str, &str, &str, &str)] = &[
+        (
+            "POST",
+            "/api/presence",
+            "api::post_dashboard_presence",
+            "Ephemeral browser foreground heartbeat.",
+        ),
+        (
+            "POST",
+            "/api/plugins/{id}/pages/{page_id}/ticket",
+            "api::mint_plugin_page_ticket",
+            "Scoped authentication ticket for displaying a plugin page.",
+        ),
+        (
+            "POST",
+            "/api/client-log",
+            "api::post_client_log",
+            "Bounded browser diagnostic relay.",
+        ),
+        (
+            "POST",
+            "/api/plugins/{id}/settings/options/resolve",
+            "api::resolve_options",
+            "UI option discovery may run capability probes and populate the shared catalog.",
+        ),
+        (
+            "POST",
+            "/api/login",
+            "login::login_handler",
+            "Authentication remains available in read-only mode.",
+        ),
+        (
+            "POST",
+            "/api/login/elevate",
+            "login::elevate_handler",
+            "Authentication elevation retains its existing policy.",
+        ),
+        (
+            "POST",
+            "/api/logout",
+            "login::logout_handler",
+            "Signing out remains available in read-only mode.",
+        ),
+        (
+            "POST",
+            "/api/login/logout-all",
+            "login::logout_all_handler",
+            "Device sign-out retains its elevation policy.",
+        ),
+        (
+            "DELETE",
+            "/api/login/sessions/{id}",
+            "login::revoke_session_handler",
+            "Device revocation retains its elevation policy.",
+        ),
+        (
+            "POST",
+            "/api/login/passkey/start",
+            "passkeys::login_start_handler",
+            "Passkey authentication remains available in read-only mode.",
+        ),
+        (
+            "POST",
+            "/api/login/passkey/finish",
+            "passkeys::login_finish_handler",
+            "Passkey authentication remains available in read-only mode.",
+        ),
+        (
+            "POST",
+            "/api/passkeys/register/start",
+            "passkeys::register_start_handler",
+            "Passkey registration retains its elevation policy.",
+        ),
+        (
+            "POST",
+            "/api/passkeys/register/finish",
+            "passkeys::register_finish_handler",
+            "Passkey registration retains its elevation policy.",
+        ),
+        (
+            "DELETE",
+            "/api/passkeys/{id}",
+            "passkeys::delete_handler",
+            "Passkey removal retains its elevation policy.",
+        ),
+        (
+            "POST",
+            "/mcp",
+            "super::mcp::service(state.clone())",
+            "MCP currently exposes only session listing and caller identity.",
+        ),
+        (
+            "PUT",
+            "/mcp",
+            "super::mcp::service(state.clone())",
+            "MCP currently exposes only session listing and caller identity.",
+        ),
+        (
+            "PATCH",
+            "/mcp",
+            "super::mcp::service(state.clone())",
+            "MCP currently exposes only session listing and caller identity.",
+        ),
+        (
+            "DELETE",
+            "/mcp",
+            "super::mcp::service(state.clone())",
+            "MCP currently exposes only session listing and caller identity.",
+        ),
+    ];
+
+    fn audited_handler(identity: &str, audited: &[&str]) -> bool {
+        audited.iter().any(|name| {
+            if name.contains("::") {
+                identity == *name
+            } else {
+                identity.strip_prefix("api::") == Some(*name)
+            }
+        })
+    }
+
+    #[derive(Debug, PartialEq, Eq)]
+    enum MutationAuditFailureKind {
+        UnknownHandler,
+        AuditedAndExempt,
+        MissingReason,
+        StaleExemption,
+        DuplicateExemption,
+    }
+
+    #[derive(Debug, PartialEq, Eq)]
+    struct MutationAuditFailure<'a> {
+        kind: MutationAuditFailureKind,
+        identity: (&'a str, &'a str, &'a str),
+    }
+
+    fn mutation_audit_failures<'a>(
+        routes: &[crate::server::access::MutatingRoute<'a>],
+        audited: &[&str],
+        exemptions: &[(&'a str, &'a str, &'a str, &str)],
+    ) -> Vec<MutationAuditFailure<'a>> {
+        let mut failures = Vec::new();
+        for route in routes {
+            let exempt = exemptions.iter().any(|(method, path, handler, _)| {
+                (route.method, route.path, route.handler) == (*method, *path, *handler)
+            });
+            let kind = match (audited_handler(route.handler, audited), exempt) {
+                (false, false) => Some(MutationAuditFailureKind::UnknownHandler),
+                (true, true) => Some(MutationAuditFailureKind::AuditedAndExempt),
+                _ => None,
+            };
+            if let Some(kind) = kind {
+                failures.push(MutationAuditFailure {
+                    kind,
+                    identity: (route.method, route.path, route.handler),
+                });
+            }
+        }
+        for (index, (method, path, handler, reason)) in exemptions.iter().enumerate() {
+            let identity = (*method, *path, *handler);
+            if reason.trim().is_empty() {
+                failures.push(MutationAuditFailure {
+                    kind: MutationAuditFailureKind::MissingReason,
+                    identity,
+                });
+            }
+            if !routes.iter().any(|route| {
+                (route.method, route.path, route.handler) == (*method, *path, *handler)
+            }) {
+                failures.push(MutationAuditFailure {
+                    kind: MutationAuditFailureKind::StaleExemption,
+                    identity,
+                });
+            }
+            if exemptions[..index]
+                .iter()
+                .any(|(m, p, h, _)| (*m, *p, *h) == (*method, *path, *handler))
+            {
+                failures.push(MutationAuditFailure {
+                    kind: MutationAuditFailureKind::DuplicateExemption,
+                    identity,
+                });
+            }
+        }
+        failures
+    }
+
+    #[test]
+    fn mutation_audit_rejects_unknown_handlers_without_prefix_exceptions() {
+        use crate::server::access::MutatingRoute;
+
+        for handler in [
+            "api::new_handler",
+            "other::new_handler",
+            "login::new_handler",
+            "push::new_handler",
+        ] {
+            let routes = [MutatingRoute {
+                method: "POST",
+                path: "/unrelated/new-route",
+                handler,
+                read_only_layer: true,
+            }];
+            assert_eq!(
+                mutation_audit_failures(&routes, &[], &[]),
+                vec![MutationAuditFailure {
+                    kind: MutationAuditFailureKind::UnknownHandler,
+                    identity: ("POST", "/unrelated/new-route", handler),
+                }]
+            );
+        }
+    }
+
+    #[test]
+    fn mutation_audit_exemptions_require_exact_identity_and_reason() {
+        use crate::server::access::MutatingRoute;
+        use MutationAuditFailureKind::*;
+
+        let routes = [MutatingRoute {
+            method: "POST",
+            path: "/discovery",
+            handler: "api::discover",
+            read_only_layer: false,
+        }];
+        let exemption = ("POST", "/discovery", "api::discover", "Discovery policy.");
+        assert!(mutation_audit_failures(&routes, &[], &[exemption]).is_empty());
+        for changed in [
+            ("PUT", exemption.1, exemption.2, exemption.3),
+            (exemption.0, "/other", exemption.2, exemption.3),
+            (exemption.0, exemption.1, "other::discover", exemption.3),
+        ] {
+            assert_eq!(
+                mutation_audit_failures(&routes, &[], &[changed]),
+                vec![
+                    MutationAuditFailure {
+                        kind: UnknownHandler,
+                        identity: (exemption.0, exemption.1, exemption.2),
+                    },
+                    MutationAuditFailure {
+                        kind: StaleExemption,
+                        identity: (changed.0, changed.1, changed.2),
+                    },
+                ]
+            );
+        }
+        for (routes, audited, exemptions, kind) in [
+            (&[][..], &[][..], vec![exemption], StaleExemption),
+            (
+                &routes[..],
+                &[][..],
+                vec![exemption, exemption],
+                DuplicateExemption,
+            ),
+            (
+                &routes[..],
+                &["discover"][..],
+                vec![exemption],
+                AuditedAndExempt,
+            ),
+            (
+                &routes[..],
+                &[][..],
+                vec![(exemption.0, exemption.1, exemption.2, " ")],
+                MissingReason,
+            ),
+        ] {
+            assert_eq!(
+                mutation_audit_failures(routes, audited, &exemptions),
+                vec![MutationAuditFailure {
+                    kind,
+                    identity: (exemption.0, exemption.1, exemption.2),
+                }]
+            );
+        }
+    }
+
+    #[test]
+    fn mutation_audit_matches_qualified_handlers_without_conflating_modules() {
+        use crate::server::access::MutatingRoute;
+
+        let routes = [MutatingRoute {
+            method: "POST",
+            path: "/push",
+            handler: "push::subscribe",
+            read_only_layer: false,
+        }];
+        assert!(mutation_audit_failures(&routes, &["push::subscribe"], &[]).is_empty());
+        for audited in ["subscribe", "api::subscribe"] {
+            assert_eq!(
+                mutation_audit_failures(&routes, &[audited], &[]),
+                vec![MutationAuditFailure {
+                    kind: MutationAuditFailureKind::UnknownHandler,
+                    identity: ("POST", "/push", "push::subscribe"),
+                }]
+            );
+        }
+    }
 
     fn handler_source<'a>(source: &'a str, name: &str) -> Option<(&'a str, &'a str)> {
         use syn::spanned::Spanned;
@@ -705,34 +1016,17 @@ mod tests {
     #[test]
     fn mutating_handlers_guard_read_only_before_body_extraction() {
         let routes = crate::server::access::router_mutating_handlers();
+        let audited: Vec<_> = MUTATING_HANDLERS
+            .iter()
+            .flat_map(|(_, _, names)| names.iter().copied())
+            .collect();
+        let classification_failures =
+            mutation_audit_failures(&routes, &audited, MUTATION_AUDIT_EXEMPTIONS);
         let mut failures = Vec::new();
-        for route in &routes {
-            if route.path.starts_with("/api/sessions")
-                || route.path.starts_with("/api/plugins/commands/")
-                || route.path.starts_with("/api/groups")
-                || matches!(
-                    route.path,
-                    "/api/reorder" | "/api/workspaces" | "/api/workspace-ordering"
-                )
-            {
-                let name = route
-                    .handler
-                    .strip_prefix("api::")
-                    .expect("API mutation handler");
-                if !MUTATING_HANDLERS
-                    .iter()
-                    .any(|(_, _, names)| names.contains(&name))
-                {
-                    failures.push(format!(
-                        "{} {}: handler `{name}` is not audited",
-                        route.method, route.path
-                    ));
-                }
-            }
-        }
         for (file, source, handlers) in MUTATING_HANDLERS {
             for name in *handlers {
-                let Some((signature, body)) = handler_source(source, name) else {
+                let source_name = name.rsplit("::").next().expect("handler name");
+                let Some((signature, body)) = handler_source(source, source_name) else {
                     failures.push(format!("{file}: handler `{name}` not found"));
                     continue;
                 };
@@ -743,7 +1037,7 @@ mod tests {
                     .join("\n");
                 let mut handler_routes = routes
                     .iter()
-                    .filter(|route| route.handler.strip_prefix("api::") == Some(name))
+                    .filter(|route| audited_handler(route.handler, &[*name]))
                     .peekable();
                 let route_layer = handler_routes.peek().is_some()
                     && handler_routes.all(|route| route.read_only_layer);
@@ -773,7 +1067,11 @@ mod tests {
                 }
             }
         }
-        assert!(failures.is_empty(), "{}", failures.join("\n"));
+        assert!(
+            classification_failures.is_empty() && failures.is_empty(),
+            "{classification_failures:#?}\n{}",
+            failures.join("\n")
+        );
         let (_, preparation) = handler_source(
             include_str!("sessions/lifecycle.rs"),
             "prepare_agent_session_inner",
@@ -825,6 +1123,12 @@ mod tests {
             (Method::PATCH, "/api/groups/collapse"),
             (Method::POST, "/api/reorder"),
             (Method::DELETE, "/api/workspaces"),
+            (Method::POST, "/api/plugins/missing/enabled"),
+            (Method::POST, "/api/plugins/install/preview"),
+            (Method::POST, "/api/plugins/install"),
+            (Method::POST, "/api/plugins/missing/update/apply"),
+            (Method::POST, "/api/plugins/missing/update/dismiss"),
+            (Method::PATCH, "/api/theme"),
         ] {
             let mut request = Request::builder()
                 .method(method.clone())
