@@ -208,8 +208,8 @@ fn save_file(
     }
     let path = FsPath::new(&request.path);
     let confined = project_file(roots, path)?;
-    // Once, outside the lock: a runtime probe can take a minute, and mounts
-    // change only with the container ID that `sandbox_reason` verifies.
+    // Outside `SAVES`: a runtime probe can take a minute. The caller's instance
+    // lock keeps the container from being replaced before publication.
     if let Some(reason) = sandbox_reason(instance, &confined.canonical) {
         return Err((StatusCode::FORBIDDEN, reason));
     }
@@ -291,6 +291,10 @@ pub async fn save_session_file(
         Ok(scope) => scope,
         Err(response) => return response,
     };
+    // Sandbox start and replacement hold this lock, so the mount check and the
+    // publication see one container. Read the instance after taking it.
+    let inst_lock = state.instance_lock(&id).await;
+    let _guard = inst_lock.lock().await;
     let Some(instance) = find_instance(&state, &id).await else {
         return crate::server::api::session_not_found();
     };
