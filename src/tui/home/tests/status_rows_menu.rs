@@ -1,6 +1,7 @@
 //! Status updates, row decoration, and the context menu.
 
 use super::*;
+use crate::tui::home::pollers::ServeProbe;
 
 // -- apply_one_status_update -------------------------------------------------
 //
@@ -2085,7 +2086,13 @@ fn serve_status_renders_from_the_probe_worker() {
     let idle = render_home_to_string(&mut env.view, 160, 40);
     assert!(idle.contains(&format!("R {what}")), "{idle}");
 
-    env.view.serve_probe = crate::tui::worker::Worker::seeded_for_test("serve-probe-test", true);
+    env.view.serve_probe = crate::tui::worker::Worker::seeded_for_test(
+        "serve-probe-test",
+        ServeProbe {
+            running: true,
+            start_failed: false,
+        },
+    );
     env.view.request_serve_probe();
     assert!(
         env.view.tick_serve_probe(false),
@@ -2098,9 +2105,74 @@ fn serve_status_renders_from_the_probe_worker() {
 
 #[test]
 #[serial]
+fn a_start_that_fails_with_the_serve_view_closed_raises_a_status() {
+    // (was running, view open, probe start_failed, flash expected)
+    let cases = [
+        (true, false, true, true),   // hidden with Esc, then failed
+        (true, true, true, false),   // the open view shows the failure itself
+        (false, false, true, false), // a failure from before this TUI saw a start
+        (true, false, false, false), // a plain stop
+    ];
+    for (was_running, view_open, start_failed, flashed) in cases {
+        let mut env = create_test_env_with_sessions(1);
+        env.view.serve_running = was_running;
+        if view_open {
+            env.view.serve_view = Some(crate::tui::dialogs::ServeView::new());
+        }
+        let probe = ServeProbe {
+            running: false,
+            start_failed,
+        };
+        env.view.serve_probe =
+            crate::tui::worker::Worker::seeded_for_test("serve-probe-test", probe);
+        env.view.request_serve_probe();
+        env.view.tick_serve_probe(false);
+        let flash = env
+            .view
+            .status_flash
+            .as_ref()
+            .map(|(text, _)| text.as_str());
+        assert_eq!(
+            flash.is_some_and(|t| t.ends_with("didn't start. Press R for details.")),
+            flashed,
+            "{was_running} {view_open} {start_failed}: {flash:?}"
+        );
+    }
+}
+
+#[test]
+#[serial]
+fn r_after_a_hidden_start_failed_shows_the_recorded_reason_once() {
+    let mut env = create_test_env_with_sessions(1);
+    let failure = crate::session::get_app_dir()
+        .unwrap()
+        .join(crate::server::startup::STARTUP_FAILURE_FILE);
+    let reason = "The HTTPS tunnel did not come up within 90s, so the daemon stopped.";
+    std::fs::write(
+        &failure,
+        format!(r#"{{"remote":true,"transport":"tailscale","message":"{reason}"}}"#),
+    )
+    .unwrap();
+
+    env.view
+        .handle_key(KeyEvent::new(KeyCode::Char('R'), KeyModifiers::SHIFT), None);
+    assert!(env.view.serve_view.is_some(), "R opens the serve view");
+    let screen = render_home_to_string(&mut env.view, 160, 40);
+    assert!(screen.contains("did not come up within 90s"), "{screen}");
+    assert!(!failure.exists(), "the failure is shown once");
+}
+
+#[test]
+#[serial]
 fn due_serve_probe_is_requested_after_a_queued_result_is_applied() {
     let mut env = create_test_env_with_sessions(1);
-    env.view.serve_probe = crate::tui::worker::Worker::seeded_for_test("serve-probe-test", true);
+    env.view.serve_probe = crate::tui::worker::Worker::seeded_for_test(
+        "serve-probe-test",
+        ServeProbe {
+            running: true,
+            start_failed: false,
+        },
+    );
     env.view.serve_probe_in_flight = true;
 
     assert!(env.view.tick_serve_probe(true));

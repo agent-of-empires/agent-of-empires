@@ -452,7 +452,12 @@ async fn restart_tunnel(kind: &TunnelKind, port: u16) -> anyhow::Result<Child> {
 /// tailnet.
 pub async fn tailscale_available() -> bool {
     // Cheapest possible check first.
-    let version = Command::new("tailscale").arg("--version").output().await;
+    // The startup deadline drops these probes; a wedged `tailscale` must not outlive the daemon.
+    let version = Command::new("tailscale")
+        .arg("--version")
+        .kill_on_drop(true)
+        .output()
+        .await;
     match &version {
         Ok(o) => debug!(
             exit = ?o.status.code(),
@@ -470,7 +475,11 @@ pub async fn tailscale_available() -> bool {
         return false;
     }
     // Then confirm the daemon is running and signed in.
-    let status = Command::new("tailscale").arg("status").output().await;
+    let status = Command::new("tailscale")
+        .arg("status")
+        .kill_on_drop(true)
+        .output()
+        .await;
     match &status {
         Ok(o) => debug!(
             exit = ?o.status.code(),
@@ -491,6 +500,7 @@ async fn inspect_existing_funnel(local_port: u16) -> Option<String> {
     let out = Command::new("tailscale")
         .args(["funnel", "status", "--json"])
         .stdin(std::process::Stdio::null())
+        .kill_on_drop(true)
         .output()
         .await
         .ok()?;
@@ -584,6 +594,7 @@ async fn check_funnel_capability() -> anyhow::Result<()> {
     let out = Command::new("tailscale")
         .args(["status", "--json"])
         .stdin(std::process::Stdio::null())
+        .kill_on_drop(true)
         .output()
         .await
         .map_err(|e| anyhow::anyhow!("could not run `tailscale status --json`: {e}"))?;
@@ -614,6 +625,7 @@ async fn check_funnel_capability() -> anyhow::Result<()> {
 async fn tailscale_funnel_url() -> anyhow::Result<String> {
     let out = Command::new("tailscale")
         .args(["status", "--json"])
+        .kill_on_drop(true)
         .output()
         .await
         .map_err(|e| anyhow::anyhow!("failed to run tailscale status: {}", e))?;

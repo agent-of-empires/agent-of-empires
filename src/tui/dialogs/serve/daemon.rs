@@ -3,12 +3,14 @@
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::Mutex;
+use std::time::Instant;
 
 use rand::prelude::IndexedRandom;
 
 use super::words::PASSPHRASE_WORDS;
 use super::{ServeMode, TransportStatus, TunnelTransport};
 use crate::acp::client::autostart::{initial_log_tail, load_or_generate_port};
+use crate::server::startup::{StartupFailure, STARTUP_FAILURE_FILE};
 
 const SAVED_PASSPHRASE_FILE: &str = "serve.saved_passphrase";
 /// Written by the server at startup, so CLI-launched daemons can show their passphrase.
@@ -151,7 +153,12 @@ pub(super) fn spawn_daemon(
     let exe = current_exe()?;
 
     // Stale files from a hard-killed daemon would show its URL or passphrase while starting.
-    for name in ["serve.url", "serve.mode", EPHEMERAL_PASSPHRASE_FILE] {
+    for name in [
+        "serve.url",
+        "serve.mode",
+        EPHEMERAL_PASSPHRASE_FILE,
+        STARTUP_FAILURE_FILE,
+    ] {
         remove_app_file(name);
     }
 
@@ -270,6 +277,37 @@ pub(super) fn remember_last_mode(mode: ServeMode) {
     if let Some(path) = app_file("serve.last_mode") {
         let _ = std::fs::write(path, mode.file_token());
     }
+}
+
+/// The failed start the Daemon recorded, removed so it is shown once.
+pub(super) fn take_startup_failure() -> Option<StartupFailure> {
+    take_startup_failure_in(&crate::session::get_app_dir().ok()?)
+}
+
+fn take_startup_failure_in(dir: &Path) -> Option<StartupFailure> {
+    let path = dir.join(STARTUP_FAILURE_FILE);
+    let raw = std::fs::read_to_string(&path).ok()?;
+    let _ = std::fs::remove_file(&path);
+    serde_json::from_str(&raw).ok()
+}
+
+/// When the running daemon started, from its `serve.pid`, so a reopened Starting view counts
+/// from the spawn rather than from reopening.
+pub(super) fn daemon_started_at() -> Instant {
+    crate::cli::serve::pid_file_path()
+        .ok()
+        .and_then(|path| started_at_of(&path))
+        .unwrap_or_else(Instant::now)
+}
+
+fn started_at_of(path: &Path) -> Option<Instant> {
+    let age = std::fs::metadata(path)
+        .ok()?
+        .modified()
+        .ok()?
+        .elapsed()
+        .ok()?;
+    Instant::now().checked_sub(age)
 }
 
 /// The port the next spawn reuses, if any; `None` means it picks a random one. Mirrors the reuse
@@ -416,6 +454,28 @@ mod tests {
         for (input, expected) in cases {
             assert_eq!(compact_log_line(input), expected);
         }
+    }
+
+    #[test]
+    fn a_recorded_start_failure_is_shown_once_and_reopening_counts_from_the_spawn() {
+        let tmp = tempfile::tempdir().unwrap();
+        let failure = r#"{"remote":true,"transport":"tailscale","message":"boom"}"#;
+        std::fs::write(tmp.path().join(STARTUP_FAILURE_FILE), failure).unwrap();
+        let taken = take_startup_failure_in(tmp.path()).expect("recorded failure");
+        assert_eq!(taken.message, "boom");
+        assert!(take_startup_failure_in(tmp.path()).is_none(), "shown once");
+
+        let pid = tmp.path().join("serve.pid");
+        std::fs::write(&pid, "1").unwrap();
+        let spawned = std::time::SystemTime::now() - std::time::Duration::from_secs(45);
+        std::fs::File::options()
+            .write(true)
+            .open(&pid)
+            .unwrap()
+            .set_modified(spawned)
+            .unwrap();
+        let elapsed = started_at_of(&pid).unwrap().elapsed().as_secs();
+        assert!((45..47).contains(&elapsed), "{elapsed}");
     }
 
     #[test]

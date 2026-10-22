@@ -431,7 +431,7 @@ impl HomeView {
             active_tui_count: 1,
             serve_running: false,
             serve_probe: crate::tui::worker::Worker::spawn("aoe-serve-probe", |()| {
-                crate::cli::serve::daemon_pid().is_some()
+                super::pollers::ServeProbe::read()
             }),
             serve_probe_in_flight: false,
             idle_decay_window,

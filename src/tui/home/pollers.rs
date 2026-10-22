@@ -2,6 +2,29 @@
 
 use super::*;
 
+/// What the serve probe worker reads each poll.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ServeProbe {
+    pub(crate) running: bool,
+    /// The Daemon left a startup failure nobody has seen yet.
+    pub(crate) start_failed: bool,
+}
+
+impl ServeProbe {
+    pub(crate) fn read() -> Self {
+        let running = crate::cli::serve::daemon_pid().is_some();
+        let start_failed = !running
+            && crate::session::get_app_dir().is_ok_and(|dir| {
+                dir.join(crate::server::startup::STARTUP_FAILURE_FILE)
+                    .exists()
+            });
+        Self {
+            running,
+            start_failed,
+        }
+    }
+}
+
 impl HomeView {
     pub fn apply_deletion_results(&mut self) -> bool {
         use crate::session::deletion::DeletionDisposition;
@@ -534,12 +557,22 @@ impl HomeView {
         changed
     }
 
-    /// True when the running state changed.
+    /// True when the running state changed. A start that failed with the view closed (hidden
+    /// with Esc) is otherwise silent, so it raises a status the user can follow with R.
     fn apply_serve_probe(&mut self) -> bool {
         match self.serve_probe.try_recv() {
-            Ok(running) => {
+            Ok(probe) => {
                 self.serve_probe_in_flight = false;
-                std::mem::replace(&mut self.serve_running, running) != running
+                let was_running = std::mem::replace(&mut self.serve_running, probe.running);
+                if was_running && probe.start_failed && self.serve_view.is_none() {
+                    let what = if cfg!(feature = "web") {
+                        "Web dashboard"
+                    } else {
+                        "API server"
+                    };
+                    self.flash_status(format!("{what} didn't start. Press R for details."));
+                }
+                was_running != probe.running
             }
             Err(std::sync::mpsc::TryRecvError::Empty) => false,
             Err(std::sync::mpsc::TryRecvError::Disconnected) => {

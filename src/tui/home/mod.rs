@@ -379,7 +379,7 @@ pub struct HomeView {
 
     pub(super) active_tui_count: usize,
     pub(super) serve_running: bool,
-    pub(super) serve_probe: crate::tui::worker::Worker<(), bool>,
+    pub(super) serve_probe: crate::tui::worker::Worker<(), pollers::ServeProbe>,
     pub(super) serve_probe_in_flight: bool,
 
     pub(super) settings_view: Option<SettingsView>,

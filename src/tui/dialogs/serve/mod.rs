@@ -17,7 +17,6 @@ use crate::tui::dialogs::{contains, hit, target_rects};
 use crate::tui::styles::Theme;
 use daemon::*;
 
-const TUNNEL_STARTUP_TIMEOUT_SECS: u64 = 60;
 const FLASH_TTL: Duration = Duration::from_millis(1500);
 const CONFIRM_TTL: Duration = Duration::from_secs(3);
 
@@ -54,6 +53,15 @@ impl ServeMode {
 enum TunnelTransport {
     Tailscale,
     Cloudflare,
+}
+
+impl From<crate::server::startup::StartupTransport> for TunnelTransport {
+    fn from(t: crate::server::startup::StartupTransport) -> Self {
+        match t {
+            crate::server::startup::StartupTransport::Tailscale => TunnelTransport::Tailscale,
+            crate::server::startup::StartupTransport::Cloudflare => TunnelTransport::Cloudflare,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -158,6 +166,26 @@ impl ServeViewState {
         }
     }
 
+    /// The Error screen for a daemon that exited while starting, led by the reason it recorded.
+    fn start_failed(
+        mode: ServeMode,
+        transport: Option<TunnelTransport>,
+        reason: Option<&str>,
+    ) -> Self {
+        let tail = initial_log_tail();
+        let prefix = match mode {
+            ServeMode::Tunnel => "`aoe serve --remote --daemon` exited before the tunnel came up.",
+            ServeMode::Local => "`aoe serve --daemon` exited before the server started.",
+        };
+        let reason = reason.map(|r| format!("\n\n{r}")).unwrap_or_default();
+        let hint = diagnose_daemon_exit(&tail.join("\n"), mode);
+        ServeViewState::Error {
+            message: format!("{prefix}{reason}{hint}{}", last_log_lines(&tail)),
+            mode,
+            transport,
+        }
+    }
+
     /// Active once the daemon has published its URLs, Starting until then.
     fn running(
         mode: ServeMode,
@@ -171,7 +199,7 @@ impl ServeViewState {
                 mode,
                 transport,
                 passphrase,
-                started_at: Instant::now(),
+                started_at: daemon_started_at(),
                 log_offset,
             };
         }
@@ -441,6 +469,18 @@ impl ServeView {
                 .then(recall_passphrase)
                 .flatten();
             ServeViewState::running(mode, None, passphrase, log_file_size())
+        } else if let Some(failure) = take_startup_failure() {
+            // A start hidden with Esc, or begun before this TUI opened, failed meanwhile.
+            let mode = if failure.remote {
+                ServeMode::Tunnel
+            } else {
+                ServeMode::Local
+            };
+            ServeViewState::start_failed(
+                mode,
+                failure.transport.map(TunnelTransport::from),
+                Some(&failure.message),
+            )
         } else {
             ServeViewState::mode_picker()
         };
@@ -825,8 +865,8 @@ impl ServeView {
                 mode,
                 transport,
                 passphrase,
-                started_at,
                 log_offset,
+                ..
             } => {
                 let log_grew = log_grew(log_offset);
                 let mode = *mode;
@@ -849,52 +889,17 @@ impl ServeView {
                     };
                     return true;
                 }
+                // The Daemon bounds a Tunnel start itself, so this also catches its timeout.
                 if crate::cli::serve::daemon_pid().is_none() {
-                    let tail = initial_log_tail();
-                    let prefix = match mode {
-                        ServeMode::Tunnel => {
-                            "`aoe serve --remote --daemon` exited before the tunnel came up."
-                        }
-                        ServeMode::Local => {
-                            "`aoe serve --daemon` exited before the server started."
-                        }
-                    };
-                    let hint = diagnose_daemon_exit(&tail.join("\n"), mode);
-                    self.state = ServeViewState::Error {
-                        message: format!("{prefix}{hint}{}", last_log_lines(&tail)),
+                    let failure = take_startup_failure();
+                    let transport = (*transport).or(failure
+                        .as_ref()
+                        .and_then(|f| f.transport.map(TunnelTransport::from)));
+                    self.state = ServeViewState::start_failed(
                         mode,
-                        transport: *transport,
-                    };
-                    return true;
-                }
-                if mode == ServeMode::Tunnel
-                    && started_at.elapsed() > Duration::from_secs(TUNNEL_STARTUP_TIMEOUT_SECS)
-                {
-                    // Stop it so a tunnel that never came up doesn't linger in the status bar.
-                    let stop_note = match stop_daemon() {
-                        Ok(()) => "Stuck daemon stopped.".to_string(),
-                        Err(e) => format!(
-                            "Daemon may still be running \
-                             (tried to stop: {}). Stop manually with `aoe serve --stop`.",
-                            e
-                        ),
-                    };
-                    let message = format!(
-                        "HTTPS tunnel did not announce a URL within {}s. \
-                         {}\n\n\
-                         Most likely cause: Tailscale Funnel needs HTTPS certs \
-                         or ACL approval, OR cloudflared is rate-limited / \
-                         offline. Re-run with AGENT_OF_EMPIRES_DEBUG=1 and \
-                         check debug.log for details.{}",
-                        TUNNEL_STARTUP_TIMEOUT_SECS,
-                        stop_note,
-                        last_log_lines(&initial_log_tail())
+                        transport,
+                        failure.as_ref().map(|f| f.message.as_str()),
                     );
-                    self.state = ServeViewState::Error {
-                        message,
-                        mode,
-                        transport: *transport,
-                    };
                     return true;
                 }
                 log_grew
