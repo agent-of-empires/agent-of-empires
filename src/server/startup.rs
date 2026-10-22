@@ -310,7 +310,12 @@ pub(crate) async fn start_server(
 
     let ownership_repair = if !read_only && std::env::var_os("AOE_CITYHALL_MODE").is_none() {
         if crate::session::list_profiles().is_ok_and(|profiles| profiles.is_empty()) {
-            crate::session::Storage::new(profile, file_watch.clone())?;
+            let configured_default = crate::session::config::Config::load()?.default_profile;
+            let stale_default = !configured_default.is_empty()
+                && (profile.is_empty() || profile == configured_default);
+            if !core_only || !stale_default {
+                crate::session::Storage::new(profile, file_watch.clone())?;
+            }
         }
         super::startup_recovery::repair_startup_profile_ownership(&file_watch)
     } else {

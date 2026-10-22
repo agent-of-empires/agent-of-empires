@@ -213,7 +213,7 @@ Without an HTTP endpoint, Linux first reads through its verified, same-user runt
 
 `--no-autostart` or `AOE_NO_AUTOSTART=1` disables local startup, not reuse of an existing Daemon. Startup failure or an absent Daemon with startup disabled is an error with guidance, never a disk answer. The spawning Client announces `Started aoe daemon (pid N)` only on stderr, including under `--json`. Local administrative commands and reads outside this covered set retain their existing behavior.
 
-The startup profile does not determine read scope. A missing configured default does not block an explicitly scoped read or a profile-independent read; an unscoped read still reports that missing default from the Daemon snapshot.
+The startup profile does not determine read scope. A missing configured default does not block an explicitly scoped read or a profile-independent read; an unscoped read still reports that missing default from the Daemon snapshot. An empty profile registry does not permit a read to recreate a configured missing default. Configured aliases retain their read scope without becoming physical startup profiles.
 
 The route follows the daemon's authentication mode. CLI clients use `AOE_DAEMON_TOKEN` or `AOE_DAEMON_PASSPHRASE`; passphrase login shares the ACP client's device-bound session cache. Environment URLs discard query parameters, including query tokens. Explicit endpoints reject queries. HTTP on a non-loopback host is accepted only without credentials; remote authentication requires HTTPS. Localhost connections bypass proxies and pin both loopback address families.
 

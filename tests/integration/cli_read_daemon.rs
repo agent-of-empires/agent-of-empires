@@ -429,3 +429,87 @@ fn reads_do_not_need_an_unrelated_missing_default_to_bootstrap() {
         assert!(!fixture.app.join("profiles/unknown").exists());
     }
 }
+
+#[test]
+#[parallel]
+fn empty_registry_reads_preserve_a_missing_configured_default() {
+    for default in ["missing", "main"] {
+        for args in [
+            &["list", "--json"][..],
+            &["profile", "list"],
+            &["list", "--all", "--json"],
+            &["project", "list", "--scope", "global", "--json"],
+        ] {
+            let fixture = Fixture::new();
+            std::fs::remove_dir_all(fixture.app.join("profiles/main")).unwrap();
+            std::fs::write(
+                fixture.app.join("config.toml"),
+                format!(
+                    "default_profile = \"{default}\"\n[updates]\nupdate_check_mode = \"off\"\n[systemd]\nenabled = false\n"
+                ),
+            )
+            .unwrap();
+            let output = fixture.run(args);
+            if args == ["list", "--json"] {
+                assert_eq!(output.status.code(), Some(1), "{output:?}");
+                assert!(output.stdout.is_empty(), "{output:?}");
+                assert!(String::from_utf8_lossy(&output.stderr)
+                    .contains(&format!("Profile '{default}' does not exist")));
+            } else {
+                assert!(output.status.success(), "{args:?}: {output:?}");
+                if args.contains(&"project") {
+                    assert_eq!(
+                        serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap(),
+                        serde_json::json!([])
+                    );
+                } else {
+                    assert!(
+                        String::from_utf8_lossy(&output.stdout).starts_with("No profiles found.")
+                    );
+                }
+            }
+            assert!(fixture.app.join("serve.pid").exists());
+            assert_eq!(
+                std::fs::read_dir(fixture.app.join("profiles"))
+                    .unwrap()
+                    .count(),
+                0,
+                "read created a profile: {args:?}"
+            );
+            let reused = fixture.run(&["--no-autostart", "profile", "list"]);
+            assert!(reused.status.success(), "{reused:?}");
+            assert!(String::from_utf8_lossy(&reused.stdout).starts_with("No profiles found."));
+        }
+    }
+}
+
+#[test]
+#[parallel]
+fn configured_alias_does_not_choose_an_unlisted_startup_profile() {
+    for args in [&["-p", "main", "list", "--json"][..], &["list", "--json"]] {
+        let fixture = Fixture::new();
+        let migrated = fixture.run(&["migrate"]);
+        assert!(migrated.status.success(), "{migrated:?}");
+        std::os::unix::fs::symlink("main", fixture.app.join("profiles/account")).unwrap();
+        std::fs::write(
+            fixture.app.join("config.toml"),
+            "default_profile = \"account\"\n[updates]\nupdate_check_mode = \"off\"\n[systemd]\nenabled = false\n",
+        ).unwrap();
+        let output = fixture.run(args);
+        assert!(output.status.success(), "{args:?}: {output:?}");
+        let rows: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(rows[0]["id"], "daemon-only-row");
+        let all = fixture.run(&["list", "--all", "--json"]);
+        assert!(all.status.success(), "{all:?}");
+        let rows: serde_json::Value = serde_json::from_slice(&all.stdout).unwrap();
+        assert_eq!(rows.as_array().unwrap().len(), 1);
+        assert_eq!(rows[0]["id"], "daemon-only-row");
+        assert_eq!(rows[0]["profile"], "main");
+        assert!(
+            std::fs::symlink_metadata(fixture.app.join("profiles/account"))
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+    }
+}

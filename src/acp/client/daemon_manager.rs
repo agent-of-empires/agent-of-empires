@@ -81,13 +81,11 @@ pub(crate) async fn require_local_read_daemon() -> Result<DaemonEndpoint, Manage
     let (endpoint, started) = async {
         let profile = if allow_start {
             let default = crate::session::config::resolve_default_profile();
-            if crate::session::get_profile_dir_path(&default)?.try_exists()? {
+            let profiles = crate::session::list_profiles()?;
+            if profiles.iter().any(|profile| profile == &default) {
                 default
             } else {
-                crate::session::list_profiles()?
-                    .into_iter()
-                    .next()
-                    .unwrap_or(default)
+                profiles.into_iter().next().unwrap_or(default)
             }
         } else {
             String::new()
