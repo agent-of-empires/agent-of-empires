@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 use rattles::presets::prelude as spinners;
 
 use super::{
-    live_send, HomeView, TerminalMode, ViewMode, ICON_ARCHIVED_SECTION, ICON_COLLAPSED,
+    live_send, DragKind, HomeView, TerminalMode, ViewMode, ICON_ARCHIVED_SECTION, ICON_COLLAPSED,
     ICON_DELETING, ICON_DORMANT, ICON_ERROR, ICON_EXPANDED, ICON_FAVORITE, ICON_IDLE, ICON_PINNED,
     ICON_STOPPED, ICON_TERMINAL, ICON_TRASH_SECTION, ICON_UNKNOWN, ICON_UNREAD,
 };
@@ -913,6 +913,16 @@ impl HomeView {
         }
         self.collapse_button_area = Rect::default();
         self.expand_strip_area = Rect::default();
+        self.divider_row = None;
+        self.main_area_height = 0;
+        if self.has_non_live_send_overlay()
+            && matches!(
+                self.drag_state,
+                Some(DragKind::ListDivider | DragKind::StackedListDivider)
+            )
+        {
+            self.handle_drag_end();
+        }
         // Hyperlink cells are per-frame: a takeover view or a link-free preview must
         // leave none behind for the backend to re-emit. Recover from poison rather than
         // skip, or the last recorded set would be re-wrapped over unrelated cells forever.
@@ -1012,6 +1022,7 @@ impl HomeView {
         let content_area = main_chunks[0];
         let available_width = content_area.width;
         self.main_area_width = available_width;
+        self.main_area_height = content_area.height;
         // A collapsed strip leaves enough preview space even on narrow terminals.
         if self.sidebar_collapsed {
             self.divider_col = None;
@@ -1029,7 +1040,7 @@ impl HomeView {
             self.render_preview(frame, preview_area, theme);
         } else if available_width < responsive::STACKED_BREAKPOINT {
             let main_height = content_area.height;
-            let list_height = responsive::stacked_list_height(main_height);
+            let list_height = responsive::stacked_list_height(main_height, self.list_height);
             let chunks = Layout::default()
                 .direction(Direction::Vertical)
                 .constraints([
@@ -1038,9 +1049,10 @@ impl HomeView {
                 ])
                 .split(content_area);
 
-            // Stacked layout has no vertical divider; only the side-by-side
-            // path exposes the resize-by-drag affordance.
             self.divider_col = None;
+            self.divider_row =
+                (chunks[0].height > 0 && chunks[1].height > 0 && content_area.width > 0)
+                    .then_some(chunks[1].y);
 
             // Stacked: the list sits above the preview, so there is no column to dock
             // under; the strip spans the list's width.
@@ -1071,6 +1083,12 @@ impl HomeView {
             let layout = ListLayout::Horizontal(self.sidebar_position);
             self.render_list(frame, list_rect, theme, layout);
             self.render_preview(frame, preview_area, theme);
+        }
+        if matches!(self.drag_state, Some(DragKind::ListDivider)) && self.divider_col.is_none()
+            || matches!(self.drag_state, Some(DragKind::StackedListDivider))
+                && self.divider_row.is_none()
+        {
+            self.handle_drag_end();
         }
         if let (Some(idx), Some(text)) = (last_prompt_idx, last_prompt.as_deref()) {
             self.render_last_prompt_footer(frame, main_chunks[idx], theme, text);

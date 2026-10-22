@@ -443,7 +443,12 @@ impl HomeView {
                 .and_then(|c| c.app_state.home_list_width)
                 .unwrap_or(35),
             divider_col: None,
+            list_height: user_config
+                .as_ref()
+                .and_then(|c| c.app_state.home_list_height),
+            divider_row: None,
             main_area_width: 0,
+            main_area_height: 0,
             drag_state: None,
             mouse_forward_btn: None,
             hover_forward_cell: None,

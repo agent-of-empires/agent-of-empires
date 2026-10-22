@@ -614,7 +614,7 @@ impl HomeView {
             return;
         }
         match self.drag_state {
-            Some(DragKind::ListDivider) => {
+            Some(DragKind::ListDivider | DragKind::StackedListDivider) => {
                 self.handle_drag_end();
             }
             Some(DragKind::PreviewSelect) => {
@@ -625,11 +625,13 @@ impl HomeView {
         self.sidebar_position = position;
     }
 
-    /// Hit the preview border shared with the list, on either side.
-    /// Stacked and takeover views clear `divider_col`; modals block drags.
+    /// Hit the shared list/preview border. Overlays block resizing.
     pub fn hit_divider(&self, col: u16, row: u16) -> bool {
-        if self.has_dialog() {
+        if self.has_non_live_send_overlay() {
             return false;
+        }
+        if let Some(div_row) = self.divider_row {
+            return row == div_row && col >= self.list_area.x && col < self.list_area.right();
         }
         let Some(div_col) = self.divider_col else {
             return false;
@@ -652,7 +654,11 @@ impl HomeView {
     /// mobile clients where Shift-bypass does nothing.
     pub fn handle_drag_start(&mut self, col: u16, row: u16) -> bool {
         if self.hit_divider(col, row) {
-            self.drag_state = Some(DragKind::ListDivider);
+            self.drag_state = Some(if self.divider_row.is_some() {
+                DragKind::StackedListDivider
+            } else {
+                DragKind::ListDivider
+            });
             return true;
         }
         // Modals that aren't live-send sit over the preview, so a click inside
@@ -678,15 +684,12 @@ impl HomeView {
         false
     }
 
-    /// Resize the list within the preview's minimum width, or update a
-    /// text selection within the preview's content bounds.
+    /// Resize the list while reserving preview space, or update a text selection.
     ///
     /// True when state changed, so the caller redraws. Nothing persists per tick: the
     /// divider saves on release and the preview-select path emits OSC 52 on release.
     pub fn handle_drag_move(&mut self, col: u16, row: u16) -> bool {
-        // Settings scrollbar grab: map the live row to a scroll offset. Handled before the
-        // cancel-on-overlay logic below, which keys off `has_dialog()` (true while settings
-        // is open) and would tear the drag down on the first move.
+        // The settings scrollbar belongs to the overlay itself.
         if matches!(self.drag_state, Some(DragKind::SettingsScrollbar)) {
             if let Some(view) = &mut self.settings_view {
                 return view.scrollbar_drag_to_row(row);
@@ -696,28 +699,16 @@ impl HomeView {
             self.drag_state = None;
             return false;
         }
-        // A dialog opened mid-drag must not keep updating the sidebar invisibly under the
-        // modal, so end the drag here and persist whatever width was reached, mirroring
-        // `handle_drag_end`.
-        //
-        // `has_dialog()` is true during live-send, which is exactly when preview
-        // drag-select is meant to work, so live mode is exempt; a real modal opening
-        // mid-select still kills the drag and drops the selection so it cannot finalize
-        // behind the overlay.
+        // Live mode keeps the separator interactive; real overlays end the gesture.
         let drag_is_preview = matches!(self.drag_state, Some(DragKind::PreviewSelect));
-        let cancel_drag = if drag_is_preview {
-            self.has_non_live_send_overlay()
-        } else {
-            self.has_dialog()
-        };
-        if cancel_drag && self.drag_state.is_some() {
-            self.drag_state = None;
+        if self.has_non_live_send_overlay() && self.drag_state.is_some() {
             if drag_is_preview {
+                self.drag_state = None;
                 self.preview_selection = None;
                 self.preview_copy_pending = false;
                 self.preview_copy_text = None;
             } else {
-                self.save_list_width();
+                self.handle_drag_end();
             }
             return false;
         }
@@ -743,6 +734,21 @@ impl HomeView {
                     return false;
                 }
                 self.list_width = clamped;
+                true
+            }
+            Some(DragKind::StackedListDivider) => {
+                if self.divider_row.is_none() {
+                    self.handle_drag_end();
+                    return false;
+                }
+                let proposed = row.saturating_sub(self.list_area.y);
+                let height = responsive::stacked_list_height(self.main_area_height, Some(proposed));
+                if responsive::stacked_list_height(self.main_area_height, self.list_height)
+                    == height
+                {
+                    return false;
+                }
+                self.list_height = Some(height);
                 true
             }
             Some(DragKind::PreviewSelect) => {
@@ -875,10 +881,7 @@ impl HomeView {
         true
     }
 
-    /// End any active drag: the divider persists its final `list_width` to config, and a
-    /// preview selection is marked `finalized` so the renderer keeps the highlight until
-    /// dismissed. The clipboard copy is the caller's job (see `app.rs`), keeping this
-    /// method free of side effects beyond state.
+    /// Persist the final list size or finalize a preview selection for the caller to copy.
     ///
     /// True when a drag was in progress, so an `Up(Left)` that wasn't part of one causes
     /// no redraw.
@@ -893,6 +896,9 @@ impl HomeView {
         match state {
             DragKind::ListDivider => {
                 self.save_list_width();
+            }
+            DragKind::StackedListDivider => {
+                self.save_list_height();
             }
             DragKind::PreviewSelect => {
                 // A bare click collapses anchor == extent; treat it as no selection so a
