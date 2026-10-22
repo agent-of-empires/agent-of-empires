@@ -7,7 +7,7 @@ use anyhow::bail;
 /// `company-codex` can be the agent itself under another name (a symlink or copy), so the identity
 /// hook's ancestor walk must count that name too: otherwise a nested `codex exec` is the only
 /// process named like the agent and passes as the pane's own.
-pub(super) fn status_hook_env_prefix(
+pub(super) fn host_launch_env_prefix(
     profile: &str,
     instance_id: &str,
     agent: Option<&crate::agents::AgentDef>,
@@ -1853,12 +1853,12 @@ mod tests {
     }
 
     #[test]
-    fn status_hook_env_prefix_is_set_for_hook_agents_only() {
+    fn host_launch_env_prefix_adds_identity_only_for_hooks() {
         for agent in ["codex", "hermes", "settl", "claude", "kiro", "kimi"] {
             let binary = crate::agents::get_agent(agent).unwrap().binary;
             for program in [None, Some(binary)] {
                 assert_eq!(
-                    status_hook_env_prefix(
+                    host_launch_env_prefix(
                         "work",
                         "abc123",
                         crate::agents::get_agent(agent),
@@ -1869,7 +1869,7 @@ mod tests {
             }
         }
         assert_eq!(
-            status_hook_env_prefix("work", "abc123", crate::agents::get_agent("opencode"), None),
+            host_launch_env_prefix("work", "abc123", crate::agents::get_agent("opencode"), None),
             ""
         );
     }
@@ -1877,8 +1877,8 @@ mod tests {
     /// A renamed launch (`company-codex` running Codex) tells the identity hook its name, so the
     /// hook's ancestor walk counts the outer agent and refuses a nested `codex exec`.
     #[test]
-    fn status_hook_env_prefix_names_a_renamed_launched_program() {
-        let prefix = status_hook_env_prefix(
+    fn host_launch_env_prefix_names_a_renamed_launched_program() {
+        let prefix = host_launch_env_prefix(
             "work",
             "abc123",
             crate::agents::get_agent("codex"),

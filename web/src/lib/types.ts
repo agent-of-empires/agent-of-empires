@@ -282,7 +282,7 @@ export interface Workspace {
 
 export interface AgentInfo {
   name: string;
-  kind: "builtin" | "custom";
+  kind: "builtin" | "custom" | "plugin";
   binary: string;
   host_only: boolean;
   installed: boolean;

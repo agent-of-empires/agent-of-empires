@@ -2127,22 +2127,32 @@ pub fn is_resolvable_agent_config_dir(dir: &str) -> bool {
 }
 
 impl SessionConfig {
-    /// Resolve the command override for a tool, checking agent_command_override first,
-    /// then falling back to custom_agents. Returns empty string if no override found.
+    /// Resolve the explicit command, custom command, or installed plugin agent command.
     pub fn resolve_tool_command(&self, tool: &str) -> String {
         self.agent_command_override
             .get(tool)
-            .filter(|s| !s.is_empty())
-            .or_else(|| self.custom_agents.get(tool))
+            .filter(|command| !command.trim().is_empty())
             .cloned()
+            .or_else(|| {
+                self.custom_agents
+                    .get(tool)
+                    .filter(|command| !command.trim().is_empty())
+                    .cloned()
+            })
+            .or_else(|| {
+                crate::plugin::agent_integration::agent_command(
+                    tool,
+                    self.custom_agents
+                        .iter()
+                        .filter(|(_, command)| !command.trim().is_empty())
+                        .map(|(name, _)| name.as_str()),
+                )
+            })
             .unwrap_or_default()
     }
 
-    /// The command a launch runs for `tool` when the session carries no
-    /// per-session override: `agent_command_override`, else `custom_agents`,
-    /// else the built-in's binary, else empty. A surface with no session to
-    /// ask names the agent from this, so it describes the launch instead of a
-    /// second derivation of it.
+    /// The launch command when no per-session override is set: explicit
+    /// override, custom command, active plugin agent command, then built-in binary.
     pub fn launch_command_for(&self, tool: &str) -> String {
         let resolved = self.resolve_tool_command(tool);
         if !resolved.is_empty() {

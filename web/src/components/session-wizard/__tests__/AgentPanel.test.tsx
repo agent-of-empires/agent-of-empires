@@ -31,12 +31,15 @@ describe("AgentPickerEssentials", () => {
     return { onChange };
   };
 
-  it("lists installed built-ins and custom agents with a Custom badge, and selects on click", () => {
-    const { onChange } = renderPicker("claude", [claude, custom, agent("uninstalled", { installed: false })]);
+  it("lists installed built-ins, configured custom agents, and plugin-provided agents", () => {
+    const plugin = agent("plugin-agent", { kind: "plugin", install_hint: "Provided by AoE plugin" });
+    const { onChange } = renderPicker("claude", [claude, custom, plugin, agent("uninstalled", { installed: false })]);
     expect(screen.queryByRole("button", { name: "uninstalled", exact: true })).toBeNull();
     expect(screen.getAllByText("Custom").length).toBeGreaterThan(0);
     fireEvent.click(screen.getByRole("button", { name: /remote-helper/ }));
     expect(onChange).toHaveBeenCalledWith("tool", "remote-helper");
+    fireEvent.click(screen.getByRole("button", { name: /plugin-agent/ }));
+    expect(onChange).toHaveBeenCalledWith("tool", "plugin-agent");
   });
 
   it("does not warn about missing agents when only a custom agent exists", () => {

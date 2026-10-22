@@ -153,7 +153,7 @@ pub async fn list_agents(State(state): State<Arc<AppState>>) -> Json<Vec<AgentIn
         let custom_agents = config.session.custom_agents;
         let agent_acp_cmd = config.session.agent_acp_cmd;
         let agent_detect_as = config.session.agent_detect_as;
-        let tools = crate::tmux::AvailableTools::detect();
+        let tools = crate::tmux::AvailableTools::detect_with_custom_agents(&custom_agents);
         let available = tools.available_list();
         let acp_registry = crate::acp::AgentRegistry::with_defaults();
         // Global config, not `config` above: the allowlist is an operator
@@ -184,6 +184,32 @@ pub async fn list_agents(State(state): State<Arc<AppState>>) -> Json<Vec<AgentIn
                 }
             })
             .collect::<Vec<_>>();
+        let registry = crate::plugin::registry();
+        let plugin_agents = crate::plugin::agent_integration::catalog(
+            &registry,
+            crate::agents::AGENTS.iter().map(|agent| agent.name),
+            custom_agents
+                .iter()
+                .filter(|(_, command)| !command.trim().is_empty())
+                .map(|(name, _)| name.as_str()),
+        );
+        for integration in plugin_agents {
+            agents.push(AgentInfo {
+                kind: "plugin".to_string(),
+                name: integration.tool.to_string(),
+                binary: integration.tool.to_string(),
+                host_only: false,
+                installed: available.iter().any(|name| name == integration.tool),
+                install_hint: format!("Provided by AoE plugin {}", integration.plugin),
+                oneshot_capable: false,
+                acp_capable: false,
+                acp_installed: false,
+                acp_allowed: policy.allows(integration.tool),
+                acp_command: None,
+                acp_args: Vec::new(),
+                lifecycle: crate::agents::AgentLifecycle::Active,
+            });
+        }
         agents.extend(build_custom_agent_infos(
             &custom_agents,
             &agent_acp_cmd,

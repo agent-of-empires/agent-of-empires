@@ -177,6 +177,12 @@ agent_detect_as = { "lenovo-claude" = "claude" }
 
 Custom agents remain selectable even for remote or unmanaged commands. Profile maps replace global maps, so redeclare entries you want to keep. `agent_execution_as` and `agent_config_dir` are trusted global/profile declarations; repository overrides are refused. The web wizard can select a custom agent but never edits these command strings.
 
+Native terminal launches receive `AOE_INSTANCE_ID` directly in the process
+environment before agent extensions initialize. This identity does not depend on
+`agent_status_hooks`, which controls installation of optional status hooks rather
+than plugin-report consumption. Hook sidecars and native-plugin reports retain
+their own transport, freshness, and identity-validation rules.
+
 ### One CLI, two accounts
 
 A wrapper that runs the same CLI against a second login usually exports the agent's config-dir variable, which AoE cannot see: the wrapper sets it after AoE has chosen which file to write. Name the directory in `agent_config_dir` so folder-trust records and [native MCP discovery](mcp-servers.md) land on the config the agent actually reads, for as long as the conversation has not recorded a store of its own.

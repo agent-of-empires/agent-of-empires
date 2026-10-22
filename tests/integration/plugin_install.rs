@@ -928,7 +928,7 @@ command = ["false"]
     )
     .unwrap();
 
-    let err = install::update("acme.upd", false)
+    let err = install::update("acme.upd", true)
         .await
         .unwrap_err()
         .to_string();
@@ -1034,6 +1034,105 @@ command = ["cp", "aoe-plugin.toml", "marker-v2"]
             .unwrap()
             .version,
         "0.2.0"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+#[serial]
+async fn update_reprompts_when_plugin_agent_command_changes() {
+    let _home = isolate();
+    let src = tempfile::tempdir().unwrap();
+    let dir = write_plugin_dir(
+        src.path(),
+        r#"
+id = "acme.agent"
+name = "Agent"
+version = "0.1.0"
+api_version = 19
+
+[[agent_integrations]]
+tool = "session-helper"
+command = "session-helper --safe"
+"#,
+    );
+    install::install(dir.to_str().unwrap(), true).await.unwrap();
+
+    std::fs::write(
+        dir.join("aoe-plugin.toml"),
+        r#"
+id = "acme.agent"
+name = "Agent"
+version = "0.1.1"
+api_version = 19
+
+[[agent_integrations]]
+tool = "session-helper"
+command = "session-helper --safe"
+"#,
+    )
+    .unwrap();
+    install::update("acme.agent", false).await.unwrap();
+
+    std::fs::write(
+        dir.join("aoe-plugin.toml"),
+        r#"
+id = "acme.agent"
+name = "Agent"
+version = "0.2.0"
+api_version = 19
+
+[[agent_integrations]]
+tool = "session-helper"
+command = "session-helper --unsafe"
+"#,
+    )
+    .unwrap();
+
+    let err = install::update("acme.agent", false)
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("not a terminal"), "got: {err}");
+    assert_eq!(
+        Lockfile::load().unwrap().get("acme.agent").unwrap().version,
+        "0.1.1"
+    );
+
+    assert!(std::fs::read_to_string(
+        agent_of_empires::plugin::plugins_dir()
+            .unwrap()
+            .join("acme.agent/aoe-plugin.toml")
+    )
+    .unwrap()
+    .contains("command = \"session-helper --safe\""));
+
+    install::update("acme.agent", true).await.unwrap();
+    assert_eq!(
+        Lockfile::load().unwrap().get("acme.agent").unwrap().version,
+        "0.2.0"
+    );
+    assert!(std::fs::read_to_string(
+        agent_of_empires::plugin::plugins_dir()
+            .unwrap()
+            .join("acme.agent/aoe-plugin.toml")
+    )
+    .unwrap()
+    .contains("command = \"session-helper --unsafe\""));
+    std::fs::write(
+        dir.join("aoe-plugin.toml"),
+        r#"
+id = "acme.agent"
+name = "Agent"
+version = "0.3.0"
+api_version = 19
+"#,
+    )
+    .unwrap();
+    install::update("acme.agent", false).await.unwrap();
+    assert_eq!(
+        Lockfile::load().unwrap().get("acme.agent").unwrap().version,
+        "0.3.0"
     );
 }
 

@@ -46,15 +46,26 @@ export function PluginInstallConsentModal({ consent, busy, error, onApprove, onC
           {consent.capabilities.join(", ")}
         </ModalSection>
       )}
+      {consent.agent_integrations.length > 0 && (
+        <ModalSection label="Agent launch commands" warn testId="plugin-install-agent-integrations">
+          <ul className="space-y-0.5">
+            {consent.agent_integrations.map((agent) => (
+              <li key={agent.tool} className="font-mono text-[11px] text-text-dim">
+                {agent.tool}: {agent.command ?? "No launch command declared"}
+              </li>
+            ))}
+          </ul>
+        </ModalSection>
+      )}
 
       <BuildSteps steps={consent.build_steps} testId="plugin-install-build-steps" />
 
       {consent.ui.length > 0 && <ModalSection label="Dashboard UI slots">{uniqueSlots(consent.ui)}</ModalSection>}
 
       <p className="mb-3 text-[11px] text-text-dim">
-        Installing trusts this plugin. The host enforces capabilities at its API boundary, but a plugin worker (and any
-        build step) runs without OS-level sandboxing, so a malicious plugin is not contained. Build steps run as you
-        before any capability gate. Only install plugins you trust.
+        Installing trusts this plugin. In particular, its declared agent commands run as your user when launched.
+        Workers and build steps run without OS-level sandboxing, so a malicious plugin is not contained. Only install
+        plugins you trust.
       </p>
 
       {error && (
