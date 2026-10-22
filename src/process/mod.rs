@@ -893,14 +893,27 @@ mod captured_process_tests {
         }
     }
 
-    #[test]
-    fn single_process_capture_refuses_another_birth() {
+    fn waiting_child() -> ChildGuard {
+        let ready = tempfile::tempdir().unwrap();
+        let path = ready.path().join("ready");
         let child = Command::new("sh")
-            .args(["-c", "read -r line"])
+            .args(["-c", ": > \"$1\"; read -r line", "sh"])
+            .arg(&path)
             .stdin(Stdio::piped())
             .spawn()
             .unwrap();
         let child = ChildGuard(child);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !path.exists() {
+            assert!(Instant::now() < deadline, "child did not become ready");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        child
+    }
+
+    #[test]
+    fn single_process_capture_refuses_another_birth() {
+        let child = waiting_child();
         let pid = child.0.id();
         let birth = process_birth_identity(pid).unwrap().unwrap();
         assert!(CapturedProcess::capture(pid, &birth).unwrap().is_some());
@@ -914,12 +927,7 @@ mod captured_process_tests {
 
     #[test]
     fn single_process_handle_observes_exit_before_parent_reaps() {
-        let child = Command::new("sh")
-            .args(["-c", "read -r line"])
-            .stdin(Stdio::piped())
-            .spawn()
-            .unwrap();
-        let mut child = ChildGuard(child);
+        let mut child = waiting_child();
         let pid = child.0.id();
         let birth = process_birth_identity(pid).unwrap().unwrap();
         let process = CapturedProcess::capture(pid, &birth).unwrap().unwrap();

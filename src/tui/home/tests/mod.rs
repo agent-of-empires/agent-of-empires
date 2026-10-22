@@ -361,7 +361,7 @@ fn instance_in(title: &str, path: &str, group: &str) -> Instance {
 
 fn create_test_env_empty() -> TestEnv {
     use crate::session::config::GroupByMode;
-    let temp = TempDir::new().unwrap();
+    let temp = TempDir::new_in("/tmp").unwrap();
     let _guard = setup_test_home(&temp);
     let _storage = Storage::new_unwatched("test").unwrap(); // ensure profile dir exists
     let tools = AvailableTools::with_tools(&["claude"]);
@@ -444,7 +444,7 @@ fn shelf_row_for_idx(view: &HomeView, idx: usize) -> u16 {
 
 fn create_test_env_with_sessions(count: usize) -> TestEnv {
     use crate::session::config::GroupByMode;
-    let temp = TempDir::new().unwrap();
+    let temp = TempDir::new_in("/tmp").unwrap();
     let _guard = setup_test_home(&temp);
     let storage = Storage::new_unwatched("test").unwrap();
     let mut instances = Vec::new();
