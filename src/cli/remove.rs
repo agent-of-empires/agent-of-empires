@@ -108,6 +108,11 @@ pub async fn run(profile: &str, args: RemoveArgs) -> Result<()> {
         }
         inst.kill_ancillary_tmux_sessions_locked();
         inst.release_scope();
+        let runner_stop = if inst.is_structured() {
+            super::acp::stop_runner(&removed_id).await
+        } else {
+            Ok(())
+        };
 
         let mut inst = inst;
         inst.trash();
@@ -172,7 +177,11 @@ pub async fn run(profile: &str, args: RemoveArgs) -> Result<()> {
         println!(
             "  Restore with `aoe session restore {removed_id}`, or delete permanently with `aoe rm --purge {removed_id}`."
         );
-        return Ok(());
+        return runner_stop.map_err(|error| {
+            anyhow::anyhow!(
+                "the session is in the trash, but its agent runner could not be stopped: {error:#}"
+            )
+        });
     }
 
     let delete_worktree = needs_worktree_cleanup(&inst, &args);
@@ -211,6 +220,13 @@ pub async fn run(profile: &str, args: RemoveArgs) -> Result<()> {
             anyhow::bail!("{detail}: {removed_title}");
         }
     };
+    if inst.is_structured() {
+        super::acp::stop_runner(&removed_id)
+            .await
+            .map_err(|error| {
+                anyhow::anyhow!("could not stop the agent runner of {removed_title}: {error:#}")
+            })?;
+    }
     let result = transaction.run_hooks().complete_with(|instance| {
         super::purge_acp_transcript(instance).map_err(|error| {
             format!(
