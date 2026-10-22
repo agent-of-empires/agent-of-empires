@@ -166,7 +166,7 @@ impl PluginHost {
     }
 
     pub async fn refresh_suggestions(&self, profile: &str) -> usize {
-        if profile != self.api.profile() {
+        if profile != crate::session::config::effective_profile(self.api.profile()) {
             return 0;
         }
         let ids: Vec<String> = crate::plugin::registry()

@@ -104,7 +104,7 @@ impl HostApiState {
             .unwrap_or_default();
         let profile = self.suggestion_profile();
         self.with_suggestions_db(|db| {
-            let overrides = source_overrides(db, profile, provider_id)?;
+            let overrides = source_overrides(db, &profile, provider_id)?;
             Ok(effective_sources(declared, &overrides))
         })
     }
@@ -462,6 +462,31 @@ mod tests {
             variables: Vec::new(),
             default_enabled,
         }
+    }
+
+    #[test]
+    fn default_profile_publishes_under_the_effective_profile() {
+        let dir = tempfile::tempdir().unwrap();
+        let _home = crate::session::test_support::isolate_app_dir_at(dir.path());
+        let host = HostApiState::open(&dir.path().join("plugin_events.db"), "", 100).unwrap();
+        host.lock_suggestion_generations()
+            .begin("example.provider", 1);
+        assert!(host
+            .publish_suggestions("example.provider", 1, "Example", &[suggestion()])
+            .unwrap());
+        let effective = crate::session::config::effective_profile("");
+        assert!(!effective.is_empty());
+        assert_eq!(
+            host.snapshot(&effective).unwrap()["items"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(host.snapshot("").unwrap()["items"]
+            .as_array()
+            .unwrap()
+            .is_empty());
     }
 
     #[test]

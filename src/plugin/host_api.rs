@@ -116,8 +116,10 @@ impl HostApiState {
 }
 
 impl HostApiState {
-    pub(crate) fn suggestion_profile(&self) -> &str {
-        &self.profile
+    /// Suggestions are keyed by the effective profile so a daemon serving the
+    /// default profile (`""`) and the API, which resolves it, agree.
+    pub(crate) fn suggestion_profile(&self) -> String {
+        crate::session::config::effective_profile(&self.profile)
     }
 
     pub(crate) fn lock_suggestion_generations(
@@ -394,7 +396,7 @@ fn suggestions_sources(
 }
 
 fn projects_list(state: &HostApiState) -> Result<Value, DispatchError> {
-    let projects: Vec<Value> = crate::session::projects::load_merged(state.profile())
+    let projects: Vec<Value> = crate::session::projects::load_merged(&state.suggestion_profile())
         .map_err(|e| DispatchError::internal(e.to_string()))?
         .into_iter()
         .map(|project| json!({ "name": project.name, "path": project.path }))
