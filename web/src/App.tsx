@@ -783,6 +783,8 @@ function AppContent({
       if (isTerminalTabId(id)) {
         const idx = terminalIndexOf(id);
         if (idx >= 1) {
+          // Confirm before the kill, which cannot be undone; the later closeTab then passes.
+          if (!confirmFileEditNavigation()) return;
           // Remove the tab only once the shell is actually killed; if the
           // DELETE fails, keep the tab so the user can retry instead of
           // silently leaking the shell with no way to close it.

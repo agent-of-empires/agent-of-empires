@@ -537,7 +537,7 @@ epoch, with matching lifecycle generation, profile, and live terminal identity.
 
 GET accepts `?path=<relative-or-absolute-path>` and returns `content`, `is_binary`, `truncated`, `version`, and `edit_disabled_reason`. Add `editing=true` to request a version and edit-eligibility checks. `version_only=true` requests those checks without the content payload. Reads may include out-of-project files proven by the Session's transcript; that provenance never grants writes.
 
-PUT accepts `{ "path", "version", "content" }` for an existing project UTF-8 text file up to 5 MB. Send the opened GET version. A successful atomic replacement returns 204; a changed version returns 409 and preserves the disk file. Read-only and CityHall modes return 403. Escaping paths, binary files, and unverified or separate Sandbox volumes cannot be edited. The browser's opt-in setting and workflow are described in [Editing project files](guides/web/dashboard.md#editing-project-files).
+PUT accepts `{ "path", "version", "content" }` for an existing project UTF-8 text file up to 5 MB. Send the opened GET version. A successful atomic replacement returns 204; a version that no longer matches returns 409 and leaves the disk file unchanged. The version is checked again just before the rename, but this is not a lock: a write by another process inside that final window can be replaced. Read-only and CityHall modes return 403. Escaping paths, binary files, and unverified or separate Sandbox volumes cannot be edited. The browser's opt-in setting and workflow are described in [Editing project files](guides/web/dashboard.md#editing-project-files).
 
 ## POST /api/sessions/{id}/send
 
