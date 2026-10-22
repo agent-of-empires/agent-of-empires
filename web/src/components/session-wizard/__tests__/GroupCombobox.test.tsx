@@ -137,6 +137,43 @@ describe("GroupCombobox", () => {
       type("client/");
       key("ArrowUp");
       expect(scrolled.at(-1)).toBe("client/web · 1 session");
+      // Groups loading after typing put rows above the highlighted create row: reveal it again.
+      cleanup();
+      scrolled.length = 0;
+      const { rerender } = render(<Harness groups={[]} />);
+      fireEvent.focus(input());
+      type("client/");
+      expect(scrolled).toEqual(['Create group "client/"']);
+      rerender(<Harness groups={GROUPS} />);
+      expect(activeOption()).toBe('Create group "client/"');
+      expect(scrolled).toEqual(['Create group "client/"', 'Create group "client/"']);
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
+  it("re-measures the room when the sheet scrolls with the list open", () => {
+    let fieldTop = 300;
+    const rect = (top: number, bottom: number) => ({ top, bottom }) as DOMRect;
+    const spy = vi.spyOn(Element.prototype, "getBoundingClientRect").mockImplementation(function (this: Element) {
+      if (this.hasAttribute("data-wizard-scroll")) return rect(0, 400);
+      if (this.getAttribute("role") === "combobox") return rect(fieldTop, fieldTop + 40);
+      return rect(0, 0);
+    });
+    try {
+      render(
+        <div data-wizard-scroll="">
+          <Harness />
+        </div>,
+      );
+      fireEvent.focus(input());
+      const popup = screen.getByTestId("group-combobox-popup");
+      expect(popup.style.maxHeight).toBe("288px");
+      // Scrolling brings the field near the top: 112px above it, 232px below.
+      fieldTop = 120;
+      fireEvent.scroll(input().closest("[data-wizard-scroll]")!);
+      expect(popup.style.maxHeight).toBe("232px");
+      expect(popup.className).toContain("top-full");
     } finally {
       spy.mockRestore();
     }

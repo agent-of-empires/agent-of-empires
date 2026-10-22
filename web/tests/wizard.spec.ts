@@ -468,6 +468,42 @@ test.describe("Group field", () => {
     await expect.poll(() => inView("team/g01 · 1 session")).toBe(true);
   });
 
+  test("Groups that load after typing keep the highlighted create row in view", async ({ page }) => {
+    const many = Array.from({ length: 20 }, (_, i) => ({
+      path: `team/g${String(i + 1).padStart(2, "0")}`,
+      session_count: 1,
+    }));
+    await mockWizardApis(page);
+    // Registered last, so it answers `/api/groups` instead of the helper, once released.
+    let release: () => void = () => {};
+    const held = new Promise<void>((resolve) => (release = resolve));
+    await page.route("**/api/groups**", async (r) => {
+      await held;
+      await r.fulfill({ json: many });
+    });
+    await page.setViewportSize({ width: 1280, height: 900 });
+    await page.goto("/");
+    await openWizard(page);
+    await selectProject(page, "/tmp/example");
+    const w = wizard(page);
+    const field = w.getByRole("combobox", { name: "Group" });
+    await field.click();
+    await field.fill("team/");
+    const create = w.getByRole("option", { name: 'Create group "team/"' });
+    await expect(create).toHaveAttribute("aria-selected", "true");
+    release();
+    const list = w.getByRole("listbox", { name: "Groups" });
+    await expect(list.getByRole("option")).toHaveCount(21);
+    await expect(create).toHaveAttribute("aria-selected", "true");
+    await expect
+      .poll(async () => {
+        const row = (await create.boundingBox())!;
+        const box = (await list.boundingBox())!;
+        return row.y >= box.y - 1 && row.y + row.height <= box.y + box.height + 1;
+      })
+      .toBe(true);
+  });
+
   test.describe("at 375px", () => {
     test.use({ viewport: { width: 375, height: 812 } });
 

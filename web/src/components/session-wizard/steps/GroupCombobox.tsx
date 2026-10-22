@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useId, useRef, useState } from "react";
+import { useCallback, useEffect, useId, useLayoutEffect, useRef, useState } from "react";
 
 import type { GroupInfo } from "../../../lib/types";
 import { ROW_INPUT } from "../WizardRows";
@@ -7,8 +7,6 @@ import { groupOptions, optionLabel, type GroupOption } from "./groupOptions";
 const LIST_MAX = 288;
 
 const keyOf = (option: GroupOption) => (option.kind === "group" ? `group:${option.group.path}` : "create");
-// Stable, so React calls it once each time a row becomes the highlighted one.
-const reveal = (row: HTMLLIElement | null) => row?.scrollIntoView?.({ block: "nearest" });
 
 /** The wizard's Group field: free text with a themed list of the profile's groups. */
 export function GroupCombobox({
@@ -49,10 +47,13 @@ export function GroupCombobox({
   useEffect(() => {
     if (!open) return;
     place();
+    const scroller = inputRef.current?.closest<HTMLElement>("[data-wizard-scroll]");
     const viewport = window.visualViewport;
+    scroller?.addEventListener("scroll", place, { passive: true });
     viewport?.addEventListener("resize", place);
     window.addEventListener("resize", place);
     return () => {
+      scroller?.removeEventListener("scroll", place);
       viewport?.removeEventListener("resize", place);
       window.removeEventListener("resize", place);
     };
@@ -70,6 +71,11 @@ export function GroupCombobox({
   const kept = highlight === null ? -1 : options.findIndex((o) => keyOf(o) === highlight);
   const active = !open ? -1 : highlight === null ? -1 : kept >= 0 ? kept : defaultHighlight;
   const optionId = (i: number) => `${listId}-option-${i}`;
+  // Also when rows arrive above the highlighted one or the popup resizes around it.
+  useLayoutEffect(() => {
+    if (open && active >= 0)
+      document.getElementById(`${listId}-option-${active}`)?.scrollIntoView?.({ block: "nearest" });
+  }, [open, active, listId, options.length, placement.maxHeight]);
   const noGroups = groups.length === 0;
 
   return (
@@ -128,7 +134,6 @@ export function GroupCombobox({
             {options.map((option, i) => (
               <li
                 key={keyOf(option)}
-                ref={i === active ? reveal : undefined}
                 id={optionId(i)}
                 role="option"
                 aria-label={optionLabel(option)}
