@@ -1541,7 +1541,9 @@ pub(super) async fn resolve_mcp_servers(
             Some((def.name.clone(), (def.clone(), provenance)))
         })
         .collect();
-    let defs = crate::acp::mcp_rewrite::rewrite_servers(&ctx, defs).await;
+    let rewritten = crate::acp::mcp_rewrite::rewrite_servers(&ctx, defs).await;
+    let mut served_by = rewritten.served_by;
+    let defs = rewritten.servers;
     debug!(
         target: "acp.mcp",
         session = %session_id,
@@ -1550,13 +1552,15 @@ pub(super) async fn resolve_mcp_servers(
         servers = %crate::session::mcp::mcp_model::summarize_defs(&defs),
         "forwarding MCP servers"
     );
-    // Only a definition the hook left untouched keeps its provenance; an added or redefined
-    // one is project-local so it never receives session env values.
+    // A hook-served entry is a plugin entry. Otherwise only a definition the hook left
+    // untouched keeps its provenance; an added or redefined one is project-local so it never
+    // receives session env values.
     let resolved = defs
         .into_iter()
         .map(|def| ResolvedMcpServer {
-            provenance: match originals.remove(&def.name) {
-                Some((original, provenance)) if original == def => provenance,
+            provenance: match (served_by.remove(&def.name), originals.remove(&def.name)) {
+                (Some(plugin_id), _) => McpProvenance::Plugin { plugin_id },
+                (None, Some((original, provenance))) if original == def => provenance,
                 _ => McpProvenance::ProjectLocal,
             },
             def,
@@ -3356,6 +3360,70 @@ time.sleep(60)
             assert_eq!(names_of(&out), expected, "{case}");
             assert_eq!(rewriter.worker_calls() > 0, asked, "{case}");
         }
+    }
+
+    /// A hook-served entry replacing a user server is a plugin entry, so session env never
+    /// expands into its headers; a server the hook returned unchanged keeps its own provenance.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn hook_served_entries_have_plugin_provenance() {
+        use crate::acp::mcp_rewrite::test_support::{RecordingRewriter, SlotGuard};
+        use crate::acp::mcp_rewrite::Rewritten;
+        use crate::session::mcp::project_mcp::{ProjectMcpServer, ProjectMcpTransport};
+        use agent_client_protocol::schema::v1::McpServer;
+
+        let (_home, tmp) = isolate_home();
+        let _env = crate::session::test_support::EnvGuard::unset(&["CLAUDE_CONFIG_DIR"]);
+        std::fs::write(
+            tmp.path().join(".claude.json"),
+            r#"{ "mcpServers": {
+                "fs": { "command": "n" },
+                "ctl": { "type": "http", "url": "http://d/ctl", "headers": { "X-Probe": "${PROBE}" } }
+            } }"#,
+        )
+        .unwrap();
+        let probe = |name: &str| ProjectMcpServer {
+            name: name.into(),
+            transport: ProjectMcpTransport::Http {
+                url: format!("http://d/{name}"),
+                headers: [("X-Probe".to_string(), "${PROBE}".to_string())].into(),
+            },
+        };
+        let rewriter = RecordingRewriter::returning(Rewritten {
+            servers: vec![probe("fs"), probe("ctl")],
+            served_by: [("fs".to_string(), "acme.a".to_string())].into(),
+        });
+        let _slot = SlotGuard::install(rewriter);
+
+        let out = resolve_mcp_servers(
+            "claude",
+            "sess-prov",
+            None,
+            test_paths(tmp.path()),
+            McpHostEnv {
+                session_env: vec![("PROBE".into(), "expanded".into())],
+                native_config_override: None,
+            },
+            McpSandboxScope::default(),
+            "failed",
+        )
+        .await;
+
+        let mut headers: Vec<(String, String)> = out
+            .iter()
+            .map(|s| match s {
+                McpServer::Http(s) => (s.name.clone(), s.headers[0].value.clone()),
+                _ => panic!("unexpected transport"),
+            })
+            .collect();
+        headers.sort();
+        assert_eq!(
+            headers,
+            [
+                ("ctl".to_string(), "expanded".to_string()),
+                ("fs".to_string(), "${PROBE}".to_string()),
+            ]
+        );
     }
 
     #[tokio::test]

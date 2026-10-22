@@ -13,6 +13,7 @@ use serde_json::Value;
 
 use crate::acp::mcp_rewrite::{context_params, McpRewriteContext, PluginServed};
 use crate::plugin::worker_call::WorkerCall;
+use crate::plugin::worker_requests::WorkerRequestError;
 use crate::server::session_credential::McpSessionSecret;
 use crate::session::mcp::project_mcp::{ProjectMcpServer, ProjectMcpTransport};
 
@@ -110,6 +111,7 @@ async fn ask(
     .await;
     let names = match reply {
         Ok(Ok(value)) => parse_names(value).ok(),
+        Ok(Err(WorkerRequestError::MethodNotFound)) => return Some(Vec::new()),
         Ok(Err(_)) | Err(_) => None,
     };
     if names.is_none() {
@@ -242,8 +244,7 @@ fn drop_collisions(
 #[cfg(test)]
 pub(crate) mod test_support {
     use super::*;
-    use crate::acp::mcp_rewrite::{McpRewriter, RewriteError, RewriteFuture};
-    use crate::plugin::worker_requests::WorkerRequestError;
+    use crate::acp::mcp_rewrite::{McpEntry, McpRewriter, RewriteError, RewriteFuture};
     use crate::session::mcp::project_mcp::ProjectMcpServer;
     use futures_util::future::BoxFuture;
     use serde_json::{json, Value};
@@ -381,17 +382,23 @@ pub(crate) mod test_support {
             ctx: &'a McpRewriteContext,
             servers: Vec<ProjectMcpServer>,
         ) -> RewriteFuture<'a> {
+            let entries: Vec<McpEntry> = servers.iter().cloned().map(McpEntry::from).collect();
+            let contributors = crate::acp::mcp_rewrite::initial_contributors(ctx, &servers);
             self.requests
                 .lock()
                 .unwrap()
-                .push(crate::acp::mcp_rewrite::request_params(ctx, &servers));
+                .push(crate::acp::mcp_rewrite::request_params(
+                    ctx,
+                    &entries,
+                    &contributors,
+                ));
             let out = if self.fail_hook {
                 Err(RewriteError {
                     plugin: "acme.hook".into(),
                     cause: "failed".into(),
                 })
             } else {
-                Ok(servers)
+                Ok(servers.into())
             };
             Box::pin(std::future::ready(out))
         }
@@ -418,7 +425,6 @@ mod tests {
     use super::test_support::*;
     use super::*;
     use crate::acp::mcp_rewrite::McpSandbox;
-    use crate::plugin::worker_requests::WorkerRequestError;
     use serde_json::json;
 
     fn ctx(sandboxed: bool) -> McpRewriteContext {
@@ -573,6 +579,19 @@ mod tests {
             assert!(out.is_empty(), "{label}");
             assert_eq!(*caller.failures.lock().unwrap(), ["acme.a"], "{label}");
         }
+    }
+
+    /// A rewrite-only worker that never implemented the method offers nothing, silently.
+    #[tokio::test]
+    async fn method_not_found_offers_nothing_without_notification() {
+        let caller = FakeCaller::with(vec![
+            ("acme.a", Err(WorkerRequestError::MethodNotFound)),
+            ("acme.b", Err(WorkerRequestError::Rejected)),
+        ]);
+        let ms = [manifest("acme.a", true), manifest("acme.b", true)];
+        let out = run(&caller, &ms, CALLBACK_TIMEOUT).await;
+        assert!(out.is_empty());
+        assert_eq!(*caller.failures.lock().unwrap(), ["acme.b"]);
     }
 
     #[tokio::test]
