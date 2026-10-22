@@ -634,6 +634,8 @@ impl<S: BroadcastSink> Drain<S> {
             config.cwd.clone(),
             config.host_environment.clone(),
             claude_config_dir,
+            config.sandbox_info.as_ref(),
+            config.workspace_info.as_ref(),
             "MCP re-resolution on respawn failed",
         )
         .await;
@@ -1628,6 +1630,59 @@ mod tests {
             })
             .collect();
         assert_eq!(names, ["home"]);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn respawn_runs_the_rewrite_hook_with_the_sandbox_mounts() {
+        use crate::acp::mcp_rewrite::test_support::{
+            outside_main_mount, workspace_info, RecordingRewriter, SlotGuard, OUTSIDE_MAIN,
+        };
+        use crate::session::mcp::project_mcp::{ProjectMcpServer, ProjectMcpTransport};
+        use agent_client_protocol::schema::v1::McpServer;
+        use std::path::Path;
+
+        let (_home, temp) = isolate_home();
+        let rewriter = RecordingRewriter::returning(vec![ProjectMcpServer {
+            name: "rewritten".into(),
+            transport: ProjectMcpTransport::Http {
+                url: "http://gateway/mcp".into(),
+                headers: Default::default(),
+            },
+        }]);
+        let _slot = SlotGuard::install(rewriter.clone());
+
+        let mut config = runner_config(worker_registry::socket_path_for("s-hook").unwrap());
+        config.cwd = temp.path().to_path_buf();
+        config.sandbox_info = Some(crate::session::SandboxInfo {
+            enabled: true,
+            container_id: None,
+            image: "aoe-sandbox:test".into(),
+            container_name: "aoe-sandbox-hook".into(),
+            extra_env: None,
+            custom_instruction: None,
+            container_workdir: None,
+            before_start_env: Vec::new(),
+            provider: None,
+        });
+        config.workspace_info = Some(workspace_info(
+            temp.path(),
+            &[("alpha", Path::new(OUTSIDE_MAIN))],
+        ));
+        Drain::<VecSink>::refresh_launch_env("s-hook", &mut config).await;
+
+        let sandboxes = rewriter.sandboxes.lock().unwrap();
+        let [Some(sandbox)] = sandboxes.as_slice() else {
+            panic!("one sandboxed call expected: {sandboxes:?}");
+        };
+        assert!(
+            sandbox.mounts.contains(&outside_main_mount()),
+            "respawn reports the workspace mounts: {sandbox:?}"
+        );
+        assert!(matches!(
+            config.mcp_servers.as_slice(),
+            [McpServer::Http(server)] if server.name == "rewritten"
+        ));
     }
 
     #[tokio::test]

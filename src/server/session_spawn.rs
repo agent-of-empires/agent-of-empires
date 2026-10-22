@@ -418,6 +418,7 @@ pub(crate) async fn spawn_structured_session(
                     instance.command.clone(),
                     instance.import_pending == Some(true),
                     instance.fork_pending.clone(),
+                    instance.workspace_info.clone(),
                 ))
             } else {
                 None
@@ -444,6 +445,7 @@ pub(crate) async fn spawn_structured_session(
                 command,
                 seed_history_replay,
                 fork_from,
+                workspace_info,
             )) = acp_spawn_target
             {
                 let agent = service
@@ -510,6 +512,7 @@ pub(crate) async fn spawn_structured_session(
                                 sandbox_continuation:
                                     crate::acp::supervisor::SandboxContinuation::Persisted,
                                 sandbox_info,
+                                workspace_info,
                                 source_profile: source_profile_for_spawn,
                                 yolo_mode,
                                 acp_mode_id,
@@ -756,5 +759,79 @@ mod tests {
         .expect("the refused spawn reports a startup error");
         assert_eq!(launches.load(std::sync::atomic::Ordering::SeqCst), 0);
         assert!(!state.acp_supervisor.is_running(&id).await);
+    }
+
+    /// The detached spawn after a create re-resolves MCP servers from the session's workspace,
+    /// so a multi-repo create must hand the new workspace layout to the supervisor.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn create_spawn_carries_the_new_workspace() {
+        use crate::server::test_support as support;
+        use axum::extract::{Query, State};
+        use axum::response::IntoResponse;
+        use axum::Json;
+
+        fn init_repo(path: &std::path::Path) {
+            std::fs::create_dir_all(path).unwrap();
+            for args in [
+                &["init", "-q"][..],
+                &["config", "user.email", "test@example.com"],
+                &["config", "user.name", "Test"],
+                &["commit", "-q", "--allow-empty", "-m", "init"],
+            ] {
+                let out = std::process::Command::new("git")
+                    .args(args)
+                    .current_dir(path)
+                    .output()
+                    .unwrap();
+                assert!(out.status.success(), "git {args:?}: {out:?}");
+            }
+        }
+
+        let _home = crate::session::test_support::isolate_app_dir();
+        let repos = tempfile::tempdir().unwrap();
+        let (alpha, beta) = (repos.path().join("alpha"), repos.path().join("beta"));
+        init_repo(&alpha);
+        init_repo(&beta);
+        support::seed_instances_on_disk_for_test("test", Vec::new());
+        let (launcher, seen) = support::workspace_capturing_launcher();
+        let state = support::build_test_app_state_with_launcher(Vec::new(), launcher);
+        let body = serde_json::from_value(serde_json::json!({
+            "title": "created-workspace", "path": alpha, "tool": "claude",
+            "view": "structured", "profile": "test",
+            "extra_repo_paths": [beta],
+            "worktree_enabled": true, "worktree_branch": "feat/ws", "create_new_branch": true,
+        }))
+        .unwrap();
+        let response = crate::server::api::sessions::create_session(
+            State(state.clone()),
+            Query(crate::server::api::sessions::CreateSessionQuery { wait: None }),
+            Ok(Json(body)),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), axum::http::StatusCode::CREATED);
+        let created = support::load_instances_from_disk_for_test("test")
+            .into_iter()
+            .find(|inst| inst.title == "created-workspace")
+            .expect("create persisted its row");
+        assert_eq!(
+            created.workspace_info.as_ref().map(|w| w.repos.len()),
+            Some(2),
+            "the create built a two-repo workspace"
+        );
+
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            while seen.lock().unwrap().is_empty() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the post-create spawn reaches the launcher");
+        support::assert_carries_workspace(
+            seen.lock().unwrap()[0].as_ref(),
+            &created,
+            "session_spawn acp_spawn_target",
+        );
     }
 }

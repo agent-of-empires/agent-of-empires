@@ -121,6 +121,7 @@ fn spawn_request_for(
         fork_from: instance.fork_pending.clone(),
         sandbox_continuation: crate::acp::supervisor::SandboxContinuation::Persisted,
         sandbox_info,
+        workspace_info: instance.workspace_info.clone(),
         // Passed even without sandboxing so agent_acp_cmd and worker env
         // resolve from the session's profile.
         source_profile: Some(instance.source_profile.clone()),
@@ -155,6 +156,21 @@ async fn pick_agent(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn spawn_request_for_carries_the_workspace_layout() {
+        let instance = crate::server::test_support::workspace_instance(
+            "ws-spawn-request",
+            std::path::Path::new("/tmp/aoe-ws-spawn-request"),
+        );
+        let req = spawn_request_for(&instance, "claude".into(), None);
+        crate::server::test_support::assert_carries_workspace(
+            req.workspace_info.as_ref(),
+            &instance,
+            "spawn_request_for",
+        );
+        assert_eq!(req.cwd, PathBuf::from(&instance.project_path));
+    }
 
     #[tokio::test]
     async fn agent_exited_maps_to_the_retryable_status_not_a_fault() {

@@ -58,6 +58,7 @@ pub const KNOWN_CAPABILITIES: &[&str] = &[
     "session.prompt",
     "session.unattended",
     "session.message",
+    "mcp.rewrite",
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

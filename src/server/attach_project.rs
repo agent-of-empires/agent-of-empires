@@ -286,6 +286,7 @@ async fn spawn_worker(state: &Arc<AppState>, id: &str) -> WorkerOutcome {
             fork_from: inst.fork_pending.clone(),
             sandbox_continuation: crate::acp::supervisor::SandboxContinuation::Persisted,
             sandbox_info: inst.sandbox_info.clone(),
+            workspace_info: inst.workspace_info.clone(),
             source_profile: Some(inst.source_profile.clone()),
             yolo_mode: inst.yolo_mode,
             acp_mode_id: inst.acp_mode_id.clone(),
@@ -362,5 +363,27 @@ mod tests {
             _ => panic!("an archived row must not restart its worker"),
         }
         assert_eq!(launches.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    /// The restarted worker re-resolves MCP servers from the converted workspace, so the
+    /// respawn request must carry the mirrored `workspace_info`.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn worker_restart_carries_the_converted_workspace() {
+        let _app_dir = crate::session::test_support::isolate_app_dir();
+        let dir = tempfile::tempdir().unwrap();
+        let mut inst = support::workspace_instance("attach-ws", dir.path());
+        inst.view = crate::session::View::Structured;
+        inst.status = crate::session::Status::Idle;
+        let id = inst.id.clone();
+        support::seed_instances_on_disk_for_test(&inst.source_profile, vec![inst.clone()]);
+        let (launcher, seen) = support::workspace_capturing_launcher();
+        let state = support::build_test_app_state_with_launcher(vec![inst.clone()], launcher);
+
+        spawn_worker(&state, &id).await;
+
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 1, "the worker was launched once");
+        support::assert_carries_workspace(seen[0].as_ref(), &inst, "attach_project::spawn_worker");
     }
 }

@@ -47,6 +47,7 @@ pub use reset::ResetSessionOutcome;
 pub use resolve_command::{resolve_agent_command, ResolvedAgentCommand, Unresolved};
 pub(crate) use runner::wrap_in_scope;
 pub use session_sandbox::SessionSandbox;
+pub(crate) use session_sandbox::{known_container_workdir, SandboxLayout};
 pub(crate) use spawn::host_environment_denyreason;
 pub use spawn::SpawnConfig;
 

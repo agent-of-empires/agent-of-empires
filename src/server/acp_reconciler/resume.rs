@@ -376,6 +376,7 @@ async fn build_spawn_request(
         agent_provider,
         claude_store_pin,
         prior_conversation,
+        workspace_info,
     ) = {
         let _guard = inst_lock.lock().await;
         let instances = service.instances.read().await;
@@ -394,6 +395,7 @@ async fn build_spawn_request(
             // A restart before the first worker assigned an ACP id leaves only
             // the terminal conversation id to announce replacing.
             target.stored_acp_session_id.is_none() && inst.agent_session_id.is_some(),
+            inst.workspace_info.clone(),
         )
     };
     let agent = supervisor
@@ -438,6 +440,7 @@ async fn build_spawn_request(
         fork_from,
         sandbox_continuation: crate::acp::supervisor::SandboxContinuation::Persisted,
         sandbox_info,
+        workspace_info,
         source_profile: Some(target.source_profile.clone()),
         yolo_mode: target.yolo_mode,
         acp_mode_id,
@@ -654,6 +657,29 @@ mod tests {
             .unwrap();
             assert_eq!(req.prior_conversation, expected, "{agent_id:?} {acp_id:?}");
         }
+    }
+
+    #[tokio::test]
+    async fn build_spawn_request_carries_the_workspace_layout() {
+        let mut ws = crate::server::test_support::workspace_instance(
+            "ws-resume",
+            std::path::Path::new("/tmp/aoe-ws-resume"),
+        );
+        ws.id = "sess-ws-resume".to_string();
+        ws.view = crate::session::View::Structured;
+        let state = crate::server::test_support::build_test_app_state(vec![ws.clone()]);
+
+        // The target snapshot carries no workspace; the request must read the live row.
+        let mut target = ResumeTarget::from_instance(&ws);
+        target.project_path = "/tmp/aoe-ws-resume-stale".to_string();
+        let req = build_spawn_request(&state.session_service, &target)
+            .await
+            .unwrap();
+        crate::server::test_support::assert_carries_workspace(
+            req.workspace_info.as_ref(),
+            &ws,
+            "build_spawn_request",
+        );
     }
 
     /// #4127: a request is not an observation. Building one derives the route

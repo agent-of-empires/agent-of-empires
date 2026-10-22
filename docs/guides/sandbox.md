@@ -168,6 +168,8 @@ Claude Code rotates its refresh token on every refresh and invalidates the old o
 
 A file holding no credential is seeded at the next start from the freshest of the macOS Keychain entry, `~/.claude/.credentials.json`, and any copy left in the session's store. Once it holds one, the host's copy never replaces it: from the first refresh on, the sandboxes are a credential chain of their own. Claude Code empties both tokens in place when its credential fails to authenticate, which reaches every sandbox through the shared mount and makes the file eligible for seeding again. To re-seed from a new host login, stop the sandboxes, delete `sandbox-v2/.credentials.json`, and start one. Running `/logout` inside a sandbox revokes the token for all of them.
 
+MCP servers hold credentials of their own. A plugin can rewrite what a sandboxed session receives with the [`mcp.rewrite` hook](../plugin-api.md#hooks). AoE does not copy host MCP definitions into a Claude sandbox's agent store (`.mcp.json` files inside the copied Claude `plugins/` directory are copied as they are), but other agents' MCP-bearing config files are still copied verbatim, so for those agents the hook alone does not keep host MCP secrets out of the sandbox.
+
 ### Reclaiming stores
 
 Permanently deleting a sandboxed session removes its store along with its
