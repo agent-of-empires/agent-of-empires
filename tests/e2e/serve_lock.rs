@@ -49,7 +49,7 @@ fn direct_serve_upgrades_legacy_policy_under_its_existing_transaction() {
             "serve_legacy_foreground"
         });
         h.stop_daemon_on_drop();
-        h.run_cli_ok(&["list"]);
+        h.run_cli_ok(&["migrate"]);
         let app = app_dir_in(h.home_path());
         std::fs::write(app.join(VERSION_FILE), "43").unwrap();
         std::fs::write(
