@@ -1,4 +1,6 @@
+import { execFileSync } from "node:child_process";
 import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 
 import { isolateEnv, pinnedVars, type IsolatedPaths } from "./isolatedEnv";
@@ -116,5 +118,11 @@ describe("isolateEnv", () => {
     // Pinned unconditionally: an unset GIT_CONFIG_SYSTEM still leaves the
     // daemon's git reading /etc/gitconfig.
     expect(isolateEnv({}, PATHS)).toMatchObject(pinned);
+  });
+
+  it("classifies every environment variable src/ reads", () => {
+    execFileSync(process.execPath, [fileURLToPath(new URL("../../scripts/check-env-isolation.mjs", import.meta.url))], {
+      timeout: 30_000,
+    });
   });
 });
