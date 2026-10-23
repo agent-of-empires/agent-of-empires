@@ -22,17 +22,28 @@ function workerSummary(res: AttachProjectResult): string {
  *  closing on success, since a 200 can still mean the agent did not restart. */
 export function AddProjectModal({
   title,
+  profile,
   onCancel,
   onSubmit,
   onDone,
 }: {
   title: string;
+  profile: string | undefined;
   onCancel: () => void;
   onSubmit: (project: string, attachExistingBranch: boolean) => Promise<AttachProjectResult>;
   onDone: () => void;
 }) {
   const [project, setProject] = useState("");
-  const { loading, query, setQuery, filteredSaved, filteredRecent, hasPicks } = useProjectPicker();
+  const {
+    loading,
+    error: projectsError,
+    retry,
+    query,
+    setQuery,
+    filteredSaved,
+    filteredRecent,
+    hasPicks,
+  } = useProjectPicker(profile);
   const [attachExistingBranch, setAttachExistingBranch] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
@@ -70,6 +81,14 @@ export function AddProjectModal({
         <AttachResult result={result} />
       ) : (
         <div className="px-4 py-3 flex flex-col gap-3">
+          {projectsError && (
+            <div role="alert" className="text-sm text-status-warning">
+              Saved projects could not be loaded. You can still enter a path.
+              <button type="button" onClick={retry} className="ml-2 text-brand-400 hover:underline cursor-pointer">
+                Retry
+              </button>
+            </div>
+          )}
           {!loading && hasPicks && (
             <div className="max-h-72 overflow-y-auto">
               <ProjectSearchList

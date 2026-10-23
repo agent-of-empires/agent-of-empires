@@ -5,9 +5,12 @@ use crate::session::projection::SessionProjection;
 use chrono::{DateTime, Utc};
 
 impl SessionResponse {
-    /// Build a response from a session instance plus the user's Claude Code
-    /// fullscreen-renderer preference, which surfaces only when the session's
-    /// agent is Claude.
+    /// Build a response from a session instance plus the user's current
+    /// Claude Code fullscreen-renderer preference.
+    ///
+    /// `claude_fullscreen` is the *user-level* setting (read once per
+    /// request via `crate::claude_settings::read_tui_fullscreen()`); it
+    /// surfaces on the response only when the session's agent is Claude.
     pub fn from_instance(inst: &Instance, claude_fullscreen: bool) -> Self {
         Self::from_instance_with_plan(
             inst,
@@ -20,8 +23,9 @@ impl SessionResponse {
         )
     }
 
-    /// Build a response with the per-session plan snapshot, from the REST
-    /// sessions endpoint's single bulk read of the event store (#1061).
+    /// Build a response with the per-session plan snapshot. Called from
+    /// the REST sessions endpoint after a single bulk read of the
+    /// structured view event store; see #1061.
     pub fn from_instance_with_plan(
         inst: &Instance,
         claude_fullscreen: bool,
@@ -39,17 +43,38 @@ impl SessionResponse {
         };
         let row = SessionProjection::new(inst, &inst.source_profile);
         let timestamp = |value: Option<DateTime<Utc>>| value.map(|t| t.to_rfc3339());
+        let status = if inst
+            .lifecycle_reservation
+            .as_ref()
+            .is_some_and(|reservation| reservation.op == crate::session::LifecycleOperation::Purge)
+        {
+            Status::Deleting
+        } else {
+            row.status
+        };
         Self {
+            agent_pane: inst.agent_pane.clone(),
+            auxiliary: inst.auxiliary.clone(),
             id: row.id.to_string(),
+            idempotency_key: inst.idempotency_key.clone(),
             title: row.title.to_string(),
             project_path: row.project_path.to_string(),
+            agent_session_id: inst.agent_session_id.clone(),
+            parent_session_id: row.parent_session_id.map(str::to_string),
             artifact_dir: crate::session::artifacts::artifact_dir_path(&inst.id)
                 .map(|p| p.to_string_lossy().to_string())
                 .unwrap_or_default(),
             group_path: row.group_path.to_string(),
+            sort_index: inst.sort_index,
             tool: row.tool.to_string(),
-            status: row.status.wire_str().to_string(),
+            command: row.command.to_string(),
+            extra_args: inst.extra_args.clone(),
+            status: status.wire_str().to_string(),
+            lifecycle_reservation: inst.lifecycle_reservation.clone(),
+            lifecycle_generation: inst.lifecycle_generation,
             dormant: inst.is_shown_dormant(),
+            idle_dormant_since: inst.idle_dormant_since.map(|t| t.to_rfc3339()),
+            pane_dead_observed: inst.pane_dead_observed,
             yolo_mode: inst.yolo_mode,
             created_at: row.created_at.to_rfc3339(),
             last_accessed_at: timestamp(row.last_accessed_at),
@@ -59,19 +84,27 @@ impl SessionResponse {
             main_repo_path: row.worktree.map(|w| w.main_repo_path.clone()),
             base_branch: row.worktree.and_then(|w| w.base_branch.clone()),
             base_branch_override: inst.base_branch_override.clone(),
+            worktree_created_at: inst
+                .worktree_info
+                .as_ref()
+                .map(|w| w.created_at.to_rfc3339()),
             is_sandboxed: inst.is_sandboxed(),
+            sandbox_container_name: inst.sandbox_info.as_ref().map(|s| s.container_name.clone()),
             // Worktree and workspace creation refuse a path that is not a Repository.
             outside_repository: inst.worktree_info.is_none()
                 && inst.workspace_info.is_none()
                 && outside_repository_cached(&inst.project_path),
             scratch: inst.scratch,
             favorited: inst.is_favorited(),
+            favorited_at: inst.favorited_at.map(|t| t.to_rfc3339()),
             color: inst.color.clone(),
             urgent: inst.is_urgent(),
             pinned_at: timestamp(row.pinned_at),
             archived_at: timestamp(row.archived_at),
             snoozed_until: timestamp(row.active_snoozed_until),
             trashed_at: timestamp(row.trashed_at),
+            trash_lifecycle_id: inst.trash_lifecycle_id.clone(),
+            failed_purge_forced: inst.failed_purge_forced(),
             // Surface the marker; the web gates the visual on the
             // `session.unread_indicator` setting.
             unread: inst.unread,
@@ -98,11 +131,6 @@ impl SessionResponse {
             notify_on_error: inst.notify_on_error,
             view: inst.view,
             context_resume: Some(context_resume_for(inst)),
-            queued_prompts: {
-                let mut q = inst.queued_prompts.clone();
-                q.sort_by_key(|e| e.seq);
-                q
-            },
             acp_worker_state,
             acp_worker_start: None,
             pending_approvals: Vec::new(),
@@ -134,9 +162,12 @@ impl SessionResponse {
             acp_provider: inst.agent_provider.clone(),
             // The create-time guard calls the same classifier, so the web
             // "Fork" affordance and server-side acceptance cannot drift.
-            acp_can_fork: agent_is_structured_fork_capable(&inst.tool, inst.agent_name.as_deref()),
-            // Same agent resolution as `acp_agent`, computed once here so the
-            // web dashboard and native TUI stop mirroring the gate.
+            acp_can_fork: crate::session::fork::structured_fork_capable(
+                &inst.tool,
+                inst.agent_name.as_deref(),
+            ),
+            // Same agent resolution as `acp_agent` above; computed once here so
+            // the web dashboard and native TUI stop mirroring the gate.
             keeps_context: crate::agents::acp_transcript_cli_resumable(
                 &inst.tool,
                 inst.agent_name
@@ -167,8 +198,24 @@ impl SessionResponse {
                     name: r.name.clone(),
                     source_path: r.source_path.clone(),
                     branch: r.branch.clone(),
+                    worktree_path: r.worktree_path.clone(),
+                    main_repo_path: r.main_repo_path.clone(),
+                    managed_by_aoe: r.managed_by_aoe,
+                    branch_preexisting: r.branch_preexisting,
+                    base_branch: r.base_branch.clone(),
+                    base_branch_override: r.base_branch_override.clone(),
                 })
                 .collect(),
+            workspace_dir: inst
+                .workspace_info
+                .as_ref()
+                .map(|w| w.workspace_dir.clone()),
+            workspace_branch: inst.workspace_info.as_ref().map(|w| w.branch.clone()),
+            workspace_created_at: inst
+                .workspace_info
+                .as_ref()
+                .map(|w| w.created_at.to_rfc3339()),
+            workspace_cleanup_on_delete: inst.workspace_info.as_ref().map(|w| w.cleanup_on_delete),
             warnings: Vec::new(),
             plan_summary,
             next_wakeup_at,
@@ -202,9 +249,9 @@ fn outside_repository_cached(path: &str) -> bool {
     outside
 }
 
-/// Project a stored `Plan` into the `PlanSummary` the sidebar consumes.
-/// Current step is the first non-Done entry; counts reflect the persisted step
-/// state from the agent's last PlanUpdated.
+/// Project a stored `Plan` into the lightweight `PlanSummary` shape the
+/// sidebar consumes. Current step is the first non-Done entry; counts
+/// reflect the persisted step state from the agent's last PlanUpdated.
 pub(super) fn plan_summary_from_plan(plan: crate::acp::state::Plan) -> PlanSummary {
     use crate::acp::state::PlanStepStatus;
     let total = plan.steps.len() as u32;
@@ -289,16 +336,18 @@ pub(super) fn context_resume_for(inst: &Instance) -> ContextResumeAvailability {
     }
 }
 
-/// Process-wide built-in ACP registry, built once, so `acp_capable` costs no
-/// per-row allocation.
+/// Process-wide built-in ACP registry, built once. Used to compute
+/// `SessionResponse.acp_capable` for built-in agents without allocating
+/// a registry per response row.
 fn builtin_acp_registry() -> &'static crate::acp::AgentRegistry {
     static REG: std::sync::OnceLock<crate::acp::AgentRegistry> = std::sync::OnceLock::new();
     REG.get_or_init(crate::acp::AgentRegistry::with_defaults)
 }
 
 /// True iff this custom agent can run in structured view: it declares a valid
-/// `agent_acp_cmd`, or inherits a registry-backed base via `agent_detect_as`.
-/// Built-in capability is handled in the constructor.
+/// `agent_acp_cmd`, or it inherits a registry-backed base via
+/// `agent_detect_as`. Built-in capability is handled separately in the
+/// constructor, so this only covers the custom case.
 pub(super) fn custom_agent_acp_capable(
     session: &crate::session::config::SessionConfig,
     tool: &str,
@@ -311,14 +360,15 @@ pub(super) fn custom_agent_acp_capable(
 }
 
 /// Per-request cache for `(profile, project_path)` config resolution, shared
-/// across the `list_sessions` overlays so a repo-local override is read once per
-/// unique pair rather than once per row (#2603).
+/// across the `list_sessions` overlays so a repo-local override is read from
+/// disk once per unique pair rather than once per row. See #2603.
 pub(super) struct SessionCfgCache<'a> {
     entries: HashMap<(String, String), SessionConfig>,
     /// Where this cache reports its disk reads. The counter belongs to the
-    /// request, so splitting the shared cache per overlay shows up as extra
-    /// resolutions instead of hiding behind a second private tally. There is no
-    /// counter-less constructor for the same reason.
+    /// request, not to the cache, so every cache the request opens adds to
+    /// one total: splitting the shared cache per overlay then shows up as
+    /// extra resolutions instead of hiding behind a second private tally.
+    /// There is no counter-less constructor for the same reason.
     misses: &'a std::sync::atomic::AtomicUsize,
 }
 
@@ -329,7 +379,6 @@ impl<'a> SessionCfgCache<'a> {
             misses,
         }
     }
-
     /// Resolve `(profile, project_path)`, reading from disk on first miss only.
     pub(super) fn resolve(&mut self, profile: &str, project_path: &str) -> &SessionConfig {
         let misses = self.misses;

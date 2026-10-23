@@ -49,7 +49,11 @@ test("press-and-hold drag reorders and round-trips PUT /api/workspace-ordering",
   await page.waitForTimeout(250);
   await page.mouse.move(targetBox.x + targetBox.width / 2, targetBox.y + targetBox.height / 2, { steps: 12 });
   expect((await wrappers.nth(2).getAttribute("class")) ?? "").toContain("ring-2");
+  const committed = page.waitForResponse(
+    (response) => response.url().endsWith("/api/workspace-ordering") && response.request().method() === "PUT",
+  );
   await page.mouse.up();
+  expect((await committed).ok()).toBe(true);
 
   await expect
     .poll(() => readVisibleSessionTitles(page), { timeout: 4_000 })
@@ -77,8 +81,19 @@ test("saved-unpinned hidden; pin POSTs; unpin keeps the saved project", async ({
   const sessions = await listSessions(serve.baseUrl);
   expect(sessions).toHaveLength(1);
   const repoA = sessions[0]!.project_path as string;
+  const profiles = (await (await page.request.get(`${serve.baseUrl}/api/profiles`)).json()) as Array<{
+    name: string;
+    is_default?: boolean;
+  }>;
+  const profile = profiles.find((candidate) => candidate.is_default)?.name ?? profiles[0]?.name;
+  expect(profile).toBeTruthy();
   const savedProjects = async () =>
-    (await (await page.request.get(`${serve.baseUrl}/api/projects`)).json()) as { name: string; path: string }[];
+    (await (
+      await page.request.get(`${serve.baseUrl}/api/projects?profile=${encodeURIComponent(profile!)}`)
+    ).json()) as {
+      name: string;
+      path: string;
+    }[];
 
   await page.goto(`${serve.baseUrl}/`);
   const headerA = page.locator(`[data-testid='sidebar-group-header'][data-group-id='${repoA}']`);
@@ -138,7 +153,7 @@ test("attaching a project over the daemon converts the session into a workspace"
   });
   type AttachResponse = {
     attached: { name: string; branch: string; branch_created: boolean; moved_to: string | null };
-    worker: string;
+    worker: { status: string; message?: string };
   };
   const attach = async (
     handle: ServeHandle,
@@ -155,7 +170,7 @@ test("attaching a project over the daemon converts the session into a workspace"
   const attachOk = async (...args: Parameters<typeof attach>) => {
     const { status, text } = await attach(...args);
     if (status !== 200) throw new Error(`POST projects failed: ${status} ${text}`);
-    return JSON.parse(text) as AttachResponse;
+    return (JSON.parse(text) as { outcome: AttachResponse }).outcome;
   };
 
   const created = await fetch(`${serve.baseUrl}/api/sessions`, {
@@ -176,7 +191,7 @@ test("attaching a project over the daemon converts the session into a workspace"
   expect(attached.attached.name).toBe("frontend");
   expect(attached.attached.branch).toBe("feature/attach-live");
   expect(attached.attached.branch_created).toBe(true);
-  expect(attached.worker).toBe("not_running");
+  expect(attached.worker.status).toBe("not_running");
 
   // The worktree session converts into a workspace directory holding both repos.
   const workspaceDir = attached.attached.moved_to;

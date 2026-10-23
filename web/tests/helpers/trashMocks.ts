@@ -1,6 +1,7 @@
 // Session/workspace trash mocks: the sessions list plus the trash, restore and
 // workspace-DELETE endpoints the Trash panel drives.
 
+import { randomUUID } from "node:crypto";
 import { expect, type Locator, type Page } from "@playwright/test";
 import { mockSessionShellApis, mockStaticApis } from "./apiMocks";
 import { sessionResponse } from "./sessions";
@@ -19,6 +20,13 @@ export interface TrashSession {
   /** A cleanup flag reaches the DELETE only when the session flag and its cleanup_defaults entry are both set. */
   cleanableWorktree?: boolean;
   sandboxed?: boolean;
+}
+
+interface TrashState extends TrashSession {
+  createdAt: string;
+  trashedAt: string | null;
+  trashLifecycleId: string | null;
+  lifecycleGeneration: number;
 }
 
 export interface DeleteBody {
@@ -45,7 +53,7 @@ export interface TrashMockOptions {
   groupAxis?: boolean;
 }
 
-function sessionPayload(s: TrashSession) {
+function sessionPayload(s: TrashState) {
   const cleanable = s.cleanableWorktree ?? false;
   const sandboxed = s.sandboxed ?? false;
   return sessionResponse({
@@ -59,7 +67,10 @@ function sessionPayload(s: TrashSession) {
     is_sandboxed: sandboxed,
     has_cleanable_worktree: cleanable,
     has_managed_worktree: false,
-    trashed_at: s.trashed ? new Date().toISOString() : null,
+    created_at: s.createdAt,
+    trashed_at: s.trashedAt,
+    trash_lifecycle_id: s.trashLifecycleId,
+    lifecycle_generation: s.lifecycleGeneration,
     cleanup_defaults: {
       delete_to_trash: s.deleteToTrash ?? true,
       delete_worktree: cleanable,
@@ -81,7 +92,19 @@ export async function installTrashMocks(
     deleteBodies: [],
     failTrash: false,
   };
-  const state = new Map(sessions.map((s) => [s.id, s]));
+  const createdAt = new Date().toISOString();
+  const state = new Map<string, TrashState>(
+    sessions.map((s) => [
+      s.id,
+      {
+        ...s,
+        createdAt,
+        trashedAt: s.trashed ? createdAt : null,
+        trashLifecycleId: s.trashed ? randomUUID() : null,
+        lifecycleGeneration: s.trashed ? 1 : 0,
+      },
+    ]),
+  );
   const failDelete = new Set(opts.failDeleteIds ?? []);
 
   if (opts.groupAxis) {
@@ -101,7 +124,10 @@ export async function installTrashMocks(
   await page.route("**/api/sessions", (r) => {
     if (r.request().method() !== "GET") return r.fulfill({ status: 400 });
     const live = sessions.filter((s) => !handle.deletedIds.includes(s.id)).map((s) => sessionPayload(state.get(s.id)!));
-    return r.fulfill({ json: { sessions: live, workspace_ordering: [] } });
+    return r.fulfill({
+      headers: { "aoe-runtime-epoch": "mock-runtime", "aoe-runtime-revision": "1" },
+      json: { sessions: live, workspace_ordering: [] },
+    });
   });
 
   for (const s of sessions) {
@@ -113,7 +139,14 @@ export async function installTrashMocks(
         if (r.request().method() !== "POST") return r.fulfill({ status: 400 });
         log.push(s.id);
         if (trashed && handle.failTrash) return r.fulfill({ status: 500, body: "boom" });
-        const next = { ...state.get(s.id)!, trashed };
+        const previous = state.get(s.id)!;
+        const next = {
+          ...previous,
+          trashed,
+          trashedAt: trashed ? new Date().toISOString() : null,
+          trashLifecycleId: trashed ? randomUUID() : null,
+          lifecycleGeneration: previous.lifecycleGeneration + 1,
+        };
         state.set(s.id, next);
         return r.fulfill({ json: sessionPayload(next) });
       });

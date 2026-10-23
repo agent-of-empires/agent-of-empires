@@ -259,15 +259,29 @@ impl Instance {
             .then_some(options)
     }
 
+    #[cfg(test)]
     pub(super) fn prime_agent_capture_plan(
         &self,
         options: PrimeAgentLaunchOptions,
     ) -> anyhow::Result<PrimeAgentCapturePlan> {
+        let file_watch = crate::file_watch::FileWatchService::noop();
+        self.prime_agent_capture_plan_in(options, CaptureStorage::Profiles(&file_watch))
+    }
+
+    pub(super) fn prime_agent_capture_plan_in(
+        &self,
+        options: PrimeAgentLaunchOptions,
+        stores: CaptureStorage<'_>,
+    ) -> anyhow::Result<PrimeAgentCapturePlan> {
         let store = self
             .sandbox_capture_store_dir()
             .context("managed Prime store is unavailable")?;
+        let launch_config = stores.launch_configuration(
+            &self.effective_profile(),
+            std::path::Path::new(&self.project_path),
+        )?;
         let config = self
-            .build_container_config()
+            .build_container_config(&launch_config)
             .context("cannot build Prime container configuration")?;
         self.resolve_prime_agent_capture_plan(&config, store, options)
     }
@@ -464,6 +478,39 @@ impl Instance {
         })
     }
 
+    pub(super) fn prime_root_publication(&self, fresh: bool) -> Option<PrimeRootPublication> {
+        let active = self.active_execution.as_ref()?;
+        let Some(CaptureContext::Prime {
+            plan,
+            runtime: Some(runtime),
+        }) = &active.capture
+        else {
+            return None;
+        };
+        validated_prime_root_publication(plan, runtime.observe(fresh)?.as_ref())
+    }
+
+    pub(super) fn prime_root_observation(
+        &self,
+        sid: String,
+    ) -> crate::session::poller::SessionIdObservation {
+        let mut observation =
+            crate::session::poller::SessionIdObservation::instance_sidecar(sid, None);
+        if let Some(active) = self.active_execution.as_ref().filter(|active| {
+            matches!(
+                active.capture,
+                Some(CaptureContext::Prime {
+                    runtime: Some(_),
+                    ..
+                })
+            )
+        }) {
+            observation.execution = Some(active.clone());
+            observation.scope_to(active.binding.clone());
+        }
+        observation
+    }
+
     pub(super) fn prime_live_status(&self, shell_pid: u32) -> Option<Status> {
         if let Some(observation) = self
             .prime_runtime()
@@ -564,39 +611,6 @@ impl Instance {
         }
     }
 
-    pub(super) fn prime_root_publication(&self, fresh: bool) -> Option<PrimeRootPublication> {
-        let active = self.active_execution.as_ref()?;
-        let Some(CaptureContext::Prime {
-            plan,
-            runtime: Some(runtime),
-        }) = &active.capture
-        else {
-            return None;
-        };
-        validated_prime_root_publication(plan, runtime.observe(fresh)?.as_ref())
-    }
-
-    pub(super) fn prime_root_observation(
-        &self,
-        sid: String,
-    ) -> crate::session::poller::SessionIdObservation {
-        let mut observation =
-            crate::session::poller::SessionIdObservation::instance_sidecar(sid, None);
-        if let Some(active) = self.active_execution.as_ref().filter(|active| {
-            matches!(
-                active.capture,
-                Some(CaptureContext::Prime {
-                    runtime: Some(_),
-                    ..
-                })
-            )
-        }) {
-            observation.execution = Some(active.clone());
-            observation.scope_to(active.binding.clone());
-        }
-        observation
-    }
-
     pub(super) fn prime_published_conversation(
         &self,
     ) -> Option<crate::session::poller::SessionIdObservation> {
@@ -606,7 +620,10 @@ impl Instance {
         Some(self.prime_root_observation(sid))
     }
 
-    fn attributable_prime_root(&self, publication: PrimeRootPublication) -> Option<Option<String>> {
+    fn attributable_prime_root_in(
+        &self,
+        publication: PrimeRootPublication,
+    ) -> Option<Option<String>> {
         match publication {
             PrimeRootPublication::Ready(id)
                 if !self.is_capture_excluded(
@@ -636,7 +653,7 @@ impl Instance {
             return false;
         }
         let Some(target) =
-            publication.and_then(|publication| self.attributable_prime_root(publication))
+            publication.and_then(|publication| self.attributable_prime_root_in(publication))
         else {
             return false;
         };
@@ -675,6 +692,7 @@ mod tests {
 
     #[test]
     #[serial_test::serial]
+
     fn prime_capture_plan_follows_upstream_session_directory_precedence() {
         let tmp = tempfile::tempdir().unwrap();
         let _app = crate::session::test_support::isolate_app_dir_at(&tmp.path().join("app"));
@@ -685,7 +703,7 @@ mod tests {
         admit_sandbox_fixture(&inst);
         let store = inst.sandbox_capture_store_dir().unwrap();
         std::fs::create_dir_all(&store).unwrap();
-        let mut config = inst.build_container_config().unwrap();
+        let mut config = inst.build_container_config_for_test().unwrap();
 
         let plan = inst
             .prime_agent_capture_plan_with(&config, store.clone())
@@ -897,7 +915,7 @@ mod tests {
         inst.extra_args = "--session-dir /root/.prime/agent/sessions".into();
         inst.sandbox_info = Some(test_sandbox("prime-resident", Some("/workspace/project")));
         admit_sandbox_fixture(&inst);
-        let config = inst.build_container_config().unwrap();
+        let config = inst.build_container_config_for_test().unwrap();
         let _transport = install_container_transport(tmp.path(), "prime-resident", &config.volumes);
         let parent = "018f47a6-7b80-7cc3-98a2-37b5f486b2a1";
         let newer = "018f47a6-7b80-7cc3-98a2-37b5f486b2a3";
@@ -1018,7 +1036,7 @@ mod tests {
         let parent_transcript = write_transcript(&parent_plan, parent_id);
         let parent_bytes = std::fs::read(&parent_transcript).unwrap();
         let parent_binding = {
-            let config = parent.build_container_config().unwrap();
+            let config = parent.build_container_config_for_test().unwrap();
             let _transport = install_container_transport(
                 &tmp.path().join("parent-transport"),
                 "prime-fork-parent",
@@ -1040,7 +1058,7 @@ mod tests {
             transcript_path: None,
         });
         child.agent_session_id = Some(child_id.into());
-        let config = child.build_container_config().unwrap();
+        let config = child.build_container_config_for_test().unwrap();
         let _transport = install_container_transport(
             &tmp.path().join("child-transport"),
             "prime-fork-child",

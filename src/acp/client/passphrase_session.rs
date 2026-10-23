@@ -13,7 +13,6 @@
 use std::io::Write;
 use std::path::Path;
 use std::sync::{Arc, RwLock};
-use std::time::Duration;
 
 use reqwest::header::{self, HeaderMap};
 use reqwest::StatusCode;
@@ -23,9 +22,6 @@ use super::http::HttpError;
 
 const DEVICE_BINDING_FILENAME: &str = "cli_device_binding";
 const SESSION_COOKIE_FILENAME: &str = "cli_login_session";
-/// Matches `HttpClient`'s own `DEFAULT_TIMEOUT`; a fresh client is built for
-/// the login POST (see `login_client`), so the value isn't shared directly.
-const LOGIN_TIMEOUT: Duration = Duration::from_secs(15);
 
 #[derive(Debug, Clone)]
 pub(crate) struct PassphraseSession {
@@ -91,8 +87,7 @@ pub(crate) async fn login(
     let res = client.post(url).json(&body).send().await?;
     let status = res.status();
     if !status.is_success() {
-        let body = res.text().await.unwrap_or_default();
-        return Err(map_auth_error(status, body));
+        return Err(map_auth_error(status));
     }
     let cookie = extract_session_cookie(res.headers()).ok_or(HttpError::Unauthorized)?;
     let session = PassphraseSession {
@@ -104,14 +99,14 @@ pub(crate) async fn login(
     Ok(session)
 }
 
-/// Map a non-success `/api/login` or `/api/login/elevate` response the same
-/// way: a wrong passphrase is `Unauthorized` (mirrors the daemon's own
-/// wording for both endpoints), anything else (rate limiting, a locked-out
-/// session) is a generic server error the caller surfaces verbatim.
-fn map_auth_error(status: StatusCode, body: String) -> HttpError {
+/// Authentication response bodies can reflect credentials, including transformed values.
+fn map_auth_error(status: StatusCode) -> HttpError {
     match status {
         StatusCode::UNAUTHORIZED => HttpError::Unauthorized,
-        _ => HttpError::Server { status, body },
+        _ => HttpError::Server {
+            status,
+            body: String::new(),
+        },
     }
 }
 
@@ -141,36 +136,13 @@ pub(super) async fn elevate(
     if status.is_success() {
         return Ok(());
     }
-    let body = res.text().await.unwrap_or_default();
-    Err(map_auth_error(status, body))
+    Err(map_auth_error(status))
 }
 
-/// Login secrets never follow redirects or use a proxy for a loopback destination.
 fn login_client(url: impl reqwest::IntoUrl) -> Result<(reqwest::Client, reqwest::Url), HttpError> {
     let url = url.into_url()?;
-    Ok((login_client_builder(&url).build()?, url))
-}
-
-fn login_client_builder(url: &reqwest::Url) -> reqwest::ClientBuilder {
-    let builder = reqwest::Client::builder()
-        .timeout(LOGIN_TIMEOUT)
-        .redirect(reqwest::redirect::Policy::none());
-    let builder = if crate::daemon::is_loopback_url(url) {
-        builder.no_proxy()
-    } else {
-        builder
-    };
-    if url.host_str() == Some("localhost") {
-        builder.resolve_to_addrs(
-            "localhost",
-            &[
-                std::net::SocketAddr::from(([127, 0, 0, 1], 0)),
-                std::net::SocketAddr::from((std::net::Ipv6Addr::LOCALHOST, 0)),
-            ],
-        )
-    } else {
-        builder
-    }
+    let client = crate::daemon::native_http_client(&url, true).map_err(|_| HttpError::Transport)?;
+    Ok((client, url))
 }
 
 fn extract_session_cookie(headers: &HeaderMap) -> Option<String> {
@@ -282,9 +254,21 @@ mod tests {
     use super::*;
     use crate::acp::client::discovery::Source;
 
-    fn local_endpoint(dir: &std::path::Path) -> DaemonEndpoint {
-        DaemonEndpoint::new("http://127.0.0.1:8080".into(), None, Source::LocalDaemon)
-            .with_local_passphrase_path(dir.join("serve.passphrase"))
+    fn cached_endpoint() -> (
+        crate::session::test_support::AppDirGuard,
+        crate::session::test_support::EnvGuard,
+        DaemonEndpoint,
+        std::path::PathBuf,
+    ) {
+        let app = crate::session::test_support::isolate_app_dir();
+        let env = crate::session::test_support::EnvGuard::set(&[(
+            "AOE_DAEMON_PASSPHRASE",
+            "cache-fixture",
+        )]);
+        let endpoint = DaemonEndpoint::new("http://127.0.0.1:8080".into(), None, Source::Env);
+        let cache_dir = endpoint.session_cache_dir().unwrap();
+        std::fs::create_dir_all(&cache_dir).unwrap();
+        (app, env, endpoint, cache_dir)
     }
 
     #[tokio::test]
@@ -313,7 +297,8 @@ mod tests {
             let url: reqwest::Url = format!("http://localhost:{port}/api/login")
                 .parse()
                 .unwrap();
-            let client = login_client_builder(&url)
+            let client = crate::daemon::native_http_client_builder(&url, true)
+                .unwrap()
                 .dns_resolver(Arc::new(HostileDns))
                 .build()
                 .unwrap();
@@ -366,9 +351,9 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn device_binding_secret_persists_and_reuses_across_calls() {
-        let dir = tempfile::tempdir().unwrap();
-        let endpoint = local_endpoint(dir.path());
+        let (_app, _env, endpoint, _cache_dir) = cached_endpoint();
 
         let first = device_binding_secret(&endpoint);
         let second = device_binding_secret(&endpoint);
@@ -377,11 +362,11 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn device_binding_secret_regenerates_when_file_is_invalid() {
-        let dir = tempfile::tempdir().unwrap();
-        let endpoint = local_endpoint(dir.path());
+        let (_app, _env, endpoint, cache_dir) = cached_endpoint();
         std::fs::write(
-            dir.path().join(DEVICE_BINDING_FILENAME),
+            cache_dir.join(DEVICE_BINDING_FILENAME),
             "not-valid-base64!!",
         )
         .unwrap();
@@ -401,9 +386,9 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn persist_and_load_round_trip() {
-        let dir = tempfile::tempdir().unwrap();
-        let endpoint = local_endpoint(dir.path());
+        let (_app, _env, endpoint, cache_dir) = cached_endpoint();
         let session = PassphraseSession {
             cookie: "aoe_session=xyz".to_string(),
             binding_secret: generate_binding_secret(),
@@ -413,7 +398,7 @@ mod tests {
         // device_binding_secret must be persisted too, or the loaded cookie
         // is orphaned without its matching secret.
         write_owner_only(
-            &dir.path().join(DEVICE_BINDING_FILENAME),
+            &cache_dir.join(DEVICE_BINDING_FILENAME),
             &session.binding_secret,
         );
         persist_session(&endpoint, &session);
@@ -424,26 +409,26 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn load_persisted_rejects_malformed_cookie_file() {
-        let dir = tempfile::tempdir().unwrap();
-        let endpoint = local_endpoint(dir.path());
+        let (_app, _env, endpoint, cache_dir) = cached_endpoint();
         write_owner_only(
-            &dir.path().join(DEVICE_BINDING_FILENAME),
+            &cache_dir.join(DEVICE_BINDING_FILENAME),
             &generate_binding_secret(),
         );
-        write_owner_only(&dir.path().join(SESSION_COOKIE_FILENAME), "garbage");
+        write_owner_only(&cache_dir.join(SESSION_COOKIE_FILENAME), "garbage");
 
         assert!(load_persisted(&endpoint).is_none());
     }
 
     #[test]
+    #[serial_test::serial]
     fn cache_loads_persisted_session_once_and_reuses_in_memory() {
-        let dir = tempfile::tempdir().unwrap();
-        let endpoint = local_endpoint(dir.path());
+        let (_app, _env, endpoint, cache_dir) = cached_endpoint();
         let secret = generate_binding_secret();
-        write_owner_only(&dir.path().join(DEVICE_BINDING_FILENAME), &secret);
+        write_owner_only(&cache_dir.join(DEVICE_BINDING_FILENAME), &secret);
         write_owner_only(
-            &dir.path().join(SESSION_COOKIE_FILENAME),
+            &cache_dir.join(SESSION_COOKIE_FILENAME),
             "aoe_session=cached",
         );
 
@@ -452,21 +437,21 @@ mod tests {
         assert_eq!(session.cookie, "aoe_session=cached");
 
         // Deleting the on-disk file must not affect the in-memory cache.
-        std::fs::remove_file(dir.path().join(SESSION_COOKIE_FILENAME)).unwrap();
+        std::fs::remove_file(cache_dir.join(SESSION_COOKIE_FILENAME)).unwrap();
         assert!(cache.get(&endpoint).is_some());
     }
 
     #[test]
+    #[serial_test::serial]
     fn invalidate_clears_memory_and_deletes_persisted_cookie() {
         // A persisted cookie that survives invalidation would let the very
         // next `get` reload the same rejected session straight off disk,
         // so the retry-after-401 flow would resend it unchanged.
-        let dir = tempfile::tempdir().unwrap();
-        let endpoint = local_endpoint(dir.path());
+        let (_app, _env, endpoint, cache_dir) = cached_endpoint();
         let secret = generate_binding_secret();
-        write_owner_only(&dir.path().join(DEVICE_BINDING_FILENAME), &secret);
+        write_owner_only(&cache_dir.join(DEVICE_BINDING_FILENAME), &secret);
         write_owner_only(
-            &dir.path().join(SESSION_COOKIE_FILENAME),
+            &cache_dir.join(SESSION_COOKIE_FILENAME),
             "aoe_session=cached",
         );
 
@@ -476,26 +461,62 @@ mod tests {
         cache.invalidate(&endpoint);
 
         assert!(
-            !dir.path().join(SESSION_COOKIE_FILENAME).exists(),
+            !cache_dir.join(SESSION_COOKIE_FILENAME).exists(),
             "invalidate must delete the persisted cookie file"
         );
         assert!(cache.get(&endpoint).is_none());
 
         // The device-binding secret survives: a fresh login reuses it
         // rather than binding a new "device" every time a session expires.
-        assert!(dir.path().join(DEVICE_BINDING_FILENAME).exists());
+        assert!(cache_dir.join(DEVICE_BINDING_FILENAME).exists());
     }
 
     #[test]
     fn map_auth_error_distinguishes_unauthorized_from_generic() {
         assert!(matches!(
-            map_auth_error(StatusCode::UNAUTHORIZED, "bad passphrase".into()),
+            map_auth_error(StatusCode::UNAUTHORIZED),
             HttpError::Unauthorized
         ));
         assert!(matches!(
-            map_auth_error(StatusCode::TOO_MANY_REQUESTS, "locked out".into()),
+            map_auth_error(StatusCode::TOO_MANY_REQUESTS),
             HttpError::Server { status, .. } if status == StatusCode::TOO_MANY_REQUESTS
         ));
+    }
+
+    #[tokio::test]
+    async fn authentication_failures_do_not_reflect_credentials() {
+        let (_app, _env, mut endpoint, _cache_dir) = cached_endpoint();
+        for status in [
+            StatusCode::TOO_MANY_REQUESTS,
+            StatusCode::SERVICE_UNAVAILABLE,
+        ] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            endpoint.base_url = format!("http://{}", listener.local_addr().unwrap());
+            let handler =
+                move |headers: axum::http::HeaderMap,
+                      axum::Json(body): axum::Json<serde_json::Value>| async move {
+                    assert_eq!(body["passphrase"], "cache-fixture");
+                    (status, format!("rejected body={body}, headers={headers:?}"))
+                };
+            let app = axum::Router::new()
+                .route("/api/login", axum::routing::post(handler))
+                .route("/api/login/elevate", axum::routing::post(handler));
+            let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+            let cache = PassphraseSessionCache::default();
+            let login_error = login(&endpoint, &cache).await.unwrap_err();
+            cache.set(PassphraseSession {
+                cookie: "aoe_session=fixture-cookie".into(),
+                binding_secret: "fixture-binding".into(),
+            });
+            let elevation_error = elevate(&endpoint, &cache).await.unwrap_err();
+            server.abort();
+            for error in [login_error, elevation_error] {
+                assert!(
+                    matches!(&error, HttpError::Server { status: received, body } if *received == status && body.is_empty()),
+                    "credential-bearing authentication response reached diagnostics: {error:?}"
+                );
+            }
+        }
     }
 }
 
@@ -531,7 +552,8 @@ pub(crate) mod test_daemon {
     pub(crate) struct TestDaemon {
         inner: Arc<Mutex<Inner>>,
         pub(crate) endpoint: DaemonEndpoint,
-        _dir: tempfile::TempDir,
+        _env: crate::session::test_support::EnvGuard,
+        _app: crate::session::test_support::AppDirGuard,
         server: tokio::task::JoinHandle<()>,
     }
 
@@ -546,19 +568,18 @@ pub(crate) mod test_daemon {
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let port = listener.local_addr().unwrap().port();
             let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
-            let dir = tempfile::tempdir().unwrap();
-            let path = dir.path().join("serve.passphrase");
-            std::fs::write(&path, passphrase).unwrap();
-            let endpoint = DaemonEndpoint::new(
-                format!("http://127.0.0.1:{port}"),
-                None,
-                Source::LocalDaemon,
-            )
-            .with_local_passphrase_path(path);
+            let app = crate::session::test_support::isolate_app_dir();
+            let env = crate::session::test_support::EnvGuard::set(&[(
+                "AOE_DAEMON_PASSPHRASE",
+                passphrase,
+            )]);
+            let endpoint =
+                DaemonEndpoint::new(format!("http://127.0.0.1:{port}"), None, Source::Env);
             Self {
                 inner,
                 endpoint,
-                _dir: dir,
+                _env: env,
+                _app: app,
                 server,
             }
         }

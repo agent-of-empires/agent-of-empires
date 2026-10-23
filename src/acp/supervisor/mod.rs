@@ -9,7 +9,7 @@ mod requests;
 mod sink;
 mod teardown;
 #[cfg(test)]
-mod test_support;
+pub(crate) mod test_support;
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -33,9 +33,10 @@ use super::runner_lifecycle::{
 use super::state::AcpSessionId;
 use crate::daemon::{AcpWorkerStart, AcpWorkerStartKind, AcpWorkerState};
 use crate::session::SandboxInfo;
+pub(crate) use teardown::{RetirementResources, RetirementTarget};
 
 pub(crate) use agents::apply_agent_command_override;
-pub(crate) use launch::host_spawn_environment;
+pub(crate) use launch::{host_spawn_environment, with_durable_launch};
 pub use sink::{BroadcastSink, ChannelSink};
 
 /// Post-startup respawns allowed within `RESTART_WINDOW` before the session is parked.
@@ -61,8 +62,18 @@ type Workers = Arc<Mutex<HashMap<String, WorkerHandle>>>;
 /// Per-session seq counter; outlives workers so every publisher shares one sequence.
 type SeqMap = std::sync::Mutex<HashMap<String, u64>>;
 type SharedSet = Arc<std::sync::Mutex<HashSet<String>>>;
-type ResumeCancellations = Arc<std::sync::Mutex<HashMap<String, (u64, CancellationToken)>>>;
 type RestartRequests = Arc<std::sync::Mutex<HashMap<String, (u64, CancellationToken)>>>;
+type SpawnRequests = Arc<std::sync::Mutex<SpawnRequestState>>;
+
+#[derive(Default)]
+struct SpawnRequestState {
+    /// Requests that have not reached lifecycle admission yet. A stop cancels
+    /// these before it waits on any durable launch work.
+    pending: HashMap<String, HashMap<u64, CancellationToken>>,
+    /// A stop fence remains held while the request owns its submission and
+    /// instance guards, preventing a replacement from slipping through.
+    stop_fences: HashMap<String, (u64, usize)>,
+}
 
 #[derive(Debug, Error)]
 pub enum SupervisorError {
@@ -95,6 +106,8 @@ pub enum SupervisorError {
     Blocked(crate::session::StartBlocked),
     #[error("session {0:?} no longer exists")]
     SessionGone(String),
+    #[error("native session authority unavailable")]
+    NativeStoreUnavailable,
 }
 
 /// What the caller does with prompt text after it was published.
@@ -130,6 +143,7 @@ struct WorkerHandle {
     /// Respawn timestamps inside the restart window; the initial spawn is not counted.
     restart_history: Vec<Instant>,
     kind: WorkerKind,
+    launch_epoch: u64,
     lease: Lease,
     native_session_id: Option<String>,
 }
@@ -171,14 +185,15 @@ pub struct Supervisor<S: BroadcastSink> {
     next_seqs: Arc<SeqMap>,
     /// Owner of every runner epoch. Lock order: `workers` before `lifecycle`.
     lifecycle: Arc<std::sync::Mutex<LifecycleTable>>,
-    /// Cancellation signals for launch futures admitted in the lifecycle table.
-    /// The epoch guards against an old reservation removing a newer token.
-    resume_cancellations: ResumeCancellations,
     /// Explicit restart requests currently operating on each session.
     restart_requests: RestartRequests,
     next_restart_request_id: AtomicU64,
+    spawn_requests: SpawnRequests,
+    next_spawn_request_id: AtomicU64,
+    next_stop_request_id: AtomicU64,
     process_control: Arc<dyn ProcessControl>,
     launcher: Launcher,
+    native_admission_required: bool,
     /// Agents whose first spawn finished; until then spawns serialize on a
     /// per-agent lock so a lazy adapter install is not raced.
     warmed_up_agents: SharedSet,
@@ -202,14 +217,14 @@ pub struct Supervisor<S: BroadcastSink> {
     max_concurrent_workers: u32,
 }
 
-/// RAII guard over a `Starting` or `Respawning` epoch; dropping it before
-/// install abandons the epoch so a failed resume cannot pin the session.
+/// RAII guard over a `Starting` or `Respawning` epoch. A dropped attach
+/// abandons only its observation unless an explicit stop claimed the runner.
 pub(crate) struct ResumeReservation {
     lease: Lease,
+    pub(crate) expected_lifecycle_generation: Option<u64>,
+    attach_record: Option<Box<crate::process::worker_registry::WorkerRecord>>,
     lifecycle: Arc<std::sync::Mutex<LifecycleTable>>,
     notify: Arc<tokio::sync::Notify>,
-    cancellation: CancellationToken,
-    cancellations: ResumeCancellations,
 }
 
 /// Keeps concurrent explicit restart requests from restarting the same worker twice.
@@ -218,6 +233,62 @@ pub(crate) struct RestartRequestGuard {
     request_id: u64,
     cancellation: CancellationToken,
     requests: RestartRequests,
+}
+
+/// Cancellation for a request that is still acquiring launch guards or
+/// waiting to be admitted into the Lease table.
+pub(crate) struct PendingSpawnGuard {
+    session_id: String,
+    request_id: u64,
+    cancellation: CancellationToken,
+    requests: SpawnRequests,
+}
+
+/// A stop fence that outlives the HTTP request and cancels pending spawns.
+pub(crate) struct StopRequestGuard {
+    session_id: String,
+    request_id: u64,
+    requests: SpawnRequests,
+    cancelled_pending: usize,
+    cancelled_launch: bool,
+}
+
+impl Drop for PendingSpawnGuard {
+    fn drop(&mut self) {
+        let mut requests = lock_recover(&self.requests);
+        if let Some(pending) = requests.pending.get_mut(&self.session_id) {
+            pending.remove(&self.request_id);
+            if pending.is_empty() {
+                requests.pending.remove(&self.session_id);
+            }
+        }
+    }
+}
+
+impl PendingSpawnGuard {
+    pub(crate) fn cancellation(&self) -> &CancellationToken {
+        &self.cancellation
+    }
+}
+
+impl Drop for StopRequestGuard {
+    fn drop(&mut self) {
+        let mut requests = lock_recover(&self.requests);
+        if let Some((request_id, owners)) = requests.stop_fences.get_mut(&self.session_id) {
+            if *request_id == self.request_id {
+                *owners -= 1;
+                if *owners == 0 {
+                    requests.stop_fences.remove(&self.session_id);
+                }
+            }
+        }
+    }
+}
+
+impl StopRequestGuard {
+    pub(crate) fn cancelled_target(&self) -> bool {
+        self.cancelled_pending > 0 || self.cancelled_launch
+    }
 }
 
 impl Drop for RestartRequestGuard {
@@ -248,22 +319,29 @@ impl ResumeReservation {
     }
 
     pub(crate) fn cancellation(&self) -> &CancellationToken {
-        &self.cancellation
+        self.lease.cancellation()
     }
 }
 
 impl Drop for ResumeReservation {
     fn drop(&mut self) {
-        let abandoned = lock_recover(&self.lifecycle).abandon(&self.lease);
-        let mut cancellations = lock_recover(&self.cancellations);
-        if cancellations
-            .get(self.lease.session_id())
-            .is_some_and(|(epoch, _)| *epoch == self.lease.epoch())
-        {
-            cancellations.remove(self.lease.session_id());
+        let mut lifecycle = lock_recover(&self.lifecycle);
+        if !lifecycle.construction_is_pending(&self.lease) {
+            return;
         }
-        drop(cancellations);
-        if abandoned {
+        self.lease.cancellation().cancel();
+        if self.lease.retirement_runners().next().is_none() && lifecycle.abandon(&self.lease) {
+            self.notify.notify_waiters();
+            return;
+        }
+        // abandon can refuse because a producer crossed the birth gate while
+        // we inspected it. Convert that same construction instead of losing it.
+        if lifecycle.convert_to_stopping(&self.lease) {
+            let identity = self.lease.retirement_runners().next();
+            lifecycle.settle(
+                &self.lease,
+                super::runner_lifecycle::Settlement::Unproven(identity),
+            );
             self.notify.notify_waiters();
         }
     }
@@ -287,6 +365,8 @@ pub enum SandboxContinuation {
 
 #[derive(Debug, Clone)]
 pub struct SpawnRequest {
+    pub(crate) launch_admission: Option<LaunchAdmission>,
+    pub(crate) expected_lifecycle_generation: u64,
     pub session_id: String,
     /// The ACP backend `pick_agent_for_tool` resolved.
     pub agent: String,
@@ -323,6 +403,21 @@ pub struct SpawnRequest {
     pub claude_store_pin: Option<crate::session::capture::ClaudeStorePin>,
 }
 
+#[derive(Clone)]
+pub(crate) struct LaunchAdmission {
+    pub store: Arc<dyn crate::session::SessionStore>,
+    pub generation: u64,
+    pub namespace: Option<Arc<tokio::sync::RwLock<()>>>,
+}
+
+impl std::fmt::Debug for LaunchAdmission {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LaunchAdmission")
+            .field("generation", &self.generation)
+            .finish_non_exhaustive()
+    }
+}
+
 impl<S: BroadcastSink> Supervisor<S> {
     /// Constructor with no concurrency cap.
     pub fn new(sink: Arc<S>) -> Self {
@@ -338,11 +433,14 @@ impl<S: BroadcastSink> Supervisor<S> {
             lifecycle: Arc::new(std::sync::Mutex::new(LifecycleTable::new(
                 chrono::Utc::now().timestamp_millis().max(1) as u64,
             ))),
-            resume_cancellations: Arc::default(),
             restart_requests: Arc::default(),
             next_restart_request_id: AtomicU64::new(1),
+            spawn_requests: Arc::default(),
+            next_spawn_request_id: AtomicU64::new(1),
+            next_stop_request_id: AtomicU64::new(1),
             process_control: Arc::new(SystemProcessControl::default()),
             launcher: Arc::new(|config, session_id| Box::pin(AcpClient::spawn(config, session_id))),
+            native_admission_required: false,
             warmed_up_agents: Arc::default(),
             agent_warmup_locks: Arc::default(),
             worker_notify: Arc::default(),
@@ -356,6 +454,14 @@ impl<S: BroadcastSink> Supervisor<S> {
             respawned_in_place: Arc::default(),
             max_concurrent_workers,
         }
+    }
+
+    pub(crate) fn with_native_admission(mut self) -> Self {
+        self.native_admission_required = true;
+        self
+    }
+    pub(crate) fn max_concurrent_workers(&self) -> u32 {
+        self.max_concurrent_workers
     }
 
     /// Flag a build-stale worker kept alive to finish its turn.
@@ -431,15 +537,27 @@ impl<S: BroadcastSink> Supervisor<S> {
         lock_recover(&self.lifecycle).phase(session_id).into()
     }
 
-    /// Drop per-session bookkeeping for a deleted session.
-    pub fn forget_session(&self, session_id: &str) {
+    /// Drop bookkeeping only after the matching runner retirement is proven.
+    pub fn forget_session(&self, session_id: &str) -> Result<(), SupervisorError> {
+        let mut lifecycle = lock_recover(&self.lifecycle);
+        if lifecycle.phase(session_id) == WorkerPhase::Resuming {
+            // Keep the lease until its cancelled producer has retired any runner
+            // and scope it created; the launch path will settle this stop debt.
+            let _ = lifecycle.begin_stop(session_id, "user_stopped", false);
+            drop(lifecycle);
+            self.worker_notify.notify_waiters();
+            return Err(SupervisorError::TeardownPending(session_id.into()));
+        }
+        if !lifecycle.forget(session_id) {
+            return Err(SupervisorError::TeardownPending(session_id.into()));
+        }
+        drop(lifecycle);
         if let Ok(mut guard) = self.next_seqs.lock() {
             guard.remove(session_id);
         }
-        lock_recover(&self.lifecycle).forget(session_id);
-        // Let an in-flight launch reach stale-install cleanup so it can reap its runner.
         lock_recover(&self.startup_failures).remove(session_id);
         lock_recover(&self.respawned_in_place).remove(session_id);
+        Ok(())
     }
 
     /// Seed seq counters from the event store's stored maxima.
@@ -465,6 +583,15 @@ impl<S: BroadcastSink> Supervisor<S> {
             .await
             .get(session_id)
             .is_some_and(|worker| worker.lease.epoch() == generation)
+    }
+
+    /// Automatic respawns retain the originating launch; a new launch supersedes it.
+    pub(crate) async fn is_current_launch(&self, session_id: &str, launch_epoch: u64) -> bool {
+        self.workers
+            .lock()
+            .await
+            .get(session_id)
+            .is_some_and(|worker| worker.launch_epoch == launch_epoch)
     }
 
     /// Return the native store owned by the current worker only when it still
@@ -493,22 +620,93 @@ impl<S: BroadcastSink> Supervisor<S> {
         self.workers.lock().await.len()
     }
 
-    /// Create the cancellation-aware reservation used by a launch or respawn.
-    /// Keeping this beside the lifecycle lease makes every in-flight start
-    /// observable to `shutdown`, including drain-task respawns.
-    pub(crate) fn reservation_for_lease(&self, lease: Lease) -> ResumeReservation {
-        new_reservation(
-            lease,
-            Arc::clone(&self.lifecycle),
-            Arc::clone(&self.worker_notify),
-            Arc::clone(&self.resume_cancellations),
-        )
+    /// Register an HTTP spawn before it acquires submission and instance
+    /// guards. The stop endpoint uses this token to wake that path promptly.
+    pub(crate) fn begin_spawn_request(
+        &self,
+        session_id: &str,
+    ) -> Result<PendingSpawnGuard, SupervisorError> {
+        let mut requests = lock_recover(&self.spawn_requests);
+        if requests.stop_fences.contains_key(session_id) {
+            return Err(SupervisorError::SpawnCancelled(session_id.to_string()));
+        }
+        let request_id = self.next_spawn_request_id.fetch_add(1, Ordering::Relaxed);
+        let cancellation = CancellationToken::new();
+        requests
+            .pending
+            .entry(session_id.to_string())
+            .or_default()
+            .insert(request_id, cancellation.clone());
+        Ok(PendingSpawnGuard {
+            session_id: session_id.to_string(),
+            request_id,
+            cancellation,
+            requests: Arc::clone(&self.spawn_requests),
+        })
     }
 
-    /// Cancel an admitted launch after the lifecycle table records the stop.
-    pub(crate) fn cancel_resume(&self, session_id: &str) {
-        if let Some((_, token)) = lock_recover(&self.resume_cancellations).get(session_id) {
-            token.cancel();
+    /// Fence replacement admission and cancel every spawn that has not yet
+    /// acquired a Lease. The lifecycle stop still owns any already-admitted
+    /// launch and its physical teardown.
+    pub(crate) async fn begin_stop_request(
+        &self,
+        session_id: &str,
+        reason: &str,
+        expected_lease: Option<&Lease>,
+        captured: bool,
+    ) -> StopRequestGuard {
+        let (request_id, cancelled_pending) = {
+            let mut requests = lock_recover(&self.spawn_requests);
+            let request_id =
+                if let Some((request_id, owners)) = requests.stop_fences.get_mut(session_id) {
+                    *owners += 1;
+                    *request_id
+                } else {
+                    let request_id = self.next_stop_request_id.fetch_add(1, Ordering::Relaxed);
+                    requests
+                        .stop_fences
+                        .insert(session_id.to_string(), (request_id, 1));
+                    request_id
+                };
+            let pending = requests
+                .pending
+                .get(session_id)
+                .map(|pending| pending.values().cloned().collect::<Vec<_>>())
+                .unwrap_or_default();
+            let cancelled_pending = pending
+                .iter()
+                .filter(|cancellation| !cancellation.is_cancelled())
+                .count();
+            for cancellation in pending {
+                cancellation.cancel();
+            }
+            (request_id, cancelled_pending)
+        };
+        let workers = self.workers.lock().await;
+        let cancelled_launch = {
+            let mut lifecycle = lock_recover(&self.lifecycle);
+            let matches_target = expected_lease.is_some_and(|expected| {
+                lifecycle.current_lease(session_id).as_ref() == Some(expected)
+            });
+            if !captured || matches_target {
+                let was_cancelled = lifecycle
+                    .current_lease(session_id)
+                    .is_some_and(|lease| lifecycle.cancel_requested(&lease).is_some());
+                lifecycle.request_stop(session_id, reason) && !was_cancelled
+            } else {
+                false
+            }
+        };
+        drop(workers);
+        if cancelled_launch {
+            self.worker_notify.notify_waiters();
+        }
+        StopRequestGuard {
+            session_id: session_id.to_string(),
+            request_id,
+            requests: Arc::clone(&self.spawn_requests),
+            cancelled_pending,
+            cancelled_launch,
         }
     }
 
@@ -537,26 +735,6 @@ impl<S: BroadcastSink> Supervisor<S> {
         if let Some((_, cancellation)) = lock_recover(&self.restart_requests).get(session_id) {
             cancellation.cancel();
         }
-    }
-}
-
-pub(super) fn new_reservation(
-    lease: Lease,
-    lifecycle: Arc<std::sync::Mutex<LifecycleTable>>,
-    notify: Arc<tokio::sync::Notify>,
-    cancellations: ResumeCancellations,
-) -> ResumeReservation {
-    let cancellation = CancellationToken::new();
-    lock_recover(&cancellations).insert(
-        lease.session_id().to_string(),
-        (lease.epoch(), cancellation.clone()),
-    );
-    ResumeReservation {
-        lease,
-        lifecycle,
-        notify,
-        cancellation,
-        cancellations,
     }
 }
 

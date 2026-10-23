@@ -1301,6 +1301,35 @@ mod tests {
         ] {
             assert!(parse_skill_md(bad).is_err(), "{bad:?}");
         }
+
+        for description in [
+            "colon: value",
+            "hash # value",
+            "quotes \"double\" and 'single'",
+            "Résumé 漢字",
+            "first line\nsecond line",
+        ] {
+            let content = scaffold("yaml-boundary", description).unwrap();
+            let parsed = parse_skill_md(&content).unwrap();
+            assert_eq!(parsed.name, "yaml-boundary");
+            assert_eq!(parsed.description, description);
+            assert_eq!(parsed.body, format!("\n# yaml-boundary\n\n{description}\n"));
+        }
+        let aliased = parse_skill_md("---\nname: &name yaml-boundary\ndescription: *name\nvendor: {ignored: [true, on, 001]}\n---\nbody\n").unwrap();
+        assert_eq!(aliased.description, "yaml-boundary");
+        assert_eq!(aliased.body, "body\n");
+        let block = parse_skill_md(
+            "---\nname: yaml-boundary\ndescription: |\n  first: line\n  second # line\n---\nbody",
+        )
+        .unwrap();
+        assert_eq!(block.description, "first: line\nsecond # line\n");
+        for invalid in [
+            "---\nname: foo\nname: duplicate\ndescription: d\n---\n",
+            "---\nname: foo\ndescription: d\ndescription: duplicate\n---\n",
+            "---\nname: [\ndescription: d\n---\n",
+        ] {
+            assert!(parse_skill_md(invalid).is_err(), "{invalid:?}");
+        }
     }
 
     #[test]

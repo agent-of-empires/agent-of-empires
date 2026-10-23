@@ -3,10 +3,10 @@
 
 use crate::acp::agent_profiles::AgentProfile;
 use crate::acp::background_agent::{spawn_tailer, TailerStart, TranscriptSource};
-use crate::acp::state::Event;
-use crate::acp::task_transcript::spawn_task_tailer;
+use crate::acp::state::{BackgroundTaskLaunch, Event};
+use crate::acp::task_transcript::{spawn_task_tailer, ActiveTasks};
 use agent_client_protocol::schema::v1::{SessionId, SessionNotification, SessionUpdate};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::sync::mpsc;
@@ -72,9 +72,8 @@ pub(super) struct Shared {
     compaction: std::sync::Mutex<CompactionTracker>,
     pub(super) tool_context_cache: ToolContextCache,
     bg_transcript_source: TranscriptSource,
-    /// Background tasks with a live transcript tailer, which removes its id
-    /// when the task ends.
-    pub(super) bg_tasks: Arc<std::sync::Mutex<HashSet<String>>>,
+    pub(super) bg_tasks: Arc<ActiveTasks>,
+    claude_home: Option<std::path::PathBuf>,
 }
 
 impl Shared {
@@ -88,6 +87,7 @@ impl Shared {
         prompt_in_flight: Arc<AtomicBool>,
         sandbox: Option<&SessionSandbox>,
         ingress: Arc<SessionIngress>,
+        claude_home: Option<std::path::PathBuf>,
     ) -> Self {
         // A sandboxed session's sub-agent transcripts live in the container.
         let bg_transcript_source = match sandbox {
@@ -119,6 +119,7 @@ impl Shared {
             tool_context_cache: Arc::new(std::sync::Mutex::new(ToolCallContextCache::default())),
             bg_transcript_source,
             bg_tasks: Arc::default(),
+            claude_home,
         }
     }
 
@@ -290,49 +291,61 @@ impl Shared {
                 );
                 continue;
             }
-            let started_task = match &event {
-                Event::BackgroundTaskStarted { task_id, .. } => {
-                    // A sandboxed session's transcript lives in the container,
-                    // which is not read, so its tasks are not tracked.
-                    if !matches!(self.bg_transcript_source, TranscriptSource::Host) {
-                        continue;
-                    }
-                    Some(task_id.clone())
+            if let Event::BackgroundTaskStarted {
+                task_id,
+                tool_call_id,
+                ..
+            } = &event
+            {
+                if !matches!(self.bg_transcript_source, TranscriptSource::Host) {
+                    continue;
                 }
-                _ => None,
-            };
-            update_tool_context_cache(&self.tool_context_cache, &event, &update_for_tool_context);
-            if self.event_tx.send(event).await.is_err() {
-                break;
-            }
-            // After the start is queued, so a task that already ended cannot
-            // have its finish overtake it.
-            if let Some(task_id) = started_task {
                 spawn_task_tailer(
-                    task_id,
+                    BackgroundTaskLaunch {
+                        task_id: task_id.clone(),
+                        tool_call_id: tool_call_id.clone(),
+                    },
                     session_id.clone(),
+                    self.claude_home.clone(),
                     self.bg_tasks.clone(),
                     self.event_tx.downgrade(),
                     TailerStart::Live,
-                );
+                    Some(event),
+                )
+                .await;
+                if self.event_tx.is_closed() {
+                    break;
+                }
+                continue;
+            }
+            update_tool_context_cache(&self.tool_context_cache, &event, &update_for_tool_context);
+            if self.event_tx.send(event).await.is_err() {
+                break;
             }
         }
     }
 
     /// Re-tail tasks a previous daemon left open: their end may already be in
     /// the transcript, so each tailer reads it from the start.
-    pub(super) fn resume_task_tailing(&self, session_id: &str, task_ids: Vec<String>) {
+    pub(super) async fn resume_task_tailing(
+        &self,
+        session_id: &str,
+        tasks: Vec<BackgroundTaskLaunch>,
+    ) {
         if !matches!(self.bg_transcript_source, TranscriptSource::Host) {
             return;
         }
-        for task_id in task_ids {
+        for task in tasks {
             spawn_task_tailer(
-                task_id,
+                task,
                 session_id.to_string(),
+                self.claude_home.clone(),
                 self.bg_tasks.clone(),
                 self.event_tx.downgrade(),
                 TailerStart::Resumed,
-            );
+                None,
+            )
+            .await;
         }
     }
 

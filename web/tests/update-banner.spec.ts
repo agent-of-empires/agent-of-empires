@@ -4,7 +4,12 @@ import { Page } from "@playwright/test";
 
 async function mockBase(page: Page) {
   await mockStaticApis(page);
-  await page.route("**/api/sessions", (r) => r.fulfill({ json: { sessions: [], workspace_ordering: [] } }));
+  await page.route("**/api/sessions", (r) =>
+    r.fulfill({
+      headers: { "aoe-runtime-epoch": "mock-runtime", "aoe-runtime-revision": "1" },
+      json: { sessions: [], workspace_ordering: [] },
+    }),
+  );
 }
 
 test.describe("Update banner (#984, #1140)", () => {

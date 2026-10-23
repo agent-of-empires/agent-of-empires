@@ -58,10 +58,8 @@ pub(super) enum ClientCmd {
     /// `Supervisor::attach` once, right after the connection is up, so
     /// tracking resumes instead of the panel showing them as detached.
     ResumeBackgroundTailing(Vec<(String, String)>),
-    /// Spawn a transcript tailer for each task id: background tasks a
-    /// previous daemon left open. Issued by `Supervisor::attach` right after
-    /// the connection is up.
-    ResumeTaskTailing(Vec<String>),
+    /// Re-tail the exact background task launches a previous daemon left open.
+    ResumeTaskTailing(Vec<crate::acp::state::BackgroundTaskLaunch>),
     #[cfg(test)]
     FlushForTest(oneshot::Sender<()>),
     CloseSession(oneshot::Sender<super::close::CloseSessionOutcome>),

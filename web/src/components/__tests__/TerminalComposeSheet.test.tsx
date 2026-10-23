@@ -10,7 +10,7 @@ function renderSheet(draftKey: string, delivered = true) {
   const onSubmit = vi.fn<(text: string, submit: boolean) => boolean>(() => delivered);
   const onClose = vi.fn<(refocusTerminal: boolean) => void>();
   const utils = render(
-    <TerminalComposeSheet draftKey={draftKey} bottomInset={0} onSubmit={onSubmit} onClose={onClose} />,
+    <TerminalComposeSheet readOnly={false} draftKey={draftKey} bottomInset={0} onSubmit={onSubmit} onClose={onClose} />,
   );
   const text = screen.getByLabelText<HTMLTextAreaElement>("Message");
   const type = (value: string) => fireEvent.input(text, { target: { value } });

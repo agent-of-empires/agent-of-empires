@@ -653,16 +653,16 @@ impl ContainerRuntime {
         name: &str,
         image: &str,
         config: &ContainerConfig,
-    ) -> Result<String> {
+    ) -> Result<(String, bool)> {
         if self.does_container_exist(name)? {
             return Err(DockerError::ContainerAlreadyExists(name.to_string()));
         }
         match self.base.run_create(name, image, config) {
             Err(error) if is_runtime_timeout(&error) => match self.inspect_container_id(name) {
-                Ok(id) => Ok(id),
+                Ok(id) => Ok((id, false)),
                 Err(_) => Err(error),
             },
-            result => result,
+            result => result.map(|id| (id, true)),
         }
     }
 

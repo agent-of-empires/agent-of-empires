@@ -21,12 +21,14 @@ pub mod login;
 mod mcp;
 mod pane;
 pub mod passkeys;
+pub(crate) mod peer;
 pub mod plugin_status;
 pub mod push;
 pub mod push_send;
 pub mod rate_limit;
 pub(crate) mod reload;
 pub(crate) mod router;
+pub(crate) mod runtime;
 #[cfg(target_os = "linux")]
 pub(crate) mod runtime_uds;
 pub(crate) mod runtime_ws;
@@ -35,6 +37,7 @@ pub(crate) mod serve_snapshot;
 pub(crate) mod session_identity;
 pub(crate) mod session_service;
 pub(crate) mod session_spawn;
+pub(crate) mod session_store;
 pub(crate) mod sleep_inhibit;
 pub(crate) mod startup;
 pub(crate) mod startup_recovery;
@@ -54,7 +57,7 @@ pub mod tunnel;
 /// `crate::server::` so existing supervisor/WS call sites keep resolving without churn.
 pub use crate::acp::protocol::AcpBroadcastFrame;
 pub(crate) use access::{is_untrusted_ip_literal, is_wildcard_bind, norm_host};
-pub(crate) use acp_events::{apply_status_intent, derive_acp_status};
+pub(crate) use acp_events::derive_acp_status;
 #[cfg(feature = "web")]
 pub use assets::web_build_id;
 
@@ -72,7 +75,7 @@ pub(crate) use sleep_inhibit::{
     SLEEP_INHIBIT_SNAPSHOT_ENABLED, SLEEP_INHIBIT_SNAPSHOT_SLOT_PRESENT,
 };
 pub(crate) use startup::resolve_auth_mode;
-pub use startup::{start_server, ServerConfig};
+pub(crate) use startup::{start_server, ServerConfig};
 pub use state::{AppState, CleanupDefaultsCache};
 pub(crate) use token::generate_token;
 pub use token::TokenManager;
