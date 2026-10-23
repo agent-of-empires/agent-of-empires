@@ -108,6 +108,7 @@ pub const DEFAULT_TARGET_ROOTS: &[&str] = &[
     "tmux",
     "http",
     "serve",
+    "server",
     "runtime",
     "hooks",
     "sound",
@@ -146,6 +147,28 @@ pub const KNOWN_SUB_TARGETS: &[&str] = &[
     "git.command",
     "web.client",
     "log.runtime",
+    "migrations.v036",
+    "migrations.v037",
+    "migrations.v038",
+    "migrations.v039",
+    "migrations.v040",
+    "migrations.v041",
+    "migrations.v043",
+    "migrations.v044",
+    "migrations.v045",
+    "migrations.v046",
+    "migrations.v047",
+    "migrations.v048",
+    "server.file_watch",
+    "server.lifecycle",
+    "server.idle_reap",
+    "server.runtime",
+    "server.session_service",
+    "server.session_store",
+    "server.sleep_inhibit",
+    "server.maintenance",
+    "server.status",
+    "server.sessions",
     "runtime.uds",
     "runtime.ws",
 ];
@@ -873,14 +896,14 @@ fn apply_filter_file(path: &std::path::Path) {
             previous = %swap.previous,
             current = %swap.current,
             source = "file-watch",
-            "runner filter swapped"
+            "filter swapped"
         ),
         Ok(_) => {}
         Err(e) => tracing::warn!(
             target: "log.runtime",
             error = %e,
             directive = %directive,
-            "runner filter swap failed"
+            "filter swap failed"
         ),
     }
     #[cfg(debug_assertions)]

@@ -166,7 +166,6 @@ impl Fixture {
         for name in ["default", "zeta"] {
             std::fs::create_dir_all(app_dir.join("profiles").join(name)).expect("extra profile");
         }
-        // Disable network-dependent update notices and keep the default profile explicit.
         std::fs::write(
             app_dir.join("config.toml"),
             format!("default_profile = \"{PROFILE}\"\n\n[updates]\nupdate_check_mode = \"off\"\n"),
@@ -693,7 +692,7 @@ async fn unreadable_profiles_preserve_inventory_and_healthy_aggregate_rows() {
         } else {
             std::fs::create_dir_all(fixture.app_dir().join("profiles").join(name)).unwrap();
         }
-        let served = compare_transports(
+        let served = compare_transports_with(
             &fixture,
             &[
                 &["profile"],
@@ -702,11 +701,22 @@ async fn unreadable_profiles_preserve_inventory_and_healthy_aggregate_rows() {
             ],
             usize::MAX,
             &[&["profile"]],
+            |args, served, local| {
+                if args.first().is_none_or(|arg| arg != "list") {
+                    assert_same(args, served, local);
+                    return;
+                }
+                assert_eq!(served.stdout, local.stdout, "{name}: {}", args.join(" "));
+                assert_eq!(served.exit, local.exit, "{name}: {}", args.join(" "));
+                for answer in [served, local] {
+                    assert!(answer.stderr.contains(name), "{name}: {}", answer.stderr);
+                }
+            },
         )
         .await;
-        for answer in &served {
-            assert_eq!(answer.exit, 0, "{name}: {}", answer.stderr);
-        }
+        assert_eq!(served[0].exit, 0);
+        assert_eq!(served[1].exit, 0);
+        assert_eq!(served[2].exit, 1);
         assert!(served[0].stdout.contains(name));
         let rows: Vec<serde_json::Value> = serde_json::from_str(&served[2].stdout).unwrap();
         let mut actual: Vec<_> = rows
@@ -836,6 +846,21 @@ async fn compare_transports(
     refusals_from: usize,
     not_witnessed: &[&[&str]],
 ) -> Vec<Run> {
+    compare_transports_with(fixture, commands, refusals_from, not_witnessed, assert_same).await
+}
+
+async fn compare_transports_with(
+    fixture: &Fixture,
+    commands: &[&[&str]],
+    refusals_from: usize,
+    not_witnessed: &[&[&str]],
+    compare: impl Fn(&[String], &Run, &Run),
+) -> Vec<Run> {
+    // Normalize caller-prepared data before caching or comparing either transport.
+    tokio::task::spawn_blocking(agent_of_empires::migrations::run_migrations)
+        .await
+        .expect("the fixture migration task joins")
+        .expect("migrate the fixture before publishing its read cache");
     let xdg_base = fixture.path().join(".config");
     let state = build_test_app_state_with_policy(
         daemon_instances(),
@@ -883,7 +908,7 @@ async fn compare_transports(
 
     for (args, expected) in &served {
         let local = run(home.clone(), args.clone()).await;
-        assert_same(args, expected, &local);
+        compare(args, expected, &local);
     }
 
     // Verify which answers are unchanged by emptying the local session registry.

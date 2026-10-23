@@ -102,11 +102,47 @@ pub struct AcpRunnerArgs {
     /// the registry record and compared against the restart marker.
     #[arg(long, default_value_t = 0)]
     pub generation: u64,
+    /// Native row generation authorized at physical birth; distinct from runner epoch.
+    #[arg(long)]
+    pub lifecycle_generation: Option<u64>,
+    /// Exact transient unit created by this launch, absent for an unscoped runner.
+    #[arg(long)]
+    pub systemd_scope: Option<String>,
     #[arg(long)]
     pub prime_runtime: Option<String>,
     /// Agent program + args after `--`.
     #[arg(last = true, required = true)]
     pub agent_argv: Vec<String>,
+}
+
+fn native_registration_guard(
+    args: &AcpRunnerArgs,
+) -> Result<Option<(crate::session::Storage, crate::session::StorageFlock)>> {
+    let Some(expected_generation) = args.lifecycle_generation else {
+        return Ok(None);
+    };
+    anyhow::ensure!(
+        !args.source_profile.is_empty(),
+        "native runner has no source profile"
+    );
+    let storage = crate::session::Storage::open_unwatched(&args.source_profile)?;
+    let lifecycle = storage.acquire_instance_lifecycle_lock(&args.session_id)?;
+    let row = storage
+        .load()?
+        .into_iter()
+        .find(|row| row.id == args.session_id)
+        .ok_or(crate::session::SessionGone)?;
+    row.ensure_startable()?;
+    anyhow::ensure!(
+        row.lifecycle_generation == expected_generation
+            && row.is_structured()
+            && row.terminal_handoff.is_none()
+            && row.launch_is_finalized()
+            && row.status != crate::session::Status::Stopped
+            && !row.is_idle_dormant(),
+        crate::session::LifecycleReservationError::Superseded
+    );
+    Ok(Some((storage, lifecycle)))
 }
 
 pub async fn run(args: AcpRunnerArgs) -> Result<()> {
@@ -145,7 +181,7 @@ pub async fn run(args: AcpRunnerArgs) -> Result<()> {
 
     // Save the record before spawning so a save failure has no agent tree to leak.
     let our_pid = std::process::id();
-    let record = WorkerRecord::new(
+    let mut record = WorkerRecord::new(
         args.session_id.clone(),
         our_pid,
         args.socket.clone(),
@@ -163,23 +199,19 @@ pub async fn run(args: AcpRunnerArgs) -> Result<()> {
         },
     )
     .with_generation(args.generation);
-    let mut record = record;
+    record.scope = args
+        .systemd_scope
+        .as_ref()
+        .map(|unit| worker_registry::ScopeOwnership::Owned { unit: unit.clone() })
+        .unwrap_or(worker_registry::ScopeOwnership::Unscoped);
     record.prime_runtime = args
         .prime_runtime
         .as_deref()
         .map(serde_json::from_str)
         .transpose()
         .context("parsing Prime runtime")?;
-    let control_listener =
-        worker_registry::register_runner(&record).context("registering runner ownership")?;
-
-    let (mut agent_child, agent_stdin, agent_stdout, agent_stderr) = match spawn_agent(&args) {
-        Ok(handles) => handles,
-        Err(e) => {
-            worker_registry::delete(&args.session_id).ok();
-            return Err(e).with_context(|| format!("spawning agent {:?}", args.agent_argv));
-        }
-    };
+    let (control_listener, mut agent_child, agent_stdin, agent_stdout, agent_stderr) =
+        register_and_spawn_agent(&args, &record)?;
     let agent_started_at = std::time::Instant::now();
 
     // Drain stderr so the child cannot block on a full pipe.
@@ -464,6 +496,29 @@ async fn self_terminate_agent_tree(
     }
 }
 
+fn register_and_spawn_agent(
+    args: &AcpRunnerArgs,
+    record: &WorkerRecord,
+) -> Result<(
+    tokio::net::UnixListener,
+    Child,
+    tokio::process::ChildStdin,
+    tokio::process::ChildStdout,
+    Option<tokio::process::ChildStderr>,
+)> {
+    // Stop commits either before registration or after the complete agent birth.
+    let _native_admission = native_registration_guard(args)?;
+    let listener =
+        worker_registry::register_runner(record).context("registering runner ownership")?;
+    match spawn_agent(args) {
+        Ok((child, stdin, stdout, stderr)) => Ok((listener, child, stdin, stdout, stderr)),
+        Err(error) => {
+            worker_registry::delete(&args.session_id).ok();
+            Err(error).with_context(|| format!("spawning agent {:?}", args.agent_argv))
+        }
+    }
+}
+
 fn spawn_agent(
     args: &AcpRunnerArgs,
 ) -> Result<(
@@ -627,6 +682,92 @@ fn open_log_file(path: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn native_registration_rejects_stopped_and_superseded_births_before_agent_spawn() {
+        use crate::session::{Instance, Status, Storage, View};
+        let _home = crate::session::test_support::isolate_app_dir();
+        let project = tempfile::tempdir().unwrap();
+        let marker = project.path().join("agent-born");
+        let mut row = Instance::new("native registration", project.path().to_str().unwrap());
+        row.source_profile = "default".into();
+        row.view = View::Structured;
+        row.status = Status::Running;
+        row.lifecycle_generation = 5;
+        crate::server::test_support::seed_instances_on_disk_for_test("default", vec![row.clone()]);
+        let mut args = AcpRunnerArgs {
+            socket: worker_registry::socket_path_for(&row.id).unwrap(),
+            session_id: row.id.clone(),
+            agent_name: "sh".into(),
+            agent_key: "claude".into(),
+            cwd: project.path().to_owned(),
+            model: None,
+            additional_dirs: Vec::new(),
+            provider_env_keys: Vec::new(),
+            stored_acp_session_id: None,
+            source_profile: "default".into(),
+            generation: 97,
+            lifecycle_generation: Some(5),
+            systemd_scope: None,
+            prime_runtime: None,
+            agent_argv: vec!["sh".into(), "-c".into(), "printf born > agent-born".into()],
+        };
+        let record = WorkerRecord::new(
+            row.id.clone(),
+            std::process::id(),
+            args.socket.clone(),
+            "sh".into(),
+            "claude".into(),
+            project.path().to_owned(),
+            None,
+            Vec::new(),
+            Vec::new(),
+            None,
+            Some("default".into()),
+        )
+        .with_generation(args.generation);
+        let storage = Storage::open_unwatched("default").unwrap();
+        storage
+            .update(|rows, _| {
+                rows[0].lifecycle_generation = 6;
+                rows[0].status = Status::Stopped;
+                rows[0].mark_idle_dormant();
+                Ok(())
+            })
+            .unwrap();
+        assert!(register_and_spawn_agent(&args, &record).is_err());
+        assert!(!marker.exists());
+        assert!(worker_registry::load(&row.id).unwrap().is_none());
+        assert!(!crate::process::worker::control_socket_sibling(&args.socket).exists());
+
+        // An explicit later resume cannot admit the original, delayed constructor.
+        storage
+            .update(|rows, _| {
+                rows[0].lifecycle_generation = 7;
+                rows[0].status = Status::Idle;
+                rows[0].idle_dormant_since = None;
+                Ok(())
+            })
+            .unwrap();
+        assert!(register_and_spawn_agent(&args, &record).is_err());
+        assert!(!marker.exists());
+        args.lifecycle_generation = Some(7);
+        let stop_path = worker_registry::workers_dir()
+            .unwrap()
+            .join(format!("{}.stop", row.id));
+        std::fs::write(&stop_path, b"undecodable stop intent").unwrap();
+        assert!(register_and_spawn_agent(&args, &record).is_err());
+        assert!(!marker.exists());
+        std::fs::remove_file(stop_path).unwrap();
+
+        let (listener, mut child, stdin, stdout, stderr) =
+            register_and_spawn_agent(&args, &record).unwrap();
+        assert!(child.wait().await.unwrap().success());
+        assert_eq!(std::fs::read(marker).unwrap(), b"born");
+        drop((listener, stdin, stdout, stderr));
+        worker_registry::retire_selected(&record).unwrap();
+    }
 
     #[cfg(unix)]
     #[tokio::test]

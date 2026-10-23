@@ -90,6 +90,25 @@ pub(super) fn background_command_launched_from_value(v: &serde_json::Value) -> O
     Some(Event::MonitorArmed { description: None })
 }
 
+/// The background task such a `Bash` launch started, so the session stays busy
+/// until the task ends (reported through the session transcript, see
+/// `crate::acp::task_transcript`).
+pub(super) fn background_task_started_from_value(v: &serde_json::Value) -> Option<Event> {
+    let cc = v.get("_meta")?.get("claudeCode")?;
+    if cc.get("toolName").and_then(|t| t.as_str()) != Some("Bash") {
+        return None;
+    }
+    let task_id = cc.get("toolResponse")?.get("backgroundTaskId")?.as_str()?;
+    Some(Event::BackgroundTaskStarted {
+        task_id: task_id.to_string(),
+        tool_call_id: v
+            .get("toolCallId")
+            .and_then(|id| id.as_str())
+            .map(str::to_string),
+        description: String::new(),
+    })
+}
+
 /// A Claude async sub-agent launch, arriving as `_meta.claudeCode` with
 /// `toolName: "Agent"` and a `toolResponse` whose `status` is
 /// `"async_launched"`. `agentId` is the only required field; anything else
@@ -139,6 +158,34 @@ mod tests {
         ));
         assert!(background_command_launched_from_value(&launched("Read", bg)).is_none());
         assert!(background_command_launched_from_value(&launched(
+            "Bash",
+            serde_json::json!({"stdout": "ok"})
+        ))
+        .is_none());
+    }
+
+    #[test]
+    fn background_command_launch_starts_a_task() {
+        let update = |tool: &str, response: serde_json::Value| {
+            serde_json::json!({
+                "toolCallId": "toolu_1",
+                "_meta": {"claudeCode": {"toolName": tool, "toolResponse": response}},
+            })
+        };
+        let bg = serde_json::json!({"stdout": "", "backgroundTaskId": "byiee4aex"});
+        match background_task_started_from_value(&update("Bash", bg.clone())) {
+            Some(Event::BackgroundTaskStarted {
+                task_id,
+                tool_call_id,
+                ..
+            }) => {
+                assert_eq!(task_id, "byiee4aex");
+                assert_eq!(tool_call_id.as_deref(), Some("toolu_1"));
+            }
+            other => panic!("expected BackgroundTaskStarted, got {other:?}"),
+        }
+        assert!(background_task_started_from_value(&update("Read", bg)).is_none());
+        assert!(background_task_started_from_value(&update(
             "Bash",
             serde_json::json!({"stdout": "ok"})
         ))

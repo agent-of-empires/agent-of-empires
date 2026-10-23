@@ -83,7 +83,7 @@ fn schema_v30_runs_pr_conversation_migrations() -> Result<()> {
     fs::write(app.join(".schema_version"), "30")?;
     fs::write(
         &sessions,
-        r#"[{"agent_session_id":"legacy","retroactive_capture_excludes":["excluded"]}]"#,
+        r#"[{"id":"3030303030303030","agent_session_id":"legacy","retroactive_capture_excludes":["excluded"]}]"#,
     )?;
 
     agent_of_empires::migrations::run_migrations()?;

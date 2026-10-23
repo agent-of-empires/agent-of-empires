@@ -64,7 +64,6 @@ impl HomeView {
             None => {}
         }
     }
-
     pub fn sort_order(&self) -> SortOrder {
         self.sort_order
     }
@@ -90,39 +89,157 @@ impl HomeView {
         }
     }
 
-    /// Select `session_id`, expanding its collapsed group so the row exists.
-    /// No-op when the session is gone.
+    /// Reveal the original session through profile-qualified canonical expansion.
     pub fn select_and_reveal_session(&mut self, session_id: &str) {
-        let Some(inst) = self.get_instance(session_id) else {
-            return;
+        if let Err(error) = self.reveal_session(session_id, false) {
+            self.info_dialog = Some(InfoDialog::sized_to_fit(
+                "Session Not Revealed",
+                &error.to_string(),
+            ));
+        }
+    }
+
+    pub(super) fn reveal_session(&mut self, id: &str, attach: bool) -> anyhow::Result<bool> {
+        let row = self
+            .session_feed
+            .applied_session(id)
+            .ok_or_else(|| anyhow::anyhow!("The original session is unavailable"))?;
+        let intent = NamespaceIntent::Reveal {
+            epoch: self
+                .session_feed
+                .applied_epoch()
+                .unwrap_or_default()
+                .to_owned(),
+            profile: row.profile.clone(),
+            id: row.id.clone(),
+            generation: row.lifecycle_generation,
+            created_at: row.created_at.clone(),
+            group: row.group_path.clone(),
+            attach,
         };
-        let target_profile = inst.source_profile.clone();
-        let group_path = match self.group_by {
-            GroupByMode::Project => Some(project_group_key(inst)),
-            GroupByMode::Org => Some(self.org_group_key(inst)),
-            GroupByMode::Manual => Some(inst.group_path.clone()).filter(|p| !p.is_empty()),
+        self.continue_reveal(intent)
+    }
+
+    pub(super) fn continue_reveal(&mut self, intent: NamespaceIntent) -> anyhow::Result<bool> {
+        let NamespaceIntent::Reveal {
+            epoch,
+            profile,
+            id,
+            generation,
+            created_at,
+            group,
+            attach,
+        } = &intent
+        else {
+            anyhow::bail!("No reveal is owed");
         };
-        self.selected_session = Some(session_id.to_string());
-        self.selected_group = None;
-        self.selected_group_profile = None;
-        if let Some(gpath) = group_path {
-            match self.group_by {
-                GroupByMode::Project => {
-                    self.project_group_collapsed.insert(gpath, false);
-                }
-                GroupByMode::Org => {
-                    self.org_group_collapsed.insert(gpath, false);
-                }
-                GroupByMode::Manual => {
-                    if let Some(tree) = self.group_trees.get_mut(&target_profile) {
-                        tree.set_collapsed(&gpath, false);
-                    }
+        let valid = self.session_feed.applied_epoch() == Some(epoch.as_str())
+            && self.session_feed.applied_session(id).is_some_and(|row| {
+                row.profile == *profile
+                    && row.lifecycle_generation == *generation
+                    && row.created_at == *created_at
+                    && row.group_path == *group
+                    && row.trashed_at.is_none()
+                    && row.archived_at.is_none()
+            });
+        if !valid {
+            self.pending_created_attach = None;
+            anyhow::bail!("The original session identity or runtime epoch changed; reveal and attachment cancelled");
+        }
+        let Some(instance) = self.get_instance(id) else {
+            anyhow::bail!("Native metadata is not yet available for the original session");
+        };
+        match self.group_by {
+            GroupByMode::Project => {
+                let key = project_group_key(instance);
+                self.project_group_collapsed.insert(key, false);
+                self.save_project_group_collapsed();
+            }
+            GroupByMode::Org => {
+                let key = self.org_group_key(instance);
+                self.org_group_collapsed.insert(key, false);
+                self.save_org_group_collapsed();
+            }
+            GroupByMode::Manual => {
+                let path = self.session_feed.applied_snapshot().and_then(|snapshot| {
+                    snapshot
+                        .contents
+                        .profiles
+                        .iter()
+                        .find(|candidate| candidate.name == *profile)
+                        .and_then(|owner| {
+                            owner
+                                .groups
+                                .iter()
+                                .filter(|candidate| {
+                                    candidate.collapsed
+                                        && (candidate.path == *group
+                                            || group
+                                                .strip_prefix(candidate.path.as_str())
+                                                .is_some_and(|tail| tail.starts_with('/')))
+                                })
+                                .min_by_key(|candidate| candidate.path.len())
+                                .map(|candidate| candidate.path.clone())
+                        })
+                });
+                if let Some(path) = path {
+                    let location = crate::daemon::GroupLocation {
+                        profile: profile.clone(),
+                        path,
+                    };
+                    self.set_group_collapsed(location, false, intent)?;
+                    return Ok(false);
                 }
             }
-            self.rebuild_flat_items();
         }
-        if let Some(pos) = self.session_row(session_id) {
-            self.cursor = pos;
+        self.rebuild_flat_items();
+        let position = self
+            .session_row(id)
+            .ok_or_else(|| anyhow::anyhow!("The original session is not visible in this view"))?;
+        self.cursor = position;
+        self.update_selected();
+        self.preview_scroll_offset = 0;
+        self.manual_unread_hold = None;
+        if *attach {
+            self.pending_created_attach = Some((
+                epoch.clone(),
+                profile.clone(),
+                id.clone(),
+                *generation,
+                created_at.clone(),
+            ));
+        }
+        Ok(true)
+    }
+
+    pub(in crate::tui) fn take_created_attach(&mut self) -> Option<String> {
+        let (epoch, profile, id, generation, created_at) = self.pending_created_attach.as_ref()?;
+        let identity_matches = self.session_feed.applied_epoch() == Some(epoch.as_str())
+            && self.session_feed.applied_session(id).is_some_and(|row| {
+                row.profile == *profile
+                    && row.lifecycle_generation == *generation
+                    && row.created_at == *created_at
+                    && row.trashed_at.is_none()
+                    && row.archived_at.is_none()
+            });
+        if !self.session_feed.mutations_available() || !identity_matches {
+            self.pending_created_attach = None;
+            return None;
+        }
+        if !self.session_feed.current_snapshot_applied() {
+            return None;
+        }
+        self.pending_created_attach
+            .take()
+            .map(|(_, _, id, _, _)| id)
+    }
+
+    pub(super) fn offer_retained_reveal(&mut self) {
+        if self.retained_reveal.is_some() {
+            self.confirm_dialog = Some(ConfirmDialog::new(
+                "Reveal Not Changed", "The original reveal is retained. Retry only after reviewing the current canonical state. A changed epoch or target cancels attachment.",
+                "resume_reveal",
+            ).buttons("Retry", "Keep Draft"));
         }
     }
 }

@@ -25,7 +25,11 @@ pub(super) async fn repair_missing_terminal(state: &Arc<AppState>) {
         let instances = state.instances.read().await;
         instances
             .iter()
-            .filter(|i| i.is_structured() && i.status == crate::session::Status::Running)
+            .filter(|i| {
+                i.is_structured()
+                    && i.terminal_handoff.is_none()
+                    && i.status == crate::session::Status::Running
+            })
             .map(|i| i.id.clone())
             .collect()
     };

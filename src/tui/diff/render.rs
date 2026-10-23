@@ -33,36 +33,26 @@ fn truncate_left(s: &str, max_width: usize) -> String {
 
 impl DiffView {
     pub fn render(&mut self, frame: &mut Frame, area: Rect, theme: &Theme) {
-        // Clear the area
         frame.render_widget(Clear, area);
-
-        // If branch select dialog is open, render it
         if self.branch_select.is_some() {
             self.render_with_branch_dialog(frame, area, theme);
-            return;
+        } else {
+            let layout = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([
+                    Constraint::Length(3),
+                    Constraint::Min(10),
+                    Constraint::Length(3),
+                ])
+                .split(area);
+            self.render_header(frame, layout[0], theme);
+            self.render_content(frame, layout[1], theme);
+            self.render_footer(frame, layout[2], theme);
+            if self.show_help {
+                self.render_help(frame, area, theme);
+            }
         }
-
-        // Main layout: header, content, footer
-        let layout = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([
-                Constraint::Length(3), // Header
-                Constraint::Min(10),   // Content
-                Constraint::Length(3), // Footer
-            ])
-            .split(area);
-
-        self.render_header(frame, layout[0], theme);
-        self.render_content(frame, layout[1], theme);
-        self.render_footer(frame, layout[2], theme);
-
-        // Render help overlay if active
-        if self.show_help {
-            self.render_help(frame, area, theme);
-        }
-
-        // Render warning dialog on top of everything
-        if let Some(ref mut dialog) = self.warning_dialog {
+        if let Some(dialog) = &mut self.warning_dialog {
             dialog.render(frame, area, theme);
         }
     }
@@ -93,6 +83,20 @@ impl DiffView {
             ),
             Span::styled("vs ", Style::default().fg(theme.dimmed)),
             Span::styled(&self.base_branch, Style::default().fg(theme.accent)),
+            Span::styled(
+                if self.base_save.is_some()
+                    && self.base_save_branch.as_deref() != Some(self.base_branch.as_str())
+                {
+                    " [not saved; prior save pending]"
+                } else if self.base_save.is_some() {
+                    " [saving]"
+                } else if self.base_unsaved {
+                    " [not saved]"
+                } else {
+                    ""
+                },
+                Style::default().fg(theme.waiting),
+            ),
             Span::styled("  |  ", Style::default().fg(theme.border)),
             Span::styled(
                 format!("{} changed", file_count),
