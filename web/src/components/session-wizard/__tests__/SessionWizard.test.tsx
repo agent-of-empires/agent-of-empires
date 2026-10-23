@@ -765,7 +765,7 @@ describe("SessionWizard served-profile authority", () => {
   const settings = (profile: string) => ({
     session: { yolo_mode_default: profile === "Beta", agent_command_override: { claude: profile + "-claude" } },
     worktree: { enabled: true },
-    acp: { default_new_session_view: "terminal" },
+    acp: { structured_view: "terminal" },
   });
   const open = (label: string) => fireEvent.click(screen.getByText(label).closest("button")!);
   const chooseProfile = async (profile: string) => {
