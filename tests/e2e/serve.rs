@@ -83,6 +83,36 @@ fn login_status_required(port: u16, token: &str) -> Result<bool, String> {
     })
 }
 
+fn assert_original_passphrase_login(h: &TuiTestHarness, passphrase: &str) {
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    use base64::Engine;
+
+    let url = primary_serve_url(h).expect("successor URL");
+    let (port, token) = serve_url_parts(&url).expect("successor endpoint");
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    runtime.block_on(async {
+        let response = reqwest::Client::builder()
+            .no_proxy()
+            .timeout(Duration::from_secs(3))
+            .build()
+            .unwrap()
+            .post(format!("http://127.0.0.1:{port}/api/login"))
+            .bearer_auth(token)
+            .json(&serde_json::json!({
+                "passphrase": passphrase,
+                "device_binding_secret": URL_SAFE_NO_PAD.encode([0x5Au8; 32]),
+            }))
+            .send()
+            .await
+            .expect("successor login response");
+        assert_eq!(
+            response.status(),
+            reqwest::StatusCode::OK,
+            "successor rejected the original passphrase"
+        );
+    });
+}
+
 fn wait_for_published_dashboard(h: &TuiTestHarness) -> (u16, String) {
     wait_until(Duration::from_secs(30), Duration::from_millis(100), || {
         let url = primary_serve_url(h).ok_or("serve.url missing")?;
@@ -2819,6 +2849,7 @@ fn tui_local_restart_preserves_the_env_passphrase_gate() {
         "Local restart dropped the passphrase gate (successor PID {successor}); \
          /api/login/status reported required=false"
     );
+    assert_original_passphrase_login(&h, "e2e-local-restart-gate");
 }
 
 /// Issue #4896: the preserved credential must come from the recorded launch,
@@ -2871,6 +2902,7 @@ fn tui_local_restart_preserves_the_gate_without_the_env_variable() {
         "Local restart from a TUI without AOE_SERVE_PASSPHRASE dropped the gate \
          (successor PID {successor}); /api/login/status reported required=false"
     );
+    assert_original_passphrase_login(&h, "e2e-local-restart-gate");
 
     h.wait_for("R: restart");
     std::fs::remove_file(app_dir_in(h.home_path()).join("serve.passphrase")).unwrap();
@@ -2941,6 +2973,7 @@ fn cli_serve_restart_replays_the_recorded_passphrase_gate() {
         wait_for_login_status(&h),
         "CLI restart dropped the recorded passphrase gate"
     );
+    assert_original_passphrase_login(&h, "e2e-cli-restart-gate");
 }
 
 /// Regression guard for the sink consolidation (issue #1124): the daemon
