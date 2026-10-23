@@ -53,10 +53,7 @@ function CopyCommand({ command }: { command: string }) {
         )}
       </button>
       {/* Always mounted so screen readers announce the change. */}
-      <span
-        role="status"
-        className={`self-center ${result ? "pr-2" : ""} ${result === "failed" ? "text-status-error" : "text-status-running"}`}
-      >
+      <span role="status" className={`self-center text-text-primary ${result ? "pr-2" : ""}`}>
         {result === "copied" ? "Copied" : result === "failed" ? "Couldn't copy. Select and copy it." : ""}
       </span>
     </span>

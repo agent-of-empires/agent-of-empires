@@ -126,12 +126,17 @@ describe("UpdateBanner", () => {
       expect(writeClipboard).toHaveBeenLastCalledWith("aoe update");
       const feedback = button.parentElement!.querySelector("[role='status']")!;
       expect(feedback.textContent).toBe("Copied");
+      // The feedback is small text on surface-900, where resolved.rs holds text-primary at AA;
+      // status-running is 2.96:1 there in Latte. The state colour stays on the icon.
+      const textToken = () => feedback.className.match(/(?:^|\s)(text-[a-z-]+)/g)?.map((c) => c.trim());
+      expect(textToken()).toEqual(["text-text-primary"]);
       await act(async () => vi.advanceTimersByTime(2000));
       expect(screen.queryByText("Copied")).toBeNull();
 
       writeClipboard.mockResolvedValueOnce(false);
       await act(async () => fireEvent.click(button));
       expect(feedback.textContent).toBe("Couldn't copy. Select and copy it.");
+      expect(textToken()).toEqual(["text-text-primary"]);
       expect(window.getSelection()?.toString()).toBe("aoe update");
     } finally {
       vi.useRealTimers();
