@@ -764,7 +764,7 @@ fn inspect_temporary_markers(dir: RawFd) -> Result<(), ReadFailure> {
                 }
                 Ok(_) => return Err(ReadFailure::pre("marker_invalid")),
                 Err(error) if error.is_eof() => continue,
-                Err(_) => return Err(ReadFailure::pre("marker_invalid")),
+                Err(_) => return Err(undecodable_temporary_marker(&name)),
             },
             TempKind::Postbind => match serde_json::from_slice::<PostbindMarker>(&bytes) {
                 Ok(value)
@@ -780,7 +780,7 @@ fn inspect_temporary_markers(dir: RawFd) -> Result<(), ReadFailure> {
                 }
                 Ok(_) => return Err(ReadFailure::pre("marker_invalid")),
                 Err(error) if error.is_eof() => continue,
-                Err(_) => return Err(ReadFailure::pre("marker_invalid")),
+                Err(_) => return Err(undecodable_temporary_marker(&name)),
             },
         };
         if content_uuid != suffix {
@@ -792,6 +792,18 @@ fn inspect_temporary_markers(dir: RawFd) -> Result<(), ReadFailure> {
         }
     }
     Ok(())
+}
+
+fn undecodable_temporary_marker(name: &str) -> ReadFailure {
+    ReadFailure::pre_exact(
+        "marker_invalid",
+        format!(
+            "daemon read: marker_invalid\nThis client cannot decode temporary publication marker {name}.\n\
+             Check CLI/Daemon version compatibility. Before removing this file, stop any Daemon using \
+             this app directory through its manager (or `aoe serve --stop`) and verify no publisher \
+             remains. Remove only the named file if it is abandoned, then retry.\n"
+        ),
+    )
 }
 
 #[derive(Clone, Copy)]

@@ -292,6 +292,36 @@ fn unknown_publication_schema_never_authorizes_bootstrap() {
     }
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+#[parallel]
+fn malformed_temporaries_identify_the_file_without_starting_or_removing_it() {
+    use std::os::unix::fs::PermissionsExt;
+
+    for kind in ["prebind", "postbind"] {
+        let fixture = Fixture::new();
+        let migrated = fixture.run(&["migrate"]);
+        assert!(migrated.status.success(), "{migrated:?}");
+        std::fs::set_permissions(&fixture.app, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let name = format!("runtime.{kind}.json.tmp.11111111-2222-3333-4444-555555555555");
+        let path = fixture.app.join(&name);
+        std::fs::write(&path, b"{]").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+        let output = fixture.run(&["list", "--json"]);
+        assert_refused(&output, "daemon read: marker_invalid");
+        assert_eq!(output.status.code(), Some(2));
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains(&name), "missing marker identity: {stderr}");
+        assert!(
+            stderr.contains("aoe serve --stop"),
+            "missing recovery command: {stderr}"
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), b"{]");
+        fixture.assert_not_started();
+    }
+}
+
 #[tokio::test]
 #[parallel]
 async fn peer_refusals_never_switch_to_a_live_local_daemon() {
