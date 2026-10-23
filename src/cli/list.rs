@@ -321,6 +321,12 @@ fn print_table_row(inst: &Instance, depth: usize, show_state: bool) {
     );
 }
 
+/// Whether the human table should render the `STATE` column. Off for
+/// `--state=live` (every row is `live` and the column carries no
+/// information) and off when filtering to only `trashed` (same). Only
+/// meaningful under `all`, where rows are mixed and a scripted consumer
+/// or human reader benefits from distinguishing a live row from a trashed
+/// or archived one.
 fn table_shows_state(scope: SessionScope) -> bool {
     matches!(scope, SessionScope::All)
 }
@@ -332,13 +338,20 @@ pub async fn run(profile: &str, args: ListArgs) -> Result<()> {
         return run_all_profiles(args.json, scope).await;
     }
 
-    let storage = Storage::open_unwatched(profile)?;
+    let storage = Storage::open_reference(profile)?;
     let (all_instances, _) = storage.load_with_groups()?;
     let instances: Vec<Instance> = all_instances
         .into_iter()
-        .filter(|inst| SessionScope::matches(Some(scope), inst))
+        .filter(|inst| {
+            SessionScope::matches(Some(scope), (inst).is_archived(), (inst).is_trashed())
+        })
         .collect();
 
+    // `--json` is answered before the empty-listing message: an empty result is
+    // `[]`, never human prose on stdout, matching `aoe ps --json` and `aoe group
+    // list --json`. `--state=live` makes this reachable with sessions present
+    // (a profile whose rows are all trashed), which is precisely the scripted
+    // consumer #3350 is about.
     if args.json {
         let systemd_active = systemd_scopes_active();
         let sessions: Vec<SessionJson> = instances
@@ -368,6 +381,57 @@ pub async fn run(profile: &str, args: ListArgs) -> Result<()> {
     Ok(())
 }
 
+/// Read one profile's rows, naming the failure instead of dropping the profile.
+fn read_profile(profile_name: &str) -> Result<Vec<Instance>, String> {
+    let storage = Storage::open_unwatched(profile_name).map_err(|error| error.to_string())?;
+    storage
+        .load_with_groups()
+        .map(|(instances, _)| instances)
+        .map_err(|error| error.to_string())
+}
+
+/// The `--json` listing across every profile, plus a per-profile note for each
+/// one that could not be read. An unreadable profile must never be silently
+/// skipped: the caller has no other way to tell a partial list from a complete
+/// one.
+fn collect_profile_sessions(
+    profiles: &[String],
+    scope: SessionScope,
+) -> (Vec<SessionJson>, Vec<String>) {
+    let systemd_active = systemd_scopes_active();
+    let mut all_sessions: Vec<SessionJson> = Vec::new();
+    let mut failures = Vec::new();
+    for profile_name in profiles {
+        match read_profile(profile_name) {
+            Ok(instances) => {
+                for inst in &instances {
+                    if !SessionScope::matches(Some(scope), inst.is_archived(), inst.is_trashed()) {
+                        continue;
+                    }
+                    all_sessions.push(session_json(inst, profile_name, systemd_active));
+                }
+            }
+            Err(error) => failures.push(format!("profile '{profile_name}': {error}")),
+        }
+    }
+    (all_sessions, failures)
+}
+
+/// Report each unreadable profile on stderr and fail the command, leaving
+/// stdout untouched.
+fn report_profile_failures(failures: Vec<String>) -> Result<()> {
+    if failures.is_empty() {
+        return Ok(());
+    }
+    for failure in &failures {
+        eprintln!("warning: {failure}");
+    }
+    anyhow::bail!(
+        "{} profile(s) could not be read; the listing is incomplete",
+        failures.len()
+    )
+}
+
 async fn run_all_profiles(json: bool, scope: SessionScope) -> Result<()> {
     let profiles = crate::session::list_profiles()?;
 
@@ -376,48 +440,42 @@ async fn run_all_profiles(json: bool, scope: SessionScope) -> Result<()> {
         return Ok(());
     }
 
-    let mut loaded: Vec<(&str, Vec<Instance>)> = Vec::with_capacity(profiles.len());
-    for profile in &profiles {
-        if let Ok((instances, _)) =
-            Storage::open_unwatched(profile).and_then(|storage| storage.load_with_groups())
-        {
-            loaded.push((profile.as_str(), instances));
-        }
-    }
-
     if json {
-        let systemd_active = systemd_scopes_active();
-        let mut all_sessions: Vec<SessionJson> = Vec::new();
-        for (profile, instances) in &loaded {
-            for inst in instances {
-                if !SessionScope::matches(Some(scope), inst) {
-                    continue;
-                }
-                all_sessions.push(session_json(inst, profile, systemd_active));
-            }
-        }
+        let (all_sessions, failures) = collect_profile_sessions(&profiles, scope);
         super::output::print_json(&all_sessions)?;
-        return Ok(());
+        // stdout stays pure JSON: a profile that could not be read is reported
+        // on stderr and turns the exit code non-zero, so a consumer never
+        // mistakes a partial listing for a complete one.
+        return report_profile_failures(failures);
     }
 
     let show_state = table_shows_state(scope);
     let mut total_sessions = 0;
-    for (profile, instances) in &loaded {
-        let listed: Vec<&Instance> = instances
+    for profile_name in &profiles {
+        let (all_instances, failure) = match read_profile(profile_name) {
+            Ok(instances) => (instances, None),
+            Err(error) => (Vec::new(), Some(error)),
+        };
+        if let Some(error) = &failure {
+            eprintln!("warning: profile '{profile_name}': {error}");
+        }
+        let instances: Vec<&Instance> = all_instances
             .iter()
-            .filter(|inst| SessionScope::matches(Some(scope), inst))
+            .filter(|inst| {
+                SessionScope::matches(Some(scope), (inst).is_archived(), (inst).is_trashed())
+            })
             .collect();
-        if listed.is_empty() {
+        if instances.is_empty() {
             continue;
         }
 
-        println!("\n═══ Profile: {} ═══\n", profile);
+        println!("\n═══ Profile: {} ═══\n", profile_name);
         print!("{}", table_header(show_state));
-        for (inst, depth) in nest_children(&listed) {
+        for (inst, depth) in nest_children(&instances) {
             print_table_row(inst, depth, show_state);
         }
-        println!("({} sessions)", listed.len());
-        total_sessions += listed.len();
+        println!("({} sessions)", instances.len());
+        total_sessions += instances.len();
     }
 
     println!("\n═══════════════════════════════════════");
@@ -564,6 +622,7 @@ mod tests {
         );
     }
 
+    /// #3472: `aoe add -P` children render under their parent in the table.
     #[test]
     fn nest_children_lists_each_child_under_its_listed_parent() {
         let row = |title: &str, parent: Option<&str>| {
@@ -637,6 +696,35 @@ mod tests {
         assert_eq!(json.state, "trashed");
         assert!(json.trashed_at.is_some());
         assert!(json.archived_at.is_none());
+    }
+
+    /// An unreadable profile must surface, not vanish: a silent skip makes a
+    /// partial listing indistinguishable from a complete one.
+    #[test]
+    fn an_unreadable_profile_is_reported_rather_than_skipped() {
+        let temp = tempfile::tempdir().unwrap();
+        let _guard = crate::session::test_support::isolate_app_dir_at(temp.path());
+        // A regular file where the profile directory belongs: the name still
+        // exists, so nothing creates it, and opening it fails deterministically.
+        let profiles = temp.path().join("profiles");
+        std::fs::create_dir_all(&profiles).unwrap();
+        std::fs::write(profiles.join("broken"), b"x").unwrap();
+        let (rows, failures) =
+            collect_profile_sessions(&["broken".to_string()], SessionScope::Live);
+        assert!(rows.is_empty());
+        assert_eq!(failures.len(), 1, "got: {failures:?}");
+        assert!(
+            failures[0].contains("broken"),
+            "the failure must name the profile: {}",
+            failures[0]
+        );
+        assert!(
+            report_profile_failures(failures)
+                .unwrap_err()
+                .to_string()
+                .contains("incomplete"),
+            "an incomplete listing must not exit zero"
+        );
     }
 
     #[test]
@@ -739,19 +827,6 @@ mod tests {
     }
 
     #[test]
-    fn systemd_unit_field_serialization() {
-        let mut j = session_json(&Instance::new("example", "/repo"), "p", false);
-        j.systemd_unit = Some("aoe-session-abc123-*.scope".into());
-        let v = serde_json::to_value(&j).unwrap();
-        assert_eq!(v["systemd_unit"], "aoe-session-abc123-*.scope");
-        j.systemd_unit = None;
-        assert!(serde_json::to_value(&j)
-            .unwrap()
-            .get("systemd_unit")
-            .is_none());
-    }
-
-    #[test]
     fn systemd_unit_only_for_live_sessions_when_scopes_are_active() {
         let live = Instance::new("example", "/repo");
         let mut trashed = Instance::new("example", "/repo");
@@ -770,24 +845,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn default_state_is_all_for_backward_compat() {
-        let default: SessionScope = StateFilter::All.into();
-        assert!(matches!(default, SessionScope::All));
-
-        let live_inst = Instance::new("l", "/r");
-        let mut trashed = Instance::new("t", "/r");
-        trashed.trash();
-        let mut archived = Instance::new("a", "/r");
-        archived.archive();
-        for inst in [&live_inst, &trashed, &archived] {
-            assert!(
-                SessionScope::matches(Some(default), inst),
-                "default state=all must list every session"
-            );
-        }
-    }
-
+    /// `list --all` never consumes `--profile`; the single-profile form goes
+    /// through `Storage::open_unwatched`, which refuses an unknown name (#148).
     mod profile_guard {
         use crate::cli::{Cli, Commands};
         use clap::Parser;

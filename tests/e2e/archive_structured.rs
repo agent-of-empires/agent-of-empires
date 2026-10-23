@@ -16,11 +16,35 @@ fn archive_case(name: &str, kill_pane: bool) {
     let (port, session_id) = h.start_structured_session(name);
     h.prompt_until_accepted(&session_id, "hello", Duration::from_secs(30));
 
-    // Named so `kill_ancillary_tmux_sessions()` sweeps it for this session.
+    // Archive requires verified ownership, not only a matching tool name.
     let tool_name = agent_of_empires::tmux::ToolSession::new(&session_id, name, "tooltest")
         .session_name()
         .to_string();
     h.tmux_new_detached(&tool_name, "sleep 600");
+    let target = format!("={tool_name}:");
+    let owner = serde_json::to_string(&(&session_id, "tooltest")).unwrap();
+    let mark = h
+        .tmux()
+        .args([
+            "set-option",
+            "-t",
+            &target,
+            "@aoe_tool_owner",
+            &owner,
+            ";",
+            "set-option",
+            "-t",
+            &target,
+            "@aoe_kind",
+            "tool",
+        ])
+        .output()
+        .expect("mark archive tool fixture ownership");
+    assert!(
+        mark.status.success(),
+        "mark archive tool fixture failed: {}",
+        String::from_utf8_lossy(&mark.stderr)
+    );
     assert!(h.tmux_has_session(&tool_name));
 
     tokio::runtime::Runtime::new()

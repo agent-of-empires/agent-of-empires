@@ -253,7 +253,8 @@ fn restore_or_remove(key: &str, prev: Option<OsString>) {
 }
 
 pub(crate) fn isolate_app_dir() -> AppDirGuard {
-    let temp_home = TempDir::new().expect("create tempdir for AppDirGuard");
+    // Private Unix sockets must fit Darwin's sockaddr_un even when TMPDIR is long.
+    let temp_home = TempDir::new_in("/tmp").expect("create tempdir for AppDirGuard");
     let path = temp_home.path().to_path_buf();
     install_env_vars(path, Some(temp_home))
 }

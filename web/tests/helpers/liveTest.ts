@@ -57,6 +57,18 @@ export function authHeaders(handle: ServeHandle): Record<string, string> {
   return out;
 }
 
+/** Confirm a real elevation prompt with this browser's bound login session. Does not replay the denied action. */
+export async function confirmPassphraseElevation(page: Page, handle: ServeHandle): Promise<void> {
+  const dialog = page.getByRole("dialog").filter({ hasText: "Confirm passphrase" });
+  await expect(dialog).toBeVisible({ timeout: 5_000 });
+  await dialog.locator('input[type="password"]').fill(handle.passphrase!);
+  await dialog.getByRole("button", { name: "Confirm", exact: true }).click();
+  await expect(dialog).toHaveCount(0, { timeout: 5_000 });
+  const status = await page.evaluate(async () => (await fetch("/api/login/status")).json());
+  expect(status).toMatchObject({ required: true, authenticated: true, elevated: true });
+  expect(status.principal).not.toBe("local_owner");
+}
+
 /**
  * Authenticate the page and open the SPA at `/`, then route client-side: in passphrase mode a hard
  * navigation elsewhere carries no device-binding header and redirects to /login.

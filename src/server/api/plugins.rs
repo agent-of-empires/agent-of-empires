@@ -1,6 +1,9 @@
-//! Plugin management REST API: list plugins and enable/disable them, the web
-//! twin of `aoe plugin`. The enable/disable toggle runs on the host, so it
-//! requires read-write mode and an elevated session when login is enabled.
+//! Plugin management REST API: list plugins and enable/disable them. The web
+//! twin of `aoe plugin`.
+//!
+//! The enable/disable toggle is a mutation that runs on the host, so it
+//! requires read-write mode AND an elevated session when login is enabled,
+//! mirroring the requires-elevation settings fields.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -16,38 +19,27 @@ use serde_json::json;
 use super::{api_error, AppState};
 use crate::plugin;
 use crate::plugin::install::OperationLog;
-use crate::server::auth::{handler_elevated, AuthenticatedSession, LoopbackTrusted};
+use crate::server::auth::{handler_elevated, AuthenticatedSession, LocalAuthorization};
 
 const CAP_COMPOSER_READ: &str = "composer.read";
 const CAP_SESSION_READ: &str = "session.read";
 
-/// Resolve the read-only and elevation gates shared by every mutation.
-/// Elevation goes through `handler_elevated`, so a loopback-trusted caller
-/// passes without a session: the bypass paths never insert
-/// `AuthenticatedSession`, and treating that as not-elevated made these
-/// mutations unreachable from localhost (#2610).
+/// Apply mutation restrictions before resolving the authenticated principal.
 async fn mutation_gate(
     state: &AppState,
     session: Option<&AuthenticatedSession>,
-    loopback_trusted: bool,
+    local: Option<&LocalAuthorization>,
 ) -> Result<(), Response> {
     if state.read_only {
-        return Err(api_error(
-            StatusCode::FORBIDDEN,
-            "read_only",
-            "Server is in read-only mode",
-        ));
+        return Err(super::read_only_response());
     }
-    // CityHall renders the Plugins tab read-only: install / uninstall / enable /
-    // update all mutate host state, and elevation is no barrier for a
-    // locked-down user holding the passphrase or running `--auth=none` (#7).
+    // Host-side plugin changes remain forbidden in CityHall mode.
     if let Some(resp) = super::cityhall_block(state) {
         return Err(resp);
     }
-    if !handler_elevated(state, session, loopback_trusted).await {
-        return Err(api_error(
-            StatusCode::FORBIDDEN,
-            "elevation_required",
+    if !handler_elevated(state, session, local.is_some()).await {
+        return Err(super::api_error_with_code_header(
+            crate::daemon::ApiErrorCode::ElevationRequired,
             "Re-enter the passphrase to continue",
         ));
     }
@@ -55,12 +47,16 @@ async fn mutation_gate(
 }
 
 /// `GET /api/plugins`: every known plugin plus load errors.
-pub async fn list_plugins() -> Json<serde_json::Value> {
+pub async fn list_plugins(State(state): State<std::sync::Arc<AppState>>) -> Response {
+    if let Some(resp) = super::cityhall_block(&state) {
+        return resp;
+    }
     let registry = plugin::registry();
     Json(json!({
         "plugins": registry.all().iter().map(|p| p.view()).collect::<Vec<_>>(),
         "load_errors": registry.load_errors(),
     }))
+    .into_response()
 }
 
 /// Resolve a declared plugin file (`icon_asset`, page `entry`) against its
@@ -95,11 +91,18 @@ fn content_type_for_icon(path: &std::path::Path) -> Option<&'static str> {
     }
 }
 
-/// `GET /api/plugins/{id}/icon`: stream an installed plugin's `icon_asset` from
-/// its install directory. Like `serve_sound_file`, the manifest path is
-/// re-validated and re-joined rather than trusted from a cached URL. A builtin
-/// or a plugin with no `icon_asset` 404s.
-pub async fn serve_plugin_icon(Path(id): Path<String>) -> Response {
+/// `GET /api/plugins/{id}/icon`: stream an installed plugin's `icon_asset`
+/// from its install directory. Mirrors `serve_sound_file`'s allowlist-then-read
+/// shape: the manifest path is re-validated and re-joined against the
+/// plugin's own directory rather than trusted from a cached URL. A builtin
+/// (no install directory) or a plugin with no `icon_asset` 404s.
+pub async fn serve_plugin_icon(
+    State(state): State<std::sync::Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Response {
+    if let Some(resp) = super::cityhall_block(&state) {
+        return resp;
+    }
     let registry = plugin::registry();
     let Some(plugin) = registry.all().iter().find(|p| p.id() == id) else {
         return StatusCode::NOT_FOUND.into_response();
@@ -247,8 +250,9 @@ pub async fn mint_plugin_page_ticket(
 }
 
 /// One active plugin command, normalized for the dashboard command palette and
-/// keymap: the namespaced `fqid`, its keybind chords, and its optional
-/// client-executed `action`.
+/// keymap: the namespaced `fqid`, its declared keybind chords, and its optional
+/// client-executed `action`. The web binds and renders these without parsing
+/// raw manifests.
 #[derive(Serialize)]
 struct PluginCommandView {
     fqid: String,
@@ -260,10 +264,13 @@ struct PluginCommandView {
     action: Option<aoe_plugin_api::ClientAction>,
 }
 
-/// `GET /api/plugins/commands`: active plugins' contributed commands with their
-/// chords and client actions. Reads manifests, not workers, so it is safe in
-/// read-only mode.
-pub async fn plugin_commands() -> Json<serde_json::Value> {
+/// `GET /api/plugins/commands`: active plugins' contributed commands, each with
+/// the chords bound to it and its client action. Reads the registry (manifests),
+/// not workers, so it is safe in read-only mode.
+pub async fn plugin_commands(State(state): State<std::sync::Arc<AppState>>) -> Response {
+    if let Some(resp) = super::cityhall_block(&state) {
+        return resp;
+    }
     let registry = plugin::registry();
     let mut commands = Vec::new();
     for p in registry.active() {
@@ -288,18 +295,18 @@ pub async fn plugin_commands() -> Json<serde_json::Value> {
             });
         }
     }
-    Json(json!({ "commands": commands }))
+    Json(json!({ "commands": commands })).into_response()
 }
 
 /// `GET /api/plugins/ui-state`: the plugin host's aggregated UI-state snapshot
-/// plus the notification ring, and the pages active plugins declare. The
-/// snapshot is empty when no host is running.
-pub async fn plugin_ui_state(
-    State(state): State<std::sync::Arc<AppState>>,
-) -> Json<serde_json::Value> {
+/// Includes worker slots, notifications, and active plugin pages.
+pub async fn plugin_ui_state(State(state): State<std::sync::Arc<AppState>>) -> Response {
+    if let Some(resp) = super::cityhall_block(&state) {
+        return resp;
+    }
     let pages: Vec<_> = plugin::registry()
         .active()
-        .flat_map(|p| p.pages())
+        .flat_map(|plugin| plugin.pages())
         .collect();
     let empty = || json!({ "entries": [], "notifications": [] });
     let mut body = match state.plugin_host.as_ref().map(|h| h.ui_snapshot()) {
@@ -312,15 +319,19 @@ pub async fn plugin_ui_state(
         None => empty(),
     };
     body["pages"] = json!(pages);
-    Json(body)
+    Json(body).into_response()
 }
 
-/// `GET /api/plugins/updates`: which installed external plugins have an update.
-/// An explicit, on-demand network check kept off the always-on
-/// `GET /api/plugins` path so a settings render never blocks on git. Allowed in
-/// read-only mode: it mutates nothing.
-pub async fn plugin_updates() -> Json<serde_json::Value> {
-    Json(json!({ "updates": plugin::update_check::outdated().await }))
+/// `GET /api/plugins/updates`: which installed external plugins have an update
+/// available. An explicit, on-demand network check (the dashboard "Check for
+/// updates" button), kept off the always-on `GET /api/plugins` list path so a
+/// settings render never blocks on git/network. Allowed in read-only mode: it
+/// reads remote state and mutates nothing.
+pub async fn plugin_updates(State(state): State<std::sync::Arc<AppState>>) -> Response {
+    if let Some(resp) = super::cityhall_block(&state) {
+        return resp;
+    }
+    Json(json!({ "updates": plugin::update_check::outdated().await })).into_response()
 }
 
 #[derive(Deserialize)]
@@ -329,11 +340,19 @@ pub struct DiscoverQuery {
     pub q: Option<String>,
 }
 
-/// `GET /api/plugins/discover?q=`: search the `aoe-plugin` GitHub topic.
-/// Browse-only, since capability approval needs a terminal, so each result
-/// carries an `install_command` to copy. A GitHub failure (notably the
-/// unauthenticated rate limit) returns its message rather than a generic 500.
-pub async fn plugin_discover(Query(query): Query<DiscoverQuery>) -> Response {
+/// `GET /api/plugins/discover?q=`: search the `aoe-plugin` GitHub topic. The
+/// dashboard "Search GitHub" button. Browse-only: the dashboard has no install
+/// path (capability approval needs a terminal), so each result carries an
+/// `install_command` the user copies. On a GitHub failure (notably the
+/// unauthenticated search rate limit) the message is returned for the UI to
+/// show, rather than a generic 500.
+pub async fn plugin_discover(
+    State(state): State<std::sync::Arc<AppState>>,
+    Query(query): Query<DiscoverQuery>,
+) -> Response {
+    if let Some(resp) = super::cityhall_block(&state) {
+        return resp;
+    }
     match plugin::discover::discover(query.q.as_deref()).await {
         Ok(results) => Json(json!({ "results": results })).into_response(),
         Err(e) => api_error(StatusCode::BAD_GATEWAY, "discover_failed", format!("{e:#}")),
@@ -345,14 +364,22 @@ pub struct DetailsQuery {
     pub source: String,
 }
 
-/// `GET /api/plugins/details?source=gh:owner/repo`: manifest fields plus
-/// release tags for one plugin source, backing the detail modal. Allowed in
-/// read-only mode.
-pub async fn plugin_details(Query(query): Query<DetailsQuery>) -> Response {
+/// `GET /api/plugins/details?source=gh:owner/repo`: the on-demand detail for one
+/// plugin source (manifest fields + release tags) backing the dashboard detail
+/// modal. Allowed in read-only mode; reads remote state and mutates nothing.
+pub async fn plugin_details(
+    State(state): State<std::sync::Arc<AppState>>,
+    Query(query): Query<DetailsQuery>,
+) -> Response {
+    if let Some(resp) = super::cityhall_block(&state) {
+        return resp;
+    }
     match plugin::discover::details(&query.source).await {
         Ok(detail) => Json(detail).into_response(),
-        // `details()` hard-errors only on an invalid source; a GitHub fetch
-        // failure is reported in-band, so a hard error is bad client input.
+        // `details()` only hard-errors on an invalid / unsupported `source`; a
+        // GitHub fetch failure is reported in-band (manifest_error / empty
+        // release tags), so a hard error here is bad client input, not an
+        // upstream outage.
         Err(e) => api_error(StatusCode::BAD_REQUEST, "invalid_source", format!("{e:#}")),
     }
 }
@@ -371,8 +398,9 @@ pub async fn plugin_sessions(
             format!("Plugin {id} does not declare {CAP_SESSION_READ}"),
         );
     }
+    let _namespace = state.profile_namespace.read().await;
     // The worker's `sessions.list` scope: the host's profile, and only structured sessions in CityHall.
-    let profile = crate::session::config::effective_profile(&state.profile);
+    let profile = crate::session::config::effective_profile(&state.served_profile());
     let instances = state.instances.read().await;
     let sessions: Vec<_> = instances
         .iter()
@@ -392,37 +420,34 @@ pub struct PluginActionBody {
     pub params: serde_json::Value,
     /// The session whose UI fired the action, if any. The host reads the
     /// baseline revision for this `(plugin, session)` scope so the dashboard
-    /// waits only for it. Merged into `params.session_id` before forwarding.
+    /// waits only for that scope's re-pushed state. It is merged into
+    /// `params.session_id` before forwarding to the worker.
     #[serde(default)]
     pub session_id: Option<String>,
 }
 
 /// `POST /api/plugins/{id}/action`: forward a dashboard UI action to the
-/// plugin's worker as a fire-and-forget JSON-RPC notification. The worker is the
-/// trust boundary, acting only on methods it implements, so this never waits for
-/// a result.
+/// plugin's worker as a fire-and-forget JSON-RPC notification.
+/// The worker is the trust boundary: it acts only on methods it implements and
+/// ignores the rest, so this never waits for or returns a worker result.
 ///
-/// Read-write only, not elevation: a UI action mutates no host-managed state and
-/// grants no capability, so a routine `github.refresh` should not prompt for the
-/// passphrase.
+/// Gated on read-write mode only, not elevation. Unlike enable/disable, a UI
+/// action does not mutate host-managed state (config, registry, grants,
+/// lockfile) and grants no new host capability, so it does not warrant the
+/// passphrase step-up, the same reasoning as `update_theme` in `system.rs`.
+/// A routine `github.refresh` should not prompt for the passphrase.
 pub async fn invoke_plugin_action(
     State(state): State<std::sync::Arc<AppState>>,
     Path(id): Path<String>,
     body: Result<Json<PluginActionBody>, axum::extract::rejection::JsonRejection>,
 ) -> Response {
     if state.read_only {
-        return api_error(
-            StatusCode::FORBIDDEN,
-            "read_only",
-            "Server is in read-only mode",
-        );
+        return super::read_only_response();
     }
     // Plugin panes are hidden in CityHall (plugins are display only).
     if let Some(resp) = super::cityhall_block(&state) {
         return resp;
     }
-    // Extracted after the guards so a read-only or CityHall server answers with
-    // its own status rather than a body-shape 400 (#1229).
     let Json(body) = match body {
         Ok(body) => body,
         Err(rejection) => return rejection.into_response(),
@@ -475,25 +500,27 @@ pub struct InvokeCommandBody {
 }
 
 /// `POST /api/plugins/commands/{fqid}/invoke`: dispatch an action-less plugin
-/// command to its worker as a fixed `plugin.command.invoke` notification.
+/// command to its worker as a fixed `plugin.command.invoke` fire-and-forget
+/// notification.
 ///
-/// This is the path for a command with no client `action`, which the palette and
-/// keybinds cannot reach through `open-ui-link`. Unlike `/action`, the command
-/// is resolved from the registry and must exist, carry no client action, and
-/// name a live session.
+/// This is the invocation path for a command with no client `action` (the
+/// GitHub plugin's `status` / `refresh`), which the palette and keybinds cannot
+/// reach through `open-ui-link`. Unlike `/action` (an arbitrary caller-named
+/// worker method), the command is resolved from the registry and must exist,
+/// carry no client action (a client action runs on the surface, not the
+/// worker), and name a live session. The fixed `plugin.command.invoke` method
+/// carries `{ command, session_id }`; the worker acts on commands it knows and
+/// ignores the rest.
 ///
-/// Read-write only, no elevation, as for `invoke_plugin_action`.
+/// Read-write only, no elevation, the same reasoning as `invoke_plugin_action`:
+/// it mutates no host-managed state and grants no capability.
 pub async fn invoke_plugin_command(
     State(state): State<std::sync::Arc<AppState>>,
     Path(fqid): Path<String>,
     Json(body): Json<InvokeCommandBody>,
 ) -> Response {
     if state.read_only {
-        return api_error(
-            StatusCode::FORBIDDEN,
-            "read_only",
-            "Server is in read-only mode",
-        );
+        return super::read_only_response();
     }
     // Plugin commands are not surfaced in CityHall (plugins are display only).
     if let Some(resp) = super::cityhall_block(&state) {
@@ -582,21 +609,22 @@ fn strip_composer_snapshot_without_capability(plugin_id: &str, params: &mut serd
     }
 }
 
-/// `GET /api/plugins/{id}/update/preview`: classify an available update
-/// (no_update / safe_update / consent_required) and return the disclosure the
-/// dashboard and TUI render. Read-write only, NOT elevation: it powers the
-/// approval UI, so a non-elevated session must be able to fetch the capability
-/// diff before deciding. Network failures surface as a 502.
+/// `GET /api/plugins/{id}/update/preview`: classify the available update for one
+/// installed external plugin (no_update / safe_update / consent_required) and,
+/// when consent is required, return the structured disclosure the dashboard and
+/// TUI render. Gated on read-write mode only, NOT elevation: it mutates no host
+/// state and it powers the approval UI, so a non-elevated session must be able
+/// to fetch the capability diff before deciding (elevation is required on the
+/// actual apply). Network failures (no release, dead remote) surface as a 502.
 pub async fn plugin_update_preview(
     State(state): State<std::sync::Arc<AppState>>,
     Path(id): Path<String>,
 ) -> Response {
+    if let Some(resp) = super::cityhall_block(&state) {
+        return resp;
+    }
     if state.read_only {
-        return api_error(
-            StatusCode::FORBIDDEN,
-            "read_only",
-            "Server is in read-only mode",
-        );
+        return super::read_only_response();
     }
     match plugin::install::preview_update(&id).await {
         Ok(preview) => Json(preview).into_response(),
@@ -612,19 +640,22 @@ pub struct ApplyUpdateBody {
     pub expected_fingerprint: Option<String>,
 }
 
-/// `POST /api/plugins/{id}/update/apply`: apply an update the user approved.
-/// A privileged host mutation (it can expand the capability set and run build
-/// steps), so it needs read-write mode AND elevation. Runs as a host-side job
-/// and returns a `job_id` to poll. A fingerprint mismatch surfaces as a failed
-/// job, which the UI recovers from by re-previewing.
+/// `POST /api/plugins/{id}/update/apply`: apply an update the user approved in
+/// the dashboard, granting whatever the fetched manifest declares. A privileged
+/// host mutation (it can expand the capability set and run build steps), so it
+/// is gated on read-write mode AND elevation, like enable/disable. Runs as a
+/// host-side job so the build is observable; returns a `job_id` the dashboard
+/// polls for the live log. A fingerprint mismatch (the remote moved since the
+/// preview) surfaces as a failed job, which the UI recovers from by
+/// re-previewing.
 pub async fn apply_plugin_update(
     State(state): State<std::sync::Arc<AppState>>,
     session: Option<axum::Extension<AuthenticatedSession>>,
-    loopback: Option<axum::Extension<LoopbackTrusted>>,
+    loopback: Option<axum::Extension<LocalAuthorization>>,
     Path(id): Path<String>,
     Json(body): Json<ApplyUpdateBody>,
 ) -> Response {
-    if let Err(resp) = mutation_gate(&state, session.as_deref(), loopback.is_some()).await {
+    if let Err(resp) = mutation_gate(&state, session.as_deref(), loopback.as_deref()).await {
         return resp;
     }
     let plugin_id = id.clone();
@@ -637,6 +668,7 @@ pub async fn apply_plugin_update(
         }
         Ok(())
     })
+    .await
 }
 
 #[derive(Deserialize)]
@@ -646,16 +678,17 @@ pub struct DismissUpdateBody {
 }
 
 /// `POST /api/plugins/{id}/update/dismiss`: record that the user declined an
-/// update, so nagging stops until the next version. Mutates host config and
-/// suppresses a security signal, so it is gated like apply.
+/// available update, so the popup and the auto-update notification stop nagging
+/// until the next version. Mutates host config and suppresses a security
+/// signal, so it is gated like apply (read-write + elevation).
 pub async fn dismiss_plugin_update(
     State(state): State<std::sync::Arc<AppState>>,
     session: Option<axum::Extension<AuthenticatedSession>>,
-    loopback: Option<axum::Extension<LoopbackTrusted>>,
+    loopback: Option<axum::Extension<LocalAuthorization>>,
     Path(id): Path<String>,
     Json(body): Json<DismissUpdateBody>,
 ) -> Response {
-    if let Err(resp) = mutation_gate(&state, session.as_deref(), loopback.is_some()).await {
+    if let Err(resp) = mutation_gate(&state, session.as_deref(), loopback.as_deref()).await {
         return resp;
     }
     let result = tokio::task::spawn_blocking(move || {
@@ -678,11 +711,11 @@ pub struct SetEnabledBody {
 pub async fn set_plugin_enabled(
     State(state): State<std::sync::Arc<AppState>>,
     session: Option<axum::Extension<AuthenticatedSession>>,
-    loopback: Option<axum::Extension<LoopbackTrusted>>,
+    loopback: Option<axum::Extension<LocalAuthorization>>,
     Path(id): Path<String>,
     Json(body): Json<SetEnabledBody>,
 ) -> Response {
-    if let Err(resp) = mutation_gate(&state, session.as_deref(), loopback.is_some()).await {
+    if let Err(resp) = mutation_gate(&state, session.as_deref(), loopback.as_deref()).await {
         return resp;
     }
     let result =
@@ -696,7 +729,7 @@ pub async fn set_plugin_enabled(
             if let Some(host) = state.plugin_host.clone() {
                 host.reconcile(&crate::plugin::registry()).await;
             }
-            list_plugins().await.into_response()
+            list_plugins(State(state)).await
         }
         Ok(Err(e)) => api_error(StatusCode::BAD_REQUEST, "plugin_error", format!("{e:#}")),
         Err(e) => api_error(StatusCode::INTERNAL_SERVER_ERROR, "internal", e.to_string()),
@@ -709,10 +742,10 @@ pub async fn set_plugin_enabled(
 pub async fn restart_plugin_worker(
     State(state): State<std::sync::Arc<AppState>>,
     session: Option<axum::Extension<AuthenticatedSession>>,
-    loopback: Option<axum::Extension<LoopbackTrusted>>,
+    loopback: Option<axum::Extension<LocalAuthorization>>,
     Path(id): Path<String>,
 ) -> Response {
-    if let Err(resp) = mutation_gate(&state, session.as_deref(), loopback.is_some()).await {
+    if let Err(resp) = mutation_gate(&state, session.as_deref(), loopback.as_deref()).await {
         return resp;
     }
     let registry = match tokio::task::spawn_blocking(plugin::reload_registry).await {
@@ -730,7 +763,8 @@ pub async fn restart_plugin_worker(
 use std::sync::atomic::{AtomicBool, Ordering};
 
 /// A host-side plugin lifecycle operation the dashboard started and tails. The
-/// daemon owns the work; the browser polls `GET /api/plugins/jobs/{id}`.
+/// daemon owns the work; the browser polls `GET /api/plugins/jobs/{id}` for
+/// status plus the live log tail.
 #[derive(Clone, Copy, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PluginJobKind {
@@ -762,20 +796,23 @@ pub struct PluginJob {
 }
 
 /// Drop finished jobs and their log files older than this when a new job
-/// starts. A dashboard polls for seconds to minutes, so an hour bounds the
-/// in-memory map and the on-disk logs with a wide margin.
+/// starts. A dashboard polls a job for seconds to minutes; an hour is a wide
+/// margin that bounds the in-memory map and the on-disk logs over a long-lived
+/// daemon.
 const FINISHED_JOB_TTL_SECS: i64 = 3600;
 
 /// In-memory registry of plugin lifecycle jobs. Dies with the daemon: a job
 /// running at shutdown is gone, but its on-disk log survives so a tail after a
-/// restart still shows what happened.
-// ponytail: a persisted job table would need process supervision and
-// orphaned-build recovery to mean anything.
+/// restart still shows what happened, just without live status.
+// ponytail: in-memory only; a persisted job table would need process
+// supervision and orphaned-build recovery to mean anything. Add that only if
+// restart-survival of in-flight jobs is ever required.
 pub struct PluginJobRegistry {
     jobs: Mutex<HashMap<String, PluginJob>>,
-    /// At most one lifecycle mutation runs at a time: config and lockfile
-    /// writes and in-place tree mutations are not concurrency-safe, so a second
-    /// start is rejected with 409 rather than queued.
+    /// At most one lifecycle mutation runs at a time. Config + lockfile writes
+    /// and in-place tree mutations are not concurrency-safe, so a second start
+    /// is rejected with 409 rather than queued (a queued mutation can go stale
+    /// before it runs).
     active: AtomicBool,
 }
 
@@ -858,12 +895,8 @@ impl PluginJobRegistry {
     }
 }
 
-/// Begin a lifecycle job, spawn its work, and return `202 { job_id }`, or `409`
-/// when another lifecycle mutation is running. The work runs in a detached task
-/// whose output lands in the job log file the dashboard tails.
-// ponytail: install/update run their synchronous build inside this async task,
-// parking one runtime worker; the single-active guard caps that at one.
-fn start_job<F, Fut>(
+/// Admit one lifecycle job; return its id while its work remains tracked.
+async fn start_job<F, Fut>(
     state: std::sync::Arc<AppState>,
     kind: PluginJobKind,
     target: String,
@@ -882,7 +915,7 @@ where
     };
     let jobs = state.plugin_jobs.clone();
     let id = job_id.clone();
-    tokio::spawn(async move {
+    state.runtime.work.spawn("server.plugin_job", async move {
         let result = match OperationLog::file(&log_path) {
             Ok(log) => run(log).await,
             Err(e) => Err(e),
@@ -898,18 +931,15 @@ pub struct InstallPreviewBody {
 }
 
 /// `POST /api/plugins/install/preview`: classify a `gh:` install candidate and
-/// return the disclosure the dashboard renders before approval. Read-write only,
-/// NOT elevation: it mutates nothing and powers the approval UI.
+/// return the capability / build / UI disclosure the dashboard renders before
+/// the user approves. Read-write only, NOT elevation: it mutates nothing and
+/// powers the approval UI (elevation is required on the actual install).
 pub async fn preview_plugin_install(
     State(state): State<std::sync::Arc<AppState>>,
     Json(body): Json<InstallPreviewBody>,
 ) -> Response {
     if state.read_only {
-        return api_error(
-            StatusCode::FORBIDDEN,
-            "read_only",
-            "Server is in read-only mode",
-        );
+        return super::read_only_response();
     }
     // The marketplace / install flow is hidden and closed in CityHall.
     if let Some(resp) = super::cityhall_block(&state) {
@@ -929,16 +959,16 @@ pub struct StartInstallBody {
     pub expected_fingerprint: String,
 }
 
-/// `POST /api/plugins/install`: start a host-side install job for an approved
-/// `gh:` source. Read-write plus elevation, like update apply. Returns a
-/// `job_id` to poll; `409` if another lifecycle job is running.
+/// `POST /api/plugins/install`: start a host-side install job for a `gh:` source
+/// the user approved in the dashboard. Read-write + elevation, like update
+/// apply. Returns a `job_id` to poll; `409` if another lifecycle job is running.
 pub async fn start_plugin_install(
     State(state): State<std::sync::Arc<AppState>>,
     session: Option<axum::Extension<AuthenticatedSession>>,
-    loopback: Option<axum::Extension<LoopbackTrusted>>,
+    loopback: Option<axum::Extension<LocalAuthorization>>,
     Json(body): Json<StartInstallBody>,
 ) -> Response {
-    if let Err(resp) = mutation_gate(&state, session.as_deref(), loopback.is_some()).await {
+    if let Err(resp) = mutation_gate(&state, session.as_deref(), loopback.as_deref()).await {
         return resp;
     }
     let source = body.source.clone();
@@ -953,18 +983,19 @@ pub async fn start_plugin_install(
                 .map(|_| ())
         },
     )
+    .await
 }
 
-/// `POST /api/plugins/{id}/uninstall`: start a host-side uninstall job,
-/// removing the plugin's tree, config entry and lockfile entry. Read-write plus
-/// elevation; returns a `job_id` to poll, or `409` if one is running.
+/// `POST /api/plugins/{id}/uninstall`: start a host-side uninstall job. Removes
+/// the plugin's tree, config entry, and lockfile entry. Read-write + elevation;
+/// returns a `job_id` to poll; `409` if another lifecycle job is running.
 pub async fn start_plugin_uninstall(
     State(state): State<std::sync::Arc<AppState>>,
     session: Option<axum::Extension<AuthenticatedSession>>,
-    loopback: Option<axum::Extension<LoopbackTrusted>>,
+    loopback: Option<axum::Extension<LocalAuthorization>>,
     Path(id): Path<String>,
 ) -> Response {
-    if let Err(resp) = mutation_gate(&state, session.as_deref(), loopback.is_some()).await {
+    if let Err(resp) = mutation_gate(&state, session.as_deref(), loopback.as_deref()).await {
         return resp;
     }
     let plugin_id = id.clone();
@@ -980,6 +1011,7 @@ pub async fn start_plugin_uninstall(
             Err(e) => Err(anyhow::anyhow!("uninstall task failed: {e}")),
         }
     })
+    .await
 }
 
 #[derive(Deserialize)]
@@ -989,12 +1021,16 @@ pub struct JobLogQuery {
 }
 
 /// `GET /api/plugins/jobs/{job_id}`: a lifecycle job's status plus a bounded
-/// tail of its host-side log, polled by the dashboard progress modal.
+/// tail of its host-side log. Polled by the dashboard progress modal. Reads job
+/// state only, so no elevation; the global auth middleware still applies.
 pub async fn plugin_job_status(
     State(state): State<std::sync::Arc<AppState>>,
     Path(job_id): Path<String>,
     Query(q): Query<JobLogQuery>,
 ) -> Response {
+    if let Some(resp) = super::cityhall_block(&state) {
+        return resp;
+    }
     let Some(job) = state.plugin_jobs.get(&job_id) else {
         return api_error(
             StatusCode::NOT_FOUND,
@@ -1333,16 +1369,16 @@ id = "voice"
         let _app_dir = AppDirEnvGuard::new();
         install_page_plugins(&[("acme.board", true)], &["board", "notes"]);
 
-        let mut state = crate::server::test_support::build_test_app_state_with_policy(
+        let state = crate::server::test_support::build_test_app_state_with_policy_configured(
             Vec::new(),
             Vec::new(),
             Vec::new(),
             Some("secret-token".to_string()),
+            |state| {
+                state.login_manager =
+                    std::sync::Arc::new(crate::server::login::LoginManager::new(Some("pw")))
+            },
         );
-        std::sync::Arc::get_mut(&mut state)
-            .expect("fresh state")
-            .login_manager =
-            std::sync::Arc::new(crate::server::login::LoginManager::new(Some("pw")));
         let login = std::sync::Arc::clone(&state.login_manager);
         let binding = [7u8; 32];
         let session = login.create_session(&binding, "203.0.113.7", "t").await;

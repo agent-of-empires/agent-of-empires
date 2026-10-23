@@ -6,12 +6,13 @@ import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/re
 import { ExtraReposPicker } from "../steps/ExtraReposPicker";
 import type { ProjectInfo } from "../../../lib/types";
 
-const fetchProjectRegistry = vi.fn();
+const fetchProjects = vi.fn();
 const fetchRecentProjects = vi.fn();
 const fetchBranches = vi.fn();
 vi.mock("../../../lib/api", () => ({
-  fetchProjectRegistry: () => fetchProjectRegistry(),
-  fetchSessions: () => Promise.resolve({ sessions: [], workspace_ordering: [] }),
+  fetchProjects: (...args: unknown[]) => fetchProjects(...args),
+  fetchSessions: () =>
+    Promise.resolve({ sessions: [], workspace_ordering: [], cursor: { epoch: "boot", revision: 1n } }),
   fetchRecentProjects: () => fetchRecentProjects(),
   fetchBranches: (...args: unknown[]) => fetchBranches(...args),
 }));
@@ -19,7 +20,7 @@ vi.mock("../../../lib/api", () => ({
 const project = (name: string): ProjectInfo => ({ name, path: `/repos/${name}`, scope: "global", pinned: false });
 
 beforeEach(() => {
-  fetchProjectRegistry.mockResolvedValue([project("primary"), project("alpha"), project("beta")]);
+  fetchProjects.mockResolvedValue([project("primary"), project("alpha"), project("beta")]);
   fetchRecentProjects.mockResolvedValue({ projects: [] });
   fetchBranches.mockResolvedValue([]);
 });
@@ -34,6 +35,7 @@ function setup(over: { selectedPaths?: string[]; repoBases?: Record<string, stri
   const onRepoBasesChange = vi.fn();
   const { container } = render(
     <ExtraReposPicker
+      profile="default"
       primaryPath="/repos/primary"
       selectedPaths={over.selectedPaths ?? []}
       onChange={onChange}
@@ -60,6 +62,7 @@ describe("ExtraReposPicker selection", () => {
     const { container } = setup();
     expect(container.textContent).toContain("none");
     await loaded(container);
+    expect(fetchProjects).toHaveBeenCalledWith({ profile: "default" });
     expect(row(container, "alpha")).toBeTruthy();
     expect(row(container, "beta")).toBeTruthy();
     expect(row(container, "primary")).toBeFalsy();

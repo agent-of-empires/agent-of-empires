@@ -1,6 +1,6 @@
 //! Test-only constructors that integration tests in `tests/` need to drive
-//! `reload_state_instances_from_disk` and the dynamic-profile-rewire helpers without going
-//! through the full daemon.
+//! `reload_state_instances_from_disk` and the dynamic-profile-rewire helpers
+//! without going through the full daemon.
 
 use super::*;
 use crate::file_watch::FileWatchService;
@@ -60,9 +60,11 @@ impl Drop for RuntimeEnvGuard {
         crate::test_env_lock::release_env_lock(self._lock.is_some());
     }
 }
-use tokio_util::sync::CancellationToken;
 
-/// Build a minimal `Arc<AppState>` for helper-equivalence tests.
+/// Build a minimal `Arc<AppState>` for helper-equivalence tests. Most
+/// fields are seeded with empty / default values; only `instances`,
+/// `recently_restarted`, and the file-watch trio are real. Acp
+/// fields are stubbed because the helper's acp overlay reads them.
 pub fn build_test_app_state(prior: Vec<Instance>) -> Arc<AppState> {
     build_test_app_state_with_policy(prior, Vec::new(), Vec::new(), None)
 }
@@ -76,6 +78,7 @@ pub fn build_test_app_state_cityhall(prior: Vec<Instance>) -> Arc<AppState> {
         Vec::new(),
         None,
         true,
+        |_| {},
         std::convert::identity,
     )
 }
@@ -95,6 +98,40 @@ pub fn build_test_app_state_with_policy(
         allowed_origins,
         token,
         false,
+        |_| {},
+        std::convert::identity,
+    )
+}
+
+pub fn build_test_app_state_with_policy_configured(
+    prior: Vec<Instance>,
+    allowed_hosts: Vec<String>,
+    allowed_origins: Vec<String>,
+    token: Option<String>,
+    configure: impl FnOnce(&mut AppState),
+) -> Arc<AppState> {
+    build_test_app_state_impl(
+        prior,
+        allowed_hosts,
+        allowed_origins,
+        token,
+        false,
+        configure,
+        std::convert::identity,
+    )
+}
+
+pub fn build_test_app_state_configured(
+    prior: Vec<Instance>,
+    configure: impl FnOnce(&mut AppState),
+) -> Arc<AppState> {
+    build_test_app_state_impl(
+        prior,
+        Vec::new(),
+        Vec::new(),
+        None,
+        false,
+        configure,
         std::convert::identity,
     )
 }
@@ -106,26 +143,66 @@ pub(crate) fn build_test_app_state_with_launcher(
     prior: Vec<Instance>,
     launcher: crate::acp::supervisor::Launcher,
 ) -> Arc<AppState> {
-    build_test_app_state_impl(prior, Vec::new(), Vec::new(), None, false, |s| {
-        s.with_launcher(launcher)
-    })
+    build_test_app_state_impl(
+        prior,
+        Vec::new(),
+        Vec::new(),
+        None,
+        false,
+        |_| {},
+        |s| s.with_launcher(launcher),
+    )
 }
 
-fn build_test_app_state_impl(
+pub(crate) fn build_test_app_state_impl(
     prior: Vec<Instance>,
     allowed_hosts: Vec<String>,
     allowed_origins: Vec<String>,
     token: Option<String>,
     cityhall_mode: bool,
+    configure: impl FnOnce(&mut AppState),
     customize: impl FnOnce(
         crate::acp::supervisor::Supervisor<crate::acp::supervisor::ChannelSink>,
     )
         -> crate::acp::supervisor::Supervisor<crate::acp::supervisor::ChannelSink>,
 ) -> Arc<AppState> {
-    let app_dir = tempfile::tempdir().expect("tempdir");
-    let acp_db = app_dir.path().join("acp_events.db");
-    let event_store =
-        Arc::new(crate::acp::event_store::EventStore::open(&acp_db, 100).expect("event store"));
+    build_test_app_state_impl_with_event_store(
+        prior,
+        allowed_hosts,
+        allowed_origins,
+        token,
+        None,
+        |state| {
+            state.cityhall_mode = cityhall_mode;
+            configure(state);
+        },
+        customize,
+    )
+}
+
+pub(crate) fn build_test_app_state_impl_with_event_store(
+    prior: Vec<Instance>,
+    allowed_hosts: Vec<String>,
+    allowed_origins: Vec<String>,
+    token: Option<String>,
+    event_store: Option<Arc<crate::acp::event_store::EventStore>>,
+    configure: impl FnOnce(&mut AppState),
+    customize: impl FnOnce(
+        crate::acp::supervisor::Supervisor<crate::acp::supervisor::ChannelSink>,
+    )
+        -> crate::acp::supervisor::Supervisor<crate::acp::supervisor::ChannelSink>,
+) -> Arc<AppState> {
+    let app_dir = event_store
+        .is_none()
+        .then(|| tempfile::tempdir().expect("tempdir"));
+    let event_store = event_store.unwrap_or_else(|| {
+        let acp_db = app_dir
+            .as_ref()
+            .expect("default store directory")
+            .path()
+            .join("acp_events.db");
+        Arc::new(crate::acp::event_store::EventStore::open(&acp_db, 100).expect("event store"))
+    });
     let acp_events_tx = broadcast::channel::<AcpBroadcastFrame>(8).0;
     let acp_control_cache = Arc::new(crate::acp::control_cache::ControlStateCache::new());
     let sink = std::sync::Arc::new(crate::acp::supervisor::ChannelSink {
@@ -133,9 +210,10 @@ fn build_test_app_state_impl(
         event_store: event_store.clone(),
         control_cache: acp_control_cache.clone(),
     });
-    let supervisor = std::sync::Arc::new(customize(
-        crate::acp::supervisor::Supervisor::with_capacity(sink, 1),
-    ));
+    let supervisor = std::sync::Arc::new(
+        customize(crate::acp::supervisor::Supervisor::with_capacity(sink, 1))
+            .with_native_admission(),
+    );
     let instances = Arc::new(RwLock::new(prior));
     let instance_locks = Arc::new(RwLock::new(HashMap::new()));
     let idempotency_locks = Arc::new(RwLock::new(HashMap::new()));
@@ -154,11 +232,27 @@ fn build_test_app_state_impl(
             control_cache: acp_control_cache.clone(),
         },
     ));
-    Arc::new(AppState {
-        profile: "test".to_string(),
+    let shutdown = session_service.work.shutdown.clone();
+    let mut state = AppState {
+        profile: "test".to_owned().into(),
+        core_only: false,
         read_only: false,
-        cityhall_mode,
+        cityhall_mode: false,
         instances,
+        profile_namespace: Arc::new(RwLock::new(())),
+        publication: Arc::new(RwLock::new(())),
+        reload_lane: tokio::sync::Mutex::new(()),
+        canonical_metadata: RwLock::new(super::reload::CanonicalMetadata {
+            default_profile: "test".into(),
+            ..Default::default()
+        }),
+        canonical_health: RwLock::new(crate::daemon::RuntimeHealth::Healthy),
+        canonical_diagnostics: Default::default(),
+        runtime: super::runtime::NativeRuntime::new(
+            "test".into(),
+            None,
+            session_service.work.clone(),
+        ),
         runtime_read_cache: Default::default(),
         session_service,
         token_manager: Arc::new(TokenManager::new(token, Duration::from_secs(3600))),
@@ -216,25 +310,36 @@ fn build_test_app_state_impl(
         telemetry_structured: StructuredTelemetryCounters::default(),
         telemetry_last_reported: std::sync::Mutex::new(None),
         acp_orphan_cleanups: std::sync::Mutex::new(std::collections::HashSet::new()),
-        shutdown: CancellationToken::new(),
+        shutdown,
         file_watch,
         disk_changed: Arc::new(tokio::sync::Notify::new()),
         disk_watch_handles: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
-    })
+    };
+    configure(&mut state);
+    let state = Arc::new(state);
+    state.session_service.bind_native_state(&state);
+    state
 }
 
-/// Accept a fixture's disk rows and cache through the normal reload commit.
+pub async fn refresh_canonical_metadata_for_test(state: &Arc<AppState>) {
+    let loaded = super::reload::load_all_profiles(&state.file_watch).expect("load profiles");
+    *state.canonical_metadata.write().await = loaded.metadata;
+}
+
+/// Accept fixture disk rows and component health through the normal reload commit.
 pub async fn accept_runtime_read_cache_for_test(state: &Arc<AppState>) {
     let read_epoch = state
         .mutation_epoch
         .load(std::sync::atomic::Ordering::SeqCst);
-    let loaded = super::reload::load_all_instances(&state.file_watch);
+    let (loaded, metadata) = super::reload::load_profiles_for_reload(&state.file_watch);
     super::reload::reload_state_instances_from_disk(
         state,
         loaded,
         Vec::new(),
         super::state::StatusSource::DiskOnly,
         read_epoch,
+        metadata,
+        Default::default(),
     )
     .await;
 }
@@ -287,9 +392,7 @@ pub async fn disk_watch_handle_count(state: &Arc<AppState>) -> usize {
     state.disk_watch_handles.lock().await.len()
 }
 
-pub use super::api::system::{
-    create_profile, delete_profile, rename_profile, CreateProfileBody, RenameProfileBody,
-};
+pub use super::api::system::{create_profile, delete_profile, rename_profile};
 
 pub async fn add_profile_disk_watch(state: &Arc<AppState>, profile: &str) {
     super::add_profile_disk_watch(state, profile).await
@@ -299,14 +402,40 @@ pub async fn rename_profile_disk_watch(state: &Arc<AppState>, old: &str, new: &s
     super::rename_profile_disk_watch(state, old, new).await
 }
 
-/// Replace the `Arc<FileWatchService>` on a unique-Arc'd `AppState`.
+/// Configure both collaborators before binding the native runtime.
 pub fn replace_file_watch(state: &mut AppState, fw: Arc<crate::file_watch::FileWatchService>) {
+    Arc::get_mut(&mut state.session_service)
+        .expect("configure session service before sharing it")
+        .file_watch = fw.clone();
     state.file_watch = fw;
 }
 
-/// Read the current `Arc<FileWatchService>` for tests asserting on `subscriber_count`.
+/// Read the current `Arc<FileWatchService>` for tests asserting on
+/// `subscriber_count`. The Arc clone is cheap.
 pub fn file_watch(state: &AppState) -> Arc<crate::file_watch::FileWatchService> {
     state.file_watch.clone()
+}
+
+pub async fn reload_disk_snapshot_at_epoch_for_test(
+    state: &Arc<AppState>,
+    fresh: Vec<Instance>,
+    read_epoch: u64,
+) {
+    let metadata = state.canonical_metadata.read().await.clone();
+    tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        super::reload::reload_state_instances_from_disk(
+            state,
+            fresh.into(),
+            Vec::new(),
+            super::state::StatusSource::DiskOnly,
+            read_epoch,
+            Ok(metadata),
+            Default::default(),
+        ),
+    )
+    .await
+    .expect("disk snapshot reload did not finish within 30 seconds");
 }
 
 pub async fn reload_disk_only_for_test(
@@ -317,14 +446,21 @@ pub async fn reload_disk_only_for_test(
     let read_epoch = state
         .mutation_epoch
         .load(std::sync::atomic::Ordering::SeqCst);
-    super::reload::reload_state_instances_from_disk(
-        state,
-        fresh.into(),
-        live_worker_records,
-        super::state::StatusSource::DiskOnly,
-        read_epoch,
+    let metadata = state.canonical_metadata.read().await.clone();
+    tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        super::reload::reload_state_instances_from_disk(
+            state,
+            fresh.into(),
+            live_worker_records,
+            super::state::StatusSource::DiskOnly,
+            read_epoch,
+            Ok(metadata),
+            Default::default(),
+        ),
     )
     .await
+    .expect("disk-only reload did not finish within 30 seconds");
 }
 
 pub async fn reload_tmux_applied_for_test(
@@ -335,14 +471,21 @@ pub async fn reload_tmux_applied_for_test(
     let read_epoch = state
         .mutation_epoch
         .load(std::sync::atomic::Ordering::SeqCst);
-    super::reload::reload_state_instances_from_disk(
-        state,
-        fresh.into(),
-        live_worker_records,
-        super::state::StatusSource::TmuxApplied,
-        read_epoch,
+    let metadata = state.canonical_metadata.read().await.clone();
+    tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        super::reload::reload_state_instances_from_disk(
+            state,
+            fresh.into(),
+            live_worker_records,
+            super::state::StatusSource::TmuxApplied,
+            read_epoch,
+            Ok(metadata),
+            Default::default(),
+        ),
     )
     .await
+    .expect("Tmux-applied reload did not finish within 30 seconds");
 }
 
 /// A temporary XDG base whose whole ancestor chain satisfies the client's
@@ -541,4 +684,24 @@ pub(crate) async fn archive_while_hook_waits(
     }
     std::fs::write(release, b"release").expect("release hook");
     target.is_some()
+}
+
+#[cfg(test)]
+/// Serve a fixture router through the real owner-authenticated private listener.
+pub(crate) async fn serve_owner_router_for_test(
+    socket: &std::path::Path,
+    router: axum::Router,
+) -> tokio::task::JoinHandle<()> {
+    let (listener, lease) = super::peer::bind_private(socket)
+        .await
+        .expect("fixture private listener");
+    tokio::spawn(async move {
+        let _lease = lease;
+        axum::serve(
+            listener,
+            router.into_make_service_with_connect_info::<super::peer::ConnectionPeer>(),
+        )
+        .await
+        .expect("fixture owner server");
+    })
 }

@@ -84,25 +84,24 @@ describe("deleteWorkspaceSessions (#2536)", () => {
   const sessions = (...ids: string[]) => ids.map((id) => ({ id }) as unknown as SessionResponse);
   const deps = () => ({
     setStatus: vi.fn(),
+    clearDeleting: vi.fn(),
     purgeLocal: vi.fn(),
     navigateHome: vi.fn(),
     notify: { info: vi.fn(), error: vi.fn() },
   });
 
-  it("makes ONE workspace call with the full id set in order, and purges every deleted id", async () => {
+  it("purges only confirmed deletions and retains the open session otherwise", async () => {
     deleteMock.mockResolvedValue(ok({ deleted: ["a", "b", "c"] }));
     const d = deps();
 
     await deleteWorkspaceSessions(sessions("a", "b", "c"), { delete_worktree: true, delete_branch: true }, null, d);
 
-    expect(deleteMock).toHaveBeenCalledTimes(1);
-    expect(deleteMock).toHaveBeenCalledWith(["a", "b", "c"], { delete_worktree: true, delete_branch: true });
     expect(d.purgeLocal).toHaveBeenCalledTimes(3);
     expect(d.notify.info).toHaveBeenCalledWith("Sessions deleted");
     expect(d.navigateHome).not.toHaveBeenCalled();
   });
 
-  it("leaves a session that is neither deleted nor failed untouched (kept-restored)", async () => {
+  it("keeps retained sessions and clears only their deletion progress", async () => {
     deleteMock.mockResolvedValue(ok({ deleted: ["a"], failed: [] }));
     const d = deps();
 
@@ -111,7 +110,8 @@ describe("deleteWorkspaceSessions (#2536)", () => {
     expect(d.purgeLocal).toHaveBeenCalledTimes(1);
     expect(d.purgeLocal).toHaveBeenCalledWith("a");
     expect(d.setStatus).not.toHaveBeenCalledWith("b", "Error");
-    expect(d.notify.info).toHaveBeenCalledWith("Sessions deleted");
+    expect(d.clearDeleting).toHaveBeenCalledExactlyOnceWith(sessions("b"));
+    expect(d.notify.info).toHaveBeenCalledWith("Some selected sessions changed and were not deleted");
   });
 
   it("flags every session Error and does not navigate when the call fails", async () => {

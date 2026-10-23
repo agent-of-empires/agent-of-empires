@@ -3,14 +3,11 @@
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::Mutex;
-use std::time::Instant;
 
 use rand::prelude::IndexedRandom;
 
 use super::words::PASSPHRASE_WORDS;
 use super::{ServeMode, TransportStatus, TunnelTransport};
-use crate::acp::client::autostart::{initial_log_tail, load_or_generate_port};
-use crate::server::startup::{StartupFailure, STARTUP_FAILURE_FILE};
 
 const SAVED_PASSPHRASE_FILE: &str = "serve.saved_passphrase";
 /// Written by the server at startup, so CLI-launched daemons can show their passphrase.
@@ -29,7 +26,7 @@ fn read_app_file(name: &str) -> Option<String> {
     (!trimmed.is_empty()).then(|| trimmed.to_string())
 }
 
-fn remove_app_file(name: &str) {
+pub(super) fn remove_app_file(name: &str) {
     if let Some(path) = app_file(name) {
         let _ = std::fs::remove_file(path);
     }
@@ -137,84 +134,6 @@ pub(super) fn default_transport(
     }
 }
 
-/// Tunnel mode takes a passphrase and the transport picked on the Confirm screen.
-pub(super) fn spawn_daemon(
-    mode: ServeMode,
-    passphrase: Option<&str>,
-    transport: Option<TunnelTransport>,
-) -> Result<(), String> {
-    // Another daemon may have started while the picker was open; spawning would orphan it.
-    if crate::cli::serve::daemon_pid().is_some() {
-        return Err(
-            "A daemon is already running. Close this dialog and reopen to see it.".to_string(),
-        );
-    }
-
-    let exe = current_exe()?;
-
-    // Stale files from a hard-killed daemon would show its URL or passphrase while starting.
-    for name in [
-        "serve.url",
-        "serve.mode",
-        EPHEMERAL_PASSPHRASE_FILE,
-        STARTUP_FAILURE_FILE,
-    ] {
-        remove_app_file(name);
-    }
-
-    let port = load_or_generate_port();
-    let mut cmd = Command::new(&exe);
-    cmd.args(["serve", "--daemon", "--port", &port.to_string()]);
-    match mode {
-        ServeMode::Tunnel => {
-            cmd.args(["--remote", "--host", "127.0.0.1"]);
-            // Picking Cloudflare must skip the server's Tailscale auto-detect.
-            if transport == Some(TunnelTransport::Cloudflare) {
-                cmd.arg("--no-tailscale");
-            }
-            if let Some(pp) = passphrase {
-                cmd.env("AOE_SERVE_PASSPHRASE", pp);
-            }
-        }
-        ServeMode::Local => {
-            cmd.args(["--host", "0.0.0.0"]);
-        }
-    }
-    // The wrapper double-forks; the daemon's output lands in the log file.
-    let status = cmd
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .map_err(|e| format!("Failed to launch `aoe serve --daemon`: {}", e))?;
-
-    if !status.success() {
-        // Forget an occupied port so the next attempt picks a fresh one.
-        let tail = initial_log_tail().join("\n");
-        if tail.contains("EADDRINUSE") || tail.contains("Address already in use") {
-            remove_app_file("serve.last_port");
-        }
-        let hint = match mode {
-            ServeMode::Tunnel => format!(
-                "Most likely no tunnel tool is installed (install tailscale \
-                 or cloudflared) or port {} is in use.",
-                port
-            ),
-            ServeMode::Local => format!("Most likely port {} is in use.", port),
-        };
-        return Err(format!(
-            "`aoe serve --daemon` exited with {:?}. {}",
-            status.code(),
-            hint
-        ));
-    }
-    if let Some(pp) = passphrase {
-        remember_passphrase(pp);
-        save_passphrase_to_disk(pp);
-    }
-    Ok(())
-}
-
 fn current_exe() -> Result<PathBuf, String> {
     std::env::current_exe().map_err(|e| format!("Could not resolve aoe binary path: {}", e))
 }
@@ -255,15 +174,6 @@ pub(super) fn stop_daemon() -> Result<(), String> {
     Ok(())
 }
 
-pub(super) fn restart_daemon(
-    mode: ServeMode,
-    passphrase: Option<&str>,
-    transport: Option<TunnelTransport>,
-) -> Result<(), String> {
-    stop_daemon()?;
-    spawn_daemon(mode, passphrase, transport)
-}
-
 pub(super) fn read_serve_mode() -> Option<ServeMode> {
     ServeMode::from_file_token(&read_app_file("serve.mode")?)
 }
@@ -277,37 +187,6 @@ pub(super) fn remember_last_mode(mode: ServeMode) {
     if let Some(path) = app_file("serve.last_mode") {
         let _ = std::fs::write(path, mode.file_token());
     }
-}
-
-/// The failed start the Daemon recorded, removed so it is shown once.
-pub(super) fn take_startup_failure() -> Option<StartupFailure> {
-    take_startup_failure_in(&crate::session::get_app_dir().ok()?)
-}
-
-fn take_startup_failure_in(dir: &Path) -> Option<StartupFailure> {
-    let path = dir.join(STARTUP_FAILURE_FILE);
-    let raw = std::fs::read_to_string(&path).ok()?;
-    let _ = std::fs::remove_file(&path);
-    serde_json::from_str(&raw).ok()
-}
-
-/// When the running daemon started, from its `serve.pid`, so a reopened Starting view counts
-/// from the spawn rather than from reopening.
-pub(super) fn daemon_started_at() -> Instant {
-    crate::cli::serve::pid_file_path()
-        .ok()
-        .and_then(|path| started_at_of(&path))
-        .unwrap_or_else(Instant::now)
-}
-
-fn started_at_of(path: &Path) -> Option<Instant> {
-    let age = std::fs::metadata(path)
-        .ok()?
-        .modified()
-        .ok()?
-        .elapsed()
-        .ok()?;
-    Instant::now().checked_sub(age)
 }
 
 /// The port the next spawn reuses, if any; `None` means it picks a random one. Mirrors the reuse
@@ -454,28 +333,6 @@ mod tests {
         for (input, expected) in cases {
             assert_eq!(compact_log_line(input), expected);
         }
-    }
-
-    #[test]
-    fn a_recorded_start_failure_is_shown_once_and_reopening_counts_from_the_spawn() {
-        let tmp = tempfile::tempdir().unwrap();
-        let failure = r#"{"remote":true,"transport":"tailscale","message":"boom"}"#;
-        std::fs::write(tmp.path().join(STARTUP_FAILURE_FILE), failure).unwrap();
-        let taken = take_startup_failure_in(tmp.path()).expect("recorded failure");
-        assert_eq!(taken.message, "boom");
-        assert!(take_startup_failure_in(tmp.path()).is_none(), "shown once");
-
-        let pid = tmp.path().join("serve.pid");
-        std::fs::write(&pid, "1").unwrap();
-        let spawned = std::time::SystemTime::now() - std::time::Duration::from_secs(45);
-        std::fs::File::options()
-            .write(true)
-            .open(&pid)
-            .unwrap()
-            .set_modified(spawned)
-            .unwrap();
-        let elapsed = started_at_of(&pid).unwrap().elapsed().as_secs();
-        assert!((45..47).contains(&elapsed), "{elapsed}");
     }
 
     #[test]

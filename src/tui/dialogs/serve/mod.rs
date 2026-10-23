@@ -21,8 +21,117 @@ const FLASH_TTL: Duration = Duration::from_millis(1500);
 const CONFIRM_TTL: Duration = Duration::from_secs(3);
 
 pub enum ServeAction {
+    Launch(ServeLaunchRequest),
+    Stop,
     Continue,
     Close,
+}
+pub struct ServeLaunchRequest {
+    restart: bool,
+    mode: ServeMode,
+    transport: Option<TunnelTransport>,
+    passphrase: Option<String>,
+}
+
+/// A dashboard launch the App runs, kept on Home so a view opened meanwhile shows it.
+#[derive(Clone)]
+pub enum DashboardLaunch {
+    Running {
+        target: LaunchTarget,
+        started_at: Instant,
+    },
+    /// Failed with no view open; the next view shows it, once.
+    Failed {
+        target: LaunchTarget,
+        message: String,
+    },
+}
+
+#[cfg(test)]
+impl DashboardLaunch {
+    pub(crate) fn tunnel_for_test(started_at: Instant) -> Self {
+        DashboardLaunch::Running {
+            target: LaunchTarget {
+                mode: ServeMode::Tunnel,
+                transport: Some(TunnelTransport::Tailscale),
+                passphrase: None,
+            },
+            started_at,
+        }
+    }
+}
+
+#[derive(Clone)]
+pub struct LaunchTarget {
+    mode: ServeMode,
+    transport: Option<TunnelTransport>,
+    passphrase: Option<String>,
+}
+
+impl ServeLaunchRequest {
+    pub(crate) fn target(&self) -> LaunchTarget {
+        LaunchTarget {
+            mode: self.mode,
+            transport: self.transport,
+            passphrase: self.passphrase.clone(),
+        }
+    }
+
+    pub(crate) async fn run(
+        self,
+        profile: String,
+        predecessor_epoch: Option<String>,
+    ) -> Result<
+        (
+            crate::daemon::RuntimeConnection,
+            crate::daemon::DaemonClient,
+        ),
+        String,
+    > {
+        use clap::Parser;
+        let port = crate::acp::client::autostart::load_or_generate_port().to_string();
+        let mut argv = vec!["aoe", "serve", "--daemon", "--port", port.as_str()];
+        match self.mode {
+            ServeMode::Local => argv.extend(["--host", "0.0.0.0"]),
+            ServeMode::Tunnel => {
+                argv.extend(["--remote", "--host", "127.0.0.1"]);
+                if self.transport == Some(TunnelTransport::Cloudflare) {
+                    argv.push("--no-tailscale");
+                }
+            }
+        }
+        let parsed = crate::cli::Cli::try_parse_from(argv).map_err(|error| error.to_string())?;
+        let Some(crate::cli::Commands::Serve(mut args)) = parsed.command else {
+            unreachable!();
+        };
+        args.passphrase = self.passphrase.clone();
+        let result = crate::cli::serve::start_dashboard_for_tui(&profile, args, predecessor_epoch.as_deref(), self.restart).await
+            .map_err(|error| {
+                if error.downcast_ref::<crate::session::LoadSource>().is_some()
+                    || matches!(error.downcast_ref::<crate::daemon::RuntimeConnectionError>(), Some(crate::daemon::RuntimeConnectionError::Protocol))
+                {
+                    crate::session::sanitized_load_failure(&error)
+                } else {
+                    tracing::warn!(target: "tui.home", %error, "dashboard launch failed");
+                    "Dashboard start failed. Check `aoe logs`; use `aoe serve --status` to inspect the current daemon. If replacement stopped its predecessor, restore the retained launch explicitly with `aoe serve --rollback`.".to_owned()
+                }
+            });
+        if result.is_err()
+            && initial_log_tail()
+                .iter()
+                .any(|line| line.contains("EADDRINUSE") || line.contains("Address already in use"))
+        {
+            remove_app_file("serve.last_port");
+        }
+        if result.is_ok() {
+            remember_last_mode(self.mode);
+            if let Some(passphrase) = self.passphrase {
+                remember_passphrase(&passphrase);
+                save_passphrase_to_disk(&passphrase);
+            }
+        }
+        result
+    }
 }
 
 /// Persisted to `serve.mode` and `serve.last_mode`.
@@ -53,15 +162,6 @@ impl ServeMode {
 enum TunnelTransport {
     Tailscale,
     Cloudflare,
-}
-
-impl From<crate::server::startup::StartupTransport> for TunnelTransport {
-    fn from(t: crate::server::startup::StartupTransport) -> Self {
-        match t {
-            crate::server::startup::StartupTransport::Tailscale => TunnelTransport::Tailscale,
-            crate::server::startup::StartupTransport::Cloudflare => TunnelTransport::Cloudflare,
-        }
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -166,21 +266,13 @@ impl ServeViewState {
         }
     }
 
-    /// The Error screen for a daemon that exited while starting, led by the reason it recorded.
-    fn start_failed(
-        mode: ServeMode,
-        transport: Option<TunnelTransport>,
-        reason: Option<&str>,
-    ) -> Self {
+    /// A start that failed, with the likely cause and the daemon's last log lines, which hold
+    /// the reason it gave.
+    fn start_failed(mode: ServeMode, transport: Option<TunnelTransport>, headline: &str) -> Self {
         let tail = initial_log_tail();
-        let prefix = match mode {
-            ServeMode::Tunnel => "`aoe serve --remote --daemon` exited before the tunnel came up.",
-            ServeMode::Local => "`aoe serve --daemon` exited before the server started.",
-        };
-        let reason = reason.map(|r| format!("\n\n{r}")).unwrap_or_default();
         let hint = diagnose_daemon_exit(&tail.join("\n"), mode);
         ServeViewState::Error {
-            message: format!("{prefix}{reason}{hint}{}", last_log_lines(&tail)),
+            message: format!("{headline}{hint}{}", last_log_lines(&tail)),
             mode,
             transport,
         }
@@ -199,7 +291,7 @@ impl ServeViewState {
                 mode,
                 transport,
                 passphrase,
-                started_at: daemon_started_at(),
+                started_at: Instant::now(),
                 log_offset,
             };
         }
@@ -450,6 +542,9 @@ pub struct ServeView {
     /// What a restart would do now. Refreshed when R, G or help is pressed rather than per
     /// frame: the probe shells out to `tailscale`.
     restart_probe: RestartProbe,
+    pending_launch: Option<ServeLaunchRequest>,
+    launch_in_flight: bool,
+    stop_requested: bool,
 }
 
 impl Default for ServeView {
@@ -462,28 +557,46 @@ impl ServeView {
     /// Reattaches to a running daemon, otherwise opens the mode picker.
     pub fn new() -> Self {
         let pending_passphrase = load_or_generate_passphrase();
-        let state = if crate::cli::serve::daemon_pid().is_some() {
+        let state = if crate::cli::serve::web_daemon_pid().is_some() {
             // Daemons that predate `serve.mode` could only be Tunnel.
             let mode = read_serve_mode().unwrap_or(ServeMode::Tunnel);
             let passphrase = (mode == ServeMode::Tunnel)
                 .then(recall_passphrase)
                 .flatten();
             ServeViewState::running(mode, None, passphrase, log_file_size())
-        } else if let Some(failure) = take_startup_failure() {
-            // A start hidden with Esc, or begun before this TUI opened, failed meanwhile.
-            let mode = if failure.remote {
-                ServeMode::Tunnel
-            } else {
-                ServeMode::Local
-            };
-            ServeViewState::start_failed(
-                mode,
-                failure.transport.map(TunnelTransport::from),
-                Some(&failure.message),
-            )
         } else {
             ServeViewState::mode_picker()
         };
+        Self::with_state(state, pending_passphrase)
+    }
+
+    /// Opened while the App runs a launch, or after one failed with no view open.
+    pub fn for_launch(launch: DashboardLaunch) -> Self {
+        let pending_passphrase = load_or_generate_passphrase();
+        match launch {
+            DashboardLaunch::Running { target, started_at } => {
+                let mut view = Self::with_state(
+                    ServeViewState::Starting {
+                        mode: target.mode,
+                        transport: target.transport,
+                        passphrase: target.passphrase,
+                        started_at,
+                        log_offset: log_file_size(),
+                    },
+                    pending_passphrase,
+                );
+                // The App calls finish_launch on whichever view is open when the launch ends.
+                view.launch_in_flight = true;
+                view
+            }
+            DashboardLaunch::Failed { target, message } => Self::with_state(
+                ServeViewState::start_failed(target.mode, target.transport, &message),
+                pending_passphrase,
+            ),
+        }
+    }
+
+    fn with_state(state: ServeViewState, pending_passphrase: String) -> Self {
         Self {
             state,
             pending_passphrase,
@@ -493,6 +606,9 @@ impl ServeView {
             copied: None,
             running_persists: None,
             restart_probe: RestartProbe::default(),
+            pending_launch: None,
+            launch_in_flight: false,
+            stop_requested: false,
         }
     }
 
@@ -523,21 +639,40 @@ impl ServeView {
     }
 
     pub fn handle_key(&mut self, key: KeyEvent) -> ServeAction {
-        match self.state {
+        if matches!(key.code, KeyCode::Char('s' | 'S'))
+            && matches!(
+                self.state,
+                ServeViewState::Starting { .. }
+                    | ServeViewState::Active { .. }
+                    | ServeViewState::Error { .. }
+            )
+        {
+            if self.stop_requested {
+                return ServeAction::Continue;
+            }
+            self.begin_stop();
+            return ServeAction::Stop;
+        }
+        if self.stop_requested {
+            return if matches!(key.code, KeyCode::Esc | KeyCode::Char('q')) {
+                ServeAction::Close
+            } else {
+                ServeAction::Continue
+            };
+        }
+        let action = match self.state {
             ServeViewState::ModePicker { .. } => self.mode_picker_key(key.code),
             ServeViewState::Confirm { .. } => self.confirm_key(key.code),
             ServeViewState::Starting { .. } => match key.code {
-                // Closing leaves the daemon coming up; `s` aborts it.
                 KeyCode::Esc | KeyCode::Char('q') => ServeAction::Close,
-                KeyCode::Char('s' | 'S') => {
-                    let _ = stop_daemon();
-                    ServeAction::Close
-                }
                 _ => ServeAction::Continue,
             },
             ServeViewState::Active { .. } => self.active_key(key.code),
             ServeViewState::Error { .. } => self.error_key(key.code),
-        }
+        };
+        self.pending_launch
+            .take()
+            .map_or(action, ServeAction::Launch)
     }
 
     fn mode_picker_key(&mut self, code: KeyCode) -> ServeAction {
@@ -680,23 +815,66 @@ impl ServeView {
     }
 
     fn spawn(&mut self, mode: ServeMode, transport: Option<TunnelTransport>) {
-        // Taken before spawning so only the new daemon's output counts as progress.
-        let log_offset = log_file_size();
         let passphrase = (mode == ServeMode::Tunnel).then(|| self.pending_passphrase.clone());
-        // Read just before the daemon reads it at startup.
-        let persists = persist_sessions();
-        self.state = match spawn_daemon(mode, passphrase.as_deref(), transport) {
-            Ok(()) => {
-                self.running_persists = Some(persists);
-                remember_last_mode(mode);
-                ServeViewState::Starting {
-                    mode,
-                    transport,
-                    passphrase,
-                    started_at: Instant::now(),
-                    log_offset,
-                }
+        // Read just before the launch, which the daemon reads at startup.
+        self.running_persists = Some(persist_sessions());
+        self.pending_launch = Some(ServeLaunchRequest {
+            restart: false,
+            mode,
+            transport,
+            passphrase: passphrase.clone(),
+        });
+        self.launch_in_flight = true;
+        self.state = ServeViewState::Starting {
+            mode,
+            transport,
+            passphrase,
+            started_at: Instant::now(),
+            log_offset: log_file_size(),
+        };
+    }
+
+    pub(crate) fn finish_launch(&mut self, result: Result<(), String>) {
+        self.launch_in_flight = false;
+        let ServeViewState::Starting {
+            mode,
+            transport,
+            passphrase,
+            log_offset,
+            ..
+        } = &self.state
+        else {
+            return;
+        };
+        self.state = match result {
+            Ok(()) => ServeViewState::running(*mode, *transport, passphrase.clone(), *log_offset),
+            Err(message) => ServeViewState::start_failed(*mode, *transport, &message),
+        };
+    }
+
+    pub(crate) fn begin_stop(&mut self) {
+        self.stop_requested = true;
+        self.launch_in_flight = true;
+    }
+
+    pub(crate) fn finish_stop(&mut self, result: Result<(), String>) {
+        self.stop_requested = false;
+        self.launch_in_flight = false;
+        let (mode, transport) = match &self.state {
+            ServeViewState::ModePicker { selected, .. } => (*selected, None),
+            ServeViewState::Confirm { selected, .. } => (ServeMode::Tunnel, Some(*selected)),
+            ServeViewState::Starting {
+                mode, transport, ..
             }
+            | ServeViewState::Active {
+                mode, transport, ..
+            }
+            | ServeViewState::Error {
+                mode, transport, ..
+            } => (*mode, *transport),
+        };
+        self.state = match result {
+            Ok(()) => ServeViewState::mode_picker(),
             Err(message) => ServeViewState::Error {
                 message,
                 mode,
@@ -729,16 +907,6 @@ impl ServeView {
         };
         let (mode, transport) = (*mode, *transport);
         match code {
-            KeyCode::Char('s' | 'S') => match stop_daemon() {
-                Ok(()) => self.state = ServeViewState::mode_picker(),
-                Err(e) => {
-                    self.state = ServeViewState::Error {
-                        message: stop_failed(&e),
-                        mode,
-                        transport,
-                    }
-                }
-            },
             KeyCode::Char('g' | 'G') if mode == ServeMode::Tunnel => {
                 if confirmed == Some(PendingConfirm::NewPassphrase) {
                     let new_pp = generate_passphrase();
@@ -786,11 +954,6 @@ impl ServeView {
         };
         let (mode, transport) = (*mode, *transport);
         match code {
-            // Best effort: no daemon left running is the goal either way.
-            KeyCode::Char('s' | 'S') => {
-                let _ = stop_daemon();
-                ServeAction::Close
-            }
             KeyCode::Char('p' | 'P') if mode == ServeMode::Tunnel => {
                 // Like S: a daemon left running must not outlive the retry.
                 if crate::cli::serve::daemon_pid().is_some() {
@@ -837,28 +1000,28 @@ impl ServeView {
         transport: Option<TunnelTransport>,
         passphrase: Option<String>,
     ) {
-        let log_offset = log_file_size();
-        let persists = persist_sessions();
-        self.state = match restart_daemon(mode, passphrase.as_deref(), transport) {
-            Ok(()) => {
-                self.running_persists = Some(persists);
-                if let Some(pp) = &passphrase {
-                    remember_passphrase(pp);
-                }
-                // A reused Tailscale tunnel is back almost at once; skip the Starting flash.
-                std::thread::sleep(Duration::from_millis(200));
-                ServeViewState::running(mode, transport, passphrase, log_offset)
-            }
-            Err(e) => ServeViewState::Error {
-                message: format!("Restart failed: {}", e),
-                mode,
-                transport,
-            },
+        self.running_persists = Some(persist_sessions());
+        self.pending_launch = Some(ServeLaunchRequest {
+            restart: true,
+            mode,
+            transport,
+            passphrase: passphrase.clone(),
+        });
+        self.launch_in_flight = true;
+        self.state = ServeViewState::Starting {
+            mode,
+            transport,
+            passphrase,
+            started_at: Instant::now(),
+            log_offset: log_file_size(),
         };
     }
 
     /// Poll the daemon's files and advance the state. Returns true when a redraw is needed.
     pub fn tick(&mut self) -> bool {
+        if self.launch_in_flight {
+            return false;
+        }
         match &mut self.state {
             ServeViewState::ModePicker { flash, .. } => expire_flash(flash),
             ServeViewState::Starting {
@@ -891,15 +1054,15 @@ impl ServeView {
                 }
                 // The Daemon bounds a Tunnel start itself, so this also catches its timeout.
                 if crate::cli::serve::daemon_pid().is_none() {
-                    let failure = take_startup_failure();
-                    let transport = (*transport).or(failure
-                        .as_ref()
-                        .and_then(|f| f.transport.map(TunnelTransport::from)));
-                    self.state = ServeViewState::start_failed(
-                        mode,
-                        transport,
-                        failure.as_ref().map(|f| f.message.as_str()),
-                    );
+                    let headline = match mode {
+                        ServeMode::Tunnel => {
+                            "`aoe serve --remote --daemon` exited before the tunnel came up."
+                        }
+                        ServeMode::Local => {
+                            "`aoe serve --daemon` exited before the server started."
+                        }
+                    };
+                    self.state = ServeViewState::start_failed(mode, *transport, headline);
                     return true;
                 }
                 log_grew
@@ -969,6 +1132,9 @@ mod tests {
                     persists: true,
                     ..RestartProbe::default()
                 },
+                pending_launch: None,
+                launch_in_flight: false,
+                stop_requested: false,
             };
             crate::session::config::update_config(|c| c.auth.persist_sessions = false).unwrap();
             view.handle_key(KeyEvent::from(KeyCode::Char(key)));
@@ -1033,6 +1199,9 @@ mod tests {
             copied: None,
             running_persists: None,
             restart_probe: RestartProbe::default(),
+            pending_launch: None,
+            launch_in_flight: false,
+            stop_requested: false,
         };
         for key in ['p', 'P', 'r', 'R'] {
             let action = view.handle_key(KeyEvent::from(KeyCode::Char(key)));
@@ -1042,5 +1211,44 @@ mod tests {
                 "{key}"
             );
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial_test::serial]
+    async fn stop_key_returns_owned_action_while_launch_transaction_is_held() {
+        let _home = crate::session::test_support::isolate_app_dir();
+        let transaction = crate::daemon::lifecycle::Transaction::acquire()
+            .await
+            .unwrap();
+        let mut view = ServeView::new();
+        view.state = ServeViewState::Starting {
+            mode: ServeMode::Local,
+            transport: None,
+            passphrase: None,
+            started_at: Instant::now(),
+            log_offset: 0,
+        };
+        view.launch_in_flight = true;
+        let (sent, received) = tokio::sync::oneshot::channel();
+        let key_thread = std::thread::spawn(move || {
+            let action = view.handle_key(KeyEvent::from(KeyCode::Char('s')));
+            let _ = sent.send((view, action));
+        });
+        let (mut view, action) = tokio::time::timeout(Duration::from_secs(2), received)
+            .await
+            .expect("Stop must not wait for the held launch transaction")
+            .unwrap();
+        assert!(matches!(action, ServeAction::Stop));
+        assert!(view.stop_requested);
+        let buffer = crate::tui::dialogs::test_render::draw(110, 40, |frame, theme| {
+            view.render(frame, frame.area(), theme)
+        });
+        crate::tui::dialogs::test_render::find(&buffer, "Stopping daemon");
+        assert!(matches!(
+            view.handle_key(KeyEvent::from(KeyCode::Esc)),
+            ServeAction::Close
+        ));
+        drop(transaction);
+        key_thread.join().unwrap();
     }
 }

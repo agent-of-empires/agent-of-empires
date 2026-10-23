@@ -251,15 +251,23 @@ pub enum ScopedRead {
 pub async fn attempt(command: ScopedCommand<'_>, source: &ReadRequestSource) -> ScopedRead {
     match execute_inner(command, source).await {
         Ok(projection) => {
-            let stderr = if projection.session_table {
+            let notice = if projection.session_table {
                 crate::update::update_notice().await
             } else {
                 None
             };
+            let stderr = match (projection.stderr, notice) {
+                (Some(mut diagnostics), Some(notice)) => {
+                    diagnostics.push_str(&notice);
+                    Some(diagnostics)
+                }
+                (diagnostics, None) => diagnostics,
+                (None, notice) => notice,
+            };
             ScopedRead::Answered(ReadOutcome {
                 stdout: Some(projection.stdout),
                 stderr,
-                exit: 0,
+                exit: projection.exit,
             })
         }
         Err(error) if absent_local_publication(&error, source) => {
@@ -961,6 +969,8 @@ mod tests {
         let projection = render::Projection {
             stdout: "rows\n".into(),
             session_table: false,
+            stderr: None,
+            exit: 0,
         };
         let error = finish_with_close(&mut stream, deadline, Ok(projection))
             .await
@@ -998,16 +1008,18 @@ mod tests {
         row.source_profile = "main".into();
         row.tool = "claude".into();
         test_support::seed_instances_on_disk_for_test("main", vec![row.clone()]);
-        let mut state = test_support::build_test_app_state_with_policy(
+        let state = test_support::build_test_app_state_with_policy_configured(
             vec![row],
             vec!["localhost".into(), "127.0.0.1".into()],
             Vec::new(),
             None,
+            |state| {
+                state.login_manager =
+                    Arc::new(crate::server::login::LoginManager::new(Some(phrase)));
+                state.behind_tunnel = true;
+                state.auth_mode = "passphrase";
+            },
         );
-        let mutable = Arc::get_mut(&mut state).unwrap();
-        mutable.login_manager = Arc::new(crate::server::login::LoginManager::new(Some(phrase)));
-        mutable.behind_tunnel = true;
-        mutable.auth_mode = "passphrase";
         test_support::accept_runtime_read_cache_for_test(&state).await;
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();

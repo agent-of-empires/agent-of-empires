@@ -416,6 +416,11 @@ impl Session {
             Some(ClientCmd::ResumeBackgroundTailing(launches)) => {
                 self.shared.resume_background_tailing(launches)
             }
+            Some(ClientCmd::ResumeTaskTailing(task_ids)) => {
+                self.shared
+                    .resume_task_tailing(&self.acp_session_id.0, task_ids)
+                    .await
+            }
             Some(ClientCmd::Prompt(blocks)) => return Ok(self.on_follow_up(turn, blocks).await),
             Some(ClientCmd::ResetSession {
                 text, respond_to, ..

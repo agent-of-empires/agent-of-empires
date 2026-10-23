@@ -9,7 +9,7 @@ use std::time::Instant;
 use anyhow::Result;
 use fs2::FileExt;
 
-use super::{Instance, StartOutcome};
+use super::Instance;
 
 /// File-system claim that the holder is the sole recovery owner for this machine.
 pub struct RecoveryLock {
@@ -51,7 +51,8 @@ pub fn is_recovery_candidate(inst: &Instance) -> bool {
         .agent_session_id
         .as_deref()
         .is_some_and(super::is_valid_session_id);
-    !inst.is_structured()
+    inst.terminal_handoff.is_none()
+        && !inst.is_structured()
         && !inst.is_archived()
         && !inst.is_snoozed()
         && !inst.is_trashed()
@@ -318,40 +319,6 @@ pub fn drain_recovery_pending(
         guard.remove(id);
     }
     unmark_recently_restarted(recently_restarted, id);
-}
-
-/// Run the recovery cascade for one instance.
-pub fn run_recovery_for_instance(inst: &mut Instance) -> Result<StartOutcome> {
-    let _scope = HookTimeoutScope::new(recovery_hook_timeout());
-    let result = inst.restart_with_size_opts(None, false);
-    if let Err(ref e) = result {
-        // A peer archived or trashed the row after the candidate filter; that is not a failure.
-        if e.downcast_ref::<super::StartBlocked>().is_none() {
-            stamp_recovery_error(inst, e);
-        }
-    }
-    result
-}
-
-fn stamp_recovery_error(inst: &mut Instance, e: &anyhow::Error) {
-    inst.status = super::Status::Error;
-    inst.last_error = Some(format_recovery_last_error(e));
-    inst.last_error_check = Some(std::time::Instant::now());
-}
-
-/// Project a cascade `anyhow::Error` onto the operator-facing `last_error` string.
-fn format_recovery_last_error(e: &anyhow::Error) -> String {
-    if let Some(t) = e
-        .chain()
-        .find_map(|c| c.downcast_ref::<super::config::repo_config::HookTimeout>())
-    {
-        format!(
-            "on_launch hook timed out after {}s: {}",
-            t.timeout_secs, t.cmd
-        )
-    } else {
-        format!("recovery cascade: {}", e)
-    }
 }
 
 /// 30 s default; the operational guidance for non-interactive on_launch hooks.
@@ -772,83 +739,5 @@ mod tests {
             try_acquire_recovery_lock_at(&path).unwrap().is_some(),
             "re-acquisition after drop should succeed"
         );
-    }
-
-    fn hook_timeout(cmd: &str, timeout_secs: u64) -> anyhow::Error {
-        anyhow::Error::new(super::super::config::repo_config::HookTimeout {
-            cmd: cmd.to_string(),
-            timeout_secs,
-        })
-    }
-
-    #[test]
-    fn recovery_error_classifies_a_hook_timeout_anywhere_in_the_chain_and_stamps_it() {
-        assert_eq!(
-            format_recovery_last_error(&hook_timeout("sleep 60", 30)),
-            "on_launch hook timed out after 30s: sleep 60",
-        );
-        assert_eq!(
-            format_recovery_last_error(
-                &hook_timeout("echo hi && sleep 60", 12).context("recovery cascade tier 1")
-            ),
-            "on_launch hook timed out after 12s: echo hi && sleep 60",
-            "a later `.context(..)` wrap must not hide the timeout",
-        );
-        assert_eq!(
-            format_recovery_last_error(&anyhow::anyhow!("tmux session is gone")),
-            "recovery cascade: tmux session is gone",
-        );
-
-        let mut inst = Instance::new("timeout", "/tmp/test");
-        let before = std::time::Instant::now();
-        stamp_recovery_error(&mut inst, &hook_timeout("sleep 60", 30));
-        assert_eq!(inst.status, super::super::Status::Error);
-        assert_eq!(
-            inst.last_error.as_deref(),
-            Some("on_launch hook timed out after 30s: sleep 60"),
-        );
-        assert!(
-            inst.last_error_check
-                .is_some_and(|checked| checked >= before),
-            "last_error_check must arm sticky error handling",
-        );
-    }
-
-    /// #4116: a row archived or trashed after the candidate filter is not relaunched by
-    /// `auto_resume_on_restart` recovery, and is not stamped as a recovery failure.
-    #[test]
-    #[serial_test::serial]
-    fn recovery_does_not_relaunch_a_row_shelved_after_candidacy() {
-        use crate::session::StartBlocked;
-        for (shelve, want) in [
-            (
-                Instance::archive as fn(&mut Instance),
-                StartBlocked::Archived,
-            ),
-            (Instance::trash, StartBlocked::Trashed),
-        ] {
-            let temp = tempfile::tempdir().unwrap();
-            let _home = crate::session::test_support::isolate_home(temp.path());
-            let profile = "recovery-shelved";
-            let mut inst = Instance::new("shelved", "/tmp/test");
-            inst.source_profile = profile.to_string();
-            inst.status = super::super::Status::Error;
-            inst.agent_session_id = Some("11111111-1111-4111-8111-111111111111".into());
-            assert!(is_recovery_candidate(&inst));
-            let mut peer = inst.clone();
-            shelve(&mut peer);
-            super::super::Storage::new_unwatched(profile)
-                .unwrap()
-                .update(|rows, _| {
-                    *rows = vec![peer];
-                    Ok(())
-                })
-                .unwrap();
-
-            let err = run_recovery_for_instance(&mut inst).unwrap_err();
-            assert_eq!(err.downcast_ref::<StartBlocked>(), Some(&want));
-            assert_eq!(inst.last_error, None);
-            assert!(!inst.tmux_session().unwrap().exists());
-        }
     }
 }

@@ -1291,6 +1291,9 @@ mod tests {
                     None,
                     "codex".into(),
                     None,
+                    None,
+                    None,
+                    None,
                 )
                 .await
                 .unwrap();
@@ -1463,6 +1466,9 @@ mod tests {
                 None,
                 "codex".into(),
                 None,
+                None,
+                None,
+                None,
             )
             .await
             .unwrap();
@@ -1548,6 +1554,9 @@ mod tests {
                 AcpSessionId("same-id".into()),
                 None,
                 "codex".into(),
+                None,
+                None,
+                None,
                 None,
             )
             .await
@@ -1668,6 +1677,9 @@ mod tests {
                 AcpSessionId("byte-backlog".into()),
                 None,
                 "codex".into(),
+                None,
+                None,
+                None,
                 None,
             )
             .await

@@ -45,6 +45,7 @@ const TAP_MAX_MS = 350;
 const LIVE_DEBUG = typeof location !== "undefined" && new URLSearchParams(location.search).has("livedebug");
 
 export interface MobileLiveTerminalProps {
+  readOnly: boolean;
   frame: LiveFrame | null;
   /** Wire counters for the `?livedebug=1` overlay. */
   liveStats?: LiveStats;
@@ -64,7 +65,9 @@ export interface MobileLiveTerminalProps {
   sendData: (data: string) => boolean;
   sendPaste: (text: string, submit: boolean) => boolean;
   /** Uploads a pasted image and resolves to a path the pane can read, or null. */
-  uploadPastedImage: (file: File) => Promise<string | null>;
+  uploadPastedImage: (file: File, canWrite: () => boolean) => Promise<string | null>;
+  /** Captures this gesture's policy/terminal identity before any asynchronous work. */
+  captureWriteAdmission: () => () => boolean;
   forwardWheel: (up: boolean, sgr: boolean, col: number, row: number) => void;
   forwardButton: (
     baseButton: number,
@@ -110,6 +113,7 @@ function pushFlickSample(samples: FlickSample[], sample: FlickSample) {
 }
 
 export function MobileLiveTerminal({
+  readOnly,
   frame: streamFrame,
   liveStats,
   transport,
@@ -125,6 +129,7 @@ export function MobileLiveTerminal({
   sendData: sendDataRaw,
   sendPaste,
   uploadPastedImage,
+  captureWriteAdmission,
   forwardWheel,
   forwardButton,
   ctrlActiveRef,
@@ -224,7 +229,7 @@ export function MobileLiveTerminal({
   const spacerLines = Math.max(0, (frame?.history ?? 0) - Math.max(0, lines.length - screenRows));
   // A full-screen mouse app's scrollback is not capturable: no spacer, no native scroll, wheels go to the app.
   const altScreen = frame?.altScreen ?? false;
-  const forwardMode = altScreen && (frame?.mouse ?? false);
+  const forwardMode = !readOnly && altScreen && (frame?.mouse ?? false);
   const effectiveSpacerLines = forwardMode ? 0 : spacerLines;
   // Gestures yield to a selection so WebKit can drag its handles; the layout keeps `forwardMode` so row keys hold.
   const { forwardModeRef, mouseSgrRef } = useTerminalGestureBoundary({
@@ -338,6 +343,7 @@ export function MobileLiveTerminal({
 
   // A tap raises the keyboard; focus() must stay synchronous for iOS. A click ending a selection is left alone.
   const focusInputOnTap = useCallback(() => {
+    if (readOnly) return;
     if (suppressTouchClickRef.current) {
       suppressTouchClickRef.current = false;
       return;
@@ -346,7 +352,7 @@ export function MobileLiveTerminal({
     const sel = window.getSelection();
     if (sel && !sel.isCollapsed) return;
     inputRef.current?.focus();
-  }, [inputRef]);
+  }, [inputRef, readOnly]);
 
   // A viewport point as a 1-based pane-0 cell, measured from the (possibly bottom-aligned) rendered content.
   const pointerCell = useCallback(
@@ -662,6 +668,7 @@ export function MobileLiveTerminal({
     sendData,
     sendPaste,
     uploadPastedImage,
+    captureWriteAdmission,
   });
 
   const cursorRow = connected && !reading ? live.row : -1;
@@ -789,6 +796,7 @@ export function MobileLiveTerminal({
       <textarea
         ref={inputRef}
         aria-label="Live terminal input"
+        readOnly={readOnly}
         className="absolute bottom-2 left-2 w-px h-px opacity-0"
         // iOS draws the caret ignoring opacity; caret-color hides it.
         style={{ fontSize: "16px", caretColor: "transparent", color: "transparent" }}

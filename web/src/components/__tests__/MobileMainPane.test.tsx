@@ -67,6 +67,7 @@ function setup(overrides: Partial<Parameters<typeof MobileMainPane>[0]> = {}) {
   const onBackToAgent = vi.fn();
   const props: Parameters<typeof MobileMainPane>[0] = {
     view: "agent",
+    readOnly: false,
     pluginPanes: [],
     onBackToAgent,
     onOpenAgentsPane: vi.fn(),

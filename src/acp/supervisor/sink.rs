@@ -6,7 +6,7 @@ use tokio::sync::broadcast;
 
 use crate::acp::approvals::Nonce;
 use crate::acp::event_store::{AttachmentBlob, EventStore, UnresolvedBackgroundAgentLaunch};
-use crate::acp::state::{Event, RateLimitInfo};
+use crate::acp::state::{BackgroundTaskLaunch, Event, RateLimitInfo};
 
 /// Destination for published events; test sinks override only what they observe.
 pub trait BroadcastSink: Send + Sync + 'static {
@@ -34,6 +34,14 @@ pub trait BroadcastSink: Send + Sync + 'static {
     /// `BackgroundAgentCompleted`: sub-agents a dead worker's tailer will
     /// never report on again.
     fn unresolved_background_agent_ids(&self, _session_id: &str) -> Vec<String> {
+        Vec::new()
+    }
+    /// Task ids of `BackgroundTaskStarted` events on disk with no matching
+    /// `BackgroundTaskFinished`: tasks a dead worker will never report on.
+    fn unresolved_background_task_ids(&self, _session_id: &str) -> Vec<String> {
+        Vec::new()
+    }
+    fn unresolved_background_task_launches(&self, _session_id: &str) -> Vec<BackgroundTaskLaunch> {
         Vec::new()
     }
     /// The same rows, carrying `output_file` so `Supervisor::attach` can
@@ -88,6 +96,15 @@ impl BroadcastSink for ChannelSink {
 
     fn unresolved_background_agent_ids(&self, session_id: &str) -> Vec<String> {
         self.event_store.unresolved_background_agent_ids(session_id)
+    }
+
+    fn unresolved_background_task_ids(&self, session_id: &str) -> Vec<String> {
+        self.event_store.unresolved_background_task_ids(session_id)
+    }
+
+    fn unresolved_background_task_launches(&self, session_id: &str) -> Vec<BackgroundTaskLaunch> {
+        self.event_store
+            .unresolved_background_task_launches(session_id)
     }
 
     fn unresolved_background_agent_launches(

@@ -66,7 +66,7 @@ pub use rename::{RenameData, RenameDialog, RenameMode};
 pub use repo_trust::{RepoTrustAction, RepoTrustDialog};
 pub use restart::{RestartData, RestartDialog};
 pub use send_message::SendMessageDialog;
-pub use serve::{ServeAction, ServeView};
+pub use serve::{DashboardLaunch, ServeAction, ServeLaunchRequest, ServeView};
 pub use skills_manager::SkillsManagerDialog;
 pub use snooze_duration::SnoozeDurationDialog;
 pub use telemetry_consent::TelemetryConsentDialog;
