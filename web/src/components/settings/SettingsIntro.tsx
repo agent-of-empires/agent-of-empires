@@ -49,11 +49,15 @@ export function SettingsIntro({ id, onFold }: { id: SettingsIntroId; onFold: () 
           aria-expanded={open}
           aria-controls={detailsId}
           onClick={() => setOpen((o) => !o)}
-          className="min-h-8 cursor-pointer text-brand-500 hover:text-brand-400"
+          className="min-h-8 cursor-pointer font-medium text-text-primary underline-offset-4 hover:underline"
         >
           Details <span aria-hidden="true">{open ? "⌄" : "›"}</span>
         </button>
-        <button type="button" onClick={onFold} className="min-h-8 cursor-pointer text-brand-500 hover:text-brand-400">
+        <button
+          type="button"
+          onClick={onFold}
+          className="min-h-8 cursor-pointer font-medium text-text-primary underline-offset-4 hover:underline"
+        >
           Got it
         </button>
       </div>
@@ -67,7 +71,7 @@ export function SettingsIntroReopen({ onReopen }: { onReopen: () => void }) {
       type="button"
       onClick={onReopen}
       aria-label="About this tab"
-      className="inline-flex min-h-8 cursor-pointer items-center gap-1 text-xs text-text-secondary hover:text-text-primary"
+      className="inline-flex min-h-8 cursor-pointer items-center gap-1 text-xs text-text-subtle hover:text-text-primary"
     >
       <span aria-hidden="true">ⓘ</span>
       About

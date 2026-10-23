@@ -4644,6 +4644,7 @@
       "risk": "low",
       "specs": [
         "src/components/__tests__/SettingsView.intros.test.tsx",
+        "src/components/settings/__tests__/SettingsIntro.test.tsx",
         "src/hooks/useTour.test.tsx",
         "src/lib/__tests__/webUiSync.test.ts"
       ],
