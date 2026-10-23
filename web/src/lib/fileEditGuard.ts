@@ -1,47 +1,71 @@
+import type { SessionFileResponse } from "./api";
 import { toastBus } from "./toastBus";
 
-interface EditGuard {
-  dirty(): boolean;
-  saving(): boolean;
-  discard(): void;
+interface FileDraft {
+  /** The snapshot the edit started from; its version guards the save. */
+  original: SessionFileResponse;
+  text: string;
+  saving: boolean;
 }
 
-const guards = new Set<EditGuard>();
+// Unsaved drafts outlive their editor, so a layout switch or reopening the file restores them.
+// Leaving an open editor asks first; a page unload loses every draft.
+const drafts = new Map<string, FileDraft>();
+// Mounted editors by draft key; discarding a draft closes its editor.
+const editors = new Map<string, () => void>();
 
-export function registerFileEditGuard(guard: EditGuard): () => void {
-  guards.add(guard);
+export function fileDraftKey(sessionId: string, filePath: string): string {
+  return `${sessionId} ${filePath}`;
+}
+
+export function getFileDraft(key: string): FileDraft | undefined {
+  return drafts.get(key);
+}
+
+/** Store an unsaved draft, or drop it with `null` once saved, discarded or clean. */
+export function setFileDraft(key: string, draft: FileDraft | null): void {
+  if (draft) drafts.set(key, draft);
+  else drafts.delete(key);
+}
+
+export function registerFileEditor(key: string, discard: () => void): () => void {
+  editors.set(key, discard);
   return () => {
-    guards.delete(guard);
+    if (editors.get(key) === discard) editors.delete(key);
   };
 }
 
 /** An open editor owns Escape: it cancels the edit rather than closing the file. */
 export function isFileEditorOpen(): boolean {
-  return guards.size > 0;
+  return editors.size > 0;
+}
+
+function openDrafts(): [string, FileDraft][] {
+  return [...drafts].filter(([key]) => editors.has(key));
 }
 
 export function hasUnsavedFileEdits(): boolean {
-  return [...guards].some((guard) => guard.dirty() || guard.saving());
+  return openDrafts().length > 0;
 }
 
 export function confirmFileEditNavigation(): boolean {
-  if ([...guards].some((guard) => guard.saving())) {
+  const open = openDrafts();
+  if (open.some(([, draft]) => draft.saving)) {
     toastBus.handler?.error("Wait for the file save to finish.");
     return false;
   }
-  const dirty = [...guards].filter((guard) => guard.dirty());
-  if (dirty.length === 0) return true;
+  if (open.length === 0) return true;
   if (!window.confirm("Discard unsaved file changes?")) return false;
-  dirty.forEach((guard) => {
-    guards.delete(guard);
-    guard.discard();
+  open.forEach(([key]) => {
+    drafts.delete(key);
+    editors.get(key)?.();
   });
   return true;
 }
 
 let previousLocation: { index: number | undefined; state: unknown; url: string } | null = null;
 let restoringHistory = false;
-let historyInstalled = false;
+let installed = false;
 
 export function rememberFileEditLocation(): void {
   if (restoringHistory) return;
@@ -53,9 +77,14 @@ export function rememberFileEditLocation(): void {
 }
 
 /** Install before BrowserRouter so its popstate listener cannot unmount a dirty editor first. */
-export function installFileEditHistoryGuard(): void {
-  if (historyInstalled) return;
-  historyInstalled = true;
+export function installFileEditGuards(): void {
+  if (installed) return;
+  installed = true;
+  window.addEventListener("beforeunload", (event) => {
+    if (drafts.size === 0) return;
+    event.preventDefault();
+    event.returnValue = "";
+  });
   window.addEventListener(
     "popstate",
     (event: PopStateEvent) => {

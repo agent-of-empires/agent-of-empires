@@ -2,7 +2,8 @@ import { useEffect, useRef, useState } from "react";
 import { Pencil } from "lucide-react";
 import { TextFileEditor } from "./TextFileEditor";
 import { requestComposerPrefill } from "../../lib/composerPrefill";
-import { getSessionFile } from "../../lib/api";
+import { getSessionFile, type SessionFileResponse } from "../../lib/api";
+import { fileDraftKey, getFileDraft } from "../../lib/fileEditGuard";
 import { useWebSettings } from "../../hooks/useWebSettings";
 import { extensionToLanguage } from "./comments/language";
 import { BinaryFileView } from "./BinaryFileView";
@@ -18,29 +19,24 @@ interface Props {
   structured?: boolean;
 }
 
-interface Loaded {
-  content: string;
-  is_binary: boolean;
-  truncated: boolean;
-  version?: string | null;
-  edit_disabled_reason?: string | null;
-}
-
 /** A session file: Markdown with a Rendered/Raw toggle, otherwise highlighted source. */
 export function FileContentViewer(props: Props) {
-  return <SessionFileViewer key={`${props.sessionId} ${props.filePath}`} {...props} />;
+  return <SessionFileViewer key={fileDraftKey(props.sessionId, props.filePath)} {...props} />;
 }
 
 function SessionFileViewer({ sessionId, filePath, onBack, structured }: Props) {
   const { settings } = useWebSettings();
   // The opened snapshot, frozen so a refetch cannot move the version under a draft.
-  const [editing, setEditing] = useState<Loaded | null>(null);
+  // An unsaved draft from before a layout switch reopens the editor.
+  const [editing, setEditing] = useState<SessionFileResponse | null>(
+    () => getFileDraft(fileDraftKey(sessionId, filePath))?.original ?? null,
+  );
   const [revision, setRevision] = useState(0);
   const [saved, setSaved] = useState(false);
   const containerRef = useRef<HTMLDivElement>(null);
   // Keyed by target so a stale response from a fast switch is ignored at render.
   const key = `${sessionId} ${filePath} ${revision}`;
-  const [loaded, setLoaded] = useState<{ key: string; data: Loaded | null; error: string | null }>({
+  const [loaded, setLoaded] = useState<{ key: string; data: SessionFileResponse | null; error: string | null }>({
     key,
     data: null,
     error: null,

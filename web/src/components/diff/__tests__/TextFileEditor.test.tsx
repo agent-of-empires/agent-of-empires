@@ -4,10 +4,20 @@ import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-libra
 import { TextFileEditor } from "../TextFileEditor";
 import * as api from "../../../lib/api";
 import * as clipboard from "../../../lib/clipboard";
-import { confirmFileEditNavigation, isFileEditorOpen, preserveLineEndings } from "../../../lib/fileEditGuard";
+import {
+  confirmFileEditNavigation,
+  fileDraftKey,
+  hasUnsavedFileEdits,
+  installFileEditGuards,
+  isFileEditorOpen,
+  preserveLineEndings,
+  setFileDraft,
+} from "../../../lib/fileEditGuard";
 
+installFileEditGuards();
 afterEach(() => {
   cleanup();
+  setFileDraft(fileDraftKey("s1", "notes.txt"), null);
   vi.restoreAllMocks();
   vi.useRealTimers();
 });
@@ -114,6 +124,28 @@ describe("TextFileEditor", () => {
     expect(isFileEditorOpen()).toBe(true);
     cleanup();
     expect(isFileEditorOpen()).toBe(false);
+  });
+  it("keeps an unsaved draft through a remount, as a layout switch does", () => {
+    const { editor } = setup();
+    fireEvent.change(editor, { target: { value: "survives" } });
+    cleanup();
+    expect(isFileEditorOpen()).toBe(false);
+    // Switching views parks the draft without asking; only an unload would lose it.
+    expect(hasUnsavedFileEdits()).toBe(false);
+    const unload = new Event("beforeunload", { cancelable: true });
+    window.dispatchEvent(unload);
+    expect(unload.defaultPrevented).toBe(true);
+    expect((setup().editor as HTMLTextAreaElement).value).toBe("survives");
+    expect(hasUnsavedFileEdits()).toBe(true);
+  });
+  it("leaves no draft behind once the edit is clean again", () => {
+    const { editor } = setup();
+    fireEvent.change(editor, { target: { value: "changed" } });
+    fireEvent.change(editor, { target: { value: "one\ntwo\n" } });
+    cleanup();
+    const unload = new Event("beforeunload", { cancelable: true });
+    window.dispatchEvent(unload);
+    expect(unload.defaultPrevented).toBe(false);
   });
   it("warns on tab unload only while edits are dirty", () => {
     const { editor } = setup();
