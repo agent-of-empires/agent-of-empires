@@ -66,6 +66,13 @@ pub(super) fn render(view: &ServeView, frame: &mut Frame, area: Rect, theme: &Th
             (*tailscale, *cloudflare),
             flash_text(flash),
         ),
+        ServeViewState::Checking { .. } => render_pending(
+            frame,
+            area,
+            theme,
+            " Checking... ",
+            "Looking for a running daemon",
+        ),
         ServeViewState::Starting {
             mode, started_at, ..
         } => render_starting(
@@ -435,6 +442,15 @@ fn render_confirm(
         Style::default().fg(theme.dimmed),
     );
     record_hints(frame, mouse, keys);
+}
+
+fn render_pending(frame: &mut Frame, area: Rect, theme: &Theme, title: &str, line: &str) {
+    let inner = render_page(frame, area, title, theme.border, theme.title);
+    frame.render_widget(
+        Paragraph::new(Line::styled(line, Style::default().fg(theme.text)))
+            .alignment(Alignment::Center),
+        centered_rect(inner, inner.width, 1),
+    );
 }
 
 fn render_starting(
@@ -1006,6 +1022,7 @@ mod tests {
             pending_launch: None,
             launch_in_flight: false,
             stop_requested: false,
+            probes: super::super::Probes::new(|_| false),
         };
         let mut term = Terminal::new(TestBackend::new(72, 26)).unwrap();
         term.draw(|f| render(&view, f, f.area(), &Theme::default()))
@@ -1058,6 +1075,7 @@ mod tests {
             pending_launch: None,
             launch_in_flight: false,
             stop_requested: false,
+            probes: super::super::Probes::new(|_| false),
         }
     }
 
