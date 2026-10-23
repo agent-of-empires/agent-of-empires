@@ -263,7 +263,7 @@ impl Instance {
             // fresh process attached to a running container with no values yet.
             self.ensure_before_start_env(false, &launch_config, &mut scoped_hook)?;
             if self.sandbox_store_generation < container_config::CURRENT_SANDBOX_STORE_GENERATION {
-                self.backfill_container_workdir(&container);
+                self.reconcile_container_workdir(&container);
                 return Ok((container, false));
             }
             // Still rotating the copy in its store.
