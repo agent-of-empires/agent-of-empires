@@ -152,13 +152,13 @@ export function GroupCombobox({
                   pick(option);
                 }}
                 className={`flex min-h-11 cursor-pointer items-center justify-between gap-2 px-3 py-1.5 text-sm md:min-h-0 ${
-                  i === active ? "bg-surface-800 text-text-primary" : "text-text-secondary"
+                  i === active ? "bg-surface-800 text-text-primary" : "text-text-subtle"
                 }`}
               >
                 {option.kind === "group" ? (
                   <>
                     <span className="truncate font-mono">{option.group.path}</span>
-                    <span className="shrink-0 text-xs text-text-dim">
+                    <span className="shrink-0 text-xs text-text-subtle">
                       {option.group.session_count} {option.group.session_count === 1 ? "session" : "sessions"}
                       {option.group.archived && " · archived"}
                     </span>
@@ -171,7 +171,7 @@ export function GroupCombobox({
               </li>
             ))}
           </ul>
-          <p className="min-h-0 shrink overflow-y-auto border-t border-surface-700/60 px-3 py-2 text-xs text-text-dim">
+          <p className="min-h-0 shrink overflow-y-auto border-t border-surface-700/60 px-3 py-2 text-xs text-text-subtle">
             {noGroups && !value.trim() ? (
               "No groups yet. Type a name to create one."
             ) : (

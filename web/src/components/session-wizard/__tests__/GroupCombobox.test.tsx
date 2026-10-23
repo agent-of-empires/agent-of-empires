@@ -210,6 +210,17 @@ describe("GroupCombobox", () => {
     }
   });
 
+  // resolved.rs asserts text-subtle and text-primary on surface-900 and surface-800, the popup's
+  // and the highlighted row's backgrounds; the raw secondary and dim slots fail in light themes.
+  it("draws its rows and help only in the asserted readable tokens", () => {
+    render(<Harness />);
+    fireEvent.focus(input());
+    type("client/");
+    const popup = screen.getByTestId("group-combobox-popup");
+    expect(popup.querySelectorAll(".text-text-secondary, .text-text-dim")).toHaveLength(0);
+    expect(popup.querySelectorAll(".text-text-subtle").length).toBeGreaterThan(0);
+  });
+
   it("a click picks a group", () => {
     render(<Harness />);
     fireEvent.focus(input());
