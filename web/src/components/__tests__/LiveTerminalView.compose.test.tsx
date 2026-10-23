@@ -53,7 +53,7 @@ async function openCompose(sessionId: string, delivered: boolean) {
   live.sendPaste.mockReset().mockReturnValue(delivered);
   const error = vi.fn();
   toastBus.handler = { push: vi.fn(), error, info: vi.fn(), openLink: vi.fn() };
-  render(<LiveTerminalView session={makeSession({ id: sessionId })} />);
+  render(<LiveTerminalView readOnly={false} session={makeSession({ id: sessionId })} />);
   fireEvent.click(await screen.findByRole("button", { name: "Compose" }));
   const text = screen.getByLabelText<HTMLTextAreaElement>("Message");
   fireEvent.input(text, { target: { value: "ship it" } });
@@ -72,7 +72,7 @@ describe("LiveTerminalView compose", () => {
 
   it("stops the hidden input shadowing text typed before the compose send", async () => {
     live.sendPaste.mockReset().mockReturnValue(true);
-    render(<LiveTerminalView session={makeSession({ id: "compose-shadow" })} />);
+    render(<LiveTerminalView readOnly={false} session={makeSession({ id: "compose-shadow" })} />);
     const input = await screen.findByLabelText<HTMLTextAreaElement>("Live terminal input");
     input.value = `${HIDDEN_INPUT_SENTINEL}abc`;
     fireEvent.click(screen.getByRole("button", { name: "Compose" }));

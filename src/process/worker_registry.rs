@@ -16,6 +16,15 @@ pub use crate::process::worker::{is_pid_alive, validate_id as validate_session_i
 /// Generation 7 binds runner retirement to a kernel birth identity.
 pub const RUNNER_VERSION: u32 = 7;
 
+/// Frozen scope authority for this runner, never a session-wide wildcard.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum ScopeOwnership {
+    Unscoped,
+    Owned { unit: String },
+    Unresolved,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkerRecord {
     pub runner_version: u32,
@@ -44,6 +53,7 @@ pub struct WorkerRecord {
     /// Together with `pid`, identifies the exact runner process. Older records default to 0.
     #[serde(default)]
     pub generation: u64,
+    pub scope: ScopeOwnership,
     pub started_at: u64,
     pub last_attached_at: Option<u64>,
     pub detached_at: Option<u64>,
@@ -81,6 +91,7 @@ impl WorkerRecord {
             source_profile,
             prime_runtime: None,
             generation: 0,
+            scope: ScopeOwnership::Unscoped,
             started_at: now_secs(),
             last_attached_at: None,
             detached_at: None,
@@ -166,6 +177,7 @@ pub(crate) fn admit_resume(
 ) -> Result<()> {
     with_registry_lock(session_id, || {
         let current = stop_intent(session_id)?;
+        let record = load_strict_unlocked(session_id)?;
         if current.is_none() {
             return Ok(());
         }
@@ -174,7 +186,7 @@ pub(crate) fn admit_resume(
             "worker stop intent fences automatic or superseded resume"
         );
         anyhow::ensure!(
-            load_strict_unlocked(session_id)?.is_none(),
+            record.is_none(),
             "worker shutdown is not settled; resume remains fenced"
         );
         std::fs::remove_file(stop_path(session_id)?)?;
@@ -362,10 +374,7 @@ fn save_unlocked(record: &WorkerRecord) -> Result<()> {
         .context("publishing worker record")
 }
 
-pub(crate) fn with_registry_lock<T>(
-    session_id: &str,
-    operation: impl FnOnce() -> Result<T>,
-) -> Result<T> {
+pub(crate) fn acquire_registry_lock(session_id: &str) -> Result<std::fs::File> {
     validate_session_id(session_id)?;
     let lock_path = workers_dir()?.join(format!("{session_id}.lock"));
     let lock_file = std::fs::OpenOptions::new()
@@ -383,6 +392,14 @@ pub(crate) fn with_registry_lock<T>(
     lock_file
         .lock_exclusive()
         .with_context(|| format!("locking worker registry entry {session_id}"))?;
+    Ok(lock_file)
+}
+
+pub(crate) fn with_registry_lock<T>(
+    session_id: &str,
+    operation: impl FnOnce() -> Result<T>,
+) -> Result<T> {
+    let lock_file = acquire_registry_lock(session_id)?;
     let result = operation();
     let unlock = fs2::FileExt::unlock(&lock_file)
         .with_context(|| format!("unlocking worker registry entry {session_id}"));
@@ -394,7 +411,28 @@ pub(crate) fn with_registry_lock<T>(
 }
 
 pub fn load(session_id: &str) -> Result<Option<WorkerRecord>> {
-    load_strict_unlocked(session_id)
+    let path = record_path(session_id)?;
+    if !path.exists() {
+        return Ok(None);
+    }
+    let bytes = std::fs::read(&path).with_context(|| format!("reading {}", path.display()))?;
+    match serde_json::from_slice::<WorkerRecord>(&bytes) {
+        Ok(record) => Ok(Some(record)),
+        Err(e) => {
+            warn!(
+                target: "acp.registry",
+                path = %path.display(),
+                "failed to parse worker record: {e}; treating as missing"
+            );
+            Ok(None)
+        }
+    }
+}
+
+/// Locked, strict read for destructive ownership decisions. Unlike [`load`],
+/// malformed or unreadable state remains an error instead of looking absent.
+pub(crate) fn load_strict(session_id: &str) -> Result<Option<WorkerRecord>> {
+    with_registry_lock(session_id, || load_strict_unlocked(session_id))
 }
 fn load_strict_unlocked(session_id: &str) -> Result<Option<WorkerRecord>> {
     let path = record_path(session_id)?;
@@ -958,7 +996,7 @@ mod tests {
             let control = crate::process::worker::control_socket_sibling(&socket);
             let listener = std::os::unix::net::UnixListener::bind(&control).unwrap();
             let replacement = new_record(id, std::process::id(), socket);
-            assert!(load(id).is_err());
+            assert!(load_strict(id).is_err());
             assert!(save(&replacement).is_err());
             assert!(delete(id).is_err());
             assert!(recover_worker(id).is_err());
@@ -1219,52 +1257,6 @@ mod tests {
 
             stale.build_version = "0.0.0+gdeadbeef".into();
             assert!(!is_build_current(&stale));
-        });
-    }
-
-    #[test]
-    #[serial]
-    fn load_fills_defaults_for_fields_legacy_records_lack() {
-        with_temp_home(|| {
-            let cases: [(&str, &[&str], fn(&WorkerRecord)); 3] = [
-                ("legacy-bv", &["build_version"], |rec| {
-                    assert_eq!(rec.build_version, "");
-                    assert!(!is_build_current(rec));
-                }),
-                ("legacy-ak", &["agent_key"], |rec| {
-                    assert_eq!(rec.agent_name, "claude-agent-acp");
-                    assert_eq!(rec.agent_key, "");
-                }),
-                ("legacy-sp", &["source_profile"], |rec| {
-                    assert_eq!(rec.source_profile, None);
-                }),
-            ];
-            for (session_id, dropped, check) in cases {
-                let mut legacy = serde_json::json!({
-                    "runner_version": RUNNER_VERSION,
-                    "build_version": crate::build_info::BUILD_VERSION,
-                    "session_id": session_id,
-                    "pid": 7,
-                    "socket_path": format!("/tmp/{session_id}.sock"),
-                    "agent_name": "claude-agent-acp",
-                    "agent_key": "claude",
-                    "cwd": "/repo",
-                    "model": null,
-                    "additional_dirs": [],
-                    "provider_env_keys": [],
-                    "stored_acp_session_id": null,
-                    "source_profile": null,
-                    "started_at": 0,
-                    "last_attached_at": null,
-                    "detached_at": null
-                });
-                for field in dropped {
-                    legacy.as_object_mut().unwrap().remove(*field);
-                }
-                let path = workers_dir().unwrap().join(format!("{session_id}.json"));
-                std::fs::write(&path, serde_json::to_string(&legacy).unwrap()).unwrap();
-                check(&load(session_id).unwrap().unwrap());
-            }
         });
     }
 

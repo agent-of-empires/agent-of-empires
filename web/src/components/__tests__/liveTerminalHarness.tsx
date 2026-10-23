@@ -39,6 +39,7 @@ export const alt = { altScreen: true, mouse: true, mouseSgr: true } as const;
 export function liveProps(over: Partial<MobileLiveTerminalProps> = {}): MobileLiveTerminalProps {
   return {
     frame: liveFrame(),
+    readOnly: false,
     connected: true,
     active: true,
     reading: false,
@@ -50,6 +51,7 @@ export function liveProps(over: Partial<MobileLiveTerminalProps> = {}): MobileLi
     sendData: vi.fn(),
     sendPaste: vi.fn(() => true),
     uploadPastedImage: vi.fn(async () => null),
+    captureWriteAdmission: () => () => true,
     forwardWheel: vi.fn(),
     forwardButton: vi.fn(),
     ctrlActiveRef: { current: false },

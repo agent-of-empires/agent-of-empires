@@ -16,6 +16,7 @@ use crate::common::setup_temp_home;
 #[serial]
 fn rename_profile_moves_sessions_and_tracks_the_default() -> Result<()> {
     let _temp = setup_temp_home();
+    agent_of_empires::migrations::run_migrations()?;
 
     create_profile("primary")?;
     create_profile("other")?;

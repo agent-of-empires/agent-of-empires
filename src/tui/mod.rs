@@ -2,13 +2,9 @@
 
 mod app;
 mod approval_poller;
-mod attach_project_poller;
-mod attached_status_hooks;
 mod boot_spinner;
 pub(crate) mod clipboard;
 mod components;
-mod creation_poller;
-mod deletion_poller;
 pub mod dialogs;
 pub mod diff;
 pub(crate) mod home;
@@ -19,18 +15,13 @@ pub(crate) mod markdown;
 mod metrics_poller;
 pub(crate) mod open_url;
 pub(crate) mod plugin_ui;
-mod reconcile_poller;
 pub(crate) mod remote_home;
 pub(crate) mod responsive;
-mod restart_poller;
 mod session_feed;
 pub mod settings;
-mod status_poller;
-mod stop_poller;
 mod store_move_poller;
 pub(crate) mod structured_view;
 pub(crate) mod styles;
-mod trash_poller;
 mod worker;
 
 pub use app::*;
@@ -128,18 +119,38 @@ use crate::migrations;
 /// Mouse capture needs both the `session.mouse_capture` setting and no
 /// `AOE_MOUSE_CAPTURE=0|false` opt-out.
 pub fn mouse_capture_requested(session: &crate::session::config::SessionConfig) -> bool {
-    session.mouse_capture
-        && std::env::var("AOE_MOUSE_CAPTURE")
-            .map(|v| !(v == "0" || v.eq_ignore_ascii_case("false")))
-            .unwrap_or(true)
+    session.mouse_capture && env_mouse_capture_allows()
 }
 
-/// Restores the terminal on every exit path, including a panic mid-render.
-/// Under `panic = "abort"` nothing would be restored (recover the kitty stack
-/// with `printf '\e[<1u'`).
+/// The legacy `AOE_MOUSE_CAPTURE` opt-out: `0`/`false` disables capture, any
+/// other value (or an unset var) leaves it enabled. Kept as a backstop to
+/// the Settings toggle.
+fn env_mouse_capture_allows() -> bool {
+    std::env::var("AOE_MOUSE_CAPTURE")
+        .map(|v| !(v == "0" || v.eq_ignore_ascii_case("false")))
+        .unwrap_or(true)
+}
+
+/// RAII guard for the TUI's terminal mode. `enter` turns on raw mode, the
+/// alternate screen, bracketed paste, the kitty keyboard protocol
+/// `DISAMBIGUATE_ESCAPE_CODES` flag (so `Shift+Enter` arrives as a distinct
+/// `KeyEvent` instead of collapsing to bare CR, #2362), and (when requested)
+/// mouse capture; the `Drop` impl reverses all of it. Because it runs on drop,
+/// the terminal is restored on EVERY exit path, including a panic mid-render,
+/// where the old inline teardown was skipped and left the terminal wedged (raw
+/// mode / mouse reporting / enhancement stack stuck on). Drop is best-effort
+/// and never panics.
+///
+/// The kitty-enhancement pop depends on Rust's default `panic = "unwind"`. A future
+/// profile that sets `panic = "abort"` would skip every Drop here and leak
+/// raw mode, alt screen, paste, mouse, and the enhancement stack into the
+/// user's shell; recovery from a leaked enhancement stack is
+/// `printf '\e[<1u'`. Same exposure as a SIGKILL/SIGSEGV mid-TUI.
 struct TerminalGuard {
-    /// False under Mosh, where capture is never enabled. Otherwise always
-    /// disabled, since a settings toggle can enable it mid-session.
+    /// Whether to emit `DisableMouseCapture` on teardown. Mirrors the startup
+    /// gate: under Mosh we never enable capture, so we must not disable it
+    /// either; otherwise we always disable (a mid-session settings toggle can
+    /// turn it on after startup, so we can't gate on the startup value).
     disable_mouse: bool,
 }
 
@@ -200,12 +211,31 @@ impl Drop for TerminalGuard {
     }
 }
 
-/// Clear the screen and force a full repaint without ratatui's `Terminal::clear`,
-/// whose cursor-position query races the live `EventStream` and fails.
+/// Clear the screen and force a full redraw on the next frame, without the
+/// `ESC[6n` cursor-position round-trip that ratatui's `Terminal::clear` does.
+///
+/// ratatui 0.30's `Terminal::clear` snapshots the cursor via
+/// `get_cursor_position` before clearing. That read shares crossterm's internal
+/// event reader with our live `EventStream`; around stream lifecycle changes the
+/// reader's poll wakes early and the cursor read completes with no matching
+/// event, which surfaces as "cursor position could not be read within a normal
+/// duration" (an immediate 0 ms failure, not the 2 s timeout the message
+/// implies). Clearing the backend directly via `clear_region(ClearType::All)`
+/// (the same call ratatui's Fullscreen `clear_viewport` issues) and resetting
+/// the diff baseline repaints every cell on the next `draw` with no cursor
+/// query.
+///
+/// A free function rather than an `App` method so both the local home view and
+/// the remote home view route through one definition, keeping the "no clear
+/// path calls `get_cursor_position`" invariant true across the whole TUI.
+/// `ClearType::All` is correct for the `Viewport::Fullscreen` the TUI uses; an
+/// inline or fixed viewport would need a different clear.
 pub(crate) fn clear_terminal<B: Backend>(terminal: &mut Terminal<B>) -> Result<(), B::Error> {
     terminal
         .backend_mut()
         .clear_region(ratatui::backend::ClearType::All)?;
+    // Reset both buffers so the next draw diffs against an empty baseline and
+    // repaints the whole viewport.
     terminal.current_buffer_mut().reset();
     terminal.swap_buffers();
     Ok(())
@@ -214,6 +244,8 @@ pub(crate) fn clear_terminal<B: Backend>(terminal: &mut Terminal<B>) -> Result<(
 pub async fn run(profile: &str, startup_warning: Option<String>) -> Result<()> {
     // `AOE_DAEMON_URL` makes this a pure client of a remote daemon.
     if let Some(endpoint) = crate::acp::client::discovery::discover_env() {
+        let _ = startup_warning; // remote mode skips the local startup-warning channel
+        let _ = profile;
         return remote_home::run_standalone(endpoint).await;
     }
 
@@ -279,6 +311,8 @@ pub async fn run(profile: &str, startup_warning: Option<String>) -> Result<()> {
     // Mosh mangles mouse-tracking escapes, so capture stays off under it.
     // `App` re-resolves the config so a mid-session toggle still applies.
     let mosh_active = std::env::var_os("MOSH_CONNECTION").is_some();
+    // Resolve once for the startup enable; `App` re-resolves on its own reload
+    // cadence so a mid-session settings toggle still applies.
     let startup_session_config = crate::session::resolve_config(profile)
         .map(|c| c.session)
         .unwrap_or_default();
@@ -296,7 +330,9 @@ pub async fn run(profile: &str, startup_warning: Option<String>) -> Result<()> {
         crate::session::collect_startup_config_warnings(profile),
     ) {
         (Some(a), Some(b)) => Some(format!("{a}\n\n{b}")),
-        (a, b) => a.or(b),
+        (Some(a), None) => Some(a),
+        (None, Some(b)) => Some(b),
+        (None, None) => None,
     };
 
     // Without file watching, the 5s heartbeat is the only reload signal.
@@ -375,27 +411,40 @@ mod mouse_capture_tests {
     use crate::session::test_support::EnvGuard;
     use serial_test::serial;
 
+    fn session_with(mouse_capture: bool) -> SessionConfig {
+        SessionConfig {
+            mouse_capture,
+            ..SessionConfig::default()
+        }
+    }
+
     #[test]
     #[serial]
-    fn config_and_env_must_both_allow_capture() {
-        // (config, AOE_MOUSE_CAPTURE, expected)
-        let cases = [
-            (true, None, true),
-            (false, None, false),
-            (true, Some("0"), false),
-            (true, Some("false"), false),
-            (false, Some("1"), false),
-        ];
-        for (mouse_capture, env, expected) in cases {
-            let _g = match env {
-                Some(value) => EnvGuard::set(&[("AOE_MOUSE_CAPTURE", value)]),
-                None => EnvGuard::unset(&["AOE_MOUSE_CAPTURE"]),
-            };
-            let session = SessionConfig {
-                mouse_capture,
-                ..SessionConfig::default()
-            };
-            assert_eq!(mouse_capture_requested(&session), expected, "{env:?}");
-        }
+    fn enabled_config_without_env_requests_capture() {
+        let _g = EnvGuard::unset(&["AOE_MOUSE_CAPTURE"]);
+        assert!(mouse_capture_requested(&session_with(true)));
+    }
+
+    #[test]
+    #[serial]
+    fn disabled_config_opts_out_even_without_env() {
+        let _g = EnvGuard::unset(&["AOE_MOUSE_CAPTURE"]);
+        assert!(!mouse_capture_requested(&session_with(false)));
+    }
+
+    #[test]
+    #[serial]
+    fn env_zero_still_wins_over_enabled_config() {
+        // The pre-existing AOE_MOUSE_CAPTURE=0 escape hatch keeps working
+        // even though the config defaults to enabled (#1346).
+        let _g = EnvGuard::set(&[("AOE_MOUSE_CAPTURE", "0")]);
+        assert!(!mouse_capture_requested(&session_with(true)));
+    }
+
+    #[test]
+    #[serial]
+    fn env_true_does_not_re_enable_disabled_config() {
+        let _g = EnvGuard::set(&[("AOE_MOUSE_CAPTURE", "1")]);
+        assert!(!mouse_capture_requested(&session_with(false)));
     }
 }

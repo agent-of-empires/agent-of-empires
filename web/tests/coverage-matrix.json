@@ -180,8 +180,24 @@
       "id": "terminal.live-split-composite",
       "kind": "vitest",
       "risk": "high",
-      "specs": ["src/components/__tests__/MobileLiveTerminal.forward.test.tsx", "src/hooks/useLiveTerminal.test.ts"],
-      "components": ["web/src/hooks/useLiveTerminal.ts", "web/src/components/MobileLiveTerminal.tsx"]
+      "specs": [
+        "src/components/__tests__/MobileLiveTerminal.forward.test.tsx",
+        "src/hooks/useLiveTerminal.test.ts",
+        "src/components/__tests__/LiveTerminalView.restart.test.tsx",
+        "src/lib/api.test.ts"
+      ],
+      "components": [
+        "web/src/hooks/useLiveTerminal.ts",
+        "web/src/components/MobileLiveTerminal.tsx",
+        "web/src/components/LiveTerminalView.tsx",
+        "web/src/components/TerminalView.tsx",
+        "web/src/components/PairedTerminal.tsx",
+        "web/src/components/MobileTerminalToolbar.tsx",
+        "web/src/components/live-terminal/useTerminalInput.ts",
+        "web/src/components/TerminalComposeSheet.tsx",
+        "web/src/components/TerminalConnectionBanners.tsx"
+      ],
+      "notes": "Deterministic real WebSocket and terminal consumers cover read-only agent, host and container observation, suppressed ensure/claim/resize/input/mouse/restart writes, late open and reconnect after revocation, retained callbacks and proxy refusal, no unsent replay, preserved compose drafts, accepted in-flight ensure results, and fresh writable takeover/paste. Real consumer cases revoke and restore policy while image decoding, dispatched upload responses and toolbar clipboard reads are pending; only fresh gesture admission permits later upload/paste, while dispatched upload receipts remain accepted. API tests also gate decoding before HTTP dispatch. Backend ownership heartbeat fences require the live read-only recheck; these unit cases do not claim physical tmux-lock coverage."
     },
     {
       "id": "terminal.live-grid-transport",
@@ -545,14 +561,15 @@
     },
     {
       "id": "settings.mcp-server-toggle",
-      "kind": "vitest",
+      "kind": "live-playwright",
       "risk": "medium",
-      "specs": ["src/components/__tests__/SettingsView.mcpToggle.test.tsx"],
+      "specs": ["tests/live/settings-persistence.spec.ts"],
       "components": [
         "web/src/components/SettingsView.tsx",
         "web/src/components/settings/SchemaSection.tsx",
         "src/server/mcp.rs"
-      ]
+      ],
+      "notes": "The real schema-driven switch persists machine-wide, rejects profile overrides, survives reload, and changes MCP route availability only after daemon restart."
     },
     {
       "id": "settings.list-field",
@@ -686,9 +703,22 @@
       ]
     },
     {
+      "id": "settings.sandbox-passphrase-elevation",
+      "kind": "live-playwright",
+      "risk": "high",
+      "description": "Direct and proxied TCP sandbox image saves require real browser elevation; forwarding headers never grant Unix owner authority.",
+      "specs": ["tests/live/settings-persistence.spec.ts"],
+      "components": [
+        "web/src/components/settings/SchemaSection.tsx",
+        "web/src/components/ElevationPrompt.tsx",
+        "web/src/lib/fetchInterceptor.ts"
+      ]
+    },
+    {
       "id": "settings.custom-widgets",
       "kind": "vitest",
       "risk": "medium",
+      "description": "Server, migration and systemd area controls preserve unrelated logging overrides when edited or cleared.",
       "specs": ["src/components/settings/__tests__/customWidgets.test.tsx"],
       "components": ["web/src/components/settings/customWidgets.tsx"]
     },
@@ -709,6 +739,7 @@
       "id": "settings.schema-persistence",
       "kind": "live-playwright",
       "risk": "medium",
+      "description": "Server and migration logging overrides survive reload and restart; clearing one retains the other area overrides.",
       "specs": ["tests/live/settings-persistence.spec.ts"],
       "components": [
         "web/src/components/SettingsView.tsx",
@@ -1170,6 +1201,7 @@
     },
     {
       "id": "wizard.project-sandbox-override",
+      "notes": "Tri-state project container defaults resolve from the acknowledged served or explicitly selected profile; registry retries preserve unknown versus empty, profile switches commit atomically, manual edits and host-only imports outrank late defaults, and saves preserve explicit false while omitting inherited values.",
       "kind": "vitest",
       "risk": "medium",
       "specs": [
@@ -1433,7 +1465,12 @@
       "id": "wizard.import-session.unit",
       "kind": "vitest",
       "risk": "high",
-      "specs": ["src/components/session-wizard/__tests__/ProjectStep.test.tsx"],
+      "notes": "Generic ACP import reads the acknowledged served or explicitly selected profile, waits while Server default is unresolved, never writes the implicit profile choice into the form, clears worktree/container/branch/attach/scratch/extra-repo state, and ignores late registry and profile defaults.",
+      "specs": [
+        "src/components/session-wizard/__tests__/ProjectStep.test.tsx",
+        "src/components/session-wizard/__tests__/SessionWizard.test.tsx",
+        "src/components/session-wizard/wizardReducer.test.ts"
+      ],
       "components": [
         "web/src/components/session-wizard/steps/ProjectStep.tsx",
         "web/src/components/session-wizard/steps/ImportSessionPicker.tsx"
@@ -1586,9 +1623,23 @@
     {
       "id": "sidebar.session-color",
       "kind": "vitest",
-      "risk": "low",
-      "specs": ["src/components/__tests__/SessionRowTriage.test.tsx"],
-      "components": ["web/src/components/WorkspaceSidebar.tsx"]
+      "risk": "high",
+      "specs": [
+        "src/components/__tests__/SessionRowTriage.test.tsx",
+        "src/components/__tests__/SessionRowReceipts.test.tsx",
+        "src/hooks/__tests__/useSessionsPolling.test.tsx",
+        "src/lib/api.test.ts"
+      ],
+      "description": "Accepted color and notification resets survive visual unmount and temporary polling failure. Dispatched receipts survive read-only changes; revoked unsent work and true identity invalidation never replay.",
+      "components": [
+        "web/src/components/WorkspaceSidebar.tsx",
+        "web/src/components/sidebar/SessionActionProvider.tsx",
+        "web/src/components/sidebar/usePendingSetting.ts",
+        "web/src/components/sidebar/SessionRow.tsx",
+        "web/src/components/sidebar/useSessionRowModel.ts",
+        "web/src/hooks/useSessions.ts",
+        "web/src/lib/api.ts"
+      ]
     },
     {
       "id": "sidebar.menu-choice-stays-open",
@@ -1596,7 +1647,7 @@
       "risk": "medium",
       "specs": [
         "src/components/__tests__/SessionRowTriage.test.tsx",
-        "src/components/sidebar/usePendingSetting.test.ts"
+        "src/components/__tests__/SessionRowReceipts.test.tsx"
       ],
       "components": [
         "web/src/components/sidebar/SessionRow.tsx",
@@ -1616,7 +1667,7 @@
       "kind": "mocked-playwright",
       "risk": "medium",
       "specs": ["tests/sidebar-context-menu.spec.ts"],
-      "components": ["web/src/components/ContextMenu.tsx", "web/src/components/sidebar/SidebarGroupHeader.tsx"]
+      "components": ["web/src/components/ContextMenu.tsx"]
     },
     {
       "id": "sidebar.system-health",
@@ -1639,8 +1690,20 @@
       "id": "sidebar.session-color-toggle",
       "kind": "vitest",
       "risk": "low",
-      "specs": ["src/lib/__tests__/sessionColors.test.ts", "src/components/__tests__/SessionRowTriage.test.tsx"],
-      "components": ["web/src/lib/sessionColors.ts", "web/src/components/WorkspaceSidebar.tsx"]
+      "specs": [
+        "src/lib/__tests__/sessionColors.test.ts",
+        "src/components/__tests__/SessionRowTriage.test.tsx",
+        "src/components/__tests__/SessionRowReceipts.test.tsx"
+      ],
+      "notes": "Accepted color queues survive visual unmount. Independent canonical values permanently surrender only the optimistic overlay; away-and-back observations cannot resurrect a stale choice or suppress a new pick.",
+      "components": [
+        "web/src/lib/sessionColors.ts",
+        "web/src/components/WorkspaceSidebar.tsx",
+        "web/src/components/sidebar/usePendingSetting.ts",
+        "web/src/components/sidebar/SessionActionProvider.tsx",
+        "web/src/components/sidebar/rowModel.ts",
+        "web/src/components/sidebar/useSessionRowModel.ts"
+      ]
     },
     {
       "id": "sidebar.dormant-dot",
@@ -1978,10 +2041,12 @@
         "web/src/components/plugin/PluginSessionMenu.tsx",
         "web/src/components/sidebar/SessionActions.tsx",
         "web/src/lib/pluginBridge.ts",
+        "web/src/lib/api.ts",
+        "web/src/hooks/useSessions.ts",
         "web/src/components/TopBar.tsx",
         "web/src/App.tsx"
       ],
-      "notes": "TopBar page buttons and palette entries appear only with a declared page, the button marking the open page; the route hides the sidebar, mints a page ticket before framing, and Back pops history. A fixture page served under the daemon's page CSP proves the sandboxed frame cannot read storage, cookies or call the API. A bridge fixture page round-trips ready, sessions.list, plugins.uiState, its own action, session.archive, session.trash and openSession, a page without session.write is refused both lifecycle calls, and it receives a theme change without reloading; with split view on, openSession shows the session below the page with its docks, in `?session=` rather than navigating, pushes the selection, maximizes over the page without reloading it, and Open full navigates; session.contextMenu opens the sidebar's session menu at the frame-relative point, resolves with a picked page item or null, opens the snooze picker and a rename dialog that PATCHes the title, and a click over the frame dismisses it; a page that navigates to another plugin's page before ready never hands that page the bridge. Mint ordering, empty states, the nonce-checked ready-only channel handoff, theme pushes, teardown on a second load and remount resets are unit-tested in PluginPageView.test.tsx; envelope validation and gating in pluginBridge.test.ts; the ticket's server side in src/server/api/plugins.rs."
+      "notes": "TopBar page buttons and palette entries appear only with a declared page, the button marking the open page; the route hides the sidebar, mints a page ticket before framing, and Back pops history. A fixture page served under the daemon's page CSP proves the sandboxed frame cannot read storage, cookies or call the API. A bridge fixture page round-trips ready, sessions.list, plugins.uiState, its own action, session.archive, session.trash and openSession, a page without session.write is refused both lifecycle calls, and it receives a theme change without reloading; with split view on, openSession shows the session below the page with its docks, in `?session=` rather than navigating, pushes the selection, maximizes over the page without reloading it, and Open full navigates; session.contextMenu opens the sidebar's session menu at the frame-relative point, resolves with a picked page item or null, opens the snooze picker and a rename dialog that PATCHes the title, and a click over the frame dismisses it; a page that navigates to another plugin's page before ready never hands that page the bridge. Mint ordering, empty states, the nonce-checked ready-only channel handoff, theme pushes, teardown on a second load and remount resets are unit-tested in PluginPageView.test.tsx; envelope validation and gating in pluginBridge.test.ts; the ticket's server side in src/server/api/plugins.rs. Session lists carry canonical runtime epoch/revision headers, and rename completion consumes a matching advancing receipt and outcome."
     },
     {
       "id": "sidebar.plugin-row-slots",
@@ -1993,7 +2058,14 @@
         "web/src/components/plugin/PluginSlots.tsx",
         "web/src/components/plugin/SlotChrome.tsx"
       ],
-      "notes": "Grouped badge items collapse into one chip that cycles on click. The Playwright story clicks it inside the real session-row link, which jsdom cannot cover: the click must cycle without the row selecting or the browser following the row href. Group, wrap-around and clamping logic is in PluginSlots.test.tsx."
+      "notes": "Grouped badge items collapse into one chip that cycles on click. The Playwright story clicks it inside the real session-row link, which jsdom cannot cover: the click must cycle without the row selecting or the browser following the row href. Group, wrap-around and clamping logic is in PluginSlots.test.tsx, which also verifies that changing the addressed session resets a detail badge cycle."
+    },
+    {
+      "id": "sidebar.plugin-row-badge-link",
+      "kind": "vitest",
+      "risk": "medium",
+      "specs": ["src/components/plugin/__tests__/PluginSlots.test.tsx"],
+      "components": ["web/src/components/plugin/PluginSlots.tsx", "web/src/components/plugin/SlotChrome.tsx"]
     },
     {
       "id": "sidebar.group-axis-pure",
@@ -2272,8 +2344,11 @@
         "web/src/components/diff/comments/CommentsBanner.tsx",
         "web/src/components/diff/comments/DiffCommentsUserCard.tsx",
         "web/src/components/diff/comments/SendCommentsDialog.tsx",
-        "web/src/lib/paneLayout.ts"
-      ]
+        "web/src/lib/paneLayout.ts",
+        "web/src/components/ContentSplit.tsx",
+        "web/src/App.tsx"
+      ],
+      "notes": "Holding the first canonical session list through the diff-files effect leaves no persisted layout while the session is unknown. Releasing it pins Terminal but not Diff for a non-git session; explicitly opening Diff shows the neutral non-git message without a repository error."
     },
     {
       "id": "right-panel.markdown-viewer",
@@ -2569,6 +2644,7 @@
       "id": "devices",
       "kind": "live-playwright",
       "risk": "medium",
+      "description": "Authenticated TCP device management requires real browser elevation before revoke and sign-out-all; revoked credentials stop authenticating.",
       "specs": ["tests/live/auth.spec.ts"],
       "components": ["web/src/components/ConnectedDevices.tsx"]
     },
@@ -2910,7 +2986,8 @@
         "web/src/components/acp/AcpRuntime.tsx",
         "web/src/hooks/useAcpSession.ts",
         "web/src/lib/acpTypes.ts"
-      ]
+      ],
+      "notes": "Provider requests remain single-flight across keyed session-view remounts and keep controls locked until settlement. Canonical changes observed during a pending request invalidate its late echo, including a return to the previous provider. Open model menus close when turn or provider locks arrive."
     },
     {
       "id": "acp.mode-switch",
@@ -2939,6 +3016,7 @@
       "id": "acp.mode-switch-tmux-teardown",
       "kind": "live-playwright",
       "risk": "high",
+      "description": "Mode switches reap verified owned panes and preserve tools whose matching name lacks owner evidence.",
       "specs": ["tests/live/session-lifecycle.spec.ts"],
       "components": ["src/server/api/acp.rs"]
     },
@@ -3432,7 +3510,8 @@
       "kind": "live-playwright",
       "risk": "high",
       "specs": ["tests/live/read-only-mode.spec.ts"],
-      "components": ["web/src/components/MobileTerminalToolbar.tsx"]
+      "components": ["web/src/components/Dashboard.tsx"],
+      "notes": "Live coverage checks authoritative /api/about policy, pre-extraction mutation refusal and dashboard shortcut suppression. Terminal policy transitions and passive consumers are exercised by terminal.live-split-composite; this live spec does not open an existing terminal."
     },
     {
       "id": "ensure-session-restart",
@@ -3443,8 +3522,13 @@
         "web/src/lib/api.ts",
         "web/src/components/LiveTerminalView.tsx",
         "web/src/App.tsx",
-        "web/src/lib/types.ts"
-      ]
+        "web/src/lib/types.ts",
+        "src/server/api/sessions/ensure.rs",
+        "src/session/instance/start.rs",
+        "src/tmux/session.rs",
+        "src/tmux/mod.rs"
+      ],
+      "notes": "The real daemon returns HTTP 200 and the expected restarted/alive status before and immediately after an acknowledged exact-session kill, without waiting for a cache or poller refresh. A live pane stays alive; the frontend's held ensure request keeps Starting visible until release."
     },
     {
       "id": "modals",
@@ -3460,7 +3544,7 @@
     {
       "id": "projects-form-modal",
       "kind": "vitest",
-      "risk": "low",
+      "risk": "medium",
       "specs": ["src/components/__tests__/ProjectFormModal.test.tsx"],
       "components": ["web/src/components/ProjectFormModal.tsx", "web/src/components/ProjectPluginSettings.tsx"]
     },
@@ -4208,9 +4292,14 @@
     {
       "id": "story.wizard-saved-projects",
       "kind": "mocked-playwright",
-      "risk": "low",
+      "risk": "high",
       "specs": ["tests/wizard-project.spec.ts"],
-      "components": ["web/src/components/session-wizard/steps/ProjectStep.tsx"]
+      "components": [
+        "web/src/components/session-wizard/steps/ProjectStep.tsx",
+        "web/src/components/session-wizard/steps/projectPicker.ts",
+        "web/src/components/session-wizard/SessionWizard.tsx",
+        "web/src/lib/api.ts"
+      ]
     },
     {
       "id": "story.wizard-browse-disk",
@@ -4272,7 +4361,9 @@
       "components": [
         "web/src/components/session-wizard/steps/ExtraReposPicker.tsx",
         "web/src/components/session-wizard/steps/projectPicker.ts",
-        "web/src/components/session-wizard/steps/ProjectSearchList.tsx"
+        "web/src/components/session-wizard/steps/ProjectSearchList.tsx",
+        "web/src/components/session-wizard/SessionWizard.tsx",
+        "web/src/lib/api.ts"
       ]
     },
     {
@@ -4331,7 +4422,7 @@
       "kind": "mocked-playwright",
       "risk": "high",
       "specs": ["tests/sidebar-project-pin.spec.ts"],
-      "components": ["web/src/App.tsx", "web/src/lib/api.ts"]
+      "components": ["web/src/App.tsx", "web/src/lib/api.ts", "web/src/hooks/useProjects.ts"]
     },
     {
       "id": "sidebar.active-project-settings",
@@ -4402,13 +4493,22 @@
       "id": "sidebar.add-project",
       "kind": "vitest",
       "risk": "high",
-      "description": "Picker lists saved and recent projects, and a clicked row or typed path posts to attach; attach eligibility and worker outcomes; native conversation continuation is best-effort, not a modal guarantee.",
+      "description": "Profile-scoped picker, canonical attach receipts, retained warnings and restart failures, and explicit unconfirmed results on captured target invalidation.",
       "specs": ["src/components/__tests__/AddProjectAction.test.tsx"],
       "components": [
         "web/src/components/WorkspaceSidebar.tsx",
         "web/src/lib/api.ts",
+        "web/src/components/sidebar/SessionActionProvider.tsx",
         "web/src/components/sidebar/AddProjectModal.tsx"
       ]
+    },
+    {
+      "id": "sidebar.add-project-regrouping",
+      "kind": "mocked-playwright",
+      "risk": "high",
+      "specs": ["tests/native-session-receipts.spec.ts"],
+      "components": ["web/src/App.tsx", "web/src/components/sidebar/SessionActionProvider.tsx"],
+      "description": "Actual canonical Multi-repo regrouping preserves the attach result, moved path, warning and failed restart until Done."
     },
     {
       "id": "sidebar.add-project-daemon",
@@ -4622,9 +4722,10 @@
       "components": ["web/src/components/settings/PluginsSettings.tsx"]
     },
     {
-      "id": "settings.plugins-passphrase-loopback",
+      "id": "settings.plugins-passphrase-elevation",
       "kind": "live-playwright",
       "risk": "high",
+      "description": "Direct TCP plugin changes require passphrase elevation, explicit retry and persisted UI/backend state.",
       "specs": ["tests/live/settings-panels.spec.ts"],
       "components": [
         "web/src/components/settings/PluginsSettings.tsx",
@@ -4689,6 +4790,140 @@
         "web/src/components/acp/Composer.tsx",
         "web/src/components/acp/ComposerControls.tsx"
       ]
+    },
+    {
+      "id": "projects.served-profile-registry.unit",
+      "kind": "vitest",
+      "risk": "high",
+      "specs": ["src/hooks/__tests__/useProjects.test.tsx"],
+      "components": ["web/src/hooks/useProjects.ts", "web/src/hooks/app/useProjectActions.ts"]
+    },
+    {
+      "id": "projects.served-profile-registry",
+      "kind": "mocked-playwright",
+      "risk": "high",
+      "specs": ["tests/served-profile-browser.spec.ts"],
+      "components": ["web/src/hooks/useProjects.ts", "web/src/hooks/app/useProjectActions.ts"],
+      "notes": "Focus refresh retains acknowledged registry on failure. Both same-tab rename origins refresh served-profile authority before implicit wizard registry reads."
+    },
+    {
+      "id": "wizard.served-profile-scope.unit",
+      "kind": "vitest",
+      "risk": "high",
+      "specs": [
+        "src/components/session-wizard/__tests__/SessionWizard.test.tsx",
+        "src/components/session-wizard/__tests__/ProjectStep.test.tsx",
+        "src/components/session-wizard/__tests__/SessionWizard.projectWorktreeOverride.test.tsx",
+        "src/components/session-wizard/__tests__/SessionWizard.lastProject.test.tsx",
+        "src/components/session-wizard/__tests__/projectPickerScope.test.ts"
+      ],
+      "components": [
+        "web/src/App.tsx",
+        "web/src/components/session-wizard/SessionWizard.tsx",
+        "web/src/components/session-wizard/steps/ProjectStep.tsx",
+        "web/src/components/session-wizard/steps/ImportSessionPicker.tsx",
+        "web/src/components/session-wizard/steps/projectPicker.ts",
+        "web/src/components/session-wizard/steps/ExtraReposPicker.tsx"
+      ]
+    },
+    {
+      "id": "wizard.served-profile-scope",
+      "kind": "mocked-playwright",
+      "risk": "high",
+      "specs": ["tests/served-profile-browser.spec.ts"],
+      "components": [
+        "web/src/App.tsx",
+        "web/src/components/session-wizard/SessionWizard.tsx",
+        "web/src/components/session-wizard/steps/projectPicker.ts",
+        "web/src/components/session-wizard/steps/ExtraReposPicker.tsx"
+      ],
+      "notes": "Both Settings rename origins invalidate implicit authority until refresh or explicit retry succeeds, without old-profile reads or dirty-field loss. Existing explicit-profile and no-default fallback cases remain."
+    },
+    {
+      "id": "connectivity.poll-abort-deadline.unit",
+      "kind": "vitest",
+      "risk": "high",
+      "specs": [
+        "src/hooks/__tests__/useSessionsPolling.test.tsx",
+        "src/hooks/__tests__/useProjects.test.tsx",
+        "src/components/__tests__/TopBar.test.tsx",
+        "src/lib/api.test.ts"
+      ],
+      "components": [
+        "web/src/hooks/useSessions.ts",
+        "web/src/hooks/useProjects.ts",
+        "web/src/lib/api.ts",
+        "web/src/lib/connectionState.ts",
+        "web/src/components/TopBar.tsx"
+      ]
+    },
+    {
+      "id": "connectivity.poll-abort-deadline",
+      "kind": "mocked-playwright",
+      "risk": "high",
+      "specs": ["tests/native-session-receipts.spec.ts"],
+      "components": [
+        "web/src/hooks/useSessions.ts",
+        "web/src/hooks/useProjects.ts",
+        "web/src/lib/api.ts",
+        "web/src/lib/connectionState.ts",
+        "web/src/components/TopBar.tsx"
+      ],
+      "notes": "Browser: valid stale same epoch polls restore online state without admitting stale rows or settings; valid stale abandoned epoch polls restore online state without admitting stale rows or settings; a hung sessions poll aborts at its deadline and the next canonical poll restores online controls."
+    },
+    {
+      "id": "sidebar.canonical-settings-receipts.unit",
+      "kind": "vitest",
+      "risk": "high",
+      "specs": [
+        "src/components/__tests__/SessionRowReceipts.test.tsx",
+        "src/hooks/__tests__/useSessionsPolling.test.tsx",
+        "src/lib/api.test.ts"
+      ],
+      "components": [
+        "web/src/App.tsx",
+        "web/src/components/WorkspaceSidebar.tsx",
+        "web/src/components/sidebar/SessionActionProvider.tsx",
+        "web/src/components/sidebar/SessionRow.tsx",
+        "web/src/components/sidebar/useSessionRowModel.ts",
+        "web/src/components/sidebar/usePendingSetting.ts",
+        "web/src/hooks/useSessions.ts",
+        "web/src/lib/api.ts"
+      ]
+    },
+    {
+      "id": "sidebar.canonical-settings-receipts",
+      "kind": "mocked-playwright",
+      "risk": "high",
+      "specs": ["tests/native-session-receipts.spec.ts"],
+      "components": [
+        "web/src/App.tsx",
+        "web/src/components/WorkspaceSidebar.tsx",
+        "web/src/components/sidebar/SessionActionProvider.tsx",
+        "web/src/components/sidebar/SessionRow.tsx",
+        "web/src/components/sidebar/useSessionRowModel.ts",
+        "web/src/components/sidebar/usePendingSetting.ts",
+        "web/src/hooks/useSessions.ts",
+        "web/src/lib/api.ts"
+      ],
+      "notes": "Color and notification receipt ordering remains exact above Number.MAX_SAFE_INTEGER. Accepted color reset survives Settings navigation before its first ACK; true invalidation never replays queued work."
+    },
+    {
+      "id": "sidebar.canonical-settings-receipts.live",
+      "kind": "live-playwright",
+      "risk": "high",
+      "specs": ["tests/live/native-session-receipts.spec.ts"],
+      "components": [
+        "web/src/App.tsx",
+        "web/src/components/WorkspaceSidebar.tsx",
+        "web/src/components/sidebar/SessionRow.tsx",
+        "web/src/components/sidebar/SessionActionProvider.tsx",
+        "web/src/components/sidebar/useSessionRowModel.ts",
+        "web/src/components/sidebar/usePendingSetting.ts",
+        "web/src/hooks/useSessions.ts",
+        "web/src/lib/api.ts"
+      ],
+      "notes": "Browser: isolated serve publishes advancing native epoch revision receipts for color and notifications. Uses the isolated spawnServe fixture; native HTTP receipts and canonical persistence are asserted, then a page reload verifies the sidebar without pending overlays."
     }
   ]
 }

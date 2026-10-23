@@ -4,7 +4,7 @@
 import { readFileSync } from "node:fs";
 import { test, expect } from "./helpers/mockedTest";
 import { mockStaticApis, mockSessionShellApis } from "./helpers/apiMocks";
-import { sessionResponse } from "./helpers/sessions";
+import { mockSessionsList, sessionResponse } from "./helpers/sessions";
 import type { Page } from "@playwright/test";
 
 const PAGE = {
@@ -92,14 +92,7 @@ const theme = (name: string, appearance: "dark" | "light", bg: string) => ({
 async function mockApis(page: Page, pages: unknown[]) {
   await mockStaticApis(page);
   await mockSessionShellApis(page);
-  await page.route("**/api/sessions", (r) =>
-    r.fulfill({
-      json: {
-        sessions: [sessionResponse({ id: "sess-a", title: "Ethiopians", project_path: "/tmp/agent-of-empires" })],
-        workspace_ordering: [],
-      },
-    }),
-  );
+  await mockSessionsList(page, () => [{ id: "sess-a", title: "Ethiopians", project_path: "/tmp/agent-of-empires" }]);
   await page.route("**/api/plugins/ui-state", (r) => r.fulfill({ json: { entries: [], notifications: [], pages } }));
   await page.route(`**${PAGE.url}/ticket`, (r) => r.fulfill({ status: 204 }));
   await page.route(`**${PAGE.url}`, (r) =>
@@ -332,7 +325,13 @@ test.describe("Plugin pages (#4460)", () => {
     await page.route("**/api/sessions/sess-a", (r) => {
       if (r.request().method() !== "PATCH") return r.fallback();
       renames.push(r.request().postDataJSON());
-      return r.fulfill({ json: sessionResponse({ id: "sess-a", title: "Renamed" }) });
+      return r.fulfill({
+        headers: { "aoe-runtime-epoch": "mock-runtime", "aoe-runtime-revision": "2" },
+        json: {
+          ...sessionResponse({ id: "sess-a", title: "Renamed", project_path: "/tmp/agent-of-empires" }),
+          outcome: { warnings: [] },
+        },
+      });
     });
 
     await page.goto("/plugins/acme.kit/board");

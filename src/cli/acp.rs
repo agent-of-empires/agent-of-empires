@@ -949,14 +949,68 @@ async fn restart(session: &str) -> Result<()> {
     let Some(record) = worker_registry::load(session)? else {
         anyhow::bail!("No agent worker registry entry for session {session}");
     };
+    let native = match record.source_profile.clone() {
+        Some(profile) => {
+            let id = session.to_owned();
+            Some(
+                tokio::task::spawn_blocking(move || -> Result<_> {
+                    let storage = crate::session::Storage::open_unwatched(&profile)?;
+                    let _lifecycle = storage.acquire_instance_lifecycle_lock(&id)?;
+                    let row = storage
+                        .load()?
+                        .into_iter()
+                        .find(|row| row.id == id)
+                        .ok_or(crate::session::SessionGone)?;
+                    row.ensure_startable()?;
+                    anyhow::ensure!(
+                        row.is_structured() && row.terminal_handoff.is_none(),
+                        "session is no longer an available structured target"
+                    );
+                    Ok((storage, row.lifecycle_generation))
+                })
+                .await??,
+            )
+        }
+        None => None,
+    };
     let intent = worker_registry::request_stop(&record)?;
     let pid = record.pid;
     worker_registry::terminate_record_and_wait(record.clone(), ()).await?;
-    worker_registry::admit_resume(
-        session,
-        worker_registry::ResumeAuthority::Explicit,
-        &Some(intent),
-    )?;
+    if let Some((storage, generation)) = native {
+        let id = session.to_owned();
+        tokio::task::spawn_blocking(move || -> Result<()> {
+            let _lifecycle = storage.acquire_instance_lifecycle_lock(&id)?;
+            storage.update(|rows, _| {
+                let row = rows
+                    .iter_mut()
+                    .find(|row| row.id == id)
+                    .ok_or(crate::session::SessionGone)?;
+                row.ensure_startable()?;
+                anyhow::ensure!(
+                    row.is_structured() && row.terminal_handoff.is_none(),
+                    "session is no longer an available structured target"
+                );
+                anyhow::ensure!(
+                    row.lifecycle_generation == generation,
+                    crate::session::LifecycleReservationError::Superseded
+                );
+                worker_registry::admit_resume(
+                    &id,
+                    worker_registry::ResumeAuthority::Explicit,
+                    &Some(intent),
+                )?;
+                row.resume_structured_after_retirement(generation)?;
+                Ok(())
+            })
+        })
+        .await??;
+    } else {
+        worker_registry::admit_resume(
+            session,
+            worker_registry::ResumeAuthority::Explicit,
+            &Some(intent),
+        )?;
+    }
     worker_registry::mark_restart_pending(session, record.generation);
 
     println!(
@@ -1014,17 +1068,13 @@ async fn status(session: &str, json: bool) -> Result<()> {
             "highest_seq": probe.highest_seq,
             "lowest_seq": probe.lowest_seq,
             "lost": probe.lost,
-            "daemon_url": endpoint.base_url,
             "daemon_source": format!("{:?}", endpoint.source),
         });
         println!("{}", serde_json::to_string_pretty(&blob)?);
         return Ok(());
     }
     println!("Agent session: {session}");
-    println!(
-        "  daemon       : {} ({:?})",
-        endpoint.base_url, endpoint.source
-    );
+    println!("  daemon source: {:?}", endpoint.source);
     println!("  highest_seq  : {}", probe.highest_seq);
     println!(
         "  lowest_seq   : {}",
@@ -1236,6 +1286,135 @@ fn event_kind(event: &crate::acp::Event) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn native_acp_restart_consumes_only_its_retired_observed_generation() {
+        use crate::process::worker_registry::{self, WorkerRecord};
+        use crate::session::{Instance, LifecycleOperation, Status, Storage, View};
+        use tokio::io::AsyncWriteExt as _;
+        for newer_stop in [false, true] {
+            let _home = crate::session::test_support::isolate_app_dir();
+            let project = tempfile::tempdir().unwrap();
+            let term = project.path().join("term");
+            let ready = project.path().join("ready");
+            let mut row = Instance::new("native CLI restart", project.path().to_str().unwrap());
+            row.source_profile = "default".into();
+            row.view = View::Structured;
+            row.status = Status::Stopped;
+            row.mark_idle_dormant();
+            let observed = row
+                .try_acquire_lifecycle_reservation(
+                    LifecycleOperation::Stop,
+                    Instance::LIFECYCLE_RESERVATION_TTL,
+                    chrono::Utc::now(),
+                )
+                .unwrap();
+            crate::server::test_support::seed_instances_on_disk_for_test(
+                "default",
+                vec![row.clone()],
+            );
+            let mut child = tokio::process::Command::new("sh")
+                .args(["-c", r#"trap 'printf term > "$1"; IFS= read -r release; exit 0' TERM; printf ready > "$2"; IFS= read -r initial"#, "sh"])
+                .arg(&term).arg(&ready).stdin(std::process::Stdio::piped())
+                .process_group(0).kill_on_drop(true).spawn().unwrap();
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                while !ready.exists() {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            let record = WorkerRecord::new(
+                row.id.clone(),
+                child.id().unwrap(),
+                worker_registry::socket_path_for(&row.id).unwrap(),
+                "sh".into(),
+                "claude".into(),
+                project.path().to_owned(),
+                None,
+                Vec::new(),
+                Vec::new(),
+                None,
+                Some("default".into()),
+            )
+            .with_generation(101);
+            assert!(record.runner_identity.is_some());
+            worker_registry::save(&record).unwrap();
+            let id = row.id.clone();
+            let restarting = tokio::spawn(async move { restart(&id).await });
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                while !term.exists() {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            let storage = Storage::open_unwatched("default").unwrap();
+            let newest = if newer_stop {
+                Some(
+                    storage
+                        .update(|rows, _| {
+                            let row = &mut rows[0];
+                            row.release_lifecycle_reservation_if_owned(
+                                LifecycleOperation::Stop,
+                                observed,
+                            );
+                            let generation = row.try_acquire_lifecycle_reservation(
+                                LifecycleOperation::Stop,
+                                Instance::LIFECYCLE_RESERVATION_TTL,
+                                chrono::Utc::now(),
+                            )?;
+                            row.status = Status::Stopped;
+                            row.mark_idle_dormant();
+                            Ok(generation)
+                        })
+                        .unwrap(),
+                )
+            } else {
+                None
+            };
+            child.stdin.take().unwrap().write_all(b"\n").await.unwrap();
+            child.wait().await.unwrap();
+            let result = restarting.await.unwrap();
+            assert!(worker_registry::load(&row.id).unwrap().is_none());
+            let stored = storage.load().unwrap().remove(0);
+            if let Some(newest) = newest {
+                let error = result.expect_err("newer native stop wins over earlier restart");
+                assert!(error.is::<crate::session::LifecycleReservationError>());
+                assert_eq!(stored.lifecycle_generation, newest);
+                assert_eq!(stored.status, Status::Stopped);
+                assert!(stored.is_idle_dormant());
+                assert!(worker_registry::stop_intent(&row.id).unwrap().is_some());
+            } else {
+                result.unwrap();
+                assert!(stored.lifecycle_generation > observed);
+                assert_eq!(stored.status, Status::Idle);
+                assert!(!stored.is_idle_dormant());
+                assert!(stored.lifecycle_reservation.is_none());
+                assert!(worker_registry::stop_intent(&row.id).unwrap().is_none());
+                let admission = crate::acp::supervisor::LaunchAdmission {
+                    store: std::sync::Arc::new(Storage::open_unwatched("default").unwrap()),
+                    generation: stored.lifecycle_generation,
+                    namespace: None,
+                };
+                let mut admitted = crate::acp::supervisor::with_durable_launch(
+                    Some(admission),
+                    row.id.clone(),
+                    || {
+                        std::process::Command::new("true").spawn().map_err(|error| {
+                            crate::acp::acp_client::AcpError::Spawn(error.to_string())
+                        })
+                    },
+                )
+                .await
+                .unwrap();
+                assert!(admitted.wait().unwrap().success());
+                worker_registry::clear_restart_marker(&row.id);
+            }
+        }
+    }
 
     #[tokio::test]
     #[serial_test::serial]

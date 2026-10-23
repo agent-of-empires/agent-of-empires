@@ -101,94 +101,69 @@ pub(super) fn repair_structured_rows_from_live_workers(
     repairs
 }
 
-pub(super) fn persist_structured_row_repairs(
+pub(super) async fn persist_structured_row_repairs(
     state: &Arc<AppState>,
     repairs: Vec<StructuredRowRepair>,
-    repair_guards: Vec<tokio::sync::OwnedMutexGuard<()>>,
-) {
-    if repairs.is_empty() {
-        return;
+    fresh: &mut Vec<Instance>,
+    metadata: &mut super::reload::CanonicalMetadata,
+    transition: &Arc<crate::session::StorageTransition>,
+    _publication: &tokio::sync::RwLockWriteGuard<'_, ()>,
+) -> Result<(), super::reload::ReloadFailure> {
+    let mut by_profile: std::collections::HashMap<String, Vec<StructuredRowRepair>> =
+        std::collections::HashMap::new();
+    for repair in repairs {
+        by_profile
+            .entry(repair.source_profile.clone())
+            .or_default()
+            .push(repair);
     }
-    let state = state.clone();
-    let file_watch = state.file_watch.clone();
-    let shutdown = state.shutdown.clone();
-    crate::task_util::spawn_supervised(
-        "server.reload.persist_repairs",
-        crate::task_util::PanicPolicy::Log,
-        async move {
-            // Keep view transitions behind the repair until its durable write
-            // (or rollback) finishes; otherwise a queued repair can undo disable.
-            let _repair_guards = repair_guards;
-            let mut by_profile: std::collections::HashMap<String, Vec<StructuredRowRepair>> =
-                std::collections::HashMap::new();
-            for repair in repairs {
-                by_profile
-                    .entry(repair.source_profile.clone())
-                    .or_default()
-                    .push(repair);
-            }
-            for (profile, repairs) in by_profile {
-                if shutdown.is_cancelled() {
-                    break;
-                }
-                let file_watch = file_watch.clone();
-                let failed_ids: Vec<String> = repairs
-                    .iter()
-                    .map(|repair| repair.session_id.clone())
-                    .collect();
-                let save_result = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
-                    let storage = crate::session::Storage::new(&profile, file_watch)?;
-                    storage.update(|all, _groups| {
-                        for repair in repairs {
-                            if let Some(inst) = all.iter_mut().find(|i| i.id == repair.session_id) {
-                                inst.view = crate::session::View::Structured;
-                                if inst.agent_name.is_none() {
-                                    inst.agent_name = repair.agent_name;
-                                }
-                                if inst.agent_model.is_none() {
-                                    inst.agent_model = repair.agent_model;
-                                }
-                                inst.acp_session_id = Some(repair.acp_session_id);
-                            } else {
-                                tracing::debug!(
-                                    target: "server.file_watch",
-                                    session = %repair.session_id,
-                                    "repair target not found on disk; skipping"
-                                );
-                            }
-                        }
-                        Ok(())
-                    })?;
-                    Ok(())
-                })
-                .await;
-                match save_result {
-                    Ok(Ok(())) => {}
-                    Ok(Err(e)) => {
-                        rollback_structured_row_repairs(&state, &failed_ids).await;
-                        tracing::warn!(target: "server.file_watch", "save after structured row repair: {e}");
+    for (profile, repairs) in by_profile {
+        let file_watch = state.file_watch.clone();
+        let storage_profile = profile.clone();
+        let transition = transition.clone();
+        let saved = tokio::task::spawn_blocking(move || {
+            let storage = crate::session::Storage::open(&storage_profile, file_watch)?;
+            transition.update_with_snapshot(&storage, |all, _groups| {
+                for repair in repairs {
+                    let inst = all
+                        .iter_mut()
+                        .find(|i| i.id == repair.session_id)
+                        .ok_or_else(|| anyhow::anyhow!("structured repair target disappeared"))?;
+                    inst.view = crate::session::View::Structured;
+                    if inst.agent_name.is_none() {
+                        inst.agent_name = repair.agent_name;
                     }
-                    Err(join_err) => {
-                        rollback_structured_row_repairs(&state, &failed_ids).await;
-                        tracing::warn!(
-                            target: "server.file_watch",
-                            "structured row repair save task panicked: {join_err}"
-                        );
+                    if inst.agent_model.is_none() {
+                        inst.agent_model = repair.agent_model;
                     }
+                    inst.acp_session_id = Some(repair.acp_session_id);
                 }
+                Ok(())
+            })
+        })
+        .await;
+        let error = match saved {
+            Ok(Ok(((), rows, groups))) => {
+                super::reload::replace_committed_profiles(
+                    fresh,
+                    metadata,
+                    [(&profile, rows, groups)],
+                    |_| None,
+                )?;
+                continue;
             }
-        },
-    );
-}
-
-pub(super) async fn rollback_structured_row_repairs(state: &Arc<AppState>, failed_ids: &[String]) {
-    let mut instances = state.instances.write().await;
-    for inst in instances.iter_mut() {
-        if failed_ids.iter().any(|id| id == &inst.id) {
-            inst.view = crate::session::View::Terminal;
-            inst.acp_session_id = None;
-        }
+            Ok(Err(error)) => error,
+            Err(error) => error.into(),
+        };
+        return Err(super::reload::ReloadFailure {
+            health: crate::daemon::RuntimeHealth::Degraded {
+                code: crate::daemon::ReloadFailureCode::ProfileData,
+                profiles: vec![profile],
+            },
+            source: error,
+        });
     }
+    Ok(())
 }
 
 #[cfg(test)]

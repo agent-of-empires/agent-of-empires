@@ -85,7 +85,7 @@ fn park_message(project_path: &str) -> String {
 #[derive(Debug, Clone)]
 enum ResumeOutcome {
     Attached,
-    /// The orphan registry entry was swept; retry next tick unless parked.
+    /// Attachment or retirement is unfinished; retry next tick unless parked.
     RetryAfterAttachTimeout,
     /// Spawn finished with or without error; `attempted` stays set so a
     /// permanently failing spawn does not loop.
@@ -94,6 +94,8 @@ enum ResumeOutcome {
     /// once. `message` is its Display, matched by the front-end regex (#1027).
     CapacityDeferred {
         message: String,
+        source_profile: String,
+        lifecycle_generation: u64,
     },
 }
 
@@ -115,12 +117,16 @@ fn due(last: &mut Option<Instant>, interval: Duration) -> bool {
 
 /// Structured and not archived, snoozed or trashed.
 fn is_untriaged_structured(i: &Instance) -> bool {
-    i.is_structured() && !i.is_archived() && !i.is_snoozed() && !i.is_trashed()
+    i.is_structured()
+        && i.terminal_handoff.is_none()
+        && !i.is_archived()
+        && !i.is_snoozed()
+        && !i.is_trashed()
 }
 
 /// Eligible for a reconciler-driven worker.
 fn is_resumable(i: &Instance) -> bool {
-    is_untriaged_structured(i) && !i.is_idle_dormant()
+    is_untriaged_structured(i) && !i.is_idle_dormant() && i.launch_is_finalized()
 }
 
 /// Runs a blocking event-store query for `id` off the runtime; `None` (logged) if the task panicked.
@@ -171,6 +177,11 @@ pub async fn reconcile_acp_workers(
 ) {
     let supervisor = &state.acp_supervisor;
     supervisor.retry_pending_teardowns().await;
+    crate::server::api::recover_pending_terminal_handoffs(
+        state,
+        crate::server::api::HandoffRecovery::Maintenance,
+    )
+    .await;
 
     // Before the reaper, so this tick's reaper tears down the drained handle.
     resume::respawn_drained_stale_workers(state).await;
@@ -300,7 +311,14 @@ pub async fn reconcile_acp_workers(
                 "structured-view worker respawn budget exhausted; parking session"
             );
             if parked.insert(id.clone()) {
-                supervisor.publish_startup_error(&id, park_message(&target.project_path));
+                crate::server::api::publish_startup_error_if_current(
+                    state,
+                    &id,
+                    &target.source_profile,
+                    target.lifecycle_generation,
+                    park_message(&target.project_path),
+                )
+                .await;
             }
             attempted.insert(id);
             continue;
@@ -318,10 +336,18 @@ pub async fn reconcile_acp_workers(
         return;
     }
 
-    let cfg = crate::session::config::profile_config::resolve_config_or_warn(&state.profile);
-    let resume_limit = MAX_CONCURRENT_RESUMES
-        .min(cfg.acp.max_concurrent_workers)
-        .max(1);
+    // Live served-profile config bounds cold resumes; the supervisor owns the total cap.
+    let namespace = state.profile_namespace.read().await;
+    let served = state.served_profile().to_string();
+    let live_max_workers = tokio::task::spawn_blocking(move || {
+        crate::session::config::profile_config::resolve_config_or_warn(&served)
+            .acp
+            .max_concurrent_workers
+    })
+    .await
+    .unwrap_or_else(|_| state.acp_supervisor.max_concurrent_workers());
+    drop(namespace);
+    let resume_limit = MAX_CONCURRENT_RESUMES.min(live_max_workers).max(1);
     let semaphore = Arc::new(Semaphore::new(resume_limit as usize));
     let mut set: JoinSet<(String, ResumeOutcome)> = JoinSet::new();
     for target in tasks {
@@ -343,7 +369,14 @@ pub async fn reconcile_acp_workers(
                     attempted.remove(&id);
                 }
             }
-            Ok((id, ResumeOutcome::CapacityDeferred { message })) => {
+            Ok((
+                id,
+                ResumeOutcome::CapacityDeferred {
+                    message,
+                    source_profile,
+                    lifecycle_generation,
+                },
+            )) => {
                 // Refund only this tick's budget entry so prior crash history survives.
                 if let Some(entries) = respawn_history.get_mut(&id) {
                     entries.pop();
@@ -355,7 +388,14 @@ pub async fn reconcile_acp_workers(
                 attempted.remove(&id);
                 // `publish_startup_error` does not dedup, so publish once per transition.
                 if capacity_deferred.insert(id.clone()) {
-                    supervisor.publish_startup_error(&id, message);
+                    crate::server::api::publish_startup_error_if_current(
+                        state,
+                        &id,
+                        &source_profile,
+                        lifecycle_generation,
+                        message,
+                    )
+                    .await;
                 }
             }
             Ok((id, ResumeOutcome::Attached | ResumeOutcome::SpawnFinished)) => {
@@ -374,7 +414,7 @@ async fn drain_pending_initial_turns(state: &Arc<AppState>) {
         let instances = state.instances.read().await;
         instances
             .iter()
-            .filter(|i| i.pending_initial_turn.is_some() && is_untriaged_structured(i))
+            .filter(|i| i.pending_initial_turn.is_some() && is_resumable(i))
             .map(|i| i.id.clone())
             .collect()
     };
@@ -465,8 +505,17 @@ async fn sweep_orphan_workers(state: &Arc<AppState>, live: &HashSet<&String>) {
     let Ok(records) = crate::process::worker_registry::list() else {
         return;
     };
+    let pending_handoffs: HashSet<String> = state
+        .instances
+        .read()
+        .await
+        .iter()
+        .filter(|row| row.terminal_handoff.is_some())
+        .map(|row| row.id.clone())
+        .collect();
     for record in records {
-        if live.contains(&record.session_id)
+        if pending_handoffs.contains(&record.session_id)
+            || live.contains(&record.session_id)
             || state.acp_supervisor.is_owned(&record.session_id).await
         {
             continue;

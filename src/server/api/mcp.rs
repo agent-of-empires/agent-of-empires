@@ -17,7 +17,6 @@ use axum::{
 use serde::Deserialize;
 
 use super::mutation_guard::ElevatedMutationGuard;
-use super::read_only_response;
 use super::{api_error, AppState};
 use crate::session::config::profile_config;
 use crate::session::mcp::mcp_model::{self, McpProvenance, ResolvedMcpServer};
@@ -33,9 +32,9 @@ pub struct AgentQuery {
 
 /// Resolve the agent to inspect: explicit query value, else the profile's
 /// configured default tool, else `claude`.
-fn resolve_agent(state: &AppState, requested: Option<String>) -> String {
+fn resolve_agent(profile: &str, requested: Option<String>) -> String {
     requested.unwrap_or_else(|| {
-        profile_config::resolve_config_or_warn(&state.profile)
+        profile_config::resolve_config_or_warn(profile)
             .session
             .default_tool
             .unwrap_or_else(|| "claude".to_string())
@@ -47,8 +46,14 @@ pub async fn get_mcp_servers(
     State(state): State<Arc<AppState>>,
     Query(query): Query<AgentQuery>,
 ) -> impl IntoResponse {
-    let agent = resolve_agent(&state, query.agent);
-    let profile = state.profile.clone();
+    // The effective MCP surface is read out of the agents' own config files on
+    // this host, so it is admin state this mode has no business seeing.
+    if let Some(resp) = super::cityhall_block(&state) {
+        return resp;
+    }
+    let _namespace = state.profile_namespace.read().await;
+    let profile = state.served_profile().to_string();
+    let agent = resolve_agent(&profile, query.agent);
     let result = tokio::task::spawn_blocking(move || {
         let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
         let profile_opt = (!profile.is_empty()).then_some(profile.as_str());
@@ -102,7 +107,7 @@ pub async fn resolve_mcp_conflict(
     body: Result<Json<ResolveConflictBody>, axum::extract::rejection::JsonRejection>,
 ) -> impl IntoResponse {
     if state.read_only {
-        return read_only_response();
+        return super::read_only_response();
     }
     // CityHall renders the MCP servers tab read-only (display only).
     if let Some(resp) = super::cityhall_block(&state) {
@@ -127,7 +132,8 @@ pub async fn resolve_mcp_conflict(
         }
     };
 
-    let profile = state.profile.clone();
+    let _namespace = state.profile_namespace.read().await;
+    let profile = state.served_profile().to_string();
     let result = tokio::task::spawn_blocking(move || {
         // Re-resolve the current conflicts and find the one for `name`; the
         // fingerprint guard in resolve_conflict rejects a stale resolution.
@@ -177,7 +183,7 @@ pub async fn keep_mcp_server(
     body: Result<Json<AgentBody>, axum::extract::rejection::JsonRejection>,
 ) -> impl IntoResponse {
     if state.read_only {
-        return read_only_response();
+        return super::read_only_response();
     }
     // CityHall renders the MCP servers tab read-only (display only).
     if let Some(resp) = super::cityhall_block(&state) {
@@ -207,7 +213,7 @@ pub async fn drop_mcp_server(
     body: Result<Json<AgentBody>, axum::extract::rejection::JsonRejection>,
 ) -> impl IntoResponse {
     if state.read_only {
-        return read_only_response();
+        return super::read_only_response();
     }
     // CityHall renders the MCP servers tab read-only (display only).
     if let Some(resp) = super::cityhall_block(&state) {
@@ -268,8 +274,9 @@ async fn run_write<R: Send + 'static>(
     state: &AppState,
     write: impl FnOnce() -> Result<R, McpWriteError> + Send + 'static,
 ) -> Result<R, McpWriteError> {
-    let agent = resolve_agent(state, None);
-    let profile = state.profile.clone();
+    let _namespace = state.profile_namespace.read().await;
+    let profile = state.served_profile().clone();
+    let agent = resolve_agent(&profile, None);
     tokio::task::spawn_blocking(move || {
         write().map_err(|e| {
             let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));

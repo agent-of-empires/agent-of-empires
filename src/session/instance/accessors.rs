@@ -12,6 +12,7 @@ impl Instance {
         Self {
             id: generate_id(),
             title: title.to_string(),
+            terminal_scopes: Some(Vec::new()),
             last_auto_title: None,
             first_launch_names_agent: false,
             sort_index: None,
@@ -35,9 +36,11 @@ impl Instance {
             idle_dormant_since: None,
             pinned_at: None,
             trashed_at: None,
+            failed_purge: None,
             trash_lifecycle_id: None,
             pre_trash_project_path: None,
             lifecycle_reservation: None,
+            terminal_handoff: None,
             plugin_meta: std::collections::BTreeMap::new(),
             created_by_plugin: None,
             plugin_create_idempotency: None,
@@ -100,12 +103,29 @@ impl Instance {
             session_id_poller_retry_after: None,
             retroactive_capture_excludes: HashSet::new(),
             pane_dead_observed: false,
+            agent_pane: PaneObservation::default(),
+            auxiliary: Vec::new(),
             file_watch: None,
         }
     }
 
-    /// Inject the live FileWatchService Arc into this Instance for in-process Local fast-path
-    /// notifications during subsequent storage mutations.
+    pub fn auxiliary_presence(&self, target: &AuxiliaryTarget) -> PanePresence {
+        self.auxiliary
+            .iter()
+            .find(|observation| &observation.target == target)
+            .map_or(PanePresence::Unknown, |observation| observation.pane.state)
+    }
+
+    pub fn tool_presence(&self, name: &str) -> PanePresence {
+        self.auxiliary.iter().find(|observation| matches!(&observation.target, AuxiliaryTarget::Tool { tool_name } if tool_name == name))
+            .map_or(PanePresence::Unknown, |observation| observation.pane.state)
+    }
+
+    /// Inject the live FileWatchService Arc into this Instance for
+    /// in-process Local fast-path notifications during subsequent storage
+    /// mutations. Called by `Storage::load*` automatically; manual call
+    /// sites are daemon-side recovery and TUI session-creation paths that
+    /// build Instances without going through Storage::load.
     pub(crate) fn set_file_watch(
         &mut self,
         fw: std::sync::Arc<crate::file_watch::FileWatchService>,
@@ -113,34 +133,20 @@ impl Instance {
         self.file_watch = Some(fw);
     }
 
-    /// Write this row's sandbox provider stamp to disk, leaving every other
-    /// stored field as it is.
-    pub(crate) fn persist_sandbox_provider(&self) -> anyhow::Result<()> {
-        let provider = self.sandbox_info.as_ref().and_then(|s| s.provider.clone());
-        crate::session::Storage::new(&self.source_profile, self.resolve_file_watch())?.update(
-            |instances, _groups| {
-                if let Some(sandbox) = instances
-                    .iter_mut()
-                    .find(|i| i.id == self.id)
-                    .and_then(|i| i.sandbox_info.as_mut())
-                {
-                    sandbox.provider = provider;
-                }
-                Ok(())
-            },
-        )
-    }
-
-    /// Resolve the live `Arc<FileWatchService>` for this Instance, falling back to a noop service
-    /// when none was injected (ad-hoc construction or pre-injection state).
+    /// Resolve the live `Arc<FileWatchService>` for this Instance, falling
+    /// back to a noop service when none was injected (ad-hoc construction
+    /// or pre-injection state). Use sites pair this with `Storage::new`
+    /// directly because `new_unwatched` would shadow a live injection.
     pub(super) fn resolve_file_watch(&self) -> std::sync::Arc<crate::file_watch::FileWatchService> {
         self.file_watch
             .clone()
             .unwrap_or_else(crate::file_watch::FileWatchService::noop)
     }
 
-    /// Whether a title rename should also move the worktree directory leaf, given the resolved
-    /// `session.tie_workdir_to_name` setting.
+    /// Whether a title rename should also move the worktree directory leaf,
+    /// given the resolved `session.tie_workdir_to_name` setting. True only for
+    /// aoe-managed worktree sessions: non-worktree (scratch, plain tmux) and
+    /// externally-attached worktrees are always a no-op. See #1927.
     pub fn tie_workdir_applies(&self, tie_setting: bool) -> bool {
         tie_setting
             && self
@@ -149,8 +155,14 @@ impl Instance {
                 .is_some_and(|w| w.managed_by_aoe)
     }
 
-    /// Whether deleting this session has aoe-managed worktree state to clean up, covering BOTH
-    /// single-repo and multi-repo (workspace) sessions.
+    /// Whether deleting this session has aoe-managed worktree state to clean
+    /// up, covering BOTH single-repo and multi-repo (workspace) sessions.
+    /// Single-repo sessions carry an aoe-managed `worktree_info`; workspace
+    /// sessions carry `workspace_info` instead (with `worktree_info = None`),
+    /// and opt into cleanup via `cleanup_on_delete`. Entry points use this to
+    /// decide whether to set `delete_worktree`; gating on `worktree_info`
+    /// alone silently leaks the workspace directory (#2363). Mirrors the TUI
+    /// group-delete predicate so every surface agrees.
     pub fn has_managed_worktree_or_workspace(&self) -> bool {
         self.worktree_info
             .as_ref()
@@ -162,6 +174,12 @@ impl Instance {
     }
 
     /// Every repo this session works in, empty for a single-repo session.
+    ///
+    /// The one accessor consumers read, so nothing has to know that a session
+    /// gains repos two ways: created multi-repo, or converted by
+    /// `attach_project` (#3103). Both end up in `workspace_info.repos`, which is
+    /// the point of converting rather than keeping a second list: a repo added
+    /// later is indistinguishable from one present at creation.
     pub fn all_repos(&self) -> &[WorkspaceRepo] {
         self.workspace_info
             .as_ref()
@@ -169,9 +187,9 @@ impl Instance {
             .unwrap_or(&[])
     }
 
-    /// Return the profile that should drive config resolution for this instance, falling back to
-    /// the user's globally configured default when `source_profile` was never populated (e.g.
-    /// legacy callers).
+    /// Return the profile that should drive config resolution for this
+    /// instance, falling back to the user's globally configured default
+    /// when `source_profile` was never populated (e.g. legacy callers).
     pub fn effective_profile(&self) -> String {
         crate::session::config::effective_profile(&self.source_profile)
     }
@@ -192,7 +210,33 @@ impl Instance {
             .or_else(|| crate::agents::get_agent(&self.effective_detect_as()))
     }
 
+    pub(super) fn effective_detect_as_in<'a>(
+        &'a self,
+        config: &'a crate::session::config::SessionConfig,
+    ) -> &'a str {
+        if self.detect_as.is_empty() {
+            config
+                .agent_detect_as
+                .get(&self.tool)
+                .map_or("", String::as_str)
+        } else {
+            &self.detect_as
+        }
+    }
+
+    pub(super) fn resolved_agent_in(
+        &self,
+        config: &crate::session::config::SessionConfig,
+    ) -> Option<&'static crate::agents::AgentDef> {
+        crate::agents::get_agent(&self.tool)
+            .or_else(|| crate::agents::get_agent(self.effective_detect_as_in(config)))
+    }
+
     /// The built-in identity used to compare capture stores and aliases.
+    ///
+    /// This is classification only. Capture and resume authorization still
+    /// goes through `resolved_session_support` or `supports_native_resume`,
+    /// which also prove the launch command and capture context.
     pub(crate) fn capture_agent_name(&self) -> Option<&'static str> {
         self.resolved_agent().map(|a| a.name)
     }
@@ -265,8 +309,14 @@ impl Instance {
             && !words.iter().any(|word| word == "--")
     }
 
-    /// The basename of the program this launch actually runs, which is the token a live process
-    /// carries in argv.
+    /// The basename of the program this launch actually runs, which is the
+    /// token a live process carries in argv.
+    ///
+    /// A command override names it; otherwise it is the resolved agent's own
+    /// binary. Matching on this rather than on `agent.binary` is what lets the
+    /// orphan scan see a renamed wrapper, which carries the pane's
+    /// `AOE_INSTANCE_ID` because [`status_hook_env_prefix`] injects the marker
+    /// on hook presence alone.
     pub(crate) fn launch_executable_token(&self) -> Option<String> {
         let words = parse_launch_command(self.get_tool_command())?.words;
         Path::new(words.first()?)
@@ -291,6 +341,9 @@ impl Instance {
     }
 
     /// Whether this launch shape leaves Claude user hooks enabled.
+    ///
+    /// This is evidence for the identity publisher only. It does not change
+    /// native resume support.
     pub(crate) fn hook_session_publisher_allowed_by_argv(&self) -> bool {
         if !self
             .default_selector_agent()
@@ -523,18 +576,34 @@ impl Instance {
         if !self.is_sandboxed() {
             return None;
         }
+        // The host home, not `resolved_host_home()`: a sandboxed session
+        // ignores `session.environment`, whose `HOME` entry is the host
+        // command line's, never the container's. The launcher stages the store
+        // under the process home (`container_config::build_container_config`,
+        // `ensure_folder_trust_config_for_active_agent`), so that is where the
+        // identity sidecar, the exclusivity lease and this read all have to
+        // agree; resolving the profile entry instead names a directory nothing
+        // mounts.
         let home = dirs::home_dir()?;
         let config = crate::session::config::profile_config::resolve_config_or_warn(
             &self.effective_profile(),
         );
-        let declared = config.session.agent_config_dir_for(&self.tool, &home);
-        let agent = self.resolved_agent()?;
+        self.sandbox_capture_store_dir_for(self.resolved_agent()?, &config, &home)
+    }
+
+    pub(super) fn sandbox_capture_store_dir_for(
+        &self,
+        agent: &crate::agents::AgentDef,
+        config: &crate::session::config::Config,
+        home: &Path,
+    ) -> Option<std::path::PathBuf> {
+        let declared = config.session.agent_config_dir_for(&self.tool, home);
         if self.sandbox_store_generation
             >= crate::session::config::container_config::CURRENT_SANDBOX_STORE_GENERATION
         {
             crate::session::config::container_config::sandbox_store_dir(
                 agent.name,
-                &home,
+                home,
                 declared.as_deref(),
                 &self.id,
             )
@@ -543,7 +612,7 @@ impl Instance {
         } else {
             crate::session::config::container_config::sandbox_store_migration_paths(
                 agent.name,
-                &home,
+                home,
                 declared.as_deref(),
                 &self.id,
             )
@@ -552,6 +621,45 @@ impl Instance {
             .next()
             .map(|(shared, _)| shared)
         }
+    }
+
+    pub(crate) fn is_managed_capture_peer(
+        &self,
+        current_id: &str,
+        is_current_profile: bool,
+    ) -> bool {
+        !(is_current_profile && self.id == current_id)
+            && self.is_sandboxed()
+            && self.archived_at.is_none()
+            && self.trashed_at.is_none()
+            && !matches!(self.status, Status::Stopped | Status::Deleting)
+    }
+
+    pub(crate) fn managed_capture_store_conflicts(
+        &self,
+        backend: crate::agents::SessionCaptureBackend,
+        current_store: &Path,
+        config: &crate::session::config::Config,
+        home: &Path,
+    ) -> bool {
+        let agent = crate::agents::get_agent(&self.tool).or_else(|| {
+            let detect_as = if self.detect_as.is_empty() {
+                config.session.agent_detect_as.get(&self.tool)?.as_str()
+            } else {
+                &self.detect_as
+            };
+            crate::agents::get_agent(detect_as)
+        });
+        let Some(agent) = agent else { return false };
+        if !self
+            .source_session_support()
+            .is_some_and(|(capture, _)| capture.backend == backend)
+        {
+            return false;
+        }
+        self.sandbox_capture_store_dir_for(agent, config, home)
+            .and_then(|path| std::fs::canonicalize(path).ok())
+            .is_none_or(|path| path == current_store)
     }
 
     pub(super) fn sandbox_capture_store_dir(&self) -> Option<std::path::PathBuf> {
@@ -568,8 +676,11 @@ impl Instance {
         self.sandbox_info.as_ref().is_some_and(|s| s.enabled)
     }
 
-    /// The repo this session groups under: the worktree's main repo when present (so all branches
-    /// of a repo group together), else the project path.
+    /// The repo this session groups under: the worktree's main repo when
+    /// present (so all branches of a repo group together), else the project
+    /// path. Shared by sidebar project grouping and new-session prefill so
+    /// the "which directory does this session belong to" rule lives in one
+    /// place.
     pub fn repo_path(&self) -> &str {
         self.worktree_info
             .as_ref()
@@ -581,19 +692,18 @@ impl Instance {
         self.yolo_mode
     }
 
-    /// True when this session renders in the structured (ACP) view. Rows damaged by pre-fix writers
-    /// are healed on reload by the server's structured row repair path.
+    /// True when this session renders in the structured (ACP) view. Rows
+    /// damaged by pre-fix writers are healed on reload by the server's
+    /// structured row repair path.
     pub fn is_structured(&self) -> bool {
         self.view == View::Structured
     }
 
-    /// Move a structured row to the terminal view, keeping the store an
-    /// asserted binding or the live worker proved, and refusing to move at all
-    /// when neither did: the row then keeps its view and its ACP id.
-    pub(crate) fn switch_to_terminal_keep_context(
-        &mut self,
+    /// Require an asserted or worker-proven native store before planning a terminal handoff.
+    pub(crate) fn terminal_keep_context_state(
+        &self,
         worker: Option<&ExecutionBinding>,
-    ) -> Result<()> {
+    ) -> Result<ConversationState> {
         let sid = self
             .acp_session_id
             .clone()
@@ -621,7 +731,7 @@ impl Instance {
         let binding = resolved
             .context(unresolved)?
             .ok_or_else(|| anyhow::anyhow!(unresolved))?;
-        self.adopt_conversation_state(ConversationState {
+        Ok(ConversationState {
             tool: self.tool.clone(),
             session_id: Some(sid.clone()),
             binding: Some(binding.clone()),
@@ -629,12 +739,7 @@ impl Instance {
             resume_binding: Some(binding),
             active: None,
             pi_session_path: None,
-        });
-        self.acp_session_id = None;
-        self.import_pending = None;
-        self.acp_load_session_capable = None;
-        self.view = View::Terminal;
-        Ok(())
+        })
     }
 
     pub(crate) fn selected_claude_conversation(&self) -> Option<(&str, &ExecutionBinding)> {
@@ -650,12 +755,7 @@ impl Instance {
         (execution.agent == "claude" && execution.filesystem == "host").then_some((sid, execution))
     }
 
-    /// A legacy binding carries no route marker, so the marker is derived from
-    /// the configuration as it stands right now — the same rule the launch
-    /// itself routes with, ambient `CLAUDE_CONFIG_DIR` included, since a
-    /// wrapper that exports the default store is naming it too. Deriving
-    /// rather than reading keeps a reconfigured alias observed instead of
-    /// frozen into the row.
+    /// Legacy route markers follow current launch configuration so alias changes stay visible.
     pub(crate) fn selected_claude_store_pin(
         &self,
     ) -> Option<crate::session::capture::ClaudeStorePin> {
@@ -756,12 +856,10 @@ mod tests {
     }
 
     #[test]
-    fn switch_to_terminal_keep_context_carries_asserted_native_binding() {
+    fn terminal_keep_context_state_carries_asserted_native_binding() {
         let mut inst = Instance::new("claude", "/tmp");
         inst.view = View::Structured;
         inst.acp_session_id = Some("sid-abc".to_string());
-        inst.import_pending = Some(true);
-        inst.acp_load_session_capable = Some(true);
         let binding = ConversationBinding {
             session_id: "sid-abc".into(),
             execution: Some(ExecutionBinding {
@@ -779,37 +877,24 @@ mod tests {
         inst.resume_intent = ResumeIntent::Use("sid-abc".into());
         inst.resume_binding = Some(binding.clone());
 
-        inst.switch_to_terminal_keep_context(None).unwrap();
+        let planned = inst.terminal_keep_context_state(None).unwrap();
 
-        assert_eq!(inst.view, View::Terminal);
-        assert_eq!(inst.agent_session_binding.as_ref(), Some(&binding));
-        assert_eq!(inst.resume_intent, ResumeIntent::Use("sid-abc".to_string()));
-        assert_eq!(
-            (
-                inst.acp_session_id,
-                inst.import_pending,
-                inst.acp_load_session_capable
-            ),
-            (None, None, None)
-        );
+        assert_eq!(planned.binding.as_ref(), Some(&binding));
+        assert_eq!(planned.resume_binding.as_ref(), Some(&binding));
+        assert_eq!(planned.session_id.as_deref(), Some("sid-abc"));
+        assert_eq!(planned.intent, ResumeIntent::Use("sid-abc".to_string()));
     }
 
-    /// A structured row with no asserted binding and no worker has proved no
-    /// store, so the switch is refused and names the command that would, and
-    /// the row keeps the view and the ACP id it had.
     #[test]
     #[serial_test::serial]
-    fn switch_to_terminal_keep_context_refuses_a_row_nothing_proved() {
+    fn terminal_keep_context_state_refuses_unproved_store() {
         let temp = tempfile::tempdir().unwrap();
         let _app = crate::session::test_support::isolate_app_dir_at(temp.path());
         let mut inst = Instance::new("claude-unproved", "/tmp");
         inst.view = View::Structured;
         inst.acp_session_id = Some("sid-abc".into());
 
-        let error = inst.switch_to_terminal_keep_context(None).unwrap_err();
-        assert!(error.to_string().contains("set-session-id"));
-        assert_eq!(inst.view, View::Structured);
-        assert_eq!(inst.acp_session_id.as_deref(), Some("sid-abc"));
+        assert!(inst.terminal_keep_context_state(None).is_err());
     }
 
     /// A legacy binding carries no route marker, and the marker it would be
@@ -1085,6 +1170,13 @@ mod tests {
     #[test]
     fn native_resume_requires_a_direct_local_builtin_launch() {
         const PROFILE: &str = "resume-custom-launch-test";
+        // The table resolves the agent through the profile config and the
+        // detection registry, both of which read the app dir and reinstall
+        // themselves; the serialised tests next door do the same. Without an
+        // app dir of its own this test reads whichever one a concurrent test
+        // left behind, and the resolution flips on cases that are decided by
+        // the environment rather than by the argv under test.
+        let _app = crate::session::test_support::isolate_app_dir();
         let _registry = install_aliases(PROFILE, &[("work-claude", "claude")]);
         // (tool, command, extra_args, supported)
         for (tool, command, extra, supported) in [
@@ -1178,10 +1270,11 @@ mod tests {
         inst.acp_session_id = Some("sid-abc".to_string());
 
         let worker = inst.resolve_native_execution(None).unwrap().binding;
-        inst.switch_to_terminal_keep_context(Some(&worker)).unwrap();
+        let planned = inst.terminal_keep_context_state(Some(&worker)).unwrap();
 
         assert_eq!(
-            inst.agent_session_binding
+            planned
+                .binding
                 .as_ref()
                 .and_then(|binding| binding.execution.as_ref())
                 .and_then(|execution| execution.stores.first())
@@ -1212,14 +1305,11 @@ mod tests {
         inst.view = View::Structured;
         inst.acp_session_id = Some("sid-abc".to_string());
 
-        let error = inst.switch_to_terminal_keep_context(None).unwrap_err();
-        assert!(error.to_string().contains("set-session-id"));
-        assert_eq!(inst.view, View::Structured);
-        assert_eq!(inst.acp_session_id.as_deref(), Some("sid-abc"));
+        assert!(inst.terminal_keep_context_state(None).is_err());
     }
     #[test]
     #[serial_test::serial]
-    fn handoff_reports_native_resolution_failure_without_losing_acp_session() {
+    fn handoff_refuses_unattested_native_configuration() {
         let temp = tempfile::tempdir().unwrap();
         let _app = crate::session::test_support::isolate_app_dir_at(temp.path());
         let _claude = crate::session::test_support::install_login_shell_path_command(
@@ -1233,14 +1323,7 @@ mod tests {
         let worker = inst.resolve_native_execution(None).unwrap().binding;
         inst.extra_args = "--mcp-config /tmp/unattested.json".into();
 
-        let error = inst
-            .switch_to_terminal_keep_context(Some(&worker))
-            .unwrap_err();
-        let chain = format!("{error:#}");
-        assert!(chain.contains("set-session-id"), "{chain}");
-        assert!(chain.contains("--mcp-config"), "{chain}");
-        assert_eq!(inst.view, View::Structured);
-        assert_eq!(inst.acp_session_id.as_deref(), Some("sid-abc"));
+        assert!(inst.terminal_keep_context_state(Some(&worker)).is_err());
     }
 
     /// #4127: the launch's route reaches both bindings a resume may persist,
@@ -1307,5 +1390,53 @@ mod tests {
         sandboxed.agent_session_binding = Some(legacy());
         assert!(!sandboxed.attest_launch_default_store(Some(&observed)));
         assert_eq!(markers(&sandboxed), vec![None]);
+    }
+
+    /// The store this session's capture reads is the one the container mounts,
+    /// and a sandboxed session ignores `session.environment`; so a `HOME`
+    /// entry in the profile must not move the store off the host home the
+    /// launcher stages it under. Reading the profile entry instead leaves the
+    /// identity sidecar with a bind dir nothing mounted (no sidecar is ever
+    /// produced) and hands the exclusivity lease a path that does not exist,
+    /// which reports "not exclusive" and defers capture for good.
+    #[test]
+    #[serial_test::serial]
+    fn sandbox_capture_store_reads_the_store_the_container_mounts() {
+        let temp = tempfile::tempdir().unwrap();
+        let host_home = temp.path().join("host-home");
+        let profile_home = temp.path().join("profile-home");
+        std::fs::create_dir_all(&host_home).unwrap();
+        std::fs::create_dir_all(&profile_home).unwrap();
+        let _app = crate::session::test_support::isolate_app_dir_at(temp.path());
+        let _home = crate::session::test_support::isolate_home(&host_home);
+
+        let profile = "capture-store-home";
+        std::fs::write(
+            crate::session::get_profile_dir(profile)
+                .unwrap()
+                .join("config.toml"),
+            format!("environment = [\"HOME={}\"]\n", profile_home.display()),
+        )
+        .unwrap();
+
+        let mut inst = Instance::new("gemini", temp.path().to_str().unwrap());
+        inst.tool = "gemini".to_string();
+        inst.source_profile = profile.to_string();
+        inst.sandbox_info = Some(test_sandbox(&inst.id, Some("/workspace/session")));
+
+        let mounted = crate::session::config::container_config::sandbox_store_dir(
+            "gemini", &host_home, None, &inst.id,
+        )
+        .unwrap()
+        .expect("gemini mounts a private store");
+        assert_eq!(inst.sandbox_capture_store_path(), Some(mounted.clone()));
+
+        // The pair that has to agree with this read: an exclusive-store lease
+        // taken over a path the launcher never stages defers capture forever.
+        std::fs::create_dir_all(&mounted).unwrap();
+        assert_eq!(
+            std::fs::canonicalize(&mounted).unwrap(),
+            std::fs::canonicalize(inst.sandbox_capture_store_path().unwrap()).unwrap()
+        );
     }
 }

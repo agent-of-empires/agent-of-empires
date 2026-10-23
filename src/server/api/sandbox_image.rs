@@ -16,8 +16,8 @@ use serde::{Deserialize, Serialize};
 use tokio::time::Instant;
 
 use super::{api_error, cityhall_block, read_only_block};
-use crate::containers::container_runtime_for;
 use crate::containers::image_update::{self, ImageCheck};
+use crate::containers::ContainerRuntime;
 use crate::server::AppState;
 use crate::session::ContainerRuntimeName;
 
@@ -106,7 +106,7 @@ static CHECK_TURNS: LazyLock<Mutex<HashMap<ImageKey, Arc<tokio::sync::Mutex<()>>
 
 async fn image_state(runtime: ContainerRuntimeName, key: ImageKey, fresh: bool) -> ImageState {
     image_state_with(key, fresh, move |image| async move {
-        image_update::check_image(container_runtime_for(runtime), &image).await
+        image_update::check_image(ContainerRuntime::from(runtime), &image).await
     })
     .await
 }
@@ -200,7 +200,7 @@ struct Configured {
 impl Configured {
     fn key(&self, image: String) -> ImageKey {
         ImageKey {
-            runtime: container_runtime_for(self.runtime).display_name(),
+            runtime: ContainerRuntime::from(self.runtime).display_name(),
             image,
         }
     }
@@ -313,7 +313,7 @@ pub async fn sandbox_image_status(
         Ok(image) => image,
         Err(resp) => return resp,
     };
-    let runtime = container_runtime_for(configured.runtime);
+    let runtime = ContainerRuntime::from(configured.runtime);
     let key = configured.key(image.clone());
     let image_state = if configured.checks_enabled {
         image_state(configured.runtime, key.clone(), query.fresh).await
@@ -411,7 +411,7 @@ pub async fn sandbox_image_pull(
         tokio::spawn(async move {
             let pulled = key.image.clone();
             let result = tokio::task::spawn_blocking(move || {
-                container_runtime_for(runtime).pull_image(&pulled)
+                ContainerRuntime::from(runtime).pull_image(&pulled)
             })
             .await;
             let outcome = match result {
@@ -881,8 +881,10 @@ mod tests {
             (StatusCode::FORBIDDEN, Some("pull_disabled"))
         );
 
-        let mut read_only = crate::server::test_support::build_test_app_state(Vec::new());
-        Arc::get_mut(&mut read_only).unwrap().read_only = true;
+        let read_only =
+            crate::server::test_support::build_test_app_state_configured(Vec::new(), |state| {
+                state.read_only = true
+            });
         let (code, body) = json(pull(read_only.clone()).await).await;
         assert_eq!(
             (code, body["error"].as_str()),

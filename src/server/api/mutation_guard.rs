@@ -5,12 +5,12 @@ use axum::http::{request::Parts, StatusCode};
 use axum::response::Response;
 
 use super::{api_error, AppState};
-use crate::server::auth::{handler_elevated, AuthenticatedSession, LoopbackTrusted};
+use crate::server::auth::{handler_elevated, AuthenticatedSession, LocalAuthorization};
 
 async fn mutation_gate(
     state: &AppState,
     session: Option<&AuthenticatedSession>,
-    loopback_trusted: bool,
+    local_owner: bool,
 ) -> Result<(), Response> {
     if state.read_only {
         return Err(super::read_only_response());
@@ -18,7 +18,7 @@ async fn mutation_gate(
     if let Some(response) = super::cityhall_block(state) {
         return Err(response);
     }
-    if !handler_elevated(state, session, loopback_trusted).await {
+    if !handler_elevated(state, session, local_owner).await {
         return Err(api_error(
             StatusCode::FORBIDDEN,
             "elevation_required",
@@ -40,8 +40,8 @@ impl FromRequestParts<std::sync::Arc<AppState>> for ElevatedMutationGuard {
         state: &std::sync::Arc<AppState>,
     ) -> Result<Self, Self::Rejection> {
         let session = parts.extensions.get::<AuthenticatedSession>();
-        let loopback_trusted = parts.extensions.get::<LoopbackTrusted>().is_some();
-        mutation_gate(state, session, loopback_trusted).await?;
+        let local_owner = parts.extensions.get::<LocalAuthorization>().is_some();
+        mutation_gate(state, session, local_owner).await?;
         Ok(Self)
     }
 }

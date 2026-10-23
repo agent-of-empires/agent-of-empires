@@ -27,6 +27,7 @@ export function useTerminalInput({
   sendData,
   sendPaste,
   uploadPastedImage,
+  captureWriteAdmission,
 }: {
   active: boolean;
   inputRef: RefObject<HTMLTextAreaElement | null>;
@@ -35,7 +36,8 @@ export function useTerminalInput({
   sendData: (data: string) => boolean;
   /** Pastes through tmux, which adds bracketed-paste markers only when the pane enabled them. */
   sendPaste: (text: string, submit: boolean) => boolean;
-  uploadPastedImage: (file: File) => Promise<string | null>;
+  uploadPastedImage: (file: File, canWrite: () => boolean) => Promise<string | null>;
+  captureWriteAdmission: () => () => boolean;
 }) {
   const composingRef = useRef(false);
   const activeRef = useRef(active);
@@ -144,6 +146,11 @@ export function useTerminalInput({
 
   const onPaste = useCallback(
     (e: ClipboardEvent) => {
+      const canWrite = captureWriteAdmission();
+      if (!canWrite()) {
+        e.preventDefault();
+        return;
+      }
       // clipboardData may not survive an await, so read it synchronously.
       const text = e.clipboardData?.getData("text/plain") ?? "";
       const imageFiles = Array.from(e.clipboardData?.items ?? [])
@@ -158,19 +165,19 @@ export function useTerminalInput({
       }
       // Images cannot be typed into the pane: upload them and paste the paths the agent can read.
       void (async () => {
-        const paths = (await Promise.all(imageFiles.map((f) => uploadPastedImage(f)))).filter(
+        const paths = (await Promise.all(imageFiles.map((f) => uploadPastedImage(f, canWrite)))).filter(
           (p): p is string => p != null,
         );
         const parts = [text.trim(), ...paths.map(escapePastePath)].filter((s) => s.length > 0);
         const target = inputRef.current;
-        if (parts.length === 0 || !target) return;
+        if (!canWrite() || parts.length === 0 || !target) return;
         // A background session may finish its paste but must not invalidate the foreground proxy.
         if (activeRef.current) invalidateRetainedImeContext(target);
         else resetHiddenInput(target);
         sendPaste(` ${parts.join(" ")} `, false);
       })();
     },
-    [inputRef, sendPaste, uploadPastedImage],
+    [inputRef, sendPaste, uploadPastedImage, captureWriteAdmission],
   );
 
   // Composition text is sent by the hidden input's diff at compositionend; this only gates key handling.

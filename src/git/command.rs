@@ -210,16 +210,11 @@ mod tests {
     use super::*;
     use std::ffi::OsString;
 
-    /// The same failing command is a WARN through `run_git_with_timeout` and a
-    /// DEBUG through `run_git_quiet_with_timeout`; the quiet variant must not
-    /// drop the record entirely, since the stderr summary is what makes a
-    /// surprise diagnosable.
     #[test]
     fn run_git_quiet_demotes_expected_failure_to_debug() {
         let tmp = tempfile::tempdir().unwrap();
         let logs = crate::session::test_support::LogCapture::start();
-        // Not a repository, so `git worktree unlock` exits non-zero: the
-        // shape `unlock_worktree` classifies as a harmless no-op.
+        // Unlocking outside a repository fails without affecting any worktree.
         let args = ["worktree", "unlock", "/nonexistent"];
         let timeout = Duration::from_secs(30);
         let loud = run_git_with_timeout(tmp.path(), args, timeout)
@@ -234,7 +229,7 @@ mod tests {
         let logs = logs.contents();
         let failures = |level: &str| {
             logs.lines()
-                .filter(|l| l.contains(level) && l.contains("git command failed"))
+                .filter(|line| line.contains(level) && line.contains("git command failed"))
                 .count()
         };
         assert_eq!(

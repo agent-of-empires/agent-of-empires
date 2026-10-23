@@ -98,6 +98,12 @@ slot = "row-badge"
 id = "my_badge"
 ```
 
+`href` may also be a same-origin relative path, which is the only portable way
+to link back into aoe (a plugin cannot know the host, port, or tunnel origin).
+Relative hrefs must start with exactly one `/`; `//host`, backslashes, and
+embedded tab/CR/LF are rejected because a browser would resolve them onto a
+different origin. See [Link targets](#link-targets).
+
 ## Keybinds
 
 ```toml
@@ -253,10 +259,14 @@ With `api_version >= 9` a worker can discover ACP capabilities and create host-o
 **Idempotency.** `sessions.create` takes a plugin-scoped `idempotency_key`: retrying with the same key and payload returns the existing session (`created: false`), while a different payload under that key is a conflict.
 
 **Limits.** Per plugin: 20 creates per hour, 5 active plugin-created sessions, 120 turns per hour, 600 messages per hour, reported as `rate_limited` or `concurrency_limited`. Disabling the plugin stops all of its automation.
+A pending revival occupies an active slot until a real counted or terminal
+transition settles it. Metadata reloads and prompt recency writes do not release that slot.
 
 **Settings-change events.** After a settings write the host notifies the worker with `plugin.settings.changed` carrying `{ revision, changed_keys }`; the worker re-reads those values with `config.get`, whose response carries the current `revision`. Polling that method is the fallback for a worker that was down.
 
 **Session status events.** With `api_version >= 14` and the `session.read` capability, the host notifies the worker with `session.status.changed` on every status transition of a session in the host's profile (the same sessions `sessions.list` returns), for structured and terminal sessions alike. The params are `{ session_id, title, from, to, at }`: `from` and `to` use the same PascalCase spelling as `sessions.list` (`Running`, `Idle`, `Waiting`, `Stopped`, `Error`, and so on), and `at` is an RFC 3339 timestamp. The host sends the transitions it processes, so filter on `to` (for example `Idle` for "the agent stopped working"). Do not treat the notifications as a complete transition log: a status change made by another process, such as the CLI or TUI, is reported when the daemon next reloads it, changes within one poll tick can merge into one event, and delivery is best-effort as described below. It is a best-effort, fire-and-forget notification: do not reply, and an event is never replayed. It is lost if the worker was down when it fired, if the daemon's status stream lagged and skipped it, or if the worker had stopped reading stdin (at most 64 unread status events are queued per worker; later ones are dropped until it catches up). Resynchronize from `sessions.list` on startup and whenever you may have missed events, but it reads the stored sessions: the `status` of a structured (ACP) session moves on the live row without being persisted each time, so the listed value can be older than the live one. There is no live-status snapshot call yet.
+
+Status notifications follow canonical row adoption. Rejected or stale operations emit no status transition, and status polling does not resend a transition already published by that commit.
 
 **Session lifecycle events.** With `api_version >= 19` and the `session.read` capability, the host also notifies the worker with `session.lifecycle.changed` when a session in the host's profile changes lifecycle state. The params are `{ session_id, kind, at, summary }`. `kind` is `created`, `deleted`, `archived`, `unarchived`, `trashed`, `restored`, `renamed` or `workspace_changed` (the set of checkouts the session works in changed; a branch switch alone does not count), and `at` is an RFC 3339 timestamp. `summary` is the session's `sessions.list` entry at the time of the change. The events keep membership and the listed lifecycle fields current; other fields such as `snoozed` and branches can change without an event, so re-read `sessions.list` when you need their current values. A `deleted` event has no `summary`: the session is gone. The events follow the host's profile, like `sessions.list`: a session moved to another profile is `deleted` for a plugin in the old profile and `created` for one in the new profile. One change can produce several events, such as `archived` and `trashed` together. These events share the delivery guarantee and the 64-event queue of the status events above, and are never replayed. They are best-effort: a change made by another process (the CLI or TUI) is detected from the session store a moment later, and changes inside that window are coalesced, so a session created and deleted in quick succession may produce no event. A session created while the daemon was not running produces no `created` event. Resynchronize from `sessions.list` on startup and whenever you may have missed events.
 
@@ -503,6 +513,25 @@ Clicking an `action` block, or a `row` carrying a `method`, POSTs to `/api/plugi
 The host merges in the authoritative `session_id` (a plugin cannot spoof it) and delivers the call as a **fire-and-forget JSON-RPC notification**: no reply, no return value. The worker does its work and re-pushes its UI state, and the clicked control spins until the plugin's UI revision moves, with a 15s timeout. Actions are read-write-mode only and are not passphrase gated, so treat every method as reachable by anyone who can use the dashboard.
 
 The TUI renders panes read-only: it draws the text of every kind (dropping icons, hrefs, and tooltips, and stacking `columns`) but cannot fire an action, so `action` blocks appear as inert `[action] <label>` labels.
+
+#### Link targets
+
+An `href` is either an absolute `http(s)://` URL, or a same-origin path
+resolved against the host's own dashboard origin:
+
+- **In the web dashboard** a relative path navigates inside the open SPA, so
+  the browser stays on the same origin and no page reload is needed.
+- **In the TUI** there is no browser origin, so a relative path needs a
+  reachable dashboard to open: a local `aoe serve` web daemon (its published
+  URL, including its bootstrap token, is used), or an explicit
+  `AOE_DASHBOARD_URL` when the TUI is attached to a remote daemon
+  (`AOE_DAEMON_URL`). A core-only daemon has no TCP listener and no dashboard,
+  so a relative link is refused with a message rather than opened against a
+  guessed host. Absolute `http(s)` hrefs work everywhere and need no
+  dashboard.
+
+Dashboard bootstrap query parameters are preserved across the navigation, so
+a tokenized `serve.url` still authenticates a relative link.
 
 ### Composer action payload
 

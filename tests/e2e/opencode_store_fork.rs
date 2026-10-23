@@ -4,9 +4,10 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+use rusqlite::OptionalExtension;
 use serial_test::parallel;
 
-use crate::harness::{require_python3, require_tmux, TuiTestHarness};
+use crate::harness::{require_python3, require_tmux, session_by_title, TuiTestHarness};
 
 const PARENT: &str = "OpencodeForkParent";
 const CHILD: &str = "OpencodeForkChild";
@@ -33,11 +34,18 @@ fn declare_host_environment(h: &TuiTestHarness, entries: &[String]) {
 }
 
 fn server_program() -> String {
-    r#"import json, os, sqlite3, sys
+    r#"import base64, json, os, sqlite3, sys
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 class Handler(BaseHTTPRequestHandler):
-    def do_GET(self):
+    def authorized(self):
+        expected = 'Basic ' + base64.b64encode(('opencode:' + os.environ['OPENCODE_PASSWORD']).encode()).decode()
+        if self.headers.get('Authorization') == expected:
+            return True
+        self.send_error(401)
+        return False
+
+    def reply_body(self):
         encoded = json.dumps(body).encode()
         self.send_response(200)
         self.send_header('Content-Type', 'application/json')
@@ -46,7 +54,13 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(encoded)
 
+    def do_GET(self):
+        if self.authorized():
+            self.reply_body()
+
     def do_POST(self):
+        if not self.authorized():
+            return
         self.rfile.read(int(self.headers.get('Content-Length', '0')))
         parent = self.path.split('/')[-2]
         print('fork request:', parent, file=sys.stderr, flush=True)
@@ -63,7 +77,7 @@ class Handler(BaseHTTPRequestHandler):
                 workspace = 'remote' if mode == 'workspace' else None
                 database.execute('INSERT INTO ' + table + ' (id,project_id,directory,workspace_id,slug,version) SELECT ?,project_id,?,?,slug,version FROM session_v2 WHERE id=?', (body['data']['id'], directory, workspace, parent))
             print('persisted child:', body['data']['id'], file=sys.stderr, flush=True)
-        self.do_GET()
+        self.reply_body()
 
 if __name__ == '__main__':
     body = json.loads(sys.argv[2])
@@ -74,46 +88,71 @@ if __name__ == '__main__':
 
 #[test]
 #[parallel]
-fn opencode_fork_fixture_waits_for_the_body_and_closes_the_response() {
+fn opencode_fork_fixture_authenticates_store_access_and_waits_for_the_body() {
     require_python3!();
     let script = format!(
         "__name__ = 'fixture'\n{}\n{}",
         server_program(),
-        r#"import http.client, socket, threading
+        r#"import http.client, socket, tempfile, threading
 body = {'data': {'id': 'child'}}
-mode = 'missing'
+mode = 'inactive'
+os.environ['OPENCODE_PASSWORD'] = 'fixture-password'
+authorization = 'Basic ' + base64.b64encode(b'opencode:fixture-password').decode()
 started = threading.Event()
 class ObservedHandler(Handler):
     def do_POST(self):
         started.set()
         super().do_POST()
 
-with HTTPServer(('127.0.0.1', 0), ObservedHandler) as server:
-    worker = threading.Thread(target=server.handle_request, daemon=True)
-    worker.start()
-    peer = socket.create_connection(server.server_address, timeout=2)
-    try:
-        peer.sendall(b'POST /api/session/parent/fork HTTP/1.1\r\nHost: localhost\r\nContent-Length: 2\r\n\r\n')
-        assert started.wait(2), 'handler did not receive the headers'
-        peer.settimeout(0.1)
+with tempfile.TemporaryDirectory() as home:
+    os.environ['OPENCODE_DB'] = os.path.join(home, 'store.db')
+    with sqlite3.connect(os.environ['OPENCODE_DB']) as database:
+        database.execute('CREATE TABLE session_v2 (id TEXT PRIMARY KEY, project_id TEXT, directory TEXT, workspace_id TEXT, slug TEXT, version TEXT)')
+        database.execute("INSERT INTO session_v2 VALUES ('parent', 'p', '/project', NULL, 'parent', '2.0.24')")
+    with HTTPServer(('127.0.0.1', 0), ObservedHandler) as server:
+        def handle_requests():
+            for _ in range(4):
+                server.handle_request()
+        worker = threading.Thread(target=handle_requests, daemon=True)
+        worker.start()
+        for method, credentials in [('GET', None), ('GET', 'Basic Zm9yZWlnbjpjcmVk'), ('POST', 'Basic Zm9yZWlnbjpjcmVk')]:
+            client = http.client.HTTPConnection(*server.server_address, timeout=2)
+            headers = {} if credentials is None else {'Authorization': credentials}
+            client.request(method, '/api/session/parent/fork', body='{}' if method == 'POST' else None, headers=headers)
+            response = client.getresponse()
+            assert response.status == 401, (method, credentials, response.status)
+            response.read()
+            client.close()
+            with sqlite3.connect(os.environ['OPENCODE_DB']) as database:
+                assert database.execute('SELECT id FROM session_v2').fetchall() == [('parent',)]
+                assert database.execute("SELECT name FROM sqlite_master WHERE name='session'").fetchone() is None
+        started.clear()
+        peer = socket.create_connection(server.server_address, timeout=2)
         try:
-            early = peer.recv(1)
-        except socket.timeout:
-            pass
-        else:
-            raise AssertionError(f'response before request body: {early!r}')
-        peer.settimeout(2)
-        peer.sendall(b'{}')
-        response = http.client.HTTPResponse(peer)
-        response.begin()
-        assert response.status == 200
-        assert response.will_close, 'fixture advertised a reusable connection'
-        assert json.loads(response.read()) == body
-        assert peer.recv(1) == b'', 'fixture did not close the response'
-    finally:
-        peer.close()
-    worker.join(2)
-    assert not worker.is_alive(), 'fixture handler did not finish'
+            peer.sendall(('POST /api/session/parent/fork HTTP/1.1\r\nHost: localhost\r\nAuthorization: ' + authorization + '\r\nContent-Length: 2\r\n\r\n').encode())
+            assert started.wait(2), 'handler did not receive the headers'
+            peer.settimeout(0.1)
+            try:
+                early = peer.recv(1)
+            except socket.timeout:
+                pass
+            else:
+                raise AssertionError(f'response before request body: {early!r}')
+            peer.settimeout(2)
+            peer.sendall(b'{}')
+            response = http.client.HTTPResponse(peer)
+            response.begin()
+            assert response.status == 200
+            assert response.will_close, 'fixture advertised a reusable connection'
+            assert json.loads(response.read()) == body
+            assert peer.recv(1) == b'', 'fixture did not close the response'
+        finally:
+            peer.close()
+        worker.join(2)
+        assert not worker.is_alive(), 'fixture handler did not finish'
+    with sqlite3.connect(os.environ['OPENCODE_DB']) as database:
+        assert database.execute("SELECT id FROM session_v2 WHERE id='child'").fetchone() is None
+        assert database.execute("SELECT id,directory FROM session WHERE id='child'").fetchone() == ('child', '/project')
 "#
     );
     let output = agent_of_empires::process::run_with_timeout(
@@ -384,13 +423,13 @@ fn opencode_store_fork_opens_the_child_the_store_minted() {
 fn opencode_store_fork_rejects_an_unattested_child_without_adoption() {
     require_tmux!();
     require_python3!();
-    for (case, reason) in [
-        ("missing", "active session table"),
-        ("inactive", "active session table"),
-        ("wrong-cwd", "working directory"),
-        ("relative", "working directory"),
-        ("workspace", "workspace"),
-        ("parent", "instead of a child"),
+    for case in [
+        "missing",
+        "inactive",
+        "wrong-cwd",
+        "relative",
+        "workspace",
+        "parent",
     ] {
         let mut h = TuiTestHarness::new("opencode_fork_invalid_child");
         let database = seed_store(&h);
@@ -420,20 +459,49 @@ fn opencode_store_fork_rejects_an_unattested_child_without_adoption() {
         let before = h.read_sessions();
         let start = h.run_cli(&["session", "start", CHILD]);
         let stderr = String::from_utf8_lossy(&start.stderr);
-        assert!(!start.status.success(), "{case}: {stderr}");
-        assert!(stderr.contains(reason), "{case}: {stderr}");
+        let fixture_stderr =
+            fs::read_to_string(format!("{}.err", log.display())).unwrap_or_default();
+        assert!(
+            !start.status.success(),
+            "{case}: {stderr}\nfixture:\n{fixture_stderr}"
+        );
+        let connection = rusqlite::Connection::open(&database).unwrap();
+        let active_child: Option<(String, Option<String>)> = connection
+            .query_row(
+                "SELECT directory,workspace_id FROM session_v2 WHERE id=?",
+                [CHILD_ID],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()
+            .unwrap();
+        let project = fs::canonicalize(h.project_path()).unwrap();
+        let expected = match case {
+            "wrong-cwd" => Some((
+                project.parent().unwrap().to_string_lossy().into_owned(),
+                None,
+            )),
+            "relative" => Some((".".to_string(), None)),
+            "workspace" => Some((
+                project.to_string_lossy().into_owned(),
+                Some("remote".to_string()),
+            )),
+            _ => None,
+        };
+        assert_eq!(active_child, expected, "{case}: {fixture_stderr}");
+        if case == "inactive" {
+            let inactive_directory: String = connection
+                .query_row(
+                    "SELECT directory FROM session WHERE id=?",
+                    [CHILD_ID],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(inactive_directory, project.to_string_lossy());
+        }
         let after = h.read_sessions();
         for title in [PARENT, CHILD] {
-            let find = |rows: &serde_json::Value| {
-                rows.as_array()
-                    .unwrap()
-                    .iter()
-                    .find(|row| row["title"] == title)
-                    .unwrap()
-                    .clone()
-            };
-            let old = find(&before);
-            let new = find(&after);
+            let old = session_by_title(&before, title);
+            let new = session_by_title(&after, title);
             for key in [
                 "agent_session_id",
                 "agent_session_binding",
@@ -467,8 +535,7 @@ fn opencode_store_fork_rejects_an_unattested_child_without_adoption() {
     }
 }
 
-/// With no store reachable the fork must be refused rather than started
-/// unforked, and the refusal must say so.
+/// A failed fork without a listening store must leave its intent pending.
 #[test]
 #[parallel]
 fn opencode_store_fork_refuses_rather_than_starting_unforked() {
@@ -478,8 +545,7 @@ fn opencode_store_fork_refuses_rather_than_starting_unforked() {
     let mut h = TuiTestHarness::new("opencode_store_fork_refusal");
     let database = seed_store(&h);
     h.set_env("OPENCODE_DB", &database);
-    // The agent answers `--help` but never serves, so readiness cannot complete.
-    let _log = install_fake_opencode(&mut h, false);
+    let log = install_fake_opencode(&mut h, false);
     let project = h.project_path();
 
     h.run_cli_ok(&[
@@ -492,6 +558,7 @@ fn opencode_store_fork_refuses_rather_than_starting_unforked() {
     ]);
     h.run_cli_ok(&["session", "set-session-id", PARENT, PARENT_ID]);
     let _cleanup = StopSessionsOnDrop { h: &h };
+    let before = h.read_sessions();
 
     let add = h.run_cli(&[
         "add",
@@ -506,12 +573,28 @@ fn opencode_store_fork_refuses_rather_than_starting_unforked() {
     ]);
     let stderr = String::from_utf8_lossy(&add.stderr);
     assert!(
-        !add.status.success()
-            && stderr.contains("refused")
-            && stderr.contains("opencode serve did not become ready within the deadline"),
-        "a fork with no reachable store must be refused, not silently unforked: \
-         status={}\n{stderr}",
-        add.status
+        !add.status.success(),
+        "fork unexpectedly launched: {stderr}\nfixture:\n{}",
+        fs::read_to_string(format!("{}.err", log.display())).unwrap_or_default()
+    );
+    let after = h.read_sessions();
+    assert_eq!(
+        session_by_title(&after, PARENT),
+        session_by_title(&before, PARENT)
+    );
+    let child = session_by_title(&after, CHILD);
+    assert_eq!(child["resume_intent"]["kind"], "Fork");
+    assert_eq!(child["resume_intent"]["value"]["from"], PARENT_ID);
+    assert_ne!(child["agent_session_id"], CHILD_ID);
+    assert!(child.get("active_execution").is_none());
+    assert!(
+        !h.tmux()
+            .arg("has-session")
+            .output()
+            .unwrap()
+            .status
+            .success(),
+        "a refused fork opened a pane"
     );
 }
 

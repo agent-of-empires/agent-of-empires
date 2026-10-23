@@ -47,7 +47,7 @@ aoe-settings-derive = { path = "aoe-settings-derive" }
 aoe-plugin-api = { path = "aoe-plugin-api" }
 
 # Serialization
-serde = { version = "1.0", features = ["derive"] }
+serde = { version = "1.0", features = ["derive", "rc"] }
 serde_ignored = "0.1"
 serde_json = { version = "1.0", features = ["preserve_order"] }
 ts-rs = { version = "12", optional = true }
@@ -77,7 +77,7 @@ anyhow = "1.0"
 chrono = { version = "0.4", features = ["serde"] }
 
 # UUID generation
-uuid = { version = "1.23", features = ["v4"] }
+uuid = { version = "1.23", features = ["v4", "serde"] }
 zstd = "0.14"
 
 # Random
@@ -100,7 +100,7 @@ reqwest = { version = "0.13", features = ["json", "query", "rustls", "stream"], 
 percent-encoding = "2"
 
 # Unix sockets + futures-compat for ACP byte streams
-tokio-util = { version = "0.7", features = ["codec", "compat"] }
+tokio-util = { version = "0.7", features = ["codec", "compat", "io-util"] }
 
 # Unicode width + normalization (NFKD used to fold accents in title-derived branch names)
 unicode-normalization = "0.1"
@@ -138,9 +138,10 @@ which = "8.0"
 # SQLite
 rusqlite = "0.40"
 
-# Daemon HTTP/WS server. Core: the daemon is the product, the dashboard is one
-# surface on it (see the `web` feature).
 axum = { version = "0.8", features = ["ws"] }
+# hyper/TokioIo reuse the UID/PID-verified UnixStream, including builds without `web`.
+hyper = { version = "1", features = ["client", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
 # Cross-platform browser launcher: `aoe serve --open`, the plugin host's
 # `ui.open_url`, and structured-view link activation.
 webbrowser = "1"

@@ -391,7 +391,7 @@ mod tests {
             Event::RateLimitAutoResumed { resets_at: ts, .. } if *ts == resets_at
         ));
 
-        sup.forget_session("s-1");
+        sup.forget_session("s-1").unwrap();
         assert_eq!(next_seq(&sup.next_seqs, "s-1"), 1);
     }
 

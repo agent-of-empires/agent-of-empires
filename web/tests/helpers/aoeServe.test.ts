@@ -168,7 +168,7 @@ it.skipIf(process.platform !== "linux")(
       const recordPath = join(workers, `${sessionId}.json`);
       const socketPath = join(workers, `${sessionId}.sock`);
       // Titled like `aoe __acp-runner` so the harness accepts it as this record's live runner.
-      const title = `${realpathSync(binary)} __acp-runner --socket ${socketPath} --session-id ${sessionId} --generation 7 -- agent`;
+      const title = `${realpathSync(binary)} __acp-runner --socket ${socketPath} --session-id ${sessionId} --generation 7 --lifecycle-generation 19 -- agent --generation 23`;
       const runner = spawn(
         process.execPath,
         [
