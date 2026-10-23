@@ -9,7 +9,7 @@ import App from "./App";
 import { ErrorBoundary } from "./components/ErrorBoundary";
 import { ToastBusBridge, ToastProvider } from "./components/Toasts";
 import { installFetchErrorToasts } from "./lib/fetchInterceptor";
-import { installFileEditHistoryGuard } from "./lib/fileEditGuard";
+import { installFileEditGuards } from "./lib/fileEditGuard";
 import { installEditingFocus } from "./lib/editingFocus";
 import "./index.css";
 
@@ -19,7 +19,7 @@ if ("serviceWorker" in navigator) {
 
 installFetchErrorToasts();
 installEditingFocus();
-installFileEditHistoryGuard();
+installFileEditGuards();
 
 createRoot(document.getElementById("root")!).render(
   <StrictMode>
