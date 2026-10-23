@@ -90,4 +90,12 @@ describe("useSessions.applySession (#2489)", () => {
     expect(row?.pinned_at).toBe("2026-01-01T00:00:00Z");
     expect(resolveActionTargets([row!], EMPTY_OPTIMISTIC).switchView).toEqual([]);
   });
+
+  it("offers no switch on a created session whose response already carries the gate", () => {
+    const { result } = renderHook(() => useSessions());
+    // The wizard injects the create response before any list refresh has run.
+    act(() => result.current.injectSession(base({ view: "terminal", acp_capable: true, structured_view_off: true })));
+
+    expect(resolveActionTargets(result.current.sessions, EMPTY_OPTIMISTIC).switchView).toEqual([]);
+  });
 });
