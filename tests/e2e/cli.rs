@@ -1464,7 +1464,7 @@ fn cli_ps_empty_json() {
 #[parallel]
 fn cli_send_waits_for_slow_boot_before_typing() {
     require_tmux!();
-    let mut h = TuiTestHarness::new("cli_send_settle_wait");
+    let mut h = TuiTestHarness::new_in_tmp("cli_send_settle_wait");
     h.install_path_command("opencode");
 
     let dir = h.home_path().join("fake-bin");
