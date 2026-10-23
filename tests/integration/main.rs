@@ -45,7 +45,6 @@ mod terminal_smart_rename;
 mod tmux_reachability;
 #[cfg(debug_assertions)]
 mod tmux_send_keys;
-mod tui_attach_detach;
 mod update_command;
 mod worktree_integration;
 

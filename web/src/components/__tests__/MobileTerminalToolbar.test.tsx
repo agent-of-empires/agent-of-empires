@@ -36,6 +36,7 @@ function renderToolbar(
   const onCompose = vi.fn();
   const result = render(
     <MobileTerminalToolbar
+      captureWriteAdmission={() => () => true}
       keys={opts.keys ?? TOOLBAR_KEY_CATALOG.map((k) => k.id)}
       sendData={sendData}
       sendPaste={sendPaste}
@@ -202,6 +203,7 @@ function CtrlLatchHarness({ sendData }: { sendData: (data: string) => boolean })
   const [ctrlActive, setCtrlActive] = useState(false);
   return (
     <MobileTerminalToolbar
+      captureWriteAdmission={() => () => true}
       keys={["ctrl", "ctrl-c", "enter", "backspace"]}
       sendData={sendData}
       sendPaste={vi.fn()}

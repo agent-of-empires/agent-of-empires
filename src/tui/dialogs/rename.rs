@@ -325,7 +325,12 @@ impl RenameDialog {
         match key.code {
             KeyCode::Esc => DialogResult::Cancel,
             KeyCode::Enter => {
-                let title_value = self.new_title.value().trim().to_string();
+                let entered_title = self.new_title.value().trim();
+                let title_value = if entered_title == self.current_title {
+                    String::new()
+                } else {
+                    entered_title.to_string()
+                };
                 let group_value = self.new_group.value().trim();
                 let selected_profile = self.selected_profile();
                 let profile_changed = selected_profile != self.current_profile;

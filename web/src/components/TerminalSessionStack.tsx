@@ -5,6 +5,7 @@ import { DEFAULT_PERSISTENT_TERMINALS, normalizePersistentTerminalLimit } from "
 import { TerminalView } from "./TerminalView";
 
 interface Props {
+  readOnly: boolean;
   active?: boolean;
   activeSessionId: string;
   sessions: SessionResponse[];
@@ -13,6 +14,7 @@ interface Props {
 }
 
 export function TerminalSessionStack({
+  readOnly,
   active = true,
   activeSessionId,
   sessions,
@@ -42,7 +44,7 @@ export function TerminalSessionStack({
                 : "absolute inset-0 flex flex-col min-h-0 invisible pointer-events-none"
             }
           >
-            <TerminalView session={session} active={active && selected} />
+            <TerminalView session={session} readOnly={readOnly} active={active && selected} />
           </div>
         );
       })}

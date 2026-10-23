@@ -888,6 +888,18 @@ done"#;
         Ok(())
     }
 
+    /// Check the frozen route's termination receipt without signalling or recapturing processes.
+    pub(crate) fn verify_stopped(&self) -> Result<()> {
+        self.validate()?;
+        let _lock = self.lock_proof()?;
+        let proof = self.read_proof()?;
+        anyhow::ensure!(
+            proof.settled && proof.processes.is_empty() && proof.epoch.is_some(),
+            "Prime native termination remains unproven"
+        );
+        Ok(())
+    }
+
     pub fn cleanup(&self) -> Result<()> {
         self.validate()?;
         let mut state = self

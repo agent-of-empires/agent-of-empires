@@ -58,13 +58,13 @@ pub struct Cli {
     #[arg(short = 'p', long, global = true)]
     pub profile: Option<String>,
 
-    /// Select a daemon endpoint for read-only CLI commands or the TUI
+    /// Select a daemon endpoint for read-only CLI commands or the TUI.
     ///
     /// Explicit CLI endpoints never fall back. `AOE_DAEMON_URL` discovery may
     /// fall back to local storage before reaching a TCP peer, with a notice.
-    /// Authenticate CLI reads with `AOE_DAEMON_TOKEN` or `AOE_DAEMON_PASSPHRASE`;
-    /// TUI session lists support bearer tokens only. An unauthenticated daemon
-    /// needs neither. See the HTTP API reference for transport and fallback rules.
+    /// Authenticate with `AOE_DAEMON_TOKEN` or `AOE_DAEMON_PASSPHRASE`.
+    /// An unauthenticated daemon needs neither. See the HTTP API reference
+    /// for transport and fallback rules.
     // Keep the explicit flag separate from the optional environment endpoint.
     #[arg(long, global = true)]
     pub daemon_url: Option<String>,
@@ -272,13 +272,10 @@ pub enum Commands {
     /// Update aoe to the latest release
     Update(UpdateArgs),
 
-    /// Run pending data migrations now, showing progress. A sandboxed session
-    /// moves its own agent store when it starts; use this to move every
-    /// eligible store at once instead. Trashed and archived sessions are
-    /// skipped; each moves when it is started, or restore or unarchive it
-    /// and run this again. Refuses while the aoe serve daemon runs; stop it
-    /// with `aoe serve --stop` first.
-    Migrate,
+    /// Run pending migrations or restore complete original lifecycle authority.
+    /// Stop the daemon with `aoe serve --stop` first. By default, also move
+    /// eligible sandbox stores and retry deferred ownership recovery.
+    Migrate(crate::cli::migrate::MigrateArgs),
 
     /// Generate shell completions
     Completion {
@@ -362,7 +359,7 @@ pub fn command_name(command: &Commands) -> Option<&'static str> {
         Commands::ExtractSessionId(_) => return None,
         Commands::Uninstall(_) => "uninstall",
         Commands::Update(_) => "update",
-        Commands::Migrate => "migrate",
+        Commands::Migrate(_) => "migrate",
         Commands::Completion { .. } => "completion",
     })
 }

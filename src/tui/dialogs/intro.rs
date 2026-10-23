@@ -1008,6 +1008,13 @@ impl IntroDialog {
             height: 1,
         };
     }
+
+    /// True on every page, so xterm mouse tracking stays off and the terminal
+    /// can drag-select the URLs. The trade is keyboard-only navigation, which
+    /// each page's hint advertises.
+    pub fn wants_text_selection(&self) -> bool {
+        true
+    }
 }
 
 #[cfg(test)]

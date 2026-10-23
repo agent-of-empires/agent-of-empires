@@ -200,11 +200,11 @@ An attach mode that keeps the TUI on the home view and forwards keystrokes to wh
 ### Processes
 
 **Daemon**:
-The `aoe serve` process. Hosts the API, the Web dashboard, the Supervisor, the Reconciler, Plugin workers and push notifications. Target (#2734): always-on, required, owns all Session runtime state. Today the local TUI and CLI also act on the Session store and tmux directly.
+The `aoe serve` process. Hosts the API, optional Web serving, the Supervisor, the Reconciler, Plugin workers and push notifications. Target (#2734): always-on, required, owns all Session runtime state. Today the local TUI gets canonical Session runtime rows from the Daemon; the CLI still has direct Session-store and tmux operations.
 _Avoid_: server, agent daemon
 
 **Client**:
-A program that pilots a Daemon: the TUI, the CLI or the Web dashboard. Target (#2734): reaches the Daemon only through its API, holding no Session runtime state. Today only the Web dashboard and the TUI under `AOE_DAEMON_URL` do.
+A program that pilots a Daemon: the TUI, the CLI or the Web dashboard. Target (#2734): reaches the Daemon only through its API, holding no Session runtime state. Today the Web dashboard and both local and remote TUI use the Daemon for canonical Session state; the CLI cutover is incomplete.
 _Avoid_: surface, frontend
 
 **Remote Daemon**:
@@ -212,7 +212,7 @@ A Daemon on another machine that a Client reaches over the network. Plain Daemon
 _Avoid_: remote server, host
 
 **Web serving**:
-Target (#2734): a Daemon toggle for hosting the Web dashboard, not a separate process. Today `aoe serve` always hosts it and no Setting controls it.
+Target (#2734): a Daemon toggle for hosting the Web dashboard, not a separate process. Today the Daemon can run without Web serving; an explicit `aoe serve` request enables it.
 _Avoid_: web server
 
 **Supervisor**:

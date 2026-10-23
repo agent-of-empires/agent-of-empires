@@ -24,13 +24,15 @@ export function TerminalConnectionBanners({
   onRestart,
 }: Props) {
   if (connected) return null;
-  if (paneDead && onRestart) {
+  if (paneDead) {
     return (
       <div className="bg-status-error/10 border-b border-status-error/30 px-4 py-1.5 flex items-center gap-2 shrink-0">
         <span className="text-xs text-status-error">Agent exited</span>
-        <button onClick={onRestart} className="text-xs text-brand-500 hover:text-brand-400 cursor-pointer underline">
-          Restart
-        </button>
+        {onRestart && (
+          <button onClick={onRestart} className="text-xs text-brand-500 hover:text-brand-400 cursor-pointer underline">
+            Restart
+          </button>
+        )}
       </div>
     );
   }

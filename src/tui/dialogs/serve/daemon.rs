@@ -8,7 +8,6 @@ use rand::prelude::IndexedRandom;
 
 use super::words::PASSPHRASE_WORDS;
 use super::{ServeMode, TransportStatus, TunnelTransport};
-use crate::acp::client::autostart::{initial_log_tail, load_or_generate_port};
 
 const SAVED_PASSPHRASE_FILE: &str = "serve.saved_passphrase";
 /// Written by the server at startup, so CLI-launched daemons can show their passphrase.
@@ -27,7 +26,7 @@ fn read_app_file(name: &str) -> Option<String> {
     (!trimmed.is_empty()).then(|| trimmed.to_string())
 }
 
-fn remove_app_file(name: &str) {
+pub(super) fn remove_app_file(name: &str) {
     if let Some(path) = app_file(name) {
         let _ = std::fs::remove_file(path);
     }
@@ -135,79 +134,6 @@ pub(super) fn default_transport(
     }
 }
 
-/// Tunnel mode takes a passphrase and the transport picked on the Confirm screen.
-pub(super) fn spawn_daemon(
-    mode: ServeMode,
-    passphrase: Option<&str>,
-    transport: Option<TunnelTransport>,
-) -> Result<(), String> {
-    // Another daemon may have started while the picker was open; spawning would orphan it.
-    if crate::cli::serve::daemon_pid().is_some() {
-        return Err(
-            "A daemon is already running. Close this dialog and reopen to see it.".to_string(),
-        );
-    }
-
-    let exe = current_exe()?;
-
-    // Stale files from a hard-killed daemon would show its URL or passphrase while starting.
-    for name in ["serve.url", "serve.mode", EPHEMERAL_PASSPHRASE_FILE] {
-        remove_app_file(name);
-    }
-
-    let port = load_or_generate_port();
-    let mut cmd = Command::new(&exe);
-    cmd.args(["serve", "--daemon", "--port", &port.to_string()]);
-    match mode {
-        ServeMode::Tunnel => {
-            cmd.args(["--remote", "--host", "127.0.0.1"]);
-            // Picking Cloudflare must skip the server's Tailscale auto-detect.
-            if transport == Some(TunnelTransport::Cloudflare) {
-                cmd.arg("--no-tailscale");
-            }
-            if let Some(pp) = passphrase {
-                cmd.env("AOE_SERVE_PASSPHRASE", pp);
-            }
-        }
-        ServeMode::Local => {
-            cmd.args(["--host", "0.0.0.0"]);
-        }
-    }
-    // The wrapper double-forks; the daemon's output lands in the log file.
-    let status = cmd
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .map_err(|e| format!("Failed to launch `aoe serve --daemon`: {}", e))?;
-
-    if !status.success() {
-        // Forget an occupied port so the next attempt picks a fresh one.
-        let tail = initial_log_tail().join("\n");
-        if tail.contains("EADDRINUSE") || tail.contains("Address already in use") {
-            remove_app_file("serve.last_port");
-        }
-        let hint = match mode {
-            ServeMode::Tunnel => format!(
-                "Most likely no tunnel tool is installed (install tailscale \
-                 or cloudflared) or port {} is in use.",
-                port
-            ),
-            ServeMode::Local => format!("Most likely port {} is in use.", port),
-        };
-        return Err(format!(
-            "`aoe serve --daemon` exited with {:?}. {}",
-            status.code(),
-            hint
-        ));
-    }
-    if let Some(pp) = passphrase {
-        remember_passphrase(pp);
-        save_passphrase_to_disk(pp);
-    }
-    Ok(())
-}
-
 fn current_exe() -> Result<PathBuf, String> {
     std::env::current_exe().map_err(|e| format!("Could not resolve aoe binary path: {}", e))
 }
@@ -246,15 +172,6 @@ pub(super) fn stop_daemon() -> Result<(), String> {
     set_cached_passphrase(None);
     remove_app_file(EPHEMERAL_PASSPHRASE_FILE);
     Ok(())
-}
-
-pub(super) fn restart_daemon(
-    mode: ServeMode,
-    passphrase: Option<&str>,
-    transport: Option<TunnelTransport>,
-) -> Result<(), String> {
-    stop_daemon()?;
-    spawn_daemon(mode, passphrase, transport)
 }
 
 pub(super) fn read_serve_mode() -> Option<ServeMode> {

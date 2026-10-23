@@ -244,6 +244,8 @@ function processSnapshot(env: NodeJS.ProcessEnv): ProcessSnapshot[] {
   const result = spawnSync("ps", ["-ww", "-axo", "pid=,ppid=,pgid=,stat=,args="], {
     env: { ...env, LC_ALL: "C" },
     encoding: "utf8",
+    // Full command lines can exceed Node's default 1 MiB on busy hosts.
+    maxBuffer: Infinity,
     timeout: 2000,
   });
   if (result.status !== 0) throw new Error(`cannot inspect fixture processes: ${result.error ?? result.stderr}`);
@@ -305,7 +307,7 @@ async function stopOrphanRunners(appDir: string, binary: string, env: NodeJS.Pro
     if (
       runner.group !== pid ||
       !runner.command.startsWith(prefix) ||
-      !runner.command.split(" -- ")[0].endsWith(` --generation ${generation}`)
+      runner.command.split(" -- ")[0].match(/ --generation ([0-9]+)(?= |$)/)?.[1] !== generation
     ) {
       throw new Error(`runner ${pid} no longer matches ${name}; retaining ${appDir}`);
     }

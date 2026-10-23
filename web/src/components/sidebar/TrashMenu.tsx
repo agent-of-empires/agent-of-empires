@@ -29,10 +29,10 @@ export function TrashMenu({
   onOpen: RowActivate;
   onRestore: (sessionIds: string[]) => void;
   onDelete: (sessionIds: string[]) => void;
-  onEmptyTrash: () => void;
+  onEmptyTrash: (workspaces: Workspace[]) => void;
 }) {
   const [open, setOpen] = useState(false);
-  const [confirmEmpty, setConfirmEmpty] = useState(false);
+  const [confirmEmpty, setConfirmEmpty] = useState<Workspace[] | null>(null);
   const [panelPosition, setPanelPosition] = useState<{ left: number; bottom: number; width: number } | null>(null);
   const ref = useRef<HTMLDivElement>(null);
   const panelRef = useRef<HTMLDivElement>(null);
@@ -131,7 +131,7 @@ export function TrashMenu({
                 {!readOnly && (
                   <button
                     type="button"
-                    onClick={() => setConfirmEmpty(true)}
+                    onClick={() => setConfirmEmpty(trashedWorkspaces)}
                     data-testid="sidebar-trash-empty"
                     title="Empty Trash"
                     aria-label="Empty Trash"
@@ -214,14 +214,13 @@ export function TrashMenu({
       {confirmEmpty &&
         createPortal(
           <EmptyTrashConfirm
-            // Counts sessions, not workspaces, matching the TUI.
-            sessionCount={trashedWorkspaces.reduce((n, ws) => n + ws.sessions.length, 0)}
+            sessionCount={confirmEmpty.reduce((n, ws) => n + ws.sessions.length, 0)}
             onConfirm={() => {
-              setConfirmEmpty(false);
+              setConfirmEmpty(null);
               setOpen(false);
-              onEmptyTrash();
+              onEmptyTrash(confirmEmpty);
             }}
-            onCancel={() => setConfirmEmpty(false)}
+            onCancel={() => setConfirmEmpty(null)}
           />,
           document.body,
         )}

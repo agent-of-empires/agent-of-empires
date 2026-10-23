@@ -1,28 +1,9 @@
-//! Locate the structured view daemon the caller should talk to.
-//!
-//! Rules:
-//!
-//! 1. If `AOE_DAEMON_URL` is set, point at it and health-check the
-//!    endpoint. Never silently fall back to a local daemon: the whole
-//!    point of the env override is to attach to a *specific* daemon.
-//! 2. If a live local daemon exists (`serve.pid` + reachable
-//!    `serve.url`), use it.
-//! 3. Otherwise start a detached loopback daemon, unless autostart is
-//!    disabled (`--no-autostart`, `AOE_NO_AUTOSTART=1`), in which case
-//!    return [`ManagerError::NoDaemonRunning`] with an actionable hint.
-//!    [`locate_daemon`] never spawns.
-//!
-//! Build-namespace discipline (debug vs release) is enforced by
-//! `crate::session::get_app_dir`: discovery reads `serve.pid` /
-//! `serve.url` from the same app dir an `aoe serve` of the same build
-//! would have written, so a debug client never picks up a release
-//! daemon (or vice versa).
+//! Local clients share one private daemon startup path; discovery never spawns.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use thiserror::Error;
 
-use super::autostart;
 use super::discovery::{discover, discover_env, DaemonEndpoint, DiscoveryError};
 use super::http::HttpError;
 
@@ -33,19 +14,13 @@ pub enum ManagerError {
     )]
     EnvOverrideUnreachable,
     #[error(
-        "AOE_DAEMON_URL is set but the daemon rejected the bearer token; check AOE_DAEMON_TOKEN"
+        "AOE_DAEMON_URL is set but authentication was rejected; check AOE_DAEMON_TOKEN and daemon policy"
     )]
     EnvOverrideUnauthorized,
-    /// No daemon was reachable and no env override was set. Carries
-    /// the underlying discovery error so callers can distinguish "no
-    /// `serve.pid` at all" from "stale PID" if they care; most
-    /// callers just render the user-facing hint.
-    #[error(
-        "no structured view daemon is running.\n\nStart one with one of:\n  aoe serve --daemon                 (localhost only, recommended for solo dev)\n  aoe serve --daemon --remote        (Tailscale Funnel or Cloudflare quick tunnel)\n  aoe serve --daemon --tunnel-name … (named Cloudflare Tunnel)\n\nOr attach to an existing remote daemon with:\n  AOE_DAEMON_URL=<url> AOE_DAEMON_TOKEN=<token> aoe …"
-    )]
+    #[error("local daemon unavailable: {0}")]
     NoDaemonRunning(#[from] DiscoveryError),
     #[error(
-        "could not start a local aoe daemon: {0}\n\nStart one by hand with `aoe serve --daemon`, or attach to an existing remote daemon with:\n  AOE_DAEMON_URL=<url> AOE_DAEMON_TOKEN=<token> aoe …"
+        "could not start a local aoe daemon: {0}\n\nStart one by hand with `aoe serve --core-only --daemon`, or attach to an existing remote daemon with:\n  AOE_DAEMON_URL=<url> AOE_DAEMON_TOKEN=<token> aoe …"
     )]
     AutostartFailed(String),
 }
@@ -57,13 +32,13 @@ pub fn set_autostart_disabled(disabled: bool) {
     AUTOSTART_DISABLED.store(disabled, Ordering::Relaxed);
 }
 
-/// Locate the daemon the caller should talk to. Never spawns one.
+pub(crate) fn autostart_disabled() -> bool {
+    AUTOSTART_DISABLED.load(Ordering::Relaxed)
+}
+
+/// Check the selected endpoint without spawning or changing exposure.
 pub async fn locate_daemon() -> Result<DaemonEndpoint, ManagerError> {
     if discover_env().is_some() {
-        // Resolve through `discover()` so the parsing/redaction
-        // applied to local endpoints is also applied here, then
-        // health-check before returning so callers don't bubble up
-        // raw reqwest transport errors on every subsequent API call.
         let endpoint = discover().map_err(|_| ManagerError::EnvOverrideUnreachable)?;
         let client = super::HttpClient::new(endpoint.clone())
             .map_err(|_| ManagerError::EnvOverrideUnreachable)?;
@@ -73,29 +48,41 @@ pub async fn locate_daemon() -> Result<DaemonEndpoint, ManagerError> {
             Err(_) => Err(ManagerError::EnvOverrideUnreachable),
         };
     }
-    discover().map_err(ManagerError::NoDaemonRunning)
+    let endpoint = discover().map_err(ManagerError::NoDaemonRunning)?;
+    let client = super::HttpClient::new(endpoint.clone())
+        .map_err(|_| ManagerError::NoDaemonRunning(DiscoveryError::Unreachable))?;
+    client
+        .health_check()
+        .await
+        .map_err(|_| ManagerError::NoDaemonRunning(DiscoveryError::Unreachable))?;
+    Ok(endpoint)
 }
 
-/// Like [`locate_daemon`], but starts a local daemon when none answers. The pid
-/// is `Some` only for the caller that spawned it, so each start is announced
-/// once. A TUI caller shows it in the status line; stderr would corrupt the screen.
+/// Start a local daemon if needed; only its spawning caller receives the PID.
 pub async fn ensure_daemon() -> Result<(DaemonEndpoint, Option<u32>), ManagerError> {
-    if discover_env().is_some() || AUTOSTART_DISABLED.load(Ordering::Relaxed) {
+    if discover_env().is_some() || autostart_disabled() {
         return locate_daemon().await.map(|endpoint| (endpoint, None));
     }
-    if let Some(endpoint) = autostart::healthy_local().await {
-        return Ok((endpoint, None));
-    }
-    autostart::start_local()
+    crate::cli::serve::ensure_local_daemon("", true)
         .await
-        .map_err(ManagerError::AutostartFailed)
+        .map_err(|error| ManagerError::AutostartFailed(error.to_string()))
 }
 
-/// [`ensure_daemon`] for the CLI: announces a start on stderr, also under `--json`.
+/// Announce CLI autostart on stderr, also under `--json`.
 pub async fn require_daemon() -> Result<DaemonEndpoint, ManagerError> {
     let (endpoint, started) = ensure_daemon().await?;
     if let Some(pid) = started {
         eprintln!("Started aoe daemon (pid {pid})");
     }
     Ok(endpoint)
+}
+
+/// Initial native bootstrap and explicit reconnect may start the local Daemon.
+pub async fn ensure_native_daemon(profile: &str) -> anyhow::Result<DaemonEndpoint> {
+    if discover_env().is_some() {
+        return locate_daemon().await.map_err(Into::into);
+    }
+    crate::cli::serve::ensure_local_daemon(profile, !autostart_disabled())
+        .await
+        .map(|(endpoint, _)| endpoint)
 }

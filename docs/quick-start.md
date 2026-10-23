@@ -6,6 +6,10 @@
 aoe
 ```
 
+The TUI starts or reuses the local Daemon through its private Unix socket and reads canonical session rows from it. Starting the TUI does not open a web listener. The shared Daemon keeps running when you quit the TUI; `aoe serve --stop` stops it.
+
+If startup or connection fails, the TUI shows the diagnostic and masks daemon-owned session state. Press `r` to reconnect or retry local startup after fixing the cause, or `q` to quit.
+
 | Key | Action |
 |-----|--------|
 | `n` | New session |

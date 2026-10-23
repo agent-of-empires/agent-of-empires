@@ -4,6 +4,47 @@ use anyhow::Result;
 use serde_json::Value;
 use std::{fs, path::Path};
 
+/// Published worker schema before exact scope ownership was introduced.
+#[derive(serde::Deserialize)]
+struct HistoricalWorkerRecord {
+    #[serde(rename = "runner_version")]
+    _runner_version: u32,
+    #[serde(default, rename = "build_version")]
+    _build_version: String,
+    #[serde(rename = "session_id")]
+    _session_id: String,
+    pid: u32,
+    #[serde(default, rename = "runner_identity")]
+    _runner_identity: Option<crate::process::ProcessBirthIdentity>,
+    socket_path: std::path::PathBuf,
+    #[serde(rename = "agent_name")]
+    _agent_name: String,
+    #[serde(default, rename = "agent_key")]
+    _agent_key: String,
+    #[serde(rename = "cwd")]
+    _cwd: std::path::PathBuf,
+    #[serde(rename = "model")]
+    _model: Option<String>,
+    #[serde(rename = "additional_dirs")]
+    _additional_dirs: Vec<std::path::PathBuf>,
+    #[serde(rename = "provider_env_keys")]
+    _provider_env_keys: Vec<String>,
+    #[serde(rename = "stored_acp_session_id")]
+    _stored_acp_session_id: Option<String>,
+    #[serde(default, rename = "source_profile")]
+    _source_profile: Option<String>,
+    #[serde(default, rename = "prime_runtime")]
+    _prime_runtime: Option<crate::process::prime::PrimeRuntime>,
+    #[serde(default, rename = "generation")]
+    _generation: u64,
+    #[serde(rename = "started_at")]
+    _started_at: u64,
+    #[serde(rename = "last_attached_at")]
+    _last_attached_at: Option<u64>,
+    #[serde(rename = "detached_at")]
+    _detached_at: Option<u64>,
+}
+
 pub fn run() -> Result<()> {
     run_in(&crate::session::get_app_dir()?)
 }
@@ -42,7 +83,7 @@ fn run_in(app: &Path) -> Result<()> {
         let mut value: Value = match serde_json::from_slice(&bytes) {
             Ok(value) => value,
             Err(error) => {
-                tracing::warn!(path = %path.display(), %error, "v040: preserving unreadable ownership evidence");
+                tracing::warn!(target: "migrations.v040", path = %path.display(), %error, "v040: preserving unreadable ownership evidence");
                 continue;
             }
         };
@@ -50,26 +91,25 @@ fn run_in(app: &Path) -> Result<()> {
             continue;
         };
         let changed = if is_record && !object.contains_key("runner_identity") {
-            let identity = if let Ok(record) =
-                serde_json::from_slice::<crate::process::worker_registry::WorkerRecord>(&bytes)
-            {
-                let before = crate::process::process_birth_identity(record.pid)
-                    .ok()
-                    .flatten();
-                let peer = crate::process::worker::peer_pid_from_socket(
-                    &crate::process::worker::control_socket_sibling(&record.socket_path),
-                );
-                let after = crate::process::process_birth_identity(record.pid)
-                    .ok()
-                    .flatten();
-                if peer == Some(record.pid) && before == after {
-                    after
+            let identity =
+                if let Ok(record) = serde_json::from_slice::<HistoricalWorkerRecord>(&bytes) {
+                    let before = crate::process::process_birth_identity(record.pid)
+                        .ok()
+                        .flatten();
+                    let peer = crate::process::worker::peer_pid_from_socket(
+                        &crate::process::worker::control_socket_sibling(&record.socket_path),
+                    );
+                    let after = crate::process::process_birth_identity(record.pid)
+                        .ok()
+                        .flatten();
+                    if peer == Some(record.pid) && before == after {
+                        after
+                    } else {
+                        None
+                    }
                 } else {
                     None
-                }
-            } else {
-                None
-            };
+                };
             object.insert("runner_identity".into(), serde_json::to_value(identity)?);
             true
         } else if is_proof {
@@ -87,7 +127,7 @@ fn run_in(app: &Path) -> Result<()> {
         if changed {
             crate::session::backup_before_migration(&path)?;
             crate::session::atomic_write(&path, &serde_json::to_vec_pretty(&value)?)?;
-            tracing::info!(path = %path.display(), "v040: migrated worker ownership evidence");
+            tracing::info!(target: "migrations.v040", path = %path.display(), "v040: migrated worker ownership evidence");
         }
     }
     Ok(())
@@ -122,6 +162,7 @@ mod tests {
         );
         let mut old = serde_json::to_value(record).unwrap();
         old.as_object_mut().unwrap().remove("runner_identity");
+        old.as_object_mut().unwrap().remove("scope");
         old["runner_version"] = serde_json::json!(6);
         old["extension"] = serde_json::json!({"keep":"opaque"});
         let bytes = serde_json::to_vec(&old).unwrap();

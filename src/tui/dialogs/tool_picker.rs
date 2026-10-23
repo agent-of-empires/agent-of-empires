@@ -1,4 +1,4 @@
-//! Tool picker dialog: quick list of configured tool sessions.
+//! Tool picker dialog: configured tools and selected-row recovery targets.
 
 use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::prelude::*;
@@ -25,7 +25,10 @@ struct ToolPickerEntry {
 }
 
 impl ToolPickerDialog {
-    pub fn new(tools: &std::collections::HashMap<String, ToolSessionConfig>) -> Self {
+    pub fn new<'a>(
+        tools: &std::collections::HashMap<String, ToolSessionConfig>,
+        observed: impl IntoIterator<Item = &'a str>,
+    ) -> Self {
         let mut items: Vec<ToolPickerEntry> = tools
             .iter()
             .map(|(name, config)| ToolPickerEntry {
@@ -35,6 +38,22 @@ impl ToolPickerDialog {
                 background: config.background,
             })
             .collect();
+        for name in observed {
+            if let Some(entry) = items.iter_mut().find(|entry| entry.name == name) {
+                if entry.background || entry.command.trim().is_empty() {
+                    entry.command = "Recovery only; use Stop to finish cleanup".into();
+                    entry.hotkey.clear();
+                    entry.background = false;
+                }
+            } else {
+                items.push(ToolPickerEntry {
+                    name: name.to_owned(),
+                    command: "Recovery only; use Stop to finish cleanup".into(),
+                    hotkey: String::new(),
+                    background: false,
+                });
+            }
+        }
         items.sort_by(|a, b| a.name.cmp(&b.name));
         Self {
             items,

@@ -49,6 +49,7 @@ fn spawn_config(
         env.push(("SHIM_LOAD_SESSION".into(), "1".into()));
     }
     SpawnConfig {
+        launch_lease: None,
         wrapper_substitution: None,
         agent_key: "claude".into(),
         tool: "claude".into(),

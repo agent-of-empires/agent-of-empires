@@ -10,16 +10,17 @@
 //! The transcript is followed through the shared file watcher, so nothing
 //! polls while it is quiet.
 
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
 use std::time::Duration;
 
 use tokio::io::{AsyncReadExt, AsyncSeekExt, SeekFrom};
 use tokio::sync::mpsc::WeakSender;
+use tokio_util::sync::CancellationToken;
 
 use crate::acp::background_agent::TailerStart;
-use crate::acp::state::Event;
+use crate::acp::state::{BackgroundTaskLaunch, Event};
 use crate::file_watch::{FileMatcher, FileWatchService, WatchSpec};
 
 /// Coalesces the burst of writes one transcript entry causes.
@@ -50,15 +51,14 @@ pub(crate) type IdleHook = Arc<dyn Fn() + Send + Sync>;
 /// leak into (a tool result that read another transcript, model text, API
 /// dumps), so a substring match on the raw line is not enough. Monitor event
 /// notifications carry the task id without a status.
-fn is_terminal_notification(line: &str, task_id: &str) -> bool {
-    // Cheap filter before parsing: nearly every line is about something else.
+fn is_terminal_notification(line: &str, task_id: &str, tool_call_id: &str) -> bool {
     if !line.contains(task_id) {
         return false;
     }
     let Ok(entry) = serde_json::from_str::<serde_json::Value>(line) else {
         return false;
     };
-    let text = match entry.get("type").and_then(serde_json::Value::as_str) {
+    let content = match entry.get("type").and_then(serde_json::Value::as_str) {
         Some("queue-operation")
             if entry.get("operation").and_then(serde_json::Value::as_str) == Some("enqueue") =>
         {
@@ -66,15 +66,45 @@ fn is_terminal_notification(line: &str, task_id: &str) -> bool {
         }
         Some("user") => entry.pointer("/message/content"),
         _ => None,
-    }
-    .and_then(serde_json::Value::as_str);
-    text.is_some_and(|text| {
-        text.trim_start().starts_with("<task-notification>")
-            && text.contains(&format!("<task-id>{task_id}</task-id>"))
-            && TERMINAL_STATUSES
-                .iter()
-                .any(|status| text.contains(&format!("<status>{status}</status>")))
-    })
+    };
+    let Some(content) = content else {
+        return false;
+    };
+    let matches = |text: &str| {
+        let Some(body) = text.trim_start().strip_prefix("<task-notification>") else {
+            return false;
+        };
+        let Some((body, _)) = body.split_once("</task-notification>") else {
+            return false;
+        };
+        let header = body
+            .split_once("<result>")
+            .map_or(body, |(header, _)| header);
+        let header = header
+            .split_once("<summary>")
+            .map_or(header, |(header, _)| header);
+        let field = |open, close| {
+            header
+                .split_once(open)?
+                .1
+                .split_once(close)
+                .map(|(value, _)| value.trim())
+        };
+        field("<task-id>", "</task-id>") == Some(task_id)
+            && field("<tool-use-id>", "</tool-use-id>") == Some(tool_call_id)
+            && field("<status>", "</status>")
+                .is_some_and(|status| TERMINAL_STATUSES.contains(&status))
+    };
+    content.as_str().is_some_and(matches)
+        || content.as_array().is_some_and(|parts| {
+            parts.iter().any(|part| {
+                part.get("type").and_then(serde_json::Value::as_str) == Some("text")
+                    && part
+                        .get("text")
+                        .and_then(serde_json::Value::as_str)
+                        .is_some_and(matches)
+            })
+        })
 }
 
 /// `<home>/projects/<encoded-cwd>/<session>.jsonl`. The encoded directory is
@@ -101,59 +131,108 @@ fn shared_watch() -> Arc<FileWatchService> {
         .clone()
 }
 
-/// Locks the in-flight set. It only holds plain ids, so a tailer that
-/// panicked holding the lock leaves it valid; a poisoned lock must not strand
-/// the task it was about to track.
-fn lock_active(active: &Mutex<HashSet<String>>) -> MutexGuard<'_, HashSet<String>> {
-    active.lock().unwrap_or_else(PoisonError::into_inner)
+#[derive(Default)]
+pub(crate) struct ActiveTasks {
+    owners: Mutex<HashMap<String, Arc<TaskOwner>>>,
+    publication: tokio::sync::Mutex<()>,
 }
 
-/// Removes a task from the shared in-flight set on any tailer exit.
+struct TaskOwner {
+    tool_call_id: Option<String>,
+    cancellation: CancellationToken,
+}
+
+impl ActiveTasks {
+    fn lock(&self) -> MutexGuard<'_, HashMap<String, Arc<TaskOwner>>> {
+        self.owners.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.lock().is_empty()
+    }
+
+    fn owns(&self, task_id: &str, owner: &Arc<TaskOwner>) -> bool {
+        self.lock()
+            .get(task_id)
+            .is_some_and(|current| Arc::ptr_eq(current, owner))
+    }
+}
+
 struct ActiveGuard {
-    active: Arc<Mutex<HashSet<String>>>,
+    active: Arc<ActiveTasks>,
     task_id: String,
+    owner: Arc<TaskOwner>,
 }
 
 impl Drop for ActiveGuard {
     fn drop(&mut self) {
-        lock_active(&self.active).remove(&self.task_id);
+        let mut owners = self.active.lock();
+        if owners
+            .get(&self.task_id)
+            .is_some_and(|current| Arc::ptr_eq(current, &self.owner))
+        {
+            owners.remove(&self.task_id);
+        }
     }
 }
 
-/// The tailer of one background task: follows the session transcript until
-/// the task ends, then publishes `BackgroundTaskFinished`. Every way out of
-/// tracking ends with that finish (a transcript that cannot be found or a
-/// Claude home that cannot be resolved included), because the start was
-/// already published and the session must not stay busy for a task nothing
-/// can report on. It holds only a weak sender, so it never keeps the worker's
-/// event channel open: once the connection is gone it exits at its next wake
-/// instead of blocking the drain's recovery.
+/// Follows one exact launch without retaining the worker's event channel.
 pub(crate) struct TaskTailer {
-    /// `None` when the Claude config dir could not be resolved.
     pub claude_home: Option<PathBuf>,
     pub watch: Arc<FileWatchService>,
     pub task_id: String,
+    pub tool_call_id: Option<String>,
     pub session_id: String,
-    pub active: Arc<Mutex<HashSet<String>>>,
+    pub active: Arc<ActiveTasks>,
     pub event_tx: WeakSender<Event>,
     pub start: TailerStart,
     pub idle: IdleHook,
 }
 
 impl TaskTailer {
-    /// Must run inside the tokio runtime. A task that already has a tailer
-    /// keeps it, and that one finishes it.
-    pub(crate) fn spawn(self) {
-        if !lock_active(&self.active).insert(self.task_id.clone()) {
-            return;
+    pub(crate) async fn spawn(
+        self,
+        start_event: Option<Event>,
+    ) -> Option<tokio::task::JoinHandle<()>> {
+        let publication = self.active.publication.lock().await;
+        let owner = {
+            let mut owners = self.active.lock();
+            if let Some(current) = owners.get(&self.task_id) {
+                if current.tool_call_id == self.tool_call_id {
+                    return None;
+                }
+                current.cancellation.cancel();
+            }
+            let owner = Arc::new(TaskOwner {
+                tool_call_id: self.tool_call_id.clone(),
+                cancellation: CancellationToken::new(),
+            });
+            owners.insert(self.task_id.clone(), owner.clone());
+            owner
+        };
+        let guard = ActiveGuard {
+            active: self.active.clone(),
+            task_id: self.task_id.clone(),
+            owner: owner.clone(),
+        };
+        if let Some(event) = start_event {
+            let tx = self.event_tx.upgrade()?;
+            if tx.send(event).await.is_err() {
+                return None;
+            }
         }
-        tokio::spawn(async move {
-            let _guard = ActiveGuard {
-                active: self.active.clone(),
-                task_id: self.task_id.clone(),
-            };
-            self.follow().await;
-            // Upgraded only for the send: the connection may be gone by now.
+        drop(publication);
+        Some(tokio::spawn(async move {
+            let _guard = guard;
+            tokio::select! {
+                () = owner.cancellation.cancelled() => return,
+                () = self.follow() => {}
+            }
+            // Keep owner validation and enqueue ordered against replacement starts.
+            let _publication = self.active.publication.lock().await;
+            if !self.active.owns(&self.task_id, &owner) {
+                return;
+            }
             if let Some(tx) = self.event_tx.upgrade() {
                 let _ = tx
                     .send(Event::BackgroundTaskFinished {
@@ -161,30 +240,32 @@ impl TaskTailer {
                     })
                     .await;
             }
-        });
+        }))
     }
 }
 
-/// Track `task_id` through the session transcript of the host's Claude home.
-/// Must run inside the tokio runtime.
-pub fn spawn_task_tailer(
-    task_id: String,
+pub(crate) async fn spawn_task_tailer(
+    launch: BackgroundTaskLaunch,
     session_id: String,
-    active: Arc<Mutex<HashSet<String>>>,
+    claude_home: Option<PathBuf>,
+    active: Arc<ActiveTasks>,
     event_tx: WeakSender<Event>,
     start: TailerStart,
+    start_event: Option<Event>,
 ) {
-    TaskTailer {
-        claude_home: crate::session::capture::claude_home_for_host_environment(None, &[]).ok(),
+    let _ = TaskTailer {
+        claude_home,
         watch: shared_watch(),
-        task_id,
+        task_id: launch.task_id,
+        tool_call_id: launch.tool_call_id,
         session_id,
         active,
         event_tx,
         start,
         idle: Arc::new(|| {}),
     }
-    .spawn();
+    .spawn(start_event)
+    .await;
 }
 
 /// Where a transcript has been read to, and the partial line after it.
@@ -206,6 +287,9 @@ enum Scan {
 impl TaskTailer {
     /// Returns once the task ended, or tracking was given up.
     async fn follow(&self) {
+        let Some(tool_call_id) = self.tool_call_id.as_deref() else {
+            return;
+        };
         // A task start implies the session already ran a tool, so its
         // transcript exists; one that cannot be found is not trackable.
         let Some(home) = self.claude_home.clone() else {
@@ -254,7 +338,7 @@ impl TaskTailer {
             if self.event_tx.upgrade().is_none() {
                 return;
             }
-            match scan(&path, &mut cursor, &self.task_id).await {
+            match scan(&path, &mut cursor, &self.task_id, tool_call_id).await {
                 Scan::Ended | Scan::Gone => return,
                 Scan::Pending => {}
             }
@@ -274,7 +358,7 @@ impl TaskTailer {
 /// Reads what was appended since the cursor, one bounded chunk at a time, and
 /// looks for the task's end. Stops at the first terminal notification without
 /// reading the rest.
-async fn scan(path: &Path, cursor: &mut Cursor, task_id: &str) -> Scan {
+async fn scan(path: &Path, cursor: &mut Cursor, task_id: &str, tool_call_id: &str) -> Scan {
     let Ok(mut file) = tokio::fs::File::open(path).await else {
         return Scan::Gone;
     };
@@ -291,7 +375,7 @@ async fn scan(path: &Path, cursor: &mut Cursor, task_id: &str) -> Scan {
         };
         read_any = true;
         cursor.offset += read as u64;
-        if scan_chunk(cursor, &buf[..read], task_id) {
+        if scan_chunk(cursor, &buf[..read], task_id, tool_call_id) {
             return Scan::Ended;
         }
     }
@@ -314,7 +398,7 @@ async fn scan(path: &Path, cursor: &mut Cursor, task_id: &str) -> Scan {
 
 /// Whether a line completed by `chunk` is the task's terminal notification.
 /// Only the partial line at the end of the chunk is carried over.
-fn scan_chunk(cursor: &mut Cursor, chunk: &[u8], task_id: &str) -> bool {
+fn scan_chunk(cursor: &mut Cursor, chunk: &[u8], task_id: &str, tool_call_id: &str) -> bool {
     let mut rest = chunk;
     while !rest.is_empty() {
         let Some(end) = rest.iter().position(|byte| *byte == b'\n') else {
@@ -336,12 +420,16 @@ fn scan_chunk(cursor: &mut Cursor, chunk: &[u8], task_id: &str) -> bool {
             continue;
         }
         let ended = if cursor.carry.is_empty() {
-            is_terminal_notification(&String::from_utf8_lossy(line), task_id)
+            is_terminal_notification(&String::from_utf8_lossy(line), task_id, tool_call_id)
         } else if cursor.carry.len() + line.len() > MAX_LINE_BYTES {
             false
         } else {
             cursor.carry.extend_from_slice(line);
-            is_terminal_notification(&String::from_utf8_lossy(&cursor.carry), task_id)
+            is_terminal_notification(
+                &String::from_utf8_lossy(&cursor.carry),
+                task_id,
+                tool_call_id,
+            )
         };
         cursor.carry.clear();
         if ended {
@@ -380,7 +468,7 @@ mod tests {
 
     fn full_notification_text(task_id: &str) -> String {
         format!(
-            "<task-notification>\n<task-id>{task_id}</task-id>\n<status>completed</status>\n</task-notification>"
+            "<task-notification>\n<task-id>{task_id}</task-id>\n<tool-use-id>toolu_1</tool-use-id>\n<status>completed</status>\n</task-notification>"
         )
     }
 
@@ -450,7 +538,11 @@ mod tests {
             ),
         ];
         for (name, line, want) in cases {
-            assert_eq!(is_terminal_notification(&line, "t-1"), want, "{name}");
+            assert_eq!(
+                is_terminal_notification(&line, "t-1", "toolu_1"),
+                want,
+                "{name}"
+            );
         }
     }
 
@@ -465,13 +557,58 @@ mod tests {
             ("monitor event, no status", notification_line("t-1", None), false),
             ("another task", notification_line("t-2", Some("completed")), false),
             (
+                "earlier incarnation of the same task id",
+                notification_line("t-1", Some("completed")).replace("toolu_1", "toolu_old"),
+                false,
+            ),
+            (
+                "quoted task identity in another task's result",
+                entry_carrying("user", serde_json::json!({"content": format!(
+                    "<task-notification><task-id>other</task-id><tool-use-id>other</tool-use-id><status>completed</status><result>{}</result></task-notification>",
+                    full_notification_text("t-1")
+                )})),
+                false,
+            ),
+            (
+                "quoted terminal status inside a running task's result",
+                notification_line("t-1", Some("running")).replace(
+                    "</task-notification>",
+                    "<result><status>completed</status></result></task-notification>",
+                ),
+                false,
+            ),
+            (
+                "completion without captured tool identity",
+                notification_line("t-1", Some("completed")).replace("<tool-use-id>toolu_1</tool-use-id>\\n", ""),
+                false,
+            ),
+            (
+                "summary cannot supply missing launch identity",
+                entry_carrying("user", serde_json::json!({"content":
+                    "<task-notification><task-id>t-1</task-id><status>completed</status><summary>quoted <tool-use-id>toolu_1</tool-use-id></summary></task-notification>"
+                })),
+                false,
+            ),
+            (
+                "summary cannot supply terminal status",
+                notification_line("t-1", None).replace(
+                    "</task-notification>",
+                    "<summary><status>completed</status></summary></task-notification>",
+                ),
+                false,
+            ),
+            (
                 "not a notification",
                 "{\"type\":\"user\",\"content\":\"<task-id>t-1</task-id><status>completed</status>\"}\n".to_string(),
                 false,
             ),
         ];
         for (name, line, want) in cases {
-            assert_eq!(is_terminal_notification(&line, "t-1"), want, "{name}");
+            assert_eq!(
+                is_terminal_notification(&line, "t-1", "toolu_1"),
+                want,
+                "{name}"
+            );
         }
     }
 
@@ -496,7 +633,7 @@ mod tests {
         _home: tempfile::TempDir,
         home: PathBuf,
         transcript: PathBuf,
-        active: Arc<Mutex<HashSet<String>>>,
+        active: Arc<ActiveTasks>,
         tx: Option<Sender<Event>>,
         rx: Receiver<Event>,
         idle: IdleHook,
@@ -526,8 +663,9 @@ mod tests {
     }
 
     impl Fixture {
-        fn spawn_with(&self, watch: Arc<FileWatchService>, start: TailerStart) {
-            TaskTailer {
+        async fn spawn_with(&self, watch: Arc<FileWatchService>, start: TailerStart) {
+            let _ = TaskTailer {
+                tool_call_id: Some("toolu_1".into()),
                 claude_home: Some(self.home.clone()),
                 watch,
                 task_id: "t-1".into(),
@@ -537,11 +675,13 @@ mod tests {
                 start,
                 idle: self.idle.clone(),
             }
-            .spawn();
+            .spawn(None)
+            .await;
         }
 
-        fn spawn(&self, start: TailerStart) {
-            self.spawn_with(FileWatchService::new().unwrap(), start);
+        async fn spawn(&self, start: TailerStart) {
+            self.spawn_with(FileWatchService::new().unwrap(), start)
+                .await;
         }
 
         /// Waits until a tailer has scanned everything written so far and is
@@ -579,7 +719,7 @@ mod tests {
 
         async fn released(&self) {
             tokio::time::timeout(Duration::from_secs(5), async {
-                while !self.active.lock().unwrap().is_empty() {
+                while !self.active.is_empty() {
                     tokio::task::yield_now().await;
                 }
             })
@@ -598,7 +738,7 @@ mod tests {
     #[tokio::test]
     async fn a_change_after_the_initial_scan_wakes_the_tailer() {
         let mut f = fixture("{\"type\":\"user\"}\n");
-        f.spawn(TailerStart::Live);
+        f.spawn(TailerStart::Live).await;
         f.parked().await;
         // Another task's end first: the tailer keeps following.
         f.append(&notification_line("t-9", Some("completed")));
@@ -610,7 +750,8 @@ mod tests {
     #[tokio::test]
     async fn without_a_watcher_a_later_append_is_found_by_the_fallback_poll() {
         let mut f = fixture("{\"type\":\"user\"}\n");
-        f.spawn_with(FileWatchService::noop(), TailerStart::Live);
+        f.spawn_with(FileWatchService::noop(), TailerStart::Live)
+            .await;
         // A no-op watcher hands back a closed channel, so the tailer switches
         // to polling right after its first checkpoint, and rescans once on
         // the way. Only the second checkpoint is after that switch: an append
@@ -624,7 +765,7 @@ mod tests {
     #[tokio::test]
     async fn a_notification_before_the_tailer_started_is_still_found() {
         let mut f = fixture(&notification_line("t-1", Some("failed")));
-        f.spawn(TailerStart::Live);
+        f.spawn(TailerStart::Live).await;
         assert_eq!(finished_id(f.next().await), "t-1");
     }
 
@@ -636,7 +777,7 @@ mod tests {
         initial.push('\n');
         initial.push_str(&notification_line("t-1", Some("killed")));
         let mut resumed = fixture(&initial);
-        resumed.spawn(TailerStart::Resumed);
+        resumed.spawn(TailerStart::Resumed).await;
         assert_eq!(finished_id(resumed.next().await), "t-1");
     }
 
@@ -644,7 +785,8 @@ mod tests {
     async fn a_transcript_that_cannot_be_found_ends_tracking() {
         let home = tempfile::tempdir().unwrap();
         let (tx, mut rx) = tokio::sync::mpsc::channel(8);
-        TaskTailer {
+        let _ = TaskTailer {
+            tool_call_id: Some("toolu_1".into()),
             claude_home: Some(home.path().to_path_buf()),
             watch: FileWatchService::noop(),
             task_id: "t-1".into(),
@@ -654,7 +796,8 @@ mod tests {
             start: TailerStart::Live,
             idle: Arc::new(|| {}),
         }
-        .spawn();
+        .spawn(None)
+        .await;
         let event = tokio::time::timeout(Duration::from_secs(10), rx.recv())
             .await
             .expect("an event within the deadline")
@@ -667,7 +810,8 @@ mod tests {
     #[tokio::test]
     async fn an_unresolvable_claude_home_ends_tracking() {
         let (tx, mut rx) = tokio::sync::mpsc::channel(8);
-        TaskTailer {
+        let _ = TaskTailer {
+            tool_call_id: Some("toolu_1".into()),
             claude_home: None,
             watch: FileWatchService::noop(),
             task_id: "t-1".into(),
@@ -677,7 +821,8 @@ mod tests {
             start: TailerStart::Live,
             idle: Arc::new(|| {}),
         }
-        .spawn();
+        .spawn(None)
+        .await;
         let event = tokio::time::timeout(Duration::from_secs(10), rx.recv())
             .await
             .expect("an event within the deadline")
@@ -691,21 +836,21 @@ mod tests {
         let active = f.active.clone();
         // A tailer that panicked while holding the set's lock.
         let _ = std::thread::spawn(move || {
-            let _held = active.lock().unwrap();
+            let _held = active.owners.lock().unwrap();
             panic!("poison the in-flight set");
         })
         .join();
-        assert!(f.active.is_poisoned());
+        assert!(f.active.owners.is_poisoned());
 
-        f.spawn(TailerStart::Live);
+        f.spawn(TailerStart::Live).await;
         assert_eq!(finished_id(f.next().await), "t-1");
     }
 
     #[tokio::test]
     async fn a_task_already_tracked_is_not_tailed_twice() {
         let mut f = fixture("");
-        f.spawn(TailerStart::Live);
-        f.spawn(TailerStart::Live);
+        f.spawn(TailerStart::Live).await;
+        f.spawn(TailerStart::Live).await;
         f.parked().await;
         f.append(&notification_line("t-1", Some("completed")));
         assert_eq!(finished_id(f.next().await), "t-1");
@@ -724,7 +869,7 @@ mod tests {
     #[tokio::test]
     async fn a_pending_tailer_does_not_hold_the_event_channel_open() {
         let mut f = fixture("{\"type\":\"user\"}\n");
-        f.spawn(TailerStart::Live);
+        f.spawn(TailerStart::Live).await;
         f.parked().await;
 
         f.drop_sender();
@@ -761,7 +906,10 @@ mod tests {
         assert!(contents.len() > READ_CHUNK_BYTES * 3);
 
         let mut cursor = start_of_transcript();
-        assert!(matches!(scan(&path, &mut cursor, "t-1").await, Scan::Ended));
+        assert!(matches!(
+            scan(&path, &mut cursor, "t-1", "toolu_1").await,
+            Scan::Ended
+        ));
         assert!(
             cursor.offset <= READ_CHUNK_BYTES as u64,
             "read {} bytes for a notification in the first line",
@@ -779,7 +927,10 @@ mod tests {
         let (_dir, path) = write_transcript(&contents);
 
         let mut cursor = start_of_transcript();
-        assert!(matches!(scan(&path, &mut cursor, "t-1").await, Scan::Ended));
+        assert!(matches!(
+            scan(&path, &mut cursor, "t-1", "toolu_1").await,
+            Scan::Ended
+        ));
         assert!(
             cursor.offset > READ_CHUNK_BYTES as u64,
             "the second chunk was needed"
@@ -794,7 +945,76 @@ mod tests {
         let (_dir, path) = write_transcript(&contents);
 
         let mut cursor = start_of_transcript();
-        assert!(matches!(scan(&path, &mut cursor, "t-1").await, Scan::Ended));
+        assert!(matches!(
+            scan(&path, &mut cursor, "t-1", "toolu_1").await,
+            Scan::Ended
+        ));
         assert!(cursor.carry.len() <= MAX_LINE_BYTES);
+    }
+
+    #[tokio::test]
+    async fn a_reused_task_id_waits_for_its_captured_launch_completion() {
+        for start in [TailerStart::Live, TailerStart::Resumed] {
+            let old = notification_line("t-1", Some("completed")).replace("toolu_1", "toolu_old");
+            let mut fixture = fixture(&old);
+            fixture.spawn(start).await;
+            fixture.parked().await;
+            assert!(fixture.rx.try_recv().is_err());
+            fixture.append(&notification_line("t-1", Some("completed")));
+            assert_eq!(finished_id(fixture.next().await), "t-1");
+            fixture.released().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn a_superseded_tailer_cannot_finish_or_release_the_new_launch() {
+        let mut fixture = fixture("");
+        let tailer = |tool_call_id: &str| TaskTailer {
+            claude_home: Some(fixture.home.clone()),
+            watch: FileWatchService::new().unwrap(),
+            task_id: "t-1".into(),
+            tool_call_id: Some(tool_call_id.into()),
+            session_id: "sess".into(),
+            active: fixture.active.clone(),
+            event_tx: fixture.tx.as_ref().unwrap().downgrade(),
+            start: TailerStart::Live,
+            idle: fixture.idle.clone(),
+        };
+        let old_tailer = tailer("toolu_old");
+        let new_tailer = tailer("toolu_1");
+        let started = |tool_call_id: &str| Event::BackgroundTaskStarted {
+            task_id: "t-1".into(),
+            tool_call_id: Some(tool_call_id.into()),
+            description: "sleep".into(),
+        };
+        let old = old_tailer.spawn(Some(started("toolu_old"))).await.unwrap();
+        assert!(matches!(
+            fixture.next().await,
+            Event::BackgroundTaskStarted { .. }
+        ));
+        fixture.parked().await;
+        let new = new_tailer.spawn(Some(started("toolu_1"))).await.unwrap();
+        assert!(matches!(
+            fixture.next().await,
+            Event::BackgroundTaskStarted { .. }
+        ));
+        tokio::time::timeout(Duration::from_secs(5), old)
+            .await
+            .unwrap()
+            .unwrap();
+        fixture.parked().await;
+        fixture
+            .append(&notification_line("t-1", Some("completed")).replace("toolu_1", "toolu_old"));
+        fixture.parked().await;
+        assert!(fixture.rx.try_recv().is_err());
+        fixture.append(&notification_line("t-1", Some("completed")));
+        assert_eq!(finished_id(fixture.next().await), "t-1");
+        tokio::time::timeout(Duration::from_secs(5), new)
+            .await
+            .unwrap()
+            .unwrap();
+        fixture.released().await;
+        fixture.drop_sender();
+        assert!(fixture.rx.recv().await.is_none());
     }
 }

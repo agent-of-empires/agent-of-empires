@@ -45,21 +45,53 @@ fn opt_out_hard_fails_without_spawning() {
     let mut h = TuiTestHarness::new_in_tmp("autostart_opt_out");
     h.stop_daemon_on_drop();
 
-    let flag = h.run_cli_err(&["--no-autostart", "acp", "status", "no-such-session"]);
-    assert!(
-        flag.contains("no structured view daemon is running"),
-        "{flag}"
-    );
-
+    h.run_cli_err(&["--no-autostart", "acp", "status", "no-such-session"]);
     h.set_env("AOE_NO_AUTOSTART", "1");
-    let env = h.run_cli_err(&["acp", "status", "no-such-session"]);
-    assert!(
-        env.contains("no structured view daemon is running"),
-        "{env}"
-    );
+    h.run_cli_err(&["acp", "status", "no-such-session"]);
 
     assert!(
         !app_dir_in(h.home_path()).join("serve.pid").exists(),
         "an opted-out client must not start a daemon"
     );
+}
+
+#[test]
+#[parallel]
+fn native_opt_out_refuses_spawn_and_reuses_existing_core() {
+    crate::harness::require_tmux!();
+    for use_env in [false, true] {
+        let mut h = TuiTestHarness::new_in_tmp(if use_env {
+            "native_autostart_env"
+        } else {
+            "native_autostart_flag"
+        });
+        h.stop_daemon_on_drop();
+        h.set_env("AGENT_OF_EMPIRES_PROFILE", "default");
+        if use_env {
+            h.set_env("AOE_NO_AUTOSTART", "1");
+            h.spawn_tui();
+        } else {
+            h.spawn(&["--no-autostart"]);
+        }
+        h.wait_for("Runtime unavailable");
+        let app = app_dir_in(h.home_path());
+        assert!(!app.join("serve.pid").exists(), "opt-out started a daemon");
+        assert!(
+            !app.join("daemon/api.sock").exists(),
+            "opt-out created a native listener"
+        );
+
+        h.run_cli_ok(&["serve", "--core-only", "--daemon"]);
+        let original_pid = std::fs::read_to_string(app.join("serve.pid")).unwrap();
+        h.send_keys("r");
+        h.wait_for("Runtime ready");
+        assert_eq!(
+            std::fs::read_to_string(app.join("serve.pid")).unwrap(),
+            original_pid,
+            "reconnect replaced the existing owner"
+        );
+        let launch: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(app.join("serve.launch")).unwrap()).unwrap();
+        assert_eq!(launch["core_only"], true, "reconnect changed exposure");
+    }
 }

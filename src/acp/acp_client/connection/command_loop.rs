@@ -173,9 +173,11 @@ impl Session {
                 Some(ClientCmd::ResumeBackgroundTailing(launches)) => {
                     self.shared.resume_background_tailing(launches)
                 }
-                Some(ClientCmd::ResumeTaskTailing(task_ids)) => self
-                    .shared
-                    .resume_task_tailing(&self.acp_session_id.0, task_ids),
+                Some(ClientCmd::ResumeTaskTailing(task_ids)) => {
+                    self.shared
+                        .resume_task_tailing(&self.acp_session_id.0, task_ids)
+                        .await
+                }
                 Some(ClientCmd::ResetSession {
                     text,
                     deadline,
@@ -281,7 +283,7 @@ impl Session {
             return Ok(());
         };
         let work = self.shared.between_prompt.work_state();
-        if work.is_busy() {
+        if work.is_busy() || !self.shared.bg_tasks.is_empty() {
             // Old-session events would be attributed to the new conversation.
             warn!(
                 target: "acp.protocol",

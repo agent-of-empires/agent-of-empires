@@ -2159,6 +2159,7 @@ enter to select · esc to cancel";
             detect_status_from_content_in("", stale, "claude"),
             Status::Idle
         );
+        assert_eq!(detect_claude_status(stale), Status::Idle);
         assert_eq!(
             detect_via_manifest("claude", stale, "", hook(Status::Running, secs(300))),
             Status::Idle
@@ -4162,5 +4163,32 @@ Final prose line.\n";
                 .detect(&pane, &Observation::new("π ⠋ Task", None, true));
             assert_eq!(detection.status, Some(expected));
         }
+    }
+
+    #[test]
+    fn hook_only_registry_ignores_unrelated_live_spinner() {
+        for agent in ["kiro", "settl", "kimi"] {
+            let Some(definition) = crate::agents::get_agent(agent) else {
+                continue;
+            };
+            assert_eq!(
+                (definition.detect_status)("✶ Working… (4s · ↓ 88 tokens)"),
+                Status::Idle,
+                "{agent}",
+            );
+        }
+    }
+
+    #[test]
+    fn named_profile_and_direct_ansi_entrypoints_keep_their_boundaries() {
+        for (profile, tool, pane, expected) in [
+            ("unknown-tool-without-rules", "unknown_tool", "Processing ⠋", Status::Idle),
+            ("ansi-dispatch-without-rules", "opencode", "\x1b[38;2;39;62;94m⬝⬝⬝⬝⬝⬝⬝⬝\x1b[0m  \x1b[38;2;238;238;238mesc \x1b[38;2;128;128;128minterrupt\x1b[0m", Status::Running),
+            ("ansi-dispatch-without-rules", "opencode", "\x1b[38;2;255;255;255m⠋\x1b[0m generating", Status::Running),
+        ] {
+            assert_eq!(detect_status_from_content_in(profile, pane, tool), expected);
+        }
+        let pane = "\x1b[38;5;174m✶\x1b[39m \x1b[38;5;180mWorking…\x1b[38;5;174m \x1b[38;5;246m(4s · ↓\x1b[39m \x1b[38;5;246m88 tokens)\x1b[39m\n\x1b[39m  \x1b[38;5;246mesc\x1b[39m \x1b[38;5;246mto\x1b[39m \x1b[38;5;246minterrupt\x1b[39m";
+        assert_eq!(detect_claude_status(pane), Status::Running);
     }
 }

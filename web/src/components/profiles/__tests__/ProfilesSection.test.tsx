@@ -62,7 +62,7 @@ function LocationProbe() {
 async function mountAndSelectWork(readOnly?: boolean) {
   const api = render(
     <MemoryRouter initialEntries={["/settings/profiles"]}>
-      <ProfilesSection readOnly={readOnly} />
+      <ProfilesSection readOnly={readOnly} onRenamed={() => {}} />
       <LocationProbe />
     </MemoryRouter>,
   );
