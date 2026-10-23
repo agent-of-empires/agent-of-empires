@@ -1,6 +1,12 @@
 import { useCallback, useEffect, useReducer, useRef, useState } from "react";
 import { createPortal } from "react-dom";
-import type { CreateProgress, CreateSessionRequest, SessionResponse, CreationTrustFingerprint } from "../../lib/types";
+import type {
+  CreateProgress,
+  CreateSessionRequest,
+  SessionResponse,
+  CreationTrustFingerprint,
+  GroupInfo,
+} from "../../lib/types";
 import {
   fetchAgents,
   fetchGroups,
@@ -170,6 +176,8 @@ interface Props {
   nameOnly?: boolean;
 }
 
+const NO_GROUPS: GroupInfo[] = [];
+
 export function SessionWizard({
   onClose,
   onCreated,
@@ -185,6 +193,7 @@ export function SessionWizard({
     error: null,
     agents: [],
     groups: [],
+    groupsFor: null,
     profiles: [],
     dockerAvailable: false,
     dockerChecked: false,
@@ -259,16 +268,18 @@ export function SessionWizard({
     };
   }, [servedProfile, prefill?.profile, onRetryServedProfile]);
 
-  // Groups are per profile, so the list follows the selected one.
+  // Groups are per profile, so the list follows the selected one, or the served one, which can
+  // change while the Daemon runs. A list is shown only for the profile it was fetched for.
+  const groupsKey = state.data.profile || `served:${servedProfile ?? ""}`;
   useEffect(() => {
     let alive = true;
     void fetchGroups(state.data.profile || undefined).then((groups) => {
-      if (alive) dispatch({ type: "SET_GROUPS", groups });
+      if (alive) dispatch({ type: "SET_GROUPS", groups, groupsFor: groupsKey });
     });
     return () => {
       alive = false;
     };
-  }, [state.data.profile]);
+  }, [state.data.profile, groupsKey]);
 
   useEffect(() => {
     const generations = defaultsGeneration;
@@ -858,7 +869,7 @@ export function SessionWizard({
             id="wizard-group"
             value={d.group}
             onChange={(v) => handleChange("group", v)}
-            groups={state.groups}
+            groups={state.groupsFor === groupsKey ? state.groups : NO_GROUPS}
           />
         </FieldRow>
       </RowGroup>

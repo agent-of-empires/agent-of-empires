@@ -985,6 +985,48 @@ describe("SessionWizard Docker readiness", () => {
 });
 
 describe("SessionWizard Group field", () => {
+  it("never offers one profile's Groups under another while its list loads", async () => {
+    vi.mocked(fetchProfiles).mockResolvedValue([
+      { name: "default", is_default: true },
+      { name: "work", is_default: false },
+    ]);
+    vi.mocked(fetchGroups).mockResolvedValueOnce([{ path: "home-group", session_count: 1 }]);
+    renderWizard();
+    const field = await screen.findByRole("combobox", { name: "Group" });
+    fireEvent.focus(field);
+    await screen.findByRole("option", { name: "home-group · 1 session" });
+    fireEvent.blur(field);
+    let release: (groups: { path: string; session_count: number }[]) => void = () => {};
+    vi.mocked(fetchGroups).mockReturnValueOnce(new Promise((resolve) => (release = resolve)));
+    fireEvent.click(await screen.findByText("Profile"));
+    fireEvent.click(screen.getByRole("radio", { name: /work/ }));
+    await waitFor(() => expect(fetchGroups).toHaveBeenLastCalledWith("work"));
+    const again = await screen.findByRole("combobox", { name: "Group" });
+    fireEvent.focus(again);
+    expect(screen.queryByRole("option", { name: /home-group/ })).toBeNull();
+    await act(async () => release([{ path: "work-group", session_count: 2 }]));
+    await screen.findByRole("option", { name: "work-group · 2 sessions" });
+  });
+
+  it("refetches Groups when the served profile changes, dropping the old list first", async () => {
+    vi.mocked(fetchGroups).mockResolvedValueOnce([{ path: "alpha-group", session_count: 1 }]);
+    const props = { onClose: () => {}, onCreated: () => {}, prefill: { path: "/tmp/proj", tool: "claude" } };
+    const view = render(<SessionWizard servedProfile="Alpha" {...props} />);
+    const field = await screen.findByRole("combobox", { name: "Group" });
+    fireEvent.focus(field);
+    await screen.findByRole("option", { name: "alpha-group · 1 session" });
+    fireEvent.blur(field);
+    let release: (groups: { path: string; session_count: number }[]) => void = () => {};
+    vi.mocked(fetchGroups).mockReturnValueOnce(new Promise((resolve) => (release = resolve)));
+    const calls = vi.mocked(fetchGroups).mock.calls.length;
+    view.rerender(<SessionWizard servedProfile="Beta" {...props} />);
+    await waitFor(() => expect(vi.mocked(fetchGroups).mock.calls.length).toBe(calls + 1));
+    fireEvent.focus(field);
+    expect(screen.queryByRole("option", { name: /alpha-group/ })).toBeNull();
+    await act(async () => release([{ path: "beta-group", session_count: 2 }]));
+    await screen.findByRole("option", { name: "beta-group · 2 sessions" });
+  });
+
   it("launches with the typed group while its list is open", async () => {
     vi.mocked(fetchGroups).mockResolvedValue([{ path: "client/api", session_count: 2 }]);
     renderWizard();

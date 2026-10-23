@@ -1689,6 +1689,8 @@ pub async fn list_groups(
     State(state): State<Arc<AppState>>,
     axum::extract::Query(query): axum::extract::Query<GroupsQuery>,
 ) -> impl IntoResponse {
+    // Held across the name check and the read, so a profile rename or delete can't slip between.
+    let _namespace = state.profile_namespace.read().await;
     let served = state.served_profile().to_string();
     let requested = query.profile.filter(|p| !p.is_empty());
     let profile = tokio::task::spawn_blocking(move || match requested {
@@ -1715,7 +1717,8 @@ pub async fn list_groups(
         .map(|inst| inst.group_path.clone())
         .collect();
     let stored = tokio::task::spawn_blocking(move || {
-        crate::session::Storage::new_unwatched(&profile).and_then(|s| s.load_groups_readonly())
+        crate::session::Storage::open(&profile, crate::file_watch::FileWatchService::noop())
+            .and_then(|s| s.load_groups_readonly())
     })
     .await
     .ok()
@@ -2631,6 +2634,30 @@ pub async fn serve_sound_file(
 
 #[cfg(test)]
 mod tests {
+    /// A served profile deleted from disk lists no Groups, and listing doesn't recreate it.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn list_groups_never_recreates_a_missing_profile() -> anyhow::Result<()> {
+        use axum::response::IntoResponse;
+        let _home = crate::session::test_support::isolate_app_dir();
+        let state = crate::server::test_support::build_test_app_state(Vec::new());
+        let served = state.served_profile().to_string();
+        state.rename_served_profile(&served, "ghost");
+        let response = super::list_groups(
+            axum::extract::State(state),
+            axum::extract::Query(super::GroupsQuery { profile: None }),
+        )
+        .await
+        .into_response();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await?;
+        assert_eq!(body.as_ref(), b"[]");
+        let ghost = crate::session::get_app_dir()?
+            .join("profiles")
+            .join("ghost");
+        assert!(!ghost.exists(), "{}", ghost.display());
+        Ok(())
+    }
+
     /// The wizard's Group list holds every group the sidebar can show: stored
     /// empty groups and the parents of nested paths, but not the synthetic shelves.
     #[test]
