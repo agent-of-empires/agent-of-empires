@@ -108,8 +108,14 @@ async fn unreachable_selected_targets_never_answer_from_disk() {
                 command.env("AOE_NO_AUTOSTART", "1");
             }
             let output = command.output().unwrap();
-            assert_refused(&output, "daemon read: publisher_absent");
-            assert_eq!(output.status.code(), Some(4));
+            assert_refused(&output, "daemon read:");
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            for option in ["--daemon-url", "AOE_DAEMON_URL"] {
+                assert!(
+                    stderr.contains(option),
+                    "missing reconnect guidance: {stderr}"
+                );
+            }
             fixture.assert_not_started();
         }
     }

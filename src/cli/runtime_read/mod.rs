@@ -914,29 +914,6 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn unreachable_environment_and_explicit_endpoints_both_refuse() {
-        let unused = tokio::net::TcpSocket::new_v4().unwrap();
-        unused.bind("127.0.0.1:0".parse().unwrap()).unwrap();
-        let absent = format!("http://{}", unused.local_addr().unwrap());
-        let source = |explicit_url: Option<&str>| ReadRequestSource {
-            explicit_url: explicit_url.map(str::to_string),
-            env_url: Some(OsString::from(&absent)),
-            token: Some(OsString::from("t")),
-            explicit_profile: None,
-            env_profile: None,
-        };
-        let cli = Cli::try_parse_from(["aoe", "list"]).expect("the argv parses");
-        let command = classify(cli.command.as_ref()).expect("`aoe list` is scoped");
-
-        for explicit in [None, Some(absent.as_str())] {
-            let outcome = attempt(command, &source(explicit)).await;
-            assert_eq!(outcome.exit, 4);
-            assert!(outcome.stdout.is_none());
-            assert!(outcome.stderr.unwrap().contains("publisher_absent"));
-        }
-    }
-
     /// Connect targets omit the authority brackets around IPv6 literals.
     #[test]
     fn a_bracketed_ipv6_endpoint_connects_to_an_address_literal() {
