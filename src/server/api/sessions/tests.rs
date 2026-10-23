@@ -9449,4 +9449,21 @@ async fn create_refuses_a_structured_session_without_its_adapter() {
         let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap_or_default();
         assert_ne!(body["error"], "acp_adapter_missing", "{extra}: {body}");
     }
+    // A repository on_create hook may install the adapter before launch, so it isn't refused,
+    // unless the create skips the repository's hooks.
+    let hooked = project_with_on_create_hooks(&["npm install"]);
+    let hooked_path = hooked.path().display().to_string();
+    for (trust_hooks, refused) in [(None, false), (Some(true), false), (Some(false), true)] {
+        let mut extra = serde_json::json!({ "view": "structured", "path": hooked_path });
+        if let Some(trust) = trust_hooks {
+            extra["trust_hooks"] = serde_json::json!(trust);
+        }
+        let (_, bytes) = post_create_bytes(&state, base(extra.clone())).await;
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap_or_default();
+        assert_eq!(
+            body["error"] == "acp_adapter_missing",
+            refused,
+            "{extra}: {body}"
+        );
+    }
 }

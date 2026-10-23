@@ -1171,6 +1171,36 @@ pub mod structured {
         /// Where the session launches, or `None` while that directory doesn't exist yet
         /// (a worktree, scratch or multi-repo session checked before provisioning).
         pub project_path: Option<&'a std::path::Path>,
+        /// Whether an `on_create` hook runs before launch, or awaits the user's trust decision,
+        /// and so may install the adapter; see [`create_hooks_apply`]. Asked only when the
+        /// adapter can't be found, so a normal create skips the repository trust read.
+        pub create_hooks: &'a dyn Fn() -> bool,
+    }
+
+    /// Whether an `on_create` hook will run before a create in `project_path` launches, or is
+    /// waiting on the user's trust decision. `profile_hooks` must be the profile's own, without the
+    /// repository's, which count only under `trust_hooks` (the create's decision; `Some(false)`
+    /// skips them).
+    pub fn create_hooks_apply(
+        profile_hooks: &crate::session::HooksConfig,
+        project_path: &std::path::Path,
+        scratch: bool,
+        trust_hooks: Option<bool>,
+    ) -> bool {
+        use crate::session::config::repo_config::{check_repo_trust, TrustSurface};
+        if !profile_hooks.on_create.is_empty() {
+            return true;
+        }
+        if scratch {
+            return false;
+        }
+        match check_repo_trust(project_path).map(|trust| trust.hooks) {
+            Ok(TrustSurface::Trusted(hooks)) => !hooks.on_create.is_empty(),
+            Ok(TrustSurface::NeedsTrust { config: hooks, .. }) => {
+                trust_hooks != Some(false) && !hooks.on_create.is_empty()
+            }
+            _ => false,
+        }
     }
 
     /// Pre-create validation for an explicit structured-view choice, run BEFORE any worktree,
@@ -1259,7 +1289,8 @@ pub mod structured {
             config,
             host_environment,
             inherited_path,
-        ) {
+        ) || (choice.create_hooks)()
+        {
             return Ok(());
         }
         let hint = crate::acp::install_hints::install_hint_for(&spec.command)
@@ -1284,6 +1315,7 @@ pub mod structured {
             command_override: "",
             sandboxed: false,
             project_path: None,
+            create_hooks: &|| false,
         };
         validate_structured_choice_with(
             &choice,
@@ -1704,6 +1736,8 @@ mod tests {
             /// `agent_command_override` for gemini.
             configured_command: Option<&'a str>,
             before_session_hook: bool,
+            /// An `on_create` hook runs before launch (see `create_hooks_apply`).
+            create_hooks: bool,
             inherited_path: Option<&'a str>,
             /// `None` passes; otherwise a substring of the refusal.
             expected: Option<&'a str>,
@@ -1718,6 +1752,7 @@ mod tests {
             environment: Vec::new(),
             configured_command: None,
             before_session_hook: false,
+            create_hooks: false,
             inherited_path: None,
             expected: None,
         };
@@ -1780,6 +1815,11 @@ mod tests {
                 ..base()
             },
             Case {
+                label: "an on_create hook may install the adapter",
+                create_hooks: true,
+                ..base()
+            },
+            Case {
                 label: "agent_name overrides the tool",
                 tool: "claude",
                 agent_name: Some("fake"),
@@ -1832,6 +1872,7 @@ mod tests {
         ];
         for case in cases {
             let label = case.label;
+            let asked = std::cell::Cell::new(false);
             let config = config(
                 &case.environment,
                 case.before_session_hook,
@@ -1843,6 +1884,10 @@ mod tests {
                 command_override: case.command_override,
                 sandboxed: case.sandboxed,
                 project_path: case.project,
+                create_hooks: &|| {
+                    asked.set(true);
+                    case.create_hooks
+                },
             };
             let got = structured::validate_structured_choice_with(
                 &choice,
@@ -1861,6 +1906,13 @@ mod tests {
                     assert!(msg.contains(want), "{label}: {msg}");
                 }
                 (got, expected) => panic!("{label}: got {got:?}, expected {expected:?}"),
+            }
+            // Hooks are asked about only when the adapter isn't otherwise found.
+            if case.expected.is_none() && !case.create_hooks {
+                assert!(
+                    !asked.get(),
+                    "{label}: asked about hooks for a reachable adapter"
+                );
             }
         }
     }

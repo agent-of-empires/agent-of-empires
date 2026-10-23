@@ -2145,6 +2145,15 @@ impl NewSessionDialog {
             // A worktree or scratch session launches in a directory created later.
             project_path: (!self.scratch && !self.worktree_enabled)
                 .then(|| std::path::Path::new(&path)),
+            // The dialog asks for hook trust itself, so an unapproved hook still counts here.
+            create_hooks: &|| {
+                crate::session::builder::structured::create_hooks_apply(
+                    &crate::session::config::profile_config::resolve_config_or_warn(&profile).hooks,
+                    std::path::Path::new(&path),
+                    self.scratch,
+                    None,
+                )
+            },
         };
         if let Err(e) =
             crate::session::builder::structured::validate_structured_choice(&choice, &config)

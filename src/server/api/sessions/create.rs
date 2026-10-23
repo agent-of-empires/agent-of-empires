@@ -918,9 +918,11 @@ pub async fn create_session(
             || !body.extra_repo_paths.is_empty());
         let (tool, agent_name) = (body.tool.clone(), body.agent_name.clone());
         let (command_override, sandboxed) = (body.command_override.clone(), body.sandbox);
+        let (scratch, trust_hooks) = (body.scratch, body.trust_hooks);
         let missing = tokio::task::spawn_blocking(move || {
             use crate::session::builder::structured::{
-                validate_structured_choice, StructuredChoice, StructuredChoiceError,
+                create_hooks_apply, validate_structured_choice, StructuredChoice,
+                StructuredChoiceError,
             };
             let config = crate::session::config::repo_config::resolve_config_with_repo_or_warn(
                 &profile,
@@ -932,6 +934,16 @@ pub async fn create_session(
                 command_override: &command_override,
                 sandboxed,
                 project_path: launch_dir_known.then_some(project_path.as_path()),
+                // The repository's hooks are merged into `config` whatever their trust.
+                create_hooks: &|| {
+                    create_hooks_apply(
+                        &crate::session::config::profile_config::resolve_config_or_warn(&profile)
+                            .hooks,
+                        &project_path,
+                        scratch,
+                        trust_hooks,
+                    )
+                },
             };
             match validate_structured_choice(&choice, &config) {
                 Err(StructuredChoiceError::AdapterMissing(msg)) => Some(msg),
