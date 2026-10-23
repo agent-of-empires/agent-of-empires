@@ -31,6 +31,8 @@ pub struct SnoozeDurationDialog {
     row_rects: Vec<(u32, Rect)>,
     /// Hovered row. Drives the highlight only; a click submits.
     hovered_row: Option<usize>,
+    selected_minutes: Option<u32>,
+    error: Option<super::InfoDialog>,
 }
 
 impl SnoozeDurationDialog {
@@ -39,14 +41,25 @@ impl SnoozeDurationDialog {
             title: session_title.to_string(),
             row_rects: Vec::new(),
             hovered_row: None,
+            selected_minutes: None,
+            error: None,
         }
     }
 
-    pub fn handle_click(&self, col: u16, row: u16) -> Option<DialogResult<u32>> {
+    pub fn handle_click(&mut self, col: u16, row: u16) -> Option<DialogResult<u32>> {
+        if let Some(error) = &self.error {
+            if error.handle_click(col, row).is_some() {
+                self.error = None;
+            }
+            return Some(DialogResult::Continue);
+        }
         super::hit(&self.row_rects, col, row).map(DialogResult::Submit)
     }
 
     pub fn handle_hover(&mut self, col: u16, row: u16) -> bool {
+        if let Some(error) = &mut self.error {
+            return error.handle_hover(col, row);
+        }
         let pos = ratatui::layout::Position::from((col, row));
         let new_hover = self
             .row_rects
@@ -60,6 +73,17 @@ impl SnoozeDurationDialog {
     }
 
     pub fn handle_key(&mut self, key: KeyEvent) -> DialogResult<u32> {
+        if let Some(error) = &mut self.error {
+            if !matches!(error.handle_key(key), DialogResult::Continue) {
+                self.error = None;
+            }
+            return DialogResult::Continue;
+        }
+        if key.code == KeyCode::Enter {
+            return self
+                .selected_minutes
+                .map_or(DialogResult::Continue, DialogResult::Submit);
+        }
         match key.code {
             KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('Q') => DialogResult::Cancel,
             KeyCode::Char('1') => DialogResult::Submit(ONE_HOUR),
@@ -72,6 +96,13 @@ impl SnoozeDurationDialog {
             KeyCode::Char('0') => DialogResult::Submit(ONE_WEEK),
             _ => DialogResult::Continue,
         }
+    }
+    pub(crate) fn reject(&mut self, minutes: u32, message: &str) {
+        self.selected_minutes = Some(minutes);
+        self.error = Some(super::InfoDialog::sized_to_fit(
+            "Snooze Not Changed",
+            message,
+        ));
     }
 
     pub fn render(&mut self, frame: &mut Frame, area: Rect, theme: &Theme) {
@@ -134,6 +165,9 @@ impl SnoozeDurationDialog {
             ]));
             frame.render_widget(line, area);
             self.row_rects.push((*minutes, area));
+        }
+        if let Some(error) = &mut self.error {
+            error.render(frame, area, theme);
         }
     }
 }

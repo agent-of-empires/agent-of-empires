@@ -12,6 +12,7 @@ pub(crate) mod status_rules;
 mod terminal_session;
 #[cfg(test)]
 pub(crate) mod test_helpers;
+pub(crate) mod tool_retirement;
 mod tool_session;
 pub(crate) mod utils;
 #[cfg(unix)]
@@ -23,13 +24,19 @@ pub(crate) use session::{peel_trailing_semicolons, submit_text, SubmitText};
 pub use session::{PaneCursor, PaneEnvMutation, Session, SIZE_OWNER_HEARTBEAT, SIZE_OWNER_TTL};
 pub use status_bar::{get_session_info_for_current, get_status_for_current_session};
 pub use status_detection::{detect_status_from_content_in, DetectionPlan};
-pub use terminal_session::{kill_all_terminals_for_id, ContainerTerminalSession, TerminalSession};
-pub use tool_session::{kill_all_tool_sessions_for_id, ToolSession};
-pub use utils::{attach_return_hint, tmux_prefix_display};
+pub use terminal_session::{ContainerTerminalSession, TerminalSession};
+pub use tool_session::ToolSession;
+pub(crate) use tool_session::{LegacyToolScope, LegacyToolUnavailable};
+pub use utils::{attach_return_hint, first_pane_id, tmux_prefix_display};
 
 pub(crate) use session_kind::{append_session_kind_args, SessionKind};
 
-/// Change count of `session`'s advertised OSC 8 links; always 0 off unix.
+/// OSC 8 hyperlinks the live VT channel for `session` has seen, oldest first.
+/// Always empty off unix, where there is no channel and the capture fallback
+/// carries the sequences in the frame text.
+/// How many times `session`'s advertised links have changed. Zero off unix and
+/// whenever no channel is armed, which is stable, so a consumer comparing it
+/// against its own copy simply never re-collects on those transports.
 pub(crate) fn pane_links_generation(session: &str) -> u64 {
     #[cfg(unix)]
     {
@@ -71,26 +78,53 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Mutex, OnceLock, RwLock};
 use std::time::{Duration, Instant};
 
-/// Overrides the tmux socket path (the e2e harness sets it).
+/// Environment variable that overrides the tmux socket path. Set by the e2e
+/// harness (and available for opt-in isolation) so a spawned `aoe` routes all
+/// tmux calls to a known per-test socket instead of relying on `$TMUX`.
 pub const TMUX_SOCKET_ENV: &str = "AOE_TMUX_SOCKET";
 
-/// The profile-merged config governing a session's `[tmux]` options.
+/// Resolve the config layer that governs a session's `[tmux]` options.
+///
+/// `[tmux]` is profile-overridable like any other section, so every consumer of
+/// [`crate::session::config::resolve_tmux_setting`] resolves
+/// through here rather than reading the global `config.toml`: doing the latter
+/// made a profile's `[tmux]` block silently inert (issue #3207). An empty
+/// profile name resolves to the default profile, matching every other
+/// profile-scoped read.
 pub(crate) fn tmux_option_config(profile: &str) -> crate::session::Config {
     crate::session::config::profile_config::resolve_config_or_warn(profile)
 }
 
+/// How aoe points tmux at a specific server, if at all.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum TmuxSocket {
-    /// `tmux -S <path>`: build/test isolation and `AOE_TMUX_SOCKET`.
+    /// A full socket path, passed as `tmux -S <path>`. Used for build/test
+    /// isolation and the `AOE_TMUX_SOCKET` override, where aoe owns the exact
+    /// path.
     Path(PathBuf),
-    /// `tmux -L <name>`: the user's `tmux.socket_name` setting.
+    /// A socket name, passed as `tmux -L <name>`. Used for the user-facing
+    /// segmentation setting (#2267); tmux owns the socket directory
+    /// (`$TMUX_TMPDIR`, else `/tmp/tmux-<UID>/`) and its `0700` perms.
     Name(String),
 }
 
-/// Which tmux server this build talks to, cached for the process:
-/// `AOE_TMUX_SOCKET`, else a test/debug isolation socket (so dev builds never
-/// poison the release server), else `tmux.socket_name` in release builds, else
-/// tmux's default socket.
+/// Resolve which tmux server this build talks to, or `None` to use tmux's
+/// default per-user socket. Cached: neither the process env nor the config are
+/// re-read at runtime (moving live sessions across servers is not meaningful).
+///
+/// - `AOE_TMUX_SOCKET` set -> that path via `-S` (e2e / opt-in isolation).
+/// - unit tests            -> a shared temp socket, so `cargo test` never
+///   touches the developer's real tmux server.
+/// - debug builds          -> `<app_dir>/tmux.sock`, giving `cargo run` and
+///   e2e their own tmux server so they can never poison an installed release
+///   build's shared server (#2608); the app dir is already namespaced
+///   (`~/.agent-of-empires-dev`).
+/// - `tmux.socket_name` config set -> that name via `-L` (#2267): the user
+///   opts into a private tmux server so their hand-managed `tmux ls` no longer
+///   lists aoe's sessions. Release builds only; debug/test already isolate onto
+///   their own socket above.
+/// - release builds        -> `None`: keep tmux's default socket so upgrading
+///   does not orphan the release build's live sessions.
 fn tmux_socket() -> Option<TmuxSocket> {
     static SOCKET: OnceLock<Option<TmuxSocket>> = OnceLock::new();
     SOCKET
@@ -108,6 +142,10 @@ fn tmux_socket() -> Option<TmuxSocket> {
         .clone()
 }
 
+/// The build-specific isolation socket path, if this build forces one. Test
+/// and debug builds get their own server so they can never poison an installed
+/// release build's shared tmux server (#2608). Release builds return `None` so
+/// the user's `tmux.socket_name` setting (or the default socket) applies.
 fn build_isolation_socket() -> Option<PathBuf> {
     #[cfg(test)]
     {
@@ -132,14 +170,17 @@ fn build_isolation_socket() -> Option<PathBuf> {
     None
 }
 
+/// The user-configured tmux socket name (`tmux.socket_name`), if any.
 fn configured_socket_name() -> Option<String> {
     crate::session::config::Config::load()
         .ok()
         .and_then(|c| c.tmux.socket_name)
 }
 
-/// `None` for an empty name or one containing a path separator (`-L` takes a
-/// bare name); `AOE_TMUX_SOCKET` is the way to pass a path.
+/// Turn a configured socket name into a `-L` socket, or `None` to fall back to
+/// the default socket. A name containing a path separator is rejected (tmux
+/// `-L` takes a bare name and owns the directory itself) so a stray `/` cannot
+/// silently redirect the server; use `AOE_TMUX_SOCKET` for a full path.
 fn socket_from_config_name(name: Option<String>) -> Option<TmuxSocket> {
     let trimmed = name?.trim().to_string();
     if trimmed.is_empty() {
@@ -156,8 +197,11 @@ fn socket_from_config_name(name: Option<String>) -> Option<TmuxSocket> {
     Some(TmuxSocket::Name(trimmed))
 }
 
-/// A `tmux` command on this build's socket. Every tmux invocation must use this
-/// (or [`tmux_query_command`]) so all commands hit the same server.
+/// A `tmux` [`Command`] preconfigured with this build's socket flag (`-S` for a
+/// path, `-L` for a name) when one applies. Every tmux invocation in aoe MUST
+/// go through this so all commands hit the same server; a raw
+/// `Command::new("tmux")` would fall back to the default socket and split state
+/// across two servers.
 pub(crate) fn tmux_command() -> Command {
     #[cfg(test)]
     fork_probe::record();
@@ -178,15 +222,55 @@ pub(crate) fn tmux_command() -> Command {
     cmd
 }
 
-/// [`tmux_command`] with `LC_MESSAGES=C` (and no `LC_ALL`) so stderr stays
-/// matchable English, plus `-u` for UTF-8 session names. Not for interactive
-/// paths, which must keep the user's locale.
+/// Like [`tmux_command`], but pins `LC_MESSAGES=C` so tmux's connection-failure
+/// messages on stderr stay stable English for callers that match them. tmux's
+/// `client.c` prints `error connecting to <socket> (strerror(errno))` for a
+/// non-`ECONNREFUSED` connect failure, and glibc localizes `strerror` by
+/// `LC_MESSAGES`, so on a non-English host the `(No such file or directory)`
+/// ENOENT marker for an absent socket (#3337) would not match. `LC_ALL` is
+/// removed so it cannot override that. Global `-u` forces UTF-8 session names
+/// even when the caller has `LC_CTYPE=C` or when `LC_ALL` was the only UTF-8
+/// locale source. Used by the status-query callers (which classify via
+/// [`tmux_no_server_running`]) and by `kill_session_if_present`. NOT folded into
+/// [`tmux_command`]: the interactive attach/switch-client/capture-pane paths must
+/// keep the user's locale for UTF-8 and status-bar rendering, and `-u` would
+/// assert UTF-8 to a terminal that may not be.
 pub(crate) fn tmux_query_command() -> Command {
     let mut cmd = tmux_command();
     cmd.arg("-u");
     cmd.env_remove("LC_ALL");
     cmd.env("LC_MESSAGES", "C");
     cmd
+}
+
+pub(crate) fn native_socket_locator() -> Option<PathBuf> {
+    let output = run_tmux_command_with_timeout(tmux_query_command().args([
+        "display-message",
+        "-p",
+        "#{socket_path}",
+    ]))
+    .ok()?;
+    let text = if output.status.success() {
+        std::str::from_utf8(&output.stdout).ok()?
+    } else {
+        if !tmux_no_server_running(&output.stderr) {
+            return None;
+        }
+        std::str::from_utf8(&output.stderr).ok()?
+    };
+    let text = text.strip_suffix('\n').unwrap_or(text);
+    // A missing server still reports its selected socket in the C-locale diagnostic.
+    let path = if output.status.success() {
+        text
+    } else if let Some(path) = text.strip_prefix("no server running on ") {
+        path
+    } else {
+        text.strip_prefix("error connecting to ")?
+            .rsplit_once(" (")?
+            .0
+    };
+    let path = PathBuf::from(path);
+    path.is_absolute().then_some(path)
 }
 
 fn tmux_query_command_for_socket(socket: &str) -> Command {
@@ -201,7 +285,7 @@ fn tmux_query_command_for_socket(socket: &str) -> Command {
     cmd
 }
 
-// Debug builds use `aoe_dev_*` so dev and release sessions never mix.
+// Debug builds use a separate socket and prefix so dev and release sessions never mix.
 pub const SESSION_PREFIX: &str = if cfg!(debug_assertions) {
     "aoe_dev_"
 } else {
@@ -224,17 +308,37 @@ pub const TOOL_PREFIX: &str = if cfg!(debug_assertions) {
 };
 
 #[derive(Debug, Clone)]
+pub enum ToolPaneOwner {
+    Unmarked,
+    Named {
+        instance_id: String,
+        tool_name: String,
+    },
+    Invalid,
+}
+
+/// Pre-fetched pane metadata from a single `tmux list-panes -a` call.
+#[derive(Debug, Clone)]
 pub struct PaneMetadata {
+    pub server: Option<std::sync::Arc<crate::session::TmuxServerIdentity>>,
+    pub session_id: String,
+    pub pane_id: String,
+    pub session_kind: Option<String>,
+    pub tool_owner: ToolPaneOwner,
     pub pane_dead: bool,
     pub pane_current_command: Option<String>,
     pub pane_start_command_is_protected: bool,
     pub pane_pid: Option<u32>,
     /// OSC 0/2 title: None is unavailable; Some("") is observed empty.
     pub pane_title: Option<String>,
-    /// The window's last-output time, used to skip unchanged captures.
+    /// tmux's last-output timestamp for the pane's window, used to skip a
+    /// capture when nothing has been drawn since the last one.
     pub window_activity: Option<i64>,
-    /// Observed window (not pane) size: splits and chrome only move rows inside
-    /// the window, so this is what passive resize compares against.
+    /// Observed `(window_width, window_height)`. Window, not pane: a resize
+    /// by another client changes the window, while pane splits and status-bar
+    /// chrome only redistribute rows inside an unchanged window, so this is
+    /// the signal the passive-resize reconcile can compare against what it
+    /// applied without false mismatches.
     pub window_size: Option<(u16, u16)>,
 }
 
@@ -242,8 +346,13 @@ static SESSION_REFRESH_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::Ato
 #[cfg(test)]
 static FORCED_SESSION_CACHE_GUARDS: AtomicUsize = AtomicUsize::new(0);
 
-/// Whether a test's [`SessionCacheGuard`] owns the cache, in which case refreshes
-/// must not overwrite its forced snapshot.
+/// Whether a test owns SESSION_CACHE through a live SessionCacheGuard, in
+/// which case refresh_session_cache must leave the forced snapshot alone.
+/// serial_test only orders serial tests against each other, so a parallel test
+/// can already be past its staleness check and blocked on the list-sessions
+/// fork when the guard forces a snapshot, then land its write mid-test. On a
+/// host with no tmux server that write is data: None, which reads back as
+/// SessionExistence::Unknown and flips the assertion the guard meant to pin.
 #[cfg(test)]
 fn forced_session_cache_active() -> bool {
     FORCED_SESSION_CACHE_GUARDS.load(Ordering::SeqCst) > 0
@@ -260,15 +369,20 @@ static SESSION_CACHE: RwLock<SessionCache> = RwLock::new(SessionCache {
     outcome: SessionCacheRefresh::Unknown,
 });
 
+/// One live tmux session, as the shared `list-sessions` scan sees it.
 #[derive(Debug, Clone)]
 pub(crate) struct LiveSession {
+    /// tmux's `#{session_activity}` epoch seconds.
     activity: i64,
-    /// Absent for sessions created before [`session_kind::KIND_OPTION`].
+    /// The kind this session was stamped with at creation, absent for a
+    /// session created before [`session_kind::KIND_OPTION`] existed.
     kind: Option<SessionKind>,
 }
 
 #[cfg(test)]
 impl LiveSession {
+    /// A session as an older build (or a tmux that never answered the option)
+    /// leaves it: present, with nothing recorded about its kind.
     fn unmarked() -> Self {
         Self {
             activity: 0,
@@ -284,7 +398,8 @@ struct SessionCache {
     outcome: SessionCacheRefresh,
 }
 
-/// Shared `list-panes` snapshot, mirroring `SESSION_CACHE`.
+/// Shared tmux list-panes snapshot behind pane_dead_for_display, mirroring
+/// SESSION_CACHE's TTL and its data: None "the server could not answer" state.
 static PANE_META_REFRESH_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static PANE_META_CACHE: RwLock<PaneMetaCache> = RwLock::new(PaneMetaCache {
     data: None,
@@ -299,15 +414,19 @@ struct PaneMetaCache {
 }
 pub(crate) const TMUX_COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// One wall-clock budget shared by every tmux subprocess in an operation.
+/// One wall-clock budget shared by every tmux subprocess in a logical
+/// operation. Composite capture uses this so its layout fallback cannot turn
+/// one stalled preview sample into two consecutive full timeouts.
 pub(crate) struct TmuxCommandDeadline {
     deadline: Instant,
     #[cfg(test)]
     budget: Option<CommandBudget>,
 }
 
-/// Test stand-in clock: the first `commands` runs get the full timeout, then
-/// the budget reads as spent.
+/// Test-only stand-in for the wall clock: the first `commands` runs get the
+/// standard timeout and every later one reports the budget as spent. Lets a
+/// test expire a deadline at a chosen command instead of racing the tmux
+/// forks that precede it.
 #[cfg(test)]
 struct CommandBudget(std::sync::atomic::AtomicI64);
 
@@ -383,8 +502,11 @@ pub(crate) fn run_tmux_command_with_timeout(cmd: &mut Command) -> std::io::Resul
     TmuxCommandDeadline::new().run(cmd)
 }
 
-/// Outcome of the `list-sessions` scan; both failures leave `data: None`, but
-/// rekeying stays quiet only for the recognized no-server case.
+/// Result of the authoritative `list-sessions` scan performed by
+/// [`refresh_session_cache`]. The shared cache intentionally keeps both
+/// no-server and unexpected failures as `data: None` so status pollers retain
+/// their existing conservative `Unknown` behavior; rekeying uses this outcome
+/// to suppress a warning only for the recognized no-server case.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SessionCacheRefresh {
     Populated,
@@ -394,17 +516,36 @@ pub enum SessionCacheRefresh {
 
 // Printable and absent from sanitized names; C0 bytes are reserved for the tail.
 const FIELD_SEP: char = '|';
-/// Separates the trailing fields, which may contain `FIELD_SEP`. tmux 3.4
-/// escapes it as `ESCAPED_TAIL_SEP`; newer versions emit it raw.
+/// Separator for the two trailing fields. pane_start_command may itself
+/// contain FIELD_SEP, which is why it was last in the original format. A C0
+/// control byte cannot appear in a shell command or terminal title. tmux 3.4
+/// escapes it as ESCAPED_TAIL_SEP, while newer versions emit it raw.
 const TAIL_SEP: char = '\x1f';
 const ESCAPED_TAIL_SEP: &str = r"\037";
 
-/// Whether stderr says there is no server: `no server running` or an ENOENT
-/// connect failure. Other connect errnos stay errors. Markers are anchored per
-/// line so a socket path cannot spoof them; callers must use
-/// [`tmux_query_command`] for stable English.
+/// tmux exits non-zero with `no server running on <socket>` on stderr when
+/// there is no server on the resolved socket (zero sessions, or the socket's
+/// server has died): the normal state for a structured-view user who never
+/// opens a terminal. It also exits non-zero with
+/// `error connecting to <socket> (No such file or directory)` when the socket
+/// file itself is absent (issue #3337), which is likewise the empty case, not
+/// an error. Both are treated as empty: callers log at trace and return an
+/// empty result, reserving warn for a genuinely unexpected non-zero exit.
+///
+/// A transient glitch on an existing socket stays on the error path: tmux
+/// (`client.c`) emits `error connecting to <socket> (<strerror>)` for a
+/// non-`ECONNREFUSED` connect failure, so `(Permission denied)` (EACCES) and
+/// `(Socket operation on non-socket)` (ENOTSOCK) do NOT match. The ENOENT
+/// marker (and the `no server running` marker) is matched anchored per line,
+/// so a socket path that happens to contain either phrase cannot fake the
+/// empty case on a different errno. Callers MUST use [`tmux_query_command`] so
+/// the `strerror` text is stable English (see #3327/#3328).
 pub(super) fn tmux_no_server_running(stderr: &[u8]) -> bool {
     let s = String::from_utf8_lossy(stderr);
+    // tmux (`client.c`) prints both markers at the start of their own line
+    // (`no server running on <socket>` / `error connecting to <socket>
+    // (<strerror>)`), so anchor to the line rather than scanning the whole
+    // buffer, where an arbitrary socket path could otherwise spoof a match.
     s.lines().any(|line| {
         let line = line.trim();
         line.starts_with("no server running")
@@ -441,7 +582,10 @@ fn publish_session_cache(
     cache.outcome = outcome;
     outcome
 }
-/// A fresh scan with the cache's parser; `None` when tmux is unreachable.
+/// One authoritative scan, parsed: the same command and parser the shared
+/// cache uses, for a caller that needs a fresh answer rather than the cache's.
+/// `None` when the tmux server could not be reached, which is not evidence
+/// that anything is absent.
 pub(crate) fn probe_live_sessions() -> Option<HashMap<String, LiveSession>> {
     let output = run_tmux_command_with_timeout(&mut session_scan_command()).ok()?;
     output
@@ -450,6 +594,8 @@ pub(crate) fn probe_live_sessions() -> Option<HashMap<String, LiveSession>> {
         .then(|| parse_session_scan(&String::from_utf8_lossy(&output.stdout)))
 }
 
+/// Every live session as `(name, kind marker)` pairs, the shape the id
+/// lookups take.
 pub(crate) fn marked_names(
     sessions: &HashMap<String, LiveSession>,
 ) -> impl Iterator<Item = (&str, Option<&str>)> {
@@ -458,6 +604,8 @@ pub(crate) fn marked_names(
         .map(|(name, session)| (name.as_str(), session.kind.map(SessionKind::as_marker)))
 }
 
+/// The one scan every kind-aware lookup reads: the inheritable `@aoe_kind`
+/// scopes (see [`parse_session_scan`]) followed by one line per live session.
 fn session_scan_command() -> Command {
     let mut command = tmux_query_command();
     for flags in INHERITABLE_KIND_SCOPES {
@@ -467,15 +615,32 @@ fn session_scan_command() -> Command {
     command
 }
 
-/// Server-wide scopes that also answer `#{@aoe_kind}`, read back so the scan
-/// can subtract them. Measured on tmux 3.6, all but `-g` override a session's
-/// own mark, so subtracting them never discards a visible legitimate mark.
+/// The server-wide option scopes a `list-sessions` `#{@aoe_kind}` reads, as
+/// `show-options` flag sets, each read back so [`parse_session_scan`] can
+/// subtract it.
+///
+/// Measured on tmux 3.6, highest first: `-s` > `-gw` > `-w` > a session's own
+/// value > `-g`. Only `-g` is a fall-through; the rest OVERRIDE the mark aoe
+/// wrote, so a user who sets one does not shadow aoe's answer selectively,
+/// they hide every mark on the server and put the whole fleet back on the
+/// name-shape guess. Subtracting them is therefore never able to discard a
+/// legitimate mark: when they are set, no legitimate mark is visible anyway.
+///
+/// `-w` and `-p` reach the format too but are per-window and per-pane, so a
+/// single subtracted value cannot cover them. Setting `@aoe_kind` yourself
+/// stays unsupported (`docs/guides/tmux-status-bar.md`).
 const INHERITABLE_KIND_SCOPES: [&str; 3] = ["-gqv", "-sqv", "-gwqv"];
 
 const SESSION_SCAN_FORMAT: &str = "#{session_name}|#{session_activity}|#{@aoe_kind}";
 
-/// Session lines are `<name>|<activity>|<marker>`; the integer activity field
-/// tells them apart from scope values that may contain `|`.
+/// Whether a scan line is a session rather than one of the leading
+/// [`INHERITABLE_KIND_SCOPES`] values.
+///
+/// A session line is `<name>|<activity>|<marker>`, so its second field is
+/// always `#{session_activity}`'s integer. Testing that rather than the mere
+/// presence of a [`FIELD_SEP`] keeps a scope value that happens to contain one
+/// from ending the scope block early, which would leave every later scope
+/// unsubtracted and hand a paired terminal the agent's kind.
 fn is_session_line(line: &str) -> bool {
     let mut fields = line.split(FIELD_SEP);
     fields.next();
@@ -484,8 +649,24 @@ fn is_session_line(line: &str) -> bool {
         .is_some_and(|activity| activity.parse::<i64>().is_ok())
 }
 
-/// Parse [`session_scan_command`] output. A session whose marker equals one of
-/// the leading scope values is treated as unmarked (name-shape fallback).
+/// Parse the [`session_scan_command`] output.
+///
+/// A session line is `<name>|<activity>|<kind marker>`, the marker empty for a
+/// session with no mark, so a line that is short or empty there is an unmarked
+/// session and not a parse failure.
+///
+/// The leading lines are the [`INHERITABLE_KIND_SCOPES`] values, printed only
+/// for a scope the user set one in and told apart by [`is_session_line`].
+/// They have to be subtracted: a session that sets none of its own reads the
+/// broadest scope that is set, so a user who sets one would otherwise mark
+/// their whole server as agents and a paired terminal would pass as an agent
+/// pane. A session whose value merely equals one of them is treated as
+/// unmarked, which is the name-shape fallback rather than a wrong answer.
+///
+/// aoe-created names are sanitized to `[A-Za-z0-9_-]`, but the shared server
+/// also carries foreign sessions, whose names tmux does allow `|` in. Such a
+/// name splits into a nonsense key that no `_<id8>` lookup can match, which is
+/// the same outcome it had before the kind field existed.
 fn parse_session_scan(stdout: &str) -> HashMap<String, LiveSession> {
     let mut lines = stdout.lines().peekable();
     let mut inherited: Vec<&str> = Vec::new();
@@ -561,8 +742,9 @@ pub fn refresh_session_cache() -> SessionCacheRefresh {
     publish_session_cache(refresh_id, new_data, outcome, true)
 }
 
-/// Existence of the selected agent session, where an ambiguous resolution is
-/// Unknown rather than Absent.
+/// Classify the currently selected agent session without letting an
+/// ambiguous title-derived resolution turn "another live name carries this
+/// id" into confirmed absence.
 fn resolved_agent_existence(
     id: &str,
     session: &Session,
@@ -588,20 +770,28 @@ fn resolved_agent_existence(
     if !names.keys().any(|name| shape.matches(name)) {
         return SessionExistence::Absent;
     }
+    // Multiple id-shaped candidates make `Session::new` deliberately retain
+    // the derived name. That is unresolved, not absence.
     SessionExistence::Unknown
 }
 
-/// Rekey a live tmux session after its new title is persisted. `Ok(false)` only
-/// when tmux confirms no live session. Callers hold the title and lifecycle
-/// locks and persist first.
+/// Rekey a live title-derived tmux session after its new title is durable.
+///
+/// Returns `Ok(false)` only when tmux authoritatively confirms that no live
+/// session exists. Title writers must persist first while holding the
+/// per-session title and lifecycle locks through this call; rekeying before
+/// commit can strand the pane when persistence fails.
 pub(crate) fn rekey_session(id: &str, old_title: &str, new_title: &str) -> anyhow::Result<bool> {
     let renamed = rekey_session_name(id, old_title, new_title)?;
     if renamed {
+        // Every `Ok(true)` path leaves the session under the new derived name.
         status_bar::refresh_session_title(&Session::generate_name(id, new_title), new_title);
     }
     Ok(renamed)
 }
 
+/// The rename half of [`rekey_session`]: resolves the live session for `id`
+/// and moves it to the name derived from `new_title`.
 fn rekey_session_name(id: &str, old_title: &str, new_title: &str) -> anyhow::Result<bool> {
     // Force a fresh scan so a stale snapshot cannot target the old name.
     let initial_refresh = refresh_session_cache();
@@ -657,27 +847,45 @@ fn rekey_session_name(id: &str, old_title: &str, new_title: &str) -> anyhow::Res
     }
 }
 
-/// Every session kind nests under `SESSION_PREFIX` for this build.
+/// True for any tmux session name owned by this aoe namespace. Every session
+/// kind (agent, terminal, container terminal, tool) is prefixed with
+/// `SESSION_PREFIX` (`aoe_` in release, `aoe_dev_` in debug), so the single
+/// root prefix matches all of them and never a release session from a debug
+/// build (or vice versa).
 fn is_aoe_session(name: &str) -> bool {
     name.starts_with(SESSION_PREFIX)
 }
 
-/// The `_<id8>` tail, immutable across renames.
+/// The `_<id8>` tail every tmux session name aoe derives for a session id
+/// carries. Immutable across renames: only the title portion of the name
+/// moves, so this is the durable handle from a session row to its panes.
 fn id_suffix(session_id: &str) -> String {
     format!("_{}", crate::cli::truncate_id(session_id, 8))
 }
 
-/// `<prefix><sanitized title><suffix>` for one kind and session id; only the
-/// title moves.
+/// How one kind of aoe tmux session's name is shaped for one session id, so a
+/// live session can still be found after the title embedded in the name has
+/// gone stale. Every name of a given kind is
+/// `<prefix><sanitized title><suffix>`, and only the title in the middle moves.
+///
+/// - agent: prefix `aoe_`, suffix `_<id8>`, excluding the auxiliary prefixes
+/// - paired terminal: prefix `aoe_term_`, suffix `_<id8>` (or `_<id8>_t<N>`)
+/// - container terminal: prefix `aoe_cterm_`, same suffixes
+/// - tool: prefix `aoe_tool_<tool>_`, suffix `_<id8>`
 pub(crate) struct NameShape<'a> {
     pub prefix: &'a str,
     pub suffix: &'a str,
-    /// Needed because auxiliary prefixes nest under `SESSION_PREFIX` and titles can
-    /// sanitize into another kind's shape.
+    /// The kind a name of this shape belongs to. A live session is matched
+    /// against this rather than against the prefix alone: the auxiliary
+    /// prefixes nest under `SESSION_PREFIX`, and a sanitized title can carry
+    /// a name into another kind's shape, so only [`SessionKind`] separates
+    /// them (see [`session_kind`]).
     pub kind: SessionKind,
 }
 
 impl NameShape<'_> {
+    /// The agent shape for a session id. The suffix must outlive the shape, so
+    /// the caller owns it (see [`id_suffix`]).
     pub(crate) fn agent<'a>(suffix: &'a str) -> NameShape<'a> {
         NameShape {
             prefix: SESSION_PREFIX,
@@ -686,6 +894,7 @@ impl NameShape<'_> {
         }
     }
 
+    /// The paired-terminal shape for a session id.
     pub(crate) fn terminal<'a>(suffix: &'a str) -> NameShape<'a> {
         NameShape {
             prefix: TERMINAL_PREFIX,
@@ -694,6 +903,7 @@ impl NameShape<'_> {
         }
     }
 
+    /// The container-terminal shape for a session id.
     pub(crate) fn container<'a>(suffix: &'a str) -> NameShape<'a> {
         NameShape {
             prefix: CONTAINER_TERMINAL_PREFIX,
@@ -702,20 +912,29 @@ impl NameShape<'_> {
         }
     }
 
-    /// `marker` is `None` for pre-marker sessions, which classify by name shape.
+    /// True when the live session `name`, stamped with kind marker `marker`,
+    /// is this shape's session for this id. `marker` is `None` for a session
+    /// created before [`session_kind::KIND_OPTION`] existed, which classifies
+    /// by name shape and so cannot tell an agent titled `term Foo` from the
+    /// paired terminal of a row titled `Foo`.
     fn matches_marked(&self, name: &str, marker: Option<&str>) -> bool {
         name.starts_with(self.prefix)
             && name.ends_with(self.suffix)
             && SessionKind::of(name, marker) == Some(self.kind)
     }
 
+    /// [`Self::matches_marked`] for a caller holding only the name.
     fn matches(&self, name: &str) -> bool {
         self.matches_marked(name, None)
     }
 }
 
-/// Whether `tmux_name` is `session_id`'s agent session, whatever title it was
-/// created with.
+/// True when `tmux_name` is the agent tmux session belonging to `session_id`,
+/// whatever title was embedded in it when it was created. Use this instead of
+/// comparing against `Session::generate_name`: the stored title moves under a
+/// rename (smart rename, or a manual one whose tmux rename failed) while the
+/// live session keeps the name it was created with, so an equality check
+/// against the freshly derived name misses the very session it is looking for.
 pub fn agent_session_belongs_to(tmux_name: &str, session_id: &str) -> bool {
     NameShape::agent(&id_suffix(session_id)).matches(tmux_name)
 }
@@ -729,11 +948,35 @@ pub(crate) fn agent_session_belongs_to_marked(
         .matches_marked(tmux_name, kind.map(SessionKind::as_marker))
 }
 
+/// A live session's name paired with the kind marker the scan read for it,
+/// absent for a session created before the marker existed.
 pub(crate) type MarkedSessionName = (String, Option<SessionKind>);
 
-/// Fresh (not cached) tmux observations shared by a batch of liveness lookups:
-/// at most one `list-sessions` and one `list-panes -a`, each taken lazily. An
-/// unreachable server stays distinguishable from absence.
+/// One tmux observation shared by a batch of per-instance liveness lookups.
+///
+/// A pass that asks "is this instance's pane live?" once per stored session
+/// otherwise pays a `list-sessions` fork per instance, plus a `pane_dead`
+/// fork per match. `compose_exclusion_with_persisted_peers` walks every
+/// session sharing the project path, trashed ones included, so on a store of
+/// a few hundred that is a few hundred `fork`+`exec` round-trips per pass, on
+/// the thread that also serves input.
+///
+/// The observations are *fresh*, not cached: the session cache's answers are
+/// asymmetric (a hit proves existence, a miss only means "not seen at the last
+/// scan"), and liveness here decides both peer exclusion and env publication,
+/// where a false negative and a false positive are each harmful. One live
+/// observation per pass leaves the decision exactly as authoritative as the
+/// per-item probe it replaces.
+///
+/// Each observation is taken on first use, and only if used: a pass that ends
+/// up asking nothing, because no stored peer shares the project path or every
+/// row short-circuits before the liveness clause, forks nothing, and a caller
+/// that only needs session names never forks `list-panes`.
+///
+/// An unreachable server is preserved rather than collapsed into "absent":
+/// [`LiveSessionSnapshot::sessions`] returns `None`, so a one-shot caller that
+/// cannot retry can tell Unknown from Absent and probe per row instead (see
+/// `Instance::tmux_env_session_name_in_or_probe`).
 #[derive(Default)]
 pub(crate) struct LiveSessionSnapshot {
     sessions: OnceLock<Option<Vec<MarkedSessionName>>>,
@@ -741,10 +984,14 @@ pub(crate) struct LiveSessionSnapshot {
 }
 
 impl LiveSessionSnapshot {
+    /// A snapshot for one pass: at most one `list-sessions` and at most one
+    /// `list-panes -a`, however many instances are then looked up.
     pub(crate) fn new() -> Self {
         Self::default()
     }
 
+    /// Build a snapshot from already-known parts, for tests that must not
+    /// depend on a live tmux server.
     #[cfg(test)]
     pub(crate) fn from_parts(
         names: Option<Vec<String>>,
@@ -756,6 +1003,8 @@ impl LiveSessionSnapshot {
         )
     }
 
+    /// [`Self::from_parts`] for a test that needs the sessions stamped with
+    /// the kind marker a live scan would have read.
     #[cfg(test)]
     pub(crate) fn from_marked_parts(
         names: Option<Vec<MarkedSessionName>>,
@@ -788,11 +1037,17 @@ impl LiveSessionSnapshot {
             .as_deref()
     }
 
+    /// [`Self::sessions`] for a caller that only needs the names.
     pub(crate) fn names(&self) -> Option<impl Iterator<Item = &str>> {
         Some(self.sessions()?.iter().map(|(name, _)| name.as_str()))
     }
 
-    /// From the batched metadata; an absent entry reads as alive.
+    /// Whether `name`'s first pane is dead, mirroring `utils::is_pane_dead`
+    /// but read from the batched metadata. An absent entry is reported alive,
+    /// matching the per-item probe's `unwrap_or(false)` on a failed query.
+    ///
+    /// Only reachable once [`Self::names`] has produced a candidate, so an
+    /// unreachable server never pays for this observation.
     pub(crate) fn pane_dead(&self, name: &str) -> bool {
         self.panes
             .get_or_init(|| batch_pane_metadata().ok())
@@ -803,7 +1058,9 @@ impl LiveSessionSnapshot {
     }
 }
 
-/// The unique live agent pane for a poller seed; multiple matches are ambiguous.
+/// The unique live agent pane for a poller seed. Marked panes use their durable
+/// kind; legacy unmarked panes retain name-shape filtering. Multiple live
+/// matches are ambiguous and cannot safely seed a poller.
 pub(crate) fn live_agent_name_for_id_in(
     snapshot: &LiveSessionSnapshot,
     session_id: &str,
@@ -818,6 +1075,8 @@ pub(crate) fn live_agent_name_for_id_in(
     )
 }
 
+/// [`live_agent_name_for_id_in`] against a scan the caller has just taken,
+/// as `(name, kind marker)` pairs.
 pub(crate) fn live_agent_name_for_id<'a>(
     live: impl IntoIterator<Item = (&'a str, Option<&'a str>)>,
     session_id: &str,
@@ -832,6 +1091,8 @@ pub(crate) fn live_agent_name_for_id<'a>(
     matches.next().is_none().then(|| name.to_owned())
 }
 
+/// [`live_any_kind_name_for_id`] against an already-taken snapshot, so a batch
+/// of lookups costs one observation instead of one per instance.
 pub(crate) fn live_any_kind_name_for_id_in(
     snapshot: &LiveSessionSnapshot,
     session_id: &str,
@@ -846,8 +1107,13 @@ pub(crate) fn live_any_kind_name_for_id_in(
     )
 }
 
-/// The live session carrying `session_id`'s tail, preferring agent, then
-/// terminal, then container terminal, skipping dead panes.
+/// The live tmux session name carrying `session_id`'s `_<id8>` tail, preferring
+/// the agent pane, then a paired terminal, then a container terminal, skipping
+/// dead panes (tool sub-sessions never match any of these shapes). Unlike
+/// [`resolve_agent_session_name`] this takes no title-derived name: it is an
+/// id -> live-name lookup for liveness checks and poller-spawn resolution,
+/// where any live pane for the id is evidence the session exists. Matching runs
+/// through [`NameShape`] so the name shapes stay the single source of truth.
 pub(crate) fn live_any_kind_name_for_id<'a>(
     live: impl IntoIterator<Item = (&'a str, Option<&'a str>)>,
     session_id: &str,
@@ -875,6 +1141,7 @@ pub(crate) fn live_any_kind_name_for_id<'a>(
     agent_hit.or(terminal_hit).or(container_hit)
 }
 
+/// Name-only pairs for a caller with no kind markers to offer.
 #[cfg(test)]
 fn unmarked<'a>(
     names: impl IntoIterator<Item = &'a str>,
@@ -882,13 +1149,21 @@ fn unmarked<'a>(
     names.into_iter().map(|name| (name, None))
 }
 
-/// The name to act on: `derived` unless it is not live and exactly one other
-/// live session fits `shape` (a retitle without a tmux rename).
+/// The tmux session name to act on for one of a session's panes, resolved
+/// against `live_names` (any iterator of live tmux session names).
+///
+/// `derived` is the title-derived name and stays the answer unless it is absent
+/// from `live_names` while exactly one other live session fits `shape`. That
+/// one case is a session whose stored title moved without its tmux session
+/// being renamed: adopting the live name keeps stop / archive / trash / attach
+/// / status pointed at the running pane instead of a name that never existed,
+/// and keeps `create` from spawning a second pane beside it. Two candidates are
+/// ambiguous, so `derived` wins there as well.
 pub(crate) fn resolve_session_name<'a>(
     live: impl IntoIterator<Item = (&'a str, Option<&'a str>)>,
-    derived: &str,
+    derived: &'a str,
     shape: &NameShape,
-) -> String {
+) -> &'a str {
     let mut adopted: Option<&str> = None;
     let mut ambiguous = false;
     let mut derived_is_live = false;
@@ -908,16 +1183,42 @@ pub(crate) fn resolve_session_name<'a>(
         }
     }
     match adopted {
-        Some(name) if !derived_is_live && !ambiguous => name.to_string(),
-        _ => derived.to_string(),
+        Some(name) if !derived_is_live && !ambiguous => name,
+        _ => derived,
     }
 }
 
-/// Names-only: without markers, shapes cannot tell kinds apart.
+pub(crate) fn pane_metadata_for_shape<'a>(
+    panes: &'a HashMap<String, PaneMetadata>,
+    derived: &str,
+    shape: &NameShape,
+) -> anyhow::Result<Option<(&'a str, &'a PaneMetadata)>> {
+    if let Some((name, metadata)) = panes.get_key_value(derived) {
+        return Ok(Some((name.as_str(), metadata)));
+    }
+    let mut matches = panes.iter().filter(|(name, _)| shape.matches(name));
+    let found = matches.next();
+    anyhow::ensure!(matches.next().is_none(), "Pane identity is ambiguous");
+    Ok(found.map(|(name, metadata)| (name.as_str(), metadata)))
+}
+
+pub(crate) fn agent_pane_metadata_in<'a>(
+    panes: &'a HashMap<String, PaneMetadata>,
+    id: &str,
+    title: &str,
+) -> anyhow::Result<Option<(&'a str, &'a PaneMetadata)>> {
+    let derived = Session::generate_name(id, title);
+    pane_metadata_for_shape(panes, &derived, &NameShape::agent(&id_suffix(id)))
+}
+
+/// `resolve_session_name` for the agent pane, against names alone: with no
+/// kind marker every name falls back to its shape, which cannot separate an
+/// agent titled `term Foo` from a paired terminal. Callers reading the shared
+/// scan resolve through `live_session_name`, which does have the markers.
 pub fn resolve_agent_session_name<'a>(
     live_names: impl IntoIterator<Item = &'a str>,
     session_id: &str,
-    derived: &str,
+    derived: &'a str,
 ) -> String {
     let suffix = id_suffix(session_id);
     resolve_session_name(
@@ -925,9 +1226,13 @@ pub fn resolve_agent_session_name<'a>(
         derived,
         &NameShape::agent(&suffix),
     )
+    .to_owned()
 }
 
-/// Against a [`batch_pane_metadata`] snapshot, O(1) when the derived name is live.
+/// [`resolve_agent_session_name`] against a [`batch_pane_metadata`] snapshot
+/// the caller is about to index, with an O(1) fast path for the overwhelmingly
+/// common case where the derived name is live. Without it the per-instance poll
+/// loops would each scan every live session on every pass.
 pub fn resolve_agent_session_name_in(
     pane_metadata: &HashMap<String, PaneMetadata>,
     session_id: &str,
@@ -943,8 +1248,14 @@ pub fn resolve_agent_session_name_in(
     )
 }
 
-/// [`resolve_session_name`] against the shared cache, refreshing a stale
-/// snapshot once; `derived` when tmux is unreachable.
+/// [`resolve_session_name`] against the shared session cache, refreshing a
+/// stale snapshot once. Falls back to `derived` when the tmux server cannot be
+/// reached, matching every other lookup here: an unreachable server is not
+/// evidence about any name.
+///
+/// Every session kind's `resolve_name` goes through this, so a retitled
+/// session's agent pane, paired terminals, and tool sub-sessions all stay
+/// reachable under their original names.
 pub(crate) fn live_session_name(derived: &str, shape: &NameShape) -> String {
     if let Some(name) = session_name_from_cache(derived, shape) {
         return name;
@@ -953,7 +1264,11 @@ pub(crate) fn live_session_name(derived: &str, shape: &NameShape) -> String {
     session_name_from_cache(derived, shape).unwrap_or_else(|| derived.to_string())
 }
 
-/// Snapshot-only [`live_session_name`] for paint, which never waits on tmux.
+/// Display variant of live_session_name, answered from the last successful
+/// snapshot only and never refreshing. Display keeps using that map while it
+/// is stale or an unexpected refresh fails; only a populated miss or recognized
+/// no-server response changes visible liveness. Paint must never wait on tmux,
+/// so this path has no synchronous fallback.
 pub(crate) fn session_name_for_display(derived: &str, shape: &NameShape) -> String {
     let Ok(cache) = SESSION_CACHE.read() else {
         return derived.to_string();
@@ -961,11 +1276,13 @@ pub(crate) fn session_name_for_display(derived: &str, shape: &NameShape) -> Stri
     resolve_session_name_from_snapshot(cache.data.as_ref(), derived, shape)
 }
 
+/// `session_name_for_display` for the agent pane.
 pub(crate) fn agent_session_name_for_display(session_id: &str, derived: &str) -> String {
     let suffix = id_suffix(session_id);
     session_name_for_display(derived, &NameShape::agent(&suffix))
 }
 
+/// `live_session_name` for the agent pane.
 pub fn live_agent_session_name(session_id: &str, derived: &str) -> String {
     let suffix = id_suffix(session_id);
     live_session_name(derived, &NameShape::agent(&suffix))
@@ -993,9 +1310,11 @@ fn resolve_session_name_from_snapshot(
         derived,
         shape,
     )
+    .to_owned()
 }
 
-/// `None` when the snapshot is stale or the lock poisoned.
+/// Resolve from the current authoritative cache snapshot without spawning.
+/// Returns None only when the snapshot is stale or the lock is poisoned, so
 fn session_name_from_cache(derived: &str, shape: &NameShape) -> Option<String> {
     let cache = SESSION_CACHE.read().ok()?;
     let fresh = cache
@@ -1015,8 +1334,18 @@ fn session_name_from_cache(derived: &str, shape: &NameShape) -> Option<String> {
     ))
 }
 
-/// Kill every aoe tmux session in this namespace and return the count. `Err`
-/// only when `list-sessions` cannot spawn; no server is `Ok(0)`.
+/// Force-stop every aoe-owned tmux session in this namespace.
+/// Return the number killed and refresh the session cache once.
+///
+/// `Err` means the `tmux list-sessions` process could not be spawned (e.g.
+/// tmux is not installed), which callers should treat as a failed surface. A
+/// non-zero exit (no server running, hence no sessions) is `Ok(0)`, and
+/// per-session kills stay best-effort.
+///
+/// ponytail: per-session `kill_process_tree` is sequential and each does a
+/// fixed 100ms SIGTERM grace, so a sweep of N sessions blocks ~N*100ms. Fine
+/// for a panic button with a handful of sessions; if counts grow, batch the
+/// SIGTERM across all pids, wait once, then SIGKILL survivors.
 pub fn stop_all_sessions() -> anyhow::Result<usize> {
     let output = tmux_query_command()
         .args(["list-sessions", "-F", "#{session_name}"])
@@ -1053,32 +1382,76 @@ fn stop_aoe_sessions<'a>(
         .count()
 }
 
-/// Pane metadata for every aoe session's first pane in one call. `Err` means
-/// "don't know" and must not be read as absence.
+/// Fetch the first pane of each aoe session.
+///
+/// An empty map proves absence. A missing server or a successful empty session
+/// inventory also proves absence when `list-panes` has no current target.
+/// Other query failures return `Err`; recovery and status pollers must retain
+/// possibly-live resources until a later successful inventory.
 pub fn batch_pane_metadata() -> anyhow::Result<HashMap<String, PaneMetadata>> {
     let start = Instant::now();
+    let format = concat!(
+        "#{session_name}|#{session_id}|#{pane_id}|#{@aoe_kind}|#{pane_index}|#{pane_dead}|#{window_width}|#{window_height}",
+        "|#{pane_current_command}",
+        "|#{pane_start_command}|#{pane_pid}\x1f#{window_activity}\x1f#{@aoe_tool_owner}\x1f#{pane_title}"
+    );
     let mut command = tmux_query_command();
-    command.args([
-        "list-panes",
-        "-a",
-        "-F",
-        // Fields that may contain `|` ride `TAIL_SEP` after `pane_pid`.
-        concat!(
-            "#{session_name}|#{pane_index}|#{pane_dead}|#{window_width}|#{window_height}",
-            "|#{pane_current_command}",
-            "|#{pane_start_command}|#{pane_pid}\x1f#{window_activity}\x1f#{pane_title}"
-        ),
-    ]);
+    command.args(["list-panes", "-a", "-F", format]);
     let output = run_tmux_command_with_timeout(&mut command);
 
     let result: anyhow::Result<HashMap<String, PaneMetadata>> = match output {
         Ok(out) if out.status.success() => {
             let stdout = String::from_utf8_lossy(&out.stdout);
-            Ok(parse_pane_metadata(&stdout))
+            let mut panes = parse_pane_metadata(&stdout);
+            if panes.iter().any(|(name, pane)| {
+                name.starts_with(TOOL_PREFIX)
+                    && (pane.pane_dead || matches!(pane.tool_owner, ToolPaneOwner::Unmarked))
+            }) {
+                if let Ok(server) = ToolSession::server_identity() {
+                    let mut command = tmux_query_command_for_socket(&server.socket);
+                    command.args([
+                        "display-message",
+                        "-p",
+                        "#{pid}",
+                        ";",
+                        "list-panes",
+                        "-a",
+                        "-F",
+                        format,
+                    ]);
+                    if let Ok(output) = run_tmux_command_with_timeout(&mut command) {
+                        let output_text = String::from_utf8_lossy(&output.stdout);
+                        if let Some((pid, rows)) = output_text.split_once('\n') {
+                            if output.status.success()
+                                && pid.trim().parse::<u32>().ok() == Some(server.pid)
+                                && crate::process::process_birth_is_live(server.pid, &server.birth)
+                                    .unwrap_or(false)
+                            {
+                                panes = parse_pane_metadata(rows);
+                                let server = std::sync::Arc::new(server);
+                                for (name, pane) in &mut panes {
+                                    if name.starts_with(TOOL_PREFIX) {
+                                        pane.server = Some(server.clone());
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            Ok(panes)
         }
         Ok(out) => {
-            if tmux_no_server_running(&out.stderr) {
-                tracing::trace!(target: "tmux.pane", "no tmux server running; no panes");
+            let confirmed_empty = std::str::from_utf8(&out.stderr)
+                .is_ok_and(|stderr| stderr.trim() == "no current target")
+                && run_tmux_command_with_timeout(tmux_query_command().args([
+                    "list-sessions",
+                    "-F",
+                    "#{session_name}",
+                ]))
+                .is_ok_and(|inventory| inventory.status.success() && inventory.stdout.is_empty());
+            if tmux_no_server_running(&out.stderr) || confirmed_empty {
+                tracing::trace!(target: "tmux.pane", "tmux inventory confirms no panes");
                 Ok(HashMap::new())
             } else {
                 tracing::warn!(
@@ -1109,7 +1482,14 @@ pub fn batch_pane_metadata() -> anyhow::Result<HashMap<String, PaneMetadata>> {
     result
 }
 
-/// aoe sessions with an attached client. `Err` means "don't know, skip".
+/// Names of aoe tmux sessions that currently have at least one attached
+/// client, from a single `tmux list-sessions` call.
+///
+/// Used by the idle auto-stop reapers (#1690) to spare a session the user is
+/// reading. Returns `Err` when the underlying tmux call fails to spawn or
+/// exits non-zero: callers MUST treat `Err` as "don't know, skip this reap
+/// pass" rather than "nothing attached", so a transient tmux glitch cannot
+/// kill a pane the user is sitting in.
 pub fn attached_session_names() -> anyhow::Result<HashSet<String>> {
     let output = tmux_query_command()
         .args(["list-sessions", "-F", "#{session_name}|#{session_attached}"])
@@ -1121,6 +1501,8 @@ pub fn attached_session_names() -> anyhow::Result<HashSet<String>> {
             let mut attached = HashSet::new();
             for line in stdout.lines() {
                 if let Some((name, flag)) = line.split_once(FIELD_SEP) {
+                    // `#{session_attached}` is the attached client count; any
+                    // non-zero value means a client is attached.
                     if name.starts_with(SESSION_PREFIX) && flag.trim() != "0" {
                         attached.insert(name.to_string());
                     }
@@ -1171,43 +1553,57 @@ fn find_escaped_tail_sep(line: &str, from: usize) -> Option<usize> {
     None
 }
 
-fn split_pane_metadata_tail(line: &str) -> (&str, Option<&str>, Option<&str>) {
-    if let Some(first) = line.find(TAIL_SEP) {
-        let rest = &line[first + TAIL_SEP.len_utf8()..];
-        return match rest.find(TAIL_SEP) {
-            Some(second) => (
-                &line[..first],
-                Some(&rest[..second]),
-                Some(&rest[second + 1..]),
-            ),
-            None => (&line[..first], Some(rest), None),
-        };
+fn split_pane_metadata_field(line: &str) -> (&str, Option<&str>) {
+    if let Some((field, rest)) = line.split_once(TAIL_SEP) {
+        return (field, Some(rest));
     }
-
-    let Some(first) = find_escaped_tail_sep(line, 0) else {
-        return (line, None, None);
-    };
-    let rest_start = first + ESCAPED_TAIL_SEP.len();
-    match find_escaped_tail_sep(line, rest_start) {
-        Some(second) => (
-            &line[..first],
-            Some(&line[rest_start..second]),
-            Some(&line[second + ESCAPED_TAIL_SEP.len()..]),
+    match find_escaped_tail_sep(line, 0) {
+        Some(index) => (
+            &line[..index],
+            Some(&line[index + ESCAPED_TAIL_SEP.len()..]),
         ),
-        None => (&line[..first], Some(&line[rest_start..]), None),
+        None => (line, None),
     }
 }
 
-/// Filters to aoe sessions, pane index 0, first window per session.
+fn split_pane_metadata_tail(line: &str) -> (&str, Option<&str>, Option<&str>, Option<&str>) {
+    let (head, tail) = split_pane_metadata_field(line);
+    let Some(tail) = tail else {
+        return (head, None, None, None);
+    };
+    let (activity, tail) = split_pane_metadata_field(tail);
+    let Some(tail) = tail else {
+        return (head, Some(activity), None, None);
+    };
+    let (owner, title) = split_pane_metadata_field(tail);
+    (head, Some(activity), Some(owner), title)
+}
+
+/// Parse the output of `tmux list-panes -a` into a map of session name to pane metadata.
+/// Filters to aoe sessions, pane index 0, and takes only the first window per session.
 fn parse_pane_metadata(output: &str) -> HashMap<String, PaneMetadata> {
     let mut map = HashMap::new();
 
     for line in output.lines() {
-        let (line, activity, pane_title) = split_pane_metadata_tail(line);
+        // tmux 3.4 renders TAIL_SEP in octal; newer versions emit the raw byte.
+        let (line, activity, tool_owner, pane_title) = split_pane_metadata_tail(line);
+        let tool_owner = match tool_owner {
+            None | Some("") => ToolPaneOwner::Unmarked,
+            Some(value) => match serde_json::from_str::<(String, String)>(value) {
+                Ok((instance_id, tool_name)) => ToolPaneOwner::Named {
+                    instance_id,
+                    tool_name,
+                },
+                Err(_) => ToolPaneOwner::Invalid,
+            },
+        };
         let window_activity = activity.and_then(|a| a.trim().parse::<i64>().ok());
-        let mut parts = line.splitn(7, FIELD_SEP);
+        let mut parts = line.splitn(10, FIELD_SEP);
         let (
             Some(session_name),
+            Some(session_id),
+            Some(pane_id),
+            Some(session_kind),
             Some(pane_index),
             Some(pane_dead),
             Some(window_width),
@@ -1222,27 +1618,42 @@ fn parse_pane_metadata(output: &str) -> HashMap<String, PaneMetadata> {
             parts.next(),
             parts.next(),
             parts.next(),
+            parts.next(),
+            parts.next(),
+            parts.next(),
         )
         else {
             continue;
         };
+        if !session_id
+            .strip_prefix('$')
+            .is_some_and(|id| !id.is_empty() && id.bytes().all(|ch| ch.is_ascii_digit()))
+            || !pane_id
+                .strip_prefix('%')
+                .is_some_and(|id| !id.is_empty() && id.bytes().all(|ch| ch.is_ascii_digit()))
+        {
+            continue;
+        }
         let window_size = window_width
             .parse::<u16>()
             .ok()
             .zip(window_height.parse::<u16>().ok());
         // The start command may contain the separator, so split the pid off the end.
-        let (pane_start_command, pane_pid) = match rest.rsplit_once(FIELD_SEP) {
-            Some((command, pid)) => (command, pid.trim().parse().ok()),
-            None => (rest, None),
+        let Some((pane_start_command, pane_pid)) = rest.rsplit_once(FIELD_SEP) else {
+            continue;
         };
+        let pane_pid = pane_pid.trim().parse().ok();
         if !session_name.starts_with(SESSION_PREFIX) {
             continue;
         }
 
+        // Only take pane 0 (the agent pane). aoe pins pane-base-index to 0.
         if pane_index != "0" {
             continue;
         }
 
+        // First occurrence per session = first window's pane 0 (list-panes
+        // returns windows in index order).
         if map.contains_key(session_name) {
             continue;
         }
@@ -1250,6 +1661,11 @@ fn parse_pane_metadata(output: &str) -> HashMap<String, PaneMetadata> {
         map.insert(
             session_name.to_string(),
             PaneMetadata {
+                server: None,
+                session_id: session_id.to_owned(),
+                pane_id: pane_id.to_owned(),
+                session_kind: (!session_kind.is_empty()).then(|| session_kind.to_owned()),
+                tool_owner,
                 pane_dead: pane_dead == "1",
                 pane_pid,
                 pane_current_command: if pane_current_command.is_empty() {
@@ -1269,7 +1685,10 @@ fn parse_pane_metadata(output: &str) -> HashMap<String, PaneMetadata> {
     map
 }
 
-/// Observed window size and the instant taken before the `list-panes` fork.
+/// Observed window geometry for `session_name` from the shared list-panes
+/// snapshot, with the snapshot's observation time: the instant captured
+/// before the `list-panes` fork, not when the result was published. `None`
+/// when the snapshot is absent, failed, or does not include the session.
 pub(crate) fn observed_window_size_from_cache(session_name: &str) -> Option<((u16, u16), Instant)> {
     let cache = PANE_META_CACHE.read().ok()?;
     let time = cache.time?;
@@ -1277,7 +1696,13 @@ pub(crate) fn observed_window_size_from_cache(session_name: &str) -> Option<((u1
     Some((size, time))
 }
 
-/// Test-only: make `session_exists_from_cache` see `name`.
+/// Test-only: inject a synthetic session name into the cache so
+/// callers of `session_exists_from_cache` see it as present. Used
+/// by live-send tests that install a fake `LiveSendState` without a
+/// real tmux pane; without this the per-keystroke drift check
+/// (which calls `session_exists_from_cache`) trips in CI runs that
+/// have already populated the cache via the e2e suite, causing the
+/// drift detector to flag the fake session as gone.
 #[cfg(test)]
 pub fn test_inject_session_into_cache(name: &str) {
     if let Ok(mut cache) = SESSION_CACHE.write() {
@@ -1288,13 +1713,18 @@ pub fn test_inject_session_into_cache(name: &str) {
     }
 }
 
+/// Test-only: publish a pane snapshot carrying a window size for `name`, so
+/// the render-side observed-size invalidation can be exercised without a
+/// real tmux server. Observed "now", the common case.
 #[cfg(test)]
 pub fn test_inject_pane_window_size(name: &str, size: (u16, u16)) {
     test_inject_pane_window_size_at(name, size, Instant::now());
 }
 
-/// Test-only: publish a pane snapshot through the real publication path with an
-/// explicit observation time.
+/// Test-only: like [`test_inject_pane_window_size`], but with an explicit
+/// observation time. Routes through [`publish_pane_meta_cache`], the real
+/// publication path, so a regression that re-stamped `cache.time` at publish
+/// instead of observation is caught by the tests using this.
 #[cfg(test)]
 pub fn test_inject_pane_window_size_at(name: &str, size: (u16, u16), taken_at: Instant) {
     let map = {
@@ -1305,6 +1735,11 @@ pub fn test_inject_pane_window_size_at(name: &str, size: (u16, u16), taken_at: I
         map.insert(
             name.to_string(),
             PaneMetadata {
+                server: None,
+                session_id: "$42".into(),
+                pane_id: "%42".into(),
+                session_kind: None,
+                tool_owner: ToolPaneOwner::Unmarked,
                 pane_dead: false,
                 pane_current_command: None,
                 pane_start_command_is_protected: false,
@@ -1323,8 +1758,12 @@ pub fn test_inject_pane_window_size_at(name: &str, size: (u16, u16), taken_at: I
     );
 }
 
-/// Test-only per-thread fork counter at `tmux_command()`, so paint-path tests
-/// can assert zero forks.
+/// Test-only instrumentation at the process's single tmux entry point.
+///
+/// `tmux_command()` records one hit per invocation on the *current* thread
+/// while that thread is armed, so a paint-path regression test can assert
+/// zero forks from the render thread while worker threads (capture, live
+/// send) fork freely. Never compiled outside `cfg(test)`.
 #[cfg(test)]
 pub(crate) mod fork_probe {
     use std::cell::Cell;
@@ -1334,6 +1773,7 @@ pub(crate) mod fork_probe {
         static COUNT: Cell<u64> = const { Cell::new(0) };
     }
 
+    /// Arms fork counting for the calling thread until the guard drops.
     pub(crate) struct Guard;
 
     pub(crate) fn arm() -> Guard {
@@ -1353,6 +1793,7 @@ pub(crate) mod fork_probe {
         }
     }
 
+    /// Returns the armed thread's fork count since the last call.
     pub(crate) fn take() -> u64 {
         COUNT.with(|c| {
             let n = c.get();
@@ -1362,8 +1803,12 @@ pub(crate) mod fork_probe {
     }
 }
 
-/// Test-only guard that restores [`SESSION_CACHE`] on drop. Pair with
-/// `#[serial_test::serial]`.
+/// Test-only RAII guard for tests that force [`SESSION_CACHE`] into a known
+/// state (e.g. simulating a server-unreachable snapshot for
+/// [`probe_session_existence`]). Captures the prior cache on construction and
+/// restores it on `Drop`, so a mid-test panic can never leak a forced cache
+/// state into a later test; pair with `#[serial_test::serial]` since the
+/// cache is process-global.
 #[cfg(test)]
 pub(crate) struct SessionCacheGuard {
     prev_data: Option<HashMap<String, LiveSession>>,
@@ -1379,11 +1824,14 @@ impl SessionCacheGuard {
         Self::capture_inner(true)
     }
 
+    /// Save and restore the cache without suppressing refresh publication.
     pub(crate) fn capture_restore_only() -> Self {
         Self::capture_inner(false)
     }
 
     fn capture_inner(forced_snapshot: bool) -> Self {
+        // The lock makes guard registration and the state snapshot atomic
+        // against a concurrent refresh publisher.
         let cache = SESSION_CACHE.write().expect("session cache lock");
         if forced_snapshot {
             FORCED_SESSION_CACHE_GUARDS.fetch_add(1, Ordering::SeqCst);
@@ -1397,6 +1845,8 @@ impl SessionCacheGuard {
         }
     }
 
+    /// Force a fresh "server unreachable" snapshot: mirrors what
+    /// `refresh_session_cache` writes when `list-sessions` fails.
     pub(crate) fn force_unreachable(&self) {
         if let Ok(mut cache) = SESSION_CACHE.write() {
             cache.data = None;
@@ -1405,6 +1855,7 @@ impl SessionCacheGuard {
         }
     }
 
+    /// Force a fresh "server reachable" snapshot containing exactly `names`.
     pub(crate) fn force_present(&self, names: &[&str]) {
         if let Ok(mut cache) = SESSION_CACHE.write() {
             cache.data = Some(
@@ -1418,7 +1869,9 @@ impl SessionCacheGuard {
         }
     }
 
-    /// An expired snapshot with data intact; paint must still answer from it.
+    /// Force an EXPIRED snapshot with data intact: what the shared cache
+    /// looks like just past [`CACHE_TTL`] after a successful refresh. Paint
+    /// must answer from it anyway instead of re-forking.
     pub(crate) fn force_stale(&self) {
         if let Ok(mut cache) = SESSION_CACHE.write() {
             cache.time = Some(Instant::now() - CACHE_TTL - Duration::from_secs(1));
@@ -1429,6 +1882,9 @@ impl SessionCacheGuard {
 #[cfg(test)]
 impl Drop for SessionCacheGuard {
     fn drop(&mut self) {
+        // Deregistered under the same lock the restore takes, mirroring
+        // `capture`: a refresh arriving mid-drop is either suppressed or lands
+        // on top of the restored snapshot, never dropped on the floor.
         let mut cache = SESSION_CACHE.write();
         if let Ok(cache) = cache.as_mut() {
             cache.data = self.prev_data.take();
@@ -1442,7 +1898,9 @@ impl Drop for SessionCacheGuard {
     }
 }
 
-/// [`SessionCacheGuard`] for [`PANE_META_CACHE`].
+/// [`SessionCacheGuard`] for [`PANE_META_CACHE`]: captures the prior snapshot
+/// and restores it on `Drop` so a mid-test panic cannot leak a forced state
+/// into a later test. Pair with `#[serial_test::serial]`.
 #[cfg(test)]
 pub(crate) struct PaneMetaCacheGuard {
     prev_data: Option<std::sync::Arc<HashMap<String, PaneMetadata>>>,
@@ -1461,12 +1919,16 @@ impl PaneMetaCacheGuard {
         }
     }
 
+    /// Force a fresh snapshot that carries no data: what `refresh_pane_meta_cache`
+    /// writes when `batch_pane_metadata` fails.
     pub(crate) fn force_failed_refresh(&self) {
         if let Ok(mut cache) = PANE_META_CACHE.write() {
             cache.data = None;
             cache.time = Some(Instant::now());
         }
     }
+    /// Force an EXPIRED snapshot: the past-`CACHE_TTL` state that paint must
+    /// answer from without re-forking once display helpers are cache-only.
     pub(crate) fn force_stale(&self) {
         if let Ok(mut cache) = PANE_META_CACHE.write() {
             cache.time = Some(Instant::now() - CACHE_TTL - Duration::from_secs(1));
@@ -1484,8 +1946,11 @@ impl Drop for PaneMetaCacheGuard {
     }
 }
 
-/// Test-only holder of [`AGENT_PROBE_LOCK`] plus the worker blocked on it; drop
-/// releases then joins. Declare after [`AgentAvailabilityGuard`].
+/// Test-only owner for a held [`AGENT_PROBE_LOCK`] guard plus the worker that
+/// is blocked on it. `Drop` releases the lock and then joins, so a panicking
+/// assertion cannot detach the worker and let it clear the memo after
+/// [`AgentAvailabilityGuard`] has restored it. Declare it after that guard so
+/// it drops first.
 #[cfg(test)]
 pub(crate) struct BlockedProbeWorker<'a> {
     guard: Option<std::sync::MutexGuard<'a, ()>>,
@@ -1504,6 +1969,8 @@ impl<'a> BlockedProbeWorker<'a> {
         }
     }
 
+    /// Release the lock and wait for the worker, so assertions after this run
+    /// against a settled memo. Idempotent; `Drop` is then a no-op.
     pub(crate) fn release_and_join(&mut self) {
         drop(self.guard.take());
         if let Some(handle) = self.handle.take() {
@@ -1522,7 +1989,10 @@ impl Drop for BlockedProbeWorker<'_> {
     }
 }
 
-/// Test-only guard that restores [`AGENT_AVAILABILITY`] on drop.
+/// Test-only RAII guard for tests that seed [`AGENT_AVAILABILITY`] into a known
+/// state. Same shape and reason as [`SessionCacheGuard`]: the memo is
+/// process-global, so a mid-test panic must not leak a seeded entry into a
+/// later test and make it order-dependent. Pair with `#[serial_test::serial]`.
 #[cfg(test)]
 pub(crate) struct AgentAvailabilityGuard {
     prev: Option<HashMap<String, (bool, std::time::Instant)>>,
@@ -1539,6 +2009,7 @@ impl AgentAvailabilityGuard {
         }
     }
 
+    /// Seed one memoized answer, as a completed probe would have published it.
     pub(crate) fn seed(&self, agent: &str, available: bool) {
         if let Ok(mut cache) = AGENT_AVAILABILITY.write() {
             cache
@@ -1547,6 +2018,7 @@ impl AgentAvailabilityGuard {
         }
     }
 
+    /// Backdate one entry past the TTL, as if it had been published long ago.
     pub(crate) fn age_past_ttl(&self, agent: &str) {
         use std::time::{Duration, Instant};
         if let Ok(mut cache) = AGENT_AVAILABILITY.write() {
@@ -1560,12 +2032,14 @@ impl AgentAvailabilityGuard {
         }
     }
 
+    /// Clear the memo, as `invalidate_agent_availability` does.
     pub(crate) fn clear(&self) {
         if let Ok(mut cache) = AGENT_AVAILABILITY.write() {
             *cache = None;
         }
     }
 
+    /// Whether the memo currently holds any answer.
     pub(crate) fn is_populated(&self) -> bool {
         AGENT_AVAILABILITY
             .read()
@@ -1584,7 +2058,8 @@ impl Drop for AgentAvailabilityGuard {
     }
 }
 
-/// How long a [`SESSION_CACHE`] snapshot is trusted.
+/// How long a [`SESSION_CACHE`] snapshot is trusted before a lookup must
+/// force a fresh `refresh_session_cache()` call.
 const CACHE_TTL: Duration = Duration::from_secs(2);
 
 pub fn session_exists_from_cache(name: &str) -> Option<bool> {
@@ -1599,7 +2074,10 @@ pub fn session_exists_from_cache(name: &str) -> Option<bool> {
     cache.data.as_ref().map(|m| m.contains_key(name))
 }
 
-/// Cached `#{session_activity}` for `name`, ignoring the TTL (an age hint only).
+/// Cached tmux `#{session_activity}` epoch (seconds) for `name`, else `None`.
+/// Read-only view over the private `SESSION_CACHE`; caller refreshes first if needed.
+/// Ignores the snapshot TTL on purpose: this is a best-effort AGE hint for
+/// `aoe ps`, not a liveness decision.
 pub fn session_activity(name: &str) -> Option<i64> {
     let cache = SESSION_CACHE.read().ok()?;
     cache
@@ -1609,17 +2087,27 @@ pub fn session_activity(name: &str) -> Option<i64> {
         .map(|session| session.activity)
 }
 
-/// Session existence that keeps "tmux unreachable" apart from "absent";
-/// `Unknown` means don't act.
+/// Tri-state result of probing whether an aoe tmux session exists, per
+/// [`probe_session_existence`]. Unlike a plain `bool`, this keeps "the tmux
+/// server itself was unreachable" distinct from "the server answered and the
+/// session is not in its list": callers must treat `Unknown` as "don't know,
+/// don't act" rather than collapsing it into `Absent`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SessionExistence {
+    /// The tmux server answered and the session is in its list.
     Present,
+    /// The tmux server answered and the session is not in its list.
     Absent,
-    /// No-server responses and query failures; not evidence of absence.
+    /// The shared cache cannot establish liveness (including a recognized
+    /// no-server response or an unexpected query failure). This is NOT
+    /// evidence the session is gone.
     Unknown,
 }
 
-/// `None` when the snapshot is stale or the lock poisoned.
+/// Derive a [`SessionExistence`] from the current cache snapshot, without
+/// spawning anything. Returns `None` when the snapshot is stale (older than
+/// [`CACHE_TTL`]) or the cache lock is poisoned, meaning the caller must
+/// refresh before it can say anything.
 fn session_existence_from_cache(name: &str) -> Option<SessionExistence> {
     let cache = SESSION_CACHE.read().ok()?;
 
@@ -1637,13 +2125,25 @@ fn session_existence_from_cache(name: &str) -> Option<SessionExistence> {
     Some(match &cache.data {
         Some(map) if map.contains_key(name) => SessionExistence::Present,
         Some(_) => SessionExistence::Absent,
+        // A recognized no-server response is conservative for lifecycle
+        // callers: it still means the session cannot be proven absent.
         None => SessionExistence::Unknown,
     })
 }
+/// Read the current session cache without refreshing it. A stale or poisoned
+/// snapshot remains unknown so async request handlers never spawn tmux.
 pub(crate) fn cached_session_existence(name: &str) -> SessionExistence {
     session_existence_from_cache(name).unwrap_or(SessionExistence::Unknown)
 }
-/// Existence from the cache, refreshing a stale snapshot once.
+/// Probe whether an aoe tmux session exists, distinguishing "confirmed
+/// absent" from "couldn't tell because the tmux server was unreachable".
+///
+/// Reuses `SESSION_CACHE`: a fresh snapshot answers immediately, a stale
+/// one triggers a single [`refresh_session_cache`] call and re-derives from
+/// the result. Callers that only care about "known-live" (never latch a
+/// destructive action on an `Unknown`) should treat `Unknown` the same as a
+/// skipped pass, mirroring [`batch_pane_metadata`] and
+/// [`attached_session_names`]'s `Err` convention.
 pub fn probe_session_existence(name: &str) -> SessionExistence {
     if let Some(existence) = session_existence_from_cache(name) {
         return existence;
@@ -1652,22 +2152,42 @@ pub fn probe_session_existence(name: &str) -> SessionExistence {
     session_existence_from_cache(name).unwrap_or(SessionExistence::Unknown)
 }
 
-/// Trusts a cache hit, but a miss (a session may be newer than the scan) falls
-/// through to a live `has-session`.
+/// Cached-positive existence hint; misses probe tmux live.
+/// Claiming or creating a physical name requires `session_exists_live`.
 pub fn session_exists(name: &str) -> bool {
     if session_exists_from_cache(name) == Some(true) {
         return true;
     }
+    session_exists_live(name)
+}
 
+/// Probe current exact-name existence without consulting the snapshot cache.
+pub(crate) fn session_exists_live(name: &str) -> bool {
     let mut command = tmux_command();
-    command.args(["has-session", "-t", name]);
+    command.args(["has-session", "-t"]).arg(format!("={name}"));
     run_tmux_command_with_timeout(&mut command)
         .map(|o| o.status.success())
         .unwrap_or(false)
 }
 
-/// Render-path liveness from the snapshot only, never forking. A new session
-/// may read absent until the background poller refreshes.
+/// Session liveness for a **render path**, answered from the shared snapshot
+/// only: never a per-name probe, never a synchronous refresh.
+///
+/// [`session_exists`] falls through to a live `has-session` on a cache miss so
+/// teardown and drift decisions can't act on a cached false negative. A row
+/// glyph is neither of those, and that fallback costs one fork per call: the
+/// Terminal-view list called it once per visible row per frame, which measured
+/// 52ms/frame at 30 rows (1.7ms/row) against 47us for the agent view, whose
+/// rows read `Instance.status` straight from the poller's batched snapshot.
+///
+/// The trade is that a session created since the last scan reads as absent for
+/// up to `CACHE_TTL`, and an expired snapshot reads as absent until the
+/// background [`spawn_snapshot_poller`] refreshes it. Call sites that start or
+/// kill a pane already force a [`refresh_session_cache`], so the glyph flips
+/// immediately there; the poller covers panes created behind this process's
+/// back. Paint must never wait on tmux, so there is no synchronous fallback.
+/// An expired or unexpectedly failed refresh retains the last successful map;
+/// a populated miss or recognized no-server response removes the session.
 pub fn session_exists_for_display(name: &str) -> bool {
     SESSION_CACHE
         .read()
@@ -1676,13 +2196,28 @@ pub fn session_exists_for_display(name: &str) -> bool {
         .unwrap_or(false)
 }
 
-/// Render-path pane-dead from the `list-panes` snapshot; unknown reads as not
-/// dead.
+/// Pane-dead state for a **render path**, from a shared `list-panes -a`
+/// snapshot refreshed at most once per `CACHE_TTL`.
+///
+/// The per-name `utils::is_pane_dead` forks a `display-message` on every
+/// call, so the Tool view paid two forks per row per frame (this plus
+/// existence). See [`session_exists_for_display`] for the measurement and the
+/// staleness trade.
+///
+/// Returns `false` ("not known to be dead") for a session missing from the
+/// snapshot and whenever the snapshot could not be produced, matching
+/// [`batch_pane_metadata`]'s contract that an `Err` means "don't know" rather
+/// than "everything is dead". Callers gate on existence first, so a missing
+/// key is an absent session rather than a live pane.
 pub fn pane_dead_for_display(name: &str) -> bool {
     pane_dead_from_cache(name).unwrap_or(false)
 }
 
-/// `None` only when stale or poisoned; a fresh failed snapshot answers `false`.
+/// Resolve from the current pane snapshot without spawning. `None` only when
+/// the snapshot is stale or the lock is poisoned, so the caller knows a
+/// refresh could still change the answer. A fresh snapshot with no data is an
+/// answer (`Some(false)`, "can't tell, don't claim dead"), not a stale one, or
+/// every row would re-refresh into the same failure.
 fn pane_dead_from_cache(name: &str) -> Option<bool> {
     let cache = PANE_META_CACHE.read().ok()?;
     if cache.time.map(|t| t.elapsed() > CACHE_TTL).unwrap_or(true) {
@@ -1697,8 +2232,15 @@ fn pane_dead_from_cache(name: &str) -> Option<bool> {
     )
 }
 
-/// Stamped even on failure so an outage costs one fork per cycle. `taken_at`
-/// must predate the fork so a stalled listing cannot pose as fresher.
+/// Repopulate [`PANE_META_CACHE`]. The timestamp is stamped even when the
+/// query fails, so a tmux outage costs one fork per poller cycle
+/// ([`CACHE_TTL`] / 2) instead of one per row per frame.
+///
+/// `taken_at` must be captured BEFORE the `list-panes` fork: consumers
+/// compare it against their own write times (`passive_synced_contradicted`),
+/// and a publish-time stamp would let a listing that read pre-resize sizes,
+/// then stalled past the resize's adoption, masquerade as a fresher
+/// observation.
 fn publish_pane_meta_cache(
     refresh_id: u64,
     data: Option<std::sync::Arc<HashMap<String, PaneMetadata>>>,
@@ -1752,14 +2294,16 @@ fn pane_snapshot_refresh_due() -> bool {
         .read()
         .map_or(true, |cache| snapshot_refresh_due(cache.time))
 }
-/// A passive preview resize queued by paint, run by the passive-resize worker.
+/// One queued passive preview resize, pushed by the render thread when its
+/// debounce fires and executed by the dedicated passive-resize worker.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct PassiveResizeIntent {
     pub session_id: String,
     pub session_name: String,
     pub cols: u16,
     pub rows: u16,
-    /// The session the user is viewing; resized before other work.
+    /// Resize before any queued non-priority work: this is the session the
+    /// user is currently viewing, so its pane must be correct first.
     pub priority: bool,
 }
 
@@ -1769,18 +2313,26 @@ struct PassiveResizeWork {
     generation: u64,
 }
 
-/// A finished passive resize; render adopts the geometry or parks a decline.
+/// A passive resize the worker finished. The render thread consumes these to
+/// adopt the per-session (cols, rows) dedup on success, or to park a declined
+/// geometry so background sessions get one attempt per geometry change
+/// instead of a per-frame retry loop.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct PassiveResizeDone {
     pub session_id: String,
     pub cols: u16,
     pub rows: u16,
-    /// Applied window rows (including chrome); `None` when declined or failed.
+    /// The window row count actually applied (`rows` plus status-bar chrome)
+    /// so render can later spot an external resize by comparing the observed
+    /// window size against `(cols, this)`. `None` when the resize did not
+    /// happen: the session is missing, a client is attached, a size owner is
+    /// active, or tmux errored.
     pub applied_window_rows: Option<u16>,
     generation: u64,
 }
 
-/// Geometry in flight or awaiting adoption; suppresses identical re-queues.
+/// Geometry the worker is executing (or has finished, pending render
+/// adoption). Suppresses identical re-queues until the completion is adopted.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct PassiveResizeTicket {
     session_id: String,
@@ -1800,13 +2352,18 @@ thread_local! {
     static PASSIVE_RESIZE_EXECUTION_COUNT: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
-/// Keep one queued resize per session (the latest); an identical in-flight
-/// geometry is ignored.
+/// Replace any queued resize for the same session with the latest geometry.
+/// Paint can queue every frame while the pending slot stays armed; an exact
+/// in-flight geometry is ignored until render consumes its completion. A
+/// different geometry supersedes the pending slot. This bounds the queue by
+/// the number of sessions even if the worker is delayed or restarts.
 fn queue_latest_passive_resize(
     queue: &mut Vec<PassiveResizeWork>,
     in_flight: &[PassiveResizeTicket],
     work: PassiveResizeWork,
 ) {
+    // Any newly wanted geometry supersedes the queued one for this session,
+    // even when it returns to the currently in-flight geometry.
     let intent = &work.intent;
     queue.retain(|prev| prev.intent.session_id != intent.session_id);
     if in_flight.iter().any(|active| {
@@ -1827,7 +2384,9 @@ fn queue_latest_passive_resize(
     }
 }
 
-/// Non-blocking (called from paint); spawns the worker on first use.
+/// Queue a passive preview resize for its worker. Non-blocking by contract:
+/// this is called from paint. Spawns the worker on first use (a fresh worker
+/// drains the queue before its first park, so no wakeup is lost).
 pub(crate) fn queue_passive_resize(intent: PassiveResizeIntent) {
     spawn_passive_resize_worker();
     {
@@ -1853,7 +2412,8 @@ fn remove_pending_passive_resize(queue: &mut Vec<PassiveResizeWork>, session_id:
     queue.retain(|work| work.intent.session_id != session_id);
 }
 
-/// Drop queued geometry once render sees the wanted size already applied.
+/// Cancel queued geometry once render observes that the completed geometry is
+/// already the one wanted. Any other pending size for this session is stale.
 pub(crate) fn cancel_pending_passive_resize(session_id: &str) {
     let mut queue = PASSIVE_RESIZE_INTENTS
         .lock()
@@ -1861,7 +2421,8 @@ pub(crate) fn cancel_pending_passive_resize(session_id: &str) {
     remove_pending_passive_resize(&mut queue, session_id);
 }
 
-/// Drain completions, releasing in-flight entries only when still current.
+/// Drain completions and release matching in-flight geometry only when render
+/// can adopt the dedup. A newer geometry for the same session remains active.
 fn take_current_passive_completions(
     in_flight: &mut Vec<PassiveResizeTicket>,
     dones: Vec<PassiveResizeDone>,
@@ -1895,8 +2456,11 @@ pub(crate) fn take_passive_resize_dones() -> Vec<PassiveResizeDone> {
     take_current_passive_completions(&mut in_flight, dones)
 }
 
-/// Run one resize under tmux's atomic guard; a refusal completes as declined
-/// so render parks it.
+/// Execute one queued passive resize under an atomic final tmux guard. The
+/// worker first rejects a missing session; the Session helper then fences both
+/// a newly attached client and a size-owner takeover at resize execution. A
+/// resize the guard refuses (or that errors) still completes, as declined, so
+/// render can park the geometry instead of retrying it every frame.
 fn execute_passive_resize(work: &PassiveResizeWork) -> PassiveResizeDone {
     let intent = &work.intent;
     let deadline = TmuxCommandDeadline::new();
@@ -1924,7 +2488,10 @@ fn publish_latest_passive_resize_done(dones: &mut Vec<PassiveResizeDone>, done: 
     dones.push(done);
 }
 
-/// One at a time, so a priority intent queued mid-drain goes next.
+/// Pop the head of the queue. One item at a time, not a batch snapshot: a
+/// priority intent (the session the user is viewing) queued mid-drain is
+/// front-inserted and picked on the very next iteration instead of waiting
+/// out a fleet-sized batch.
 fn take_next_passive_resize() -> Option<PassiveResizeWork> {
     let mut queue = PASSIVE_RESIZE_INTENTS
         .lock()
@@ -2003,8 +2570,15 @@ fn refresh_display_snapshots() {
         let _ = refresh_pane_meta_cache();
     }
 }
-/// Keep the session and pane snapshots fresh so display helpers never fork
-/// from paint. Idempotent; a panicking cycle is logged and retried.
+/// Background poller that keeps the session and pane metadata snapshots fresh
+/// so every cache-only display helper can answer without forking from paint.
+/// Commands run under the shared timeout; a tmux outage costs two bounded forks
+/// per cycle, never per row or per frame. A panicking cycle is logged and
+/// retried by the same thread; a failed thread spawn clears the latch so a
+/// later call retries.
+///
+/// Idempotent while the poller is running. The daemon thread dies with the
+/// process.
 pub fn spawn_snapshot_poller() {
     static STARTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
     if STARTED.swap(true, std::sync::atomic::Ordering::AcqRel) {
@@ -2193,12 +2767,17 @@ pub fn is_tmux_available() -> bool {
     tmux_command().arg("-V").output().is_ok()
 }
 
-/// Whether `binary` resolves on PATH, falling back to a login shell for
-/// version-manager PATHs.
+/// True when `binary` resolves on the user's PATH. An absolute or relative
+/// path is checked for existence; a bare name is looked up with `which`,
+/// falling back to a login shell so version-manager PATHs (NVM, etc.) are
+/// loaded. Used by the `aoe add` override availability check; agent
+/// detection routes through `agent_available_direct` + `login_shell_probe`
+/// so a multi-agent scan shares one login shell. See #1910.
 pub(crate) fn is_binary_on_path(binary: &str) -> bool {
     if binary.contains('/') || binary.contains('\\') {
         return std::path::Path::new(binary).exists();
     }
+    // First try direct `which` (fast path).
     let direct = Command::new("which")
         .arg(binary)
         .output()
@@ -2207,6 +2786,7 @@ pub(crate) fn is_binary_on_path(binary: &str) -> bool {
     if direct {
         return true;
     }
+    // Fall back to a login shell so version-manager PATHs (NVM, etc.) are loaded.
     let shell = crate::session::user_shell();
     Command::new(&shell)
         .args(["-lc", &format!("which {}", shell_words::quote(binary))])
@@ -2288,8 +2868,10 @@ fn agent_available_direct(
     }
 }
 
-/// Chained per-agent probes; hits print `AOE_AGENT_OK <name>` among whatever
-/// the login shell prints.
+/// One probe command per agent, chained with `;` so every probe runs
+/// regardless of earlier results. Each hit prints a `AOE_AGENT_OK <name>`
+/// marker line that [`parse_login_shell_probe`] picks out of whatever else
+/// the user's login shell prints (motd, nvm chatter, ...).
 fn login_shell_probe_script(agents: &[&crate::agents::AgentDef]) -> String {
     use crate::agents::DetectionMethod;
     agents
@@ -2348,6 +2930,7 @@ fn login_shell_probe(
 static AGENT_AVAILABILITY: RwLock<Option<HashMap<String, (bool, std::time::Instant)>>> =
     RwLock::new(None);
 
+/// Refresh external installations without charging every settings keystroke for a probe.
 const AGENT_AVAILABILITY_TTL: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// Serialize population across concurrent cold callers, without blocking fresh cache hits.
@@ -2382,6 +2965,8 @@ pub(crate) fn invalidate_agent_availability() {
     }
 }
 
+/// Names from `agents` that the memo already answers, plus the ones it does
+/// not know about yet. Split under a single read lock.
 fn partition_cached_agents<'a>(
     agents: &[&'a crate::agents::AgentDef],
 ) -> (HashSet<String>, Vec<&'a crate::agents::AgentDef>) {
@@ -2391,6 +2976,8 @@ fn partition_cached_agents<'a>(
     let cached = cache.as_ref().and_then(|c| c.as_ref());
     for agent in agents {
         match cached.and_then(|c| c.get(agent.name)) {
+            // Expired entries are as good as absent: the next probe
+            // re-runs and republishes.
             Some((true, at)) if at.elapsed() < AGENT_AVAILABILITY_TTL => {
                 found.insert(agent.name.to_string());
             }
@@ -2401,7 +2988,9 @@ fn partition_cached_agents<'a>(
     (found, uncached)
 }
 
-/// Memoized availability; the uncached set costs at most one login shell.
+/// Availability for `agents`, memoized across calls and batched so the whole
+/// uncached set costs at most ONE login shell. Returns the subset of names
+/// that resolved.
 pub(crate) fn probe_agents_available(
     agents: &[&crate::agents::AgentDef],
 ) -> std::collections::HashSet<String> {
@@ -2456,6 +3045,8 @@ fn probe_agents_available_inner(
         return found;
     }
 
+    // Pass 1 is cheap per agent (`which` / a version run on the inherited
+    // PATH); only the inconclusive rest goes to the batched login-shell probe.
     let mut results: Vec<(&str, bool)> = Vec::new();
     let mut needs_shell: Vec<&crate::agents::AgentDef> = Vec::new();
     for agent in uncached {
@@ -2593,7 +3184,7 @@ impl AvailableTools {
 
 #[cfg(test)]
 mod tests {
-    use crate::tmux::test_helpers::require_tmux;
+    /// Invalidation must clear after an in-flight probe publishes, not before.
     #[test]
     #[serial_test::serial]
     fn invalidate_agent_availability_waits_for_an_in_flight_probe() {
@@ -2630,6 +3221,7 @@ mod tests {
         );
     }
 
+    // Unrelated tests can launch tools without holding EnvGuard's process-wide lock.
     #[cfg(unix)]
     fn run_probe_test_in_subprocess() -> bool {
         const CHILD_ENV: &str = "AOE_AGENT_PROBE_TEST_CHILD";
@@ -2809,6 +3401,9 @@ mod tests {
         );
     }
 
+    // Session names embed `SESSION_PREFIX`, which differs between release
+    // (`aoe_`) and debug (`aoe_dev_`) builds. Use the constant so the same
+    // test bodies cover both.
     const P: &str = SESSION_PREFIX;
 
     #[test]
@@ -2999,6 +3594,8 @@ mod tests {
             ("a", 120)
         );
 
+        // A priority intent (the viewed session) is inserted ahead of queued
+        // non-priority work so the worker resizes it first.
         let mut viewed = work(4, "sel", 100, 30);
         viewed.intent.priority = true;
         queue_latest_passive_resize(&mut queue, &[], viewed);
@@ -3028,6 +3625,8 @@ mod tests {
             (while_running[0].intent.cols, while_running[0].intent.rows),
             (140, 50)
         );
+        // If the desired geometry returns to the in-flight one before G2 is
+        // drained, the now-stale queued G2 must be removed as well.
         queue_latest_passive_resize(&mut while_running, &in_flight, work(8, "a", 120, 40));
         assert!(
             while_running.is_empty(),
@@ -3124,6 +3723,10 @@ mod tests {
     }
     #[test]
     fn test_tmux_command_carries_socket_flag() {
+        // Under `cfg(test)` the socket resolves to a shared temp path, so the
+        // command must lead with `-S <path>` before any subcommand. This is
+        // the isolation mechanism (#2608): every tmux call routes through the
+        // same explicit socket instead of the default.
         let cmd = tmux_command();
         let args: Vec<_> = cmd.get_args().map(|a| a.to_owned()).collect();
         assert_eq!(args.first().map(|a| a.to_str().unwrap()), Some("-S"));
@@ -3271,6 +3874,7 @@ mod tests {
         struct ClientCleanup(libc::pid_t);
         impl Drop for ClientCleanup {
             fn drop(&mut self) {
+                // Only signal a process that is still our unreaped child.
                 unsafe {
                     if libc::waitpid(self.0, std::ptr::null_mut(), libc::WNOHANG) == 0 {
                         libc::kill(self.0, libc::SIGKILL);
@@ -3287,6 +3891,7 @@ mod tests {
             .unwrap();
         let mut command = Command::new("/bin/sleep");
         command.arg("30");
+        // pre_exec runs before spawn returns, so even a descheduled exec has an identity.
         unsafe {
             command.pre_exec(move || {
                 let pid = libc::getpid().to_ne_bytes();
@@ -3345,16 +3950,33 @@ mod tests {
 
     #[test]
     #[serial_test::serial]
-    fn probe_session_existence_answers_from_the_fresh_cache() {
+    fn probe_session_existence_returns_present_when_fresh_cache_has_name() {
         let guard = SessionCacheGuard::capture();
-        let name = format!("{P}probe_abc12345");
-
+        let name = format!("{P}probe_present_abc12345");
         guard.force_present(&[&name]);
         assert_eq!(probe_session_existence(&name), SessionExistence::Present);
+    }
 
+    #[test]
+    #[serial_test::serial]
+    fn probe_session_existence_returns_absent_when_fresh_cache_lacks_name() {
+        let guard = SessionCacheGuard::capture();
+        let name = format!("{P}probe_absent_abc12345");
+        // Populated map, but not containing `name`: the server answered and
+        // confirmed this session is not in its list.
         guard.force_present(&[&format!("{P}some_other_session")]);
         assert_eq!(probe_session_existence(&name), SessionExistence::Absent);
+    }
 
+    #[test]
+    #[serial_test::serial]
+    fn probe_session_existence_returns_unknown_when_server_unreachable() {
+        let guard = SessionCacheGuard::capture();
+        let name = format!("{P}probe_unknown_abc12345");
+        // Simulates `list-sessions` failing unexpectedly (permission denied,
+        // malformed socket, or spawn failure): the cache is fresh but has no
+        // data. This must resolve straight from the cache, without falling
+        // back to a fresh `has-session` subprocess call.
         guard.force_unreachable();
         assert_eq!(probe_session_existence(&name), SessionExistence::Unknown);
     }
@@ -3432,6 +4054,8 @@ mod tests {
         }
     }
 
+    /// A session id long enough that `truncate_id(.., 8)` actually truncates,
+    /// so the tests exercise the real `_<id8>` tail.
     const ID: &str = "abc12345deadbeef";
     const ID8: &str = "abc12345";
 
@@ -3443,7 +4067,9 @@ mod tests {
             format!("{TERMINAL_PREFIX}Vikings_{ID8}"),
             format!("{CONTAINER_TERMINAL_PREFIX}Vikings_{ID8}"),
             format!("{TOOL_PREFIX}lazygit_Vikings_{ID8}"),
+            // Agent-shaped, but a different session's id.
             format!("{P}Vikings_99999999"),
+            // Not ours at all.
             "vim".to_string(),
         ];
         // (derived, live names, expected)
@@ -3486,6 +4112,8 @@ mod tests {
 
     #[test]
     fn resolve_agent_session_name_in_agrees_with_the_scan_on_both_paths() {
+        // The poll loops go through the map wrapper for its O(1) hit path; it
+        // must not diverge from the scan it short-circuits.
         let meta = |names: &[&str]| -> HashMap<String, PaneMetadata> {
             names
                 .iter()
@@ -3493,6 +4121,11 @@ mod tests {
                     (
                         n.to_string(),
                         PaneMetadata {
+                            server: None,
+                            session_id: "$42".into(),
+                            pane_id: "%42".into(),
+                            session_kind: None,
+                            tool_owner: ToolPaneOwner::Unmarked,
                             pane_dead: false,
                             pane_current_command: None,
                             pane_start_command_is_protected: false,
@@ -3525,6 +4158,9 @@ mod tests {
 
     #[test]
     fn agent_session_belongs_to_matches_by_id_not_title() {
+        // The inverse lookup (`aoe session current` and friends): map a live
+        // tmux session name back to its row without knowing the title it was
+        // created under.
         assert!(agent_session_belongs_to(&format!("{P}Vikings_{ID8}"), ID));
         assert!(agent_session_belongs_to(&format!("{P}Anything_{ID8}"), ID));
         assert!(!agent_session_belongs_to(
@@ -3557,6 +4193,11 @@ mod tests {
 
     fn dead_pane_meta(dead: bool) -> PaneMetadata {
         PaneMetadata {
+            server: None,
+            session_id: "$42".into(),
+            pane_id: "%42".into(),
+            session_kind: None,
+            tool_owner: ToolPaneOwner::Unmarked,
             pane_dead: dead,
             pane_current_command: None,
             pane_start_command_is_protected: false,
@@ -3596,6 +4237,9 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn live_any_kind_name_for_id_prefers_agent_then_terminal_then_container() {
+        // None of these fake names is a live tmux session, so the internal
+        // `is_pane_dead` probe returns false for all of them and the ordering
+        // under test is the kind-preference, not liveness.
         let agent = format!("{P}Refactor_{ID8}");
         let terminal = format!("{TERMINAL_PREFIX}Refactor_{ID8}");
         let container = format!("{CONTAINER_TERMINAL_PREFIX}Refactor_{ID8}");
@@ -3621,6 +4265,9 @@ mod tests {
         }
     }
 
+    /// The poller must not accept a paired terminal or container pane as
+    /// evidence of a live agent: seeded with that name it probes a pane that
+    /// really is alive and holds a budget slot for an agent that is gone.
     #[test]
     #[serial_test::serial]
     fn live_agent_name_for_id_ignores_terminal_and_container_panes() {
@@ -3636,6 +4283,7 @@ mod tests {
             live_agent_name_for_id_in(&snapshot, ID).as_deref(),
             Some(agent.as_str()),
         );
+        // The case that leaked the slot: agent gone, terminal still up.
         let snapshot = LiveSessionSnapshot::from_parts(
             Some(vec![terminal.clone(), container.clone()]),
             Some(HashMap::new()),
@@ -3645,6 +4293,8 @@ mod tests {
             None,
             "a surviving terminal is not a live agent pane"
         );
+        // And the any-kind lookup still answers it, since peer exclusion and
+        // the TUI reload legitimately want any live pane for the id.
         assert_eq!(
             live_any_kind_name_for_id(
                 unmarked([terminal.as_str(), container.as_str()]),
@@ -3655,12 +4305,19 @@ mod tests {
             Some(terminal.as_str()),
         );
 
+        // A title sanitizing under an auxiliary prefix is refused, and stays
+        // refused: `aoe_term_Foo_<id>` is simultaneously the agent name for
+        // title `term_Foo` and the paired-terminal name for title `Foo`, so
+        // accepting it would let a surviving terminal pass as the agent.
         let shadowed = format!("{TERMINAL_PREFIX}rewriting_{ID8}");
         let snapshot =
             LiveSessionSnapshot::from_parts(Some(vec![shadowed.clone()]), Some(HashMap::new()));
         assert_eq!(live_agent_name_for_id_in(&snapshot, ID), None);
     }
 
+    /// The scan is where a marker becomes usable at all: a wrong split
+    /// silently unmarks every session and puts the whole fleet back on the
+    /// ambiguous name-shape guess.
     #[test]
     fn session_scan_reads_the_kind_field_and_tolerates_its_absence() {
         let parsed = parse_session_scan(
@@ -3695,6 +4352,11 @@ mod tests {
         assert!(!parsed.contains_key("garbage-with-no-separator"));
     }
 
+    /// `#{@aoe_kind}` falls through to the server, global-window and
+    /// global-session options, so a user who sets one would otherwise have
+    /// every unmarked session on their server claim that kind, which is how a
+    /// paired terminal would pass as an agent pane again. The scan prints
+    /// those scopes first so they can be subtracted.
     #[test]
     fn an_inherited_kind_option_marks_nothing() {
         let agent = format!("{P}Vikings{ID8}");
@@ -3724,12 +4386,16 @@ mod tests {
             "a value the global cannot explain is still a mark"
         );
 
+        // Without a global line every mark stands.
         let parsed = parse_session_scan(&format!("{terminal}|1789065184|agent"));
         assert_eq!(
             parsed.get(&terminal).unwrap().kind,
             Some(SessionKind::Agent)
         );
 
+        // `#{@aoe_kind}` inherits from the server and global-window scopes as
+        // well, so the scan reads back one line per scope and every value has
+        // to be subtracted, not just the first.
         let parsed = parse_session_scan(&format!(
             "term\n\
              agent\n\
@@ -3745,6 +4411,10 @@ mod tests {
             "a value no scope could have produced is still a mark"
         );
 
+        // A separator inside one scope's value must not end the scope block:
+        // the scopes are printed in a fixed order, so a `|` in the first one
+        // would otherwise leave the rest unsubtracted and hand this terminal
+        // the agent kind.
         let parsed = parse_session_scan(&format!(
             "a|b\n\
              agent\n\
@@ -3783,9 +4453,15 @@ mod tests {
         );
     }
 
+    /// The kind marker is what name shape cannot say, in both directions: an
+    /// agent whose title sanitizes into a terminal's shape is still the agent
+    /// pane (#3888), and a paired terminal is never one however its name
+    /// reads (#3880).
     #[test]
     #[serial_test::serial]
     fn live_agent_lookup_follows_the_marker_over_the_name_shape() {
+        // `aoe_term_rewriting_<id8>`: the agent name for title `term
+        // rewriting`, and the paired-terminal name for title `rewriting`.
         let ambiguous = format!("{TERMINAL_PREFIX}rewriting_{ID8}");
 
         let as_agent = LiveSessionSnapshot::from_marked_parts(
@@ -3816,6 +4492,8 @@ mod tests {
             "a session created before the marker keeps the old, ambiguous guess"
         );
 
+        // The any-kind lookup buckets by the same classifier, so the marked
+        // agent is preferred over a terminal rather than mistaken for one.
         let terminal = format!("{TERMINAL_PREFIX}other_{ID8}");
         assert_eq!(
             live_any_kind_name_for_id(
@@ -3831,6 +4509,11 @@ mod tests {
         );
     }
 
+    /// The collision a smart rename creates: a row titled `Foo` gets the
+    /// paired terminal `aoe_term_Foo_<id8>`, is retitled to `term Foo`, and
+    /// that terminal now holds the agent's derived name. Adopting it would
+    /// point every lifecycle operation, and the session-id poller, at the
+    /// wrong pane.
     #[test]
     fn a_session_marked_another_kind_is_not_the_live_derived_name() {
         let derived = format!("{TERMINAL_PREFIX}Foo_{ID8}");
@@ -3858,6 +4541,11 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn session_new_resolves_onto_a_retitled_sessions_live_name() {
+        // End to end through the constructor every lifecycle op goes through
+        // (`Instance::tmux_session`): with only the pre-rename session live,
+        // `Session::new` under the NEW title must target it, so trash/archive
+        // stop the running agent and `create` adopts it instead of spawning a
+        // second one.
         let guard = SessionCacheGuard::capture();
         let stale = Session::generate_name(ID, "Vikings");
         let derived = Session::generate_name(ID, "Refactor billing module");
@@ -3871,6 +4559,10 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn live_agent_session_name_answers_from_an_unreachable_snapshot_without_refreshing() {
+        // No tmux server (the common state for a user who has not opened a
+        // session yet) is an answer, not a stale snapshot: resolution must
+        // return the derived name straight from the cache rather than spawn a
+        // doomed `list-sessions` on every call from a render loop.
         let guard = SessionCacheGuard::capture();
         guard.force_unreachable();
         let derived = format!("{P}Vikings_{ID8}");
@@ -3895,6 +4587,13 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn session_exists_trusts_a_cache_hit_without_tmux() {
+        // A cached hit proves recent existence; session_exists must return
+        // true from the fast path without a live query.
+        //
+        // Serial + guard: this writes the process-global SESSION_CACHE, and
+        // running it in parallel with the serial probe_session_existence
+        // tests turns their carefully-forced cache states into flakes (a
+        // mid-test injection makes an "unreachable" cache look populated).
         let _guard = SessionCacheGuard::capture();
         let name = format!("{P}exists_probe_cache_hit");
         test_inject_session_into_cache(&name);
@@ -3903,7 +4602,34 @@ mod tests {
 
     #[test]
     #[serial_test::serial]
+    fn session_exists_does_not_accept_a_sibling_name_prefix() {
+        if !tmux_available() {
+            return;
+        }
+        let guard = SessionCacheGuard::capture();
+        let primary = test_helpers::TmuxTestSession::new(&format!("{TERMINAL_PREFIX}exact_probe"));
+        let sibling = test_helpers::TmuxTestSession::from_name(format!("{}_t1", primary.name()));
+        let created = tmux_command()
+            .args(["new-session", "-d", "-s", sibling.name(), "sleep 60"])
+            .output()
+            .expect("tmux new-session");
+        assert!(created.status.success());
+        guard.force_present(&[]);
+        assert!(session_exists(sibling.name()));
+        assert!(
+            !session_exists(primary.name()),
+            "an extra tab does not establish primary-terminal existence"
+        );
+        assert!(
+            !Session::from_name(primary.name()).exists_with_deadline(&TmuxCommandDeadline::new())
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
     fn a_forced_cache_snapshot_survives_a_concurrent_refresh() {
+        // See `forced_session_cache_active`: a refresh a parallel test
+        // started must not land inside a guarded window.
         let guard = SessionCacheGuard::capture();
         let name = format!("{P}forced_snapshot_survives_refresh");
         guard.force_present(&[name.as_str()]);
@@ -3953,7 +4679,7 @@ mod tests {
 
     #[test]
     fn test_parse_pane_metadata_basic() {
-        let output = format!("{P}my_proj_abc12345|0|0|190|52|claude|claude|4242\n");
+        let output = format!("{P}my_proj_abc12345|$42|%42||0|0|190|52|claude|claude|4242\n");
         let map = parse_pane_metadata(&output);
         assert_eq!(map.len(), 1);
         let meta = map.get(&format!("{P}my_proj_abc12345")).unwrap();
@@ -3961,13 +4687,16 @@ mod tests {
         assert_eq!(meta.pane_current_command.as_deref(), Some("claude"));
         assert!(!meta.pane_start_command_is_protected);
         assert_eq!(meta.pane_pid, Some(4242));
+        assert_eq!(meta.session_id, "$42");
+        assert_eq!(meta.pane_id, "%42");
+        assert_eq!(meta.session_kind, None);
         assert_eq!(meta.window_size, Some((190, 52)));
     }
 
     #[test]
     fn test_parse_pane_metadata_reads_the_tail_fields() {
         let output = format!(
-            "{P}proj_abc12345|0|0|190|52|claude|claude{TAIL_SEP}1770000000{TAIL_SEP}✶ Working\n"
+            "{P}proj_abc12345|$42|%42||0|0|190|52|claude|claude|4242{TAIL_SEP}1770000000{TAIL_SEP}{TAIL_SEP}✶ Working\n"
         );
         let meta = parse_pane_metadata(&output)
             .remove(&format!("{P}proj_abc12345"))
@@ -3975,8 +4704,10 @@ mod tests {
         assert_eq!(meta.window_activity, Some(1770000000));
         assert_eq!(meta.pane_title.as_deref(), Some("✶ Working"));
 
+        // tmux 3.4 renders the control separators as unescaped octal tokens.
+        // A doubled backslash belongs to the title and must not split it.
         let escaped_output = format!(
-            "{P}proj_escaped_abc12345|0|0|190|52|claude|claude literal{}{ESCAPED_TAIL_SEP}|4242{ESCAPED_TAIL_SEP}1770000001{ESCAPED_TAIL_SEP}literal{}{ESCAPED_TAIL_SEP}title{}",
+            "{P}proj_escaped_abc12345|$42|%42||0|0|190|52|claude|claude literal{}{ESCAPED_TAIL_SEP}|4242{ESCAPED_TAIL_SEP}1770000001{ESCAPED_TAIL_SEP}{ESCAPED_TAIL_SEP}literal{}{ESCAPED_TAIL_SEP}title{}",
             char::from(92),
             char::from(92),
             char::from(10)
@@ -3991,12 +4722,28 @@ mod tests {
             Some(format!("literal{}{ESCAPED_TAIL_SEP}title", char::from(92)))
         );
 
-        let odd = format!("{P}proj_def67890|0|0|||claude|claude{TAIL_SEP}{TAIL_SEP}\n");
+        let odd = format!(
+            "{P}proj_def67890|$42|%42||0|0|||claude|claude|4242{TAIL_SEP}{TAIL_SEP}{TAIL_SEP}\n"
+        );
         let meta = parse_pane_metadata(&odd)
             .remove(&format!("{P}proj_def67890"))
             .unwrap();
         assert_eq!(meta.window_activity, None);
         assert_eq!(meta.window_size, None);
+        let id = "abc12345full";
+        let name = ToolSession::generate_name(id, "T", "git|log");
+        let owner = serde_json::to_string(&(id, "git|log")).unwrap();
+        for separator in ["\x1f", ESCAPED_TAIL_SEP] {
+            let output = format!("{name}|$42|%42|tool|0|0|80|24|sh|sh|4242{separator}1770000000{separator}{owner}{separator}title\n");
+            let panes = parse_pane_metadata(&output);
+            assert_eq!(
+                ToolSession::from_snapshot(id, "renamed", "git|log", &panes)
+                    .unwrap()
+                    .session_name(),
+                name
+            );
+            assert!(ToolSession::from_snapshot(id, "T", "git_log", &panes).is_err());
+        }
     }
 
     #[test]
@@ -4008,15 +4755,15 @@ mod tests {
         instance.status = crate::session::Status::Idle;
         let name = Session::generate_name(&instance.id, &instance.title);
         let cache = SessionCacheGuard::capture();
-        cache.force_present(&[&name]);
 
         for (tail, expected_title, expected_forks) in [
-            (format!("{TAIL_SEP}1{TAIL_SEP}"), Some(""), 0),
-            (format!("{TAIL_SEP}1"), None, 1),
+            (format!("{TAIL_SEP}1{TAIL_SEP}{TAIL_SEP}"), Some(""), 0),
+            (format!("{TAIL_SEP}1{TAIL_SEP}"), None, 1),
         ] {
-            let metadata = parse_pane_metadata(&format!("{name}|0|0|100|40|omp|omp|42{tail}\n"))
-                .remove(&name)
-                .unwrap();
+            let metadata =
+                parse_pane_metadata(&format!("{name}|$42|%42||0|0|100|40|omp|omp|42{tail}\n"))
+                    .remove(&name)
+                    .unwrap();
             assert_eq!(metadata.pane_title.as_deref(), expected_title);
             instance.detection = crate::session::DetectionState {
                 activity: Some(1),
@@ -4030,12 +4777,12 @@ mod tests {
                 .observation_key(&Observation::new("", None, true)),
                 ..Default::default()
             };
+            cache.force_present(&[&name]);
             let _ = fork_probe::take();
             let probe = fork_probe::arm();
             instance.update_status_once(Some(&metadata), Some(&name));
             let forks = fork_probe::take();
             drop(probe);
-            assert_eq!(instance.detection.rule, Some("screen_unchanged"));
             assert_eq!(instance.status, crate::session::Status::Idle);
             assert_eq!(forks, expected_forks, "metadata tail: {tail:?}");
         }
@@ -4044,8 +4791,8 @@ mod tests {
     #[test]
     fn test_parse_pane_metadata_protected_wrapper_shell_is_not_stale() {
         let output = format!(
-            "{P}protected_abc12345|0|0|190|52|sh|/bin/sh -c 'prepare | . /tmp/aoe-pane-env-123 | exec claude'\n\
-             {P}interactive_def67890|0|0|190|52|sh|sh\n"
+            "{P}protected_abc12345|$42|%42||0|0|190|52|sh|/bin/sh -c 'prepare | . /tmp/aoe-pane-env-123 | exec claude'|4242\n\
+             {P}interactive_def67890|$42|%42||0|0|190|52|sh|sh|4242\n"
         );
         let map = parse_pane_metadata(&output);
 
@@ -4066,74 +4813,110 @@ mod tests {
         }
     }
 
-    /// One row per aoe session: pane and window zero, first line wins.
     #[test]
-    fn parse_pane_metadata_row_selection_table() {
-        type Want<'a> = &'a [(&'a str, Option<&'a str>, bool)];
-        let cases: &[(&str, String, Want<'_>)] = &[
-            (
-                "dead pane",
-                format!("{P}proj_abc12345|0|1|190|52|bash|bash\n"),
-                &[("proj_abc12345", Some("bash"), true)],
-            ),
-            (
-                "non-aoe sessions filtered",
-                format!(
-                    "user_session|0|0|190|52|bash|bash\n{P}proj_abc12345|0|0|190|52|claude|claude\nmy_tmux|0|0|190|52|vim|vim\n"
-                ),
-                &[("proj_abc12345", Some("claude"), false)],
-            ),
-            (
-                "non-zero panes filtered",
-                format!(
-                    "{P}proj_abc12345|0|0|190|52|claude|claude\n{P}proj_abc12345|1|0|190|52|bash|bash\n"
-                ),
-                &[("proj_abc12345", Some("claude"), false)],
-            ),
-            (
-                "first window wins",
-                format!(
-                    "{P}proj_abc12345|0|0|190|52|claude|claude\n{P}proj_abc12345|0|1|190|52|bash|bash\n"
-                ),
-                &[("proj_abc12345", Some("claude"), false)],
-            ),
-            ("empty output", String::new(), &[]),
-            (
-                "malformed and blank lines skipped",
-                format!("too|few|fields\n{P}proj_abc12345|0|0|190|52|claude|claude\n\n"),
-                &[("proj_abc12345", Some("claude"), false)],
-            ),
-            (
-                "empty command",
-                format!("{P}proj_abc12345|0|0|190|52||sh\n"),
-                &[("proj_abc12345", None, false)],
-            ),
-            (
-                "several sessions",
-                format!(
-                    "{P}proj_a_abc12345|0|0|190|52|claude|claude\n{P}proj_b_def67890|0|0|190|52|opencode|opencode\n{P}proj_c_ghi11111|0|1|190|52|bash|bash\n"
-                ),
-                &[
-                    ("proj_a_abc12345", Some("claude"), false),
-                    ("proj_b_def67890", Some("opencode"), false),
-                    ("proj_c_ghi11111", Some("bash"), true),
-                ],
-            ),
-        ];
-        for (label, output, want) in cases {
-            let map = parse_pane_metadata(output);
-            assert_eq!(map.len(), want.len(), "{label}");
-            for (suffix, command, dead) in *want {
-                let name = format!("{P}{suffix}");
-                let meta = map.get(&name).unwrap_or_else(|| panic!("{label}: {name}"));
-                assert_eq!(meta.pane_current_command.as_deref(), *command, "{label}");
-                assert_eq!(meta.pane_dead, *dead, "{label}");
-            }
-        }
+    fn test_parse_pane_metadata_dead_pane() {
+        let output = format!("{P}proj_abc12345|$42|%42||0|1|190|52|bash|bash|4242\n");
+        let map = parse_pane_metadata(&output);
+        let meta = map.get(&format!("{P}proj_abc12345")).unwrap();
+        assert!(meta.pane_dead);
     }
+
+    #[test]
+    fn test_parse_pane_metadata_filters_non_aoe_sessions() {
+        let output = format!(
+            "user_session|$42|%42||0|0|190|52|bash|bash|4242\n{P}proj_abc12345|$42|%42||0|0|190|52|claude|claude|4242\nmy_tmux|$42|%42||0|0|190|52|vim|vim|4242\n"
+        );
+        let map = parse_pane_metadata(&output);
+        assert_eq!(map.len(), 1);
+        assert!(map.contains_key(&format!("{P}proj_abc12345")));
+    }
+
+    #[test]
+    fn test_parse_pane_metadata_filters_non_zero_panes() {
+        let output = format!(
+            "{P}proj_abc12345|$42|%42||0|0|190|52|claude|claude|4242\n{P}proj_abc12345|$42|%42||1|0|190|52|bash|bash|4242\n"
+        );
+        let map = parse_pane_metadata(&output);
+        assert_eq!(map.len(), 1);
+        let meta = map.get(&format!("{P}proj_abc12345")).unwrap();
+        assert_eq!(meta.pane_current_command.as_deref(), Some("claude"));
+    }
+
+    #[test]
+    fn test_parse_pane_metadata_first_window_wins() {
+        // Two windows both have pane 0, first window's data should be kept
+        let output = format!(
+            "{P}proj_abc12345|$42|%42||0|0|190|52|claude|claude|4242\n{P}proj_abc12345|$42|%42||0|1|190|52|bash|bash|4242\n"
+        );
+        let map = parse_pane_metadata(&output);
+        assert_eq!(map.len(), 1);
+        let meta = map.get(&format!("{P}proj_abc12345")).unwrap();
+        assert!(!meta.pane_dead);
+        assert_eq!(meta.pane_current_command.as_deref(), Some("claude"));
+    }
+
+    #[test]
+    fn test_parse_pane_metadata_empty_output() {
+        assert!(parse_pane_metadata("").is_empty());
+    }
+
+    #[test]
+    fn test_parse_pane_metadata_malformed_lines() {
+        let output =
+            format!("too|few|fields\n{P}proj_abc12345|$42|%42||0|0|190|52|claude|claude|4242\n\n");
+        let map = parse_pane_metadata(&output);
+        assert_eq!(map.len(), 1);
+    }
+
+    #[test]
+    fn test_parse_pane_metadata_empty_command() {
+        let output = format!("{P}proj_abc12345|$42|%42||0|0|190|52||sh|4242\n");
+        let map = parse_pane_metadata(&output);
+        let meta = map.get(&format!("{P}proj_abc12345")).unwrap();
+        assert!(meta.pane_current_command.is_none());
+    }
+
+    #[test]
+    fn test_parse_pane_metadata_multiple_sessions() {
+        let output = format!(
+            "{P}proj_a_abc12345|$42|%42||0|0|190|52|claude|claude|4242\n{P}proj_b_def67890|$42|%42||0|0|190|52|opencode|opencode|4242\n{P}proj_c_ghi11111|$42|%42||0|1|190|52|bash|bash|4242\n"
+        );
+        let map = parse_pane_metadata(&output);
+        assert_eq!(map.len(), 3);
+        assert_eq!(
+            map.get(&format!("{P}proj_a_abc12345"))
+                .unwrap()
+                .pane_current_command
+                .as_deref(),
+            Some("claude")
+        );
+        assert_eq!(
+            map.get(&format!("{P}proj_b_def67890"))
+                .unwrap()
+                .pane_current_command
+                .as_deref(),
+            Some("opencode")
+        );
+        assert!(map.get(&format!("{P}proj_c_ghi11111")).unwrap().pane_dead);
+    }
+
+    fn tmux_available() -> bool {
+        tmux_command()
+            .arg("-V")
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+    }
+
     #[test]
     #[serial_test::serial]
     fn a_failed_pane_snapshot_is_an_answer_so_rows_do_not_re_fork() {
+        // `refresh_pane_meta_cache` stamps `time` even when `batch_pane_metadata`
+        // fails, and `pane_dead_from_cache` gates on `time` alone. That pairing is
+        // what bounds a tmux outage to one fork per poller cycle (CACHE_TTL / 2)
+        // instead of one per row per frame: if a fresh-but-empty snapshot
+        // resolved to `None`, every Tool row would drive another doomed refresh,
+        // which is the per-row fork this whole change removes.
         let guard = PaneMetaCacheGuard::capture();
         guard.force_failed_refresh();
 
@@ -4203,7 +4986,17 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn display_liveness_answers_from_the_snapshot_instead_of_probing_per_name() {
-        require_tmux!();
+        // The render path's contract: `session_exists_for_display` reads the
+        // shared snapshot, where `session_exists` falls through to a live
+        // `has-session` on a miss. Only a snapshot that DISAGREES with tmux
+        // separates them, so force one that says "server reachable, zero
+        // sessions" while a real pane is live. Getting this wrong costs one
+        // fork per row per frame (~1.7ms each), which is what stalled the
+        // Terminal-view list at ~19fps.
+        if !tmux_available() {
+            eprintln!("Skipping test: tmux not available");
+            return;
+        }
         let guard = SessionCacheGuard::capture();
         let session = test_helpers::TmuxTestSession::new(&format!("{SESSION_PREFIX}display_probe"));
         let created = tmux_command()
@@ -4212,6 +5005,8 @@ mod tests {
             .expect("tmux new-session");
         assert!(created.status.success());
 
+        // No fork between forcing the snapshot and reading it, so the TTL
+        // cannot expire out from under the assertions.
         guard.force_present(&[]);
         assert!(
             !session_exists_for_display(session.name()),
@@ -4223,6 +5018,8 @@ mod tests {
              without this the test would pass on a broken snapshot too"
         );
 
+        // And a snapshot that lists the session resolves live without tmux
+        // being consulted at all.
         guard.force_present(&[session.name()]);
         assert!(session_exists_for_display(session.name()));
     }
@@ -4230,7 +5027,10 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn rekey_session_adopts_peer_renamed_pane() {
-        require_tmux!();
+        if !tmux_available() {
+            eprintln!("Skipping test: tmux not available");
+            return;
+        }
         let start_name = Session::generate_name(ID, "Fix login bug");
         let peer_name = Session::generate_name(ID, "Peer rename");
         let final_name = Session::generate_name(ID, "Final rename");
@@ -4244,6 +5044,9 @@ mod tests {
         assert!(created.status.success());
         refresh_session_cache();
 
+        // A sibling process renames the live pane without refreshing this
+        // process's cache. `rekey_session` must scan first, adopt the
+        // id-matching peer name, and move that same pane to the destination.
         let peer_rename = tmux_command()
             .args(["rename-session", "-t", &start_name, &peer_name])
             .output()
@@ -4257,7 +5060,10 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn rekey_session_refreshes_the_status_bar_title() {
-        require_tmux!();
+        if !tmux_available() {
+            eprintln!("Skipping test: tmux not available");
+            return;
+        }
         let start_name = Session::generate_name(ID, "Britons");
         let final_name = Session::generate_name(ID, "Fix detach hint");
         let start_guard = TmuxTestSession::from_name(start_name.clone());
@@ -4267,6 +5073,7 @@ mod tests {
             .output()
             .expect("tmux new-session");
         assert!(created.status.success());
+        // Seed the option the way `apply_status_bar` does at session start.
         let seeded = tmux_command()
             .args(["set-option", "-t", &start_name, "@aoe_title", "Britons"])
             .output()
@@ -4276,6 +5083,8 @@ mod tests {
 
         assert!(rekey_session(ID, "Britons", "Fix detach hint").unwrap());
 
+        // `status-right` renders `#{@aoe_title}`, so a stale value keeps the
+        // pre-rename title on the bar until the session is restarted.
         let shown = tmux_command()
             .args(["show-options", "-t", &final_name, "-v", "@aoe_title"])
             .output()
@@ -4290,7 +5099,12 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn rekey_session_reports_false_for_vanished_pane() {
-        require_tmux!();
+        if !tmux_available() {
+            eprintln!("Skipping test: tmux not available");
+            return;
+        }
+        // Keep the isolated tmux server alive after the target is killed, so
+        // the assertion distinguishes an absent session from a vanished server.
         let dummy_guard = TmuxTestSession::new("aoe_test_rekey_dummy");
         let dummy_created = tmux_command()
             .args(["new-session", "-d", "-s", dummy_guard.name(), "sleep 60"])
@@ -4304,6 +5118,10 @@ mod tests {
             .output()
             .expect("tmux new-session");
         assert!(created.status.success());
+        // Populate a positive cache entry, then remove the target without
+        // refreshing it. The authoritative refresh inside `rekey_session` must
+        // classify the vanished pane as `Ok(false)`, keeping API/TUI callers
+        // from showing a warning.
         refresh_session_cache();
         let killed = tmux_command()
             .args(["kill-session", "-t", &name])

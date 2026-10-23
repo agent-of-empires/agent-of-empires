@@ -53,8 +53,12 @@ mod tests {
             run_in,
             &[
                 (
-                    Some("[session]\nconfirm_delete = false\nsnooze_duration_minutes = 45\n\n[theme]\nname = \"rose-pine\"\n"),
-                    Some("[session]\nconfirm_delete = true\nsnooze_duration_minutes = 45\n\n[theme]\nname = \"rose-pine\"\n"),
+                    Some(
+                        "[session]\nconfirm_delete = false\nsnooze_duration_minutes = 45\n\n[theme]\nname = \"rose-pine\"\n",
+                    ),
+                    Some(
+                        "[session]\nconfirm_delete = true\nsnooze_duration_minutes = 45\n\n[theme]\nname = \"rose-pine\"\n",
+                    ),
                 ),
                 // Already on, by an earlier run or a deliberate opt-in.
                 unchanged("[session]\nconfirm_delete = true\n"),

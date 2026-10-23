@@ -32,6 +32,7 @@ pub mod session_paths;
 pub mod session_tee;
 pub mod state;
 pub mod supervisor;
+pub mod task_transcript;
 pub mod terminal_handler;
 pub mod transcript;
 pub mod version_probe;

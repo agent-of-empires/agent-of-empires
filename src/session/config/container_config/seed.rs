@@ -1923,6 +1923,39 @@ mod tests {
     use super::*;
 
     #[test]
+    fn yaml_resource_documents_preserve_bytes_and_skip_undecodable_inputs() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = AnchoredDir::open(temporary.path()).unwrap();
+        let path = Path::new("config.yaml");
+        let source = "\u{feff}defaults: &defaults {path: './plugin', enabled: true}\ncopy: *defaults\nvalues: [true, false, on, 001, 'true']\n";
+        fs::write(temporary.path().join(path), source).unwrap();
+        let document = read_document(&root, path, true).unwrap().unwrap();
+        assert_eq!(
+            document["copy"],
+            serde_json::json!({"path":"./plugin","enabled":true})
+        );
+        assert_eq!(
+            fs::read(temporary.path().join(path)).unwrap(),
+            source.as_bytes()
+        );
+        let duplicate = "path: first\npath: second\n";
+        fs::write(temporary.path().join(path), duplicate).unwrap();
+        assert_eq!(
+            read_document(&root, path, true).unwrap().unwrap()["path"],
+            "second"
+        );
+        assert_eq!(
+            fs::read(temporary.path().join(path)).unwrap(),
+            duplicate.as_bytes()
+        );
+        for invalid in [b"plugins: [".as_slice(), b"\xff", b"? [a, b]\n: value\n"] {
+            fs::write(temporary.path().join(path), invalid).unwrap();
+            assert!(read_document(&root, path, true).unwrap().is_none());
+            assert_eq!(fs::read(temporary.path().join(path)).unwrap(), invalid);
+        }
+    }
+
+    #[test]
     fn sqlite_seed_refuses_uncommitted_spilled_pages_and_retries_after_rollback() {
         let temporary = tempfile::tempdir().unwrap();
         let source = temporary.path().join("source");

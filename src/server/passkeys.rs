@@ -27,6 +27,7 @@ use super::auth::{resolve_client_ip, AuthenticatedSession};
 use super::login::{
     argon2_verify, decode_binding_secret, hash_passphrase, issue_session, session_id_from_headers,
 };
+use super::rate_limit::AuthBudget;
 use super::secure_store::{check_path_security, write_private};
 use super::AppState;
 use crate::util::now_ms;
@@ -600,11 +601,15 @@ pub async fn login_start_handler(
     ConnectInfo(addr): ConnectInfo<std::net::SocketAddr>,
     headers: HeaderMap,
 ) -> Response {
-    let ip = resolve_client_ip(addr, &headers);
+    let ip = resolve_client_ip(addr, &headers, state.behind_tunnel);
     if !state.login_manager.is_enabled() {
         return login_disabled();
     }
-    if let Some(remaining) = state.rate_limiter.check_locked(ip).await {
+    if let Some(remaining) = state
+        .rate_limiter
+        .check_locked(ip, AuthBudget::Passkey)
+        .await
+    {
         return (
             StatusCode::TOO_MANY_REQUESTS,
             [("Retry-After", remaining.to_string())],
@@ -637,11 +642,15 @@ pub async fn login_finish_handler(
     headers: HeaderMap,
     body: Result<Json<LoginFinishRequest>, axum::extract::rejection::JsonRejection>,
 ) -> Response {
-    let ip = resolve_client_ip(addr, &headers);
+    let ip = resolve_client_ip(addr, &headers, state.behind_tunnel);
     if !state.login_manager.is_enabled() {
         return login_disabled();
     }
-    if let Some(remaining) = state.rate_limiter.check_locked(ip).await {
+    if let Some(remaining) = state
+        .rate_limiter
+        .check_locked(ip, AuthBudget::Passkey)
+        .await
+    {
         return (
             StatusCode::TOO_MANY_REQUESTS,
             [("Retry-After", remaining.to_string())],
@@ -672,7 +681,10 @@ pub async fn login_finish_handler(
         .await
     {
         Ok(()) => {
-            state.rate_limiter.record_success(ip).await;
+            state
+                .rate_limiter
+                .record_success(ip, AuthBudget::Passkey)
+                .await;
             tracing::info!(target: "auth.passkey", ip = %ip, "passkey login successful");
             issue_session(&state, &binding, ip, &headers).await
         }
@@ -682,7 +694,10 @@ pub async fn login_finish_handler(
             let locked = if matches!(e, PasskeyError::InvalidCeremony) {
                 false
             } else {
-                state.rate_limiter.record_failure(ip).await
+                state
+                    .rate_limiter
+                    .record_failure(ip, AuthBudget::Passkey)
+                    .await
             };
             tracing::warn!(
                 target: "auth.passkey",
@@ -702,8 +717,8 @@ pub struct RegisterStartRequest {
     label: String,
 }
 
-/// The session enrolling a passkey. The auth middleware sets it, except on the loopback
-/// bypass, where the cookie and device binding are validated here instead.
+/// The session enrolling a passkey. The auth middleware sets it for browser login.
+/// Owner-socket callers must still present a valid session cookie and device binding.
 async fn enrolling_session(
     state: &AppState,
     session: Option<Extension<AuthenticatedSession>>,
@@ -1237,11 +1252,11 @@ mod tests {
         assert!(mgr.disabled, "a symlinked store is refused");
     }
 
-    fn state_with_login(passphrase: Option<&str>) -> Arc<AppState> {
-        let mut state = crate::server::test_support::build_test_app_state(Vec::new());
-        Arc::get_mut(&mut state).unwrap().login_manager =
-            Arc::new(crate::server::login::LoginManager::new(passphrase));
-        state
+    fn state_with_login(passphrase: Option<&str>, origins: Vec<String>) -> Arc<AppState> {
+        crate::server::test_support::build_test_app_state_configured(Vec::new(), |state| {
+            state.login_manager = Arc::new(crate::server::login::LoginManager::new(passphrase));
+            state.allowed_origins = origins;
+        })
     }
 
     #[tokio::test]
@@ -1251,11 +1266,11 @@ mod tests {
         headers.insert("origin", ORIGIN.parse().unwrap());
         headers.insert("host", "aoe.example.com".parse().unwrap());
 
-        let off = state_with_login(None);
+        let off = state_with_login(None, Vec::new());
         let res = login_start_handler(State(off.clone()), addr, headers.clone()).await;
         assert_eq!(res.status(), StatusCode::NOT_FOUND);
 
-        let on = state_with_login(Some("pw"));
+        let on = state_with_login(Some("pw"), Vec::new());
         let res = register_start_handler(State(on.clone()), None, headers.clone(), None).await;
         assert_eq!(
             res.status(),
@@ -1269,8 +1284,7 @@ mod tests {
         assert_eq!(res.status(), StatusCode::FORBIDDEN);
 
         // Allowlisted origin, but nothing enrolled: login start has nothing to offer.
-        let mut with_origin = state_with_login(Some("pw"));
-        Arc::get_mut(&mut with_origin).unwrap().allowed_origins = allowed();
+        let with_origin = state_with_login(Some("pw"), allowed());
         let res = login_start_handler(State(with_origin.clone()), addr, headers.clone()).await;
         assert_eq!(res.status(), StatusCode::NOT_FOUND);
 
@@ -1280,65 +1294,102 @@ mod tests {
         assert_eq!(res.status(), StatusCode::FORBIDDEN);
     }
 
-    /// On a direct loopback bind the auth wall is bypassed and sets no session extension,
-    /// so enrolment must validate the cookie and binding itself.
+    /// TCP loopback enrolment requires a bound session and passphrase elevation.
     #[tokio::test]
     async fn loopback_enrolment_validates_the_bound_session_through_the_router() {
         use tower::ServiceExt;
 
-        let mut state = crate::server::test_support::build_test_app_state_with_policy(
+        let state = crate::server::test_support::build_test_app_state_with_policy_configured(
             Vec::new(),
             vec!["localhost".to_string()],
             vec!["http://localhost".to_string()],
             None,
+            |state| {
+                state.login_manager = Arc::new(crate::server::login::LoginManager::new(Some("pw")));
+            },
         );
-        Arc::get_mut(&mut state).unwrap().login_manager =
-            Arc::new(crate::server::login::LoginManager::new(Some("pw")));
         let binding = [9u8; 32];
         let session = state
             .login_manager
             .create_session(&binding, "127.0.0.1", "t")
             .await;
         let binding = URL_SAFE_NO_PAD.encode(binding);
+        let wrong_binding = URL_SAFE_NO_PAD.encode([8u8; 32]);
         let app = crate::server::test_support::build_router_for_test(state);
 
-        let send = |cookie: Option<&str>, bound: bool| {
-            let mut req = axum::http::Request::builder()
-                .method("POST")
-                .uri("/api/passkeys/register/start")
-                .header("host", "localhost")
-                .header("origin", "http://localhost")
-                .header("content-type", "application/json");
-            if let Some(cookie) = cookie {
-                req = req.header("cookie", cookie);
-            }
-            if bound {
-                req = req.header("x-aoe-device-binding", &binding);
-            }
-            let mut req = req
-                .body(axum::body::Body::from(r#"{"label":"Laptop"}"#))
-                .unwrap();
-            req.extensions_mut()
-                .insert(ConnectInfo(std::net::SocketAddr::from((
-                    [127, 0, 0, 1],
-                    5555,
-                ))));
-            app.clone().oneshot(req)
-        };
+        let send =
+            |path: &str, cookie: Option<&str>, binding: Option<&str>, body: serde_json::Value| {
+                let mut req = axum::http::Request::builder()
+                    .method("POST")
+                    .uri(path)
+                    .header("host", "localhost")
+                    .header("origin", "http://localhost")
+                    .header("content-type", "application/json");
+                if let Some(cookie) = cookie {
+                    req = req.header("cookie", cookie);
+                }
+                if let Some(binding) = binding {
+                    req = req.header("x-aoe-device-binding", binding);
+                }
+                let mut req = req.body(axum::body::Body::from(body.to_string())).unwrap();
+                req.extensions_mut()
+                    .insert(ConnectInfo(crate::server::peer::ConnectionPeer::Tcp(
+                        std::net::SocketAddr::from(([127, 0, 0, 1], 5555)),
+                    )));
+                app.clone().oneshot(req)
+            };
         let cookie = format!("aoe_session={session}");
+        let register_path = "/api/passkeys/register/start";
+        let register_body = serde_json::json!({ "label": "Laptop" });
 
-        let ok = send(Some(&cookie), true).await.unwrap();
+        let res = send(
+            register_path,
+            Some(&cookie),
+            Some(&binding),
+            register_body.clone(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(res.status(), StatusCode::FORBIDDEN);
+        let bytes = axum::body::to_bytes(res.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let error: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(error["error"], "elevation_required");
+
+        let res = send(
+            "/api/login/elevate",
+            Some(&cookie),
+            Some(&binding),
+            serde_json::json!({ "passphrase": "pw" }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+
+        let ok = send(
+            register_path,
+            Some(&cookie),
+            Some(&binding),
+            register_body.clone(),
+        )
+        .await
+        .unwrap();
         assert_eq!(ok.status(), StatusCode::OK);
-        for (cookie, bound) in [
-            (Some(cookie.as_str()), false),
-            (None, true),
-            (Some("aoe_session=forged"), true),
+        for (cookie, binding) in [
+            (Some(cookie.as_str()), None),
+            (Some(cookie.as_str()), Some(wrong_binding.as_str())),
+            (None, Some(binding.as_str())),
+            (Some("aoe_session=forged"), Some(binding.as_str())),
+            (None, None),
         ] {
-            let res = send(cookie, bound).await.unwrap();
+            let res = send(register_path, cookie, binding, register_body.clone())
+                .await
+                .unwrap();
             assert_eq!(
                 res.status(),
                 StatusCode::UNAUTHORIZED,
-                "{cookie:?} bound={bound}"
+                "{cookie:?} binding={binding:?}"
             );
         }
     }
@@ -1350,17 +1401,19 @@ mod tests {
     ) {
         use tower::ServiceExt;
 
-        let mut state = crate::server::test_support::build_test_app_state_with_policy(
+        let state = crate::server::test_support::build_test_app_state_with_policy_configured(
             Vec::new(),
             vec!["aoe.example.com".to_string()],
             vec![ORIGIN.to_string()],
             None,
+            |state| {
+                state.login_manager = Arc::new(crate::server::login::LoginManager::new(Some("pw")));
+            },
         );
-        Arc::get_mut(&mut state).unwrap().login_manager =
-            Arc::new(crate::server::login::LoginManager::new(Some("pw")));
         let mut auth = authenticator();
         enrol(&state.passkey_manager, &mut auth, ORIGIN, "enrolling").await;
         let limiter = Arc::clone(&state.rate_limiter);
+        limiter.record_failure(ip(), AuthBudget::Passphrase).await;
         let app = crate::server::test_support::build_router_for_test(state);
         let binding = URL_SAFE_NO_PAD.encode([5u8; 32]);
 
@@ -1417,6 +1470,11 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(res.status(), StatusCode::OK);
+        assert_eq!(
+            limiter.failure_count(ip(), AuthBudget::Passphrase).await,
+            1,
+            "passkey login must not clear passphrase guesses"
+        );
         let cookie = res
             .headers()
             .get_all("set-cookie")
@@ -1453,7 +1511,7 @@ mod tests {
             .unwrap();
             assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
         }
-        assert_eq!(limiter.failure_count(client).await, 0);
+        assert_eq!(limiter.failure_count(client, AuthBudget::Passkey).await, 0);
 
         // A credential that fails verification does.
         let (_, started) = start().await;
@@ -1465,7 +1523,7 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
-        assert_eq!(limiter.failure_count(client).await, 1);
+        assert_eq!(limiter.failure_count(client, AuthBudget::Passkey).await, 1);
     }
 
     #[test]

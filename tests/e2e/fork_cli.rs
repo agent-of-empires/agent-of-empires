@@ -30,7 +30,9 @@ fn patch_session(h: &TuiTestHarness, title: &str, patch: impl Fn(&mut Value)) {
 }
 
 /// Add a parent session and assert its native conversation through the CLI.
+/// The conversation's store exists, as it does once the agent has written to it.
 fn seed_parent(h: &TuiTestHarness, project: &Path, title: &str, tool: &str) {
+    std::fs::create_dir_all(h.home_path().join(".claude")).unwrap();
     h.run_cli_ok(&[
         "add",
         project.to_str().unwrap(),

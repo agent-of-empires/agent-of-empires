@@ -1,16 +1,14 @@
 //! Daemon process control and the `$APP_DIR/serve.*` files the view reads and writes.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::sync::Mutex;
 
 use rand::prelude::IndexedRandom;
-use rand::RngExt;
 
 use super::words::PASSPHRASE_WORDS;
 use super::{ServeMode, TransportStatus, TunnelTransport};
 
-const LOG_TAIL_LINES: usize = 200;
 const SAVED_PASSPHRASE_FILE: &str = "serve.saved_passphrase";
 /// Written by the server at startup, so CLI-launched daemons can show their passphrase.
 const EPHEMERAL_PASSPHRASE_FILE: &str = "serve.passphrase";
@@ -28,7 +26,7 @@ fn read_app_file(name: &str) -> Option<String> {
     (!trimmed.is_empty()).then(|| trimmed.to_string())
 }
 
-fn remove_app_file(name: &str) {
+pub(super) fn remove_app_file(name: &str) {
     if let Some(path) = app_file(name) {
         let _ = std::fs::remove_file(path);
     }
@@ -136,110 +134,6 @@ pub(super) fn default_transport(
     }
 }
 
-/// Spawn a Local daemon and wait until discovery finds it and it answers a health check.
-pub(crate) async fn start_local_daemon_and_wait(
-) -> Result<crate::acp::client::DaemonEndpoint, String> {
-    use crate::acp::client::{discovery::discover, HttpClient};
-
-    spawn_daemon(ServeMode::Local, None, None)?;
-    // A warm start takes about 1s; 20s covers a cold start without wedging the UI.
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
-    loop {
-        if let Ok(endpoint) = discover() {
-            if let Ok(client) = HttpClient::new(endpoint.clone()) {
-                if client.health_check().await.is_ok() {
-                    return Ok(endpoint);
-                }
-            }
-        }
-        if std::time::Instant::now() >= deadline {
-            let tail = initial_log_tail();
-            let hint = if tail.is_empty() {
-                String::new()
-            } else {
-                format!(" Last log lines:\n{}", tail.join("\n"))
-            };
-            return Err(format!(
-                "the daemon was started but never became reachable.{hint}"
-            ));
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-    }
-}
-
-/// Tunnel mode takes a passphrase and the transport picked on the Confirm screen.
-pub(super) fn spawn_daemon(
-    mode: ServeMode,
-    passphrase: Option<&str>,
-    transport: Option<TunnelTransport>,
-) -> Result<(), String> {
-    // Another daemon may have started while the picker was open; spawning would orphan it.
-    if crate::cli::serve::daemon_pid().is_some() {
-        return Err(
-            "A daemon is already running. Close this dialog and reopen to see it.".to_string(),
-        );
-    }
-
-    let exe = current_exe()?;
-
-    // Stale files from a hard-killed daemon would show its URL or passphrase while starting.
-    for name in ["serve.url", "serve.mode", EPHEMERAL_PASSPHRASE_FILE] {
-        remove_app_file(name);
-    }
-
-    let port = load_or_generate_port();
-    let mut cmd = Command::new(&exe);
-    cmd.args(["serve", "--daemon", "--port", &port.to_string()]);
-    match mode {
-        ServeMode::Tunnel => {
-            cmd.args(["--remote", "--host", "127.0.0.1"]);
-            // Picking Cloudflare must skip the server's Tailscale auto-detect.
-            if transport == Some(TunnelTransport::Cloudflare) {
-                cmd.arg("--no-tailscale");
-            }
-            if let Some(pp) = passphrase {
-                cmd.env("AOE_SERVE_PASSPHRASE", pp);
-            }
-        }
-        ServeMode::Local => {
-            cmd.args(["--host", "0.0.0.0"]);
-        }
-    }
-    // The wrapper double-forks; the daemon's output lands in the log file.
-    let status = cmd
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .map_err(|e| format!("Failed to launch `aoe serve --daemon`: {}", e))?;
-
-    if !status.success() {
-        // Forget an occupied port so the next attempt picks a fresh one.
-        let tail = initial_log_tail().join("\n");
-        if tail.contains("EADDRINUSE") || tail.contains("Address already in use") {
-            remove_app_file("serve.last_port");
-        }
-        let hint = match mode {
-            ServeMode::Tunnel => format!(
-                "Most likely no tunnel tool is installed (install tailscale \
-                 or cloudflared) or port {} is in use.",
-                port
-            ),
-            ServeMode::Local => format!("Most likely port {} is in use.", port),
-        };
-        return Err(format!(
-            "`aoe serve --daemon` exited with {:?}. {}",
-            status.code(),
-            hint
-        ));
-    }
-    if let Some(pp) = passphrase {
-        remember_passphrase(pp);
-        save_passphrase_to_disk(pp);
-    }
-    Ok(())
-}
-
 fn current_exe() -> Result<PathBuf, String> {
     std::env::current_exe().map_err(|e| format!("Could not resolve aoe binary path: {}", e))
 }
@@ -280,15 +174,6 @@ pub(super) fn stop_daemon() -> Result<(), String> {
     Ok(())
 }
 
-pub(super) fn restart_daemon(
-    mode: ServeMode,
-    passphrase: Option<&str>,
-    transport: Option<TunnelTransport>,
-) -> Result<(), String> {
-    stop_daemon()?;
-    spawn_daemon(mode, passphrase, transport)
-}
-
 pub(super) fn read_serve_mode() -> Option<ServeMode> {
     ServeMode::from_file_token(&read_app_file("serve.mode")?)
 }
@@ -305,30 +190,6 @@ pub(super) fn remember_last_mode(mode: ServeMode) {
 }
 
 /// Reusing the last port keeps a bookmarked URL valid; a random high port avoids a user's own 8080.
-fn load_or_generate_port() -> u16 {
-    match crate::session::get_app_dir() {
-        Ok(dir) => load_or_generate_port_in(&dir),
-        Err(_) => random_port(),
-    }
-}
-
-fn load_or_generate_port_in(dir: &Path) -> u16 {
-    let path = dir.join("serve.last_port");
-    let saved = std::fs::read_to_string(&path)
-        .ok()
-        .and_then(|raw| raw.trim().parse::<u16>().ok())
-        .filter(|port| *port >= 49152);
-    saved.unwrap_or_else(|| {
-        let port = random_port();
-        let _ = std::fs::write(&path, port.to_string());
-        port
-    })
-}
-
-fn random_port() -> u16 {
-    rand::rng().random_range(49152..65535)
-}
-
 fn log_file_size_opt() -> Option<u64> {
     let path = crate::cli::serve::stdio_redirect_path().ok()?;
     std::fs::metadata(path).ok().map(|m| m.len())
@@ -346,24 +207,6 @@ pub(super) fn log_grew(offset: &mut u64) -> bool {
     let changed = size != *offset;
     *offset = size;
     changed
-}
-
-/// The current run's lines: the log is shared, so start at the last `[AOE_START_MARKER]`.
-pub(super) fn initial_log_tail() -> Vec<String> {
-    let Some(contents) = crate::cli::serve::stdio_redirect_path()
-        .ok()
-        .and_then(|p| std::fs::read_to_string(p).ok())
-    else {
-        return Vec::new();
-    };
-    let all: Vec<&str> = contents.lines().collect();
-    let from = all
-        .iter()
-        .rposition(|line| line.contains("[AOE_START_MARKER]"))
-        .unwrap_or(0);
-    let window = &all[from..];
-    let start = window.len().saturating_sub(LOG_TAIL_LINES);
-    window[start..].iter().map(|s| s.to_string()).collect()
 }
 
 /// `"\n\nLast log lines:\n..."` with compacted lines, or `""` for an empty tail.
@@ -485,29 +328,5 @@ mod tests {
         );
         set_cached_passphrase(None);
         assert_eq!(cached_passphrase(), None);
-    }
-
-    #[test]
-    fn port_is_reused_only_when_valid() {
-        for (saved, reused) in [
-            (None, None),
-            (Some("55555"), Some(55555)),
-            (Some("8080"), None),
-            (Some("not-a-number\n"), None),
-        ] {
-            let tmp = tempfile::tempdir().unwrap();
-            let path = tmp.path().join("serve.last_port");
-            if let Some(saved) = saved {
-                std::fs::write(&path, saved).unwrap();
-            }
-            let port = load_or_generate_port_in(tmp.path());
-            match reused {
-                Some(expected) => assert_eq!(port, expected),
-                None => {
-                    assert!(port >= 49152, "{saved:?} gave {port}");
-                    assert_eq!(std::fs::read_to_string(&path).unwrap(), port.to_string());
-                }
-            }
-        }
     }
 }

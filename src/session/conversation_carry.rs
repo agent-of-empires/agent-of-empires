@@ -21,7 +21,7 @@ use crate::agents::{AgentDef, SessionCaptureBackend};
 use crate::session::capture::is_valid_session_id;
 use crate::session::config::container_config;
 use crate::session::config::profile_config::resolve_config_or_warn;
-use crate::session::{AnchoredDir, Instance};
+use crate::session::{AnchoredDir, ConversationBinding, ExecutionBinding, Instance};
 
 /// Claude refuses to open a transcript it cannot fit in memory long before
 /// this, so the cap only exists to keep [`AnchoredDir::open_regular`] bounded.
@@ -108,12 +108,6 @@ pub(crate) enum ToolSwap {
 /// transcript for would resume into nothing and lose the id the parking swap
 /// would have kept. Anything unresolvable therefore parks.
 pub(crate) fn classify(instance: &Instance, new_profile: &str, new_tool: &str) -> ToolSwap {
-    if instance.is_structured() {
-        // Structured rows have no terminal launch to consume a carry; their
-        // restart short-circuits before any copy could happen.
-        return ToolSwap::Park;
-    }
-
     if !is_account_swap(
         &instance.source_profile,
         &instance.tool,
@@ -251,6 +245,113 @@ fn shared_account_roots_carry_the_selected_external_store() {
             .exported_default_store,
         None,
         "a carry must not decide store export; only an attested launch may",
+    );
+}
+
+/// A fork onto a tool with another account's store resumes the parent's id
+/// there, so the transcript must travel and the child must be recorded on the
+/// store it launches on, not the parent's (#4347).
+#[cfg(test)]
+#[test]
+#[serial_test::serial]
+fn fork_parent_carry_relocates_a_cross_store_parent() {
+    let _app = crate::session::test_support::isolate_app_dir();
+    let stub = tempfile::tempdir().unwrap();
+    let _claude = crate::session::test_support::install_login_shell_path_command(
+        stub.path(),
+        "claude",
+        "#!/bin/sh\nexit 1\n",
+    );
+    let home = dirs::home_dir().unwrap();
+    let app = crate::session::get_app_dir().unwrap();
+    std::fs::create_dir_all(&app).unwrap();
+    std::fs::write(
+        app.join("config.toml"),
+        "[session.agent_detect_as]\nb = \"claude\"\n\
+         [session.agent_config_dir]\nb = \"~/destination\"\n",
+    )
+    .unwrap();
+    let profile = crate::session::config::effective_profile("");
+    let _registry = crate::tmux::status_rules::ProfileRegistryGuard::take(&profile);
+    crate::session::config::profile_config::resolve_config_or_warn(&profile);
+    let project = home.join("project");
+    let source = home.join("source");
+    std::fs::create_dir_all(&project).unwrap();
+    let sid = "11111111-2222-3333-4444-555555555555";
+    let relative = Path::new("projects")
+        .join(crate::session::capture::encode_claude_project_path(
+            &project.to_string_lossy(),
+        ))
+        .join(format!("{sid}.jsonl"));
+    let parent = |agent: &str| crate::session::ConversationBinding {
+        session_id: sid.into(),
+        provenance: crate::session::ConversationProvenance::Asserted,
+        transcript_path: None,
+        execution: Some(crate::session::ExecutionBinding {
+            agent: agent.into(),
+            stores: vec![source.clone()],
+            configuration: vec![],
+            cwd: project.clone(),
+            cwd_filesystem: "host".into(),
+            filesystem: "host".into(),
+            exported_default_store: None,
+        }),
+    };
+    let fork = |agent: &str| {
+        let mut child = Instance::new("fork", project.to_str().unwrap());
+        child.source_profile = profile.clone();
+        child.tool = "b".into();
+        child.command = "claude".into();
+        child.detect_as = "claude".into();
+        child.resume_intent = crate::session::ResumeIntent::Fork { from: sid.into() };
+        child.resume_binding = Some(parent(agent));
+        child
+    };
+    let stores = |child: &Instance| {
+        child
+            .resume_binding
+            .as_ref()
+            .unwrap()
+            .execution
+            .as_ref()
+            .unwrap()
+            .stores
+            .clone()
+    };
+
+    let mut child = fork("claude");
+    assert!(
+        carry_fork_parent(&mut child).is_err(),
+        "a parent with no transcript must refuse the fork, not launch on the wrong store"
+    );
+    assert_eq!(stores(&child), vec![source.clone()]);
+
+    std::fs::create_dir_all(source.join(relative.parent().unwrap())).unwrap();
+    std::fs::write(source.join(&relative), "parent conversation\n").unwrap();
+    let mut other_agent = fork("codex");
+    carry_fork_parent(&mut other_agent).unwrap();
+    assert_eq!(stores(&other_agent), vec![source.clone()]);
+
+    let mut other_child = fork("claude");
+    other_child.command = "codex".into();
+    carry_fork_parent(&mut other_child)
+        .expect("a child the launch will refuse is left to the launch, not refused here");
+    assert_eq!(stores(&other_child), vec![source.clone()]);
+    assert!(
+        !home.join("destination").exists(),
+        "nothing is written for a child that cannot be attested"
+    );
+
+    carry_fork_parent(&mut child).unwrap();
+    let destination = home.join("destination");
+    assert_eq!(
+        std::fs::read_to_string(destination.join(&relative)).unwrap(),
+        "parent conversation\n",
+    );
+    assert_eq!(stores(&child), vec![destination.canonicalize().unwrap()]);
+    assert!(
+        source.join(&relative).exists(),
+        "the parent keeps its own copy"
     );
 }
 
@@ -549,70 +650,12 @@ impl ConversationCarry {
     }
 
     pub(crate) fn run_for(&self, instance: &mut Instance) -> Result<bool> {
-        // Attest the incoming command's native identity and store before any
-        // filesystem write: a Claude-labeled alias resolving to a codex or
-        // opaque wrapper must not receive a Claude transcript. Resolving
-        // without the source binding keeps the recorded store from masking the
-        // configured destination.
         let destination = instance.attested_carry_destination()?;
         let mut bindings = [
             instance.agent_session_binding.clone(),
             instance.resume_binding.clone(),
         ];
-        for binding in bindings.iter_mut().flatten() {
-            if !binding.is_known() {
-                continue;
-            }
-            let execution = binding.execution.as_ref().expect("known execution");
-            anyhow::ensure!(
-                execution.agent == "claude"
-                    && execution.filesystem == "host"
-                    && execution.stores.len() == 1,
-                "conversation carry requires one host-accessible Claude store"
-            );
-            anyhow::ensure!(
-                Instance::execution_matches_destination(execution, &destination),
-                "incoming execution context differs from the attested destination"
-            );
-        }
-        let mut relocated = false;
-        for binding in bindings.iter_mut().flatten() {
-            if !binding.is_known() {
-                continue;
-            }
-            let execution = binding.execution.as_mut().expect("known execution");
-            let source_root = execution.stores[0].canonicalize()?;
-            let target_root = destination.stores[0].clone();
-            if source_root == target_root {
-                // Nothing moves, and the marker is not ours to write: the
-                // route is only observed by a launch, which stamps it from
-                // the store it really routed to.
-                continue;
-            }
-            std::fs::create_dir_all(&target_root)?;
-            let source = AnchoredDir::open(&source_root)?;
-            let target = AnchoredDir::open(&target_root)?;
-            // Scan by sid rather than encoding a required cwd: in a sandbox
-            // the binding carries the physical host cwd while Claude wrote
-            // the transcript under the container's cwd namespace, so a
-            // cwd-derived path would miss the very file the store holds.
-            let relatives = claude_transcripts_for(&source, &binding.session_id)?;
-            anyhow::ensure!(
-                !relatives.is_empty(),
-                "could not carry conversation {}: no transcript in {}",
-                binding.session_id,
-                source_root.display()
-            );
-            for relative in relatives {
-                anyhow::ensure!(
-                    copy_file_confirmed(&source, &target, &relative)?,
-                    "could not carry transcript {}",
-                    relative.display()
-                );
-            }
-            execution.stores[0] = target_root;
-            relocated = true;
-        }
+        let relocated = relocate_known_bindings(&destination, &mut bindings)?;
         if relocated {
             let [agent, resume] = bindings;
             instance.agent_session_binding = agent;
@@ -637,6 +680,115 @@ impl ConversationCarry {
             );
         });
     }
+}
+
+/// Copy each known binding's transcript into `destination`'s store and repoint
+/// the binding at it. The caller attests `destination` first, so a Claude-labeled
+/// alias resolving to a codex or opaque wrapper never receives a Claude
+/// transcript. Resolving it without the source binding keeps the recorded store
+/// from masking the configured destination.
+fn relocate_known_bindings(
+    destination: &ExecutionBinding,
+    bindings: &mut [Option<ConversationBinding>],
+) -> Result<bool> {
+    for binding in bindings.iter().flatten() {
+        if !binding.is_known() {
+            continue;
+        }
+        let execution = binding.execution.as_ref().expect("known execution");
+        anyhow::ensure!(
+            execution.agent == "claude"
+                && execution.filesystem == "host"
+                && execution.stores.len() == 1,
+            "conversation carry requires one host-accessible Claude store"
+        );
+        anyhow::ensure!(
+            Instance::execution_matches_destination(execution, destination),
+            "incoming execution context differs from the attested destination"
+        );
+    }
+    let mut relocated = false;
+    for binding in bindings.iter_mut().flatten() {
+        if !binding.is_known() {
+            continue;
+        }
+        let execution = binding.execution.as_mut().expect("known execution");
+        let source_root = execution.stores[0].canonicalize().with_context(|| {
+            format!(
+                "opening conversation store {}",
+                execution.stores[0].display()
+            )
+        })?;
+        let target_root = destination.stores[0].clone();
+        if source_root == target_root {
+            // Nothing moves, and the marker is not ours to write: the
+            // route is only observed by a launch, which stamps it from
+            // the store it really routed to.
+            continue;
+        }
+        std::fs::create_dir_all(&target_root)?;
+        let source = AnchoredDir::open(&source_root)?;
+        let target = AnchoredDir::open(&target_root)?;
+        // Scan by sid rather than encoding a required cwd: in a sandbox
+        // the binding carries the physical host cwd while Claude wrote
+        // the transcript under the container's cwd namespace, so a
+        // cwd-derived path would miss the very file the store holds.
+        let relatives = claude_transcripts_for(&source, &binding.session_id)?;
+        anyhow::ensure!(
+            !relatives.is_empty(),
+            "could not carry conversation {}: no transcript in {}",
+            binding.session_id,
+            source_root.display()
+        );
+        for relative in relatives {
+            anyhow::ensure!(
+                copy_file_confirmed(&source, &target, &relative)?,
+                "could not carry transcript {}",
+                relative.display()
+            );
+        }
+        execution.stores[0] = target_root;
+        relocated = true;
+    }
+    Ok(relocated)
+}
+
+/// Put a terminal fork's parent conversation on the store the child launches
+/// on. The fork resumes the parent's id there, and the child's binding is
+/// recorded from that launch, so a parent bound to another account's store
+/// would leave the child recorded on a store it never wrote to. A child whose
+/// launch cannot be attested as a host Claude one carries nothing: the launch
+/// resolves the same execution and refuses it with its own message.
+pub(crate) fn carry_fork_parent(instance: &mut Instance) -> Result<()> {
+    let mut binding = [instance.resume_binding.clone()];
+    let is_claude_parent = binding[0].as_ref().is_some_and(|binding| {
+        binding.is_known()
+            && binding
+                .execution
+                .as_ref()
+                .is_some_and(|execution| execution.agent == "claude")
+    });
+    if !is_claude_parent {
+        return Ok(());
+    }
+    let destination = match instance.attested_carry_destination() {
+        Ok(destination) => destination,
+        Err(error) => {
+            tracing::debug!(target: "session.store", error = %error, "fork child has no attestable Claude destination; leaving the conversation to the launch checks");
+            return Ok(());
+        }
+    };
+    if relocate_known_bindings(&destination, &mut binding)? {
+        let [mut resume] = binding;
+        if let Some(execution) = resume
+            .as_mut()
+            .and_then(|binding| binding.execution.as_mut())
+        {
+            execution.exported_default_store = None;
+        }
+        instance.resume_binding = resume;
+    }
+    Ok(())
 }
 
 /// Whether AoE knows where this agent keeps one conversation inside its config

@@ -81,7 +81,9 @@ mod tests {
                 ),
                 // An existing [session] value wins over the sandbox one.
                 (
-                    Some("[sandbox]\nyolo_mode_default = true\n\n[session]\nyolo_mode_default = false\n"),
+                    Some(
+                        "[sandbox]\nyolo_mode_default = true\n\n[session]\nyolo_mode_default = false\n",
+                    ),
                     Some("[sandbox]\n\n[session]\nyolo_mode_default = false\n"),
                 ),
                 (Some(no_sandbox), Some(no_sandbox)),

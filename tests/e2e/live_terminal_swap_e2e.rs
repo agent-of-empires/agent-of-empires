@@ -6,7 +6,7 @@ use serial_test::parallel;
 use std::process::Command;
 use std::time::{Duration, Instant};
 
-use crate::harness::{require_tmux, TuiTestHarness};
+use crate::harness::{require_tmux, wait_until, TuiTestHarness};
 use crate::live_send_paste_e2e::{capture, write_live_send_config};
 
 fn session_with_prefix(socket: &std::path::Path, prefix: &str) -> Option<String> {
@@ -37,6 +37,23 @@ fn wait_for_pane_text(socket: &std::path::Path, prefix: &str, text: &str) -> Str
         );
         std::thread::sleep(Duration::from_millis(50));
     }
+}
+
+fn wait_for_live_target(h: &TuiTestHarness, terminal: bool) {
+    wait_until(Duration::from_secs(10), Duration::from_millis(50), || {
+        let screen = h.capture_screen();
+        let footer = screen.lines().last().unwrap_or_default();
+        if footer.contains("LIVE")
+            && footer.contains("Swappy")
+            && footer.contains("(terminal)") == terminal
+        {
+            Ok(())
+        } else {
+            Err(format!(
+                "waiting for the acknowledged Swappy live target (terminal={terminal}):\n{screen}"
+            ))
+        }
+    });
 }
 
 #[test]
@@ -83,37 +100,44 @@ fn swap_round_trip(split: bool) {
         h.send_keys("|");
     }
     h.send_keys("Enter");
-    h.wait_for_timeout("LIVE", Duration::from_secs(10));
+    wait_for_live_target(&h, false);
     let socket = h.home_path().join("tmux.sock");
 
     h.send_keys("C-b");
     h.send_keys("t");
-    h.wait_for_timeout("(terminal)", Duration::from_secs(10));
+    wait_for_live_target(&h, true);
     h.send_keys("echo SHELL_SIDE");
     h.send_keys("Enter");
     wait_for_pane_text(&socket, "aoe_dev_term_", "SHELL_SIDE");
 
     h.send_keys("C-b");
     h.send_keys("t");
+    wait_for_live_target(&h, false);
     h.send_keys("AGENT_SIDE");
     let agent = wait_for_pane_text(&socket, "aoe_dev_Swappy", "AGENT_SIDE");
     assert!(
         !agent.contains("SHELL_SIDE"),
         "shell keystrokes must not reach the agent pane:\n{agent}"
     );
+    let terminal = wait_for_pane_text(&socket, "aoe_dev_term_", "SHELL_SIDE");
+    assert!(
+        !terminal.contains("AGENT_SIDE"),
+        "acknowledged agent keystrokes must not reach the terminal pane:\n{terminal}"
+    );
     let screen = h.capture_screen();
-    assert!(screen.contains("LIVE"), "swapping must not leave live mode");
+    let footer = screen.lines().last().unwrap_or_default();
+    assert!(
+        footer.contains("LIVE") && footer.contains("Swappy") && !footer.contains("(terminal)"),
+        "swapping must retain the acknowledged live agent target:\n{screen}"
+    );
     if split {
-        let deadline = Instant::now() + Duration::from_secs(10);
-        while !(h.capture_screen().contains("SHELL_SIDE")
-            && h.capture_screen().contains("AGENT_SIDE"))
-        {
-            assert!(
-                Instant::now() < deadline,
-                "split must show both panes:\n{}",
-                h.capture_screen()
-            );
-            std::thread::sleep(Duration::from_millis(50));
-        }
+        wait_until(Duration::from_secs(10), Duration::from_millis(50), || {
+            let screen = h.capture_screen();
+            if screen.contains("SHELL_SIDE") && screen.contains("AGENT_SIDE") {
+                Ok(())
+            } else {
+                Err(format!("split must show both panes:\n{screen}"))
+            }
+        });
     }
 }

@@ -22,7 +22,7 @@ fn run_in(app_dir: &Path) -> Result<()> {
         let mut rows: Value = match serde_json::from_str(&content) {
             Ok(rows) => rows,
             Err(error) => {
-                tracing::warn!(path = %path.display(), %error, "v038: skipping unreadable sessions");
+                tracing::warn!(target: "migrations.v038", path = %path.display(), %error, "skipping unreadable sessions");
                 continue;
             }
         };
@@ -44,7 +44,7 @@ fn run_in(app_dir: &Path) -> Result<()> {
         if changed {
             crate::session::backup_before_migration(&path)?;
             crate::session::atomic_write(&path, serde_json::to_vec_pretty(&rows)?.as_slice())?;
-            tracing::info!(path = %path.display(), "v038: retired Prime JavaScript publication");
+            tracing::info!(target: "migrations.v038", path = %path.display(), "retired Prime JavaScript publication");
         }
     }
     Ok(())
