@@ -462,7 +462,12 @@ async fn restart_tunnel(kind: &TunnelKind, port: u16) -> anyhow::Result<Child> {
 /// tailnet.
 pub async fn tailscale_available() -> bool {
     // Cheapest possible check first.
-    let version = Command::new("tailscale").arg("--version").output().await;
+    // The startup deadline drops these probes; a wedged `tailscale` must not outlive the daemon.
+    let version = Command::new("tailscale")
+        .arg("--version")
+        .kill_on_drop(true)
+        .output()
+        .await;
     match &version {
         Ok(o) => debug!(
             exit = ?o.status.code(),
@@ -480,7 +485,11 @@ pub async fn tailscale_available() -> bool {
         return false;
     }
     // Then confirm the daemon is running and signed in.
-    let status = Command::new("tailscale").arg("status").output().await;
+    let status = Command::new("tailscale")
+        .arg("status")
+        .kill_on_drop(true)
+        .output()
+        .await;
     match &status {
         Ok(o) => debug!(
             exit = ?o.status.code(),
@@ -501,6 +510,7 @@ async fn inspect_existing_funnel(local_port: u16) -> Option<String> {
     let out = Command::new("tailscale")
         .args(["funnel", "status", "--json"])
         .stdin(std::process::Stdio::null())
+        .kill_on_drop(true)
         .output()
         .await
         .ok()?;
@@ -594,6 +604,7 @@ async fn check_funnel_capability() -> anyhow::Result<()> {
     let out = Command::new("tailscale")
         .args(["status", "--json"])
         .stdin(std::process::Stdio::null())
+        .kill_on_drop(true)
         .output()
         .await
         .map_err(|e| anyhow::anyhow!("could not run `tailscale status --json`: {e}"))?;
@@ -624,6 +635,7 @@ async fn check_funnel_capability() -> anyhow::Result<()> {
 async fn tailscale_funnel_url() -> anyhow::Result<String> {
     let out = Command::new("tailscale")
         .args(["status", "--json"])
+        .kill_on_drop(true)
         .output()
         .await
         .map_err(|e| anyhow::anyhow!("failed to run tailscale status: {}", e))?;
@@ -767,39 +779,51 @@ pub fn check_cloudflared() -> anyhow::Result<()> {
     }
 }
 
+/// How long a sync `tailscale` probe may take. A healthy CLI answers in well under a second;
+/// a wedged `tailscaled` must not hang `aoe serve`'s pre-flight, which runs before the
+/// Daemon's startup deadline, or freeze the TUI when R opens the view.
+const SYNC_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+
 /// Sync counterpart of `tailscale_available()` for use from the TUI (which avoids spinning
 /// up a tokio runtime just to probe for a CLI).
 pub fn tailscale_available_sync() -> bool {
+    tailscale_available_sync_with(std::ffi::OsStr::new("tailscale"), SYNC_PROBE_TIMEOUT)
+}
+
+fn tailscale_available_sync_with(program: &std::ffi::OsStr, timeout: std::time::Duration) -> bool {
     // Unlike the async path, this runs on the TUI render hot path, so we keep it cheap and
     // quiet on the happy path.
-    let version = std::process::Command::new("tailscale")
-        .arg("--version")
+    probe_succeeds(program, "--version", timeout) && probe_succeeds(program, "status", timeout)
+}
+
+/// Whether `program arg` exits zero within `timeout`; a probe still running is killed.
+fn probe_succeeds(program: &std::ffi::OsStr, arg: &str, timeout: std::time::Duration) -> bool {
+    let spawned = std::process::Command::new(program)
+        .arg(arg)
+        .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
-        .status();
-    let version_ok = version.as_ref().map(|s| s.success()).unwrap_or(false);
-    if !version_ok {
-        debug!(
-            error = ?version.as_ref().err(),
-            exit = ?version.as_ref().ok().and_then(|s| s.code()),
-            "tailscale_available_sync: `tailscale --version` failed"
-        );
-        return false;
+        .spawn();
+    let status =
+        spawned.and_then(|mut child| crate::process::wait_with_timeout(&mut child, timeout));
+    match status {
+        Ok(Some(status)) if status.success() => true,
+        Ok(Some(status)) => {
+            debug!(exit = ?status.code(), "tailscale_available_sync: `tailscale {arg}` failed");
+            false
+        }
+        Ok(None) => {
+            debug!(
+                timeout_s = timeout.as_secs_f32(),
+                "tailscale_available_sync: `tailscale {arg}` timed out; treating Tailscale as unavailable"
+            );
+            false
+        }
+        Err(error) => {
+            debug!(%error, "tailscale_available_sync: `tailscale {arg}` could not run");
+            false
+        }
     }
-    let status = std::process::Command::new("tailscale")
-        .arg("status")
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status();
-    let status_ok = status.as_ref().map(|s| s.success()).unwrap_or(false);
-    if !status_ok {
-        debug!(
-            error = ?status.as_ref().err(),
-            exit = ?status.as_ref().ok().and_then(|s| s.code()),
-            "tailscale_available_sync: `tailscale status` failed (likely not logged in)"
-        );
-    }
-    status_ok
 }
 
 /// Sync counterpart of `check_funnel_capability()`.
@@ -807,11 +831,14 @@ pub fn tailscale_funnel_cap_ready_sync() -> bool {
     // Tailscale emits the cap key with the allowed-port list appended as a query string,
     // e.g. `?ports=443,8443,10000`.
     const FUNNEL_CAP_PREFIX: &str = "https://tailscale.com/cap/funnel-ports";
-    let out = std::process::Command::new("tailscale")
-        .args(["status", "--json"])
-        .output();
-    let Ok(out) = out else {
-        debug!("tailscale_funnel_cap_ready_sync: spawn failed");
+    let out = crate::process::run_with_timeout(
+        std::process::Command::new("tailscale")
+            .args(["status", "--json"])
+            .stdin(std::process::Stdio::null()),
+        SYNC_PROBE_TIMEOUT,
+    );
+    let Ok(Some(out)) = out else {
+        debug!("tailscale_funnel_cap_ready_sync: spawn failed or timed out");
         return false;
     };
     if !out.status.success() {
@@ -862,6 +889,36 @@ mod tests {
     }
 
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn a_wedged_tailscale_reads_as_unavailable_within_the_probe_bound() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        // (script body, expected availability)
+        let cases = [
+            ("exit 0", true),
+            ("[ \"$1\" = status ] && exit 1; exit 0", false), // not logged in
+            ("[ \"$1\" = status ] && exec sleep 600; exit 0", false), // wedged tailscaled
+        ];
+        for (i, (body, expected)) in cases.into_iter().enumerate() {
+            let fake = tmp.path().join(format!("tailscale-{i}"));
+            std::fs::write(&fake, format!("#!/bin/sh\n{body}\n")).unwrap();
+            std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let started = std::time::Instant::now();
+            let timeout = std::time::Duration::from_millis(300);
+            assert_eq!(
+                tailscale_available_sync_with(fake.as_os_str(), timeout),
+                expected,
+                "{body}"
+            );
+            assert!(
+                started.elapsed() < std::time::Duration::from_secs(3),
+                "{body}: took {:?}",
+                started.elapsed()
+            );
+        }
+    }
 
     // The telemetry `serve_mode` signal reads `mode_label()`, so a named
     // Cloudflare tunnel must bucket to "tunnel" rather than leak the configured

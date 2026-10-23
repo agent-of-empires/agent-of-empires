@@ -274,10 +274,33 @@ async fn notify_stopping() {
 #[cfg(not(unix))]
 async fn notify_stopping() {}
 
+/// Bounds a remote start from the moment the Daemon starts, so a Tunnel that never comes up
+/// stops on its own even when nothing is waiting on it. Longer than one 60 s Tailscale step,
+/// so first-time HTTPS cert provisioning still fits.
+pub(crate) const TUNNEL_STARTUP_DEADLINE: Duration = Duration::from_secs(90);
+
+async fn within_tunnel_deadline<T>(
+    deadline: tokio::time::Instant,
+    start: impl Future<Output = anyhow::Result<T>>,
+) -> anyhow::Result<T> {
+    tokio::time::timeout_at(deadline, start)
+        .await
+        .unwrap_or_else(|_| {
+            Err(anyhow::anyhow!(
+                "The HTTPS tunnel did not come up within {}s, so the daemon stopped.\n\n\
+                 Most likely cause: Tailscale Funnel needs HTTPS certs or ACL approval, or \
+                 cloudflared is rate-limited or offline. Re-run with AGENT_OF_EMPIRES_DEBUG=1 \
+                 and check debug.log for details.",
+                TUNNEL_STARTUP_DEADLINE.as_secs()
+            ))
+        })
+}
+
 pub(crate) async fn start_server(
     config: ServerConfig<'_>,
     transaction: crate::daemon::lifecycle::Transaction,
 ) -> anyhow::Result<()> {
+    let tunnel_deadline = tokio::time::Instant::now() + TUNNEL_STARTUP_DEADLINE;
     let ServerConfig {
         profile,
         host,
@@ -579,48 +602,47 @@ pub(crate) async fn start_server(
         crate::acp::version_probe::warn_for_structured_sessions(&instances, !is_daemon).await;
     }
 
-    // Start tunnel if remote mode.
-    let tailscale_ok = if remote && !no_tailscale {
-        let available = tunnel::tailscale_available().await;
-        tracing::debug!(target: "http.middleware",
-            no_tailscale,
-            tailscale_available = available,
-            "tunnel: choosing transport"
-        );
-        available
-    } else {
-        if remote && no_tailscale {
-            tracing::debug!(target: "http.middleware", "tunnel: --no-tailscale set, skipping Tailscale auto-detection");
-        }
-        false
-    };
-
     let tunnel_handle = if remote {
-        let handle = if let (Some(name), Some(url)) = (tunnel_name, tunnel_url) {
-            tunnel::TunnelHandle::spawn_named(name, url, local_port).await?
-        } else if tailscale_ok {
-            info!("Tailscale detected; using Tailscale Funnel for stable HTTPS origin");
-            // Do NOT fall back to Cloudflare on Tailscale failure.
-            tunnel::TunnelHandle::spawn_tailscale(local_port)
-                .await
-                .map_err(|e| {
-                    anyhow::anyhow!(
-                        "Tailscale Funnel setup failed: {e}\n\n\
-                     aoe detected a logged-in Tailscale on this host and did not \
-                     fall back to Cloudflare, because doing so silently would \
-                     give you a rotating URL that breaks installed PWAs (the \
-                     reason Tailscale is the preferred transport).\n\n\
-                     Ways to move forward:\n  \
-                     - Fix the Tailscale issue above and re-run `aoe serve --remote`.\n  \
-                     - Re-run with `aoe serve --remote --no-tailscale` to use \
-                     Cloudflare intentionally (quick-tunnel URL rotates on restart).\n  \
-                     - Re-run with `--tunnel-name <name> --tunnel-url <host>` \
-                     to use a named Cloudflare tunnel."
-                    )
-                })?
-        } else {
-            tunnel::TunnelHandle::spawn_quick(local_port).await?
-        };
+        // Choosing and starting the tunnel is the part that can hang, so it shares one deadline.
+        let handle = within_tunnel_deadline(tunnel_deadline, async {
+            let tailscale_ok = if no_tailscale {
+                tracing::debug!(target: "http.middleware", "tunnel: --no-tailscale set, skipping Tailscale auto-detection");
+                false
+            } else {
+                let available = tunnel::tailscale_available().await;
+                tracing::debug!(target: "http.middleware",
+                    tailscale_available = available,
+                    "tunnel: choosing transport"
+                );
+                available
+            };
+            anyhow::Ok(if let (Some(name), Some(url)) = (tunnel_name, tunnel_url) {
+                tunnel::TunnelHandle::spawn_named(name, url, local_port).await?
+            } else if tailscale_ok {
+                info!("Tailscale detected; using Tailscale Funnel for stable HTTPS origin");
+                // Do NOT fall back to Cloudflare on Tailscale failure.
+                tunnel::TunnelHandle::spawn_tailscale(local_port)
+                    .await
+                    .map_err(|e| {
+                        anyhow::anyhow!(
+                            "Tailscale Funnel setup failed: {e}\n\n\
+                             aoe detected a logged-in Tailscale on this host and did not \
+                             fall back to Cloudflare, because doing so silently would \
+                             give you a rotating URL that breaks installed PWAs (the \
+                             reason Tailscale is the preferred transport).\n\n\
+                             Ways to move forward:\n  \
+                             - Fix the Tailscale issue above and re-run `aoe serve --remote`.\n  \
+                             - Re-run with `aoe serve --remote --no-tailscale` to use \
+                             Cloudflare intentionally (quick-tunnel URL rotates on restart).\n  \
+                             - Re-run with `--tunnel-name <name> --tunnel-url <host>` \
+                             to use a named Cloudflare tunnel."
+                        )
+                    })?
+            } else {
+                tunnel::TunnelHandle::spawn_quick(local_port).await?
+            })
+        })
+        .await?;
 
         let tunnel_url_with_token = if let Some(ref token) = auth_token {
             format!("{}/?token={}", handle.url, token)
@@ -1376,6 +1398,27 @@ async fn remote_rotation_loop(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test(start_paused = true)]
+    async fn a_tunnel_start_is_bounded_from_the_daemon_start_not_from_the_wait() {
+        let started = tokio::time::Instant::now();
+        let deadline = started + TUNNEL_STARTUP_DEADLINE;
+        // Startup work before the tunnel uses up part of the budget.
+        tokio::time::advance(Duration::from_secs(80)).await;
+        let err = within_tunnel_deadline(deadline, std::future::pending::<anyhow::Result<()>>())
+            .await
+            .unwrap_err();
+        assert_eq!(started.elapsed(), TUNNEL_STARTUP_DEADLINE);
+        assert!(err.to_string().contains("within 90s"), "{err}");
+
+        let deadline = tokio::time::Instant::now() + TUNNEL_STARTUP_DEADLINE;
+        assert_eq!(
+            within_tunnel_deadline(deadline, async { Ok(7) })
+                .await
+                .unwrap(),
+            7
+        );
+    }
 
     #[tokio::test]
     async fn passphraseless_start_retires_a_predecessors_passphrase() {
