@@ -9,8 +9,14 @@ async function openFile(page: Page, serve: ServeHandle, title?: string) {
   const sessions = await listSessions(serve.baseUrl);
   const session = title ? sessions.find((item) => item.title === title) : sessions[0];
   const sessionLink = page.locator(`a[href="/session/${session!.id}"]`).first();
-  if (page.url().startsWith(serve.baseUrl) && (await sessionLink.isVisible())) await sessionLink.click();
+  // In-app navigation keeps one document, so a later history.back() stays a popstate.
+  if (page.url().startsWith(serve.baseUrl)) await sessionLink.click();
   else await page.goto(`${serve.baseUrl}/session/${session!.id}`);
+  await showNotes(page);
+  return session!;
+}
+
+async function showNotes(page: Page) {
   if (page.viewportSize()!.width < 768) {
     await page.getByRole("button", { name: "Toggle panels" }).click();
     await page.getByTestId("mobile-right-panel-picker").getByRole("button", { name: "Files", exact: true }).click();
@@ -20,7 +26,6 @@ async function openFile(page: Page, serve: ServeHandle, title?: string) {
     if ((await toggle.getAttribute("aria-pressed")) !== "true") await toggle.click();
   }
   await page.getByRole("button", { name: "notes.txt", exact: true }).first().click();
-  return session!;
 }
 
 async function enableEditing(page: Page, serve: ServeHandle) {
@@ -190,6 +195,29 @@ test("mobile editing keeps controls usable and confirms leaving the Files pane",
   page.once("dialog", (dialog) => dialog.accept());
   await editor.press("Escape");
   await expect(editor).toHaveCount(0);
+});
+
+test("an unsaved draft survives crossing the mobile breakpoint in both directions", async ({ page, spawnServe }) => {
+  const serve = await spawnServe({
+    seedFn: seedSessionViaAoeAdd({ title: "file-resize", git: false, files: { "notes.txt": "original" } }),
+  });
+  await page.addInitScript(() =>
+    localStorage.setItem("aoe-web-settings", JSON.stringify({ fileEditing: true, autoOpenKeyboard: false })),
+  );
+  await openFile(page, serve);
+  await page.getByRole("button", { name: "Edit", exact: true }).click();
+  const editor = page.getByRole("textbox", { name: "Edit notes.txt" });
+  await editor.fill("desktop draft");
+  await page.setViewportSize({ width: 390, height: 844 });
+  // The desktop sidebar stays open as an overlay after the resize.
+  await page.getByRole("navigation", { name: "Sessions sidebar" }).getByRole("button", { name: "×" }).click();
+  // The Files pane keeps its selection locally; reopening the file restores the draft.
+  await showNotes(page);
+  await expect(editor).toHaveValue("desktop draft");
+  await editor.fill("phone draft");
+  await page.setViewportSize({ width: 1280, height: 720 });
+  await showNotes(page);
+  await expect(editor).toHaveValue("phone draft");
 });
 
 test("a Structured view save offers a note that appends to the draft without submitting", async ({
