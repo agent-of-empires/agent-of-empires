@@ -167,13 +167,13 @@ pub struct ServeArgs {
     #[arg(long)]
     pub open: bool,
 
-    /// Internal marker: this invocation is the detached child spawned by
-    /// `--daemon`. Set automatically by `start_daemon()`; never pass by hand.
-    /// Tells `main.rs` to classify the process as `ServeDaemonChild` so the
-    /// sink resolver routes tracing to the configured log file (its
-    /// stdout/stderr are detached). Hidden from `--help`.
+    /// Internal marker for a detached child; selects daemon logging.
     #[arg(long, hide = true)]
     pub daemon_child: bool,
+
+    /// Preserve missing defaults only during automatic read acquisition.
+    #[arg(long, hide = true, requires_all = ["daemon_child", "core_only"])]
+    pub read_acquisition: bool,
 
     /// Restart the running managed daemon with its recorded policy.
     /// Missing credentials are rejected before stopping it.
@@ -626,6 +626,7 @@ impl ServeLaunch {
             passphrase,
             open: false,
             daemon_child: false,
+            read_acquisition: false,
             restart: false,
             rollback: false,
             allowed_host: self.allowed_host.clone(),
@@ -1317,6 +1318,7 @@ pub async fn run(profile: &str, mut args: ServeArgs, startup: Option<ServeStartu
         crate::server::ServerConfig {
             profile,
             core_only: args.core_only,
+            read_acquisition: args.read_acquisition,
             host: &host,
             port: args.resolved_port(),
             auth_mode,
@@ -1498,9 +1500,10 @@ pub(crate) async fn ensure_local_daemon(
         let profile = resolved_profile.as_str();
         crate::session::require_known_profile(profile)?;
         let cli = crate::cli::Cli::try_parse_from(["aoe", "serve", "--core-only", "--daemon"])?;
-        let Some(crate::cli::Commands::Serve(args)) = cli.command else {
+        let Some(crate::cli::Commands::Serve(mut args)) = cli.command else {
             unreachable!()
         };
+        args.read_acquisition = native_profile.is_none();
         start_daemon(profile, &args, &transaction, false).await?;
         daemon_pid()
     } else {
@@ -1599,6 +1602,9 @@ async fn start_daemon(
     cmd.env_remove("AOE_CITYHALL_MODE")
         .env_remove("AOE_SERVE_PASSPHRASE");
     cmd.args(["serve", "--daemon-child"]);
+    if args.read_acquisition {
+        cmd.arg("--read-acquisition");
+    }
     if args.core_only {
         cmd.arg("--core-only");
     } else {

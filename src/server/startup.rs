@@ -170,6 +170,7 @@ pub(crate) struct ServerConfig<'a> {
     pub host: &'a str,
     pub port: u16,
     pub core_only: bool,
+    pub read_acquisition: bool,
     /// Auth mode the operator asked for. Carried whole rather than
     /// flattened to a "no token" bool so `start_server` can tell
     /// `--auth=passphrase` (token off, passphrase wall on) apart from
@@ -280,6 +281,7 @@ pub(crate) async fn start_server(
         host,
         port,
         core_only,
+        read_acquisition,
         auth_mode,
         read_only,
         remote,
@@ -310,7 +312,7 @@ pub(crate) async fn start_server(
 
     let ownership_repair = if !read_only && std::env::var_os("AOE_CITYHALL_MODE").is_none() {
         if crate::session::list_profiles().is_ok_and(|profiles| profiles.is_empty()) {
-            let stale_default = core_only && {
+            let stale_default = read_acquisition && core_only && {
                 let configured_default =
                     crate::session::config::Config::load_or_warn().default_profile;
                 !configured_default.is_empty()
