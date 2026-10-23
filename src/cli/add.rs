@@ -678,6 +678,15 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
             &spec.command,
             std::path::Path::new(&instance.project_path),
             || containers::get_container_runtime().is_available(),
+            // Trust is asked later, so without --trust-hooks the repository's hooks may still run.
+            || {
+                crate::session::builder::structured::create_hooks_apply(
+                    &crate::session::config::profile_config::resolve_config_or_warn(profile).hooks,
+                    &original_project_path,
+                    args.scratch,
+                    args.trust_hooks.then_some(true),
+                )
+            },
         ) {
             let hint = crate::acp::install_hints::install_hint_for(&spec.command)
                 .unwrap_or("install via your package manager and re-run");
@@ -1322,13 +1331,15 @@ fn cleanup_partial_session(
 
 /// Whether a structured `aoe add` must refuse, or fall back, for its adapter. A sandboxed
 /// adapter runs inside the container, which bundles it, so a sandbox the runtime can start
-/// skips the host check.
+/// skips the host check. `create_hooks` is asked only when the adapter isn't found: an
+/// `on_create` hook that runs first may install it.
 fn structured_adapter_missing(
     args: &AddArgs,
     config: &crate::session::Config,
     command: &str,
     project_path: &std::path::Path,
     runtime_available: impl FnOnce() -> bool,
+    create_hooks: impl FnOnce() -> bool,
 ) -> bool {
     let sandboxed =
         (args.sandbox || args.sandbox_image.is_some() || config.sandbox.enabled_by_default)
@@ -1339,6 +1350,7 @@ fn structured_adapter_missing(
             Some(project_path),
             config,
         )
+        && !create_hooks()
 }
 
 fn resolve_tool_for_add(args: &AddArgs, config: &crate::session::Config) -> Result<String> {
@@ -1989,6 +2001,7 @@ mod tests {
                         checked_runtime.set(true);
                         runtime
                     },
+                    || false,
                 );
                 assert_eq!(got, refused, "{label}");
                 let asked_for_sandbox = !extra.is_empty() || config.sandbox.enabled_by_default;
@@ -1997,6 +2010,28 @@ mod tests {
                     asked_for_sandbox,
                     "{label}: runtime probe"
                 );
+            }
+            // An on_create hook that may install the adapter clears the refusal, and is asked
+            // about only when the adapter isn't found.
+            let (_, args) = dispatch_argv(&["aoe", "add", dir]);
+            for (label, config, missing) in [
+                ("found nowhere", &plain, true),
+                ("on PATH", &on_path, false),
+            ] {
+                let asked = std::cell::Cell::new(false);
+                let got = super::super::structured_adapter_missing(
+                    &args,
+                    config,
+                    &adapter,
+                    project.path(),
+                    || false,
+                    || {
+                        asked.set(true);
+                        true
+                    },
+                );
+                assert!(!got, "{label}: an on_create hook may install it");
+                assert_eq!(asked.get(), missing, "{label}: asked about hooks");
             }
         }
 
