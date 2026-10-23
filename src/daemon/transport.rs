@@ -60,13 +60,13 @@ pub(crate) fn prepare_runtime_directory(parent: &Path) -> anyhow::Result<()> {
         {
             if ancestor == parent {
                 anyhow::bail!(
-                    "Unsafe daemon socket directory: {}. Set this directory to mode 0700 with `chmod 0700 -- {}`, then retry.",
+                    "Unsafe daemon socket directory: {}. Set this directory to mode 0700 with `chmod -- 0700 {}`, then retry.",
                     ancestor.display(),
                     crate::session::environment::shell_escape(&ancestor.to_string_lossy())
                 );
             }
             anyhow::bail!(
-                "Unsafe daemon socket directory: {}. Remove group/other write permission from this directory with `chmod go-w -- {}`, then retry.",
+                "Unsafe daemon socket directory: {}. Remove group/other write permission from this directory with `chmod -- go-w {}`, then retry.",
                 ancestor.display(),
                 crate::session::environment::shell_escape(&ancestor.to_string_lossy())
             );
@@ -87,7 +87,7 @@ pub(crate) fn prepare_runtime_directory(parent: &Path) -> anyhow::Result<()> {
     );
     anyhow::ensure!(
         directory.mode() & 0o777 == 0o700,
-        "Daemon socket directory {} must have mode 0700. Set it with `chmod 0700 -- {}`, then retry.",
+        "Daemon socket directory {} must have mode 0700. Set it with `chmod -- 0700 {}`, then retry.",
         parent.display(),
         crate::session::environment::shell_escape(&parent.to_string_lossy())
     );
