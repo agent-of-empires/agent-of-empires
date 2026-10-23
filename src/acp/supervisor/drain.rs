@@ -550,10 +550,9 @@ impl<S: BroadcastSink> Drain<S> {
         Self::refresh_launch_env(&self.session_id, &mut config).await;
         self.refuse_if_dismissed(&config).await;
         let cancelled = lock_recover(&self.lifecycle).cancel_requested(&respawn_lease);
-        if let Some(reason) = cancelled {
+        if cancelled.is_some() {
             if lock_recover(&self.lifecycle).convert_to_stopping(&respawn_lease) {
-                self.finish_cancelled(&respawn_lease, previous, reason, None)
-                    .await;
+                self.finish_cancelled(&respawn_lease, previous).await;
             }
             return None;
         }
@@ -770,7 +769,7 @@ impl<S: BroadcastSink> Drain<S> {
         match admit_stored_row(config.source_profile.as_deref(), &self.session_id).await {
             Ok(()) => {}
             Err(SupervisorError::Blocked(blocked)) => {
-                lock_recover(&self.lifecycle).begin_stop(&self.session_id, blocked.code());
+                lock_recover(&self.lifecycle).begin_stop(&self.session_id, blocked.code(), false);
             }
             Err(error) => warn!(
                 target: "acp.supervisor",
@@ -1782,16 +1781,12 @@ mod tests {
                 Ok(())
             })
             .unwrap();
-        save_record("s-dismissed", 4242, 0);
+        save_attested_test_record("s-dismissed", 4242, 0);
         let socket = worker_registry::socket_path_for("s-dismissed").unwrap();
         let mut config = runner_config(socket);
         config.source_profile = Some(profile);
         let lease = sup
-            .test_install_runner(
-                "s-dismissed",
-                config,
-                Some(RunnerIdentity::unattested(4242, 0)),
-            )
+            .test_install_runner("s-dismissed", config, Some(attested_test_identity(4242, 0)))
             .await;
         let (inbound_tx, inbound_rx) = mpsc::channel::<Event>(4);
         let drain = sup.start_drain_task("s-dismissed".into(), lease, inbound_rx, None);
@@ -1828,16 +1823,12 @@ mod tests {
                 .with_launcher(gated_launcher(&gate, 4343)),
         );
         let (storage, profile) = seed_row("s-trashed");
-        save_record("s-trashed", 4242, 0);
+        save_attested_test_record("s-trashed", 4242, 0);
         let socket = worker_registry::socket_path_for("s-trashed").unwrap();
         let mut config = runner_config(socket);
         config.source_profile = Some(profile);
         let lease = sup
-            .test_install_runner(
-                "s-trashed",
-                config,
-                Some(RunnerIdentity::unattested(4242, 0)),
-            )
+            .test_install_runner("s-trashed", config, Some(attested_test_identity(4242, 0)))
             .await;
         let (inbound_tx, inbound_rx) = mpsc::channel::<Event>(4);
         let drain = sup.start_drain_task("s-trashed".into(), lease, inbound_rx, None);
