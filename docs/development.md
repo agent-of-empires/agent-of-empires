@@ -25,9 +25,11 @@ preserves an intentional policy exception; it does not imply that the handler
 has no side effects.
 
 Keep read-only refusal ahead of JSON rejection using the route layer, parts-only
-guard, or existing deferred-rejection convention. Use direct Axum method builders.
-Opaque builders and unsupported router compositions fail the audit until their
-method coverage is implemented.
+guard, or existing deferred-rejection convention. Deferred JSON parameters need
+a completed top-level read-only guard before their first use. The audited
+preparation wrappers may forward them unchanged to their audited delegate.
+Use direct Axum method builders. Opaque builders and unsupported router
+compositions fail the audit until their method coverage is implemented.
 
 Debug builds carry line tables only, and dependencies carry no debug info, to keep `target/` small across worktrees. Panics still name the file and line in this crate, but a debugger has no local values; rebuild with `RUSTFLAGS="-Cdebuginfo=2"` for a full debugging session.
 

@@ -927,41 +927,194 @@ mod tests {
         })
     }
 
+    fn eager_json_type(ty: &syn::Type) -> bool {
+        let syn::Type::Path(path) = ty else {
+            return false;
+        };
+        let Some(segment) = path.path.segments.last() else {
+            return false;
+        };
+        if segment.ident == "Json" {
+            return true;
+        }
+        if segment.ident != "Option" {
+            return false;
+        }
+        let syn::PathArguments::AngleBracketed(arguments) = &segment.arguments else {
+            return false;
+        };
+        arguments.args.iter().any(
+            |argument| matches!(argument, syn::GenericArgument::Type(ty) if eager_json_type(ty)),
+        )
+    }
+
     fn eager_json_consumer(signature: &str) -> Option<usize> {
         use syn::spanned::Spanned;
-
-        fn eager(ty: &syn::Type) -> bool {
-            let syn::Type::Path(path) = ty else {
-                return false;
-            };
-            let Some(segment) = path.path.segments.last() else {
-                return false;
-            };
-            if segment.ident == "Json" {
-                return true;
-            }
-            if segment.ident != "Option" {
-                return false;
-            }
-            let syn::PathArguments::AngleBracketed(arguments) = &segment.arguments else {
-                return false;
-            };
-            arguments
-                .args
-                .iter()
-                .any(|argument| matches!(argument, syn::GenericArgument::Type(ty) if eager(ty)))
-        }
 
         syn::parse_str::<syn::Signature>(signature)
             .expect("audited function signature")
             .inputs
             .iter()
             .find_map(|argument| match argument {
-                syn::FnArg::Typed(argument) if eager(&argument.ty) => {
+                syn::FnArg::Typed(argument) if eager_json_type(&argument.ty) => {
                     Some(argument.ty.span().byte_range().start)
                 }
                 _ => None,
             })
+    }
+
+    fn deferred_json_is_guarded(signature: &str, body: &str, delegate: Option<&str>) -> bool {
+        use syn::{spanned::Spanned, visit::Visit};
+
+        struct FirstUse<'a> {
+            binding: &'a syn::Ident,
+            position: Option<usize>,
+        }
+        impl FirstUse<'_> {
+            fn tokens(&mut self, tokens: proc_macro2::TokenStream) {
+                for token in tokens {
+                    match token {
+                        proc_macro2::TokenTree::Ident(ident) if ident == *self.binding => {
+                            self.record(ident.span().byte_range().start);
+                        }
+                        proc_macro2::TokenTree::Group(group) => self.tokens(group.stream()),
+                        _ => {}
+                    }
+                }
+            }
+
+            fn record(&mut self, position: usize) {
+                self.position = Some(self.position.map_or(position, |old| old.min(position)));
+            }
+        }
+        impl<'ast> Visit<'ast> for FirstUse<'_> {
+            fn visit_expr_path(&mut self, path: &'ast syn::ExprPath) {
+                if path.path.get_ident() == Some(self.binding) {
+                    self.record(path.span().byte_range().start);
+                }
+                syn::visit::visit_expr_path(self, path);
+            }
+
+            fn visit_macro(&mut self, expression: &'ast syn::Macro) {
+                self.tokens(expression.tokens.clone());
+            }
+        }
+
+        fn exits(block: &syn::Block) -> bool {
+            matches!(
+                block.stmts.last(),
+                Some(syn::Stmt::Expr(syn::Expr::Return(_), _))
+            )
+        }
+
+        fn app_state_type(ty: &syn::Type) -> bool {
+            match ty {
+                syn::Type::Reference(reference) => app_state_type(&reference.elem),
+                syn::Type::Path(path) => path.path.segments.iter().any(|segment| {
+                    segment.ident == "AppState"
+                        || matches!(&segment.arguments, syn::PathArguments::AngleBracketed(arguments)
+                            if arguments.args.iter().any(|argument|
+                                matches!(argument, syn::GenericArgument::Type(ty) if app_state_type(ty))))
+                }),
+                _ => false,
+            }
+        }
+
+        fn read_only_condition(condition: &syn::Expr, state: Option<&syn::Ident>) -> bool {
+            match condition {
+                syn::Expr::Field(field) => {
+                    matches!(&field.member, syn::Member::Named(member) if member == "read_only")
+                        && matches!(&*field.base, syn::Expr::Path(path)
+                            if state.is_some() && path.path.get_ident() == state)
+                }
+                syn::Expr::Let(binding)
+                    if matches!(&*binding.pat, syn::Pat::TupleStruct(pattern)
+                        if pattern.path.is_ident("Some") && pattern.elems.len() == 1) =>
+                {
+                    matches!(&*binding.expr, syn::Expr::Call(call)
+                        if matches!(&*call.func, syn::Expr::Path(path)
+                            if path.path.segments.last().is_some_and(|name| name.ident == "read_only_block"))
+                        && call.args.len() == 1
+                        && matches!(&call.args[0], syn::Expr::Reference(reference)
+                            if matches!(&*reference.expr, syn::Expr::Path(path)
+                                if state.is_some() && path.path.get_ident() == state)))
+                }
+                _ => false,
+            }
+        }
+
+        let signature = syn::parse_str::<syn::Signature>(signature).expect("audited signature");
+        let state = signature.inputs.iter().find_map(|argument| {
+            let syn::FnArg::Typed(argument) = argument else {
+                return None;
+            };
+            if !app_state_type(&argument.ty) {
+                return None;
+            }
+            match &*argument.pat {
+                syn::Pat::Ident(binding) => Some(&binding.ident),
+                syn::Pat::TupleStruct(pattern) if pattern.elems.len() == 1 => {
+                    match pattern.elems.first()? {
+                        syn::Pat::Ident(binding) => Some(&binding.ident),
+                        _ => None,
+                    }
+                }
+                _ => None,
+            }
+        });
+        let body = syn::parse_str::<syn::Block>(body).expect("audited body");
+        signature.inputs.iter().all(|argument| {
+            let syn::FnArg::Typed(argument) = argument else {
+                return true;
+            };
+            let syn::Type::Path(path) = &*argument.ty else {
+                return true;
+            };
+            let Some(segment) = path.path.segments.last() else {
+                return true;
+            };
+            let syn::PathArguments::AngleBracketed(arguments) = &segment.arguments else {
+                return true;
+            };
+            if segment.ident != "Result"
+                || !matches!(arguments.args.first(), Some(syn::GenericArgument::Type(ty)) if eager_json_type(ty))
+            {
+                return true;
+            }
+            let syn::Pat::Ident(binding) = &*argument.pat else {
+                return false;
+            };
+            let mut first = FirstUse {
+                binding: &binding.ident,
+                position: None,
+            };
+            first.visit_block(&body);
+            let Some(first) = first.position else {
+                return true;
+            };
+            if body.stmts.iter().any(|statement| {
+                matches!(statement, syn::Stmt::Expr(syn::Expr::If(guard), _)
+                    if read_only_condition(&guard.cond, state) && exits(&guard.then_branch)
+                    && guard.span().byte_range().end <= first)
+            }) {
+                return true;
+            }
+            let [syn::Stmt::Expr(syn::Expr::Await(tail), None)] = body.stmts.as_slice() else {
+                return false;
+            };
+            let syn::Expr::Call(call) = &*tail.base else {
+                return false;
+            };
+            delegate.is_some_and(|target| {
+                matches!(&*call.func, syn::Expr::Path(path)
+                    if path.path.segments.last().is_some_and(|name| name.ident == target))
+                    && call.args.iter().any(|argument| {
+                        matches!(argument, syn::Expr::Path(path)
+                            if path.path.get_ident() == Some(&binding.ident)
+                            && path.span().byte_range().start == first)
+                    })
+            })
+        })
     }
 
     #[test]
@@ -1014,6 +1167,62 @@ mod tests {
     }
 
     #[test]
+    fn deferred_json_requires_a_completed_guard_before_first_use() {
+        for parameter in ["body", "payload"] {
+            for ty in ["Json<Body>", "Option<axum::Json<Body>>"] {
+                let signature = format!(
+                    "fn write(State(app): State<Arc<AppState>>, {parameter}: std::result::Result<{ty}, JsonRejection>)"
+                );
+                for consumer in [
+                    format!("let value = match {parameter} {{ Ok(value) => value, Err(error) => return error }};"),
+                    format!("let Ok(value) = {parameter} else {{ return bad_body() }};"),
+                    format!("let value = {parameter}.map_err(rejection)?;"),
+                    format!("consume!({parameter});"),
+                ] {
+                    for guard in [
+                        "if app.read_only { return forbidden() }",
+                        "if let Some(response) = read_only_block(&app) { return response }",
+                    ] {
+                        assert!(deferred_json_is_guarded(
+                            &signature, &format!("{{ {guard} {consumer} }}"), None
+                        ));
+                        assert!(!deferred_json_is_guarded(
+                            &signature, &format!("{{ {consumer} {guard} }}"), None
+                        ));
+                    }
+                    for not_a_guard in [
+                        r#"let text = "if app.read_only { return forbidden() }";"#,
+                        "/* if app.read_only { return forbidden() } */",
+                        "if app.read_only { record() }",
+                        "if app.read_only && condition { return forbidden() }",
+                        "if condition { if app.read_only { return forbidden() } }",
+                    ] {
+                        assert!(!deferred_json_is_guarded(
+                            &signature, &format!("{{ {not_a_guard} {consumer} }}"), None
+                        ));
+                    }
+                }
+                assert!(deferred_json_is_guarded(
+                    &signature,
+                    &format!("{{ prepare(app, id, {parameter}).await }}"),
+                    Some("prepare")
+                ));
+                for body in [
+                    format!("{{ prepare(app, id, {parameter}.map(transform)).await }}"),
+                    format!("{{ inspect(&{parameter}); prepare(app, id, {parameter}).await }}"),
+                    format!("{{ unknown(app, id, {parameter}).await }}"),
+                ] {
+                    assert!(!deferred_json_is_guarded(
+                        &signature,
+                        &body,
+                        Some("prepare")
+                    ));
+                }
+            }
+        }
+    }
+
+    #[test]
     fn mutating_handlers_guard_read_only_before_body_extraction() {
         let routes = crate::server::access::router_mutating_handlers();
         let audited: Vec<_> = MUTATING_HANDLERS
@@ -1030,6 +1239,12 @@ mod tests {
                     failures.push(format!("{file}: handler `{name}` not found"));
                     continue;
                 };
+                let delegate = match *name {
+                    "ensure_session" | "start_session" => Some("prepare_agent_session"),
+                    "prepare_agent_session" => Some("prepare_agent_session_inner"),
+                    _ => None,
+                };
+                let deferred_guarded = deferred_json_is_guarded(signature, body, delegate);
                 let body = body
                     .lines()
                     .filter(|line| !line.trim_start().starts_with("//"))
@@ -1063,6 +1278,11 @@ mod tests {
                 {
                     failures.push(format!(
                         "{file}: `{name}` rejects JSON before its read-only guard"
+                    ));
+                }
+                if !route_layer && parts_guard.is_none() && !deferred_guarded {
+                    failures.push(format!(
+                        "{file}: `{name}` can reject deferred JSON before its read-only guard"
                     ));
                 }
             }
