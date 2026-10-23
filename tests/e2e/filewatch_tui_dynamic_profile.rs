@@ -1,12 +1,5 @@
-//! e2e: dynamic profile add/remove. Catches subscription-registration bugs
-//! (forgot to call `rewire_disk_subscriptions`) and forwarder wiring bugs
-//! (forwarder spawned but `disk_dirty` Arc not cloned correctly).
-//!
-//! Flow: spawn TUI; create a new profile from the test process; switch the
-//! TUI to the new profile via the picker; perform a `Storage::update`
-//! against the new profile from outside the TUI; assert the TUI reflects
-//! the row within sub-tick budget. Then delete the new profile and assert
-//! the TUI does not panic and the picker repopulates.
+//! External profile writes and removal propagate through daemon publication
+//! to the filtered TUI and its profile picker.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -15,7 +8,7 @@ use agent_of_empires::file_watch::FileWatchService;
 use agent_of_empires::session::{Instance, Storage};
 use serial_test::serial;
 
-use crate::harness::{require_tmux, HomeGuard, TuiTestHarness};
+use crate::harness::{require_tmux, wait_until, HomeGuard, TuiTestHarness};
 
 #[test]
 #[serial]
@@ -32,13 +25,12 @@ fn dynamic_profile_add_and_remove_keeps_subscriptions_in_sync() {
     h.spawn_tui();
     h.wait_for(" aoe ");
 
-    // All-profiles mode opens the picker on its first row, and the picker
-    // sinks `default` last, so that row is the new profile.
     h.send_keys("P");
     h.wait_for("Profiles");
-    h.assert_screen_contains(new_profile);
+    h.wait_for("> scratch");
     h.send_keys("Enter");
     h.wait_for_absent("Profiles", Duration::from_secs(5));
+    h.wait_for("[scratch]");
 
     let _home = HomeGuard::new(h.home_path());
 
@@ -65,25 +57,29 @@ fn dynamic_profile_add_and_remove_keeps_subscriptions_in_sync() {
         "TUI should not have crashed after profile dir removal"
     );
 
-    // The active-profile filter is not auto-reset when its dir vanishes,
-    // so the list header still reads `aoe [scratch]`. Switch back to
-    // all-profiles mode first: with the active profile gone from the
-    // list, the picker opens with "all" highlighted at the top
-    // (ProfilePickerDialog::new falls back to index 0), so Enter selects
-    // it and the header drops the profile tag.
+    // Row and catalogue removal share a publication; wait for the TUI to apply it.
+    wait_until(Duration::from_secs(5), Duration::from_millis(100), || {
+        let screen = h.capture_screen();
+        if screen.contains("[scratch]") && !screen.contains(title) {
+            Ok(())
+        } else {
+            Err(format!("removed profile row is still displayed:\n{screen}"))
+        }
+    });
+
+    // The filter stays selected until the user chooses another scope.
     h.send_keys("P");
     h.wait_for("Profiles");
+    h.wait_for_timeout("> all  0 sessions", Duration::from_secs(5));
     h.send_keys("Enter");
     h.wait_for_absent("Profiles", Duration::from_secs(5));
+    h.wait_for_absent("[scratch]", Duration::from_secs(5));
 
-    // Now in all-profiles mode the header carries no profile tag, so a
-    // lingering "scratch" can only be a stale picker row. Reopen the
-    // picker and assert the removed profile is gone. Substring "scratch"
-    // rather than "scratch  0 sessions" so a stale row with any session
-    // count still trips the assertion.
+    // With no profile tag, any scratch text would be a stale catalogue entry.
     h.send_keys("P");
     h.wait_for("Profiles");
-    h.wait_for_absent("scratch", Duration::from_secs(5));
+    h.assert_screen_not_contains(new_profile);
+    h.assert_screen_contains("default  0 sessions");
     h.send_keys("Escape");
     h.wait_for_absent("Profiles", Duration::from_secs(5));
 }

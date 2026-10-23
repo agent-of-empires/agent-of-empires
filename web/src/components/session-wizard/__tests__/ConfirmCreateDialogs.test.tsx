@@ -23,6 +23,7 @@ function renderHooks(props: Partial<Parameters<typeof HooksTrustDialog>[0]> = {}
       onLaunch={[]}
       onDestroy={[]}
       needsMcpTrust={false}
+      mcpSummaries={[]}
       onConfirm={onConfirm}
       onCancel={onCancel}
       {...props}

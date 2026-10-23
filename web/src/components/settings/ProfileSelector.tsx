@@ -6,9 +6,10 @@ import { validateProfileName } from "../profiles/profileName";
 interface Props {
   selectedProfile: string;
   onSelect: (profile: string) => void;
+  onRenamed: () => Promise<void> | void;
 }
 
-export function ProfileSelector({ selectedProfile, onSelect }: Props) {
+export function ProfileSelector({ selectedProfile, onSelect, onRenamed }: Props) {
   const [profiles, setProfiles] = useState<ProfileInfo[]>([]);
   const [mode, setMode] = useState<"create" | "rename" | null>(null);
   const [inputValue, setInputValue] = useState("");
@@ -52,7 +53,11 @@ export function ProfileSelector({ selectedProfile, onSelect }: Props) {
     const err = validateProfileName(trimmed);
     if (err) return setError(err);
     if (mode === "create" ? await createProfile(trimmed) : await renameProfile(selectedProfile, trimmed)) {
-      if (mode === "rename") onSelect(trimmed);
+      if (mode === "rename") {
+        const refreshed = onRenamed();
+        onSelect(trimmed);
+        await refreshed;
+      }
       closeInput();
       load();
     } else {

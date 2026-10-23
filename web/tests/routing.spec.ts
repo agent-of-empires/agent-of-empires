@@ -67,7 +67,10 @@ test.describe("URL routing", () => {
       if (route.request().method() === "POST") return route.fulfill({ status: 400 });
       requested = true;
       await sessionsPending;
-      await route.fulfill({ json: { sessions: [], workspace_ordering: [] } });
+      await route.fulfill({
+        headers: { "aoe-runtime-epoch": "mock-runtime", "aoe-runtime-revision": "1" },
+        json: { sessions: [], workspace_ordering: [] },
+      });
     });
 
     try {
@@ -88,6 +91,7 @@ test.describe("URL routing", () => {
     await page.route("**/api/sessions", (r) => {
       if (r.request().method() === "POST") return r.fulfill({ status: 400 });
       return r.fulfill({
+        headers: { "aoe-runtime-epoch": "mock-runtime", "aoe-runtime-revision": "1" },
         json: {
           sessions: [makeSession("known-session", "/tmp/known")],
           workspace_ordering: [],
@@ -117,7 +121,10 @@ const LAST_SESSION_KEY = "aoe-last-session-id";
 async function stubSessions(page: import("@playwright/test").Page, ids: string[]) {
   await page.route("**/api/sessions", (r) => {
     if (r.request().method() === "POST") return r.fulfill({ status: 400 });
-    return r.fulfill({ json: { sessions: ids.map((id) => makeSession(id)), workspace_ordering: [] } });
+    return r.fulfill({
+      headers: { "aoe-runtime-epoch": "mock-runtime", "aoe-runtime-revision": "1" },
+      json: { sessions: ids.map((id) => makeSession(id)), workspace_ordering: [] },
+    });
   });
   await page.route("**/api/sessions/*/ensure", (r) => r.fulfill({ json: { ok: true } }));
   await page.route("**/api/sessions/*/terminal", (r) => r.fulfill({ status: 200, body: "" }));

@@ -25,6 +25,18 @@ pub(super) fn render(view: &ServeView, frame: &mut Frame, area: Rect, theme: &Th
     let mut mouse = view.mouse.borrow_mut();
     mouse.keys.clear();
     mouse.copies.clear();
+    if view.stop_requested {
+        render_starting(
+            frame,
+            area,
+            theme,
+            &mut mouse,
+            ServeMode::Local,
+            Duration::ZERO,
+            true,
+        );
+        return;
+    }
     match &view.state {
         ServeViewState::ModePicker {
             selected,
@@ -56,7 +68,15 @@ pub(super) fn render(view: &ServeView, frame: &mut Frame, area: Rect, theme: &Th
         ),
         ServeViewState::Starting {
             mode, started_at, ..
-        } => render_starting(frame, area, theme, &mut mouse, *mode, started_at.elapsed()),
+        } => render_starting(
+            frame,
+            area,
+            theme,
+            &mut mouse,
+            *mode,
+            started_at.elapsed(),
+            false,
+        ),
         ServeViewState::Active { mode, .. } => {
             render_active(view, frame, area, theme, &mut mouse);
             if view.show_help {
@@ -422,18 +442,27 @@ fn render_starting(
     mouse: &mut ServeMouse,
     mode: ServeMode,
     elapsed: Duration,
+    stopping: bool,
 ) {
-    let (title, wait_line1, wait_line2) = match mode {
-        ServeMode::Tunnel => (
-            " Starting HTTPS tunnel... ",
-            "Waiting for the daemon to bring the tunnel up",
-            "(first-time Tailscale cert provisioning can take 30\u{2013}60s).",
-        ),
-        ServeMode::Local => (
-            " Starting local server... ",
-            "Binding on 0.0.0.0 and discovering interfaces",
-            "(usually under a second).",
-        ),
+    let (title, wait_line1, wait_line2) = if stopping {
+        (
+            " Stopping daemon... ",
+            "Waiting for the owned launch to settle, then stop",
+            "No reconnect or mutation will be replayed.",
+        )
+    } else {
+        match mode {
+            ServeMode::Tunnel => (
+                " Starting HTTPS tunnel... ",
+                "Waiting for the daemon to bring the tunnel up",
+                "(first-time Tailscale cert provisioning can take 30\u{2013}60s).",
+            ),
+            ServeMode::Local => (
+                " Starting local server... ",
+                "Binding on 0.0.0.0 and discovering interfaces",
+                "(usually under a second).",
+            ),
+        }
     };
     let inner = render_page(frame, area, title, theme.border, theme.title);
     let text = Style::default().fg(theme.text);
@@ -443,7 +472,11 @@ fn render_starting(
         Line::styled(wait_line2, text),
         Line::from(""),
         Line::styled(
-            format!("Elapsed: {}s    [Esc close]  [S stop]", elapsed.as_secs()),
+            if stopping {
+                "[Esc close]".to_owned()
+            } else {
+                format!("Elapsed: {}s    [Esc close]  [S stop]", elapsed.as_secs())
+            },
             Style::default().fg(theme.dimmed),
         ),
     ];
@@ -893,6 +926,9 @@ mod tests {
             show_help: false,
             mouse: Default::default(),
             copied: None,
+            pending_launch: None,
+            launch_in_flight: false,
+            stop_requested: false,
         };
         let mut term = Terminal::new(TestBackend::new(72, 26)).unwrap();
         term.draw(|f| render(&view, f, f.area(), &Theme::default()))
@@ -940,6 +976,9 @@ mod tests {
             show_help: false,
             mouse: Default::default(),
             copied: None,
+            pending_launch: None,
+            launch_in_flight: false,
+            stop_requested: false,
         }
     }
 

@@ -18,8 +18,7 @@ fn yaml_command_is_aoe(hook: &Value) -> bool {
         .is_some_and(is_aoe_hook_command)
 }
 
-/// Commands for one event: the identity extractor first (it must see stdin first), then the
-/// status writer. `config.yaml` and the allowlist both render from this, so they cannot drift.
+/// Run the identity publisher before the status writer.
 fn event_commands(event: &ResolvedHookEvent, target: HookInstallTarget) -> Vec<String> {
     let identity = event
         .identity_field
@@ -209,11 +208,11 @@ mod tests {
     fn hermes_hooks_install_beside_user_config_and_uninstall() {
         let tmp = TempDir::new().unwrap();
         let path = tmp.path().join("config.yaml");
-        std::fs::write(
-            &path,
-            "model: hermes-pro\nhooks:\n  pre_tool_call:\n    - command: \"echo user-hook\"\n      matcher: \"terminal\"\nhooks_auto_accept: false\n",
-        )
-        .unwrap();
+        let input = "model: hermes-pro\nhooks:\n  pre_tool_call:\n    - command: \"echo user-hook\"\n      matcher: \"terminal\"\nhooks_auto_accept: false\nvendor: {enabled: true, label: on, code: 001}\nopaque: !custom {enabled: true, label: on, code: 001}\ndefaults: &defaults {token: keep}\ncopy: *defaults\n";
+        std::fs::write(&path, input).unwrap();
+        let mut unrelated_before: Value =
+            serde_saphyr::from_str_with_options(input, crate::yaml::options()).unwrap();
+        unrelated_before.as_object_mut().unwrap().remove("hooks");
         let allowlist_path = tmp.path().join("shell-hooks-allowlist.json");
         std::fs::write(&allowlist_path, "{\"version\":7,\"approvals\":[]}").unwrap();
 
@@ -222,16 +221,22 @@ mod tests {
         let config = read_yaml(&path);
         assert_eq!(config["model"].as_str(), Some("hermes-pro"));
         assert_eq!(config["hooks_auto_accept"].as_bool(), Some(false));
+        assert_eq!(config["vendor"]["label"], "on");
         let events = agent_events("hermes", &[]);
         for event in &events {
             let entries = config["hooks"][event.name.as_str()].as_array().unwrap();
             assert_eq!(
-                entries.iter().filter(|h| yaml_command_is_aoe(h)).count(),
+                entries
+                    .iter()
+                    .filter(|h| h["command"].as_str().is_some_and(is_aoe_hook_command))
+                    .count(),
                 1 + usize::from(event.identity_field.is_some()),
                 "{}",
                 event.name
             );
-            assert!(yaml_command_is_aoe(entries.last().unwrap()));
+            assert!(entries.last().unwrap()["command"]
+                .as_str()
+                .is_some_and(is_aoe_hook_command));
         }
         // The foreground identity publisher runs before the status writer on `pre_llm_call`.
         let identity = config["hooks"]["pre_llm_call"][0]["command"]
@@ -252,6 +257,14 @@ mod tests {
         let approvals = allowlist["approvals"].as_array().unwrap();
         assert_eq!(approvals.len(), events.len() + 1);
         assert!(approvals.iter().any(|entry| entry["command"] == identity));
+        let mut unrelated_after = config.clone();
+        unrelated_after.as_object_mut().unwrap().remove("hooks");
+        assert_eq!(unrelated_after, unrelated_before);
+        let config_bytes = std::fs::read(&path).unwrap();
+        let allowlist_bytes = std::fs::read(&allowlist_path).unwrap();
+        install(&path).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), config_bytes);
+        assert_eq!(std::fs::read(&allowlist_path).unwrap(), allowlist_bytes);
 
         assert!(uninstall_hermes_hooks(&path).unwrap());
         let config = read_yaml(&path);

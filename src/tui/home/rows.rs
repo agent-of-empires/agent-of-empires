@@ -1,9 +1,8 @@
 //! The rows on screen: reading instances and flattening them into the
 //! tree, project, and org groupings.
 
-use std::collections::HashSet;
-
 use super::*;
+use std::collections::HashSet;
 
 /// `pool` without the stopped sessions that sit in a group, when `hide_stopped` is on. Archived
 /// and trashed sessions keep their own sections.
@@ -21,16 +20,20 @@ fn shown_in_groups(pool: Vec<Instance>, hide_stopped: bool) -> Vec<Instance> {
         .collect()
 }
 
-/// Project-mode group key: the repo label, or the `SCRATCH_GROUP_PATH`
-/// sentinel so a real repo named `scratch` keeps its own identity.
+/// Project-mode group key, including the distinct scratch sentinel.
 pub(super) fn project_group_key(inst: &Instance) -> String {
     if inst.scratch {
         return crate::session::SCRATCH_GROUP_PATH.to_string();
     }
+
     crate::session::projects::repo_label(inst.repo_path())
 }
 
-/// Org-view label (and key) for sessions with no resolvable remote owner.
+/// Header label the synthetic "no resolvable owner" bucket renders under in
+/// org view. This is a display label; a hosted remote whose owner is literally
+/// "No organization" would share it, but that collision is vanishingly unlikely
+/// (unlike `scratch`, a plausible real repo basename), so org does not give it a
+/// sentinel identity the way project mode does for scratch (#3237).
 pub(super) const NO_ORG_GROUP_LABEL: &str = "No organization";
 
 impl HomeView {
@@ -46,11 +49,15 @@ impl HomeView {
         self.instances.get(id)
     }
 
+    /// Title of the currently selected session row, if the cursor is on one.
     pub(in crate::tui) fn selected_session_title(&self) -> Option<&str> {
         let id = self.selected_session.as_deref()?;
         Some(self.get_instance(id)?.title.as_str())
     }
 
+    /// Materialize `self.instances` into a `Vec` for callsites that hand off
+    /// a `&[Instance]` slice to a downstream API. Single seam so the day
+    /// `HomeView` grows a cache, only this helper needs to change.
     pub(in crate::tui) fn cloned_instances(&self) -> Vec<Instance> {
         self.instances.values().cloned().collect()
     }
@@ -63,9 +70,12 @@ impl HomeView {
             .collect()
     }
 
-    /// Build the id-keyed map from loaded instances. Ids duplicated across profiles (an
-    /// interrupted profile move) are ambiguous, so every copy is excluded rather than routing
-    /// lifecycle work to the wrong profile.
+    /// Build the id-keyed `IndexMap` from a `Vec<Instance>` (the storage-load
+    /// shape). Duplicate ids across profiles are ambiguous after an interrupted
+    /// profile move: selecting either row by iteration order can route lifecycle
+    /// work to the wrong profile. Exclude every copy and fail closed; the
+    /// reload path runs `reconcile_profile_duplicates` first, so only
+    /// legacy duplicates without journal evidence ever reach this state.
     pub(super) fn build_instances_map(
         all_instances: Vec<Instance>,
     ) -> indexmap::IndexMap<String, Instance> {
@@ -76,26 +86,25 @@ impl HomeView {
             if duplicate_ids.contains(&inst.id) {
                 continue;
             }
-            match map.shift_remove(&inst.id) {
-                Some(previous) => {
-                    duplicate_ids.insert(inst.id.clone());
-                    tracing::error!(
-                        target: "tui.home",
-                        id = %inst.id,
-                        first_profile = %previous.source_profile,
-                        second_profile = %inst.source_profile,
-                        "duplicate session id across profiles; excluding every copy until durable reconciliation"
-                    );
-                }
-                None => {
-                    map.insert(inst.id.clone(), inst);
-                }
+            if let Some(previous) = map.shift_remove(&inst.id) {
+                duplicate_ids.insert(inst.id.clone());
+                tracing::error!(
+                    target: "tui.home",
+                    id = %inst.id,
+                    first_profile = %previous.source_profile,
+                    second_profile = %inst.source_profile,
+                    "duplicate session id across profiles; excluding every copy until durable reconciliation"
+                );
+            } else {
+                map.insert(inst.id.clone(), inst);
             }
         }
         map
     }
 
-    /// Instances in the active profile filter, or all of them.
+    /// `cloned_instances_for_profile` on `self.active_profile` when set,
+    /// else the unfiltered `cloned_instances`. The scope every UI-facing
+    /// build path (flat items, project view) shares.
     pub(in crate::tui) fn cloned_instances_in_active_view(&self) -> Vec<Instance> {
         match &self.active_profile {
             Some(profile) => self.cloned_instances_for_profile(profile),
@@ -106,24 +115,19 @@ impl HomeView {
     #[cfg(test)]
     #[track_caller]
     pub(in crate::tui) fn instance_at(&self, idx: usize) -> &Instance {
-        let len = self.instances.len();
         self.instances
             .get_index(idx)
             .map(|(_, v)| v)
-            .unwrap_or_else(|| panic!("instance_at: idx {idx} out of bounds (len={len})"))
+            .unwrap_or_else(|| {
+                panic!(
+                    "instance_at: idx {idx} out of bounds (len={})",
+                    self.instances.len()
+                )
+            })
     }
 
-    #[cfg(test)]
-    #[track_caller]
-    pub(in crate::tui) fn instance_at_mut(&mut self, idx: usize) -> &mut Instance {
-        let len = self.instances.len();
-        self.instances
-            .get_index_mut(idx)
-            .map(|(_, v)| v)
-            .unwrap_or_else(|| panic!("instance_at_mut: idx {idx} out of bounds (len={len})"))
-    }
-
-    /// True when any session animates a spinner, so the TUI must keep redrawing.
+    /// Returns true if any session has an animated status (Running, Waiting, Starting,
+    /// Creating), which means the TUI needs periodic redraws for spinner animation.
     pub fn has_animated_sessions(&self) -> bool {
         use crate::session::Status;
         self.instances.values().any(|inst| {
@@ -134,8 +138,14 @@ impl HomeView {
         })
     }
 
-    /// Index where the pinned Archived / Trash shelf begins. Both sections are
-    /// appended last by `build_flat_items`, so the shelf is a contiguous suffix.
+    /// Index of the first `flat_items` row that belongs to the pinned bottom
+    /// shelf (the synthetic Archived / Trash sections), or `None` when neither
+    /// section is present. The shelf is always a contiguous suffix: both
+    /// sections are appended last (Archived then Trash) by `build_flat_items`,
+    /// and nothing non-shelf follows them, so the first row whose path sits
+    /// within either section marks where the workspace list ends and the shelf
+    /// begins. The renderer splits the sidebar here and hit-testing maps clicks
+    /// in the shelf region back to this suffix.
     pub(in crate::tui) fn shelf_start(&self) -> Option<usize> {
         self.flat_items.iter().position(|it| match it {
             Item::Group { path, .. } => {
@@ -181,17 +191,6 @@ impl HomeView {
         } else {
             "Showing stopped sessions"
         });
-    }
-
-    /// Session `id` entered or left Stopped: while those are hidden in groups, its row joins or
-    /// leaves the list now rather than at the next reload.
-    pub(super) fn rows_after_stopped_change(&mut self, id: &str) {
-        let hideable = self
-            .get_instance(id)
-            .is_some_and(|inst| self.could_hide(inst));
-        if self.hide_stopped_in_groups && hideable {
-            self.rebuild_flat_items_keeping_cursor();
-        }
     }
 
     /// Whether the `y` filter is keeping `inst` out of the list.

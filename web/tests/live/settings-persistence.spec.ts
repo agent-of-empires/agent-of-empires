@@ -3,7 +3,14 @@
 import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import type { Locator, Page } from "@playwright/test";
-import { test, expect, authHeaders, bootDashboard, type ServeHandle } from "../helpers/liveTest";
+import {
+  test,
+  expect,
+  authHeaders,
+  bootDashboard,
+  confirmPassphraseElevation,
+  type ServeHandle,
+} from "../helpers/liveTest";
 import { appDirFor, loginWithPassphrase, resolveAoeBinary, spawnAoeServe } from "../helpers/aoeServe";
 
 // #1189: the theme resolver once deadlocked per request, which mocked specs cannot see.
@@ -92,6 +99,55 @@ test("structured view settings persist through PATCH + reload, node_path is stri
   expect(fetched?.acp?.node_path).not.toBe("/tmp/evil-node");
 });
 
+test("MCP switch persists globally and changes route availability only after restart", async ({ serve, page }) => {
+  const settingsUrl = `${serve.baseUrl}/api/settings`;
+  const machineUrl = `${settingsUrl}?layer=machine`;
+  const mcpList = () =>
+    fetch(`${serve.baseUrl}/mcp`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Accept: "application/json, text/event-stream" },
+      body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/list" }),
+    });
+  await page.goto(`${serve.baseUrl}/settings/notifications`);
+  const toggle = page.locator('[data-settings-field="web.mcp_enabled"]').getByRole("switch");
+  await expect(toggle).toHaveAttribute("aria-checked", "false");
+  expect([404, 405]).toContain((await mcpList()).status);
+  await toggle.click();
+  await expect.poll(async () => (await getJson(machineUrl)).web.mcp_enabled).toBe(true);
+  expect([404, 405]).toContain((await mcpList()).status);
+  await page.reload();
+  await expect(toggle).toHaveAttribute("aria-checked", "true");
+
+  const created = await fetch(`${serve.baseUrl}/api/profiles`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ name: "mcp-other" }),
+  });
+  expect(created.ok).toBe(true);
+  expect((await getJson(`${settingsUrl}?profile=mcp-other`)).web.mcp_enabled).toBe(true);
+  const profileUrl = `${serve.baseUrl}/api/profiles/mcp-other/settings`;
+  expect((await getJson(profileUrl)).web?.mcp_enabled).toBeUndefined();
+  const rejected = await fetch(profileUrl, {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ web: { mcp_enabled: false } }),
+  });
+  expect(rejected.status).toBe(400);
+  expect((await getJson(machineUrl)).web.mcp_enabled).toBe(true);
+
+  await serve.restart();
+  const enabled = await mcpList();
+  expect(enabled.status).toBe(200);
+  expect((await enabled.json()).result.tools.map((tool: { name: string }) => tool.name)).toContain("list_sessions");
+  await page.reload();
+  await expect(toggle).toHaveAttribute("aria-checked", "true");
+  await toggle.click();
+  await expect.poll(async () => (await getJson(machineUrl)).web.mcp_enabled).toBe(false);
+  expect((await mcpList()).status).toBe(200);
+  await serve.restart();
+  expect([404, 405]).toContain((await mcpList()).status);
+});
+
 test("theme picker repaints, persists across reload and serve restart (#1510)", async ({ serve, page }) => {
   // The picker writes the global /api/theme endpoint and must dispatch its repaint only after the write.
   const settingsUrl = `${serve.baseUrl}/api/settings`;
@@ -148,43 +204,61 @@ test.describe("passphrase mode", () => {
     expect((await getJson(settingsUrl, servePreauthed))?.theme?.name).toBe("dracula");
   });
 
-  test("sandbox image change requires elevation for remote callers, not loopback", async ({ servePreauthed, page }) => {
-    const profile = await defaultProfile(servePreauthed);
-    await bootDashboard(page, servePreauthed);
-    // From the page, so the SPA's interceptor sees a 403 and opens the prompt. A TEST-NET-3
-    // X-Forwarded-For from a loopback socket resolves as a remote caller.
-    const patchImage = (image: string, xff?: string) =>
-      page.evaluate(
-        async ({ profile, image, xff }) =>
-          (
-            await fetch(`/api/profiles/${encodeURIComponent(profile)}/settings`, {
-              method: "PATCH",
-              headers: { "Content-Type": "application/json", ...(xff ? { "X-Forwarded-For": xff } : {}) },
-              body: JSON.stringify({ sandbox: { default_image: image } }),
-            })
-          ).status,
-        { profile, image, xff },
-      );
-    const savedImage = async () =>
-      (await getJson(`${servePreauthed.baseUrl}/api/profiles/${encodeURIComponent(profile)}/settings`, servePreauthed))
-        ?.sandbox?.default_image;
+  for (const ingress of ["direct TCP", "proxy-reported remote TCP"] as const) {
+    test(`sandbox image changes require browser elevation over ${ingress}`, async ({ spawnServe, page }) => {
+      const proxied = ingress === "proxy-reported remote TCP";
+      const handle = await spawnServe({
+        authMode: "passphrase",
+        preloginViaHarness: true,
+        ...(proxied ? { extraArgs: ["--behind-proxy", "--allowed-host", "127.0.0.1"] } : {}),
+      });
+      if (proxied) await page.setExtraHTTPHeaders({ "X-Forwarded-For": "203.0.113.10" });
+      const profile = await defaultProfile(handle);
+      const profileUrl = `${handle.baseUrl}/api/profiles/${encodeURIComponent(profile)}/settings`;
+      const savedImage = async () => (await getJson(profileUrl, handle))?.sandbox?.default_image;
+      const baseline = await savedImage();
+      await bootDashboard(page, handle, "/settings/sandbox");
+      const status = await page.evaluate(async () => (await fetch("/api/login/status")).json());
+      expect(status).toMatchObject({ required: true, authenticated: true, elevated: false });
+      expect(status.principal).not.toBe("local_owner");
 
-    // #2610: loopback is trusted and must not loop the prompt.
-    expect(await patchImage("ghcr.io/example/img:local-trusted")).toBe(200);
-    await expect(confirmPassphraseDialog(page)).toHaveCount(0);
+      // Proxy address claims cannot manufacture kernel-authenticated Unix owner authority.
+      const spoofed = await fetch(profileUrl, {
+        method: "PATCH",
+        headers: {
+          ...authHeaders(handle),
+          "Content-Type": "application/json",
+          "X-Forwarded-For": "127.0.0.1",
+          "CF-Connecting-IP": "127.0.0.1",
+          "X-Real-IP": "127.0.0.1",
+          Forwarded: "for=127.0.0.1",
+        },
+        body: JSON.stringify({ sandbox: { default_image: "ghcr.io/example/img:spoofed-owner" } }),
+      });
+      expect(spoofed.status).toBe(403);
+      expect(await spoofed.json()).toMatchObject({ error: "elevation_required" });
+      expect(await savedImage()).toBe(baseline);
 
-    expect(await patchImage("ghcr.io/example/img:tampered", "203.0.113.10")).toBe(403);
-    const dialog = confirmPassphraseDialog(page);
-    await expect(dialog).toBeVisible({ timeout: 5_000 });
-    expect((await savedImage()) ?? "").not.toBe("ghcr.io/example/img:tampered");
+      const profilePicker = page.getByTestId("settings-profile-picker").locator("select");
+      await expect(profilePicker).toHaveValue(profile);
+      const image = page.locator('[data-settings-field="sandbox.default_image"]').locator('input[type="text"]');
+      await expect(image).toBeVisible({ timeout: 10_000 });
+      await image.fill("ghcr.io/example/img:blocked");
+      await image.blur();
+      await expect(confirmPassphraseDialog(page)).toBeVisible({ timeout: 5_000 });
+      expect(await savedImage()).toBe(baseline);
 
-    // Elevation is per session, so the remote retry succeeds.
-    await dialog.locator('input[type="password"]').fill(servePreauthed.passphrase!);
-    await dialog.getByRole("button", { name: /Confirm/i }).click();
-    await expect(dialog).toHaveCount(0, { timeout: 5_000 });
-    expect(await patchImage("ghcr.io/example/img:elevated", "203.0.113.10")).toBe(200);
-    expect(await savedImage()).toBe("ghcr.io/example/img:elevated");
-  });
+      await confirmPassphraseElevation(page, handle);
+      expect(await savedImage()).toBe(baseline);
+      await image.fill("ghcr.io/example/img:elevated");
+      await image.blur();
+      await expect.poll(savedImage).toBe("ghcr.io/example/img:elevated");
+      await expect(image).toHaveValue("ghcr.io/example/img:elevated");
+      await expect(confirmPassphraseDialog(page)).toHaveCount(0);
+      await bootDashboard(page, handle, "/settings/sandbox");
+      await expect(image).toHaveValue("ghcr.io/example/img:elevated", { timeout: 10_000 });
+    });
+  }
 });
 
 test("global settings migrate from profiles and reject stale profile writes", async ({ spawnServe, page }) => {
@@ -193,7 +267,10 @@ test("global settings migrate from profiles and reject stale profile writes", as
     seedFn: ({ home, xdg }) => {
       appDir = appDirFor(home, xdg, resolveAoeBinary());
       writeFileSync(join(appDir, ".schema_version"), "29");
-      writeFileSync(join(appDir, "config.toml"), "default_profile = 'work'\n[theme]\nname = 'empire'\n");
+      writeFileSync(
+        join(appDir, "config.toml"),
+        "default_profile = 'work'\n[theme]\nname = 'empire'\n[systemd]\nenabled = false\n",
+      );
       for (const name of ["alpha", "work"]) mkdirSync(join(appDir, "profiles", name), { recursive: true });
       writeFileSync(join(appDir, "profiles", "alpha", "config.toml"), "[theme]\nname = 'rose-pine'\n");
       writeFileSync(
@@ -302,7 +379,8 @@ test("shortcut bar toggle persists globally from Terminal UI settings", async ({
 test("runtime logging overrides persist and clearing one preserves the other", async ({ serve, page }) => {
   await page.goto(`${serve.baseUrl}/settings/logging`);
   const uds = labelledSelect(page, /^runtime\.uds$/);
-  const ws = labelledSelect(page, /^runtime\.ws$/);
+  const ws = labelledSelect(page, /^server\.lifecycle$/);
+  const migration = labelledSelect(page, /^migrations\.v043$/);
   await expect(uds).toBeVisible();
   await uds.selectOption("warn");
   const globalUrl = `${serve.baseUrl}/api/settings`;
@@ -310,17 +388,23 @@ test("runtime logging overrides persist and clearing one preserves the other", a
   await ws.selectOption("debug");
   await expect
     .poll(async () => (await getJson(globalUrl)).logging.targets)
-    .toEqual({ "runtime.uds": "warn", "runtime.ws": "debug" });
+    .toEqual({ "runtime.uds": "warn", "server.lifecycle": "debug" });
+  await migration.selectOption("info");
+  await expect.poll(async () => (await getJson(globalUrl)).logging.targets["migrations.v043"]).toBe("info");
   await page.reload();
   await expect(uds).toHaveValue("warn");
   await expect(ws).toHaveValue("debug");
+  await expect(migration).toHaveValue("info");
 
-  await ws.selectOption("");
-  await expect.poll(async () => (await getJson(globalUrl)).logging.targets).toEqual({ "runtime.uds": "warn" });
+  await migration.selectOption("");
+  await expect
+    .poll(async () => (await getJson(globalUrl)).logging.targets)
+    .toEqual({ "runtime.uds": "warn", "server.lifecycle": "debug" });
   await serve.restart();
   await page.reload();
   await expect(uds).toHaveValue("warn");
-  await expect(ws).toHaveValue("");
+  await expect(ws).toHaveValue("debug");
+  await expect(migration).toHaveValue("");
 });
 
 test("systemd settings save machine-wide and refuse an invalid slice", async ({ serve, page }) => {

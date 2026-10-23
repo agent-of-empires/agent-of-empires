@@ -53,7 +53,7 @@ beforeEach(() => {
 
 /** Render the hook and return it with its (optionally opened) socket. */
 function mount(openSocket = true) {
-  const hook = renderHook(() => useLiveTerminal("s1", "live-ws"));
+  const hook = renderHook(() => useLiveTerminal("s1", false, "live-ws"));
   const ws = FakeWS.sockets[0]!;
   if (openSocket) ws.open();
   return { ...hook, ws };
@@ -171,7 +171,9 @@ describe("clipboard", () => {
   it("delivers every event, even repeated text, to the latest callback without reconnecting", () => {
     const first = vi.fn();
     const second = vi.fn();
-    const { rerender } = renderHook(({ cb }) => useLiveTerminal("s", "live-ws", cb), { initialProps: { cb: first } });
+    const { rerender } = renderHook(({ cb }) => useLiveTerminal("s", false, "live-ws", cb), {
+      initialProps: { cb: first },
+    });
     const ws = FakeWS.sockets[0]!;
     ws.deliver({ type: "clipboard", text: "same" });
     rerender({ cb: second });
@@ -209,6 +211,121 @@ describe("reconnect", () => {
       vi.clearAllTimers();
       vi.useRealTimers();
     }
+  });
+});
+
+describe("read-only policy", () => {
+  it("opens a passive stream without claims, grid writes, input or mouse writes", () => {
+    const { result } = renderHook(() => useLiveTerminal("s1", true, "live-ws"));
+    const ws = FakeWS.sockets[0]!;
+    act(() => {
+      result.current.sendResize(99, 31);
+      expect(result.current.sendData("blocked")).toBe(false);
+      expect(result.current.sendPaste("blocked", true)).toBe(false);
+    });
+    ws.open();
+    ws.deliver({ type: "size_owner", is_owner: true });
+    const sent = ws.sent.length;
+    act(() => {
+      result.current.claim();
+      result.current.sendResize(100, 32);
+      result.current.forwardWheel(true, true, 2, 2);
+      result.current.forwardButton(0, false, false, true, 2, 2);
+      expect(result.current.sendData("still blocked")).toBe(false);
+      expect(result.current.sendPaste("still blocked", false)).toBe(false);
+    });
+    expect(ws.sent).toHaveLength(sent);
+    expect(ws.json()).toEqual(
+      expect.arrayContaining([{ type: "cadence", fast: true }, expect.objectContaining({ type: "caps", patch: true })]),
+    );
+    expect(ws.json().some(({ type }) => ["claim", "claim_if_vacant", "resize", "paste"].includes(String(type)))).toBe(
+      false,
+    );
+    expect(ws.bytes()).toEqual([]);
+    ws.deliver(frame(1, "old\n"));
+    ws.deliver(patch(2, 1, [[0, "new"]]));
+    expect(result.current.state.frame?.content).toBe("new\n");
+    act(() => {
+      result.current.enterReading(3);
+      result.current.setWindow(100);
+      result.current.setCadence(false);
+    });
+    expect(ws.json()).toContainEqual({ type: "window", lines: 100 });
+    expect(ws.json()).toContainEqual({ type: "cadence", fast: false });
+    expect(result.current.state.connected).toBe(true);
+  });
+
+  it("revokes queued input and grids before a late open, using retained callbacks", () => {
+    const { result, rerender } = renderHook(({ readOnly }) => useLiveTerminal("s1", readOnly, "live-ws"), {
+      initialProps: { readOnly: false },
+    });
+    const ws = FakeWS.sockets[0]!;
+    const retained = result.current;
+    act(() => {
+      expect(retained.sendData("queued")).toBe(true);
+      expect(retained.sendPaste("queued paste", true)).toBe(true);
+      retained.sendResize(99, 31);
+    });
+    rerender({ readOnly: true });
+    act(() => {
+      retained.claim();
+      retained.sendResize(100, 32);
+      retained.forwardWheel(true, true, 2, 2);
+      retained.forwardButton(0, false, false, true, 2, 2);
+      expect(retained.sendData("late")).toBe(false);
+      expect(retained.sendPaste("late paste", true)).toBe(false);
+    });
+    ws.open();
+    ws.deliver({ type: "size_owner", is_owner: true });
+    ws.deliver(frame(1, "passive\n"));
+    expect(FakeWS.sockets).toHaveLength(1);
+    expect(result.current.state.frame?.content).toBe("passive\n");
+    expect(ws.json().some(({ type }) => ["claim", "claim_if_vacant", "resize", "paste"].includes(String(type)))).toBe(
+      false,
+    );
+    expect(ws.bytes()).toEqual([]);
+    const sent = ws.sent.length;
+    rerender({ readOnly: false });
+    ws.deliver({ type: "size_owner", is_owner: true });
+    expect(ws.sent).toHaveLength(sent);
+    act(() => {
+      retained.claim();
+      retained.sendResize(101, 33);
+      expect(retained.sendData("fresh")).toBe(true);
+      expect(retained.sendPaste("fresh paste", false)).toBe(true);
+    });
+    expect(ws.json()).toContainEqual({ type: "claim" });
+    expect(ws.json().filter(({ type }) => type === "resize")).toEqual([{ type: "resize", cols: 101, rows: 33 }]);
+    expect(ws.json().filter(({ type }) => type === "paste")).toEqual([
+      { type: "paste", text: "fresh paste", submit: false },
+    ]);
+    expect(ws.bytes()).toEqual(["fresh"]);
+  });
+
+  it("does not replay a writable grid or unsent input when reconnecting as an observer", () => {
+    const { result, rerender } = renderHook(({ readOnly }) => useLiveTerminal("s1", readOnly, "live-ws"), {
+      initialProps: { readOnly: false },
+    });
+    const first = FakeWS.sockets[0]!;
+    first.open();
+    act(() => {
+      result.current.sendResize(99, 31);
+      result.current.setWindow(500);
+      expect(result.current.sendPaste("unsent", false)).toBe(true);
+    });
+    rerender({ readOnly: true });
+    first.readyState = FakeWS.CLOSED;
+    act(() => window.dispatchEvent(new Event("online")));
+    const next = FakeWS.sockets[1]!;
+    next.open();
+    next.deliver({ type: "size_owner", is_owner: true });
+    expect(next.json().some(({ type }) => ["claim", "claim_if_vacant", "resize", "paste"].includes(String(type)))).toBe(
+      false,
+    );
+    expect(next.bytes()).toEqual([]);
+    expect(next.json()).toContainEqual({ type: "window", lines: 500 });
+    next.deliver(frame(1, "still observing\n"));
+    expect(result.current.state.frame?.content).toBe("still observing\n");
   });
 });
 

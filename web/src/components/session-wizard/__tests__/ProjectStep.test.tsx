@@ -12,7 +12,7 @@ import { agent, mockSession } from "./fixtures";
 vi.mock("../../../lib/api", () => ({
   fetchSessions: vi.fn(),
   fetchRecentProjects: vi.fn(),
-  fetchProjectRegistry: vi.fn(),
+  fetchProjects: vi.fn(),
   cloneRepo: vi.fn(),
   getHomePath: vi.fn(),
   browseFilesystem: vi.fn(),
@@ -21,7 +21,7 @@ vi.mock("../../../lib/api", () => ({
 
 import {
   browseFilesystem,
-  fetchProjectRegistry,
+  fetchProjects,
   fetchRecentProjects,
   fetchSessions,
   getHomePath,
@@ -29,9 +29,13 @@ import {
 } from "../../../lib/api";
 
 beforeEach(() => {
-  vi.mocked(fetchSessions).mockResolvedValue({ sessions: [], workspace_ordering: [] });
+  vi.mocked(fetchSessions).mockResolvedValue({
+    sessions: [],
+    workspace_ordering: [],
+    cursor: { epoch: "boot", revision: 1n },
+  });
   vi.mocked(fetchRecentProjects).mockResolvedValue({ projects: [] });
-  vi.mocked(fetchProjectRegistry).mockResolvedValue([]);
+  vi.mocked(fetchProjects).mockResolvedValue([]);
   vi.mocked(getHomePath).mockResolvedValue(null);
   vi.mocked(browseFilesystem).mockResolvedValue({ ok: false, entries: [] } as never);
 });
@@ -41,21 +45,33 @@ afterEach(() => {
   vi.clearAllMocks();
 });
 
-function renderStep(data: Partial<WizardData> = {}, props: { initialTab?: "import"; agents?: AgentInfo[] } = {}) {
+function renderStep(
+  data: Partial<WizardData> = {},
+  props: { initialTab?: "import"; agents?: AgentInfo[]; profile?: string } = {},
+) {
   const onChange = vi.fn();
   const onPicked = vi.fn();
   const step = (d: Partial<WizardData>) => (
-    <ProjectStep data={{ ...initialData, ...d }} onChange={onChange} onPicked={onPicked} {...props} />
+    <ProjectStep
+      profile="default"
+      profile={d.profile || "default"}
+      data={{ ...initialData, ...d }}
+      onChange={onChange}
+      onPicked={onPicked}
+      {...props}
+    />
   );
   const { rerender } = render(step(data));
   return { onChange, onPicked, rerender: (d: Partial<WizardData>) => rerender(step(d)) };
 }
 
 const sessions = (...list: ReturnType<typeof mockSession>[]) =>
-  vi.mocked(fetchSessions).mockResolvedValue({ sessions: list, workspace_ordering: [] });
+  vi
+    .mocked(fetchSessions)
+    .mockResolvedValue({ sessions: list, workspace_ordering: [], cursor: { epoch: "boot", revision: 1n } });
 const savedProjects = (...paths: string[]) =>
   vi
-    .mocked(fetchProjectRegistry)
+    .mocked(fetchProjects)
     .mockResolvedValue(
       paths.map((path) => ({ name: path.split("/").pop()!, path, scope: "global", pinned: false }) as ProjectInfo),
     );
@@ -123,12 +139,19 @@ describe("recent and saved projects", () => {
   });
 
   it("reports each selection's saved overrides, undefined when there are none", async () => {
-    vi.mocked(fetchProjectRegistry).mockResolvedValue([
+    vi.mocked(fetchProjects).mockResolvedValue([
       { name: "alpha", path: "/repo/alpha", scope: "global", pinned: false, overrides: { worktree_enabled: true } },
       { name: "beta", path: "/repo/beta", scope: "global", pinned: false },
     ] as ProjectInfo[]);
     const onSelectSavedProject = vi.fn();
-    render(<ProjectStep data={initialData} onChange={vi.fn()} onSelectSavedProject={onSelectSavedProject} />);
+    render(
+      <ProjectStep
+        profile="default"
+        data={initialData}
+        onChange={vi.fn()}
+        onSelectSavedProject={onSelectSavedProject}
+      />,
+    );
     fireEvent.click((await screen.findByText("/repo/alpha")).closest("button")!);
     fireEvent.click((await screen.findByText("/repo/beta")).closest("button")!);
     expect(onSelectSavedProject.mock.calls).toEqual([
@@ -141,9 +164,16 @@ describe("recent and saved projects", () => {
     vi.mocked(fetchRecentProjects).mockResolvedValue({
       projects: [{ path: "/repo/alpha", display_name: "alpha", last_used_at: null, tool: "claude" }],
     } as Awaited<ReturnType<typeof fetchRecentProjects>>);
-    vi.mocked(fetchProjectRegistry).mockResolvedValue(null);
+    vi.mocked(fetchProjects).mockResolvedValue(null);
     const onSelectSavedProject = vi.fn();
-    render(<ProjectStep data={initialData} onChange={vi.fn()} onSelectSavedProject={onSelectSavedProject} />);
+    render(
+      <ProjectStep
+        profile="default"
+        data={initialData}
+        onChange={vi.fn()}
+        onSelectSavedProject={onSelectSavedProject}
+      />,
+    );
     fireEvent.click((await screen.findByText("/repo/alpha")).closest("button")!);
     expect(onSelectSavedProject.mock.calls).toEqual([[null, "/repo/alpha"]]);
   });
@@ -242,7 +272,19 @@ describe("Import session tab", () => {
   });
 
   it("selecting a session prefills a structured import for the chosen agent", async () => {
-    const { onChange } = renderImport();
+    const { onChange } = renderStep(
+      {
+        useWorktree: true,
+        sandboxEnabled: true,
+        extraRepoPaths: ["/previous/repo"],
+        repoBases: { "/previous/repo": "main" },
+        scratch: true,
+        attachExisting: true,
+        worktreeBranch: "old",
+        baseBranch: "main",
+      },
+      { initialTab: "import", agents: [CLAUDE] },
+    );
     fireEvent.click(await row("Fix the spinner bug"));
     expect(Object.fromEntries(onChange.mock.calls)).toMatchObject({
       importAcpSessionId: "713b",
@@ -250,7 +292,13 @@ describe("Import session tab", () => {
       tool: "claude",
       useStructuredView: true,
       useWorktree: false,
+      extraRepoPaths: [],
+      repoBases: {},
       sandboxEnabled: false,
+      scratch: false,
+      attachExisting: false,
+      worktreeBranch: "",
+      baseBranch: "",
     });
   });
 
@@ -272,10 +320,10 @@ describe("Import session tab", () => {
     renderImport("", [PI, CLAUDE]);
     await screen.findByText("Fix the spinner bug");
     expect(agentSelect().value).toBe("claude");
-    expect(listImportableSessions).toHaveBeenLastCalledWith("claude", undefined);
+    expect(listImportableSessions).toHaveBeenLastCalledWith("claude", "default");
 
     fireEvent.change(agentSelect(), { target: { value: "pi" } });
-    await waitFor(() => expect(listImportableSessions).toHaveBeenLastCalledWith("pi", undefined));
+    await waitFor(() => expect(listImportableSessions).toHaveBeenLastCalledWith("pi", "default"));
     cleanup();
 
     renderImport("", [PI, CLAUDE]);
@@ -295,6 +343,22 @@ describe("Import session tab", () => {
     expect(listImportableSessions).toHaveBeenLastCalledWith("claude", "work");
     rerender({ profile: "home" });
     await waitFor(() => expect(listImportableSessions).toHaveBeenLastCalledWith("claude", "home"));
+  });
+
+  it("uses the acknowledged served profile while the form keeps Server default implicit", async () => {
+    const { onChange } = renderStep({}, { profile: "served", initialTab: "import", agents: [PI] });
+    fireEvent.click(await row("Fix the spinner bug"));
+    expect(listImportableSessions).toHaveBeenLastCalledWith("pi", "served");
+    expect(fetchProjects).toHaveBeenLastCalledWith({ profile: "served" });
+    expect(onChange).not.toHaveBeenCalledWith("profile", expect.anything());
+    expect(onChange).toHaveBeenCalledWith("tool", "pi");
+  });
+
+  it("does not list native sessions while Server default is unresolved", async () => {
+    renderStep({}, { profile: undefined, initialTab: "import", agents: [CLAUDE] });
+    await screen.findByText("Resolve the server profile or select a profile to import a session.");
+    expect(listImportableSessions).not.toHaveBeenCalled();
+    expect(fetchProjects).not.toHaveBeenCalled();
   });
 
   it("reports partial returned counts independently of visible rows and only for truncated results", async () => {

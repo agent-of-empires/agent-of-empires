@@ -159,12 +159,22 @@ fn test_wait_returns_when_the_agent_reaches_the_target_status() {
         }
     });
 
-    let mut waiter = h.spawn_cli(&["session", "wait", &id, "--until", "waiting"]);
+    h.run_cli_ok(&["profile", "create", "other"]);
+    let mut waiter = h.spawn_cli(&[
+        "session",
+        "wait",
+        &id,
+        "--until",
+        "waiting",
+        "--timeout",
+        "10000",
+    ]);
     wait_for_poll(&h, |s| s != "waiting");
     assert!(
         waiter.try_wait().expect("poll waiter").is_none(),
         "wait returned before the agent reached Waiting"
     );
+    h.run_cli_ok(&["profile", "default", "other"]);
     std::fs::write(&gate, "").expect("open the gate");
 
     let out = waiter.wait_with_output().expect("wait for `session wait`");

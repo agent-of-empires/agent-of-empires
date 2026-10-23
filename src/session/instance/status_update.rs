@@ -28,6 +28,9 @@ fn skip_capture(
 const LEGACY_RUNNING_HOOK_MAX_AGE: std::time::Duration = std::time::Duration::from_secs(900);
 
 impl Instance {
+    // Local polling measures from finalization; the Daemon uses persisted pane birth.
+    pub(crate) const STARTUP_GRACE_SECS: u64 = 3;
+
     /// Update status using pre-fetched pane metadata to avoid per-instance subprocess spawns.
     pub fn update_status_with_metadata(
         &mut self,
@@ -169,7 +172,7 @@ impl Instance {
         }
 
         if let Some(start_time) = self.last_start_time {
-            if start_time.elapsed().as_secs() < 3 {
+            if start_time.elapsed().as_secs() < Self::STARTUP_GRACE_SECS {
                 self.status = Status::Starting;
                 return;
             }
@@ -1062,6 +1065,11 @@ Esc to cancel \u{b7} Tab to amend \u{b7} ctrl+e to explain\n\
     /// dead-pane branch nor the stale-shell check spawns tmux behind the test.
     fn agent_pane_metadata(command: &str, window_activity: Option<i64>) -> tmux::PaneMetadata {
         tmux::PaneMetadata {
+            server: None,
+            session_id: "$42".into(),
+            pane_id: "%42".into(),
+            session_kind: None,
+            tool_owner: crate::tmux::ToolPaneOwner::Unmarked,
             pane_dead: false,
             pane_current_command: Some(command.to_string()),
             pane_start_command_is_protected: false,
@@ -1494,7 +1502,7 @@ Esc to cancel \u{b7} Tab to amend \u{b7} ctrl+e to explain\n\
             .status()
             .unwrap()
             .success());
-        let cache = crate::tmux::SessionCacheGuard::capture();
+        let cache = crate::tmux::SessionCacheGuard::capture_restore_only();
         cache.force_present(&[&session_name]);
         inst.update_status_once(None, Some(&session_name));
         assert_eq!(

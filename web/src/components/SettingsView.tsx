@@ -525,7 +525,7 @@ export function SettingsView({
 
     switch (activeTab) {
       case "profiles":
-        return <ProfilesSection readOnly={readOnly} />;
+        return <ProfilesSection readOnly={readOnly} onRenamed={onServerAboutRefresh} />;
 
       case "session":
         // CityHall mode reduces this tab to the trash-related options and
@@ -852,7 +852,11 @@ export function SettingsView({
               </div>
               {showProfilePicker && (
                 <div data-testid="settings-profile-picker">
-                  <ProfileSelector selectedProfile={selectedProfile} onSelect={handleSelectProfile} />
+                  <ProfileSelector
+                    selectedProfile={selectedProfile}
+                    onSelect={handleSelectProfile}
+                    onRenamed={onServerAboutRefresh}
+                  />
                 </div>
               )}
             </div>

@@ -1,14 +1,16 @@
 //! Skills management REST API.
 
-use axum::extract::Path;
+use std::sync::Arc;
+
+use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use serde::Deserialize;
 use serde_json::json;
 
-use super::api_error;
 use super::mutation_guard::ElevatedMutationGuard;
+use super::{api_error, AppState};
 use crate::session::skills_model::{self, SkillError, SkillProvenance};
 
 fn skill_error(error: SkillError) -> Response {
@@ -51,7 +53,10 @@ fn source_provenance(source: &str) -> Result<SkillProvenance, String> {
 }
 
 /// `GET /api/skills`: discover skills across every supported host root.
-pub async fn list_skills() -> Response {
+pub async fn list_skills(State(state): State<Arc<AppState>>) -> Response {
+    if let Some(resp) = super::cityhall_block(&state) {
+        return resp;
+    }
     match tokio::task::spawn_blocking(skills_model::discover_all).await {
         Ok(Ok(skills)) => Json(json!({
             "skills": skills.into_iter().map(|skill| {
@@ -79,7 +84,13 @@ pub async fn list_skills() -> Response {
 }
 
 /// `GET /api/skills/{source}/{directory}`: read one source-qualified skill.
-pub async fn read_skill(Path((source, directory)): Path<(String, String)>) -> Response {
+pub async fn read_skill(
+    State(state): State<Arc<AppState>>,
+    Path((source, directory)): Path<(String, String)>,
+) -> Response {
+    if let Some(resp) = super::cityhall_block(&state) {
+        return resp;
+    }
     let provenance = match source_provenance(&source) {
         Ok(value) => value,
         Err(message) => return api_error(StatusCode::BAD_REQUEST, "invalid_skill_source", message),
@@ -207,16 +218,19 @@ pub struct SyncSkillsBody {
     roots: Vec<String>,
     /// Skills the caller has explicitly asked AoE to take over, overwriting a
     /// skill AoE does not manage or a propagated copy edited in place. Empty
-    /// (the default, and what every automatic sync uses) overwrites nothing.
+    /// means overwrite nothing, which is the default and what every automatic
+    /// sync uses.
     #[serde(default)]
     replace: Vec<String>,
-    /// When non-empty, reconcile only these skills, so sharing a single skill
-    /// is a single-skill operation rather than a filtered full sync.
+    /// When non-empty, reconcile only these skills. This is what makes sharing
+    /// a single skill a single-skill operation rather than a full sync whose
+    /// report is filtered afterwards.
     #[serde(default)]
     directories: Vec<String>,
 }
 
 /// `POST /api/skills/sync`: reconcile the managed store into agent skills dirs.
+///
 /// Returns one outcome per skill per root rather than failing on the first
 /// conflict: a destination AoE does not own is a normal result the user needs to
 /// see, not an error that should abandon the remaining roots.

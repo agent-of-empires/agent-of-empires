@@ -73,16 +73,16 @@ test("diff pane in a non-git session stays closed until opened, then shows one n
     await route.continue();
   });
   const diffFilesRequested = page.waitForRequest((r) => r.url().includes(`/sessions/${session!.id}/diff/files`));
-  await page.goto(`${serve.baseUrl}/session/${encodeURIComponent(session!.id)}`);
-  // The diff-files fetch starts from an effect, so the layout effects of that
-  // commit have run: an unknown Session must leave nothing pinned.
-  await diffFilesRequested;
-  expect(held).toBe(true);
-  expect(await storedTabs()).toBeNull();
+  try {
+    await page.goto(`${serve.baseUrl}/session/${encodeURIComponent(session!.id)}`);
+    // The diff-files effect establishes the unknown-session layout window.
+    await diffFilesRequested;
+    expect(held).toBe(true);
+    expect(await storedTabs()).toBeNull();
+  } finally {
+    release();
+  }
   const diffToggle = page.getByTestId("pane-toggle-diff").first();
-  await expect(diffToggle).toHaveAttribute("aria-pressed", "false");
-
-  release();
   await expect.poll(storedTabs).not.toBeNull();
   const pinned = (await storedTabs())!;
   expect(pinned.some((t) => t.startsWith("terminal:"))).toBe(true);

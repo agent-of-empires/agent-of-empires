@@ -1,4 +1,14 @@
 //! Scratch-session directory provisioning and identification.
+//!
+//! A scratch session has no associated project path. The session layer
+//! provisions a fresh directory under `<app_dir>/scratch/<instance-id>/` and
+//! attaches the session to it. On deletion the directory is removed; the
+//! "lives under the scratch root" check guards `remove_dir_all` from being
+//! aimed at unrelated paths if a session JSON is tampered.
+//!
+//! Storage under the app dir (instead of `std::env::temp_dir()`) means the
+//! directory survives OS temp-dir cleanup (e.g. `systemd-tmpfiles`) and is
+//! easy to find when a user wants to peek at the agent's scratch work.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -10,6 +20,8 @@ use anyhow::{Context, Result};
 const SCRATCH_SUBDIR: &str = "scratch";
 
 /// Return the absolute path of the scratch root, creating it lazily.
+/// Every scratch session's working directory is provisioned as a child of
+/// this directory.
 pub fn scratch_root() -> Result<PathBuf> {
     let root = super::get_app_dir()?.join(SCRATCH_SUBDIR);
     if !root.exists() {
@@ -19,17 +31,36 @@ pub fn scratch_root() -> Result<PathBuf> {
     Ok(root)
 }
 
-/// Create a fresh directory for a scratch session and return its absolute path.
-pub fn provision_scratch_dir(instance_id: &str) -> Result<PathBuf> {
+pub(crate) fn scratch_path(instance_id: &str) -> Result<PathBuf> {
     super::validate_instance_id(instance_id)?;
-    let path = scratch_root()?.join(instance_id);
+    Ok(super::get_app_dir()?.join(SCRATCH_SUBDIR).join(instance_id))
+}
+
+/// Create a fresh directory for a scratch session and return its absolute
+/// path. Uses `fs::create_dir` (not `create_dir_all`) so a collision with a
+/// pre-existing directory surfaces as an error rather than silently reusing
+/// the directory's contents, which would violate the freshness contract.
+pub fn provision_scratch_dir(instance_id: &str) -> Result<PathBuf> {
+    let path = scratch_path(instance_id)?;
+    scratch_root()?;
     fs::create_dir(&path)
         .with_context(|| format!("Failed to create scratch directory at {}", path.display()))?;
     Ok(path)
 }
 
-/// Return true iff `path` is plausibly a scratch directory created by this crate: it lives under
-/// `scratch_root()`.
+/// Return true iff `path` is plausibly a scratch directory created by this
+/// crate: it lives under `scratch_root()`. Used by
+/// `session::deletion::perform_deletion` to guard `fs::remove_dir_all`
+/// against accidental or malicious targeting of unrelated paths if a session
+/// JSON is hand-edited.
+///
+/// Both sides are canonicalized before the prefix check so a lexical
+/// `..` cannot escape the scratch root (e.g.
+/// `<scratch_root>/../profiles` lexically `starts_with(<scratch_root>)`
+/// but resolves outside it). A path that does not exist on disk cannot
+/// be canonicalized and is refused; that is acceptable because the only
+/// caller that needs a yes here is the deletion path, which is removing
+/// a directory it just looked up from session state.
 pub fn is_scratch_path(path: &Path) -> bool {
     let Ok(root) = scratch_root() else {
         return false;

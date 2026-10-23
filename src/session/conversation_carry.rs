@@ -108,12 +108,6 @@ pub(crate) enum ToolSwap {
 /// transcript for would resume into nothing and lose the id the parking swap
 /// would have kept. Anything unresolvable therefore parks.
 pub(crate) fn classify(instance: &Instance, new_profile: &str, new_tool: &str) -> ToolSwap {
-    if instance.is_structured() {
-        // Structured rows have no terminal launch to consume a carry; their
-        // restart short-circuits before any copy could happen.
-        return ToolSwap::Park;
-    }
-
     if !is_account_swap(
         &instance.source_profile,
         &instance.tool,
@@ -785,7 +779,13 @@ pub(crate) fn carry_fork_parent(instance: &mut Instance) -> Result<()> {
         }
     };
     if relocate_known_bindings(&destination, &mut binding)? {
-        let [resume] = binding;
+        let [mut resume] = binding;
+        if let Some(execution) = resume
+            .as_mut()
+            .and_then(|binding| binding.execution.as_mut())
+        {
+            execution.exported_default_store = None;
+        }
         instance.resume_binding = resume;
     }
     Ok(())
