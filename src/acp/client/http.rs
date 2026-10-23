@@ -62,6 +62,17 @@ pub enum PromptDispositionWire {
 /// under the server's `MAX_REPLAY_PAGE` so it is never clamped down.
 pub const REPLAY_PAGE_SIZE: u64 = 1000;
 
+/// `GET` and `PATCH /api/log-level` answers; each leaves out the fields the other owns.
+#[derive(Debug, serde::Deserialize, serde::Serialize)]
+pub struct LogFilterReply {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub previous: Option<String>,
+    pub current: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reloadable: Option<bool>,
+    pub ephemeral: bool,
+}
+
 /// Acp daemon HTTP client. Cheap to clone; the underlying
 /// `reqwest::Client` is reference-counted.
 #[derive(Debug, Clone)]
@@ -713,6 +724,20 @@ impl HttpClient {
             display: about.acp_notice_display,
             timeout_secs: about.acp_notice_timeout_secs,
         })
+    }
+
+    /// `GET /api/log-level`, or `PATCH` it first when `patch` is given.
+    pub async fn log_level(
+        &self,
+        patch: Option<&serde_json::Value>,
+    ) -> Result<LogFilterReply, HttpError> {
+        let url = format!("{}/api/log-level", self.endpoint.base_url);
+        let builder = match patch {
+            None => self.http.get(&url),
+            Some(body) => self.http.patch(&url).json(body),
+        };
+        let res = check_global_status(self.execute(builder).await?)?;
+        Ok(crate::daemon::decode_json::<LogFilterReply>(res).await?)
     }
 
     /// Lightweight reachability probe used by `require_daemon` (when
@@ -1522,6 +1547,47 @@ mod tests {
                 crate::daemon::DaemonClientError::InvalidPathSegment
             ))
         ));
+    }
+
+    #[tokio::test]
+    async fn log_level_reads_and_patches_without_surfacing_an_error_body() {
+        use axum::{response::IntoResponse, routing::get, Json, Router};
+        let app = Router::new().route(
+            "/api/log-level",
+            get(|| async {
+                Json(serde_json::json!({
+                    "current": "info", "reloadable": true, "ephemeral": true
+                }))
+            })
+            .patch(|Json(body): Json<serde_json::Value>| async move {
+                if body["filter"] == "bad" {
+                    return (StatusCode::BAD_REQUEST, "secret-token echoed").into_response();
+                }
+                Json(serde_json::json!({
+                    "previous": "info", "current": "debug", "ephemeral": true
+                }))
+                .into_response()
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let client = HttpClient::new(endpoint(&format!("http://{address}"), None)).unwrap();
+        let read = client.log_level(None).await.unwrap();
+        let patched = client
+            .log_level(Some(&serde_json::json!({ "level": "debug" })))
+            .await
+            .unwrap();
+        let rejected = client
+            .log_level(Some(&serde_json::json!({ "filter": "bad" })))
+            .await
+            .unwrap_err();
+        server.abort();
+        assert_eq!(read.reloadable, Some(true));
+        assert_eq!(patched.previous.as_deref(), Some("info"));
+        assert!(!rejected.to_string().contains("secret-token"));
     }
 
     #[tokio::test]
