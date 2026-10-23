@@ -1171,33 +1171,36 @@ pub mod structured {
         /// Where the session launches, or `None` while that directory doesn't exist yet
         /// (a worktree, scratch or multi-repo session checked before provisioning).
         pub project_path: Option<&'a std::path::Path>,
-        /// Whether an `on_create` hook runs before launch, or awaits the user's trust decision,
-        /// and so may install the adapter; see [`create_hooks_apply`]. Asked only when the
+        /// Whether a preparation hook runs before launch, or awaits the user's trust decision,
+        /// and so may install the adapter; see [`preparation_hooks_apply`]. Asked only when the
         /// adapter can't be found, so a normal create skips the repository trust read.
-        pub create_hooks: &'a dyn Fn() -> bool,
+        pub preparation_hooks: &'a dyn Fn() -> bool,
     }
 
-    /// Whether an `on_create` hook will run before a create in `project_path` launches, or is
-    /// waiting on the user's trust decision. `profile_hooks` must be the profile's own, without the
-    /// repository's, which count only under `trust_hooks` (the create's decision; `Some(false)`
-    /// skips them).
-    pub fn create_hooks_apply(
+    /// Whether an `on_create` or `on_launch` hook will run before a create in `project_path`
+    /// launches, or is waiting on the user's trust decision. `profile_hooks` must be the
+    /// profile's own, without the repository's, which count only under `trust_hooks` (the
+    /// create's decision; `Some(false)` skips them).
+    pub fn preparation_hooks_apply(
         profile_hooks: &crate::session::HooksConfig,
         project_path: &std::path::Path,
         scratch: bool,
         trust_hooks: Option<bool>,
     ) -> bool {
         use crate::session::config::repo_config::{check_repo_trust, TrustSurface};
-        if !profile_hooks.on_create.is_empty() {
+        let prepares = |hooks: &crate::session::HooksConfig| {
+            !hooks.on_create.is_empty() || !hooks.on_launch.is_empty()
+        };
+        if prepares(profile_hooks) {
             return true;
         }
         if scratch {
             return false;
         }
         match check_repo_trust(project_path).map(|trust| trust.hooks) {
-            Ok(TrustSurface::Trusted(hooks)) => !hooks.on_create.is_empty(),
+            Ok(TrustSurface::Trusted(hooks)) => prepares(&hooks),
             Ok(TrustSurface::NeedsTrust { config: hooks, .. }) => {
-                trust_hooks != Some(false) && !hooks.on_create.is_empty()
+                trust_hooks != Some(false) && prepares(&hooks)
             }
             _ => false,
         }
@@ -1289,7 +1292,7 @@ pub mod structured {
             config,
             host_environment,
             inherited_path,
-        ) || (choice.create_hooks)()
+        ) || (choice.preparation_hooks)()
         {
             return Ok(());
         }
@@ -1315,7 +1318,7 @@ pub mod structured {
             command_override: "",
             sandboxed: false,
             project_path: None,
-            create_hooks: &|| false,
+            preparation_hooks: &|| false,
         };
         validate_structured_choice_with(
             &choice,
@@ -1328,8 +1331,8 @@ pub mod structured {
 
     /// Whether the adapter can launch, judged as the runner does: the daemon's lookup, or the
     /// configured PATH searched from the session's directory. Given the benefit of the doubt
-    /// when that can't be known yet: any `before_session` hook may set PATH at spawn, and a
-    /// relative PATH entry resolves in a directory that `on_create` hooks may still fill.
+    /// when that can't be known yet: any `before_session` hook may install it or set PATH at
+    /// spawn, and a relative PATH entry resolves in a directory that hooks may still fill.
     pub fn adapter_reachable(
         command: &str,
         project_path: Option<&std::path::Path>,
@@ -1352,15 +1355,16 @@ pub mod structured {
         inherited_path: Option<&std::ffi::OsStr>,
     ) -> bool {
         use crate::acp::acp_client::{is_bare_command, on_agent_path, resolve_agent_command};
+        if !config.host_hooks.before_session.is_empty() {
+            return true;
+        }
         if !is_bare_command(command) {
             let checkable =
                 command.contains("${aoe_data_dir}") || std::path::Path::new(command).is_absolute();
             return !checkable || crate::cli::acp::command_present(command);
         }
         let app_dir = crate::session::get_app_dir().ok();
-        if resolve_agent_command(command, app_dir.as_deref()).is_ok()
-            || !config.host_hooks.before_session.is_empty()
-        {
+        if resolve_agent_command(command, app_dir.as_deref()).is_ok() {
             return true;
         }
         match project_path {
@@ -1736,8 +1740,9 @@ mod tests {
             /// `agent_command_override` for gemini.
             configured_command: Option<&'a str>,
             before_session_hook: bool,
-            /// An `on_create` hook runs before launch (see `create_hooks_apply`).
-            create_hooks: bool,
+            /// An `on_create` or `on_launch` hook runs before launch
+            /// (see `preparation_hooks_apply`).
+            preparation_hooks: bool,
             inherited_path: Option<&'a str>,
             /// `None` passes; otherwise a substring of the refusal.
             expected: Option<&'a str>,
@@ -1752,7 +1757,7 @@ mod tests {
             environment: Vec::new(),
             configured_command: None,
             before_session_hook: false,
-            create_hooks: false,
+            preparation_hooks: false,
             inherited_path: None,
             expected: None,
         };
@@ -1816,7 +1821,7 @@ mod tests {
             },
             Case {
                 label: "an on_create hook may install the adapter",
-                create_hooks: true,
+                preparation_hooks: true,
                 ..base()
             },
             Case {
@@ -1836,6 +1841,12 @@ mod tests {
                 label: "absolute command, missing",
                 tool: "fake-path",
                 expected: missing,
+                ..base()
+            },
+            Case {
+                label: "a before_session hook may install an absolute command",
+                tool: "fake-path",
+                before_session_hook: true,
                 ..base()
             },
             Case {
@@ -1884,9 +1895,9 @@ mod tests {
                 command_override: case.command_override,
                 sandboxed: case.sandboxed,
                 project_path: case.project,
-                create_hooks: &|| {
+                preparation_hooks: &|| {
                     asked.set(true);
-                    case.create_hooks
+                    case.preparation_hooks
                 },
             };
             let got = structured::validate_structured_choice_with(
@@ -1908,12 +1919,103 @@ mod tests {
                 (got, expected) => panic!("{label}: got {got:?}, expected {expected:?}"),
             }
             // Hooks are asked about only when the adapter isn't otherwise found.
-            if case.expected.is_none() && !case.create_hooks {
+            if case.expected.is_none() && !case.preparation_hooks {
                 assert!(
                     !asked.get(),
                     "{label}: asked about hooks for a reachable adapter"
                 );
             }
+        }
+    }
+
+    /// Repository hooks count only while their trust isn't declined, and never for scratch.
+    #[test]
+    #[serial_test::serial]
+    fn preparation_hooks_apply_cases() {
+        use crate::session::config::repo_config::{compute_hooks_hash, trust_repo};
+        use crate::session::HooksConfig;
+        let _home = crate::session::test_support::isolate_app_dir();
+        let on_launch = HooksConfig {
+            on_launch: vec!["npm install".into()],
+            ..Default::default()
+        };
+        let on_create = HooksConfig {
+            on_create: vec!["npm install".into()],
+            ..Default::default()
+        };
+        let repo_with_on_launch = || {
+            let repo = tempfile::tempdir().unwrap();
+            let dir = repo.path().join(".agent-of-empires");
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(
+                dir.join("config.toml"),
+                "[hooks]\non_launch = [\"npm install\"]\n",
+            )
+            .unwrap();
+            repo
+        };
+        let plain = tempfile::tempdir().unwrap();
+        let untrusted = repo_with_on_launch();
+        let trusted = repo_with_on_launch();
+        trust_repo(trusted.path(), Some(&compute_hooks_hash(&on_launch)), None).unwrap();
+        let none = HooksConfig::default();
+        let cases = [
+            (
+                "profile on_launch",
+                &on_launch,
+                plain.path(),
+                false,
+                None,
+                true,
+            ),
+            (
+                "profile on_create",
+                &on_create,
+                plain.path(),
+                false,
+                None,
+                true,
+            ),
+            ("no hooks", &none, plain.path(), false, None, false),
+            (
+                "repo on_launch awaiting trust",
+                &none,
+                untrusted.path(),
+                false,
+                None,
+                true,
+            ),
+            (
+                "repo on_launch, trust declined",
+                &none,
+                untrusted.path(),
+                false,
+                Some(false),
+                false,
+            ),
+            (
+                "repo on_launch, scratch",
+                &none,
+                untrusted.path(),
+                true,
+                None,
+                false,
+            ),
+            (
+                "repo on_launch trusted",
+                &none,
+                trusted.path(),
+                false,
+                Some(false),
+                true,
+            ),
+        ];
+        for (label, profile, project, scratch, trust_hooks, want) in cases {
+            assert_eq!(
+                structured::preparation_hooks_apply(profile, project, scratch, trust_hooks),
+                want,
+                "{label}"
+            );
         }
     }
 

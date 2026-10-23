@@ -921,7 +921,7 @@ pub async fn create_session(
         let (scratch, trust_hooks) = (body.scratch, body.trust_hooks);
         let missing = tokio::task::spawn_blocking(move || {
             use crate::session::builder::structured::{
-                create_hooks_apply, validate_structured_choice, StructuredChoice,
+                preparation_hooks_apply, validate_structured_choice, StructuredChoice,
                 StructuredChoiceError,
             };
             let config = crate::session::config::repo_config::resolve_config_with_repo_or_warn(
@@ -935,8 +935,8 @@ pub async fn create_session(
                 sandboxed,
                 project_path: launch_dir_known.then_some(project_path.as_path()),
                 // The repository's hooks are merged into `config` whatever their trust.
-                create_hooks: &|| {
-                    create_hooks_apply(
+                preparation_hooks: &|| {
+                    preparation_hooks_apply(
                         &crate::session::config::profile_config::resolve_config_or_warn(&profile)
                             .hooks,
                         &project_path,

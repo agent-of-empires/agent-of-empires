@@ -2146,8 +2146,8 @@ impl NewSessionDialog {
             project_path: (!self.scratch && !self.worktree_enabled)
                 .then(|| std::path::Path::new(&path)),
             // The dialog asks for hook trust itself, so an unapproved hook still counts here.
-            create_hooks: &|| {
-                crate::session::builder::structured::create_hooks_apply(
+            preparation_hooks: &|| {
+                crate::session::builder::structured::preparation_hooks_apply(
                     &crate::session::config::profile_config::resolve_config_or_warn(&profile).hooks,
                     std::path::Path::new(&path),
                     self.scratch,

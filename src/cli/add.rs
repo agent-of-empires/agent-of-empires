@@ -683,7 +683,7 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
             || containers::get_container_runtime().is_available(),
             // Trust is asked later, so without --trust-hooks the repository's hooks may still run.
             || {
-                let apply = crate::session::builder::structured::create_hooks_apply(
+                let apply = crate::session::builder::structured::preparation_hooks_apply(
                     &crate::session::config::profile_config::resolve_config_or_warn(profile).hooks,
                     &original_project_path,
                     args.scratch,
@@ -1338,7 +1338,7 @@ fn cleanup_partial_session(
     }
 }
 
-/// Once trust is decided, refuse the adapter the first check let through for an `on_create`
+/// Once trust is decided, refuse the adapter the first check let through for a preparation
 /// hook if declining trust left no such hook to run.
 fn refuse_adapter_without_hooks(
     adapter_awaits_hooks: Option<&str>,
@@ -1347,14 +1347,17 @@ fn refuse_adapter_without_hooks(
     let Some(command) = adapter_awaits_hooks else {
         return Ok(());
     };
-    if resolved.is_some_and(|resolved| !resolved.hooks().on_create.is_empty()) {
+    if resolved.is_some_and(|resolved| {
+        let hooks = resolved.hooks();
+        !hooks.on_create.is_empty() || !hooks.on_launch.is_empty()
+    }) {
         return Ok(());
     }
     let hint = crate::acp::install_hints::install_hint_for(command)
         .unwrap_or("install via your package manager and re-run");
     bail!(
-        "ACP adapter `{command}` is not installed or not on $PATH, and no on_create hook will \
-         run to install it (the repository's hooks weren't trusted).\n\
+        "ACP adapter `{command}` is not installed or not on $PATH, and no on_create or \
+         on_launch hook will run to install it (the repository's hooks weren't trusted).\n\
          Install: {hint}\n\
          Or re-run with --trust-hooks, or use the terminal view: drop --agent / --structured-view."
     )
@@ -1362,15 +1365,15 @@ fn refuse_adapter_without_hooks(
 
 /// Whether a structured `aoe add` must refuse, or fall back, for its adapter. A sandboxed
 /// adapter runs inside the container, which bundles it, so a sandbox the runtime can start
-/// skips the host check. `create_hooks` is asked only when the adapter isn't found: an
-/// `on_create` hook that runs first may install it.
+/// skips the host check. `preparation_hooks` is asked only when the adapter isn't found:
+/// an `on_create` or `on_launch` hook that runs first may install it.
 fn structured_adapter_missing(
     args: &AddArgs,
     config: &crate::session::Config,
     command: &str,
     project_path: &std::path::Path,
     runtime_available: impl FnOnce() -> bool,
-    create_hooks: impl FnOnce() -> bool,
+    preparation_hooks: impl FnOnce() -> bool,
 ) -> bool {
     let sandboxed =
         (args.sandbox || args.sandbox_image.is_some() || config.sandbox.enabled_by_default)
@@ -1381,7 +1384,7 @@ fn structured_adapter_missing(
             Some(project_path),
             config,
         )
-        && !create_hooks()
+        && !preparation_hooks()
 }
 
 fn resolve_tool_for_add(args: &AddArgs, config: &crate::session::Config) -> Result<String> {
@@ -1978,13 +1981,23 @@ mod tests {
                     ..Default::default()
                 },
             );
-            assert!(installing.is_some());
+            let launching = ResolvedHooks::with_repo(
+                "default",
+                repo.path(),
+                crate::session::HooksConfig {
+                    on_launch: vec!["npm install".into()],
+                    ..Default::default()
+                },
+            );
+            assert!(installing.is_some() && launching.is_some());
             let refuse = super::super::refuse_adapter_without_hooks;
             assert!(refuse(None, None).is_ok(), "nothing waited on hooks");
-            assert!(
-                refuse(Some("my-acp"), installing.as_ref()).is_ok(),
-                "a hook will run"
-            );
+            for (hook, resolved) in [("on_create", &installing), ("on_launch", &launching)] {
+                assert!(
+                    refuse(Some("my-acp"), resolved.as_ref()).is_ok(),
+                    "an {hook} hook will run"
+                );
+            }
             let refused = refuse(Some("my-acp"), None).unwrap_err().to_string();
             assert!(
                 refused.contains("`my-acp`") && refused.contains("--trust-hooks"),
