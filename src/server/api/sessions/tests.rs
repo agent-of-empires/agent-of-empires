@@ -7611,6 +7611,61 @@ fn resolve_hook_plan_inherits_trust_across_worktrees() {
         "inherited trust needs no new record"
     );
 }
+
+#[test]
+fn update_restart_needs_a_captured_session_id_unless_resume_is_proven() {
+    let mut inst = Instance::new("t", "/tmp");
+    let unchecked = ContextResumeAvailability::Indeterminate {
+        reason: ContextResumeIndeterminateReason::RuntimeCheckRequired,
+    };
+    let handshake = ContextResumeAvailability::Indeterminate {
+        reason: ContextResumeIndeterminateReason::AgentHandshakeRequired,
+    };
+    assert!(update_restart_resumable(
+        &inst,
+        &ContextResumeAvailability::Available
+    ));
+    assert!(!update_restart_resumable(&inst, &unchecked));
+    assert!(!update_restart_resumable(&inst, &handshake));
+    inst.agent_session_id = Some("sid".into());
+    assert!(update_restart_resumable(&inst, &unchecked));
+    assert!(!update_restart_resumable(&inst, &handshake));
+}
+
+#[tokio::test]
+async fn restart_for_update_refuses_a_session_that_is_not_out_of_date() {
+    let mut inst = Instance::new("fresh-agent", "/tmp/fresh-agent");
+    inst.id = "fresh-agent".to_string();
+    inst.status = Status::Idle;
+    let state = crate::server::test_support::build_test_app_state(vec![inst]);
+    for (id, expected) in [
+        ("fresh-agent", StatusCode::CONFLICT),
+        ("missing", StatusCode::NOT_FOUND),
+    ] {
+        let response = restart_for_update(
+            axum::extract::State(state.clone()),
+            axum::extract::Path(id.to_string()),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), expected, "{id}");
+    }
+}
+
+#[tokio::test]
+async fn update_restart_of_a_structured_session_defers_to_the_reconciler() {
+    let mut inst = Instance::new("structured-agent", "/tmp/structured-agent");
+    inst.id = "structured-agent".to_string();
+    inst.view = crate::session::View::Structured;
+    let state = crate::server::test_support::build_test_app_state(vec![inst.clone()]);
+    let response = apply_update_restart(&state, inst.id.clone(), inst).await;
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    assert_eq!(
+        state.acp_supervisor.respawn_pending_ids(),
+        vec!["structured-agent".to_string()]
+    );
+}
+
 #[tokio::test]
 async fn list_sessions_projects_pending_approvals_only_for_running_workers() {
     use crate::acp::permissions::build_approval;

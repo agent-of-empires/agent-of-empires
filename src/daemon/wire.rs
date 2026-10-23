@@ -1036,6 +1036,9 @@ pub struct SessionResponse {
     pub acp_worker_state: AcpWorkerState,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub acp_worker_start: Option<AcpWorkerStart>,
+    /// The agent binary was replaced after launch and a restart is safe to offer now.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub update_restart: bool,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub pending_approvals: Vec<PendingApproval>,
     /// The provider rate limit this session is parked on, read from the

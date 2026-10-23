@@ -2014,8 +2014,13 @@ impl HomeView {
         let terminal_badge = (self.view_mode == ViewMode::Structured
             && self.paired_terminal_running_for_display(inst))
         .then(|| format!(" {ICON_TERMINAL}"));
-        let badge_width =
-            badge_text.map_or(0, |s| s.len()) + terminal_badge.as_ref().map_or(0, |s| s.len());
+        // Paint must not fork tmux, so this skips the resume gate the menu applies.
+        let update_badge = (!inst.is_structured()
+            && crate::session::update_restart::binary_updated(inst))
+        .then_some(" [update]");
+        let badge_width = badge_text.map_or(0, |s| s.len())
+            + terminal_badge.as_ref().map_or(0, |s| s.len())
+            + update_badge.map_or(0, |s| s.len());
         let age = if self.show_activity_age {
             row_age(inst, in_attention)
         } else {
@@ -2060,6 +2065,17 @@ impl HomeView {
 
         if let Some(badge) = terminal_badge {
             let badge_style = Style::default().fg(theme.terminal_active);
+            line_spans.push(Span::styled(
+                badge,
+                if is_selected {
+                    selected_row_style(badge_style, theme)
+                } else {
+                    badge_style
+                },
+            ));
+        }
+        if let Some(badge) = update_badge {
+            let badge_style = Style::default().fg(theme.waiting);
             line_spans.push(Span::styled(
                 badge,
                 if is_selected {
