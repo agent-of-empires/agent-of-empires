@@ -517,7 +517,7 @@ pub struct InvokeCommandBody {
 pub async fn invoke_plugin_command(
     State(state): State<std::sync::Arc<AppState>>,
     Path(fqid): Path<String>,
-    Json(body): Json<InvokeCommandBody>,
+    body: Result<Json<InvokeCommandBody>, axum::extract::rejection::JsonRejection>,
 ) -> Response {
     if state.read_only {
         return super::read_only_response();
@@ -526,6 +526,10 @@ pub async fn invoke_plugin_command(
     if let Some(resp) = super::cityhall_block(&state) {
         return resp;
     }
+    let Json(body) = match body {
+        Ok(body) => body,
+        Err(error) => return error.into_response(),
+    };
     // Plugin ids contain dots, so resolve fqid against the registry rather
     // than string-splitting it.
     let mut resolved: Option<(String, bool)> = None;

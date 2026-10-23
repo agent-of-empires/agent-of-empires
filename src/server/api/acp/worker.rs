@@ -167,7 +167,7 @@ pub async fn spawn_acp(
         Ok(store) => store,
         Err(response) => return response,
     };
-    let (sandbox_info, mut exclusion) = match crate::acp::sandbox::ensure_container_for_session(
+    let (sandbox_info, exclusion) = match crate::acp::sandbox::ensure_container_for_session(
         native.clone(),
         instance.clone(),
         exclusion,
@@ -217,22 +217,47 @@ pub async fn spawn_acp(
             &SupervisorError::SpawnCancelled(id.clone()),
         );
     }
-    match state
+    // Reserve the lifecycle generation while the preparation exclusion is
+    // still held, then release all request locks before spawn configuration
+    // and before_session hooks. Hooks may re-enter the API for this session.
+    let reservation = match state
         .acp_supervisor
-        .spawn_with_request(
-            request,
+        .reserve_spawn(
+            &id,
+            if request.stored_acp_session_id.is_some() {
+                crate::acp::supervisor::ResumeKind::Spawn
+            } else {
+                crate::acp::supervisor::ResumeKind::SpawnFirst
+            },
             crate::process::worker_registry::ResumeAuthority::Explicit,
-            &spawn_request,
         )
         .await
     {
+        Ok(reservation) => reservation,
+        Err(e) => return supervisor_error_response("spawn failed", &e),
+    };
+    if spawn_request.cancellation().is_cancelled() {
+        drop(reservation);
+        return supervisor_error_response(
+            "spawn cancelled",
+            &SupervisorError::SpawnCancelled(id.clone()),
+        );
+    }
+    drop(exclusion);
+    match state.acp_supervisor.spawn_inner(request, reservation).await {
         Ok(()) => {}
         Err(SupervisorError::AlreadyRunning(_)) if rate_limit_resume_resets_at.is_some() => {}
         Err(e) => return supervisor_error_response("spawn failed", &e),
     }
     if rate_limit_resume_resets_at.is_some() {
-        if let Some(submission) = exclusion.take_submission() {
-            let _ = install_rate_limit_continuation(&state, &id, submission).await;
+        // Reacquire only for installing the continuation. The guard is not
+        // held while the adapter launch and its hooks run.
+        if let Ok(mut exclusion) =
+            crate::acp::sandbox::LaunchExclusion::acquire(state.clone(), &id, true).await
+        {
+            if let Some(submission) = exclusion.take_submission() {
+                let _ = install_rate_limit_continuation(&state, &id, submission).await;
+            }
         }
     }
     if let Some(resets_at) = rate_limit_resume_resets_at {
@@ -749,7 +774,7 @@ async fn persist_agent_switch(
 pub async fn switch_acp_agent(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
-    Json(req): Json<SwitchAgentRequest>,
+    req: Result<Json<SwitchAgentRequest>, axum::extract::rejection::JsonRejection>,
 ) -> impl IntoResponse {
     if let Some(resp) = read_only_block(&state) {
         return resp;
@@ -757,6 +782,10 @@ pub async fn switch_acp_agent(
     if let Some(resp) = cityhall_block(&state) {
         return resp;
     }
+    let Json(req) = match req {
+        Ok(req) => req,
+        Err(error) => return error.into_response(),
+    };
     let target = req.target.trim().to_string();
     if target.is_empty() {
         return (StatusCode::BAD_REQUEST, "target is required").into_response();
@@ -1377,6 +1406,62 @@ mod tests {
 
     #[tokio::test]
     #[serial_test::serial]
+    async fn explicit_resume_retirement_preserves_its_request_until_an_external_stop() {
+        use crate::session::{Instance, Status, Storage, View};
+
+        let _home = crate::session::test_support::isolate_app_dir();
+        let project = tempfile::tempdir().unwrap();
+        let mut row = Instance::new("stop then resume", project.path().to_str().unwrap());
+        row.source_profile = "default".into();
+        row.view = View::Structured;
+        let state = durable_stop_state(row.clone()).await;
+        assert_eq!(
+            shutdown_acp(State(state.clone()), Path(row.id.clone()))
+                .await
+                .into_response()
+                .status(),
+            StatusCode::NO_CONTENT
+        );
+        let stopped = Storage::open_unwatched("default")
+            .unwrap()
+            .load()
+            .unwrap()
+            .remove(0);
+        assert_eq!(stopped.status, Status::Stopped);
+
+        // The HTTP spawn registers before acquiring exclusion and retiring
+        // the old stopped instance. That retirement is part of this request.
+        let request = state.acp_supervisor.begin_spawn_request(&row.id).unwrap();
+        let restart = state
+            .acp_supervisor
+            .try_begin_restart(&row.id)
+            .await
+            .unwrap();
+        let exclusion = crate::acp::sandbox::LaunchExclusion::acquire(state.clone(), &row.id, true)
+            .await
+            .unwrap();
+        let resumed = crate::server::api::sessions::resume_structured_stop(&state, stopped)
+            .await
+            .unwrap_or_else(|response| panic!("resume failed: {}", response.status()));
+        assert_eq!(resumed.status, Status::Idle);
+        assert!(!request.cancellation().is_cancelled());
+        assert!(!restart.is_cancelled());
+        drop(exclusion);
+
+        // A subsequent real stop must still cancel both launch paths.
+        assert_eq!(
+            shutdown_acp(State(state.clone()), Path(row.id.clone()))
+                .await
+                .into_response()
+                .status(),
+            StatusCode::NO_CONTENT
+        );
+        assert!(request.cancellation().is_cancelled());
+        assert!(restart.is_cancelled());
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
     async fn explicit_resume_cannot_consume_a_newer_native_stop() {
         use crate::session::{Instance, Status, Storage, View};
         let _home = crate::session::test_support::isolate_app_dir();
@@ -1654,7 +1739,7 @@ mod tests {
                 switch_acp_agent(
                     State(state.clone()),
                     Path(row.id.clone()),
-                    Json(SwitchAgentRequest {
+                    Ok(Json(SwitchAgentRequest {
                         target: if case == "backend" {
                             "codex".into()
                         } else {
@@ -1662,7 +1747,7 @@ mod tests {
                         },
                         model: None,
                         reason: None,
-                    }),
+                    })),
                 )
                 .await
                 .into_response()
@@ -1761,15 +1846,18 @@ mod tests {
         let calls = Arc::new(AtomicUsize::new(0));
         let launcher: crate::acp::supervisor::Launcher = {
             let calls = Arc::clone(&calls);
-            Arc::new(move |_config, _session_id| {
+            Arc::new(move |config, _session_id| {
                 let call = calls.fetch_add(1, Ordering::SeqCst);
                 let started = started_tx.clone();
                 Box::pin(async move {
+                    let lease = config
+                        .launch_lease
+                        .expect("supervisor retains launch lease");
                     started.send(call).expect("test receiver remains open");
-                    std::future::pending::<
-                        Result<crate::acp::acp_client::AcpClient, crate::acp::acp_client::AcpError>,
-                    >()
-                    .await
+                    lease.cancellation().cancelled().await;
+                    Err(crate::acp::acp_client::AcpError::Spawn(
+                        "launch cancelled before runner birth".into(),
+                    ))
                 })
             })
         };
@@ -1888,15 +1976,18 @@ mod tests {
         let calls = Arc::new(AtomicUsize::new(0));
         let launcher: crate::acp::supervisor::Launcher = {
             let calls = Arc::clone(&calls);
-            Arc::new(move |_config, _session_id| {
+            Arc::new(move |config, _session_id| {
                 let call = calls.fetch_add(1, Ordering::SeqCst);
                 let started = started_tx.clone();
                 Box::pin(async move {
+                    let lease = config
+                        .launch_lease
+                        .expect("supervisor retains launch lease");
                     started.send(call).expect("test receiver remains open");
-                    std::future::pending::<
-                        Result<crate::acp::acp_client::AcpClient, crate::acp::acp_client::AcpError>,
-                    >()
-                    .await
+                    lease.cancellation().cancelled().await;
+                    Err(crate::acp::acp_client::AcpError::Spawn(
+                        "launch cancelled before runner birth".into(),
+                    ))
                 })
             })
         };

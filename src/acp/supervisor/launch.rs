@@ -12,9 +12,9 @@ use super::agents::{
 };
 use super::publish::collect_resumable_background_agent_launches;
 use super::{
-    lock_recover, BroadcastSink, PendingContextReset, PendingSpawnGuard, RestartRequestGuard,
-    ResumeKind, ResumeReservation, ResumeReservationOutcome, SpawnRequest, Supervisor,
-    SupervisorError, WorkerHandle, WorkerKind,
+    lock_recover, BroadcastSink, PendingContextReset, RestartRequestGuard, ResumeKind,
+    ResumeReservation, ResumeReservationOutcome, SpawnRequest, Supervisor, SupervisorError,
+    WorkerHandle, WorkerKind,
 };
 use crate::acp::acp_client::{AcpClient, AcpError, SpawnConfig};
 use crate::acp::agent_policy::AgentPolicy;
@@ -45,19 +45,6 @@ impl<S: BroadcastSink> Supervisor<S> {
         restart: &RestartRequestGuard,
     ) -> Result<(), SupervisorError> {
         self.spawn_with_restart_claim(req, authority, Some(restart), None)
-            .await
-    }
-
-    /// Spawn from an HTTP request whose pre-admission guards can be cancelled
-    /// by a concurrent stop. Once admitted, the Lease owns cancellation and
-    /// all physical retirement work.
-    pub(crate) async fn spawn_with_request(
-        &self,
-        req: SpawnRequest,
-        authority: crate::process::worker_registry::ResumeAuthority,
-        request: &PendingSpawnGuard,
-    ) -> Result<(), SupervisorError> {
-        self.spawn_with_restart_claim(req, authority, None, Some(request.cancellation().clone()))
             .await
     }
 
@@ -328,21 +315,9 @@ impl<S: BroadcastSink> Supervisor<S> {
             self.sink.clear_session_events(session_id);
         }
 
-        // `session/new` and `session/load` can wait on an adapter indefinitely.
-        // A shutdown must be able to cancel that future instead of waiting for
-        // the adapter to eventually notice the stop.
-        let launched = match await_resume(
-            reservation.cancellation(),
-            (self.launcher)(config.clone(), AcpSessionId(session_id.to_string())),
-        )
-        .await
-        {
-            Ok(launched) => launched,
-            Err(()) => {
-                drop(warmup_guard);
-                return Err(self.cancelled_spawn(&lease).await);
-            }
-        };
+        // The client observes the Lease cancellation during its handshake.
+        // Retain its result so retirement can still delete adapter-side state.
+        let launched = (self.launcher)(config.clone(), AcpSessionId(session_id.to_string())).await;
         let mut client = match launched {
             Ok(c) => c,
             Err(err) => {
@@ -389,25 +364,14 @@ impl<S: BroadcastSink> Supervisor<S> {
                 .unwrap_or_else(|| RunnerIdentity::unattested(pid, lease.epoch()))
         });
         // A peer that archived or trashed the row during the handshake wins: retire the runner.
-        match await_resume(
-            reservation.cancellation(),
-            admit_durable_launch(req.launch_admission.as_ref(), &req.session_id),
-        )
-        .await
-        {
-            Ok(Ok(())) => {}
-            Ok(Err(refused)) => {
+        match admit_durable_launch(req.launch_admission.as_ref(), &req.session_id).await {
+            Ok(()) => {}
+            Err(refused) => {
                 super::teardown::retire_client(&self.lifecycle, &lease, &client, identity).await;
                 drop(client);
                 drop(warmup_guard);
                 self.reap_failed_launch(&lease).await;
                 return Err(refused);
-            }
-            Err(()) => {
-                super::teardown::retire_client(&self.lifecycle, &lease, &client, identity).await;
-                drop(client);
-                drop(warmup_guard);
-                return Err(self.cancelled_spawn(&lease).await);
             }
         }
 
@@ -1417,6 +1381,57 @@ mod tests {
     use crate::acp::approvals::{ApprovalDecision, Nonce};
     use crate::acp::runner_lifecycle::test_support::FakeProcessControl;
     use crate::daemon::AcpWorkerState;
+
+    #[tokio::test]
+    #[serial_test::serial]
+    #[cfg(unix)]
+    async fn lease_cancellation_releases_a_real_stalled_handshake() -> anyhow::Result<()> {
+        let _home = isolate_home();
+        let project = tempfile::tempdir()?;
+        let ready = project.path().join("request-received");
+        let mut lifecycle = crate::acp::runner_lifecycle::LifecycleTable::new(0);
+        let lease = lifecycle
+            .admit("stalled-handshake", ResumeKind::SpawnFirst)
+            .expect("fresh launch admission");
+        let mut config = runner_config(project.path().join("unused.sock"));
+        config.socket_path = None;
+        config.launch_lease = Some(lease.clone());
+        config.spec.command = "python3".into();
+        config.spec.args = vec![
+            "-c".into(),
+            r#"import json, os, sys, time
+request = json.loads(sys.stdin.readline())
+assert request['method'] == 'initialize'
+with open(sys.argv[1], 'w') as marker:
+    marker.write(str(os.getpid()))
+time.sleep(60)
+"#
+            .into(),
+            ready.to_string_lossy().into_owned(),
+        ];
+        let spawning = tokio::spawn(AcpClient::spawn(
+            config,
+            AcpSessionId("stalled-handshake".into()),
+        ));
+        let pid = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if let Ok(pid) = std::fs::read_to_string(&ready)
+                    .unwrap_or_default()
+                    .parse::<u32>()
+                {
+                    break pid;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await?;
+        assert!(worker_registry::is_pid_alive(pid));
+        lease.cancellation().cancel();
+        let result = tokio::time::timeout(std::time::Duration::from_secs(3), spawning).await??;
+        assert!(result.is_err());
+        assert!(!worker_registry::is_pid_alive(pid));
+        Ok(())
+    }
 
     #[tokio::test]
     async fn ordinary_spawn_is_rejected_while_restart_claim_is_held() {

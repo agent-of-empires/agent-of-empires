@@ -56,7 +56,6 @@ use crate::acp::approvals::{ApprovalDecision, Nonce};
 use crate::acp::elicitations::{build_response, summarize_answers, ElicitationResolution};
 use crate::acp::event_store::AttachmentBlob;
 use crate::acp::fs_handler::{FsPolicy, SandboxPathMap};
-use crate::acp::runner_lifecycle::RunnerIdentity;
 use crate::acp::state::{AcpSessionId, Event};
 use crate::acp::terminal_handler::TerminalManager;
 use crate::daemon::PromptAttachmentKind;
@@ -71,7 +70,6 @@ use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use tokio::sync::{mpsc, oneshot, Mutex};
 use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
-use tokio_util::sync::CancellationToken;
 use tracing::Instrument;
 
 use self::commands::{ClientCmd, ConnectMode};
@@ -568,39 +566,6 @@ impl AcpClient {
         }
         client.native_store = native_store;
         Ok(client)
-    }
-
-    pub(crate) async fn spawn_cancellable(
-        config: SpawnConfig,
-        session_id: AcpSessionId,
-        cancellation: CancellationToken,
-        _process_control: Arc<dyn crate::acp::runner_lifecycle::ProcessControl>,
-        on_runner_spawned: impl Fn(RunnerIdentity) + Send + Sync + 'static,
-    ) -> Result<Self, AcpError> {
-        if cancellation.is_cancelled() {
-            return Err(AcpError::Spawn("runner launch cancelled".into()));
-        }
-        let generation = config.generation;
-        tokio::select! {
-            biased;
-            _ = cancellation.cancelled() => {
-                Err(AcpError::Spawn("runner launch cancelled".into()))
-            }
-            result = Self::spawn(config, session_id) => {
-                let client = result?;
-                if let Some(pid) = client.runner_pid {
-                    on_runner_spawned(RunnerIdentity {
-                        pid,
-                        generation,
-                        birth_fingerprint: crate::process::process_birth_identity(pid)
-                            .ok()
-                            .flatten()
-                            .map(|identity| identity.fingerprint()),
-                    });
-                }
-                Ok(client)
-            }
-        }
     }
 
     /// Dial a runner's control socket, which carries the whole transport

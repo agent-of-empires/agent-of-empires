@@ -655,6 +655,41 @@ impl<S: BroadcastSink> Supervisor<S> {
         expected_lease: Option<&Lease>,
         captured: bool,
     ) -> StopRequestGuard {
+        self.begin_stop_request_with_pending_cancellation(
+            session_id,
+            reason,
+            expected_lease,
+            captured,
+            true,
+        )
+        .await
+    }
+
+    /// Resume already owns launch exclusion. Fence its captured retirement
+    /// without cancelling the pending request that is performing that resume.
+    pub(super) async fn begin_retirement_request(
+        &self,
+        session_id: &str,
+        expected_lease: Option<&Lease>,
+    ) -> StopRequestGuard {
+        self.begin_stop_request_with_pending_cancellation(
+            session_id,
+            "user_stopped",
+            expected_lease,
+            true,
+            false,
+        )
+        .await
+    }
+
+    async fn begin_stop_request_with_pending_cancellation(
+        &self,
+        session_id: &str,
+        reason: &str,
+        expected_lease: Option<&Lease>,
+        captured: bool,
+        cancel_pending: bool,
+    ) -> StopRequestGuard {
         let (request_id, cancelled_pending) = {
             let mut requests = lock_recover(&self.spawn_requests);
             let request_id =
@@ -671,6 +706,7 @@ impl<S: BroadcastSink> Supervisor<S> {
             let pending = requests
                 .pending
                 .get(session_id)
+                .filter(|_| cancel_pending)
                 .map(|pending| pending.values().cloned().collect::<Vec<_>>())
                 .unwrap_or_default();
             let cancelled_pending = pending
@@ -681,6 +717,16 @@ impl<S: BroadcastSink> Supervisor<S> {
                 cancellation.cancel();
             }
             (request_id, cancelled_pending)
+        };
+        // Install the guard before the first await. If acquiring the worker
+        // gate is cancelled, Drop must release the fence owner that was just
+        // registered above.
+        let mut stop_request = StopRequestGuard {
+            session_id: session_id.to_string(),
+            request_id,
+            requests: Arc::clone(&self.spawn_requests),
+            cancelled_pending,
+            cancelled_launch: false,
         };
         let workers = self.workers.lock().await;
         let cancelled_launch = {
@@ -701,13 +747,8 @@ impl<S: BroadcastSink> Supervisor<S> {
         if cancelled_launch {
             self.worker_notify.notify_waiters();
         }
-        StopRequestGuard {
-            session_id: session_id.to_string(),
-            request_id,
-            requests: Arc::clone(&self.spawn_requests),
-            cancelled_pending,
-            cancelled_launch,
-        }
+        stop_request.cancelled_launch = cancelled_launch;
+        stop_request
     }
 
     /// Claim the session's restart lane while holding the same gate used by
@@ -826,5 +867,75 @@ mod tests {
         ids.sort();
         assert_eq!(ids, vec!["s-1", "s-2"]);
         assert!(sup.take_respawn_requests().is_empty());
+    }
+
+    #[tokio::test]
+    async fn cancelled_stop_request_drops_fence_before_fresh_admission() {
+        let sup = Arc::new(Supervisor::new(VecSink::new()));
+        let workers = sup.workers.lock().await;
+        let stopping = {
+            let sup = Arc::clone(&sup);
+            tokio::spawn(async move {
+                sup.begin_stop_request("s-fence-cancel", "user_stopped", None, false)
+                    .await
+            })
+        };
+
+        // The stop request must publish its fence before waiting for workers.
+        for _ in 0..100 {
+            if lock_recover(&sup.spawn_requests)
+                .stop_fences
+                .contains_key("s-fence-cancel")
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(lock_recover(&sup.spawn_requests)
+            .stop_fences
+            .contains_key("s-fence-cancel"));
+        assert!(matches!(
+            sup.begin_spawn_request("s-fence-cancel"),
+            Err(SupervisorError::SpawnCancelled(_))
+        ));
+
+        stopping.abort();
+        assert!(matches!(stopping.await, Err(join) if join.is_cancelled()));
+        drop(workers);
+        assert!(!lock_recover(&sup.spawn_requests)
+            .stop_fences
+            .contains_key("s-fence-cancel"));
+        let fresh = sup
+            .begin_spawn_request("s-fence-cancel")
+            .expect("cancelled stop must not strand admission");
+        drop(fresh);
+    }
+
+    #[tokio::test]
+    async fn stop_fence_cancellation_helper_cancels_pending_spawn_before_worker_wait() {
+        let sup = Arc::new(Supervisor::new(VecSink::new()));
+        let pending = sup.begin_spawn_request("s-fence-helper").unwrap();
+        let workers = sup.workers.lock().await;
+        let stopping = {
+            let sup = Arc::clone(&sup);
+            tokio::spawn(async move {
+                sup.begin_stop_request("s-fence-helper", "user_stopped", None, false)
+                    .await
+            })
+        };
+        for _ in 0..100 {
+            if pending.cancellation().is_cancelled() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(pending.cancellation().is_cancelled());
+        stopping.abort();
+        assert!(matches!(stopping.await, Err(join) if join.is_cancelled()));
+        drop(workers);
+        drop(pending);
+        assert!(!lock_recover(&sup.spawn_requests)
+            .stop_fences
+            .contains_key("s-fence-helper"));
     }
 }

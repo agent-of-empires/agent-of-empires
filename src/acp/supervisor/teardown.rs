@@ -449,6 +449,25 @@ impl<S: BroadcastSink> Supervisor<S> {
         self.shutdown_and_wait_with_policy(session_id, deadline, false, Some(target))
             .await
     }
+
+    /// Settle the old runner as part of an explicit resume. The caller owns
+    /// launch exclusion; this cleanup must preserve its pending spawn and
+    /// restart claim while still fencing admission during retirement.
+    pub(crate) async fn retire_captured_for_resume_and_wait(
+        &self,
+        session_id: &str,
+        target: &RetirementTarget,
+        deadline: Duration,
+    ) -> Result<(), SupervisorError> {
+        self.shutdown_and_wait_with_pending_cancellation(
+            session_id,
+            deadline,
+            false,
+            Some(target),
+            false,
+        )
+        .await
+    }
     pub(crate) async fn shutdown_captured_and_delete_and_wait(
         &self,
         session_id: &str,
@@ -528,6 +547,24 @@ impl<S: BroadcastSink> Supervisor<S> {
         delete_adapter_state: bool,
         expected: Option<&RetirementTarget>,
     ) -> Result<(), SupervisorError> {
+        self.shutdown_and_wait_with_pending_cancellation(
+            session_id,
+            deadline,
+            delete_adapter_state,
+            expected,
+            true,
+        )
+        .await
+    }
+
+    async fn shutdown_and_wait_with_pending_cancellation(
+        &self,
+        session_id: &str,
+        deadline: Duration,
+        delete_adapter_state: bool,
+        expected: Option<&RetirementTarget>,
+        cancel_pending: bool,
+    ) -> Result<(), SupervisorError> {
         let record_before = if expected.is_none() {
             worker_registry::load_strict(session_id).map_err(|error| {
                 SupervisorError::Acp(crate::acp::acp_client::AcpError::Spawn(error.to_string()))
@@ -539,7 +576,13 @@ impl<S: BroadcastSink> Supervisor<S> {
             .and_then(|target| target.identity)
             .or_else(|| record_before.as_ref().map(RunnerIdentity::from_record));
         let stopped = self
-            .shutdown_with_reason(session_id, "user_stopped", delete_adapter_state, expected)
+            .shutdown_with_reason_and_pending_cancellation(
+                session_id,
+                "user_stopped",
+                delete_adapter_state,
+                expected,
+                cancel_pending,
+            )
             .await;
         // The existing synchronous teardown grace precedes the settlement wait.
         let deadline = tokio::time::Instant::now() + deadline;
@@ -607,17 +650,42 @@ impl<S: BroadcastSink> Supervisor<S> {
         delete_adapter_state: bool,
         expected: Option<&RetirementTarget>,
     ) -> Result<(), SupervisorError> {
+        self.shutdown_with_reason_and_pending_cancellation(
+            session_id,
+            stop_reason,
+            delete_adapter_state,
+            expected,
+            true,
+        )
+        .await
+    }
+
+    async fn shutdown_with_reason_and_pending_cancellation(
+        &self,
+        session_id: &str,
+        stop_reason: &str,
+        delete_adapter_state: bool,
+        expected: Option<&RetirementTarget>,
+        cancel_pending: bool,
+    ) -> Result<(), SupervisorError> {
         // Close the request lane before inspecting lifecycle state. Pending
         // spawns must observe the stop while they still wait on submission or
         // instance guards; admitted launches are cancelled by their Lease.
-        let _stop_request = self
-            .begin_stop_request(
+        let _stop_request = if cancel_pending {
+            self.begin_stop_request(
                 session_id,
                 stop_reason,
                 expected.and_then(|target| target.lease.as_ref()),
                 expected.is_some(),
             )
-            .await;
+            .await
+        } else {
+            self.begin_retirement_request(
+                session_id,
+                expected.and_then(|target| target.lease.as_ref()),
+            )
+            .await
+        };
         // Same lock order as `begin_resume`, so a resume cannot slip between
         // the decision and the handle removal.
         let mut workers = self.workers.lock().await;

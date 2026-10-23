@@ -498,7 +498,12 @@ mod tests {
         (
             "acp/worker.rs",
             include_str!("acp/worker.rs"),
-            &["spawn_acp", "restart_acp", "shutdown_acp"],
+            &[
+                "spawn_acp",
+                "restart_acp",
+                "shutdown_acp",
+                "switch_acp_agent",
+            ],
         ),
         (
             "acp/prompt.rs",
@@ -539,7 +544,7 @@ mod tests {
         (
             "plugins.rs",
             include_str!("plugins.rs"),
-            &["invoke_plugin_action"],
+            &["invoke_plugin_action", "invoke_plugin_command"],
         ),
     ];
 
@@ -557,16 +562,29 @@ mod tests {
             }
             (depth == 0).then_some(i)
         })?;
-        let body_end = ["\npub async fn ", "\npub fn ", "\nasync fn ", "\nfn "]
-            .iter()
-            .filter_map(|t| rest.find(t))
-            .min()
-            .unwrap_or(rest.len());
+        let body_end = [
+            "\npub async fn ",
+            "\npub fn ",
+            "\npub(",
+            "\nasync fn ",
+            "\nfn ",
+        ]
+        .iter()
+        .filter_map(|t| rest.find(t))
+        .min()
+        .unwrap_or(rest.len());
         Some((&rest[..sig_end], &rest[..body_end]))
     }
 
     #[test]
     fn mutating_handlers_guard_read_only_before_body_extraction() {
+        let lifecycle = include_str!("sessions/lifecycle.rs");
+        let (_, preparation) =
+            handler_source(lifecycle, "prepare_agent_session").expect("prepare_agent_session");
+        let (_, preparation_inner) = handler_source(lifecycle, "prepare_agent_session_inner")
+            .expect("prepare_agent_session_inner");
+        let preparation_guards_read_only = preparation.contains("prepare_agent_session_inner(")
+            && preparation_inner.contains("state.read_only");
         let mut failures = Vec::new();
         for (file, source, handlers) in MUTATING_HANDLERS {
             for name in *handlers {
@@ -574,9 +592,16 @@ mod tests {
                     failures.push(format!("{file}: handler `{name}` not found"));
                     continue;
                 };
-                if !["state.read_only", "self.read_only", "read_only_block("]
-                    .iter()
-                    .any(|p| body.contains(p))
+                let delegates_preparation = matches!(
+                    (*file, *name),
+                    ("sessions/ensure.rs", "ensure_session")
+                        | ("sessions/lifecycle.rs", "start_session")
+                ) && body.contains("prepare_agent_session(")
+                    && preparation_guards_read_only;
+                if !delegates_preparation
+                    && !["state.read_only", "self.read_only", "read_only_block("]
+                        .iter()
+                        .any(|p| body.contains(p))
                 {
                     failures.push(format!("{file}: `{name}` lacks a read-only guard"));
                 }
