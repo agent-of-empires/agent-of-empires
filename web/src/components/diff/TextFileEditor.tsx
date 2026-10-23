@@ -3,7 +3,14 @@ import { AlertTriangle } from "lucide-react";
 import { BackButton } from "./viewerChrome";
 import { getSessionFile, saveSessionFile, type SessionFileResponse } from "../../lib/api";
 import { writeClipboard } from "../../lib/clipboard";
-import { confirmFileEditNavigation, preserveLineEndings, registerFileEditGuard } from "../../lib/fileEditGuard";
+import {
+  confirmFileEditNavigation,
+  fileDraftKey,
+  getFileDraft,
+  preserveLineEndings,
+  registerFileEditor,
+  setFileDraft,
+} from "../../lib/fileEditGuard";
 import { useLatestRef } from "../../hooks/useLatestRef";
 
 interface Props {
@@ -20,7 +27,8 @@ const button =
 
 export function TextFileEditor({ sessionId, filePath, original, onBack, onCancel, onSaved }: Props) {
   const normalized = original.content.replace(/\r\n|\r/g, "\n");
-  const [draft, setDraft] = useState(normalized);
+  const key = fileDraftKey(sessionId, filePath);
+  const [draft, setDraft] = useState(() => getFileDraft(key)?.text ?? normalized);
   const [saving, setSaving] = useState(false);
   const [changed, setChanged] = useState(false);
   const [checkFailed, setCheckFailed] = useState(false);
@@ -28,27 +36,13 @@ export function TextFileEditor({ sessionId, filePath, original, onBack, onCancel
   const [copied, setCopied] = useState(false);
   const textarea = useRef<HTMLTextAreaElement>(null);
   const dirty = draft !== normalized;
-  const latest = useLatestRef({ dirty, saving, onCancel });
+  const latest = useLatestRef({ onCancel });
   const savingRef = useRef(false);
 
   useEffect(() => {
     textarea.current?.focus();
-    return registerFileEditGuard({
-      dirty: () => latest.current.dirty,
-      saving: () => savingRef.current,
-      discard: () => latest.current.onCancel(),
-    });
-  }, [latest]);
-
-  useEffect(() => {
-    const warn = (event: BeforeUnloadEvent) => {
-      if (!latest.current.dirty && !savingRef.current) return;
-      event.preventDefault();
-      event.returnValue = "";
-    };
-    window.addEventListener("beforeunload", warn);
-    return () => window.removeEventListener("beforeunload", warn);
-  }, [latest]);
+    return registerFileEditor(key, () => latest.current.onCancel());
+  }, [key, latest]);
 
   useEffect(() => {
     let cancelled = false;
@@ -81,13 +75,18 @@ export function TextFileEditor({ sessionId, filePath, original, onBack, onCancel
     };
   }, [sessionId, filePath, original.version]);
 
+  const discard = () => {
+    setFileDraft(key, null);
+    onCancel();
+  };
   const cancel = () => {
     if (savingRef.current) return;
-    if (!dirty || window.confirm("Discard unsaved file changes?")) onCancel();
+    if (!dirty || window.confirm("Discard unsaved file changes?")) discard();
   };
   const save = async () => {
     if (savingRef.current || !dirty || changed || !original.version) return;
     savingRef.current = true;
+    setFileDraft(key, { original, text: draft, saving: true });
     setSaving(true);
     setError(null);
     try {
@@ -97,8 +96,10 @@ export function TextFileEditor({ sessionId, filePath, original, onBack, onCancel
         original.version,
         preserveLineEndings(draft, original.content),
       );
-      if (result.ok) onSaved();
-      else {
+      if (result.ok) {
+        setFileDraft(key, null);
+        onSaved();
+      } else {
         if (result.status === 409 || result.status === 404) setChanged(true);
         setError(result.error ?? "Could not save file. Your edits are kept.");
       }
@@ -106,6 +107,7 @@ export function TextFileEditor({ sessionId, filePath, original, onBack, onCancel
       setError("Save could not be confirmed. Your edits are kept; check the file before retrying.");
     } finally {
       savingRef.current = false;
+      if (getFileDraft(key)) setFileDraft(key, { original, text: draft, saving: false });
       setSaving(false);
     }
   };
@@ -162,7 +164,7 @@ export function TextFileEditor({ sessionId, filePath, original, onBack, onCancel
               className={button}
               disabled={saving}
               onClick={() => {
-                if (!dirty || window.confirm("Discard your edits and reload the file from disk?")) onCancel();
+                if (!dirty || window.confirm("Discard your edits and reload the file from disk?")) discard();
               }}
             >
               Reload from disk
@@ -190,7 +192,9 @@ export function TextFileEditor({ sessionId, filePath, original, onBack, onCancel
         autoCorrect="off"
         className="flex-1 min-h-0 w-full resize-none p-3 font-mono text-base md:text-[12px] text-text-primary bg-surface-950 focus:outline-none focus:ring-1 focus:ring-inset focus:ring-brand-500/50 whitespace-pre overflow-auto"
         onChange={(event) => {
-          setDraft(event.target.value);
+          const text = event.target.value;
+          setDraft(text);
+          setFileDraft(key, text === normalized ? null : { original, text, saving: false });
           setCopied(false);
         }}
         onKeyDown={(event) => {
